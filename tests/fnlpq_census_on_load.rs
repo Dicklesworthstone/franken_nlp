@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
+
 use franken_nlp::artifact::converter::expected_nanbeige42_census;
 use franken_nlp::artifact::format::{
-    framed_sha256_hex, logical_model_sha256, logical_tensor_sha256, write, ArchTarget,
-    CanonicalDtype, FnlpqWriteError, FnlpqWriterInput, PackingSetInput, SectionKind,
-    SectionPayload, SectionRange, TensorInput,
+    ArchTarget, CanonicalDtype, FnlpqWriteError, FnlpqWriterInput, PackingSetInput, SectionKind,
+    SectionPayload, SectionRange, TensorInput, framed_sha256_hex, logical_model_sha256,
+    logical_tensor_sha256, write,
 };
 use franken_nlp::artifact::reader::{FnlpqArtifact, FnlpqReadError};
 use sha2::{Digest, Sha256};
@@ -53,6 +55,54 @@ fn complete_nanbeige_census_loads_and_missing_shape_and_name_drift_refuse() {
     assert_census_refusal(
         write(&renamed).expect("renamed fixture writes").bytes,
         "renamed",
+    );
+}
+
+#[test]
+fn bf16_synthetic_census_round_trip_preserves_every_record_bytes() {
+    let mut input = nanbeige_input();
+    let expected_payloads = install_synthetic_bf16_payloads(&mut input);
+    let written = write(&input)
+        .expect("non-empty synthetic BF16 census artifact writes")
+        .bytes;
+    let artifact = FnlpqArtifact::from_bytes(written.clone())
+        .expect("checked loader accepts the non-empty synthetic BF16 census");
+    let reserialized = artifact
+        .reserialize()
+        .expect("checked loader reserializes every synthetic BF16 record");
+
+    assert_eq!(
+        reserialized, written,
+        "checked load then canonical re-serialize must preserve every BF16 record byte"
+    );
+    assert_eq!(artifact.tensors().len(), expected_payloads.len());
+
+    for tensor in artifact.tensors() {
+        assert_eq!(tensor.canonical_dtype, "bf16");
+        assert_eq!(tensor.quantization, BF16_RECIPE);
+        let expected = expected_payloads
+            .get(&tensor.name)
+            .expect("every checked tensor has an expected BF16 byte slice");
+        let observed = checked_data_bytes(&artifact, tensor);
+        assert_eq!(
+            observed,
+            expected.as_slice(),
+            "BF16 byte identity drifted for tensor={} bytes={}",
+            tensor.name,
+            expected.len()
+        );
+        eprintln!(
+            "FNLPQ_ROUND_TRIP tensor={} dtype={} bytes={} sha256={}",
+            tensor.name,
+            tensor.canonical_dtype,
+            observed.len(),
+            hex(&Sha256::digest(observed))
+        );
+    }
+    eprintln!(
+        "FNLPQ_ROUND_TRIP RESULT=PASS tensors={} bf16_payload_bytes={}",
+        expected_payloads.len(),
+        expected_payloads.values().map(Vec::len).sum::<usize>()
     );
 }
 
@@ -114,6 +164,47 @@ fn nanbeige_input() -> FnlpqWriterInput {
         .collect();
     refresh_logical_model_identity(&mut input);
     input
+}
+
+/// Install a small unique byte slice for each 201-record synthetic census
+/// member.  This is deliberately bounded: the real 8.3 GiB BF16 closure is
+/// exercised only by the model-gated converter path, while this always-on
+/// fixture proves that every declared record survives the checked load path.
+fn install_synthetic_bf16_payloads(input: &mut FnlpqWriterInput) -> BTreeMap<String, Vec<u8>> {
+    const BYTES_PER_TENSOR: usize = 8;
+
+    let mut expected_payloads = BTreeMap::new();
+    let mut payload = Vec::with_capacity(input.tensors.len() * BYTES_PER_TENSOR);
+    for (ordinal, tensor) in input.tensors.iter_mut().enumerate() {
+        let offset = u64::try_from(payload.len()).expect("synthetic payload offset fits u64");
+        let ordinal = u16::try_from(ordinal + 1).expect("201-record census fits u16");
+        let [ordinal_low, ordinal_high] = ordinal.to_le_bytes();
+        let bytes = [
+            ordinal_low,
+            ordinal_high,
+            0x80,
+            0x3f,
+            0x00,
+            0xc0,
+            0x00,
+            0x3f,
+        ];
+        payload.extend_from_slice(&bytes);
+        tensor.data = SectionRange::new(
+            "generic-payload",
+            offset,
+            u64::try_from(BYTES_PER_TENSOR).expect("fixed synthetic slice fits u64"),
+        );
+        expected_payloads.insert(tensor.name.clone(), bytes.to_vec());
+    }
+    input
+        .sections
+        .iter_mut()
+        .find(|section| section.name == "generic-payload")
+        .expect("synthetic generic payload section")
+        .bytes = payload;
+    refresh_logical_model_identity(input);
+    expected_payloads
 }
 
 fn tiny_input() -> FnlpqWriterInput {
@@ -231,6 +322,23 @@ fn mapped_bytes_in_sections<'a>(sections: &'a [SectionPayload], range: &SectionR
     &section[start..end]
 }
 
+fn checked_data_bytes<'a>(
+    artifact: &'a FnlpqArtifact,
+    tensor: &franken_nlp::artifact::reader::CheckedTensor,
+) -> &'a [u8] {
+    let section = artifact
+        .section_bytes(tensor.data.section_ordinal)
+        .expect("checked tensor data section remains available");
+    let start = usize::try_from(tensor.data.offset).expect("checked tensor data offset fits host");
+    let len = usize::try_from(tensor.data.len).expect("checked tensor data length fits host");
+    let end = start
+        .checked_add(len)
+        .expect("checked tensor data range cannot overflow host usize");
+    section
+        .get(start..end)
+        .expect("checked tensor data range remains inside its checked section")
+}
+
 fn replace_header_digest(bytes: &mut [u8], field: &str, replacement: &str) {
     let header_len = usize::try_from(u64::from_le_bytes(
         bytes[16..24].try_into().expect("prelude"),
@@ -241,9 +349,11 @@ fn replace_header_digest(bytes: &mut [u8], field: &str, replacement: &str) {
     let prefix = format!("\"{field}\":\"");
     let start = header.find(&prefix).expect("header field") + prefix.len();
     let end = start + 64;
-    assert!(header[start..end]
-        .bytes()
-        .all(|byte| byte.is_ascii_hexdigit()));
+    assert!(
+        header[start..end]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    );
     bytes[80 + start..80 + end].copy_from_slice(replacement.as_bytes());
     let digest: [u8; 32] = Sha256::digest(&bytes[header_range]).into();
     bytes[48..80].copy_from_slice(&digest);
