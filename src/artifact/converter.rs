@@ -1294,6 +1294,8 @@ pub enum ConverterError {
     PeakRssExceeded { observed: u64, cap: u64 },
     /// Atomic activation would clobber an existing artifact.
     ActivationTargetExists { path: PathBuf },
+    /// Required machine receipt field was absent or malformed.
+    ReceiptField { field: &'static str, detail: String },
 }
 
 impl fmt::Display for ConverterError {
@@ -1327,6 +1329,9 @@ impl fmt::Display for ConverterError {
             Self::StagingWriteRange { name, expected_offset, observed_offset, expected_len, observed_len } => write!(formatter, "staging write {name} mismatch: expected offset/len={expected_offset}/{expected_len}, observed={observed_offset}/{observed_len}"),
             Self::PeakRssExceeded { observed, cap } => write!(formatter, "peak RSS gate exceeded: observed={observed} formula-cap={cap}"),
             Self::ActivationTargetExists { path } => write!(formatter, "refusing to overwrite existing artifact {}; quarantine it explicitly, then rerun fnlp convert", path.display()),
+            Self::ReceiptField { field, detail } => {
+                write!(formatter, "conversion receipt field {field}: {detail}")
+            }
         }
     }
 }
@@ -1492,6 +1497,32 @@ fn source_root_digest(files: &[VerifiedSourceFile]) -> Result<String, ConverterE
         hasher.update(file.name.as_bytes());
         hasher.update(file.bytes.to_le_bytes());
         hasher.update(file.sha256.as_bytes());
+    }
+    Ok(hex_lower(&hasher.finalize()))
+}
+
+fn census_digest(census: &[TensorCensusEntry]) -> Result<String, ConverterError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"fnlpq-census-v1\0");
+    let count = u64::try_from(census.len()).map_err(|_| ConverterError::Arithmetic {
+        invariant: "census tensor count",
+    })?;
+    hasher.update(count.to_le_bytes());
+    for tensor in census {
+        let name_len = u64::try_from(tensor.name.len()).map_err(|_| ConverterError::Arithmetic {
+            invariant: "census tensor name length",
+        })?;
+        hasher.update(name_len.to_le_bytes());
+        hasher.update(tensor.name.as_bytes());
+        hasher.update(tensor.dtype.as_str().as_bytes());
+        let rank = u64::try_from(tensor.shape.len()).map_err(|_| ConverterError::Arithmetic {
+            invariant: "census tensor rank",
+        })?;
+        hasher.update(rank.to_le_bytes());
+        for dimension in &tensor.shape {
+            hasher.update(dimension.to_le_bytes());
+        }
+        hasher.update(tensor.len.to_le_bytes());
     }
     Ok(hex_lower(&hasher.finalize()))
 }
