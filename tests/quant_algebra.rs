@@ -1,6 +1,7 @@
 use franken_nlp::native_engine::quant_algebra::{
-    apply_fixed_scale_order, corrected_x86_offset_dot_i32, s8_slice_to_x86_offset_u8,
-    s8_to_x86_offset_u8, signed_dot_i32, sum_int4_groups_in_fixed_order, DigestBoundRowSums,
+    apply_fixed_scale_order, corrected_x86_offset_dot_i32, offset_correction_bound,
+    offset_intermediate_bound, raw_u8_s8_bound, s8_slice_to_x86_offset_u8, s8_to_x86_offset_u8,
+    signed_dot_i32, signed_s8_s8_bound, sum_int4_groups_in_fixed_order, DigestBoundRowSums,
     EpilogueScales, PhysicalSectionDigest, QuantAlgebraError, RowSumTable, ScaleOperand,
     INT4_GROUP_SUM_ORDER, MAX_MODEL_K, MAX_OFFSET_CORRECTION_K_10752,
     MAX_OFFSET_INTERMEDIATE_K_10752, MAX_S8_S8_ACCUMULATOR_K_10752,
@@ -45,14 +46,20 @@ fn corrected_offset_dot_matches_signed_dot_at_full_domain_extremes_and_k10752() 
 
 #[test]
 fn published_k10752_integer_bounds_are_safe_with_more_than_fourfold_headroom() {
-    assert_eq!(MAX_MODEL_K as i64 * 16_384, MAX_S8_S8_ACCUMULATOR_K_10752);
     assert_eq!(
-        MAX_MODEL_K as i64 * 32_640,
+        signed_s8_s8_bound(MAX_MODEL_K),
+        MAX_S8_S8_ACCUMULATOR_K_10752
+    );
+    assert_eq!(
+        raw_u8_s8_bound(MAX_MODEL_K),
         MAX_U8_S8_RAW_ACCUMULATOR_K_10752
     );
-    assert_eq!(MAX_MODEL_K as i64 * 16_384, MAX_OFFSET_CORRECTION_K_10752);
     assert_eq!(
-        MAX_U8_S8_RAW_ACCUMULATOR_K_10752 + MAX_OFFSET_CORRECTION_K_10752,
+        offset_correction_bound(MAX_MODEL_K),
+        MAX_OFFSET_CORRECTION_K_10752
+    );
+    assert_eq!(
+        offset_intermediate_bound(MAX_MODEL_K),
         MAX_OFFSET_INTERMEDIATE_K_10752
     );
     assert!(MAX_OFFSET_INTERMEDIATE_K_10752 * 4 < i64::from(i32::MAX));

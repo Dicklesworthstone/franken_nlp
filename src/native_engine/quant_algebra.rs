@@ -31,16 +31,16 @@ pub const X86_ACTIVATION_XOR_OFFSET: u8 = 0x80;
 pub const MAX_MODEL_K: usize = 10_752;
 
 /// Full-domain `s8 * s8` accumulation bound at [`MAX_MODEL_K`].
-pub const MAX_S8_S8_ACCUMULATOR_K_10752: i64 = 176_160_768;
+pub const MAX_S8_S8_ACCUMULATOR_K_10752: i64 = signed_s8_s8_bound(MAX_MODEL_K);
 
 /// Full-domain raw `u8 * s8` accumulation bound at [`MAX_MODEL_K`].
-pub const MAX_U8_S8_RAW_ACCUMULATOR_K_10752: i64 = 350_945_280;
+pub const MAX_U8_S8_RAW_ACCUMULATOR_K_10752: i64 = raw_u8_s8_bound(MAX_MODEL_K);
 
 /// Full-domain `128 * sum(w)` correction bound at [`MAX_MODEL_K`].
-pub const MAX_OFFSET_CORRECTION_K_10752: i64 = 176_160_768;
+pub const MAX_OFFSET_CORRECTION_K_10752: i64 = offset_correction_bound(MAX_MODEL_K);
 
 /// Conservative raw-plus-correction magnitude at [`MAX_MODEL_K`].
-pub const MAX_OFFSET_INTERMEDIATE_K_10752: i64 = 527_106_048;
+pub const MAX_OFFSET_INTERMEDIATE_K_10752: i64 = offset_intermediate_bound(MAX_MODEL_K);
 
 /// Fixed physical table header: magic, version, reserved, row count, row width, digest.
 pub const ROW_SUM_TABLE_HEADER_BYTES: usize = 52;
@@ -58,6 +58,30 @@ pub const SCALE_APPLICATION_ORDER: [ScaleOperand; 4] = [
 
 /// Int4 group partials are accumulated in increasing logical group index.
 pub const INT4_GROUP_SUM_ORDER: &str = "increasing-logical-group-index-v1";
+
+/// Full-domain signed `s8 * s8` accumulation bound for a fixed K.
+#[must_use]
+pub const fn signed_s8_s8_bound(k: usize) -> i64 {
+    (k as i64) * 16_384
+}
+
+/// Full-domain raw `u8 * s8` accumulation bound for a fixed K.
+#[must_use]
+pub const fn raw_u8_s8_bound(k: usize) -> i64 {
+    (k as i64) * 32_640
+}
+
+/// Full-domain `128 * sum(w)` correction bound for a fixed K.
+#[must_use]
+pub const fn offset_correction_bound(k: usize) -> i64 {
+    (k as i64) * 16_384
+}
+
+/// Conservative raw-plus-correction intermediate bound for a fixed K.
+#[must_use]
+pub const fn offset_intermediate_bound(k: usize) -> i64 {
+    raw_u8_s8_bound(k) + offset_correction_bound(k)
+}
 
 /// A digest of one native packed section or whole packed file.
 ///
