@@ -326,7 +326,10 @@ impl ExactDecimal {
             output.push('-');
         }
         let mut characters = digits.chars();
-        output.push(characters.next().expect("nonzero coefficient has a digit"));
+        let Some(first) = characters.next() else {
+            return "0".to_owned();
+        };
+        output.push(first);
         let rest = characters.as_str();
         if !rest.is_empty() {
             output.push('.');

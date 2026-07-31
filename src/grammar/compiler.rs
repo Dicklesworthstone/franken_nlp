@@ -7,8 +7,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::schema::{
-    ExactDecimal, IntegerValue, JsonValue, ScalarValue, SchemaError, escape_json_string,
-    parse_json, pointer_index, pointer_key,
+    IntegerValue, JsonValue, ScalarValue, SchemaError, escape_json_string, parse_json,
+    pointer_index, pointer_key,
 };
 
 /// Nanbeige's vocabulary mask footprint: 166,144 legal bits / 8.
@@ -452,6 +452,25 @@ fn compile_node(
                     });
                 }
             };
+            if let Some(values) = &allowed {
+                for value in values {
+                    let ScalarValue::String(value) = value else {
+                        return Err(SchemaError::InvalidSchema {
+                            pointer: pointer.to_owned(),
+                            reason: "string enum/const contains a non-string scalar".to_owned(),
+                        });
+                    };
+                    if value.len() > max_bytes {
+                        return Err(SchemaError::Resource {
+                            pointer: pointer.to_owned(),
+                            reason: format!(
+                                "string enum/const value is {} bytes and exceeds effective maxLength {max_bytes}",
+                                value.len()
+                            ),
+                        });
+                    }
+                }
+            }
             Ok(SchemaNode::String {
                 max_bytes,
                 allowed,
@@ -768,16 +787,20 @@ fn estimate_node_inner(
             }
             Ok(output)
         }
-        SchemaNode::Array { items, .. } => {
+        SchemaNode::Array { items, max_items } => {
+            let counter_states = u64::try_from(*max_items)
+                .ok()
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(|| resource_overflow(pointer, "array counter state estimate"))?;
             add_checked(
                 &mut raw.states,
-                1,
+                counter_states,
                 pointer,
-                "array delimiter state estimate",
+                "array counter state estimate",
             )?;
             add_checked(
                 &mut raw.transitions,
-                1,
+                counter_states,
                 pointer,
                 "array item transition estimate",
             )?;
@@ -835,7 +858,10 @@ fn estimate_node_inner(
                     Ok(1)
                 }
                 SchemaNode::Object { .. } | SchemaNode::Array { .. } => {
-                    unreachable!("matched scalar node")
+                    Err(SchemaError::InvalidSchema {
+                        pointer: pointer.to_owned(),
+                        reason: "internal scalar-estimate type mismatch".to_owned(),
+                    })
                 }
             }
         }

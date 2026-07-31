@@ -1,0 +1,22 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "answer": {
+      "type": "string",
+      "enum": ["yes"]
+    },
+    "score": {
+      "type": "number",
+      "const": 1e0
+    },
+    "values": {
+      "type": "array",
+      "maxItems": 2,
+      "items": {
+        "type": "integer"
+      }
+    }
+  },
+  "required": ["answer", "score", "values"]
+}
