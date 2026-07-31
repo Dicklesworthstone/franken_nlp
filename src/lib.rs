@@ -2,8 +2,10 @@
 
 pub mod artifact;
 pub mod batch;
+pub mod canonjson;
 pub mod cli;
 pub mod error;
+pub mod execution_identity;
 pub mod grammar;
 pub mod jobs;
 pub mod native_engine;
