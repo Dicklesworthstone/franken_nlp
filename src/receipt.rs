@@ -531,12 +531,14 @@ impl Receipt {
     /// Decode only canonical `.fnlpr` bytes through the duplicate-key-rejecting
     /// repository JSON boundary.
     pub fn parse_canonical_json(input: &str) -> Result<Self, ReceiptError> {
-        let canonical = canonjson::canonicalize_str(input, canonjson::ParseLimits::default())
+        let value = canonjson::parse_str_with_limits(input, canonjson::ParseLimits::default())
+            .map_err(|error| ReceiptError::Canonical(error.to_string()))?;
+        let canonical = canonjson::canonical_bytes(&value)
             .map_err(|error| ReceiptError::Canonical(error.to_string()))?;
         if canonical.as_slice() != input.as_bytes() {
             return Err(ReceiptError::NonCanonicalBytes);
         }
-        let receipt: Self = serde_json::from_str(input)
+        let receipt: Self = serde_json::from_value(value)
             .map_err(|error| ReceiptError::Parse(error.to_string()))?;
         receipt.validate()?;
         Ok(receipt)
