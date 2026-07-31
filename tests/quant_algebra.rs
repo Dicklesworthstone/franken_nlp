@@ -1,11 +1,11 @@
 use franken_nlp::native_engine::quant_algebra::{
-    DigestBoundRowSums, EpilogueScales, INT4_GROUP_SUM_ORDER, MAX_MODEL_K,
-    MAX_OFFSET_CORRECTION_K_10752, MAX_OFFSET_INTERMEDIATE_K_10752,
-    MAX_S8_S8_ACCUMULATOR_K_10752, MAX_U8_S8_RAW_ACCUMULATOR_K_10752,
-    PhysicalSectionDigest, QuantAlgebraError, ROW_SUM_TABLE_HEADER_BYTES, RowSumTable,
-    SCALE_APPLICATION_ORDER, S8_ZERO_POINT, ScaleOperand, X86_ACTIVATION_XOR_OFFSET,
     apply_fixed_scale_order, corrected_x86_offset_dot_i32, s8_slice_to_x86_offset_u8,
-    s8_to_x86_offset_u8, signed_dot_i32, sum_int4_groups_in_fixed_order,
+    s8_to_x86_offset_u8, signed_dot_i32, sum_int4_groups_in_fixed_order, DigestBoundRowSums,
+    EpilogueScales, PhysicalSectionDigest, QuantAlgebraError, RowSumTable, ScaleOperand,
+    INT4_GROUP_SUM_ORDER, MAX_MODEL_K, MAX_OFFSET_CORRECTION_K_10752,
+    MAX_OFFSET_INTERMEDIATE_K_10752, MAX_S8_S8_ACCUMULATOR_K_10752,
+    MAX_U8_S8_RAW_ACCUMULATOR_K_10752, ROW_SUM_TABLE_HEADER_BYTES, S8_ZERO_POINT,
+    SCALE_APPLICATION_ORDER, X86_ACTIVATION_XOR_OFFSET,
 };
 
 #[test]
@@ -42,7 +42,10 @@ fn corrected_offset_dot_matches_signed_dot_at_full_domain_extremes_and_k10752() 
 #[test]
 fn published_k10752_integer_bounds_are_safe_with_more_than_fourfold_headroom() {
     assert_eq!(MAX_MODEL_K as i64 * 16_384, MAX_S8_S8_ACCUMULATOR_K_10752);
-    assert_eq!(MAX_MODEL_K as i64 * 32_640, MAX_U8_S8_RAW_ACCUMULATOR_K_10752);
+    assert_eq!(
+        MAX_MODEL_K as i64 * 32_640,
+        MAX_U8_S8_RAW_ACCUMULATOR_K_10752
+    );
     assert_eq!(MAX_MODEL_K as i64 * 16_384, MAX_OFFSET_CORRECTION_K_10752);
     assert_eq!(
         MAX_U8_S8_RAW_ACCUMULATOR_K_10752 + MAX_OFFSET_CORRECTION_K_10752,
@@ -60,7 +63,9 @@ fn digest_bound_row_sums_reject_mutated_section_and_mutated_table_before_dispatc
     let verified = binding.verify_contiguous_s8_rows(&physical).unwrap();
     let activation = [i8::MIN, -1, 0, i8::MAX];
     assert_eq!(
-        verified.corrected_x86_offset_dot_i32(0, &activation).unwrap(),
+        verified
+            .corrected_x86_offset_dot_i32(0, &activation)
+            .unwrap(),
         signed_dot_i32(&activation, &semantic_weights[..4]).unwrap()
     );
 
@@ -108,5 +113,22 @@ fn scale_and_int4_group_orders_are_explicit_and_deterministic() {
     )
     .unwrap();
     assert_eq!(result, 32.0);
+    let order_sensitive = EpilogueScales {
+        activation: 1.0e20,
+        row: 1.0e20,
+        column: 1.0e-20,
+        group: 1.0e-20,
+    };
+    assert!(matches!(
+        apply_fixed_scale_order(1, order_sensitive),
+        Err(QuantAlgebraError::NonFiniteEpilogue)
+    ));
+    let reversed = (((1.0_f32 * order_sensitive.group) * order_sensitive.column)
+        * order_sensitive.row)
+        * order_sensitive.activation;
+    assert!(
+        reversed.is_finite(),
+        "reordering must not silently be equivalent"
+    );
     assert_eq!(sum_int4_groups_in_fixed_order(&[7, -3, 9, -5]).unwrap(), 8);
 }

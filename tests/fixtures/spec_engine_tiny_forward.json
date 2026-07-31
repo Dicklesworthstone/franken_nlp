@@ -1,0 +1,25 @@
+{
+  "tokens": [1, 1],
+  "embedding": {
+    "row": 1,
+    "values": [3.0, 4.0, 0.0, 0.0]
+  },
+  "lm_head_rows": [
+    {
+      "row": 0,
+      "values": [1.0, 0.0, 0.0, 0.0]
+    },
+    {
+      "row": 1,
+      "values": [0.0, 1.0, 0.0, 0.0]
+    }
+  ],
+  "expected": {
+    "prefill_positions": 2,
+    "decode_position": 2,
+    "slot_len_after_prefill": 2,
+    "slot_len_after_decode": 3,
+    "layer_taps": 44,
+    "post_loop_norms": 2
+  }
+}

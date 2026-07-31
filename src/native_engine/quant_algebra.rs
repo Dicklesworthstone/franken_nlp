@@ -225,7 +225,11 @@ pub const fn s8_to_x86_offset_u8(qx: i8) -> u8 {
 /// Applies the canonical x86 offset transform to a logical activation vector.
 #[must_use]
 pub fn s8_slice_to_x86_offset_u8(activations: &[i8]) -> Vec<u8> {
-    activations.iter().copied().map(s8_to_x86_offset_u8).collect()
+    activations
+        .iter()
+        .copied()
+        .map(s8_to_x86_offset_u8)
+        .collect()
 }
 
 /// Exact scalar signed-domain dot, shadowed in i64 before narrowing to i32.
@@ -234,7 +238,9 @@ pub fn signed_dot_i32(activations: &[i8], weights: &[i8]) -> Result<i32, QuantAl
     let total = activations
         .iter()
         .zip(weights)
-        .fold(0_i64, |sum, (&qx, &weight)| sum + i64::from(qx) * i64::from(weight));
+        .fold(0_i64, |sum, (&qx, &weight)| {
+            sum + i64::from(qx) * i64::from(weight)
+        });
     narrow_i32("signed s8*s8 accumulator", total)
 }
 
@@ -259,9 +265,12 @@ fn corrected_x86_offset_dot_with_sum_i32(
     row_sum: i32,
 ) -> Result<i32, QuantAlgebraError> {
     require_matching_lengths("offset dot weights", activations, weights)?;
-    let raw = activations.iter().zip(weights).fold(0_i64, |sum, (&qx, &weight)| {
-        sum + i64::from(s8_to_x86_offset_u8(qx)) * i64::from(weight)
-    });
+    let raw = activations
+        .iter()
+        .zip(weights)
+        .fold(0_i64, |sum, (&qx, &weight)| {
+            sum + i64::from(s8_to_x86_offset_u8(qx)) * i64::from(weight)
+        });
     let correction = 128_i64 * i64::from(row_sum);
     let corrected = raw - correction;
     narrow_i32("corrected x86 u8*s8 accumulator", corrected)
@@ -386,7 +395,10 @@ impl DigestBoundRowSums {
     }
 
     /// Decodes a row-sum table whose section identity is supplied by its artifact mapping.
-    pub fn decode(section_id: impl Into<String>, encoded: &[u8]) -> Result<Self, QuantAlgebraError> {
+    pub fn decode(
+        section_id: impl Into<String>,
+        encoded: &[u8],
+    ) -> Result<Self, QuantAlgebraError> {
         if encoded.len() < ROW_SUM_TABLE_HEADER_BYTES {
             return Err(QuantAlgebraError::RowSumTableLength {
                 expected: ROW_SUM_TABLE_HEADER_BYTES,
@@ -406,14 +418,11 @@ impl DigestBoundRowSums {
             return Err(QuantAlgebraError::RowSumTableDimensions { rows, row_width });
         }
         let expected = ROW_SUM_TABLE_HEADER_BYTES
-            .checked_add(rows.checked_mul(4).ok_or(QuantAlgebraError::DimensionOverflow {
-                rows,
-                row_width: 4,
-            })?)
-            .ok_or(QuantAlgebraError::DimensionOverflow {
-                rows,
-                row_width,
-            })?;
+            .checked_add(
+                rows.checked_mul(4)
+                    .ok_or(QuantAlgebraError::DimensionOverflow { rows, row_width: 4 })?,
+            )
+            .ok_or(QuantAlgebraError::DimensionOverflow { rows, row_width })?;
         if encoded.len() != expected {
             return Err(QuantAlgebraError::RowSumTableLength {
                 expected,
@@ -461,7 +470,10 @@ impl DigestBoundRowSums {
                 observed: physical_section.len(),
             });
         }
-        for (row_index, packed_row) in physical_section.chunks_exact(self.table.row_width).enumerate() {
+        for (row_index, packed_row) in physical_section
+            .chunks_exact(self.table.row_width)
+            .enumerate()
+        {
             let observed = sum_packed_s8_row(packed_row)?;
             let expected = self.table.row_sums[row_index];
             if observed != expected {
@@ -569,8 +581,7 @@ fn require_matching_lengths(
 }
 
 fn checked_matrix_len(rows: usize, row_width: usize) -> Result<usize, QuantAlgebraError> {
-    rows
-        .checked_mul(row_width)
+    rows.checked_mul(row_width)
         .ok_or(QuantAlgebraError::DimensionOverflow { rows, row_width })
 }
 

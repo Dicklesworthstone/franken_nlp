@@ -4,12 +4,37 @@ mod spec_engine;
 use std::fs;
 use std::path::Path;
 
+use serde::Deserialize;
 use spec_engine::{
     DenseAttention, KvCache, NANBEIGE_HEAD_DIM, NANBEIGE_HIDDEN, NANBEIGE_INTERMEDIATE,
     NANBEIGE_KV_HEADS, NANBEIGE_QUERY_HEADS, NANBEIGE_VOCAB, PHYSICAL_LAYERS, SpecConfig,
     SpecEngine, SpecWeights, Tensor, apply_rope_split_half, dense_gqa_attention, greedy_argmax,
     kv_slot, rms_norm, silu, stable_dot,
 };
+
+#[derive(Deserialize)]
+struct TinyForwardFixture {
+    tokens: Vec<u32>,
+    embedding: TinyRow,
+    lm_head_rows: Vec<TinyRow>,
+    expected: TinyForwardExpected,
+}
+
+#[derive(Deserialize)]
+struct TinyRow {
+    row: usize,
+    values: Vec<f32>,
+}
+
+#[derive(Deserialize)]
+struct TinyForwardExpected {
+    prefill_positions: usize,
+    decode_position: usize,
+    slot_len_after_prefill: usize,
+    slot_len_after_decode: usize,
+    layer_taps: usize,
+    post_loop_norms: usize,
+}
 
 #[test]
 fn scalar_op_goldens_are_hand_checkable() {
@@ -78,49 +103,74 @@ fn real_shape_constants_preserve_explicit_head_dim_and_row_major_stride() {
 
 #[test]
 fn tiny_full_forward_has_44_taps_two_norms_and_44_slot_kv_occupancy() {
+    let fixture: TinyForwardFixture =
+        serde_json::from_str(include_str!("fixtures/spec_engine_tiny_forward.json"))
+            .expect("tiny forward fixture must remain valid JSON");
     let config = SpecConfig::tiny_for_tests();
     let mut weights = SpecWeights::zeroed(&config).unwrap();
-    weights.embeddings.set(1, 0, 3.0).unwrap();
-    weights.embeddings.set(1, 1, 4.0).unwrap();
-    weights.lm_head.set(0, 0, 1.0).unwrap();
-    weights.lm_head.set(1, 1, 1.0).unwrap();
+    for (column, value) in fixture.embedding.values.iter().copied().enumerate() {
+        weights.embeddings.set(fixture.embedding.row, column, value).unwrap();
+    }
+    for row in &fixture.lm_head_rows {
+        for (column, value) in row.values.iter().copied().enumerate() {
+            weights.lm_head.set(row.row, column, value).unwrap();
+        }
+    }
     let engine = SpecEngine::new(config.clone(), weights).unwrap();
     let mut cache = KvCache::new(&config);
 
-    let prefill = engine.prefill(&[1, 1], &mut cache).unwrap();
-    assert_eq!(prefill.len(), 2);
+    let prefill = engine.prefill(&fixture.tokens, &mut cache).unwrap();
+    assert_eq!(prefill.len(), fixture.expected.prefill_positions);
     for output in &prefill {
-        assert_eq!(output.taps.layer_taps.len(), 44);
-        assert_eq!(output.taps.post_loop_norms.len(), 2);
+        assert_eq!(output.taps.layer_taps.len(), fixture.expected.layer_taps);
+        assert_eq!(
+            output.taps.post_loop_norms.len(),
+            fixture.expected.post_loop_norms
+        );
         assert_eq!(output.taps.logits.len(), config.vocab);
     }
     for loop_index in 0..2 {
         for layer_index in 0..22 {
             let slot = kv_slot(loop_index, layer_index);
             assert_eq!(slot, layer_index + loop_index * PHYSICAL_LAYERS);
-            assert_eq!(cache.slot_len(slot).unwrap(), 2);
+            assert_eq!(
+                cache.slot_len(slot).unwrap(),
+                fixture.expected.slot_len_after_prefill
+            );
         }
     }
 
-    let decoded = engine.decode(1, &mut cache).unwrap();
-    assert_eq!(decoded.position, 2);
-    assert_eq!(decoded.taps.layer_taps.len(), 44);
+    let decoded = engine.decode(fixture.tokens[0], &mut cache).unwrap();
+    assert_eq!(decoded.position, fixture.expected.decode_position);
+    assert_eq!(decoded.taps.layer_taps.len(), fixture.expected.layer_taps);
     for slot in 0..44 {
-        assert_eq!(cache.slot_len(slot).unwrap(), 3);
+        assert_eq!(
+            cache.slot_len(slot).unwrap(),
+            fixture.expected.slot_len_after_decode
+        );
     }
 
     // Independent tiny fixture calculation: all projections are zero, so the
     // two post-loop norms are the only transformations before lm_head.
     let once = rms_norm(
-        &[3.0, 4.0, 0.0, 0.0],
+        &fixture.embedding.values,
         &[1.0; 4],
         config.rms_epsilon,
         "fixture",
     )
     .unwrap();
     let twice = rms_norm(&once, &[1.0; 4], config.rms_epsilon, "fixture").unwrap();
-    assert_close("tiny_e2e", 1, 21, 0, decoded.taps.logits[0], twice[0]);
-    assert_close("tiny_e2e", 1, 21, 1, decoded.taps.logits[1], twice[1]);
+    for row in &fixture.lm_head_rows {
+        let expected = stable_dot(&row.values, &twice, "fixture_lm_head").unwrap();
+        assert_close(
+            "tiny_e2e",
+            1,
+            21,
+            row.row,
+            decoded.taps.logits[row.row],
+            expected,
+        );
+    }
 }
 
 #[test]
