@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "model_revision": "f56ec5a9650268aa098496734743c25ea778bd2d",
+  "selection_rule": "A candidate becomes the hf-bf16-eager oracle only after a local pinned-source CPU smoke run loads remote code, observes eager attention, verifies a slow tokenizer, and reproduces the fixed greedy fixture. SDPA is a recorded variance run, never that authority.",
+  "candidates": [
+    {
+      "id": "config-hint-tf-4.42.4-torch-2.5.1-eager",
+      "transformers": "4.42.4",
+      "torch": "2.5.1",
+      "attention": "eager",
+      "role": "bounded compatibility candidate",
+      "provenance": "serialized config version field only; not a pin"
+    },
+    {
+      "id": "hf-4.51.0-torch-2.6.0-eager-cpu-aarch64-macos-py312",
+      "transformers": "4.51.0",
+      "torch": "2.6.0",
+      "attention": "eager",
+      "role": "selected hash-bound candidate pending local model smoke",
+      "provenance": "generation_config version field is a hint; exact package closure is oracle-requirements.lock"
+    },
+    {
+      "id": "hf-4.51.0-torch-2.6.0-sdpa-variance",
+      "transformers": "4.51.0",
+      "torch": "2.6.0",
+      "attention": "sdpa",
+      "role": "non-authoritative variance measurement",
+      "provenance": "records the separately scoped SDPA variance; it cannot establish hf-bf16-eager semantics"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+# Candidate selected for the CPU oracle closure.
+#
+# `oracle-requirements.lock` is generated from this file with the exact command
+# recorded in `oracle_env.json`.  Do not install this input directly: the lock
+# is the executable closure and carries every resolved package hash.
+transformers==4.51.0
+torch==2.6.0

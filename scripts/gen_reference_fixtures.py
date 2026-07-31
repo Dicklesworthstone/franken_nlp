@@ -19,6 +19,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -562,6 +563,8 @@ def write_trace_bundle(
     greedy: list[int],
     logits: Any,
     oracle_digest: str,
+    oracle_floor_sha256: str | None,
+    stable_prefix_length: int | None,
 ) -> Path:
     bundle = output_root / profile.name / f"prompt-{prompt_index:03d}"
     bundle.mkdir(parents=True, exist_ok=False)
@@ -577,6 +580,11 @@ def write_trace_bundle(
         "prompt_sha256": sha256_bytes(prompt.encode("utf-8")),
         "prompt_index": prompt_index,
         "greedy_tokens": greedy,
+        "greedy_contract": {
+            "oracle_floor_sha256": oracle_floor_sha256,
+            "stable_prefix_length": stable_prefix_length,
+            "status": "frozen" if stable_prefix_length is not None else "unbound",
+        },
         "prefill": write_phase(bundle, prefill, "prefill"),
         "append": write_phase(bundle, append, "append"),
     }
