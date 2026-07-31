@@ -33,10 +33,22 @@ pub enum Int8KernelError {
         expected: usize,
         observed: usize,
     },
-    UnsupportedModelShape { k: usize, n: usize },
-    LengthOverflow { rows: usize, columns: usize },
-    AccumulatorOverflow { operation: &'static str, k_index: usize },
-    Int4Layout { expected_weights: usize, observed_weights: usize },
+    UnsupportedModelShape {
+        k: usize,
+        n: usize,
+    },
+    LengthOverflow {
+        rows: usize,
+        columns: usize,
+    },
+    AccumulatorOverflow {
+        operation: &'static str,
+        k_index: usize,
+    },
+    Int4Layout {
+        expected_weights: usize,
+        observed_weights: usize,
+    },
 }
 
 impl fmt::Display for Int8KernelError {
@@ -54,10 +66,16 @@ impl fmt::Display for Int8KernelError {
                 write!(formatter, "unsupported fixed int8 model shape K={k}, N={n}")
             }
             Self::LengthOverflow { rows, columns } => {
-                write!(formatter, "matrix length overflows usize for rows={rows}, columns={columns}")
+                write!(
+                    formatter,
+                    "matrix length overflows usize for rows={rows}, columns={columns}"
+                )
             }
             Self::AccumulatorOverflow { operation, k_index } => {
-                write!(formatter, "i32 accumulator overflow in {operation} at K index {k_index}")
+                write!(
+                    formatter,
+                    "i32 accumulator overflow in {operation} at K index {k_index}"
+                )
             }
             Self::Int4Layout {
                 expected_weights,
@@ -88,14 +106,26 @@ pub fn dot_s8s8(input: &[i8], weights: &[i8]) -> Result<i32, Int8KernelError> {
         });
     }
     let mut accumulator = 0_i32;
+    #[cfg(debug_assertions)]
+    let mut shadow = 0_i64;
     for (k_index, (&activation, &weight)) in input.iter().zip(weights).enumerate() {
         let product = i32::from(activation) * i32::from(weight);
-        accumulator = accumulator
-            .checked_add(product)
-            .ok_or(Int8KernelError::AccumulatorOverflow {
-                operation: "s8*s8 dot",
-                k_index,
-            })?;
+        accumulator =
+            accumulator
+                .checked_add(product)
+                .ok_or(Int8KernelError::AccumulatorOverflow {
+                    operation: "s8*s8 dot",
+                    k_index,
+                })?;
+        #[cfg(debug_assertions)]
+        {
+            shadow += i64::from(activation) * i64::from(weight);
+            debug_assert_eq!(
+                i64::from(accumulator),
+                shadow,
+                "i64 shadow differs at K={k_index}"
+            );
+        }
     }
     Ok(accumulator)
 }
@@ -110,6 +140,9 @@ pub fn gemv_s8s8(input: &[i8], weights: &[i8], n: usize) -> Result<Vec<i32>, Int
             expected: expected_weights,
             observed: weights.len(),
         });
+    }
+    if k == 0 {
+        return Ok(vec![0; n]);
     }
     let mut output = Vec::with_capacity(n);
     for row in weights.chunks_exact(k) {
@@ -144,6 +177,9 @@ pub fn gemm_s8s8(
             expected: expected_weights,
             observed: weights.len(),
         });
+    }
+    if k == 0 {
+        return Ok(vec![0; checked_len(m, n)?]);
     }
     let mut output = Vec::with_capacity(checked_len(m, n)?);
     for activation_row in activations.chunks_exact(k) {
@@ -220,6 +256,10 @@ pub fn dot_u8s8_xor128(input: &[u8], weights: &[i8]) -> Result<i32, Int8KernelEr
     }
     let mut raw = 0_i32;
     let mut row_sum = 0_i32;
+    #[cfg(debug_assertions)]
+    let mut raw_shadow = 0_i64;
+    #[cfg(debug_assertions)]
+    let mut row_sum_shadow = 0_i64;
     for (k_index, (&activation, &weight)) in input.iter().zip(weights).enumerate() {
         raw = raw
             .checked_add(i32::from(activation) * i32::from(weight))
@@ -227,12 +267,28 @@ pub fn dot_u8s8_xor128(input: &[u8], weights: &[i8]) -> Result<i32, Int8KernelEr
                 operation: "u8*s8 raw dot",
                 k_index,
             })?;
-        row_sum = row_sum
-            .checked_add(i32::from(weight))
-            .ok_or(Int8KernelError::AccumulatorOverflow {
-                operation: "u8*s8 row sum",
-                k_index,
-            })?;
+        row_sum =
+            row_sum
+                .checked_add(i32::from(weight))
+                .ok_or(Int8KernelError::AccumulatorOverflow {
+                    operation: "u8*s8 row sum",
+                    k_index,
+                })?;
+        #[cfg(debug_assertions)]
+        {
+            raw_shadow += i64::from(activation) * i64::from(weight);
+            row_sum_shadow += i64::from(weight);
+            debug_assert_eq!(
+                i64::from(raw),
+                raw_shadow,
+                "raw i64 shadow differs at K={k_index}"
+            );
+            debug_assert_eq!(
+                i64::from(row_sum),
+                row_sum_shadow,
+                "row-sum i64 shadow differs at K={k_index}"
+            );
+        }
     }
     let correction = row_sum
         .checked_mul(128)
@@ -240,11 +296,19 @@ pub fn dot_u8s8_xor128(input: &[u8], weights: &[i8]) -> Result<i32, Int8KernelEr
             operation: "u8*s8 offset correction",
             k_index: input.len(),
         })?;
-    raw.checked_sub(correction)
+    let corrected = raw
+        .checked_sub(correction)
         .ok_or(Int8KernelError::AccumulatorOverflow {
             operation: "u8*s8 corrected dot",
             k_index: input.len(),
-        })
+        })?;
+    #[cfg(debug_assertions)]
+    debug_assert_eq!(
+        i64::from(corrected),
+        raw_shadow - 128_i64 * row_sum_shadow,
+        "corrected i64 shadow differs"
+    );
+    Ok(corrected)
 }
 
 const fn contains(values: &[usize], candidate: usize) -> bool {
