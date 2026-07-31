@@ -37,7 +37,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NoReturn
 
-
 ROOT = Path(__file__).resolve().parents[1]
 RUN_SCHEMA_VERSION = 1
 PREREGISTRATION_SCHEMA_VERSION = 1
