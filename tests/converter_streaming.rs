@@ -121,6 +121,27 @@ fn routed_int8_panel_preserves_the_typed_nonfinite_refusal() {
 }
 
 #[test]
+fn routed_transform_refuses_a_whole_tensor_request_before_quantization() {
+    let entry = one_row_entry("lm_head.weight");
+    let route = remap_tensor_name(&entry.name).expect("named converter route");
+
+    assert_eq!(
+        transform_routed_panel(
+            &entry,
+            &route,
+            RowPanel::WholeTensor,
+            &ONE_ROW_BF16,
+            &ONE_ROW_F32,
+        ),
+        Err(ConverterError::PipelinePlanAlignment {
+            tensor: "lm_head.weight".to_owned(),
+            detail: "routed transform requires a complete-row panel, not a whole-tensor panel"
+                .to_owned(),
+        })
+    );
+}
+
+#[test]
 fn output_range_plan_refuses_duplicate_names_and_arithmetic_overflow() {
     assert_eq!(
         OutputRangePlan::contiguous(&[("data".to_owned(), 4), ("data".to_owned(), 2)]),
