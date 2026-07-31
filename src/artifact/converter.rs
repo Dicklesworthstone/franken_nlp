@@ -1896,6 +1896,54 @@ impl CreateNewStagingFile {
     }
 }
 
+/// Let the canonical streaming envelope use the same create-new staging
+/// boundary as the converter's range writer.  The private file handle means
+/// every path through this implementation remains serial; this implementation
+/// additionally refuses an envelope that would exceed its precomputed length.
+impl Write for CreateNewStagingFile {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let requested = u64::try_from(bytes.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "streaming staging write length does not fit u64",
+            )
+        })?;
+        let end = self.next_offset.checked_add(requested).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "streaming staging write offset overflow",
+            )
+        })?;
+        if end > self.expected_file_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "streaming staging write exceeds planned file length: next_offset={} requested={} expected_file_len={}",
+                    self.next_offset, requested, self.expected_file_len
+                ),
+            ));
+        }
+        let written = self.file.write(bytes)?;
+        let written_u64 = u64::try_from(written).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "streaming staging result length does not fit u64",
+            )
+        })?;
+        self.next_offset = self.next_offset.checked_add(written_u64).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "streaming staging result offset overflow",
+            )
+        })?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
 /// Guard the activation boundary without ever falling back to a clobbering
 /// `rename`.  Existing/invalid targets are left untouched for the caller's
 /// explicit quarantine workflow; success awaits the dedicated `fs_tx`
