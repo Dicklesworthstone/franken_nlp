@@ -20,6 +20,8 @@ pub const ATTENTION_SCALE: f32 = 0.088_388_346;
 pub enum AttentionError {
     /// The full query projection did not contain all 48 explicit heads.
     QueryVectorLength { expected: usize, actual: usize },
+    /// A prefill query buffer was not an integral sequence of 48-head rows.
+    QuerySequenceShape { query_width: usize, actual: usize },
     /// A query head outside 0..48 was requested.
     QueryHeadOutOfRange { query_head: usize },
     /// A head vector did not have the explicit 128-element width.
@@ -32,6 +34,11 @@ pub enum AttentionError {
     },
     /// The fixed-shape forty-four-slot cache refused a read.
     Kv(KvCacheError),
+    /// A causal prefix extended beyond the resident K/V positions.
+    CausalPrefixUnavailable {
+        requested_positions: usize,
+        available_positions: usize,
+    },
     /// Attention has no defined reduction over an empty sequence.
     EmptySequence,
 }
@@ -142,6 +149,22 @@ pub fn eager_gqa_attention_from_cache(
     cache: &KvCache,
     slot: usize,
 ) -> Result<Vec<Bf16>, AttentionError> {
+    let sequence_len = cache.len_for_slot(slot)?;
+    eager_gqa_attention_from_cache_prefix(query, cache, slot, sequence_len)
+}
+
+/// Computes one causal GQA row against a resident prefix of a logical slot.
+///
+/// This is the common decode/prefill primitive.  Decode selects the complete
+/// resident slot; prefill selects `position + 1` for each query row.  The
+/// prefix length is explicit so a prefilled cache cannot accidentally expose
+/// future K/V positions to an earlier causal query.
+pub fn eager_gqa_attention_from_cache_prefix(
+    query: &[Bf16],
+    cache: &KvCache,
+    slot: usize,
+    sequence_len: usize,
+) -> Result<Vec<Bf16>, AttentionError> {
     let expected_query_width = QUERY_HEAD_COUNT * NANBEIGE_HEAD_DIM;
     if query.len() != expected_query_width {
         return Err(AttentionError::QueryVectorLength {
@@ -149,7 +172,13 @@ pub fn eager_gqa_attention_from_cache(
             actual: query.len(),
         });
     }
-    let sequence_len = cache.len_for_slot(slot)?;
+    let available_positions = cache.len_for_slot(slot)?;
+    if sequence_len > available_positions {
+        return Err(AttentionError::CausalPrefixUnavailable {
+            requested_positions: sequence_len,
+            available_positions,
+        });
+    }
     if sequence_len == 0 {
         return Err(AttentionError::EmptySequence);
     }
@@ -191,6 +220,48 @@ pub fn eager_gqa_attention_from_cache(
             }
             destination.copy_from_slice(&cast_f32_to_bf16(&accumulated));
         }
+    }
+    Ok(output)
+}
+
+/// Computes native causal GQA for every row in an already-populated prefill.
+///
+/// `queries` has one contiguous 48 × 128 row per cache position.  Row `n`
+/// observes exactly K/V positions `0..=n`, so the last row is the same native
+/// operation as decode after that cache position has been appended.  No 6x
+/// expanded K/V storage is built at any point.
+pub fn eager_gqa_prefill_from_cache(
+    queries: &[Bf16],
+    cache: &KvCache,
+    slot: usize,
+) -> Result<Vec<Bf16>, AttentionError> {
+    let query_width = QUERY_HEAD_COUNT * NANBEIGE_HEAD_DIM;
+    if queries.len() % query_width != 0 {
+        return Err(AttentionError::QuerySequenceShape {
+            query_width,
+            actual: queries.len(),
+        });
+    }
+    let sequence_len = cache.len_for_slot(slot)?;
+    if sequence_len == 0 {
+        return Err(AttentionError::EmptySequence);
+    }
+    let query_rows = queries.len() / query_width;
+    if query_rows != sequence_len {
+        return Err(AttentionError::CausalPrefixUnavailable {
+            requested_positions: query_rows,
+            available_positions: sequence_len,
+        });
+    }
+
+    let mut output = Vec::with_capacity(queries.len());
+    for (position, query) in queries.chunks_exact(query_width).enumerate() {
+        output.extend(eager_gqa_attention_from_cache_prefix(
+            query,
+            cache,
+            slot,
+            position + 1,
+        )?);
     }
     Ok(output)
 }
@@ -288,5 +359,45 @@ mod tests {
                 actual: 0,
             })
         );
+    }
+
+    #[test]
+    fn prefill_rows_match_the_same_cache_prefix_used_by_decode() {
+        let sequence_len = 3;
+        let slot = 0;
+        let mut cache = KvCache::try_with_capacity(sequence_len).expect("small cache reserves");
+        for position in 0..sequence_len {
+            cache
+                .append(
+                    slot,
+                    position,
+                    &cache_vector(position, 0.000_1),
+                    &cache_vector(position, 0.000_01),
+                )
+                .expect("append valid 8x128 KV vectors");
+        }
+        let query_width = QUERY_HEAD_COUNT * NANBEIGE_HEAD_DIM;
+        let queries = (0..sequence_len * query_width)
+            .map(|index| bf16_bits((index % NANBEIGE_HEAD_DIM) as f32 * 0.000_1 + 1.0))
+            .map(Bf16::from_bits)
+            .collect::<Vec<_>>();
+
+        let prefill = eager_gqa_prefill_from_cache(&queries, &cache, slot)
+            .expect("valid causal prefill cache scan");
+        for position in 0..sequence_len {
+            let start = position * query_width;
+            let decode_prefix = eager_gqa_attention_from_cache_prefix(
+                &queries[start..start + query_width],
+                &cache,
+                slot,
+                position + 1,
+            )
+            .expect("valid decode cache prefix");
+            assert_eq!(
+                &prefill[start..start + query_width],
+                decode_prefix.as_slice(),
+                "prefill position {position} must use its matching decode prefix"
+            );
+        }
     }
 }
