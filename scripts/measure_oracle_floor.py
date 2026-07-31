@@ -31,8 +31,8 @@ import random
 import re
 import struct
 import sys
-from collections.abc import Iterable
 from collections import defaultdict
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NoReturn

@@ -14,10 +14,11 @@ import json
 import re
 import sys
 import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 
 MODEL_NAME = "Nanbeige4.2-3B"
