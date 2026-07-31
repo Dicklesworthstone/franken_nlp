@@ -46,6 +46,16 @@ fn complete_nanbeige_census_loads_and_missing_shape_and_name_drift_refuse() {
         "shape",
     );
 
+    let mut wrong_dtype = complete.clone();
+    wrong_dtype.tensors[0].canonical_dtype = CanonicalDtype::F32;
+    refresh_logical_model_identity(&mut wrong_dtype);
+    assert_census_refusal(
+        write(&wrong_dtype)
+            .expect("wrong-dtype fixture writes")
+            .bytes,
+        "dtype",
+    );
+
     let mut renamed = complete;
     renamed
         .tensors
