@@ -37,7 +37,6 @@
     {"name": "serde_json", "source": "registry+https://github.com/rust-lang/crates.io-index", "version": "1.0.151"},
     {"name": "sha2", "source": "registry+https://github.com/rust-lang/crates.io-index", "version": "0.10.9"},
     {"name": "strsim", "source": "registry+https://github.com/rust-lang/crates.io-index", "version": "0.11.1"},
-    {"name": "subtle", "source": "registry+https://github.com/rust-lang/crates.io-index", "version": "2.6.1"},
     {"name": "syn", "source": "registry+https://github.com/rust-lang/crates.io-index", "version": "3.0.3"},
     {"name": "typenum", "source": "registry+https://github.com/rust-lang/crates.io-index", "version": "1.20.1"},
     {"name": "unicode-ident", "source": "registry+https://github.com/rust-lang/crates.io-index", "version": "1.0.24"},
