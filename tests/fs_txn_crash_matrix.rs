@@ -4,8 +4,8 @@ use std::path::Path;
 
 use franken_nlp::artifact::fs_tx::{
     discover_activation, open_ratified_model_root, ActivationDigest, ActivationRecord,
-    ActivationRecordBody, ChainWalkVerdict, FsTxError, NonReentrantContentLock,
-    SimulatedActivationJournal, ACTIVATION_RECORD_DOMAIN,
+    ActivationRecordBody, ChainWalkVerdict, ContentAddressLockSet, FsTxError,
+    NonReentrantContentLock, SimulatedActivationJournal, ACTIVATION_RECORD_DOMAIN,
 };
 use sha2::{Digest, Sha256};
 
@@ -457,6 +457,24 @@ fn sequence_overflow_lock_reentry_and_unratified_root_refuse_typed() {
         Err(FsTxError::PlatformSurfaceUnavailable { .. })
     ));
     eprintln!("FS_TXN case=overflow-lock-platform-refusal RESULT=PASS");
+}
+
+#[test]
+fn content_address_locks_are_independent_but_never_reentrant_per_digest() {
+    let locks = ContentAddressLockSet::default();
+    let first_digest = digest(1);
+    let second_digest = digest(2);
+    let first = locks.try_lock(first_digest).unwrap();
+    let second = locks.try_lock(second_digest).unwrap();
+    assert!(matches!(
+        locks.try_lock(first_digest),
+        Err(FsTxError::LockReentrant)
+    ));
+    drop(first);
+    assert!(locks.try_lock(first_digest).is_ok());
+    drop(second);
+    assert!(locks.try_lock(second_digest).is_ok());
+    eprintln!("FS_TXN case=content-address-locks RESULT=PASS rows=4");
 }
 
 #[test]

@@ -7,7 +7,13 @@
 //! checks.  The canonical journal core is fully implemented here so a future
 //! ratified handle has one recovery authority to call.
 
-use std::{cell::Cell, collections::BTreeSet, error::Error, fmt, path::Path};
+use std::{
+    cell::{Cell, RefCell},
+    collections::BTreeSet,
+    error::Error,
+    fmt,
+    path::Path,
+};
 
 use sha2::{Digest, Sha256};
 
@@ -661,6 +667,46 @@ pub struct ContentLockGuard<'lock> {
 impl Drop for ContentLockGuard<'_> {
     fn drop(&mut self) {
         self.held.set(false);
+    }
+}
+
+/// A process-local lock table keyed by immutable content address.
+///
+/// This test-model surface makes the intended granularity explicit: separate
+/// artifacts may make progress independently, while a second mutation scope
+/// for the same digest fails typed rather than sharing an ambiguous lock.
+#[derive(Debug, Default)]
+pub struct ContentAddressLockSet {
+    held: RefCell<BTreeSet<ActivationDigest>>,
+}
+
+impl ContentAddressLockSet {
+    /// Acquires the one non-reentrant lock associated with `content_digest`.
+    pub fn try_lock(
+        &self,
+        content_digest: ActivationDigest,
+    ) -> Result<ContentAddressLockGuard<'_>, FsTxError> {
+        if !self.held.borrow_mut().insert(content_digest) {
+            return Err(FsTxError::LockReentrant);
+        }
+        Ok(ContentAddressLockGuard {
+            held: &self.held,
+            content_digest,
+        })
+    }
+}
+
+/// RAII release for one simulated content-address lock.
+#[derive(Debug)]
+pub struct ContentAddressLockGuard<'lock> {
+    held: &'lock RefCell<BTreeSet<ActivationDigest>>,
+    content_digest: ActivationDigest,
+}
+
+impl Drop for ContentAddressLockGuard<'_> {
+    fn drop(&mut self) {
+        let removed = self.held.borrow_mut().remove(&self.content_digest);
+        debug_assert!(removed, "a content-address lock guard must release once");
     }
 }
 
