@@ -208,11 +208,35 @@ fn canonical_identity_serialization_is_frozen() {
 }
 
 #[test]
-fn notice_only_provenance_change_never_changes_execution_identity() {
+fn identity_version_and_fast_context_are_fail_closed() {
+    let mut unsupported_version = identity();
+    unsupported_version.schema_version += 1;
+    assert!(matches!(
+        unsupported_version.validate(),
+        Err(franken_nlp::execution_identity::IdentityError::InvalidSchemaVersion(2))
+    ));
+
+    let mut non_fast = identity();
+    non_fast.numerics_profile = NumericsProfile::HfBf16Eager;
+    assert!(matches!(
+        non_fast.validate(),
+        Err(franken_nlp::execution_identity::IdentityError::UnexpectedHostContext)
+    ));
+    non_fast.host_class = None;
+    non_fast.compiler_identity = None;
+    non_fast
+        .validate()
+        .expect("non-fast profiles must omit host/compiler context");
+}
+
+#[test]
+fn notice_only_provenance_change_never_changes_any_execution_projection() {
     let execution = identity();
-    let before = execution
-        .receipt_identity()
-        .expect("execution receipt identity");
+    let before = IdentityProjection::ALL.map(|projection| {
+        execution
+            .projection_key(projection)
+            .expect("execution semantic projection")
+    });
     let mut provenance = ProvenanceIdentity {
         source_root_sha256: digest("source-root"),
         fnlpq_file_sha256: digest("fnlpq-file"),
@@ -231,10 +255,14 @@ fn notice_only_provenance_change_never_changes_execution_identity() {
         provenance_before, provenance_after,
         "license bundle correction is provenance-visible"
     );
-    assert_eq!(
-        before,
-        execution
-            .receipt_identity()
-            .expect("unchanged semantic receipt")
-    );
+    for (index, projection) in IdentityProjection::ALL.into_iter().enumerate() {
+        assert_eq!(
+            before[index],
+            execution
+                .projection_key(projection)
+                .expect("unchanged semantic projection"),
+            "notice-only provenance change must not alter {}",
+            projection.name()
+        );
+    }
 }

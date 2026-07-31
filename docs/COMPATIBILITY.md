@@ -15,26 +15,26 @@ they are required there and forbidden for the other profiles.
 | schema_version | YES | YES | YES | YES | YES | Schema changes create a different canonical identity contract. |
 | source_revision | YES | YES | YES | YES | YES | Upstream source behavior is semantic authority. |
 | logical_model_digest | YES | YES | YES | YES | YES | Logical tensor bytes change model computation. |
-| artifact_format | YES | YES | YES | NO | YES | Execution package format is part of deployed semantics, not the source golden. |
-| quant_recipe | YES | YES | YES | NO | YES | Quantization changes deployed numeric behavior. |
-| packing_set_digest | YES | YES | YES | NO | YES | Packing rules can change effective execution semantics. |
+| artifact_format | YES | YES | YES | YES | YES | Execution package format is part of deployed semantics and golden replay. |
+| quant_recipe | YES | YES | YES | YES | YES | Quantization changes deployed numeric behavior. |
+| packing_set_digest | YES | YES | YES | YES | YES | Packing rules can change effective execution semantics. |
 | tokenizer_digest | YES | YES | YES | YES | YES | Token IDs and boundary behavior are authoritative. |
 | template_digest | YES | YES | YES | YES | YES | Template bytes determine model input and task behavior. |
-| task_spec | NO | YES | YES | NO | YES | Task policy changes job/output/calibration authority, not cached prefix states. |
-| taskir_digest | NO | YES | YES | NO | YES | Compiled task semantics affect job and calibration policy. |
+| task_spec | NO | YES | YES | YES | YES | Task policy changes job/output/calibration authority, not cached prefix states. |
+| taskir_digest | NO | YES | YES | YES | YES | Compiled task semantics affect job and calibration policy. |
 | prompt_digest | YES | YES | YES | YES | YES | Prompt bytes determine the prefix and comparison surface. |
 | grammar_compiler_version | YES | YES | YES | YES | YES | Compiler behavior determines constrained-decode legality. |
 | schema_digest | YES | YES | YES | YES | YES | Schema changes the constrained output language. |
 | numerics_profile | YES | YES | YES | YES | YES | Every floating or quantized comparison is profile-scoped. |
-| kv_dtype | YES | YES | YES | NO | YES | KV representation changes deployed state but not source golden bytes. |
+| kv_dtype | YES | YES | YES | YES | YES | KV representation changes deployed state and golden replay. |
 | sampler_version | NO | YES | YES | YES | YES | Sampling does not alter a cached prefix but changes generated streams. |
 | thinking_mode | YES | YES | YES | YES | YES | Thinking markers change trusted template input. |
 | tool_mode | YES | YES | YES | YES | YES | XML/JSON branches change trusted template input. |
-| calibration_digest | NO | YES | YES | NO | YES | Selected calibration changes semantic job/receipt and calibration validity. |
-| decision_policy_digest | NO | YES | YES | NO | YES | Decision policy changes task results but not the model prefix. |
+| calibration_digest | NO | YES | YES | YES | YES | Selected calibration changes semantic job/receipt, golden, and calibration validity. |
+| decision_policy_digest | NO | YES | YES | YES | YES | Decision policy changes task results but not the model prefix. |
 | backend_semantic_version | YES | YES | YES | YES | YES | Backend behavior is part of named numerical semantics. |
-| host_class | YES | YES | YES | NO | YES | Fast profiles are host-scoped; other profiles carry no host field. |
-| compiler_identity | YES | YES | YES | NO | YES | Fast profiles are compiler-scoped; other profiles carry no compiler field. |
+| host_class | YES | YES | YES | YES | YES | Fast profiles are host-scoped; other profiles carry no host field. |
+| compiler_identity | YES | YES | YES | YES | YES | Fast profiles are compiler-scoped; other profiles carry no compiler field. |
 
 ## Provenance boundary
 

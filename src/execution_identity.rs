@@ -168,7 +168,7 @@ impl ExecutionIdentity {
 
     /// Validate the version and the fast-profile host/compiler boundary.
     pub fn validate(&self) -> Result<(), IdentityError> {
-        if self.schema_version == 0 {
+        if self.schema_version != EXECUTION_IDENTITY_SCHEMA_VERSION {
             return Err(IdentityError::InvalidSchemaVersion(self.schema_version));
         }
         for (field, value) in [
@@ -540,22 +540,11 @@ impl IdentityProjection {
                 ) || (fast_profile && matches!(field, HostClass | CompilerIdentity))
             }
             Self::SemanticJob | Self::ReceiptIdentity => true,
-            Self::GoldenFixture => matches!(
-                field,
-                SchemaVersion
-                    | SourceRevision
-                    | LogicalModelDigest
-                    | TokenizerDigest
-                    | TemplateDigest
-                    | PromptDigest
-                    | GrammarCompilerVersion
-                    | SchemaDigest
-                    | NumericsProfile
-                    | SamplerVersion
-                    | ThinkingMode
-                    | ToolMode
-                    | BackendSemanticVersion
-            ),
+            // A golden is only authoritative for this complete semantic
+            // identity.  In particular, a quantized, differently packed, or
+            // differently calibrated execution must never reuse an oracle
+            // golden merely because its source model digest matches.
+            Self::GoldenFixture => true,
             Self::CalibrationArtifact => {
                 matches!(
                     field,
@@ -606,7 +595,7 @@ impl fmt::Display for IdentityError {
             Self::InvalidSchemaVersion(observed) => {
                 write!(
                     formatter,
-                    "execution identity schema version must be nonzero, observed {observed}"
+                    "execution identity schema version must equal v{EXECUTION_IDENTITY_SCHEMA_VERSION}, observed {observed}"
                 )
             }
             Self::EmptyField(field) => write!(
