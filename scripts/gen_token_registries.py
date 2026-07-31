@@ -20,7 +20,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-
 MODEL_NAME = "Nanbeige4.2-3B"
 MODEL_REVISION = "f56ec5a9650268aa098496734743c25ea778bd2d"
 VOCAB_SIZE = 166_144
@@ -644,6 +643,20 @@ def run_self_test() -> tuple[int, int]:
         loaded = unverified_source_files(source)
         specials, controls = build_registries(loaded)
         validate_registry_pair(specials, controls)
+        special_surfaces = {entry["surface"] for entry in specials["entries"]}
+        expected_specials = {"<pad>", *REQUIRED_SPECIAL_SURFACES}
+        if special_surfaces != expected_specials:
+            raise RegistryError(
+                "self-test TokenizerSpecialIds contents changed "
+                f"expected={sorted(expected_specials)!r} observed={sorted(special_surfaces)!r}"
+            )
+        control_surfaces = {entry["surface"] for entry in controls["entries"]}
+        expected_controls = special_surfaces | set(TEMPLATE_ONLY_SURFACES)
+        if control_surfaces != expected_controls:
+            raise RegistryError(
+                "self-test TemplateControlIds contents changed "
+                f"expected={sorted(expected_controls)!r} observed={sorted(control_surfaces)!r}"
+            )
         if canonical_json_bytes(specials) != canonical_json_bytes(build_registries(loaded)[0]):
             raise RegistryError("self-test canonical special-registry replay was not byte-identical")
         output = root / "out"
