@@ -1,6 +1,7 @@
 # Nanbeige4.2-3B CPU oracle closure for CPython 3.11 on macOS arm64.
 # Every artifact is a direct, hash-addressed wheel. Install only with:
 #   python -m pip install --require-hashes --no-deps -r oracle_requirements.lock
+accelerate @ https://files.pythonhosted.org/packages/63/b1/8198e3cdd11a426b1df2912e3381018c4a4a55368f6d0857ba3ca418ef93/accelerate-1.6.0-py3-none-any.whl#sha256=1aee717d3d3735ad6d09710a7c26990ee4652b79b4e93df46551551b5227c2aa
 certifi @ https://files.pythonhosted.org/packages/0b/a7/71ac2cff56fec219ed242bb11b8efb69fcc4bec75db06fb7bfe35de520e6/certifi-2026.7.22-py3-none-any.whl#sha256=62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775
 charset-normalizer @ https://files.pythonhosted.org/packages/98/2b/f97f1c193fb855c345d678f5077d6926034db0722df74c8f057020e05a25/charset_normalizer-3.4.9-py3-none-any.whl#sha256=68e5f26a1ad57ded6d1cfb85331d1c1a195314756471d97758c48498bb4dcdf5
 filelock @ https://files.pythonhosted.org/packages/c1/e8/72f8cef9fdfeffe06213fe8508039396ee48daa0e3259457ed766173bfd6/filelock-3.32.2-py3-none-any.whl#sha256=87dd94cf281e586d135fa51132b8e3d9a598b316e90377a288663c9321036c82
@@ -15,6 +16,7 @@ networkx @ https://files.pythonhosted.org/packages/9e/c9/b2622292ea83fbb4ec318f5
 numpy @ https://files.pythonhosted.org/packages/0e/0d/f5957185c0ee2f3e12f78715aa9e3b353fd83633316c8532b38faa37e3f6/numpy-2.4.6-cp311-cp311-macosx_11_0_arm64.whl#sha256=110f8b71aacb688ec69062bb7f6938a0f8acb01b7c1c4beb453c65b6d234584d
 packaging @ https://files.pythonhosted.org/packages/df/b2/87e62e8c3e2f4b32e5fe99e0b86d576da1312593b39f47d8ceef365e95ed/packaging-26.2-py3-none-any.whl#sha256=5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e
 protobuf @ https://files.pythonhosted.org/packages/dd/73/10e1661c21f139f2c6ad9b23040ff36fee624310dc28fba20d33fdae124c/protobuf-5.29.5-cp38-abi3-macosx_10_9_universal2.whl#sha256=e38c5add5a311f2a6eb0340716ef9b039c1dfa428b28f25a7838ac329204a671
+psutil @ https://files.pythonhosted.org/packages/04/8b/30f930733afe425e3cbfc0e1468a30a18942350c1a8816acfade80c005c4/psutil-7.0.0-cp36-abi3-macosx_11_0_arm64.whl#sha256=39db632f6bb862eeccf56660871433e111b6ea58f2caea825571951d4b6aa3da
 pyyaml @ https://files.pythonhosted.org/packages/16/19/13de8e4377ed53079ee996e1ab0a9c33ec2faf808a4647b7b4c0d46dd239/pyyaml-6.0.3-cp311-cp311-macosx_11_0_arm64.whl#sha256=652cb6edd41e718550aad172851962662ff2681490a8a711af6a4d288dd96824
 regex @ https://files.pythonhosted.org/packages/41/2e/2360c41d8080a3d9ec7e5c90fad6eab3b50192869d10e9a5609e48c8177b/regex-2026.7.19-cp311-cp311-macosx_11_0_arm64.whl#sha256=90c633e7e8d6bf4e992b8b36ce69e018f834b641dd6de8cea6d78c06ffa119c5
 requests @ https://files.pythonhosted.org/packages/a0/f4/c67b0b3f1b9245e8d266f0f112c500d50e5b4e83cb6f3b71b6528104182a/requests-2.34.2-py3-none-any.whl#sha256=2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0

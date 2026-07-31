@@ -2,10 +2,11 @@
   "closure_status": "candidate_pending_model_smoke",
   "closure_status_explanation": "The dependency closure and CPU/eager execution posture are immutable. The pinned source snapshot and 8.34 GB weight closure are not present in this checkout, so no smoke output or matrix verdict is claimed yet. scripts/verify_oracle_env.py records those model-gated results without overwriting this authority record.",
   "closure": {
-    "freeze_sha256": "745393eaaec94d1392278bccdaf6b292e955bd91793b28a03558f4c96ca754c6",
+    "freeze_sha256": "21ccb4eeed1b554f8e6300d1a3580f3a1ad13ca7d3c20afccf17b06654f271b3",
     "lock_path": "docs/truth-pack/oracle_requirements.lock",
-    "lock_sha256": "4fd5e7fb0f07bf9aedc2623b399285b769083162e671ab50010a5a2e9a7866a8",
+    "lock_sha256": "09bc3548e0ef18aa4a0b3a06b9b98aed196bf3a038cd94dcee4053d784f9e955",
     "packages": [
+      { "name": "accelerate", "version": "1.6.0" },
       { "name": "certifi", "version": "2026.7.22" },
       { "name": "charset-normalizer", "version": "3.4.9" },
       { "name": "filelock", "version": "3.32.2" },
@@ -20,6 +21,7 @@
       { "name": "numpy", "version": "2.4.6" },
       { "name": "packaging", "version": "26.2" },
       { "name": "protobuf", "version": "5.29.5" },
+      { "name": "psutil", "version": "7.0.0" },
       { "name": "pyyaml", "version": "6.0.3" },
       { "name": "regex", "version": "2026.7.19" },
       { "name": "requests", "version": "2.34.2" },
