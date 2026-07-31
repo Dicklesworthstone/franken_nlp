@@ -2,8 +2,8 @@
 
 use franken_nlp::native_engine::{
     kv::{
-        slot_for, KvCache, KvCacheError, KV_BYTES_PER_TOKEN, KV_ELEMENTS_PER_POSITION, KV_SLOT_COUNT,
-        LOOP_COUNT, PHYSICAL_LAYER_COUNT,
+        KV_BYTES_PER_TOKEN, KV_ELEMENTS_PER_POSITION, KV_SLOT_COUNT, KvCache, KvCacheError,
+        LOOP_COUNT, PHYSICAL_LAYER_COUNT, slot_for,
     },
     looprun::{LayerBinding, LayerExecutor, LoopRunner, PositionContext},
 };
@@ -43,7 +43,12 @@ impl LayerExecutor<u16> for RecordingExecutor {
         }
         self.key[0] = binding.kv_slot() as u16;
         self.value[0] = positions.cache_position as u16;
-        kv_cache.append(binding.kv_slot(), positions.cache_position, &self.key, &self.value)?;
+        kv_cache.append(
+            binding.kv_slot(),
+            positions.cache_position,
+            &self.key,
+            &self.value,
+        )?;
         self.layer_calls.push((
             binding.loop_index(),
             binding.layer_index(),
@@ -79,7 +84,12 @@ fn run_positions(cache: &mut KvCache, positions: std::ops::RangeInclusive<usize>
     for position in positions {
         let mut hidden = 7;
         runner
-            .run_token(&mut executor, &mut hidden, PositionContext::at(position), cache)
+            .run_token(
+                &mut executor,
+                &mut hidden,
+                PositionContext::at(position),
+                cache,
+            )
             .expect("test executor must append valid K/V values");
         executor.reset_for_token();
     }
@@ -96,7 +106,9 @@ fn looprun_kv_contract() {
         for layer_index in 0..PHYSICAL_LAYER_COUNT {
             let expected = layer_index + loop_index * PHYSICAL_LAYER_COUNT;
             assert_eq!(slot_for(loop_index, layer_index), Some(expected));
-            let binding = runner.binding(loop_index, layer_index).expect("all 44 bindings exist");
+            let binding = runner
+                .binding(loop_index, layer_index)
+                .expect("all 44 bindings exist");
             assert_eq!(binding.kv_slot(), expected);
             assert_eq!(binding.loop_index(), loop_index);
             assert_eq!(binding.layer_index(), layer_index);
@@ -128,14 +140,33 @@ fn looprun_kv_contract() {
     }
 
     let boundary = executor.boundary.expect("loop one final norm is recorded");
-    let loop_two_entry = executor.loop_two_entry.expect("loop two layer zero is recorded");
-    assert_eq!(loop_two_entry.0, boundary.0, "loop two receives the same hidden allocation");
-    assert_eq!(loop_two_entry.1, boundary.1, "loop two receives the post-norm hidden value");
-    assert_eq!(loop_two_entry.2, boundary.2, "position/mask/RoPE coordinates are reused");
-    assert_ne!(loop_two_entry.1, 7, "loop two must not re-inject the embedding");
+    let loop_two_entry = executor
+        .loop_two_entry
+        .expect("loop two layer zero is recorded");
+    assert_eq!(
+        loop_two_entry.0, boundary.0,
+        "loop two receives the same hidden allocation"
+    );
+    assert_eq!(
+        loop_two_entry.1, boundary.1,
+        "loop two receives the post-norm hidden value"
+    );
+    assert_eq!(
+        loop_two_entry.2, boundary.2,
+        "position/mask/RoPE coordinates are reused"
+    );
+    assert_ne!(
+        loop_two_entry.1, 7,
+        "loop two must not re-inject the embedding"
+    );
 
     let duplicate = cache
-        .append(0, 0, &[0; KV_ELEMENTS_PER_POSITION], &[0; KV_ELEMENTS_PER_POSITION])
+        .append(
+            0,
+            0,
+            &[0; KV_ELEMENTS_PER_POSITION],
+            &[0; KV_ELEMENTS_PER_POSITION],
+        )
         .expect_err("overwrite is not append semantics");
     assert!(matches!(
         duplicate,
@@ -146,21 +177,34 @@ fn looprun_kv_contract() {
         }
     ));
     assert!(matches!(
-        cache.append(0, 1, &[0; KV_ELEMENTS_PER_POSITION - 1], &[0; KV_ELEMENTS_PER_POSITION]),
+        cache.append(
+            0,
+            1,
+            &[0; KV_ELEMENTS_PER_POSITION - 1],
+            &[0; KV_ELEMENTS_PER_POSITION]
+        ),
         Err(KvCacheError::InvalidVectorLength { .. })
     ));
 
     let sampled_prefill_lengths = [1, 2, 3, 5, 8, 13, 21, 34, 64];
     for prefill_len in sampled_prefill_lengths {
-        let mut staged = KvCache::try_with_capacity(prefill_len + 1).expect("staged cache reserves");
+        let mut staged =
+            KvCache::try_with_capacity(prefill_len + 1).expect("staged cache reserves");
         run_positions(&mut staged, 0..=prefill_len - 1);
         run_positions(&mut staged, prefill_len..=prefill_len);
 
-        let mut one_shot = KvCache::try_with_capacity(prefill_len + 1).expect("one-shot cache reserves");
+        let mut one_shot =
+            KvCache::try_with_capacity(prefill_len + 1).expect("one-shot cache reserves");
         run_positions(&mut one_shot, 0..=prefill_len);
 
-        assert_eq!(staged, one_shot, "prefill then decode must equal one-shot prefill");
-        assert_eq!(staged.occupied_slot_positions(), KV_SLOT_COUNT * (prefill_len + 1));
+        assert_eq!(
+            staged, one_shot,
+            "prefill then decode must equal one-shot prefill"
+        );
+        assert_eq!(
+            staged.occupied_slot_positions(),
+            KV_SLOT_COUNT * (prefill_len + 1)
+        );
         assert!(staged.all_slots_have_len(prefill_len + 1));
     }
 
