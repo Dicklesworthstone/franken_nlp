@@ -11,7 +11,18 @@
 //! drive-all-no-short-circuit, preset worker/blocking observation, Lab
 //! determinism + crashpack replay, capability compile-fail suite.
 
+use std::{
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    task::{Context, Poll, Waker},
+};
+
 use asupersync::combinator::first_ok_outcomes;
+use asupersync::cx::Cx;
+use asupersync::plan::execute::capture;
 use asupersync::{Budget, CancelKind, CancelReason, CapabilityBudget, Outcome, PanicPayload};
 
 fn census(item: &str, result: &str, evidence: &str) {
@@ -222,4 +233,64 @@ fn preset_builder_values_observed_on_constructed_runtimes() {
         "observed-on-built-runtimes:current1+default4+throughput8x32+latency4x32",
     );
     println!("G0_CENSUS summary items=4 ratified=4 absent_with_fallback=0 fail=0 residual=cast-enqueue-only,try-cast-policies,execplan-first-ok,lab-determinism,compile-fail-suite");
+}
+
+/// `ExecPlan::first_ok` is not the sequential mirror fallback required by
+/// `fnlp pull`: its pinned implementation drives every child to completion
+/// before it inspects the input-ordered result vector.  This probe makes both
+/// facts observable with a completed first success and a later child whose
+/// side effect would be absent under short-circuiting.
+#[test]
+fn execplan_first_ok_drives_every_child_before_input_order_selection() {
+    let child_runs = Arc::new(AtomicUsize::new(0));
+    let first_runs = Arc::clone(&child_runs);
+    let second_runs = Arc::clone(&child_runs);
+    let third_runs = Arc::clone(&child_runs);
+    let plan = capture(move |capture| {
+        let first = capture.labeled_leaf("first-success", async move {
+            first_runs.fetch_add(1, Ordering::SeqCst);
+            10_u8
+        });
+        let second = capture.labeled_leaf("second-success", async move {
+            second_runs.fetch_add(1, Ordering::SeqCst);
+            20_u8
+        });
+        let third = capture.labeled_leaf("late-success", async move {
+            third_runs.fetch_add(1, Ordering::SeqCst);
+            30_u8
+        });
+        capture.first_ok([first, second, third], |_| true)
+    })
+    .expect("first_ok capture has a nonempty tree");
+
+    let execution_cx = Cx::for_testing();
+    let selected = poll_immediately_ready(plan.execute_scalar(&execution_cx))
+        .expect("all immediate children complete and a success is selected");
+    assert_eq!(selected, 10, "first_ok selects the first input-order success");
+    assert_eq!(
+        child_runs.load(Ordering::SeqCst),
+        3,
+        "the late child completed despite an already-complete first success"
+    );
+    println!(
+        "G0_CENSUS item=execplan-first-ok case=drive-all children_completed=3 selected_input_index=0 loser_cancelled=false"
+    );
+    census(
+        "execplan-first-ok",
+        "RATIFIED",
+        "drive-all-concurrently+input-order-selection+no-loser-cancellation",
+    );
+}
+
+fn poll_immediately_ready<F>(future: F) -> F::Output
+where
+    F: Future,
+{
+    let waker = Waker::noop();
+    let mut task_cx = Context::from_waker(waker);
+    let mut future = std::pin::pin!(future);
+    match future.as_mut().poll(&mut task_cx) {
+        Poll::Ready(output) => output,
+        Poll::Pending => panic!("immediate census futures must resolve in one poll"),
+    }
 }
