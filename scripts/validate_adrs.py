@@ -377,6 +377,24 @@ def run_self_test() -> None:
         pass
     else:
         raise AdrValidationError("duplicate-key fixture was accepted")
+    fixture_root = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "adr"
+    fully_populated = parse_metadata(fixture_root / "fully-populated-ratified.md")
+    fully_populated_issues = validate_metadata(fully_populated)
+    if fully_populated_issues:
+        raise AdrValidationError("fully populated fixture rejected: " + "; ".join(issue.render() for issue in fully_populated_issues))
+    evidence_issues = validate_evidence(fully_populated, fixture_root)
+    if not any(issue.field.endswith(".sha256") for issue in evidence_issues):
+        raise AdrValidationError("tampered-evidence fixture did not name a digest mismatch")
+    for fixture_name, field in (("missing-fallback.md", "fallback"), ("blocked-without-surface.md", "blocked_surface")):
+        fixture = parse_metadata(fixture_root / fixture_name)
+        if not any(issue.field == field for issue in validate_metadata(fixture)):
+            raise AdrValidationError(f"fixture {fixture_name} did not fail field {field}")
+    try:
+        parse_metadata(fixture_root / "duplicate-key.md")
+    except AdrValidationError:
+        pass
+    else:
+        raise AdrValidationError("duplicate-key ADR fixture was accepted")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
