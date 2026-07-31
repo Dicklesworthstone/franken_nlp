@@ -428,9 +428,9 @@ fn parse_trainer(
     let model_type =
         model_type.ok_or_else(|| missing("trainer_spec.model_type", base_offset + input.len()))?;
     if model_type != 2 {
-        return Err(model_type_context
-            .expect("model_type context set with value")
-            .error(SpmErrorKind::UnsupportedModelType { value: model_type }));
+        let context = model_type_context
+            .ok_or_else(|| missing("trainer_spec.model_type", base_offset + input.len()))?;
+        return Err(context.error(SpmErrorKind::UnsupportedModelType { value: model_type }));
     }
     Ok((
         ModelType::Bpe,
@@ -472,9 +472,9 @@ fn parse_normalizer(
     }
     let name = name.ok_or_else(|| missing("normalizer_spec.name", base_offset + input.len()))?;
     if name != "identity" {
-        return Err(name_context
-            .expect("normalizer name context set with value")
-            .error(SpmErrorKind::NonIdentityNormalizer { name }));
+        let context = name_context
+            .ok_or_else(|| missing("normalizer_spec.name", base_offset + input.len()))?;
+        return Err(context.error(SpmErrorKind::NonIdentityNormalizer { name }));
     }
     Ok(NormalizerFacts {
         name,

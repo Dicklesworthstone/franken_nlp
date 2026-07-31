@@ -150,6 +150,18 @@ fn rejects_overflow_and_truncated_lengths() {
 }
 
 #[test]
+fn rejects_trailing_garbage_after_a_complete_model() {
+    let mut input = valid_model();
+    // A zero protobuf key cannot begin another field, so it is malformed
+    // trailing data rather than an unknown field that the closed reader may
+    // safely skip.
+    input.push(0);
+    let error = parse_spm_model(&input).expect_err("trailing garbage must reject");
+    assert!(matches!(error.kind, SpmErrorKind::InvalidFieldNumber));
+    assert_context(&error);
+}
+
+#[test]
 fn rejects_conflicting_singular_and_invalid_utf8_piece_fields() {
     let mut duplicate_piece = piece(b"a", 0.0_f32.to_bits(), 1);
     add_bytes(&mut duplicate_piece, 1, b"b");
