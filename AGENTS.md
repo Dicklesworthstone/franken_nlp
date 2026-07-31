@@ -298,7 +298,9 @@ Separate the cheap, parallelizable work (writing code) from the expensive, seria
 │               → COMMIT immediately ("…— code-first, batch-test  │
 │                 pending"), leave bead in_progress               │
 │               → next bead                                       │
-│  diagnostic = reviewed commit flow + ready-pool depth            │
+│  diagnostic = commit flow + ready-pool depth (prior campaign:   │
+│               ~20–40 commits/10 min at full wave — a historical │
+│               reference point, not this project's target)       │
 └─────────────────────────────────────────────────────────────────┘
                               │  (commit-rate dip = wave saturated)
                               ▼
@@ -329,7 +331,7 @@ So the loop is not "code forever then test once at the very end"; it is a **pump
 
 ### The trigger (when to flip Phase 1 → Phase 2)
 
-**The commit-rate/ready-pool dip.** While agents have claimable work, reviewed commits and in-progress changes arrive steadily. When `br ready` empties and that flow falls, the wave is probably saturated and should move to batch verification. Prior-campaign rates are anecdotes, not a FrankenNLP throughput guarantee; the orchestrator records this campaign's own ready depth, in-flight count, commit flow, and build queue before deciding.
+**The commit-rate/ready-pool dip.** While agents have claimable work, reviewed commits and in-progress changes arrive steadily. When `br ready` empties and that flow falls, the wave is probably saturated and should move to batch verification. The prior campaign that proved this loop watched the rate fall 20 → 12 → 5 commits per 10 minutes at saturation; treat those numbers as a historical reference point for the *shape* of the dip, not a FrankenNLP throughput guarantee — the orchestrator records this campaign's own ready depth, in-flight count, commit flow, and build queue before deciding.
 
 ### Enforcement (what keeps it honest)
 
@@ -354,7 +356,7 @@ Code committed without running its tests will have failures; that is expected an
 - A coordinated build can cover several compatible changes in one wave instead of repeating the same dependency compilation per bead.
 - The intended effect is less build contention, local-fallback thrash, and disk pressure; campaign telemetry must show whether that effect materialized.
 
-Those are design hypotheses, not a 20–100× promise. Each campaign records wall time, queue time, build count, failure/rework rate, and escaped-defect rate against a representative prior or pilot wave; if batch verification increases integration failures or does not save time, shrink the wave or grant more focused build slots.
+Those are design hypotheses, not a promise: the originating campaign estimated a ~20–100× reduction in build-serialized wall time on its own workload, and that figure is retained here only as the historical motivation. Each campaign records wall time, queue time, build count, failure/rework rate, and escaped-defect rate against a representative prior or pilot wave; if batch verification increases integration failures or does not save time, shrink the wave or grant more focused build slots.
 
 ### Hard-won gotchas (baked in from prior campaigns)
 
