@@ -6,7 +6,8 @@
 //! controller-owned.
 
 use franken_nlp::artifact::converter::{
-    ConverterError, GenericPanel, StorageStage, remap_tensor_name, transform_routed_panel,
+    ConverterError, GenericPanel, OutputRange, OutputRangePlan, StorageStage, remap_tensor_name,
+    transform_routed_panel,
 };
 use franken_nlp::artifact::quantize::QuantizeError;
 use franken_nlp::artifact::safetensors::{RowPanel, SafetensorDtype, TensorCensusEntry};
@@ -116,5 +117,57 @@ fn routed_int8_panel_preserves_the_typed_nonfinite_refusal() {
             column: 2,
             bits: f32::NAN.to_bits(),
         }))
+    );
+}
+
+#[test]
+fn output_range_plan_refuses_duplicate_names_and_arithmetic_overflow() {
+    assert_eq!(
+        OutputRangePlan::contiguous(&[("data".to_owned(), 4), ("data".to_owned(), 2)]),
+        Err(ConverterError::DuplicateOutputRange {
+            name: "data".to_owned(),
+        })
+    );
+    assert_eq!(
+        OutputRangePlan::contiguous(&[("data".to_owned(), u64::MAX), ("scales".to_owned(), 1)]),
+        Err(ConverterError::Arithmetic {
+            invariant: "output range end",
+        })
+    );
+}
+
+#[test]
+fn output_range_plan_rejects_noncontiguous_or_incomplete_directories() {
+    let gap = OutputRangePlan {
+        ranges: vec![OutputRange {
+            name: "data".to_owned(),
+            offset: 4,
+            len: 1,
+        }],
+        file_len: 5,
+    };
+    assert_eq!(
+        gap.validate(),
+        Err(ConverterError::OutputRangeLayout {
+            name: "data".to_owned(),
+            expected_offset: 0,
+            actual_offset: 4,
+        })
+    );
+
+    let incomplete = OutputRangePlan {
+        ranges: vec![OutputRange {
+            name: "data".to_owned(),
+            offset: 0,
+            len: 4,
+        }],
+        file_len: 5,
+    };
+    assert_eq!(
+        incomplete.validate(),
+        Err(ConverterError::OutputFileLength {
+            expected: 4,
+            actual: 5,
+        })
     );
 }
