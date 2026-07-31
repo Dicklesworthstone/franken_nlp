@@ -1096,6 +1096,23 @@ where
     )
 }
 
+/// Observed accounting from a completed bounded BF16 panel traversal.
+///
+/// `f32_work_bytes` is the total work presented to the recipe sink over the
+/// full run, not retained memory.  The concurrent allocation remains bounded
+/// by [`PanelPlan::largest_f32_panel_bytes`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Bf16PanelStreamReport {
+    /// Number of source tensors whose complete planned panel sequence ran.
+    pub tensors: u64,
+    /// Number of source panels read and consumed.
+    pub panels: u64,
+    /// Total BF16 source bytes passed through the reader boundary.
+    pub source_bytes: u64,
+    /// Total f32 work bytes passed to the recipe sink.
+    pub f32_work_bytes: u64,
+}
+
 /// Traverse a fully prepared census in its canonical order, keeping only one
 /// source panel and its decoded f32 work panel live at a time.
 ///
@@ -1110,7 +1127,7 @@ pub fn stream_routed_bf16_panels<R, C>(
     panels: &[PanelPlan],
     mut read_panel: R,
     mut consume: C,
-) -> Result<(), ConverterError>
+) -> Result<Bf16PanelStreamReport, ConverterError>
 where
     R: FnMut(&TensorCensusEntry, RowPanel) -> Result<Vec<u8>, ConverterError>,
     C: FnMut(&TensorCensusEntry, &TensorRoute, RowPanel, &[u8], &[f32]) -> Result<(), ConverterError>,
@@ -1122,6 +1139,12 @@ where
             panels: panels.len(),
         });
     }
+    let mut report = Bf16PanelStreamReport {
+        tensors: 0,
+        panels: 0,
+        source_bytes: 0,
+        f32_work_bytes: 0,
+    };
     for ((entry, route), plan) in census.iter().zip(routes).zip(panels) {
         let expected_route = remap_tensor_name(&entry.name)?;
         if route != &expected_route {
@@ -1146,10 +1169,50 @@ where
             entry,
             plan,
             |panel| read_panel(entry, panel),
-            |panel, source_bytes, f32_work| consume(entry, route, panel, source_bytes, f32_work),
+            |panel, source_bytes, f32_work| {
+                consume(entry, route, panel, source_bytes, f32_work)?;
+                let source_bytes_len = u64::try_from(source_bytes.len()).map_err(|_| {
+                    ConverterError::Arithmetic {
+                        invariant: "routed panel source bytes to u64",
+                    }
+                })?;
+                let f32_work_bytes = u64::try_from(f32_work.len())
+                    .map_err(|_| ConverterError::Arithmetic {
+                        invariant: "routed panel f32 elements to u64",
+                    })?
+                    .checked_mul(4)
+                    .ok_or(ConverterError::Arithmetic {
+                        invariant: "routed panel f32 work bytes",
+                    })?;
+                report.panels = report
+                    .panels
+                    .checked_add(1)
+                    .ok_or(ConverterError::Arithmetic {
+                        invariant: "routed panel count",
+                    })?;
+                report.source_bytes = report
+                    .source_bytes
+                    .checked_add(source_bytes_len)
+                    .ok_or(ConverterError::Arithmetic {
+                        invariant: "routed source byte count",
+                    })?;
+                report.f32_work_bytes = report
+                    .f32_work_bytes
+                    .checked_add(f32_work_bytes)
+                    .ok_or(ConverterError::Arithmetic {
+                        invariant: "routed f32 work byte count",
+                    })?;
+                Ok(())
+            },
         )?;
+        report.tensors = report
+            .tensors
+            .checked_add(1)
+            .ok_or(ConverterError::Arithmetic {
+                invariant: "routed tensor count",
+            })?;
     }
-    Ok(())
+    Ok(report)
 }
 
 fn stream_bf16_row_panels<R, C>(
@@ -2348,7 +2411,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut observed = Vec::new();
 
-        stream_routed_bf16_panels(
+        let report = stream_routed_bf16_panels(
             &census,
             &routes,
             &panels,
@@ -2375,6 +2438,10 @@ mod tests {
         )
         .expect("the prepared route stream is serial and bounded");
 
+        assert_eq!(report.tensors, 2);
+        assert_eq!(report.panels, 5);
+        assert_eq!(report.source_bytes, 20);
+        assert_eq!(report.f32_work_bytes, 40);
         assert_eq!(
             observed,
             vec![
