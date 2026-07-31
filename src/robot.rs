@@ -268,6 +268,12 @@ struct ThreadInventoryDocument {
     thread_ceiling: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     runtime_binding: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_engine_leases: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outstanding_pool_closures: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cancelled_wrapper_closures: Option<usize>,
 }
 
 impl ThreadInventoryDocument {
@@ -282,12 +288,16 @@ impl ThreadInventoryDocument {
             total_runnable_threads: None,
             thread_ceiling: None,
             runtime_binding: None,
+            active_engine_leases: None,
+            outstanding_pool_closures: None,
+            cancelled_wrapper_closures: None,
         }
     }
 
     fn from_resources(resources: &orchestrator::EngineResources) -> Self {
         let config = resources.config();
         let inventory = resources.thread_inventory();
+        let outstanding = resources.outstanding_closure_snapshot();
         Self {
             status: "configured",
             runtime_preset: Some(config.runtime_preset.as_str()),
@@ -304,6 +314,9 @@ impl ThreadInventoryDocument {
             } else {
                 "not_compiled"
             }),
+            active_engine_leases: Some(resources.active_lease_count()),
+            outstanding_pool_closures: Some(outstanding.active_closures),
+            cancelled_wrapper_closures: Some(outstanding.wrapper_cancelled_closures),
         }
     }
 }

@@ -211,6 +211,9 @@ fn schema_and_unpopulated_commands_are_data_only_and_golden_frozen() {
                         "total_runnable_threads",
                         "thread_ceiling",
                         "runtime_binding",
+                        "active_engine_leases",
+                        "outstanding_pool_closures",
+                        "cancelled_wrapper_closures",
                     ] {
                         assert!(
                             inventory.get(field).is_some(),
@@ -221,6 +224,11 @@ fn schema_and_unpopulated_commands_are_data_only_and_golden_frozen() {
                         inventory["total_runnable_threads"].as_u64()
                             <= inventory["thread_ceiling"].as_u64(),
                         "health must not report an envelope above its fixed ceiling"
+                    );
+                    assert!(
+                        inventory["cancelled_wrapper_closures"].as_u64()
+                            <= inventory["outstanding_pool_closures"].as_u64(),
+                        "cancelled wrapper count is a subset of outstanding pool closures"
                     );
                 }
             }
