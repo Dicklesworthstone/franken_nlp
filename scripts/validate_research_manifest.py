@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import re
 import sys
@@ -208,7 +209,7 @@ def validate_archived_files(manifest: dict[str, Any], archive_root: Path) -> tup
             observed_digest = sha256_file(path)
             if observed_length != expected_length:
                 mismatches.append(f"length:{archive_text}")
-            if observed_digest != expected_digest:
+            if not hmac.compare_digest(observed_digest, expected_digest):
                 mismatches.append(f"digest:{archive_text}")
         log(
             "file="
@@ -323,7 +324,7 @@ def validate_source_replay(census_entries: list[dict[str, Any]], source_repo: Pa
         if observed_length != expected_length:
             mismatches.append(f"census_length:{relative}")
             verdict = "LENGTH_MISMATCH"
-        if observed_digest != expected_digest:
+        if not hmac.compare_digest(observed_digest, expected_digest):
             mismatches.append(f"census_digest:{relative}")
             verdict = "DIGEST_MISMATCH"
         log(
