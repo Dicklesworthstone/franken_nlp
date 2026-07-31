@@ -44,6 +44,25 @@ does not adopt a production reservation/escalation protocol. The static
 compile-fail fixture and the runtime `Cx::current()` probe are deliberately
 separate proof tracks.
 
+## Supplemental adoption boundaries
+
+The following pin-scoped ADRs consume the individual census verdicts without
+changing this aggregate record's status. Together they keep the distinction
+between an observed suite facility and a FrankenNLP product adoption explicit:
+
+| Scope | Supplemental record | Adoption boundary |
+| --- | --- | --- |
+| Capability narrowing and budgets | `ADR-OQ35-authority-and-budget.md` | No project capability aliases or project-unit conversion is adopted. |
+| Execution, cancellation, and durability | `ADR-OQ35-execution-and-durability.md` | The ordered `for`/`await` pull fallback and acknowledged durable transitions remain required. |
+| Lab and bounded-model evidence | `ADR-OQ35-lab-and-model-evidence.md` | Lab observations do not prove native-team interleavings or exhaustive exploration. |
+| Supervision and workspace substrates | `ADR-OQ35-supervision-and-substrates.md` | No supervisor, registry, or substrate crate is adopted; the generated `SUITE.lock` intentionally gains no substrate row. |
+
+In particular, the last record is an adoption note, not a lock-file mutation:
+`SUITE.lock` continues to record only the already selected optional
+`asupersync-runtime` dependency for this census. Any future substrate adoption
+requires its own product use, compatibility review, generated-lock update, and
+replayed receipt.
+
 ## Evidence and remaining gate
 
 The executable probes are committed and name their intended replay command in
