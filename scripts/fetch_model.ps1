@@ -270,7 +270,7 @@ function Download-Partial([string]$Url, [string]$Partial, [string]$Journal, $Ent
                 }
                 $effectiveUri = $response.RequestMessage.RequestUri
                 if (-not $TestBaseUrl -and -not (Test-EffectiveHost $effectiveUri)) {
-                    Write-Log "REDIRECT_HOST_REFUSED phase=post-transfer activation=refused effective_url=$effectiveUri"
+                    Write-Log "REDIRECT_HOST_REFUSED phase=post-contact-body-refused activation=refused effective_url=$effectiveUri"
                     throw "redirect host refused effective_url=$effectiveUri"
                 }
                 $input = $response.Content.ReadAsStream()

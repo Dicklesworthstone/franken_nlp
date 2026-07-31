@@ -364,7 +364,7 @@ try {
     $script:Cases++; $d11 = Join-Path $Work 'case11'; $rejected = Start-RedirectServer 'unlisted.invalid'; $case11Err = Join-Path $Work 'case11.err'
     if ($rejected) {
         $status = Invoke-RedirectPolicyFetch $d11 $rejected.ProxyPort $rejected.CaCertificate 2> $case11Err
-        if ($status -ne 0 -and -not (Test-Path -LiteralPath (Join-Path $d11 'alpha.bin')) -and (Get-Content -LiteralPath $case11Err -Raw) -match 'REDIRECT_HOST_REFUSED phase=post-transfer activation=refused effective_url=https://unlisted.invalid/') { Pass '11' 'unlisted-redirect-refusal' } else { Fail '11' "unlisted-redirect-refusal exit=$status" }
+        if ($status -ne 0 -and -not (Test-Path -LiteralPath (Join-Path $d11 'alpha.bin')) -and (Get-Content -LiteralPath $case11Err -Raw) -match 'REDIRECT_HOST_REFUSED phase=post-contact-body-refused activation=refused effective_url=https://unlisted.invalid/') { Pass '11' 'unlisted-redirect-refusal' } else { Fail '11' "unlisted-redirect-refusal exit=$status" }
     } else {
         Fail '11' 'unlisted-redirect-server'
     }
