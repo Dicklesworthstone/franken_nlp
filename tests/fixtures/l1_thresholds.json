@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "oracle_floor": {
+    "relative_path": "docs/truth-pack/oracle_floor.json",
+    "sha256": "7530b49b907e734464fa8b9bfbccdf7fec31568577ec2bc0909b48c9392ee7ef",
+    "hf_bf16_eager_run_count_per_thread": 5,
+    "hf_bf16_eager_thread_counts": [1, 10],
+    "hf_bf16_eager_margin_rule": "The recorded eager oracle floor observed zero logit spread in five fresh processes at each preregistered thread count. Exact zero thresholds are valid only for a same-operation-order replay against the frozen eager profile; a future non-zero floor requires a new row with its stated margin.",
+    "diagnostic_f32_rule": "diagnostic-f32 is a structural scalar-bisect profile, not an HF token-identity claim. Its zero thresholds govern only deterministic in-process scalar equality; they do not claim an independently measured HF nondeterminism floor."
+  },
+  "float_rows": [
+    {"operation":"rms_norm","profile":"hf-bf16-eager","max_abs":0.0,"max_rel":0.0,"max_ulp":0,"min_cosine":1.0},
+    {"operation":"rope","profile":"hf-bf16-eager","max_abs":0.0,"max_rel":0.0,"max_ulp":0,"min_cosine":1.0},
+    {"operation":"softmax","profile":"hf-bf16-eager","max_abs":0.0,"max_rel":0.0,"max_ulp":0,"min_cosine":1.0},
+    {"operation":"gqa_qk_scores","profile":"hf-bf16-eager","max_abs":0.0,"max_rel":0.0,"max_ulp":0,"min_cosine":1.0},
+    {"operation":"gqa_weighted_values","profile":"hf-bf16-eager","max_abs":0.0,"max_rel":0.0,"max_ulp":0,"min_cosine":1.0},
+    {"operation":"mlp_gate_gemv","profile":"hf-bf16-eager","max_abs":0.0,"max_rel":0.0,"max_ulp":0,"min_cosine":1.0},
+    {"operation":"mlp_up_gemv","profile":"hf-bf16-eager","max_abs":0.0,"max_rel":0.0,"max_ulp":0,"min_cosine":1.0},
+    {"operation":"swiglu","profile":"hf-bf16-eager","max_abs":0.0,"max_rel":0.0,"max_ulp":0,"min_cosine":1.0},
+    {"operation":"mlp_down_gemv","profile":"hf-bf16-eager","max_abs":0.0,"max_rel":0.0,"max_ulp":0,"min_cosine":1.0},
+    {"operation":"residual_add","profile":"hf-bf16-eager","max_abs":0.0,"max_rel":0.0,"max_ulp":0,"min_cosine":1.0},
+    {"operation":"final_norm","profile":"hf-bf16-eager","max_abs":0.0,"max_rel":0.0,"max_ulp":0,"min_cosine":1.0},
+    {"operation":"lm_head","profile":"hf-bf16-eager","max_abs":0.0,"max_rel":0.0,"max_ulp":0,"min_cosine":1.0},
+    {"operation":"rms_norm","profile":"diagnostic-f32","max_abs":0.0,"max_rel":0.0,"max_ulp":0,"min_cosine":1.0},
+    {"operation":"rope","profile":"diagnostic-f32","max_abs":0.0,"max_rel":0.0,"max_ulp":0,"min_cosine":1.0},
+    {"operation":"softmax","profile":"diagnostic-f32","max_abs":0.0,"max_rel":0.0,"max_ulp":0,"min_cosine":1.0},
+    {"operation":"gqa_qk_scores","profile":"diagnostic-f32","max_abs":0.0,"max_rel":0.0,"max_ulp":0,"min_cosine":1.0},
+    {"operation":"gqa_weighted_values","profile":"diagnostic-f32","max_abs":0.0,"max_rel":0.0,"max_ulp":0,"min_cosine":1.0},
+    {"operation":"mlp_gate_gemv","profile":"diagnostic-f32","max_abs":0.0,"max_rel":0.0,"max_ulp":0,"min_cosine":1.0},
+    {"operation":"mlp_up_gemv","profile":"diagnostic-f32","max_abs":0.0,"max_rel":0.0,"max_ulp":0,"min_cosine":1.0},
+    {"operation":"swiglu","profile":"diagnostic-f32","max_abs":0.0,"max_rel":0.0,"max_ulp":0,"min_cosine":1.0},
+    {"operation":"mlp_down_gemv","profile":"diagnostic-f32","max_abs":0.0,"max_rel":0.0,"max_ulp":0,"min_cosine":1.0},
+    {"operation":"residual_add","profile":"diagnostic-f32","max_abs":0.0,"max_rel":0.0,"max_ulp":0,"min_cosine":1.0},
+    {"operation":"final_norm","profile":"diagnostic-f32","max_abs":0.0,"max_rel":0.0,"max_ulp":0,"min_cosine":1.0},
+    {"operation":"lm_head","profile":"diagnostic-f32","max_abs":0.0,"max_rel":0.0,"max_ulp":0,"min_cosine":1.0}
+  ],
+  "integer_rows": [
+    {"operation":"embedding_gather","profile":"hf-bf16-eager"},
+    {"operation":"argmax","profile":"hf-bf16-eager"},
+    {"operation":"top_k","profile":"hf-bf16-eager"},
+    {"operation":"embedding_gather","profile":"diagnostic-f32"},
+    {"operation":"argmax","profile":"diagnostic-f32"},
+    {"operation":"top_k","profile":"diagnostic-f32"}
+  ]
+}

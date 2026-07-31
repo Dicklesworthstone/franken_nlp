@@ -8,8 +8,8 @@ use std::{
 
 use franken_nlp::{
     grammar::mask::{
-        ByteState, MaskCacheError, MaskOracleError, MaskWorkLimits, NANBEIGE_MASK_BYTES_PER_STATE,
-        SchemaMaskCache, SchemaMaskKey, VocabMaskOracle, VocabTrie,
+        ByteState, MaskCacheDisposition, MaskCacheError, MaskOracleError, MaskWorkLimits,
+        NANBEIGE_MASK_BYTES_PER_STATE, SchemaMaskCache, SchemaMaskKey, VocabMaskOracle, VocabTrie,
     },
     tokenizer::{
         bpe::{AddedToken, SpBpeTokenizer},
@@ -254,6 +254,52 @@ fn schema_cache_is_byte_bounded_and_has_no_document_key_surface() {
         .insert(key, 8, mask)
         .expect_err("second state exceeds the strict byte budget");
     assert!(matches!(error, MaskCacheError::ByteBudgetExceeded { .. }));
+}
+
+#[test]
+fn lazy_schema_cache_materializes_once_then_hits_without_trie_work() {
+    let oracle = VocabMaskOracle::new(VocabTrie::from_tokenizer(&tokenizer(), 10).unwrap());
+    let key = SchemaMaskKey {
+        tokenizer_digest: [9; 32],
+        schema_digest: [8; 32],
+        grammar_version: 1,
+    };
+    let mut cache = SchemaMaskCache::new(2);
+    let mut first_checkpoints = 0;
+    let (first, disposition) = cache
+        .get_or_materialize(
+            key,
+            3,
+            &oracle,
+            &PrefixState::new(b" a"),
+            MaskWorkLimits {
+                max_trie_node_visits: 100,
+                checkpoint_interval_nodes: 1,
+            },
+            |_| {
+                first_checkpoints += 1;
+                true
+            },
+        )
+        .expect("first schema-state mask materializes and fits");
+    assert_eq!(disposition, MaskCacheDisposition::Materialized);
+    assert!(first_checkpoints > 0);
+
+    let (second, disposition) = cache
+        .get_or_materialize(
+            key,
+            3,
+            &oracle,
+            &PrefixState::new(b"not consulted on a cache hit"),
+            MaskWorkLimits {
+                max_trie_node_visits: 1,
+                checkpoint_interval_nodes: 1,
+            },
+            |_| false,
+        )
+        .expect("cache hit bypasses both work limits and checkpoint");
+    assert_eq!(disposition, MaskCacheDisposition::Hit);
+    assert_eq!(second, first);
 }
 
 #[test]

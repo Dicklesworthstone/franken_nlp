@@ -337,6 +337,13 @@ pub struct MaskCacheStats {
     pub capacity_bytes: usize,
 }
 
+/// Whether a schema-only mask came from the cache or a fresh trie walk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaskCacheDisposition {
+    Hit,
+    Materialized,
+}
+
 /// Byte-budgeted cache of immutable schema masks only.
 #[derive(Clone, Debug)]
 pub struct SchemaMaskCache {
@@ -362,6 +369,35 @@ impl SchemaMaskCache {
             .get(&key)
             .and_then(|states| states.get(&schema_state_id))
             .cloned()
+    }
+
+    /// Lazily materialize and cache exactly one reusable schema state.
+    ///
+    /// A hit returns before invoking the checkpoint, while a miss cannot be
+    /// observed until the full trie walk and strict byte-budget admission both
+    /// succeed.  Request/source state is deliberately absent from this API.
+    pub fn get_or_materialize<S, F>(
+        &mut self,
+        key: SchemaMaskKey,
+        schema_state_id: u32,
+        oracle: &VocabMaskOracle,
+        schema_state: &S,
+        limits: MaskWorkLimits,
+        checkpoint: F,
+    ) -> Result<(DenseTokenMask, MaskCacheDisposition), MaskCacheMaterializationError>
+    where
+        S: ByteState,
+        F: FnMut(MaskWorkProgress) -> bool,
+    {
+        if let Some(mask) = self.get(key, schema_state_id) {
+            return Ok((mask, MaskCacheDisposition::Hit));
+        }
+        let mask = oracle
+            .materialize(schema_state, limits, checkpoint)
+            .map_err(MaskCacheMaterializationError::Oracle)?;
+        self.insert(key, schema_state_id, mask.clone())
+            .map_err(MaskCacheMaterializationError::Cache)?;
+        Ok((mask, MaskCacheDisposition::Materialized))
     }
 
     /// Admit one schema-only mask, replacing an existing same-key state mask.
@@ -528,6 +564,32 @@ impl fmt::Display for MaskCacheError {
 }
 
 impl Error for MaskCacheError {}
+
+/// Lazy materialization failed either before a complete mask existed or during
+/// schema-only cache admission.  It never returns a partial legal set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MaskCacheMaterializationError {
+    Oracle(MaskOracleError),
+    Cache(MaskCacheError),
+}
+
+impl fmt::Display for MaskCacheMaterializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Oracle(error) => write!(formatter, "mask materialization failed: {error}"),
+            Self::Cache(error) => write!(formatter, "mask-cache admission failed: {error}"),
+        }
+    }
+}
+
+impl Error for MaskCacheMaterializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Oracle(error) => Some(error),
+            Self::Cache(error) => Some(error),
+        }
+    }
+}
 
 /// The compiler's fixed Nanbeige dense-mask size is retained here as an
 /// explicit cross-check for integrations that bind the standard model width.
