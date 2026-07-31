@@ -572,23 +572,30 @@ pub fn diagnostic_f32_metrics(
     let mut max_abs = 0.0_f32;
     let mut max_rel = 0.0_f32;
     let mut max_ulp = 0_u32;
-    let mut dot = 0.0_f32;
-    let mut reference_norm = 0.0_f32;
-    let mut observed_norm = 0.0_f32;
+    // Keep this reporting calculation higher precision than the compared values.
+    // In particular, an f32 dot product and two independently rounded f32 norms can
+    // otherwise make a bit-identical vector report a cosine just below one.
+    let mut dot = 0.0_f64;
+    let mut reference_norm = 0.0_f64;
+    let mut observed_norm = 0.0_f64;
     for (&left, &right) in reference.iter().zip(observed) {
         max_abs = max_abs.max((left - right).abs());
         max_rel = max_rel.max((left - right).abs() / left.abs().max(f32::MIN_POSITIVE));
         max_ulp = max_ulp.max(ordered_f32_bits(left).abs_diff(ordered_f32_bits(right)));
-        dot += left * right;
-        reference_norm += left * left;
-        observed_norm += right * right;
+        let left_f64 = f64::from(left);
+        let right_f64 = f64::from(right);
+        dot += left_f64 * right_f64;
+        reference_norm += left_f64 * left_f64;
+        observed_norm += right_f64 * right_f64;
     }
-    let cosine = if reference_norm == 0.0 && observed_norm == 0.0 {
+    let cosine = if max_ulp == 0 {
+        1.0
+    } else if reference_norm == 0.0 && observed_norm == 0.0 {
         1.0
     } else if reference_norm == 0.0 || observed_norm == 0.0 {
         0.0
     } else {
-        dot / (reference_norm.sqrt() * observed_norm.sqrt())
+        (dot / (reference_norm.sqrt() * observed_norm.sqrt())) as f32
     };
     Ok(DiagnosticF32Metrics {
         max_abs,

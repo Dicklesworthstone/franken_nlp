@@ -145,6 +145,17 @@ fn diagnostic_f32_is_single_widen_structural_bisect_oracle() {
     assert!(metrics.max_ulp > 0);
     assert!(metrics.cosine > 0.99);
 
+    let exact_metrics = diagnostic_f32_metrics(
+        &[0.00390625, -123.75, 8192.5, -0.03125],
+        &[0.00390625, -123.75, 8192.5, -0.03125],
+    )
+    .expect("bit-identical f32 metric vectors");
+    assert_eq!(exact_metrics.max_ulp, 0);
+    assert_eq!(
+        exact_metrics.cosine, 1.0,
+        "bit-identical vectors must report an exact cosine of one"
+    );
+
     let mut mis_slotted_cache_tap = first.clone();
     mis_slotted_cache_tap.taps.layer_taps[7].output[0] += 1.0;
     assert_eq!(
