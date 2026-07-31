@@ -91,6 +91,30 @@ impl RuntimePreset {
     }
 }
 
+/// Bounded runtime guardrails applied to the one process host.
+///
+/// These are concrete asupersync defaults observed at the selected pin, kept
+/// explicit so scheduler receipts can report the actual cancellation and
+/// checkpoint-monitor envelope rather than a preset name alone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeGuardrails {
+    pub deadline_check_interval_millis: u64,
+    pub checkpoint_timeout_millis: u64,
+    pub cancel_attribution_max_depth: usize,
+    pub cancel_attribution_max_memory_bytes: usize,
+}
+
+impl RuntimeGuardrails {
+    /// The pinned defaults: 1s monitor checks, 30s checkpoint stall warning,
+    /// and the finite 16-deep / 4096-byte cancellation attribution envelope.
+    pub const PINNED_DEFAULTS: Self = Self {
+        deadline_check_interval_millis: 1_000,
+        checkpoint_timeout_millis: 30_000,
+        cancel_attribution_max_depth: 16,
+        cancel_attribution_max_memory_bytes: 4_096,
+    };
+}
+
 /// The independently counted components of the process runnable-thread bound.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ThreadInventory {
@@ -893,8 +917,16 @@ struct RuntimeHost {
 
 #[cfg(feature = "asupersync-runtime")]
 impl RuntimeHost {
-    fn build(config: ResourceHostConfig) -> Result<Self, RuntimeHostError> {
-        use asupersync::runtime::RuntimeBuilder;
+    fn build(
+        config: ResourceHostConfig,
+        guardrails: RuntimeGuardrails,
+    ) -> Result<Self, RuntimeHostError> {
+        use std::time::Duration;
+
+        use asupersync::{
+            runtime::RuntimeBuilder,
+            types::CancelAttributionConfig,
+        };
 
         let builder = match config.runtime_preset {
             RuntimePreset::CurrentThread => RuntimeBuilder::current_thread(),
@@ -906,7 +938,29 @@ impl RuntimeHost {
         // is independently counted in the thread inventory above.
         .blocking_threads(1, config.max_blocking_coordinators)
         .on_thread_start(mark_runtime_worker_started)
-        .on_thread_stop(mark_runtime_worker_stopped);
+        .on_thread_stop(mark_runtime_worker_stopped)
+        .cancel_attribution_config(CancelAttributionConfig::new(
+            guardrails.cancel_attribution_max_depth,
+            guardrails.cancel_attribution_max_memory_bytes,
+        ))
+        .deadline_monitoring(move |monitor| {
+            monitor
+                .enabled(true)
+                .check_interval(Duration::from_millis(
+                    guardrails.deadline_check_interval_millis,
+                ))
+                .checkpoint_timeout(Duration::from_millis(
+                    guardrails.checkpoint_timeout_millis,
+                ))
+                .on_warning(|warning| {
+                    eprintln!(
+                        "ENGINE_RESOURCES DEADLINE_WARNING reason={:?} last_checkpoint={:?} checkpoint_history_entries={}",
+                        warning.reason,
+                        warning.last_checkpoint_message,
+                        warning.checkpoint_history.len(),
+                    );
+                })
+        });
         let runtime = builder
             .build()
             .map_err(|error| RuntimeHostError::RuntimeBuild {
@@ -937,6 +991,7 @@ impl fmt::Debug for RuntimeHost {
 pub struct EngineResources {
     config: ResourceHostConfig,
     thread_inventory: ThreadInventory,
+    guardrails: RuntimeGuardrails,
     memory: Arc<MemoryLedger>,
     next_lease_id: AtomicU64,
     leases: Mutex<LeaseState>,
@@ -951,11 +1006,13 @@ impl EngineResources {
         config: ResourceHostConfig,
         thread_inventory: ThreadInventory,
     ) -> Result<Self, RuntimeHostError> {
+        let guardrails = RuntimeGuardrails::PINNED_DEFAULTS;
         #[cfg(feature = "asupersync-runtime")]
-        let runtime = RuntimeHost::build(config)?;
+        let runtime = RuntimeHost::build(config, guardrails)?;
         Ok(Self {
             config,
             thread_inventory,
+            guardrails,
             memory: Arc::new(MemoryLedger::new(
                 config.memory_ceiling_bytes,
                 config.leak_response_policy,
@@ -977,6 +1034,12 @@ impl EngineResources {
     /// Complete runnable-thread accounting used by future health/receipt code.
     pub const fn thread_inventory(&self) -> ThreadInventory {
         self.thread_inventory
+    }
+
+    /// The finite deadline-monitor and cancellation-attribution limits bound
+    /// into this process host.
+    pub const fn runtime_guardrails(&self) -> RuntimeGuardrails {
+        self.guardrails
     }
 
     /// Current aggregate memory charge snapshot.
@@ -1393,6 +1456,17 @@ mod tests {
         assert_eq!(inventory.scoped_cpu_children_per_coordinator, 3);
         assert_eq!(inventory.helper_threads, 1);
         assert_eq!(inventory.total_runnable_threads, 13);
+    }
+
+    #[test]
+    fn pinned_guardrails_are_finite_and_nonzero() {
+        let guardrails = RuntimeGuardrails::PINNED_DEFAULTS;
+        assert!(guardrails.deadline_check_interval_millis > 0);
+        assert!(guardrails.checkpoint_timeout_millis > 0);
+        assert!(guardrails.cancel_attribution_max_depth > 0);
+        assert!(guardrails.cancel_attribution_max_memory_bytes > 0);
+        assert!(guardrails.cancel_attribution_max_depth < usize::MAX);
+        assert!(guardrails.cancel_attribution_max_memory_bytes < usize::MAX);
     }
 
     #[test]
