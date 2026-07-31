@@ -62,6 +62,86 @@ pub struct ReceiptReplay {
     pub retention_policy: ReceiptRetention,
 }
 
+/// The outcome observed for the named receipt operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunDisposition {
+    Ok,
+    Err,
+    Cancelled,
+    Panicked,
+}
+
+/// Reproduction material required for a scheduler or concurrency failure.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct FailureReplay {
+    pub crashpack_id: String,
+    pub lab_seed: String,
+    pub replay_command: Vec<String>,
+    pub trace_fingerprint: Sha256Digest,
+}
+
+/// Caller-provided operation facts used to build a [`ReceiptRun`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReceiptRunSpec {
+    pub operation: String,
+    pub disposition: RunDisposition,
+    pub failure_replay: Option<FailureReplay>,
+}
+
+/// Stable run facts derived from the one execution identity plus its outcome.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ReceiptRun {
+    pub operation: String,
+    pub disposition: RunDisposition,
+    pub source_revision: String,
+    pub numerics_profile: String,
+    pub recipe_id: String,
+    pub prompt_template_sha256: Sha256Digest,
+    pub fixture_digests: Vec<Sha256Digest>,
+    pub failure_replay: Option<FailureReplay>,
+}
+
+impl ReceiptRun {
+    fn from_execution(
+        spec: ReceiptRunSpec,
+        execution: &ExecutionIdentity,
+        fixture_digests: Vec<Sha256Digest>,
+    ) -> Self {
+        Self {
+            operation: spec.operation,
+            disposition: spec.disposition,
+            source_revision: execution.source_revision.clone(),
+            numerics_profile: execution.numerics_profile.label(),
+            recipe_id: execution.quant_recipe.clone(),
+            prompt_template_sha256: execution.template_digest,
+            fixture_digests,
+            failure_replay: spec.failure_replay,
+        }
+    }
+
+    fn validate(&self, grade: ReceiptGrade) -> Result<(), ReceiptError> {
+        validate_identifier("run.operation", &self.operation)?;
+        validate_authority("run.source_revision", &self.source_revision)?;
+        validate_authority("run.numerics_profile", &self.numerics_profile)?;
+        validate_authority("run.recipe_id", &self.recipe_id)?;
+        if let Some(failure) = &self.failure_replay {
+            if grade != ReceiptGrade::StructuralReplay || self.disposition == RunDisposition::Ok {
+                return Err(ReceiptError::InvalidFailureReplay);
+            }
+            validate_identifier("run.failure_replay.crashpack_id", &failure.crashpack_id)?;
+            validate_authority("run.failure_replay.lab_seed", &failure.lab_seed)?;
+            if failure.replay_command.is_empty() {
+                return Err(ReceiptError::InvalidFailureReplay);
+            }
+            for command_part in &failure.replay_command {
+                validate_authority("run.failure_replay.replay_command", command_part)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The domain used to prevent input, output, and configuration commitments
 /// from being interchangeable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -355,6 +435,7 @@ pub struct ReceiptArtifacts {
     pub release_manifest_sha256: Sha256Digest,
     pub license_bundle_sha256: Sha256Digest,
     pub fnlpq_file_sha256: Sha256Digest,
+    pub provenance_receipt: Sha256Digest,
 }
 
 /// Code provenance retained separately from semantic identity.
@@ -371,17 +452,12 @@ pub struct Receipt {
     pub completeness_grade: ReceiptGrade,
     pub replay: ReceiptReplay,
     pub identity: ReceiptIdentity,
-    pub provenance_identity: Sha256Digest,
-    pub source_revision: String,
-    pub artifacts: ReceiptArtifacts,
+    pub artifact: ReceiptArtifacts,
     pub code: ReceiptCodeIdentity,
-    pub numerics_profile: String,
-    pub recipe_id: String,
-    pub prompt_template_sha256: Sha256Digest,
-    pub fixture_digests: Vec<Sha256Digest>,
     pub content: ReceiptContent,
     pub checks: Vec<ReceiptCheck>,
     pub evidence: Vec<ReceiptEvidence>,
+    pub run: ReceiptRun,
 }
 
 impl Receipt {
@@ -390,6 +466,7 @@ impl Receipt {
     pub fn from_identities(
         completeness_grade: ReceiptGrade,
         replay: ReceiptReplay,
+        run_spec: ReceiptRunSpec,
         identity_disclosure: IdentityDisclosure,
         identity_commitment_key: Option<&CommitmentKey>,
         execution: &ExecutionIdentity,
@@ -410,26 +487,22 @@ impl Receipt {
                 identity_commitment_key,
                 execution,
             )?,
-            provenance_identity: provenance
-                .receipt_digest()
-                .map_err(ReceiptError::Identity)?,
-            source_revision: execution.source_revision.clone(),
-            artifacts: ReceiptArtifacts {
+            artifact: ReceiptArtifacts {
                 source_root_sha256: provenance.source_root_sha256,
                 logical_model_sha256: execution.logical_model_digest,
                 packing_set_sha256: execution.packing_set_digest,
                 release_manifest_sha256: provenance.release_manifest_sha256,
                 license_bundle_sha256: provenance.license_bundle_sha256,
                 fnlpq_file_sha256: provenance.fnlpq_file_sha256,
+                provenance_receipt: provenance
+                    .receipt_digest()
+                    .map_err(ReceiptError::Identity)?,
             },
             code,
-            numerics_profile: execution.numerics_profile.label(),
-            recipe_id: execution.quant_recipe.clone(),
-            prompt_template_sha256: execution.template_digest,
-            fixture_digests,
             content,
             checks,
             evidence,
+            run: ReceiptRun::from_execution(run_spec, execution, fixture_digests),
         };
         receipt.validate()?;
         Ok(receipt)
@@ -451,9 +524,7 @@ impl Receipt {
         validate_replay(self.completeness_grade, &self.replay)?;
         validate_commit("binary_commit", &self.code.binary_commit)?;
         validate_commit("converter_commit", &self.code.converter_commit)?;
-        validate_authority("source_revision", &self.source_revision)?;
-        validate_authority("numerics_profile", &self.numerics_profile)?;
-        validate_authority("recipe_id", &self.recipe_id)?;
+        self.run.validate(self.completeness_grade)?;
         if self.checks.is_empty() {
             return Err(ReceiptError::MissingChecks);
         }
@@ -488,6 +559,7 @@ pub enum ReceiptError {
     ReplayMetadata {
         grade: ReceiptGrade,
     },
+    InvalidFailureReplay,
     MissingIdentityCommitmentKey,
     InvalidIdentityDisclosure {
         disclosure: IdentityDisclosure,
@@ -517,6 +589,9 @@ impl fmt::Display for ReceiptError {
             Self::ReplayMetadata { grade } => write!(
                 formatter,
                 "receipt grade {grade:?} has incompatible replay command or missing requirements"
+            ),
+            Self::InvalidFailureReplay => formatter.write_str(
+                "failure replay requires a non-success structural-replay receipt with a command",
             ),
             Self::MissingIdentityCommitmentKey => {
                 formatter.write_str("committed receipt identity requires an HMAC key")
@@ -776,6 +851,14 @@ mod tests {
         }
     }
 
+    fn run_spec() -> ReceiptRunSpec {
+        ReceiptRunSpec {
+            operation: "receipt-fixture".to_owned(),
+            disposition: RunDisposition::Ok,
+            failure_replay: None,
+        }
+    }
+
     #[test]
     fn hmac_sha256_matches_rfc_4231_case_one() {
         let output = hmac_sha256(&[0x0b; 20], b"Hi There");
@@ -808,6 +891,7 @@ mod tests {
                 },
                 &["private-input"],
             ),
+            run_spec(),
             IdentityDisclosure::Committed,
             Some(&key),
             &execution,
@@ -850,6 +934,7 @@ mod tests {
                 },
                 &[],
             ),
+            run_spec(),
             IdentityDisclosure::Public,
             None,
             &execution(),
@@ -876,6 +961,7 @@ mod tests {
                 },
                 &["private-input"],
             ),
+            run_spec(),
             IdentityDisclosure::Committed,
             None,
             &execution(),
