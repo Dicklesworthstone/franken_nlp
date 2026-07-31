@@ -63,8 +63,6 @@ struct ManifestDependency {
     kind: Option<String>,
     #[serde(default)]
     optional: bool,
-    #[serde(default)]
-    source: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -315,7 +313,37 @@ fn synthetic_metadata_excludes_dev_only_dependencies_from_release_graph() {
     assert!(!report.release_packages.contains("rayon"));
 }
 
+#[test]
+fn immutable_optional_suite_pin_is_read_from_manifest_not_metadata_source() {
+    const REVISION: &str = "362dc5b174427f66cfa76ab2bdd68cce1a95c6cc";
+    let manifest = r#"
+        [dependencies]
+        asupersync = { git = "https://github.com/Dicklesworthstone/asupersync.git", rev = "362dc5b174427f66cfa76ab2bdd68cce1a95c6cc", optional = true }
+    "#;
+
+    let Some((git, revision)) = manifest_git_revision(manifest, "asupersync") else {
+        panic!("an optional Suite dependency must be read from Cargo.toml");
+    };
+    assert_eq!(git, "https://github.com/Dicklesworthstone/asupersync.git");
+    assert_eq!(revision, REVISION);
+    assert!(is_immutable_git_revision(git, revision));
+}
+
+#[test]
+fn manifest_suite_pin_rejects_non_immutable_revision() {
+    let manifest = r#"
+        [dependencies]
+        asupersync = { git = "https://github.com/Dicklesworthstone/asupersync.git", rev = "362dc5b", optional = true }
+    "#;
+
+    let Some((git, revision)) = manifest_git_revision(manifest, "asupersync") else {
+        panic!("the malformed fixture must still parse its git and rev fields");
+    };
+    assert!(!is_immutable_git_revision(git, revision));
+}
+
 fn current_policy(root: &Path) -> Result<PolicyReport, PolicyFailure> {
+    validate_declared_suite_pins(root)?;
     let metadata = cargo_metadata(root)?;
     let cargo_tree = cargo_tree(root)?;
     let lock_packages = cargo_lock_packages(root)?;
@@ -561,13 +589,6 @@ fn validate_direct_dependency(
             detail: "direct release dependency is outside the three commodity families and pinned FrankenSuite".to_owned(),
         });
     }
-    if SUITE_ROOTS.contains(&name) && !is_immutable_git_pin(dependency.source.as_deref()) {
-        return Err(PolicyFailure {
-            offending_crate: dependency.name.clone(),
-            full_path: dependency_path.to_owned(),
-            detail: "FrankenSuite dependency is not pinned to an immutable Git revision".to_owned(),
-        });
-    }
     Ok(())
 }
 
@@ -599,16 +620,78 @@ fn is_allocator_crate(name: &str) -> bool {
         )
 }
 
-fn is_immutable_git_pin(source: Option<&str>) -> bool {
-    let Some(source) = source else {
-        return false;
-    };
-    let Some((_, revision)) = source.rsplit_once('#') else {
-        return false;
-    };
-    source.starts_with("git+")
-        && revision.len() == 40
-        && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+fn validate_declared_suite_pins(root: &Path) -> Result<(), PolicyFailure> {
+    let manifest_path = root.join("Cargo.toml");
+    let manifest = fs::read_to_string(&manifest_path).map_err(|error| PolicyFailure {
+        offending_crate: "Cargo.toml".to_owned(),
+        full_path: manifest_path.display().to_string(),
+        detail: format!("cannot read manifest: {error}"),
+    })?;
+
+    for dependency in SUITE_ROOTS {
+        let Some((git, revision)) = manifest_git_revision(&manifest, dependency) else {
+            return Err(PolicyFailure {
+                offending_crate: (*dependency).to_owned(),
+                full_path: manifest_path.display().to_string(),
+                detail: "FrankenSuite dependency must declare inline `git` and immutable 40-hex `rev` fields in Cargo.toml".to_owned(),
+            });
+        };
+        if !is_immutable_git_revision(git, revision) {
+            return Err(PolicyFailure {
+                offending_crate: (*dependency).to_owned(),
+                full_path: manifest_path.display().to_string(),
+                detail: "FrankenSuite dependency must declare a Git URL and immutable 40-hex `rev` in Cargo.toml".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn manifest_git_revision<'a>(manifest: &'a str, dependency: &str) -> Option<(&'a str, &'a str)> {
+    let declaration = manifest_dependency_declaration(manifest, dependency)?;
+    Some((
+        quoted_inline_attribute(declaration, "git")?,
+        quoted_inline_attribute(declaration, "rev")?,
+    ))
+}
+
+fn manifest_dependency_declaration<'a>(manifest: &'a str, dependency: &str) -> Option<&'a str> {
+    let mut in_dependencies = false;
+    for raw_line in manifest.lines() {
+        let line = raw_line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_dependencies = line == "[dependencies]";
+            continue;
+        }
+        if !in_dependencies {
+            continue;
+        }
+        let Some(suffix) = line.strip_prefix(dependency) else {
+            continue;
+        };
+        if suffix.trim_start().starts_with('=') {
+            return Some(line);
+        }
+    }
+    None
+}
+
+fn quoted_inline_attribute<'a>(declaration: &'a str, attribute: &str) -> Option<&'a str> {
+    declaration
+        .split_once('{')?
+        .1
+        .split(',')
+        .map(str::trim)
+        .find_map(|field| {
+            let value = field.strip_prefix(attribute)?.trim_start();
+            let value = value.strip_prefix('=')?.trim_start();
+            let value = value.strip_prefix('\"')?;
+            value.split_once('\"').map(|(value, _)| value)
+        })
+}
+
+fn is_immutable_git_revision(git: &str, revision: &str) -> bool {
+    !git.is_empty() && revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn root_package(metadata: &Metadata) -> Result<&Package, PolicyFailure> {
@@ -689,11 +772,7 @@ fn package_by_id<'a>(metadata: &'a Metadata, id: &str) -> Option<&'a Package> {
     metadata.packages.iter().find(|package| package.id == id)
 }
 
-fn full_path_to_named_package(
-    metadata: &Metadata,
-    cargo_tree: &str,
-    name: &str,
-) -> Option<String> {
+fn full_path_to_named_package(metadata: &Metadata, cargo_tree: &str, name: &str) -> Option<String> {
     let target = release_package_ids(metadata, cargo_tree)
         .ok()?
         .into_iter()
