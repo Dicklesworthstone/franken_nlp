@@ -1,8 +1,22 @@
 {
   "admission": {
-    "committed_bytes": 10000000000,
-    "outcome": "admitted",
-    "peak_bytes": 9500000000
+    "above_cap": {
+      "outcome": "rejected",
+      "rejection": "context_cap_exceeded",
+      "tokens": 32769
+    },
+    "at_cap": {
+      "committed_bytes": 10000000000,
+      "outcome": "admitted",
+      "peak_bytes": 9500000000,
+      "tokens": 32768
+    },
+    "below_cap": {
+      "committed_bytes": 9990000000,
+      "outcome": "admitted",
+      "peak_bytes": 9490000000,
+      "tokens": 32767
+    }
   },
   "artifact": {
     "kernel_table_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",

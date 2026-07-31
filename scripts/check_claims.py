@@ -72,7 +72,9 @@ R4_COMMON_RECEIPT_KEYS = {
 R4_ARTIFACT_KEYS = {"kernel_table_sha256", "load_mode", "packing_sha256", "recipe_id"}
 R4_CONTEXT_KEYS = {"kv_dtype", "tokens"}
 R4_MEASUREMENT_KEYS = {"decode_tokens_per_s", "kv_bytes", "peak_rss_bytes", "prefill_ms"}
-R4_ADMISSION_KEYS = {"committed_bytes", "outcome", "peak_bytes"}
+R4_ADMISSION_KEYS = {"at_cap", "above_cap", "below_cap"}
+R4_ADMITTED_BOUNDARY_KEYS = {"committed_bytes", "outcome", "peak_bytes", "tokens"}
+R4_REJECTED_BOUNDARY_KEYS = {"outcome", "rejection", "tokens"}
 PERCENTILE_KEYS = {"p50", "p95", "p99"}
 R4_REQUIRED_FIELDS = (
     "Host fingerprint",
@@ -409,10 +411,47 @@ def r4_measurement_summary(measurement: dict[str, Any]) -> str:
 
 
 def r4_admission_binding(admission: dict[str, Any]) -> str:
+    below_cap = admission["below_cap"]
+    at_cap = admission["at_cap"]
+    above_cap = admission["above_cap"]
     return (
-        f"outcome={admission['outcome']}; committed_bytes={admission['committed_bytes']}; "
-        f"peak_bytes={admission['peak_bytes']}"
+        f"below_cap(tokens={below_cap['tokens']},outcome={below_cap['outcome']},"
+        f"committed_bytes={below_cap['committed_bytes']},peak_bytes={below_cap['peak_bytes']}); "
+        f"at_cap(tokens={at_cap['tokens']},outcome={at_cap['outcome']},"
+        f"committed_bytes={at_cap['committed_bytes']},peak_bytes={at_cap['peak_bytes']}); "
+        f"above_cap(tokens={above_cap['tokens']},outcome={above_cap['outcome']},"
+        f"rejection={above_cap['rejection']})"
     )
+
+
+def validate_r4_admission(admission: Any, context: dict[str, Any], *, location: str) -> dict[str, Any]:
+    """Require the three exact admission boundary points for an R4 receipt."""
+
+    if not isinstance(admission, dict) or set(admission) != R4_ADMISSION_KEYS:
+        raise ClaimsError(f"R4 admission keys are invalid at {location}")
+    below_cap = admission["below_cap"]
+    at_cap = admission["at_cap"]
+    above_cap = admission["above_cap"]
+    for name, boundary in (("below_cap", below_cap), ("at_cap", at_cap)):
+        if not isinstance(boundary, dict) or set(boundary) != R4_ADMITTED_BOUNDARY_KEYS:
+            raise ClaimsError(f"R4 admitted boundary keys are invalid at {location}/{name}")
+        if boundary["outcome"] != "admitted":
+            raise ClaimsError(f"R4 admitted boundary outcome is invalid at {location}/{name}")
+        for key in ("tokens", "committed_bytes", "peak_bytes"):
+            require_positive_int(boundary[key], location=f"{location}/{name}/{key}")
+    if not isinstance(above_cap, dict) or set(above_cap) != R4_REJECTED_BOUNDARY_KEYS:
+        raise ClaimsError(f"R4 rejected boundary keys are invalid at {location}/above_cap")
+    if above_cap["outcome"] != "rejected":
+        raise ClaimsError(f"R4 rejected boundary outcome is invalid at {location}/above_cap")
+    require_positive_int(above_cap["tokens"], location=f"{location}/above_cap/tokens")
+    require_string(above_cap["rejection"], location=f"{location}/above_cap/rejection")
+    if below_cap["tokens"] + 1 != at_cap["tokens"]:
+        raise ClaimsError(f"R4 below-cap boundary must adjoin at-cap boundary at {location}")
+    if at_cap["tokens"] + 1 != above_cap["tokens"]:
+        raise ClaimsError(f"R4 above-cap boundary must adjoin at-cap boundary at {location}")
+    if context["tokens"] != at_cap["tokens"]:
+        raise ClaimsError(f"R4 receipt context must equal its at-cap boundary at {location}")
+    return admission
 
 
 def load_r4_receipt(path: Path, expected_digest: str, expected_kind: str) -> dict[str, Any]:
@@ -494,12 +533,7 @@ def load_r4_receipt(path: Path, expected_digest: str, expected_kind: str) -> dic
             require_positive_int(measurement[metric], location=f"R4 receipt {path}/{metric}")
     else:
         admission = receipt["admission"]
-        if not isinstance(admission, dict) or set(admission) != R4_ADMISSION_KEYS:
-            raise ClaimsError(f"R4 admission keys are invalid file={path}")
-        if admission["outcome"] != "admitted":
-            raise ClaimsError(f"R4 admission outcome must be admitted file={path}")
-        for key in ("committed_bytes", "peak_bytes"):
-            require_positive_int(admission[key], location=f"R4 receipt {path}/admission/{key}")
+        validate_r4_admission(admission, context, location=f"R4 receipt {path}/admission")
     return receipt
 
 
@@ -1062,6 +1096,20 @@ def run_self_test(root: Path, claims: dict[str, dict[str, Any]]) -> None:
                 f"self-test wrapped R4 claim mismatch lines={case['lines']!r} expected="
                 f"{case['is_practicality_claim']} observed={observed}"
             )
+    typed_admission, _ = load_json(fixtures / "r4_typed_admission.json")
+    invalid_admission = copy.deepcopy(typed_admission["admission"])
+    invalid_admission["above_cap"]["tokens"] += 1
+    try:
+        validate_r4_admission(
+            invalid_admission,
+            typed_admission["context"],
+            location="self-test/admission-boundaries",
+        )
+    except ClaimsError as error:
+        if "must adjoin" not in str(error):
+            raise
+    else:
+        raise ClaimsError("self-test non-adjacent R4 admission boundary was accepted")
     fabricated = eligible_r4_ledger_entries(
         root,
         r4_claims,

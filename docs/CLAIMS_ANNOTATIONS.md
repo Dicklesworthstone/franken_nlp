@@ -60,7 +60,9 @@ The two files are canonical, duplicate-key-free JSON receipts at schema version
 1. The `r4-measurement` receipt carries typed p50/p95/p99 prefill and decode
 distributions in ordinary nondecreasing quantile order (`p50 ≤ p95 ≤ p99`),
 plus exact KV and peak-RSS bytes; the `r4-admission` receipt
-carries an `admitted` outcome plus committed/peak bytes. Both must agree on
+carries adjacent below-cap and at-cap `admitted` outcomes with committed/peak
+bytes, plus the immediately above-cap `rejected` outcome and exact rejection
+term. Its context point must be the at-cap point. Both receipts must agree on
 their ledger entry, claim id, command/environment record, fairness controls,
 full claim validity domain, host fingerprint, CPU feature string, typed artifact
 identity (`recipe_id`, packing hash, kernel-table hash, load mode), and typed
