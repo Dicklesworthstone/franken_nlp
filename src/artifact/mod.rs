@@ -1,5 +1,6 @@
 //! Model artifact lifecycle surfaces.
 
+pub mod converter;
 pub mod format;
 pub mod fs_tx;
 pub mod manifest;
