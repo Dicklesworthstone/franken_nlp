@@ -1,7 +1,7 @@
 ## PERF-R4-TYPED-001
 
 - Claim ID: r4-fixture-claim
-- Evidence: r4-receipt=docs/../tests/fixtures/claims/r4_typed_measurement.json#sha256:7d0bffb30199347f6c39fbcaedcdf28c60f9b333e3a48546b1ca0cf7da2e6f17; admission-receipt=docs/../tests/fixtures/claims/r4_typed_admission.json#sha256:c3edd0874eb75036d18e1d88f170dc6d10781fc86478c8d1a431efa2d595e041
+- Evidence: r4-receipt=tests/fixtures/claims/r4_typed_measurement.json#sha256:7d0bffb30199347f6c39fbcaedcdf28c60f9b333e3a48546b1ca0cf7da2e6f17; admission-receipt=tests/fixtures/claims/r4_typed_admission.json#sha256:c3edd0874eb75036d18e1d88f170dc6d10781fc86478c8d1a431efa2d595e041
 - Fixture hashes: sha256:7d0bffb30199347f6c39fbcaedcdf28c60f9b333e3a48546b1ca0cf7da2e6f17, sha256:c3edd0874eb75036d18e1d88f170dc6d10781fc86478c8d1a431efa2d595e041
 - CPU feature string: fixture-cpu-v1
 - Command + environment: fixture command

@@ -1,7 +1,7 @@
 ## PERF-R4-DUPLICATE-EVIDENCE-001
 
 - Claim ID: r4-fixture-claim
-- Evidence: r4-receipt=docs/../tests/fixtures/claims/r4_retained_garbage_receipt.json#sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356; r4-receipt=docs/../tests/fixtures/claims/r4_retained_garbage_admission.json#sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356
+- Evidence: r4-receipt=tests/fixtures/claims/r4_retained_garbage_receipt.json#sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356; r4-receipt=tests/fixtures/claims/r4_retained_garbage_admission.json#sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356
 - Fixture hashes: sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356
 - CPU feature string: fixture-cpu-v1
 - Command + environment: fixture command
