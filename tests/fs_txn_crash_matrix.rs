@@ -180,6 +180,39 @@ fn immutable_final_filename_binds_the_canonical_envelope_identity() {
 }
 
 #[test]
+fn simulated_retained_ingress_requires_bound_filename_and_authenticated_body() {
+    let record = ActivationRecord::new(ActivationRecordBody::genesis(
+        digest(1),
+        digest(2),
+        digest(3),
+    ));
+    let filename = record.final_filename();
+    let envelope = record.canonical_envelope_bytes();
+    let mut journal = SimulatedActivationJournal::new();
+
+    journal
+        .retain_canonical_final_envelope(&filename, &envelope)
+        .unwrap();
+    assert_eq!(journal.records(), [record.clone()]);
+
+    let wrong_filename = format!("00000000000000000001-{}.fnlpaj", record.record_digest());
+    assert!(matches!(
+        journal.retain_canonical_final_envelope(&wrong_filename, &envelope),
+        Err(FsTxError::FinalFilenameBindingMismatch { .. })
+    ));
+
+    let mut tampered = envelope;
+    let last = tampered.len() - 1;
+    tampered[last] ^= 1;
+    assert!(matches!(
+        journal.retain_canonical_final_envelope(&filename, &tampered),
+        Err(FsTxError::EnvelopeDigestMismatch)
+    ));
+    assert_eq!(journal.records(), [record]);
+    eprintln!("FS_TXN case=retained-envelope-ingress RESULT=PASS rows=3");
+}
+
+#[test]
 fn forged_successors_raise_activation_fork_and_retain_last_unambiguous_head() {
     let mut journal = SimulatedActivationJournal::new();
     let genesis = journal.append(digest(1), digest(2), digest(3)).unwrap();

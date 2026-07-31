@@ -597,6 +597,23 @@ impl SimulatedActivationJournal {
         self.retain_immutable(record)
     }
 
+    /// Parses and retains one immutable final envelope through the same
+    /// byte-and-name binding a future ratified directory reader must enforce.
+    ///
+    /// This remains an in-memory fixture ingress: it performs no filesystem
+    /// access and does not weaken the fail-closed model-root policy. Tests that
+    /// need forged or torn retained state must use [`Self::retain_recovery_fixture`]
+    /// explicitly so their forensic-only status is visible at the call site.
+    pub fn retain_canonical_final_envelope(
+        &mut self,
+        filename: &str,
+        envelope: &[u8],
+    ) -> Result<(), FsTxError> {
+        let record = ActivationRecord::parse_canonical_envelope(envelope)?;
+        record.validate_final_filename(filename)?;
+        self.retain_immutable(record)
+    }
+
     /// Discovers the unique contiguous chain from retained envelopes.
     pub fn discover(&self) -> Result<ActivationDiscovery, FsTxError> {
         discover_activation(&self.records)
