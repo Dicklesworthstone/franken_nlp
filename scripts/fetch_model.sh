@@ -20,9 +20,6 @@ CATALOG=
 CHECK_ONLY=0
 ALLOW_UNTRUSTED=0
 TEST_BASE=
-TEST_REDIRECT_POLICY=${FNLP_FETCH_ALLOW_TEST_REDIRECT_POLICY:-}
-TEST_CURL_CONNECT_TO_1=${FNLP_FETCH_TEST_CONNECT_TO_1:-}
-TEST_CURL_CONNECT_TO_2=${FNLP_FETCH_TEST_CONNECT_TO_2:-}
 LOCK_DIR=
 JOURNAL_DIR=
 
@@ -296,9 +293,6 @@ download_with_progress() {
     if [ -z "$TEST_BASE" ]; then
         set -- "$@" --proto =https --proto-redir =https
     fi
-    if [ "$TEST_REDIRECT_POLICY" = 1 ]; then
-        set -- "$@" --insecure --connect-to "$TEST_CURL_CONNECT_TO_1" --connect-to "$TEST_CURL_CONNECT_TO_2"
-    fi
     set -- "$@" --max-redirs 8 --retry 3 --retry-all-errors --connect-timeout 30
     if [ "$start" -gt 0 ]; then
         "$@" --continue-at - --output "$partial" --write-out '%{url_effective}' "$url" > "$curl_log" 2>&1 &
@@ -316,7 +310,9 @@ download_with_progress() {
     if [ "$curl_status" -ne 0 ]; then return "$curl_status"; fi
     effective=$(tail -n 1 "$curl_log" | tr -d '\r\n')
     if [ -z "$TEST_BASE" ] && ! effective_host_ok "$effective"; then
-        log "REDIRECT_HOST_REFUSED effective_url=$effective"
+        # This final-URL check gates verification and activation. Curl has already
+        # transferred the response, so it is not a no-request-to-unlisted-host claim.
+        log "REDIRECT_HOST_REFUSED phase=post-transfer activation=refused effective_url=$effective"
         return 90
     fi
     return 0
@@ -421,11 +417,6 @@ if [ -n "$TEST_BASE" ] && [ "${FNLP_FETCH_ALLOW_TEST_BASE_URL:-}" != 1 ]; then
     log "ERROR code=2 detail=--test-base-url requires FNLP_FETCH_ALLOW_TEST_BASE_URL=1"
     exit 2
 fi
-if [ -n "$TEST_REDIRECT_POLICY" ] && { [ "$TEST_REDIRECT_POLICY" != 1 ] || [ -z "$TEST_CURL_CONNECT_TO_1" ] || [ -z "$TEST_CURL_CONNECT_TO_2" ]; }; then
-    log "ERROR code=2 detail=test redirect transport requires FNLP_FETCH_ALLOW_TEST_REDIRECT_POLICY=1 and two connect mappings"
-    exit 2
-fi
-
 ensure_destination
 catalog_stats
 acquire_lock

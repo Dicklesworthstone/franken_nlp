@@ -6,6 +6,7 @@ set -u
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 FETCH="$ROOT/scripts/fetch_model.sh"
+REAL_CURL=$(command -v curl)
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/fnlp-fetch-model-test.XXXXXX")
 REV=f56ec5a9650268aa098496734743c25ea778bd2d
 CASES=0
@@ -29,13 +30,14 @@ trap finish EXIT
 
 command -v python3 >/dev/null 2>&1 || { log "FETCH_MODEL_TESTS RESULT=FAIL cases=0 failed=missing-python3 retained_work=$WORK"; exit 1; }
 command -v openssl >/dev/null 2>&1 || { log "FETCH_MODEL_TESTS RESULT=FAIL cases=0 failed=missing-openssl retained_work=$WORK"; exit 1; }
+command -v curl >/dev/null 2>&1 || { log "FETCH_MODEL_TESTS RESULT=FAIL cases=0 failed=missing-curl retained_work=$WORK"; exit 1; }
 
-# 0. The production redirect policy permits official Xet and regional CDN hosts.
+# 0. Test transport injection stays in this harness, never in the fetch script.
 CASES=$((CASES + 1))
-if rg -q 'https://\*\.xethub\.hf\.co/\*\|https://\*\.cdn\.hf\.co/\*' "$FETCH"; then
-    pass_case 0 official-xet-cdn-redirect-policy
+if rg -q 'FNLP_FETCH_TEST|--insecure|--connect-to' "$FETCH"; then
+    fail_case 0 production-transport-isolation
 else
-    fail_case 0 official-xet-cdn-redirect-policy
+    pass_case 0 production-transport-isolation
 fi
 
 FIXTURE="$WORK/fixture/resolve/$REV"
