@@ -196,10 +196,33 @@ fn schema_and_unpopulated_commands_are_data_only_and_golden_frozen() {
                     document["capabilities"]["status"],
                     Value::from("unpopulated")
                 );
-                assert_eq!(
-                    document["thread_inventory"]["status"],
-                    Value::from("unpopulated")
-                );
+                let inventory = &document["thread_inventory"];
+                let status = inventory["status"]
+                    .as_str()
+                    .expect("health inventory must name its state");
+                assert!(matches!(status, "not_installed" | "configured"));
+                if status == "configured" {
+                    for field in [
+                        "runtime_preset",
+                        "runtime_workers",
+                        "blocking_coordinators",
+                        "scoped_cpu_children_per_coordinator",
+                        "helper_threads",
+                        "total_runnable_threads",
+                        "thread_ceiling",
+                        "runtime_binding",
+                    ] {
+                        assert!(
+                            inventory.get(field).is_some(),
+                            "configured health must include thread inventory field {field}"
+                        );
+                    }
+                    assert!(
+                        inventory["total_runnable_threads"].as_u64()
+                            <= inventory["thread_ceiling"].as_u64(),
+                        "health must not report an envelope above its fixed ceiling"
+                    );
+                }
             }
         }
     }

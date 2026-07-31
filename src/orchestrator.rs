@@ -1050,6 +1050,15 @@ pub fn install_process_resources(
     process_broker().install(config)
 }
 
+/// Return the installed process host without creating one.
+///
+/// Health and receipt surfaces use this observation to report an honest
+/// `not_installed` state. They must never create an unbounded host merely to
+/// make a diagnostic document look populated.
+pub fn installed_process_resources() -> Option<Arc<EngineResources>> {
+    process_broker().installed()
+}
+
 /// The synchronous library facade. Inference methods arrive on later scheduler
 /// beads; this type already guarantees that each engine holds a broker lease.
 #[derive(Debug)]

@@ -9,7 +9,7 @@ use std::io::{self, Write};
 
 use serde::Serialize;
 
-use crate::native_engine::dispatch;
+use crate::{native_engine::dispatch, orchestrator};
 
 pub const ROBOT_SCHEMA_VERSION: u32 = 1;
 
@@ -236,7 +236,7 @@ pub enum RobotCommand {
 /// The error-map bead owns the executable table. This frozen representation
 /// fixes the machine contract now, so that bead must make its table match this
 /// schema rather than adding a second public vocabulary.
-const ROBOT_SCHEMA_JSON: &str = r#"{"$id":"https://franken-nlp.dev/schema/robot/v1","$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"allOf":[{"if":{"properties":{"event":{"const":"doc_error"}}},"then":{"required":["input_line","request_seq"]}},{"if":{"properties":{"event":{"enum":["doc","token","run_complete"]}}},"then":{"required":["request_seq"]}}],"properties":{"byte_offset":{"minimum":0,"type":"integer"},"caller_id":{"minLength":1,"type":"string"},"event":{"enum":["run_start","stage","doc","doc_error","token","flush","run_complete","run_error"],"type":"string"},"input_line":{"minimum":1,"type":"integer"},"json_path":{"type":"string"},"request_seq":{"minimum":0,"type":"integer"},"schema_version":{"const":1,"type":"integer"},"status":{"type":"string"}},"required":["event","schema_version"],"title":"franken_nlp robot NDJSON v1","type":"object","x_fnlp_robot":{"commands":{"backends":{"fields":["architecture","backends","kind","schema_version","status"],"kind":"robot_backends","status":"populated"},"health":{"kind":"robot_health","status":"unpopulated"},"schema":{"kind":"robot_schema"}},"exit_code_authority":"src/error.rs","exit_codes":[{"code":0,"name":"ok"},{"code":1,"name":"generic"},{"code":2,"name":"usage"},{"code":3,"name":"model_not_found"},{"code":4,"name":"input_decode_or_parse"},{"code":5,"name":"budget_or_timeout"},{"code":6,"name":"cancelled"},{"code":7,"name":"artifact_integrity_or_format_or_version"},{"code":8,"name":"schema_or_recipe_compile"},{"code":9,"name":"admission_or_resource_limit"},{"code":10,"name":"structured_task_no_result"}],"request_seq_events":["doc","doc_error","token","run_complete"],"stderr":"diagnostics_only","stdout":"data_only","volatile_fields":[]}}"#;
+const ROBOT_SCHEMA_JSON: &str = r#"{"$id":"https://franken-nlp.dev/schema/robot/v1","$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"allOf":[{"if":{"properties":{"event":{"const":"doc_error"}}},"then":{"required":["input_line","request_seq"]}},{"if":{"properties":{"event":{"enum":["doc","token","run_complete"]}}},"then":{"required":["request_seq"]}}],"properties":{"byte_offset":{"minimum":0,"type":"integer"},"caller_id":{"minLength":1,"type":"string"},"event":{"enum":["run_start","stage","doc","doc_error","token","flush","run_complete","run_error"],"type":"string"},"input_line":{"minimum":1,"type":"integer"},"json_path":{"type":"string"},"request_seq":{"minimum":0,"type":"integer"},"schema_version":{"const":1,"type":"integer"},"status":{"type":"string"}},"required":["event","schema_version"],"title":"franken_nlp robot NDJSON v1","type":"object","x_fnlp_robot":{"commands":{"backends":{"fields":["architecture","backends","kind","schema_version","status"],"kind":"robot_backends","status":"populated"},"health":{"fields":["capabilities","kind","schema_version","thread_inventory"],"kind":"robot_health","status":"conditional"},"schema":{"kind":"robot_schema"}},"exit_code_authority":"src/error.rs","exit_codes":[{"code":0,"name":"ok"},{"code":1,"name":"generic"},{"code":2,"name":"usage"},{"code":3,"name":"model_not_found"},{"code":4,"name":"input_decode_or_parse"},{"code":5,"name":"budget_or_timeout"},{"code":6,"name":"cancelled"},{"code":7,"name":"artifact_integrity_or_format_or_version"},{"code":8,"name":"schema_or_recipe_compile"},{"code":9,"name":"admission_or_resource_limit"},{"code":10,"name":"structured_task_no_result"}],"request_seq_events":["doc","doc_error","token","run_complete"],"stderr":"diagnostics_only","stdout":"data_only","volatile_fields":[]}}"#;
 
 pub fn schema_json_bytes() -> Vec<u8> {
     let mut result = ROBOT_SCHEMA_JSON.as_bytes().to_vec();
@@ -250,11 +250,70 @@ struct Unpopulated {
 }
 
 #[derive(Serialize)]
+struct ThreadInventoryDocument {
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_preset: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_workers: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocking_coordinators: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scoped_cpu_children_per_coordinator: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    helper_threads: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_runnable_threads: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thread_ceiling: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_binding: Option<&'static str>,
+}
+
+impl ThreadInventoryDocument {
+    fn not_installed() -> Self {
+        Self {
+            status: "not_installed",
+            runtime_preset: None,
+            runtime_workers: None,
+            blocking_coordinators: None,
+            scoped_cpu_children_per_coordinator: None,
+            helper_threads: None,
+            total_runnable_threads: None,
+            thread_ceiling: None,
+            runtime_binding: None,
+        }
+    }
+
+    fn from_resources(resources: &orchestrator::EngineResources) -> Self {
+        let config = resources.config();
+        let inventory = resources.thread_inventory();
+        Self {
+            status: "configured",
+            runtime_preset: Some(config.runtime_preset.as_str()),
+            runtime_workers: Some(inventory.runtime_workers),
+            blocking_coordinators: Some(inventory.blocking_coordinators),
+            scoped_cpu_children_per_coordinator: Some(
+                inventory.scoped_cpu_children_per_coordinator,
+            ),
+            helper_threads: Some(inventory.helper_threads),
+            total_runnable_threads: Some(inventory.total_runnable_threads),
+            thread_ceiling: Some(config.thread_ceiling),
+            runtime_binding: Some(if resources.has_real_blocking_pool() {
+                "real_blocking_pool"
+            } else {
+                "not_compiled"
+            }),
+        }
+    }
+}
+
+#[derive(Serialize)]
 struct HealthDocument {
     capabilities: Unpopulated,
     kind: &'static str,
     schema_version: u32,
-    thread_inventory: Unpopulated,
+    thread_inventory: ThreadInventoryDocument,
 }
 
 #[derive(Serialize)]
@@ -287,9 +346,9 @@ pub fn write_command<W: Write, D: Write>(
                 },
                 kind: "robot_health",
                 schema_version: ROBOT_SCHEMA_VERSION,
-                thread_inventory: Unpopulated {
-                    status: "unpopulated",
-                },
+                thread_inventory: orchestrator::installed_process_resources()
+                    .as_deref()
+                    .map_or_else(ThreadInventoryDocument::not_installed, ThreadInventoryDocument::from_resources),
             },
         ),
         RobotCommand::Backends => write_json_document(

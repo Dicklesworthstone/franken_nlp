@@ -25,6 +25,7 @@ pub use orchestrator::{
     NlpEngineBuilder, ReservationError, ResourceBrokerError, ResourceConfigConflict,
     ResourceConfigError, ResourceConfigField, ResourceConfigValue, ResourceHostConfig,
     RuntimeHostError, RuntimePreset, ThreadInventory, install_process_resources,
+    installed_process_resources,
 };
 
 pub fn cli_main() -> std::process::ExitCode {
