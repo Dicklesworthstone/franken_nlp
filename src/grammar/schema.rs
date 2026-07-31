@@ -265,8 +265,7 @@ impl ExactDecimal {
         let adjusted = exponent
             .checked_add((significant.len() - 1) as i32)
             .ok_or(DecimalError::ExponentOutOfRange)?;
-        if !(MIN_ADJUSTED_DECIMAL_EXPONENT..=MAX_ADJUSTED_DECIMAL_EXPONENT).contains(&adjusted)
-        {
+        if !(MIN_ADJUSTED_DECIMAL_EXPONENT..=MAX_ADJUSTED_DECIMAL_EXPONENT).contains(&adjusted) {
             return Err(DecimalError::AdjustedExponentOutOfRange { adjusted });
         }
 
@@ -362,7 +361,9 @@ impl fmt::Display for DecimalError {
                 formatter,
                 "number has {observed} significant digits; maximum is {MAX_SIGNIFICANT_DECIMAL_DIGITS}"
             ),
-            Self::CoefficientOverflow => formatter.write_str("checked decimal coefficient overflow"),
+            Self::CoefficientOverflow => {
+                formatter.write_str("checked decimal coefficient overflow")
+            }
             Self::ExponentOutOfRange => formatter.write_str("checked decimal exponent overflow"),
             Self::AdjustedExponentOutOfRange { adjusted } => write!(
                 formatter,
@@ -391,7 +392,7 @@ pub enum SchemaError {
 }
 
 impl SchemaError {
-    pub const fn pointer(&self) -> &str {
+    pub fn pointer(&self) -> &str {
         match self {
             Self::Parse { .. } => "$",
             Self::DuplicateKey { pointer }
@@ -415,9 +416,14 @@ impl fmt::Display for SchemaError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Parse { offset, reason } => {
-                write!(formatter, "schema JSON parse failure at byte {offset}: {reason}")
+                write!(
+                    formatter,
+                    "schema JSON parse failure at byte {offset}: {reason}"
+                )
             }
-            Self::DuplicateKey { pointer } => write!(formatter, "duplicate object key at {pointer}"),
+            Self::DuplicateKey { pointer } => {
+                write!(formatter, "duplicate object key at {pointer}")
+            }
             Self::UnsupportedKeyword { pointer, keyword } => {
                 write!(formatter, "unsupported keyword {keyword:?} at {pointer}")
             }
@@ -566,7 +572,11 @@ impl<'a> RawJsonParser<'a> {
         Ok(JsonValue::Array(values))
     }
 
-    fn parse_literal(&mut self, expected: &str, value: JsonValue) -> Result<JsonValue, SchemaError> {
+    fn parse_literal(
+        &mut self,
+        expected: &str,
+        value: JsonValue,
+    ) -> Result<JsonValue, SchemaError> {
         if self.input[self.offset..].starts_with(expected) {
             self.offset += expected.len();
             Ok(value)
@@ -637,7 +647,9 @@ impl<'a> RawJsonParser<'a> {
                 }
                 b'\\' => {
                     self.offset += 1;
-                    let escaped = self.peek().ok_or_else(|| self.parse_error("incomplete JSON escape"))?;
+                    let escaped = self
+                        .peek()
+                        .ok_or_else(|| self.parse_error("incomplete JSON escape"))?;
                     self.offset += 1;
                     match escaped {
                         b'"' => output.push('"'),
@@ -652,7 +664,9 @@ impl<'a> RawJsonParser<'a> {
                         _ => return Err(self.parse_error("unsupported JSON escape")),
                     }
                 }
-                0x00..=0x1f => return Err(self.parse_error("unescaped control character in JSON string")),
+                0x00..=0x1f => {
+                    return Err(self.parse_error("unescaped control character in JSON string"));
+                }
                 _ => {
                     let rest = &self.input[self.offset..];
                     let character = rest
@@ -692,7 +706,10 @@ impl<'a> RawJsonParser<'a> {
             return Err(self.parse_error("incomplete unicode escape"));
         }
         let mut value = 0_u16;
-        for byte in self.input.as_bytes()[self.offset..self.offset + 4].iter().copied() {
+        for byte in self.input.as_bytes()[self.offset..self.offset + 4]
+            .iter()
+            .copied()
+        {
             let digit = match byte {
                 b'0'..=b'9' => byte - b'0',
                 b'a'..=b'f' => byte - b'a' + 10,
