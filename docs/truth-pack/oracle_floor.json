@@ -1,0 +1,377 @@
+{
+  "analysis_generated_at": "2026-07-31T15:32:48+00:00",
+  "cross_thread_first_divergence_token_positions": {
+    "00326c36b03df5da1508fc9137587368b531695c1d1d11d9af6076ddaf169957": null,
+    "9267825d5b89ce68e9bde740d46459dcd46755b318dedfdceacfe62185b3b5a0": null,
+    "e9304f8f785fcf1bd5a51aa78f6555926a140cb127431afd04cd6b69c9d509cf": null
+  },
+  "derived_tolerance_vectors": {
+    "1": [
+      {
+        "max_abs": 0.0,
+        "mean_elementwise_variance": 0.0,
+        "metric": "prompt:fixture-000:logits",
+        "run_count": 5
+      },
+      {
+        "max_abs": 0.0,
+        "mean_elementwise_variance": 0.0,
+        "metric": "prompt:fixture-001:logits",
+        "run_count": 5
+      },
+      {
+        "max_abs": 0.0,
+        "mean_elementwise_variance": 0.0,
+        "metric": "prompt:fixture-002:logits",
+        "run_count": 5
+      }
+    ],
+    "10": [
+      {
+        "max_abs": 0.0,
+        "mean_elementwise_variance": 0.0,
+        "metric": "prompt:fixture-000:logits",
+        "run_count": 5
+      },
+      {
+        "max_abs": 0.0,
+        "mean_elementwise_variance": 0.0,
+        "metric": "prompt:fixture-001:logits",
+        "run_count": 5
+      },
+      {
+        "max_abs": 0.0,
+        "mean_elementwise_variance": 0.0,
+        "metric": "prompt:fixture-002:logits",
+        "run_count": 5
+      }
+    ]
+  },
+  "execution_status": "measured_from_recorded_runs",
+  "oracle_reproducible_prefixes": {
+    "1": {
+      "fixture-000": 8,
+      "fixture-001": 8,
+      "fixture-002": 8
+    },
+    "10": {
+      "fixture-000": 8,
+      "fixture-001": 8,
+      "fixture-002": 8
+    }
+  },
+  "per_thread_count": [
+    {
+      "derived_tolerance_vector": [
+        {
+          "max_abs": 0.0,
+          "mean_elementwise_variance": 0.0,
+          "metric": "prompt:fixture-000:logits",
+          "run_count": 5
+        },
+        {
+          "max_abs": 0.0,
+          "mean_elementwise_variance": 0.0,
+          "metric": "prompt:fixture-001:logits",
+          "run_count": 5
+        },
+        {
+          "max_abs": 0.0,
+          "mean_elementwise_variance": 0.0,
+          "metric": "prompt:fixture-002:logits",
+          "run_count": 5
+        }
+      ],
+      "launch_ids": [
+        "t1-launch01",
+        "t1-launch02",
+        "t1-launch03",
+        "t1-launch04",
+        "t1-launch05"
+      ],
+      "prompts": {
+        "fixture-000": {
+          "first_divergence_token_position": null,
+          "metrics": [
+            {
+              "elements": 166144,
+              "max_abs_spread": 0.0,
+              "max_elementwise_variance": 0.0,
+              "mean_elementwise_variance": 0.0,
+              "mean_per_run_max_abs_confidence_interval": {
+                "lower": 0.0,
+                "method": "deterministic-bootstrap-percentile-mean-per-run-max-abs",
+                "samples": 2000,
+                "upper": 0.0
+              },
+              "metric": "prompt:fixture-000:logits",
+              "per_run_max_abs": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "run_count": 5,
+              "zero_observed_divergence_upper_rate": 0.4507197283469411
+            }
+          ],
+          "stable_prefix_token_count": 8,
+          "token_stream_lengths": [
+            8,
+            8,
+            8,
+            8,
+            8
+          ]
+        },
+        "fixture-001": {
+          "first_divergence_token_position": null,
+          "metrics": [
+            {
+              "elements": 166144,
+              "max_abs_spread": 0.0,
+              "max_elementwise_variance": 0.0,
+              "mean_elementwise_variance": 0.0,
+              "mean_per_run_max_abs_confidence_interval": {
+                "lower": 0.0,
+                "method": "deterministic-bootstrap-percentile-mean-per-run-max-abs",
+                "samples": 2000,
+                "upper": 0.0
+              },
+              "metric": "prompt:fixture-001:logits",
+              "per_run_max_abs": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "run_count": 5,
+              "zero_observed_divergence_upper_rate": 0.4507197283469411
+            }
+          ],
+          "stable_prefix_token_count": 8,
+          "token_stream_lengths": [
+            8,
+            8,
+            8,
+            8,
+            8
+          ]
+        },
+        "fixture-002": {
+          "first_divergence_token_position": null,
+          "metrics": [
+            {
+              "elements": 166144,
+              "max_abs_spread": 0.0,
+              "max_elementwise_variance": 0.0,
+              "mean_elementwise_variance": 0.0,
+              "mean_per_run_max_abs_confidence_interval": {
+                "lower": 0.0,
+                "method": "deterministic-bootstrap-percentile-mean-per-run-max-abs",
+                "samples": 2000,
+                "upper": 0.0
+              },
+              "metric": "prompt:fixture-002:logits",
+              "per_run_max_abs": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "run_count": 5,
+              "zero_observed_divergence_upper_rate": 0.4507197283469411
+            }
+          ],
+          "stable_prefix_token_count": 8,
+          "token_stream_lengths": [
+            8,
+            8,
+            8,
+            8,
+            8
+          ]
+        }
+      },
+      "run_count": 5,
+      "run_record_sha256s": [
+        "f204ff18725b5c1b4744b6b4719cefa86d391439a193f44882a9e7c3c33b3810",
+        "5692aeeced42c1f9662fef210af64c61a8381ad5a9a1ccb186fc20163efc9fcc",
+        "eecee963171d0cfcf4a060e08473dc6819282d3128487f917da6702ff94881cb",
+        "f42be19020a6fc657ab2c307a2f730734d92d47050fc6ff26decfd686ce1b5b5",
+        "808f0ba73e6ed34228268b7659d5d5d78f4f59ad459a4dc4ec372f502149a73a"
+      ],
+      "thread_count": 1,
+      "variation_detected": false
+    },
+    {
+      "derived_tolerance_vector": [
+        {
+          "max_abs": 0.0,
+          "mean_elementwise_variance": 0.0,
+          "metric": "prompt:fixture-000:logits",
+          "run_count": 5
+        },
+        {
+          "max_abs": 0.0,
+          "mean_elementwise_variance": 0.0,
+          "metric": "prompt:fixture-001:logits",
+          "run_count": 5
+        },
+        {
+          "max_abs": 0.0,
+          "mean_elementwise_variance": 0.0,
+          "metric": "prompt:fixture-002:logits",
+          "run_count": 5
+        }
+      ],
+      "launch_ids": [
+        "t10-launch01",
+        "t10-launch02",
+        "t10-launch03",
+        "t10-launch04",
+        "t10-launch05"
+      ],
+      "prompts": {
+        "fixture-000": {
+          "first_divergence_token_position": null,
+          "metrics": [
+            {
+              "elements": 166144,
+              "max_abs_spread": 0.0,
+              "max_elementwise_variance": 0.0,
+              "mean_elementwise_variance": 0.0,
+              "mean_per_run_max_abs_confidence_interval": {
+                "lower": 0.0,
+                "method": "deterministic-bootstrap-percentile-mean-per-run-max-abs",
+                "samples": 2000,
+                "upper": 0.0
+              },
+              "metric": "prompt:fixture-000:logits",
+              "per_run_max_abs": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "run_count": 5,
+              "zero_observed_divergence_upper_rate": 0.4507197283469411
+            }
+          ],
+          "stable_prefix_token_count": 8,
+          "token_stream_lengths": [
+            8,
+            8,
+            8,
+            8,
+            8
+          ]
+        },
+        "fixture-001": {
+          "first_divergence_token_position": null,
+          "metrics": [
+            {
+              "elements": 166144,
+              "max_abs_spread": 0.0,
+              "max_elementwise_variance": 0.0,
+              "mean_elementwise_variance": 0.0,
+              "mean_per_run_max_abs_confidence_interval": {
+                "lower": 0.0,
+                "method": "deterministic-bootstrap-percentile-mean-per-run-max-abs",
+                "samples": 2000,
+                "upper": 0.0
+              },
+              "metric": "prompt:fixture-001:logits",
+              "per_run_max_abs": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "run_count": 5,
+              "zero_observed_divergence_upper_rate": 0.4507197283469411
+            }
+          ],
+          "stable_prefix_token_count": 8,
+          "token_stream_lengths": [
+            8,
+            8,
+            8,
+            8,
+            8
+          ]
+        },
+        "fixture-002": {
+          "first_divergence_token_position": null,
+          "metrics": [
+            {
+              "elements": 166144,
+              "max_abs_spread": 0.0,
+              "max_elementwise_variance": 0.0,
+              "mean_elementwise_variance": 0.0,
+              "mean_per_run_max_abs_confidence_interval": {
+                "lower": 0.0,
+                "method": "deterministic-bootstrap-percentile-mean-per-run-max-abs",
+                "samples": 2000,
+                "upper": 0.0
+              },
+              "metric": "prompt:fixture-002:logits",
+              "per_run_max_abs": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "run_count": 5,
+              "zero_observed_divergence_upper_rate": 0.4507197283469411
+            }
+          ],
+          "stable_prefix_token_count": 8,
+          "token_stream_lengths": [
+            8,
+            8,
+            8,
+            8,
+            8
+          ]
+        }
+      },
+      "run_count": 5,
+      "run_record_sha256s": [
+        "e1e12da021d164f328596c1e151a3927cc8c2763866d27ffbe8c6de071dd6857",
+        "047ff376b6d2e7cd2ab0d297754cd83fed099c029782edf70719d25037bda57c",
+        "ec113dc72ab4f9bf9700f2331e714d3aa5fe9c46bbfc9e404fb19068da8311a6",
+        "bec7b69c215a852a86fb7e4b2760280aacdb9dfbd4c063fcdf1214c97ae62af1",
+        "680d05d90daa8e0cfabe6bbe78b20f71f2b2e5189fe720caaa1fcfd12304f363"
+      ],
+      "thread_count": 10,
+      "variation_detected": false
+    }
+  ],
+  "preregistration": {
+    "additional_processes_per_thread": 5,
+    "confidence_level": 0.95,
+    "convergence_rule": "Run five independently launched fresh interpreters at every preregistered thread count. If any greedy token, logits element, or recorded tap varies, add five fresh interpreters at every preregistered thread count before deriving the floor. Exact goldens end at the first divergence in the common prefix across every recorded run and every preregistered thread count.",
+    "minimum_processes": 5,
+    "thread_counts": [
+      1,
+      10
+    ]
+  },
+  "preregistration_sha256": "d225e5d45fe3e2f5cd55bcd01999ed9c6d87bae16609055bccd0516660d10c24",
+  "profile": "hf-bf16-eager",
+  "schema_version": 1,
+  "stable_prefixes": {
+    "00326c36b03df5da1508fc9137587368b531695c1d1d11d9af6076ddaf169957": 8,
+    "9267825d5b89ce68e9bde740d46459dcd46755b318dedfdceacfe62185b3b5a0": 8,
+    "e9304f8f785fcf1bd5a51aa78f6555926a140cb127431afd04cd6b69c9d509cf": 8
+  },
+  "total_run_count": 10,
+  "variation_detected": false
+}

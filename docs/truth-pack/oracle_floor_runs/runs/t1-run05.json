@@ -1,0 +1,133 @@
+{
+  "ended_at": "2026-07-31T15:31:19+00:00",
+  "environment": {
+    "captured_at": "2026-07-31T15:31:19+00:00",
+    "cpu_count": 14,
+    "environment": {
+      "BLIS_NUM_THREADS": null,
+      "CUBLAS_WORKSPACE_CONFIG": null,
+      "KMP_AFFINITY": null,
+      "KMP_BLOCKTIME": null,
+      "KMP_SETTINGS": null,
+      "MKL_NUM_THREADS": "1",
+      "NUMEXPR_NUM_THREADS": null,
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "PYTORCH_DETERMINISTIC": null,
+      "PYTORCH_ENABLE_MPS_FALLBACK": null,
+      "PYTORCH_MPS_HIGH_WATERMARK_RATIO": null,
+      "TORCH_DETERMINISTIC": null,
+      "VECLIB_MAXIMUM_THREADS": "1"
+    },
+    "implementation": "CPython",
+    "machine": "arm64",
+    "oracle_source": {
+      "attention_implementation": "eager",
+      "model_id": "Nanbeige/Nanbeige4.2-3B",
+      "path": "/Users/jemanuel/.cache/franken_nlp/source/Nanbeige4.2-3B/f56ec5a9650268aa098496734743c25ea778bd2d",
+      "revision": "f56ec5a9650268aa098496734743c25ea778bd2d",
+      "tokenizer_class": "LlamaTokenizer",
+      "tokenizer_is_fast": false
+    },
+    "package_versions": {
+      "safetensors": "0.8.0",
+      "sentencepiece": "0.2.0",
+      "tokenizers": "0.21.4",
+      "torch": "2.6.0",
+      "transformers": "4.51.0"
+    },
+    "platform": "macOS-26.2-arm64-arm-64bit",
+    "processor": "arm",
+    "python": "3.11.14 (main, Nov 19 2025, 23:12:58) [Clang 21.1.4 ]",
+    "thread_control": {
+      "MKL_NUM_THREADS": "1",
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "VECLIB_MAXIMUM_THREADS": "1",
+      "torch_num_interop_threads": 1,
+      "torch_num_threads": 1
+    },
+    "torch_build_config": "PyTorch built with:\n  - GCC 4.2\n  - C++ Version: 201703\n  - clang 15.0.0\n  - OpenMP 201811\n  - LAPACK is enabled (usually provided by MKL)\n  - NNPACK is enabled\n  - CPU capability usage: NO AVX\n  - Build settings: BLAS_INFO=accelerate, BUILD_TYPE=Release, COMMIT_SHA=2236df1770800ffea5697b11b0bb0d910b2e59e1, CXX_COMPILER=/Applications/Xcode_15.4.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++, CXX_FLAGS= -fvisibility-inlines-hidden -DUSE_PTHREADPOOL -DNDEBUG -DUSE_KINETO -DLIBKINETO_NOCUPTI -DLIBKINETO_NOROCTRACER -DLIBKINETO_NOXPUPTI=ON -DUSE_PYTORCH_QNNPACK -DAT_BUILD_ARM_VEC256_WITH_SLEEF -DUSE_XNNPACK -DUSE_PYTORCH_METAL_EXPORT -DSYMBOLICATE_MOBILE_DEBUG_HANDLE -DUSE_COREML_DELEGATE -O2 -fPIC -Wall -Wextra -Werror=return-type -Werror=non-virtual-dtor -Werror=braced-scalar-init -Werror=range-loop-construct -Werror=bool-operation -Wnarrowing -Wno-missing-field-initializers -Wno-type-limits -Wno-array-bounds -Wno-unknown-pragmas -Wno-unused-parameter -Wno-strict-overflow -Wno-strict-aliasing -Wvla-extension -Wsuggest-override -Wnewline-eof -Winconsistent-missing-override -Winconsistent-missing-destructor-override -Wno-pass-failed -Wno-error=old-style-cast -Wconstant-conversion -Wno-missing-braces -Qunused-arguments -fcolor-diagnostics -faligned-new -Wno-unused-but-set-variable -fno-math-errno -fno-trapping-math -Werror=format -DUSE_MPS -Wno-unused-private-field -Wno-missing-braces, LAPACK_INFO=accelerate, TORCH_VERSION=2.6.0, USE_CUDA=OFF, USE_CUDNN=OFF, USE_CUSPARSELT=OFF, USE_EIGEN_FOR_BLAS=ON, USE_EXCEPTION_PTR=1, USE_GFLAGS=OFF, USE_GLOG=OFF, USE_GLOO=ON, USE_MKL=OFF, USE_MKLDNN=OFF, USE_MPI=OFF, USE_NCCL=OFF, USE_NNPACK=ON, USE_OPENMP=ON, USE_ROCM=OFF, USE_ROCM_KERNEL_ASSERT=OFF, \n",
+    "torch_deterministic_algorithms": false,
+    "torch_mkldnn_available": false,
+    "torch_num_interop_threads": 1,
+    "torch_num_threads": 1,
+    "torch_version": "2.6.0"
+  },
+  "fresh_interpreter": true,
+  "launch_id": "t1-launch05",
+  "preregistration_sha256": "d225e5d45fe3e2f5cd55bcd01999ed9c6d87bae16609055bccd0516660d10c24",
+  "profile": "hf-bf16-eager",
+  "prompts": [
+    {
+      "greedy_token_ids": [
+        295,
+        152481,
+        13,
+        152481,
+        954,
+        5538,
+        796,
+        954
+      ],
+      "id": "fixture-000",
+      "logits": {
+        "dtype": "f32",
+        "path": "t1-run05-fixture-000-logits.f32",
+        "sha256": "1bd7f9c16fa1ed599e4c1059ffd4770d1c0d5e7298bb82de776f39bb6a3357c9",
+        "shape": [
+          166144
+        ]
+      },
+      "taps": {}
+    },
+    {
+      "greedy_token_ids": [
+        13,
+        13,
+        11070,
+        322,
+        269,
+        12396,
+        152382,
+        13
+      ],
+      "id": "fixture-001",
+      "logits": {
+        "dtype": "f32",
+        "path": "t1-run05-fixture-001-logits.f32",
+        "sha256": "183112652581d9e6dfde6970978d2da54d0b0f165afa2cf15d15712947c0ec1e",
+        "shape": [
+          166144
+        ]
+      },
+      "taps": {}
+    },
+    {
+      "greedy_token_ids": [
+        13,
+        166104,
+        13,
+        13,
+        11070,
+        322,
+        261,
+        19706
+      ],
+      "id": "fixture-002",
+      "logits": {
+        "dtype": "f32",
+        "path": "t1-run05-fixture-002-logits.f32",
+        "sha256": "da00fa92b49e9efbb4ce43003b15697520d851b6c8577b1591425efc44edf687",
+        "shape": [
+          166144
+        ]
+      },
+      "taps": {}
+    }
+  ],
+  "run_id": "t1-run05",
+  "schema_version": 1,
+  "started_at": "2026-07-31T15:30:52+00:00",
+  "thread_count": 1
+}
