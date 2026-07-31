@@ -11,6 +11,7 @@ pub mod grammar;
 pub mod jobs;
 pub mod native_engine;
 pub mod orchestrator;
+pub mod receipt;
 pub mod robot;
 pub mod storage;
 pub mod tasks;

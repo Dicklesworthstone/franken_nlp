@@ -54,6 +54,7 @@ pub struct ReceiptRetention {
 /// The domain used to prevent input, output, and configuration commitments
 /// from being interchangeable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CommitmentDomain {
     Input,
     Output,
@@ -61,11 +62,11 @@ pub enum CommitmentDomain {
 }
 
 impl CommitmentDomain {
-    const fn label(self) -> &'static str {
+    const fn tag(self) -> &'static str {
         match self {
-            Self::Input => "input",
-            Self::Output => "output",
-            Self::Configuration => "configuration",
+            Self::Input => "fnlp-receipt-input-v1",
+            Self::Output => "fnlp-receipt-output-v1",
+            Self::Configuration => "fnlp-receipt-config-v1",
         }
     }
 }
@@ -91,28 +92,59 @@ impl CommitmentKey {
     /// Construct a key with a non-secret identifier safe for receipt exports.
     pub fn new(key_id: impl Into<String>, secret: [u8; 32]) -> Result<Self, ReceiptError> {
         let key_id = key_id.into();
-        validate_authority("commitment_key_id", &key_id)?;
+        validate_identifier("commitment_key_id", &key_id)?;
         Ok(Self { key_id, secret })
     }
 
     /// Commit to private bytes without retaining a raw SHA-256 content digest.
-    #[must_use]
-    pub fn commit(&self, domain: CommitmentDomain, bytes: &[u8]) -> ContentCommitment {
-        let mut message = Vec::with_capacity(RECIPT_HMAC_PREFIX.len() + bytes.len() + 16);
-        message.extend_from_slice(RECIPT_HMAC_PREFIX);
-        message.extend_from_slice(domain.label().as_bytes());
-        message.push(0);
-        message.extend_from_slice(bytes);
-        ContentCommitment {
+    ///
+    /// Every field participates in a versioned, length-delimited message so a
+    /// commitment for one receipt namespace or entity kind cannot be reused in
+    /// another field merely because its raw bytes happen to match.
+    pub fn commit(
+        &self,
+        domain: CommitmentDomain,
+        namespace: &str,
+        entity_kind: &str,
+        bytes: &[u8],
+    ) -> Result<ContentCommitment, ReceiptError> {
+        validate_identifier("commitment.namespace", namespace)?;
+        validate_identifier("commitment.entity_kind", entity_kind)?;
+        let message = commitment_message(domain, namespace, entity_kind, bytes)?;
+        Ok(ContentCommitment {
             domain,
             key_id: self.key_id.clone(),
-            hmac_sha256: Sha256Digest::of_bytes(&hmac_sha256(&self.secret, &message)),
-        }
+            hmac_sha256: digest_from_bytes(hmac_sha256(&self.secret, &message)),
+        })
     }
 }
 
-const RECIPT_HMAC_PREFIX: &[u8] = b"fnlpr-hmac-v1\0";
 const HMAC_BLOCK_BYTES: usize = 64;
+
+fn commitment_message(
+    domain: CommitmentDomain,
+    namespace: &str,
+    entity_kind: &str,
+    bytes: &[u8],
+) -> Result<Vec<u8>, ReceiptError> {
+    let capacity = [domain.tag().len(), namespace.len(), entity_kind.len(), bytes.len(), 32]
+        .into_iter()
+        .try_fold(0_usize, |total, length| total.checked_add(length))
+        .ok_or(ReceiptError::CommitmentTooLarge)?;
+    let mut message = Vec::with_capacity(capacity);
+    append_commitment_field(&mut message, domain.tag().as_bytes())?;
+    append_commitment_field(&mut message, namespace.as_bytes())?;
+    append_commitment_field(&mut message, entity_kind.as_bytes())?;
+    append_commitment_field(&mut message, bytes)?;
+    Ok(message)
+}
+
+fn append_commitment_field(output: &mut Vec<u8>, field: &[u8]) -> Result<(), ReceiptError> {
+    let length = u64::try_from(field.len()).map_err(|_| ReceiptError::CommitmentTooLarge)?;
+    output.extend_from_slice(&length.to_le_bytes());
+    output.extend_from_slice(field);
+    Ok(())
+}
 
 /// RFC 2104 HMAC-SHA-256, retained in-tree to keep the dependency allowlist.
 #[must_use]
@@ -285,6 +317,7 @@ pub enum ReceiptError {
         grade: ReceiptGrade,
         retention: ReceiptRetention,
     },
+    CommitmentTooLarge,
     MissingChecks,
 }
 
@@ -299,6 +332,9 @@ impl fmt::Display for ReceiptError {
                 formatter,
                 "receipt grade {grade:?} is incompatible with public retention {retention:?}"
             ),
+            Self::CommitmentTooLarge => {
+                formatter.write_str("receipt commitment field does not fit u64 length framing")
+            }
             Self::MissingChecks => formatter.write_str("receipt requires at least one named check"),
         }
     }
@@ -358,6 +394,23 @@ fn validate_authority(field: &'static str, value: &str) -> Result<(), ReceiptErr
     Ok(())
 }
 
+fn validate_identifier(field: &'static str, value: &str) -> Result<(), ReceiptError> {
+    let bytes = value.as_bytes();
+    let valid_first = bytes
+        .first()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric());
+    let valid_rest = bytes.iter().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'/' | b'-')
+    });
+    if !valid_first || !valid_rest || bytes.len() > 256 {
+        return Err(ReceiptError::InvalidField {
+            field,
+            reason: "must match the bounded receipt identifier grammar",
+        });
+    }
+    Ok(())
+}
+
 fn validate_commit(field: &'static str, value: &str) -> Result<(), ReceiptError> {
     if value.len() != 40
         || !value
@@ -370,6 +423,21 @@ fn validate_commit(field: &'static str, value: &str) -> Result<(), ReceiptError>
         });
     }
     Ok(())
+}
+
+fn digest_from_bytes(bytes: [u8; 32]) -> Sha256Digest {
+    Sha256Digest::from_hex(&hex_lower(&bytes))
+        .expect("a fixed-width SHA-256 byte array always has valid lowercase hex")
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[usize::from(*byte >> 4)] as char);
+        output.push(HEX[usize::from(*byte & 0x0f)] as char);
+    }
+    output
 }
 
 #[cfg(test)]
@@ -443,7 +511,7 @@ mod tests {
     fn hmac_sha256_matches_rfc_4231_case_one() {
         let output = hmac_sha256(&[0x0b; 20], b"Hi There");
         assert_eq!(
-            hex(&output),
+            hex_lower(&output),
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
     }
@@ -452,8 +520,12 @@ mod tests {
     fn commitment_domains_are_distinct_and_export_never_contains_raw_digest() {
         let private = b"yes";
         let key = CommitmentKey::new("owner-key-2026", [7; 32]).expect("key id");
-        let input = key.commit(CommitmentDomain::Input, private);
-        let output = key.commit(CommitmentDomain::Output, private);
+        let input = key
+            .commit(CommitmentDomain::Input, "receipt-fixture", "input", private)
+            .expect("input commitment");
+        let output = key
+            .commit(CommitmentDomain::Output, "receipt-fixture", "output", private)
+            .expect("output commitment");
         assert_ne!(input.hmac_sha256, output.hmac_sha256);
 
         let receipt = Receipt::from_identities(
@@ -499,16 +571,6 @@ mod tests {
     }
 
     fn digest_private(bytes: &[u8]) -> String {
-        hex(&Sha256::digest(bytes))
-    }
-
-    fn hex(bytes: &[u8]) -> String {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut output = String::with_capacity(bytes.len() * 2);
-        for byte in bytes {
-            output.push(HEX[usize::from(*byte >> 4)] as char);
-            output.push(HEX[usize::from(*byte & 0x0f)] as char);
-        }
-        output
+        hex_lower(&Sha256::digest(bytes))
     }
 }
