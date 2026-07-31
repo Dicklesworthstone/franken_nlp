@@ -13,6 +13,7 @@ $script:Cases = 0
 $script:Failed = [System.Collections.Generic.List[string]]::new()
 $script:Server = $null
 $script:RedirectServer = $null
+$script:RetryServer = $null
 $script:PwshPath = $null
 
 function Write-Log([string]$Message) { [Console]::Error.WriteLine("{0} FETCH_MODEL_TEST {1}" -f [DateTime]::UtcNow.ToString('o'), $Message) }
@@ -28,6 +29,84 @@ function Stop-RedirectServer {
         try { Stop-Process -Id $script:RedirectServer.Id -ErrorAction Stop } catch {}
         $script:RedirectServer = $null
     }
+}
+function Stop-RetryServer {
+    if ($script:RetryServer) {
+        try { Stop-Process -Id $script:RetryServer.Id -ErrorAction Stop } catch {}
+        $script:RetryServer = $null
+    }
+}
+function Start-InterruptedResumeServer {
+    $ready = Join-Path $Work 'retry.ready'
+    $trace = Join-Path $Work 'retry.trace'
+    $serverScript = Join-Path $Work 'retry_server.py'
+    $serverCode = @'
+import http.server
+import socket
+import sys
+from pathlib import Path
+from urllib.parse import urlsplit
+
+fixture, ready_path, trace_path = sys.argv[1:]
+root = Path(fixture)
+state = {"first_alpha": True}
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        candidate = root / Path(urlsplit(self.path).path).name
+        if not candidate.is_file():
+            self.send_error(404)
+            return
+        payload = candidate.read_bytes()
+        range_header = self.headers.get("Range", "")
+        with open(trace_path, "a", encoding="ascii") as trace:
+            trace.write("{} range={}\n".format(candidate.name, range_header))
+        if candidate.name == "alpha.bin" and state["first_alpha"]:
+            state["first_alpha"] = False
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload[:5])
+            self.wfile.flush()
+            self.close_connection = True
+            self.connection.shutdown(socket.SHUT_RDWR)
+            return
+        if candidate.name == "alpha.bin":
+            expected = "bytes=5-"
+            if range_header != expected:
+                self.send_error(416, "expected {}".format(expected))
+                return
+            remainder = payload[5:]
+            self.send_response(206)
+            self.send_header("Content-Length", str(len(remainder)))
+            self.send_header("Content-Range", "bytes 5-{}/{}".format(len(payload) - 1, len(payload)))
+            self.end_headers()
+            self.wfile.write(remainder)
+            return
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, _format, *_args):
+        pass
+
+server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+with open(ready_path, "w", encoding="ascii") as ready:
+    ready.write(str(server.server_address[1]))
+server.serve_forever()
+'@
+    Set-Content -LiteralPath $serverScript -NoNewline -Encoding utf8 -Value $serverCode
+    $script:RetryServer = Start-Process -FilePath python3 -ArgumentList @($serverScript, $Fixture, $ready, $trace) -PassThru -RedirectStandardOutput (Join-Path $Work 'retry.out') -RedirectStandardError (Join-Path $Work 'retry.err')
+    for ($attempt = 0; $attempt -lt 30; $attempt++) {
+        if (Test-Path -LiteralPath $ready) {
+            $port = [int](Get-Content -LiteralPath $ready -Raw)
+            return [PSCustomObject]@{ Base = "http://127.0.0.1:$port/resolve/$Revision"; Trace = $trace }
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    Stop-RetryServer
+    return $null
 }
 function Start-RedirectServer([string]$RedirectHost) {
     $cert = Join-Path $Work 'redirect.crt'
@@ -249,6 +328,15 @@ try {
     $env:FNLP_FETCH_ALLOW_TEST_BASE_URL = '1'; & pwsh -NoProfile -File $Fetch -Dest $d8 -Catalog $script:Catalog -TestBaseUrl 'http://127.0.0.1:1' -AllowUntrustedRevision 2> (Join-Path $Work 'case8.err'); $status = $LASTEXITCODE
     if ($status -eq 3 -and (Get-Content (Join-Path $Work 'case8.err') -Raw) -match ([regex]::Escape("-Dest `"$d8`""))) { Pass '8' 'interrupted-resume-guidance' } else { Fail '8' "interrupted-resume-guidance exit=$status" }
 
+    $script:Cases++; $d8retry = Join-Path $Work 'case8retry'; $retry = Start-InterruptedResumeServer
+    if ($retry) {
+        $env:FNLP_FETCH_ALLOW_TEST_BASE_URL = '1'; & pwsh -NoProfile -File $Fetch -Dest $d8retry -Catalog $script:Catalog -TestBaseUrl $retry.Base -AllowUntrustedRevision 2> (Join-Path $Work 'case8retry.err'); $status = $LASTEXITCODE
+        if ($status -eq 0 -and (Get-FileHash (Join-Path $d8retry 'alpha.bin') -Algorithm SHA256).Hash.ToLowerInvariant() -eq $alphaSha -and (Get-Content -LiteralPath $retry.Trace -Raw) -match 'alpha.bin range=bytes=5-') { Pass '8retry' 'retry-rebinds-range-after-partial-body' } else { Fail '8retry' "retry-rebinds-range-after-partial-body exit=$status" }
+    } else {
+        Fail '8retry' 'retry-server'
+    }
+    Stop-RetryServer
+
     $script:Cases++; $d9 = Join-Path $Work 'case9'; $status = Invoke-Fetch $d9 @('-CheckOnly')
     if ($status -eq 0) { Pass '9' 'check-only-no-model-skip' } else { Fail '9' "check-only-no-model-skip exit=$status" }
 
@@ -273,6 +361,7 @@ try {
 } finally {
     if ($script:Server) { try { Stop-Process -Id $script:Server.Id -ErrorAction Stop } catch {} }
     Stop-RedirectServer
+    Stop-RetryServer
     if ($script:Failed.Count -eq 0) { Write-Log "FETCH_MODEL_TESTS RESULT=PASS cases=$script:Cases failed=none retained_work=$Work"; exit 0 }
     Write-Log "FETCH_MODEL_TESTS RESULT=FAIL cases=$script:Cases failed=$($script:Failed -join ',') retained_work=$Work"; exit 1
 }
