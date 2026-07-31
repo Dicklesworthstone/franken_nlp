@@ -119,7 +119,6 @@ struct SupplyChainManifest {
 struct SupplyChainPackage {
     name: String,
     version: String,
-    source: String,
 }
 
 #[test]
@@ -507,13 +506,7 @@ fn validate_supply_chain_manifest(root: &Path, report: &PolicyReport) -> Result<
     let manifest_inventory: BTreeSet<String> = manifest
         .packages
         .into_iter()
-        .map(|package| {
-            if package.source.trim().is_empty() {
-                format!("{}@{}", package.name, package.version)
-            } else {
-                format!("{}@{}", package.name, package.version)
-            }
-        })
+        .map(|package| format!("{}@{}", package.name, package.version))
         .collect();
     if manifest_inventory.len() != report.release_package_inventory.len()
         || manifest_inventory != report.release_package_inventory
