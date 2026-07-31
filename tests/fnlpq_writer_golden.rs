@@ -6,6 +6,7 @@ use franken_nlp::artifact::format::{
     framed_sha256_hex, logical_model_sha256 as compute_logical_model_sha256, logical_tensor_sha256,
     streaming_input_from_materialized, write, write_streaming,
 };
+use franken_nlp::artifact::format::LogicalTensorStreamingHasher;
 use franken_nlp::artifact::reader::FnlpqArtifact;
 use franken_nlp::canonjson;
 use serde::Serialize;
@@ -131,6 +132,70 @@ fn tiny_input() -> FnlpqWriterInput {
             },
         ],
     }
+}
+
+#[test]
+fn incremental_logical_tensor_hasher_matches_the_framed_v1_identity() {
+    let data = [0x80, 0x3f, 0x00, 0x40];
+    let scales = [0x00, 0x00, 0x00, 0x3f];
+    let row_sums = [0_i32.to_le_bytes(), 1_i32.to_le_bytes()].concat();
+    let expected = framed_sha256(
+        "fnlpq-logical-tensor-v1",
+        &[
+            b"model.layers.0.self_attn.q_proj.weight",
+            b"i8",
+            &[1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0],
+            b"portable-quant-v1",
+            &data,
+            &scales,
+            &row_sums,
+        ],
+    )
+    .expect("bounded framed identity");
+
+    let mut incremental = LogicalTensorStreamingHasher::new(
+        "model.layers.0.self_attn.q_proj.weight",
+        "i8",
+        &[2],
+        "portable-quant-v1",
+        data.len() as u64,
+        scales.len() as u64,
+        row_sums.len() as u64,
+    )
+    .expect("bounded logical tensor declaration");
+    incremental
+        .write_data(&data[..1])
+        .expect("first payload panel");
+    incremental
+        .write_data(&data[1..])
+        .expect("second payload panel");
+    incremental
+        .write_scale(&scales)
+        .expect("complete scale sidecar");
+    incremental
+        .write_row_sum(&row_sums)
+        .expect("complete row-sum sidecar");
+
+    assert_eq!(incremental.finish().expect("complete first pass"), expected);
+}
+
+#[test]
+fn incremental_logical_tensor_hasher_rejects_sidecars_before_payload_completion() {
+    let mut incremental = LogicalTensorStreamingHasher::new(
+        "model.embed_tokens.weight",
+        "bf16",
+        &[2],
+        "bf16-verbatim-v1",
+        4,
+        0,
+        0,
+    )
+    .expect("bounded logical tensor declaration");
+
+    assert!(matches!(
+        incremental.write_scale(&[]),
+        Err(FnlpqWriteError::LogicalTensorStream { field: "data", .. })
+    ));
 }
 
 #[test]

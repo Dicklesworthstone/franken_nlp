@@ -443,6 +443,9 @@ pub enum FnlpqWriteError {
         expected: String,
         actual: String,
     },
+    /// A bounded first-pass logical-tensor digest received its data, scale, or
+    /// row-sum bytes out of order or at a length different from its plan.
+    LogicalTensorStream { field: &'static str, detail: String },
     /// A packing set is incomplete or does not name valid stored sections.
     Packing { set: String, reason: String },
     /// JSON serialization of a typed closed schema failed.
@@ -504,6 +507,9 @@ impl fmt::Display for FnlpqWriteError {
                 formatter,
                 "logical identity mismatch for {record}: expected={expected} actual={actual}"
             ),
+            Self::LogicalTensorStream { field, detail } => {
+                write!(formatter, "logical tensor stream {field}: {detail}")
+            }
             Self::Packing { set, reason } => write!(formatter, "packing set {set}: {reason}"),
             Self::CanonicalJson(reason) => write!(formatter, "canonical header JSON: {reason}"),
             Self::NonFiniteScale { index } => {
@@ -575,6 +581,143 @@ pub fn framed_sha256_hex(tag: &str, fields: &[&[u8]]) -> Result<String, FnlpqWri
     Ok(hex_lower(&framed_sha256(tag, fields)?))
 }
 
+/// Incremental first-pass identity for one logical tensor.
+///
+/// A conversion pass may write its data bytes panel-by-panel, but v1 frames
+/// the scale and row-sum fields after the complete data field.  This state
+/// machine preserves that order and the three planned lengths without
+/// retaining the tensor image in memory.
+pub struct LogicalTensorStreamingHasher {
+    hasher: Sha256,
+    data_remaining: u64,
+    scale_remaining: u64,
+    row_sum_remaining: u64,
+    scale_started: bool,
+    row_sum_started: bool,
+}
+
+impl LogicalTensorStreamingHasher {
+    /// Start a framed v1 logical-tensor identity from fixed declaration
+    /// metadata and its three precomputed Generic byte lengths.
+    pub fn new(
+        name: &str,
+        canonical_dtype: &str,
+        shape: &[u32],
+        quantization: &str,
+        data_len: u64,
+        scale_len: u64,
+        row_sum_len: u64,
+    ) -> Result<Self, FnlpqWriteError> {
+        let encoded_shape = encode_logical_tensor_shape(shape)?;
+        let mut hasher = framed_stream_hasher("fnlpq-logical-tensor-v1", 7);
+        for field in [
+            name.as_bytes(),
+            canonical_dtype.as_bytes(),
+            encoded_shape.as_slice(),
+            quantization.as_bytes(),
+        ] {
+            framed_stream_field_prefix(
+                &mut hasher,
+                u64::try_from(field.len()).map_err(|_| FnlpqWriteError::Arithmetic {
+                    field: "logical tensor stream declaration length",
+                })?,
+            );
+            hasher.update(field);
+        }
+        framed_stream_field_prefix(&mut hasher, data_len);
+        Ok(Self {
+            hasher,
+            data_remaining: data_len,
+            scale_remaining: scale_len,
+            row_sum_remaining: row_sum_len,
+            scale_started: false,
+            row_sum_started: false,
+        })
+    }
+
+    /// Append the next bounded Generic payload panel for this tensor.
+    pub fn write_data(&mut self, bytes: &[u8]) -> Result<(), FnlpqWriteError> {
+        if self.scale_started {
+            return Err(logical_tensor_stream_error(
+                "data",
+                "payload bytes arrived after the scale field began",
+            ));
+        }
+        write_logical_tensor_stream_bytes(&mut self.hasher, &mut self.data_remaining, "data", bytes)
+    }
+
+    /// Append the complete tensor's Generic scale sidecar after its payload.
+    pub fn write_scale(&mut self, bytes: &[u8]) -> Result<(), FnlpqWriteError> {
+        self.start_scale()?;
+        if self.row_sum_started {
+            return Err(logical_tensor_stream_error(
+                "scale",
+                "scale bytes arrived after the row-sum field began",
+            ));
+        }
+        write_logical_tensor_stream_bytes(
+            &mut self.hasher,
+            &mut self.scale_remaining,
+            "scale",
+            bytes,
+        )
+    }
+
+    /// Append the complete tensor's Generic row-sum sidecar after scales.
+    pub fn write_row_sum(&mut self, bytes: &[u8]) -> Result<(), FnlpqWriteError> {
+        self.start_row_sum()?;
+        write_logical_tensor_stream_bytes(
+            &mut self.hasher,
+            &mut self.row_sum_remaining,
+            "row_sum",
+            bytes,
+        )
+    }
+
+    /// Finish only when the data and both sidecars exactly match their
+    /// precomputed lengths.
+    pub fn finish(mut self) -> Result<[u8; 32], FnlpqWriteError> {
+        self.start_scale()?;
+        self.start_row_sum()?;
+        if self.row_sum_remaining != 0 {
+            return Err(logical_tensor_stream_error(
+                "row_sum",
+                &format!("underflow by {} planned bytes", self.row_sum_remaining),
+            ));
+        }
+        Ok(self.hasher.finalize().into())
+    }
+
+    fn start_scale(&mut self) -> Result<(), FnlpqWriteError> {
+        if self.data_remaining != 0 {
+            return Err(logical_tensor_stream_error(
+                "data",
+                &format!("underflow by {} planned bytes", self.data_remaining),
+            ));
+        }
+        if !self.scale_started {
+            framed_stream_field_prefix(&mut self.hasher, self.scale_remaining);
+            self.scale_started = true;
+        }
+        Ok(())
+    }
+
+    fn start_row_sum(&mut self) -> Result<(), FnlpqWriteError> {
+        self.start_scale()?;
+        if self.scale_remaining != 0 {
+            return Err(logical_tensor_stream_error(
+                "scale",
+                &format!("underflow by {} planned bytes", self.scale_remaining),
+            ));
+        }
+        if !self.row_sum_started {
+            framed_stream_field_prefix(&mut self.hasher, self.row_sum_remaining);
+            self.row_sum_started = true;
+        }
+        Ok(())
+    }
+}
+
 /// Compute the canonical identity of one logical tensor record.
 ///
 /// The record binds the name, source dtype, shape, generic quantization
@@ -589,17 +732,7 @@ pub fn logical_tensor_sha256(
     scale: &[u8],
     row_sum: &[u8],
 ) -> Result<[u8; 32], FnlpqWriteError> {
-    let mut encoded_shape = Vec::with_capacity(8 + shape.len().saturating_mul(4));
-    encoded_shape.extend_from_slice(
-        &u64::try_from(shape.len())
-            .map_err(|_| FnlpqWriteError::Arithmetic {
-                field: "logical tensor shape rank",
-            })?
-            .to_le_bytes(),
-    );
-    for dimension in shape {
-        encoded_shape.extend_from_slice(&dimension.to_le_bytes());
-    }
+    let encoded_shape = encode_logical_tensor_shape(shape)?;
     framed_sha256(
         "fnlpq-logical-tensor-v1",
         &[
@@ -612,6 +745,51 @@ pub fn logical_tensor_sha256(
             row_sum,
         ],
     )
+}
+
+fn encode_logical_tensor_shape(shape: &[u32]) -> Result<Vec<u8>, FnlpqWriteError> {
+    let mut encoded_shape = Vec::with_capacity(8 + shape.len().saturating_mul(4));
+    encoded_shape.extend_from_slice(
+        &u64::try_from(shape.len())
+            .map_err(|_| FnlpqWriteError::Arithmetic {
+                field: "logical tensor shape rank",
+            })?
+            .to_le_bytes(),
+    );
+    for dimension in shape {
+        encoded_shape.extend_from_slice(&dimension.to_le_bytes());
+    }
+    Ok(encoded_shape)
+}
+
+fn logical_tensor_stream_error(field: &'static str, detail: &str) -> FnlpqWriteError {
+    FnlpqWriteError::LogicalTensorStream {
+        field,
+        detail: detail.to_owned(),
+    }
+}
+
+fn write_logical_tensor_stream_bytes(
+    hasher: &mut Sha256,
+    remaining: &mut u64,
+    field: &'static str,
+    bytes: &[u8],
+) -> Result<(), FnlpqWriteError> {
+    let bytes_len = u64::try_from(bytes.len()).map_err(|_| FnlpqWriteError::Arithmetic {
+        field: "logical tensor stream write length",
+    })?;
+    if bytes_len > *remaining {
+        return Err(logical_tensor_stream_error(
+            field,
+            &format!(
+                "overflow: planned remaining={} received={bytes_len}",
+                *remaining
+            ),
+        ));
+    }
+    hasher.update(bytes);
+    *remaining -= bytes_len;
+    Ok(())
 }
 
 /// Compute the domain-separated identity of one materialized semantic source.
