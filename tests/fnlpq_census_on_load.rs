@@ -274,6 +274,30 @@ fn logical_identity_is_checked_at_write_and_load_boundaries() {
         Err(FnlpqWriteError::LogicalIdentity { .. })
     ));
 
+    for source_name in [
+        "model-config",
+        "tokenizer-model",
+        "tokenizer-config",
+        "chat-template",
+    ] {
+        let mut stale_source = tiny_input();
+        stale_source
+            .sections
+            .iter_mut()
+            .find(|section| section.name == source_name)
+            .expect("tiny input includes every materialized identity source")
+            .bytes
+            .push(0x7f);
+        let error = write(&stale_source)
+            .expect_err("changing a materialized source must invalidate the stale model digest");
+        let detail = error.to_string();
+        assert!(matches!(error, FnlpqWriteError::LogicalIdentity { .. }));
+        assert!(detail.contains("logical_model_sha256"));
+        eprintln!(
+            "FNLPQ_LOGICAL_IDENTITY source={source_name} verdict=REFUSED reason=stale_model_digest"
+        );
+    }
+
     let valid = write(&tiny_input())
         .expect("tiny logical fixture writes")
         .bytes;
