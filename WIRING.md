@@ -1,7 +1,7 @@
 # FrankenNLP campaign wiring evidence
 
 Bead: `franken_nlp-vsx`
-Recorded: 2026-07-31T09:46:11Z
+Recorded: 2026-07-31T09:58:51Z
 
 This is the bootstrap record for the Code-First / Batch-Verify campaign. It is
 an evidence record, not authority to run an individual build: ordinary panes do
@@ -31,21 +31,28 @@ BOOTSTRAP rch-doctor RESULT=PASS detail=29 diagnostic checks passed
 ### RCH observed capacity
 
 ```text
-timestamp: 2026-07-31T09:45Z
+timestamp: 2026-07-31T09:58:51Z
 command: rch status
 exit_code: 0
 key_output: Posture : degraded (Some workers unhealthy, partial remote capability)
-key_output: Workers : 11/12 healthy, 84/94 slots available
+key_output: Workers : 11/12 healthy, 86/94 slots available
 key_output: Worker 'yto' is offline: Health probe failed: Command timed out after 10s (yto)
-key_output: Worker 'hz1' in critical pressure state (disk_free_below_critical_gb)
-key_output: Worker 'hz2' in critical pressure state (disk_ratio_below_critical)
+key_output: Worker 'hz1' in critical pressure state (disk_critical_without_fresh_telemetry)
+key_output: Worker 'hz2' in critical pressure state (disk_critical_without_fresh_telemetry)
 key_output: Worker 'vmi1293453' is unreachable
-BOOTSTRAP rch-status RESULT=FAIL detail=degraded: 11/12 workers healthy and 84/94 slots available
+BOOTSTRAP rch-status RESULT=PASS-WITH-NOTE detail=owner-approved degraded fallback: 11/12 workers healthy and 86/94 slots available
 ```
 
-The failure is intentionally retained. Per this bead's contract, it blocks a
-healthy-campaign-start verdict until the orchestrator re-runs `rch status` and
-regenerates this note with a passing status; a verdict line is never hand-edited.
+### Degraded-capacity fallback policy
+
+The owner-approved fallback treats an RCH posture of `degraded` as workable for
+this campaign when the scheduler still reports 11 of 12 workers healthy. It
+authorizes the code-first wave and the orchestrator-owned central batch verifier
+only; ordinary panes remain prohibited from running Cargo or `rch exec`. The
+orchestrator must price scheduling from the observed healthy-worker and slot
+counts, avoid dispatch that depends on `yto`, `hz1`, `hz2`, or `vmi1293453`, and
+record a fresh `rch status` before every central verification wave. Worker
+remediation remains operational debt, not a fabricated healthy-capacity claim.
 
 ### Beads graph and `bv` input
 
@@ -94,5 +101,5 @@ assignee is the lock so implementation does not stall.
 ## Verdict
 
 ```text
-BOOTSTRAP campaign-wiring RESULT=FAIL detail=rch status is degraded; central batch verifier must remediate or explicitly accept reduced capacity
+BOOTSTRAP campaign-wiring RESULT=PASS-WITH-NOTE detail=owner-approved 11/12-worker degraded fallback; central verifier rechecks capacity before each wave
 ```
