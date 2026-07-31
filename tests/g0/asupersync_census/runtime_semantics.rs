@@ -7,9 +7,9 @@
 //!
 //! Residual items for the runtime-backed continuation of this census (they
 //! need a constructed runtime or Lab and are NOT emitted from this file):
-//! cast-enqueue-only, try-cast overflow policies, ExecPlan::first_ok
-//! drive-all-no-short-circuit, preset worker/blocking observation, Lab
-//! determinism + crashpack replay, capability compile-fail suite.
+//! cast-enqueue-only, try-cast overflow policies, preset worker/blocking
+//! observation, Lab determinism + crashpack replay, capability compile-fail
+//! suite.
 
 use std::{
     future::Future,
@@ -47,7 +47,11 @@ fn cancelkind_eleven_variants_present_and_round_trip() {
         CancelKind::Shutdown,
         CancelKind::LinkedExit,
     ];
-    assert_eq!(all.len(), 11, "doctrine demands exactly eleven CancelKind variants");
+    assert_eq!(
+        all.len(),
+        11,
+        "doctrine demands exactly eleven CancelKind variants"
+    );
     for kind in all {
         let encoded = serde_json::to_string(&kind).expect("CancelKind serializes");
         let decoded: CancelKind = serde_json::from_str(&encoded).expect("CancelKind deserializes");
@@ -88,9 +92,16 @@ fn first_ok_outcomes_is_input_order_classification_only() {
     ];
     let picked = first_ok_outcomes(outcomes);
     let success = picked.success.expect("a success exists");
-    assert_eq!(success.index, 1, "selection is first success in input order");
+    assert_eq!(
+        success.index, 1,
+        "selection is first success in input order"
+    );
     assert_eq!(picked.total, 3);
-    assert_eq!(picked.failures.len(), 1, "failures before the winner are preserved");
+    assert_eq!(
+        picked.failures.len(),
+        1,
+        "failures before the winner are preserved"
+    );
     assert_eq!(picked.failures[0].0, 0, "failure indices keep input order");
     println!("G0_CENSUS item=first-ok-sequential case=mixed picked_index=1 failures_before=1");
 
@@ -105,9 +116,19 @@ fn first_ok_outcomes_is_input_order_classification_only() {
     ];
     let none = first_ok_outcomes(all_fail);
     assert!(none.success.is_none());
-    assert_eq!(none.failures.len(), 2, "cancellation stops the chain; index 2 unclassified");
-    assert!(none.was_cancelled, "cancellation is surfaced, not swallowed");
-    assert!(!none.had_panic, "the panic after the chain-stopping cancel is never seen");
+    assert_eq!(
+        none.failures.len(),
+        2,
+        "cancellation stops the chain; index 2 unclassified"
+    );
+    assert!(
+        none.was_cancelled,
+        "cancellation is surfaced, not swallowed"
+    );
+    assert!(
+        !none.had_panic,
+        "the panic after the chain-stopping cancel is never seen"
+    );
     println!("G0_CENSUS item=first-ok-sequential case=cancel-stops-chain classified=2of3");
 
     let panic_stops: Vec<Outcome<&str, &str>> = vec![
@@ -117,7 +138,11 @@ fn first_ok_outcomes_is_input_order_classification_only() {
     ];
     let stopped = first_ok_outcomes(panic_stops);
     assert!(stopped.success.is_none());
-    assert_eq!(stopped.failures.len(), 2, "panic stops the chain; index 2 unclassified");
+    assert_eq!(
+        stopped.failures.len(),
+        2,
+        "panic stops the chain; index 2 unclassified"
+    );
     assert!(stopped.had_panic);
     assert!(!stopped.was_cancelled);
     println!("G0_CENSUS item=first-ok-sequential case=panic-stops-chain classified=2of3");
@@ -192,7 +217,10 @@ fn preset_builder_values_observed_on_constructed_runtimes() {
     let default_rt = RuntimeBuilder::multi_thread()
         .build()
         .expect("multi_thread runtime builds");
-    assert_eq!(default_rt.config().worker_threads, RuntimeConfig::DEFAULT_WORKER_THREADS);
+    assert_eq!(
+        default_rt.config().worker_threads,
+        RuntimeConfig::DEFAULT_WORKER_THREADS
+    );
     println!(
         "G0_CENSUS item=preset-values preset=multi_thread workers={}",
         default_rt.config().worker_threads
@@ -232,7 +260,9 @@ fn preset_builder_values_observed_on_constructed_runtimes() {
         "RATIFIED",
         "observed-on-built-runtimes:current1+default4+throughput8x32+latency4x32",
     );
-    println!("G0_CENSUS summary items=4 ratified=4 absent_with_fallback=0 fail=0 residual=cast-enqueue-only,try-cast-policies,execplan-first-ok,lab-determinism,compile-fail-suite");
+    println!(
+        "G0_CENSUS summary items=4 ratified=4 absent_with_fallback=0 fail=0 residual=cast-enqueue-only,try-cast-policies,lab-determinism,compile-fail-suite"
+    );
 }
 
 /// `ExecPlan::first_ok` is not the sequential mirror fallback required by
