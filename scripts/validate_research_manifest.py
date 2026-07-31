@@ -404,18 +404,20 @@ def expect_self_test_failure(callback: Any, expected: str) -> None:
 
 def self_test() -> int:
     """Exercise fail-closed manifest invariants without creating mutable evidence files."""
-    valid_census = {
-        "entries": [
-            {
-                "length": 0,
-                "path": "README.md",
-                "sha256": "0" * 64,
-            }
-        ],
-        "file_count": 1,
-        "revision": PINNED_REVISION,
-        "upstream_license_file": None,
-        "upstream_notice_file": None,
+    valid_manifest = {
+        "repository_census": {
+            "entries": [
+                {
+                    "length": 0,
+                    "path": "README.md",
+                    "sha256": "0" * 64,
+                }
+            ],
+            "file_count": 1,
+            "revision": PINNED_REVISION,
+            "upstream_license_file": None,
+            "upstream_notice_file": None,
+        }
     }
     validate_top_level(
         {
@@ -429,12 +431,18 @@ def self_test() -> int:
             "schema_version": 1,
         }
     )
-    census, mismatches = validate_repository_census(valid_census)
+    census, mismatches = validate_repository_census(valid_manifest)
     if len(census) != 1 or mismatches:
         fail("self-test valid census did not validate")
     expect_self_test_failure(
         lambda: validate_repository_census(
-            {key: value for key, value in valid_census.items() if key != "upstream_license_file"}
+            {
+                "repository_census": {
+                    key: value
+                    for key, value in valid_manifest["repository_census"].items()
+                    if key != "upstream_license_file"
+                }
+            }
         ),
         "repository_census missing required null field: upstream_license_file",
     )
