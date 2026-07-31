@@ -197,10 +197,10 @@ impl VocabTrie {
         tokenizer: &SpBpeTokenizer,
         model_vocab_size: usize,
     ) -> Result<Self, VocabTrieBuildError> {
-        Self::from_transducer(DetokenizationTransducer::from_tokenizer(
+        Ok(Self::from_transducer(DetokenizationTransducer::from_tokenizer(
             tokenizer,
             model_vocab_size,
-        )?)
+        )?))
     }
 
     /// Build a trie from one already-audited exact-byte transducer.
