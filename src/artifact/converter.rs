@@ -655,11 +655,12 @@ impl PreparedConversionInput {
             parser_metadata_bytes,
             margin_bytes,
         };
-        let final_disk_bytes = staged_output_bytes
-            .checked_add(margin_bytes)
-            .ok_or(ConverterError::Arithmetic {
-                invariant: "preflight final disk bytes",
-            })?;
+        let final_disk_bytes =
+            staged_output_bytes
+                .checked_add(margin_bytes)
+                .ok_or(ConverterError::Arithmetic {
+                    invariant: "preflight final disk bytes",
+                })?;
         Ok(ConversionPreflight {
             closure_bytes_to_read: self.source.manifest.closure_total_bytes,
             staged_output_bytes,
@@ -1509,9 +1510,10 @@ fn census_digest(census: &[TensorCensusEntry]) -> Result<String, ConverterError>
     })?;
     hasher.update(count.to_le_bytes());
     for tensor in census {
-        let name_len = u64::try_from(tensor.name.len()).map_err(|_| ConverterError::Arithmetic {
-            invariant: "census tensor name length",
-        })?;
+        let name_len =
+            u64::try_from(tensor.name.len()).map_err(|_| ConverterError::Arithmetic {
+                invariant: "census tensor name length",
+            })?;
         hasher.update(name_len.to_le_bytes());
         hasher.update(tensor.name.as_bytes());
         hasher.update(tensor.dtype.as_str().as_bytes());

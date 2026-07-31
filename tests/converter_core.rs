@@ -2,8 +2,8 @@
 //! model-gated in `scripts/e2e_convert_roundtrip.sh`.
 
 use franken_nlp::artifact::converter::{
-    expected_nanbeige42_census, remap_tensor_name, validate_nanbeige42_census,
-    ConversionReceipt, ConversionSourceManifest, StorageStage,
+    expected_nanbeige42_census, remap_tensor_name, validate_nanbeige42_census, ConversionReceipt,
+    ConversionSourceManifest, StorageStage,
 };
 use franken_nlp::artifact::safetensors::TensorCensusEntry;
 
