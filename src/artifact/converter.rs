@@ -846,6 +846,44 @@ pub struct PanelPlan {
     pub largest_f32_panel_bytes: u64,
 }
 
+/// One lazy, source-order stream of bounded row panels for a tensor.
+///
+/// This keeps panel bookkeeping proportional to the current panel rather than
+/// to the number of rows in a strict-cap conversion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RowPanelIter {
+    total_rows: u64,
+    next_row: u64,
+    rows_per_panel: u64,
+}
+
+impl Iterator for RowPanelIter {
+    type Item = RowPanel;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next_row >= self.total_rows {
+            return None;
+        }
+        let row_count = self.rows_per_panel.min(self.total_rows - self.next_row);
+        let panel = RowPanel::Rows {
+            start_row: self.next_row,
+            row_count,
+        };
+        self.next_row += row_count;
+        Some(panel)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining_rows = self.total_rows - self.next_row;
+        let remaining_panels = remaining_rows / self.rows_per_panel
+            + u64::from(remaining_rows % self.rows_per_panel != 0);
+        match usize::try_from(remaining_panels) {
+            Ok(exact) => (exact, Some(exact)),
+            Err(_) => (usize::MAX, None),
+        }
+    }
+}
+
 impl PanelPlan {
     /// Derive a panel plan before allocating source or f32 work bytes.
     pub fn for_tensor(entry: &TensorCensusEntry, panel_cap: u64) -> Result<Self, ConverterError> {
@@ -927,23 +965,29 @@ impl PanelPlan {
         })
     }
 
-    /// Produce checked row ranges in source order.
-    pub fn row_panels(&self, total_rows: u64) -> Result<Vec<RowPanel>, ConverterError> {
-        let mut output = Vec::new();
-        let mut start_row = 0_u64;
-        while start_row < total_rows {
-            let row_count = self.rows_per_panel.min(total_rows - start_row);
-            output.push(RowPanel::Rows {
-                start_row,
-                row_count,
+    /// Produce a checked, lazy stream of row ranges in source order.
+    pub fn row_panels(&self, total_rows: u64) -> Result<RowPanelIter, ConverterError> {
+        if self.rows_per_panel == 0 {
+            return Err(ConverterError::InvalidPanelPlan {
+                tensor: self.tensor.clone(),
+                detail: "zero rows per panel cannot produce a stream".to_owned(),
             });
-            start_row = start_row
-                .checked_add(row_count)
-                .ok_or(ConverterError::Arithmetic {
-                    invariant: "panel row cursor",
-                })?;
         }
-        Ok(output)
+        let observed_panel_count = div_ceil(total_rows, self.rows_per_panel)?;
+        if observed_panel_count != self.panel_count {
+            return Err(ConverterError::InvalidPanelPlan {
+                tensor: self.tensor.clone(),
+                detail: format!(
+                    "row count {total_rows} requires {observed_panel_count} panels, plan declares {}",
+                    self.panel_count
+                ),
+            });
+        }
+        Ok(RowPanelIter {
+            total_rows,
+            next_row: 0,
+            rows_per_panel: self.rows_per_panel,
+        })
     }
 }
 
@@ -1740,7 +1784,45 @@ mod tests {
         assert_eq!(plan.rows_per_panel, 4);
         assert_eq!(plan.panel_count, 5);
         assert!(plan.largest_source_panel_bytes <= 64);
-        assert_eq!(plan.row_panels(17).expect("row panels").len(), 5);
+        assert_eq!(plan.row_panels(17).expect("row panels").count(), 5);
+    }
+
+    #[test]
+    fn row_panel_stream_keeps_strict_cap_bookkeeping_lazy() {
+        let entry = TensorCensusEntry {
+            name: "synthetic.weight".to_owned(),
+            dtype: SafetensorDtype::Bf16,
+            shape: vec![10_000, 1],
+            len: 20_000,
+        };
+        let plan = PanelPlan::for_tensor(&entry, 2).expect("one BF16 value per panel");
+        let mut panels = plan.row_panels(10_000).expect("lazy row stream");
+
+        assert_eq!(panels.size_hint(), (10_000, Some(10_000)));
+        assert_eq!(
+            panels.next(),
+            Some(RowPanel::Rows {
+                start_row: 0,
+                row_count: 1,
+            })
+        );
+        assert_eq!(panels.count(), 9_999);
+    }
+
+    #[test]
+    fn row_panel_stream_refuses_a_row_count_outside_its_plan() {
+        let entry = TensorCensusEntry {
+            name: "synthetic.weight".to_owned(),
+            dtype: SafetensorDtype::Bf16,
+            shape: vec![17, 1],
+            len: 34,
+        };
+        let plan = PanelPlan::for_tensor(&entry, 8).expect("four rows per panel");
+
+        let error = plan
+            .row_panels(16)
+            .expect_err("different row count must not reuse a panel plan");
+        assert!(error.to_string().contains("requires 4 panels"));
     }
 
     #[test]
