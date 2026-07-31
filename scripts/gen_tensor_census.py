@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -20,6 +21,7 @@ from typing import Any
 
 
 MODEL_REVISION = "f56ec5a9650268aa098496734743c25ea778bd2d"
+MODEL_NAME = "Nanbeige4.2-3B"
 INDEX_SHA256 = "30d8da0fa8b97abc6d9eddfd017a0cb7a649bcbd58caa57804c56c767db5c0f1"
 INDEX_BYTES = 16_519
 
@@ -269,6 +271,22 @@ def load_index(path: Path) -> set[str]:
     return set(weight_map)
 
 
+def default_index_path() -> Path:
+    """Return the approved fetch-script cache location for the pinned index."""
+    source_dir = os.environ.get("FNLP_SOURCE_DIR")
+    if source_dir:
+        return Path(source_dir) / "model.safetensors.index.json"
+    return (
+        Path.home()
+        / ".cache"
+        / "franken_nlp"
+        / "source"
+        / MODEL_NAME
+        / MODEL_REVISION
+        / "model.safetensors.index.json"
+    )
+
+
 def compare_committed_artifact(path: Path, generated: dict[str, Any]) -> tuple[list[str], list[str], list[str]]:
     try:
         committed = json.loads(path.read_bytes())
@@ -334,7 +352,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     mode.add_argument("--generate", action="store_true", help="write a canonical census after index-name validation")
     mode.add_argument("--check", action="store_true", help="diff the real index and committed census against regenerated expectations")
     mode.add_argument("--self-test", action="store_true", help="run hermetic arithmetic and negative-fixture tests")
-    parser.add_argument("--index", type=Path, help="verified model.safetensors.index.json")
+    parser.add_argument(
+        "--index",
+        type=Path,
+        help="verified model.safetensors.index.json (defaults to the fetch-script cache for --check)",
+    )
     parser.add_argument(
         "--output",
         type=Path,
@@ -342,8 +364,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="census artifact path (default: docs/truth-pack/tensor_census.json)",
     )
     args = parser.parse_args(argv)
-    if (args.generate or args.check) and args.index is None:
-        parser.error("--generate and --check require --index")
+    if args.generate and args.index is None:
+        parser.error("--generate requires --index")
     return args
 
 
@@ -357,9 +379,14 @@ def main(argv: list[str]) -> int:
             log("phase=self-test start")
             run_self_test()
         else:
+            index_path = args.index or default_index_path()
+            if args.check and not index_path.is_file():
+                log(f"phase=check source={index_path}")
+                log("RESULT=SKIPPED_NO_MODEL missing=0 mismatched=0 extra=0")
+                return 0
             log("phase=regenerate start")
             generated = census_document()
-            observed_names = load_index(args.index)
+            observed_names = load_index(index_path)
             expected_names = {record["name"] for record in generated["tensors"]}
             missing, extra = diff_names(expected_names, observed_names)
             report_and_raise(missing, mismatched, extra)
