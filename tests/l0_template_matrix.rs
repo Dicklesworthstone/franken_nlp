@@ -5,7 +5,7 @@
 //! installing those bytes later changes test data rather than renderer logic.
 
 use franken_nlp::template::{
-    AssistantReasoning, ContentPart, Conversation, DEFAULT_SYSTEM_TEXT, IM_START,
+    AssistantReasoning, ContentPart, Conversation, DEFAULT_SYSTEM_TEXT, IM_END, IM_START,
     MEDIA_REMINDER_TEXT, Message, MessageContent, MessageRole, RenderOptions, THINK_END,
     THINK_START, TemplateBuilder, ToolCall, ToolDefinition, ToolFormat, ToolResult,
 };
