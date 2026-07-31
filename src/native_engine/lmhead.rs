@@ -8,12 +8,16 @@ pub const NANBEIGE_VOCAB_SIZE: usize = 166_144;
 /// Exported f32 logits for the fixed vocabulary: 166,144 × 4 bytes.
 pub const NANBEIGE_F32_LOGIT_BYTES: usize = NANBEIGE_VOCAB_SIZE * size_of::<f32>();
 
-/// Projects hidden state through the untied lm_head and keeps logits in f32.
+/// Projects hidden state through the untied bf16 lm_head and exports f32 logits.
+///
+/// The pinned eager oracle's `nn.Linear` receives bf16 inputs and weights, so
+/// the completed projection narrows to bf16 before `logits.float()` widens it
+/// at the model's public output boundary.
 pub fn export_logits_f32(
     hidden: &[Bf16],
     lm_head: &Bf16Matrix,
 ) -> Result<Vec<f32>, WeightShapeError> {
-    lm_head.project_f32_export(hidden)
+    lm_head.project_f32_accumulate_bf16_then_export(hidden)
 }
 
 /// Deterministic first-index-wins greedy argmax over exported f32 logits.

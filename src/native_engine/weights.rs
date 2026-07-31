@@ -113,8 +113,16 @@ impl Bf16Matrix {
         Ok(cast_f32_to_bf16(&output))
     }
 
-    /// Reference f32 accumulation for the untied lm_head export boundary.
-    pub fn project_f32_export(&self, input: &[Bf16]) -> Result<Vec<f32>, WeightShapeError> {
+    /// Pinned `lm_head` operation result widened for the f32 logit boundary.
+    ///
+    /// `NanbeigeForCausalLM.forward` passes bf16 hidden activations and bf16
+    /// weights to `nn.Linear`, so the CPU eager linear operation returns bf16.
+    /// It then calls `logits.float()`. Keep the f32 dot-product accumulation,
+    /// but narrow the completed linear result to bf16 before that final export.
+    pub fn project_f32_accumulate_bf16_then_export(
+        &self,
+        input: &[Bf16],
+    ) -> Result<Vec<f32>, WeightShapeError> {
         if input.len() != self.columns {
             return Err(WeightShapeError::ProjectionInput {
                 expected: self.columns,
@@ -125,10 +133,12 @@ impl Bf16Matrix {
             .values
             .chunks_exact(self.columns)
             .map(|row| {
-                row.iter()
+                let accumulator = row
+                    .iter()
                     .zip(input)
                     .map(|(weight, activation)| weight.to_f32() * activation.to_f32())
-                    .sum::<f32>()
+                    .sum::<f32>();
+                Bf16::from_f32(accumulator).to_f32()
             })
             .collect())
     }

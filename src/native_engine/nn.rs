@@ -29,7 +29,7 @@ pub enum HfBf16EagerCastSite {
     SoftmaxF32CastBack,
     /// RoPE tables are f32 and rotate into bf16 q/k activations.
     RopeF32TableCastAtApplication,
-    /// The untied lm_head emits f32 logits.
+    /// The bf16 lm_head result widens to f32 at the public logits boundary.
     LogitsExportF32,
 }
 
