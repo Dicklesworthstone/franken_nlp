@@ -888,6 +888,12 @@ impl ConversionReceipt {
                 cap: self.peak_rss_cap_bytes,
             });
         }
+        if self.final_disk_bytes < self.output_len {
+            return Err(ConverterError::ReceiptField {
+                field: "final_disk_bytes",
+                detail: "must cover output_len".to_owned(),
+            });
+        }
         Ok(())
     }
 

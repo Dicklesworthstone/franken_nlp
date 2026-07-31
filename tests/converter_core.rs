@@ -118,6 +118,18 @@ fn receipt_requires_every_identity_and_serializes_canonically() {
     let json = receipt.canonical_json().expect("complete receipt");
     assert!(json.contains("\"recipe_id\":\"nanbeige42-int8-v1\""));
 
+    let undersized_disk = ConversionReceipt {
+        output_len: 21,
+        ..receipt.clone()
+    };
+    assert_eq!(
+        undersized_disk.canonical_json(),
+        Err(ConverterError::ReceiptField {
+            field: "final_disk_bytes",
+            detail: "must cover output_len".to_owned(),
+        })
+    );
+
     let malformed_commit = ConversionReceipt {
         converter_commit: "unbound-converter".to_owned(),
         ..receipt
