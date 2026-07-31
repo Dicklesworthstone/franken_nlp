@@ -653,10 +653,16 @@ def run_self_test() -> tuple[int, int]:
         config, _ = load_json_object(config_path)
         config["added_tokens_decoder"]["166106"] = {"content": "<new_special>", "special": True}
         config_path.write_bytes(canonical_json_bytes(config))
-        changed_specials, _ = build_registries(unverified_source_files(source))
-        drift = describe_registry_diff(changed_specials, (output / TOKENIZER_SPECIAL_OUTPUT).read_bytes(), path=output / TOKENIZER_SPECIAL_OUTPUT)
-        if "missing id=166106 surface='<new_special>'" not in drift:
-            raise RegistryError(f"self-test new-added-token negative did not report exact drift: {drift}")
+        changed_specials, changed_controls = build_registries(unverified_source_files(source))
+        try:
+            check_committed_artifacts(output, changed_specials, changed_controls)
+        except RegistryError as exc:
+            if "missing id=166106 surface='<new_special>'" not in str(exc):
+                raise RegistryError(
+                    "self-test new-added-token negative did not report exact drift: " + str(exc)
+                ) from exc
+        else:
+            raise RegistryError("self-test new-added-token negative was accepted by --check")
 
         docs = root / "docs"
         docs.mkdir()
