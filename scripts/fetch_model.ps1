@@ -19,8 +19,6 @@ $DefaultBase = 'https://huggingface.co/Nanbeige/Nanbeige4.2-3B/resolve'
 $MarginBytes = [int64]67108864
 $script:LockDir = $null
 $script:JournalDir = $null
-$script:TestRedirectPolicy = $env:FNLP_FETCH_ALLOW_TEST_REDIRECT_POLICY -eq '1'
-$script:TestInsecureTls = $env:FNLP_FETCH_TEST_ALLOW_INSECURE_TLS -eq '1'
 
 function Write-Log([string]$Message) {
     [Console]::Error.WriteLine("{0} FETCH_MODEL {1}" -f [DateTime]::UtcNow.ToString('o'), $Message)
@@ -214,7 +212,6 @@ function Download-Partial([string]$Url, [string]$Partial, [string]$Journal, $Ent
             $handler = [Net.Http.HttpClientHandler]::new()
             $handler.AllowAutoRedirect = $true
             $handler.MaxAutomaticRedirections = 8
-            if ($script:TestInsecureTls) { $handler.ServerCertificateCustomValidationCallback = { $true } }
             $client = [Net.Http.HttpClient]::new($handler)
             $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, $Url)
             if ($start -gt 0) { $request.Headers.Range = [Net.Http.Headers.RangeHeaderValue]::Parse("bytes=$start-") }
@@ -223,7 +220,7 @@ function Download-Partial([string]$Url, [string]$Partial, [string]$Journal, $Ent
             if ($start -gt 0 -and $response.StatusCode -ne [Net.HttpStatusCode]::PartialContent) { throw 'server refused secure Range resume' }
             $effectiveUri = $response.RequestMessage.RequestUri
             if (-not $TestBaseUrl -and -not (Test-EffectiveHost $effectiveUri)) {
-                Write-Log "REDIRECT_HOST_REFUSED effective_url=$effectiveUri"
+                Write-Log "REDIRECT_HOST_REFUSED phase=post-transfer activation=refused effective_url=$effectiveUri"
                 throw "redirect host refused effective_url=$effectiveUri"
             }
             $input = $response.Content.ReadAsStream()
@@ -279,7 +276,6 @@ if ($Revision -ne $DefaultRevision) {
     Write-Log "UNTRUSTED_REVISION revision=$Revision catalog=$Catalog; this download is not the default recipe/catalog identity"
 }
 if ($TestBaseUrl -and $env:FNLP_FETCH_ALLOW_TEST_BASE_URL -ne '1') { Exit-Fetch 2 '-TestBaseUrl requires FNLP_FETCH_ALLOW_TEST_BASE_URL=1' }
-if ($script:TestInsecureTls -and -not $script:TestRedirectPolicy) { Exit-Fetch 2 'FNLP_FETCH_TEST_ALLOW_INSECURE_TLS requires FNLP_FETCH_ALLOW_TEST_REDIRECT_POLICY=1' }
 
 Ensure-Destination
 $entries = Get-Catalog
