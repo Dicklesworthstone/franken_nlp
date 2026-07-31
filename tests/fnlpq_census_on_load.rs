@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 
 const PINNED_REVISION: &str = "f56ec5a9650268aa098496734743c25ea778bd2d";
 const BF16_RECIPE: &str = "bf16-verbatim-v1";
+const STRUCTURAL_CENSUS_RECIPE: &str = "census-structure-v1";
 
 #[test]
 fn complete_nanbeige_census_loads_and_missing_shape_and_name_drift_refuse() {
@@ -59,35 +60,35 @@ fn complete_nanbeige_census_loads_and_missing_shape_and_name_drift_refuse() {
 }
 
 #[test]
-fn bf16_synthetic_census_round_trip_preserves_every_record_bytes() {
+fn bounded_census_round_trip_preserves_every_mapped_record_bytes() {
     let mut input = nanbeige_input();
-    let expected_payloads = install_synthetic_bf16_payloads(&mut input);
+    let expected_payloads = install_structural_census_payloads(&mut input);
     let written = write(&input)
-        .expect("non-empty synthetic BF16 census artifact writes")
+        .expect("non-empty structural census artifact writes")
         .bytes;
     let artifact = FnlpqArtifact::from_bytes(written.clone())
-        .expect("checked loader accepts the non-empty synthetic BF16 census");
+        .expect("checked loader accepts the non-empty structural census");
     let reserialized = artifact
         .reserialize()
-        .expect("checked loader reserializes every synthetic BF16 record");
+        .expect("checked loader reserializes every structural census record");
 
     assert_eq!(
         reserialized, written,
-        "checked load then canonical re-serialize must preserve every BF16 record byte"
+        "checked load then canonical re-serialize must preserve every mapped record byte"
     );
     assert_eq!(artifact.tensors().len(), expected_payloads.len());
 
     for tensor in artifact.tensors() {
         assert_eq!(tensor.canonical_dtype, "bf16");
-        assert_eq!(tensor.quantization, BF16_RECIPE);
+        assert_eq!(tensor.quantization, STRUCTURAL_CENSUS_RECIPE);
         let expected = expected_payloads
             .get(&tensor.name)
-            .expect("every checked tensor has an expected BF16 byte slice");
+            .expect("every checked tensor has an expected mapped byte slice");
         let observed = checked_data_bytes(&artifact, tensor);
         assert_eq!(
             observed,
             expected.as_slice(),
-            "BF16 byte identity drifted for tensor={} bytes={}",
+            "mapped byte identity drifted for tensor={} bytes={}",
             tensor.name,
             expected.len()
         );
@@ -100,10 +101,59 @@ fn bf16_synthetic_census_round_trip_preserves_every_record_bytes() {
         );
     }
     eprintln!(
-        "FNLPQ_ROUND_TRIP RESULT=PASS tensors={} bf16_payload_bytes={}",
+        "FNLPQ_ROUND_TRIP RESULT=PASS tensors={} mapped_payload_bytes={}",
         expected_payloads.len(),
         expected_payloads.values().map(Vec::len).sum::<usize>()
     );
+}
+
+#[test]
+fn bf16_verbatim_extent_must_match_declared_shape_on_write_and_load() {
+    let mut underlength = tiny_input();
+    underlength.tensors[0].shape = vec![2];
+    refresh_logical_model_identity(&mut underlength);
+    let error = write(&underlength).expect_err("underlength BF16 mapping must not serialize");
+    assert!(matches!(
+        error,
+        FnlpqWriteError::Mapping {
+            mapping: "data",
+            ..
+        }
+    ));
+    assert!(error.to_string().contains("bf16-verbatim-v1"));
+
+    let mut valid = tiny_input();
+    valid.tensors[0].shape = vec![2];
+    valid.tensors[0].data = SectionRange::new("generic-payload", 0, 4);
+    valid
+        .sections
+        .iter_mut()
+        .find(|section| section.name == "generic-payload")
+        .expect("generic payload section")
+        .bytes = vec![0x80, 0x3f, 0x00, 0xc0];
+    refresh_logical_model_identity(&mut valid);
+    let mut corrupted = write(&valid)
+        .expect("exactly sized BF16 mapping writes")
+        .bytes;
+    let header_len = usize::try_from(u64::from_le_bytes(
+        corrupted[16..24].try_into().expect("fixed prelude"),
+    ))
+    .expect("header length fits host usize");
+    let header_start = 80;
+    let header_end = header_start + header_len;
+    let shape_offset = corrupted[header_start..header_end]
+        .windows(b"\"shape\":[2]".len())
+        .position(|window| window == b"\"shape\":[2]")
+        .expect("canonical tiny header shape");
+    corrupted[header_start + shape_offset + b"\"shape\":[".len()] = b'3';
+    let header_digest: [u8; 32] = Sha256::digest(&corrupted[header_start..header_end]).into();
+    corrupted[48..80].copy_from_slice(&header_digest);
+
+    let error = FnlpqArtifact::from_bytes(corrupted)
+        .expect_err("underlength BF16 mapping must fail before logical identity use");
+    assert!(matches!(error, FnlpqReadError::Header { .. }));
+    assert!(error.to_string().contains("bf16-verbatim-v1"));
+    eprintln!("FNLPQ_LOAD stage=bf16_extent verdict=PASS");
 }
 
 #[test]
@@ -151,11 +201,15 @@ fn nanbeige_input() -> FnlpqWriterInput {
                 .map(|dimension| u32::try_from(*dimension).expect("frozen shape fits v1"))
                 .collect::<Vec<_>>();
             TensorInput {
-                canonical_logical_sha256: logical_tensor_hex(&expected.name, &shape),
+                canonical_logical_sha256: logical_tensor_hex(
+                    &expected.name,
+                    &shape,
+                    STRUCTURAL_CENSUS_RECIPE,
+                ),
                 name: expected.name,
                 canonical_dtype: CanonicalDtype::Bf16,
                 shape,
-                quantization: BF16_RECIPE.to_owned(),
+                quantization: STRUCTURAL_CENSUS_RECIPE.to_owned(),
                 data: SectionRange::new("generic-payload", 0, 0),
                 scale: SectionRange::new("generic-scales", 0, 0),
                 row_sum: SectionRange::new("generic-row-sums", 0, 0),
@@ -166,11 +220,11 @@ fn nanbeige_input() -> FnlpqWriterInput {
     input
 }
 
-/// Install a small unique byte slice for each 201-record synthetic census
-/// member.  This is deliberately bounded: the real 8.3 GiB BF16 closure is
+/// Install a small unique byte slice for each 201-record structural census
+/// member. This is deliberately bounded: the real 8.3 GiB BF16 closure is
 /// exercised only by the model-gated converter path, while this always-on
 /// fixture proves that every declared record survives the checked load path.
-fn install_synthetic_bf16_payloads(input: &mut FnlpqWriterInput) -> BTreeMap<String, Vec<u8>> {
+fn install_structural_census_payloads(input: &mut FnlpqWriterInput) -> BTreeMap<String, Vec<u8>> {
     const BYTES_PER_TENSOR: usize = 8;
 
     let mut expected_payloads = BTreeMap::new();
@@ -219,7 +273,7 @@ fn tiny_input() -> FnlpqWriterInput {
         name: "tiny.weight".to_owned(),
         canonical_dtype: CanonicalDtype::Bf16,
         shape: vec![1],
-        canonical_logical_sha256: logical_tensor_hex("tiny.weight", &[1]),
+        canonical_logical_sha256: logical_tensor_hex("tiny.weight", &[1], BF16_RECIPE),
         quantization: BF16_RECIPE.to_owned(),
         data: SectionRange::new("generic-payload", 0, 2),
         scale: SectionRange::new("generic-scales", 0, 0),
@@ -295,9 +349,9 @@ fn refresh_logical_model_identity(input: &mut FnlpqWriterInput) {
         hex(&logical_model_sha256(&tensor_digests, &sources).expect("logical model identity"));
 }
 
-fn logical_tensor_hex(name: &str, shape: &[u32]) -> String {
+fn logical_tensor_hex(name: &str, shape: &[u32], quantization: &str) -> String {
     hex(
-        &logical_tensor_sha256(name, "bf16", shape, BF16_RECIPE, &[], &[], &[])
+        &logical_tensor_sha256(name, "bf16", shape, quantization, &[], &[], &[])
             .expect("logical tensor identity"),
     )
 }

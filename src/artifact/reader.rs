@@ -21,10 +21,10 @@ use sha2::{Digest, Sha256};
 
 use crate::artifact::converter::expected_nanbeige42_census;
 use crate::artifact::format::{
-    framed_sha256, logical_model_sha256, logical_tensor_sha256, write, ArchTarget, CanonicalDtype,
-    FnlpqWriterInput, PackingSetInput, SectionKind, SectionPayload, SectionRange, TensorInput,
-    FORMAT_VERSION, MAGIC, MAX_ALIGNMENT, MAX_ENTRIES, MAX_FILE_BYTES, MAX_HEADER_BYTES,
-    PRELUDE_BYTES, SECTION_DIRECTORY_ENTRY_BYTES,
+    ArchTarget, BF16_VERBATIM_V1, CanonicalDtype, FORMAT_VERSION, FnlpqWriterInput, MAGIC,
+    MAX_ALIGNMENT, MAX_ENTRIES, MAX_FILE_BYTES, MAX_HEADER_BYTES, PRELUDE_BYTES, PackingSetInput,
+    SECTION_DIRECTORY_ENTRY_BYTES, SectionKind, SectionPayload, SectionRange, TensorInput,
+    framed_sha256, logical_model_sha256, logical_tensor_sha256, write,
 };
 use crate::canonjson::{self, ParseLimits};
 
@@ -926,7 +926,6 @@ fn parse_tensors(value: &Value) -> Result<Vec<CheckedTensor>, FnlpqReadError> {
             })?;
             shape.push(number as u32);
         }
-        let _ = element_count;
         let generic = exact_object(
             value_at(object, "generic", &path)?,
             &format!("{path}/generic"),
@@ -936,6 +935,28 @@ fn parse_tensors(value: &Value) -> Result<Vec<CheckedTensor>, FnlpqReadError> {
             exact_string(generic, "quantization", &format!("{path}/generic"))?,
             "tensor.generic.quantization",
         )?;
+        let data = parse_mapping(
+            value_at(generic, "data", &format!("{path}/generic"))?,
+            &path,
+            "data",
+        )?;
+        if canonical_dtype == "bf16" && quantization == BF16_VERBATIM_V1 {
+            let expected_data_len = element_count.checked_mul(2).ok_or_else(|| {
+                header_error(
+                    format!("{path}/shape"),
+                    "bf16-verbatim byte length overflows u64",
+                )
+            })?;
+            if data.len != expected_data_len {
+                return Err(header_error(
+                    format!("{path}/generic/data/length"),
+                    format!(
+                        "bf16-verbatim-v1 requires {expected_data_len} bytes for shape {shape:?}, observed {}",
+                        data.len
+                    ),
+                ));
+            }
+        }
         output.push(CheckedTensor {
             name,
             canonical_dtype,
@@ -946,11 +967,7 @@ fn parse_tensors(value: &Value) -> Result<Vec<CheckedTensor>, FnlpqReadError> {
                 "tensor.canonical_logical_sha256",
             )?,
             quantization,
-            data: parse_mapping(
-                value_at(generic, "data", &format!("{path}/generic"))?,
-                &path,
-                "data",
-            )?,
+            data,
             scale: parse_mapping(
                 value_at(generic, "scale", &format!("{path}/generic"))?,
                 &path,

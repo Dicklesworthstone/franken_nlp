@@ -21,6 +21,9 @@ pub const FORMAT_VERSION: u32 = 1;
 pub const PRELUDE_BYTES: usize = 80;
 /// Bytes in one fixed section-directory entry.
 pub const SECTION_DIRECTORY_ENTRY_BYTES: usize = 80;
+/// The generic representation that retains canonical BF16 tensor bytes
+/// without quantization.
+pub const BF16_VERBATIM_V1: &str = "bf16-verbatim-v1";
 /// Maximum accepted canonical-header size in bytes.
 pub const MAX_HEADER_BYTES: u64 = 1_048_576;
 /// Maximum v1 directory entries and logical tensor declarations.
@@ -903,6 +906,26 @@ fn canonical_tensors(
                     tensor: tensor.name.clone(),
                     reason: "shape element product overflows u64".to_owned(),
                 })?;
+        }
+        if tensor.canonical_dtype == CanonicalDtype::Bf16 && tensor.quantization == BF16_VERBATIM_V1
+        {
+            let expected_data_len =
+                element_count
+                    .checked_mul(2)
+                    .ok_or_else(|| FnlpqWriteError::Tensor {
+                        tensor: tensor.name.clone(),
+                        reason: "bf16-verbatim byte length overflows u64".to_owned(),
+                    })?;
+            if tensor.data.len != expected_data_len {
+                return Err(FnlpqWriteError::Mapping {
+                    tensor: tensor.name.clone(),
+                    mapping: "data",
+                    reason: format!(
+                        "bf16-verbatim-v1 requires {expected_data_len} bytes for shape {:?}, observed {}",
+                        tensor.shape, tensor.data.len
+                    ),
+                });
+            }
         }
         let expected = [
             ("data", &tensor.data, SectionKind::GenericTensorPayload),

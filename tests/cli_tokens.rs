@@ -21,6 +21,8 @@ use franken_nlp::{
     },
 };
 
+const TOKENIZER_METADATA_RECIPE: &str = "tokenizer-metadata-fixture-v1";
+
 fn varint(mut value: u64) -> Vec<u8> {
     let mut output = Vec::new();
     loop {
@@ -83,10 +85,10 @@ fn test_model_bytes() -> &'static [u8] {
 }
 
 fn synthetic_artifact(tokenizer_model: Vec<u8>) -> FnlpqArtifact {
-    // A Nanbeige-labelled artifact is accepted only after the full frozen
-    // census passes.  Its tensor payload mappings may stay empty here because
-    // this boundary test needs only the authenticated tokenizer copy, not
-    // executable weights.
+    // A Nanbeige-labelled metadata fixture is accepted only after the full
+    // frozen census passes. Its payload mappings intentionally stay empty:
+    // this boundary test authenticates only the tokenizer copy, and must not
+    // claim the `bf16-verbatim-v1` representation it does not materialize.
     let (tensors, tensor_digests): (Vec<_>, Vec<_>) = expected_nanbeige42_census()
         .into_iter()
         .map(|expected| {
@@ -99,7 +101,7 @@ fn synthetic_artifact(tokenizer_model: Vec<u8>) -> FnlpqArtifact {
                 &expected.name,
                 "bf16",
                 &shape,
-                "bf16-verbatim-v1",
+                TOKENIZER_METADATA_RECIPE,
                 &[],
                 &[],
                 &[],
@@ -111,7 +113,7 @@ fn synthetic_artifact(tokenizer_model: Vec<u8>) -> FnlpqArtifact {
                     canonical_dtype: CanonicalDtype::Bf16,
                     shape,
                     canonical_logical_sha256: hex_lower(&tensor_digest),
-                    quantization: "bf16-verbatim-v1".to_owned(),
+                    quantization: TOKENIZER_METADATA_RECIPE.to_owned(),
                     data: SectionRange::new("generic-payload", 0, 0),
                     scale: SectionRange::new("generic-scales", 0, 0),
                     row_sum: SectionRange::new("generic-row-sums", 0, 0),
