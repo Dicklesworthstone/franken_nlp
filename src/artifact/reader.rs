@@ -940,7 +940,7 @@ fn parse_tensors(value: &Value) -> Result<Vec<CheckedTensor>, FnlpqReadError> {
         )?;
         let logical_bytes = exact_u64(object, "logical_bytes", &path)?;
         let expected_logical_bytes = element_count
-            .checked_mul(canonical_dtype(&canonical_dtype).logical_bytes_per_element())
+            .checked_mul(self::canonical_dtype(&canonical_dtype).logical_bytes_per_element())
             .ok_or_else(|| {
                 header_error(
                     format!("{path}/logical_bytes"),
