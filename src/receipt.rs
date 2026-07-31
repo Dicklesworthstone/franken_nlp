@@ -54,6 +54,14 @@ pub struct ReceiptRetention {
     pub commitment_secret: RetentionState,
 }
 
+/// Grade-constrained replay metadata retained with a receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ReceiptReplay {
+    pub command: Vec<String>,
+    pub missing_requirements: Vec<String>,
+    pub retention_policy: ReceiptRetention,
+}
+
 /// The domain used to prevent input, output, and configuration commitments
 /// from being interchangeable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -360,8 +368,8 @@ pub struct ReceiptCodeIdentity {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Receipt {
     pub receipt_schema: String,
-    pub grade: ReceiptGrade,
-    pub retention: ReceiptRetention,
+    pub completeness_grade: ReceiptGrade,
+    pub replay: ReceiptReplay,
     pub identity: ReceiptIdentity,
     pub provenance_identity: Sha256Digest,
     pub source_revision: String,
@@ -380,8 +388,8 @@ impl Receipt {
     /// Construct a receipt strictly from the canonical identity pair and typed
     /// public metadata. No caller can supply an ad-hoc semantic identity tuple.
     pub fn from_identities(
-        grade: ReceiptGrade,
-        retention: ReceiptRetention,
+        completeness_grade: ReceiptGrade,
+        replay: ReceiptReplay,
         identity_disclosure: IdentityDisclosure,
         identity_commitment_key: Option<&CommitmentKey>,
         execution: &ExecutionIdentity,
@@ -395,8 +403,8 @@ impl Receipt {
         execution.validate().map_err(ReceiptError::Identity)?;
         let receipt = Self {
             receipt_schema: RECEIPT_SCHEMA.to_owned(),
-            grade,
-            retention,
+            completeness_grade,
+            replay,
             identity: ReceiptIdentity::from_execution(
                 identity_disclosure,
                 identity_commitment_key,
@@ -440,7 +448,7 @@ impl Receipt {
             return Err(ReceiptError::Schema(self.receipt_schema.clone()));
         }
         self.identity.validate()?;
-        validate_grade(self.grade, self.retention)?;
+        validate_replay(self.completeness_grade, &self.replay)?;
         validate_commit("binary_commit", &self.code.binary_commit)?;
         validate_commit("converter_commit", &self.code.converter_commit)?;
         validate_authority("source_revision", &self.source_revision)?;
@@ -477,6 +485,9 @@ pub enum ReceiptError {
         grade: ReceiptGrade,
         retention: ReceiptRetention,
     },
+    ReplayMetadata {
+        grade: ReceiptGrade,
+    },
     MissingIdentityCommitmentKey,
     InvalidIdentityDisclosure {
         disclosure: IdentityDisclosure,
@@ -503,6 +514,10 @@ impl fmt::Display for ReceiptError {
                 formatter,
                 "receipt grade {grade:?} is incompatible with public retention {retention:?}"
             ),
+            Self::ReplayMetadata { grade } => write!(
+                formatter,
+                "receipt grade {grade:?} has incompatible replay command or missing requirements"
+            ),
             Self::MissingIdentityCommitmentKey => {
                 formatter.write_str("committed receipt identity requires an HMAC key")
             }
@@ -528,8 +543,15 @@ impl fmt::Display for ReceiptError {
 
 impl Error for ReceiptError {}
 
-fn validate_grade(grade: ReceiptGrade, retention: ReceiptRetention) -> Result<(), ReceiptError> {
-    let valid = match grade {
+fn validate_replay(grade: ReceiptGrade, replay: &ReceiptReplay) -> Result<(), ReceiptError> {
+    for command_part in &replay.command {
+        validate_authority("replay.command", command_part)?;
+    }
+    for requirement in &replay.missing_requirements {
+        validate_authority("replay.missing_requirements", requirement)?;
+    }
+    let retention = replay.retention_policy;
+    let retention_matches = match grade {
         ReceiptGrade::Replayable => {
             retention
                 == ReceiptRetention {
@@ -563,10 +585,26 @@ fn validate_grade(grade: ReceiptGrade, retention: ReceiptRetention) -> Result<()
                 }
         }
     };
-    if valid {
+    if !retention_matches {
+        return Err(ReceiptError::GradeRetention { grade, retention });
+    }
+    let command_matches = match grade {
+        ReceiptGrade::AuditOnly => replay.command.is_empty(),
+        ReceiptGrade::Replayable
+        | ReceiptGrade::StructuralReplay
+        | ReceiptGrade::VerifiableIfArtifactsSupplied => !replay.command.is_empty(),
+    };
+    let requirements_match = match grade {
+        ReceiptGrade::Replayable => replay.missing_requirements.is_empty(),
+        ReceiptGrade::StructuralReplay | ReceiptGrade::VerifiableIfArtifactsSupplied => {
+            !replay.missing_requirements.is_empty()
+        }
+        ReceiptGrade::AuditOnly => true,
+    };
+    if command_matches && requirements_match {
         Ok(())
     } else {
-        Err(ReceiptError::GradeRetention { grade, retention })
+        Err(ReceiptError::ReplayMetadata { grade })
     }
 }
 
@@ -730,6 +768,14 @@ mod tests {
         }
     }
 
+    fn replay(retention_policy: ReceiptRetention, missing: &[&str]) -> ReceiptReplay {
+        ReceiptReplay {
+            command: vec!["fnlp".to_owned(), "replay".to_owned()],
+            missing_requirements: missing.iter().map(|value| (*value).to_owned()).collect(),
+            retention_policy,
+        }
+    }
+
     #[test]
     fn hmac_sha256_matches_rfc_4231_case_one() {
         let output = hmac_sha256(&[0x0b; 20], b"Hi There");
@@ -754,11 +800,14 @@ mod tests {
         let execution = execution();
         let receipt = Receipt::from_identities(
             ReceiptGrade::VerifiableIfArtifactsSupplied,
-            ReceiptRetention {
-                private_inputs: RetentionState::CallerSupplies,
-                artifacts: RetentionState::CallerSupplies,
-                commitment_secret: RetentionState::CallerSupplies,
-            },
+            replay(
+                ReceiptRetention {
+                    private_inputs: RetentionState::CallerSupplies,
+                    artifacts: RetentionState::CallerSupplies,
+                    commitment_secret: RetentionState::CallerSupplies,
+                },
+                &["private-input"],
+            ),
             IdentityDisclosure::Committed,
             Some(&key),
             &execution,
@@ -793,11 +842,14 @@ mod tests {
     fn grade_retention_matrix_rejects_a_replayable_claim_without_secrets() {
         let error = Receipt::from_identities(
             ReceiptGrade::Replayable,
-            ReceiptRetention {
-                private_inputs: RetentionState::Resolvable,
-                artifacts: RetentionState::Resolvable,
-                commitment_secret: RetentionState::NotRetained,
-            },
+            replay(
+                ReceiptRetention {
+                    private_inputs: RetentionState::Resolvable,
+                    artifacts: RetentionState::Resolvable,
+                    commitment_secret: RetentionState::NotRetained,
+                },
+                &[],
+            ),
             IdentityDisclosure::Public,
             None,
             &execution(),
@@ -816,11 +868,14 @@ mod tests {
     fn committed_identity_refuses_to_fall_back_without_a_key() {
         let error = Receipt::from_identities(
             ReceiptGrade::VerifiableIfArtifactsSupplied,
-            ReceiptRetention {
-                private_inputs: RetentionState::CallerSupplies,
-                artifacts: RetentionState::CallerSupplies,
-                commitment_secret: RetentionState::CallerSupplies,
-            },
+            replay(
+                ReceiptRetention {
+                    private_inputs: RetentionState::CallerSupplies,
+                    artifacts: RetentionState::CallerSupplies,
+                    commitment_secret: RetentionState::CallerSupplies,
+                },
+                &["private-input"],
+            ),
             IdentityDisclosure::Committed,
             None,
             &execution(),
