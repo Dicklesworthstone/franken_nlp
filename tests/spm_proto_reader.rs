@@ -93,6 +93,7 @@ fn parses_the_bpe_identity_model_subset_exactly() {
     assert_eq!(model.model_type, ModelType::Bpe);
     assert!(model.normalizer.is_identity);
     assert_eq!(model.normalizer.name, "identity");
+    assert!(model.normalizer.precompiled_charsmap_is_empty);
     assert_eq!(model.special_ids.unk_id, 0);
     assert_eq!(model.special_ids.bos_id, 1);
     assert_eq!(model.special_ids.eos_id, 2);
@@ -229,5 +230,23 @@ fn rejects_non_bpe_and_non_identity_assertions() {
             .expect_err("non-identity normalizer must reject")
             .kind,
         SpmErrorKind::NonIdentityNormalizer { .. }
+    ));
+
+    let mut precompiled_charsmap = Vec::new();
+    add_bytes(&mut precompiled_charsmap, 1, b"identity");
+    add_bytes(&mut precompiled_charsmap, 2, &[0x00]);
+    let mut non_identity_charsmap = Vec::new();
+    add_bytes(
+        &mut non_identity_charsmap,
+        1,
+        &piece(b"a", 0, 1),
+    );
+    add_bytes(&mut non_identity_charsmap, 2, &trainer(2));
+    add_bytes(&mut non_identity_charsmap, 3, &precompiled_charsmap);
+    assert!(matches!(
+        parse_spm_model(&non_identity_charsmap)
+            .expect_err("identity name with a character map must reject")
+            .kind,
+        SpmErrorKind::NonIdentityNormalizerCharsmap { bytes: 1 }
     ));
 }

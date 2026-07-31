@@ -1,8 +1,9 @@
 //! Dependency-free, fail-closed reader for the SentencePiece `ModelProto` subset.
 //!
 //! Accepted fields are deliberately closed: top-level `pieces`, `trainer_spec`,
-//! and `normalizer_spec`; each piece's `piece`, `score`, and `type`; and the
-//! trainer's `model_type`, `unk_id`, `bos_id`, `eos_id`, and `pad_id`. Unknown
+//! and `normalizer_spec`; each piece's `piece`, `score`, and `type`; the
+//! trainer's `model_type`, `unk_id`, `bos_id`, `eos_id`, and `pad_id`; and the
+//! normalizer's `name` plus an asserted-empty `precompiled_charsmap`. Unknown
 //! fields are skipped only for protobuf's four non-group wire types. Groups,
 //! malformed lengths, conflicting singular fields, and data beyond a nested
 //! message boundary are errors.
@@ -17,8 +18,9 @@
 //! varints; overflowing or out-of-bounds lengths; truncated nested messages or
 //! malformed trailing keys; conflicting singular fields; invalid UTF-8 piece
 //! text; unsupported protobuf groups; invalid enum/int32 values; non-BPE
-//! trainer specs; and non-identity normalizers. No rejected parse exposes
-//! partially built tokenizer state.
+//! trainer specs; and non-identity normalizers (including a nonempty
+//! precompiled character map). No rejected parse exposes partially built
+//! tokenizer state.
 
 use std::{error::Error, fmt, mem::size_of};
 
@@ -52,6 +54,7 @@ const TRAINER_FIELD_EOS_ID: u32 = 42;
 const TRAINER_FIELD_PAD_ID: u32 = 43;
 
 const NORMALIZER_FIELD_NAME: u32 = 1;
+const NORMALIZER_FIELD_PRECOMPILED_CHARSMAP: u32 = 2;
 
 const WIRE_VARINT: u8 = 0;
 const WIRE_FIXED64: u8 = 1;
@@ -117,6 +120,7 @@ pub struct SpecialPieceIds {
 pub struct NormalizerFacts {
     pub name: String,
     pub is_identity: bool,
+    pub precompiled_charsmap_is_empty: bool,
 }
 
 /// The bounded semantic projection of a SentencePiece ModelProto.
@@ -185,6 +189,9 @@ pub enum SpmErrorKind {
     },
     NonIdentityNormalizer {
         name: String,
+    },
+    NonIdentityNormalizerCharsmap {
+        bytes: usize,
     },
 }
 
@@ -255,6 +262,12 @@ impl fmt::Display for SpmError {
             }
             SpmErrorKind::NonIdentityNormalizer { name } => {
                 write!(formatter, " error=non-identity-normalizer name={name:?}")
+            }
+            SpmErrorKind::NonIdentityNormalizerCharsmap { bytes } => {
+                write!(
+                    formatter,
+                    " error=non-identity-normalizer precompiled_charsmap_bytes={bytes}"
+                )
             }
         }
     }
@@ -462,6 +475,8 @@ fn parse_normalizer(
     let mut reader = Reader::new(input, base_offset);
     let mut name: Option<String> = None;
     let mut name_context: Option<Context> = None;
+    let mut precompiled_charsmap: Option<&[u8]> = None;
+    let mut precompiled_charsmap_context: Option<Context> = None;
     while !reader.is_finished() {
         let context = reader.read_key()?;
         match context.field_number {
@@ -476,6 +491,17 @@ fn parse_normalizer(
                 set_once(&mut name, value, "normalizer_spec.name", context)?;
                 name_context = Some(context);
             }
+            NORMALIZER_FIELD_PRECOMPILED_CHARSMAP => {
+                reader.require_wire(context, WIRE_LENGTH_DELIMITED)?;
+                let value = reader.read_length_delimited(context)?;
+                set_once(
+                    &mut precompiled_charsmap,
+                    value,
+                    "normalizer_spec.precompiled_charsmap",
+                    context,
+                )?;
+                precompiled_charsmap_context = Some(context);
+            }
             _ => reader.skip_field(context)?,
         }
     }
@@ -485,9 +511,21 @@ fn parse_normalizer(
             .ok_or_else(|| missing("normalizer_spec.name", base_offset + input.len()))?;
         return Err(context.error(SpmErrorKind::NonIdentityNormalizer { name }));
     }
+    if let Some(charsmap) = precompiled_charsmap.filter(|charsmap| !charsmap.is_empty()) {
+        let context = precompiled_charsmap_context.ok_or_else(|| {
+            missing(
+                "normalizer_spec.precompiled_charsmap",
+                base_offset + input.len(),
+            )
+        })?;
+        return Err(context.error(SpmErrorKind::NonIdentityNormalizerCharsmap {
+            bytes: charsmap.len(),
+        }));
+    }
     Ok(NormalizerFacts {
         name,
         is_identity: true,
+        precompiled_charsmap_is_empty: true,
     })
 }
 
