@@ -344,10 +344,6 @@ def verify_evidence(
         raise PromotionError(f"{context}.path missing: {path_text}")
     raw = candidate.read_bytes()
     observed_digest = hashlib.sha256(raw).hexdigest()
-    reporter.log(
-        f"oq={record_id} evidence={path_text} lines={line_start}-{line_end} "
-        f"sha256_expected={expected_digest} sha256_observed={observed_digest}"
-    )
     try:
         lines = raw.decode("utf-8").splitlines()
     except UnicodeDecodeError as error:
@@ -360,6 +356,12 @@ def verify_evidence(
         )
     observed_text = "\n".join(lines[line_start - 1 : line_end])
     observed_span_digest = hashlib.sha256(observed_text.encode("utf-8")).hexdigest()
+    reporter.log(
+        f"oq={record_id} evidence={path_text} lines={line_start}-{line_end} "
+        f"sha256_expected={expected_digest} sha256_observed={observed_digest} "
+        f"span_sha256_expected={expected_span_digest} "
+        f"span_sha256_observed={observed_span_digest}"
+    )
     text_matches = (
         expected_text == observed_text
         if expected_text is not None
