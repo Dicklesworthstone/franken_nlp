@@ -6,26 +6,26 @@ inference or release-installer test.
 
 ## Unix fixture run
 
-- Timestamp: `2026-07-31T09:58:26Z` through `2026-07-31T10:00:00Z`
+- Timestamp: `2026-07-31T10:00:47Z` through `2026-07-31T10:02:23Z`
 - Host-local command: `sh -n scripts/fetch_model.sh && sh -n scripts/test_fetch_model.sh && scripts/test_fetch_model.sh`
 - Exit code: `0`
-- Retained fixture directory: `/var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/T/fnlp-fetch-model-test.R6dWxZ`
+- Retained fixture directory: `/var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/T/fnlp-fetch-model-test.Q71H8c`
 
 The test creates a two-file catalog behind a loopback HTTP fixture and records
 the detailed per-file logs, journals, partials, and quarantine entries in that
 retained directory. Its transcript ended as follows:
 
 ```text
-2026-07-31T09:58:56Z FETCH_MODEL_TEST CASE=1 RESULT=PASS detail=fresh-download
-2026-07-31T09:59:17Z FETCH_MODEL_TEST CASE=2 RESULT=PASS detail=journal-resume
-2026-07-31T09:59:28Z FETCH_MODEL_TEST CASE=3 RESULT=PASS detail=unbound-partial-quarantine
-2026-07-31T09:59:28Z FETCH_MODEL_TEST CASE=4 RESULT=PASS detail=symlink-refusal
-2026-07-31T09:59:39Z FETCH_MODEL_TEST CASE=5 RESULT=PASS detail=corrupt-final-quarantine
-2026-07-31T09:59:50Z FETCH_MODEL_TEST CASE=6 RESULT=PASS detail=check-only-tamper
-2026-07-31T09:59:50Z FETCH_MODEL_TEST CASE=7 RESULT=PASS detail=untrusted-revision-refusal
-2026-07-31T10:00:00Z FETCH_MODEL_TEST CASE=8 RESULT=PASS detail=interrupted-resume-guidance
-2026-07-31T10:00:00Z FETCH_MODEL_TEST CASE=9 RESULT=PASS detail=check-only-no-model-skip
-2026-07-31T10:00:00Z FETCH_MODEL_TEST FETCH_MODEL_TESTS RESULT=PASS cases=9 failed=none
+2026-07-31T10:01:17Z FETCH_MODEL_TEST CASE=1 RESULT=PASS detail=fresh-download
+2026-07-31T10:01:39Z FETCH_MODEL_TEST CASE=2 RESULT=PASS detail=journal-resume
+2026-07-31T10:01:50Z FETCH_MODEL_TEST CASE=3 RESULT=PASS detail=unbound-partial-quarantine
+2026-07-31T10:01:50Z FETCH_MODEL_TEST CASE=4 RESULT=PASS detail=symlink-refusal
+2026-07-31T10:02:01Z FETCH_MODEL_TEST CASE=5 RESULT=PASS detail=corrupt-final-quarantine
+2026-07-31T10:02:12Z FETCH_MODEL_TEST CASE=6 RESULT=PASS detail=check-only-tamper
+2026-07-31T10:02:12Z FETCH_MODEL_TEST CASE=7 RESULT=PASS detail=untrusted-revision-refusal
+2026-07-31T10:02:22Z FETCH_MODEL_TEST CASE=8 RESULT=PASS detail=interrupted-resume-guidance
+2026-07-31T10:02:23Z FETCH_MODEL_TEST CASE=9 RESULT=PASS detail=check-only-no-model-skip
+2026-07-31T10:02:23Z FETCH_MODEL_TEST FETCH_MODEL_TESTS RESULT=PASS cases=9 failed=none
 ```
 
 `CASE=2` also verifies the safe fallback for a fixture server that declines a

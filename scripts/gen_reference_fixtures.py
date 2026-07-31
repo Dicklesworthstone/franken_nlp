@@ -24,7 +24,8 @@ import re
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable, Sequence
+import tempfile
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -628,6 +629,343 @@ def trace_counts(index: dict[str, object]) -> tuple[int, int, int]:
     return taps, norms, len(kv_slots)
 
 
+def load_fixture_inputs(path: Path) -> dict[str, object]:
+    """Read only repository-authored prompt, tokenizer, and template inputs."""
+
+    payload = read_json(path)
+    prompts = payload.get("prompts")
+    tokenizer_cases = payload.get("tokenizer_cases")
+    template_cases = payload.get("template_cases")
+    if not isinstance(prompts, list) or not prompts or not all(isinstance(item, str) and item for item in prompts):
+        raise TraceError("fixture input corpus requires a non-empty string prompts array")
+    if not isinstance(tokenizer_cases, list) or not isinstance(template_cases, list):
+        raise TraceError("fixture input corpus requires tokenizer_cases and template_cases arrays")
+    return payload
+
+
+def stable_prefixes_from_floor(path: Path) -> tuple[str, dict[str, int]]:
+    """Load the exact prompt-hash stable prefixes published by the floor campaign."""
+
+    floor = read_json(path)
+    raw_prefixes = floor.get("stable_prefixes")
+    if not isinstance(raw_prefixes, dict):
+        raise TraceError("oracle floor lacks stable_prefixes keyed by prompt SHA-256")
+    prefixes: dict[str, int] = {}
+    for prompt_digest, value in raw_prefixes.items():
+        if not isinstance(prompt_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", prompt_digest):
+            raise TraceError("oracle floor has a non-SHA-256 stable-prefix key")
+        if not isinstance(value, int) or value < 0:
+            raise TraceError(f"oracle floor has an invalid stable-prefix length for prompt={prompt_digest}")
+        prefixes[prompt_digest] = value
+    return sha256_path(path), prefixes
+
+
+def capture_auxiliary_fixtures(output_root: Path, tokenizer: Any, corpus: dict[str, object]) -> Path:
+    """Record slow-tokenizer ids and chat-template renderings with their input digests."""
+
+    tokenizer_records: list[dict[str, object]] = []
+    template_records: list[dict[str, object]] = []
+    raw_tokenizer_cases = corpus["tokenizer_cases"]
+    raw_template_cases = corpus["template_cases"]
+    assert isinstance(raw_tokenizer_cases, list)
+    assert isinstance(raw_template_cases, list)
+    seen_case_ids: set[str] = set()
+    for case in raw_tokenizer_cases:
+        if not isinstance(case, dict):
+            raise TraceError("tokenizer case must be an object")
+        case_id = case.get("id")
+        text = case.get("text")
+        if not isinstance(case_id, str) or not SAFE_NAME.fullmatch(case_id) or not isinstance(text, str):
+            raise TraceError("tokenizer case requires a safe id and string text")
+        if case_id in seen_case_ids:
+            raise TraceError(f"duplicate fixture input case id={case_id}")
+        seen_case_ids.add(case_id)
+        token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+        if not isinstance(token_ids, list) or not all(isinstance(token_id, int) for token_id in token_ids):
+            raise TraceError(f"slow tokenizer did not return integer ids for case={case_id}")
+        tokenizer_records.append(
+            {
+                "id": case_id,
+                "input_sha256": sha256_bytes(text.encode("utf-8")),
+                "token_ids": token_ids,
+                "token_ids_sha256": sha256_bytes(canonical_json(token_ids)),
+            }
+        )
+    for case in raw_template_cases:
+        if not isinstance(case, dict):
+            raise TraceError("template case must be an object")
+        case_id = case.get("id")
+        messages = case.get("messages")
+        options = case.get("options", {})
+        if not isinstance(case_id, str) or not SAFE_NAME.fullmatch(case_id):
+            raise TraceError("template case requires a safe id")
+        if case_id in seen_case_ids:
+            raise TraceError(f"duplicate fixture input case id={case_id}")
+        seen_case_ids.add(case_id)
+        if not isinstance(messages, list) or not isinstance(options, dict):
+            raise TraceError(f"template case={case_id} requires messages array and options object")
+        if not hasattr(tokenizer, "apply_chat_template"):
+            raise TraceError("slow tokenizer has no apply_chat_template for template fixture capture")
+        rendered = tokenizer.apply_chat_template(messages, tokenize=False, **options)
+        if not isinstance(rendered, str):
+            raise TraceError(f"template case={case_id} did not render text")
+        rendered_ids = tokenizer(rendered, add_special_tokens=False)["input_ids"]
+        if not isinstance(rendered_ids, list) or not all(isinstance(token_id, int) for token_id in rendered_ids):
+            raise TraceError(f"template case={case_id} did not round-trip to integer ids")
+        template_records.append(
+            {
+                "id": case_id,
+                "input_sha256": sha256_bytes(canonical_json({"messages": messages, "options": options})),
+                "rendered": rendered,
+                "rendered_sha256": sha256_bytes(rendered.encode("utf-8")),
+                "token_ids": rendered_ids,
+                "token_ids_sha256": sha256_bytes(canonical_json(rendered_ids)),
+            }
+        )
+    payload = {
+        "format_version": TRACE_FORMAT_VERSION,
+        "slow_tokenizer_class": tokenizer.__class__.__name__,
+        "tokenizer_cases": tokenizer_records,
+        "template_cases": template_records,
+    }
+    path = output_root / "auxiliary.json"
+    write_json(path, payload)
+    return path
+
+
+def all_trace_records(index: dict[str, object]) -> Iterable[dict[str, object]]:
+    for phase_name in ("prefill", "append"):
+        phase = index.get(phase_name)
+        if not isinstance(phase, dict):
+            raise TraceError(f"trace index has no {phase_name} phase")
+        records = phase.get("records")
+        if not isinstance(records, list):
+            raise TraceError(f"trace index phase={phase_name} has no record array")
+        for record in records:
+            if not isinstance(record, dict):
+                raise TraceError(f"trace index phase={phase_name} has a non-object record")
+            yield record
+    logits = index.get("logits")
+    if not isinstance(logits, dict):
+        raise TraceError("trace index has no logits descriptor")
+    yield logits
+
+
+def validate_tensor_record(root: Path, record: dict[str, object], seen_paths: set[str]) -> None:
+    relative_text = record.get("relative_path")
+    digest = record.get("sha256")
+    shape = record.get("shape")
+    element_size = record.get("element_size")
+    byte_length = record.get("byte_length")
+    dtype = record.get("dtype")
+    if not isinstance(relative_text, str):
+        raise TraceError("tensor record has no relative_path")
+    relative = require_safe_relative_path(relative_text)
+    if relative_text in seen_paths:
+        raise TraceError(f"duplicate tensor sidecar path={relative_text}")
+    seen_paths.add(relative_text)
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise TraceError(f"tensor record={relative_text} has an invalid SHA-256")
+    if not isinstance(dtype, str) or not dtype:
+        raise TraceError(f"tensor record={relative_text} has no dtype")
+    if not isinstance(shape, list) or not all(isinstance(value, int) and value >= 0 for value in shape):
+        raise TraceError(f"tensor record={relative_text} has an invalid shape")
+    if not isinstance(element_size, int) or element_size <= 0:
+        raise TraceError(f"tensor record={relative_text} has an invalid element_size")
+    if not isinstance(byte_length, int) or byte_length < 0:
+        raise TraceError(f"tensor record={relative_text} has an invalid byte_length")
+    if math.prod(shape) * element_size != byte_length:
+        raise TraceError(f"tensor record={relative_text} byte_length disagrees with shape and element_size")
+    path = root / relative
+    if not path.is_file() or path.is_symlink():
+        raise TraceError(f"tensor record={relative_text} is missing or not a regular file")
+    actual_length = path.stat().st_size
+    if actual_length != byte_length:
+        raise TraceError(
+            f"tensor record={relative_text} length mismatch expected={byte_length} observed={actual_length}"
+        )
+    actual_digest = sha256_path(path)
+    if actual_digest != digest:
+        raise TraceError(
+            f"tensor record={relative_text} SHA-256 mismatch expected={digest} observed={actual_digest}"
+        )
+
+
+def build_fixture_manifest(
+    output_root: Path,
+    trace_indices: Sequence[Path],
+    auxiliary_path: Path,
+    oracle_floor_sha256: str,
+) -> Path:
+    fixtures: list[dict[str, object]] = []
+    for index_path in trace_indices:
+        relative = index_path.relative_to(output_root).as_posix()
+        index = read_json(index_path)
+        fixtures.append(
+            {
+                "trace_index": relative,
+                "trace_index_sha256": sha256_path(index_path),
+                "profile": index["profile"],
+                "attention_backend": index["attention_backend"],
+                "prompt_sha256": index["prompt_sha256"],
+            }
+        )
+    manifest = {
+        "format_version": TRACE_FORMAT_VERSION,
+        "model_id": MODEL_ID,
+        "revision": PINNED_REVISION,
+        "generator_commit": git_commit(),
+        "oracle_floor_sha256": oracle_floor_sha256,
+        "fixtures": fixtures,
+        "auxiliary": {
+            "relative_path": auxiliary_path.relative_to(output_root).as_posix(),
+            "sha256": sha256_path(auxiliary_path),
+        },
+    }
+    path = output_root / "manifest.json"
+    write_json(path, manifest)
+    return path
+
+
+def verify_fixture_root(root: Path, oracle_floor: Path | None) -> int:
+    try:
+        manifest_path = root / "manifest.json"
+        manifest = read_json(manifest_path)
+        if manifest.get("format_version") != TRACE_FORMAT_VERSION:
+            raise TraceError("fixture manifest format_version is unsupported")
+        if manifest.get("model_id") != MODEL_ID or manifest.get("revision") != PINNED_REVISION:
+            raise TraceError("fixture manifest model identity does not match the pinned wedge")
+        fixtures = manifest.get("fixtures")
+        if not isinstance(fixtures, list) or not fixtures:
+            raise TraceError("fixture manifest has no fixtures")
+        expected_floor_digest = manifest.get("oracle_floor_sha256")
+        if not isinstance(expected_floor_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_floor_digest):
+            raise TraceError("fixture manifest has no immutable oracle_floor_sha256")
+        floor_prefixes: dict[str, int] | None = None
+        if oracle_floor is not None:
+            observed_floor_digest, floor_prefixes = stable_prefixes_from_floor(oracle_floor)
+            if observed_floor_digest != expected_floor_digest:
+                raise TraceError(
+                    f"oracle floor digest mismatch expected={expected_floor_digest} observed={observed_floor_digest}"
+                )
+        seen_indices: set[str] = set()
+        fixture_count = 0
+        for fixture in fixtures:
+            if not isinstance(fixture, dict):
+                raise TraceError("fixture manifest has a non-object fixture")
+            relative_text = fixture.get("trace_index")
+            expected_index_digest = fixture.get("trace_index_sha256")
+            if not isinstance(relative_text, str) or not isinstance(expected_index_digest, str):
+                raise TraceError("fixture manifest has an incomplete trace index descriptor")
+            if relative_text in seen_indices:
+                raise TraceError(f"fixture manifest repeats trace index={relative_text}")
+            seen_indices.add(relative_text)
+            index_path = root / require_safe_relative_path(relative_text)
+            if not index_path.is_file() or index_path.is_symlink():
+                raise TraceError(f"fixture trace index missing or not regular: {relative_text}")
+            observed_index_digest = sha256_path(index_path)
+            if observed_index_digest != expected_index_digest:
+                raise TraceError(
+                    f"fixture trace index digest mismatch path={relative_text} "
+                    f"expected={expected_index_digest} observed={observed_index_digest}"
+                )
+            index = read_json(index_path)
+            profile_name = index.get("profile")
+            if profile_name not in PROFILES:
+                raise TraceError(f"fixture trace index has unknown profile={profile_name!r}")
+            profile = PROFILES[str(profile_name)]
+            if index.get("attention_backend") != profile.attention_backend:
+                raise TraceError(f"fixture profile={profile.name} has an incorrect attention backend")
+            if index.get("variance_only") is not profile.variance_only:
+                raise TraceError(f"fixture profile={profile.name} has an incorrect variance-only tag")
+            taps, norms, kv_slots = trace_counts(index)
+            if taps != TRACE_SLOT_COUNT * 2 or norms != LOOP_COUNT * 2 or kv_slots != KV_SLOT_COUNT * 2:
+                raise TraceError(
+                    f"fixture={relative_text} incomplete traces taps={taps}/88 norms={norms}/4 kv_slots={kv_slots}/88"
+                )
+            seen_sidecars: set[str] = set()
+            for record in all_trace_records(index):
+                validate_tensor_record(index_path.parent, record, seen_sidecars)
+            greedy = index.get("greedy_tokens")
+            contract = index.get("greedy_contract")
+            if not isinstance(greedy, list) or not all(isinstance(token, int) for token in greedy):
+                raise TraceError(f"fixture={relative_text} has invalid greedy tokens")
+            if not isinstance(contract, dict):
+                raise TraceError(f"fixture={relative_text} has no greedy contract")
+            stable_prefix = contract.get("stable_prefix_length")
+            if not isinstance(stable_prefix, int) or stable_prefix < 0 or stable_prefix > len(greedy):
+                raise TraceError(f"fixture={relative_text} has an invalid stable prefix length")
+            if contract.get("status") != "frozen" or contract.get("oracle_floor_sha256") != expected_floor_digest:
+                raise TraceError(f"fixture={relative_text} is not frozen against this oracle floor")
+            prompt_digest = index.get("prompt_sha256")
+            if floor_prefixes is not None:
+                if not isinstance(prompt_digest, str) or floor_prefixes.get(prompt_digest) != stable_prefix:
+                    raise TraceError(f"fixture={relative_text} stable prefix disagrees with oracle floor")
+            fixture_count += 1
+        auxiliary = manifest.get("auxiliary")
+        if not isinstance(auxiliary, dict):
+            raise TraceError("fixture manifest has no auxiliary fixture descriptor")
+        auxiliary_relative = auxiliary.get("relative_path")
+        auxiliary_digest = auxiliary.get("sha256")
+        if not isinstance(auxiliary_relative, str) or not isinstance(auxiliary_digest, str):
+            raise TraceError("fixture manifest has an incomplete auxiliary descriptor")
+        auxiliary_path = root / require_safe_relative_path(auxiliary_relative)
+        if not auxiliary_path.is_file() or auxiliary_path.is_symlink():
+            raise TraceError("auxiliary fixture is missing or not a regular file")
+        observed_auxiliary_digest = sha256_path(auxiliary_path)
+        if observed_auxiliary_digest != auxiliary_digest:
+            raise TraceError(
+                f"auxiliary fixture digest mismatch expected={auxiliary_digest} observed={observed_auxiliary_digest}"
+            )
+        auxiliary_payload = read_json(auxiliary_path)
+        if not isinstance(auxiliary_payload.get("tokenizer_cases"), list) or not isinstance(
+            auxiliary_payload.get("template_cases"), list
+        ):
+            raise TraceError("auxiliary fixture cannot be parsed as tokenizer/template records")
+    except (OSError, TraceError) as error:
+        log("REF_FIXTURES", f"FAIL {error}")
+        log("REF_FIXTURES", "RESULT=FAIL fixtures=0 missing=invalid-or-missing")
+        return 1
+    log("REF_FIXTURES", f"RESULT=PASS fixtures={fixture_count} missing=none")
+    return 0
+
+
+def run_fixture_self_test() -> int:
+    """Model-free coverage for raw-sidecar integrity and unknown-profile rejection."""
+
+    with tempfile.TemporaryDirectory(prefix="fnlp-fixture-selftest-") as temporary:
+        root = Path(temporary)
+        sidecar = root / "tensors" / "one.bin"
+        sidecar.parent.mkdir(parents=True)
+        sidecar.write_bytes(b"\x00")
+        record: dict[str, object] = {
+            "relative_path": "tensors/one.bin",
+            "sha256": sha256_path(sidecar),
+            "dtype": "uint8",
+            "shape": [1],
+            "element_size": 1,
+            "byte_length": 1,
+        }
+        validate_tensor_record(root, record, set())
+        sidecar.write_bytes(b"\x01")
+        try:
+            validate_tensor_record(root, record, set())
+        except TraceError:
+            pass
+        else:
+            log("REF_FIXTURES", "RESULT=FAIL fixtures=0 missing=synthetic-digest-tamper-not-detected")
+            return 1
+        try:
+            unknown = {"profile": "unknown-profile"}
+            if unknown["profile"] not in PROFILES:
+                raise TraceError("unknown profile rejected")
+        except TraceError:
+            log("REF_FIXTURES", "RESULT=PASS fixtures=0 missing=none selftest=synthetic")
+            return 0
+    log("REF_FIXTURES", "RESULT=FAIL fixtures=0 missing=unknown-profile-not-detected")
+    return 1
+
+
 def compare_untraced(torch_module: Any, tokenizer: Any, model: Any, prompt: str, max_new_tokens: int, traced_logits: Any, traced_greedy: list[int]) -> None:
     tokenized = tokenizer(prompt, return_tensors="pt")
     with torch_module.inference_mode():
@@ -661,7 +999,15 @@ def install_perturbing_hook(layers: Sequence[Any], torch_module: Any) -> Any:
     return layers[0].register_forward_hook(perturb)
 
 
-def run_trace(args: argparse.Namespace, *, selftest: bool = False) -> int:
+def run_trace(
+    args: argparse.Namespace,
+    *,
+    selftest: bool = False,
+    allow_existing_output: bool = False,
+    prompts_override: Sequence[str] | None = None,
+    oracle_floor_sha256: str | None = None,
+    stable_prefixes: dict[str, int] | None = None,
+) -> int:
     model_source = args.model_source
     if model_source is None or not model_source.is_dir():
         log("TRACE_HARNESS", "RESULT=SKIPPED_NO_MODEL taps=0/44 norms=0/2 perturbation=none reason=source_closure_absent")
@@ -670,13 +1016,19 @@ def run_trace(args: argparse.Namespace, *, selftest: bool = False) -> int:
         profile = PROFILES[args.profile]
         oracle_digest = closure_digest(args.repo_root)
         torch_module, tokenizer, model = load_oracle(profile, model_source)
-        prompts = args.prompt or list(DEFAULT_PROMPTS)
+        prompts = list(prompts_override) if prompts_override is not None else args.prompt or list(DEFAULT_PROMPTS)
         output_root = args.output.resolve()
-        if output_root.exists() and any(output_root.iterdir()):
+        if output_root.exists() and any(output_root.iterdir()) and not allow_existing_output:
             raise TraceError(f"output directory must be absent or empty: {output_root}")
         output_root.mkdir(parents=True, exist_ok=True)
         completed_prompts = 0
         for index, prompt in enumerate(prompts):
+            prompt_digest = sha256_bytes(prompt.encode("utf-8"))
+            stable_prefix = None
+            if stable_prefixes is not None:
+                stable_prefix = stable_prefixes.get(prompt_digest)
+                if stable_prefix is None:
+                    raise TraceError(f"oracle floor has no stable prefix for prompt_sha256={prompt_digest}")
             prefill, append, greedy, logits = capture_prompt(
                 torch_module, tokenizer, model, prompt, args.max_new_tokens
             )
@@ -691,6 +1043,8 @@ def run_trace(args: argparse.Namespace, *, selftest: bool = False) -> int:
                 greedy,
                 logits,
                 oracle_digest,
+                oracle_floor_sha256,
+                stable_prefix,
             )
             index_payload = read_json(written)
             taps, norms, kv_slots = trace_counts(index_payload)
