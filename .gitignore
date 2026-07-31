@@ -1,0 +1,28 @@
+/target/
+
+# Local model material and derived artifacts must never enter source control.
+*.safetensors
+*.gguf
+*.fnlpq
+*.fnlpq.part*
+/models/
+/model-artifacts/
+/tokenizer.model
+/tokenizer.json
+pytorch_model*.bin
+*.redaction-map.json
+
+# Local oracle/tooling environments and profiles.
+/.venv/
+__pycache__/
+*.py[cod]
+*.profraw
+*.profdata
+perf.data
+perf.data.old
+
+# Secrets and workstation noise.
+.env
+!.env.example
+.DS_Store
+Thumbs.db
