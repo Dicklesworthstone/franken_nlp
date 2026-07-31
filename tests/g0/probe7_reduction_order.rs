@@ -62,7 +62,11 @@ fn canonical_per_row_order_is_bitwise_batch_invariant_at_model_k_shapes() {
                 .all(|(row, result)| reverse_dot(row, &right).to_bits() == result.to_bits());
             println!(
                 "G0_PROBE7 case=k-{k}-m-{batch_width} RESULT=PASS reduction=canonical-row-major reverse_candidate={} authority=scalar-order-only",
-                if reverse_matches { "not-distinguished" } else { "rejected" }
+                if reverse_matches {
+                    "not-distinguished"
+                } else {
+                    "rejected"
+                }
             );
         }
     }
@@ -78,13 +82,21 @@ fn reassociated_order_has_a_named_bitwise_counterexample() {
     left[..3].copy_from_slice(&[16_777_216.0, -16_777_216.0, 1.0]);
     let right = vec![1.0_f32; left.len()];
     let canonical = canonical_dot(&left, &right);
-    let reverse = reverse_dot(&left, &right);
-    assert_eq!(canonical, 1.0);
-    assert_eq!(reverse, 0.0);
-    assert_ne!(canonical.to_bits(), reverse.to_bits());
+    let a = left[0] * right[0];
+    let b = left[1] * right[1];
+    let c = left[2] * right[2];
+    let sequential = (a + b) + c;
+    let reassociated = a + (b + c);
+
+    assert_eq!(canonical.to_bits(), sequential.to_bits());
+    assert_eq!(sequential, 1.0, "(a + b) + c keeps the unit term");
+    assert_eq!(reassociated, 0.0, "a + (b + c) loses the unit term");
+    assert_ne!(sequential.to_bits(), reassociated.to_bits());
     println!(
-        "G0_PROBE7 case=reassociated-counterexample RESULT=PASS canonical_bits={:08x} reverse_bits={:08x} decision=reverse-order-rejected authority=scalar-order-only",
-        canonical.to_bits(),
-        reverse.to_bits()
+        "G0_PROBE7 case=reassociated-counterexample RESULT=PASS sequential_bits={:08x} reassociated_bits={:08x} sequential_value={} reassociated_value={} decision=reassociated-order-rejected authority=scalar-order-only",
+        sequential.to_bits(),
+        reassociated.to_bits(),
+        sequential,
+        reassociated
     );
 }
