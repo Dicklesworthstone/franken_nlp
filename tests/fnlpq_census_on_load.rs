@@ -108,6 +108,97 @@ fn bounded_census_round_trip_preserves_every_mapped_record_bytes() {
 }
 
 #[test]
+fn bf16_verbatim_multi_tensor_round_trip_preserves_raw_words() {
+    let cases: [(&str, &[u32], &[u8]); 3] = [
+        (
+            "model.embed_tokens.weight",
+            &[4],
+            &[0x00, 0x00, 0x80, 0x00, 0x80, 0x3f, 0x00, 0x80],
+        ),
+        (
+            "model.layers.0.input_layernorm.weight",
+            &[2, 2],
+            &[0xff, 0x7f, 0x01, 0x80, 0x80, 0xff, 0x55, 0x3f],
+        ),
+        (
+            "lm_head.weight",
+            &[3],
+            &[0x7f, 0x00, 0x34, 0x12, 0xab, 0xcd],
+        ),
+    ];
+    let mut input = base_input("FnlpqBf16VerbatimRoundTrip");
+    let mut payload = Vec::new();
+
+    for (name, shape, bytes) in cases {
+        let offset = u64::try_from(payload.len()).expect("synthetic offset fits u64");
+        payload.extend_from_slice(bytes);
+        input.tensors.push(TensorInput {
+            name: (*name).to_owned(),
+            canonical_dtype: CanonicalDtype::Bf16,
+            shape: shape.to_vec(),
+            canonical_logical_sha256: hex(
+                &logical_tensor_sha256(name, "bf16", shape, BF16_RECIPE, bytes, &[], &[])
+                    .expect("BF16 logical identity"),
+            ),
+            quantization: BF16_RECIPE.to_owned(),
+            data: SectionRange::new(
+                "generic-payload",
+                offset,
+                u64::try_from(bytes.len()).expect("synthetic byte length fits u64"),
+            ),
+            scale: SectionRange::new("generic-scales", 0, 0),
+            row_sum: SectionRange::new("generic-row-sums", 0, 0),
+        });
+    }
+    input
+        .sections
+        .iter_mut()
+        .find(|section| section.name == "generic-payload")
+        .expect("BF16 payload section")
+        .bytes = payload;
+    refresh_logical_model_identity(&mut input);
+
+    let written = write(&input)
+        .expect("every synthetic BF16 verbatim range has its declared byte extent")
+        .bytes;
+    let artifact = FnlpqArtifact::from_bytes(written.clone())
+        .expect("checked loader accepts exact BF16 verbatim ranges");
+    assert_eq!(
+        artifact
+            .reserialize()
+            .expect("checked BF16 artifact reserializes"),
+        written,
+        "checked BF16 load then canonical re-serialize must preserve envelope bytes"
+    );
+
+    for (name, _shape, expected) in cases {
+        let tensor = artifact
+            .tensors()
+            .iter()
+            .find(|tensor| tensor.name == name)
+            .expect("every synthetic BF16 tensor remains declared");
+        assert_eq!(tensor.canonical_dtype, "bf16");
+        assert_eq!(tensor.quantization, BF16_RECIPE);
+        assert_eq!(
+            tensor.logical_bytes,
+            u64::try_from(expected.len()).expect("synthetic byte length fits u64"),
+            "logical byte declaration must retain the full BF16 extent for {name}"
+        );
+        assert_eq!(
+            checked_data_bytes(&artifact, tensor),
+            expected,
+            "BF16 bytes must remain verbatim for {name}"
+        );
+        eprintln!(
+            "FNLPQ_BF16_ROUND_TRIP tensor={name} bytes={} sha256={}",
+            expected.len(),
+            hex(&Sha256::digest(expected))
+        );
+    }
+    eprintln!("FNLPQ_BF16_ROUND_TRIP RESULT=PASS tensors={}", cases.len());
+}
+
+#[test]
 fn bf16_verbatim_extent_must_match_declared_shape_on_write_and_load() {
     let mut underlength = tiny_input();
     underlength.tensors[0].shape = vec![2];
