@@ -98,8 +98,36 @@ fn routed_bf16_panel_preserves_the_verified_source_bytes_exactly() {
 fn routed_int8_panel_preserves_the_typed_nonfinite_refusal() {
     let entry = one_row_entry("lm_head.weight");
     let route = remap_tensor_name(&entry.name).expect("named converter route");
+    let mut source_with_nan = ONE_ROW_BF16;
+    source_with_nan[4..6].copy_from_slice(&0x7fc0_u16.to_le_bytes());
     let mut nonfinite = ONE_ROW_F32;
-    nonfinite[2] = f32::NAN;
+    nonfinite[2] = f32::from_bits(0x7fc0_0000);
+
+    assert_eq!(
+        transform_routed_panel(
+            &entry,
+            &route,
+            RowPanel::Rows {
+                start_row: 0,
+                row_count: 1,
+            },
+            &source_with_nan,
+            &nonfinite,
+        ),
+        Err(ConverterError::Quantize(QuantizeError::NonFinite {
+            row: 0,
+            column: 2,
+            bits: 0x7fc0_0000,
+        }))
+    );
+}
+
+#[test]
+fn routed_int8_panel_refuses_a_tampered_decoded_element_before_quantization() {
+    let entry = one_row_entry("lm_head.weight");
+    let route = remap_tensor_name(&entry.name).expect("named converter route");
+    let mut tampered = ONE_ROW_F32;
+    tampered[2] = f32::from_bits(0x7fc0_0000);
 
     assert_eq!(
         transform_routed_panel(
@@ -110,12 +138,12 @@ fn routed_int8_panel_preserves_the_typed_nonfinite_refusal() {
                 row_count: 1,
             },
             &ONE_ROW_BF16,
-            &nonfinite,
+            &tampered,
         ),
-        Err(ConverterError::Quantize(QuantizeError::NonFinite {
-            row: 0,
-            column: 2,
-            bits: f32::NAN.to_bits(),
+        Err(ConverterError::Quantize(QuantizeError::DecodedBf16Mismatch {
+            element: 2,
+            expected_bits: 0x3f00_0000,
+            observed_bits: 0x7fc0_0000,
         }))
     );
 }
