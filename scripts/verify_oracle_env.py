@@ -347,6 +347,36 @@ def validate_installed_closure(record: dict[str, Any]) -> None:
         )
 
 
+def explicit_greedy_decode(model: Any, inputs: dict[str, Any], max_new_tokens: int) -> tuple[Any, list[int]]:
+    """Decode greedily through the pinned model's native tuple KV-cache path.
+
+    The archived remote model uses the pre-4.43 tuple-cache API. Transformers
+    4.51's generic ``generate`` upgrades that tuple to ``DynamicCache``, whose
+    removed ``get_max_length`` method makes the generic wrapper fail before a
+    decode token is produced. Calling the model's forward directly preserves
+    the archived source path without patching the source snapshot.
+    """
+    if max_new_tokens < 1:
+        raise OracleFailure("smoke max_new_tokens must be positive")
+    forward = model(**inputs, use_cache=True)
+    step = forward
+    tokens: list[int] = []
+    for index in range(max_new_tokens):
+        token_id = int(step.logits[0, -1].argmax().item())
+        tokens.append(token_id)
+        if index + 1 == max_new_tokens:
+            break
+        past_key_values = getattr(step, "past_key_values", None)
+        if past_key_values is None:
+            raise OracleFailure("pinned model forward omitted past_key_values during greedy decode")
+        step = model(
+            input_ids=inputs["input_ids"].new_tensor([[token_id]]),
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+    return forward, tokens
+
+
 def smoke(record: dict[str, Any], source: Path, output: Path | None) -> None:
     source_files(record, source, need_weights=True)
     validate_installed_closure(record)
@@ -383,10 +413,7 @@ def smoke(record: dict[str, Any], source: Path, output: Path | None) -> None:
     prompt = record["smoke"]["prompt"]
     inputs = tokenizer(prompt, return_tensors="pt")
     with torch.inference_mode():
-        forward = model(**inputs, use_cache=True)
-        generated = model.generate(**inputs, do_sample=False, max_new_tokens=record["smoke"]["max_new_tokens"])
-    prompt_length = int(inputs["input_ids"].shape[1])
-    new_tokens = generated[0, prompt_length:].tolist()
+        forward, new_tokens = explicit_greedy_decode(model, inputs, record["smoke"]["max_new_tokens"])
     payload = {
         "schema_version": 1,
         "model_id": MODEL_ID,
