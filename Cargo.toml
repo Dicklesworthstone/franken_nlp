@@ -11,10 +11,12 @@ autobins = false
 [[bin]]
 name = "franken_nlp"
 path = "src/main.rs"
+test = false
 
 [[bin]]
 name = "fnlp"
 path = "src/bin/fnlp.rs"
+test = false
 
 [features]
 default = []
