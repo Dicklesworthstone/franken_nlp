@@ -312,7 +312,7 @@ fn pinned_slow_reference_vocabulary_is_token_id_exact() {
             .get(&id)
             .expect("every added_tokens.json ID appears in tokenizer_config");
         assert_eq!(
-            metadata.content, surface,
+            metadata.content, *surface,
             "tokenizer metadata surface drifted at added token id={id}"
         );
     }
