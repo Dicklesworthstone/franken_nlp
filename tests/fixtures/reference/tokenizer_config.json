@@ -1,0 +1,103 @@
+{
+  "add_bos_token": true,
+  "add_eos_token": false,
+  "add_prefix_space": true,
+  "added_tokens_decoder": {
+    "0": {
+      "content": "<unk>",
+      "lstrip": false,
+      "normalized": true,
+      "rstrip": false,
+      "single_word": false,
+      "special": true
+    },
+    "1": {
+      "content": "<s>",
+      "lstrip": false,
+      "normalized": true,
+      "rstrip": false,
+      "single_word": false,
+      "special": true
+    },
+    "2": {
+      "content": "</s>",
+      "lstrip": false,
+      "normalized": true,
+      "rstrip": false,
+      "single_word": false,
+      "special": true
+    },
+    "166100": {
+      "content": "<|im_start|>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": true
+    },
+    "166101": {
+      "content": "<|im_end|>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": true
+    },
+    "166102": {
+      "content": "<|endoftext|>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": true
+    },
+    "166103": {
+      "content": "<think>",
+      "lstrip": false,
+      "normalized": true,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "166104": {
+      "content": "</think>",
+      "lstrip": false,
+      "normalized": true,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "166105": {
+      "content": "<tool_call>",
+      "lstrip": false,
+      "normalized": true,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "166106": {
+      "content": "</tool_call>",
+      "lstrip": false,
+      "normalized": true,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    }
+  },
+  "additional_special_tokens": [
+    "<|endoftext|>"
+  ],
+  "bos_token": "<|im_start|>",
+  "chat_template": "\n\n{%- macro visible_text(content) -%}\n    {%- if content is string -%}\n        {{- content }}\n    {%- elif content is iterable and content is not mapping -%}\n        {%- for item in content -%}\n            {%- if item is mapping and item.type == 'text' -%}\n                {{- item.text }}\n            {%- elif item is string -%}\n                {{- item }}\n            {%- elif item is mapping and item.type in ['image', 'image_url', 'video', 'video_url', 'audio', 'audio_url', 'input_audio'] -%}\n                {%- set media_type = item.type | replace('_url', '') | replace('input_', '') -%}\n                {{- \"<reminder>You are unable to process this \" ~ media_type ~ \" because you don't have multi-modal input ability. Try different methods.</reminder>\" }}\n            {%- endif -%}\n        {%- endfor -%}\n    {%- else -%}\n        {{- content }}\n    {%- endif -%}\n{%- endmacro -%}\n\n\n{%- set tool_call_format = tool_call_format if tool_call_format is defined else 'xml' %}\n{%- if tools %}\n    {{- '<|im_start|>system\\n' }}    \n    {%- if messages|length > 0 and messages[0].get('role', '') == 'system' %}\n        {{- visible_text(messages[0].content) + '\\n\\n' }}\n    {%- else %} \n        {{- '你是一位工具函数调用专家，你会得到一个问题和一组可能的工具函数。根据问题，你需要进行一个或多个函数/工具调用以实现目的，请尽量尝试探索通过工具解决问题。\\n如果没有一个函数可以使用，请直接使用自然语言回复用户。\\n如果给定的问题缺少函数所需的参数，请使用自然语言进行提问，向用户询问必要信息。\\n如果调用结果已经足够回答用户问题，请对历史结果进行总结，使用自然语言回复用户。' }} \n    {%- endif %}\n\n    {{- \"# Tools\\n\\nYou may call one or more functions to assist with the user query.\\n\\nYou are provided with function signatures within <tools></tools> XML tags:\\n<tools>\" }}\n    {%- for tool in tools %}\n        {{- \"\\n\" }}\n        {{- tool | tojson }}\n    {%- endfor %}\n    \n    {%- if tool_call_format == 'json' %}\n        {{- \"\\n</tools>\\n\\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\\n\" }}\n        {{- '<tool_call>\\n{\\\"name\\\": <function-name>, \\\"arguments\\\": <args-json-object>}\\n</tool_call><|im_end|>\\n' }}\n    {%- else %}\n        {{- \"\\n</tools>\\n\\nFor each function call, output the function name and arguments within the following XML format:\\n\" }}\n        {{- '<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call><|im_end|>\\n' }}\n    {%- endif %}\n    \n{%- else %}\n    {%- if messages|length > 0 and messages[0].get('role', '') == 'system' %}\n        {{- '<|im_start|>system\\n' + visible_text(messages[0].content) + '<|im_end|>\\n' }}\n    {%- else %} \n        {{- '<|im_start|>system\\n你是南北阁，一款由BOSS直聘自主研发并训练的专业大语言模型。<|im_end|>\\n' }} \n    {%- endif %}\n{%- endif %}\n\n{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}\n{%- for message in messages[::-1] %}\n    {%- set index = (messages|length - 1) - loop.index0 %}\n    {%- if ns.multi_step_tool and message.get('role', '') == \"user\" and visible_text(message.content) is string and not(visible_text(message.content).startswith('<tool_response>') and visible_text(message.content).endswith('</tool_response>')) %}\n        {%- set ns.multi_step_tool = false %}\n        {%- set ns.last_query_index = index %}\n    {%- endif %}\n{%- endfor %}\n\n{%- for message in messages %}\n    {%- if visible_text(message.content) is string %}\n        {%- set content = visible_text(message.content) %}\n    {%- else %}\n        {%- set content = '' %}\n    {%- endif %}\n    \n    {%- if message.get('role', '') == \"system\" %}\n        {%- if not loop.first %}\n            {{- raise_exception('System message must be at the beginning.') }}\n        {%- endif %}\n        \n    {%- elif message.get('role', '') == \"assistant\" %}\n        {%- set reasoning_content = '' %}\n        {%- if message.reasoning_content is string %}\n            {%- set reasoning_content = message.reasoning_content %}\n        {%- else %}\n            {%- if '</think>' in content %}\n                {%- set reasoning_content = content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n') %}\n                {%- set content = content.split('</think>')[-1].lstrip('\\n').rstrip('\\n') %}\n            {%- endif %}\n        {%- endif %}\n        {%- set reasoning_content = reasoning_content|trim %}\n        \n        {%- if (preserve_thinking is defined and preserve_thinking is false) and (loop.index0 < ns.last_query_index) %}\n            {{- '<|im_start|>' + message.get('role', '') + '\\n<think>\\n\\n</think>\\n\\n' + content }}\n        {%- else %}\n            {{- '<|im_start|>' + message.get('role', '') + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content }}\n        {%- endif %}\n        \n        {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}\n            {%- if tool_call_format == 'json' %}\n                {%- for tool_call in message.tool_calls %}\n                    {%- if (loop.first and content) or (not loop.first) %}\n                        {{- '\\n' }}\n                    {%- endif %}\n                    {%- if tool_call.function %}\n                        {%- set tool_call = tool_call.function %}\n                    {%- endif %}\n                    {{- '<tool_call>\\n{\"name\": \"' }}\n                    {{- tool_call.name }}\n                    {{- '\", \"arguments\": ' }}\n                    {%- if tool_call.arguments is string %}\n                        {{- tool_call.arguments }}\n                    {%- else %}\n                        {{- tool_call.arguments | tojson }}\n                    {%- endif %}\n                    {{- '}\\n</tool_call>' }}\n                {%- endfor %}\n            {%- else %}\n                {%- for tool_call in message.tool_calls %}\n                    {%- if tool_call.function is defined %}\n                        {%- set tool_call = tool_call.function %}\n                    {%- endif %}\n                    \n                    {%- if loop.first %}\n                        {%- if content|trim %}\n                            {{- '\n\n<tool_call>\n<function=' + tool_call.name + '>\n' }}\n                        {%- else %}\n                            {{- '<tool_call>\n<function=' + tool_call.name + '>\n' }}\n                        {%- endif %}\n                    {%- else %}\n                        {{- '\n<tool_call>\n<function=' + tool_call.name + '>\n' }}\n                    {%- endif %}\n                    \n                    {%- if tool_call.arguments is defined %}\n                        {%- for args_name, args_value in tool_call.arguments|items %}\n                            {{- '<parameter=' + args_name + '>\n' }}\n                            {%- set args_value = args_value | string if args_value is string else args_value | tojson | safe %}\n                            {{- args_value }}\n                            {{- '\n</parameter>\n' }}\n                        {%- endfor %}\n                    {%- endif %}\n                    {{- '</function>\n</tool_call>' }}\n                {%- endfor %}\n            {%- endif %}\n        {%- endif %}\n        {{- '<|im_end|>\\n' }}\n        \n    {%- elif message.get('role', '') == \"tool\" %}\n        {%- if loop.previtem and loop.previtem.get('role', '') != \"tool\" %}\n            {{- '<|im_start|>user' }}\n        {%- endif %}\n        {{- '\\n<tool_response>\\n' }}\n        {{- content }}\n        {{- '\\n</tool_response>' }}\n        {%- if loop.last or loop.nextitem.get('role', '') != \"tool\" %}\n            {{- '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- elif message.get('role', '') != '' %}\n        {{- '<|im_start|>' + message.get('role', '') + '\\n' + content + '<|im_end|>' + '\\n' }}\n    {%- endif %}\n{%- endfor %}\n\n{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\\n' }}\n    \n    {%- if enable_thinking is defined and enable_thinking is false %}\n        {{- '<think>\n\n</think>\n\n' }}\n    {%- else %}\n        {{- '<think>\n' }}\n    {%- endif %}\n    \n{%- endif %}\n",
+  "clean_up_tokenization_spaces": false,
+  "eos_token": "<|im_end|>",
+  "extra_special_tokens": {},
+  "legacy": false,
+  "model_max_length": 1000000000000000019884624838656,
+  "pad_token": "<unk>",
+  "sp_model_kwargs": {},
+  "spaces_between_special_tokens": false,
+  "tokenizer_class": "LlamaTokenizer",
+  "unk_token": "<unk>",
+  "use_default_system_prompt": false
+}
