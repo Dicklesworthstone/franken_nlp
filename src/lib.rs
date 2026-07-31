@@ -20,11 +20,12 @@ pub mod tokenizer;
 pub mod validation;
 
 pub use orchestrator::{
-    CommittedMemory, EngineBuildError, EngineLease, EngineResources, LeakResponsePolicy,
+    CommittedMemory, EngineBuildError, EngineCallGuard, EngineLease, EngineResources,
+    LeakResponsePolicy,
     MemoryClass, MemoryClassCharge, MemoryReservation, MemorySnapshot, NlpEngine,
     NlpEngineBuilder, ReservationError, ResourceBrokerError, ResourceConfigConflict,
     ResourceConfigError, ResourceConfigField, ResourceConfigValue, ResourceHostConfig,
-    RuntimeHostError, RuntimePreset, ThreadInventory, install_process_resources,
+    ReentrantCall, RuntimeHostError, RuntimePreset, ThreadInventory, install_process_resources,
     installed_process_resources,
 };
 

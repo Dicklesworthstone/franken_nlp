@@ -11,13 +11,51 @@
 //! recorded configuration inputs, not a CPU-team sizing certificate.
 
 use std::{
+    cell::Cell,
     collections::BTreeMap,
     fmt,
+    marker::PhantomData,
+    rc::Rc,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
 };
+
+thread_local! {
+    /// A synchronous facade call may not nest a second runtime entry on one
+    /// thread. The guard is intentionally process-local because a production
+    /// process has exactly one broker host.
+    static ACTIVE_SYNC_RESOURCE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+#[cfg(feature = "asupersync-runtime")]
+thread_local! {
+    /// Set only by the runtime builder's worker lifecycle callbacks. Ambient
+    /// `Cx::current()` is deliberately not consulted: the census records that
+    /// it is not a least-authority boundary at this pin.
+    static RUNTIME_WORKER_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(feature = "asupersync-runtime")]
+fn mark_runtime_worker_started() {
+    RUNTIME_WORKER_THREAD.with(|worker| worker.set(true));
+}
+
+#[cfg(feature = "asupersync-runtime")]
+fn mark_runtime_worker_stopped() {
+    RUNTIME_WORKER_THREAD.with(|worker| worker.set(false));
+}
+
+#[cfg(feature = "asupersync-runtime")]
+fn is_runtime_worker_thread() -> bool {
+    RUNTIME_WORKER_THREAD.with(Cell::get)
+}
+
+#[cfg(not(feature = "asupersync-runtime"))]
+const fn is_runtime_worker_thread() -> bool {
+    false
+}
 
 /// The asupersync runtime-builder profile selected by an entrypoint.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -847,7 +885,9 @@ impl RuntimeHost {
         .worker_threads(config.runtime_workers)
         // A nonzero pool is a production precondition. The configured maximum
         // is independently counted in the thread inventory above.
-        .blocking_threads(1, config.max_blocking_coordinators);
+        .blocking_threads(1, config.max_blocking_coordinators)
+        .on_thread_start(mark_runtime_worker_started)
+        .on_thread_stop(mark_runtime_worker_stopped);
         let runtime = builder
             .build()
             .map_err(|error| RuntimeHostError::RuntimeBuild {
@@ -1083,6 +1123,77 @@ impl NlpEngine {
     pub const fn lease_id(&self) -> u64 {
         self.lease.id()
     }
+
+    /// Enter a synchronous public operation without nesting a runtime.
+    ///
+    /// Future inference and task methods must retain the returned guard until
+    /// their owned blocking closure has drained. Calling from this runtime's
+    /// worker thread or recursively from a synchronous engine call returns a
+    /// typed failure instead of attempting `block_on`.
+    pub fn enter_sync_call(&self) -> Result<EngineCallGuard, ReentrantCall> {
+        if is_runtime_worker_thread() {
+            return Err(ReentrantCall::RuntimeWorker);
+        }
+        let resource_key = Arc::as_ptr(self.resources()) as usize;
+        ACTIVE_SYNC_RESOURCE.with(|active| {
+            if active.get().is_some() {
+                return Err(ReentrantCall::NestedSyncCall);
+            }
+            active.set(Some(resource_key));
+            Ok(EngineCallGuard {
+                resource_key,
+                // A guard restores a thread-local entry on Drop and therefore
+                // must never cross to a different thread.
+                _not_send_or_sync: PhantomData,
+            })
+        })
+    }
+}
+
+/// Typed refusal for a synchronous call that would nest the owned runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReentrantCall {
+    /// The caller is already executing on this process host's runtime worker.
+    RuntimeWorker,
+    /// The current OS thread already holds a synchronous engine entry guard.
+    NestedSyncCall,
+}
+
+impl fmt::Display for ReentrantCall {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RuntimeWorker => formatter.write_str(
+                "ReentrantCall: synchronous NlpEngine entry from a runtime worker is refused",
+            ),
+            Self::NestedSyncCall => formatter.write_str(
+                "ReentrantCall: nested synchronous NlpEngine entry is refused",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReentrantCall {}
+
+/// Ownership marker for an admitted synchronous engine operation.
+#[derive(Debug)]
+pub struct EngineCallGuard {
+    resource_key: usize,
+    _not_send_or_sync: PhantomData<Rc<()>>,
+}
+
+impl Drop for EngineCallGuard {
+    fn drop(&mut self) {
+        ACTIVE_SYNC_RESOURCE.with(|active| {
+            if active.get() == Some(self.resource_key) {
+                active.set(None);
+            } else {
+                eprintln!(
+                    "ENGINE_RESOURCES SYNC_GUARD_INVARIANT expected_resource_key={}",
+                    self.resource_key,
+                );
+            }
+        });
+    }
 }
 
 /// Builder for a synchronous [`NlpEngine`] backed by the process host.
@@ -1280,5 +1391,24 @@ mod tests {
         assert_eq!(snapshot.reserved_bytes, 0);
         assert_eq!(snapshot.committed_bytes, 0);
         assert_eq!(snapshot.recorded_leaks, 1);
+    }
+
+    #[test]
+    fn synchronous_entry_refuses_recursion_and_recovers_after_drop() {
+        let broker = ResourceBroker::isolated_for_test();
+        let resources = broker.install(config()).expect("host installs");
+        let engine = NlpEngine {
+            lease: resources.acquire_lease(),
+        };
+        let guard = engine.enter_sync_call().expect("first entry is admitted");
+        assert!(
+            matches!(engine.enter_sync_call(), Err(ReentrantCall::NestedSyncCall)),
+            "nested entry must fail before it can attempt a second runtime"
+        );
+        drop(guard);
+        let recovered = engine
+            .enter_sync_call()
+            .expect("dropping the outer guard restores entry");
+        drop(recovered);
     }
 }
