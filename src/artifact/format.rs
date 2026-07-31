@@ -161,6 +161,15 @@ impl CanonicalDtype {
             Self::I8 => "i8",
         }
     }
+
+    /// Exact byte width of one canonical logical element in v1.
+    pub const fn logical_bytes_per_element(self) -> u64 {
+        match self {
+            Self::Bf16 => 2,
+            Self::F32 => 4,
+            Self::I8 => 1,
+        }
+    }
 }
 
 /// A named stored section supplied to the canonical writer.
@@ -892,36 +901,15 @@ fn canonical_tensors(
                 reason: "shape rank must be in 1..=8".to_owned(),
             });
         }
-        let mut element_count = 1_u64;
-        for dimension in &tensor.shape {
-            if *dimension == 0 {
-                return Err(FnlpqWriteError::Tensor {
-                    tensor: tensor.name.clone(),
-                    reason: "shape dimensions must be nonzero".to_owned(),
-                });
-            }
-            element_count = element_count
-                .checked_mul(u64::from(*dimension))
-                .ok_or_else(|| FnlpqWriteError::Tensor {
-                    tensor: tensor.name.clone(),
-                    reason: "shape element product overflows u64".to_owned(),
-                })?;
-        }
+        let logical_bytes = logical_byte_len(&tensor.name, &tensor.shape, tensor.canonical_dtype)?;
         if tensor.canonical_dtype == CanonicalDtype::Bf16 && tensor.quantization == BF16_VERBATIM_V1
         {
-            let expected_data_len =
-                element_count
-                    .checked_mul(2)
-                    .ok_or_else(|| FnlpqWriteError::Tensor {
-                        tensor: tensor.name.clone(),
-                        reason: "bf16-verbatim byte length overflows u64".to_owned(),
-                    })?;
-            if tensor.data.len != expected_data_len {
+            if tensor.data.len != logical_bytes {
                 return Err(FnlpqWriteError::Mapping {
                     tensor: tensor.name.clone(),
                     mapping: "data",
                     reason: format!(
-                        "bf16-verbatim-v1 requires {expected_data_len} bytes for shape {:?}, observed {}",
+                        "bf16-verbatim-v1 requires {logical_bytes} bytes for shape {:?}, observed {}",
                         tensor.shape, tensor.data.len
                     ),
                 });
@@ -1167,6 +1155,11 @@ fn build_header(
                     row_sum: header_mapping(&tensor.row_sum, &ordinals)?,
                     scale: header_mapping(&tensor.scale, &ordinals)?,
                 },
+                logical_bytes: logical_byte_len(
+                    &tensor.name,
+                    &tensor.shape,
+                    tensor.canonical_dtype,
+                )?,
                 name: tensor.name.clone(),
                 shape: tensor.shape.clone(),
             })
@@ -1249,6 +1242,34 @@ fn input_range_bytes<'a>(
             tensor: "logical identity".to_owned(),
             mapping: "range",
             reason: format!("range [{start}, {end}) exceeds section {}", section.name),
+        })
+}
+
+fn logical_byte_len(
+    tensor_name: &str,
+    shape: &[u32],
+    canonical_dtype: CanonicalDtype,
+) -> Result<u64, FnlpqWriteError> {
+    let mut element_count = 1_u64;
+    for dimension in shape {
+        if *dimension == 0 {
+            return Err(FnlpqWriteError::Tensor {
+                tensor: tensor_name.to_owned(),
+                reason: "shape dimensions must be nonzero".to_owned(),
+            });
+        }
+        element_count = element_count
+            .checked_mul(u64::from(*dimension))
+            .ok_or_else(|| FnlpqWriteError::Tensor {
+                tensor: tensor_name.to_owned(),
+                reason: "shape element product overflows u64".to_owned(),
+            })?;
+    }
+    element_count
+        .checked_mul(canonical_dtype.logical_bytes_per_element())
+        .ok_or_else(|| FnlpqWriteError::Tensor {
+            tensor: tensor_name.to_owned(),
+            reason: "logical byte length overflows u64".to_owned(),
         })
 }
 
@@ -1457,6 +1478,7 @@ struct HeaderTensor {
     canonical_dtype: &'static str,
     canonical_logical_sha256: String,
     generic: HeaderGenericMapping,
+    logical_bytes: u64,
     name: String,
     shape: Vec<u32>,
 }

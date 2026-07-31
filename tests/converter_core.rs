@@ -2,9 +2,9 @@
 //! model-gated in `scripts/e2e_convert_roundtrip.sh`.
 
 use franken_nlp::artifact::converter::{
-    expected_nanbeige42_census, prepare_convert_request, remap_tensor_name,
-    validate_nanbeige42_census, ConversionReceipt, ConversionSourceManifest, ConvertArch,
-    ConvertRequest, ConverterError, StorageStage, DEFAULT_PANEL_BYTES,
+    DEFAULT_PANEL_BYTES, ConversionReceipt, ConversionSourceManifest, ConvertArch, ConverterError,
+    ConvertRequest, StorageStage, expected_nanbeige42_census, prepare_convert_request,
+    remap_tensor_name, validate_nanbeige42_census,
 };
 use franken_nlp::artifact::safetensors::TensorCensusEntry;
 
@@ -124,9 +124,6 @@ fn conversion_admission_rejects_the_recipe_before_source_access() {
 
     assert!(matches!(
         prepare_convert_request(&request, DEFAULT_PANEL_BYTES),
-        Err(ConverterError::InvalidConvertArgument {
-            argument: "--recipe",
-            ..
-        })
+        Err(ConverterError::InvalidConvertArgument { argument: "--recipe", .. })
     ));
 }

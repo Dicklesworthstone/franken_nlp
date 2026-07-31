@@ -167,6 +167,8 @@ pub struct CheckedTensor {
     pub shape: Vec<u32>,
     /// Converter-provided canonical logical identity.
     pub canonical_logical_sha256: String,
+    /// Exact byte length derived from the logical dtype and full shape.
+    pub logical_bytes: u64,
     /// Fixed generic quantization recipe ID.
     pub quantization: String,
     /// Mapping into the generic payload section.
@@ -880,6 +882,7 @@ fn parse_tensors(value: &Value) -> Result<Vec<CheckedTensor>, FnlpqReadError> {
                 "canonical_dtype",
                 "canonical_logical_sha256",
                 "generic",
+                "logical_bytes",
                 "name",
                 "shape",
             ],
@@ -935,6 +938,25 @@ fn parse_tensors(value: &Value) -> Result<Vec<CheckedTensor>, FnlpqReadError> {
             exact_string(generic, "quantization", &format!("{path}/generic"))?,
             "tensor.generic.quantization",
         )?;
+        let logical_bytes = exact_u64(object, "logical_bytes", &path)?;
+        let expected_logical_bytes = element_count
+            .checked_mul(
+                canonical_dtype(&canonical_dtype).logical_bytes_per_element(),
+            )
+            .ok_or_else(|| {
+                header_error(
+                    format!("{path}/logical_bytes"),
+                    "logical byte length overflows u64",
+                )
+            })?;
+        if logical_bytes != expected_logical_bytes {
+            return Err(header_error(
+                format!("{path}/logical_bytes"),
+                format!(
+                    "must equal {expected_logical_bytes} for dtype {canonical_dtype} and shape {shape:?}, observed {logical_bytes}"
+                ),
+            ));
+        }
         let data = parse_mapping(
             value_at(generic, "data", &format!("{path}/generic"))?,
             &path,
@@ -966,6 +988,7 @@ fn parse_tensors(value: &Value) -> Result<Vec<CheckedTensor>, FnlpqReadError> {
                 64,
                 "tensor.canonical_logical_sha256",
             )?,
+            logical_bytes,
             quantization,
             data,
             scale: parse_mapping(

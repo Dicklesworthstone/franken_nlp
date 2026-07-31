@@ -157,6 +157,24 @@ fn bf16_verbatim_extent_must_match_declared_shape_on_write_and_load() {
 }
 
 #[test]
+fn logical_bytes_is_derived_from_declared_dtype_and_shape() {
+    let valid = write(&tiny_input())
+        .expect("tiny logical fixture writes")
+        .bytes;
+    let artifact = FnlpqArtifact::from_bytes(valid.clone())
+        .expect("writer emits a logical byte count matching the tensor declaration");
+    assert_eq!(artifact.tensors()[0].logical_bytes, 2);
+
+    let mut corrupted = valid;
+    replace_header_decimal(&mut corrupted, "logical_bytes", b'3');
+    let error = FnlpqArtifact::from_bytes(corrupted)
+        .expect_err("forged logical byte count must fail before any tensor consumer");
+    assert!(matches!(error, FnlpqReadError::Header { .. }));
+    assert!(error.to_string().contains("logical_bytes"));
+    eprintln!("FNLPQ_LOAD stage=logical_bytes verdict=PASS");
+}
+
+#[test]
 fn logical_identity_is_checked_at_write_and_load_boundaries() {
     let mut stale_tensor = tiny_input();
     stale_tensor.tensors[0].canonical_logical_sha256 = "0".repeat(64);
@@ -409,6 +427,22 @@ fn replace_header_digest(bytes: &mut [u8], field: &str, replacement: &str) {
             .all(|byte| byte.is_ascii_hexdigit())
     );
     bytes[80 + start..80 + end].copy_from_slice(replacement.as_bytes());
+    let digest: [u8; 32] = Sha256::digest(&bytes[header_range]).into();
+    bytes[48..80].copy_from_slice(&digest);
+}
+
+fn replace_header_decimal(bytes: &mut [u8], field: &str, replacement: u8) {
+    assert!(replacement.is_ascii_digit(), "replacement must be a decimal digit");
+    let header_len = usize::try_from(u64::from_le_bytes(
+        bytes[16..24].try_into().expect("prelude"),
+    ))
+    .expect("fixture header fits host");
+    let header_range = 80..80 + header_len;
+    let header = std::str::from_utf8(&bytes[header_range.clone()]).expect("header UTF-8");
+    let prefix = format!("\"{field}\":");
+    let start = header.find(&prefix).expect("header field") + prefix.len();
+    assert!(header.as_bytes()[start].is_ascii_digit());
+    bytes[80 + start] = replacement;
     let digest: [u8; 32] = Sha256::digest(&bytes[header_range]).into();
     bytes[48..80].copy_from_slice(&digest);
 }

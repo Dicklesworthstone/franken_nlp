@@ -46,6 +46,7 @@
     {"id": "header.tensors.canonical_dtype", "json_pointer": "/tensors/*/canonical_dtype", "size_bytes": "variable", "endianness": "n/a", "cap": "known v1 logical dtype"},
     {"id": "header.tensors.shape", "json_pointer": "/tensors/*/shape", "size_bytes": "variable", "endianness": "n/a", "cap": "rank 1..=8; each dimension 1..=4294967295; checked product"},
     {"id": "header.tensors.canonical_logical_sha256", "json_pointer": "/tensors/*/canonical_logical_sha256", "size_bytes": "variable", "endianness": "n/a", "cap": "64 lowercase hex in logical-model record"},
+    {"id": "header.tensors.logical_bytes", "json_pointer": "/tensors/*/logical_bytes", "size_bytes": "variable", "endianness": "n/a", "cap": "exactly dtype byte width times checked shape product"},
     {"id": "header.tensors.generic.quantization", "json_pointer": "/tensors/*/generic/quantization", "size_bytes": "variable", "endianness": "n/a", "cap": "fixed known quantization recipe ID"},
     {"id": "header.tensors.generic.mapping", "json_pointer": "/tensors/*/generic/{data,scale,row_sum}", "size_bytes": "variable", "endianness": "n/a", "cap": "each has section_ordinal, offset, length; checked within matching singleton section"},
     {"id": "header.packing_sets", "json_pointer": "/packing_sets", "size_bytes": "variable", "endianness": "n/a", "cap": "1..=16; includes mandatory generic set"},

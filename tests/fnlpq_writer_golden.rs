@@ -244,6 +244,7 @@ fn field_inventory_ids_are_all_covered_by_the_writer_golden() {
         "header.tensors.canonical_dtype",
         "header.tensors.shape",
         "header.tensors.canonical_logical_sha256",
+        "header.tensors.logical_bytes",
         "header.tensors.generic.quantization",
         "header.tensors.generic.mapping",
         "header.packing_sets",
