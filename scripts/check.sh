@@ -248,11 +248,14 @@ main() {
     run_section clippy cargo clippy --locked --all-targets -- -D warnings
     run_section test cargo test --locked
     run_section doc-links validate_doc_links
+    run_section adr-registry python3 scripts/validate_adrs.py
     run_section platform-surfaces validate_platform_surfaces
     run_section ubs run_bounded_ubs
 
     # These dedicated policy scripts become mandatory as their sibling beads land.
     run_optional_policy_section lint-policy "${REPO_ROOT}/scripts/check_lint_policy.sh"
+    run_optional_policy_section claims "${REPO_ROOT}/scripts/check_claims.sh"
+    run_optional_policy_section behavior-notes "${REPO_ROOT}/scripts/lint_behavior_notes.sh"
     run_optional_policy_section dependency-policy "${REPO_ROOT}/scripts/check_dependency_policy.sh"
     run_optional_policy_section suite-lock "${REPO_ROOT}/scripts/check_suite_lock.sh"
     run_optional_policy_section toolchain-policy "${REPO_ROOT}/scripts/check_toolchain.sh"

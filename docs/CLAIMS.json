@@ -1,0 +1,125 @@
+{
+  "claims": [
+    {
+      "evidence_artifact_digests": [],
+      "expiry_revalidation_trigger": "on_change: pinned oracle revision, bf16 cast point, tokenizer, template, or eager-attention execution",
+      "id": "hf-bf16-eager-fidelity",
+      "probability_space": "full_vocab_sequence_logprob",
+      "public_surfaces": [
+        "README",
+        "--help",
+        "robot_schema_descriptions"
+      ],
+      "state": "targeted",
+      "transition_history": [],
+      "validity_domain": {
+        "dataset": "not-applicable-until-task-qualification",
+        "host": "pinned CPU oracle host and declared replay hosts",
+        "numerics_profile": "hf-bf16-eager",
+        "prompt_hash": "not-applicable-until-task-qualification",
+        "recipe_id": "bf16 reference execution",
+        "thinking_mode": "pinned-template mode"
+      },
+      "wording_scope": "Only hf-bf16-eager may make HF-match fidelity claims; diagnostic-f32 is structural only and quantized profiles require their own preregistered budgets."
+    },
+    {
+      "evidence_artifact_digests": [],
+      "expiry_revalidation_trigger": "on_change: converter inputs, canonical serialization, publisher target, artifact recipe, or release receipt",
+      "id": "portable-quant-v1-identity-or-fallback",
+      "public_surfaces": [
+        "README",
+        "release_notes"
+      ],
+      "state": "targeted",
+      "transition_history": [],
+      "validity_domain": {
+        "dataset": "not-applicable",
+        "host": "all claimed publisher targets",
+        "numerics_profile": "portable-quant-v1",
+        "prompt_hash": "not-applicable",
+        "recipe_id": "nanbeige42-int8-v1",
+        "thinking_mode": "not-applicable"
+      },
+      "wording_scope": "Portable quantization identity is claimed only after cross-target digest evidence; otherwise releases name a narrower canonical publisher fallback."
+    },
+    {
+      "evidence_artifact_digests": [],
+      "expiry_revalidation_trigger": "on_change: model revision, tensor census, artifact format, KV layout, binary build profile, or hardware profile",
+      "id": "five-quantity-footprint",
+      "public_surfaces": [
+        "README",
+        "release_notes",
+        "robot_schema_descriptions"
+      ],
+      "state": "targeted",
+      "transition_history": [],
+      "validity_domain": {
+        "dataset": "not-applicable",
+        "host": "named measured host only",
+        "numerics_profile": "named profile only",
+        "prompt_hash": "not-applicable",
+        "recipe_id": "named immutable artifact only",
+        "thinking_mode": "named template mode only"
+      },
+      "wording_scope": "Footprint reports separately name model bytes, resident bytes, KV commitment, scratch bytes, and binary size with their measurement conditions."
+    },
+    {
+      "evidence_artifact_digests": [],
+      "expiry_revalidation_trigger": "on_change: phase gate landing or README target-scope split",
+      "id": "readme-target-system-specification",
+      "public_surfaces": [
+        "README"
+      ],
+      "state": "targeted",
+      "transition_history": [],
+      "validity_domain": {
+        "dataset": "not-applicable-target-specification",
+        "host": "not-applicable-target-specification",
+        "numerics_profile": "not-applicable-target-specification",
+        "prompt_hash": "not-applicable-target-specification",
+        "recipe_id": "not-applicable-target-specification",
+        "thinking_mode": "not-applicable-target-specification"
+      },
+      "wording_scope": "The README's declared present-tense finished-system description is a targeted specification, not evidence that an unlanded subsystem is already proven."
+    },
+    {
+      "evidence_artifact_digests": [],
+      "expiry_revalidation_trigger": "on_change: public CLI wording, command contract, exit-code table, or robot-schema version",
+      "id": "cli-target-system-identity",
+      "public_surfaces": [
+        "--help"
+      ],
+      "state": "targeted",
+      "transition_history": [],
+      "validity_domain": {
+        "dataset": "not-applicable-target-specification",
+        "host": "all supported targets",
+        "numerics_profile": "not-applicable-target-specification",
+        "prompt_hash": "not-applicable-target-specification",
+        "recipe_id": "not-applicable-target-specification",
+        "thinking_mode": "not-applicable-target-specification"
+      },
+      "wording_scope": "Public fnlp help text describes the targeted one-model Nanbeige4.2-3B local NLP toolbox contract."
+    },
+    {
+      "evidence_artifact_digests": [],
+      "expiry_revalidation_trigger": "on_change: event field, schema version, error-map table, or robot command description",
+      "id": "robot-schema-contract",
+      "public_surfaces": [
+        "robot_schema_descriptions"
+      ],
+      "state": "targeted",
+      "transition_history": [],
+      "validity_domain": {
+        "dataset": "not-applicable-target-specification",
+        "host": "all supported targets",
+        "numerics_profile": "not-applicable-target-specification",
+        "prompt_hash": "not-applicable-target-specification",
+        "recipe_id": "robot-schema-v1",
+        "thinking_mode": "not-applicable-target-specification"
+      },
+      "wording_scope": "Robot schema descriptions are targeted v1 contract text until canonical-JSON and error-map gates complete."
+    }
+  ],
+  "schema_version": 1
+}
