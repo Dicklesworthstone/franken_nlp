@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "model": "Nanbeige4.2-3B",
+  "model_revision": "f56ec5a9650268aa098496734743c25ea778bd2d",
+  "promotions": [
+    {
+      "oq_id": "OQ-1",
+      "claim": "The pinned safetensors index resolves to the generated 201-name Nanbeige4.2-3B census; no mHC, ngram, depth, or LoopSplit tensor family appears in that census.",
+      "old_state": "OBSERVED@pin",
+      "new_state": "EVIDENCED",
+      "replay_fixture": "docs/truth-pack/tensor_census.json",
+      "evidence": [{ "path": "tensor_census.json", "sha256": "ebe71a912723366e4def38cc8e558c0b09dba028a44bb7892872ff04d5d0f982", "line_start": 1, "line_end": 1, "expected_text_sha256": "021fb596db81e6d02bf3d2586ee3981fe519f275c0ac9ca76bbcf2ebb4097d96" }]
+    },
+    {
+      "oq_id": "OQ-2",
+      "claim": "The pinned HF cache helper computes the normal loop-aware KV index as layer_idx + loop_idx * num_hidden_layers; the independent fixture receipt binds 44 KV slots, but official llama.cpp agreement remains unexecuted.",
+      "old_state": "PARTIAL",
+      "new_state": "PARTIAL",
+      "open_remainders": [{ "blocking_phase": "Phase -1 official llama.cpp matched-fixture conversion and inference" }],
+      "replay_fixture": "tests/fixtures/reference/hf-bf16-eager/prompt-000/trace.json",
+      "evidence": [
+        { "path": "research/modeling_nanbeige.py", "sha256": "547737f989f5cb741c1a568acaf85f83521fa67a8f7268e19f9a37e60127c0d5", "line_start": 133, "line_end": 143, "expected_text_sha256": "a2e16da8378f4605ba032d2e86caffa8bcd016fda945287d53ec4183eb97f71d" },
+        { "path": "reference_fixture_verification_f56ec5a.json", "sha256": "08e793d2b82b7490cfce6b39a35e5c78aa3442f19efba6fe09b601721f20ab1c", "line_start": 24, "line_end": 30, "expected_text_sha256": "c6ae67b479e17ccbfd7245ed5aec9c46e5b763de98350dc41e1c66c31a549ef0" }
+      ]
+    },
+    {
+      "oq_id": "OQ-3",
+      "claim": "The pinned loop iterates decoder layers and applies self.norm after each completed loop; the replayed fixture receipt covers 44 post-layer states and two post-loop norm states.",
+      "old_state": "OBSERVED@pin",
+      "new_state": "EVIDENCED",
+      "replay_fixture": "tests/fixtures/reference/hf-bf16-eager/prompt-000/trace.json",
+      "evidence": [
+        { "path": "research/modeling_nanbeige.py", "sha256": "547737f989f5cb741c1a568acaf85f83521fa67a8f7268e19f9a37e60127c0d5", "line_start": 2217, "line_end": 2306, "expected_text_sha256": "4e8eb37a2538132dea08067f61fc37424bc3a8747ffaaa0492bdd2a0c8a37f2d" },
+        { "path": "reference_fixture_verification_f56ec5a.json", "sha256": "08e793d2b82b7490cfce6b39a35e5c78aa3442f19efba6fe09b601721f20ab1c", "line_start": 24, "line_end": 30, "expected_text_sha256": "c6ae67b479e17ccbfd7245ed5aec9c46e5b763de98350dc41e1c66c31a549ef0" }
+      ]
+    },
+    {
+      "oq_id": "OQ-4",
+      "claim": "The pinned implementation uses split-half rotation and computes RoPE frequencies, cosine, and sine in f32 before casting them to the input dtype; L1 numerical parity remains the authority for the complete position contract.",
+      "old_state": "PARTIAL",
+      "new_state": "PARTIAL",
+      "open_remainders": [{ "blocking_phase": "L1 RoPE numeric parity and boundary-position fixtures" }],
+      "replay_fixture": "tests/fixtures/reference/hf-bf16-eager/prompt-000/trace.json",
+      "evidence": [{ "path": "research/modeling_nanbeige.py", "sha256": "547737f989f5cb741c1a568acaf85f83521fa67a8f7268e19f9a37e60127c0d5", "line_start": 939, "line_end": 965, "expected_text_sha256": "5504c4949a00150ec7f7e5712acd9418e05ec0cfd7563f91dbb6ca69d158fd44" }]
+    },
+    {
+      "oq_id": "OQ-5",
+      "claim": "The pinned eager attention path repeats KV groups, divides QK scores by sqrt(head_dim), adds the causal mask, runs f32 softmax, and casts back to query dtype; L1 attention parity remains open.",
+      "old_state": "PARTIAL",
+      "new_state": "PARTIAL",
+      "open_remainders": [{ "blocking_phase": "L1 attention mask and GQA parity matrix" }],
+      "replay_fixture": "tests/fixtures/reference/hf-bf16-eager/prompt-000/trace.json",
+      "evidence": [{ "path": "research/modeling_nanbeige.py", "sha256": "547737f989f5cb741c1a568acaf85f83521fa67a8f7268e19f9a37e60127c0d5", "line_start": 1191, "line_end": 1202, "expected_text_sha256": "8bf0fcb0b86d62f4991966a2429289db85201400c9d1d98b2153afda5490ec97" }]
+    },
+    {
+      "oq_id": "OQ-6",
+      "claim": "The pinned model card explicitly selects use_fast=False, making the slow tokenizer reference path; complete byte-fallback, added-token, and decode behavior remains separately bounded.",
+      "old_state": "PARTIAL",
+      "new_state": "PARTIAL",
+      "open_remainders": [{ "blocking_phase": "Tokenizer decode and added-token edge corpus completion" }],
+      "replay_fixture": "tests/fixtures/reference/auxiliary.json",
+      "evidence": [{ "path": "research/model_card.md", "sha256": "01cbce423668845435003dc0828033ab7ad07e88f076ed96ec66d4b014f4654f", "line_start": 173, "line_end": 176, "expected_text_sha256": "7e906c0ea2ae65973b5fe2151f0cbdced4f6f6a18064d296ff084e5c428a65de" }]
+    },
+    {
+      "oq_id": "OQ-7",
+      "claim": "The digest-bound chat AST records the fixed role/content/thinking/tool branches and the 72-cell matrix; typed parser and task behavior stay separate from template rendering.",
+      "old_state": "PARTIAL",
+      "new_state": "PARTIAL",
+      "open_remainders": [{ "blocking_phase": "Phase 4 task parser and streaming-boundary proof" }],
+      "replay_fixture": "tests/fixtures/reference/auxiliary.json",
+      "evidence": [{ "path": "chat_ast.md", "sha256": "c695de76e4696ee86a3b4eb6ce2e715f659a615dcfad4bb825739d6de9a9599e", "line_start": 1, "line_end": 13, "expected_text_sha256": "7f433a14b0d1ca9ea4eba02509716b300afcfde5f7f91a1d39d3ec811f75aaa0" }]
+    },
+    {
+      "oq_id": "OQ-8",
+      "claim": "The model-card example names only a limited generation call, so it cannot establish the complete HF generate processor/default ordering that the sampler surface requires.",
+      "old_state": "OPEN",
+      "new_state": "OPEN",
+      "open_remainders": [{ "blocking_phase": "L4 sampler processor-order and forced-run eligibility witness" }],
+      "replay_fixture": "docs/truth-pack/oracle_smoke_f56ec5a.json",
+      "evidence": [{ "path": "research/model_card.md", "sha256": "01cbce423668845435003dc0828033ab7ad07e88f076ed96ec66d4b014f4654f", "line_start": 198, "line_end": 205, "expected_text_sha256": "aacfcc1ad88312bf4a3532d56c04ef7e85c0fea36e0b993e998f253f23348bba" }]
+    },
+    {
+      "oq_id": "OQ-9",
+      "claim": "The fixed chat adapter rejects unknown roles and malformed content/tool-call structures before tokenization; malformed think-close, EOS, preserve/strip, and task-boundary behavior remain unresolved.",
+      "old_state": "PARTIAL",
+      "new_state": "PARTIAL",
+      "open_remainders": [{ "blocking_phase": "Phase 4 structured-task and parser differential" }],
+      "replay_fixture": "tests/fixtures/reference/auxiliary.json",
+      "evidence": [{ "path": "chat_ast.md", "sha256": "c695de76e4696ee86a3b4eb6ce2e715f659a615dcfad4bb825739d6de9a9599e", "line_start": 7, "line_end": 13, "expected_text_sha256": "7ee494d87faf886fbca71041a2b531f20b623e3f340d5b393938405dfef03e6d" }]
+    },
+    {
+      "oq_id": "OQ-16",
+      "claim": "The pinned model-card path applies the chat template and then tokenizes with add_special_tokens=False; a complete pad/BOS/EOS off-by-one matrix remains required.",
+      "old_state": "PARTIAL",
+      "new_state": "PARTIAL",
+      "open_remainders": [{ "blocking_phase": "Tokenizer special-token boundary matrix" }],
+      "replay_fixture": "tests/fixtures/reference/auxiliary.json",
+      "evidence": [{ "path": "research/model_card.md", "sha256": "01cbce423668845435003dc0828033ab7ad07e88f076ed96ec66d4b014f4654f", "line_start": 188, "line_end": 205, "expected_text_sha256": "6a82de49b87529aa615acb2c1e4a201f488f6a65436a52116ba582f33275e92a" }]
+    },
+    {
+      "oq_id": "OQ-25",
+      "claim": "The official llama.cpp baseline revision is selected and line-bound, but its retained smoke transcript still says SKIPPED_NO_MODEL; no conversion or inference success is claimed.",
+      "old_state": "OPEN",
+      "new_state": "PARTIAL",
+      "open_remainders": [{ "blocking_phase": "Phase -1 official llama.cpp CPU conversion and matched-fixture inference" }],
+      "replay_fixture": "docs/truth-pack/llamacpp_baseline.json",
+      "evidence": [{ "path": "llamacpp_baseline.json", "sha256": "c6e120b128cc774f33e8b6b8ad5615d159935a0fb90aef51d10ca556f17de8e8", "line_start": 3, "line_end": 53, "expected_text_sha256": "08ec813b904b33ad757f7a43362575ba9cb33b060c3ce098255675cb4ad5de06" }]
+    }
+  ]
+}

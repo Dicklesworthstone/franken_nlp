@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "model": "Nanbeige4.2-3B",
+  "model_revision": "f56ec5a9650268aa098496734743c25ea778bd2d",
+  "benchmarks": [
+    {
+      "benchmark": "Agent-IF-Oneday",
+      "state": "REPORTED",
+      "thinking_mode": { "enabled": true, "preserve_thinking": true },
+      "sources": [{ "path": "research/model_card.md", "sha256": "01cbce423668845435003dc0828033ab7ad07e88f076ed96ec66d4b014f4654f", "value": "67.5" }]
+    },
+    {
+      "benchmark": "Claw-Gym",
+      "state": "REPORTED",
+      "thinking_mode": { "enabled": true, "preserve_thinking": true },
+      "sources": [{ "path": "research/model_card.md", "sha256": "01cbce423668845435003dc0828033ab7ad07e88f076ed96ec66d4b014f4654f", "value": "65.0" }]
+    },
+    {
+      "benchmark": "DeepResearch Bench II",
+      "state": "REPORTED",
+      "thinking_mode": { "enabled": true, "preserve_thinking": true },
+      "sources": [{ "path": "research/model_card.md", "sha256": "01cbce423668845435003dc0828033ab7ad07e88f076ed96ec66d4b014f4654f", "value": "33.4" }]
+    },
+    {
+      "benchmark": "GDPval",
+      "state": "REPORTED",
+      "thinking_mode": { "enabled": true, "preserve_thinking": true },
+      "sources": [{ "path": "research/model_card.md", "sha256": "01cbce423668845435003dc0828033ab7ad07e88f076ed96ec66d4b014f4654f", "value": "68.8" }]
+    },
+    {
+      "benchmark": "GDPval-rubrics",
+      "state": "REPORTED",
+      "thinking_mode": { "enabled": true, "preserve_thinking": true },
+      "sources": [{ "path": "research/model_card.md", "sha256": "01cbce423668845435003dc0828033ab7ad07e88f076ed96ec66d4b014f4654f", "value": "74.3" }]
+    },
+    {
+      "benchmark": "GPQA-Diamond",
+      "state": "REPORTED",
+      "thinking_mode": { "enabled": true, "preserve_thinking": true },
+      "sources": [{ "path": "research/model_card.md", "sha256": "01cbce423668845435003dc0828033ab7ad07e88f076ed96ec66d4b014f4654f", "value": "87.4" }]
+    },
+    {
+      "benchmark": "HMMT-Feb-2026",
+      "state": "PARTIAL",
+      "thinking_mode": { "enabled": true, "preserve_thinking": true },
+      "conflict": "The pinned card table reports 82.8 while the committed evaluation metadata reports 82.1; neither source is selected as authoritative.",
+      "sources": [
+        { "path": "research/model_card.md", "sha256": "01cbce423668845435003dc0828033ab7ad07e88f076ed96ec66d4b014f4654f", "value": "82.8" },
+        { "path": "research/eval_results/hmmt_feb_2026.yaml", "sha256": "83b573b376db47798ed3654587dee63774956be34e27667ab7cac1e20dac752a", "value": "82.1" }
+      ]
+    },
+    {
+      "benchmark": "Pinch-Bench-V2",
+      "state": "REPORTED",
+      "thinking_mode": { "enabled": true, "preserve_thinking": true },
+      "sources": [{ "path": "research/model_card.md", "sha256": "01cbce423668845435003dc0828033ab7ad07e88f076ed96ec66d4b014f4654f", "value": "74.7" }]
+    },
+    {
+      "benchmark": "ResearchRubrics",
+      "state": "REPORTED",
+      "thinking_mode": { "enabled": true, "preserve_thinking": true },
+      "sources": [{ "path": "research/model_card.md", "sha256": "01cbce423668845435003dc0828033ab7ad07e88f076ed96ec66d4b014f4654f", "value": "44.8" }]
+    },
+    {
+      "benchmark": "SWE-Bench Verified",
+      "state": "REPORTED",
+      "thinking_mode": { "enabled": true, "preserve_thinking": true },
+      "sources": [{ "path": "research/model_card.md", "sha256": "01cbce423668845435003dc0828033ab7ad07e88f076ed96ec66d4b014f4654f", "value": "63.6" }]
+    },
+    {
+      "benchmark": "Terminal-Bench 2.0",
+      "state": "REPORTED",
+      "thinking_mode": { "enabled": true, "preserve_thinking": true },
+      "sources": [{ "path": "research/model_card.md", "sha256": "01cbce423668845435003dc0828033ab7ad07e88f076ed96ec66d4b014f4654f", "value": "44.1" }]
+    }
+  ]
+}

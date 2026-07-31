@@ -8,7 +8,7 @@ promotion record has this shape::
     {
       "oq_id": "OQ-1",
       "claim": "...",
-      "old_state": "OBSERVED",
+      "old_state": "OBSERVED@pin",
       "new_state": "EVIDENCED",
       "replay_fixture": "tests/fixtures/...",
       "evidence": [{
@@ -20,10 +20,16 @@ promotion record has this shape::
       }]
     }
 
-Partial records additionally carry a non-empty ``open_remainders`` list whose
-objects name the blocking phase.  A benchmark row uses ``thinking_mode`` with
-``enabled: true`` and ``preserve_thinking: true``, plus source entries with a
-truth-pack-relative path, SHA-256, and reported numeric value.
+``expected_text_sha256`` may replace ``expected_text`` for a line-bounded
+canonical document whose one line is too large to duplicate in the promotion
+record.  The validator still compares that precise span and logs a bounded
+observed context if it drifts.
+
+Partial or open records additionally carry a non-empty ``open_remainders``
+list whose objects name the blocking phase.  A benchmark row uses
+``thinking_mode`` with ``enabled: true`` and ``preserve_thinking: true``, plus
+source entries with a truth-pack-relative path, SHA-256, and reported numeric
+value.
 
 The validator intentionally fails while the two dependency beads have not yet
 materialized their evidence inputs.  It never downloads sources or fabricates a
@@ -75,6 +81,16 @@ EXPECTED_BENCHMARKS: dict[str, Decimal] = {
     "ResearchRubrics": Decimal("44.8"),
 }
 HMMT_CONFLICT_VALUES = frozenset({Decimal("82.8"), Decimal("82.1")})
+LEGAL_PROMOTION_TRANSITIONS = frozenset(
+    {
+        ("OBSERVED@pin", "EVIDENCED"),
+        ("OBSERVED", "EVIDENCED"),
+        ("PARTIAL", "EVIDENCED"),
+        ("PARTIAL", "PARTIAL"),
+        ("OPEN", "PARTIAL"),
+        ("OPEN", "OPEN"),
+    }
+)
 
 
 class PromotionError(ValueError):
@@ -304,7 +320,22 @@ def verify_evidence(
     expected_digest = require_digest(evidence, "sha256", context)
     line_start = require_positive_int(evidence, "line_start", context)
     line_end = require_positive_int(evidence, "line_end", context)
-    expected_text = require_string(evidence, "expected_text", context)
+    expected_text = evidence.get("expected_text")
+    expected_span_digest = evidence.get("expected_text_sha256")
+    if expected_text is not None:
+        if not isinstance(expected_text, str) or not expected_text:
+            raise PromotionError(f"{context}.expected_text must be a non-empty string")
+        if expected_span_digest is not None:
+            raise PromotionError(
+                f"{context} must provide expected_text or expected_text_sha256, not both"
+            )
+    elif expected_span_digest is not None:
+        if not isinstance(expected_span_digest, str) or not SHA256_RE.fullmatch(expected_span_digest):
+            raise PromotionError(
+                f"{context}.expected_text_sha256 must be a lowercase SHA-256 digest"
+            )
+    else:
+        raise PromotionError(f"{context} must provide expected_text or expected_text_sha256")
     if line_end < line_start:
         raise PromotionError(f"{context}.line_end must be at least line_start")
     candidate = resolve_under(root, relative, f"{context}.path")
@@ -328,11 +359,19 @@ def verify_evidence(
             f"{context} line span {line_start}-{line_end} exceeds {path_text} line count {len(lines)}"
         )
     observed_text = "\n".join(lines[line_start - 1 : line_end])
-    if not hmac.compare_digest(expected_digest, observed_digest) or expected_text != observed_text:
+    observed_span_digest = hashlib.sha256(observed_text.encode("utf-8")).hexdigest()
+    text_matches = (
+        expected_text == observed_text
+        if expected_text is not None
+        else hmac.compare_digest(expected_span_digest, observed_span_digest)
+    )
+    if not hmac.compare_digest(expected_digest, observed_digest) or not text_matches:
         reporter.mark_drifted(record_id, path_text)
         reporter.log(
-            f"DRIFT oq={record_id} evidence={path_text} expected_text={expected_text!r} "
-            f"observed_text={observed_text!r}"
+            f"DRIFT oq={record_id} evidence={path_text} "
+            f"expected_text={expected_text!r} expected_text_sha256={expected_span_digest} "
+            f"observed_text={observed_text[:240]!r} "
+            f"observed_text_sha256={observed_span_digest}"
         )
         raise PromotionError(
             f"{context} drift for {path_text}: expected digest/text differs from observed span"
@@ -377,9 +416,9 @@ def validate_promotions(root: Path, repo_root: Path, record_path: Path, reporter
             require_string(promotion, "claim", context)
             old_state = require_string(promotion, "old_state", context)
             new_state = require_string(promotion, "new_state", context)
-            if old_state != "OBSERVED" or new_state not in {"EVIDENCED", "PARTIAL"}:
+            if (old_state, new_state) not in LEGAL_PROMOTION_TRANSITIONS:
                 raise PromotionError(
-                    f"{context} has illegal transition {old_state}->{new_state}; expected OBSERVED->EVIDENCED|PARTIAL"
+                    f"{context} has illegal transition {old_state}->{new_state}"
                 )
             fixture_text = require_string(promotion, "replay_fixture", context)
             fixture = resolve_under(
@@ -389,10 +428,12 @@ def validate_promotions(root: Path, repo_root: Path, record_path: Path, reporter
             )
             if not fixture.is_file():
                 raise PromotionError(f"{context}.replay_fixture missing: {fixture_text}")
-            if new_state == "PARTIAL":
+            if new_state in {"PARTIAL", "OPEN"}:
                 remainders = require_list(promotion, "open_remainders", context)
                 if not remainders:
-                    raise PromotionError(f"{context}.open_remainders must not be empty for PARTIAL")
+                    raise PromotionError(
+                        f"{context}.open_remainders must not be empty for {new_state}"
+                    )
                 for remainder_index, remainder in enumerate(remainders):
                     remainder_context = f"{context}.open_remainders[{remainder_index}]"
                     require_string(require_mapping(remainder, remainder_context), "blocking_phase", remainder_context)
