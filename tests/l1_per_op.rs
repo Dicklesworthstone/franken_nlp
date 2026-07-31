@@ -48,6 +48,9 @@ const LOCAL_PASS_NONAUTHORITATIVE: &str = "LOCAL_PASS_NONAUTHORITATIVE";
 const L1_BLOCKED_STATUS: &str = "BLOCKED_UNVERIFIED_ORACLE_CLOSURE_AND_OP_INPUTS";
 const UNVERIFIED_WEIGHT_CLOSURE: &str = "unverified-full-weight-shard-closure";
 const UNAVAILABLE_ISOLATED_OP_INPUTS: &str = "unavailable";
+const CLOSURE_MANIFEST_AWAITING_REOPENED_CONTRACT: &str =
+    "awaiting-reopened-contract-and-per-bullet-manifest";
+const INDEPENDENT_REVIEW_NOT_REQUESTED: &str = "not-requested";
 
 const FLOAT_OPS: &[&str] = &[
     "rms_norm",
@@ -131,6 +134,8 @@ struct L1Report {
     schema_version: u32,
     status: String,
     authority: String,
+    closure_manifest_status: String,
+    independent_review_status: String,
     blocking_reasons: Vec<String>,
     note: String,
     rows: Vec<ReportRow>,
@@ -546,19 +551,26 @@ fn top_k_indices(logits: &[f32], count: usize) -> Vec<usize> {
     indices
 }
 
-fn write_report(rows: Vec<ReportRow>) {
-    let report = L1Report {
+fn blocked_report(rows: Vec<ReportRow>) -> L1Report {
+    L1Report {
         schema_version: 1,
         status: L1_BLOCKED_STATUS.to_owned(),
         authority: "local-scalar-comparison-only".to_owned(),
+        closure_manifest_status: CLOSURE_MANIFEST_AWAITING_REOPENED_CONTRACT.to_owned(),
+        independent_review_status: INDEPENDENT_REVIEW_NOT_REQUESTED.to_owned(),
         blocking_reasons: vec![
             "the frozen reference matrix has whole-forward traces, not isolated external per-operation input/output vectors".to_owned(),
             "the current oracle tooling does not verify the complete model-weight-shard length/SHA-256 closure".to_owned(),
+            "governance freeze: the original closure contract must be reopened or narrowed and receive a per-bullet manifest before independent review".to_owned(),
         ],
         note: "The harness is executable for public primitive surfaces, but every local pass is non-authoritative. A verified full source closure and isolated external per-operation fixtures are both required before this report can become an L1 parity gate."
             .to_owned(),
         rows,
-    };
+    }
+}
+
+fn write_report(rows: Vec<ReportRow>) {
+    let report = blocked_report(rows);
     let bytes = serde_json::to_vec_pretty(&report).expect("L1 report must serialize");
     if let Some(path) = std::env::var_os("FRANKEN_NLP_L1_REPORT").map(PathBuf::from) {
         let mut report_file = OpenOptions::new()
@@ -578,18 +590,22 @@ fn write_report(rows: Vec<ReportRow>) {
             .sync_all()
             .unwrap_or_else(|error| panic!("sync L1 report {}: {error}", path.display()));
         eprintln!(
-            "L1 RESULT={L1_BLOCKED_STATUS} rows={} authority={} report={}",
+            "L1 RESULT={L1_BLOCKED_STATUS} rows={} authority={} closure_manifest={} independent_review={} report={}",
             report.rows.len(),
             report.authority,
+            report.closure_manifest_status,
+            report.independent_review_status,
             path.display()
         );
     } else {
         let report_json = String::from_utf8(bytes).expect("serde JSON output must be UTF-8");
         eprintln!("L1 REPORT={report_json}");
         eprintln!(
-            "L1 RESULT={L1_BLOCKED_STATUS} rows={} authority={} report=stderr-json",
+            "L1 RESULT={L1_BLOCKED_STATUS} rows={} authority={} closure_manifest={} independent_review={} report=stderr-json",
             report.rows.len(),
             report.authority,
+            report.closure_manifest_status,
+            report.independent_review_status,
         );
     }
 }
@@ -660,6 +676,27 @@ fn oracle_provenance_is_explicitly_blocked_until_closure_and_op_inputs_are_verif
     assert_eq!(
         table.oracle_floor.isolated_operation_inputs_status, UNAVAILABLE_ISOLATED_OP_INPUTS,
         "whole-forward traces cannot be mislabeled as independently replayable L1 operation inputs"
+    );
+}
+
+#[test]
+fn l1_report_cannot_be_misread_as_closure_ready_during_governance_freeze() {
+    let report = blocked_report(Vec::new());
+    assert_eq!(report.status, L1_BLOCKED_STATUS);
+    assert_eq!(
+        report.closure_manifest_status,
+        CLOSURE_MANIFEST_AWAITING_REOPENED_CONTRACT
+    );
+    assert_eq!(
+        report.independent_review_status,
+        INDEPENDENT_REVIEW_NOT_REQUESTED
+    );
+    assert!(
+        report
+            .blocking_reasons
+            .iter()
+            .any(|reason| reason.starts_with("governance freeze:")),
+        "a local L1 report must retain the governance blocker until a revised contract names its manifest"
     );
 }
 
