@@ -10,7 +10,7 @@ pub const KV_HEAD_COUNT: usize = 8;
 /// Query heads served by each KV head.
 pub const QUERY_HEADS_PER_KV_HEAD: usize = QUERY_HEAD_COUNT / KV_HEAD_COUNT;
 /// Eager attention scale, `1 / sqrt(128)`.
-pub const ATTENTION_SCALE: f32 = 1.0 / (NANBEIGE_HEAD_DIM as f32).sqrt();
+pub const ATTENTION_SCALE: f32 = 0.088_388_346;
 
 /// Eager-attention shape or grouping refusal.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,7 +104,10 @@ pub fn eager_attention_head(
         .collect::<Vec<_>>();
     let probabilities = softmax_f32_cast_back(&scores)?;
     let mut output = vec![0.0_f32; NANBEIGE_HEAD_DIM];
-    for (probability, value) in probabilities.iter().zip(values.chunks_exact(NANBEIGE_HEAD_DIM)) {
+    for (probability, value) in probabilities
+        .iter()
+        .zip(values.chunks_exact(NANBEIGE_HEAD_DIM))
+    {
         let probability = probability.to_f32();
         for (destination, source) in output.iter_mut().zip(value) {
             *destination += probability * source.to_f32();

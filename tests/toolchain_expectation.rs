@@ -49,7 +49,11 @@ fn expectation_and_toolchain_pin_agree() {
         .as_array()
         .expect("release_targets must be an array")
         .iter()
-        .map(|target| target["triple"].as_str().expect("target triple must be a string"))
+        .map(|target| {
+            target["triple"]
+                .as_str()
+                .expect("target triple must be a string")
+        })
         .collect();
     if expected_targets != RELEASE_TARGETS {
         drifts.push(format!(
@@ -79,7 +83,10 @@ fn expectation_and_toolchain_pin_agree() {
         .expect("release_targets must be an array")
     {
         for field in ["enabled_target_features", "required_compiler_features"] {
-            if target[field].as_array().is_none_or(|items| items.is_empty()) {
+            if target[field]
+                .as_array()
+                .is_none_or(|items| items.is_empty())
+            {
                 drifts.push(format!(
                     "target {} missing {field}",
                     target["triple"].as_str().unwrap_or("<missing>")
