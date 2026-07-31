@@ -19,7 +19,12 @@ struct Violation {
 }
 
 impl Violation {
-    fn new(path: impl Into<String>, line: usize, lint: &'static str, reason: impl Into<String>) -> Self {
+    fn new(
+        path: impl Into<String>,
+        line: usize,
+        lint: &'static str,
+        reason: impl Into<String>,
+    ) -> Self {
         Self {
             path: path.into(),
             line,
@@ -50,7 +55,12 @@ fn current_tree_obeys_the_unsafe_policy() {
     for path in source_files {
         let relative = relative_path(root, &path);
         let source = read_text(&path);
-        scan_source(&relative, &source, islands.contains(&relative), &mut violations);
+        scan_source(
+            &relative,
+            &source,
+            islands.contains(&relative),
+            &mut violations,
+        );
     }
 
     report(violations);
@@ -111,7 +121,10 @@ fn negative_fixtures_are_rejected_and_a_safe_island_fixture_is_accepted() {
         true,
         &mut safe,
     );
-    assert!(safe.is_empty(), "safe island fixture was rejected: {safe:#?}");
+    assert!(
+        safe.is_empty(),
+        "safe island fixture was rejected: {safe:#?}"
+    );
 }
 
 fn read_allowlist(root: &Path) -> BTreeSet<String> {
@@ -144,9 +157,7 @@ fn lints_rust_section(manifest: &str) -> &str {
         return "";
     };
     let after_header = &manifest[start + "[lints.rust]".len()..];
-    let end = after_header
-        .find("\n[")
-        .unwrap_or(after_header.len());
+    let end = after_header.find("\n[").unwrap_or(after_header.len());
     &after_header[..end]
 }
 
@@ -171,14 +182,17 @@ fn check_crate_roots(root: &Path, violations: &mut Vec<Violation>) {
 fn collect_rust_sources(directory: &Path, sources: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(directory).expect("source directory must be readable") {
         let entry = entry.expect("source directory entry must be readable");
-        let file_type = entry.file_type().expect("source entry type must be readable");
+        let file_type = entry
+            .file_type()
+            .expect("source entry type must be readable");
         if file_type.is_symlink() {
             continue;
         }
         let path = entry.path();
         if file_type.is_dir() {
             collect_rust_sources(&path, sources);
-        } else if file_type.is_file() && path.extension().is_some_and(|extension| extension == "rs") {
+        } else if file_type.is_file() && path.extension().is_some_and(|extension| extension == "rs")
+        {
             sources.push(path);
         }
     }
@@ -253,7 +267,10 @@ fn check_governed_lints(
     is_island: bool,
     violations: &mut Vec<Violation>,
 ) {
-    let compact: String = attribute.chars().filter(|character| !character.is_whitespace()).collect();
+    let compact: String = attribute
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
     let level = ["allow", "warn", "expect", "forbid", "deny"]
         .into_iter()
         .find(|level| compact.contains(&format!("{level}(")));
@@ -288,7 +305,13 @@ fn starts_unsafe_block(line: &str, next_line: Option<&str>) -> bool {
     code.contains("unsafe {")
         || (code.ends_with("unsafe")
             && next_line
-                .map(|next| next.split("//").next().unwrap_or_default().trim().starts_with('{'))
+                .map(|next| {
+                    next.split("//")
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .starts_with('{')
+                })
                 .unwrap_or(false))
 }
 
@@ -313,7 +336,8 @@ fn line_number(source: &str, needle: &str) -> usize {
 }
 
 fn read_text(path: &Path) -> String {
-    fs::read_to_string(path).unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()))
+    fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()))
 }
 
 fn report(violations: Vec<Violation>) {
