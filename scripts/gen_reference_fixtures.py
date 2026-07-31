@@ -598,6 +598,22 @@ def source_root_sha256(entries: Sequence[dict[str, object]]) -> str:
     return digest.hexdigest()
 
 
+def pinned_source_root_sha256() -> str:
+    """Derive the trace-visible root from the canonical pinned manifest."""
+
+    source_manifest = (
+        Path(__file__).resolve().parents[1] / "docs" / "truth-pack" / "nanbeige4.2-3b.source.json"
+    )
+    try:
+        from validate_source_manifest import ManifestError, read_json as read_source_manifest, validate_manifest
+    except ImportError as error:
+        raise TraceError(f"cannot import canonical source manifest validator: {error}") from error
+    try:
+        return source_root_sha256(validate_manifest(read_source_manifest(source_manifest)))
+    except (ManifestError, OSError, ValueError) as error:
+        raise TraceError(f"cannot derive pinned source-root identity: {error}") from error
+
+
 def verify_model_source_closure(model_source: Path) -> SourceClosureBinding:
     """Require the oracle's hash-bound ten-file closure before source access."""
 
@@ -1310,6 +1326,7 @@ def verify_fixture_root(root: Path, oracle_floor: Path | None) -> int:
         if manifest.get("model_id") != MODEL_ID or manifest.get("revision") != PINNED_REVISION:
             raise TraceError("fixture manifest model identity does not match the pinned wedge")
         manifest_provenance = validated_provenance(manifest)
+        expected_source_root = pinned_source_root_sha256()
         if manifest.get("profile_matrix") != sorted(PROFILES):
             raise TraceError("fixture manifest does not declare the complete profile matrix")
         fixtures = manifest.get("fixtures")
@@ -1354,6 +1371,26 @@ def verify_fixture_root(root: Path, oracle_floor: Path | None) -> int:
             index = read_json(index_path)
             if not hmac.compare_digest(canonical_json(validated_provenance(index)), canonical_json(manifest_provenance)):
                 raise TraceError(f"fixture trace index={relative_text} has mismatched provenance")
+            prefill_input_ids = index.get("prefill_input_ids")
+            append_input_ids = index.get("append_input_ids")
+            if (
+                not isinstance(prefill_input_ids, list)
+                or not prefill_input_ids
+                or not all(
+                    isinstance(token, int) and not isinstance(token, bool) and token >= 0
+                    for token in prefill_input_ids
+                )
+                or not isinstance(append_input_ids, list)
+                or len(append_input_ids) != 1
+                or not isinstance(append_input_ids[0], int)
+                or isinstance(append_input_ids[0], bool)
+                or append_input_ids[0] < 0
+            ):
+                raise TraceError(f"fixture trace index={relative_text} has invalid captured replay input ids")
+            if index.get("source_closure_verification") != SOURCE_CLOSURE_VERIFICATION:
+                raise TraceError(f"fixture trace index={relative_text} lacks full source-closure verification")
+            if index.get("source_root_sha256") != expected_source_root:
+                raise TraceError(f"fixture trace index={relative_text} source-root identity disagrees with the pinned manifest")
             profile_name = index.get("profile")
             if profile_name not in PROFILES:
                 raise TraceError(f"fixture trace index has unknown profile={profile_name!r}")
