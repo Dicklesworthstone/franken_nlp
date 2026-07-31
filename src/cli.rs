@@ -18,7 +18,8 @@ use crate::{
     artifact::format::{
         ArchTarget, CanonicalDtype, FnlpqStreamingInput, FnlpqWriteError,
         LogicalTensorStreamingHasher, PackingSetInput, SectionKind, SectionRange, StreamingSection,
-        StreamingSectionHasher, TensorInput, framed_sha256, logical_model_sha256, write_streaming,
+        StreamingSectionHasher, TensorInput, framed_sha256, logical_model_sha256,
+        validate_authority_identifier, write_streaming,
     },
     artifact::package::{PackageRequest, package_model, verify_model_package},
     artifact::quantize::{GenericPanelBytes, encode_generic_panel},
@@ -36,6 +37,7 @@ const MODEL_CONFIG_SECTION: &str = "model-config";
 const TOKENIZER_CONFIG_SECTION: &str = "tokenizer-config";
 const CHAT_TEMPLATE_SECTION: &str = "chat-template";
 const LICENSE_BUNDLE_SECTION: &str = "license-bundle";
+const EMISSION_PROGRESS_TENSOR_INTERVAL: usize = 16;
 
 const EMBEDDED_LICENSE_FILES: [(&str, &[u8]); 3] = [
     (
@@ -94,8 +96,8 @@ struct ConvertCommand {
     /// Canonical artifact target; only `generic` is admitted.
     #[arg(long)]
     arch: String,
-    /// Final canonical `.fnlpq` destination; no output is created until the
-    /// streaming envelope is available.
+    /// Final canonical `.fnlpq` destination; no final-path entry is created
+    /// until a complete staged streaming envelope is ready to publish.
     #[arg(short = 'o', long)]
     output: PathBuf,
     /// Bypass the later interactive confirmation step.
@@ -236,9 +238,22 @@ fn run_convert_command(command: ConvertCommand) -> ExitCode {
         robot,
     };
 
+    eprintln!(
+        "CONVERT STAGE=census RESULT=START source={} manifest={}",
+        request.source_dir.display(),
+        request.source_manifest.display(),
+    );
     match prepare_convert_request(&request, DEFAULT_PANEL_BYTES) {
         Ok(prepared) => match plan_generic_payload(&prepared.census, &prepared.routes) {
-            Ok(generic) => run_streaming_convert(&request, &prepared, &generic),
+            Ok(generic) => {
+                eprintln!(
+                    "CONVERT STAGE=census RESULT=END source-root-sha256={} census-sha256={} tensors={}",
+                    prepared.source.source_root_sha256,
+                    prepared.census_sha256,
+                    prepared.census.len(),
+                );
+                run_streaming_convert(&request, &prepared, &generic)
+            }
             Err(error) => emit_convert_refusal(error),
         },
         Err(error) => emit_convert_refusal(error),
@@ -250,6 +265,10 @@ fn run_streaming_convert(
     prepared: &PreparedConversionInput,
     generic: &GenericPayloadPlan,
 ) -> ExitCode {
+    eprintln!(
+        "CONVERT STAGE=plan RESULT=START tensors={}",
+        prepared.census.len()
+    );
     let materialized = match read_materialized_sources(&request.source_dir, prepared) {
         Ok(value) => value,
         Err(error) => return emit_streaming_refusal("materialized-sources", error),
@@ -263,19 +282,21 @@ fn run_streaming_convert(
         Ok(value) => value,
         Err(error) => return emit_streaming_refusal("streaming-first-pass", error),
     };
-    let mut output = match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&request.output)
-    {
-        Ok(file) => file,
-        Err(error) => {
-            return emit_streaming_refusal(
-                "create-output",
-                format!("create_new {}: {error}", request.output.display()),
-            );
-        }
+    eprintln!(
+        "CONVERT STAGE=plan RESULT=END tensors={} sections={}",
+        plan.input.tensors.len(),
+        plan.input.sections.len(),
+    );
+    let (staging_output, mut output) = match create_conversion_stage(&request.output) {
+        Ok(stage) => stage,
+        Err(error) => return emit_streaming_refusal("create-staging", error),
     };
+    eprintln!(
+        "CONVERT STAGE=emission RESULT=START staging={} destination={} tensors={}",
+        staging_output.display(),
+        request.output.display(),
+        prepared.census.len(),
+    );
     let written = match write_streaming(&plan.input, &mut output, |section, sink| {
         emit_streaming_section(
             &request.source_dir,
@@ -289,6 +310,16 @@ fn run_streaming_convert(
         Ok(value) => value,
         Err(error) => return emit_streaming_refusal("streaming-envelope", error),
     };
+    if let Err(error) = output.sync_all() {
+        return emit_streaming_refusal(
+            "sync-staging",
+            format!("sync {}: {error}", staging_output.display()),
+        );
+    }
+    drop(output);
+    if let Err(error) = publish_staged_output(&staging_output, &request.output) {
+        return emit_streaming_refusal("publish-output", error);
+    }
     let output_len = match fs::metadata(&request.output) {
         Ok(metadata) => metadata.len(),
         Err(error) => {
@@ -308,8 +339,9 @@ fn run_streaming_convert(
         );
     }
     eprintln!(
-        "CONVERT RESULT=PASS stage=streaming-envelope artifact={} source-root-sha256={} census-sha256={} tensors={} fnlpq-file-sha256={} output-bytes={} license-bundle-sha256={}",
+        "CONVERT RESULT=PASS stage=streaming-envelope artifact={} staging-artifact={} source-root-sha256={} census-sha256={} tensors={} fnlpq-file-sha256={} output-bytes={} license-bundle-sha256={}",
         request.output.display(),
+        staging_output.display(),
         prepared.source.source_root_sha256,
         prepared.census_sha256,
         prepared.census.len(),
@@ -318,6 +350,53 @@ fn run_streaming_convert(
         hex_lower(&written.license_bundle_sha256),
     );
     ExitCode::SUCCESS
+}
+
+/// Derive a deterministic sibling staging name.  It is deliberately distinct
+/// from the requested final output, so any refusal leaves evidence only at
+/// the retained staging path rather than a partial final artifact path.
+fn conversion_staging_path(destination: &Path, attempt: u16) -> Result<PathBuf, String> {
+    let name = destination
+        .file_name()
+        .ok_or_else(|| format!("final output has no file name: {}", destination.display()))?;
+    let mut staging_name = OsString::from(".");
+    staging_name.push(name);
+    staging_name.push(format!(".fnlpq-stage.{attempt}"));
+    Ok(destination.with_file_name(staging_name))
+}
+
+/// Reserve the first unused sibling stage.  Refused attempts retain their
+/// stage for audit, so later attempts advance to a distinct create-new name
+/// instead of touching either the prior evidence or the final destination.
+fn create_conversion_stage(destination: &Path) -> Result<(PathBuf, fs::File), String> {
+    for attempt in 0..=1024_u16 {
+        let path = conversion_staging_path(destination, attempt)?;
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!("create_new {}: {error}", path.display()));
+            }
+        }
+    }
+    Err(format!(
+        "all 1025 retained staging names are occupied for destination {}",
+        destination.display()
+    ))
+}
+
+/// Publish a completed stage without a clobbering rename.  A hard-link create
+/// is atomic with respect to the final pathname and fails if it already
+/// exists; the staged entry is intentionally retained for audit rather than
+/// deleted by this CLI layer.
+fn publish_staged_output(stage: &Path, destination: &Path) -> Result<(), String> {
+    fs::hard_link(stage, destination).map_err(|error| {
+        format!(
+            "link completed stage {} to previously absent destination {}: {error}",
+            stage.display(),
+            destination.display(),
+        )
+    })
 }
 
 fn emit_streaming_refusal(stage: &str, error: impl std::fmt::Display) -> ExitCode {
@@ -498,6 +577,7 @@ fn build_streaming_envelope_plan(
     generic: &GenericPayloadPlan,
     materialized: &MaterializedSources,
 ) -> Result<StreamingEnvelopePlan, String> {
+    validate_generic_tensor_authorities(generic)?;
     let (mut tensors, payload_sha256, scales_sha256, row_sums_sha256) =
         first_pass_generic_identities(source_dir, prepared, generic)?;
     tensors.sort_by(|left, right| left.0.name.as_bytes().cmp(right.0.name.as_bytes()));
@@ -594,6 +674,17 @@ fn build_streaming_envelope_plan(
             license_bundle_sha256,
         },
     })
+}
+
+/// Check every converter-planned logical name before opening safetensor
+/// shards.  The writer repeats this validation defensively, but discovery at
+/// that point would waste a complete model traversal on a malformed header.
+fn validate_generic_tensor_authorities(generic: &GenericPayloadPlan) -> Result<(), String> {
+    for layout in &generic.tensors {
+        validate_authority_identifier("tensor.name", &layout.internal_name)
+            .map_err(|error| format!("invalid planned tensor {}: {error}", layout.source_name))?;
+    }
+    Ok(())
 }
 
 fn streaming_section(
@@ -950,6 +1041,16 @@ fn emit_generic_section(
             operation: "replay verified generic section",
             detail: error.to_string(),
         })?;
+        let completed = index + 1;
+        if completed % EMISSION_PROGRESS_TENSOR_INTERVAL == 0 || completed == prepared.census.len()
+        {
+            eprintln!(
+                "CONVERT STAGE=emission section={} tensors={}/{}",
+                section.name,
+                completed,
+                prepared.census.len(),
+            );
+        }
     }
     if observed_len != expected_len {
         return Err(FnlpqWriteError::StoredIdentity {
@@ -1126,11 +1227,17 @@ fn emit_schema_error(mode: &str, error: &SchemaError) {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, io::Cursor, process::ExitCode};
+    use std::{ffi::OsString, io::Cursor, path::Path, process::ExitCode};
 
     use clap::Parser;
 
-    use super::{Cli, Command, ReleaseSubcommand, cli_main_with_reader};
+    use super::{
+        Cli, Command, ReleaseSubcommand, cli_main_with_reader, conversion_staging_path,
+        validate_generic_tensor_authorities,
+    };
+    use crate::artifact::converter::{
+        GenericPayloadPlan, GenericTensorLayout, OutputRange, StorageStage,
+    };
 
     #[test]
     fn schema_dash_uses_the_injected_reader() {
@@ -1207,5 +1314,55 @@ mod tests {
         ])
         .expect("reference conversion invocation parses");
         assert!(matches!(convert.command, Some(Command::Convert(..))));
+    }
+
+    #[test]
+    fn invalid_planned_tensor_name_refuses_before_source_traversal() {
+        let invalid_plan = GenericPayloadPlan {
+            tensors: vec![GenericTensorLayout {
+                source_name: "model.layers.0.self_attn.k_proj.weight".to_owned(),
+                internal_name: "layer[0].attn.k".to_owned(),
+                stage: StorageStage::Int8Stage2B,
+                shape: vec![1, 1],
+                quantization: "portable-int8-row-v1".to_owned(),
+                data: OutputRange {
+                    name: "layer[0].attn.k.data".to_owned(),
+                    offset: 0,
+                    len: 1,
+                },
+                scale: OutputRange {
+                    name: "layer[0].attn.k.scale".to_owned(),
+                    offset: 0,
+                    len: 4,
+                },
+                row_sum: OutputRange {
+                    name: "layer[0].attn.k.row_sum".to_owned(),
+                    offset: 0,
+                    len: 4,
+                },
+            }],
+            payload_bytes: 1,
+            scale_bytes: 4,
+            row_sum_bytes: 4,
+        };
+
+        let error = validate_generic_tensor_authorities(&invalid_plan)
+            .expect_err("an invalid header authority must reject before a source pass");
+        assert!(error.contains("invalid tensor.name authority identifier"));
+    }
+
+    #[test]
+    fn conversion_stage_is_a_sibling_never_the_final_destination() {
+        let destination = Path::new("/models/nanbeige.fnlpq");
+        let stage = conversion_staging_path(destination, 0).expect("named final destination");
+        let later_stage =
+            conversion_staging_path(destination, 1).expect("second retained staging name");
+        assert_eq!(stage.parent(), destination.parent());
+        assert_ne!(stage, destination);
+        assert_ne!(stage, later_stage);
+        assert_eq!(
+            stage.file_name().and_then(|name| name.to_str()),
+            Some(".nanbeige.fnlpq.fnlpq-stage.0")
+        );
     }
 }

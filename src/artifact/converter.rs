@@ -586,7 +586,10 @@ fn remap_layer_tensor(name: &str) -> Result<(String, StorageStage), ConverterErr
             tensor: name.to_owned(),
         });
     }
-    let base = format!("layer[{layer}]");
+    // The frozen fnlpq v1 authority grammar excludes bracket indexing.  Keep
+    // the internal route explicit but spell its layer index with identifier
+    // characters so the planned tensor name is writer-valid before traversal.
+    let base = format!("layer.{layer}");
     match suffix {
         "input_layernorm.weight" => Ok((format!("{base}.norm1"), StorageStage::Bf16Verbatim)),
         "post_attention_layernorm.weight" => {
@@ -2575,6 +2578,15 @@ mod tests {
                 .stage,
             StorageStage::Bf16Verbatim
         );
+    }
+
+    #[test]
+    fn remap_uses_fnlpq_authority_safe_layer_names() {
+        let route =
+            remap_tensor_name("model.layers.7.self_attn.k_proj.weight").expect("known route");
+        assert_eq!(route.internal_name, "layer.7.attn.k");
+        crate::artifact::format::validate_authority_identifier("tensor.name", &route.internal_name)
+            .expect("converter route must satisfy the frozen fnlpq authority grammar");
     }
 
     #[test]

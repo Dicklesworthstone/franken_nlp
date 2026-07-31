@@ -2178,7 +2178,15 @@ fn write_directory_entry(bytes: &mut [u8], section: &WrittenSection) {
     bytes[48..80].copy_from_slice(&section.stored_sha256);
 }
 
-fn validate_authority(field: &'static str, value: &str) -> Result<(), FnlpqWriteError> {
+/// Validate an ASCII authority identifier under the frozen v1 writer grammar.
+///
+/// Conversion planners use this before any source traversal so an invalid
+/// logical tensor identity cannot consume a full model pass before the writer
+/// rejects the same header field.
+pub fn validate_authority_identifier(
+    field: &'static str,
+    value: &str,
+) -> Result<(), FnlpqWriteError> {
     if value.len() > 128 || !is_authority_ascii(value) {
         return Err(FnlpqWriteError::InvalidAuthority {
             field,
@@ -2186,6 +2194,10 @@ fn validate_authority(field: &'static str, value: &str) -> Result<(), FnlpqWrite
         });
     }
     Ok(())
+}
+
+fn validate_authority(field: &'static str, value: &str) -> Result<(), FnlpqWriteError> {
+    validate_authority_identifier(field, value)
 }
 
 fn validate_revision(value: &str) -> Result<(), FnlpqWriteError> {
