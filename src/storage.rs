@@ -815,10 +815,7 @@ impl EnabledMetadataStore {
         Ok(())
     }
 
-    fn record_state_transition(
-        &self,
-        record: StateTransitionMetadata,
-    ) -> Result<(), StorageError> {
+    fn record_state_transition(&self, record: StateTransitionMetadata) -> Result<(), StorageError> {
         let parameters = [
             sqlite_integer(record.transition_id.get())?,
             sqlite_integer(record.job_id.get())?,
