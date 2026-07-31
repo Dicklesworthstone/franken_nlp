@@ -1142,7 +1142,13 @@ pub fn transform_routed_panel(
             detail: "route differs from canonical mapping".to_owned(),
         });
     }
-    let RowPanel::Rows { row_count, .. } = panel;
+    let RowPanel::Rows { row_count, .. } = panel else {
+        return Err(ConverterError::PipelinePlanAlignment {
+            tensor: entry.name.clone(),
+            detail: "routed transform requires a complete-row panel, not a whole-tensor panel"
+                .to_owned(),
+        });
+    };
     let columns = entry.shape[1..].iter().try_fold(1_u64, |product, dimension| {
         product.checked_mul(*dimension).ok_or(ConverterError::Arithmetic {
             invariant: "routed panel column product",
