@@ -1,0 +1,7 @@
+- dataset:
+    id: SWE-bench/SWE-bench_Verified
+    task_id: swe_bench_%_resolved
+  source:
+    name: Model Card
+    url: https://huggingface.co/Nanbeige/Nanbeige4.2-3B
+  value: 63.6

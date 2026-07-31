@@ -1,0 +1,7 @@
+- dataset:
+    id: Idavidrein/gpqa
+    task_id: diamond
+  source:
+    name: Model Card
+    url: https://huggingface.co/Nanbeige/Nanbeige4.2-3B
+  value: 87.4

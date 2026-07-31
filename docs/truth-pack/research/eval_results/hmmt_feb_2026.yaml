@@ -1,0 +1,7 @@
+- dataset:
+    id: MathArena/hmmt_feb_2026
+    task_id: MathArena/hmmt_feb_2026
+  source:
+    name: Model Card
+    url: https://huggingface.co/Nanbeige/Nanbeige4.2-3B
+  value: 82.1

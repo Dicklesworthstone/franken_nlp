@@ -1,0 +1,7 @@
+- dataset:
+    id: claw-eval/Claw-Eval
+    task_id: general
+  source:
+    name: Model Card
+    url: https://huggingface.co/Nanbeige/Nanbeige4.2-3B
+  value: 52.2

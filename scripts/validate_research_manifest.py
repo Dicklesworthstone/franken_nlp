@@ -356,13 +356,24 @@ def conversion_paths(manifest: dict[str, Any]) -> set[str]:
     fail("conversion manifest has no recognized file-entry array")
 
 
+def conversion_manifest_revision(manifest: dict[str, Any]) -> str:
+    """Read the revision from either ratified conversion-manifest shape."""
+    model = manifest.get("model")
+    if isinstance(model, dict):
+        revision = model.get("revision")
+    else:
+        revision = manifest.get("revision")
+    if not isinstance(revision, str) or not revision:
+        fail("conversion manifest revision must be a non-empty string")
+    return revision
+
+
 def validate_separation(manifest: dict[str, Any], conversion_manifest: Path | None) -> list[str]:
     if conversion_manifest is None:
         log("separation verdict=SKIPPED_NO_CONVERSION_MANIFEST")
         return []
     other = canonical_json(conversion_manifest)
-    other_model = expect_mapping(other.get("model"), "conversion_manifest.model")
-    if other_model.get("revision") != PINNED_REVISION:
+    if conversion_manifest_revision(other) != PINNED_REVISION:
         fail("conversion manifest revision differs from research manifest revision")
     research_paths = {
         entry["source_path"]
@@ -454,7 +465,18 @@ def self_test() -> int:
         lambda: required_digest({"sha256": "not-a-digest"}, "sha256", "self-test digest"),
         "self-test digest.sha256 must be a lowercase SHA-256 hex digest",
     )
-    log("self_test verdict=PASS checks=4")
+    if (
+        conversion_manifest_revision(
+            {"model": "Nanbeige4.2-3B", "revision": PINNED_REVISION}
+        )
+        != PINNED_REVISION
+    ):
+        fail("self-test top-level conversion revision did not validate")
+    expect_self_test_failure(
+        lambda: conversion_manifest_revision({"model": "Nanbeige4.2-3B"}),
+        "conversion manifest revision must be a non-empty string",
+    )
+    log("self_test verdict=PASS checks=6")
     return 0
 
 

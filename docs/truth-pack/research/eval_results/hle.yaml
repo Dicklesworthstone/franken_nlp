@@ -1,0 +1,7 @@
+- dataset:
+    id: cais/hle
+    task_id: hle
+  source:
+    name: Model Card
+    url: https://huggingface.co/Nanbeige/Nanbeige4.2-3B
+  value: 17.8

@@ -1,0 +1,234 @@
+{
+  "archived_files": [
+    {
+      "archive_path": "research/Nanbeige42_report.pdf",
+      "kind": "technical_report",
+      "length": 587630,
+      "sha256": "a3d196f37b7d2f0c771bf07afd0a4f2290265187fb55e7645ca7161406294b83",
+      "source_path": "Nanbeige42_report.pdf"
+    },
+    {
+      "archive_path": "research/configuration_nanbeige.py",
+      "kind": "configuration_nanbeige_py",
+      "length": 26023,
+      "sha256": "c517227741f0fc007061bde1873138545ce15e67716a062513193c06300c7685",
+      "source_path": "configuration_nanbeige.py"
+    },
+    {
+      "archive_path": "research/eval_results/claw-eval.yaml",
+      "kind": "evaluation_metadata",
+      "length": 161,
+      "sha256": "81343b4388229adbfa19cf2c9148eddbf54a549336fbdf1d3b41f2e73f95c5bf",
+      "source_path": ".eval_results/claw-eval.yaml"
+    },
+    {
+      "archive_path": "research/eval_results/gpqa.yaml",
+      "kind": "evaluation_metadata_gpqa",
+      "length": 157,
+      "sha256": "4e199ec2672ef9543fc3b0f049370211984c04912c95411bae45fe68ff53bbf3",
+      "source_path": ".eval_results/gpqa.yaml"
+    },
+    {
+      "archive_path": "research/eval_results/hle.yaml",
+      "kind": "evaluation_metadata_hle",
+      "length": 146,
+      "sha256": "19dfc31ad6469792e3932392c01db3c1c2cb1448dbbc62c8d424a5102e676d50",
+      "source_path": ".eval_results/hle.yaml"
+    },
+    {
+      "archive_path": "research/eval_results/hmmt_feb_2026.yaml",
+      "kind": "evaluation_metadata_hmmt_feb_2026",
+      "length": 181,
+      "sha256": "83b573b376db47798ed3654587dee63774956be34e27667ab7cac1e20dac752a",
+      "source_path": ".eval_results/hmmt_feb_2026.yaml"
+    },
+    {
+      "archive_path": "research/eval_results/swe-bench_pro.yaml",
+      "kind": "evaluation_metadata_swe_bench_pro",
+      "length": 169,
+      "sha256": "345f8daae9db22be34410583f0581145fbd09cf543888a89db63c81165bef190",
+      "source_path": ".eval_results/swe-bench_pro.yaml"
+    },
+    {
+      "archive_path": "research/eval_results/swe-bench_verified.yaml",
+      "kind": "evaluation_metadata_swe_bench_verified",
+      "length": 183,
+      "sha256": "8a661f2c3ecf17d2580a8657a6af447d2b3c5dae7d7fab2f5d63343fe0172ae8",
+      "source_path": ".eval_results/swe-bench_verified.yaml"
+    },
+    {
+      "archive_path": "research/eval_results/terminal-bench-2.0.yaml",
+      "kind": "evaluation_metadata_terminal_bench_2_0",
+      "length": 184,
+      "sha256": "07ad2512106139387d05a97cb714adb4fc7331c53ee912aaf01d4fbd11e2211c",
+      "source_path": ".eval_results/terminal-bench-2.0.yaml"
+    },
+    {
+      "archive_path": "research/hf_api_metadata.json",
+      "kind": "hf_api_metadata",
+      "length": 11513,
+      "sha256": "11095d68070bf80d18c333031c53bf998b240e2f65b34d051d78bc009caaec36",
+      "source_path": "api/model-metadata.json"
+    },
+    {
+      "archive_path": "research/model_card.md",
+      "kind": "model_card",
+      "length": 16373,
+      "sha256": "01cbce423668845435003dc0828033ab7ad07e88f076ed96ec66d4b014f4654f",
+      "source_path": "README.md"
+    },
+    {
+      "archive_path": "research/modeling_nanbeige.py",
+      "kind": "modeling_nanbeige_py",
+      "length": 121957,
+      "sha256": "547737f989f5cb741c1a568acaf85f83521fa67a8f7268e19f9a37e60127c0d5",
+      "source_path": "modeling_nanbeige.py"
+    }
+  ],
+  "kind": "nanbeige4.2-3b-research-truth-pack",
+  "model": {
+    "author_attribution": "Nanbeige Team",
+    "id": "Nanbeige/Nanbeige4.2-3B",
+    "license_spdx": "Apache-2.0",
+    "revision": "f56ec5a9650268aa098496734743c25ea778bd2d"
+  },
+  "repository_census": {
+    "entries": [
+      {
+        "length": 161,
+        "path": ".eval_results/claw-eval.yaml",
+        "sha256": "81343b4388229adbfa19cf2c9148eddbf54a549336fbdf1d3b41f2e73f95c5bf"
+      },
+      {
+        "length": 157,
+        "path": ".eval_results/gpqa.yaml",
+        "sha256": "4e199ec2672ef9543fc3b0f049370211984c04912c95411bae45fe68ff53bbf3"
+      },
+      {
+        "length": 146,
+        "path": ".eval_results/hle.yaml",
+        "sha256": "19dfc31ad6469792e3932392c01db3c1c2cb1448dbbc62c8d424a5102e676d50"
+      },
+      {
+        "length": 181,
+        "path": ".eval_results/hmmt_feb_2026.yaml",
+        "sha256": "83b573b376db47798ed3654587dee63774956be34e27667ab7cac1e20dac752a"
+      },
+      {
+        "length": 169,
+        "path": ".eval_results/swe-bench_pro.yaml",
+        "sha256": "345f8daae9db22be34410583f0581145fbd09cf543888a89db63c81165bef190"
+      },
+      {
+        "length": 183,
+        "path": ".eval_results/swe-bench_verified.yaml",
+        "sha256": "8a661f2c3ecf17d2580a8657a6af447d2b3c5dae7d7fab2f5d63343fe0172ae8"
+      },
+      {
+        "length": 184,
+        "path": ".eval_results/terminal-bench-2.0.yaml",
+        "sha256": "07ad2512106139387d05a97cb714adb4fc7331c53ee912aaf01d4fbd11e2211c"
+      },
+      {
+        "length": 1694,
+        "path": ".gitattributes",
+        "sha256": "33e7cb9ef6ca69656824019394bbdb357f0f8be8e265b279f0074d4b9bc1c792"
+      },
+      {
+        "length": 587630,
+        "path": "Nanbeige42_report.pdf",
+        "sha256": "a3d196f37b7d2f0c771bf07afd0a4f2290265187fb55e7645ca7161406294b83"
+      },
+      {
+        "length": 16373,
+        "path": "README.md",
+        "sha256": "01cbce423668845435003dc0828033ab7ad07e88f076ed96ec66d4b014f4654f"
+      },
+      {
+        "length": 174,
+        "path": "added_tokens.json",
+        "sha256": "9e3b127a27647df2c353cc1e5500826f7cdbe8bd15a458e368bba8422e9719cf"
+      },
+      {
+        "length": 1019,
+        "path": "config.json",
+        "sha256": "f6cb15b22847664f3a6049dc4b58fdd10f1650d112ac99a1da3d051f17c2ca19"
+      },
+      {
+        "length": 26023,
+        "path": "configuration_nanbeige.py",
+        "sha256": "c517227741f0fc007061bde1873138545ce15e67716a062513193c06300c7685"
+      },
+      {
+        "length": 0,
+        "path": "figures/1",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "length": 491843,
+        "path": "figures/model_performance.png",
+        "sha256": "c35b4ea176f9ae73893ac5e0d7e8ed7b8c6c2fe828fa5dc59dc528ff073045f1"
+      },
+      {
+        "length": 15639,
+        "path": "figures/nbg.png",
+        "sha256": "a8da0574aadbd88453fe662bc741379316d7ef353dc1631ed0870e3dfd3e9db0"
+      },
+      {
+        "length": 187,
+        "path": "generation_config.json",
+        "sha256": "68c690ce23efb6caae30c006ff3c1efd826297ff1df4338c04f7ac6f685d8746"
+      },
+      {
+        "length": 4973547960,
+        "path": "model-00001-of-00002.safetensors",
+        "sha256": "09d265d5ec837bc64462796b7f8c110be9a135a55ed7a6eb5d07e0e90c976a94"
+      },
+      {
+        "length": 3366076760,
+        "path": "model-00002-of-00002.safetensors",
+        "sha256": "31019e7870a044f44bc3f7e981f8c5ecd42d341e5ca6cfdbfd07fb95d95be389"
+      },
+      {
+        "length": 16519,
+        "path": "model.safetensors.index.json",
+        "sha256": "30d8da0fa8b97abc6d9eddfd017a0cb7a649bcbd58caa57804c56c767db5c0f1"
+      },
+      {
+        "length": 121957,
+        "path": "modeling_nanbeige.py",
+        "sha256": "547737f989f5cb741c1a568acaf85f83521fa67a8f7268e19f9a37e60127c0d5"
+      },
+      {
+        "length": 623,
+        "path": "special_tokens_map.json",
+        "sha256": "b718fce2b7a8940ffeddc1e67f3b092cc0d13ac885c63a021528786f8c4cf6c0"
+      },
+      {
+        "length": 18450979,
+        "path": "tokenizer.json",
+        "sha256": "1d858a0fc007f22af6ae18bfa1ae52d30e398aa9cd1ea06e7777176869346a3f"
+      },
+      {
+        "length": 2782298,
+        "path": "tokenizer.model",
+        "sha256": "fb41d04798b714520a9b075727b0226538b7330254299062742c50ec8374bc36"
+      },
+      {
+        "length": 10990,
+        "path": "tokenizer_config.json",
+        "sha256": "3edfa64a0826a77e9412b9008f1febf3fe906a68fd616b6de4cd15897a8c8518"
+      }
+    ],
+    "file_count": 25,
+    "revision": "f56ec5a9650268aa098496734743c25ea778bd2d",
+    "upstream_license_file": null,
+    "upstream_notice_file": null
+  },
+  "role_boundary": {
+    "converter_reads_manifest": false,
+    "research_only": true,
+    "runtime_reads_manifest": false
+  },
+  "schema_version": 1
+}

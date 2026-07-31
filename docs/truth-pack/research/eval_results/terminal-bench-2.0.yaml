@@ -1,0 +1,7 @@
+- dataset:
+    id: harborframework/terminal-bench-2.0
+    task_id: terminalbench_2
+  source:
+    name: Model Card
+    url: https://huggingface.co/Nanbeige/Nanbeige4.2-3B
+  value: 44.1
