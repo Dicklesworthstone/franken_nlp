@@ -16,8 +16,8 @@
 //! | generation tails | [`RenderOptions::add_generation_prompt`] |
 //!
 //! The byte-exact literals and reference cases are frozen by the Phase -1
-//! fixture bead.  Until that artifact lands, the executable structure here is
-//! intentionally narrow and every L0 byte claim remains blocked on its matrix.
+//! fixture bead. The executable matrix below is the authority for L0 prompt
+//! bytes and token ids.
 
 use std::collections::{BTreeSet, HashSet};
 use std::error::Error;
@@ -39,19 +39,22 @@ pub const TOOL_CALL_START: &str = "<tool_call>";
 /// The XML tool-call closing delimiter emitted only by trusted template code.
 pub const TOOL_CALL_END: &str = "</tool_call>";
 
-/// The fixed fallback used when the first message is not a system message.
+/// The fixed fallback used when the first message is not a system message and
+/// no tools are declared.
 ///
-/// Its final bytes are covered by the pinned L0 default-system fixture.  It is
-/// kept in one named location so a fixture-authorized correction cannot become
-/// an incidental string change in a caller.
-pub const DEFAULT_SYSTEM_TEXT: &str = "You are a helpful assistant.";
+/// Its bytes are the pinned slow-tokenizer template's default, not a
+/// project-authored substitute.
+pub const DEFAULT_SYSTEM_TEXT: &str = "你是南北阁，一款由BOSS直聘自主研发并训练的专业大语言模型。";
+
+/// The pinned fallback system instruction for a tools-enabled conversation.
+const TOOL_SYSTEM_TEXT: &str = "你是一位工具函数调用专家，你会得到一个问题和一组可能的工具函数。根据问题，你需要进行一个或多个函数/工具调用以实现目的，请尽量尝试探索通过工具解决问题。\n如果没有一个函数可以使用，请直接使用自然语言回复用户。\n如果给定的问题缺少函数所需的参数，请使用自然语言进行提问，向用户询问必要信息。\n如果调用结果已经足够回答用户问题，请对历史结果进行总结，使用自然语言回复用户。";
 
 /// The fixed reminder substituted for the pinned non-text media kinds.
 ///
 /// The template is text-only; original media payloads are never rendered as
 /// model input.  The literal is a single fixture-governed control point.
 pub const MEDIA_REMINDER_TEXT: &str =
-    "\n<reminder>This is a text-only model and cannot process non-text media input.</reminder>\n";
+    "<reminder>You are unable to process this image because you don't have multi-modal input ability. Try different methods.</reminder>";
 
 /// A complete conversation passed to the fixed chat-template builder.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -123,6 +126,12 @@ impl Conversation {
             }
         }
         for (index, message) in self.messages.iter().enumerate() {
+            if message.role == MessageRole::System && index != 0 {
+                return Err(TemplateError::InvalidMessage {
+                    index,
+                    reason: "system message must be at the beginning".to_owned(),
+                });
+            }
             message.validate(index)?;
         }
         Ok(())
@@ -265,8 +274,14 @@ pub enum ContentPart {
     ImageUrl { source: Option<String> },
     /// Pinned video part; its payload becomes [`MEDIA_REMINDER_TEXT`].
     Video { source: Option<String> },
+    /// Pinned video-url part; its payload becomes [`MEDIA_REMINDER_TEXT`].
+    VideoUrl { source: Option<String> },
     /// Pinned audio part; its payload becomes [`MEDIA_REMINDER_TEXT`].
     Audio { source: Option<String> },
+    /// Pinned audio-url part; its payload becomes [`MEDIA_REMINDER_TEXT`].
+    AudioUrl { source: Option<String> },
+    /// Pinned input-audio part; its payload becomes [`MEDIA_REMINDER_TEXT`].
+    InputAudio { source: Option<String> },
 }
 
 impl ContentPart {
@@ -299,15 +314,29 @@ impl AssistantReasoning {
         }
     }
 
-    /// Extract only a leading, complete assistant thinking region.
+    /// Extract the same assistant reasoning region as the pinned fixed template.
     ///
     /// Think-looking text in user/system/tool content never reaches this method
     /// and is therefore ordinary text, not trusted control markup.
     pub fn extract_leading(content: &str) -> Option<(Self, String)> {
-        let rest = content.strip_prefix(THINK_START)?;
-        let close = rest.find(THINK_END)?;
-        let reasoning_content = rest[..close].to_owned();
-        let visible_content = rest[(close + THINK_END.len())..].to_owned();
+        let close = content.find(THINK_END)?;
+        let before_close = content[..close].trim_end_matches('\n');
+        let reasoning_content = before_close
+            .rsplit(THINK_START)
+            .next()
+            .expect("rsplit always yields at least one segment")
+            .trim_start_matches('\n')
+            .to_owned();
+        // The reference Jinja expression uses `content.split('</think>')[-1]`:
+        // reasoning comes from before the first close, but visible content is
+        // the segment after the last close.
+        let visible_content = content
+            .rsplit_once(THINK_END)
+            .expect("the first close guarantees a last close")
+            .1
+            .trim_start_matches('\n')
+            .trim_end_matches('\n')
+            .to_owned();
         Some((
             Self {
                 reasoning_content,
@@ -458,20 +487,47 @@ impl TemplateBuilder {
     pub fn render(&self, conversation: &Conversation) -> Result<String, TemplateError> {
         conversation.validate()?;
         let mut output = String::new();
-        let first_is_system = conversation
+        let first_system = conversation
             .messages
             .first()
-            .is_some_and(|message| message.role == MessageRole::System);
-        if !first_is_system {
-            render_frame(&mut output, MessageRole::System, DEFAULT_SYSTEM_TEXT);
+            .filter(|message| message.role == MessageRole::System);
+        if conversation.tools.is_empty() {
+            render_frame(
+                &mut output,
+                MessageRole::System,
+                &first_system.map_or_else(
+                    || DEFAULT_SYSTEM_TEXT.to_owned(),
+                    |message| render_content(&message.content),
+                ),
+            );
+        } else {
+            render_tool_preamble(
+                &mut output,
+                &conversation.tools,
+                first_system.map(|message| render_content(&message.content)),
+                self.options.tool_format,
+            )?;
         }
-        if !conversation.tools.is_empty() {
-            render_tool_definitions(&mut output, &conversation.tools, self.options.tool_format)?;
-        }
+
+        let last_query_index = conversation
+            .messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, message)| {
+                (message.role == MessageRole::User
+                    && !is_tool_response(&render_content(&message.content)))
+                .then_some(index)
+            })
+            .unwrap_or(conversation.messages.len() - 1);
 
         let mut index = 0;
         while index < conversation.messages.len() {
             let message = &conversation.messages[index];
+            if message.role == MessageRole::System {
+                index += 1;
+                continue;
+            }
             if message.role == MessageRole::Tool {
                 let group_end = conversation.messages[index..]
                     .iter()
@@ -482,7 +538,7 @@ impl TemplateBuilder {
                 index = group_end;
                 continue;
             }
-            render_message(&mut output, message, self.options)?;
+            render_message(&mut output, message, index, last_query_index, self.options)?;
             index += 1;
         }
         if self.options.add_generation_prompt {
@@ -491,6 +547,11 @@ impl TemplateBuilder {
             if self.options.enable_thinking {
                 output.push_str(THINK_START);
                 output.push('\n');
+            } else {
+                output.push_str(THINK_START);
+                output.push_str("\n\n");
+                output.push_str(THINK_END);
+                output.push_str("\n\n");
             }
         }
         Ok(output)
@@ -552,6 +613,8 @@ impl Error for TemplateError {}
 fn render_message(
     output: &mut String,
     message: &Message,
+    index: usize,
+    last_query_index: usize,
     options: RenderOptions,
 ) -> Result<(), TemplateError> {
     let mut content = render_content(&message.content);
@@ -566,16 +629,27 @@ fn render_message(
         None
     };
     let mut body = String::new();
-    if options.preserve_thinking {
-        if let Some(reasoning) = reasoning {
-            body.push_str(THINK_START);
-            body.push_str(&reasoning.reasoning_content);
-            body.push_str(THINK_END);
+    if message.role == MessageRole::Assistant {
+        let strip_historical_reasoning = !options.preserve_thinking && index < last_query_index;
+        body.push_str(THINK_START);
+        body.push('\n');
+        if !strip_historical_reasoning {
+            if let Some(reasoning) = reasoning {
+                body.push_str(reasoning.reasoning_content.trim());
+            }
         }
+        body.push('\n');
+        body.push_str(THINK_END);
+        body.push_str("\n\n");
     }
     body.push_str(&content);
     if !message.tool_calls.is_empty() {
-        render_tool_calls(&mut body, &message.tool_calls, options.tool_format)?;
+        render_tool_calls(
+            &mut body,
+            &message.tool_calls,
+            options.tool_format,
+            !content.is_empty(),
+        )?;
     }
     render_frame(output, message.role, &body);
     Ok(())
@@ -592,11 +666,35 @@ fn render_content(content: &MessageContent) -> String {
                     ContentPart::Image { .. }
                     | ContentPart::ImageUrl { .. }
                     | ContentPart::Video { .. }
-                    | ContentPart::Audio { .. } => output.push_str(MEDIA_REMINDER_TEXT),
+                    | ContentPart::VideoUrl { .. }
+                    | ContentPart::Audio { .. }
+                    | ContentPart::AudioUrl { .. }
+                    | ContentPart::InputAudio { .. } => {
+                        output.push_str(media_reminder(part));
+                    }
                 }
             }
             output
         }
+    }
+}
+
+fn is_tool_response(content: &str) -> bool {
+    content.starts_with("<tool_response>") && content.ends_with("</tool_response>")
+}
+
+fn media_reminder(part: &ContentPart) -> &'static str {
+    match part {
+        ContentPart::Image { .. } | ContentPart::ImageUrl { .. } => MEDIA_REMINDER_TEXT,
+        ContentPart::Video { .. } | ContentPart::VideoUrl { .. } => {
+            "<reminder>You are unable to process this video because you don't have multi-modal input ability. Try different methods.</reminder>"
+        }
+        ContentPart::Audio { .. }
+        | ContentPart::AudioUrl { .. }
+        | ContentPart::InputAudio { .. } => {
+            "<reminder>You are unable to process this audio because you don't have multi-modal input ability. Try different methods.</reminder>"
+        }
+        ContentPart::Text { .. } => unreachable!("text parts do not have media reminders"),
     }
 }
 
@@ -609,50 +707,116 @@ fn render_frame(output: &mut String, role: MessageRole, body: &str) {
     output.push('\n');
 }
 
-fn render_tool_definitions(
+fn render_tool_preamble(
     output: &mut String,
     tools: &[ToolDefinition],
+    first_system: Option<String>,
     format: ToolFormat,
 ) -> Result<(), TemplateError> {
+    output.push_str(IM_START);
+    output.push_str("system\n");
+    if let Some(system) = first_system {
+        output.push_str(&system);
+        output.push_str("\n\n");
+    } else {
+        output.push_str(TOOL_SYSTEM_TEXT);
+    }
+    output.push_str("# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>");
+    for tool in tools {
+        output.push('\n');
+        render_tool_definition_json(output, tool)?;
+    }
     match format {
         ToolFormat::Xml => {
-            output.push_str("<tools>\n");
-            for tool in tools {
-                output.push_str("<tool><name>");
-                output.push_str(&escape_xml(&tool.name));
-                output.push_str("</name><description>");
-                output.push_str(&escape_xml(&tool.description));
-                output.push_str("</description><parameters>");
-                output.push_str(&canonical_json(&tool.parameters, "tool parameters")?);
-                output.push_str("</parameters></tool>\n");
-            }
-            output.push_str("</tools>\n");
+            output.push_str("\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>");
         }
         ToolFormat::Json => {
-            let values = tools
-                .iter()
-                .map(|tool| {
-                    Value::Object(Map::from_iter([
-                        ("type".to_owned(), Value::String("function".to_owned())),
-                        (
-                            "function".to_owned(),
-                            Value::Object(Map::from_iter([
-                                ("name".to_owned(), Value::String(tool.name.clone())),
-                                (
-                                    "description".to_owned(),
-                                    Value::String(tool.description.clone()),
-                                ),
-                                ("parameters".to_owned(), tool.parameters.clone()),
-                            ])),
-                        ),
-                    ]))
-                })
-                .collect::<Vec<_>>();
-            output.push_str("<tools>");
-            output.push_str(&canonical_json(&values, "tool definitions")?);
-            output.push_str("</tools>\n");
+            output.push_str("\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>");
         }
     }
+    output.push_str(IM_END);
+    output.push('\n');
+    Ok(())
+}
+
+fn render_tool_definition_json(
+    output: &mut String,
+    tool: &ToolDefinition,
+) -> Result<(), TemplateError> {
+    output.push_str("{\"type\": \"function\", \"function\": {\"name\": ");
+    render_json_string(output, &tool.name)?;
+    output.push_str(", \"description\": ");
+    render_json_string(output, &tool.description)?;
+    output.push_str(", \"parameters\": ");
+    render_jinja_json(output, &tool.parameters)?;
+    output.push_str("}}");
+    Ok(())
+}
+
+fn render_tool_argument_value(output: &mut String, value: &Value) -> Result<(), TemplateError> {
+    if let Some(text) = value.as_str() {
+        output.push_str(text);
+        return Ok(());
+    }
+    render_jinja_json(output, value)
+}
+
+fn render_jinja_json(output: &mut String, value: &Value) -> Result<(), TemplateError> {
+    match value {
+        Value::Null => output.push_str("null"),
+        Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+        Value::Number(value) => output.push_str(&value.to_string()),
+        Value::String(value) => render_json_string(output, value)?,
+        Value::Array(values) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push_str(", ");
+                }
+                render_jinja_json(output, value)?;
+            }
+            output.push(']');
+        }
+        Value::Object(values) => {
+            output.push('{');
+            let mut first = true;
+            for key in ["type", "properties", "required"] {
+                if let Some(value) = values.get(key) {
+                    render_jinja_json_entry(output, key, value, &mut first)?;
+                }
+            }
+            for (key, value) in values {
+                if !matches!(key.as_str(), "type" | "properties" | "required") {
+                    render_jinja_json_entry(output, key, value, &mut first)?;
+                }
+            }
+            output.push('}');
+        }
+    }
+    Ok(())
+}
+
+fn render_jinja_json_entry(
+    output: &mut String,
+    key: &str,
+    value: &Value,
+    first: &mut bool,
+) -> Result<(), TemplateError> {
+    if !*first {
+        output.push_str(", ");
+    }
+    *first = false;
+    render_json_string(output, key)?;
+    output.push_str(": ");
+    render_jinja_json(output, value)
+}
+
+fn render_json_string(output: &mut String, value: &str) -> Result<(), TemplateError> {
+    let encoded = serde_json::to_string(value).map_err(|error| TemplateError::CanonicalJson {
+        context: "template JSON string",
+        message: error.to_string(),
+    })?;
+    output.push_str(&encoded);
     Ok(())
 }
 
@@ -660,34 +824,44 @@ fn render_tool_calls(
     output: &mut String,
     calls: &[ToolCall],
     format: ToolFormat,
+    content_is_present: bool,
 ) -> Result<(), TemplateError> {
-    for call in calls {
+    for (call_index, call) in calls.iter().enumerate() {
         match format {
             ToolFormat::Xml => {
-                output.push_str(TOOL_CALL_START);
-                output.push_str("<name>");
-                output.push_str(&escape_xml(&call.name));
-                output.push_str("</name><arguments>");
-                output.push_str(&canonical_json(&call.arguments, "tool-call arguments")?);
-                output.push_str("</arguments>");
-                if let Some(id) = &call.id {
-                    output.push_str("<id>");
-                    output.push_str(&escape_xml(id));
-                    output.push_str("</id>");
+                if call_index == 0 && content_is_present {
+                    output.push_str("\n\n");
+                } else if call_index > 0 {
+                    output.push('\n');
                 }
-                output.push_str(TOOL_CALL_END);
+                output.push_str("<tool_call>\n<function=");
+                output.push_str(&call.name);
+                output.push_str(">\n");
+                let arguments =
+                    call.arguments
+                        .as_object()
+                        .ok_or_else(|| TemplateError::InvalidMessage {
+                            index: 0,
+                            reason: "tool-call arguments must be a JSON object".to_owned(),
+                        })?;
+                for (name, value) in arguments {
+                    output.push_str("<parameter=");
+                    output.push_str(name);
+                    output.push_str(">\n");
+                    render_tool_argument_value(output, value)?;
+                    output.push_str("\n</parameter>\n");
+                }
+                output.push_str("</function>\n</tool_call>");
             }
             ToolFormat::Json => {
-                let mut object = Map::from_iter([
-                    ("name".to_owned(), Value::String(call.name.clone())),
-                    ("arguments".to_owned(), call.arguments.clone()),
-                ]);
-                if let Some(id) = &call.id {
-                    object.insert("id".to_owned(), Value::String(id.clone()));
+                if (call_index == 0 && content_is_present) || call_index > 0 {
+                    output.push('\n');
                 }
-                output.push_str(TOOL_CALL_START);
-                output.push_str(&canonical_json(&Value::Object(object), "tool call")?);
-                output.push_str(TOOL_CALL_END);
+                output.push_str("<tool_call>\n{\"name\": ");
+                render_json_string(output, &call.name)?;
+                output.push_str(", \"arguments\": ");
+                render_jinja_json(output, &call.arguments)?;
+                output.push_str("}\n</tool_call>");
             }
         }
     }
@@ -696,34 +870,14 @@ fn render_tool_calls(
 
 fn render_tool_result_group(output: &mut String, messages: &[Message]) {
     output.push_str(IM_START);
-    output.push_str("tool\n");
+    output.push_str("user");
     for message in messages {
-        for result in &message.tool_results {
-            output.push_str("<tool_result id=\"");
-            output.push_str(&escape_xml(&result.tool_call_id));
-            output.push_str("\">");
-            output.push_str(&result.content);
-            output.push_str("</tool_result>");
-        }
+        output.push_str("\n<tool_response>\n");
+        output.push_str(&render_content(&message.content));
+        output.push_str("\n</tool_response>");
     }
     output.push_str(IM_END);
     output.push('\n');
-}
-
-fn canonical_json(value: &impl Serialize, context: &'static str) -> Result<String, TemplateError> {
-    crate::canonjson::canonical_string(value).map_err(|error| TemplateError::CanonicalJson {
-        context,
-        message: error.to_string(),
-    })
-}
-
-fn escape_xml(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
 }
 
 fn object_at<'a>(value: &'a Value, path: &str) -> Result<&'a Map<String, Value>, TemplateError> {
@@ -856,6 +1010,11 @@ fn parse_content(value: &Value, path: &str) -> Result<MessageContent, TemplateEr
 }
 
 fn parse_content_part(value: &Value, path: &str) -> Result<ContentPart, TemplateError> {
+    if let Some(text) = value.as_str() {
+        return Ok(ContentPart::Text {
+            text: text.to_owned(),
+        });
+    }
     let object = object_at(value, path)?;
     let kind = required_string(object, "type", path)?;
     match kind.as_str() {
@@ -874,12 +1033,22 @@ fn parse_content_part(value: &Value, path: &str) -> Result<ContentPart, Template
         "video" => parse_media_part(object, path, "video", |source| ContentPart::Video {
             source,
         }),
+        "video_url" => parse_media_part(object, path, "video_url", |source| {
+            ContentPart::VideoUrl { source }
+        }),
         "audio" => parse_media_part(object, path, "audio", |source| ContentPart::Audio {
             source,
         }),
+        "audio_url" => parse_media_part(object, path, "audio_url", |source| {
+            ContentPart::AudioUrl { source }
+        }),
+        "input_audio" => parse_media_part(object, path, "input_audio", |source| {
+            ContentPart::InputAudio { source }
+        }),
         _ => Err(TemplateError::InvalidShape {
             path: format!("{path}.type"),
-            expected: "text, image, image_url, video, or audio".to_owned(),
+            expected: "text, image, image_url, video, video_url, audio, audio_url, or input_audio"
+                .to_owned(),
         }),
     }
 }

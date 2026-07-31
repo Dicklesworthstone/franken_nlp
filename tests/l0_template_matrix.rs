@@ -4,13 +4,26 @@
 //! This file deliberately owns the matrix ids and mismatch diagnostics now, so
 //! installing those bytes later changes test data rather than renderer logic.
 
-use franken_nlp::template::{
-    AssistantReasoning, ContentPart, Conversation, DEFAULT_SYSTEM_TEXT, IM_END, IM_START,
-    MEDIA_REMINDER_TEXT, Message, MessageContent, MessageRole, RenderOptions, THINK_END,
-    THINK_START, TemplateBuilder, ToolCall, ToolDefinition, ToolFormat, ToolResult,
+use std::collections::BTreeMap;
+
+use franken_nlp::{
+    template::{
+        AssistantReasoning, ContentPart, Conversation, Message, MessageContent, MessageRole,
+        RenderOptions, TemplateBuilder, ToolCall, ToolDefinition, ToolFormat, ToolResult,
+        DEFAULT_SYSTEM_TEXT, IM_END, IM_START, MEDIA_REMINDER_TEXT, THINK_END, THINK_START,
+    },
+    tokenizer::{
+        bpe::{AddedToken, EncodeOptions, SpBpeTokenizer},
+        sp_model::parse_spm_model,
+    },
 };
 use serde_json::json;
-use std::path::Path;
+use sha2::{Digest, Sha256};
+
+const REFERENCE_INPUTS: &str = include_str!("fixtures/reference_inputs.json");
+const REFERENCE_AUXILIARY: &str = include_str!("fixtures/reference/auxiliary.json");
+const PINNED_TOKENIZER_MODEL: &[u8] = include_bytes!("fixtures/reference/tokenizer.model");
+const PINNED_ADDED_TOKENS: &[u8] = include_bytes!("fixtures/reference/added_tokens.json");
 
 const L0_MATRIX_IDS: &[&str] = &[
     "system-first",
@@ -91,21 +104,30 @@ fn typed_rejections_happen_before_the_tokenizer_boundary() {
         r#"{"messages":[{"role":"user","content":[{"type":"pdf","url":"x"}]}]}"#,
     )
     .expect_err("unknown media kinds must reject");
-    assert!(
-        error
-            .to_string()
-            .contains("text, image, image_url, video, or audio")
-    );
+    assert!(error
+        .to_string()
+        .contains("text, image, image_url, video, video_url, audio, audio_url, or input_audio"));
 
     let error = Conversation::from_json(
         r#"{"messages":[{"role":"assistant","content":"","tool_calls":[{"type":"function","function":{"name":"lookup","arguments":"[]"}}]}]}"#,
     )
     .expect_err("non-object tool-call arguments must reject");
-    assert!(
-        error
-            .to_string()
-            .contains("tool-call arguments must be a JSON object")
-    );
+    assert!(error
+        .to_string()
+        .contains("tool-call arguments must be a JSON object"));
+
+    let conversation = Conversation::from_json(
+        r#"{"messages":[{"role":"user","content":["bare text",{"type":"image"}]}]}"#,
+    )
+    .expect("the reference content-array branch accepts bare string items");
+    let rendered = TemplateBuilder::with_options(RenderOptions {
+        add_generation_prompt: false,
+        ..RenderOptions::default()
+    })
+    .render(&conversation)
+    .expect("bare content-array strings render before tokenization");
+    assert!(rendered.contains("bare text"));
+    assert!(rendered.contains(MEDIA_REMINDER_TEXT));
 }
 
 #[test]
@@ -189,8 +211,9 @@ fn default_system_and_generation_suffix_are_explicit() {
     })
     .render(&conversation)
     .expect("typed conversation renders with thinking disabled");
-    assert!(no_thinking.ends_with(&format!("{IM_START}assistant\n")));
-    assert!(!no_thinking.ends_with(THINK_START));
+    assert!(no_thinking.ends_with(&format!(
+        "{IM_START}assistant\n{THINK_START}\n\n{THINK_END}\n\n"
+    )));
 }
 
 #[test]
@@ -218,12 +241,11 @@ fn first_system_position_and_tool_definition_formats_are_explicit() {
     })
     .render(&first_system)
     .expect("first system with XML tool declaration renders");
-    assert!(xml.starts_with("<tools>\n"));
-    assert!(xml.contains("<tool><name>lookup</name><description>Look up a value.</description>"));
-    assert_eq!(xml.matches(&format!("{IM_START}system\n")).count(), 1);
-    assert!(xml.contains(&format!(
-        "{IM_START}system\nowner supplied system{IM_END}\n"
+    assert!(xml.starts_with(&format!(
+        "{IM_START}system\nowner supplied system\n\n# Tools"
     )));
+    assert!(xml.contains("<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"lookup\""));
+    assert_eq!(xml.matches(&format!("{IM_START}system\n")).count(), 1);
     assert!(!xml.contains(DEFAULT_SYSTEM_TEXT));
 
     let json = TemplateBuilder::with_options(RenderOptions {
@@ -233,22 +255,23 @@ fn first_system_position_and_tool_definition_formats_are_explicit() {
     })
     .render(&first_system)
     .expect("first system with JSON tool declaration renders");
-    assert!(json.starts_with("<tools>[{"));
+    assert!(json.starts_with(&format!(
+        "{IM_START}system\nowner supplied system\n\n# Tools"
+    )));
     assert!(json.contains(
-        "\"function\":{\"description\":\"Look up a value.\",\"name\":\"lookup\",\"parameters\":{"
+        "\"function\": {\"name\": \"lookup\", \"description\": \"Look up a value.\", \"parameters\": {"
     ));
     assert_ne!(xml, json);
 
-    let rendered_non_leading = TemplateBuilder::with_options(RenderOptions {
+    let error = TemplateBuilder::with_options(RenderOptions {
         add_generation_prompt: false,
         ..RenderOptions::default()
     })
     .render(&non_leading_system)
-    .expect("non-leading system remains role framed");
-    assert!(rendered_non_leading.starts_with(&format!(
-        "{IM_START}system\n{DEFAULT_SYSTEM_TEXT}{IM_END}\n{IM_START}user\nhello{IM_END}\n"
-    )));
-    assert!(rendered_non_leading.ends_with(&format!("{IM_START}system\nlater system{IM_END}\n")));
+    .expect_err("non-leading systems must reject before rendering");
+    assert!(error
+        .to_string()
+        .contains("system message must be at the beginning"));
 }
 
 #[test]
@@ -260,7 +283,7 @@ fn media_and_assistant_reasoning_follow_the_selected_mode() {
                 ContentPart::Text {
                     text: "inspect ".to_owned(),
                 },
-                ContentPart::Video { source: None },
+                ContentPart::Image { source: None },
             ]),
             reasoning: None,
             tool_calls: Vec::new(),
@@ -276,14 +299,18 @@ fn media_and_assistant_reasoning_follow_the_selected_mode() {
     .render(&conversation)
     .expect("assistant leading thinking region is typed");
     assert!(preserved.contains(MEDIA_REMINDER_TEXT));
-    assert!(preserved.contains(&format!("{THINK_START}private{THINK_END}visible")));
+    assert!(preserved.contains(&format!("{THINK_START}\nprivate\n{THINK_END}\n\nvisible")));
 
+    let historical = Conversation::new(vec![
+        Message::text(MessageRole::Assistant, "<think>private</think>visible"),
+        Message::text(MessageRole::User, "follow-up"),
+    ]);
     let stripped = TemplateBuilder::with_options(RenderOptions {
         add_generation_prompt: false,
         preserve_thinking: false,
         ..RenderOptions::default()
     })
-    .render(&conversation)
+    .render(&historical)
     .expect("assistant leading thinking region can be stripped");
     assert!(stripped.contains("visible"));
     assert!(!stripped.contains("private"));
@@ -342,26 +369,134 @@ fn tool_branches_and_adjacent_results_are_structurally_distinct() {
     })
     .render(&conversation)
     .expect("JSON branch renders");
-    assert!(xml.contains("<name>lookup</name>"));
-    assert!(json.contains(r#"{"arguments":{"key":"value"},"id":"call-1","name":"lookup"}"#));
+    assert!(xml.contains("<function=lookup>"));
+    assert!(json.contains(r#"{"name": "lookup", "arguments": {"key": "value"}}"#));
     assert_ne!(xml, json);
-    assert_eq!(xml.matches(&format!("{IM_START}tool\n")).count(), 1);
-    assert!(xml.contains("first</tool_result><tool_result"));
+    assert_eq!(xml.matches(&format!("{IM_START}user")).count(), 1);
+    assert!(xml.contains("first\n</tool_response>\n<tool_response>"));
+}
+
+fn pinned_tokenizer() -> SpBpeTokenizer {
+    let model = parse_spm_model(PINNED_TOKENIZER_MODEL)
+        .expect("the frozen tokenizer.model must remain a valid SentencePiece BPE model");
+    let added: BTreeMap<String, u32> = serde_json::from_slice(PINNED_ADDED_TOKENS)
+        .expect("the frozen added-token registry must remain valid JSON");
+    SpBpeTokenizer::with_added_tokens(
+        model,
+        added
+            .into_iter()
+            .map(|(surface, id)| AddedToken::new(surface, id)),
+    )
+    .expect("the frozen SentencePiece and added-token registries must compose")
+}
+
+fn render_options(value: &serde_json::Map<String, serde_json::Value>) -> RenderOptions {
+    let tool_format = match value
+        .get("tool_call_format")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("xml")
+    {
+        "xml" => ToolFormat::Xml,
+        "json" => ToolFormat::Json,
+        other => panic!("fixture supplied unknown pinned tool-call format {other:?}"),
+    };
+    RenderOptions {
+        add_generation_prompt: value
+            .get("add_generation_prompt")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        enable_thinking: value
+            .get("enable_thinking")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        preserve_thinking: value
+            .get("preserve_thinking")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        tool_format,
+    }
 }
 
 #[test]
-#[ignore = "requires frozen Phase -1 apply_chat_template byte fixtures"]
-fn pinned_oracle_matrix_is_byte_exact() {
-    let fixture_root = Path::new("tests/fixtures/reference");
-    for matrix_id in L0_MATRIX_IDS {
-        eprintln!("L0T cell={matrix_id} RESULT=PASS source=pinned-reference-fixture");
+fn pinned_oracle_matrix_is_byte_and_token_id_exact() {
+    let inputs: serde_json::Value =
+        serde_json::from_str(REFERENCE_INPUTS).expect("reference input corpus is valid JSON");
+    let auxiliary: serde_json::Value = serde_json::from_str(REFERENCE_AUXILIARY)
+        .expect("reference auxiliary fixture is valid JSON");
+    let input_cases = inputs["template_cases"]
+        .as_array()
+        .expect("reference inputs contain template cases");
+    let expected_cases = auxiliary["template_cases"]
+        .as_array()
+        .expect("reference auxiliary fixture contains template cases");
+    let tokenizer = pinned_tokenizer();
+    let mut rendered_cases = 0_usize;
+
+    for input_case in input_cases {
+        let id = input_case["id"]
+            .as_str()
+            .expect("template fixture id is a string");
+        let options = input_case["options"]
+            .as_object()
+            .expect("template fixture options are an object");
+        let expected = expected_cases
+            .iter()
+            .find(|candidate| candidate["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("missing frozen template output for cell {id}"));
+        let conversation_value = json!({
+            "messages": input_case["messages"].clone(),
+            "tools": options.get("tools").cloned().unwrap_or_else(|| json!([])),
+        });
+        let conversation = Conversation::from_value(&conversation_value)
+            .unwrap_or_else(|error| panic!("fixture cell {id} rejected before rendering: {error}"));
+        let actual = TemplateBuilder::with_options(render_options(options))
+            .render(&conversation)
+            .unwrap_or_else(|error| panic!("fixture cell {id} did not render: {error}"));
+        let expected_bytes = expected["rendered"]
+            .as_str()
+            .expect("frozen rendered prompt is a string")
+            .as_bytes();
+        assert_byte_exact(id, expected_bytes, actual.as_bytes());
+        let expected_sha256 = expected["rendered_sha256"]
+            .as_str()
+            .expect("frozen rendered-prompt digest is a string");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(actual.as_bytes())),
+            expected_sha256,
+            "frozen rendered-prompt digest drifted for cell {id}"
+        );
+        let expected_ids = expected["token_ids"]
+            .as_array()
+            .expect("frozen template token ids are an array")
+            .iter()
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|id| u32::try_from(id).ok())
+                    .expect("frozen template token id fits u32")
+            })
+            .collect::<Vec<_>>();
+        let actual_ids = tokenizer
+            .encode_ids_with_options(
+                &actual,
+                EncodeOptions {
+                    add_bos: false,
+                    add_eos: false,
+                },
+            )
+            .unwrap_or_else(|error| panic!("fixture cell {id} did not tokenize: {error}"));
+        assert_eq!(
+            actual_ids, expected_ids,
+            "L0 template token-id mismatch for fixture cell {id}"
+        );
+        eprintln!("L0T cell={id} RESULT=PASS");
+        rendered_cases += 1;
     }
-    assert!(
-        fixture_root.is_dir(),
-        "unignore only when the pinned reference fixture matrix is committed"
+
+    assert_eq!(rendered_cases, expected_cases.len());
+    assert_eq!(
+        rendered_cases, 5,
+        "the frozen Phase -1 corpus must retain its complete template matrix"
     );
-    eprintln!(
-        "L0_TEMPLATE RESULT=PASS cells={} rejects=3",
-        L0_MATRIX_IDS.len()
-    );
+    eprintln!("L0_TEMPLATE RESULT=PASS cells={rendered_cases} rejects=3");
 }
