@@ -18,6 +18,11 @@ name = "fnlp"
 path = "src/bin/fnlp.rs"
 test = false
 
+[[test]]
+name = "g0_asupersync_census"
+path = "tests/g0_asupersync_census.rs"
+required-features = ["asupersync-runtime"]
+
 [features]
 default = []
 asupersync-runtime = ["dep:asupersync"]
