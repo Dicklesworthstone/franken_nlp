@@ -26,6 +26,9 @@ a FrankenNLP measurement.
 - `p50/p95/p99`
 - `Fairness controls` — thread count, allocator, precision, warmup, and any
   additional control required to compare candidates.
+- `Admission boundary outcomes` — the named accepted/rejected long-context
+  points and the retained admission receipt; required for an R4 row to support
+  a public >8K practicality claim.
 - `Bandwidth denominator` — explicitly `logical-tensor-bytes`,
   `packed-payload-bytes`, or `measured-dram-bytes`.
 
@@ -51,6 +54,7 @@ No local performance campaign has been measured at scaffold time.
 - p50/p95/p99: `pending: no measurement`
 - Fairness controls: `pending: same artifact, numerics profile, thread cap, and
   thermal state are required before promotion`
+- Admission boundary outcomes: `n/a: this R1 decode candidate does not measure R4 admission`
 - Bandwidth denominator: `measured-dram-bytes`
 
 The fused variant remains **default off** until this row is replaced by a
@@ -76,6 +80,7 @@ removed merely because the unfused path remains selected.
 - Artifact recipe + packing + kernel table + load mode: pending: no runnable artifact or packing set
 - p50/p95/p99: pending: p50=pending; p95=pending; p99=pending; no measurement
 - Fairness controls: blocked: select every context point from the future admission certificate, then match oracle and official-baseline prompt, precision, thread, load-mode, warmup, and thermal controls
+- Admission boundary outcomes: pending: no admitted/rejected boundary receipt has been retained
 - Bandwidth denominator: measured-dram-bytes
 
 This row must be replaced—not promoted—only after the retained oracle and

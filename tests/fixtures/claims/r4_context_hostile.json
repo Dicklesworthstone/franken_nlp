@@ -1,0 +1,24 @@
+{
+  "cases": [
+    {
+      "claim": "Observed model limit 262,144 positions; usable at 32K context.",
+      "is_practicality_claim": true
+    },
+    {
+      "claim": "The runtime supports a 32K window.",
+      "is_practicality_claim": true
+    },
+    {
+      "claim": "The runtime handles prompts up to 32K.",
+      "is_practicality_claim": true
+    },
+    {
+      "claim": "Context length 32,768 is supported.",
+      "is_practicality_claim": true
+    },
+    {
+      "claim": "Observed model limit: 262,144 positions.",
+      "is_practicality_claim": false
+    }
+  ]
+}
