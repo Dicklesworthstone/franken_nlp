@@ -24,10 +24,10 @@ G0 decision as ratified merely because this schema exists.
 ## Metadata block
 
 Every G0 ADR contains exactly one fenced block with the opening fence
-` ```adr-metadata` and a JSON object as its body. The object is canonical JSON:
-UTF-8, two-space indentation, sorted keys, no duplicate keys, and a trailing
-newline. The validator rejects a second metadata block, malformed JSON, or a
-non-canonical serialization.
+` ```adr-metadata` and a JSON object as its body. The object has canonical
+semantics: UTF-8, recursively duplicate-key-free JSON with sorted top-level
+keys. The validator rejects a second metadata block, malformed JSON, duplicate
+keys, or out-of-order metadata keys; insignificant JSON whitespace is ignored.
 
 ```adr-metadata
 {

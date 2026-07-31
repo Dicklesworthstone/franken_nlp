@@ -61,10 +61,19 @@ def canonical_json_bytes(value: Any) -> bytes:
     return (json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
 
 
+def no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise AdrValidationError(f"duplicate JSON key {key!r}")
+        value[key] = item
+    return value
+
+
 def decode_json(document: str, context: str) -> Any:
     try:
-        return json.JSONDecoder().decode(document)
-    except json.JSONDecodeError as error:
+        return json.loads(document, object_pairs_hook=no_duplicate_keys)
+    except (AdrValidationError, json.JSONDecodeError) as error:
         raise AdrValidationError(f"cannot parse JSON {context}: {error}") from error
 
 
@@ -114,8 +123,8 @@ def parse_metadata(path: Path) -> AdrRecord:
     metadata = decode_json(payload, f"ADR {path} metadata")
     if not isinstance(metadata, dict):
         raise AdrValidationError(f"ADR {path} metadata must be a JSON object")
-    if canonical_json_bytes(metadata).decode("utf-8") != payload:
-        raise AdrValidationError(f"ADR {path} metadata block is not canonical sorted JSON")
+    if list(metadata) != sorted(metadata):
+        raise AdrValidationError(f"ADR {path} metadata keys are not in canonical sorted order")
     return AdrRecord(path=path, metadata=metadata)
 
 
@@ -362,6 +371,12 @@ def run_self_test() -> None:
     unknown_issues = validate_metadata(AdrRecord(record.path, unknown))
     if not any(issue.field == "status" for issue in unknown_issues):
         raise AdrValidationError("unknown-status fixture was accepted")
+    try:
+        decode_json('{"field": 1, "field": 2}', "duplicate-key fixture")
+    except AdrValidationError:
+        pass
+    else:
+        raise AdrValidationError("duplicate-key fixture was accepted")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:

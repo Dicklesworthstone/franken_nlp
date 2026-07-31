@@ -1,0 +1,10 @@
+{"id":"dev-001","label":"yes","split":"development","text":"fixture development row"}
+{"id":"dev-002","label":"no","split":"development","text":"fixture development counterexample"}
+{"id":"cal-001","label":"yes","split":"calibration","text":"fixture calibration row"}
+{"id":"cal-002","label":"no","split":"calibration","text":"fixture calibration counterexample"}
+{"id":"test-001","label":"yes","split":"test","text":"fixture test one"}
+{"id":"test-002","label":"no","split":"test","text":"fixture test two"}
+{"id":"test-003","label":"yes","split":"test","text":"fixture test three"}
+{"id":"test-004","label":"no","split":"test","text":"fixture test four"}
+{"id":"test-005","label":"yes","split":"test","text":"fixture test five"}
+{"id":"test-006","label":"no","split":"test","text":"fixture test six"}

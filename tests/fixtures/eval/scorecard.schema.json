@@ -1,0 +1,22 @@
+{
+  "required": [
+    "dataset",
+    "dataset_digest_sha256",
+    "dataset_id",
+    "dataset_version",
+    "input_digest_sha256",
+    "metric",
+    "model_recipe_id",
+    "prompt_hash",
+    "schema_version",
+    "split",
+    "status",
+    "thinking_mode"
+  ],
+  "schema_version": 1,
+  "status_values": [
+    "OK",
+    "INSUFFICIENT_DATA",
+    "SKIPPED_NO_MODEL"
+  ]
+}
