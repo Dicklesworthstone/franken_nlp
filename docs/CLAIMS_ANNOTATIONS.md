@@ -49,6 +49,9 @@ admission-receipt=docs/evidence/r4-admission.json#sha256:<64-lowercase-hex>
 
 Both artifact digests must also occur in `Fixture hashes`; the referenced files
 must be regular, repository-relative files whose bytes hash to those digests.
+Both raw receipt digests must additionally occur in the named evidenced claim's
+`evidence_artifact_digests`; an unrelated evidenced claim cannot authorize a
+later R4 row.
 This binds a positive >8K practicality claim to both an evidenced public claim
 id and retained R4/admission evidence; a markdown row alone cannot authorize
 public wording.

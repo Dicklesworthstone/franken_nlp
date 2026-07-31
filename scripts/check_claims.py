@@ -530,6 +530,9 @@ def r4_evidence_is_retained(
     claim = claims.get(claim_id or "")
     if claim is None or claim["state"] != "evidenced":
         return False
+    receipt_digests = {digest for _, digest in receipt_paths.values()}
+    if not receipt_digests.issubset(set(claim["evidence_artifact_digests"])):
+        return False
     for key in ("ledger_entry", "claim_id", "validity_domain", "host_fingerprint", "cpu_feature_string", "artifact", "context"):
         if measurement[key] != admission[key]:
             return False
@@ -905,7 +908,12 @@ def run_self_test(root: Path, claims: dict[str, dict[str, Any]]) -> None:
     r4_claim = copy.deepcopy(next(iter(claims.values())))
     r4_claim["id"] = "r4-fixture-claim"
     r4_claim["state"] = "evidenced"
-    r4_claim["evidence_artifact_digests"] = ["a" * 64]
+    r4_claim["evidence_artifact_digests"] = [
+        match["digest"]
+        for match in R4_EVIDENCE_RECEIPT_RE.finditer(
+            (fixtures / "r4_typed_ledger.md").read_text(encoding="utf-8")
+        )
+    ]
     r4_claim["validity_domain"] = {
         "dataset": "r4-fixture-dataset",
         "host": "fixture-host-v1",
@@ -991,6 +999,14 @@ def run_self_test(root: Path, claims: dict[str, dict[str, Any]]) -> None:
     )
     if typed != {"PERF-R4-TYPED-001": r4_claim["id"]}:
         raise ClaimsError("self-test typed R4 ledger row was not eligible")
+    unbound_claim = copy.deepcopy(r4_claim)
+    unbound_claim["evidence_artifact_digests"] = ["a" * 64]
+    if eligible_r4_ledger_entries(
+        root,
+        {unbound_claim["id"]: unbound_claim},
+        ledger_path=fixtures / "r4_typed_ledger.md",
+    ):
+        raise ClaimsError("self-test R4 receipts not bound to the registry claim were eligible")
     for fixture_name in ("r4_retained_garbage_ledger.md", "r4_duplicate_evidence_ledger.md"):
         hostile = eligible_r4_ledger_entries(
             root,
