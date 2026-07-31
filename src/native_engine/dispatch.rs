@@ -221,7 +221,7 @@ impl KernelTier {
     }
 
     #[must_use]
-    pub const fn is_detected(self, features: DetectedFeatures) -> bool {
+    pub fn is_detected(self, features: DetectedFeatures) -> bool {
         match self {
             Self::A1Smmla => {
                 features.architecture == Architecture::Aarch64 && features.aarch64_i8mm
