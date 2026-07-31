@@ -490,6 +490,38 @@ fn scalar_lm_head_bf16_then_export(matrix: &Bf16Matrix, input: &[Bf16]) -> Vec<f
         .collect()
 }
 
+fn seeded_bf16(seed: u32, elements: usize) -> Vec<Bf16> {
+    let mut state = seed;
+    (0..elements)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let signed_mantissa = ((state >> 16) & 0x3ff) as f32 - 512.0;
+            Bf16::from_f32(signed_mantissa / 256.0)
+        })
+        .collect()
+}
+
+fn seeded_lm_head_report_digest(seed: u32) -> String {
+    let matrix = Bf16Matrix::new(5, 7, seeded_bf16(seed, 5 * 7))
+        .expect("the seeded L1 lm-head matrix has a valid shape");
+    let hidden = seeded_bf16(seed ^ 0x9e37_79b9, 7);
+    let expected = scalar_lm_head_bf16_then_export(&matrix, &hidden);
+    let observed =
+        export_logits_f32(&hidden, &matrix).expect("the seeded L1 lm-head input width matches");
+    let vector = metrics(&expected, &observed)
+        .expect("the seeded L1 lm-head comparison has a metric vector");
+    assert_eq!(vector.max_abs, 0.0, "seeded eager lm-head must be exact");
+    assert_eq!(vector.max_ulp, 0, "seeded eager lm-head must be exact");
+    let encoded = serde_json::to_vec(&serde_json::json!({
+        "seed": seed,
+        "expected": expected,
+        "observed": observed,
+        "metrics": vector,
+    }))
+    .expect("the seeded L1 report row serializes");
+    format!("{:x}", Sha256::digest(encoded))
+}
+
 fn top_k_indices(logits: &[f32], count: usize) -> Vec<usize> {
     let mut indices = (0..logits.len()).collect::<Vec<_>>();
     indices.sort_by(|left, right| {
@@ -672,6 +704,22 @@ fn hf_bf16_lm_head_rounds_linear_output_before_f32_export() {
     assert_eq!(
         observed, expected,
         "hf-bf16-eager lm_head must narrow the completed linear output before f32 export"
+    );
+}
+
+#[test]
+fn seeded_l1_lm_head_differential_is_reproducible() {
+    let first = seeded_lm_head_report_digest(0x4c31_0001);
+    let replay = seeded_lm_head_report_digest(0x4c31_0001);
+    let distinct_seed = seeded_lm_head_report_digest(0x4c31_0002);
+
+    assert_eq!(
+        first, replay,
+        "the same L1 seed must reproduce its machine-readable report digest"
+    );
+    assert_ne!(
+        first, distinct_seed,
+        "the fixed seed must remain an actual report input, not ignored metadata"
     );
 }
 
