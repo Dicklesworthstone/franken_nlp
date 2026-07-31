@@ -436,6 +436,15 @@ impl TemperatureModel {
         }
         Ok(sigmoid(logit(probability) / self.temperature))
     }
+
+    /// Content-free fit diagnostic suitable for an evaluation receipt or test log.
+    #[must_use]
+    pub fn diagnostic_line(self) -> String {
+        format!(
+            "CALIBRATION_FIT method=temperature fitted_rows={} temperature={:.17}",
+            self.fitted_rows, self.temperature
+        )
+    }
 }
 
 /// A monotonic isotonic regression fit represented by deterministic PAV blocks.
@@ -552,6 +561,31 @@ pub struct SelectiveRisk {
     pub accepted: usize,
     pub abstained: usize,
     pub risk: Option<f64>,
+}
+
+impl ReliabilityMetrics {
+    /// Content-free locked-test metric diagnostic; callers attach identity separately.
+    #[must_use]
+    pub fn diagnostic_line(self) -> String {
+        format!(
+            "CALIBRATION_METRICS split=locked_test rows={} ece={:.17} brier={:.17}",
+            self.rows, self.ece, self.brier
+        )
+    }
+}
+
+impl SelectiveRisk {
+    /// Content-free locked-test selective-risk diagnostic.
+    #[must_use]
+    pub fn diagnostic_line(self) -> String {
+        let risk = self
+            .risk
+            .map_or_else(|| "not_computed".to_owned(), |risk| format!("{risk:.17}"));
+        format!(
+            "CALIBRATION_SELECTIVE_RISK split=locked_test threshold={:.17} accepted={} abstained={} risk={risk}",
+            self.threshold, self.accepted, self.abstained
+        )
+    }
 }
 
 /// Report calibration reliability on locked-test rows only.
@@ -766,6 +800,19 @@ impl CoverageReport {
     #[must_use]
     pub fn empirical_coverage(&self) -> f64 {
         self.covered as f64 / self.total as f64
+    }
+
+    /// Coverage is logged with its finite sample and named population, never as a universal claim.
+    #[must_use]
+    pub fn diagnostic_line(&self) -> String {
+        format!(
+            "CALIBRATION_COVERAGE split=locked_test population={} alpha={:.17} covered={} total={} empirical_coverage={:.17}",
+            self.named_population,
+            self.alpha,
+            self.covered,
+            self.total,
+            self.empirical_coverage(),
+        )
     }
 }
 
@@ -1056,9 +1103,10 @@ impl CalibrationArtifact {
     #[must_use]
     pub fn diagnostic_line(&self) -> String {
         format!(
-            "CALIBRATION artifact_key={} calibration_digest={} population={} valid_from={} valid_through={} development_split={} calibration_split={} locked_test_split={} shift_policy={}",
+            "CALIBRATION artifact_key={} calibration_digest={} fitted_parameter_digest={} population={} valid_from={} valid_through={} development_split={} calibration_split={} locked_test_split={} shift_policy={}",
             self.identity_key.to_hex(),
             self.calibration_digest.to_hex(),
+            self.spec.fitted_parameter_digest.to_hex(),
             self.spec.named_population,
             self.spec.validity.valid_from,
             self.spec.validity.valid_through,

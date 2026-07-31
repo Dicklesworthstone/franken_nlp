@@ -249,6 +249,7 @@ fn artifact_is_identity_bound_and_shift_or_expiry_never_stays_calibrated() {
     .unwrap();
     let abstaining =
         CalibrationArtifact::new(&identity(abstain_spec.digest()), abstain_spec).unwrap();
+    assert_ne!(artifact.key(), abstaining.key());
     let shifted_to_abstention = abstaining
         .decide(
             0.9,
@@ -269,9 +270,34 @@ fn artifact_is_identity_bound_and_shift_or_expiry_never_stays_calibrated() {
     );
     assert!(shifted_to_abstention.is_success());
 
+    let temperature = TemperatureModel::fit(partition.calibration()).unwrap();
+    let (metrics, selective) = report_locked_test(
+        partition.locked_test(),
+        |probability| temperature.calibrate(probability),
+        0.5,
+    )
+    .unwrap();
+    let memo = ExchangeabilityMemo::new(
+        "repo-authored synthetic binary population",
+        "one independent synthetic row",
+        "The fixture's calibration and locked-test rows are exchangeable only for this test.",
+    )
+    .unwrap();
+    let conformal = ConformalModel::fit(partition.calibration(), Some(memo), 0.25).unwrap();
+    let coverage = conformal
+        .coverage_on_locked_test(partition.locked_test())
+        .unwrap();
+    assert!(temperature.diagnostic_line().contains("fitted_rows=4"));
+    assert!(metrics.diagnostic_line().contains("split=locked_test"));
+    assert!(selective.diagnostic_line().contains("accepted="));
+    assert!(coverage.diagnostic_line().contains("population="));
+
     eprintln!(
-        "CALIBRATION RESULT=PASS split_digests={:?} artifact_key={} coverage_scope=locked_test",
-        partition.split_digests(),
-        artifact.key().to_hex(),
+        "{}\n{}\n{}\n{}\n{}\nCALIBRATION RESULT=PASS coverage_scope=locked_test",
+        artifact.diagnostic_line(),
+        temperature.diagnostic_line(),
+        metrics.diagnostic_line(),
+        selective.diagnostic_line(),
+        coverage.diagnostic_line(),
     );
 }
