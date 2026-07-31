@@ -274,6 +274,14 @@ struct ThreadInventoryDocument {
     outstanding_pool_closures: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cancelled_wrapper_closures: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deadline_check_interval_millis: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint_timeout_millis: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cancel_attribution_max_depth: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cancel_attribution_max_memory_bytes: Option<usize>,
 }
 
 impl ThreadInventoryDocument {
@@ -291,6 +299,10 @@ impl ThreadInventoryDocument {
             active_engine_leases: None,
             outstanding_pool_closures: None,
             cancelled_wrapper_closures: None,
+            deadline_check_interval_millis: None,
+            checkpoint_timeout_millis: None,
+            cancel_attribution_max_depth: None,
+            cancel_attribution_max_memory_bytes: None,
         }
     }
 
@@ -298,6 +310,7 @@ impl ThreadInventoryDocument {
         let config = resources.config();
         let inventory = resources.thread_inventory();
         let outstanding = resources.outstanding_closure_snapshot();
+        let guardrails = resources.runtime_guardrails();
         Self {
             status: "configured",
             runtime_preset: Some(config.runtime_preset.as_str()),
@@ -317,6 +330,12 @@ impl ThreadInventoryDocument {
             active_engine_leases: Some(resources.active_lease_count()),
             outstanding_pool_closures: Some(outstanding.active_closures),
             cancelled_wrapper_closures: Some(outstanding.wrapper_cancelled_closures),
+            deadline_check_interval_millis: Some(guardrails.deadline_check_interval_millis),
+            checkpoint_timeout_millis: Some(guardrails.checkpoint_timeout_millis),
+            cancel_attribution_max_depth: Some(guardrails.cancel_attribution_max_depth),
+            cancel_attribution_max_memory_bytes: Some(
+                guardrails.cancel_attribution_max_memory_bytes,
+            ),
         }
     }
 }

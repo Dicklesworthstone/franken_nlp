@@ -214,6 +214,10 @@ fn schema_and_unpopulated_commands_are_data_only_and_golden_frozen() {
                         "active_engine_leases",
                         "outstanding_pool_closures",
                         "cancelled_wrapper_closures",
+                        "deadline_check_interval_millis",
+                        "checkpoint_timeout_millis",
+                        "cancel_attribution_max_depth",
+                        "cancel_attribution_max_memory_bytes",
                     ] {
                         assert!(
                             inventory.get(field).is_some(),
@@ -230,6 +234,17 @@ fn schema_and_unpopulated_commands_are_data_only_and_golden_frozen() {
                             <= inventory["outstanding_pool_closures"].as_u64(),
                         "cancelled wrapper count is a subset of outstanding pool closures"
                     );
+                    for field in [
+                        "deadline_check_interval_millis",
+                        "checkpoint_timeout_millis",
+                        "cancel_attribution_max_depth",
+                        "cancel_attribution_max_memory_bytes",
+                    ] {
+                        assert!(
+                            inventory[field].as_u64().is_some_and(|value| value > 0),
+                            "configured health must report a finite nonzero guardrail in {field}"
+                        );
+                    }
                 }
             }
         }
