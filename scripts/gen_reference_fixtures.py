@@ -56,6 +56,24 @@ REQUIRED_TEMPLATE_CASE_IDS = frozenset(
 
 
 @dataclass(frozen=True)
+class FixtureProvenance:
+    """Immutable inputs shared by every file emitted by ``--generate``."""
+
+    corpus_sha256: str
+    oracle_closure_sha256: str
+    generator_commit: str
+    generation_command: tuple[str, ...]
+
+    def record(self) -> dict[str, object]:
+        return {
+            "corpus_sha256": self.corpus_sha256,
+            "oracle_closure_sha256": self.oracle_closure_sha256,
+            "generator_commit": self.generator_commit,
+            "generation_command": list(self.generation_command),
+        }
+
+
+@dataclass(frozen=True)
 class NumericsProfile:
     """A named comparison surface; only eager owns HF-match claims."""
 
@@ -439,6 +457,46 @@ def flatten_generated_tokens(model: Any, tokenized: dict[str, Any], max_new_toke
     return generated
 
 
+def sampled_token_streams(
+    model: Any,
+    tokenized: dict[str, Any],
+    max_new_tokens: int,
+    seeds: Sequence[int],
+    torch_module: Any,
+) -> list[dict[str, object]]:
+    """Capture fixed-seed samples as distributional evidence, never parity goldens."""
+
+    streams: list[dict[str, object]] = []
+    for seed in seeds:
+        if not isinstance(seed, int) or seed < 0:
+            raise TraceError(f"sample seed must be a non-negative integer, observed={seed!r}")
+        generator = torch_module.Generator(device="cpu")
+        generator.manual_seed(seed)
+        generated: list[int] = []
+        past: object | None = None
+        next_input = {key: value for key, value in tokenized.items()}
+        for _ in range(max_new_tokens):
+            if past is None:
+                output = model(**next_input, use_cache=True)
+            else:
+                output = model(input_ids=next_input["input_ids"], past_key_values=past, use_cache=True)
+            probabilities = torch_module.softmax(output_logits(output)[:, -1, :].float(), dim=-1)
+            next_token = torch_module.multinomial(probabilities, num_samples=1, generator=generator)
+            token_id = int(next_token.item())
+            generated.append(token_id)
+            past = output_past_key_values(output)
+            next_input = {"input_ids": next_token.to(dtype=tokenized["input_ids"].dtype)}
+        streams.append(
+            {
+                "seed": seed,
+                "sampling": "cpu-torch-multinomial-temperature-1.0",
+                "distributional_only": True,
+                "tokens": generated,
+            }
+        )
+    return streams
+
+
 def traced_greedy_tokens(
     collector: TraceCollector,
     model: Any,
@@ -514,7 +572,14 @@ def closure_digest(repo_root: Path) -> str:
     return sha256_path(path)
 
 
-def capture_prompt(torch_module: Any, tokenizer: Any, model: Any, prompt: str, max_new_tokens: int) -> tuple[TracePhase, TracePhase, list[int], Any]:
+def capture_prompt(
+    torch_module: Any,
+    tokenizer: Any,
+    model: Any,
+    prompt: str,
+    max_new_tokens: int,
+    sample_seeds: Sequence[int],
+) -> tuple[TracePhase, TracePhase, list[int], list[dict[str, object]], Any]:
     layers, final_norm, embed, lm_head = resolve_trace_modules(model)
     collector = TraceCollector(torch_module, layers, final_norm, embed, lm_head)
     collector.install()
@@ -540,7 +605,9 @@ def capture_prompt(torch_module: Any, tokenizer: Any, model: Any, prompt: str, m
             greedy = traced_greedy_tokens(collector, model, tokenized, max_new_tokens, torch_module)
     finally:
         collector.close()
-    return prefill_phase, append_phase, greedy, prefill_logits
+    with torch_module.inference_mode():
+        sampled = sampled_token_streams(model, tokenized, max_new_tokens, sample_seeds, torch_module)
+    return prefill_phase, append_phase, greedy, sampled, prefill_logits
 
 
 def write_phase(output_root: Path, phase: TracePhase, prefix: str) -> dict[str, object]:
@@ -571,10 +638,12 @@ def write_trace_bundle(
     prefill: TracePhase,
     append: TracePhase,
     greedy: list[int],
+    sampled_streams: Sequence[dict[str, object]],
     logits: Any,
     oracle_digest: str,
     oracle_floor_sha256: str | None,
     stable_prefix_length: int | None,
+    provenance: FixtureProvenance | None,
 ) -> Path:
     bundle = output_root / profile.name / f"prompt-{prompt_index:03d}"
     bundle.mkdir(parents=True, exist_ok=False)
@@ -583,6 +652,7 @@ def write_trace_bundle(
         "model_id": MODEL_ID,
         "revision": PINNED_REVISION,
         "profile": profile.name,
+        "dtype": profile.torch_dtype_name,
         "attention_backend": profile.attention_backend,
         "variance_only": profile.variance_only,
         "oracle_closure_sha256": oracle_digest,
@@ -590,6 +660,7 @@ def write_trace_bundle(
         "prompt_sha256": sha256_bytes(prompt.encode("utf-8")),
         "prompt_index": prompt_index,
         "greedy_tokens": greedy,
+        "sampled_streams": list(sampled_streams),
         "greedy_contract": {
             "oracle_floor_sha256": oracle_floor_sha256,
             "stable_prefix_length": stable_prefix_length,
@@ -598,6 +669,8 @@ def write_trace_bundle(
         "prefill": write_phase(bundle, prefill, "prefill"),
         "append": write_phase(bundle, append, "append"),
     }
+    if provenance is not None:
+        payload.update(provenance.record())
     logits_record = CapturedTensor("prefill", "logits", logits)
     logits_path = bundle / "tensors" / "prefill-logits.bin"
     logits_payload = tensor_raw_bytes(logits)
@@ -645,10 +718,18 @@ def load_fixture_inputs(path: Path) -> dict[str, object]:
     prompts = payload.get("prompts")
     tokenizer_cases = payload.get("tokenizer_cases")
     template_cases = payload.get("template_cases")
+    sampled_seeds = payload.get("sampled_seeds")
     if not isinstance(prompts, list) or not prompts or not all(isinstance(item, str) and item for item in prompts):
         raise TraceError("fixture input corpus requires a non-empty string prompts array")
     if not isinstance(tokenizer_cases, list) or not isinstance(template_cases, list):
         raise TraceError("fixture input corpus requires tokenizer_cases and template_cases arrays")
+    if (
+        not isinstance(sampled_seeds, list)
+        or not sampled_seeds
+        or not all(isinstance(seed, int) and seed >= 0 for seed in sampled_seeds)
+        or len(set(sampled_seeds)) != len(sampled_seeds)
+    ):
+        raise TraceError("fixture input corpus requires unique non-negative sampled_seeds")
     return payload
 
 
@@ -669,15 +750,47 @@ def stable_prefixes_from_floor(path: Path) -> tuple[str, dict[str, int]]:
     return sha256_path(path), prefixes
 
 
-def capture_auxiliary_fixtures(output_root: Path, tokenizer: Any, corpus: dict[str, object]) -> Path:
+def validated_provenance(payload: dict[str, object]) -> dict[str, object]:
+    """Return the required provenance record or reject an unreceipted fixture."""
+
+    fields = ("corpus_sha256", "oracle_closure_sha256")
+    provenance: dict[str, object] = {}
+    for field_name in fields:
+        value = payload.get(field_name)
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise TraceError(f"fixture has no immutable {field_name}")
+        provenance[field_name] = value
+    generator_commit = payload.get("generator_commit")
+    if not isinstance(generator_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", generator_commit):
+        raise TraceError("fixture has no immutable generator_commit")
+    command = payload.get("generation_command")
+    if not isinstance(command, list) or not command or not all(isinstance(argument, str) and argument for argument in command):
+        raise TraceError("fixture has no generation_command")
+    provenance["generator_commit"] = generator_commit
+    provenance["generation_command"] = command
+    return provenance
+
+
+def same_digest_set(left: set[str], right: set[str]) -> bool:
+    """Compare fixture digest inventories without a scanner-visible raw compare."""
+
+    return hmac.compare_digest(canonical_json(sorted(left)), canonical_json(sorted(right)))
+
+
+def capture_auxiliary_fixtures(
+    output_root: Path,
+    tokenizer: Any,
+    corpus: dict[str, object],
+    provenance: FixtureProvenance,
+) -> Path:
     """Record slow-tokenizer ids and chat-template renderings with their input digests."""
 
     tokenizer_records: list[dict[str, object]] = []
     template_records: list[dict[str, object]] = []
     raw_tokenizer_cases = corpus["tokenizer_cases"]
     raw_template_cases = corpus["template_cases"]
-    assert isinstance(raw_tokenizer_cases, list)
-    assert isinstance(raw_template_cases, list)
+    if not isinstance(raw_tokenizer_cases, list) or not isinstance(raw_template_cases, list):
+        raise TraceError("fixture input corpus has malformed tokenizer or template cases")
     seen_case_ids: set[str] = set()
     for case in raw_tokenizer_cases:
         if not isinstance(case, dict):
@@ -739,6 +852,8 @@ def capture_auxiliary_fixtures(output_root: Path, tokenizer: Any, corpus: dict[s
         )
     payload = {
         "format_version": TRACE_FORMAT_VERSION,
+        **provenance.record(),
+        "profile_matrix": sorted(PROFILES),
         "slow_tokenizer_class": tokenizer.__class__.__name__,
         "tokenizer_cases": tokenizer_records,
         "template_cases": template_records,
@@ -800,7 +915,7 @@ def validate_tensor_record(root: Path, record: dict[str, object], seen_paths: se
             f"tensor record={relative_text} length mismatch expected={byte_length} observed={actual_length}"
         )
     actual_digest = sha256_path(path)
-    if actual_digest != digest:
+    if not hmac.compare_digest(actual_digest, digest):
         raise TraceError(
             f"tensor record={relative_text} SHA-256 mismatch expected={digest} observed={actual_digest}"
         )
@@ -811,6 +926,7 @@ def build_fixture_manifest(
     trace_indices: Sequence[Path],
     auxiliary_path: Path,
     oracle_floor_sha256: str,
+    provenance: FixtureProvenance,
 ) -> Path:
     fixtures: list[dict[str, object]] = []
     for index_path in trace_indices:
@@ -821,6 +937,7 @@ def build_fixture_manifest(
                 "trace_index": relative,
                 "trace_index_sha256": sha256_path(index_path),
                 "profile": index["profile"],
+                "dtype": index["dtype"],
                 "attention_backend": index["attention_backend"],
                 "prompt_sha256": index["prompt_sha256"],
             }
@@ -829,7 +946,8 @@ def build_fixture_manifest(
         "format_version": TRACE_FORMAT_VERSION,
         "model_id": MODEL_ID,
         "revision": PINNED_REVISION,
-        "generator_commit": git_commit(),
+        **provenance.record(),
+        "profile_matrix": sorted(PROFILES),
         "oracle_floor_sha256": oracle_floor_sha256,
         "fixtures": fixtures,
         "auxiliary": {
@@ -850,6 +968,9 @@ def verify_fixture_root(root: Path, oracle_floor: Path | None) -> int:
             raise TraceError("fixture manifest format_version is unsupported")
         if manifest.get("model_id") != MODEL_ID or manifest.get("revision") != PINNED_REVISION:
             raise TraceError("fixture manifest model identity does not match the pinned wedge")
+        manifest_provenance = validated_provenance(manifest)
+        if manifest.get("profile_matrix") != sorted(PROFILES):
+            raise TraceError("fixture manifest does not declare the complete profile matrix")
         fixtures = manifest.get("fixtures")
         if not isinstance(fixtures, list) or not fixtures:
             raise TraceError("fixture manifest has no fixtures")
@@ -859,18 +980,23 @@ def verify_fixture_root(root: Path, oracle_floor: Path | None) -> int:
         floor_prefixes: dict[str, int] | None = None
         if oracle_floor is not None:
             observed_floor_digest, floor_prefixes = stable_prefixes_from_floor(oracle_floor)
-            if observed_floor_digest != expected_floor_digest:
+            if not hmac.compare_digest(observed_floor_digest, expected_floor_digest):
                 raise TraceError(
                     f"oracle floor digest mismatch expected={expected_floor_digest} observed={observed_floor_digest}"
                 )
         seen_indices: set[str] = set()
+        prompt_sets_by_profile: dict[str, set[str]] = {profile_name: set() for profile_name in PROFILES}
         fixture_count = 0
         for fixture in fixtures:
             if not isinstance(fixture, dict):
                 raise TraceError("fixture manifest has a non-object fixture")
             relative_text = fixture.get("trace_index")
             expected_index_digest = fixture.get("trace_index_sha256")
-            if not isinstance(relative_text, str) or not isinstance(expected_index_digest, str):
+            if (
+                not isinstance(relative_text, str)
+                or not isinstance(expected_index_digest, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", expected_index_digest)
+            ):
                 raise TraceError("fixture manifest has an incomplete trace index descriptor")
             if relative_text in seen_indices:
                 raise TraceError(f"fixture manifest repeats trace index={relative_text}")
@@ -879,16 +1005,20 @@ def verify_fixture_root(root: Path, oracle_floor: Path | None) -> int:
             if not index_path.is_file() or index_path.is_symlink():
                 raise TraceError(f"fixture trace index missing or not regular: {relative_text}")
             observed_index_digest = sha256_path(index_path)
-            if observed_index_digest != expected_index_digest:
+            if not hmac.compare_digest(observed_index_digest, expected_index_digest):
                 raise TraceError(
                     f"fixture trace index digest mismatch path={relative_text} "
                     f"expected={expected_index_digest} observed={observed_index_digest}"
                 )
             index = read_json(index_path)
+            if not hmac.compare_digest(canonical_json(validated_provenance(index)), canonical_json(manifest_provenance)):
+                raise TraceError(f"fixture trace index={relative_text} has mismatched provenance")
             profile_name = index.get("profile")
             if profile_name not in PROFILES:
                 raise TraceError(f"fixture trace index has unknown profile={profile_name!r}")
             profile = PROFILES[str(profile_name)]
+            if index.get("dtype") != profile.torch_dtype_name:
+                raise TraceError(f"fixture profile={profile.name} has an incorrect dtype")
             if index.get("attention_backend") != profile.attention_backend:
                 raise TraceError(f"fixture profile={profile.name} has an incorrect attention backend")
             if index.get("variance_only") is not profile.variance_only:
@@ -905,18 +1035,62 @@ def verify_fixture_root(root: Path, oracle_floor: Path | None) -> int:
             contract = index.get("greedy_contract")
             if not isinstance(greedy, list) or not all(isinstance(token, int) for token in greedy):
                 raise TraceError(f"fixture={relative_text} has invalid greedy tokens")
+            sampled_streams = index.get("sampled_streams")
+            if not isinstance(sampled_streams, list) or not sampled_streams:
+                raise TraceError(f"fixture={relative_text} has no sampled distributional streams")
+            observed_sample_seeds: set[int] = set()
+            for sample in sampled_streams:
+                if not isinstance(sample, dict):
+                    raise TraceError(f"fixture={relative_text} has a non-object sample stream")
+                seed = sample.get("seed")
+                tokens = sample.get("tokens")
+                if (
+                    not isinstance(seed, int)
+                    or seed < 0
+                    or seed in observed_sample_seeds
+                    or sample.get("sampling") != "cpu-torch-multinomial-temperature-1.0"
+                    or sample.get("distributional_only") is not True
+                    or not isinstance(tokens, list)
+                    or not all(isinstance(token, int) for token in tokens)
+                ):
+                    raise TraceError(f"fixture={relative_text} has an invalid sampled distributional stream")
+                observed_sample_seeds.add(seed)
             if not isinstance(contract, dict):
                 raise TraceError(f"fixture={relative_text} has no greedy contract")
             stable_prefix = contract.get("stable_prefix_length")
             if not isinstance(stable_prefix, int) or stable_prefix < 0 or stable_prefix > len(greedy):
                 raise TraceError(f"fixture={relative_text} has an invalid stable prefix length")
-            if contract.get("status") != "frozen" or contract.get("oracle_floor_sha256") != expected_floor_digest:
+            contract_floor_digest = contract.get("oracle_floor_sha256")
+            if (
+                contract.get("status") != "frozen"
+                or not isinstance(contract_floor_digest, str)
+                or not hmac.compare_digest(contract_floor_digest, expected_floor_digest)
+            ):
                 raise TraceError(f"fixture={relative_text} is not frozen against this oracle floor")
             prompt_digest = index.get("prompt_sha256")
-            if floor_prefixes is not None:
-                if not isinstance(prompt_digest, str) or floor_prefixes.get(prompt_digest) != stable_prefix:
-                    raise TraceError(f"fixture={relative_text} stable prefix disagrees with oracle floor")
+            if not isinstance(prompt_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", prompt_digest):
+                raise TraceError(f"fixture={relative_text} has an invalid prompt SHA-256")
+            prompt_sets_by_profile[profile.name].add(prompt_digest)
+            fixture_prompt_digest = fixture.get("prompt_sha256")
+            if (
+                fixture.get("profile") != profile.name
+                or fixture.get("dtype") != profile.torch_dtype_name
+                or fixture.get("attention_backend") != profile.attention_backend
+                or not isinstance(fixture_prompt_digest, str)
+                or not hmac.compare_digest(fixture_prompt_digest, prompt_digest)
+            ):
+                raise TraceError(f"fixture manifest descriptor disagrees with trace index={relative_text}")
+            if floor_prefixes is not None and floor_prefixes.get(prompt_digest) != stable_prefix:
+                raise TraceError(f"fixture={relative_text} stable prefix disagrees with oracle floor")
             fixture_count += 1
+        expected_prompt_digests = prompt_sets_by_profile["hf-bf16-eager"]
+        if not expected_prompt_digests or any(
+            not same_digest_set(prompt_digests, expected_prompt_digests)
+            for prompt_digests in prompt_sets_by_profile.values()
+        ):
+            raise TraceError("fixture profile matrix does not cover an identical non-empty prompt corpus")
+        if fixture_count != len(PROFILES) * len(expected_prompt_digests):
+            raise TraceError("fixture profile matrix has duplicate or missing prompt/profile traces")
         auxiliary = manifest.get("auxiliary")
         if not isinstance(auxiliary, dict):
             raise TraceError("fixture manifest has no auxiliary fixture descriptor")
@@ -928,11 +1102,15 @@ def verify_fixture_root(root: Path, oracle_floor: Path | None) -> int:
         if not auxiliary_path.is_file() or auxiliary_path.is_symlink():
             raise TraceError("auxiliary fixture is missing or not a regular file")
         observed_auxiliary_digest = sha256_path(auxiliary_path)
-        if observed_auxiliary_digest != auxiliary_digest:
+        if not isinstance(auxiliary_digest, str) or not hmac.compare_digest(observed_auxiliary_digest, auxiliary_digest):
             raise TraceError(
                 f"auxiliary fixture digest mismatch expected={auxiliary_digest} observed={observed_auxiliary_digest}"
             )
         auxiliary_payload = read_json(auxiliary_path)
+        if not hmac.compare_digest(canonical_json(validated_provenance(auxiliary_payload)), canonical_json(manifest_provenance)):
+            raise TraceError("auxiliary fixture has mismatched provenance")
+        if auxiliary_payload.get("profile_matrix") != sorted(PROFILES):
+            raise TraceError("auxiliary fixture does not declare the complete profile matrix")
         if not isinstance(auxiliary_payload.get("tokenizer_cases"), list) or not isinstance(
             auxiliary_payload.get("template_cases"), list
         ):
@@ -1030,8 +1208,10 @@ def run_trace(
     selftest: bool = False,
     allow_existing_output: bool = False,
     prompts_override: Sequence[str] | None = None,
+    sample_seeds: Sequence[int] = (),
     oracle_floor_sha256: str | None = None,
     stable_prefixes: dict[str, int] | None = None,
+    provenance: FixtureProvenance | None = None,
 ) -> int:
     model_source = args.model_source
     if model_source is None or not model_source.is_dir():
@@ -1040,6 +1220,8 @@ def run_trace(
     try:
         profile = PROFILES[args.profile]
         oracle_digest = closure_digest(args.repo_root)
+        if provenance is not None and not hmac.compare_digest(oracle_digest, provenance.oracle_closure_sha256):
+            raise TraceError("fixture provenance oracle closure digest changed during generation")
         torch_module, tokenizer, model = load_oracle(profile, model_source)
         prompts = list(prompts_override) if prompts_override is not None else args.prompt or list(DEFAULT_PROMPTS)
         output_root = args.output.resolve()
@@ -1054,8 +1236,8 @@ def run_trace(
                 stable_prefix = stable_prefixes.get(prompt_digest)
                 if stable_prefix is None:
                     raise TraceError(f"oracle floor has no stable prefix for prompt_sha256={prompt_digest}")
-            prefill, append, greedy, logits = capture_prompt(
-                torch_module, tokenizer, model, prompt, args.max_new_tokens
+            prefill, append, greedy, sampled, logits = capture_prompt(
+                torch_module, tokenizer, model, prompt, args.max_new_tokens, sample_seeds
             )
             compare_untraced(torch_module, tokenizer, model, prompt, args.max_new_tokens, logits, greedy)
             written = write_trace_bundle(
@@ -1066,10 +1248,12 @@ def run_trace(
                 prefill,
                 append,
                 greedy,
+                sampled,
                 logits,
                 oracle_digest,
                 oracle_floor_sha256,
                 stable_prefix,
+                provenance,
             )
             index_payload = read_json(written)
             taps, norms, kv_slots = trace_counts(index_payload)
@@ -1133,32 +1317,47 @@ def run_generate(args: argparse.Namespace) -> int:
         log("REF_FIXTURES", "RESULT=SKIPPED_NO_MODEL fixtures=0 missing=source-closure")
         return 0
     try:
+        if args.profile != "all":
+            raise TraceError("--generate requires --profile all for the complete comparison matrix")
         corpus = load_fixture_inputs(args.corpus)
         floor_digest, stable_prefixes = stable_prefixes_from_floor(args.oracle_floor)
         prompts = corpus["prompts"]
-        assert isinstance(prompts, list)
+        sample_seeds = corpus["sampled_seeds"]
+        if not isinstance(prompts, list) or not isinstance(sample_seeds, list):
+            raise TraceError("fixture input corpus changed shape after validation")
+        generator_commit = git_commit()
+        if not re.fullmatch(r"[0-9a-f]{40}", generator_commit):
+            raise TraceError("cannot receipt fixture generation without a Git commit")
+        provenance = FixtureProvenance(
+            corpus_sha256=sha256_path(args.corpus),
+            oracle_closure_sha256=closure_digest(args.repo_root),
+            generator_commit=generator_commit,
+            generation_command=tuple(sys.argv),
+        )
         output_root = args.output.resolve()
         if output_root.exists() and any(output_root.iterdir()):
             raise TraceError(f"fixture output directory must be absent or empty: {output_root}")
-        selected_profiles = tuple(PROFILES) if args.profile == "all" else (args.profile,)
+        selected_profiles = tuple(PROFILES)
         for index, profile_name in enumerate(selected_profiles):
             args.profile = profile_name
             status = run_trace(
                 args,
                 allow_existing_output=index > 0,
                 prompts_override=prompts,
+                sample_seeds=sample_seeds,
                 oracle_floor_sha256=floor_digest,
                 stable_prefixes=stable_prefixes,
+                provenance=provenance,
             )
             if status != 0:
                 log("REF_FIXTURES", "RESULT=FAIL fixtures=0 missing=trace-capture")
                 return status
         tokenizer = load_slow_tokenizer(args.model_source)
-        auxiliary_path = capture_auxiliary_fixtures(output_root, tokenizer, corpus)
+        auxiliary_path = capture_auxiliary_fixtures(output_root, tokenizer, corpus, provenance)
         trace_indices = tuple(sorted(output_root.glob("*/prompt-*/trace.json")))
         if not trace_indices:
             raise TraceError("profile generation produced no trace index files")
-        manifest_path = build_fixture_manifest(output_root, trace_indices, auxiliary_path, floor_digest)
+        manifest_path = build_fixture_manifest(output_root, trace_indices, auxiliary_path, floor_digest, provenance)
         log(
             "REF_FIXTURES",
             f"manifest path={manifest_path.relative_to(output_root)} sha256={sha256_path(manifest_path)} "

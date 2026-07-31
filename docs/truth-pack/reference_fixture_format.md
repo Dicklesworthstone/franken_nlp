@@ -21,11 +21,12 @@ scripts/gen_reference_fixtures.py --verify \
 
 ## Matrix and authority
 
-The generator writes `hf-bf16-eager`, `diagnostic-f32`, and
-`hf-bf16-sdpa`.  Every trace index names its profile, dtype, and attention
-backend.  Eager bf16 owns HF-match claims; diagnostic f32 is a structural
-bisect surface only; SDPA carries `variance_only: true` and cannot redefine
-eager semantics.
+The generator requires `--profile all` and writes `hf-bf16-eager`,
+`diagnostic-f32`, and `hf-bf16-sdpa`; verification rejects a partial or
+uneven prompt/profile matrix.  Every trace index names its profile, dtype,
+and attention backend.  Eager bf16 owns HF-match claims; diagnostic f32 is a
+structural bisect surface only; SDPA carries `variance_only: true` and cannot
+redefine eager semantics.
 
 The repository-authored input corpus covers ordinary/multilingual/code/marker
 tokenization and the chat-template mode matrix: default system text, thinking
@@ -60,11 +61,19 @@ stable prefix length for that prompt.  `oracle_floor.json` provides a
 length.  A fixture with an unbound or mismatched floor digest is rejected; it
 cannot be presented as an exact golden.
 
+Every generated trace, `auxiliary.json`, and `manifest.json` carries the
+input-corpus SHA-256, oracle-closure SHA-256, generator commit, and exact
+generation command.  Trace indexes additionally carry the prompt digest.
+Each corpus prompt records the fixed-seed CPU multinomial streams from
+`sampled_seeds`; they are explicitly `distributional_only` and never greedy
+parity gates.
+
 `manifest.json` hashes every trace index and `auxiliary.json`.  The verifier
 rejects an unknown profile tag, unexpected attention backend, stale digest,
 unsafe/duplicate sidecar path, malformed shape/byte length, incomplete
-44-slot/2-norm/KV inventory, missing frozen prefix, or a variance file without
-its explicit tag.  It has no model dependency and ends with:
+44-slot/2-norm/KV inventory, an incomplete profile matrix, missing frozen
+prefix, provenance mismatch, malformed sampled stream, or a variance file
+without its explicit tag.  It has no model dependency and ends with:
 
 ```text
 REF_FIXTURES RESULT=PASS|FAIL|SKIPPED_NO_MODEL fixtures=<n> missing=<list>

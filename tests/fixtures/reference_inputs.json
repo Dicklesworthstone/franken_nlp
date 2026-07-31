@@ -4,6 +4,10 @@
     "Return a concise trace label.",
     "A multilingual fixture: cafe, ¡hola!, Привет, 你好."
   ],
+  "sampled_seeds": [
+    17,
+    2718
+  ],
   "tokenizer_cases": [
     {
       "id": "ascii-whitespace",
