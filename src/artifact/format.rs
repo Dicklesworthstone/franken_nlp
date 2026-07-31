@@ -481,8 +481,6 @@ pub fn write(input: &FnlpqWriterInput) -> Result<WrittenFnlpq, FnlpqWriteError> 
         .1;
     let license_bundle_sha256 =
         framed_sha256("fnlpq-license-bundle-v1", &[&license_section.bytes])?;
-    let packing_set_sha256 = packing_set_digest(&input.recipe_id, &packing_sets)?;
-
     let section_hashes: Vec<[u8; 32]> = sections
         .iter()
         .map(|section| {
@@ -492,6 +490,8 @@ pub fn write(input: &FnlpqWriterInput) -> Result<WrittenFnlpq, FnlpqWriteError> 
             )
         })
         .collect::<Result<_, _>>()?;
+    let packing_set_sha256 =
+        packing_set_digest(&input.recipe_id, &packing_sets, &sections, &section_hashes)?;
     let header = build_header(
         input,
         &sections,
@@ -1088,13 +1088,41 @@ fn header_mapping(
 fn packing_set_digest(
     recipe_id: &str,
     packing_sets: &[PackingSetInput],
+    sections: &[SectionPayload],
+    section_hashes: &[[u8; 32]],
 ) -> Result<[u8; 32], FnlpqWriteError> {
+    let section_index: BTreeMap<_, _> = sections
+        .iter()
+        .enumerate()
+        .map(|(ordinal, section)| (section.name.as_str(), ordinal))
+        .collect();
     let digest_view: Vec<_> = packing_sets
         .iter()
-        .map(|set| PackingDigestSet {
-            id: &set.id,
-            section_names: &set.section_names,
-            target: set.target.header_name(),
+        .map(|set| {
+            let mut representations: Vec<_> = set
+                .section_names
+                .iter()
+                .map(|name| {
+                    let ordinal = *section_index
+                        .get(name.as_str())
+                        .expect("packing sections were validated before digest construction");
+                    PackingDigestRepresentation {
+                        byte_cost: sections[ordinal].bytes.len() as u64,
+                        section_name: name,
+                        stored_sha256: hex_lower(&section_hashes[ordinal]),
+                    }
+                })
+                .collect();
+            representations.sort_by(|left, right| {
+                left.section_name
+                    .as_bytes()
+                    .cmp(right.section_name.as_bytes())
+            });
+            PackingDigestSet {
+                id: &set.id,
+                representations,
+                target: set.target.header_name(),
+            }
         })
         .collect();
     let canonical = canonjson::canonical_bytes(&digest_view)
@@ -1282,6 +1310,13 @@ struct HeaderPackingRepresentation {
 #[derive(Serialize)]
 struct PackingDigestSet<'a> {
     id: &'a str,
-    section_names: &'a [String],
+    representations: Vec<PackingDigestRepresentation<'a>>,
     target: &'static str,
+}
+
+#[derive(Serialize)]
+struct PackingDigestRepresentation<'a> {
+    byte_cost: u64,
+    section_name: &'a str,
+    stored_sha256: String,
 }
