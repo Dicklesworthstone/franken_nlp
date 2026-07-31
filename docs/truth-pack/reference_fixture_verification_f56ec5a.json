@@ -1,0 +1,82 @@
+{
+  "capture_provenance": {
+    "generator_commit": "d2db8c5c9e6727ef0f892ec418999e841b1374c6",
+    "generation_command": [
+      "scripts/gen_reference_fixtures.py",
+      "--generate",
+      "--profile",
+      "all",
+      "--model-source",
+      "/Users/jemanuel/.cache/franken_nlp/source/Nanbeige4.2-3B/f56ec5a9650268aa098496734743c25ea778bd2d",
+      "--corpus",
+      "tests/fixtures/reference_inputs.json",
+      "--oracle-floor",
+      "docs/truth-pack/oracle_floor.json",
+      "--output",
+      "tests/fixtures/reference"
+    ]
+  },
+  "fixture_root": {
+    "auxiliary_sha256": "c1d36563b667832c0e3c24b630502cd3edfdaab522de30d245c4fa6fec678bca",
+    "manifest_sha256": "46e1dfbe53407d21c9e7f2c9d80ec1c78e41be17167fd2e43bb28c26b93f8e03",
+    "path": "tests/fixtures/reference"
+  },
+  "inventory": {
+    "fixture_traces": 9,
+    "per_phase": {
+      "kv_slots": 44,
+      "post_layer_slots": 44,
+      "post_loop_norm_states": 2
+    },
+    "profiles": [
+      {
+        "attention_backend": "eager",
+        "dtype": "bfloat16",
+        "id": "hf-bf16-eager",
+        "traces": 3,
+        "variance_only": false
+      },
+      {
+        "attention_backend": "eager",
+        "dtype": "float32",
+        "id": "diagnostic-f32",
+        "traces": 3,
+        "variance_only": false
+      },
+      {
+        "attention_backend": "sdpa",
+        "dtype": "bfloat16",
+        "id": "hf-bf16-sdpa",
+        "traces": 3,
+        "variance_only": true
+      }
+    ],
+    "template_case_ids": [
+      "system-default-no-think",
+      "thinking-preserved",
+      "tool-json",
+      "tool-xml",
+      "media-reminder"
+    ]
+  },
+  "oracle": {
+    "closure_record_sha256": "0661b2e28c22b728ace2e912ef9012bdf085669c5ff3d087fe6dedc63fbf7511",
+    "floor_sha256": "7530b49b907e734464fa8b9bfbccdf7fec31568577ec2bc0909b48c9392ee7ef",
+    "model_id": "Nanbeige/Nanbeige4.2-3B",
+    "revision": "f56ec5a9650268aa098496734743c25ea778bd2d"
+  },
+  "recorded_at": "2026-07-31T16:48:04Z",
+  "schema_version": 1,
+  "verification_replay": {
+    "command": [
+      "/tmp/fnlp-oracle-venv9/bin/python",
+      "scripts/gen_reference_fixtures.py",
+      "--verify",
+      "--output",
+      "tests/fixtures/reference",
+      "--oracle-floor",
+      "docs/truth-pack/oracle_floor.json"
+    ],
+    "result": "PASS"
+  }
+}
