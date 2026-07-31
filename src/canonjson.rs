@@ -949,8 +949,8 @@ impl<'input> Preflight<'input> {
         loop {
             self.skip_whitespace();
             let key = self.scan_string()?;
-            self.check_string_limit(path, &key)?;
             let key_path = path.key(&key);
+            self.check_string_limit(&key_path, &key)?;
             if !keys.insert(key) {
                 return Err(PreflightError::DuplicateKey(key_path));
             }
