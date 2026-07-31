@@ -28,6 +28,23 @@ public line without an active annotation and compares the explicit wording tier
 against the registered state. An annotation labeled `targeted` marks a
 target-state specification; it does not manufacture evidence.
 
+## R4 long-context practicality claims
+
+A public line that makes a context claim above the default 8,192-token cap
+needs the ordinary `fnlp-claim` annotation at `wording=evidenced` **and** this
+single-use companion annotation immediately before the line:
+
+```text
+<!-- fnlp-r4-context: ledger=PERF-EXACT-R4-ROW -->
+```
+
+The named ledger row must be an `R4-long-context` row with `Disposition: won`
+and immutable fixture digests. This binds a positive >8K practicality claim to
+both an evidenced public claim id and the measured R4 receipt. An explicit
+`observed model limit` is not a practicality claim: it may report an upstream
+position limit, but must never be worded as a usability, throughput, or
+admission promise without the R4 pair.
+
 Use `UPDATE_GOLDENS=1` nowhere here: claim registry updates are ordinary
 reviewed JSON diffs. Run `scripts/check_claims.sh` to validate the registry,
 its negative fixtures, and all currently present public surfaces.

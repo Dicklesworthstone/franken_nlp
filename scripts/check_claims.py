@@ -25,6 +25,18 @@ EXPIRY_RE = re.compile(r"(?P<kind>on_change|on_date|before_release): (?P<detail>
 ANNOTATION_RE = re.compile(
     r"fnlp-claim:\s*(?P<claim_id>[a-z][a-z0-9-]{1,79})\s*;\s*wording=(?P<wording>targeted|observed|evidenced|withdrawn)\b"
 )
+R4_CONTEXT_ANNOTATION_RE = re.compile(
+    r"fnlp-r4-context:\s*ledger=(?P<ledger>PERF-[A-Z0-9-]+)\b"
+)
+CONTEXT_WORD_RE = re.compile(r"\b(?:context|ctx)\b", re.IGNORECASE)
+CONTEXT_AMOUNT_RE = re.compile(
+    r"\b(?P<value>\d{1,3}(?:,\d{3})+|\d+)\s*(?P<unit>[kK]|tokens?|tok(?:ens)?|positions?)\b",
+    re.IGNORECASE,
+)
+OBSERVED_MODEL_LIMIT_RE = re.compile(r"\bobserved\s+model(?:-card)?\s+limit\b", re.IGNORECASE)
+PERF_ENTRY_RE = re.compile(r"^## (?P<entry>PERF-[A-Z0-9-]+)\s*$")
+LEDGER_SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+DEFAULT_CONTEXT_CAP = 8_192
 NUMERIC_RE = re.compile(r"(?<![A-Za-z_])\d+(?:[.,]\d+)?(?:\s*(?:%|×|x|tok/s|KiB|MiB|GiB|GB|B))?", re.IGNORECASE)
 SUPERLATIVE_RE = re.compile(
     r"\b(?:best|fastest|faster|smallest|largest|lowest|highest|only|exact|verified|proven|guaranteed|deterministic|secure|safe)\b",
@@ -244,14 +256,101 @@ def is_claim_bearing(line: str) -> bool:
     return bool(NUMERIC_RE.search(line) or SUPERLATIVE_RE.search(line))
 
 
-def scan_surface(path: Path, surface: str, claims: dict[str, dict[str, Any]]) -> tuple[int, int]:
+def eligible_r4_ledger_entries(root: Path) -> set[str]:
+    """Return measured R4 ledger rows eligible to support public context claims."""
+
+    path = root / "docs" / "PERF_LEDGER.md"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise ClaimsError(f"R4 ledger unavailable file={path}: {error}") from error
+
+    entries: dict[str, dict[str, str]] = {}
+    entry_id: str | None = None
+    fields: dict[str, str] = {}
+    for line in lines:
+        match = PERF_ENTRY_RE.fullmatch(line)
+        if match:
+            if entry_id is not None:
+                entries[entry_id] = fields
+            entry_id = match["entry"]
+            fields = {}
+            continue
+        if entry_id is None or not line.startswith("- ") or ": " not in line:
+            continue
+        name, value = line[2:].split(": ", maxsplit=1)
+        fields[name] = value
+    if entry_id is not None:
+        entries[entry_id] = fields
+
+    eligible: set[str] = set()
+    for candidate, fields in entries.items():
+        fixture_hashes = [item.strip() for item in fields.get("Fixture hashes", "").split(",")]
+        if (
+            fields.get("Regime") == "R4-long-context"
+            and fields.get("Disposition") == "won"
+            and fixture_hashes
+            and all(LEDGER_SHA256_RE.fullmatch(item) for item in fixture_hashes)
+        ):
+            eligible.add(candidate)
+    return eligible
+
+
+def context_amount_exceeds_default(line: str) -> bool:
+    """Recognize explicit context quantities above the 8K product default."""
+
+    if CONTEXT_WORD_RE.search(line) is None or OBSERVED_MODEL_LIMIT_RE.search(line):
+        return False
+    for match in CONTEXT_AMOUNT_RE.finditer(line):
+        value = int(match["value"].replace(",", ""))
+        if match["unit"].lower() == "k":
+            value *= 1024
+        if value > DEFAULT_CONTEXT_CAP:
+            return True
+    return False
+
+
+def validate_r4_context_claim(
+    *,
+    path: Path,
+    line_number: int,
+    active: Annotation | None,
+    r4_ledger: str | None,
+    claims: dict[str, dict[str, Any]],
+    eligible_ledgers: set[str],
+) -> None:
+    if active is None:
+        raise ClaimsError(f"file={path}:{line_number} R4 context claim missing fnlp-claim annotation")
+    claim = claims[active.claim_id]
+    if active.wording != "evidenced" or claim["state"] != "evidenced":
+        raise ClaimsError(
+            f"file={path}:{line_number} R4 context claim requires an evidenced claim id={active.claim_id}"
+        )
+    if r4_ledger is None:
+        raise ClaimsError(f"file={path}:{line_number} R4 context claim missing fnlp-r4-context ledger annotation")
+    if r4_ledger not in eligible_ledgers:
+        raise ClaimsError(
+            f"file={path}:{line_number} R4 context ledger={r4_ledger} lacks a won R4 row with fixture digests"
+        )
+
+
+def scan_surface(
+    path: Path,
+    surface: str,
+    claims: dict[str, dict[str, Any]],
+    eligible_r4_ledgers: set[str] | None = None,
+) -> tuple[int, int]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except UnicodeDecodeError as error:
         raise ClaimsError(f"public surface is not UTF-8 file={path}: {error}") from error
     active: Annotation | None = None
+    active_r4_ledger: str | None = None
     annotations = 0
     claim_lines = 0
+    r4_context_lines = 0
+    if eligible_r4_ledgers is None:
+        eligible_r4_ledgers = set()
     for line_number, line in enumerate(lines, start=1):
         match = ANNOTATION_RE.search(line)
         if match:
@@ -270,6 +369,21 @@ def scan_surface(path: Path, surface: str, claims: dict[str, dict[str, Any]]) ->
                     f"offending_wording={active.wording}"
                 )
             continue
+        r4_match = R4_CONTEXT_ANNOTATION_RE.search(line)
+        if r4_match:
+            active_r4_ledger = r4_match["ledger"]
+            continue
+        if context_amount_exceeds_default(line):
+            validate_r4_context_claim(
+                path=path,
+                line_number=line_number,
+                active=active,
+                r4_ledger=active_r4_ledger,
+                claims=claims,
+                eligible_ledgers=eligible_r4_ledgers,
+            )
+            active_r4_ledger = None
+            r4_context_lines += 1
         if not is_claim_bearing(line):
             continue
         claim_lines += 1
@@ -285,7 +399,10 @@ def scan_surface(path: Path, surface: str, claims: dict[str, dict[str, Any]]) ->
                 f"file={path}:{line_number} claim id={active.claim_id} registry_state={claim['state']} "
                 f"offending_wording={active.wording}"
             )
-    log(f"SCAN file={path} surface={surface} annotations={annotations} claim_lines={claim_lines}")
+    log(
+        f"SCAN file={path} surface={surface} annotations={annotations} claim_lines={claim_lines} "
+        f"r4_context_lines={r4_context_lines}"
+    )
     return annotations, claim_lines
 
 
@@ -424,6 +541,38 @@ def run_self_test(root: Path, claims: dict[str, dict[str, Any]]) -> None:
         ),
     )
 
+    r4_claim = copy.deepcopy(next(iter(claims.values())))
+    r4_claim["state"] = "evidenced"
+    r4_claim["evidence_artifact_digests"] = ["a" * 64]
+    r4_claims = {r4_claim["id"]: r4_claim}
+    r4_annotation = Annotation(r4_claim["id"], "evidenced")
+    validate_r4_context_claim(
+        path=Path("in-memory.md"),
+        line_number=1,
+        active=r4_annotation,
+        r4_ledger="PERF-R4-VALID-001",
+        claims=r4_claims,
+        eligible_ledgers={"PERF-R4-VALID-001"},
+    )
+    try:
+        validate_r4_context_claim(
+            path=Path("in-memory.md"),
+            line_number=1,
+            active=r4_annotation,
+            r4_ledger=None,
+            claims=r4_claims,
+            eligible_ledgers={"PERF-R4-VALID-001"},
+        )
+    except ClaimsError as error:
+        if "missing fnlp-r4-context" not in str(error):
+            raise
+    else:
+        raise ClaimsError("self-test R4 context claim without ledger annotation was accepted")
+    if not context_amount_exceeds_default("Measured context window reaches 16K tokens"):
+        raise ClaimsError("self-test R4 context quantity above default was not recognized")
+    if context_amount_exceeds_default("Observed model limit: context supports 262,144 positions"):
+        raise ClaimsError("self-test observed model limit was treated as a practicality claim")
+
     with tempfile.TemporaryDirectory(prefix="fnlp-claims-") as temporary:
         malformed = Path(temporary) / "duplicate.json"
         malformed.write_text('{"schema_version":1,"schema_version":1,"claims":[]}', encoding="utf-8")
@@ -461,8 +610,10 @@ def main() -> int:
         if arguments.check:
             validate_links(root)
             validate_deferred_p7_scope(root)
+            r4_ledgers = eligible_r4_ledger_entries(root)
+            log(f"R4_CONTEXT_GATE eligible_ledgers={len(r4_ledgers)}")
             for surface, path in existing_public_surfaces(root):
-                scan_surface(path, surface, claims)
+                scan_surface(path, surface, claims, r4_ledgers)
                 scanned += 1
     except ClaimsError as error:
         log(f"REJECT detail={error}")
