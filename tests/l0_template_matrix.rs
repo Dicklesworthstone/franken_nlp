@@ -96,6 +96,16 @@ fn typed_rejections_happen_before_the_tokenizer_boundary() {
             .to_string()
             .contains("text, image, image_url, video, or audio")
     );
+
+    let error = Conversation::from_json(
+        r#"{"messages":[{"role":"assistant","content":"","tool_calls":[{"type":"function","function":{"name":"lookup","arguments":"[]"}}]}]}"#,
+    )
+    .expect_err("non-object tool-call arguments must reject");
+    assert!(
+        error
+            .to_string()
+            .contains("tool-call arguments must be a JSON object")
+    );
 }
 
 #[test]
