@@ -8,9 +8,10 @@ use std::{
 
 use franken_nlp::{
     grammar::mask::{
-        ByteState, DetokenizationTransducer, MaskCacheDisposition, MaskCacheError, MaskOracleError,
-        MaskWorkLimits, NANBEIGE_MASK_BYTES_PER_STATE, SchemaMaskCache, SchemaMaskKey,
-        VocabMaskOracle, VocabTrie,
+        ByteState, DetokenizationTransducer, MaskCacheDisposition, MaskCacheError,
+        MaskCacheMaterializationError, MaskOracleError, MaskWorkLimits,
+        NANBEIGE_MASK_BYTES_PER_STATE, SchemaMaskCache, SchemaMaskKey, VocabMaskOracle,
+        VocabTrie,
     },
     tokenizer::{
         bpe::{AddedToken, SpBpeTokenizer},
@@ -329,6 +330,47 @@ fn lazy_schema_cache_materializes_once_then_hits_without_trie_work() {
     assert_eq!(event.disposition, MaskCacheDisposition::Hit);
     assert_eq!(event.cache_bytes_remaining, 0);
     assert_eq!(second, first);
+}
+
+#[test]
+fn lazy_schema_cache_budget_refusal_leaves_no_entry_or_accounting() {
+    let oracle = VocabMaskOracle::new(VocabTrie::from_tokenizer(&tokenizer(), 10).unwrap());
+    let key = SchemaMaskKey {
+        tokenizer_digest: [7; 32],
+        schema_digest: [6; 32],
+        grammar_version: 1,
+    };
+    let mut cache = SchemaMaskCache::new(1);
+    let error = cache
+        .get_or_materialize(
+            key,
+            11,
+            &oracle,
+            &PrefixState::new(b" a"),
+            MaskWorkLimits::default(),
+            |_| true,
+        )
+        .expect_err("a two-byte toy mask cannot enter a one-byte schema cache");
+    assert!(matches!(
+        error,
+        MaskCacheMaterializationError::Cache(MaskCacheError::ByteBudgetExceeded {
+            capacity_bytes: 1,
+            used_bytes: 0,
+            requested_bytes: 2,
+            replacing_bytes: 0,
+        })
+    ));
+    assert_eq!(cache.get(key, 11), None);
+    assert_eq!(
+        cache.stats(),
+        franken_nlp::grammar::mask::MaskCacheStats {
+            schema_entries: 0,
+            state_masks: 0,
+            used_bytes: 0,
+            capacity_bytes: 1,
+        },
+        "failed lazy admission must not publish a partial global mask or consume budget"
+    );
 }
 
 #[test]
