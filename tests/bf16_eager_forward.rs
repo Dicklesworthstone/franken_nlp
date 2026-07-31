@@ -5,9 +5,12 @@ use franken_nlp::native_engine::{
         ATTENTION_SCALE, KV_HEAD_COUNT, QUERY_HEAD_COUNT, QUERY_HEADS_PER_KV_HEAD,
         eager_attention_head, kv_head_for_query, softmax_f32_cast_back,
     },
+    hf_bf16_eager::{
+        HF_BF16_EAGER_PROFILE, HfBf16EagerEngine, HfBf16EagerError, HfBf16EagerWeights,
+    },
     layer::{
-        NANBEIGE_HIDDEN_SIZE, NANBEIGE_INTERMEDIATE_SIZE, NANBEIGE_KV_PROJECTION_SIZE,
-        NANBEIGE_Q_PROJECTION_SIZE,
+        HfBf16EagerLayerWeights, NANBEIGE_HIDDEN_SIZE, NANBEIGE_INTERMEDIATE_SIZE,
+        NANBEIGE_KV_PROJECTION_SIZE, NANBEIGE_Q_PROJECTION_SIZE,
     },
     lmhead::{NANBEIGE_F32_LOGIT_BYTES, NANBEIGE_VOCAB_SIZE, export_logits_f32, greedy_argmax},
     nn::{
@@ -99,6 +102,10 @@ fn bf16_eager_reference_primitives_and_cast_schedule() {
 
     let lm_head = Bf16Matrix::new(3, 2, bf16s(&[1.0, 0.0, 0.0, 2.0, -1.0, -1.0]))
         .expect("tiny untied lm head");
+    assert_eq!(
+        lm_head.row(1).expect("second row exists"),
+        &bf16s(&[0.0, 2.0])
+    );
     let logits = export_logits_f32(&bf16s(&[2.0, 3.0]), &lm_head).expect("matching hidden width");
     assert_eq!(logits, vec![2.0, 6.0, -5.0]);
     assert_eq!(greedy_argmax(&logits), Some(1));
@@ -125,4 +132,40 @@ fn bf16_eager_reference_primitives_and_cast_schedule() {
     );
 
     eprintln!("BF16_EAGER RESULT=PASS taps=0 model_fixture=SKIPPED_NO_MODEL");
+}
+
+#[test]
+fn bf16_eager_engine_refuses_a_non_nanbeige_model_before_cache_allocation() {
+    let scalar = Bf16Matrix::new(1, 1, bf16s(&[1.0])).expect("one scalar");
+    let tiny_layer = HfBf16EagerLayerWeights {
+        input_norm: bf16s(&[1.0]),
+        q_proj: scalar.clone(),
+        k_proj: scalar.clone(),
+        v_proj: scalar.clone(),
+        o_proj: scalar.clone(),
+        post_attention_norm: bf16s(&[1.0]),
+        gate_proj: scalar.clone(),
+        up_proj: scalar.clone(),
+        down_proj: scalar.clone(),
+    };
+    let error = HfBf16EagerEngine::new(
+        HfBf16EagerWeights {
+            embeddings: scalar.clone(),
+            layers: std::array::from_fn(|_| tiny_layer.clone()),
+            final_norm: bf16s(&[1.0]),
+            lm_head: scalar,
+        },
+        1,
+    )
+    .expect_err("a tiny fixture cannot impersonate the single-model wedge");
+    assert!(matches!(
+        error,
+        HfBf16EagerError::ModelMatrixShape {
+            name: "embeddings",
+            expected_rows: NANBEIGE_VOCAB_SIZE,
+            expected_columns: NANBEIGE_HIDDEN_SIZE,
+            ..
+        }
+    ));
+    assert_eq!(HF_BF16_EAGER_PROFILE, "hf-bf16-eager");
 }

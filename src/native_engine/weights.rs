@@ -22,6 +22,8 @@ pub enum WeightShapeError {
     },
     /// An input activation length did not match the matrix column count.
     ProjectionInput { expected: usize, actual: usize },
+    /// A requested row was outside the matrix's output dimension.
+    RowOutOfRange { row: usize, rows: usize },
 }
 
 impl Bf16Matrix {
@@ -60,6 +62,28 @@ impl Bf16Matrix {
     #[must_use]
     pub const fn columns(&self) -> usize {
         self.columns
+    }
+
+    /// Borrows one row without widening its bf16 values.
+    pub fn row(&self, row: usize) -> Result<&[Bf16], WeightShapeError> {
+        let start = row
+            .checked_mul(self.columns)
+            .ok_or(WeightShapeError::RowOutOfRange {
+                row,
+                rows: self.rows,
+            })?;
+        let end = start
+            .checked_add(self.columns)
+            .ok_or(WeightShapeError::RowOutOfRange {
+                row,
+                rows: self.rows,
+            })?;
+        self.values
+            .get(start..end)
+            .ok_or(WeightShapeError::RowOutOfRange {
+                row,
+                rows: self.rows,
+            })
     }
 
     /// Reference f32 accumulation followed by an explicit bf16 activation cast.
