@@ -348,13 +348,14 @@ def validate_installed_closure(record: dict[str, Any]) -> None:
 
 
 def explicit_greedy_decode(model: Any, inputs: dict[str, Any], max_new_tokens: int) -> tuple[Any, list[int]]:
-    """Decode greedily through the pinned model's native tuple KV-cache path.
+    """Decode greedily through the pinned model's direct cache-forward path.
 
-    The archived remote model uses the pre-4.43 tuple-cache API. Transformers
-    4.51's generic ``generate`` upgrades that tuple to ``DynamicCache``, whose
-    removed ``get_max_length`` method makes the generic wrapper fail before a
-    decode token is produced. Calling the model's forward directly preserves
-    the archived source path without patching the source snapshot.
+    The archived remote model's ``prepare_inputs_for_generation`` calls the
+    pre-4.43 ``Cache.get_max_length`` API. Transformers 4.51's ``generate``
+    route reaches that adapter with a ``DynamicCache`` that no longer exposes
+    the method, failing before a decode token is produced. Calling the model
+    forward directly reuses the cache object returned by each prior forward
+    without patching the source snapshot.
     """
     if max_new_tokens < 1:
         raise OracleFailure("smoke max_new_tokens must be positive")
