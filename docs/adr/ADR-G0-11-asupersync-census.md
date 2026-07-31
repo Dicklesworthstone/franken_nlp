@@ -39,6 +39,58 @@ observations and absence records for the following areas:
 | Lab | Same-seed replay, explicit leak policy, and failed-run crashpack replay material are observable. | `lab_determinism.rs` |
 | Bounded exploration/model export | DPOR-style exploration records finite run/class/race/backtrack/saturation coverage; TLA+ behavior and skeleton export are inputs only. | `explorer_tla.rs` |
 
+## Complete verdict ledger — source inventory, not acceptance evidence
+
+This table is the complete OQ-35 item inventory as of the recorded source
+state. `RATIFIED (source-only)` means only that the hash-addressed committed
+probe expresses the stated pin observation; it is **not** a target execution,
+retained raw transcript, DSR result, closure manifest, independent review, or
+product-adoption decision. `ABSENT_WITH_FALLBACK` means no such surface exists
+in this tree and names the required project-level replacement. Nothing in this
+table authorizes a bead closure or a dependent scheduler, daemon, job, pull,
+oracle-fixture, or parity claim.
+
+Source-digest key:
+
+| Key | SHA-256 | Source |
+| --- | --- | --- |
+| R | `08a1021d83e728115e151a00d84061a87907654f9451b1a96a87f3a5a8c15568` | `tests/g0/asupersync_census/runtime_semantics.rs` |
+| C | `abae26b3c891eec6d1286320fd04914b9d981966cbada64c51ec16f078f9bd50` | `tests/g0/asupersync_census/compile_fail.rs` |
+| W | `a4fe807d006e05bf26c48c222829698fc0654c4af0fc514b0270d1aa00d89f0a` | `tests/g0/compile_fail/capability_widening.rs` |
+| N | `a60d3a1da485b6cfc7313def50a146052d6ec0ec15bb14cc5be8d76584b9c724` | `tests/g0/compile_fail/cx_current_regain.rs` |
+| G | `85b88cdca830fed52ddc6cd46080128d8dc31109753b04dab278de05cf652567` | `tests/g0/asupersync_census/gen_server_semantics.rs` |
+| L | `a985054524f5c0faa410a62dbdf8ecc502220954e023149f149c3f016603334d` | `tests/g0/asupersync_census/lab_determinism.rs` |
+| E | `06f4a3d0323650704cf91d21a375cf2227e644b22fbe395c875e6e987cfef490` | `tests/g0/asupersync_census/explorer_tla.rs` |
+
+`no artifact` is itself a negative inventory result, not a digest omission: no
+committed source or retained receipt exists to bind the corresponding claim.
+
+| Contract item | Verdict | Source digest or gap | Required fallback / limit |
+| --- | --- | --- | --- |
+| Static `Cx::restrict` narrowing | RATIFIED (source-only) | C + W | Pass an explicit narrowed `Cx`; no product alias is adopted. |
+| Ambient `Cx::current()` least authority | ABSENT_WITH_FALLBACK | R | Explicit narrowed `Cx` parameter; prohibit ambient leaf lookup. |
+| Project capability aliases (pull/inference/greedy/leaf) | ABSENT_WITH_FALLBACK | no artifact | Define and compile-check project aliases before use. |
+| Typed `Budget` and `CapabilityBudget` shapes | RATIFIED (source-only) | R | Pin type presence only; no complete project budget claim. |
+| Project unit conversion and typed-budget meet mapping | ABSENT_WITH_FALLBACK | no artifact | Checked project-unit conversion plus cleanup-reserve cases. |
+| Same-seed Lab replay shape | RATIFIED (source-only) | L | Async-Lab observation only; no native-team inference. |
+| Lab oracle suite, seed-bound chaos, loser drain, cancellation protocol, and `VirtualTcp` | ABSENT_WITH_FALLBACK | no artifact; L does not cover these rows | Add project Lab fixtures and retained replay receipts. |
+| Pin leak-policy values | RATIFIED (source-only) | L | Builder observation only. |
+| Project two-phase reservation/leak-escalation policy | ABSENT_WITH_FALLBACK | no artifact | Owned reservation ledger; panic in lab/CI and logged production escalation. |
+| Runtime preset values | RATIFIED (source-only) | R | Concrete values only; no safe CPU-team sizing decision. |
+| `first_ok_outcomes` classification semantics | RATIFIED (source-only) | R | Classification is not live sequential execution. |
+| `ExecPlan::first_ok` all-child behavior | RATIFIED (source-only) | R | Not a first-success primitive; no loser cancellation claim. |
+| Pull sequential mirror fallback | ABSENT_WITH_FALLBACK | no artifact | Explicit ordered `for`/`await` with per-attempt budgets. |
+| `bracket` normal/drop durability split | ABSENT_WITH_FALLBACK | no artifact | RAII plus explicit await, journal/recovery, and atomic activation. |
+| `GenServer::cast` enqueue acknowledgement | RATIFIED (source-only) | G | Enqueue is not processing or commit acknowledgement. |
+| `GenServer::try_cast` reject/drop-oldest policy | RATIFIED (source-only) | G | Use only declared-lossy streams with counted drops. |
+| Eleven `CancelKind` variants | RATIFIED (source-only) | R | Preserve variants until the product policy boundary. |
+| Bounded DPOR-style exploration | RATIFIED (source-only) | E | Finite guided coverage only; never exhaustive. |
+| TLA+ export | RATIFIED (source-only) | E | Export is input, not a model-check result. |
+| TLC run, version/config/command/result/property/counterexample | ABSENT_WITH_FALLBACK | no artifact | Retain the complete TLC result bundle before a bounded-model-check claim. |
+| Batch-daemon supervision, restart policy, and registry leases | ABSENT_WITH_FALLBACK | no artifact | Explicit region tree and hand-rolled restart-on-error until separately adopted. |
+| Workspace substrates (`franken_kernel`, `franken_evidence`, `franken_decision`, `frankenlab`) | ABSENT_WITH_FALLBACK | no artifact | No silent import; per-substrate audit, ADR, and `SUITE.lock` decision. |
+| Raw `G0_CENSUS` transcript and evidence digest | ABSENT_WITH_FALLBACK | no artifact | Retained hash-addressed transcript plus independent review; remains a closure prerequisite. |
+
 These are narrower than product readiness. In particular, `budget-typed` does
 not freeze a FrankenNLP project-unit conversion, and `obligation-leak-policy`
 does not adopt a production reservation/escalation protocol. The static
