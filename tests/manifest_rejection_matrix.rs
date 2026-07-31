@@ -2,9 +2,10 @@
 
 use franken_nlp::{
     artifact::manifest::{
-        EmbeddedReleaseManifest, FNLPQ_FORMAT_V1, LOCAL_DERIVATION_PACKING_POLICY_V1, PULL_API_V1,
-        RELEASE_MANIFEST_SCHEMA_V1, ReleaseArtifact, ReleaseCompatibility, ReleaseDigests,
-        ReleaseLifecycle, ReleaseManifest, ReleasePart, ReleaseSourceClosure, ReleaseSourceFile,
+        EmbeddedReleaseManifest, FNLPQ_FORMAT_V1, LOCAL_DERIVATION_PACKING_POLICY_V1,
+        NANBEIGE42_INT8_V1_COMPATIBILITY, PULL_API_V1, RELEASE_MANIFEST_SCHEMA_V1, ReleaseArtifact,
+        ReleaseCompatibility, ReleaseDigests, ReleaseLifecycle, ReleaseManifest, ReleasePart,
+        ReleaseSourceClosure, ReleaseSourceFile,
     },
     canonjson,
 };
@@ -19,6 +20,9 @@ fn release_manifest_rejection_matrix() {
     let canonical = valid.canonical_bytes().expect("valid canonical manifest");
     let parsed = ReleaseManifest::parse(&canonical).expect("valid manifest parses");
     assert_eq!(parsed, valid);
+    parsed
+        .validate_for(NANBEIGE42_INT8_V1_COMPATIBILITY)
+        .expect("current binary compatibility accepts the pinned int8 recipe");
     let digest = valid.release_manifest_sha256().expect("manifest digest");
     let embedded = EmbeddedReleaseManifest::new(
         Box::leak(canonical.clone().into_boxed_slice()),
@@ -79,6 +83,13 @@ fn release_manifest_rejection_matrix() {
     let mut bad_format = valid.clone();
     bad_format.compatibility.fnlpq_format = "fnlpq-v0".to_owned();
     cases.push(("format", bad_format, "fnlpq-format-compatibility"));
+
+    let mut incompatible_recipe = valid.clone();
+    incompatible_recipe.compatibility.recipe_id = "nanbeige42-int4-v1".to_owned();
+    let incompatibility = incompatible_recipe
+        .validate_for(NANBEIGE42_INT8_V1_COMPATIBILITY)
+        .expect_err("unlisted future recipe rejects before I/O");
+    assert_eq!(incompatibility.invariant, "recipe-compatibility");
 
     let mut missing_revocation = valid.clone();
     missing_revocation.lifecycle = ReleaseLifecycle {

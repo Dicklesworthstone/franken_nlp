@@ -21,6 +21,10 @@ pub const FNLPQ_FORMAT_V1: &str = "fnlpq-v1";
 /// Native packs are derived locally and never downloaded as an alternative
 /// authority root.
 pub const LOCAL_DERIVATION_PACKING_POLICY_V1: &str = "derive-local-v1";
+/// The sole model identity accepted by the current one-model product wedge.
+pub const NANBEIGE42_MODEL_ID: &str = "Nanbeige4.2-3B";
+/// The exact source revision from which the current artifact family derives.
+pub const NANBEIGE42_SOURCE_REVISION: &str = "f56ec5a9650268aa098496734743c25ea778bd2d";
 
 /// The bounded v1 maximum for the complete canonical manifest.
 pub const MAX_RELEASE_MANIFEST_BYTES: usize = 256 * 1024;
@@ -170,6 +174,37 @@ pub struct ReleaseLifecycle {
     /// Required for `revoked`; absent otherwise.
     pub revocation_reason: Option<String>,
 }
+
+/// Binary-specific compatibility policy applied before a pull may open a
+/// cache path or network request.  The schema parser cannot infer this from
+/// an untrusted manifest: the installed binary supplies its own fixed list of
+/// compatible recipes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManifestCompatibility {
+    /// The one model identity compiled into this binary family.
+    pub model_id: &'static str,
+    /// The source revision this binary is prepared to load.
+    pub source_revision: &'static str,
+    /// Exact accepted immutable recipe identifiers.
+    pub recipes: &'static [&'static str],
+    /// The reader format selected by this binary.
+    pub fnlpq_format: &'static str,
+    /// The pull protocol selected by this binary.
+    pub pull_api: &'static str,
+}
+
+/// Compatibility contract for the currently defined Generic int8 artifact.
+///
+/// A future immutable int4 release must add its own explicit entry during a
+/// versioned binary compatibility change; it cannot inherit this acceptance by
+/// having a superficially valid manifest shape.
+pub const NANBEIGE42_INT8_V1_COMPATIBILITY: ManifestCompatibility = ManifestCompatibility {
+    model_id: NANBEIGE42_MODEL_ID,
+    source_revision: NANBEIGE42_SOURCE_REVISION,
+    recipes: &["nanbeige42-int8-v1"],
+    fnlpq_format: FNLPQ_FORMAT_V1,
+    pull_api: PULL_API_V1,
+};
 
 /// A validated immutable embedded byte bundle supplied by a binary build.
 ///
@@ -340,6 +375,49 @@ impl ReleaseManifest {
             &self.packing_policy,
         )?;
         self.validate_lifecycle()
+    }
+
+    /// Check this structurally valid manifest against the installed binary's
+    /// exact compatibility contract.  A `pull` implementation calls this
+    /// immediately after [`Self::parse`] and before any network or cache I/O.
+    pub fn validate_for(&self, compatibility: ManifestCompatibility) -> Result<(), ManifestError> {
+        self.validate()?;
+        expect_exact(
+            "model-compatibility",
+            "/model_id",
+            compatibility.model_id,
+            &self.model_id,
+        )?;
+        expect_exact(
+            "source-revision-compatibility",
+            "/source_revision",
+            compatibility.source_revision,
+            &self.source_revision,
+        )?;
+        if !compatibility
+            .recipes
+            .iter()
+            .any(|recipe| *recipe == self.compatibility.recipe_id.as_str())
+        {
+            return Err(ManifestError::new(
+                "recipe-compatibility",
+                "/compatibility/recipe_id",
+                compatibility.recipes.join(" or "),
+                &self.compatibility.recipe_id,
+            ));
+        }
+        expect_exact(
+            "fnlpq-format-compatibility",
+            "/compatibility/fnlpq_format",
+            compatibility.fnlpq_format,
+            &self.compatibility.fnlpq_format,
+        )?;
+        expect_exact(
+            "pull-api-compatibility",
+            "/compatibility/pull_api",
+            compatibility.pull_api,
+            &self.compatibility.pull_api,
+        )
     }
 
     fn validate_artifact(&self) -> Result<(), ManifestError> {
