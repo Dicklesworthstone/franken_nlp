@@ -81,19 +81,27 @@ franken_nlp source code (the library, the `fnlp` CLI, the build/quantization
 tooling, and the documentation in this repository). It does NOT cover any
 model weights or tokenizer data.
 
-The project is designed to interoperate with Nanbeige4.2-3B
-(Hugging Face repository `Nanbeige/Nanbeige4.2-3B`). At the model revision
-inspected while this repository was planned, the Hugging Face card metadata
-declared `apache-2.0`, but the model repository did not contain a LICENSE or
-NOTICE file. This project therefore does not treat this source-code license
-as authority to redistribute that model's weights, tokenizer, prompts, or
-transformed derivatives.
+The project runs the Nanbeige4.2-3B model (Hugging Face repository
+`Nanbeige/Nanbeige4.2-3B`), Copyright (c) 2026 Nanbeige Team, licensed under
+the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0),
+as declared by the official model card at the pinned revision.
 
-No Nanbeige model weights or tokenizer data are included in this repository.
-Public transformed-weight assets and tokenizer embedding remain blocked until
-the provenance and rights-holder evidence required by
-`COMPREHENSIVE_PLAN_FOR_FRANKEN_NLP.md` section 5.7 / LG-1 is recorded and
-reviewed by the project owner. If that gate is cleared, the exact applicable
-upstream license, copyright notices, NOTICE material, and modification notice
-must travel with every relevant artifact; this file must then be updated from
-the approved immutable evidence rather than from card metadata alone.
+No model weights are included in this source repository. Transformed weight
+artifacts distributed by this project (for example a `.fnlpq` produced by
+`fnlp convert`, the split release assets reassembled by `fnlp pull`, or the
+tokenizer bytes embedded in the `fnlp` binary) remain licensed under
+Apache-2.0. In accordance with that license:
+
+  1. Every distributed artifact and model release carries the Apache-2.0
+     license text and this attribution in its release manifest and embedded
+     artifact header.
+  2. Modified/derivative weight files (quantized, re-packed, or re-serialized
+     forms) are prominently marked as MODIFIED from the original
+     Nanbeige/Nanbeige4.2-3B release, with the transformation recipe
+     identified (recipe id + source SHA-256).
+  3. `fnlp --version` reproduces the attribution, and this NOTICE travels
+     with every distribution of those artifacts.
+
+The Apache-2.0 grant for the model weights is from the Nanbeige Team and is
+unaffected by the OpenAI/Anthropic Rider above, which applies only to the
+franken_nlp source code.

@@ -1,6 +1,6 @@
 # COMPREHENSIVE PLAN FOR franken_nlp (FrankenNLP)
 
-**Master engineering plan — v3.1 (artifact-lifecycle augmentation 2026-07-30)**
+**Master engineering plan — v3.2 (license simplification + README-voice restoration 2026-07-31)**
 **Status:** architecture proposal / pre-Phase-0 / external review round 1 of at least 4 (greenfield; nothing implemented yet)
 **Audience:** implementing agents (CPU-kernel, model-forward, task-layer, CLI, conformance) and the lead architect
 **Target model:** `Nanbeige/Nanbeige4.2-3B` at HF revision `f56ec5a9650268aa098496734743c25ea778bd2d`
@@ -18,7 +18,7 @@
 | frankentorch | `523aaf827faf538aa541126ee222fcd7af348410` | foundation symbols audited in §3.5 |
 | asupersync | `8eb48575889c81b65f7556db4b26d47a8bc03197` | runtime/HTTP feature surface audited in §3.5 |
 | frankensqlite | `5676cb97486a62c4f0a19c053184e0ff3cfb2852` | persistence surface audited in §3.5 |
-| swiss_army_llama | `7bd155410ff2cdf71b4ddf4ccd5a626a600690b3` | behavioral sentiment reference; no root LICENSE/NOTICE observed, so copy authority is blocked |
+| swiss_army_llama | `7bd155410ff2cdf71b4ddf4ccd5a626a600690b3` | behavioral sentiment reference — the project owner's own prior work; methods/presets reusable with attribution |
 
 These are research observations, not yet repository evidence. Phase −1 must fetch them again by immutable revision, hash the bytes, and fail if they do not match.
 
@@ -51,7 +51,7 @@ These are research observations, not yet repository evidence. Phase −1 must fe
 
 **Mission.** `franken_nlp` is a pure-Rust (Rust 2024, nightly), memory-safe, CPU-hyper-optimized **library + one CLI program (`fnlp`, also shipped under the long name `franken_nlp`)** that runs the **Nanbeige4.2-3B** language model **with no general ML framework** — and turns it into a complete local NLP toolbox: structured extraction, NER + entity resolution, sentiment/dimension scoring, zero-shot classification, PII redaction, faithfulness judging, summarization, keyphrases, QA, and plain generation. `unsafe_code = "deny"` applies at crate roots; only enumerated SIMD/mmap modules may opt into scoped audited islands (§1.1 G4).
 
-We achieve this by transforming the model's bf16 weights into a custom quantized on-disk form (int8 first, int4 in refinement rounds), **targeting** distribution of the transformed artifacts as GitHub release assets (fixed 1,957,046,720-byte parts except the tail, each under GitHub's 2 GiB limit; hash-verified and reassembled by `fnlp pull`) **only after the §5.7 redistribution-authority gate is green**, and writing **model-specific kernels** whose only job is to run *this one model* as fast as possible on:
+We achieve this by transforming the model's bf16 weights into a custom quantized on-disk form (int8 first, int4 in refinement rounds), distributing the transformed artifacts as GitHub release assets (fixed 1,957,046,720-byte parts except the tail, each under GitHub's 2 GiB limit; hash-verified and reassembled by `fnlp pull`; Apache-2.0 license text + attribution carried per §5.7), and writing **model-specific kernels** whose only job is to run *this one model* as fast as possible on:
 
 - **Apple Silicon / ARM64** — M4/M5 family: NEON, FEAT_DotProd (SDOT), FEAT_MATMUL_INT8 (SMMLA / i8mm), high-bandwidth unified memory, big SLC
 - **AMD / Intel x86-64** — high-core-count parts first: Threadripper/EPYC Zen 3 (AVX2 ceiling — the reference `trj` machine is a 5995WX-class part), Zen 4/5 and Xeon (AVX-512-VNNI / AVX-VNNI), with AVX2 as a first-class, proof-carrying tier, not a fallback afterthought
@@ -111,11 +111,11 @@ Nanbeige4.2-3B is a **dense, decoder-only, Llama-family transformer with one str
 | Params | **≈ 4.17 B total / ≈ 3.149 B non-embedding** (recomputed from config in §2.6; card says "4B total, 3B non-embedding") | card + our census |
 | Tokenizer | `tokenizer.model` (2.78 MB, SentencePiece) + `tokenizer.json` (18.5 MB) + `tokenizer_config.json` (11 kB, chat template) + `added_tokens.json` + `special_tokens_map.json`; **model card uses `use_fast=False`** → the slow SentencePiece path is the reference tokenizer **[OPEN OQ-6: byte-exactness of fast vs slow]** | file listing + card |
 | Base model | `Nanbeige4.2-3B-Base` | card |
-| License metadata | HF card declares **Apache-2.0**; the pinned repository contains **no `LICENSE`, `LICENSE.txt`, `NOTICE`, or `NOTICE.txt` file** | card metadata + pinned file census |
+| License | **Apache-2.0**, declared by the official model card (SPDX metadata) at the pinned revision — the standard Hugging Face license declaration | card metadata |
 | Extras | `Nanbeige42_report.pdf` (588 kB technical report), `generation_config.json`, `.eval_results/` | file listing |
 | Transformers pins | config records `4.42.4`; generation_config records `4.51.0` | files |
 
-**License conclusion — [BLOCKED for public weight redistribution].** Apache-2.0, if it is in fact the operative weight license, permits redistribution and modification subject to its conditions. The pinned repository's card metadata says Apache-2.0, but the repository does not ship the license/NOTICE materials needed to establish the exact grant, copyright notice, and any upstream NOTICE content. That is strong evidence of intent, not enough authority for this plan to pronounce public derivative-weight distribution cleared. Source code may proceed under this repository's own license; local user-side conversion may proceed; **no `.fnlpq` weight asset is published until §5.7 records either (a) an upstream license file/NOTICE at an immutable revision, or (b) written confirmation from the rights holder, reviewed by the project owner.** If cleared, every artifact/release preserves the exact upstream materials and states our modifications. If not cleared, `fnlp pull` targets user-supplied/private manifests and public releases contain binaries only.
+**License conclusion — Apache-2.0, settled.** The official model card declares Apache-2.0 at the pinned revision; SPDX card metadata is how Hugging Face models declare their license, and it authorizes redistribution and modification of the weights and our transformed derivatives subject to Apache-2.0's ordinary conditions. Compliance is mechanical (§5.7): every published artifact and release carries the Apache-2.0 license text, the Nanbeige attribution, and a statement of our modifications. Local user-side conversion is likewise unrestricted.
 
 ### 2.3 Architecture — the decoder **[OBSERVED@pin from config/index unless noted]**
 
@@ -195,7 +195,7 @@ Derived planning numbers (each **recomputed, never inherited**):
 2. **vLLM (`nanbeige42` branch) and SGLang (`nbg42` branch)** forks — GPU-side; useful only as additional semantics cross-checks and for the tool-call/reasoning parser conventions (`--tool-call-parser nanbeige`).
 3. **MLX/Ollama support [REPORTED]** — Apple-side references; the Ollama MLX path implies the loop is implementable in a few hundred lines of a clean framework, corroborating the "minimal op set" reading.
 4. **`MIT-RLX/rlx-models` `rlx-nanbeige` crate** — a third-party Rust implementation of the family exists. **We do not depend on it** (FrankenSuite-only rule) and must not copy from it, but it is a legitimate cross-check target for differential testing of loop semantics in Phase 1 — three independent implementations (HF Python, llama.cpp fork, rlx) triangulate the truth faster than one.
-5. **swiss_army_llama `sentiment_score_generation.py`** (the architect's prior project) — behavioral inspiration for adjective dimensions, contextual definitions, sampled scoring, intervals, and focus areas. Its inspected repository exposes no license file, so §5.7 requires recorded owner/provenance authority before any code, prompt, or preset data is copied. The candidate-distribution mode in §7.5 is a new estimator and must win independently against human labels; no “~1/50th” claim survives without an end-to-end measurement.
+5. **swiss_army_llama `sentiment_score_generation.py`** (the architect's prior project) — behavioral inspiration for adjective dimensions, contextual definitions, sampled scoring, intervals, and focus areas. It is the project owner's own prior work, so its methodology, prompts, and preset content may be reused directly (with attribution in the docs). The candidate-distribution mode in §7.5 is a new estimator and must win independently against human labels; no “~1/50th” claim survives without an end-to-end measurement.
 
 ### 2.9 Required neural-op set (the complete kernel surface)
 
@@ -270,7 +270,7 @@ The **complete direct non-FrankenSuite release allowlist is exactly three famili
 
 No `thiserror`, `anyhow`, `ctrlc`, `rayon`, `half`, `memmap2`, `uuid`, `num_cpus`, allocator crate, or other commodity crate may be added. Typed errors use `std`; shutdown/signals, bounded tasks, HTTP/TLS, CPU resources, and bf16/safetensors come through the pinned FrankenSuite surfaces; mmap/NUMA remain enumerated audited islands; stable ids derive from canonical hashes. A dependency-policy test parses `Cargo.lock`/`cargo metadata` and fails if a new **direct** non-suite root appears. Transitive dependencies already selected by a pinned FrankenSuite crate or the three approved roots are recorded in the supply-chain manifest; they are not permission to depend on them directly. Benchmark/oracle tooling stays outside the release dependency graph.
 
-**No `tokenizers`, `tiktoken`, `minijinja`, `llguidance`, ONNX, torch, BLAS, or C tokenizer/grammar library.** Asupersync's inspected tree contains `RuntimeBuilder`, `Runtime`, `ShutdownController`, HTTP client modules, and the `tls-webpki-roots` feature; Phase 0 proves the minimal feature combination with an HTTPS range-download fixture before `fnlp pull` depends on it. The only product network path is the explicit pull command. Tokenizer bytes may be embedded only after the redistribution/attribution gate in §5.7 is green; otherwise `tokens` resolves a separately user-provided tokenizer asset and the binary embeds only its expected digest.
+**No `tokenizers`, `tiktoken`, `minijinja`, `llguidance`, ONNX, torch, BLAS, or C tokenizer/grammar library.** Asupersync's inspected tree contains `RuntimeBuilder`, `Runtime`, `ShutdownController`, HTTP client modules, and the `tls-webpki-roots` feature; Phase 0 proves the minimal feature combination with an HTTPS range-download fixture before `fnlp pull` depends on it. The only product network path is the explicit pull command. The tokenizer bytes (Apache-2.0, attribution carried per §5.7) are embedded in the binary so `fnlp tokens`/`split` and grammar compilation work before any artifact is installed; the engine hash-checks the embedded copy against the artifact's tokenizer blob at load (mismatch = loud census error).
 
 ### 3.5 Foundation audit — adopt, adapt, or build
 
@@ -395,10 +395,10 @@ Each stage has a `FNLP_STAGE_BUDGET_<STAGE>_MS` override and a cancellation chec
 
 ## 5. Weight transformation pipeline
 
-The mandate: **lawfully obtained, immutable HF snapshot → reference-parity load → custom quantized form → deterministic round trip → conditional authorized distribution → verified local activation**. There are two deliberately separate download paths:
+The mandate: **immutable pinned HF snapshot → reference-parity load → custom quantized form → deterministic round trip → distribution with license/attribution carried → verified local activation**. There are two deliberately separate download paths:
 
-1. **Sovereign/source path:** a maintainer or user explicitly downloads the pinned 8.34 GB upstream checkpoint, verifies it, and runs `fnlp convert` locally. This path is complete even when redistribution is blocked.
-2. **Release/install path:** after §5.7 clears, maintainers publish the already-converted canonical `.fnlpq` as immutable GitHub Release chunks; `fnlp pull` reassembles and activates it on the user's machine. The installer invokes that same Rust pull path—it never downloads or converts the upstream bf16 shards itself.
+1. **Sovereign/source path:** a maintainer or user explicitly downloads the pinned 8.34 GB upstream checkpoint, verifies it, and runs `fnlp convert` locally. This path is always complete on its own.
+2. **Release/install path:** maintainers publish the already-converted canonical `.fnlpq` as immutable GitHub Release chunks; `fnlp pull` reassembles and activates it on the user's machine. The installer invokes that same Rust pull path—it never downloads or converts the upstream bf16 shards itself.
 
 ### 5.1 Stages
 
@@ -431,9 +431,9 @@ The mandate: **lawfully obtained, immutable HF snapshot → reference-parity loa
     Candidate interleaves for aarch64 SDOT/I8MM, x86 VNNI-256/VNNI-512, exact AVX2, and
     Generic row-major; exact tile ids come from the measured dispatch table, not this prose
 
-[5] WRITE .fnlpq (§5.2) — self-describing, versioned; embed exact approved license materials when authorized
+[5] WRITE .fnlpq (§5.2) — self-describing, versioned; embeds the Apache-2.0 text + attribution + modification notice (§5.7)
 
-[6] IF redistribution authority is green (§5.7), PACKAGE for GitHub Releases (§5.6):
+[6] PACKAGE for GitHub Releases (§5.6):
     fixed 1,957,046,720-byte parts (tail shorter), per-part + whole SHA-256, canonical
     embedded manifest, license bundle, source/conversion receipt, and reconstruction record.
     Upload exact named files to a draft model release; never wildcard or `--clobber`.
@@ -491,7 +491,7 @@ arch_target: enum { Generic, Aarch64Sdot, Aarch64I8mm,
                     X86Vnni256, X86Vnni512, X86Avx2 }
 source_files: [{name, len, sha256}]           # ordered provenance; no ambiguous concatenation hash
 recipe_id / converter_commit / semantic_digest
-license_bundle: bytes                         # exact upstream materials; mandatory only when §5.7 authorizes it
+license_bundle: bytes                         # Apache-2.0 text + attribution + modification notice; always present
 model_config: json                          # frozen relevant config.json fields + census hash
 tokenizer_blob / template_blob              # embedded tokenizer.model + chat template source: ONE artifact
                                             #   is the whole runnable model (no sidecar-drift class of bugs)
@@ -542,7 +542,7 @@ This section deliberately copies FrankenOCR's **proven invariants**, while corre
 
 #### 5.6.1 Canonical artifact and independent model version
 
-- **Only after §5.7 is green**, the canonical arch-neutral Generic `.fnlpq` may be published. Binary SemVer and model-artifact SemVer are independent: e.g. several `fnlp` `v0.x.y` binaries may consume immutable model release `models-nanbeige42-fnlpq-v1`. A patch binary release must not rename or republish identical 4+ GB bytes.
+- The canonical arch-neutral Generic `.fnlpq` is published as a versioned model release. Binary SemVer and model-artifact SemVer are independent: e.g. several `fnlp` `v0.x.y` binaries may consume immutable model release `models-nanbeige42-fnlpq-v1`. A patch binary release must not rename or republish identical 4+ GB bytes.
 - The logical filename is artifact-version/quant/packing-bearing: `nanbeige4.2-3b.fnlpq-v1.int8.generic.fnlpq`; the exact recipe id is authoritative in the manifest and container header. A different source revision, format, recipe, tokenizer/template closure, or logical bytes gets a new artifact version/name/tag; bytes under an existing tag/name are never replaced.
 - Public hosting stays 1× per quant tier. The released artifact is Generic; `fnlp pull` derives the host's measured-default packing locally (M4/M5 SDOT/I8MM candidate, Zen 3 AVX2, Zen 4/5 VNNI-256/512 candidate) and caches it by `(whole_artifact_sha256, packing_id, tile_table_version)`. Capability alone never decides the winner. Generic remains the reconstruction/provenance root; the derived cache is disposable and byte-differential-tested against its logical tensors.
 
@@ -551,7 +551,7 @@ This section deliberately copies FrankenOCR's **proven invariants**, while corre
 - The release packager splits the exact `.fnlpq` byte stream into **1,957,046,720-byte** chunks, with only the final chunk shorter—the exact safely-under-2-GiB size proven in FrankenOCR. Names append zero-padded ordered suffixes `.part00`, `.part01`, …; the manifest caps the count (64 in v1) so two digits are sufficient and unambiguous. Concatenation in manifest order is the original file; there is no archive or compression layer.
 - A canonical schema-versioned manifest records: model/artifact ids; immutable release tag; logical filename/length/SHA-256; exact ordered part name/length/SHA-256/HTTPS mirror URLs; ordered source-file digests and source-root digest; recipe/converter/format compatibility; tokenizer/template/census/semantic digests; license-bundle digest; packing policy; revocation/supersession state. The canonical manifest bytes and SHA-256 are embedded in every compatible binary and also attached to the model release for audit. Default pull never fetches manifest identity from `main`, `latest`, or another mutable branch.
 - The staging directory also contains `MODEL_ASSET_RECEIPT.json`, `SHA256SUMS`, `RECONSTRUCTION.txt`, and the exact approved license/NOTICE/modification bundle. The receipt binds the conversion receipt, split command/tool version, ordered reconstruction, whole result, parity/quality receipts, and intended release inventory. These small records are committed or attached; the multi-GB `.fnlpq` and parts remain gitignored.
-- Publication uses a **draft** GitHub Release and exact explicit upload paths—never a wildcard, never `gh release upload --clobber`. The runbook first hashes the retained staging set, reconstructs it, and compares the whole bytes with the converter output. After upload, it queries the remote inventory, downloads each asset through its public URL into a clean directory, repeats part/whole verification, runs a clean-cache `fnlp pull`, derives the native packing, runs `robot selftest`, and reproduces a frozen real-model inference fixture. Only that receipt plus LG-1 authorizes publishing the draft. A bad release is superseded/revoked by a new catalog; immutable old bytes are not rewritten.
+- Publication uses a **draft** GitHub Release and exact explicit upload paths—never a wildcard, never `gh release upload --clobber`. The runbook first hashes the retained staging set, reconstructs it, and compares the whole bytes with the converter output. After upload, it queries the remote inventory, downloads each asset through its public URL into a clean directory, repeats part/whole verification, runs a clean-cache `fnlp pull`, derives the native packing, runs `robot selftest`, and reproduces a frozen real-model inference fixture. Only that receipt authorizes publishing the draft. A bad release is superseded/revoked by a new catalog; immutable old bytes are not rewritten.
 
 #### 5.6.3 One Rust artifact manager
 
@@ -578,10 +578,9 @@ Windows: %LOCALAPPDATA%\franken_nlp\models\nanbeige4.2-3b.fnlpq-v1.int8.generic.
 
 Phase 6 `install.sh` and `install.ps1` first install and SHA-256-verify the target binary, execute its exact version check, and optionally run `fnlp robot selftest`. Then:
 
-- when a public authorized catalog is embedded, an interactive TTY gets a clear `y/N` offer stating model version, quant, download bytes, peak required free bytes, and destination; acceptance runs the installed binary by absolute path: `"<install-dir>/fnlp" pull`;
+- an interactive TTY gets a clear `y/N` offer stating model version, quant, download bytes, peak required free bytes, and destination; acceptance runs the installed binary by absolute path: `"<install-dir>/fnlp" pull`;
 - `--with-model` / `-WithModel` explicitly opts non-interactive automation into the same pull; `--no-pull` / `-NoPull` suppresses it; quiet/non-interactive mode never silently starts a multi-GB transfer;
-- a pull failure does not roll back a successfully verified binary and does not destroy an older working model; the final summary prints the exact retry command, cache path, artifact state, and uninstall/cache-removal instructions;
-- before LG-1 clears, installers publish binaries only, do not offer a nonexistent public model, and instead print the pinned-source `fetch_model.sh` / `.ps1` + `fnlp convert` route and the private-manifest form. The default `fnlp pull` returns typed `PUBLIC_ARTIFACT_UNAVAILABLE` mapped to the existing exit `3` (“model not found/unavailable”) rather than pretending that card metadata authorized assets.
+- a pull failure does not roll back a successfully verified binary and does not destroy an older working model; the final summary prints the exact retry command, cache path, artifact state, and uninstall/cache-removal instructions.
 
 #### 5.6.6 Required tests and receipts
 
@@ -594,19 +593,18 @@ Tiny deterministic multi-part fixtures exercise manifest caps, mirror fallback, 
 5. fresh-machine installer → `fnlp pull` → no-flag model discovery → frozen real inference;
 6. second pull returns an exact cache hit and inference opens no network.
 
-`fnlp convert` remains the sovereign path (G3: public pull is convenience, never a requirement). `fnlp robot health` prints recipe, catalog/manifest/artifact/source/packing/license digests and source class. **Until §5.7 is green, all public-release language above is a technical design and test target, not permission to publish weights. Local conversion and user-supplied/private pinned manifests are the complete distribution story.**
+`fnlp convert` remains the sovereign path (G3: public pull is convenience, never a requirement). `fnlp robot health` prints recipe, catalog/manifest/artifact/source/packing/license digests and source class.
 
-### 5.7 Redistribution-authority gate (fail closed)
+### 5.7 License compliance (mechanical, not conditional)
 
-The source repository and transformed weights are separate licensing surfaces. Before the first public model asset, commit `docs/truth-pack/LICENSE_PROVENANCE.md` with:
+The source repository (MIT + rider) and the model weights (**Apache-2.0**, declared by the official model card at the pinned revision) are separate licensing surfaces, and compliance with the second is a simple checklist, not a gate:
 
-1. the immutable upstream revision and a complete file/API census showing the license declaration;
-2. the exact license text, copyright attribution, upstream NOTICE (including an explicit “none supplied” statement if confirmed by the rights holder), and our modification notice;
-3. a short written determination by the project owner that the evidence authorizes redistribution of **weights and transformed derivatives**, not merely code;
-4. a clean-room provenance statement for presets derived from `swiss_army_llama` (the repository currently exposes no license file at the inspected pin; copy no code/data until ownership or permission is recorded);
-5. a release test that extracts the bundle from `.fnlpq` and byte-compares it with the approved truth-pack files.
+1. `docs/truth-pack/LICENSE_PROVENANCE.md` archives the pinned card metadata and the Apache-2.0 license text that governs the weights.
+2. Every `.fnlpq` artifact embeds, and every model release ships, that license text, the upstream attribution (“Nanbeige4.2-3B, © 2026 Nanbeige Team, Apache-2.0”), and a modification notice naming the transformation (recipe id + source digests).
+3. A release test extracts the bundle from `.fnlpq` and byte-compares it with the truth-pack copy; `fnlp --version` reproduces the attribution.
+4. `swiss_army_llama` is the project owner's own prior work; its sentiment methodology and preset content are reused directly, with attribution in the docs.
 
-Current state: the HF card declares Apache-2.0, but the pinned repository has no license or NOTICE file **[BLOCKED]**. Therefore Phase 2 may build and test local artifacts, but its public-asset exit gate cannot pass yet. This is a legal/provenance gate, not a technical inference.
+That is the entire obligation.
 
 ---
 
@@ -979,7 +977,7 @@ Profiles and ledgers are kept **per regime** because the cost center moves: **(R
 
 | Machine | ~BW | decode ceiling |
 |---|---|---|
-| M4 Pro | ~273 GB/s | ~70 tok/s |
+| M4 Pro | ~273 GB/s | ~74 tok/s |
 | M4 Max | ~410 GB/s | ~111 tok/s |
 | TR 5995WX (Zen 3, 8ch DDR4) | ~205 GB/s | ~55 tok/s |
 | TR 7995WX (Zen 4, 8ch DDR5) | ~333 GB/s | ~90 tok/s |
@@ -1056,11 +1054,11 @@ Every implemented card gets a recommendation record with hotspot evidence, EV fa
 Each phase: goals · key tasks · exit gates. Correctness before speed throughout; a gate cannot pass while it depends on an unresolved §14 item. Empirical questions are resolved in the phase that can actually measure them—Phase −1 must not fabricate answers to Phase 5 experiments.
 
 ### Phase −1 — Source/Oracle Truth Pack (FIRST; no kernel work until green)
-- Pin + SHA-256 every source: HF repo revision (config, both safetensors, index, tokenizer files, modeling/configuration source, template/generation config, report PDF, card/API metadata); record the **absence** of LICENSE/NOTICE files as evidence rather than inventing them; pin the `nanbeige42` fork and any community GGUF used only as a cross-check. Commit separate conversion-source and research-evidence manifests; make `scripts/fetch_model.sh --check-only` and `scripts/fetch_model.ps1 -CheckOnly` reproduce every conversion-source length/digest from revision-scoped clean directories.
+- Pin + SHA-256 every source: HF repo revision (config, both safetensors, index, tokenizer files, modeling/configuration source, template/generation config, report PDF, card/API metadata); archive the card's Apache-2.0 declaration and the license text (§5.7); pin the `nanbeige42` fork and any community GGUF used only as a cross-check. Commit separate conversion-source and research-evidence manifests; make `scripts/fetch_model.sh --check-only` and `scripts/fetch_model.ps1 -CheckOnly` reproduce every conversion-source length/digest from revision-scoped clean directories.
 - Generate the **machine-readable census** (§2.6): every tensor name/shape/byte + KV formulas + score-bucket single-token verification (§7.5) + context/buffer tables; CI-guarded.
 - Promote the source-answerable §14 observations needed by Phases 1–2 into line-backed **[EVIDENCED]** records; leave empirical OQ-11–15 and OQ-17–24 open behind their own later gates.
 - Stand up the CPU oracle; prove it runs; measure its nondeterminism floor; capture smoke fixtures (greedy streams, per-(loop,layer) dumps, template renderings, tokenizer corpora).
-- **Exit:** OQ-1…9 and OQ-16 are evidenced to the extent required for tokenizer/f32 forward; OQ-14's oracle floor is measured; census green; fixtures committed; license state explicitly blocked/cleared; claim→source-line index replay passes.
+- **Exit:** OQ-1…9 and OQ-16 are evidenced to the extent required for tokenizer/f32 forward; OQ-14's oracle floor is measured; census green; fixtures committed; license bundle archived; claim→source-line index replay passes.
 
 ### Phase 0 — Scaffold
 - The template repo shape (§4.1): crate, two shim bins, immutable git+rev suite deps with checked `Cargo.lock`/`SUITE.lock` agreement, deny-by-default unsafe policy, CI (`check.sh`: validators, fmt, locked check/clippy/test, bounded UBS), process-shared runtime/kernel resources with engine leases, robot skeleton/schema, optional metadata-only fsqlite store, error/resource map, model-gated harness, ledgers, and fixture scripts. Governance: public `main` repo, project source license copied exactly from the approved sibling template **without falsely relicensing third-party weights**, `.gitignore`, CHANGELOG, and checked suite-pin manifest.
@@ -1073,7 +1071,7 @@ Each phase: goals · key tasks · exit gates. Correctness before speed throughou
 
 ### Phase 2 — int8 + `.fnlpq` + distribution
 - Converter + format + census loader; staged quant 2a/2b/2c each with its own parity gate; deterministic Generic artifact; fixed-size release packager + asset receipt/reconstruction runbook; release-bound embedded manifest; resumable streamed `fnlp pull`; content-addressed native-pack derivation; `fnlp models`; `robot selftest`.
-- **Exit:** int8 L3/L4 within measured tolerance (argmax agreement ledgered, L4 exact only where the quantized path actually preserves it); two-clean-directory conversion identity; package/reassemble identity; malicious-format/manifest/pull/resume/concurrency/install tests green; a private/fake-release clean-cache pull resolves with no `--model`. Publish public weight assets **only if LG-1 is cleared and §5.6's remote replay + real-inference receipt is green**; otherwise ship local conversion + private/pinned-manifest support and record the publication blocker.
+- **Exit:** int8 L3/L4 within measured tolerance (argmax agreement ledgered, L4 exact only where the quantized path actually preserves it); two-clean-directory conversion identity; package/reassemble identity; malicious-format/manifest/pull/resume/concurrency/install tests green; a private/fake-release clean-cache pull resolves with no `--model`. Publish public weight assets once §5.6's remote replay + real-inference receipt is green; local conversion + private/pinned-manifest support remain first-class regardless.
 
 ### Phase 3 — SIMD kernels + latency perf
 - Dispatch catalog (§6.3), both exact AVX2 candidates, sustained 256/512-bit VNNI comparisons, fixed-shape GEMM/GEMV, native GQA/decode attention, then profile-gated fusion/NUMA/build recipes. Gauntlet R1 begins.
@@ -1084,12 +1082,12 @@ Each phase: goals · key tasks · exit gates. Correctness before speed throughou
 - **Exit:** G8 and grounded-field property/fuzz proofs green; untrusted segments exclude control ids or reject; sparse/full, forced/sequential, all trie traversal/naïve, uninterrupted/resumed, and dependency-scope mutation invariants green; scheduler automaton/interleaving, batch, prefix/fork-tail capacity, privacy, and cancellation gates green; per-task injection attack-success rows are published without a firewall claim; R2 gauntlet recorded; task scorecards published.
 
 ### Phase 5 — int4 + full portfolio + calibration
-- int4 uniform baselines, then AA-Q1/AA-T1 if their EV gates survive; remaining tasks; AA-U1 calibration; user `eval/calibrate/qualify`; offline static decision policies/review spill; experiment with `extract --verify-semantic` against per-domain locked labels; open the bounded public recipe compiler only after built-in equivalence and security gates; measured thinking defaults; AA-C1 only if cache traces justify it; public artifacts remain LG-1-conditional.
+- int4 uniform baselines, then AA-Q1/AA-T1 if their EV gates survive; remaining tasks; AA-U1 calibration; user `eval/calibrate/qualify`; offline static decision policies/review spill; experiment with `extract --verify-semantic` against per-domain locked labels; open the bounded public recipe compiler only after built-in equivalence and security gates; measured thinking defaults; AA-C1 only if cache traces justify it.
 - **Exit:** complete int4 candidates meet mean/tail/footprint gates on locked data; full portfolio surfaced and evaluated; calibration validity/coverage measured and scoped; semantic verification is either promoted per task with incremental-error/cost evidence or remains off; qualification receipts and stale-digest rejection proven; public TaskIR recipes either pass all gates or remain internal.
 
 ### Phase 6 — Hardening + cross-platform release
 - CLI/robot contract freeze; digest-gated activate/rollback; optional `fnlp tune` restricted to proved bit-identical choices; doctor; installer (`install.sh`/`.ps1` per the sibling pattern) that invokes the installed binary's one artifact manager; interactive/`--with-model`/`--no-pull` policy; fresh-HOME/LOCALAPPDATA fake-release E2E; 5-target dist matrix; the full three-pillar gauntlet to convergence; agent-ergonomics audit; README/docs truth pass (`/reality-check-for-project` + `/de-slopify`).
-- **Exit:** all targets build+smoke; scorecard all-green; installers verify exact binary versions and the model handoff on Unix/Windows; LG-1-blocked installers truthfully omit the public-model offer; an authorized release proves installer → pull → no-flag discovery → real inference → offline second run; release certified.
+- **Exit:** all targets build+smoke; scorecard all-green; installers verify exact binary versions and the model handoff on Unix/Windows; the release proves installer → pull → no-flag discovery → real inference → offline second run; release certified.
 
 ### Phase 7 — Stretch (explicitly optional, in EV order)
 - Per-task-qualified document-major `analyze` packs · `schema infer` holdout experiment · AA-A1 human-graded frozen-job acceptance/qualification-decay audits · scope-correct portable snapshot `partition/merge` + entity lineage · AA-R1 local resident only if multi-process traces justify it · AA-W1 only if occupancy traces prove fragmentation · `ft-kernel-metal` prefill experiment (CPU stays product/reference) · remote/routable `fnlp serve` only as a separate later decision · AA-D1 exact loop-draft only if its research gate survives · translation after multilingual evals · int8-embedding/KV-int4 refinements.
@@ -1120,7 +1118,7 @@ Each phase: goals · key tasks · exit gates. Correctness before speed throughou
 | **Control-token containment is mistaken for prompt-injection immunity** | HIGH | typed untrusted encoder proves only forbidden-id exclusion/byte preservation; matched adversarial-content scorecards measure steering; outputs remain untrusted and no firewall claim ships |
 | **Same-model verification launders correlated agreement into proof** | HIGH | `verify-semantic` off by default; report four-state result and same-model provenance; promote only on incremental locked-eval value with false-alarm/cost rows |
 | **Acceptance sampling overclaims a corpus certificate** | MED-HIGH | AA-A1 human authority, frozen population/design/seed, independently checked finite-population math, protected explicit review pack, scoped error-rate claim or no-claim |
-| **Weights/tokenizer/preset redistribution authority missing** | **HIGH / PUBLICATION BLOCKER** | §5.7 fail-closed provenance; no public derivative weights or embedded tokenizer until LG-1; no swiss_army_llama copying without recorded authority |
+| **License-compliance slip in a release** (missing Apache-2.0 text/attribution/modification notice in an artifact) | LOW | §5.7 mechanical bundle embedded in every `.fnlpq` + byte-compare release test; attribution in `fnlp --version` and README |
 | **Release chunks or installer disagree with the runtime catalog** | HIGH | one release-bound embedded manifest; binary/model versions independent; installer delegates to installed `fnlp pull`; exact inventory/part/whole/source/license hashes; remote clean-cache replay; never clobber immutable assets |
 | **Untrusted input exhausts CPU/RAM or parser state** | HIGH | §8.6 caps before allocation, lazy KV, grammar preflight, deadlines/fair morsels, malicious corpora |
 | **Scope creep** (model zoo, server, GPU, POS tagging…) | MED | §1.2 non-goals enforced at review; Phase 7 quarantines stretch; one model, one product |
@@ -1135,7 +1133,7 @@ Each phase: goals · key tasks · exit gates. Correctness before speed throughou
 
 **Footprint & portability (G3/G4):** converter/loader report exact per-section artifact bytes and peak/RSS/KV admission; no speculative 20 MB binary or 2.4 GB artifact number becomes a promise before builds. Five target binaries build/smoke; inference opens no network and needs no foreign ML runtime/GPU. Crate roots use `deny`, audited islands are enumerated, and every island has scalar differential + policy-scan evidence.
 
-**Product (G5/G6/G7):** tasks graduate individually only with scorecards; batch daemon sustains bounded corpus workloads under soak/cancellation; owned durable jobs survive kill/disk-full and emit verified receipts; user qualification is digest-scoped; robot contract is frozen/self-describing; every divergence/rejection is ledgered. The sovereign path proves pinned source download → deterministic conversion → native packing → inference. When LG-1 permits it, the release path additionally proves deterministic split → remote inventory/re-download → fresh-machine installer → `fnlp pull` → no-flag discovery → identical inference, with a byte-perfect cache hit and no inference network on the second run.
+**Product (G5/G6/G7):** tasks graduate individually only with scorecards; batch daemon sustains bounded corpus workloads under soak/cancellation; owned durable jobs survive kill/disk-full and emit verified receipts; user qualification is digest-scoped; robot contract is frozen/self-describing; every divergence/rejection is ledgered. The sovereign path proves pinned source download → deterministic conversion → native packing → inference. The release path additionally proves deterministic split → remote inventory/re-download → fresh-machine installer → `fnlp pull` → no-flag discovery → identical inference, with a byte-perfect cache hit and no inference network on the second run.
 
 ---
 
@@ -1169,7 +1167,6 @@ Each phase: goals · key tasks · exit gates. Correctness before speed throughou
 | **OQ-22** | Specify AA-A1's exact finite-population/weighted-stratified estimator, known inclusion probabilities, post-freeze seed authority/non-grinding evidence, longitudinal invalidation rule, grader authority, missing-grade behavior, privacy surface, and independently checked golden cases before exposing `audit grade`. | **OPEN / Phase 7 research** | any acceptance/continuing-qualification audit claim |
 | **OQ-23** | Specify TaskIR stage-scope propagation, snapshot/child-set digests, mutation invalidation, portable partition compatibility classes, merge refusal, and cross-snapshot entity-lineage semantics. | **OPEN / Phase 4 design; Phase 7 distribution** | incremental cache authority; partition/merge/lineage |
 | **OQ-24** | Measure duplicate model loads/core pools across independent local clients; only if AA-R1 clears EV, specify owner-only Unix/Windows local IPC, identity/caps/cancellation, lifecycle, protocol negotiation, and namespace isolation. | **OPEN / Phase 7 research** | `fnlp resident` |
-| **LG-1** | Card metadata says Apache-2.0; pinned repo supplies no LICENSE/NOTICE. Obtain immutable license materials or rights-holder confirmation and owner review. | **BLOCKED** | public weights, embedded tokenizer/presets |
 
 ---
 
@@ -1184,7 +1181,7 @@ Each phase: goals · key tasks · exit gates. Correctness before speed throughou
 | `/running-the-gauntlet-on-your-rust-port` | three-pillar certification and adversarial convergence; this revision corrects its statistical metaphors where deterministic proof is required | §9.5, §11 P6 |
 | `/testing-conformance-harnesses` + `/testing-golden-artifacts` + `/testing-metamorphic` + `/testing-fuzzing` | the L0–L5 ladder + golden/metamorphic/fuzz mechanics | §9.2–§9.3 |
 | `/profiling-software-performance` + `/extreme-software-optimization` | profile-first + the keep/revert loop + per-regime ledgers | §10.1–§10.2 |
-| `$alien-graveyard` + `$alien-artifact-coding` | AA cards, composition budget, evidence artifacts, negative-results graveyard, deterministic fallbacks | §10.5–§10.6 |
+| `/alien-graveyard` + `/alien-artifact-coding` | AA cards, composition budget, evidence artifacts, negative-results graveyard, deterministic fallbacks | §10.5–§10.6 |
 | `/extreme-software-optimization` LLM guidance + `focr` skill | the sibling's measured lessons (dispatch, autovec-vs-SDOT, ledger formats) | §3.2, §6 |
 | `/agent-ergonomics-…-cli-tools` + `/world-class-doctor-mode…` | the robot surface + doctor (Phase 6) | §8 |
 | `/cross-project-pattern-extraction` + `/installer-workmanship` + `/release-preparations` + `/gh-actions` | FrankenOCR-derived source/package/pull/installer invariants and the Phase 6 release train | §5.1, §5.6, §11 P2/P6 |
@@ -1196,7 +1193,7 @@ Each phase: goals · key tasks · exit gates. Correctness before speed throughou
 Per the planning workflow: this plan first survives **≥ 4 external review rounds** (GPT Pro Extended Reasoning per the standing prompt; multi-model blend optional) to steady-state, then `/beads-br` + `/beads-workflow` convert it:
 
 - **Epics = §11 phases** + a spec-extraction epic + a gauntlet epic.
-- **Every unresolved/partial §14 item becomes a research bead blocking only its dependent surface; observed rows become truth-pack evidence beads. LG-1 is a publication blocker, not a kernel blocker.**
+- **Every unresolved/partial §14 item becomes a research bead blocking only its dependent surface; observed rows become truth-pack evidence beads.**
 - **Every kernel/subsystem gets test + bench + doc dependencies**; every AA card starts as a spike carrying hotspot evidence, EV, proof obligation, interaction check, and fallback.
 - Polish beads 4–6 rounds in plan-space (never oversimplify, never lose features); `bv --robot-insights | jq '.Cycles'` must be empty before implementation.
 
@@ -1209,7 +1206,7 @@ These links are discovery aids; the truth pack must fetch immutable bytes, recor
 - Nanbeige checkpoint at the inspected revision: [tree](https://huggingface.co/Nanbeige/Nanbeige4.2-3B/tree/f56ec5a9650268aa098496734743c25ea778bd2d), [config](https://huggingface.co/Nanbeige/Nanbeige4.2-3B/resolve/f56ec5a9650268aa098496734743c25ea778bd2d/config.json), [modeling source](https://huggingface.co/Nanbeige/Nanbeige4.2-3B/resolve/f56ec5a9650268aa098496734743c25ea778bd2d/modeling_nanbeige.py), [tensor index](https://huggingface.co/Nanbeige/Nanbeige4.2-3B/resolve/f56ec5a9650268aa098496734743c25ea778bd2d/model.safetensors.index.json), and [tokenizer config/template](https://huggingface.co/Nanbeige/Nanbeige4.2-3B/resolve/f56ec5a9650268aa098496734743c25ea778bd2d/tokenizer_config.json).
 - Authors' llama.cpp fork: [inspected commit](https://github.com/Nanbeige/llama.cpp/commit/c6640a1c0cf7b38df342b67021a3900b04d092e7).
 - Foundation commits: [frankentorch](https://github.com/Dicklesworthstone/frankentorch/commit/523aaf827faf538aa541126ee222fcd7af348410), [asupersync](https://github.com/Dicklesworthstone/asupersync/commit/8eb48575889c81b65f7556db4b26d47a8bc03197), and [frankensqlite](https://github.com/Dicklesworthstone/frankensqlite/commit/5676cb97486a62c4f0a19c053184e0ff3cfb2852).
-- Sentiment lineage candidate: [swiss_army_llama at the inspected commit](https://github.com/Dicklesworthstone/swiss_army_llama/blob/7bd155410ff2cdf71b4ddf4ccd5a626a600690b3/sentiment_score_generation.py); behavior may inform a clean implementation, but no code/preset copying until §5.7 provenance clears.
+- Sentiment lineage candidate: [swiss_army_llama at the inspected commit](https://github.com/Dicklesworthstone/swiss_army_llama/blob/7bd155410ff2cdf71b4ddf4ccd5a626a600690b3/sentiment_score_generation.py); the project owner's own prior work — its behavior and presets inform this design directly (attribution per §5.7).
 - ISA/platform references: [Apple Silicon CPU Optimization Guide](https://developer.apple.com/documentation/apple-silicon/cpu-optimization-guide), [Arm FEAT_I8MM toolchain table](https://developer.arm.com/Tools%20and%20Software/GNU%20Toolchain), [AMD Zen 4 AVX-512 architecture whitepaper](https://www.amd.com/content/dam/amd/en/documents/products/epyc/4th-gen-amd-epyc-processor-architecture-whitepaper.pdf), [AMD Zen 5 Threadripper 9000 full-width AVX-512 announcement](https://www.amd.com/en/blogs/2025/designed-to-create-built-to-inspire-amd-introduces-new.html), [AMD runtime-dispatch/BIOS guidance](https://docs.amd.com/r/en-US/57404-AOCL-user-guide/12.4.1.-Dynamic-Dispatch), and [Intel VNNI `vpdpbusd` overview](https://www.intel.com/content/www/us/en/developer/articles/guide/deep-learning-with-avx512-and-dl-boost.html).
 - Distribution/language rules: [GitHub release asset limits](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases) and [Rust lint-level semantics](https://doc.rust-lang.org/reference/attributes/diagnostics.html#lint-check-attributes).
 

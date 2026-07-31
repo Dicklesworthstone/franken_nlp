@@ -11,7 +11,7 @@ The project is currently in design review. There is no executable release yet.
 - Defined the one-model Rust library and `fnlp` CLI target around Nanbeige4.2-3B.
 - Specified the pinned-source truth pack, loop/KV/norm conformance ladder, custom `.fnlpq` format, CPU kernel campaign, bounded batch engine, and staged NLP task layer.
 - Added first-class Apple M4/M5, exact Zen 3 AVX2, and measured Zen 4/5/Intel AVX-512-VNNI design tracks.
-- Added fail-closed model-license provenance, artifact-integrity, privacy, resource-admission, and evidence-state requirements.
+- Added artifact-integrity, privacy, resource-admission, and evidence-state requirements.
 - Froze direct non-FrankenSuite release dependencies to the owner-approved `clap`, `serde`/`serde_json`, and `sha2` families.
 - Added exact constrained-execution primitives (all-legal row projection, forced causal runs, byte-exact source languages), continuation-trie scoring, and their universal differential-tested fallbacks.
 - Added opt-in durable corpus jobs, user-owned evaluation/calibration/qualification, bounded data-only TaskIR recipes, and explicit authority/privacy boundaries.
@@ -23,4 +23,6 @@ The project is currently in design review. There is no executable release yet.
 - Added byte-certified KV fork-tail admission and exact breadth/depth-first/short-ID/naïve continuation-scoring alternatives for the model's unusually expensive 44-deep cache.
 - Added AA-R1 as trace-gated local resident research for agent-heavy hosts, explicitly without authorizing a routable inference server.
 - Preserved both adversarial cross-scores and both post-duel reaction records with prominent notices distinguishing historical snapshots from the normative v3 plan.
-- Traced FrankenOCR's shipped Baidu model lifecycle and made the Nanbeige equivalent normative: immutable local source fetch, deterministic Generic `.fnlpq` conversion receipts, independent model-artifact versioning, exact 1,957,046,720-byte GitHub Release chunks, release-bound manifests, streamed `fnlp pull` verification/reassembly/native packing, platform cache paths, and installer delegation to the one Rust artifact manager—while retaining LG-1 as a hard no-publication gate.
+- Traced FrankenOCR's shipped Baidu model lifecycle and made the Nanbeige equivalent normative: immutable local source fetch, deterministic Generic `.fnlpq` conversion receipts, independent model-artifact versioning, exact 1,957,046,720-byte GitHub Release chunks, release-bound manifests, streamed `fnlp pull` verification/reassembly/native packing, platform cache paths, and installer delegation to the one Rust artifact manager.
+- Settled model licensing as the declared Apache-2.0 (official model-card metadata at the pinned revision, per owner ruling): removed the former fail-closed LG-1 publication gate everywhere; compliance is the mechanical §5.7 checklist — every artifact/release carries the Apache-2.0 text, Nanbeige attribution, and modification notice, byte-compared by a release test. `swiss_army_llama` is the owner's own prior work; its sentiment methodology/presets are reused directly with attribution.
+- Restored the README to the FrankenSuite as-if-realized voice (the franken_lean form): present tense with an explicit note on tense, trued up as phase gates land; performance numbers remain TARGETED-not-OBSERVED until measured.
