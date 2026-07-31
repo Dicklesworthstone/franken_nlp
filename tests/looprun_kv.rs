@@ -8,14 +8,26 @@ use franken_nlp::native_engine::{
     looprun::{LayerBinding, LayerExecutor, LoopRunner, PositionContext},
 };
 
-#[derive(Default)]
 struct RecordingExecutor {
-    key: [u16; KV_ELEMENTS_PER_POSITION],
-    value: [u16; KV_ELEMENTS_PER_POSITION],
+    key: Vec<u16>,
+    value: Vec<u16>,
     layer_calls: Vec<(usize, usize, usize, PositionContext)>,
     boundary: Option<(usize, i64, PositionContext)>,
     loop_two_entry: Option<(usize, i64, PositionContext)>,
     norm_calls: usize,
+}
+
+impl Default for RecordingExecutor {
+    fn default() -> Self {
+        Self {
+            key: vec![0; KV_ELEMENTS_PER_POSITION],
+            value: vec![0; KV_ELEMENTS_PER_POSITION],
+            layer_calls: Vec::new(),
+            boundary: None,
+            loop_two_entry: None,
+            norm_calls: 0,
+        }
+    }
 }
 
 impl RecordingExecutor {
@@ -114,7 +126,7 @@ fn looprun_kv_contract() {
             assert_eq!(binding.layer_index(), layer_index);
             assert!(std::ptr::eq(
                 binding.weights(),
-                &runner.bindings()[layer_index].weights(),
+                runner.bindings()[layer_index].weights(),
             ));
         }
     }
