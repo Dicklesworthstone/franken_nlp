@@ -703,6 +703,29 @@ pub fn prepare_nanbeige42_input(
     })
 }
 
+/// Prepare the one admitted `fnlp convert` request before any output-side
+/// allocation or staging-file creation.
+///
+/// This is deliberately the command boundary rather than a convenience
+/// wrapper: immutable CLI semantics are rejected before any source I/O, the
+/// checked pinned manifest is authenticated before the source directory is
+/// traversed, and the full closure/census route is established before a later
+/// streaming envelope may plan output bytes.  Successful preparation is not a
+/// conversion result and does not authorize creation of `request.output`.
+pub fn prepare_convert_request(
+    request: &ConvertRequest,
+    panel_cap: u64,
+) -> Result<PreparedConversionInput, ConverterError> {
+    request.validate()?;
+    let manifest = ConversionSourceManifest::load_pinned(&request.source_manifest)?;
+    prepare_nanbeige42_input(
+        &request.source_dir,
+        manifest,
+        request.strict_source_dir,
+        panel_cap,
+    )
+}
+
 impl PreparedConversionInput {
     /// Calculate the pre-conversion footprint from actual parsed panel plans.
     /// The stage/output planner supplies its independently bounded buffers.

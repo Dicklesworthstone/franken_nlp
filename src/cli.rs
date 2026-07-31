@@ -9,6 +9,9 @@ use std::{
 use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::{
+    artifact::converter::{
+        DEFAULT_PANEL_BYTES, ConvertArch, ConverterError, ConvertRequest, prepare_convert_request,
+    },
     artifact::package::{PackageRequest, package_model, verify_model_package},
     error::ErrorCode,
     grammar::{CompileLimits, CompiledSchema, SchemaError, compile_json_schema},
@@ -38,6 +41,34 @@ enum Command {
     Release {
         #[command(subcommand)]
         command: ReleaseSubcommand,
+    },
+    /// Prepare a bounded, canonical Generic conversion from the pinned source closure.
+    Convert {
+        /// Directory containing the pinned ten-file source closure.
+        #[arg(long)]
+        source: PathBuf,
+        /// Authenticated source-closure manifest.
+        #[arg(long)]
+        source_manifest: PathBuf,
+        /// Versioned conversion recipe identity.
+        #[arg(long)]
+        recipe: String,
+        /// Canonical artifact target; only `generic` is admitted.
+        #[arg(long)]
+        arch: String,
+        /// Final canonical `.fnlpq` destination; no output is created until the
+        /// streaming envelope is available.
+        #[arg(short = 'o', long)]
+        output: PathBuf,
+        /// Bypass the later interactive confirmation step.
+        #[arg(long)]
+        yes: bool,
+        /// Reject all otherwise-unrelated source-directory entries.
+        #[arg(long)]
+        strict_source_dir: bool,
+        /// Reserve stdout for versioned robot events once conversion execution lands.
+        #[arg(long)]
+        robot: bool,
     },
 }
 
@@ -132,12 +163,79 @@ fn cli_main_with_reader(
         }
         Some(Command::Schema { command }) => run_schema_command_with_reader(command, schema_input),
         Some(Command::Release { command }) => run_release_command(command),
+        Some(Command::Convert {
+            source,
+            source_manifest,
+            recipe,
+            arch,
+            output,
+            yes,
+            strict_source_dir,
+            robot,
+        }) => run_convert_command(
+            source,
+            source_manifest,
+            recipe,
+            arch,
+            output,
+            yes,
+            strict_source_dir,
+            robot,
+        ),
         None => {
             let mut command = Cli::command();
             let _ = command.print_help();
             println!();
             ExitCode::SUCCESS
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_convert_command(
+    source_dir: PathBuf,
+    source_manifest: PathBuf,
+    recipe_id: String,
+    arch: String,
+    output: PathBuf,
+    yes: bool,
+    strict_source_dir: bool,
+    robot: bool,
+) -> ExitCode {
+    let arch = match ConvertArch::parse(&arch) {
+        Ok(arch) => arch,
+        Err(error) => return emit_convert_refusal(error),
+    };
+    let request = ConvertRequest {
+        source_dir,
+        source_manifest,
+        recipe_id,
+        arch,
+        output,
+        yes,
+        strict_source_dir,
+        robot,
+    };
+
+    match prepare_convert_request(&request, DEFAULT_PANEL_BYTES) {
+        Ok(prepared) => {
+            eprintln!(
+                "CONVERT RESULT=BLOCKED stage=streaming-envelope source-root-sha256={} census-sha256={} tensors={} reason=canonical-v1-writer-requires-an-in-memory-envelope; no-output-created",
+                prepared.source.source_root_sha256,
+                prepared.census_sha256,
+                prepared.census.len(),
+            );
+            ErrorCode::Generic.as_process_exit()
+        }
+        Err(error) => emit_convert_refusal(error),
+    }
+}
+
+fn emit_convert_refusal(error: ConverterError) -> ExitCode {
+    eprintln!("CONVERT RESULT=FAIL stage=admission reason={error}");
+    match error {
+        ConverterError::InvalidConvertArgument { .. } => ErrorCode::Usage.as_process_exit(),
+        _ => ErrorCode::ArtifactIntegrityOrFormatOrVersion.as_process_exit(),
     }
 }
 
@@ -271,7 +369,7 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{Cli, Command, ReleaseSubcommand, cli_main_with_reader};
+    use super::{Cli, Command, cli_main_with_reader};
 
     #[test]
     fn schema_dash_uses_the_injected_reader() {
@@ -328,5 +426,25 @@ mod tests {
                 command: ReleaseSubcommand::VerifyModelPackage { .. }
             })
         ));
+    }
+
+    #[test]
+    fn convert_reference_invocation_requires_every_named_authority() {
+        let convert = Cli::try_parse_from([
+            "fnlp",
+            "convert",
+            "--source",
+            "/models/nanbeige-source",
+            "--source-manifest",
+            "docs/truth-pack/nanbeige4.2-3b.source.json",
+            "--recipe",
+            "nanbeige42-int8-v1",
+            "--arch",
+            "generic",
+            "-o",
+            "nanbeige4.2-3b.fnlpq-v1.int8.generic.fnlpq",
+        ])
+        .expect("reference conversion invocation parses");
+        assert!(matches!(convert.command, Some(Command::Convert { .. })));
     }
 }

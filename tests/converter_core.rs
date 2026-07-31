@@ -2,8 +2,9 @@
 //! model-gated in `scripts/e2e_convert_roundtrip.sh`.
 
 use franken_nlp::artifact::converter::{
-    expected_nanbeige42_census, remap_tensor_name, validate_nanbeige42_census, ConversionReceipt,
-    ConversionSourceManifest, ConvertArch, ConvertRequest, StorageStage,
+    DEFAULT_PANEL_BYTES, ConversionReceipt, ConversionSourceManifest, ConvertArch, ConverterError,
+    ConvertRequest, StorageStage, expected_nanbeige42_census, prepare_convert_request,
+    remap_tensor_name, validate_nanbeige42_census,
 };
 use franken_nlp::artifact::safetensors::TensorCensusEntry;
 
@@ -106,4 +107,23 @@ fn cli_contract_admits_only_recipe_and_generic_arch() {
     };
     request.validate().expect("reference invocation contract");
     assert!(ConvertArch::parse("x86-avx2").is_err());
+}
+
+#[test]
+fn conversion_admission_rejects_the_recipe_before_source_access() {
+    let request = ConvertRequest {
+        source_dir: "/unreachable-source".into(),
+        source_manifest: "/unreachable-manifest.json".into(),
+        recipe_id: "unapproved-recipe".to_owned(),
+        arch: ConvertArch::Generic,
+        output: "artifact.fnlpq".into(),
+        yes: false,
+        strict_source_dir: false,
+        robot: false,
+    };
+
+    assert!(matches!(
+        prepare_convert_request(&request, DEFAULT_PANEL_BYTES),
+        Err(ConverterError::InvalidConvertArgument { argument: "--recipe", .. })
+    ));
 }
