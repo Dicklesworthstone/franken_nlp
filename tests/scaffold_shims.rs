@@ -24,6 +24,10 @@ fn both_bins_expose_the_same_help_surface() {
     assert!(short.status.success());
     assert!(long.status.success());
     assert_eq!(short.stdout, long.stdout);
+    assert!(
+        String::from_utf8_lossy(&short.stdout).contains("Usage: fnlp"),
+        "shared cli_main must normalize argv[0] so both shim entrypoints expose the canonical fnlp help name"
+    );
 }
 
 #[test]
