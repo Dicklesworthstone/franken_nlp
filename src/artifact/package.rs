@@ -1011,8 +1011,8 @@ fn hex_digest(digest: impl AsRef<[u8]>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        PackageError, PackageFile, RELEASE_PART_BYTES, expected_part_count, part_name,
-        reconstruction_text, validate_logical_name,
+        expected_part_count, part_name, reconstruction_text, validate_logical_name, PackageError,
+        PackageFile, RELEASE_PART_BYTES,
     };
 
     #[test]

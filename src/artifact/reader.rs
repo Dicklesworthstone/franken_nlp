@@ -15,6 +15,7 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -1186,7 +1187,8 @@ fn validate_header_relationships(
             }
         }
     }
-    validate_packing_sets(header, sections)
+    validate_packing_sets(header, sections)?;
+    validate_header_identities(bytes, header, sections)
 }
 
 fn validate_scale_range(
@@ -1330,6 +1332,86 @@ fn validate_packing_sets(
         }
     }
     Ok(())
+}
+
+fn validate_header_identities(
+    bytes: &[u8],
+    header: &CheckedHeader,
+    sections: &[CheckedSection],
+) -> Result<(), FnlpqReadError> {
+    let license = sections
+        .iter()
+        .find(|section| section.kind == SectionKind::LicenseBundle)
+        .expect("required singleton kind was checked before identity validation");
+    let license_bytes = stored_bytes(bytes, license)?;
+    let observed_license = framed_sha256("fnlpq-license-bundle-v1", &[license_bytes])
+        .map_err(|error| section_error(license, error.to_string()))?;
+    if hex_lower(&observed_license) != header.license_bundle_sha256 {
+        return Err(section_error(
+            license,
+            "license_bundle_sha256 does not bind exact license bytes",
+        ));
+    }
+
+    let digest_view: Vec<_> = header
+        .packing_sets
+        .iter()
+        .map(|set| {
+            let mut representations: Vec<_> = set
+                .representations
+                .iter()
+                .map(|representation| {
+                    let section = section_for(
+                        sections,
+                        representation.section_ordinal,
+                        "packing digest representation",
+                    )?;
+                    Ok(PackingDigestRepresentation {
+                        byte_cost: representation.byte_cost,
+                        section_name: section.name.as_str(),
+                        stored_sha256: representation.sha256.as_str(),
+                    })
+                })
+                .collect::<Result<_, FnlpqReadError>>()?;
+            representations.sort_by(|left, right| {
+                left.section_name
+                    .as_bytes()
+                    .cmp(right.section_name.as_bytes())
+            });
+            Ok(PackingDigestSet {
+                id: set.id.as_str(),
+                representations,
+                target: set.target.as_str(),
+            })
+        })
+        .collect::<Result<_, FnlpqReadError>>()?;
+    let canonical = canonjson::canonical_bytes(&digest_view)
+        .map_err(|error| header_error("packing_set_sha256", error.to_string()))?;
+    let observed_packing = framed_sha256(
+        "fnlpq-packing-set-v1",
+        &[header.recipe_id.as_bytes(), &canonical],
+    )
+    .map_err(|error| header_error("packing_set_sha256", error.to_string()))?;
+    if hex_lower(&observed_packing) != header.packing_set_sha256 {
+        return Err(header_error(
+            "packing_set_sha256",
+            "does not bind declared targets, byte costs, and section digests",
+        ));
+    }
+    Ok(())
+}
+
+fn stored_bytes<'a>(
+    bytes: &'a [u8],
+    section: &CheckedSection,
+) -> Result<&'a [u8], FnlpqReadError> {
+    let start = usize_from_u64(section.file_offset, "section stored start")?;
+    let end = start
+        .checked_add(usize_from_u64(section.stored_len, "section stored length")?)
+        .ok_or_else(|| section_error(section, "stored-byte end overflow"))?;
+    bytes
+        .get(start..end)
+        .ok_or_else(|| section_error(section, "stored bytes outside owned buffer"))
 }
 
 fn section_for<'a>(
@@ -1563,4 +1645,18 @@ fn section_error(section: &CheckedSection, reason: impl Into<String>) -> FnlpqRe
         name: section.name.clone(),
         reason: reason.into(),
     }
+}
+
+#[derive(Serialize)]
+struct PackingDigestSet<'a> {
+    id: &'a str,
+    representations: Vec<PackingDigestRepresentation<'a>>,
+    target: &'a str,
+}
+
+#[derive(Serialize)]
+struct PackingDigestRepresentation<'a> {
+    byte_cost: u64,
+    section_name: &'a str,
+    stored_sha256: &'a str,
 }
