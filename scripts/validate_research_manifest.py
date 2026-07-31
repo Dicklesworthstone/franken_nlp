@@ -388,8 +388,75 @@ def validate(manifest_path: Path, archive_root: Path, source_repo: Path | None, 
     return len(archived), sorted(set(mismatches))
 
 
+def expect_self_test_failure(callback: Any, expected: str) -> None:
+    """Assert that a deliberately malformed in-memory manifest is rejected."""
+    try:
+        callback()
+    except ManifestError as error:
+        if expected not in str(error):
+            fail(
+                "self-test rejection differed "
+                f"expected_substring={expected!r} observed={str(error)!r}"
+            )
+        return
+    fail(f"self-test expected rejection: {expected}")
+
+
+def self_test() -> int:
+    """Exercise fail-closed manifest invariants without creating mutable evidence files."""
+    valid_census = {
+        "entries": [
+            {
+                "length": 0,
+                "path": "README.md",
+                "sha256": "0" * 64,
+            }
+        ],
+        "file_count": 1,
+        "revision": PINNED_REVISION,
+        "upstream_license_file": None,
+        "upstream_notice_file": None,
+    }
+    validate_top_level(
+        {
+            "kind": "nanbeige4.2-3b-research-truth-pack",
+            "model": {"id": PINNED_MODEL_ID, "revision": PINNED_REVISION},
+            "role_boundary": {
+                "converter_reads_manifest": False,
+                "research_only": True,
+                "runtime_reads_manifest": False,
+            },
+            "schema_version": 1,
+        }
+    )
+    census, mismatches = validate_repository_census(valid_census)
+    if len(census) != 1 or mismatches:
+        fail("self-test valid census did not validate")
+    expect_self_test_failure(
+        lambda: validate_repository_census(
+            {key: value for key, value in valid_census.items() if key != "upstream_license_file"}
+        ),
+        "repository_census missing required null field: upstream_license_file",
+    )
+    expect_self_test_failure(
+        lambda: relative_path("../escape", "self-test path"),
+        "self-test path must not escape its root",
+    )
+    expect_self_test_failure(
+        lambda: required_digest({"sha256": "not-a-digest"}, "sha256", "self-test digest"),
+        "self-test digest.sha256 must be a lowercase SHA-256 hex digest",
+    )
+    log("self_test verdict=PASS checks=4")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="exercise in-memory validator invariants without reading or writing evidence",
+    )
     parser.add_argument(
         "--manifest",
         type=Path,
@@ -417,6 +484,26 @@ def main() -> int:
         help="conversion-source manifest for the required no-role-overlap check",
     )
     args = parser.parse_args()
+    if args.self_test:
+        try:
+            files = self_test()
+            mismatches: list[str] = []
+        except ManifestError as error:
+            files = 0
+            mismatches = [str(error)]
+        if mismatches:
+            for mismatch in mismatches:
+                log(f"FAIL {mismatch}")
+            print(
+                f"RESEARCH_MANIFEST RESULT=FAIL files={files} mismatches={','.join(mismatches)}",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"RESEARCH_MANIFEST RESULT=PASS files={files} mismatches=",
+            file=sys.stderr,
+        )
+        return 0
     try:
         files, mismatches = validate(
             args.manifest,
