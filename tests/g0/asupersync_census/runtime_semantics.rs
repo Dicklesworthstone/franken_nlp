@@ -266,7 +266,10 @@ fn execplan_first_ok_drives_every_child_before_input_order_selection() {
     let execution_cx = Cx::for_testing();
     let selected = poll_immediately_ready(plan.execute_scalar(&execution_cx))
         .expect("all immediate children complete and a success is selected");
-    assert_eq!(selected, 10, "first_ok selects the first input-order success");
+    assert_eq!(
+        selected, 10,
+        "first_ok selects the first input-order success"
+    );
     assert_eq!(
         child_runs.load(Ordering::SeqCst),
         3,
