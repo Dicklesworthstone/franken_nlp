@@ -7,6 +7,7 @@
 use franken_nlp::template::{
     AssistantReasoning, ContentPart, Conversation, Message, MessageContent, MessageRole,
     RenderOptions, TemplateBuilder, ToolCall, ToolDefinition, ToolFormat, ToolResult,
+    DEFAULT_SYSTEM_TEXT, IM_START, MEDIA_REMINDER_TEXT, THINK_END, THINK_START,
 };
 use serde_json::json;
 use std::path::Path;
@@ -161,6 +162,123 @@ fn renderer_is_deterministic_across_typed_modes() {
         first.as_bytes(),
         second.as_bytes(),
     );
+}
+
+#[test]
+fn default_system_and_generation_suffix_are_explicit() {
+    let conversation = Conversation::new(vec![Message::text(MessageRole::User, "hello")]);
+    let thinking = TemplateBuilder::with_options(RenderOptions::default())
+        .render(&conversation)
+        .expect("typed conversation renders");
+    assert!(thinking.starts_with(&format!("{IM_START}system\n{DEFAULT_SYSTEM_TEXT}")));
+    assert!(thinking.ends_with(&format!("{IM_START}assistant\n{THINK_START}\n")));
+
+    let no_thinking = TemplateBuilder::with_options(RenderOptions {
+        enable_thinking: false,
+        ..RenderOptions::default()
+    })
+    .render(&conversation)
+    .expect("typed conversation renders with thinking disabled");
+    assert!(no_thinking.ends_with(&format!("{IM_START}assistant\n")));
+    assert!(!no_thinking.ends_with(THINK_START));
+}
+
+#[test]
+fn media_and_assistant_reasoning_follow_the_selected_mode() {
+    let conversation = Conversation::new(vec![
+        Message {
+            role: MessageRole::User,
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "inspect ".to_owned(),
+                },
+                ContentPart::Video { source: None },
+            ]),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+        },
+        Message::text(MessageRole::Assistant, "<think>private</think>visible"),
+    ]);
+    let preserved = TemplateBuilder::with_options(RenderOptions {
+        add_generation_prompt: false,
+        preserve_thinking: true,
+        ..RenderOptions::default()
+    })
+    .render(&conversation)
+    .expect("assistant leading thinking region is typed");
+    assert!(preserved.contains(MEDIA_REMINDER_TEXT));
+    assert!(preserved.contains(&format!("{THINK_START}private{THINK_END}visible")));
+
+    let stripped = TemplateBuilder::with_options(RenderOptions {
+        add_generation_prompt: false,
+        preserve_thinking: false,
+        ..RenderOptions::default()
+    })
+    .render(&conversation)
+    .expect("assistant leading thinking region can be stripped");
+    assert!(stripped.contains("visible"));
+    assert!(!stripped.contains("private"));
+}
+
+#[test]
+fn tool_branches_and_adjacent_results_are_structurally_distinct() {
+    let tool_call = ToolCall {
+        id: Some("call-1".to_owned()),
+        name: "lookup".to_owned(),
+        arguments: json!({"key":"value"}),
+    };
+    let conversation = Conversation {
+        messages: vec![
+            Message {
+                role: MessageRole::Assistant,
+                content: MessageContent::Text(String::new()),
+                reasoning: None,
+                tool_calls: vec![tool_call],
+                tool_results: Vec::new(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: MessageContent::Text("first".to_owned()),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                tool_results: vec![ToolResult {
+                    tool_call_id: "call-1".to_owned(),
+                    content: "first".to_owned(),
+                }],
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: MessageContent::Text("second".to_owned()),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                tool_results: vec![ToolResult {
+                    tool_call_id: "call-1".to_owned(),
+                    content: "second".to_owned(),
+                }],
+            },
+        ],
+        tools: Vec::new(),
+    };
+    let xml = TemplateBuilder::with_options(RenderOptions {
+        add_generation_prompt: false,
+        tool_format: ToolFormat::Xml,
+        ..RenderOptions::default()
+    })
+    .render(&conversation)
+    .expect("XML branch renders");
+    let json = TemplateBuilder::with_options(RenderOptions {
+        add_generation_prompt: false,
+        tool_format: ToolFormat::Json,
+        ..RenderOptions::default()
+    })
+    .render(&conversation)
+    .expect("JSON branch renders");
+    assert!(xml.contains("<name>lookup</name>"));
+    assert!(json.contains(r#"{"arguments":{"key":"value"},"id":"call-1","name":"lookup"}"#));
+    assert_ne!(xml, json);
+    assert_eq!(xml.matches(&format!("{IM_START}tool\n")).count(), 1);
+    assert!(xml.contains("first</tool_result><tool_result"));
 }
 
 #[test]
