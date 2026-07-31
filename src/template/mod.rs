@@ -279,10 +279,6 @@ impl ContentPart {
             _ => Ok(()),
         }
     }
-
-    fn is_media(&self) -> bool {
-        !matches!(self, Self::Text { .. })
-    }
 }
 
 /// Typed assistant reasoning and the source from which it was obtained.
@@ -593,8 +589,10 @@ fn render_content(content: &MessageContent) -> String {
             for part in parts {
                 match part {
                     ContentPart::Text { text } => output.push_str(text),
-                    media if media.is_media() => output.push_str(MEDIA_REMINDER_TEXT),
-                    _ => unreachable!("all pinned content-part kinds are handled above"),
+                    ContentPart::Image { .. }
+                    | ContentPart::ImageUrl { .. }
+                    | ContentPart::Video { .. }
+                    | ContentPart::Audio { .. } => output.push_str(MEDIA_REMINDER_TEXT),
                 }
             }
             output
@@ -794,6 +792,12 @@ fn parse_message(value: &Value, path: &str) -> Result<Message, TemplateError> {
         &required_string(object, "role", path)?,
         &format!("{path}.role"),
     )?;
+    if role != MessageRole::Tool && object.contains_key("tool_call_id") {
+        return Err(TemplateError::InvalidShape {
+            path: format!("{path}.tool_call_id"),
+            expected: "field valid only for a tool role".to_owned(),
+        });
+    }
     let content = parse_content(
         required_value(object, "content", path)?,
         &format!("{path}.content"),
