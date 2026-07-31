@@ -57,3 +57,30 @@ The fused variant remains **default off** until this row is replaced by a
 measured, profile-scoped winner for its exact `(ISA, shape, regime)` key. A
 slower or non-promoted result remains in this ledger as `rejected`; it is never
 removed merely because the unfused path remains selected.
+
+## PERF-G9MI-R4-ADMISSION-PREFLIGHT
+
+- Claim ID: `none`
+- Evidence: no R4 long-context measurement has been made. The current tree has
+  an admitted-cap RoPE table candidate, but no `fnlp robot plan --ctx --batch
+  --quant` surface, active artifact/packing path, or tested official llama.cpp
+  baseline from which to select an admitted context point and account for the
+  complete process commitment. This row is a fail-closed preflight record, not
+  a measurement of model acceptance, KV practicality, latency, or RSS.
+- Fixture hashes: `pending: R4 fixtures require an exact admitted-memory certificate`
+- CPU feature string: `pending: no host measurement`
+- Command + environment: `n/a: R4 execution waits for the admission, artifact, and official-baseline surfaces`
+- Disposition: `deferred`
+- Regime: `R4-long-context`
+- Host fingerprint: `pending: no host measurement`
+- Artifact recipe + packing + kernel table + load mode: `pending: no runnable artifact or packing set`
+- p50/p95/p99: `pending: no measurement`
+- Fairness controls: `blocked: select every context point from the future admission certificate, then match oracle and official-baseline prompt, precision, thread, load-mode, warmup, and thermal controls`
+- Bandwidth denominator: `measured-dram-bytes`
+
+This row must be replaced—not promoted—only after the retained oracle and
+official-baseline runs provide host-qualified context points, prefill/decode
+distributions, peak RSS, exact KV overhead, admission boundary outcomes, and
+cancellation-observation latency. Until then, the model's observed 262,144
+position limit remains a non-practicality fact and does not authorize a >8K
+claim.
