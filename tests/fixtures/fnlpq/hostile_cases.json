@@ -1,0 +1,26 @@
+{
+  "fixture_schema": "fnlpq-hostile-cases-v1",
+  "format_version": 1,
+  "cases": [
+    {"id": "FNLPG-H001-TRUNCATED-PRELUDE", "stage": "prelude", "mutation": "provide fewer than 80 bytes", "expected_error": "truncated prelude", "required_diagnostic": "prelude range [0,80)", "allocation_rule": "no variable allocation"},
+    {"id": "FNLPG-H002-HEADER-LEN-OVERFLOW", "stage": "prelude", "mutation": "header_len plus directory bytes overflows u64", "expected_error": "header_len/directory arithmetic overflow", "required_diagnostic": "prelude.header_len", "allocation_rule": "no variable allocation"},
+    {"id": "FNLPG-H003-HEADER-OVER-CAP", "stage": "prelude", "mutation": "header_len is 1048577", "expected_error": "header length exceeds cap", "required_diagnostic": "prelude.header_len cap=1048576", "allocation_rule": "no variable allocation"},
+    {"id": "FNLPG-H004-WRONG-FILE-LEN", "stage": "prelude", "mutation": "file_len differs from observed regular-file length", "expected_error": "file length mismatch", "required_diagnostic": "prelude.file_len expected versus observed", "allocation_rule": "no variable allocation"},
+    {"id": "FNLPG-H005-UNKNOWN-REQUIRED-FLAG", "stage": "prelude", "mutation": "set a required_flags bit", "expected_error": "unknown required flag", "required_diagnostic": "prelude.required_flags", "allocation_rule": "no variable allocation"},
+    {"id": "FNLPG-H006-HEADER-SHA-MISMATCH", "stage": "header", "mutation": "change one header byte without changing header_sha256", "expected_error": "header digest mismatch", "required_diagnostic": "prelude.header_sha256", "allocation_rule": "header allocation permitted only after prelude checks"},
+    {"id": "FNLPG-H007-DUPLICATE-JSON-KEY", "stage": "header", "mutation": "repeat a JSON object key", "expected_error": "duplicate header key", "required_diagnostic": "exact JSON pointer", "allocation_rule": "directory payload access forbidden"},
+    {"id": "FNLPG-H008-UNICODE-ESCAPE", "stage": "header", "mutation": "encode an authority identifier with a Unicode escape", "expected_error": "noncanonical header escape", "required_diagnostic": "exact JSON pointer", "allocation_rule": "directory payload access forbidden"},
+    {"id": "FNLPG-H009-SECTION-TABLE-OVERLAP", "stage": "directory", "mutation": "give two sections overlapping file ranges", "expected_error": "overlapping section ranges", "required_diagnostic": "both section names and [start,end) ranges", "allocation_rule": "payload access forbidden"},
+    {"id": "FNLPG-H010-DUPLICATE-REQUIRED-SECTION-KIND", "stage": "directory", "mutation": "emit two TOKENIZER_MODEL sections", "expected_error": "duplicate required section kind", "required_diagnostic": "section kind TOKENIZER_MODEL and both ordinals", "allocation_rule": "payload access forbidden"},
+    {"id": "FNLPG-H011-UNKNOWN-SECTION-KIND", "stage": "directory", "mutation": "use an unassigned kind enum", "expected_error": "unknown section kind", "required_diagnostic": "directory kind and ordinal", "allocation_rule": "payload access forbidden"},
+    {"id": "FNLPG-H012-NONZERO-ALIGNMENT-GAP", "stage": "directory", "mutation": "place a nonzero byte in an otherwise declared alignment gap", "expected_error": "nonzero alignment gap", "required_diagnostic": "gap [start,end)", "allocation_rule": "payload digest access forbidden"},
+    {"id": "FNLPG-H013-RANGE-INTO-HEADER", "stage": "directory", "mutation": "set a section offset before directory_end", "expected_error": "section range intersects metadata", "required_diagnostic": "section ordinal and directory_end", "allocation_rule": "payload access forbidden"},
+    {"id": "FNLPG-H014-DUPLICATE-TENSOR-NAME", "stage": "header", "mutation": "repeat one tensor name", "expected_error": "duplicate tensor name", "required_diagnostic": "tensor name and both indices", "allocation_rule": "payload access forbidden"},
+    {"id": "FNLPG-H015-NAN-SCALE", "stage": "tensor-mapping", "mutation": "insert an IEEE-754 NaN scale bit pattern in GENERIC_TENSOR_SCALES", "expected_error": "nonfinite scale", "required_diagnostic": "tensor name, scale index, and section range", "allocation_rule": "only the named scale range may be read"},
+    {"id": "FNLPG-H016-PACKING-ARCH-MISMATCH", "stage": "dispatch", "mutation": "request an absent target representation", "expected_error": "required packing derivation missing", "required_diagnostic": "requested target and available packing-set IDs", "allocation_rule": "no fallback to a different native packing"},
+    {"id": "FNLPG-H017-DUPLICATE-SECTION-NAME", "stage": "header", "mutation": "repeat one section name at distinct ordinals", "expected_error": "duplicate section name", "required_diagnostic": "section name and both ordinals", "allocation_rule": "directory payload access forbidden"},
+    {"id": "FNLPG-H018-INFINITE-SCALE", "stage": "tensor-mapping", "mutation": "insert an IEEE-754 infinite scale bit pattern in GENERIC_TENSOR_SCALES", "expected_error": "nonfinite scale", "required_diagnostic": "tensor name, scale index, and section range", "allocation_rule": "only the named scale range may be read"}
+  ],
+  "required_case_count": 18,
+  "reader_contract": "Every case must be referenced by a stable ID in the reader fuzz/regression corpus, assert rejection before the stated forbidden access, and assert the required diagnostic location."
+}

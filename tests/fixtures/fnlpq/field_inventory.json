@@ -1,0 +1,59 @@
+{
+  "fixture_schema": "fnlpq-field-inventory-v1",
+  "format_version": 1,
+  "prelude_bytes": 80,
+  "section_directory_entry_bytes": 80,
+  "prelude_fields": [
+    {"id": "prelude.magic", "offset": 0, "size_bytes": 8, "endianness": "raw", "cap": "exact hex 464e4c5051000001"},
+    {"id": "prelude.format_version", "offset": 8, "size_bytes": 4, "endianness": "little", "cap": "exactly 1"},
+    {"id": "prelude.required_flags", "offset": 12, "size_bytes": 4, "endianness": "little", "cap": "exactly 0 in v1"},
+    {"id": "prelude.header_len", "offset": 16, "size_bytes": 8, "endianness": "little", "cap": "0..=1048576"},
+    {"id": "prelude.section_count", "offset": 24, "size_bytes": 8, "endianness": "little", "cap": "1..=4096"},
+    {"id": "prelude.tensor_count", "offset": 32, "size_bytes": 8, "endianness": "little", "cap": "1..=4096 and equals /tensors length"},
+    {"id": "prelude.file_len", "offset": 40, "size_bytes": 8, "endianness": "little", "cap": "equals actual regular-file length; <=68719476736"},
+    {"id": "prelude.header_sha256", "offset": 48, "size_bytes": 32, "endianness": "raw", "cap": "SHA-256 exact canonical header bytes"}
+  ],
+  "section_directory_fields": [
+    {"id": "directory.kind", "offset": 0, "size_bytes": 4, "endianness": "little", "cap": "known v1 enum"},
+    {"id": "directory.flags", "offset": 4, "size_bytes": 4, "endianness": "little", "cap": "exactly 0 in v1"},
+    {"id": "directory.name_index", "offset": 8, "size_bytes": 8, "endianness": "little", "cap": "matches header section ordinal/name"},
+    {"id": "directory.file_offset", "offset": 16, "size_bytes": 8, "endianness": "little", "cap": "directory_end..=file_len; declared alignment"},
+    {"id": "directory.stored_len", "offset": 24, "size_bytes": 8, "endianness": "little", "cap": "checked end <= file_len"},
+    {"id": "directory.logical_len", "offset": 32, "size_bytes": 8, "endianness": "little", "cap": "equals stored_len in v1"},
+    {"id": "directory.alignment", "offset": 40, "size_bytes": 8, "endianness": "little", "cap": "power of two in 1..=4096"},
+    {"id": "directory.stored_sha256", "offset": 48, "size_bytes": 32, "endianness": "raw", "cap": "D(fnlpq-section-v1,name,stored bytes)"}
+  ],
+  "header_fields": [
+    {"id": "header.header_schema", "json_pointer": "/header_schema", "size_bytes": "variable", "endianness": "n/a", "cap": "exactly fnlpq-header-v1"},
+    {"id": "header.model.model_id", "json_pointer": "/model/model_id", "size_bytes": "variable", "endianness": "n/a", "cap": "printable-ASCII authority ID"},
+    {"id": "header.model.revision", "json_pointer": "/model/revision", "size_bytes": "variable", "endianness": "n/a", "cap": "exactly 40 lowercase hex"},
+    {"id": "header.recipe_id", "json_pointer": "/recipe_id", "size_bytes": "variable", "endianness": "n/a", "cap": "ASCII authority ID <=128 bytes"},
+    {"id": "header.source_root_sha256", "json_pointer": "/source_root_sha256", "size_bytes": "variable", "endianness": "n/a", "cap": "64 lowercase hex; fnlpq-source-root-v1 domain"},
+    {"id": "header.logical_model_sha256", "json_pointer": "/logical_model_sha256", "size_bytes": "variable", "endianness": "n/a", "cap": "64 lowercase hex; fnlpq-logical-model-v1 domain"},
+    {"id": "header.packing_set_sha256", "json_pointer": "/packing_set_sha256", "size_bytes": "variable", "endianness": "n/a", "cap": "64 lowercase hex; fnlpq-packing-set-v1 domain"},
+    {"id": "header.license_bundle_sha256", "json_pointer": "/license_bundle_sha256", "size_bytes": "variable", "endianness": "n/a", "cap": "64 lowercase hex; fnlpq-license-bundle-v1 domain"},
+    {"id": "header.limits_profile", "json_pointer": "/limits_profile", "size_bytes": "variable", "endianness": "n/a", "cap": "exactly fnlpq-limits-v1"},
+    {"id": "header.materialized_sources", "json_pointer": "/materialized_sources", "size_bytes": "variable", "endianness": "n/a", "cap": "exact model_config/tokenizer_model/tokenizer_config/chat_template objects"},
+    {"id": "header.materialized_sources.entry.section_ordinal", "json_pointer": "/materialized_sources/*/section_ordinal", "size_bytes": "variable", "endianness": "n/a", "cap": "existing required singleton section ordinal"},
+    {"id": "header.materialized_sources.entry.sha256", "json_pointer": "/materialized_sources/*/sha256", "size_bytes": "variable", "endianness": "n/a", "cap": "matches directory stored_sha256"},
+    {"id": "header.sections", "json_pointer": "/sections", "size_bytes": "variable", "endianness": "n/a", "cap": "length equals prelude.section_count; ordinals contiguous"},
+    {"id": "header.sections.ordinal", "json_pointer": "/sections/*/ordinal", "size_bytes": "variable", "endianness": "n/a", "cap": "0..section_count-1"},
+    {"id": "header.sections.name", "json_pointer": "/sections/*/name", "size_bytes": "variable", "endianness": "n/a", "cap": "unique ASCII authority ID <=128 bytes"},
+    {"id": "header.sections.kind", "json_pointer": "/sections/*/kind", "size_bytes": "variable", "endianness": "n/a", "cap": "matches directory kind; singleton cardinality enforced"},
+    {"id": "header.sections.required", "json_pointer": "/sections/*/required", "size_bytes": "variable", "endianness": "n/a", "cap": "true for required singleton kinds"},
+    {"id": "header.tensors", "json_pointer": "/tensors", "size_bytes": "variable", "endianness": "n/a", "cap": "length equals prelude.tensor_count; sorted unique ASCII names"},
+    {"id": "header.tensors.name", "json_pointer": "/tensors/*/name", "size_bytes": "variable", "endianness": "n/a", "cap": "unique ASCII authority ID <=128 bytes"},
+    {"id": "header.tensors.canonical_dtype", "json_pointer": "/tensors/*/canonical_dtype", "size_bytes": "variable", "endianness": "n/a", "cap": "known v1 logical dtype"},
+    {"id": "header.tensors.shape", "json_pointer": "/tensors/*/shape", "size_bytes": "variable", "endianness": "n/a", "cap": "rank 1..=8; each dimension 1..=4294967295; checked product"},
+    {"id": "header.tensors.canonical_logical_sha256", "json_pointer": "/tensors/*/canonical_logical_sha256", "size_bytes": "variable", "endianness": "n/a", "cap": "64 lowercase hex in logical-model record"},
+    {"id": "header.tensors.generic.quantization", "json_pointer": "/tensors/*/generic/quantization", "size_bytes": "variable", "endianness": "n/a", "cap": "fixed known quantization recipe ID"},
+    {"id": "header.tensors.generic.mapping", "json_pointer": "/tensors/*/generic/{data,scale,row_sum}", "size_bytes": "variable", "endianness": "n/a", "cap": "each has section_ordinal, offset, length; checked within matching singleton section"},
+    {"id": "header.packing_sets", "json_pointer": "/packing_sets", "size_bytes": "variable", "endianness": "n/a", "cap": "1..=16; includes mandatory generic set"},
+    {"id": "header.packing_sets.id", "json_pointer": "/packing_sets/*/id", "size_bytes": "variable", "endianness": "n/a", "cap": "unique ASCII authority ID <=128 bytes"},
+    {"id": "header.packing_sets.target", "json_pointer": "/packing_sets/*/target", "size_bytes": "variable", "endianness": "n/a", "cap": "declared target; architecture mismatch is hard error"},
+    {"id": "header.packing_sets.representations", "json_pointer": "/packing_sets/*/representations", "size_bytes": "variable", "endianness": "n/a", "cap": "1..=16; section, byte cost, digest each match directory"}
+  ],
+  "canonical_json_rules": [
+    "UTF-8 without BOM", "no insignificant whitespace", "ASCII-key lexical order", "duplicate key reject", "no Unicode escapes", "integer-only numeric grammar", "closed schema"
+  ]
+}
