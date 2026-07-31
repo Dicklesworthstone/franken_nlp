@@ -34,6 +34,7 @@ from typing import Any
 
 PINNED_REVISION = "f56ec5a9650268aa098496734743c25ea778bd2d"
 MODEL_ID = "Nanbeige/Nanbeige4.2-3B"
+PINNED_TOKENIZER_JSON_SHA256 = "1d858a0fc007f22af6ae18bfa1ae52d30e398aa9cd1ea06e7777176869346a3f"
 PHYSICAL_LAYER_COUNT = 22
 LOOP_COUNT = 2
 TRACE_SLOT_COUNT = PHYSICAL_LAYER_COUNT * LOOP_COUNT
@@ -718,12 +719,19 @@ def load_fixture_inputs(path: Path) -> dict[str, object]:
     payload = read_json(path)
     prompts = payload.get("prompts")
     tokenizer_cases = payload.get("tokenizer_cases")
+    fast_slow_tokenizer_cases = payload.get("fast_slow_tokenizer_cases")
     template_cases = payload.get("template_cases")
     sampled_seeds = payload.get("sampled_seeds")
     if not isinstance(prompts, list) or not prompts or not all(isinstance(item, str) and item for item in prompts):
         raise TraceError("fixture input corpus requires a non-empty string prompts array")
-    if not isinstance(tokenizer_cases, list) or not isinstance(template_cases, list):
-        raise TraceError("fixture input corpus requires tokenizer_cases and template_cases arrays")
+    if (
+        not isinstance(tokenizer_cases, list)
+        or not isinstance(fast_slow_tokenizer_cases, list)
+        or not isinstance(template_cases, list)
+    ):
+        raise TraceError(
+            "fixture input corpus requires tokenizer_cases, fast_slow_tokenizer_cases, and template_cases arrays"
+        )
     if (
         not isinstance(sampled_seeds, list)
         or not sampled_seeds
@@ -772,6 +780,45 @@ def validated_provenance(payload: dict[str, object]) -> dict[str, object]:
     return provenance
 
 
+def validated_tokenizer_provenance(payload: dict[str, object]) -> FixtureProvenance:
+    """Read the independently receipted tokenizer-subcorpus provenance."""
+
+    fields = (
+        ("tokenizer_corpus_sha256", "corpus_sha256"),
+        ("tokenizer_oracle_closure_sha256", "oracle_closure_sha256"),
+    )
+    values: dict[str, str] = {}
+    for field_name, destination in fields:
+        value = payload.get(field_name)
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise TraceError(f"auxiliary fixture has no immutable {field_name}")
+        values[destination] = value
+    generator_commit = payload.get("tokenizer_generator_commit")
+    if not isinstance(generator_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", generator_commit):
+        raise TraceError("auxiliary fixture has no immutable tokenizer_generator_commit")
+    command = payload.get("tokenizer_generation_command")
+    if not isinstance(command, list) or not command or not all(isinstance(argument, str) and argument for argument in command):
+        raise TraceError("auxiliary fixture has no tokenizer_generation_command")
+    return FixtureProvenance(
+        corpus_sha256=values["corpus_sha256"],
+        oracle_closure_sha256=values["oracle_closure_sha256"],
+        generator_commit=generator_commit,
+        generation_command=tuple(command),
+    )
+
+
+def provenance_from_payload(payload: dict[str, object]) -> FixtureProvenance:
+    """Convert a validated shared fixture record into a typed provenance value."""
+
+    record = validated_provenance(payload)
+    return FixtureProvenance(
+        corpus_sha256=str(record["corpus_sha256"]),
+        oracle_closure_sha256=str(record["oracle_closure_sha256"]),
+        generator_commit=str(record["generator_commit"]),
+        generation_command=tuple(str(argument) for argument in record["generation_command"]),
+    )
+
+
 def same_digest_set(left: set[str], right: set[str]) -> bool:
     """Compare fixture digest inventories without a scanner-visible raw compare."""
 
@@ -780,17 +827,26 @@ def same_digest_set(left: set[str], right: set[str]) -> bool:
 
 def capture_auxiliary_fixtures(
     output_root: Path,
-    tokenizer: Any,
+    slow_tokenizer: Any,
+    fast_tokenizer: Any,
     corpus: dict[str, object],
     provenance: FixtureProvenance,
+    tokenizer_provenance: FixtureProvenance,
+    fast_tokenizer_json_sha256: str,
 ) -> Path:
-    """Record slow-tokenizer ids and chat-template renderings with their input digests."""
+    """Record slow/fast tokenizer facts and slow chat-template renderings."""
 
     tokenizer_records: list[dict[str, object]] = []
+    fast_slow_tokenizer_records: list[dict[str, object]] = []
     template_records: list[dict[str, object]] = []
     raw_tokenizer_cases = corpus["tokenizer_cases"]
+    raw_fast_slow_tokenizer_cases = corpus["fast_slow_tokenizer_cases"]
     raw_template_cases = corpus["template_cases"]
-    if not isinstance(raw_tokenizer_cases, list) or not isinstance(raw_template_cases, list):
+    if (
+        not isinstance(raw_tokenizer_cases, list)
+        or not isinstance(raw_fast_slow_tokenizer_cases, list)
+        or not isinstance(raw_template_cases, list)
+    ):
         raise TraceError("fixture input corpus has malformed tokenizer or template cases")
     seen_case_ids: set[str] = set()
     for case in raw_tokenizer_cases:
@@ -803,7 +859,7 @@ def capture_auxiliary_fixtures(
         if case_id in seen_case_ids:
             raise TraceError(f"duplicate fixture input case id={case_id}")
         seen_case_ids.add(case_id)
-        token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+        token_ids = slow_tokenizer(text, add_special_tokens=False)["input_ids"]
         if not isinstance(token_ids, list) or not all(isinstance(token_id, int) for token_id in token_ids):
             raise TraceError(f"slow tokenizer did not return integer ids for case={case_id}")
         tokenizer_records.append(
@@ -812,6 +868,46 @@ def capture_auxiliary_fixtures(
                 "input_sha256": sha256_bytes(text.encode("utf-8")),
                 "token_ids": token_ids,
                 "token_ids_sha256": sha256_bytes(canonical_json(token_ids)),
+            }
+        )
+    fast_slow_case_ids: set[str] = set()
+    for case in raw_fast_slow_tokenizer_cases:
+        if not isinstance(case, dict):
+            raise TraceError("fast/slow tokenizer case must be an object")
+        case_id = case.get("id")
+        text = case.get("text")
+        if not isinstance(case_id, str) or not SAFE_NAME.fullmatch(case_id) or not isinstance(text, str):
+            raise TraceError("fast/slow tokenizer case requires a safe id and string text")
+        if case_id in fast_slow_case_ids:
+            raise TraceError(f"duplicate fast/slow tokenizer case id={case_id}")
+        fast_slow_case_ids.add(case_id)
+        slow_token_ids = slow_tokenizer(text, add_special_tokens=False)["input_ids"]
+        fast_token_ids = fast_tokenizer(text, add_special_tokens=False)["input_ids"]
+        if not isinstance(slow_token_ids, list) or not all(isinstance(token_id, int) for token_id in slow_token_ids):
+            raise TraceError(f"slow tokenizer did not return integer ids for fast/slow case={case_id}")
+        if not isinstance(fast_token_ids, list) or not all(isinstance(token_id, int) for token_id in fast_token_ids):
+            raise TraceError(f"fast tokenizer did not return integer ids for fast/slow case={case_id}")
+        first_diverging_index = next(
+            (
+                index
+                for index, (slow_id, fast_id) in enumerate(zip(slow_token_ids, fast_token_ids))
+                if slow_id != fast_id
+            ),
+            None,
+        )
+        if first_diverging_index is None and len(slow_token_ids) != len(fast_token_ids):
+            first_diverging_index = min(len(slow_token_ids), len(fast_token_ids))
+        relation = "agreement" if first_diverging_index is None else "divergence"
+        fast_slow_tokenizer_records.append(
+            {
+                "id": case_id,
+                "input_sha256": sha256_bytes(text.encode("utf-8")),
+                "slow_token_ids": slow_token_ids,
+                "slow_token_ids_sha256": sha256_bytes(canonical_json(slow_token_ids)),
+                "fast_token_ids": fast_token_ids,
+                "fast_token_ids_sha256": sha256_bytes(canonical_json(fast_token_ids)),
+                "relation": relation,
+                "first_diverging_index": first_diverging_index,
             }
         )
     for case in raw_template_cases:
@@ -827,12 +923,12 @@ def capture_auxiliary_fixtures(
         seen_case_ids.add(case_id)
         if not isinstance(messages, list) or not isinstance(options, dict):
             raise TraceError(f"template case={case_id} requires messages array and options object")
-        if not hasattr(tokenizer, "apply_chat_template"):
+        if not hasattr(slow_tokenizer, "apply_chat_template"):
             raise TraceError("slow tokenizer has no apply_chat_template for template fixture capture")
-        rendered = tokenizer.apply_chat_template(messages, tokenize=False, **options)
+        rendered = slow_tokenizer.apply_chat_template(messages, tokenize=False, **options)
         if not isinstance(rendered, str):
             raise TraceError(f"template case={case_id} did not render text")
-        rendered_ids = tokenizer(rendered, add_special_tokens=False)["input_ids"]
+        rendered_ids = slow_tokenizer(rendered, add_special_tokens=False)["input_ids"]
         if not isinstance(rendered_ids, list) or not all(isinstance(token_id, int) for token_id in rendered_ids):
             raise TraceError(f"template case={case_id} did not round-trip to integer ids")
         template_records.append(
@@ -854,9 +950,16 @@ def capture_auxiliary_fixtures(
     payload = {
         "format_version": TRACE_FORMAT_VERSION,
         **provenance.record(),
+        "tokenizer_corpus_sha256": tokenizer_provenance.corpus_sha256,
+        "tokenizer_oracle_closure_sha256": tokenizer_provenance.oracle_closure_sha256,
+        "tokenizer_generator_commit": tokenizer_provenance.generator_commit,
+        "tokenizer_generation_command": list(tokenizer_provenance.generation_command),
         "profile_matrix": sorted(PROFILES),
-        "slow_tokenizer_class": tokenizer.__class__.__name__,
+        "slow_tokenizer_class": slow_tokenizer.__class__.__name__,
+        "fast_tokenizer_class": fast_tokenizer.__class__.__name__,
+        "fast_tokenizer_json_sha256": fast_tokenizer_json_sha256,
         "tokenizer_cases": tokenizer_records,
+        "fast_slow_tokenizer_cases": fast_slow_tokenizer_records,
         "template_cases": template_records,
     }
     path = output_root / "auxiliary.json"
@@ -1112,10 +1215,55 @@ def verify_fixture_root(root: Path, oracle_floor: Path | None) -> int:
             raise TraceError("auxiliary fixture has mismatched provenance")
         if auxiliary_payload.get("profile_matrix") != sorted(PROFILES):
             raise TraceError("auxiliary fixture does not declare the complete profile matrix")
+        validated_tokenizer_provenance(auxiliary_payload)
         if not isinstance(auxiliary_payload.get("tokenizer_cases"), list) or not isinstance(
             auxiliary_payload.get("template_cases"), list
         ):
             raise TraceError("auxiliary fixture cannot be parsed as tokenizer/template records")
+        if "fast" not in str(auxiliary_payload.get("fast_tokenizer_class", "")).lower():
+            raise TraceError("auxiliary fixture has no fast tokenizer reconciliation class")
+        if not hmac.compare_digest(
+            str(auxiliary_payload.get("fast_tokenizer_json_sha256", "")), PINNED_TOKENIZER_JSON_SHA256
+        ):
+            raise TraceError("auxiliary fixture fast tokenizer JSON digest is not the pinned tokenizer.json")
+        fast_slow_records = auxiliary_payload.get("fast_slow_tokenizer_cases")
+        if not isinstance(fast_slow_records, list) or not fast_slow_records:
+            raise TraceError("auxiliary fixture has no fast/slow tokenizer reconciliation cases")
+        observed_relations: set[str] = set()
+        for record in fast_slow_records:
+            if not isinstance(record, dict):
+                raise TraceError("fast/slow tokenizer reconciliation has a non-object record")
+            slow_ids = record.get("slow_token_ids")
+            fast_ids = record.get("fast_token_ids")
+            relation = record.get("relation")
+            divergence = record.get("first_diverging_index")
+            if (
+                not isinstance(record.get("id"), str)
+                or not isinstance(record.get("input_sha256"), str)
+                or not isinstance(slow_ids, list)
+                or not isinstance(fast_ids, list)
+                or not all(isinstance(token_id, int) for token_id in [*slow_ids, *fast_ids])
+                or relation not in {"agreement", "divergence"}
+            ):
+                raise TraceError("fast/slow tokenizer reconciliation record is malformed")
+            observed_divergence = next(
+                (
+                    index
+                    for index, (slow_id, fast_id) in enumerate(zip(slow_ids, fast_ids))
+                    if slow_id != fast_id
+                ),
+                None,
+            )
+            if observed_divergence is None and len(slow_ids) != len(fast_ids):
+                observed_divergence = min(len(slow_ids), len(fast_ids))
+            if relation == "agreement":
+                if observed_divergence is not None or divergence is not None:
+                    raise TraceError("fast/slow agreement record contains a divergence")
+            elif observed_divergence is None or divergence != observed_divergence:
+                raise TraceError("fast/slow divergence record has an incorrect first divergence")
+            observed_relations.add(str(relation))
+        if observed_relations != {"agreement", "divergence"}:
+            raise TraceError("fast/slow tokenizer reconciliation must freeze both agreements and divergences")
         observed_template_ids = {
             record.get("id")
             for record in auxiliary_payload["template_cases"]
@@ -1311,6 +1459,40 @@ def load_slow_tokenizer(model_source: Path) -> Any:
     return tokenizer
 
 
+def load_fast_tokenizer(model_source: Path) -> Any:
+    """Load the pinned tokenizer.json route only for frozen reconciliation evidence."""
+
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as error:
+        raise TraceError(f"missing locked oracle dependency: {error}") from error
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_source,
+        revision=PINNED_REVISION,
+        trust_remote_code=True,
+        use_fast=True,
+        local_files_only=True,
+    )
+    if "fast" not in tokenizer.__class__.__name__.lower():
+        raise TraceError(f"fast tokenizer required, observed class={tokenizer.__class__.__name__}")
+    return tokenizer
+
+
+def pinned_fast_tokenizer_json_sha256(model_source: Path) -> str:
+    """Hash-check the tokenizer.json input that backs the reconciliation route."""
+
+    path = model_source / "tokenizer.json"
+    if not path.is_file() or path.is_symlink():
+        raise TraceError(f"pinned fast tokenizer JSON is absent or not regular: {path}")
+    observed = sha256_path(path)
+    if not hmac.compare_digest(observed, PINNED_TOKENIZER_JSON_SHA256):
+        raise TraceError(
+            "pinned fast tokenizer JSON digest mismatch "
+            f"expected={PINNED_TOKENIZER_JSON_SHA256} observed={observed}"
+        )
+    return observed
+
+
 def run_generate(args: argparse.Namespace) -> int:
     """Generate the complete profile matrix, then seal it with a model-free manifest pass."""
 
@@ -1353,8 +1535,18 @@ def run_generate(args: argparse.Namespace) -> int:
             if status != 0:
                 log("REF_FIXTURES", "RESULT=FAIL fixtures=0 missing=trace-capture")
                 return status
-        tokenizer = load_slow_tokenizer(args.model_source)
-        auxiliary_path = capture_auxiliary_fixtures(output_root, tokenizer, corpus, provenance)
+        slow_tokenizer = load_slow_tokenizer(args.model_source)
+        fast_tokenizer = load_fast_tokenizer(args.model_source)
+        fast_tokenizer_json_sha256 = pinned_fast_tokenizer_json_sha256(args.model_source)
+        auxiliary_path = capture_auxiliary_fixtures(
+            output_root,
+            slow_tokenizer,
+            fast_tokenizer,
+            corpus,
+            provenance,
+            provenance,
+            fast_tokenizer_json_sha256,
+        )
         trace_indices = tuple(sorted(output_root.glob("*/prompt-*/trace.json")))
         if not trace_indices:
             raise TraceError("profile generation produced no trace index files")
@@ -1371,11 +1563,71 @@ def run_generate(args: argparse.Namespace) -> int:
     return verify_fixture_root(args.output.resolve(), args.oracle_floor)
 
 
+def run_refresh_auxiliary(args: argparse.Namespace) -> int:
+    """Refresh only tokenizer/template evidence without rewriting model trace files."""
+
+    if args.model_source is None or not args.model_source.is_dir():
+        log("REF_FIXTURES", "RESULT=SKIPPED_NO_MODEL fixtures=0 missing=source-closure")
+        return 0
+    try:
+        output_root = args.output.resolve()
+        manifest_path = output_root / "manifest.json"
+        if not manifest_path.is_file():
+            raise TraceError(f"cannot refresh auxiliary without manifest: {manifest_path}")
+        manifest = read_json(manifest_path)
+        trace_provenance = provenance_from_payload(manifest)
+        observed_closure = closure_digest(args.repo_root)
+        if not hmac.compare_digest(observed_closure, trace_provenance.oracle_closure_sha256):
+            raise TraceError(
+                "oracle closure mismatch for auxiliary refresh "
+                f"expected={trace_provenance.oracle_closure_sha256} observed={observed_closure}"
+            )
+        generator_commit = git_commit()
+        if not re.fullmatch(r"[0-9a-f]{40}", generator_commit):
+            raise TraceError("cannot receipt auxiliary refresh without a Git commit")
+        corpus = load_fixture_inputs(args.corpus)
+        tokenizer_provenance = FixtureProvenance(
+            corpus_sha256=sha256_path(args.corpus),
+            oracle_closure_sha256=observed_closure,
+            generator_commit=generator_commit,
+            generation_command=tuple(sys.argv),
+        )
+        slow_tokenizer = load_slow_tokenizer(args.model_source)
+        fast_tokenizer = load_fast_tokenizer(args.model_source)
+        fast_tokenizer_json_sha256 = pinned_fast_tokenizer_json_sha256(args.model_source)
+        auxiliary_path = capture_auxiliary_fixtures(
+            output_root,
+            slow_tokenizer,
+            fast_tokenizer,
+            corpus,
+            trace_provenance,
+            tokenizer_provenance,
+            fast_tokenizer_json_sha256,
+        )
+        trace_indices = tuple(sorted(output_root.glob("*/prompt-*/trace.json")))
+        if not trace_indices:
+            raise TraceError("cannot refresh auxiliary without committed trace indices")
+        floor_digest = manifest.get("oracle_floor_sha256")
+        if not isinstance(floor_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", floor_digest):
+            raise TraceError("manifest has no immutable oracle_floor_sha256")
+        build_fixture_manifest(output_root, trace_indices, auxiliary_path, floor_digest, trace_provenance)
+    except (OSError, TraceError) as error:
+        log("REF_FIXTURES", f"FAIL {error}")
+        log("REF_FIXTURES", "RESULT=FAIL fixtures=0 missing=auxiliary-refresh")
+        return 1
+    return verify_fixture_root(args.output.resolve(), args.oracle_floor if args.oracle_floor.is_file() else None)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trace", action="store_true", help="capture prefill and one-token-append traces")
     parser.add_argument("--trace-selftest", action="store_true", help="run model-gated trace checks including perturbation detection")
     parser.add_argument("--generate", action="store_true", help="generate and seal the complete profile-tagged fixture matrix")
+    parser.add_argument(
+        "--refresh-auxiliary",
+        action="store_true",
+        help="refresh model-gated tokenizer/template evidence and reseal its manifest digest",
+    )
     parser.add_argument("--verify", action="store_true", help="verify a committed fixture manifest without a model")
     parser.add_argument("--self-test", action="store_true", help="run model-free fixture-format negative checks")
     parser.add_argument("--model-source", type=Path, help="revision-scoped local Nanbeige source closure")
@@ -1402,9 +1654,21 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    selected = sum(bool(value) for value in (args.trace, args.trace_selftest, args.generate, args.verify, args.self_test))
+    selected = sum(
+        bool(value)
+        for value in (
+            args.trace,
+            args.trace_selftest,
+            args.generate,
+            args.refresh_auxiliary,
+            args.verify,
+            args.self_test,
+        )
+    )
     if selected != 1:
-        parser.error("select exactly one of --trace, --trace-selftest, --generate, --verify, or --self-test")
+        parser.error(
+            "select exactly one of --trace, --trace-selftest, --generate, --refresh-auxiliary, --verify, or --self-test"
+        )
     if args.max_new_tokens <= 0:
         parser.error("--max-new-tokens must be positive")
     if args.profile == "all" and not args.generate:
@@ -1413,6 +1677,8 @@ def main() -> int:
         return run_trace(args, selftest=args.trace_selftest)
     if args.generate:
         return run_generate(args)
+    if args.refresh_auxiliary:
+        return run_refresh_auxiliary(args)
     if args.verify:
         return verify_fixture_root(args.output.resolve(), args.oracle_floor if args.oracle_floor.is_file() else None)
     return run_fixture_self_test()
