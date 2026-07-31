@@ -347,6 +347,17 @@ fn bf16_eager_reference_primitives_and_cast_schedule() {
     assert_close(normalized[0].to_f32(), 0.848, 0.01);
     assert_close(normalized[1].to_f32(), 1.133, 0.01);
 
+    let cast_site_input = bf16s(&[3.4375, 2.578125, -0.79296875, -2.40625]);
+    let cast_site_weight = bf16s(&[0.06787109375, -0.5703125, 1.703125, -1.1796875]);
+    let cast_site_output =
+        rms_norm_f32_reduce_cast_back(&cast_site_input, &cast_site_weight, RMS_NORM_EPSILON)
+            .expect("cast-site regression vector has matching shape");
+    assert_eq!(
+        cast_site_output,
+        bf16s(&[0.09326171875, -0.58984375, -0.54296875, 1.140625]),
+        "RMSNorm must narrow the normalized activation before the bf16 scale multiply"
+    );
+
     let probabilities = softmax_f32_cast_back(&[0.0, 1.0]).expect("nonempty softmax");
     assert_close(probabilities[0].to_f32(), 0.2689, 0.01);
     assert_close(probabilities[1].to_f32(), 0.7311, 0.01);

@@ -48,7 +48,11 @@ pub fn embedding_row_stays_bf16(row: &[Bf16]) -> Vec<Bf16> {
     row.to_vec()
 }
 
-/// Performs RMSNorm's f32 reduction and returns a bf16 activation.
+/// Performs the pinned RMSNorm cast graph and returns a bf16 activation.
+///
+/// The variance reduction and reciprocal square root execute in f32.  The
+/// normalized activation then narrows to the input dtype *before* the bf16
+/// scale multiply, matching `NanbeigeRMSNorm.forward` in the pinned source.
 pub fn rms_norm_f32_reduce_cast_back(
     input: &[Bf16],
     weight: &[Bf16],
@@ -77,10 +81,13 @@ pub fn rms_norm_f32_reduce_cast_back(
     let inverse_rms = (mean_square + epsilon).sqrt().recip();
     let normalized = input
         .iter()
-        .zip(weight)
-        .map(|(activation, scale)| activation.to_f32() * inverse_rms * scale.to_f32())
+        .map(|activation| Bf16::from_f32(activation.to_f32() * inverse_rms))
         .collect::<Vec<_>>();
-    Ok(cast_f32_to_bf16(&normalized))
+    Ok(normalized
+        .iter()
+        .zip(weight)
+        .map(|(activation, scale)| Bf16::from_f32(activation.to_f32() * scale.to_f32()))
+        .collect())
 }
 
 /// Computes SiLU in f32 before the profile's bf16 activation cast.
