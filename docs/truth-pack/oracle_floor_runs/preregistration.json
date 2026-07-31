@@ -1,0 +1,32 @@
+{
+  "additional_processes_per_thread": 5,
+  "campaign_scope": "The pinned Nanbeige/Nanbeige4.2-3B f56ec5a9650268aa098496734743c25ea778bd2d CPU eager oracle. Every run loads the immutable local source closure with the committed hash-locked CPython 3.11 dependency closure; no network or accelerator execution is permitted.",
+  "confidence_level": 0.95,
+  "convergence_rule": "Run five independently launched fresh interpreters at every preregistered thread count. If any greedy token, logits element, or recorded tap varies, add five fresh interpreters at every preregistered thread count before deriving the floor. Exact goldens end at the first divergence in the common prefix across every recorded run and every preregistered thread count.",
+  "created_at": "2026-07-31T15:25:15Z",
+  "fixture_corpus_path": "tests/fixtures/reference_inputs.json",
+  "fixture_prompt_cases": [
+    {
+      "id": "fixture-000",
+      "prompt_sha256": "00326c36b03df5da1508fc9137587368b531695c1d1d11d9af6076ddaf169957"
+    },
+    {
+      "id": "fixture-001",
+      "prompt_sha256": "9267825d5b89ce68e9bde740d46459dcd46755b318dedfdceacfe62185b3b5a0"
+    },
+    {
+      "id": "fixture-002",
+      "prompt_sha256": "e9304f8f785fcf1bd5a51aa78f6555926a140cb127431afd04cd6b69c9d509cf"
+    }
+  ],
+  "max_new_tokens": 8,
+  "measurement_notes": "Logits are the float32 CPU values at the final prefill position. The separately claimed sdb trace harness owns non-perturbing 44-execution hook capture; this floor campaign records an empty taps map unless its repeatable tap output is available before the campaign starts.",
+  "minimum_processes": 5,
+  "profile": "hf-bf16-eager",
+  "schema_version": 1,
+  "thread_configuration": "For each fresh child process, OMP_NUM_THREADS, MKL_NUM_THREADS, OPENBLAS_NUM_THREADS, VECLIB_MAXIMUM_THREADS, and torch.set_num_threads are set to the preregistered count before model load; torch inter-op threads are fixed at one.",
+  "thread_counts": [
+    1,
+    10
+  ]
+}
