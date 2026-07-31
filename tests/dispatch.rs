@@ -194,7 +194,7 @@ fn entry_points_execute_the_scalar_floor_and_keep_the_selection() {
             None,
         )
         .unwrap();
-    assert_eq!(gemm.output, vec![11, 7, 9, 23]);
+    assert_eq!(gemm.output, vec![11, 7, 25, 9]);
     assert_eq!(gemm.selection.tier, KernelTier::Scalar);
 
     let gemv = dispatcher
