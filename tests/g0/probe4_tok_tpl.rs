@@ -11,7 +11,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-const REQUIRED_TEMPLATE_CASES: &[&str] = [
+const REQUIRED_TEMPLATE_CASES: &[&str] = &[
     "system-default-no-think",
     "thinking-preserved",
     "tool-json",
