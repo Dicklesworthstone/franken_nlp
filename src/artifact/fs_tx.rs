@@ -510,6 +510,7 @@ pub fn discover_activation(records: &[ActivationRecord]) -> Result<ActivationDis
             });
         }
         append_disconnected_walk_entries(&valid, &mut walk);
+        sort_walk(&mut walk);
         return Err(FsTxError::ActivationFork {
             last_unambiguous: None,
             successor_digests: successors,
@@ -518,6 +519,7 @@ pub fn discover_activation(records: &[ActivationRecord]) -> Result<ActivationDis
     }
     let Some(mut current) = genesis.pop() else {
         append_disconnected_walk_entries(&valid, &mut walk);
+        sort_walk(&mut walk);
         return Ok(ActivationDiscovery { head: None, walk });
     };
 
@@ -573,6 +575,7 @@ pub fn discover_activation(records: &[ActivationRecord]) -> Result<ActivationDis
                     }
                 }
                 append_disconnected_walk_entries(&valid, &mut walk);
+                sort_walk(&mut walk);
                 return Err(FsTxError::ActivationFork {
                     last_unambiguous: Some(ActivationHead {
                         record: current.clone(),
@@ -595,7 +598,7 @@ pub fn discover_activation(records: &[ActivationRecord]) -> Result<ActivationDis
             },
         });
     }
-    walk.sort_by_key(|entry| (entry.sequence, entry.digest, entry.verdict as u8));
+    sort_walk(&mut walk);
     Ok(ActivationDiscovery {
         head: Some(ActivationHead {
             record: current.clone(),
@@ -618,6 +621,10 @@ fn append_disconnected_walk_entries(valid: &[&ActivationRecord], walk: &mut Vec<
             });
         }
     }
+}
+
+fn sort_walk(walk: &mut [ChainWalkEntry]) {
+    walk.sort_by_key(|entry| (entry.sequence, entry.digest, entry.verdict as u8));
 }
 
 fn digest_record_body(body: &ActivationRecordBody) -> ActivationDigest {

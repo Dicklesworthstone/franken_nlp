@@ -126,6 +126,63 @@ fn forged_successors_raise_activation_fork_and_retain_last_unambiguous_head() {
 }
 
 #[test]
+fn fork_walk_is_stable_across_retained_record_order() {
+    let genesis = ActivationRecord::new(ActivationRecordBody::genesis(
+        digest(1),
+        digest(2),
+        digest(3),
+    ));
+    let left = ActivationRecord::new(
+        ActivationRecordBody::successor(&genesis, digest(4), digest(5), digest(6)).unwrap(),
+    );
+    let right = ActivationRecord::new(
+        ActivationRecordBody::successor(&genesis, digest(7), digest(8), digest(9)).unwrap(),
+    );
+    let disconnected = ActivationRecord::new(ActivationRecordBody::from_retained_parts(
+        7,
+        digest(10),
+        digest(11),
+        digest(12),
+        Some(genesis.record_digest()),
+    ));
+
+    let walk_for = |records: &[ActivationRecord]| match discover_activation(records) {
+        Err(FsTxError::ActivationFork { walk, .. }) => walk,
+        other => panic!("expected ActivationFork, observed {other:?}"),
+    };
+    let first = walk_for(&[
+        genesis.clone(),
+        right.clone(),
+        disconnected.clone(),
+        left.clone(),
+    ]);
+    let second = walk_for(&[left, disconnected, genesis, right]);
+    assert_eq!(
+        first, second,
+        "forensic diagnostics must not depend on directory enumeration order"
+    );
+    assert_eq!(
+        first
+            .iter()
+            .map(|entry| (entry.sequence, entry.digest, entry.verdict as u8))
+            .collect::<Vec<_>>(),
+        {
+            let mut sorted = first
+                .iter()
+                .map(|entry| (entry.sequence, entry.digest, entry.verdict as u8))
+                .collect::<Vec<_>>();
+            sorted.sort();
+            sorted
+        },
+        "fork walk must be canonically sorted"
+    );
+    eprintln!(
+        "FS_TXN case=stable-fork-walk RESULT=PASS rows={}",
+        first.len()
+    );
+}
+
+#[test]
 fn torn_gapped_and_disconnected_records_never_become_active() {
     let mut journal = SimulatedActivationJournal::new();
     let genesis = journal.append(digest(1), digest(2), digest(3)).unwrap();
