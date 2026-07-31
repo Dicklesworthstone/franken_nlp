@@ -236,11 +236,7 @@ fn rejects_non_bpe_and_non_identity_assertions() {
     add_bytes(&mut precompiled_charsmap, 1, b"identity");
     add_bytes(&mut precompiled_charsmap, 2, &[0x00]);
     let mut non_identity_charsmap = Vec::new();
-    add_bytes(
-        &mut non_identity_charsmap,
-        1,
-        &piece(b"a", 0, 1),
-    );
+    add_bytes(&mut non_identity_charsmap, 1, &piece(b"a", 0, 1));
     add_bytes(&mut non_identity_charsmap, 2, &trainer(2));
     add_bytes(&mut non_identity_charsmap, 3, &precompiled_charsmap);
     assert!(matches!(

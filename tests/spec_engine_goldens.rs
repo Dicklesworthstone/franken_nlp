@@ -109,7 +109,10 @@ fn tiny_full_forward_has_44_taps_two_norms_and_44_slot_kv_occupancy() {
     let config = SpecConfig::tiny_for_tests();
     let mut weights = SpecWeights::zeroed(&config).unwrap();
     for (column, value) in fixture.embedding.values.iter().copied().enumerate() {
-        weights.embeddings.set(fixture.embedding.row, column, value).unwrap();
+        weights
+            .embeddings
+            .set(fixture.embedding.row, column, value)
+            .unwrap();
     }
     for row in &fixture.lm_head_rows {
         for (column, value) in row.values.iter().copied().enumerate() {
