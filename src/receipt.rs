@@ -264,6 +264,16 @@ pub enum CheckVerdict {
     NotRun,
 }
 
+/// One immutable evidence reference retained by a receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ReceiptEvidence {
+    pub id: String,
+    pub kind: String,
+    /// A digest is present only when the evidence bytes are public and retained.
+    pub sha256: Option<Sha256Digest>,
+    pub uri: String,
+}
+
 /// Complete artifact identity taxonomy needed by a receipt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ReceiptArtifacts {
@@ -299,7 +309,7 @@ pub struct Receipt {
     pub fixture_digests: Vec<Sha256Digest>,
     pub commitments: Vec<ContentCommitment>,
     pub checks: Vec<ReceiptCheck>,
-    pub evidence_links: Vec<String>,
+    pub evidence: Vec<ReceiptEvidence>,
 }
 
 impl Receipt {
@@ -316,7 +326,7 @@ impl Receipt {
         fixture_digests: Vec<Sha256Digest>,
         commitments: Vec<ContentCommitment>,
         checks: Vec<ReceiptCheck>,
-        evidence_links: Vec<String>,
+        evidence: Vec<ReceiptEvidence>,
     ) -> Result<Self, ReceiptError> {
         execution.validate().map_err(ReceiptError::Identity)?;
         let receipt = Self {
@@ -347,7 +357,7 @@ impl Receipt {
             fixture_digests,
             commitments,
             checks,
-            evidence_links,
+            evidence,
         };
         receipt.validate()?;
         Ok(receipt)
@@ -382,8 +392,10 @@ impl Receipt {
         for commitment in &self.commitments {
             validate_authority("commitment.key_id", &commitment.key_id)?;
         }
-        for link in &self.evidence_links {
-            validate_authority("evidence_link", link)?;
+        for evidence in &self.evidence {
+            validate_identifier("evidence.id", &evidence.id)?;
+            validate_identifier("evidence.kind", &evidence.kind)?;
+            validate_authority("evidence.uri", &evidence.uri)?;
         }
         Ok(())
     }
@@ -604,6 +616,15 @@ mod tests {
         }]
     }
 
+    fn evidence() -> Vec<ReceiptEvidence> {
+        vec![ReceiptEvidence {
+            id: "receipt-privacy-fixture".to_owned(),
+            kind: "fixture".to_owned(),
+            sha256: Some(digest(16)),
+            uri: "fixture://receipt-privacy".to_owned(),
+        }]
+    }
+
     #[test]
     fn hmac_sha256_matches_rfc_4231_case_one() {
         let output = hmac_sha256(&[0x0b; 20], b"Hi There");
@@ -641,7 +662,7 @@ mod tests {
             vec![digest(15)],
             vec![input, output],
             checks(),
-            vec!["fixture://receipt-privacy".to_owned()],
+            evidence(),
         )
         .expect("typed receipt");
         let rendered = receipt.canonical_json().expect("canonical receipt");
