@@ -271,18 +271,20 @@ const _: () = assert!(KV_ELEMENTS_PER_POSITION == KV_HEAD_COUNT * NANBEIGE_HEAD_
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native_engine::kv::KV_SLOT_COUNT;
 
     fn bf16_bits(value: f32) -> u16 {
         Bf16::from_f32(value).to_bits()
     }
 
-    fn cache_vector(position: usize, value_scale: f32) -> Vec<u16> {
+    fn cache_vector(slot: usize, position: usize, value_scale: f32) -> Vec<u16> {
         (0..KV_ELEMENTS_PER_POSITION)
             .map(|index| {
                 let head = index / NANBEIGE_HEAD_DIM;
                 let dimension = index % NANBEIGE_HEAD_DIM;
                 bf16_bits(
                     value_scale
+                        * (slot as f32 + 1.0)
                         * (position as f32 + 1.0)
                         * (head as f32 + 1.0)
                         * (dimension as f32 + 1.0),
@@ -294,58 +296,61 @@ mod tests {
     #[test]
     fn cache_scanning_gqa_matches_gathered_head_reference_for_all_48_heads() {
         let sequence_len = 3;
-        let slot = 43;
         let mut cache = KvCache::try_with_capacity(sequence_len).expect("small cache reserves");
-        for position in 0..sequence_len {
-            cache
-                .append(
-                    slot,
-                    position,
-                    &cache_vector(position, 0.000_1),
-                    &cache_vector(position, 0.000_01),
-                )
-                .expect("append valid 8x128 KV vectors");
+        for slot in 0..KV_SLOT_COUNT {
+            for position in 0..sequence_len {
+                cache
+                    .append(
+                        slot,
+                        position,
+                        &cache_vector(slot, position, 0.000_1),
+                        &cache_vector(slot, position, 0.000_01),
+                    )
+                    .expect("append valid 8x128 KV vectors");
+            }
         }
         let query = (0..QUERY_HEAD_COUNT * NANBEIGE_HEAD_DIM)
             .map(|index| bf16_bits((index % NANBEIGE_HEAD_DIM) as f32 * 0.000_1 + 1.0))
             .map(Bf16::from_bits)
             .collect::<Vec<_>>();
 
-        let observed = eager_gqa_attention_from_cache(&query, &cache, slot)
-            .expect("valid native cache-scanning GQA");
-        for query_head in 0..QUERY_HEAD_COUNT {
-            let kv_head = kv_head_for_query(query_head).expect("all 48 query heads map");
-            let kv_start = kv_head * NANBEIGE_HEAD_DIM;
-            let kv_end = kv_start + NANBEIGE_HEAD_DIM;
-            let mut keys = Vec::with_capacity(sequence_len * NANBEIGE_HEAD_DIM);
-            let mut values = Vec::with_capacity(sequence_len * NANBEIGE_HEAD_DIM);
-            for position in 0..sequence_len {
-                keys.extend(
-                    cache.key_at(slot, position).expect("resident key")[kv_start..kv_end]
-                        .iter()
-                        .copied()
-                        .map(Bf16::from_bits),
-                );
-                values.extend(
-                    cache.value_at(slot, position).expect("resident value")[kv_start..kv_end]
-                        .iter()
-                        .copied()
-                        .map(Bf16::from_bits),
+        for slot in 0..KV_SLOT_COUNT {
+            let observed = eager_gqa_attention_from_cache(&query, &cache, slot)
+                .expect("valid native cache-scanning GQA");
+            for query_head in 0..QUERY_HEAD_COUNT {
+                let kv_head = kv_head_for_query(query_head).expect("all 48 query heads map");
+                let kv_start = kv_head * NANBEIGE_HEAD_DIM;
+                let kv_end = kv_start + NANBEIGE_HEAD_DIM;
+                let mut keys = Vec::with_capacity(sequence_len * NANBEIGE_HEAD_DIM);
+                let mut values = Vec::with_capacity(sequence_len * NANBEIGE_HEAD_DIM);
+                for position in 0..sequence_len {
+                    keys.extend(
+                        cache.key_at(slot, position).expect("resident key")[kv_start..kv_end]
+                            .iter()
+                            .copied()
+                            .map(Bf16::from_bits),
+                    );
+                    values.extend(
+                        cache.value_at(slot, position).expect("resident value")[kv_start..kv_end]
+                            .iter()
+                            .copied()
+                            .map(Bf16::from_bits),
+                    );
+                }
+                let query_start = query_head * NANBEIGE_HEAD_DIM;
+                let expected = eager_attention_head(
+                    &query[query_start..query_start + NANBEIGE_HEAD_DIM],
+                    &keys,
+                    &values,
+                    sequence_len,
+                )
+                .expect("gathered reference head");
+                assert_eq!(
+                    &observed[query_start..query_start + NANBEIGE_HEAD_DIM],
+                    expected.as_slice(),
+                    "slot {slot}, query head {query_head} must read KV head {kv_head} without a repeat buffer"
                 );
             }
-            let query_start = query_head * NANBEIGE_HEAD_DIM;
-            let expected = eager_attention_head(
-                &query[query_start..query_start + NANBEIGE_HEAD_DIM],
-                &keys,
-                &values,
-                sequence_len,
-            )
-            .expect("gathered reference head");
-            assert_eq!(
-                &observed[query_start..query_start + NANBEIGE_HEAD_DIM],
-                expected.as_slice(),
-                "query head {query_head} must read KV head {kv_head} without a repeat buffer"
-            );
         }
     }
 
@@ -371,8 +376,8 @@ mod tests {
                 .append(
                     slot,
                     position,
-                    &cache_vector(position, 0.000_1),
-                    &cache_vector(position, 0.000_01),
+                    &cache_vector(slot, position, 0.000_1),
+                    &cache_vector(slot, position, 0.000_01),
                 )
                 .expect("append valid 8x128 KV vectors");
         }
