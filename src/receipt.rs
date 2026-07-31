@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -21,7 +21,7 @@ use crate::{
 pub const RECEIPT_SCHEMA: &str = "fnlpr-v1";
 
 /// Completeness is a scope statement, never a substitute for a named check.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReceiptGrade {
     /// Authorized inputs, artifacts, and any commitment secret are resolvable.
@@ -35,7 +35,7 @@ pub enum ReceiptGrade {
 }
 
 /// Public retention availability used to validate a receipt grade.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetentionState {
     /// The owner-authorized retention policy can resolve this input.
@@ -47,7 +47,8 @@ pub enum RetentionState {
 }
 
 /// Public retention facts. No path, secret, or content byte appears here.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptRetention {
     pub private_inputs: RetentionState,
     pub artifacts: RetentionState,
@@ -55,7 +56,8 @@ pub struct ReceiptRetention {
 }
 
 /// Grade-constrained replay metadata retained with a receipt.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptReplay {
     pub command: Vec<String>,
     pub missing_requirements: Vec<String>,
@@ -63,7 +65,7 @@ pub struct ReceiptReplay {
 }
 
 /// The outcome observed for the named receipt operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunDisposition {
     Ok,
@@ -73,7 +75,8 @@ pub enum RunDisposition {
 }
 
 /// Reproduction material required for a scheduler or concurrency failure.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct FailureReplay {
     pub crashpack_id: String,
     pub lab_seed: String,
@@ -90,7 +93,8 @@ pub struct ReceiptRunSpec {
 }
 
 /// Stable run facts derived from the one execution identity plus its outcome.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptRun {
     pub operation: String,
     pub disposition: RunDisposition,
@@ -144,7 +148,7 @@ impl ReceiptRun {
 
 /// The domain used to prevent input, output, and configuration commitments
 /// from being interchangeable.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommitmentDomain {
     ExecutionIdentity,
@@ -165,7 +169,7 @@ impl CommitmentDomain {
 }
 
 /// Whether the semantic execution identity is safe to publish verbatim.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityDisclosure {
     /// The complete identity contains only receipt-authorized public fields.
@@ -179,7 +183,8 @@ pub enum IdentityDisclosure {
 /// A committed projection deliberately omits the normal unkeyed receipt key:
 /// even a digest of a low-entropy prompt can be dictionary-tested by an
 /// untrusted receipt reader.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptIdentity {
     execution_identity_schema: u32,
     disclosure: IdentityDisclosure,
@@ -237,7 +242,8 @@ impl ReceiptIdentity {
 }
 
 /// A public, domain-separated HMAC commitment to private bytes.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContentCommitment {
     pub domain: CommitmentDomain,
     pub key_id: String,
@@ -342,7 +348,8 @@ pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
 }
 
 /// One named check performed by the emitting surface.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptCheck {
     pub id: String,
     pub scope: String,
@@ -350,7 +357,7 @@ pub struct ReceiptCheck {
 }
 
 /// Typed check outcome retained in a receipt.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckVerdict {
     Pass,
@@ -360,7 +367,8 @@ pub enum CheckVerdict {
 }
 
 /// One immutable evidence reference retained by a receipt.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptEvidence {
     pub id: String,
     pub kind: String,
@@ -370,7 +378,7 @@ pub struct ReceiptEvidence {
 }
 
 /// How a content item is represented in a public receipt.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentKind {
     /// No content identity was authorized for export.
@@ -382,7 +390,8 @@ pub enum ContentKind {
 }
 
 /// One input or output identity retained by a receipt.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptContentItem {
     pub kind: ContentKind,
     pub label: String,
@@ -390,7 +399,8 @@ pub struct ReceiptContentItem {
 }
 
 /// Public content identity inventory. It never carries raw private bytes.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptContent {
     pub commitment_key_id: Option<String>,
     pub inputs: Vec<ReceiptContentItem>,
@@ -427,7 +437,8 @@ impl ReceiptContent {
 }
 
 /// Complete artifact identity taxonomy needed by a receipt.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptArtifacts {
     pub source_root_sha256: Sha256Digest,
     pub logical_model_sha256: Sha256Digest,
@@ -439,14 +450,16 @@ pub struct ReceiptArtifacts {
 }
 
 /// Code provenance retained separately from semantic identity.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptCodeIdentity {
     pub binary_commit: String,
     pub converter_commit: String,
 }
 
 /// Canonical, typed public projection of one `.fnlpr` receipt.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Receipt {
     pub receipt_schema: String,
     pub completeness_grade: ReceiptGrade,
@@ -515,6 +528,20 @@ impl Receipt {
             .map_err(|error| ReceiptError::Canonical(error.to_string()))
     }
 
+    /// Decode only canonical `.fnlpr` bytes through the duplicate-key-rejecting
+    /// repository JSON boundary.
+    pub fn parse_canonical_json(input: &str) -> Result<Self, ReceiptError> {
+        let canonical = canonjson::canonicalize_str(input, canonjson::ParseLimits::default())
+            .map_err(|error| ReceiptError::Canonical(error.to_string()))?;
+        if canonical.as_slice() != input.as_bytes() {
+            return Err(ReceiptError::NonCanonicalBytes);
+        }
+        let receipt: Self = serde_json::from_str(input)
+            .map_err(|error| ReceiptError::Parse(error.to_string()))?;
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
     /// Validate the grade/retention matrix and every public authority string.
     pub fn validate(&self) -> Result<(), ReceiptError> {
         if self.receipt_schema != RECEIPT_SCHEMA {
@@ -547,6 +574,8 @@ impl Receipt {
 pub enum ReceiptError {
     Identity(IdentityError),
     Canonical(String),
+    Parse(String),
+    NonCanonicalBytes,
     Schema(String),
     InvalidField {
         field: &'static str,
@@ -580,6 +609,8 @@ impl fmt::Display for ReceiptError {
         match self {
             Self::Identity(error) => write!(formatter, "receipt identity: {error}"),
             Self::Canonical(error) => write!(formatter, "receipt canonical JSON: {error}"),
+            Self::Parse(error) => write!(formatter, "receipt JSON schema: {error}"),
+            Self::NonCanonicalBytes => formatter.write_str("receipt JSON bytes are not canonical"),
             Self::Schema(schema) => write!(formatter, "unknown receipt schema {schema:?}"),
             Self::InvalidField { field, reason } => write!(formatter, "receipt {field}: {reason}"),
             Self::GradeRetention { grade, retention } => write!(
@@ -904,6 +935,20 @@ mod tests {
         )
         .expect("typed receipt");
         let rendered = receipt.canonical_json().expect("canonical receipt");
+        assert_eq!(
+            Receipt::parse_canonical_json(&rendered).expect("strict canonical receipt decode"),
+            receipt
+        );
+        assert!(matches!(
+            Receipt::parse_canonical_json(
+                r#"{"receipt_schema":"fnlpr-v1","receipt_schema":"fnlpr-v1"}"#
+            ),
+            Err(ReceiptError::Canonical(_))
+        ));
+        assert!(matches!(
+            Receipt::parse_canonical_json(&format!("{rendered}\n")),
+            Err(ReceiptError::NonCanonicalBytes)
+        ));
         assert!(rendered.contains("owner-key-2026"));
         assert!(!rendered.contains(&digest_private(private)));
         assert!(rendered.contains("\"receipt_identity\":null"));
