@@ -1,7 +1,7 @@
 use franken_nlp::artifact::format::{
-    ArchTarget, CanonicalDtype, FnlpqWriteError, FnlpqWriterInput, PackingSetInput, SectionKind,
-    SectionPayload, SectionRange, decode_prelude, encode_f32_scales, framed_sha256,
-    framed_sha256_hex, write,
+    decode_prelude, encode_f32_scales, framed_sha256, framed_sha256_hex, write, ArchTarget,
+    CanonicalDtype, FnlpqWriteError, FnlpqWriterInput, PackingSetInput, SectionKind,
+    SectionPayload, SectionRange,
 };
 use franken_nlp::canonjson;
 use serde::Serialize;
@@ -19,11 +19,8 @@ fn tiny_input() -> FnlpqWriterInput {
         recipe_id: "tiny-golden-v1".to_owned(),
         source_root_sha256: framed_sha256_hex("fnlpq-source-root-v1", &[b"tiny source manifest"])
             .expect("valid source identity"),
-        logical_model_sha256: framed_sha256_hex(
-            "fnlpq-logical-model-v1",
-            &[b"tiny logical model"],
-        )
-        .expect("valid logical identity"),
+        logical_model_sha256: framed_sha256_hex("fnlpq-logical-model-v1", &[b"tiny logical model"])
+            .expect("valid logical identity"),
         // Deliberately unordered: the writer establishes the canonical v1
         // directory sequence by kind and native section name.
         sections: vec![
@@ -134,9 +131,9 @@ fn tiny_v1_matches_committed_byte_and_header_goldens() {
     assert_eq!(prelude.section_count as usize, written.sections.len());
     assert_eq!(prelude.tensor_count, 1);
     assert_eq!(prelude.file_len as usize, written.bytes.len());
+    let expected_header_sha256: [u8; 32] = Sha256::digest(&written.header_bytes).into();
     assert_eq!(
-        prelude.header_sha256,
-        Sha256::digest(&written.header_bytes).into(),
+        prelude.header_sha256, expected_header_sha256,
         "prelude header hash must cover exactly header_len bytes"
     );
 
@@ -171,7 +168,11 @@ fn tiny_v1_matches_committed_byte_and_header_goldens() {
         );
         expected_gap_start = offset + section.stored_len as usize;
     }
-    assert_eq!(expected_gap_start, written.bytes.len(), "no trailing padding");
+    assert_eq!(
+        expected_gap_start,
+        written.bytes.len(),
+        "no trailing padding"
+    );
 }
 
 #[test]
@@ -229,7 +230,11 @@ fn field_inventory_ids_are_all_covered_by_the_writer_golden() {
         );
     }
     let written = write(&tiny_input()).expect("golden writer input succeeds");
-    assert_eq!(written.sections.len(), 9, "all v1 section kinds are represented");
+    assert_eq!(
+        written.sections.len(),
+        9,
+        "all v1 section kinds are represented"
+    );
     assert!(written
         .sections
         .iter()
@@ -241,7 +246,10 @@ fn canonical_input_order_and_digest_taxonomy_are_stable() {
     let input = tiny_input();
     let first = write(&input).expect("first canonical write");
     let second = write(&input).expect("second canonical write");
-    assert_eq!(first.bytes, second.bytes, "identical input must be byte stable");
+    assert_eq!(
+        first.bytes, second.bytes,
+        "identical input must be byte stable"
+    );
 
     let mut repacked = input.clone();
     repacked
@@ -252,7 +260,10 @@ fn canonical_input_order_and_digest_taxonomy_are_stable() {
         .bytes
         .push(0x02);
     let repacked = write(&repacked).expect("native repack writes");
-    assert_eq!(input.logical_model_sha256, tiny_input().logical_model_sha256);
+    assert_eq!(
+        input.logical_model_sha256,
+        tiny_input().logical_model_sha256
+    );
     assert_ne!(first.packing_set_sha256, repacked.packing_set_sha256);
     assert_ne!(first.fnlpq_file_sha256, repacked.fnlpq_file_sha256);
     assert_eq!(first.license_bundle_sha256, repacked.license_bundle_sha256);
@@ -267,7 +278,10 @@ fn canonical_input_order_and_digest_taxonomy_are_stable() {
         .extend_from_slice(b"Modified by franken_nlp.\n");
     let notice_only = write(&notice_only).expect("notice correction writes");
     assert_eq!(first.packing_set_sha256, notice_only.packing_set_sha256);
-    assert_ne!(first.license_bundle_sha256, notice_only.license_bundle_sha256);
+    assert_ne!(
+        first.license_bundle_sha256,
+        notice_only.license_bundle_sha256
+    );
     assert_ne!(first.fnlpq_file_sha256, notice_only.fnlpq_file_sha256);
 }
 
