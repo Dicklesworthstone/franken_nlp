@@ -1,0 +1,31 @@
+{
+  "admission": {
+    "committed_bytes": 10000000000,
+    "outcome": "admitted",
+    "peak_bytes": 9500000000
+  },
+  "artifact": {
+    "kernel_table_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "load_mode": "resident",
+    "packing_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "recipe_id": "r4-fixture-recipe"
+  },
+  "claim_id": "r4-fixture-claim",
+  "context": {
+    "kv_dtype": "bf16",
+    "tokens": 32768
+  },
+  "cpu_feature_string": "fixture-cpu-v1",
+  "host_fingerprint": "fixture-host-v1",
+  "kind": "r4-admission",
+  "ledger_entry": "PERF-R4-TYPED-001",
+  "schema_version": 1,
+  "validity_domain": {
+    "dataset": "r4-fixture-dataset",
+    "host": "fixture-host-v1",
+    "numerics_profile": "hf-bf16-eager",
+    "prompt_hash": "r4-fixture-prompt",
+    "recipe_id": "r4-fixture-recipe",
+    "thinking_mode": "r4-fixture-thinking"
+  }
+}
