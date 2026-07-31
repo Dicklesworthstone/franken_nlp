@@ -149,13 +149,23 @@ fn synthetic_metadata_rejects_new_direct_roots_and_names_the_full_path() {
         }
         "#,
     );
+    assert!(
+        metadata.is_ok(),
+        "synthetic direct-root metadata must parse: {metadata:?}"
+    );
+    let Some(metadata) = metadata.ok() else {
+        return;
+    };
 
-    let failure = evaluate_policy(
+    let result = evaluate_policy(
         &metadata,
         "franken_nlp\n└── reqwest v1.0.0",
         &BTreeSet::new(),
-    )
-    .expect_err("a fourth release root must fail");
+    );
+    assert!(result.is_err(), "a fourth release root must fail");
+    let Some(failure) = result.err() else {
+        return;
+    };
     assert_eq!(failure.offending_crate, "reqwest");
     assert_eq!(failure.full_path, "franken_nlp@0.1.0 -> reqwest@1.0.0");
 }
@@ -202,13 +212,26 @@ fn synthetic_metadata_rejects_transitive_rayon_and_names_the_full_path() {
         }
         "#,
     );
+    assert!(
+        metadata.is_ok(),
+        "synthetic Rayon metadata must parse: {metadata:?}"
+    );
+    let Some(metadata) = metadata.ok() else {
+        return;
+    };
 
-    let failure = evaluate_policy(
+    let result = evaluate_policy(
         &metadata,
         "franken_nlp\n└── ft-core v0.1.0\n    └── rayon v1.0.0",
         &BTreeSet::new(),
-    )
-    .expect_err("transitive Rayon must fail the release graph");
+    );
+    assert!(
+        result.is_err(),
+        "transitive Rayon must fail the release graph"
+    );
+    let Some(failure) = result.err() else {
+        return;
+    };
     assert_eq!(failure.offending_crate, "rayon");
     assert_eq!(
         failure.full_path,
@@ -251,9 +274,22 @@ fn synthetic_metadata_excludes_dev_only_dependencies_from_release_graph() {
         }
         "#,
     );
+    assert!(
+        metadata.is_ok(),
+        "synthetic dev-only metadata must parse: {metadata:?}"
+    );
+    let Some(metadata) = metadata.ok() else {
+        return;
+    };
 
-    let report = evaluate_policy(&metadata, "franken_nlp", &BTreeSet::new())
-        .expect("a dev-only dependency must not enter the release graph");
+    let result = evaluate_policy(&metadata, "franken_nlp", &BTreeSet::new());
+    assert!(
+        result.is_ok(),
+        "a dev-only dependency must not enter the release graph: {result:?}"
+    );
+    let Some(report) = result.ok() else {
+        return;
+    };
     assert_eq!(
         report.dev_direct_roots,
         BTreeSet::from(["rayon".to_owned()])
@@ -320,7 +356,7 @@ fn cargo_lock_packages(root: &Path) -> Result<BTreeSet<String>, PolicyFailure> {
         full_path: lock_path.display().to_string(),
         detail: format!("cannot read lockfile: {error}"),
     })?;
-    Ok(lock
+    let packages: BTreeSet<String> = lock
         .split("[[package]]")
         .skip(1)
         .filter_map(|section| {
@@ -330,7 +366,15 @@ fn cargo_lock_packages(root: &Path) -> Result<BTreeSet<String>, PolicyFailure> {
             })
         })
         .map(ToOwned::to_owned)
-        .collect())
+        .collect();
+    if packages.is_empty() {
+        return Err(PolicyFailure {
+            offending_crate: "Cargo.lock".to_owned(),
+            full_path: lock_path.display().to_string(),
+            detail: "lockfile contains no [[package]] entries".to_owned(),
+        });
+    }
+    Ok(packages)
 }
 
 fn evaluate_policy(
@@ -582,8 +626,8 @@ fn cargo_tree_mentions(cargo_tree: &str, package: &str) -> bool {
     })
 }
 
-fn parse_fixture(document: &str) -> Metadata {
-    serde_json::from_str(document).expect("synthetic dependency-policy metadata must parse")
+fn parse_fixture(document: &str) -> Result<Metadata, String> {
+    serde_json::from_str(document).map_err(|error| error.to_string())
 }
 
 fn report_pass(report: &PolicyReport) {
@@ -603,7 +647,7 @@ fn report_pass(report: &PolicyReport) {
     eprintln!("DEP_POLICY RESULT=PASS violation=none");
 }
 
-fn report_failure(failure: &PolicyFailure) -> ! {
+fn report_failure(failure: &PolicyFailure) {
     eprintln!("DEP_POLICY violation={}", failure.offending_crate);
     eprintln!("DEP_POLICY path={}", failure.full_path);
     eprintln!("DEP_POLICY detail={}", failure.detail);
@@ -611,7 +655,8 @@ fn report_failure(failure: &PolicyFailure) -> ! {
         "DEP_POLICY RESULT=FAIL violation={}",
         failure.offending_crate
     );
-    panic!(
+    assert!(
+        false,
         "dependency policy violation: {} ({})",
         failure.offending_crate, failure.full_path
     );
