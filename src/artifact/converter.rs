@@ -38,6 +38,89 @@ pub const PINNED_REVISION: &str = "f56ec5a9650268aa098496734743c25ea778bd2d";
 /// Digest of the canonical checked-in ten-file source manifest.
 pub const PINNED_SOURCE_MANIFEST_SHA256: &str =
     "9263a395e9a9c948cb66aeb9ef05147b5e6e7f848defcafd0ce6b2e31aacddca";
+/// The first admitted portable conversion recipe.  It is intentionally a
+/// recipe identity, never a loose `--quant` bit-width switch.
+pub const PINNED_CONVERSION_RECIPE: &str = "nanbeige42-int8-v1";
+
+/// The only source-to-artifact target admitted by `fnlp convert`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConvertArch {
+    /// Canonical cross-host generic representation.
+    Generic,
+}
+
+impl ConvertArch {
+    /// Parse the stable CLI spelling while refusing native derived packings.
+    pub fn parse(value: &str) -> Result<Self, ConverterError> {
+        match value {
+            "generic" => Ok(Self::Generic),
+            actual => Err(ConverterError::InvalidConvertArgument {
+                argument: "--arch",
+                expected: "generic".to_owned(),
+                actual: actual.to_owned(),
+            }),
+        }
+    }
+
+    /// Stable CLI/receipt spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Generic => "generic",
+        }
+    }
+}
+
+/// Parsed `fnlp convert` arguments, independent of the CLI parser so unit
+/// tests and robot dispatch share the same fail-closed validation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConvertRequest {
+    /// Pinned source closure directory.
+    pub source_dir: PathBuf,
+    /// Authenticated ten-file source manifest.
+    pub source_manifest: PathBuf,
+    /// Versioned conversion recipe id supplied via `--recipe`.
+    pub recipe_id: String,
+    /// Canonical target only.
+    pub arch: ConvertArch,
+    /// Final no-clobber `.fnlpq` destination.
+    pub output: PathBuf,
+    /// Interactive confirmation bypass.
+    pub yes: bool,
+    /// Reject all unrelated directory entries when true.
+    pub strict_source_dir: bool,
+    /// Emit versioned progress events on the robot data channel.
+    pub robot: bool,
+}
+
+impl ConvertRequest {
+    /// Validate immutable CLI semantics before hashing a potentially large
+    /// source closure.  `--quant` is deliberately not represented anywhere in
+    /// this request type.
+    pub fn validate(&self) -> Result<(), ConverterError> {
+        if self.recipe_id != PINNED_CONVERSION_RECIPE {
+            return Err(ConverterError::InvalidConvertArgument {
+                argument: "--recipe",
+                expected: PINNED_CONVERSION_RECIPE.to_owned(),
+                actual: self.recipe_id.clone(),
+            });
+        }
+        if self.output.as_os_str().is_empty() {
+            return Err(ConverterError::InvalidConvertArgument {
+                argument: "-o/--output",
+                expected: "a non-empty .fnlpq destination".to_owned(),
+                actual: "empty".to_owned(),
+            });
+        }
+        if self.output.extension().and_then(|value| value.to_str()) != Some("fnlpq") {
+            return Err(ConverterError::InvalidConvertArgument {
+                argument: "-o/--output",
+                expected: "a .fnlpq destination".to_owned(),
+                actual: self.output.display().to_string(),
+            });
+        }
+        Ok(())
+    }
+}
 
 /// One file included in the immutable conversion source closure.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1187,6 +1270,12 @@ pub fn activate_no_clobber(
 /// and expected values plus a next command where an operator can act.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConverterError {
+    /// `fnlp convert` was invoked outside its one-recipe/Generic contract.
+    InvalidConvertArgument {
+        argument: &'static str,
+        expected: String,
+        actual: String,
+    },
     /// Bounded canonical JSON parser rejection.
     ManifestJson(canonjson::CanonJsonError),
     /// Manifest schema/type/key validation failure.
@@ -1302,6 +1391,14 @@ pub enum ConverterError {
 impl fmt::Display for ConverterError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidConvertArgument {
+                argument,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "convert argument {argument} mismatch: expected={expected} observed={actual}; next=run fnlp convert --recipe {PINNED_CONVERSION_RECIPE} --arch generic"
+            ),
             Self::ManifestJson(error) => write!(formatter, "source manifest JSON: {error}"),
             Self::ManifestSchema { path, detail } => write!(formatter, "source manifest {path}: {detail}"),
             Self::ManifestTooLarge { path, observed, cap } => write!(formatter, "source manifest {} is {observed} bytes; cap is {cap}", path.display()),

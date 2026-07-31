@@ -3,7 +3,7 @@
 
 use franken_nlp::artifact::converter::{
     expected_nanbeige42_census, remap_tensor_name, validate_nanbeige42_census, ConversionReceipt,
-    ConversionSourceManifest, StorageStage,
+    ConversionSourceManifest, ConvertArch, ConvertRequest, StorageStage,
 };
 use franken_nlp::artifact::safetensors::TensorCensusEntry;
 
@@ -90,4 +90,20 @@ fn receipt_requires_every_identity_and_serializes_canonically() {
 
     let json = receipt.canonical_json().expect("complete receipt");
     assert!(json.contains("\"recipe_id\":\"nanbeige42-int8-v1\""));
+}
+
+#[test]
+fn cli_contract_admits_only_recipe_and_generic_arch() {
+    let request = ConvertRequest {
+        source_dir: "source".into(),
+        source_manifest: "manifest.json".into(),
+        recipe_id: "nanbeige42-int8-v1".to_owned(),
+        arch: ConvertArch::parse("generic").expect("generic arch"),
+        output: "artifact.fnlpq".into(),
+        yes: true,
+        strict_source_dir: false,
+        robot: false,
+    };
+    request.validate().expect("reference invocation contract");
+    assert!(ConvertArch::parse("x86-avx2").is_err());
 }
