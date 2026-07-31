@@ -5,3 +5,4 @@
 # is the executable closure and carries every resolved package hash.
 transformers==4.51.0
 torch==2.6.0
+protobuf==5.29.5
