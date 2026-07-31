@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import importlib
 import json
 import math
 import re
@@ -582,6 +583,150 @@ def closure_digest(repo_root: Path) -> str:
     if not path.is_file():
         raise TraceError(f"oracle closure record is absent: {path}")
     return sha256_path(path)
+
+
+def write_new_json(path: Path, payload: object) -> None:
+    """Write a capture once, refusing any path that already has an object."""
+
+    if path.exists() or path.is_symlink():
+        raise TraceError(f"refusing to overwrite existing capture output: {path}")
+    if not path.parent.is_dir():
+        raise TraceError(f"capture output parent does not exist: {path.parent}")
+    try:
+        with path.open("x", encoding="utf-8", newline="\n") as handle:
+            handle.write(canonical_json(payload).decode("utf-8"))
+            handle.flush()
+    except FileExistsError as error:
+        raise TraceError(f"refusing to overwrite existing capture output: {path}") from error
+
+
+def bf16_hex(tensor: Any, torch_module: Any) -> str:
+    """Serialize a CPU bf16 tensor by its IEEE bfloat16 bit patterns."""
+
+    values = tensor.detach().to(device="cpu", dtype=torch_module.bfloat16).contiguous()
+    try:
+        words = values.view(torch_module.int16).reshape(-1).tolist()
+    except RuntimeError as error:
+        raise TraceError(f"cannot view bf16 capture values as u16 bits: {error}") from error
+    return "".join(f"{int(word) & 0xffff:04x}" for word in words)
+
+
+def capture_rope_application(args: argparse.Namespace) -> int:
+    """Capture one real first-prefill Q/K RoPE row with an oracle receipt.
+
+    This narrow capture is evidence for one application path only.  It does not
+    claim L-ladder parity, coverage of later loop/layer states, or any
+    performance result.
+    """
+
+    if args.model_source is None or not args.model_source.is_dir():
+        log("ROPE_CAPTURE", "RESULT=SKIPPED_NO_MODEL captures=0 missing=source-closure")
+        return 0
+    if args.rope_application_output is None:
+        raise TraceError("--capture-rope-application requires --rope-application-output")
+    if args.profile != "hf-bf16-eager":
+        raise TraceError("--capture-rope-application requires --profile hf-bf16-eager")
+
+    try:
+        verify_model_source_closure(args.model_source)
+        generator_commit = git_commit()
+        if not re.fullmatch(r"[0-9a-f]{40}", generator_commit):
+            raise TraceError("cannot receipt RoPE capture without a Git commit")
+        torch_module, _tokenizer, model = load_oracle(PROFILES[args.profile], args.model_source)
+        layers, _final_norm, embed, _lm_head = resolve_trace_modules(model)
+        if len(layers) != PHYSICAL_LAYER_COUNT:
+            raise TraceError(f"expected {PHYSICAL_LAYER_COUNT} physical layers, observed {len(layers)}")
+        layer = layers[0]
+        attention = resolve_module(layer, ("self_attn", "attention"), "first-layer attention")
+        for name in ("q_proj", "k_proj", "v_proj", "rotary_emb", "num_heads", "num_key_value_heads", "head_dim"):
+            if not hasattr(attention, name):
+                raise TraceError(f"first-layer attention lacks required RoPE capture member: {name}")
+        if not hasattr(layer, "input_layernorm"):
+            raise TraceError("first decoder layer lacks input_layernorm")
+        remote_module = importlib.import_module(attention.__class__.__module__)
+        apply_rotary = getattr(remote_module, "apply_rotary_pos_emb", None)
+        if not callable(apply_rotary):
+            raise TraceError("remote attention module does not expose apply_rotary_pos_emb")
+
+        input_ids = torch_module.tensor([[1, 2]], dtype=torch_module.long)
+        position_ids = torch_module.arange(input_ids.shape[1], dtype=torch_module.long).unsqueeze(0)
+        with torch_module.inference_mode():
+            prefill = model(input_ids=input_ids, use_cache=True)
+            hidden_states = layer.input_layernorm(embed(input_ids))
+            batch, sequence, _hidden = hidden_states.shape
+            query = attention.q_proj(hidden_states).view(
+                batch, sequence, attention.num_heads, attention.head_dim
+            ).transpose(1, 2)
+            key = attention.k_proj(hidden_states).view(
+                batch, sequence, attention.num_key_value_heads, attention.head_dim
+            ).transpose(1, 2)
+            value = attention.v_proj(hidden_states).view(
+                batch, sequence, attention.num_key_value_heads, attention.head_dim
+            ).transpose(1, 2)
+            if getattr(attention, "q_layernorm", None) is not None:
+                query = attention.q_layernorm(query)
+            if getattr(attention, "k_layernorm", None) is not None:
+                key = attention.k_layernorm(key)
+            cosine, sine = attention.rotary_emb(value, position_ids)
+            rotated_query, rotated_key = apply_rotary(query, key, cosine, sine)
+            cached_key, _cached_value = extract_kv_slots(output_past_key_values(prefill))[0]
+
+        position = int(input_ids.shape[1] - 1)
+        query_head = 0
+        key_head = 0
+        captured_key = rotated_key[0, key_head, position]
+        cache_key = cached_key[0, key_head, position]
+        if not torch_module.equal(captured_key, cache_key):
+            raise TraceError("first-prefill rotated K differs from the model KV cache")
+
+        repo_root = args.repo_root.resolve()
+        source_manifest = repo_root / "docs" / "truth-pack" / "nanbeige4.2-3b.source.json"
+        source_record = repo_root / "docs" / "truth-pack" / "oracle_env.json"
+        modeling_source = repo_root / "docs" / "truth-pack" / "research" / "modeling_nanbeige.py"
+        for path in (source_manifest, source_record, modeling_source):
+            if not path.is_file() or path.is_symlink():
+                raise TraceError(f"required RoPE capture receipt input is absent or non-regular: {path}")
+        application = {
+            "capture_schema_version": 2,
+            "cosine_bf16_hex": bf16_hex(cosine[0, position], torch_module),
+            "input_ids": [int(value) for value in input_ids[0].tolist()],
+            "key_head": key_head,
+            "key_input_bf16_hex": bf16_hex(key[0, key_head, position], torch_module),
+            "key_rotated_bf16_hex": bf16_hex(captured_key, torch_module),
+            "layer": 0,
+            "loop": 0,
+            "modeling_source_sha256": sha256_path(modeling_source),
+            "phase": "prefill",
+            "position": position,
+            "profile": args.profile,
+            "query_head": query_head,
+            "query_input_bf16_hex": bf16_hex(query[0, query_head, position], torch_module),
+            "query_rotated_bf16_hex": bf16_hex(rotated_query[0, query_head, position], torch_module),
+            "sine_bf16_hex": bf16_hex(sine[0, position], torch_module),
+            "torch": str(torch_module.__version__),
+        }
+        receipt = {
+            "capture_scope": "loop0/layer0/prefill/position1/query-head0/key-head0",
+            "generator_commit": generator_commit,
+            "generator_path": "scripts/gen_reference_fixtures.py",
+            "generation_command": list(sys.argv),
+            "model_id": MODEL_ID,
+            "model_source_closure_verification": "passed-before-model-load",
+            "oracle_env_record_sha256": sha256_path(source_record),
+            "pinned_revision": PINNED_REVISION,
+            "source_manifest_sha256": sha256_path(source_manifest),
+        }
+        write_new_json(args.rope_application_output, {"application": application, "receipt": receipt})
+        log(
+            "ROPE_CAPTURE",
+            "RESULT=PASS captures=1 "
+            f"output={args.rope_application_output} key_cache_match=true "
+            "scope=loop0/layer0/prefill/position1/q0/k0",
+        )
+        return 0
+    except (OSError, TraceError) as error:
+        log("ROPE_CAPTURE", f"RESULT=FAIL captures=0 error={error}")
+        return 1
 
 
 def capture_prompt(
@@ -1640,6 +1785,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trace-selftest", action="store_true", help="run model-gated trace checks including perturbation detection")
     parser.add_argument("--generate", action="store_true", help="generate and seal the complete profile-tagged fixture matrix")
     parser.add_argument(
+        "--capture-rope-application",
+        action="store_true",
+        help="capture one receipt-bound first-prefill Q/K RoPE application row",
+    )
+    parser.add_argument(
         "--refresh-auxiliary",
         action="store_true",
         help="refresh model-gated tokenizer/template evidence and reseal its manifest digest",
@@ -1648,6 +1798,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--self-test", action="store_true", help="run model-free fixture-format negative checks")
     parser.add_argument("--model-source", type=Path, help="revision-scoped local Nanbeige source closure")
     parser.add_argument("--output", type=Path, default=Path("tests/fixtures/reference"), help="fixture output root")
+    parser.add_argument(
+        "--rope-application-output",
+        type=Path,
+        help="new JSON output path required by --capture-rope-application; existing paths are refused",
+    )
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1], help="repository root")
     parser.add_argument("--profile", choices=[*sorted(PROFILES), "all"], default="hf-bf16-eager")
     parser.add_argument("--prompt", action="append", help="fixture prompt; repeat to add prompts")
@@ -1676,6 +1831,7 @@ def main() -> int:
             args.trace,
             args.trace_selftest,
             args.generate,
+            args.capture_rope_application,
             args.refresh_auxiliary,
             args.verify,
             args.self_test,
@@ -1683,7 +1839,8 @@ def main() -> int:
     )
     if selected != 1:
         parser.error(
-            "select exactly one of --trace, --trace-selftest, --generate, --refresh-auxiliary, --verify, or --self-test"
+            "select exactly one of --trace, --trace-selftest, --generate, --capture-rope-application, "
+            "--refresh-auxiliary, --verify, or --self-test"
         )
     if args.max_new_tokens <= 0:
         parser.error("--max-new-tokens must be positive")
@@ -1693,6 +1850,8 @@ def main() -> int:
         return run_trace(args, selftest=args.trace_selftest)
     if args.generate:
         return run_generate(args)
+    if args.capture_rope_application:
+        return capture_rope_application(args)
     if args.refresh_auxiliary:
         return run_refresh_auxiliary(args)
     if args.verify:
