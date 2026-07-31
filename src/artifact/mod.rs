@@ -7,4 +7,5 @@ pub mod package;
 pub mod packing;
 pub mod pull;
 pub mod quantize;
+pub mod reader;
 pub mod safetensors;
