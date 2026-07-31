@@ -1150,11 +1150,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trace", action="store_true", help="capture prefill and one-token-append traces")
     parser.add_argument("--trace-selftest", action="store_true", help="run model-gated trace checks including perturbation detection")
+    parser.add_argument("--generate", action="store_true", help="generate and seal the complete profile-tagged fixture matrix")
+    parser.add_argument("--verify", action="store_true", help="verify a committed fixture manifest without a model")
+    parser.add_argument("--self-test", action="store_true", help="run model-free fixture-format negative checks")
     parser.add_argument("--model-source", type=Path, help="revision-scoped local Nanbeige source closure")
     parser.add_argument("--output", type=Path, default=Path("tests/fixtures/reference"), help="fixture output root")
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1], help="repository root")
-    parser.add_argument("--profile", choices=sorted(PROFILES), default="hf-bf16-eager")
+    parser.add_argument("--profile", choices=[*sorted(PROFILES), "all"], default="hf-bf16-eager")
     parser.add_argument("--prompt", action="append", help="fixture prompt; repeat to add prompts")
+    parser.add_argument(
+        "--corpus",
+        type=Path,
+        default=Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "reference_inputs.json",
+        help="repository-authored prompt/tokenizer/template input corpus used by --generate",
+    )
+    parser.add_argument(
+        "--oracle-floor",
+        type=Path,
+        default=Path(__file__).resolve().parents[1] / "docs" / "truth-pack" / "oracle_floor.json",
+        help="measured oracle floor with stable_prefixes used by --generate/--verify",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=8)
     return parser
 
@@ -1162,14 +1177,20 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    selected = sum(bool(value) for value in (args.trace, args.trace_selftest))
+    selected = sum(bool(value) for value in (args.trace, args.trace_selftest, args.generate, args.verify, args.self_test))
     if selected != 1:
-        parser.error("select exactly one of --trace or --trace-selftest")
+        parser.error("select exactly one of --trace, --trace-selftest, --generate, --verify, or --self-test")
     if args.max_new_tokens <= 0:
         parser.error("--max-new-tokens must be positive")
+    if args.profile == "all" and not args.generate:
+        parser.error("--profile all is valid only with --generate")
     if args.trace or args.trace_selftest:
         return run_trace(args, selftest=args.trace_selftest)
-    return run_trace(args, selftest=args.trace_selftest)
+    if args.generate:
+        return run_generate(args)
+    if args.verify:
+        return verify_fixture_root(args.output.resolve(), args.oracle_floor if args.oracle_floor.is_file() else None)
+    return run_fixture_self_test()
 
 
 if __name__ == "__main__":
