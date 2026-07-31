@@ -41,6 +41,8 @@ LOOP_COUNT = 2
 TRACE_SLOT_COUNT = PHYSICAL_LAYER_COUNT * LOOP_COUNT
 KV_SLOT_COUNT = TRACE_SLOT_COUNT
 TRACE_FORMAT_VERSION = 1
+SOURCE_CLOSURE_VERIFICATION = "verified-full-ten-file-sha256"
+SOURCE_ROOT_DIGEST_TAG = b"fnlpq-source-root-v1\0"
 DEFAULT_PROMPTS = (
     "The two-pass loop is explicit.",
     "Return a concise trace label.",
@@ -73,6 +75,13 @@ class FixtureProvenance:
             "generator_commit": self.generator_commit,
             "generation_command": list(self.generation_command),
         }
+
+
+@dataclass(frozen=True)
+class SourceClosureBinding:
+    """Identity emitted only after the full pinned ten-file rehash succeeds."""
+
+    source_root_sha256: str
 
 
 @dataclass(frozen=True)
@@ -562,20 +571,59 @@ def load_oracle(profile: NumericsProfile, model_source: Path) -> tuple[Any, Any,
     return torch, tokenizer, model
 
 
-def verify_model_source_closure(model_source: Path) -> None:
+def source_root_sha256(entries: Sequence[dict[str, object]]) -> str:
+    """Mirror the converter's framed, ordered ten-file source-root identity."""
+
+    digest = hashlib.sha256()
+    digest.update(SOURCE_ROOT_DIGEST_TAG)
+    digest.update(len(entries).to_bytes(8, byteorder="little", signed=False))
+    for entry in entries:
+        name = entry.get("name")
+        byte_length = entry.get("bytes")
+        file_sha256 = entry.get("sha256")
+        if (
+            not isinstance(name, str)
+            or not isinstance(byte_length, int)
+            or isinstance(byte_length, bool)
+            or byte_length < 0
+            or not isinstance(file_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", file_sha256)
+        ):
+            raise TraceError("verified source manifest has an invalid source-root record")
+        encoded_name = name.encode("utf-8")
+        digest.update(len(encoded_name).to_bytes(8, byteorder="little", signed=False))
+        digest.update(encoded_name)
+        digest.update(byte_length.to_bytes(8, byteorder="little", signed=False))
+        digest.update(file_sha256.encode("ascii"))
+    return digest.hexdigest()
+
+
+def verify_model_source_closure(model_source: Path) -> SourceClosureBinding:
     """Require the oracle's hash-bound ten-file closure before source access."""
 
     try:
-        from verify_oracle_env import OracleFailure, read_record, source_files, verify_record
+        from verify_oracle_env import (
+            OracleFailure,
+            read_record,
+            source_files,
+            verified_source_manifest_entries,
+            verify_record,
+        )
     except ImportError as error:
         raise TraceError(f"cannot import oracle source-closure verifier: {error}") from error
 
     try:
         record = read_record()
         verify_record(record)
-        source_files(record, model_source, need_weights=True)
+        closure = source_files(record, model_source, need_weights=True)
+        entries = verified_source_manifest_entries(record)
+        if closure.get("file_count") != len(entries) or closure.get("closure_total_bytes") != sum(
+            int(entry["bytes"]) for entry in entries
+        ):
+            raise TraceError("full source closure receipt disagrees with its manifest rehash")
     except (OSError, OracleFailure) as error:
         raise TraceError(f"full source closure verification failed: {error}") from error
+    return SourceClosureBinding(source_root_sha256=source_root_sha256(entries))
 
 
 def closure_digest(repo_root: Path) -> str:
@@ -749,11 +797,14 @@ def capture_prompt(
     prompt: str,
     max_new_tokens: int,
     sample_seeds: Sequence[int],
-) -> tuple[TracePhase, TracePhase, list[int], list[dict[str, object]], Any]:
+) -> tuple[TracePhase, TracePhase, list[int], list[int], list[int], list[dict[str, object]], Any]:
     layers, final_norm, embed, lm_head = resolve_trace_modules(model)
     collector = TraceCollector(torch_module, layers, final_norm, embed, lm_head)
     collector.install()
     tokenized = tokenizer(prompt, return_tensors="pt")
+    prefill_input_ids = [int(value) for value in tokenized["input_ids"][0].tolist()]
+    if not prefill_input_ids:
+        raise TraceError("tokenizer produced an empty prefill input-id sequence")
     try:
         with torch_module.inference_mode():
             collector.begin_phase("prefill")
@@ -763,6 +814,9 @@ def capture_prompt(
             capture_kv(prefill_phase, output_past_key_values(prefill_output), torch_module)
 
             append_input = output_logits(prefill_output)[:, -1, :].argmax(dim=-1, keepdim=True)
+            append_input_ids = [int(value) for value in append_input[0].tolist()]
+            if len(append_input_ids) != 1:
+                raise TraceError("trace append must record exactly one input id")
             collector.begin_phase("append")
             append_output = model(
                 input_ids=append_input,
@@ -777,7 +831,15 @@ def capture_prompt(
         collector.close()
     with torch_module.inference_mode():
         sampled = sampled_token_streams(model, tokenized, max_new_tokens, sample_seeds, torch_module)
-    return prefill_phase, append_phase, greedy, sampled, prefill_logits
+    return (
+        prefill_phase,
+        append_phase,
+        prefill_input_ids,
+        append_input_ids,
+        greedy,
+        sampled,
+        prefill_logits,
+    )
 
 
 def write_phase(output_root: Path, phase: TracePhase, prefix: str) -> dict[str, object]:
@@ -805,6 +867,8 @@ def write_trace_bundle(
     profile: NumericsProfile,
     prompt: str,
     prompt_index: int,
+    prefill_input_ids: Sequence[int],
+    append_input_ids: Sequence[int],
     prefill: TracePhase,
     append: TracePhase,
     greedy: list[int],
@@ -814,6 +878,7 @@ def write_trace_bundle(
     oracle_floor_sha256: str | None,
     stable_prefix_length: int | None,
     provenance: FixtureProvenance | None,
+    source_binding: SourceClosureBinding,
 ) -> Path:
     bundle = output_root / profile.name / f"prompt-{prompt_index:03d}"
     bundle.mkdir(parents=True, exist_ok=False)
@@ -821,6 +886,8 @@ def write_trace_bundle(
         "format_version": TRACE_FORMAT_VERSION,
         "model_id": MODEL_ID,
         "revision": PINNED_REVISION,
+        "source_closure_verification": SOURCE_CLOSURE_VERIFICATION,
+        "source_root_sha256": source_binding.source_root_sha256,
         "profile": profile.name,
         "dtype": profile.torch_dtype_name,
         "attention_backend": profile.attention_backend,
@@ -829,6 +896,8 @@ def write_trace_bundle(
         "generator_commit": git_commit(),
         "prompt_sha256": sha256_bytes(prompt.encode("utf-8")),
         "prompt_index": prompt_index,
+        "prefill_input_ids": list(prefill_input_ids),
+        "append_input_ids": list(append_input_ids),
         "greedy_tokens": greedy,
         "sampled_streams": list(sampled_streams),
         "greedy_contract": {
@@ -1530,6 +1599,7 @@ def run_trace(
     stable_prefixes: dict[str, int] | None = None,
     provenance: FixtureProvenance | None = None,
     source_verified: bool = False,
+    source_binding: SourceClosureBinding | None = None,
 ) -> int:
     model_source = args.model_source
     if model_source is None or not model_source.is_dir():
@@ -1537,7 +1607,9 @@ def run_trace(
         return 0
     try:
         if not source_verified:
-            verify_model_source_closure(model_source)
+            source_binding = verify_model_source_closure(model_source)
+        if source_binding is None:
+            raise TraceError("trace capture needs a completed full source-closure binding")
         profile = PROFILES[args.profile]
         oracle_digest = closure_digest(args.repo_root)
         if provenance is not None and not hmac.compare_digest(oracle_digest, provenance.oracle_closure_sha256):
@@ -1556,7 +1628,7 @@ def run_trace(
                 stable_prefix = stable_prefixes.get(prompt_digest)
                 if stable_prefix is None:
                     raise TraceError(f"oracle floor has no stable prefix for prompt_sha256={prompt_digest}")
-            prefill, append, greedy, sampled, logits = capture_prompt(
+            prefill, append, prefill_input_ids, append_input_ids, greedy, sampled, logits = capture_prompt(
                 torch_module, tokenizer, model, prompt, args.max_new_tokens, sample_seeds
             )
             compare_untraced(torch_module, tokenizer, model, prompt, args.max_new_tokens, logits, greedy)
@@ -1565,6 +1637,8 @@ def run_trace(
                 profile,
                 prompt,
                 index,
+                prefill_input_ids,
+                append_input_ids,
                 prefill,
                 append,
                 greedy,
@@ -1574,6 +1648,7 @@ def run_trace(
                 oracle_floor_sha256,
                 stable_prefix,
                 provenance,
+                source_binding,
             )
             index_payload = read_json(written)
             taps, norms, kv_slots = trace_counts(index_payload)
@@ -1673,7 +1748,7 @@ def run_generate(args: argparse.Namespace) -> int:
     try:
         if args.profile != "all":
             raise TraceError("--generate requires --profile all for the complete comparison matrix")
-        verify_model_source_closure(args.model_source)
+        source_binding = verify_model_source_closure(args.model_source)
         corpus = load_fixture_inputs(args.corpus)
         floor_digest, stable_prefixes = stable_prefixes_from_floor(args.oracle_floor)
         prompts = corpus["prompts"]
@@ -1704,6 +1779,7 @@ def run_generate(args: argparse.Namespace) -> int:
                 stable_prefixes=stable_prefixes,
                 provenance=provenance,
                 source_verified=True,
+                source_binding=source_binding,
             )
             if status != 0:
                 log("REF_FIXTURES", "RESULT=FAIL fixtures=0 missing=trace-capture")
