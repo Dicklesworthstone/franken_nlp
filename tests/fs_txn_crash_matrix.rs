@@ -251,6 +251,38 @@ fn forged_successors_raise_activation_fork_and_retain_last_unambiguous_head() {
 }
 
 #[test]
+fn append_refuses_an_existing_fork_without_mutating_forensic_records() {
+    let mut journal = SimulatedActivationJournal::new();
+    let genesis = journal.append(digest(1), digest(2), digest(3)).unwrap();
+    let left = ActivationRecord::new(
+        ActivationRecordBody::successor(&genesis.record, digest(4), digest(5), digest(6)).unwrap(),
+    );
+    let right = ActivationRecord::new(
+        ActivationRecordBody::successor(&genesis.record, digest(7), digest(8), digest(9)).unwrap(),
+    );
+    journal.retain_recovery_fixture(left).unwrap();
+    journal.retain_recovery_fixture(right).unwrap();
+    let retained_before = journal.records().to_vec();
+
+    let error = journal
+        .append(digest(10), digest(11), digest(12))
+        .expect_err("a forked journal has no append authority");
+    assert!(matches!(
+        error,
+        FsTxError::ActivationFork {
+            last_unambiguous: Some(_),
+            ..
+        }
+    ));
+    assert_eq!(
+        journal.records(),
+        retained_before.as_slice(),
+        "append refusal must preserve all competing retained evidence"
+    );
+    log_walk("append-refuses-existing-fork", "FORK", &journal);
+}
+
+#[test]
 fn fork_walk_is_stable_across_retained_record_order() {
     let genesis = ActivationRecord::new(ActivationRecordBody::genesis(
         digest(1),
