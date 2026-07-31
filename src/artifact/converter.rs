@@ -1739,7 +1739,7 @@ mod tests {
         decode_bf16_panel, expected_nanbeige42_census, remap_tensor_name, ConversionProgress,
         OutputRangePlan, PanelPlan, PeakRssFormula, StorageStage, TensorCensusEntry,
     };
-    use crate::artifact::safetensors::SafetensorDtype;
+    use crate::artifact::safetensors::{RowPanel, SafetensorDtype};
 
     #[test]
     fn census_has_the_full_pinned_mapping_surface() {
