@@ -1,0 +1,152 @@
+{
+  "channel": "nightly-2026-07-20",
+  "compiler_identity": {
+    "commit_date": "2026-07-19",
+    "commit_hash": "9f36de775bc636c8e88c31a173c2bcb6995956a0",
+    "llvm_version": "22.1.8",
+    "release": "1.99.0-nightly",
+    "rustc_vv_volatile_fields": [
+      "host"
+    ]
+  },
+  "record_per_ci_run": {
+    "enabled_target_features": true,
+    "llvm_version": true,
+    "rustc_vv": true,
+    "target_feature_catalogue": true,
+    "target_triple": true
+  },
+  "release_targets": [
+    {
+      "enabled_target_features": [
+        "aes",
+        "crc",
+        "dit",
+        "dotprod",
+        "dpb",
+        "dpb2",
+        "fcma",
+        "fhm",
+        "flagm",
+        "flagm2",
+        "fp16",
+        "frintts",
+        "jsconv",
+        "lor",
+        "lse",
+        "lse2",
+        "neon",
+        "paca",
+        "pacg",
+        "pan",
+        "pmuv3",
+        "ras",
+        "rcpc",
+        "rcpc2",
+        "rdm",
+        "sb",
+        "sha2",
+        "sha3",
+        "ssbs",
+        "v8.1a",
+        "v8.2a",
+        "v8.3a",
+        "v8.4a",
+        "vh"
+      ],
+      "required_compiler_features": [
+        "dotprod",
+        "i8mm",
+        "neon"
+      ],
+      "triple": "aarch64-apple-darwin"
+    },
+    {
+      "enabled_target_features": [
+        "cmpxchg16b",
+        "fxsr",
+        "lahfsahf",
+        "sse",
+        "sse2",
+        "sse3",
+        "sse4.1",
+        "ssse3",
+        "x87"
+      ],
+      "required_compiler_features": [
+        "avx2",
+        "avx512vnni",
+        "avxvnni",
+        "sse2"
+      ],
+      "triple": "x86_64-apple-darwin"
+    },
+    {
+      "enabled_target_features": [
+        "fxsr",
+        "sse",
+        "sse2",
+        "x87"
+      ],
+      "required_compiler_features": [
+        "avx2",
+        "avx512vnni",
+        "avxvnni",
+        "sse2"
+      ],
+      "triple": "x86_64-unknown-linux-gnu"
+    },
+    {
+      "enabled_target_features": [
+        "neon",
+        "outline-atomics"
+      ],
+      "required_compiler_features": [
+        "dotprod",
+        "i8mm",
+        "neon"
+      ],
+      "triple": "aarch64-unknown-linux-gnu"
+    },
+    {
+      "enabled_target_features": [
+        "cmpxchg16b",
+        "fxsr",
+        "lahfsahf",
+        "sse",
+        "sse2",
+        "sse3",
+        "x87"
+      ],
+      "required_compiler_features": [
+        "avx2",
+        "avx512vnni",
+        "avxvnni",
+        "sse2"
+      ],
+      "triple": "x86_64-pc-windows-msvc"
+    }
+  ],
+  "required_components": [
+    "clippy",
+    "rustfmt"
+  ],
+  "required_language_features": [
+    "portable_simd",
+    "stdarch_aarch64_dotprod",
+    "stdarch_aarch64_i8mm"
+  ],
+  "schema_version": 1,
+  "selection": {
+    "batch_verification_pending": [
+      "cargo +nightly-2026-07-20 check --locked on every release target",
+      "portable_simd and stdarch compile probes on their applicable targets"
+    ],
+    "selected_on": "2026-07-31",
+    "verified_locally": [
+      "rustc -Vv identity recorded from the dated toolchain",
+      "rustfmt and clippy components installed for the dated host toolchain",
+      "aarch64 target-feature catalogues expose dotprod, i8mm, and neon"
+    ]
+  }
+}
