@@ -287,6 +287,27 @@ pub fn corrected_x86_offset_dot_i32(
     corrected_x86_offset_dot_with_sum_i32(activations, weights, row_sum)
 }
 
+/// Exact x86 offset-domain dot for already transformed `u = qx XOR 0x80` bytes.
+///
+/// This is the entry point used by U8-by-S8 hardware tiers. It recomputes the
+/// logical row sum for a standalone scalar call; packed production paths use
+/// [`VerifiedPackedRows`] so their stored sum is first digest- and
+/// row-sum-verified before reaching the same correction implementation.
+pub fn corrected_x86_offset_u8_dot_i32(
+    offset_activations: &[u8],
+    weights: &[i8],
+) -> Result<i32, QuantAlgebraError> {
+    if offset_activations.len() != weights.len() {
+        return Err(QuantAlgebraError::LengthMismatch {
+            operand: "offset dot weights",
+            expected: offset_activations.len(),
+            observed: weights.len(),
+        });
+    }
+    let row_sum = sum_row_i32(weights)?;
+    corrected_x86_offset_u8_dot_with_sum_i32(offset_activations, weights, row_sum)
+}
+
 /// Applies the exact U8-by-S8 correction after a verified row sum is available.
 ///
 /// Callers do not receive a correction table from this function; the only
@@ -298,11 +319,48 @@ fn corrected_x86_offset_dot_with_sum_i32(
     row_sum: i32,
 ) -> Result<i32, QuantAlgebraError> {
     require_matching_lengths("offset dot weights", activations, weights)?;
-    let raw = activations
-        .iter()
+    corrected_x86_offset_dot_from_iter_i32(
+        activations.len(),
+        activations.iter().copied().map(s8_to_x86_offset_u8),
+        weights,
+        row_sum,
+    )
+}
+
+fn corrected_x86_offset_u8_dot_with_sum_i32(
+    offset_activations: &[u8],
+    weights: &[i8],
+    row_sum: i32,
+) -> Result<i32, QuantAlgebraError> {
+    corrected_x86_offset_dot_from_iter_i32(
+        offset_activations.len(),
+        offset_activations.iter().copied(),
+        weights,
+        row_sum,
+    )
+}
+
+fn corrected_x86_offset_dot_from_iter_i32<I>(
+    activation_len: usize,
+    offset_activations: I,
+    weights: &[i8],
+    row_sum: i32,
+) -> Result<i32, QuantAlgebraError>
+where
+    I: IntoIterator<Item = u8>,
+{
+    if activation_len != weights.len() {
+        return Err(QuantAlgebraError::LengthMismatch {
+            operand: "offset dot weights",
+            expected: activation_len,
+            observed: weights.len(),
+        });
+    }
+    let raw = offset_activations
+        .into_iter()
         .zip(weights)
-        .fold(0_i64, |sum, (&qx, &weight)| {
-            sum + i64::from(s8_to_x86_offset_u8(qx)) * i64::from(weight)
+        .fold(0_i64, |sum, (activation, &weight)| {
+            sum + i64::from(activation) * i64::from(weight)
         });
     let correction = 128_i64 * i64::from(row_sum);
     let corrected = raw - correction;

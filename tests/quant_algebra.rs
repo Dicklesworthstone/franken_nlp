@@ -1,12 +1,15 @@
+use franken_nlp::native_engine::int8::{
+    dequantize_i32_fixed, dot_int4_grouped_s8, dot_u8s8_xor128,
+};
 use franken_nlp::native_engine::quant_algebra::{
-    apply_fixed_scale_order, corrected_x86_offset_dot_i32, offset_correction_bound,
-    offset_intermediate_bound, raw_u8_s8_bound, s8_slice_to_x86_offset_u8, s8_to_x86_offset_u8,
-    signed_dot_i32, signed_s8_s8_bound, sum_int4_groups_in_fixed_order, DigestBoundRowSums,
-    EpilogueScales, PhysicalSectionDigest, QuantAlgebraError, RowSumTable, ScaleOperand,
-    INT4_GROUP_SUM_ORDER, MAX_MODEL_K, MAX_OFFSET_CORRECTION_K_10752,
-    MAX_OFFSET_INTERMEDIATE_K_10752, MAX_S8_S8_ACCUMULATOR_K_10752,
-    MAX_U8_S8_RAW_ACCUMULATOR_K_10752, ROW_SUM_TABLE_HEADER_BYTES, S8_ZERO_POINT,
-    SCALE_APPLICATION_ORDER, X86_ACTIVATION_XOR_OFFSET,
+    DigestBoundRowSums, EpilogueScales, INT4_GROUP_SUM_ORDER, MAX_MODEL_K,
+    MAX_OFFSET_CORRECTION_K_10752, MAX_OFFSET_INTERMEDIATE_K_10752, MAX_S8_S8_ACCUMULATOR_K_10752,
+    MAX_U8_S8_RAW_ACCUMULATOR_K_10752, PhysicalSectionDigest, QuantAlgebraError,
+    ROW_SUM_TABLE_HEADER_BYTES, RowSumTable, S8_ZERO_POINT, SCALE_APPLICATION_ORDER, ScaleOperand,
+    X86_ACTIVATION_XOR_OFFSET, apply_fixed_scale_order, corrected_x86_offset_dot_i32,
+    corrected_x86_offset_u8_dot_i32, offset_correction_bound, offset_intermediate_bound,
+    raw_u8_s8_bound, s8_slice_to_x86_offset_u8, s8_to_x86_offset_u8, signed_dot_i32,
+    signed_s8_s8_bound, sum_int4_groups_in_fixed_order,
 };
 
 #[test]
@@ -41,6 +44,46 @@ fn corrected_offset_dot_matches_signed_dot_at_full_domain_extremes_and_k10752() 
             signed_dot_i32(&activations, &weights).unwrap(),
             "activation={activation} weight={weight}"
         );
+    }
+}
+
+#[test]
+fn full_domain_seeded_vectors_and_tails_share_one_signed_and_x86_identity() {
+    fn next_i8(state: &mut u64) -> i8 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (*state >> 56) as u8 as i8
+    }
+
+    for (case, k) in [1_usize, 15, 16, 17, 31, 32, 33, 3_072, 6_144, MAX_MODEL_K]
+        .into_iter()
+        .enumerate()
+    {
+        let mut state = 0x8_u64.wrapping_add(case as u64);
+        let activations = (0..k).map(|_| next_i8(&mut state)).collect::<Vec<_>>();
+        let weights = (0..k).map(|_| next_i8(&mut state)).collect::<Vec<_>>();
+        let offset = s8_slice_to_x86_offset_u8(&activations);
+        let signed = signed_dot_i32(&activations, &weights).unwrap();
+        let raw = offset
+            .iter()
+            .zip(&weights)
+            .fold(0_i64, |sum, (&activation, &weight)| {
+                sum + i64::from(activation) * i64::from(weight)
+            });
+        let correction = 128_i64 * weights.iter().map(|&weight| i64::from(weight)).sum::<i64>();
+        let x86 = corrected_x86_offset_u8_dot_i32(&offset, &weights).unwrap();
+        assert_eq!(
+            x86,
+            signed,
+            "identity violation k={k} seed=0x{state:016x} signed={signed} raw={raw} correction={correction} difference={}",
+            i64::from(x86) - (raw - correction)
+        );
+        assert_eq!(
+            corrected_x86_offset_dot_i32(&activations, &weights).unwrap(),
+            x86
+        );
+        assert_eq!(dot_u8s8_xor128(&offset, &weights).unwrap(), x86);
     }
 }
 
@@ -84,6 +127,10 @@ fn digest_bound_row_sums_reject_mutated_section_and_mutated_table_before_dispatc
     corrupt_section[0] ^= 1;
     assert!(matches!(
         binding.verify_contiguous_s8_rows(&corrupt_section),
+        Err(QuantAlgebraError::SectionDigestMismatch { .. })
+    ));
+    assert!(matches!(
+        binding.verify_contiguous_s8_rows(&physical[..physical.len() - 1]),
         Err(QuantAlgebraError::SectionDigestMismatch { .. })
     ));
 
@@ -142,4 +189,25 @@ fn scale_and_int4_group_orders_are_explicit_and_deterministic() {
         "reordering must not silently be equivalent"
     );
     assert_eq!(sum_int4_groups_in_fixed_order(&[7, -3, 9, -5]).unwrap(), 8);
+}
+
+#[test]
+fn tier_s_epilogue_and_int4_group_reducer_consume_the_canonical_functions() {
+    let scales = EpilogueScales {
+        activation: 0.25,
+        row: 2.0,
+        column: 0.5,
+        group: 4.0,
+    };
+    assert_eq!(dequantize_i32_fixed(32, scales).unwrap(), 32.0);
+    assert_eq!(
+        dequantize_i32_fixed(32, scales).unwrap(),
+        apply_fixed_scale_order(32, scales).unwrap()
+    );
+
+    // Low nibble first: [-8, 7, 0, -1], two logical groups.
+    assert_eq!(
+        dot_int4_grouped_s8(&[1, 2, 3, 4], &[0x78, 0xf0], 2).unwrap(),
+        2
+    );
 }

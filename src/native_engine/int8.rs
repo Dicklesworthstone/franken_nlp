@@ -7,6 +7,8 @@
 use std::error::Error;
 use std::fmt;
 
+use super::quant_algebra::{self, EpilogueScales, QuantAlgebraError};
+
 /// Model K dimensions that this one-model kernel family supports.
 pub const MODEL_KS: [usize; 3] = [3072, 6144, 10752];
 
@@ -14,16 +16,17 @@ pub const MODEL_KS: [usize; 3] = [3072, 6144, 10752];
 pub const MODEL_NS: [usize; 5] = [6144, 1024, 3072, 10752, 166_144];
 
 /// `10752 * abs(-128 * -128)`: full-domain signed i8 MAC bound.
-pub const MAX_S8_S8_K_10752: i64 = 176_160_768;
+pub const MAX_S8_S8_K_10752: i64 = quant_algebra::MAX_S8_S8_ACCUMULATOR_K_10752;
 
 /// `10752 * abs(255 * -128)`: raw offset-domain u8-by-i8 MAC bound.
-pub const MAX_U8_S8_RAW_K_10752: i64 = 350_945_280;
+pub const MAX_U8_S8_RAW_K_10752: i64 = quant_algebra::MAX_U8_S8_RAW_ACCUMULATOR_K_10752;
 
 /// `128 * abs(sum_k(-128))` at K=10752.
-pub const MAX_U8_S8_CORRECTION_K_10752: i64 = 176_160_768;
+pub const MAX_U8_S8_CORRECTION_K_10752: i64 = quant_algebra::MAX_OFFSET_CORRECTION_K_10752;
 
 /// Conservative sum of the raw u8 MAC and correction magnitudes.
-pub const MAX_U8_S8_RAW_PLUS_CORRECTION_K_10752: i64 = 527_106_048;
+pub const MAX_U8_S8_RAW_PLUS_CORRECTION_K_10752: i64 =
+    quant_algebra::MAX_OFFSET_INTERMEDIATE_K_10752;
 
 /// Fail-closed scalar-kernel shape and arithmetic errors.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -49,6 +52,10 @@ pub enum Int8KernelError {
         expected_weights: usize,
         observed_weights: usize,
     },
+    Int4GroupWidth {
+        group_width: usize,
+    },
+    CanonicalAlgebra(QuantAlgebraError),
 }
 
 impl fmt::Display for Int8KernelError {
@@ -84,11 +91,25 @@ impl fmt::Display for Int8KernelError {
                 formatter,
                 "packed int4 layout mismatch: expected {expected_weights} unpacked weights, observed {observed_weights}"
             ),
+            Self::Int4GroupWidth { group_width } => {
+                write!(
+                    formatter,
+                    "int4 group width must be nonzero, observed {group_width}"
+                )
+            }
+            Self::CanonicalAlgebra(error) => write!(formatter, "canonical quant algebra: {error}"),
         }
     }
 }
 
-impl Error for Int8KernelError {}
+impl Error for Int8KernelError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::CanonicalAlgebra(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// Return whether a K/N pair belongs to Nanbeige4.2-3B's fixed weight shapes.
 #[must_use]
@@ -239,7 +260,71 @@ pub fn gemv_int4_s8(
             observed_weights: unpacked.len(),
         });
     }
-    gemv_s8s8(input, &unpacked, n)
+    if input.is_empty() {
+        return Ok(vec![0; n]);
+    }
+    let mut output = Vec::with_capacity(n);
+    for row in unpacked.chunks_exact(input.len()) {
+        output.push(dot_int4_grouped_s8_unpacked(input, row, input.len())?);
+    }
+    Ok(output)
+}
+
+/// Exact scalar int4 dot with logical group partials reduced in canonical order.
+///
+/// The packing format supplies the group width. The final partial may be a
+/// tail; ordering is always increasing logical group index, independently of
+/// how a future SIMD tier packs bytes.
+pub fn dot_int4_grouped_s8(
+    input: &[i8],
+    packed_weights: &[u8],
+    group_width: usize,
+) -> Result<i32, Int8KernelError> {
+    let unpacked = unpack_int4_to_i8(packed_weights);
+    if unpacked.len() != input.len() {
+        return Err(Int8KernelError::Int4Layout {
+            expected_weights: input.len(),
+            observed_weights: unpacked.len(),
+        });
+    }
+    dot_int4_grouped_s8_unpacked(input, &unpacked, group_width)
+}
+
+fn dot_int4_grouped_s8_unpacked(
+    input: &[i8],
+    weights: &[i8],
+    group_width: usize,
+) -> Result<i32, Int8KernelError> {
+    if group_width == 0 {
+        return Err(Int8KernelError::Int4GroupWidth { group_width });
+    }
+    if input.len() != weights.len() {
+        return Err(Int8KernelError::LengthMismatch {
+            operand: "int4 grouped weights",
+            expected: input.len(),
+            observed: weights.len(),
+        });
+    }
+    let mut partials = Vec::with_capacity(input.len().div_ceil(group_width));
+    for (activation_group, weight_group) in
+        input.chunks(group_width).zip(weights.chunks(group_width))
+    {
+        partials.push(dot_s8s8(activation_group, weight_group)?);
+    }
+    quant_algebra::sum_int4_groups_in_fixed_order(&partials)
+        .map_err(Int8KernelError::CanonicalAlgebra)
+}
+
+/// Tier-S's only float dequantization epilogue.
+///
+/// SIMD tiers must call the same canonical function after their exact i32
+/// accumulator/correction stage; no kernel picks its own scale order.
+pub fn dequantize_i32_fixed(
+    accumulator: i32,
+    scales: EpilogueScales,
+) -> Result<f32, Int8KernelError> {
+    quant_algebra::apply_fixed_scale_order(accumulator, scales)
+        .map_err(Int8KernelError::CanonicalAlgebra)
 }
 
 /// Canonical XOR-0x80 offset correction: `(u8 - 128) * s8` in fixed order.
@@ -247,68 +332,8 @@ pub fn gemv_int4_s8(
 /// This makes raw u8-by-s8 accumulation and the `128 * sum(weights)` correction
 /// explicit for the offset-domain proof while producing signed-domain semantics.
 pub fn dot_u8s8_xor128(input: &[u8], weights: &[i8]) -> Result<i32, Int8KernelError> {
-    if input.len() != weights.len() {
-        return Err(Int8KernelError::LengthMismatch {
-            operand: "offset dot weights",
-            expected: input.len(),
-            observed: weights.len(),
-        });
-    }
-    let mut raw = 0_i32;
-    let mut row_sum = 0_i32;
-    #[cfg(debug_assertions)]
-    let mut raw_shadow = 0_i64;
-    #[cfg(debug_assertions)]
-    let mut row_sum_shadow = 0_i64;
-    for (k_index, (&activation, &weight)) in input.iter().zip(weights).enumerate() {
-        raw = raw
-            .checked_add(i32::from(activation) * i32::from(weight))
-            .ok_or(Int8KernelError::AccumulatorOverflow {
-                operation: "u8*s8 raw dot",
-                k_index,
-            })?;
-        row_sum =
-            row_sum
-                .checked_add(i32::from(weight))
-                .ok_or(Int8KernelError::AccumulatorOverflow {
-                    operation: "u8*s8 row sum",
-                    k_index,
-                })?;
-        #[cfg(debug_assertions)]
-        {
-            raw_shadow += i64::from(activation) * i64::from(weight);
-            row_sum_shadow += i64::from(weight);
-            debug_assert_eq!(
-                i64::from(raw),
-                raw_shadow,
-                "raw i64 shadow differs at K={k_index}"
-            );
-            debug_assert_eq!(
-                i64::from(row_sum),
-                row_sum_shadow,
-                "row-sum i64 shadow differs at K={k_index}"
-            );
-        }
-    }
-    let correction = row_sum
-        .checked_mul(128)
-        .ok_or(Int8KernelError::AccumulatorOverflow {
-            operation: "u8*s8 offset correction",
-            k_index: input.len(),
-        })?;
-    let corrected = raw
-        .checked_sub(correction)
-        .ok_or(Int8KernelError::AccumulatorOverflow {
-            operation: "u8*s8 corrected dot",
-            k_index: input.len(),
-        })?;
-    #[cfg(debug_assertions)]
-    debug_assert_eq!(
-        i64::from(corrected),
-        raw_shadow - 128_i64 * row_sum_shadow,
-        "corrected i64 shadow differs"
-    );
-    Ok(corrected)
+    quant_algebra::corrected_x86_offset_u8_dot_i32(input, weights)
+        .map_err(Int8KernelError::CanonicalAlgebra)
 }
 
 const fn contains(values: &[usize], candidate: usize) -> bool {
