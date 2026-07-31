@@ -431,7 +431,7 @@ fn evaluate_policy(
         }
     }
 
-    let release_ids = release_package_ids(metadata)?;
+    let release_ids = release_package_ids(metadata, cargo_tree)?;
     for package_id in &release_ids {
         let package = package_by_id(metadata, package_id).ok_or_else(|| PolicyFailure {
             offending_crate: package_id.clone(),
@@ -441,7 +441,7 @@ fn evaluate_policy(
         if !lock_packages.is_empty() && !lock_packages.contains(&package.name) {
             return Err(PolicyFailure {
                 offending_crate: package.name.clone(),
-                full_path: full_path_to_id(metadata, package_id)
+                full_path: full_path_to_id(metadata, cargo_tree, package_id)
                     .unwrap_or_else(|| root_label.clone()),
                 detail: "release package is absent from Cargo.lock".to_owned(),
             });
@@ -452,12 +452,12 @@ fn evaluate_policy(
         if cargo_tree_mentions(cargo_tree, forbidden) {
             return Err(PolicyFailure {
                 offending_crate: (*forbidden).to_owned(),
-                full_path: full_path_to_named_package(metadata, forbidden)
+                full_path: full_path_to_named_package(metadata, cargo_tree, forbidden)
                     .unwrap_or_else(|| format!("{root_label} -> {forbidden}")),
                 detail: "cargo tree found a forbidden crate in the release graph".to_owned(),
             });
         }
-        if let Some(path) = full_path_to_named_package(metadata, forbidden) {
+        if let Some(path) = full_path_to_named_package(metadata, cargo_tree, forbidden) {
             return Err(PolicyFailure {
                 offending_crate: (*forbidden).to_owned(),
                 full_path: path,
@@ -608,7 +608,10 @@ fn root_package(metadata: &Metadata) -> Result<&Package, PolicyFailure> {
     })
 }
 
-fn release_package_ids(metadata: &Metadata) -> Result<BTreeSet<String>, PolicyFailure> {
+fn release_package_ids(
+    metadata: &Metadata,
+    cargo_tree: &str,
+) -> Result<BTreeSet<String>, PolicyFailure> {
     let root_id = metadata
         .resolve
         .root
@@ -636,7 +639,7 @@ fn release_package_ids(metadata: &Metadata) -> Result<BTreeSet<String>, PolicyFa
             detail: "release graph references a package without a resolve node".to_owned(),
         })?;
         for dependency in &node.deps {
-            if is_release_edge(dependency) {
+            if is_active_release_edge(metadata, cargo_tree, dependency) {
                 queue.push_back(dependency.pkg.clone());
             }
         }
@@ -652,19 +655,33 @@ fn is_release_edge(dependency: &ResolveDependency) -> bool {
             .any(|kind| kind.kind.as_deref() != Some("dev"))
 }
 
+fn is_active_release_edge(
+    metadata: &Metadata,
+    cargo_tree: &str,
+    dependency: &ResolveDependency,
+) -> bool {
+    is_release_edge(dependency)
+        && package_by_id(metadata, &dependency.pkg)
+            .is_some_and(|package| cargo_tree_mentions(cargo_tree, &package.name))
+}
+
 fn package_by_id<'a>(metadata: &'a Metadata, id: &str) -> Option<&'a Package> {
     metadata.packages.iter().find(|package| package.id == id)
 }
 
-fn full_path_to_named_package(metadata: &Metadata, name: &str) -> Option<String> {
-    let target = release_package_ids(metadata)
+fn full_path_to_named_package(
+    metadata: &Metadata,
+    cargo_tree: &str,
+    name: &str,
+) -> Option<String> {
+    let target = release_package_ids(metadata, cargo_tree)
         .ok()?
         .into_iter()
         .find(|id| package_by_id(metadata, id).is_some_and(|package| package.name == name))?;
-    full_path_to_id(metadata, &target)
+    full_path_to_id(metadata, cargo_tree, &target)
 }
 
-fn full_path_to_id(metadata: &Metadata, target: &str) -> Option<String> {
+fn full_path_to_id(metadata: &Metadata, cargo_tree: &str, target: &str) -> Option<String> {
     let root = metadata.resolve.root.as_deref()?;
     let nodes: BTreeMap<&str, &ResolveNode> = metadata
         .resolve
@@ -691,7 +708,9 @@ fn full_path_to_id(metadata: &Metadata, target: &str) -> Option<String> {
         }
         let node = nodes.get(id.as_str())?;
         for dependency in &node.deps {
-            if is_release_edge(dependency) && seen.insert(dependency.pkg.clone()) {
+            if is_active_release_edge(metadata, cargo_tree, dependency)
+                && seen.insert(dependency.pkg.clone())
+            {
                 previous.insert(dependency.pkg.clone(), id.clone());
                 queue.push_back(dependency.pkg.clone());
             }
