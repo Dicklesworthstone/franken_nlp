@@ -3,6 +3,9 @@
 //! This deliberately uses the pinned toolchain directly rather than adding a
 //! release-graph dependency for a UI-test helper. Each fixture is compiled
 //! against the exact `asupersync` rlib that built this feature-gated target.
+//! `Cx::current()` remains a separately censused runtime-mask boundary: this
+//! compile-fail target proves only that a statically restricted `Cx` cannot be
+//! retyped into a wider capability row.
 
 use std::{
     env,
@@ -112,6 +115,6 @@ fn capability_widening_and_restricted_current_regain_fail_to_compile() {
     }
 
     println!(
-        "G0_CENSUS item=compile-fail-suite RESULT=RATIFIED evidence=restricted-to-all-rejected+typed-current-regain-rejected"
+        "G0_CENSUS item=compile-fail-suite RESULT=RATIFIED evidence=restricted-to-all-rejected+static-current-retyping-rejected"
     );
 }
