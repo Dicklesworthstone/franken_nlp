@@ -548,8 +548,38 @@ macro_rules! probe_elements {
 
 probe_elements!(SerializeSeq);
 probe_elements!(SerializeTuple);
-probe_elements!(SerializeTupleStruct);
-probe_elements!(SerializeTupleVariant);
+
+impl SerializeTupleStruct for FiniteProbeCompound {
+    type Ok = ();
+    type Error = FiniteProbeError;
+
+    fn serialize_field<T>(&mut self, value: &T) -> Result<(), Self::Error>
+    where
+        T: Serialize + ?Sized,
+    {
+        value.serialize(FiniteProbe)
+    }
+
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+}
+
+impl SerializeTupleVariant for FiniteProbeCompound {
+    type Ok = ();
+    type Error = FiniteProbeError;
+
+    fn serialize_field<T>(&mut self, value: &T) -> Result<(), Self::Error>
+    where
+        T: Serialize + ?Sized,
+    {
+        value.serialize(FiniteProbe)
+    }
+
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+}
 
 impl SerializeMap for FiniteProbeCompound {
     type Ok = ();
