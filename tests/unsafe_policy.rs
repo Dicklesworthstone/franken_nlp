@@ -70,7 +70,7 @@ fn current_tree_obeys_the_unsafe_policy() {
 fn negative_fixtures_are_rejected_and_a_safe_island_fixture_is_accepted() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let fixture_root = root.join("tests/fixtures/unsafe_policy");
-    let no_islands = BTreeSet::new();
+    let no_islands = BTreeSet::<String>::new();
 
     let mut unlisted = Vec::new();
     scan_source(
