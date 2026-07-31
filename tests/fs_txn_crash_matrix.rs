@@ -3,9 +3,9 @@
 use std::path::Path;
 
 use franken_nlp::artifact::fs_tx::{
-    ACTIVATION_RECORD_DOMAIN, ActivationDigest, ActivationRecord, ActivationRecordBody,
-    ChainWalkVerdict, FsTxError, NonReentrantContentLock, SimulatedActivationJournal,
-    discover_activation, open_ratified_model_root,
+    discover_activation, open_ratified_model_root, ActivationDigest, ActivationRecord,
+    ActivationRecordBody, ChainWalkVerdict, FsTxError, NonReentrantContentLock,
+    SimulatedActivationJournal, ACTIVATION_RECORD_DOMAIN,
 };
 use sha2::{Digest, Sha256};
 
@@ -54,11 +54,9 @@ fn canonical_body_domain_digest_and_append_only_chain_are_locked() {
     assert_eq!(record.record_digest(), expected);
     assert!(record.digest_is_valid());
     assert!(record.final_filename().starts_with("00000000000000000000-"));
-    assert!(
-        record
-            .canonical_envelope_bytes()
-            .ends_with(&record.record_digest().as_bytes())
-    );
+    assert!(record
+        .canonical_envelope_bytes()
+        .ends_with(&record.record_digest().as_bytes()));
 
     let mut journal = SimulatedActivationJournal::new();
     let first = journal.append(digest(1), digest(2), digest(3)).unwrap();
@@ -87,6 +85,64 @@ fn canonical_body_domain_digest_and_append_only_chain_are_locked() {
 }
 
 #[test]
+fn canonical_envelopes_round_trip_and_refuse_wire_mutations() {
+    let genesis = ActivationRecord::new(ActivationRecordBody::genesis(
+        digest(1),
+        digest(2),
+        digest(3),
+    ));
+    let successor = ActivationRecord::new(
+        ActivationRecordBody::successor(&genesis, digest(4), digest(5), digest(6)).unwrap(),
+    );
+
+    for record in [&genesis, &successor] {
+        let envelope = record.canonical_envelope_bytes();
+        assert_eq!(
+            ActivationRecord::parse_canonical_envelope(&envelope).unwrap(),
+            *record,
+            "the fixed-width retained envelope must retain every body field"
+        );
+
+        let mut truncated = envelope.clone();
+        truncated.pop();
+        assert!(matches!(
+            ActivationRecord::parse_canonical_envelope(&truncated),
+            Err(FsTxError::EnvelopeLength { observed }) if observed == truncated.len()
+        ));
+
+        let mut trailing = envelope;
+        trailing.push(0);
+        assert!(matches!(
+            ActivationRecord::parse_canonical_envelope(&trailing),
+            Err(FsTxError::EnvelopeLength { observed }) if observed == trailing.len()
+        ));
+    }
+
+    let mut unsupported_version = genesis.canonical_envelope_bytes();
+    unsupported_version[0] = 2;
+    assert!(matches!(
+        ActivationRecord::parse_canonical_envelope(&unsupported_version),
+        Err(FsTxError::EnvelopeVersion { observed: 2 })
+    ));
+
+    let mut invalid_previous_flag = genesis.canonical_envelope_bytes();
+    invalid_previous_flag[1 + 8 + (3 * 32)] = 2;
+    assert!(matches!(
+        ActivationRecord::parse_canonical_envelope(&invalid_previous_flag),
+        Err(FsTxError::EnvelopePreviousFlag { observed: 2 })
+    ));
+
+    let mut forged_digest = successor.canonical_envelope_bytes();
+    let final_byte = forged_digest.len() - 1;
+    forged_digest[final_byte] ^= 1;
+    assert!(matches!(
+        ActivationRecord::parse_canonical_envelope(&forged_digest),
+        Err(FsTxError::EnvelopeDigestMismatch)
+    ));
+    eprintln!("FS_TXN case=canonical-envelope-wire-refusal RESULT=PASS rows=2");
+}
+
+#[test]
 fn forged_successors_raise_activation_fork_and_retain_last_unambiguous_head() {
     let mut journal = SimulatedActivationJournal::new();
     let genesis = journal.append(digest(1), digest(2), digest(3)).unwrap();
@@ -110,10 +166,9 @@ fn forged_successors_raise_activation_fork_and_retain_last_unambiguous_head() {
         } => {
             assert_eq!(last_unambiguous.map(|head| head.sequence()), Some(0));
             assert_eq!(successor_digests.len(), 2);
-            assert!(
-                walk.iter()
-                    .any(|entry| entry.verdict == ChainWalkVerdict::ForkSuccessor)
-            );
+            assert!(walk
+                .iter()
+                .any(|entry| entry.verdict == ChainWalkVerdict::ForkSuccessor));
         }
         other => panic!("expected ActivationFork, observed {other:?}"),
     }
@@ -225,12 +280,10 @@ fn torn_gapped_and_disconnected_records_never_become_active() {
         Some(0),
         "a sequence gap is disconnected, never a promoted head"
     );
-    assert!(
-        gapped_discovery
-            .walk
-            .iter()
-            .any(|entry| entry.verdict == ChainWalkVerdict::IgnoredDisconnected)
-    );
+    assert!(gapped_discovery
+        .walk
+        .iter()
+        .any(|entry| entry.verdict == ChainWalkVerdict::IgnoredDisconnected));
 
     let only_torn = vec![ActivationRecord::from_retained_parts(
         valid_successor.body().clone(),
