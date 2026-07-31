@@ -190,6 +190,21 @@ impl StoreConfig {
         }
     }
 
+    /// Disables the store while retaining an owner-supplied path solely for
+    /// configuration round-trips.  [`MetadataStore::open`] still never
+    /// inspects this path while disabled.
+    #[must_use]
+    pub fn disabled_at_path(database_path: impl Into<PathBuf>) -> Self {
+        #[cfg(not(feature = "metadata-store"))]
+        let _ = database_path;
+
+        Self {
+            enabled: false,
+            #[cfg(feature = "metadata-store")]
+            database_path: database_path.into(),
+        }
+    }
+
     /// Enables metadata history at an engine- or CLI-owned database location.
     #[must_use]
     pub fn metadata_only(database_path: impl Into<PathBuf>) -> Self {

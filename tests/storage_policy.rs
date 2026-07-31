@@ -4,6 +4,14 @@ use franken_nlp::storage::{
 };
 
 fn report(columns_checked: usize) {
+    for table in schema_tables() {
+        for column in table.columns {
+            println!(
+                "STORAGE_POLICY table={}.{} class={:?} allowlist=PASS",
+                table.name, column.name, column.class
+            );
+        }
+    }
     println!("STORAGE_POLICY RESULT=PASS columns_checked={columns_checked}");
 }
 
@@ -50,6 +58,10 @@ fn content_bearing_column_is_rejected() {
             column: "document_text",
         })
     );
+    println!(
+        "STORAGE_POLICY RESULT=EXPECTED-FAIL table=jobs.document_text class={:?}",
+        ColumnClass::Digest
+    );
     report(
         schema_tables()
             .iter()
@@ -79,7 +91,7 @@ fn disabled_store_does_not_touch_its_path() {
         "franken-nlp-storage-disabled-{}",
         std::process::id()
     ));
-    let store = MetadataStore::open(StoreConfig::disabled())
+    let store = MetadataStore::open(StoreConfig::disabled_at_path(path.clone()))
         .expect("disabled store must not attempt to open a database");
     assert!(!store.is_open());
     assert!(
