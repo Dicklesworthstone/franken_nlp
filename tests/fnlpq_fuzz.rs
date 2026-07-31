@@ -1,7 +1,10 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use franken_nlp::artifact::format::{framed_sha256, ArchTarget};
+use franken_nlp::artifact::format::{
+    ArchTarget, CanonicalDtype, FnlpqWriterInput, PackingSetInput, SectionKind, SectionPayload,
+    SectionRange, TensorInput, framed_sha256, logical_model_sha256, logical_tensor_sha256, write,
+};
 use franken_nlp::artifact::reader::{FnlpqArtifact, FnlpqReadError};
 
 const GOLDEN: &str = include_str!("fixtures/fnlpq/golden/tiny_v1.hex");
@@ -175,6 +178,173 @@ fn sampled_single_bit_mutations_are_all_typed_rejections() {
     eprintln!("FUZZ_SUMMARY cases={cases} rejects={cases} zero_panics=true");
 }
 
+#[test]
+fn generated_artifacts_round_trip_and_refuse_each_stored_payload_bit_flip() {
+    const SEEDS: [u64; 12] = [
+        0x0000_0000_0000_0001,
+        0x0000_0000_0000_0002,
+        0x0000_0000_0000_0003,
+        0x0123_4567_89ab_cdef,
+        0x5a5a_5a5a_5a5a_5a5a,
+        0xa5a5_a5a5_a5a5_a5a5,
+        0xcafe_babe_dead_beef,
+        0xd1ce_f00d_1234_5678,
+        0xdead_beef_c001_d00d,
+        0xfeed_face_2468_1357,
+        0xffff_ffff_ffff_fffe,
+        0xffff_ffff_ffff_ffff,
+    ];
+
+    let mut valid_artifacts = 0_usize;
+    let mut rejected_payload_flips = 0_usize;
+    for seed in SEEDS {
+        let valid = generated_valid_artifact(seed);
+        let artifact = FnlpqArtifact::from_bytes(valid.clone())
+            .expect("writer-generated artifact must load before mutation");
+        assert_eq!(
+            artifact
+                .reserialize()
+                .expect("checked generated artifact reserializes"),
+            valid,
+            "generated fixture seed={seed:#018x} must retain canonical bytes"
+        );
+        valid_artifacts += 1;
+
+        let directory = directory_start(&valid);
+        let section_count = u64_at(&valid, 24) as usize;
+        for ordinal in 0..section_count {
+            let entry = directory + ordinal * 80;
+            let offset = u64_at(&valid, entry + 16) as usize;
+            let len = u64_at(&valid, entry + 24) as usize;
+            for payload_offset in offset..offset + len {
+                let mut mutation = valid.clone();
+                mutation[payload_offset] ^= 0x01;
+                assert!(
+                    FnlpqArtifact::from_bytes(mutation).is_err(),
+                    "stored payload flip accepted seed={seed:#018x} section={ordinal} offset={payload_offset}"
+                );
+                rejected_payload_flips += 1;
+            }
+        }
+    }
+    eprintln!(
+        "FUZZ_SUMMARY generated_artifacts={valid_artifacts} stored_payload_flips={rejected_payload_flips} verdict=REFUSED"
+    );
+}
+
+fn generated_valid_artifact(seed: u64) -> Vec<u8> {
+    let element_count = usize::try_from(seed % 31 + 1).expect("bounded generated shape");
+    let mut state = seed;
+    let mut next_byte = || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (state >> 56) as u8
+    };
+    let payload = (0..element_count * 2)
+        .map(|_| next_byte())
+        .collect::<Vec<_>>();
+    let scales = [0.5_f32.to_le_bytes(), 1.0_f32.to_le_bytes()].concat();
+    let row_sums = [0_i32.to_le_bytes(), 1_i32.to_le_bytes()].concat();
+    let shape = vec![u32::try_from(element_count).expect("bounded generated shape")];
+    let tensor_digest = logical_tensor_sha256(
+        "generated.weight",
+        "bf16",
+        &shape,
+        "bf16-verbatim-v1",
+        &payload,
+        &scales,
+        &row_sums,
+    )
+    .expect("generated logical tensor digest");
+    let model_config = b"{\"hidden_size\":1}".to_vec();
+    let tokenizer_model = vec![0x0a, 0x01, 0x41];
+    let tokenizer_config = b"{\"bos_token\":\"<s>\"}".to_vec();
+    let chat_template = b"{{ generated }}".to_vec();
+    let logical_model = logical_model_sha256(
+        &[tensor_digest],
+        &[
+            ("model_config", model_config.as_slice()),
+            ("tokenizer_model", tokenizer_model.as_slice()),
+            ("tokenizer_config", tokenizer_config.as_slice()),
+            ("chat_template", chat_template.as_slice()),
+        ],
+    )
+    .expect("generated logical model digest");
+    write(&FnlpqWriterInput {
+        model_id: "FnlpqGeneratedFuzz".to_owned(),
+        revision: "f56ec5a9650268aa098496734743c25ea778bd2d".to_owned(),
+        recipe_id: "generated-fuzz-v1".to_owned(),
+        source_root_sha256: hex(&framed_sha256(
+            "fnlpq-source-root-v1",
+            &[b"generated fuzz source"],
+        )
+        .expect("generated source root digest")),
+        logical_model_sha256: hex(&logical_model),
+        sections: vec![
+            SectionPayload::new(
+                "generic-payload",
+                SectionKind::GenericTensorPayload,
+                payload,
+                64,
+            ),
+            SectionPayload::new(
+                "generic-scales",
+                SectionKind::GenericTensorScales,
+                scales,
+                8,
+            ),
+            SectionPayload::new(
+                "generic-row-sums",
+                SectionKind::GenericTensorRowSums,
+                row_sums,
+                8,
+            ),
+            SectionPayload::new(
+                "tokenizer-model",
+                SectionKind::TokenizerModel,
+                tokenizer_model,
+                8,
+            ),
+            SectionPayload::new("model-config", SectionKind::ModelConfig, model_config, 8),
+            SectionPayload::new(
+                "tokenizer-config",
+                SectionKind::TokenizerConfig,
+                tokenizer_config,
+                8,
+            ),
+            SectionPayload::new("chat-template", SectionKind::ChatTemplate, chat_template, 8),
+            SectionPayload::new(
+                "license-bundle",
+                SectionKind::LicenseBundle,
+                b"Apache-2.0\n",
+                8,
+            ),
+        ],
+        tensors: vec![TensorInput {
+            name: "generated.weight".to_owned(),
+            canonical_dtype: CanonicalDtype::Bf16,
+            shape,
+            canonical_logical_sha256: hex(&tensor_digest),
+            quantization: "bf16-verbatim-v1".to_owned(),
+            data: SectionRange::new("generic-payload", 0, (element_count * 2) as u64),
+            scale: SectionRange::new("generic-scales", 0, 8),
+            row_sum: SectionRange::new("generic-row-sums", 0, 8),
+        }],
+        packing_sets: vec![PackingSetInput {
+            id: "generic".to_owned(),
+            target: ArchTarget::Generic,
+            section_names: vec![
+                "generic-payload".to_owned(),
+                "generic-scales".to_owned(),
+                "generic-row-sums".to_owned(),
+            ],
+        }],
+    })
+    .expect("generated fixture writes")
+    .bytes
+}
+
 fn golden_bytes() -> Vec<u8> {
     let digits: Vec<_> = GOLDEN
         .bytes()
@@ -219,4 +389,14 @@ fn nibble(byte: u8) -> u8 {
         b'a'..=b'f' => byte - b'a' + 10,
         _ => panic!("invalid fixture hex byte {byte:?}"),
     }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
