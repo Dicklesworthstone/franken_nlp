@@ -56,6 +56,7 @@ pub struct ReceiptRetention {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommitmentDomain {
+    ExecutionIdentity,
     Input,
     Output,
     Configuration,
@@ -64,9 +65,82 @@ pub enum CommitmentDomain {
 impl CommitmentDomain {
     const fn tag(self) -> &'static str {
         match self {
+            Self::ExecutionIdentity => "fnlp-receipt-execution-identity-v1",
             Self::Input => "fnlp-receipt-input-v1",
             Self::Output => "fnlp-receipt-output-v1",
             Self::Configuration => "fnlp-receipt-config-v1",
+        }
+    }
+}
+
+/// Whether the semantic execution identity is safe to publish verbatim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityDisclosure {
+    /// The complete identity contains only receipt-authorized public fields.
+    Public,
+    /// The identity contains private material and is exported only as an HMAC.
+    Committed,
+}
+
+/// The receipt projection of one canonical [`ExecutionIdentity`].
+///
+/// A committed projection deliberately omits the normal unkeyed receipt key:
+/// even a digest of a low-entropy prompt can be dictionary-tested by an
+/// untrusted receipt reader.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ReceiptIdentity {
+    execution_identity_schema: u32,
+    disclosure: IdentityDisclosure,
+    receipt_identity: Option<Sha256Digest>,
+    value: Sha256Digest,
+}
+
+impl ReceiptIdentity {
+    fn from_execution(
+        disclosure: IdentityDisclosure,
+        commitment_key: Option<&CommitmentKey>,
+        execution: &ExecutionIdentity,
+    ) -> Result<Self, ReceiptError> {
+        execution.validate().map_err(ReceiptError::Identity)?;
+        let canonical = execution
+            .canonical_json_bytes()
+            .map_err(ReceiptError::Identity)?;
+        let (receipt_identity, value) = match disclosure {
+            IdentityDisclosure::Public => (
+                Some(execution.receipt_identity().map_err(ReceiptError::Identity)?),
+                Sha256Digest::of_bytes(&canonical),
+            ),
+            IdentityDisclosure::Committed => {
+                let key = commitment_key.ok_or(ReceiptError::MissingIdentityCommitmentKey)?;
+                let commitment = key.commit(
+                    CommitmentDomain::ExecutionIdentity,
+                    "fnlpr-v1",
+                    "execution-identity",
+                    &canonical,
+                )?;
+                (None, commitment.hmac_sha256)
+            }
+        };
+        Ok(Self {
+            execution_identity_schema: execution.schema_version,
+            disclosure,
+            receipt_identity,
+            value,
+        })
+    }
+
+    fn validate(&self) -> Result<(), ReceiptError> {
+        let valid = match self.disclosure {
+            IdentityDisclosure::Public => self.receipt_identity.is_some(),
+            IdentityDisclosure::Committed => self.receipt_identity.is_none(),
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(ReceiptError::InvalidIdentityDisclosure {
+                disclosure: self.disclosure,
+            })
         }
     }
 }
@@ -209,7 +283,7 @@ pub struct Receipt {
     pub receipt_schema: String,
     pub grade: ReceiptGrade,
     pub retention: ReceiptRetention,
-    pub execution_identity: Sha256Digest,
+    pub identity: ReceiptIdentity,
     pub provenance_identity: Sha256Digest,
     pub source_revision: String,
     pub artifacts: ReceiptArtifacts,
@@ -229,6 +303,8 @@ impl Receipt {
     pub fn from_identities(
         grade: ReceiptGrade,
         retention: ReceiptRetention,
+        identity_disclosure: IdentityDisclosure,
+        identity_commitment_key: Option<&CommitmentKey>,
         execution: &ExecutionIdentity,
         provenance: &ProvenanceIdentity,
         code: ReceiptCodeIdentity,
@@ -242,9 +318,11 @@ impl Receipt {
             receipt_schema: RECEIPT_SCHEMA.to_owned(),
             grade,
             retention,
-            execution_identity: execution
-                .receipt_identity()
-                .map_err(ReceiptError::Identity)?,
+            identity: ReceiptIdentity::from_execution(
+                identity_disclosure,
+                identity_commitment_key,
+                execution,
+            )?,
             provenance_identity: provenance
                 .receipt_digest()
                 .map_err(ReceiptError::Identity)?,
@@ -281,6 +359,7 @@ impl Receipt {
         if self.receipt_schema != RECEIPT_SCHEMA {
             return Err(ReceiptError::Schema(self.receipt_schema.clone()));
         }
+        self.identity.validate()?;
         validate_grade(self.grade, self.retention)?;
         validate_commit("binary_commit", &self.code.binary_commit)?;
         validate_commit("converter_commit", &self.code.converter_commit)?;
@@ -317,6 +396,10 @@ pub enum ReceiptError {
         grade: ReceiptGrade,
         retention: ReceiptRetention,
     },
+    MissingIdentityCommitmentKey,
+    InvalidIdentityDisclosure {
+        disclosure: IdentityDisclosure,
+    },
     CommitmentTooLarge,
     MissingChecks,
 }
@@ -331,6 +414,13 @@ impl fmt::Display for ReceiptError {
             Self::GradeRetention { grade, retention } => write!(
                 formatter,
                 "receipt grade {grade:?} is incompatible with public retention {retention:?}"
+            ),
+            Self::MissingIdentityCommitmentKey => {
+                formatter.write_str("committed receipt identity requires an HMAC key")
+            }
+            Self::InvalidIdentityDisclosure { disclosure } => write!(
+                formatter,
+                "receipt identity disclosure {disclosure:?} has an incompatible projection"
             ),
             Self::CommitmentTooLarge => {
                 formatter.write_str("receipt commitment field does not fit u64 length framing")
@@ -528,6 +618,7 @@ mod tests {
             .expect("output commitment");
         assert_ne!(input.hmac_sha256, output.hmac_sha256);
 
+        let execution = execution();
         let receipt = Receipt::from_identities(
             ReceiptGrade::VerifiableIfArtifactsSupplied,
             ReceiptRetention {
@@ -535,7 +626,9 @@ mod tests {
                 artifacts: RetentionState::CallerSupplies,
                 commitment_secret: RetentionState::CallerSupplies,
             },
-            &execution(),
+            IdentityDisclosure::Committed,
+            Some(&key),
+            &execution,
             &provenance(),
             code(),
             vec![digest(15)],
@@ -547,6 +640,20 @@ mod tests {
         let rendered = receipt.canonical_json().expect("canonical receipt");
         assert!(rendered.contains("owner-key-2026"));
         assert!(!rendered.contains(&digest_private(private)));
+        assert!(rendered.contains("\"receipt_identity\":null"));
+        assert!(
+            !rendered.contains(
+                &execution
+                    .receipt_identity()
+                    .expect("fixture execution identity")
+                    .to_hex()
+            ),
+            "committed receipts must not export an unkeyed identity projection"
+        );
+        assert!(
+            !rendered.contains(&execution.prompt_digest.to_hex()),
+            "committed receipts must not export the prompt digest"
+        );
     }
 
     #[test]
@@ -558,6 +665,8 @@ mod tests {
                 artifacts: RetentionState::Resolvable,
                 commitment_secret: RetentionState::NotRetained,
             },
+            IdentityDisclosure::Public,
+            None,
             &execution(),
             &provenance(),
             code(),
@@ -568,6 +677,29 @@ mod tests {
         )
         .expect_err("a replayable receipt needs its commitment secret");
         assert!(matches!(error, ReceiptError::GradeRetention { .. }));
+    }
+
+    #[test]
+    fn committed_identity_refuses_to_fall_back_without_a_key() {
+        let error = Receipt::from_identities(
+            ReceiptGrade::VerifiableIfArtifactsSupplied,
+            ReceiptRetention {
+                private_inputs: RetentionState::CallerSupplies,
+                artifacts: RetentionState::CallerSupplies,
+                commitment_secret: RetentionState::CallerSupplies,
+            },
+            IdentityDisclosure::Committed,
+            None,
+            &execution(),
+            &provenance(),
+            code(),
+            Vec::new(),
+            Vec::new(),
+            checks(),
+            Vec::new(),
+        )
+        .expect_err("committed identity must require a keyed commitment");
+        assert!(matches!(error, ReceiptError::MissingIdentityCommitmentKey));
     }
 
     fn digest_private(bytes: &[u8]) -> String {
