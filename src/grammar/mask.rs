@@ -94,24 +94,20 @@ struct TrieNode {
     terminal_ids: Vec<u32>,
 }
 
-/// Trie of actual bytes emitted by every decodable model-logit row.
+/// Exact byte-emission transducer for one tokenizer and model-logit width.
 ///
-/// `token_bytes(id)` is `None` for padded model rows and for zero-byte control
-/// pieces.  The latter cannot advance a grammar and are deliberately not legal
-/// in a one-token constrained-decoding step.
+/// The transducer is constructed by decoding every candidate after an emitted
+/// byte-fallback probe, so its table already resolves SentencePiece's
+/// context-sensitive leading-whitespace behavior before the trie is built.
 #[derive(Clone, Debug)]
-pub struct VocabTrie {
-    nodes: Vec<TrieNode>,
-    token_bytes: Vec<Option<Vec<u8>>>,
-    indexed_token_count: usize,
+pub struct DetokenizationTransducer {
+    emitted_by_token: Vec<Option<Vec<u8>>>,
+    emitting_token_count: usize,
 }
 
-impl VocabTrie {
-    /// Build the full model-width trie from tokenizer decoding semantics.
-    ///
-    /// A decoded byte-fallback NUL precedes each candidate token.  This makes
-    /// a leading SentencePiece `▁` emit a real ASCII space instead of being
-    /// mistaken for the decoder's suppressed dummy prefix.
+impl DetokenizationTransducer {
+    /// Derive exact emitted bytes for every model-logit row from the approved
+    /// tokenizer decoder, never from raw SentencePiece piece text.
     pub fn from_tokenizer(
         tokenizer: &SpBpeTokenizer,
         model_vocab_size: usize,
@@ -134,11 +130,8 @@ impl VocabTrie {
             return Err(VocabTrieBuildError::ProbeRoundTrip);
         }
 
-        let mut trie = Self {
-            nodes: vec![TrieNode::default()],
-            token_bytes: vec![None; model_vocab_size],
-            indexed_token_count: 0,
-        };
+        let mut emitted_by_token = vec![None; model_vocab_size];
+        let mut emitting_token_count = 0;
         for index in 0..model_vocab_size {
             let token_id = u32::try_from(index)
                 .expect("model vocabulary width was checked to fit u32 before allocation");
@@ -152,24 +145,93 @@ impl VocabTrie {
             if emitted.is_empty() {
                 continue;
             }
-            let bytes = emitted.to_vec();
-            trie.insert(token_id, &bytes);
-            trie.token_bytes[index] = Some(bytes);
-            trie.indexed_token_count += 1;
+            emitted_by_token[index] = Some(emitted.to_vec());
+            emitting_token_count += 1;
         }
-        Ok(trie)
+        Ok(Self {
+            emitted_by_token,
+            emitting_token_count,
+        })
+    }
+
+    /// Model-logit width, including non-token padding rows.
+    #[must_use]
+    pub fn vocab_size(&self) -> usize {
+        self.emitted_by_token.len()
+    }
+
+    /// Number of model-logit rows with a nonempty emitted byte sequence.
+    #[must_use]
+    pub const fn emitting_token_count(&self) -> usize {
+        self.emitting_token_count
+    }
+
+    /// Exact bytes emitted after prior prompt/template output already exists.
+    #[must_use]
+    pub fn emitted_bytes(&self, token_id: u32) -> Option<&[u8]> {
+        usize::try_from(token_id)
+            .ok()
+            .and_then(|index| self.emitted_by_token.get(index))
+            .and_then(Option::as_deref)
+    }
+}
+
+/// Trie of actual bytes emitted by every decodable model-logit row.
+///
+/// `token_bytes(id)` is `None` for padded model rows and for zero-byte control
+/// pieces.  The latter cannot advance a grammar and are deliberately not legal
+/// in a one-token constrained-decoding step.
+#[derive(Clone, Debug)]
+pub struct VocabTrie {
+    nodes: Vec<TrieNode>,
+    transducer: DetokenizationTransducer,
+}
+
+impl VocabTrie {
+    /// Build the full model-width trie from tokenizer decoding semantics.
+    ///
+    /// A decoded byte-fallback NUL precedes each candidate token.  This makes
+    /// a leading SentencePiece `▁` emit a real ASCII space instead of being
+    /// mistaken for the decoder's suppressed dummy prefix.
+    pub fn from_tokenizer(
+        tokenizer: &SpBpeTokenizer,
+        model_vocab_size: usize,
+    ) -> Result<Self, VocabTrieBuildError> {
+        Self::from_transducer(DetokenizationTransducer::from_tokenizer(
+            tokenizer,
+            model_vocab_size,
+        )?)
+    }
+
+    /// Build a trie from one already-audited exact-byte transducer.
+    #[must_use]
+    pub fn from_transducer(transducer: DetokenizationTransducer) -> Self {
+        let mut trie = Self {
+            nodes: vec![TrieNode::default()],
+            transducer,
+        };
+        for index in 0..trie.transducer.vocab_size() {
+            let token_id = u32::try_from(index)
+                .expect("detokenization transducer width was checked to fit u32");
+            let Some(bytes) = trie.transducer.emitted_bytes(token_id) else {
+                continue;
+            };
+            let bytes = bytes.to_vec();
+            trie.insert(token_id, &bytes);
+        }
+        trie
     }
 
     /// The configured model-logit width, including any non-token padding rows.
     #[must_use]
     pub fn vocab_size(&self) -> usize {
-        self.token_bytes.len()
+        self.transducer.vocab_size()
     }
 
     /// Number of model-logit rows that emit nonempty bytes and enter the trie.
     #[must_use]
     pub const fn indexed_token_count(&self) -> usize {
-        self.indexed_token_count
+        self.transducer.emitting_token_count()
     }
 
     /// Number of shared byte-prefix nodes retained by the vocabulary trie.
@@ -181,10 +243,13 @@ impl VocabTrie {
     /// Exact emitted bytes for one candidate model-logit row.
     #[must_use]
     pub fn token_bytes(&self, token_id: u32) -> Option<&[u8]> {
-        usize::try_from(token_id)
-            .ok()
-            .and_then(|index| self.token_bytes.get(index))
-            .and_then(Option::as_deref)
+        self.transducer.emitted_bytes(token_id)
+    }
+
+    /// The tokenizer-derived byte transducer that this trie indexes.
+    #[must_use]
+    pub const fn transducer(&self) -> &DetokenizationTransducer {
+        &self.transducer
     }
 
     fn insert(&mut self, token_id: u32, bytes: &[u8]) {

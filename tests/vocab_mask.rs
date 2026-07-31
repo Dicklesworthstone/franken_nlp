@@ -8,8 +8,9 @@ use std::{
 
 use franken_nlp::{
     grammar::mask::{
-        ByteState, MaskCacheDisposition, MaskCacheError, MaskOracleError, MaskWorkLimits,
-        NANBEIGE_MASK_BYTES_PER_STATE, SchemaMaskCache, SchemaMaskKey, VocabMaskOracle, VocabTrie,
+        ByteState, DetokenizationTransducer, MaskCacheDisposition, MaskCacheError, MaskOracleError,
+        MaskWorkLimits, NANBEIGE_MASK_BYTES_PER_STATE, SchemaMaskCache, SchemaMaskKey,
+        VocabMaskOracle, VocabTrie,
     },
     tokenizer::{
         bpe::{AddedToken, SpBpeTokenizer},
@@ -121,6 +122,29 @@ fn trie_uses_detokenized_bytes_and_keeps_model_padding_illegal() {
     assert_eq!(trie.token_bytes(7), Some("λ".as_bytes()));
     assert!(trie.indexed_token_count() < trie.vocab_size());
     assert!(trie.node_count() > 1);
+}
+
+#[test]
+fn detokenization_transducer_is_a_separate_exact_byte_boundary() {
+    let transducer = DetokenizationTransducer::from_tokenizer(&tokenizer(), 10)
+        .expect("toy exact-byte transducer builds");
+    assert_eq!(transducer.emitted_bytes(4), Some(&b" a"[..]));
+    assert_eq!(
+        transducer.emitted_bytes(1),
+        None,
+        "control piece is zero-byte"
+    );
+    assert_eq!(
+        transducer.emitted_bytes(9),
+        None,
+        "padded row is not a token"
+    );
+    let trie = VocabTrie::from_transducer(transducer.clone());
+    assert_eq!(trie.transducer().emitted_bytes(4), Some(&b" a"[..]));
+    assert_eq!(
+        trie.indexed_token_count(),
+        transducer.emitting_token_count()
+    );
 }
 
 #[test]
