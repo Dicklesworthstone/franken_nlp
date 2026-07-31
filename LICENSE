@@ -82,9 +82,11 @@ tooling, and the documentation in this repository). It does NOT cover any
 model weights or tokenizer data.
 
 The project runs the Nanbeige4.2-3B model (Hugging Face repository
-`Nanbeige/Nanbeige4.2-3B`), Copyright (c) 2026 Nanbeige Team, licensed under
-the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0),
-as declared by the official model card at the pinned revision.
+`Nanbeige/Nanbeige4.2-3B`). The official model card attributes the model to
+the Nanbeige Team and declares the Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0) at the pinned revision. This is
+factual source attribution; it does not synthesize a copyright notice that
+is absent from the pinned upstream materials.
 
 No model weights are included in this source repository. Transformed weight
 artifacts distributed by this project (for example a `.fnlpq` produced by
@@ -94,13 +96,13 @@ Apache-2.0. In accordance with that license:
 
   1. Every distributed artifact and model release carries the Apache-2.0
      license text and this attribution in its release manifest and embedded
-     artifact header.
+     license/notice section.
   2. Modified/derivative weight files (quantized, re-packed, or re-serialized
      forms) are prominently marked as MODIFIED from the original
      Nanbeige/Nanbeige4.2-3B release, with the transformation recipe
      identified (recipe id + source SHA-256).
-  3. `fnlp --version` reproduces the attribution, and this NOTICE travels
-     with every distribution of those artifacts.
+  3. `fnlp --version` reproduces the concise attribution, and this third-party
+     notice travels with every distribution of those artifacts.
 
 The Apache-2.0 grant for the model weights is from the Nanbeige Team and is
 unaffected by the OpenAI/Anthropic Rider above, which applies only to the

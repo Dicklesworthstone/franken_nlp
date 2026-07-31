@@ -29,14 +29,14 @@
 | | `franken_nlp` |
 |---|---|
 | Model | Nanbeige4.2-3B: 4.17B params (3.149B non-embedding), 44 effective layer executions via the 2-pass loop, 256K max positions, thinking mode, tool calls; **Apache-2.0**, with model-card scores of 63.6 SWE-Bench Verified / 87.4 GPQA-Diamond at a fraction of competitors' size. |
-| Ships as | One self-contained executable per target (two entrypoint names over one dispatch) + a provenance-attested, digest-verified model artifact: `fnlp pull` streams fixed 1,957,046,720-byte release chunks, verifies part/whole/source/license digests, derives the host-native packing, and atomically activates. Offline thereafter. |
-| Output contract | Successful structured results are **schema-valid by construction** (compiled grammar masks illegal tokens every step); `verbatim` fields are byte-exact source substrings by construction; offsets are UTF-8-byte + Unicode-scalar, re-anchored and explicit about ambiguity; budget/cancel returns a typed no-result, never truncated "success." |
+| Ships as | Two self-contained executable names per target (`fnlp` + `franken_nlp`) over one shared library dispatch, plus a provenance-attested, digest-verified model artifact: `fnlp pull` streams fixed 1,957,046,720-byte release chunks, verifies part/whole/source/license digests, derives the host-native packing, and atomically activates. Offline thereafter. |
+| Output contract | Successful structured results are **schema-valid by construction** (compiled grammar masks illegal tokens every step); `verbatim` fields are byte-exact source substrings by construction; offsets are UTF-8-byte + Unicode-scalar, independently byte-verified against the original source, with ambiguity explicit and no approximate relocation; budget/cancel returns a typed no-result, never truncated "success." |
 | The loop, exploited | Decode streams the full 3.149B-parameter stack **twice per token**; the engine schedules both passes (per-`(layer, loop)` KV binding, two post-loop norm states, loop-corrected rooflines) instead of replaying a generic graph. |
 | Corpus fabric | `fnlp batch`: an NDJSON daemon with layer-major continuous batching, fair prefill morsels, checked memory admission, lazy copy-on-write KV pages, and shipped-prefix caching. `fnlp job`: opt-in durable corpus runs with content-addressed semantic keys, transactional resume, verify, and owned materialization: metadata-only by default, never your text. |
 | Determinism | Scoped and named: semantic greedy output is exact under a declared numerics profile; batch-M ≡ batch-1 and prefix-fork ≡ cold-prefill are gated invariants; canonical byte replay fixes ordering and scrubs volatile telemetry. |
 | Hardware | Apple M4/M5 (NEON SDOT/SMMLA/autovec, measured per shape), AMD Threadripper/EPYC with **two exact AVX2 constructions for Zen 3** (raw saturating `vpmaddubsw` is banned) and AVX-512-VNNI benchmarked separately on Zen 4 (double-pumped), Zen 5 (native 512), and Intel; runtime feature detection, one binary per arch. |
-| Fidelity | A parity ladder against the pinned HF reference: tokenizer-exact, per-op metric vectors, hidden states at **all 44 layer executions plus both post-loop norms**, logits, greedy tokens, task outputs. The f32 path exact-matches reproducible HF greedy output; optimized backends preserve one fixed recipe's scalar semantics; deliberate int8/int4 divergence from bf16 is separately measured and ledgered. |
-| Safety | `unsafe` denied crate-wide and forbidden outside enumerated, audited SIMD/mmap islands (scoped allows + a CI policy test), each integer kernel differentially proven against scalar/i64. NUMA/topology/QoS/huge-page experiments require a safe FrankenSuite surface or remain off. |
+| Fidelity | A profile-scoped parity ladder against the pinned HF reference: tokenizer-exact, per-op metric vectors, hidden states at **all 44 layer executions plus both post-loop norms**, logits, greedy tokens, task outputs. `hf-bf16-eager` owns reproducible HF-match claims; `diagnostic-f32` is a structural/bisect oracle and any bf16 token flip is a named fixture; optimized backends preserve one fixed recipe's scalar semantics; deliberate int8/int4 divergence from bf16 is separately measured and ledgered. |
+| Safety | `unsafe_code` and `unsafe_op_in_unsafe_fn` are denied crate-wide; only enumerated SIMD/mmap modules may allow `unsafe_code`, while every operation remains in an explicit block with a local safety proof and a CI policy test. Each integer kernel is differentially proven against scalar/i64. NUMA/topology/QoS/huge-page experiments require a safe FrankenSuite surface or remain off. |
 | Dependencies | **Closed universe.** Pinned FrankenSuite foundations (frankentorch kernels, asupersync runtime/HTTP, optional fsqlite) plus exactly three commodity families: `clap`, `serde`/`serde_json`, `sha2`. The SentencePiece BPE tokenizer, chat-template builder, and grammar engine are built in-house. |
 
 ---
@@ -254,12 +254,12 @@ cd franken_nlp
 cargo build --locked --release        # produces target/release/fnlp
 ```
 
-**3. Embedded, as a Rust library:**
+**3. Embedded, as a Rust library** (after the first crate release; pin the exact published commit rather than a floating branch):
 
 ```toml
 # Cargo.toml
 [dependencies]
-franken_nlp = { git = "https://github.com/Dicklesworthstone/franken_nlp" }
+franken_nlp = { git = "https://github.com/Dicklesworthstone/franken_nlp", rev = "<published-release-commit-sha>" }
 ```
 
 ```rust
@@ -274,7 +274,10 @@ fn main() -> franken_nlp::Result<()> {
         labels: vec!["billing".into(), "bug".into(), "praise".into()],
         ..Default::default()
     })?;
-    println!("{} ({:.2})", result.label, result.confidence); // calibrated
+    println!("{} score={} ({})", result.label, result.score, result.score_space);
+    if let Some(probability) = result.calibrated_probability {
+        println!("calibrated_probability={probability:.3}");
+    }
     Ok(())
 }
 ```
@@ -305,7 +308,7 @@ Every number below is a provisional gate, **TARGETED rather than OBSERVED: no Fr
 | Gate | Requirement |
 |---|---|
 | PG-0 · Execution ownership | One admitted asupersync `scoped_cpu` team per request/bounded batch epoch; exact coordinator/child cap; team formed and spawn-sealed before work release; no post-start/latch spawn; bounded checkpoints; disconnect-safe cancel/panic join; closure-owned leases until actual completion; no per-op thread creation or Rayon; one-time host config and aggregate multi-engine memory reservations proven |
-| PG-1 · Fidelity | L0 exact; full L1 metric vectors; all 44 layer + two loop-norm L2 states; same-recipe integer stages exact, floating stages within named tolerances, and greedy tokens exact; f32 L4 exact where HF is reproducible; quantized-vs-bf16 agreement explicitly measured |
+| PG-1 · Fidelity | L0 exact; full L1 metric vectors; all 44 layer + two loop-norm L2 states; same-recipe integer stages exact, floating stages within named tolerances, and greedy tokens exact; `hf-bf16-eager` L4 exact on oracle-reproducible prefixes; `diagnostic-f32` uses its structural/logit contract; quantized-vs-bf16 agreement explicitly measured |
 | PG-2 · Integer kernels | Scalar/SDOT/SMMLA/AVX2/VNNI accumulators exactly equal i64, including full-domain extremes and every tail |
 | PG-3 · Decode (R1) | Meet/beat official llama.cpp against nearest format peers (our int8 vs its Q8_0 class) on every M4/M5/Zen host for which a claim is published |
 | PG-4 · Corpus (R2/R3) | Meet/beat official llama.cpp's completion engine under identical prompts, with grammar/prefix/task-layer gains attributed separately |
@@ -362,7 +365,7 @@ A few honest boundaries:
 
 **How does this relate to frankensearch?** Cleanly: frankensearch owns embeddings/retrieval; `fnlp` owns generation-adjacent NLP (extraction, scoring, judging, redaction). A RAG pipeline retrieves with frankensearch and verifies with `fnlp judge --faithfulness`; the two meet over NDJSON.
 
-**What about my data?** Inference opens no network, structurally: the only networked code path in the binary is the explicit `fnlp pull`. Run history is opt-in and metadata-only (the schema cannot store document/prompt/result text); prefix caching defaults to shipped task prefixes, never your content; `redact` exists precisely so text can be sanitized *before* it goes anywhere else.
+**What about my data?** Inference opens no network, structurally: the only networked code path in the binary is the explicit `fnlp pull`. The metadata/run-history schema is opt-in and structurally cannot store document, prompt, or result text. A separately enabled owner-only job spool may store content when you explicitly request durable materialization; it is not telemetry or hidden history. Prefix caching defaults to shipped task prefixes, never your content; `redact` exists precisely so text can be sanitized *before* it goes anywhere else.
 
 ## About Contributions
 

@@ -1,6 +1,6 @@
 # COD’s reaction to CC’s scoring, plus post-duel blind spots
 
-> **Post-review disposition (2026-07-30): non-normative provenance.** Plan v3 §10.6 controls and now incorporates the surviving corrections: token-id-exact forced runs with rarity allowed to kill them; breadth/depth-first/short-ID/naïve continuation scoring under actual 44-deep KV tail admission; `ItemLocal`/`PartitionReduce`/`CorpusGlobal` snapshot authority; AA-A1 accepted-population and qualification-decay audits under human authority; and AA-R1 as trace-gated Phase-7 local-resident research. None of those dispositions turns pressure into confidence, audit sampling into a universal certificate, or local IPC into permission for a routable server.
+> **Post-review disposition (2026-07-30; refreshed 2026-07-31): non-normative provenance.** The current master plan §10.6 controls and incorporates the surviving corrections: token-id-exact forced runs with rarity allowed to kill them; breadth/depth-first/short-ID/naïve continuation scoring under actual 44-deep KV tail admission; `ItemLocal`/`PartitionReduce`/`CorpusGlobal` snapshot authority; AA-A1 accepted-population and qualification-decay audits under human authority; and AA-R1 as trace-gated Phase-7 local-resident research. None of those dispositions turns pressure into confidence, audit sampling into a universal certificate, or local IPC into permission for a routable server.
 
 **Status:** post-reveal reaction to `WIZARD_SCORES_CC_ON_COD.md`, followed by
 the Phase-6.9 blind-spot probe. This is non-normative review provenance. The
