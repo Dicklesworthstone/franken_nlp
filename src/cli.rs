@@ -9,6 +9,7 @@ use std::{
 use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::{
+    artifact::package::{PackageRequest, package_model, verify_model_package},
     error::ErrorCode,
     grammar::{CompileLimits, CompiledSchema, SchemaError, compile_json_schema},
     robot::{self, RobotCommand},
@@ -33,6 +34,11 @@ enum Command {
         #[command(subcommand)]
         command: SchemaSubcommand,
     },
+    /// Construct or verify an immutable maintainer model-release package.
+    Release {
+        #[command(subcommand)]
+        command: ReleaseSubcommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -56,6 +62,34 @@ enum SchemaSubcommand {
     Sample {
         #[arg(value_name = "SCHEMA")]
         schema: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReleaseSubcommand {
+    /// Split a finished canonical artifact into fixed immutable release parts.
+    PackageModel {
+        /// Finished canonical Generic `.fnlpq` artifact.
+        #[arg(long)]
+        artifact: PathBuf,
+        /// New, previously absent package staging directory.
+        #[arg(long)]
+        staging_dir: PathBuf,
+        /// Versioned `.fnlpq` basename recorded in the release receipt.
+        #[arg(long)]
+        logical_artifact_name: String,
+        /// Converter receipt retained with the release closure.
+        #[arg(long)]
+        conversion_receipt: PathBuf,
+        /// Directory containing exactly the approved three-file license bundle.
+        #[arg(long)]
+        license_bundle_dir: PathBuf,
+    },
+    /// Rehash, reassemble, and validate an immutable release package.
+    VerifyModelPackage {
+        /// Existing package staging directory to verify.
+        #[arg(long)]
+        staging_dir: PathBuf,
     },
 }
 
@@ -97,11 +131,63 @@ fn cli_main_with_reader(
             }
         }
         Some(Command::Schema { command }) => run_schema_command_with_reader(command, schema_input),
+        Some(Command::Release { command }) => run_release_command(command),
         None => {
             let mut command = Cli::command();
             let _ = command.print_help();
             println!();
             ExitCode::SUCCESS
+        }
+    }
+}
+
+fn run_release_command(command: ReleaseSubcommand) -> ExitCode {
+    match command {
+        ReleaseSubcommand::PackageModel {
+            artifact,
+            staging_dir,
+            logical_artifact_name,
+            conversion_receipt,
+            license_bundle_dir,
+        } => match package_model(&PackageRequest {
+            artifact,
+            staging_dir,
+            logical_artifact_name,
+            conversion_receipt,
+            license_bundle_dir,
+        }) {
+            Ok(report) => {
+                eprintln!(
+                    "RELEASE_PACKAGE RESULT=PASS staging_dir={} artifact_bytes={} artifact_sha256={} parts={}",
+                    report.staging_dir.display(),
+                    report.artifact_bytes,
+                    report.artifact_sha256,
+                    report.parts.len(),
+                );
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("RELEASE_PACKAGE RESULT=FAIL reason={error}");
+                ErrorCode::ArtifactIntegrityOrFormatOrVersion.as_process_exit()
+            }
+        },
+        ReleaseSubcommand::VerifyModelPackage { staging_dir } => {
+            match verify_model_package(&staging_dir) {
+                Ok(report) => {
+                    eprintln!(
+                        "RELEASE_VERIFY RESULT=PASS staging_dir={} artifact_bytes={} artifact_sha256={} parts={}",
+                        report.staging_dir.display(),
+                        report.artifact_bytes,
+                        report.artifact_sha256,
+                        report.parts.len(),
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("RELEASE_VERIFY RESULT=FAIL reason={error}");
+                    ErrorCode::ArtifactIntegrityOrFormatOrVersion.as_process_exit()
+                }
+            }
         }
     }
 }
@@ -183,7 +269,9 @@ fn emit_schema_error(mode: &str, error: &SchemaError) {
 mod tests {
     use std::{ffi::OsString, io::Cursor, process::ExitCode};
 
-    use super::cli_main_with_reader;
+    use clap::Parser;
+
+    use super::{Cli, Command, ReleaseSubcommand, cli_main_with_reader};
 
     #[test]
     fn schema_dash_uses_the_injected_reader() {
@@ -199,5 +287,46 @@ mod tests {
             cli_main_with_reader(args, &mut schema_input),
             ExitCode::SUCCESS
         );
+    }
+
+    #[test]
+    fn release_package_commands_have_only_explicit_named_paths() {
+        let package = Cli::try_parse_from([
+            "fnlp",
+            "release",
+            "package-model",
+            "--artifact",
+            "/artifacts/model.fnlpq",
+            "--staging-dir",
+            "/staging/model-v1",
+            "--logical-artifact-name",
+            "model.fnlpq",
+            "--conversion-receipt",
+            "/receipts/conversion.json",
+            "--license-bundle-dir",
+            "/licenses/model-v1",
+        ])
+        .expect("explicit package command parses");
+        assert!(matches!(
+            package.command,
+            Some(Command::Release {
+                command: ReleaseSubcommand::PackageModel { .. }
+            })
+        ));
+
+        let verify = Cli::try_parse_from([
+            "fnlp",
+            "release",
+            "verify-model-package",
+            "--staging-dir",
+            "/staging/model-v1",
+        ])
+        .expect("explicit verify command parses");
+        assert!(matches!(
+            verify.command,
+            Some(Command::Release {
+                command: ReleaseSubcommand::VerifyModelPackage { .. }
+            })
+        ));
     }
 }
