@@ -11,21 +11,23 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     artifact::converter::{
-        ConvertArch, ConvertRequest, ConverterError, DEFAULT_PANEL_BYTES, GenericPayloadPlan,
-        PreparedConversionInput, plan_generic_payload, prepare_convert_request,
-        stream_routed_bf16_panels,
+        plan_generic_payload, prepare_convert_request, stream_routed_bf16_panels, ConvertArch,
+        ConvertRequest, ConverterError, GenericPayloadPlan, PreparedConversionInput,
+        DEFAULT_PANEL_BYTES,
     },
     artifact::format::{
+        framed_sha256, logical_model_sha256, validate_authority_identifier, write_streaming,
         ArchTarget, CanonicalDtype, FnlpqStreamingInput, FnlpqWriteError,
         LogicalTensorStreamingHasher, PackingSetInput, SectionKind, SectionRange, StreamingSection,
-        StreamingSectionHasher, TensorInput, framed_sha256, logical_model_sha256,
-        validate_authority_identifier, write_streaming,
+        StreamingSectionHasher, TensorInput,
     },
-    artifact::package::{PackageRequest, package_model, verify_model_package},
-    artifact::quantize::{GenericPanelBytes, encode_generic_panel},
+    artifact::fs_tx::open_ratified_model_root,
+    artifact::package::{package_model, verify_model_package, PackageRequest},
+    artifact::packing::{NativePackingTarget, TILE_TABLE_VERSION_V1},
+    artifact::quantize::{encode_generic_panel, GenericPanelBytes},
     artifact::safetensors::{RowPanel, SafetensorsRangeIndex, TensorCensusEntry},
     error::ErrorCode,
-    grammar::{CompileLimits, CompiledSchema, SchemaError, compile_json_schema},
+    grammar::{compile_json_schema, CompileLimits, CompiledSchema, SchemaError},
     robot::{self, RobotCommand},
 };
 
@@ -80,6 +82,11 @@ enum Command {
     },
     /// Prepare a bounded, canonical Generic conversion from the pinned source closure.
     Convert(ConvertCommand),
+    /// Inspect or derive local representations of an installed Generic model.
+    Models {
+        #[command(subcommand)]
+        command: ModelsSubcommand,
+    },
 }
 
 #[derive(clap::Args)]
@@ -109,6 +116,28 @@ struct ConvertCommand {
     /// Reserve stdout for versioned robot events once conversion execution lands.
     #[arg(long)]
     robot: bool,
+}
+
+#[derive(Subcommand)]
+enum ModelsSubcommand {
+    /// Derive one target-specific native cache from an immutable Generic root.
+    Derive(ModelsDeriveCommand),
+}
+
+#[derive(clap::Args)]
+struct ModelsDeriveCommand {
+    /// Immutable Generic `.fnlpq` reconstruction root.
+    #[arg(long)]
+    generic: PathBuf,
+    /// Closed native packing target.
+    #[arg(long)]
+    arch: String,
+    /// Owner-controlled model root that owns the content-addressed native cache.
+    #[arg(long)]
+    model_dir: PathBuf,
+    /// Immutable target tile-table revision.
+    #[arg(long, default_value = TILE_TABLE_VERSION_V1)]
+    tile_table_version: String,
 }
 
 #[derive(Subcommand)]
@@ -203,6 +232,7 @@ fn cli_main_with_reader(
         Some(Command::Schema { command }) => run_schema_command_with_reader(command, schema_input),
         Some(Command::Release { command }) => run_release_command(command),
         Some(Command::Convert(command)) => run_convert_command(command),
+        Some(Command::Models { command }) => run_models_command(command),
         None => {
             let mut command = Cli::command();
             let _ = command.print_help();
@@ -210,6 +240,45 @@ fn cli_main_with_reader(
             ExitCode::SUCCESS
         }
     }
+}
+
+fn run_models_command(command: ModelsSubcommand) -> ExitCode {
+    match command {
+        ModelsSubcommand::Derive(command) => run_models_derive(command),
+    }
+}
+
+fn run_models_derive(command: ModelsDeriveCommand) -> ExitCode {
+    let target = match NativePackingTarget::parse(&command.arch) {
+        Ok(target) => target,
+        Err(error) => {
+            eprintln!("MODELS_DERIVE RESULT=FAIL stage=arch reason={error}");
+            return ErrorCode::Usage.as_process_exit();
+        }
+    };
+    if let Err(error) = open_ratified_model_root(&command.model_dir) {
+        eprintln!(
+            "MODELS_DERIVE RESULT=REFUSED stage=model-root generic={} model_dir={} arch={} tile_table_version={} reason={error}",
+            command.generic.display(),
+            command.model_dir.display(),
+            target.cli_name(),
+            command.tile_table_version,
+        );
+        return ErrorCode::AdmissionOrResourceLimit.as_process_exit();
+    }
+
+    // No target currently has a model-root handle capable of `create_new`,
+    // same-filesystem staging, sync, and non-replacing activation.  Keep this
+    // branch fail-closed even if a future platform probe changes the root
+    // opener: raw filesystem writes here would violate the artifact contract.
+    eprintln!(
+        "MODELS_DERIVE RESULT=REFUSED stage=cache-transaction generic={} model_dir={} arch={} tile_table_version={} reason=ratified-native-cache-create-new-stage-unavailable",
+        command.generic.display(),
+        command.model_dir.display(),
+        target.cli_name(),
+        command.tile_table_version,
+    );
+    ErrorCode::AdmissionOrResourceLimit.as_process_exit()
 }
 
 fn run_convert_command(command: ConvertCommand) -> ExitCode {
@@ -1232,8 +1301,8 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        Cli, Command, ReleaseSubcommand, cli_main_with_reader, conversion_staging_path,
-        validate_generic_tensor_authorities,
+        cli_main_with_reader, conversion_staging_path, validate_generic_tensor_authorities, Cli,
+        Command, ModelsSubcommand, ReleaseSubcommand,
     };
     use crate::artifact::converter::{
         GenericPayloadPlan, GenericTensorLayout, OutputRange, StorageStage,
@@ -1294,6 +1363,38 @@ mod tests {
                 command: ReleaseSubcommand::VerifyModelPackage { .. }
             })
         ));
+    }
+
+    #[test]
+    fn models_derive_requires_explicit_generic_arch_and_model_root() {
+        let parsed = Cli::try_parse_from([
+            "fnlp",
+            "models",
+            "derive",
+            "--generic",
+            "/models/generic.fnlpq",
+            "--arch",
+            "x86-avx2",
+            "--model-dir",
+            "/models",
+        ])
+        .expect("derive command accepts exact explicit paths");
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Models {
+                command: ModelsSubcommand::Derive(_)
+            })
+        ));
+        assert!(Cli::try_parse_from([
+            "fnlp",
+            "models",
+            "derive",
+            "--generic",
+            "/models/generic.fnlpq",
+            "--arch",
+            "x86-avx2",
+        ])
+        .is_err());
     }
 
     #[test]
