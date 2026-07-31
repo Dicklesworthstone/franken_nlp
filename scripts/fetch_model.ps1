@@ -91,13 +91,41 @@ function Test-ReparsePoint([string]$Path) {
     return (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
 }
 
+function Test-OwnerControlledWindowsAcl([string]$Path) {
+    $acl = Get-Acl -LiteralPath $Path
+    $current = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier])
+    if ($null -eq $current.User -or $null -eq $owner -or $owner.Value -ne $current.User.Value) {
+        return $false
+    }
+
+    # SYSTEM and local Administrators are privileged machine principals; every
+    # non-privileged write grant must name the current owner directly. Treat an
+    # unresolvable SID as untrusted rather than guessing at its authority.
+    $trustedWriterSids = @($current.User.Value, 'S-1-5-18', 'S-1-5-32-544')
+    $writeRights =
+        [Security.AccessControl.FileSystemRights]::WriteData -bor
+        [Security.AccessControl.FileSystemRights]::AppendData -bor
+        [Security.AccessControl.FileSystemRights]::WriteExtendedAttributes -bor
+        [Security.AccessControl.FileSystemRights]::WriteAttributes -bor
+        [Security.AccessControl.FileSystemRights]::Delete -bor
+        [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+        [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+        [Security.AccessControl.FileSystemRights]::TakeOwnership
+    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+        if (($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
+        if (($rule.FileSystemRights -band $writeRights) -eq 0) { continue }
+        if ($trustedWriterSids -notcontains $rule.IdentityReference.Value) { return $false }
+    }
+    return $true
+}
+
 function Assert-OwnerControlledDirectory([string]$Path) {
     $item = Get-Item -LiteralPath $Path -Force
     if (-not $item.PSIsContainer -or (Test-ReparsePoint $Path)) { Exit-Fetch 4 "destination must be a non-reparse directory: $Path" }
     if ($env:OS -eq 'Windows_NT') {
-        $owner = (Get-Acl -LiteralPath $Path).Owner
-        $current = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-        if ($owner -ne $current) { Exit-Fetch 4 "destination is not owned by the current user: $Path" }
+        if (-not (Test-OwnerControlledWindowsAcl $Path)) { Exit-Fetch 4 "destination ACL grants write authority beyond the owner-controlled root: $Path" }
     }
 }
 
@@ -105,8 +133,7 @@ function Test-SecureRegularFile([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
     if (Test-ReparsePoint $Path) { return $false }
     if ($env:OS -eq 'Windows_NT') {
-        $owner = (Get-Acl -LiteralPath $Path).Owner
-        if ($owner -ne [Security.Principal.WindowsIdentity]::GetCurrent().Name) { return $false }
+        if (-not (Test-OwnerControlledWindowsAcl $Path)) { return $false }
     }
     return $true
 }
