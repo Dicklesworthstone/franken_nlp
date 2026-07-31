@@ -672,7 +672,7 @@ fn full_path_to_id(metadata: &Metadata, target: &str) -> Option<String> {
         .iter()
         .map(|node| (node.id.as_str(), node))
         .collect();
-    let mut previous = BTreeMap::new();
+    let mut previous: BTreeMap<String, String> = BTreeMap::new();
     let mut seen = BTreeSet::from([root.to_owned()]);
     let mut queue = VecDeque::from([root.to_owned()]);
 
