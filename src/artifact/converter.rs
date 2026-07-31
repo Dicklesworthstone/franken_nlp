@@ -22,6 +22,7 @@ use crate::artifact::safetensors::{
     CensusDiff, RowPanel, SafetensorDtype, SafetensorsError, SafetensorsRangeIndex, SourceClosure,
     SourceDigest, TensorCensusEntry, TensorExpectation, diff_census_entries,
 };
+use crate::artifact::quantize::{QuantizeError, quantize_per_output_channel_i8};
 use crate::canonjson::{self, ParseLimits};
 
 /// The complete source closure, including tokenizer/configuration files.
@@ -1113,6 +1114,72 @@ pub struct Bf16PanelStreamReport {
     pub f32_work_bytes: u64,
 }
 
+/// One bounded Generic-representation panel ready for a streaming envelope.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GenericPanel {
+    /// BF16 logical bytes preserved verbatim for normalization/embedding rows.
+    Bf16Verbatim { bytes: Vec<u8> },
+    /// Portable signed int8 values plus little-endian per-row sidecars.
+    Int8 {
+        values: Vec<i8>,
+        scales_le: Vec<u8>,
+        row_sums_le: Vec<u8>,
+    },
+}
+
+/// Apply the frozen route's bounded Generic transform to one complete-row
+/// source panel.  This does not retain a tensor or write an artifact.
+pub fn transform_routed_panel(
+    entry: &TensorCensusEntry,
+    route: &TensorRoute,
+    panel: RowPanel,
+    source_bytes: &[u8],
+    f32_work: &[f32],
+) -> Result<GenericPanel, ConverterError> {
+    if route != &remap_tensor_name(&entry.name)? {
+        return Err(ConverterError::PipelinePlanAlignment {
+            tensor: entry.name.clone(),
+            detail: "route differs from canonical mapping".to_owned(),
+        });
+    }
+    let RowPanel::Rows { row_count, .. } = panel;
+    let columns = entry.shape[1..].iter().try_fold(1_u64, |product, dimension| {
+        product.checked_mul(*dimension).ok_or(ConverterError::Arithmetic {
+            invariant: "routed panel column product",
+        })
+    })?;
+    let rows = usize::try_from(row_count).map_err(|_| ConverterError::Arithmetic {
+        invariant: "routed panel rows to usize",
+    })?;
+    let columns = usize::try_from(columns).map_err(|_| ConverterError::Arithmetic {
+        invariant: "routed panel columns to usize",
+    })?;
+    match route.stage {
+        StorageStage::Bf16Verbatim => Ok(GenericPanel::Bf16Verbatim {
+            bytes: source_bytes.to_vec(),
+        }),
+        StorageStage::Int8Stage2A | StorageStage::Int8Stage2B | StorageStage::Int8Stage2C => {
+            let quantized = quantize_per_output_channel_i8(f32_work, rows, columns)
+                .map_err(ConverterError::Quantize)?;
+            let scales_le = quantized
+                .scales
+                .iter()
+                .flat_map(|scale| scale.to_le_bytes())
+                .collect();
+            let row_sums_le = quantized
+                .row_sums
+                .iter()
+                .flat_map(|sum| sum.to_le_bytes())
+                .collect();
+            Ok(GenericPanel::Int8 {
+                values: quantized.values,
+                scales_le,
+                row_sums_le,
+            })
+        }
+    }
+}
+
 /// Traverse a fully prepared census in its canonical order, keeping only one
 /// source panel and its decoded f32 work panel live at a time.
 ///
@@ -1758,6 +1825,8 @@ pub enum ConverterError {
     },
     /// A route or panel no longer corresponds to its prepared source tensor.
     PipelinePlanAlignment { tensor: String, detail: String },
+    /// Portable panel quantization rejected the bounded f32 work slice.
+    Quantize(QuantizeError),
     /// An unapproved bias tensor was discovered.
     BiasTensor { tensor: String },
     /// A source tensor has no complete mapping.
@@ -1939,6 +2008,7 @@ impl fmt::Display for ConverterError {
                 formatter,
                 "prepared pipeline alignment for {tensor}: {detail}"
             ),
+            Self::Quantize(error) => write!(formatter, "portable panel quantization: {error}"),
             Self::BiasTensor { tensor } => write!(
                 formatter,
                 "bias tensor {tensor} is forbidden by the Nanbeige4.2-3B source contract"
