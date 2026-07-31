@@ -354,7 +354,7 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{cli_main_with_reader, Cli, Command};
+    use super::{cli_main_with_reader, Cli, Command, ReleaseSubcommand};
 
     #[test]
     fn schema_dash_uses_the_injected_reader() {
