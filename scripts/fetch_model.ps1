@@ -199,7 +199,7 @@ function Assert-Preflight($Entries) {
 
 function Test-EffectiveHost([Uri]$Uri) {
     $host = $Uri.Host.ToLowerInvariant()
-    return $host -eq 'huggingface.co' -or $host -eq 'cdn-lfs.huggingface.co' -or $host -like '*.xethub.hf.co'
+    return $host -eq 'huggingface.co' -or $host -eq 'cdn-lfs.huggingface.co' -or $host -like '*.xethub.hf.co' -or $host -like '*.cdn.hf.co'
 }
 
 function Download-Partial([string]$Url, [string]$Partial, [string]$Journal, $Entry) {

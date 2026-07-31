@@ -29,6 +29,13 @@ function Write-Journal([string]$Dest, [string]$Name, [int64]$Length, [string]$Di
 
 try {
     if (-not (Get-Command python3 -ErrorAction SilentlyContinue)) { throw 'python3 is required for the local fixture server' }
+    $script:Cases++
+    $effectiveHostPolicy = (Select-String -LiteralPath $Fetch -Pattern '^\s*return \$host ' | Select-Object -Last 1).Line
+    if ($effectiveHostPolicy -match "\$host -like '\*\.xethub\.hf\.co'" -and $effectiveHostPolicy -match "\$host -like '\*\.cdn\.hf\.co'") {
+        Pass 'redirect-policy' 'official-xet-cdn-hosts-accepted'
+    } else {
+        Fail 'redirect-policy' 'official-xet-cdn-hosts-accepted'
+    }
     New-Item -ItemType Directory -Path $Work | Out-Null
     $Fixture = Join-Path $Work ('fixture/resolve/' + $Revision)
     New-Item -ItemType Directory -Path $Fixture -Force | Out-Null
