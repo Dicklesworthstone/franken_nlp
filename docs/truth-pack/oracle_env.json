@@ -1,6 +1,6 @@
 {
-  "closure_status": "recreated_and_cpu_eager_smoke_recorded_before_full_source_closure_verification",
-  "closure_status_explanation": "The exact 28-package CPU/eager closure was recreated from the hash-addressed lock, then recorded a CPU/eager smoke forward and 32-token greedy decode. This historical transcript predates the verifier's full ten-file source-closure check and therefore is retained as audit evidence rather than as mechanically source-bound acceptance evidence. A new smoke transcript is mechanically bound only when this record's hash-bound source manifest and all ten files, including both safetensors shard byte lengths and SHA-256 values, verify before the run.",
+  "closure_status": "recreated_and_cpu_eager_smoke_with_full_source_closure_verification",
+  "closure_status_explanation": "The exact 28-package CPU/eager closure was recreated from the hash-addressed lock, then a fresh CPU/eager smoke run verified the committed ten-file source closure before model load: each file, including both safetensors shards, matched its canonical byte length and SHA-256. The canonical transcript below records that verified closure. Earlier smoke, floor, trace, and fixture transcripts remain historical evidence only; this record does not retroactively bind them to the model weights or authorize dependent parity gates.",
   "closure": {
     "freeze_sha256": "21ccb4eeed1b554f8e6300d1a3580f3a1ad13ca7d3c20afccf17b06654f271b3",
     "lock_path": "docs/truth-pack/oracle_requirements.lock",
@@ -112,8 +112,8 @@
   "schema_version": 1,
   "smoke": {
     "expected": {
-      "canonical_transcript_path": "docs/truth-pack/oracle_smoke_f56ec5a.json",
-      "canonical_transcript_sha256": "ad4981a9ec2912999a7d3cb85cbfe837026ce7fe2c2e3daa8d6df0cbbaa1e5ad",
+      "canonical_transcript_path": "docs/truth-pack/oracle_smoke_source_closure_f56ec5a.json",
+      "canonical_transcript_sha256": "d9c7e6fd9766e847cd7b20d90ab24c74558bcd877820f555c2cf6385fe8e78e4",
       "greedy_new_token_ids": [
         152382,
         13,
