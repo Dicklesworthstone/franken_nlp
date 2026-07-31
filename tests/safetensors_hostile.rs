@@ -158,6 +158,21 @@ fn index_mapping_and_digest_refusal_are_typed() {
         Err(SafetensorsError::SourceDigest { expected, actual, .. })
             if expected != actual
     ));
+
+    let wrong_length = SourceDigest::new(
+        "length-fixture.safetensors",
+        3,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    )
+    .expect("valid expected digest grammar");
+    assert!(matches!(
+        verify_source_bytes(&wrong_length, &[0, 1]),
+        Err(SafetensorsError::SourceLength {
+            expected: 3,
+            actual: 2,
+            ..
+        })
+    ));
 }
 
 #[test]
