@@ -1,0 +1,39 @@
+{
+  "decision_gate": "A candidate becomes a recipe decision only after retained full-artifact conversion plus preregistered held-out parity and task metrics.",
+  "evidence_status": "SOURCE_RULE_PREDICTION_BLOCKED_NO_GGUF_DIGEST",
+  "gguf_digests": [],
+  "hypotheses": [
+    {
+      "candidate": "lm_head",
+      "candidate_tier": "Q6_K_or_higher",
+      "evidence_pointer": "llama-quant.cpp Q4_K_M output override",
+      "id": "OQ12-H1",
+      "status": "SEARCH_SEED_ONLY"
+    },
+    {
+      "candidate": "attention value projections at layers 0,1,4,7,10,13,16,19,20,21",
+      "candidate_tier": "Q6_K_or_higher",
+      "evidence_pointer": "llama-quant.cpp use_more_bits rule",
+      "id": "OQ12-H2",
+      "status": "SEARCH_SEED_ONLY"
+    },
+    {
+      "candidate": "FFN down projections at layers 0,1,4,7,10,13,16,19,20,21",
+      "candidate_tier": "Q6_K_or_higher",
+      "evidence_pointer": "llama-quant.cpp use_more_bits rule",
+      "id": "OQ12-H3",
+      "status": "SEARCH_SEED_ONLY"
+    }
+  ],
+  "model": "Nanbeige4.2-3B",
+  "model_revision": "f56ec5a9650268aa098496734743c25ea778bd2d",
+  "non_authority": "These are llama.cpp source-rule predictions and search seeds. They are not a forward-parity result, artifact evidence, or an approved FrankenNLP quantization recipe.",
+  "official_llamacpp_revision": "000547513f1530346ecd163db8b3e13962949961",
+  "schema_version": 1,
+  "source_evidence": {
+    "base_mapping": "https://raw.githubusercontent.com/ggml-org/llama.cpp/000547513f1530346ecd163db8b3e13962949961/conversion/base.py",
+    "llama_mapping_and_permute": "https://raw.githubusercontent.com/ggml-org/llama.cpp/000547513f1530346ecd163db8b3e13962949961/conversion/llama.py",
+    "nanbeige_model_registration": "https://raw.githubusercontent.com/ggml-org/llama.cpp/000547513f1530346ecd163db8b3e13962949961/conversion/nanbeige.py",
+    "quant_mixture_rules": "https://raw.githubusercontent.com/ggml-org/llama.cpp/000547513f1530346ecd163db8b3e13962949961/src/llama-quant.cpp"
+  }
+}

@@ -1,0 +1,2066 @@
+{
+  "evidence_status": "SOURCE_RULE_PREDICTION_BLOCKED_NO_GGUF_DIGEST",
+  "gguf_digests": [],
+  "model": "Nanbeige4.2-3B",
+  "model_revision": "f56ec5a9650268aa098496734743c25ea778bd2d",
+  "non_authority": "These are llama.cpp source-rule predictions and search seeds. They are not a forward-parity result, artifact evidence, or an approved FrankenNLP quantization recipe.",
+  "official_llamacpp_revision": "000547513f1530346ecd163db8b3e13962949961",
+  "q4_k_m_rule": {
+    "base": "Q4_K for eligible rank-2 weights",
+    "ordering_assumption": "Layer index is the source-rule ordinal; retain actual GGUF tensor order before treating it as observed output.",
+    "overrides": {
+      "down": {
+        "layers": [
+          0,
+          1,
+          4,
+          7,
+          10,
+          13,
+          16,
+          19,
+          20,
+          21
+        ],
+        "tier": "Q6_K"
+      },
+      "lm_head": {
+        "tier": "Q6_K"
+      },
+      "v": {
+        "layers": [
+          0,
+          1,
+          4,
+          7,
+          10,
+          13,
+          16,
+          19,
+          20,
+          21
+        ],
+        "tier": "Q6_K"
+      }
+    }
+  },
+  "records": [
+    {
+      "class": "lm_head",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "output.weight",
+      "hf_name": "lm_head.weight",
+      "layer": null,
+      "q4_k_m_source_rule": "Q6_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "embed",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "token_embd.weight",
+      "hf_name": "model.embed_tokens.weight",
+      "layer": null,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.0.attn_norm.weight",
+      "hf_name": "model.layers.0.input_layernorm.weight",
+      "layer": 0,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "down",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.0.ffn_down.weight",
+      "hf_name": "model.layers.0.mlp.down_proj.weight",
+      "layer": 0,
+      "q4_k_m_source_rule": "Q6_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "gate",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.0.ffn_gate.weight",
+      "hf_name": "model.layers.0.mlp.gate_proj.weight",
+      "layer": 0,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "up",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.0.ffn_up.weight",
+      "hf_name": "model.layers.0.mlp.up_proj.weight",
+      "layer": 0,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.0.ffn_norm.weight",
+      "hf_name": "model.layers.0.post_attention_layernorm.weight",
+      "layer": 0,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "k",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.0.attn_k.weight",
+      "hf_name": "model.layers.0.self_attn.k_proj.weight",
+      "layer": 0,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "o",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.0.attn_output.weight",
+      "hf_name": "model.layers.0.self_attn.o_proj.weight",
+      "layer": 0,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "q",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.0.attn_q.weight",
+      "hf_name": "model.layers.0.self_attn.q_proj.weight",
+      "layer": 0,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "v",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.0.attn_v.weight",
+      "hf_name": "model.layers.0.self_attn.v_proj.weight",
+      "layer": 0,
+      "q4_k_m_source_rule": "Q6_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.1.attn_norm.weight",
+      "hf_name": "model.layers.1.input_layernorm.weight",
+      "layer": 1,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "down",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.1.ffn_down.weight",
+      "hf_name": "model.layers.1.mlp.down_proj.weight",
+      "layer": 1,
+      "q4_k_m_source_rule": "Q6_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "gate",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.1.ffn_gate.weight",
+      "hf_name": "model.layers.1.mlp.gate_proj.weight",
+      "layer": 1,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "up",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.1.ffn_up.weight",
+      "hf_name": "model.layers.1.mlp.up_proj.weight",
+      "layer": 1,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.1.ffn_norm.weight",
+      "hf_name": "model.layers.1.post_attention_layernorm.weight",
+      "layer": 1,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "k",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.1.attn_k.weight",
+      "hf_name": "model.layers.1.self_attn.k_proj.weight",
+      "layer": 1,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "o",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.1.attn_output.weight",
+      "hf_name": "model.layers.1.self_attn.o_proj.weight",
+      "layer": 1,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "q",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.1.attn_q.weight",
+      "hf_name": "model.layers.1.self_attn.q_proj.weight",
+      "layer": 1,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "v",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.1.attn_v.weight",
+      "hf_name": "model.layers.1.self_attn.v_proj.weight",
+      "layer": 1,
+      "q4_k_m_source_rule": "Q6_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.10.attn_norm.weight",
+      "hf_name": "model.layers.10.input_layernorm.weight",
+      "layer": 10,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "down",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.10.ffn_down.weight",
+      "hf_name": "model.layers.10.mlp.down_proj.weight",
+      "layer": 10,
+      "q4_k_m_source_rule": "Q6_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "gate",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.10.ffn_gate.weight",
+      "hf_name": "model.layers.10.mlp.gate_proj.weight",
+      "layer": 10,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "up",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.10.ffn_up.weight",
+      "hf_name": "model.layers.10.mlp.up_proj.weight",
+      "layer": 10,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.10.ffn_norm.weight",
+      "hf_name": "model.layers.10.post_attention_layernorm.weight",
+      "layer": 10,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "k",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.10.attn_k.weight",
+      "hf_name": "model.layers.10.self_attn.k_proj.weight",
+      "layer": 10,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "o",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.10.attn_output.weight",
+      "hf_name": "model.layers.10.self_attn.o_proj.weight",
+      "layer": 10,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "q",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.10.attn_q.weight",
+      "hf_name": "model.layers.10.self_attn.q_proj.weight",
+      "layer": 10,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "v",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.10.attn_v.weight",
+      "hf_name": "model.layers.10.self_attn.v_proj.weight",
+      "layer": 10,
+      "q4_k_m_source_rule": "Q6_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.11.attn_norm.weight",
+      "hf_name": "model.layers.11.input_layernorm.weight",
+      "layer": 11,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "down",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.11.ffn_down.weight",
+      "hf_name": "model.layers.11.mlp.down_proj.weight",
+      "layer": 11,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "gate",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.11.ffn_gate.weight",
+      "hf_name": "model.layers.11.mlp.gate_proj.weight",
+      "layer": 11,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "up",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.11.ffn_up.weight",
+      "hf_name": "model.layers.11.mlp.up_proj.weight",
+      "layer": 11,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.11.ffn_norm.weight",
+      "hf_name": "model.layers.11.post_attention_layernorm.weight",
+      "layer": 11,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "k",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.11.attn_k.weight",
+      "hf_name": "model.layers.11.self_attn.k_proj.weight",
+      "layer": 11,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "o",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.11.attn_output.weight",
+      "hf_name": "model.layers.11.self_attn.o_proj.weight",
+      "layer": 11,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "q",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.11.attn_q.weight",
+      "hf_name": "model.layers.11.self_attn.q_proj.weight",
+      "layer": 11,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "v",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.11.attn_v.weight",
+      "hf_name": "model.layers.11.self_attn.v_proj.weight",
+      "layer": 11,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.12.attn_norm.weight",
+      "hf_name": "model.layers.12.input_layernorm.weight",
+      "layer": 12,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "down",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.12.ffn_down.weight",
+      "hf_name": "model.layers.12.mlp.down_proj.weight",
+      "layer": 12,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "gate",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.12.ffn_gate.weight",
+      "hf_name": "model.layers.12.mlp.gate_proj.weight",
+      "layer": 12,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "up",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.12.ffn_up.weight",
+      "hf_name": "model.layers.12.mlp.up_proj.weight",
+      "layer": 12,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.12.ffn_norm.weight",
+      "hf_name": "model.layers.12.post_attention_layernorm.weight",
+      "layer": 12,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "k",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.12.attn_k.weight",
+      "hf_name": "model.layers.12.self_attn.k_proj.weight",
+      "layer": 12,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "o",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.12.attn_output.weight",
+      "hf_name": "model.layers.12.self_attn.o_proj.weight",
+      "layer": 12,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "q",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.12.attn_q.weight",
+      "hf_name": "model.layers.12.self_attn.q_proj.weight",
+      "layer": 12,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "v",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.12.attn_v.weight",
+      "hf_name": "model.layers.12.self_attn.v_proj.weight",
+      "layer": 12,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.13.attn_norm.weight",
+      "hf_name": "model.layers.13.input_layernorm.weight",
+      "layer": 13,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "down",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.13.ffn_down.weight",
+      "hf_name": "model.layers.13.mlp.down_proj.weight",
+      "layer": 13,
+      "q4_k_m_source_rule": "Q6_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "gate",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.13.ffn_gate.weight",
+      "hf_name": "model.layers.13.mlp.gate_proj.weight",
+      "layer": 13,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "up",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.13.ffn_up.weight",
+      "hf_name": "model.layers.13.mlp.up_proj.weight",
+      "layer": 13,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.13.ffn_norm.weight",
+      "hf_name": "model.layers.13.post_attention_layernorm.weight",
+      "layer": 13,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "k",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.13.attn_k.weight",
+      "hf_name": "model.layers.13.self_attn.k_proj.weight",
+      "layer": 13,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "o",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.13.attn_output.weight",
+      "hf_name": "model.layers.13.self_attn.o_proj.weight",
+      "layer": 13,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "q",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.13.attn_q.weight",
+      "hf_name": "model.layers.13.self_attn.q_proj.weight",
+      "layer": 13,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "v",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.13.attn_v.weight",
+      "hf_name": "model.layers.13.self_attn.v_proj.weight",
+      "layer": 13,
+      "q4_k_m_source_rule": "Q6_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.14.attn_norm.weight",
+      "hf_name": "model.layers.14.input_layernorm.weight",
+      "layer": 14,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "down",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.14.ffn_down.weight",
+      "hf_name": "model.layers.14.mlp.down_proj.weight",
+      "layer": 14,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "gate",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.14.ffn_gate.weight",
+      "hf_name": "model.layers.14.mlp.gate_proj.weight",
+      "layer": 14,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "up",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.14.ffn_up.weight",
+      "hf_name": "model.layers.14.mlp.up_proj.weight",
+      "layer": 14,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.14.ffn_norm.weight",
+      "hf_name": "model.layers.14.post_attention_layernorm.weight",
+      "layer": 14,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "k",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.14.attn_k.weight",
+      "hf_name": "model.layers.14.self_attn.k_proj.weight",
+      "layer": 14,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "o",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.14.attn_output.weight",
+      "hf_name": "model.layers.14.self_attn.o_proj.weight",
+      "layer": 14,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "q",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.14.attn_q.weight",
+      "hf_name": "model.layers.14.self_attn.q_proj.weight",
+      "layer": 14,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "v",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.14.attn_v.weight",
+      "hf_name": "model.layers.14.self_attn.v_proj.weight",
+      "layer": 14,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.15.attn_norm.weight",
+      "hf_name": "model.layers.15.input_layernorm.weight",
+      "layer": 15,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "down",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.15.ffn_down.weight",
+      "hf_name": "model.layers.15.mlp.down_proj.weight",
+      "layer": 15,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "gate",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.15.ffn_gate.weight",
+      "hf_name": "model.layers.15.mlp.gate_proj.weight",
+      "layer": 15,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "up",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.15.ffn_up.weight",
+      "hf_name": "model.layers.15.mlp.up_proj.weight",
+      "layer": 15,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.15.ffn_norm.weight",
+      "hf_name": "model.layers.15.post_attention_layernorm.weight",
+      "layer": 15,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "k",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.15.attn_k.weight",
+      "hf_name": "model.layers.15.self_attn.k_proj.weight",
+      "layer": 15,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "o",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.15.attn_output.weight",
+      "hf_name": "model.layers.15.self_attn.o_proj.weight",
+      "layer": 15,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "q",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.15.attn_q.weight",
+      "hf_name": "model.layers.15.self_attn.q_proj.weight",
+      "layer": 15,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "v",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.15.attn_v.weight",
+      "hf_name": "model.layers.15.self_attn.v_proj.weight",
+      "layer": 15,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.16.attn_norm.weight",
+      "hf_name": "model.layers.16.input_layernorm.weight",
+      "layer": 16,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "down",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.16.ffn_down.weight",
+      "hf_name": "model.layers.16.mlp.down_proj.weight",
+      "layer": 16,
+      "q4_k_m_source_rule": "Q6_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "gate",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.16.ffn_gate.weight",
+      "hf_name": "model.layers.16.mlp.gate_proj.weight",
+      "layer": 16,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "up",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.16.ffn_up.weight",
+      "hf_name": "model.layers.16.mlp.up_proj.weight",
+      "layer": 16,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.16.ffn_norm.weight",
+      "hf_name": "model.layers.16.post_attention_layernorm.weight",
+      "layer": 16,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "k",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.16.attn_k.weight",
+      "hf_name": "model.layers.16.self_attn.k_proj.weight",
+      "layer": 16,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "o",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.16.attn_output.weight",
+      "hf_name": "model.layers.16.self_attn.o_proj.weight",
+      "layer": 16,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "q",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.16.attn_q.weight",
+      "hf_name": "model.layers.16.self_attn.q_proj.weight",
+      "layer": 16,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "v",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.16.attn_v.weight",
+      "hf_name": "model.layers.16.self_attn.v_proj.weight",
+      "layer": 16,
+      "q4_k_m_source_rule": "Q6_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.17.attn_norm.weight",
+      "hf_name": "model.layers.17.input_layernorm.weight",
+      "layer": 17,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "down",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.17.ffn_down.weight",
+      "hf_name": "model.layers.17.mlp.down_proj.weight",
+      "layer": 17,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "gate",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.17.ffn_gate.weight",
+      "hf_name": "model.layers.17.mlp.gate_proj.weight",
+      "layer": 17,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "up",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.17.ffn_up.weight",
+      "hf_name": "model.layers.17.mlp.up_proj.weight",
+      "layer": 17,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.17.ffn_norm.weight",
+      "hf_name": "model.layers.17.post_attention_layernorm.weight",
+      "layer": 17,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "k",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.17.attn_k.weight",
+      "hf_name": "model.layers.17.self_attn.k_proj.weight",
+      "layer": 17,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "o",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.17.attn_output.weight",
+      "hf_name": "model.layers.17.self_attn.o_proj.weight",
+      "layer": 17,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "q",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.17.attn_q.weight",
+      "hf_name": "model.layers.17.self_attn.q_proj.weight",
+      "layer": 17,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "v",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.17.attn_v.weight",
+      "hf_name": "model.layers.17.self_attn.v_proj.weight",
+      "layer": 17,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.18.attn_norm.weight",
+      "hf_name": "model.layers.18.input_layernorm.weight",
+      "layer": 18,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "down",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.18.ffn_down.weight",
+      "hf_name": "model.layers.18.mlp.down_proj.weight",
+      "layer": 18,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "gate",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.18.ffn_gate.weight",
+      "hf_name": "model.layers.18.mlp.gate_proj.weight",
+      "layer": 18,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "up",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.18.ffn_up.weight",
+      "hf_name": "model.layers.18.mlp.up_proj.weight",
+      "layer": 18,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.18.ffn_norm.weight",
+      "hf_name": "model.layers.18.post_attention_layernorm.weight",
+      "layer": 18,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "k",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.18.attn_k.weight",
+      "hf_name": "model.layers.18.self_attn.k_proj.weight",
+      "layer": 18,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "o",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.18.attn_output.weight",
+      "hf_name": "model.layers.18.self_attn.o_proj.weight",
+      "layer": 18,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "q",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.18.attn_q.weight",
+      "hf_name": "model.layers.18.self_attn.q_proj.weight",
+      "layer": 18,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "v",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.18.attn_v.weight",
+      "hf_name": "model.layers.18.self_attn.v_proj.weight",
+      "layer": 18,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.19.attn_norm.weight",
+      "hf_name": "model.layers.19.input_layernorm.weight",
+      "layer": 19,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "down",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.19.ffn_down.weight",
+      "hf_name": "model.layers.19.mlp.down_proj.weight",
+      "layer": 19,
+      "q4_k_m_source_rule": "Q6_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "gate",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.19.ffn_gate.weight",
+      "hf_name": "model.layers.19.mlp.gate_proj.weight",
+      "layer": 19,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "up",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.19.ffn_up.weight",
+      "hf_name": "model.layers.19.mlp.up_proj.weight",
+      "layer": 19,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.19.ffn_norm.weight",
+      "hf_name": "model.layers.19.post_attention_layernorm.weight",
+      "layer": 19,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "k",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.19.attn_k.weight",
+      "hf_name": "model.layers.19.self_attn.k_proj.weight",
+      "layer": 19,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "o",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.19.attn_output.weight",
+      "hf_name": "model.layers.19.self_attn.o_proj.weight",
+      "layer": 19,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "q",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.19.attn_q.weight",
+      "hf_name": "model.layers.19.self_attn.q_proj.weight",
+      "layer": 19,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "v",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.19.attn_v.weight",
+      "hf_name": "model.layers.19.self_attn.v_proj.weight",
+      "layer": 19,
+      "q4_k_m_source_rule": "Q6_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.2.attn_norm.weight",
+      "hf_name": "model.layers.2.input_layernorm.weight",
+      "layer": 2,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "down",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.2.ffn_down.weight",
+      "hf_name": "model.layers.2.mlp.down_proj.weight",
+      "layer": 2,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "gate",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.2.ffn_gate.weight",
+      "hf_name": "model.layers.2.mlp.gate_proj.weight",
+      "layer": 2,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "up",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.2.ffn_up.weight",
+      "hf_name": "model.layers.2.mlp.up_proj.weight",
+      "layer": 2,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.2.ffn_norm.weight",
+      "hf_name": "model.layers.2.post_attention_layernorm.weight",
+      "layer": 2,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "k",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.2.attn_k.weight",
+      "hf_name": "model.layers.2.self_attn.k_proj.weight",
+      "layer": 2,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "o",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.2.attn_output.weight",
+      "hf_name": "model.layers.2.self_attn.o_proj.weight",
+      "layer": 2,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "q",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.2.attn_q.weight",
+      "hf_name": "model.layers.2.self_attn.q_proj.weight",
+      "layer": 2,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "v",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.2.attn_v.weight",
+      "hf_name": "model.layers.2.self_attn.v_proj.weight",
+      "layer": 2,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.20.attn_norm.weight",
+      "hf_name": "model.layers.20.input_layernorm.weight",
+      "layer": 20,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "down",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.20.ffn_down.weight",
+      "hf_name": "model.layers.20.mlp.down_proj.weight",
+      "layer": 20,
+      "q4_k_m_source_rule": "Q6_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "gate",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.20.ffn_gate.weight",
+      "hf_name": "model.layers.20.mlp.gate_proj.weight",
+      "layer": 20,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "up",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.20.ffn_up.weight",
+      "hf_name": "model.layers.20.mlp.up_proj.weight",
+      "layer": 20,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.20.ffn_norm.weight",
+      "hf_name": "model.layers.20.post_attention_layernorm.weight",
+      "layer": 20,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "k",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.20.attn_k.weight",
+      "hf_name": "model.layers.20.self_attn.k_proj.weight",
+      "layer": 20,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "o",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.20.attn_output.weight",
+      "hf_name": "model.layers.20.self_attn.o_proj.weight",
+      "layer": 20,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "q",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.20.attn_q.weight",
+      "hf_name": "model.layers.20.self_attn.q_proj.weight",
+      "layer": 20,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "v",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.20.attn_v.weight",
+      "hf_name": "model.layers.20.self_attn.v_proj.weight",
+      "layer": 20,
+      "q4_k_m_source_rule": "Q6_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.21.attn_norm.weight",
+      "hf_name": "model.layers.21.input_layernorm.weight",
+      "layer": 21,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "down",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.21.ffn_down.weight",
+      "hf_name": "model.layers.21.mlp.down_proj.weight",
+      "layer": 21,
+      "q4_k_m_source_rule": "Q6_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "gate",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.21.ffn_gate.weight",
+      "hf_name": "model.layers.21.mlp.gate_proj.weight",
+      "layer": 21,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "up",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.21.ffn_up.weight",
+      "hf_name": "model.layers.21.mlp.up_proj.weight",
+      "layer": 21,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.21.ffn_norm.weight",
+      "hf_name": "model.layers.21.post_attention_layernorm.weight",
+      "layer": 21,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "k",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.21.attn_k.weight",
+      "hf_name": "model.layers.21.self_attn.k_proj.weight",
+      "layer": 21,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "o",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.21.attn_output.weight",
+      "hf_name": "model.layers.21.self_attn.o_proj.weight",
+      "layer": 21,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "q",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.21.attn_q.weight",
+      "hf_name": "model.layers.21.self_attn.q_proj.weight",
+      "layer": 21,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "v",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.21.attn_v.weight",
+      "hf_name": "model.layers.21.self_attn.v_proj.weight",
+      "layer": 21,
+      "q4_k_m_source_rule": "Q6_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.3.attn_norm.weight",
+      "hf_name": "model.layers.3.input_layernorm.weight",
+      "layer": 3,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "down",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.3.ffn_down.weight",
+      "hf_name": "model.layers.3.mlp.down_proj.weight",
+      "layer": 3,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "gate",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.3.ffn_gate.weight",
+      "hf_name": "model.layers.3.mlp.gate_proj.weight",
+      "layer": 3,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "up",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.3.ffn_up.weight",
+      "hf_name": "model.layers.3.mlp.up_proj.weight",
+      "layer": 3,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.3.ffn_norm.weight",
+      "hf_name": "model.layers.3.post_attention_layernorm.weight",
+      "layer": 3,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "k",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.3.attn_k.weight",
+      "hf_name": "model.layers.3.self_attn.k_proj.weight",
+      "layer": 3,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "o",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.3.attn_output.weight",
+      "hf_name": "model.layers.3.self_attn.o_proj.weight",
+      "layer": 3,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "q",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.3.attn_q.weight",
+      "hf_name": "model.layers.3.self_attn.q_proj.weight",
+      "layer": 3,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "v",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.3.attn_v.weight",
+      "hf_name": "model.layers.3.self_attn.v_proj.weight",
+      "layer": 3,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.4.attn_norm.weight",
+      "hf_name": "model.layers.4.input_layernorm.weight",
+      "layer": 4,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "down",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.4.ffn_down.weight",
+      "hf_name": "model.layers.4.mlp.down_proj.weight",
+      "layer": 4,
+      "q4_k_m_source_rule": "Q6_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "gate",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.4.ffn_gate.weight",
+      "hf_name": "model.layers.4.mlp.gate_proj.weight",
+      "layer": 4,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "up",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.4.ffn_up.weight",
+      "hf_name": "model.layers.4.mlp.up_proj.weight",
+      "layer": 4,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.4.ffn_norm.weight",
+      "hf_name": "model.layers.4.post_attention_layernorm.weight",
+      "layer": 4,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "k",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.4.attn_k.weight",
+      "hf_name": "model.layers.4.self_attn.k_proj.weight",
+      "layer": 4,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "o",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.4.attn_output.weight",
+      "hf_name": "model.layers.4.self_attn.o_proj.weight",
+      "layer": 4,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "q",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.4.attn_q.weight",
+      "hf_name": "model.layers.4.self_attn.q_proj.weight",
+      "layer": 4,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "v",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.4.attn_v.weight",
+      "hf_name": "model.layers.4.self_attn.v_proj.weight",
+      "layer": 4,
+      "q4_k_m_source_rule": "Q6_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.5.attn_norm.weight",
+      "hf_name": "model.layers.5.input_layernorm.weight",
+      "layer": 5,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "down",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.5.ffn_down.weight",
+      "hf_name": "model.layers.5.mlp.down_proj.weight",
+      "layer": 5,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "gate",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.5.ffn_gate.weight",
+      "hf_name": "model.layers.5.mlp.gate_proj.weight",
+      "layer": 5,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "up",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.5.ffn_up.weight",
+      "hf_name": "model.layers.5.mlp.up_proj.weight",
+      "layer": 5,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.5.ffn_norm.weight",
+      "hf_name": "model.layers.5.post_attention_layernorm.weight",
+      "layer": 5,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "k",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.5.attn_k.weight",
+      "hf_name": "model.layers.5.self_attn.k_proj.weight",
+      "layer": 5,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "o",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.5.attn_output.weight",
+      "hf_name": "model.layers.5.self_attn.o_proj.weight",
+      "layer": 5,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "q",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.5.attn_q.weight",
+      "hf_name": "model.layers.5.self_attn.q_proj.weight",
+      "layer": 5,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "v",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.5.attn_v.weight",
+      "hf_name": "model.layers.5.self_attn.v_proj.weight",
+      "layer": 5,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.6.attn_norm.weight",
+      "hf_name": "model.layers.6.input_layernorm.weight",
+      "layer": 6,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "down",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.6.ffn_down.weight",
+      "hf_name": "model.layers.6.mlp.down_proj.weight",
+      "layer": 6,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "gate",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.6.ffn_gate.weight",
+      "hf_name": "model.layers.6.mlp.gate_proj.weight",
+      "layer": 6,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "up",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.6.ffn_up.weight",
+      "hf_name": "model.layers.6.mlp.up_proj.weight",
+      "layer": 6,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.6.ffn_norm.weight",
+      "hf_name": "model.layers.6.post_attention_layernorm.weight",
+      "layer": 6,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "k",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.6.attn_k.weight",
+      "hf_name": "model.layers.6.self_attn.k_proj.weight",
+      "layer": 6,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "o",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.6.attn_output.weight",
+      "hf_name": "model.layers.6.self_attn.o_proj.weight",
+      "layer": 6,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "q",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.6.attn_q.weight",
+      "hf_name": "model.layers.6.self_attn.q_proj.weight",
+      "layer": 6,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "v",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.6.attn_v.weight",
+      "hf_name": "model.layers.6.self_attn.v_proj.weight",
+      "layer": 6,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.7.attn_norm.weight",
+      "hf_name": "model.layers.7.input_layernorm.weight",
+      "layer": 7,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "down",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.7.ffn_down.weight",
+      "hf_name": "model.layers.7.mlp.down_proj.weight",
+      "layer": 7,
+      "q4_k_m_source_rule": "Q6_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "gate",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.7.ffn_gate.weight",
+      "hf_name": "model.layers.7.mlp.gate_proj.weight",
+      "layer": 7,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "up",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.7.ffn_up.weight",
+      "hf_name": "model.layers.7.mlp.up_proj.weight",
+      "layer": 7,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.7.ffn_norm.weight",
+      "hf_name": "model.layers.7.post_attention_layernorm.weight",
+      "layer": 7,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "k",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.7.attn_k.weight",
+      "hf_name": "model.layers.7.self_attn.k_proj.weight",
+      "layer": 7,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "o",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.7.attn_output.weight",
+      "hf_name": "model.layers.7.self_attn.o_proj.weight",
+      "layer": 7,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "q",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.7.attn_q.weight",
+      "hf_name": "model.layers.7.self_attn.q_proj.weight",
+      "layer": 7,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "v",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.7.attn_v.weight",
+      "hf_name": "model.layers.7.self_attn.v_proj.weight",
+      "layer": 7,
+      "q4_k_m_source_rule": "Q6_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.8.attn_norm.weight",
+      "hf_name": "model.layers.8.input_layernorm.weight",
+      "layer": 8,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "down",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.8.ffn_down.weight",
+      "hf_name": "model.layers.8.mlp.down_proj.weight",
+      "layer": 8,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "gate",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.8.ffn_gate.weight",
+      "hf_name": "model.layers.8.mlp.gate_proj.weight",
+      "layer": 8,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "up",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.8.ffn_up.weight",
+      "hf_name": "model.layers.8.mlp.up_proj.weight",
+      "layer": 8,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.8.ffn_norm.weight",
+      "hf_name": "model.layers.8.post_attention_layernorm.weight",
+      "layer": 8,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "k",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.8.attn_k.weight",
+      "hf_name": "model.layers.8.self_attn.k_proj.weight",
+      "layer": 8,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "o",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.8.attn_output.weight",
+      "hf_name": "model.layers.8.self_attn.o_proj.weight",
+      "layer": 8,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "q",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.8.attn_q.weight",
+      "hf_name": "model.layers.8.self_attn.q_proj.weight",
+      "layer": 8,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "v",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.8.attn_v.weight",
+      "hf_name": "model.layers.8.self_attn.v_proj.weight",
+      "layer": 8,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.9.attn_norm.weight",
+      "hf_name": "model.layers.9.input_layernorm.weight",
+      "layer": 9,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "down",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.9.ffn_down.weight",
+      "hf_name": "model.layers.9.mlp.down_proj.weight",
+      "layer": 9,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "gate",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.9.ffn_gate.weight",
+      "hf_name": "model.layers.9.mlp.gate_proj.weight",
+      "layer": 9,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "up",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.9.ffn_up.weight",
+      "hf_name": "model.layers.9.mlp.up_proj.weight",
+      "layer": 9,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "blk.9.ffn_norm.weight",
+      "hf_name": "model.layers.9.post_attention_layernorm.weight",
+      "layer": 9,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    },
+    {
+      "class": "k",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.9.attn_k.weight",
+      "hf_name": "model.layers.9.self_attn.k_proj.weight",
+      "layer": 9,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "o",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.9.attn_output.weight",
+      "hf_name": "model.layers.9.self_attn.o_proj.weight",
+      "layer": 9,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "q",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.9.attn_q.weight",
+      "hf_name": "model.layers.9.self_attn.q_proj.weight",
+      "layer": 9,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "rope_permute"
+    },
+    {
+      "class": "v",
+      "eligible_for_weight_quantization": true,
+      "gguf_name": "blk.9.attn_v.weight",
+      "hf_name": "model.layers.9.self_attn.v_proj.weight",
+      "layer": 9,
+      "q4_k_m_source_rule": "Q4_K",
+      "q8_0_source_rule": "Q8_0",
+      "transform": "identity"
+    },
+    {
+      "class": "norm",
+      "eligible_for_weight_quantization": false,
+      "gguf_name": "output_norm.weight",
+      "hf_name": "model.norm.weight",
+      "layer": null,
+      "q4_k_m_source_rule": "UNQUANTIZED",
+      "q8_0_source_rule": "UNQUANTIZED",
+      "transform": "identity"
+    }
+  ],
+  "schema_version": 1,
+  "source_evidence": {
+    "base_mapping": "https://raw.githubusercontent.com/ggml-org/llama.cpp/000547513f1530346ecd163db8b3e13962949961/conversion/base.py",
+    "llama_mapping_and_permute": "https://raw.githubusercontent.com/ggml-org/llama.cpp/000547513f1530346ecd163db8b3e13962949961/conversion/llama.py",
+    "nanbeige_model_registration": "https://raw.githubusercontent.com/ggml-org/llama.cpp/000547513f1530346ecd163db8b3e13962949961/conversion/nanbeige.py",
+    "quant_mixture_rules": "https://raw.githubusercontent.com/ggml-org/llama.cpp/000547513f1530346ecd163db8b3e13962949961/src/llama-quant.cpp"
+  }
+}
