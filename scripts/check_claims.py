@@ -59,8 +59,10 @@ R4_RECEIPT_SCHEMA_VERSION = 1
 R4_COMMON_RECEIPT_KEYS = {
     "artifact",
     "claim_id",
+    "command_environment",
     "context",
     "cpu_feature_string",
+    "fairness_controls",
     "host_fingerprint",
     "kind",
     "ledger_entry",
@@ -443,7 +445,14 @@ def load_r4_receipt(path: Path, expected_digest: str, expected_kind: str) -> dic
     expected_keys.add("measurement" if expected_kind == "r4-measurement" else "admission")
     if set(receipt) != expected_keys:
         raise ClaimsError(f"R4 receipt keys are invalid file={path}")
-    for key in ("ledger_entry", "claim_id", "cpu_feature_string", "host_fingerprint"):
+    for key in (
+        "ledger_entry",
+        "claim_id",
+        "command_environment",
+        "cpu_feature_string",
+        "fairness_controls",
+        "host_fingerprint",
+    ):
         require_string(receipt[key], location=f"R4 receipt {path}/{key}")
     if not CLAIM_ID_RE.fullmatch(receipt["claim_id"]):
         raise ClaimsError(f"R4 receipt claim id grammar violation file={path}")
@@ -544,7 +553,17 @@ def r4_evidence_is_retained(
     receipt_digests = {digest for _, digest in receipt_paths.values()}
     if not receipt_digests.issubset(set(claim["evidence_artifact_digests"])):
         return False
-    for key in ("ledger_entry", "claim_id", "validity_domain", "host_fingerprint", "cpu_feature_string", "artifact", "context"):
+    for key in (
+        "ledger_entry",
+        "claim_id",
+        "command_environment",
+        "validity_domain",
+        "host_fingerprint",
+        "cpu_feature_string",
+        "fairness_controls",
+        "artifact",
+        "context",
+    ):
         if measurement[key] != admission[key]:
             return False
     if measurement["ledger_entry"] != entry_id or measurement["claim_id"] != claim_id:
@@ -554,6 +573,10 @@ def r4_evidence_is_retained(
     if fields.get("Host fingerprint") != measurement["host_fingerprint"]:
         return False
     if fields.get("CPU feature string") != measurement["cpu_feature_string"]:
+        return False
+    if fields.get("Command + environment") != measurement["command_environment"]:
+        return False
+    if fields.get("Fairness controls") != measurement["fairness_controls"]:
         return False
     if fields.get("Artifact recipe + packing + kernel table + load mode") != r4_artifact_binding(measurement["artifact"]):
         return False
@@ -1053,6 +1076,24 @@ def run_self_test(root: Path, claims: dict[str, dict[str, Any]]) -> None:
     )
     if typed != {"PERF-R4-TYPED-001": r4_claim["id"]}:
         raise ClaimsError("self-test typed R4 ledger row was not eligible")
+    typed_fields = {
+        line[2:].split(": ", maxsplit=1)[0]: line[2:].split(": ", maxsplit=1)[1]
+        for line in (fixtures / "r4_typed_ledger.md").read_text(encoding="utf-8").splitlines()
+        if line.startswith("- ") and ": " in line
+    }
+    typed_hashes = {item.strip() for item in typed_fields["Fixture hashes"].split(",")}
+    for field in ("Command + environment", "Fairness controls"):
+        mismatched_fields = copy.deepcopy(typed_fields)
+        mismatched_fields[field] = "hostile mismatched binding"
+        if r4_evidence_is_retained(
+            root,
+            "PERF-R4-TYPED-001",
+            mismatched_fields,
+            typed_hashes,
+            r4_claims,
+            allow_fixture_receipts=True,
+        ):
+            raise ClaimsError(f"self-test R4 receipt did not bind ledger field={field!r}")
     unbound_claim = copy.deepcopy(r4_claim)
     unbound_claim["evidence_artifact_digests"] = ["a" * 64]
     if eligible_r4_ledger_entries(

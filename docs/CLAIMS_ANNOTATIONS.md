@@ -61,17 +61,18 @@ The two files are canonical, duplicate-key-free JSON receipts at schema version
 distributions in ordinary nondecreasing quantile order (`p50 ≤ p95 ≤ p99`),
 plus exact KV and peak-RSS bytes; the `r4-admission` receipt
 carries an `admitted` outcome plus committed/peak bytes. Both must agree on
-their ledger entry, claim id, full claim validity domain, host fingerprint, CPU
-feature string, typed artifact identity (`recipe_id`, packing hash, kernel-table
-hash, load mode), and typed context point (`tokens`, KV dtype). The receipt
-claim id must be an evidenced registry claim and must be the same id as the
-public `fnlp-claim` annotation.
+their ledger entry, claim id, command/environment record, fairness controls,
+full claim validity domain, host fingerprint, CPU feature string, typed artifact
+identity (`recipe_id`, packing hash, kernel-table hash, load mode), and typed
+context point (`tokens`, KV dtype). The receipt claim id must be an evidenced
+registry claim and must be the same id as the public `fnlp-claim` annotation.
 
-For an eligible R4 row, the ledger repeats those typed bindings exactly: host
-and CPU fields, the artifact/context fields, the percentile field, the
-KV/RSS summary, and the admission outcome/byte terms. Production rows may only
-refer to `docs/evidence/…` receipts; `tests/fixtures/claims/…` is accepted only
-while exercising the checker fixtures.
+For an eligible R4 row, the ledger repeats those typed bindings exactly:
+command/environment and fairness fields, host and CPU fields, the
+artifact/context fields, the percentile field, the KV/RSS summary, and the
+admission outcome/byte terms. Production rows may only refer to
+`docs/evidence/…` receipts; `tests/fixtures/claims/…` is accepted only while
+exercising the checker fixtures.
 
 The R4 annotation is consumed by exactly the immediately following >8K claim;
 blank lines, other annotations, or ordinary prose leave it stale and are

@@ -6,11 +6,13 @@
     "recipe_id": "r4-fixture-recipe"
   },
   "claim_id": "r4-fixture-claim",
+  "command_environment": "fixture command",
   "context": {
     "kv_dtype": "bf16",
     "tokens": 32768
   },
   "cpu_feature_string": "fixture-cpu-v1",
+  "fairness_controls": "fixture controls",
   "host_fingerprint": "fixture-host-v1",
   "kind": "r4-measurement",
   "ledger_entry": "PERF-R4-TYPED-001",
