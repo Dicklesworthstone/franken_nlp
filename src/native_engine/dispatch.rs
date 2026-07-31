@@ -410,10 +410,15 @@ impl DispatchTable {
         Ok(Self { rows })
     }
 
-    /// Parse a strict JSON table.  Serde rejects duplicate struct fields and
-    /// `deny_unknown_fields` rejects accidental schema expansion.
+    /// Parse a strict JSON table through the duplicate-key-rejecting boundary.
+    /// `deny_unknown_fields` then rejects accidental schema expansion.
     pub fn from_json(source: &str) -> Result<Self, DispatchError> {
-        let rows = serde_json::from_str(source).map_err(|error| DispatchError::CorruptTable {
+        let value = crate::canonjson::parse_str(source).map_err(|error| {
+            DispatchError::CorruptTable {
+                detail: error.to_string(),
+            }
+        })?;
+        let rows = serde_json::from_value(value).map_err(|error| DispatchError::CorruptTable {
             detail: error.to_string(),
         })?;
         Self::from_rows(rows)

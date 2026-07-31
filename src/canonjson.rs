@@ -18,7 +18,11 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 
-use serde::Serialize;
+use serde::ser::{
+    self, SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant, SerializeTuple,
+    SerializeTupleStruct, SerializeTupleVariant,
+};
+use serde::{Serialize, Serializer};
 use serde::de::{self, DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 
@@ -176,6 +180,7 @@ pub fn parse_str_with_limits(input: &str, limits: ParseLimits) -> Result<Value, 
     .deserialize(&mut deserializer)
     .map_err(parse_error)?;
     deserializer.end().map_err(parse_error)?;
+    validate_value_limits(&value, &JsonPath::root(), 0, limits)?;
     Ok(value)
 }
 
@@ -188,6 +193,7 @@ pub fn canonical_bytes<T>(value: &T) -> Result<Vec<u8>, CanonJsonError>
 where
     T: Serialize + ?Sized,
 {
+    ensure_finite(value)?;
     let value = serde_json::to_value(value).map_err(serialization_error)?;
     let mut output = Vec::new();
     write_value(&value, &mut output);
@@ -231,6 +237,372 @@ fn serialization_error(error: serde_json::Error) -> CanonJsonError {
         CanonJsonError::Serialize {
             message: error.to_string(),
         }
+    }
+}
+
+fn validate_value_limits(
+    value: &Value,
+    path: &JsonPath,
+    depth: usize,
+    limits: ParseLimits,
+) -> Result<(), CanonJsonError> {
+    match value {
+        Value::String(value) => check_value_string_limit(path, value, limits),
+        Value::Array(values) => {
+            check_value_depth(path, depth, limits)?;
+            for (index, value) in values.iter().enumerate() {
+                validate_value_limits(value, &path.index(index), depth + 1, limits)?;
+            }
+            Ok(())
+        }
+        Value::Object(values) => {
+            check_value_depth(path, depth, limits)?;
+            for (key, value) in values {
+                let key_path = path.key(key);
+                check_value_string_limit(&key_path, key, limits)?;
+                validate_value_limits(value, &key_path, depth + 1, limits)?;
+            }
+            Ok(())
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => Ok(()),
+    }
+}
+
+fn check_value_depth(
+    path: &JsonPath,
+    depth: usize,
+    limits: ParseLimits,
+) -> Result<(), CanonJsonError> {
+    if depth >= limits.max_depth {
+        Err(CanonJsonError::DepthLimit {
+            path: path.clone(),
+            max_depth: limits.max_depth,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn check_value_string_limit(
+    path: &JsonPath,
+    value: &str,
+    limits: ParseLimits,
+) -> Result<(), CanonJsonError> {
+    if value.len() > limits.max_string_bytes {
+        Err(CanonJsonError::StringLimit {
+            path: path.clone(),
+            max_string_bytes: limits.max_string_bytes,
+            observed_bytes: value.len(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_finite<T>(value: &T) -> Result<(), CanonJsonError>
+where
+    T: Serialize + ?Sized,
+{
+    value.serialize(FiniteProbe).map_err(|error| match error {
+        FiniteProbeError::NonFiniteNumber => CanonJsonError::NonFiniteNumber,
+        FiniteProbeError::Custom(message) => CanonJsonError::Serialize { message },
+    })
+}
+
+#[derive(Debug)]
+enum FiniteProbeError {
+    NonFiniteNumber,
+    Custom(String),
+}
+
+impl fmt::Display for FiniteProbeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonFiniteNumber => formatter.write_str("non-finite JSON number is forbidden"),
+            Self::Custom(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl Error for FiniteProbeError {}
+
+impl ser::Error for FiniteProbeError {
+    fn custom<T>(message: T) -> Self
+    where
+        T: fmt::Display,
+    {
+        Self::Custom(message.to_string())
+    }
+}
+
+/// A traversal-only Serde serializer.  serde_json normally converts non-finite
+/// floats to `null` in some serializers, so inspect the original typed value
+/// before any JSON tree is constructed.
+struct FiniteProbe;
+
+impl Serializer for FiniteProbe {
+    type Ok = ();
+    type Error = FiniteProbeError;
+    type SerializeSeq = FiniteProbeCompound;
+    type SerializeTuple = FiniteProbeCompound;
+    type SerializeTupleStruct = FiniteProbeCompound;
+    type SerializeTupleVariant = FiniteProbeCompound;
+    type SerializeMap = FiniteProbeCompound;
+    type SerializeStruct = FiniteProbeCompound;
+    type SerializeStructVariant = FiniteProbeCompound;
+
+    fn serialize_bool(self, _: bool) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_i8(self, _: i8) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_i16(self, _: i16) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_i32(self, _: i32) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_i64(self, _: i64) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_i128(self, _: i128) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_u8(self, _: u8) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_u16(self, _: u16) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_u32(self, _: u32) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_u64(self, _: u64) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_u128(self, _: u128) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_f32(self, value: f32) -> Result<Self::Ok, Self::Error> {
+        if value.is_finite() {
+            Ok(())
+        } else {
+            Err(FiniteProbeError::NonFiniteNumber)
+        }
+    }
+
+    fn serialize_f64(self, value: f64) -> Result<Self::Ok, Self::Error> {
+        if value.is_finite() {
+            Ok(())
+        } else {
+            Err(FiniteProbeError::NonFiniteNumber)
+        }
+    }
+
+    fn serialize_char(self, _: char) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_str(self, _: &str) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_bytes(self, _: &[u8]) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_some<T>(self, value: &T) -> Result<Self::Ok, Self::Error>
+    where
+        T: Serialize + ?Sized,
+    {
+        value.serialize(self)
+    }
+
+    fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_unit_struct(self, _: &'static str) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_unit_variant(
+        self,
+        _: &'static str,
+        _: u32,
+        _: &'static str,
+    ) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+
+    fn serialize_newtype_struct<T>(
+        self,
+        _: &'static str,
+        value: &T,
+    ) -> Result<Self::Ok, Self::Error>
+    where
+        T: Serialize + ?Sized,
+    {
+        value.serialize(self)
+    }
+
+    fn serialize_newtype_variant<T>(
+        self,
+        _: &'static str,
+        _: u32,
+        _: &'static str,
+        value: &T,
+    ) -> Result<Self::Ok, Self::Error>
+    where
+        T: Serialize + ?Sized,
+    {
+        value.serialize(self)
+    }
+
+    fn serialize_seq(self, _: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
+        Ok(FiniteProbeCompound)
+    }
+
+    fn serialize_tuple(self, _: usize) -> Result<Self::SerializeTuple, Self::Error> {
+        Ok(FiniteProbeCompound)
+    }
+
+    fn serialize_tuple_struct(
+        self,
+        _: &'static str,
+        _: usize,
+    ) -> Result<Self::SerializeTupleStruct, Self::Error> {
+        Ok(FiniteProbeCompound)
+    }
+
+    fn serialize_tuple_variant(
+        self,
+        _: &'static str,
+        _: u32,
+        _: &'static str,
+        _: usize,
+    ) -> Result<Self::SerializeTupleVariant, Self::Error> {
+        Ok(FiniteProbeCompound)
+    }
+
+    fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
+        Ok(FiniteProbeCompound)
+    }
+
+    fn serialize_struct(
+        self,
+        _: &'static str,
+        _: usize,
+    ) -> Result<Self::SerializeStruct, Self::Error> {
+        Ok(FiniteProbeCompound)
+    }
+
+    fn serialize_struct_variant(
+        self,
+        _: &'static str,
+        _: u32,
+        _: &'static str,
+        _: usize,
+    ) -> Result<Self::SerializeStructVariant, Self::Error> {
+        Ok(FiniteProbeCompound)
+    }
+}
+
+struct FiniteProbeCompound;
+
+macro_rules! probe_elements {
+    ($trait:ident) => {
+        impl ser::$trait for FiniteProbeCompound {
+            type Ok = ();
+            type Error = FiniteProbeError;
+
+            fn serialize_element<T>(&mut self, value: &T) -> Result<(), Self::Error>
+            where
+                T: Serialize + ?Sized,
+            {
+                value.serialize(FiniteProbe)
+            }
+
+            fn end(self) -> Result<Self::Ok, Self::Error> {
+                Ok(())
+            }
+        }
+    };
+}
+
+probe_elements!(SerializeSeq);
+probe_elements!(SerializeTuple);
+probe_elements!(SerializeTupleStruct);
+probe_elements!(SerializeTupleVariant);
+
+impl SerializeMap for FiniteProbeCompound {
+    type Ok = ();
+    type Error = FiniteProbeError;
+
+    fn serialize_key<T>(&mut self, key: &T) -> Result<(), Self::Error>
+    where
+        T: Serialize + ?Sized,
+    {
+        key.serialize(FiniteProbe)
+    }
+
+    fn serialize_value<T>(&mut self, value: &T) -> Result<(), Self::Error>
+    where
+        T: Serialize + ?Sized,
+    {
+        value.serialize(FiniteProbe)
+    }
+
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+}
+
+impl SerializeStruct for FiniteProbeCompound {
+    type Ok = ();
+    type Error = FiniteProbeError;
+
+    fn serialize_field<T>(&mut self, _: &'static str, value: &T) -> Result<(), Self::Error>
+    where
+        T: Serialize + ?Sized,
+    {
+        value.serialize(FiniteProbe)
+    }
+
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+}
+
+impl SerializeStructVariant for FiniteProbeCompound {
+    type Ok = ();
+    type Error = FiniteProbeError;
+
+    fn serialize_field<T>(&mut self, _: &'static str, value: &T) -> Result<(), Self::Error>
+    where
+        T: Serialize + ?Sized,
+    {
+        value.serialize(FiniteProbe)
+    }
+
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        Ok(())
     }
 }
 
