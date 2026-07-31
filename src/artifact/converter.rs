@@ -515,6 +515,18 @@ pub enum StorageStage {
     Int8Stage2C,
 }
 
+impl StorageStage {
+    /// Stable stage spelling for diagnostics and receipts.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bf16Verbatim => "bf16-verbatim",
+            Self::Int8Stage2A => "int8-stage-2a",
+            Self::Int8Stage2B => "int8-stage-2b",
+            Self::Int8Stage2C => "int8-stage-2c",
+        }
+    }
+}
+
 /// One total mapping from a source tensor to an internal logical tensor.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TensorRoute {
@@ -1084,6 +1096,62 @@ where
     )
 }
 
+/// Traverse a fully prepared census in its canonical order, keeping only one
+/// source panel and its decoded f32 work panel live at a time.
+///
+/// The reader is supplied by the checked safetensors range-index boundary and
+/// the consumer is supplied by the recipe-specific quantization/staging
+/// boundary.  This module owns the intervening shape, route, panel-length,
+/// and BF16 decoding checks.  It intentionally has no output writer: a
+/// canonical streaming envelope must first precompute its exact ranges.
+pub fn stream_routed_bf16_panels<R, C>(
+    census: &[TensorCensusEntry],
+    routes: &[TensorRoute],
+    panels: &[PanelPlan],
+    mut read_panel: R,
+    mut consume: C,
+) -> Result<(), ConverterError>
+where
+    R: FnMut(&TensorCensusEntry, RowPanel) -> Result<Vec<u8>, ConverterError>,
+    C: FnMut(&TensorCensusEntry, &TensorRoute, RowPanel, &[u8], &[f32]) -> Result<(), ConverterError>,
+{
+    if census.len() != routes.len() || census.len() != panels.len() {
+        return Err(ConverterError::PipelinePlanCount {
+            census: census.len(),
+            routes: routes.len(),
+            panels: panels.len(),
+        });
+    }
+    for ((entry, route), plan) in census.iter().zip(routes).zip(panels) {
+        let expected_route = remap_tensor_name(&entry.name)?;
+        if route != &expected_route {
+            return Err(ConverterError::PipelinePlanAlignment {
+                tensor: entry.name.clone(),
+                detail: format!(
+                    "route={}/{} differs from canonical={}/{}",
+                    route.internal_name,
+                    route.stage.as_str(),
+                    expected_route.internal_name,
+                    expected_route.stage.as_str(),
+                ),
+            });
+        }
+        if plan.tensor != entry.name {
+            return Err(ConverterError::PipelinePlanAlignment {
+                tensor: entry.name.clone(),
+                detail: format!("panel belongs to {}", plan.tensor),
+            });
+        }
+        stream_bf16_row_panels(
+            entry,
+            plan,
+            |panel| read_panel(entry, panel),
+            |panel, source_bytes, f32_work| consume(entry, route, panel, source_bytes, f32_work),
+        )?;
+    }
+    Ok(())
+}
+
 fn stream_bf16_row_panels<R, C>(
     entry: &TensorCensusEntry,
     plan: &PanelPlan,
@@ -1594,6 +1662,14 @@ pub enum ConverterError {
     /// payload.  This protects progress/ETA and preflight accounting against
     /// a second, drifting byte total.
     CensusPayloadBytes { expected: u64, actual: u64 },
+    /// A caller attempted to traverse differently sized prepared inputs.
+    PipelinePlanCount {
+        census: usize,
+        routes: usize,
+        panels: usize,
+    },
+    /// A route or panel no longer corresponds to its prepared source tensor.
+    PipelinePlanAlignment { tensor: String, detail: String },
     /// An unapproved bias tensor was discovered.
     BiasTensor { tensor: String },
     /// A source tensor has no complete mapping.
@@ -1762,6 +1838,18 @@ impl fmt::Display for ConverterError {
             Self::CensusPayloadBytes { expected, actual } => write!(
                 formatter,
                 "pinned logical source payload mismatch: expected={expected} observed={actual}"
+            ),
+            Self::PipelinePlanCount {
+                census,
+                routes,
+                panels,
+            } => write!(
+                formatter,
+                "prepared pipeline length mismatch: census={census} routes={routes} panels={panels}"
+            ),
+            Self::PipelinePlanAlignment { tensor, detail } => write!(
+                formatter,
+                "prepared pipeline alignment for {tensor}: {detail}"
             ),
             Self::BiasTensor { tensor } => write!(
                 formatter,
@@ -2081,7 +2169,7 @@ mod tests {
     use super::{
         ConversionProgress, ConverterError, OutputRangePlan, PanelPlan, PeakRssFormula,
         StorageStage, TensorCensusEntry, decode_bf16_panel, expected_nanbeige42_census,
-        remap_tensor_name, stream_bf16_row_panels,
+        remap_tensor_name, stream_bf16_row_panels, stream_routed_bf16_panels,
     };
     use crate::artifact::safetensors::{RowPanel, SafetensorDtype};
 
@@ -2231,6 +2319,95 @@ mod tests {
                 expected: 4,
                 actual: 3,
             } if tensor == "synthetic.weight"
+        ));
+    }
+
+    #[test]
+    fn routed_panel_stream_keeps_canonical_tensor_and_panel_order() {
+        let census = vec![
+            TensorCensusEntry {
+                name: "model.embed_tokens.weight".to_owned(),
+                dtype: SafetensorDtype::Bf16,
+                shape: vec![3, 2],
+                len: 12,
+            },
+            TensorCensusEntry {
+                name: "model.norm.weight".to_owned(),
+                dtype: SafetensorDtype::Bf16,
+                shape: vec![2, 2],
+                len: 8,
+            },
+        ];
+        let routes = census
+            .iter()
+            .map(|entry| remap_tensor_name(&entry.name).expect("known route"))
+            .collect::<Vec<_>>();
+        let panels = census
+            .iter()
+            .map(|entry| PanelPlan::for_tensor(entry, 4).expect("one row per panel"))
+            .collect::<Vec<_>>();
+        let mut observed = Vec::new();
+
+        stream_routed_bf16_panels(
+            &census,
+            &routes,
+            &panels,
+            |entry, panel| {
+                let RowPanel::Rows { row_count, .. } = panel else {
+                    panic!("prepared plan must yield row panels");
+                };
+                let scalar_count = usize::try_from(row_count * entry.shape[1]).expect("tiny");
+                Ok(vec![0x80, 0x3f].repeat(scalar_count))
+            },
+            |entry, route, panel, source_bytes, f32_work| {
+                let RowPanel::Rows { start_row, .. } = panel else {
+                    panic!("prepared plan must yield row panels");
+                };
+                observed.push((
+                    entry.name.clone(),
+                    route.internal_name.clone(),
+                    start_row,
+                    source_bytes.len(),
+                    f32_work.len(),
+                ));
+                Ok(())
+            },
+        )
+        .expect("the prepared route stream is serial and bounded");
+
+        assert_eq!(
+            observed,
+            vec![
+                ("model.embed_tokens.weight".to_owned(), "embed".to_owned(), 0, 4, 2),
+                ("model.embed_tokens.weight".to_owned(), "embed".to_owned(), 1, 4, 2),
+                ("model.embed_tokens.weight".to_owned(), "embed".to_owned(), 2, 4, 2),
+                ("model.norm.weight".to_owned(), "final_norm".to_owned(), 0, 4, 2),
+                ("model.norm.weight".to_owned(), "final_norm".to_owned(), 1, 4, 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn routed_panel_stream_refuses_a_stale_route_before_reading() {
+        let census = vec![TensorCensusEntry {
+            name: "model.embed_tokens.weight".to_owned(),
+            dtype: SafetensorDtype::Bf16,
+            shape: vec![1, 1],
+            len: 2,
+        }];
+        let routes = vec![remap_tensor_name("model.norm.weight").expect("known route")];
+        let panels = vec![PanelPlan::for_tensor(&census[0], 2).expect("one row")];
+
+        assert!(matches!(
+            stream_routed_bf16_panels(
+                &census,
+                &routes,
+                &panels,
+                |_, _| panic!("stale route must reject before source reads"),
+                |_, _, _, _, _| panic!("stale route must reject before consumption"),
+            ),
+            Err(ConverterError::PipelinePlanAlignment { tensor, .. })
+                if tensor == "model.embed_tokens.weight"
         ));
     }
 
