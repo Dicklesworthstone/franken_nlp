@@ -191,7 +191,15 @@ fn schema_and_unpopulated_commands_are_data_only_and_golden_frozen() {
                     );
                 }
             } else {
-                assert_eq!(document["status"], Value::from("unpopulated"));
+                assert_eq!(document["kind"], Value::from("robot_health"));
+                assert_eq!(
+                    document["capabilities"]["status"],
+                    Value::from("unpopulated")
+                );
+                assert_eq!(
+                    document["thread_inventory"]["status"],
+                    Value::from("unpopulated")
+                );
             }
         }
     }
