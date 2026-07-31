@@ -4,7 +4,7 @@
 
 use franken_nlp::artifact::converter::{
     remap_tensor_name, stream_routed_bf16_panels, transform_routed_panel, ConverterError,
-    GenericPanel, PanelPlan, StorageStage,
+    PanelPlan, StorageStage,
 };
 use franken_nlp::artifact::quantize::encode_generic_panel;
 use franken_nlp::artifact::safetensors::{RowPanel, SafetensorDtype, TensorCensusEntry};
@@ -100,24 +100,17 @@ fn routed_stream_applies_each_storage_stage_without_retaining_the_tensor() {
     assert_eq!(report.source_bytes, 32);
     assert_eq!(report.f32_work_bytes, 64);
     assert_eq!(produced.len(), 4);
-    assert!(matches!(
-        &produced[0].1,
-        GenericPanel::Bf16Verbatim { bytes } if bytes == &ONE_ROW_BF16
-    ));
+    assert_eq!(produced[0].1.data, ONE_ROW_BF16.to_vec());
+    assert!(produced[0].1.scales.is_empty());
+    assert!(produced[0].1.row_sums.is_empty());
 
     let scale_bytes = (1.0_f32 / 127.0).to_bits().to_le_bytes();
     for (source_name, generic) in produced.iter().skip(1) {
-        assert!(
-            matches!(
-                generic,
-                GenericPanel::Int8 {
-                    values,
-                    scales_le,
-                    row_sums_le,
-                } if values == &vec![127, -127, 64, -64]
-                    && scales_le == &scale_bytes
-                    && row_sums_le == &0_i32.to_le_bytes()
-            ),
+        assert_eq!(generic.data, vec![127_u8, 129, 64, 192], "route={source_name}");
+        assert_eq!(generic.scales, scale_bytes.to_vec(), "route={source_name}");
+        assert_eq!(
+            generic.row_sums,
+            0_i32.to_le_bytes().to_vec(),
             "route={source_name}"
         );
     }

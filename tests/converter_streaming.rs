@@ -6,10 +6,10 @@
 //! controller-owned.
 
 use franken_nlp::artifact::converter::{
-    ConversionPreflight, ConverterError, GenericPanel, OutputRange, OutputRangePlan,
-    PeakRssFormula, StorageStage, remap_tensor_name, transform_routed_panel,
+    ConversionPreflight, ConverterError, OutputRange, OutputRangePlan, PeakRssFormula,
+    StorageStage, remap_tensor_name, transform_routed_panel,
 };
-use franken_nlp::artifact::quantize::QuantizeError;
+use franken_nlp::artifact::quantize::{GenericPanelBytes, QuantizeError};
 use franken_nlp::artifact::safetensors::{RowPanel, SafetensorDtype, TensorCensusEntry};
 
 const ONE_ROW_BF16: [u8; 8] = [0x80, 0x3f, 0x80, 0xbf, 0x00, 0x3f, 0x00, 0xbf];
@@ -45,11 +45,7 @@ fn routed_int8_panels_have_one_canonical_generic_byte_spelling() {
         let route = remap_tensor_name(name).expect("named converter route");
         assert_eq!(route.stage, expected_stage, "route={name}");
 
-        let GenericPanel::Int8 {
-            values,
-            scales_le,
-            row_sums_le,
-        } = transform_routed_panel(
+        let panel = transform_routed_panel(
             &entry,
             &route,
             RowPanel::Rows {
@@ -59,14 +55,11 @@ fn routed_int8_panels_have_one_canonical_generic_byte_spelling() {
             &ONE_ROW_BF16,
             &ONE_ROW_F32,
         )
-        .expect("finite verified panel")
-        else {
-            panic!("int8 route must emit int8 Generic bytes: route={name}");
-        };
+        .expect("finite verified panel");
 
-        assert_eq!(values, vec![127, -127, 64, -64], "route={name}");
-        assert_eq!(scales_le, expected_scale, "route={name}");
-        assert_eq!(row_sums_le, expected_row_sum, "route={name}");
+        assert_eq!(panel.data, vec![127_u8, 129, 64, 192], "route={name}");
+        assert_eq!(panel.scales, expected_scale, "route={name}");
+        assert_eq!(panel.row_sums, expected_row_sum, "route={name}");
     }
 }
 
@@ -88,8 +81,10 @@ fn routed_bf16_panel_preserves_the_verified_source_bytes_exactly() {
             &ONE_ROW_F32,
         )
         .expect("verified BF16 route"),
-        GenericPanel::Bf16Verbatim {
-            bytes: ONE_ROW_BF16.to_vec(),
+        GenericPanelBytes {
+            data: ONE_ROW_BF16.to_vec(),
+            scales: Vec::new(),
+            row_sums: Vec::new(),
         }
     );
 }

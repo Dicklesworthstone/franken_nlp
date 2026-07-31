@@ -18,7 +18,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::artifact::quantize::{encode_generic_panel, QuantizeError};
+use crate::artifact::quantize::{encode_generic_panel, GenericPanelBytes, QuantizeError};
 use crate::artifact::safetensors::{
     CensusDiff, RowPanel, SafetensorDtype, SafetensorsError, SafetensorsRangeIndex, SourceClosure,
     SourceDigest, TensorCensusEntry, TensorExpectation, diff_census_entries,
@@ -1296,28 +1296,16 @@ pub struct Bf16PanelStreamReport {
     pub f32_work_bytes: u64,
 }
 
-/// One bounded Generic-representation panel ready for a streaming envelope.
-#[derive(Clone, Debug, PartialEq)]
-pub enum GenericPanel {
-    /// BF16 logical bytes preserved verbatim for normalization/embedding rows.
-    Bf16Verbatim { bytes: Vec<u8> },
-    /// Portable signed int8 values plus little-endian per-row sidecars.
-    Int8 {
-        values: Vec<i8>,
-        scales_le: Vec<u8>,
-        row_sums_le: Vec<u8>,
-    },
-}
-
 /// Apply the frozen route's bounded Generic transform to one complete-row
-/// source panel.  This does not retain a tensor or write an artifact.
+/// source panel.  This does not retain a tensor or write an artifact; its
+/// returned bytes are the quantization module's sole Generic-panel authority.
 pub fn transform_routed_panel(
     entry: &TensorCensusEntry,
     route: &TensorRoute,
     panel: RowPanel,
     source_bytes: &[u8],
     f32_work: &[f32],
-) -> Result<GenericPanel, ConverterError> {
+) -> Result<GenericPanelBytes, ConverterError> {
     if route != &remap_tensor_name(&entry.name)? {
         return Err(ConverterError::PipelinePlanAlignment {
             tensor: entry.name.clone(),
@@ -1342,24 +1330,8 @@ pub fn transform_routed_panel(
     let columns = usize::try_from(columns).map_err(|_| ConverterError::Arithmetic {
         invariant: "routed panel columns to usize",
     })?;
-    let encoded = encode_generic_panel(route.stage, source_bytes, f32_work, rows, columns)
-        .map_err(ConverterError::Quantize)?;
-    match route.stage {
-        StorageStage::Bf16Verbatim => Ok(GenericPanel::Bf16Verbatim {
-            bytes: encoded.data,
-        }),
-        StorageStage::Int8Stage2A | StorageStage::Int8Stage2B | StorageStage::Int8Stage2C => {
-            Ok(GenericPanel::Int8 {
-                values: encoded
-                    .data
-                    .into_iter()
-                    .map(|value| i8::from_ne_bytes([value]))
-                    .collect(),
-                scales_le: encoded.scales,
-                row_sums_le: encoded.row_sums,
-            })
-        }
-    }
+    encode_generic_panel(route.stage, source_bytes, f32_work, rows, columns)
+        .map_err(ConverterError::Quantize)
 }
 
 /// Traverse a fully prepared census in its canonical order, keeping only one
