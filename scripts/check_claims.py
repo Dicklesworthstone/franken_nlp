@@ -49,7 +49,8 @@ OBSERVED_MODEL_LIMIT_CLAUSE_RE = re.compile(
 PERF_ENTRY_RE = re.compile(r"^## (?P<entry>PERF-[A-Z0-9-]+)\s*$")
 LEDGER_SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 R4_EVIDENCE_RECEIPT_RE = re.compile(
-    r"\b(?P<kind>r4-receipt|admission-receipt)=(?P<path>docs/[A-Za-z0-9_./-]+)#sha256:(?P<digest>[0-9a-f]{64})\b"
+    r"\b(?P<kind>r4-receipt|admission-receipt)="
+    r"(?P<path>(?:docs/evidence|tests/fixtures/claims)/[A-Za-z0-9_./-]+)#sha256:(?P<digest>[0-9a-f]{64})\b"
 )
 R4_ARTIFACT_BINDING_RE = re.compile(
     r"recipe_id=(?P<recipe_id>[^;]+); packing_sha256=(?P<packing>[0-9a-f]{64}); "
@@ -471,6 +472,8 @@ def r4_evidence_is_retained(
     fields: dict[str, str],
     fixture_hashes: set[str],
     claims: Mapping[str, dict[str, Any]],
+    *,
+    allow_fixture_receipts: bool,
 ) -> bool:
     """Require typed receipts whose contents exactly bind the R4 ledger row."""
 
@@ -490,6 +493,10 @@ def r4_evidence_is_retained(
     receipts: dict[str, dict[str, Any]] = {}
     expected_kinds = {"r4-receipt": "r4-measurement", "admission-receipt": "r4-admission"}
     for evidence_kind, (path_text, digest) in receipt_paths.items():
+        if not path_text.startswith("docs/evidence/") and not (
+            allow_fixture_receipts and path_text.startswith("tests/fixtures/claims/")
+        ):
+            return False
         if f"sha256:{digest}" not in fixture_hashes:
             return False
         path = retained_regular_file(root, path_text)
@@ -539,6 +546,7 @@ def eligible_r4_ledger_entries(
     """Return measured R4 ledger rows eligible to support public context claims."""
 
     path = ledger_path if ledger_path is not None else root / "docs" / "PERF_LEDGER.md"
+    allow_fixture_receipts = ledger_path is not None and path.is_relative_to(root / "tests" / "fixtures")
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError as error:
@@ -574,7 +582,14 @@ def eligible_r4_ledger_entries(
             and all(LEDGER_SHA256_RE.fullmatch(item) for item in fixture_hashes)
             and all(field_is_measured(fields.get(field)) for field in R4_REQUIRED_FIELDS)
             and all(percentile in fields["p50/p95/p99"].lower() for percentile in ("p50", "p95", "p99"))
-            and r4_evidence_is_retained(root, candidate, fields, fixture_hash_set, claims)
+            and r4_evidence_is_retained(
+                root,
+                candidate,
+                fields,
+                fixture_hash_set,
+                claims,
+                allow_fixture_receipts=allow_fixture_receipts,
+            )
         ):
             eligible[candidate] = claim_id
     return eligible
