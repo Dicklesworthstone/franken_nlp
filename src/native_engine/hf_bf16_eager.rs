@@ -14,7 +14,7 @@ use super::{
         PHYSICAL_LAYER_COUNT, slot_for,
     },
     layer::{
-        HfBf16EagerLayerError, HfBf16EagerLayerWeights, NANBEIGE_HIDDEN_SIZE,
+        HfBf16EagerLayerWeights, HfBf16LayerError, NANBEIGE_HIDDEN_SIZE,
         NANBEIGE_KV_PROJECTION_SIZE, NANBEIGE_Q_PROJECTION_SIZE,
     },
     lmhead::{NANBEIGE_VOCAB_SIZE, export_logits_f32, greedy_argmax},
@@ -88,7 +88,7 @@ pub enum HfBf16EagerError {
         actual: usize,
     },
     /// A physical decoder layer failed its own no-bias shape check.
-    Layer(HfBf16EagerLayerError),
+    Layer(HfBf16LayerError),
     /// A projection or embedding-row lookup failed.
     Weights(WeightShapeError),
     /// A 44-slot K/V append/read invariant failed.
@@ -115,8 +115,8 @@ pub enum HfBf16EagerError {
     AttentionCapacityOverflow { sequence_len: usize },
 }
 
-impl From<HfBf16EagerLayerError> for HfBf16EagerError {
-    fn from(value: HfBf16EagerLayerError) -> Self {
+impl From<HfBf16LayerError> for HfBf16EagerError {
+    fn from(value: HfBf16LayerError) -> Self {
         Self::Layer(value)
     }
 }
@@ -331,7 +331,7 @@ impl LayerExecutor<HfBf16EagerLayerWeights> for HfBf16EagerExecutor<'_> {
             .filter(|&loop_index| loop_index < LOOP_COUNT)
             .ok_or(HfBf16EagerError::InvalidRunnerBoundary)?;
         *hidden = rms_norm_f32_reduce_cast_back(hidden, self.final_norm, RMS_NORM_EPSILON)
-            .map_err(HfBf16EagerLayerError::from)
+            .map_err(HfBf16LayerError::from)
             .map_err(HfBf16EagerError::from)?;
         self.post_loop_norms[loop_index] = hidden.clone();
         Ok(())
