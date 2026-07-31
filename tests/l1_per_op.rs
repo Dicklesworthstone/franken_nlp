@@ -21,15 +21,15 @@ use std::{
 };
 
 use franken_nlp::native_engine::{
-    attention::{eager_attention_head, softmax_f32_cast_back, ATTENTION_SCALE},
+    attention::{ATTENTION_SCALE, eager_attention_head, softmax_f32_cast_back},
     diagnostic_f32::{
-        greedy_argmax as diagnostic_argmax, softmax_f32, DiagnosticF32Matrix,
-        DiagnosticF32RopeTables,
+        DiagnosticF32Matrix, DiagnosticF32RopeTables, greedy_argmax as diagnostic_argmax,
+        softmax_f32,
     },
     lmhead::{export_logits_f32, greedy_argmax as eager_argmax},
     nn::{
-        embedding_row_stays_bf16, residual_add_f32_cast_back, rms_norm_f32_reduce_cast_back,
-        swiglu_f32_cast_back, RMS_NORM_EPSILON,
+        RMS_NORM_EPSILON, embedding_row_stays_bf16, residual_add_f32_cast_back,
+        rms_norm_f32_reduce_cast_back, swiglu_f32_cast_back,
     },
     rope::RopeTablesF32,
     tensor::Bf16,
@@ -470,16 +470,22 @@ fn scalar_project_bf16(matrix: &Bf16Matrix, input: &[Bf16]) -> Vec<Bf16> {
         .collect()
 }
 
-fn scalar_project_f32(matrix: &Bf16Matrix, input: &[Bf16]) -> Vec<f32> {
+/// Scalar reference for the pinned eager `lm_head` boundary.
+///
+/// PyTorch's bf16 `nn.Linear` returns a bf16 tensor; Nanbeige then widens that
+/// result through `logits.float()`.  This is intentionally distinct from a
+/// direct f32 export of the accumulator.
+fn scalar_lm_head_bf16_then_export(matrix: &Bf16Matrix, input: &[Bf16]) -> Vec<f32> {
     (0..matrix.rows())
         .map(|row_index| {
-            matrix
+            let accumulator = matrix
                 .row(row_index)
                 .unwrap()
                 .iter()
                 .zip(input)
                 .map(|(weight, activation)| weight.to_f32() * activation.to_f32())
-                .sum::<f32>()
+                .sum::<f32>();
+            Bf16::from_f32(accumulator).to_f32()
         })
         .collect()
 }
@@ -613,21 +619,60 @@ fn metric_vector_rejects_unsafe_special_value_equivalence() {
         "bit-identical vectors must report an exact cosine of one"
     );
 
-    assert!(metrics(
-        &[f32::from_bits(0x7fc0_0001)],
-        &[f32::from_bits(0x7fc0_0002)]
-    )
-    .unwrap_err()
-    .contains("NaN behavior mismatch"));
-    assert!(metrics(&[-0.0], &[0.0])
+    assert!(
+        metrics(
+            &[f32::from_bits(0x7fc0_0001)],
+            &[f32::from_bits(0x7fc0_0002)]
+        )
         .unwrap_err()
-        .contains("signed-zero behavior mismatch"));
-    assert!(metrics(&[f32::INFINITY], &[f32::NEG_INFINITY])
-        .unwrap_err()
-        .contains("infinite behavior mismatch"));
-    assert!(metrics(&[1.0], &[1.0, 2.0])
-        .unwrap_err()
-        .contains("length mismatch"));
+        .contains("NaN behavior mismatch")
+    );
+    assert!(
+        metrics(&[-0.0], &[0.0])
+            .unwrap_err()
+            .contains("signed-zero behavior mismatch")
+    );
+    assert!(
+        metrics(&[f32::INFINITY], &[f32::NEG_INFINITY])
+            .unwrap_err()
+            .contains("infinite behavior mismatch")
+    );
+    assert!(
+        metrics(&[1.0], &[1.0, 2.0])
+            .unwrap_err()
+            .contains("length mismatch")
+    );
+}
+
+#[test]
+fn hf_bf16_lm_head_rounds_linear_output_before_f32_export() {
+    // This vector crosses a bf16 rounding boundary.  A direct f32 accumulator
+    // export is 0.150146484375, whereas the pinned eager linear output rounds
+    // to bf16 0.150390625 before Nanbeige widens it with `logits.float()`.
+    let lm_head = Bf16Matrix::new(1, 2, bf16s(&[0.10009765625, 0.050048828125]))
+        .expect("the bf16 lm-head cast regression matrix has a valid shape");
+    let hidden = bf16s(&[1.0, 1.0]);
+    let direct_f32_accumulator = lm_head
+        .row(0)
+        .expect("the regression lm-head row exists")
+        .iter()
+        .zip(&hidden)
+        .map(|(weight, activation)| weight.to_f32() * activation.to_f32())
+        .sum::<f32>();
+    let expected = scalar_lm_head_bf16_then_export(&lm_head, &hidden);
+    let observed =
+        export_logits_f32(&hidden, &lm_head).expect("the regression lm-head input width matches");
+
+    assert_eq!(direct_f32_accumulator, 0.150146484375);
+    assert_eq!(expected, vec![0.150390625]);
+    assert_ne!(
+        direct_f32_accumulator, expected[0],
+        "the vector must detect an omitted bf16 linear-output cast"
+    );
+    assert_eq!(
+        observed, expected,
+        "hf-bf16-eager lm_head must narrow the completed linear output before f32 export"
+    );
 }
 
 #[test]
@@ -809,7 +854,7 @@ fn hf_bf16_eager_primitives_match_scalar_spec_and_emit_report() {
         embedding_row_stays_bf16(&input),
         &manifest_digest,
     ));
-    let expected_logits = scalar_project_f32(&down, &expected_swiglu);
+    let expected_logits = scalar_lm_head_bf16_then_export(&down, &expected_swiglu);
     let observed_logits = export_logits_f32(&observed_swiglu, &down).unwrap();
     rows.push(assert_float_row(
         &table,
