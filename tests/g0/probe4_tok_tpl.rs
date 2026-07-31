@@ -18,7 +18,7 @@ const REQUIRED_TEMPLATE_CASES: &[&str] = [
     "tool-xml",
     "media-reminder",
 ];
-const REQUIRED_TOKENIZER_CASES: &[&str] = [
+const REQUIRED_TOKENIZER_CASES: &[&str] = &[
     "ascii-whitespace",
     "multilingual",
     "code-punctuation",
