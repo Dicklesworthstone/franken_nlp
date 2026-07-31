@@ -128,3 +128,9 @@ The validator is stdlib-only repository tooling. The scaffold wires this exact
 command into `scripts/check.sh`; no release-binary dependency or model weight
 is involved. A successful structural validation does not turn a `BLOCKED` ADR
 into a ratified decision.
+
+Before the scaffold supplies the committed registry and fixture tree,
+`python3 scripts/validate_adrs.py --self-test` exercises the metadata-status
+rules in memory and reports `mode=self-test`. It is a generator/validator smoke
+check only; it is not evidence that a G0 registry exists or that any G0 probe
+is ratified.

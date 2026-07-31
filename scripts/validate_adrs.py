@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import re
 import sys
@@ -16,7 +17,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-
 
 STATUS_VALUES = frozenset({"RATIFIED", "ABSENT-WITH-FALLBACK", "BLOCKED"})
 PRIMARY_PROBES = frozenset(range(1, 12))
@@ -61,11 +61,19 @@ def canonical_json_bytes(value: Any) -> bytes:
     return (json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
 
 
+def decode_json(document: str, context: str) -> Any:
+    try:
+        return json.JSONDecoder().decode(document)
+    except json.JSONDecodeError as error:
+        raise AdrValidationError(f"cannot parse JSON {context}: {error}") from error
+
+
 def read_json_object(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise AdrValidationError(f"cannot parse JSON {path}: {error}") from error
+        document = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise AdrValidationError(f"cannot read JSON {path}: {error}") from error
+    value = decode_json(document, str(path))
     if not isinstance(value, dict):
         raise AdrValidationError(f"JSON document is not an object: {path}")
     return value
@@ -103,10 +111,7 @@ def parse_metadata(path: Path) -> AdrRecord:
     if len(matches) != 1:
         raise AdrValidationError(f"ADR {path} must contain exactly one adr-metadata block; observed={len(matches)}")
     payload = matches[0].group("body")
-    try:
-        metadata = json.loads(payload)
-    except json.JSONDecodeError as error:
-        raise AdrValidationError(f"ADR {path} metadata is not JSON: {error}") from error
+    metadata = decode_json(payload, f"ADR {path} metadata")
     if not isinstance(metadata, dict):
         raise AdrValidationError(f"ADR {path} metadata must be a JSON object")
     if canonical_json_bytes(metadata).decode("utf-8") != payload:
@@ -232,8 +237,9 @@ def validate_evidence(record: AdrRecord, adr_root: Path) -> list[Issue]:
         observed_digest = hashlib.sha256(path.read_bytes()).hexdigest()
         if observed_bytes != item.get("bytes"):
             issues.append(Issue(record.path, f"{prefix}.bytes", f"expected={item.get('bytes')} observed={observed_bytes}"))
-        if observed_digest != item.get("sha256"):
-            issues.append(Issue(record.path, f"{prefix}.sha256", f"expected={item.get('sha256')} observed={observed_digest}"))
+        expected_digest = item.get("sha256")
+        if not isinstance(expected_digest, str) or not hmac.compare_digest(observed_digest, expected_digest):
+            issues.append(Issue(record.path, f"{prefix}.sha256", f"expected={expected_digest} observed={observed_digest}"))
     return issues
 
 
