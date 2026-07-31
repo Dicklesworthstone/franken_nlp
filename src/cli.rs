@@ -10,11 +10,11 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::{
     artifact::converter::{
-        DEFAULT_PANEL_BYTES, ConvertArch, ConverterError, ConvertRequest, prepare_convert_request,
+        prepare_convert_request, ConvertArch, ConvertRequest, ConverterError, DEFAULT_PANEL_BYTES,
     },
-    artifact::package::{PackageRequest, package_model, verify_model_package},
+    artifact::package::{package_model, verify_model_package, PackageRequest},
     error::ErrorCode,
-    grammar::{CompileLimits, CompiledSchema, SchemaError, compile_json_schema},
+    grammar::{compile_json_schema, CompileLimits, CompiledSchema, SchemaError},
     robot::{self, RobotCommand},
 };
 
@@ -43,33 +43,36 @@ enum Command {
         command: ReleaseSubcommand,
     },
     /// Prepare a bounded, canonical Generic conversion from the pinned source closure.
-    Convert {
-        /// Directory containing the pinned ten-file source closure.
-        #[arg(long)]
-        source: PathBuf,
-        /// Authenticated source-closure manifest.
-        #[arg(long)]
-        source_manifest: PathBuf,
-        /// Versioned conversion recipe identity.
-        #[arg(long)]
-        recipe: String,
-        /// Canonical artifact target; only `generic` is admitted.
-        #[arg(long)]
-        arch: String,
-        /// Final canonical `.fnlpq` destination; no output is created until the
-        /// streaming envelope is available.
-        #[arg(short = 'o', long)]
-        output: PathBuf,
-        /// Bypass the later interactive confirmation step.
-        #[arg(long)]
-        yes: bool,
-        /// Reject all otherwise-unrelated source-directory entries.
-        #[arg(long)]
-        strict_source_dir: bool,
-        /// Reserve stdout for versioned robot events once conversion execution lands.
-        #[arg(long)]
-        robot: bool,
-    },
+    Convert(ConvertCommand),
+}
+
+#[derive(clap::Args)]
+struct ConvertCommand {
+    /// Directory containing the pinned ten-file source closure.
+    #[arg(long)]
+    source: PathBuf,
+    /// Authenticated source-closure manifest.
+    #[arg(long)]
+    source_manifest: PathBuf,
+    /// Versioned conversion recipe identity.
+    #[arg(long)]
+    recipe: String,
+    /// Canonical artifact target; only `generic` is admitted.
+    #[arg(long)]
+    arch: String,
+    /// Final canonical `.fnlpq` destination; no output is created until the
+    /// streaming envelope is available.
+    #[arg(short = 'o', long)]
+    output: PathBuf,
+    /// Bypass the later interactive confirmation step.
+    #[arg(long)]
+    yes: bool,
+    /// Reject all otherwise-unrelated source-directory entries.
+    #[arg(long)]
+    strict_source_dir: bool,
+    /// Reserve stdout for versioned robot events once conversion execution lands.
+    #[arg(long)]
+    robot: bool,
 }
 
 #[derive(Subcommand)]
@@ -163,25 +166,7 @@ fn cli_main_with_reader(
         }
         Some(Command::Schema { command }) => run_schema_command_with_reader(command, schema_input),
         Some(Command::Release { command }) => run_release_command(command),
-        Some(Command::Convert {
-            source,
-            source_manifest,
-            recipe,
-            arch,
-            output,
-            yes,
-            strict_source_dir,
-            robot,
-        }) => run_convert_command(
-            source,
-            source_manifest,
-            recipe,
-            arch,
-            output,
-            yes,
-            strict_source_dir,
-            robot,
-        ),
+        Some(Command::Convert(command)) => run_convert_command(command),
         None => {
             let mut command = Cli::command();
             let _ = command.print_help();
@@ -191,25 +176,25 @@ fn cli_main_with_reader(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_convert_command(
-    source_dir: PathBuf,
-    source_manifest: PathBuf,
-    recipe_id: String,
-    arch: String,
-    output: PathBuf,
-    yes: bool,
-    strict_source_dir: bool,
-    robot: bool,
-) -> ExitCode {
+fn run_convert_command(command: ConvertCommand) -> ExitCode {
+    let ConvertCommand {
+        source,
+        source_manifest,
+        recipe,
+        arch,
+        output,
+        yes,
+        strict_source_dir,
+        robot,
+    } = command;
     let arch = match ConvertArch::parse(&arch) {
         Ok(arch) => arch,
         Err(error) => return emit_convert_refusal(error),
     };
     let request = ConvertRequest {
-        source_dir,
+        source_dir: source,
         source_manifest,
-        recipe_id,
+        recipe_id: recipe,
         arch,
         output,
         yes,
@@ -369,7 +354,7 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{Cli, Command, cli_main_with_reader};
+    use super::{cli_main_with_reader, Cli, Command};
 
     #[test]
     fn schema_dash_uses_the_injected_reader() {
@@ -445,6 +430,6 @@ mod tests {
             "nanbeige4.2-3b.fnlpq-v1.int8.generic.fnlpq",
         ])
         .expect("reference conversion invocation parses");
-        assert!(matches!(convert.command, Some(Command::Convert { .. })));
+        assert!(matches!(convert.command, Some(Command::Convert(..))));
     }
 }
