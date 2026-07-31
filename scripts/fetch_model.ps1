@@ -203,37 +203,71 @@ function Test-EffectiveHost([Uri]$Uri) {
 }
 
 function Download-Partial([string]$Url, [string]$Partial, [string]$Journal, $Entry) {
-    $start = Get-Length $Partial
     $lastError = $null
     for ($attempt = 1; $attempt -le 4; $attempt++) {
         try {
+            # A failed body can leave an authenticated partial behind. Rebind
+            # Range on every attempt so retry appends only the bytes still
+            # missing, never a duplicate prefix.
+            $start = Get-Length $Partial
+            if ($start -gt $Entry.Length) {
+                throw "partial exceeds expected length expected=$($Entry.Length) observed=$start"
+            }
+            $expectedBodyBytes = $Entry.Length - $start
             $requestedUri = [Uri]$Url
             if (-not $TestBaseUrl -and -not (Test-EffectiveHost $requestedUri)) { throw "redirect host refused effective_url=$requestedUri" }
             $handler = [Net.Http.HttpClientHandler]::new()
             $handler.AllowAutoRedirect = $true
             $handler.MaxAutomaticRedirections = 8
             $client = [Net.Http.HttpClient]::new($handler)
-            $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, $Url)
-            if ($start -gt 0) { $request.Headers.Range = [Net.Http.Headers.RangeHeaderValue]::Parse("bytes=$start-") }
-            $response = $client.SendAsync($request, [Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
-            if (-not $response.IsSuccessStatusCode) { throw "HTTP status $([int]$response.StatusCode)" }
-            if ($start -gt 0 -and $response.StatusCode -ne [Net.HttpStatusCode]::PartialContent) { throw 'server refused secure Range resume' }
-            $effectiveUri = $response.RequestMessage.RequestUri
-            if (-not $TestBaseUrl -and -not (Test-EffectiveHost $effectiveUri)) {
-                Write-Log "REDIRECT_HOST_REFUSED phase=post-transfer activation=refused effective_url=$effectiveUri"
-                throw "redirect host refused effective_url=$effectiveUri"
-            }
-            $input = $response.Content.ReadAsStream()
-            $output = [IO.File]::Open($Partial, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            $request = $null
+            $response = $null
+            $input = $null
+            $output = $null
             try {
+                $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, $Url)
+                if ($start -gt 0) { $request.Headers.Range = [Net.Http.Headers.RangeHeaderValue]::Parse("bytes=$start-") }
+                $response = $client.SendAsync($request, [Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+                if (-not $response.IsSuccessStatusCode) { throw "HTTP status $([int]$response.StatusCode)" }
+                if ($start -gt 0) {
+                    if ($response.StatusCode -ne [Net.HttpStatusCode]::PartialContent) { throw 'server refused secure Range resume' }
+                    $contentRange = $response.Content.Headers.ContentRange
+                    $expectedEnd = $Entry.Length - 1
+                    if ($null -eq $contentRange -or $contentRange.From -ne $start -or $contentRange.To -ne $expectedEnd -or $contentRange.Length -ne $Entry.Length) {
+                        throw "server returned mismatched Content-Range expected=bytes $start-$expectedEnd/$($Entry.Length) actual=$contentRange"
+                    }
+                }
+                $contentLength = $response.Content.Headers.ContentLength
+                if ($null -ne $contentLength -and $contentLength -ne $expectedBodyBytes) {
+                    throw "server returned mismatched Content-Length expected=$expectedBodyBytes actual=$contentLength"
+                }
+                $effectiveUri = $response.RequestMessage.RequestUri
+                if (-not $TestBaseUrl -and -not (Test-EffectiveHost $effectiveUri)) {
+                    Write-Log "REDIRECT_HOST_REFUSED phase=post-transfer activation=refused effective_url=$effectiveUri"
+                    throw "redirect host refused effective_url=$effectiveUri"
+                }
+                $input = $response.Content.ReadAsStream()
+                $output = [IO.File]::Open($Partial, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::None)
                 $buffer = New-Object byte[] 1048576
                 $nextLog = [DateTime]::UtcNow
+                $receivedBytes = [int64]0
                 while (($read = $input.Read($buffer, 0, $buffer.Length)) -gt 0) {
                     $output.Write($buffer, 0, $read)
+                    $receivedBytes += $read
                     if ([DateTime]::UtcNow -ge $nextLog) { Write-Log "PROGRESS file=$($Entry.Name) bytes=$($output.Length) expected_bytes=$($Entry.Length)"; $nextLog = [DateTime]::UtcNow.AddSeconds(5) }
                 }
+                if ($receivedBytes -ne $expectedBodyBytes) {
+                    throw "response body length mismatch expected=$expectedBodyBytes actual=$receivedBytes"
+                }
                 $output.Flush($true)
-            } finally { $output.Dispose(); $input.Dispose(); $response.Dispose(); $client.Dispose(); $handler.Dispose() }
+            } finally {
+                if ($null -ne $output) { $output.Dispose() }
+                if ($null -ne $input) { $input.Dispose() }
+                if ($null -ne $response) { $response.Dispose() }
+                if ($null -ne $request) { $request.Dispose() }
+                $client.Dispose()
+                $handler.Dispose()
+            }
             return
         } catch {
             $lastError = $_.Exception.Message
@@ -270,10 +304,21 @@ function Download-One($Entry, $Entries) {
 }
 
 if ($Revision -notmatch '^[a-f0-9]+$') { Write-Usage; exit 2 }
-if (-not $Dest) { $Dest = Join-Path $env:LOCALAPPDATA ("franken_nlp\source\$Model\$Revision") }
+if (-not $Dest) {
+    if ($env:LOCALAPPDATA) {
+        $Dest = Join-Path $env:LOCALAPPDATA ("franken_nlp\source\$Model\$Revision")
+    } elseif ($env:USERPROFILE) {
+        $Dest = Join-Path $env:USERPROFILE (".cache\franken_nlp\source\$Model\$Revision")
+    } else {
+        Exit-Fetch 2 'cannot choose a default destination: LOCALAPPDATA and USERPROFILE are both unset'
+    }
+}
 if ($Revision -ne $DefaultRevision) {
     if (-not $AllowUntrustedRevision -or -not $Catalog) { Write-Log "UNTRUSTED_REVISION_REFUSED revision=$Revision requires -AllowUntrustedRevision and -Catalog"; exit 2 }
     Write-Log "UNTRUSTED_REVISION revision=$Revision catalog=$Catalog; this download is not the default recipe/catalog identity"
+} elseif ($Catalog) {
+    if (-not $AllowUntrustedRevision) { Write-Log "UNTRUSTED_CATALOG_REFUSED revision=$Revision requires -AllowUntrustedRevision with -Catalog"; exit 2 }
+    Write-Log "UNTRUSTED_CATALOG revision=$Revision catalog=$Catalog; this download is not the default recipe/catalog identity"
 }
 if ($TestBaseUrl -and $env:FNLP_FETCH_ALLOW_TEST_BASE_URL -ne '1') { Exit-Fetch 2 '-TestBaseUrl requires FNLP_FETCH_ALLOW_TEST_BASE_URL=1' }
 

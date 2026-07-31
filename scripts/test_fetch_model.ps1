@@ -20,7 +20,7 @@ function Pass([string]$Case, [string]$Detail) { Write-Log "CASE=$Case RESULT=PAS
 function Fail([string]$Case, [string]$Detail) { $script:Failed.Add($Case); Write-Log "CASE=$Case RESULT=FAIL detail=$Detail" }
 function Invoke-Fetch([string]$Dest, [string[]]$Extra = @()) {
     $env:FNLP_FETCH_ALLOW_TEST_BASE_URL = '1'
-    & $script:PwshPath -NoProfile -File $Fetch -Dest $Dest -Catalog $script:Catalog -TestBaseUrl $script:Base @Extra
+    & $script:PwshPath -NoProfile -File $Fetch -Dest $Dest -Catalog $script:Catalog -TestBaseUrl $script:Base -AllowUntrustedRevision @Extra
     return $LASTEXITCODE
 }
 function Stop-RedirectServer {
@@ -165,7 +165,7 @@ function Invoke-RedirectPolicyFetch([string]$Dest, [int]$ProxyPort, [string]$CaC
         $env:HTTP_PROXY = "http://127.0.0.1:$ProxyPort"
         $env:ALL_PROXY = "http://127.0.0.1:$ProxyPort"
         $env:NO_PROXY = ''
-        & $script:PwshPath -NoProfile -File $Fetch -Dest $Dest -Catalog $script:Catalog
+        & $script:PwshPath -NoProfile -File $Fetch -Dest $Dest -Catalog $script:Catalog -AllowUntrustedRevision
         return $LASTEXITCODE
     } finally {
         foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process') }
@@ -241,8 +241,12 @@ try {
     $env:FNLP_FETCH_ALLOW_TEST_BASE_URL = '1'; & pwsh -NoProfile -File $Fetch -Dest $d7 -Revision deadbeef 2> (Join-Path $Work 'case7.err'); $status = $LASTEXITCODE
     if ($status -eq 2 -and (Get-Content (Join-Path $Work 'case7.err') -Raw) -match 'UNTRUSTED_REVISION_REFUSED') { Pass '7' 'untrusted-revision-refusal' } else { Fail '7' "untrusted-revision-refusal exit=$status" }
 
+    $script:Cases++; $d7catalog = Join-Path $Work 'case7catalog'
+    $env:FNLP_FETCH_ALLOW_TEST_BASE_URL = '1'; & pwsh -NoProfile -File $Fetch -Dest $d7catalog -Catalog $script:Catalog -TestBaseUrl $script:Base 2> (Join-Path $Work 'case7catalog.err'); $status = $LASTEXITCODE
+    if ($status -eq 2 -and (Get-Content (Join-Path $Work 'case7catalog.err') -Raw) -match 'UNTRUSTED_CATALOG_REFUSED') { Pass '7catalog' 'default-revision-custom-catalog-refusal' } else { Fail '7catalog' "default-revision-custom-catalog-refusal exit=$status" }
+
     $script:Cases++; $d8 = Join-Path $Work 'case8'; New-Item -ItemType Directory -Path $d8 -Force | Out-Null; [IO.File]::WriteAllBytes((Join-Path $d8 'alpha.bin.partial'), [IO.File]::ReadAllBytes($alpha)[0..4]); Write-Journal $d8 'alpha.bin' $alphaLength $alphaSha 'http://127.0.0.1:1/alpha.bin'
-    $env:FNLP_FETCH_ALLOW_TEST_BASE_URL = '1'; & pwsh -NoProfile -File $Fetch -Dest $d8 -Catalog $script:Catalog -TestBaseUrl 'http://127.0.0.1:1' 2> (Join-Path $Work 'case8.err'); $status = $LASTEXITCODE
+    $env:FNLP_FETCH_ALLOW_TEST_BASE_URL = '1'; & pwsh -NoProfile -File $Fetch -Dest $d8 -Catalog $script:Catalog -TestBaseUrl 'http://127.0.0.1:1' -AllowUntrustedRevision 2> (Join-Path $Work 'case8.err'); $status = $LASTEXITCODE
     if ($status -eq 3 -and (Get-Content (Join-Path $Work 'case8.err') -Raw) -match ([regex]::Escape("-Dest `"$d8`""))) { Pass '8' 'interrupted-resume-guidance' } else { Fail '8' "interrupted-resume-guidance exit=$status" }
 
     $script:Cases++; $d9 = Join-Path $Work 'case9'; $status = Invoke-Fetch $d9 @('-CheckOnly')
