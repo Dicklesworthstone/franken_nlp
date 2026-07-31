@@ -274,27 +274,128 @@ fn sequence_overflow_lock_reentry_and_unratified_root_refuse_typed() {
 
 #[test]
 fn crash_matrix_recovers_only_old_or_new_head() {
-    for (logical_timestamp, stage) in [
-        "create-staging",
-        "sync-staging",
-        "rename-final",
-        "sync-directory",
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    struct CrashCase {
+        stage: &'static str,
+        retained_envelope: RetainedEnvelope,
+        expected_head_delta: u64,
+        expected_new_verdict: Option<ChainWalkVerdict>,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RetainedEnvelope {
+        /// Staging names are never discovery candidates, even after a synced
+        /// file write. The old immutable head must remain active.
+        NotVisible,
+        /// A completed same-filesystem rename has made the immutable final
+        /// envelope discoverable, so recovery may adopt the new head even
+        /// before a later directory-sync observation.
+        ValidFinal,
+        /// A power cut may leave bytes that resemble a final envelope but do
+        /// not authenticate. Discovery must ignore them, not promote them.
+        TornFinal,
+    }
+
+    let cases = [
+        CrashCase {
+            stage: "create-staging",
+            retained_envelope: RetainedEnvelope::NotVisible,
+            expected_head_delta: 0,
+            expected_new_verdict: None,
+        },
+        CrashCase {
+            stage: "sync-staging",
+            retained_envelope: RetainedEnvelope::NotVisible,
+            expected_head_delta: 0,
+            expected_new_verdict: None,
+        },
+        CrashCase {
+            stage: "rename-before-visibility",
+            retained_envelope: RetainedEnvelope::NotVisible,
+            expected_head_delta: 0,
+            expected_new_verdict: None,
+        },
+        CrashCase {
+            stage: "rename-torn-final",
+            retained_envelope: RetainedEnvelope::TornFinal,
+            expected_head_delta: 0,
+            expected_new_verdict: Some(ChainWalkVerdict::IgnoredDigestMismatch),
+        },
+        CrashCase {
+            stage: "rename-visible-final",
+            retained_envelope: RetainedEnvelope::ValidFinal,
+            expected_head_delta: 1,
+            expected_new_verdict: Some(ChainWalkVerdict::Adopted),
+        },
+        CrashCase {
+            stage: "sync-directory",
+            retained_envelope: RetainedEnvelope::ValidFinal,
+            expected_head_delta: 1,
+            expected_new_verdict: Some(ChainWalkVerdict::Adopted),
+        },
+    ];
+
+    for (logical_timestamp, case) in cases.into_iter().enumerate() {
         let mut journal = SimulatedActivationJournal::new();
         let old = journal.append(digest(1), digest(2), digest(3)).unwrap();
-        if matches!(stage, "rename-final" | "sync-directory") {
-            journal.append(digest(4), digest(5), digest(6)).unwrap();
-        }
+        let candidate = ActivationRecord::new(
+            ActivationRecordBody::successor(&old.record, digest(4), digest(5), digest(6))
+                .expect("the genesis record has a checked successor"),
+        );
+        let expected_candidate = match case.retained_envelope {
+            RetainedEnvelope::NotVisible => None,
+            RetainedEnvelope::ValidFinal => {
+                let digest = candidate.record_digest();
+                journal
+                    .retain_recovery_fixture(candidate)
+                    .expect("the first immutable final name is available");
+                Some((digest, ChainWalkVerdict::Adopted))
+            }
+            RetainedEnvelope::TornFinal => {
+                let torn = ActivationRecord::from_retained_parts(
+                    candidate.body().clone(),
+                    ActivationDigest::from_bytes([0xa5; 32]),
+                );
+                let digest = torn.record_digest();
+                journal
+                    .retain_recovery_fixture(torn)
+                    .expect("the distinct torn envelope name is retained for recovery");
+                Some((digest, ChainWalkVerdict::IgnoredDigestMismatch))
+            }
+        };
+
         let discovery = journal.discover().unwrap();
         let observed = discovery.head.expect("old or new retained head");
-        assert!(observed.sequence() == old.sequence() || observed.sequence() == old.sequence() + 1);
+        assert_eq!(
+            observed.sequence(),
+            old.sequence() + case.expected_head_delta,
+            "crash recovery must name the exact old/new visibility outcome"
+        );
+        if let Some(expected_verdict) = case.expected_new_verdict {
+            let (candidate_digest, candidate_verdict) = expected_candidate
+                .expect("a retained crash envelope must have a walk classification");
+            assert_eq!(candidate_verdict, expected_verdict);
+            assert!(
+                discovery
+                    .walk
+                    .iter()
+                    .any(|entry| entry.digest == candidate_digest && entry.verdict == expected_verdict),
+                "the crash walk must classify the visible candidate: stage={} expected={expected_verdict:?} walk={:?}",
+                case.stage,
+                discovery.walk
+            );
+        } else {
+            assert!(
+                expected_candidate.is_none(),
+                "an invisible staging record must not enter discovery"
+            );
+        }
         eprintln!(
-            "FS_TXN case=crash-{stage} logical_timestamp={logical_timestamp} RESULT=PASS head={}",
-            observed.sequence()
+            "FS_TXN case=crash-{} logical_timestamp={logical_timestamp} expected_head={} observed_head={} retained={:?} RESULT=PASS",
+            case.stage,
+            old.sequence() + case.expected_head_delta,
+            observed.sequence(),
+            case.retained_envelope,
         );
     }
-    eprintln!("FS_TXN_CRASH_MATRIX RESULT=PASS rows=4 forks=0 model=simulated-failure-fs");
+    eprintln!("FS_TXN_CRASH_MATRIX RESULT=PASS rows=6 forks=0 model=simulated-failure-fs");
 }
