@@ -442,6 +442,7 @@ impl std::error::Error for ResourceBrokerError {}
 /// The process host could not establish the required production runtime seam.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeHostError {
+    RuntimeFeatureDisabled,
     RuntimeBuild { detail: String },
     MissingBlockingPool,
 }
@@ -449,6 +450,9 @@ pub enum RuntimeHostError {
 impl fmt::Display for RuntimeHostError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::RuntimeFeatureDisabled => formatter.write_str(
+                "asupersync-runtime feature is disabled; a production EngineResources host cannot use an inline fallback",
+            ),
             Self::RuntimeBuild { detail } => {
                 write!(formatter, "asupersync runtime construction failed: {detail}")
             }
@@ -1006,10 +1010,37 @@ impl EngineResources {
         config: ResourceHostConfig,
         thread_inventory: ThreadInventory,
     ) -> Result<Self, RuntimeHostError> {
-        let guardrails = RuntimeGuardrails::PINNED_DEFAULTS;
         #[cfg(feature = "asupersync-runtime")]
-        let runtime = RuntimeHost::build(config, guardrails)?;
-        Ok(Self {
+        {
+            let guardrails = RuntimeGuardrails::PINNED_DEFAULTS;
+            let runtime = RuntimeHost::build(config, guardrails)?;
+            return Ok(Self {
+                config,
+                thread_inventory,
+                guardrails,
+                memory: Arc::new(MemoryLedger::new(
+                    config.memory_ceiling_bytes,
+                    config.leak_response_policy,
+                )),
+                next_lease_id: AtomicU64::new(0),
+                leases: Mutex::new(LeaseState::default()),
+                next_closure_id: AtomicU64::new(0),
+                completions: Mutex::new(CompletionState::default()),
+                runtime,
+            });
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let _ = (config, thread_inventory);
+            Err(RuntimeHostError::RuntimeFeatureDisabled)
+        }
+    }
+
+    #[cfg(all(test, not(feature = "asupersync-runtime")))]
+    fn new_for_test(config: ResourceHostConfig, thread_inventory: ThreadInventory) -> Self {
+        let guardrails = RuntimeGuardrails::PINNED_DEFAULTS;
+        Self {
             config,
             thread_inventory,
             guardrails,
@@ -1021,9 +1052,13 @@ impl EngineResources {
             leases: Mutex::new(LeaseState::default()),
             next_closure_id: AtomicU64::new(0),
             completions: Mutex::new(CompletionState::default()),
-            #[cfg(feature = "asupersync-runtime")]
-            runtime,
-        })
+        }
+    }
+
+    #[cfg(all(test, feature = "asupersync-runtime"))]
+    fn new_for_test(config: ResourceHostConfig, thread_inventory: ThreadInventory) -> Self {
+        Self::new(config, thread_inventory)
+            .expect("feature-enabled test host must retain a real blocking pool")
     }
 
     /// Fixed configuration selected by the first successful installation.
@@ -1217,6 +1252,8 @@ impl Drop for BlockingClosureGuard {
 #[derive(Debug, Default)]
 pub struct ResourceBroker {
     installed: Mutex<Option<Arc<EngineResources>>>,
+    #[cfg(test)]
+    allow_test_runtime_model: bool,
 }
 
 impl ResourceBroker {
@@ -1234,6 +1271,16 @@ impl ResourceBroker {
             }
             return Ok(Arc::clone(existing));
         }
+        #[cfg(test)]
+        let resources = if self.allow_test_runtime_model {
+            Arc::new(EngineResources::new_for_test(requested, thread_inventory))
+        } else {
+            Arc::new(
+                EngineResources::new(requested, thread_inventory)
+                    .map_err(ResourceBrokerError::Runtime)?,
+            )
+        };
+        #[cfg(not(test))]
         let resources = Arc::new(
             EngineResources::new(requested, thread_inventory).map_err(ResourceBrokerError::Runtime)?,
         );
@@ -1247,7 +1294,10 @@ impl ResourceBroker {
 
     #[cfg(test)]
     fn isolated_for_test() -> Self {
-        Self::default()
+        Self {
+            installed: Mutex::new(None),
+            allow_test_runtime_model: true,
+        }
     }
 }
 
@@ -1469,6 +1519,18 @@ mod tests {
         assert!(guardrails.cancel_attribution_max_memory_bytes < usize::MAX);
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
+    #[test]
+    fn production_broker_refuses_to_model_a_missing_runtime_pool() {
+        let broker = ResourceBroker::default();
+        assert_eq!(
+            broker
+                .install(config())
+                .expect_err("production host must not use an inline fallback"),
+            ResourceBrokerError::Runtime(RuntimeHostError::RuntimeFeatureDisabled),
+        );
+    }
+
     #[test]
     fn first_install_is_shared_and_conflicts_name_each_field() {
         let broker = ResourceBroker::isolated_for_test();
@@ -1539,9 +1601,7 @@ mod tests {
     fn reservations_commit_abort_and_release_exactly() {
         let config = config();
         let thread_inventory = config.thread_inventory().expect("inventory is valid");
-        let resources = Arc::new(
-            EngineResources::new(config, thread_inventory).expect("valid resources"),
-        );
+        let resources = Arc::new(EngineResources::new_for_test(config, thread_inventory));
         let lease = resources.acquire_lease();
         let committed = lease
             .reserve(MemoryClass::Weights, 600)
