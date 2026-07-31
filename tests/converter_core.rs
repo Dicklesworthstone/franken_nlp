@@ -117,6 +117,18 @@ fn receipt_requires_every_identity_and_serializes_canonically() {
 
     let json = receipt.canonical_json().expect("complete receipt");
     assert!(json.contains("\"recipe_id\":\"nanbeige42-int8-v1\""));
+
+    let malformed_commit = ConversionReceipt {
+        converter_commit: "unbound-converter".to_owned(),
+        ..receipt
+    };
+    assert_eq!(
+        malformed_commit.canonical_json(),
+        Err(ConverterError::ReceiptField {
+            field: "converter_commit",
+            detail: "must be a lowercase 40-character Git commit".to_owned(),
+        })
+    );
 }
 
 #[test]

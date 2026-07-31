@@ -864,8 +864,13 @@ impl ConversionReceipt {
                 });
             }
         }
+        if !is_lower_git_commit(&self.converter_commit) {
+            return Err(ConverterError::ReceiptField {
+                field: "converter_commit",
+                detail: "must be a lowercase 40-character Git commit".to_owned(),
+            });
+        }
         for (field, value) in [
-            ("converter_commit", self.converter_commit.as_str()),
             ("recipe_id", self.recipe_id.as_str()),
             ("rounding_id", self.rounding_id.as_str()),
             ("packing_id", self.packing_id.as_str()),
@@ -2232,6 +2237,13 @@ fn is_safe_basename(name: &str) -> bool {
 
 fn is_lower_sha256(value: &str) -> bool {
     value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_lower_git_commit(value: &str) -> bool {
+    value.len() == 40
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
