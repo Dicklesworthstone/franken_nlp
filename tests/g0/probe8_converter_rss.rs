@@ -7,6 +7,31 @@
 const PANEL_CAP_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PeakRssFormula {
+    largest_source_panel: usize,
+    largest_f32_panel: usize,
+    scratch: usize,
+    output_buffer: usize,
+    parser_metadata: usize,
+    margin: usize,
+}
+
+impl PeakRssFormula {
+    fn checked_total(self) -> Option<usize> {
+        [
+            self.largest_source_panel,
+            self.largest_f32_panel,
+            self.scratch,
+            self.output_buffer,
+            self.parser_metadata,
+            self.margin,
+        ]
+        .into_iter()
+        .try_fold(0_usize, |total, term| total.checked_add(term))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RangeError {
     Overflow,
     ExceedsPanelCap,
@@ -59,12 +84,26 @@ fn converter_panel_access_rejects_overflow_and_never_exceeds_the_declared_cap() 
         checked_range(source.len(), 0, PANEL_CAP_BYTES + 1),
         Err(RangeError::ExceedsPanelCap)
     );
-    let estimated_peak_bytes = PANEL_CAP_BYTES
-        .checked_add(PANEL_CAP_BYTES)
-        .and_then(|bytes| bytes.checked_add(PANEL_CAP_BYTES))
-        .expect("bounded peak model must fit usize");
+    let formula = PeakRssFormula {
+        largest_source_panel: PANEL_CAP_BYTES,
+        largest_f32_panel: PANEL_CAP_BYTES * 2,
+        scratch: PANEL_CAP_BYTES,
+        output_buffer: PANEL_CAP_BYTES,
+        parser_metadata: 4 * 1024 * 1024,
+        margin: 16 * 1024 * 1024,
+    };
+    let estimated_peak_bytes = formula
+        .checked_total()
+        .expect("bounded peak formula must fit usize");
+    assert_eq!(estimated_peak_bytes, 340 * 1024 * 1024);
     println!(
-        "G0_PROBE8 case=bounded-range-access RESULT=PASS panel_cap_bytes={PANEL_CAP_BYTES} estimated_panel_scratch_output_peak_bytes={estimated_peak_bytes} authority=range-model-only"
+        "G0_PROBE8 case=bounded-range-access RESULT=PASS panel_cap_bytes={PANEL_CAP_BYTES} source_panel_bytes={} f32_panel_bytes={} scratch_bytes={} output_buffer_bytes={} parser_metadata_bytes={} margin_bytes={} estimated_peak_bytes={estimated_peak_bytes} authority=range-model-only",
+        formula.largest_source_panel,
+        formula.largest_f32_panel,
+        formula.scratch,
+        formula.output_buffer,
+        formula.parser_metadata,
+        formula.margin,
     );
     println!("G0_PROBE8 RESULT=PASS cases=1 authority=range-model-only");
 }
