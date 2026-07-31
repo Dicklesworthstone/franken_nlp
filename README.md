@@ -10,7 +10,7 @@
 [![output: schema--valid by construction](https://img.shields.io/badge/output-schema--valid_by_construction-red.svg)](./COMPREHENSIVE_PLAN_FOR_FRANKEN_NLP.md)
 [![deps: closed universe](https://img.shields.io/badge/deps-closed_universe-black.svg)](./COMPREHENSIVE_PLAN_FOR_FRANKEN_NLP.md)
 
-**A pure-Rust, memory-safe, CPU-hyper-optimized NLP engine built around exactly one model. `franken_nlp` takes Nanbeige4.2-3B, whose model card reports unusually strong sub-4B results, transforms its weights into a custom quantized format redistributed as digest-verified, provenance-attested GitHub release assets, runs it through kernels written for its exact shapes (including its one structural novelty: 22 layers executed twice, with a final RMSNorm after each pass), and wraps it in a complete local NLP toolbox: schema-guaranteed structured extraction, source-grounded NER + entity resolution, sentiment distribution scoring, zero-shot classification, PII redaction, faithfulness judging, summarization, keyphrases, QA, and generation. One library and one CLI (`fnlp`); no Python, no CUDA, no GPU, and no network after the one-time model pull.**
+**A pure-Rust, memory-safe, CPU-hyper-optimized NLP engine built around exactly one model. `franken_nlp` takes Nanbeige4.2-3B, whose model card reports unusually strong sub-4B results, transforms its weights into a custom quantized format redistributed as digest-verified, provenance-attested GitHub release assets, runs it through kernels written for its exact shapes (including its one structural novelty: 22 layers executed twice, with a final RMSNorm after each pass), and wraps it in a complete local NLP toolbox: schema-guaranteed structured extraction, source-grounded NER + entity resolution, sentiment distribution scoring, zero-shot classification, PII redaction, faithfulness judging, summarization, keyphrases, QA, and generation. One library and one CLI (`fnlp`); no Python, no CUDA, no GPU required, and no network after the one-time model pull.**
 
 </div>
 
@@ -35,8 +35,8 @@
 | Corpus fabric | `fnlp batch`: an NDJSON daemon with layer-major continuous batching, fair prefill morsels, checked memory admission, lazy copy-on-write KV pages, and shipped-prefix caching. `fnlp job`: opt-in durable corpus runs with content-addressed semantic keys, transactional resume, verify, and owned materialization: metadata-only by default, never your text. |
 | Determinism | Scoped and named: semantic greedy output is exact under a declared numerics profile; batch-M ≡ batch-1 and prefix-fork ≡ cold-prefill are gated invariants; canonical byte replay fixes ordering and scrubs volatile telemetry. |
 | Hardware | Apple M4/M5 (NEON SDOT/SMMLA/autovec, measured per shape), AMD Threadripper/EPYC with **two exact AVX2 constructions for Zen 3** (raw saturating `vpmaddubsw` is banned) and AVX-512-VNNI benchmarked separately on Zen 4 (double-pumped), Zen 5 (native 512), and Intel; runtime feature detection, one binary per arch. |
-| Fidelity | A parity ladder against the pinned HF reference: tokenizer-exact, per-op metric vectors, hidden states at **all 44 layer executions plus both post-loop norms**, logits, greedy tokens, task outputs. Staged quantization with per-stage kill-switches; every divergence ledgered. |
-| Safety | `unsafe` denied crate-wide and forbidden outside enumerated, audited SIMD/mmap islands (scoped allows + a CI policy test), each integer kernel differentially proven against scalar/i64. |
+| Fidelity | A parity ladder against the pinned HF reference: tokenizer-exact, per-op metric vectors, hidden states at **all 44 layer executions plus both post-loop norms**, logits, greedy tokens, task outputs. The f32 path exact-matches reproducible HF greedy output; optimized backends preserve one fixed recipe's scalar semantics; deliberate int8/int4 divergence from bf16 is separately measured and ledgered. |
+| Safety | `unsafe` denied crate-wide and forbidden outside enumerated, audited SIMD/mmap islands (scoped allows + a CI policy test), each integer kernel differentially proven against scalar/i64. NUMA/topology/QoS/huge-page experiments require a safe FrankenSuite surface or remain off. |
 | Dependencies | **Closed universe.** Pinned FrankenSuite foundations (frankentorch kernels, asupersync runtime/HTTP, optional fsqlite) plus exactly three commodity families: `clap`, `serde`/`serde_json`, `sha2`. The SentencePiece BPE tokenizer, chat-template builder, and grammar engine are built in-house. |
 
 ---
@@ -72,8 +72,9 @@ fnlp redact transcript.txt --verify
 # Verify RAG answers against their sources.
 fnlp judge --faithfulness --source retrieved_passages.txt answer.txt
 
-# Chat with bounded thinking, reproducibly.
-fnlp chat --think --seed 42 "Plan a Python 2→3 migration for a 100kLOC codebase"
+# Chat with bounded thinking and explicit reproducible sampling.
+fnlp chat --think --sample --preset nanbeige --seed 42 \
+  "Plan a Python 2→3 migration for a 100kLOC codebase"
 
 # Measure it on YOUR data before you believe anyone's benchmark.
 fnlp eval --task classify --dataset tickets.test.ndjson --gold label
@@ -110,13 +111,13 @@ No single trick makes this worth building. The **composition** of six bets does;
 
 These are the constitutional, non-negotiable constraints the whole system is built under. They read like restrictions; they are the moat.
 
-1. **The dependency universe is closed.** `std`, the pinned nightly, pinned FrankenSuite foundations ([frankentorch](https://github.com/Dicklesworthstone/frankentorch) serial/range leaf kernels; [asupersync](https://github.com/Dicklesworthstone/asupersync) for orchestration, cancellation, budgets, CPU-team ownership, and the one network path `fnlp pull`; optional [frankensqlite](https://github.com/Dicklesworthstone/frankensqlite) for metadata/job state), plus exactly three commodity families: `clap`, `serde`/`serde_json`, `sha2`. The release graph contains no Rayon; the tokenizer, chat template, grammar engine, and every task are built in-house. A dependency-policy test fails CI if a new direct root or Rayon appears.
-2. **Correctness outranks speed, always.** The parity ladder gates every kernel; a faster kernel that drifts decoded tokens is reverted, no source landed, and recorded in the negative-evidence ledger. Speed ships *on top of* parity, never instead of it.
+1. **The dependency universe is closed.** `std`, the pinned nightly, pinned FrankenSuite foundations ([frankentorch](https://github.com/Dicklesworthstone/frankentorch) serial/range leaf kernels; [asupersync](https://github.com/Dicklesworthstone/asupersync) as the execution foundation for orchestration, cancellation, budgets, CPU-team ownership, and the one network path `fnlp pull`; optional [frankensqlite](https://github.com/Dicklesworthstone/frankensqlite) for metadata/job state), plus exactly three commodity families: `clap`, `serde`/`serde_json`, `sha2`. The release graph contains no Rayon; the tokenizer, chat template, grammar engine, and every task are built in-house. A dependency-policy test fails CI if a new direct root or Rayon appears.
+2. **Correctness outranks speed, always.** The parity ladder gates every kernel; a faster backend that violates the same-recipe scalar comparison contract or changes its greedy tokens is reverted, no source landed, and recorded in the negative-evidence ledger. Integer stages are exact; floating stages carry named metric/tolerance contracts. Deliberate quantization-vs-bf16 changes face separate logit/token/task gates. Speed ships on top of named semantics, never instead of them.
 3. **Valid-by-construction output has the same rank.** A constrained-decode change that could emit schema-invalid JSON is reverted like a parity break. There is no "retry on parse failure" anywhere in the engine, by law.
 4. **The loop is the architecture.** Never size or schedule as a conventional 22-layer model: it is 44 layer executions, 44 KV slots (176 KiB/token bf16), and two post-loop norm states, everywhere, pinned against the reference source before any kernel existed.
 5. **Determinism is scoped, not hand-waved.** Semantic, byte, batch, and prefix claims each name their numerics/order/telemetry conditions. Approximate math never inherits the exact profile's promise.
 6. **Measured-faster wins; width is not routing.** Apple candidates (autovec/SDOT/SMMLA) are benchmarked per shape; Zen 4's double-pumped AVX-512 is measured separately from Zen 5's native datapath; AVX2 ships two exact constructions and the raw saturating shortcut is banned outright.
-7. **Honesty is enforced, not aspired to.** Every accepted numeric divergence lives in `docs/DISCREPANCIES.md` with a kill-switch; every rejected optimization in `docs/NEGATIVE_EVIDENCE.md`; benchmark comparisons are thread/allocator/precision-fair against the strongest real baseline with slower rows published; task-quality claims name their dataset, prompt hash, recipe id, and thinking mode.
+7. **Honesty is enforced, not aspired to.** Every accepted numeric divergence lives in `docs/DISCREPANCIES.md` with a rollback path that actually exists (a kernel selector, a CLI option, or activation of a prior immutable artifact); every rejected optimization in `docs/NEGATIVE_EVIDENCE.md`; benchmark comparisons are thread/allocator/precision-fair against the strongest real baseline with slower rows published; task-quality claims name their dataset, prompt hash, recipe id, and thinking mode.
 8. **Trust boundaries name exactly what they prove.** Typed document encoding prevents control-token smuggling, not instruction-shaped steering (measured per task). A same-model verifier is correlated evidence, not proof. A corpus audit's claim stays scoped to its frozen population and human grades.
 
 ---
@@ -152,9 +153,9 @@ These are the constitutional, non-negotiable constraints the whole system is bui
    ── process-shared asupersync resources · optional metadata-only fsqlite
 ```
 
-- **Foundry:** the weight pipeline. `fnlp convert` loads the pinned bf16 shards, census-checks all 201 tensors, quantizes in staged kill-switched steps (MLP int8 → attention int8 → lm_head int8 → int4 by measured allocation), embeds the tokenizer, template, config, and the Apache-2.0 license bundle, and emits the canonical Generic `.fnlpq`. Releases certify cross-OS/ISA digest identity or explicitly name the canonical publisher target and narrower local-reproduction claim. They ship fixed 1,957,046,720-byte chunks with per-part and whole SHA-256 plus GitHub attestations over the binary and manifest/receipt closure; `fnlp pull` streams, verifies, derives the measured host-native packing, and activates atomically. Installers delegate to that one Rust artifact manager: shell scripts never touch model bytes.
+- **Foundry:** the weight pipeline. `fnlp convert` loads the pinned bf16 shards, census-checks all 201 tensors, quantizes through staged immutable recipes (`int8-mlp`, then `int8-mlp-attn`, then `int8-all`, then int4 by measured allocation), each stage its own parity-gated content-addressed artifact, embeds the tokenizer, template, config, and the Apache-2.0 license bundle, and emits the canonical Generic `.fnlpq`. Releases certify cross-OS/ISA digest identity or explicitly name the canonical publisher target and narrower local-reproduction claim. They ship fixed 1,957,046,720-byte chunks with per-part and whole SHA-256 plus GitHub attestations over the binary and manifest/receipt closure; `fnlp pull` streams, verifies, derives the measured host-native packing, and activates atomically. Installers delegate to that one Rust artifact manager: shell scripts never touch model bytes.
 - **Ouroboros:** the model core, named for what it is: the snake that runs its own layers twice. The loop schedule is explicit (per-`(layer, loop)` KV binding resolved at engine build; final RMSNorm after each pass; two shared weight streams per token, never 2M), attention is GQA 48:8 at head_dim 128 (explicitly 128; the config overrides the Llama fallback of 64, and the whole engine is built on that fact), KV lives in lazily-allocated copy-on-write pages under a byte-certified admission budget, and the lm_head has two personalities: full 166K-row GEMV fused with argmax for generation, and sliced/trie-scored rows for finite-candidate tasks.
-- **Conveyor:** the throughput fabric. One process `EngineResources` host gives every engine the same asupersync admission domain and aggregate memory ledger, so ten embedded engines cannot create ten compute teams or each promise the same RAM. An admitted run crosses `Cx::spawn_blocking` once, then one `Cx::scoped_cpu` team spans the whole request or bounded batch epoch and checkpoints at tile/morsel boundaries; leaf kernels never spawn and the release graph contains no Rayon. Each engine step executes layer-major across all compatible rows, so each physical layer's weights stream **once per loop for the whole batch**; long prefills are chunked into fair morsels; the prefix cache forks shipped task prompts copy-on-write (user-content caching is explicit opt-in, namespace-isolated). `fnlp batch` wraps it in a bounded NDJSON daemon; `fnlp job` adds durable, content-addressed corpus runs whose cache authority follows declared dependency scope: item-local results reuse exactly; corpus-global results (entity clusters, reduce outputs) rerun when the snapshot changes.
+- **Conveyor:** the throughput fabric. One process `EngineResources` host gives every engine the same asupersync admission domain and aggregate memory ledger, so ten embedded engines cannot create ten compute teams or each promise the same RAM. An admitted run crosses a proved real `Cx::spawn_blocking` pool boundary (never its inline lab fallback), then one `Cx::scoped_cpu` team spans the whole request or bounded batch epoch and checkpoints at tile/morsel boundaries; leaf kernels never spawn and the release graph contains no Rayon. Because blocking work is cooperative rather than preemptible, its closure retains the admission/memory/output guards until the team has actually joined, even if cancellation reached the wrapper first. Each engine step executes layer-major across all compatible rows, so each physical layer's weights stream **once per loop for the whole batch**; long prefills are chunked into fair morsels; the prefix cache forks shipped task prompts copy-on-write (user-content caching is explicit opt-in, namespace-isolated). `fnlp batch` wraps it in a bounded NDJSON daemon; `fnlp job` adds durable, content-addressed corpus runs whose cache authority follows declared dependency scope: item-local results reuse exactly; corpus-global results (entity clusters, reduce outputs) rerun when the snapshot changes.
 - **Stencil:** the constrained execution compiler. The supported JSON-Schema subset (plus the `verbatim` source language) compiles to a bounded automaton whose per-state execution primitive is chosen exactly: full projection, every-legal-row sparse projection, forced-token causal feeding, or source-copy. No heuristic ever drops a legal token. EOS only at accept states; unsatisfiable/budget/cancel returns a typed no-result.
 - **Lexicon:** the text boundary. A pure-Rust SentencePiece BPE implementation (token-id-exact against the reference slow tokenizer; embedded in the binary so `fnlp tokens`/`split` and schema compilation work before any model is installed) and a typed chat-template builder for the pinned `<|im_start|>`/`<think>` template with thinking/tool modes. Only trusted template code can emit control ids; untrusted document bytes are encoded through a path that preserves them exactly while excluding every role/think/tool token.
 - **Atelier:** the task layer. Twelve tasks compile through one bounded internal `TaskIR` (exact prompt segments, decode strategy, grammar, budgets, dependency scope); presets are data with hashed, versioned prompts; per-task calibration keeps stated confidences honest; a map-reduce spine handles over-context documents. A public data-only recipe format opens once built-in equivalence and no-code/no-network gates pass.
@@ -175,11 +176,11 @@ Every task is available one-shot, as `--json`, and through the batch daemon; tas
 | `fnlp classify --labels …` | Zero-shot single/multi-label with calibrated probabilities; large taxonomies compile to exact continuation tries | prefill-only, sliced/trie |
 | `fnlp judge` | Rubric scoring, RAG faithfulness (`entailed/contradicted/unsupported` + evidence), order-debiased pairwise preference | mixed |
 | `fnlp redact` | PII detection (LLM ∪ rule detectors) + masking/pseudonymization, offset-exact, optional reversible map, `--verify` residual scan | constrained + rules |
-| `fnlp summarize` | Length/style presets, `--grounded` span evidence, map-reduce over long docs | free text |
+| `fnlp summarize` | Length/style presets, `--cited` byte-verified span evidence, map-reduce over long docs | free text |
 | `fnlp keyphrases` | Ranked, source-anchored keyphrases | constrained list |
 | `fnlp answer` | Context-grounded QA with span citations and **calibrated abstention** | constrained + free |
-| `fnlp generate` / `chat` | Completion/chat: bounded thinking, XML/JSON tool calls (parsed, never executed), `--seed`, streaming | free |
-| `fnlp tokens` / `split` | Non-LLM, no-model-load utilities: exact token counts for *this* tokenizer and conservative byte-span-preserving sentence/chunk splitting, with speed/language coverage measured rather than assumed | n/a |
+| `fnlp generate` / `chat` | Completion/chat: greedy product default; explicit `--sample --preset nanbeige`, bounded thinking, XML/JSON tool calls (parsed, never executed), addressable `--seed`, streaming | free |
+| `fnlp tokens` / `split` / `normalize` | Non-LLM, no-model-load utilities: exact token counts, conservative byte-span-preserving splitting, and the deliberately narrow CRLF/ASCII-whitespace normalization contract; speed/language coverage measured rather than assumed | n/a |
 
 **Deliberate non-goals:** POS tagging, dependency parsing, lemmatization (specialized classical tools are usually the right cost/latency choice; keep spaCy for that slice); embeddings (that's [frankensearch](https://github.com/Dicklesworthstone/frankensearch)'s job; `fnlp` interoperates over shared NDJSON conventions); training/fine-tuning; a model zoo.
 
@@ -195,8 +196,8 @@ Honest framing. `fnlp` is deliberately built as an NLP *product* around this spe
 | Valid-JSON guarantee | **By construction** (+ source-grounded fields) | GBNF (generic, DIY) | DIY constrained decoding/validation | n/a | Vendor JSON modes |
 | Corpus engine | **Layer-major batching + prefix cache + durable resumable jobs** | Server mode (generic) | DIY | Excellent (shallow tasks) | Rate-limited, $ |
 | Loop-aware execution | **Model-specific kernels + task fusion** | Native model support in a general runtime | Reference model code | n/a | n/a |
-| Verified offsets / calibrated confidence | **Yes** | No | DIY | Partial | No |
-| Reads for meaning | Yes (3B-class reasoning) | Yes | Yes | No | Yes |
+| Source-grounded offsets / calibrated confidence | **Task-scoped and scorecard-gated** | No | DIY | Offsets yes; calibration varies | Vendor-specific |
+| Semantic reasoning | Yes (3B-class, task-evaluated) | Yes | Yes | Statistical/transformer pipeline-dependent | Yes |
 | Default data path | Local/offline after pull | Local | Local | Local | Submitted to provider |
 
 ## The `fnlp` CLI
@@ -227,6 +228,7 @@ fnlp models activate nanbeige-int4-v2 --qualification qualification.json
 # Model artifacts
 fnlp pull                            # streamed, verified, atomically activated
 fnlp convert --source /path/to/pinned-snapshot -o model.fnlpq --quant int8 --arch generic
+fnlp models derive --arch auto       # disposable content-addressed host packing
 fnlp models                          # installed artifacts, recipes, digests, active state
 
 # Agent & ops surfaces
@@ -286,15 +288,15 @@ The CLI snapshots environment into its builder; the library uses explicit builde
 | Env | Default | Meaning |
 |---|---|---|
 | `FNLP_MODEL_DIR` | platform cache path above | artifact search/install root |
-| `FNLP_THREADS` | measured table | shared kernel-pool cap (direct sweep, not extrapolation) |
+| `FNLP_THREADS` | measured table | process asupersync compute-team cap (direct sweep, not extrapolation) |
 | `FNLP_CTX` | `8192` | per-sequence cap; KV pages allocate lazily |
-| `FNLP_MEMORY_BUDGET` | host-derived, printed | hard admission budget across KV/scratch/cache/output |
+| `FNLP_MEMORY_BUDGET` | safely host-derived or required explicitly | process-aggregate admission budget across weights/KV/scratch/cache/output; never guessed when cgroup/job-object-aware authority is unavailable |
 | `FNLP_BATCH` | `1` (CLI) / auto (daemon) | max in-flight sequences for Conveyor |
 | `FNLP_QUANT` | best installed | artifact selection (int8 / int4) |
 | `FNLP_FORCE_ARCH` | auto | pin an ISA tier for proof/bench runs (selftest first) |
-| `FNLP_NUMA` | measured/portable | bind-local / replicate / interleave; admission prices the choice |
+| `FNLP_NUMA` | portable | bind-local / replicate / interleave only through a ratified safe FrankenSuite placement surface; unsupported modes reject, and admission prices replication |
 | `FNLP_MMAP` | off | opt-in read-only weight mmap (audited island) |
-| `FNLP_KV_INT8`, `FNLP_INT8_ATTN`, `FNLP_INT8_LMHEAD` | off / per-recipe | staged-quantization kill-switches |
+| `FNLP_KV_INT8` | off | runtime KV-cache quantization toggle (weight precision is a property of the installed artifact recipe, selected with `fnlp models activate`, never an env var) |
 
 ## Performance
 
@@ -302,10 +304,10 @@ Every number below is a provisional gate, **TARGETED rather than OBSERVED: no Fr
 
 | Gate | Requirement |
 |---|---|
-| PG-0 · Execution ownership | One admitted asupersync `scoped_cpu` team per request/batch epoch; exact coordinator/child cap; bounded checkpoints; disconnect-safe cancel/panic join; no per-op thread creation or Rayon; one-time host config and aggregate multi-engine memory reservations proven |
-| PG-1 · Fidelity | L0 exact; full L1 metric vectors; all 44 layer + two loop-norm L2 states; f32 L4 greedy exact where the oracle is reproducible |
+| PG-0 · Execution ownership | One admitted asupersync `scoped_cpu` team per request/bounded batch epoch; exact coordinator/child cap; team formed and spawn-sealed before work release; no post-start/latch spawn; bounded checkpoints; disconnect-safe cancel/panic join; closure-owned leases until actual completion; no per-op thread creation or Rayon; one-time host config and aggregate multi-engine memory reservations proven |
+| PG-1 · Fidelity | L0 exact; full L1 metric vectors; all 44 layer + two loop-norm L2 states; same-recipe integer stages exact, floating stages within named tolerances, and greedy tokens exact; f32 L4 exact where HF is reproducible; quantized-vs-bf16 agreement explicitly measured |
 | PG-2 · Integer kernels | Scalar/SDOT/SMMLA/AVX2/VNNI accumulators exactly equal i64, including full-domain extremes and every tail |
-| PG-3 · Decode (R1) | Meet/beat official llama.cpp at matched quant on every M4/M5/Zen host for which a claim is published |
+| PG-3 · Decode (R1) | Meet/beat official llama.cpp against nearest format peers (our int8 vs its Q8_0 class) on every M4/M5/Zen host for which a claim is published |
 | PG-4 · Corpus (R2/R3) | Meet/beat official llama.cpp's completion engine under identical prompts, with grammar/prefix/task-layer gains attributed separately |
 | PG-5 · Structural levers | Batch, prefix, sliced/trie lm_head, forced runs, paging, jobs, NUMA: each gets an isolated baseline curve; no invented multipliers before profiles |
 | PG-6 · Tails & resources | p50/p95/p99, peak RSS, admitted/rejected bytes, energy where available, cancellation/fairness under load |
@@ -338,8 +340,11 @@ A few honest boundaries:
 - **Durable does not make stdout exactly-once.** One canonical committed record per item holds when `fnlp job` owns its checksummed spool/materialization; an arbitrary downstream pipe gets stable ids and documented at-least-once replay.
 - **Unchanged input does not imply unchanged corpus-global output.** Item-local results reuse exactly; entity clusters and reduce steps rerun when the snapshot's child set changes, and cluster ids are snapshot-qualified.
 - **Thinking mode trades latency for measured benefit.** Structured tasks default it off until a locked scorecard justifies otherwise; thinking always has hard time/token bounds.
+- **The product generation default intentionally differs from upstream.** Nanbeige's generation config samples at temperature 0.6/top-k 20/top-p 0.95; `fnlp` defaults to greedy for reproducibility. `--sample --preset nanbeige` opts into that recipe, and receipts record the effective 256-bit seed.
+- **Cancellation is cooperative.** Asupersync owns and drains the scoped CPU team; the engine never reuses its buffers or memory lease merely because a wrapper task reported cancellation. A stuck kernel that fails to checkpoint is a bug, not something safe Rust can forcibly preempt.
+- **Process admission bounds FrankenNLP, not every other program.** The aggregate ledger prevents this process's engines from each promising the same RAM; it cannot stop unrelated processes from consuming memory after admission.
 - **Multilingual quality is measured before it is marketed.** `translate` stays out of the portfolio until honest evals justify it (Phase 7).
-- **No GPU.** CPU is the product. Metal via `ft-kernel-metal` is a Phase 7 experiment gated on the CPU product being finished; CUDA is out of scope entirely.
+- **No GPU required.** CPU is the reference implementation and the portable floor; every task runs at full fidelity on CPU alone. The Apple integrated GPU (Metal via `ft-kernel-metal`) is a planned M4/M5 acceleration layer that lands after the CPU core is parity-proven, under its own named numerics profile; CUDA is out of scope entirely.
 
 ## FAQ
 
@@ -347,13 +352,13 @@ A few honest boundaries:
 
 **Why one model instead of a zoo?** Because the entire premise is specialization: compile-time shapes, a hand-scheduled loop, per-arch weight packing, prompts and calibration evaluated against one set of weights. Every generality knob added back spends performance and verifiability. franken_ocr proved this shape ships; `fnlp` inherits it.
 
-**Why not just use llama.cpp?** Official upstream now runs Nanbeige4.2-3B and is our strongest maintained CPU/GGUF baseline. It is a general inference runtime rather than this project's complete NLP product: `fnlp` adds the schema/source execution compiler, task presets and scorecards, calibrated/abstaining surfaces, layer-major corpus paths, and digest-scoped durable jobs. We benchmark against official upstream honestly (same prompts, matched quant class, thread-fair) and publish the rows where it wins.
+**Why not just use llama.cpp?** Official upstream now runs Nanbeige4.2-3B and is our strongest maintained CPU/GGUF baseline. It is a general inference runtime rather than this project's complete NLP product: `fnlp` adds the schema/source execution compiler, task presets and scorecards, calibrated/abstaining surfaces, layer-major corpus paths, and digest-scoped durable jobs. We benchmark against official upstream honestly (same prompts, nearest format class since Q8_0 and our int8 are not bit-equivalent, thread-fair) and publish the rows where it wins.
 
 **Why is a 3B model worth trying for real NLP work?** Many tasks are extraction/scoring-shaped rather than open-ended, and this checkpoint performs 44 effective layer executions in a 3.149B non-embedding footprint. Its model card reports SWE-Bench Verified 63.6 and GPQA-Diamond 87.4, but those benchmarks do not prove NER, extraction, sentiment, or calibration quality. Our locked task scorecards, not the card, decide which capabilities ship as supported.
 
 **What do "valid by construction" and "grounded by construction" actually mean?** At every decode step, Stencil executes only grammar-legal choices: invalid JSON is unrepresentable rather than detected and retried. For a `verbatim` field, the logical unescaped bytes must also traverse a bounded substring language over the source document, so off-source text is equally unrepresentable. That proves syntax and source membership; choosing the *right* fact is what the scorecards measure.
 
-**Where do the quantized weights come from, and why should I trust them?** `fnlp convert` transforms the exact pinned bf16 snapshot under a versioned canonical recipe. The release either certifies one Generic digest across supported targets or names its canonical publisher target and narrower local-reproduction scope. SHA-256 then proves that downloaded bytes match that manifest; it does not identify the publisher, so GitHub attestations bind the released binaries and manifest/receipt closure to the project workflow. The weights are Apache-2.0 (© 2026 Nanbeige Team); every artifact/release carries the license, attribution, and modification notice, and `fnlp pull` verifies part, whole, source, license, and census identities before crash-safe atomic activation.
+**Where do the quantized weights come from, and why should I trust them?** `fnlp convert` transforms the exact pinned bf16 snapshot under a versioned canonical recipe. The release either certifies one Generic digest across supported targets or names its canonical publisher target and narrower local-reproduction scope. SHA-256 then proves that downloaded bytes match that manifest; it does not identify the publisher, so GitHub attestations bind the released binaries and manifest/receipt closure to the project workflow. The weights are Apache-2.0 as declared by the pinned model card; every artifact and release carries the license text, factual attribution, and modification notice, and `fnlp pull` verifies part, whole, source, license, and census identities before crash-safe atomic activation.
 
 **How does this relate to frankensearch?** Cleanly: frankensearch owns embeddings/retrieval; `fnlp` owns generation-adjacent NLP (extraction, scoring, judging, redaction). A RAG pipeline retrieves with frankensearch and verifies with `fnlp judge --faithfulness`; the two meet over NDJSON.
 
@@ -367,7 +372,7 @@ Please don't take this the wrong way, but I do not accept outside contributions 
 
 The `franken_nlp` source code is licensed under the **MIT License with an OpenAI/Anthropic Rider**, Copyright (c) 2026 Jeffrey Emanuel (see [`LICENSE`](./LICENSE)). The rider withholds all rights from OpenAI, Anthropic, their affiliates, and anyone acting on their behalf, including any use of the software or derivative works in a machine-learning dataset, training corpus, evaluation harness, or pipeline. In any conflict between the rider and the rest of the license, the rider controls.
 
-The **Nanbeige4.2-3B model weights**, and every transformed `.fnlpq` derivative this project distributes, are **Apache-2.0, Copyright (c) 2026 Nanbeige Team**, as declared by the official model card at the pinned revision, independent of the rider. Every artifact, release manifest, and `fnlp --version` carries the license text, attribution, and modification notice; the LICENSE file's third-party section states the same.
+The **Nanbeige4.2-3B model weights**, and every transformed `.fnlpq` derivative this project distributes, are **Apache-2.0** as declared by the official model card at the pinned revision, independent of the rider. Every artifact and release carries the license text, the factual attribution (model origin, pinned revision, author attribution per the pinned card: Nanbeige Team), and a modification notice; `fnlp licenses` prints the complete bundle, `fnlp --version` carries the one-line attribution, and the LICENSE file's third-party section states the same.
 
 ## See also
 
