@@ -7,6 +7,7 @@ import argparse
 import copy
 import hashlib
 import json
+import math
 import re
 import sys
 import tempfile
@@ -335,7 +336,12 @@ def require_positive_int(value: Any, *, location: str) -> int:
 
 
 def require_positive_number(value: Any, *, location: str) -> int | float:
-    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value <= 0
+    ):
         raise ClaimsError(f"expected positive number at {location}: observed={value!r}")
     return value
 
@@ -915,6 +921,12 @@ def run_self_test(root: Path, claims: dict[str, dict[str, Any]]) -> None:
         raise ClaimsError("self-test R4 context quantity above default was not recognized")
     if context_amount_exceeds_default("Observed model limit: 262,144 positions"):
         raise ClaimsError("self-test observed model limit was treated as a practicality claim")
+    for nonfinite in (float("nan"), float("inf"), float("-inf")):
+        try:
+            require_positive_number(nonfinite, location="self-test/nonfinite")
+        except ClaimsError:
+            continue
+        raise ClaimsError(f"self-test non-finite R4 receipt value was accepted value={nonfinite!r}")
 
     hostile_cases, _ = load_json(fixtures / "r4_context_hostile.json")
     for case in hostile_cases["cases"]:
