@@ -107,16 +107,15 @@ def installed_packages(python: Path | None = None) -> dict[str, str]:
     if python is None:
         distributions = importlib.metadata.distributions()
         return {canonical_name(dist.metadata["Name"]): dist.version for dist in distributions}
-    completed = run([str(python), "-m", "pip", "freeze", "--all"], "pip_freeze")
+    # pip list --format=json reports every installed distribution with its
+    # version regardless of install source; pip freeze emits "name @ url" for
+    # URL-pinned installs, which a name==version parser misreads as missing.
+    completed = run([str(python), "-m", "pip", "list", "--format=json"], "pip_list")
     if completed.returncode != 0:
-        raise OracleFailure("pip freeze failed")
+        raise OracleFailure("pip list failed")
     package_map: dict[str, str] = {}
-    for raw_line in completed.stdout.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "==" not in line:
-            continue
-        name, version = line.split("==", 1)
-        package_map[canonical_name(name)] = version
+    for entry in json.loads(completed.stdout):
+        package_map[canonical_name(entry["name"])] = entry["version"]
     return package_map
 
 
@@ -221,7 +220,10 @@ def recreate(record: dict[str, Any], target: Path) -> None:
     if not target.parent.is_dir():
         raise OracleFailure(f"venv parent does not exist: {target.parent}")
     log("recreate_start", venv=str(target), lock=str(LOCK_PATH))
-    venv.EnvBuilder(with_pip=True, clear=False, symlinks=False).create(target)
+    # symlinks=True: relocatable CPython builds (uv/python-build-standalone) break
+    # when the interpreter binary is copied out of its install tree; the closure's
+    # integrity is carried by the hash-verified package freeze, not the binary.
+    venv.EnvBuilder(with_pip=True, clear=False, symlinks=True).create(target)
     python = venv_python(target)
     install = run(
         [
