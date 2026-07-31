@@ -23,7 +23,11 @@ a FrankenNLP measurement.
   `R2-corpus-scoring`, `R3-corpus-generation`, or `R4-long-context`.
 - `Host fingerprint`
 - `Artifact recipe + packing + kernel table + load mode`
+- `Context point` — exact `tokens=<positive>; kv_dtype=<name>` for a measured
+  R4 row, bound to both typed receipts.
 - `p50/p95/p99`
+- `R4 measurement summary` — exact KV and peak-RSS byte terms from the typed
+  measurement receipt.
 - `Fairness controls` — thread count, allocator, precision, warmup, and any
   additional control required to compare candidates.
 - `Admission boundary outcomes` — the named accepted/rejected long-context
@@ -51,7 +55,9 @@ No local performance campaign has been measured at scaffold time.
 - Regime: `R1-latency-generate`
 - Host fingerprint: `pending: no host measurement`
 - Artifact recipe + packing + kernel table + load mode: `pending: no artifact`
+- Context point: `n/a: this R1 decode candidate does not measure an R4 context point`
 - p50/p95/p99: `pending: no measurement`
+- R4 measurement summary: `n/a: this R1 decode candidate has no R4 measurement receipt`
 - Fairness controls: `pending: same artifact, numerics profile, thread cap, and
   thermal state are required before promotion`
 - Admission boundary outcomes: `n/a: this R1 decode candidate does not measure R4 admission`
@@ -78,7 +84,9 @@ removed merely because the unfused path remains selected.
 - Regime: R4-long-context
 - Host fingerprint: pending: no host measurement
 - Artifact recipe + packing + kernel table + load mode: pending: no runnable artifact or packing set
+- Context point: pending: no admitted R4 context point has been selected
 - p50/p95/p99: pending: p50=pending; p95=pending; p99=pending; no measurement
+- R4 measurement summary: pending: no R4 measurement receipt has been retained
 - Fairness controls: blocked: select every context point from the future admission certificate, then match oracle and official-baseline prompt, precision, thread, load-mode, warmup, and thermal controls
 - Admission boundary outcomes: pending: no admitted/rejected boundary receipt has been retained
 - Bandwidth denominator: measured-dram-bytes
