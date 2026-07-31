@@ -121,6 +121,52 @@ pub enum PackageError {
     Arithmetic(&'static str),
 }
 
+/// Return the exact number of fixed-size v1 release parts for an artifact.
+///
+/// This is a non-mutating preflight surface used by release tooling and the
+/// integration harness.  It applies the same 64-part cap as [`package_model`]
+/// before any file is opened or staging directory is created.
+pub fn release_part_count(artifact_bytes: u64) -> Result<usize, PackageError> {
+    let count = expected_part_count(artifact_bytes, RELEASE_PART_BYTES)?;
+    if count > MAX_RELEASE_PARTS {
+        return Err(PackageError::Integrity {
+            member: "release part layout".to_owned(),
+            detail: format!("part count {count} exceeds v1 cap {MAX_RELEASE_PARTS}"),
+        });
+    }
+    Ok(count)
+}
+
+/// Return the exact length of one ordered v1 release part.
+///
+/// All non-final parts are exactly [`RELEASE_PART_BYTES`]; only the final part
+/// may be shorter.  An index outside the preflight layout rejects explicitly.
+pub fn release_part_len(artifact_bytes: u64, index: usize) -> Result<u64, PackageError> {
+    let part_count = release_part_count(artifact_bytes)?;
+    if index >= part_count {
+        return Err(PackageError::Integrity {
+            member: "release part layout".to_owned(),
+            detail: format!("part index {index} is outside part count {part_count}"),
+        });
+    }
+    let prefix = RELEASE_PART_BYTES
+        .checked_mul(u64::try_from(index).map_err(|_| PackageError::Arithmetic("part index"))?)
+        .ok_or(PackageError::Arithmetic("part prefix bytes"))?;
+    let remaining = artifact_bytes
+        .checked_sub(prefix)
+        .ok_or(PackageError::Arithmetic("part remaining bytes"))?;
+    Ok(remaining.min(RELEASE_PART_BYTES))
+}
+
+/// Return the canonical zero-padded v1 filename for one release part.
+pub fn release_part_name(
+    logical_artifact_name: &str,
+    index: usize,
+) -> Result<String, PackageError> {
+    validate_logical_name(logical_artifact_name)?;
+    part_name(logical_artifact_name, index)
+}
+
 impl fmt::Display for PackageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -259,7 +305,6 @@ fn package_model_with_part_bytes(
         &request.artifact,
         &request.staging_dir,
         &request.logical_artifact_name,
-        part_bytes,
     )?;
     let conversion_receipt = copy_digest_bound_file(
         &request.conversion_receipt,
@@ -311,17 +356,10 @@ fn split_artifact(
     source_path: &Path,
     staging_dir: &Path,
     logical_name: &str,
-    part_bytes: u64,
 ) -> Result<(u64, Vec<PackageFile>, String), PackageError> {
     let metadata = metadata_regular_file(source_path)?;
     let artifact_bytes = metadata.len();
-    let expected_parts = expected_part_count(artifact_bytes, part_bytes)?;
-    if expected_parts > MAX_RELEASE_PARTS {
-        return Err(PackageError::Integrity {
-            member: source_path.display().to_string(),
-            detail: format!("part count {expected_parts} exceeds v1 cap {MAX_RELEASE_PARTS}"),
-        });
-    }
+    let expected_parts = release_part_count(artifact_bytes)?;
 
     let source = File::open(source_path).map_err(|source| PackageError::Io {
         operation: "open source artifact",
@@ -332,11 +370,10 @@ fn split_artifact(
     let mut whole_hasher = Sha256::new();
     let mut buffer = [0_u8; COPY_BUFFER_BYTES];
     let mut parts = Vec::with_capacity(expected_parts);
-    let mut remaining_file = artifact_bytes;
 
     for index in 0..expected_parts {
-        let part_len = remaining_file.min(part_bytes);
-        let name = part_name(logical_name, index)?;
+        let part_len = release_part_len(artifact_bytes, index)?;
+        let name = release_part_name(logical_name, index)?;
         let path = staging_dir.join(&name);
         let destination = create_new_file(&path)?;
         let mut writer = BufWriter::with_capacity(COPY_BUFFER_BYTES, destination);
@@ -378,9 +415,6 @@ fn split_artifact(
             bytes: part_len,
             sha256: hex_digest(part_hasher.finalize()),
         });
-        remaining_file = remaining_file
-            .checked_sub(part_len)
-            .ok_or(PackageError::Arithmetic("artifact remaining"))?;
     }
     let mut trailing = [0_u8; 1];
     if reader
@@ -610,7 +644,7 @@ fn validate_receipt_shape(receipt: &ModelAssetReceipt) -> Result<(), PackageErro
         });
     }
     validate_digest(&receipt.fnlpq_file_sha256, RECEIPT_FILE)?;
-    let expected_parts = expected_part_count(receipt.artifact_bytes, receipt.part_bytes)?;
+    let expected_parts = release_part_count(receipt.artifact_bytes)?;
     if receipt.parts.len() != expected_parts || receipt.parts.len() > MAX_RELEASE_PARTS {
         return Err(PackageError::Integrity {
             member: RECEIPT_FILE.to_owned(),
@@ -622,26 +656,14 @@ fn validate_receipt_shape(receipt: &ModelAssetReceipt) -> Result<(), PackageErro
     }
     for (index, part) in receipt.parts.iter().enumerate() {
         validate_record(part)?;
-        let expected_name = part_name(&receipt.logical_artifact_name, index)?;
+        let expected_name = release_part_name(&receipt.logical_artifact_name, index)?;
         if part.name != expected_name {
             return Err(PackageError::Integrity {
                 member: part.name.clone(),
                 detail: format!("expected ordered part name {expected_name}"),
             });
         }
-        let expected_len = (if index + 1 == receipt.parts.len() {
-            receipt.artifact_bytes.checked_sub(
-                receipt
-                    .part_bytes
-                    .checked_mul(
-                        u64::try_from(index).map_err(|_| PackageError::Arithmetic("part index"))?,
-                    )
-                    .ok_or(PackageError::Arithmetic("part prefix bytes"))?,
-            )
-        } else {
-            Some(receipt.part_bytes)
-        })
-        .ok_or(PackageError::Arithmetic("part final bytes"))?;
+        let expected_len = release_part_len(receipt.artifact_bytes, index)?;
         if part.bytes != expected_len || (expected_len == 0 && !receipt.parts.is_empty()) {
             return Err(PackageError::Integrity {
                 member: part.name.clone(),
@@ -748,6 +770,18 @@ fn ensure_exact_inventory(
         observed.insert(file_name(&path)?);
     }
     if &observed != expected {
+        if let Some(missing) = expected.difference(&observed).next() {
+            return Err(PackageError::Integrity {
+                member: missing.clone(),
+                detail: "expected package member is missing or renamed".to_owned(),
+            });
+        }
+        if let Some(unexpected) = observed.difference(expected).next() {
+            return Err(PackageError::Integrity {
+                member: unexpected.clone(),
+                detail: "unexpected package member is present".to_owned(),
+            });
+        }
         return Err(PackageError::Integrity {
             member: "package inventory".to_owned(),
             detail: format!("expected={expected:?} observed={observed:?}"),
@@ -1011,8 +1045,8 @@ fn hex_digest(digest: impl AsRef<[u8]>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        expected_part_count, part_name, reconstruction_text, validate_logical_name, PackageError,
-        PackageFile, RELEASE_PART_BYTES,
+        PackageError, PackageFile, RELEASE_PART_BYTES, expected_part_count, part_name,
+        reconstruction_text, validate_logical_name,
     };
 
     #[test]
