@@ -1,0 +1,16 @@
+{
+  "items": [
+    {"adr_id": "G0-01", "adr_path": "ADR-G0-01-https-range.md", "g0_item": {"name": "HTTPS/range matrix", "probe": 1}, "owner_bead": "franken_nlp-upv", "status": "BLOCKED"},
+    {"adr_id": "G0-02", "adr_path": "ADR-G0-02-blocking-seam.md", "g0_item": {"name": "spawn_blocking scoped_cpu seam", "probe": 2}, "owner_bead": "franken_nlp-upv", "status": "BLOCKED"},
+    {"adr_id": "G0-03", "adr_path": "ADR-G0-03-resource-broker.md", "g0_item": {"name": "EngineResources broker", "probe": 3}, "owner_bead": "franken_nlp-upv", "status": "BLOCKED"},
+    {"adr_id": "G0-04", "adr_path": "ADR-G0-04-tokenizer-template.md", "g0_item": {"name": "tokenizer template spike", "probe": 4}, "owner_bead": "franken_nlp-o2y", "status": "BLOCKED"},
+    {"adr_id": "G0-05", "adr_path": "ADR-G0-05-loop-boundary.md", "g0_item": {"name": "loop boundary scalar fixture", "probe": 5}, "owner_bead": "franken_nlp-o2y", "status": "BLOCKED"},
+    {"adr_id": "G0-06", "adr_path": "ADR-G0-06-mask-projection.md", "g0_item": {"name": "mask projection memory", "probe": 6}, "owner_bead": "franken_nlp-o2y", "status": "BLOCKED"},
+    {"adr_id": "G0-07", "adr_path": "ADR-G0-07-reduction-order.md", "g0_item": {"name": "reduction-order invariance", "probe": 7}, "owner_bead": "franken_nlp-o2y", "status": "BLOCKED"},
+    {"adr_id": "G0-08", "adr_path": "ADR-G0-08-converter-rss.md", "g0_item": {"name": "converter range RSS", "probe": 8}, "owner_bead": "franken_nlp-o2y", "status": "BLOCKED"},
+    {"adr_id": "G0-09", "adr_path": "ADR-G0-09-model-root-crash.md", "g0_item": {"name": "model-root crash semantics", "probe": 9}, "owner_bead": "franken_nlp-upv", "status": "BLOCKED"},
+    {"adr_id": "G0-10", "adr_path": "ADR-G0-10-avx2-exact.md", "g0_item": {"name": "Zen-3 AVX2 exactness", "probe": 10}, "owner_bead": "franken_nlp-o2y", "status": "BLOCKED"},
+    {"adr_id": "G0-11", "adr_path": "ADR-G0-11-asupersync-census.md", "g0_item": {"name": "asupersync leverage census", "probe": 11}, "owner_bead": "franken_nlp-idt", "status": "BLOCKED"}
+  ],
+  "schema_version": 1
+}
