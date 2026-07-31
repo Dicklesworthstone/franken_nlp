@@ -20,6 +20,9 @@ CATALOG=
 CHECK_ONLY=0
 ALLOW_UNTRUSTED=0
 TEST_BASE=
+TEST_REDIRECT_POLICY=${FNLP_FETCH_ALLOW_TEST_REDIRECT_POLICY:-}
+TEST_CURL_CONNECT_TO_1=${FNLP_FETCH_TEST_CONNECT_TO_1:-}
+TEST_CURL_CONNECT_TO_2=${FNLP_FETCH_TEST_CONNECT_TO_2:-}
 LOCK_DIR=
 JOURNAL_DIR=
 
@@ -289,15 +292,18 @@ download_with_progress() {
     partial=$2
     start=$(bytes "$partial")
     curl_log="$JOURNAL_DIR/${partial##*/}.curl.log"
-    if [ -n "$TEST_BASE" ]; then
-        curl_scheme_args=''
-    else
-        curl_scheme_args="--proto =https --proto-redir =https"
+    set -- curl --fail --location
+    if [ -z "$TEST_BASE" ]; then
+        set -- "$@" --proto =https --proto-redir =https
     fi
+    if [ "$TEST_REDIRECT_POLICY" = 1 ]; then
+        set -- "$@" --insecure --connect-to "$TEST_CURL_CONNECT_TO_1" --connect-to "$TEST_CURL_CONNECT_TO_2"
+    fi
+    set -- "$@" --max-redirs 8 --retry 3 --retry-all-errors --connect-timeout 30
     if [ "$start" -gt 0 ]; then
-        curl --fail --location $curl_scheme_args --max-redirs 8 --retry 3 --retry-all-errors --connect-timeout 30 --continue-at - --output "$partial" --write-out '%{url_effective}' "$url" > "$curl_log" 2>&1 &
+        "$@" --continue-at - --output "$partial" --write-out '%{url_effective}' "$url" > "$curl_log" 2>&1 &
     else
-        curl --fail --location $curl_scheme_args --max-redirs 8 --retry 3 --retry-all-errors --connect-timeout 30 --output "$partial" --write-out '%{url_effective}' "$url" > "$curl_log" 2>&1 &
+        "$@" --output "$partial" --write-out '%{url_effective}' "$url" > "$curl_log" 2>&1 &
     fi
     curl_pid=$!
     while kill -0 "$curl_pid" 2>/dev/null; do
@@ -413,6 +419,10 @@ if [ -n "$CATALOG" ] && [ ! -f "$CATALOG" ]; then
 fi
 if [ -n "$TEST_BASE" ] && [ "${FNLP_FETCH_ALLOW_TEST_BASE_URL:-}" != 1 ]; then
     log "ERROR code=2 detail=--test-base-url requires FNLP_FETCH_ALLOW_TEST_BASE_URL=1"
+    exit 2
+fi
+if [ -n "$TEST_REDIRECT_POLICY" ] && { [ "$TEST_REDIRECT_POLICY" != 1 ] || [ -z "$TEST_CURL_CONNECT_TO_1" ] || [ -z "$TEST_CURL_CONNECT_TO_2" ]; }; then
+    log "ERROR code=2 detail=test redirect transport requires FNLP_FETCH_ALLOW_TEST_REDIRECT_POLICY=1 and two connect mappings"
     exit 2
 fi
 

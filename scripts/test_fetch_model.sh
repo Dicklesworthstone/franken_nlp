@@ -11,12 +11,14 @@ REV=f56ec5a9650268aa098496734743c25ea778bd2d
 CASES=0
 FAILED=
 SERVER_PID=
+TLS_SERVER_PID=
 
 log() { printf '%s FETCH_MODEL_TEST %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
 fail_case() { FAILED="${FAILED}${FAILED:+,}$1"; log "CASE=$1 RESULT=FAIL detail=$2"; }
 pass_case() { log "CASE=$1 RESULT=PASS detail=$2"; }
 finish() {
     if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || true; fi
+    if [ -n "$TLS_SERVER_PID" ]; then kill "$TLS_SERVER_PID" 2>/dev/null || true; fi
     if [ -n "$FAILED" ]; then
         log "FETCH_MODEL_TESTS RESULT=FAIL cases=$CASES failed=$FAILED retained_work=$WORK"
         exit 1
@@ -26,6 +28,7 @@ finish() {
 trap finish EXIT
 
 command -v python3 >/dev/null 2>&1 || { log "FETCH_MODEL_TESTS RESULT=FAIL cases=0 failed=missing-python3 retained_work=$WORK"; exit 1; }
+command -v openssl >/dev/null 2>&1 || { log "FETCH_MODEL_TESTS RESULT=FAIL cases=0 failed=missing-openssl retained_work=$WORK"; exit 1; }
 
 # 0. The production redirect policy permits official Xet and regional CDN hosts.
 CASES=$((CASES + 1))
@@ -54,6 +57,81 @@ run_fetch() {
     dest=$1
     shift
     FNLP_FETCH_ALLOW_TEST_BASE_URL=1 "$FETCH" --dest "$dest" --catalog "$CATALOG" --test-base-url "$BASE" "$@"
+}
+
+start_redirect_server() {
+    redirect_host=$1
+    TLS_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+    if ! openssl req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/redirect.key" -out "$WORK/redirect.crt" -subj /CN=localhost -days 1 > "$WORK/openssl.log" 2>&1; then
+        return 1
+    fi
+    FIXTURE_ROOT="$FIXTURE" REDIRECT_HOST="$redirect_host" TLS_PORT="$TLS_PORT" TLS_CERT="$WORK/redirect.crt" TLS_KEY="$WORK/redirect.key" python3 -c '
+import http.server
+import os
+import ssl
+from pathlib import Path
+from urllib.parse import urlsplit
+
+root = Path(os.environ["FIXTURE_ROOT"])
+redirect_host = os.environ["REDIRECT_HOST"]
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        host = self.headers.get("Host", "").split(":", 1)[0].lower()
+        if host == "huggingface.co":
+            self.send_response(302)
+            self.send_header("Location", "https://{}{}".format(redirect_host, self.path))
+            self.end_headers()
+            return
+        if host != redirect_host:
+            self.send_error(421, "unexpected host")
+            return
+        candidate = root / Path(urlsplit(self.path).path).name
+        if not candidate.is_file():
+            self.send_error(404)
+            return
+        payload = candidate.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, _format, *_args):
+        pass
+
+server = http.server.ThreadingHTTPServer(("127.0.0.1", int(os.environ["TLS_PORT"])), Handler)
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain(os.environ["TLS_CERT"], os.environ["TLS_KEY"])
+server.socket = context.wrap_socket(server.socket, server_side=True)
+server.serve_forever()
+' > "$WORK/redirect-$redirect_host.log" 2>&1 &
+    TLS_SERVER_PID=$!
+    sleep 1
+    kill -0 "$TLS_SERVER_PID" 2>/dev/null
+}
+
+stop_redirect_server() {
+    if [ -n "$TLS_SERVER_PID" ]; then
+        kill "$TLS_SERVER_PID" 2>/dev/null || true
+        wait "$TLS_SERVER_PID" 2>/dev/null || true
+        TLS_SERVER_PID=
+    fi
+}
+
+run_redirect_policy_fetch() {
+    redirect_host=$1
+    dest=$2
+    output=$3
+    error=$4
+    start_redirect_server "$redirect_host" || return 1
+    HTTPS_PROXY= https_proxy= HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
+        FNLP_FETCH_ALLOW_TEST_REDIRECT_POLICY=1 \
+        FNLP_FETCH_TEST_CONNECT_TO_1="huggingface.co:443:127.0.0.1:$TLS_PORT" \
+        FNLP_FETCH_TEST_CONNECT_TO_2="$redirect_host:443:127.0.0.1:$TLS_PORT" \
+        "$FETCH" --dest "$dest" --catalog "$CATALOG" > "$output" 2> "$error"
+    status=$?
+    stop_redirect_server
+    return "$status"
 }
 
 secure_mkdir() {
@@ -109,3 +187,17 @@ if FNLP_FETCH_ALLOW_TEST_BASE_URL=1 "$FETCH" --dest "$DEST8" --catalog "$CATALOG
 # 9. The model-gated check-only path is an honest no-model skip, not a cache hit.
 CASES=$((CASES + 1)); DEST9="$WORK/case9"
 if FNLP_FETCH_ALLOW_TEST_BASE_URL=1 "$FETCH" --dest "$DEST9" --catalog "$CATALOG" --test-base-url "$BASE" --check-only > "$WORK/case9.out" 2> "$WORK/case9.err" && grep -q 'CHECK_ONLY RESULT=SKIPPED_NO_MODEL' "$WORK/case9.err"; then pass_case 9 check-only-no-model-skip; else fail_case 9 check-only-no-model-skip; fi
+
+# 10. A local TLS redirect to an official regional Xet CDN host passes the real policy.
+CASES=$((CASES + 1)); DEST10="$WORK/case10"
+if run_redirect_policy_fetch us.aws.cdn.hf.co "$DEST10" "$WORK/case10.out" "$WORK/case10.err" && cmp "$FIXTURE/alpha.bin" "$DEST10/alpha.bin" >/dev/null && cmp "$FIXTURE/beta.bin" "$DEST10/beta.bin" >/dev/null; then pass_case 10 regional-cdn-redirect-accepted; else fail_case 10 regional-cdn-redirect-accepted; fi
+
+# 11. The same hermetic hop refuses a final redirect outside the explicit allowlist.
+CASES=$((CASES + 1)); DEST11="$WORK/case11"
+if run_redirect_policy_fetch unlisted.invalid "$DEST11" "$WORK/case11.out" "$WORK/case11.err"; then
+    fail_case 11 unlisted-redirect-refusal
+elif grep -q 'REDIRECT_HOST_REFUSED effective_url=https://unlisted.invalid/' "$WORK/case11.err"; then
+    pass_case 11 unlisted-redirect-refusal
+else
+    fail_case 11 unlisted-redirect-refusal
+fi
