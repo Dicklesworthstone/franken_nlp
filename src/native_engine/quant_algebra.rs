@@ -161,10 +161,16 @@ impl fmt::Display for QuantAlgebraError {
                 "{operand} length mismatch: expected {expected}, observed {observed}"
             ),
             Self::DimensionOverflow { rows, row_width } => {
-                write!(formatter, "row geometry overflows usize: rows={rows}, width={row_width}")
+                write!(
+                    formatter,
+                    "row geometry overflows usize: rows={rows}, width={row_width}"
+                )
             }
             Self::IntegerRange { stage, value } => {
-                write!(formatter, "{stage} does not fit the canonical i32 stage: {value}")
+                write!(
+                    formatter,
+                    "{stage} does not fit the canonical i32 stage: {value}"
+                )
             }
             Self::SectionDigestMismatch {
                 section_id,
@@ -198,7 +204,10 @@ impl fmt::Display for QuantAlgebraError {
                 "invalid row-sum table dimensions: rows={rows}, width={row_width}"
             ),
             Self::NonFiniteScale { operand } => {
-                write!(formatter, "non-finite {operand} scale is not a valid quant epilogue")
+                write!(
+                    formatter,
+                    "non-finite {operand} scale is not a valid quant epilogue"
+                )
             }
             Self::NonFiniteEpilogue => write!(formatter, "fixed-order quant epilogue overflowed"),
         }

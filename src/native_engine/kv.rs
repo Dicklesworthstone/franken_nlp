@@ -108,22 +108,25 @@ pub struct KvCache {
 impl KvCache {
     /// Preallocates K and V vectors for every slot through `max_positions`.
     pub fn try_with_capacity(max_positions: usize) -> Result<Self, KvCacheError> {
-        let element_capacity = max_positions
-            .checked_mul(KV_ELEMENTS_PER_POSITION)
-            .ok_or(KvCacheError::CapacityOverflow {
+        let element_capacity = max_positions.checked_mul(KV_ELEMENTS_PER_POSITION).ok_or(
+            KvCacheError::CapacityOverflow {
                 positions: max_positions,
-            })?;
+            },
+        )?;
         let mut reservation_failed = None;
-        let slots = array::from_fn(|_| match KvSlot::try_with_capacity(element_capacity, max_positions) {
-            Ok(slot) => slot,
-            Err(error) => {
-                reservation_failed = Some(error);
-                KvSlot {
-                    keys: Vec::new(),
-                    values: Vec::new(),
-                }
-            }
-        });
+        let slots =
+            array::from_fn(
+                |_| match KvSlot::try_with_capacity(element_capacity, max_positions) {
+                    Ok(slot) => slot,
+                    Err(error) => {
+                        reservation_failed = Some(error);
+                        KvSlot {
+                            keys: Vec::new(),
+                            values: Vec::new(),
+                        }
+                    }
+                },
+            );
         if let Some(error) = reservation_failed {
             return Err(error);
         }
@@ -229,7 +232,12 @@ impl KvCache {
         self.vector_at(slot, position, KvVector::Value)
     }
 
-    fn vector_at(&self, slot: usize, position: usize, vector: KvVector) -> Result<&[u16], KvCacheError> {
+    fn vector_at(
+        &self,
+        slot: usize,
+        position: usize,
+        vector: KvVector,
+    ) -> Result<&[u16], KvCacheError> {
         let source = self
             .slots
             .get(slot)

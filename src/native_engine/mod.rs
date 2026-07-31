@@ -3,6 +3,7 @@
 pub mod attention;
 pub mod batchsched;
 pub mod decode;
+pub mod diagnostic_f32;
 pub mod dispatch;
 pub mod int8;
 pub mod kv;

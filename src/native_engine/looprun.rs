@@ -6,7 +6,7 @@
 //! runner owns only straight-line control flow; selected numerics profiles own
 //! the math behind [`LayerExecutor`].
 
-use super::kv::{slot_for, KvCache, PHYSICAL_LAYER_COUNT, KV_SLOT_COUNT, LOOP_COUNT};
+use super::kv::{KV_SLOT_COUNT, KvCache, LOOP_COUNT, PHYSICAL_LAYER_COUNT, slot_for};
 
 /// Logical position identities shared unchanged by both decoder passes.
 ///
@@ -103,6 +103,33 @@ pub trait LayerExecutor<W> {
     ) -> Result<(), Self::Error>;
 }
 
+/// An executor whose numerics profile owns its cache representation.
+///
+/// The diagnostic-f32 profile uses this entry point so its K/V activations stay
+/// f32 after the one-time weight widening.  It still consumes this module's
+/// single resolved 44-binding schedule; it is not a second loop implementation.
+pub trait StructuralLayerExecutor<W> {
+    /// Profile-specific hidden-state representation.
+    type Hidden;
+    /// Profile-specific failure returned without erasing its diagnostics.
+    type Error;
+
+    /// Executes a binding in the precomputed two-pass schedule.
+    fn layer_forward(
+        &mut self,
+        binding: &LayerBinding<'_, W>,
+        hidden: &mut Self::Hidden,
+        positions: PositionContext,
+    ) -> Result<(), Self::Error>;
+
+    /// Applies the shared post-pass final RMSNorm.
+    fn final_rms_norm(
+        &mut self,
+        hidden: &mut Self::Hidden,
+        positions: PositionContext,
+    ) -> Result<(), Self::Error>;
+}
+
 /// Prebuilt, fixed-size binding table for the two-pass decoder.
 pub struct LoopRunner<'weights, W> {
     bindings: [LayerBinding<'weights, W>; KV_SLOT_COUNT],
@@ -135,7 +162,11 @@ impl<'weights, W> LoopRunner<'weights, W> {
 
     /// Looks up a resolved binding outside the hot loop for diagnostics/tests.
     #[must_use]
-    pub fn binding(&self, loop_index: usize, layer_index: usize) -> Option<&LayerBinding<'weights, W>> {
+    pub fn binding(
+        &self,
+        loop_index: usize,
+        layer_index: usize,
+    ) -> Option<&LayerBinding<'weights, W>> {
         slot_for(loop_index, layer_index).and_then(|slot| self.bindings.get(slot))
     }
 
@@ -159,6 +190,29 @@ impl<'weights, W> LoopRunner<'weights, W> {
             let offset = loop_index * PHYSICAL_LAYER_COUNT;
             for binding in &self.bindings[offset..offset + PHYSICAL_LAYER_COUNT] {
                 executor.layer_forward(binding, hidden, positions, kv_cache)?;
+            }
+            executor.final_rms_norm(hidden, positions)?;
+        }
+        Ok(())
+    }
+
+    /// Executes the same two-pass schedule for a profile with non-bf16 K/V
+    /// storage.  The sole distinction from [`Self::run_token`] is that the
+    /// executor owns its typed cache; binding order and boundary norms remain
+    /// exactly the same shared implementation contract.
+    pub fn run_token_structural<E>(
+        &self,
+        executor: &mut E,
+        hidden: &mut E::Hidden,
+        positions: PositionContext,
+    ) -> Result<(), E::Error>
+    where
+        E: StructuralLayerExecutor<W>,
+    {
+        for loop_index in 0..LOOP_COUNT {
+            let offset = loop_index * PHYSICAL_LAYER_COUNT;
+            for binding in &self.bindings[offset..offset + PHYSICAL_LAYER_COUNT] {
+                executor.layer_forward(binding, hidden, positions)?;
             }
             executor.final_rms_norm(hidden, positions)?;
         }
