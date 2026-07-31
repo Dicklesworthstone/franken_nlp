@@ -13,7 +13,7 @@
   "killed_alternatives": [{"name": "ambient capability re-expansion", "reason": "Cx::current() is runtime-masked under cap::None"}, {"name": "short-circuit first_ok mirror", "reason": "the pin drives all ExecPlan::first_ok children before input-order selection"}, {"name": "cast acknowledgement as commit", "reason": "cast().await and try_cast acknowledge mailbox admission only"}],
   "source_pin": {"asupersync": "362dc5b174427f66cfa76ab2bdd68cce1a95c6cc"},
   "status": "BLOCKED",
-  "x_executable_verdicts": [{"commit": "8dce5ac369ec8cdecd68ac1e17ccd2a17e89509a", "items": ["cancelkind-eleven", "first-ok-sequential", "budget-typed", "preset-values", "current-no-regain", "execplan-first-ok"], "path": "tests/g0/asupersync_census/runtime_semantics.rs", "scope": "pin-scoped executable observations"}, {"commit": "2f23773b05c3108b7cbf2168d74a4e7014fb8d8f", "items": ["cast-async-ack", "try-cast-policies"], "path": "tests/g0/asupersync_census/gen_server_semantics.rs", "scope": "Lab mailbox acknowledgement and declared overflow observations"}, {"commit": "f7f2076f1c2b12a25417afeba9163f52a48b9d97", "items": ["lab-determinism", "obligation-leak-policy", "lab-crashpack"], "path": "tests/g0/asupersync_census/lab_determinism.rs", "scope": "Lab replay, leak-policy, and crashpack material observations"}, {"commit": "41d0aa36b1cc3e3bef4928c909623f1b10feb141", "items": ["compile-fail-suite"], "path": "tests/g0/asupersync_census/compile_fail.rs", "scope": "static narrowing proof; current-context runtime masking is separately covered above"}],
+  "x_executable_verdicts": [{"commit": "8dce5ac369ec8cdecd68ac1e17ccd2a17e89509a", "items": ["cancelkind-eleven", "first-ok-sequential", "budget-typed", "preset-values", "current-no-regain", "execplan-first-ok"], "path": "tests/g0/asupersync_census/runtime_semantics.rs", "scope": "pin-scoped executable observations"}, {"commit": "2f23773b05c3108b7cbf2168d74a4e7014fb8d8f", "items": ["cast-async-ack", "try-cast-policies"], "path": "tests/g0/asupersync_census/gen_server_semantics.rs", "scope": "Lab mailbox acknowledgement and declared overflow observations"}, {"commit": "f7f2076f1c2b12a25417afeba9163f52a48b9d97", "items": ["lab-determinism", "obligation-leak-policy", "lab-crashpack"], "path": "tests/g0/asupersync_census/lab_determinism.rs", "scope": "Lab replay, leak-policy, and crashpack material observations"}, {"commit": "41d0aa36b1cc3e3bef4928c909623f1b10feb141", "items": ["compile-fail-suite"], "path": "tests/g0/asupersync_census/compile_fail.rs", "scope": "static narrowing proof; current-context runtime masking is separately covered above"}, {"commit": "37e4dbaab1aa7912929e13a8f50c40ba5128bff7", "items": ["dpor-explorer", "tla-export"], "path": "tests/g0/asupersync_census/explorer_tla.rs", "scope": "bounded DPOR-style coverage and TLA export only; no exhaustive or TLC claim"}],
   "x_unratified_rows": ["retained raw G0_CENSUS transcript and evidence digest", "project capability aliases and budget-unit conversion", "project two-phase reservation and production leak-escalation policy", "Lab oracle/chaos/VirtualTcp coverage", "bracket normal-versus-drop evidence", "bounded exploration/TLC retained artifacts", "supervision/registry/substrate adoption decisions"]
 }
 ```
@@ -37,6 +37,7 @@ The feature-gated `g0_asupersync_census` target contains executable
 | Messaging | `cast().await` and accepted `try_cast` acknowledge enqueue only; `Reject` reports full and `DropOldest` is explicitly lossy. | `gen_server_semantics.rs` |
 | Cancellation/budgets/presets | Eleven `CancelKind` values, typed budget shapes, and concrete runtime preset values are observable. | `runtime_semantics.rs` |
 | Lab | Same-seed replay, explicit leak policy, and failed-run crashpack replay material are observable. | `lab_determinism.rs` |
+| Bounded exploration/model export | DPOR-style exploration records finite run/class/race/backtrack/saturation coverage; TLA+ behavior and skeleton export are inputs only. | `explorer_tla.rs` |
 
 These are narrower than product readiness. In particular, `budget-typed` does
 not freeze a FrankenNLP project-unit conversion, and `obligation-leak-policy`
@@ -69,8 +70,10 @@ The executable probes are committed and name their intended replay command in
 metadata, but this tree has no retained raw `G0_CENSUS` transcript under
 `docs/adr/evidence/G0-11/`. Therefore the ADR stays `BLOCKED`: a source line
 or a passing batch summary is not a substitute for the hash-addressed evidence
-artifact required by the ADR schema. The retained transcript must be added
-before changing either this ADR or the matching registry row to `RATIFIED`.
+artifact required by the ADR schema. In particular, the bounded DPOR source
+test is not a retained coverage receipt, and the TLA+ export source test is
+not a TLC run. The retained transcript must be added before changing either
+this ADR or the matching registry row to `RATIFIED`.
 
 The remaining blocked rows are listed in `x_unratified_rows` above. Their
 fallback remains the explicit project implementations and tests required by
