@@ -74,6 +74,13 @@ pub enum QuantizeError {
         expected_f32_values: usize,
         observed_f32_values: usize,
     },
+    /// The f32 work panel was not the exact BF16 widening of the verified
+    /// source bytes, so conversion must not quantize a substituted panel.
+    DecodedBf16Mismatch {
+        element: usize,
+        expected_bits: u32,
+        observed_bits: u32,
+    },
 }
 
 impl fmt::Display for QuantizeError {
@@ -110,6 +117,14 @@ impl fmt::Display for QuantizeError {
             } => write!(
                 formatter,
                 "generic panel geometry rows={rows} columns={columns}: expected bf16-bytes={expected_bf16_bytes} observed={observed_bf16_bytes}; expected f32-values={expected_f32_values} observed={observed_f32_values}"
+            ),
+            Self::DecodedBf16Mismatch {
+                element,
+                expected_bits,
+                observed_bits,
+            } => write!(
+                formatter,
+                "generic panel BF16 decode mismatch at element={element}: expected-f32-bits=0x{expected_bits:08x} observed=0x{observed_bits:08x}"
             ),
         }
     }
@@ -241,6 +256,20 @@ pub fn encode_generic_panel(
             expected_f32_values,
             observed_f32_values: decoded_f32.len(),
         });
+    }
+    for (element, (source, &decoded)) in source_bf16
+        .chunks_exact(2)
+        .zip(decoded_f32.iter())
+        .enumerate()
+    {
+        let expected_bits = u32::from(u16::from_le_bytes([source[0], source[1]])) << 16;
+        if decoded.to_bits() != expected_bits {
+            return Err(QuantizeError::DecodedBf16Mismatch {
+                element,
+                expected_bits,
+                observed_bits: decoded.to_bits(),
+            });
+        }
     }
 
     if stage == StorageStage::Bf16Verbatim {
@@ -402,5 +431,18 @@ mod tests {
         )
         .expect_err("BF16 source and decoded work must share the declared shape");
         assert!(matches!(error, QuantizeError::PanelShape { .. }));
+    }
+
+    #[test]
+    fn panel_refuses_f32_not_exactly_widened_from_its_bf16_source() {
+        let error = encode_generic_panel(
+            StorageStage::Int8Stage2C,
+            &[0x80, 0x3f, 0, 0],
+            &[1.0, 1.0],
+            1,
+            2,
+        )
+        .expect_err("a substituted work panel must not enter quantization");
+        assert!(matches!(error, QuantizeError::DecodedBf16Mismatch { element: 1, .. }));
     }
 }
