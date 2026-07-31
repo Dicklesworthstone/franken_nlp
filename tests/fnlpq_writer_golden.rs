@@ -7,6 +7,7 @@ use franken_nlp::artifact::format::{
     streaming_input_from_materialized, write, write_streaming,
 };
 use franken_nlp::artifact::format::LogicalTensorStreamingHasher;
+use franken_nlp::artifact::format::StreamingSectionHasher;
 use franken_nlp::artifact::reader::FnlpqArtifact;
 use franken_nlp::canonjson;
 use serde::Serialize;
@@ -195,6 +196,34 @@ fn incremental_logical_tensor_hasher_rejects_sidecars_before_payload_completion(
     assert!(matches!(
         incremental.write_scale(&[]),
         Err(FnlpqWriteError::LogicalTensorStream { field: "data", .. })
+    ));
+}
+
+#[test]
+fn incremental_section_hasher_matches_the_framed_v1_identity() {
+    let bytes = b"a bounded generic payload";
+    let expected = framed_sha256("fnlpq-section-v1", &[b"generic-payload", bytes])
+        .expect("bounded framed section identity");
+    let mut incremental = StreamingSectionHasher::new("generic-payload", bytes.len() as u64)
+        .expect("bounded section declaration");
+    incremental
+        .write(&bytes[..7])
+        .expect("first payload chunk");
+    incremental
+        .write(&bytes[7..])
+        .expect("second payload chunk");
+
+    assert_eq!(incremental.finish().expect("complete first pass"), expected);
+}
+
+#[test]
+fn incremental_section_hasher_rejects_overflow_before_digesting() {
+    let mut incremental = StreamingSectionHasher::new("generic-payload", 2)
+        .expect("bounded section declaration");
+
+    assert!(matches!(
+        incremental.write(b"abc"),
+        Err(FnlpqWriteError::StoredIdentity { .. })
     ));
 }
 

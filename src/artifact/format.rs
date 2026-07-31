@@ -581,6 +581,67 @@ pub fn framed_sha256_hex(tag: &str, fields: &[&[u8]]) -> Result<String, FnlpqWri
     Ok(hex_lower(&framed_sha256(tag, fields)?))
 }
 
+/// Incremental first-pass identity for one stored section.
+///
+/// The converter records this identity before the second pass calls
+/// [`write_streaming`], so a planned section can be checked without retaining
+/// its full bytes in memory.
+pub struct StreamingSectionHasher {
+    section: String,
+    remaining: u64,
+    hasher: Sha256,
+}
+
+impl StreamingSectionHasher {
+    /// Start a section identity from its canonical name and exact planned
+    /// stored length.
+    pub fn new(section: &str, stored_len: u64) -> Result<Self, FnlpqWriteError> {
+        let mut hasher = framed_stream_hasher("fnlpq-section-v1", 2);
+        framed_stream_field_prefix(
+            &mut hasher,
+            u64::try_from(section.len()).map_err(|_| FnlpqWriteError::Arithmetic {
+                field: "streaming section name length",
+            })?,
+        );
+        hasher.update(section.as_bytes());
+        framed_stream_field_prefix(&mut hasher, stored_len);
+        Ok(Self {
+            section: section.to_owned(),
+            remaining: stored_len,
+            hasher,
+        })
+    }
+
+    /// Include one bounded chunk in the planned stored section.
+    pub fn write(&mut self, bytes: &[u8]) -> Result<(), FnlpqWriteError> {
+        let bytes_len = u64::try_from(bytes.len()).map_err(|_| FnlpqWriteError::Arithmetic {
+            field: "streaming section write length",
+        })?;
+        if bytes_len > self.remaining {
+            return Err(FnlpqWriteError::StoredIdentity {
+                section: self.section.clone(),
+                expected: format!("{} bytes", self.remaining),
+                actual: format!("{bytes_len} additional bytes"),
+            });
+        }
+        self.hasher.update(bytes);
+        self.remaining -= bytes_len;
+        Ok(())
+    }
+
+    /// Return the section's first-pass digest only after exact coverage.
+    pub fn finish(self) -> Result<[u8; 32], FnlpqWriteError> {
+        if self.remaining != 0 {
+            return Err(FnlpqWriteError::StoredIdentity {
+                section: self.section,
+                expected: "exact planned length".to_owned(),
+                actual: format!("underflow by {} bytes", self.remaining),
+            });
+        }
+        Ok(self.hasher.finalize().into())
+    }
+}
+
 /// Incremental first-pass identity for one logical tensor.
 ///
 /// A conversion pass may write its data bytes panel-by-panel, but v1 frames
