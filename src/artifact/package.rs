@@ -239,6 +239,16 @@ pub fn verify_model_package(staging_dir: &Path) -> Result<PackageReport, Package
         insert_unique_name(&mut expected_names, record)?;
         ordered_records.push(record);
     }
+    // The writer's SHA256SUMS ends with the receipt's own record; recompute it
+    // from the on-disk receipt so the round-trip covers every hashed member.
+    let receipt_bytes = read_small_file(&receipt_path)?;
+    let receipt_file_record = PackageFile {
+        name: RECEIPT_FILE.to_owned(),
+        bytes: u64::try_from(receipt_bytes.len())
+            .map_err(|_| PackageError::Arithmetic("receipt bytes"))?,
+        sha256: hex_digest(Sha256::digest(&receipt_bytes)),
+    };
+    ordered_records.push(&receipt_file_record);
     expected_names.insert(RECEIPT_FILE.to_owned());
     expected_names.insert(SUMS_FILE.to_owned());
     ensure_exact_inventory(staging_dir, &expected_names)?;
