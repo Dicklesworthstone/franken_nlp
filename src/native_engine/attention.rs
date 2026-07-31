@@ -486,6 +486,69 @@ mod tests {
     }
 
     #[test]
+    fn cache_scanning_gqa_preserves_each_causal_context_edge() {
+        let slot = 0;
+        let maximum_context = 65;
+        let mut cache =
+            KvCache::try_with_capacity(maximum_context).expect("edge-matrix cache reserves");
+        for position in 0..maximum_context {
+            cache
+                .append(
+                    slot,
+                    position,
+                    &cache_vector(slot, position, 0.000_1),
+                    &cache_vector(slot, position, 0.000_01),
+                )
+                .expect("append valid 8x128 KV edge-matrix position");
+        }
+        let query = (0..QUERY_HEAD_COUNT * NANBEIGE_HEAD_DIM)
+            .map(|index| bf16_bits((index % NANBEIGE_HEAD_DIM) as f32 * 0.000_1 + 1.0))
+            .map(Bf16::from_bits)
+            .collect::<Vec<_>>();
+
+        for sequence_len in [1, 2, 15, 16, 17, 63, 64, 65] {
+            let observed = eager_gqa_attention_from_cache_prefix(&query, &cache, slot, sequence_len)
+                .expect("valid causal cache prefix");
+            for query_head in 0..QUERY_HEAD_COUNT {
+                let kv_head = kv_head_for_query(query_head).expect("all 48 query heads map");
+                let kv_start = kv_head * NANBEIGE_HEAD_DIM;
+                let kv_end = kv_start + NANBEIGE_HEAD_DIM;
+                let mut keys = Vec::with_capacity(sequence_len * NANBEIGE_HEAD_DIM);
+                let mut values = Vec::with_capacity(sequence_len * NANBEIGE_HEAD_DIM);
+                for position in 0..sequence_len {
+                    keys.extend(
+                        cache.key_at(slot, position).expect("resident edge key")[kv_start..kv_end]
+                            .iter()
+                            .copied()
+                            .map(Bf16::from_bits),
+                    );
+                    values.extend(
+                        cache
+                            .value_at(slot, position)
+                            .expect("resident edge value")[kv_start..kv_end]
+                            .iter()
+                            .copied()
+                            .map(Bf16::from_bits),
+                    );
+                }
+                let query_start = query_head * NANBEIGE_HEAD_DIM;
+                let expected = eager_attention_head(
+                    &query[query_start..query_start + NANBEIGE_HEAD_DIM],
+                    &keys,
+                    &values,
+                    sequence_len,
+                )
+                .expect("gathered causal-prefix reference head");
+                assert_eq!(
+                    &observed[query_start..query_start + NANBEIGE_HEAD_DIM],
+                    expected.as_slice(),
+                    "context {sequence_len}, query head {query_head} must exclude future KV positions",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn cache_scanning_gqa_rejects_a_non_48_head_query() {
         let cache = KvCache::try_with_capacity(1).expect("small cache reserves");
         assert_eq!(
