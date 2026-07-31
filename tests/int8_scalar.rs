@@ -1,5 +1,7 @@
 #[path = "support/int8_oracle.rs"]
 mod int8_oracle;
+#[path = "spec_engine/mod.rs"]
+mod spec_engine;
 
 use franken_nlp::native_engine::int8::{
     MAX_S8_S8_K_10752, MODEL_KS, dot_s8s8, gemm_s8s8, gemv_int4_s8, gemv_s8s8, is_model_shape,
@@ -44,6 +46,27 @@ fn dynamic_m_gemm_rows_each_preserve_the_scalar_dot_order() {
             assert_eq!(actual[row * n + column], dot_s8s8(input, weight).unwrap());
         }
     }
+}
+
+#[test]
+fn scalar_gemm_and_gemv_match_the_readable_spec_engine_on_exact_integers() {
+    let input = [1_i8, -2, 3];
+    let weights = [4_i8, 5, -6, -7, 8, 9];
+    let spec_input = input.map(f32::from);
+    let expected = weights
+        .chunks_exact(input.len())
+        .map(|row| {
+            let spec_row = row.iter().copied().map(f32::from).collect::<Vec<_>>();
+            spec_engine::stable_dot(&spec_row, &spec_input, "tier_s_int8_differential")
+                .expect("same-length readable-spec vectors") as i32
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(gemv_s8s8(&input, &weights, 2).unwrap(), expected);
+    assert_eq!(
+        gemm_s8s8(&[1, -2, 3, -3, 2, -1], 2, 3, &weights, 2).unwrap(),
+        vec![expected[0], expected[1], 4, 28]
+    );
 }
 
 #[test]
