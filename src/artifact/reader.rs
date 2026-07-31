@@ -19,9 +19,12 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::artifact::converter::expected_nanbeige42_census;
 use crate::artifact::format::{
-    framed_sha256, ArchTarget, SectionKind, FORMAT_VERSION, MAGIC, MAX_ALIGNMENT, MAX_ENTRIES,
-    MAX_FILE_BYTES, MAX_HEADER_BYTES, PRELUDE_BYTES, SECTION_DIRECTORY_ENTRY_BYTES,
+    framed_sha256, logical_model_sha256, logical_tensor_sha256, write, ArchTarget, CanonicalDtype,
+    FnlpqWriterInput, PackingSetInput, SectionKind, SectionPayload, SectionRange, TensorInput,
+    FORMAT_VERSION, MAGIC, MAX_ALIGNMENT, MAX_ENTRIES, MAX_FILE_BYTES, MAX_HEADER_BYTES,
+    PRELUDE_BYTES, SECTION_DIRECTORY_ENTRY_BYTES,
 };
 use crate::canonjson::{self, ParseLimits};
 
@@ -62,6 +65,8 @@ pub enum FnlpqReadError {
         name: String,
         reason: String,
     },
+    /// The declared one-model tensor census differs from the loaded artifact.
+    Census { tensor: String, reason: String },
     /// No declared packing set exists for the requested target.
     MissingPackingDerivation {
         requested_target: String,
@@ -91,6 +96,9 @@ impl fmt::Display for FnlpqReadError {
                 formatter,
                 "fnlpq section[{ordinal}] {name:?}: {reason}"
             ),
+            Self::Census { tensor, reason } => {
+                write!(formatter, "fnlpq census divergence at {tensor}: {reason}")
+            }
             Self::MissingPackingDerivation {
                 requested_target,
                 available_ids,
@@ -437,6 +445,117 @@ impl FnlpqArtifact {
                     .collect(),
             })
     }
+
+    /// Rebuild the canonical envelope from checked records and compare its
+    /// bytes at the caller's chosen gate.  No unchecked header JSON or stored
+    /// range is reused in this path.
+    pub fn reserialize(&self) -> Result<Vec<u8>, FnlpqReadError> {
+        let sections = self
+            .sections
+            .iter()
+            .map(|section| {
+                let bytes = self.section_bytes(section.ordinal).ok_or_else(|| {
+                    section_error(section, "checked section bytes became unavailable")
+                })?;
+                Ok(SectionPayload::new(
+                    section.name.clone(),
+                    section.kind,
+                    bytes.to_vec(),
+                    section.alignment,
+                ))
+            })
+            .collect::<Result<Vec<_>, FnlpqReadError>>()?;
+        let tensors = self
+            .header
+            .tensors
+            .iter()
+            .map(|tensor| {
+                Ok(TensorInput {
+                    name: tensor.name.clone(),
+                    canonical_dtype: canonical_dtype(&tensor.canonical_dtype),
+                    shape: tensor.shape.clone(),
+                    canonical_logical_sha256: tensor.canonical_logical_sha256.clone(),
+                    quantization: tensor.quantization.clone(),
+                    data: mapping_range(&self.sections, &tensor.data)?,
+                    scale: mapping_range(&self.sections, &tensor.scale)?,
+                    row_sum: mapping_range(&self.sections, &tensor.row_sum)?,
+                })
+            })
+            .collect::<Result<Vec<_>, FnlpqReadError>>()?;
+        let packing_sets = self
+            .header
+            .packing_sets
+            .iter()
+            .map(|set| {
+                let section_names = set
+                    .representations
+                    .iter()
+                    .map(|representation| {
+                        section_for(
+                            &self.sections,
+                            representation.section_ordinal,
+                            "reserialize packing representation",
+                        )
+                        .map(|section| section.name.clone())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(PackingSetInput {
+                    id: set.id.clone(),
+                    target: arch_target(&set.target),
+                    section_names,
+                })
+            })
+            .collect::<Result<Vec<_>, FnlpqReadError>>()?;
+        write(&FnlpqWriterInput {
+            model_id: self.header.model_id.clone(),
+            revision: self.header.revision.clone(),
+            recipe_id: self.header.recipe_id.clone(),
+            source_root_sha256: self.header.source_root_sha256.clone(),
+            logical_model_sha256: self.header.logical_model_sha256.clone(),
+            sections,
+            tensors,
+            packing_sets,
+        })
+        .map(|written| written.bytes)
+        .map_err(|error| header_error("reserialize", error.to_string()))
+    }
+}
+
+fn canonical_dtype(value: &str) -> CanonicalDtype {
+    match value {
+        "bf16" => CanonicalDtype::Bf16,
+        "f32" => CanonicalDtype::F32,
+        "i8" => CanonicalDtype::I8,
+        _ => unreachable!("parse_tensors enforces the closed dtype set"),
+    }
+}
+
+fn arch_target(value: &str) -> ArchTarget {
+    match value {
+        "generic" => ArchTarget::Generic,
+        "aarch64-sdot" => ArchTarget::Aarch64Sdot,
+        "aarch64-i8mm" => ArchTarget::Aarch64I8mm,
+        "x86-vnni-256" => ArchTarget::X86Vnni256,
+        "x86-vnni-512" => ArchTarget::X86Vnni512,
+        "x86-avx2" => ArchTarget::X86Avx2,
+        _ => unreachable!("parse_packing_sets enforces the closed target set"),
+    }
+}
+
+fn mapping_range(
+    sections: &[CheckedSection],
+    mapping: &CheckedMapping,
+) -> Result<SectionRange, FnlpqReadError> {
+    let section = section_for(
+        sections,
+        mapping.section_ordinal,
+        "reserialize tensor mapping",
+    )?;
+    Ok(SectionRange::new(
+        section.name.clone(),
+        mapping.offset,
+        mapping.len,
+    ))
 }
 
 fn validate_prelude(bytes: &[u8], observed_len: u64) -> Result<CheckedPrelude, FnlpqReadError> {
@@ -1185,7 +1304,61 @@ fn validate_header_relationships(
         }
     }
     validate_packing_sets(header, sections)?;
+    validate_nanbeige42_census(header)?;
     validate_header_identities(bytes, header, sections)
+}
+
+fn validate_nanbeige42_census(header: &CheckedHeader) -> Result<(), FnlpqReadError> {
+    if header.model_id != "Nanbeige4.2-3B" {
+        return Ok(());
+    }
+    let expected = expected_nanbeige42_census();
+    let expected_by_name: BTreeMap<_, _> = expected
+        .iter()
+        .map(|entry| (entry.name.as_str(), entry))
+        .collect();
+    let actual_by_name: BTreeMap<_, _> = header
+        .tensors
+        .iter()
+        .map(|tensor| (tensor.name.as_str(), tensor))
+        .collect();
+    for expected in &expected {
+        let Some(actual) = actual_by_name.get(expected.name.as_str()) else {
+            return Err(FnlpqReadError::Census {
+                tensor: expected.name.clone(),
+                reason: "missing expected tensor".to_owned(),
+            });
+        };
+        let expected_shape = expected
+            .shape
+            .iter()
+            .map(|dimension| u32::try_from(*dimension))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| FnlpqReadError::Census {
+                tensor: expected.name.clone(),
+                reason: "frozen expected shape exceeds v1 u32 dimension cap".to_owned(),
+            })?;
+        if actual.canonical_dtype != "bf16" || actual.shape != expected_shape {
+            return Err(FnlpqReadError::Census {
+                tensor: expected.name.clone(),
+                reason: format!(
+                    "expected dtype=bf16 shape={expected_shape:?}, observed dtype={} shape={:?}",
+                    actual.canonical_dtype, actual.shape
+                ),
+            });
+        }
+    }
+    if let Some(extra) = header
+        .tensors
+        .iter()
+        .find(|tensor| !expected_by_name.contains_key(tensor.name.as_str()))
+    {
+        return Err(FnlpqReadError::Census {
+            tensor: extra.name.clone(),
+            reason: "unexpected tensor absent from the frozen 201-name census".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_scale_range(
@@ -1395,7 +1568,85 @@ fn validate_header_identities(
             "does not bind declared targets, byte costs, and section digests",
         ));
     }
+    let tensor_digests = header
+        .tensors
+        .iter()
+        .map(|tensor| {
+            let data = mapping_bytes(bytes, sections, &tensor.data, &tensor.name, "data")?;
+            let scale = mapping_bytes(bytes, sections, &tensor.scale, &tensor.name, "scale")?;
+            let row_sum = mapping_bytes(bytes, sections, &tensor.row_sum, &tensor.name, "row_sum")?;
+            let observed = logical_tensor_sha256(
+                &tensor.name,
+                &tensor.canonical_dtype,
+                &tensor.shape,
+                &tensor.quantization,
+                data,
+                scale,
+                row_sum,
+            )
+            .map_err(|error| header_error("logical tensor identity", error.to_string()))?;
+            let actual = hex_lower(&observed);
+            if actual != tensor.canonical_logical_sha256 {
+                return Err(header_error(
+                    format!("tensors/{}/canonical_logical_sha256", tensor.name),
+                    format!(
+                        "first divergent logical record expected={} actual={actual}",
+                        tensor.canonical_logical_sha256
+                    ),
+                ));
+            }
+            Ok(observed)
+        })
+        .collect::<Result<Vec<_>, FnlpqReadError>>()?;
+    let materialized_sources = header
+        .sources
+        .iter()
+        .map(|source| {
+            let section = section_for(
+                sections,
+                source.section_ordinal,
+                "logical materialized source",
+            )?;
+            Ok((source.name.as_str(), stored_bytes(bytes, section)?))
+        })
+        .collect::<Result<Vec<_>, FnlpqReadError>>()?;
+    let observed_logical_model = logical_model_sha256(&tensor_digests, &materialized_sources)
+        .map_err(|error| header_error("logical_model_sha256", error.to_string()))?;
+    let actual_logical_model = hex_lower(&observed_logical_model);
+    if actual_logical_model != header.logical_model_sha256 {
+        return Err(header_error(
+            "logical_model_sha256",
+            format!(
+                "first divergent logical record expected={} actual={actual_logical_model}",
+                header.logical_model_sha256
+            ),
+        ));
+    }
     Ok(())
+}
+
+fn mapping_bytes<'a>(
+    bytes: &'a [u8],
+    sections: &'a [CheckedSection],
+    mapping: &CheckedMapping,
+    tensor_name: &str,
+    mapping_name: &str,
+) -> Result<&'a [u8], FnlpqReadError> {
+    let section = section_for(sections, mapping.section_ordinal, mapping_name)?;
+    let stored = stored_bytes(bytes, section)?;
+    let start = usize::try_from(mapping.offset)
+        .map_err(|_| section_error(section, "mapping offset exceeds host usize"))?;
+    let len = usize::try_from(mapping.len)
+        .map_err(|_| section_error(section, "mapping length exceeds host usize"))?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| section_error(section, "mapping end overflows host usize"))?;
+    stored.get(start..end).ok_or_else(|| {
+        section_error(
+            section,
+            format!("tensor {tensor_name} {mapping_name} range is outside checked section bytes"),
+        )
+    })
 }
 
 fn stored_bytes<'a>(bytes: &'a [u8], section: &CheckedSection) -> Result<&'a [u8], FnlpqReadError> {

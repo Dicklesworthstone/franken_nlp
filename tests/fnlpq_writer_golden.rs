@@ -1,8 +1,10 @@
 use franken_nlp::artifact::format::{
-    decode_prelude, encode_f32_scales, framed_sha256, framed_sha256_hex, write, ArchTarget,
+    decode_prelude, encode_f32_scales, framed_sha256, framed_sha256_hex,
+    logical_model_sha256 as compute_logical_model_sha256, logical_tensor_sha256, write, ArchTarget,
     CanonicalDtype, FnlpqWriteError, FnlpqWriterInput, PackingSetInput, SectionKind,
     SectionPayload, SectionRange,
 };
+use franken_nlp::artifact::reader::FnlpqArtifact;
 use franken_nlp::canonjson;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -13,14 +15,35 @@ const FIELD_INVENTORY: &str = include_str!("fixtures/fnlpq/field_inventory.json"
 
 fn tiny_input() -> FnlpqWriterInput {
     let scales = encode_f32_scales(&[0.5]).expect("finite synthetic scale");
+    let payload = vec![0x80, 0x3f, 0x00, 0x40];
+    let row_sums = 0_i32.to_le_bytes().to_vec();
+    let tensor_sha256 = logical_tensor_sha256(
+        "model.embed_tokens.weight",
+        "bf16",
+        &[2],
+        "bf16-verbatim-v1",
+        &payload,
+        &scales,
+        &row_sums,
+    )
+    .expect("valid tiny logical tensor identity");
+    let logical_model_sha256 = compute_logical_model_sha256(
+        &[tensor_sha256],
+        &[
+            ("model_config", br#"{"hidden_size":2}"#.as_slice()),
+            ("tokenizer_model", &[0x50, 0x4b, 0x03, 0x04]),
+            ("tokenizer_config", br#"{"bos_token":"<s>"}"#.as_slice()),
+            ("chat_template", b"{% set x = 1 %}"),
+        ],
+    )
+    .expect("valid tiny logical-model identity");
     FnlpqWriterInput {
-        model_id: "Nanbeige4.2-3B".to_owned(),
+        model_id: "FnlpqTinyGolden".to_owned(),
         revision: "f56ec5a9650268aa098496734743c25ea778bd2d".to_owned(),
         recipe_id: "tiny-golden-v1".to_owned(),
         source_root_sha256: framed_sha256_hex("fnlpq-source-root-v1", &[b"tiny source manifest"])
             .expect("valid source identity"),
-        logical_model_sha256: framed_sha256_hex("fnlpq-logical-model-v1", &[b"tiny logical model"])
-            .expect("valid logical identity"),
+        logical_model_sha256: hex(&logical_model_sha256),
         // Deliberately unordered: the writer establishes the canonical v1
         // directory sequence by kind and native section name.
         sections: vec![
@@ -45,7 +68,7 @@ fn tiny_input() -> FnlpqWriterInput {
             SectionPayload::new(
                 "generic-row-sums",
                 SectionKind::GenericTensorRowSums,
-                0_i32.to_le_bytes().to_vec(),
+                row_sums.clone(),
                 8,
             ),
             SectionPayload::new(
@@ -57,7 +80,7 @@ fn tiny_input() -> FnlpqWriterInput {
             SectionPayload::new(
                 "generic-payload",
                 SectionKind::GenericTensorPayload,
-                vec![0x80, 0x3f, 0x00, 0x40],
+                payload.clone(),
                 64,
             ),
             SectionPayload::new(
@@ -83,11 +106,7 @@ fn tiny_input() -> FnlpqWriterInput {
             name: "model.embed_tokens.weight".to_owned(),
             canonical_dtype: CanonicalDtype::Bf16,
             shape: vec![2],
-            canonical_logical_sha256: framed_sha256_hex(
-                "fnlpq-logical-tensor-v1",
-                &[b"model.embed_tokens.weight", &[0x80, 0x3f, 0x00, 0x40]],
-            )
-            .expect("valid tiny tensor identity"),
+            canonical_logical_sha256: hex(&tensor_sha256),
             quantization: "bf16-verbatim-v1".to_owned(),
             data: SectionRange::new("generic-payload", 0, 4),
             scale: SectionRange::new("generic-scales", 0, 4),
@@ -172,6 +191,15 @@ fn tiny_v1_matches_committed_byte_and_header_goldens() {
         expected_gap_start,
         written.bytes.len(),
         "no trailing padding"
+    );
+    let artifact = FnlpqArtifact::from_bytes(written.bytes.clone())
+        .expect("canonical writer bytes load through the checked reader");
+    assert_eq!(
+        artifact
+            .reserialize()
+            .expect("checked artifact reserializes"),
+        written.bytes,
+        "load then re-serialize must preserve canonical bytes"
     );
 }
 
@@ -368,4 +396,14 @@ fn hex_nibble(byte: u8) -> u8 {
         b'A'..=b'F' => byte - b'A' + 10,
         _ => panic!("invalid golden hex digit {byte:?}"),
     }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }

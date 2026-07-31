@@ -41,6 +41,13 @@ const REQUIRED_SECTION_KINDS: [SectionKind; 8] = [
     SectionKind::LicenseBundle,
 ];
 
+const MATERIALIZED_SOURCE_KINDS: [(&str, SectionKind); 4] = [
+    ("model_config", SectionKind::ModelConfig),
+    ("tokenizer_model", SectionKind::TokenizerModel),
+    ("tokenizer_config", SectionKind::TokenizerConfig),
+    ("chat_template", SectionKind::ChatTemplate),
+];
+
 /// The fixed v1 section-kind namespace.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum SectionKind {
@@ -348,6 +355,13 @@ pub enum FnlpqWriteError {
         mapping: &'static str,
         reason: String,
     },
+    /// A declared logical identity did not match the canonical bytes being
+    /// written.  The writer never serializes a caller-supplied stale claim.
+    LogicalIdentity {
+        record: String,
+        expected: String,
+        actual: String,
+    },
     /// A packing set is incomplete or does not name valid stored sections.
     Packing { set: String, reason: String },
     /// JSON serialization of a typed closed schema failed.
@@ -390,6 +404,14 @@ impl fmt::Display for FnlpqWriteError {
                 mapping,
                 reason,
             } => write!(formatter, "tensor {tensor} {mapping} mapping: {reason}"),
+            Self::LogicalIdentity {
+                record,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "logical identity mismatch for {record}: expected={expected} actual={actual}"
+            ),
             Self::Packing { set, reason } => write!(formatter, "packing set {set}: {reason}"),
             Self::CanonicalJson(reason) => write!(formatter, "canonical header JSON: {reason}"),
             Self::NonFiniteScale { index } => {
@@ -452,6 +474,74 @@ pub fn framed_sha256_hex(tag: &str, fields: &[&[u8]]) -> Result<String, FnlpqWri
     Ok(hex_lower(&framed_sha256(tag, fields)?))
 }
 
+/// Compute the canonical identity of one logical tensor record.
+///
+/// The record binds the name, source dtype, shape, generic quantization
+/// recipe, and every generic byte range.  It is deliberately independent of
+/// section placement and native packing bytes.
+pub fn logical_tensor_sha256(
+    name: &str,
+    canonical_dtype: &str,
+    shape: &[u32],
+    quantization: &str,
+    data: &[u8],
+    scale: &[u8],
+    row_sum: &[u8],
+) -> Result<[u8; 32], FnlpqWriteError> {
+    let mut encoded_shape = Vec::with_capacity(8 + shape.len().saturating_mul(4));
+    encoded_shape.extend_from_slice(
+        &u64::try_from(shape.len())
+            .map_err(|_| FnlpqWriteError::Arithmetic {
+                field: "logical tensor shape rank",
+            })?
+            .to_le_bytes(),
+    );
+    for dimension in shape {
+        encoded_shape.extend_from_slice(&dimension.to_le_bytes());
+    }
+    framed_sha256(
+        "fnlpq-logical-tensor-v1",
+        &[
+            name.as_bytes(),
+            canonical_dtype.as_bytes(),
+            &encoded_shape,
+            quantization.as_bytes(),
+            data,
+            scale,
+            row_sum,
+        ],
+    )
+}
+
+/// Compute the domain-separated identity of one materialized semantic source.
+pub fn materialized_source_sha256(
+    source_name: &str,
+    bytes: &[u8],
+) -> Result<[u8; 32], FnlpqWriteError> {
+    framed_sha256(
+        "fnlpq-materialized-source-v1",
+        &[source_name.as_bytes(), bytes],
+    )
+}
+
+/// Compute the canonical model identity over sorted tensor records and the
+/// four materialized configuration/tokenizer/template identities.
+pub fn logical_model_sha256(
+    tensor_digests: &[[u8; 32]],
+    materialized_sources: &[(&str, &[u8])],
+) -> Result<[u8; 32], FnlpqWriteError> {
+    let source_digests = materialized_sources
+        .iter()
+        .map(|(name, bytes)| materialized_source_sha256(name, bytes))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut fields = Vec::with_capacity(2 + tensor_digests.len() + source_digests.len());
+    fields.push(b"tensors".as_slice());
+    fields.extend(tensor_digests.iter().map(|digest| digest.as_slice()));
+    fields.push(b"materialized_sources".as_slice());
+    fields.extend(source_digests.iter().map(|digest| digest.as_slice()));
+    framed_sha256("fnlpq-logical-model-v1", &fields)
+}
+
 /// Serialize a typed logical model into canonical v1 `.fnlpq` bytes.
 pub fn write(input: &FnlpqWriterInput) -> Result<WrittenFnlpq, FnlpqWriteError> {
     validate_authority("model_id", &input.model_id)?;
@@ -475,6 +565,52 @@ pub fn write(input: &FnlpqWriterInput) -> Result<WrittenFnlpq, FnlpqWriteError> 
     let tensors = canonical_tensors(&input.tensors, &section_by_name, &sections_by_kind)?;
     let packing_sets =
         canonical_packing_sets(&input.packing_sets, &section_by_name, &sections_by_kind)?;
+    let logical_tensor_digests = tensors
+        .iter()
+        .map(|tensor| {
+            let data = input_range_bytes(&sections, &tensor.data)?;
+            let scale = input_range_bytes(&sections, &tensor.scale)?;
+            let row_sum = input_range_bytes(&sections, &tensor.row_sum)?;
+            let observed = logical_tensor_sha256(
+                &tensor.name,
+                tensor.canonical_dtype.header_name(),
+                &tensor.shape,
+                &tensor.quantization,
+                data,
+                scale,
+                row_sum,
+            )?;
+            let actual = hex_lower(&observed);
+            if actual != tensor.canonical_logical_sha256 {
+                return Err(FnlpqWriteError::LogicalIdentity {
+                    record: tensor.name.clone(),
+                    expected: tensor.canonical_logical_sha256.clone(),
+                    actual,
+                });
+            }
+            Ok(observed)
+        })
+        .collect::<Result<Vec<_>, FnlpqWriteError>>()?;
+    let materialized_sources = MATERIALIZED_SOURCE_KINDS
+        .iter()
+        .map(|(name, kind)| {
+            let section = sections_by_kind
+                .get(kind)
+                .expect("required materialized source section was validated")
+                .1;
+            (*name, section.bytes.as_slice())
+        })
+        .collect::<Vec<_>>();
+    let observed_logical_model =
+        logical_model_sha256(&logical_tensor_digests, &materialized_sources)?;
+    let actual_logical_model = hex_lower(&observed_logical_model);
+    if actual_logical_model != input.logical_model_sha256 {
+        return Err(FnlpqWriteError::LogicalIdentity {
+            record: "logical_model_sha256".to_owned(),
+            expected: input.logical_model_sha256.clone(),
+            actual: actual_logical_model,
+        });
+    }
     let license_section = sections_by_kind
         .get(&SectionKind::LicenseBundle)
         .expect("validated required singleton section")
@@ -967,13 +1103,7 @@ fn build_header(
         .zip(section_hashes)
         .map(|(section, digest)| (section.name.as_str(), hex_lower(digest)))
         .collect();
-    let source_kinds = [
-        ("model_config", SectionKind::ModelConfig),
-        ("tokenizer_model", SectionKind::TokenizerModel),
-        ("tokenizer_config", SectionKind::TokenizerConfig),
-        ("chat_template", SectionKind::ChatTemplate),
-    ];
-    let materialized_sources = source_kinds
+    let materialized_sources = MATERIALIZED_SOURCE_KINDS
         .into_iter()
         .map(|(name, kind)| {
             let section = sections
@@ -1067,6 +1197,36 @@ fn build_header(
         source_root_sha256: input.source_root_sha256.clone(),
         tensors: tensors_header,
     })
+}
+
+fn input_range_bytes<'a>(
+    sections: &'a [SectionPayload],
+    range: &SectionRange,
+) -> Result<&'a [u8], FnlpqWriteError> {
+    let section = sections
+        .iter()
+        .find(|section| section.name == range.section_name)
+        .ok_or_else(|| FnlpqWriteError::Missing {
+            field: "logical tensor mapping section",
+            value: range.section_name.clone(),
+        })?;
+    let start = usize::try_from(range.offset).map_err(|_| FnlpqWriteError::Arithmetic {
+        field: "logical tensor mapping offset",
+    })?;
+    let len = usize::try_from(range.len).map_err(|_| FnlpqWriteError::Arithmetic {
+        field: "logical tensor mapping length",
+    })?;
+    let end = start.checked_add(len).ok_or(FnlpqWriteError::Arithmetic {
+        field: "logical tensor mapping end",
+    })?;
+    section
+        .bytes
+        .get(start..end)
+        .ok_or_else(|| FnlpqWriteError::Mapping {
+            tensor: "logical identity".to_owned(),
+            mapping: "range",
+            reason: format!("range [{start}, {end}) exceeds section {}", section.name),
+        })
 }
 
 fn header_mapping(
