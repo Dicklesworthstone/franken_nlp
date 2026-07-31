@@ -131,23 +131,52 @@ pub struct SpmError {
 /// Stable, typed rejection categories for the constrained protobuf surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpmErrorKind {
-    InputTooLarge { limit: usize, actual: usize },
+    InputTooLarge {
+        limit: usize,
+        actual: usize,
+    },
     VarintUnterminated,
-    VarintTooLong { limit: usize },
+    VarintTooLong {
+        limit: usize,
+    },
     VarintOverflow,
     LengthOverflow,
-    Truncated { needed: usize, remaining: usize },
+    Truncated {
+        needed: usize,
+        remaining: usize,
+    },
     InvalidFieldNumber,
-    InvalidWireType { wire_type: u8 },
+    InvalidWireType {
+        wire_type: u8,
+    },
     GroupWireTypeUnsupported,
-    LimitExceeded { limit_name: &'static str, limit: usize },
-    DuplicateSingular { field_name: &'static str },
-    InvalidUtf8 { field_name: &'static str },
-    InvalidEnum { enum_name: &'static str, value: u64 },
-    InvalidInt32 { field_name: &'static str, value: u64 },
-    MissingRequiredField { field_name: &'static str },
-    UnsupportedModelType { value: i32 },
-    NonIdentityNormalizer { name: String },
+    LimitExceeded {
+        limit_name: &'static str,
+        limit: usize,
+    },
+    DuplicateSingular {
+        field_name: &'static str,
+    },
+    InvalidUtf8 {
+        field_name: &'static str,
+    },
+    InvalidEnum {
+        enum_name: &'static str,
+        value: u64,
+    },
+    InvalidInt32 {
+        field_name: &'static str,
+        value: u64,
+    },
+    MissingRequiredField {
+        field_name: &'static str,
+    },
+    UnsupportedModelType {
+        value: i32,
+    },
+    NonIdentityNormalizer {
+        name: String,
+    },
 }
 
 impl fmt::Display for SpmError {
@@ -161,7 +190,10 @@ impl fmt::Display for SpmError {
         }
         match &self.kind {
             SpmErrorKind::InputTooLarge { limit, actual } => {
-                write!(formatter, " limit=MAX_TOTAL_INPUT_BYTES actual={actual} max={limit}")
+                write!(
+                    formatter,
+                    " limit=MAX_TOTAL_INPUT_BYTES actual={actual} max={limit}"
+                )
             }
             SpmErrorKind::VarintUnterminated => write!(formatter, " error=unterminated-varint"),
             SpmErrorKind::VarintTooLong { limit } => {
@@ -170,7 +202,10 @@ impl fmt::Display for SpmError {
             SpmErrorKind::VarintOverflow => write!(formatter, " error=varint-overflow"),
             SpmErrorKind::LengthOverflow => write!(formatter, " error=length-overflow"),
             SpmErrorKind::Truncated { needed, remaining } => {
-                write!(formatter, " error=truncated needed={needed} remaining={remaining}")
+                write!(
+                    formatter,
+                    " error=truncated needed={needed} remaining={remaining}"
+                )
             }
             SpmErrorKind::InvalidFieldNumber => write!(formatter, " error=invalid-field-number"),
             SpmErrorKind::InvalidWireType { wire_type } => {
@@ -183,16 +218,25 @@ impl fmt::Display for SpmError {
                 write!(formatter, " limit={limit_name} max={limit}")
             }
             SpmErrorKind::DuplicateSingular { field_name } => {
-                write!(formatter, " error=conflicting-duplicate field_name={field_name}")
+                write!(
+                    formatter,
+                    " error=conflicting-duplicate field_name={field_name}"
+                )
             }
             SpmErrorKind::InvalidUtf8 { field_name } => {
                 write!(formatter, " error=invalid-utf8 field_name={field_name}")
             }
             SpmErrorKind::InvalidEnum { enum_name, value } => {
-                write!(formatter, " error=invalid-enum enum={enum_name} value={value}")
+                write!(
+                    formatter,
+                    " error=invalid-enum enum={enum_name} value={value}"
+                )
             }
             SpmErrorKind::InvalidInt32 { field_name, value } => {
-                write!(formatter, " error=invalid-int32 field_name={field_name} value={value}")
+                write!(
+                    formatter,
+                    " error=invalid-int32 field_name={field_name} value={value}"
+                )
             }
             SpmErrorKind::MissingRequiredField { field_name } => {
                 write!(formatter, " error=missing-required field_name={field_name}")
@@ -214,49 +258,47 @@ impl Error for SpmError {}
 /// The parser is total for byte strings: hostile input returns [`SpmError`]
 /// before allocation or indexing can exceed the declared limits.
 pub fn parse_spm_model(input: &[u8]) -> Result<SpmModel, SpmError> {
-    if input.len() > MAX_TOTAL_INPUT_BYTES {
-        return Err(SpmError {
-            offset: 0,
-            field_number: None,
-            wire_type: None,
-            kind: SpmErrorKind::InputTooLarge {
-                limit: MAX_TOTAL_INPUT_BYTES,
-                actual: input.len(),
-            },
-        });
-    }
+    ensure_input_length(input.len())?;
 
     let mut allocation = 0_usize;
     let mut reader = Reader::new(input, 0);
     let mut pieces = Vec::new();
-    let mut trainer_payload: Option<&[u8]> = None;
-    let mut normalizer_payload: Option<&[u8]> = None;
+    let mut trainer_payload: Option<(&[u8], usize)> = None;
+    let mut normalizer_payload: Option<(&[u8], usize)> = None;
 
     while !reader.is_finished() {
         let context = reader.read_key()?;
         match context.field_number {
             MODEL_FIELD_PIECES => {
                 reader.require_wire(context, WIRE_LENGTH_DELIMITED)?;
-                let payload = reader.read_length_delimited(context)?;
-                if pieces.len() == MAX_PIECE_COUNT {
-                    return Err(context.error(SpmErrorKind::LimitExceeded {
-                        limit_name: "MAX_PIECE_COUNT",
-                        limit: MAX_PIECE_COUNT,
-                    }));
-                }
-                let piece = parse_piece(payload, context.offset, 1, &mut allocation)?;
+                let (payload, payload_offset) =
+                    reader.read_length_delimited_with_offset(context)?;
+                ensure_piece_room(pieces.len(), context)?;
+                let piece = parse_piece(payload, payload_offset, 1, &mut allocation)?;
                 charge_allocation(&mut allocation, size_of::<SpmPiece>(), context)?;
                 pieces.push(piece);
             }
             MODEL_FIELD_TRAINER_SPEC => {
                 reader.require_wire(context, WIRE_LENGTH_DELIMITED)?;
-                let payload = reader.read_length_delimited(context)?;
-                set_payload_once(&mut trainer_payload, payload, "trainer_spec", context)?;
+                let (payload, payload_offset) =
+                    reader.read_length_delimited_with_offset(context)?;
+                set_payload_once(
+                    &mut trainer_payload,
+                    (payload, payload_offset),
+                    "trainer_spec",
+                    context,
+                )?;
             }
             MODEL_FIELD_NORMALIZER_SPEC => {
                 reader.require_wire(context, WIRE_LENGTH_DELIMITED)?;
-                let payload = reader.read_length_delimited(context)?;
-                set_payload_once(&mut normalizer_payload, payload, "normalizer_spec", context)?;
+                let (payload, payload_offset) =
+                    reader.read_length_delimited_with_offset(context)?;
+                set_payload_once(
+                    &mut normalizer_payload,
+                    (payload, payload_offset),
+                    "normalizer_spec",
+                    context,
+                )?;
             }
             _ => reader.skip_field(context)?,
         }
@@ -265,8 +307,13 @@ pub fn parse_spm_model(input: &[u8]) -> Result<SpmModel, SpmError> {
     let trainer_payload = trainer_payload.ok_or_else(|| missing("trainer_spec", input.len()))?;
     let normalizer_payload =
         normalizer_payload.ok_or_else(|| missing("normalizer_spec", input.len()))?;
-    let (model_type, special_ids) = parse_trainer(trainer_payload, 1)?;
-    let normalizer = parse_normalizer(normalizer_payload, 1, &mut allocation)?;
+    let (model_type, special_ids) = parse_trainer(trainer_payload.0, trainer_payload.1, 1)?;
+    let normalizer = parse_normalizer(
+        normalizer_payload.0,
+        normalizer_payload.1,
+        1,
+        &mut allocation,
+    )?;
 
     Ok(SpmModel {
         pieces,
@@ -323,55 +370,67 @@ fn parse_piece(
     })
 }
 
-fn parse_trainer(input: &[u8], depth: usize) -> Result<(ModelType, SpecialPieceIds), SpmError> {
-    ensure_depth(0, depth)?;
-    let mut reader = Reader::new(input, 0);
+fn parse_trainer(
+    input: &[u8],
+    base_offset: usize,
+    depth: usize,
+) -> Result<(ModelType, SpecialPieceIds), SpmError> {
+    ensure_depth(base_offset, depth)?;
+    let mut reader = Reader::new(input, base_offset);
     let mut model_type: Option<i32> = None;
     let mut unk_id: Option<i32> = None;
     let mut bos_id: Option<i32> = None;
     let mut eos_id: Option<i32> = None;
     let mut pad_id: Option<i32> = None;
+    let mut model_type_context: Option<Context> = None;
 
     while !reader.is_finished() {
         let context = reader.read_key()?;
         match context.field_number {
             TRAINER_FIELD_MODEL_TYPE => {
                 reader.require_wire(context, WIRE_VARINT)?;
-                let value = parse_i32(reader.read_varint(context)?, "trainer_spec.model_type", context)?;
+                let value = parse_i32(
+                    reader.read_varint(context)?,
+                    "trainer_spec.model_type",
+                    context,
+                )?;
                 set_once(&mut model_type, value, "trainer_spec.model_type", context)?;
+                model_type_context = Some(context);
             }
             TRAINER_FIELD_UNK_ID => {
                 reader.require_wire(context, WIRE_VARINT)?;
-                let value = parse_i32(reader.read_varint(context)?, "trainer_spec.unk_id", context)?;
+                let value =
+                    parse_i32(reader.read_varint(context)?, "trainer_spec.unk_id", context)?;
                 set_once(&mut unk_id, value, "trainer_spec.unk_id", context)?;
             }
             TRAINER_FIELD_BOS_ID => {
                 reader.require_wire(context, WIRE_VARINT)?;
-                let value = parse_i32(reader.read_varint(context)?, "trainer_spec.bos_id", context)?;
+                let value =
+                    parse_i32(reader.read_varint(context)?, "trainer_spec.bos_id", context)?;
                 set_once(&mut bos_id, value, "trainer_spec.bos_id", context)?;
             }
             TRAINER_FIELD_EOS_ID => {
                 reader.require_wire(context, WIRE_VARINT)?;
-                let value = parse_i32(reader.read_varint(context)?, "trainer_spec.eos_id", context)?;
+                let value =
+                    parse_i32(reader.read_varint(context)?, "trainer_spec.eos_id", context)?;
                 set_once(&mut eos_id, value, "trainer_spec.eos_id", context)?;
             }
             TRAINER_FIELD_PAD_ID => {
                 reader.require_wire(context, WIRE_VARINT)?;
-                let value = parse_i32(reader.read_varint(context)?, "trainer_spec.pad_id", context)?;
+                let value =
+                    parse_i32(reader.read_varint(context)?, "trainer_spec.pad_id", context)?;
                 set_once(&mut pad_id, value, "trainer_spec.pad_id", context)?;
             }
             _ => reader.skip_field(context)?,
         }
     }
 
-    let model_type = model_type.ok_or_else(|| missing("trainer_spec.model_type", input.len()))?;
+    let model_type =
+        model_type.ok_or_else(|| missing("trainer_spec.model_type", base_offset + input.len()))?;
     if model_type != 2 {
-        return Err(SpmError {
-            offset: 0,
-            field_number: Some(TRAINER_FIELD_MODEL_TYPE),
-            wire_type: Some(WIRE_VARINT),
-            kind: SpmErrorKind::UnsupportedModelType { value: model_type },
-        });
+        return Err(model_type_context
+            .expect("model_type context set with value")
+            .error(SpmErrorKind::UnsupportedModelType { value: model_type }));
     }
     Ok((
         ModelType::Bpe,
@@ -386,12 +445,14 @@ fn parse_trainer(input: &[u8], depth: usize) -> Result<(ModelType, SpecialPieceI
 
 fn parse_normalizer(
     input: &[u8],
+    base_offset: usize,
     depth: usize,
     allocation: &mut usize,
 ) -> Result<NormalizerFacts, SpmError> {
-    ensure_depth(0, depth)?;
-    let mut reader = Reader::new(input, 0);
+    ensure_depth(base_offset, depth)?;
+    let mut reader = Reader::new(input, base_offset);
     let mut name: Option<String> = None;
+    let mut name_context: Option<Context> = None;
     while !reader.is_finished() {
         let context = reader.read_key()?;
         match context.field_number {
@@ -404,18 +465,16 @@ fn parse_normalizer(
                     allocation,
                 )?;
                 set_once(&mut name, value, "normalizer_spec.name", context)?;
+                name_context = Some(context);
             }
             _ => reader.skip_field(context)?,
         }
     }
-    let name = name.ok_or_else(|| missing("normalizer_spec.name", input.len()))?;
+    let name = name.ok_or_else(|| missing("normalizer_spec.name", base_offset + input.len()))?;
     if name != "identity" {
-        return Err(SpmError {
-            offset: 0,
-            field_number: Some(NORMALIZER_FIELD_NAME),
-            wire_type: Some(WIRE_LENGTH_DELIMITED),
-            kind: SpmErrorKind::NonIdentityNormalizer { name },
-        });
+        return Err(name_context
+            .expect("normalizer name context set with value")
+            .error(SpmErrorKind::NonIdentityNormalizer { name }));
     }
     Ok(NormalizerFacts {
         name,
@@ -425,12 +484,8 @@ fn parse_normalizer(
 
 fn parse_i32(value: u64, field_name: &'static str, context: Context) -> Result<i32, SpmError> {
     let signed = value as i64;
-    i32::try_from(signed).map_err(|_| {
-        context.error(SpmErrorKind::InvalidInt32 {
-            field_name,
-            value,
-        })
-    })
+    i32::try_from(signed)
+        .map_err(|_| context.error(SpmErrorKind::InvalidInt32 { field_name, value }))
 }
 
 fn ensure_depth(offset: usize, depth: usize) -> Result<(), SpmError> {
@@ -448,7 +503,36 @@ fn ensure_depth(offset: usize, depth: usize) -> Result<(), SpmError> {
     Ok(())
 }
 
-fn charge_allocation(allocation: &mut usize, amount: usize, context: Context) -> Result<(), SpmError> {
+fn ensure_input_length(input_length: usize) -> Result<(), SpmError> {
+    if input_length > MAX_TOTAL_INPUT_BYTES {
+        return Err(SpmError {
+            offset: 0,
+            field_number: None,
+            wire_type: None,
+            kind: SpmErrorKind::InputTooLarge {
+                limit: MAX_TOTAL_INPUT_BYTES,
+                actual: input_length,
+            },
+        });
+    }
+    Ok(())
+}
+
+fn ensure_piece_room(piece_count: usize, context: Context) -> Result<(), SpmError> {
+    if piece_count >= MAX_PIECE_COUNT {
+        return Err(context.error(SpmErrorKind::LimitExceeded {
+            limit_name: "MAX_PIECE_COUNT",
+            limit: MAX_PIECE_COUNT,
+        }));
+    }
+    Ok(())
+}
+
+fn charge_allocation(
+    allocation: &mut usize,
+    amount: usize,
+    context: Context,
+) -> Result<(), SpmError> {
     let next = allocation.checked_add(amount).ok_or_else(|| {
         context.error(SpmErrorKind::LimitExceeded {
             limit_name: "MAX_TOTAL_ALLOCATION_BYTES",
@@ -482,12 +566,19 @@ fn set_once<T: PartialEq>(
 }
 
 fn set_payload_once<'a>(
-    slot: &mut Option<&'a [u8]>,
-    value: &'a [u8],
+    slot: &mut Option<(&'a [u8], usize)>,
+    value: (&'a [u8], usize),
     field_name: &'static str,
     context: Context,
 ) -> Result<(), SpmError> {
-    set_once(slot, value, field_name, context)
+    if let Some(existing) = slot {
+        if existing.0 != value.0 {
+            return Err(context.error(SpmErrorKind::DuplicateSingular { field_name }));
+        }
+        return Ok(());
+    }
+    *slot = Some(value);
+    Ok(())
 }
 
 fn missing(field_name: &'static str, offset: usize) -> SpmError {
@@ -608,10 +699,18 @@ impl<'a> Reader<'a> {
     }
 
     fn read_length_delimited(&mut self, context: Context) -> Result<&'a [u8], SpmError> {
+        self.read_length_delimited_with_offset(context)
+            .map(|(bytes, _)| bytes)
+    }
+
+    fn read_length_delimited_with_offset(
+        &mut self,
+        context: Context,
+    ) -> Result<(&'a [u8], usize), SpmError> {
         let length_offset = self.absolute_offset();
         let length = self.read_varint(context)?;
-        let length = usize::try_from(length)
-            .map_err(|_| context.error(SpmErrorKind::LengthOverflow))?;
+        let length =
+            usize::try_from(length).map_err(|_| context.error(SpmErrorKind::LengthOverflow))?;
         let end = self.position.checked_add(length).ok_or_else(|| {
             self.error_at(Some(context), length_offset, SpmErrorKind::LengthOverflow)
         })?;
@@ -621,9 +720,10 @@ impl<'a> Reader<'a> {
                 remaining: self.input.len().saturating_sub(self.position),
             }));
         }
+        let payload_offset = self.absolute_offset();
         let result = &self.input[self.position..end];
         self.position = end;
-        Ok(result)
+        Ok((result, payload_offset))
     }
 
     fn read_bounded_string(
@@ -678,9 +778,10 @@ impl<'a> Reader<'a> {
     }
 
     fn read_exact(&mut self, length: usize, context: Context) -> Result<&'a [u8], SpmError> {
-        let end = self.position.checked_add(length).ok_or_else(|| {
-            context.error(SpmErrorKind::LengthOverflow)
-        })?;
+        let end = self
+            .position
+            .checked_add(length)
+            .ok_or_else(|| context.error(SpmErrorKind::LengthOverflow))?;
         if end > self.input.len() {
             return Err(context.error(SpmErrorKind::Truncated {
                 needed: length,
@@ -696,12 +797,7 @@ impl<'a> Reader<'a> {
         self.base_offset.saturating_add(self.position)
     }
 
-    fn error_at(
-        &self,
-        context: Option<Context>,
-        offset: usize,
-        kind: SpmErrorKind,
-    ) -> SpmError {
+    fn error_at(&self, context: Option<Context>, offset: usize, kind: SpmErrorKind) -> SpmError {
         match context {
             Some(context) => context.error(kind),
             None => SpmError {
@@ -711,5 +807,60 @@ impl<'a> Reader<'a> {
                 kind,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    fn context() -> Context {
+        Context {
+            offset: 11,
+            field_number: 7,
+            wire_type: WIRE_LENGTH_DELIMITED,
+        }
+    }
+
+    #[test]
+    fn rejects_declared_limit_boundaries_without_constructing_hostile_inputs() {
+        assert!(matches!(
+            ensure_depth(0, MAX_MESSAGE_NESTING + 1),
+            Err(SpmError {
+                kind: SpmErrorKind::LimitExceeded {
+                    limit_name: "MAX_MESSAGE_NESTING",
+                    ..
+                },
+                ..
+            })
+        ));
+        assert!(matches!(
+            ensure_input_length(MAX_TOTAL_INPUT_BYTES + 1),
+            Err(SpmError {
+                kind: SpmErrorKind::InputTooLarge { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            ensure_piece_room(MAX_PIECE_COUNT, context()),
+            Err(SpmError {
+                kind: SpmErrorKind::LimitExceeded {
+                    limit_name: "MAX_PIECE_COUNT",
+                    ..
+                },
+                ..
+            })
+        ));
+        let mut allocation = MAX_TOTAL_ALLOCATION_BYTES;
+        assert!(matches!(
+            charge_allocation(&mut allocation, 1, context()),
+            Err(SpmError {
+                kind: SpmErrorKind::LimitExceeded {
+                    limit_name: "MAX_TOTAL_ALLOCATION_BYTES",
+                    ..
+                },
+                ..
+            })
+        ));
     }
 }
