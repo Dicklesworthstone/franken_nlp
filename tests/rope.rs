@@ -148,10 +148,6 @@ fn parse_bf16_vector(bits: &str, field: &str, expected_elements: usize) -> Vec<B
         .collect()
 }
 
-fn parse_bf16_chunks(chunks: &[String], field: &str, expected_elements: usize) -> Vec<Bf16> {
-    parse_bf16_vector(&chunks.concat(), field, expected_elements)
-}
-
 fn real_shape_values(elements: usize, multiplier: f32, offset: f32) -> Vec<f32> {
     (0..elements)
         .map(|index| index as f32 * multiplier + offset)

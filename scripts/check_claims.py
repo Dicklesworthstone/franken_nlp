@@ -886,8 +886,17 @@ def run_self_test(root: Path, claims: dict[str, dict[str, Any]]) -> None:
     )
 
     r4_claim = copy.deepcopy(next(iter(claims.values())))
+    r4_claim["id"] = "r4-fixture-claim"
     r4_claim["state"] = "evidenced"
     r4_claim["evidence_artifact_digests"] = ["a" * 64]
+    r4_claim["validity_domain"] = {
+        "dataset": "r4-fixture-dataset",
+        "host": "fixture-host-v1",
+        "numerics_profile": "hf-bf16-eager",
+        "prompt_hash": "r4-fixture-prompt",
+        "recipe_id": "r4-fixture-recipe",
+        "thinking_mode": "r4-fixture-thinking",
+    }
     r4_claims = {r4_claim["id"]: r4_claim}
     r4_annotation = Annotation(r4_claim["id"], "evidenced")
     validate_r4_context_claim(
@@ -932,6 +941,35 @@ def run_self_test(root: Path, claims: dict[str, dict[str, Any]]) -> None:
     )
     if fabricated:
         raise ClaimsError("self-test fabricated R4 ledger row was eligible without retained receipts")
+    typed = eligible_r4_ledger_entries(
+        root,
+        r4_claims,
+        ledger_path=fixtures / "r4_typed_ledger.md",
+    )
+    if typed != {"PERF-R4-TYPED-001": r4_claim["id"]}:
+        raise ClaimsError("self-test typed R4 ledger row was not eligible")
+    for fixture_name in ("r4_retained_garbage_ledger.md", "r4_duplicate_evidence_ledger.md"):
+        hostile = eligible_r4_ledger_entries(
+            root,
+            r4_claims,
+            ledger_path=fixtures / fixture_name,
+        )
+        if hostile:
+            raise ClaimsError(f"self-test hostile R4 ledger row was eligible fixture={fixture_name}")
+    try:
+        validate_r4_context_claim(
+            path=Path("in-memory.md"),
+            line_number=1,
+            active=r4_annotation,
+            r4_ledger="PERF-R4-TYPED-001",
+            claims=r4_claims,
+            eligible_ledgers={"PERF-R4-TYPED-001": "another-claim"},
+        )
+    except ClaimsError as error:
+        if "is bound to claim" not in str(error):
+            raise
+    else:
+        raise ClaimsError("self-test R4 ledger claim binding mismatch was accepted")
     floating_claim = copy.deepcopy(claims["hf-bf16-eager-fidelity"])
     floating_claim["state"] = "evidenced"
     floating_claim["evidence_artifact_digests"] = ["a" * 64]

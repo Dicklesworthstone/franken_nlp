@@ -668,6 +668,9 @@ pub struct PreparedConversionInput {
     pub routes: Vec<TensorRoute>,
     /// One bounded row-panel plan for every source tensor.
     pub panels: Vec<PanelPlan>,
+    /// Checked total BF16 source payload across the complete census.  This is
+    /// the fixed denominator for progress and ETA accounting.
+    pub logical_payload_bytes: u64,
     /// Domain-framed exact source census identity.
     pub census_sha256: String,
 }
@@ -693,12 +696,14 @@ pub fn prepare_nanbeige42_input(
         .iter()
         .map(|entry| PanelPlan::for_tensor(entry, panel_cap))
         .collect::<Result<Vec<_>, _>>()?;
+    let logical_payload_bytes = validate_pinned_logical_payload_bytes(&census)?;
     let census_sha256 = census_digest(&census)?;
     Ok(PreparedConversionInput {
         source,
         census,
         routes,
         panels,
+        logical_payload_bytes,
         census_sha256,
     })
 }
@@ -724,6 +729,29 @@ pub fn prepare_convert_request(
         request.strict_source_dir,
         panel_cap,
     )
+}
+
+/// Sum a validated source census and bind its payload total to the pinned
+/// model.  Call this after [`validate_nanbeige42_census`]: it gives progress
+/// and preflight code one fixed logical-byte denominator rather than allowing
+/// a second, independently maintained total.
+pub fn validate_pinned_logical_payload_bytes(
+    census: &[TensorCensusEntry],
+) -> Result<u64, ConverterError> {
+    let actual = census.iter().try_fold(0_u64, |total, tensor| {
+        total
+            .checked_add(tensor.len)
+            .ok_or(ConverterError::Arithmetic {
+                invariant: "pinned logical payload census sum",
+            })
+    })?;
+    if actual != PINNED_LOGICAL_PAYLOAD_BYTES {
+        return Err(ConverterError::CensusPayloadBytes {
+            expected: PINNED_LOGICAL_PAYLOAD_BYTES,
+            actual,
+        });
+    }
+    Ok(actual)
 }
 
 impl PreparedConversionInput {
@@ -1562,6 +1590,10 @@ pub enum ConverterError {
     Oq1Tripwire { tensor: String },
     /// Census differs in named categories.
     CensusMismatch { diff: CensusDiff },
+    /// The checked full census did not add up to the frozen logical source
+    /// payload.  This protects progress/ETA and preflight accounting against
+    /// a second, drifting byte total.
+    CensusPayloadBytes { expected: u64, actual: u64 },
     /// An unapproved bias tensor was discovered.
     BiasTensor { tensor: String },
     /// A source tensor has no complete mapping.
@@ -1726,6 +1758,10 @@ impl fmt::Display for ConverterError {
                 formatter,
                 "tensor census mismatch: MISSING={:?} SHAPE-MISMATCH={:?} EXTRA={:?}",
                 diff.missing, diff.shape_mismatch, diff.extra
+            ),
+            Self::CensusPayloadBytes { expected, actual } => write!(
+                formatter,
+                "pinned logical source payload mismatch: expected={expected} observed={actual}"
             ),
             Self::BiasTensor { tensor } => write!(
                 formatter,

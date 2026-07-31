@@ -4,7 +4,8 @@
 use franken_nlp::artifact::converter::{
     DEFAULT_PANEL_BYTES, ConversionReceipt, ConversionSourceManifest, ConvertArch, ConverterError,
     ConvertRequest, StorageStage, expected_nanbeige42_census, prepare_convert_request,
-    remap_tensor_name, validate_nanbeige42_census,
+    remap_tensor_name, validate_nanbeige42_census, validate_pinned_logical_payload_bytes,
+    PINNED_LOGICAL_PAYLOAD_BYTES,
 };
 use franken_nlp::artifact::safetensors::TensorCensusEntry;
 
@@ -48,6 +49,31 @@ fn census_validation_reports_a_clean_round_trip() {
     assert!(validate_nanbeige42_census(&actual)
         .expect("matching census")
         .is_match());
+    assert_eq!(
+        validate_pinned_logical_payload_bytes(&actual).expect("pinned payload total"),
+        PINNED_LOGICAL_PAYLOAD_BYTES
+    );
+}
+
+#[test]
+fn payload_total_refuses_a_census_byte_drift() {
+    let mut actual: Vec<_> = expected_nanbeige42_census()
+        .into_iter()
+        .map(|tensor| TensorCensusEntry {
+            name: tensor.name,
+            dtype: tensor.dtype,
+            shape: tensor.shape,
+            len: tensor.len,
+        })
+        .collect();
+    actual[0].len -= 2;
+
+    assert!(matches!(
+        validate_pinned_logical_payload_bytes(&actual),
+        Err(ConverterError::CensusPayloadBytes { expected, actual })
+            if expected == PINNED_LOGICAL_PAYLOAD_BYTES
+                && actual == PINNED_LOGICAL_PAYLOAD_BYTES - 2
+    ));
 }
 
 #[test]
