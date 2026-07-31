@@ -174,7 +174,25 @@ fn schema_and_unpopulated_commands_are_data_only_and_golden_frozen() {
                 document["schema_version"],
                 Value::from(robot::ROBOT_SCHEMA_VERSION)
             );
-            assert_eq!(document["status"], Value::from("unpopulated"));
+            if command == RobotCommand::Backends {
+                assert_eq!(document["status"], Value::from("populated"));
+                assert_eq!(document["kind"], Value::from("robot_backends"));
+                assert!(document["backends"]["detected_features"].is_object());
+                assert!(document["backends"]["registry"].is_array());
+                let selections = document["backends"]["selections"]
+                    .as_array()
+                    .expect("backends report must enumerate every fixed dispatch key");
+                assert_eq!(selections.len(), 3 * 3 * 3 * 5);
+                for selection in selections {
+                    assert_eq!(selection["tier"], Value::from("scalar"));
+                    assert_eq!(
+                        selection["provenance"]["detail"],
+                        Value::from("no measurement — conservative default")
+                    );
+                }
+            } else {
+                assert_eq!(document["status"], Value::from("unpopulated"));
+            }
         }
     }
 }
