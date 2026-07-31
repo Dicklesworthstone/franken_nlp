@@ -301,7 +301,7 @@ impl ReleaseManifest {
                 error.to_string(),
             )
         })?;
-        let manifest = serde_json::from_value(value).map_err(|error| {
+        let manifest: ReleaseManifest = serde_json::from_value(value).map_err(|error| {
             ManifestError::new(
                 "manifest-schema",
                 "$",
