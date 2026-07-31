@@ -38,7 +38,7 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ## Project Mission
 
-`franken_nlp` is a **pure-Rust, memory-safe, CPU-hyper-optimized library + one CLI program (`fnlp`, also shipped as `franken_nlp`)** that runs **Nanbeige4.2-3B** with no general ML framework and turns it into a local NLP toolbox. We transform bf16 weights into `.fnlpq` (int8 first, int4 later) and write model-specific kernels for this one model. Plan §5.1/§5.6 is the normative artifact lifecycle: pinned local HF snapshot → deterministic Generic conversion → fixed 1,957,046,720-byte GitHub Release chunks → release-bound manifest → `fnlp pull` streamed verification/reassembly → native packing → atomic activation. The model weights are **Apache-2.0** — declared by the official model card at the pinned revision, which is the standard Hugging Face license declaration and is settled, not uncertain. Every published artifact/release carries the Apache-2.0 text, Nanbeige attribution, and our modification notice per plan §5.7.
+`franken_nlp` is a **pure-Rust, memory-safe, CPU-hyper-optimized library + one CLI program (`fnlp`, also shipped as `franken_nlp`)** that runs **Nanbeige4.2-3B** with no general ML framework and turns it into a local NLP toolbox. We transform bf16 weights into `.fnlpq` (int8 first, int4 later) and write model-specific kernels for this one model. Plan §5.1/§5.6 is the normative artifact lifecycle: pinned local HF snapshot → canonical Generic conversion (cross-target digest gate or an explicitly narrower canonical-publisher fallback) → fixed 1,957,046,720-byte GitHub Release chunks → release-bound manifest → `fnlp pull` streamed verification/reassembly → native packing → atomic activation. The model weights are **Apache-2.0** — declared by the official model card at the pinned revision, which is the standard Hugging Face license declaration and is settled, not uncertain. Every published artifact/release carries the Apache-2.0 text, Nanbeige attribution, and our modification notice per plan §5.7.
 
 - **Apple Silicon / ARM64** — M4/M5: NEON/SDOT and SMMLA only when the OS actually advertises FEAT_I8MM; autovec remains a measured candidate
 - **AMD / Intel x86-64** — Zen 3 Threadripper AVX2 first-class; Zen 4/5 and Xeon compare sustained 512-bit VNNI, 256-bit VNNI, and narrower tiers rather than assuming widest wins
@@ -47,10 +47,10 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ### What we stand on (the closed dependency universe)
 
-- `/dp/frankentorch` (`ft-kernel-cpu`, `ft-core`, `ft-serialize`) — consumed at the kernel level. At the audited pin, dynamic int8 linear has SDOT/AVX-512-VNNI/scalar but no AVX2/SMMLA, and f32 SDPA is dense per-head, not native 48:8 GQA. Read plan §3.5 before claiming reuse.
-- `../asupersync` — structured-concurrency runtime, for **orchestration / cancellation / IO only** (not for intra-op math parallelism). Its HTTP/TLS client (`tls-webpki-roots`) is the ONLY networked Rust/product code path (`fnlp pull`); no reqwest/hyper, ever. The explicit out-of-band `scripts/fetch_model.sh` / `scripts/fetch_model.ps1` provisioning tools may use system `curl` / PowerShell web APIs to fetch the pinned upstream source closure; they are not inference or library code.
+- `/dp/frankentorch` (`ft-kernel-cpu`, `ft-core`, `ft-serialize`) — consumed at the serial/range-leaf kernel level. At the audited pin, dynamic int8 linear has SDOT/AVX-512-VNNI/scalar but no AVX2/SMMLA, f32 SDPA is dense per-head rather than native 48:8 GQA, and `ft-kernel-cpu` makes Rayon unconditional. Phase 0 must expose the required no-spawn leaves behind a no-Rayon suite surface; current Rayon-backed entrypoints are never production scheduling. Read plan §3.5 before claiming reuse.
+- `../asupersync` — the execution foundation: structured orchestration, cancellation, budgets, IO, bounded admission, and CPU-team lifecycle through `Cx::spawn_blocking` + whole-request/batch-epoch `Cx::scoped_cpu`. Leaf kernels perform math but never spawn. Its HTTP/TLS client (`tls-webpki-roots`) is the ONLY networked Rust/product code path (`fnlp pull`); no reqwest/hyper, ever. The explicit out-of-band `scripts/fetch_model.sh` / `scripts/fetch_model.ps1` provisioning tools may use system `curl` / PowerShell web APIs to fetch the pinned upstream source closure; they are not inference or library code.
 - `/dp/frankensqlite` (`fsqlite`, `fsqlite-types`) — optional metadata/job-state history, disabled by default (NEVER `rusqlite`; fsqlite tables never contain document/prompt/output text). Durable job content spools are separate, explicit, owner-only files governed by plan §8.4.
-- The **complete** direct non-suite release allowlist is `clap`, `serde`/`serde_json`, and `sha2`, each only for the layer named in plan §3.4. Everything else must be `std` or a pinned FrankenSuite surface. **No `thiserror`, `anyhow`, `ctrlc`, `rayon`, `half`, `memmap2`, `uuid`, `num_cpus`, allocator crate, `tokenizers`, `tiktoken`, `minijinja`, or `llguidance`.** Tokenizer/template/grammar are ours; the tokenizer bytes (Apache-2.0, attributed) are embedded in the binary and hash-checked against the artifact's copy at load.
+- The **complete** direct non-suite release allowlist is `clap`, `serde`/`serde_json`, and `sha2`, each only for the layer named in plan §3.4. Everything else must be `std` or a pinned FrankenSuite surface. **No `thiserror`, `anyhow`, `ctrlc`, `rayon`, `half`, `memmap2`, `uuid`, `num_cpus`, allocator crate, `tokenizers`, `tiktoken`, `minijinja`, or `llguidance`. Rayon is forbidden from the entire FrankenNLP release graph, not merely as a direct dependency.** Tokenizer/template/grammar are ours; the tokenizer bytes (Apache-2.0, attributed) are embedded in the binary and hash-checked against the artifact's copy at load.
 
 Project source license is the exact text in `LICENSE` (MIT + OpenAI/Anthropic Rider); the model weights remain **Apache-2.0 © 2026 Nanbeige Team**, with attribution carried in artifacts, manifests, and `fnlp --version`. `swiss_army_llama` is the project owner's own prior work — reuse its methods/presets freely with attribution.
 
@@ -73,7 +73,7 @@ The project must be both:
    - opt-in **durable job mode** (`fnlp job`: manifest → journal/resume/verify/materialize with no content persistence by default)
    - user-owned **Assay surfaces** (`eval`, `calibrate`, `qualify`) and a bounded data-only recipe compiler only after its Phase-5 gates
 
-Input: text files/stdin/NDJSON. No Python or foreign ML/runtime ABI in the default inference path, no inference network, no GPU required. Enumerated OS-facing islands/features (SIMD, opt-in mmap/NUMA hints, optional allocator) are governed by plan G3/G4 rather than hidden under an absolute “no FFI” slogan.
+Input: text files/stdin/NDJSON. No Python or foreign ML/runtime ABI in the default inference path, no inference network, no GPU required. Enumerated OS-facing islands/features (SIMD and opt-in mmap/NUMA/huge-page hints) are governed by plan G3/G4 rather than hidden under an absolute “no FFI” slogan. The release uses the system allocator.
 
 ---
 
@@ -82,7 +82,7 @@ Input: text files/stdin/NDJSON. No Python or foreign ML/runtime ABI in the defau
 Implementation follows spec documents, not ad-hoc copying. Read in this order:
 1. [`COMPREHENSIVE_PLAN_FOR_FRANKEN_NLP.md`](COMPREHENSIVE_PLAN_FOR_FRANKEN_NLP.md) — the master plan.
 2. The **research-decision register (plan §14)** — observed rows need truth-pack promotion; partial/open/blocked rows gate only their dependent surface. Empirical questions must be measured in their named phase, not “answered” from prose.
-3. The **reference sources** (pinned + hashed in `docs/truth-pack/`): `modeling_nanbeige.py` (the loop driver, KV binding, attention), `configuration_nanbeige.py` (the defaults that decide which features are active), `tokenizer_config.json` (the verbatim chat template), `tokenizer.model`, and the `Nanbeige/llama.cpp` `nanbeige42` fork (a second, easier-to-read implementation of the same semantics).
+3. The **reference sources** (pinned + hashed in `docs/truth-pack/`): `modeling_nanbeige.py` (the primary loop/KV/attention semantics), `configuration_nanbeige.py` (the defaults that decide which features are active), `tokenizer_config.json` (the verbatim chat template), `tokenizer.model`, a tested official `ggml-org/llama.cpp` revision at/after Nanbeige support commit `b77d646…` (secondary CPU/GGUF differential and performance baseline), and the authors' `Nanbeige/llama.cpp` `nanbeige42` fork (historical lineage, not an independent oracle). GPL-3.0 `rlx-nanbeige` may be exercised only out-of-tree as a black-box differential; never copy or depend on it.
 
 **Hard rule: no surface ships against an unresolved dependency.** Promote source observations only with immutable hash + line span + replay fixture.
 
@@ -106,7 +106,7 @@ Load-bearing, non-negotiable rules distilled from the plan and from the frankent
 
 7. **AVX2 is first-class and exact.** Raw `vpmaddubsw` can saturate inside the instruction; accumulation cadence cannot fix it. Implement/measure both plan §6.5 candidates: low-7/high-bit decomposition with proved i16 pair bounds and the widened signed-i16 route. Both equal scalar/i64 over the full i8 domain; raw saturation is not a shippable approximate mode.
 
-8. **NEVER nest rayon under a held lock; NEVER nest asupersync runtimes.** The process has one shared runtime/kernel resource set; engines hold leases. Concurrent sync callers enter bounded admission, not independent forwards. Re-entrant calls from the same runtime fail typed/fast. Scheduler lifecycle is model-checked/replayed, not just watchdog-tested.
+8. **Asupersync owns every compute team; leaf kernels never spawn.** An admitted run crosses `Cx::spawn_blocking` once and uses one `Cx::scoped_cpu` region spanning the whole request or bounded batch epoch, with checkpoints at tile/morsel boundaries. Never enter it under an engine lock, recursively create a team, or nest an asupersync runtime. Concurrent sync callers enter bounded admission or a compatible batch, not independent forwards. Rayon is absent from the release graph. Re-entrant calls fail typed/fast; cancellation/panic joins and scheduler lifecycle are model-checked/replayed, not just watchdog-tested.
 
 9. **Determinism is scoped.** Semantic greedy output is exact under a named numerics profile; canonical bytes additionally require ordered output and scrub volatile metadata. Batch/prefix equivalence requires the same per-row reduction order. Never promise byte identity for completion-order NDJSON or approximate transcendental modes.
 
@@ -120,7 +120,7 @@ Load-bearing, non-negotiable rules distilled from the plan and from the frankent
 
 14. **AVX-512 width is not destiny.** Benchmark sustained zmm-VNNI, ymm-VNNI, AVX2, and scalar per host/shape with p50/p95/p99, clocks/energy where available, and thermal steady state. Dynamic M/T tails still exist; firmware/VM feature exposure is authoritative.
 
-15. **Memory admission precedes allocation.** BF16 KV is 176 KiB/token/sequence: 8K is ~1.38 GiB and batch 64 is ~88 GiB. Use lazy COW pages, an explicit memory budget, and checked worst-case admission. Reported 256K context is not a usability promise.
+15. **Memory admission precedes allocation and is process-aggregate.** BF16 KV is 176 KiB/token/sequence: 8K is ~1.38 GiB and batch 64 is ~88 GiB. One `EngineResources` ledger charges weights, KV, scratch, caches, jobs, and staging across every engine; per-engine limits cannot each promise the same RAM. Use two-phase reservations, lazy COW pages, and checked worst-case admission. Reported 256K context is not a usability promise.
 
 16. **License compliance is mechanical, not conditional.** The model is Apache-2.0 per the official card's declaration at the pinned revision. Every published artifact/release carries the license text, attribution, and modification notice (plan §5.7), verified by the byte-compare release test. Do not reintroduce fail-closed "license uncertainty" language — the owner has ruled it settled.
 
@@ -146,15 +146,17 @@ Load-bearing, non-negotiable rules distilled from the plan and from the frankent
 
 27. **A resident process is research, not permission to add a server.** AA-R1 begins with evidence of repeated multi-process loads/pool contention. Any experiment is owner-only OS-local IPC over the versioned framed contract, with no routable listener or remote credentials, and retains the in-process/batch fallback.
 
-28. **Source acquisition, release packaging, and client installation are different trust zones.** `scripts/fetch_model.sh` / `scripts/fetch_model.ps1` download the immutable upstream conversion closure; they never masquerade as the end-user installer. Research-only truth-pack evidence does not become a converter prerequisite. The public artifact is the deterministic Generic `.fnlpq`, versioned independently from the binary and split at exactly 1,957,046,720 bytes except the tail. Never publish from an unreceipted converter output, never upload with a wildcard/`--clobber`, and never rewrite bytes under an existing tag/name.
+28. **Source acquisition, release packaging, and client installation are different trust zones.** `scripts/fetch_model.sh` / `scripts/fetch_model.ps1` download the immutable upstream conversion closure; they never masquerade as the end-user installer. Research-only truth-pack evidence does not become a converter prerequisite. The public artifact is the canonical Generic `.fnlpq`, versioned independently from the binary and split at exactly 1,957,046,720 bytes except the tail. Cross-OS/ISA conversion must hash-identically or the release names one canonical publisher target and narrows the reproducibility claim. Never publish from an unreceipted converter output, upload with a wildcard/`--clobber`, or rewrite bytes under an existing tag/name.
 
-29. **One artifact manager owns every client model download.** `install.sh`/`install.ps1` install the binary, then invoke that exact installed binary's `fnlp pull`; shell and PowerShell must not parse the model manifest, concatenate parts, invent cache filenames, or duplicate integrity logic. Default pull trusts only the release-bound embedded manifest; local/private manifests require an explicit expected digest. Part + whole + source/license/census identities, native-pack differential, and atomic activation all pass before the new model becomes visible.
+29. **One artifact manager owns every client model download.** `install.sh`/`install.ps1` install the binary, then invoke that exact installed binary's `fnlp pull`; shell and PowerShell must not parse the model manifest, concatenate parts, invent cache filenames, or duplicate integrity logic. Default pull trusts only the release-bound embedded manifest; local/private manifests require an expected digest obtained through an independently trusted channel. SHA-256 proves byte identity, not publisher identity; releases also publish GitHub attestations for binaries and the manifest/receipt closure. Owner-controlled roots, a non-reentrant content lock, `create_new`, no symlink/reparse/device targets, sync/same-filesystem activation, native-pack differential, and honest durability status all pass before the new model becomes visible.
+
+30. **Claims and receipts are typed evidence.** Public numeric/superlative claims must map to `docs/CLAIMS.json`; intentional reference behavior belongs in `docs/BEHAVIOR_NOTES.md`; `.fnlpr` receipts declare `Replayable`, `StructuralReplay`, `VerifiableIfArtifactsSupplied`, or `AuditOnly`, and omit private bytes unless retention is explicitly authorized. Structural cost witnesses distinguish a full target invocation (two loops / 44 layer executions per position) from any AA-D1 loop-1 draft invocation, and count lm_head rows plus KV bytes. “Verified” without scope, validity domain, and evidence grade is forbidden.
 
 ---
 
 ## Alien-Artifact Engineering Contract
 
-Start with a deterministic baseline and measured hotspot. A candidate needs `EV=(Impact×Confidence×Reuse)/(Effort×AdoptionFriction)≥2`, explicit state/actions/loss/units, assumptions, p50/p95/p99, proof/tolerance authority, interaction/composition check, provenance, and fallback. Runtime adaptation follows offline replay → shadow → canary → explicit default; at most one controller per subsystem. Use CVaR alone for quality-tail optimization; do not stack tail jargon. Exact loop speculation or graveyard it. Cross-loop wavefront work requires a fragmentation trace before code. See plan §10.5 cards AA-K1/Q1/S1/W1/C1/T1/D1/U1/A1/R1 and §10.6's rejected/deferred ideas.
+Start with a deterministic baseline and measured hotspot. A candidate needs `EV=(Impact×Confidence×Reuse)/(Effort×AdoptionFriction)≥2`, explicit state/actions/loss/units, assumptions, p50/p95/p99, proof/tolerance authority, interaction/composition check, provenance, and fallback. Runtime adaptation follows offline replay → shadow → canary → explicit default; at most one controller per subsystem. Use CVaR alone for quality-tail optimization; do not stack tail jargon. Exact loop speculation or graveyard it. Cross-loop wavefront work requires a fragmentation trace before code. See plan §10.5 cards AA-K1/N1/L1/B1/Q1/S1/W1/C1/T1/D1/U1/A1/R1 and §10.6's rejected/deferred ideas.
 
 ---
 
@@ -207,8 +209,9 @@ Build-surface note: both binaries compile from thin shims over `cli_main()` (doc
 Each module includes unit tests for happy path, edge cases, error handling. Beyond that, the conformance ladder is the heart of the project (plan §9):
 
 - **Reference oracle**: pinned CPU HF environment running `NanbeigeForCausalLM` (`trust_remote_code`, `use_fast=False`) via `scripts/gen_reference_fixtures.py` — **establish the oracle's own nondeterminism floor first** (two runs × two thread counts) before setting any tolerance.
+- **Independent-enough checks**: a deliberately simple in-repo scalar f32 specification engine localizes failures; a tested official post-`b77d646…` llama.cpp revision is the secondary CPU/GGUF differential and performance baseline. The authors' fork is shared lineage, not another vote; RLX remains an out-of-tree GPL black box only.
 - **Parity ladder L0–L5**: L0 exact; L1 metric vector (not cosine alone); L2 all 44 layer outputs + two loop norms; L3 measured tolerance; L4 f32 greedy exact where oracle reproducible; L5 task semantics.
-- **Invariant gates**: scoped determinism, batch/prefix equivalence, independent structured-output/source-grounding validation, untrusted-segment bytes preserved with all control ids excluded (or rejection), sparse=full, forced=sequential KV, every trie traversal=naïve, uninterrupted=resumed owned job, dependency-scope snapshot mutation, integer SIMD ≡ scalar/i64, overflow/fork-tail/admission proofs, scheduler model/interleaving tests, cache privacy, source-manifest verification, conversion-twice identity, split/reassembly identity, streamed part/whole verification, resume/concurrent-pull safety, and installed-basename discovery.
+- **Invariant gates**: scoped determinism, batch/prefix equivalence, independent structured-output/source-grounding validation, untrusted-segment bytes preserved with all control ids excluded (or rejection), sparse=full, forced=sequential KV, every trie traversal=naïve, uninterrupted=resumed owned job, dependency-scope snapshot mutation, integer SIMD ≡ scalar/i64, overflow/fork-tail/admission proofs, one admitted `scoped_cpu` team with exact coordinator/child width, bounded checkpoints, disconnect-safe cancel/panic full join, re-entry refusal, no per-op thread creation, no-spawn leaves and no Rayon in the release graph, one-time resource-host config conflict plus aggregate multi-engine reserve/commit/abort accounting, scheduler model/interleaving tests, cache privacy, source-manifest verification, conversion-twice plus cross-target identity-or-fallback, split/reassembly identity, streamed part/whole verification, hostile-root/atomic-output safety, resume/concurrent-pull safety, installed-basename discovery, and claims/receipt/structural-cost registry consistency.
 - **Task evals** (plan §9.6): named, versioned datasets per task; scorecards carry recipe id + prompt hash + thinking mode. Quality regressions gate releases like parity regressions.
 - **Adversarial-content and evidence gates**: matched clean/attack fixtures report task-specific steering rather than a firewall claim; semantic second-reader uplift is measured against labeled fields; acceptance-audit arithmetic uses exact small-population goldens and requires human grades.
 - **Model-gated e2e**: ordinary CI reports `SKIPPED_NO_MODEL`; release certification requires an armed pass with artifact digest and fallbacks pointed at `/nonexistent`. An authorized public-model release additionally proves fresh HOME/LOCALAPPDATA installer → `fnlp pull` → no-flag inference, followed by a byte-perfect cache hit whose inference run opens no network.
@@ -261,6 +264,98 @@ br sync --flush-only     # export to JSONL (NO git ops)
 ```
 
 Conventions: use the bead ID (e.g. `br-123`) as the Agent-Mail `thread_id` and prefix subjects with `[br-123]`; put the issue ID in the file-reservation `reason`; include `br-###` in commit messages.
+
+---
+
+## The Implementation Swarm — Code-First / Batch-Verify Strategy (NTM)
+
+Implementation of this project runs as an NTM tmux swarm of **12 codex panes on `gpt-5.6-terra` at `xhigh` reasoning effort**, governed by `/ntm` and `/vibing-with-ntm`, after the final plan has been converted to beads via `/beads-br`, `/beads-bv`, and `/beads-workflow`. All real builds route through `/rch`. The swarm follows the **Code-First / Batch-Verify** methodology below. It exists to defeat build contention; every agent in the swarm must know it and follow it.
+
+> Operational note: NTM's codex launch template pins the reasoning effort. Before spawning this swarm, set the template's `model_reasoning_effort` to `xhigh` (and restore it afterward), then `ntm spawn franken_nlp --cod=12:gpt-5.6-terra --no-user`.
+
+### The core problem it solves
+
+A swarm of N agents sharing one repo and one remote-build backend (rch) has a brutal bottleneck: builds, not coding. Two compounding facts make per-bead building catastrophic here:
+
+1. **The crate is big.** `franken_nlp` is a single crate by design (plan §4.1); a from-scratch compile takes minutes even offloaded to rch.
+2. **rch serializes same-project builds.** rch's `active_project_exclusion` lets only a few concurrent builds of the same project run; the rest queue or fall back to local execution, thrashing the disk.
+
+### The insight
+
+Separate the cheap, parallelizable work (writing code) from the expensive, serialized work (building/testing). Reading and writing code is free and embarrassingly parallel across 12 agents. Building is the scarce, serialized resource. So: let all 12 agents write code at full speed and commit without building; then run the build/test exactly ONCE, centrally, over everyone's combined changes.
+
+### The two-phase loop
+
+```
+┌─ PHASE 1: CODE-FIRST WAVE (all 12 agents, parallel, no builds) ─┐
+│  each agent:  claim a ready bead (via bead-assignee)            │
+│               → WRITE the real code + test                      │
+│               → `cargo check --locked` at most (syntax only)    │
+│               → COMMIT immediately ("…— code-first, batch-test  │
+│                 pending"), leave bead in_progress               │
+│               → next bead                                       │
+│  KPI = commit stream (target ~20–40 commits/10 min)             │
+└─────────────────────────────────────────────────────────────────┘
+                              │  (commit-rate dip = wave saturated)
+                              ▼
+┌─ PHASE 2: BATCH VERIFY + CLOSE (orchestrator, once, central) ───┐
+│  1. commit-flush: tell agents to commit in-flight work so the   │
+│     tree is consistent                                          │
+│  2. ONE build/test over the combined changes: `cargo test       │
+│     --locked` (or `scripts/check.sh` once it exists), on a      │
+│     dedicated orchestrator CARGO_TARGET_DIR, via rch            │
+│  3. triage failures (see below), fix, re-run until green        │
+│  4. CLOSE the green in_progress beads with the suite as proof   │
+└─────────────────────────────────────────────────────────────────┘
+                              │  closing beads UNBLOCKS dependents
+                              ▼
+                    ready pool refills → next Phase-1 wave
+```
+
+(This project is one crate, so "the union of touched crates" collapses to the crate's full locked test suite; the amortization argument is unchanged.)
+
+### Why the close step is the engine that refills work
+
+This is the subtle, critical part. `br` unblocks a dependent bead only when its blocker is **closed**, not when it is committed-but-in_progress. During a code-first wave, agents commit but deliberately leave beads in_progress, so:
+
+- The ready pool drains (claimed → in_progress) and does not refill; the blocked beads stay blocked because nothing has closed.
+- The unblock wave fires only at the Phase-2 close step: when the WIP beads pass tests and close, their dependents flip to ready in a burst.
+
+So the loop is not "code forever then test once at the very end"; it is a **pump**. Each Phase-2 cycle closes a layer, which unblocks the next layer of the blocked pool, which feeds the next Phase-1 wave. Periodic cycles keep the swarm fed; one giant end-pass would starve it.
+
+### The trigger (when to flip Phase 1 → Phase 2)
+
+**The commit-rate dip.** While agents have claimable work, commits pour in (20–40 per 10 minutes). When the ready pool empties, agents finish their in_progress beads and the rate falls off a cliff (a prior campaign watched 20 → 12 → 5 per 10 minutes). That dip means "the wave is saturated, the queue is dry" and is the signal to run the batch verify. It is a self-pacing trigger; no fixed timer.
+
+### Enforcement (what keeps it honest)
+
+Agents want to build to "prove" their work, so the model has to be actively enforced:
+
+- **Build-kill:** every orchestrator tick kills any per-agent rch/cargo-test build (pkill by PID on the pane-unique target dirs). The orchestrator's own batch-verify uses a separate, exempt target dir.
+- **Explicit directive:** agents are told `cargo check --locked` is the maximum per bead; no `cargo test`, no rch, no remote-proof waiting; commit immediately.
+- **KPI reframed:** success during Phase 1 is measured by the commit stream, not per-bead closures (closures are deferred and arrive in bursts during Phase 2).
+
+### Failure triage in Phase 2 (the part that makes it safe)
+
+Code committed without running its tests will have failures; that is expected and fine, because the batch pass catches them all at once:
+
+- **Cargo's early-abort trap:** a single test-target compile error makes `cargo test` abort early, so the pass/fail line is a misleading prefix (a prior campaign saw "240/0 green" that was actually 793/17 once it compiled). Always fix compile errors first, then re-run for the true count.
+- **Cluster failures by file**, then dispatch each cluster to one agent (file-exclusive, no collisions) with the exact assertion + location. Re-run until 0 failed.
+- **Close only green, with evidence.** Cite the green suite in the close reason. Leave genuinely-incomplete beads in_progress (or reopen) with a comment; never false-close.
+- **The project's quality gates move to close time, not per bead.** The "Mandatory Checks After Substantive Changes" section above applies to the Phase-2 batch pass (plus `ubs --diff` over the wave's combined diff), and the plan's parity/eval gates are unchanged: a bead whose contract includes an L-gate or scorecard closes only when that gate ran in the batch pass.
+
+### Why it is ~20–100× faster
+
+- Phase 1 parallelizes the cheap resource (12 agents writing) and removes the scarce one (builds) from the per-bead path entirely.
+- The expensive build happens once per N agents per wave instead of once per bead per agent, amortizing the multi-minute compile across dozens of changes.
+- No build contention, no local-fallback thrash, no disk blowups.
+
+### Hard-won gotchas (baked in from prior campaigns)
+
+- **Shared `main`, no git surgery.** A `git reset` by one agent can orphan a peer's commit. Verify no commit was lost via `git merge-base --is-ancestor`; never rewrite shared history.
+- **Stale rate-limit display.** A codex "usage limit" message persists in-buffer and codex won't auto-retry; nudge the pane to confirm before assuming an outage (a prior campaign lost ~5.5 hours idling on a false outage).
+- **Degraded Agent Mail.** If the mail layer is slow or down, fall back to bead-assignee locking (`br update <id> --assignee <agent>`) instead of blocking on mail reservations.
+- **Disk/build-storm watch.** If free disk drops fast or the build-process count spikes, the enforcement slipped; re-kill stray builds and re-issue the directive.
 
 ---
 
