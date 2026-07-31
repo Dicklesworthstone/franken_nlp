@@ -5,9 +5,9 @@
 //! installing those bytes later changes test data rather than renderer logic.
 
 use franken_nlp::template::{
-    AssistantReasoning, ContentPart, Conversation, Message, MessageContent, MessageRole,
-    RenderOptions, TemplateBuilder, ToolCall, ToolDefinition, ToolFormat, ToolResult,
-    DEFAULT_SYSTEM_TEXT, IM_START, MEDIA_REMINDER_TEXT, THINK_END, THINK_START,
+    AssistantReasoning, ContentPart, Conversation, DEFAULT_SYSTEM_TEXT, IM_START,
+    MEDIA_REMINDER_TEXT, Message, MessageContent, MessageRole, RenderOptions, THINK_END,
+    THINK_START, TemplateBuilder, ToolCall, ToolDefinition, ToolFormat, ToolResult,
 };
 use serde_json::json;
 use std::path::Path;
@@ -181,6 +181,64 @@ fn default_system_and_generation_suffix_are_explicit() {
     .expect("typed conversation renders with thinking disabled");
     assert!(no_thinking.ends_with(&format!("{IM_START}assistant\n")));
     assert!(!no_thinking.ends_with(THINK_START));
+}
+
+#[test]
+fn first_system_position_and_tool_definition_formats_are_explicit() {
+    let first_system = Conversation {
+        messages: vec![
+            Message::text(MessageRole::System, "owner supplied system"),
+            Message::text(MessageRole::User, "hello"),
+        ],
+        tools: vec![ToolDefinition {
+            name: "lookup".to_owned(),
+            description: "Look up a value.".to_owned(),
+            parameters: json!({"type":"object","properties":{"key":{"type":"string"}}}),
+        }],
+    };
+    let non_leading_system = Conversation::new(vec![
+        Message::text(MessageRole::User, "hello"),
+        Message::text(MessageRole::System, "later system"),
+    ]);
+
+    let xml = TemplateBuilder::with_options(RenderOptions {
+        add_generation_prompt: false,
+        tool_format: ToolFormat::Xml,
+        ..RenderOptions::default()
+    })
+    .render(&first_system)
+    .expect("first system with XML tool declaration renders");
+    assert!(xml.starts_with("<tools>\n"));
+    assert!(xml.contains("<tool><name>lookup</name><description>Look up a value.</description>"));
+    assert_eq!(xml.matches(&format!("{IM_START}system\n")).count(), 1);
+    assert!(xml.contains(&format!(
+        "{IM_START}system\nowner supplied system{IM_END}\n"
+    )));
+    assert!(!xml.contains(DEFAULT_SYSTEM_TEXT));
+
+    let json = TemplateBuilder::with_options(RenderOptions {
+        add_generation_prompt: false,
+        tool_format: ToolFormat::Json,
+        ..RenderOptions::default()
+    })
+    .render(&first_system)
+    .expect("first system with JSON tool declaration renders");
+    assert!(json.starts_with("<tools>[{"));
+    assert!(json.contains(
+        "\"function\":{\"description\":\"Look up a value.\",\"name\":\"lookup\",\"parameters\":{"
+    ));
+    assert_ne!(xml, json);
+
+    let rendered_non_leading = TemplateBuilder::with_options(RenderOptions {
+        add_generation_prompt: false,
+        ..RenderOptions::default()
+    })
+    .render(&non_leading_system)
+    .expect("non-leading system remains role framed");
+    assert!(rendered_non_leading.starts_with(&format!(
+        "{IM_START}system\n{DEFAULT_SYSTEM_TEXT}{IM_END}\n{IM_START}user\nhello{IM_END}\n"
+    )));
+    assert!(rendered_non_leading.ends_with(&format!("{IM_START}system\nlater system{IM_END}\n")));
 }
 
 #[test]
