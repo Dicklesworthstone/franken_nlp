@@ -321,14 +321,12 @@ check_source_patch_closure() {
     log "PATCH suite=frankentorch name=block relevance=required source_closure=PASS"
 }
 
-cargo_lock_package_matches() {
+cargo_lock_package_sources() {
     package=$1
-    url=$2
-    rev=$3
-    awk -v expected_package="$package" -v expected_url="$url" -v expected_rev="$rev" '
+    awk -v expected_package="$package" '
         function complete() {
-            if (active && package == expected_package && source ~ expected_url && source ~ expected_rev) {
-                found = 1
+            if (active && package == expected_package) {
+                print source
             }
         }
         /^\[\[package\]\]/ { complete(); active = 1; package = ""; source = ""; next }
@@ -339,8 +337,19 @@ cargo_lock_package_matches() {
             package = line
         }
         active && $0 ~ /^source = / { source = $0 }
-        END { complete(); exit(found ? 0 : 1) }
+        END { complete() }
     ' "$CARGO_LOCK"
+}
+
+cargo_lock_package_matches_exact_source() {
+    package=$1
+    url=$2
+    rev=$3
+    sources=$(cargo_lock_package_sources "$package")
+    count=$(printf '%s\n' "$sources" | awk 'NF { count += 1 } END { print count + 0 }')
+    [ "$count" -eq 1 ] || return 1
+    expected="source = \"git+$url?rev=$rev#$rev\""
+    [ "$sources" = "$expected" ]
 }
 
 check_cargo_cross_checks() {
@@ -358,7 +367,10 @@ check_cargo_cross_checks() {
 
     while IFS='|' read -r kind dependency package source url rev optional consumer features; do
         [ "$kind" = dependency ] || continue
-        cargo_lock_package_matches "$package" "$url" "$rev" || fail "cargo-lock-suite-drift" "package=$package url=$url rev=$rev"
+        if ! cargo_lock_package_matches_exact_source "$package" "$url" "$rev"; then
+            observed=$(cargo_lock_package_sources "$package" | tr '\n' ';')
+            fail "cargo-lock-suite-source-closure-drift" "package=$package expected=git+$url?rev=$rev#$rev observed=${observed:-none}"
+        fi
         grep -F "$url" "$metadata" >/dev/null 2>&1 || fail "metadata-suite-source-missing" "package=$package url=$url"
         grep -F "$rev" "$metadata" >/dev/null 2>&1 || fail "metadata-suite-revision-missing" "package=$package rev=$rev"
     done < "$LOCK_FILE"
