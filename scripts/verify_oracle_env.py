@@ -311,7 +311,7 @@ def recreate(record: dict[str, Any], target: Path) -> None:
     log("recreate_pass", venv=str(target), freeze_sha256=observed, package_count=len(expected))
 
 
-def source_files(record: dict[str, Any], source: Path, *, need_weights: bool) -> None:
+def source_files(record: dict[str, Any], source: Path, *, need_weights: bool) -> dict[str, object]:
     """Hash-check every canonical model file before an oracle loads any of it.
 
     ``need_weights`` remains a compatibility argument for existing callers.  The
@@ -336,7 +336,15 @@ def source_files(record: dict[str, Any], source: Path, *, need_weights: bool) ->
         raise OracleFailure(f"canonical source closure verification failed: {exc}") from exc
     except (OSError, ValueError) as exc:
         raise OracleFailure(f"cannot verify canonical source closure: {exc}") from exc
+    closure = {
+        "manifest_path": SOURCE_MANIFEST_RELATIVE_PATH,
+        "manifest_sha256": sha256_file(SOURCE_MANIFEST_PATH),
+        "file_count": len(entries),
+        "closure_total_bytes": sum(int(entry["bytes"]) for entry in entries),
+        "verification": "sha256_and_byte_length_each_canonical_file",
+    }
     log("source_closure_valid", source=str(source), file_count=len(entries))
+    return closure
 
 
 def capture_environment() -> dict[str, Any]:
@@ -431,7 +439,7 @@ def explicit_greedy_decode(model: Any, inputs: dict[str, Any], max_new_tokens: i
 
 
 def smoke(record: dict[str, Any], source: Path, output: Path | None) -> None:
-    source_files(record, source, need_weights=True)
+    source_closure = source_files(record, source, need_weights=True)
     validate_installed_closure(record)
     try:
         import torch
@@ -471,6 +479,7 @@ def smoke(record: dict[str, Any], source: Path, output: Path | None) -> None:
         "schema_version": 1,
         "model_id": MODEL_ID,
         "revision": REVISION,
+        "source_closure": source_closure,
         "runtime": capture_environment(),
         "execution": {
             "device": "cpu",
