@@ -279,7 +279,7 @@ ensure_partial_and_journal() {
 effective_host_ok() {
     effective=$1
     case "$effective" in
-        https://huggingface.co/*|https://cdn-lfs.huggingface.co/*|https://*.xethub.hf.co/*) return 0 ;;
+        https://huggingface.co/*|https://cdn-lfs.huggingface.co/*|https://*.xethub.hf.co/*|https://*.cdn.hf.co/*) return 0 ;;
         *) return 1 ;;
     esac
 }
