@@ -141,9 +141,26 @@ pub struct ItemMetadata {
     pub updated_at_ms: u64,
 }
 
+/// A state-transition audit record for a job item.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StateTransitionMetadata {
+    /// Engine-owned transition identifier.
+    pub transition_id: MetadataId,
+    /// Parent job identifier.
+    pub job_id: MetadataId,
+    /// Parent item identifier.
+    pub item_id: MetadataId,
+    /// State reached at this transition.
+    pub state: JobState,
+    /// Owner-supplied UTC milliseconds since the Unix epoch.
+    pub recorded_at_ms: u64,
+}
+
 /// A completed or interrupted attempt's metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AttemptMetadata {
+    /// Engine-owned attempt identifier.
+    pub attempt_id: MetadataId,
     /// Parent job identifier.
     pub job_id: MetadataId,
     /// Parent item identifier.
@@ -159,6 +176,8 @@ pub struct AttemptMetadata {
 /// A scalar measurement associated with an item attempt.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MetricMetadata {
+    /// Engine-owned metric identifier.
+    pub metric_id: MetadataId,
     /// Parent job identifier.
     pub job_id: MetadataId,
     /// Parent item identifier.
@@ -167,6 +186,21 @@ pub struct MetricMetadata {
     pub kind_code: u16,
     /// Numeric measurement in the kind's documented unit.
     pub value: f64,
+    /// Owner-supplied UTC milliseconds since the Unix epoch.
+    pub recorded_at_ms: u64,
+}
+
+/// A typed error observation without error-message text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ErrorMetadata {
+    /// Engine-owned error identifier.
+    pub error_id: MetadataId,
+    /// Parent job identifier.
+    pub job_id: MetadataId,
+    /// Parent item identifier.
+    pub item_id: MetadataId,
+    /// Closed error category and context codes.
+    pub summary: TypedErrorSummary,
     /// Owner-supplied UTC milliseconds since the Unix epoch.
     pub recorded_at_ms: u64,
 }
@@ -608,6 +642,18 @@ impl MetadataStore {
         }
     }
 
+    /// Persists a state transition when persistence is enabled.
+    pub fn record_state_transition(
+        &self,
+        record: StateTransitionMetadata,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Disabled => Ok(()),
+            #[cfg(feature = "metadata-store")]
+            Self::Enabled(store) => store.record_state_transition(record),
+        }
+    }
+
     /// Persists an attempt record when persistence is enabled.
     pub fn record_attempt(&self, record: AttemptMetadata) -> Result<(), StorageError> {
         match self {
@@ -627,17 +673,11 @@ impl MetadataStore {
     }
 
     /// Persists a typed error summary when persistence is enabled.
-    pub fn record_error(
-        &self,
-        job_id: MetadataId,
-        item_id: MetadataId,
-        error: TypedErrorSummary,
-        recorded_at_ms: u64,
-    ) -> Result<(), StorageError> {
+    pub fn record_error(&self, record: ErrorMetadata) -> Result<(), StorageError> {
         match self {
             Self::Disabled => Ok(()),
             #[cfg(feature = "metadata-store")]
-            Self::Enabled(store) => store.record_error(job_id, item_id, error, recorded_at_ms),
+            Self::Enabled(store) => store.record_error(record),
         }
     }
 
@@ -647,6 +687,15 @@ impl MetadataStore {
             Self::Disabled => Ok(None),
             #[cfg(feature = "metadata-store")]
             Self::Enabled(store) => store.job_state(job_id),
+        }
+    }
+
+    /// Reads a stored item state without exposing arbitrary database values.
+    pub fn item_state(&self, item_id: MetadataId) -> Result<Option<JobState>, StorageError> {
+        match self {
+            Self::Disabled => Ok(None),
+            #[cfg(feature = "metadata-store")]
+            Self::Enabled(store) => store.item_state(item_id),
         }
     }
 }
@@ -766,15 +815,32 @@ impl EnabledMetadataStore {
         Ok(())
     }
 
-    fn record_attempt(&self, record: AttemptMetadata) -> Result<(), StorageError> {
-        let attempt_id = record
-            .item_id
-            .get()
-            .checked_mul(1_000_000)
-            .and_then(|base| base.checked_add(u64::from(record.attempt_number)))
-            .ok_or(StorageError::IntegerOutOfRange)?;
+    fn record_state_transition(
+        &self,
+        record: StateTransitionMetadata,
+    ) -> Result<(), StorageError> {
         let parameters = [
-            sqlite_integer(attempt_id)?,
+            sqlite_integer(record.transition_id.get())?,
+            sqlite_integer(record.job_id.get())?,
+            sqlite_integer(record.item_id.get())?,
+            fsqlite::SqliteValue::Text(record.state.as_database_value().into()),
+            sqlite_integer(record.recorded_at_ms)?,
+        ];
+        self.connection
+            .execute_with_params(
+                "INSERT INTO state_transitions (transition_id, job_id, item_id, state, recorded_at_ms) \\
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                &parameters,
+            )
+            .map_err(|_| StorageError::DatabaseOperationFailed {
+                operation: "record state transition",
+            })?;
+        Ok(())
+    }
+
+    fn record_attempt(&self, record: AttemptMetadata) -> Result<(), StorageError> {
+        let parameters = [
+            sqlite_integer(record.attempt_id.get())?,
             sqlite_integer(record.job_id.get())?,
             sqlite_integer(record.item_id.get())?,
             fsqlite::SqliteValue::Integer(i64::from(record.attempt_number)),
@@ -794,14 +860,8 @@ impl EnabledMetadataStore {
     }
 
     fn record_metric(&self, record: MetricMetadata) -> Result<(), StorageError> {
-        let metric_id = record
-            .item_id
-            .get()
-            .checked_mul(1_000_000)
-            .and_then(|base| base.checked_add(u64::from(record.kind_code)))
-            .ok_or(StorageError::IntegerOutOfRange)?;
         let parameters = [
-            sqlite_integer(metric_id)?,
+            sqlite_integer(record.metric_id.get())?,
             sqlite_integer(record.job_id.get())?,
             sqlite_integer(record.item_id.get())?,
             fsqlite::SqliteValue::Integer(i64::from(record.kind_code)),
@@ -820,25 +880,14 @@ impl EnabledMetadataStore {
         Ok(())
     }
 
-    fn record_error(
-        &self,
-        job_id: MetadataId,
-        item_id: MetadataId,
-        error: TypedErrorSummary,
-        recorded_at_ms: u64,
-    ) -> Result<(), StorageError> {
-        let error_id = item_id
-            .get()
-            .checked_mul(1_000_000)
-            .and_then(|base| base.checked_add(u64::from(error.code)))
-            .ok_or(StorageError::IntegerOutOfRange)?;
+    fn record_error(&self, record: ErrorMetadata) -> Result<(), StorageError> {
         let parameters = [
-            sqlite_integer(error_id)?,
-            sqlite_integer(job_id.get())?,
-            sqlite_integer(item_id.get())?,
-            fsqlite::SqliteValue::Integer(i64::from(error.code)),
-            fsqlite::SqliteValue::Integer(i64::from(error.context_code)),
-            sqlite_integer(recorded_at_ms)?,
+            sqlite_integer(record.error_id.get())?,
+            sqlite_integer(record.job_id.get())?,
+            sqlite_integer(record.item_id.get())?,
+            fsqlite::SqliteValue::Integer(i64::from(record.summary.code)),
+            fsqlite::SqliteValue::Integer(i64::from(record.summary.context_code)),
+            sqlite_integer(record.recorded_at_ms)?,
         ];
         self.connection
             .execute_with_params(
@@ -853,12 +902,34 @@ impl EnabledMetadataStore {
     }
 
     fn job_state(&self, job_id: MetadataId) -> Result<Option<JobState>, StorageError> {
-        let parameters = [sqlite_integer(job_id.get())?];
+        self.state_for("jobs", "job_id", job_id)
+    }
+
+    fn item_state(&self, item_id: MetadataId) -> Result<Option<JobState>, StorageError> {
+        self.state_for("items", "item_id", item_id)
+    }
+
+    fn state_for(
+        &self,
+        table: &'static str,
+        identifier_column: &'static str,
+        identifier: MetadataId,
+    ) -> Result<Option<JobState>, StorageError> {
+        let parameters = [sqlite_integer(identifier.get())?];
+        let query = match (table, identifier_column) {
+            ("jobs", "job_id") => "SELECT state FROM jobs WHERE job_id = ?1",
+            ("items", "item_id") => "SELECT state FROM items WHERE item_id = ?1",
+            _ => {
+                return Err(StorageError::DatabaseOperationFailed {
+                    operation: "read state query policy",
+                });
+            }
+        };
         let rows = self
             .connection
-            .query_with_params("SELECT state FROM jobs WHERE job_id = ?1", &parameters)
+            .query_with_params(query, &parameters)
             .map_err(|_| StorageError::DatabaseOperationFailed {
-                operation: "read job state",
+                operation: "read stored state",
             })?;
         match rows.as_slice() {
             [] => Ok(None),
@@ -871,7 +942,7 @@ impl EnabledMetadataStore {
                 _ => Err(StorageError::InvalidStoredState),
             },
             _ => Err(StorageError::DatabaseOperationFailed {
-                operation: "read unique job state",
+                operation: "read unique stored state",
             }),
         }
     }
