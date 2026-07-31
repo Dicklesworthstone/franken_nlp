@@ -1,9 +1,9 @@
 {
   "auxiliary": {
     "relative_path": "auxiliary.json",
-    "sha256": "c1d36563b667832c0e3c24b630502cd3edfdaab522de30d245c4fa6fec678bca"
+    "sha256": "a11e5395d884f5a600887c2266545892c6bb37ec5a79e6dbdacdf5d554a1e0a9"
   },
-  "corpus_sha256": "8e92bfaf4c602f28cd5d75305afaba810a32cd857efa9878a7ae1074c71eed40",
+  "corpus_sha256": "bec0ae13a547ecaf5df62c9a2399150cf340641049eb94d9a87df2ad1ccf6047",
   "fixtures": [
     {
       "attention_backend": "eager",
@@ -11,7 +11,7 @@
       "profile": "diagnostic-f32",
       "prompt_sha256": "00326c36b03df5da1508fc9137587368b531695c1d1d11d9af6076ddaf169957",
       "trace_index": "diagnostic-f32/prompt-000/trace.json",
-      "trace_index_sha256": "a956ccf8e355e91fdd6c226a738b554d09bc0ec80218675adc3174c62a528600"
+      "trace_index_sha256": "e3355dc462f83e8badfc9bd242dfd6c708f6d0216104b6b9cea44daa983d45e3"
     },
     {
       "attention_backend": "eager",
@@ -19,7 +19,7 @@
       "profile": "diagnostic-f32",
       "prompt_sha256": "9267825d5b89ce68e9bde740d46459dcd46755b318dedfdceacfe62185b3b5a0",
       "trace_index": "diagnostic-f32/prompt-001/trace.json",
-      "trace_index_sha256": "020c55eaa37e32265c5a725813c36637cf51df680b084e6496b81649ac8174b1"
+      "trace_index_sha256": "6db5d11b52fab7f35d034f305a5047b67c746ec2888549a18c7822b4460667ae"
     },
     {
       "attention_backend": "eager",
@@ -27,7 +27,7 @@
       "profile": "diagnostic-f32",
       "prompt_sha256": "e9304f8f785fcf1bd5a51aa78f6555926a140cb127431afd04cd6b69c9d509cf",
       "trace_index": "diagnostic-f32/prompt-002/trace.json",
-      "trace_index_sha256": "8d482db17b41fb1eb02cf95aa26c5be345c91b84fdc122d23ce5a6af0c7e889d"
+      "trace_index_sha256": "5ffb29ea766394819d26a9ffa2deaf58e45d2687603e4e5559c08235fca333fd"
     },
     {
       "attention_backend": "eager",
@@ -35,7 +35,7 @@
       "profile": "hf-bf16-eager",
       "prompt_sha256": "00326c36b03df5da1508fc9137587368b531695c1d1d11d9af6076ddaf169957",
       "trace_index": "hf-bf16-eager/prompt-000/trace.json",
-      "trace_index_sha256": "d59f03e9dd52b5e1284c9ca2e7217696471b62aab6c9bbfe2ac3a98fa54cffcf"
+      "trace_index_sha256": "11f6ba511ea52a0725d4077d98f3a9ce3aa88b0d1b0f55ae62e728131e04212c"
     },
     {
       "attention_backend": "eager",
@@ -43,7 +43,7 @@
       "profile": "hf-bf16-eager",
       "prompt_sha256": "9267825d5b89ce68e9bde740d46459dcd46755b318dedfdceacfe62185b3b5a0",
       "trace_index": "hf-bf16-eager/prompt-001/trace.json",
-      "trace_index_sha256": "6b4112f12f0b917dc4e731da0caf774d91147fe97a6d7bbdc6e3387173b4bf1d"
+      "trace_index_sha256": "5406b099ff15463aa1b49291428ddd99650164b9256e8f8d673abbc56dd78c1a"
     },
     {
       "attention_backend": "eager",
@@ -51,7 +51,7 @@
       "profile": "hf-bf16-eager",
       "prompt_sha256": "e9304f8f785fcf1bd5a51aa78f6555926a140cb127431afd04cd6b69c9d509cf",
       "trace_index": "hf-bf16-eager/prompt-002/trace.json",
-      "trace_index_sha256": "6ee14b57cba9432e3e6a81fdbb65eff5c84937ad7e2b91b68c3cdc19fa54f71d"
+      "trace_index_sha256": "0bd0c9a454327a30bca063ce0620b97c8f1b80a4ecb0c208dcef2334a6e1cd75"
     },
     {
       "attention_backend": "sdpa",
@@ -59,7 +59,7 @@
       "profile": "hf-bf16-sdpa",
       "prompt_sha256": "00326c36b03df5da1508fc9137587368b531695c1d1d11d9af6076ddaf169957",
       "trace_index": "hf-bf16-sdpa/prompt-000/trace.json",
-      "trace_index_sha256": "7f9fd63a089a16591e6438edd981c7dd7a9951d44275adeed24f48771e95de81"
+      "trace_index_sha256": "1832c0cd07289ddce59f9fb580fc60ff8b103e8c958c6a0f1dc593f614a32c1d"
     },
     {
       "attention_backend": "sdpa",
@@ -67,7 +67,7 @@
       "profile": "hf-bf16-sdpa",
       "prompt_sha256": "9267825d5b89ce68e9bde740d46459dcd46755b318dedfdceacfe62185b3b5a0",
       "trace_index": "hf-bf16-sdpa/prompt-001/trace.json",
-      "trace_index_sha256": "4df434eca7bfc6b34473c72462d0e990199550c0c4a0f47b3db681b16e57acec"
+      "trace_index_sha256": "cc03dd650efdedca36ea7ba45d981fb2caa4bdaf4fabe84f5285644cdd5653c5"
     },
     {
       "attention_backend": "sdpa",
@@ -75,7 +75,7 @@
       "profile": "hf-bf16-sdpa",
       "prompt_sha256": "e9304f8f785fcf1bd5a51aa78f6555926a140cb127431afd04cd6b69c9d509cf",
       "trace_index": "hf-bf16-sdpa/prompt-002/trace.json",
-      "trace_index_sha256": "37f16d71b6e60db1a6e95117817cca191e7b0bb98490167d638368400183bb6c"
+      "trace_index_sha256": "2b262b3f27d3c7b1de1cad2d35cd12b2a6eada726b5c2bb1436733a11557bfd0"
     }
   ],
   "format_version": 1,
@@ -91,11 +91,13 @@
     "--oracle-floor",
     "docs/truth-pack/oracle_floor.json",
     "--output",
-    "tests/fixtures/reference"
+    "/tmp/fnlp-l2-provenance-full.wrSwD1",
+    "--repo-root",
+    "/Users/jemanuel/projects/franken_nlp"
   ],
-  "generator_commit": "d2db8c5c9e6727ef0f892ec418999e841b1374c6",
+  "generator_commit": "ba6449942066f90e4eb1d0f01f82a96a86f385f8",
   "model_id": "Nanbeige/Nanbeige4.2-3B",
-  "oracle_closure_sha256": "0661b2e28c22b728ace2e912ef9012bdf085669c5ff3d087fe6dedc63fbf7511",
+  "oracle_closure_sha256": "cf6045756fcad840b3a2297f369f714e8cdf1304bc08aec70206d3d091e72776",
   "oracle_floor_sha256": "7530b49b907e734464fa8b9bfbccdf7fec31568577ec2bc0909b48c9392ee7ef",
   "profile_matrix": [
     "diagnostic-f32",

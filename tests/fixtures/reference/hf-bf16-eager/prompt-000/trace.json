@@ -4642,8 +4642,11 @@
       }
     ]
   },
+  "append_input_ids": [
+    295
+  ],
   "attention_backend": "eager",
-  "corpus_sha256": "8e92bfaf4c602f28cd5d75305afaba810a32cd857efa9878a7ae1074c71eed40",
+  "corpus_sha256": "bec0ae13a547ecaf5df62c9a2399150cf340641049eb94d9a87df2ad1ccf6047",
   "dtype": "bfloat16",
   "format_version": 1,
   "generation_command": [
@@ -4658,9 +4661,11 @@
     "--oracle-floor",
     "docs/truth-pack/oracle_floor.json",
     "--output",
-    "tests/fixtures/reference"
+    "/tmp/fnlp-l2-provenance-full.wrSwD1",
+    "--repo-root",
+    "/Users/jemanuel/projects/franken_nlp"
   ],
-  "generator_commit": "d2db8c5c9e6727ef0f892ec418999e841b1374c6",
+  "generator_commit": "ba6449942066f90e4eb1d0f01f82a96a86f385f8",
   "greedy_contract": {
     "oracle_floor_sha256": "7530b49b907e734464fa8b9bfbccdf7fec31568577ec2bc0909b48c9392ee7ef",
     "stable_prefix_length": 8,
@@ -4692,7 +4697,7 @@
     "tap_name": "logits"
   },
   "model_id": "Nanbeige/Nanbeige4.2-3B",
-  "oracle_closure_sha256": "0661b2e28c22b728ace2e912ef9012bdf085669c5ff3d087fe6dedc63fbf7511",
+  "oracle_closure_sha256": "cf6045756fcad840b3a2297f369f714e8cdf1304bc08aec70206d3d091e72776",
   "prefill": {
     "phase": "prefill",
     "records": [
@@ -9336,6 +9341,17 @@
       }
     ]
   },
+  "prefill_input_ids": [
+    166100,
+    363,
+    804,
+    152369,
+    4265,
+    7035,
+    322,
+    8841,
+    152361
+  ],
   "profile": "hf-bf16-eager",
   "prompt_index": 0,
   "prompt_sha256": "00326c36b03df5da1508fc9137587368b531695c1d1d11d9af6076ddaf169957",
@@ -9372,5 +9388,7 @@
       ]
     }
   ],
+  "source_closure_verification": "verified-full-ten-file-sha256",
+  "source_root_sha256": "71686a7075712c2b38e80fe387b9f23e3befac6e367bb4cb0d0ba5a90374c7fd",
   "variance_only": false
 }

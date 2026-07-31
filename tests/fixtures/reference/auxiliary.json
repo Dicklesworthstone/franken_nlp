@@ -1,5 +1,5 @@
 {
-  "corpus_sha256": "8e92bfaf4c602f28cd5d75305afaba810a32cd857efa9878a7ae1074c71eed40",
+  "corpus_sha256": "bec0ae13a547ecaf5df62c9a2399150cf340641049eb94d9a87df2ad1ccf6047",
   "fast_slow_tokenizer_cases": [
     {
       "fast_token_ids": [
@@ -303,10 +303,12 @@
     "--oracle-floor",
     "docs/truth-pack/oracle_floor.json",
     "--output",
-    "tests/fixtures/reference"
+    "/tmp/fnlp-l2-provenance-full.wrSwD1",
+    "--repo-root",
+    "/Users/jemanuel/projects/franken_nlp"
   ],
-  "generator_commit": "d2db8c5c9e6727ef0f892ec418999e841b1374c6",
-  "oracle_closure_sha256": "0661b2e28c22b728ace2e912ef9012bdf085669c5ff3d087fe6dedc63fbf7511",
+  "generator_commit": "ba6449942066f90e4eb1d0f01f82a96a86f385f8",
+  "oracle_closure_sha256": "cf6045756fcad840b3a2297f369f714e8cdf1304bc08aec70206d3d091e72776",
   "profile_matrix": [
     "diagnostic-f32",
     "hf-bf16-eager",
@@ -1313,7 +1315,9 @@
   "tokenizer_corpus_sha256": "bec0ae13a547ecaf5df62c9a2399150cf340641049eb94d9a87df2ad1ccf6047",
   "tokenizer_generation_command": [
     "scripts/gen_reference_fixtures.py",
-    "--refresh-auxiliary",
+    "--generate",
+    "--profile",
+    "all",
     "--model-source",
     "/Users/jemanuel/.cache/franken_nlp/source/Nanbeige4.2-3B/f56ec5a9650268aa098496734743c25ea778bd2d",
     "--corpus",
@@ -1321,8 +1325,10 @@
     "--oracle-floor",
     "docs/truth-pack/oracle_floor.json",
     "--output",
-    "tests/fixtures/reference"
+    "/tmp/fnlp-l2-provenance-full.wrSwD1",
+    "--repo-root",
+    "/Users/jemanuel/projects/franken_nlp"
   ],
-  "tokenizer_generator_commit": "223a80e9fff6782237e69d890e1bca79f5cfef58",
-  "tokenizer_oracle_closure_sha256": "0661b2e28c22b728ace2e912ef9012bdf085669c5ff3d087fe6dedc63fbf7511"
+  "tokenizer_generator_commit": "ba6449942066f90e4eb1d0f01f82a96a86f385f8",
+  "tokenizer_oracle_closure_sha256": "cf6045756fcad840b3a2297f369f714e8cdf1304bc08aec70206d3d091e72776"
 }
