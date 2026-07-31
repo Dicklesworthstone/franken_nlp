@@ -7,10 +7,11 @@
 
 use franken_nlp::{
     artifact::{
+        converter::expected_nanbeige42_census,
         format::{
             ArchTarget, CanonicalDtype, FnlpqWriterInput, PackingSetInput, SectionKind,
-            SectionPayload, SectionRange, TensorInput, encode_f32_scales, framed_sha256_hex,
-            logical_model_sha256, logical_tensor_sha256, write,
+            SectionPayload, SectionRange, TensorInput, framed_sha256_hex, logical_model_sha256,
+            logical_tensor_sha256, write,
         },
         reader::FnlpqArtifact,
     },
@@ -82,21 +83,45 @@ fn test_model_bytes() -> &'static [u8] {
 }
 
 fn synthetic_artifact(tokenizer_model: Vec<u8>) -> FnlpqArtifact {
-    let scales = encode_f32_scales(&[0.5]).expect("finite synthetic scale");
-    let payload = vec![0x80, 0x3f, 0x00, 0x40];
-    let row_sums = 0_i32.to_le_bytes().to_vec();
-    let tensor_digest = logical_tensor_sha256(
-        "model.embed_tokens.weight",
-        "bf16",
-        &[2],
-        "bf16-verbatim-v1",
-        &payload,
-        &scales,
-        &row_sums,
-    )
-    .expect("synthetic tensor identity");
+    // A Nanbeige-labelled artifact is accepted only after the full frozen
+    // census passes.  Its tensor payload mappings may stay empty here because
+    // this boundary test needs only the authenticated tokenizer copy, not
+    // executable weights.
+    let (tensors, tensor_digests): (Vec<_>, Vec<_>) = expected_nanbeige42_census()
+        .into_iter()
+        .map(|expected| {
+            let shape = expected
+                .shape
+                .iter()
+                .map(|dimension| u32::try_from(*dimension).expect("frozen shape fits v1"))
+                .collect::<Vec<_>>();
+            let tensor_digest = logical_tensor_sha256(
+                &expected.name,
+                "bf16",
+                &shape,
+                "bf16-verbatim-v1",
+                &[],
+                &[],
+                &[],
+            )
+            .expect("synthetic tensor identity");
+            (
+                TensorInput {
+                    name: expected.name,
+                    canonical_dtype: CanonicalDtype::Bf16,
+                    shape,
+                    canonical_logical_sha256: hex_lower(&tensor_digest),
+                    quantization: "bf16-verbatim-v1".to_owned(),
+                    data: SectionRange::new("generic-payload", 0, 0),
+                    scale: SectionRange::new("generic-scales", 0, 0),
+                    row_sum: SectionRange::new("generic-row-sums", 0, 0),
+                },
+                tensor_digest,
+            )
+        })
+        .unzip();
     let logical_model_digest = logical_model_sha256(
-        &[tensor_digest],
+        &tensor_digests,
         &[
             ("model_config", br#"{"hidden_size":2}"#.as_slice()),
             ("tokenizer_model", tokenizer_model.as_slice()),
@@ -113,24 +138,9 @@ fn synthetic_artifact(tokenizer_model: Vec<u8>) -> FnlpqArtifact {
             .expect("valid source identity"),
         logical_model_sha256: hex_lower(&logical_model_digest),
         sections: vec![
-            SectionPayload::new(
-                "generic-payload",
-                SectionKind::GenericTensorPayload,
-                payload,
-                64,
-            ),
-            SectionPayload::new(
-                "generic-scales",
-                SectionKind::GenericTensorScales,
-                scales,
-                8,
-            ),
-            SectionPayload::new(
-                "generic-row-sums",
-                SectionKind::GenericTensorRowSums,
-                row_sums,
-                8,
-            ),
+            SectionPayload::new("generic-payload", SectionKind::GenericTensorPayload, [], 64),
+            SectionPayload::new("generic-scales", SectionKind::GenericTensorScales, [], 8),
+            SectionPayload::new("generic-row-sums", SectionKind::GenericTensorRowSums, [], 8),
             SectionPayload::new(
                 "tokenizer-model",
                 SectionKind::TokenizerModel,
@@ -162,16 +172,7 @@ fn synthetic_artifact(tokenizer_model: Vec<u8>) -> FnlpqArtifact {
                 16,
             ),
         ],
-        tensors: vec![TensorInput {
-            name: "model.embed_tokens.weight".to_owned(),
-            canonical_dtype: CanonicalDtype::Bf16,
-            shape: vec![2],
-            canonical_logical_sha256: hex_lower(&tensor_digest),
-            quantization: "bf16-verbatim-v1".to_owned(),
-            data: SectionRange::new("generic-payload", 0, 4),
-            scale: SectionRange::new("generic-scales", 0, 4),
-            row_sum: SectionRange::new("generic-row-sums", 0, 4),
-        }],
+        tensors,
         packing_sets: vec![PackingSetInput {
             id: "generic".to_owned(),
             target: ArchTarget::Generic,
