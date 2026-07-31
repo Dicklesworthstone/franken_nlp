@@ -825,13 +825,33 @@ impl EnabledMetadataStore {
         ];
         self.connection
             .execute_with_params(
-                "INSERT INTO state_transitions (transition_id, job_id, item_id, state, recorded_at_ms) \\
+                "INSERT INTO state_transitions (transition_id, job_id, item_id, state, recorded_at_ms) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 &parameters,
             )
             .map_err(|_| StorageError::DatabaseOperationFailed {
                 operation: "record state transition",
             })?;
+        let state_parameters = [
+            fsqlite::SqliteValue::Text(record.state.as_database_value().into()),
+            sqlite_integer(record.recorded_at_ms)?,
+            sqlite_integer(record.item_id.get())?,
+            sqlite_integer(record.job_id.get())?,
+        ];
+        let updated = self
+            .connection
+            .execute_with_params(
+                "UPDATE items SET state = ?1, updated_at_ms = ?2 WHERE item_id = ?3 AND job_id = ?4",
+                &state_parameters,
+            )
+            .map_err(|_| StorageError::DatabaseOperationFailed {
+                operation: "apply item state transition",
+            })?;
+        if updated != 1 {
+            return Err(StorageError::DatabaseOperationFailed {
+                operation: "apply exactly one item state transition",
+            });
+        }
         Ok(())
     }
 
