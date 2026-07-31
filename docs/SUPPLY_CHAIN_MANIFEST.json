@@ -48,5 +48,5 @@
     {"name": "zmij", "source": "registry+https://github.com/rust-lang/crates.io-index", "version": "1.0.23"}
   ],
   "schema_version": 1,
-  "scope": "release-normal-build"
+  "scope": "release-normal-build-all-targets"
 }

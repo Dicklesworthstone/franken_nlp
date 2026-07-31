@@ -1,9 +1,11 @@
 //! Release dependency-policy enforcement.
 //!
 //! The test deliberately invokes Cargo at test time rather than adding a TOML
-//! parser or graph library to the release dependency graph.  It only evaluates
-//! normal/build dependency edges; dev dependencies are inventoried separately
-//! and do not participate in the release-graph assertions.
+//! parser or graph library to the release dependency graph. It inventories the
+//! normal/build release graph across every supported target; dev dependencies
+//! are inventoried separately and do not participate in the release-graph
+//! assertions. `cargo tree` still supplies the active feature selection, so
+//! disabled optional dependencies do not leak into the manifest.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -90,6 +92,8 @@ struct ResolveDependency {
 struct DependencyKind {
     #[serde(default)]
     kind: Option<String>,
+    #[serde(default)]
+    target: Option<String>,
 }
 
 #[derive(Debug)]
@@ -314,6 +318,96 @@ fn synthetic_metadata_excludes_dev_only_dependencies_from_release_graph() {
 }
 
 #[test]
+fn synthetic_metadata_includes_target_conditional_release_dependencies() {
+    let metadata = parse_fixture(
+        r#"
+        {
+          "packages": [
+            {
+              "id": "franken_nlp 0.1.0 (path+file:///fixture)",
+              "name": "franken_nlp",
+              "version": "0.1.0",
+              "dependencies": [
+                {"name": "clap", "kind": null},
+                {"name": "serde", "kind": null},
+                {"name": "serde_json", "kind": null},
+                {"name": "sha2", "kind": null},
+                {"name": "fsqlite", "kind": null, "optional": true}
+              ]
+            },
+            {"id": "clap 4.0.0 (registry+fixture)", "name": "clap", "version": "4.0.0"},
+            {"id": "windows-sys 0.61.2 (registry+fixture)", "name": "windows-sys", "version": "0.61.2"},
+            {"id": "windows-link 0.2.1 (registry+fixture)", "name": "windows-link", "version": "0.2.1"},
+            {"id": "fsqlite 0.1.0 (git+fixture)", "name": "fsqlite", "version": "0.1.0"}
+          ],
+          "resolve": {
+            "root": "franken_nlp 0.1.0 (path+file:///fixture)",
+            "nodes": [
+              {
+                "id": "franken_nlp 0.1.0 (path+file:///fixture)",
+                "deps": [
+                  {"pkg": "clap 4.0.0 (registry+fixture)", "dep_kinds": [{"kind": null}]},
+                  {"pkg": "fsqlite 0.1.0 (git+fixture)", "dep_kinds": [{"kind": null}]}
+                ]
+              },
+              {
+                "id": "clap 4.0.0 (registry+fixture)",
+                "deps": [
+                  {"pkg": "windows-sys 0.61.2 (registry+fixture)", "dep_kinds": [{"kind": null, "target": "cfg(windows)"}]}
+                ]
+              },
+              {
+                "id": "windows-sys 0.61.2 (registry+fixture)",
+                "deps": [
+                  {"pkg": "windows-link 0.2.1 (registry+fixture)", "dep_kinds": [{"kind": null}]}
+                ]
+              },
+              {"id": "windows-link 0.2.1 (registry+fixture)", "deps": []},
+              {"id": "fsqlite 0.1.0 (git+fixture)", "deps": []}
+            ]
+          }
+        }
+        "#,
+    );
+    assert!(
+        metadata.is_ok(),
+        "synthetic target-conditional metadata must parse: {metadata:?}"
+    );
+    let Some(metadata) = metadata.ok() else {
+        return;
+    };
+
+    let result = evaluate_policy(
+        &metadata,
+        "franken_nlp v0.1.0\n└── clap v4.0.0",
+        &BTreeSet::new(),
+    );
+    assert!(
+        result.is_ok(),
+        "target-conditional normal dependency must remain in the release inventory: {result:?}"
+    );
+    let Some(report) = result.ok() else {
+        return;
+    };
+    assert!(
+        report
+            .release_package_inventory
+            .contains("windows-sys@0.61.2"),
+        "the all-target manifest must include Windows-only release dependencies"
+    );
+    assert!(
+        report
+            .release_package_inventory
+            .contains("windows-link@0.2.1"),
+        "the all-target manifest must retain descendants of a target-only dependency"
+    );
+    assert!(
+        !report.release_package_inventory.contains("fsqlite@0.1.0"),
+        "an inactive optional feature must not enter the release manifest"
+    );
+}
+
+#[test]
 fn immutable_optional_suite_pin_is_read_from_manifest_not_metadata_source() {
     const REVISION: &str = "362dc5b174427f66cfa76ab2bdd68cce1a95c6cc";
     let manifest = r#"
@@ -524,12 +618,13 @@ fn validate_supply_chain_manifest(root: &Path, report: &PolicyReport) -> Result<
             full_path: path.display().to_string(),
             detail: format!("cannot parse supply-chain manifest JSON: {error}"),
         })?;
-    if manifest.schema_version != 1 || manifest.scope != "release-normal-build" {
+    if manifest.schema_version != 1 || manifest.scope != "release-normal-build-all-targets" {
         return Err(PolicyFailure {
             offending_crate: "supply-chain-manifest".to_owned(),
             full_path: path.display().to_string(),
-            detail: "manifest schema_version/scope is not the release normal/build contract"
-                .to_owned(),
+            detail:
+                "manifest schema_version/scope is not the all-target release normal/build contract"
+                    .to_owned(),
         });
     }
     let manifest_roots: BTreeSet<String> = manifest.direct_release_roots.into_iter().collect();
@@ -731,19 +826,24 @@ fn release_package_ids(
         .map(|node| (node.id.as_str(), node))
         .collect();
     let mut reachable = BTreeSet::new();
-    let mut queue = VecDeque::from([root_id.to_owned()]);
-    while let Some(id) = queue.pop_front() {
-        if !reachable.insert(id.clone()) {
+    let mut traversed = BTreeSet::new();
+    let mut queue = VecDeque::from([(root_id.to_owned(), false)]);
+    while let Some((id, target_context)) = queue.pop_front() {
+        if !traversed.insert((id.clone(), target_context)) {
             continue;
         }
+        reachable.insert(id.clone());
         let node = nodes.get(id.as_str()).ok_or_else(|| PolicyFailure {
             offending_crate: "cargo-metadata".to_owned(),
             full_path: id.clone(),
             detail: "release graph references a package without a resolve node".to_owned(),
         })?;
         for dependency in &node.deps {
-            if is_active_release_edge(metadata, cargo_tree, dependency) {
-                queue.push_back(dependency.pkg.clone());
+            if is_active_release_edge(metadata, cargo_tree, dependency, target_context) {
+                queue.push_back((
+                    dependency.pkg.clone(),
+                    target_context || is_target_conditional_release_edge(dependency),
+                ));
             }
         }
     }
@@ -762,10 +862,20 @@ fn is_active_release_edge(
     metadata: &Metadata,
     cargo_tree: &str,
     dependency: &ResolveDependency,
+    target_context: bool,
 ) -> bool {
     is_release_edge(dependency)
-        && package_by_id(metadata, &dependency.pkg)
-            .is_some_and(|package| cargo_tree_mentions(cargo_tree, &package.name))
+        && (target_context
+            || is_target_conditional_release_edge(dependency)
+            || package_by_id(metadata, &dependency.pkg)
+                .is_some_and(|package| cargo_tree_mentions(cargo_tree, &package.name)))
+}
+
+fn is_target_conditional_release_edge(dependency: &ResolveDependency) -> bool {
+    dependency
+        .dep_kinds
+        .iter()
+        .any(|kind| kind.kind.as_deref() != Some("dev") && kind.target.is_some())
 }
 
 fn package_by_id<'a>(metadata: &'a Metadata, id: &str) -> Option<&'a Package> {
@@ -788,30 +898,35 @@ fn full_path_to_id(metadata: &Metadata, cargo_tree: &str, target: &str) -> Optio
         .iter()
         .map(|node| (node.id.as_str(), node))
         .collect();
-    let mut previous: BTreeMap<String, String> = BTreeMap::new();
-    let mut seen = BTreeSet::from([root.to_owned()]);
-    let mut queue = VecDeque::from([root.to_owned()]);
+    let root = (root.to_owned(), false);
+    let mut previous: BTreeMap<(String, bool), (String, bool)> = BTreeMap::new();
+    let mut seen = BTreeSet::from([root.clone()]);
+    let mut queue = VecDeque::from([root]);
 
-    while let Some(id) = queue.pop_front() {
+    while let Some((id, target_context)) = queue.pop_front() {
         if id == target {
-            let mut ids = vec![id];
+            let mut ids = vec![(id, target_context)];
             while let Some(parent) = previous.get(ids.last()?) {
                 ids.push(parent.clone());
             }
             ids.reverse();
             return ids
                 .iter()
-                .map(|id| package_by_id(metadata, id).map(package_label))
+                .map(|(id, _)| package_by_id(metadata, id).map(package_label))
                 .collect::<Option<Vec<_>>>()
                 .map(|labels| labels.join(" -> "));
         }
         let node = nodes.get(id.as_str())?;
         for dependency in &node.deps {
-            if is_active_release_edge(metadata, cargo_tree, dependency)
-                && seen.insert(dependency.pkg.clone())
-            {
-                previous.insert(dependency.pkg.clone(), id.clone());
-                queue.push_back(dependency.pkg.clone());
+            if is_active_release_edge(metadata, cargo_tree, dependency, target_context) {
+                let next = (
+                    dependency.pkg.clone(),
+                    target_context || is_target_conditional_release_edge(dependency),
+                );
+                if seen.insert(next.clone()) {
+                    previous.insert(next.clone(), (id.clone(), target_context));
+                    queue.push_back(next);
+                }
             }
         }
     }
