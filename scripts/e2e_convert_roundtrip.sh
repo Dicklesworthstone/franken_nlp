@@ -45,6 +45,7 @@ if ! command -v "${fnlp_bin}" >/dev/null 2>&1; then
 fi
 
 log source "RESULT=START source=${source_dir} manifest=${source_manifest}"
+set +e
 "${fnlp_bin}" convert \
     --source "${source_dir}" \
     --source-manifest "${source_manifest}" \
@@ -52,6 +53,14 @@ log source "RESULT=START source=${source_dir} manifest=${source_manifest}"
     --arch generic \
     --yes \
     -o "${output_path}"
+convert_status=$?
+set -e
+
+if [[ ${convert_status} -ne 0 ]]; then
+    log convert "RESULT=INCOMPLETE exit=${convert_status} reason=converter-command-failed"
+    printf 'E2E_SUMMARY RESULT=INCOMPLETE stage=convert exit=%s expected=successful-conversion-receipt actual=converter-nonzero\n' "${convert_status}" >&2
+    exit "${convert_status}"
+fi
 
 if [[ ! -f "${output_path}" || -L "${output_path}" || ! -s "${output_path}" ]]; then
     log artifact "RESULT=FAIL reason=missing-or-invalid-created-artifact expected=nonempty-regular-file actual=${output_path}"
