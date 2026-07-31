@@ -1,5 +1,11 @@
 #![deny(unsafe_code)]
 
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+};
+
 use franken_nlp::native_engine::{
     rope::{
         DEFAULT_ADMITTED_CONTEXT_CAP, NANBEIGE_HEAD_DIM, NANBEIGE_ROPE_THETA, RopeError,
@@ -7,6 +13,46 @@ use franken_nlp::native_engine::{
     },
     tensor::Bf16,
 };
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+
+const ORACLE_FIXTURE: &str = include_str!("fixtures/rope_oracle_f32.json");
+const PINNED_REVISION: &str = "f56ec5a9650268aa098496734743c25ea778bd2d";
+const PINNED_SOURCE: &str = "docs/truth-pack/research/modeling_nanbeige.py";
+const PINNED_SOURCE_SHA256: &str =
+    "547737f989f5cb741c1a568acaf85f83521fa67a8f7268e19f9a37e60127c0d5";
+
+#[derive(Debug, Deserialize)]
+struct RopeOracleFixture {
+    schema_version: u32,
+    model_id: String,
+    revision: String,
+    profile: String,
+    producer: RopeOracleProducer,
+    head_dim: usize,
+    theta: u64,
+    admitted_cap: usize,
+    rows: Vec<RopeOracleRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RopeOracleProducer {
+    source_path: String,
+    source_sha256: String,
+    source_lines: String,
+    oracle_python: String,
+    torch: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RopeOracleRow {
+    position: usize,
+    lane: usize,
+    f32_cosine_bits: String,
+    f32_sine_bits: String,
+    bf16_cosine_bits: String,
+    bf16_sine_bits: String,
+}
 
 fn assert_close(observed: f32, expected: f32, tolerance: f32) {
     assert!(
@@ -17,6 +63,37 @@ fn assert_close(observed: f32, expected: f32, tolerance: f32) {
 
 fn pair_norm(left: f32, right: f32) -> f32 {
     left.mul_add(left, right * right)
+}
+
+fn repo_path(relative: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
+}
+
+fn sha256_path(path: &Path) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(fs::read(path).unwrap_or_else(|error| {
+            panic!("read {} for fixture provenance: {error}", path.display())
+        }))
+    )
+}
+
+fn parse_u32_bits(bits: &str, field: &str) -> u32 {
+    assert_eq!(bits.len(), 8, "oracle {field} must have eight hex digits");
+    u32::from_str_radix(bits, 16)
+        .unwrap_or_else(|error| panic!("parse oracle {field}={bits:?} as u32: {error}"))
+}
+
+fn parse_u16_bits(bits: &str, field: &str) -> u16 {
+    assert_eq!(bits.len(), 4, "oracle {field} must have four hex digits");
+    u16::from_str_radix(bits, 16)
+        .unwrap_or_else(|error| panic!("parse oracle {field}={bits:?} as u16: {error}"))
+}
+
+fn real_shape_values(elements: usize, multiplier: f32, offset: f32) -> Vec<f32> {
+    (0..elements)
+        .map(|index| index as f32 * multiplier + offset)
+        .collect()
 }
 
 #[test]
@@ -96,6 +173,60 @@ fn position_zero_is_identity_for_f32_and_bf16_cast_profile() {
 }
 
 #[test]
+fn pinned_oracle_rope_fixture_covers_boundary_positions_and_casts() {
+    let fixture: RopeOracleFixture =
+        serde_json::from_str(ORACLE_FIXTURE).expect("the pinned RoPE oracle fixture is valid JSON");
+    assert_eq!(fixture.schema_version, 1);
+    assert_eq!(fixture.model_id, "Nanbeige/Nanbeige4.2-3B");
+    assert_eq!(fixture.revision, PINNED_REVISION);
+    assert_eq!(fixture.profile, "hf-bf16-eager");
+    assert_eq!(fixture.producer.source_path, PINNED_SOURCE);
+    assert_eq!(fixture.producer.source_sha256, PINNED_SOURCE_SHA256);
+    assert_eq!(
+        sha256_path(&repo_path(PINNED_SOURCE)),
+        fixture.producer.source_sha256,
+        "the fixture must remain bound to the archived pinned oracle source"
+    );
+    assert_eq!(fixture.producer.source_lines, "939-967");
+    assert_eq!(fixture.producer.oracle_python, "3.11.14");
+    assert_eq!(fixture.producer.torch, "2.6.0");
+    assert_eq!(fixture.head_dim, NANBEIGE_HEAD_DIM);
+    assert_eq!(fixture.theta, NANBEIGE_ROPE_THETA as u64);
+    assert!(fixture.admitted_cap > 1);
+
+    let tables = RopeTablesF32::nanbeige(fixture.admitted_cap)
+        .expect("the oracle fixture's admitted cap is valid");
+    let positions = fixture
+        .rows
+        .iter()
+        .map(|row| row.position)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(positions, BTreeSet::from([0, 1, fixture.admitted_cap - 1]));
+    for row in fixture.rows {
+        assert!(row.lane < NANBEIGE_HEAD_DIM / 2);
+        let (cosine, sine) = tables.table_value(row.position, row.lane).unwrap();
+        let oracle_cosine = f32::from_bits(parse_u32_bits(&row.f32_cosine_bits, "f32 cosine"));
+        let oracle_sine = f32::from_bits(parse_u32_bits(&row.f32_sine_bits, "f32 sine"));
+        assert_close(cosine, oracle_cosine, 2.0e-6);
+        assert_close(sine, oracle_sine, 2.0e-6);
+        assert_eq!(
+            Bf16::from_f32(cosine).to_bits(),
+            parse_u16_bits(&row.bf16_cosine_bits, "bf16 cosine"),
+            "hf-bf16-eager cosine cast must match oracle position={} lane={}",
+            row.position,
+            row.lane
+        );
+        assert_eq!(
+            Bf16::from_f32(sine).to_bits(),
+            parse_u16_bits(&row.bf16_sine_bits, "bf16 sine"),
+            "hf-bf16-eager sine cast must match oracle position={} lane={}",
+            row.position,
+            row.lane
+        );
+    }
+}
+
+#[test]
 fn projection_epilogue_candidate_is_bit_equal_to_unfused_for_q_and_k() {
     let tables = RopeTablesF32::nanbeige(6).unwrap();
     let query = (0..(48 * NANBEIGE_HEAD_DIM))
@@ -146,6 +277,64 @@ fn projection_epilogue_candidate_is_bit_equal_to_unfused_for_q_and_k() {
         .apply_split_half_f32_all_heads(5, &mut second_loop_query)
         .unwrap();
     assert_eq!(second_loop_query, unfused_query, "both loop passes use P=5");
+}
+
+#[test]
+fn real_shape_prefill_and_decode_qk_projection_boundaries_are_exact() {
+    const QUERY_ELEMENTS: usize = 48 * NANBEIGE_HEAD_DIM;
+    const KEY_ELEMENTS: usize = 8 * NANBEIGE_HEAD_DIM;
+    let tables = RopeTablesF32::nanbeige(18).expect("the admitted real-shape cap is valid");
+
+    for (phase, position) in [
+        ("prefill", 0_usize),
+        ("prefill", 1),
+        ("prefill", 2),
+        ("decode", 17),
+    ] {
+        let query = real_shape_values(QUERY_ELEMENTS, 0.000_976_562_5, -3.0);
+        let key = real_shape_values(KEY_ELEMENTS, -0.001_953_125, 1.5);
+        let mut unfused_query = query.clone();
+        let mut unfused_key = key.clone();
+        let mut fused_query = query.clone();
+        let mut fused_key = key.clone();
+        let mut loop_two_query = query.clone();
+        let mut loop_two_key = key.clone();
+
+        tables
+            .apply_projected_qk_unfused(position, &mut unfused_query, &mut unfused_key)
+            .unwrap();
+        tables
+            .apply_projected_qk_fused_epilogue(position, &mut fused_query, &mut fused_key)
+            .unwrap();
+        tables
+            .apply_projected_qk(
+                RopeProjectionVariant::default(),
+                position,
+                &mut loop_two_query,
+                &mut loop_two_key,
+            )
+            .unwrap();
+
+        assert_eq!(
+            fused_query, unfused_query,
+            "{phase} Q fused/unfused position={position}"
+        );
+        assert_eq!(
+            fused_key, unfused_key,
+            "{phase} K fused/unfused position={position}"
+        );
+        assert_eq!(
+            loop_two_query, unfused_query,
+            "both logical loop passes must use the same RoPE row at {phase} position={position}"
+        );
+        assert_eq!(
+            loop_two_key, unfused_key,
+            "both logical loop passes must use the same RoPE row at {phase} position={position}"
+        );
+    }
+    eprintln!(
+        "ROPE RESULT=PASS oracle_fixture=pinned-source positions=0,1,17 q_elements={QUERY_ELEMENTS} k_elements={KEY_ELEMENTS}"
+    );
 }
 
 #[test]

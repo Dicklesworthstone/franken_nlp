@@ -1,0 +1,27 @@
+{
+  "admitted_cap": 18,
+  "head_dim": 128,
+  "model_id": "Nanbeige/Nanbeige4.2-3B",
+  "producer": {
+    "oracle_python": "3.11.14",
+    "source_lines": "939-967",
+    "source_path": "docs/truth-pack/research/modeling_nanbeige.py",
+    "source_sha256": "547737f989f5cb741c1a568acaf85f83521fa67a8f7268e19f9a37e60127c0d5",
+    "torch": "2.6.0"
+  },
+  "profile": "hf-bf16-eager",
+  "revision": "f56ec5a9650268aa098496734743c25ea778bd2d",
+  "rows": [
+    {"bf16_cosine_bits": "3c00", "bf16_sine_bits": "0000", "f32_cosine_bits": "3f800000", "f32_sine_bits": "00000000", "lane": 0, "position": 0},
+    {"bf16_cosine_bits": "3c00", "bf16_sine_bits": "0000", "f32_cosine_bits": "3f800000", "f32_sine_bits": "00000000", "lane": 1, "position": 0},
+    {"bf16_cosine_bits": "3c00", "bf16_sine_bits": "0000", "f32_cosine_bits": "3f800000", "f32_sine_bits": "00000000", "lane": 63, "position": 0},
+    {"bf16_cosine_bits": "3850", "bf16_sine_bits": "3ab8", "f32_cosine_bits": "3f0a5141", "f32_sine_bits": "3f576aa4", "lane": 0, "position": 1},
+    {"bf16_cosine_bits": "39d8", "bf16_sine_bits": "3978", "f32_cosine_bits": "3f3a9913", "f32_sine_bits": "3f2f4364", "lane": 1, "position": 1},
+    {"bf16_cosine_bits": "3c00", "bf16_sine_bits": "0000", "f32_cosine_bits": "3f800000", "f32_sine_bits": "32a2bb40", "lane": 63, "position": 1},
+    {"bf16_cosine_bits": "b468", "bf16_sine_bits": "bbb0", "f32_cosine_bits": "be8ce236", "f32_sine_bits": "bf761e26", "lane": 0, "position": 17},
+    {"bf16_cosine_bits": "3bc0", "bf16_sine_bits": "3400", "f32_cosine_bits": "3f77d879", "f32_sine_bits": "3e803237", "lane": 1, "position": 17},
+    {"bf16_cosine_bits": "3c00", "bf16_sine_bits": "0005", "f32_cosine_bits": "3f800000", "f32_sine_bits": "34ace6f4", "lane": 63, "position": 17}
+  ],
+  "schema_version": 1,
+  "theta": 70000000
+}
