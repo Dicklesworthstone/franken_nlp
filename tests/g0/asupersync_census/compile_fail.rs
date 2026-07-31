@@ -3,9 +3,10 @@
 //! This deliberately uses the pinned toolchain directly rather than adding a
 //! release-graph dependency for a UI-test helper. Each fixture is compiled
 //! against the exact `asupersync` rlib that built this feature-gated target.
-//! `Cx::current()` remains a separately censused runtime-mask boundary: this
-//! compile-fail target proves only that a statically restricted `Cx` cannot be
-//! retyped into a wider capability row.
+//! This target proves only a static narrowing boundary. It does not establish
+//! that ambient `Cx::current()` enforces reduced effects: the pin returns
+//! `Cx<cap::All>` there, so product leaves must receive an explicit narrowed
+//! context instead.
 
 use std::{
     env,
@@ -27,7 +28,7 @@ const CASES: [CompileFailCase; 2] = [
     },
     CompileFailCase {
         source: "tests/g0/compile_fail/cx_current_regain.rs",
-        required_diagnostic: "mismatched types",
+        required_diagnostic: "no function or associated item named",
     },
 ];
 
@@ -98,7 +99,7 @@ fn compile_failure(case: &CompileFailCase, dependency_dir: &Path, asupersync: &P
 }
 
 #[test]
-fn capability_widening_and_restricted_current_regain_fail_to_compile() {
+fn static_widening_and_no_generic_restricted_current_api_fail_to_compile() {
     let dependency_dir = dependency_dir();
     let asupersync = asupersync_rlib(&dependency_dir);
 
@@ -115,6 +116,6 @@ fn capability_widening_and_restricted_current_regain_fail_to_compile() {
     }
 
     println!(
-        "G0_CENSUS item=compile-fail-suite RESULT=RATIFIED evidence=restricted-to-all-rejected+static-current-retyping-rejected"
+        "G0_CENSUS item=compile-fail-suite RESULT=RATIFIED evidence=restricted-to-all-rejected+generic-restricted-current-api-absent;no-ambient-authority-claim"
     );
 }

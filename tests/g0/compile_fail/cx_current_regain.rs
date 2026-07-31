@@ -1,11 +1,10 @@
-//! Negative OQ-35 fixture: a statically restricted `Cx<cap::None>` lookup
-//! cannot be assigned an all-capability context. Ambient `Cx::current()`
-//! runtime-mask behavior is covered by the ordinary census semantics probe,
-//! not this type-only fixture.
+//! Negative OQ-35 fixture: the pin does not provide a generic
+//! `Cx::<cap::None>::current()` lookup. This proves API absence only; it is
+//! not an ambient-authority or post-restriction-regain test.
 
 use asupersync::cx::{Cx, cap};
 
-fn illegal_static_current_retype() -> Cx<cap::All> {
+fn no_generic_restricted_current_api() -> Cx<cap::All> {
     Cx::<cap::None>::current().expect("compile-only fixture has no runtime")
 }
 

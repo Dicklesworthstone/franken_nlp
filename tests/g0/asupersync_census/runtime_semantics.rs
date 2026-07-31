@@ -264,12 +264,14 @@ fn preset_builder_values_observed_on_constructed_runtimes() {
     );
 }
 
-/// An ambient lookup may be instantiated as `Cx<cap::All>`, but it must not
-/// regain effects removed by an enclosing `Cx<cap::None>` restriction. The
-/// capability snapshot makes the runtime mask observable without relying on
-/// whether this test constructor happens to attach an I/O or timer handle.
+/// `Cx::current()` retains the default `Cx<cap::All>` static type even while a
+/// restricted context changes the capability *metadata* it reports. That
+/// metadata observation is not an authority boundary: at this pin the
+/// underlying handles used by `now`, random, and spawn do not consult it.
+/// Product code must therefore pass an explicit narrowed `Cx` to leaves and
+/// must never use ambient lookup as least-authority enforcement.
 #[test]
-fn current_cannot_regain_dropped_effects_after_restriction() {
+fn ambient_current_capability_snapshot_is_not_authority_enforcement() {
     let full = Cx::for_testing();
     let _outer = Cx::set_current(Some(full.clone()));
 
@@ -285,16 +287,17 @@ fn current_cannot_regain_dropped_effects_after_restriction() {
     {
         let _restriction = leaf.set_current_restricted();
         let ambient: Cx = Cx::current().expect("restricted context remains installed");
+        let _: Cx<cap::All> = ambient.clone();
         let capabilities = ambient.capabilities();
 
-        // `ambient` has the default `Cx<cap::All>` static type, so this is the
-        // runtime-mask half of the authority proof, distinct from the
-        // compile-fail proof that `Cx<cap::None>` cannot be widened.
-        assert!(!capabilities.spawn, "SPAWN must remain dropped");
-        assert!(!capabilities.time, "TIME must remain dropped");
-        assert!(!capabilities.entropy, "RANDOM must remain dropped");
-        assert!(!capabilities.io, "IO must remain dropped");
-        assert!(!capabilities.remote, "REMOTE must remain dropped");
+        // This proves only the present metadata observation. It must not be
+        // promoted to an effects-enforcement claim: `ambient` is statically
+        // all-capability and its privileged methods use their stored handles.
+        assert!(!capabilities.spawn, "restricted metadata omits SPAWN");
+        assert!(!capabilities.time, "restricted metadata omits TIME");
+        assert!(!capabilities.entropy, "restricted metadata omits RANDOM");
+        assert!(!capabilities.io, "restricted metadata omits IO");
+        assert!(!capabilities.remote, "restricted metadata omits REMOTE");
     }
 
     let restored: Cx = Cx::current().expect("outer full context is restored");
@@ -306,9 +309,9 @@ fn current_cannot_regain_dropped_effects_after_restriction() {
     assert!(restored_capabilities.remote);
 
     census(
-        "current-no-regain",
-        "RATIFIED",
-        "ambient-all-static-type+none-runtime-mask-blocks-spawn-time-random-io-remote+outer-mask-restored",
+        "ambient-current-authority",
+        "ABSENT_WITH_FALLBACK",
+        "current-returns-static-all;restricted-capabilities-are-metadata-only;fallback=explicit-narrowed-cx-parameter-no-ambient-leaf-lookup",
     );
 }
 
