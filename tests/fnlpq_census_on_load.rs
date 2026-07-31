@@ -29,14 +29,23 @@ fn complete_nanbeige_census_loads_and_missing_shape_and_name_drift_refuse() {
     );
 
     let mut missing = complete.clone();
+    let missing_name = missing
+        .tensors
+        .last()
+        .expect("complete census has a final tensor")
+        .name
+        .clone();
     missing.tensors.pop();
     refresh_logical_model_identity(&mut missing);
     assert_census_refusal(
         write(&missing).expect("missing fixture writes").bytes,
         "missing",
+        &missing_name,
+        "missing expected tensor",
     );
 
     let mut wrong_shape = complete.clone();
+    let wrong_shape_name = wrong_shape.tensors[0].name.clone();
     wrong_shape.tensors[0].shape[0] += 1;
     refresh_logical_model_identity(&mut wrong_shape);
     assert_census_refusal(
@@ -44,9 +53,12 @@ fn complete_nanbeige_census_loads_and_missing_shape_and_name_drift_refuse() {
             .expect("wrong-shape fixture writes")
             .bytes,
         "shape",
+        &wrong_shape_name,
+        "expected dtype=bf16 shape=",
     );
 
     let mut wrong_dtype = complete.clone();
+    let wrong_dtype_name = wrong_dtype.tensors[0].name.clone();
     wrong_dtype.tensors[0].canonical_dtype = CanonicalDtype::F32;
     refresh_logical_model_identity(&mut wrong_dtype);
     assert_census_refusal(
@@ -54,9 +66,17 @@ fn complete_nanbeige_census_loads_and_missing_shape_and_name_drift_refuse() {
             .expect("wrong-dtype fixture writes")
             .bytes,
         "dtype",
+        &wrong_dtype_name,
+        "expected dtype=bf16 shape=",
     );
 
     let mut renamed = complete;
+    let renamed_name = renamed
+        .tensors
+        .last()
+        .expect("complete census has a final tensor")
+        .name
+        .clone();
     renamed
         .tensors
         .last_mut()
@@ -66,6 +86,8 @@ fn complete_nanbeige_census_loads_and_missing_shape_and_name_drift_refuse() {
     assert_census_refusal(
         write(&renamed).expect("renamed fixture writes").bytes,
         "renamed",
+        &renamed_name,
+        "missing expected tensor",
     );
 
     let mut extra = nanbeige_input();
@@ -87,6 +109,8 @@ fn complete_nanbeige_census_loads_and_missing_shape_and_name_drift_refuse() {
     assert_census_refusal(
         write(&extra).expect("extra fixture writes").bytes,
         "extra",
+        "z.extra.tensor",
+        "unexpected tensor absent from the frozen 201-name census",
     );
 }
 
@@ -348,10 +372,26 @@ fn logical_identity_is_checked_at_write_and_load_boundaries() {
     eprintln!("FNLPQ_LOAD stage=identity verdict=PASS catching_layers=logical,section");
 }
 
-fn assert_census_refusal(bytes: Vec<u8>, fixture: &str) {
+fn assert_census_refusal(
+    bytes: Vec<u8>,
+    fixture: &str,
+    expected_tensor: &str,
+    expected_reason_prefix: &str,
+) {
     let error = FnlpqArtifact::from_bytes(bytes).expect_err(fixture);
-    assert!(matches!(error, FnlpqReadError::Census { .. }));
-    eprintln!("FNLPQ_LOAD stage=census fixture={fixture} verdict=REFUSED detail={error}");
+    match error {
+        FnlpqReadError::Census { tensor, reason } => {
+            assert_eq!(tensor, expected_tensor, "census fixture={fixture}");
+            assert!(
+                reason.starts_with(expected_reason_prefix),
+                "census fixture={fixture} expected reason prefix {expected_reason_prefix:?} actual={reason:?}"
+            );
+            eprintln!(
+                "FNLPQ_LOAD stage=census fixture={fixture} verdict=REFUSED tensor={tensor} reason={reason}"
+            );
+        }
+        other => panic!("census fixture={fixture} expected Census error, actual={other}"),
+    }
 }
 
 fn nanbeige_input() -> FnlpqWriterInput {
