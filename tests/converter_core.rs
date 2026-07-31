@@ -2,10 +2,11 @@
 //! model-gated in `scripts/e2e_convert_roundtrip.sh`.
 
 use franken_nlp::artifact::converter::{
-    expected_nanbeige42_census, prepare_convert_request, remap_tensor_name,
-    validate_nanbeige42_census, validate_pinned_logical_payload_bytes, ConversionReceipt,
-    ConversionSourceManifest, ConvertArch, ConvertRequest, ConverterError, OutputRange,
-    OutputRangePlan, StorageStage, DEFAULT_PANEL_BYTES, PINNED_LOGICAL_PAYLOAD_BYTES,
+    BF16_VERBATIM_V1, ConversionReceipt, ConversionSourceManifest, ConvertArch, ConvertRequest,
+    ConverterError, DEFAULT_PANEL_BYTES, OutputRange, OutputRangePlan,
+    PINNED_LOGICAL_PAYLOAD_BYTES, PORTABLE_QUANT_V1, StorageStage, expected_nanbeige42_census,
+    plan_generic_payload, prepare_convert_request, remap_tensor_name, validate_nanbeige42_census,
+    validate_pinned_logical_payload_bytes,
 };
 use franken_nlp::artifact::safetensors::TensorCensusEntry;
 
@@ -32,6 +33,48 @@ fn exact_generated_census_is_complete_and_routes_every_tensor() {
             assert_eq!(route.stage, StorageStage::Bf16Verbatim);
         }
     }
+}
+
+#[test]
+fn generic_payload_plan_precomputes_exact_int8_and_bf16_section_ranges() {
+    let census = vec![
+        TensorCensusEntry {
+            name: "model.embed_tokens.weight".to_owned(),
+            dtype: franken_nlp::artifact::safetensors::SafetensorDtype::Bf16,
+            shape: vec![3, 2],
+            len: 12,
+        },
+        TensorCensusEntry {
+            name: "lm_head.weight".to_owned(),
+            dtype: franken_nlp::artifact::safetensors::SafetensorDtype::Bf16,
+            shape: vec![4, 2],
+            len: 16,
+        },
+    ];
+    let routes = census
+        .iter()
+        .map(|entry| remap_tensor_name(&entry.name).expect("named converter route"))
+        .collect::<Vec<_>>();
+
+    let plan = plan_generic_payload(&census, &routes).expect("complete Generic layout");
+
+    assert_eq!(plan.payload_bytes, 20);
+    assert_eq!(plan.scale_bytes, 16);
+    assert_eq!(plan.row_sum_bytes, 16);
+    assert_eq!(plan.tensors[0].internal_name, "embed");
+    assert_eq!(plan.tensors[0].quantization, BF16_VERBATIM_V1);
+    assert_eq!(plan.tensors[0].data.offset, 0);
+    assert_eq!(plan.tensors[0].data.len, 12);
+    assert_eq!(plan.tensors[0].scale.len, 0);
+    assert_eq!(plan.tensors[0].row_sum.len, 0);
+    assert_eq!(plan.tensors[1].internal_name, "lm_head");
+    assert_eq!(plan.tensors[1].quantization, PORTABLE_QUANT_V1);
+    assert_eq!(plan.tensors[1].data.offset, 12);
+    assert_eq!(plan.tensors[1].data.len, 8);
+    assert_eq!(plan.tensors[1].scale.offset, 0);
+    assert_eq!(plan.tensors[1].scale.len, 16);
+    assert_eq!(plan.tensors[1].row_sum.offset, 0);
+    assert_eq!(plan.tensors[1].row_sum.len, 16);
 }
 
 #[test]

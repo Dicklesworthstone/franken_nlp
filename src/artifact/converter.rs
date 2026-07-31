@@ -42,6 +42,10 @@ pub const PINNED_SOURCE_MANIFEST_SHA256: &str =
 /// The first admitted portable conversion recipe.  It is intentionally a
 /// recipe identity, never a loose `--quant` bit-width switch.
 pub const PINNED_CONVERSION_RECIPE: &str = "nanbeige42-int8-v1";
+/// Canonical Generic encoding for every quantized stage in the first recipe.
+pub const PORTABLE_QUANT_V1: &str = "portable-quant-v1";
+/// Canonical Generic encoding for source-preserved BF16 tensors.
+pub const BF16_VERBATIM_V1: &str = "bf16-verbatim-v1";
 
 /// The only source-to-artifact target admitted by `fnlp convert`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -686,6 +690,173 @@ pub struct PreparedConversionInput {
     pub logical_payload_bytes: u64,
     /// Domain-framed exact source census identity.
     pub census_sha256: String,
+}
+
+/// One tensor's precomputed destinations in the three Generic payload
+/// sections.  The plan carries only small layout metadata; it never retains a
+/// source tensor or a quantized tensor image.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GenericTensorLayout {
+    /// Exact source tensor name in the checked safetensors census.
+    pub source_name: String,
+    /// Canonical internal tensor identity in the artifact header.
+    pub internal_name: String,
+    /// Frozen converter route that determines the Generic representation.
+    pub stage: StorageStage,
+    /// Exact source shape, retained for a later logical-digest pass.
+    pub shape: Vec<u64>,
+    /// Versioned Generic encoding identifier for this logical tensor.
+    pub quantization: String,
+    /// Destination range in `GENERIC_TENSOR_PAYLOAD`.
+    pub data: OutputRange,
+    /// Destination range in `GENERIC_TENSOR_SCALES`.
+    pub scale: OutputRange,
+    /// Destination range in `GENERIC_TENSOR_ROW_SUMS`.
+    pub row_sum: OutputRange,
+}
+
+/// Exact section byte totals and per-tensor mappings calculated before any
+/// output file is created.  The later streaming-envelope bridge uses this to
+/// allocate header/directory metadata and to enforce one-write coverage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GenericPayloadPlan {
+    /// Mappings in checked census order.
+    pub tensors: Vec<GenericTensorLayout>,
+    /// Exact stored bytes for `GENERIC_TENSOR_PAYLOAD`.
+    pub payload_bytes: u64,
+    /// Exact stored bytes for `GENERIC_TENSOR_SCALES`.
+    pub scale_bytes: u64,
+    /// Exact stored bytes for `GENERIC_TENSOR_ROW_SUMS`.
+    pub row_sum_bytes: u64,
+}
+
+/// Precompute every bounded Generic tensor destination before source-panel
+/// traversal or staging-file creation.
+///
+/// BF16-verbatim routes retain their exact source byte count and claim no
+/// scale/row-sum bytes.  The portable int8 routes emit one signed byte per
+/// BF16 scalar plus one little-endian f32 scale and i32 row sum per output
+/// row.  This is only a layout plan: the later first pass still hashes and
+/// validates every emitted byte before it can construct a streaming envelope.
+pub fn plan_generic_payload(
+    census: &[TensorCensusEntry],
+    routes: &[TensorRoute],
+) -> Result<GenericPayloadPlan, ConverterError> {
+    if census.len() != routes.len() {
+        return Err(ConverterError::PipelinePlanCount {
+            census: census.len(),
+            routes: routes.len(),
+            panels: 0,
+        });
+    }
+
+    let mut tensors = Vec::with_capacity(census.len());
+    let mut internal_names = BTreeSet::new();
+    let mut payload_offset = 0_u64;
+    let mut scale_offset = 0_u64;
+    let mut row_sum_offset = 0_u64;
+
+    for (entry, route) in census.iter().zip(routes) {
+        let expected_route = remap_tensor_name(&entry.name)?;
+        if route != &expected_route {
+            return Err(ConverterError::PipelinePlanAlignment {
+                tensor: entry.name.clone(),
+                detail: "route differs from canonical mapping".to_owned(),
+            });
+        }
+        if entry.dtype != SafetensorDtype::Bf16 {
+            return Err(ConverterError::UnexpectedDtype {
+                tensor: entry.name.clone(),
+                expected: SafetensorDtype::Bf16,
+                actual: entry.dtype,
+            });
+        }
+        if !internal_names.insert(route.internal_name.clone()) {
+            return Err(ConverterError::PipelinePlanAlignment {
+                tensor: entry.name.clone(),
+                detail: format!("duplicate internal tensor name {}", route.internal_name),
+            });
+        }
+        let rows = *entry
+            .shape
+            .first()
+            .ok_or_else(|| ConverterError::InvalidPanelPlan {
+                tensor: entry.name.clone(),
+                detail: "rank-zero tensor has no Generic row layout".to_owned(),
+            })?;
+        let scalar_count = entry.len.checked_div(2).ok_or(ConverterError::Arithmetic {
+            invariant: "BF16 scalar count",
+        })?;
+        if scalar_count
+            .checked_mul(2)
+            .ok_or(ConverterError::Arithmetic {
+                invariant: "BF16 scalar byte reconstruction",
+            })?
+            != entry.len
+        {
+            return Err(ConverterError::InvalidPanelPlan {
+                tensor: entry.name.clone(),
+                detail: "BF16 source byte length is not scalar-aligned".to_owned(),
+            });
+        }
+        let (data_len, scale_len, row_sum_len, quantization) = match route.stage {
+            StorageStage::Bf16Verbatim => (entry.len, 0, 0, BF16_VERBATIM_V1),
+            StorageStage::Int8Stage2A | StorageStage::Int8Stage2B | StorageStage::Int8Stage2C => {
+                let sidecar_len = rows.checked_mul(4).ok_or(ConverterError::Arithmetic {
+                    invariant: "portable int8 row sidecar bytes",
+                })?;
+                (scalar_count, sidecar_len, sidecar_len, PORTABLE_QUANT_V1)
+            }
+        };
+        let data = OutputRange {
+            name: format!("{}.data", route.internal_name),
+            offset: payload_offset,
+            len: data_len,
+        };
+        let scale = OutputRange {
+            name: format!("{}.scale", route.internal_name),
+            offset: scale_offset,
+            len: scale_len,
+        };
+        let row_sum = OutputRange {
+            name: format!("{}.row_sum", route.internal_name),
+            offset: row_sum_offset,
+            len: row_sum_len,
+        };
+        payload_offset =
+            payload_offset
+                .checked_add(data_len)
+                .ok_or(ConverterError::Arithmetic {
+                    invariant: "Generic payload section bytes",
+                })?;
+        scale_offset = scale_offset
+            .checked_add(scale_len)
+            .ok_or(ConverterError::Arithmetic {
+                invariant: "Generic scale section bytes",
+            })?;
+        row_sum_offset =
+            row_sum_offset
+                .checked_add(row_sum_len)
+                .ok_or(ConverterError::Arithmetic {
+                    invariant: "Generic row-sum section bytes",
+                })?;
+        tensors.push(GenericTensorLayout {
+            source_name: entry.name.clone(),
+            internal_name: route.internal_name.clone(),
+            stage: route.stage,
+            shape: entry.shape.clone(),
+            quantization: quantization.to_owned(),
+            data,
+            scale,
+            row_sum,
+        });
+    }
+    Ok(GenericPayloadPlan {
+        tensors,
+        payload_bytes: payload_offset,
+        scale_bytes: scale_offset,
+        row_sum_bytes: row_sum_offset,
+    })
 }
 
 /// Execute the refusal-first converter preparation path.
