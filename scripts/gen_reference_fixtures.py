@@ -699,7 +699,7 @@ def capture_rope_application(args: argparse.Namespace) -> int:
                 raise TraceError(f"required RoPE capture receipt input is absent or non-regular: {path}")
         application = {
             "capture_schema_version": 2,
-            "cosine_bf16_hex": bf16_hex(cosine[0, position], torch_module),
+            "cosine_bf16_hex": bf16_hex(cosine[0, -1], torch_module),
             "input_ids": [int(value) for value in input_ids[0].tolist()],
             "key_head": key_head,
             "key_input_bf16_hex": bf16_hex(key[0, key_head, position], torch_module),
@@ -713,7 +713,7 @@ def capture_rope_application(args: argparse.Namespace) -> int:
             "query_head": query_head,
             "query_input_bf16_hex": bf16_hex(query[0, query_head, position], torch_module),
             "query_rotated_bf16_hex": bf16_hex(rotated_query[0, query_head, position], torch_module),
-            "sine_bf16_hex": bf16_hex(sine[0, position], torch_module),
+            "sine_bf16_hex": bf16_hex(sine[0, -1], torch_module),
             "torch": str(torch_module.__version__),
         }
         if phase == "decode-append":
