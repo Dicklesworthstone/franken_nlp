@@ -13,7 +13,7 @@ use crate::artifact::safetensors::{
 
 use super::{
     attention::{
-        AttentionError, KV_HEAD_COUNT, QUERY_HEAD_COUNT, eager_attention_head, kv_head_for_query,
+        AttentionError, eager_gqa_attention_from_cache,
     },
     kv::{
         KV_ELEMENTS_PER_POSITION, KV_SLOT_COUNT, KvCache, KvCacheError, LOOP_COUNT,
@@ -172,8 +172,6 @@ pub enum HfBf16EagerError {
     EmptyLogits,
     /// Prefill must contain at least one token position to execute.
     EmptyPrefill,
-    /// A cache sequence length could not be expanded to one 128-wide head.
-    AttentionCapacityOverflow { sequence_len: usize },
 }
 
 impl From<HfBf16LayerError> for HfBf16EagerError {
@@ -719,59 +717,9 @@ fn run_hf_bf16_layer(
             .map(|value| value.to_bits())
             .collect::<Vec<_>>(),
     )?;
-    let attention = eager_gqa_attention(&query, cache, kv_slot)?;
+    let attention = eager_gqa_attention_from_cache(&query, cache, kv_slot)?;
     let attention_output = layer.o_proj.project_f32_accumulate_cast_back(&attention)?;
     Ok(layer.finish_attention_and_mlp(hidden, &attention_output)?)
-}
-
-fn eager_gqa_attention(
-    query: &[Bf16],
-    cache: &KvCache,
-    slot: usize,
-) -> Result<Vec<Bf16>, HfBf16EagerError> {
-    if query.len() != NANBEIGE_Q_PROJECTION_SIZE {
-        return Err(HfBf16EagerError::ModelVectorShape {
-            name: "attention_query",
-            expected: NANBEIGE_Q_PROJECTION_SIZE,
-            actual: query.len(),
-        });
-    }
-    let sequence_len = cache.len_for_slot(slot)?;
-    let head_elements = sequence_len
-        .checked_mul(NANBEIGE_HEAD_DIM)
-        .ok_or(HfBf16EagerError::AttentionCapacityOverflow { sequence_len })?;
-    let mut output = vec![Bf16::from_bits(0); NANBEIGE_Q_PROJECTION_SIZE];
-    for query_head in 0..QUERY_HEAD_COUNT {
-        let kv_head = kv_head_for_query(query_head)?;
-        let query_start = query_head * NANBEIGE_HEAD_DIM;
-        let key_start = kv_head * NANBEIGE_HEAD_DIM;
-        let mut keys = Vec::with_capacity(head_elements);
-        let mut values = Vec::with_capacity(head_elements);
-        for position in 0..sequence_len {
-            let cached_key = cache.key_at(slot, position)?;
-            let cached_value = cache.value_at(slot, position)?;
-            keys.extend(
-                cached_key[key_start..key_start + NANBEIGE_HEAD_DIM]
-                    .iter()
-                    .copied()
-                    .map(Bf16::from_bits),
-            );
-            values.extend(
-                cached_value[key_start..key_start + NANBEIGE_HEAD_DIM]
-                    .iter()
-                    .copied()
-                    .map(Bf16::from_bits),
-            );
-        }
-        let head = eager_attention_head(
-            &query[query_start..query_start + NANBEIGE_HEAD_DIM],
-            &keys,
-            &values,
-            sequence_len,
-        )?;
-        output[query_start..query_start + NANBEIGE_HEAD_DIM].copy_from_slice(&head);
-    }
-    Ok(output)
 }
 
 fn validate_matrix(
@@ -793,4 +741,3 @@ fn validate_matrix(
 }
 
 const _: () = assert!(NANBEIGE_KV_PROJECTION_SIZE == KV_ELEMENTS_PER_POSITION);
-const _: () = assert!(QUERY_HEAD_COUNT / KV_HEAD_COUNT == 6);
