@@ -143,6 +143,43 @@ fn canonical_envelopes_round_trip_and_refuse_wire_mutations() {
 }
 
 #[test]
+fn immutable_final_filename_binds_the_canonical_envelope_identity() {
+    let record = ActivationRecord::new(ActivationRecordBody::genesis(
+        digest(1),
+        digest(2),
+        digest(3),
+    ));
+    let filename = record.final_filename();
+    assert!(record.validate_final_filename(&filename).is_ok());
+
+    let wrong_sequence = format!("00000000000000000001-{}.fnlpaj", record.record_digest());
+    assert!(matches!(
+        record.validate_final_filename(&wrong_sequence),
+        Err(FsTxError::FinalFilenameBindingMismatch { .. })
+    ));
+
+    let wrong_digest = format!("00000000000000000000-{}.fnlpaj", digest(9));
+    assert!(matches!(
+        record.validate_final_filename(&wrong_digest),
+        Err(FsTxError::FinalFilenameBindingMismatch { .. })
+    ));
+
+    for malformed in [
+        "0-not-a-digest.fnlpaj",
+        "00000000000000000000-ABCDEF.fnlpaj",
+        "00000000000000000000-deadbeef.fnlpaj",
+        "00000000000000000000-deadbeef.fnlpaj.tmp",
+        "00000000000000000000-deadbeef/escape.fnlpaj",
+    ] {
+        assert!(matches!(
+            record.validate_final_filename(malformed),
+            Err(FsTxError::FinalFilenameInvalid { .. })
+        ));
+    }
+    eprintln!("FS_TXN case=final-filename-envelope-binding RESULT=PASS rows=7");
+}
+
+#[test]
 fn forged_successors_raise_activation_fork_and_retain_last_unambiguous_head() {
     let mut journal = SimulatedActivationJournal::new();
     let genesis = journal.append(digest(1), digest(2), digest(3)).unwrap();

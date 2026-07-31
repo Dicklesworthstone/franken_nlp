@@ -22,6 +22,9 @@ const BODY_WITH_PREVIOUS_BYTES: usize = BODY_WITHOUT_PREVIOUS_BYTES + ACTIVATION
 const ENVELOPE_WITHOUT_PREVIOUS_BYTES: usize =
     BODY_WITHOUT_PREVIOUS_BYTES + ACTIVATION_DIGEST_BYTES;
 const ENVELOPE_WITH_PREVIOUS_BYTES: usize = BODY_WITH_PREVIOUS_BYTES + ACTIVATION_DIGEST_BYTES;
+const FINAL_FILENAME_SEQUENCE_DIGITS: usize = 20;
+const FINAL_FILENAME_DIGEST_HEX_DIGITS: usize = ACTIVATION_DIGEST_BYTES * 2;
+const FINAL_FILENAME_SUFFIX: &str = ".fnlpaj";
 
 /// Fixed-width SHA-256 identity used by activation records and filenames.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -309,10 +312,61 @@ impl ActivationRecord {
     #[must_use]
     pub fn final_filename(&self) -> String {
         format!(
-            "{:020}-{}.fnlpaj",
+            "{:0width$}-{}{}",
             self.body.sequence,
-            self.record_digest.to_hex()
+            self.record_digest.to_hex(),
+            FINAL_FILENAME_SUFFIX,
+            width = FINAL_FILENAME_SEQUENCE_DIGITS,
         )
+    }
+
+    /// Refuses a retained filename unless it canonically binds this envelope's
+    /// sequence and digest. A future directory reader must perform this check
+    /// before it admits parsed bytes to chain discovery.
+    pub fn validate_final_filename(&self, filename: &str) -> Result<(), FsTxError> {
+        let Some(stem) = filename.strip_suffix(FINAL_FILENAME_SUFFIX) else {
+            return Err(FsTxError::FinalFilenameInvalid {
+                filename: filename.to_owned(),
+            });
+        };
+        let Some((sequence_text, digest_text)) = stem.split_once('-') else {
+            return Err(FsTxError::FinalFilenameInvalid {
+                filename: filename.to_owned(),
+            });
+        };
+        if sequence_text.len() != FINAL_FILENAME_SEQUENCE_DIGITS
+            || !sequence_text.bytes().all(|byte| byte.is_ascii_digit())
+            || digest_text.len() != FINAL_FILENAME_DIGEST_HEX_DIGITS
+            || !digest_text
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(FsTxError::FinalFilenameInvalid {
+                filename: filename.to_owned(),
+            });
+        }
+        let sequence =
+            sequence_text
+                .parse::<u64>()
+                .map_err(|_| FsTxError::FinalFilenameInvalid {
+                    filename: filename.to_owned(),
+                })?;
+        if format!(
+            "{:0width$}",
+            sequence,
+            width = FINAL_FILENAME_SEQUENCE_DIGITS
+        ) != sequence_text
+        {
+            return Err(FsTxError::FinalFilenameInvalid {
+                filename: filename.to_owned(),
+            });
+        }
+        if sequence != self.body.sequence || digest_text != self.record_digest.to_hex() {
+            return Err(FsTxError::FinalFilenameBindingMismatch {
+                filename: filename.to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// Constructs retained untrusted input for recovery tests/readers. Discovery
@@ -395,6 +449,10 @@ pub enum FsTxError {
     SequenceOverflow,
     /// A final immutable filename was already retained and cannot be reopened.
     FinalNameExists { filename: String },
+    /// A retained final filename has no exact canonical journal spelling.
+    FinalFilenameInvalid { filename: String },
+    /// A canonical-looking final filename names a different record body/digest.
+    FinalFilenameBindingMismatch { filename: String },
     /// A retained envelope did not have one exact supported fixed width.
     EnvelopeLength { observed: usize },
     /// A retained envelope named an unsupported body format version.
@@ -431,6 +489,14 @@ impl fmt::Display for FsTxError {
                     "FS_TXN refused: immutable final already exists {filename}"
                 )
             }
+            Self::FinalFilenameInvalid { filename } => write!(
+                formatter,
+                "FS_TXN refused: activation final filename is not canonical {filename}"
+            ),
+            Self::FinalFilenameBindingMismatch { filename } => write!(
+                formatter,
+                "FS_TXN refused: activation final filename does not bind its envelope {filename}"
+            ),
             Self::EnvelopeLength { observed } => write!(
                 formatter,
                 "FS_TXN refused: canonical activation envelope length {observed} is unsupported"
