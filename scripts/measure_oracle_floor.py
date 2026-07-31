@@ -31,10 +31,11 @@ import random
 import re
 import struct
 import sys
+from collections.abc import Iterable
 from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable, NoReturn
+from typing import Any, NoReturn
 
 
 ROOT = Path(__file__).resolve().parents[1]
