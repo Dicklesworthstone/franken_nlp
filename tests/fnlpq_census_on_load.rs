@@ -432,7 +432,10 @@ fn replace_header_digest(bytes: &mut [u8], field: &str, replacement: &str) {
 }
 
 fn replace_header_decimal(bytes: &mut [u8], field: &str, replacement: u8) {
-    assert!(replacement.is_ascii_digit(), "replacement must be a decimal digit");
+    assert!(
+        replacement.is_ascii_digit(),
+        "replacement must be a decimal digit"
+    );
     let header_len = usize::try_from(u64::from_le_bytes(
         bytes[16..24].try_into().expect("prelude"),
     ))

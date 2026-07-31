@@ -52,16 +52,6 @@ R4_EVIDENCE_RECEIPT_RE = re.compile(
     r"\b(?P<kind>r4-receipt|admission-receipt)="
     r"(?P<path>(?:docs/evidence|tests/fixtures/claims)/[A-Za-z0-9_./-]+)#sha256:(?P<digest>[0-9a-f]{64})\b"
 )
-R4_ARTIFACT_BINDING_RE = re.compile(
-    r"recipe_id=(?P<recipe_id>[^;]+); packing_sha256=(?P<packing>[0-9a-f]{64}); "
-    r"kernel_table_sha256=(?P<kernel_table>[0-9a-f]{64}); load_mode=(?P<load_mode>[^;]+)\Z"
-)
-R4_CONTEXT_BINDING_RE = re.compile(
-    r"tokens=(?P<tokens>[1-9][0-9]*); kv_dtype=(?P<kv_dtype>[A-Za-z0-9_-]+)\Z"
-)
-R4_ADMISSION_BINDING_RE = re.compile(
-    r"outcome=admitted; committed_bytes=(?P<committed>[1-9][0-9]*); peak_bytes=(?P<peak>[1-9][0-9]*)\Z"
-)
 R4_RECEIPT_SCHEMA_VERSION = 1
 R4_COMMON_RECEIPT_KEYS = {
     "artifact",

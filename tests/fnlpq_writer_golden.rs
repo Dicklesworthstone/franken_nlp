@@ -1,8 +1,8 @@
 use franken_nlp::artifact::format::{
-    decode_prelude, encode_f32_scales, framed_sha256, framed_sha256_hex,
-    logical_model_sha256 as compute_logical_model_sha256, logical_tensor_sha256, write, ArchTarget,
-    CanonicalDtype, FnlpqWriteError, FnlpqWriterInput, PackingSetInput, SectionKind,
-    SectionPayload, SectionRange,
+    ArchTarget, CanonicalDtype, FnlpqWriteError, FnlpqWriterInput, PackingSetInput, SectionKind,
+    SectionPayload, SectionRange, decode_prelude, encode_f32_scales, framed_sha256,
+    framed_sha256_hex, logical_model_sha256 as compute_logical_model_sha256, logical_tensor_sha256,
+    write,
 };
 use franken_nlp::artifact::reader::FnlpqArtifact;
 use franken_nlp::canonjson;
@@ -264,10 +264,12 @@ fn field_inventory_ids_are_all_covered_by_the_writer_golden() {
         9,
         "all v1 section kinds are represented"
     );
-    assert!(written
-        .sections
-        .iter()
-        .any(|section| section.kind == SectionKind::NativePackingPayload));
+    assert!(
+        written
+            .sections
+            .iter()
+            .any(|section| section.kind == SectionKind::NativePackingPayload)
+    );
 }
 
 #[test]
