@@ -28,6 +28,7 @@ struct RopeOracleFixture {
     model_id: String,
     revision: String,
     profile: String,
+    application: RopeApplicationFixture,
     producer: RopeOracleProducer,
     head_dim: usize,
     theta: u64,
@@ -52,6 +53,29 @@ struct RopeOracleRow {
     f32_sine_bits: String,
     bf16_cosine_bits: String,
     bf16_sine_bits: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RopeApplicationFixture {
+    capture_schema_version: u32,
+    cosine_half_bf16_hex: Vec<String>,
+    input_ids: Vec<u32>,
+    key_head: usize,
+    key_input_bf16_hex: String,
+    key_rotated_bf16_hex: String,
+    layer: usize,
+    #[serde(rename = "loop")]
+    loop_index: usize,
+    modeling_source_sha256: String,
+    phase: String,
+    position: usize,
+    profile: String,
+    query_head: usize,
+    query_input_bf16_hex: String,
+    query_rotated_bf16_hex: String,
+    sine_half_bf16_hex: Vec<String>,
+    source_closure_verification: String,
+    torch: String,
 }
 
 fn assert_close(observed: f32, expected: f32, tolerance: f32) {
@@ -88,6 +112,31 @@ fn parse_u16_bits(bits: &str, field: &str) -> u16 {
     assert_eq!(bits.len(), 4, "oracle {field} must have four hex digits");
     u16::from_str_radix(bits, 16)
         .unwrap_or_else(|error| panic!("parse oracle {field}={bits:?} as u16: {error}"))
+}
+
+fn parse_bf16_vector(bits: &str, field: &str, expected_elements: usize) -> Vec<Bf16> {
+    assert_eq!(
+        bits.len(),
+        expected_elements * 4,
+        "oracle {field} must encode exactly {expected_elements} bf16 values"
+    );
+    bits.as_bytes()
+        .chunks_exact(4)
+        .enumerate()
+        .map(|(index, chunk)| {
+            let chunk = std::str::from_utf8(chunk).unwrap_or_else(|error| {
+                panic!("oracle {field} chunk={index} is not UTF-8: {error}")
+            });
+            let value = u16::from_str_radix(chunk, 16).unwrap_or_else(|error| {
+                panic!("parse oracle {field} chunk={index} value={chunk:?} as bf16: {error}")
+            });
+            Bf16::from_bits(value)
+        })
+        .collect()
+}
+
+fn parse_bf16_chunks(chunks: &[String], field: &str, expected_elements: usize) -> Vec<Bf16> {
+    parse_bf16_vector(&chunks.concat(), field, expected_elements)
 }
 
 fn real_shape_values(elements: usize, multiplier: f32, offset: f32) -> Vec<f32> {
@@ -224,6 +273,88 @@ fn pinned_oracle_rope_fixture_covers_boundary_positions_and_casts() {
             row.lane
         );
     }
+}
+
+#[test]
+fn hf_bf16_eager_rope_application_matches_captured_qk_head() {
+    let fixture: RopeOracleFixture =
+        serde_json::from_str(ORACLE_FIXTURE).expect("the pinned RoPE oracle fixture is valid JSON");
+    let application = fixture.application;
+    assert_eq!(application.capture_schema_version, 1);
+    assert_eq!(application.profile, "hf-bf16-eager");
+    assert_eq!(application.phase, "prefill");
+    assert_eq!(application.layer, 0);
+    assert_eq!(application.loop_index, 0);
+    assert_eq!(application.position, 1);
+    assert_eq!(application.query_head, 0);
+    assert_eq!(application.key_head, 0);
+    assert_eq!(application.input_ids, vec![1, 2]);
+    assert_eq!(application.modeling_source_sha256, PINNED_SOURCE_SHA256);
+    assert_eq!(application.torch, "2.6.0");
+    assert_eq!(
+        application.source_closure_verification, "not_mechanically_verified",
+        "this local capture must not be represented as a mechanically verified model closure"
+    );
+
+    let mut query = parse_bf16_vector(
+        &application.query_input_bf16_hex,
+        "application query input",
+        NANBEIGE_HEAD_DIM,
+    );
+    let mut key = parse_bf16_vector(
+        &application.key_input_bf16_hex,
+        "application key input",
+        NANBEIGE_HEAD_DIM,
+    );
+    let expected_query = parse_bf16_vector(
+        &application.query_rotated_bf16_hex,
+        "application rotated query",
+        NANBEIGE_HEAD_DIM,
+    );
+    let expected_key = parse_bf16_vector(
+        &application.key_rotated_bf16_hex,
+        "application rotated key",
+        NANBEIGE_HEAD_DIM,
+    );
+    let captured_cosine = parse_bf16_chunks(
+        &application.cosine_half_bf16_hex,
+        "application cosine half-row",
+        NANBEIGE_HEAD_DIM / 2,
+    );
+    let captured_sine = parse_bf16_chunks(
+        &application.sine_half_bf16_hex,
+        "application sine half-row",
+        NANBEIGE_HEAD_DIM / 2,
+    );
+    let tables = RopeTablesF32::nanbeige(application.position + 1)
+        .expect("application capture position is an admitted table row");
+    for lane in 0..NANBEIGE_HEAD_DIM {
+        let table_lane = lane % (NANBEIGE_HEAD_DIM / 2);
+        let (cosine, sine) = tables
+            .table_value(application.position, table_lane)
+            .unwrap();
+        assert_eq!(
+            Bf16::from_f32(cosine),
+            captured_cosine[table_lane],
+            "captured hf-bf16-eager cosine lane={lane}"
+        );
+        assert_eq!(
+            Bf16::from_f32(sine),
+            captured_sine[table_lane],
+            "captured hf-bf16-eager sine lane={lane}"
+        );
+    }
+    tables
+        .apply_split_half(application.position, &mut query)
+        .unwrap();
+    tables
+        .apply_split_half(application.position, &mut key)
+        .unwrap();
+    assert_eq!(query, expected_query, "captured Q RoPE application bits");
+    assert_eq!(key, expected_key, "captured K RoPE application bits");
+    eprintln!(
+        "ROPE_APPLICATION_CAPTURE RESULT=PASS profile=hf-bf16-eager source_closure_verification=not_mechanically_verified position=1 q_head=0 k_head=0"
+    );
 }
 
 #[test]

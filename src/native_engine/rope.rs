@@ -204,8 +204,13 @@ impl RopeTablesF32 {
         Ok(())
     }
 
-    /// Applies one f32 table row to a single bf16 Q or K head, narrowing each
-    /// rotated lane at the `hf-bf16-eager` profile's named cast site.
+    /// Applies one f32 table row to a single bf16 Q or K head with the
+    /// `hf-bf16-eager` RoPE cast graph.
+    ///
+    /// The remote eager path first casts the f32 table row to the Q/K bf16
+    /// dtype, rounds each bf16 product, then rounds their sum.  Keeping either
+    /// the table or intermediate products widened would be a different
+    /// numeric profile even when its final output often agrees.
     pub fn apply_split_half(
         &self,
         position: usize,
@@ -217,10 +222,14 @@ impl RopeTablesF32 {
         for lane in 0..half_dim {
             let left = activation[lane].to_f32();
             let right = activation[lane + half_dim].to_f32();
-            let cosine = self.cosine[offset + lane];
-            let sine = self.sine[offset + lane];
-            activation[lane] = Bf16::from_f32(left * cosine - right * sine);
-            activation[lane + half_dim] = Bf16::from_f32(right * cosine + left * sine);
+            let cosine = Bf16::from_f32(self.cosine[offset + lane]).to_f32();
+            let sine = Bf16::from_f32(self.sine[offset + lane]).to_f32();
+            let left_cosine = Bf16::from_f32(left * cosine).to_f32();
+            let negated_right_sine = Bf16::from_f32((-right) * sine).to_f32();
+            let right_cosine = Bf16::from_f32(right * cosine).to_f32();
+            let left_sine = Bf16::from_f32(left * sine).to_f32();
+            activation[lane] = Bf16::from_f32(left_cosine + negated_right_sine);
+            activation[lane + half_dim] = Bf16::from_f32(right_cosine + left_sine);
         }
         Ok(())
     }

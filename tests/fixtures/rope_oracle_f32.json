@@ -1,5 +1,43 @@
 {
   "admitted_cap": 18,
+  "application": {
+    "capture_schema_version": 1,
+    "cosine_half_bf16_hex": [
+      "3f0a3f3b3f583f693f733f783f7c3f7e",
+      "3f7f3f7f3f803f803f803f803f803f80",
+      "3f803f803f803f803f803f803f803f80",
+      "3f803f803f803f803f803f803f803f80",
+      "3f803f803f803f803f803f803f803f80",
+      "3f803f803f803f803f803f803f803f80",
+      "3f803f803f803f803f803f803f803f80",
+      "3f803f803f803f803f803f803f803f80"
+    ],
+    "input_ids": [1, 2],
+    "key_head": 0,
+    "key_input_bf16_hex": "3fbd3ff13fa1400a3df33efdbf09bfdf3fe2401f3fc93f3fbe56bfeac024bd943f883fa4c017bf91bfb23fb83cb0bf293fcb3f88bfaf3fc73c433ee73f30bf7f3f57c0c73e05be843ec0bf823fd43e91bfc33f5c3e18bfa3ba863fb2c0cb4049bf10bf04be9ebf7e3f6d3fe03e2bbfb93e02bfadbf21bf823f85c0c23e253fde40183eeac01dbf04bfeec009c009bef73f303ec83eed4009bdf1bf473fa53f603f39bfaf3fd9bf31c0253ed3beb0bd8a401abe9e400c3f76bfc03e02bede3ebf3e38bd663ebbc00ebf223da2c01f400a3ead3c9cbf89c141bd6d3f053d66bd3bc0003fa1bde73f5a3f8a3def3ef83f103f7d3ee73f833f28bff2c015c01dbf37",
+    "key_rotated_bf16_hex": "bf993f884018400b3f353f7ebe0cbfd43fd8401c3fc53f26be52bfe7c026bdae3f873fa5c018bf91bfb13fb83cb6bf293fcb3f88bfaf3fc73c4c3ee73f30bf7f3f57c0c73e05be843ec0bf823fd43e91bfc33f5c3e18bfa3ba863fb2c0cb4049bf10bf04be9ebf7e3f6d3fe03e2bbfb93e02bfadbf21bf823f85c0c23e253fde40223fd0bfb13edcbfddbffbc00dbf383f5e3f163f0e400bbdffbf533f9f3f603f3cbfae3fd7bf32c0253ed5beb0bd8c401abe9e400c3f76bfc03e02bede3ebf3e38bd683ebbc00ebf223da2c01f400a3ead3c9cbf89c141bd6d3f053d66bd3bc0003fa1bde73f5a3f8a3def3ef83f103f7d3ee73f833f28bff2c015c01dbf37",
+    "layer": 0,
+    "loop": 0,
+    "modeling_source_sha256": "547737f989f5cb741c1a568acaf85f83521fa67a8f7268e19f9a37e60127c0d5",
+    "phase": "prefill",
+    "position": 1,
+    "profile": "hf-bf16-eager",
+    "query_head": 0,
+    "query_input_bf16_hex": "3feb3efbbfb53f2a3c50bfb5bfb0bfbf3f603fcf401c3f8ebce4bea7c027bf203f663f0fc0613ef9be82bd873ef33f823f63bf73be053f273f0fbf14bf26bef83de4bf243f9a3f3a3f003f003d673f283dc63d16be0941363efabf203fd73f0f3f0dbe873e95bdc63dc4bf15bedd3cfb3ed53f24bea03f413e3840273e79bd613e8abf48bfdbbf81bcf0bfa2bf933f8ebd34bf973e3b3f833e97bd8d3f123eb83ecabed63f2e3e4dc0133eb1bed2bf134034bfa33e903f96bdf93e4e3f97be0abf20c0643cea3e873e56bdf73fd9bea6bdbebf03bed53ffc3ed93ec4c0183f2d3e87bf513e2c3d4cbe643ec63e533ec6bf36bf0ebdf73ed23fda3ed03f2fbe0c",
+    "query_rotated_bf16_hex": "3f433f64be8c3f833cafbf88bf92bfd23f603fda401b3f88bd1bbea6c028bf213f653f10c0613ef9be7cbd893ef33f823f62bf73be053f273f0fbf14bf26bef83de4bf243f9a3f3a3f003f003d673f283dc63d16be0941363efabf203fd73f0f3f0dbe873e95bdc63dc4bf15bedd3cfb3ed53f24bea03f413e3840273e79bd613fd8be70c00dbf24bcc3bfc9bfb13f653d43bf863ea83f893e97bd9e3f053eb33ecfbed43f283e4fc0133eb1bed2bf134034bfa33e903f96bdf93e4e3f97be0abf20c0643ceb3e873e56bdf73fd9bea6bdbebf03bed53ffc3ed93ec4c0183f2d3e87bf513e2c3d4cbe643ec63e533ec6bf36bf0ebdf73ed23fda3ed03f2fbe0c",
+    "sine_half_bf16_hex": [
+      "3f573f2f3f0a3ed53ea33e773e3b3e0e",
+      "3dd63da13d733d383d0a3cd13c9d3c6e",
+      "3c333c073bcc3b9a3b683b2f3b043ac7",
+      "3a963a623a2a3a0039c23992395c3926",
+      "38fb38bd388f3857382237f437b8378b",
+      "3752371e36ee36b43688364d361a35e9",
+      "35af35843547351634e334ab34813443",
+      "341333dd33a7337c333e330f32d832a3"
+    ],
+    "source_closure_verification": "not_mechanically_verified",
+    "torch": "2.6.0"
+  },
   "head_dim": 128,
   "model_id": "Nanbeige/Nanbeige4.2-3B",
   "producer": {
