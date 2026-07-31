@@ -4,8 +4,8 @@
 use franken_nlp::artifact::converter::{
     expected_nanbeige42_census, prepare_convert_request, remap_tensor_name,
     validate_nanbeige42_census, validate_pinned_logical_payload_bytes, ConversionReceipt,
-    ConversionSourceManifest, ConvertArch, ConvertRequest, ConverterError, StorageStage,
-    DEFAULT_PANEL_BYTES, PINNED_LOGICAL_PAYLOAD_BYTES,
+    ConversionSourceManifest, ConvertArch, ConvertRequest, ConverterError, OutputRange,
+    OutputRangePlan, StorageStage, DEFAULT_PANEL_BYTES, PINNED_LOGICAL_PAYLOAD_BYTES,
 };
 use franken_nlp::artifact::safetensors::TensorCensusEntry;
 
@@ -155,4 +155,30 @@ fn conversion_admission_rejects_the_recipe_before_source_access() {
             ..
         })
     ));
+}
+
+#[test]
+fn externally_supplied_output_range_plans_refuse_duplicate_names() {
+    let plan = OutputRangePlan {
+        ranges: vec![
+            OutputRange {
+                name: "data".to_owned(),
+                offset: 0,
+                len: 4,
+            },
+            OutputRange {
+                name: "data".to_owned(),
+                offset: 4,
+                len: 2,
+            },
+        ],
+        file_len: 6,
+    };
+
+    assert_eq!(
+        plan.validate(),
+        Err(ConverterError::DuplicateOutputRange {
+            name: "data".to_owned(),
+        })
+    );
 }

@@ -1454,7 +1454,13 @@ impl OutputRangePlan {
     /// a downstream envelope planner.
     pub fn validate(&self) -> Result<(), ConverterError> {
         let mut cursor = 0_u64;
+        let mut names = BTreeSet::new();
         for range in &self.ranges {
+            if !names.insert(range.name.clone()) {
+                return Err(ConverterError::DuplicateOutputRange {
+                    name: range.name.clone(),
+                });
+            }
             if range.offset != cursor {
                 return Err(ConverterError::OutputRangeLayout {
                     name: range.name.clone(),
