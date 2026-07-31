@@ -17,7 +17,37 @@
       "is_practicality_claim": true
     },
     {
+      "claim": "Measured context window reaches 16K tokens.",
+      "is_practicality_claim": true
+    },
+    {
+      "claim": "A 32K context is practical.",
+      "is_practicality_claim": true
+    },
+    {
+      "claim": "The runtime accepts 32K-token prompts.",
+      "is_practicality_claim": true
+    },
+    {
+      "claim": "The tokenizer supports 16,384 vocabulary entries.",
+      "is_practicality_claim": false
+    },
+    {
       "claim": "Observed model limit: 262,144 positions.",
+      "is_practicality_claim": false
+    }
+  ],
+  "wrapped_cases": [
+    {
+      "lines": ["The runtime supports", "32K window."],
+      "is_practicality_claim": true
+    },
+    {
+      "lines": ["The 32K context", "is practical."],
+      "is_practicality_claim": true
+    },
+    {
+      "lines": ["This prose leaves the annotation stale.", "The runtime supports a 32K window."],
       "is_practicality_claim": false
     }
   ]

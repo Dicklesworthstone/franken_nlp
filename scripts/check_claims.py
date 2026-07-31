@@ -30,9 +30,11 @@ R4_CONTEXT_ANNOTATION_RE = re.compile(
     r"fnlp-r4-context:\s*ledger=(?P<ledger>PERF-[A-Z0-9-]+)\b"
 )
 PRACTICALITY_WORD_RE = re.compile(
-    r"\b(?:usable|support(?:s|ed|ing)|handle(?:s|d|ing)|admission)\b",
+    r"\b(?:usable|practical|support(?:s|ed|ing)|handle(?:s|d|ing)|accept(?:s|ed|ing)?|"
+    r"reach(?:es|ed|ing)?|admission)\b",
     re.IGNORECASE,
 )
+CONTEXT_NOUN_RE = re.compile(r"\b(?:context|ctx|window|prompts?)\b", re.IGNORECASE)
 CONTEXT_LENGTH_CLAUSE_RE = re.compile(
     r"\b(?:context|ctx)(?:\s+(?:length|window|cap))?\s*(?:(?:is|of|at|up\s+to)\s*)?:?\s*"
     r"(?P<value>\d{1,3}(?:,\d{3})+|\d+)\b",
@@ -643,9 +645,13 @@ def context_amount_exceeds_default(line: str) -> bool:
             value *= 1024
         nearby_text = line[max(0, match.start() - 48) : min(len(line), match.end() + 48)]
         observed_limit_value = match.span("value") in observed_limit_values
+        contextual_practicality = (
+            CONTEXT_NOUN_RE.search(nearby_text) is not None
+            and PRACTICALITY_WORD_RE.search(nearby_text) is not None
+        )
         if (
             match.span("value") not in direct_context_values
-            and PRACTICALITY_WORD_RE.search(nearby_text) is None
+            and not contextual_practicality
             and not (observed_limit_value and practicality_language)
         ):
             continue
@@ -654,6 +660,24 @@ def context_amount_exceeds_default(line: str) -> bool:
         if value > DEFAULT_CONTEXT_CAP:
             return True
     return False
+
+
+def r4_context_claim_on_line(lines: list[str], line_index: int) -> bool:
+    """Recognize an immediate R4 claim, including a single natural line wrap.
+
+    A wrap is only joined when its first line names the context subject or the
+    practical-capability predicate.  This keeps an annotation from floating
+    across unrelated prose while recognizing ordinary prose wrapping.
+    """
+
+    line = lines[line_index]
+    if context_amount_exceeds_default(line):
+        return True
+    if line_index + 1 >= len(lines) or not lines[line_index + 1].strip():
+        return False
+    if CONTEXT_NOUN_RE.search(line) is None and PRACTICALITY_WORD_RE.search(line) is None:
+        return False
+    return context_amount_exceeds_default(f"{line} {lines[line_index + 1]}")
 
 
 def validate_r4_context_claim(
@@ -702,10 +726,12 @@ def scan_surface(
     r4_context_lines = 0
     if eligible_r4_ledgers is None:
         eligible_r4_ledgers = {}
-    for line_number, line in enumerate(lines, start=1):
+    for line_index, line in enumerate(lines):
+        line_number = line_index + 1
+        r4_context_claim = r4_context_claim_on_line(lines, line_index)
         consumed_r4 = False
         if active_r4 is not None:
-            if not context_amount_exceeds_default(line):
+            if not r4_context_claim:
                 ledger, annotation_line = active_r4
                 raise ClaimsError(
                     f"file={path}:{annotation_line} fnlp-r4-context ledger={ledger} must immediately precede "
@@ -744,7 +770,7 @@ def scan_surface(
         if r4_match:
             active_r4 = (r4_match["ledger"], line_number)
             continue
-        if not consumed_r4 and context_amount_exceeds_default(line):
+        if not consumed_r4 and r4_context_claim:
             validate_r4_context_claim(
                 path=path,
                 line_number=line_number,
@@ -1004,6 +1030,13 @@ def run_self_test(root: Path, claims: dict[str, dict[str, Any]]) -> None:
         if observed != case["is_practicality_claim"]:
             raise ClaimsError(
                 f"self-test hostile R4 claim mismatch claim={case['claim']!r} expected="
+                f"{case['is_practicality_claim']} observed={observed}"
+            )
+    for case in hostile_cases["wrapped_cases"]:
+        observed = r4_context_claim_on_line(case["lines"], 0)
+        if observed != case["is_practicality_claim"]:
+            raise ClaimsError(
+                f"self-test wrapped R4 claim mismatch lines={case['lines']!r} expected="
                 f"{case['is_practicality_claim']} observed={observed}"
             )
     fabricated = eligible_r4_ledger_entries(
