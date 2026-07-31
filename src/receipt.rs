@@ -5,6 +5,7 @@
 //! while private content is represented only by domain-separated HMAC-SHA-256
 //! commitments. The HMAC key deliberately has no serialization or debug path.
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 
@@ -172,6 +173,12 @@ impl CommitmentKey {
         Ok(Self { key_id, secret })
     }
 
+    /// Return the non-secret key rotation identifier suitable for a receipt.
+    #[must_use]
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
     /// Commit to private bytes without retaining a raw SHA-256 content digest.
     ///
     /// Every field participates in a versioned, length-delimited message so a
@@ -274,6 +281,63 @@ pub struct ReceiptEvidence {
     pub uri: String,
 }
 
+/// How a content item is represented in a public receipt.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentKind {
+    /// No content identity was authorized for export.
+    Absent,
+    /// A SHA-256 value for public, non-low-entropy content.
+    PublicSha256,
+    /// A domain-separated HMAC for private or low-entropy content.
+    HmacSha256,
+}
+
+/// One input or output identity retained by a receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ReceiptContentItem {
+    pub kind: ContentKind,
+    pub label: String,
+    pub value: Option<Sha256Digest>,
+}
+
+/// Public content identity inventory. It never carries raw private bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ReceiptContent {
+    pub commitment_key_id: Option<String>,
+    pub inputs: Vec<ReceiptContentItem>,
+    pub outputs: Vec<ReceiptContentItem>,
+}
+
+impl ReceiptContent {
+    fn validate(&self) -> Result<(), ReceiptError> {
+        if let Some(key_id) = &self.commitment_key_id {
+            validate_identifier("content.commitment_key_id", key_id)?;
+        }
+        let mut seen = BTreeSet::new();
+        for item in self.inputs.iter().chain(&self.outputs) {
+            validate_identifier("content.label", &item.label)?;
+            let value_matches_kind = match item.kind {
+                ContentKind::Absent => item.value.is_none(),
+                ContentKind::PublicSha256 => item.value.is_some(),
+                ContentKind::HmacSha256 => {
+                    self.commitment_key_id.is_some() && item.value.is_some()
+                }
+            };
+            if !value_matches_kind {
+                return Err(ReceiptError::InvalidContentItem { kind: item.kind });
+            }
+            if !seen.insert((item.kind, item.label.clone())) {
+                return Err(ReceiptError::DuplicateContentItem {
+                    kind: item.kind,
+                    label: item.label.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Complete artifact identity taxonomy needed by a receipt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ReceiptArtifacts {
@@ -307,7 +371,7 @@ pub struct Receipt {
     pub recipe_id: String,
     pub prompt_template_sha256: Sha256Digest,
     pub fixture_digests: Vec<Sha256Digest>,
-    pub commitments: Vec<ContentCommitment>,
+    pub content: ReceiptContent,
     pub checks: Vec<ReceiptCheck>,
     pub evidence: Vec<ReceiptEvidence>,
 }
@@ -324,7 +388,7 @@ impl Receipt {
         provenance: &ProvenanceIdentity,
         code: ReceiptCodeIdentity,
         fixture_digests: Vec<Sha256Digest>,
-        commitments: Vec<ContentCommitment>,
+        content: ReceiptContent,
         checks: Vec<ReceiptCheck>,
         evidence: Vec<ReceiptEvidence>,
     ) -> Result<Self, ReceiptError> {
@@ -355,7 +419,7 @@ impl Receipt {
             recipe_id: execution.quant_recipe.clone(),
             prompt_template_sha256: execution.template_digest,
             fixture_digests,
-            commitments,
+            content,
             checks,
             evidence,
         };
@@ -385,12 +449,10 @@ impl Receipt {
         if self.checks.is_empty() {
             return Err(ReceiptError::MissingChecks);
         }
+        self.content.validate()?;
         for check in &self.checks {
             validate_identifier("check.id", &check.id)?;
             validate_authority("check.scope", &check.scope)?;
-        }
-        for commitment in &self.commitments {
-            validate_authority("commitment.key_id", &commitment.key_id)?;
         }
         for evidence in &self.evidence {
             validate_identifier("evidence.id", &evidence.id)?;
@@ -419,6 +481,13 @@ pub enum ReceiptError {
     InvalidIdentityDisclosure {
         disclosure: IdentityDisclosure,
     },
+    InvalidContentItem {
+        kind: ContentKind,
+    },
+    DuplicateContentItem {
+        kind: ContentKind,
+        label: String,
+    },
     CommitmentTooLarge,
     MissingChecks,
 }
@@ -440,6 +509,14 @@ impl fmt::Display for ReceiptError {
             Self::InvalidIdentityDisclosure { disclosure } => write!(
                 formatter,
                 "receipt identity disclosure {disclosure:?} has an incompatible projection"
+            ),
+            Self::InvalidContentItem { kind } => write!(
+                formatter,
+                "receipt content item {kind:?} has an incompatible value or key identifier"
+            ),
+            Self::DuplicateContentItem { kind, label } => write!(
+                formatter,
+                "receipt has duplicate content item kind={kind:?} label={label:?}"
             ),
             Self::CommitmentTooLarge => {
                 formatter.write_str("receipt commitment field does not fit u64 length framing")
@@ -625,6 +702,34 @@ mod tests {
         }]
     }
 
+    fn empty_content() -> ReceiptContent {
+        ReceiptContent {
+            commitment_key_id: None,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        }
+    }
+
+    fn committed_content(
+        key: &CommitmentKey,
+        input: ContentCommitment,
+        output: ContentCommitment,
+    ) -> ReceiptContent {
+        ReceiptContent {
+            commitment_key_id: Some(key.key_id().to_owned()),
+            inputs: vec![ReceiptContentItem {
+                kind: ContentKind::HmacSha256,
+                label: "input".to_owned(),
+                value: Some(input.hmac_sha256),
+            }],
+            outputs: vec![ReceiptContentItem {
+                kind: ContentKind::HmacSha256,
+                label: "output".to_owned(),
+                value: Some(output.hmac_sha256),
+            }],
+        }
+    }
+
     #[test]
     fn hmac_sha256_matches_rfc_4231_case_one() {
         let output = hmac_sha256(&[0x0b; 20], b"Hi There");
@@ -660,7 +765,7 @@ mod tests {
             &provenance(),
             code(),
             vec![digest(15)],
-            vec![input, output],
+            committed_content(&key, input, output),
             checks(),
             evidence(),
         )
@@ -699,7 +804,7 @@ mod tests {
             &provenance(),
             code(),
             Vec::new(),
-            Vec::new(),
+            empty_content(),
             checks(),
             Vec::new(),
         )
@@ -722,7 +827,7 @@ mod tests {
             &provenance(),
             code(),
             Vec::new(),
-            Vec::new(),
+            empty_content(),
             checks(),
             Vec::new(),
         )
