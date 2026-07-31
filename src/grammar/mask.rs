@@ -197,10 +197,9 @@ impl VocabTrie {
         tokenizer: &SpBpeTokenizer,
         model_vocab_size: usize,
     ) -> Result<Self, VocabTrieBuildError> {
-        Ok(Self::from_transducer(DetokenizationTransducer::from_tokenizer(
-            tokenizer,
-            model_vocab_size,
-        )?))
+        Ok(Self::from_transducer(
+            DetokenizationTransducer::from_tokenizer(tokenizer, model_vocab_size)?,
+        ))
     }
 
     /// Build a trie from one already-audited exact-byte transducer.
@@ -409,6 +408,16 @@ pub enum MaskCacheDisposition {
     Materialized,
 }
 
+/// One source-free cache event suitable for health or eviction telemetry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaskCacheEvent {
+    pub key: SchemaMaskKey,
+    pub schema_state_id: u32,
+    pub disposition: MaskCacheDisposition,
+    pub mask_bytes: usize,
+    pub cache_bytes_remaining: usize,
+}
+
 /// Byte-budgeted cache of immutable schema masks only.
 #[derive(Clone, Debug)]
 pub struct SchemaMaskCache {
@@ -449,20 +458,38 @@ impl SchemaMaskCache {
         schema_state: &S,
         limits: MaskWorkLimits,
         checkpoint: F,
-    ) -> Result<(DenseTokenMask, MaskCacheDisposition), MaskCacheMaterializationError>
+    ) -> Result<(DenseTokenMask, MaskCacheEvent), MaskCacheMaterializationError>
     where
         S: ByteState,
         F: FnMut(MaskWorkProgress) -> bool,
     {
         if let Some(mask) = self.get(key, schema_state_id) {
-            return Ok((mask, MaskCacheDisposition::Hit));
+            return Ok((
+                mask.clone(),
+                MaskCacheEvent {
+                    key,
+                    schema_state_id,
+                    disposition: MaskCacheDisposition::Hit,
+                    mask_bytes: mask.byte_len(),
+                    cache_bytes_remaining: self.capacity_bytes - self.used_bytes,
+                },
+            ));
         }
         let mask = oracle
             .materialize(schema_state, limits, checkpoint)
             .map_err(MaskCacheMaterializationError::Oracle)?;
         self.insert(key, schema_state_id, mask.clone())
             .map_err(MaskCacheMaterializationError::Cache)?;
-        Ok((mask, MaskCacheDisposition::Materialized))
+        Ok((
+            mask.clone(),
+            MaskCacheEvent {
+                key,
+                schema_state_id,
+                disposition: MaskCacheDisposition::Materialized,
+                mask_bytes: mask.byte_len(),
+                cache_bytes_remaining: self.capacity_bytes - self.used_bytes,
+            },
+        ))
     }
 
     /// Admit one schema-only mask, replacing an existing same-key state mask.

@@ -290,7 +290,7 @@ fn lazy_schema_cache_materializes_once_then_hits_without_trie_work() {
     };
     let mut cache = SchemaMaskCache::new(2);
     let mut first_checkpoints = 0;
-    let (first, disposition) = cache
+    let (first, event) = cache
         .get_or_materialize(
             key,
             3,
@@ -306,10 +306,14 @@ fn lazy_schema_cache_materializes_once_then_hits_without_trie_work() {
             },
         )
         .expect("first schema-state mask materializes and fits");
-    assert_eq!(disposition, MaskCacheDisposition::Materialized);
+    assert_eq!(event.disposition, MaskCacheDisposition::Materialized);
+    assert_eq!(event.key, key);
+    assert_eq!(event.schema_state_id, 3);
+    assert_eq!(event.mask_bytes, first.byte_len());
+    assert_eq!(event.cache_bytes_remaining, 0);
     assert!(first_checkpoints > 0);
 
-    let (second, disposition) = cache
+    let (second, event) = cache
         .get_or_materialize(
             key,
             3,
@@ -322,7 +326,8 @@ fn lazy_schema_cache_materializes_once_then_hits_without_trie_work() {
             |_| false,
         )
         .expect("cache hit bypasses both work limits and checkpoint");
-    assert_eq!(disposition, MaskCacheDisposition::Hit);
+    assert_eq!(event.disposition, MaskCacheDisposition::Hit);
+    assert_eq!(event.cache_bytes_remaining, 0);
     assert_eq!(second, first);
 }
 
