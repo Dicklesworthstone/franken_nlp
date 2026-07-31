@@ -6,3 +6,5 @@
 //! asupersync revision so verdicts are observations, not memory.
 #[path = "g0/asupersync_census/runtime_semantics.rs"]
 mod runtime_semantics;
+#[path = "g0/asupersync_census/gen_server_semantics.rs"]
+mod gen_server_semantics;
