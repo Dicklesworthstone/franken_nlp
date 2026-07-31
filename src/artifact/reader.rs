@@ -689,10 +689,7 @@ fn parse_header_sections(value: &Value) -> Result<Vec<HeaderSection>, FnlpqReadE
                 "must match v1 section-kind cardinality",
             ));
         }
-        output.push(HeaderSection {
-            name,
-            kind,
-        });
+        output.push(HeaderSection { name, kind });
     }
     for kind in REQUIRED_KINDS {
         if kinds.get(&kind).copied() != Some(1) {
@@ -1401,10 +1398,7 @@ fn validate_header_identities(
     Ok(())
 }
 
-fn stored_bytes<'a>(
-    bytes: &'a [u8],
-    section: &CheckedSection,
-) -> Result<&'a [u8], FnlpqReadError> {
+fn stored_bytes<'a>(bytes: &'a [u8], section: &CheckedSection) -> Result<&'a [u8], FnlpqReadError> {
     let start = usize_from_u64(section.file_offset, "section stored start")?;
     let end = start
         .checked_add(usize_from_u64(section.stored_len, "section stored length")?)
