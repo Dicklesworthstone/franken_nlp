@@ -58,7 +58,10 @@ fn assert_byte_exact(cell: &str, expected: &[u8], actual: &[u8]) {
         expected_window,
         actual_window,
     );
-    assert_eq!(expected, actual, "L0 template mismatch in matrix cell {cell}");
+    assert_eq!(
+        expected, actual,
+        "L0 template mismatch in matrix cell {cell}"
+    );
 }
 
 #[test]
@@ -171,5 +174,8 @@ fn pinned_oracle_matrix_is_byte_exact() {
         fixture_root.is_dir(),
         "unignore only when the pinned reference fixture matrix is committed"
     );
-    eprintln!("L0_TEMPLATE RESULT=PASS cells={} rejects=3", L0_MATRIX_IDS.len());
+    eprintln!(
+        "L0_TEMPLATE RESULT=PASS cells={} rejects=3",
+        L0_MATRIX_IDS.len()
+    );
 }
