@@ -62,6 +62,8 @@ struct ManifestDependency {
     #[serde(default)]
     kind: Option<String>,
     #[serde(default)]
+    optional: bool,
+    #[serde(default)]
     source: Option<String>,
 }
 
@@ -410,6 +412,10 @@ fn evaluate_policy(
             dev_direct_roots.insert(dependency.name.clone());
             continue;
         }
+        if dependency.optional {
+            validate_direct_dependency(dependency, &root_label)?;
+            continue;
+        }
         release_direct_roots.insert(dependency.name.clone());
         validate_direct_dependency(dependency, &root_label)?;
     }
@@ -483,16 +489,18 @@ fn validate_supply_chain_manifest(root: &Path, report: &PolicyReport) -> Result<
         full_path: path.display().to_string(),
         detail: format!("cannot read committed supply-chain manifest: {error}"),
     })?;
-    let manifest: SupplyChainManifest = serde_json::from_str(&document).map_err(|error| PolicyFailure {
-        offending_crate: "supply-chain-manifest".to_owned(),
-        full_path: path.display().to_string(),
-        detail: format!("cannot parse supply-chain manifest JSON: {error}"),
-    })?;
+    let manifest: SupplyChainManifest =
+        serde_json::from_str(&document).map_err(|error| PolicyFailure {
+            offending_crate: "supply-chain-manifest".to_owned(),
+            full_path: path.display().to_string(),
+            detail: format!("cannot parse supply-chain manifest JSON: {error}"),
+        })?;
     if manifest.schema_version != 1 || manifest.scope != "release-normal-build" {
         return Err(PolicyFailure {
             offending_crate: "supply-chain-manifest".to_owned(),
             full_path: path.display().to_string(),
-            detail: "manifest schema_version/scope is not the release normal/build contract".to_owned(),
+            detail: "manifest schema_version/scope is not the release normal/build contract"
+                .to_owned(),
         });
     }
     let manifest_roots: BTreeSet<String> = manifest.direct_release_roots.into_iter().collect();
@@ -500,7 +508,10 @@ fn validate_supply_chain_manifest(root: &Path, report: &PolicyReport) -> Result<
         return Err(PolicyFailure {
             offending_crate: "supply-chain-manifest".to_owned(),
             full_path: path.display().to_string(),
-            detail: format!("direct-root drift expected={:?} observed={manifest_roots:?}", report.release_direct_roots),
+            detail: format!(
+                "direct-root drift expected={:?} observed={manifest_roots:?}",
+                report.release_direct_roots
+            ),
         });
     }
     let manifest_inventory: BTreeSet<String> = manifest
@@ -516,8 +527,13 @@ fn validate_supply_chain_manifest(root: &Path, report: &PolicyReport) -> Result<
             full_path: path.display().to_string(),
             detail: format!(
                 "release package inventory drift missing={:?} unexpected={:?}",
-                report.release_package_inventory.difference(&manifest_inventory).collect::<Vec<_>>(),
-                manifest_inventory.difference(&report.release_package_inventory).collect::<Vec<_>>(),
+                report
+                    .release_package_inventory
+                    .difference(&manifest_inventory)
+                    .collect::<Vec<_>>(),
+                manifest_inventory
+                    .difference(&report.release_package_inventory)
+                    .collect::<Vec<_>>(),
             ),
         });
     }
