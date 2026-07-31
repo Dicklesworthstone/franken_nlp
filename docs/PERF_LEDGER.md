@@ -35,3 +35,25 @@ campaign may use `pending:` only while no measurement has been made.
 ## Current entries
 
 No local performance campaign has been measured at scaffold time.
+
+### PERF-6WT-Rope-projection-epilogue
+
+- Claim ID: `PERF-6WT-Rope-projection-epilogue`
+- Evidence: no measurement yet; the fused projection-epilogue implementation is
+  retained as a bit-equality candidate only.
+- Fixture hashes: `pending: no benchmark fixture has been accepted`
+- CPU feature string: `pending: no host measurement`
+- Command + environment: `pending: benchmark command is not yet authorized`
+- Disposition: `deferred`
+- Regime: `R1-latency-generate`
+- Host fingerprint: `pending: no host measurement`
+- Artifact recipe + packing + kernel table + load mode: `pending: no artifact`
+- p50/p95/p99: `pending: no measurement`
+- Fairness controls: `pending: same artifact, numerics profile, thread cap, and
+  thermal state are required before promotion`
+- Bandwidth denominator: `measured-dram-bytes`
+
+The fused variant remains **default off** until this row is replaced by a
+measured, profile-scoped winner for its exact `(ISA, shape, regime)` key. A
+slower or non-promoted result remains in this ledger as `rejected`; it is never
+removed merely because the unfused path remains selected.
