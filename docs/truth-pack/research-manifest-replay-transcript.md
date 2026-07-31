@@ -4,6 +4,12 @@ The evidence closure was replayed on 2026-07-31 against the immutable files
 under `docs/truth-pack/research/`. This documents the validator evidence only;
 the research manifest remains outside converter and runtime inputs.
 
+`--source-repo` is deliberately a stricter optional replay: it accepts a complete
+pinned upstream repository tree, not `scripts/fetch_model.*`'s smaller conversion
+closure. That closure omits research-only paths and retains fetch journals, so
+passing it to the complete-census comparison must fail rather than weakening the
+census to fit the conversion role.
+
 ```text
 $ python3 scripts/validate_research_manifest.py --self-test
 2026-07-31T13:18:13+00:00 RESEARCH_MANIFEST self_test verdict=PASS checks=6

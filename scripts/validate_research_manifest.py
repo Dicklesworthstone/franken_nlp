@@ -502,7 +502,10 @@ def main() -> int:
     parser.add_argument(
         "--source-repo",
         type=Path,
-        help="optional pinned upstream checkout for complete census replay",
+        help=(
+            "optional complete pinned upstream repository checkout for census replay; "
+            "the fetch_model conversion-source cache is intentionally not a valid input"
+        ),
     )
     parser.add_argument(
         "--conversion-manifest",
