@@ -127,7 +127,10 @@ fn closed_cli_target_spellings_do_not_accept_envelope_aliases() {
 
 fn generic_root(seed: u64) -> Vec<u8> {
     let payload = pseudo_random_bytes(seed, 4);
-    let scales = pseudo_random_bytes(seed.wrapping_add(1), 4);
+    // The checked reader validates every scale as finite and strictly
+    // positive.  Keep tensor payload/row-sum bytes synthetic while giving the
+    // one-group fixture a canonical valid f32 scale.
+    let scales = 0.5_f32.to_le_bytes().to_vec();
     let row_sums = pseudo_random_bytes(seed.wrapping_add(2), 4);
     let tensor_sha256 = logical_tensor_sha256(
         "model.embed_tokens.weight",
