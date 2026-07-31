@@ -802,7 +802,7 @@ fn expect_basename(
     value: &str,
 ) -> Result<(), ManifestError> {
     let pointer = pointer.into();
-    expect_identifier(invariant, &pointer, value)?;
+    expect_identifier(invariant, pointer.clone(), value)?;
     if value == "." || value == ".." || value.starts_with('.') {
         return Err(ManifestError::new(
             invariant,
