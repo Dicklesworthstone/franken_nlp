@@ -1215,6 +1215,31 @@ where
     Ok(report)
 }
 
+/// Feed one already-checked source range index through a prepared conversion
+/// plan.  The range index is the only production reader admitted here; it
+/// preserves its own source-digest and range-length checks while the routed
+/// traversal preserves converter plan alignment and bounded BF16 decoding.
+pub fn stream_prepared_bf16_panels<C>(
+    source: &SafetensorsRangeIndex,
+    prepared: &PreparedConversionInput,
+    consume: C,
+) -> Result<Bf16PanelStreamReport, ConverterError>
+where
+    C: FnMut(&TensorCensusEntry, &TensorRoute, RowPanel, &[u8], &[f32]) -> Result<(), ConverterError>,
+{
+    stream_routed_bf16_panels(
+        &prepared.census,
+        &prepared.routes,
+        &prepared.panels,
+        |entry, panel| {
+            source
+                .read_range(&entry.name, panel)
+                .map_err(ConverterError::Safetensors)
+        },
+        consume,
+    )
+}
+
 fn stream_bf16_row_panels<R, C>(
     entry: &TensorCensusEntry,
     plan: &PanelPlan,
