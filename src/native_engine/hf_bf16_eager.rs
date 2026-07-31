@@ -109,6 +109,10 @@ pub enum HfBf16EagerError {
     InvalidRunnerBoundary,
     /// The untied lm_head unexpectedly contained no output rows.
     EmptyLogits,
+    /// Prefill must contain at least one token position to execute.
+    EmptyPrefill,
+    /// A cache sequence length could not be expanded to one 128-wide head.
+    AttentionCapacityOverflow { sequence_len: usize },
 }
 
 impl From<HfBf16EagerLayerError> for HfBf16EagerError {
@@ -252,7 +256,7 @@ impl HfBf16EagerEngine {
         token_ids: &[u32],
     ) -> Result<Vec<HfBf16EagerForward>, HfBf16EagerError> {
         if token_ids.is_empty() {
-            return Ok(Vec::new());
+            return Err(HfBf16EagerError::EmptyPrefill);
         }
         token_ids
             .iter()
@@ -390,13 +394,16 @@ fn eager_gqa_attention(
         });
     }
     let sequence_len = cache.len_for_slot(slot)?;
+    let head_elements = sequence_len
+        .checked_mul(NANBEIGE_HEAD_DIM)
+        .ok_or(HfBf16EagerError::AttentionCapacityOverflow { sequence_len })?;
     let mut output = vec![Bf16::from_bits(0); NANBEIGE_Q_PROJECTION_SIZE];
     for query_head in 0..QUERY_HEAD_COUNT {
         let kv_head = kv_head_for_query(query_head)?;
         let query_start = query_head * NANBEIGE_HEAD_DIM;
         let key_start = kv_head * NANBEIGE_HEAD_DIM;
-        let mut keys = Vec::with_capacity(sequence_len * NANBEIGE_HEAD_DIM);
-        let mut values = Vec::with_capacity(sequence_len * NANBEIGE_HEAD_DIM);
+        let mut keys = Vec::with_capacity(head_elements);
+        let mut values = Vec::with_capacity(head_elements);
         for position in 0..sequence_len {
             let cached_key = cache.key_at(slot, position)?;
             let cached_value = cache.value_at(slot, position)?;
