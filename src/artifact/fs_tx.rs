@@ -1,1 +1,611 @@
-//! Crash-safe artifact filesystem transactions.
+//! Fail-closed model-root transactions and append-only activation journals.
+//!
+//! The mutable model-root OS surface is intentionally unavailable until
+//! [`docs/PLATFORM_SURFACES.md`](../../docs/PLATFORM_SURFACES.md) ratifies an
+//! owner-only, no-follow lock/rename/durability implementation.  The public
+//! root opener therefore refuses rather than applying racy `stat`-then-open
+//! checks.  The canonical journal core is fully implemented here so a future
+//! ratified handle has one recovery authority to call.
+
+use std::{
+    cell::Cell,
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+    path::Path,
+};
+
+use sha2::{Digest, Sha256};
+
+/// Domain framing prepended to every activation-record body before hashing.
+pub const ACTIVATION_RECORD_DOMAIN: &[u8] = b"fnlp-activation-v1";
+const BODY_FORMAT_VERSION: u8 = 1;
+
+/// Fixed-width SHA-256 identity used by activation records and filenames.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ActivationDigest([u8; 32]);
+
+impl ActivationDigest {
+    /// Wraps an already verified SHA-256 digest.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the fixed-width digest bytes.
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+
+    /// Lowercase hexadecimal suitable for immutable journal filenames.
+    #[must_use]
+    pub fn to_hex(self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut rendered = String::with_capacity(64);
+        for byte in self.0 {
+            rendered.push(char::from(HEX[usize::from(byte >> 4)]));
+            rendered.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        rendered
+    }
+}
+
+impl fmt::Display for ActivationDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.to_hex())
+    }
+}
+
+/// The canonical body of one immutable activation record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivationRecordBody {
+    artifact_digest: ActivationDigest,
+    config_digest: ActivationDigest,
+    native_digest: ActivationDigest,
+    previous_record_digest: Option<ActivationDigest>,
+    sequence: u64,
+}
+
+impl ActivationRecordBody {
+    /// Creates the unique sequence-zero genesis body.
+    #[must_use]
+    pub const fn genesis(
+        artifact_digest: ActivationDigest,
+        native_digest: ActivationDigest,
+        config_digest: ActivationDigest,
+    ) -> Self {
+        Self {
+            artifact_digest,
+            config_digest,
+            native_digest,
+            previous_record_digest: None,
+            sequence: 0,
+        }
+    }
+
+    /// Creates the next checked sequence body linked to an immutable record.
+    pub fn successor(
+        previous: &ActivationRecord,
+        artifact_digest: ActivationDigest,
+        native_digest: ActivationDigest,
+        config_digest: ActivationDigest,
+    ) -> Result<Self, FsTxError> {
+        let sequence = previous
+            .body
+            .sequence
+            .checked_add(1)
+            .ok_or(FsTxError::SequenceOverflow)?;
+        Ok(Self {
+            artifact_digest,
+            config_digest,
+            native_digest,
+            previous_record_digest: Some(previous.record_digest),
+            sequence,
+        })
+    }
+
+    /// Checked, monotonic sequence number; it never wraps.
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Immutable artifact identity activated by this record.
+    #[must_use]
+    pub const fn artifact_digest(&self) -> ActivationDigest {
+        self.artifact_digest
+    }
+
+    /// Native packing identity activated by this record.
+    #[must_use]
+    pub const fn native_digest(&self) -> ActivationDigest {
+        self.native_digest
+    }
+
+    /// Execution/configuration identity activated by this record.
+    #[must_use]
+    pub const fn config_digest(&self) -> ActivationDigest {
+        self.config_digest
+    }
+
+    /// The immediately previous immutable record, absent only for genesis.
+    #[must_use]
+    pub const fn previous_record_digest(&self) -> Option<ActivationDigest> {
+        self.previous_record_digest
+    }
+
+    /// Canonical, length-free fixed-width body bytes.
+    ///
+    /// The format is `version || sequence_be || artifact || native || config
+    /// || previous_present || previous?`, so it has exactly one spelling and
+    /// cannot be confused by JSON escaping or map ordering.
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(1 + 8 + 32 * 4 + 1);
+        bytes.push(BODY_FORMAT_VERSION);
+        bytes.extend_from_slice(&self.sequence.to_be_bytes());
+        bytes.extend_from_slice(&self.artifact_digest.0);
+        bytes.extend_from_slice(&self.native_digest.0);
+        bytes.extend_from_slice(&self.config_digest.0);
+        match self.previous_record_digest {
+            Some(previous) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&previous.0);
+            }
+            None => bytes.push(0),
+        }
+        bytes
+    }
+}
+
+/// A digest-bound record envelope retained under a unique immutable filename.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivationRecord {
+    body: ActivationRecordBody,
+    record_digest: ActivationDigest,
+}
+
+impl ActivationRecord {
+    /// Creates a record whose digest is bound to this exact canonical body.
+    #[must_use]
+    pub fn new(body: ActivationRecordBody) -> Self {
+        let record_digest = digest_record_body(&body);
+        Self {
+            body,
+            record_digest,
+        }
+    }
+
+    /// Returns the immutable body.
+    #[must_use]
+    pub const fn body(&self) -> &ActivationRecordBody {
+        &self.body
+    }
+
+    /// Returns this record's domain-separated digest.
+    #[must_use]
+    pub const fn record_digest(&self) -> ActivationDigest {
+        self.record_digest
+    }
+
+    /// Recomputes the domain-framed digest before any record can be adopted.
+    #[must_use]
+    pub fn digest_is_valid(&self) -> bool {
+        self.record_digest == digest_record_body(&self.body)
+    }
+
+    /// Canonical staged-envelope bytes written before a future ratified rename.
+    #[must_use]
+    pub fn canonical_envelope_bytes(&self) -> Vec<u8> {
+        let body = self.body.canonical_bytes();
+        let mut envelope = Vec::with_capacity(body.len() + self.record_digest.0.len());
+        envelope.extend_from_slice(&body);
+        envelope.extend_from_slice(&self.record_digest.0);
+        envelope
+    }
+
+    /// The destination basename for a `create_new` staged envelope after its
+    /// same-filesystem immutable rename. A name is never overwritten.
+    #[must_use]
+    pub fn final_filename(&self) -> String {
+        format!(
+            "{:020}-{}.fnlpaj",
+            self.body.sequence,
+            self.record_digest.to_hex()
+        )
+    }
+
+    /// Constructs retained untrusted input for recovery tests/readers. Discovery
+    /// still recomputes the digest and ignores this record if it is forged.
+    #[must_use]
+    pub const fn from_retained_parts(
+        body: ActivationRecordBody,
+        record_digest: ActivationDigest,
+    ) -> Self {
+        Self {
+            body,
+            record_digest,
+        }
+    }
+}
+
+/// An adopted unambiguous journal head.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivationHead {
+    /// The retained record itself.
+    pub record: ActivationRecord,
+}
+
+impl ActivationHead {
+    /// Sequence of the adopted head.
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.record.body.sequence
+    }
+
+    /// Digest of the adopted head.
+    #[must_use]
+    pub const fn digest(&self) -> ActivationDigest {
+        self.record.record_digest
+    }
+}
+
+/// One diagnostic row from a full activation-chain walk.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChainWalkEntry {
+    /// Sequence advertised by this retained record.
+    pub sequence: u64,
+    /// Envelope digest as retained on disk.
+    pub digest: ActivationDigest,
+    /// Whether this row was adopted, ignored, or exposed a fork.
+    pub verdict: ChainWalkVerdict,
+}
+
+/// A stable chain-walk diagnostic classification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChainWalkVerdict {
+    /// The record's recomputed digest mismatched and it was ignored.
+    IgnoredDigestMismatch,
+    /// The record was valid but disconnected from the unique genesis chain.
+    IgnoredDisconnected,
+    /// The record was adopted into the one contiguous chain.
+    Adopted,
+    /// The record is one of multiple valid successors of a retained head.
+    ForkSuccessor,
+}
+
+/// Successful recovery output. Empty journals are an explicit state, not an
+/// invented initial pointer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivationDiscovery {
+    /// Last unambiguous record, or `None` if no unique valid genesis exists.
+    pub head: Option<ActivationHead>,
+    /// Complete deterministic walk, including every ignored retained record.
+    pub walk: Vec<ChainWalkEntry>,
+}
+
+/// Typed durable mutation or recovery failures.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FsTxError {
+    /// The platform registry has no ratified owner-only/no-follow root surface.
+    PlatformSurfaceUnavailable { surface: &'static str },
+    /// One process attempted to take the same non-reentrant content lock twice.
+    LockReentrant,
+    /// A monotonic activation sequence would wrap at `u64::MAX`.
+    SequenceOverflow,
+    /// A final immutable filename was already retained and cannot be reopened.
+    FinalNameExists { filename: String },
+    /// Two valid successors exist; recovery retains the previous head and never
+    /// selects a winner by digest or filename order.
+    ActivationFork {
+        last_unambiguous: Option<ActivationHead>,
+        successor_digests: Vec<ActivationDigest>,
+        walk: Vec<ChainWalkEntry>,
+    },
+}
+
+impl fmt::Display for FsTxError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PlatformSurfaceUnavailable { surface } => {
+                write!(formatter, "FS_TXN refused: unratified platform surface {surface}")
+            }
+            Self::LockReentrant => formatter.write_str("FS_TXN refused: content lock re-entry"),
+            Self::SequenceOverflow => {
+                formatter.write_str("FS_TXN refused: activation sequence overflow")
+            }
+            Self::FinalNameExists { filename } => {
+                write!(formatter, "FS_TXN refused: immutable final already exists {filename}")
+            }
+            Self::ActivationFork {
+                last_unambiguous,
+                successor_digests,
+                ..
+            } => write!(
+                formatter,
+                "FS_TXN activation fork last_unambiguous={:?} successors={successor_digests:?}",
+                last_unambiguous.as_ref().map(ActivationHead::sequence)
+            ),
+        }
+    }
+}
+
+impl Error for FsTxError {}
+
+/// A model-root capability. It has no public constructor while every target in
+/// `PLATFORM_SURFACES.md` remains blocked; callers therefore cannot accidentally
+/// turn a check-then-open path into a durable activation implementation.
+#[derive(Debug)]
+pub struct RatifiedModelRoot {
+    _private: (),
+}
+
+/// Opens a mutable model root only after platform authority exists.
+///
+/// The current platform registry explicitly blocks this operation on all
+/// release targets, so this function fails before it stats, follows, creates,
+/// locks, or mutates the caller-supplied path.
+pub fn open_ratified_model_root(_root: &Path) -> Result<RatifiedModelRoot, FsTxError> {
+    Err(FsTxError::PlatformSurfaceUnavailable {
+        surface: "model-root owner-only lock/no-follow/durability",
+    })
+}
+
+/// A safe in-memory stand-in for the create-new/sync/rename journal protocol.
+///
+/// It is used by the crash-state matrix and cannot mutate a user model root.
+/// A future ratified filesystem adapter must preserve these append-only naming
+/// and recovery rules exactly.
+#[derive(Debug, Default)]
+pub struct SimulatedActivationJournal {
+    final_names: BTreeSet<String>,
+    records: Vec<ActivationRecord>,
+}
+
+impl SimulatedActivationJournal {
+    /// Creates an empty journal with no implicit genesis record.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            final_names: BTreeSet::new(),
+            records: Vec::new(),
+        }
+    }
+
+    /// Appends an activation or rollback record. Both operations use this same
+    /// append-only mechanism; callers choose prior immutable digests to roll
+    /// back rather than overwriting any active pointer.
+    pub fn append(
+        &mut self,
+        artifact_digest: ActivationDigest,
+        native_digest: ActivationDigest,
+        config_digest: ActivationDigest,
+    ) -> Result<ActivationHead, FsTxError> {
+        let body = match discover_activation(&self.records)?.head {
+            Some(previous) => ActivationRecordBody::successor(
+                &previous.record,
+                artifact_digest,
+                native_digest,
+                config_digest,
+            )?,
+            None => ActivationRecordBody::genesis(artifact_digest, native_digest, config_digest),
+        };
+        let record = ActivationRecord::new(body);
+        self.retain_immutable(record.clone())?;
+        Ok(ActivationHead { record })
+    }
+
+    /// Retains a staged/final envelope exactly as recovery would find it. This
+    /// enables forged, torn, disconnected, and fork fixtures without granting
+    /// any real filesystem write capability.
+    pub fn retain_recovery_fixture(&mut self, record: ActivationRecord) -> Result<(), FsTxError> {
+        self.retain_immutable(record)
+    }
+
+    /// Discovers the unique contiguous chain from retained envelopes.
+    pub fn discover(&self) -> Result<ActivationDiscovery, FsTxError> {
+        discover_activation(&self.records)
+    }
+
+    /// Immutable retained records in creation/discovery input order.
+    #[must_use]
+    pub fn records(&self) -> &[ActivationRecord] {
+        &self.records
+    }
+
+    fn retain_immutable(&mut self, record: ActivationRecord) -> Result<(), FsTxError> {
+        let filename = record.final_filename();
+        if !self.final_names.insert(filename.clone()) {
+            return Err(FsTxError::FinalNameExists { filename });
+        }
+        self.records.push(record);
+        Ok(())
+    }
+}
+
+/// A process-local content-lock model used by the test matrix to prove that a
+/// re-entrant caller is rejected rather than silently sharing a mutation scope.
+#[derive(Debug, Default)]
+pub struct NonReentrantContentLock {
+    held: Cell<bool>,
+}
+
+impl NonReentrantContentLock {
+    /// Acquires the model-root content lock once.
+    pub fn try_lock(&self) -> Result<ContentLockGuard<'_>, FsTxError> {
+        if self.held.replace(true) {
+            return Err(FsTxError::LockReentrant);
+        }
+        Ok(ContentLockGuard { held: &self.held })
+    }
+}
+
+/// RAII release for the simulated non-reentrant content lock.
+#[derive(Debug)]
+pub struct ContentLockGuard<'lock> {
+    held: &'lock Cell<bool>,
+}
+
+impl Drop for ContentLockGuard<'_> {
+    fn drop(&mut self) {
+        self.held.set(false);
+    }
+}
+
+/// Recomputes every digest and follows only the one unique contiguous chain
+/// from a valid sequence-zero genesis record. Invalid, staged/torn, gapped, and
+/// disconnected records never become an active head.
+pub fn discover_activation(
+    records: &[ActivationRecord],
+) -> Result<ActivationDiscovery, FsTxError> {
+    let mut valid = Vec::new();
+    let mut walk = Vec::with_capacity(records.len());
+    for record in records {
+        if record.digest_is_valid() {
+            valid.push(record);
+        } else {
+            walk.push(ChainWalkEntry {
+                sequence: record.body.sequence,
+                digest: record.record_digest,
+                verdict: ChainWalkVerdict::IgnoredDigestMismatch,
+            });
+        }
+    }
+
+    let mut genesis = valid
+        .iter()
+        .copied()
+        .filter(|record| {
+            record.body.sequence == 0 && record.body.previous_record_digest.is_none()
+        })
+        .collect::<Vec<_>>();
+    genesis.sort_by_key(|record| record.record_digest);
+    if genesis.len() > 1 {
+        let successors = genesis
+            .iter()
+            .map(|record| record.record_digest)
+            .collect::<Vec<_>>();
+        for record in genesis {
+            walk.push(ChainWalkEntry {
+                sequence: record.body.sequence,
+                digest: record.record_digest,
+                verdict: ChainWalkVerdict::ForkSuccessor,
+            });
+        }
+        append_disconnected_walk_entries(&valid, &mut walk);
+        return Err(FsTxError::ActivationFork {
+            last_unambiguous: None,
+            successor_digests: successors,
+            walk,
+        });
+    }
+    let Some(mut current) = genesis.pop() else {
+        append_disconnected_walk_entries(&valid, &mut walk);
+        return Ok(ActivationDiscovery { head: None, walk });
+    };
+
+    let mut adopted = BTreeSet::new();
+    adopted.insert(current.record_digest);
+    loop {
+        let next_sequence = match current.body.sequence.checked_add(1) {
+            Some(sequence) => sequence,
+            None => {
+                if valid.iter().any(|record| {
+                    record.body.previous_record_digest == Some(current.record_digest)
+                }) {
+                    return Err(FsTxError::SequenceOverflow);
+                }
+                break;
+            }
+        };
+        let mut successors = valid
+            .iter()
+            .copied()
+            .filter(|record| {
+                record.body.sequence == next_sequence
+                    && record.body.previous_record_digest == Some(current.record_digest)
+            })
+            .collect::<Vec<_>>();
+        successors.sort_by_key(|record| record.record_digest);
+        match successors.len() {
+            0 => break,
+            1 => {
+                current = successors[0];
+                adopted.insert(current.record_digest);
+            }
+            _ => {
+                let successor_digests = successors
+                    .iter()
+                    .map(|record| record.record_digest)
+                    .collect::<Vec<_>>();
+                for record in successors {
+                    walk.push(ChainWalkEntry {
+                        sequence: record.body.sequence,
+                        digest: record.record_digest,
+                        verdict: ChainWalkVerdict::ForkSuccessor,
+                    });
+                }
+                for record in valid {
+                    if adopted.contains(&record.record_digest) {
+                        walk.push(ChainWalkEntry {
+                            sequence: record.body.sequence,
+                            digest: record.record_digest,
+                            verdict: ChainWalkVerdict::Adopted,
+                        });
+                    }
+                }
+                append_disconnected_walk_entries(&valid, &mut walk);
+                return Err(FsTxError::ActivationFork {
+                    last_unambiguous: Some(ActivationHead {
+                        record: current.clone(),
+                    }),
+                    successor_digests,
+                    walk,
+                });
+            }
+        }
+    }
+
+    for record in valid {
+        walk.push(ChainWalkEntry {
+            sequence: record.body.sequence,
+            digest: record.record_digest,
+            verdict: if adopted.contains(&record.record_digest) {
+                ChainWalkVerdict::Adopted
+            } else {
+                ChainWalkVerdict::IgnoredDisconnected
+            },
+        });
+    }
+    walk.sort_by_key(|entry| (entry.sequence, entry.digest, entry.verdict as u8));
+    Ok(ActivationDiscovery {
+        head: Some(ActivationHead {
+            record: current.clone(),
+        }),
+        walk,
+    })
+}
+
+fn append_disconnected_walk_entries(
+    valid: &[&ActivationRecord],
+    walk: &mut Vec<ChainWalkEntry>,
+) {
+    let existing = walk.iter().map(|entry| entry.digest).collect::<BTreeSet<_>>();
+    for record in valid {
+        if !existing.contains(&record.record_digest) {
+            walk.push(ChainWalkEntry {
+                sequence: record.body.sequence,
+                digest: record.record_digest,
+                verdict: ChainWalkVerdict::IgnoredDisconnected,
+            });
+        }
+    }
+}
+
+fn digest_record_body(body: &ActivationRecordBody) -> ActivationDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(ACTIVATION_RECORD_DOMAIN);
+    hasher.update(body.canonical_bytes());
+    ActivationDigest(hasher.finalize().into())
+}

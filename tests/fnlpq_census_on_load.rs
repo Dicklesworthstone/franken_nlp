@@ -159,28 +159,25 @@ fn base_input(model_id: &str) -> FnlpqWriterInput {
 }
 
 fn refresh_logical_model_identity(input: &mut FnlpqWriterInput) {
+    let sections = input.sections.clone();
+    let mut tensor_digests = Vec::with_capacity(input.tensors.len());
     for tensor in &mut input.tensors {
-        tensor.canonical_logical_sha256 = logical_tensor_hex(&tensor.name, &tensor.shape);
+        let data = mapped_bytes_in_sections(&sections, &tensor.data);
+        let scale = mapped_bytes_in_sections(&sections, &tensor.scale);
+        let row_sum = mapped_bytes_in_sections(&sections, &tensor.row_sum);
+        let digest = logical_tensor_sha256(
+            &tensor.name,
+            tensor.canonical_dtype.header_name(),
+            &tensor.shape,
+            &tensor.quantization,
+            data,
+            scale,
+            row_sum,
+        )
+        .expect("logical tensor identity");
+        tensor.canonical_logical_sha256 = hex(&digest);
+        tensor_digests.push(digest);
     }
-    let tensor_digests = input
-        .tensors
-        .iter()
-        .map(|tensor| {
-            let data = mapped_bytes(input, &tensor.data);
-            let scale = mapped_bytes(input, &tensor.scale);
-            let row_sum = mapped_bytes(input, &tensor.row_sum);
-            logical_tensor_sha256(
-                &tensor.name,
-                tensor.canonical_dtype.header_name(),
-                &tensor.shape,
-                &tensor.quantization,
-                data,
-                scale,
-                row_sum,
-            )
-            .expect("logical tensor identity")
-        })
-        .collect::<Vec<_>>();
     let sources = [
         ("model_config", section_bytes(input, "model-config")),
         ("tokenizer_model", section_bytes(input, "tokenizer-model")),
@@ -208,8 +205,12 @@ fn section_bytes<'a>(input: &'a FnlpqWriterInput, name: &str) -> &'a [u8] {
         .bytes
 }
 
-fn mapped_bytes<'a>(input: &'a FnlpqWriterInput, range: &SectionRange) -> &'a [u8] {
-    let section = section_bytes(input, &range.section_name);
+fn mapped_bytes_in_sections<'a>(sections: &'a [SectionPayload], range: &SectionRange) -> &'a [u8] {
+    let section = &sections
+        .iter()
+        .find(|section| section.name == range.section_name)
+        .expect("fixture mapping section")
+        .bytes;
     let start = usize::try_from(range.offset).expect("fixture offset");
     let end = start + usize::try_from(range.len).expect("fixture length");
     &section[start..end]
