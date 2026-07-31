@@ -52,7 +52,10 @@ impl RobotEventType {
     }
 
     pub const fn requires_request_seq(self) -> bool {
-        matches!(self, Self::Doc | Self::DocError | Self::Token | Self::RunComplete)
+        matches!(
+            self,
+            Self::Doc | Self::DocError | Self::Token | Self::RunComplete
+        )
     }
 }
 
@@ -149,14 +152,20 @@ impl RobotEvent {
 
     pub fn validate(&self) -> Result<(), RobotContractError> {
         if self.schema_version != ROBOT_SCHEMA_VERSION {
-            return Err(RobotContractError::new("/schema_version", "unexpected schema version"));
+            return Err(RobotContractError::new(
+                "/schema_version",
+                "unexpected schema version",
+            ));
         }
         if self
             .caller_id
             .as_deref()
             .is_some_and(|caller_id| caller_id.is_empty())
         {
-            return Err(RobotContractError::new("/caller_id", "must not be empty when supplied"));
+            return Err(RobotContractError::new(
+                "/caller_id",
+                "must not be empty when supplied",
+            ));
         }
         if self.event.requires_request_seq() && self.request_seq.is_none() {
             return Err(RobotContractError::new(
@@ -195,7 +204,11 @@ impl RobotContractError {
 
 impl std::fmt::Display for RobotContractError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "robot contract violation at {}: {}", self.path, self.detail)
+        write!(
+            formatter,
+            "robot contract violation at {}: {}",
+            self.path, self.detail
+        )
     }
 }
 
