@@ -1,0 +1,4 @@
+# Relative `src/` paths permitted to use `#![allow(unsafe_code)]`.
+#
+# The scaffold intentionally has no islands.  Future SIMD or mmap work must add
+# one reviewed path here in the same commit as its safety proof and tests.
