@@ -31,7 +31,7 @@
     },
     {
       "id": "byte-fallback-only",
-      "text": "\u0001\u0002\u007f"
+      "text": "\u0378"
     },
     {
       "id": "long-run-whitespace",

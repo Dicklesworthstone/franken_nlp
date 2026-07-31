@@ -1174,14 +1174,13 @@
     },
     {
       "id": "byte-fallback-only",
-      "input_sha256": "5c62c043a4a54f22ebca4d98f88671b2d60adaa804eba7cc51ff90941c8a5cb9",
+      "input_sha256": "efa4b2b545f9afb38e233be047fb08864dc71d9edc658fd5dc3cd2822ac74b88",
       "token_ids": [
         152343,
-        158515,
-        156083,
-        157424
+        208,
+        187
       ],
-      "token_ids_sha256": "b509997f6711ef14488d1590ce006cf205efb81c32b127d01c278e5c21a8a856"
+      "token_ids_sha256": "3ce425ab5dfc2584d59f8f8a8e293bfa133b5685f0e7670965db4e2da3eeafaa"
     },
     {
       "id": "long-run-whitespace",
@@ -1311,7 +1310,7 @@
       "token_ids_sha256": "0f45a93b0621c2e5198f716c5c9f9b7f33b1dd5976ed3f8637d777789b72e653"
     }
   ],
-  "tokenizer_corpus_sha256": "d9bda8271bf9e7ec151e8316b854b624c4808db0f7930551fda21f6fd52c7716",
+  "tokenizer_corpus_sha256": "bec0ae13a547ecaf5df62c9a2399150cf340641049eb94d9a87df2ad1ccf6047",
   "tokenizer_generation_command": [
     "scripts/gen_reference_fixtures.py",
     "--refresh-auxiliary",
@@ -1324,6 +1323,6 @@
     "--output",
     "tests/fixtures/reference"
   ],
-  "tokenizer_generator_commit": "53a72ffaceea6d1bac1af495e90889c3243bd3a2",
+  "tokenizer_generator_commit": "223a80e9fff6782237e69d890e1bca79f5cfef58",
   "tokenizer_oracle_closure_sha256": "0661b2e28c22b728ace2e912ef9012bdf085669c5ff3d087fe6dedc63fbf7511"
 }

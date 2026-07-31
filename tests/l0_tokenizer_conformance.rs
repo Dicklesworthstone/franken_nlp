@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use franken_nlp::native_engine::lmhead::NANBEIGE_VOCAB_SIZE;
 use franken_nlp::tokenizer::{
     bpe::{AddedToken, DecodeBytesError, DecodeTextError, EncodeOptions, SpBpeTokenizer},
-    sp_model::{parse_spm_model, NormalizerFacts, PieceType, SpecialPieceIds, SpmModel, SpmPiece},
+    sp_model::{NormalizerFacts, PieceType, SpecialPieceIds, SpmModel, SpmPiece, parse_spm_model},
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -486,8 +486,8 @@ fn pinned_slow_reference_vocabulary_is_token_id_exact() {
         .expect("required byte-fallback case exists");
     assert_eq!(
         byte_fallback_only.text.as_bytes(),
-        &[0x01, 0x02, 0x7f],
-        "byte-fallback case must use source bytes with no ordinary text-piece coverage"
+        &[0xcd, 0xb8],
+        "byte-fallback case must use the U+0378 UTF-8 bytes, which have no ordinary text-piece coverage"
     );
     let long_whitespace = inputs
         .tokenizer_cases
