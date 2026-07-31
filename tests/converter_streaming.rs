@@ -6,8 +6,8 @@
 //! controller-owned.
 
 use franken_nlp::artifact::converter::{
-    ConverterError, GenericPanel, OutputRange, OutputRangePlan, StorageStage, remap_tensor_name,
-    transform_routed_panel,
+    ConversionPreflight, ConverterError, GenericPanel, OutputRange, OutputRangePlan,
+    PeakRssFormula, StorageStage, remap_tensor_name, transform_routed_panel,
 };
 use franken_nlp::artifact::quantize::QuantizeError;
 use franken_nlp::artifact::safetensors::{RowPanel, SafetensorDtype, TensorCensusEntry};
@@ -190,5 +190,27 @@ fn output_range_plan_rejects_noncontiguous_or_incomplete_directories() {
             expected: 4,
             actual: 5,
         })
+    );
+}
+
+#[test]
+fn conversion_preflight_keeps_the_machine_footprint_block_stable() {
+    let preflight = ConversionPreflight {
+        closure_bytes_to_read: 10,
+        staged_output_bytes: 11,
+        peak_rss: PeakRssFormula {
+            largest_source_panel_bytes: 1,
+            largest_f32_panel_bytes: 2,
+            quant_packing_scratch_bytes: 3,
+            output_buffer_bytes: 4,
+            parser_metadata_bytes: 5,
+            margin_bytes: 6,
+        },
+        final_disk_bytes: 12,
+    };
+
+    assert_eq!(
+        preflight.stderr_block().expect("checked footprint formula"),
+        "CONVERT PREFLIGHT closure-bytes=10 staged-output-bytes=11 peak-rss=largest-source-panel=1 + largest-f32-panel=2 + quant-packing-scratch=3 + output-buffer=4 + parser-metadata=5 + margin=6 = 21 bytes final-disk-bytes=12"
     );
 }
