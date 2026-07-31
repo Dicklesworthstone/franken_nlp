@@ -8,8 +8,26 @@
 use std::error::Error;
 use std::fmt;
 
+use super::converter::StorageStage;
+
 /// The largest signed magnitude emitted by the portable int8 recipe.
 pub const PORTABLE_I8_MAX_MAGNITUDE: i8 = 127;
+
+/// One canonical Generic section triplet produced for a bounded tensor panel.
+///
+/// The converter appends each byte vector to its separately precomputed
+/// section range.  This type deliberately contains no file offset, section
+/// name, native layout, or writer identity: the envelope plan remains the
+/// sole range authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GenericPanelBytes {
+    /// Canonical logical data bytes: source BF16 bytes or signed int8 bytes.
+    pub data: Vec<u8>,
+    /// Little-endian IEEE f32 per-output-row scales for an int8 panel.
+    pub scales: Vec<u8>,
+    /// Little-endian i32 per-output-row sums for an int8 panel.
+    pub row_sums: Vec<u8>,
+}
 
 /// A bounded row-major result of per-output-channel symmetric int8 quantization.
 #[derive(Clone, Debug, PartialEq)]
@@ -46,6 +64,16 @@ pub enum QuantizeError {
     },
     /// A generic caller requested a matrix too large for the i32 row-sum ABI.
     RowSumOverflow { row: usize },
+    /// A verified source panel and its decoded work panel disagree with the
+    /// declared row-major geometry before any output bytes are made.
+    PanelShape {
+        rows: usize,
+        columns: usize,
+        expected_bf16_bytes: usize,
+        observed_bf16_bytes: usize,
+        expected_f32_values: usize,
+        observed_f32_values: usize,
+    },
 }
 
 impl fmt::Display for QuantizeError {
@@ -71,6 +99,17 @@ impl fmt::Display for QuantizeError {
             Self::RowSumOverflow { row } => write!(
                 formatter,
                 "portable-int8-v1 row-sum does not fit i32 for row={row}"
+            ),
+            Self::PanelShape {
+                rows,
+                columns,
+                expected_bf16_bytes,
+                observed_bf16_bytes,
+                expected_f32_values,
+                observed_f32_values,
+            } => write!(
+                formatter,
+                "generic panel geometry rows={rows} columns={columns}: expected bf16-bytes={expected_bf16_bytes} observed={observed_bf16_bytes}; expected f32-values={expected_f32_values} observed={observed_f32_values}"
             ),
         }
     }
@@ -158,6 +197,80 @@ pub fn quantize_per_output_channel_i8(
     })
 }
 
+/// Encode one validated BF16 work panel according to its converter storage stage.
+///
+/// `Bf16Verbatim` copies the original little-endian BF16 source bytes, never a
+/// widened/re-rounded f32 reconstruction.  The three int8 stages share the
+/// same portable row algebra while retaining their routing distinction in the
+/// caller's tensor declaration.  In both cases the result contains only the
+/// Generic data/scale/row-sum payload bytes; the authoritative envelope plan
+/// assigns their eventual section offsets.
+pub fn encode_generic_panel(
+    stage: StorageStage,
+    source_bf16: &[u8],
+    decoded_f32: &[f32],
+    rows: usize,
+    columns: usize,
+) -> Result<GenericPanelBytes, QuantizeError> {
+    let expected_f32_values = rows
+        .checked_mul(columns)
+        .ok_or(QuantizeError::PanelShape {
+            rows,
+            columns,
+            expected_bf16_bytes: usize::MAX,
+            observed_bf16_bytes: source_bf16.len(),
+            expected_f32_values: usize::MAX,
+            observed_f32_values: decoded_f32.len(),
+        })?;
+    let expected_bf16_bytes = expected_f32_values
+        .checked_mul(2)
+        .ok_or(QuantizeError::PanelShape {
+            rows,
+            columns,
+            expected_bf16_bytes: usize::MAX,
+            observed_bf16_bytes: source_bf16.len(),
+            expected_f32_values,
+            observed_f32_values: decoded_f32.len(),
+        })?;
+    if source_bf16.len() != expected_bf16_bytes || decoded_f32.len() != expected_f32_values {
+        return Err(QuantizeError::PanelShape {
+            rows,
+            columns,
+            expected_bf16_bytes,
+            observed_bf16_bytes: source_bf16.len(),
+            expected_f32_values,
+            observed_f32_values: decoded_f32.len(),
+        });
+    }
+
+    if stage == StorageStage::Bf16Verbatim {
+        return Ok(GenericPanelBytes {
+            data: source_bf16.to_vec(),
+            scales: Vec::new(),
+            row_sums: Vec::new(),
+        });
+    }
+
+    let quantized = quantize_per_output_channel_i8(decoded_f32, rows, columns)?;
+    let mut scales = Vec::with_capacity(quantized.scales.len().saturating_mul(4));
+    for scale in quantized.scales {
+        scales.extend_from_slice(&scale.to_bits().to_le_bytes());
+    }
+    let mut row_sums = Vec::with_capacity(quantized.row_sums.len().saturating_mul(4));
+    for row_sum in quantized.row_sums {
+        row_sums.extend_from_slice(&row_sum.to_le_bytes());
+    }
+    Ok(GenericPanelBytes {
+        data: quantized
+            .values
+            .into_iter()
+            .map(|value| value.to_ne_bytes()[0])
+            .collect(),
+        scales,
+        row_sums,
+    })
+}
+
 fn round_nearest_ties_even(value: f32) -> i8 {
     debug_assert!((-127.0..=127.0).contains(&value));
     let truncated = value as i32;
@@ -182,9 +295,10 @@ fn round_from_lower(lower: i32, fractional: f32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        quantize_per_output_channel_i8, round_nearest_ties_even, QuantizeError,
-        PORTABLE_I8_MAX_MAGNITUDE,
+        encode_generic_panel, quantize_per_output_channel_i8, round_nearest_ties_even,
+        QuantizeError, PORTABLE_I8_MAX_MAGNITUDE,
     };
+    use crate::artifact::converter::StorageStage;
 
     #[test]
     fn ties_round_to_even_in_both_directions() {
@@ -244,5 +358,49 @@ mod tests {
         let empty = quantize_per_output_channel_i8(&[], 1, 0)
             .expect_err("per-output scale is undefined for an empty row");
         assert_eq!(empty, QuantizeError::EmptyRowWidth { rows: 1 });
+    }
+
+    #[test]
+    fn bf16_stage_keeps_source_bytes_and_int8_stage_emits_generic_metadata() {
+        let source = [0x80, 0x3f, 0x80, 0xbf];
+        let bf16 = encode_generic_panel(
+            StorageStage::Bf16Verbatim,
+            &source,
+            &[1.0, -1.0],
+            1,
+            2,
+        )
+        .expect("exact BF16 source panel is copied");
+        assert_eq!(bf16.data, source);
+        assert!(bf16.scales.is_empty());
+        assert!(bf16.row_sums.is_empty());
+
+        let int8 = encode_generic_panel(
+            StorageStage::Int8Stage2A,
+            &source,
+            &[1.0, -1.0],
+            1,
+            2,
+        )
+        .expect("finite panel quantizes");
+        assert_eq!(int8.data, vec![127, 129]);
+        assert_eq!(
+            int8.scales,
+            (1.0_f32 / 127.0).to_bits().to_le_bytes().to_vec()
+        );
+        assert_eq!(int8.row_sums, 0_i32.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn panel_geometry_refuses_before_stage_selection() {
+        let error = encode_generic_panel(
+            StorageStage::Int8Stage2B,
+            &[0, 0],
+            &[0.0, 1.0],
+            1,
+            2,
+        )
+        .expect_err("BF16 source and decoded work must share the declared shape");
+        assert!(matches!(error, QuantizeError::PanelShape { .. }));
     }
 }
