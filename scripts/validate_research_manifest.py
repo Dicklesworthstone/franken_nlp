@@ -22,6 +22,7 @@ from typing import Any, NoReturn
 PINNED_MODEL_ID = "Nanbeige/Nanbeige4.2-3B"
 PINNED_REVISION = "f56ec5a9650268aa098496734743c25ea778bd2d"
 MANIFEST_NAME = "nanbeige4.2-3b.research.json"
+CONVERSION_MANIFEST_NAME = "nanbeige4.2-3b.source.json"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SAFE_RELATIVE_PATH_RE = re.compile(r"^[^/\\\x00]+(?:/[^/\\\x00]+)*$")
 LEGAL_BASENAMES = frozenset(
@@ -183,6 +184,7 @@ def validate_archived_files(manifest: dict[str, Any], archive_root: Path) -> tup
     typed_entries: list[dict[str, Any]] = []
     kinds: set[str] = set()
     archive_paths: list[str] = []
+    source_paths: set[str] = set()
     mismatches: list[str] = []
     for index, raw_entry in enumerate(entries):
         context = f"archived_files[{index}]"
@@ -196,6 +198,10 @@ def validate_archived_files(manifest: dict[str, Any], archive_root: Path) -> tup
             fail(f"duplicate archived_files kind: {kind}")
         kinds.add(kind)
         archive_text = archive_rel.as_posix()
+        source_text = source_path.as_posix()
+        if source_text in source_paths:
+            fail(f"duplicate archived_files source_path: {source_text}")
+        source_paths.add(source_text)
         archive_paths.append(archive_text)
         path = under_root(archive_root, archive_rel, context)
         observed_length = -1
@@ -404,7 +410,11 @@ def main() -> int:
     parser.add_argument(
         "--conversion-manifest",
         type=Path,
-        help="optional conversion-source manifest for the no-role-overlap check",
+        default=Path(__file__).resolve().parents[1]
+        / "docs"
+        / "truth-pack"
+        / CONVERSION_MANIFEST_NAME,
+        help="conversion-source manifest for the required no-role-overlap check",
     )
     args = parser.parse_args()
     try:
