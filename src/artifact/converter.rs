@@ -1681,9 +1681,9 @@ fn div_ceil(numerator: u64, denominator: u64) -> Result<u64, ConverterError> {
             invariant: "division by zero in panel planner",
         });
     }
-    numerator
-        .checked_add(denominator - 1)
-        .and_then(|value| value.checked_div(denominator))
+    let quotient = numerator / denominator;
+    quotient
+        .checked_add(u64::from(numerator % denominator != 0))
         .ok_or(ConverterError::Arithmetic {
             invariant: "panel division ceiling",
         })
@@ -1741,6 +1741,19 @@ mod tests {
         assert_eq!(plan.panel_count, 5);
         assert!(plan.largest_source_panel_bytes <= 64);
         assert_eq!(plan.row_panels(17).expect("row panels").len(), 5);
+    }
+
+    #[test]
+    fn panel_division_ceiling_accepts_maximum_valid_dimensions() {
+        assert_eq!(super::div_ceil(u64::MAX, 1).expect("one-row panels"), u64::MAX);
+        assert_eq!(
+            super::div_ceil(u64::MAX, 2).expect("two-row panels"),
+            (u64::MAX / 2) + 1
+        );
+        assert_eq!(
+            super::div_ceil(u64::MAX, u64::MAX).expect("one maximum-size panel"),
+            1
+        );
     }
 
     #[test]
