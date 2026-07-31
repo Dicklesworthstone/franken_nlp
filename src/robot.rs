@@ -256,7 +256,11 @@ fn write_json_document<W: Write, T: Serialize>(writer: &mut W, document: &T) -> 
 
 /// Implement the non-engine robot subcommands. These bytes are data-only and
 /// intentionally unaffected by NO_COLOR, CI, or TERM=dumb.
-pub fn write_command<W: Write>(writer: &mut W, command: RobotCommand) -> io::Result<()> {
+pub fn write_command<W: Write, D: Write>(
+    writer: &mut W,
+    _diagnostics: &mut D,
+    command: RobotCommand,
+) -> io::Result<()> {
     match command {
         RobotCommand::Schema => writer.write_all(&schema_json_bytes()),
         RobotCommand::Health => write_json_document(
