@@ -136,6 +136,7 @@ fn looprun_kv_contract() {
     let positions = PositionContext::at(3);
     let mut hidden = 7;
     let mut cache = KvCache::try_with_capacity(4).expect("small fixed cache reserves");
+    run_positions(&mut cache, 0..=2);
     let mut executor = RecordingExecutor::default();
     runner
         .run_token(&mut executor, &mut hidden, positions, &mut cache)
@@ -144,11 +145,11 @@ fn looprun_kv_contract() {
     assert_eq!(executor.layer_calls.len(), KV_SLOT_COUNT);
     assert_eq!(executor.norm_calls, LOOP_COUNT);
     assert!(executor.layer_calls.iter().all(|call| call.3 == positions));
-    assert_eq!(cache.occupied_slot_positions(), KV_SLOT_COUNT);
-    assert!(cache.all_slots_have_len(1));
+    assert_eq!(cache.occupied_slot_positions(), KV_SLOT_COUNT * 4);
+    assert!(cache.all_slots_have_len(4));
     for slot in 0..KV_SLOT_COUNT {
-        assert_eq!(cache.key_at(slot, 0).expect("written key")[0], slot as u16);
-        assert_eq!(cache.value_at(slot, 0).expect("written value")[0], 3);
+        assert_eq!(cache.key_at(slot, 3).expect("written key")[0], slot as u16);
+        assert_eq!(cache.value_at(slot, 3).expect("written value")[0], 3);
     }
 
     let boundary = executor.boundary.expect("loop one final norm is recorded");
@@ -175,7 +176,7 @@ fn looprun_kv_contract() {
     let duplicate = cache
         .append(
             0,
-            0,
+            3,
             &[0; KV_ELEMENTS_PER_POSITION],
             &[0; KV_ELEMENTS_PER_POSITION],
         )
@@ -184,8 +185,8 @@ fn looprun_kv_contract() {
         duplicate,
         KvCacheError::NonAppendPosition {
             slot: 0,
-            expected_position: 1,
-            received_position: 0
+            expected_position: 4,
+            received_position: 3
         }
     ));
     assert!(matches!(
