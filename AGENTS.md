@@ -66,7 +66,7 @@ Nanbeige4.2-3B is a dense decoder-only Llama-family transformer with a loop. The
 
 The project must be both:
 1. A reusable Rust library (`NlpEngine`) for embedding the model + task layer, **synchronous and blocking** — the async runtime is an owned implementation detail.
-2. A standalone CLI binary `fnlp` with:
+2. A standalone CLI program, shipped under the short binary name `fnlp` and long binary name `franken_nlp`, with:
    - **robot mode** (agent-first, versioned NDJSON, self-describing `robot schema`)
    - human mode (`fnlp extract|ner|classify|sentiment|… <file>` → JSON/text, `--json` everywhere)
    - **batch daemon mode** (`fnlp batch`: NDJSON docs on stdin → NDJSON results on stdout, bounded queues, weights loaded once)
@@ -96,7 +96,7 @@ Load-bearing, non-negotiable rules distilled from the plan and from the frankent
 
 2. **Valid-by-construction task output (G8) has the same rank.** Every successful structured response validates; budget/cancel/resource failure is typed no-result, never partial success. An unconstrained “retry on parse failure” loop is a design bug.
 
-3. **The loop is the architecture.** Decode streams decoder weights twice; KV is 44-deep; execute `22 layers → final RMSNorm → 22 layers → final RMSNorm`. The L2 ladder has 44 layer outputs **plus two norm states**. Never size/schedule as a conventional 22-layer model.
+3. **The loop is the architecture.** Decode logically visits the decoder stack twice; physical DRAM/cache traffic is measured, not inferred. KV is 44-deep; execute `22 layers → final RMSNorm → 22 layers → final RMSNorm`. The L2 ladder has 44 layer outputs **plus two norm states**. Never size/schedule as a conventional 22-layer model.
 
 4. **`head_dim` is 128, not `hidden/heads` = 64.** The config overrides the Llama fallback. q_proj is 3072→6144, k/v are 3072→1024, o is 6144→3072. Any kernel, buffer, or RoPE table built on 64 is silently, catastrophically wrong.
 
@@ -106,7 +106,7 @@ Load-bearing, non-negotiable rules distilled from the plan and from the frankent
 
 7. **AVX2 is first-class and exact.** Raw `vpmaddubsw` can saturate inside the instruction; accumulation cadence cannot fix it. Implement/measure both plan §6.5 candidates: low-7/high-bit decomposition with proved i16 pair bounds and the widened signed-i16 route. Both equal scalar/i64 over the full i8 domain; raw saturation is not a shippable approximate mode.
 
-8. **Asupersync owns every request region and compute team; leaf kernels never spawn.** Each admitted request or finite batch epoch has one owned asupersync region/child `Cx`; its feeder, timers, wrapper/output tasks, and drain are not detached. The pinned blocking contract has one explicit physical-lifetime exception: an already-running pool closure may outlive its cancelled wrapper, so `EngineResources` tracks that closure to an actual-completion latch and treats it as outstanding drain work. The run crosses `Cx::spawn_blocking` once and uses one `Cx::scoped_cpu` region spanning the whole request or bounded epoch, with checkpoints at tile/morsel boundaries. Production must prove its `Cx` carries a real blocking-pool handle; the pinned inline fallback is lab/test behavior, not a valid engine route. The pinned `ScopedCpu::spawn` enforces the numeric cap but does not itself reject a spawn after its drain latch rises, so the team-formation protocol must create the fixed team before releasing any worker into fallible work, seal spawning forever, and test that no post-start/post-latch worker can appear. Never enter the seam under an engine lock, recursively create a team, detach or lose supervision of a semantic-request task/closure, or nest an asupersync runtime. Concurrent sync callers enter bounded admission or a compatible batch, not independent forwards. Rayon is absent from the release graph. Re-entrant calls fail typed/fast; cancellation/panic joins and scheduler lifecycle are model-checked/replayed, not just watchdog-tested. Admission/memory/output guards remain owned by the blocking closure until its latch fires after the scoped team joins—never release or reuse them merely because the wrapper task resolved cancelled. Use the foundation's depth, not just its scheduler: capability rows (`[SPAWN, TIME, RANDOM, IO, REMOTE]`, monotone `Cx::restrict`) make no-spawn leaves, no-network inference, and RANDOM-once sampling admission compile-time properties; budgets are typed meet-composed children with a reserved cleanup budget, never ambient milliseconds; two-phase reservations are tracked obligations under an explicit leak-response policy (panic in lab/CI, logged escalation in production); and the async half of every scheduler/daemon/job/pull proof runs on the deterministic lab (oracles, seed-bound chaos, crashpack replay) while the bounded native team-state model covers the `scoped_cpu` OS-thread half — plan §3.3, §9.3, §9.5, OQ-35.
+8. **Asupersync owns every request region and compute team; leaf kernels never spawn.** Each admitted request or finite batch epoch has one owned asupersync region/child `Cx`; its feeder, timers, wrapper/output tasks, and drain are not detached. The pinned blocking contract has one explicit physical-lifetime exception: an already-running pool closure may outlive its cancelled wrapper, so `EngineResources` tracks that closure to an actual-completion latch and treats it as outstanding drain work. The run crosses `Cx::spawn_blocking` once and uses one `Cx::scoped_cpu` region spanning the whole request or bounded epoch, with checkpoints at tile/morsel boundaries. Production must prove its `Cx` carries a real blocking-pool handle; the pinned inline fallback is lab/test behavior, not a valid engine route. The pinned `ScopedCpu::spawn` enforces the numeric cap but does not itself reject a spawn after its drain latch rises, so the team-formation protocol must create the fixed team before releasing any worker into fallible work, seal spawning forever, and test that no post-start/post-latch worker can appear. Never enter the seam under an engine lock, recursively create a team, detach or lose supervision of a semantic-request task/closure, or nest an asupersync runtime. Concurrent sync callers enter bounded admission or a compatible batch, not independent forwards. Rayon is absent from the release graph. Re-entrant calls fail typed/fast; cancellation/panic joins and scheduler lifecycle are model-checked/replayed, not just watchdog-tested. Admission/memory/output guards remain owned by the blocking closure until its latch fires after the scoped team joins—never release or reuse them merely because the wrapper task resolved cancelled. The capacity certificate inventories the entire process at once: runtime workers + maximum concurrent blocking coordinators + scoped CPU children + separately ratified service/helper threads. A preset name is not a safe thread count; in particular, never pair `high_throughput()` blindly with a physical-core-wide scoped team. Use the foundation's depth, not just its scheduler: capability rows (`[SPAWN, TIME, RANDOM, IO, REMOTE]`, monotone `Cx::restrict`) make no-spawn leaves, no-network inference, and RANDOM-once sampling admission compile-time properties; budgets are typed meet-composed children with a reserved cleanup budget, never ambient milliseconds; two-phase reservations are tracked obligations under an explicit leak-response policy (panic in lab/CI, logged escalation in production); and the async half of every scheduler/daemon/job/pull proof runs on the deterministic lab (oracles, seed-bound chaos, crashpack replay) while the bounded native team-state model covers the `scoped_cpu` OS-thread half — plan §3.3, §9.3, §9.5, OQ-35.
 
 9. **Determinism is scoped.** Semantic greedy output is exact under a named numerics profile; canonical bytes additionally require ordered output and scrub volatile metadata. Batch/prefix equivalence requires the same per-row reduction order. Never promise byte identity for completion-order NDJSON or approximate transcendental modes.
 
@@ -153,6 +153,8 @@ Load-bearing, non-negotiable rules distilled from the plan and from the frankent
 30. **Claims and receipts are typed evidence.** Public numeric/superlative claims must map to `docs/CLAIMS.json`; intentional reference behavior belongs in `docs/BEHAVIOR_NOTES.md`; `.fnlpr` receipts declare `Replayable`, `StructuralReplay`, `VerifiableIfArtifactsSupplied`, or `AuditOnly`, and omit private bytes unless retention is explicitly authorized. Structural cost witnesses distinguish a full target invocation (two loops / 44 layer executions per position) from any AA-D1 loop-1 draft invocation, and count lm_head rows plus KV bytes. “Verified” without scope, validity domain, and evidence grade is forbidden.
 
 31. **Asupersync authority, budgets, and outcomes stay typed.** Narrow each child `Cx` monotonically: pull gets only the spawn/time/IO and TLS entropy its pinned path proves necessary, never REMOTE; ordinary inference gets no network/remote authority; unseeded sampling may draw entropy once at admission, while greedy and kernel leaves get no RANDOM; leaves receive `cap::None` or the ratified checkpoint-only view and cannot spawn. Typed child budgets may only tighten parent deadline/poll/cost and memory/CPU/IO/cleanup/artifact envelopes; request token/output/page/byte counters remain explicit, and drain keeps reserved cleanup budget. Preserve `Outcome::{Ok,Err,Cancelled,Panicked}` until the library/CLI policy boundary. LabRuntime proves region/obligation/cleanup/quiescence properties, not every native `scoped_cpu` OS-thread interleaving; pair it with the bounded team-state model and hostile native stress.
+
+32. **Asupersync names are exact contracts, not permission to infer stronger semantics.** At the pinned revision, `first_ok` tries futures sequentially; it is not a concurrent race and has no losers. Any concurrent hedge needs a separately ratified first-success primitive, a duplicate-work/byte budget, and cancel-then-drain proof for every loser. `bracket` is useful on the normal awaited path, but its drop-time release is bounded best-effort; durable artifact cleanup remains RAII + explicit await + journal/recovery + atomic activation. Required state transitions, output delivery, and durable spool/journal writes use `GenServer::call` or reserve→permit plus an explicit processing/commit acknowledgement; `cast().await` proves enqueue only, and `try_cast` applies its declared overflow policy. Preserve all eleven pinned `CancelKind` variants (`User`, `Timeout`, `Deadline`, `PollQuota`, `CostBudget`, `FailFast`, `RaceLost`, `ParentCancelled`, `ResourceUnavailable`, `Shutdown`, `LinkedExit`) until the policy boundary. Lab's DPOR-style explorer supplies bounded guided coverage, not exhaustive proof; a TLA+ export is a TLC input, not a model-check result. A bounded-model-check claim requires retained TLC version, config, command, result, property scope, and counterexample when one exists.
 
 ---
 
@@ -277,10 +279,10 @@ Implementation of this project runs as an NTM tmux swarm of **12 codex panes on 
 
 ### The core problem it solves
 
-A swarm of N agents sharing one repo and one remote-build backend (rch) has a brutal bottleneck: builds, not coding. Two compounding facts make per-bead building catastrophic here:
+A swarm of N agents sharing one repo and one remote-build backend (rch) can make builds, rather than coding, the bottleneck. Two conditions make uncoordinated per-bead building especially costly here:
 
-1. **The crate is big.** `franken_nlp` is a single crate by design (plan §4.1); a from-scratch compile takes minutes even offloaded to rch.
-2. **rch serializes same-project builds.** rch's `active_project_exclusion` lets only a few concurrent builds of the same project run; the rest queue or fall back to local execution, thrashing the disk.
+1. **The planned crate is broad.** `franken_nlp` is a single crate by design (plan §4.1), but this greenfield repository has no measured clean-build duration yet. Record that duration once a real crate exists; do not repeat “takes minutes” as fact before then.
+2. **The shared backend has finite same-project capacity.** Measure the deployed rch `active_project_exclusion` behavior and worker capacity at campaign start; excess concurrent builds may queue or fall back locally, so the orchestrator grants build slots from observed capacity rather than assuming a fixed count.
 
 ### The insight
 
@@ -296,7 +298,7 @@ Separate the cheap, parallelizable work (writing code) from the expensive, seria
 │               → COMMIT immediately ("…— code-first, batch-test  │
 │                 pending"), leave bead in_progress               │
 │               → next bead                                       │
-│  KPI = commit stream (target ~20–40 commits/10 min)             │
+│  diagnostic = reviewed commit flow + ready-pool depth            │
 └─────────────────────────────────────────────────────────────────┘
                               │  (commit-rate dip = wave saturated)
                               ▼
@@ -327,7 +329,7 @@ So the loop is not "code forever then test once at the very end"; it is a **pump
 
 ### The trigger (when to flip Phase 1 → Phase 2)
 
-**The commit-rate dip.** While agents have claimable work, commits pour in (20–40 per 10 minutes). When the ready pool empties, agents finish their in_progress beads and the rate falls off a cliff (a prior campaign watched 20 → 12 → 5 per 10 minutes). That dip means "the wave is saturated, the queue is dry" and is the signal to run the batch verify. It is a self-pacing trigger; no fixed timer.
+**The commit-rate/ready-pool dip.** While agents have claimable work, reviewed commits and in-progress changes arrive steadily. When `br ready` empties and that flow falls, the wave is probably saturated and should move to batch verification. Prior-campaign rates are anecdotes, not a FrankenNLP throughput guarantee; the orchestrator records this campaign's own ready depth, in-flight count, commit flow, and build queue before deciding.
 
 ### Enforcement (what keeps it honest)
 
@@ -346,11 +348,13 @@ Code committed without running its tests will have failures; that is expected an
 - **Close only green, with evidence.** Cite the combined green suite **and each bead's own named contract/test/eval evidence** in its close reason; a repository-wide green bar proves compatibility, not that an individual requirement was actually implemented. Leave genuinely incomplete beads in_progress (or reopen) with a comment; never false-close.
 - **The project's quality gates move to close time, not per bead.** The "Mandatory Checks After Substantive Changes" section above applies to the Phase-2 batch pass (plus `ubs --diff` over the wave's combined diff), and the plan's parity/eval gates are unchanged: a bead whose contract includes an L-gate or scorecard closes only when that gate ran in the batch pass.
 
-### Why it is ~20–100× faster
+### Expected benefit and the measurement obligation
 
-- Phase 1 parallelizes the cheap resource (12 agents writing) and removes the scarce one (builds) from the per-bead path entirely.
-- The expensive build happens once per N agents per wave instead of once per bead per agent, amortizing the multi-minute compile across dozens of changes.
-- No build contention, no local-fallback thrash, no disk blowups.
+- Phase 1 parallelizes independent editing and removes routine builds from the per-bead path.
+- A coordinated build can cover several compatible changes in one wave instead of repeating the same dependency compilation per bead.
+- The intended effect is less build contention, local-fallback thrash, and disk pressure; campaign telemetry must show whether that effect materialized.
+
+Those are design hypotheses, not a 20–100× promise. Each campaign records wall time, queue time, build count, failure/rework rate, and escaped-defect rate against a representative prior or pilot wave; if batch verification increases integration failures or does not save time, shrink the wave or grant more focused build slots.
 
 ### Hard-won gotchas (baked in from prior campaigns)
 
@@ -364,7 +368,7 @@ Code committed without running its tests will have failures; that is expected an
 
 ## bv — Graph-Aware Triage
 
-`bv` computes PageRank/betweenness/critical-path/cycles over `.beads/beads.jsonl`. **Use ONLY `--robot-*` flags — bare `bv` launches a blocking TUI.** Start with `bv --robot-triage` (counts + top picks + quick wins + blockers). `bv --robot-plan` for parallel tracks; `bv --robot-insights` for full metrics (check `.Cycles` — must be empty).
+`bv` computes PageRank/betweenness/critical-path/cycles over `.beads/issues.jsonl` (generated by `br sync --flush-only`). **Use ONLY `--robot-*` flags — bare `bv` launches a blocking TUI.** Start with `bv --robot-triage` (counts + top picks + quick wins + blockers). `bv --robot-plan` for parallel tracks; `bv --robot-insights` for full metrics (check `.Cycles` — must be empty).
 
 ---
 
