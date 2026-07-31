@@ -358,10 +358,11 @@ impl fmt::Display for ResourceConfigConflict {
 impl std::error::Error for ResourceConfigConflict {}
 
 /// Failure to install or reuse the one process resource host.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResourceBrokerError {
     InvalidConfig(ResourceConfigError),
     ConfigConflict(ResourceConfigConflict),
+    Runtime(RuntimeHostError),
 }
 
 impl fmt::Display for ResourceBrokerError {
@@ -369,11 +370,34 @@ impl fmt::Display for ResourceBrokerError {
         match self {
             Self::InvalidConfig(error) => write!(formatter, "invalid resource host config: {error}"),
             Self::ConfigConflict(error) => error.fmt(formatter),
+            Self::Runtime(error) => error.fmt(formatter),
         }
     }
 }
 
 impl std::error::Error for ResourceBrokerError {}
+
+/// The process host could not establish the required production runtime seam.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeHostError {
+    RuntimeBuild { detail: String },
+    MissingBlockingPool,
+}
+
+impl fmt::Display for RuntimeHostError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RuntimeBuild { detail } => {
+                write!(formatter, "asupersync runtime construction failed: {detail}")
+            }
+            Self::MissingBlockingPool => formatter.write_str(
+                "asupersync runtime has no blocking-pool handle; inline fallback is not a production route",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeHostError {}
 
 /// A category that must be charged to the process-wide memory ledger.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -804,6 +828,51 @@ struct LeaseState {
     active: BTreeMap<u64, ()>,
 }
 
+#[cfg(feature = "asupersync-runtime")]
+struct RuntimeHost {
+    runtime: asupersync::runtime::Runtime,
+    blocking_pool: asupersync::runtime::blocking_pool::BlockingPoolHandle,
+}
+
+#[cfg(feature = "asupersync-runtime")]
+impl RuntimeHost {
+    fn build(config: ResourceHostConfig) -> Result<Self, RuntimeHostError> {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let builder = match config.runtime_preset {
+            RuntimePreset::CurrentThread => RuntimeBuilder::current_thread(),
+            RuntimePreset::LowLatency => RuntimeBuilder::low_latency(),
+            RuntimePreset::HighThroughput => RuntimeBuilder::high_throughput(),
+        }
+        .worker_threads(config.runtime_workers)
+        // A nonzero pool is a production precondition. The configured maximum
+        // is independently counted in the thread inventory above.
+        .blocking_threads(1, config.max_blocking_coordinators);
+        let runtime = builder
+            .build()
+            .map_err(|error| RuntimeHostError::RuntimeBuild {
+                detail: error.to_string(),
+            })?;
+        let blocking_pool = runtime
+            .blocking_handle()
+            .ok_or(RuntimeHostError::MissingBlockingPool)?;
+        Ok(Self {
+            runtime,
+            blocking_pool,
+        })
+    }
+}
+
+#[cfg(feature = "asupersync-runtime")]
+impl fmt::Debug for RuntimeHost {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeHost")
+            .field("blocking_pool", &"configured")
+            .finish_non_exhaustive()
+    }
+}
+
 /// The process-owned runtime/admission/memory host shared by engine leases.
 #[derive(Debug)]
 pub struct EngineResources {
@@ -812,11 +881,17 @@ pub struct EngineResources {
     memory: Arc<MemoryLedger>,
     next_lease_id: AtomicU64,
     leases: Mutex<LeaseState>,
+    #[cfg(feature = "asupersync-runtime")]
+    runtime: RuntimeHost,
 }
 
 impl EngineResources {
-    fn new(config: ResourceHostConfig) -> Result<Self, ResourceConfigError> {
-        let thread_inventory = config.thread_inventory()?;
+    fn new(
+        config: ResourceHostConfig,
+        thread_inventory: ThreadInventory,
+    ) -> Result<Self, RuntimeHostError> {
+        #[cfg(feature = "asupersync-runtime")]
+        let runtime = RuntimeHost::build(config)?;
         Ok(Self {
             config,
             thread_inventory,
@@ -826,6 +901,8 @@ impl EngineResources {
             )),
             next_lease_id: AtomicU64::new(0),
             leases: Mutex::new(LeaseState::default()),
+            #[cfg(feature = "asupersync-runtime")]
+            runtime,
         })
     }
 
@@ -859,6 +936,26 @@ impl EngineResources {
     /// Number of still-live engine leases for diagnostic inventory only.
     pub fn active_lease_count(&self) -> usize {
         lock_unpoisoned(&self.leases).active.len()
+    }
+
+    /// Whether this build has retained the required real blocking-pool handle.
+    /// The default crate feature intentionally returns false because it cannot
+    /// execute production requests without `asupersync-runtime`.
+    #[cfg(feature = "asupersync-runtime")]
+    pub fn has_real_blocking_pool(&self) -> bool {
+        let _ = &self.runtime.blocking_pool;
+        true
+    }
+
+    /// Whether this build has retained the required real blocking-pool handle.
+    #[cfg(not(feature = "asupersync-runtime"))]
+    pub fn has_real_blocking_pool(&self) -> bool {
+        false
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    pub(crate) fn runtime(&self) -> &asupersync::runtime::Runtime {
+        &self.runtime.runtime
     }
 }
 
@@ -910,8 +1007,8 @@ impl ResourceBroker {
         &self,
         requested: ResourceHostConfig,
     ) -> Result<Arc<EngineResources>, ResourceBrokerError> {
-        requested
-            .validate()
+        let thread_inventory = requested
+            .thread_inventory()
             .map_err(ResourceBrokerError::InvalidConfig)?;
         let mut installed = lock_unpoisoned(&self.installed);
         if let Some(existing) = installed.as_ref() {
@@ -921,7 +1018,7 @@ impl ResourceBroker {
             return Ok(Arc::clone(existing));
         }
         let resources = Arc::new(
-            EngineResources::new(requested).map_err(ResourceBrokerError::InvalidConfig)?,
+            EngineResources::new(requested, thread_inventory).map_err(ResourceBrokerError::Runtime)?,
         );
         *installed = Some(Arc::clone(&resources));
         Ok(resources)
@@ -1007,7 +1104,7 @@ impl NlpEngineBuilder {
 }
 
 /// The library builder did not create an unbounded private host.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EngineBuildError {
     HostNotInstalled,
     Broker(ResourceBrokerError),
@@ -1132,7 +1229,11 @@ mod tests {
 
     #[test]
     fn reservations_commit_abort_and_release_exactly() {
-        let resources = Arc::new(EngineResources::new(config()).expect("valid resources"));
+        let config = config();
+        let thread_inventory = config.thread_inventory().expect("inventory is valid");
+        let resources = Arc::new(
+            EngineResources::new(config, thread_inventory).expect("valid resources"),
+        );
         let lease = resources.acquire_lease();
         let committed = lease
             .reserve(MemoryClass::Weights, 600)
