@@ -164,7 +164,9 @@ pub fn verify_declared_bounds() -> Result<(), String> {
         let signed = s8_s8_bound(k);
         let raw = u8_s8_raw_bound(k);
         let correction = u8_s8_correction_bound(k);
-        let conservative = raw + correction;
+        let conservative = raw
+            .checked_add(correction)
+            .ok_or_else(|| format!("declared conservative bound overflows i64 at k={k}"))?;
         for (name, value) in [
             ("s8*s8", signed),
             ("u8*s8 raw", raw),
@@ -204,8 +206,20 @@ pub fn verify_s8_fixture(fixture: &DotFixture) -> Result<OracleReport, String> {
     let mut max_abs_product = 0_i64;
     let mut max_abs_intermediate = 0_i64;
     for (index, (&input, &weight)) in fixture.input.iter().zip(&fixture.weights).enumerate() {
-        let product = i64::from(input) * i64::from(weight);
-        sum += product;
+        let product = i64::from(input)
+            .checked_mul(i64::from(weight))
+            .ok_or_else(|| {
+                format!(
+                    "i64 product overflow shape={:?} seed={} element={} input={} weight={}",
+                    fixture.shape, fixture.seed, index, input, weight
+                )
+            })?;
+        sum = sum.checked_add(product).ok_or_else(|| {
+            format!(
+                "i64 accumulation overflow shape={:?} seed={} element={} prior={} product={}",
+                fixture.shape, fixture.seed, index, sum, product
+            )
+        })?;
         max_abs_product = max_abs_product.max(product.abs());
         max_abs_intermediate = max_abs_intermediate.max(sum.abs());
         if sum < i64::from(i32::MIN) || sum > i64::from(i32::MAX) {
@@ -262,12 +276,42 @@ pub fn verify_offset_fixture(fixture: &OffsetFixture) -> Result<OracleReport, St
     let mut row_sum = 0_i64;
     let mut max_abs_product = 0_i64;
     let mut max_abs_intermediate = 0_i64;
+    let conservative_bound = u8_s8_raw_bound(fixture.k)
+        .checked_add(u8_s8_correction_bound(fixture.k))
+        .ok_or_else(|| format!("offset conservative bound overflow k={}", fixture.k))?;
     for (index, (&input, &weight)) in fixture.input.iter().zip(&fixture.weights).enumerate() {
-        let product = i64::from(input) * i64::from(weight);
-        raw += product;
-        row_sum += i64::from(weight);
-        let correction = 128_i64 * row_sum;
-        let corrected = raw - correction;
+        let product = i64::from(input)
+            .checked_mul(i64::from(weight))
+            .ok_or_else(|| {
+                format!(
+                    "offset i64 product overflow k={} seed={} element={} input={} weight={}",
+                    fixture.k, fixture.seed, index, input, weight
+                )
+            })?;
+        raw = raw.checked_add(product).ok_or_else(|| {
+            format!(
+                "offset raw accumulation overflow k={} seed={} element={} prior={} product={}",
+                fixture.k, fixture.seed, index, raw, product
+            )
+        })?;
+        row_sum = row_sum.checked_add(i64::from(weight)).ok_or_else(|| {
+            format!(
+                "offset row-sum overflow k={} seed={} element={} prior={} weight={}",
+                fixture.k, fixture.seed, index, row_sum, weight
+            )
+        })?;
+        let correction = 128_i64.checked_mul(row_sum).ok_or_else(|| {
+            format!(
+                "offset correction overflow k={} seed={} element={} row_sum={}",
+                fixture.k, fixture.seed, index, row_sum
+            )
+        })?;
+        let corrected = raw.checked_sub(correction).ok_or_else(|| {
+            format!(
+                "offset corrected result overflow k={} seed={} element={} raw={} correction={}",
+                fixture.k, fixture.seed, index, raw, correction
+            )
+        })?;
         max_abs_product = max_abs_product.max(product.abs());
         max_abs_intermediate = max_abs_intermediate
             .max(raw.abs())
@@ -278,8 +322,13 @@ pub fn verify_offset_fixture(fixture: &OffsetFixture) -> Result<OracleReport, St
             ("correction", correction, u8_s8_correction_bound(fixture.k)),
             (
                 "raw+correction",
-                raw.abs() + correction.abs(),
-                u8_s8_raw_bound(fixture.k) + u8_s8_correction_bound(fixture.k),
+                raw.abs().checked_add(correction.abs()).ok_or_else(|| {
+                    format!(
+                        "offset conservative bound overflow k={} seed={} element={} raw={} correction={}",
+                        fixture.k, fixture.seed, index, raw, correction
+                    )
+                })?,
+                conservative_bound,
             ),
         ] {
             if value.abs() > bound || value < i64::from(i32::MIN) || value > i64::from(i32::MAX) {
@@ -290,8 +339,18 @@ pub fn verify_offset_fixture(fixture: &OffsetFixture) -> Result<OracleReport, St
             }
         }
     }
-    let correction = 128_i64 * row_sum;
-    let expected_i64 = raw - correction;
+    let correction = 128_i64.checked_mul(row_sum).ok_or_else(|| {
+        format!(
+            "final offset correction overflow k={} seed={}",
+            fixture.k, fixture.seed
+        )
+    })?;
+    let expected_i64 = raw.checked_sub(correction).ok_or_else(|| {
+        format!(
+            "final offset result overflow k={} seed={}",
+            fixture.k, fixture.seed
+        )
+    })?;
     let expected =
         i32::try_from(expected_i64).map_err(|_| "offset result cannot narrow".to_owned())?;
     let actual =
@@ -306,7 +365,7 @@ pub fn verify_offset_fixture(fixture: &OffsetFixture) -> Result<OracleReport, St
         expected,
         max_abs_product,
         max_abs_intermediate,
-        bound: u8_s8_raw_bound(fixture.k) + u8_s8_correction_bound(fixture.k),
+        bound: conservative_bound,
     })
 }
 
