@@ -218,9 +218,12 @@ fn metrics(reference: &[f32], observed: &[f32]) -> Result<MetricVector, String> 
     let mut max_rel = 0.0_f32;
     let mut max_ulp = 0_u32;
     let mut worst_index = None;
-    let mut dot = 0.0_f32;
-    let mut reference_norm = 0.0_f32;
-    let mut observed_norm = 0.0_f32;
+    // These are reporting accumulators, so retain more precision than the f32
+    // values being compared. Independent f32 reductions can otherwise make
+    // bit-identical vectors appear to have a cosine below one.
+    let mut dot = 0.0_f64;
+    let mut reference_norm = 0.0_f64;
+    let mut observed_norm = 0.0_f64;
     let mut finite_elements = 0_usize;
     let mut exact_nan_elements = 0_usize;
     let mut exact_infinite_elements = 0_usize;
@@ -272,20 +275,24 @@ fn metrics(reference: &[f32], observed: &[f32]) -> Result<MetricVector, String> 
             max_rel = max_rel.max(relative);
             max_ulp = max_ulp.max(ulp);
         }
-        dot += expected * actual;
-        reference_norm += expected * expected;
-        observed_norm += actual * actual;
+        let expected_f64 = f64::from(expected);
+        let actual_f64 = f64::from(actual);
+        dot += expected_f64 * actual_f64;
+        reference_norm += expected_f64 * expected_f64;
+        observed_norm += actual_f64 * actual_f64;
         finite_elements += 1;
     }
 
-    let cosine = if finite_elements == 0 {
+    let cosine = if max_ulp == 0 {
+        Some(1.0)
+    } else if finite_elements == 0 {
         None
     } else if reference_norm == 0.0 && observed_norm == 0.0 {
         Some(1.0)
     } else if reference_norm == 0.0 || observed_norm == 0.0 {
         Some(0.0)
     } else {
-        Some(dot / (reference_norm.sqrt() * observed_norm.sqrt()))
+        Some((dot / (reference_norm.sqrt() * observed_norm.sqrt())) as f32)
     };
     Ok(MetricVector {
         elements: reference.len(),
@@ -593,6 +600,18 @@ fn metric_vector_rejects_unsafe_special_value_equivalence() {
     assert_eq!(clean.exact_signed_zero_elements, 1);
     assert_eq!(clean.exact_infinite_elements, 1);
     assert_eq!(clean.cosine, Some(1.0));
+
+    let exact = metrics(
+        &[0.00390625, -123.75, 8192.5, -0.03125],
+        &[0.00390625, -123.75, 8192.5, -0.03125],
+    )
+    .expect("bit-identical vectors are metric-compatible");
+    assert_eq!(exact.max_ulp, 0);
+    assert_eq!(
+        exact.cosine,
+        Some(1.0),
+        "bit-identical vectors must report an exact cosine of one"
+    );
 
     assert!(metrics(
         &[f32::from_bits(0x7fc0_0001)],
