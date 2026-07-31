@@ -948,10 +948,15 @@ fn parse_tensors(value: &Value) -> Result<Vec<CheckedTensor>, FnlpqReadError> {
                 )
             })?;
         if logical_bytes != expected_logical_bytes {
+            let storage_stage = if canonical_dtype == "bf16" && quantization == BF16_VERBATIM_V1 {
+                "bf16-verbatim-v1 "
+            } else {
+                ""
+            };
             return Err(header_error(
                 format!("{path}/logical_bytes"),
                 format!(
-                    "must equal {expected_logical_bytes} for dtype {canonical_dtype} and shape {shape:?}, observed {logical_bytes}"
+                    "{storage_stage}requires logical_bytes={expected_logical_bytes} for dtype {canonical_dtype} and shape {shape:?}, observed {logical_bytes}"
                 ),
             ));
         }
