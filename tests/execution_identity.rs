@@ -3,8 +3,8 @@ use std::fs;
 use std::path::Path;
 
 use franken_nlp::execution_identity::{
-    ExecutionIdentity, IdentityField, IdentityProjection, NumericsProfile, ProvenanceIdentity,
-    PublisherAttestationStatus, Sha256Digest, ThinkingMode, ToolMode,
+    ExecutionIdentity, IdentityError, IdentityField, IdentityProjection, NumericsProfile,
+    ProvenanceIdentity, PublisherAttestationStatus, Sha256Digest, ThinkingMode, ToolMode,
 };
 
 fn digest(label: &str) -> Sha256Digest {
@@ -84,9 +84,6 @@ fn mutate(identity: &ExecutionIdentity, field: IdentityField) -> ExecutionIdenti
         }
     }
     mutated
-        .validate()
-        .expect("single-field mutation remains valid");
-    mutated
 }
 
 fn compatibility_matrix() -> BTreeMap<String, [bool; 5]> {
@@ -139,6 +136,17 @@ fn every_documented_field_mutation_matches_each_projection() {
     let mut mismatches = Vec::new();
     for field in IdentityField::ALL {
         let changed = mutate(&original, field);
+        if field == IdentityField::SchemaVersion {
+            assert_eq!(
+                changed.validate(),
+                Err(IdentityError::InvalidSchemaVersion(2)),
+                "schema-version mutations must reject at the versioned identity boundary"
+            );
+            continue;
+        }
+        changed
+            .validate()
+            .expect("non-version single-field mutation remains valid");
         let expected = matrix
             .get(field.name())
             .expect("every code field has a documentation row");
