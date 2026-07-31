@@ -14,6 +14,7 @@ use std::{
 use asupersync::{
     Budget,
     lab::{LabConfig, LabRuntime},
+    record::ObligationKind,
     runtime::{RuntimeBuilder, config::ObligationLeakResponse},
     trace::ReplayTrace,
     util::DetRng,
@@ -147,5 +148,66 @@ fn obligation_leak_response_is_explicit_for_lab_and_runtime() {
     println!("G0_CENSUS item=obligation-leak-policy case=runtime-builder response=Log");
     println!(
         "G0_CENSUS item=obligation-leak-policy RESULT=RATIFIED evidence=lab-default-panic+explicit-lab-log+runtime-builder-log"
+    );
+}
+
+/// A failing Lab run with replay recording retains an in-memory crashpack
+/// whose divergent prefix and replay command identify the exact failing
+/// schedule. This is an artifact capability of the pin, not a claim that a
+/// FrankenNLP production crashpack format has been adopted.
+#[test]
+fn lab_failure_retains_crashpack_replay_material() {
+    const SEED: u64 = 0x035C_C4A5;
+
+    let mut runtime = LabRuntime::new(
+        LabConfig::new(SEED)
+            .panic_on_leak(false)
+            .with_default_replay_recording(),
+    );
+    let region = runtime.state.create_root_region(Budget::INFINITE);
+    let (task, _) = runtime
+        .state
+        .create_task(region, Budget::INFINITE, async {})
+        .expect("LabRuntime creates the intentional-leak task");
+    runtime.scheduler.lock().schedule(task, 0);
+    runtime
+        .state
+        .create_obligation(
+            ObligationKind::SendPermit,
+            task,
+            region,
+            Some("franken_nlp OQ-35 intentional leak".to_owned()),
+        )
+        .expect("the live task receives a tracked obligation");
+    runtime.run_until_quiescent();
+
+    let report = runtime.report();
+    assert!(
+        !report.oracle_report.all_passed(),
+        "the unresolved obligation must make the Lab report fail"
+    );
+    let crashpack = runtime
+        .build_crashpack_for_report(&report)
+        .expect("a failing replay-recording Lab report builds a crashpack");
+    assert_eq!(crashpack.seed(), SEED);
+    assert!(
+        crashpack.has_divergent_prefix(),
+        "the crashpack retains a replayable divergent prefix"
+    );
+    let replay = crashpack
+        .replay
+        .as_ref()
+        .expect("the crashpack retains replay-command metadata");
+    assert!(
+        !replay.command_line.is_empty(),
+        "replay metadata supplies a non-empty command"
+    );
+
+    println!(
+        "G0_CENSUS item=lab-crashpack case=intentional-obligation-leak seed={SEED:#x} divergent_prefix_events={} replay_command=true",
+        crashpack.divergent_prefix.len(),
+    );
+    println!(
+        "G0_CENSUS item=lab-crashpack RESULT=RATIFIED evidence=failing-lab-report+replay-recording+divergent-prefix+replay-command"
     );
 }
