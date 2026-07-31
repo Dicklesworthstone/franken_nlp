@@ -113,6 +113,8 @@ fn independent_schema_walker_accepts_exact_numeric_equivalence() {
         validate_json(&schema, r#"{"n":1,"i":1.5}"#).expect_err("fraction is not an exact integer");
     assert_eq!(error.pointer(), "/i");
     assert!(error.expected().contains("64-bit integer"));
+    assert!(error.byte_offset().is_some());
+    assert!(error.scalar_offset().is_some());
 }
 
 #[test]

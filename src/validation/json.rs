@@ -365,6 +365,19 @@ impl fmt::Display for JsonParseError {
 
 impl std::error::Error for JsonParseError {}
 
+/// An internal source location retained by the independent parser so the
+/// schema walker can report a safe byte and Unicode-scalar coordinate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct JsonLocation {
+    pub byte_offset: usize,
+    pub scalar_offset: usize,
+}
+
+pub(crate) struct ParsedJson {
+    pub value: JsonValue,
+    pub locations: BTreeMap<String, JsonLocation>,
+}
+
 /// Parse one JSON document under the ordinary product bounds.
 pub fn parse_json(input: &str) -> Result<JsonValue, JsonParseError> {
     parse_json_with_limits(input, JsonLimits::default())
@@ -375,6 +388,17 @@ pub fn parse_json_with_limits(
     input: &str,
     limits: JsonLimits,
 ) -> Result<JsonValue, JsonParseError> {
+    parse_json_with_locations_and_limits(input, limits).map(|document| document.value)
+}
+
+pub(crate) fn parse_json_with_locations(input: &str) -> Result<ParsedJson, JsonParseError> {
+    parse_json_with_locations_and_limits(input, JsonLimits::default())
+}
+
+fn parse_json_with_locations_and_limits(
+    input: &str,
+    limits: JsonLimits,
+) -> Result<ParsedJson, JsonParseError> {
     if input.len() > limits.max_input_bytes {
         return Err(JsonParseError {
             kind: JsonParseErrorKind::Resource,
@@ -391,18 +415,20 @@ pub fn parse_json_with_limits(
         input,
         offset: 0,
         limits,
+        locations: BTreeMap::new(),
     }
-    .parse()
+    .parse_document()
 }
 
 struct Parser<'a> {
     input: &'a str,
     offset: usize,
     limits: JsonLimits,
+    locations: BTreeMap<String, JsonLocation>,
 }
 
 impl<'a> Parser<'a> {
-    fn parse(mut self) -> Result<JsonValue, JsonParseError> {
+    fn parse_document(mut self) -> Result<ParsedJson, JsonParseError> {
         self.skip_whitespace();
         let value = self.parse_value(0, "$")?;
         self.skip_whitespace();
@@ -413,7 +439,10 @@ impl<'a> Parser<'a> {
                 "trailing bytes after JSON value",
             ));
         }
-        Ok(value)
+        Ok(ParsedJson {
+            value,
+            locations: self.locations,
+        })
     }
 
     fn parse_value(&mut self, depth: usize, pointer: &str) -> Result<JsonValue, JsonParseError> {
@@ -425,6 +454,12 @@ impl<'a> Parser<'a> {
             ));
         }
         self.skip_whitespace();
+        self.locations
+            .entry(pointer.to_owned())
+            .or_insert(JsonLocation {
+                byte_offset: self.offset,
+                scalar_offset: self.input[..self.offset].chars().count(),
+            });
         match self.peek() {
             Some(b'{') => self.parse_object(depth + 1, pointer),
             Some(b'[') => self.parse_array(depth + 1, pointer),

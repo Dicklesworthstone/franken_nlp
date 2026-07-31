@@ -5,7 +5,7 @@ use std::fmt;
 
 use crate::grammar::{ScalarValue, SchemaNode, SourceAnnotation};
 
-use super::json::{JsonParseError, JsonValue, parse_json};
+use super::json::{JsonLocation, JsonParseError, JsonValue, ParsedJson, parse_json_with_locations};
 use super::offsets::SourceSpan;
 use super::source_membership::{GroundingError, verify_source_membership};
 
@@ -112,8 +112,8 @@ pub struct GroundedValue<'a> {
 
 /// Parse and validate a structured response through the independent parser.
 pub fn validate_json(schema: &SchemaNode, input: &str) -> Result<(), ValidationError> {
-    let value = parse_json(input)?;
-    validate_value(schema, &value)
+    let document = parse_json_with_locations(input)?;
+    validate_document(schema, &document)
 }
 
 /// Validate a previously parsed value against only immutable schema data.
@@ -128,8 +128,9 @@ pub fn validate_with_grounding(
     input: &str,
     groundings: &[GroundedValue<'_>],
 ) -> Result<(), ValidationError> {
-    let value = parse_json(input)?;
-    validate_value(schema, &value)?;
+    let document = parse_json_with_locations(input)?;
+    validate_document(schema, &document)?;
+    let value = &document.value;
 
     let mut required = BTreeMap::new();
     collect_grounded_strings(schema, &value, "$", &mut required)?;
@@ -165,6 +166,32 @@ pub fn validate_with_grounding(
         }
     }
     Ok(())
+}
+
+fn validate_document(schema: &SchemaNode, document: &ParsedJson) -> Result<(), ValidationError> {
+    validate_value(schema, &document.value)
+        .map_err(|error| attach_location(error, &document.locations))
+}
+
+fn attach_location(
+    mut error: ValidationError,
+    locations: &BTreeMap<String, JsonLocation>,
+) -> ValidationError {
+    if error.byte_offset.is_some() {
+        return error;
+    }
+    let mut pointer = error.pointer.clone();
+    loop {
+        if let Some(location) = locations.get(&pointer) {
+            error.byte_offset = Some(location.byte_offset);
+            error.scalar_offset = Some(location.scalar_offset);
+            return error;
+        }
+        if pointer == "$" {
+            return error;
+        }
+        pointer = parent_pointer(&pointer);
+    }
 }
 
 fn validate_node(
@@ -355,5 +382,16 @@ fn pointer_index(parent: &str, index: usize) -> String {
         format!("/{index}")
     } else {
         format!("{parent}/{index}")
+    }
+}
+
+fn parent_pointer(pointer: &str) -> String {
+    let Some(index) = pointer.rfind('/') else {
+        return "$".to_owned();
+    };
+    if index == 0 {
+        "$".to_owned()
+    } else {
+        pointer[..index].to_owned()
     }
 }
