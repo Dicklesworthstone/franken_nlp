@@ -177,13 +177,78 @@ def verified_source_manifest_entries(record: dict[str, Any]) -> list[dict[str, o
     return entries
 
 
+def verify_expected_smoke_transcript(record: dict[str, Any], entries: list[dict[str, object]]) -> None:
+    """Bind the canonical smoke receipt to the closure that smoke verified.
+
+    A receipt path and digest alone are not sufficient provenance: the JSON must
+    retain the exact canonical source-manifest identity and closure accounting
+    that ``smoke`` checked before importing or loading the model.
+    """
+
+    smoke = record.get("smoke")
+    expected = smoke.get("expected") if isinstance(smoke, dict) else None
+    if not isinstance(expected, dict):
+        raise OracleFailure("smoke.expected must be an object")
+    relative_path = expected.get("canonical_transcript_path")
+    expected_digest = expected.get("canonical_transcript_sha256")
+    if not isinstance(relative_path, str) or not relative_path.startswith("docs/truth-pack/"):
+        raise OracleFailure("canonical smoke transcript must be a docs/truth-pack relative path")
+    if ".." in Path(relative_path).parts:
+        raise OracleFailure("canonical smoke transcript path must not traverse parents")
+    if not isinstance(expected_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+        raise OracleFailure("canonical smoke transcript digest must be lowercase SHA-256")
+    transcript_path = ROOT / relative_path
+    if not transcript_path.is_file() or transcript_path.is_symlink():
+        raise OracleFailure(f"canonical smoke transcript is absent or not regular: {transcript_path}")
+    observed_digest = sha256_file(transcript_path)
+    if not hmac.compare_digest(expected_digest, observed_digest):
+        raise OracleFailure(
+            f"canonical smoke transcript digest mismatch expected={expected_digest} observed={observed_digest}"
+        )
+    try:
+        transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise OracleFailure(f"canonical smoke transcript is invalid JSON: {exc}") from exc
+    if not isinstance(transcript, dict):
+        raise OracleFailure("canonical smoke transcript root must be an object")
+    if transcript.get("model_id") != MODEL_ID or transcript.get("revision") != REVISION:
+        raise OracleFailure("canonical smoke transcript model identity differs from the pinned oracle")
+    source_identity = record["source_identity"]
+    source_manifest = source_identity["source_manifest"]
+    source_closure = transcript.get("source_closure")
+    if not isinstance(source_closure, dict):
+        raise OracleFailure("canonical smoke transcript omits source_closure verification")
+    expected_closure = {
+        "manifest_path": source_manifest["path"],
+        "manifest_sha256": source_manifest["sha256"],
+        "file_count": len(entries),
+        "closure_total_bytes": sum(int(entry["bytes"]) for entry in entries),
+        "verification": "sha256_and_byte_length_each_canonical_file",
+    }
+    for field, expected_value in expected_closure.items():
+        if source_closure.get(field) != expected_value:
+            raise OracleFailure(
+                f"canonical smoke source_closure mismatch field={field} "
+                f"expected={expected_value!r} observed={source_closure.get(field)!r}"
+            )
+    execution = transcript.get("execution")
+    if not isinstance(execution, dict):
+        raise OracleFailure("canonical smoke transcript omits execution")
+    if execution.get("device") != "cpu" or execution.get("attn_implementation") != "eager":
+        raise OracleFailure("canonical smoke transcript is not a CPU/eager execution")
+    expected_tokens = expected.get("greedy_new_token_ids")
+    if not isinstance(expected_tokens, list) or execution.get("greedy_new_token_ids") != expected_tokens:
+        raise OracleFailure("canonical smoke transcript greedy tokens differ from the record")
+    log("smoke_transcript_valid", sha256=observed_digest, file_count=len(entries))
+
+
 def verify_record(record: dict[str, Any]) -> None:
     if record.get("schema_version") != 1:
         raise OracleFailure("unsupported oracle_env schema_version")
     source = record.get("source_identity")
     if not isinstance(source, dict) or source.get("model_id") != MODEL_ID or source.get("revision") != REVISION:
         raise OracleFailure("closure record model_id/revision differs from the pinned oracle")
-    verified_source_manifest_entries(record)
+    source_entries = verified_source_manifest_entries(record)
     closure = record.get("closure")
     if not isinstance(closure, dict):
         raise OracleFailure("closure must be an object")
@@ -215,6 +280,7 @@ def verify_record(record: dict[str, Any]) -> None:
         raise OracleFailure("the selected closure must state its CPython 3.11 macOS-arm64 target")
     if not isinstance(record.get("environment_capture"), dict):
         raise OracleFailure("environment_capture contract is missing")
+    verify_expected_smoke_transcript(record, source_entries)
     log("record_valid", lock_sha256=observed_lock_sha, freeze_sha256=observed_freeze_sha, package_count=len(packages))
 
 
