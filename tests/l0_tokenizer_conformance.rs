@@ -60,7 +60,7 @@ fn digest_hex(bytes: &[u8]) -> String {
 #[test]
 fn l0_synthetic_merge_rows_log_exact_digests() {
     let tokenizer = tokenizer();
-    let rows = [("ab", vec![1, 8]), (" a", vec![1, 3, 8])];
+    let rows: [(&str, Vec<u32>); 2] = [("ab", vec![1, 8]), (" a", vec![1, 3, 8])];
     for (input, expected_ids) in rows {
         let got_ids = tokenizer.encode_ids(input).expect("toy input encodes");
         let expected = expected_ids
