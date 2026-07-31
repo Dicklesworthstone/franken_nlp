@@ -37,7 +37,10 @@ fn accepts_staging_target(kind: TargetKind, same_filesystem: bool, create_new: b
 }
 
 fn recover_after_kill(step: ActivationStep) -> RecoveryObservation {
-    let candidate_root_visible = matches!(step, ActivationStep::RenameIntoPlace | ActivationStep::SyncModelRoot);
+    let candidate_root_visible = matches!(
+        step,
+        ActivationStep::RenameIntoPlace | ActivationStep::SyncModelRoot
+    );
     RecoveryObservation {
         previous_root_visible: !candidate_root_visible,
         candidate_root_visible,
@@ -79,12 +82,27 @@ fn kill_matrix_model_keeps_only_previous_or_candidate_root_visible() {
     }
 
     assert!(accepts_staging_target(TargetKind::RegularFile, true, true));
-    for target in [TargetKind::Symlink, TargetKind::ReparsePoint, TargetKind::Device] {
+    for target in [
+        TargetKind::Symlink,
+        TargetKind::ReparsePoint,
+        TargetKind::Device,
+    ] {
         assert!(!accepts_staging_target(target, true, true));
     }
-    assert!(!accepts_staging_target(TargetKind::RegularFile, false, true));
-    assert!(!accepts_staging_target(TargetKind::RegularFile, true, false));
-    log_case("reject-link-reparse-device-crossfs-and-nonexclusive-create", "PASS");
+    assert!(!accepts_staging_target(
+        TargetKind::RegularFile,
+        false,
+        true
+    ));
+    assert!(!accepts_staging_target(
+        TargetKind::RegularFile,
+        true,
+        false
+    ));
+    log_case(
+        "reject-link-reparse-device-crossfs-and-nonexclusive-create",
+        "PASS",
+    );
 
     println!("G0_PROBE9 RESULT=PASS cases=7 seed={SEED} authority=kill-matrix-model-only");
 }

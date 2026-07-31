@@ -32,11 +32,16 @@ struct Broker {
 }
 
 impl Broker {
-    fn install(&self, requested: ResourceConfig) -> Result<Arc<EngineResources>, ResourceConfigConflict> {
+    fn install(
+        &self,
+        requested: ResourceConfig,
+    ) -> Result<Arc<EngineResources>, ResourceConfigConflict> {
         let mut installed = self.installed.lock().expect("broker lock poisoned");
         if let Some(existing) = installed.as_ref() {
             if existing.config.weight_digest != requested.weight_digest {
-                return Err(ResourceConfigConflict { field: "weight_digest" });
+                return Err(ResourceConfigConflict {
+                    field: "weight_digest",
+                });
             }
             if existing.config.memory_limit_bytes != requested.memory_limit_bytes {
                 return Err(ResourceConfigConflict {
@@ -44,7 +49,9 @@ impl Broker {
                 });
             }
             if existing.config.worker_cap != requested.worker_cap {
-                return Err(ResourceConfigConflict { field: "worker_cap" });
+                return Err(ResourceConfigConflict {
+                    field: "worker_cap",
+                });
             }
             return Ok(Arc::clone(existing));
         }
@@ -82,7 +89,10 @@ impl MemoryLedger {
 
     fn reserve(&self, bytes: u64) -> Option<Reservation> {
         let mut state = self.state.lock().expect("ledger lock poisoned");
-        let total = state.reserved.checked_add(state.committed)?.checked_add(bytes)?;
+        let total = state
+            .reserved
+            .checked_add(state.committed)?
+            .checked_add(bytes)?;
         if total > self.capacity {
             return None;
         }
@@ -128,7 +138,9 @@ fn broker_model_has_one_winner_and_aggregate_memory_rollback() {
         let barrier = Arc::clone(&barrier);
         joins.push(thread::spawn(move || {
             barrier.wait();
-            broker.install(config).expect("compatible install must succeed")
+            broker
+                .install(config)
+                .expect("compatible install must succeed")
         }));
     }
     barrier.wait();
@@ -158,7 +170,10 @@ fn broker_model_has_one_winner_and_aggregate_memory_rollback() {
 
     let ledger = MemoryLedger::new(100);
     let mut committed = ledger.reserve(60).expect("first reservation fits");
-    assert!(ledger.reserve(50).is_none(), "aggregate reservation must refuse");
+    assert!(
+        ledger.reserve(50).is_none(),
+        "aggregate reservation must refuse"
+    );
     ledger.commit(&mut committed);
     let mut cancelled = ledger.reserve(30).expect("remaining capacity fits");
     ledger.abort(&mut cancelled);

@@ -45,7 +45,10 @@ fn validate_range_response(
     if response.status != 206 {
         return Err(RangeViolation::Status);
     }
-    if response.content_encoding.is_some_and(|value| value != "identity") {
+    if response
+        .content_encoding
+        .is_some_and(|value| value != "identity")
+    {
         return Err(RangeViolation::UnexpectedContentEncoding);
     }
     let (start, end, _) = response
