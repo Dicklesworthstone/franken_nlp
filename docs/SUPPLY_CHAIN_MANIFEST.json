@@ -6,7 +6,6 @@
     "sha2"
   ],
   "packages": [
-    {"name": "allocator-api2", "source": "registry+https://github.com/rust-lang/crates.io-index", "version": "0.2.21"},
     {"name": "anstream", "source": "registry+https://github.com/rust-lang/crates.io-index", "version": "1.0.0"},
     {"name": "anstyle", "source": "registry+https://github.com/rust-lang/crates.io-index", "version": "1.0.14"},
     {"name": "anstyle-parse", "source": "registry+https://github.com/rust-lang/crates.io-index", "version": "1.0.0"},
@@ -22,13 +21,9 @@
     {"name": "cpufeatures", "source": "registry+https://github.com/rust-lang/crates.io-index", "version": "0.2.17"},
     {"name": "crypto-common", "source": "registry+https://github.com/rust-lang/crates.io-index", "version": "0.1.7"},
     {"name": "digest", "source": "registry+https://github.com/rust-lang/crates.io-index", "version": "0.10.7"},
-    {"name": "equivalent", "source": "registry+https://github.com/rust-lang/crates.io-index", "version": "1.0.2"},
-    {"name": "foldhash", "source": "registry+https://github.com/rust-lang/crates.io-index", "version": "0.2.0"},
     {"name": "franken_nlp", "source": "workspace-root", "version": "0.1.0"},
     {"name": "generic-array", "source": "registry+https://github.com/rust-lang/crates.io-index", "version": "0.14.7"},
-    {"name": "hashbrown", "source": "registry+https://github.com/rust-lang/crates.io-index", "version": "0.17.1"},
     {"name": "heck", "source": "registry+https://github.com/rust-lang/crates.io-index", "version": "0.5.0"},
-    {"name": "indexmap", "source": "registry+https://github.com/rust-lang/crates.io-index", "version": "2.14.0"},
     {"name": "is_terminal_polyfill", "source": "registry+https://github.com/rust-lang/crates.io-index", "version": "1.70.2"},
     {"name": "itoa", "source": "registry+https://github.com/rust-lang/crates.io-index", "version": "1.0.18"},
     {"name": "libc", "source": "registry+https://github.com/rust-lang/crates.io-index", "version": "0.2.189"},
