@@ -118,7 +118,9 @@
     "required_files": {
       "config.json": "f6cb15b22847664f3a6049dc4b58fdd10f1650d112ac99a1da3d051f17c2ca19",
       "configuration_nanbeige.py": "c517227741f0fc007061bde1873138545ce15e67716a062513193c06300c7685",
+      "model.safetensors.index.json": "30d8da0fa8b97abc6d9eddfd017a0cb7a649bcbd58caa57804c56c767db5c0f1",
       "modeling_nanbeige.py": "547737f989f5cb741c1a568acaf85f83521fa67a8f7268e19f9a37e60127c0d5",
+      "tokenizer.model": "fb41d04798b714520a9b075727b0226538b7330254299062742c50ec8374bc36",
       "tokenizer_config.json": "3edfa64a0826a77e9412b9008f1febf3fe906a68fd616b6de4cd15897a8c8518"
     },
     "revision": "f56ec5a9650268aa098496734743c25ea778bd2d"

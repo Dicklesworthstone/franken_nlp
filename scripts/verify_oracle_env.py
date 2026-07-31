@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import importlib.metadata
 import json
 import os
@@ -20,8 +21,7 @@ import sys
 import venv
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, NoReturn
-
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 RECORD_PATH = ROOT / "docs/truth-pack/oracle_env.json"
@@ -29,6 +29,7 @@ LOCK_PATH = ROOT / "docs/truth-pack/oracle_requirements.lock"
 MODEL_ID = "Nanbeige/Nanbeige4.2-3B"
 REVISION = "f56ec5a9650268aa098496734743c25ea778bd2d"
 CANONICAL_NAME = re.compile(r"[-_.]+")
+COMMAND_TIMEOUT_SECONDS = 1800
 
 
 class OracleFailure(RuntimeError):
@@ -140,15 +141,17 @@ def verify_record(record: dict[str, Any]) -> None:
     if not LOCK_PATH.is_file():
         raise OracleFailure(f"missing closure lock: {LOCK_PATH}")
     observed_lock_sha = sha256_file(LOCK_PATH)
-    if closure.get("lock_sha256") != observed_lock_sha:
+    expected_lock_sha = closure.get("lock_sha256")
+    if not isinstance(expected_lock_sha, str) or not hmac.compare_digest(expected_lock_sha, observed_lock_sha):
         raise OracleFailure(
-            f"lock digest mismatch expected={closure.get('lock_sha256')} observed={observed_lock_sha}"
+            f"lock digest mismatch expected={expected_lock_sha} observed={observed_lock_sha}"
         )
     packages = expected_packages(record)
     observed_freeze_sha = freeze_digest(packages)
-    if closure.get("freeze_sha256") != observed_freeze_sha:
+    expected_freeze_sha = closure.get("freeze_sha256")
+    if not isinstance(expected_freeze_sha, str) or not hmac.compare_digest(expected_freeze_sha, observed_freeze_sha):
         raise OracleFailure(
-            f"closure package digest mismatch expected={closure.get('freeze_sha256')} observed={observed_freeze_sha}"
+            f"closure package digest mismatch expected={expected_freeze_sha} observed={observed_freeze_sha}"
         )
     required_names = {"torch", "transformers", "sentencepiece"}
     if not required_names <= set(packages):
@@ -162,7 +165,22 @@ def verify_record(record: dict[str, Any]) -> None:
 
 def run(command: list[str], event: str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     log("command_start", step=event, command=command, cwd=str(cwd) if cwd else None)
-    completed = subprocess.run(command, text=True, capture_output=True, cwd=cwd, check=False)
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            cwd=cwd,
+            check=False,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        completed = subprocess.CompletedProcess(
+            command,
+            124,
+            stdout=exc.stdout or "",
+            stderr=(exc.stderr or "") + f"\ncommand timed out after {COMMAND_TIMEOUT_SECONDS}s",
+        )
     log(
         "command_complete",
         step=event,
@@ -227,9 +245,10 @@ def recreate(record: dict[str, Any], target: Path) -> None:
     if difference:
         raise OracleFailure(f"recreation mismatch first differing package==version: {difference}")
     observed = freeze_digest({name: actual[name] for name in expected})
-    if observed != record["closure"]["freeze_sha256"]:
+    expected_freeze_sha = record["closure"]["freeze_sha256"]
+    if not hmac.compare_digest(expected_freeze_sha, observed):
         raise OracleFailure(
-            f"recreation closure hash mismatch expected={record['closure']['freeze_sha256']} observed={observed}"
+            f"recreation closure hash mismatch expected={expected_freeze_sha} observed={observed}"
         )
     log("recreate_pass", venv=str(target), freeze_sha256=observed, package_count=len(expected))
 
@@ -241,14 +260,25 @@ def source_files(record: dict[str, Any], source: Path, *, need_weights: bool) ->
     if not isinstance(required, dict):
         raise OracleFailure("source_identity.required_files must be an object")
     for name, expected_sha in required.items():
+        if not isinstance(name, str) or not isinstance(expected_sha, str):
+            raise OracleFailure("source_identity.required_files must map string paths to SHA-256 strings")
         path = source / name
         if not path.is_file():
             raise NoModel(f"source snapshot missing required file: {path}")
         observed_sha = sha256_file(path)
-        if observed_sha != expected_sha:
+        if not hmac.compare_digest(expected_sha, observed_sha):
             raise OracleFailure(f"source hash mismatch file={name} expected={expected_sha} observed={observed_sha}")
-    if need_weights and not list(source.glob("model-*.safetensors")):
-        raise NoModel(f"source snapshot has no model-*.safetensors weights: {source}")
+    if need_weights:
+        try:
+            index = json.loads((source / "model.safetensors.index.json").read_text(encoding="utf-8"))
+            shard_names = sorted(set(index["weight_map"].values()))
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise OracleFailure("model.safetensors.index.json has no valid weight_map") from exc
+        missing = [name for name in shard_names if not (source / name).is_file()]
+        if missing:
+            raise NoModel(f"source snapshot missing weight shards: {','.join(missing)}")
+        if any((source / name).is_symlink() for name in shard_names):
+            raise OracleFailure("oracle weight shards must be regular files, not symlinks")
 
 
 def capture_environment() -> dict[str, Any]:
@@ -304,30 +334,41 @@ def validate_installed_closure(record: dict[str, Any]) -> None:
     if difference:
         raise OracleFailure(f"installed closure mismatch first differing package==version: {difference}")
     observed = freeze_digest(relevant_actual)
-    if observed != record["closure"]["freeze_sha256"]:
+    expected_freeze_sha = record["closure"]["freeze_sha256"]
+    if not hmac.compare_digest(expected_freeze_sha, observed):
         raise OracleFailure(
-            f"installed closure hash mismatch expected={record['closure']['freeze_sha256']} observed={observed}"
+            f"installed closure hash mismatch expected={expected_freeze_sha} observed={observed}"
         )
 
 
 def smoke(record: dict[str, Any], source: Path, output: Path | None) -> None:
     source_files(record, source, need_weights=True)
     validate_installed_closure(record)
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except ImportError as exc:
+        raise OracleFailure(f"selected closure cannot import an oracle dependency: {exc}") from exc
 
     log("smoke_load_start", source=str(source), revision=REVISION, device="cpu", attention="eager")
-    tokenizer = AutoTokenizer.from_pretrained(source, trust_remote_code=True, use_fast=False, local_files_only=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        source,
+        trust_remote_code=True,
+        use_fast=False,
+        local_files_only=True,
+        revision=REVISION,
+    )
     if getattr(tokenizer, "is_fast", None) is not False:
         raise OracleFailure(f"slow tokenizer required; got {tokenizer.__class__.__name__}")
     model = AutoModelForCausalLM.from_pretrained(
         source,
         trust_remote_code=True,
         local_files_only=True,
+        revision=REVISION,
         torch_dtype=torch.bfloat16,
         attn_implementation="eager",
     ).to("cpu")
-    model.eval()
+    model.train(False)
     actual_attention = getattr(model.config, "_attn_implementation", None)
     if actual_attention != "eager":
         raise OracleFailure(f"eager attention required; runtime config reported {actual_attention!r}")
@@ -360,8 +401,14 @@ def smoke(record: dict[str, Any], source: Path, output: Path | None) -> None:
         },
     }
     expected = record["smoke"].get("expected")
-    if expected is not None and payload["execution"]["greedy_new_token_ids"] != expected.get("greedy_new_token_ids"):
-        raise OracleFailure("smoke greedy tokens differ from the recorded oracle output")
+    if expected is not None:
+        expected_tokens = expected.get("greedy_new_token_ids")
+        if not isinstance(expected_tokens, list):
+            raise OracleFailure("recorded smoke expectation has no greedy_new_token_ids list")
+        observed_bytes = json.dumps(payload["execution"]["greedy_new_token_ids"], separators=(",", ":")).encode("utf-8")
+        expected_bytes = json.dumps(expected_tokens, separators=(",", ":")).encode("utf-8")
+        if not hmac.compare_digest(observed_bytes, expected_bytes):
+            raise OracleFailure("smoke greedy tokens differ from the recorded oracle output")
     if output is not None:
         write_new_json(output, payload)
     log("smoke_pass", tokenizer=tokenizer.__class__.__name__, generated_tokens=len(new_tokens))
@@ -372,11 +419,11 @@ def matrix_import_command(source: Path) -> str:
         "from transformers import AutoConfig, AutoTokenizer; "
         "from transformers.dynamic_module_utils import get_class_from_dynamic_module; "
         f"p={str(source)!r}; "
-        "c=AutoConfig.from_pretrained(p, trust_remote_code=True, local_files_only=True); "
+        f"c=AutoConfig.from_pretrained(p, trust_remote_code=True, local_files_only=True, revision={REVISION!r}); "
         "r=c.auto_map['AutoModelForCausalLM']; "
         "get_class_from_dynamic_module(r, p, local_files_only=True); "
-        "t=AutoTokenizer.from_pretrained(p, trust_remote_code=True, use_fast=False, local_files_only=True); "
-        "assert t.is_fast is False; print(type(t).__name__)"
+        f"t=AutoTokenizer.from_pretrained(p, trust_remote_code=True, use_fast=False, local_files_only=True, revision={REVISION!r}); "
+        "assert not t.is_fast; print(type(t).__name__)"
     )
 
 
