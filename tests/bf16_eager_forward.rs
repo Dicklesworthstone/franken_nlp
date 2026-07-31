@@ -2,7 +2,7 @@
 
 use std::{
     collections::BTreeMap,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
 };
 
@@ -33,6 +33,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const HF_BF16_EAGER_TRACE_PROMPT: &str = "tests/fixtures/reference/hf-bf16-eager/prompt-000";
+const PINNED_MODEL_SOURCE_ENV: &str = "FNLP_PINNED_MODEL_SOURCE";
 const NANBEIGE_PHYSICAL_LAYER_COUNT: usize = 22;
 const NANBEIGE_LOGICAL_LAYER_COUNT: usize = 44;
 
@@ -74,6 +75,22 @@ fn assert_close(observed: f32, expected: f32, tolerance: f32) {
         (observed - expected).abs() <= tolerance,
         "observed={observed} expected={expected} tolerance={tolerance}"
     );
+}
+
+fn armed_pinned_model_source() -> Option<PathBuf> {
+    let Some(source) = env::var_os(PINNED_MODEL_SOURCE_ENV).map(PathBuf::from) else {
+        eprintln!(
+            "BF16_EAGER RESULT=SKIPPED_NO_MODEL taps=0 norms=0 reason={PINNED_MODEL_SOURCE_ENV}-unset"
+        );
+        return None;
+    };
+    if !source.is_dir() {
+        eprintln!(
+            "BF16_EAGER RESULT=SKIPPED_NO_MODEL taps=0 norms=0 reason={PINNED_MODEL_SOURCE_ENV}-not-directory"
+        );
+        return None;
+    }
+    Some(source)
 }
 
 fn trace_tensor_element_count(tensor: &HfBf16EagerTraceTensor) -> usize {
@@ -325,6 +342,60 @@ fn hf_bf16_eager_fixture_binds_the_44_layer_l2_ladder_and_greedy_seed() {
 
     eprintln!(
         "BF16_EAGER_FIXTURE_CONTRACT RESULT=PASS logical_layers=44 post_loop_norms=2 greedy_seed={greedy_seed}"
+    );
+}
+
+/// Exercises the actual source-backed semantic engine once the release or
+/// parity runner arms this model-gated check.  Fixture-integrity coverage above
+/// proves the frozen oracle inventory; `zre` owns the separate per-tensor L2
+/// metric comparison against those bytes.
+#[test]
+fn bf16_eager_armed_source_runs_all_44_layers_and_both_boundary_norms() {
+    let Some(source) = armed_pinned_model_source() else {
+        return;
+    };
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(HF_BF16_EAGER_TRACE_PROMPT);
+    let trace: HfBf16EagerTrace = serde_json::from_slice(
+        &fs::read(root.join("trace.json")).expect("read hf-bf16 eager oracle trace"),
+    )
+    .expect("parse hf-bf16 eager oracle trace");
+    let token_id = *trace
+        .greedy_tokens
+        .first()
+        .expect("frozen eager trace must retain a greedy seed");
+
+    let weights = HfBf16EagerWeights::from_pinned_source(&source)
+        .expect("armed source closure must satisfy the pinned bf16 tensor census");
+    let mut engine = HfBf16EagerEngine::new(weights, 1)
+        .expect("one-position eager engine must admit all 44 bf16 K/V slots");
+    let forward = engine
+        .decode(token_id)
+        .expect("armed eager source must execute the frozen greedy seed");
+
+    assert_eq!(forward.position, 0);
+    assert_eq!(forward.layer_outputs.len(), NANBEIGE_LOGICAL_LAYER_COUNT);
+    for (logical_slot, output) in forward.layer_outputs.iter().enumerate() {
+        let loop_index = logical_slot / NANBEIGE_PHYSICAL_LAYER_COUNT;
+        let layer_index = logical_slot % NANBEIGE_PHYSICAL_LAYER_COUNT;
+        assert_eq!(output.loop_index, loop_index);
+        assert_eq!(output.layer_index, layer_index);
+        assert_eq!(output.kv_slot, logical_slot);
+        assert_eq!(output.hidden.len(), NANBEIGE_HIDDEN_SIZE);
+    }
+    for norm in &forward.post_loop_norms {
+        assert_eq!(norm.len(), NANBEIGE_HIDDEN_SIZE);
+    }
+    assert_eq!(forward.logits.len(), NANBEIGE_VOCAB_SIZE);
+    assert_eq!(greedy_argmax(&forward.logits), Some(forward.greedy_token));
+    for slot in 0..NANBEIGE_LOGICAL_LAYER_COUNT {
+        assert_eq!(engine.kv_cache().len_for_slot(slot), Ok(1));
+    }
+
+    eprintln!(
+        "BF16_EAGER RESULT=PASS taps={} norms={} source=armed greedy_token={}",
+        forward.layer_outputs.len(),
+        forward.post_loop_norms.len(),
+        forward.greedy_token,
     );
 }
 
