@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "model": "Nanbeige4.2-3B",
+  "revision": "f56ec5a9650268aa098496734743c25ea778bd2d",
+  "source_url": "https://huggingface.co/Nanbeige/Nanbeige4.2-3B/raw/f56ec5a9650268aa098496734743c25ea778bd2d/README.md",
+  "source_api_url": "https://huggingface.co/api/models/Nanbeige/Nanbeige4.2-3B/revision/f56ec5a9650268aa098496734743c25ea778bd2d",
+  "readme_sha256": "01cbce423668845435003dc0828033ab7ad07e88f076ed96ec66d4b014f4654f",
+  "spdx_license": "apache-2.0",
+  "front_matter_snapshot": "---\nlicense: apache-2.0\nlanguage:\n- en\n- zh\nlibrary_name: transformers\npipeline_tag: text-generation\ntags:\n- llm\n- nanbeige\nbase_model:\n- Nanbeige/Nanbeige4.2-3B-Base\n---\n",
+  "observed_via": "Hugging Face model API and the revision-pinned README.md raw endpoint",
+  "interpretation": "The revision-pinned model card declares SPDX Apache-2.0. This declaration is settled provenance for the model weights; it is not a conditional or uncertain license claim."
+}

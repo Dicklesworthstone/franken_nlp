@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "model": "Nanbeige4.2-3B",
+  "model_revision": "f56ec5a9650268aa098496734743c25ea778bd2d",
+  "minimum_nanbeige_support_revision": "b77d646751d01c0962bc203b6809e9d94f7d50b7",
+  "selected_official_llamacpp_revision": "000547513f1530346ecd163db8b3e13962949961",
+  "selection_reason": "This was the official ggml-org/llama.cpp HEAD selected on 2026-07-31. It is immutable, is 57 commits ahead of the required Nanbeige-support commit, and avoids treating the authors' fork as an independent oracle.",
+  "selection_evidence": {
+    "repository": "https://github.com/ggml-org/llama.cpp.git",
+    "selected_commit_url": "https://github.com/ggml-org/llama.cpp/commit/000547513f1530346ecd163db8b3e13962949961",
+    "selected_commit_committed_at": "2026-07-31T08:16:17Z",
+    "head_observation_command": "git ls-remote https://github.com/ggml-org/llama.cpp.git HEAD",
+    "head_observation_output": "000547513f1530346ecd163db8b3e13962949961\tHEAD",
+    "ancestry_check_command": "git merge-base --is-ancestor b77d646751d01c0962bc203b6809e9d94f7d50b7 000547513f1530346ecd163db8b3e13962949961",
+    "remote_compare_url": "https://api.github.com/repos/ggml-org/llama.cpp/compare/b77d646751d01c0962bc203b6809e9d94f7d50b7...000547513f1530346ecd163db8b3e13962949961",
+    "remote_compare_status": "ahead",
+    "remote_compare_ahead_by": 57,
+    "remote_compare_behind_by": 0,
+    "remote_compare_merge_base": "b77d646751d01c0962bc203b6809e9d94f7d50b7"
+  },
+  "role_boundaries": {
+    "official_ggml_org_llamacpp": "Secondary CPU/GGUF differential and performance baseline.",
+    "authors_nanbeige_llamacpp_nanbeige42": "Historical lineage only; not an independent oracle.",
+    "gpl3_rlx_nanbeige": "Out-of-tree black-box differential only; no code or dependency crosses into this repository; not an independent oracle."
+  },
+  "cpu_only_build_recipe": {
+    "source": [
+      "git clone https://github.com/ggml-org/llama.cpp.git llama.cpp",
+      "git -C llama.cpp checkout --detach 000547513f1530346ecd163db8b3e13962949961",
+      "git -C llama.cpp merge-base --is-ancestor b77d646751d01c0962bc203b6809e9d94f7d50b7 000547513f1530346ecd163db8b3e13962949961"
+    ],
+    "configure": "cmake -S llama.cpp -B llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF -DGGML_METAL=OFF -DGGML_VULKAN=OFF -DLLAMA_CURL=OFF -DBUILD_SHARED_LIBS=OFF",
+    "build": "cmake --build llama.cpp/build --config Release -j <measured-cpu-job-cap>",
+    "convert": "python3 llama.cpp/convert_hf_to_gguf.py <pinned-source-dir> --outfile <nanbeige4.2-3b-f56ec5a-q8_0.gguf> --outtype q8_0",
+    "decode": "llama.cpp/build/bin/llama-cli -m <nanbeige4.2-3b-f56ec5a-q8_0.gguf> -p 'FrankenNLP baseline smoke.' -n 32 --temp 0 --no-warmup",
+    "environment": {
+      "CUDA_VISIBLE_DEVICES": "",
+      "GGML_METAL": "0",
+      "GGML_VK_VISIBLE_DEVICES": ""
+    },
+    "notes": "The job cap, compiler identity, compiler version, architecture flags, and host fingerprint are measured-run evidence and must be captured by the armed smoke transcript; they are not inferred from this recipe."
+  },
+  "smoke_transcript": {
+    "evidence_state": "SKIPPED_NO_MODEL",
+    "status": "SKIPPED_NO_MODEL",
+    "reason": "The pinned Hugging Face source closure was not present locally, so conversion and greedy inference were not run. This record deliberately does not claim a successful smoke run.",
+    "armed_replay_order": [
+      "cmake -S llama.cpp -B llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF -DGGML_METAL=OFF -DGGML_VULKAN=OFF -DLLAMA_CURL=OFF -DBUILD_SHARED_LIBS=OFF",
+      "cmake --build llama.cpp/build --config Release -j <measured-cpu-job-cap>",
+      "python3 llama.cpp/convert_hf_to_gguf.py <pinned-source-dir> --outfile <nanbeige4.2-3b-f56ec5a-q8_0.gguf> --outtype q8_0",
+      "llama.cpp/build/bin/llama-cli -m <nanbeige4.2-3b-f56ec5a-q8_0.gguf> -p 'FrankenNLP baseline smoke.' -n 32 --temp 0 --no-warmup"
+    ],
+    "promotion_requirement": "Replace this SKIPPED_NO_MODEL transcript only with a retained CPU-only build, conversion, and 32-token greedy-decode transcript tied to this exact selected revision and model revision."
+  }
+}

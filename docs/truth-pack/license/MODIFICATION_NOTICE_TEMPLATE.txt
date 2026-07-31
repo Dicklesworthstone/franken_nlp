@@ -1,0 +1,3 @@
+FrankenNLP modification notice
+
+This artifact contains a transformed and/or repacked derivative of Nanbeige4.2-3B at revision f56ec5a9650268aa098496734743c25ea778bd2d. FrankenNLP changed the weight representation and packaging for its `.fnlpq` artifact lifecycle. This notice describes FrankenNLP's modifications only; it does not invent an upstream copyright notice.

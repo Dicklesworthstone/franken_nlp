@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "bundle_content_files": [
+    "APACHE-2.0.txt",
+    "ATTRIBUTION.txt",
+    "MODIFICATION_NOTICE_TEMPLATE.txt",
+    "model_card_license_snapshot.json",
+    "upstream_license_notice_absence.json"
+  ],
+  "license_bundle_sha256_algorithm": "SHA-256 over the lexicographically ordered content records: UTF-8 relative filename, NUL, lowercase hexadecimal SHA-256 of the file bytes, LF. This manifest is metadata and is excluded from the content digest to avoid self-reference.",
+  "canonical_apache_license_source": "https://www.apache.org/licenses/LICENSE-2.0.txt",
+  "canonical_apache_license_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+}

@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "model": "Nanbeige4.2-3B",
+  "revision": "f56ec5a9650268aa098496734743c25ea778bd2d",
+  "source_tree_api_url": "https://huggingface.co/api/models/Nanbeige/Nanbeige4.2-3B/tree/f56ec5a9650268aa098496734743c25ea778bd2d?recursive=true&expand=false",
+  "research_manifest_cross_reference": "../nanbeige4.2-3b.source.json",
+  "searched_object_names": [
+    "LICENSE",
+    "LICENSE.md",
+    "LICENSE.txt",
+    "NOTICE",
+    "NOTICE.md",
+    "NOTICE.txt"
+  ],
+  "observed_paths": [
+    ".eval_results/claw-eval.yaml",
+    ".eval_results/gpqa.yaml",
+    ".eval_results/hle.yaml",
+    ".eval_results/hmmt_feb_2026.yaml",
+    ".eval_results/swe-bench_pro.yaml",
+    ".eval_results/swe-bench_verified.yaml",
+    ".eval_results/terminal-bench-2.0.yaml",
+    ".gitattributes",
+    "Nanbeige42_report.pdf",
+    "README.md",
+    "added_tokens.json",
+    "config.json",
+    "configuration_nanbeige.py",
+    "figures/1",
+    "figures/model_performance.png",
+    "figures/nbg.png",
+    "generation_config.json",
+    "model-00001-of-00002.safetensors",
+    "model-00002-of-00002.safetensors",
+    "model.safetensors.index.json",
+    "modeling_nanbeige.py",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer_config.json"
+  ],
+  "conclusion": "No upstream LICENSE or NOTICE object exists in the source tree at this revision. The release bundle therefore carries the exact Apache-2.0 text, factual model-card attribution, and this recorded absence; it does not synthesize an upstream copyright line."
+}

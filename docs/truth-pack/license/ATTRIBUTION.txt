@@ -1,0 +1,1 @@
+model: Nanbeige4.2-3B, revision f56ec5a9650268aa098496734743c25ea778bd2d, author attribution per the pinned card: Nanbeige Team
