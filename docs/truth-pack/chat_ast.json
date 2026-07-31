@@ -1,0 +1,1742 @@
+{
+  "branch_coverage": [
+    {
+      "branch_id": "template-line-4",
+      "mapped_node_ids": [
+        "content.plain_string"
+      ],
+      "source_span": {
+        "end_byte": 70,
+        "end_line": 4,
+        "quoted_template": "    {%- if content is string -%}",
+        "start_byte": 38,
+        "start_line": 4
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-6",
+      "mapped_node_ids": [
+        "content.iterable_parts"
+      ],
+      "source_span": {
+        "end_byte": 157,
+        "end_line": 6,
+        "quoted_template": "    {%- elif content is iterable and content is not mapping -%}",
+        "start_byte": 94,
+        "start_line": 6
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-8",
+      "mapped_node_ids": [
+        "content.part.text"
+      ],
+      "source_span": {
+        "end_byte": 256,
+        "end_line": 8,
+        "quoted_template": "            {%- if item is mapping and item.type == 'text' -%}",
+        "start_byte": 194,
+        "start_line": 8
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-10",
+      "mapped_node_ids": [
+        "content.part.bare_string"
+      ],
+      "source_span": {
+        "end_byte": 329,
+        "end_line": 10,
+        "quoted_template": "            {%- elif item is string -%}",
+        "start_byte": 290,
+        "start_line": 10
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-12",
+      "mapped_node_ids": [
+        "content.part.media"
+      ],
+      "source_span": {
+        "end_byte": 497,
+        "end_line": 12,
+        "quoted_template": "            {%- elif item is mapping and item.type in ['image', 'image_url', 'video', 'video_url', 'audio', 'audio_url', 'input_audio'] -%}",
+        "start_byte": 358,
+        "start_line": 12
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-17",
+      "mapped_node_ids": [
+        "content.other"
+      ],
+      "source_span": {
+        "end_byte": 829,
+        "end_line": 17,
+        "quoted_template": "    {%- else -%}",
+        "start_byte": 813,
+        "start_line": 17
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-24",
+      "mapped_node_ids": [
+        "tools.present"
+      ],
+      "source_span": {
+        "end_byte": 994,
+        "end_line": 24,
+        "quoted_template": "{%- if tools %}",
+        "start_byte": 979,
+        "start_line": 24
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-26",
+      "mapped_node_ids": [
+        "tools.system_present"
+      ],
+      "source_span": {
+        "end_byte": 1110,
+        "end_line": 26,
+        "quoted_template": "    {%- if messages|length > 0 and messages[0].get('role', '') == 'system' %}",
+        "start_byte": 1033,
+        "start_line": 26
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-28",
+      "mapped_node_ids": [
+        "tools.system_default"
+      ],
+      "source_span": {
+        "end_byte": 1185,
+        "end_line": 28,
+        "quoted_template": "    {%- else %} ",
+        "start_byte": 1169,
+        "start_line": 28
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-38",
+      "mapped_node_ids": [
+        "tools.format.json"
+      ],
+      "source_span": {
+        "end_byte": 2088,
+        "end_line": 38,
+        "quoted_template": "    {%- if tool_call_format == 'json' %}",
+        "start_byte": 2048,
+        "start_line": 38
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-41",
+      "mapped_node_ids": [
+        "tools.format.xml"
+      ],
+      "source_span": {
+        "end_byte": 2375,
+        "end_line": 41,
+        "quoted_template": "    {%- else %}",
+        "start_byte": 2360,
+        "start_line": 41
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-57",
+      "mapped_node_ids": [
+        "tools.absent"
+      ],
+      "source_span": {
+        "end_byte": 2807,
+        "end_line": 57,
+        "quoted_template": "{%- else %}",
+        "start_byte": 2796,
+        "start_line": 57
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-58",
+      "mapped_node_ids": [
+        "system.leading"
+      ],
+      "source_span": {
+        "end_byte": 2885,
+        "end_line": 58,
+        "quoted_template": "    {%- if messages|length > 0 and messages[0].get('role', '') == 'system' %}",
+        "start_byte": 2808,
+        "start_line": 58
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-60",
+      "mapped_node_ids": [
+        "system.default"
+      ],
+      "source_span": {
+        "end_byte": 2993,
+        "end_line": 60,
+        "quoted_template": "    {%- else %} ",
+        "start_byte": 2977,
+        "start_line": 60
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-68",
+      "mapped_node_ids": [
+        "tool_history.last_query"
+      ],
+      "source_span": {
+        "end_byte": 3589,
+        "end_line": 68,
+        "quoted_template": "    {%- if ns.multi_step_tool and message.get('role', '') == \"user\" and visible_text(message.content) is string and not(visible_text(message.content).startswith('<tool_response>') and visible_text(message.content).endswith('</tool_response>')) %}",
+        "start_byte": 3343,
+        "start_line": 68
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-75",
+      "mapped_node_ids": [
+        "content.rendered_string"
+      ],
+      "source_span": {
+        "end_byte": 3799,
+        "end_line": 75,
+        "quoted_template": "    {%- if visible_text(message.content) is string %}",
+        "start_byte": 3746,
+        "start_line": 75
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-77",
+      "mapped_node_ids": [
+        "content.rendered_nonstring"
+      ],
+      "source_span": {
+        "end_byte": 3874,
+        "end_line": 77,
+        "quoted_template": "    {%- else %}",
+        "start_byte": 3859,
+        "start_line": 77
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-81",
+      "mapped_node_ids": [
+        "role.system"
+      ],
+      "source_span": {
+        "end_byte": 3978,
+        "end_line": 81,
+        "quoted_template": "    {%- if message.get('role', '') == \"system\" %}",
+        "start_byte": 3929,
+        "start_line": 81
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-82",
+      "mapped_node_ids": [
+        "role.system_nonleading_reject"
+      ],
+      "source_span": {
+        "end_byte": 4011,
+        "end_line": 82,
+        "quoted_template": "        {%- if not loop.first %}",
+        "start_byte": 3979,
+        "start_line": 82
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-86",
+      "mapped_node_ids": [
+        "role.assistant"
+      ],
+      "source_span": {
+        "end_byte": 4175,
+        "end_line": 86,
+        "quoted_template": "    {%- elif message.get('role', '') == \"assistant\" %}",
+        "start_byte": 4121,
+        "start_line": 86
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-88",
+      "mapped_node_ids": [
+        "assistant.reasoning.explicit"
+      ],
+      "source_span": {
+        "end_byte": 4271,
+        "end_line": 88,
+        "quoted_template": "        {%- if message.reasoning_content is string %}",
+        "start_byte": 4218,
+        "start_line": 88
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-90",
+      "mapped_node_ids": [
+        "assistant.reasoning.embedded"
+      ],
+      "source_span": {
+        "end_byte": 4360,
+        "end_line": 90,
+        "quoted_template": "        {%- else %}",
+        "start_byte": 4341,
+        "start_line": 90
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-91",
+      "mapped_node_ids": [
+        "assistant.reasoning.embedded"
+      ],
+      "source_span": {
+        "end_byte": 4404,
+        "end_line": 91,
+        "quoted_template": "            {%- if '</think>' in content %}",
+        "start_byte": 4361,
+        "start_line": 91
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-98",
+      "mapped_node_ids": [
+        "assistant.reasoning.strip_prior"
+      ],
+      "source_span": {
+        "end_byte": 4857,
+        "end_line": 98,
+        "quoted_template": "        {%- if (preserve_thinking is defined and preserve_thinking is false) and (loop.index0 < ns.last_query_index) %}",
+        "start_byte": 4738,
+        "start_line": 98
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-100",
+      "mapped_node_ids": [
+        "assistant.reasoning.preserve"
+      ],
+      "source_span": {
+        "end_byte": 4977,
+        "end_line": 100,
+        "quoted_template": "        {%- else %}",
+        "start_byte": 4958,
+        "start_line": 100
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-104",
+      "mapped_node_ids": [
+        "assistant.tool_calls"
+      ],
+      "source_span": {
+        "end_byte": 5242,
+        "end_line": 104,
+        "quoted_template": "        {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}",
+        "start_byte": 5133,
+        "start_line": 104
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-105",
+      "mapped_node_ids": [
+        "assistant.tool_calls.json"
+      ],
+      "source_span": {
+        "end_byte": 5291,
+        "end_line": 105,
+        "quoted_template": "            {%- if tool_call_format == 'json' %}",
+        "start_byte": 5243,
+        "start_line": 105
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-107",
+      "mapped_node_ids": [
+        "assistant.tool_calls.json_separator"
+      ],
+      "source_span": {
+        "end_byte": 5425,
+        "end_line": 107,
+        "quoted_template": "                    {%- if (loop.first and content) or (not loop.first) %}",
+        "start_byte": 5351,
+        "start_line": 107
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-110",
+      "mapped_node_ids": [
+        "assistant.tool_calls.function_wrapper"
+      ],
+      "source_span": {
+        "end_byte": 5543,
+        "end_line": 110,
+        "quoted_template": "                    {%- if tool_call.function %}",
+        "start_byte": 5495,
+        "start_line": 110
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-116",
+      "mapped_node_ids": [
+        "assistant.tool_calls.arguments_string"
+      ],
+      "source_span": {
+        "end_byte": 5843,
+        "end_line": 116,
+        "quoted_template": "                    {%- if tool_call.arguments is string %}",
+        "start_byte": 5784,
+        "start_line": 116
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-118",
+      "mapped_node_ids": [
+        "assistant.tool_calls.arguments_json"
+      ],
+      "source_span": {
+        "end_byte": 5926,
+        "end_line": 118,
+        "quoted_template": "                    {%- else %}",
+        "start_byte": 5895,
+        "start_line": 118
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-123",
+      "mapped_node_ids": [
+        "assistant.tool_calls.xml"
+      ],
+      "source_span": {
+        "end_byte": 6118,
+        "end_line": 123,
+        "quoted_template": "            {%- else %}",
+        "start_byte": 6095,
+        "start_line": 123
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-125",
+      "mapped_node_ids": [
+        "assistant.tool_calls.xml_function_wrapper"
+      ],
+      "source_span": {
+        "end_byte": 6237,
+        "end_line": 125,
+        "quoted_template": "                    {%- if tool_call.function is defined %}",
+        "start_byte": 6178,
+        "start_line": 125
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-129",
+      "mapped_node_ids": [
+        "assistant.tool_calls.xml_spacing"
+      ],
+      "source_span": {
+        "end_byte": 6398,
+        "end_line": 129,
+        "quoted_template": "                    {%- if loop.first %}",
+        "start_byte": 6358,
+        "start_line": 129
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-130",
+      "mapped_node_ids": [
+        "assistant.tool_calls.xml_nonempty_content"
+      ],
+      "source_span": {
+        "end_byte": 6445,
+        "end_line": 130,
+        "quoted_template": "                        {%- if content|trim %}",
+        "start_byte": 6399,
+        "start_line": 130
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-136",
+      "mapped_node_ids": [
+        "assistant.tool_calls.xml_empty_content"
+      ],
+      "source_span": {
+        "end_byte": 6567,
+        "end_line": 136,
+        "quoted_template": "                        {%- else %}",
+        "start_byte": 6532,
+        "start_line": 136
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-141",
+      "mapped_node_ids": [
+        "assistant.tool_calls.xml_subsequent"
+      ],
+      "source_span": {
+        "end_byte": 6720,
+        "end_line": 141,
+        "quoted_template": "                    {%- else %}",
+        "start_byte": 6689,
+        "start_line": 141
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-148",
+      "mapped_node_ids": [
+        "assistant.tool_calls.xml_arguments"
+      ],
+      "source_span": {
+        "end_byte": 6916,
+        "end_line": 148,
+        "quoted_template": "                    {%- if tool_call.arguments is defined %}",
+        "start_byte": 6856,
+        "start_line": 148
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-166",
+      "mapped_node_ids": [
+        "role.tool"
+      ],
+      "source_span": {
+        "end_byte": 7586,
+        "end_line": 166,
+        "quoted_template": "    {%- elif message.get('role', '') == \"tool\" %}",
+        "start_byte": 7537,
+        "start_line": 166
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-167",
+      "mapped_node_ids": [
+        "tool_results.group_start"
+      ],
+      "source_span": {
+        "end_byte": 7662,
+        "end_line": 167,
+        "quoted_template": "        {%- if loop.previtem and loop.previtem.get('role', '') != \"tool\" %}",
+        "start_byte": 7587,
+        "start_line": 167
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-173",
+      "mapped_node_ids": [
+        "tool_results.group_end"
+      ],
+      "source_span": {
+        "end_byte": 7888,
+        "end_line": 173,
+        "quoted_template": "        {%- if loop.last or loop.nextitem.get('role', '') != \"tool\" %}",
+        "start_byte": 7818,
+        "start_line": 173
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-176",
+      "mapped_node_ids": [
+        "role.generic_nonempty"
+      ],
+      "source_span": {
+        "end_byte": 7989,
+        "end_line": 176,
+        "quoted_template": "    {%- elif message.get('role', '') != '' %}",
+        "start_byte": 7944,
+        "start_line": 176
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-181",
+      "mapped_node_ids": [
+        "generation.suffix"
+      ],
+      "source_span": {
+        "end_byte": 8148,
+        "end_line": 181,
+        "quoted_template": "{%- if add_generation_prompt %}",
+        "start_byte": 8117,
+        "start_line": 181
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-184",
+      "mapped_node_ids": [
+        "generation.thinking_disabled"
+      ],
+      "source_span": {
+        "end_byte": 8260,
+        "end_line": 184,
+        "quoted_template": "    {%- if enable_thinking is defined and enable_thinking is false %}",
+        "start_byte": 8191,
+        "start_line": 184
+      },
+      "status": "covered"
+    },
+    {
+      "branch_id": "template-line-190",
+      "mapped_node_ids": [
+        "generation.thinking_enabled"
+      ],
+      "source_span": {
+        "end_byte": 8313,
+        "end_line": 190,
+        "quoted_template": "    {%- else %}",
+        "start_byte": 8298,
+        "start_line": 190
+      },
+      "status": "covered"
+    }
+  ],
+  "evidence_status": "OBSERVED_PINNED_SOURCE_DIGEST_VERIFIED_REPLAY_PENDING_FETCH_CLOSURE",
+  "exact_literals": {
+    "generation_suffix_enable_thinking_false": "<think>\n\n</think>\n\n",
+    "generation_suffix_enable_thinking_true_or_undefined": "<think>\n",
+    "media_reminder": "<reminder>You are unable to process this {media_type} because you don't have multi-modal input ability. Try different methods.</reminder>",
+    "no_tools_default_system": "你是南北阁，一款由BOSS直聘自主研发并训练的专业大语言模型。",
+    "tool_default_system": "你是一位工具函数调用专家，你会得到一个问题和一组可能的工具函数。根据问题，你需要进行一个或多个函数/工具调用以实现目的，请尽量尝试探索通过工具解决问题。\n如果没有一个函数可以使用，请直接使用自然语言回复用户。\n如果给定的问题缺少函数所需的参数，请使用自然语言进行提问，向用户询问必要信息。\n如果调用结果已经足够回答用户问题，请对历史结果进行总结，使用自然语言回复用户。"
+  },
+  "mode_matrix": [
+    {
+      "content_form": "string",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=on;tools=none;content=string;system=present",
+      "preserve_thinking": true,
+      "system_form": "present",
+      "tool_call_format": "none"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=on;tools=none;content=string;system=absent",
+      "preserve_thinking": true,
+      "system_form": "absent",
+      "tool_call_format": "none"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=on;tools=none;content=string;system=default",
+      "preserve_thinking": true,
+      "system_form": "default",
+      "tool_call_format": "none"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=on;tools=none;content=parts;system=present",
+      "preserve_thinking": true,
+      "system_form": "present",
+      "tool_call_format": "none"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=on;tools=none;content=parts;system=absent",
+      "preserve_thinking": true,
+      "system_form": "absent",
+      "tool_call_format": "none"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=on;tools=none;content=parts;system=default",
+      "preserve_thinking": true,
+      "system_form": "default",
+      "tool_call_format": "none"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=on;tools=xml;content=string;system=present",
+      "preserve_thinking": true,
+      "system_form": "present",
+      "tool_call_format": "xml"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=on;tools=xml;content=string;system=absent",
+      "preserve_thinking": true,
+      "system_form": "absent",
+      "tool_call_format": "xml"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=on;tools=xml;content=string;system=default",
+      "preserve_thinking": true,
+      "system_form": "default",
+      "tool_call_format": "xml"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=on;tools=xml;content=parts;system=present",
+      "preserve_thinking": true,
+      "system_form": "present",
+      "tool_call_format": "xml"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=on;tools=xml;content=parts;system=absent",
+      "preserve_thinking": true,
+      "system_form": "absent",
+      "tool_call_format": "xml"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=on;tools=xml;content=parts;system=default",
+      "preserve_thinking": true,
+      "system_form": "default",
+      "tool_call_format": "xml"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=on;tools=json;content=string;system=present",
+      "preserve_thinking": true,
+      "system_form": "present",
+      "tool_call_format": "json"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=on;tools=json;content=string;system=absent",
+      "preserve_thinking": true,
+      "system_form": "absent",
+      "tool_call_format": "json"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=on;tools=json;content=string;system=default",
+      "preserve_thinking": true,
+      "system_form": "default",
+      "tool_call_format": "json"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=on;tools=json;content=parts;system=present",
+      "preserve_thinking": true,
+      "system_form": "present",
+      "tool_call_format": "json"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=on;tools=json;content=parts;system=absent",
+      "preserve_thinking": true,
+      "system_form": "absent",
+      "tool_call_format": "json"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=on;tools=json;content=parts;system=default",
+      "preserve_thinking": true,
+      "system_form": "default",
+      "tool_call_format": "json"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=off;tools=none;content=string;system=present",
+      "preserve_thinking": false,
+      "system_form": "present",
+      "tool_call_format": "none"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=off;tools=none;content=string;system=absent",
+      "preserve_thinking": false,
+      "system_form": "absent",
+      "tool_call_format": "none"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=off;tools=none;content=string;system=default",
+      "preserve_thinking": false,
+      "system_form": "default",
+      "tool_call_format": "none"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=off;tools=none;content=parts;system=present",
+      "preserve_thinking": false,
+      "system_form": "present",
+      "tool_call_format": "none"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=off;tools=none;content=parts;system=absent",
+      "preserve_thinking": false,
+      "system_form": "absent",
+      "tool_call_format": "none"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=off;tools=none;content=parts;system=default",
+      "preserve_thinking": false,
+      "system_form": "default",
+      "tool_call_format": "none"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=off;tools=xml;content=string;system=present",
+      "preserve_thinking": false,
+      "system_form": "present",
+      "tool_call_format": "xml"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=off;tools=xml;content=string;system=absent",
+      "preserve_thinking": false,
+      "system_form": "absent",
+      "tool_call_format": "xml"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=off;tools=xml;content=string;system=default",
+      "preserve_thinking": false,
+      "system_form": "default",
+      "tool_call_format": "xml"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=off;tools=xml;content=parts;system=present",
+      "preserve_thinking": false,
+      "system_form": "present",
+      "tool_call_format": "xml"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=off;tools=xml;content=parts;system=absent",
+      "preserve_thinking": false,
+      "system_form": "absent",
+      "tool_call_format": "xml"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=off;tools=xml;content=parts;system=default",
+      "preserve_thinking": false,
+      "system_form": "default",
+      "tool_call_format": "xml"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=off;tools=json;content=string;system=present",
+      "preserve_thinking": false,
+      "system_form": "present",
+      "tool_call_format": "json"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=off;tools=json;content=string;system=absent",
+      "preserve_thinking": false,
+      "system_form": "absent",
+      "tool_call_format": "json"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=off;tools=json;content=string;system=default",
+      "preserve_thinking": false,
+      "system_form": "default",
+      "tool_call_format": "json"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=off;tools=json;content=parts;system=present",
+      "preserve_thinking": false,
+      "system_form": "present",
+      "tool_call_format": "json"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=off;tools=json;content=parts;system=absent",
+      "preserve_thinking": false,
+      "system_form": "absent",
+      "tool_call_format": "json"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": true,
+      "id": "thinking=on;preserve=off;tools=json;content=parts;system=default",
+      "preserve_thinking": false,
+      "system_form": "default",
+      "tool_call_format": "json"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=on;tools=none;content=string;system=present",
+      "preserve_thinking": true,
+      "system_form": "present",
+      "tool_call_format": "none"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=on;tools=none;content=string;system=absent",
+      "preserve_thinking": true,
+      "system_form": "absent",
+      "tool_call_format": "none"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=on;tools=none;content=string;system=default",
+      "preserve_thinking": true,
+      "system_form": "default",
+      "tool_call_format": "none"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=on;tools=none;content=parts;system=present",
+      "preserve_thinking": true,
+      "system_form": "present",
+      "tool_call_format": "none"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=on;tools=none;content=parts;system=absent",
+      "preserve_thinking": true,
+      "system_form": "absent",
+      "tool_call_format": "none"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=on;tools=none;content=parts;system=default",
+      "preserve_thinking": true,
+      "system_form": "default",
+      "tool_call_format": "none"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=on;tools=xml;content=string;system=present",
+      "preserve_thinking": true,
+      "system_form": "present",
+      "tool_call_format": "xml"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=on;tools=xml;content=string;system=absent",
+      "preserve_thinking": true,
+      "system_form": "absent",
+      "tool_call_format": "xml"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=on;tools=xml;content=string;system=default",
+      "preserve_thinking": true,
+      "system_form": "default",
+      "tool_call_format": "xml"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=on;tools=xml;content=parts;system=present",
+      "preserve_thinking": true,
+      "system_form": "present",
+      "tool_call_format": "xml"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=on;tools=xml;content=parts;system=absent",
+      "preserve_thinking": true,
+      "system_form": "absent",
+      "tool_call_format": "xml"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=on;tools=xml;content=parts;system=default",
+      "preserve_thinking": true,
+      "system_form": "default",
+      "tool_call_format": "xml"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=on;tools=json;content=string;system=present",
+      "preserve_thinking": true,
+      "system_form": "present",
+      "tool_call_format": "json"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=on;tools=json;content=string;system=absent",
+      "preserve_thinking": true,
+      "system_form": "absent",
+      "tool_call_format": "json"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=on;tools=json;content=string;system=default",
+      "preserve_thinking": true,
+      "system_form": "default",
+      "tool_call_format": "json"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=on;tools=json;content=parts;system=present",
+      "preserve_thinking": true,
+      "system_form": "present",
+      "tool_call_format": "json"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=on;tools=json;content=parts;system=absent",
+      "preserve_thinking": true,
+      "system_form": "absent",
+      "tool_call_format": "json"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=on;tools=json;content=parts;system=default",
+      "preserve_thinking": true,
+      "system_form": "default",
+      "tool_call_format": "json"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=off;tools=none;content=string;system=present",
+      "preserve_thinking": false,
+      "system_form": "present",
+      "tool_call_format": "none"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=off;tools=none;content=string;system=absent",
+      "preserve_thinking": false,
+      "system_form": "absent",
+      "tool_call_format": "none"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=off;tools=none;content=string;system=default",
+      "preserve_thinking": false,
+      "system_form": "default",
+      "tool_call_format": "none"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=off;tools=none;content=parts;system=present",
+      "preserve_thinking": false,
+      "system_form": "present",
+      "tool_call_format": "none"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=off;tools=none;content=parts;system=absent",
+      "preserve_thinking": false,
+      "system_form": "absent",
+      "tool_call_format": "none"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=off;tools=none;content=parts;system=default",
+      "preserve_thinking": false,
+      "system_form": "default",
+      "tool_call_format": "none"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=off;tools=xml;content=string;system=present",
+      "preserve_thinking": false,
+      "system_form": "present",
+      "tool_call_format": "xml"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=off;tools=xml;content=string;system=absent",
+      "preserve_thinking": false,
+      "system_form": "absent",
+      "tool_call_format": "xml"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=off;tools=xml;content=string;system=default",
+      "preserve_thinking": false,
+      "system_form": "default",
+      "tool_call_format": "xml"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=off;tools=xml;content=parts;system=present",
+      "preserve_thinking": false,
+      "system_form": "present",
+      "tool_call_format": "xml"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=off;tools=xml;content=parts;system=absent",
+      "preserve_thinking": false,
+      "system_form": "absent",
+      "tool_call_format": "xml"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=off;tools=xml;content=parts;system=default",
+      "preserve_thinking": false,
+      "system_form": "default",
+      "tool_call_format": "xml"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=off;tools=json;content=string;system=present",
+      "preserve_thinking": false,
+      "system_form": "present",
+      "tool_call_format": "json"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=off;tools=json;content=string;system=absent",
+      "preserve_thinking": false,
+      "system_form": "absent",
+      "tool_call_format": "json"
+    },
+    {
+      "content_form": "string",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=off;tools=json;content=string;system=default",
+      "preserve_thinking": false,
+      "system_form": "default",
+      "tool_call_format": "json"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=off;tools=json;content=parts;system=present",
+      "preserve_thinking": false,
+      "system_form": "present",
+      "tool_call_format": "json"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=off;tools=json;content=parts;system=absent",
+      "preserve_thinking": false,
+      "system_form": "absent",
+      "tool_call_format": "json"
+    },
+    {
+      "content_form": "parts",
+      "enable_thinking": false,
+      "id": "thinking=off;preserve=off;tools=json;content=parts;system=default",
+      "preserve_thinking": false,
+      "system_form": "default",
+      "tool_call_format": "json"
+    }
+  ],
+  "model": {
+    "name": "Nanbeige4.2-3B",
+    "revision": "f56ec5a9650268aa098496734743c25ea778bd2d"
+  },
+  "must_reject_before_tokenization": [
+    {
+      "case": "unknown role",
+      "reason": "Raw template line 176 renders a generic nonempty role; the typed fixed-program adapter must reject it before controls can be emitted.",
+      "source_observation": "raw-template-permissive"
+    },
+    {
+      "case": "unsupported mapping content shape",
+      "reason": "visible_text fallback at line 17 does not define a typed content-part grammar.",
+      "source_observation": "adapter-required"
+    },
+    {
+      "case": "unknown content-part kind",
+      "reason": "Only text, bare string, image/image_url, video/video_url, audio/audio_url, and input_audio have explicit template branches.",
+      "source_observation": "adapter-required"
+    },
+    {
+      "case": "malformed tool-call structure",
+      "reason": "The raw template relies on attribute access and filters; the typed adapter validates function/name/arguments shapes before rendering.",
+      "source_observation": "adapter-required"
+    }
+  ],
+  "nodes": [
+    {
+      "description": "Accept plain string content and render it verbatim.",
+      "id": "content.plain_string",
+      "source_span": {
+        "end_byte": 70,
+        "end_line": 4,
+        "quoted_template": "    {%- if content is string -%}",
+        "start_byte": 38,
+        "start_line": 4
+      }
+    },
+    {
+      "description": "Accept iterable non-mapping content parts.",
+      "id": "content.iterable_parts",
+      "source_span": {
+        "end_byte": 157,
+        "end_line": 6,
+        "quoted_template": "    {%- elif content is iterable and content is not mapping -%}",
+        "start_byte": 94,
+        "start_line": 6
+      }
+    },
+    {
+      "description": "Render mapping text parts from item.text.",
+      "id": "content.part.text",
+      "source_span": {
+        "end_byte": 256,
+        "end_line": 8,
+        "quoted_template": "            {%- if item is mapping and item.type == 'text' -%}",
+        "start_byte": 194,
+        "start_line": 8
+      }
+    },
+    {
+      "description": "Render bare string items in an iterable content value.",
+      "id": "content.part.bare_string",
+      "source_span": {
+        "end_byte": 329,
+        "end_line": 10,
+        "quoted_template": "            {%- elif item is string -%}",
+        "start_byte": 290,
+        "start_line": 10
+      }
+    },
+    {
+      "description": "Replace each accepted media kind with the exact reminder literal.",
+      "id": "content.part.media",
+      "source_span": {
+        "end_byte": 497,
+        "end_line": 12,
+        "quoted_template": "            {%- elif item is mapping and item.type in ['image', 'image_url', 'video', 'video_url', 'audio', 'audio_url', 'input_audio'] -%}",
+        "start_byte": 358,
+        "start_line": 12
+      }
+    },
+    {
+      "description": "The Jinja fallback renders a non-string content value; the typed adapter rejects unsupported shapes before tokenization.",
+      "id": "content.other",
+      "source_span": {
+        "end_byte": 829,
+        "end_line": 17,
+        "quoted_template": "    {%- else -%}",
+        "start_byte": 813,
+        "start_line": 17
+      }
+    },
+    {
+      "description": "Use the tool-special system prelude when tools are supplied.",
+      "id": "tools.present",
+      "source_span": {
+        "end_byte": 994,
+        "end_line": 24,
+        "quoted_template": "{%- if tools %}",
+        "start_byte": 979,
+        "start_line": 24
+      }
+    },
+    {
+      "description": "Use only a leading system message in the tool prelude.",
+      "id": "tools.system_present",
+      "source_span": {
+        "end_byte": 1110,
+        "end_line": 26,
+        "quoted_template": "    {%- if messages|length > 0 and messages[0].get('role', '') == 'system' %}",
+        "start_byte": 1033,
+        "start_line": 26
+      }
+    },
+    {
+      "description": "Use the exact Chinese tool-calling system default when no leading system exists.",
+      "id": "tools.system_default",
+      "source_span": {
+        "end_byte": 1185,
+        "end_line": 28,
+        "quoted_template": "    {%- else %} ",
+        "start_byte": 1169,
+        "start_line": 28
+      }
+    },
+    {
+      "description": "Describe and emit the JSON-in-XML tool-call branch.",
+      "id": "tools.format.json",
+      "source_span": {
+        "end_byte": 2088,
+        "end_line": 38,
+        "quoted_template": "    {%- if tool_call_format == 'json' %}",
+        "start_byte": 2048,
+        "start_line": 38
+      }
+    },
+    {
+      "description": "Describe and emit the XML parameter tool-call branch.",
+      "id": "tools.format.xml",
+      "source_span": {
+        "end_byte": 2375,
+        "end_line": 41,
+        "quoted_template": "    {%- else %}",
+        "start_byte": 2360,
+        "start_line": 41
+      }
+    },
+    {
+      "description": "Use the ordinary system prelude when no tools are supplied.",
+      "id": "tools.absent",
+      "source_span": {
+        "end_byte": 2807,
+        "end_line": 57,
+        "quoted_template": "{%- else %}",
+        "start_byte": 2796,
+        "start_line": 57
+      }
+    },
+    {
+      "description": "Render a first-position system message in the ordinary prelude.",
+      "id": "system.leading",
+      "source_span": {
+        "end_byte": 2885,
+        "end_line": 58,
+        "quoted_template": "    {%- if messages|length > 0 and messages[0].get('role', '') == 'system' %}",
+        "start_byte": 2808,
+        "start_line": 58
+      }
+    },
+    {
+      "description": "Use the exact Nanbeige default system text with no tools.",
+      "id": "system.default",
+      "source_span": {
+        "end_byte": 2993,
+        "end_line": 60,
+        "quoted_template": "    {%- else %} ",
+        "start_byte": 2977,
+        "start_line": 60
+      }
+    },
+    {
+      "description": "Identify the last non-tool-response user query for thinking preservation.",
+      "id": "tool_history.last_query",
+      "source_span": {
+        "end_byte": 3589,
+        "end_line": 68,
+        "quoted_template": "    {%- if ns.multi_step_tool and message.get('role', '') == \"user\" and visible_text(message.content) is string and not(visible_text(message.content).startswith('<tool_response>') and visible_text(message.content).endswith('</tool_response>')) %}",
+        "start_byte": 3343,
+        "start_line": 68
+      }
+    },
+    {
+      "description": "Bind visible content only when visible_text resolves to a string.",
+      "id": "content.rendered_string",
+      "source_span": {
+        "end_byte": 3799,
+        "end_line": 75,
+        "quoted_template": "    {%- if visible_text(message.content) is string %}",
+        "start_byte": 3746,
+        "start_line": 75
+      }
+    },
+    {
+      "description": "Use an empty rendered-content binding for non-string visible content.",
+      "id": "content.rendered_nonstring",
+      "source_span": {
+        "end_byte": 3874,
+        "end_line": 77,
+        "quoted_template": "    {%- else %}",
+        "start_byte": 3859,
+        "start_line": 77
+      }
+    },
+    {
+      "description": "System role is special only at the first message position.",
+      "id": "role.system",
+      "source_span": {
+        "end_byte": 3978,
+        "end_line": 81,
+        "quoted_template": "    {%- if message.get('role', '') == \"system\" %}",
+        "start_byte": 3929,
+        "start_line": 81
+      }
+    },
+    {
+      "description": "Template raises when a system message is not first.",
+      "id": "role.system_nonleading_reject",
+      "source_span": {
+        "end_byte": 4011,
+        "end_line": 82,
+        "quoted_template": "        {%- if not loop.first %}",
+        "start_byte": 3979,
+        "start_line": 82
+      }
+    },
+    {
+      "description": "Assistant messages have thinking and tool-call subtrees.",
+      "id": "role.assistant",
+      "source_span": {
+        "end_byte": 4175,
+        "end_line": 86,
+        "quoted_template": "    {%- elif message.get('role', '') == \"assistant\" %}",
+        "start_byte": 4121,
+        "start_line": 86
+      }
+    },
+    {
+      "description": "Prefer a string reasoning_content field.",
+      "id": "assistant.reasoning.explicit",
+      "source_span": {
+        "end_byte": 4271,
+        "end_line": 88,
+        "quoted_template": "        {%- if message.reasoning_content is string %}",
+        "start_byte": 4218,
+        "start_line": 88
+      }
+    },
+    {
+      "description": "Extract a complete embedded think region when the explicit field is absent.",
+      "id": "assistant.reasoning.embedded",
+      "source_span": {
+        "end_byte": 4404,
+        "end_line": 91,
+        "quoted_template": "            {%- if '</think>' in content %}",
+        "start_byte": 4361,
+        "start_line": 91
+      }
+    },
+    {
+      "description": "Replace prior-turn reasoning with an empty think region when preserve_thinking is false.",
+      "id": "assistant.reasoning.strip_prior",
+      "source_span": {
+        "end_byte": 4857,
+        "end_line": 98,
+        "quoted_template": "        {%- if (preserve_thinking is defined and preserve_thinking is false) and (loop.index0 < ns.last_query_index) %}",
+        "start_byte": 4738,
+        "start_line": 98
+      }
+    },
+    {
+      "description": "Preserve trimmed reasoning when the strip condition does not apply.",
+      "id": "assistant.reasoning.preserve",
+      "source_span": {
+        "end_byte": 4977,
+        "end_line": 100,
+        "quoted_template": "        {%- else %}",
+        "start_byte": 4958,
+        "start_line": 100
+      }
+    },
+    {
+      "description": "Render an iterable non-mapping assistant tool_calls list.",
+      "id": "assistant.tool_calls",
+      "source_span": {
+        "end_byte": 5242,
+        "end_line": 104,
+        "quoted_template": "        {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}",
+        "start_byte": 5133,
+        "start_line": 104
+      }
+    },
+    {
+      "description": "Render JSON tool calls in tool_call XML delimiters.",
+      "id": "assistant.tool_calls.json",
+      "source_span": {
+        "end_byte": 5291,
+        "end_line": 105,
+        "quoted_template": "            {%- if tool_call_format == 'json' %}",
+        "start_byte": 5243,
+        "start_line": 105
+      }
+    },
+    {
+      "description": "Insert JSON-call newlines after visible content and between calls.",
+      "id": "assistant.tool_calls.json_separator",
+      "source_span": {
+        "end_byte": 5425,
+        "end_line": 107,
+        "quoted_template": "                    {%- if (loop.first and content) or (not loop.first) %}",
+        "start_byte": 5351,
+        "start_line": 107
+      }
+    },
+    {
+      "description": "Accept the function wrapper form before serializing a tool call.",
+      "id": "assistant.tool_calls.function_wrapper",
+      "source_span": {
+        "end_byte": 5543,
+        "end_line": 110,
+        "quoted_template": "                    {%- if tool_call.function %}",
+        "start_byte": 5495,
+        "start_line": 110
+      }
+    },
+    {
+      "description": "Preserve string tool-call arguments as supplied.",
+      "id": "assistant.tool_calls.arguments_string",
+      "source_span": {
+        "end_byte": 5843,
+        "end_line": 116,
+        "quoted_template": "                    {%- if tool_call.arguments is string %}",
+        "start_byte": 5784,
+        "start_line": 116
+      }
+    },
+    {
+      "description": "Serialize structured JSON tool-call arguments with tojson.",
+      "id": "assistant.tool_calls.arguments_json",
+      "source_span": {
+        "end_byte": 5926,
+        "end_line": 118,
+        "quoted_template": "                    {%- else %}",
+        "start_byte": 5895,
+        "start_line": 118
+      }
+    },
+    {
+      "description": "Render XML function and parameter tool calls.",
+      "id": "assistant.tool_calls.xml",
+      "source_span": {
+        "end_byte": 6118,
+        "end_line": 123,
+        "quoted_template": "            {%- else %}",
+        "start_byte": 6095,
+        "start_line": 123
+      }
+    },
+    {
+      "description": "Accept the XML branch function wrapper form.",
+      "id": "assistant.tool_calls.xml_function_wrapper",
+      "source_span": {
+        "end_byte": 6237,
+        "end_line": 125,
+        "quoted_template": "                    {%- if tool_call.function is defined %}",
+        "start_byte": 6178,
+        "start_line": 125
+      }
+    },
+    {
+      "description": "Choose first-call spacing based on visible assistant content.",
+      "id": "assistant.tool_calls.xml_spacing",
+      "source_span": {
+        "end_byte": 6398,
+        "end_line": 129,
+        "quoted_template": "                    {%- if loop.first %}",
+        "start_byte": 6358,
+        "start_line": 129
+      }
+    },
+    {
+      "description": "Insert the content-to-tool-call separator only for nonempty content.",
+      "id": "assistant.tool_calls.xml_nonempty_content",
+      "source_span": {
+        "end_byte": 6445,
+        "end_line": 130,
+        "quoted_template": "                        {%- if content|trim %}",
+        "start_byte": 6399,
+        "start_line": 130
+      }
+    },
+    {
+      "description": "Start a first XML tool call without a content separator when content is empty.",
+      "id": "assistant.tool_calls.xml_empty_content",
+      "source_span": {
+        "end_byte": 6567,
+        "end_line": 136,
+        "quoted_template": "                        {%- else %}",
+        "start_byte": 6532,
+        "start_line": 136
+      }
+    },
+    {
+      "description": "Separate every XML tool call after the first.",
+      "id": "assistant.tool_calls.xml_subsequent",
+      "source_span": {
+        "end_byte": 6720,
+        "end_line": 141,
+        "quoted_template": "                    {%- else %}",
+        "start_byte": 6689,
+        "start_line": 141
+      }
+    },
+    {
+      "description": "Iterate named XML parameters when arguments are defined.",
+      "id": "assistant.tool_calls.xml_arguments",
+      "source_span": {
+        "end_byte": 6916,
+        "end_line": 148,
+        "quoted_template": "                    {%- if tool_call.arguments is defined %}",
+        "start_byte": 6856,
+        "start_line": 148
+      }
+    },
+    {
+      "description": "Render tool responses in one user-framed consecutive group.",
+      "id": "role.tool",
+      "source_span": {
+        "end_byte": 7586,
+        "end_line": 166,
+        "quoted_template": "    {%- elif message.get('role', '') == \"tool\" %}",
+        "start_byte": 7537,
+        "start_line": 166
+      }
+    },
+    {
+      "description": "Start a grouped tool-result user frame after a non-tool message.",
+      "id": "tool_results.group_start",
+      "source_span": {
+        "end_byte": 7662,
+        "end_line": 167,
+        "quoted_template": "        {%- if loop.previtem and loop.previtem.get('role', '') != \"tool\" %}",
+        "start_byte": 7587,
+        "start_line": 167
+      }
+    },
+    {
+      "description": "Close the grouped tool-result frame at the last adjacent tool result.",
+      "id": "tool_results.group_end",
+      "source_span": {
+        "end_byte": 7888,
+        "end_line": 173,
+        "quoted_template": "        {%- if loop.last or loop.nextitem.get('role', '') != \"tool\" %}",
+        "start_byte": 7818,
+        "start_line": 173
+      }
+    },
+    {
+      "description": "The raw template renders any other nonempty role; this is an adapter-required rejection boundary, not a raw-template rejection.",
+      "id": "role.generic_nonempty",
+      "source_span": {
+        "end_byte": 7989,
+        "end_line": 176,
+        "quoted_template": "    {%- elif message.get('role', '') != '' %}",
+        "start_byte": 7944,
+        "start_line": 176
+      }
+    },
+    {
+      "description": "Append the assistant generation suffix when requested.",
+      "id": "generation.suffix",
+      "source_span": {
+        "end_byte": 8148,
+        "end_line": 181,
+        "quoted_template": "{%- if add_generation_prompt %}",
+        "start_byte": 8117,
+        "start_line": 181
+      }
+    },
+    {
+      "description": "Append an empty think block when enable_thinking is explicitly false.",
+      "id": "generation.thinking_disabled",
+      "source_span": {
+        "end_byte": 8260,
+        "end_line": 184,
+        "quoted_template": "    {%- if enable_thinking is defined and enable_thinking is false %}",
+        "start_byte": 8191,
+        "start_line": 184
+      }
+    },
+    {
+      "description": "Append an open think tag when thinking is enabled or unspecified.",
+      "id": "generation.thinking_enabled",
+      "source_span": {
+        "end_byte": 8313,
+        "end_line": 190,
+        "quoted_template": "    {%- else %}",
+        "start_byte": 8298,
+        "start_line": 190
+      }
+    }
+  ],
+  "schema_version": 1,
+  "source": {
+    "chat_template_bytes": 8375,
+    "chat_template_json_path": "/chat_template",
+    "chat_template_sha256": "ed118a3c5ddf1d24ffa43229de22bacd5b803be31acaafeb4c0fff0cefee551a",
+    "file": "tokenizer_config.json",
+    "file_bytes": 10990,
+    "file_sha256": "3edfa64a0826a77e9412b9008f1febf3fe906a68fd616b6de4cd15897a8c8518",
+    "replay_requirement": "scripts/fetch_model.sh must acquire and verify the full pinned source closure before any promotion from OBSERVED."
+  }
+}
