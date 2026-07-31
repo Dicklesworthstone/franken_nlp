@@ -68,11 +68,22 @@ if [[ ! -f "${output_path}" || -L "${output_path}" || ! -s "${output_path}" ]]; 
     exit 3
 fi
 
+artifact_bytes=$(wc -c < "${output_path}" | tr -d '[:space:]')
+if command -v sha256sum >/dev/null 2>&1; then
+    artifact_sha256=$(sha256sum "${output_path}" | awk '{print $1}')
+elif command -v shasum >/dev/null 2>&1; then
+    artifact_sha256=$(shasum -a 256 "${output_path}" | awk '{print $1}')
+else
+    log artifact "RESULT=INCOMPLETE reason=missing-sha256-utility"
+    printf 'E2E_SUMMARY RESULT=INCOMPLETE stage=artifact expected=sha256sum-or-shasum actual=unavailable\n' >&2
+    exit 3
+fi
+
 # A successful process exit and a newly created file do not demonstrate that
 # the staged artifact was re-opened, census-checked, or round-tripped.  This
 # driver must stay fail-closed until `fnlp convert` exposes a machine-readable
 # reload-verification receipt that the driver can inspect.
-log artifact "RESULT=CREATED artifact=${output_path}"
+log artifact "RESULT=CREATED artifact=${output_path} bytes=${artifact_bytes} sha256=${artifact_sha256}"
 log reload "RESULT=BLOCKED reason=no-machine-readable-reload-verification-receipt"
-printf 'E2E_SUMMARY RESULT=INCOMPLETE stages=source,convert,artifact,reload expected_payload_bytes=8339601408 output=%s next=add-and-verify-reload-receipt\n' "${output_path}" >&2
+printf 'E2E_SUMMARY RESULT=INCOMPLETE stages=source,convert,artifact,reload expected_payload_bytes=8339601408 output=%s output_bytes=%s output_sha256=%s next=add-and-verify-reload-receipt\n' "${output_path}" "${artifact_bytes}" "${artifact_sha256}" >&2
 exit 3
