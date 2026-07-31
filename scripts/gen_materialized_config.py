@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Generate/check the pinned Nanbeige materialized configuration truth-pack record.
 
 The released config.json is intentionally not treated as complete: this tool
@@ -12,11 +11,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-
 
 MODEL_REVISION = "f56ec5a9650268aa098496734743c25ea778bd2d"
 RAW_CONFIG_BYTES = 1_019
@@ -53,7 +52,7 @@ def normalize_json(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int, str)):
         return value
     if isinstance(value, float):
-        if value != value or value in (float("inf"), float("-inf")):
+        if not math.isfinite(value):
             raise MaterializedConfigError("materialized config contains NaN or infinity")
         return value
     if isinstance(value, (list, tuple)):
@@ -107,7 +106,7 @@ def inactive_finding(
     values = {name: materialized[name] for name in config_fields}
     tensor_matches = index_matches(index_names, tokens)
     config_is_false_or_null = bool(config_fields) and all(
-        value is False or value is None for value in values.values()
+        value is None or (isinstance(value, bool) and not value) for value in values.values()
     )
     return {
         "config_fields": values,
@@ -231,6 +230,7 @@ def load_pinned_configuration(source: Path) -> tuple[dict[str, Any], dict[str, A
     try:
         config = AutoConfig.from_pretrained(
             source,
+            revision=MODEL_REVISION,
             trust_remote_code=True,
             local_files_only=True,
         )
