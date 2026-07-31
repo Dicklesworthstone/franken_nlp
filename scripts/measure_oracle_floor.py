@@ -117,6 +117,18 @@ def require_timestamp(value: object, location: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
+def validate_run_timing(
+    started_at: datetime,
+    ended_at: datetime,
+    preregistration_created_at: datetime,
+    filename: str,
+) -> None:
+    if ended_at < started_at:
+        fail(f"run record {filename}.ended_at precedes started_at")
+    if started_at < preregistration_created_at:
+        fail(f"preregistration ordering failure: {filename} starts before preregistration.json")
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -322,10 +334,7 @@ def load_run(path: Path, preregistration_digest: str, preregistration: dict[str,
     launch_id = require_identifier(record["launch_id"], f"run record {path.name}.launch_id")
     started_at = require_timestamp(record["started_at"], f"run record {path.name}.started_at")
     ended_at = require_timestamp(record["ended_at"], f"run record {path.name}.ended_at")
-    if ended_at < started_at:
-        fail(f"run record {path.name}.ended_at precedes started_at")
-    if started_at < preregistration["created_at"]:
-        fail(f"preregistration ordering failure: {path.name} starts before preregistration.json")
+    validate_run_timing(started_at, ended_at, preregistration["created_at"], path.name)
     if record["profile"] != PROFILE:
         fail(f"run record {path.name}.profile must be {PROFILE}")
     thread_count = record["thread_count"]
@@ -662,8 +671,12 @@ def self_test() -> None:
     out_of_order = [synthetic_run(count, index) for count in (1, 4) for index in range(MINIMUM_PROCESSES)]
     out_of_order[0]["started_at"] = datetime(2026, 7, 30, tzinfo=UTC)
     try:
-        if out_of_order[0]["started_at"] < preregistration["created_at"]:
-            fail("preregistration ordering failure: synthetic-1-0.json starts before preregistration.json")
+        validate_run_timing(
+            out_of_order[0]["started_at"],
+            out_of_order[0]["started_at"],
+            preregistration["created_at"],
+            "synthetic-1-0.json",
+        )
     except FloorError as exc:
         if "preregistration ordering failure" not in str(exc):
             raise
