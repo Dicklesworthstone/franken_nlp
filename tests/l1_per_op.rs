@@ -15,7 +15,8 @@ mod spec_engine;
 
 use std::{
     collections::BTreeSet,
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -496,17 +497,36 @@ fn write_report(rows: Vec<ReportRow>) {
         rows,
     };
     let bytes = serde_json::to_vec_pretty(&report).expect("L1 report must serialize");
-    let path = std::env::var_os("FRANKEN_NLP_L1_REPORT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("franken_nlp_l1_{}.json", std::process::id()))
-        });
-    fs::write(&path, bytes).unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
-    eprintln!(
-        "L1 RESULT=PARTIAL rows={} report={}",
-        report.rows.len(),
-        path.display()
-    );
+    if let Some(path) = std::env::var_os("FRANKEN_NLP_L1_REPORT").map(PathBuf::from) {
+        let mut report_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "create new L1 report {} without replacing an existing artifact: {error}",
+                    path.display()
+                )
+            });
+        report_file
+            .write_all(&bytes)
+            .unwrap_or_else(|error| panic!("write L1 report {}: {error}", path.display()));
+        report_file
+            .sync_all()
+            .unwrap_or_else(|error| panic!("sync L1 report {}: {error}", path.display()));
+        eprintln!(
+            "L1 RESULT=PARTIAL rows={} report={}",
+            report.rows.len(),
+            path.display()
+        );
+    } else {
+        let report_json = String::from_utf8(bytes).expect("serde JSON output must be UTF-8");
+        eprintln!("L1 REPORT={report_json}");
+        eprintln!(
+            "L1 RESULT=PARTIAL rows={} report=stderr-json",
+            report.rows.len()
+        );
+    }
 }
 
 #[test]
