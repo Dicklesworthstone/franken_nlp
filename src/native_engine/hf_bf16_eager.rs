@@ -5,6 +5,12 @@
 //! activations and K/V in bf16 at the named cast boundaries, and exports only
 //! the final untied lm-head logits as f32.
 
+use std::{error::Error, fmt, path::Path};
+
+use crate::artifact::safetensors::{
+    DEFAULT_MAX_RANGE_BYTES, RowPanel, SafetensorDtype, SafetensorsRangeIndex,
+};
+
 use super::{
     attention::{
         AttentionError, KV_HEAD_COUNT, QUERY_HEAD_COUNT, eager_attention_head, kv_head_for_query,
@@ -15,7 +21,7 @@ use super::{
     },
     layer::{
         HfBf16EagerLayerWeights, HfBf16LayerError, NANBEIGE_HIDDEN_SIZE,
-        NANBEIGE_KV_PROJECTION_SIZE, NANBEIGE_Q_PROJECTION_SIZE,
+        NANBEIGE_INTERMEDIATE_SIZE, NANBEIGE_KV_PROJECTION_SIZE, NANBEIGE_Q_PROJECTION_SIZE,
     },
     lmhead::{NANBEIGE_VOCAB_SIZE, export_logits_f32, greedy_argmax},
     looprun::{LayerBinding, LayerExecutor, LoopRunner, PositionContext},
@@ -27,6 +33,61 @@ use super::{
 
 /// The execution-identity label selected by this exact cast schedule.
 pub const HF_BF16_EAGER_PROFILE: &str = "hf-bf16-eager";
+
+/// A refusal while materializing the explicit test/oracle source closure.
+///
+/// Production activation remains artifact-led; this source loader exists only
+/// for the model-gated `hf-bf16-eager` conformance route and is never reached
+/// from the CLI or ordinary model activation path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HfBf16EagerSourceError {
+    /// The pinned source closure failed authenticated range-index construction.
+    SourceClosure { detail: String },
+    /// A named source tensor was absent or disagreed with its fixed bf16 shape.
+    TensorContract { tensor: String, detail: String },
+    /// A bounded, authenticated source panel could not be read.
+    TensorRead { tensor: String, detail: String },
+    /// A source tensor could not form its declared row-major matrix.
+    TensorMatrix { tensor: String, detail: String },
+    /// The assembled tensors failed the eager engine's one-model validation.
+    ModelContract { detail: String },
+}
+
+impl fmt::Display for HfBf16EagerSourceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SourceClosure { detail } => {
+                write!(formatter, "hf-bf16 eager source closure rejected: {detail}")
+            }
+            Self::TensorContract { tensor, detail } => {
+                write!(
+                    formatter,
+                    "hf-bf16 eager source tensor {tensor} rejected: {detail}"
+                )
+            }
+            Self::TensorRead { tensor, detail } => {
+                write!(
+                    formatter,
+                    "hf-bf16 eager source tensor {tensor} unreadable: {detail}"
+                )
+            }
+            Self::TensorMatrix { tensor, detail } => {
+                write!(
+                    formatter,
+                    "hf-bf16 eager source tensor {tensor} has invalid matrix: {detail}"
+                )
+            }
+            Self::ModelContract { detail } => {
+                write!(
+                    formatter,
+                    "hf-bf16 eager assembled model rejected: {detail}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for HfBf16EagerSourceError {}
 
 /// Shape-checked bf16 model tensors used by the eager semantic oracle.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -146,6 +207,62 @@ impl From<RopeError> for HfBf16EagerError {
 }
 
 impl HfBf16EagerWeights {
+    /// Materialize the authenticated pinned source closure for the
+    /// model-gated semantic-oracle route.
+    ///
+    /// This intentionally reads one bounded row panel at a time: the source
+    /// index verifies the complete closure before exposing a byte range, and
+    /// this adapter never maps a shard or opens an unchecked tensor path.
+    pub fn from_pinned_source(
+        source_dir: impl AsRef<Path>,
+    ) -> Result<Self, HfBf16EagerSourceError> {
+        let source =
+            SafetensorsRangeIndex::open_pinned_nanbeige42(source_dir).map_err(|error| {
+                HfBf16EagerSourceError::SourceClosure {
+                    detail: error.to_string(),
+                }
+            })?;
+        let embeddings = read_pinned_matrix(
+            &source,
+            "model.embed_tokens.weight",
+            NANBEIGE_VOCAB_SIZE,
+            NANBEIGE_HIDDEN_SIZE,
+        )?;
+        let final_norm = read_pinned_vector(&source, "model.norm.weight", NANBEIGE_HIDDEN_SIZE)?;
+        let lm_head = read_pinned_matrix(
+            &source,
+            "lm_head.weight",
+            NANBEIGE_VOCAB_SIZE,
+            NANBEIGE_HIDDEN_SIZE,
+        )?;
+        let layer_values = (0..PHYSICAL_LAYER_COUNT)
+            .map(|layer_index| read_pinned_layer(&source, layer_index))
+            .collect::<Result<Vec<_>, _>>()?;
+        let layers =
+            layer_values
+                .try_into()
+                .map_err(|observed: Vec<HfBf16EagerLayerWeights>| {
+                    HfBf16EagerSourceError::ModelContract {
+                        detail: format!(
+                            "expected {PHYSICAL_LAYER_COUNT} physical layers, materialized {}",
+                            observed.len()
+                        ),
+                    }
+                })?;
+        let weights = Self {
+            embeddings,
+            layers,
+            final_norm,
+            lm_head,
+        };
+        weights
+            .validate()
+            .map_err(|error| HfBf16EagerSourceError::ModelContract {
+                detail: format!("{error:?}"),
+            })?;
+        Ok(weights)
+    }
+
     fn validate(&self) -> Result<(), HfBf16EagerError> {
         validate_matrix(
             "embeddings",
@@ -170,6 +287,232 @@ impl HfBf16EagerWeights {
             NANBEIGE_HIDDEN_SIZE,
         )
     }
+}
+
+fn read_pinned_layer(
+    source: &SafetensorsRangeIndex,
+    layer_index: usize,
+) -> Result<HfBf16EagerLayerWeights, HfBf16EagerSourceError> {
+    let prefix = format!("model.layers.{layer_index}");
+    Ok(HfBf16EagerLayerWeights {
+        input_norm: read_pinned_vector(
+            source,
+            &format!("{prefix}.input_layernorm.weight"),
+            NANBEIGE_HIDDEN_SIZE,
+        )?,
+        q_proj: read_pinned_matrix(
+            source,
+            &format!("{prefix}.self_attn.q_proj.weight"),
+            NANBEIGE_Q_PROJECTION_SIZE,
+            NANBEIGE_HIDDEN_SIZE,
+        )?,
+        k_proj: read_pinned_matrix(
+            source,
+            &format!("{prefix}.self_attn.k_proj.weight"),
+            NANBEIGE_KV_PROJECTION_SIZE,
+            NANBEIGE_HIDDEN_SIZE,
+        )?,
+        v_proj: read_pinned_matrix(
+            source,
+            &format!("{prefix}.self_attn.v_proj.weight"),
+            NANBEIGE_KV_PROJECTION_SIZE,
+            NANBEIGE_HIDDEN_SIZE,
+        )?,
+        o_proj: read_pinned_matrix(
+            source,
+            &format!("{prefix}.self_attn.o_proj.weight"),
+            NANBEIGE_HIDDEN_SIZE,
+            NANBEIGE_Q_PROJECTION_SIZE,
+        )?,
+        post_attention_norm: read_pinned_vector(
+            source,
+            &format!("{prefix}.post_attention_layernorm.weight"),
+            NANBEIGE_HIDDEN_SIZE,
+        )?,
+        gate_proj: read_pinned_matrix(
+            source,
+            &format!("{prefix}.mlp.gate_proj.weight"),
+            NANBEIGE_INTERMEDIATE_SIZE,
+            NANBEIGE_HIDDEN_SIZE,
+        )?,
+        up_proj: read_pinned_matrix(
+            source,
+            &format!("{prefix}.mlp.up_proj.weight"),
+            NANBEIGE_INTERMEDIATE_SIZE,
+            NANBEIGE_HIDDEN_SIZE,
+        )?,
+        down_proj: read_pinned_matrix(
+            source,
+            &format!("{prefix}.mlp.down_proj.weight"),
+            NANBEIGE_HIDDEN_SIZE,
+            NANBEIGE_INTERMEDIATE_SIZE,
+        )?,
+    })
+}
+
+fn read_pinned_vector(
+    source: &SafetensorsRangeIndex,
+    tensor: &str,
+    length: usize,
+) -> Result<Vec<Bf16>, HfBf16EagerSourceError> {
+    check_pinned_tensor(source, tensor, &[length])?;
+    let bytes = source
+        .read_range(tensor, RowPanel::WholeTensor)
+        .map_err(|error| HfBf16EagerSourceError::TensorRead {
+            tensor: tensor.to_owned(),
+            detail: error.to_string(),
+        })?;
+    let mut values = Vec::with_capacity(length);
+    append_bf16_values(tensor, &mut values, &bytes, length)?;
+    Ok(values)
+}
+
+fn read_pinned_matrix(
+    source: &SafetensorsRangeIndex,
+    tensor: &str,
+    rows: usize,
+    columns: usize,
+) -> Result<Bf16Matrix, HfBf16EagerSourceError> {
+    check_pinned_tensor(source, tensor, &[rows, columns])?;
+    let expected_values =
+        rows.checked_mul(columns)
+            .ok_or_else(|| HfBf16EagerSourceError::TensorContract {
+                tensor: tensor.to_owned(),
+                detail: "matrix element count overflowed usize".to_owned(),
+            })?;
+    let row_bytes = columns
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| HfBf16EagerSourceError::TensorContract {
+            tensor: tensor.to_owned(),
+            detail: "matrix row byte count overflowed usize".to_owned(),
+        })?;
+    let panel_cap = usize::try_from(DEFAULT_MAX_RANGE_BYTES).map_err(|_| {
+        HfBf16EagerSourceError::TensorContract {
+            tensor: tensor.to_owned(),
+            detail: "bounded source panel cap does not fit usize".to_owned(),
+        }
+    })?;
+    let rows_per_panel = panel_cap / row_bytes;
+    if rows_per_panel == 0 {
+        return Err(HfBf16EagerSourceError::TensorContract {
+            tensor: tensor.to_owned(),
+            detail: format!(
+                "one {row_bytes}-byte row exceeds bounded source panel cap {panel_cap}"
+            ),
+        });
+    }
+
+    let mut values = Vec::with_capacity(expected_values);
+    let mut start_row = 0_usize;
+    while start_row < rows {
+        let row_count = rows_per_panel.min(rows - start_row);
+        let source_start =
+            u64::try_from(start_row).map_err(|_| HfBf16EagerSourceError::TensorContract {
+                tensor: tensor.to_owned(),
+                detail: "row start does not fit source range index".to_owned(),
+            })?;
+        let source_count =
+            u64::try_from(row_count).map_err(|_| HfBf16EagerSourceError::TensorContract {
+                tensor: tensor.to_owned(),
+                detail: "row count does not fit source range index".to_owned(),
+            })?;
+        let bytes = source
+            .read_range(
+                tensor,
+                RowPanel::Rows {
+                    start_row: source_start,
+                    row_count: source_count,
+                },
+            )
+            .map_err(|error| HfBf16EagerSourceError::TensorRead {
+                tensor: tensor.to_owned(),
+                detail: error.to_string(),
+            })?;
+        append_bf16_values(tensor, &mut values, &bytes, row_count * columns)?;
+        start_row += row_count;
+    }
+    Bf16Matrix::new(rows, columns, values).map_err(|error| HfBf16EagerSourceError::TensorMatrix {
+        tensor: tensor.to_owned(),
+        detail: format!("{error:?}"),
+    })
+}
+
+fn check_pinned_tensor(
+    source: &SafetensorsRangeIndex,
+    tensor: &str,
+    expected_shape: &[usize],
+) -> Result<(), HfBf16EagerSourceError> {
+    let expected_shape = expected_shape
+        .iter()
+        .copied()
+        .map(u64::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| HfBf16EagerSourceError::TensorContract {
+            tensor: tensor.to_owned(),
+            detail: "expected shape does not fit source index dimensions".to_owned(),
+        })?;
+    let expected_values = expected_shape
+        .iter()
+        .try_fold(1_u64, |total, dimension| total.checked_mul(*dimension));
+    let expected_bytes = expected_values
+        .and_then(|values| values.checked_mul(SafetensorDtype::Bf16.byte_width()))
+        .ok_or_else(|| HfBf16EagerSourceError::TensorContract {
+            tensor: tensor.to_owned(),
+            detail: "expected bf16 byte count overflowed u64".to_owned(),
+        })?;
+    let observed = source
+        .census()
+        .into_iter()
+        .find(|entry| entry.name == tensor)
+        .ok_or_else(|| HfBf16EagerSourceError::TensorContract {
+            tensor: tensor.to_owned(),
+            detail: "tensor is absent from the verified source census".to_owned(),
+        })?;
+    if observed.dtype != SafetensorDtype::Bf16
+        || observed.shape != expected_shape
+        || observed.len != expected_bytes
+    {
+        return Err(HfBf16EagerSourceError::TensorContract {
+            tensor: tensor.to_owned(),
+            detail: format!(
+                "expected dtype={} shape={expected_shape:?} bytes={expected_bytes}; observed dtype={} shape={:?} bytes={}",
+                SafetensorDtype::Bf16.as_str(),
+                observed.dtype.as_str(),
+                observed.shape,
+                observed.len,
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn append_bf16_values(
+    tensor: &str,
+    destination: &mut Vec<Bf16>,
+    bytes: &[u8],
+    expected_values: usize,
+) -> Result<(), HfBf16EagerSourceError> {
+    let expected_bytes = expected_values
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| HfBf16EagerSourceError::TensorRead {
+            tensor: tensor.to_owned(),
+            detail: "expected bf16 panel byte count overflowed usize".to_owned(),
+        })?;
+    if bytes.len() != expected_bytes {
+        return Err(HfBf16EagerSourceError::TensorRead {
+            tensor: tensor.to_owned(),
+            detail: format!(
+                "expected {expected_bytes} bytes for {expected_values} bf16 values, read {}",
+                bytes.len()
+            ),
+        });
+    }
+    destination.extend(
+        bytes
+            .chunks_exact(std::mem::size_of::<u16>())
+            .map(|pair| Bf16::from_bits(u16::from_le_bytes([pair[0], pair[1]]))),
+    );
+    Ok(())
 }
 
 /// The one-model eager semantic reference engine.

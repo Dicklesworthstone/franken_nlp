@@ -12,7 +12,8 @@ use franken_nlp::native_engine::{
         eager_attention_head, kv_head_for_query, softmax_f32_cast_back,
     },
     hf_bf16_eager::{
-        HF_BF16_EAGER_PROFILE, HfBf16EagerEngine, HfBf16EagerError, HfBf16EagerWeights,
+        HF_BF16_EAGER_PROFILE, HfBf16EagerEngine, HfBf16EagerError, HfBf16EagerSourceError,
+        HfBf16EagerWeights,
     },
     layer::{
         HfBf16EagerLayerWeights, NANBEIGE_HIDDEN_SIZE, NANBEIGE_INTERMEDIATE_SIZE,
@@ -461,4 +462,16 @@ fn bf16_eager_engine_refuses_a_non_nanbeige_model_before_cache_allocation() {
         }
     ));
     assert_eq!(HF_BF16_EAGER_PROFILE, "hf-bf16-eager");
+}
+
+#[test]
+fn bf16_eager_source_loader_refuses_an_unverified_source_root() {
+    let missing_source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/reference/absent-pinned-source-closure");
+    let error = HfBf16EagerWeights::from_pinned_source(missing_source)
+        .expect_err("the source loader must authenticate the complete pinned closure first");
+    assert!(matches!(
+        error,
+        HfBf16EagerSourceError::SourceClosure { .. }
+    ));
 }
