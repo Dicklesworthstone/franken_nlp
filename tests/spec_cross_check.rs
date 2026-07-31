@@ -13,6 +13,7 @@ use spec_engine::{
     rms_norm,
 };
 
+#[allow(dead_code)]
 #[derive(Debug)]
 enum CrossCheckError {
     Kv(KvCacheError),
@@ -97,7 +98,9 @@ fn runner_schedule_and_boundary_norm_match_independent_scalar_spec() {
     weights.embeddings.set(1, 1, 4.0).expect("row write");
     let spec = SpecEngine::new(config.clone(), weights).expect("tiny spec model is valid");
     let mut spec_cache = SpecKvCache::new(&config);
-    let expected = spec.decode(1, &mut spec_cache).expect("scalar forward succeeds");
+    let expected = spec
+        .decode(1, &mut spec_cache)
+        .expect("scalar forward succeeds");
 
     static PHYSICAL_WEIGHTS: [(); PHYSICAL_LAYERS] = [(); PHYSICAL_LAYERS];
     let runner = LoopRunner::from_layer_weights(&PHYSICAL_WEIGHTS);
