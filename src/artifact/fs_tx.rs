@@ -14,6 +14,14 @@ use sha2::{Digest, Sha256};
 /// Domain framing prepended to every activation-record body before hashing.
 pub const ACTIVATION_RECORD_DOMAIN: &[u8] = b"fnlp-activation-v1";
 const BODY_FORMAT_VERSION: u8 = 1;
+const ACTIVATION_DIGEST_BYTES: usize = 32;
+const BODY_FIXED_PREFIX_BYTES: usize = 1 + 8 + (3 * ACTIVATION_DIGEST_BYTES);
+const BODY_PREVIOUS_FLAG_OFFSET: usize = BODY_FIXED_PREFIX_BYTES;
+const BODY_WITHOUT_PREVIOUS_BYTES: usize = BODY_FIXED_PREFIX_BYTES + 1;
+const BODY_WITH_PREVIOUS_BYTES: usize = BODY_WITHOUT_PREVIOUS_BYTES + ACTIVATION_DIGEST_BYTES;
+const ENVELOPE_WITHOUT_PREVIOUS_BYTES: usize =
+    BODY_WITHOUT_PREVIOUS_BYTES + ACTIVATION_DIGEST_BYTES;
+const ENVELOPE_WITH_PREVIOUS_BYTES: usize = BODY_WITH_PREVIOUS_BYTES + ACTIVATION_DIGEST_BYTES;
 
 /// Fixed-width SHA-256 identity used by activation records and filenames.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -156,7 +164,7 @@ impl ActivationRecordBody {
     /// cannot be confused by JSON escaping or map ordering.
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(1 + 8 + 32 * 5 + 1);
+        let mut bytes = Vec::with_capacity(BODY_WITH_PREVIOUS_BYTES);
         bytes.push(BODY_FORMAT_VERSION);
         bytes.extend_from_slice(&self.sequence.to_be_bytes());
         bytes.extend_from_slice(&self.artifact_digest.0);
@@ -217,6 +225,83 @@ impl ActivationRecord {
         envelope.extend_from_slice(&body);
         envelope.extend_from_slice(&self.record_digest.0);
         envelope
+    }
+
+    /// Parses one exact canonical envelope and authenticates its body digest.
+    ///
+    /// This is deliberately stricter than [`Self::from_retained_parts`]: a
+    /// retained byte stream must use the current fixed-width format, have no
+    /// trailing bytes, and carry the domain-separated digest for the decoded
+    /// body before recovery may consider it. Chain continuity remains the
+    /// separate authority of [`discover_activation`].
+    pub fn parse_canonical_envelope(envelope: &[u8]) -> Result<Self, FsTxError> {
+        let Some(&version) = envelope.first() else {
+            return Err(FsTxError::EnvelopeLength {
+                observed: envelope.len(),
+            });
+        };
+        if version != BODY_FORMAT_VERSION {
+            return Err(FsTxError::EnvelopeVersion { observed: version });
+        }
+        if envelope.len() < BODY_WITHOUT_PREVIOUS_BYTES {
+            return Err(FsTxError::EnvelopeLength {
+                observed: envelope.len(),
+            });
+        }
+
+        let expected_length = match envelope[BODY_PREVIOUS_FLAG_OFFSET] {
+            0 => ENVELOPE_WITHOUT_PREVIOUS_BYTES,
+            1 => ENVELOPE_WITH_PREVIOUS_BYTES,
+            observed => return Err(FsTxError::EnvelopePreviousFlag { observed }),
+        };
+        if envelope.len() != expected_length {
+            return Err(FsTxError::EnvelopeLength {
+                observed: envelope.len(),
+            });
+        }
+
+        let mut offset = 1;
+        let mut sequence_bytes = [0_u8; 8];
+        let sequence_len = sequence_bytes.len();
+        sequence_bytes.copy_from_slice(&envelope[offset..offset + sequence_len]);
+        let sequence = u64::from_be_bytes(sequence_bytes);
+        offset += sequence_len;
+
+        let artifact_digest =
+            digest_from_fixed_bytes(&envelope[offset..offset + ACTIVATION_DIGEST_BYTES]);
+        offset += ACTIVATION_DIGEST_BYTES;
+        let native_digest =
+            digest_from_fixed_bytes(&envelope[offset..offset + ACTIVATION_DIGEST_BYTES]);
+        offset += ACTIVATION_DIGEST_BYTES;
+        let config_digest =
+            digest_from_fixed_bytes(&envelope[offset..offset + ACTIVATION_DIGEST_BYTES]);
+        offset += ACTIVATION_DIGEST_BYTES;
+
+        let previous_record_digest = match envelope[offset] {
+            0 => None,
+            1 => {
+                offset += 1;
+                Some(digest_from_fixed_bytes(
+                    &envelope[offset..offset + ACTIVATION_DIGEST_BYTES],
+                ))
+            }
+            observed => return Err(FsTxError::EnvelopePreviousFlag { observed }),
+        };
+        let body = ActivationRecordBody::from_retained_parts(
+            sequence,
+            artifact_digest,
+            native_digest,
+            config_digest,
+            previous_record_digest,
+        );
+        let record_digest = digest_from_fixed_bytes(
+            &envelope[expected_length - ACTIVATION_DIGEST_BYTES..expected_length],
+        );
+        let record = Self::from_retained_parts(body, record_digest);
+        if !record.digest_is_valid() {
+            return Err(FsTxError::EnvelopeDigestMismatch);
+        }
+        Ok(record)
     }
 
     /// The destination basename for a `create_new` staged envelope after its
@@ -310,6 +395,14 @@ pub enum FsTxError {
     SequenceOverflow,
     /// A final immutable filename was already retained and cannot be reopened.
     FinalNameExists { filename: String },
+    /// A retained envelope did not have one exact supported fixed width.
+    EnvelopeLength { observed: usize },
+    /// A retained envelope named an unsupported body format version.
+    EnvelopeVersion { observed: u8 },
+    /// A retained envelope used a non-canonical previous-record flag.
+    EnvelopePreviousFlag { observed: u8 },
+    /// A retained envelope body and its claimed record digest did not match.
+    EnvelopeDigestMismatch,
     /// Two valid successors exist; recovery retains the previous head and never
     /// selects a winner by digest or filename order.
     ActivationFork {
@@ -337,6 +430,21 @@ impl fmt::Display for FsTxError {
                     formatter,
                     "FS_TXN refused: immutable final already exists {filename}"
                 )
+            }
+            Self::EnvelopeLength { observed } => write!(
+                formatter,
+                "FS_TXN refused: canonical activation envelope length {observed} is unsupported"
+            ),
+            Self::EnvelopeVersion { observed } => write!(
+                formatter,
+                "FS_TXN refused: canonical activation envelope version {observed} is unsupported"
+            ),
+            Self::EnvelopePreviousFlag { observed } => write!(
+                formatter,
+                "FS_TXN refused: canonical activation envelope previous flag {observed} is invalid"
+            ),
+            Self::EnvelopeDigestMismatch => {
+                formatter.write_str("FS_TXN refused: canonical activation envelope digest mismatch")
             }
             Self::ActivationFork {
                 last_unambiguous,
@@ -632,4 +740,10 @@ fn digest_record_body(body: &ActivationRecordBody) -> ActivationDigest {
     hasher.update(ACTIVATION_RECORD_DOMAIN);
     hasher.update(body.canonical_bytes());
     ActivationDigest(hasher.finalize().into())
+}
+
+fn digest_from_fixed_bytes(bytes: &[u8]) -> ActivationDigest {
+    let mut digest = [0_u8; ACTIVATION_DIGEST_BYTES];
+    digest.copy_from_slice(bytes);
+    ActivationDigest::from_bytes(digest)
 }
