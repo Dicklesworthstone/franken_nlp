@@ -92,8 +92,13 @@ fn no_measurement_is_explicit_conservative_scalar_default() {
 
 #[test]
 fn forced_unsupported_tier_fails_before_selection() {
-    let dispatcher = Dispatcher::new(x86((false, false, false, false, false)), DispatchTable::default());
-    let error = dispatcher.select(key(), Some(KernelTier::X2AvxVnni)).unwrap_err();
+    let dispatcher = Dispatcher::new(
+        x86((false, false, false, false, false)),
+        DispatchTable::default(),
+    );
+    let error = dispatcher
+        .select(key(), Some(KernelTier::X2AvxVnni))
+        .unwrap_err();
     assert_eq!(
         error,
         DispatchError::ForcedTierUnavailable {
@@ -105,7 +110,10 @@ fn forced_unsupported_tier_fails_before_selection() {
 
 #[test]
 fn forced_detected_unimplemented_tier_fails_without_entering_a_kernel() {
-    let dispatcher = Dispatcher::new(x86((true, false, false, false, false)), DispatchTable::default());
+    let dispatcher = Dispatcher::new(
+        x86((true, false, false, false, false)),
+        DispatchTable::default(),
+    );
     assert_eq!(
         dispatcher
             .select(key(), Some(KernelTier::X3aAvx2Low7HighBit))
@@ -171,7 +179,10 @@ fn malformed_duplicate_and_unknown_table_rows_reject_cleanly() {
 
 #[test]
 fn entry_points_execute_the_scalar_floor_and_keep_the_selection() {
-    let dispatcher = Dispatcher::new(x86((false, false, false, false, false)), DispatchTable::default());
+    let dispatcher = Dispatcher::new(
+        x86((false, false, false, false, false)),
+        DispatchTable::default(),
+    );
     let gemm = dispatcher
         .int8_gemm(
             &[1, 2, 3, 4],
@@ -187,13 +198,7 @@ fn entry_points_execute_the_scalar_floor_and_keep_the_selection() {
     assert_eq!(gemm.selection.tier, KernelTier::Scalar);
 
     let gemv = dispatcher
-        .int8_gemv(
-            &[1, 2],
-            &[3, 4, -5, 6],
-            2,
-            DispatchRegime::DecodeGemv,
-            None,
-        )
+        .int8_gemv(&[1, 2], &[3, 4, -5, 6], 2, DispatchRegime::DecodeGemv, None)
         .unwrap();
     assert_eq!(gemv.output, vec![11, 7]);
 
@@ -214,13 +219,15 @@ fn host_report_covers_every_fixed_shape_regime_and_tier() {
     let report = host_backend_report();
     assert_eq!(report.registry.len(), KernelTier::ALL.len());
     assert_eq!(report.selections.len(), 3 * 3 * 3 * 5);
-    assert!(report
-        .selections
-        .iter()
-        .all(|selection| selection.tier == KernelTier::Scalar));
+    assert!(
+        report
+            .selections
+            .iter()
+            .all(|selection| selection.tier == KernelTier::Scalar)
+    );
     assert!(report.selections.iter().all(|selection| {
         matches!(
-            selection.provenance,
+            &selection.provenance,
             SelectionProvenance::ConservativeDefault { .. }
         )
     }));

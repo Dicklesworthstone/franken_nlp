@@ -3,6 +3,7 @@
 pub mod attention;
 pub mod batchsched;
 pub mod decode;
+pub mod dispatch;
 pub mod int8;
 pub mod kv;
 pub mod layer;

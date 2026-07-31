@@ -223,7 +223,9 @@ impl KernelTier {
     #[must_use]
     pub const fn is_detected(self, features: DetectedFeatures) -> bool {
         match self {
-            Self::A1Smmla => features.architecture == Architecture::Aarch64 && features.aarch64_i8mm,
+            Self::A1Smmla => {
+                features.architecture == Architecture::Aarch64 && features.aarch64_i8mm
+            }
             Self::A2Dotprod => {
                 features.architecture == Architecture::Aarch64 && features.aarch64_dotprod
             }
@@ -239,7 +241,9 @@ impl KernelTier {
                     && features.x86_avx512vnni
                     && features.x86_avx512vl
             }
-            Self::X2AvxVnni => features.architecture == Architecture::X86_64 && features.x86_avxvnni,
+            Self::X2AvxVnni => {
+                features.architecture == Architecture::X86_64 && features.x86_avxvnni
+            }
             Self::X3aAvx2Low7HighBit | Self::X3bAvx2WidenedI16 => {
                 features.architecture == Architecture::X86_64 && features.x86_avx2
             }
@@ -409,8 +413,9 @@ impl DispatchTable {
     /// Parse a strict JSON table.  Serde rejects duplicate struct fields and
     /// `deny_unknown_fields` rejects accidental schema expansion.
     pub fn from_json(source: &str) -> Result<Self, DispatchError> {
-        let rows = serde_json::from_str(source)
-            .map_err(|error| DispatchError::CorruptTable { detail: error.to_string() })?;
+        let rows = serde_json::from_str(source).map_err(|error| DispatchError::CorruptTable {
+            detail: error.to_string(),
+        })?;
         Self::from_rows(rows)
     }
 
@@ -455,14 +460,22 @@ pub struct DispatchSelection {
 /// fail before an executor could reach an ISA-specific function.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DispatchError {
-    CorruptTable { detail: String },
-    DuplicateTableKey { key: DispatchKey },
+    CorruptTable {
+        detail: String,
+    },
+    DuplicateTableKey {
+        key: DispatchKey,
+    },
     ForcedTierUnavailable {
         requested: KernelTier,
         detected: Vec<KernelTier>,
     },
-    ForcedTierUnimplemented { requested: KernelTier },
-    InvalidMeasurement { detail: String },
+    ForcedTierUnimplemented {
+        requested: KernelTier,
+    },
+    InvalidMeasurement {
+        detail: String,
+    },
     ScalarKernel(Int8KernelError),
 }
 
@@ -471,14 +484,22 @@ impl fmt::Display for DispatchError {
         match self {
             Self::CorruptTable { detail } => write!(formatter, "corrupt dispatch table: {detail}"),
             Self::DuplicateTableKey { key } => write!(formatter, "duplicate dispatch key: {key:?}"),
-            Self::ForcedTierUnavailable { requested, detected } => write!(
+            Self::ForcedTierUnavailable {
+                requested,
+                detected,
+            } => write!(
                 formatter,
                 "forced tier {requested} is not OS-detected; detected candidates={detected:?}"
             ),
             Self::ForcedTierUnimplemented { requested } => {
-                write!(formatter, "forced tier {requested} has no registered kernel implementation")
+                write!(
+                    formatter,
+                    "forced tier {requested} has no registered kernel implementation"
+                )
             }
-            Self::InvalidMeasurement { detail } => write!(formatter, "invalid measured dispatch row: {detail}"),
+            Self::InvalidMeasurement { detail } => {
+                write!(formatter, "invalid measured dispatch row: {detail}")
+            }
             Self::ScalarKernel(error) => error.fmt(formatter),
         }
     }
@@ -593,7 +614,11 @@ impl Dispatcher {
         let key = DispatchKey::new(
             KernelOperation::Int8Gemv,
             regime,
-            KernelShape { k: input.len(), m: 1, n },
+            KernelShape {
+                k: input.len(),
+                m: 1,
+                n,
+            },
         );
         let selection = self.select(key, forced)?;
         let output = int8::gemv_s8s8(input, weights, n)?;
@@ -612,7 +637,11 @@ impl Dispatcher {
         let key = DispatchKey::new(
             KernelOperation::Int4Gemv,
             regime,
-            KernelShape { k: input.len(), m: 1, n },
+            KernelShape {
+                k: input.len(),
+                m: 1,
+                n,
+            },
         );
         let selection = self.select(key, forced)?;
         let output = int8::gemv_int4_s8(input, packed_weights, n)?;
@@ -748,7 +777,8 @@ fn validate_row(row: &DispatchRow) -> Result<(), DispatchError> {
                 .any(|prior| prior.tier == candidate.tier)
         {
             return Err(DispatchError::InvalidMeasurement {
-                detail: "losing candidate tiers must be unique and differ from selected tier".to_owned(),
+                detail: "losing candidate tiers must be unique and differ from selected tier"
+                    .to_owned(),
             });
         }
     }
