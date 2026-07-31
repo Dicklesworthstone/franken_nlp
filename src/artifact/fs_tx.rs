@@ -7,13 +7,7 @@
 //! checks.  The canonical journal core is fully implemented here so a future
 //! ratified handle has one recovery authority to call.
 
-use std::{
-    cell::Cell,
-    collections::{BTreeMap, BTreeSet},
-    error::Error,
-    fmt,
-    path::Path,
-};
+use std::{cell::Cell, collections::BTreeSet, error::Error, fmt, path::Path};
 
 use sha2::{Digest, Sha256};
 
@@ -162,7 +156,7 @@ impl ActivationRecordBody {
     /// cannot be confused by JSON escaping or map ordering.
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(1 + 8 + 32 * 4 + 1);
+        let mut bytes = Vec::with_capacity(1 + 8 + 32 * 5 + 1);
         bytes.push(BODY_FORMAT_VERSION);
         bytes.extend_from_slice(&self.sequence.to_be_bytes());
         bytes.extend_from_slice(&self.artifact_digest.0);
@@ -329,14 +323,20 @@ impl fmt::Display for FsTxError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::PlatformSurfaceUnavailable { surface } => {
-                write!(formatter, "FS_TXN refused: unratified platform surface {surface}")
+                write!(
+                    formatter,
+                    "FS_TXN refused: unratified platform surface {surface}"
+                )
             }
             Self::LockReentrant => formatter.write_str("FS_TXN refused: content lock re-entry"),
             Self::SequenceOverflow => {
                 formatter.write_str("FS_TXN refused: activation sequence overflow")
             }
             Self::FinalNameExists { filename } => {
-                write!(formatter, "FS_TXN refused: immutable final already exists {filename}")
+                write!(
+                    formatter,
+                    "FS_TXN refused: immutable final already exists {filename}"
+                )
             }
             Self::ActivationFork {
                 last_unambiguous,
@@ -476,9 +476,7 @@ impl Drop for ContentLockGuard<'_> {
 /// Recomputes every digest and follows only the one unique contiguous chain
 /// from a valid sequence-zero genesis record. Invalid, staged/torn, gapped, and
 /// disconnected records never become an active head.
-pub fn discover_activation(
-    records: &[ActivationRecord],
-) -> Result<ActivationDiscovery, FsTxError> {
+pub fn discover_activation(records: &[ActivationRecord]) -> Result<ActivationDiscovery, FsTxError> {
     let mut valid = Vec::new();
     let mut walk = Vec::with_capacity(records.len());
     for record in records {
@@ -496,9 +494,7 @@ pub fn discover_activation(
     let mut genesis = valid
         .iter()
         .copied()
-        .filter(|record| {
-            record.body.sequence == 0 && record.body.previous_record_digest.is_none()
-        })
+        .filter(|record| record.body.sequence == 0 && record.body.previous_record_digest.is_none())
         .collect::<Vec<_>>();
     genesis.sort_by_key(|record| record.record_digest);
     if genesis.len() > 1 {
@@ -531,9 +527,10 @@ pub fn discover_activation(
         let next_sequence = match current.body.sequence.checked_add(1) {
             Some(sequence) => sequence,
             None => {
-                if valid.iter().any(|record| {
-                    record.body.previous_record_digest == Some(current.record_digest)
-                }) {
+                if valid
+                    .iter()
+                    .any(|record| record.body.previous_record_digest == Some(current.record_digest))
+                {
                     return Err(FsTxError::SequenceOverflow);
                 }
                 break;
@@ -607,11 +604,11 @@ pub fn discover_activation(
     })
 }
 
-fn append_disconnected_walk_entries(
-    valid: &[&ActivationRecord],
-    walk: &mut Vec<ChainWalkEntry>,
-) {
-    let existing = walk.iter().map(|entry| entry.digest).collect::<BTreeSet<_>>();
+fn append_disconnected_walk_entries(valid: &[&ActivationRecord], walk: &mut Vec<ChainWalkEntry>) {
+    let existing = walk
+        .iter()
+        .map(|entry| entry.digest)
+        .collect::<BTreeSet<_>>();
     for record in valid {
         if !existing.contains(&record.record_digest) {
             walk.push(ChainWalkEntry {

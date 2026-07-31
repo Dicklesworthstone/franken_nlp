@@ -22,7 +22,19 @@ fn log_walk(case: &str, result: &str, journal: &SimulatedActivationJournal) {
                     entry.sequence, entry.digest, entry.verdict
                 );
             }
-            eprintln!("FS_TXN case={case} RESULT={result} head={:?}", discovery.head.map(|head| head.sequence()));
+            eprintln!(
+                "FS_TXN case={case} RESULT={result} head={:?}",
+                discovery.head.map(|head| head.sequence())
+            );
+        }
+        Err(FsTxError::ActivationFork { walk, .. }) => {
+            for entry in &walk {
+                eprintln!(
+                    "FS_TXN case={case} sequence={} digest={} verdict={:?}",
+                    entry.sequence, entry.digest, entry.verdict
+                );
+            }
+            eprintln!("FS_TXN case={case} RESULT={result} error=ActivationFork");
         }
         Err(error) => eprintln!("FS_TXN case={case} RESULT={result} error={error}"),
     }
@@ -42,14 +54,25 @@ fn canonical_body_domain_digest_and_append_only_chain_are_locked() {
     assert_eq!(record.record_digest(), expected);
     assert!(record.digest_is_valid());
     assert!(record.final_filename().starts_with("00000000000000000000-"));
-    assert!(record.canonical_envelope_bytes().ends_with(&record.record_digest().as_bytes()));
+    assert!(
+        record
+            .canonical_envelope_bytes()
+            .ends_with(&record.record_digest().as_bytes())
+    );
 
     let mut journal = SimulatedActivationJournal::new();
     let first = journal.append(digest(1), digest(2), digest(3)).unwrap();
     let rollback = journal.append(digest(4), digest(5), digest(6)).unwrap();
     let activate = journal.append(digest(1), digest(2), digest(3)).unwrap();
-    assert_eq!([first.sequence(), rollback.sequence(), activate.sequence()], [0, 1, 2]);
-    assert_eq!(journal.records().len(), 3, "activate/rollback append, never overwrite");
+    assert_eq!(
+        [first.sequence(), rollback.sequence(), activate.sequence()],
+        [0, 1, 2]
+    );
+    assert_eq!(
+        journal.records().len(),
+        3,
+        "activate/rollback append, never overwrite"
+    );
     let discovery = journal.discover().unwrap();
     assert_eq!(discovery.head.as_ref().map(|head| head.sequence()), Some(2));
     assert_eq!(
@@ -76,7 +99,9 @@ fn forged_successors_raise_activation_fork_and_retain_last_unambiguous_head() {
     journal.retain_recovery_fixture(first).unwrap();
     journal.retain_recovery_fixture(second).unwrap();
 
-    let error = journal.discover().expect_err("two successors must never be ordered into a winner");
+    let error = journal
+        .discover()
+        .expect_err("two successors must never be ordered into a winner");
     match error {
         FsTxError::ActivationFork {
             last_unambiguous,
@@ -85,11 +110,18 @@ fn forged_successors_raise_activation_fork_and_retain_last_unambiguous_head() {
         } => {
             assert_eq!(last_unambiguous.map(|head| head.sequence()), Some(0));
             assert_eq!(successor_digests.len(), 2);
-            assert!(walk.iter().any(|entry| entry.verdict == ChainWalkVerdict::ForkSuccessor));
+            assert!(
+                walk.iter()
+                    .any(|entry| entry.verdict == ChainWalkVerdict::ForkSuccessor)
+            );
         }
         other => panic!("expected ActivationFork, observed {other:?}"),
     }
-    assert_eq!(journal.records().len(), 3, "fork evidence remains retained for forensics");
+    assert_eq!(
+        journal.records().len(),
+        3,
+        "fork evidence remains retained for forensics"
+    );
     log_walk("forged-valid-successors", "FORK", &journal);
 }
 
@@ -104,12 +136,44 @@ fn torn_gapped_and_disconnected_records_never_become_active() {
         valid_successor.body().clone(),
         ActivationDigest::from_bytes([0xff; 32]),
     );
-    let disconnected = ActivationRecord::new(ActivationRecordBody::genesis(digest(7), digest(8), digest(9)));
+    let disconnected = ActivationRecord::new(ActivationRecordBody::genesis(
+        digest(7),
+        digest(8),
+        digest(9),
+    ));
     journal.retain_recovery_fixture(torn).unwrap();
     journal.retain_recovery_fixture(disconnected).unwrap();
 
-    let discovery = journal.discover().expect_err("two valid genesis records are an explicit fork");
-    assert!(matches!(discovery, FsTxError::ActivationFork { last_unambiguous: None, .. }));
+    let discovery = journal
+        .discover()
+        .expect_err("two valid genesis records are an explicit fork");
+    assert!(matches!(
+        discovery,
+        FsTxError::ActivationFork {
+            last_unambiguous: None,
+            ..
+        }
+    ));
+
+    let gapped = ActivationRecord::new(ActivationRecordBody::from_retained_parts(
+        7,
+        digest(10),
+        digest(11),
+        digest(12),
+        Some(genesis.digest()),
+    ));
+    let gapped_discovery = discover_activation(&[genesis.record.clone(), gapped]).unwrap();
+    assert_eq!(
+        gapped_discovery.head.as_ref().map(|head| head.sequence()),
+        Some(0),
+        "a sequence gap is disconnected, never a promoted head"
+    );
+    assert!(
+        gapped_discovery
+            .walk
+            .iter()
+            .any(|entry| entry.verdict == ChainWalkVerdict::IgnoredDisconnected)
+    );
 
     let only_torn = vec![ActivationRecord::from_retained_parts(
         valid_successor.body().clone(),
@@ -117,7 +181,10 @@ fn torn_gapped_and_disconnected_records_never_become_active() {
     )];
     let empty = discover_activation(&only_torn).unwrap();
     assert_eq!(empty.head, None);
-    assert_eq!(empty.walk[0].verdict, ChainWalkVerdict::IgnoredDigestMismatch);
+    assert_eq!(
+        empty.walk[0].verdict,
+        ChainWalkVerdict::IgnoredDigestMismatch
+    );
     eprintln!("FS_TXN case=torn-gapped-disconnected RESULT=PASS head=none");
 }
 
