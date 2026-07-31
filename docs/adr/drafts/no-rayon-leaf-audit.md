@@ -143,10 +143,28 @@ artifacts and checks:
 | `scripts/check.sh` | Enforces the no-Rayon assertion; the dependency-policy known-blocked entry is deleted rather than suppressed. |
 | Pin closure audit | `SUITE.lock`, `SUITE_ROOT_PATCHES.lock`, `Cargo.lock`, and `cargo metadata` agree at the selected revision and patch closure. |
 
-No Cargo graph claim is made in this document: FrankenNLP has no crate scaffold
-or `Cargo.toml` at the time of this audit, and the required lock tooling is
-blocked on `franken_nlp-b2p`. This is a precise implementation handoff, not a
-substitute for those gates.
+## Reconciliation snapshot — 2026-07-31
+
+The Phase-0 crate scaffold and `franken_nlp-b2p` lock tooling are now present,
+so the earlier pre-scaffold wording is superseded. The implementation gate is
+still blocked at the source boundary, not at the lock-tooling boundary:
+
+- `/dp/frankentorch` remains at
+  `523aaf827faf538aa541126ee222fcd7af348410`; it contains none of the required
+  no-Rayon leaf/range symbols or a `rayon-runtime` feature split.
+- FrankenNLP's `frankentorch-leaves` feature still selects
+  `ft-kernel-cpu`; the committed lock record for that package lists `rayon`.
+  This is static lock evidence only, not a substitute for the required release
+  feature-graph proof.
+- `SUITE_ROOT_PATCHES.lock` records the reviewed `block` patch closure, but
+  the root `Cargo.toml` has no matching `[patch.crates-io]` entry. The pin
+  closure gate therefore cannot pass yet.
+
+No Cargo command was run for this reconciliation. Until a reviewed upstream
+pin exposes the required leaf surface and the root patch/feature closure is
+materialized, `xmx` has no honest `READY-TO-CLOSE` state. This audit remains a
+precise implementation handoff, not a substitute for the no-spawn and
+release-graph gates.
 
 ## Implementation handoff
 
