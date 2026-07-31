@@ -7,9 +7,18 @@
 //! malformed lengths, conflicting singular fields, and data beyond a nested
 //! message boundary are errors.
 //!
-//! The limits below are part of the parser contract and fuzz target: no varint
-//! exceeds ten bytes, messages never exceed [`MAX_MESSAGE_NESTING`], and no
-//! untrusted length can reserve memory before its checked allocation charge.
+//! The limits below are part of the parser contract and fuzz target:
+//! [`MAX_VARINT_BYTES`], [`MAX_MESSAGE_NESTING`], [`MAX_PIECE_COUNT`],
+//! [`MAX_PIECE_STRING_BYTES`], [`MAX_TOTAL_INPUT_BYTES`], and
+//! [`MAX_TOTAL_ALLOCATION_BYTES`]. No untrusted length can reserve memory
+//! before its checked incremental allocation charge.
+//!
+//! Rejections are typed and fail closed: unterminated, overlong, or overflowing
+//! varints; overflowing or out-of-bounds lengths; truncated nested messages or
+//! malformed trailing keys; conflicting singular fields; invalid UTF-8 piece
+//! text; unsupported protobuf groups; invalid enum/int32 values; non-BPE
+//! trainer specs; and non-identity normalizers. No rejected parse exposes
+//! partially built tokenizer state.
 
 use std::{error::Error, fmt, mem::size_of};
 
