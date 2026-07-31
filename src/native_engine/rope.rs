@@ -13,7 +13,10 @@ pub enum RopeError {
     /// Split-half rotation requires an even head dimension.
     OddHeadDimension { head_dim: usize },
     /// The requested position was not precomputed into the f32 table.
-    PositionOutOfRange { position: usize, table_positions: usize },
+    PositionOutOfRange {
+        position: usize,
+        table_positions: usize,
+    },
     /// Q or K did not have the table's exact head dimension.
     ActivationLength { expected: usize, actual: usize },
 }
@@ -30,7 +33,7 @@ pub struct RopeTablesF32 {
 impl RopeTablesF32 {
     /// Builds f32 tables for an explicit even head dimension and θ.
     pub fn new(positions: usize, head_dim: usize, theta: f32) -> Result<Self, RopeError> {
-        if !head_dim.is_multiple_of(2) {
+        if head_dim % 2 != 0 {
             return Err(RopeError::OddHeadDimension { head_dim });
         }
         let half_dim = head_dim / 2;
@@ -58,7 +61,11 @@ impl RopeTablesF32 {
     }
 
     /// Applies split-half RoPE in f32 then casts the Q/K activation back to bf16.
-    pub fn apply_split_half(&self, position: usize, activation: &mut [Bf16]) -> Result<(), RopeError> {
+    pub fn apply_split_half(
+        &self,
+        position: usize,
+        activation: &mut [Bf16],
+    ) -> Result<(), RopeError> {
         if activation.len() != self.head_dim {
             return Err(RopeError::ActivationLength {
                 expected: self.head_dim,

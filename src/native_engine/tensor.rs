@@ -24,7 +24,7 @@ impl Bf16 {
     /// Widens a bfloat16 value exactly into f32.
     #[must_use]
     pub const fn to_f32(self) -> f32 {
-        f32::from_bits(u32::from(self.0) << 16)
+        f32::from_bits((self.0 as u32) << 16)
     }
 
     /// Rounds f32 to bfloat16 using round-to-nearest, ties-to-even.
