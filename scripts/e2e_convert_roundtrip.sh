@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Model-gated converter round-trip driver.  It intentionally never downloads,
-# creates, replaces, or removes model/artifact files.
+# Model-gated converter round-trip driver. It intentionally never downloads or
+# mutates the source closure, and it refuses an existing artifact destination
+# before delegating exclusive creation to `fnlp convert`.
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -22,6 +23,18 @@ fi
 if [[ -z "${output_path}" ]]; then
     log invocation "RESULT=FAIL reason=missing-output-path expected=second-argument-or-FNLP_CONVERT_OUTPUT"
     printf 'E2E_SUMMARY RESULT=FAIL stage=invocation expected=output-path actual=empty\n' >&2
+    exit 2
+fi
+
+if [[ ! -f "${source_manifest}" ]]; then
+    log preflight "RESULT=FAIL reason=missing-source-manifest expected=regular-file actual=${source_manifest}"
+    printf 'E2E_SUMMARY RESULT=FAIL stage=preflight expected=regular-source-manifest actual=%s\n' "${source_manifest}" >&2
+    exit 2
+fi
+
+if [[ -e "${output_path}" || -L "${output_path}" ]]; then
+    log preflight "RESULT=FAIL reason=output-already-exists expected=nonexistent-create-new-destination actual=${output_path}"
+    printf 'E2E_SUMMARY RESULT=FAIL stage=preflight expected=nonexistent-output actual=%s\n' "${output_path}" >&2
     exit 2
 fi
 
