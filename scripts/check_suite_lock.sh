@@ -1,0 +1,413 @@
+#!/bin/sh
+# Generate and verify the committed FrankenSuite pin and root-patch closure.
+#
+# A dependency repository's root [patch] table is not inherited by a consumer.
+# This tool makes that closure explicit, refusing a missing, stale, or extra
+# root mirror. It never records a local path: local source inspection is
+# allowed only through an untracked, reviewed-HEAD override file.
+
+set -u
+
+PROGRAM=${0##*/}
+MANIFEST=${SUITE_MANIFEST:-Cargo.toml}
+LOCK_FILE=${SUITE_LOCK_FILE:-SUITE.lock}
+PATCH_LOCK_FILE=${SUITE_ROOT_PATCHES_LOCK_FILE:-SUITE_ROOT_PATCHES.lock}
+CARGO_LOCK=${SUITE_CARGO_LOCK_FILE:-Cargo.lock}
+OVERRIDE_FILE=${SUITE_OVERRIDE_FILE:-.suite.override}
+MODE=check
+SKIP_CARGO=0
+OVERRIDE_EXPLICIT=0
+OVERRIDE_FRANKENTORCH=
+
+usage() {
+    cat >&2 <<'EOF'
+Usage: scripts/check_suite_lock.sh [--check|--generate] [--override FILE] [--skip-cargo]
+
+--check       Verify committed SUITE.lock, SUITE_ROOT_PATCHES.lock, the root
+              Cargo.toml patch mirror, Cargo metadata/tree, and Cargo.lock.
+              This is the default mode.
+--generate    Regenerate both lock files from Cargo.toml and an untracked
+              reviewed-HEAD override. It writes only SUITE.lock and
+              SUITE_ROOT_PATCHES.lock.
+--override    Untracked file containing `suite|absolute-path` rows. The only
+              currently required source row for generation is `frankentorch`.
+--skip-cargo  Run manifest/lock/patch structural checks only. This is intended
+              for the pre-scaffold handoff; CI must not use it.
+
+Every invocation emits `SUITE_LOCK RESULT=PASS|FAIL drift=<summary>`.
+EOF
+}
+
+log() {
+    printf '%s SUITE_LOCK %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2
+}
+
+finish() {
+    code=$1
+    if [ "$code" -eq 0 ]; then
+        result=PASS
+    else
+        result=FAIL
+    fi
+    printf '%s SUITE_LOCK RESULT=%s drift=%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$result" "$DRIFT" >&2
+    exit "$code"
+}
+
+fail() {
+    DRIFT=$1
+    shift
+    log "CHECK=FAIL drift=$DRIFT detail=$*"
+    finish 1
+}
+
+require_regular() {
+    [ -f "$1" ] && [ ! -L "$1" ] || fail "missing-or-nonregular" "path=$1"
+}
+
+toml_attr() {
+    line=$1
+    key=$2
+    printf '%s\n' "$line" | sed -n "s/.*$key[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p"
+}
+
+dependency_line() {
+    name=$1
+    awk -v target="$name" '
+        $0 ~ "^[[:space:]]*" target "[[:space:]]*=" { print; exit }
+    ' "$MANIFEST"
+}
+
+feature_line() {
+    name=$1
+    awk -v target="$name" '
+        /^[[:space:]]*\[features\][[:space:]]*$/ { in_features = 1; next }
+        in_features && /^[[:space:]]*\[/ { exit }
+        in_features && $0 ~ "^[[:space:]]*" target "[[:space:]]*=" { print; exit }
+    ' "$MANIFEST"
+}
+
+feature_selects_dependency() {
+    feature=$1
+    dependency=$2
+    line=$(feature_line "$feature")
+    case "$line" in
+        *"dep:$dependency"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+dependency_features() {
+    line=$1
+    value=$(printf '%s\n' "$line" | sed -n 's/.*features[[:space:]]*=[[:space:]]*\[\([^]]*\)\].*/\1/p')
+    if [ -z "$value" ]; then
+        printf '%s\n' none
+    else
+        printf '%s\n' "$value" | tr -d '[:space:]",'
+    fi
+}
+
+assert_dependency_shape() {
+    dependency=$1
+    package=$2
+    consumer_feature=$3
+    expected_features=$4
+    line=$(dependency_line "$dependency")
+    [ -n "$line" ] || fail "dependency-missing" "dependency=$dependency"
+
+    url=$(toml_attr "$line" git)
+    rev=$(toml_attr "$line" rev)
+    observed_package=$(toml_attr "$line" package)
+    if [ -z "$observed_package" ]; then
+        observed_package=$dependency
+    fi
+    observed_features=$(dependency_features "$line")
+    case "$line" in *'optional = true'*) ;; *) fail "dependency-not-optional" "dependency=$dependency" ;; esac
+    [ -n "$url" ] || fail "dependency-source-missing" "dependency=$dependency field=git"
+    [ -n "$rev" ] || fail "dependency-source-missing" "dependency=$dependency field=rev"
+    [ "$observed_package" = "$package" ] || fail "dependency-package-drift" "dependency=$dependency expected=$package observed=${observed_package:-none}"
+    [ "$observed_features" = "$expected_features" ] || fail "dependency-feature-drift" "dependency=$dependency expected=$expected_features observed=$observed_features"
+    feature_selects_dependency "$consumer_feature" "$dependency" || fail "consumer-feature-drift" "feature=$consumer_feature dependency=$dependency"
+}
+
+emit_dependency() {
+    dependency=$1
+    package=$2
+    consumer_feature=$3
+    expected_features=$4
+    assert_dependency_shape "$dependency" "$package" "$consumer_feature" "$expected_features"
+    line=$(dependency_line "$dependency")
+    url=$(toml_attr "$line" git)
+    rev=$(toml_attr "$line" rev)
+    printf 'dependency|%s|%s|git|%s|%s|optional|%s|%s\n' \
+        "$dependency" "$package" "$url" "$rev" "$consumer_feature" "$expected_features"
+}
+
+emit_suite_lock() {
+    printf '%s\n' '# Generated by scripts/check_suite_lock.sh --generate. Do not edit.'
+    printf '%s\n' 'format|1'
+    emit_dependency asupersync asupersync asupersync-runtime tls-webpki-roots
+    emit_dependency ft-core ft-core frankentorch-leaves none
+    emit_dependency ft-kernel-cpu ft-kernel-cpu frankentorch-leaves none
+    emit_dependency ft-serialize ft-serialize frankentorch-leaves none
+    emit_dependency fsqlite fsqlite metadata-store none
+    emit_dependency fsqlite-types fsqlite-types metadata-store none
+}
+
+patch_line() {
+    name=$1
+    manifest=$2
+    awk -v target="$name" '
+        /^[[:space:]]*\[patch\.crates-io\][[:space:]]*$/ { in_patch = 1; next }
+        in_patch && /^[[:space:]]*\[/ { exit }
+        in_patch && $0 ~ "^[[:space:]]*" target "[[:space:]]*=" { print; exit }
+    ' "$manifest"
+}
+
+patch_names() {
+    manifest=$1
+    awk '
+        /^[[:space:]]*\[patch\.crates-io\][[:space:]]*$/ { in_patch = 1; next }
+        in_patch && /^[[:space:]]*\[/ { exit }
+        in_patch && /^[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=/ {
+            line = $0
+            sub(/^[[:space:]]*/, "", line)
+            sub(/[[:space:]]*=.*/, "", line)
+            print line
+        }
+    ' "$manifest"
+}
+
+frankentorch_source() {
+    line=$(dependency_line ft-core)
+    toml_attr "$line" git
+}
+
+frankentorch_revision() {
+    line=$(dependency_line ft-core)
+    toml_attr "$line" rev
+}
+
+emit_patch_lock() {
+    source_root=$1
+    source_manifest=$source_root/Cargo.toml
+    require_regular "$source_manifest"
+    feature_selects_dependency frankentorch-leaves ft-core || fail "patch-relevance-unselected" "feature=frankentorch-leaves dependency=ft-core"
+    feature_selects_dependency frankentorch-leaves ft-kernel-cpu || fail "patch-relevance-unselected" "feature=frankentorch-leaves dependency=ft-kernel-cpu"
+    feature_selects_dependency frankentorch-leaves ft-serialize || fail "patch-relevance-unselected" "feature=frankentorch-leaves dependency=ft-serialize"
+    source_line=$(patch_line block "$source_manifest")
+    [ -n "$source_line" ] || fail "source-patch-missing" "suite=frankentorch patch=block"
+    patch_url=$(toml_attr "$source_line" git)
+    patch_rev=$(toml_attr "$source_line" rev)
+    [ -n "$patch_url" ] || fail "source-patch-malformed" "suite=frankentorch patch=block field=git"
+    [ -n "$patch_rev" ] || fail "source-patch-malformed" "suite=frankentorch patch=block field=rev"
+    printf '%s\n' '# Generated by scripts/check_suite_lock.sh --generate. Do not edit.'
+    printf '%s\n' 'format|1'
+    printf 'patch|frankentorch|git|%s|%s|patch.crates-io|block|git|%s|%s|frankentorch-leaves\n' \
+        "$(frankentorch_source)" "$(frankentorch_revision)" "$patch_url" "$patch_rev"
+}
+
+check_lock_no_local_paths() {
+    lock=$1
+    require_regular "$lock"
+    if grep -nE '(^|[|=])(/|~|file://)' "$lock" >/dev/null 2>&1; then
+        grep -nE '(^|[|=])(/|~|file://)' "$lock" >&2
+        fail "committed-local-path" "lock=$lock"
+    fi
+}
+
+check_suite_lock() {
+    require_regular "$LOCK_FILE"
+    check_lock_no_local_paths "$LOCK_FILE"
+    tmp=$(mktemp "${TMPDIR:-/tmp}/fnlp-suite-lock.expected.XXXXXX") || fail "temp-create" "kind=suite-lock"
+    if ! emit_suite_lock > "$tmp"; then
+        fail "suite-lock-generation" "temporary=$tmp"
+    fi
+    if ! cmp -s "$tmp" "$LOCK_FILE"; then
+        diff -u "$LOCK_FILE" "$tmp" >&2 || true
+        fail "suite-lock-drift" "lock=$LOCK_FILE"
+    fi
+    log "FEATURE_GRAPH RESULT=COMPUTED consumer_features=asupersync-runtime,frankentorch-leaves,metadata-store dependencies=asupersync,ft-core,ft-kernel-cpu,ft-serialize,fsqlite,fsqlite-types"
+}
+
+patch_lock_record() {
+    require_regular "$PATCH_LOCK_FILE"
+    awk -F '|' '
+        $1 == "patch" && $2 == "frankentorch" && $6 == "patch.crates-io" && $7 == "block" { print }
+    ' "$PATCH_LOCK_FILE"
+}
+
+check_patch_lock_shape() {
+    check_lock_no_local_paths "$PATCH_LOCK_FILE"
+    record=$(patch_lock_record)
+    count=$(printf '%s\n' "$record" | awk 'NF { count += 1 } END { print count + 0 }')
+    [ "$count" -eq 1 ] || fail "patch-lock-cardinality" "expected=1 observed=$count"
+    fields=$(printf '%s\n' "$record" | awk -F '|' '{ print NF }')
+    [ "$fields" -eq 11 ] || fail "patch-lock-malformed" "expected_fields=11 observed=$fields"
+    printf '%s\n' "$record" | awk -F '|' '
+        $3 != "git" || $8 != "git" || $11 != "frankentorch-leaves" { exit 1 }
+    ' || fail "patch-lock-malformed" "record=$record"
+}
+
+check_root_patch_mirror() {
+    record=$(patch_lock_record)
+    expected_suite_url=$(printf '%s\n' "$record" | awk -F '|' '{ print $4 }')
+    expected_suite_rev=$(printf '%s\n' "$record" | awk -F '|' '{ print $5 }')
+    expected_url=$(printf '%s\n' "$record" | awk -F '|' '{ print $9 }')
+    expected_rev=$(printf '%s\n' "$record" | awk -F '|' '{ print $10 }')
+    [ "$expected_suite_url" = "$(frankentorch_source)" ] || fail "suite-source-drift" "suite=frankentorch expected=$expected_suite_url observed=$(frankentorch_source)"
+    [ "$expected_suite_rev" = "$(frankentorch_revision)" ] || fail "suite-revision-drift" "suite=frankentorch expected=$expected_suite_rev observed=$(frankentorch_revision)"
+
+    line=$(patch_line block "$MANIFEST")
+    [ -n "$line" ] || fail "required-root-patch-missing" "patch=block expected_git=$expected_url expected_rev=$expected_rev"
+    observed_url=$(toml_attr "$line" git)
+    observed_rev=$(toml_attr "$line" rev)
+    [ "$observed_url" = "$expected_url" ] || fail "root-patch-source-drift" "patch=block expected=$expected_url observed=${observed_url:-none}"
+    [ "$observed_rev" = "$expected_rev" ] || fail "root-patch-revision-drift" "patch=block expected=$expected_rev observed=${observed_rev:-none}"
+
+    observed_names=$(patch_names "$MANIFEST")
+    observed_count=$(printf '%s\n' "$observed_names" | awk 'NF { count += 1 } END { print count + 0 }')
+    [ "$observed_count" -eq 1 ] || fail "irrelevant-or-unrecorded-root-patch" "observed=$observed_names"
+    [ "$observed_names" = block ] || fail "irrelevant-or-unrecorded-root-patch" "observed=$observed_names"
+    log "PATCH suite=frankentorch name=block relevance=required consumer_feature=frankentorch-leaves mirror=PASS"
+}
+
+check_override_file() {
+    [ -e "$OVERRIDE_FILE" ] || return 0
+    require_regular "$OVERRIDE_FILE"
+    if git ls-files --error-unmatch "$OVERRIDE_FILE" >/dev/null 2>&1; then
+        fail "tracked-override-refused" "override=$OVERRIDE_FILE"
+    fi
+    while IFS='|' read -r suite path extra; do
+        [ -n "$suite" ] || continue
+        case "$suite" in \#*) continue ;; esac
+        [ -n "$path" ] && [ -z "${extra:-}" ] || fail "override-malformed" "line=$suite|$path"
+        case "$path" in /*) ;; *) fail "override-not-absolute" "suite=$suite path=$path" ;; esac
+        case "$suite" in
+            frankentorch)
+                expected=$(frankentorch_revision)
+                observed=$(git -C "$path" rev-parse HEAD 2>/dev/null) || fail "override-not-git" "suite=$suite path=$path"
+                [ "$observed" = "$expected" ] || fail "override-head-drift" "suite=$suite expected=$expected observed=$observed"
+                OVERRIDE_FRANKENTORCH=$path
+                ;;
+            asupersync|frankensqlite)
+                expected_line=$(dependency_line "$([ "$suite" = asupersync ] && printf asupersync || printf fsqlite)")
+                expected=$(toml_attr "$expected_line" rev)
+                observed=$(git -C "$path" rev-parse HEAD 2>/dev/null) || fail "override-not-git" "suite=$suite path=$path"
+                [ "$observed" = "$expected" ] || fail "override-head-drift" "suite=$suite expected=$expected observed=$observed"
+                ;;
+            *) fail "override-unknown-suite" "suite=$suite" ;;
+        esac
+    done < "$OVERRIDE_FILE"
+    log "OVERRIDE RESULT=PASS file=$OVERRIDE_FILE frankentorch_root=${OVERRIDE_FRANKENTORCH:+checked}"
+}
+
+check_source_patch_closure() {
+    [ -n "$OVERRIDE_FRANKENTORCH" ] || return 0
+    source_manifest=$OVERRIDE_FRANKENTORCH/Cargo.toml
+    require_regular "$source_manifest"
+    source_names=$(patch_names "$source_manifest")
+    source_count=$(printf '%s\n' "$source_names" | awk 'NF { count += 1 } END { print count + 0 }')
+    [ "$source_count" -eq 1 ] || fail "source-patch-closure-drift" "suite=frankentorch observed=$source_names"
+    [ "$source_names" = block ] || fail "source-patch-closure-drift" "suite=frankentorch observed=$source_names"
+    tmp=$(mktemp "${TMPDIR:-/tmp}/fnlp-suite-patches.expected.XXXXXX") || fail "temp-create" "kind=patch-lock"
+    if ! emit_patch_lock "$OVERRIDE_FRANKENTORCH" > "$tmp"; then
+        fail "patch-lock-generation" "temporary=$tmp"
+    fi
+    if ! cmp -s "$tmp" "$PATCH_LOCK_FILE"; then
+        diff -u "$PATCH_LOCK_FILE" "$tmp" >&2 || true
+        fail "source-patch-closure-drift" "suite=frankentorch lock=$PATCH_LOCK_FILE"
+    fi
+    log "PATCH suite=frankentorch name=block relevance=required source_closure=PASS"
+}
+
+cargo_lock_package_matches() {
+    package=$1
+    url=$2
+    rev=$3
+    awk -v expected_package="$package" -v expected_url="$url" -v expected_rev="$rev" '
+        function complete() {
+            if (active && package == expected_package && source ~ expected_url && source ~ expected_rev) {
+                found = 1
+            }
+        }
+        /^\[\[package\]\]/ { complete(); active = 1; package = ""; source = ""; next }
+        active && $0 ~ /^name = / {
+            line = $0
+            sub(/^name = "/, "", line)
+            sub(/"$/, "", line)
+            package = line
+        }
+        active && $0 ~ /^source = / { source = $0 }
+        END { complete(); exit(found ? 0 : 1) }
+    ' "$CARGO_LOCK"
+}
+
+check_cargo_cross_checks() {
+    [ "$SKIP_CARGO" -eq 0 ] || return 0
+    require_regular "$CARGO_LOCK"
+    command -v cargo >/dev/null 2>&1 || fail "cargo-missing" "command=cargo"
+    metadata=$(mktemp "${TMPDIR:-/tmp}/fnlp-suite-metadata.XXXXXX") || fail "temp-create" "kind=metadata"
+    tree=$(mktemp "${TMPDIR:-/tmp}/fnlp-suite-tree.XXXXXX") || fail "temp-create" "kind=tree"
+    if ! cargo metadata --locked --format-version 1 > "$metadata"; then
+        fail "cargo-metadata-failed" "command=cargo metadata --locked --format-version 1"
+    fi
+    if ! cargo tree --locked -e features --all-features > "$tree"; then
+        fail "cargo-tree-failed" "command=cargo tree --locked -e features --all-features"
+    fi
+
+    while IFS='|' read -r kind dependency package source url rev optional consumer features; do
+        [ "$kind" = dependency ] || continue
+        cargo_lock_package_matches "$package" "$url" "$rev" || fail "cargo-lock-suite-drift" "package=$package url=$url rev=$rev"
+        grep -F "$url" "$metadata" >/dev/null 2>&1 || fail "metadata-suite-source-missing" "package=$package url=$url"
+        grep -F "$rev" "$metadata" >/dev/null 2>&1 || fail "metadata-suite-revision-missing" "package=$package rev=$rev"
+    done < "$LOCK_FILE"
+    log "CARGO_METADATA RESULT=PASS command='cargo metadata --locked --format-version 1'"
+    log "CARGO_TREE RESULT=PASS command='cargo tree --locked -e features --all-features'"
+}
+
+generate_locks() {
+    [ -n "$OVERRIDE_FRANKENTORCH" ] || fail "generator-source-required" "provide untracked override row frankentorch|/absolute/path"
+    suite_tmp=$(mktemp "${TMPDIR:-/tmp}/fnlp-suite-lock.generate.XXXXXX") || fail "temp-create" "kind=suite-lock"
+    patch_tmp=$(mktemp "${TMPDIR:-/tmp}/fnlp-suite-patches.generate.XXXXXX") || fail "temp-create" "kind=patch-lock"
+    emit_suite_lock > "$suite_tmp" || fail "suite-lock-generation" "temporary=$suite_tmp"
+    emit_patch_lock "$OVERRIDE_FRANKENTORCH" > "$patch_tmp" || fail "patch-lock-generation" "temporary=$patch_tmp"
+    mv "$suite_tmp" "$LOCK_FILE" || fail "suite-lock-write" "path=$LOCK_FILE"
+    mv "$patch_tmp" "$PATCH_LOCK_FILE" || fail "patch-lock-write" "path=$PATCH_LOCK_FILE"
+    log "GENERATE RESULT=PASS locks=$LOCK_FILE,$PATCH_LOCK_FILE"
+}
+
+DRIFT=none
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check) MODE=check ;;
+        --generate) MODE=generate ;;
+        --override)
+            shift
+            [ "$#" -gt 0 ] || fail "argument-missing" "option=--override"
+            OVERRIDE_FILE=$1
+            OVERRIDE_EXPLICIT=1
+            ;;
+        --skip-cargo) SKIP_CARGO=1 ;;
+        --help|-h) usage; exit 0 ;;
+        *) usage; fail "argument-unknown" "argument=$1" ;;
+    esac
+    shift
+done
+
+require_regular "$MANIFEST"
+check_override_file
+case "$MODE" in
+    generate)
+        generate_locks
+        ;;
+    check)
+        check_suite_lock
+        check_patch_lock_shape
+        check_root_patch_mirror
+        check_source_patch_closure
+        check_cargo_cross_checks
+        ;;
+    *) fail "mode-invalid" "mode=$MODE" ;;
+esac
+finish 0
