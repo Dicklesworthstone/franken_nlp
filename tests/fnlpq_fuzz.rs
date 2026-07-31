@@ -31,7 +31,7 @@ const CORPUS_IDS: &[&str] = &[
 #[test]
 fn owned_reader_accepts_writer_golden_and_refuses_wrong_target() {
     let artifact = FnlpqArtifact::from_bytes(golden_bytes()).expect("writer golden must parse");
-    assert_eq!(artifact.model_id(), "Nanbeige4.2-3B");
+    assert_eq!(artifact.model_id(), "FnlpqTinyGolden");
     assert_eq!(
         artifact.revision(),
         "f56ec5a9650268aa098496734743c25ea778bd2d"
