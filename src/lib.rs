@@ -2,6 +2,7 @@
 
 pub mod artifact;
 pub mod batch;
+pub mod calibration;
 pub mod canonjson;
 pub mod cli;
 pub mod error;
