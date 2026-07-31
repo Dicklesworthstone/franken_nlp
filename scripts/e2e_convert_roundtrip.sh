@@ -52,5 +52,18 @@ log source "RESULT=START source=${source_dir} manifest=${source_manifest}"
     --arch generic \
     --yes \
     -o "${output_path}"
-log reload "RESULT=PASS artifact=${output_path}"
-printf 'E2E_SUMMARY RESULT=PASS stages=source,convert,reload expected_payload_bytes=8339601408 output=%s\n' "${output_path}" >&2
+
+if [[ ! -f "${output_path}" || -L "${output_path}" || ! -s "${output_path}" ]]; then
+    log artifact "RESULT=FAIL reason=missing-or-invalid-created-artifact expected=nonempty-regular-file actual=${output_path}"
+    printf 'E2E_SUMMARY RESULT=FAIL stage=artifact expected=nonempty-regular-output actual=%s\n' "${output_path}" >&2
+    exit 3
+fi
+
+# A successful process exit and a newly created file do not demonstrate that
+# the staged artifact was re-opened, census-checked, or round-tripped.  This
+# driver must stay fail-closed until `fnlp convert` exposes a machine-readable
+# reload-verification receipt that the driver can inspect.
+log artifact "RESULT=CREATED artifact=${output_path}"
+log reload "RESULT=BLOCKED reason=no-machine-readable-reload-verification-receipt"
+printf 'E2E_SUMMARY RESULT=INCOMPLETE stages=source,convert,artifact,reload expected_payload_bytes=8339601408 output=%s next=add-and-verify-reload-receipt\n' "${output_path}" >&2
+exit 3
