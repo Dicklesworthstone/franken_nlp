@@ -712,7 +712,7 @@ def capture_rope_application(args: argparse.Namespace) -> int:
             "profile": args.profile,
             "query_head": query_head,
             "query_input_bf16_hex": bf16_hex(query[0, query_head, -1], torch_module),
-            "query_rotated_bf16_hex": bf16_hex(rotated_query[0, query_head, position], torch_module),
+            "query_rotated_bf16_hex": bf16_hex(rotated_query[0, query_head, -1], torch_module),
             "sine_bf16_hex": bf16_hex(sine[0, -1], torch_module),
             "torch": str(torch_module.__version__),
         }
