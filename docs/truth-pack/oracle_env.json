@@ -1,6 +1,6 @@
 {
-  "closure_status": "candidate_pending_model_smoke",
-  "closure_status_explanation": "The dependency closure and CPU/eager execution posture are immutable. The pinned source snapshot and 8.34 GB weight closure are not present in this checkout, so no smoke output or matrix verdict is claimed yet. scripts/verify_oracle_env.py records those model-gated results without overwriting this authority record.",
+  "closure_status": "recreated_and_cpu_eager_smoke_verified",
+  "closure_status_explanation": "The exact 28-package CPU/eager closure was recreated from the hash-addressed lock, then ran a source-verified CPU/eager smoke forward and 32-token greedy decode against the pinned local snapshot. The separately measured oracle floor found the stream stable, so the full 32-token result below is now the verifier expectation; the canonical transcript remains immutable evidence.",
   "closure": {
     "freeze_sha256": "21ccb4eeed1b554f8e6300d1a3580f3a1ad13ca7d3c20afccf17b06654f271b3",
     "lock_path": "docs/truth-pack/oracle_requirements.lock",
@@ -111,10 +111,47 @@
   },
   "schema_version": 1,
   "smoke": {
-    "expected": null,
+    "expected": {
+      "canonical_transcript_path": "docs/truth-pack/oracle_smoke_f56ec5a.json",
+      "canonical_transcript_sha256": "ad4981a9ec2912999a7d3cb85cbfe837026ce7fe2c2e3daa8d6df0cbbaa1e5ad",
+      "greedy_new_token_ids": [
+        152382,
+        13,
+        166104,
+        13,
+        13,
+        1874,
+        6592,
+        895,
+        588,
+        3851,
+        4722,
+        261,
+        2703,
+        290,
+        8498,
+        297,
+        9107,
+        261,
+        11342,
+        11495,
+        152363,
+        589,
+        388,
+        152402,
+        152350,
+        455,
+        10277,
+        3065,
+        880,
+        389,
+        152402,
+        265
+      ]
+    },
     "max_new_tokens": 32,
     "prompt": "Nanbeige CPU oracle smoke prompt: the next token is",
-    "recording_policy": "The first source-verified smoke run writes a new JSON transcript. Its greedy token ids become expected only after the separately measured nondeterminism-floor procedure approves them."
+    "recording_policy": "Every smoke run writes a new JSON transcript. Its greedy token ids become expected only after the separately measured nondeterminism-floor procedure approves them; this 32-token expectation is bound to the canonical transcript above."
   },
   "source_identity": {
     "model_id": "Nanbeige/Nanbeige4.2-3B",
