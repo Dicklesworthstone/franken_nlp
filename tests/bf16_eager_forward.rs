@@ -34,6 +34,7 @@ use sha2::{Digest, Sha256};
 
 const HF_BF16_EAGER_TRACE_PROMPT: &str = "tests/fixtures/reference/hf-bf16-eager/prompt-000";
 const PINNED_MODEL_SOURCE_ENV: &str = "FNLP_PINNED_MODEL_SOURCE";
+const STRUCTURAL_SMOKE_TOKEN_ID: u32 = 0;
 const NANBEIGE_PHYSICAL_LAYER_COUNT: usize = 22;
 const NANBEIGE_LOGICAL_LAYER_COUNT: usize = 44;
 
@@ -346,31 +347,21 @@ fn hf_bf16_eager_fixture_binds_the_44_layer_l2_ladder_and_greedy_seed() {
 }
 
 /// Exercises the actual source-backed semantic engine once the release or
-/// parity runner arms this model-gated check.  Fixture-integrity coverage above
-/// proves the frozen oracle inventory; `zre` owns the separate per-tensor L2
-/// metric comparison against those bytes.
+/// parity runner arms this model-gated check. This is a structural schedule
+/// check only: it does not establish L2/L3/L4 parity or consume oracle-fixture
+/// values. `zre` owns the separate per-tensor L2 metric comparison.
 #[test]
 fn bf16_eager_armed_source_runs_all_44_layers_and_both_boundary_norms() {
     let Some(source) = armed_pinned_model_source() else {
         return;
     };
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(HF_BF16_EAGER_TRACE_PROMPT);
-    let trace: HfBf16EagerTrace = serde_json::from_slice(
-        &fs::read(root.join("trace.json")).expect("read hf-bf16 eager oracle trace"),
-    )
-    .expect("parse hf-bf16 eager oracle trace");
-    let token_id = *trace
-        .greedy_tokens
-        .first()
-        .expect("frozen eager trace must retain a greedy seed");
-
     let weights = HfBf16EagerWeights::from_pinned_source(&source)
         .expect("armed source closure must satisfy the pinned bf16 tensor census");
     let mut engine = HfBf16EagerEngine::new(weights, 1)
         .expect("one-position eager engine must admit all 44 bf16 K/V slots");
     let forward = engine
-        .decode(token_id)
-        .expect("armed eager source must execute the frozen greedy seed");
+        .decode(STRUCTURAL_SMOKE_TOKEN_ID)
+        .expect("armed eager source must execute a fixed in-vocabulary token");
 
     assert_eq!(forward.position, 0);
     assert_eq!(forward.layer_outputs.len(), NANBEIGE_LOGICAL_LAYER_COUNT);
