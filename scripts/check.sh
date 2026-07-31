@@ -191,6 +191,14 @@ print(f"DOC_LINKS RESULT=PASS files={len(markdown_files)}")
 PY
 }
 
+validate_platform_surfaces() {
+    command -v python3 >/dev/null 2>&1 || {
+        printf '%s\n' 'python3 is required for the platform-surface validator' >&2
+        return 1
+    }
+    python3 "${REPO_ROOT}/scripts/validate_platform_surfaces.py"
+}
+
 run_bounded_ubs() {
     if ! command -v ubs >/dev/null 2>&1; then
         printf 'UBS RESULT=SKIPPED_NO_UBS reason=binary-absent\n' >&2
@@ -240,6 +248,7 @@ main() {
     run_section clippy cargo clippy --locked --all-targets -- -D warnings
     run_section test cargo test --locked
     run_section doc-links validate_doc_links
+    run_section platform-surfaces validate_platform_surfaces
     run_section ubs run_bounded_ubs
 
     # These dedicated policy scripts become mandatory as their sibling beads land.

@@ -39,6 +39,7 @@ const FORBIDDEN_DIRECT: &[&str] = &[
     "uuid",
 ];
 const FORBIDDEN_RELEASE_GRAPH: &[&str] = &["rayon", "rayon-core"];
+const SUPPLY_CHAIN_MANIFEST: &str = "docs/SUPPLY_CHAIN_MANIFEST.json";
 
 #[derive(Debug, Deserialize)]
 struct Metadata {
@@ -103,6 +104,22 @@ struct PolicyReport {
     release_direct_roots: BTreeSet<String>,
     dev_direct_roots: BTreeSet<String>,
     release_packages: BTreeSet<String>,
+    release_package_inventory: BTreeSet<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SupplyChainManifest {
+    schema_version: u32,
+    scope: String,
+    direct_release_roots: Vec<String>,
+    packages: Vec<SupplyChainPackage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SupplyChainPackage {
+    name: String,
+    version: String,
+    source: String,
 }
 
 #[test]
@@ -301,7 +318,9 @@ fn current_policy(root: &Path) -> Result<PolicyReport, PolicyFailure> {
     let metadata = cargo_metadata(root)?;
     let cargo_tree = cargo_tree(root)?;
     let lock_packages = cargo_lock_packages(root)?;
-    evaluate_policy(&metadata, &cargo_tree, &lock_packages)
+    let report = evaluate_policy(&metadata, &cargo_tree, &lock_packages)?;
+    validate_supply_chain_manifest(root, &report)?;
+    Ok(report)
 }
 
 fn cargo_metadata(root: &Path) -> Result<Metadata, PolicyFailure> {
@@ -443,14 +462,73 @@ fn evaluate_policy(
     }
 
     let release_packages = release_ids
-        .into_iter()
-        .filter_map(|id| package_by_id(metadata, &id).map(|package| package.name.clone()))
+        .iter()
+        .filter_map(|id| package_by_id(metadata, id).map(|package| package.name.clone()))
+        .collect();
+    let release_package_inventory = release_ids
+        .iter()
+        .filter_map(|id| package_by_id(metadata, id).map(package_inventory_label))
         .collect();
     Ok(PolicyReport {
         release_direct_roots,
         dev_direct_roots,
         release_packages,
+        release_package_inventory,
     })
+}
+
+fn validate_supply_chain_manifest(root: &Path, report: &PolicyReport) -> Result<(), PolicyFailure> {
+    let path = root.join(SUPPLY_CHAIN_MANIFEST);
+    let document = fs::read_to_string(&path).map_err(|error| PolicyFailure {
+        offending_crate: "supply-chain-manifest".to_owned(),
+        full_path: path.display().to_string(),
+        detail: format!("cannot read committed supply-chain manifest: {error}"),
+    })?;
+    let manifest: SupplyChainManifest = serde_json::from_str(&document).map_err(|error| PolicyFailure {
+        offending_crate: "supply-chain-manifest".to_owned(),
+        full_path: path.display().to_string(),
+        detail: format!("cannot parse supply-chain manifest JSON: {error}"),
+    })?;
+    if manifest.schema_version != 1 || manifest.scope != "release-normal-build" {
+        return Err(PolicyFailure {
+            offending_crate: "supply-chain-manifest".to_owned(),
+            full_path: path.display().to_string(),
+            detail: "manifest schema_version/scope is not the release normal/build contract".to_owned(),
+        });
+    }
+    let manifest_roots: BTreeSet<String> = manifest.direct_release_roots.into_iter().collect();
+    if manifest_roots != report.release_direct_roots {
+        return Err(PolicyFailure {
+            offending_crate: "supply-chain-manifest".to_owned(),
+            full_path: path.display().to_string(),
+            detail: format!("direct-root drift expected={:?} observed={manifest_roots:?}", report.release_direct_roots),
+        });
+    }
+    let manifest_inventory: BTreeSet<String> = manifest
+        .packages
+        .into_iter()
+        .map(|package| {
+            if package.source.trim().is_empty() {
+                format!("{}@{}", package.name, package.version)
+            } else {
+                format!("{}@{}", package.name, package.version)
+            }
+        })
+        .collect();
+    if manifest_inventory.len() != report.release_package_inventory.len()
+        || manifest_inventory != report.release_package_inventory
+    {
+        return Err(PolicyFailure {
+            offending_crate: "supply-chain-manifest".to_owned(),
+            full_path: path.display().to_string(),
+            detail: format!(
+                "release package inventory drift missing={:?} unexpected={:?}",
+                report.release_package_inventory.difference(&manifest_inventory).collect::<Vec<_>>(),
+                manifest_inventory.difference(&report.release_package_inventory).collect::<Vec<_>>(),
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn validate_direct_dependency(
@@ -615,6 +693,10 @@ fn full_path_to_id(metadata: &Metadata, target: &str) -> Option<String> {
 
 fn package_label(package: &Package) -> String {
     format!("{}@{}", package.name, package.version)
+}
+
+fn package_inventory_label(package: &Package) -> String {
+    package_label(package)
 }
 
 fn cargo_tree_mentions(cargo_tree: &str, package: &str) -> bool {

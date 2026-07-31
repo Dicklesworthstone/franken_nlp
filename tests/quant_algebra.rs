@@ -19,6 +19,10 @@ fn xor_offset_is_plus_128_for_every_i8_bit_pattern() {
     }
     assert_eq!(S8_ZERO_POINT, 0);
     assert_eq!(X86_ACTIVATION_XOR_OFFSET, 0x80);
+    assert_eq!(
+        s8_slice_to_x86_offset_u8(&[i8::MIN, -1, 0, i8::MAX]),
+        vec![0, 127, 128, 255]
+    );
 }
 
 #[test]

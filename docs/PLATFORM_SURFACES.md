@@ -79,7 +79,7 @@ call directly.
    the doc-validation leg, must parse this table, require every column above,
    print the complete facility-by-target matrix, and end with
    `PLATFORM_SURFACES RESULT=PASS|FAIL rows=<n> incomplete=<list>`.
-4. The future document-link check must link this file from the plan-adjacent
-   governance documentation and report a missing link as a documentation-gate
-   failure.  That wiring is intentionally deferred to uxw rather than being
-   implied by this pre-write.
+4. G0 ADRs that consume a facility identify its exact `Facility` value on a
+   standalone line as `PLATFORM_SURFACE: <facility>`.  The validator activates
+   this cross-reference check as soon as `ADR-G0-*.md` files land, and reports
+   any unknown facility as a documentation-gate failure.
