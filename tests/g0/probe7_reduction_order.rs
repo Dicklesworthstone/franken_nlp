@@ -79,7 +79,11 @@ fn canonical_per_row_order_is_bitwise_batch_invariant_at_model_k_shapes() {
 #[test]
 fn reassociated_order_has_a_named_bitwise_counterexample() {
     let mut left = vec![0.0_f32; 1_024];
-    left[..3].copy_from_slice(&[16_777_216.0, -16_777_216.0, 1.0]);
+    // 2^25: one power beyond f32's 24-bit mantissa, so -(2^25) + 1.0 rounds
+    // back to -(2^25) and the reassociated order genuinely absorbs the unit.
+    // (At 2^24 the sum -(2^24 - 1) is still exactly representable and the
+    // counterexample vanishes.)
+    left[..3].copy_from_slice(&[33_554_432.0, -33_554_432.0, 1.0]);
     let right = vec![1.0_f32; left.len()];
     let canonical = canonical_dot(&left, &right);
     let a = left[0] * right[0];
