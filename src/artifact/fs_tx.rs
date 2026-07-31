@@ -84,6 +84,26 @@ impl ActivationRecordBody {
         }
     }
 
+    /// Reconstructs a retained body before its envelope digest is verified.
+    /// This is intentionally explicit: discovery treats every body/digest pair
+    /// as untrusted until [`ActivationRecord::digest_is_valid`] succeeds.
+    #[must_use]
+    pub const fn from_retained_parts(
+        sequence: u64,
+        artifact_digest: ActivationDigest,
+        native_digest: ActivationDigest,
+        config_digest: ActivationDigest,
+        previous_record_digest: Option<ActivationDigest>,
+    ) -> Self {
+        Self {
+            artifact_digest,
+            config_digest,
+            native_digest,
+            previous_record_digest,
+            sequence,
+        }
+    }
+
     /// Creates the next checked sequence body linked to an immutable record.
     pub fn successor(
         previous: &ActivationRecord,

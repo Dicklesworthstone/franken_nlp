@@ -123,18 +123,7 @@ fn torn_gapped_and_disconnected_records_never_become_active() {
 
 #[test]
 fn sequence_overflow_lock_reentry_and_unratified_root_refuse_typed() {
-    let overflow_body = ActivationRecordBody::genesis(digest(1), digest(2), digest(3));
-    let overflow = ActivationRecord::from_retained_parts(
-        ActivationRecordBody::successor(&ActivationRecord::new(overflow_body), digest(4), digest(5), digest(6))
-            .unwrap(),
-        digest(7),
-    );
-    let max = ActivationRecord::from_retained_parts(
-        ActivationRecordBody::genesis(digest(1), digest(2), digest(3)),
-        overflow.record_digest(),
-    );
-    let _ = max;
-    let max_body = ActivationRecordBody::from_retained_parts_for_test(
+    let max_body = ActivationRecordBody::from_retained_parts(
         u64::MAX,
         digest(1),
         digest(2),

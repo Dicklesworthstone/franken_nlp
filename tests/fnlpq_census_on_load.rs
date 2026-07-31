@@ -28,13 +28,18 @@ fn complete_nanbeige_census_loads_and_missing_shape_and_name_drift_refuse() {
     let mut missing = complete.clone();
     missing.tensors.pop();
     refresh_logical_model_identity(&mut missing);
-    assert_census_refusal(write(&missing).expect("missing fixture writes").bytes, "missing");
+    assert_census_refusal(
+        write(&missing).expect("missing fixture writes").bytes,
+        "missing",
+    );
 
     let mut wrong_shape = complete.clone();
     wrong_shape.tensors[0].shape[0] += 1;
     refresh_logical_model_identity(&mut wrong_shape);
     assert_census_refusal(
-        write(&wrong_shape).expect("wrong-shape fixture writes").bytes,
+        write(&wrong_shape)
+            .expect("wrong-shape fixture writes")
+            .bytes,
         "shape",
     );
 
@@ -45,7 +50,10 @@ fn complete_nanbeige_census_loads_and_missing_shape_and_name_drift_refuse() {
         .expect("complete census has tensors")
         .name = "z.renamed.tensor".to_owned();
     refresh_logical_model_identity(&mut renamed);
-    assert_census_refusal(write(&renamed).expect("renamed fixture writes").bytes, "renamed");
+    assert_census_refusal(
+        write(&renamed).expect("renamed fixture writes").bytes,
+        "renamed",
+    );
 }
 
 #[test]
@@ -57,13 +65,11 @@ fn logical_identity_is_checked_at_write_and_load_boundaries() {
         Err(FnlpqWriteError::LogicalIdentity { .. })
     ));
 
-    let valid = write(&tiny_input()).expect("tiny logical fixture writes").bytes;
+    let valid = write(&tiny_input())
+        .expect("tiny logical fixture writes")
+        .bytes;
     let mut stale_model = valid.clone();
-    replace_header_digest(
-        &mut stale_model,
-        "logical_model_sha256",
-        &"0".repeat(64),
-    );
+    replace_header_digest(&mut stale_model, "logical_model_sha256", &"0".repeat(64));
     let error = FnlpqArtifact::from_bytes(stale_model)
         .expect_err("stale model digest must fail before a consumer can load it");
     assert!(matches!(error, FnlpqReadError::Header { .. }));
@@ -112,7 +118,12 @@ fn nanbeige_input() -> FnlpqWriterInput {
 
 fn tiny_input() -> FnlpqWriterInput {
     let mut input = base_input("FnlpqTinyIdentity");
-    input.sections.iter_mut().find(|section| section.name == "generic-payload").expect("payload section").bytes = vec![0x80, 0x3f];
+    input
+        .sections
+        .iter_mut()
+        .find(|section| section.name == "generic-payload")
+        .expect("payload section")
+        .bytes = vec![0x80, 0x3f];
     input.tensors = vec![TensorInput {
         name: "tiny.weight".to_owned(),
         canonical_dtype: CanonicalDtype::Bf16,
@@ -143,7 +154,12 @@ fn base_input(model_id: &str) -> FnlpqWriterInput {
             SectionPayload::new("model-config", SectionKind::ModelConfig, b"{}", 8),
             SectionPayload::new("tokenizer-config", SectionKind::TokenizerConfig, b"{}", 8),
             SectionPayload::new("chat-template", SectionKind::ChatTemplate, b"template", 8),
-            SectionPayload::new("license-bundle", SectionKind::LicenseBundle, b"Apache-2.0\n", 8),
+            SectionPayload::new(
+                "license-bundle",
+                SectionKind::LicenseBundle,
+                b"Apache-2.0\n",
+                8,
+            ),
         ],
         tensors: Vec::new(),
         packing_sets: vec![PackingSetInput {
@@ -184,9 +200,8 @@ fn refresh_logical_model_identity(input: &mut FnlpqWriterInput) {
         ("tokenizer_config", section_bytes(input, "tokenizer-config")),
         ("chat_template", section_bytes(input, "chat-template")),
     ];
-    input.logical_model_sha256 = hex(
-        &logical_model_sha256(&tensor_digests, &sources).expect("logical model identity"),
-    );
+    input.logical_model_sha256 =
+        hex(&logical_model_sha256(&tensor_digests, &sources).expect("logical model identity"));
 }
 
 fn logical_tensor_hex(name: &str, shape: &[u32]) -> String {
@@ -217,22 +232,28 @@ fn mapped_bytes_in_sections<'a>(sections: &'a [SectionPayload], range: &SectionR
 }
 
 fn replace_header_digest(bytes: &mut [u8], field: &str, replacement: &str) {
-    let header_len = usize::try_from(u64::from_le_bytes(bytes[16..24].try_into().expect("prelude")))
-        .expect("fixture header fits host");
+    let header_len = usize::try_from(u64::from_le_bytes(
+        bytes[16..24].try_into().expect("prelude"),
+    ))
+    .expect("fixture header fits host");
     let header_range = 80..80 + header_len;
     let header = std::str::from_utf8(&bytes[header_range.clone()]).expect("header UTF-8");
     let prefix = format!("\"{field}\":\"");
     let start = header.find(&prefix).expect("header field") + prefix.len();
     let end = start + 64;
-    assert!(header[start..end].bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert!(header[start..end]
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit()));
     bytes[80 + start..80 + end].copy_from_slice(replacement.as_bytes());
     let digest: [u8; 32] = Sha256::digest(&bytes[header_range]).into();
     bytes[48..80].copy_from_slice(&digest);
 }
 
 fn first_section_offset(bytes: &[u8]) -> usize {
-    let header_len = usize::try_from(u64::from_le_bytes(bytes[16..24].try_into().expect("prelude")))
-        .expect("fixture header fits host");
+    let header_len = usize::try_from(u64::from_le_bytes(
+        bytes[16..24].try_into().expect("prelude"),
+    ))
+    .expect("fixture header fits host");
     usize::try_from(u64::from_le_bytes(
         bytes[80 + header_len + 16..80 + header_len + 24]
             .try_into()
