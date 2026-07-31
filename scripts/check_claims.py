@@ -46,6 +46,19 @@ REQUIRED_CLAIM_KEYS = CLAIM_KEYS - {"probability_space"}
 VALID_SURFACES = {"README", "--help", "release_notes", "robot_schema_descriptions"}
 DOMAIN_KEYS = {"dataset", "host", "numerics_profile", "prompt_hash", "recipe_id", "thinking_mode"}
 TRANSITION_KEYS = {"at", "from_state", "reason", "to_state"}
+P7_REGISTER_ROWS = {
+    "P7-METAL": "| P7-METAL | DEFERRED |",
+    "P7-SERVE": "| P7-SERVE | DEFERRED |",
+    "P7-TRANSLATION": "| P7-TRANSLATION | DEFERRED |",
+}
+P7_SCOPE_REQUIREMENTS = (
+    "**Status:** DEFERRED — no implementation authority",
+    "`BLOCKED_CPU_PARITY`",
+    "`metal-prefill-v1`",
+    "`fnlp serve` or any remote/routable listener",
+    "Translation | DEFERRED and not a task surface.",
+    "CPU-only build/host retains identical CPU behavior",
+)
 ALLOWED_TRANSITIONS = {
     "targeted": {"observed", "evidenced", "withdrawn"},
     "observed": {"evidenced", "withdrawn"},
@@ -302,6 +315,38 @@ def validate_links(root: Path) -> None:
         raise ClaimsError("CLAIMS_ANNOTATIONS.md must link to CLAIMS.json")
 
 
+def validate_deferred_p7_scope(root: Path) -> None:
+    """Keep the deferred Metal/serve/translation boundary mechanically visible.
+
+    This is deliberately a scope check rather than a parity claim: while the
+    P7 decision remains deferred, the release manifest must not acquire the
+    Metal surface merely because its future profile name appears in documents.
+    A later ratified promotion changes this validator together with the
+    decision record and its named L-ladder evidence.
+    """
+
+    register_path = root / "docs" / "RESEARCH_DECISION_REGISTER.md"
+    scope_path = root / "docs" / "adr" / "drafts" / "p7-metal-prefill-scope.md"
+    manifest_path = root / "Cargo.toml"
+    try:
+        register = register_path.read_text(encoding="utf-8")
+        scope = scope_path.read_text(encoding="utf-8")
+        manifest = manifest_path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise ClaimsError(f"P7 scope input unavailable: {error}") from error
+
+    for decision_id, row in P7_REGISTER_ROWS.items():
+        if row not in register:
+            raise ClaimsError(f"P7 decision register missing deferred row id={decision_id}")
+    normalized_scope = " ".join(scope.split())
+    for requirement in P7_SCOPE_REQUIREMENTS:
+        if " ".join(requirement.split()) not in normalized_scope:
+            raise ClaimsError(f"P7 scope gate missing requirement={requirement!r}")
+    if "ft-kernel-metal" in manifest:
+        raise ClaimsError("P7 scope violation: deferred ft-kernel-metal entered Cargo.toml")
+    log("P7_SCOPE RESULT=PASS decisions=3 metal_release_dependency=absent")
+
+
 def check_fixture(path: Path, claims: dict[str, dict[str, Any]], expected_fragment: str | None) -> None:
     try:
         scan_surface(path, "README", claims)
@@ -415,6 +460,7 @@ def main() -> int:
         run_self_test(root, claims)
         if arguments.check:
             validate_links(root)
+            validate_deferred_p7_scope(root)
             for surface, path in existing_public_surfaces(root):
                 scan_surface(path, surface, claims)
                 scanned += 1
