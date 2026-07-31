@@ -181,6 +181,18 @@ try {
     if (-not (Get-Command python3 -ErrorAction SilentlyContinue)) { throw 'python3 is required for the local fixture server' }
     if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) { throw 'openssl is required for the local TLS redirect server' }
     $script:PwshPath = (Get-Command pwsh -ErrorAction Stop).Source
+
+    # Keep the redirect fixture honest: it supplies a private CA through the
+    # process trust store rather than introducing a production escape hatch for
+    # certificate or redirect policy. This mirrors case 0 in the shell harness.
+    $script:Cases++
+    $fetchSource = Get-Content -LiteralPath $Fetch -Raw
+    if ($fetchSource -match 'FNLP_FETCH_TEST|FNLP_FETCH_TEST_ALLOW_INSECURE_TLS|ServerCertificateCustomValidationCallback|DangerousAcceptAnyServerCertificateValidator|SkipCertificateCheck') {
+        Fail '0' 'production-transport-isolation'
+    } else {
+        Pass '0' 'production-transport-isolation'
+    }
+
     $script:Cases++
     $pwshVersion = [Version](& $script:PwshPath -NoProfile -Command '$PSVersionTable.PSVersion.ToString()')
     if ($pwshVersion.Major -ge 7) {
