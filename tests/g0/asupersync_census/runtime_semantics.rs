@@ -8,8 +8,7 @@
 //! Residual items for the runtime-backed continuation of this census (they
 //! need a constructed runtime or Lab and are NOT emitted from this file):
 //! cast-enqueue-only, try-cast overflow policies, preset worker/blocking
-//! observation, Lab determinism + crashpack replay, capability compile-fail
-//! suite.
+//! observation, and Lab determinism + crashpack replay.
 
 use std::{
     future::Future,
@@ -21,7 +20,7 @@ use std::{
 };
 
 use asupersync::combinator::first_ok_outcomes;
-use asupersync::cx::Cx;
+use asupersync::cx::{Cx, cap};
 use asupersync::plan::execute::capture;
 use asupersync::{Budget, CancelKind, CancelReason, CapabilityBudget, Outcome, PanicPayload};
 
@@ -261,7 +260,55 @@ fn preset_builder_values_observed_on_constructed_runtimes() {
         "observed-on-built-runtimes:current1+default4+throughput8x32+latency4x32",
     );
     println!(
-        "G0_CENSUS summary items=4 ratified=4 absent_with_fallback=0 fail=0 residual=cast-enqueue-only,try-cast-policies,lab-determinism,compile-fail-suite"
+        "G0_CENSUS summary items=4 ratified=4 absent_with_fallback=0 fail=0 residual=cast-enqueue-only,try-cast-policies,lab-determinism"
+    );
+}
+
+/// An ambient lookup may be instantiated as `Cx<cap::All>`, but it must not
+/// regain effects removed by an enclosing `Cx<cap::None>` restriction. The
+/// capability snapshot makes the runtime mask observable without relying on
+/// whether this test constructor happens to attach an I/O or timer handle.
+#[test]
+fn current_cannot_regain_dropped_effects_after_restriction() {
+    let full = Cx::for_testing();
+    let _outer = Cx::set_current(Some(full.clone()));
+
+    let unrestricted: Cx = Cx::current().expect("outer full context is installed");
+    let unrestricted_capabilities = unrestricted.capabilities();
+    assert!(unrestricted_capabilities.spawn);
+    assert!(unrestricted_capabilities.time);
+    assert!(unrestricted_capabilities.entropy);
+    assert!(unrestricted_capabilities.io);
+    assert!(unrestricted_capabilities.remote);
+
+    let leaf: Cx<cap::None> = full.restrict::<cap::None>();
+    {
+        let _restriction = leaf.set_current_restricted();
+        let ambient: Cx = Cx::current().expect("restricted context remains installed");
+        let capabilities = ambient.capabilities();
+
+        // `ambient` has the default `Cx<cap::All>` static type, so this is the
+        // runtime-mask half of the authority proof, distinct from the
+        // compile-fail proof that `Cx<cap::None>` cannot be widened.
+        assert!(!capabilities.spawn, "SPAWN must remain dropped");
+        assert!(!capabilities.time, "TIME must remain dropped");
+        assert!(!capabilities.entropy, "RANDOM must remain dropped");
+        assert!(!capabilities.io, "IO must remain dropped");
+        assert!(!capabilities.remote, "REMOTE must remain dropped");
+    }
+
+    let restored: Cx = Cx::current().expect("outer full context is restored");
+    let restored_capabilities = restored.capabilities();
+    assert!(restored_capabilities.spawn);
+    assert!(restored_capabilities.time);
+    assert!(restored_capabilities.entropy);
+    assert!(restored_capabilities.io);
+    assert!(restored_capabilities.remote);
+
+    census(
+        "current-no-regain",
+        "RATIFIED",
+        "ambient-all-static-type+none-runtime-mask-blocks-spawn-time-random-io-remote+outer-mask-restored",
     );
 }
 
