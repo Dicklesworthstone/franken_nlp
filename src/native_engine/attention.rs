@@ -75,6 +75,77 @@ pub fn softmax_f32_cast_back(scores: &[f32]) -> Result<Vec<Bf16>, AttentionError
     ))
 }
 
+/// Fixed-order streaming softmax state for one value vector width.
+///
+/// Each observed score rescales the prior maximum, denominator, and weighted
+/// value sum before absorbing the next K/V position.  It retains only one
+/// 128-wide value accumulator, so decode does not need a score or probability
+/// buffer proportional to context length.  This is a distinct float reduction
+/// surface: [`eager_gqa_attention_from_cache_prefix`] remains the
+/// `hf-bf16-eager` route because that profile has a named bf16 probability
+/// cast-back site.
+#[derive(Clone, Debug)]
+pub struct OnlineSoftmaxF32 {
+    maximum: f32,
+    normalizer: f32,
+    weighted_values: Vec<f32>,
+    observations: usize,
+}
+
+impl OnlineSoftmaxF32 {
+    /// Starts an empty streaming reduction for `value_width` scalar values.
+    #[must_use]
+    pub fn new(value_width: usize) -> Self {
+        Self {
+            maximum: f32::NEG_INFINITY,
+            normalizer: 0.0,
+            weighted_values: vec![0.0; value_width],
+            observations: 0,
+        }
+    }
+
+    /// Absorbs a cache-resident bf16 value vector at one score position.
+    pub fn observe_bf16_bits(
+        &mut self,
+        score: f32,
+        values: &[u16],
+    ) -> Result<(), AttentionError> {
+        if values.len() != self.weighted_values.len() {
+            return Err(AttentionError::HeadDimension {
+                expected: self.weighted_values.len(),
+                actual: values.len(),
+            });
+        }
+        let next_maximum = self.maximum.max(score);
+        let existing_scale = if self.observations == 0 {
+            0.0
+        } else {
+            (self.maximum - next_maximum).exp()
+        };
+        let next_scale = (score - next_maximum).exp();
+        self.normalizer = self.normalizer * existing_scale + next_scale;
+        for (weighted, value) in self.weighted_values.iter_mut().zip(values) {
+            let value = Bf16::from_bits(*value).to_f32();
+            *weighted = *weighted * existing_scale + next_scale * value;
+        }
+        self.maximum = next_maximum;
+        self.observations += 1;
+        Ok(())
+    }
+
+    /// Returns the fixed-order f32 weighted average after at least one input.
+    pub fn finish(self) -> Result<Vec<f32>, AttentionError> {
+        if self.observations == 0 {
+            return Err(AttentionError::EmptySequence);
+        }
+        Ok(self
+            .weighted_values
+            .into_iter()
+            .map(|value| value / self.normalizer)
+            .collect())
+    }
+}
+
 /// Computes one eager causal-attention output head.
 ///
 /// `keys` and `values` contain exactly `sequence_len` contiguous 128-wide
@@ -266,6 +337,66 @@ pub fn eager_gqa_prefill_from_cache(
     Ok(output)
 }
 
+/// Computes one bounded-state online-softmax GQA decode row from a KV prefix.
+///
+/// This function uses no per-context score/probability or repeated-KV buffer.
+/// Its f32 streaming reduction is intentionally not wired into the exact
+/// `hf-bf16-eager` profile: promotion requires the named float metric contract
+/// and two-pass-comparator evidence described by the GQA bead.
+pub fn online_gqa_attention_from_cache_prefix(
+    query: &[Bf16],
+    cache: &KvCache,
+    slot: usize,
+    sequence_len: usize,
+) -> Result<Vec<Bf16>, AttentionError> {
+    let expected_query_width = QUERY_HEAD_COUNT * NANBEIGE_HEAD_DIM;
+    if query.len() != expected_query_width {
+        return Err(AttentionError::QueryVectorLength {
+            expected: expected_query_width,
+            actual: query.len(),
+        });
+    }
+    let available_positions = cache.len_for_slot(slot)?;
+    if sequence_len > available_positions {
+        return Err(AttentionError::CausalPrefixUnavailable {
+            requested_positions: sequence_len,
+            available_positions,
+        });
+    }
+    if sequence_len == 0 {
+        return Err(AttentionError::EmptySequence);
+    }
+
+    let mut output = vec![Bf16::from_bits(0); expected_query_width];
+    for kv_head in 0..KV_HEAD_COUNT {
+        let kv_start = kv_head * NANBEIGE_HEAD_DIM;
+        let kv_end = kv_start + NANBEIGE_HEAD_DIM;
+        for query_offset in 0..QUERY_HEADS_PER_KV_HEAD {
+            let query_head = kv_head * QUERY_HEADS_PER_KV_HEAD + query_offset;
+            let query_start = query_head * NANBEIGE_HEAD_DIM;
+            let query_end = query_start + NANBEIGE_HEAD_DIM;
+            let query_head_values = &query[query_start..query_end];
+            let mut reduction = OnlineSoftmaxF32::new(NANBEIGE_HEAD_DIM);
+            for position in 0..sequence_len {
+                let key = cache.key_at(slot, position)?;
+                let score = query_head_values
+                    .iter()
+                    .zip(&key[kv_start..kv_end])
+                    .map(|(query_value, key_value)| {
+                        query_value.to_f32() * Bf16::from_bits(*key_value).to_f32()
+                    })
+                    .sum::<f32>()
+                    * ATTENTION_SCALE;
+                let value = cache.value_at(slot, position)?;
+                reduction.observe_bf16_bits(score, &value[kv_start..kv_end])?;
+            }
+            output[query_start..query_end]
+                .copy_from_slice(&cast_f32_to_bf16(&reduction.finish()?));
+        }
+    }
+    Ok(output)
+}
+
 const _: () = assert!(KV_ELEMENTS_PER_POSITION == KV_HEAD_COUNT * NANBEIGE_HEAD_DIM);
 
 #[cfg(test)]
@@ -364,6 +495,65 @@ mod tests {
                 actual: 0,
             })
         );
+    }
+
+    #[test]
+    fn online_softmax_uses_bounded_state_for_equal_two_position_mass() {
+        let mut reduction = OnlineSoftmaxF32::new(2);
+        reduction
+            .observe_bf16_bits(0.0, &[bf16_bits(2.0), bf16_bits(6.0)])
+            .expect("first 128-wide analogue value is accepted");
+        reduction
+            .observe_bf16_bits(0.0, &[bf16_bits(4.0), bf16_bits(10.0)])
+            .expect("second 128-wide analogue value is accepted");
+        assert_eq!(reduction.finish().expect("nonempty reduction"), vec![3.0, 8.0]);
+    }
+
+    #[test]
+    fn online_softmax_refuses_an_empty_or_wrong_width_reduction() {
+        assert_eq!(
+            OnlineSoftmaxF32::new(1).finish(),
+            Err(AttentionError::EmptySequence)
+        );
+        let mut reduction = OnlineSoftmaxF32::new(2);
+        assert_eq!(
+            reduction.observe_bf16_bits(0.0, &[bf16_bits(1.0)]),
+            Err(AttentionError::HeadDimension {
+                expected: 2,
+                actual: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn online_gqa_matches_the_eager_route_for_exact_equal_score_mass() {
+        let slot = 0;
+        let mut cache = KvCache::try_with_capacity(2).expect("small cache reserves");
+        let keys = vec![0_u16; KV_ELEMENTS_PER_POSITION];
+        cache
+            .append(
+                slot,
+                0,
+                &keys,
+                &vec![bf16_bits(2.0); KV_ELEMENTS_PER_POSITION],
+            )
+            .expect("first uniform KV position is valid");
+        cache
+            .append(
+                slot,
+                1,
+                &keys,
+                &vec![bf16_bits(4.0); KV_ELEMENTS_PER_POSITION],
+            )
+            .expect("second uniform KV position is valid");
+        let query = vec![Bf16::from_f32(1.0); QUERY_HEAD_COUNT * NANBEIGE_HEAD_DIM];
+
+        let eager = eager_gqa_attention_from_cache(&query, &cache, slot)
+            .expect("two-position eager GQA is valid");
+        let online = online_gqa_attention_from_cache_prefix(&query, &cache, slot, 2)
+            .expect("two-position online GQA is valid");
+        assert_eq!(online, eager);
+        assert!(online.iter().all(|value| *value == Bf16::from_f32(3.0)));
     }
 
     #[test]
