@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsString,
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
@@ -9,7 +10,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::{
     error::ErrorCode,
-    grammar::{CompileLimits, CompiledSchema, SchemaError, compile_json_schema},
+    grammar::{compile_json_schema, CompileLimits, CompiledSchema, SchemaError},
     robot::{self, RobotCommand},
 };
 
@@ -69,7 +70,8 @@ impl From<RobotSubcommand> for RobotCommand {
 }
 
 pub fn cli_main() -> ExitCode {
-    match Cli::parse().command {
+    let canonical_args = std::iter::once(OsString::from("fnlp")).chain(std::env::args_os().skip(1));
+    match Cli::parse_from(canonical_args).command {
         Some(Command::Robot { command }) => {
             let mut stdout = io::stdout().lock();
             let mut stderr = io::stderr().lock();
