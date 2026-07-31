@@ -27,6 +27,14 @@ trap finish EXIT
 
 command -v python3 >/dev/null 2>&1 || { log "FETCH_MODEL_TESTS RESULT=FAIL cases=0 failed=missing-python3 retained_work=$WORK"; exit 1; }
 
+# 0. The production redirect policy permits official Xet and regional CDN hosts.
+CASES=$((CASES + 1))
+if rg -q 'https://\*\.xethub\.hf\.co/\*\|https://\*\.cdn\.hf\.co/\*' "$FETCH"; then
+    pass_case 0 official-xet-cdn-redirect-policy
+else
+    fail_case 0 official-xet-cdn-redirect-policy
+fi
+
 FIXTURE="$WORK/fixture/resolve/$REV"
 mkdir -p "$FIXTURE"
 printf 'alpha fixture bytes\n' > "$FIXTURE/alpha.bin"
