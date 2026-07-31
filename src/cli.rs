@@ -10,7 +10,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::{
     error::ErrorCode,
-    grammar::{compile_json_schema, CompileLimits, CompiledSchema, SchemaError},
+    grammar::{CompileLimits, CompiledSchema, SchemaError, compile_json_schema},
     robot::{self, RobotCommand},
 };
 
@@ -71,7 +71,20 @@ impl From<RobotSubcommand> for RobotCommand {
 
 pub fn cli_main() -> ExitCode {
     let canonical_args = std::iter::once(OsString::from("fnlp")).chain(std::env::args_os().skip(1));
-    match Cli::parse_from(canonical_args).command {
+    let stdin = io::stdin();
+    let mut stdin = stdin.lock();
+    cli_main_with_reader(canonical_args, &mut stdin)
+}
+
+/// Runs the CLI with an explicit schema-input reader.
+///
+/// Keeping the reader at this boundary prevents unit tests from accidentally
+/// inheriting the process stdin and waiting for a terminal or pipe to close.
+fn cli_main_with_reader(
+    args: impl IntoIterator<Item = OsString>,
+    schema_input: &mut impl Read,
+) -> ExitCode {
+    match Cli::parse_from(args).command {
         Some(Command::Robot { command }) => {
             let mut stdout = io::stdout().lock();
             let mut stderr = io::stderr().lock();
@@ -83,7 +96,7 @@ pub fn cli_main() -> ExitCode {
                 }
             }
         }
-        Some(Command::Schema { command }) => run_schema_command(command),
+        Some(Command::Schema { command }) => run_schema_command_with_reader(command, schema_input),
         None => {
             let mut command = Cli::command();
             let _ = command.print_help();
@@ -93,12 +106,15 @@ pub fn cli_main() -> ExitCode {
     }
 }
 
-fn run_schema_command(command: SchemaSubcommand) -> ExitCode {
+fn run_schema_command_with_reader(
+    command: SchemaSubcommand,
+    schema_input: &mut impl Read,
+) -> ExitCode {
     let (mode, path) = match command {
         SchemaSubcommand::Check { schema } => ("check", schema),
         SchemaSubcommand::Sample { schema } => ("sample", schema),
     };
-    let source = match read_schema_source(&path) {
+    let source = match read_schema_source_from(&path, schema_input) {
         Ok(source) => source,
         Err(error) => {
             eprintln!(
@@ -127,10 +143,10 @@ fn run_schema_command(command: SchemaSubcommand) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn read_schema_source(path: &Path) -> io::Result<String> {
+fn read_schema_source_from(path: &Path, schema_input: &mut impl Read) -> io::Result<String> {
     if path == Path::new("-") {
         let mut source = String::new();
-        io::stdin().read_to_string(&mut source)?;
+        schema_input.read_to_string(&mut source)?;
         Ok(source)
     } else {
         fs::read_to_string(path)
@@ -161,4 +177,27 @@ fn emit_schema_error(mode: &str, error: &SchemaError) {
         "SCHEMA mode={mode} RESULT=FAIL pointer={} keyword={keyword} reason={error}",
         error.pointer(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{ffi::OsString, io::Cursor, process::ExitCode};
+
+    use super::cli_main_with_reader;
+
+    #[test]
+    fn schema_dash_uses_the_injected_reader() {
+        let args = [
+            OsString::from("fnlp"),
+            OsString::from("schema"),
+            OsString::from("check"),
+            OsString::from("-"),
+        ];
+        let mut schema_input = Cursor::new(br#"{"type":"string"}"#);
+
+        assert_eq!(
+            cli_main_with_reader(args, &mut schema_input),
+            ExitCode::SUCCESS
+        );
+    }
 }
