@@ -4,11 +4,12 @@
 //!
 //! This test owns comparison policy, not production math.  Every row names a
 //! profile and threshold table entry, and missing/duplicate threshold rows are
-//! a hard error.  The frozen Phase -1 corpus currently provides whole-forward
-//! traces rather than independently replayable per-op input vectors, so this
-//! harness records that distinction in its report: scalar-spec comparisons are
-//! executable now, while an oracle per-op claim remains unavailable until its
-//! inputs are frozen.
+//! a hard error. The frozen Phase -1 corpus currently provides whole-forward
+//! traces rather than independently replayable per-op input vectors. Further,
+//! its source capture has not verified every model-weight shard length and
+//! SHA-256. This harness therefore records local scalar comparisons only; it
+//! must report blocked rather than an oracle-bound L1 result until both debts
+//! are discharged.
 
 #[path = "spec_engine/mod.rs"]
 mod spec_engine;
@@ -43,6 +44,10 @@ const ORACLE_FLOOR: &str = "docs/truth-pack/oracle_floor.json";
 const REFERENCE_MANIFEST: &str = "tests/fixtures/reference/manifest.json";
 const HF_BF16_EAGER: &str = "hf-bf16-eager";
 const DIAGNOSTIC_F32: &str = "diagnostic-f32";
+const LOCAL_PASS_NONAUTHORITATIVE: &str = "LOCAL_PASS_NONAUTHORITATIVE";
+const L1_BLOCKED_STATUS: &str = "BLOCKED_UNVERIFIED_ORACLE_CLOSURE_AND_OP_INPUTS";
+const UNVERIFIED_WEIGHT_CLOSURE: &str = "unverified-full-weight-shard-closure";
+const UNAVAILABLE_ISOLATED_OP_INPUTS: &str = "unavailable";
 
 const FLOAT_OPS: &[&str] = &[
     "rms_norm",
@@ -73,6 +78,8 @@ struct ThresholdTable {
 struct FloorProvenance {
     relative_path: String,
     sha256: String,
+    source_closure_status: String,
+    isolated_operation_inputs_status: String,
     hf_bf16_eager_run_count_per_thread: u32,
     hf_bf16_eager_thread_counts: Vec<u32>,
     hf_bf16_eager_margin_rule: String,
@@ -123,6 +130,8 @@ struct ReportRow {
 struct L1Report {
     schema_version: u32,
     status: String,
+    authority: String,
+    blocking_reasons: Vec<String>,
     note: String,
     rows: Vec<ReportRow>,
 }
@@ -339,14 +348,14 @@ fn assert_float_row(
         threshold.min_cosine,
     );
     eprintln!(
-        "L1 op={operation} profile={profile} RESULT=PASS max_abs={} max_rel={} max_ulp={} cosine={cosine}",
+        "L1 op={operation} profile={profile} RESULT={LOCAL_PASS_NONAUTHORITATIVE} max_abs={} max_rel={} max_ulp={} cosine={cosine}",
         vector.max_abs, vector.max_rel, vector.max_ulp
     );
     ReportRow {
         operation: operation.to_owned(),
         profile: profile.to_owned(),
-        status: "PASS".to_owned(),
-        comparison_surface: "scalar-spec; frozen fixture matrix bound as provenance; isolated oracle op input unavailable"
+        status: LOCAL_PASS_NONAUTHORITATIVE.to_owned(),
+        comparison_surface: "synthetic scalar-spec only; frozen whole-forward matrix is provenance-only, has no isolated oracle op input, and is not mechanically bound to a verified full model-shard closure"
             .to_owned(),
         metrics: Some(vector),
         fixture_manifest_sha256: fixture_manifest_sha256.to_owned(),
@@ -367,12 +376,16 @@ fn assert_integer_row<T: Eq + std::fmt::Debug>(
         observed, expected,
         "L1 integer op={operation} profile={profile} must be bit-exact"
     );
-    eprintln!("L1 op={operation} profile={profile} RESULT=PASS exact=true");
+    eprintln!(
+        "L1 op={operation} profile={profile} RESULT={LOCAL_PASS_NONAUTHORITATIVE} exact=true"
+    );
     ReportRow {
         operation: operation.to_owned(),
         profile: profile.to_owned(),
-        status: "PASS".to_owned(),
-        comparison_surface: "bit-exact scalar-spec selection/gather".to_owned(),
+        status: LOCAL_PASS_NONAUTHORITATIVE.to_owned(),
+        comparison_surface:
+            "bit-exact synthetic scalar-spec selection/gather; not an external oracle comparison"
+                .to_owned(),
         metrics: None,
         fixture_manifest_sha256: fixture_manifest_sha256.to_owned(),
         oracle_floor_sha256: table.oracle_floor.sha256.clone(),
@@ -536,8 +549,13 @@ fn top_k_indices(logits: &[f32], count: usize) -> Vec<usize> {
 fn write_report(rows: Vec<ReportRow>) {
     let report = L1Report {
         schema_version: 1,
-        status: "PARTIAL".to_owned(),
-        note: "The harness is executable for current public primitive surfaces. Whole-forward Phase -1 traces bind provenance, but they are not isolated oracle per-op inputs; a later fixture expansion is required before this report can be promoted to a complete external L1 gate."
+        status: L1_BLOCKED_STATUS.to_owned(),
+        authority: "local-scalar-comparison-only".to_owned(),
+        blocking_reasons: vec![
+            "the frozen reference matrix has whole-forward traces, not isolated external per-operation input/output vectors".to_owned(),
+            "the current oracle tooling does not verify the complete model-weight-shard length/SHA-256 closure".to_owned(),
+        ],
+        note: "The harness is executable for public primitive surfaces, but every local pass is non-authoritative. A verified full source closure and isolated external per-operation fixtures are both required before this report can become an L1 parity gate."
             .to_owned(),
         rows,
     };
@@ -560,16 +578,18 @@ fn write_report(rows: Vec<ReportRow>) {
             .sync_all()
             .unwrap_or_else(|error| panic!("sync L1 report {}: {error}", path.display()));
         eprintln!(
-            "L1 RESULT=PARTIAL rows={} report={}",
+            "L1 RESULT={L1_BLOCKED_STATUS} rows={} authority={} report={}",
             report.rows.len(),
+            report.authority,
             path.display()
         );
     } else {
         let report_json = String::from_utf8(bytes).expect("serde JSON output must be UTF-8");
         eprintln!("L1 REPORT={report_json}");
         eprintln!(
-            "L1 RESULT=PARTIAL rows={} report=stderr-json",
-            report.rows.len()
+            "L1 RESULT={L1_BLOCKED_STATUS} rows={} authority={} report=stderr-json",
+            report.rows.len(),
+            report.authority,
         );
     }
 }
@@ -628,6 +648,19 @@ fn threshold_table_is_complete_unique_and_floor_bound() {
             let _ = integer_threshold(&table, operation, profile);
         }
     }
+}
+
+#[test]
+fn oracle_provenance_is_explicitly_blocked_until_closure_and_op_inputs_are_verified() {
+    let table = load_thresholds();
+    assert_eq!(
+        table.oracle_floor.source_closure_status, UNVERIFIED_WEIGHT_CLOSURE,
+        "do not promote a source capture that omits full weight-shard length/SHA-256 verification"
+    );
+    assert_eq!(
+        table.oracle_floor.isolated_operation_inputs_status, UNAVAILABLE_ISOLATED_OP_INPUTS,
+        "whole-forward traces cannot be mislabeled as independently replayable L1 operation inputs"
+    );
 }
 
 #[test]
@@ -724,7 +757,7 @@ fn seeded_l1_lm_head_differential_is_reproducible() {
 }
 
 #[test]
-fn hf_bf16_eager_primitives_match_scalar_spec_and_emit_report() {
+fn hf_bf16_eager_local_primitives_match_scalar_spec_and_emit_blocked_report() {
     let table = load_thresholds();
     let manifest_digest = fixture_manifest_sha256(&table);
     let mut rows = Vec::new();

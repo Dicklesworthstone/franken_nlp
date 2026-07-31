@@ -3,6 +3,8 @@
   "oracle_floor": {
     "relative_path": "docs/truth-pack/oracle_floor.json",
     "sha256": "7530b49b907e734464fa8b9bfbccdf7fec31568577ec2bc0909b48c9392ee7ef",
+    "source_closure_status": "unverified-full-weight-shard-closure",
+    "isolated_operation_inputs_status": "unavailable",
     "hf_bf16_eager_run_count_per_thread": 5,
     "hf_bf16_eager_thread_counts": [1, 10],
     "hf_bf16_eager_margin_rule": "The recorded eager oracle floor observed zero logit spread in five fresh processes at each preregistered thread count. Exact zero thresholds are valid only for a same-operation-order replay against the frozen eager profile; a future non-zero floor requires a new row with its stated margin.",
