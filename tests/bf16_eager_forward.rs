@@ -490,6 +490,21 @@ fn bf16_eager_reference_primitives_and_cast_schedule() {
         Some(0),
         "ties preserve first token id"
     );
+
+    let lm_head_cast_boundary = Bf16Matrix::new(1, 2, bf16s(&[1.0, 0.003_906_25]))
+        .expect("one-row lm head with a bf16 half-quantum sum");
+    let cast_boundary_logits = export_logits_f32(&bf16s(&[1.0, 1.0]), &lm_head_cast_boundary)
+        .expect("lm head input width matches");
+    assert_eq!(
+        cast_boundary_logits,
+        vec![1.0],
+        "lm_head must narrow its bf16 linear output before the public f32 export"
+    );
+    assert_ne!(
+        cast_boundary_logits,
+        vec![1.003_906_25],
+        "exporting the f32 accumulator would skip the pinned bf16 cast site"
+    );
     assert_eq!(NANBEIGE_F32_LOGIT_BYTES, NANBEIGE_VOCAB_SIZE * 4);
 
     assert_eq!(NANBEIGE_HIDDEN_SIZE, 3_072);
