@@ -20,13 +20,13 @@ pub mod tokenizer;
 pub mod validation;
 
 pub use orchestrator::{
-    CommittedMemory, EngineBuildError, EngineCallGuard, EngineLease, EngineResources,
-    LeakResponsePolicy,
+    BlockingClosureGuard, CommittedMemory, EngineBuildError, EngineCallGuard, EngineLease,
+    EngineResources, LeakResponsePolicy,
     MemoryClass, MemoryClassCharge, MemoryReservation, MemorySnapshot, NlpEngine,
     NlpEngineBuilder, ReservationError, ResourceBrokerError, ResourceConfigConflict,
     ResourceConfigError, ResourceConfigField, ResourceConfigValue, ResourceHostConfig,
-    ReentrantCall, RuntimeHostError, RuntimePreset, ThreadInventory, install_process_resources,
-    installed_process_resources,
+    OutstandingClosureSnapshot, ReentrantCall, RuntimeHostError, RuntimePreset, ThreadInventory,
+    install_process_resources, installed_process_resources,
 };
 
 pub fn cli_main() -> std::process::ExitCode {

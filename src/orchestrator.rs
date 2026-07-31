@@ -866,6 +866,25 @@ struct LeaseState {
     active: BTreeMap<u64, ()>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OutstandingClosure {
+    engine_lease_id: u64,
+    wrapper_cancelled: bool,
+}
+
+#[derive(Debug, Default)]
+struct CompletionState {
+    active: BTreeMap<u64, OutstandingClosure>,
+}
+
+/// Snapshot of pool closures that remain live after their async wrappers have
+/// resolved or cancelled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutstandingClosureSnapshot {
+    pub active_closures: usize,
+    pub wrapper_cancelled_closures: usize,
+}
+
 #[cfg(feature = "asupersync-runtime")]
 struct RuntimeHost {
     runtime: asupersync::runtime::Runtime,
@@ -921,6 +940,8 @@ pub struct EngineResources {
     memory: Arc<MemoryLedger>,
     next_lease_id: AtomicU64,
     leases: Mutex<LeaseState>,
+    next_closure_id: AtomicU64,
+    completions: Mutex<CompletionState>,
     #[cfg(feature = "asupersync-runtime")]
     runtime: RuntimeHost,
 }
@@ -941,6 +962,8 @@ impl EngineResources {
             )),
             next_lease_id: AtomicU64::new(0),
             leases: Mutex::new(LeaseState::default()),
+            next_closure_id: AtomicU64::new(0),
+            completions: Mutex::new(CompletionState::default()),
             #[cfg(feature = "asupersync-runtime")]
             runtime,
         })
@@ -976,6 +999,59 @@ impl EngineResources {
     /// Number of still-live engine leases for diagnostic inventory only.
     pub fn active_lease_count(&self) -> usize {
         lock_unpoisoned(&self.leases).active.len()
+    }
+
+    /// Count pool closures that still own their resources through actual
+    /// completion. Scheduler shutdown must treat this as drain work.
+    pub fn outstanding_closure_snapshot(&self) -> OutstandingClosureSnapshot {
+        let completions = lock_unpoisoned(&self.completions);
+        OutstandingClosureSnapshot {
+            active_closures: completions.active.len(),
+            wrapper_cancelled_closures: completions
+                .active
+                .values()
+                .filter(|closure| closure.wrapper_cancelled)
+                .count(),
+        }
+    }
+
+    fn register_blocking_closure(self: &Arc<Self>, engine_lease_id: u64) -> BlockingClosureGuard {
+        let closure_id = self.next_closure_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut completions = lock_unpoisoned(&self.completions);
+        completions.active.insert(
+            closure_id,
+            OutstandingClosure {
+                engine_lease_id,
+                wrapper_cancelled: false,
+            },
+        );
+        BlockingClosureGuard {
+            resources: Arc::clone(self),
+            closure_id,
+        }
+    }
+
+    fn mark_wrapper_cancelled(&self, closure_id: u64) {
+        let mut completions = lock_unpoisoned(&self.completions);
+        let Some(closure) = completions.active.get_mut(&closure_id) else {
+            eprintln!("ENGINE_RESOURCES CANCELLED_WRAPPER_UNKNOWN closure_id={closure_id}");
+            return;
+        };
+        closure.wrapper_cancelled = true;
+    }
+
+    fn complete_blocking_closure(&self, closure_id: u64) {
+        let mut completions = lock_unpoisoned(&self.completions);
+        let Some(closure) = completions.active.remove(&closure_id) else {
+            eprintln!("ENGINE_RESOURCES COMPLETION_UNKNOWN closure_id={closure_id}");
+            return;
+        };
+        eprintln!(
+            "ENGINE_RESOURCES CLOSURE_COMPLETE closure_id={} engine_lease_id={} wrapper_cancelled={}",
+            closure_id,
+            closure.engine_lease_id,
+            closure.wrapper_cancelled,
+        );
     }
 
     /// Whether this build has retained the required real blocking-pool handle.
@@ -1025,6 +1101,16 @@ impl EngineLease {
     pub fn resources(&self) -> &Arc<EngineResources> {
         &self.resources
     }
+
+    /// Register a pool closure before releasing it into fallible work.
+    ///
+    /// The closure must retain this guard together with its admission, memory,
+    /// and output guards. An async wrapper cancellation calls
+    /// [`BlockingClosureGuard::mark_wrapper_cancelled`] but cannot release the
+    /// process resources; only the closure's actual completion drops the guard.
+    pub fn register_blocking_closure(&self) -> BlockingClosureGuard {
+        self.resources.register_blocking_closure(self.lease_id)
+    }
 }
 
 impl Drop for EngineLease {
@@ -1032,6 +1118,34 @@ impl Drop for EngineLease {
         lock_unpoisoned(&self.resources.leases)
             .active
             .remove(&self.lease_id);
+    }
+}
+
+/// Actual-completion registration for one `spawn_blocking` closure.
+///
+/// This guard is intentionally `Send`: it is moved into the physical pool
+/// closure and drops only after that closure's work, resource guards, and
+/// completion latch have reached their terminal cleanup path.
+#[derive(Debug)]
+pub struct BlockingClosureGuard {
+    resources: Arc<EngineResources>,
+    closure_id: u64,
+}
+
+impl BlockingClosureGuard {
+    pub const fn closure_id(&self) -> u64 {
+        self.closure_id
+    }
+
+    /// Record wrapper cancellation without releasing the physical closure.
+    pub fn mark_wrapper_cancelled(&self) {
+        self.resources.mark_wrapper_cancelled(self.closure_id);
+    }
+}
+
+impl Drop for BlockingClosureGuard {
+    fn drop(&mut self) {
+        self.resources.complete_blocking_closure(self.closure_id);
     }
 }
 
@@ -1410,5 +1524,38 @@ mod tests {
             .enter_sync_call()
             .expect("dropping the outer guard restores entry");
         drop(recovered);
+    }
+
+    #[test]
+    fn cancelled_wrapper_remains_outstanding_until_closure_drop() {
+        let broker = ResourceBroker::isolated_for_test();
+        let resources = broker.install(config()).expect("host installs");
+        let lease = resources.acquire_lease();
+        let closure = lease.register_blocking_closure();
+        assert_eq!(
+            resources.outstanding_closure_snapshot(),
+            OutstandingClosureSnapshot {
+                active_closures: 1,
+                wrapper_cancelled_closures: 0,
+            }
+        );
+        closure.mark_wrapper_cancelled();
+        assert_eq!(
+            resources.outstanding_closure_snapshot(),
+            OutstandingClosureSnapshot {
+                active_closures: 1,
+                wrapper_cancelled_closures: 1,
+            },
+            "wrapper cancellation must not release a live pool closure"
+        );
+        drop(closure);
+        assert_eq!(
+            resources.outstanding_closure_snapshot(),
+            OutstandingClosureSnapshot {
+                active_closures: 0,
+                wrapper_cancelled_closures: 0,
+            },
+            "only actual completion clears the outstanding drain entry"
+        );
     }
 }
