@@ -17,6 +17,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const ORACLE_FIXTURE: &str = include_str!("fixtures/rope_oracle_f32.json");
+const DECODE_APPLICATION_FIXTURE: &str = include_str!("fixtures/rope_oracle_decode_bf16.json");
 const PINNED_REVISION: &str = "f56ec5a9650268aa098496734743c25ea778bd2d";
 const PINNED_SOURCE: &str = "docs/truth-pack/research/modeling_nanbeige.py";
 const PINNED_SOURCE_SHA256: &str =
@@ -89,6 +90,35 @@ struct RopeApplicationReproductionReceipt {
     oracle_env_record_sha256: String,
     pinned_revision: String,
     source_manifest_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RopeDecodeApplicationFixture {
+    application: RopeDecodeApplication,
+    receipt: RopeApplicationReproductionReceipt,
+}
+
+#[derive(Debug, Deserialize)]
+struct RopeDecodeApplication {
+    capture_schema_version: u32,
+    cosine_bf16_hex: String,
+    input_ids: Vec<u32>,
+    key_head: usize,
+    key_input_bf16_hex: String,
+    key_rotated_bf16_hex: String,
+    layer: usize,
+    #[serde(rename = "loop")]
+    loop_index: usize,
+    modeling_source_sha256: String,
+    phase: String,
+    position: usize,
+    prefill_input_ids: Vec<u32>,
+    profile: String,
+    query_head: usize,
+    query_input_bf16_hex: String,
+    query_rotated_bf16_hex: String,
+    sine_bf16_hex: String,
+    torch: String,
 }
 
 fn assert_close(observed: f32, expected: f32, tolerance: f32) {
@@ -389,6 +419,117 @@ fn hf_bf16_eager_rope_application_matches_captured_qk_head() {
     assert_eq!(key, expected_key, "captured K RoPE application bits");
     eprintln!(
         "ROPE_APPLICATION_CAPTURE RESULT=PASS profile=hf-bf16-eager historical_capture=not_mechanically_verified reproduction_receipt=source-closure-verified position=1 q_head=0 k_head=0"
+    );
+}
+
+#[test]
+fn hf_bf16_eager_rope_decode_append_matches_captured_qk_head() {
+    let fixture: RopeDecodeApplicationFixture = serde_json::from_str(DECODE_APPLICATION_FIXTURE)
+        .expect("the pinned RoPE decode application fixture is valid JSON");
+    let application = fixture.application;
+    assert_eq!(application.capture_schema_version, 2);
+    assert_eq!(application.profile, "hf-bf16-eager");
+    assert_eq!(application.phase, "decode-append");
+    assert_eq!(application.layer, 0);
+    assert_eq!(application.loop_index, 0);
+    assert_eq!(application.position, 2);
+    assert_eq!(application.prefill_input_ids, vec![1, 2]);
+    assert_eq!(application.input_ids, vec![13]);
+    assert_eq!(application.query_head, 0);
+    assert_eq!(application.key_head, 0);
+    assert_eq!(application.modeling_source_sha256, PINNED_SOURCE_SHA256);
+    assert_eq!(application.torch, "2.6.0");
+    assert_eq!(
+        fixture.receipt.capture_scope,
+        "loop0/layer0/decode-append/position2/query-head0/key-head0"
+    );
+    assert_eq!(
+        fixture.receipt.generator_path,
+        "scripts/gen_reference_fixtures.py"
+    );
+    assert_eq!(
+        fixture.receipt.generator_commit,
+        "39e4dd81e7c22268221d83d034ae54701afe8743"
+    );
+    assert_eq!(fixture.receipt.model_id, "Nanbeige/Nanbeige4.2-3B");
+    assert_eq!(fixture.receipt.pinned_revision, PINNED_REVISION);
+    assert_eq!(
+        fixture.receipt.model_source_closure_verification,
+        "passed-before-model-load"
+    );
+    assert_eq!(
+        fixture.receipt.source_manifest_sha256,
+        sha256_path(&repo_path("docs/truth-pack/nanbeige4.2-3b.source.json")),
+        "the decode capture receipt must stay bound to the source manifest that names both weight shards"
+    );
+    assert_eq!(fixture.receipt.oracle_env_record_sha256.len(), 64);
+    assert!(fixture
+        .receipt
+        .oracle_env_record_sha256
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit()));
+
+    let mut query = parse_bf16_vector(
+        &application.query_input_bf16_hex,
+        "decode application query input",
+        NANBEIGE_HEAD_DIM,
+    );
+    let mut key = parse_bf16_vector(
+        &application.key_input_bf16_hex,
+        "decode application key input",
+        NANBEIGE_HEAD_DIM,
+    );
+    let expected_query = parse_bf16_vector(
+        &application.query_rotated_bf16_hex,
+        "decode application rotated query",
+        NANBEIGE_HEAD_DIM,
+    );
+    let expected_key = parse_bf16_vector(
+        &application.key_rotated_bf16_hex,
+        "decode application rotated key",
+        NANBEIGE_HEAD_DIM,
+    );
+    let captured_cosine = parse_bf16_vector(
+        &application.cosine_bf16_hex,
+        "decode application cosine row",
+        NANBEIGE_HEAD_DIM,
+    );
+    let captured_sine = parse_bf16_vector(
+        &application.sine_bf16_hex,
+        "decode application sine row",
+        NANBEIGE_HEAD_DIM,
+    );
+    let tables = RopeTablesF32::nanbeige(application.position + 1)
+        .expect("decode application capture position is an admitted table row");
+    for lane in 0..NANBEIGE_HEAD_DIM {
+        let table_lane = lane % (NANBEIGE_HEAD_DIM / 2);
+        let (cosine, sine) = tables
+            .table_value(application.position, table_lane)
+            .unwrap();
+        assert_eq!(
+            Bf16::from_f32(cosine),
+            captured_cosine[lane],
+            "captured hf-bf16-eager decode cosine lane={lane}"
+        );
+        assert_eq!(
+            Bf16::from_f32(sine),
+            captured_sine[lane],
+            "captured hf-bf16-eager decode sine lane={lane}"
+        );
+    }
+    tables
+        .apply_split_half(application.position, &mut query)
+        .unwrap();
+    tables
+        .apply_split_half(application.position, &mut key)
+        .unwrap();
+    assert_eq!(
+        query, expected_query,
+        "captured decode Q RoPE application bits"
+    );
+    assert_eq!(key, expected_key, "captured decode K RoPE application bits");
+    eprintln!(
+        "ROPE_DECODE_APPLICATION_CAPTURE RESULT=PASS profile=hf-bf16-eager position=2 q_head=0 k_head=0"
     );
 }
 

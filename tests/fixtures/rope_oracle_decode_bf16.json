@@ -1,0 +1,47 @@
+{
+  "application": {
+    "capture_schema_version": 2,
+    "cosine_bf16_hex": "bed53d803ed73f273f4c3f623f6f3f763f7a3f7d3f7e3f7f3f7f3f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f80bed53d803ed73f273f4c3f623f6f3f763f7a3f7d3f7e3f7f3f7f3f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f803f80",
+    "input_ids": [
+      13
+    ],
+    "key_head": 0,
+    "key_input_bf16_hex": "3e8a3f723ec73ed6beabbf01bfabbfdd3e69400640153f2abedbbfd9c03c3e1a3f8c3facc061bebebf293f8a3f913f12401a3dcbbf673ef03e49be8e3f9dbecc3d7fc1073cc43eb4bbecbf5f3fafbe1abefb3f01bea9bf1b3f07beeac0ff4027befd3f813f613f11bf12400b3db3c000bfdbbfe4c00bbf93bf51bf3e3ded3fb23f96be5bbf5abf6ebfa5bfb9bfcfbf34bf07bfcd3e7a4023bf04bfc83fcc3ff23e91bf883fc63ed8c0703f3ebf8cbcc54071bfe23f873fa1bff03f8d3f583d4bbec9bfaa3f49bfcdbeb1bed8bf76be4bbea23e71c002c17bbed0bfe13f423e91bf22401a3d5c40143db0be9f3f963ef93b593f863d253f0bc081c06fc02cbff7",
+    "key_rotated_bf16_hex": "bf973e8b3f703f7a3f033e6cbf2bbfbb3eaa401440123edebec8bfcfc0403dc43f8b3faec062bec0bf223f893f923f1240193dd1bf673eef3e4abe8e3f9dbecc3d7fc1073cc33eb4bbebbf5f3fafbe1abefb3f01bea9bf1b3f07beeac0ff4027befd3f813f613f11bf12400b3db3c000bfdbbfe4c00bbf93bf51bf3e3ded3fb2be793f6ebbc0be94bf9dbfc1bffebf93bef0bfa13f044026bf0abfd33fbe3ff33e9dbf853fc03ed6c0703f3fbf8bbcb74071bfe23f873fa1bff03f8d3f583d4abec9bfaa3f49bfcdbeb1bed8bf76be4bbea23e71c002c17bbed0bfe13f423e91bf22401a3d5c40143db0be9f3f963ef93b593f863d253f0bc081c06fc02cbff7",
+    "layer": 0,
+    "loop": 0,
+    "modeling_source_sha256": "547737f989f5cb741c1a568acaf85f83521fa67a8f7268e19f9a37e60127c0d5",
+    "phase": "decode-append",
+    "position": 2,
+    "prefill_input_ids": [
+      1,
+      2
+    ],
+    "profile": "hf-bf16-eager",
+    "query_head": 0,
+    "query_input_bf16_hex": "3f343fafbe313f373cf4bf8dbf95bfe23f0b405e403b3e983e9fbf52c06fbe643ede3f8ec06dbeed3ea53ef43f2f3e973e81bd8cbef2beaf3e39bf2fbe4d3daabdc9bf2d3e5a3ea0bd673e5c3ea0bdaa3eee3cd7bf36412fbdaebf4c4042be043ecdbdd9bed1bd86be9abf2a3d013e993e533e413d523e03be2a40143e8b3b8b401ebf4abfbfbfe8c017c021c03ebf3bbde1bf793f214045be95bf5b3f5e3f923ebdbf83bed23f1cc06e3f18bf1c3ea3407fbf463eed3f5bbf223ef43ebbbe85bddfc082bcdb3e17be2dbdb13efe3bde3e463e513c8e401bbca7bf12c0523d373e98bf1c3dc2bf8f3e29be7dbe20bea43ee0be0dbd59beef3ffa3fec3f5dbdc2",
+    "query_rotated_bf16_hex": "c0233f5f3fa43fec3fb93e54bc80bfbf3f0e406540353ca03ea8bf47c071be833eda3f90c06dbef03eb23ef23f303e973e79bd89bef2beaf3e39bf2fbe4d3daabdc9bf2d3e5a3ea0bd673e5c3ea0bdaa3eee3cd7bf36412fbdaebf4c4042be043ecdbdd9bed1bd86be9abf2a3d013e993e533e413d523e03be2a40143e8b3b8bbec43fa8bf48bf23bfefc02fc04cbf983bb0bed43f794046be89bf663f393f913ec2bf81beea3f1bc06e3f19bf1b3ea3407fbf463eed3f5bbf223ef43ebbbe85bddfc082bcdb3e17be2dbdb13efe3bde3e463e513c8e401bbca7bf12c0523d373e98bf1c3dc2bf8f3e29be7dbe20bea43ee0be0dbd59beef3ffa3fec3f5dbdc2",
+    "sine_bf16_hex": "3f693f7f3f683f423f1a3ef03eb83e8c3e553e213df33db73d8a3d513d1d3cee3cb33c873c4c3c1a3be83baf3b843b473b163ae23aaa3a803a423a1239dc39a6397b393d390f38d738a238743838380b37d2379e376e3734370836cd369a3669362f360435c735963563352b350134c33493345d342733fc33be338f335833233f693f7f3f683f423f1a3ef03eb83e8c3e553e213df33db73d8a3d513d1d3cee3cb33c873c4c3c1a3be83baf3b843b473b163ae23aaa3a803a423a1239dc39a6397b393d390f38d738a238743838380b37d2379e376e3734370836cd369a3669362f360435c735963563352b350134c33493345d342733fc33be338f33583323",
+    "torch": "2.6.0"
+  },
+  "receipt": {
+    "capture_scope": "loop0/layer0/decode-append/position2/query-head0/key-head0",
+    "generation_command": [
+      "scripts/gen_reference_fixtures.py",
+      "--capture-rope-application",
+      "--rope-application-phase",
+      "decode-append",
+      "--model-source",
+      "/Users/jemanuel/.cache/franken_nlp/source/Nanbeige4.2-3B/f56ec5a9650268aa098496734743c25ea778bd2d",
+      "--rope-application-output",
+      "/tmp/fnlp-rope-decode-application-6wt.json"
+    ],
+    "generator_commit": "39e4dd81e7c22268221d83d034ae54701afe8743",
+    "generator_path": "scripts/gen_reference_fixtures.py",
+    "model_id": "Nanbeige/Nanbeige4.2-3B",
+    "model_source_closure_verification": "passed-before-model-load",
+    "oracle_env_record_sha256": "cf6045756fcad840b3a2297f369f714e8cdf1304bc08aec70206d3d091e72776",
+    "pinned_revision": "f56ec5a9650268aa098496734743c25ea778bd2d",
+    "source_manifest_sha256": "9263a395e9a9c948cb66aeb9ef05147b5e6e7f848defcafd0ce6b2e31aacddca"
+  }
+}
