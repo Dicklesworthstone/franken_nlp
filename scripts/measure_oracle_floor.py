@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Analyze the pinned CPU oracle's independently-launched-run floor.
 
-This pre-write deliberately implements only the model-free portions of
-franken_nlp-snp: `--analyze-only` and `--self-test`.  Recording a live oracle
-run is blocked on franken_nlp-ilz's immutable, smoke-proven closure.  No mode
-in this script imports torch, downloads a model, creates a venv, or overwrites
-an existing artifact.
+`--record-campaign` launches one fresh locked-venv interpreter per run; its
+child-only `--record-run` mode loads the pinned CPU/eager oracle, records the
+fixture-corpus logits and a greedy stream, and refuses to overwrite a run or
+sidecar.  `--analyze-only` remains model-free and replays the recorded
+campaign.  No mode downloads a model, creates a venv, or overwrites an
+existing artifact.
 
 Expected recorded-campaign layout (to be produced only after ilz is complete):
 
@@ -30,6 +31,7 @@ import os
 import random
 import re
 import struct
+import subprocess
 import sys
 from collections import defaultdict
 from collections.abc import Iterable
@@ -137,6 +139,10 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
 def rejecting_object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -209,7 +215,37 @@ def load_preregistration(path: Path) -> tuple[dict[str, Any], str]:
         "additional_processes_per_thread": additional,
         "confidence_level": float(confidence),
         "convergence_rule": rule,
+        "fixture_prompt_cases": record.get("fixture_prompt_cases"),
+        "max_new_tokens": record.get("max_new_tokens"),
     }, digest
+
+
+def fixture_prompt_cases(preregistration: dict[str, Any]) -> dict[str, str]:
+    """Return the preregistered prompt-id to SHA-256 mapping for a live run."""
+
+    values = require_list(preregistration.get("fixture_prompt_cases"), "preregistration.fixture_prompt_cases")
+    if not values:
+        fail("preregistration.fixture_prompt_cases must not be empty")
+    result: dict[str, str] = {}
+    for index, value in enumerate(values):
+        item = require_object(value, f"preregistration.fixture_prompt_cases[{index}]")
+        if set(item) != {"id", "prompt_sha256"}:
+            fail(f"preregistration.fixture_prompt_cases[{index}] must contain exactly id and prompt_sha256")
+        prompt_id = require_identifier(item["id"], f"preregistration.fixture_prompt_cases[{index}].id")
+        digest = require_sha256(item["prompt_sha256"], f"preregistration.fixture_prompt_cases[{index}].prompt_sha256")
+        if prompt_id in result:
+            fail(f"preregistration.fixture_prompt_cases duplicates id={prompt_id}")
+        if digest in result.values():
+            fail(f"preregistration.fixture_prompt_cases duplicates prompt_sha256={digest}")
+        result[prompt_id] = digest
+    return result
+
+
+def preregistered_max_new_tokens(preregistration: dict[str, Any]) -> int:
+    value = preregistration.get("max_new_tokens")
+    if not is_uint(value) or value < 1:
+        fail("preregistration.max_new_tokens must be a positive integer")
+    return value
 
 
 def resolve_sidecar(run_path: Path, relative: object, location: str) -> Path:
@@ -561,7 +597,7 @@ def analyze_records(preregistration: dict[str, Any], preregistration_digest: str
         }
         for result in results
     }
-    return {
+    analysis: dict[str, Any] = {
         "schema_version": ANALYSIS_SCHEMA_VERSION,
         "profile": PROFILE,
         "preregistration_sha256": preregistration_digest,
@@ -579,6 +615,27 @@ def analyze_records(preregistration: dict[str, Any], preregistration_digest: str
         "analysis_generated_at": utc_now(),
         "execution_status": "measured_from_recorded_runs",
     }
+    if preregistration.get("fixture_prompt_cases") is not None:
+        digest_by_id = fixture_prompt_cases(preregistration)
+        observed_ids = sorted({prompt_id for record in records for prompt_id in record["prompts"]})
+        if observed_ids != sorted(digest_by_id):
+            fail(
+                "recorded prompt ids differ from preregistration "
+                f"expected={sorted(digest_by_id)} observed={observed_ids}"
+            )
+        cross_thread_prefixes: dict[str, int] = {}
+        first_divergences: dict[str, int | None] = {}
+        for prompt_id, prompt_digest in sorted(digest_by_id.items()):
+            token_streams = [record["prompts"][prompt_id]["tokens"] for record in records]
+            stable_count, first_divergence = common_prefix(token_streams)
+            cross_thread_prefixes[prompt_digest] = stable_count
+            first_divergences[prompt_digest] = first_divergence
+        analysis["stable_prefixes"] = cross_thread_prefixes
+        analysis["cross_thread_first_divergence_token_positions"] = first_divergences
+        analysis["derived_tolerance_vectors"] = {
+            str(result["thread_count"]): result["derived_tolerance_vector"] for result in results
+        }
+    return analysis
 
 
 def write_new_json(path: Path, payload: dict[str, Any]) -> str:
@@ -597,6 +654,270 @@ def write_new_json(path: Path, payload: dict[str, Any]) -> str:
     digest = hashlib.sha256(encoded).hexdigest()
     log("analysis_written", path=str(path), sha256=digest)
     return digest
+
+
+def write_new_bytes(path: Path, payload: bytes) -> str:
+    if path.exists() or path.is_symlink():
+        fail(f"refusing to overwrite existing output: {path}")
+    if not path.parent.is_dir():
+        fail(f"output parent does not exist: {path.parent}")
+    try:
+        with path.open("xb") as destination:
+            destination.write(payload)
+            destination.flush()
+            os.fsync(destination.fileno())
+    except FileExistsError as exc:
+        raise FloorError(f"refusing to overwrite existing output: {path}") from exc
+    return sha256_bytes(payload)
+
+
+def load_fixture_prompts(path: Path, expected_digests: dict[str, str]) -> list[tuple[str, str]]:
+    corpus, _ = read_json(path, "fixture corpus")
+    prompts = require_list(corpus.get("prompts"), "fixture corpus.prompts")
+    if len(prompts) != len(expected_digests):
+        fail(
+            "fixture corpus prompt count differs from preregistration "
+            f"expected={len(expected_digests)} observed={len(prompts)}"
+        )
+    result: list[tuple[str, str]] = []
+    for index, prompt in enumerate(prompts):
+        if not isinstance(prompt, str) or not prompt:
+            fail(f"fixture corpus.prompts[{index}] must be a non-empty string")
+        prompt_id = f"fixture-{index:03d}"
+        expected_digest = expected_digests.get(prompt_id)
+        if expected_digest is None:
+            fail(f"fixture corpus has no preregistered id={prompt_id}")
+        observed_digest = sha256_bytes(prompt.encode("utf-8"))
+        if observed_digest != expected_digest:
+            fail(
+                f"fixture corpus prompt digest differs for id={prompt_id} "
+                f"expected={expected_digest} observed={observed_digest}"
+            )
+        result.append((prompt_id, prompt))
+    return result
+
+
+def configure_child_threads(thread_count: int) -> Any:
+    """Set every declared thread knob before importing the oracle runtime."""
+
+    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ[name] = str(thread_count)
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    try:
+        import torch
+    except ImportError as exc:
+        raise FloorError(f"locked oracle interpreter cannot import torch: {exc}") from exc
+    torch.set_num_threads(thread_count)
+    torch.set_num_interop_threads(1)
+    if torch.get_num_threads() != thread_count or torch.get_num_interop_threads() != 1:
+        fail(
+            "torch thread configuration differs from the preregistered values "
+            f"intra={torch.get_num_threads()} inter={torch.get_num_interop_threads()}"
+        )
+    return torch
+
+
+def direct_greedy_from_prefill(model: Any, inputs: dict[str, Any], first_forward: Any, max_new_tokens: int) -> list[int]:
+    """Continue the smoke's direct cache-forward greedy route from one prefill."""
+
+    step = first_forward
+    tokens: list[int] = []
+    for index in range(max_new_tokens):
+        token_id = int(step.logits[0, -1].argmax().item())
+        tokens.append(token_id)
+        if index + 1 == max_new_tokens:
+            break
+        past_key_values = getattr(step, "past_key_values", None)
+        if past_key_values is None:
+            fail("pinned model forward omitted past_key_values during greedy decode")
+        step = model(
+            input_ids=inputs["input_ids"].new_tensor([[token_id]]),
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+    return tokens
+
+
+def record_run(
+    runs_dir: Path,
+    source: Path,
+    fixture_corpus: Path,
+    thread_count: int,
+    run_id: str,
+    launch_id: str,
+    max_new_tokens: int,
+) -> None:
+    """Record one run in this process, which the parent launches only once."""
+
+    preregistration, preregistration_digest = load_preregistration(runs_dir / "preregistration.json")
+    if thread_count not in preregistration["thread_counts"]:
+        fail(f"thread_count={thread_count} is not preregistered")
+    if max_new_tokens != preregistered_max_new_tokens(preregistration):
+        fail(
+            "--max-new-tokens differs from preregistration "
+            f"expected={preregistered_max_new_tokens(preregistration)} observed={max_new_tokens}"
+        )
+    prompt_cases = fixture_prompt_cases(preregistration)
+    prompts = load_fixture_prompts(fixture_corpus, prompt_cases)
+    if not isinstance(run_id, str) or not IDENTIFIER.fullmatch(run_id):
+        fail("--run-id must be an ASCII identifier")
+    if not isinstance(launch_id, str) or not IDENTIFIER.fullmatch(launch_id):
+        fail("--launch-id must be an ASCII identifier")
+    run_dir = runs_dir / "runs"
+    if not run_dir.is_dir() or run_dir.is_symlink():
+        fail(f"recording requires a regular runs directory: {run_dir}")
+    run_path = run_dir / f"{run_id}.json"
+    if run_path.exists() or run_path.is_symlink():
+        fail(f"refusing to overwrite existing output: {run_path}")
+
+    started_at = utc_now()
+    torch = configure_child_threads(thread_count)
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from verify_oracle_env import capture_environment, read_record, source_files, validate_installed_closure, verify_record
+    except ImportError as exc:
+        raise FloorError(f"locked oracle interpreter cannot import an oracle dependency: {exc}") from exc
+
+    oracle_record = read_record()
+    verify_record(oracle_record)
+    source_files(oracle_record, source, need_weights=True)
+    validate_installed_closure(oracle_record)
+    tokenizer = AutoTokenizer.from_pretrained(
+        source,
+        trust_remote_code=True,
+        use_fast=False,
+        local_files_only=True,
+        revision=oracle_record["source_identity"]["revision"],
+    )
+    if getattr(tokenizer, "is_fast", None) is not False:
+        fail(f"slow tokenizer required; got {tokenizer.__class__.__name__}")
+    model = AutoModelForCausalLM.from_pretrained(
+        source,
+        trust_remote_code=True,
+        local_files_only=True,
+        revision=oracle_record["source_identity"]["revision"],
+        torch_dtype=torch.bfloat16,
+        attn_implementation="eager",
+    ).to("cpu")
+    model.train(False)
+    actual_attention = getattr(model.config, "_attn_implementation", None)
+    if actual_attention != "eager":
+        fail(f"eager attention required; runtime config reported {actual_attention!r}")
+
+    captured: list[tuple[str, list[int], bytes, list[int]]] = []
+    with torch.inference_mode():
+        for prompt_id, prompt in prompts:
+            inputs = tokenizer(prompt, return_tensors="pt")
+            forward = model(**inputs, use_cache=True)
+            logits = forward.logits[0, -1].detach().to(device="cpu", dtype=torch.float32).contiguous()
+            values = logits.numpy().astype("<f4", copy=False).tobytes()
+            tokens = direct_greedy_from_prefill(model, inputs, forward, max_new_tokens)
+            captured.append((prompt_id, list(logits.shape), values, tokens))
+
+    environment = capture_environment()
+    environment["thread_control"] = {
+        "torch_num_interop_threads": 1,
+        "torch_num_threads": thread_count,
+        "OMP_NUM_THREADS": str(thread_count),
+        "MKL_NUM_THREADS": str(thread_count),
+        "OPENBLAS_NUM_THREADS": str(thread_count),
+        "VECLIB_MAXIMUM_THREADS": str(thread_count),
+    }
+    environment["oracle_source"] = {
+        "model_id": oracle_record["source_identity"]["model_id"],
+        "revision": oracle_record["source_identity"]["revision"],
+        "path": str(source),
+        "attention_implementation": actual_attention,
+        "tokenizer_class": tokenizer.__class__.__name__,
+        "tokenizer_is_fast": tokenizer.is_fast,
+    }
+    prompt_records: list[dict[str, Any]] = []
+    for prompt_id, shape, payload, tokens in captured:
+        sidecar_name = f"{run_id}-{prompt_id}-logits.f32"
+        sidecar_digest = write_new_bytes(run_dir / sidecar_name, payload)
+        prompt_records.append(
+            {
+                "id": prompt_id,
+                "greedy_token_ids": tokens,
+                "logits": {"path": sidecar_name, "dtype": "f32", "shape": shape, "sha256": sidecar_digest},
+                "taps": {},
+            }
+        )
+    write_new_json(
+        run_path,
+        {
+            "schema_version": RUN_SCHEMA_VERSION,
+            "run_id": run_id,
+            "launch_id": launch_id,
+            "started_at": started_at,
+            "ended_at": utc_now(),
+            "profile": PROFILE,
+            "thread_count": thread_count,
+            "fresh_interpreter": True,
+            "preregistration_sha256": preregistration_digest,
+            "environment": environment,
+            "prompts": prompt_records,
+        },
+    )
+    log("run_recorded", run_id=run_id, launch_id=launch_id, thread_count=thread_count, prompts=len(prompt_records))
+
+
+def record_campaign(
+    runs_dir: Path,
+    venv_python: Path,
+    source: Path,
+    fixture_corpus: Path,
+    max_new_tokens: int,
+) -> int:
+    """Launch the preregistered independent-process campaign without importing torch."""
+
+    preregistration, _ = load_preregistration(runs_dir / "preregistration.json")
+    fixture_prompt_cases(preregistration)
+    if max_new_tokens != preregistered_max_new_tokens(preregistration):
+        fail(
+            "--max-new-tokens differs from preregistration "
+            f"expected={preregistered_max_new_tokens(preregistration)} observed={max_new_tokens}"
+        )
+    if not venv_python.is_file() or not os.access(venv_python, os.X_OK):
+        fail(f"--venv-python must be an executable file: {venv_python}")
+    if not source.is_dir():
+        fail(f"--source must be a source snapshot directory: {source}")
+    if not fixture_corpus.is_file() or fixture_corpus.is_symlink():
+        fail(f"--fixture-corpus must be a regular file: {fixture_corpus}")
+    run_dir = runs_dir / "runs"
+    if run_dir.exists() or run_dir.is_symlink():
+        fail(f"refusing to reuse an existing runs directory: {run_dir}")
+    run_dir.mkdir()
+    script = Path(__file__).resolve()
+    launched = 0
+    for thread_count in preregistration["thread_counts"]:
+        for index in range(1, preregistration["minimum_processes"] + 1):
+            run_id = f"t{thread_count}-run{index:02d}"
+            launch_id = f"t{thread_count}-launch{index:02d}"
+            command = [
+                str(venv_python),
+                str(script),
+                "--record-run",
+                str(runs_dir),
+                "--source",
+                str(source),
+                "--fixture-corpus",
+                str(fixture_corpus),
+                "--thread-count",
+                str(thread_count),
+                "--run-id",
+                run_id,
+                "--launch-id",
+                launch_id,
+                "--max-new-tokens",
+                str(max_new_tokens),
+            ]
+            log("fresh_interpreter_start", run_id=run_id, launch_id=launch_id, thread_count=thread_count, command=command)
+            completed = subprocess.run(command, check=False)
+            if completed.returncode != 0:
+                fail(f"fresh interpreter failed run_id={run_id} returncode={completed.returncode}")
+            launched += 1
+    return launched
 
 
 def synthetic_preregistration() -> dict[str, Any]:
@@ -690,17 +1011,66 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--analyze-only", type=Path, metavar="RUNS_DIR", help="analyze a previously recorded campaign; never loads a model")
     group.add_argument("--self-test", action="store_true", help="run model-free synthetic analysis checks")
+    group.add_argument("--record-campaign", type=Path, metavar="RUNS_DIR", help="launch the preregistered fresh-interpreter campaign")
+    group.add_argument("--record-run", type=Path, metavar="RUNS_DIR", help=argparse.SUPPRESS)
     parser.add_argument("--output", type=Path, help="new JSON destination for --analyze-only; existing files are refused")
+    parser.add_argument("--venv-python", type=Path, help="locked venv interpreter for --record-campaign")
+    parser.add_argument("--source", type=Path, help="revision-scoped local Nanbeige source closure for recording")
+    parser.add_argument(
+        "--fixture-corpus",
+        type=Path,
+        default=ROOT / "tests" / "fixtures" / "reference_inputs.json",
+        help="repository-authored prompt corpus named by preregistration",
+    )
+    parser.add_argument("--thread-count", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--run-id", help=argparse.SUPPRESS)
+    parser.add_argument("--launch-id", help=argparse.SUPPRESS)
+    parser.add_argument("--max-new-tokens", type=int, default=8, help="must equal the preregistered greedy length when recording")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     if args.self_test:
-        if args.output is not None:
-            fail("--output is valid only with --analyze-only")
+        if args.output is not None or args.venv_python is not None or args.source is not None or args.thread_count is not None:
+            fail("recording arguments are not valid with --self-test")
         self_test()
         return emit_result("PASS", runs=0, thread_counts=[], mode="self_test", cases=4)
+
+    if args.record_campaign is not None:
+        if args.output is not None:
+            fail("--output is valid only with --analyze-only")
+        if args.venv_python is None or args.source is None:
+            fail("--record-campaign requires --venv-python and --source")
+        if args.thread_count is not None or args.run_id is not None or args.launch_id is not None:
+            fail("--thread-count, --run-id, and --launch-id are child-only recording arguments")
+        launched = record_campaign(
+            args.record_campaign,
+            args.venv_python,
+            args.source,
+            args.fixture_corpus,
+            args.max_new_tokens,
+        )
+        preregistration, _ = load_preregistration(args.record_campaign / "preregistration.json")
+        return emit_result("PASS", runs=launched, thread_counts=preregistration["thread_counts"], mode="record_campaign")
+
+    if args.record_run is not None:
+        if args.output is not None or args.venv_python is not None:
+            fail("--output and --venv-python are not valid with --record-run")
+        if args.source is None or args.thread_count is None or args.run_id is None or args.launch_id is None:
+            fail("--record-run requires --source, --thread-count, --run-id, and --launch-id")
+        if not is_uint(args.thread_count) or args.thread_count < 1:
+            fail("--thread-count must be a positive integer")
+        record_run(
+            args.record_run,
+            args.source,
+            args.fixture_corpus,
+            args.thread_count,
+            args.run_id,
+            args.launch_id,
+            args.max_new_tokens,
+        )
+        return emit_result("PASS", runs=1, thread_counts=[args.thread_count], mode="record_run")
 
     preregistration, preregistration_digest, records = load_campaign(args.analyze_only)
     analysis = analyze_records(preregistration, preregistration_digest, records)
