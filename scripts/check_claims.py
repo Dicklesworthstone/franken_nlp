@@ -337,37 +337,201 @@ def retained_regular_file(root: Path, relative_path: str) -> Path | None:
     return current
 
 
-def r4_evidence_is_retained(root: Path, fields: dict[str, str], fixture_hashes: set[str]) -> bool:
-    """Require distinct, byte-addressed R4 and admission receipts in the tree."""
+def require_positive_int(value: Any, *, location: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ClaimsError(f"expected positive integer at {location}: observed={value!r}")
+    return value
+
+
+def require_positive_number(value: Any, *, location: str) -> int | float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+        raise ClaimsError(f"expected positive number at {location}: observed={value!r}")
+    return value
+
+
+def receipt_number(value: int | float) -> str:
+    """Render a JSON number for the fixed R4 ledger binding grammar."""
+
+    return format(value, ".17g")
+
+
+def r4_artifact_binding(artifact: dict[str, Any]) -> str:
+    return (
+        f"recipe_id={artifact['recipe_id']}; packing_sha256={artifact['packing_sha256']}; "
+        f"kernel_table_sha256={artifact['kernel_table_sha256']}; load_mode={artifact['load_mode']}"
+    )
+
+
+def r4_context_binding(context: dict[str, Any]) -> str:
+    return f"tokens={context['tokens']}; kv_dtype={context['kv_dtype']}"
+
+
+def r4_percentile_binding(measurement: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for metric in ("prefill_ms", "decode_tokens_per_s"):
+        percentiles = measurement[metric]
+        rendered = ",".join(f"{key}={receipt_number(percentiles[key])}" for key in ("p50", "p95", "p99"))
+        parts.append(f"{metric}({rendered})")
+    return "; ".join(parts)
+
+
+def r4_measurement_summary(measurement: dict[str, Any]) -> str:
+    return f"kv_bytes={measurement['kv_bytes']}; peak_rss_bytes={measurement['peak_rss_bytes']}"
+
+
+def r4_admission_binding(admission: dict[str, Any]) -> str:
+    return (
+        f"outcome={admission['outcome']}; committed_bytes={admission['committed_bytes']}; "
+        f"peak_bytes={admission['peak_bytes']}"
+    )
+
+
+def load_r4_receipt(path: Path, expected_digest: str, expected_kind: str) -> dict[str, Any]:
+    """Load a canonical typed R4 receipt and verify its content address."""
+
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise ClaimsError(f"R4 receipt unavailable file={path}: {error}") from error
+    actual_digest = hashlib.sha256(raw).hexdigest()
+    if actual_digest != expected_digest:
+        raise ClaimsError(f"R4 receipt digest mismatch file={path} expected={expected_digest} observed={actual_digest}")
+    try:
+        receipt = json.loads(raw, object_pairs_hook=no_duplicate_object)
+    except (json.JSONDecodeError, DuplicateKeyError) as error:
+        raise ClaimsError(f"R4 receipt is not duplicate-key-free JSON file={path}: {error}") from error
+    if not isinstance(receipt, dict) or raw != canonical_json_bytes(receipt):
+        raise ClaimsError(f"R4 receipt is not canonical JSON file={path}")
+    if receipt.get("schema_version") != R4_RECEIPT_SCHEMA_VERSION:
+        raise ClaimsError(f"R4 receipt schema version is invalid file={path}")
+    if receipt.get("kind") != expected_kind:
+        raise ClaimsError(f"R4 receipt kind is invalid file={path} expected={expected_kind}")
+
+    expected_keys = set(R4_COMMON_RECEIPT_KEYS)
+    expected_keys.add("measurement" if expected_kind == "r4-measurement" else "admission")
+    if set(receipt) != expected_keys:
+        raise ClaimsError(f"R4 receipt keys are invalid file={path}")
+    for key in ("ledger_entry", "claim_id", "cpu_feature_string", "host_fingerprint"):
+        require_string(receipt[key], location=f"R4 receipt {path}/{key}")
+    if not CLAIM_ID_RE.fullmatch(receipt["claim_id"]):
+        raise ClaimsError(f"R4 receipt claim id grammar violation file={path}")
+
+    domain = receipt["validity_domain"]
+    if not isinstance(domain, dict) or set(domain) != DOMAIN_KEYS:
+        raise ClaimsError(f"R4 receipt validity domain keys are invalid file={path}")
+    for key, value in domain.items():
+        require_string(value, location=f"R4 receipt {path}/validity_domain/{key}")
+
+    artifact = receipt["artifact"]
+    if not isinstance(artifact, dict) or set(artifact) != R4_ARTIFACT_KEYS:
+        raise ClaimsError(f"R4 receipt artifact keys are invalid file={path}")
+    require_string(artifact["recipe_id"], location=f"R4 receipt {path}/artifact/recipe_id")
+    require_string(artifact["load_mode"], location=f"R4 receipt {path}/artifact/load_mode")
+    for key in ("packing_sha256", "kernel_table_sha256"):
+        if not isinstance(artifact[key], str) or not DIGEST_RE.fullmatch(artifact[key]):
+            raise ClaimsError(f"R4 receipt artifact digest is invalid file={path} key={key}")
+
+    context = receipt["context"]
+    if not isinstance(context, dict) or set(context) != R4_CONTEXT_KEYS:
+        raise ClaimsError(f"R4 receipt context keys are invalid file={path}")
+    if require_positive_int(context["tokens"], location=f"R4 receipt {path}/context/tokens") <= DEFAULT_CONTEXT_CAP:
+        raise ClaimsError(f"R4 receipt context must exceed default cap file={path}")
+    require_string(context["kv_dtype"], location=f"R4 receipt {path}/context/kv_dtype")
+
+    if expected_kind == "r4-measurement":
+        measurement = receipt["measurement"]
+        if not isinstance(measurement, dict) or set(measurement) != R4_MEASUREMENT_KEYS:
+            raise ClaimsError(f"R4 measurement keys are invalid file={path}")
+        for metric in ("prefill_ms", "decode_tokens_per_s"):
+            distribution = measurement[metric]
+            if not isinstance(distribution, dict) or set(distribution) != PERCENTILE_KEYS:
+                raise ClaimsError(f"R4 measurement percentile keys are invalid file={path} metric={metric}")
+            for percentile, value in distribution.items():
+                require_positive_number(value, location=f"R4 receipt {path}/{metric}/{percentile}")
+        for metric in ("kv_bytes", "peak_rss_bytes"):
+            require_positive_int(measurement[metric], location=f"R4 receipt {path}/{metric}")
+    else:
+        admission = receipt["admission"]
+        if not isinstance(admission, dict) or set(admission) != R4_ADMISSION_KEYS:
+            raise ClaimsError(f"R4 admission keys are invalid file={path}")
+        if admission["outcome"] != "admitted":
+            raise ClaimsError(f"R4 admission outcome must be admitted file={path}")
+        for key in ("committed_bytes", "peak_bytes"):
+            require_positive_int(admission[key], location=f"R4 receipt {path}/admission/{key}")
+    return receipt
+
+
+def r4_evidence_is_retained(
+    root: Path,
+    entry_id: str,
+    fields: dict[str, str],
+    fixture_hashes: set[str],
+    claims: Mapping[str, dict[str, Any]],
+) -> bool:
+    """Require typed receipts whose contents exactly bind the R4 ledger row."""
 
     matches = list(R4_EVIDENCE_RECEIPT_RE.finditer(fields.get("Evidence", "")))
     if len(matches) != 2:
         return False
-    receipts: dict[str, tuple[str, str]] = {}
+    receipt_paths: dict[str, tuple[str, str]] = {}
     for match in matches:
-        if match["kind"] in receipts:
+        if match["kind"] in receipt_paths:
             return False
-        receipts[match["kind"]] = (match["path"], match["digest"])
-    if set(receipts) != {"r4-receipt", "admission-receipt"}:
+        receipt_paths[match["kind"]] = (match["path"], match["digest"])
+    if set(receipt_paths) != {"r4-receipt", "admission-receipt"}:
         return False
-    if receipts["r4-receipt"][0] == receipts["admission-receipt"][0]:
+    if receipt_paths["r4-receipt"][0] == receipt_paths["admission-receipt"][0]:
         return False
-    for path_text, digest in receipts.values():
+
+    receipts: dict[str, dict[str, Any]] = {}
+    expected_kinds = {"r4-receipt": "r4-measurement", "admission-receipt": "r4-admission"}
+    for evidence_kind, (path_text, digest) in receipt_paths.items():
         if f"sha256:{digest}" not in fixture_hashes:
             return False
         path = retained_regular_file(root, path_text)
         if path is None:
             return False
         try:
-            actual = hashlib.sha256(path.read_bytes()).hexdigest()
-        except OSError:
+            receipts[evidence_kind] = load_r4_receipt(path, digest, expected_kinds[evidence_kind])
+        except ClaimsError:
             return False
-        if actual != digest:
+
+    measurement = receipts["r4-receipt"]
+    admission = receipts["admission-receipt"]
+    claim_id = fields.get("Claim ID")
+    claim = claims.get(claim_id or "")
+    if claim is None or claim["state"] != "evidenced":
+        return False
+    for key in ("ledger_entry", "claim_id", "validity_domain", "host_fingerprint", "cpu_feature_string", "artifact", "context"):
+        if measurement[key] != admission[key]:
             return False
+    if measurement["ledger_entry"] != entry_id or measurement["claim_id"] != claim_id:
+        return False
+    if measurement["validity_domain"] != claim["validity_domain"]:
+        return False
+    if fields.get("Host fingerprint") != measurement["host_fingerprint"]:
+        return False
+    if fields.get("CPU feature string") != measurement["cpu_feature_string"]:
+        return False
+    if fields.get("Artifact recipe + packing + kernel table + load mode") != r4_artifact_binding(measurement["artifact"]):
+        return False
+    if fields.get("Context point") != r4_context_binding(measurement["context"]):
+        return False
+    if fields.get("p50/p95/p99") != r4_percentile_binding(measurement["measurement"]):
+        return False
+    if fields.get("R4 measurement summary") != r4_measurement_summary(measurement["measurement"]):
+        return False
+    if fields.get("Admission boundary outcomes") != r4_admission_binding(admission["admission"]):
+        return False
     return True
 
 
-def eligible_r4_ledger_entries(root: Path, *, ledger_path: Path | None = None) -> set[str]:
+def eligible_r4_ledger_entries(
+    root: Path,
+    claims: Mapping[str, dict[str, Any]],
+    *,
+    ledger_path: Path | None = None,
+) -> dict[str, str]:
     """Return measured R4 ledger rows eligible to support public context claims."""
 
     path = ledger_path if ledger_path is not None else root / "docs" / "PERF_LEDGER.md"
@@ -394,10 +558,11 @@ def eligible_r4_ledger_entries(root: Path, *, ledger_path: Path | None = None) -
     if entry_id is not None:
         entries[entry_id] = fields
 
-    eligible: set[str] = set()
+    eligible: dict[str, str] = {}
     for candidate, fields in entries.items():
         fixture_hashes = [item.strip() for item in fields.get("Fixture hashes", "").split(",")]
         fixture_hash_set = set(fixture_hashes)
+        claim_id = fields.get("Claim ID", "")
         if (
             fields.get("Regime") == "R4-long-context"
             and fields.get("Disposition") == "won"
@@ -405,9 +570,9 @@ def eligible_r4_ledger_entries(root: Path, *, ledger_path: Path | None = None) -
             and all(LEDGER_SHA256_RE.fullmatch(item) for item in fixture_hashes)
             and all(field_is_measured(fields.get(field)) for field in R4_REQUIRED_FIELDS)
             and all(percentile in fields["p50/p95/p99"].lower() for percentile in ("p50", "p95", "p99"))
-            and r4_evidence_is_retained(root, fields, fixture_hash_set)
+            and r4_evidence_is_retained(root, candidate, fields, fixture_hash_set, claims)
         ):
-            eligible.add(candidate)
+            eligible[candidate] = claim_id
     return eligible
 
 
@@ -448,7 +613,7 @@ def validate_r4_context_claim(
     active: Annotation | None,
     r4_ledger: str | None,
     claims: dict[str, dict[str, Any]],
-    eligible_ledgers: set[str],
+    eligible_ledgers: Mapping[str, str],
 ) -> None:
     if active is None:
         raise ClaimsError(f"file={path}:{line_number} R4 context claim missing fnlp-claim annotation")
@@ -461,7 +626,12 @@ def validate_r4_context_claim(
         raise ClaimsError(f"file={path}:{line_number} R4 context claim missing fnlp-r4-context ledger annotation")
     if r4_ledger not in eligible_ledgers:
         raise ClaimsError(
-            f"file={path}:{line_number} R4 context ledger={r4_ledger} lacks a won R4 row with fixture digests"
+            f"file={path}:{line_number} R4 context ledger={r4_ledger} lacks a typed, bound won R4 receipt"
+        )
+    if eligible_ledgers[r4_ledger] != active.claim_id:
+        raise ClaimsError(
+            f"file={path}:{line_number} R4 context ledger={r4_ledger} is bound to claim "
+            f"id={eligible_ledgers[r4_ledger]}, not active id={active.claim_id}"
         )
 
 
@@ -469,7 +639,7 @@ def scan_surface(
     path: Path,
     surface: str,
     claims: dict[str, dict[str, Any]],
-    eligible_r4_ledgers: set[str] | None = None,
+    eligible_r4_ledgers: Mapping[str, str] | None = None,
 ) -> tuple[int, int]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -481,7 +651,7 @@ def scan_surface(
     claim_lines = 0
     r4_context_lines = 0
     if eligible_r4_ledgers is None:
-        eligible_r4_ledgers = set()
+        eligible_r4_ledgers = {}
     for line_number, line in enumerate(lines, start=1):
         consumed_r4 = False
         if active_r4 is not None:
@@ -707,7 +877,7 @@ def run_self_test(root: Path, claims: dict[str, dict[str, Any]]) -> None:
         active=r4_annotation,
         r4_ledger="PERF-R4-VALID-001",
         claims=r4_claims,
-        eligible_ledgers={"PERF-R4-VALID-001"},
+        eligible_ledgers={"PERF-R4-VALID-001": r4_claim["id"]},
     )
     try:
         validate_r4_context_claim(
@@ -716,7 +886,7 @@ def run_self_test(root: Path, claims: dict[str, dict[str, Any]]) -> None:
             active=r4_annotation,
             r4_ledger=None,
             claims=r4_claims,
-            eligible_ledgers={"PERF-R4-VALID-001"},
+            eligible_ledgers={"PERF-R4-VALID-001": r4_claim["id"]},
         )
     except ClaimsError as error:
         if "missing fnlp-r4-context" not in str(error):
@@ -738,6 +908,7 @@ def run_self_test(root: Path, claims: dict[str, dict[str, Any]]) -> None:
             )
     fabricated = eligible_r4_ledger_entries(
         root,
+        r4_claims,
         ledger_path=fixtures / "r4_fabricated_perf_ledger.md",
     )
     if fabricated:
@@ -750,7 +921,7 @@ def run_self_test(root: Path, claims: dict[str, dict[str, Any]]) -> None:
             fixtures / "r4_floating_annotation.md",
             "README",
             {floating_claim["id"]: floating_claim},
-            {"PERF-R4-VALID-001"},
+            {"PERF-R4-VALID-001": floating_claim["id"]},
         )
     except ClaimsError as error:
         if "must immediately precede" not in str(error):
@@ -795,7 +966,7 @@ def main() -> int:
         if arguments.check:
             validate_links(root)
             validate_deferred_p7_scope(root)
-            r4_ledgers = eligible_r4_ledger_entries(root)
+            r4_ledgers = eligible_r4_ledger_entries(root, claims)
             log(f"R4_CONTEXT_GATE eligible_ledgers={len(r4_ledgers)}")
             for surface, path in existing_public_surfaces(root):
                 scan_surface(path, surface, claims, r4_ledgers)
