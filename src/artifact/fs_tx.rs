@@ -563,7 +563,7 @@ pub fn discover_activation(records: &[ActivationRecord]) -> Result<ActivationDis
                         verdict: ChainWalkVerdict::ForkSuccessor,
                     });
                 }
-                for record in valid {
+                for record in &valid {
                     if adopted.contains(&record.record_digest) {
                         walk.push(ChainWalkEntry {
                             sequence: record.body.sequence,
