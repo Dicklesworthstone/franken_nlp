@@ -123,7 +123,11 @@ fn runner_schedule_and_boundary_norm_match_independent_scalar_spec() {
     {
         assert_eq!(*loop_index, expected_tap.loop_index, "call={index}");
         assert_eq!(*layer_index, expected_tap.layer_index, "call={index}");
-        assert_eq!(*slot, layer_index + loop_index * PHYSICAL_LAYERS, "call={index}");
+        assert_eq!(
+            *slot,
+            *layer_index + *loop_index * PHYSICAL_LAYERS,
+            "call={index}"
+        );
     }
     assert_eq!(hidden, expected.taps.post_loop_norms[1]);
     assert!(product_cache.all_slots_have_len(1));

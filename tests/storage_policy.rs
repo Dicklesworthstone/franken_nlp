@@ -177,7 +177,7 @@ fn enabled_store_round_trips_metadata_only_state_with_owner_only_permissions() {
             job_id,
             item_id,
             input_digest: franken_nlp::storage::Sha256Digest::new([2; 32]),
-            state: franken_nlp::storage::Pending,
+            state: franken_nlp::storage::JobState::Pending,
             attempt_count: 0,
             updated_at_ms: 1,
         })
