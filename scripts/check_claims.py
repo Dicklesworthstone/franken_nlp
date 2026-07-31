@@ -595,6 +595,8 @@ def eligible_r4_ledger_entries(
         if entry_id is None or not line.startswith("- ") or ": " not in line:
             continue
         name, value = line[2:].split(": ", maxsplit=1)
+        if name in fields:
+            raise ClaimsError(f"R4 ledger has duplicate field entry={entry_id} field={name!r}")
         fields[name] = value
     if entry_id is not None:
         entries[entry_id] = fields
@@ -1026,6 +1028,17 @@ def run_self_test(root: Path, claims: dict[str, dict[str, Any]]) -> None:
         ledger_path=fixtures / "r4_typed_ledger.md",
     ):
         raise ClaimsError("self-test R4 receipts not bound to the registry claim were eligible")
+    try:
+        eligible_r4_ledger_entries(
+            root,
+            r4_claims,
+            ledger_path=fixtures / "r4_duplicate_field_ledger.md",
+        )
+    except ClaimsError as error:
+        if "duplicate field" not in str(error):
+            raise
+    else:
+        raise ClaimsError("self-test duplicate R4 ledger field was accepted")
     for fixture_name in ("r4_retained_garbage_ledger.md", "r4_duplicate_evidence_ledger.md"):
         hostile = eligible_r4_ledger_entries(
             root,
