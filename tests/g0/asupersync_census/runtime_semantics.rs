@@ -150,5 +150,76 @@ fn budget_and_capability_budget_shapes_match_doctrine() {
         "RATIFIED",
         "deadline-pollquota-costquota-priority-fields+capability-budget-present",
     );
-    println!("G0_CENSUS summary items=3 ratified=3 absent_with_fallback=0 fail=0 residual=cast-enqueue-only,try-cast-policies,execplan-first-ok,preset-values,lab-determinism,compile-fail-suite");
+}
+
+/// Preset builder values observed on constructed runtimes, not read from
+/// prose: current_thread pins one worker; the deterministic default is the
+/// host-independent DEFAULT_WORKER_THREADS = 4; high_throughput doubles it
+/// (workers 8, steal batch 32) — never blind-pair it with a physical-core-wide
+/// scoped team; low_latency trades throughput for tail latency (steal batch 4,
+/// poll budget 32).
+#[test]
+fn preset_builder_values_observed_on_constructed_runtimes() {
+    use asupersync::runtime::{RuntimeBuilder, RuntimeConfig};
+
+    assert_eq!(
+        RuntimeConfig::DEFAULT_WORKER_THREADS,
+        4,
+        "deterministic host-independent default worker count"
+    );
+
+    let current = RuntimeBuilder::current_thread()
+        .build()
+        .expect("current_thread runtime builds");
+    assert_eq!(current.config().worker_threads, 1);
+    println!(
+        "G0_CENSUS item=preset-values preset=current_thread workers={}",
+        current.config().worker_threads
+    );
+    drop(current);
+
+    let default_rt = RuntimeBuilder::multi_thread()
+        .build()
+        .expect("multi_thread runtime builds");
+    assert_eq!(default_rt.config().worker_threads, RuntimeConfig::DEFAULT_WORKER_THREADS);
+    println!(
+        "G0_CENSUS item=preset-values preset=multi_thread workers={}",
+        default_rt.config().worker_threads
+    );
+    drop(default_rt);
+
+    let throughput = RuntimeBuilder::high_throughput()
+        .build()
+        .expect("high_throughput runtime builds");
+    assert_eq!(
+        throughput.config().worker_threads,
+        RuntimeConfig::DEFAULT_WORKER_THREADS * 2,
+        "high_throughput doubles the deterministic default, not the host core count"
+    );
+    assert_eq!(throughput.config().steal_batch_size, 32);
+    println!(
+        "G0_CENSUS item=preset-values preset=high_throughput workers={} steal_batch={}",
+        throughput.config().worker_threads,
+        throughput.config().steal_batch_size
+    );
+    drop(throughput);
+
+    let latency = RuntimeBuilder::low_latency()
+        .build()
+        .expect("low_latency runtime builds");
+    assert_eq!(latency.config().steal_batch_size, 4);
+    assert_eq!(latency.config().poll_budget, 32);
+    println!(
+        "G0_CENSUS item=preset-values preset=low_latency steal_batch={} poll_budget={}",
+        latency.config().steal_batch_size,
+        latency.config().poll_budget
+    );
+    drop(latency);
+
+    census(
+        "preset-values",
+        "RATIFIED",
+        "observed-on-built-runtimes:current1+default4+throughput8x32+latency4x32",
+    );
+    println!("G0_CENSUS summary items=4 ratified=4 absent_with_fallback=0 fail=0 residual=cast-enqueue-only,try-cast-policies,execplan-first-ok,lab-determinism,compile-fail-suite");
 }
