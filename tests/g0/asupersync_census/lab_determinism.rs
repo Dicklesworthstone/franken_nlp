@@ -14,6 +14,7 @@ use std::{
 use asupersync::{
     Budget,
     lab::{LabConfig, LabRuntime},
+    runtime::{RuntimeBuilder, config::ObligationLeakResponse},
     trace::ReplayTrace,
     util::DetRng,
 };
@@ -109,5 +110,42 @@ fn lab_runtime_replays_same_seed_with_identical_completion_and_trace() {
     );
     println!(
         "G0_CENSUS item=lab-determinism RESULT=RATIFIED evidence=fresh-runtime+cooperative-workload+completion-order+replay-events"
+    );
+}
+
+/// The pin makes leak handling an explicit policy: strict lab/CI configuration
+/// starts at `Panic`, while a production runtime can be configured to log.
+/// This records the available foundation behavior only; FrankenNLP still needs
+/// its own named escalation and durable-reservation policy before adoption.
+#[test]
+fn obligation_leak_response_is_explicit_for_lab_and_runtime() {
+    let strict_lab = LabConfig::new(0x035C_0B11);
+    assert!(
+        strict_lab.panic_on_obligation_leak,
+        "LabConfig must default to failing fast on obligation leaks"
+    );
+
+    let diagnostic_lab = LabConfig::new(0x035C_0B12).panic_on_leak(false);
+    assert!(
+        !diagnostic_lab.panic_on_obligation_leak,
+        "the Lab must make its diagnostic log path an explicit opt-in"
+    );
+
+    let runtime = RuntimeBuilder::current_thread()
+        .obligation_leak_response(ObligationLeakResponse::Log)
+        .build()
+        .expect("current-thread runtime builds with an explicit log policy");
+    assert_eq!(
+        runtime.config().obligation_leak_response,
+        ObligationLeakResponse::Log,
+        "production logging is a deliberate builder choice, never an implicit fallback"
+    );
+    drop(runtime);
+
+    println!("G0_CENSUS item=obligation-leak-policy case=lab-default response=Panic");
+    println!("G0_CENSUS item=obligation-leak-policy case=lab-diagnostic response=Log");
+    println!("G0_CENSUS item=obligation-leak-policy case=runtime-builder response=Log");
+    println!(
+        "G0_CENSUS item=obligation-leak-policy RESULT=RATIFIED evidence=lab-default-panic+explicit-lab-log+runtime-builder-log"
     );
 }
