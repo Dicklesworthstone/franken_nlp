@@ -21,6 +21,7 @@ pub const RECEIPT_SCHEMA: &str = "fnlpr-v1";
 
 /// Completeness is a scope statement, never a substitute for a named check.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReceiptGrade {
     /// Authorized inputs, artifacts, and any commitment secret are resolvable.
     Replayable,
@@ -34,6 +35,7 @@ pub enum ReceiptGrade {
 
 /// Public retention availability used to validate a receipt grade.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RetentionState {
     /// The owner-authorized retention policy can resolve this input.
     Resolvable,
@@ -247,17 +249,19 @@ pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
 /// One named check performed by the emitting surface.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ReceiptCheck {
-    pub name: String,
+    pub id: String,
+    pub scope: String,
     pub verdict: CheckVerdict,
-    pub evidence_digest: Sha256Digest,
 }
 
 /// Typed check outcome retained in a receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CheckVerdict {
     Pass,
     Fail,
     Skipped,
+    NotRun,
 }
 
 /// Complete artifact identity taxonomy needed by a receipt.
@@ -266,6 +270,7 @@ pub struct ReceiptArtifacts {
     pub source_root_sha256: Sha256Digest,
     pub logical_model_sha256: Sha256Digest,
     pub packing_set_sha256: Sha256Digest,
+    pub release_manifest_sha256: Sha256Digest,
     pub license_bundle_sha256: Sha256Digest,
     pub fnlpq_file_sha256: Sha256Digest,
 }
@@ -331,6 +336,7 @@ impl Receipt {
                 source_root_sha256: provenance.source_root_sha256,
                 logical_model_sha256: execution.logical_model_digest,
                 packing_set_sha256: execution.packing_set_digest,
+                release_manifest_sha256: provenance.release_manifest_sha256,
                 license_bundle_sha256: provenance.license_bundle_sha256,
                 fnlpq_file_sha256: provenance.fnlpq_file_sha256,
             },
@@ -370,7 +376,8 @@ impl Receipt {
             return Err(ReceiptError::MissingChecks);
         }
         for check in &self.checks {
-            validate_authority("check.name", &check.name)?;
+            validate_identifier("check.id", &check.id)?;
+            validate_authority("check.scope", &check.scope)?;
         }
         for commitment in &self.commitments {
             validate_authority("commitment.key_id", &commitment.key_id)?;
@@ -591,9 +598,9 @@ mod tests {
 
     fn checks() -> Vec<ReceiptCheck> {
         vec![ReceiptCheck {
-            name: "fixture-structural-check".to_owned(),
+            id: "fixture-structural-check".to_owned(),
+            scope: "receipt fixture only".to_owned(),
             verdict: CheckVerdict::Pass,
-            evidence_digest: digest(14),
         }]
     }
 
