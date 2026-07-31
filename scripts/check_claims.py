@@ -13,7 +13,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 
 SCHEMA_VERSION = 1
@@ -51,10 +51,39 @@ LEDGER_SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 R4_EVIDENCE_RECEIPT_RE = re.compile(
     r"\b(?P<kind>r4-receipt|admission-receipt)=(?P<path>docs/[A-Za-z0-9_./-]+)#sha256:(?P<digest>[0-9a-f]{64})\b"
 )
+R4_ARTIFACT_BINDING_RE = re.compile(
+    r"recipe_id=(?P<recipe_id>[^;]+); packing_sha256=(?P<packing>[0-9a-f]{64}); "
+    r"kernel_table_sha256=(?P<kernel_table>[0-9a-f]{64}); load_mode=(?P<load_mode>[^;]+)\Z"
+)
+R4_CONTEXT_BINDING_RE = re.compile(
+    r"tokens=(?P<tokens>[1-9][0-9]*); kv_dtype=(?P<kv_dtype>[A-Za-z0-9_-]+)\Z"
+)
+R4_ADMISSION_BINDING_RE = re.compile(
+    r"outcome=admitted; committed_bytes=(?P<committed>[1-9][0-9]*); peak_bytes=(?P<peak>[1-9][0-9]*)\Z"
+)
+R4_RECEIPT_SCHEMA_VERSION = 1
+R4_COMMON_RECEIPT_KEYS = {
+    "artifact",
+    "claim_id",
+    "context",
+    "cpu_feature_string",
+    "host_fingerprint",
+    "kind",
+    "ledger_entry",
+    "schema_version",
+    "validity_domain",
+}
+R4_ARTIFACT_KEYS = {"kernel_table_sha256", "load_mode", "packing_sha256", "recipe_id"}
+R4_CONTEXT_KEYS = {"kv_dtype", "tokens"}
+R4_MEASUREMENT_KEYS = {"decode_tokens_per_s", "kv_bytes", "peak_rss_bytes", "prefill_ms"}
+R4_ADMISSION_KEYS = {"committed_bytes", "outcome", "peak_bytes"}
+PERCENTILE_KEYS = {"p50", "p95", "p99"}
 R4_REQUIRED_FIELDS = (
     "Host fingerprint",
     "Artifact recipe + packing + kernel table + load mode",
+    "Context point",
     "p50/p95/p99",
+    "R4 measurement summary",
     "Fairness controls",
     "Admission boundary outcomes",
 )
