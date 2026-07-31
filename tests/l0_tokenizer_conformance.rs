@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use franken_nlp::native_engine::lmhead::NANBEIGE_VOCAB_SIZE;
 use franken_nlp::tokenizer::{
     bpe::{AddedToken, DecodeBytesError, DecodeTextError, EncodeOptions, SpBpeTokenizer},
-    sp_model::{parse_spm_model, NormalizerFacts, PieceType, SpecialPieceIds, SpmModel, SpmPiece},
+    sp_model::{NormalizerFacts, PieceType, SpecialPieceIds, SpmModel, SpmPiece, parse_spm_model},
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -96,6 +96,8 @@ fn toy_model() -> SpmModel {
             piece("▁ab", 20.0, PieceType::Normal),
             piece("<0xFF>", 0.0, PieceType::Byte),
             piece("<user>", 0.0, PieceType::UserDefined),
+            piece("<0x0A>", 0.0, PieceType::Byte),
+            piece("<0x09>", 0.0, PieceType::Byte),
         ],
         model_type: franken_nlp::tokenizer::sp_model::ModelType::Bpe,
         normalizer: NormalizerFacts {
@@ -211,6 +213,35 @@ fn added_tokens_take_longest_surface_precedence_before_bpe() {
     .expect("registered ids exist in toy SPM table");
     assert_eq!(tokenizer.encode_ids("<x:y>").unwrap(), vec![1, 2]);
     assert_eq!(tokenizer.decode_bytes(&[2]).unwrap(), b"<x:y>");
+}
+
+#[test]
+fn added_tokens_do_not_restart_the_sentencepiece_dummy_prefix() {
+    let tokenizer = SpBpeTokenizer::with_added_tokens(toy_model(), [AddedToken::new("<x>", 0)])
+        .expect("registered ids exist in the toy tokenizer");
+    assert_eq!(
+        tokenizer.encode_ids("<x> a").unwrap(),
+        vec![1, 0, 6],
+        "the source space after an added token is real whitespace, not a new dummy prefix"
+    );
+}
+
+#[test]
+fn only_ascii_space_maps_to_the_sentencepiece_whitespace_marker() {
+    let tokenizer = tokenizer();
+    assert_eq!(
+        tokenizer
+            .encode_ids_with_options(
+                "a\n\t",
+                EncodeOptions {
+                    add_bos: false,
+                    add_eos: false,
+                },
+            )
+            .unwrap(),
+        vec![6, 11, 12],
+        "newline and tab must use their BYTE pieces rather than being rewritten as spaces"
+    );
 }
 
 #[test]
@@ -444,9 +475,12 @@ fn pinned_slow_reference_vocabulary_is_token_id_exact() {
             let expected_end = fixture.token_ids.len().min(index.saturating_add(9));
             let got_end = got.len().min(index.saturating_add(9));
             eprintln!(
-                "L0 corpus=slow-reference case={} RESULT=FAIL input_sha256={} expected_ids_sha256={} got_ids_sha256={} first_diverging_index={} expected_context={:?} got_context={:?}",
+                "L0 corpus=slow-reference case={} RESULT=FAIL input={:?} input_sha256={} expected_token_ids={:?} observed_token_ids={:?} expected_ids_sha256={} got_ids_sha256={} first_diverging_index={} expected_context={:?} got_context={:?}",
                 fixture.id,
+                input.text,
                 fixture.input_sha256,
+                fixture.token_ids,
+                got,
                 fixture.token_ids_sha256,
                 canonical_id_digest(&got),
                 index,

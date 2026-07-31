@@ -10,7 +10,7 @@ use std::{
     collections::BTreeMap,
     error::Error,
     fmt,
-    str::{from_utf8, Utf8Error},
+    str::{Utf8Error, from_utf8},
 };
 
 use super::sp_model::{PieceType, SpecialPieceIds, SpmModel};
@@ -357,15 +357,20 @@ impl SpBpeTokenizer {
     ) -> Result<Vec<u32>, EncodeError> {
         let mut ids = self.prefix_ids(options)?;
         let mut cursor = 0;
+        // SentencePiece prepends its dummy whitespace marker once for the
+        // complete input. An added token is injected into that stream; it does
+        // not start a fresh SentencePiece encoding region after itself.
+        let mut prepend_dummy_prefix = true;
         while cursor < input.len() {
             let Some((offset, token)) = self.next_injected_token(&input[cursor..]) else {
-                self.encode_normal_text(&input[cursor..], &mut ids)?;
+                self.encode_normal_text(&input[cursor..], &mut ids, prepend_dummy_prefix)?;
                 break;
             };
             let start = cursor + offset;
-            self.encode_normal_text(&input[cursor..start], &mut ids)?;
+            self.encode_normal_text(&input[cursor..start], &mut ids, prepend_dummy_prefix)?;
             ids.push(token.id);
             cursor = start + token.content.len();
+            prepend_dummy_prefix = false;
         }
         self.suffix_ids(&mut ids, options)?;
         Ok(ids)
@@ -496,11 +501,16 @@ impl SpBpeTokenizer {
             })
     }
 
-    fn encode_normal_text(&self, input: &str, ids: &mut Vec<u32>) -> Result<(), EncodeError> {
+    fn encode_normal_text(
+        &self,
+        input: &str,
+        ids: &mut Vec<u32>,
+        prepend_dummy_prefix: bool,
+    ) -> Result<(), EncodeError> {
         if input.is_empty() {
             return Ok(());
         }
-        let normalized = sentencepiece_whitespace(input);
+        let normalized = sentencepiece_whitespace(input, prepend_dummy_prefix);
         let mut symbols: Vec<Symbol> = normalized
             .chars()
             .map(|character| Symbol {
@@ -623,11 +633,13 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn sentencepiece_whitespace(input: &str) -> String {
+fn sentencepiece_whitespace(input: &str, prepend_dummy_prefix: bool) -> String {
     let mut normalized = String::new();
-    normalized.push(WHITESPACE_MARKER);
+    if prepend_dummy_prefix {
+        normalized.push(WHITESPACE_MARKER);
+    }
     for character in input.chars() {
-        if character.is_whitespace() {
+        if character == ' ' {
             normalized.push(WHITESPACE_MARKER);
         } else {
             normalized.push(character);
