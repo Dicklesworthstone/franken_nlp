@@ -8,6 +8,10 @@ const K: usize = 10_752;
 const LOW7_PAIR_ABS_BOUND: i64 = 2 * 127 * 128;
 const HIGH_BIT_PAIR_ABS_BOUND: i64 = 2 * 128;
 const CORRECTION_PAIR_ABS_BOUND: i64 = 2 * 128 * 128;
+const S8_I8_DOT_ABS_BOUND: i64 = K as i64 * 128 * 128;
+const RAW_U8_I8_DOT_ABS_BOUND: i64 = K as i64 * 255 * 128;
+const CORRECTION_ABS_BOUND: i64 = K as i64 * 128 * 128;
+const RAW_PLUS_CORRECTION_ABS_BOUND: i64 = RAW_U8_I8_DOT_ABS_BOUND + CORRECTION_ABS_BOUND;
 
 fn scalar_i8_dot(left: &[i8], right: &[i8]) -> i64 {
     left.iter()
@@ -27,6 +31,17 @@ fn low7_high_bit_dot(left: &[i8], right: &[i8]) -> i64 {
             low7 * signed_right + (high_bit - 1) * 128 * signed_right
         })
         .sum()
+}
+
+fn raw_u8_i8_dot(left: &[i8], right: &[i8]) -> i64 {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| (i64::from(*left) + 128) * i64::from(*right))
+        .sum()
+}
+
+fn correction_dot(right: &[i8]) -> i64 {
+    right.iter().map(|right| 128 * i64::from(*right)).sum()
 }
 
 fn widened_i16_dot(left: &[i8], right: &[i8]) -> i64 {
@@ -62,8 +77,18 @@ fn full_k_adversarial_vectors_preserve_i64_exactness_and_pair_bounds() {
         let left = vec![left_value; K];
         let right = vec![right_value; K];
         let expected = scalar_i8_dot(&left, &right);
+        let raw = raw_u8_i8_dot(&left, &right);
+        let correction = correction_dot(&right);
         assert_eq!(low7_high_bit_dot(&left, &right), expected);
         assert_eq!(widened_i16_dot(&left, &right), expected);
+        assert_eq!(raw - correction, expected);
+        assert!(expected.abs() <= S8_I8_DOT_ABS_BOUND);
+        assert!(raw.abs() <= RAW_U8_I8_DOT_ABS_BOUND);
+        assert!(correction.abs() <= CORRECTION_ABS_BOUND);
+        assert!(
+            raw.abs() + correction.abs() <= RAW_PLUS_CORRECTION_ABS_BOUND,
+            "raw-plus-correction must stay within the i32 safety bound"
+        );
 
         for (left_pair, right_pair) in left.chunks_exact(2).zip(right.chunks_exact(2)) {
             let low7_pair = left_pair
@@ -85,7 +110,7 @@ fn full_k_adversarial_vectors_preserve_i64_exactness_and_pair_bounds() {
             assert!(correction_pair.abs() <= CORRECTION_PAIR_ABS_BOUND);
         }
         println!(
-            "G0_PROBE10 case=full-k-left-{left_value}-right-{right_value} RESULT=PASS k={K} scalar={expected} authority=scalar-model-only"
+            "G0_PROBE10 case=full-k-left-{left_value}-right-{right_value} RESULT=PASS k={K} scalar={expected} raw_u8_i8={raw} correction={correction} authority=scalar-model-only"
         );
     }
     println!(
