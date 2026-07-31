@@ -362,6 +362,18 @@ def require_positive_number(value: Any, *, location: str) -> int | float:
     return value
 
 
+def validate_percentile_distribution(value: Any, *, location: str) -> dict[str, int | float]:
+    if not isinstance(value, dict) or set(value) != PERCENTILE_KEYS:
+        raise ClaimsError(f"R4 measurement percentile keys are invalid at {location}")
+    distribution = {
+        percentile: require_positive_number(measurement, location=f"{location}/{percentile}")
+        for percentile, measurement in value.items()
+    }
+    if not distribution["p50"] <= distribution["p95"] <= distribution["p99"]:
+        raise ClaimsError(f"R4 measurement percentiles must be nondecreasing at {location}")
+    return distribution
+
+
 def receipt_number(value: int | float) -> str:
     """Render a JSON number for the fixed R4 ledger binding grammar."""
 
@@ -466,10 +478,7 @@ def load_r4_receipt(path: Path, expected_digest: str, expected_kind: str) -> dic
             raise ClaimsError(f"R4 measurement keys are invalid file={path}")
         for metric in ("prefill_ms", "decode_tokens_per_s"):
             distribution = measurement[metric]
-            if not isinstance(distribution, dict) or set(distribution) != PERCENTILE_KEYS:
-                raise ClaimsError(f"R4 measurement percentile keys are invalid file={path} metric={metric}")
-            for percentile, value in distribution.items():
-                require_positive_number(value, location=f"R4 receipt {path}/{metric}/{percentile}")
+            validate_percentile_distribution(distribution, location=f"R4 receipt {path}/{metric}")
         for metric in ("kv_bytes", "peak_rss_bytes"):
             require_positive_int(measurement[metric], location=f"R4 receipt {path}/{metric}")
     else:
@@ -962,6 +971,16 @@ def run_self_test(root: Path, claims: dict[str, dict[str, Any]]) -> None:
         pass
     else:
         raise ClaimsError("self-test canonical JSON accepted a non-finite value")
+    try:
+        validate_percentile_distribution(
+            {"p50": 12.5, "p95": 10.0, "p99": 9.5},
+            location="self-test/reversed-throughput",
+        )
+    except ClaimsError as error:
+        if "must be nondecreasing" not in str(error):
+            raise
+    else:
+        raise ClaimsError("self-test reversed R4 percentile values were accepted")
     nonfinite_literals, _ = load_json(fixtures / "r4_nonfinite_literals.json")
     typed_receipt = (fixtures / "r4_typed_measurement.json").read_text(encoding="utf-8")
     for literal in nonfinite_literals["literals"]:

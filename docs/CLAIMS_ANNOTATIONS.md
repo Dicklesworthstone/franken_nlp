@@ -58,7 +58,8 @@ public wording.
 
 The two files are canonical, duplicate-key-free JSON receipts at schema version
 1. The `r4-measurement` receipt carries typed p50/p95/p99 prefill and decode
-distributions plus exact KV and peak-RSS bytes; the `r4-admission` receipt
+distributions in ordinary nondecreasing quantile order (`p50 ≤ p95 ≤ p99`),
+plus exact KV and peak-RSS bytes; the `r4-admission` receipt
 carries an `admitted` outcome plus committed/peak bytes. Both must agree on
 their ledger entry, claim id, full claim validity domain, host fingerprint, CPU
 feature string, typed artifact identity (`recipe_id`, packing hash, kernel-table

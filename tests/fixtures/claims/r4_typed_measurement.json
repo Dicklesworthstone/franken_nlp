@@ -16,9 +16,9 @@
   "ledger_entry": "PERF-R4-TYPED-001",
   "measurement": {
     "decode_tokens_per_s": {
-      "p50": 12.5,
+      "p50": 9.5,
       "p95": 10.0,
-      "p99": 9.5
+      "p99": 12.5
     },
     "kv_bytes": 5905580032,
     "peak_rss_bytes": 9126805504,

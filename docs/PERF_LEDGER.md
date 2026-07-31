@@ -25,7 +25,8 @@ a FrankenNLP measurement.
 - `Artifact recipe + packing + kernel table + load mode`
 - `Context point` — exact `tokens=<positive>; kv_dtype=<name>` for a measured
   R4 row, bound to both typed receipts.
-- `p50/p95/p99`
+- `p50/p95/p99` — ordinary nondecreasing quantile values (`p50 ≤ p95 ≤ p99`),
+  never inverse "worst-tail throughput" shorthand.
 - `R4 measurement summary` — exact KV and peak-RSS byte terms from the typed
   measurement receipt.
 - `Fairness controls` — thread count, allocator, precision, warmup, and any
