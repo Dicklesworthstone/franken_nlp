@@ -26,6 +26,8 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 RECORD_PATH = ROOT / "docs/truth-pack/oracle_env.json"
 LOCK_PATH = ROOT / "docs/truth-pack/oracle_requirements.lock"
+SOURCE_MANIFEST_PATH = ROOT / "docs/truth-pack/nanbeige4.2-3b.source.json"
+SOURCE_MANIFEST_RELATIVE_PATH = "docs/truth-pack/nanbeige4.2-3b.source.json"
 MODEL_ID = "Nanbeige/Nanbeige4.2-3B"
 REVISION = "f56ec5a9650268aa098496734743c25ea778bd2d"
 CANONICAL_NAME = re.compile(r"[-_.]+")
@@ -126,12 +128,62 @@ def first_difference(expected: dict[str, str], actual: dict[str, str]) -> str | 
     return None
 
 
+def verified_source_manifest_entries(record: dict[str, Any]) -> list[dict[str, object]]:
+    """Validate and hash-bind the complete ten-file model-source closure."""
+
+    source_identity = record.get("source_identity")
+    if not isinstance(source_identity, dict):
+        raise OracleFailure("source_identity must be an object")
+    source_manifest = source_identity.get("source_manifest")
+    if not isinstance(source_manifest, dict):
+        raise OracleFailure("source_identity.source_manifest must be an object")
+    if source_manifest.get("path") != SOURCE_MANIFEST_RELATIVE_PATH:
+        raise OracleFailure("source manifest path is not the committed Nanbeige closure manifest")
+    expected_digest = source_manifest.get("sha256")
+    if not isinstance(expected_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+        raise OracleFailure("source manifest digest must be lowercase SHA-256")
+    if not SOURCE_MANIFEST_PATH.is_file() or SOURCE_MANIFEST_PATH.is_symlink():
+        raise OracleFailure(f"source manifest is absent or not regular: {SOURCE_MANIFEST_PATH}")
+    observed_digest = sha256_file(SOURCE_MANIFEST_PATH)
+    if not hmac.compare_digest(expected_digest, observed_digest):
+        raise OracleFailure(
+            f"source manifest digest mismatch expected={expected_digest} observed={observed_digest}"
+        )
+    try:
+        from validate_source_manifest import ManifestError, read_json, validate_manifest
+    except ImportError as exc:
+        raise OracleFailure(f"cannot import canonical source manifest validator: {exc}") from exc
+    try:
+        entries = validate_manifest(read_json(SOURCE_MANIFEST_PATH))
+    except ManifestError as exc:
+        raise OracleFailure(f"canonical source manifest is invalid: {exc}") from exc
+    except (OSError, ValueError) as exc:
+        raise OracleFailure(f"cannot validate canonical source manifest: {exc}") from exc
+    expected_count = source_manifest.get("file_count")
+    expected_total = source_manifest.get("closure_total_bytes")
+    observed_total = sum(entry["bytes"] for entry in entries)
+    if expected_count != len(entries) or expected_total != observed_total:
+        raise OracleFailure(
+            "source manifest closure summary mismatch "
+            f"expected_files={expected_count} observed_files={len(entries)} "
+            f"expected_bytes={expected_total} observed_bytes={observed_total}"
+        )
+    log(
+        "source_manifest_valid",
+        sha256=observed_digest,
+        file_count=len(entries),
+        closure_total_bytes=observed_total,
+    )
+    return entries
+
+
 def verify_record(record: dict[str, Any]) -> None:
     if record.get("schema_version") != 1:
         raise OracleFailure("unsupported oracle_env schema_version")
     source = record.get("source_identity")
     if not isinstance(source, dict) or source.get("model_id") != MODEL_ID or source.get("revision") != REVISION:
         raise OracleFailure("closure record model_id/revision differs from the pinned oracle")
+    verified_source_manifest_entries(record)
     closure = record.get("closure")
     if not isinstance(closure, dict):
         raise OracleFailure("closure must be an object")
@@ -260,31 +312,31 @@ def recreate(record: dict[str, Any], target: Path) -> None:
 
 
 def source_files(record: dict[str, Any], source: Path, *, need_weights: bool) -> None:
-    if not source.is_dir():
+    """Hash-check every canonical model file before an oracle loads any of it.
+
+    ``need_weights`` remains a compatibility argument for existing callers.  The
+    canonical source closure always includes both safetensors shards, so every
+    model-facing command now verifies them regardless of its immediate use.
+    """
+
+    del need_weights
+    if not source.is_dir() or source.is_symlink():
         raise NoModel(f"source snapshot absent: {source}")
-    required = record["source_identity"].get("required_files", {})
-    if not isinstance(required, dict):
-        raise OracleFailure("source_identity.required_files must be an object")
-    for name, expected_sha in required.items():
-        if not isinstance(name, str) or not isinstance(expected_sha, str):
-            raise OracleFailure("source_identity.required_files must map string paths to SHA-256 strings")
-        path = source / name
-        if not path.is_file():
-            raise NoModel(f"source snapshot missing required file: {path}")
-        observed_sha = sha256_file(path)
-        if not hmac.compare_digest(expected_sha, observed_sha):
-            raise OracleFailure(f"source hash mismatch file={name} expected={expected_sha} observed={observed_sha}")
-    if need_weights:
-        try:
-            index = json.loads((source / "model.safetensors.index.json").read_text(encoding="utf-8"))
-            shard_names = sorted(set(index["weight_map"].values()))
-        except (KeyError, TypeError, json.JSONDecodeError) as exc:
-            raise OracleFailure("model.safetensors.index.json has no valid weight_map") from exc
-        missing = [name for name in shard_names if not (source / name).is_file()]
-        if missing:
-            raise NoModel(f"source snapshot missing weight shards: {','.join(missing)}")
-        if any((source / name).is_symlink() for name in shard_names):
-            raise OracleFailure("oracle weight shards must be regular files, not symlinks")
+    entries = verified_source_manifest_entries(record)
+    missing = [str(entry["name"]) for entry in entries if not (source / str(entry["name"])).exists()]
+    if missing:
+        raise NoModel(f"source snapshot missing canonical closure files: {','.join(missing)}")
+    try:
+        from validate_source_manifest import ManifestError, validate_source_directory
+    except ImportError as exc:
+        raise OracleFailure(f"cannot import canonical source manifest validator: {exc}") from exc
+    try:
+        validate_source_directory(entries, source)
+    except ManifestError as exc:
+        raise OracleFailure(f"canonical source closure verification failed: {exc}") from exc
+    except (OSError, ValueError) as exc:
+        raise OracleFailure(f"cannot verify canonical source closure: {exc}") from exc
+    log("source_closure_valid", source=str(source), file_count=len(entries))
 
 
 def capture_environment() -> dict[str, Any]:
@@ -512,11 +564,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--validate", action="store_true", help="validate the committed record and hash-addressed lock")
+    action.add_argument("--verify-source", action="store_true", help="rehash the complete pinned source closure")
     action.add_argument("--recreate", action="store_true", help="create and verify a new closure venv")
     action.add_argument("--smoke", action="store_true", help="run CPU eager forward plus 32-token greedy decode")
     action.add_argument("--matrix", action="store_true", help="run the bounded Transformers/PyTorch source-import matrix")
     parser.add_argument("--venv", type=Path, help="new venv path required by --recreate")
-    parser.add_argument("--source", type=Path, help="pinned local Hugging Face snapshot required by --smoke/--matrix")
+    parser.add_argument(
+        "--source",
+        type=Path,
+        help="pinned local Hugging Face snapshot required by --verify-source/--smoke/--matrix",
+    )
     parser.add_argument("--smoke-output", type=Path, help="new JSON path for a smoke transcript")
     parser.add_argument("--matrix-work-dir", type=Path, help="new persistent directory for matrix candidate venvs")
     parser.add_argument("--matrix-output", type=Path, help="new JSON path for matrix results")
@@ -530,6 +587,11 @@ def main() -> int:
         verify_record(record)
         if args.validate:
             return result("PASS", check="record_and_lock")
+        if args.verify_source:
+            if args.source is None:
+                raise NoModel("--verify-source requires --source PINNED_SNAPSHOT")
+            source_files(record, args.source, need_weights=True)
+            return result("PASS", check="full_source_closure")
         if args.recreate:
             if args.venv is None:
                 raise OracleFailure("--recreate requires --venv NEW_PATH")

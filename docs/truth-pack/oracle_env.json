@@ -1,6 +1,6 @@
 {
-  "closure_status": "recreated_and_cpu_eager_smoke_verified",
-  "closure_status_explanation": "The exact 28-package CPU/eager closure was recreated from the hash-addressed lock, then ran a source-verified CPU/eager smoke forward and 32-token greedy decode against the pinned local snapshot. The separately measured oracle floor found the stream stable, so the full 32-token result below is now the verifier expectation; the canonical transcript remains immutable evidence.",
+  "closure_status": "recreated_and_cpu_eager_smoke_recorded_before_full_source_closure_verification",
+  "closure_status_explanation": "The exact 28-package CPU/eager closure was recreated from the hash-addressed lock, then recorded a CPU/eager smoke forward and 32-token greedy decode. This historical transcript predates the verifier's full ten-file source-closure check and therefore is retained as audit evidence rather than as mechanically source-bound acceptance evidence. A new smoke transcript is mechanically bound only when this record's hash-bound source manifest and all ten files, including both safetensors shard byte lengths and SHA-256 values, verify before the run.",
   "closure": {
     "freeze_sha256": "21ccb4eeed1b554f8e6300d1a3580f3a1ad13ca7d3c20afccf17b06654f271b3",
     "lock_path": "docs/truth-pack/oracle_requirements.lock",
@@ -155,14 +155,12 @@
   },
   "source_identity": {
     "model_id": "Nanbeige/Nanbeige4.2-3B",
-    "required_files": {
-      "config.json": "f6cb15b22847664f3a6049dc4b58fdd10f1650d112ac99a1da3d051f17c2ca19",
-      "configuration_nanbeige.py": "c517227741f0fc007061bde1873138545ce15e67716a062513193c06300c7685",
-      "model.safetensors.index.json": "30d8da0fa8b97abc6d9eddfd017a0cb7a649bcbd58caa57804c56c767db5c0f1",
-      "modeling_nanbeige.py": "547737f989f5cb741c1a568acaf85f83521fa67a8f7268e19f9a37e60127c0d5",
-      "tokenizer.model": "fb41d04798b714520a9b075727b0226538b7330254299062742c50ec8374bc36",
-      "tokenizer_config.json": "3edfa64a0826a77e9412b9008f1febf3fe906a68fd616b6de4cd15897a8c8518"
-    },
-    "revision": "f56ec5a9650268aa098496734743c25ea778bd2d"
+    "revision": "f56ec5a9650268aa098496734743c25ea778bd2d",
+    "source_manifest": {
+      "closure_total_bytes": 8360887509,
+      "file_count": 10,
+      "path": "docs/truth-pack/nanbeige4.2-3b.source.json",
+      "sha256": "9263a395e9a9c948cb66aeb9ef05147b5e6e7f848defcafd0ce6b2e31aacddca"
+    }
   }
 }

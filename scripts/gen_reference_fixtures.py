@@ -531,12 +531,6 @@ def load_oracle(profile: NumericsProfile, model_source: Path) -> tuple[Any, Any,
         from transformers import AutoModelForCausalLM, AutoTokenizer
     except ImportError as error:
         raise TraceError(f"missing locked oracle dependency: {error}") from error
-    if not model_source.is_dir():
-        raise FileNotFoundError(model_source)
-    required = ("config.json", "tokenizer.model")
-    missing = [name for name in required if not (model_source / name).is_file()]
-    if missing:
-        raise TraceError(f"incomplete model source closure missing={','.join(missing)}")
     torch_dtype = getattr(torch, profile.torch_dtype_name)
     log("TRACE_HARNESS", f"load profile={profile.name} attention_backend={profile.attention_backend} source={model_source}")
     tokenizer = AutoTokenizer.from_pretrained(
@@ -565,6 +559,22 @@ def load_oracle(profile: NumericsProfile, model_source: Path) -> tuple[Any, Any,
     if tokenizer.__class__.__name__.lower().find("fast") >= 0:
         raise TraceError(f"slow tokenizer required, observed class={tokenizer.__class__.__name__}")
     return torch, tokenizer, model
+
+
+def verify_model_source_closure(model_source: Path) -> None:
+    """Require the oracle's hash-bound ten-file closure before source access."""
+
+    try:
+        from verify_oracle_env import OracleFailure, read_record, source_files, verify_record
+    except ImportError as error:
+        raise TraceError(f"cannot import oracle source-closure verifier: {error}") from error
+
+    try:
+        record = read_record()
+        verify_record(record)
+        source_files(record, model_source, need_weights=True)
+    except (OSError, OracleFailure) as error:
+        raise TraceError(f"full source closure verification failed: {error}") from error
 
 
 def closure_digest(repo_root: Path) -> str:
@@ -1361,12 +1371,15 @@ def run_trace(
     oracle_floor_sha256: str | None = None,
     stable_prefixes: dict[str, int] | None = None,
     provenance: FixtureProvenance | None = None,
+    source_verified: bool = False,
 ) -> int:
     model_source = args.model_source
     if model_source is None or not model_source.is_dir():
         log("TRACE_HARNESS", "RESULT=SKIPPED_NO_MODEL taps=0/44 norms=0/2 perturbation=none reason=source_closure_absent")
         return 0
     try:
+        if not source_verified:
+            verify_model_source_closure(model_source)
         profile = PROFILES[args.profile]
         oracle_digest = closure_digest(args.repo_root)
         if provenance is not None and not hmac.compare_digest(oracle_digest, provenance.oracle_closure_sha256):
@@ -1502,6 +1515,7 @@ def run_generate(args: argparse.Namespace) -> int:
     try:
         if args.profile != "all":
             raise TraceError("--generate requires --profile all for the complete comparison matrix")
+        verify_model_source_closure(args.model_source)
         corpus = load_fixture_inputs(args.corpus)
         floor_digest, stable_prefixes = stable_prefixes_from_floor(args.oracle_floor)
         prompts = corpus["prompts"]
@@ -1531,6 +1545,7 @@ def run_generate(args: argparse.Namespace) -> int:
                 oracle_floor_sha256=floor_digest,
                 stable_prefixes=stable_prefixes,
                 provenance=provenance,
+                source_verified=True,
             )
             if status != 0:
                 log("REF_FIXTURES", "RESULT=FAIL fixtures=0 missing=trace-capture")
@@ -1570,6 +1585,7 @@ def run_refresh_auxiliary(args: argparse.Namespace) -> int:
         log("REF_FIXTURES", "RESULT=SKIPPED_NO_MODEL fixtures=0 missing=source-closure")
         return 0
     try:
+        verify_model_source_closure(args.model_source)
         output_root = args.output.resolve()
         manifest_path = output_root / "manifest.json"
         if not manifest_path.is_file():
