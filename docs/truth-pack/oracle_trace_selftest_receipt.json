@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "bead": "franken_nlp-sdb",
+  "evidence_scope": "model-gated trace-harness self-test; this receipt proves the collector's non-perturbation contract but is not a frozen L2 differential-fixture corpus",
+  "status": "PASS",
+  "completed_at_utc": "2026-07-31T15:26:27Z",
+  "oracle": {
+    "interpreter": "/tmp/fnlp-oracle-venv9/bin/python",
+    "python": "CPython 3.11.14",
+    "requirements_lock": "docs/truth-pack/oracle_requirements.lock",
+    "requirements_lock_sha256": "09bc3548e0ef18aa4a0b3a06b9b98aed196bf3a038cd94dcee4053d784f9e955",
+    "freeze_sha256": "21ccb4eeed1b554f8e6300d1a3580f3a1ad13ca7d3c20afccf17b06654f271b3",
+    "trace_oracle_closure_sha256": "0661b2e28c22b728ace2e912ef9012bdf085669c5ff3d087fe6dedc63fbf7511",
+    "model_id": "Nanbeige/Nanbeige4.2-3B",
+    "model_revision": "f56ec5a9650268aa098496734743c25ea778bd2d",
+    "model_source": "/Users/jemanuel/.cache/franken_nlp/source/Nanbeige4.2-3B/f56ec5a9650268aa098496734743c25ea778bd2d",
+    "profile": "hf-bf16-eager",
+    "attention_backend": "eager",
+    "dtype": "bfloat16",
+    "generator_commit": "990959e05fcfdd3399913783248c0f51bba527fc"
+  },
+  "command": [
+    "/tmp/fnlp-oracle-venv9/bin/python",
+    "scripts/gen_reference_fixtures.py",
+    "--trace-selftest",
+    "--model-source",
+    "/Users/jemanuel/.cache/franken_nlp/source/Nanbeige4.2-3B/f56ec5a9650268aa098496734743c25ea778bd2d",
+    "--profile",
+    "hf-bf16-eager",
+    "--output",
+    "/tmp/fnlp-trace-sdb-20260731T1526Z"
+  ],
+  "assertions": {
+    "prompts_completed": 2,
+    "traced_vs_untraced": {
+      "logits": "torch.equal",
+      "greedy_tokens": "exact ordered equality",
+      "status": "PASS"
+    },
+    "prefill_inventory_per_prompt": {
+      "post_embed": 1,
+      "pre_layer": 44,
+      "post_attention": 44,
+      "post_mlp": 44,
+      "post_layer": 44,
+      "post_loop_norm": 2,
+      "pre_lm_head": 1,
+      "kv_key": 44,
+      "kv_value": 44,
+      "total_records": 268
+    },
+    "append_inventory_per_prompt": {
+      "post_embed": 1,
+      "pre_layer": 44,
+      "post_attention": 44,
+      "post_mlp": 44,
+      "post_layer": 44,
+      "post_loop_norm": 2,
+      "pre_lm_head": 1,
+      "kv_key": 44,
+      "kv_value": 44,
+      "total_records": 268
+    },
+    "post_loop_norms": "2/2 in both prefill and append; loop-1 norm is checked against loop-2 layer-0 input",
+    "intentional_perturbation": {
+      "hook": "replacing forward hook on physical layer 0",
+      "expected": "the perturbed logits differ from the unhooked baseline",
+      "observed": "first-diverging-layer-0",
+      "status": "PASS"
+    }
+  },
+  "trace_indexes": [
+    {
+      "relative_path": "hf-bf16-eager/prompt-000/trace.json",
+      "sha256": "c0e234a78c7c486dbc1dd4e8e7fb390253c97d0231e9bda9f30e7bfb35042517",
+      "prompt_sha256": "00326c36b03df5da1508fc9137587368b531695c1d1d11d9af6076ddaf169957",
+      "greedy_token_ids": [295, 152481, 13, 152481, 954, 5538, 796, 954]
+    },
+    {
+      "relative_path": "hf-bf16-eager/prompt-001/trace.json",
+      "sha256": "68ec2acdf7117c330007b08e3e5e64f073321104e437dc5bdaea1f63a0f7cda8",
+      "prompt_sha256": "9267825d5b89ce68e9bde740d46459dcd46755b318dedfdceacfe62185b3b5a0",
+      "greedy_token_ids": [13, 13, 11070, 322, 269, 12396, 152382, 13]
+    }
+  ],
+  "raw_trace_output": {
+    "path": "/tmp/fnlp-trace-sdb-20260731T1526Z",
+    "file_count": 1076,
+    "allocated_kib": 38100,
+    "retention": "ephemeral local scratch; integrity indexes are recorded above, but raw sidecars are not claimed as a retained truth-pack artifact"
+  },
+  "terminal_line": "TRACE_HARNESS RESULT=PASS taps=44/44 norms=2/2 append_taps=44/44 append_norms=2/2 prompts=2 perturbation=first-diverging-layer-0"
+}

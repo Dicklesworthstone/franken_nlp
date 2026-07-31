@@ -53,6 +53,17 @@ The terminal line is machine-readable:
 TRACE_HARNESS RESULT=PASS|FAIL|SKIPPED_NO_MODEL taps=<n>/44 norms=<n>/2 perturbation=<none|first-diverging-layer-0>
 ```
 
-Execution receipts, their exact command lines, and a no-perturbation run
-receipt are added only after the locked oracle closure is available.  No
-placeholder receipt is authority.
+## Executed no-perturbation receipt
+
+The locked-closure, model-gated self-test is recorded in
+[`oracle_trace_selftest_receipt.json`](oracle_trace_selftest_receipt.json).
+It retains the exact interpreter and command, source/closure identities,
+per-prompt index digests, inventory counts, and each passing assertion:
+untraced logits and greedy decode are bitwise/equal to their traced
+counterparts, and a deliberately replacing layer-0 hook is detected.
+
+That receipt proves the collector's non-perturbation contract on the named
+inputs.  It is deliberately **not** a frozen L2 differential-fixture corpus:
+the raw sidecars for this harness run stayed in local scratch.  A later fixture
+recording bead must retain the sidecars and independently seal its fixture
+manifest before they can become cross-host comparison authority.
