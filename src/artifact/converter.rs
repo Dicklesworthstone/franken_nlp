@@ -7,7 +7,7 @@
 //! the in-memory `.fnlpq` serializer as a production writer: that serializer
 //! remains a small-fixture oracle until the envelope grows its streaming sink.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -863,6 +863,12 @@ impl PanelPlan {
             });
         }
         let rows = entry.shape[0];
+        if rows == 0 || entry.shape.iter().any(|dimension| *dimension == 0) {
+            return Err(ConverterError::InvalidPanelPlan {
+                tensor: entry.name.clone(),
+                detail: "zero dimensions are not valid model tensor shapes".to_owned(),
+            });
+        }
         let columns = entry.shape[1..]
             .iter()
             .try_fold(1_u64, |value, dimension| {
@@ -875,6 +881,20 @@ impl PanelPlan {
         let bytes_per_row = columns.checked_mul(2).ok_or(ConverterError::Arithmetic {
             invariant: "BF16 panel row bytes",
         })?;
+        let expected_len = rows
+            .checked_mul(bytes_per_row)
+            .ok_or(ConverterError::Arithmetic {
+                invariant: "BF16 tensor byte length for panel plan",
+            })?;
+        if entry.len != expected_len {
+            return Err(ConverterError::InvalidPanelPlan {
+                tensor: entry.name.clone(),
+                detail: format!(
+                    "shape implies {expected_len} BF16 bytes but census declares {}",
+                    entry.len
+                ),
+            });
+        }
         if bytes_per_row > panel_cap {
             return Err(ConverterError::RowExceedsPanelCap {
                 tensor: entry.name.clone(),
@@ -1245,24 +1265,34 @@ impl CreateNewStagingFile {
     }
 }
 
-/// Atomically publish a fully verified stage only when it cannot replace an
-/// installed artifact.  Existing/invalid targets are left untouched for the
-/// caller's explicit quarantine workflow.
+/// Guard the activation boundary without ever falling back to a clobbering
+/// `rename`.  Existing/invalid targets are left untouched for the caller's
+/// explicit quarantine workflow; success awaits the dedicated `fs_tx`
+/// no-clobber activation primitive.
 pub fn activate_no_clobber(
     stage: impl AsRef<Path>,
     destination: impl AsRef<Path>,
 ) -> Result<(), ConverterError> {
     let stage = stage.as_ref();
     let destination = destination.as_ref();
-    if fs::symlink_metadata(destination).is_ok() {
-        return Err(ConverterError::ActivationTargetExists {
-            path: destination.to_path_buf(),
-        });
+    match fs::symlink_metadata(destination) {
+        Ok(_) => {
+            return Err(ConverterError::ActivationTargetExists {
+                path: destination.to_path_buf(),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ConverterError::Io {
+                path: destination.to_path_buf(),
+                operation: "stat activation destination",
+                detail: error.to_string(),
+            });
+        }
     }
-    fs::rename(stage, destination).map_err(|error| ConverterError::Io {
-        path: destination.to_path_buf(),
-        operation: "atomically activate verified conversion stage",
-        detail: error.to_string(),
+    let _ = stage;
+    Err(ConverterError::ActivationProtocolUnavailable {
+        destination: destination.to_path_buf(),
     })
 }
 
@@ -1384,6 +1414,10 @@ pub enum ConverterError {
     PeakRssExceeded { observed: u64, cap: u64 },
     /// Atomic activation would clobber an existing artifact.
     ActivationTargetExists { path: PathBuf },
+    /// The filesystem transaction substrate has not yet supplied a portable
+    /// atomic no-clobber activation primitive.  A plain `rename` is forbidden
+    /// because it can overwrite a concurrent destination on Unix.
+    ActivationProtocolUnavailable { destination: PathBuf },
     /// Required machine receipt field was absent or malformed.
     ReceiptField { field: &'static str, detail: String },
 }
@@ -1427,6 +1461,7 @@ impl fmt::Display for ConverterError {
             Self::StagingWriteRange { name, expected_offset, observed_offset, expected_len, observed_len } => write!(formatter, "staging write {name} mismatch: expected offset/len={expected_offset}/{expected_len}, observed={observed_offset}/{observed_len}"),
             Self::PeakRssExceeded { observed, cap } => write!(formatter, "peak RSS gate exceeded: observed={observed} formula-cap={cap}"),
             Self::ActivationTargetExists { path } => write!(formatter, "refusing to overwrite existing artifact {}; quarantine it explicitly, then rerun fnlp convert", path.display()),
+            Self::ActivationProtocolUnavailable { destination } => write!(formatter, "activation of {} is blocked: no portable atomic no-clobber filesystem transaction is installed; next=complete the fs_tx activation contract", destination.display()),
             Self::ReceiptField { field, detail } => {
                 write!(formatter, "conversion receipt field {field}: {detail}")
             }
