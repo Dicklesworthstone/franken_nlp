@@ -46,6 +46,8 @@ pub enum CalibrationError {
         id: String,
     },
     InvalidThreshold,
+    InvalidBootstrapResamples,
+    InvalidConfidenceLevel,
     InvalidAlpha,
     MissingExchangeabilityMemo,
     InvalidValidityWindow,
@@ -101,6 +103,15 @@ impl fmt::Display for CalibrationError {
                 "temperature fitting requires 0 < probability < 1 for id={id}"
             ),
             Self::InvalidThreshold => write!(formatter, "threshold must be finite and in [0, 1]"),
+            Self::InvalidBootstrapResamples => {
+                write!(
+                    formatter,
+                    "bootstrap confidence intervals require at least two resamples"
+                )
+            }
+            Self::InvalidConfidenceLevel => {
+                write!(formatter, "confidence level must be finite and in (0, 1)")
+            }
             Self::InvalidAlpha => write!(formatter, "conformal alpha must be finite and in (0, 1)"),
             Self::MissingExchangeabilityMemo => write!(
                 formatter,
@@ -563,6 +574,77 @@ pub struct SelectiveRisk {
     pub risk: Option<f64>,
 }
 
+/// Preregistered deterministic bootstrap parameters for a locked-test report.
+///
+/// The seed is logged with the result so confidence intervals are replayable;
+/// callers bind it to their evaluation receipt rather than sampling ambient
+/// process randomness.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BootstrapConfig {
+    resamples: usize,
+    confidence_level: f64,
+    seed: u64,
+}
+
+impl BootstrapConfig {
+    /// Validate a reproducible percentile-bootstrap configuration.
+    pub fn new(
+        resamples: usize,
+        confidence_level: f64,
+        seed: u64,
+    ) -> Result<Self, CalibrationError> {
+        if resamples < 2 {
+            return Err(CalibrationError::InvalidBootstrapResamples);
+        }
+        if !confidence_level.is_finite() || !(0.0..1.0).contains(&confidence_level) {
+            return Err(CalibrationError::InvalidConfidenceLevel);
+        }
+        Ok(Self {
+            resamples,
+            confidence_level,
+            seed,
+        })
+    }
+
+    /// Number of independently resampled locked-test replicas.
+    #[must_use]
+    pub const fn resamples(self) -> usize {
+        self.resamples
+    }
+
+    /// Central coverage of the two-sided percentile interval.
+    #[must_use]
+    pub const fn confidence_level(self) -> f64 {
+        self.confidence_level
+    }
+
+    /// Deterministic PRNG seed retained in the report diagnostic.
+    #[must_use]
+    pub const fn seed(self) -> u64 {
+        self.seed
+    }
+}
+
+/// A two-sided nonparametric percentile confidence interval.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BootstrapConfidenceInterval {
+    pub lower: f64,
+    pub upper: f64,
+    pub confidence_level: f64,
+    pub resamples: usize,
+}
+
+/// Confidence intervals for reliability metrics measured only on the locked test.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReliabilityConfidenceIntervals {
+    pub ece: BootstrapConfidenceInterval,
+    pub brier: BootstrapConfidenceInterval,
+    /// `None` is explicit when any replica accepts no rows, so selective risk
+    /// is not silently conditioned on a different population.
+    pub selective_risk: Option<BootstrapConfidenceInterval>,
+    pub bootstrap: BootstrapConfig,
+}
+
 impl ReliabilityMetrics {
     /// Content-free locked-test metric diagnostic; callers attach identity separately.
     #[must_use]
@@ -594,6 +676,101 @@ pub fn report_locked_test(
     calibrate: impl Fn(f64) -> Result<f64, CalibrationError>,
     acceptance_threshold: f64,
 ) -> Result<(ReliabilityMetrics, SelectiveRisk), CalibrationError> {
+    let rows = calibrated_locked_rows(locked_test, calibrate)?;
+    evaluate_locked_rows(&rows, acceptance_threshold)
+}
+
+/// Measure percentile-bootstrap uncertainty for a locked-test-only reliability report.
+///
+/// This is intentionally separate from fitting: every bootstrap replica draws
+/// exclusively from the already-calibrated locked-test rows.  It cannot widen
+/// the fit authority to development or calibration splits.
+pub fn bootstrap_locked_test_confidence_intervals(
+    locked_test: &LockedTestSet,
+    calibrate: impl Fn(f64) -> Result<f64, CalibrationError>,
+    acceptance_threshold: f64,
+    bootstrap: BootstrapConfig,
+) -> Result<ReliabilityConfidenceIntervals, CalibrationError> {
+    let rows = calibrated_locked_rows(locked_test, calibrate)?;
+    // Validate threshold even before sampling so an empty replica cannot hide
+    // a malformed task policy.
+    let _ = evaluate_locked_rows(&rows, acceptance_threshold)?;
+    let mut state = bootstrap.seed;
+    let mut ece = Vec::with_capacity(bootstrap.resamples);
+    let mut brier = Vec::with_capacity(bootstrap.resamples);
+    let mut selective_risk = Vec::with_capacity(bootstrap.resamples);
+    let mut replica = Vec::with_capacity(rows.len());
+    for _ in 0..bootstrap.resamples {
+        replica.clear();
+        for _ in 0..rows.len() {
+            replica.push(rows[sampled_index(&mut state, rows.len())]);
+        }
+        let (metrics, selective) = evaluate_locked_rows(&replica, acceptance_threshold)?;
+        ece.push(metrics.ece);
+        brier.push(metrics.brier);
+        selective_risk.push(selective.risk);
+    }
+
+    Ok(ReliabilityConfidenceIntervals {
+        ece: percentile_interval(&mut ece, bootstrap),
+        brier: percentile_interval(&mut brier, bootstrap),
+        selective_risk: selective_risk
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .map(|mut risks| percentile_interval(&mut risks, bootstrap)),
+        bootstrap,
+    })
+}
+
+impl ReliabilityConfidenceIntervals {
+    /// Content-free receipt line naming the method, locked-test scope, and seed.
+    #[must_use]
+    pub fn diagnostic_line(self) -> String {
+        let risk = self.selective_risk.map_or_else(
+            || "not_computed".to_owned(),
+            |interval| format!("[{:.17},{:.17}]", interval.lower, interval.upper),
+        );
+        format!(
+            "CALIBRATION_CONFIDENCE_INTERVALS split=locked_test method=nonparametric_bootstrap_percentile confidence_level={:.17} resamples={} seed={} ece=[{:.17},{:.17}] brier=[{:.17},{:.17}] selective_risk={risk}",
+            self.bootstrap.confidence_level,
+            self.bootstrap.resamples,
+            self.bootstrap.seed,
+            self.ece.lower,
+            self.ece.upper,
+            self.brier.lower,
+            self.brier.upper,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CalibratedLockedRow {
+    probability: f64,
+    positive: bool,
+}
+
+fn calibrated_locked_rows(
+    locked_test: &LockedTestSet,
+    calibrate: impl Fn(f64) -> Result<f64, CalibrationError>,
+) -> Result<Vec<CalibratedLockedRow>, CalibrationError> {
+    locked_test
+        .rows
+        .iter()
+        .map(|row| {
+            let probability = calibrate(row.probability)?;
+            validate_probability(&row.id, probability)?;
+            Ok(CalibratedLockedRow {
+                probability,
+                positive: row.positive,
+            })
+        })
+        .collect()
+}
+
+fn evaluate_locked_rows(
+    rows: &[CalibratedLockedRow],
+    acceptance_threshold: f64,
+) -> Result<(ReliabilityMetrics, SelectiveRisk), CalibrationError> {
     if !acceptance_threshold.is_finite() || !(0.0..=1.0).contains(&acceptance_threshold) {
         return Err(CalibrationError::InvalidThreshold);
     }
@@ -601,9 +778,8 @@ pub fn report_locked_test(
     let mut brier_sum = 0.0_f64;
     let mut accepted = 0_usize;
     let mut accepted_errors = 0_usize;
-    for row in &locked_test.rows {
-        let probability = calibrate(row.probability)?;
-        validate_probability(&row.id, probability)?;
+    for row in rows {
+        let probability = row.probability;
         let label = if row.positive { 1.0 } else { 0.0 };
         brier_sum += (probability - label).powi(2);
         let bin = ((probability * DEFAULT_ECE_BINS as f64) as usize).min(DEFAULT_ECE_BINS - 1);
@@ -615,7 +791,7 @@ pub fn report_locked_test(
             accepted_errors += if row.positive { 0 } else { 1 };
         }
     }
-    let rows = locked_test.len();
+    let rows = rows.len();
     let ece = bins.into_iter().fold(0.0_f64, |total, bin| {
         if bin.count == 0 {
             total
@@ -639,6 +815,42 @@ pub fn report_locked_test(
             risk: (accepted > 0).then(|| accepted_errors as f64 / accepted as f64),
         },
     ))
+}
+
+fn percentile_interval(
+    values: &mut [f64],
+    bootstrap: BootstrapConfig,
+) -> BootstrapConfidenceInterval {
+    values.sort_by(f64::total_cmp);
+    let last = values.len() - 1;
+    let lower_tail = (1.0 - bootstrap.confidence_level) / 2.0;
+    let lower_index = (lower_tail * last as f64).floor() as usize;
+    let upper_index = ((1.0 - lower_tail) * last as f64).ceil() as usize;
+    BootstrapConfidenceInterval {
+        lower: values[lower_index],
+        upper: values[upper_index],
+        confidence_level: bootstrap.confidence_level,
+        resamples: bootstrap.resamples,
+    }
+}
+
+fn sampled_index(state: &mut u64, upper: usize) -> usize {
+    let upper = u64::try_from(upper).expect("usize always fits in u64 on supported targets");
+    let limit = (u64::MAX / upper) * upper;
+    loop {
+        let value = splitmix64(state);
+        if value < limit {
+            return (value % upper) as usize;
+        }
+    }
+}
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut value = *state;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 #[derive(Clone, Copy, Debug, Default)]

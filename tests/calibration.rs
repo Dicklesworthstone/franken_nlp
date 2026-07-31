@@ -1,9 +1,10 @@
 use franken_nlp::{
     calibration::{
-        BinaryLabel, CalibrationArtifact, CalibrationArtifactSpec, CalibrationError,
-        CalibrationState, ConformalModel, ExchangeabilityMemo, IsotonicModel, LabeledScore,
-        ShiftAssessment, ShiftPolicy, SplitMembership, SplitName, TemperatureModel, ValidityDate,
-        ValidityWindow, report_locked_test,
+        BinaryLabel, BootstrapConfig, CalibrationArtifact, CalibrationArtifactSpec,
+        CalibrationError, CalibrationState, ConformalModel, ExchangeabilityMemo, IsotonicModel,
+        LabeledScore, ShiftAssessment, ShiftPolicy, SplitMembership, SplitName, TemperatureModel,
+        ValidityDate, ValidityWindow, bootstrap_locked_test_confidence_intervals,
+        report_locked_test,
     },
     error::StructuredTaskStatus,
     execution_identity::{
@@ -158,6 +159,56 @@ fn ece_brier_and_selective_risk_are_locked_test_only() {
     assert_eq!(selective.accepted, 1);
     assert_eq!(selective.abstained, 1);
     assert_eq!(selective.risk, Some(0.0));
+}
+
+#[test]
+fn locked_test_bootstrap_intervals_are_replayable_and_never_hide_undefined_risk() {
+    let partition = partition();
+    let bootstrap = BootstrapConfig::new(127, 0.95, 0x5eed_cafe_u64).unwrap();
+    let first = bootstrap_locked_test_confidence_intervals(
+        partition.locked_test(),
+        |probability| Ok(probability),
+        0.0,
+        bootstrap,
+    )
+    .unwrap();
+    let replay = bootstrap_locked_test_confidence_intervals(
+        partition.locked_test(),
+        |probability| Ok(probability),
+        0.0,
+        bootstrap,
+    )
+    .unwrap();
+    assert_eq!(first, replay);
+    assert!((0.0..=1.0).contains(&first.ece.lower));
+    assert!((0.0..=1.0).contains(&first.ece.upper));
+    assert!(first.ece.lower <= first.ece.upper);
+    assert!(first.brier.lower <= first.brier.upper);
+    assert!(first.selective_risk.is_some());
+    assert!(first.diagnostic_line().contains("split=locked_test"));
+    assert!(first.diagnostic_line().contains("seed=1592642302"));
+
+    let undefined_risk = bootstrap_locked_test_confidence_intervals(
+        partition.locked_test(),
+        |probability| Ok(probability),
+        1.0,
+        bootstrap,
+    )
+    .unwrap();
+    assert_eq!(undefined_risk.selective_risk, None);
+    assert!(
+        undefined_risk
+            .diagnostic_line()
+            .contains("selective_risk=not_computed")
+    );
+    assert!(matches!(
+        BootstrapConfig::new(1, 0.95, 0),
+        Err(CalibrationError::InvalidBootstrapResamples)
+    ));
+    assert!(matches!(
+        BootstrapConfig::new(2, 1.0, 0),
+        Err(CalibrationError::InvalidConfidenceLevel)
+    ));
 }
 
 #[test]
