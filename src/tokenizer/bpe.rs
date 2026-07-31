@@ -399,6 +399,18 @@ impl SpBpeTokenizer {
         }
     }
 
+    /// Encode every source byte through the BYTE-piece table only.
+    ///
+    /// This deliberately bypasses all added-token and ordinary-BPE matching.
+    /// It is the fail-closed primitive used by the untrusted-document boundary:
+    /// callers can prove that marker-looking source text did not become an
+    /// injected template-control id, then verify exact byte decoding.
+    pub fn encode_byte_fallback_only(&self, input: &[u8]) -> Result<Vec<u32>, EncodeError> {
+        let mut ids = Vec::with_capacity(input.len());
+        self.encode_byte_fallback(input, &mut ids)?;
+        Ok(ids)
+    }
+
     /// Reassembles the exact decoded byte stream. Invalid token ids fail closed.
     pub fn decode_bytes(&self, ids: &[u32]) -> Result<Vec<u8>, DecodeBytesError> {
         let mut output = Vec::new();

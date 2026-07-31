@@ -1,0 +1,24 @@
+{
+  "template_control_ids": {
+    "entries": [
+      {"id": 256, "special": true, "surface": "<pad>"},
+      {"id": 257, "special": true, "surface": "<|im_start|>"},
+      {"id": 258, "special": true, "surface": "<|im_end|>"},
+      {"id": 259, "special": false, "surface": "<think>"},
+      {"id": 260, "special": false, "surface": "</think>"},
+      {"id": 261, "special": false, "surface": "<tool_call>"},
+      {"id": 262, "special": false, "surface": "</tool_call>"}
+    ],
+    "registry": "TemplateControlIds",
+    "schema_version": 1
+  },
+  "tokenizer_special_ids": {
+    "entries": [
+      {"id": 256, "special": true, "surface": "<pad>"},
+      {"id": 257, "special": true, "surface": "<|im_start|>"},
+      {"id": 258, "special": true, "surface": "<|im_end|>"}
+    ],
+    "registry": "TokenizerSpecialIds",
+    "schema_version": 1
+  }
+}
