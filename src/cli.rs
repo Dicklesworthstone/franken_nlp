@@ -10,7 +10,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::{
     artifact::converter::{
-        prepare_convert_request, ConvertArch, ConvertRequest, ConverterError, DEFAULT_PANEL_BYTES,
+        plan_generic_payload, prepare_convert_request, ConvertArch, ConvertRequest, ConverterError,
+        DEFAULT_PANEL_BYTES,
     },
     artifact::package::{package_model, verify_model_package, PackageRequest},
     error::ErrorCode,
@@ -203,15 +204,21 @@ fn run_convert_command(command: ConvertCommand) -> ExitCode {
     };
 
     match prepare_convert_request(&request, DEFAULT_PANEL_BYTES) {
-        Ok(prepared) => {
-            eprintln!(
-                "CONVERT RESULT=BLOCKED stage=streaming-envelope source-root-sha256={} census-sha256={} tensors={} reason=canonical-v1-writer-requires-an-in-memory-envelope; no-output-created",
-                prepared.source.source_root_sha256,
-                prepared.census_sha256,
-                prepared.census.len(),
-            );
-            ErrorCode::Generic.as_process_exit()
-        }
+        Ok(prepared) => match plan_generic_payload(&prepared.census, &prepared.routes) {
+            Ok(generic) => {
+                eprintln!(
+                    "CONVERT RESULT=BLOCKED stage=streaming-execution-bridge source-root-sha256={} census-sha256={} tensors={} generic-payload-bytes={} generic-scale-bytes={} generic-row-sum-bytes={} reason=canonical-v1-writer-is-available-but-converter-first-pass-and-activation-are-not-yet-bound; no-output-created",
+                    prepared.source.source_root_sha256,
+                    prepared.census_sha256,
+                    prepared.census.len(),
+                    generic.payload_bytes,
+                    generic.scale_bytes,
+                    generic.row_sum_bytes,
+                );
+                ErrorCode::Generic.as_process_exit()
+            }
+            Err(error) => emit_convert_refusal(error),
+        },
         Err(error) => emit_convert_refusal(error),
     }
 }
