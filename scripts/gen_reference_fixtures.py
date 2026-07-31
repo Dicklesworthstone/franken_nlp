@@ -44,6 +44,15 @@ DEFAULT_PROMPTS = (
     "Return a concise trace label.",
 )
 SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
+REQUIRED_TEMPLATE_CASE_IDS = frozenset(
+    {
+        "system-default-no-think",
+        "thinking-preserved",
+        "tool-xml",
+        "tool-json",
+        "media-reminder",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -722,6 +731,12 @@ def capture_auxiliary_fixtures(output_root: Path, tokenizer: Any, corpus: dict[s
                 "token_ids_sha256": sha256_bytes(canonical_json(rendered_ids)),
             }
         )
+    observed_template_ids = {str(record["id"]) for record in template_records}
+    missing_template_cases = sorted(REQUIRED_TEMPLATE_CASE_IDS - observed_template_ids)
+    if missing_template_cases:
+        raise TraceError(
+            "template input corpus is missing required mode cases=" + ",".join(missing_template_cases)
+        )
     payload = {
         "format_version": TRACE_FORMAT_VERSION,
         "slow_tokenizer_class": tokenizer.__class__.__name__,
@@ -922,6 +937,16 @@ def verify_fixture_root(root: Path, oracle_floor: Path | None) -> int:
             auxiliary_payload.get("template_cases"), list
         ):
             raise TraceError("auxiliary fixture cannot be parsed as tokenizer/template records")
+        observed_template_ids = {
+            record.get("id")
+            for record in auxiliary_payload["template_cases"]
+            if isinstance(record, dict) and isinstance(record.get("id"), str)
+        }
+        missing_template_cases = sorted(REQUIRED_TEMPLATE_CASE_IDS - observed_template_ids)
+        if missing_template_cases:
+            raise TraceError(
+                "auxiliary fixture is missing required template mode cases=" + ",".join(missing_template_cases)
+            )
     except (OSError, TraceError) as error:
         log("REF_FIXTURES", f"FAIL {error}")
         log("REF_FIXTURES", "RESULT=FAIL fixtures=0 missing=invalid-or-missing")

@@ -29,9 +29,12 @@ eager semantics.
 
 The repository-authored input corpus covers ordinary/multilingual/code/marker
 tokenization and the chat-template mode matrix: default system text, thinking
-off, thinking preserved, and tool JSON.  Adding a case is a versioned corpus
-change: it changes the corpus digest and requires a new fixture generation.
-No third-party licensed prose belongs in this input file.
+off, thinking preserved, tool XML, tool JSON, and the text-only media-reminder
+branch.  These five template case ids are mechanically required by generation
+and verification, so a reduced corpus cannot silently look complete. Adding a
+case is a versioned corpus change: it changes the corpus digest and requires a
+new fixture generation. No third-party licensed prose belongs in this input
+file.
 
 ## Layout
 
