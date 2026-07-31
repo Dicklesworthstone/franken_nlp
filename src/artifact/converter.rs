@@ -18,11 +18,11 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::artifact::quantize::{encode_generic_panel, QuantizeError};
 use crate::artifact::safetensors::{
     CensusDiff, RowPanel, SafetensorDtype, SafetensorsError, SafetensorsRangeIndex, SourceClosure,
     SourceDigest, TensorCensusEntry, TensorExpectation, diff_census_entries,
 };
-use crate::artifact::quantize::{QuantizeError, quantize_per_output_channel_i8};
 use crate::canonjson::{self, ParseLimits};
 
 /// The complete source closure, including tokenizer/configuration files.
@@ -1160,27 +1160,21 @@ pub fn transform_routed_panel(
     let columns = usize::try_from(columns).map_err(|_| ConverterError::Arithmetic {
         invariant: "routed panel columns to usize",
     })?;
+    let encoded = encode_generic_panel(route.stage, source_bytes, f32_work, rows, columns)
+        .map_err(ConverterError::Quantize)?;
     match route.stage {
         StorageStage::Bf16Verbatim => Ok(GenericPanel::Bf16Verbatim {
-            bytes: source_bytes.to_vec(),
+            bytes: encoded.data,
         }),
         StorageStage::Int8Stage2A | StorageStage::Int8Stage2B | StorageStage::Int8Stage2C => {
-            let quantized = quantize_per_output_channel_i8(f32_work, rows, columns)
-                .map_err(ConverterError::Quantize)?;
-            let scales_le = quantized
-                .scales
-                .iter()
-                .flat_map(|scale| scale.to_le_bytes())
-                .collect();
-            let row_sums_le = quantized
-                .row_sums
-                .iter()
-                .flat_map(|sum| sum.to_le_bytes())
-                .collect();
             Ok(GenericPanel::Int8 {
-                values: quantized.values,
-                scales_le,
-                row_sums_le,
+                values: encoded
+                    .data
+                    .into_iter()
+                    .map(|value| i8::from_ne_bytes([value]))
+                    .collect(),
+                scales_le: encoded.scales,
+                row_sums_le: encoded.row_sums,
             })
         }
     }

@@ -3,11 +3,11 @@
 //! `fnlp convert`; the real closure conversion remains controller-owned.
 
 use franken_nlp::artifact::converter::{
-    remap_tensor_name, stream_routed_bf16_panels, transform_routed_panel, GenericPanel, PanelPlan,
-    StorageStage,
+    remap_tensor_name, stream_routed_bf16_panels, transform_routed_panel, ConverterError,
+    GenericPanel, PanelPlan, StorageStage,
 };
 use franken_nlp::artifact::quantize::encode_generic_panel;
-use franken_nlp::artifact::safetensors::{SafetensorDtype, TensorCensusEntry};
+use franken_nlp::artifact::safetensors::{RowPanel, SafetensorDtype, TensorCensusEntry};
 
 const ONE_ROW_BF16: [u8; 8] = [0x80, 0x3f, 0x80, 0xbf, 0x00, 0x3f, 0x00, 0xbf];
 const ONE_ROW_F32: [f32; 4] = [1.0, -1.0, 0.5, -0.5];
@@ -121,4 +121,33 @@ fn routed_stream_applies_each_storage_stage_without_retaining_the_tensor() {
             "route={source_name}"
         );
     }
+}
+
+#[test]
+fn routed_transform_refuses_a_substituted_f32_work_panel() {
+    let entry = TensorCensusEntry {
+        name: "model.layers.0.mlp.gate_proj.weight".to_owned(),
+        dtype: SafetensorDtype::Bf16,
+        shape: vec![1, 4],
+        len: 8,
+    };
+    let route = remap_tensor_name(&entry.name).expect("named converter route");
+    let error = transform_routed_panel(
+        &entry,
+        &route,
+        RowPanel::Rows {
+            start_row: 0,
+            row_count: 1,
+        },
+        &ONE_ROW_BF16,
+        &[1.0, -1.0, 0.75, -0.5],
+    )
+    .expect_err("substituted f32 work must not enter generic quantization");
+
+    assert!(matches!(
+        error,
+        ConverterError::Quantize(
+            franken_nlp::artifact::quantize::QuantizeError::DecodedBf16Mismatch { element: 2, .. }
+        )
+    ));
 }
