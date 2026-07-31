@@ -36,7 +36,7 @@ function Stop-RetryServer {
         $script:RetryServer = $null
     }
 }
-function Start-InterruptedResumeServer([switch]$MalformedRange) {
+function Start-InterruptedResumeServer([switch]$MalformedRange, [switch]$OverlongBody) {
     $runId = [Guid]::NewGuid().ToString('N')
     $ready = Join-Path $Work ("retry-$runId.ready")
     $trace = Join-Path $Work ("retry-$runId.trace")
@@ -79,11 +79,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             remainder = payload[5:]
             self.send_response(206)
-            self.send_header("Content-Length", str(len(remainder)))
+            if mode != "overlong-body":
+                self.send_header("Content-Length", str(len(remainder)))
             reported_start = 4 if mode == "malformed-range" else 5
             self.send_header("Content-Range", "bytes {}-{}/{}".format(reported_start, len(payload) - 1, len(payload)))
             self.end_headers()
             self.wfile.write(remainder)
+            if mode == "overlong-body":
+                self.wfile.write(b"X")
+                self.close_connection = True
             return
         self.send_response(200)
         self.send_header("Content-Length", str(len(payload)))
@@ -99,7 +103,7 @@ with open(ready_path, "w", encoding="ascii") as ready:
 server.serve_forever()
 '@
     Set-Content -LiteralPath $serverScript -NoNewline -Encoding utf8 -Value $serverCode
-    $mode = if ($MalformedRange) { 'malformed-range' } else { 'exact-range' }
+    $mode = if ($MalformedRange) { 'malformed-range' } elseif ($OverlongBody) { 'overlong-body' } else { 'exact-range' }
     $script:RetryServer = Start-Process -FilePath python3 -ArgumentList @($serverScript, $Fixture, $ready, $trace, $mode) -PassThru -RedirectStandardOutput (Join-Path $Work ("retry-$runId.out")) -RedirectStandardError (Join-Path $Work ("retry-$runId.err"))
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
         if (Test-Path -LiteralPath $ready) {
@@ -347,6 +351,16 @@ try {
         if ($status -eq 3 -and -not (Test-Path -LiteralPath (Join-Path $d8malformed 'alpha.bin')) -and (Test-Path -LiteralPath $partial) -and (Get-Item -LiteralPath $partial).Length -eq 5 -and (Get-Content -LiteralPath (Join-Path $Work 'case8malformed.err') -Raw) -match 'mismatched Content-Range') { Pass '8malformed' 'mismatched-content-range-refusal' } else { Fail '8malformed' "mismatched-content-range-refusal exit=$status" }
     } else {
         Fail '8malformed' 'malformed-range-server'
+    }
+    Stop-RetryServer
+
+    $script:Cases++; $d8overlong = Join-Path $Work 'case8overlong'; $overlong = Start-InterruptedResumeServer -OverlongBody
+    if ($overlong) {
+        $env:FNLP_FETCH_ALLOW_TEST_BASE_URL = '1'; & pwsh -NoProfile -File $Fetch -Dest $d8overlong -Catalog $script:Catalog -TestBaseUrl $overlong.Base -AllowUntrustedRevision 2> (Join-Path $Work 'case8overlong.err'); $status = $LASTEXITCODE
+        $partial = Join-Path $d8overlong 'alpha.bin.partial'
+        if ($status -eq 0 -and -not (Test-Path -LiteralPath $partial) -and (Get-FileHash (Join-Path $d8overlong 'alpha.bin') -Algorithm SHA256).Hash.ToLowerInvariant() -eq $alphaSha -and (Get-Content -LiteralPath $overlong.Trace -Raw) -match 'alpha.bin range=bytes=5-') { Pass '8overlong' 'overlong-body-never-appended' } else { Fail '8overlong' "overlong-body-never-appended exit=$status" }
+    } else {
+        Fail '8overlong' 'overlong-body-server'
     }
     Stop-RetryServer
 

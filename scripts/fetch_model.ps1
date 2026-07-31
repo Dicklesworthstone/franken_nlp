@@ -240,6 +240,10 @@ function Download-Partial([string]$Url, [string]$Partial, [string]$Journal, $Ent
             if ($start -gt $Entry.Length) {
                 throw "partial exceeds expected length expected=$($Entry.Length) observed=$start"
             }
+            # A prior body may have completed just before its transport failed.
+            # Its bound journal and the caller's SHA-256 verification decide
+            # whether it can activate; never issue an un-ranged second GET.
+            if ($start -eq $Entry.Length) { return }
             $expectedBodyBytes = $Entry.Length - $start
             $requestedUri = [Uri]$Url
             if (-not $TestBaseUrl -and -not (Test-EffectiveHost $requestedUri)) { throw "redirect host refused effective_url=$requestedUri" }
@@ -279,6 +283,9 @@ function Download-Partial([string]$Url, [string]$Partial, [string]$Journal, $Ent
                 $nextLog = [DateTime]::UtcNow
                 $receivedBytes = [int64]0
                 while (($read = $input.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                    if ([int64]$read -gt ($expectedBodyBytes - $receivedBytes)) {
+                        throw "response body exceeds expected length expected=$expectedBodyBytes observed_at_least=$($receivedBytes + $read)"
+                    }
                     $output.Write($buffer, 0, $read)
                     $receivedBytes += $read
                     if ([DateTime]::UtcNow -ge $nextLog) { Write-Log "PROGRESS file=$($Entry.Name) bytes=$($output.Length) expected_bytes=$($Entry.Length)"; $nextLog = [DateTime]::UtcNow.AddSeconds(5) }
