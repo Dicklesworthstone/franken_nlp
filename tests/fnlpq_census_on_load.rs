@@ -57,6 +57,27 @@ fn complete_nanbeige_census_loads_and_missing_shape_and_name_drift_refuse() {
         write(&renamed).expect("renamed fixture writes").bytes,
         "renamed",
     );
+
+    let mut extra = nanbeige_input();
+    extra.tensors.push(TensorInput {
+        name: "z.extra.tensor".to_owned(),
+        canonical_dtype: CanonicalDtype::Bf16,
+        shape: vec![1],
+        canonical_logical_sha256: logical_tensor_hex(
+            "z.extra.tensor",
+            &[1],
+            STRUCTURAL_CENSUS_RECIPE,
+        ),
+        quantization: STRUCTURAL_CENSUS_RECIPE.to_owned(),
+        data: SectionRange::new("generic-payload", 0, 0),
+        scale: SectionRange::new("generic-scales", 0, 0),
+        row_sum: SectionRange::new("generic-row-sums", 0, 0),
+    });
+    refresh_logical_model_identity(&mut extra);
+    assert_census_refusal(
+        write(&extra).expect("extra fixture writes").bytes,
+        "extra",
+    );
 }
 
 #[test]
