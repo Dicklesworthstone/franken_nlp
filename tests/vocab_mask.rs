@@ -1,11 +1,15 @@
 //! Model-free coverage for the exact-byte vocabulary trie and schema-only cache.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+    thread,
+};
 
 use franken_nlp::{
     grammar::mask::{
-        ByteState, MaskCacheError, MaskOracleError, MaskWorkLimits, SchemaMaskCache, SchemaMaskKey,
-        VocabMaskOracle, VocabTrie,
+        ByteState, MaskCacheError, MaskOracleError, MaskWorkLimits, NANBEIGE_MASK_BYTES_PER_STATE,
+        SchemaMaskCache, SchemaMaskKey, VocabMaskOracle, VocabTrie,
     },
     tokenizer::{
         bpe::{AddedToken, SpBpeTokenizer},
@@ -38,6 +42,7 @@ fn tokenizer() -> SpBpeTokenizer {
             piece("▁a", PieceType::Normal),
             piece("ab", PieceType::Normal),
             piece("<0xFF>", PieceType::Byte),
+            piece("λ", PieceType::Normal),
         ],
         model_type: ModelType::Bpe,
         normalizer: NormalizerFacts {
@@ -109,10 +114,11 @@ fn trie_uses_detokenized_bytes_and_keeps_model_padding_illegal() {
         "control pieces cannot advance grammar"
     );
     assert_eq!(
-        trie.token_bytes(7),
+        trie.token_bytes(8),
         None,
         "padded model rows have no tokenizer token"
     );
+    assert_eq!(trie.token_bytes(7), Some("λ".as_bytes()));
     assert!(trie.indexed_token_count() < trie.vocab_size());
     assert!(trie.node_count() > 1);
 }
@@ -131,7 +137,7 @@ fn pinned_real_vocab_trie_covers_decodable_rows_and_excludes_embedding_padding()
     assert!(trie.indexed_token_count() > 166_000);
     assert_eq!(
         (trie.vocab_size() + 7) / 8,
-        20_768,
+        NANBEIGE_MASK_BYTES_PER_STATE,
         "the model width retains the documented dense-mask footprint"
     );
 }
@@ -156,6 +162,38 @@ fn shared_trie_walk_equals_bruteforce_per_token_transition() {
         );
     }
     assert_eq!(mask.legal_ids().collect::<Vec<_>>(), vec![4]);
+}
+
+#[test]
+fn randomized_prefixes_match_bruteforce_including_byte_fallback_and_utf8_boundaries() {
+    let trie = VocabTrie::from_tokenizer(&tokenizer(), 10).expect("trie builds");
+    let oracle = VocabMaskOracle::new(trie.clone());
+    let alphabet = [0, b' ', b'a', b'b', 0xff, b'<', 0xce, 0xbb];
+    let mut seed = 0x4d41_534b_0000_0001_u64;
+    for case in 0..128 {
+        let length = usize::try_from(seed & 7).expect("small random length fits usize");
+        let mut expected = Vec::with_capacity(length);
+        for _ in 0..length {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let index = usize::try_from((seed >> 32) % alphabet.len() as u64)
+                .expect("alphabet index fits usize");
+            expected.push(alphabet[index]);
+        }
+        let initial = PrefixState::new(&expected);
+        let mask = oracle
+            .materialize(&initial, MaskWorkLimits::default(), |_| true)
+            .expect("finite toy trie always materializes under default work limits");
+        for token_id in 0..u32::try_from(trie.vocab_size()).expect("toy width fits u32") {
+            let brute_force = trie
+                .token_bytes(token_id)
+                .is_some_and(|bytes| candidate_is_legal(&initial, bytes));
+            assert_eq!(
+                mask.contains(token_id),
+                brute_force,
+                "random case={case} differs for token id={token_id} expected_bytes={expected:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -216,4 +254,42 @@ fn schema_cache_is_byte_bounded_and_has_no_document_key_surface() {
         .insert(key, 8, mask)
         .expect_err("second state exceeds the strict byte budget");
     assert!(matches!(error, MaskCacheError::ByteBudgetExceeded { .. }));
+}
+
+#[test]
+fn concurrent_schema_keys_share_only_aggregate_cache_state() {
+    let oracle = VocabMaskOracle::new(VocabTrie::from_tokenizer(&tokenizer(), 10).unwrap());
+    let mask = oracle
+        .materialize(&PrefixState::new(b" a"), MaskWorkLimits::default(), |_| {
+            true
+        })
+        .unwrap();
+    let cache = Arc::new(Mutex::new(SchemaMaskCache::new(mask.byte_len() * 2)));
+    let mut joins = Vec::new();
+    for schema_digest in [[3; 32], [4; 32]] {
+        let cache = Arc::clone(&cache);
+        let mask = mask.clone();
+        joins.push(thread::spawn(move || {
+            cache
+                .lock()
+                .expect("cache mutex is not poisoned")
+                .insert(
+                    SchemaMaskKey {
+                        tokenizer_digest: [1; 32],
+                        schema_digest,
+                        grammar_version: 1,
+                    },
+                    7,
+                    mask,
+                )
+                .expect("independent schema mask fits the aggregate budget");
+        }));
+    }
+    for join in joins {
+        join.join().expect("cache admission thread completes");
+    }
+    let stats = cache.lock().expect("cache mutex is not poisoned").stats();
+    assert_eq!(stats.schema_entries, 2);
+    assert_eq!(stats.state_masks, 2);
+    assert_eq!(stats.used_bytes, stats.capacity_bytes);
 }
