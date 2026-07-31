@@ -1084,6 +1084,68 @@ def run_trace(
         return 1
 
 
+def load_slow_tokenizer(model_source: Path) -> Any:
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as error:
+        raise TraceError(f"missing locked oracle dependency: {error}") from error
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_source,
+        revision=PINNED_REVISION,
+        trust_remote_code=True,
+        use_fast=False,
+        local_files_only=True,
+    )
+    if "fast" in tokenizer.__class__.__name__.lower():
+        raise TraceError(f"slow tokenizer required, observed class={tokenizer.__class__.__name__}")
+    return tokenizer
+
+
+def run_generate(args: argparse.Namespace) -> int:
+    """Generate the complete profile matrix, then seal it with a model-free manifest pass."""
+
+    if args.model_source is None or not args.model_source.is_dir():
+        log("REF_FIXTURES", "RESULT=SKIPPED_NO_MODEL fixtures=0 missing=source-closure")
+        return 0
+    try:
+        corpus = load_fixture_inputs(args.corpus)
+        floor_digest, stable_prefixes = stable_prefixes_from_floor(args.oracle_floor)
+        prompts = corpus["prompts"]
+        assert isinstance(prompts, list)
+        output_root = args.output.resolve()
+        if output_root.exists() and any(output_root.iterdir()):
+            raise TraceError(f"fixture output directory must be absent or empty: {output_root}")
+        selected_profiles = tuple(PROFILES) if args.profile == "all" else (args.profile,)
+        for index, profile_name in enumerate(selected_profiles):
+            args.profile = profile_name
+            status = run_trace(
+                args,
+                allow_existing_output=index > 0,
+                prompts_override=prompts,
+                oracle_floor_sha256=floor_digest,
+                stable_prefixes=stable_prefixes,
+            )
+            if status != 0:
+                log("REF_FIXTURES", "RESULT=FAIL fixtures=0 missing=trace-capture")
+                return status
+        tokenizer = load_slow_tokenizer(args.model_source)
+        auxiliary_path = capture_auxiliary_fixtures(output_root, tokenizer, corpus)
+        trace_indices = tuple(sorted(output_root.glob("*/prompt-*/trace.json")))
+        if not trace_indices:
+            raise TraceError("profile generation produced no trace index files")
+        manifest_path = build_fixture_manifest(output_root, trace_indices, auxiliary_path, floor_digest)
+        log(
+            "REF_FIXTURES",
+            f"manifest path={manifest_path.relative_to(output_root)} sha256={sha256_path(manifest_path)} "
+            f"profiles={','.join(selected_profiles)}",
+        )
+    except (OSError, TraceError) as error:
+        log("REF_FIXTURES", f"FAIL {error}")
+        log("REF_FIXTURES", "RESULT=FAIL fixtures=0 missing=generation")
+        return 1
+    return verify_fixture_root(args.output.resolve(), args.oracle_floor)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trace", action="store_true", help="capture prefill and one-token-append traces")
