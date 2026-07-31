@@ -83,6 +83,10 @@ fn first_ok_outcomes_is_input_order_classification_only() {
     assert_eq!(picked.failures[0].0, 0, "failure indices keep input order");
     println!("G0_CENSUS item=first-ok-sequential case=mixed picked_index=1 failures_before=1");
 
+    // OBSERVED at the pin: Cancelled and Panicked are chain-stopping — the
+    // classifier returns at the first severity-terminal outcome and every
+    // later entry stays unclassified. Here the Panicked at index 2 is never
+    // reached, so had_panic is false and only two failures are recorded.
     let all_fail: Vec<Outcome<&str, &str>> = vec![
         Outcome::Err("a"),
         Outcome::Cancelled(CancelReason::new(CancelKind::Timeout)),
@@ -90,10 +94,22 @@ fn first_ok_outcomes_is_input_order_classification_only() {
     ];
     let none = first_ok_outcomes(all_fail);
     assert!(none.success.is_none());
-    assert_eq!(none.failures.len(), 3, "every failure is classified");
+    assert_eq!(none.failures.len(), 2, "cancellation stops the chain; index 2 unclassified");
     assert!(none.was_cancelled, "cancellation is surfaced, not swallowed");
-    assert!(none.had_panic, "panic is surfaced, not swallowed");
-    println!("G0_CENSUS item=first-ok-sequential case=all-fail cancelled=true panicked=true");
+    assert!(!none.had_panic, "the panic after the chain-stopping cancel is never seen");
+    println!("G0_CENSUS item=first-ok-sequential case=cancel-stops-chain classified=2of3");
+
+    let panic_stops: Vec<Outcome<&str, &str>> = vec![
+        Outcome::Err("a"),
+        Outcome::Panicked(PanicPayload::new("census probe panic payload")),
+        Outcome::Err("never-classified"),
+    ];
+    let stopped = first_ok_outcomes(panic_stops);
+    assert!(stopped.success.is_none());
+    assert_eq!(stopped.failures.len(), 2, "panic stops the chain; index 2 unclassified");
+    assert!(stopped.had_panic);
+    assert!(!stopped.was_cancelled);
+    println!("G0_CENSUS item=first-ok-sequential case=panic-stops-chain classified=2of3");
 
     let empty: Vec<Outcome<&str, &str>> = Vec::new();
     let nothing = first_ok_outcomes(empty);
@@ -104,7 +120,7 @@ fn first_ok_outcomes_is_input_order_classification_only() {
     census(
         "first-ok-sequential",
         "RATIFIED",
-        "classification-only+input-order-selection+loss-preservation",
+        "classification-only+input-order-selection+cancel-and-panic-are-chain-stopping",
     );
 }
 
