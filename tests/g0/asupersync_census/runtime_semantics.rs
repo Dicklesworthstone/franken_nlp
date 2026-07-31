@@ -259,9 +259,6 @@ fn preset_builder_values_observed_on_constructed_runtimes() {
         "RATIFIED",
         "observed-on-built-runtimes:current1+default4+throughput8x32+latency4x32",
     );
-    println!(
-        "G0_CENSUS summary items=4 ratified=4 absent_with_fallback=0 fail=0 residual=cast-enqueue-only,try-cast-policies,lab-determinism"
-    );
 }
 
 /// `Cx::current()` retains the default `Cx<cap::All>` static type even while a
