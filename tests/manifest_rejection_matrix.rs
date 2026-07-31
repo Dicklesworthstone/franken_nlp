@@ -30,6 +30,19 @@ fn release_manifest_rejection_matrix() {
     )
     .expect("embedded bytes and digest agree");
     assert_eq!(embedded.parse().expect("embedded manifest parses"), valid);
+    embedded
+        .verify_release_attachment(&canonical)
+        .expect("release attachment exactly matches embedded bytes");
+    let mut stale_attachment = canonical.clone();
+    let removed = stale_attachment.pop().expect("non-empty manifest fixture");
+    stale_attachment.push(removed ^ 1);
+    let attachment_error = embedded
+        .verify_release_attachment(&stale_attachment)
+        .expect_err("one changed attachment byte rejects");
+    assert_eq!(
+        attachment_error.invariant,
+        "embedded-attached-manifest-identity"
+    );
 
     let mut cases = Vec::new();
     let mut bad_tag = valid.clone();

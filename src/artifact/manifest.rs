@@ -751,6 +751,30 @@ impl EmbeddedReleaseManifest {
     pub fn parse(self) -> Result<ReleaseManifest, ManifestError> {
         ReleaseManifest::parse(self.bytes)
     }
+
+    /// Verify that the release's audit attachment is byte-identical to the
+    /// exact canonical bytes embedded by the installed binary.  The caller
+    /// supplies only bytes already acquired by its release-audit workflow;
+    /// this pure comparison deliberately grants neither filesystem nor network
+    /// authority.
+    pub fn verify_release_attachment(self, attached_bytes: &[u8]) -> Result<(), ManifestError> {
+        if self.bytes == attached_bytes {
+            Ok(())
+        } else {
+            Err(ManifestError::new(
+                "embedded-attached-manifest-identity",
+                "$",
+                format!(
+                    "embedded release-manifest SHA-256={}",
+                    self.release_manifest_sha256
+                ),
+                format!(
+                    "attached release-manifest SHA-256={}",
+                    release_manifest_sha256(attached_bytes)
+                ),
+            ))
+        }
+    }
 }
 
 /// Hash exact canonical release-manifest bytes in their dedicated domain.
