@@ -19,8 +19,8 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::artifact::safetensors::{
-    diff_census_entries, CensusDiff, RowPanel, SafetensorDtype, SafetensorsError,
-    SafetensorsRangeIndex, SourceClosure, SourceDigest, TensorCensusEntry, TensorExpectation,
+    CensusDiff, RowPanel, SafetensorDtype, SafetensorsError, SafetensorsRangeIndex, SourceClosure,
+    SourceDigest, TensorCensusEntry, TensorExpectation, diff_census_entries,
 };
 use crate::canonjson::{self, ParseLimits};
 
@@ -1005,6 +1005,131 @@ pub fn decode_bf16_panel(source: &[u8]) -> Result<Vec<f32>, ConverterError> {
         .collect())
 }
 
+/// Read, decode, and consume a verified BF16 tensor one planned row panel at
+/// a time. The source and f32 work buffers are local to each loop iteration,
+/// so neither a whole tensor nor a whole shard can remain resident while the
+/// next panel is read.
+///
+/// The caller owns quantization/packing and staging in `consume`; this bridge
+/// owns the bounded source-range and BF16-to-f32 boundary only.
+pub fn stream_verified_bf16_panels<C>(
+    source: &SafetensorsRangeIndex,
+    entry: &TensorCensusEntry,
+    plan: &PanelPlan,
+    consume: C,
+) -> Result<(), ConverterError>
+where
+    C: FnMut(RowPanel, &[u8], &[f32]) -> Result<(), ConverterError>,
+{
+    stream_bf16_row_panels(
+        entry,
+        plan,
+        |panel| {
+            source
+                .read_range(&entry.name, panel)
+                .map_err(ConverterError::Safetensors)
+        },
+        consume,
+    )
+}
+
+fn stream_bf16_row_panels<R, C>(
+    entry: &TensorCensusEntry,
+    plan: &PanelPlan,
+    mut read_panel: R,
+    mut consume: C,
+) -> Result<(), ConverterError>
+where
+    R: FnMut(RowPanel) -> Result<Vec<u8>, ConverterError>,
+    C: FnMut(RowPanel, &[u8], &[f32]) -> Result<(), ConverterError>,
+{
+    if entry.dtype != SafetensorDtype::Bf16 {
+        return Err(ConverterError::UnexpectedDtype {
+            tensor: entry.name.clone(),
+            expected: SafetensorDtype::Bf16,
+            actual: entry.dtype,
+        });
+    }
+    if plan.tensor != entry.name {
+        return Err(ConverterError::InvalidPanelPlan {
+            tensor: entry.name.clone(),
+            detail: format!(
+                "plan belongs to {} rather than requested tensor {}",
+                plan.tensor, entry.name
+            ),
+        });
+    }
+    let total_rows = *entry
+        .shape
+        .first()
+        .ok_or_else(|| ConverterError::InvalidPanelPlan {
+            tensor: entry.name.clone(),
+            detail: "rank-zero tensor has no row-panel stream".to_owned(),
+        })?;
+
+    for panel in plan.row_panels(total_rows)? {
+        let RowPanel::Rows {
+            start_row,
+            row_count,
+        } = panel
+        else {
+            return Err(ConverterError::InvalidPanelPlan {
+                tensor: entry.name.clone(),
+                detail: "converter row plan produced a whole-tensor request".to_owned(),
+            });
+        };
+        let expected_source_bytes =
+            row_count
+                .checked_mul(plan.bytes_per_row)
+                .ok_or(ConverterError::Arithmetic {
+                    invariant: "streamed BF16 panel byte length",
+                })?;
+        let source_bytes = read_panel(panel)?;
+        let observed_source_bytes =
+            u64::try_from(source_bytes.len()).map_err(|_| ConverterError::Arithmetic {
+                invariant: "streamed BF16 panel length to u64",
+            })?;
+        if observed_source_bytes != expected_source_bytes {
+            return Err(ConverterError::PanelReadLength {
+                tensor: entry.name.clone(),
+                start_row,
+                row_count,
+                expected: expected_source_bytes,
+                actual: observed_source_bytes,
+            });
+        }
+        if observed_source_bytes > plan.largest_source_panel_bytes {
+            return Err(ConverterError::InvalidPanelPlan {
+                tensor: entry.name.clone(),
+                detail: format!(
+                    "source panel {observed_source_bytes} bytes exceeds planned maximum {}",
+                    plan.largest_source_panel_bytes
+                ),
+            });
+        }
+        let f32_work = decode_bf16_panel(&source_bytes)?;
+        let f32_work_bytes = u64::try_from(f32_work.len())
+            .map_err(|_| ConverterError::Arithmetic {
+                invariant: "streamed f32 panel element count to u64",
+            })?
+            .checked_mul(4)
+            .ok_or(ConverterError::Arithmetic {
+                invariant: "streamed f32 panel byte length",
+            })?;
+        if f32_work_bytes > plan.largest_f32_panel_bytes {
+            return Err(ConverterError::InvalidPanelPlan {
+                tensor: entry.name.clone(),
+                detail: format!(
+                    "f32 work panel {f32_work_bytes} bytes exceeds planned maximum {}",
+                    plan.largest_f32_panel_bytes
+                ),
+            });
+        }
+        consume(panel, &source_bytes, &f32_work)?;
+    }
+    Ok(())
+}
+
 /// A precomputed, non-overlapping output range in the staging artifact.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OutputRange {
@@ -1434,6 +1559,15 @@ pub enum ConverterError {
     },
     /// BF16 byte count cannot be decoded exactly.
     MalformedBf16Panel { observed_bytes: usize },
+    /// The verified range reader returned a panel outside the precomputed
+    /// row-panel byte contract.
+    PanelReadLength {
+        tensor: String,
+        start_row: u64,
+        row_count: u64,
+        expected: u64,
+        actual: u64,
+    },
     /// Checked byte/count arithmetic overflowed.
     Arithmetic { invariant: &'static str },
     /// Duplicate logical output section/range name.
@@ -1478,34 +1612,184 @@ impl fmt::Display for ConverterError {
                 "convert argument {argument} mismatch: expected={expected} observed={actual}; next=run fnlp convert --recipe {PINNED_CONVERSION_RECIPE} --arch generic"
             ),
             Self::ManifestJson(error) => write!(formatter, "source manifest JSON: {error}"),
-            Self::ManifestSchema { path, detail } => write!(formatter, "source manifest {path}: {detail}"),
-            Self::ManifestTooLarge { path, observed, cap } => write!(formatter, "source manifest {} is {observed} bytes; cap is {cap}", path.display()),
-            Self::PinnedManifestDigest { path, expected, actual } => write!(formatter, "pinned source manifest {} digest mismatch: expected={expected} observed={actual}; next=restore docs/truth-pack/nanbeige4.2-3b.source.json", path.display()),
-            Self::PinnedManifestContract { detail } => write!(formatter, "pinned source manifest contract mismatch: {detail}"),
-            Self::Io { path, operation, detail } => write!(formatter, "{operation} {}: {detail}", path.display()),
-            Self::SourceMissing { path, expected, detail } => write!(formatter, "source member {expected} missing at {}: {detail}; next=restore the pinned source closure and rerun fnlp convert", path.display()),
-            Self::SourceNotRegular { path, expected } => write!(formatter, "source member {expected} is not a regular non-symlink file at {}; next=restore the pinned source closure and rerun fnlp convert", path.display()),
-            Self::SourceLength { path, expected, actual, next_command } => write!(formatter, "source length mismatch {}: expected={expected} observed={actual}; next={next_command}", path.display()),
-            Self::SourceDigest { path, expected, actual, next_command } => write!(formatter, "source digest mismatch {}: expected={expected} observed={actual}; next={next_command}", path.display()),
-            Self::SemanticSourceExtra { path, name, next_command } => write!(formatter, "semantics-altering extra source file {name} at {}; next={next_command}", path.display()),
-            Self::StrictSourceExtra { path, name, next_command } => write!(formatter, "strict source directory rejects extra {name} at {}; next={next_command}", path.display()),
+            Self::ManifestSchema { path, detail } => {
+                write!(formatter, "source manifest {path}: {detail}")
+            }
+            Self::ManifestTooLarge {
+                path,
+                observed,
+                cap,
+            } => write!(
+                formatter,
+                "source manifest {} is {observed} bytes; cap is {cap}",
+                path.display()
+            ),
+            Self::PinnedManifestDigest {
+                path,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "pinned source manifest {} digest mismatch: expected={expected} observed={actual}; next=restore docs/truth-pack/nanbeige4.2-3b.source.json",
+                path.display()
+            ),
+            Self::PinnedManifestContract { detail } => write!(
+                formatter,
+                "pinned source manifest contract mismatch: {detail}"
+            ),
+            Self::Io {
+                path,
+                operation,
+                detail,
+            } => write!(formatter, "{operation} {}: {detail}", path.display()),
+            Self::SourceMissing {
+                path,
+                expected,
+                detail,
+            } => write!(
+                formatter,
+                "source member {expected} missing at {}: {detail}; next=restore the pinned source closure and rerun fnlp convert",
+                path.display()
+            ),
+            Self::SourceNotRegular { path, expected } => write!(
+                formatter,
+                "source member {expected} is not a regular non-symlink file at {}; next=restore the pinned source closure and rerun fnlp convert",
+                path.display()
+            ),
+            Self::SourceLength {
+                path,
+                expected,
+                actual,
+                next_command,
+            } => write!(
+                formatter,
+                "source length mismatch {}: expected={expected} observed={actual}; next={next_command}",
+                path.display()
+            ),
+            Self::SourceDigest {
+                path,
+                expected,
+                actual,
+                next_command,
+            } => write!(
+                formatter,
+                "source digest mismatch {}: expected={expected} observed={actual}; next={next_command}",
+                path.display()
+            ),
+            Self::SemanticSourceExtra {
+                path,
+                name,
+                next_command,
+            } => write!(
+                formatter,
+                "semantics-altering extra source file {name} at {}; next={next_command}",
+                path.display()
+            ),
+            Self::StrictSourceExtra {
+                path,
+                name,
+                next_command,
+            } => write!(
+                formatter,
+                "strict source directory rejects extra {name} at {}; next={next_command}",
+                path.display()
+            ),
             Self::Safetensors(error) => write!(formatter, "checked safetensors source: {error}"),
-            Self::Oq1Tripwire { tensor } => write!(formatter, "OQ-1 design-assumption abort: unexpected tensor family in {tensor}"),
-            Self::CensusMismatch { diff } => write!(formatter, "tensor census mismatch: MISSING={:?} SHAPE-MISMATCH={:?} EXTRA={:?}", diff.missing, diff.shape_mismatch, diff.extra),
-            Self::BiasTensor { tensor } => write!(formatter, "bias tensor {tensor} is forbidden by the Nanbeige4.2-3B source contract"),
-            Self::UnknownTensorRoute { tensor } => write!(formatter, "no complete converter remap for source tensor {tensor}"),
-            Self::UnexpectedDtype { tensor, expected, actual } => write!(formatter, "tensor {tensor} dtype mismatch: expected={} observed={}", expected.as_str(), actual.as_str()),
-            Self::InvalidPanelPlan { tensor, detail } => write!(formatter, "invalid panel plan for {tensor}: {detail}"),
-            Self::RowExceedsPanelCap { tensor, row_bytes, cap } => write!(formatter, "tensor {tensor} row is {row_bytes} bytes, over panel cap {cap}"),
-            Self::MalformedBf16Panel { observed_bytes } => write!(formatter, "BF16 panel byte length must be even, observed {observed_bytes}"),
-            Self::Arithmetic { invariant } => write!(formatter, "checked arithmetic overflow: {invariant}"),
-            Self::DuplicateOutputRange { name } => write!(formatter, "duplicate precomputed output range {name}"),
-            Self::OutputRangeLayout { name, expected_offset, actual_offset } => write!(formatter, "output range {name} offset mismatch: expected={expected_offset} observed={actual_offset}"),
-            Self::OutputFileLength { expected, actual } => write!(formatter, "staging coverage mismatch: expected={expected} observed={actual}"),
-            Self::StagingWriteRange { name, expected_offset, observed_offset, expected_len, observed_len } => write!(formatter, "staging write {name} mismatch: expected offset/len={expected_offset}/{expected_len}, observed={observed_offset}/{observed_len}"),
-            Self::PeakRssExceeded { observed, cap } => write!(formatter, "peak RSS gate exceeded: observed={observed} formula-cap={cap}"),
-            Self::ActivationTargetExists { path } => write!(formatter, "refusing to overwrite existing artifact {}; quarantine it explicitly, then rerun fnlp convert", path.display()),
-            Self::ActivationProtocolUnavailable { destination } => write!(formatter, "activation of {} is blocked: no portable atomic no-clobber filesystem transaction is installed; next=complete the fs_tx activation contract", destination.display()),
+            Self::Oq1Tripwire { tensor } => write!(
+                formatter,
+                "OQ-1 design-assumption abort: unexpected tensor family in {tensor}"
+            ),
+            Self::CensusMismatch { diff } => write!(
+                formatter,
+                "tensor census mismatch: MISSING={:?} SHAPE-MISMATCH={:?} EXTRA={:?}",
+                diff.missing, diff.shape_mismatch, diff.extra
+            ),
+            Self::BiasTensor { tensor } => write!(
+                formatter,
+                "bias tensor {tensor} is forbidden by the Nanbeige4.2-3B source contract"
+            ),
+            Self::UnknownTensorRoute { tensor } => write!(
+                formatter,
+                "no complete converter remap for source tensor {tensor}"
+            ),
+            Self::UnexpectedDtype {
+                tensor,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "tensor {tensor} dtype mismatch: expected={} observed={}",
+                expected.as_str(),
+                actual.as_str()
+            ),
+            Self::InvalidPanelPlan { tensor, detail } => {
+                write!(formatter, "invalid panel plan for {tensor}: {detail}")
+            }
+            Self::RowExceedsPanelCap {
+                tensor,
+                row_bytes,
+                cap,
+            } => write!(
+                formatter,
+                "tensor {tensor} row is {row_bytes} bytes, over panel cap {cap}"
+            ),
+            Self::MalformedBf16Panel { observed_bytes } => write!(
+                formatter,
+                "BF16 panel byte length must be even, observed {observed_bytes}"
+            ),
+            Self::PanelReadLength {
+                tensor,
+                start_row,
+                row_count,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "streamed panel for {tensor} rows=[{start_row}, {}) has length {actual}, expected {expected}",
+                start_row.saturating_add(*row_count)
+            ),
+            Self::Arithmetic { invariant } => {
+                write!(formatter, "checked arithmetic overflow: {invariant}")
+            }
+            Self::DuplicateOutputRange { name } => {
+                write!(formatter, "duplicate precomputed output range {name}")
+            }
+            Self::OutputRangeLayout {
+                name,
+                expected_offset,
+                actual_offset,
+            } => write!(
+                formatter,
+                "output range {name} offset mismatch: expected={expected_offset} observed={actual_offset}"
+            ),
+            Self::OutputFileLength { expected, actual } => write!(
+                formatter,
+                "staging coverage mismatch: expected={expected} observed={actual}"
+            ),
+            Self::StagingWriteRange {
+                name,
+                expected_offset,
+                observed_offset,
+                expected_len,
+                observed_len,
+            } => write!(
+                formatter,
+                "staging write {name} mismatch: expected offset/len={expected_offset}/{expected_len}, observed={observed_offset}/{observed_len}"
+            ),
+            Self::PeakRssExceeded { observed, cap } => write!(
+                formatter,
+                "peak RSS gate exceeded: observed={observed} formula-cap={cap}"
+            ),
+            Self::ActivationTargetExists { path } => write!(
+                formatter,
+                "refusing to overwrite existing artifact {}; quarantine it explicitly, then rerun fnlp convert",
+                path.display()
+            ),
+            Self::ActivationProtocolUnavailable { destination } => write!(
+                formatter,
+                "activation of {} is blocked: no portable atomic no-clobber filesystem transaction is installed; next=complete the fs_tx activation contract",
+                destination.display()
+            ),
             Self::ReceiptField { field, detail } => {
                 write!(formatter, "conversion receipt field {field}: {detail}")
             }
@@ -1736,8 +2020,9 @@ fn div_ceil(numerator: u64, denominator: u64) -> Result<u64, ConverterError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_bf16_panel, expected_nanbeige42_census, remap_tensor_name, ConversionProgress,
-        OutputRangePlan, PanelPlan, PeakRssFormula, StorageStage, TensorCensusEntry,
+        ConversionProgress, ConverterError, OutputRangePlan, PanelPlan, PeakRssFormula,
+        StorageStage, TensorCensusEntry, decode_bf16_panel, expected_nanbeige42_census,
+        remap_tensor_name, stream_bf16_row_panels,
     };
     use crate::artifact::safetensors::{RowPanel, SafetensorDtype};
 
@@ -1826,8 +2111,76 @@ mod tests {
     }
 
     #[test]
+    fn streamed_bf16_panels_read_decode_and_release_one_panel_at_a_time() {
+        let entry = TensorCensusEntry {
+            name: "synthetic.weight".to_owned(),
+            dtype: SafetensorDtype::Bf16,
+            shape: vec![5, 2],
+            len: 20,
+        };
+        let plan = PanelPlan::for_tensor(&entry, 8).expect("two rows per bounded panel");
+        let mut observed = Vec::new();
+
+        stream_bf16_row_panels(
+            &entry,
+            &plan,
+            |panel| {
+                let RowPanel::Rows { row_count, .. } = panel else {
+                    panic!("panel plan must yield row panels");
+                };
+                let scalar_count = usize::try_from(row_count * 2).expect("tiny fixture");
+                Ok(vec![0x80, 0x3f].repeat(scalar_count))
+            },
+            |panel, source_bytes, f32_work| {
+                let RowPanel::Rows {
+                    start_row,
+                    row_count,
+                } = panel
+                else {
+                    panic!("panel plan must yield row panels");
+                };
+                assert_eq!(source_bytes.len() / 2, f32_work.len());
+                assert!(source_bytes.len() <= 8);
+                assert!(f32_work.len() * 4 <= 16);
+                observed.push((start_row, row_count, source_bytes.len(), f32_work.len()));
+                Ok(())
+            },
+        )
+        .expect("every source range is decoded and consumed before the next panel");
+
+        assert_eq!(observed, vec![(0, 2, 8, 4), (2, 2, 8, 4), (4, 1, 4, 2)]);
+    }
+
+    #[test]
+    fn streamed_bf16_panels_refuse_reader_lengths_outside_the_plan() {
+        let entry = TensorCensusEntry {
+            name: "synthetic.weight".to_owned(),
+            dtype: SafetensorDtype::Bf16,
+            shape: vec![1, 2],
+            len: 4,
+        };
+        let plan = PanelPlan::for_tensor(&entry, 4).expect("one bounded row");
+
+        let error = stream_bf16_row_panels(&entry, &plan, |_| Ok(vec![0; 3]), |_, _, _| Ok(()))
+            .expect_err("a short range must not enter the BF16 work stage");
+        assert!(matches!(
+            error,
+            ConverterError::PanelReadLength {
+                tensor,
+                start_row: 0,
+                row_count: 1,
+                expected: 4,
+                actual: 3,
+            } if tensor == "synthetic.weight"
+        ));
+    }
+
+    #[test]
     fn panel_division_ceiling_accepts_maximum_valid_dimensions() {
-        assert_eq!(super::div_ceil(u64::MAX, 1).expect("one-row panels"), u64::MAX);
+        assert_eq!(
+            super::div_ceil(u64::MAX, 1).expect("one-row panels"),
+            u64::MAX
+        );
         assert_eq!(
             super::div_ceil(u64::MAX, 2).expect("two-row panels"),
             (u64::MAX / 2) + 1
