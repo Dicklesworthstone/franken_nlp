@@ -447,9 +447,10 @@ def flatten_generated_tokens(model: Any, tokenized: dict[str, Any], max_new_toke
     past: object | None = None
     next_input = inputs
     for _ in range(max_new_tokens):
-        if past is not None:
-            next_input = {"input_ids": next_input["input_ids"], "past_key_values": past, "use_cache": True}
-        output = model(**next_input, use_cache=True)
+        if past is None:
+            output = model(**next_input, use_cache=True)
+        else:
+            output = model(input_ids=next_input["input_ids"], past_key_values=past, use_cache=True)
         next_token = int(output_logits(output)[:, -1, :].argmax(dim=-1).item())
         generated.append(next_token)
         past = output_past_key_values(output)
