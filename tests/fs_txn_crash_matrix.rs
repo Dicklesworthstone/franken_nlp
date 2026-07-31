@@ -194,6 +194,10 @@ fn simulated_retained_ingress_requires_bound_filename_and_authenticated_body() {
         .retain_canonical_final_envelope(&filename, &envelope)
         .unwrap();
     assert_eq!(journal.records(), [record.clone()]);
+    assert!(matches!(
+        journal.retain_canonical_final_envelope(&filename, &envelope),
+        Err(FsTxError::FinalNameExists { filename: rejected }) if rejected == filename
+    ));
 
     let wrong_filename = format!("00000000000000000001-{}.fnlpaj", record.record_digest());
     assert!(matches!(
@@ -209,7 +213,7 @@ fn simulated_retained_ingress_requires_bound_filename_and_authenticated_body() {
         Err(FsTxError::EnvelopeDigestMismatch)
     ));
     assert_eq!(journal.records(), [record]);
-    eprintln!("FS_TXN case=retained-envelope-ingress RESULT=PASS rows=3");
+    eprintln!("FS_TXN case=retained-envelope-ingress RESULT=PASS rows=4");
 }
 
 #[test]
