@@ -10,7 +10,7 @@ use std::{
     collections::BTreeMap,
     error::Error,
     fmt,
-    str::{Utf8Error, from_utf8},
+    str::{from_utf8, Utf8Error},
 };
 
 use super::sp_model::{PieceType, SpecialPieceIds, SpmModel};
@@ -71,7 +71,6 @@ pub enum BpeBuildError {
     DuplicateBytePiece { byte: u8 },
     MalformedBytePiece { surface: String },
     EmptyAddedToken,
-    AddedTokenIdOutOfRange { id: u32, piece_count: usize },
     ConflictingAddedToken { surface: String },
     ConflictingAddedTokenId { id: u32 },
 }
@@ -105,10 +104,6 @@ impl fmt::Display for BpeBuildError {
                 )
             }
             Self::EmptyAddedToken => write!(formatter, "SP_BPE build error=empty-added-token"),
-            Self::AddedTokenIdOutOfRange { id, piece_count } => write!(
-                formatter,
-                "SP_BPE build error=added-token-id-out-of-range id={id} piece_count={piece_count}"
-            ),
             Self::ConflictingAddedToken { surface } => write!(
                 formatter,
                 "SP_BPE build error=conflicting-added-token surface={surface:?}"
@@ -313,15 +308,10 @@ impl SpBpeTokenizer {
             if token.content.is_empty() {
                 return Err(BpeBuildError::EmptyAddedToken);
             }
-            if usize::try_from(token.id)
-                .ok()
-                .is_none_or(|id| id >= piece_count)
-            {
-                return Err(BpeBuildError::AddedTokenIdOutOfRange {
-                    id: token.id,
-                    piece_count,
-                });
-            }
+            // The tokenizer's explicit registry can occupy ids immediately
+            // after the SentencePiece table.  They are not synthetic SPM
+            // pieces: `injected_by_id` owns their decode surface and
+            // `injected_by_text` owns their exact-precedence encode surface.
             insert_injected(&mut injected, &mut injected_by_id, token)?;
         }
 
