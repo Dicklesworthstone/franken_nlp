@@ -1004,17 +1004,19 @@ fn build_header(
         .collect();
     let tensors_header = tensors
         .iter()
-        .map(|tensor| HeaderTensor {
-            canonical_dtype: tensor.canonical_dtype.header_name(),
-            canonical_logical_sha256: tensor.canonical_logical_sha256.clone(),
-            generic: HeaderGenericMapping {
-                data: header_mapping(&tensor.data, &ordinals),
-                quantization: tensor.quantization.clone(),
-                row_sum: header_mapping(&tensor.row_sum, &ordinals),
-                scale: header_mapping(&tensor.scale, &ordinals),
-            },
-            name: tensor.name.clone(),
-            shape: tensor.shape.clone(),
+        .map(|tensor| {
+            Ok(HeaderTensor {
+                canonical_dtype: tensor.canonical_dtype.header_name(),
+                canonical_logical_sha256: tensor.canonical_logical_sha256.clone(),
+                generic: HeaderGenericMapping {
+                    data: header_mapping(&tensor.data, &ordinals)?,
+                    quantization: tensor.quantization.clone(),
+                    row_sum: header_mapping(&tensor.row_sum, &ordinals)?,
+                    scale: header_mapping(&tensor.scale, &ordinals)?,
+                },
+                name: tensor.name.clone(),
+                shape: tensor.shape.clone(),
+            })
         })
         .collect::<Result<_, _>>()?;
     let packing_sets_header = packing_sets
