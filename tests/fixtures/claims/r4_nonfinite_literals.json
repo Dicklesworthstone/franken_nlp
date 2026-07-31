@@ -1,0 +1,8 @@
+{
+  "literals": [
+    "NaN",
+    "Infinity",
+    "-Infinity",
+    "1e999"
+  ]
+}

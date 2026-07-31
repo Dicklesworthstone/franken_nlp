@@ -145,7 +145,7 @@ def log(message: str) -> None:
 
 
 def canonical_json_bytes(value: Any) -> bytes:
-    return (json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    return (json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
 
 
 def no_duplicate_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -157,14 +157,30 @@ def no_duplicate_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def reject_nonstandard_json_constant(literal: str) -> Any:
+    raise ValueError(f"non-standard JSON constant {literal!r}")
+
+
+def parse_finite_json_float(literal: str) -> float:
+    value = float(literal)
+    if not math.isfinite(value):
+        raise ValueError(f"non-finite JSON number {literal!r}")
+    return value
+
+
 def load_json(path: Path) -> tuple[dict[str, Any], bytes]:
     try:
         raw = path.read_bytes()
     except OSError as error:
         raise ClaimsError(f"registry unavailable file={path}: {error}") from error
     try:
-        value = json.loads(raw, object_pairs_hook=no_duplicate_object)
-    except (json.JSONDecodeError, DuplicateKeyError) as error:
+        value = json.loads(
+            raw,
+            object_pairs_hook=no_duplicate_object,
+            parse_constant=reject_nonstandard_json_constant,
+            parse_float=parse_finite_json_float,
+        )
+    except (json.JSONDecodeError, DuplicateKeyError, ValueError) as error:
         raise ClaimsError(f"registry is not duplicate-key-free JSON file={path}: {error}") from error
     if not isinstance(value, dict):
         raise ClaimsError(f"registry must be a JSON object file={path}")
@@ -394,8 +410,13 @@ def load_r4_receipt(path: Path, expected_digest: str, expected_kind: str) -> dic
     if actual_digest != expected_digest:
         raise ClaimsError(f"R4 receipt digest mismatch file={path} expected={expected_digest} observed={actual_digest}")
     try:
-        receipt = json.loads(raw, object_pairs_hook=no_duplicate_object)
-    except (json.JSONDecodeError, DuplicateKeyError) as error:
+        receipt = json.loads(
+            raw,
+            object_pairs_hook=no_duplicate_object,
+            parse_constant=reject_nonstandard_json_constant,
+            parse_float=parse_finite_json_float,
+        )
+    except (json.JSONDecodeError, DuplicateKeyError, ValueError) as error:
         raise ClaimsError(f"R4 receipt is not duplicate-key-free JSON file={path}: {error}") from error
     if not isinstance(receipt, dict) or raw != canonical_json_bytes(receipt):
         raise ClaimsError(f"R4 receipt is not canonical JSON file={path}")
@@ -927,6 +948,26 @@ def run_self_test(root: Path, claims: dict[str, dict[str, Any]]) -> None:
         except ClaimsError:
             continue
         raise ClaimsError(f"self-test non-finite R4 receipt value was accepted value={nonfinite!r}")
+    try:
+        canonical_json_bytes({"nonfinite": float("nan")})
+    except ValueError:
+        pass
+    else:
+        raise ClaimsError("self-test canonical JSON accepted a non-finite value")
+    nonfinite_literals, _ = load_json(fixtures / "r4_nonfinite_literals.json")
+    typed_receipt = (fixtures / "r4_typed_measurement.json").read_text(encoding="utf-8")
+    for literal in nonfinite_literals["literals"]:
+        hostile_receipt = typed_receipt.replace("12.5", literal, 1)
+        try:
+            json.loads(
+                hostile_receipt,
+                object_pairs_hook=no_duplicate_object,
+                parse_constant=reject_nonstandard_json_constant,
+                parse_float=parse_finite_json_float,
+            )
+        except (json.JSONDecodeError, DuplicateKeyError, ValueError):
+            continue
+        raise ClaimsError(f"self-test non-finite R4 receipt literal was accepted literal={literal!r}")
 
     hostile_cases, _ = load_json(fixtures / "r4_context_hostile.json")
     for case in hostile_cases["cases"]:
