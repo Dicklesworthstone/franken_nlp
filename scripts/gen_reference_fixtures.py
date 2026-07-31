@@ -648,10 +648,21 @@ def capture_rope_application(args: argparse.Namespace) -> int:
         if not callable(apply_rotary):
             raise TraceError("remote attention module does not expose apply_rotary_pos_emb")
 
-        input_ids = torch_module.tensor([[1, 2]], dtype=torch_module.long)
-        position_ids = torch_module.arange(input_ids.shape[1], dtype=torch_module.long).unsqueeze(0)
+        prefill_input_ids = torch_module.tensor([[1, 2]], dtype=torch_module.long)
         with torch_module.inference_mode():
-            prefill = model(input_ids=input_ids, use_cache=True)
+            prefill = model(input_ids=prefill_input_ids, use_cache=True)
+            if args.rope_application_phase == "prefill":
+                input_ids = prefill_input_ids
+                cache = output_past_key_values(prefill)
+                phase = "prefill"
+            else:
+                input_ids = output_logits(prefill)[:, -1, :].argmax(dim=-1, keepdim=True)
+                decode = model(input_ids=input_ids, past_key_values=output_past_key_values(prefill), use_cache=True)
+                cache = output_past_key_values(decode)
+                phase = "decode-append"
+            position_ids = torch_module.arange(
+                input_ids.shape[1], dtype=torch_module.long
+            ).unsqueeze(0) + (0 if phase == "prefill" else prefill_input_ids.shape[1])
             hidden_states = layer.input_layernorm(embed(input_ids))
             batch, sequence, _hidden = hidden_states.shape
             query = attention.q_proj(hidden_states).view(
@@ -669,15 +680,15 @@ def capture_rope_application(args: argparse.Namespace) -> int:
                 key = attention.k_layernorm(key)
             cosine, sine = attention.rotary_emb(value, position_ids)
             rotated_query, rotated_key = apply_rotary(query, key, cosine, sine)
-            cached_key, _cached_value = extract_kv_slots(output_past_key_values(prefill))[0]
+            cached_key, _cached_value = extract_kv_slots(cache)[0]
 
-        position = int(input_ids.shape[1] - 1)
+        position = int(position_ids[0, -1].item())
         query_head = 0
         key_head = 0
-        captured_key = rotated_key[0, key_head, position]
+        captured_key = rotated_key[0, key_head, -1]
         cache_key = cached_key[0, key_head, position]
         if not torch_module.equal(captured_key, cache_key):
-            raise TraceError("first-prefill rotated K differs from the model KV cache")
+            raise TraceError(f"captured {phase} rotated K differs from the model KV cache")
 
         repo_root = args.repo_root.resolve()
         source_manifest = repo_root / "docs" / "truth-pack" / "nanbeige4.2-3b.source.json"
@@ -696,7 +707,7 @@ def capture_rope_application(args: argparse.Namespace) -> int:
             "layer": 0,
             "loop": 0,
             "modeling_source_sha256": sha256_path(modeling_source),
-            "phase": "prefill",
+            "phase": phase,
             "position": position,
             "profile": args.profile,
             "query_head": query_head,
@@ -705,8 +716,10 @@ def capture_rope_application(args: argparse.Namespace) -> int:
             "sine_bf16_hex": bf16_hex(sine[0, position], torch_module),
             "torch": str(torch_module.__version__),
         }
+        if phase == "decode-append":
+            application["prefill_input_ids"] = [int(value) for value in prefill_input_ids[0].tolist()]
         receipt = {
-            "capture_scope": "loop0/layer0/prefill/position1/query-head0/key-head0",
+            "capture_scope": f"loop0/layer0/{phase}/position{position}/query-head0/key-head0",
             "generator_commit": generator_commit,
             "generator_path": "scripts/gen_reference_fixtures.py",
             "generation_command": list(sys.argv),
@@ -721,7 +734,7 @@ def capture_rope_application(args: argparse.Namespace) -> int:
             "ROPE_CAPTURE",
             "RESULT=PASS captures=1 "
             f"output={args.rope_application_output} key_cache_match=true "
-            "scope=loop0/layer0/prefill/position1/q0/k0",
+            f"scope=loop0/layer0/{phase}/position{position}/q0/k0",
         )
         return 0
     except (OSError, TraceError) as error:
@@ -1802,6 +1815,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--rope-application-output",
         type=Path,
         help="new JSON output path required by --capture-rope-application; existing paths are refused",
+    )
+    parser.add_argument(
+        "--rope-application-phase",
+        choices=("prefill", "decode-append"),
+        default="prefill",
+        help="RoPE application phase captured by --capture-rope-application",
     )
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1], help="repository root")
     parser.add_argument("--profile", choices=[*sorted(PROFILES), "all"], default="hf-bf16-eager")
