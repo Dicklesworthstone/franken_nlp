@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use franken_nlp::native_engine::lmhead::NANBEIGE_VOCAB_SIZE;
 use franken_nlp::tokenizer::{
     bpe::{AddedToken, DecodeBytesError, DecodeTextError, EncodeOptions, SpBpeTokenizer},
-    sp_model::{NormalizerFacts, PieceType, SpecialPieceIds, SpmModel, SpmPiece, parse_spm_model},
+    sp_model::{parse_spm_model, NormalizerFacts, PieceType, SpecialPieceIds, SpmModel, SpmPiece},
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -524,7 +524,18 @@ fn pinned_slow_reference_vocabulary_is_token_id_exact() {
     }
 
     let mut mismatches = 0_usize;
+    let expected_slow_case_ids = inputs
+        .tokenizer_cases
+        .iter()
+        .map(|case| case.id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut slow_seen_case_ids = BTreeSet::new();
     for fixture in fixtures.tokenizer_cases {
+        assert!(
+            slow_seen_case_ids.insert(fixture.id.clone()),
+            "slow-reference fixture has duplicate id={}",
+            fixture.id
+        );
         let input = inputs
             .tokenizer_cases
             .iter()
@@ -599,6 +610,10 @@ fn pinned_slow_reference_vocabulary_is_token_id_exact() {
             canonical_id_digest(&got),
         );
     }
+    assert_eq!(
+        slow_seen_case_ids, expected_slow_case_ids,
+        "every repository-authored slow-tokenizer input must have exactly one frozen auxiliary row"
+    );
     let mut fast_slow_mismatches = 0_usize;
     let mut fast_slow_agreements = 0_usize;
     let mut fast_slow_divergences = 0_usize;
