@@ -5,6 +5,7 @@
     "live_census_artifact": "docs/truth-pack/tensor_census.json",
     "reconciliation": "PENDING_CENSUS_ARTIFACT"
   },
+  "conversion_command": "python3 llama.cpp/convert_hf_to_gguf.py <pinned-source-dir> --outfile <nanbeige4.2-3b-f56ec5a-q8_0.gguf> --outtype q8_0",
   "evidence_status": "SOURCE_RULE_PREDICTION_BLOCKED_NO_GGUF_DIGEST",
   "gguf_digests": [],
   "model": "Nanbeige4.2-3B",
@@ -18,6 +19,7 @@
       "gguf_name": "output.weight",
       "hf_name": "lm_head.weight",
       "layer": null,
+      "merge": "none",
       "q4_k_m_source_rule": "Q6_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -28,6 +30,7 @@
       "gguf_name": "token_embd.weight",
       "hf_name": "model.embed_tokens.weight",
       "layer": null,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -38,6 +41,7 @@
       "gguf_name": "blk.0.attn_norm.weight",
       "hf_name": "model.layers.0.input_layernorm.weight",
       "layer": 0,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -48,6 +52,7 @@
       "gguf_name": "blk.0.ffn_down.weight",
       "hf_name": "model.layers.0.mlp.down_proj.weight",
       "layer": 0,
+      "merge": "none",
       "q4_k_m_source_rule": "Q6_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -58,6 +63,7 @@
       "gguf_name": "blk.0.ffn_gate.weight",
       "hf_name": "model.layers.0.mlp.gate_proj.weight",
       "layer": 0,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -68,6 +74,7 @@
       "gguf_name": "blk.0.ffn_up.weight",
       "hf_name": "model.layers.0.mlp.up_proj.weight",
       "layer": 0,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -78,6 +85,7 @@
       "gguf_name": "blk.0.ffn_norm.weight",
       "hf_name": "model.layers.0.post_attention_layernorm.weight",
       "layer": 0,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -88,6 +96,7 @@
       "gguf_name": "blk.0.attn_k.weight",
       "hf_name": "model.layers.0.self_attn.k_proj.weight",
       "layer": 0,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -98,6 +107,7 @@
       "gguf_name": "blk.0.attn_output.weight",
       "hf_name": "model.layers.0.self_attn.o_proj.weight",
       "layer": 0,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -108,6 +118,7 @@
       "gguf_name": "blk.0.attn_q.weight",
       "hf_name": "model.layers.0.self_attn.q_proj.weight",
       "layer": 0,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -118,6 +129,7 @@
       "gguf_name": "blk.0.attn_v.weight",
       "hf_name": "model.layers.0.self_attn.v_proj.weight",
       "layer": 0,
+      "merge": "none",
       "q4_k_m_source_rule": "Q6_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -128,6 +140,7 @@
       "gguf_name": "blk.1.attn_norm.weight",
       "hf_name": "model.layers.1.input_layernorm.weight",
       "layer": 1,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -138,6 +151,7 @@
       "gguf_name": "blk.1.ffn_down.weight",
       "hf_name": "model.layers.1.mlp.down_proj.weight",
       "layer": 1,
+      "merge": "none",
       "q4_k_m_source_rule": "Q6_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -148,6 +162,7 @@
       "gguf_name": "blk.1.ffn_gate.weight",
       "hf_name": "model.layers.1.mlp.gate_proj.weight",
       "layer": 1,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -158,6 +173,7 @@
       "gguf_name": "blk.1.ffn_up.weight",
       "hf_name": "model.layers.1.mlp.up_proj.weight",
       "layer": 1,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -168,6 +184,7 @@
       "gguf_name": "blk.1.ffn_norm.weight",
       "hf_name": "model.layers.1.post_attention_layernorm.weight",
       "layer": 1,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -178,6 +195,7 @@
       "gguf_name": "blk.1.attn_k.weight",
       "hf_name": "model.layers.1.self_attn.k_proj.weight",
       "layer": 1,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -188,6 +206,7 @@
       "gguf_name": "blk.1.attn_output.weight",
       "hf_name": "model.layers.1.self_attn.o_proj.weight",
       "layer": 1,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -198,6 +217,7 @@
       "gguf_name": "blk.1.attn_q.weight",
       "hf_name": "model.layers.1.self_attn.q_proj.weight",
       "layer": 1,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -208,6 +228,7 @@
       "gguf_name": "blk.1.attn_v.weight",
       "hf_name": "model.layers.1.self_attn.v_proj.weight",
       "layer": 1,
+      "merge": "none",
       "q4_k_m_source_rule": "Q6_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -218,6 +239,7 @@
       "gguf_name": "blk.10.attn_norm.weight",
       "hf_name": "model.layers.10.input_layernorm.weight",
       "layer": 10,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -228,6 +250,7 @@
       "gguf_name": "blk.10.ffn_down.weight",
       "hf_name": "model.layers.10.mlp.down_proj.weight",
       "layer": 10,
+      "merge": "none",
       "q4_k_m_source_rule": "Q6_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -238,6 +261,7 @@
       "gguf_name": "blk.10.ffn_gate.weight",
       "hf_name": "model.layers.10.mlp.gate_proj.weight",
       "layer": 10,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -248,6 +272,7 @@
       "gguf_name": "blk.10.ffn_up.weight",
       "hf_name": "model.layers.10.mlp.up_proj.weight",
       "layer": 10,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -258,6 +283,7 @@
       "gguf_name": "blk.10.ffn_norm.weight",
       "hf_name": "model.layers.10.post_attention_layernorm.weight",
       "layer": 10,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -268,6 +294,7 @@
       "gguf_name": "blk.10.attn_k.weight",
       "hf_name": "model.layers.10.self_attn.k_proj.weight",
       "layer": 10,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -278,6 +305,7 @@
       "gguf_name": "blk.10.attn_output.weight",
       "hf_name": "model.layers.10.self_attn.o_proj.weight",
       "layer": 10,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -288,6 +316,7 @@
       "gguf_name": "blk.10.attn_q.weight",
       "hf_name": "model.layers.10.self_attn.q_proj.weight",
       "layer": 10,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -298,6 +327,7 @@
       "gguf_name": "blk.10.attn_v.weight",
       "hf_name": "model.layers.10.self_attn.v_proj.weight",
       "layer": 10,
+      "merge": "none",
       "q4_k_m_source_rule": "Q6_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -308,6 +338,7 @@
       "gguf_name": "blk.11.attn_norm.weight",
       "hf_name": "model.layers.11.input_layernorm.weight",
       "layer": 11,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -318,6 +349,7 @@
       "gguf_name": "blk.11.ffn_down.weight",
       "hf_name": "model.layers.11.mlp.down_proj.weight",
       "layer": 11,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -328,6 +360,7 @@
       "gguf_name": "blk.11.ffn_gate.weight",
       "hf_name": "model.layers.11.mlp.gate_proj.weight",
       "layer": 11,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -338,6 +371,7 @@
       "gguf_name": "blk.11.ffn_up.weight",
       "hf_name": "model.layers.11.mlp.up_proj.weight",
       "layer": 11,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -348,6 +382,7 @@
       "gguf_name": "blk.11.ffn_norm.weight",
       "hf_name": "model.layers.11.post_attention_layernorm.weight",
       "layer": 11,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -358,6 +393,7 @@
       "gguf_name": "blk.11.attn_k.weight",
       "hf_name": "model.layers.11.self_attn.k_proj.weight",
       "layer": 11,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -368,6 +404,7 @@
       "gguf_name": "blk.11.attn_output.weight",
       "hf_name": "model.layers.11.self_attn.o_proj.weight",
       "layer": 11,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -378,6 +415,7 @@
       "gguf_name": "blk.11.attn_q.weight",
       "hf_name": "model.layers.11.self_attn.q_proj.weight",
       "layer": 11,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -388,6 +426,7 @@
       "gguf_name": "blk.11.attn_v.weight",
       "hf_name": "model.layers.11.self_attn.v_proj.weight",
       "layer": 11,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -398,6 +437,7 @@
       "gguf_name": "blk.12.attn_norm.weight",
       "hf_name": "model.layers.12.input_layernorm.weight",
       "layer": 12,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -408,6 +448,7 @@
       "gguf_name": "blk.12.ffn_down.weight",
       "hf_name": "model.layers.12.mlp.down_proj.weight",
       "layer": 12,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -418,6 +459,7 @@
       "gguf_name": "blk.12.ffn_gate.weight",
       "hf_name": "model.layers.12.mlp.gate_proj.weight",
       "layer": 12,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -428,6 +470,7 @@
       "gguf_name": "blk.12.ffn_up.weight",
       "hf_name": "model.layers.12.mlp.up_proj.weight",
       "layer": 12,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -438,6 +481,7 @@
       "gguf_name": "blk.12.ffn_norm.weight",
       "hf_name": "model.layers.12.post_attention_layernorm.weight",
       "layer": 12,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -448,6 +492,7 @@
       "gguf_name": "blk.12.attn_k.weight",
       "hf_name": "model.layers.12.self_attn.k_proj.weight",
       "layer": 12,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -458,6 +503,7 @@
       "gguf_name": "blk.12.attn_output.weight",
       "hf_name": "model.layers.12.self_attn.o_proj.weight",
       "layer": 12,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -468,6 +514,7 @@
       "gguf_name": "blk.12.attn_q.weight",
       "hf_name": "model.layers.12.self_attn.q_proj.weight",
       "layer": 12,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -478,6 +525,7 @@
       "gguf_name": "blk.12.attn_v.weight",
       "hf_name": "model.layers.12.self_attn.v_proj.weight",
       "layer": 12,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -488,6 +536,7 @@
       "gguf_name": "blk.13.attn_norm.weight",
       "hf_name": "model.layers.13.input_layernorm.weight",
       "layer": 13,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -498,6 +547,7 @@
       "gguf_name": "blk.13.ffn_down.weight",
       "hf_name": "model.layers.13.mlp.down_proj.weight",
       "layer": 13,
+      "merge": "none",
       "q4_k_m_source_rule": "Q6_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -508,6 +558,7 @@
       "gguf_name": "blk.13.ffn_gate.weight",
       "hf_name": "model.layers.13.mlp.gate_proj.weight",
       "layer": 13,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -518,6 +569,7 @@
       "gguf_name": "blk.13.ffn_up.weight",
       "hf_name": "model.layers.13.mlp.up_proj.weight",
       "layer": 13,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -528,6 +580,7 @@
       "gguf_name": "blk.13.ffn_norm.weight",
       "hf_name": "model.layers.13.post_attention_layernorm.weight",
       "layer": 13,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -538,6 +591,7 @@
       "gguf_name": "blk.13.attn_k.weight",
       "hf_name": "model.layers.13.self_attn.k_proj.weight",
       "layer": 13,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -548,6 +602,7 @@
       "gguf_name": "blk.13.attn_output.weight",
       "hf_name": "model.layers.13.self_attn.o_proj.weight",
       "layer": 13,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -558,6 +613,7 @@
       "gguf_name": "blk.13.attn_q.weight",
       "hf_name": "model.layers.13.self_attn.q_proj.weight",
       "layer": 13,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -568,6 +624,7 @@
       "gguf_name": "blk.13.attn_v.weight",
       "hf_name": "model.layers.13.self_attn.v_proj.weight",
       "layer": 13,
+      "merge": "none",
       "q4_k_m_source_rule": "Q6_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -578,6 +635,7 @@
       "gguf_name": "blk.14.attn_norm.weight",
       "hf_name": "model.layers.14.input_layernorm.weight",
       "layer": 14,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -588,6 +646,7 @@
       "gguf_name": "blk.14.ffn_down.weight",
       "hf_name": "model.layers.14.mlp.down_proj.weight",
       "layer": 14,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -598,6 +657,7 @@
       "gguf_name": "blk.14.ffn_gate.weight",
       "hf_name": "model.layers.14.mlp.gate_proj.weight",
       "layer": 14,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -608,6 +668,7 @@
       "gguf_name": "blk.14.ffn_up.weight",
       "hf_name": "model.layers.14.mlp.up_proj.weight",
       "layer": 14,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -618,6 +679,7 @@
       "gguf_name": "blk.14.ffn_norm.weight",
       "hf_name": "model.layers.14.post_attention_layernorm.weight",
       "layer": 14,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -628,6 +690,7 @@
       "gguf_name": "blk.14.attn_k.weight",
       "hf_name": "model.layers.14.self_attn.k_proj.weight",
       "layer": 14,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -638,6 +701,7 @@
       "gguf_name": "blk.14.attn_output.weight",
       "hf_name": "model.layers.14.self_attn.o_proj.weight",
       "layer": 14,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -648,6 +712,7 @@
       "gguf_name": "blk.14.attn_q.weight",
       "hf_name": "model.layers.14.self_attn.q_proj.weight",
       "layer": 14,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -658,6 +723,7 @@
       "gguf_name": "blk.14.attn_v.weight",
       "hf_name": "model.layers.14.self_attn.v_proj.weight",
       "layer": 14,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -668,6 +734,7 @@
       "gguf_name": "blk.15.attn_norm.weight",
       "hf_name": "model.layers.15.input_layernorm.weight",
       "layer": 15,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -678,6 +745,7 @@
       "gguf_name": "blk.15.ffn_down.weight",
       "hf_name": "model.layers.15.mlp.down_proj.weight",
       "layer": 15,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -688,6 +756,7 @@
       "gguf_name": "blk.15.ffn_gate.weight",
       "hf_name": "model.layers.15.mlp.gate_proj.weight",
       "layer": 15,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -698,6 +767,7 @@
       "gguf_name": "blk.15.ffn_up.weight",
       "hf_name": "model.layers.15.mlp.up_proj.weight",
       "layer": 15,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -708,6 +778,7 @@
       "gguf_name": "blk.15.ffn_norm.weight",
       "hf_name": "model.layers.15.post_attention_layernorm.weight",
       "layer": 15,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -718,6 +789,7 @@
       "gguf_name": "blk.15.attn_k.weight",
       "hf_name": "model.layers.15.self_attn.k_proj.weight",
       "layer": 15,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -728,6 +800,7 @@
       "gguf_name": "blk.15.attn_output.weight",
       "hf_name": "model.layers.15.self_attn.o_proj.weight",
       "layer": 15,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -738,6 +811,7 @@
       "gguf_name": "blk.15.attn_q.weight",
       "hf_name": "model.layers.15.self_attn.q_proj.weight",
       "layer": 15,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -748,6 +822,7 @@
       "gguf_name": "blk.15.attn_v.weight",
       "hf_name": "model.layers.15.self_attn.v_proj.weight",
       "layer": 15,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -758,6 +833,7 @@
       "gguf_name": "blk.16.attn_norm.weight",
       "hf_name": "model.layers.16.input_layernorm.weight",
       "layer": 16,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -768,6 +844,7 @@
       "gguf_name": "blk.16.ffn_down.weight",
       "hf_name": "model.layers.16.mlp.down_proj.weight",
       "layer": 16,
+      "merge": "none",
       "q4_k_m_source_rule": "Q6_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -778,6 +855,7 @@
       "gguf_name": "blk.16.ffn_gate.weight",
       "hf_name": "model.layers.16.mlp.gate_proj.weight",
       "layer": 16,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -788,6 +866,7 @@
       "gguf_name": "blk.16.ffn_up.weight",
       "hf_name": "model.layers.16.mlp.up_proj.weight",
       "layer": 16,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -798,6 +877,7 @@
       "gguf_name": "blk.16.ffn_norm.weight",
       "hf_name": "model.layers.16.post_attention_layernorm.weight",
       "layer": 16,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -808,6 +888,7 @@
       "gguf_name": "blk.16.attn_k.weight",
       "hf_name": "model.layers.16.self_attn.k_proj.weight",
       "layer": 16,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -818,6 +899,7 @@
       "gguf_name": "blk.16.attn_output.weight",
       "hf_name": "model.layers.16.self_attn.o_proj.weight",
       "layer": 16,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -828,6 +910,7 @@
       "gguf_name": "blk.16.attn_q.weight",
       "hf_name": "model.layers.16.self_attn.q_proj.weight",
       "layer": 16,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -838,6 +921,7 @@
       "gguf_name": "blk.16.attn_v.weight",
       "hf_name": "model.layers.16.self_attn.v_proj.weight",
       "layer": 16,
+      "merge": "none",
       "q4_k_m_source_rule": "Q6_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -848,6 +932,7 @@
       "gguf_name": "blk.17.attn_norm.weight",
       "hf_name": "model.layers.17.input_layernorm.weight",
       "layer": 17,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -858,6 +943,7 @@
       "gguf_name": "blk.17.ffn_down.weight",
       "hf_name": "model.layers.17.mlp.down_proj.weight",
       "layer": 17,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -868,6 +954,7 @@
       "gguf_name": "blk.17.ffn_gate.weight",
       "hf_name": "model.layers.17.mlp.gate_proj.weight",
       "layer": 17,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -878,6 +965,7 @@
       "gguf_name": "blk.17.ffn_up.weight",
       "hf_name": "model.layers.17.mlp.up_proj.weight",
       "layer": 17,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -888,6 +976,7 @@
       "gguf_name": "blk.17.ffn_norm.weight",
       "hf_name": "model.layers.17.post_attention_layernorm.weight",
       "layer": 17,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -898,6 +987,7 @@
       "gguf_name": "blk.17.attn_k.weight",
       "hf_name": "model.layers.17.self_attn.k_proj.weight",
       "layer": 17,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -908,6 +998,7 @@
       "gguf_name": "blk.17.attn_output.weight",
       "hf_name": "model.layers.17.self_attn.o_proj.weight",
       "layer": 17,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -918,6 +1009,7 @@
       "gguf_name": "blk.17.attn_q.weight",
       "hf_name": "model.layers.17.self_attn.q_proj.weight",
       "layer": 17,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -928,6 +1020,7 @@
       "gguf_name": "blk.17.attn_v.weight",
       "hf_name": "model.layers.17.self_attn.v_proj.weight",
       "layer": 17,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -938,6 +1031,7 @@
       "gguf_name": "blk.18.attn_norm.weight",
       "hf_name": "model.layers.18.input_layernorm.weight",
       "layer": 18,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -948,6 +1042,7 @@
       "gguf_name": "blk.18.ffn_down.weight",
       "hf_name": "model.layers.18.mlp.down_proj.weight",
       "layer": 18,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -958,6 +1053,7 @@
       "gguf_name": "blk.18.ffn_gate.weight",
       "hf_name": "model.layers.18.mlp.gate_proj.weight",
       "layer": 18,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -968,6 +1064,7 @@
       "gguf_name": "blk.18.ffn_up.weight",
       "hf_name": "model.layers.18.mlp.up_proj.weight",
       "layer": 18,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -978,6 +1075,7 @@
       "gguf_name": "blk.18.ffn_norm.weight",
       "hf_name": "model.layers.18.post_attention_layernorm.weight",
       "layer": 18,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -988,6 +1086,7 @@
       "gguf_name": "blk.18.attn_k.weight",
       "hf_name": "model.layers.18.self_attn.k_proj.weight",
       "layer": 18,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -998,6 +1097,7 @@
       "gguf_name": "blk.18.attn_output.weight",
       "hf_name": "model.layers.18.self_attn.o_proj.weight",
       "layer": 18,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1008,6 +1108,7 @@
       "gguf_name": "blk.18.attn_q.weight",
       "hf_name": "model.layers.18.self_attn.q_proj.weight",
       "layer": 18,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -1018,6 +1119,7 @@
       "gguf_name": "blk.18.attn_v.weight",
       "hf_name": "model.layers.18.self_attn.v_proj.weight",
       "layer": 18,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1028,6 +1130,7 @@
       "gguf_name": "blk.19.attn_norm.weight",
       "hf_name": "model.layers.19.input_layernorm.weight",
       "layer": 19,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -1038,6 +1141,7 @@
       "gguf_name": "blk.19.ffn_down.weight",
       "hf_name": "model.layers.19.mlp.down_proj.weight",
       "layer": 19,
+      "merge": "none",
       "q4_k_m_source_rule": "Q6_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1048,6 +1152,7 @@
       "gguf_name": "blk.19.ffn_gate.weight",
       "hf_name": "model.layers.19.mlp.gate_proj.weight",
       "layer": 19,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1058,6 +1163,7 @@
       "gguf_name": "blk.19.ffn_up.weight",
       "hf_name": "model.layers.19.mlp.up_proj.weight",
       "layer": 19,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1068,6 +1174,7 @@
       "gguf_name": "blk.19.ffn_norm.weight",
       "hf_name": "model.layers.19.post_attention_layernorm.weight",
       "layer": 19,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -1078,6 +1185,7 @@
       "gguf_name": "blk.19.attn_k.weight",
       "hf_name": "model.layers.19.self_attn.k_proj.weight",
       "layer": 19,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -1088,6 +1196,7 @@
       "gguf_name": "blk.19.attn_output.weight",
       "hf_name": "model.layers.19.self_attn.o_proj.weight",
       "layer": 19,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1098,6 +1207,7 @@
       "gguf_name": "blk.19.attn_q.weight",
       "hf_name": "model.layers.19.self_attn.q_proj.weight",
       "layer": 19,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -1108,6 +1218,7 @@
       "gguf_name": "blk.19.attn_v.weight",
       "hf_name": "model.layers.19.self_attn.v_proj.weight",
       "layer": 19,
+      "merge": "none",
       "q4_k_m_source_rule": "Q6_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1118,6 +1229,7 @@
       "gguf_name": "blk.2.attn_norm.weight",
       "hf_name": "model.layers.2.input_layernorm.weight",
       "layer": 2,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -1128,6 +1240,7 @@
       "gguf_name": "blk.2.ffn_down.weight",
       "hf_name": "model.layers.2.mlp.down_proj.weight",
       "layer": 2,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1138,6 +1251,7 @@
       "gguf_name": "blk.2.ffn_gate.weight",
       "hf_name": "model.layers.2.mlp.gate_proj.weight",
       "layer": 2,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1148,6 +1262,7 @@
       "gguf_name": "blk.2.ffn_up.weight",
       "hf_name": "model.layers.2.mlp.up_proj.weight",
       "layer": 2,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1158,6 +1273,7 @@
       "gguf_name": "blk.2.ffn_norm.weight",
       "hf_name": "model.layers.2.post_attention_layernorm.weight",
       "layer": 2,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -1168,6 +1284,7 @@
       "gguf_name": "blk.2.attn_k.weight",
       "hf_name": "model.layers.2.self_attn.k_proj.weight",
       "layer": 2,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -1178,6 +1295,7 @@
       "gguf_name": "blk.2.attn_output.weight",
       "hf_name": "model.layers.2.self_attn.o_proj.weight",
       "layer": 2,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1188,6 +1306,7 @@
       "gguf_name": "blk.2.attn_q.weight",
       "hf_name": "model.layers.2.self_attn.q_proj.weight",
       "layer": 2,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -1198,6 +1317,7 @@
       "gguf_name": "blk.2.attn_v.weight",
       "hf_name": "model.layers.2.self_attn.v_proj.weight",
       "layer": 2,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1208,6 +1328,7 @@
       "gguf_name": "blk.20.attn_norm.weight",
       "hf_name": "model.layers.20.input_layernorm.weight",
       "layer": 20,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -1218,6 +1339,7 @@
       "gguf_name": "blk.20.ffn_down.weight",
       "hf_name": "model.layers.20.mlp.down_proj.weight",
       "layer": 20,
+      "merge": "none",
       "q4_k_m_source_rule": "Q6_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1228,6 +1350,7 @@
       "gguf_name": "blk.20.ffn_gate.weight",
       "hf_name": "model.layers.20.mlp.gate_proj.weight",
       "layer": 20,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1238,6 +1361,7 @@
       "gguf_name": "blk.20.ffn_up.weight",
       "hf_name": "model.layers.20.mlp.up_proj.weight",
       "layer": 20,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1248,6 +1372,7 @@
       "gguf_name": "blk.20.ffn_norm.weight",
       "hf_name": "model.layers.20.post_attention_layernorm.weight",
       "layer": 20,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -1258,6 +1383,7 @@
       "gguf_name": "blk.20.attn_k.weight",
       "hf_name": "model.layers.20.self_attn.k_proj.weight",
       "layer": 20,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -1268,6 +1394,7 @@
       "gguf_name": "blk.20.attn_output.weight",
       "hf_name": "model.layers.20.self_attn.o_proj.weight",
       "layer": 20,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1278,6 +1405,7 @@
       "gguf_name": "blk.20.attn_q.weight",
       "hf_name": "model.layers.20.self_attn.q_proj.weight",
       "layer": 20,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -1288,6 +1416,7 @@
       "gguf_name": "blk.20.attn_v.weight",
       "hf_name": "model.layers.20.self_attn.v_proj.weight",
       "layer": 20,
+      "merge": "none",
       "q4_k_m_source_rule": "Q6_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1298,6 +1427,7 @@
       "gguf_name": "blk.21.attn_norm.weight",
       "hf_name": "model.layers.21.input_layernorm.weight",
       "layer": 21,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -1308,6 +1438,7 @@
       "gguf_name": "blk.21.ffn_down.weight",
       "hf_name": "model.layers.21.mlp.down_proj.weight",
       "layer": 21,
+      "merge": "none",
       "q4_k_m_source_rule": "Q6_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1318,6 +1449,7 @@
       "gguf_name": "blk.21.ffn_gate.weight",
       "hf_name": "model.layers.21.mlp.gate_proj.weight",
       "layer": 21,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1328,6 +1460,7 @@
       "gguf_name": "blk.21.ffn_up.weight",
       "hf_name": "model.layers.21.mlp.up_proj.weight",
       "layer": 21,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1338,6 +1471,7 @@
       "gguf_name": "blk.21.ffn_norm.weight",
       "hf_name": "model.layers.21.post_attention_layernorm.weight",
       "layer": 21,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -1348,6 +1482,7 @@
       "gguf_name": "blk.21.attn_k.weight",
       "hf_name": "model.layers.21.self_attn.k_proj.weight",
       "layer": 21,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -1358,6 +1493,7 @@
       "gguf_name": "blk.21.attn_output.weight",
       "hf_name": "model.layers.21.self_attn.o_proj.weight",
       "layer": 21,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1368,6 +1504,7 @@
       "gguf_name": "blk.21.attn_q.weight",
       "hf_name": "model.layers.21.self_attn.q_proj.weight",
       "layer": 21,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -1378,6 +1515,7 @@
       "gguf_name": "blk.21.attn_v.weight",
       "hf_name": "model.layers.21.self_attn.v_proj.weight",
       "layer": 21,
+      "merge": "none",
       "q4_k_m_source_rule": "Q6_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1388,6 +1526,7 @@
       "gguf_name": "blk.3.attn_norm.weight",
       "hf_name": "model.layers.3.input_layernorm.weight",
       "layer": 3,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -1398,6 +1537,7 @@
       "gguf_name": "blk.3.ffn_down.weight",
       "hf_name": "model.layers.3.mlp.down_proj.weight",
       "layer": 3,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1408,6 +1548,7 @@
       "gguf_name": "blk.3.ffn_gate.weight",
       "hf_name": "model.layers.3.mlp.gate_proj.weight",
       "layer": 3,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1418,6 +1559,7 @@
       "gguf_name": "blk.3.ffn_up.weight",
       "hf_name": "model.layers.3.mlp.up_proj.weight",
       "layer": 3,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1428,6 +1570,7 @@
       "gguf_name": "blk.3.ffn_norm.weight",
       "hf_name": "model.layers.3.post_attention_layernorm.weight",
       "layer": 3,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -1438,6 +1581,7 @@
       "gguf_name": "blk.3.attn_k.weight",
       "hf_name": "model.layers.3.self_attn.k_proj.weight",
       "layer": 3,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -1448,6 +1592,7 @@
       "gguf_name": "blk.3.attn_output.weight",
       "hf_name": "model.layers.3.self_attn.o_proj.weight",
       "layer": 3,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1458,6 +1603,7 @@
       "gguf_name": "blk.3.attn_q.weight",
       "hf_name": "model.layers.3.self_attn.q_proj.weight",
       "layer": 3,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -1468,6 +1614,7 @@
       "gguf_name": "blk.3.attn_v.weight",
       "hf_name": "model.layers.3.self_attn.v_proj.weight",
       "layer": 3,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1478,6 +1625,7 @@
       "gguf_name": "blk.4.attn_norm.weight",
       "hf_name": "model.layers.4.input_layernorm.weight",
       "layer": 4,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -1488,6 +1636,7 @@
       "gguf_name": "blk.4.ffn_down.weight",
       "hf_name": "model.layers.4.mlp.down_proj.weight",
       "layer": 4,
+      "merge": "none",
       "q4_k_m_source_rule": "Q6_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1498,6 +1647,7 @@
       "gguf_name": "blk.4.ffn_gate.weight",
       "hf_name": "model.layers.4.mlp.gate_proj.weight",
       "layer": 4,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1508,6 +1658,7 @@
       "gguf_name": "blk.4.ffn_up.weight",
       "hf_name": "model.layers.4.mlp.up_proj.weight",
       "layer": 4,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1518,6 +1669,7 @@
       "gguf_name": "blk.4.ffn_norm.weight",
       "hf_name": "model.layers.4.post_attention_layernorm.weight",
       "layer": 4,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -1528,6 +1680,7 @@
       "gguf_name": "blk.4.attn_k.weight",
       "hf_name": "model.layers.4.self_attn.k_proj.weight",
       "layer": 4,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -1538,6 +1691,7 @@
       "gguf_name": "blk.4.attn_output.weight",
       "hf_name": "model.layers.4.self_attn.o_proj.weight",
       "layer": 4,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1548,6 +1702,7 @@
       "gguf_name": "blk.4.attn_q.weight",
       "hf_name": "model.layers.4.self_attn.q_proj.weight",
       "layer": 4,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -1558,6 +1713,7 @@
       "gguf_name": "blk.4.attn_v.weight",
       "hf_name": "model.layers.4.self_attn.v_proj.weight",
       "layer": 4,
+      "merge": "none",
       "q4_k_m_source_rule": "Q6_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1568,6 +1724,7 @@
       "gguf_name": "blk.5.attn_norm.weight",
       "hf_name": "model.layers.5.input_layernorm.weight",
       "layer": 5,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -1578,6 +1735,7 @@
       "gguf_name": "blk.5.ffn_down.weight",
       "hf_name": "model.layers.5.mlp.down_proj.weight",
       "layer": 5,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1588,6 +1746,7 @@
       "gguf_name": "blk.5.ffn_gate.weight",
       "hf_name": "model.layers.5.mlp.gate_proj.weight",
       "layer": 5,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1598,6 +1757,7 @@
       "gguf_name": "blk.5.ffn_up.weight",
       "hf_name": "model.layers.5.mlp.up_proj.weight",
       "layer": 5,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1608,6 +1768,7 @@
       "gguf_name": "blk.5.ffn_norm.weight",
       "hf_name": "model.layers.5.post_attention_layernorm.weight",
       "layer": 5,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -1618,6 +1779,7 @@
       "gguf_name": "blk.5.attn_k.weight",
       "hf_name": "model.layers.5.self_attn.k_proj.weight",
       "layer": 5,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -1628,6 +1790,7 @@
       "gguf_name": "blk.5.attn_output.weight",
       "hf_name": "model.layers.5.self_attn.o_proj.weight",
       "layer": 5,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1638,6 +1801,7 @@
       "gguf_name": "blk.5.attn_q.weight",
       "hf_name": "model.layers.5.self_attn.q_proj.weight",
       "layer": 5,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -1648,6 +1812,7 @@
       "gguf_name": "blk.5.attn_v.weight",
       "hf_name": "model.layers.5.self_attn.v_proj.weight",
       "layer": 5,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1658,6 +1823,7 @@
       "gguf_name": "blk.6.attn_norm.weight",
       "hf_name": "model.layers.6.input_layernorm.weight",
       "layer": 6,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -1668,6 +1834,7 @@
       "gguf_name": "blk.6.ffn_down.weight",
       "hf_name": "model.layers.6.mlp.down_proj.weight",
       "layer": 6,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1678,6 +1845,7 @@
       "gguf_name": "blk.6.ffn_gate.weight",
       "hf_name": "model.layers.6.mlp.gate_proj.weight",
       "layer": 6,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1688,6 +1856,7 @@
       "gguf_name": "blk.6.ffn_up.weight",
       "hf_name": "model.layers.6.mlp.up_proj.weight",
       "layer": 6,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1698,6 +1867,7 @@
       "gguf_name": "blk.6.ffn_norm.weight",
       "hf_name": "model.layers.6.post_attention_layernorm.weight",
       "layer": 6,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -1708,6 +1878,7 @@
       "gguf_name": "blk.6.attn_k.weight",
       "hf_name": "model.layers.6.self_attn.k_proj.weight",
       "layer": 6,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -1718,6 +1889,7 @@
       "gguf_name": "blk.6.attn_output.weight",
       "hf_name": "model.layers.6.self_attn.o_proj.weight",
       "layer": 6,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1728,6 +1900,7 @@
       "gguf_name": "blk.6.attn_q.weight",
       "hf_name": "model.layers.6.self_attn.q_proj.weight",
       "layer": 6,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -1738,6 +1911,7 @@
       "gguf_name": "blk.6.attn_v.weight",
       "hf_name": "model.layers.6.self_attn.v_proj.weight",
       "layer": 6,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1748,6 +1922,7 @@
       "gguf_name": "blk.7.attn_norm.weight",
       "hf_name": "model.layers.7.input_layernorm.weight",
       "layer": 7,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -1758,6 +1933,7 @@
       "gguf_name": "blk.7.ffn_down.weight",
       "hf_name": "model.layers.7.mlp.down_proj.weight",
       "layer": 7,
+      "merge": "none",
       "q4_k_m_source_rule": "Q6_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1768,6 +1944,7 @@
       "gguf_name": "blk.7.ffn_gate.weight",
       "hf_name": "model.layers.7.mlp.gate_proj.weight",
       "layer": 7,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1778,6 +1955,7 @@
       "gguf_name": "blk.7.ffn_up.weight",
       "hf_name": "model.layers.7.mlp.up_proj.weight",
       "layer": 7,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1788,6 +1966,7 @@
       "gguf_name": "blk.7.ffn_norm.weight",
       "hf_name": "model.layers.7.post_attention_layernorm.weight",
       "layer": 7,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -1798,6 +1977,7 @@
       "gguf_name": "blk.7.attn_k.weight",
       "hf_name": "model.layers.7.self_attn.k_proj.weight",
       "layer": 7,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -1808,6 +1988,7 @@
       "gguf_name": "blk.7.attn_output.weight",
       "hf_name": "model.layers.7.self_attn.o_proj.weight",
       "layer": 7,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1818,6 +1999,7 @@
       "gguf_name": "blk.7.attn_q.weight",
       "hf_name": "model.layers.7.self_attn.q_proj.weight",
       "layer": 7,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -1828,6 +2010,7 @@
       "gguf_name": "blk.7.attn_v.weight",
       "hf_name": "model.layers.7.self_attn.v_proj.weight",
       "layer": 7,
+      "merge": "none",
       "q4_k_m_source_rule": "Q6_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1838,6 +2021,7 @@
       "gguf_name": "blk.8.attn_norm.weight",
       "hf_name": "model.layers.8.input_layernorm.weight",
       "layer": 8,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -1848,6 +2032,7 @@
       "gguf_name": "blk.8.ffn_down.weight",
       "hf_name": "model.layers.8.mlp.down_proj.weight",
       "layer": 8,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1858,6 +2043,7 @@
       "gguf_name": "blk.8.ffn_gate.weight",
       "hf_name": "model.layers.8.mlp.gate_proj.weight",
       "layer": 8,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1868,6 +2054,7 @@
       "gguf_name": "blk.8.ffn_up.weight",
       "hf_name": "model.layers.8.mlp.up_proj.weight",
       "layer": 8,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1878,6 +2065,7 @@
       "gguf_name": "blk.8.ffn_norm.weight",
       "hf_name": "model.layers.8.post_attention_layernorm.weight",
       "layer": 8,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -1888,6 +2076,7 @@
       "gguf_name": "blk.8.attn_k.weight",
       "hf_name": "model.layers.8.self_attn.k_proj.weight",
       "layer": 8,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -1898,6 +2087,7 @@
       "gguf_name": "blk.8.attn_output.weight",
       "hf_name": "model.layers.8.self_attn.o_proj.weight",
       "layer": 8,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1908,6 +2098,7 @@
       "gguf_name": "blk.8.attn_q.weight",
       "hf_name": "model.layers.8.self_attn.q_proj.weight",
       "layer": 8,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -1918,6 +2109,7 @@
       "gguf_name": "blk.8.attn_v.weight",
       "hf_name": "model.layers.8.self_attn.v_proj.weight",
       "layer": 8,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1928,6 +2120,7 @@
       "gguf_name": "blk.9.attn_norm.weight",
       "hf_name": "model.layers.9.input_layernorm.weight",
       "layer": 9,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -1938,6 +2131,7 @@
       "gguf_name": "blk.9.ffn_down.weight",
       "hf_name": "model.layers.9.mlp.down_proj.weight",
       "layer": 9,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1948,6 +2142,7 @@
       "gguf_name": "blk.9.ffn_gate.weight",
       "hf_name": "model.layers.9.mlp.gate_proj.weight",
       "layer": 9,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1958,6 +2153,7 @@
       "gguf_name": "blk.9.ffn_up.weight",
       "hf_name": "model.layers.9.mlp.up_proj.weight",
       "layer": 9,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1968,6 +2164,7 @@
       "gguf_name": "blk.9.ffn_norm.weight",
       "hf_name": "model.layers.9.post_attention_layernorm.weight",
       "layer": 9,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
@@ -1978,6 +2175,7 @@
       "gguf_name": "blk.9.attn_k.weight",
       "hf_name": "model.layers.9.self_attn.k_proj.weight",
       "layer": 9,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -1988,6 +2186,7 @@
       "gguf_name": "blk.9.attn_output.weight",
       "hf_name": "model.layers.9.self_attn.o_proj.weight",
       "layer": 9,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -1998,6 +2197,7 @@
       "gguf_name": "blk.9.attn_q.weight",
       "hf_name": "model.layers.9.self_attn.q_proj.weight",
       "layer": 9,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "rope_permute"
@@ -2008,6 +2208,7 @@
       "gguf_name": "blk.9.attn_v.weight",
       "hf_name": "model.layers.9.self_attn.v_proj.weight",
       "layer": 9,
+      "merge": "none",
       "q4_k_m_source_rule": "Q4_K",
       "q8_0_source_rule": "Q8_0",
       "transform": "identity"
@@ -2018,6 +2219,7 @@
       "gguf_name": "output_norm.weight",
       "hf_name": "model.norm.weight",
       "layer": null,
+      "merge": "none",
       "q4_k_m_source_rule": "UNQUANTIZED",
       "q8_0_source_rule": "UNQUANTIZED",
       "transform": "identity"
