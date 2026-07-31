@@ -1,8 +1,10 @@
+use std::io::Write;
+
 use franken_nlp::artifact::format::{
     ArchTarget, CanonicalDtype, FnlpqWriteError, FnlpqWriterInput, PackingSetInput, SectionKind,
     SectionPayload, SectionRange, decode_prelude, encode_f32_scales, framed_sha256,
     framed_sha256_hex, logical_model_sha256 as compute_logical_model_sha256, logical_tensor_sha256,
-    write,
+    streaming_input_from_materialized, write, write_streaming,
 };
 use franken_nlp::artifact::reader::FnlpqArtifact;
 use franken_nlp::canonjson;
@@ -201,6 +203,164 @@ fn tiny_v1_matches_committed_byte_and_header_goldens() {
         written.bytes,
         "load then re-serialize must preserve canonical bytes"
     );
+}
+
+#[test]
+fn streaming_writer_matches_the_materialized_v1_oracle_byte_for_byte() {
+    let input = tiny_input();
+    let materialized = write(&input).expect("tiny in-memory oracle writes");
+    let streaming = streaming_input_from_materialized(&input)
+        .expect("tiny oracle input supplies verified streaming metadata");
+    let mut streamed_bytes = Vec::new();
+    let streamed = write_streaming(&streaming, &mut streamed_bytes, |section, sink| {
+        let source = input
+            .sections
+            .iter()
+            .find(|candidate| candidate.name == section.name)
+            .expect("streaming plan section originates from tiny input");
+        sink.write_all(&source.bytes)
+            .map_err(|error| FnlpqWriteError::Io {
+                operation: "write synthetic streaming section",
+                detail: error.to_string(),
+            })
+    })
+    .expect("all tiny planned sections stream with their first-pass digests");
+
+    assert_eq!(streamed_bytes, materialized.bytes);
+    assert_eq!(streamed.header_bytes, materialized.header_bytes);
+    assert_eq!(streamed.header_sha256, materialized.header_sha256);
+    assert_eq!(streamed.sections, materialized.sections);
+    assert_eq!(streamed.file_len as usize, materialized.bytes.len());
+    assert_eq!(streamed.fnlpq_file_sha256, materialized.fnlpq_file_sha256);
+    assert_eq!(streamed.packing_set_sha256, materialized.packing_set_sha256);
+    assert_eq!(streamed.license_bundle_sha256, materialized.license_bundle_sha256);
+}
+
+#[test]
+fn streaming_writer_rejects_a_short_second_pass_section() {
+    let input = tiny_input();
+    let streaming = streaming_input_from_materialized(&input)
+        .expect("tiny oracle input supplies verified streaming metadata");
+    let expected_section = streaming
+        .sections
+        .iter()
+        .find(|section| section.kind == SectionKind::GenericTensorPayload)
+        .expect("tiny fixture has a generic tensor payload")
+        .name
+        .clone();
+    let mut streamed_bytes = Vec::new();
+    let error = write_streaming(&streaming, &mut streamed_bytes, |section, sink| {
+        let source = input
+            .sections
+            .iter()
+            .find(|candidate| candidate.name == section.name)
+            .expect("streaming plan section originates from tiny input");
+        let bytes = if section.name == expected_section {
+            let short_len = source.bytes.len().checked_sub(1).ok_or_else(|| {
+                FnlpqWriteError::Missing {
+                    field: "synthetic generic tensor payload byte",
+                    value: section.name.clone(),
+                }
+            })?;
+            source.bytes.get(..short_len).ok_or_else(|| FnlpqWriteError::Missing {
+                field: "synthetic short streaming section range",
+                value: section.name.clone(),
+            })?
+        } else {
+            &source.bytes
+        };
+        sink.write_all(bytes).map_err(|error| FnlpqWriteError::Io {
+            operation: "write short synthetic streaming section",
+            detail: error.to_string(),
+        })
+    })
+    .expect_err("a short second pass must not mint an artifact identity");
+
+    assert!(matches!(
+        error,
+        FnlpqWriteError::StoredIdentity {
+            section,
+            actual,
+            ..
+        } if section == expected_section && actual == "underflow-1-bytes"
+    ));
+}
+
+#[test]
+fn streaming_writer_rejects_a_tampered_second_pass_section() {
+    let input = tiny_input();
+    let streaming = streaming_input_from_materialized(&input)
+        .expect("tiny oracle input supplies verified streaming metadata");
+    let expected_section = streaming
+        .sections
+        .iter()
+        .find(|section| section.kind == SectionKind::GenericTensorPayload)
+        .expect("tiny fixture has a generic tensor payload")
+        .name
+        .clone();
+    let mut streamed_bytes = Vec::new();
+    let error = write_streaming(&streaming, &mut streamed_bytes, |section, sink| {
+        let source = input
+            .sections
+            .iter()
+            .find(|candidate| candidate.name == section.name)
+            .expect("streaming plan section originates from tiny input");
+        (if section.name == expected_section {
+            let mut tampered = source.bytes.clone();
+            let first = tampered.first_mut().ok_or_else(|| FnlpqWriteError::Missing {
+                field: "synthetic generic tensor payload byte",
+                value: section.name.clone(),
+            })?;
+            *first ^= 1;
+            sink.write_all(&tampered)
+        } else {
+            sink.write_all(&source.bytes)
+        })
+        .map_err(|error| FnlpqWriteError::Io {
+            operation: "write tampered synthetic streaming section",
+            detail: error.to_string(),
+        })
+    })
+    .expect_err("a tampered second pass must not mint an artifact identity");
+
+    assert!(matches!(
+        error,
+        FnlpqWriteError::StoredIdentity { section, .. } if section == expected_section
+    ));
+}
+
+#[test]
+fn streaming_writer_binds_the_license_claim_to_emitted_bytes() {
+    let input = tiny_input();
+    let mut streaming = streaming_input_from_materialized(&input)
+        .expect("tiny oracle input supplies verified streaming metadata");
+    let expected_section = streaming
+        .sections
+        .iter()
+        .find(|section| section.kind == SectionKind::LicenseBundle)
+        .expect("tiny fixture has a license bundle")
+        .name
+        .clone();
+    streaming.license_bundle_sha256 = [0xff; 32];
+    let mut streamed_bytes = Vec::new();
+    let error = write_streaming(&streaming, &mut streamed_bytes, |section, sink| {
+        let source = input
+            .sections
+            .iter()
+            .find(|candidate| candidate.name == section.name)
+            .expect("streaming plan section originates from tiny input");
+        sink.write_all(&source.bytes)
+            .map_err(|error| FnlpqWriteError::Io {
+                operation: "write synthetic streaming section",
+                detail: error.to_string(),
+            })
+    })
+    .expect_err("the license header claim must match emitted license bytes");
+
+    assert!(matches!(
+        error,
+        FnlpqWriteError::StoredIdentity { section, .. } if section == expected_section
+    ));
 }
 
 #[test]
