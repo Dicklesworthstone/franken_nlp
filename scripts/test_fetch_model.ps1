@@ -36,10 +36,11 @@ function Stop-RetryServer {
         $script:RetryServer = $null
     }
 }
-function Start-InterruptedResumeServer {
-    $ready = Join-Path $Work 'retry.ready'
-    $trace = Join-Path $Work 'retry.trace'
-    $serverScript = Join-Path $Work 'retry_server.py'
+function Start-InterruptedResumeServer([switch]$MalformedRange) {
+    $runId = [Guid]::NewGuid().ToString('N')
+    $ready = Join-Path $Work ("retry-$runId.ready")
+    $trace = Join-Path $Work ("retry-$runId.trace")
+    $serverScript = Join-Path $Work ("retry_server-$runId.py")
     $serverCode = @'
 import http.server
 import socket
@@ -47,7 +48,7 @@ import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
-fixture, ready_path, trace_path = sys.argv[1:]
+fixture, ready_path, trace_path, mode = sys.argv[1:]
 root = Path(fixture)
 state = {"first_alpha": True}
 
@@ -79,7 +80,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             remainder = payload[5:]
             self.send_response(206)
             self.send_header("Content-Length", str(len(remainder)))
-            self.send_header("Content-Range", "bytes 5-{}/{}".format(len(payload) - 1, len(payload)))
+            reported_start = 4 if mode == "malformed-range" else 5
+            self.send_header("Content-Range", "bytes {}-{}/{}".format(reported_start, len(payload) - 1, len(payload)))
             self.end_headers()
             self.wfile.write(remainder)
             return
@@ -97,7 +99,8 @@ with open(ready_path, "w", encoding="ascii") as ready:
 server.serve_forever()
 '@
     Set-Content -LiteralPath $serverScript -NoNewline -Encoding utf8 -Value $serverCode
-    $script:RetryServer = Start-Process -FilePath python3 -ArgumentList @($serverScript, $Fixture, $ready, $trace) -PassThru -RedirectStandardOutput (Join-Path $Work 'retry.out') -RedirectStandardError (Join-Path $Work 'retry.err')
+    $mode = if ($MalformedRange) { 'malformed-range' } else { 'exact-range' }
+    $script:RetryServer = Start-Process -FilePath python3 -ArgumentList @($serverScript, $Fixture, $ready, $trace, $mode) -PassThru -RedirectStandardOutput (Join-Path $Work ("retry-$runId.out")) -RedirectStandardError (Join-Path $Work ("retry-$runId.err"))
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
         if (Test-Path -LiteralPath $ready) {
             $port = [int](Get-Content -LiteralPath $ready -Raw)
@@ -334,6 +337,16 @@ try {
         if ($status -eq 0 -and (Get-FileHash (Join-Path $d8retry 'alpha.bin') -Algorithm SHA256).Hash.ToLowerInvariant() -eq $alphaSha -and (Get-Content -LiteralPath $retry.Trace -Raw) -match 'alpha.bin range=bytes=5-') { Pass '8retry' 'retry-rebinds-range-after-partial-body' } else { Fail '8retry' "retry-rebinds-range-after-partial-body exit=$status" }
     } else {
         Fail '8retry' 'retry-server'
+    }
+    Stop-RetryServer
+
+    $script:Cases++; $d8malformed = Join-Path $Work 'case8malformed'; $malformed = Start-InterruptedResumeServer -MalformedRange
+    if ($malformed) {
+        $env:FNLP_FETCH_ALLOW_TEST_BASE_URL = '1'; & pwsh -NoProfile -File $Fetch -Dest $d8malformed -Catalog $script:Catalog -TestBaseUrl $malformed.Base -AllowUntrustedRevision 2> (Join-Path $Work 'case8malformed.err'); $status = $LASTEXITCODE
+        $partial = Join-Path $d8malformed 'alpha.bin.partial'
+        if ($status -eq 3 -and -not (Test-Path -LiteralPath (Join-Path $d8malformed 'alpha.bin')) -and (Test-Path -LiteralPath $partial) -and (Get-Item -LiteralPath $partial).Length -eq 5 -and (Get-Content -LiteralPath (Join-Path $Work 'case8malformed.err') -Raw) -match 'mismatched Content-Range') { Pass '8malformed' 'mismatched-content-range-refusal' } else { Fail '8malformed' "mismatched-content-range-refusal exit=$status" }
+    } else {
+        Fail '8malformed' 'malformed-range-server'
     }
     Stop-RetryServer
 
