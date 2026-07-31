@@ -637,6 +637,8 @@ pub struct BootstrapConfidenceInterval {
 /// Confidence intervals for reliability metrics measured only on the locked test.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ReliabilityConfidenceIntervals {
+    /// Number of independently identified rows in the locked-test population.
+    pub locked_test_rows: usize,
     pub ece: BootstrapConfidenceInterval,
     pub brier: BootstrapConfidenceInterval,
     /// `None` is explicit when any replica accepts no rows, so selective risk
@@ -712,6 +714,7 @@ pub fn bootstrap_locked_test_confidence_intervals(
     }
 
     Ok(ReliabilityConfidenceIntervals {
+        locked_test_rows: rows.len(),
         ece: percentile_interval(&mut ece, bootstrap),
         brier: percentile_interval(&mut brier, bootstrap),
         selective_risk: selective_risk
@@ -731,7 +734,8 @@ impl ReliabilityConfidenceIntervals {
             |interval| format!("[{:.17},{:.17}]", interval.lower, interval.upper),
         );
         format!(
-            "CALIBRATION_CONFIDENCE_INTERVALS split=locked_test method=nonparametric_bootstrap_percentile confidence_level={:.17} resamples={} seed={} ece=[{:.17},{:.17}] brier=[{:.17},{:.17}] selective_risk={risk}",
+            "CALIBRATION_CONFIDENCE_INTERVALS split=locked_test rows={} method=nonparametric_bootstrap_percentile confidence_level={:.17} resamples={} seed={} ece=[{:.17},{:.17}] brier=[{:.17},{:.17}] selective_risk={risk}",
+            self.locked_test_rows,
             self.bootstrap.confidence_level,
             self.bootstrap.resamples,
             self.bootstrap.seed,

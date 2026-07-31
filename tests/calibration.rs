@@ -1,15 +1,15 @@
 use franken_nlp::{
     calibration::{
-        BinaryLabel, BootstrapConfig, CalibrationArtifact, CalibrationArtifactSpec,
-        CalibrationError, CalibrationState, ConformalModel, ExchangeabilityMemo, IsotonicModel,
-        LabeledScore, ShiftAssessment, ShiftPolicy, SplitMembership, SplitName, TemperatureModel,
-        ValidityDate, ValidityWindow, bootstrap_locked_test_confidence_intervals,
-        report_locked_test,
+        bootstrap_locked_test_confidence_intervals, report_locked_test, BinaryLabel,
+        BootstrapConfig, CalibrationArtifact, CalibrationArtifactSpec, CalibrationError,
+        CalibrationState, ConformalModel, ExchangeabilityMemo, IsotonicModel, LabeledScore,
+        ShiftAssessment, ShiftPolicy, SplitMembership, SplitName, TemperatureModel, ValidityDate,
+        ValidityWindow,
     },
     error::StructuredTaskStatus,
     execution_identity::{
-        EXECUTION_IDENTITY_SCHEMA_VERSION, ExecutionIdentity, NumericsProfile, Sha256Digest,
-        ThinkingMode, ToolMode,
+        ExecutionIdentity, NumericsProfile, Sha256Digest, ThinkingMode, ToolMode,
+        EXECUTION_IDENTITY_SCHEMA_VERSION,
     },
 };
 
@@ -180,12 +180,14 @@ fn locked_test_bootstrap_intervals_are_replayable_and_never_hide_undefined_risk(
     )
     .unwrap();
     assert_eq!(first, replay);
+    assert_eq!(first.locked_test_rows, 2);
     assert!((0.0..=1.0).contains(&first.ece.lower));
     assert!((0.0..=1.0).contains(&first.ece.upper));
     assert!(first.ece.lower <= first.ece.upper);
     assert!(first.brier.lower <= first.brier.upper);
     assert!(first.selective_risk.is_some());
     assert!(first.diagnostic_line().contains("split=locked_test"));
+    assert!(first.diagnostic_line().contains("rows=2"));
     assert!(first.diagnostic_line().contains("seed=1592642302"));
 
     let undefined_risk = bootstrap_locked_test_confidence_intervals(
@@ -196,11 +198,9 @@ fn locked_test_bootstrap_intervals_are_replayable_and_never_hide_undefined_risk(
     )
     .unwrap();
     assert_eq!(undefined_risk.selective_risk, None);
-    assert!(
-        undefined_risk
-            .diagnostic_line()
-            .contains("selective_risk=not_computed")
-    );
+    assert!(undefined_risk
+        .diagnostic_line()
+        .contains("selective_risk=not_computed"));
     assert!(matches!(
         BootstrapConfig::new(1, 0.95, 0),
         Err(CalibrationError::InvalidBootstrapResamples)
@@ -226,12 +226,10 @@ fn conformal_requires_a_named_exchangeability_memo_and_scopes_coverage() {
     .unwrap();
     let conformal = ConformalModel::fit(partition.calibration(), Some(memo), 0.25).unwrap();
     assert_eq!(conformal.fitted_rows(), 4);
-    assert!(
-        conformal
-            .prediction_set(0.8)
-            .unwrap()
-            .contains(&BinaryLabel::Positive)
-    );
+    assert!(conformal
+        .prediction_set(0.8)
+        .unwrap()
+        .contains(&BinaryLabel::Positive));
     let coverage = conformal
         .coverage_on_locked_test(partition.locked_test())
         .unwrap();
