@@ -430,6 +430,10 @@ def load_r4_receipt(path: Path, expected_digest: str, expected_kind: str) -> dic
     for key in ("packing_sha256", "kernel_table_sha256"):
         if not isinstance(artifact[key], str) or not DIGEST_RE.fullmatch(artifact[key]):
             raise ClaimsError(f"R4 receipt artifact digest is invalid file={path} key={key}")
+    if artifact["recipe_id"] != domain["recipe_id"]:
+        raise ClaimsError(f"R4 receipt artifact recipe does not match validity domain file={path}")
+    if receipt["host_fingerprint"] != domain["host"]:
+        raise ClaimsError(f"R4 receipt host does not match validity domain file={path}")
 
     context = receipt["context"]
     if not isinstance(context, dict) or set(context) != R4_CONTEXT_KEYS:
