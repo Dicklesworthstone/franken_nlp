@@ -29,7 +29,7 @@
 | | `franken_nlp` |
 |---|---|
 | Model observation | 4.1698B params (3.149B decoder), 22 layers used twice, 44 KV slots, max-position config 262144, thinking/tool template. Benchmark and license values are author/card claims until independently evidenced. |
-| Target packaging | Self-contained release executables; sovereign local conversion. Public `fnlp pull` assets only if LG-1 clears. No network during inference. |
+| Target packaging | Self-contained release executables; pinned sovereign source fetch + deterministic local conversion. If LG-1 clears: one Generic `.fnlpq`, fixed 1,957,046,720-byte GitHub Release parts, a release-bound embedded manifest, and installer-delegated `fnlp pull`. No network during inference. |
 | Target output contract | Successful structured results validate against the supported schema subset by construction; declared `verbatim` fields are source substrings by construction after OQ-17; budget/cancellation/unsatisfiable constraints return typed no-result, never truncated “success.” Repeated occurrences and confidence scope stay explicit. |
 | The loop, exploited | Decode streams the full 3.15B non-embedding weights **twice per token**; the engine schedules both passes (per-loop KV binding, loop-aware prefetch, loop-corrected rooflines) instead of replaying a generic graph — and every byte saved by int8/int4 quantization pays out double. |
 | Corpus throughput target | Layer-major batching streams each physical layer once per loop for all compatible rows—two shared streams rather than 2M—plus privacy-scoped prefix pages, exact finite-language projection, and opt-in durable snapshot jobs with scope-correct cache reuse and verified resume. |
@@ -91,8 +91,13 @@ fnlp qualify --baseline active --candidate nanbeige-int4-v3 \
 fnlp audit plan <job-id> --risk audit-policy.json
 fnlp audit grade <audit-id> --grades human-grades.ndjson
 
-# Sovereign path: locally convert lawfully obtained HF shards.
-fnlp convert model-*.safetensors -o nanbeige4.2-3b.int8.fnlpq --quant int8
+# Sovereign path: fetch one immutable upstream conversion closure, then convert it locally.
+# On Windows, use scripts/fetch_model.ps1 with equivalent arguments.
+scripts/fetch_model.sh --dest /path/to/nanbeige-source
+fnlp convert --source /path/to/nanbeige-source \
+  --source-manifest docs/truth-pack/nanbeige4.2-3b.source.json \
+  --recipe nanbeige42-int8-v1 --arch generic \
+  -o nanbeige4.2-3b.fnlpq-v1.int8.generic.fnlpq
 ```
 
 ---
@@ -233,8 +238,8 @@ fnlp eval --task classify --dataset tickets.test.ndjson --gold label
 fnlp qualify --baseline active --candidate candidate-id --suite support-suite.json
 
 # Model artifacts
-fnlp pull                     # exists only after LG-1 authorizes public assets
-fnlp convert shards/*.safetensors -o model.fnlpq --quant int8 --arch aarch64-smmla
+fnlp pull                     # public default only after LG-1; private pinned manifests remain explicit
+fnlp convert --source /path/to/pinned-snapshot -o model.fnlpq --quant int8 --arch generic
 fnlp models                   # installed artifacts, recipe ids, hashes
 fnlp models activate candidate-id --qualification qualification.json
 
@@ -260,6 +265,17 @@ git clone https://github.com/Dicklesworthstone/franken_nlp
 cd franken_nlp
 cargo build --locked --release
 ```
+
+The target release installer follows FrankenOCR's proven first-run shape. It installs and verifies the small `fnlp` binary first. If—and only if—LG-1 has authorized a public model catalog, an interactive terminal then gets a clear `y/N` offer to run the installed binary's own `fnlp pull`. `--with-model` explicitly enables that transfer in automation; `--no-pull` suppresses it; quiet/non-interactive installs never silently start a multi-gigabyte download. Shell and PowerShell do not implement model downloading themselves: both invoke the same Rust artifact manager used by a later manual `fnlp pull`.
+
+That artifact manager streams the GitHub Release parts in manifest order, verifies every part and the reassembled whole, validates the `.fnlpq` census/provenance/license identity, derives the measured host-native packing, runs its selftest, and only then atomically activates it. The canonical local artifact lands at:
+
+```text
+Unix:    ~/.cache/franken_nlp/models/nanbeige4.2-3b.fnlpq-v1.int8.generic.fnlpq
+Windows: %LOCALAPPDATA%\franken_nlp\models\nanbeige4.2-3b.fnlpq-v1.int8.generic.fnlpq
+```
+
+Before LG-1 clears, the binary-only installer does not offer a nonexistent public model. It prints the sovereign `scripts/fetch_model.sh` / `scripts/fetch_model.ps1` → `fnlp convert` instructions and the explicit private-manifest form instead. The two workflows are intentionally different: maintainers/users converting locally download the pinned 8.34 GB bf16 conversion closure; ordinary authorized installs download only the already-converted `.fnlpq` chunks.
 
 The intended embedding surface is:
 
@@ -288,7 +304,7 @@ fn main() -> franken_nlp::Result<()> {
 
 ## Target end-to-end workflow
 
-Once implemented: lawfully obtain/convert weights (or use an authorized catalog asset), run `robot selftest`, inspect `robot plan` for context/batch/memory admission, execute a one-document task, then move the identical task contract to bounded NDJSON batch mode. The release documentation will add copy-paste commands only when CI has executed those exact commands.
+Once implemented, the sovereign path is: fetch and fully hash the immutable HF revision → convert twice-identically to the canonical Generic `.fnlpq` → derive the selected native packing → run `robot selftest` → execute a frozen inference fixture. If LG-1 authorizes publication, the release path adds: deterministic 1,957,046,720-byte splitting → remote asset re-download/reassembly verification → fresh-machine installer → `fnlp pull` → no-flag model discovery → the same inference fixture → a second byte-perfect cache hit with no inference network. Only then does ordinary task/batch use begin. The release documentation will add copy-paste commands only when CI has executed those exact commands.
 
 ## Target configuration
 
@@ -296,7 +312,7 @@ The CLI snapshots environment into its builder; the library uses explicit builde
 
 | Env | Default | Meaning |
 |---|---|---|
-| `FNLP_MODEL_DIR` | `~/.cache/franken_nlp/models` | artifact search path |
+| `FNLP_MODEL_DIR` | `~/.cache/franken_nlp/models` (Unix); `%LOCALAPPDATA%\franken_nlp\models` (Windows) | artifact search/install root; explicit builder/`--model-dir` wins |
 | `FNLP_THREADS` | measured table | shared kernel-pool cap; direct thread sweep, not USL extrapolation |
 | `FNLP_CTX` | `8192` target | per-sequence cap; KV pages allocate lazily |
 | `FNLP_MEMORY_BUDGET` | host-derived, explicit in robot output | hard engine admission budget across KV/scratch/cache/output |
@@ -366,7 +382,7 @@ A few honest boundaries:
 
 **What do "valid" and "grounded by construction" actually mean?** At every decode step, Stencil executes only grammar-legal choices; invalid JSON is unrepresentable. For a declared `verbatim` field, the logical unescaped bytes must also traverse a bounded source-substring language, making off-source text unrepresentable. That proves syntax/source membership—not that the model chose the right fact—and repeated source occurrences remain explicit.
 
-**Where will quantized weights come from?** The sovereign route is deterministic local conversion of lawfully obtained pinned shards. If LG-1 later authorizes public derivatives, client releases pin canonical manifest digests and installs verify part/whole/source digests before atomic rename. No public asset exists today.
+**Where will quantized weights come from?** The sovereign route downloads one revision-scoped HF closure with exact length/SHA-256 checks, then deterministically converts it to the Generic `.fnlpq`. If LG-1 later authorizes public derivatives, a separately versioned model release carries fixed 1,957,046,720-byte chunks plus a canonical manifest/receipt/license bundle. The consuming binary embeds that immutable manifest; the installer simply invokes `fnlp pull`, which streams and verifies part/whole/source/license/census identities, derives the local native packing, and atomically activates the model. No public asset exists today.
 
 **How does this relate to frankensearch?** Cleanly: frankensearch owns embeddings/retrieval; `fnlp` owns generation-adjacent NLP (extraction, scoring, judging, redaction). A RAG pipeline uses frankensearch to retrieve and `fnlp judge --faithfulness` to verify — they meet over NDJSON.
 

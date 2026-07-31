@@ -1,13 +1,13 @@
 # COMPREHENSIVE PLAN FOR franken_nlp (FrankenNLP)
 
-**Master engineering plan — v3 (fresh-eyes + idea/alien review revision 2026-07-30)**
+**Master engineering plan — v3.1 (artifact-lifecycle augmentation 2026-07-30)**
 **Status:** architecture proposal / pre-Phase-0 / external review round 1 of at least 4 (greenfield; nothing implemented yet)
 **Audience:** implementing agents (CPU-kernel, model-forward, task-layer, CLI, conformance) and the lead architect
 **Target model:** `Nanbeige/Nanbeige4.2-3B` at HF revision `f56ec5a9650268aa098496734743c25ea778bd2d`
 
 > **Evidence vocabulary (normative).** This revision replaces the overloaded word “verified” with eight explicit states: **[OBSERVED@pin]** means directly inspected in a named immutable source revision but not yet archived in this repository; **[PARTIAL]** means only the stated part is observed and the named remainder is unresolved; **[REPORTED]** means claimed by the model card, paper, or another secondary source; **[TARGET]** is a design/release requirement; **[HYPOTHESIS]** is an optimization or quality prediction that measurement may kill; **[OPEN]** is an unanswered question; **[BLOCKED]** names a missing authority or prerequisite. Phase −1 promotes an observation to **[EVIDENCED]** only by committing the source hash, exact source span, extraction command, and replayable fixture under `docs/truth-pack/`. No phase gate may rely on an unresolved `[OPEN]`, `[BLOCKED]`, or unresolved portion of `[PARTIAL]`.
 
-> **Lineage and review record.** The first draft followed `franken_ocr`, the closest technical sibling. This revision also cross-read `franken_markdown` (current-vs-roadmap and output-safety contracts), `franken_lean` (claim-state taxonomy and foundation audits), `franken_manim` (normative decisions and convergence gates), and `frankengraphdb` (invariant, cost, and threat registries). Review round 1 corrected the unsafe-lint contradiction, the AVX2 saturation construction, AVX-512 tiering, loop/KV/norm semantics, license provenance, artifact trust, memory admission, grammar scope, calibration splits, and deterministic-output scope. A second pass within the same round applied the `idea-wizard`, `alien-artifact-coding`, `alien-graveyard`, and `extreme-software-optimization` disciplines: compile known structure into exact execution, add durable corpus semantics and user-owned qualification, and quarantine adaptive/exotic mechanisms behind profiles, deterministic fallbacks, and negative-evidence records. The adversarial cross-scores/reactions then caught forced-byte/token conflation, control-token trust-boundary omission, same-model-verification overclaim risk, audit-authority gaps, tuning-profile overreach, 44-deep trie-fork amplification, corpus-cache scope, and multi-client duplication; those are now bounded by OQ-19–24, AA-A1, and AA-R1. It is **not** steady-state: the planning workflow still requires at least three more independent review rounds before Beads conversion.
+> **Lineage and review record.** The first draft followed `franken_ocr`, the closest technical sibling. This revision also cross-read `franken_markdown` (current-vs-roadmap and output-safety contracts), `franken_lean` (claim-state taxonomy and foundation audits), `franken_manim` (normative decisions and convergence gates), and `frankengraphdb` (invariant, cost, and threat registries). Review round 1 corrected the unsafe-lint contradiction, the AVX2 saturation construction, AVX-512 tiering, loop/KV/norm semantics, license provenance, artifact trust, memory admission, grammar scope, calibration splits, and deterministic-output scope. A second pass within the same round applied the `idea-wizard`, `alien-artifact-coding`, `alien-graveyard`, and `extreme-software-optimization` disciplines: compile known structure into exact execution, add durable corpus semantics and user-owned qualification, and quarantine adaptive/exotic mechanisms behind profiles, deterministic fallbacks, and negative-evidence records. The adversarial cross-scores/reactions then caught forced-byte/token conflation, control-token trust-boundary omission, same-model-verification overclaim risk, audit-authority gaps, tuning-profile overreach, 44-deep trie-fork amplification, corpus-cache scope, and multi-client duplication; those are now bounded by OQ-19–24, AA-A1, and AA-R1. The v3.1 augmentation then traced FrankenOCR's shipped Baidu source-fetch, converter, immutable embedded manifest, 1,957,046,720-byte release split, `focr pull`, Unix/Windows installers, and clean-cache release receipts end to end; §5.1/§5.6 and Phases −1/2/6 now specify the equivalent Nanbeige lifecycle rather than merely naming it. It is **not** steady-state: the planning workflow still requires at least three more independent review rounds before Beads conversion.
 
 ### Research snapshot used by this revision
 
@@ -51,7 +51,7 @@ These are research observations, not yet repository evidence. Phase −1 must fe
 
 **Mission.** `franken_nlp` is a pure-Rust (Rust 2024, nightly), memory-safe, CPU-hyper-optimized **library + one CLI program (`fnlp`, also shipped under the long name `franken_nlp`)** that runs the **Nanbeige4.2-3B** language model **with no general ML framework** — and turns it into a complete local NLP toolbox: structured extraction, NER + entity resolution, sentiment/dimension scoring, zero-shot classification, PII redaction, faithfulness judging, summarization, keyphrases, QA, and plain generation. `unsafe_code = "deny"` applies at crate roots; only enumerated SIMD/mmap modules may opt into scoped audited islands (§1.1 G4).
 
-We achieve this by transforming the model's bf16 weights into a custom quantized on-disk form (int8 first, int4 in refinement rounds), **targeting** distribution of the transformed artifacts as GitHub release assets (≤ 2 GB parts, hash-verified, reassembled by `fnlp pull`) **only after the §5.7 redistribution-authority gate is green**, and writing **model-specific kernels** whose only job is to run *this one model* as fast as possible on:
+We achieve this by transforming the model's bf16 weights into a custom quantized on-disk form (int8 first, int4 in refinement rounds), **targeting** distribution of the transformed artifacts as GitHub release assets (fixed 1,957,046,720-byte parts except the tail, each under GitHub's 2 GiB limit; hash-verified and reassembled by `fnlp pull`) **only after the §5.7 redistribution-authority gate is green**, and writing **model-specific kernels** whose only job is to run *this one model* as fast as possible on:
 
 - **Apple Silicon / ARM64** — M4/M5 family: NEON, FEAT_DotProd (SDOT), FEAT_MATMUL_INT8 (SMMLA / i8mm), high-bandwidth unified memory, big SLC
 - **AMD / Intel x86-64** — high-core-count parts first: Threadripper/EPYC Zen 3 (AVX2 ceiling — the reference `trj` machine is a 5995WX-class part), Zen 4/5 and Xeon (AVX-512-VNNI / AVX-VNNI), with AVX2 as a first-class, proof-carrying tier, not a fallback afterthought
@@ -343,7 +343,7 @@ franken_nlp/                          (crate: franken_nlp)
 ├── tests/                            # conformance_harness, native_engine_e2e (model-gated), robot_contract,
 │   └── fixtures/                     #   tokenizer/template/grammar corpora + frozen reference outputs
 ├── benches/                          # prefill, decode_token, batch_throughput, task gauntlets
-├── scripts/                          # fetch_model.sh, gen_reference_fixtures.py (pinned oracle), check.sh
+├── scripts/                          # fetch_model.sh/.ps1, gen_reference_fixtures.py (pinned oracle), check.sh
 ├── docs/                             # DISCREPANCIES.md, NEGATIVE_EVIDENCE.md, PERF_LEDGER.md, truth-pack/
 └── .github/workflows/                # ci.yml (check.sh), dist.yml (5-target release matrix)
 ```
@@ -395,14 +395,21 @@ Each stage has a `FNLP_STAGE_BUDGET_<STAGE>_MS` override and a cancellation chec
 
 ## 5. Weight transformation pipeline
 
-The mandate: **lawfully obtained HF files → reference-parity load → custom quantized form → deterministic round trip → conditional authorized distribution**. Split GitHub assets/`fnlp pull` are enabled only after §5.7; local conversion is complete without them.
+The mandate: **lawfully obtained, immutable HF snapshot → reference-parity load → custom quantized form → deterministic round trip → conditional authorized distribution → verified local activation**. There are two deliberately separate download paths:
+
+1. **Sovereign/source path:** a maintainer or user explicitly downloads the pinned 8.34 GB upstream checkpoint, verifies it, and runs `fnlp convert` locally. This path is complete even when redistribution is blocked.
+2. **Release/install path:** after §5.7 clears, maintainers publish the already-converted canonical `.fnlpq` as immutable GitHub Release chunks; `fnlp pull` reassembles and activates it on the user's machine. The installer invokes that same Rust pull path—it never downloads or converts the upstream bf16 shards itself.
 
 ### 5.1 Stages
 
 ```
-[1] DOWNLOAD (out-of-band, scripts/fetch_model.sh)
-    Nanbeige/Nanbeige4.2-3B: 2 safetensors shards (8.34 GB bf16) + tokenizer.model + tokenizer.json
-    + tokenizer_config.json + config.json + generation_config.json  -> never fetched at inference time (G3)
+[1] ACQUIRE PINNED SOURCE (explicit, out-of-band, `scripts/fetch_model.sh` / `.ps1`)
+    `Nanbeige/Nanbeige4.2-3B` @ f56ec5a9650268aa098496734743c25ea778bd2d:
+    2 safetensors shards + index + config + tokenizer.model + tokenizer.json +
+    tokenizer_config.json + added_tokens.json + special_tokens_map.json +
+    generation_config.json. Download into a revision-scoped source directory,
+    verify the Phase −1 conversion-source manifest, then atomically expose each file.
+    This is never the end-user installer path and never runs at inference time.
 
 [2] REFERENCE-PARITY LOAD (`fnlp convert`)
     ft-serialize::load_safetensors_from_bytes -> BF16->f32 in process
@@ -426,12 +433,51 @@ The mandate: **lawfully obtained HF files → reference-parity load → custom q
 
 [5] WRITE .fnlpq (§5.2) — self-describing, versioned; embed exact approved license materials when authorized
 
-[6] IF redistribution authority is green (§5.7), SPLIT + HASH for GitHub release assets (§5.6):
-    N parts ≤ 1.9 GB, per-part SHA-256 + whole-artifact SHA-256 in a canonical manifest whose
-    digest is pinned by the client release; `fnlp pull` verifies before an atomic install.
+[6] IF redistribution authority is green (§5.7), PACKAGE for GitHub Releases (§5.6):
+    fixed 1,957,046,720-byte parts (tail shorter), per-part + whole SHA-256, canonical
+    embedded manifest, license bundle, source/conversion receipt, and reconstruction record.
+    Upload exact named files to a draft model release; never wildcard or `--clobber`.
 
-[7] ROUND-TRIP / DETERMINISM GATE (§5.4)
+[7] REMOTE REPLAY + INSTALL:
+    re-download every published part, verify the release inventory, run a clean-cache
+    `fnlp pull`, derive the native packing, pass census/selftest, and reproduce a frozen
+    inference fixture before the release is eligible to publish.
+
+[8] ROUND-TRIP / DETERMINISM GATE (§5.4)
 ```
+
+#### 5.1.1 Pinned conversion-source download contract
+
+`scripts/fetch_model.sh` (Unix) and `scripts/fetch_model.ps1` (Windows) are human-run provisioning tools, patterned on FrankenOCR's Baidu fetcher. Their default destination is:
+
+```text
+Unix:    ${HOME}/.cache/franken_nlp/source/Nanbeige4.2-3B/f56ec5a9650268aa098496734743c25ea778bd2d/
+Windows: %LOCALAPPDATA%\franken_nlp\source\Nanbeige4.2-3B\f56ec5a9650268aa098496734743c25ea778bd2d\
+```
+
+Each constructs every URL as `https://huggingface.co/Nanbeige/Nanbeige4.2-3B/resolve/<immutable-revision>/<canonical-filename>`; follows redirects; honors `HTTPS_PROXY`/`HTTP_PROXY`; retries transient failures; resumes only into a uniquely named `.partial`; verifies exact length and SHA-256; syncs; then same-directory renames. `--check-only` fully rehashes the existing closure. “File exists” or “size matches” alone is never a cache hit. A non-default revision requires an explicit flag, is labeled untrusted until a new truth-pack revision is reviewed, and cannot reuse the default recipe/catalog identity.
+
+The Phase −1 **conversion-source manifest** pins every file needed by `fnlp convert`, not merely the two large shards: the shards and index, config, tokenizer model/JSON/config/token maps, and generation config. At the currently inspected revision, the HF LFS API reports these load-bearing identities **[OBSERVED@pin; promote to EVIDENCED in Phase −1]**:
+
+| file | exact bytes | SHA-256 |
+|---|---:|---|
+| `model-00001-of-00002.safetensors` | 4,973,547,960 | `09d265d5ec837bc64462796b7f8c110be9a135a55ed7a6eb5d07e0e90c976a94` |
+| `model-00002-of-00002.safetensors` | 3,366,076,760 | `31019e7870a044f44bc3f7e981f8c5ecd42d341e5ca6cfdbfd07fb95d95be389` |
+| `tokenizer.json` | 18,450,979 | `1d858a0fc007f22af6ae18bfa1ae52d30e398aa9cd1ea06e7777176869346a3f` |
+| `tokenizer.model` | 2,782,298 | `fb41d04798b714520a9b075727b0226538b7330254299062742c50ec8374bc36` |
+
+A separate **truth-pack research manifest** pins the model/configuration source, card/API metadata, report, and negative LICENSE/NOTICE census. Those evidence files inform architecture and redistribution review but do not become converter or runtime prerequisites. Preflight computes free space from the conversion-source manifest plus conversion-output upper bound and safety margin; it does not hard-code “10 GB should be enough.” Invalid old files are quarantined with their observed digest, not silently overwritten. Each script's final instructions use the revision directory as one unit:
+
+```bash
+# Windows uses scripts/fetch_model.ps1 with equivalent arguments.
+scripts/fetch_model.sh --dest /path/to/nanbeige-source
+fnlp convert --source /path/to/nanbeige-source \
+  --source-manifest docs/truth-pack/nanbeige4.2-3b.source.json \
+  --recipe nanbeige42-int8-v1 --arch generic \
+  -o nanbeige4.2-3b.fnlpq-v1.int8.generic.fnlpq
+```
+
+`fnlp convert` refuses a missing/extra/wrong-digest conversion input before parsing tensors, writes through a same-directory staging file, and emits a machine-readable conversion receipt containing the ordered source-root digest, 201-tensor census digest, converter commit, recipe, rounding/packing ids, output length, output SHA-256, and license state. It then reloads the staged `.fnlpq`, reconstructs every logical tensor, runs structural/census/round-trip and kernel selftests, syncs, and atomically renames. If pinned reference fixtures are locally available, conversion also runs the applicable L1–L4 smoke checks; release certification always runs the complete named L1–L4 and task-quality gates. “Optimal” means the best recipe that has cleared the locked parity, task-quality, footprint, and host-regime performance gates; the word is never inferred from bit width alone.
 
 ### 5.2 Custom on-disk format `.fnlpq`
 
@@ -490,15 +536,65 @@ Unlike franken_ocr (which inherited a community-validated recipe), the only prio
 - **int4 by allocation, not uniformity** (Phase 5): begin with uniform deterministic recipes as baselines, then let the offline AA-Q1 allocator (§10.5) choose per-tensor tiers under a footprint budget against **held-out task metrics**, not perplexity alone. Hypotheses informed by llama.cpp `_M` recipes—such as higher precision for `down_proj` or early/late layers—remain hypotheses. The loop reuses each quantized tensor in both passes, so sensitivity interactions are joint: one-at-a-time tensor curves may seed search, but only a complete candidate artifact evaluated end-to-end may be promoted.
 - Embeddings/lm_head int8 and KV int8 are separate, kill-switched, measured stages (§6.9).
 
-### 5.6 GitHub-asset distribution & `fnlp pull` (adopting the shipped franken_ocr mechanics)
+### 5.6 GitHub-asset distribution, `fnlp pull`, and installer handoff
 
-- **Only after §5.7 is green**, artifacts may be release assets on this repo: `nanbeige4.2-3b.int8.fnlpq.partNNNN` (each ≤1.9 GB under GitHub's 2 GiB per-asset limit) plus a canonical manifest containing exact part names/order/length/digests, whole-file digest/length, ordered source digests, recipe/converter ids, required format range, and the exact license bundle digest.
-- `fnlp pull [--quant int8|int4] [--arch ...]` accepts only a manifest digest pinned in that `fnlp` release's catalog. `--manifest-url` is an expert escape hatch and **must** be paired with `--expected-sha256`; there is no unauthenticated “latest JSON decides what code trusts” path. HTTPS authenticates transport; SHA-256 authenticates content against the pinned catalog. Redirects are host-allowlisted and never forward credentials.
-- Downloads are resumable into a same-filesystem staging directory under an exclusive per-artifact lock. Part names are parsed identifiers, never joined attacker-controlled paths. Length is checked before hashing; the assembled file is whole-hashed and fully census-loaded; then file data and directory metadata are synced and one atomic rename installs it. Failure/cancellation leaves the prior artifact untouched and a safely resumable staging set. Concurrent pulls converge on the same content address.
-- **Released assets are the arch-neutral Generic packing** (one hosted artifact per quant tier — hosting stays 1×); `fnlp pull` (or first load) **derives the arch-specific tile packing locally**, a deterministic transformation cached beside the artifact with its own recorded hash — so kernels still load pre-packed tiles with zero per-inference shuffle. "Deterministic conversion" therefore means precisely: same source + same recipe → bit-identical *generic* artifact (local `fnlp convert` output hash-matches the released assets); per-arch derivations are deterministic given `--arch` and hashed separately.
-- `fnlp convert` remains the sovereign path for users who fetch the HF shards themselves (G3: pull is a convenience, never a requirement).
-- Recipe id, catalog digest, artifact digest, source digests, format version, and packing digest are printed by `fnlp robot health`; mismatched or truncated artifacts fail before load.
-- **Until §5.7 is green, this section is a design target, not permission to publish weights.** Local `fnlp convert` and user-supplied/private manifests are the complete fallback distribution story.
+This section deliberately copies FrankenOCR's **proven invariants**, while correcting its historical rough edges: versioned immutable filenames, a release-bound embedded manifest, exact recipe compatibility before any multi-GB request, streamed part/whole hashing, cache discovery that recognizes the installed basename, per-artifact locking, same-directory staging/rename, and clean-cache inference certification.
+
+#### 5.6.1 Canonical artifact and independent model version
+
+- **Only after §5.7 is green**, the canonical arch-neutral Generic `.fnlpq` may be published. Binary SemVer and model-artifact SemVer are independent: e.g. several `fnlp` `v0.x.y` binaries may consume immutable model release `models-nanbeige42-fnlpq-v1`. A patch binary release must not rename or republish identical 4+ GB bytes.
+- The logical filename is artifact-version/quant/packing-bearing: `nanbeige4.2-3b.fnlpq-v1.int8.generic.fnlpq`; the exact recipe id is authoritative in the manifest and container header. A different source revision, format, recipe, tokenizer/template closure, or logical bytes gets a new artifact version/name/tag; bytes under an existing tag/name are never replaced.
+- Public hosting stays 1× per quant tier. The released artifact is Generic; `fnlp pull` derives the host's measured-default packing locally (M4/M5 SDOT/I8MM candidate, Zen 3 AVX2, Zen 4/5 VNNI-256/512 candidate) and caches it by `(whole_artifact_sha256, packing_id, tile_table_version)`. Capability alone never decides the winner. Generic remains the reconstruction/provenance root; the derived cache is disposable and byte-differential-tested against its logical tensors.
+
+#### 5.6.2 Deterministic chunking and release inventory
+
+- The release packager splits the exact `.fnlpq` byte stream into **1,957,046,720-byte** chunks, with only the final chunk shorter—the exact safely-under-2-GiB size proven in FrankenOCR. Names append zero-padded ordered suffixes `.part00`, `.part01`, …; the manifest caps the count (64 in v1) so two digits are sufficient and unambiguous. Concatenation in manifest order is the original file; there is no archive or compression layer.
+- A canonical schema-versioned manifest records: model/artifact ids; immutable release tag; logical filename/length/SHA-256; exact ordered part name/length/SHA-256/HTTPS mirror URLs; ordered source-file digests and source-root digest; recipe/converter/format compatibility; tokenizer/template/census/semantic digests; license-bundle digest; packing policy; revocation/supersession state. The canonical manifest bytes and SHA-256 are embedded in every compatible binary and also attached to the model release for audit. Default pull never fetches manifest identity from `main`, `latest`, or another mutable branch.
+- The staging directory also contains `MODEL_ASSET_RECEIPT.json`, `SHA256SUMS`, `RECONSTRUCTION.txt`, and the exact approved license/NOTICE/modification bundle. The receipt binds the conversion receipt, split command/tool version, ordered reconstruction, whole result, parity/quality receipts, and intended release inventory. These small records are committed or attached; the multi-GB `.fnlpq` and parts remain gitignored.
+- Publication uses a **draft** GitHub Release and exact explicit upload paths—never a wildcard, never `gh release upload --clobber`. The runbook first hashes the retained staging set, reconstructs it, and compares the whole bytes with the converter output. After upload, it queries the remote inventory, downloads each asset through its public URL into a clean directory, repeats part/whole verification, runs a clean-cache `fnlp pull`, derives the native packing, runs `robot selftest`, and reproduces a frozen real-model inference fixture. Only that receipt plus LG-1 authorizes publishing the draft. A bad release is superseded/revoked by a new catalog; immutable old bytes are not rewritten.
+
+#### 5.6.3 One Rust artifact manager
+
+`fnlp pull [--quant int8|int4] [--arch auto|...] [--model-dir ...]` and the installer share exactly one implementation: the installed `fnlp` binary's Rust artifact manager over asupersync HTTP/TLS. `install.sh`/`install.ps1` never parse the model manifest, concatenate chunks, or maintain their own hash/cache rules. This prevents the binary and installer from disagreeing about recipe, filename, cache layout, or integrity.
+
+- Default manifest = release-bound embedded bytes. `--manifest <local-path-or-https-url>` is the sovereign/private-mirror escape hatch and **must** be paired with `--expected-sha256`; `FNLP_MANIFEST_URL` is not a hidden library read. HTTPS authenticates transport; the expected digest authenticates the manifest; its part/whole digests authenticate content. Redirects are host-allowlisted and credentials are never forwarded cross-origin.
+- Before any artifact request, the parser enforces exact schema/recipe/format compatibility, portable single-component filenames, unique case-folded names, canonical part ids/order, HTTPS URLs, checked part-size sum, count/size/string caps, and required license/census digests. An incompatible historical recipe fails before cache creation or network I/O.
+- The manager streams response frames directly into one same-filesystem staging file while updating per-part and whole SHA-256; a part is never buffered in RAM. Each mirror attempt rolls back to the last verified part boundary. A small resume journal binds the manifest digest, final path, committed length, and verified part index. On restart, the manager rehashes every committed part before trusting the prefix. Intra-part Range resume is used only after an asupersync fixture proves `206` plus exact `Content-Range`; otherwise the unverified tail is truncated and that part restarts.
+- A per-content-address install lock closes cache-check/install races. Existing files count as cached only after exact length + whole SHA-256. After all parts verify, the manager syncs and fully parses/census-checks the staged `.fnlpq`, verifies its embedded source/license/semantic identity, derives and differentially checks the selected native packing, runs required selftests, then atomically installs and switches the small active-artifact record. Failure, cancellation, disk-full, crash, or a malicious mirror leaves the previously active artifact untouched. Concurrent pulls converge on the same content address.
+
+#### 5.6.4 Local placement and discovery
+
+The installed canonical file lives at:
+
+```text
+Unix:    ${HOME}/.cache/franken_nlp/models/nanbeige4.2-3b.fnlpq-v1.int8.generic.fnlpq
+Windows: %LOCALAPPDATA%\franken_nlp\models\nanbeige4.2-3b.fnlpq-v1.int8.generic.fnlpq
+         (fallback: %USERPROFILE%\.cache\franken_nlp\models\...)
+```
+
+`--model-dir` wins; otherwise an explicitly configured `FNLP_MODEL_DIR` wins; otherwise the platform default above. Derived packings, the embedded-manifest audit copy, license bundle, and activation receipt sit under content-addressed subdirectories of the same model root. Successfully installed remote part files are not retained: the verified staging stream becomes the one canonical local `.fnlpq`, avoiding a second 4+ GB copy. Orphan/live staging is distinguishable by its lock and `fnlp doctor` can quarantine stale state. `fnlp models` reports installed/active digests, recipe, format, source revision, packing, license path, bytes, and whether the artifact is public-catalog, private-manifest, or locally converted. Default `NlpEngine` discovery must include the exact versioned basename that `fnlp pull` installs; a clean install cannot require `--model`.
+
+#### 5.6.5 Installer behavior
+
+Phase 6 `install.sh` and `install.ps1` first install and SHA-256-verify the target binary, execute its exact version check, and optionally run `fnlp robot selftest`. Then:
+
+- when a public authorized catalog is embedded, an interactive TTY gets a clear `y/N` offer stating model version, quant, download bytes, peak required free bytes, and destination; acceptance runs the installed binary by absolute path: `"<install-dir>/fnlp" pull`;
+- `--with-model` / `-WithModel` explicitly opts non-interactive automation into the same pull; `--no-pull` / `-NoPull` suppresses it; quiet/non-interactive mode never silently starts a multi-GB transfer;
+- a pull failure does not roll back a successfully verified binary and does not destroy an older working model; the final summary prints the exact retry command, cache path, artifact state, and uninstall/cache-removal instructions;
+- before LG-1 clears, installers publish binaries only, do not offer a nonexistent public model, and instead print the pinned-source `fetch_model.sh` / `.ps1` + `fnlp convert` route and the private-manifest form. The default `fnlp pull` returns typed `PUBLIC_ARTIFACT_UNAVAILABLE` mapped to the existing exit `3` (“model not found/unavailable”) rather than pretending that card metadata authorized assets.
+
+#### 5.6.6 Required tests and receipts
+
+Tiny deterministic multi-part fixtures exercise manifest caps, mirror fallback, streamed assembly, part/whole mismatch, overlong/short bodies, malicious names/redirects, resume at every boundary, cache-hit rehash, symlink/device targets, concurrent pulls, cancellation/disk-full/crash, old-active preservation, native-pack derivation, and `pull`-basename discovery. Installer E2E drives the real Unix and PowerShell scripts against a fake release into a fresh HOME/LOCALAPPDATA, including interactive accept/decline, `--with-model`, `--no-pull`, quiet mode, reinstall, and failure injection. The 8.34 GB source and real release assets remain model-gated; release certification must additionally prove:
+
+1. pinned HF closure download/check-only;
+2. deterministic local conversion twice on independent clean directories;
+3. package/reassemble byte identity;
+4. remote asset inventory and re-download identity;
+5. fresh-machine installer → `fnlp pull` → no-flag model discovery → frozen real inference;
+6. second pull returns an exact cache hit and inference opens no network.
+
+`fnlp convert` remains the sovereign path (G3: public pull is convenience, never a requirement). `fnlp robot health` prints recipe, catalog/manifest/artifact/source/packing/license digests and source class. **Until §5.7 is green, all public-release language above is a technical design and test target, not permission to publish weights. Local conversion and user-supplied/private pinned manifests are the complete distribution story.**
 
 ### 5.7 Redistribution-authority gate (fail closed)
 
@@ -810,7 +906,7 @@ Phase-7 acceptance sampling, if AA-A1 survives review, operates only on a frozen
 | NDJSON/text | giant lines, invalid UTF-8, duplicate ids, output amplification | byte/token/depth/output caps before allocation; streaming parser; bounded reorder window; typed per-doc errors |
 | Untrusted document segment | role/control-token smuggling; instruction-shaped content steering | forbidden-control-id tokenizer with exact-byte decode-or-reject; typed segment provenance; matched clean/attack task scorecards; never market an injection firewall |
 | Prefix/KV cache | cross-user content reuse or use-after-cancel | shipped-prefix-only default; namespace/digest-complete keys; COW page ownership model; hostile interleaving tests |
-| Pull/network | manifest substitution, redirect abuse, partial install | pinned manifest digest; HTTPS; redirect allowlist; no credential forwarding; staged hash+census+atomic rename |
+| Pull/network | manifest substitution, redirect abuse, overlong body, resume confusion, partial install | release-bound embedded manifest; explicit private-manifest digest; HTTPS + redirect/credential policy; declared-length caps while streaming; revalidated part-boundary journal; per-part/whole/source/license hashes; staged census/native-pack selftest + atomic activation |
 | Local persistence/jobs | accidental prompt/result/PII retention; torn or mixed-config resume | disabled by default; metadata field allowlist; explicit owner-only spools; exact semantic key; transactional states; kill/disk-full/corrupt-tail tests; reversible maps never enter telemetry |
 | Model output | instruction-shaped text, unsafe tool text, PII miss | output is untrusted data; segment provenance preserved; `fnlp` executes no tools; redaction is explicitly not a compliance guarantee; evidence/abstention surfaced |
 | Audit/qualification | model grades itself; cherry-picked/post-hoc sample; privacy leak in review pack | human authority; frozen job/risk/strata/seed; exact population binding; explicit protected materialization; scoped claim or `INSUFFICIENT_DATA` |
@@ -960,7 +1056,7 @@ Every implemented card gets a recommendation record with hotspot evidence, EV fa
 Each phase: goals · key tasks · exit gates. Correctness before speed throughout; a gate cannot pass while it depends on an unresolved §14 item. Empirical questions are resolved in the phase that can actually measure them—Phase −1 must not fabricate answers to Phase 5 experiments.
 
 ### Phase −1 — Source/Oracle Truth Pack (FIRST; no kernel work until green)
-- Pin + SHA-256 every source: HF repo revision (config, both safetensors, index, tokenizer files, modeling/configuration source, template/generation config, report PDF, card/API metadata); record the **absence** of LICENSE/NOTICE files as evidence rather than inventing them; pin the `nanbeige42` fork and any community GGUF used only as a cross-check.
+- Pin + SHA-256 every source: HF repo revision (config, both safetensors, index, tokenizer files, modeling/configuration source, template/generation config, report PDF, card/API metadata); record the **absence** of LICENSE/NOTICE files as evidence rather than inventing them; pin the `nanbeige42` fork and any community GGUF used only as a cross-check. Commit separate conversion-source and research-evidence manifests; make `scripts/fetch_model.sh --check-only` and `scripts/fetch_model.ps1 -CheckOnly` reproduce every conversion-source length/digest from revision-scoped clean directories.
 - Generate the **machine-readable census** (§2.6): every tensor name/shape/byte + KV formulas + score-bucket single-token verification (§7.5) + context/buffer tables; CI-guarded.
 - Promote the source-answerable §14 observations needed by Phases 1–2 into line-backed **[EVIDENCED]** records; leave empirical OQ-11–15 and OQ-17–24 open behind their own later gates.
 - Stand up the CPU oracle; prove it runs; measure its nondeterminism floor; capture smoke fixtures (greedy streams, per-(loop,layer) dumps, template renderings, tokenizer corpora).
@@ -976,8 +1072,8 @@ Each phase: goals · key tasks · exit gates. Correctness before speed throughou
 - **Exit:** L0–L4 green in f32 (44 layer outputs + two post-loop norms; greedy exact over oracle-reproducible prefixes); determinism gate green; census loader green.
 
 ### Phase 2 — int8 + `.fnlpq` + distribution
-- Converter + format + census loader; staged quant 2a/2b/2c each with its own parity gate; artifact split/manifest; `fnlp pull`; `fnlp models`; `robot selftest`.
-- **Exit:** int8 L3/L4 within measured tolerance (argmax agreement ledgered, L4 exact only where the quantized path actually preserves it); deterministic round-trip; malicious-format and pull/install tests green. Publish public weight assets **only if LG-1 is cleared**; otherwise ship local conversion + private/pinned-manifest support and record the publication blocker.
+- Converter + format + census loader; staged quant 2a/2b/2c each with its own parity gate; deterministic Generic artifact; fixed-size release packager + asset receipt/reconstruction runbook; release-bound embedded manifest; resumable streamed `fnlp pull`; content-addressed native-pack derivation; `fnlp models`; `robot selftest`.
+- **Exit:** int8 L3/L4 within measured tolerance (argmax agreement ledgered, L4 exact only where the quantized path actually preserves it); two-clean-directory conversion identity; package/reassemble identity; malicious-format/manifest/pull/resume/concurrency/install tests green; a private/fake-release clean-cache pull resolves with no `--model`. Publish public weight assets **only if LG-1 is cleared and §5.6's remote replay + real-inference receipt is green**; otherwise ship local conversion + private/pinned-manifest support and record the publication blocker.
 
 ### Phase 3 — SIMD kernels + latency perf
 - Dispatch catalog (§6.3), both exact AVX2 candidates, sustained 256/512-bit VNNI comparisons, fixed-shape GEMM/GEMV, native GQA/decode attention, then profile-gated fusion/NUMA/build recipes. Gauntlet R1 begins.
@@ -992,8 +1088,8 @@ Each phase: goals · key tasks · exit gates. Correctness before speed throughou
 - **Exit:** complete int4 candidates meet mean/tail/footprint gates on locked data; full portfolio surfaced and evaluated; calibration validity/coverage measured and scoped; semantic verification is either promoted per task with incremental-error/cost evidence or remains off; qualification receipts and stale-digest rejection proven; public TaskIR recipes either pass all gates or remain internal.
 
 ### Phase 6 — Hardening + cross-platform release
-- CLI/robot contract freeze; digest-gated activate/rollback; optional `fnlp tune` restricted to proved bit-identical choices; doctor; installer (`install.sh`/`.ps1` per the sibling pattern); 5-target dist matrix; the full three-pillar gauntlet to convergence; agent-ergonomics audit; README/docs truth pass (`/reality-check-for-project` + `/de-slopify`).
-- **Exit:** all targets build+smoke; scorecard all-green; installers verified; release certified.
+- CLI/robot contract freeze; digest-gated activate/rollback; optional `fnlp tune` restricted to proved bit-identical choices; doctor; installer (`install.sh`/`.ps1` per the sibling pattern) that invokes the installed binary's one artifact manager; interactive/`--with-model`/`--no-pull` policy; fresh-HOME/LOCALAPPDATA fake-release E2E; 5-target dist matrix; the full three-pillar gauntlet to convergence; agent-ergonomics audit; README/docs truth pass (`/reality-check-for-project` + `/de-slopify`).
+- **Exit:** all targets build+smoke; scorecard all-green; installers verify exact binary versions and the model handoff on Unix/Windows; LG-1-blocked installers truthfully omit the public-model offer; an authorized release proves installer → pull → no-flag discovery → real inference → offline second run; release certified.
 
 ### Phase 7 — Stretch (explicitly optional, in EV order)
 - Per-task-qualified document-major `analyze` packs · `schema infer` holdout experiment · AA-A1 human-graded frozen-job acceptance/qualification-decay audits · scope-correct portable snapshot `partition/merge` + entity lineage · AA-R1 local resident only if multi-process traces justify it · AA-W1 only if occupancy traces prove fragmentation · `ft-kernel-metal` prefill experiment (CPU stays product/reference) · remote/routable `fnlp serve` only as a separate later decision · AA-D1 exact loop-draft only if its research gate survives · translation after multilingual evals · int8-embedding/KV-int4 refinements.
@@ -1025,6 +1121,7 @@ Each phase: goals · key tasks · exit gates. Correctness before speed throughou
 | **Same-model verification launders correlated agreement into proof** | HIGH | `verify-semantic` off by default; report four-state result and same-model provenance; promote only on incremental locked-eval value with false-alarm/cost rows |
 | **Acceptance sampling overclaims a corpus certificate** | MED-HIGH | AA-A1 human authority, frozen population/design/seed, independently checked finite-population math, protected explicit review pack, scoped error-rate claim or no-claim |
 | **Weights/tokenizer/preset redistribution authority missing** | **HIGH / PUBLICATION BLOCKER** | §5.7 fail-closed provenance; no public derivative weights or embedded tokenizer until LG-1; no swiss_army_llama copying without recorded authority |
+| **Release chunks or installer disagree with the runtime catalog** | HIGH | one release-bound embedded manifest; binary/model versions independent; installer delegates to installed `fnlp pull`; exact inventory/part/whole/source/license hashes; remote clean-cache replay; never clobber immutable assets |
 | **Untrusted input exhausts CPU/RAM or parser state** | HIGH | §8.6 caps before allocation, lazy KV, grammar preflight, deadlines/fair morsels, malicious corpora |
 | **Scope creep** (model zoo, server, GPU, POS tagging…) | MED | §1.2 non-goals enforced at review; Phase 7 quarantines stretch; one model, one product |
 
@@ -1038,7 +1135,7 @@ Each phase: goals · key tasks · exit gates. Correctness before speed throughou
 
 **Footprint & portability (G3/G4):** converter/loader report exact per-section artifact bytes and peak/RSS/KV admission; no speculative 20 MB binary or 2.4 GB artifact number becomes a promise before builds. Five target binaries build/smoke; inference opens no network and needs no foreign ML runtime/GPU. Crate roots use `deny`, audited islands are enumerated, and every island has scalar differential + policy-scan evidence.
 
-**Product (G5/G6/G7):** tasks graduate individually only with scorecards; batch daemon sustains bounded corpus workloads under soak/cancellation; owned durable jobs survive kill/disk-full and emit verified receipts; user qualification is digest-scoped; robot contract is frozen/self-describing; every divergence/rejection is ledgered; installer and either authorized public pull or sovereign local conversion are verified end-to-end.
+**Product (G5/G6/G7):** tasks graduate individually only with scorecards; batch daemon sustains bounded corpus workloads under soak/cancellation; owned durable jobs survive kill/disk-full and emit verified receipts; user qualification is digest-scoped; robot contract is frozen/self-describing; every divergence/rejection is ledgered. The sovereign path proves pinned source download → deterministic conversion → native packing → inference. When LG-1 permits it, the release path additionally proves deterministic split → remote inventory/re-download → fresh-machine installer → `fnlp pull` → no-flag discovery → identical inference, with a byte-perfect cache hit and no inference network on the second run.
 
 ---
 
@@ -1090,7 +1187,7 @@ Each phase: goals · key tasks · exit gates. Correctness before speed throughou
 | `$alien-graveyard` + `$alien-artifact-coding` | AA cards, composition budget, evidence artifacts, negative-results graveyard, deterministic fallbacks | §10.5–§10.6 |
 | `/extreme-software-optimization` LLM guidance + `focr` skill | the sibling's measured lessons (dispatch, autovec-vs-SDOT, ledger formats) | §3.2, §6 |
 | `/agent-ergonomics-…-cli-tools` + `/world-class-doctor-mode…` | the robot surface + doctor (Phase 6) | §8 |
-| `/release-preparations` + `/installer-workmanship` + `/gh-actions` | Phase 6 release train | §11 P6 |
+| `/cross-project-pattern-extraction` + `/installer-workmanship` + `/release-preparations` + `/gh-actions` | FrankenOCR-derived source/package/pull/installer invariants and the Phase 6 release train | §5.1, §5.6, §11 P2/P6 |
 | `/beads-br` + `/beads-workflow` + `bv --robot-*` | the work graph (below) | §15.2 |
 | `/cass` | mine the franken_ocr/frankensearch kernel sessions before each perf bead | §10 |
 
