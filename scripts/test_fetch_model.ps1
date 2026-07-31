@@ -32,6 +32,10 @@ function Stop-RedirectServer {
 function Start-RedirectServer([string]$RedirectHost) {
     $cert = Join-Path $Work 'redirect.crt'
     $key = Join-Path $Work 'redirect.key'
+    $caCert = Join-Path $Work 'redirect-ca.crt'
+    $caKey = Join-Path $Work 'redirect-ca.key'
+    $leafCsr = Join-Path $Work 'redirect.csr'
+    $leafConfig = Join-Path $Work 'redirect-openssl.cnf'
     $ready = Join-Path $Work 'redirect.ready'
     $serverScript = Join-Path $Work 'redirect_server.py'
     $serverCode = @'
@@ -116,26 +120,47 @@ threading.Thread(target=tls.serve_forever, daemon=True).start()
 proxy.serve_forever()
 '@
     Set-Content -LiteralPath $serverScript -NoNewline -Encoding utf8 -Value $serverCode
-    & openssl req -x509 -newkey rsa:2048 -nodes -keyout $key -out $cert -subj '/CN=localhost' -days 1 *> (Join-Path $Work 'openssl.log')
+    @"
+[req]
+distinguished_name = subject
+prompt = no
+
+[subject]
+CN = fnlp-fetch-fixture
+
+[v3_leaf]
+basicConstraints = critical,CA:false
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = @names
+
+[names]
+DNS.1 = huggingface.co
+DNS.2 = $RedirectHost
+"@ | Set-Content -LiteralPath $leafConfig -NoNewline -Encoding utf8
+    & openssl req -x509 -newkey rsa:2048 -nodes -keyout $caKey -out $caCert -subj '/CN=fnlp-fetch-fixture-ca' -days 1 *> (Join-Path $Work 'openssl.log')
+    if ($LASTEXITCODE -ne 0) { return $null }
+    & openssl req -new -newkey rsa:2048 -nodes -keyout $key -out $leafCsr -config $leafConfig *>> (Join-Path $Work 'openssl.log')
+    if ($LASTEXITCODE -ne 0) { return $null }
+    & openssl x509 -req -in $leafCsr -CA $caCert -CAkey $caKey -CAcreateserial -out $cert -days 1 -sha256 -extfile $leafConfig -extensions v3_leaf *>> (Join-Path $Work 'openssl.log')
     if ($LASTEXITCODE -ne 0) { return $null }
     $script:RedirectServer = Start-Process -FilePath python3 -ArgumentList @($serverScript, $Fixture, $cert, $key, $RedirectHost, $ready) -PassThru -RedirectStandardOutput (Join-Path $Work 'redirect.out') -RedirectStandardError (Join-Path $Work 'redirect.err')
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
         if (Test-Path -LiteralPath $ready) {
             $ports = (Get-Content -LiteralPath $ready -Raw).Trim().Split(' ')
-            if ($ports.Count -eq 2) { return [PSCustomObject]@{ ProxyPort = [int]$ports[0]; TlsPort = [int]$ports[1] } }
+            if ($ports.Count -eq 2) { return [PSCustomObject]@{ ProxyPort = [int]$ports[0]; TlsPort = [int]$ports[1]; CaCertificate = $caCert } }
         }
         Start-Sleep -Milliseconds 100
     }
     Stop-RedirectServer
     return $null
 }
-function Invoke-RedirectPolicyFetch([string]$Dest, [int]$ProxyPort) {
-    $names = @('FNLP_FETCH_ALLOW_TEST_REDIRECT_POLICY', 'FNLP_FETCH_TEST_ALLOW_INSECURE_TLS', 'HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'NO_PROXY')
+function Invoke-RedirectPolicyFetch([string]$Dest, [int]$ProxyPort, [string]$CaCertificate) {
+    $names = @('SSL_CERT_FILE', 'HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'NO_PROXY')
     $saved = @{}
     foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
     try {
-        $env:FNLP_FETCH_ALLOW_TEST_REDIRECT_POLICY = '1'
-        $env:FNLP_FETCH_TEST_ALLOW_INSECURE_TLS = '1'
+        $env:SSL_CERT_FILE = $CaCertificate
         $env:HTTPS_PROXY = "http://127.0.0.1:$ProxyPort"
         $env:HTTP_PROXY = "http://127.0.0.1:$ProxyPort"
         $env:ALL_PROXY = "http://127.0.0.1:$ProxyPort"
@@ -212,7 +237,7 @@ try {
     if ($status -eq 0) { Pass '9' 'check-only-no-model-skip' } else { Fail '9' "check-only-no-model-skip exit=$status" }
 
     $script:Cases++; $d10 = Join-Path $Work 'case10'; $accepted = Start-RedirectServer 'us.aws.cdn.hf.co'
-    if ($accepted -and (Invoke-RedirectPolicyFetch $d10 $accepted.ProxyPort) -eq 0 -and (Get-FileHash (Join-Path $d10 'alpha.bin') -Algorithm SHA256).Hash.ToLowerInvariant() -eq $alphaSha) {
+    if ($accepted -and (Invoke-RedirectPolicyFetch $d10 $accepted.ProxyPort $accepted.CaCertificate) -eq 0 -and (Get-FileHash (Join-Path $d10 'alpha.bin') -Algorithm SHA256).Hash.ToLowerInvariant() -eq $alphaSha) {
         Pass '10' 'regional-cdn-redirect-accepted'
     } else {
         Fail '10' 'regional-cdn-redirect-accepted'
@@ -221,8 +246,8 @@ try {
 
     $script:Cases++; $d11 = Join-Path $Work 'case11'; $rejected = Start-RedirectServer 'unlisted.invalid'; $case11Err = Join-Path $Work 'case11.err'
     if ($rejected) {
-        $status = Invoke-RedirectPolicyFetch $d11 $rejected.ProxyPort 2> $case11Err
-        if ($status -ne 0 -and (Get-Content -LiteralPath $case11Err -Raw) -match 'REDIRECT_HOST_REFUSED effective_url=https://unlisted.invalid/') { Pass '11' 'unlisted-redirect-refusal' } else { Fail '11' "unlisted-redirect-refusal exit=$status" }
+        $status = Invoke-RedirectPolicyFetch $d11 $rejected.ProxyPort $rejected.CaCertificate 2> $case11Err
+        if ($status -ne 0 -and -not (Test-Path -LiteralPath (Join-Path $d11 'alpha.bin')) -and (Get-Content -LiteralPath $case11Err -Raw) -match 'REDIRECT_HOST_REFUSED phase=post-transfer activation=refused effective_url=https://unlisted.invalid/') { Pass '11' 'unlisted-redirect-refusal' } else { Fail '11' "unlisted-redirect-refusal exit=$status" }
     } else {
         Fail '11' 'unlisted-redirect-server'
     }
