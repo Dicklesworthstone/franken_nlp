@@ -169,7 +169,12 @@ impl DiagnosticF32Matrix {
                 row,
                 rows: self.rows,
             })?;
-        let end = start + self.columns;
+        let end = start
+            .checked_add(self.columns)
+            .ok_or(DiagnosticF32Error::RowOutOfRange {
+                row,
+                rows: self.rows,
+            })?;
         self.values
             .get(start..end)
             .ok_or(DiagnosticF32Error::RowOutOfRange {
@@ -834,7 +839,12 @@ fn run_f32_layer(
     let mut query = layer.q_proj.matvec(&attention_norm, "q_proj")?;
     let mut key = layer.k_proj.matvec(&attention_norm, "k_proj")?;
     let value = layer.v_proj.matvec(&attention_norm, "v_proj")?;
-    let rope = DiagnosticF32RopeTables::new(position + 1, config.head_dim, config.rope_theta)?;
+    let table_positions = position
+        .checked_add(1)
+        .ok_or(DiagnosticF32Error::InvalidConfig(
+            "f32 RoPE position count overflow",
+        ))?;
+    let rope = DiagnosticF32RopeTables::new(table_positions, config.head_dim, config.rope_theta)?;
     rope.apply_all_heads(position, &mut query)?;
     rope.apply_all_heads(position, &mut key)?;
     cache.append(kv_slot, position, &key, &value)?;

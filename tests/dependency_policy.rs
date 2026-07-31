@@ -408,16 +408,17 @@ fn evaluate_policy(
     let mut dev_direct_roots = BTreeSet::new();
 
     for dependency in &root.dependencies {
+        let dependency_path = resolved_direct_dependency_path(metadata, root, dependency);
         if dependency.kind.as_deref() == Some("dev") {
             dev_direct_roots.insert(dependency.name.clone());
             continue;
         }
         if dependency.optional {
-            validate_direct_dependency(dependency, &root_label)?;
+            validate_direct_dependency(dependency, &dependency_path)?;
             continue;
         }
         release_direct_roots.insert(dependency.name.clone());
-        validate_direct_dependency(dependency, &root_label)?;
+        validate_direct_dependency(dependency, &dependency_path)?;
     }
 
     for required in COMMODITY_ROOTS {
@@ -542,13 +543,13 @@ fn validate_supply_chain_manifest(root: &Path, report: &PolicyReport) -> Result<
 
 fn validate_direct_dependency(
     dependency: &ManifestDependency,
-    root_label: &str,
+    dependency_path: &str,
 ) -> Result<(), PolicyFailure> {
     let name = dependency.name.as_str();
     if FORBIDDEN_DIRECT.contains(&name) || is_allocator_crate(name) {
         return Err(PolicyFailure {
             offending_crate: dependency.name.clone(),
-            full_path: format!("{root_label} -> {name}"),
+            full_path: dependency_path.to_owned(),
             detail: "named forbidden crate or allocator crate is a direct release dependency"
                 .to_owned(),
         });
@@ -556,18 +557,37 @@ fn validate_direct_dependency(
     if !COMMODITY_ROOTS.contains(&name) && !SUITE_ROOTS.contains(&name) {
         return Err(PolicyFailure {
             offending_crate: dependency.name.clone(),
-            full_path: format!("{root_label} -> {name}"),
+            full_path: dependency_path.to_owned(),
             detail: "direct release dependency is outside the three commodity families and pinned FrankenSuite".to_owned(),
         });
     }
     if SUITE_ROOTS.contains(&name) && !is_immutable_git_pin(dependency.source.as_deref()) {
         return Err(PolicyFailure {
             offending_crate: dependency.name.clone(),
-            full_path: format!("{root_label} -> {name}"),
+            full_path: dependency_path.to_owned(),
             detail: "FrankenSuite dependency is not pinned to an immutable Git revision".to_owned(),
         });
     }
     Ok(())
+}
+
+fn resolved_direct_dependency_path(
+    metadata: &Metadata,
+    root: &Package,
+    dependency: &ManifestDependency,
+) -> String {
+    let resolved_label = metadata
+        .resolve
+        .nodes
+        .iter()
+        .find(|node| node.id == root.id)
+        .into_iter()
+        .flat_map(|node| node.deps.iter())
+        .filter_map(|edge| package_by_id(metadata, &edge.pkg))
+        .find(|package| package.name == dependency.name)
+        .map(package_label)
+        .unwrap_or_else(|| dependency.name.clone());
+    format!("{} -> {resolved_label}", package_label(root))
 }
 
 fn is_allocator_crate(name: &str) -> bool {

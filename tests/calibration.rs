@@ -225,6 +225,18 @@ fn artifact_is_identity_bound_and_shift_or_expiry_never_stays_calibrated() {
     assert_eq!(shifted.calibration_state, CalibrationState::Uncalibrated);
     assert!(shifted.is_success());
     assert!(artifact.diagnostic_line().contains("locked_test_split="));
+    let expired_raw = artifact
+        .decide(
+            0.9,
+            0.8,
+            ValidityDate::new(2026, 8, 1).unwrap(),
+            ShiftAssessment::InDistribution,
+        )
+        .unwrap();
+    assert_eq!(
+        expired_raw.calibration_state,
+        CalibrationState::Uncalibrated
+    );
 
     let abstain_spec = CalibrationArtifactSpec::new(
         ["yes".to_owned(), "no".to_owned()],
@@ -237,17 +249,25 @@ fn artifact_is_identity_bound_and_shift_or_expiry_never_stays_calibrated() {
     .unwrap();
     let abstaining =
         CalibrationArtifact::new(&identity(abstain_spec.digest()), abstain_spec).unwrap();
-    let expired = abstaining
+    let shifted_to_abstention = abstaining
         .decide(
             0.9,
             0.8,
-            ValidityDate::new(2026, 8, 1).unwrap(),
-            ShiftAssessment::InDistribution,
+            ValidityDate::new(2026, 7, 20).unwrap(),
+            ShiftAssessment::Detected {
+                indicator: "label-prior-drift".to_owned(),
+            },
         )
         .unwrap();
-    assert_eq!(expired.status, StructuredTaskStatus::Abstained);
-    assert_eq!(expired.calibration_state, CalibrationState::Invalidated);
-    assert!(expired.is_success());
+    assert_eq!(
+        shifted_to_abstention.status,
+        StructuredTaskStatus::Abstained
+    );
+    assert_eq!(
+        shifted_to_abstention.calibration_state,
+        CalibrationState::Invalidated
+    );
+    assert!(shifted_to_abstention.is_success());
 
     eprintln!(
         "CALIBRATION RESULT=PASS split_digests={:?} artifact_key={} coverage_scope=locked_test",

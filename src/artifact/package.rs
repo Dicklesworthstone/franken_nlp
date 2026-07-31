@@ -629,7 +629,7 @@ fn validate_receipt_shape(receipt: &ModelAssetReceipt) -> Result<(), PackageErro
                 detail: format!("expected ordered part name {expected_name}"),
             });
         }
-        let expected_len = if index + 1 == receipt.parts.len() {
+        let expected_len = (if index + 1 == receipt.parts.len() {
             receipt.artifact_bytes.checked_sub(
                 receipt
                     .part_bytes
@@ -640,7 +640,7 @@ fn validate_receipt_shape(receipt: &ModelAssetReceipt) -> Result<(), PackageErro
             )
         } else {
             Some(receipt.part_bytes)
-        }
+        })
         .ok_or(PackageError::Arithmetic("part final bytes"))?;
         if part.bytes != expected_len || (expected_len == 0 && !receipt.parts.is_empty()) {
             return Err(PackageError::Integrity {
