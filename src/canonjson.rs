@@ -19,7 +19,7 @@ use std::error::Error;
 use std::fmt;
 
 use serde::Serialize;
-use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 
 /// Default maximum number of nested object or array containers accepted by a

@@ -136,6 +136,7 @@ def records() -> list[dict[str, Any]]:
             "gguf_name": gguf_name,
             "hf_name": hf_name,
             "layer": layer,
+            "merge": "none",
             "q4_k_m_source_rule": q4,
             "q8_0_source_rule": "Q8_0" if eligible else "UNQUANTIZED",
             "transform": transform,
@@ -163,6 +164,7 @@ def payloads() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], str]:
         "model": "Nanbeige4.2-3B",
         "model_revision": MODEL_REVISION,
         "official_llamacpp_revision": OFFICIAL_REVISION,
+        "conversion_command": "python3 llama.cpp/convert_hf_to_gguf.py <pinned-source-dir> --outfile <nanbeige4.2-3b-f56ec5a-q8_0.gguf> --outtype q8_0",
         "gguf_digests": [],
         "non_authority": "These are llama.cpp source-rule predictions and search seeds. They are not a forward-parity result, artifact evidence, or an approved FrankenNLP quantization recipe.",
         "source_evidence": source_evidence(),
@@ -246,6 +248,13 @@ def check() -> None:
         raise AuditError(f"expected 201 records, got {len(audit_records)}")
     if len({item["hf_name"] for item in audit_records}) != 201 or len({item["gguf_name"] for item in audit_records}) != 201:
         raise AuditError("mapping has duplicate source or GGUF names")
+    for record in audit_records:
+        log(
+            "MAP "
+            f"hf={record['hf_name']} gguf={record['gguf_name']} "
+            f"transform={record['transform']} merge={record['merge']} "
+            f"q8={record['q8_0_source_rule']} q4km={record['q4_k_m_source_rule']}"
+        )
     census_result = verify_census(audit_records)
     digest = hashlib.sha256(canonical(expected_mapping)).hexdigest()
     log(f"RESULT=PASS tensors=201 census={census_result} mapping_sha256={digest}")
