@@ -1,0 +1,1 @@
+//! Bounded text utility primitives.

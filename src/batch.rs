@@ -1,0 +1,1 @@
+//! Bounded batch-daemon surface.

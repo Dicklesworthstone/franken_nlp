@@ -1,0 +1,1 @@
+//! Bounded interactive chat surface.

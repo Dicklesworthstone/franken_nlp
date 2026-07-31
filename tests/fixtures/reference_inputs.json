@@ -1,0 +1,94 @@
+{
+  "prompts": [
+    "The two-pass loop is explicit.",
+    "Return a concise trace label.",
+    "A multilingual fixture: cafe, ¡hola!, Привет, 你好."
+  ],
+  "tokenizer_cases": [
+    {
+      "id": "ascii-whitespace",
+      "text": "alpha  beta\n gamma\t"
+    },
+    {
+      "id": "multilingual",
+      "text": "Français · 日本語 · عربي"
+    },
+    {
+      "id": "code-punctuation",
+      "text": "fn trace(slot: usize) -> bool { slot == 43 }"
+    },
+    {
+      "id": "marker-literals",
+      "text": "<|im_start|> <think> </think> <tool_call>"
+    }
+  ],
+  "template_cases": [
+    {
+      "id": "system-default-no-think",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Answer concisely."
+        },
+        {
+          "role": "user",
+          "content": "Name the loop boundary."
+        }
+      ],
+      "options": {
+        "add_generation_prompt": true,
+        "enable_thinking": false
+      }
+    },
+    {
+      "id": "thinking-preserved",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Explain one invariant."
+        },
+        {
+          "role": "assistant",
+          "content": "The final norm feeds loop two."
+        }
+      ],
+      "options": {
+        "add_generation_prompt": false,
+        "enable_thinking": true,
+        "preserve_thinking": true
+      }
+    },
+    {
+      "id": "tool-json",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call a fixture tool."
+        }
+      ],
+      "options": {
+        "add_generation_prompt": true,
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "fixture_lookup",
+              "description": "Return a deterministic fixture value.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "key": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "key"
+                ]
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

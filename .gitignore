@@ -29,3 +29,10 @@ Thumbs.db
 
 # bv (beads viewer) local config and caches
 .bv/
+
+# Untracked workstation-only dependency/source overrides and fixture caches.
+/.cargo/config.local.toml
+/Cargo.local.toml
+/docs/truth-pack/local/
+/tests/fixtures/cache/
+/tests/fixtures/local/

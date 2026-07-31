@@ -1,0 +1,42 @@
+[package]
+name = "franken_nlp"
+version = "0.1.0"
+edition = "2024"
+license-file = "LICENSE"
+description = "Pure-Rust, CPU-first Nanbeige4.2-3B NLP toolbox"
+readme = "README.md"
+repository = "https://github.com/Dicklesworthstone/franken_nlp"
+autobins = false
+
+[[bin]]
+name = "franken_nlp"
+path = "src/main.rs"
+
+[[bin]]
+name = "fnlp"
+path = "src/bin/fnlp.rs"
+
+[features]
+default = []
+asupersync-runtime = ["dep:asupersync"]
+frankentorch-leaves = ["dep:ft-core", "dep:ft-kernel-cpu", "dep:ft-serialize"]
+metadata-store = ["dep:fsqlite", "dep:fsqlite-types"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+# The release default does not select the currently Rayon-backed kernel surface.
+# franken_nlp-xmx replaces this pin with the reviewed no-Rayon leaf surface.
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync.git", rev = "362dc5b174427f66cfa76ab2bdd68cce1a95c6cc", default-features = false, features = ["tls-webpki-roots"], optional = true }
+ft-core = { git = "https://github.com/Dicklesworthstone/frankentorch.git", rev = "523aaf827faf538aa541126ee222fcd7af348410", package = "ft-core", optional = true }
+ft-kernel-cpu = { git = "https://github.com/Dicklesworthstone/frankentorch.git", rev = "523aaf827faf538aa541126ee222fcd7af348410", package = "ft-kernel-cpu", optional = true }
+ft-serialize = { git = "https://github.com/Dicklesworthstone/frankentorch.git", rev = "523aaf827faf538aa541126ee222fcd7af348410", package = "ft-serialize", optional = true }
+fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite.git", rev = "5676cb97486a62c4f0a19c053184e0ff3cfb2852", package = "fsqlite", optional = true }
+fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite.git", rev = "5676cb97486a62c4f0a19c053184e0ff3cfb2852", package = "fsqlite-types", optional = true }
+
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
