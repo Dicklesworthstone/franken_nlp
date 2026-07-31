@@ -9,7 +9,8 @@ use franken_nlp::{
     artifact::{
         format::{
             ArchTarget, CanonicalDtype, FnlpqWriterInput, PackingSetInput, SectionKind,
-            SectionPayload, SectionRange, TensorInput, encode_f32_scales, framed_sha256_hex, write,
+            SectionPayload, SectionRange, TensorInput, encode_f32_scales, framed_sha256_hex,
+            logical_model_sha256, logical_tensor_sha256, write,
         },
         reader::FnlpqArtifact,
     },
@@ -82,22 +83,40 @@ fn test_model_bytes() -> &'static [u8] {
 
 fn synthetic_artifact(tokenizer_model: Vec<u8>) -> FnlpqArtifact {
     let scales = encode_f32_scales(&[0.5]).expect("finite synthetic scale");
+    let payload = vec![0x80, 0x3f, 0x00, 0x40];
+    let row_sums = 0_i32.to_le_bytes().to_vec();
+    let tensor_digest = logical_tensor_sha256(
+        "model.embed_tokens.weight",
+        "bf16",
+        &[2],
+        "bf16-verbatim-v1",
+        &payload,
+        &scales,
+        &row_sums,
+    )
+    .expect("synthetic tensor identity");
+    let logical_model_digest = logical_model_sha256(
+        &[tensor_digest],
+        &[
+            ("model_config", br#"{"hidden_size":2}"#.as_slice()),
+            ("tokenizer_model", tokenizer_model.as_slice()),
+            ("tokenizer_config", br#"{"bos_token":"<s>"}"#.as_slice()),
+            ("chat_template", b"{{ message }}".as_slice()),
+        ],
+    )
+    .expect("synthetic logical-model identity");
     let input = FnlpqWriterInput {
         model_id: "Nanbeige4.2-3B".to_owned(),
         revision: "f56ec5a9650268aa098496734743c25ea778bd2d".to_owned(),
         recipe_id: "cli-tokens-prewrite-v1".to_owned(),
         source_root_sha256: framed_sha256_hex("fnlpq-source-root-v1", &[b"cli token test"])
             .expect("valid source identity"),
-        logical_model_sha256: framed_sha256_hex(
-            "fnlpq-logical-model-v1",
-            &[b"cli token logical model"],
-        )
-        .expect("valid model identity"),
+        logical_model_sha256: hex_lower(&logical_model_digest),
         sections: vec![
             SectionPayload::new(
                 "generic-payload",
                 SectionKind::GenericTensorPayload,
-                vec![0x80, 0x3f, 0x00, 0x40],
+                payload,
                 64,
             ),
             SectionPayload::new(
@@ -109,7 +128,7 @@ fn synthetic_artifact(tokenizer_model: Vec<u8>) -> FnlpqArtifact {
             SectionPayload::new(
                 "generic-row-sums",
                 SectionKind::GenericTensorRowSums,
-                0_i32.to_le_bytes().to_vec(),
+                row_sums,
                 8,
             ),
             SectionPayload::new(
@@ -147,11 +166,7 @@ fn synthetic_artifact(tokenizer_model: Vec<u8>) -> FnlpqArtifact {
             name: "model.embed_tokens.weight".to_owned(),
             canonical_dtype: CanonicalDtype::Bf16,
             shape: vec![2],
-            canonical_logical_sha256: framed_sha256_hex(
-                "fnlpq-logical-tensor-v1",
-                &[b"model.embed_tokens.weight", &[0x80, 0x3f, 0x00, 0x40]],
-            )
-            .expect("valid tensor identity"),
+            canonical_logical_sha256: hex_lower(&tensor_digest),
             quantization: "bf16-verbatim-v1".to_owned(),
             data: SectionRange::new("generic-payload", 0, 4),
             scale: SectionRange::new("generic-scales", 0, 4),
@@ -169,6 +184,10 @@ fn synthetic_artifact(tokenizer_model: Vec<u8>) -> FnlpqArtifact {
     };
     let written = write(&input).expect("synthetic artifact writes");
     FnlpqArtifact::from_bytes(written.bytes).expect("synthetic artifact reads")
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[test]
