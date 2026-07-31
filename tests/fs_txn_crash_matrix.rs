@@ -283,6 +283,34 @@ fn append_refuses_an_existing_fork_without_mutating_forensic_records() {
 }
 
 #[test]
+fn append_ignores_a_disconnected_record_and_starts_the_unique_genesis_chain() {
+    let mut journal = SimulatedActivationJournal::new();
+    let orphan = ActivationRecord::new(ActivationRecordBody::from_retained_parts(
+        7,
+        digest(1),
+        digest(2),
+        digest(3),
+        Some(digest(4)),
+    ));
+    let orphan_digest = orphan.record_digest();
+    journal.retain_recovery_fixture(orphan).unwrap();
+
+    let genesis = journal.append(digest(5), digest(6), digest(7)).unwrap();
+    assert_eq!(genesis.sequence(), 0);
+    let discovery = journal.discover().unwrap();
+    assert_eq!(discovery.head.as_ref().map(|head| head.digest()), Some(genesis.digest()));
+    assert!(discovery.walk.iter().any(|entry| {
+        entry.digest == orphan_digest && entry.verdict == ChainWalkVerdict::IgnoredDisconnected
+    }));
+    assert_eq!(
+        journal.records().len(),
+        2,
+        "the orphan remains available for quarantine or forensic inspection"
+    );
+    log_walk("append-ignores-disconnected-record", "PASS", &journal);
+}
+
+#[test]
 fn fork_walk_is_stable_across_retained_record_order() {
     let genesis = ActivationRecord::new(ActivationRecordBody::genesis(
         digest(1),
