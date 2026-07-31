@@ -6,6 +6,8 @@
 //! asupersync revision so verdicts are observations, not memory.
 #[path = "g0/asupersync_census/compile_fail.rs"]
 mod compile_fail;
+#[path = "g0/asupersync_census/explorer_tla.rs"]
+mod explorer_tla;
 #[path = "g0/asupersync_census/gen_server_semantics.rs"]
 mod gen_server_semantics;
 #[path = "g0/asupersync_census/lab_determinism.rs"]
