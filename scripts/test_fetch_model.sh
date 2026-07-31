@@ -64,7 +64,27 @@ run_fetch() {
 start_redirect_server() {
     redirect_host=$1
     TLS_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
-    if ! openssl req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/redirect.key" -out "$WORK/redirect.crt" -subj /CN=localhost -days 1 > "$WORK/openssl.log" 2>&1; then
+    cat > "$WORK/redirect-openssl.cnf" <<EOF
+[req]
+distinguished_name = subject
+prompt = no
+
+[subject]
+CN = fnlp-fetch-fixture
+
+[v3_leaf]
+basicConstraints = critical,CA:false
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = @names
+
+[names]
+DNS.1 = huggingface.co
+DNS.2 = $redirect_host
+EOF
+    if ! openssl req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/redirect-ca.key" -out "$WORK/redirect-ca.crt" -subj /CN=fnlp-fetch-fixture-ca -days 1 > "$WORK/openssl.log" 2>&1 ||
+        ! openssl req -new -newkey rsa:2048 -nodes -keyout "$WORK/redirect.key" -out "$WORK/redirect.csr" -config "$WORK/redirect-openssl.cnf" >> "$WORK/openssl.log" 2>&1 ||
+        ! openssl x509 -req -in "$WORK/redirect.csr" -CA "$WORK/redirect-ca.crt" -CAkey "$WORK/redirect-ca.key" -CAcreateserial -out "$WORK/redirect.crt" -days 1 -sha256 -extfile "$WORK/redirect-openssl.cnf" -extensions v3_leaf >> "$WORK/openssl.log" 2>&1; then
         return 1
     fi
     FIXTURE_ROOT="$FIXTURE" REDIRECT_HOST="$redirect_host" TLS_PORT="$TLS_PORT" TLS_CERT="$WORK/redirect.crt" TLS_KEY="$WORK/redirect.key" python3 -c '
@@ -126,10 +146,15 @@ run_redirect_policy_fetch() {
     output=$3
     error=$4
     start_redirect_server "$redirect_host" || return 1
+    wrapper_dir="$WORK/redirect-curl-bin-$redirect_host"
+    mkdir -p "$wrapper_dir"
+    cat > "$wrapper_dir/curl" <<EOF
+#!/bin/sh
+exec "$REAL_CURL" --connect-to "huggingface.co:443:127.0.0.1:$TLS_PORT" --connect-to "$redirect_host:443:127.0.0.1:$TLS_PORT" --cacert "$WORK/redirect-ca.crt" "\$@"
+EOF
+    chmod 700 "$wrapper_dir/curl"
     HTTPS_PROXY= https_proxy= HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
-        FNLP_FETCH_ALLOW_TEST_REDIRECT_POLICY=1 \
-        FNLP_FETCH_TEST_CONNECT_TO_1="huggingface.co:443:127.0.0.1:$TLS_PORT" \
-        FNLP_FETCH_TEST_CONNECT_TO_2="$redirect_host:443:127.0.0.1:$TLS_PORT" \
+        PATH="$wrapper_dir:$PATH" \
         "$FETCH" --dest "$dest" --catalog "$CATALOG" > "$output" 2> "$error"
     status=$?
     stop_redirect_server
@@ -194,11 +219,11 @@ if FNLP_FETCH_ALLOW_TEST_BASE_URL=1 "$FETCH" --dest "$DEST9" --catalog "$CATALOG
 CASES=$((CASES + 1)); DEST10="$WORK/case10"
 if run_redirect_policy_fetch us.aws.cdn.hf.co "$DEST10" "$WORK/case10.out" "$WORK/case10.err" && cmp "$FIXTURE/alpha.bin" "$DEST10/alpha.bin" >/dev/null && cmp "$FIXTURE/beta.bin" "$DEST10/beta.bin" >/dev/null; then pass_case 10 regional-cdn-redirect-accepted; else fail_case 10 regional-cdn-redirect-accepted; fi
 
-# 11. The same hermetic hop refuses a final redirect outside the explicit allowlist.
+# 11. An unlisted final URL is post-transfer refused and never activated.
 CASES=$((CASES + 1)); DEST11="$WORK/case11"
 if run_redirect_policy_fetch unlisted.invalid "$DEST11" "$WORK/case11.out" "$WORK/case11.err"; then
     fail_case 11 unlisted-redirect-refusal
-elif grep -q 'REDIRECT_HOST_REFUSED effective_url=https://unlisted.invalid/' "$WORK/case11.err"; then
+elif [ ! -e "$DEST11/alpha.bin" ] && grep -q 'REDIRECT_HOST_REFUSED phase=post-transfer activation=refused effective_url=https://unlisted.invalid/' "$WORK/case11.err"; then
     pass_case 11 unlisted-redirect-refusal
 else
     fail_case 11 unlisted-redirect-refusal
