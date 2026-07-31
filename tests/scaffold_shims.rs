@@ -1,12 +1,14 @@
 use std::process::Command;
 
-const LONG_SHIM: &str = "fn main() -> std::process::ExitCode { franken_nlp::cli_main() }\n";
-const SHORT_SHIM: &str = "fn main() -> std::process::ExitCode { franken_nlp::cli_main() }\n";
+const CRATE_ROOT_DENY_AND_SHIM: &str = concat!(
+    "#![deny(unsafe_code)]\n\n",
+    "fn main() -> std::process::ExitCode { franken_nlp::cli_main() }\n",
+);
 
 #[test]
 fn both_bins_are_distinct_one_line_shims() {
-    assert_eq!(include_str!("../src/main.rs"), LONG_SHIM);
-    assert_eq!(include_str!("../src/bin/fnlp.rs"), SHORT_SHIM);
+    assert_eq!(include_str!("../src/main.rs"), CRATE_ROOT_DENY_AND_SHIM);
+    assert_eq!(include_str!("../src/bin/fnlp.rs"), CRATE_ROOT_DENY_AND_SHIM);
 }
 
 #[test]
