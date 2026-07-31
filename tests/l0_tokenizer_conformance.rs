@@ -65,11 +65,11 @@ fn l0_synthetic_merge_rows_log_exact_digests() {
         let got_ids = tokenizer.encode_ids(input).expect("toy input encodes");
         let expected = expected_ids
             .iter()
-            .flat_map(|id| id.to_le_bytes())
+            .flat_map(|id| (*id).to_le_bytes())
             .collect::<Vec<_>>();
         let got = got_ids
             .iter()
-            .flat_map(|id| id.to_le_bytes())
+            .flat_map(|id| (*id).to_le_bytes())
             .collect::<Vec<_>>();
         eprintln!(
             "L0 corpus=synthetic RESULT={} lines=1 input_sha256={} expected_ids_sha256={} got_ids_sha256={}",
