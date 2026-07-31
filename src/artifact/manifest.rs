@@ -306,15 +306,12 @@ impl ReleaseManifest {
             &self.manifest_schema,
         )?;
         expect_identifier("model-id", "/model_id", &self.model_id)?;
-        expect_lower_sha256("source-revision", "/source_revision", &self.source_revision)?;
-        if self.source_revision.len() != 40 {
-            return Err(ManifestError::new(
-                "source-revision",
-                "/source_revision",
-                "40 lowercase hexadecimal revision characters",
-                self.source_revision.clone(),
-            ));
-        }
+        expect_lower_hex(
+            "source-revision",
+            "/source_revision",
+            &self.source_revision,
+            40,
+        )?;
         expect_identifier("artifact-id", "/artifact_id", &self.artifact_id)?;
         expect_identifier("release-tag", "/release_tag", &self.release_tag)?;
         if matches!(self.release_tag.as_str(), "main" | "latest") {
@@ -642,21 +639,21 @@ impl EmbeddedReleaseManifest {
     /// Bind compile-time bytes to the independently recorded manifest digest.
     pub fn new(
         bytes: &'static [u8],
-        release_manifest_sha256: &'static str,
+        expected_release_manifest_sha256: &'static str,
     ) -> Result<Self, ManifestError> {
         let actual = release_manifest_sha256(bytes);
-        if actual != release_manifest_sha256 {
+        if actual != expected_release_manifest_sha256 {
             return Err(ManifestError::new(
                 "embedded-manifest-digest",
                 "$",
-                release_manifest_sha256,
+                expected_release_manifest_sha256,
                 actual,
             ));
         }
         ReleaseManifest::parse(bytes)?;
         Ok(Self {
             bytes,
-            release_manifest_sha256,
+            release_manifest_sha256: expected_release_manifest_sha256,
         })
     }
 
@@ -726,11 +723,12 @@ fn expect_basename(
     pointer: impl Into<String>,
     value: &str,
 ) -> Result<(), ManifestError> {
-    expect_identifier(invariant, pointer, value)?;
+    let pointer = pointer.into();
+    expect_identifier(invariant, &pointer, value)?;
     if value == "." || value == ".." || value.starts_with('.') {
         return Err(ManifestError::new(
             invariant,
-            "$",
+            pointer,
             "a non-hidden single-component portable filename",
             value,
         ));
@@ -743,7 +741,16 @@ fn expect_lower_sha256(
     pointer: impl Into<String>,
     value: &str,
 ) -> Result<(), ManifestError> {
-    if value.len() == 64
+    expect_lower_hex(invariant, pointer, value, 64)
+}
+
+fn expect_lower_hex(
+    invariant: &'static str,
+    pointer: impl Into<String>,
+    value: &str,
+    width: usize,
+) -> Result<(), ManifestError> {
+    if value.len() == width
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
@@ -753,7 +760,7 @@ fn expect_lower_sha256(
         Err(ManifestError::new(
             invariant,
             pointer,
-            "64 lowercase hexadecimal SHA-256 characters",
+            format!("{width} lowercase hexadecimal characters"),
             value,
         ))
     }

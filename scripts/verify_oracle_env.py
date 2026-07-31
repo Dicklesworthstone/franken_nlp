@@ -152,7 +152,11 @@ def verify_record(record: dict[str, Any]) -> None:
         raise OracleFailure(
             f"closure package digest mismatch expected={expected_freeze_sha} observed={observed_freeze_sha}"
         )
-    required_names = {"torch", "transformers", "sentencepiece"}
+    # Transformers 4.51's eager `from_pretrained` path constructs models under
+    # `accelerate.init_empty_weights`; omitting it from a hash-locked,
+    # `--no-deps` closure leaves a late NameError at the smoke gate instead of
+    # an actionable closure-validation failure.
+    required_names = {"accelerate", "torch", "transformers", "sentencepiece"}
     if not required_names <= set(packages):
         raise OracleFailure("closure must pin torch, transformers, and sentencepiece")
     if closure.get("platform") != "macos-arm64" or closure.get("python") != "CPython 3.11":
