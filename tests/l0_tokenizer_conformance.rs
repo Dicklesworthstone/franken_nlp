@@ -4,7 +4,7 @@
 //! SentencePiece model and frozen slow-reference IDs exercise the one-model
 //! vocabulary without making a model-weight artifact a test prerequisite.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use franken_nlp::native_engine::lmhead::NANBEIGE_VOCAB_SIZE;
 use franken_nlp::tokenizer::{
@@ -26,6 +26,8 @@ const PINNED_MODEL_CONFIG_SHA256: &str =
 const PINNED_TOKENIZER_CONFIG: &[u8] = include_bytes!("fixtures/reference/tokenizer_config.json");
 const PINNED_TOKENIZER_CONFIG_SHA256: &str =
     "3edfa64a0826a77e9412b9008f1febf3fe906a68fd616b6de4cd15897a8c8518";
+const PINNED_FAST_TOKENIZER_JSON_SHA256: &str =
+    "1d858a0fc007f22af6ae18bfa1ae52d30e398aa9cd1ea06e7777176869346a3f";
 const REFERENCE_AUXILIARY: &str = include_str!("fixtures/reference/auxiliary.json");
 const REFERENCE_INPUTS: &str = include_str!("fixtures/reference_inputs.json");
 
@@ -37,6 +39,7 @@ const PADDED_EMBEDDING_ROWS: usize = 37;
 #[derive(Deserialize)]
 struct ReferenceInputs {
     tokenizer_cases: Vec<ReferenceInputCase>,
+    fast_slow_tokenizer_cases: Vec<ReferenceInputCase>,
 }
 
 #[derive(Deserialize)]
@@ -48,6 +51,9 @@ struct ReferenceInputCase {
 #[derive(Deserialize)]
 struct AuxiliaryFixtures {
     tokenizer_cases: Vec<SlowTokenizerCase>,
+    fast_tokenizer_class: String,
+    fast_tokenizer_json_sha256: String,
+    fast_slow_tokenizer_cases: Vec<FastSlowTokenizerCase>,
 }
 
 #[derive(Deserialize)]
@@ -56,6 +62,18 @@ struct SlowTokenizerCase {
     input_sha256: String,
     token_ids: Vec<u32>,
     token_ids_sha256: String,
+}
+
+#[derive(Deserialize)]
+struct FastSlowTokenizerCase {
+    id: String,
+    input_sha256: String,
+    slow_token_ids: Vec<u32>,
+    slow_token_ids_sha256: String,
+    fast_token_ids: Vec<u32>,
+    fast_token_ids_sha256: String,
+    relation: String,
+    first_diverging_index: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -303,6 +321,16 @@ fn pinned_slow_reference_vocabulary_is_token_id_exact() {
         SP_PIECE_COUNT,
         "the SentencePiece file owns exactly the base-ID range"
     );
+    let byte_piece_ids = model
+        .pieces
+        .iter()
+        .enumerate()
+        .filter_map(|(index, piece)| {
+            (piece.piece_type == PieceType::Byte).then_some(
+                u32::try_from(index).expect("pinned SentencePiece piece indices fit in u32"),
+            )
+        })
+        .collect::<BTreeSet<_>>();
 
     let added_by_surface: BTreeMap<String, u32> = serde_json::from_slice(PINNED_ADDED_TOKENS)
         .expect("the hash-checked pinned added-token registry is valid JSON");
@@ -430,6 +458,71 @@ fn pinned_slow_reference_vocabulary_is_token_id_exact() {
     let fixtures: AuxiliaryFixtures =
         serde_json::from_str(REFERENCE_AUXILIARY).expect("slow tokenizer fixture JSON is valid");
 
+    let required_slow_case_ids = ["emoji-zwj", "byte-fallback-only", "long-run-whitespace"];
+    for required_id in required_slow_case_ids {
+        assert!(
+            inputs
+                .tokenizer_cases
+                .iter()
+                .any(|candidate| candidate.id == required_id),
+            "L0 slow-reference corpus is missing required adversarial class case={required_id}"
+        );
+    }
+    let emoji_zwj = inputs
+        .tokenizer_cases
+        .iter()
+        .find(|candidate| candidate.id == "emoji-zwj")
+        .expect("required emoji/ZWJ case exists");
+    assert!(
+        emoji_zwj.text.contains("👨‍👩‍👧‍👦")
+            && emoji_zwj.text.contains("👍🏽")
+            && emoji_zwj.text.contains("👩🏽‍💻"),
+        "emoji/ZWJ case must retain family, skin-tone, and ZWJ-chain coverage"
+    );
+    let byte_fallback_only = inputs
+        .tokenizer_cases
+        .iter()
+        .find(|candidate| candidate.id == "byte-fallback-only")
+        .expect("required byte-fallback case exists");
+    assert_eq!(
+        byte_fallback_only.text.as_bytes(),
+        &[0x01, 0x02, 0x7f],
+        "byte-fallback case must use source bytes with no ordinary text-piece coverage"
+    );
+    let long_whitespace = inputs
+        .tokenizer_cases
+        .iter()
+        .find(|candidate| candidate.id == "long-run-whitespace")
+        .expect("required long-whitespace case exists");
+    assert!(
+        long_whitespace.text.chars().count() >= 100
+            && long_whitespace.text.contains(' ')
+            && long_whitespace.text.contains('\t')
+            && long_whitespace.text.contains('\n'),
+        "long-whitespace case must contain at least 100 mixed spaces, tabs, and newlines"
+    );
+    assert_eq!(
+        fixtures.fast_tokenizer_class, "LlamaTokenizerFast",
+        "fast-vs-slow corpus must name the tokenizer.json-backed fast encoder"
+    );
+    assert_eq!(
+        fixtures.fast_tokenizer_json_sha256, PINNED_FAST_TOKENIZER_JSON_SHA256,
+        "fast-vs-slow corpus must remain bound to the pinned tokenizer.json bytes"
+    );
+    let required_fast_slow_case_ids = [
+        "fast-slow-ascii-agreement",
+        "fast-slow-long-whitespace-divergence",
+    ];
+    for required_id in required_fast_slow_case_ids {
+        assert!(
+            inputs
+                .fast_slow_tokenizer_cases
+                .iter()
+                .any(|candidate| candidate.id == required_id),
+            "L0 fast-vs-slow corpus is missing required named case={required_id}"
+        );
+    }
+
     let mut mismatches = 0_usize;
     for fixture in fixtures.tokenizer_cases {
         let input = inputs
@@ -464,6 +557,15 @@ fn pinned_slow_reference_vocabulary_is_token_id_exact() {
             "encoder emitted an unassigned alignment-padding id for case={}",
             fixture.id
         );
+        if fixture.id == "byte-fallback-only" {
+            assert!(
+                fixture.token_ids.len() > 1
+                    && fixture.token_ids[1..]
+                        .iter()
+                        .all(|id| byte_piece_ids.contains(id)),
+                "byte-fallback-only fixture must leave the dummy prefix followed only by BYTE-piece ids"
+            );
+        }
         if got != fixture.token_ids {
             mismatches += 1;
             let index = got
@@ -497,12 +599,128 @@ fn pinned_slow_reference_vocabulary_is_token_id_exact() {
             canonical_id_digest(&got),
         );
     }
+    let mut fast_slow_mismatches = 0_usize;
+    let mut fast_slow_agreements = 0_usize;
+    let mut fast_slow_divergences = 0_usize;
+    let mut fast_slow_seen_case_ids = BTreeSet::new();
+    for fixture in fixtures.fast_slow_tokenizer_cases {
+        assert!(
+            fast_slow_seen_case_ids.insert(fixture.id.clone()),
+            "fast-vs-slow fixture has duplicate id={}",
+            fixture.id
+        );
+        let input = inputs
+            .fast_slow_tokenizer_cases
+            .iter()
+            .find(|candidate| candidate.id == fixture.id)
+            .expect("every fast-vs-slow row has a repository-authored input");
+        assert_eq!(
+            digest_hex(input.text.as_bytes()),
+            fixture.input_sha256,
+            "fast-vs-slow fixture input digest drifted for case={}",
+            fixture.id
+        );
+        assert_eq!(
+            canonical_id_digest(&fixture.slow_token_ids),
+            fixture.slow_token_ids_sha256,
+            "slow token-ID digest drifted for fast-vs-slow case={}",
+            fixture.id
+        );
+        assert_eq!(
+            canonical_id_digest(&fixture.fast_token_ids),
+            fixture.fast_token_ids_sha256,
+            "fast token-ID digest drifted for fast-vs-slow case={}",
+            fixture.id
+        );
+        let first_diverging_index = fixture
+            .slow_token_ids
+            .iter()
+            .zip(&fixture.fast_token_ids)
+            .position(|(slow_id, fast_id)| slow_id != fast_id)
+            .or_else(|| {
+                (fixture.slow_token_ids.len() != fixture.fast_token_ids.len()).then_some(
+                    fixture
+                        .slow_token_ids
+                        .len()
+                        .min(fixture.fast_token_ids.len()),
+                )
+            });
+        let observed_relation = if first_diverging_index.is_none() {
+            "agreement"
+        } else {
+            "divergence"
+        };
+        assert_eq!(
+            fixture.relation, observed_relation,
+            "fast-vs-slow relation must be explicit and match frozen vectors for case={}",
+            fixture.id
+        );
+        assert_eq!(
+            fixture.first_diverging_index, first_diverging_index,
+            "fast-vs-slow divergence index must be frozen exactly for case={}",
+            fixture.id
+        );
+        match observed_relation {
+            "agreement" => fast_slow_agreements += 1,
+            "divergence" => fast_slow_divergences += 1,
+            _ => unreachable!("fast-vs-slow relation is constructed from two cases"),
+        }
+
+        let got = tokenizer
+            .encode_ids_with_options(
+                &input.text,
+                EncodeOptions {
+                    add_bos: false,
+                    add_eos: false,
+                },
+            )
+            .expect("pinned slow-reference text must encode");
+        if got != fixture.slow_token_ids {
+            fast_slow_mismatches += 1;
+            eprintln!(
+                "L0 corpus=fast-vs-slow case={} RESULT=FAIL canonical=slow relation={} input={:?} input_sha256={} expected_slow_token_ids={:?} observed_token_ids={:?} frozen_fast_token_ids={:?}",
+                fixture.id,
+                fixture.relation,
+                input.text,
+                fixture.input_sha256,
+                fixture.slow_token_ids,
+                got,
+                fixture.fast_token_ids,
+            );
+            continue;
+        }
+        eprintln!(
+            "L0 corpus=fast-vs-slow case={} RESULT=PASS canonical=slow relation={} input_sha256={} slow_ids_sha256={} fast_ids_sha256={}",
+            fixture.id,
+            fixture.relation,
+            fixture.input_sha256,
+            fixture.slow_token_ids_sha256,
+            fixture.fast_token_ids_sha256,
+        );
+    }
+    assert_eq!(
+        fast_slow_seen_case_ids,
+        BTreeSet::from([
+            "fast-slow-ascii-agreement".to_owned(),
+            "fast-slow-long-whitespace-divergence".to_owned(),
+        ]),
+        "fast-vs-slow corpus must retain its named agreement and divergence cases"
+    );
+    assert!(
+        fast_slow_agreements > 0 && fast_slow_divergences > 0,
+        "fast-vs-slow corpus must freeze at least one agreement and one divergence while slow remains canonical"
+    );
+    let total_mismatches = mismatches + fast_slow_mismatches;
     eprintln!(
-        "L0_TOKENIZER RESULT={} scope=slow-reference mismatches={mismatches}",
-        if mismatches == 0 { "PASS" } else { "FAIL" }
+        "L0_TOKENIZER RESULT={} scope=slow-reference+fast-vs-slow slow_reference_mismatches={mismatches} fast_slow_mismatches={fast_slow_mismatches} fast_slow_agreements={fast_slow_agreements} fast_slow_divergences={fast_slow_divergences}",
+        if total_mismatches == 0 {
+            "PASS"
+        } else {
+            "FAIL"
+        }
     );
     assert_eq!(
-        mismatches, 0,
-        "slow-reference corpus must be token-id exact"
+        total_mismatches, 0,
+        "slow-reference corpus must be token-id exact across the direct and fast-vs-slow legs"
     );
 }

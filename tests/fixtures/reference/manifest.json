@@ -1,7 +1,7 @@
 {
   "auxiliary": {
     "relative_path": "auxiliary.json",
-    "sha256": "58708afaecebd4c8e6b251290b5ed6818228f89ed2eb5a8e0dcc165fad64b1a4"
+    "sha256": "bfb7bb62e87c177d7f7628775b1ed4006dd3e5a2cb658695c49127e6a519188d"
   },
   "corpus_sha256": "8e92bfaf4c602f28cd5d75305afaba810a32cd857efa9878a7ae1074c71eed40",
   "fixtures": [

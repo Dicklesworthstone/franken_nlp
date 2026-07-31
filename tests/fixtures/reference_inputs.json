@@ -24,6 +24,28 @@
     {
       "id": "marker-literals",
       "text": "<|im_start|> <think> </think> <tool_call>"
+    },
+    {
+      "id": "emoji-zwj",
+      "text": "family 👨‍👩‍👧‍👦 skin 👍🏽 chain 👩🏽‍💻"
+    },
+    {
+      "id": "byte-fallback-only",
+      "text": "\u0001\u0002\u007f"
+    },
+    {
+      "id": "long-run-whitespace",
+      "text": " \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n"
+    }
+  ],
+  "fast_slow_tokenizer_cases": [
+    {
+      "id": "fast-slow-ascii-agreement",
+      "text": "plain ASCII words, commas, and 42."
+    },
+    {
+      "id": "fast-slow-long-whitespace-divergence",
+      "text": " \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n \t\n"
     }
   ],
   "template_cases": [
