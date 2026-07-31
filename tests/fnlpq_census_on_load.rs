@@ -218,12 +218,21 @@ fn bf16_verbatim_multi_tensor_round_trip_preserves_raw_words() {
         .bytes;
     let artifact = FnlpqArtifact::from_bytes(written.clone())
         .expect("checked loader accepts exact BF16 verbatim ranges");
+    let expected_logical_model_sha256 = artifact.logical_model_sha256().to_owned();
+    let reserialized = artifact
+        .reserialize()
+        .expect("checked BF16 artifact reserializes");
     assert_eq!(
-        artifact
-            .reserialize()
-            .expect("checked BF16 artifact reserializes"),
+        reserialized,
         written,
         "checked BF16 load then canonical re-serialize must preserve envelope bytes"
+    );
+    let round_tripped = FnlpqArtifact::from_bytes(reserialized)
+        .expect("canonical re-serialization remains loadable");
+    assert_eq!(
+        round_tripped.logical_model_sha256(),
+        expected_logical_model_sha256,
+        "canonical re-serialization must preserve the writer-derived logical model identity"
     );
 
     for (name, _shape, expected) in cases {
@@ -250,7 +259,10 @@ fn bf16_verbatim_multi_tensor_round_trip_preserves_raw_words() {
             hex(&Sha256::digest(expected))
         );
     }
-    eprintln!("FNLPQ_BF16_ROUND_TRIP RESULT=PASS tensors={}", cases.len());
+    eprintln!(
+        "FNLPQ_BF16_ROUND_TRIP RESULT=PASS tensors={} logical_model_sha256={expected_logical_model_sha256}",
+        cases.len()
+    );
 }
 
 #[test]
@@ -541,8 +553,17 @@ fn refresh_logical_model_identity(input: &mut FnlpqWriterInput) {
         )
         .expect("logical tensor identity");
         tensor.canonical_logical_sha256 = hex(&digest);
-        tensor_digests.push(digest);
+        tensor_digests.push((tensor.name.clone(), digest));
     }
+    // `write` canonicalizes tensor records by their bytewise names before it
+    // frames the model identity.  Keep synthetic inputs in that same order so
+    // this helper prepares a valid writer input rather than a stale fixture
+    // identity that happens to reflect insertion order.
+    tensor_digests.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+    let tensor_digests = tensor_digests
+        .into_iter()
+        .map(|(_, digest)| digest)
+        .collect::<Vec<_>>();
     let sources = [
         ("model_config", section_bytes(input, "model-config")),
         ("tokenizer_model", section_bytes(input, "tokenizer-model")),
