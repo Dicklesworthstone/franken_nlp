@@ -1,12 +1,15 @@
-name: CI
+# Historical record only. FrankenNLP uses occasional controller-authorized DSR
+# runs of scripts/check.sh as its sole code/build authority. This retained file
+# intentionally has no automatic, manual, reusable, or scheduled trigger.
+name: CI (historical; inert)
 
-on:
-  pull_request:
-  push:
-    branches: [main]
+on: {}
 
 jobs:
   check:
+    # Defense in depth if a trigger is ever added accidentally. Re-enabling this
+    # job requires an explicit owner policy change and corresponding plan update.
+    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
