@@ -19,6 +19,7 @@ use std::{
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
+        mpsc,
     },
 };
 
@@ -911,6 +912,442 @@ struct CompletionState {
 pub struct OutstandingClosureSnapshot {
     pub active_closures: usize,
     pub wrapper_cancelled_closures: usize,
+}
+
+/// The lifecycle of one fixed scoped-CPU team.
+///
+/// The pinned `ScopedCpu::spawn` surface caps only the number of children. It
+/// intentionally does not decide whether formation is still legal after the
+/// scope has begun draining. This protocol owns that missing state transition:
+/// workers are formed first, the coordinator seals formation, then workers may
+/// pass the entry gate into fallible work. Once sealed, no API can form another
+/// worker, including while cancellation or panic drain is in progress.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SealedTeamPhase {
+    Forming,
+    Sealed,
+    Running,
+    Draining,
+    Joined,
+}
+
+impl SealedTeamPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Forming => "forming",
+            Self::Sealed => "sealed",
+            Self::Running => "running",
+            Self::Draining => "draining",
+            Self::Joined => "joined",
+        }
+    }
+}
+
+/// Why the coordinator entered the terminal drain phase.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TeamDrainReason {
+    Completed,
+    Cancelled,
+    WorkerPanicked,
+    CoordinatorPanicked,
+}
+
+impl TeamDrainReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+            Self::WorkerPanicked => "worker_panicked",
+            Self::CoordinatorPanicked => "coordinator_panicked",
+        }
+    }
+}
+
+/// A fixed child ordinal allocated during the one legal spawn phase.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SealedTeamWorker {
+    ordinal: usize,
+}
+
+impl SealedTeamWorker {
+    pub const fn ordinal(self) -> usize {
+        self.ordinal
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SealedTeamWorkerState {
+    Formed,
+    Running,
+    Exited,
+}
+
+#[derive(Debug)]
+struct SealedTeamState {
+    phase: SealedTeamPhase,
+    expected_children: usize,
+    workers: BTreeMap<usize, SealedTeamWorkerState>,
+    drain_reason: Option<TeamDrainReason>,
+}
+
+/// A stable protocol snapshot suitable for stage-line telemetry and tests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SealedTeamSnapshot {
+    pub phase: SealedTeamPhase,
+    pub expected_children: usize,
+    pub formed_children: usize,
+    pub running_children: usize,
+    pub exited_children: usize,
+    pub drain_reason: Option<TeamDrainReason>,
+}
+
+/// Typed refusals for the sealed team protocol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SealedTeamError {
+    FormationFull {
+        expected_children: usize,
+    },
+    SpawnAfterSeal {
+        phase: SealedTeamPhase,
+    },
+    SealBeforeCompleteFormation {
+        expected_children: usize,
+        formed_children: usize,
+    },
+    ReleaseBeforeSeal {
+        phase: SealedTeamPhase,
+    },
+    WorkerStartBeforeRelease {
+        phase: SealedTeamPhase,
+    },
+    UnknownWorker {
+        ordinal: usize,
+    },
+    WorkerAlreadyRunning {
+        ordinal: usize,
+    },
+    WorkerNotRunning {
+        ordinal: usize,
+    },
+    JoinBeforeDrain {
+        phase: SealedTeamPhase,
+    },
+    JoinBeforeWorkersExit {
+        expected_children: usize,
+        exited_children: usize,
+    },
+}
+
+impl fmt::Display for SealedTeamError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FormationFull { expected_children } => {
+                write!(formatter, "sealed team formation already has {expected_children} children")
+            }
+            Self::SpawnAfterSeal { phase } => write!(
+                formatter,
+                "sealed team refuses worker formation after {}",
+                phase.as_str()
+            ),
+            Self::SealBeforeCompleteFormation {
+                expected_children,
+                formed_children,
+            } => write!(
+                formatter,
+                "sealed team cannot seal {formed_children}/{expected_children} children"
+            ),
+            Self::ReleaseBeforeSeal { phase } => write!(
+                formatter,
+                "sealed team cannot release workers from {}",
+                phase.as_str()
+            ),
+            Self::WorkerStartBeforeRelease { phase } => write!(
+                formatter,
+                "sealed team worker cannot start from {}",
+                phase.as_str()
+            ),
+            Self::UnknownWorker { ordinal } => {
+                write!(formatter, "sealed team has no worker ordinal {ordinal}")
+            }
+            Self::WorkerAlreadyRunning { ordinal } => {
+                write!(formatter, "sealed team worker {ordinal} already started")
+            }
+            Self::WorkerNotRunning { ordinal } => {
+                write!(formatter, "sealed team worker {ordinal} is not running")
+            }
+            Self::JoinBeforeDrain { phase } => write!(
+                formatter,
+                "sealed team cannot join from {}",
+                phase.as_str()
+            ),
+            Self::JoinBeforeWorkersExit {
+                expected_children,
+                exited_children,
+            } => write!(
+                formatter,
+                "sealed team cannot join {exited_children}/{expected_children} exited children"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SealedTeamError {}
+
+/// The coordinator-owned protocol for one bounded scoped-CPU team.
+///
+/// This type is deliberately independent of the foundation's scheduler types
+/// so the repository-owned bounded state model can exercise the native-thread
+/// protocol under every formation/seal/cancel/panic/join order. The production
+/// adapter holds one of these values for the exact lifetime of its one
+/// `spawn_blocking` closure and one `scoped_cpu` region.
+#[derive(Debug)]
+pub struct SealedCpuTeam {
+    state: Mutex<SealedTeamState>,
+}
+
+impl SealedCpuTeam {
+    /// Begin formation for exactly `expected_children` scoped children. The
+    /// coordinator itself is intentionally not counted here.
+    pub fn new(expected_children: usize) -> Self {
+        Self {
+            state: Mutex::new(SealedTeamState {
+                phase: SealedTeamPhase::Forming,
+                expected_children,
+                workers: BTreeMap::new(),
+                drain_reason: None,
+            }),
+        }
+    }
+
+    /// Allocate one child ordinal during the sole legal formation phase.
+    pub fn form_worker(&self) -> Result<SealedTeamWorker, SealedTeamError> {
+        let mut state = lock_unpoisoned(&self.state);
+        if state.phase != SealedTeamPhase::Forming {
+            return Err(SealedTeamError::SpawnAfterSeal { phase: state.phase });
+        }
+        if state.workers.len() == state.expected_children {
+            return Err(SealedTeamError::FormationFull {
+                expected_children: state.expected_children,
+            });
+        }
+        let ordinal = state.workers.len();
+        state.workers.insert(ordinal, SealedTeamWorkerState::Formed);
+        eprintln!(
+            "SEALED_TEAM STAGE=FORMATION RESULT=FORMED worker_ordinal={ordinal} formed_children={} expected_children={}",
+            state.workers.len(),
+            state.expected_children,
+        );
+        Ok(SealedTeamWorker { ordinal })
+    }
+
+    /// Irrevocably end the only worker-formation phase.
+    pub fn seal(&self) -> Result<(), SealedTeamError> {
+        let mut state = lock_unpoisoned(&self.state);
+        if state.phase != SealedTeamPhase::Forming {
+            return Err(SealedTeamError::SpawnAfterSeal { phase: state.phase });
+        }
+        if state.workers.len() != state.expected_children {
+            return Err(SealedTeamError::SealBeforeCompleteFormation {
+                expected_children: state.expected_children,
+                formed_children: state.workers.len(),
+            });
+        }
+        state.phase = SealedTeamPhase::Sealed;
+        eprintln!(
+            "SEALED_TEAM STAGE=FORMATION RESULT=SEALED expected_children={}",
+            state.expected_children,
+        );
+        Ok(())
+    }
+
+    /// Open the entry gate after formation has been sealed.
+    pub fn release_workers(&self) -> Result<(), SealedTeamError> {
+        let mut state = lock_unpoisoned(&self.state);
+        if state.phase != SealedTeamPhase::Sealed {
+            return Err(SealedTeamError::ReleaseBeforeSeal { phase: state.phase });
+        }
+        state.phase = SealedTeamPhase::Running;
+        eprintln!(
+            "SEALED_TEAM STAGE=ENTRY_GATE RESULT=RELEASED expected_children={}",
+            state.expected_children,
+        );
+        Ok(())
+    }
+
+    /// Record the first checkpoint boundary before a child begins fallible
+    /// work. The worker can reach this only after the coordinator opened the
+    /// entry gate.
+    pub fn worker_started(&self, worker: SealedTeamWorker) -> Result<(), SealedTeamError> {
+        let mut state = lock_unpoisoned(&self.state);
+        if state.phase != SealedTeamPhase::Running {
+            return Err(SealedTeamError::WorkerStartBeforeRelease { phase: state.phase });
+        }
+        let Some(worker_state) = state.workers.get_mut(&worker.ordinal) else {
+            return Err(SealedTeamError::UnknownWorker {
+                ordinal: worker.ordinal,
+            });
+        };
+        if *worker_state != SealedTeamWorkerState::Formed {
+            return Err(SealedTeamError::WorkerAlreadyRunning {
+                ordinal: worker.ordinal,
+            });
+        }
+        *worker_state = SealedTeamWorkerState::Running;
+        eprintln!(
+            "SEALED_TEAM STAGE=WORKER RESULT=STARTED worker_ordinal={}",
+            worker.ordinal,
+        );
+        Ok(())
+    }
+
+    /// Start cooperative drain. This closes the protocol to new formation and
+    /// lets each existing worker leave at its next checkpoint.
+    pub fn begin_drain(&self, reason: TeamDrainReason) {
+        let mut state = lock_unpoisoned(&self.state);
+        if state.phase == SealedTeamPhase::Joined {
+            return;
+        }
+        state.phase = SealedTeamPhase::Draining;
+        state.drain_reason = Some(reason);
+        eprintln!(
+            "SEALED_TEAM STAGE=DRAIN RESULT=STARTED reason={}",
+            reason.as_str(),
+        );
+    }
+
+    /// Record child exit after its final checkpoint or a contained panic.
+    pub fn worker_exited(&self, worker: SealedTeamWorker) -> Result<(), SealedTeamError> {
+        let mut state = lock_unpoisoned(&self.state);
+        let Some(worker_state) = state.workers.get_mut(&worker.ordinal) else {
+            return Err(SealedTeamError::UnknownWorker {
+                ordinal: worker.ordinal,
+            });
+        };
+        if *worker_state != SealedTeamWorkerState::Running {
+            return Err(SealedTeamError::WorkerNotRunning {
+                ordinal: worker.ordinal,
+            });
+        }
+        *worker_state = SealedTeamWorkerState::Exited;
+        eprintln!(
+            "SEALED_TEAM STAGE=WORKER RESULT=EXITED worker_ordinal={}",
+            worker.ordinal,
+        );
+        Ok(())
+    }
+
+    /// Record a child panic before drain. The child is terminal immediately;
+    /// sibling workers still need to observe drain and exit before join.
+    pub fn worker_panicked(&self, worker: SealedTeamWorker) -> Result<(), SealedTeamError> {
+        self.begin_drain(TeamDrainReason::WorkerPanicked);
+        self.worker_exited(worker)
+    }
+
+    /// Fire only after the scoped region has joined every fixed child.
+    pub fn join(&self) -> Result<(), SealedTeamError> {
+        let mut state = lock_unpoisoned(&self.state);
+        if state.phase == SealedTeamPhase::Running {
+            state.phase = SealedTeamPhase::Draining;
+            state.drain_reason = Some(TeamDrainReason::Completed);
+        }
+        if state.phase != SealedTeamPhase::Draining {
+            return Err(SealedTeamError::JoinBeforeDrain { phase: state.phase });
+        }
+        let exited_children = state
+            .workers
+            .values()
+            .filter(|worker| **worker == SealedTeamWorkerState::Exited)
+            .count();
+        if exited_children != state.expected_children {
+            return Err(SealedTeamError::JoinBeforeWorkersExit {
+                expected_children: state.expected_children,
+                exited_children,
+            });
+        }
+        let reason = state
+            .drain_reason
+            .ok_or(SealedTeamError::JoinBeforeDrain { phase: state.phase })?;
+        state.phase = SealedTeamPhase::Joined;
+        eprintln!(
+            "SEALED_TEAM STAGE=LATCH RESULT=FIRED joined_children={} reason={}",
+            exited_children,
+            reason.as_str(),
+        );
+        Ok(())
+    }
+
+    pub fn snapshot(&self) -> SealedTeamSnapshot {
+        let state = lock_unpoisoned(&self.state);
+        let formed_children = state.workers.len();
+        let running_children = state
+            .workers
+            .values()
+            .filter(|worker| **worker == SealedTeamWorkerState::Running)
+            .count();
+        let exited_children = state
+            .workers
+            .values()
+            .filter(|worker| **worker == SealedTeamWorkerState::Exited)
+            .count();
+        SealedTeamSnapshot {
+            phase: state.phase,
+            expected_children: state.expected_children,
+            formed_children,
+            running_children,
+            exited_children,
+            drain_reason: state.drain_reason,
+        }
+    }
+}
+
+/// A capacity-one command or reply lane. The sender deliberately uses
+/// `try_send`: a second in-flight command is a typed backpressure refusal, not
+/// a hidden queue or a blocking coordinator wait.
+pub struct CapacityOneSender<T> {
+    sender: mpsc::SyncSender<T>,
+}
+
+pub struct CapacityOneReceiver<T> {
+    receiver: mpsc::Receiver<T>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CapacityOneLaneError {
+    Full,
+    Disconnected,
+}
+
+impl fmt::Display for CapacityOneLaneError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full => formatter.write_str("capacity-one lane already has an in-flight message"),
+            Self::Disconnected => formatter.write_str("capacity-one lane is disconnected"),
+        }
+    }
+}
+
+impl std::error::Error for CapacityOneLaneError {}
+
+pub fn capacity_one_lane<T>() -> (CapacityOneSender<T>, CapacityOneReceiver<T>) {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    (CapacityOneSender { sender }, CapacityOneReceiver { receiver })
+}
+
+impl<T> CapacityOneSender<T> {
+    pub fn try_send(&self, value: T) -> Result<(), CapacityOneLaneError> {
+        self.sender.try_send(value).map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => CapacityOneLaneError::Full,
+            mpsc::TrySendError::Disconnected(_) => CapacityOneLaneError::Disconnected,
+        })
+    }
+}
+
+impl<T> CapacityOneReceiver<T> {
+    pub fn recv(&self) -> Result<T, CapacityOneLaneError> {
+        self.receiver
+            .recv()
+            .map_err(|_| CapacityOneLaneError::Disconnected)
+    }
 }
 
 #[cfg(feature = "asupersync-runtime")]
