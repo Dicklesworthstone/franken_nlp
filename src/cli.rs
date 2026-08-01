@@ -941,7 +941,7 @@ fn write_canonical_receipt_sidecar(
         .map_err(|error| format!("decode staged receipt {}: {error}", staging_path.display()))?;
     let parsed = ConversionReceipt::parse_canonical_json(reloaded)
         .map_err(|error| format!("parse staged receipt {}: {error}", staging_path.display()))?;
-    if parsed != receipt {
+    if &parsed != receipt {
         return Err(format!(
             "reloaded receipt differs from canonical serialization: {}",
             staging_path.display()
