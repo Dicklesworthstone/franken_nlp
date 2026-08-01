@@ -256,6 +256,8 @@ fn generic_root(seed: u64) -> Vec<u8> {
     )
     .expect("synthetic layer logical tensor identity");
     let logical_model_sha256 = logical_model_sha256(
+        "Nanbeige4.2-3B",
+        "f56ec5a9650268aa098496734743c25ea778bd2d",
         &[embed_tensor_sha256, layer_tensor_sha256],
         &[
             ("model_config", br#"{"hidden_size":2}"#.as_slice()),
