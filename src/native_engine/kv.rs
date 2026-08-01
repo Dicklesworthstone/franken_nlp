@@ -81,6 +81,93 @@ impl KvSlabDtype {
     }
 }
 
+/// Checked bf16 K/V admission price for one sequence's 44-slot cache.
+///
+/// `logical_bf16_bytes` is the exact 176-KiB-per-token charge.  The slab
+/// allocator cannot retain a fractional page, so `reserved_bf16_bytes` rounds
+/// that charge up to the selected logical-page width.  Keeping the two values
+/// distinct prevents an admission receipt from calling page-rounding slack
+/// live-token payload or, conversely, promising a fractional physical page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KvSlabAdmission {
+    positions: usize,
+    page_tokens: usize,
+    logical_bf16_bytes: usize,
+    reserved_page_count: usize,
+    reserved_slab_count: usize,
+    reserved_bf16_bytes: usize,
+}
+
+impl KvSlabAdmission {
+    /// Prices `positions` using a checked baseline 44-slot bf16 layout.
+    pub fn try_for_positions(
+        positions: usize,
+        page_tokens: usize,
+    ) -> Result<Self, KvSlabError> {
+        if page_tokens == 0 {
+            return Err(KvSlabError::InvalidPageTokens { page_tokens });
+        }
+        let logical_bf16_bytes = positions.checked_mul(KV_BYTES_PER_TOKEN).ok_or(
+            KvSlabError::AdmissionArithmeticOverflow { positions },
+        )?;
+        let completed_pages = positions / page_tokens;
+        let reserved_page_count = completed_pages
+            .checked_add(usize::from(positions % page_tokens != 0))
+            .ok_or(KvSlabError::AdmissionArithmeticOverflow { positions })?;
+        let reserved_slab_count = reserved_page_count
+            .checked_mul(KV_SLABS_PER_LOGICAL_PAGE)
+            .ok_or(KvSlabError::AdmissionArithmeticOverflow { positions })?;
+        let reserved_bf16_bytes = reserved_page_count
+            .checked_mul(page_tokens)
+            .and_then(|reserved_positions| reserved_positions.checked_mul(KV_BYTES_PER_TOKEN))
+            .ok_or(KvSlabError::AdmissionArithmeticOverflow { positions })?;
+        Ok(Self {
+            positions,
+            page_tokens,
+            logical_bf16_bytes,
+            reserved_page_count,
+            reserved_slab_count,
+            reserved_bf16_bytes,
+        })
+    }
+
+    /// Logical context positions admitted by this price.
+    #[must_use]
+    pub const fn positions(self) -> usize {
+        self.positions
+    }
+
+    /// Token positions represented by one reserved logical page.
+    #[must_use]
+    pub const fn page_tokens(self) -> usize {
+        self.page_tokens
+    }
+
+    /// Exact live-token bf16 charge, before physical-page rounding.
+    #[must_use]
+    pub const fn logical_bf16_bytes(self) -> usize {
+        self.logical_bf16_bytes
+    }
+
+    /// Whole physical pages needed to retain the admitted positions.
+    #[must_use]
+    pub const fn reserved_page_count(self) -> usize {
+        self.reserved_page_count
+    }
+
+    /// Separate K and V physical slabs needed by the reservation.
+    #[must_use]
+    pub const fn reserved_slab_count(self) -> usize {
+        self.reserved_slab_count
+    }
+
+    /// Physical bf16 slab bytes, rounded up to whole logical pages.
+    #[must_use]
+    pub const fn reserved_bf16_bytes(self) -> usize {
+        self.reserved_bf16_bytes
+    }
+}
+
 /// Address and ownership identity for one independently reference-counted
 /// physical K/V slab.
 ///
@@ -917,6 +1004,20 @@ pub struct KvSlabCache {
 }
 
 impl KvSlabCache {
+    /// Pre-reserves exactly the physical bf16 slab set priced by `admission`.
+    ///
+    /// This constructor is intentionally explicit: it allocates the full
+    /// page-rounded reservation before token/layer execution.  A scheduler
+    /// must obtain the corresponding process-wide memory reservation before
+    /// calling it; this cache only provides the local ownership protocol.
+    pub fn try_with_bf16_admission(admission: KvSlabAdmission) -> Result<Self, KvSlabError> {
+        Self::try_with_page_tokens(
+            admission.positions(),
+            admission.page_tokens(),
+            admission.reserved_slab_count(),
+        )
+    }
+
     /// Builds a cache using the baseline 16-token logical page size.
     pub fn try_with_capacity(
         max_positions: usize,

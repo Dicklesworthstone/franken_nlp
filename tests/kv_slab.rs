@@ -4,8 +4,8 @@ use franken_nlp::native_engine::kv::{
     KV_BF16_LOGICAL_PAGE_BYTES, KV_BF16_SLAB_BYTES, KV_BYTES_PER_TOKEN,
     KV_INT8_F16_SCALE_BYTES_PER_TOKEN, KV_INT8_F32_SCALE_BYTES_PER_TOKEN,
     KV_INT8_PAYLOAD_BYTES_PER_TOKEN, KV_LOGICAL_PAGE_TOKENS, KV_SLOT_COUNT,
-    KV_SLABS_PER_LOGICAL_PAGE, KV_SLAB_VECTOR_ALIGNMENT_BYTES, KvSlabCache, KvSlabDtype,
-    KvSlabError, KvSlabKey, KvVector,
+    KV_SLABS_PER_LOGICAL_PAGE, KV_SLAB_VECTOR_ALIGNMENT_BYTES, KvSlabAdmission, KvSlabCache,
+    KvSlabDtype, KvSlabError, KvSlabKey, KvVector,
 };
 
 fn append_prepared_position(cache: &mut KvSlabCache, position: usize, marker: u16) {
@@ -38,6 +38,57 @@ fn baseline_slab_geometry_is_the_44_slot_byte_certificate() {
     assert_eq!(KvSlabDtype::Bf16.bytes_per_token(), 180_224);
     assert_eq!(KvSlabDtype::Int8F32Scale.bytes_per_token(), 92_928);
     assert_eq!(KvSlabDtype::Int8F16Scale.bytes_per_token(), 91_520);
+}
+
+#[test]
+fn typed_admission_separates_token_charge_from_page_reservation() {
+    let one = KvSlabAdmission::try_for_positions(1, KV_LOGICAL_PAGE_TOKENS)
+        .expect("one token has a checked bf16 admission price");
+    assert_eq!(one.logical_bf16_bytes(), KV_BYTES_PER_TOKEN);
+    assert_eq!(one.reserved_page_count(), 1);
+    assert_eq!(one.reserved_slab_count(), KV_SLABS_PER_LOGICAL_PAGE);
+    assert_eq!(one.reserved_bf16_bytes(), KV_BF16_LOGICAL_PAGE_BYTES);
+
+    let full_page = KvSlabAdmission::try_for_positions(16, KV_LOGICAL_PAGE_TOKENS)
+        .expect("one logical page has no rounding slack");
+    assert_eq!(full_page.logical_bf16_bytes(), KV_BF16_LOGICAL_PAGE_BYTES);
+    assert_eq!(full_page.reserved_bf16_bytes(), KV_BF16_LOGICAL_PAGE_BYTES);
+
+    let seventeen = KvSlabAdmission::try_for_positions(17, KV_LOGICAL_PAGE_TOKENS)
+        .expect("a page boundary rounds upward deterministically");
+    assert_eq!(seventeen.positions(), 17);
+    assert_eq!(seventeen.page_tokens(), KV_LOGICAL_PAGE_TOKENS);
+    assert_eq!(seventeen.logical_bf16_bytes(), 17 * KV_BYTES_PER_TOKEN);
+    assert_eq!(seventeen.reserved_page_count(), 2);
+    assert_eq!(
+        seventeen.reserved_slab_count(),
+        2 * KV_SLABS_PER_LOGICAL_PAGE
+    );
+    assert_eq!(
+        seventeen.reserved_bf16_bytes(),
+        2 * KV_BF16_LOGICAL_PAGE_BYTES
+    );
+
+    assert!(matches!(
+        KvSlabAdmission::try_for_positions(1, 0),
+        Err(KvSlabError::InvalidPageTokens { page_tokens: 0 })
+    ));
+    assert!(matches!(
+        KvSlabAdmission::try_for_positions(usize::MAX, KV_LOGICAL_PAGE_TOKENS),
+        Err(KvSlabError::AdmissionArithmeticOverflow { .. })
+    ));
+}
+
+#[test]
+fn typed_admission_constructs_an_exactly_priced_pre_reserved_pool() {
+    let admission = KvSlabAdmission::try_for_positions(17, KV_LOGICAL_PAGE_TOKENS)
+        .expect("the two-page context has a checked reservation");
+    let cache = KvSlabCache::try_with_bf16_admission(admission)
+        .expect("cache construction consumes only the typed reservation");
+    let stats = cache.pool_stats();
+    assert_eq!(cache.capacity_positions(), 17);
+    assert_eq!(stats.live_slab_count, 0);
+    assert_eq!(stats.free_slab_count, admission.reserved_slab_count());
 }
 
 #[test]
