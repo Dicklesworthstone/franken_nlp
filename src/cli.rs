@@ -1,7 +1,7 @@
 use std::{
     ffi::OsString,
     fs,
-    io::{self, Read, Write},
+    io::{self, BufRead, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -208,8 +208,9 @@ impl From<RobotSubcommand> for RobotCommand {
 pub fn cli_main() -> ExitCode {
     let canonical_args = std::iter::once(OsString::from("fnlp")).chain(std::env::args_os().skip(1));
     let stdin = io::stdin();
+    let stdin_is_terminal = stdin.is_terminal();
     let mut stdin = stdin.lock();
-    cli_main_with_reader(canonical_args, &mut stdin)
+    cli_main_with_reader_and_terminal(canonical_args, &mut stdin, stdin_is_terminal)
 }
 
 /// Runs the CLI with an explicit schema-input reader.
@@ -218,7 +219,18 @@ pub fn cli_main() -> ExitCode {
 /// inheriting the process stdin and waiting for a terminal or pipe to close.
 fn cli_main_with_reader(
     args: impl IntoIterator<Item = OsString>,
-    schema_input: &mut impl Read,
+    schema_input: &mut impl BufRead,
+) -> ExitCode {
+    cli_main_with_reader_and_terminal(args, schema_input, false)
+}
+
+/// Dispatch CLI commands with an injected input reader and explicit terminal
+/// fact. Tests receive a non-terminal reader; the process entry point derives
+/// the fact through [`IsTerminal`] before locking stdin.
+fn cli_main_with_reader_and_terminal(
+    args: impl IntoIterator<Item = OsString>,
+    schema_input: &mut impl BufRead,
+    stdin_is_terminal: bool,
 ) -> ExitCode {
     match Cli::parse_from(args).command {
         Some(Command::Robot { command }) => {
@@ -234,7 +246,9 @@ fn cli_main_with_reader(
         }
         Some(Command::Schema { command }) => run_schema_command_with_reader(command, schema_input),
         Some(Command::Release { command }) => run_release_command(command),
-        Some(Command::Convert(command)) => run_convert_command(command),
+        Some(Command::Convert(command)) => {
+            run_convert_command(command, schema_input, stdin_is_terminal)
+        }
         Some(Command::Models { command }) => run_models_command(command),
         None => {
             let mut command = Cli::command();
@@ -284,7 +298,11 @@ fn run_models_derive(command: ModelsDeriveCommand) -> ExitCode {
     ErrorCode::AdmissionOrResourceLimit.as_process_exit()
 }
 
-fn run_convert_command(command: ConvertCommand) -> ExitCode {
+fn run_convert_command(
+    command: ConvertCommand,
+    input: &mut impl BufRead,
+    stdin_is_terminal: bool,
+) -> ExitCode {
     let ConvertCommand {
         source,
         source_manifest,
@@ -310,13 +328,6 @@ fn run_convert_command(command: ConvertCommand) -> ExitCode {
         robot,
     };
 
-    if !request.yes {
-        eprintln!(
-            "CONVERT RESULT=FAIL stage=confirmation reason=--yes-is-required-until-interactive-confirmation-is-implemented; no-source-opened; no-output-created"
-        );
-        return ErrorCode::Usage.as_process_exit();
-    }
-
     eprintln!(
         "CONVERT STAGE=census RESULT=START source={} manifest={}",
         request.source_dir.display(),
@@ -331,11 +342,79 @@ fn run_convert_command(command: ConvertCommand) -> ExitCode {
                     prepared.census_sha256,
                     prepared.census.len(),
                 );
+                emit_partial_convert_preflight(&prepared, &generic);
+                let confirmation = match confirm_convert(&request, input, stdin_is_terminal) {
+                    Ok(mode) => mode,
+                    Err(reason) => {
+                        eprintln!(
+                            "CONVERT RESULT=FAIL stage=confirmation reason={reason}; no-output-created"
+                        );
+                        return ErrorCode::Usage.as_process_exit();
+                    }
+                };
+                eprintln!("CONVERT STAGE=confirmation RESULT={confirmation}");
                 run_streaming_convert(&request, &prepared, &generic)
             }
             Err(error) => emit_convert_refusal(error),
         },
         Err(error) => emit_convert_refusal(error),
+    }
+}
+
+/// Record the conversion facts available before the unavailable model-root
+/// staging capability can construct a final envelope. This is intentionally a
+/// partial preflight, not the final disk/RSS admission receipt.
+fn emit_partial_convert_preflight(
+    prepared: &PreparedConversionInput,
+    generic: &GenericPayloadPlan,
+) {
+    eprintln!(
+        "CONVERT PREFLIGHT RESULT=PARTIAL closure-bytes={} generic-payload-bytes={} generic-scales-bytes={} generic-row-sums-bytes={} reason=final-envelope-and-ratified-staging-capability-unavailable",
+        prepared.source.manifest.closure_total_bytes,
+        generic.payload_bytes,
+        generic.scale_bytes,
+        generic.row_sum_bytes,
+    );
+}
+
+/// Select the one admission-confirmation policy before any conversion-side
+/// artifact output is attempted.
+///
+/// TTY callers explicitly answer y/N unless they supplied `--yes`; robot and
+/// non-TTY callers never block on a prompt and retain that fact in the stage
+/// transcript. Source validation/preflight happens first so a human sees the
+/// immutable input facts before accepting conversion work.
+fn confirm_convert(
+    request: &ConvertRequest,
+    input: &mut impl BufRead,
+    stdin_is_terminal: bool,
+) -> Result<&'static str, String> {
+    if request.yes {
+        return Ok("BYPASSED reason=--yes");
+    }
+    if request.robot {
+        return Ok("SKIPPED reason=robot-noninteractive");
+    }
+    if !stdin_is_terminal {
+        return Ok("SKIPPED reason=stdin-not-terminal");
+    }
+
+    eprint!(
+        "CONVERT CONFIRM source={} destination={} [y/N]: ",
+        request.source_dir.display(),
+        request.output.display(),
+    );
+    io::stderr()
+        .flush()
+        .map_err(|error| format!("flush confirmation prompt: {error}"))?;
+    let mut answer = String::new();
+    input
+        .read_line(&mut answer)
+        .map_err(|error| format!("read confirmation response: {error}"))?;
+    if matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
+        Ok("ACCEPTED reason=tty-y")
+    } else {
+        Err("tty-confirmation-declined".to_owned())
     }
 }
 
@@ -1323,13 +1402,13 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        cli_main_with_reader, conversion_staging_path, require_streaming_conversion_root,
-        validate_generic_tensor_authorities, Cli, Command, LogicalTensorFirstPass,
-        ModelsSubcommand, ReleaseSubcommand,
+        cli_main_with_reader, confirm_convert, conversion_staging_path,
+        require_streaming_conversion_root, validate_generic_tensor_authorities, Cli, Command,
+        LogicalTensorFirstPass, ModelsSubcommand, ReleaseSubcommand,
     };
     use crate::artifact::converter::{
-        GenericPayloadPlan, GenericTensorLayout, OutputRange, StorageStage,
-        expected_nanbeige42_census,
+        ConvertArch, ConvertRequest, GenericPayloadPlan, GenericTensorLayout, OutputRange,
+        StorageStage, expected_nanbeige42_census,
     };
     use crate::artifact::format::validate_authority_identifier;
     use crate::artifact::safetensors::{SafetensorDtype, TensorCensusEntry};
@@ -1347,6 +1426,41 @@ mod tests {
         assert_eq!(
             cli_main_with_reader(args, &mut schema_input),
             ExitCode::SUCCESS
+        );
+    }
+
+    #[test]
+    fn conversion_confirmation_distinguishes_tty_yes_robot_and_pipe_modes() {
+        let request = |yes, robot| ConvertRequest {
+            source_dir: "/models/source".into(),
+            source_manifest: "/models/source.json".into(),
+            recipe_id: "nanbeige42-int8-v1".to_owned(),
+            arch: ConvertArch::Generic,
+            output: "/models/output.fnlpq".into(),
+            yes,
+            strict_source_dir: false,
+            robot,
+        };
+
+        assert_eq!(
+            confirm_convert(&request(true, false), &mut Cursor::new(b""), true),
+            Ok("BYPASSED reason=--yes")
+        );
+        assert_eq!(
+            confirm_convert(&request(false, true), &mut Cursor::new(b""), true),
+            Ok("SKIPPED reason=robot-noninteractive")
+        );
+        assert_eq!(
+            confirm_convert(&request(false, false), &mut Cursor::new(b""), false),
+            Ok("SKIPPED reason=stdin-not-terminal")
+        );
+        assert_eq!(
+            confirm_convert(&request(false, false), &mut Cursor::new(b"yes\n"), true),
+            Ok("ACCEPTED reason=tty-y")
+        );
+        assert_eq!(
+            confirm_convert(&request(false, false), &mut Cursor::new(b"n\n"), true),
+            Err("tty-confirmation-declined".to_owned())
         );
     }
 
