@@ -11,7 +11,9 @@ use serde::Serialize;
 
 use crate::{native_engine::dispatch, orchestrator};
 
-pub const ROBOT_SCHEMA_VERSION: u32 = 1;
+/// Schema v2 adds the additive `convert_stage` event used by `fnlp convert
+/// --robot`. Existing event names and fields retain their v1 spelling.
+pub const ROBOT_SCHEMA_VERSION: u32 = 2;
 
 /// A stable robot event name. Do not rename an event without a schema-version
 /// bump and a reviewed golden update.
@@ -226,6 +228,175 @@ pub fn write_event<W: Write>(writer: &mut W, event: &RobotEvent) -> io::Result<(
     writer.write_all(b"\n")
 }
 
+/// One versioned, identity-carrying stage event from `fnlp convert --robot`.
+///
+/// The human conversion transcript remains on stderr. This event carries the
+/// same machine-relevant fields on stdout without requiring a consumer to
+/// parse diagnostic prose.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RobotConvertStageEvent {
+    schema_version: u32,
+    event: &'static str,
+    command: &'static str,
+    stage: String,
+    result: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_manifest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    destination: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    staging_artifact: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_root_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    census_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fnlpq_file_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    license_bundle_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tensors: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sections: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    staging_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+impl RobotConvertStageEvent {
+    /// Begin a typed conversion-stage record. `stage` and `result` use the
+    /// same values as the human `CONVERT STAGE=... RESULT=...` transcript.
+    pub fn new(stage: impl Into<String>, result: impl Into<String>) -> Self {
+        Self {
+            schema_version: ROBOT_SCHEMA_VERSION,
+            event: "convert_stage",
+            command: "convert",
+            stage: stage.into(),
+            result: result.into(),
+            source: None,
+            source_manifest: None,
+            destination: None,
+            staging_artifact: None,
+            source_root_sha256: None,
+            census_sha256: None,
+            fnlpq_file_sha256: None,
+            license_bundle_sha256: None,
+            tensors: None,
+            sections: None,
+            staging_bytes: None,
+            reason: None,
+        }
+    }
+
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
+    pub fn with_source_manifest(mut self, source_manifest: impl Into<String>) -> Self {
+        self.source_manifest = Some(source_manifest.into());
+        self
+    }
+
+    pub fn with_destination(mut self, destination: impl Into<String>) -> Self {
+        self.destination = Some(destination.into());
+        self
+    }
+
+    pub fn with_staging_artifact(mut self, staging_artifact: impl Into<String>) -> Self {
+        self.staging_artifact = Some(staging_artifact.into());
+        self
+    }
+
+    pub fn with_source_root_sha256(mut self, source_root_sha256: impl Into<String>) -> Self {
+        self.source_root_sha256 = Some(source_root_sha256.into());
+        self
+    }
+
+    pub fn with_census_sha256(mut self, census_sha256: impl Into<String>) -> Self {
+        self.census_sha256 = Some(census_sha256.into());
+        self
+    }
+
+    pub fn with_fnlpq_file_sha256(mut self, fnlpq_file_sha256: impl Into<String>) -> Self {
+        self.fnlpq_file_sha256 = Some(fnlpq_file_sha256.into());
+        self
+    }
+
+    pub fn with_license_bundle_sha256(mut self, license_bundle_sha256: impl Into<String>) -> Self {
+        self.license_bundle_sha256 = Some(license_bundle_sha256.into());
+        self
+    }
+
+    pub const fn with_tensors(mut self, tensors: u64) -> Self {
+        self.tensors = Some(tensors);
+        self
+    }
+
+    pub const fn with_sections(mut self, sections: u64) -> Self {
+        self.sections = Some(sections);
+        self
+    }
+
+    pub const fn with_staging_bytes(mut self, staging_bytes: u64) -> Self {
+        self.staging_bytes = Some(staging_bytes);
+        self
+    }
+
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), RobotContractError> {
+        for (path, value) in [
+            ("/stage", self.stage.as_str()),
+            ("/result", self.result.as_str()),
+        ] {
+            if value.is_empty() || !value.is_ascii() {
+                return Err(RobotContractError::new(path, "must be non-empty ASCII"));
+            }
+        }
+        for (path, value) in [
+            ("/source_root_sha256", self.source_root_sha256.as_deref()),
+            ("/census_sha256", self.census_sha256.as_deref()),
+            ("/fnlpq_file_sha256", self.fnlpq_file_sha256.as_deref()),
+            (
+                "/license_bundle_sha256",
+                self.license_bundle_sha256.as_deref(),
+            ),
+        ] {
+            if value.is_some_and(|value| !is_lower_sha256(value)) {
+                return Err(RobotContractError::new(path, "must be lowercase SHA-256"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Serialize exactly one typed conversion stage event to the robot data
+/// channel. Human diagnostics remain the caller's stderr responsibility.
+pub fn write_convert_stage_event<W: Write>(
+    writer: &mut W,
+    event: &RobotConvertStageEvent,
+) -> io::Result<()> {
+    event
+        .validate()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    serde_json::to_writer(&mut *writer, event).map_err(io::Error::other)?;
+    writer.write_all(b"\n")
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RobotCommand {
     Schema,
@@ -236,7 +407,7 @@ pub enum RobotCommand {
 /// The error-map bead owns the executable table. This frozen representation
 /// fixes the machine contract now, so that bead must make its table match this
 /// schema rather than adding a second public vocabulary.
-const ROBOT_SCHEMA_JSON: &str = r#"{"$id":"https://franken-nlp.dev/schema/robot/v1","$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"allOf":[{"if":{"properties":{"event":{"const":"doc_error"}}},"then":{"required":["input_line","request_seq"]}},{"if":{"properties":{"event":{"enum":["doc","token","run_complete"]}}},"then":{"required":["request_seq"]}}],"properties":{"byte_offset":{"minimum":0,"type":"integer"},"caller_id":{"minLength":1,"type":"string"},"event":{"enum":["run_start","stage","doc","doc_error","token","flush","run_complete","run_error"],"type":"string"},"input_line":{"minimum":1,"type":"integer"},"json_path":{"type":"string"},"request_seq":{"minimum":0,"type":"integer"},"schema_version":{"const":1,"type":"integer"},"status":{"type":"string"}},"required":["event","schema_version"],"title":"franken_nlp robot NDJSON v1","type":"object","x_fnlp_robot":{"commands":{"backends":{"fields":["architecture","backends","kind","schema_version","status"],"kind":"robot_backends","status":"populated"},"health":{"fields":["capabilities","kind","schema_version","thread_inventory"],"kind":"robot_health","status":"conditional"},"schema":{"kind":"robot_schema"}},"exit_code_authority":"src/error.rs","exit_codes":[{"code":0,"name":"ok"},{"code":1,"name":"generic"},{"code":2,"name":"usage"},{"code":3,"name":"model_not_found"},{"code":4,"name":"input_decode_or_parse"},{"code":5,"name":"budget_or_timeout"},{"code":6,"name":"cancelled"},{"code":7,"name":"artifact_integrity_or_format_or_version"},{"code":8,"name":"schema_or_recipe_compile"},{"code":9,"name":"admission_or_resource_limit"},{"code":10,"name":"structured_task_no_result"}],"request_seq_events":["doc","doc_error","token","run_complete"],"stderr":"diagnostics_only","stdout":"data_only","volatile_fields":[]}}"#;
+const ROBOT_SCHEMA_JSON: &str = r#"{"$id":"https://franken-nlp.dev/schema/robot/v2","$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"allOf":[{"if":{"properties":{"event":{"const":"doc_error"}}},"then":{"required":["input_line","request_seq"]}},{"if":{"properties":{"event":{"enum":["doc","token","run_complete"]}}},"then":{"required":["request_seq"]}},{"if":{"properties":{"event":{"const":"convert_stage"}}},"then":{"required":["command","result","stage"]}}],"properties":{"byte_offset":{"minimum":0,"type":"integer"},"caller_id":{"minLength":1,"type":"string"},"census_sha256":{"pattern":"^[0-9a-f]{64}$","type":"string"},"command":{"const":"convert","type":"string"},"destination":{"type":"string"},"event":{"enum":["run_start","stage","doc","doc_error","token","flush","run_complete","run_error","convert_stage"],"type":"string"},"fnlpq_file_sha256":{"pattern":"^[0-9a-f]{64}$","type":"string"},"input_line":{"minimum":1,"type":"integer"},"json_path":{"type":"string"},"license_bundle_sha256":{"pattern":"^[0-9a-f]{64}$","type":"string"},"reason":{"type":"string"},"request_seq":{"minimum":0,"type":"integer"},"result":{"minLength":1,"type":"string"},"schema_version":{"const":2,"type":"integer"},"sections":{"minimum":0,"type":"integer"},"source":{"type":"string"},"source_manifest":{"type":"string"},"source_root_sha256":{"pattern":"^[0-9a-f]{64}$","type":"string"},"stage":{"minLength":1,"type":"string"},"staging_artifact":{"type":"string"},"staging_bytes":{"minimum":0,"type":"integer"},"status":{"type":"string"},"tensors":{"minimum":0,"type":"integer"}},"required":["event","schema_version"],"title":"franken_nlp robot NDJSON v2","type":"object","x_fnlp_robot":{"commands":{"backends":{"fields":["architecture","backends","kind","schema_version","status"],"kind":"robot_backends","status":"populated"},"convert":{"fields":["command","stage","result","source","source_manifest","destination","staging_artifact","source_root_sha256","census_sha256","tensors","sections","fnlpq_file_sha256","staging_bytes","license_bundle_sha256","reason"],"kind":"robot_convert_stage","status":"partial"},"health":{"fields":["capabilities","kind","schema_version","thread_inventory"],"kind":"robot_health","status":"conditional"},"schema":{"kind":"robot_schema"}},"exit_code_authority":"src/error.rs","exit_codes":[{"code":0,"name":"ok"},{"code":1,"name":"generic"},{"code":2,"name":"usage"},{"code":3,"name":"model_not_found"},{"code":4,"name":"input_decode_or_parse"},{"code":5,"name":"budget_or_timeout"},{"code":6,"name":"cancelled"},{"code":7,"name":"artifact_integrity_or_format_or_version"},{"code":8,"name":"schema_or_recipe_compile"},{"code":9,"name":"admission_or_resource_limit"},{"code":10,"name":"structured_task_no_result"}],"request_seq_events":["doc","doc_error","token","run_complete"],"stderr":"diagnostics_only","stdout":"data_only","volatile_fields":[]}}"#;
 
 pub fn schema_json_bytes() -> Vec<u8> {
     let mut result = ROBOT_SCHEMA_JSON.as_bytes().to_vec();

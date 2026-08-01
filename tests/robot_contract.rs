@@ -1,6 +1,6 @@
 use std::{env, ffi::OsStr, fs, path::PathBuf};
 
-use franken_nlp::robot::{self, RobotCommand, RobotEvent, RobotEventType};
+use franken_nlp::robot::{self, RobotCommand, RobotConvertStageEvent, RobotEvent, RobotEventType};
 use serde_json::Value;
 
 const GOLDEN_PATH: &str = "tests/fixtures/robot_schema.golden.json";
@@ -137,6 +137,39 @@ fn request_sequences_and_error_locations_are_present_without_raw_input_echo() {
     assert_eq!(emitted["input_line"], Value::from(7));
     assert_eq!(emitted["byte_offset"], Value::from(11));
     assert_eq!(emitted["json_path"], Value::from("/request/document"));
+}
+
+#[test]
+fn convert_stage_events_are_versioned_ndjson_with_identity_fields() {
+    let schema = frozen_schema();
+    let event = RobotConvertStageEvent::new("census", "END")
+        .with_source_root_sha256("a".repeat(64))
+        .with_census_sha256("b".repeat(64))
+        .with_tensors(201);
+    let mut stdout = Vec::new();
+    robot::write_convert_stage_event(&mut stdout, &event)
+        .expect("typed conversion stage event must emit");
+    assert!(stdout.ends_with(b"\n"));
+    let emitted: Value = serde_json::from_slice(&stdout).expect("event must be valid JSON");
+    validate_emitted_event(&schema, &emitted);
+    assert_eq!(emitted["event"], Value::from("convert_stage"));
+    assert_eq!(emitted["command"], Value::from("convert"));
+    assert_eq!(emitted["stage"], Value::from("census"));
+    assert_eq!(emitted["result"], Value::from("END"));
+    assert_eq!(emitted["source_root_sha256"], Value::from("a".repeat(64)));
+    assert_eq!(emitted["census_sha256"], Value::from("b".repeat(64)));
+    assert_eq!(emitted["tensors"], Value::from(201));
+}
+
+#[test]
+fn convert_stage_events_reject_noncanonical_digests() {
+    let event =
+        RobotConvertStageEvent::new("census", "END").with_source_root_sha256("A".repeat(64));
+    let mut stdout = Vec::new();
+    let error = robot::write_convert_stage_event(&mut stdout, &event)
+        .expect_err("identity-bearing fields must be canonical");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(stdout.is_empty());
 }
 
 #[test]
