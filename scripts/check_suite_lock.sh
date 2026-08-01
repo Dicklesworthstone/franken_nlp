@@ -35,7 +35,8 @@ Usage: scripts/check_suite_lock.sh [--check|--generate] [--override FILE] [--ski
 --override    Untracked file containing `suite|absolute-path` rows. The only
               currently required source row for generation is `frankentorch`.
 --skip-cargo  Run manifest/lock/patch structural checks only. This is intended
-              for the pre-scaffold handoff; CI must not use it.
+              for narrow static diagnosis; a controller-authorized DSR
+              checkpoint must not use it.
 
 Every invocation emits `SUITE_LOCK RESULT=PASS|FAIL drift=<summary>`.
 EOF

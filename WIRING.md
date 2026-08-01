@@ -13,7 +13,7 @@ commit and request an occasional DSR checkpoint. The DSR recipe must run
 `scripts/check.sh` against the explicitly named Cargo feature graph
 `production`; a default-empty graph and `--all-features` are not substitutes.
 
-The exact retained DSR terminal receipt is:
+The required retained DSR terminal receipt schema is:
 
 ```text
 DSR_CHECKPOINT source_sha=<40-lower-hex> source_tree=clean production_graph=production entrypoint=scripts/check.sh dsr_run_id=<stable-id> result=PASS|FAIL

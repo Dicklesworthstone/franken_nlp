@@ -261,16 +261,21 @@ fnlp doctor                          # idempotent self-check/repair
 
 **1. Install script: *not yet available*.** The planned script installs and SHA-256-verifies the `fnlp` binary, then offers (interactive `y/N`; `--with-model` / `--no-pull` in automation) to run the installed binary's own `fnlp pull`; shell never touches model bytes itself. It is deliberately not shown as a runnable command: `install.sh` does not exist yet and there are no release binaries for it to install. This section becomes a command again when Phase 6 ships one.
 
-**2. From source** (after Phase 0 scaffolds the crate; suite dependencies are pinned by immutable git revision, so a fresh clone builds without the maintainer's sibling-directory layout):
+**2. From source — production build not yet available.** The crate has been
+scaffolded, but the required named `production` feature graph has not landed.
+The default-empty graph is not a production substitute. Once that graph and
+its no-Rayon suite leaves are wired and proved at a clean immutable SHA, the
+supported source-build command will be:
 
 ```bash
 git clone https://github.com/Dicklesworthstone/franken_nlp
 cd franken_nlp
-cargo build --locked --release        # produces target/release/fnlp and target/release/franken_nlp
+cargo build --locked --release --bins --no-default-features --features production
 ```
 
-This is a user-local build instruction, not project proof. Swarm panes do not
-run it, and its success cannot replace the controller's clean-SHA DSR receipt.
+This future command is a user-local build instruction, not current project
+proof. Swarm panes do not run it, and its eventual success cannot replace the
+controller's clean-SHA DSR receipt.
 
 **3. Embedded, as a Rust library** (after the first crate release; pin the exact published commit rather than a floating branch):
 
@@ -374,7 +379,7 @@ A few honest boundaries:
 
 ## FAQ
 
-**Is this production-ready today?** No; see the note on tense at the top. This repository currently contains the master plan, AGENTS.md, LICENSE, CHANGELOG, the review-provenance records, and this README; Phase −1 (the source/oracle truth pack) is the next milestone, and the plan's phase gates (−1 → 6) are the honest progress tracker.
+**Is this production-ready today?** No; see the note on tense at the top. The repository is now in an active Beads-driven, code-first implementation campaign, with Rust scaffolding and several provisional/synthetic surfaces present. Phase −1 and Phase 0 gates remain incomplete, the production feature graph is not wired, and no clean-SHA DSR receipt or model-present parity/release proof exists. Beads and `WIRING.md` report current implementation/proof state; the plan's phase gates (−1 → 6) remain the authority for promotion.
 
 **Why one model instead of a zoo?** Because the entire premise is specialization: compile-time shapes, a hand-scheduled loop, per-arch weight packing, prompts and calibration evaluated against one set of weights. Every generality knob added back spends performance and verifiability. franken_ocr proved this shape ships; `fnlp` inherits it.
 
