@@ -322,23 +322,25 @@ fn every_pinned_media_kind_keeps_its_template_derived_reminder_name() {
     let video = "<reminder>You are unable to process this video because you don't have multi-modal input ability. Try different methods.</reminder>";
     let audio = "<reminder>You are unable to process this audio because you don't have multi-modal input ability. Try different methods.</reminder>";
     let cases = vec![
-        ("image", ContentPart::Image { source: None }, image),
-        ("image_url", ContentPart::ImageUrl { source: None }, image),
-        ("video", ContentPart::Video { source: None }, video),
-        ("video_url", ContentPart::VideoUrl { source: None }, video),
-        ("audio", ContentPart::Audio { source: None }, audio),
-        ("audio_url", ContentPart::AudioUrl { source: None }, audio),
-        ("input_audio", ContentPart::InputAudio { source: None }, audio),
+        ("image", image),
+        ("image_url", image),
+        ("video", video),
+        ("video_url", video),
+        ("audio", audio),
+        ("audio_url", audio),
+        ("input_audio", audio),
     ];
 
-    for (kind, part, reminder) in cases {
-        let conversation = Conversation::new(vec![Message {
-            role: MessageRole::User,
-            content: MessageContent::Parts(vec![part]),
-            reasoning: None,
-            tool_calls: Vec::new(),
-            tool_results: Vec::new(),
-        }]);
+    for (kind, reminder) in cases {
+        let input = json!({
+            "messages": [{
+                "role": "user",
+                "content": [{"type": kind}],
+            }],
+        })
+        .to_string();
+        let conversation = Conversation::from_json(&input)
+            .expect("each pinned media kind is accepted by the typed boundary");
         let rendered = TemplateBuilder::with_options(RenderOptions {
             add_generation_prompt: false,
             ..RenderOptions::default()
