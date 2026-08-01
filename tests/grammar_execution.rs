@@ -139,6 +139,24 @@ fn primitive_selection_matrix_uses_one_exact_path_per_state() {
         })
     ));
     assert_eq!(copy.log().primitive, "CopyFromSource");
+
+    let mismatched_witness = compiler()
+        .compile_state(ProductExecutionState {
+            forced_path: Some(ForcedPath::Proven(
+                ForcedRun::new(vec![3], vec![unique_witness(3)], None)
+                    .expect("the proposed token has a complete one-token witness"),
+            )),
+            ..state(4, &[2, 3])
+        })
+        .expect("a stale witness falls back rather than becoming a forced token");
+    assert!(matches!(
+        mismatched_witness.primitive(),
+        ExecutionPrimitive::ProjectLegal(_)
+    ));
+    assert_eq!(
+        mismatched_witness.log().fallback_reason,
+        Some(ForcedDisableReason::WitnessDoesNotMatchUniversalMask)
+    );
 }
 
 #[test]
