@@ -22,6 +22,16 @@ untracked `.claude/` directory was deliberately excluded. Publisher settings wer
 contains them. Later source, graph, or publisher changes require an explicit delta review;
 none silently updates this snapshot.
 
+**Post-snapshot publisher delta — `2026-08-01T04:57:02Z`.** Commit
+`8cb62536e72388a52ddd0a47e3cddb7edd72f635` retained the workflow as a
+schema-valid zero-event historical record; GitHub parsed it as
+`CI (historical; inert)`, and neither that commit nor pushed shared HEAD
+`6359c87156af4f9d7b3802f95dfc47e94e962bb1` created a run. The repository
+permission then returned `enabled=false` for Actions. Beads `franken_nlp-wdne`
+and `franken_nlp-i2o3` retain the source/API receipts. Immutable releases remain
+`enabled=false`, `enforced_by_owner=false`. This delta changes publisher state
+only; it does not promote any code, DSR, model, artifact, host, or release claim.
+
 ## 0. Proof-state correction — 2026-07-31 fresh-eyes pass
 
 The implementation inventory and bridge ordering below remain useful, but the original
@@ -150,7 +160,7 @@ CLI command runs real model inference at the bound source snapshot.
 | Native product/model run | **ABSENT** | nothing | real `NlpEngine`, CLI generation, tasks, batch, quality, long-context claims |
 | Host performance | **ABSENT** | roofline hypotheses only | tok/s, docs/min, Apple/AVX2/AVX-512 dispatch winners, energy, p99 |
 | Platform filesystem authority | **BLOCKED** | honest refusal behavior | real pull/derive/activation durability |
-| Publisher/repository state | **QUERIED `2026-08-01T03:16:55Z`: Actions enabled; immutable releases disabled** | the need for `wdne`, `i2o3`, and `w9e.1` | artifact authenticity, immutable publication, release certification, or later settings state |
+| Publisher/repository state | **POST-SNAPSHOT DELTA `2026-08-01T04:57:02Z`: retained workflow inert; Actions disabled; immutable releases disabled** | `wdne` source receipt + `i2o3` repository-setting receipt; `w9e.1` remains blocked | DSR/build authority, artifact authenticity, immutable publication, release certification, or later settings state |
 | Human/task-quality authority | **ABSENT** | synthetic mechanics only | extraction/NER/sentiment/classification quality or corpus acceptance |
 | Bead graph | **BOUND to `53416a0…`: 184 total, 163 open, 16 blocked, 5 in progress, 0 closed** | ownership and prerequisite planning at that ledger commit; 184 nodes/554 edges, density 0.016452839, zero active cycles | proof that any implementation gate passed or later graph state |
 
@@ -271,8 +281,9 @@ never inferred from the repaired counts alone.
    sealed asupersync CPU team, aggregate admission, or no-Rayon production closure.
 7. **No autoregressive product path exists.** Decode/sampler/scheduler/task modules remain
    scaffolds; `NlpEngine` is a lease/re-entry facade, not yet an NLP engine.
-8. **Distribution is absent.** `fnlp pull` and both installers do not exist, GitHub Actions
-   remain enabled and auto-triggered contrary to policy, and immutable releases are disabled.
+8. **Distribution is absent.** `fnlp pull` and both installers do not exist. The retained
+   workflow is now inert and repository Actions are disabled, but immutable releases remain
+   disabled and no DSR/package/pull/offline-replay release chain exists.
 
 ## 4. Bridge and governance Beads
 
@@ -356,8 +367,9 @@ routing decision.
 is explicitly packaged into fixed parts; an immutable draft release is clean-downloaded and
 verified; the exact binary's `fnlp pull` owns compatibility, resume, hashes, reassembly,
 native packing, and activation; installers merely verify/install that binary and delegate.
-The release remains blocked until repository Actions are disabled, the retained workflow is
-inert, immutable releases are enabled, and DSR/offline signature receipts pass.
+The Actions/workflow prerequisite is now satisfied. The release remains blocked until
+immutable releases are enabled and the DSR, package, pull, offline-signature, and fresh-machine
+replay receipts pass.
 
 ## 6. Integration gates (each joint gets its own proof)
 

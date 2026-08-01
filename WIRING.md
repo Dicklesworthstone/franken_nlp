@@ -26,14 +26,17 @@ At the current implementation snapshot, that receipt cannot yet be minted:
   named release graph;
 - the release-graph dependency-policy script has not landed, so the check
   entrypoint cannot yet reject Rayon or multiple `asupersync` sources in the
-  selected product closure; and
-- `.github/workflows/ci.yml` still auto-triggers the non-authoritative check on
-  pushes and pull requests, contrary to the DSR-only operating rule. The live
-  repository API also reported Actions `enabled=true` with
-  `allowed_actions=all`; recent pushes created cancelled CI runs. The workflow
-  must be made inert and repository Actions disabled through separately
-  assigned implementation and external-setting authority. This documentation
-  record does not itself authorize either mutation or deletion.
+  selected product closure.
+
+The earlier repository-authority blocker is now resolved without creating build
+evidence. Commit `8cb62536e72388a52ddd0a47e3cddb7edd72f635` retained
+`.github/workflows/ci.yml` as a zero-event historical record with a false job
+guard. GitHub parsed it as workflow `CI (historical; inert)`, and the push that
+contained it created no workflow run. At `2026-08-01T04:57:02Z`, the repository
+Actions permission returned `enabled=false`; Beads `franken_nlp-wdne` and
+`franken_nlp-i2o3` retain the source and API receipts. This proves only that
+GitHub Actions is inert and disabled. It does not supply DSR, Cargo, model,
+artifact, host, or release evidence, and the workflow history remains preserved.
 
 These are setup blockers, not reasons to run the default graph and annotate the
 result. No DSR execution should be requested until one immutable commit contains
