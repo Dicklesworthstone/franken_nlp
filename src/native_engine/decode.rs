@@ -620,7 +620,10 @@ fn empty_output(params: &DecodeParams, profile: &str) -> DecodeOutput {
 
 fn refuse_primed_engine(engine: &HfBf16EagerEngine) -> Result<(), DecodeError> {
     for slot in 0..KV_SLOT_COUNT {
-        let cached_positions = engine.kv_cache().len_for_slot(slot)?;
+        let cached_positions = engine
+            .kv_cache()
+            .len_for_slot(slot)
+            .map_err(HfBf16EagerError::from)?;
         if cached_positions != 0 {
             return Err(DecodeError::EngineAlreadyPrimed {
                 slot,
@@ -769,6 +772,8 @@ impl DecodeStepControl for NeverCancelled {
 mod tests {
     use std::fmt;
 
+    use crate::native_engine::{hf_bf16_eager::HfBf16EagerError, kv::KvCacheError};
+
     use super::{
         DECODE_TOKEN_EVENT_SCHEMA_VERSION, DecodeError, DecodeEventSink, DecodeFinishReason,
         DecodeParams, DecodeStopPolicy, DecodeTokenEvent, deliver_stream_event, empty_output,
@@ -787,6 +792,24 @@ mod tests {
                 requested_new_tokens: 2,
                 required_positions: 4,
             })
+        );
+    }
+
+    #[test]
+    fn context_budget_refuses_position_arithmetic_overflow() {
+        assert_eq!(
+            validate_context_budget(usize::MAX, usize::MAX, 2),
+            Err(DecodeError::ContextBudgetOverflow)
+        );
+    }
+
+    #[test]
+    fn cache_introspection_refusal_stays_a_typed_engine_error() {
+        let error: DecodeError =
+            HfBf16EagerError::from(KvCacheError::InvalidSlot { slot: 44 }).into();
+        assert_eq!(
+            error,
+            DecodeError::Engine(HfBf16EagerError::Kv(KvCacheError::InvalidSlot { slot: 44 }))
         );
     }
 
