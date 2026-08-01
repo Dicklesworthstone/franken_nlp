@@ -135,6 +135,41 @@ fn tiny_input() -> FnlpqWriterInput {
     }
 }
 
+#[test]
+fn logical_model_identity_binds_model_and_revision_authority() {
+    let tensor = [0x42; 32];
+    let sources = [
+        ("model_config", br#"{"hidden_size":2}"#.as_slice()),
+        ("tokenizer_model", &[0x50, 0x4b, 0x03, 0x04][..]),
+        ("tokenizer_config", br#"{"bos_token":"<s>"}"#.as_slice()),
+        ("chat_template", b"{% set x = 1 %}".as_slice()),
+    ];
+    let canonical = compute_logical_model_sha256(
+        "FnlpqTinyGolden",
+        "f56ec5a9650268aa098496734743c25ea778bd2d",
+        &[tensor],
+        &sources,
+    )
+    .expect("canonical tiny logical model identity");
+    let different_model = compute_logical_model_sha256(
+        "FnlpqOtherGolden",
+        "f56ec5a9650268aa098496734743c25ea778bd2d",
+        &[tensor],
+        &sources,
+    )
+    .expect("different model identity is well formed");
+    let different_revision = compute_logical_model_sha256(
+        "FnlpqTinyGolden",
+        "0000000000000000000000000000000000000000",
+        &[tensor],
+        &sources,
+    )
+    .expect("different revision identity is well formed");
+
+    assert_ne!(canonical, different_model);
+    assert_ne!(canonical, different_revision);
+}
+
 fn checked_mapping_bytes(
     artifact: &FnlpqArtifact,
     section_ordinal: u64,
