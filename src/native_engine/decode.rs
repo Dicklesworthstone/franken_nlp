@@ -121,6 +121,8 @@ pub struct DecodeParams {
     pub request_seq: u64,
     /// Strict upper bound on generated tokens committed to the output.
     pub max_new_tokens: usize,
+    /// Strict upper bound on decoded bytes committed to the output.
+    pub max_output_bytes: usize,
     /// EOS, byte-stop, and minimum-length policy.
     pub stop: DecodeStopPolicy,
     /// Greedy by default; seeded sampling remains a typed deferred route.
@@ -136,11 +138,16 @@ pub struct DecodeParams {
 impl DecodeParams {
     /// Construct the smallest valid request for this eager greedy core.
     #[must_use]
-    pub fn hf_bf16_greedy(request_seq: u64, max_new_tokens: usize) -> Self {
+    pub fn hf_bf16_greedy(
+        request_seq: u64,
+        max_new_tokens: usize,
+        max_output_bytes: usize,
+    ) -> Self {
         Self {
             schema_version: DECODE_SCHEMA_VERSION,
             request_seq,
             max_new_tokens,
+            max_output_bytes,
             stop: DecodeStopPolicy::default(),
             sampling: DecodeSamplingMode::Greedy,
             thinking: None,
@@ -559,6 +566,10 @@ pub fn greedy_decode_with_hooks<D: DecodeByteDecoder, S: DecodeEventSink, C: Dec
                 decoded_len: decoded.len(),
             });
         }
+        if decoded.len() > params.max_output_bytes {
+            output.finish_reason = DecodeFinishReason::Budget;
+            return Ok(output);
+        }
         let token_bytes = decoded[output.decoded_bytes.len()..].to_vec();
         let event = DecodeTokenEvent {
             schema_version: DECODE_TOKEN_EVENT_SCHEMA_VERSION,
@@ -771,7 +782,7 @@ mod tests {
 
     #[test]
     fn byte_stop_sequences_match_only_after_minimum_length() {
-        let mut params = DecodeParams::hf_bf16_greedy(7, 2);
+        let mut params = DecodeParams::hf_bf16_greedy(7, 2, 32);
         params.stop = DecodeStopPolicy {
             eos_token_ids: vec![9],
             stop_sequences: vec![vec![0xe2, 0x80, 0xa6]],
@@ -792,7 +803,7 @@ mod tests {
 
     #[test]
     fn eos_has_priority_over_the_same_step_output_budget() {
-        let mut params = DecodeParams::hf_bf16_greedy(7, 1);
+        let mut params = DecodeParams::hf_bf16_greedy(7, 1, 32);
         params.stop.eos_token_ids.push(9);
         let mut output = empty_output(&params, "hf-bf16-eager");
         output.emitted_token_ids.push(9);
@@ -804,7 +815,7 @@ mod tests {
 
     #[test]
     fn output_budget_still_terminates_when_the_minimum_is_larger() {
-        let mut params = DecodeParams::hf_bf16_greedy(7, 1);
+        let mut params = DecodeParams::hf_bf16_greedy(7, 1, 32);
         params.stop.min_new_tokens = 2;
         let mut output = empty_output(&params, "hf-bf16-eager");
         output.emitted_token_ids.push(41);
@@ -816,7 +827,7 @@ mod tests {
 
     #[test]
     fn empty_stop_sequence_is_refused_before_engine_use() {
-        let mut params = DecodeParams::hf_bf16_greedy(0, 1);
+        let mut params = DecodeParams::hf_bf16_greedy(0, 1, 32);
         params.stop.stop_sequences.push(Vec::new());
         assert_eq!(
             params.validate_for_eager_greedy(),
@@ -826,13 +837,14 @@ mod tests {
 
     #[test]
     fn frozen_request_and_output_wire_shapes_remain_reviewable() {
-        let params = DecodeParams::hf_bf16_greedy(41, 2);
+        let params = DecodeParams::hf_bf16_greedy(41, 2, 64);
         assert_eq!(
             serde_json::to_value(&params).expect("serialize frozen decode params"),
             json!({
                 "schema_version": 1,
                 "request_seq": 41,
                 "max_new_tokens": 2,
+                "max_output_bytes": 64,
                 "stop": {
                     "eos_token_ids": [],
                     "stop_sequences": [],

@@ -100,6 +100,21 @@ fn prepared_append_uses_only_preallocated_aligned_slabs() {
 }
 
 #[test]
+fn page_admission_refuses_atomically_before_any_slab_is_assigned() {
+    let mut cache = KvSlabCache::try_with_capacity(16, KV_SLABS_PER_LOGICAL_PAGE - 1)
+        .expect("the intentionally undersized pool itself remains constructible");
+    assert!(matches!(
+        cache.prepare_append(0),
+        Err(KvSlabError::PoolExhausted {
+            requested: KV_SLABS_PER_LOGICAL_PAGE,
+            available: KV_SLABS_PER_LOGICAL_PAGE - 1,
+        })
+    ));
+    assert_eq!(cache.pool_stats().live_slab_count, 0);
+    assert_eq!(cache.pool_stats().live_payload_bytes, 0);
+}
+
+#[test]
 fn forked_tail_cow_releases_only_the_cancelled_fork_slabs() {
     let mut parent = KvSlabCache::try_with_capacity(32, KV_SLABS_PER_LOGICAL_PAGE * 2)
         .expect("the pool reserves a parent page plus one COW tail");

@@ -25,6 +25,7 @@ use crate::{
     artifact::safetensors::{RowPanel, TensorCensusEntry},
     error::ErrorCode,
     grammar::{CompileLimits, CompiledSchema, SchemaError, compile_json_schema},
+    orchestrator::{AdmissionRequest, KvCacheQuantization, ResidencyAccounting},
     robot::{self, RobotCommand},
 };
 use clap::{CommandFactory, Parser, Subcommand};
@@ -149,6 +150,59 @@ enum RobotSubcommand {
     Health,
     /// Emit an honest unpopulated backend inventory skeleton.
     Backends,
+    /// Print a non-allocating admission-certificate calculation.
+    Plan(RobotPlanCommand),
+}
+
+#[derive(clap::Args)]
+struct RobotPlanCommand {
+    /// Requested per-sequence context. The default usable cap is 8192 tokens.
+    #[arg(long, default_value_t = 8_192)]
+    ctx: u64,
+    /// Number of simultaneous sequence rows in this bounded admission group.
+    #[arg(long, default_value_t = 1)]
+    batch: u64,
+    /// Closed K/V-cache accounting profile: bf16, int8, or int8-f16-scales.
+    #[arg(long, default_value = "bf16")]
+    quant: String,
+    /// Maximum modeled process commitment. `--memory-budget` is an exact alias.
+    #[arg(long = "memory-budget-total", visible_alias = "memory-budget")]
+    memory_budget_total: Option<u64>,
+    /// Non-allocatable operating-system reserve within the local budget.
+    #[arg(long, default_value_t = 0)]
+    memory_reserve_os: u64,
+    /// Exact bytes mapped for active model packing, tokenizer, immutable caches, and runtime.
+    #[arg(long)]
+    fixed_mapped_bytes: Option<u64>,
+    /// Exact resident commitment for the active fixed mapping.
+    #[arg(long)]
+    fixed_resident_bytes: Option<u64>,
+    /// Exact elastic cache allowance outside the per-row request state.
+    #[arg(long, default_value_t = 0)]
+    elastic_cache_bytes: u64,
+    /// Optional extra mapping for replicated/NUMA-local weights.
+    #[arg(long, default_value_t = 0)]
+    replicated_weight_mapped_bytes: u64,
+    /// Optional extra resident commitment for replicated/NUMA-local weights.
+    #[arg(long, default_value_t = 0)]
+    replicated_weight_resident_bytes: u64,
+    /// Exact K/V allocator padding and page-table bytes for one token row.
+    #[arg(long)]
+    kv_page_metadata_per_token: Option<u64>,
+    #[arg(long, default_value_t = 0)]
+    activation_bytes_per_row: u64,
+    #[arg(long, default_value_t = 0)]
+    grammar_state_bytes_per_row: u64,
+    #[arg(long, default_value_t = 0)]
+    source_state_bytes_per_row: u64,
+    #[arg(long, default_value_t = 0)]
+    queue_bytes_per_row: u64,
+    #[arg(long, default_value_t = 0)]
+    output_buffer_bytes_per_row: u64,
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    unmodeled_emergency_reserve_bytes: u64,
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    safety_margin_bytes: u64,
 }
 
 #[derive(Subcommand)]
@@ -193,13 +247,68 @@ enum ReleaseSubcommand {
     },
 }
 
-impl From<RobotSubcommand> for RobotCommand {
-    fn from(command: RobotSubcommand) -> Self {
+impl TryFrom<RobotSubcommand> for RobotCommand {
+    type Error = &'static str;
+
+    fn try_from(command: RobotSubcommand) -> Result<Self, Self::Error> {
         match command {
-            RobotSubcommand::Schema => Self::Schema,
-            RobotSubcommand::Health => Self::Health,
-            RobotSubcommand::Backends => Self::Backends,
+            RobotSubcommand::Schema => Ok(Self::Schema),
+            RobotSubcommand::Health => Ok(Self::Health),
+            RobotSubcommand::Backends => Ok(Self::Backends),
+            RobotSubcommand::Plan(command) => command.admission_request().map(Self::Plan),
         }
+    }
+}
+
+impl RobotPlanCommand {
+    fn admission_request(self) -> Result<AdmissionRequest, &'static str> {
+        let quantization = KvCacheQuantization::parse(&self.quant)
+            .ok_or("--quant must be bf16, int8, or int8-f16-scales")?;
+        let fixed_residency = match (self.fixed_mapped_bytes, self.fixed_resident_bytes) {
+            (None, None) => None,
+            (Some(mapped_bytes), Some(resident_bytes)) => {
+                Some(ResidencyAccounting::new(mapped_bytes, resident_bytes).ok_or(
+                    "--fixed-resident-bytes cannot exceed --fixed-mapped-bytes",
+                )?)
+            }
+            _ => {
+                return Err(
+                    "--fixed-mapped-bytes and --fixed-resident-bytes must be supplied together",
+                );
+            }
+        };
+        let replicated_weight_residency = ResidencyAccounting::new(
+            self.replicated_weight_mapped_bytes,
+            self.replicated_weight_resident_bytes,
+        )
+        .ok_or(
+            "--replicated-weight-resident-bytes cannot exceed --replicated-weight-mapped-bytes",
+        )?;
+        let mut request = AdmissionRequest::decode(self.ctx, self.batch, quantization)
+            .with_os_reserve(self.memory_reserve_os)
+            .with_elastic_cache(self.elastic_cache_bytes)
+            .with_replicated_weight_residency(replicated_weight_residency)
+            .with_elastic_rows(
+                self.activation_bytes_per_row,
+                self.grammar_state_bytes_per_row,
+                self.source_state_bytes_per_row,
+                self.queue_bytes_per_row,
+                self.output_buffer_bytes_per_row,
+            )
+            .with_reserves(
+                self.unmodeled_emergency_reserve_bytes,
+                self.safety_margin_bytes,
+            );
+        if let Some(memory_budget_total) = self.memory_budget_total {
+            request = request.with_local_memory_budget(memory_budget_total);
+        }
+        if let Some(fixed_residency) = fixed_residency {
+            request = request.with_fixed_residency(fixed_residency);
+        }
+        if let Some(kv_page_metadata_per_token) = self.kv_page_metadata_per_token {
+            request = request.with_kv_page_metadata_per_token(kv_page_metadata_per_token);
+        }
+        Ok(request)
     }
 }
 
@@ -232,9 +341,16 @@ fn cli_main_with_reader_and_terminal(
 ) -> ExitCode {
     match Cli::parse_from(args).command {
         Some(Command::Robot { command }) => {
+            let command = match RobotCommand::try_from(command) {
+                Ok(command) => command,
+                Err(error) => {
+                    eprintln!("ROBOT_PLAN RESULT=REFUSED reason={error}");
+                    return ErrorCode::Usage.as_process_exit();
+                }
+            };
             let mut stdout = io::stdout().lock();
             let mut stderr = io::stderr().lock();
-            match robot::write_command(&mut stdout, &mut stderr, command.into()) {
+            match robot::write_command(&mut stdout, &mut stderr, command) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     eprintln!("fnlp: robot output failure: {error}");

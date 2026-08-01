@@ -105,7 +105,16 @@ fn eager_greedy_loop_matches_the_recorded_smoke_prefix_and_stream_bytes() {
     let mut engine = HfBf16EagerEngine::new(weights, context_cap)
         .expect("fixture context must admit every required K/V feedback position");
     let tokenizer = EmbeddedTokenizer::pinned().expect("embedded tokenizer must parse");
-    let params = DecodeParams::hf_bf16_greedy(41, oracle.execution.greedy_new_token_ids.len());
+    let params = DecodeParams::hf_bf16_greedy(
+        41,
+        oracle.execution.greedy_new_token_ids.len(),
+        oracle
+            .execution
+            .greedy_new_token_ids
+            .len()
+            .checked_mul(256)
+            .expect("fixture byte budget arithmetic must fit usize"),
+    );
     let mut sink = RecordingSink::default();
     let output = greedy_decode_with_sink(
         &mut engine,
