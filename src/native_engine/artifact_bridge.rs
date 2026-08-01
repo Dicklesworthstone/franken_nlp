@@ -1,19 +1,16 @@
 //! Checked `.fnlpq` tensor materialization for native-engine profiles.
 //!
 //! This module deliberately separates the checked envelope metadata from the
-//! bytes used to materialize a tensor.  A production source must expose one
-//! mapping at a time; it may not retain the envelope while the native weight
-//! set is assembled.  The current owned-buffer reader is deliberately not
-//! adapted here: artifact schema and transaction authority remain unresolved.
-//! A future ratified streaming reader may implement `CheckedArtifactSource`
-//! directly.
+//! bytes used to materialize a tensor.  This is synthetic code-first
+//! scaffolding, not an artifact activation path.  A future production source
+//! must expose one mapping at a time and may not retain the envelope while the
+//! native weight set is assembled.  The current owned-buffer reader is
+//! deliberately not adapted here: artifact schema and transaction authority
+//! remain unresolved.
 
 use std::{collections::BTreeMap, error::Error, fmt};
 
-use crate::artifact::converter::{
-    BF16_VERBATIM_V1, PORTABLE_QUANT_V1, StorageStage, expected_nanbeige42_census,
-    remap_tensor_name,
-};
+use crate::artifact::converter::{BF16_VERBATIM_V1, PORTABLE_QUANT_V1, StorageStage};
 
 use super::{
     tensor::Bf16,
@@ -21,6 +18,7 @@ use super::{
 };
 
 const NANBEIGE_MODEL_ID: &str = "Nanbeige4.2-3B";
+const SYNTHETIC_SCOPE: &str = "scope=synthetic evidence=non_authoritative";
 
 /// One Generic mapping selected from a checked tensor declaration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,7 +92,7 @@ pub struct ArtifactIdentity {
     pub logical_model_sha256: String,
 }
 
-/// A checked source that can expose only bounded portions of one tensor mapping.
+/// A synthetic checked source that can expose only bounded portions of one tensor mapping.
 ///
 /// Implementations are responsible for validating the envelope before they
 /// expose bytes.  The bridge verifies that every callback contributes exactly
@@ -109,9 +107,8 @@ pub trait CheckedArtifactSource {
 
     /// Bytes already resident solely because of the source representation.
     ///
-    /// A file-backed production implementation reports zero.  The current
-    /// owned-buffer reader reports the complete envelope, which lets the
-    /// budget reject it before weight allocation.
+    /// A future ratified file-backed implementation reports zero.  No current
+    /// `.fnlpq` reader implements this interface.
     fn resident_envelope_bytes(&self) -> u64;
 
     /// Visit one mapping in bounded chunks after the envelope is checked.
@@ -123,7 +120,7 @@ pub trait CheckedArtifactSource {
     ) -> Result<(), ArtifactBridgeError>;
 }
 
-/// The production loader's explicit allocation and streaming limits.
+/// Explicit allocation and streaming limits for synthetic bridge exercises.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArtifactLoadBudget {
     /// Maximum bytes in the completed native weight set.
@@ -131,7 +128,7 @@ pub struct ArtifactLoadBudget {
     /// Maximum callback chunk accepted from the checked source.
     pub max_stream_chunk_bytes: u64,
     /// Maximum source-owned envelope bytes while native weights are built.
-    /// Production callers set this to zero.
+    /// All synthetic fixtures use zero.
     pub max_resident_envelope_bytes: u64,
 }
 
@@ -147,7 +144,7 @@ impl ArtifactLoadBudget {
     }
 }
 
-/// A typed tensor contract used by the production one-model census and tests.
+/// A typed tensor contract used only by synthetic bridge tests.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArtifactTensorContract {
     /// Artifact-facing source tensor name.
@@ -239,24 +236,28 @@ impl ArtifactWeightSet {
     }
 }
 
-/// Modeled memory facts retained for a later process-RSS rehearsal gate.
+/// Declared synthetic-memory facts retained for a later process-RSS rehearsal gate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArtifactLoadReceipt {
-    /// Bytes retained by the completed native weight set.
-    pub weight_bytes: u64,
+    /// Sum of the tensor mappings declared by the synthetic contract.
+    pub declared_mapping_bytes: u64,
     /// Largest source callback actually observed during this load.
     pub largest_stream_chunk_bytes: u64,
-    /// Source representation residency admitted before allocation.
-    pub resident_envelope_bytes: u64,
+    /// Source representation residency declared by the synthetic source.
+    pub declared_source_resident_bytes: u64,
 }
 
 impl ArtifactLoadReceipt {
-    /// A conservative modeled ceiling for the bridge's own retained bytes.
+    /// Declared mapping bytes plus one observed chunk and source residency.
+    ///
+    /// This omits allocator, `BTreeMap`, key, descriptor, contract, and vector
+    /// capacity overhead.  It is neither a resident-set measurement nor an
+    /// admissible peak-RSS assertion.
     #[must_use]
-    pub fn modeled_resident_ceiling_bytes(self) -> Option<u64> {
-        self.weight_bytes
+    pub fn modeled_declared_bytes_without_overhead(self) -> Option<u64> {
+        self.declared_mapping_bytes
             .checked_add(self.largest_stream_chunk_bytes)?
-            .checked_add(self.resident_envelope_bytes)
+            .checked_add(self.declared_source_resident_bytes)
     }
 }
 
@@ -265,6 +266,8 @@ impl ArtifactLoadReceipt {
 pub enum ArtifactBridgeError {
     /// The artifact did not identify the only supported model.
     ModelId { observed: String },
+    /// Current OQ-31 schema and artifact-activation authority is unresolved.
+    SchemaAuthority { detail: &'static str },
     /// A source descriptor did not match the explicit on-load census contract.
     Census { tensor: String, reason: String },
     /// A mapping's dtype, bytes, or values violated its selected stage.
@@ -292,6 +295,12 @@ impl fmt::Display for ArtifactBridgeError {
                 write!(
                     formatter,
                     "artifact engine bridge rejects model_id={observed:?}"
+                )
+            }
+            Self::SchemaAuthority { detail } => {
+                write!(
+                    formatter,
+                    "artifact engine bridge authority unavailable: {detail}"
                 )
             }
             Self::Census { tensor, reason } => {
@@ -337,21 +346,21 @@ impl Error for ArtifactBridgeError {}
 /// The result of one checked materialization pass.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LoadedArtifactWeights {
-    /// Mixed bf16/int8 profile-ready weight sets.
+    /// Synthetic mixed bf16/int8 materialization output.
     pub weights: ArtifactWeightSet,
-    /// Memory facts for a later real-data RSS rehearsal assertion.
+    /// Declared synthetic-memory facts; never a real-data RSS receipt.
     pub receipt: ArtifactLoadReceipt,
 }
 
-/// Materialize the fixed Nanbeige census from a checked streaming source.
+/// Refuse one-model artifact activation until OQ-31 and xmy authority are ratified.
 ///
-/// This performs the census/name route before any mapping bytes are accepted.
-/// It does not claim L2 equivalence: current parity evidence is independently
-/// blocked on the oracle/provenance authority described in the project record.
+/// The model-id check keeps the refusal named; revision, recipe, source-root,
+/// packing, tokenizer, transaction, and receipt binding must be defined by the
+/// one ratified artifact authority before this function may materialize bytes.
 pub fn load_nanbeige42<S, F>(
     source: &S,
     budget: ArtifactLoadBudget,
-    stage_line: F,
+    mut stage_line: F,
 ) -> Result<LoadedArtifactWeights, ArtifactBridgeError>
 where
     S: CheckedArtifactSource,
@@ -362,15 +371,21 @@ where
             observed: source.identity().model_id.clone(),
         });
     }
-    let contract = nanbeige42_contract()?;
-    load_with_contract(source, budget, &contract, stage_line)
+    let _ = budget;
+    stage_line(
+        "LOAD STAGE=activation scope=synthetic evidence=non_authoritative status=REFUSED reason=oq31-authority-unresolved",
+    );
+    Err(ArtifactBridgeError::SchemaAuthority {
+        detail: "OQ-31 schema selection and artifact activation identity are unresolved",
+    })
 }
 
-/// Materialize an explicit checked tensor contract.
+/// Materialize an explicit synthetic tensor contract.
 ///
-/// Public only so narrow synthetic fixtures can exercise the same decoder,
-/// route, and memory admission path without allocating the 3B-model census.
-pub fn load_with_contract<S, F>(
+/// This is non-production test scaffolding.  It is intentionally unable to
+/// activate a `.fnlpq`, bind a real artifact identity, or establish L2 proof.
+#[doc(hidden)]
+pub fn load_synthetic_with_contract<S, F>(
     source: &S,
     budget: ArtifactLoadBudget,
     contract: &[ArtifactTensorContract],
@@ -388,7 +403,9 @@ where
             limit: budget.max_resident_envelope_bytes,
         });
     }
-    stage_line("LOAD STAGE=preflight status=BEGIN");
+    stage_line(&format!(
+        "LOAD STAGE=preflight {SYNTHETIC_SCOPE} status=BEGIN"
+    ));
     let descriptors = index_descriptors(source.tensors())?;
     validate_contract(&descriptors, contract)?;
     let weight_bytes = contract.iter().try_fold(0_u64, |total, expected| {
@@ -413,7 +430,7 @@ where
         });
     }
     stage_line(&format!(
-        "LOAD STAGE=census status=PASS tensors={} weight_bytes={weight_bytes}",
+        "LOAD STAGE=census {SYNTHETIC_SCOPE} status=PASS tensors={} declared_mapping_bytes={weight_bytes}",
         contract.len()
     ));
 
@@ -445,22 +462,24 @@ where
             }
         }
         stage_line(&format!(
-            "LOAD STAGE=tensor status=PASS tensor={} route={} storage={}",
+            "LOAD STAGE=tensor {SYNTHETIC_SCOPE} status=PASS tensor={} route={} storage={}",
             expected.source_name,
             expected.internal_name,
             expected.stage.as_str()
         ));
     }
     let receipt = ArtifactLoadReceipt {
-        weight_bytes,
+        declared_mapping_bytes: weight_bytes,
         largest_stream_chunk_bytes,
-        resident_envelope_bytes,
+        declared_source_resident_bytes: resident_envelope_bytes,
     };
     stage_line(&format!(
-        "LOAD STAGE=complete status=PASS bf16_tensors={} quantized_tensors={} modeled_resident_ceiling_bytes={}",
+        "LOAD STAGE=complete {SYNTHETIC_SCOPE} status=PASS bf16_tensors={} quantized_tensors={} modeled_declared_bytes_without_overhead={}",
         bf16.len(),
         quantized.len(),
-        receipt.modeled_resident_ceiling_bytes().unwrap_or(u64::MAX)
+        receipt
+            .modeled_declared_bytes_without_overhead()
+            .unwrap_or(u64::MAX)
     ));
     Ok(LoadedArtifactWeights {
         weights: ArtifactWeightSet {
@@ -470,35 +489,6 @@ where
         },
         receipt,
     })
-}
-
-fn nanbeige42_contract() -> Result<Vec<ArtifactTensorContract>, ArtifactBridgeError> {
-    expected_nanbeige42_census()
-        .into_iter()
-        .map(|expected| {
-            let route =
-                remap_tensor_name(&expected.name).map_err(|error| ArtifactBridgeError::Census {
-                    tensor: expected.name.clone(),
-                    reason: format!("frozen route is unavailable: {error}"),
-                })?;
-            let shape = expected
-                .shape
-                .into_iter()
-                .map(|dimension| {
-                    u32::try_from(dimension).map_err(|_| ArtifactBridgeError::Census {
-                        tensor: expected.name.clone(),
-                        reason: "frozen shape does not fit artifact v1 u32 dimensions".to_owned(),
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(ArtifactTensorContract {
-                source_name: expected.name,
-                internal_name: route.internal_name,
-                shape,
-                stage: route.stage,
-            })
-        })
-        .collect()
 }
 
 fn index_descriptors<'a>(

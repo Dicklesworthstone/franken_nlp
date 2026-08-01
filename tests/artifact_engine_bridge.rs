@@ -5,7 +5,7 @@ use franken_nlp::native_engine::{
     artifact_bridge::{
         ArtifactBridgeError, ArtifactIdentity, ArtifactLoadBudget, ArtifactTensorContract,
         ArtifactTensorDescriptor, CheckedArtifactSource, TensorMapping, TensorMappingLengths,
-        load_with_contract,
+        load_nanbeige42, load_synthetic_with_contract,
     },
     tensor::Bf16,
 };
@@ -133,7 +133,7 @@ fn contracts() -> [ArtifactTensorContract; 2] {
 fn streaming_bridge_materializes_bf16_and_portable_int8_without_envelope_residency() {
     let fixture = StreamingFixture::expected();
     let mut lines = Vec::new();
-    let loaded = load_with_contract(
+    let loaded = load_synthetic_with_contract(
         &fixture,
         ArtifactLoadBudget::streaming_only(28, 3),
         &contracts(),
@@ -167,24 +167,22 @@ fn streaming_bridge_materializes_bf16_and_portable_int8_without_envelope_residen
     assert_eq!(quantized.values(), &[-1, 2, 3, -4]);
     assert_eq!(quantized.row_scales(), &[0.25, 0.5]);
     assert_eq!(quantized.row_sums(), &[1, -1]);
-    assert_eq!(loaded.receipt.weight_bytes, 28);
+    assert_eq!(loaded.receipt.declared_mapping_bytes, 28);
     assert_eq!(loaded.receipt.largest_stream_chunk_bytes, 3);
-    assert_eq!(loaded.receipt.resident_envelope_bytes, 0);
-    assert_eq!(loaded.receipt.modeled_resident_ceiling_bytes(), Some(31));
-    assert!(
-        lines
-            .iter()
-            .any(|line| line == "LOAD STAGE=preflight status=BEGIN")
+    assert_eq!(loaded.receipt.declared_source_resident_bytes, 0);
+    assert_eq!(
+        loaded.receipt.modeled_declared_bytes_without_overhead(),
+        Some(31)
     );
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.contains("LOAD STAGE=census status=PASS tensors=2"))
-    );
-    assert!(lines.iter().any(|line| line.contains("LOAD STAGE=tensor status=PASS tensor=model.embed_tokens.weight route=embed storage=bf16-verbatim")));
-    assert!(lines.iter().any(|line| line.contains("LOAD STAGE=tensor status=PASS tensor=model.layers.0.self_attn.q_proj.weight route=layer.0.attn.q storage=int8-stage-2b")));
+    assert!(lines.iter().any(|line| line
+        == "LOAD STAGE=preflight scope=synthetic evidence=non_authoritative status=BEGIN"));
+    assert!(lines.iter().any(|line| line.contains(
+        "LOAD STAGE=census scope=synthetic evidence=non_authoritative status=PASS tensors=2"
+    )));
+    assert!(lines.iter().any(|line| line.contains("LOAD STAGE=tensor scope=synthetic evidence=non_authoritative status=PASS tensor=model.embed_tokens.weight route=embed storage=bf16-verbatim")));
+    assert!(lines.iter().any(|line| line.contains("LOAD STAGE=tensor scope=synthetic evidence=non_authoritative status=PASS tensor=model.layers.0.self_attn.q_proj.weight route=layer.0.attn.q storage=int8-stage-2b")));
     assert!(lines.iter().any(|line| {
-        line.contains("LOAD STAGE=complete status=PASS bf16_tensors=1 quantized_tensors=1")
+        line.contains("LOAD STAGE=complete scope=synthetic evidence=non_authoritative status=PASS bf16_tensors=1 quantized_tensors=1")
     }));
 }
 
@@ -195,7 +193,7 @@ fn streaming_bridge_refuses_tampered_row_sum_after_checked_sidecar_decode() {
         .mappings
         .get_mut("model.layers.0.self_attn.q_proj.weight")
         .expect("quantized mapping")[2] = [0_i32.to_le_bytes(), (-1_i32).to_le_bytes()].concat();
-    let error = load_with_contract(
+    let error = load_synthetic_with_contract(
         &fixture,
         ArtifactLoadBudget::streaming_only(28, 3),
         &contracts(),
@@ -220,7 +218,7 @@ fn streaming_bridge_refuses_nonfinite_quantization_scale_at_the_sidecar_stage() 
         .get_mut("model.layers.0.self_attn.q_proj.weight")
         .expect("quantized mapping")[1] =
         [f32::INFINITY.to_le_bytes(), 0.5_f32.to_le_bytes()].concat();
-    let error = load_with_contract(
+    let error = load_synthetic_with_contract(
         &fixture,
         ArtifactLoadBudget::streaming_only(28, 3),
         &contracts(),
@@ -241,7 +239,7 @@ fn streaming_bridge_refuses_nonfinite_quantization_scale_at_the_sidecar_stage() 
 fn streaming_bridge_refuses_a_source_chunk_larger_than_its_admitted_scratch_bound() {
     let mut fixture = StreamingFixture::expected();
     fixture.chunk_bytes = 4;
-    let error = load_with_contract(
+    let error = load_synthetic_with_contract(
         &fixture,
         ArtifactLoadBudget::streaming_only(28, 3),
         &contracts(),
@@ -262,7 +260,7 @@ fn streaming_bridge_refuses_a_source_chunk_larger_than_its_admitted_scratch_boun
 fn streaming_only_budget_refuses_a_reader_style_resident_envelope_before_allocation() {
     let mut fixture = StreamingFixture::expected();
     fixture.resident_envelope_bytes = 4_690_873_282;
-    let error = load_with_contract(
+    let error = load_synthetic_with_contract(
         &fixture,
         ArtifactLoadBudget::streaming_only(28, 3),
         &contracts(),
@@ -276,5 +274,27 @@ fn streaming_only_budget_refuses_a_reader_style_resident_envelope_before_allocat
             observed: 4_690_873_282,
             limit: 0,
         }
+    );
+}
+
+#[test]
+fn one_model_entry_refuses_unresolved_oq31_before_selecting_a_quantized_dtype() {
+    let mut fixture = StreamingFixture::expected();
+    fixture.identity.model_id = "Nanbeige4.2-3B".to_owned();
+    fixture.tensors[1].canonical_dtype = "bf16".to_owned();
+    let mut lines = Vec::new();
+    let error = load_nanbeige42(
+        &fixture,
+        ArtifactLoadBudget::streaming_only(28, 3),
+        |line| lines.push(line.to_owned()),
+    )
+    .expect_err("OQ-31 must be ratified before an artifact representation is selected");
+    assert!(matches!(error, ArtifactBridgeError::SchemaAuthority { .. }));
+    assert_eq!(
+        lines,
+        [
+            "LOAD STAGE=activation scope=synthetic evidence=non_authoritative status=REFUSED reason=oq31-authority-unresolved"
+                .to_owned()
+        ]
     );
 }
