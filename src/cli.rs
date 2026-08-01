@@ -1,6 +1,6 @@
 use std::{
     ffi::OsString,
-    fs::{self, OpenOptions},
+    fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
@@ -334,6 +334,9 @@ fn run_streaming_convert(
     prepared: &PreparedConversionInput,
     generic: &GenericPayloadPlan,
 ) -> ExitCode {
+    if let Err(error) = require_streaming_conversion_root(&request.output) {
+        return emit_streaming_activation_blocked(&request.output, prepared, error);
+    }
     eprintln!(
         "CONVERT STAGE=plan RESULT=START tensors={}",
         prepared.census.len()
@@ -407,6 +410,43 @@ fn run_streaming_convert(
     emit_unpublished_streaming_blocked(&request.output, &staging_output, prepared, &written)
 }
 
+/// Obtain the sole authority permitted to create a conversion stage.
+///
+/// Today the platform surface fails closed before touching the caller path.
+/// Even after that surface is ratified, this deliberately refuses until its
+/// opaque root exposes the complete staging, reload, receipt, and activation
+/// transaction; an `Ok(RatifiedModelRoot)` alone is not permission to fall
+/// back to raw filesystem calls.
+fn require_streaming_conversion_root(destination: &Path) -> Result<(), String> {
+    let output_root = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    open_ratified_model_root(output_root)
+        .map_err(|error| format!("model-root {}: {error}", output_root.display()))?;
+    Err(
+        "ratified model root exposes no streaming conversion staging/reload/receipt transaction"
+            .to_owned(),
+    )
+}
+
+/// Report an authority refusal before source materialization, quantization, or
+/// any filesystem output is attempted.
+fn emit_streaming_activation_blocked(
+    destination: &Path,
+    prepared: &PreparedConversionInput,
+    error: impl std::fmt::Display,
+) -> ExitCode {
+    eprintln!(
+        "CONVERT RESULT=BLOCKED stage=activation destination={} source-root-sha256={} census-sha256={} tensors={} reason={error}; no-staging-output-created; no-final-output-created",
+        destination.display(),
+        prepared.source.source_root_sha256,
+        prepared.census_sha256,
+        prepared.census.len(),
+    );
+    ErrorCode::AdmissionOrResourceLimit.as_process_exit()
+}
+
 /// Fail closed after a streamed stage is fully durable.  `fs_tx` has not yet
 /// supplied the non-replacing activation plus retained reload/receipt path
 /// required to expose a canonical artifact, so this CLI must not turn a
@@ -444,23 +484,15 @@ fn conversion_staging_path(destination: &Path, attempt: u16) -> Result<PathBuf, 
     Ok(destination.with_file_name(staging_name))
 }
 
-/// Reserve the first unused sibling stage.  Refused attempts retain their
-/// stage for audit, so later attempts advance to a distinct create-new name
-/// instead of touching either the prior evidence or the final destination.
+/// A raw `create_new` stage would bypass the same root authority that blocks
+/// activation.  Keep this fallback fail-closed until `fs_tx` provides a sink
+/// through the ratified model-root capability.
 fn create_conversion_stage(destination: &Path) -> Result<(PathBuf, fs::File), String> {
-    for attempt in 0..=1024_u16 {
-        let path = conversion_staging_path(destination, attempt)?;
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => return Ok((path, file)),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(format!("create_new {}: {error}", path.display()));
-            }
-        }
-    }
+    let stage = conversion_staging_path(destination, 0)?;
     Err(format!(
-        "all 1025 retained staging names are occupied for destination {}",
-        destination.display()
+        "ratified fs_tx streaming-stage sink unavailable for {} (would-stage={})",
+        destination.display(),
+        stage.display(),
     ))
 }
 
@@ -1300,8 +1332,9 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        cli_main_with_reader, conversion_staging_path, validate_generic_tensor_authorities, Cli,
-        Command, LogicalTensorFirstPass, ModelsSubcommand, ReleaseSubcommand,
+        cli_main_with_reader, conversion_staging_path, require_streaming_conversion_root,
+        validate_generic_tensor_authorities, Cli, Command, LogicalTensorFirstPass,
+        ModelsSubcommand, ReleaseSubcommand,
     };
     use crate::artifact::converter::{
         GenericPayloadPlan, GenericTensorLayout, OutputRange, StorageStage,
@@ -1535,5 +1568,12 @@ mod tests {
             stage.file_name().and_then(|name| name.to_str()),
             Some(".nanbeige.fnlpq.fnlpq-stage.0")
         );
+    }
+
+    #[test]
+    fn conversion_refuses_before_any_staging_without_a_ratified_root() {
+        let error = require_streaming_conversion_root(Path::new("/models/nanbeige.fnlpq"))
+            .expect_err("all current model-root targets must fail closed");
+        assert!(error.contains("FS_TXN refused"));
     }
 }
