@@ -18,7 +18,14 @@ pub enum ReferencePrimitiveError {
     EmptyActivation { operation: &'static str },
 }
 
-/// Pinned cast sites used by the HF eager semantic profile.
+/// Individually implemented cast sites recorded for the HF eager profile.
+///
+/// This enum is a code-first regression inventory, not the OQ-30 cast map.
+/// It does not enumerate every per-block boundary and therefore cannot state
+/// a complete temporal ordering for the model forward.  In particular, linear
+/// outputs, residuals, SiLU/SwiGLU, RMSNorm scale multiplication, and further
+/// attention reduction boundaries require their own modeled entries before
+/// OQ-30 can become authoritative.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HfBf16EagerCastSite {
     /// `embed_tokens(input_ids)` rows remain bf16.
@@ -37,8 +44,11 @@ pub enum HfBf16EagerCastSite {
     LogitsExportF32,
 }
 
-/// The complete, ordered cast schedule for the profile.
-pub const HF_BF16_EAGER_CAST_SCHEDULE: [HfBf16EagerCastSite; 7] = [
+/// Non-exhaustive inventory of the cast sites presently represented in code.
+///
+/// Array position is not an execution-order assertion.  The full ordered
+/// per-block cast graph remains an explicit OQ-30 deliverable.
+pub const HF_BF16_EAGER_OBSERVED_CAST_SITES: [HfBf16EagerCastSite; 7] = [
     HfBf16EagerCastSite::EmbeddingRowStaysBf16,
     HfBf16EagerCastSite::RmsNormF32ReduceCastBack,
     HfBf16EagerCastSite::AttentionQkMatmulCastBack,

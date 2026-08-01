@@ -21,7 +21,7 @@ use franken_nlp::native_engine::{
     },
     lmhead::{NANBEIGE_F32_LOGIT_BYTES, NANBEIGE_VOCAB_SIZE, export_logits_f32, greedy_argmax},
     nn::{
-        HF_BF16_EAGER_CAST_SCHEDULE, HfBf16EagerCastSite, RMS_NORM_EPSILON,
+        HF_BF16_EAGER_OBSERVED_CAST_SITES, HfBf16EagerCastSite, RMS_NORM_EPSILON,
         embedding_row_stays_bf16, residual_add_f32_cast_back, rms_norm_f32_reduce_cast_back,
         swiglu_f32_cast_back,
     },
@@ -391,7 +391,7 @@ fn bf16_eager_armed_source_runs_all_44_layers_and_both_boundary_norms() {
 }
 
 #[test]
-fn bf16_eager_reference_primitives_and_cast_schedule() {
+fn bf16_eager_reference_primitives_and_observed_cast_inventory() {
     let tie_to_even = Bf16::from_f32(f32::from_bits(0x3f80_8000));
     assert_eq!(tie_to_even.to_bits(), 0x3f80);
 
@@ -502,20 +502,22 @@ fn bf16_eager_reference_primitives_and_cast_schedule() {
     assert_eq!(NANBEIGE_Q_PROJECTION_SIZE, 6_144);
     assert_eq!(NANBEIGE_KV_PROJECTION_SIZE, 1_024);
     assert_eq!(NANBEIGE_INTERMEDIATE_SIZE, 10_752);
-    assert_eq!(
-        HF_BF16_EAGER_CAST_SCHEDULE,
-        [
-            HfBf16EagerCastSite::EmbeddingRowStaysBf16,
-            HfBf16EagerCastSite::RmsNormF32ReduceCastBack,
-            HfBf16EagerCastSite::AttentionQkMatmulCastBack,
-            HfBf16EagerCastSite::AttentionScaleCastBack,
-            HfBf16EagerCastSite::SoftmaxF32CastBack,
-            HfBf16EagerCastSite::RopeF32TableCastAtApplication,
-            HfBf16EagerCastSite::LogitsExportF32,
-        ]
-    );
+    assert_eq!(HF_BF16_EAGER_OBSERVED_CAST_SITES.len(), 7);
+    for site in [
+        HfBf16EagerCastSite::EmbeddingRowStaysBf16,
+        HfBf16EagerCastSite::RmsNormF32ReduceCastBack,
+        HfBf16EagerCastSite::AttentionQkMatmulCastBack,
+        HfBf16EagerCastSite::AttentionScaleCastBack,
+        HfBf16EagerCastSite::SoftmaxF32CastBack,
+        HfBf16EagerCastSite::RopeF32TableCastAtApplication,
+        HfBf16EagerCastSite::LogitsExportF32,
+    ] {
+        assert!(HF_BF16_EAGER_OBSERVED_CAST_SITES.contains(&site));
+    }
 
-    eprintln!("BF16_EAGER RESULT=PASS taps=0 model_fixture=SKIPPED_NO_MODEL");
+    eprintln!(
+        "BF16_EAGER RESULT=CODE_FIRST_PRIMITIVES taps=0 model_fixture=SKIPPED_NO_MODEL authority=non_authoritative"
+    );
 }
 
 #[test]
