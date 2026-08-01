@@ -2174,11 +2174,13 @@ impl SealedCpuTeam {
             return;
         }
         state.phase = SealedTeamPhase::Draining;
-        state.drain_reason = Some(reason);
-        eprintln!(
-            "SEALED_TEAM STAGE=DRAIN RESULT=STARTED reason={}",
-            reason.as_str(),
-        );
+        if state.drain_reason.is_none() {
+            state.drain_reason = Some(reason);
+            eprintln!(
+                "SEALED_TEAM STAGE=DRAIN RESULT=STARTED reason={}",
+                reason.as_str(),
+            );
+        }
     }
 
     /// Record child exit after its final checkpoint or a contained panic.
@@ -2382,6 +2384,33 @@ impl EntryGate {
     }
 }
 
+#[cfg(feature = "asupersync-runtime")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SealedTeamCommand {
+    Checkpoint,
+    Stop,
+}
+
+#[cfg(feature = "asupersync-runtime")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SealedTeamReply {
+    Checkpointed { worker_ordinal: usize },
+    Cancelled { worker_ordinal: usize },
+    Stopped { worker_ordinal: usize },
+}
+
+#[cfg(feature = "asupersync-runtime")]
+fn drain_sealed_team_workers(command_senders: &mut Vec<CapacityOneSender<SealedTeamCommand>>) {
+    for command_sender in command_senders.iter() {
+        let _ = command_sender.try_send(SealedTeamCommand::Stop);
+    }
+    // A lane containing an already-issued checkpoint command cannot accept a
+    // second stop message. Dropping all command senders is the bounded
+    // fail-closed stop signal for that case: after a worker drains its one
+    // in-flight command, `recv` observes disconnection and exits.
+    command_senders.clear();
+}
+
 /// Typed execution result for the feature-gated native CPU team seam.
 ///
 /// The outer task handle still preserves asupersync's cancellation/panic join
@@ -2394,6 +2423,15 @@ pub enum SealedTeamRunError {
     ScopeCancelled { detail: String },
     ScopePanicked { worker_ordinal: usize, detail: String },
     ScopeWorkerCapExceeded { cap: usize },
+    CommandLane {
+        worker_ordinal: usize,
+        error: CapacityOneLaneError,
+    },
+    ReplyLaneDisconnected { worker_ordinal: usize },
+    UnexpectedReply {
+        expected_worker_ordinal: usize,
+        actual_worker_ordinal: usize,
+    },
 }
 
 #[cfg(feature = "asupersync-runtime")]
@@ -2414,6 +2452,24 @@ impl fmt::Display for SealedTeamRunError {
             Self::ScopeWorkerCapExceeded { cap } => {
                 write!(formatter, "sealed scoped-CPU team exceeded child cap {cap}")
             }
+            Self::CommandLane {
+                worker_ordinal,
+                error,
+            } => write!(
+                formatter,
+                "sealed scoped-CPU worker {worker_ordinal} command lane failed: {error}"
+            ),
+            Self::ReplyLaneDisconnected { worker_ordinal } => write!(
+                formatter,
+                "sealed scoped-CPU worker {worker_ordinal} reply lane disconnected"
+            ),
+            Self::UnexpectedReply {
+                expected_worker_ordinal,
+                actual_worker_ordinal,
+            } => write!(
+                formatter,
+                "sealed scoped-CPU expected reply from worker {expected_worker_ordinal}, got worker {actual_worker_ordinal}"
+            ),
         }
     }
 }
@@ -2425,8 +2481,12 @@ impl std::error::Error for SealedTeamRunError {}
 fn drain_reason_for_run_error(error: &SealedTeamRunError) -> TeamDrainReason {
     match error {
         SealedTeamRunError::ScopeCancelled { .. } => TeamDrainReason::Cancelled,
-        SealedTeamRunError::ScopePanicked { .. } => TeamDrainReason::WorkerPanicked,
-        SealedTeamRunError::Protocol(_) | SealedTeamRunError::ScopeWorkerCapExceeded { .. } => {
+        SealedTeamRunError::ScopePanicked { .. }
+        | SealedTeamRunError::ReplyLaneDisconnected { .. } => TeamDrainReason::WorkerPanicked,
+        SealedTeamRunError::Protocol(_)
+        | SealedTeamRunError::ScopeWorkerCapExceeded { .. }
+        | SealedTeamRunError::CommandLane { .. }
+        | SealedTeamRunError::UnexpectedReply { .. } => {
             TeamDrainReason::CoordinatorPanicked
         }
     }
@@ -2523,9 +2583,13 @@ fn run_sealed_cpu_checkpoint_team(
         for _ in 0..child_count {
             workers.push(team.form_worker().map_err(SealedTeamRunError::Protocol)?);
         }
+        let mut command_senders = Vec::with_capacity(child_count);
+        let mut reply_receivers = Vec::with_capacity(child_count);
         for worker in workers {
             let worker_team = Arc::clone(&team);
             let worker_gate = Arc::clone(&gate);
+            let (command_sender, command_receiver) = capacity_one_lane();
+            let (reply_sender, reply_receiver) = capacity_one_lane();
             if let Err(error) = scope.spawn(move |cpu_cx| {
                 if !worker_gate.wait() {
                     return;
@@ -2535,16 +2599,57 @@ fn run_sealed_cpu_checkpoint_team(
                 }
                 if cpu_cx.checkpoint().is_err() {
                     worker_team.begin_drain(TeamDrainReason::Cancelled);
+                    let _ = reply_sender.try_send(SealedTeamReply::Cancelled {
+                        worker_ordinal: worker.ordinal(),
+                    });
+                    let _ = worker_team.worker_exited(worker);
+                    return;
                 }
-                if worker_team.snapshot().phase == SealedTeamPhase::Running
-                    && cpu_cx.checkpoint().is_err()
-                {
-                    worker_team.begin_drain(TeamDrainReason::Cancelled);
+                loop {
+                    let command = match command_receiver.recv() {
+                        Ok(command) => command,
+                        Err(_) => {
+                            worker_team.begin_drain(TeamDrainReason::Cancelled);
+                            let _ = worker_team.worker_exited(worker);
+                            return;
+                        }
+                    };
+                    match command {
+                        SealedTeamCommand::Checkpoint => {
+                            let reply = if cpu_cx.checkpoint().is_ok() {
+                                SealedTeamReply::Checkpointed {
+                                    worker_ordinal: worker.ordinal(),
+                                }
+                            } else {
+                                worker_team.begin_drain(TeamDrainReason::Cancelled);
+                                SealedTeamReply::Cancelled {
+                                    worker_ordinal: worker.ordinal(),
+                                }
+                            };
+                            let terminal = matches!(reply, SealedTeamReply::Cancelled { .. });
+                            if reply_sender.try_send(reply).is_err() {
+                                worker_team.begin_drain(TeamDrainReason::CoordinatorPanicked);
+                                let _ = worker_team.worker_exited(worker);
+                                return;
+                            }
+                            if terminal {
+                                let _ = worker_team.worker_exited(worker);
+                                return;
+                            }
+                        }
+                        SealedTeamCommand::Stop => {
+                            let _ = reply_sender.try_send(SealedTeamReply::Stopped {
+                                worker_ordinal: worker.ordinal(),
+                            });
+                            let _ = worker_team.worker_exited(worker);
+                            return;
+                        }
+                    }
                 }
-                let _ = worker_team.worker_exited(worker);
             }) {
                 team.begin_drain(TeamDrainReason::CoordinatorPanicked);
                 gate.abort();
+                drain_sealed_team_workers(&mut command_senders);
                 return Err(match error {
                     ScopedCpuError::WorkerCapExceeded { cap } => {
                         SealedTeamRunError::ScopeWorkerCapExceeded { cap }
@@ -2560,20 +2665,25 @@ fn run_sealed_cpu_checkpoint_team(
                     }
                 });
             }
+            command_senders.push(command_sender);
+            reply_receivers.push(reply_receiver);
         }
         if let Err(error) = team.seal() {
             team.begin_drain(TeamDrainReason::CoordinatorPanicked);
             gate.abort();
+            drain_sealed_team_workers(&mut command_senders);
             return Err(SealedTeamRunError::Protocol(error));
         }
         if let Err(error) = team.release_workers() {
             team.begin_drain(TeamDrainReason::CoordinatorPanicked);
             gate.abort();
+            drain_sealed_team_workers(&mut command_senders);
             return Err(SealedTeamRunError::Protocol(error));
         }
         gate.release();
         if let Err(error) = blocking_cx.checkpoint() {
             team.begin_drain(TeamDrainReason::Cancelled);
+            drain_sealed_team_workers(&mut command_senders);
             return Err(SealedTeamRunError::ScopeCancelled {
                 detail: error.to_string(),
             });
@@ -2581,6 +2691,114 @@ fn run_sealed_cpu_checkpoint_team(
         eprintln!(
             "SEALED_TEAM STAGE=COORDINATOR RESULT=CHECKPOINTED child_count={child_count}",
         );
+        for worker_ordinal in 0..command_senders.len() {
+            if let Err(error) = command_senders[worker_ordinal]
+                .try_send(SealedTeamCommand::Checkpoint)
+            {
+                let reason = match error {
+                    CapacityOneLaneError::Full => TeamDrainReason::CoordinatorPanicked,
+                    CapacityOneLaneError::Disconnected => TeamDrainReason::WorkerPanicked,
+                };
+                team.begin_drain(reason);
+                drain_sealed_team_workers(&mut command_senders);
+                return Err(SealedTeamRunError::CommandLane {
+                    worker_ordinal,
+                    error,
+                });
+            }
+        }
+        for worker_ordinal in 0..reply_receivers.len() {
+            let reply = match reply_receivers[worker_ordinal].recv() {
+                Ok(reply) => reply,
+                Err(CapacityOneLaneError::Disconnected) => {
+                    team.begin_drain(TeamDrainReason::WorkerPanicked);
+                    drain_sealed_team_workers(&mut command_senders);
+                    return Err(SealedTeamRunError::ReplyLaneDisconnected { worker_ordinal });
+                }
+                Err(CapacityOneLaneError::Full) => unreachable!("receivers cannot report full"),
+            };
+            let actual_worker_ordinal = match reply {
+                SealedTeamReply::Checkpointed { worker_ordinal }
+                | SealedTeamReply::Cancelled { worker_ordinal }
+                | SealedTeamReply::Stopped { worker_ordinal } => worker_ordinal,
+            };
+            if actual_worker_ordinal != worker_ordinal {
+                team.begin_drain(TeamDrainReason::CoordinatorPanicked);
+                drain_sealed_team_workers(&mut command_senders);
+                return Err(SealedTeamRunError::UnexpectedReply {
+                    expected_worker_ordinal: worker_ordinal,
+                    actual_worker_ordinal,
+                });
+            }
+            if matches!(reply, SealedTeamReply::Cancelled { .. }) {
+                team.begin_drain(TeamDrainReason::Cancelled);
+                drain_sealed_team_workers(&mut command_senders);
+                return Err(SealedTeamRunError::ScopeCancelled {
+                    detail: format!("worker {worker_ordinal} observed cancellation before reply"),
+                });
+            }
+            if matches!(reply, SealedTeamReply::Stopped { .. }) {
+                team.begin_drain(TeamDrainReason::CoordinatorPanicked);
+                drain_sealed_team_workers(&mut command_senders);
+                return Err(SealedTeamRunError::UnexpectedReply {
+                    expected_worker_ordinal: worker_ordinal,
+                    actual_worker_ordinal,
+                });
+            }
+        }
+        for worker_ordinal in 0..command_senders.len() {
+            if let Err(error) = command_senders[worker_ordinal].try_send(SealedTeamCommand::Stop) {
+                let reason = match error {
+                    CapacityOneLaneError::Full => TeamDrainReason::CoordinatorPanicked,
+                    CapacityOneLaneError::Disconnected => TeamDrainReason::WorkerPanicked,
+                };
+                team.begin_drain(reason);
+                drain_sealed_team_workers(&mut command_senders);
+                return Err(SealedTeamRunError::CommandLane {
+                    worker_ordinal,
+                    error,
+                });
+            }
+        }
+        for worker_ordinal in 0..reply_receivers.len() {
+            let reply = match reply_receivers[worker_ordinal].recv() {
+                Ok(reply) => reply,
+                Err(CapacityOneLaneError::Disconnected) => {
+                    team.begin_drain(TeamDrainReason::WorkerPanicked);
+                    drain_sealed_team_workers(&mut command_senders);
+                    return Err(SealedTeamRunError::ReplyLaneDisconnected { worker_ordinal });
+                }
+                Err(CapacityOneLaneError::Full) => unreachable!("receivers cannot report full"),
+            };
+            let actual_worker_ordinal = match reply {
+                SealedTeamReply::Checkpointed { worker_ordinal }
+                | SealedTeamReply::Cancelled { worker_ordinal }
+                | SealedTeamReply::Stopped { worker_ordinal } => worker_ordinal,
+            };
+            if actual_worker_ordinal != worker_ordinal {
+                team.begin_drain(TeamDrainReason::CoordinatorPanicked);
+                drain_sealed_team_workers(&mut command_senders);
+                return Err(SealedTeamRunError::UnexpectedReply {
+                    expected_worker_ordinal: worker_ordinal,
+                    actual_worker_ordinal,
+                });
+            }
+            if matches!(reply, SealedTeamReply::Cancelled { .. }) {
+                team.begin_drain(TeamDrainReason::Cancelled);
+                drain_sealed_team_workers(&mut command_senders);
+                return Err(SealedTeamRunError::ScopeCancelled {
+                    detail: format!("worker {worker_ordinal} observed cancellation while stopping"),
+                });
+            }
+            if matches!(reply, SealedTeamReply::Checkpointed { .. }) {
+                team.begin_drain(TeamDrainReason::CoordinatorPanicked);
+                drain_sealed_team_workers(&mut command_senders);
+                return Err(SealedTeamRunError::UnexpectedReply {
+                    expected_worker_ordinal: worker_ordinal,
+                    actual_worker_ordinal,
+                });
+            }
+        }
         Ok(())
     });
 

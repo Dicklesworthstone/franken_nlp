@@ -104,6 +104,26 @@ fn panic_drain_preserves_the_latch_until_the_scope_join() {
 }
 
 #[test]
+fn first_drain_cause_survives_sibling_shutdown() {
+    let team = SealedCpuTeam::new(1);
+    let worker = team.form_worker().expect("worker forms");
+    team.seal().expect("formation seals");
+    team.release_workers().expect("entry gate opens");
+    team.worker_started(worker).expect("worker starts");
+
+    team.begin_drain(TeamDrainReason::WorkerPanicked);
+    team.begin_drain(TeamDrainReason::Cancelled);
+    team.worker_exited(worker).expect("worker exits during drain");
+    team.join().expect("latch fires after the joined worker exits");
+
+    assert_eq!(
+        team.snapshot().drain_reason,
+        Some(TeamDrainReason::WorkerPanicked),
+        "the sibling shutdown path must not overwrite the initiating failure"
+    );
+}
+
+#[test]
 fn capacity_one_lane_refuses_a_second_in_flight_command() {
     let (sender, receiver) = capacity_one_lane();
     sender.try_send(7_u8).expect("first command occupies lane");
