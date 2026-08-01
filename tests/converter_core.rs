@@ -525,6 +525,17 @@ fn cli_contract_admits_only_recipe_and_generic_arch() {
         robot: false,
     };
     request.validate().expect("reference invocation contract");
+    let malformed_commit = ConvertRequest {
+        converter_commit: "not-a-commit".to_owned(),
+        ..request.clone()
+    };
+    assert!(matches!(
+        malformed_commit.validate(),
+        Err(ConverterError::InvalidConvertArgument {
+            argument: "--converter-commit",
+            ..
+        })
+    ));
     assert!(ConvertArch::parse("x86-avx2").is_err());
 }
 
