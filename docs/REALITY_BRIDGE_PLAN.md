@@ -46,10 +46,10 @@ Current load-bearing corrections:
 - No retained DSR `scripts/check.sh` receipt exists for the bound source snapshot
   `1af4161e63532fd17c45e25a408865e2bb554a1b` or the later audit-only ledger/docs commits.
   Local Cargo, direct RCH, and GitHub Actions results are non-authoritative for this campaign.
-  The owner policy disables GitHub Actions, but the retained workflow still auto-triggers on
-  push/pull request and must be made inert. One occasional isolated DSR checkpoint is run only
-  after the moving shared tree reaches a deliberately selected stable SHA and the named
-  `production` feature graph exists.
+  The retained workflow is now inert and repository Actions are disabled, but neither change
+  creates build evidence. One occasional isolated DSR checkpoint is run only after the moving
+  shared tree reaches a deliberately selected stable SHA and the named `production` feature
+  graph exists.
 - The claims checker is itself not yet a clean static gate. Its mutation/fixture self-test
   passes, but the full public-surface scan rejects `src/cli.rs:12` because `NUMERIC_RE` matches
   the trailing `6` inside the Rust identifier `bf16`. That is a lexical false positive, not an
