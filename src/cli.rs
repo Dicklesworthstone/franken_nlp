@@ -107,7 +107,10 @@ struct ConvertCommand {
     /// until a complete staged streaming envelope is ready to publish.
     #[arg(short = 'o', long)]
     output: PathBuf,
-    /// Bypass the later interactive confirmation step.
+    /// Explicitly acknowledge conversion before any source closure is opened.
+    ///
+    /// The interactive confirmation surface is not implemented yet, so this
+    /// flag is currently required rather than silently ignored.
     #[arg(long)]
     yes: bool,
     /// Reject all otherwise-unrelated source-directory entries.
@@ -306,6 +309,13 @@ fn run_convert_command(command: ConvertCommand) -> ExitCode {
         strict_source_dir,
         robot,
     };
+
+    if !request.yes {
+        eprintln!(
+            "CONVERT RESULT=FAIL stage=confirmation reason=--yes-is-required-until-interactive-confirmation-is-implemented; no-source-opened; no-output-created"
+        );
+        return ErrorCode::Usage.as_process_exit();
+    }
 
     eprintln!(
         "CONVERT STAGE=census RESULT=START source={} manifest={}",
