@@ -81,7 +81,7 @@ begun), `fnlp tokens/generate/chat/doctor/eval/...` — no CLI command runs infe
 
 | # | Goal | Status | Bead coverage |
 |---|------|--------|---------------|
-| 1 | `fnlp convert` → canonical Generic `.fnlpq` | WORKING (first artifact emitting) | xmy in flight |
+| 1 | `fnlp convert` → canonical Generic `.fnlpq` | CONVERTED (per §0: first artifact produced 2026-07-31 20:49, 4,690,873,282 bytes, fnlpq-file-sha256 15c57d4d…, anchors ×5; acceptance OPEN — receipt/reload-verify (xmy m6), two-clean-dir determinism (m7), 9rs independent read-back, 7p1s qualification all pending) | xmy in flight (m6-7) |
 | 2 | Reference-fidelity ladder L0/L1/L2 | WORKING | closed |
 | 3 | L3/L4/L5 ladder rungs | PARTIAL | arc, zre, 0yz, wk5 |
 | 4 | End-to-end inference from CLI | MISSING — **4 broken joints** (see §3) | partial coverage — **gaps** |
