@@ -507,6 +507,8 @@ fn bf16_eager_reference_primitives_and_cast_schedule() {
         [
             HfBf16EagerCastSite::EmbeddingRowStaysBf16,
             HfBf16EagerCastSite::RmsNormF32ReduceCastBack,
+            HfBf16EagerCastSite::AttentionQkMatmulCastBack,
+            HfBf16EagerCastSite::AttentionScaleCastBack,
             HfBf16EagerCastSite::SoftmaxF32CastBack,
             HfBf16EagerCastSite::RopeF32TableCastAtApplication,
             HfBf16EagerCastSite::LogitsExportF32,

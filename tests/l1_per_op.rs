@@ -454,12 +454,14 @@ fn scalar_attention_bf16(
     let scores = keys
         .chunks_exact(width)
         .map(|key| {
-            query
-                .iter()
-                .zip(key)
-                .map(|(left, right)| left.to_f32() * right.to_f32())
-                .sum::<f32>()
-                * ATTENTION_SCALE
+            let qk_matmul = Bf16::from_f32(
+                query
+                    .iter()
+                    .zip(key)
+                    .map(|(left, right)| left.to_f32() * right.to_f32())
+                    .sum::<f32>(),
+            );
+            Bf16::from_f32(qk_matmul.to_f32() * ATTENTION_SCALE).to_f32()
         })
         .collect::<Vec<_>>();
     assert_eq!(scores.len(), sequence_len);

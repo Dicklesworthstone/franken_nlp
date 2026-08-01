@@ -75,6 +75,43 @@ pub fn softmax_f32_cast_back(scores: &[f32]) -> Result<Vec<Bf16>, AttentionError
     ))
 }
 
+/// Computes one eager QK score with the pinned BF16 output boundaries.
+///
+/// The remote eager implementation first materializes the BF16 QK matmul
+/// result, then divides that BF16 tensor and materializes the BF16 scaled
+/// score before the softmax upcast.  This scalar reference preserves those
+/// two observable boundaries; the reduction microarchitecture remains a
+/// separately fixture-gated conformance question.
+pub fn qk_score_bf16_cast_points(
+    query: &[Bf16],
+    key: &[Bf16],
+) -> Result<Bf16, AttentionError> {
+    if query.len() != NANBEIGE_HEAD_DIM {
+        return Err(AttentionError::HeadDimension {
+            expected: NANBEIGE_HEAD_DIM,
+            actual: query.len(),
+        });
+    }
+    if key.len() != NANBEIGE_HEAD_DIM {
+        return Err(AttentionError::HeadDimension {
+            expected: NANBEIGE_HEAD_DIM,
+            actual: key.len(),
+        });
+    }
+    Ok(qk_score_bf16_cast_points_from_values(
+        query.iter().map(|value| value.to_f32()),
+        key.iter().map(|value| value.to_f32()),
+    ))
+}
+
+fn qk_score_bf16_cast_points_from_values(
+    query: impl Iterator<Item = f32>,
+    key: impl Iterator<Item = f32>,
+) -> Bf16 {
+    let qk_matmul = Bf16::from_f32(query.zip(key).map(|(left, right)| left * right).sum());
+    Bf16::from_f32(qk_matmul.to_f32() * ATTENTION_SCALE)
+}
+
 /// Fixed-order streaming softmax state for one value vector width.
 ///
 /// Each observed score rescales the prior maximum, denominator, and weighted
@@ -184,15 +221,8 @@ pub fn eager_attention_head(
 
     let scores = keys
         .chunks_exact(NANBEIGE_HEAD_DIM)
-        .map(|key| {
-            query
-                .iter()
-                .zip(key)
-                .map(|(query_value, key_value)| query_value.to_f32() * key_value.to_f32())
-                .sum::<f32>()
-                * ATTENTION_SCALE
-        })
-        .collect::<Vec<_>>();
+        .map(|key| qk_score_bf16_cast_points(query, key).map(Bf16::to_f32))
+        .collect::<Result<Vec<_>, _>>()?;
     let probabilities = softmax_f32_cast_back(&scores)?;
     let mut output = vec![0.0_f32; NANBEIGE_HEAD_DIM];
     for (probability, value) in probabilities
@@ -268,14 +298,13 @@ pub fn eager_gqa_attention_from_cache_prefix(
             for position in 0..sequence_len {
                 let key = cache.key_at(slot, position)?;
                 scores.push(
-                    query_head_values
-                        .iter()
-                        .zip(&key[kv_start..kv_end])
-                        .map(|(query_value, key_value)| {
-                            query_value.to_f32() * Bf16::from_bits(*key_value).to_f32()
-                        })
-                        .sum::<f32>()
-                        * ATTENTION_SCALE,
+                    qk_score_bf16_cast_points_from_values(
+                        query_head_values.iter().map(|value| value.to_f32()),
+                        key[kv_start..kv_end]
+                            .iter()
+                            .map(|value| Bf16::from_bits(*value).to_f32()),
+                    )
+                    .to_f32(),
                 );
             }
 
@@ -379,14 +408,13 @@ pub fn online_gqa_attention_from_cache_prefix(
             let mut reduction = OnlineSoftmaxF32::new(NANBEIGE_HEAD_DIM);
             for position in 0..sequence_len {
                 let key = cache.key_at(slot, position)?;
-                let score = query_head_values
-                    .iter()
-                    .zip(&key[kv_start..kv_end])
-                    .map(|(query_value, key_value)| {
-                        query_value.to_f32() * Bf16::from_bits(*key_value).to_f32()
-                    })
-                    .sum::<f32>()
-                    * ATTENTION_SCALE;
+                let score = qk_score_bf16_cast_points_from_values(
+                    query_head_values.iter().map(|value| value.to_f32()),
+                    key[kv_start..kv_end]
+                        .iter()
+                        .map(|value| Bf16::from_bits(*value).to_f32()),
+                )
+                .to_f32();
                 let value = cache.value_at(slot, position)?;
                 reduction.observe_bf16_bits(score, &value[kv_start..kv_end])?;
             }

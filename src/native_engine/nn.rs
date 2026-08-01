@@ -25,6 +25,10 @@ pub enum HfBf16EagerCastSite {
     EmbeddingRowStaysBf16,
     /// RMSNorm reduces in f32 and narrows its output back to bf16.
     RmsNormF32ReduceCastBack,
+    /// QK matmul output narrows to bf16 before score scaling.
+    AttentionQkMatmulCastBack,
+    /// The scaled QK score narrows to bf16 before softmax upcasts it.
+    AttentionScaleCastBack,
     /// Attention softmax computes in f32 and narrows probabilities to bf16.
     SoftmaxF32CastBack,
     /// RoPE tables are f32 and rotate into bf16 q/k activations.
@@ -34,9 +38,11 @@ pub enum HfBf16EagerCastSite {
 }
 
 /// The complete, ordered cast schedule for the profile.
-pub const HF_BF16_EAGER_CAST_SCHEDULE: [HfBf16EagerCastSite; 5] = [
+pub const HF_BF16_EAGER_CAST_SCHEDULE: [HfBf16EagerCastSite; 7] = [
     HfBf16EagerCastSite::EmbeddingRowStaysBf16,
     HfBf16EagerCastSite::RmsNormF32ReduceCastBack,
+    HfBf16EagerCastSite::AttentionQkMatmulCastBack,
+    HfBf16EagerCastSite::AttentionScaleCastBack,
     HfBf16EagerCastSite::SoftmaxF32CastBack,
     HfBf16EagerCastSite::RopeF32TableCastAtApplication,
     HfBf16EagerCastSite::LogitsExportF32,
