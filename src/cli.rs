@@ -1793,7 +1793,7 @@ mod tests {
         process::ExitCode,
     };
 
-    use clap::Parser;
+    use clap::{Parser, error::ErrorKind};
 
     use super::{
         Cli, Command, KvCacheQuantization, LogicalTensorFirstPass, ModelsSubcommand,
@@ -1948,7 +1948,7 @@ mod tests {
 
     #[test]
     fn convert_reference_invocation_requires_every_named_authority() {
-        let convert = Cli::try_parse_from([
+        let missing_converter_commit = Cli::try_parse_from([
             "fnlp",
             "convert",
             "--source",
@@ -1962,7 +1962,29 @@ mod tests {
             "-o",
             "nanbeige4.2-3b.fnlpq-v1.int8.generic.fnlpq",
         ])
-        .expect("reference conversion invocation parses");
+        .expect_err("the receipt-producing invocation requires converter provenance");
+        assert_eq!(
+            missing_converter_commit.kind(),
+            ErrorKind::MissingRequiredArgument
+        );
+
+        let convert = Cli::try_parse_from([
+            "fnlp",
+            "convert",
+            "--source",
+            "/models/nanbeige-source",
+            "--source-manifest",
+            "docs/truth-pack/nanbeige4.2-3b.source.json",
+            "--recipe",
+            "nanbeige42-int8-v1",
+            "--arch",
+            "generic",
+            "-o",
+            "nanbeige4.2-3b.fnlpq-v1.int8.generic.fnlpq",
+            "--converter-commit",
+            "0123456789abcdef0123456789abcdef01234567",
+        ])
+        .expect("fully authority-bound reference conversion invocation parses");
         assert!(matches!(convert.command, Some(Command::Convert(..))));
     }
 
