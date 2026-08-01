@@ -1756,55 +1756,57 @@ impl AdmissionReservation {
     /// charge until it is released or dropped after request drain.
     pub fn commit(mut self) -> Result<CommittedAdmission, AdmissionError> {
         let mut committed = CommittedAdmission::empty();
-        for (reservation, target) in [
-            (&mut self.weights, &mut committed.weights),
-            (&mut self.prefix_cache, &mut committed.prefix_cache),
-            (&mut self.kv_pages, &mut committed.kv_pages),
-            (
-                &mut self.activation_scratch,
-                &mut committed.activation_scratch,
-            ),
-            (&mut self.logit_scratch, &mut committed.logit_scratch),
-            (&mut self.grammar_cache, &mut committed.grammar_cache),
-            (&mut self.job_buffers, &mut committed.job_buffers),
-            (
-                &mut self.admission_reserve,
-                &mut committed.admission_reserve,
-            ),
-        ] {
-            if let Some(reservation) = reservation.take() {
-                match reservation.commit() {
-                    Ok(memory) => *target = Some(memory),
+        macro_rules! commit_slot {
+            ($slot:ident) => {
+                match commit_admission_slot(&mut self.$slot) {
+                    Ok(memory) => committed.$slot = memory,
                     Err(error) => {
                         committed.release();
                         let _ = self.abort_all();
                         return Err(AdmissionError::Reservation(error));
                     }
                 }
-            }
+            };
         }
+        commit_slot!(weights);
+        commit_slot!(prefix_cache);
+        commit_slot!(kv_pages);
+        commit_slot!(activation_scratch);
+        commit_slot!(logit_scratch);
+        commit_slot!(grammar_cache);
+        commit_slot!(job_buffers);
+        commit_slot!(admission_reserve);
         Ok(committed)
     }
 
     fn abort_all(&mut self) -> Result<(), ReservationError> {
         let mut first_error = None;
-        for reservation in [
-            &mut self.weights,
-            &mut self.prefix_cache,
-            &mut self.kv_pages,
-            &mut self.activation_scratch,
-            &mut self.logit_scratch,
-            &mut self.grammar_cache,
-            &mut self.job_buffers,
-            &mut self.admission_reserve,
-        ] {
-            if let Some(reservation) = reservation.take()
-                && let Err(error) = reservation.abort()
-            {
-                first_error.get_or_insert(error);
-            }
-        }
+        abort_admission_slot(&mut self.weights, &mut first_error);
+        abort_admission_slot(&mut self.prefix_cache, &mut first_error);
+        abort_admission_slot(&mut self.kv_pages, &mut first_error);
+        abort_admission_slot(&mut self.activation_scratch, &mut first_error);
+        abort_admission_slot(&mut self.logit_scratch, &mut first_error);
+        abort_admission_slot(&mut self.grammar_cache, &mut first_error);
+        abort_admission_slot(&mut self.job_buffers, &mut first_error);
+        abort_admission_slot(&mut self.admission_reserve, &mut first_error);
         first_error.map_or(Ok(()), Err)
+    }
+}
+
+fn commit_admission_slot(
+    slot: &mut Option<MemoryReservation>,
+) -> Result<Option<CommittedMemory>, ReservationError> {
+    slot.take().map(MemoryReservation::commit).transpose()
+}
+
+fn abort_admission_slot(
+    slot: &mut Option<MemoryReservation>,
+    first_error: &mut Option<ReservationError>,
+) {
+    if let Some(reservation) = slot.take()
+        && let Err(error) = reservation.abort()
+    {
+        first_error.get_or_insert(error);
     }
 }
 
@@ -3035,60 +3037,57 @@ impl EngineResources {
         }
         let charges = certificate.charges();
         let mut reservation = AdmissionReservation::empty();
-        for (slot, memory_class, bytes) in [
-            (
-                &mut reservation.weights,
-                MemoryClass::Weights,
-                charges.weights,
-            ),
-            (
-                &mut reservation.prefix_cache,
-                MemoryClass::PrefixCache,
-                charges.prefix_cache,
-            ),
-            (
-                &mut reservation.kv_pages,
-                MemoryClass::KvPages,
-                charges.kv_pages,
-            ),
-            (
-                &mut reservation.activation_scratch,
-                MemoryClass::ActivationScratch,
-                charges.activation_scratch,
-            ),
-            (
-                &mut reservation.logit_scratch,
-                MemoryClass::LogitScratch,
-                charges.logit_scratch,
-            ),
-            (
-                &mut reservation.grammar_cache,
-                MemoryClass::GrammarCache,
-                charges.grammar_cache,
-            ),
-            (
-                &mut reservation.job_buffers,
-                MemoryClass::JobBuffers,
-                charges.job_buffers,
-            ),
-            (
-                &mut reservation.admission_reserve,
-                MemoryClass::AdmissionReserve,
-                charges.admission_reserve,
-            ),
-        ] {
-            if bytes == 0 {
-                continue;
-            }
-            match self.memory.reserve(engine_lease_id, memory_class, bytes) {
-                Ok(memory) => *slot = Some(memory),
-                Err(error) => {
+        macro_rules! reserve_slot {
+            ($slot:ident, $memory_class:expr, $bytes:expr) => {
+                if let Err(error) = self.reserve_admission_slot(
+                    engine_lease_id,
+                    $memory_class,
+                    $bytes,
+                    &mut reservation.$slot,
+                ) {
                     let _ = reservation.abort_all();
                     return Err(AdmissionError::Reservation(error));
                 }
-            }
+            };
         }
+        reserve_slot!(weights, MemoryClass::Weights, charges.weights);
+        reserve_slot!(prefix_cache, MemoryClass::PrefixCache, charges.prefix_cache);
+        reserve_slot!(kv_pages, MemoryClass::KvPages, charges.kv_pages);
+        reserve_slot!(
+            activation_scratch,
+            MemoryClass::ActivationScratch,
+            charges.activation_scratch
+        );
+        reserve_slot!(
+            logit_scratch,
+            MemoryClass::LogitScratch,
+            charges.logit_scratch
+        );
+        reserve_slot!(
+            grammar_cache,
+            MemoryClass::GrammarCache,
+            charges.grammar_cache
+        );
+        reserve_slot!(job_buffers, MemoryClass::JobBuffers, charges.job_buffers);
+        reserve_slot!(
+            admission_reserve,
+            MemoryClass::AdmissionReserve,
+            charges.admission_reserve
+        );
         Ok(reservation)
+    }
+
+    fn reserve_admission_slot(
+        &self,
+        engine_lease_id: u64,
+        memory_class: MemoryClass,
+        bytes: u64,
+        slot: &mut Option<MemoryReservation>,
+    ) -> Result<(), ReservationError> {
+        if bytes != 0 {
+            *slot = Some(self.memory.reserve(engine_lease_id, memory_class, bytes)?);
+        }
+        Ok(())
     }
 
     /// Acquire one engine lease. An engine cannot own an independent memory or
