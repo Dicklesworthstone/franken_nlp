@@ -579,13 +579,7 @@ pub fn greedy_decode_with_hooks<D: DecodeByteDecoder, S: DecodeEventSink, C: Dec
             decoded_bytes: token_bytes,
             logprob: selected_logprob,
         };
-        let permit = sink.reserve(&event).map_err(|error| DecodeError::Stream {
-            detail: error.to_string(),
-        })?;
-        sink.permit(permit, event)
-            .map_err(|error| DecodeError::Stream {
-                detail: error.to_string(),
-            })?;
+        deliver_stream_event(sink, event)?;
 
         output.emitted_token_ids = candidate_token_ids;
         output.decoded_bytes = decoded;
@@ -731,6 +725,19 @@ fn full_vocabulary_logprob(logits: &[f32], selected: u32) -> Result<f32, DecodeE
     Ok((f64::from(selected_logit - maximum) - exp_sum.ln()) as f32)
 }
 
+fn deliver_stream_event<S: DecodeEventSink>(
+    sink: &mut S,
+    event: DecodeTokenEvent,
+) -> Result<(), DecodeError> {
+    let permit = sink.reserve(&event).map_err(|error| DecodeError::Stream {
+        detail: error.to_string(),
+    })?;
+    sink.permit(permit, event)
+        .map_err(|error| DecodeError::Stream {
+            detail: error.to_string(),
+        })
+}
+
 struct DiscardDecodeEventSink;
 
 impl DecodeEventSink for DiscardDecodeEventSink {
@@ -760,8 +767,11 @@ impl DecodeStepControl for NeverCancelled {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt;
+
     use super::{
-        DecodeError, DecodeFinishReason, DecodeParams, DecodeStopPolicy, empty_output,
+        DECODE_TOKEN_EVENT_SCHEMA_VERSION, DecodeError, DecodeEventSink, DecodeFinishReason,
+        DecodeParams, DecodeStopPolicy, DecodeTokenEvent, deliver_stream_event, empty_output,
         finish_reason_after_commit, full_vocabulary_logprob, validate_context_budget,
     };
     use serde_json::json;
@@ -878,5 +888,56 @@ mod tests {
         let observed = full_vocabulary_logprob(&[0.0, 0.0], 0)
             .expect("finite logits must have a full-vocabulary logprob");
         assert!((observed + std::f32::consts::LN_2).abs() < 1.0e-6);
+    }
+
+    #[derive(Debug)]
+    struct TestStreamError;
+
+    impl fmt::Display for TestStreamError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("test stream unavailable")
+        }
+    }
+
+    struct RefusingReservationSink {
+        permit_calls: usize,
+    }
+
+    impl DecodeEventSink for RefusingReservationSink {
+        type Permit = ();
+        type Error = TestStreamError;
+
+        fn reserve(&mut self, _event: &DecodeTokenEvent) -> Result<Self::Permit, Self::Error> {
+            Err(TestStreamError)
+        }
+
+        fn permit(
+            &mut self,
+            _permit: Self::Permit,
+            _event: DecodeTokenEvent,
+        ) -> Result<(), Self::Error> {
+            self.permit_calls += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn reservation_refusal_never_attempts_stream_delivery() {
+        let mut sink = RefusingReservationSink { permit_calls: 0 };
+        let event = DecodeTokenEvent {
+            schema_version: DECODE_TOKEN_EVENT_SCHEMA_VERSION,
+            request_seq: 7,
+            token_index: 0,
+            token_id: 1,
+            decoded_bytes: vec![b'x'],
+            logprob: None,
+        };
+        assert_eq!(
+            deliver_stream_event(&mut sink, event),
+            Err(DecodeError::Stream {
+                detail: "test stream unavailable".to_owned(),
+            })
+        );
+        assert_eq!(sink.permit_calls, 0);
     }
 }
