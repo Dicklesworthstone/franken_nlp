@@ -433,7 +433,7 @@ fn torn_gapped_and_disconnected_records_never_become_active() {
 }
 
 #[test]
-fn sequence_overflow_lock_reentry_and_unratified_root_refuse_typed() {
+fn sequence_overflow_lock_reentry_and_invalid_root_refuse_typed() {
     let max_body = ActivationRecordBody::from_retained_parts(
         u64::MAX,
         digest(1),
@@ -452,11 +452,17 @@ fn sequence_overflow_lock_reentry_and_unratified_root_refuse_typed() {
     assert!(matches!(lock.try_lock(), Err(FsTxError::LockReentrant)));
     drop(guard);
     assert!(lock.try_lock().is_ok());
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    assert!(matches!(
+        open_ratified_model_root(Path::new("/untrusted/model-root")),
+        Err(FsTxError::RootIo { .. })
+    ));
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     assert!(matches!(
         open_ratified_model_root(Path::new("/untrusted/model-root")),
         Err(FsTxError::PlatformSurfaceUnavailable { .. })
     ));
-    eprintln!("FS_TXN case=overflow-lock-platform-refusal RESULT=PASS");
+    eprintln!("FS_TXN case=overflow-lock-platform-root-refusal RESULT=PASS");
 }
 
 #[test]

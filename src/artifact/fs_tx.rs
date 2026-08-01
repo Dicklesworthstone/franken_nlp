@@ -12,8 +12,12 @@ use std::{
     collections::BTreeSet,
     error::Error,
     fmt,
-    path::Path,
+    fs::File,
+    path::{Path, PathBuf},
 };
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::fs::OpenOptions;
 
 use sha2::{Digest, Sha256};
 
@@ -449,6 +453,13 @@ pub struct ActivationDiscovery {
 pub enum FsTxError {
     /// The platform registry has no ratified owner-only/no-follow root surface.
     PlatformSurfaceUnavailable { surface: &'static str },
+    /// Opening or synchronizing a root-owned filesystem object failed.
+    RootIo {
+        operation: &'static str,
+        detail: String,
+    },
+    /// The opened root was not an owner-only directory suitable for mutation.
+    HostileRoot { reason: &'static str },
     /// One process attempted to take the same non-reentrant content lock twice.
     LockReentrant,
     /// A monotonic activation sequence would wrap at `u64::MAX`.
@@ -484,6 +495,12 @@ impl fmt::Display for FsTxError {
                     formatter,
                     "FS_TXN refused: unratified platform surface {surface}"
                 )
+            }
+            Self::RootIo { operation, detail } => {
+                write!(formatter, "FS_TXN refused: {operation}: {detail}")
+            }
+            Self::HostileRoot { reason } => {
+                write!(formatter, "FS_TXN refused: hostile model root: {reason}")
             }
             Self::LockReentrant => formatter.write_str("FS_TXN refused: content lock re-entry"),
             Self::SequenceOverflow => {
@@ -533,19 +550,87 @@ impl fmt::Display for FsTxError {
 
 impl Error for FsTxError {}
 
-/// A model-root capability. It has no public constructor while every target in
-/// `PLATFORM_SURFACES.md` remains blocked; callers therefore cannot accidentally
-/// turn a check-then-open path into a durable activation implementation.
+/// A checked, owner-only model-root directory handle.
+///
+/// The handle is deliberately opaque.  Callers must not re-resolve the caller
+/// path after this constructor has admitted it; later staging and journal APIs
+/// are added to this capability rather than granting raw-path authority.
 #[derive(Debug)]
 pub struct RatifiedModelRoot {
-    _private: (),
+    directory: File,
+    root: PathBuf,
 }
 
-/// Opens a mutable model root only after platform authority exists.
+impl RatifiedModelRoot {
+    /// Returns the root spelling bound to the opened directory handle.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.root
+    }
+
+    /// Synchronizes the admitted directory before a later transaction reports
+    /// a durable visibility point.
+    pub fn sync_directory(&self) -> Result<(), FsTxError> {
+        self.directory
+            .sync_all()
+            .map_err(|error| FsTxError::RootIo {
+                operation: "sync model-root directory",
+                detail: error.to_string(),
+            })
+    }
+}
+
+/// Opens a mutable model root without following its terminal path component.
 ///
-/// The current platform registry explicitly blocks this operation on all
-/// release targets, so this function fails before it stats, follows, creates,
-/// locks, or mutates the caller-supplied path.
+/// Linux and macOS use their documented `O_NOFOLLOW` flag through safe
+/// `OpenOptionsExt::custom_flags`, then inspect the *opened* handle.  There is
+/// intentionally no `symlink_metadata`-then-open preflight.  Other targets
+/// retain the typed refusal until an equally safe reviewed surface exists.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn open_ratified_model_root(root: &Path) -> Result<RatifiedModelRoot, FsTxError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    #[cfg(target_os = "linux")]
+    const O_NOFOLLOW: i32 = 0o400000;
+    #[cfg(target_os = "macos")]
+    const O_NOFOLLOW: i32 = 0x0100;
+
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(root)
+        .map_err(|error| FsTxError::RootIo {
+            operation: "open model-root directory without following symlink",
+            detail: error.to_string(),
+        })?;
+    let metadata = directory.metadata().map_err(|error| FsTxError::RootIo {
+        operation: "inspect opened model-root directory",
+        detail: error.to_string(),
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(FsTxError::HostileRoot {
+            reason: "root is not a directory",
+        });
+    }
+
+    // The mode is read from the opened directory handle, never from a path
+    // which could be swapped before use.  A mutable model root must be
+    // exclusive to its owner: no group or other principal receives any access.
+    let mode = metadata.mode();
+    if mode & 0o077 != 0 || mode & 0o700 != 0o700 {
+        return Err(FsTxError::HostileRoot {
+            reason: "root permissions are not owner-only rwx",
+        });
+    }
+
+    Ok(RatifiedModelRoot {
+        directory,
+        root: root.to_path_buf(),
+    })
+}
+
+/// Typed refusal for targets without the reviewed safe no-follow surface.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn open_ratified_model_root(_root: &Path) -> Result<RatifiedModelRoot, FsTxError> {
     Err(FsTxError::PlatformSurfaceUnavailable {
         surface: "model-root owner-only lock/no-follow/durability",
