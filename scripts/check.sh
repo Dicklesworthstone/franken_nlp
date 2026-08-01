@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# The sole CI and central batch-verification entrypoint for this repository.
+# Canonical validation entrypoint for an occasional controller-authorized DSR
+# checkpoint at one clean immutable SHA. Ordinary panes never invoke this
+# script, Cargo, RCH, DSR, or GitHub Actions; direct RCH/GHA output is
+# non-authoritative. A release-authority receipt also requires this entrypoint
+# to select the explicitly named `production` graph; until that wiring lands,
+# WIRING.md correctly reports the DSR checkpoint as BLOCKED.
 #
 # CHECK_UBS_TIMEOUT_S bounds `ubs --diff` (default: 180 seconds).  UBS is
 # intentionally optional only when its binary is absent; every other gate is

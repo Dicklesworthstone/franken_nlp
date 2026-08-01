@@ -106,7 +106,7 @@ Load-bearing, non-negotiable rules distilled from the plan and from the frankent
 
 7. **AVX2 is first-class and exact.** Raw `vpmaddubsw` can saturate inside the instruction; accumulation cadence cannot fix it. Implement/measure both plan §6.5 candidates: low-7/high-bit decomposition with proved i16 pair bounds and the widened signed-i16 route. Both equal scalar/i64 over the full i8 domain; raw saturation is not a shippable approximate mode.
 
-8. **Asupersync owns every request region and compute team; leaf kernels never spawn.** Each admitted request or finite batch epoch has one owned asupersync region/child `Cx`; its feeder, timers, wrapper/output tasks, and drain are not detached. The pinned blocking contract has one explicit physical-lifetime exception: an already-running pool closure may outlive its cancelled wrapper, so `EngineResources` tracks that closure to an actual-completion latch and treats it as outstanding drain work. The run crosses `Cx::spawn_blocking` once and uses one `Cx::scoped_cpu` region spanning the whole request or bounded epoch, with checkpoints at tile/morsel boundaries. Production must prove its `Cx` carries a real blocking-pool handle; the pinned inline fallback is lab/test behavior, not a valid engine route. The pinned `ScopedCpu::spawn` enforces the numeric cap but does not itself reject a spawn after its drain latch rises, so the team-formation protocol must create the fixed team before releasing any worker into fallible work, seal spawning forever, and test that no post-start/post-latch worker can appear. Never enter the seam under an engine lock, recursively create a team, detach or lose supervision of a semantic-request task/closure, or nest an asupersync runtime. Concurrent sync callers enter bounded admission or a compatible batch, not independent forwards. Rayon is absent from the release graph. Re-entrant calls fail typed/fast; cancellation/panic joins and scheduler lifecycle are model-checked/replayed, not just watchdog-tested. Admission/memory/output guards remain owned by the blocking closure until its latch fires after the scoped team joins—never release or reuse them merely because the wrapper task resolved cancelled. The capacity certificate inventories the entire process at once: runtime workers + maximum concurrent blocking coordinators + scoped CPU children + separately ratified service/helper threads. A preset name is not a safe thread count; in particular, never pair `high_throughput()` blindly with a physical-core-wide scoped team. Use the foundation's depth, not just its scheduler: capability rows (`[SPAWN, TIME, RANDOM, IO, REMOTE]`, monotone `Cx::restrict`) make no-spawn leaves, no-network inference, and RANDOM-once sampling admission compile-time properties; budgets are typed meet-composed children with a reserved cleanup budget, never ambient milliseconds; two-phase reservations are tracked obligations under an explicit leak-response policy (panic in lab/CI, logged escalation in production); and the async half of every scheduler/daemon/job/pull proof runs on the deterministic lab (oracles, seed-bound chaos, crashpack replay) while the bounded native team-state model covers the `scoped_cpu` OS-thread half — plan §3.3, §9.3, §9.5, OQ-35.
+8. **Asupersync owns every request region and compute team; leaf kernels never spawn.** Each admitted request or finite batch epoch has one owned asupersync region/child `Cx`; its feeder, timers, wrapper/output tasks, and drain are not detached. The pinned blocking contract has one explicit physical-lifetime exception: an already-running pool closure may outlive its cancelled wrapper, so `EngineResources` tracks that closure to an actual-completion latch and treats it as outstanding drain work. The run crosses `Cx::spawn_blocking` once and uses one `Cx::scoped_cpu` region spanning the whole request or bounded epoch, with checkpoints at tile/morsel boundaries. Production must prove its `Cx` carries a real blocking-pool handle; the pinned inline fallback is lab/test behavior, not a valid engine route. The pinned `ScopedCpu::spawn` enforces the numeric cap but does not itself reject a spawn after its drain latch rises, so the team-formation protocol must create the fixed team before releasing any worker into fallible work, seal spawning forever, and test that no post-start/post-latch worker can appear. Never enter the seam under an engine lock, recursively create a team, detach or lose supervision of a semantic-request task/closure, or nest an asupersync runtime. Concurrent sync callers enter bounded admission or a compatible batch, not independent forwards. Rayon is absent from the release graph. Re-entrant calls fail typed/fast; cancellation/panic joins and scheduler lifecycle are model-checked/replayed, not just watchdog-tested. Admission/memory/output guards remain owned by the blocking closure until its latch fires after the scoped team joins—never release or reuse them merely because the wrapper task resolved cancelled. The capacity certificate inventories the entire process at once: runtime workers + maximum concurrent blocking coordinators + scoped CPU children + separately ratified service/helper threads. A preset name is not a safe thread count; in particular, never pair `high_throughput()` blindly with a physical-core-wide scoped team. Use the foundation's depth, not just its scheduler: capability rows (`[SPAWN, TIME, RANDOM, IO, REMOTE]`, monotone `Cx::restrict`) make no-spawn leaves, no-network inference, and RANDOM-once sampling admission compile-time properties; budgets are typed meet-composed children with a reserved cleanup budget, never ambient milliseconds; two-phase reservations are tracked obligations under an explicit leak-response policy (panic in lab/DSR validation, logged escalation in production); and the async half of every scheduler/daemon/job/pull proof runs on the deterministic lab (oracles, seed-bound chaos, crashpack replay) while the bounded native team-state model covers the `scoped_cpu` OS-thread half — plan §3.3, §9.3, §9.5, OQ-35.
 
 9. **Determinism is scoped.** Semantic greedy output is exact under a named numerics profile; canonical bytes additionally require ordered output and scrub volatile metadata. Batch/prefix equivalence requires the same per-row reduction order. Never promise byte identity for completion-order NDJSON or approximate transcendental modes.
 
@@ -148,7 +148,7 @@ Load-bearing, non-negotiable rules distilled from the plan and from the frankent
 
 28. **Source acquisition, release packaging, and client installation are different trust zones.** `scripts/fetch_model.sh` / `scripts/fetch_model.ps1` download the immutable upstream conversion closure; they never masquerade as the end-user installer. Research-only truth-pack evidence does not become a converter prerequisite. The public artifact is the canonical Generic `.fnlpq`, versioned independently from the binary and split at exactly 1,957,046,720 bytes except the tail. Cross-OS/ISA conversion must hash-identically or the release names one canonical publisher target and narrows the reproducibility claim. Never publish from an unreceipted converter output, upload with a wildcard/`--clobber`, or rewrite bytes under an existing tag/name.
 
-29. **One artifact manager owns every client model download.** `install.sh`/`install.ps1` install the binary, then invoke that exact installed binary's `fnlp pull`; shell and PowerShell must not parse the model manifest, concatenate parts, invent cache filenames, or duplicate integrity logic. Default pull trusts only the release-bound embedded manifest; local/private manifests require an expected digest obtained through an independently trusted channel. SHA-256 proves byte identity, not publisher identity; releases also publish GitHub attestations for binaries and the manifest/receipt closure. Owner-controlled roots, a non-reentrant content lock, `create_new`, no symlink/reparse/device targets, sync/same-filesystem activation, native-pack differential, and honest durability status all pass before the new model becomes visible.
+29. **One artifact manager owns every client model download.** `install.sh`/`install.ps1` install the binary, then invoke that exact installed binary's `fnlp pull`; shell and PowerShell must not parse the model manifest, concatenate parts, invent cache filenames, or duplicate integrity logic. Default pull trusts only the release-bound embedded manifest; local/private manifests require an expected digest obtained through an independently trusted channel. SHA-256 proves byte identity, not publisher identity; the DSR release job also publishes an SBOM, SLSA provenance, and project-signature bundle binding the binaries and manifest/receipt/model inventory. The signing-key fingerprint must arrive through an independently trusted project channel; a signature and key fetched together from one untrusted mirror prove only self-consistency. Owner-controlled roots, a non-reentrant content lock, `create_new`, no symlink/reparse/device targets, sync/same-filesystem activation, native-pack differential, and honest durability status all pass before the new model becomes visible.
 
 30. **Claims and receipts are typed evidence.** Public numeric/superlative claims must map to `docs/CLAIMS.json`; intentional reference behavior belongs in `docs/BEHAVIOR_NOTES.md`; `.fnlpr` receipts declare `Replayable`, `StructuralReplay`, `VerifiableIfArtifactsSupplied`, or `AuditOnly`, and omit private bytes unless retention is explicitly authorized. Structural cost witnesses distinguish a full target invocation (two loops / 44 layer executions per position) from any AA-D1 loop-1 draft invocation, and count lm_head rows plus KV bytes. “Verified” without scope, validity domain, and evidence grade is forbidden.
 
@@ -190,6 +190,15 @@ We are in early development with **no users**. Do things the **RIGHT** way with 
 
 ## Mandatory Checks After Substantive Changes
 
+These commands describe the validation inventory implemented by
+`scripts/check.sh`; they are **not** pane-level instructions. Ordinary swarm
+panes run no Cargo, RCH, DSR, or GitHub Actions command. After code-first
+contention quiesces, the controller selects one clean immutable commit and may
+request an occasional DSR checkpoint that runs `scripts/check.sh` against the
+explicitly named `production` feature graph. Direct Cargo, direct RCH, and
+GitHub Actions output are diagnostic only and cannot authorize a close or
+release.
+
 ```bash
 cargo fmt --check
 cargo check --locked --all-targets
@@ -198,11 +207,21 @@ cargo test --locked
 ubs --diff
 ```
 
-If any check fails, fix root causes before handing off.
+If the controller's DSR checkpoint reports a failed leg, fix the root cause in
+the next code-first wave; only the controller requests the next DSR run.
 
 ### The `cargo test --locked` gate (green-bar requirement once the crate exists)
 
-After `Cargo.toml` and `scripts/check.sh` exist, `cargo test --locked` is a hard gate and must exit 0 before code is handed off or a bead is closed. Before Phase 0 scaffolding, report Cargo gates as **not applicable (crate absent)** and run only truthful document/link/whitespace/UBS checks; never create a fake empty crate merely to manufacture a green bar. CI invokes `scripts/check.sh` as its single test step once present.
+After `Cargo.toml` and `scripts/check.sh` exist, the locked test leg is a hard
+gate and must exit 0 in the retained DSR checkpoint before a code-complete bead
+is closed. Before Phase 0 scaffolding, report Cargo gates as **not applicable
+(crate absent)** and run only truthful document/link/whitespace/UBS checks;
+never create a fake empty crate merely to manufacture a green bar. The
+controller-authorized DSR recipe invokes `scripts/check.sh` as its single
+validation entrypoint and records the clean source SHA plus the exact
+`production` feature graph. Until that graph is explicitly selected by the
+script/recipe and the receipt says exactly `PASS` or `FAIL`, build authority is
+**BLOCKED** rather than inferred from the default or all-features graph.
 
 Build-surface note: both binaries compile from thin shims over `cli_main()` (doctrine #12); `cargo check --locked --all-targets` MUST be free of the "present in multiple build targets" warning.
 
@@ -215,10 +234,16 @@ Each module includes unit tests for happy path, edge cases, error handling. Beyo
 - **Reference oracle**: pinned CPU HF environment running `NanbeigeForCausalLM` (`trust_remote_code`, `use_fast=False`) via `scripts/gen_reference_fixtures.py` — **establish the oracle's own nondeterminism floor first** with at least five independently launched processes at each of at least two preregistered thread counts; if anything varies, use the preregistered additional-repetition/convergence rule and freeze only the exact stable prefix. Never derive a tolerance distribution from two observations.
 - **Independent-enough checks**: a deliberately simple in-repo scalar f32 specification engine localizes failures; a tested official post-`b77d646…` llama.cpp revision is the secondary CPU/GGUF differential and performance baseline. The authors' fork is shared lineage, not another vote; RLX remains an out-of-tree GPL black box only.
 - **Parity ladder L0–L5**: L0 exact; L1 same-recipe integer exact plus named floating metric vectors (not cosine alone); L2 all 44 layer outputs + two loop norms; L3 measured per-profile tolerance; L4 `hf-bf16-eager` greedy exact on oracle-reproducible prefixes, `diagnostic-f32` under its structural/logit contract, and optimized-vs-scalar greedy-token exact for one fixed recipe/profile; quantized-vs-bf16 token agreement is measured, not presumed; L5 task semantics.
-- **Invariant gates**: scoped determinism, batch/prefix equivalence, independent structured-output/source-grounding validation, untrusted-segment bytes preserved with all control ids excluded (or rejection), sparse=full, forced=sequential KV, every trie traversal=naïve, uninterrupted=resumed owned job, dependency-scope snapshot mutation, integer SIMD ≡ scalar/i64, overflow/fork-tail/admission proofs, a real `spawn_blocking` pool handle with executor-heartbeat proof (no production inline fallback), one admitted `scoped_cpu` team with exact coordinator/child width, bounded checkpoints, disconnect-safe cancel/panic full join, wrapper-cancel versus actual-completion lifetime with no untracked region-to-supervisor gap, re-entry refusal, no per-op thread creation, no-spawn leaves and no Rayon in the release graph, one-time resource-host config conflict plus cgroup/job-object-aware or explicit memory authority and aggregate multi-engine reserve/commit/abort accounting, scheduler model/interleaving tests, cache privacy, source-manifest verification, conversion-twice plus cross-target identity-or-fallback, split/reassembly identity, streamed part/whole verification, hostile-root/atomic-output safety, resume/concurrent-pull safety, installed-basename discovery, activation-fork fail-closed behavior, and claims/behavior/receipt/structural-cost registry consistency. The scheduler/cancellation portion executes as deterministic asupersync Lab runs (quiescence, obligation-leak, loser-drain, and cancellation-protocol oracles; seed-bound chaos; crashpack replay artifacts) combined with the repository's bounded native team-state model per plan §3.3/§9.5 — a failing interleaving must replay from its seed, never survive as a one-off CI ghost.
+- **Invariant gates**: scoped determinism, batch/prefix equivalence, independent structured-output/source-grounding validation, untrusted-segment bytes preserved with all control ids excluded (or rejection), sparse=full, forced=sequential KV, every trie traversal=naïve, uninterrupted=resumed owned job, dependency-scope snapshot mutation, integer SIMD ≡ scalar/i64, overflow/fork-tail/admission proofs, a real `spawn_blocking` pool handle with executor-heartbeat proof (no production inline fallback), one admitted `scoped_cpu` team with exact coordinator/child width, bounded checkpoints, disconnect-safe cancel/panic full join, wrapper-cancel versus actual-completion lifetime with no untracked region-to-supervisor gap, re-entry refusal, no per-op thread creation, no-spawn leaves and no Rayon in the release graph, one-time resource-host config conflict plus cgroup/job-object-aware or explicit memory authority and aggregate multi-engine reserve/commit/abort accounting, scheduler model/interleaving tests, cache privacy, source-manifest verification, conversion-twice plus cross-target identity-or-fallback, split/reassembly identity, streamed part/whole verification, hostile-root/atomic-output safety, resume/concurrent-pull safety, installed-basename discovery, activation-fork fail-closed behavior, and claims/behavior/receipt/structural-cost registry consistency. The scheduler/cancellation portion executes as deterministic asupersync Lab runs (quiescence, obligation-leak, loser-drain, and cancellation-protocol oracles; seed-bound chaos; crashpack replay artifacts) combined with the repository's bounded native team-state model per plan §3.3/§9.5 — a failing interleaving must replay from its seed, never survive as a one-off batch-verification ghost.
 - **Task evals** (plan §9.6): named, versioned datasets per task; scorecards carry recipe id + prompt hash + thinking mode. Quality regressions gate releases like parity regressions.
 - **Adversarial-content and evidence gates**: matched clean/attack fixtures report task-specific steering rather than a firewall claim; semantic second-reader uplift is measured against labeled fields; acceptance-audit arithmetic uses exact small-population goldens and requires human grades.
-- **Model-gated e2e**: ordinary CI reports `SKIPPED_NO_MODEL`; release certification requires an armed pass with artifact digest and fallbacks pointed at `/nonexistent`. A public model-asset release additionally proves fresh HOME/LOCALAPPDATA installer → `fnlp pull` → no-flag inference, followed by a byte-perfect cache hit whose inference run opens no network.
+- **Model-gated e2e**: an unarmed DSR code checkpoint reports
+  `SKIPPED_NO_MODEL`; release certification separately requires an armed pass
+  with artifact digest and fallbacks pointed at `/nonexistent`. A public
+  model-asset release additionally proves fresh HOME/LOCALAPPDATA installer →
+  `fnlp pull` → no-flag inference, followed by a byte-perfect cache hit whose
+  inference run opens no network. A green code checkpoint never promotes this
+  model gate by implication.
 - **`many_docs_without_deadlock`** concurrency watchdog.
 
 ---
@@ -233,8 +258,13 @@ Robot mode must be: stable versioned schema, deterministic where possible, expli
 
 Before finishing a work session you MUST:
 1. Once `.beads/` is initialized **after the plan's ≥4 review rounds**, file issues for remaining implementation work. During pre-Beads planning, do not initialize Beads early; record review gaps in the plan/handoff.
-2. Run quality gates (if code changed) — tests, clippy, fmt, `ubs`.
-3. Update issue status — close finished work, update in-progress.
+2. Ordinary panes run only the explicitly permitted cheap, non-Cargo hygiene
+   checks and record that compilation/tests remain pending; the controller
+   schedules the occasional clean-SHA DSR checkpoint for tests, clippy, fmt,
+   and the combined `ubs` leg.
+3. Update the handoff/status truthfully; ordinary panes leave work
+   `in_progress`. Only the controller closes after the retained DSR receipt and
+   every bead-specific gate exist.
 4. If Beads exists, `br sync --flush-only` and stage only the intended `.beads/` changes.
 5. Hand off — summarize what changed, gates run + results, remaining risks/gaps, concrete next steps.
 
@@ -273,20 +303,29 @@ Conventions: use the bead ID (e.g. `br-123`) as the Agent-Mail `thread_id` and p
 
 ## The Implementation Swarm — Code-First / Batch-Verify Strategy (NTM)
 
-Implementation of this project runs as an NTM tmux swarm of **12 codex panes on `gpt-5.6-terra` at `xhigh` reasoning effort**, governed by `/ntm` and `/vibing-with-ntm`, after the final plan has been converted to beads via `/beads-br`, `/beads-bv`, and `/beads-workflow`. All real builds route through `/rch`. The swarm follows the **Code-First / Batch-Verify** methodology below. It exists to defeat build contention; every agent in the swarm must know it and follow it.
+Implementation of this project runs as an NTM tmux swarm of **12 codex panes on `gpt-5.6-terra` at `xhigh` reasoning effort**, governed by `/ntm` and `/vibing-with-ntm`, after the final plan has been converted to beads via `/beads-br`, `/beads-bv`, and `/beads-workflow`. Ordinary panes run **no Cargo, RCH, DSR, or GitHub Actions commands**. After a code-first wave has quiesced, the controller may select one clean immutable SHA for an occasional `/dsr` checkpoint. That DSR job is the sole build/release authority and runs `scripts/check.sh` against the explicitly named `production` graph. The swarm follows the **Code-First / Batch-Verify** methodology below. It exists to defeat build contention; every agent in the swarm must know it and follow it.
 
 > Operational note: NTM's codex launch template pins the reasoning effort. Before spawning this swarm, set the template's `model_reasoning_effort` to `xhigh` (and restore it afterward), then `ntm spawn franken_nlp --cod=12:gpt-5.6-terra --no-user`.
 
 ### The core problem it solves
 
-A swarm of N agents sharing one repo and one remote-build backend (rch) can make builds, rather than coding, the bottleneck. Two conditions make uncoordinated per-bead building especially costly here:
+A swarm of N agents sharing one repo can make builds, rather than coding, the
+bottleneck. Two conditions make uncoordinated per-bead building especially
+costly here:
 
 1. **The planned crate is broad.** `franken_nlp` is a single crate by design (plan §4.1), but this greenfield repository has no measured clean-build duration yet. Record that duration once a real crate exists; do not repeat “takes minutes” as fact before then.
-2. **The shared backend has finite same-project capacity.** Measure the deployed rch `active_project_exclusion` behavior and worker capacity at campaign start; excess concurrent builds may queue or fall back locally, so the orchestrator grants build slots from observed capacity rather than assuming a fixed count.
+2. **The DSR build hosts have finite capacity.** The controller checks the DSR
+   host/config posture before a checkpoint and dispatches only after ordinary
+   editing has quiesced. Direct RCH output and GitHub Actions status may be
+   retained as historical diagnostics, but neither is current proof authority.
 
 ### The insight
 
-Separate the cheap, parallelizable work (writing code) from the expensive, serialized work (building/testing). Reading and writing code is free and embarrassingly parallel across 12 agents. Building is the scarce, serialized resource. So: let all 12 agents write code at full speed and commit without building; then run the build/test exactly ONCE, centrally, over everyone's combined changes.
+Separate the cheap, parallelizable work (writing code) from the expensive,
+serialized work (building/testing). Reading and writing code is parallel across
+12 agents; building is the scarce resource. Let the panes write and commit
+without building, then have the controller submit one DSR checkpoint for the
+selected clean SHA and accumulated proof batch.
 
 ### The two-phase loop
 
@@ -294,7 +333,7 @@ Separate the cheap, parallelizable work (writing code) from the expensive, seria
 ┌─ PHASE 1: CODE-FIRST WAVE (all 12 agents, parallel, no builds) ─┐
 │  each agent:  claim a ready bead (via bead-assignee)            │
 │               → WRITE the real code + test                      │
-│               → cheap non-Cargo checks; build slot only by grant │
+│               → cheap non-Cargo checks only                      │
 │               → COMMIT immediately ("…— code-first, batch-test  │
 │                 pending"), leave bead in_progress               │
 │               → next bead                                       │
@@ -302,23 +341,25 @@ Separate the cheap, parallelizable work (writing code) from the expensive, seria
 │               ~20–40 commits/10 min at full wave — a historical │
 │               reference point, not this project's target)       │
 └─────────────────────────────────────────────────────────────────┘
-                              │  (commit-rate dip = wave saturated)
+                              │  (quiescence + meaningful proof batch)
                               ▼
-┌─ PHASE 2: BATCH VERIFY + CLOSE (orchestrator, once, central) ───┐
-│  1. commit-flush: tell agents to commit in-flight work so the   │
-│     tree is consistent                                          │
-│  2. ONE build/test over the combined changes: `cargo test       │
-│     --locked` (or `scripts/check.sh` once it exists), on a      │
-│     dedicated orchestrator CARGO_TARGET_DIR, via rch            │
-│  3. triage failures (see below), fix, re-run until green        │
-│  4. CLOSE the green in_progress beads with the suite as proof   │
+┌─ PHASE 2: OCCASIONAL DSR CHECKPOINT + CLOSE (controller) ──────┐
+│  1. commit-flush; wait for editing/build contention to quiesce │
+│  2. require a clean tree and select one immutable source SHA    │
+│  3. ONE DSR job runs `scripts/check.sh` for graph `production`  │
+│  4. retain exact DSR PASS|FAIL receipt; triage/re-run if needed │
+│  5. CLOSE only beads whose own gates and combined proof passed  │
 └─────────────────────────────────────────────────────────────────┘
                               │  closing beads UNBLOCKS dependents
                               ▼
                     ready pool refills → next Phase-1 wave
 ```
 
-(This project is one crate, so "the union of touched crates" collapses to the crate's full locked test suite; the amortization argument is unchanged. `cargo check` is still a real whole-crate compilation—not “syntax only”—and therefore uses the same orchestrator-granted build slot rather than running independently in 12 panes.)
+(This project is one crate, so "the union of touched crates" collapses to the
+crate's full locked test suite. `cargo check` is still a real whole-crate
+compilation—not “syntax only”—so an ordinary pane never runs it. The named
+`production` aggregate must include the actual shipping asupersync runtime and
+no-Rayon leaf path; default-empty and all-features graphs are not substitutes.)
 
 ### Why the close step is the engine that refills work
 
@@ -327,36 +368,76 @@ This is the subtle, critical part. `br` unblocks a dependent bead only when its 
 - The ready pool drains (claimed → in_progress) and does not refill; the blocked beads stay blocked because nothing has closed.
 - The unblock wave fires only at the Phase-2 close step: when the WIP beads pass tests and close, their dependents flip to ready in a burst.
 
-So the loop is not "code forever then test once at the very end"; it is a **pump**. Each Phase-2 cycle closes a layer, which unblocks the next layer of the blocked pool, which feeds the next Phase-1 wave. Periodic cycles keep the swarm fed; one giant end-pass would starve it.
+So the loop is not "code forever then test once at the very end"; it is a
+**pump**. Each controller-authorized DSR checkpoint may close a proved layer,
+which unblocks the next layer of the pool. Checkpoints remain occasional: the
+controller batches enough compatible work to amortize host contention and does
+not turn a temporary ready-pool dip into twelve independent builds.
 
 ### The trigger (when to flip Phase 1 → Phase 2)
 
-**The commit-rate/ready-pool dip.** While agents have claimable work, reviewed commits and in-progress changes arrive steadily. When `br ready` empties and that flow falls, the wave is probably saturated and should move to batch verification. The prior campaign that proved this loop watched the rate fall 20 → 12 → 5 commits per 10 minutes at saturation; treat those numbers as a historical reference point for the *shape* of the dip, not a FrankenNLP throughput guarantee — the orchestrator records this campaign's own ready depth, in-flight count, commit flow, and build queue before deciding.
+**Quiescence plus a meaningful proof batch.** While agents have claimable work,
+reviewed commits and in-progress changes arrive steadily. A ready-pool/commit
+rate dip is one input, not authorization by itself. The controller first asks
+panes to commit or pause, confirms the selected SHA is immutable and the source
+tree is clean, checks there is no competing build/edit wave, and then decides
+whether enough compatible work has accumulated to justify DSR. The prior
+campaign's 20 → 12 → 5 commits-per-ten-minutes shape is historical context,
+not a FrankenNLP target or trigger threshold.
 
 ### Enforcement (what keeps it honest)
 
 Agents want to build to "prove" their work, so the model has to be actively enforced:
 
-- **Build enforcement:** every orchestrator tick detects unauthorized per-agent Cargo/rch processes from pane-owned process metadata. Terminate only the exact validated PID/process group launched by that pane—never a broad `pkill`, user-wide process-name match, or guess derived from a target-directory string. The orchestrator's own batch verify uses a separate, exempt target directory.
-- **Explicit directive:** agents run no Cargo/rch command during the ordinary code-first wave. `cargo check --locked` is a real build and is allowed only when the orchestrator grants that pane the single build slot for a specific integration question; no `cargo test`, no independent remote-proof waiting; commit immediately.
+- **Build enforcement:** every controller tick detects unauthorized pane-owned
+  Cargo, RCH, DSR, or GitHub Actions processes/jobs. Terminate or cancel only an
+  exact validated process group or job owned by that pane—never a broad
+  `pkill`, user-wide process-name match, or guessed target-directory match.
+- **Explicit directive:** ordinary agents run no Cargo, RCH, DSR, or GitHub
+  Actions command. There are no pane-specific build-slot exceptions. Commit
+  code-first work promptly and leave proof-sensitive beads `in_progress` until
+  the controller's retained DSR receipt and their own named gates exist.
 - **KPI reframed:** success during Phase 1 is measured by the commit stream, not per-bead closures (closures are deferred and arrive in bursts during Phase 2).
 
 ### Failure triage in Phase 2 (the part that makes it safe)
 
 Code committed without running its tests will have failures; that is expected and fine, because the batch pass catches them all at once:
 
-- **Cargo's early-abort trap:** a single test-target compile error makes `cargo test` abort early, so the pass/fail line is a misleading prefix (a prior campaign saw "240/0 green" that was actually 793/17 once it compiled). Always fix compile errors first, then re-run for the true count.
-- **Cluster failures by file**, then dispatch each cluster to one agent (file-exclusive, no collisions) with the exact assertion + location. Re-run until 0 failed.
-- **Close only green, with evidence.** Cite the combined green suite **and each bead's own named contract/test/eval evidence** in its close reason; a repository-wide green bar proves compatibility, not that an individual requirement was actually implemented. Leave genuinely incomplete beads in_progress (or reopen) with a comment; never false-close.
-- **The project's quality gates move to close time, not per bead.** The "Mandatory Checks After Substantive Changes" section above applies to the Phase-2 batch pass (plus `ubs --diff` over the wave's combined diff), and the plan's parity/eval gates are unchanged: a bead whose contract includes an L-gate or scorecard closes only when that gate ran in the batch pass.
+- **Cargo's early-abort trap:** a single test-target compile error makes
+  `cargo test` abort early, so the pass/fail line is a misleading prefix (a
+  prior campaign saw "240/0 green" that was actually 793/17 once it compiled).
+  Fix compile errors first; after fixes are committed and contention quiesces,
+  only the controller may request another DSR run for the true count.
+- **Cluster failures by file**, then dispatch each cluster to one agent
+  (file-exclusive, no collisions) with the exact assertion + location. Repeat
+  code-first repair plus controller-requested DSR until zero failures.
+- **Close only green, with evidence.** Cite the exact clean source SHA, retained
+  DSR `PASS` receipt for `scripts/check.sh` on `production`, **and each bead's
+  own named contract/test/eval evidence** in its close reason. A code checkpoint
+  proves compatibility only; model-present parity, target-host performance,
+  platform-native behavior, and human review remain separate authorities.
+  Leave genuinely incomplete beads in progress; never false-close.
+- **The project's quality gates move to close time, not per bead.** The
+  "Mandatory Checks After Substantive Changes" section above applies to the
+  controller's DSR checkpoint (including the combined UBS leg), and the plan's
+  parity/eval gates are unchanged: a bead whose contract includes an L-gate or
+  scorecard closes only when that separate gate also ran and was retained.
 
 ### Expected benefit and the measurement obligation
 
-- Phase 1 parallelizes independent editing and removes routine builds from the per-bead path.
-- A coordinated build can cover several compatible changes in one wave instead of repeating the same dependency compilation per bead.
+- Phase 1 parallelizes independent editing and removes all routine builds from
+  the per-bead path.
+- An occasional DSR checkpoint can cover several compatible changes at one
+  immutable SHA instead of repeating compilation per bead.
 - The intended effect is less build contention, local-fallback thrash, and disk pressure; campaign telemetry must show whether that effect materialized.
 
-Those are design hypotheses, not a promise: the originating campaign estimated a ~20–100× reduction in build-serialized wall time on its own workload, and that figure is retained here only as the historical motivation. Each campaign records wall time, queue time, build count, failure/rework rate, and escaped-defect rate against a representative prior or pilot wave; if batch verification increases integration failures or does not save time, shrink the wave or grant more focused build slots.
+Those are design hypotheses, not a promise: the originating campaign estimated
+a ~20–100× reduction in build-serialized wall time on its own workload, and
+that figure is retained here only as the historical motivation. Each campaign
+records wall time, queue time, build count, failure/rework rate, and
+escaped-defect rate against a representative prior or pilot wave; if batch
+verification increases integration failures or does not save time, shrink the
+wave. Do not create pane-level build exceptions.
 
 ### Hard-won gotchas (baked in from prior campaigns)
 
@@ -364,7 +445,9 @@ Those are design hypotheses, not a promise: the originating campaign estimated a
 - **Exact-path commits in the shared tree.** Reserve the bead's paths, stage only explicit owned paths (`git add -- path...`, never `git add -A`), inspect `git diff --cached --name-only` and the staged patch, and refuse a commit containing a peer's file or unrelated hunk. Another agent's working-tree dirt is never a reason to stash, revert, or absorb it.
 - **Stale rate-limit display.** A codex "usage limit" message persists in-buffer and codex won't auto-retry; nudge the pane to confirm before assuming an outage (a prior campaign lost ~5.5 hours idling on a false outage).
 - **Degraded Agent Mail.** If the mail layer is slow or down, fall back to bead-assignee locking (`br update <id> --assignee <agent>`) instead of blocking on mail reservations.
-- **Disk/build-storm watch.** If free disk drops fast or the build-process count spikes, the enforcement slipped; re-kill stray builds and re-issue the directive.
+- **Disk/build-storm watch.** If free disk drops fast or the build-process count
+  spikes, enforcement slipped; identify only the exact pane-owned offender,
+  stop that exact job/process safely, and re-issue the directive.
 
 ---
 
@@ -387,9 +470,30 @@ Parse `file:line:col` → location, 💡 → suggested fix. Fix root cause, not 
 
 ---
 
-## RCH — Remote Compilation Helper
+## DSR — Sole Build and Release Authority
 
-RCH offloads `cargo build/test/clippy` to remote workers to avoid local compilation storms. Installed at `~/.local/bin/rch`, hooked into Claude Code's PreToolUse — usually transparent. Manual: `rch exec -- cargo build --locked --release`. Health: `rch doctor`, `rch status`. Fails open (builds run locally if workers unavailable). **Codex/GPT users:** no auto-hook — manually `rch exec -- <cmd>` for heavy builds.
+`/dsr` governs the occasional controller-selected build/checkpoint/release job.
+Ordinary panes never invoke DSR, Cargo, RCH, or GitHub Actions. The controller
+waits for the code-first wave to quiesce, selects one clean immutable SHA, and
+submits a DSR recipe whose single validation entrypoint is `scripts/check.sh`
+against the named `production` feature graph. Retain the exact source SHA,
+expanded command/recipe identity, DSR and toolchain versions, host/target, exit
+code, and literal `PASS|FAIL` result.
+
+GitHub Actions may remain disabled in the repository for historical context,
+but its status and logs are non-authoritative. Direct RCH runs are likewise
+diagnostic history only; because RCH can fail open to local execution, they are
+especially unsuitable as release proof. DSR registration, host readiness, and
+the explicit production-graph wiring are real prerequisites—if any is absent,
+the build verdict is `BLOCKED`, not an inferred pass. A green DSR code receipt
+does not satisfy model-present, target-host performance/platform, artifact,
+security-review, or human-authorization gates unless those exact legs also ran
+and were retained under their own evidence contracts.
+
+A release DSR job additionally requires configured signing, SBOM, SLSA, exact
+asset-inventory, and offline-verification surfaces. Missing release tooling or
+key material blocks release; it never downgrades publisher authentication to a
+checksum-only claim.
 
 ---
 

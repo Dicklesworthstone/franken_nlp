@@ -1,5 +1,8 @@
 #!/bin/sh
 # Generate and verify the committed FrankenSuite pin and root-patch closure.
+# This is a subordinate leg of scripts/check.sh inside the occasional
+# controller-authorized clean-SHA DSR checkpoint. Ordinary panes do not invoke
+# it, Cargo, RCH, DSR, or GitHub Actions; direct RCH/GHA output is not proof.
 #
 # A dependency repository's root [patch] table is not inherited by a consumer.
 # This tool makes that closure explicit, refusing a missing, stale, or extra

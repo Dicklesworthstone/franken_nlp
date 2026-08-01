@@ -7,9 +7,17 @@ recorded.  Until then, `blocked` means the operation refuses and `off` means
 the optional optimization is compiled out.  No release code may replace a
 blocked row with a handwritten FFI declaration.
 
+Ordinary swarm panes run no Cargo, RCH, DSR, or GitHub Actions command. The
+controller may select one clean immutable SHA only after code-first contention
+quiesces; an occasional DSR job then runs `scripts/check.sh` against the named
+`production` graph. Direct RCH and GitHub Actions output cannot promote a row.
+Even a green DSR code receipt does not make a platform row `available` without
+the target-native evidence named here, and it cannot substitute for
+model-present, performance, artifact, or human-review authority.
+
 The intended distribution matrix is recorded with exact Rust target triples so
-that the Phase-0 CI record can ratify the deployment baseline without changing
-the row identity:
+that the Phase-0 DSR receipt plus separate target-native evidence can ratify the
+deployment baseline without changing the row identity:
 
 - Linux x86-64 GNU: `x86_64-unknown-linux-gnu`; minimum glibc is not yet
   declared, and the GNU target ABI is the only current identity.
@@ -76,8 +84,8 @@ call directly.
    `fs_tx`, tuning, durable jobs, and AA-R1 beads must update their affected
    row before shipping a facility.
 3. `scripts/validate_platform_surfaces.py`, once the uxw scaffold supplies
-   the doc-validation leg, must parse this table, require every column above,
-   print the complete facility-by-target matrix, and end with
+   the DSR-run doc-validation leg, must parse this table, require every column
+   above, print the complete facility-by-target matrix, and end with
    `PLATFORM_SURFACES RESULT=PASS|FAIL rows=<n> incomplete=<list>`.
 4. G0 ADRs that consume a facility identify its exact `Facility` value on a
    standalone line as `PLATFORM_SURFACE: <facility>`.  The validator activates
