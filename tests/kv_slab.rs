@@ -218,3 +218,48 @@ fn forked_tail_cow_releases_only_the_cancelled_fork_slabs() {
     );
     assert_eq!(parent.refcount_at(0, 0, KvVector::Key), Ok(1));
 }
+
+#[test]
+fn parent_append_after_fork_cows_the_sealed_page_before_writing() {
+    let mut parent = KvSlabCache::try_with_capacity(32, KV_SLABS_PER_LOGICAL_PAGE * 2)
+        .expect("the pool reserves a shared page plus one parent COW page");
+    for position in 0..3 {
+        append_prepared_position(&mut parent, position, 40 + position as u16);
+    }
+
+    let fork = parent
+        .try_fork()
+        .expect("forking seals the completed parent page");
+    assert_eq!(parent.refcount_at(7, 2, KvVector::Value), Ok(2));
+
+    append_prepared_position(&mut parent, 3, 90);
+    let after_parent_cow = parent.pool_stats();
+    assert_eq!(
+        after_parent_cow.live_slab_count,
+        KV_SLABS_PER_LOGICAL_PAGE * 2
+    );
+    assert_eq!(
+        after_parent_cow.retained_reference_count,
+        Some(KV_SLABS_PER_LOGICAL_PAGE * 2)
+    );
+    assert_eq!(parent.refcount_at(7, 2, KvVector::Value), Ok(1));
+    assert_eq!(fork.refcount_at(7, 2, KvVector::Value), Ok(1));
+
+    let mut parent_value = [0_u16; 1_024];
+    let mut fork_value = [0_u16; 1_024];
+    parent
+        .copy_value_at(7, 2, &mut parent_value)
+        .expect("parent COW retains the shared prefix values");
+    fork.copy_value_at(7, 2, &mut fork_value)
+        .expect("fork retains its own immutable prefix values");
+    assert_eq!(parent_value, [1_049; 1_024]);
+    assert_eq!(fork_value, [1_049; 1_024]);
+
+    drop(fork);
+    let parent_only = parent.pool_stats();
+    assert_eq!(parent_only.live_slab_count, KV_SLABS_PER_LOGICAL_PAGE);
+    assert_eq!(
+        parent_only.retained_reference_count,
+        Some(KV_SLABS_PER_LOGICAL_PAGE)
+    );
+}
