@@ -1,5 +1,5 @@
 use franken_nlp::artifact::format::{
-    logical_model_sha256, logical_tensor_sha256, write, ArchTarget, CanonicalDtype,
+    framed_sha256, logical_model_sha256, logical_tensor_sha256, write, ArchTarget, CanonicalDtype,
     FnlpqWriterInput, PackingSetInput, SectionKind, SectionPayload, SectionRange, TensorInput,
 };
 use franken_nlp::artifact::packing::{
@@ -7,6 +7,7 @@ use franken_nlp::artifact::packing::{
     NativePackingTarget, PackingError, TILE_TABLE_VERSION_V1,
 };
 use franken_nlp::artifact::reader::FnlpqArtifact;
+use sha2::{Digest, Sha256};
 
 #[test]
 fn deterministic_synthetic_matrix_derives_and_recovers_all_five_targets() {
@@ -93,6 +94,33 @@ fn cache_address_is_bound_to_a_closed_target_table_pair() {
             .join("native")
             .join(&avx2.content_address)
             .join("x86-avx2-tile-table-v1.fnlpq")
+    );
+}
+
+#[test]
+fn cache_key_raw_sha_and_fnlpq_file_identity_remain_distinct() {
+    let generic_bytes = generic_root(23);
+    let derived = derive_native_packing(
+        generic_bytes.clone(),
+        NativePackingTarget::X86Avx2,
+        TILE_TABLE_VERSION_V1,
+    )
+    .expect("synthetic native cache");
+
+    assert_eq!(
+        derived.address.whole_artifact_sha256,
+        hex(&Sha256::digest(&generic_bytes)),
+        "the content-address triple records raw Generic root SHA-256"
+    );
+    assert_eq!(
+        derived.fnlpq_file_sha256,
+        hex(&framed_sha256("fnlpq-file-v1", &[&derived.bytes])
+            .expect("derived bytes admit the frozen domain frame")),
+        "the .fnlpq physical identity uses the format's domain frame"
+    );
+    assert_ne!(
+        derived.address.whole_artifact_sha256, derived.fnlpq_file_sha256,
+        "raw Generic-root addressing and framed derived-file identity are distinct fields"
     );
 }
 
