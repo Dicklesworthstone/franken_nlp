@@ -96,6 +96,9 @@ pub struct ConvertRequest {
     pub arch: ConvertArch,
     /// Final no-clobber `.fnlpq` destination.
     pub output: PathBuf,
+    /// Exact source commit of the converter binary, supplied by its build
+    /// invocation and retained in the adjacent conversion receipt.
+    pub converter_commit: String,
     /// Interactive confirmation bypass.
     pub yes: bool,
     /// Reject all unrelated directory entries when true.
@@ -128,6 +131,13 @@ impl ConvertRequest {
                 argument: "-o/--output",
                 expected: "a .fnlpq destination".to_owned(),
                 actual: self.output.display().to_string(),
+            });
+        }
+        if !is_lower_git_commit(&self.converter_commit) {
+            return Err(ConverterError::InvalidConvertArgument {
+                argument: "--converter-commit",
+                expected: "the lowercase 40-character commit that built fnlp".to_owned(),
+                actual: self.converter_commit.clone(),
             });
         }
         Ok(())
