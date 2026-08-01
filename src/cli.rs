@@ -7,8 +7,6 @@ use std::{
 };
 
 use clap::{CommandFactory, Parser, Subcommand};
-use sha2::{Digest, Sha256};
-
 use crate::{
     artifact::converter::{
         plan_generic_payload, prepare_convert_request, stream_routed_bf16_panels, ConvertArch,
@@ -430,7 +428,7 @@ fn run_streaming_convert(
         "CONVERT STAGE=plan RESULT=START tensors={}",
         prepared.census.len()
     );
-    let materialized = match read_materialized_sources(&request.source_dir, prepared) {
+    let materialized = match read_materialized_sources(prepared) {
         Ok(value) => value,
         Err(error) => return emit_streaming_refusal("materialized-sources", error),
     };
@@ -687,57 +685,16 @@ impl LogicalTensorFirstPass {
 }
 
 fn read_materialized_sources(
-    source_dir: &Path,
     prepared: &PreparedConversionInput,
 ) -> Result<MaterializedSources, String> {
-    let model_config = read_verified_source_bytes(source_dir, prepared, "config.json")?;
-    let tokenizer_model = read_verified_source_bytes(source_dir, prepared, "tokenizer.model")?;
-    let tokenizer_config =
-        read_verified_source_bytes(source_dir, prepared, "tokenizer_config.json")?;
-    let parsed: serde_json::Value = serde_json::from_slice(&tokenizer_config).map_err(|error| {
-        format!("parse verified tokenizer_config.json for chat_template: {error}")
-    })?;
-    let chat_template = parsed
-        .get("chat_template")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "verified tokenizer_config.json lacks string chat_template".to_owned())?
-        .as_bytes()
-        .to_vec();
+    let verified = prepared.materialized_sources();
     Ok(MaterializedSources {
-        model_config,
-        tokenizer_model,
-        tokenizer_config,
-        chat_template,
+        model_config: verified.model_config.clone(),
+        tokenizer_model: verified.tokenizer_model.clone(),
+        tokenizer_config: verified.tokenizer_config.clone(),
+        chat_template: verified.chat_template.clone(),
         license_bundle: embedded_license_bundle()?,
     })
-}
-
-fn read_verified_source_bytes(
-    source_dir: &Path,
-    prepared: &PreparedConversionInput,
-    name: &str,
-) -> Result<Vec<u8>, String> {
-    let expected = prepared
-        .source
-        .files
-        .iter()
-        .find(|file| file.name == name)
-        .ok_or_else(|| format!("prepared source closure has no {name}"))?;
-    let path = source_dir.join(name);
-    let bytes = fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
-    let observed_len = u64::try_from(bytes.len())
-        .map_err(|_| format!("{} length does not fit u64", path.display()))?;
-    let observed_digest: [u8; 32] = Sha256::digest(&bytes).into();
-    let observed_sha256 = hex_lower(&observed_digest);
-    if observed_len != expected.bytes || observed_sha256 != expected.sha256 {
-        return Err(format!(
-            "verified source changed before streaming pass for {}: expected-bytes={} observed-bytes={observed_len} expected-sha256={} observed-sha256={observed_sha256}",
-            path.display(),
-            expected.bytes,
-            expected.sha256
-        ));
-    }
-    Ok(bytes)
 }
 
 fn embedded_license_bundle() -> Result<Vec<u8>, String> {

@@ -520,6 +520,83 @@ fn verify_source_member(
     })
 }
 
+/// Snapshot the exact source members embedded into an artifact while the
+/// prepared closure is still being established. Each read is re-hashed against
+/// the accepted manifest; later conversion code consumes only these retained
+/// bytes rather than reopening configuration/tokenizer paths.
+fn snapshot_materialized_sources(
+    source_dir: &Path,
+    source: &VerifiedSourceClosure,
+) -> Result<VerifiedMaterializedSources, ConverterError> {
+    let model_config = read_materialized_source_member(source_dir, source, "config.json")?;
+    let tokenizer_model = read_materialized_source_member(source_dir, source, "tokenizer.model")?;
+    let tokenizer_config =
+        read_materialized_source_member(source_dir, source, "tokenizer_config.json")?;
+    let parsed: Value = serde_json::from_slice(&tokenizer_config).map_err(|error| {
+        ConverterError::SourceMaterialization {
+            name: "tokenizer_config.json".to_owned(),
+            detail: format!("parse JSON for chat_template: {error}"),
+        }
+    })?;
+    let chat_template = parsed
+        .get("chat_template")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ConverterError::SourceMaterialization {
+            name: "tokenizer_config.json".to_owned(),
+            detail: "missing string chat_template".to_owned(),
+        })?
+        .as_bytes()
+        .to_vec();
+    Ok(VerifiedMaterializedSources {
+        model_config,
+        tokenizer_model,
+        tokenizer_config,
+        chat_template,
+    })
+}
+
+fn read_materialized_source_member(
+    source_dir: &Path,
+    source: &VerifiedSourceClosure,
+    name: &str,
+) -> Result<Vec<u8>, ConverterError> {
+    let expected = source
+        .files
+        .iter()
+        .find(|file| file.name == name)
+        .ok_or_else(|| ConverterError::SourceMaterialization {
+            name: name.to_owned(),
+            detail: "absent from verified source closure".to_owned(),
+        })?;
+    let path = source_dir.join(name);
+    let bytes = fs::read(&path).map_err(|error| ConverterError::Io {
+        path: path.clone(),
+        operation: "snapshot verified materialized source",
+        detail: error.to_string(),
+    })?;
+    let observed_len = u64::try_from(bytes.len()).map_err(|_| ConverterError::Arithmetic {
+        invariant: "materialized source bytes to u64",
+    })?;
+    if observed_len != expected.bytes {
+        return Err(ConverterError::SourceLength {
+            path,
+            expected: expected.bytes,
+            actual: observed_len,
+            next_command: "restore the pinned source closure and rerun fnlp convert".to_owned(),
+        });
+    }
+    let observed_sha256 = sha256_hex(&bytes);
+    if observed_sha256 != expected.sha256 {
+        return Err(ConverterError::SourceDigest {
+            path,
+            expected: expected.sha256.clone(),
+            actual: observed_sha256,
+            next_command: "restore the pinned source closure and rerun fnlp convert".to_owned(),
+        });
+    }
+    Ok(bytes)
+}
+
 /// Exact storage policy selected by the frozen converter route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StorageStage {
@@ -705,12 +782,27 @@ pub struct PreparedConversionInput {
     pub logical_payload_bytes: u64,
     /// Domain-framed exact source census identity.
     pub census_sha256: String,
+    /// Exact configuration/tokenizer/template bytes snapshotted and
+    /// re-authenticated during preparation.
+    materialized_sources: VerifiedMaterializedSources,
     /// The verified safetensors handles that supplied this census.
     ///
     /// This intentionally remains private: later conversion passes must reuse
     /// this authenticated range session rather than reopen mutable shard
     /// pathnames after preparation.
     range_index: SafetensorsRangeIndex,
+}
+
+/// Source bytes that must be embedded into the canonical artifact.
+///
+/// These are retained from preparation so conversion never reopens their
+/// pathnames after the source closure has been accepted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedMaterializedSources {
+    pub(crate) model_config: Vec<u8>,
+    pub(crate) tokenizer_model: Vec<u8>,
+    pub(crate) tokenizer_config: Vec<u8>,
+    pub(crate) chat_template: Vec<u8>,
 }
 
 /// One tensor's precomputed destinations in the three Generic payload
@@ -893,6 +985,7 @@ pub fn prepare_nanbeige42_input(
 ) -> Result<PreparedConversionInput, ConverterError> {
     let source_dir = source_dir.as_ref();
     let source = verify_source_closure(source_dir, manifest, strict_source_dir)?;
+    let materialized_sources = snapshot_materialized_sources(source_dir, &source)?;
     let range_index = SafetensorsRangeIndex::open_pinned_nanbeige42(source_dir)
         .map_err(ConverterError::Safetensors)?;
     let census = range_index.census();
@@ -914,6 +1007,7 @@ pub fn prepare_nanbeige42_input(
         panels,
         logical_payload_bytes,
         census_sha256,
+        materialized_sources,
         range_index,
     })
 }
@@ -979,6 +1073,11 @@ impl PreparedConversionInput {
         self.range_index
             .read_range(tensor, panel)
             .map_err(ConverterError::Safetensors)
+    }
+
+    /// Return source bytes that were re-authenticated during preparation.
+    pub(crate) fn materialized_sources(&self) -> &VerifiedMaterializedSources {
+        &self.materialized_sources
     }
 
     /// Calculate the pre-conversion footprint from actual parsed panel plans.
@@ -1520,12 +1619,12 @@ where
     Ok(report)
 }
 
-/// Feed one already-checked source range index through a prepared conversion
-/// plan.  The range index is the only production reader admitted here; it
-/// preserves its own source-digest and range-length checks while the routed
-/// traversal preserves converter plan alignment and bounded BF16 decoding.
+/// Feed the sealed prepared source session through its conversion plan.
+///
+/// The range reader is intentionally not supplied by the caller: preparation
+/// retains the authenticated safetensors handles and range authority, so a
+/// later pass cannot substitute a second independently opened source index.
 pub fn stream_prepared_bf16_panels<C>(
-    source: &SafetensorsRangeIndex,
     prepared: &PreparedConversionInput,
     consume: C,
 ) -> Result<Bf16PanelStreamReport, ConverterError>
@@ -1537,9 +1636,7 @@ where
         &prepared.routes,
         &prepared.panels,
         |entry, panel| {
-            source
-                .read_range(&entry.name, panel)
-                .map_err(ConverterError::Safetensors)
+            prepared.read_verified_panel(&entry.name, panel)
         },
         consume,
     )
@@ -1916,6 +2013,9 @@ pub enum ConverterError {
         actual: String,
         next_command: String,
     },
+    /// An artifact-materialized source member could not be retained from the
+    /// verified source closure.
+    SourceMaterialization { name: String, detail: String },
     /// Extra file always capable of changing source semantics.
     SemanticSourceExtra {
         path: PathBuf,
@@ -2089,6 +2189,10 @@ impl fmt::Display for ConverterError {
                 formatter,
                 "source digest mismatch {}: expected={expected} observed={actual}; next={next_command}",
                 path.display()
+            ),
+            Self::SourceMaterialization { name, detail } => write!(
+                formatter,
+                "materialized source {name}: {detail}; next=restore the pinned source closure and rerun fnlp convert"
             ),
             Self::SemanticSourceExtra {
                 path,
