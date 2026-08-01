@@ -2299,6 +2299,17 @@ pub fn capacity_one_lane<T>() -> (CapacityOneSender<T>, CapacityOneReceiver<T>) 
     (CapacityOneSender { sender }, CapacityOneReceiver { receiver })
 }
 
+/// Translate the process' effective compute-team width into the child cap for
+/// one lending `Cx::scoped_cpu` region.
+///
+/// The blocking coordinator owns one deterministic shard itself. The pinned
+/// foundation counts only calls to `ScopedCpu::spawn`, so a width of one is a
+/// valid coordinator-only run and every wider team may create at most
+/// `width - 1` children.
+pub const fn scoped_cpu_child_cap(effective_compute_team_width: usize) -> Option<usize> {
+    effective_compute_team_width.checked_sub(1)
+}
+
 impl<T> CapacityOneSender<T> {
     pub fn try_send(&self, value: T) -> Result<(), CapacityOneLaneError> {
         self.sender.try_send(value).map_err(|error| match error {
@@ -2410,10 +2421,22 @@ impl fmt::Display for SealedTeamRunError {
 #[cfg(feature = "asupersync-runtime")]
 impl std::error::Error for SealedTeamRunError {}
 
+#[cfg(feature = "asupersync-runtime")]
+fn drain_reason_for_run_error(error: &SealedTeamRunError) -> TeamDrainReason {
+    match error {
+        SealedTeamRunError::ScopeCancelled { .. } => TeamDrainReason::Cancelled,
+        SealedTeamRunError::ScopePanicked { .. } => TeamDrainReason::WorkerPanicked,
+        SealedTeamRunError::Protocol(_) | SealedTeamRunError::ScopeWorkerCapExceeded { .. } => {
+            TeamDrainReason::CoordinatorPanicked
+        }
+    }
+}
+
 /// Refusal before the one permitted `spawn_blocking` crossing can be admitted.
 #[cfg(feature = "asupersync-runtime")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SealedTeamLaunchError {
+    InvalidTeamWidth,
     MissingRequestContext,
     SpawnBlocking { detail: String },
 }
@@ -2422,6 +2445,9 @@ pub enum SealedTeamLaunchError {
 impl fmt::Display for SealedTeamLaunchError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidTeamWidth => {
+                formatter.write_str("sealed scoped-CPU team width must include its coordinator")
+            }
             Self::MissingRequestContext => formatter.write_str(
                 "sealed scoped-CPU team requires an asupersync request context",
             ),
@@ -2546,6 +2572,15 @@ fn run_sealed_cpu_checkpoint_team(
             return Err(SealedTeamRunError::Protocol(error));
         }
         gate.release();
+        if let Err(error) = blocking_cx.checkpoint() {
+            team.begin_drain(TeamDrainReason::Cancelled);
+            return Err(SealedTeamRunError::ScopeCancelled {
+                detail: error.to_string(),
+            });
+        }
+        eprintln!(
+            "SEALED_TEAM STAGE=COORDINATOR RESULT=CHECKPOINTED child_count={child_count}",
+        );
         Ok(())
     });
 
@@ -2554,7 +2589,7 @@ fn run_sealed_cpu_checkpoint_team(
             .reconcile_after_scoped_join(TeamDrainReason::Completed)
             .map_err(SealedTeamRunError::Protocol),
         Ok(Err(error)) => {
-            let _ = team.reconcile_after_scoped_join(TeamDrainReason::CoordinatorPanicked);
+            let _ = team.reconcile_after_scoped_join(drain_reason_for_run_error(&error));
             Err(error)
         }
         Err(ScopedCpuError::Cancelled(error)) => {
@@ -2982,18 +3017,22 @@ impl EngineLease {
     /// has joined every fixed child and the closure returns.
     ///
     /// This is the foundation seam, not a scheduler shortcut: callers supply
-    /// the already-admitted child count, and later stage schedulers attach
-    /// their capacity-one command/reply loops without creating another team.
+    /// the already-admitted effective team width. The coordinator keeps one
+    /// deterministic shard, while the scope creates at most `width - 1`
+    /// children. Later stage schedulers attach their capacity-one
+    /// command/reply loops without creating another team.
     #[cfg(feature = "asupersync-runtime")]
     pub fn spawn_sealed_cpu_checkpoint_team(
         &self,
-        child_count: usize,
+        effective_compute_team_width: usize,
     ) -> Result<
         asupersync::runtime::TaskHandle<Result<SealedTeamSnapshot, SealedTeamRunError>>,
         SealedTeamLaunchError,
     > {
         use asupersync::cx::Cx;
 
+        let child_count = scoped_cpu_child_cap(effective_compute_team_width)
+            .ok_or(SealedTeamLaunchError::InvalidTeamWidth)?;
         let completion_guard = self.register_blocking_closure();
         self.resources.runtime().block_on(async move {
             let request_cx = Cx::current().ok_or(SealedTeamLaunchError::MissingRequestContext)?;

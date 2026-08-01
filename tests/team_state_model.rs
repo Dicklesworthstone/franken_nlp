@@ -10,8 +10,15 @@
 
 use franken_nlp::orchestrator::{
     CapacityOneLaneError, SealedCpuTeam, SealedTeamError, SealedTeamPhase, TeamDrainReason,
-    capacity_one_lane,
+    capacity_one_lane, scoped_cpu_child_cap,
 };
+
+#[test]
+fn effective_team_width_reserves_the_coordinator_shard() {
+    assert_eq!(scoped_cpu_child_cap(0), None);
+    assert_eq!(scoped_cpu_child_cap(1), Some(0));
+    assert_eq!(scoped_cpu_child_cap(4), Some(3));
+}
 
 #[test]
 fn formation_seal_refuses_post_start_and_post_latch_workers() {
