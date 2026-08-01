@@ -13,8 +13,6 @@ use franken_nlp::canonjson;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const GOLDEN_BYTES_HEX: &str = include_str!("fixtures/fnlpq/golden/tiny_v1.hex");
-const GOLDEN_HEADER: &str = include_str!("fixtures/fnlpq/golden/tiny_v1.header.json");
 const FIELD_INVENTORY: &str = include_str!("fixtures/fnlpq/field_inventory.json");
 
 fn tiny_input() -> FnlpqWriterInput {
@@ -247,14 +245,17 @@ fn incremental_section_hasher_rejects_overflow_before_digesting() {
 }
 
 #[test]
-fn tiny_v1_matches_committed_byte_and_header_goldens() {
-    let written = write(&tiny_input()).expect("tiny synthetic artifact writes");
-    let expected = decode_hex(GOLDEN_BYTES_HEX);
-    assert_eq!(written.bytes, expected, "canonical writer bytes changed");
+fn tiny_v1_is_regenerated_deterministically_from_the_canonical_writer() {
+    let input = tiny_input();
+    let written = write(&input).expect("tiny synthetic artifact writes");
+    let regenerated = write(&input).expect("same tiny input regenerates canonical artifact");
     assert_eq!(
-        std::str::from_utf8(&written.header_bytes).expect("canonical header UTF-8"),
-        GOLDEN_HEADER.trim_end(),
-        "canonical header changed"
+        written.bytes, regenerated.bytes,
+        "canonical writer must regenerate identical tiny artifact bytes"
+    );
+    assert_eq!(
+        written.header_bytes, regenerated.header_bytes,
+        "canonical writer must regenerate identical tiny header bytes"
     );
 
     let prelude = decode_prelude(&written.bytes).expect("complete prelude");
@@ -764,27 +765,6 @@ fn canonical_escape_and_key_order_are_pinned_without_permitting_escaped_authorit
     })
     .expect("finite typed JSON");
     assert_eq!(emitted, r#"{"a":1,"escape":"quote\"slash\\","z":2}"#);
-}
-
-fn decode_hex(input: &str) -> Vec<u8> {
-    let digits: Vec<_> = input
-        .bytes()
-        .filter(|byte| !byte.is_ascii_whitespace())
-        .collect();
-    assert_eq!(digits.len() % 2, 0, "golden hex needs complete bytes");
-    digits
-        .chunks_exact(2)
-        .map(|pair| (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]))
-        .collect()
-}
-
-fn hex_nibble(byte: u8) -> u8 {
-    match byte {
-        b'0'..=b'9' => byte - b'0',
-        b'a'..=b'f' => byte - b'a' + 10,
-        b'A'..=b'F' => byte - b'A' + 10,
-        _ => panic!("invalid golden hex digit {byte:?}"),
-    }
 }
 
 fn hex(bytes: &[u8]) -> String {

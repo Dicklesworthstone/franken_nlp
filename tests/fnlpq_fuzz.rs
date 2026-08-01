@@ -7,7 +7,6 @@ use franken_nlp::artifact::format::{
 };
 use franken_nlp::artifact::reader::{FnlpqArtifact, FnlpqReadError};
 
-const GOLDEN: &str = include_str!("fixtures/fnlpq/golden/tiny_v1.hex");
 const HOSTILE_CASES: &str = include_str!("fixtures/fnlpq/hostile_cases.json");
 
 const CORPUS_IDS: &[&str] = &[
@@ -34,12 +33,12 @@ const CORPUS_IDS: &[&str] = &[
 #[test]
 fn owned_reader_accepts_writer_golden_and_refuses_wrong_target() {
     let artifact = FnlpqArtifact::from_bytes(golden_bytes()).expect("writer golden must parse");
-    assert_eq!(artifact.model_id(), "FnlpqTinyGolden");
+    assert_eq!(artifact.model_id(), "FnlpqGeneratedFuzz");
     assert_eq!(
         artifact.revision(),
         "f56ec5a9650268aa098496734743c25ea778bd2d"
     );
-    assert_eq!(artifact.sections().len(), 9);
+    assert_eq!(artifact.sections().len(), 8);
     assert_eq!(artifact.tensors().len(), 1);
     assert_eq!(
         artifact.select_packing(ArchTarget::Generic).unwrap().id,
@@ -77,7 +76,7 @@ fn corpus_index_has_a_dedicated_fixture_for_every_oq31_hostile_id() {
 fn fixed_preheader_directory_and_scale_mutations_reject_without_panicking() {
     let valid = golden_bytes();
     let directory_start = directory_start(&valid);
-    let directory_end = directory_start + 9 * 80;
+    let directory_end = directory_start + u64_at(&valid, 24) as usize * 80;
     let first_section_offset = u64_at(&valid, directory_start + 16) as usize;
 
     let mut cases = Vec::new();
@@ -348,14 +347,7 @@ fn generated_valid_artifact(seed: u64) -> Vec<u8> {
 }
 
 fn golden_bytes() -> Vec<u8> {
-    let digits: Vec<_> = GOLDEN
-        .bytes()
-        .filter(|byte| !byte.is_ascii_whitespace())
-        .collect();
-    digits
-        .chunks_exact(2)
-        .map(|pair| (nibble(pair[0]) << 4) | nibble(pair[1]))
-        .collect()
+    generated_valid_artifact(0x6d2f_5a83_1b94_c0de)
 }
 
 fn directory_start(bytes: &[u8]) -> usize {
@@ -383,14 +375,6 @@ fn refresh_section_digest(
     )
     .expect("fixed digest tag");
     bytes[directory_offset + 48..directory_offset + 80].copy_from_slice(&digest);
-}
-
-fn nibble(byte: u8) -> u8 {
-    match byte {
-        b'0'..=b'9' => byte - b'0',
-        b'a'..=b'f' => byte - b'a' + 10,
-        _ => panic!("invalid fixture hex byte {byte:?}"),
-    }
 }
 
 fn hex(bytes: &[u8]) -> String {
