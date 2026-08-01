@@ -678,7 +678,6 @@ pub fn validate_nanbeige42_census(
 /// Construction order is intentional: the ten-file closure is authenticated
 /// before the safetensors parser is constructed, then the parsed census is
 /// rejected before any tensor is routed or decoded.
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedConversionInput {
     /// Ten-file source closure evidence in manifest order.
     pub source: VerifiedSourceClosure,
@@ -693,6 +692,12 @@ pub struct PreparedConversionInput {
     pub logical_payload_bytes: u64,
     /// Domain-framed exact source census identity.
     pub census_sha256: String,
+    /// The verified safetensors handles that supplied this census.
+    ///
+    /// This intentionally remains private: later conversion passes must reuse
+    /// this authenticated range session rather than reopen mutable shard
+    /// pathnames after preparation.
+    range_index: SafetensorsRangeIndex,
 }
 
 /// One tensor's precomputed destinations in the three Generic payload
@@ -896,6 +901,7 @@ pub fn prepare_nanbeige42_input(
         panels,
         logical_payload_bytes,
         census_sha256,
+        range_index,
     })
 }
 
@@ -946,6 +952,22 @@ pub fn validate_pinned_logical_payload_bytes(
 }
 
 impl PreparedConversionInput {
+    /// Read one bounded BF16 panel through the sealed safetensors session that
+    /// was authenticated while preparing this conversion.
+    ///
+    /// Callers cannot replace the source directory or reopen a shard between
+    /// preflight and emission. The range index retains the verified file
+    /// handles, including the parsed tensor-to-shard authority.
+    pub(crate) fn read_verified_panel(
+        &self,
+        tensor: &str,
+        panel: RowPanel,
+    ) -> Result<Vec<u8>, ConverterError> {
+        self.range_index
+            .read_range(tensor, panel)
+            .map_err(ConverterError::Safetensors)
+    }
+
     /// Calculate the pre-conversion footprint from actual parsed panel plans.
     /// The stage/output planner supplies its independently bounded buffers.
     pub fn preflight(

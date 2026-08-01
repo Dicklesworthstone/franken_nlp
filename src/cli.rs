@@ -25,7 +25,7 @@ use crate::{
     artifact::package::{package_model, verify_model_package, PackageRequest},
     artifact::packing::{NativePackingTarget, TILE_TABLE_VERSION_V1},
     artifact::quantize::{encode_generic_panel, GenericPanelBytes},
-    artifact::safetensors::{RowPanel, SafetensorsRangeIndex, TensorCensusEntry},
+    artifact::safetensors::{RowPanel, TensorCensusEntry},
     error::ErrorCode,
     grammar::{compile_json_schema, CompileLimits, CompiledSchema, SchemaError},
     robot::{self, RobotCommand},
@@ -345,12 +345,7 @@ fn run_streaming_convert(
         Ok(value) => value,
         Err(error) => return emit_streaming_refusal("materialized-sources", error),
     };
-    let plan = match build_streaming_envelope_plan(
-        &request.source_dir,
-        prepared,
-        generic,
-        &materialized,
-    ) {
+    let plan = match build_streaming_envelope_plan(prepared, generic, &materialized) {
         Ok(value) => value,
         Err(error) => return emit_streaming_refusal("streaming-first-pass", error),
     };
@@ -672,14 +667,13 @@ fn embedded_license_bundle() -> Result<Vec<u8>, String> {
 }
 
 fn build_streaming_envelope_plan(
-    source_dir: &Path,
     prepared: &PreparedConversionInput,
     generic: &GenericPayloadPlan,
     materialized: &MaterializedSources,
 ) -> Result<StreamingEnvelopePlan, String> {
     validate_generic_tensor_authorities(generic)?;
     let (mut tensors, payload_sha256, scales_sha256, row_sums_sha256) =
-        first_pass_generic_identities(source_dir, prepared, generic)?;
+        first_pass_generic_identities(prepared, generic)?;
     tensors.sort_by(|left, right| left.0.name.as_bytes().cmp(right.0.name.as_bytes()));
     let tensor_digests = tensors
         .iter()
@@ -826,7 +820,6 @@ fn streaming_small_section(
 /// section bytes and every logical tensor identity before the envelope writer
 /// can create an artifact.
 fn first_pass_generic_identities(
-    source_dir: &Path,
     prepared: &PreparedConversionInput,
     generic: &GenericPayloadPlan,
 ) -> Result<(Vec<(TensorInput, [u8; 32])>, [u8; 32], [u8; 32], [u8; 32]), String> {
@@ -842,8 +835,6 @@ fn first_pass_generic_identities(
             generic.tensors.len(),
         ));
     }
-    let source = SafetensorsRangeIndex::open_pinned_nanbeige42(source_dir)
-        .map_err(|error| format!("open verified safetensors source: {error}"))?;
     let mut payload = StreamingSectionHasher::new(GENERIC_PAYLOAD_SECTION, generic.payload_bytes)
         .map_err(|error| format!("start generic payload identity: {error}"))?;
     let mut scales = StreamingSectionHasher::new(GENERIC_SCALES_SECTION, generic.scale_bytes)
@@ -864,9 +855,7 @@ fn first_pass_generic_identities(
             std::slice::from_ref(route),
             std::slice::from_ref(panel_plan),
             |source_entry, panel| {
-                source
-                    .read_range(&source_entry.name, panel)
-                    .map_err(ConverterError::Safetensors)
+                prepared.read_verified_panel(&source_entry.name, panel)
             },
             |source_entry, source_route, panel, source_bf16, decoded_f32| {
                 let encoded = encode_streaming_panel(
@@ -1080,12 +1069,6 @@ fn emit_generic_section(
             actual: format!("{} declared bytes", section.stored_len),
         });
     }
-    let source = SafetensorsRangeIndex::open_pinned_nanbeige42(source_dir).map_err(|error| {
-        FnlpqWriteError::Io {
-            operation: "open verified safetensors source for section replay",
-            detail: error.to_string(),
-        }
-    })?;
     let mut observed_len = 0_u64;
     for index in 0..prepared.census.len() {
         let entry = &prepared.census[index];
@@ -1102,9 +1085,7 @@ fn emit_generic_section(
             std::slice::from_ref(route),
             std::slice::from_ref(panel_plan),
             |source_entry, panel| {
-                source
-                    .read_range(&source_entry.name, panel)
-                    .map_err(ConverterError::Safetensors)
+                prepared.read_verified_panel(&source_entry.name, panel)
             },
             |source_entry, source_route, panel, source_bf16, decoded_f32| {
                 let encoded = encode_streaming_panel(
