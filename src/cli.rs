@@ -1338,7 +1338,9 @@ mod tests {
     };
     use crate::artifact::converter::{
         GenericPayloadPlan, GenericTensorLayout, OutputRange, StorageStage,
+        expected_nanbeige42_census,
     };
+    use crate::artifact::format::validate_authority_identifier;
     use crate::artifact::safetensors::{SafetensorDtype, TensorCensusEntry};
 
     #[test]
@@ -1553,6 +1555,14 @@ mod tests {
         let tensor = LogicalTensorFirstPass::new(&entry, &layout)
             .expect("source-census tensor declaration is structurally valid");
         assert_eq!(tensor.input.name, entry.name);
+    }
+
+    #[test]
+    fn frozen_source_census_names_all_satisfy_the_header_authority_grammar() {
+        for entry in expected_nanbeige42_census() {
+            validate_authority_identifier("tensor.name", &entry.name)
+                .expect("every frozen source-census name must be writer-valid");
+        }
     }
 
     #[test]
