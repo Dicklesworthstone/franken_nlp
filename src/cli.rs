@@ -1948,7 +1948,7 @@ mod tests {
 
     #[test]
     fn convert_reference_invocation_requires_every_named_authority() {
-        let missing_converter_commit = Cli::try_parse_from([
+        let missing_converter_commit = match Cli::try_parse_from([
             "fnlp",
             "convert",
             "--source",
@@ -1961,8 +1961,10 @@ mod tests {
             "generic",
             "-o",
             "nanbeige4.2-3b.fnlpq-v1.int8.generic.fnlpq",
-        ])
-        .expect_err("the receipt-producing invocation requires converter provenance");
+        ]) {
+            Ok(_) => panic!("the receipt-producing invocation requires converter provenance"),
+            Err(error) => error,
+        };
         assert_eq!(
             missing_converter_commit.kind(),
             ErrorKind::MissingRequiredArgument
