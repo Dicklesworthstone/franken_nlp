@@ -367,10 +367,16 @@ fn bf16_verbatim_multi_tensor_round_trip_preserves_raw_words() {
             name: (*name).to_owned(),
             canonical_dtype: CanonicalDtype::Bf16,
             shape: shape.to_vec(),
-            canonical_logical_sha256: hex(
-                &logical_tensor_sha256(name, "bf16", shape, BF16_RECIPE, bytes, &[], &[])
-                    .expect("BF16 logical identity"),
-            ),
+            canonical_logical_sha256: hex(&logical_tensor_sha256(
+                name,
+                "bf16",
+                shape,
+                BF16_RECIPE,
+                bytes,
+                &[],
+                &[],
+            )
+            .expect("BF16 logical identity")),
             quantization: BF16_RECIPE.to_owned(),
             data: SectionRange::new(
                 "generic-payload",
@@ -399,8 +405,7 @@ fn bf16_verbatim_multi_tensor_round_trip_preserves_raw_words() {
         .reserialize()
         .expect("checked BF16 artifact reserializes");
     assert_eq!(
-        reserialized,
-        written,
+        reserialized, written,
         "checked BF16 load then canonical re-serialize must preserve envelope bytes"
     );
     let round_tripped = FnlpqArtifact::from_bytes(reserialized)
@@ -747,7 +752,10 @@ fn refresh_logical_model_identity(input: &mut FnlpqWriterInput) {
         ("chat_template", section_bytes(input, "chat-template")),
     ];
     input.logical_model_sha256 =
-        hex(&logical_model_sha256(&tensor_digests, &sources).expect("logical model identity"));
+        hex(
+            &logical_model_sha256(&input.model_id, &input.revision, &tensor_digests, &sources)
+                .expect("logical model identity"),
+        );
 }
 
 fn logical_tensor_hex(name: &str, shape: &[u32], quantization: &str) -> String {

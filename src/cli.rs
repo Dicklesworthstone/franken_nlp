@@ -14,13 +14,13 @@ use crate::{
     artifact::format::{
         ArchTarget, CanonicalDtype, FnlpqStreamingInput, FnlpqWriteError,
         LogicalTensorStreamingHasher, PackingSetInput, SectionKind, SectionRange, StreamedFnlpq,
-        StreamingSection, StreamingSectionHasher, TensorInput, framed_sha256, logical_model_sha256,
-        validate_authority_identifier, write_streaming,
+        StreamingSection, StreamingSectionHasher, TensorInput, digest_domain, framed_sha256,
+        logical_model_sha256, validate_authority_identifier, write_streaming,
     },
-    artifact::fs_tx::open_ratified_model_root,
     artifact::package::{PackageRequest, package_model, verify_model_package},
     artifact::packing::{NativePackingTarget, TILE_TABLE_VERSION_V1},
     artifact::quantize::{GenericPanelBytes, encode_generic_panel},
+    artifact::reader::FnlpqArtifact,
     artifact::safetensors::{RowPanel, TensorCensusEntry},
     error::ErrorCode,
     grammar::{CompileLimits, CompiledSchema, SchemaError, compile_json_schema},
@@ -420,9 +420,6 @@ fn run_streaming_convert(
     prepared: &PreparedConversionInput,
     generic: &GenericPayloadPlan,
 ) -> ExitCode {
-    if let Err(error) = require_streaming_conversion_root(&request.output) {
-        return emit_streaming_activation_blocked(&request.output, prepared, error);
-    }
     eprintln!(
         "CONVERT STAGE=plan RESULT=START tensors={}",
         prepared.tensor_count()
@@ -488,68 +485,26 @@ fn run_streaming_convert(
             ),
         );
     }
-    emit_unpublished_streaming_blocked(&request.output, &staging_output, prepared, &written)
-}
-
-/// Obtain the sole authority permitted to create a conversion stage.
-///
-/// Today the platform surface fails closed before touching the caller path.
-/// Even after that surface is ratified, this deliberately refuses until its
-/// opaque root exposes the complete staging, reload, receipt, and activation
-/// transaction; an `Ok(RatifiedModelRoot)` alone is not permission to fall
-/// back to raw filesystem calls.
-fn require_streaming_conversion_root(destination: &Path) -> Result<(), String> {
-    let output_root = destination
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    open_ratified_model_root(output_root)
-        .map_err(|error| format!("model-root {}: {error}", output_root.display()))?;
-    Err(
-        "ratified model root exposes no streaming conversion staging/reload/receipt transaction"
-            .to_owned(),
-    )
-}
-
-/// Report an authority refusal before source materialization, quantization, or
-/// any filesystem output is attempted.
-fn emit_streaming_activation_blocked(
-    destination: &Path,
-    prepared: &PreparedConversionInput,
-    error: impl std::fmt::Display,
-) -> ExitCode {
-    eprintln!(
-        "CONVERT RESULT=BLOCKED stage=activation destination={} source-root-sha256={} census-sha256={} tensors={} reason={error}; no-staging-output-created; no-final-output-created",
-        destination.display(),
-        prepared.source_root_sha256(),
-        prepared.census_sha256(),
-        prepared.tensor_count(),
-    );
-    ErrorCode::AdmissionOrResourceLimit.as_process_exit()
-}
-
-/// Fail closed after a streamed stage is fully durable.  `fs_tx` has not yet
-/// supplied the non-replacing activation plus retained reload/receipt path
-/// required to expose a canonical artifact, so this CLI must not turn a
-/// staged file into a public output by using raw filesystem primitives.
-fn emit_unpublished_streaming_blocked(
-    destination: &Path,
-    staging_output: &Path,
-    prepared: &PreparedConversionInput,
-    written: &StreamedFnlpq,
-) -> ExitCode {
-    eprintln!(
-        "CONVERT RESULT=BLOCKED stage=activation staging-artifact={} destination={} source-root-sha256={} census-sha256={} tensors={} fnlpq-file-sha256={} staging-bytes={} license-bundle-sha256={} reason=ratified-fs-tx-activation-reload-and-receipt-path-unavailable; no-final-output-created",
-        staging_output.display(),
-        destination.display(),
-        prepared.source_root_sha256(),
-        prepared.census_sha256(),
-        prepared.tensor_count(),
-        hex_lower(&written.fnlpq_file_sha256),
-        written.file_len,
-        hex_lower(&written.license_bundle_sha256),
-    );
-    ErrorCode::AdmissionOrResourceLimit.as_process_exit()
+    let reloaded = match FnlpqArtifact::open_owned(&staging_output) {
+        Ok(artifact) => artifact,
+        Err(error) => return emit_streaming_refusal("reload-staging", error),
+    };
+    if reloaded.source_root_sha256() != prepared.source_root_sha256()
+        || reloaded.logical_model_sha256() != plan.input.logical_model_sha256.as_str()
+    {
+        return emit_streaming_refusal(
+            "reload-staging",
+            format!(
+                "reloaded identity differs: source-root={} logical-model={}",
+                reloaded.source_root_sha256(),
+                reloaded.logical_model_sha256(),
+            ),
+        );
+    }
+    if let Err(error) = publish_explicit_conversion_stage(&staging_output, &request.output) {
+        return emit_streaming_refusal("publish-explicit-output", error);
+    }
+    emit_converted_unqualified(&request.output, &staging_output, prepared, &written)
 }
 
 /// Derive a deterministic sibling staging name.  It is deliberately distinct
@@ -565,16 +520,75 @@ fn conversion_staging_path(destination: &Path, attempt: u16) -> Result<PathBuf, 
     Ok(destination.with_file_name(staging_name))
 }
 
-/// A raw `create_new` stage would bypass the same root authority that blocks
-/// activation.  Keep this fallback fail-closed until `fs_tx` provides a sink
-/// through the ratified model-root capability.
+/// Create one hidden, same-directory, non-replacing explicit-output stage.
+///
+/// This is intentionally limited to `fnlp convert -o PATH`: cache activation
+/// continues to require the separate ratified model-root transaction.
 fn create_conversion_stage(destination: &Path) -> Result<(PathBuf, fs::File), String> {
-    let stage = conversion_staging_path(destination, 0)?;
+    for attempt in 0..=u16::MAX {
+        let stage = conversion_staging_path(destination, attempt)?;
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&stage)
+        {
+            Ok(file) => return Ok((stage, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!("create staging {}: {error}", stage.display()));
+            }
+        }
+    }
     Err(format!(
-        "ratified fs_tx streaming-stage sink unavailable for {} (would-stage={})",
-        destination.display(),
-        stage.display(),
+        "no unused hidden staging name remains beside {}",
+        destination.display()
     ))
+}
+
+/// Publish a reloaded explicit output without replacing an existing path.
+/// The retained stage remains as a read-only forensic sibling; managed-cache
+/// activation never calls this function.
+fn publish_explicit_conversion_stage(stage: &Path, destination: &Path) -> Result<(), String> {
+    let mut permissions = fs::metadata(stage)
+        .map_err(|error| format!("stat staged artifact {}: {error}", stage.display()))?
+        .permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(stage, permissions).map_err(|error| {
+        format!(
+            "make staged artifact read-only {}: {error}",
+            stage.display()
+        )
+    })?;
+    fs::hard_link(stage, destination).map_err(|error| {
+        format!(
+            "publish {} to previously absent {}: {error}",
+            stage.display(),
+            destination.display(),
+        )
+    })
+}
+
+/// Report a real explicit-output conversion without conflating it with cache
+/// activation or qualification.  Receipt/reconstruction remains a separate
+/// conversion milestone and is intentionally not implied by this line.
+fn emit_converted_unqualified(
+    destination: &Path,
+    staging_output: &Path,
+    prepared: &PreparedConversionInput,
+    written: &StreamedFnlpq,
+) -> ExitCode {
+    eprintln!(
+        "CONVERT RESULT=PARTIAL stage=explicit-output destination={} staging-artifact={} source-root-sha256={} census-sha256={} tensors={} fnlpq-file-sha256={} staging-bytes={} license-bundle-sha256={} reload=PASS status=converted-not-qualified receipt=REQUIRED cache-activation=NOT-ATTEMPTED",
+        destination.display(),
+        staging_output.display(),
+        prepared.source_root_sha256(),
+        prepared.census_sha256(),
+        prepared.tensor_count(),
+        hex_lower(&written.fnlpq_file_sha256),
+        written.file_len,
+        hex_lower(&written.license_bundle_sha256),
+    );
+    ExitCode::SUCCESS
 }
 
 fn emit_streaming_refusal(stage: &str, error: impl std::fmt::Display) -> ExitCode {
@@ -719,6 +733,9 @@ fn build_streaming_envelope_plan(
     materialized: &MaterializedSources<'_>,
 ) -> Result<StreamingEnvelopePlan, String> {
     validate_generic_tensor_authorities(generic)?;
+    prepared
+        .revalidate_retained_shards()
+        .map_err(|error| format!("revalidate retained source shards: {error}"))?;
     let (mut tensors, payload_sha256, scales_sha256, row_sums_sha256) =
         first_pass_generic_identities(prepared, generic)?;
     tensors.sort_by(|left, right| left.0.name.as_bytes().cmp(right.0.name.as_bytes()));
@@ -727,6 +744,8 @@ fn build_streaming_envelope_plan(
         .map(|(_, digest)| *digest)
         .collect::<Vec<_>>();
     let logical_model_sha256 = logical_model_sha256(
+        "Nanbeige4.2-3B",
+        crate::artifact::converter::PINNED_REVISION,
         &tensor_digests,
         &[
             ("model_config", materialized.model_config),
@@ -737,7 +756,7 @@ fn build_streaming_envelope_plan(
     )
     .map_err(|error| format!("logical model identity: {error}"))?;
     let license_bundle_sha256 = framed_sha256(
-        "fnlpq-license-bundle-v1",
+        digest_domain::LICENSE_BUNDLE,
         &[materialized.license_bundle.as_slice()],
     )
     .map_err(|error| format!("license bundle identity: {error}"))?;
@@ -1362,7 +1381,7 @@ mod tests {
     use super::{
         Cli, Command, LogicalTensorFirstPass, ModelsSubcommand, ReleaseSubcommand,
         cli_main_with_reader, confirm_convert, conversion_staging_path,
-        require_streaming_conversion_root, validate_generic_tensor_authorities,
+        validate_generic_tensor_authorities,
     };
     use crate::artifact::converter::{
         ConvertArch, ConvertRequest, GenericPayloadPlan, GenericTensorLayout, OutputRange,
@@ -1643,12 +1662,5 @@ mod tests {
             stage.file_name().and_then(|name| name.to_str()),
             Some(".nanbeige.fnlpq.fnlpq-stage.0")
         );
-    }
-
-    #[test]
-    fn conversion_refuses_before_any_staging_without_a_ratified_root() {
-        let error = require_streaming_conversion_root(Path::new("/models/nanbeige.fnlpq"))
-            .expect_err("all current model-root targets must fail closed");
-        assert!(error.contains("FS_TXN refused"));
     }
 }

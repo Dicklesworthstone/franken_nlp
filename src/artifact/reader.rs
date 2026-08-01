@@ -24,7 +24,8 @@ use crate::artifact::format::{
     ArchTarget, BF16_VERBATIM_V1, CanonicalDtype, FORMAT_VERSION, FnlpqWriterInput, MAGIC,
     MAX_ALIGNMENT, MAX_ENTRIES, MAX_FILE_BYTES, MAX_HEADER_BYTES, PRELUDE_BYTES, PackingSetInput,
     SECTION_DIRECTORY_ENTRY_BYTES, SectionKind, SectionPayload, SectionRange, TensorInput,
-    framed_sha256, logical_model_sha256, logical_tensor_sha256, write,
+    digest_domain, framed_sha256, logical_model_sha256, logical_tensor_sha256,
+    validate_f32_scale_bytes, validate_generic_sidecar_cardinality, write,
 };
 use crate::canonjson::{self, ParseLimits};
 
@@ -1213,7 +1214,7 @@ fn parse_directory(
             ));
         }
         let observed_sha256 = framed_sha256(
-            "fnlpq-section-v1",
+            digest_domain::SECTION,
             &[header_section.name.as_bytes(), payload],
         )
         .map_err(|error| directory_error(ordinal, "stored_sha256", error.to_string()))?;
@@ -1330,6 +1331,8 @@ fn validate_header_relationships(
                 validate_scale_range(bytes, section, mapping, &tensor.name)?;
             }
         }
+        validate_generic_sidecar_cardinality(&tensor.name, tensor.scale.len, tensor.row_sum.len)
+            .map_err(|error| header_error(format!("{}/generic", tensor.name), error.to_string()))?;
     }
     for (ordinal, mut claimed) in ranges {
         claimed.sort_by_key(|(_, start, _)| *start);
@@ -1410,15 +1413,6 @@ fn validate_scale_range(
     mapping: &CheckedMapping,
     tensor_name: &str,
 ) -> Result<(), FnlpqReadError> {
-    if mapping.len % 4 != 0 {
-        return Err(section_error(
-            section,
-            format!(
-                "tensor {tensor_name} scale length {} is not f32-aligned",
-                mapping.len
-            ),
-        ));
-    }
     let start = section
         .file_offset
         .checked_add(mapping.offset)
@@ -1429,16 +1423,12 @@ fn validate_scale_range(
     let values = bytes
         .get(usize_from_u64(start, "scale start")?..usize_from_u64(end, "scale end")?)
         .ok_or_else(|| section_error(section, "scale range outside owned bytes"))?;
-    for (index, bits) in values.chunks_exact(4).enumerate() {
-        let value = f32::from_bits(u32::from_le_bytes(bits.try_into().expect("exact chunks")));
-        if !value.is_finite() || value <= 0.0 {
-            return Err(section_error(
-                section,
-                format!("tensor {tensor_name} nonfinite/nonpositive scale index={index}"),
-            ));
-        }
-    }
-    Ok(())
+    validate_f32_scale_bytes(values).map_err(|error| {
+        section_error(
+            section,
+            format!("tensor {tensor_name} scale encoding: {error}"),
+        )
+    })
 }
 
 fn validate_packing_sets(
@@ -1557,7 +1547,7 @@ fn validate_header_identities(
         .find(|section| section.kind == SectionKind::LicenseBundle)
         .expect("required singleton kind was checked before identity validation");
     let license_bytes = stored_bytes(bytes, license)?;
-    let observed_license = framed_sha256("fnlpq-license-bundle-v1", &[license_bytes])
+    let observed_license = framed_sha256(digest_domain::LICENSE_BUNDLE, &[license_bytes])
         .map_err(|error| section_error(license, error.to_string()))?;
     if hex_lower(&observed_license) != header.license_bundle_sha256 {
         return Err(section_error(
@@ -1601,7 +1591,7 @@ fn validate_header_identities(
     let canonical = canonjson::canonical_bytes(&digest_view)
         .map_err(|error| header_error("packing_set_sha256", error.to_string()))?;
     let observed_packing = framed_sha256(
-        "fnlpq-packing-set-v1",
+        digest_domain::PACKING_SET,
         &[header.recipe_id.as_bytes(), &canonical],
     )
     .map_err(|error| header_error("packing_set_sha256", error.to_string()))?;
@@ -1653,8 +1643,13 @@ fn validate_header_identities(
             Ok((source.name.as_str(), stored_bytes(bytes, section)?))
         })
         .collect::<Result<Vec<_>, FnlpqReadError>>()?;
-    let observed_logical_model = logical_model_sha256(&tensor_digests, &materialized_sources)
-        .map_err(|error| header_error("logical_model_sha256", error.to_string()))?;
+    let observed_logical_model = logical_model_sha256(
+        &header.model_id,
+        &header.revision,
+        &tensor_digests,
+        &materialized_sources,
+    )
+    .map_err(|error| header_error("logical_model_sha256", error.to_string()))?;
     let actual_logical_model = hex_lower(&observed_logical_model);
     if actual_logical_model != header.logical_model_sha256 {
         return Err(header_error(

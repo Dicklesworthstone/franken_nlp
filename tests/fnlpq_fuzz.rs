@@ -262,6 +262,8 @@ fn generated_valid_artifact(seed: u64) -> Vec<u8> {
     let tokenizer_config = b"{\"bos_token\":\"<s>\"}".to_vec();
     let chat_template = b"{{ generated }}".to_vec();
     let logical_model = logical_model_sha256(
+        "FnlpqGeneratedFuzz",
+        "f56ec5a9650268aa098496734743c25ea778bd2d",
         &[tensor_digest],
         &[
             ("model_config", model_config.as_slice()),

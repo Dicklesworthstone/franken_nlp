@@ -123,6 +123,8 @@ fn synthetic_artifact(tokenizer_model: Vec<u8>) -> FnlpqArtifact {
         })
         .unzip();
     let logical_model_digest = logical_model_sha256(
+        "Nanbeige4.2-3B",
+        "f56ec5a9650268aa098496734743c25ea778bd2d",
         &tensor_digests,
         &[
             ("model_config", br#"{"hidden_size":2}"#.as_slice()),

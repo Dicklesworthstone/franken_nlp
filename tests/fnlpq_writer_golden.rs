@@ -6,7 +6,7 @@ use franken_nlp::artifact::format::{
     ArchTarget, CanonicalDtype, FnlpqWriteError, FnlpqWriterInput, PackingSetInput, SectionKind,
     SectionPayload, SectionRange, decode_prelude, encode_f32_scales, framed_sha256,
     framed_sha256_hex, logical_model_sha256 as compute_logical_model_sha256, logical_tensor_sha256,
-    streaming_input_from_materialized, write, write_streaming,
+    streaming_input_from_materialized, validate_f32_scale_bytes, write, write_streaming,
 };
 use franken_nlp::artifact::reader::FnlpqArtifact;
 use franken_nlp::canonjson;
@@ -32,6 +32,8 @@ fn tiny_input() -> FnlpqWriterInput {
     )
     .expect("valid tiny logical tensor identity");
     let logical_model_sha256 = compute_logical_model_sha256(
+        "FnlpqTinyGolden",
+        "f56ec5a9650268aa098496734743c25ea778bd2d",
         &[tensor_sha256],
         &[
             ("model_config", br#"{"hidden_size":2}"#.as_slice()),
@@ -679,6 +681,37 @@ fn invalid_names_duplicate_mappings_and_nonfinite_scales_reject() {
         encode_f32_scales(&[f32::INFINITY]),
         Err(FnlpqWriteError::NonFiniteScale { index: 0 })
     );
+    assert_eq!(
+        encode_f32_scales(&[0.0]),
+        Err(FnlpqWriteError::NonPositiveScale { index: 0 })
+    );
+    assert_eq!(
+        encode_f32_scales(&[-0.0]),
+        Err(FnlpqWriteError::NonPositiveScale { index: 0 })
+    );
+    assert_eq!(
+        validate_f32_scale_bytes(&[0, 0, 0]),
+        Err(FnlpqWriteError::InvalidScaleBytes { observed: 3 })
+    );
+
+    let mut nonpositive_scale = tiny_input();
+    nonpositive_scale
+        .sections
+        .iter_mut()
+        .find(|section| section.name == "generic-scales")
+        .expect("tiny input includes generic scales")
+        .bytes = 0.0_f32.to_le_bytes().to_vec();
+    assert!(matches!(
+        write(&nonpositive_scale),
+        Err(FnlpqWriteError::NonPositiveScale { index: 0 })
+    ));
+
+    let mut mismatched_sidecars = tiny_input();
+    mismatched_sidecars.tensors[0].row_sum.len = 0;
+    assert!(matches!(
+        write(&mismatched_sidecars),
+        Err(FnlpqWriteError::Tensor { .. })
+    ));
 
     let mut duplicate = tiny_input();
     duplicate.sections.push(SectionPayload::new(

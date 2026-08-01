@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::artifact::format::source_root_sha256;
 use crate::artifact::quantize::{GenericPanelBytes, QuantizeError, encode_generic_panel};
 use crate::artifact::safetensors::{
     CensusDiff, RowPanel, SafetensorDtype, SafetensorsError, SafetensorsRangeIndex, SourceClosure,
@@ -159,6 +160,8 @@ pub struct ConversionSourceManifest {
     pub safetensors_container_header_bytes: u64,
     /// Files in their canonical manifest/hash order.
     pub files: Vec<SourceFileSpec>,
+    /// Exact canonical JSON bytes bound by `fnlpq-source-root-v1`.
+    canonical_bytes: Vec<u8>,
 }
 
 impl ConversionSourceManifest {
@@ -172,6 +175,8 @@ impl ConversionSourceManifest {
             },
         )
         .map_err(ConverterError::ManifestJson)?;
+        let canonical_bytes =
+            canonjson::canonical_bytes(&value).map_err(ConverterError::ManifestJson)?;
         let object = required_object(&value, "$", &MANIFEST_KEYS)?;
         let files_value = object
             .get("files")
@@ -201,6 +206,7 @@ impl ConversionSourceManifest {
                 "$",
             )?,
             files,
+            canonical_bytes,
         };
         manifest.validate()?;
         Ok(manifest)
@@ -289,6 +295,11 @@ impl ConversionSourceManifest {
             .collect::<Result<Vec<_>, _>>()?;
         shards.sort_by(|left, right| left.file_name().cmp(right.file_name()));
         SourceClosure::new(index, shards).map_err(ConverterError::Safetensors)
+    }
+
+    /// Return the canonical manifest bytes bound into the source-root digest.
+    fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
     }
 
     fn validate(&self) -> Result<(), ConverterError> {
@@ -411,7 +422,7 @@ pub fn verify_source_closure(
     for expected in &manifest.files {
         files.push(verify_source_member(source_dir, expected)?);
     }
-    let source_root_sha256 = source_root_digest(&files)?;
+    let source_root_sha256 = source_root_digest(&manifest)?;
     Ok(VerifiedSourceClosure {
         manifest,
         files,
@@ -1160,6 +1171,15 @@ impl PreparedConversionInput {
     /// Return the closure size authenticated by the pinned manifest.
     pub(crate) fn closure_total_bytes(&self) -> u64 {
         self.source.manifest.closure_total_bytes
+    }
+
+    /// Rehash the retained shard handles immediately before a conversion pass.
+    /// This catches same-inode mutation that occurred after preparation while
+    /// preserving the sealed range-index session for all reads.
+    pub(crate) fn revalidate_retained_shards(&self) -> Result<(), ConverterError> {
+        self.range_index
+            .revalidate_retained_shards()
+            .map_err(ConverterError::Safetensors)
     }
 
     /// Recheck and expose the immutable conversion plan as read-only slices.
@@ -2673,23 +2693,14 @@ fn stream_sha256(file: &mut File, path: &Path) -> Result<String, ConverterError>
     Ok(hex_lower(&hasher.finalize()))
 }
 
-fn source_root_digest(files: &[VerifiedSourceFile]) -> Result<String, ConverterError> {
-    let mut hasher = Sha256::new();
-    hasher.update(b"fnlpq-source-root-v1\0");
-    let count = u64::try_from(files.len()).map_err(|_| ConverterError::Arithmetic {
-        invariant: "source-root file count",
+fn source_root_digest(manifest: &ConversionSourceManifest) -> Result<String, ConverterError> {
+    let digest = source_root_sha256(manifest.canonical_bytes()).map_err(|error| {
+        ConverterError::ManifestSchema {
+            path: "$".to_owned(),
+            detail: format!("source-root digest: {error}"),
+        }
     })?;
-    hasher.update(count.to_le_bytes());
-    for file in files {
-        let name_len = u64::try_from(file.name.len()).map_err(|_| ConverterError::Arithmetic {
-            invariant: "source-root file name length",
-        })?;
-        hasher.update(name_len.to_le_bytes());
-        hasher.update(file.name.as_bytes());
-        hasher.update(file.bytes.to_le_bytes());
-        hasher.update(file.sha256.as_bytes());
-    }
-    Ok(hex_lower(&hasher.finalize()))
+    Ok(hex_lower(&digest))
 }
 
 fn census_digest(census: &[TensorCensusEntry]) -> Result<String, ConverterError> {

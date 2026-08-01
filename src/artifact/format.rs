@@ -34,6 +34,27 @@ pub const MAX_FILE_BYTES: u64 = 68_719_476_736;
 /// Largest accepted v1 section alignment.
 pub const MAX_ALIGNMENT: u64 = 4_096;
 
+/// Domain labels for every v1 artifact identity.  Writer, reader, converter,
+/// and receipts must call this registry rather than restating a near-match.
+pub mod digest_domain {
+    /// Identity of the canonical source-closure manifest bytes.
+    pub const SOURCE_ROOT: &str = "fnlpq-source-root-v1";
+    /// Identity of one materialized semantic source.
+    pub const MATERIALIZED_SOURCE: &str = "fnlpq-materialized-source-v1";
+    /// Identity of one logical tensor record.
+    pub const LOGICAL_TENSOR: &str = "fnlpq-logical-tensor-v1";
+    /// Identity of the logical model plus its model authority.
+    pub const LOGICAL_MODEL: &str = "fnlpq-logical-model-v1";
+    /// Identity of one stored section.
+    pub const SECTION: &str = "fnlpq-section-v1";
+    /// Identity of the license bundle bytes.
+    pub const LICENSE_BUNDLE: &str = "fnlpq-license-bundle-v1";
+    /// Identity of a complete packing-set declaration.
+    pub const PACKING_SET: &str = "fnlpq-packing-set-v1";
+    /// Identity of the serialized v1 file.
+    pub const FILE: &str = "fnlpq-file-v1";
+}
+
 const REQUIRED_SECTION_KINDS: [SectionKind; 8] = [
     SectionKind::GenericTensorPayload,
     SectionKind::GenericTensorScales,
@@ -452,6 +473,10 @@ pub enum FnlpqWriteError {
     CanonicalJson(String),
     /// A scale cannot be represented in the fixed IEEE binary section.
     NonFiniteScale { index: usize },
+    /// Quantized rows require a strictly positive finite scale.
+    NonPositiveScale { index: usize },
+    /// A scale sidecar is not an integral sequence of IEEE-754 f32 words.
+    InvalidScaleBytes { observed: usize },
     /// Streaming output or a section callback could not write exact bytes.
     Io {
         operation: &'static str,
@@ -515,6 +540,15 @@ impl fmt::Display for FnlpqWriteError {
             Self::NonFiniteScale { index } => {
                 write!(formatter, "non-finite scale at index {index}")
             }
+            Self::NonPositiveScale { index } => {
+                write!(formatter, "non-positive scale at index {index}")
+            }
+            Self::InvalidScaleBytes { observed } => {
+                write!(
+                    formatter,
+                    "scale sidecar is not f32-aligned: {observed} bytes"
+                )
+            }
             Self::Io { operation, detail } => write!(formatter, "{operation}: {detail}"),
             Self::StoredIdentity {
                 section,
@@ -536,19 +570,81 @@ impl fmt::Display for FnlpqWriteError {
 
 impl Error for FnlpqWriteError {}
 
-/// Encode finite f32 scales in the only accepted v1 binary representation.
+/// Encode strictly positive finite f32 scales in the only accepted v1 binary
+/// representation.
 ///
-/// Scale values never enter canonical JSON.  Rejecting NaN and infinity here
-/// gives converters a precise error before section bytes are accepted.
+/// Scale values never enter canonical JSON.  The reader invokes the matching
+/// [`validate_f32_scale_bytes`] routine, so a writer can never emit a scale
+/// the checked reader rejects.
 pub fn encode_f32_scales(scales: &[f32]) -> Result<Vec<u8>, FnlpqWriteError> {
     let mut encoded = Vec::with_capacity(scales.len().saturating_mul(4));
     for (index, scale) in scales.iter().copied().enumerate() {
-        if !scale.is_finite() {
-            return Err(FnlpqWriteError::NonFiniteScale { index });
-        }
+        validate_f32_scale(index, scale)?;
         encoded.extend_from_slice(&scale.to_bits().to_le_bytes());
     }
     Ok(encoded)
+}
+
+/// Validate the stored-scale encoding shared by the writer and checked reader.
+pub fn validate_f32_scale_bytes(bytes: &[u8]) -> Result<(), FnlpqWriteError> {
+    if bytes.len() % 4 != 0 {
+        return Err(FnlpqWriteError::InvalidScaleBytes {
+            observed: bytes.len(),
+        });
+    }
+    for (index, word) in bytes.chunks_exact(4).enumerate() {
+        validate_f32_scale(
+            index,
+            f32::from_bits(u32::from_le_bytes(word.try_into().expect("exact f32 word"))),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_f32_scale(index: usize, scale: f32) -> Result<(), FnlpqWriteError> {
+    if !scale.is_finite() {
+        return Err(FnlpqWriteError::NonFiniteScale { index });
+    }
+    if scale <= 0.0 {
+        return Err(FnlpqWriteError::NonPositiveScale { index });
+    }
+    Ok(())
+}
+
+/// Validate the shared cardinality of Generic quantization sidecars.
+///
+/// Every stored scale is an f32 and every matching row sum is an i32.  Their
+/// cardinalities must therefore be equal before either the writer or reader
+/// accepts the mapping.  Recipe-specific geometry remains separately bound by
+/// the converter route plan.
+pub fn validate_generic_sidecar_cardinality(
+    tensor: &str,
+    scale_len: u64,
+    row_sum_len: u64,
+) -> Result<(), FnlpqWriteError> {
+    if scale_len % 4 != 0 {
+        return Err(FnlpqWriteError::Tensor {
+            tensor: tensor.to_owned(),
+            reason: format!("scale sidecar length {scale_len} is not f32-aligned"),
+        });
+    }
+    if row_sum_len % 4 != 0 {
+        return Err(FnlpqWriteError::Tensor {
+            tensor: tensor.to_owned(),
+            reason: format!("row-sum sidecar length {row_sum_len} is not i32-aligned"),
+        });
+    }
+    if scale_len != row_sum_len {
+        return Err(FnlpqWriteError::Tensor {
+            tensor: tensor.to_owned(),
+            reason: format!(
+                "scale/row-sum cardinality differs: scales={} rows={}",
+                scale_len / 4,
+                row_sum_len / 4
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Compute a v1 domain-framed SHA-256 identity.
@@ -596,7 +692,7 @@ impl StreamingSectionHasher {
     /// Start a section identity from its canonical name and exact planned
     /// stored length.
     pub fn new(section: &str, stored_len: u64) -> Result<Self, FnlpqWriteError> {
-        let mut hasher = framed_stream_hasher("fnlpq-section-v1", 2);
+        let mut hasher = framed_stream_hasher(digest_domain::SECTION, 2);
         framed_stream_field_prefix(
             &mut hasher,
             u64::try_from(section.len()).map_err(|_| FnlpqWriteError::Arithmetic {
@@ -670,7 +766,7 @@ impl LogicalTensorStreamingHasher {
         row_sum_len: u64,
     ) -> Result<Self, FnlpqWriteError> {
         let encoded_shape = encode_logical_tensor_shape(shape)?;
-        let mut hasher = framed_stream_hasher("fnlpq-logical-tensor-v1", 7);
+        let mut hasher = framed_stream_hasher(digest_domain::LOGICAL_TENSOR, 7);
         for field in [
             name.as_bytes(),
             canonical_dtype.as_bytes(),
@@ -795,7 +891,7 @@ pub fn logical_tensor_sha256(
 ) -> Result<[u8; 32], FnlpqWriteError> {
     let encoded_shape = encode_logical_tensor_shape(shape)?;
     framed_sha256(
-        "fnlpq-logical-tensor-v1",
+        digest_domain::LOGICAL_TENSOR,
         &[
             name.as_bytes(),
             canonical_dtype.as_bytes(),
@@ -859,27 +955,42 @@ pub fn materialized_source_sha256(
     bytes: &[u8],
 ) -> Result<[u8; 32], FnlpqWriteError> {
     framed_sha256(
-        "fnlpq-materialized-source-v1",
+        digest_domain::MATERIALIZED_SOURCE,
         &[source_name.as_bytes(), bytes],
     )
+}
+
+/// Compute the source-root identity from the exact canonical source-manifest
+/// bytes.  This is intentionally distinct from a converter-local listing of
+/// observed members, which cannot substitute for the frozen manifest formula.
+pub fn source_root_sha256(canonical_source_manifest: &[u8]) -> Result<[u8; 32], FnlpqWriteError> {
+    framed_sha256(digest_domain::SOURCE_ROOT, &[canonical_source_manifest])
 }
 
 /// Compute the canonical model identity over sorted tensor records and the
 /// four materialized configuration/tokenizer/template identities.
 pub fn logical_model_sha256(
+    model_id: &str,
+    revision: &str,
     tensor_digests: &[[u8; 32]],
     materialized_sources: &[(&str, &[u8])],
 ) -> Result<[u8; 32], FnlpqWriteError> {
+    validate_authority("model_id", model_id)?;
+    validate_revision(revision)?;
     let source_digests = materialized_sources
         .iter()
         .map(|(name, bytes)| materialized_source_sha256(name, bytes))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut fields = Vec::with_capacity(2 + tensor_digests.len() + source_digests.len());
+    let mut fields = Vec::with_capacity(4 + tensor_digests.len() + source_digests.len());
+    fields.push(b"model_id".as_slice());
+    fields.push(model_id.as_bytes());
+    fields.push(b"revision".as_slice());
+    fields.push(revision.as_bytes());
     fields.push(b"tensors".as_slice());
     fields.extend(tensor_digests.iter().map(|digest| digest.as_slice()));
     fields.push(b"materialized_sources".as_slice());
     fields.extend(source_digests.iter().map(|digest| digest.as_slice()));
-    framed_sha256("fnlpq-logical-model-v1", &fields)
+    framed_sha256(digest_domain::LOGICAL_MODEL, &fields)
 }
 
 /// Serialize a typed logical model into canonical v1 `.fnlpq` bytes.
@@ -895,7 +1006,7 @@ pub fn write(input: &FnlpqWriterInput) -> Result<WrittenFnlpq, FnlpqWriteError> 
         .iter()
         .map(|section| {
             framed_sha256(
-                "fnlpq-section-v1",
+                digest_domain::SECTION,
                 &[section.name.as_bytes(), &section.bytes],
             )
         })
@@ -921,6 +1032,7 @@ pub fn write(input: &FnlpqWriterInput) -> Result<WrittenFnlpq, FnlpqWriteError> 
             let data = input_range_bytes(&sections, &tensor.data)?;
             let scale = input_range_bytes(&sections, &tensor.scale)?;
             let row_sum = input_range_bytes(&sections, &tensor.row_sum)?;
+            validate_f32_scale_bytes(scale)?;
             let observed = logical_tensor_sha256(
                 &tensor.name,
                 tensor.canonical_dtype.header_name(),
@@ -951,8 +1063,12 @@ pub fn write(input: &FnlpqWriterInput) -> Result<WrittenFnlpq, FnlpqWriteError> 
             (*name, section.bytes.as_slice())
         })
         .collect::<Vec<_>>();
-    let observed_logical_model =
-        logical_model_sha256(&logical_tensor_digests, &materialized_sources)?;
+    let observed_logical_model = logical_model_sha256(
+        &input.model_id,
+        &input.revision,
+        &logical_tensor_digests,
+        &materialized_sources,
+    )?;
     let actual_logical_model = hex_lower(&observed_logical_model);
     if actual_logical_model != input.logical_model_sha256 {
         return Err(FnlpqWriteError::LogicalIdentity {
@@ -966,7 +1082,7 @@ pub fn write(input: &FnlpqWriterInput) -> Result<WrittenFnlpq, FnlpqWriteError> 
         .find(|section| section.kind == SectionKind::LicenseBundle)
         .expect("validated required singleton section");
     let license_bundle_sha256 =
-        framed_sha256("fnlpq-license-bundle-v1", &[&license_section.bytes])?;
+        framed_sha256(digest_domain::LICENSE_BUNDLE, &[&license_section.bytes])?;
     let packing_set_sha256 =
         packing_set_digest(&input.recipe_id, &packing_sets, &streaming_sections)?;
     let header = build_header(
@@ -1099,7 +1215,7 @@ pub fn write(input: &FnlpqWriterInput) -> Result<WrittenFnlpq, FnlpqWriteError> 
         bytes[start..end].copy_from_slice(&section.bytes);
     }
 
-    let fnlpq_file_sha256 = framed_sha256("fnlpq-file-v1", &[&bytes])?;
+    let fnlpq_file_sha256 = framed_sha256(digest_domain::FILE, &[&bytes])?;
     Ok(WrittenFnlpq {
         bytes,
         header_bytes,
@@ -1127,7 +1243,7 @@ pub fn streaming_input_from_materialized(
         .iter()
         .map(|section| {
             framed_sha256(
-                "fnlpq-section-v1",
+                digest_domain::SECTION,
                 &[section.name.as_bytes(), &section.bytes],
             )
         })
@@ -1195,9 +1311,10 @@ where
     )?;
     let header_bytes = canonjson::canonical_bytes(&header)
         .map_err(|error| FnlpqWriteError::CanonicalJson(error.to_string()))?;
-    let header_len = u64::try_from(header_bytes.len()).map_err(|_| FnlpqWriteError::Arithmetic {
-        field: "header length",
-    })?;
+    let header_len =
+        u64::try_from(header_bytes.len()).map_err(|_| FnlpqWriteError::Arithmetic {
+            field: "header length",
+        })?;
     if header_len > MAX_HEADER_BYTES {
         return Err(FnlpqWriteError::Limit {
             field: "header_len",
@@ -1254,7 +1371,7 @@ where
             header_sha256,
         },
     );
-    let mut file_hasher = framed_stream_hasher("fnlpq-file-v1", 1);
+    let mut file_hasher = framed_stream_hasher(digest_domain::FILE, 1);
     framed_stream_field_prefix(&mut file_hasher, file_len);
     let mut position = 0_u64;
     write_stream_bytes(output, &mut file_hasher, &prelude_bytes)?;
@@ -1281,12 +1398,13 @@ where
     }
     let mut emitted_license_bundle_sha256 = None;
     for (section, written) in sections.iter().zip(&written_sections) {
-        let padding = written
-            .file_offset
-            .checked_sub(position)
-            .ok_or(FnlpqWriteError::Arithmetic {
-                field: "streaming section position",
-            })?;
+        let padding =
+            written
+                .file_offset
+                .checked_sub(position)
+                .ok_or(FnlpqWriteError::Arithmetic {
+                    field: "streaming section position",
+                })?;
         write_stream_zeroes(output, &mut file_hasher, padding)?;
         position = written.file_offset;
         let mut section_writer = StreamingSectionWriter::new(output, &mut file_hasher, section);
@@ -1383,10 +1501,12 @@ fn write_stream_bytes<W: Write>(
     file_hasher: &mut Sha256,
     bytes: &[u8],
 ) -> Result<(), FnlpqWriteError> {
-    output.write_all(bytes).map_err(|error| FnlpqWriteError::Io {
-        operation: "write streaming fnlpq output",
-        detail: error.to_string(),
-    })?;
+    output
+        .write_all(bytes)
+        .map_err(|error| FnlpqWriteError::Io {
+            operation: "write streaming fnlpq output",
+            detail: error.to_string(),
+        })?;
     file_hasher.update(bytes);
     Ok(())
 }
@@ -1411,43 +1531,46 @@ struct StreamingSectionWriter<'a, W: Write> {
     section: &'a StreamingSection,
     section_hasher: Sha256,
     license_bundle_hasher: Option<Sha256>,
+    scale_validator: Option<StreamingScaleValidator>,
     remaining: u64,
 }
 
 impl<'a, W: Write> StreamingSectionWriter<'a, W> {
-    fn new(
-        output: &'a mut W,
-        file_hasher: &'a mut Sha256,
-        section: &'a StreamingSection,
-    ) -> Self {
-        let mut section_hasher = framed_stream_hasher("fnlpq-section-v1", 2);
+    fn new(output: &'a mut W, file_hasher: &'a mut Sha256, section: &'a StreamingSection) -> Self {
+        let mut section_hasher = framed_stream_hasher(digest_domain::SECTION, 2);
         framed_stream_field_prefix(&mut section_hasher, section.name.len() as u64);
         section_hasher.update(section.name.as_bytes());
         framed_stream_field_prefix(&mut section_hasher, section.stored_len);
         let license_bundle_hasher = if section.kind == SectionKind::LicenseBundle {
-            let mut hasher = framed_stream_hasher("fnlpq-license-bundle-v1", 1);
+            let mut hasher = framed_stream_hasher(digest_domain::LICENSE_BUNDLE, 1);
             framed_stream_field_prefix(&mut hasher, section.stored_len);
             Some(hasher)
         } else {
             None
         };
+        let scale_validator = (section.kind == SectionKind::GenericTensorScales)
+            .then(StreamingScaleValidator::default);
         Self {
             output,
             file_hasher,
             section,
             section_hasher,
             license_bundle_hasher,
+            scale_validator,
             remaining: section.stored_len,
         }
     }
 
-    fn finish(self) -> Result<Option<[u8; 32]>, FnlpqWriteError> {
+    fn finish(mut self) -> Result<Option<[u8; 32]>, FnlpqWriteError> {
         if self.remaining != 0 {
             return Err(FnlpqWriteError::StoredIdentity {
                 section: self.section.name.clone(),
                 expected: hex_lower(&self.section.stored_sha256),
                 actual: format!("underflow-{}-bytes", self.remaining),
             });
+        }
+        if let Some(validator) = self.scale_validator.take() {
+            validator.finish()?;
         }
         let actual: [u8; 32] = self.section_hasher.finalize().into();
         if actual != self.section.stored_sha256 {
@@ -1480,6 +1603,15 @@ impl<W: Write> Write for StreamingSectionWriter<'_, W> {
                 ),
             ));
         }
+        if let Some(validator) = &self.scale_validator {
+            let mut candidate = validator.clone();
+            candidate.observe(bytes).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("streaming scale validation: {error}"),
+                )
+            })?;
+        }
         let written = self.output.write(bytes)?;
         let written_u64 = u64::try_from(written).map_err(|_| {
             io::Error::new(
@@ -1489,6 +1621,14 @@ impl<W: Write> Write for StreamingSectionWriter<'_, W> {
         })?;
         self.file_hasher.update(&bytes[..written]);
         self.section_hasher.update(&bytes[..written]);
+        if let Some(validator) = &mut self.scale_validator {
+            validator.observe(&bytes[..written]).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("streaming scale validation: {error}"),
+                )
+            })?;
+        }
         if let Some(hasher) = &mut self.license_bundle_hasher {
             hasher.update(&bytes[..written]);
         }
@@ -1498,6 +1638,61 @@ impl<W: Write> Write for StreamingSectionWriter<'_, W> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.output.flush()
+    }
+}
+
+#[derive(Clone, Default)]
+struct StreamingScaleValidator {
+    pending: [u8; 4],
+    pending_len: usize,
+    index: usize,
+}
+
+impl StreamingScaleValidator {
+    fn observe(&mut self, mut bytes: &[u8]) -> Result<(), FnlpqWriteError> {
+        if self.pending_len != 0 {
+            let needed = 4 - self.pending_len;
+            let take = needed.min(bytes.len());
+            self.pending[self.pending_len..self.pending_len + take].copy_from_slice(&bytes[..take]);
+            self.pending_len += take;
+            bytes = &bytes[take..];
+            if self.pending_len == 4 {
+                self.validate_pending()?;
+            }
+        }
+        while bytes.len() >= 4 {
+            self.pending.copy_from_slice(&bytes[..4]);
+            self.pending_len = 4;
+            self.validate_pending()?;
+            bytes = &bytes[4..];
+        }
+        if !bytes.is_empty() {
+            self.pending[..bytes.len()].copy_from_slice(bytes);
+            self.pending_len = bytes.len();
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(), FnlpqWriteError> {
+        if self.pending_len != 0 {
+            return Err(FnlpqWriteError::InvalidScaleBytes {
+                observed: self.pending_len,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_pending(&mut self) -> Result<(), FnlpqWriteError> {
+        let value = f32::from_bits(u32::from_le_bytes(self.pending));
+        validate_f32_scale(self.index, value)?;
+        self.index = self
+            .index
+            .checked_add(1)
+            .ok_or(FnlpqWriteError::Arithmetic {
+                field: "streaming scale index",
+            })?;
+        self.pending_len = 0;
+        Ok(())
     }
 }
 
@@ -1669,8 +1864,7 @@ fn canonical_streaming_sections(
     }
     let mut sections = input.to_vec();
     sections.sort_by(|left, right| {
-        left
-            .kind
+        left.kind
             .cmp(&right.kind)
             .then_with(|| left.name.as_bytes().cmp(right.name.as_bytes()))
     });
@@ -1772,6 +1966,7 @@ fn canonical_tensors(
                     .push((tensor.name.as_str(), mapping.offset, end));
             }
         }
+        validate_generic_sidecar_cardinality(&tensor.name, tensor.scale.len, tensor.row_sum.len)?;
     }
     for (section_name, mut claimed) in ranges {
         claimed.sort_by_key(|(_, start, _)| *start);
@@ -2140,7 +2335,10 @@ fn packing_set_digest(
         .collect();
     let canonical = canonjson::canonical_bytes(&digest_view)
         .map_err(|error| FnlpqWriteError::CanonicalJson(error.to_string()))?;
-    framed_sha256("fnlpq-packing-set-v1", &[recipe_id.as_bytes(), &canonical])
+    framed_sha256(
+        digest_domain::PACKING_SET,
+        &[recipe_id.as_bytes(), &canonical],
+    )
 }
 
 fn align_up(value: u64, alignment: u64) -> Result<u64, FnlpqWriteError> {

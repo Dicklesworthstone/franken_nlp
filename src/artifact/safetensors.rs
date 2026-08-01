@@ -500,6 +500,7 @@ impl CheckedShard {
 }
 
 struct VerifiedShard {
+    source: SourceDigest,
     header: CheckedShard,
     file: Mutex<File>,
 }
@@ -628,6 +629,7 @@ impl SafetensorsRangeIndex {
             shards.insert(
                 source.file_name.clone(),
                 VerifiedShard {
+                    source: source.clone(),
                     header,
                     file: Mutex::new(file),
                 },
@@ -690,6 +692,25 @@ impl SafetensorsRangeIndex {
                 detail: error.to_string(),
             })?;
         Ok(bytes)
+    }
+
+    /// Rehash every retained shard handle against its original pinned digest.
+    ///
+    /// A handle prevents pathname substitution but does not make an inode
+    /// immutable.  The conversion identity pass calls this immediately before
+    /// traversal, so a same-inode change after preparation cannot inherit the
+    /// earlier source-root assertion.
+    pub fn revalidate_retained_shards(&self) -> Result<(), SafetensorsError> {
+        for shard in self.shards.values() {
+            let mut file = shard
+                .file
+                .lock()
+                .map_err(|_| SafetensorsError::FileHandlePoisoned {
+                    source: shard.source.file_name.clone(),
+                })?;
+            verify_source_file(&shard.source, &mut file)?;
+        }
+        Ok(())
     }
 
     /// Enumerate source `(name, dtype, shape, len)` facts in name order.
