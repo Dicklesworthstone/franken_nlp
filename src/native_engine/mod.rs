@@ -1,5 +1,6 @@
 //! CPU-reference model engine surface.
 
+pub mod artifact_bridge;
 pub mod attention;
 pub mod batchsched;
 pub mod decode;
