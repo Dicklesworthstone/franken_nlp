@@ -3,8 +3,8 @@ use franken_nlp::artifact::format::{
     FnlpqWriterInput, PackingSetInput, SectionKind, SectionPayload, SectionRange, TensorInput,
 };
 use franken_nlp::artifact::packing::{
-    derive_native_packing, require_native_packing, verify_derived_packing, NativePackingTarget,
-    PackingError, TILE_TABLE_VERSION_V1,
+    derive_native_packing, require_native_packing, verify_derived_packing, NativeCacheAddress,
+    NativePackingTarget, PackingError, TILE_TABLE_VERSION_V1,
 };
 use franken_nlp::artifact::reader::FnlpqArtifact;
 
@@ -66,6 +66,34 @@ fn tile_table_version_is_part_of_the_cache_identity() {
     assert_ne!(v1.address.content_address, v2.address.content_address);
     assert_ne!(v1.bytes, v2.bytes);
     assert_eq!(v1.logical_model_sha256, v2.logical_model_sha256);
+}
+
+#[test]
+fn cache_address_is_bound_to_a_closed_target_table_pair() {
+    let root = "ab".repeat(32);
+    let avx2 = NativeCacheAddress::for_target(
+        root.clone(),
+        NativePackingTarget::X86Avx2,
+        TILE_TABLE_VERSION_V1.to_owned(),
+    )
+    .expect("closed AVX2 target/table pair forms an address");
+    let vnni = NativeCacheAddress::for_target(
+        root,
+        NativePackingTarget::X86Vnni256,
+        TILE_TABLE_VERSION_V1.to_owned(),
+    )
+    .expect("closed VNNI target/table pair forms an address");
+
+    assert_eq!(avx2.packing_id, "x86-avx2-tile-table-v1");
+    assert_ne!(avx2.packing_id, vnni.packing_id);
+    assert_ne!(avx2.content_address, vnni.content_address);
+    assert_eq!(
+        avx2.cache_path("/owner-model-root"),
+        std::path::PathBuf::from("/owner-model-root")
+            .join("native")
+            .join(&avx2.content_address)
+            .join("x86-avx2-tile-table-v1.fnlpq")
+    );
 }
 
 #[test]

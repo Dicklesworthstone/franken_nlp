@@ -110,8 +110,19 @@ pub struct NativeCacheAddress {
 }
 
 impl NativeCacheAddress {
-    /// Construct the one cache address for the contract's identity triple.
-    pub fn new(
+    /// Construct the one cache address for a closed target/table pair.
+    pub fn for_target(
+        whole_artifact_sha256: String,
+        target: NativePackingTarget,
+        tile_table_version: String,
+    ) -> Result<Self, PackingError> {
+        let packing_id = target.packing_id(&tile_table_version)?;
+        Self::new(whole_artifact_sha256, packing_id, tile_table_version)
+    }
+
+    /// Construct an address only after the target-derived packing id has been
+    /// bound by [`Self::for_target`].
+    fn new(
         whole_artifact_sha256: String,
         packing_id: String,
         tile_table_version: String,
@@ -260,9 +271,9 @@ pub fn derive_native_packing(
     let generic = FnlpqArtifact::from_bytes(generic_bytes).map_err(reader_error)?;
     ensure_generic_root(&generic)?;
     let packing_id = target.packing_id(tile_table_version)?;
-    let address = NativeCacheAddress::new(
+    let address = NativeCacheAddress::for_target(
         generic_sha256.clone(),
-        packing_id.clone(),
+        target,
         tile_table_version.to_owned(),
     )?;
     let logical = logical_tensors(&generic)?;
@@ -436,16 +447,29 @@ pub fn verify_derived_packing(
     let derived_tensors = logical_tensors(derived)?;
     compare_logical_tensors(&generic_tensors, &derived_tensors)?;
     let packing_id = target.packing_id(tile_table_version)?;
-    let native_section = derived
+    let native_sections = derived
         .sections()
         .iter()
-        .find(|section| {
-            section.kind == SectionKind::NativePackingPayload
-                && section.name == format!("native-{}", target.cli_name())
-        })
-        .ok_or_else(|| PackingError::NativePayload {
-            detail: format!("missing {} native section", target.cli_name()),
-        })?;
+        .filter(|section| section.kind == SectionKind::NativePackingPayload)
+        .collect::<Vec<_>>();
+    if native_sections.len() != 1 {
+        return Err(PackingError::NativePayload {
+            detail: format!(
+                "derived cache must contain exactly one native section, found {}",
+                native_sections.len()
+            ),
+        });
+    }
+    let native_section = native_sections[0];
+    if native_section.name != format!("native-{}", target.cli_name()) {
+        return Err(PackingError::NativePayload {
+            detail: format!(
+                "derived native section {} does not match target {}",
+                native_section.name,
+                target.cli_name()
+            ),
+        });
+    }
     let bytes = derived
         .section_bytes(native_section.ordinal)
         .ok_or_else(|| PackingError::NativePayload {
