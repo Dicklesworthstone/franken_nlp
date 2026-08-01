@@ -758,6 +758,23 @@ impl FullProjection {
         &self.legal_tokens
     }
 
+    /// Return the legal rows observed during a full scan, in token-id order.
+    ///
+    /// This is the structural sparse==full differential surface.  It is not
+    /// a probability, quality score, or acceptance signal.
+    pub fn legal_row_logits(&self, logits: &[f32]) -> Result<Vec<LegalRowLogit>, ProjectionError> {
+        validate_logits(logits, self.legal_tokens.vocab_size())?;
+        Ok(self
+            .legal_tokens
+            .legal_ids()
+            .map(|token_id| LegalRowLogit {
+                token_id,
+                logit: logits[usize::try_from(token_id)
+                    .expect("token id originated from a checked vocabulary mask")],
+            })
+            .collect())
+    }
+
     /// Evaluate all vocabulary rows while admitting only legal ids.
     pub fn select(&self, logits: &[f32]) -> Result<ProjectionSelection, ProjectionError> {
         validate_logits(logits, self.legal_tokens.vocab_size())?;
@@ -804,6 +821,22 @@ impl ProjectLegal {
         &self.legal_rows
     }
 
+    /// Return every sparse legal row, in the same token-id order as the
+    /// universal masked full scan.
+    pub fn legal_row_logits(&self, logits: &[f32]) -> Result<Vec<LegalRowLogit>, ProjectionError> {
+        validate_logits(logits, self.vocab_size)?;
+        Ok(self
+            .legal_rows
+            .iter()
+            .copied()
+            .map(|token_id| LegalRowLogit {
+                token_id,
+                logit: logits[usize::try_from(token_id)
+                    .expect("token id originated from a checked vocabulary mask")],
+            })
+            .collect())
+    }
+
     /// Evaluate every legal row.  Illegal-logit diagnostics remain unknown.
     pub fn select(&self, logits: &[f32]) -> Result<ProjectionSelection, ProjectionError> {
         validate_logits(logits, self.vocab_size)?;
@@ -827,6 +860,13 @@ pub struct ProjectionSelection {
     pub token_id: u32,
     pub logit: f32,
     pub audit: FullProjectionAudit,
+}
+
+/// One legal lm-head row observed through either equivalent projection path.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LegalRowLogit {
+    pub token_id: u32,
+    pub logit: f32,
 }
 
 fn validate_logits(logits: &[f32], expected_vocab_size: usize) -> Result<(), ProjectionError> {

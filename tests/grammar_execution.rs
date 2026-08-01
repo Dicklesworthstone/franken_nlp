@@ -165,10 +165,21 @@ fn sparse_projection_equals_masked_full_projection_and_never_invents_audit_field
                 i32::try_from((seed >> 32) & 0xffff).expect("bounded value fits i32") - 32_768;
             logits.push(centered as f32 / 257.0);
         }
-        let full = FullProjection::new(legal.clone(), true)
+        let full_projection = FullProjection::new(legal.clone(), true);
+        let sparse_projection = ProjectLegal::from_mask(&legal);
+        assert_eq!(
+            sparse_projection
+                .legal_row_logits(&logits)
+                .expect("sparse path evaluates every legal row"),
+            full_projection
+                .legal_row_logits(&logits)
+                .expect("full scan preserves each legal row"),
+            "sparse legal-row values diverged from full mask in case {case}"
+        );
+        let full = full_projection
             .select(&logits)
             .expect("nonempty dense mask selects one row");
-        let sparse = ProjectLegal::from_mask(&legal)
+        let sparse = sparse_projection
             .select(&logits)
             .expect("complete sparse rows select one row");
         assert_eq!(
