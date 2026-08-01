@@ -463,6 +463,42 @@ fn json_tool_call_preserves_validated_argument_text_spelling() {
     );
 }
 
+#[test]
+fn xml_tool_call_uses_trimmed_content_for_first_call_spacing() {
+    let conversation = Conversation {
+        messages: vec![Message {
+            role: MessageRole::Assistant,
+            content: MessageContent::Text(" \n\t".to_owned()),
+            reasoning: None,
+            tool_calls: vec![ToolCall {
+                id: None,
+                name: "lookup".to_owned(),
+                arguments: json!({"key":"value"}),
+                arguments_as_supplied: None,
+            }],
+            tool_results: Vec::new(),
+        }],
+        tools: Vec::new(),
+    };
+
+    let rendered = TemplateBuilder::with_options(RenderOptions {
+        add_generation_prompt: false,
+        tool_format: ToolFormat::Xml,
+        ..RenderOptions::default()
+    })
+    .render(&conversation)
+    .expect("the XML tool-call branch renders");
+
+    assert!(
+        rendered.contains("<think>\n\n</think>\n\n \n\t<tool_call>\n<function=lookup>"),
+        "whitespace-only content joins the first XML tool call without a separator"
+    );
+    assert!(
+        !rendered.contains(" \n\t\n\n<tool_call>"),
+        "the XML branch must not treat whitespace-only content as visible text"
+    );
+}
+
 fn pinned_tokenizer() -> SpBpeTokenizer {
     let model = parse_spm_model(PINNED_TOKENIZER_MODEL)
         .expect("the frozen tokenizer.model must remain a valid SentencePiece BPE model");

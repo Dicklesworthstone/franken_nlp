@@ -674,6 +674,7 @@ fn render_message(
             &message.tool_calls,
             options.tool_format,
             !content.is_empty(),
+            !content.trim().is_empty(),
         )?;
     }
     render_frame(output, message.role, &body);
@@ -850,11 +851,12 @@ fn render_tool_calls(
     calls: &[ToolCall],
     format: ToolFormat,
     content_is_present: bool,
+    content_has_non_whitespace_text: bool,
 ) -> Result<(), TemplateError> {
     for (call_index, call) in calls.iter().enumerate() {
         match format {
             ToolFormat::Xml => {
-                if call_index == 0 && content_is_present {
+                if call_index == 0 && content_has_non_whitespace_text {
                     output.push_str("\n\n");
                 } else if call_index > 0 {
                     output.push('\n');
