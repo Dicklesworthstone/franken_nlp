@@ -24,8 +24,27 @@ fn update_golden_if_explicitly_requested(generated: &[u8]) {
     }
 }
 
+fn event_schema(schema: &Value) -> &Value {
+    schema["oneOf"]
+        .as_array()
+        .expect("frozen robot schema must discriminate response documents")
+        .iter()
+        .find(|candidate| candidate["properties"].get("event").is_some())
+        .expect("frozen robot schema must include the event envelope variant")
+}
+
+fn response_schema<'a>(schema: &'a Value, kind: &str) -> &'a Value {
+    schema["oneOf"]
+        .as_array()
+        .expect("frozen robot schema must discriminate response documents")
+        .iter()
+        .find(|candidate| candidate["properties"]["kind"]["const"] == Value::from(kind))
+        .unwrap_or_else(|| panic!("frozen robot schema must include response kind {kind}"))
+}
+
 fn validate_emitted_event(schema: &Value, event: &Value) {
-    let properties = schema["properties"]
+    let event_schema = event_schema(schema);
+    let properties = event_schema["properties"]
         .as_object()
         .expect("frozen schema properties must be an object");
     let event_object = event
@@ -45,7 +64,7 @@ fn validate_emitted_event(schema: &Value, event: &Value) {
     let event_name = event["event"]
         .as_str()
         .expect("robot event must carry its event name");
-    let supported = schema["properties"]["event"]["enum"]
+    let supported = event_schema["properties"]["event"]["enum"]
         .as_array()
         .expect("frozen event enum must be an array");
     assert!(
@@ -73,6 +92,40 @@ fn validate_emitted_event(schema: &Value, event: &Value) {
             "schema validation failure event={event} violating_field=/input_line"
         );
     }
+}
+
+fn validate_emitted_response(schema: &Value, document: &Value, kind: &str) {
+    let response_schema = response_schema(schema, kind);
+    let properties = response_schema["properties"]
+        .as_object()
+        .expect("response schema properties must be an object");
+    let required = response_schema["required"]
+        .as_array()
+        .expect("response schema required fields must be an array");
+    let object = document
+        .as_object()
+        .expect("robot response must be a JSON object");
+
+    for field in object.keys() {
+        assert!(
+            properties.contains_key(field),
+            "schema validation failure response={document} violating_field=/{field}"
+        );
+    }
+    for field in required {
+        let field = field
+            .as_str()
+            .expect("response schema required field must be a string");
+        assert!(
+            object.contains_key(field),
+            "schema validation failure response={document} missing_field=/{field}"
+        );
+    }
+    assert_eq!(document["kind"], Value::from(kind));
+    assert_eq!(
+        document["schema_version"],
+        Value::from(robot::ROBOT_SCHEMA_VERSION)
+    );
 }
 
 #[test]
@@ -181,6 +234,15 @@ fn schema_and_unpopulated_commands_are_data_only_and_golden_frozen() {
         include_bytes!("fixtures/robot_schema.golden.json"),
         "robot schema changed; use UPDATE_GOLDENS=1, inspect the diff, and commit the reviewed golden"
     );
+    assert_eq!(
+        frozen_schema()["x_fnlp_robot"]["exit_code_authority"],
+        Value::from("src/error.rs::EXIT_CODE_TABLE"),
+        "robot schema must name the executable exit-code authority"
+    );
+    assert!(
+        frozen_schema()["x_fnlp_robot"].get("exit_codes").is_none(),
+        "robot schema must not maintain a second exit-code table"
+    );
 
     for command in [
         RobotCommand::Schema,
@@ -203,6 +265,10 @@ fn schema_and_unpopulated_commands_are_data_only_and_golden_frozen() {
         if command == RobotCommand::Schema {
             assert_eq!(document, frozen_schema());
         } else {
+            let kind = document["kind"]
+                .as_str()
+                .expect("robot response must discriminate its response kind");
+            validate_emitted_response(&frozen_schema(), &document, kind);
             assert_eq!(
                 document["schema_version"],
                 Value::from(robot::ROBOT_SCHEMA_VERSION)

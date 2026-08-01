@@ -109,16 +109,22 @@
         "robot_schema_descriptions"
       ],
       "state": "targeted",
-      "transition_history": [],
+      "transition_history": [
+        {
+          "change": "robot schema v2 adds the discriminated convert_stage, health, and backends response contract; exit-code vocabulary remains solely in src/error.rs::EXIT_CODE_TABLE",
+          "review_state": "targeted_non_promoted",
+          "trigger": "schema/event change"
+        }
+      ],
       "validity_domain": {
         "dataset": "not-applicable-target-specification",
         "host": "all supported targets",
         "numerics_profile": "not-applicable-target-specification",
         "prompt_hash": "not-applicable-target-specification",
-        "recipe_id": "robot-schema-v1",
+        "recipe_id": "robot-schema-v2",
         "thinking_mode": "not-applicable-target-specification"
       },
-      "wording_scope": "Robot schema descriptions are targeted v1 contract text until canonical-JSON and error-map gates complete."
+      "wording_scope": "Robot schema descriptions are targeted v2 contract text; this is non-promoted until canonical-JSON and error-map gates complete."
     }
   ],
   "schema_version": 1
