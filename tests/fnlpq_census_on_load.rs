@@ -32,12 +32,12 @@ const REAL_INT8_GENERIC_LICENSE_BUNDLE_SHA256: &str =
 /// not a conversion-qualification claim: any checked-reader refusal is logged
 /// before the test fails and must be adjudicated as a converter/reader defect.
 #[test]
-fn real_int8_generic_artifact_checked_reader_gate_when_supplied() {
+fn real_int8_generic_artifact_checked_reader_gate_when_supplied() -> Result<(), String> {
     let Some(path) = std::env::var_os("FNLP_REAL_FNLPQ") else {
         eprintln!(
             "FNLPQ_REAL_READER RESULT=SKIPPED_NO_REAL_ARTIFACT reason=FNLP_REAL_FNLPQ-not-set"
         );
-        return;
+        return Ok(());
     };
     let path = Path::new(&path);
     let metadata = std::fs::metadata(path).expect("real artifact metadata must be readable");
@@ -68,7 +68,7 @@ fn real_int8_generic_artifact_checked_reader_gate_when_supplied() {
             eprintln!(
                 "FNLPQ_REAL_READER RESULT=REFUSED stage=open_checked_reader error={error} scope=reader-only"
             );
-            panic!("checked reader refused real artifact: {error}");
+            return Err(format!("checked reader refused real artifact: {error}"));
         }
     };
     eprintln!(
@@ -186,6 +186,7 @@ fn real_int8_generic_artifact_checked_reader_gate_when_supplied() {
         artifact.sections().len(),
         observed_raw_sha256
     );
+    Ok(())
 }
 
 #[test]
