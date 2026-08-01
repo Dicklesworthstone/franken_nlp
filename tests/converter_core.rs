@@ -223,6 +223,66 @@ fn receipt_requires_every_identity_and_serializes_canonically() {
 }
 
 #[test]
+fn receipt_parser_rejects_duplicate_missing_and_wrongly_typed_schema_fields() {
+    let receipt = ConversionReceipt {
+        receipt_schema: CONVERSION_RECEIPT_SCHEMA.to_owned(),
+        source_root_sha256: "a".repeat(64),
+        census_sha256: "b".repeat(64),
+        converter_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+        recipe_id: "nanbeige42-int8-v1".to_owned(),
+        rounding_id: "portable-quant-v1".to_owned(),
+        packing_id: "generic-v1".to_owned(),
+        measured_peak_rss_bytes: 10,
+        measured_scratch_bytes: 4,
+        peak_rss_cap_bytes: 10,
+        final_disk_bytes: 20,
+        measured_disk_bytes: 20,
+        output_len: 20,
+        output_sha256: "c".repeat(64),
+        license_bundle_sha256: "d".repeat(64),
+    };
+    let canonical = receipt
+        .canonical_json()
+        .expect("complete synthetic receipt serializes");
+
+    let duplicate_receipt_schema = canonical.replacen(
+        "\"receipt_schema\":\"fnlp-conversion-receipt-v1\"",
+        "\"receipt_schema\":\"fnlp-conversion-receipt-v1\",\"receipt_schema\":\"fnlp-conversion-receipt-v1\"",
+        1,
+    );
+    assert!(matches!(
+        ConversionReceipt::parse_canonical_json(&duplicate_receipt_schema),
+        Err(ConverterError::ReceiptJson(_))
+    ));
+
+    let mut missing_output_sha256 = serde_json::from_str::<serde_json::Value>(&canonical)
+        .expect("canonical receipt is JSON");
+    missing_output_sha256
+        .as_object_mut()
+        .expect("receipt root is an object")
+        .remove("output_sha256");
+    let missing_output_sha256 = franken_nlp::canonjson::canonical_string(&missing_output_sha256)
+        .expect("missing-field hostile receipt stays canonical JSON");
+    assert!(matches!(
+        ConversionReceipt::parse_canonical_json(&missing_output_sha256),
+        Err(ConverterError::ReceiptParse { .. })
+    ));
+
+    let mut numeric_source_root = serde_json::from_str::<serde_json::Value>(&canonical)
+        .expect("canonical receipt is JSON");
+    numeric_source_root
+        .as_object_mut()
+        .expect("receipt root is an object")
+        .insert("source_root_sha256".to_owned(), serde_json::Value::from(7_u64));
+    let numeric_source_root = franken_nlp::canonjson::canonical_string(&numeric_source_root)
+        .expect("wrong-type hostile receipt stays canonical JSON");
+    assert!(matches!(
+        ConversionReceipt::parse_canonical_json(&numeric_source_root),
+        Err(ConverterError::ReceiptParse { .. })
+    ));
+}
+
+#[test]
 fn cli_contract_admits_only_recipe_and_generic_arch() {
     let request = ConvertRequest {
         source_dir: "source".into(),

@@ -135,6 +135,23 @@ fn tiny_input() -> FnlpqWriterInput {
     }
 }
 
+fn checked_mapping_bytes(
+    artifact: &FnlpqArtifact,
+    section_ordinal: u64,
+    offset: u64,
+    len: u64,
+) -> &[u8] {
+    let section = artifact
+        .section_bytes(section_ordinal)
+        .expect("checked mapping section remains available");
+    let start = usize::try_from(offset).expect("checked mapping offset fits usize");
+    let len = usize::try_from(len).expect("checked mapping length fits usize");
+    let end = start.checked_add(len).expect("checked mapping end fits usize");
+    section
+        .get(start..end)
+        .expect("checked mapping range remains available")
+}
+
 #[test]
 fn incremental_logical_tensor_hasher_matches_the_framed_v1_identity() {
     let data = [0x80, 0x3f, 0x00, 0x40];
@@ -328,6 +345,78 @@ fn streaming_writer_matches_the_materialized_v1_oracle_byte_for_byte() {
     assert_eq!(streamed.fnlpq_file_sha256, materialized.fnlpq_file_sha256);
     assert_eq!(streamed.packing_set_sha256, materialized.packing_set_sha256);
     assert_eq!(streamed.license_bundle_sha256, materialized.license_bundle_sha256);
+}
+
+#[test]
+fn synthetic_streamed_stage_reload_reconstructs_every_declared_logical_tensor() {
+    let input = tiny_input();
+    let streaming = streaming_input_from_materialized(&input)
+        .expect("tiny oracle input supplies verified streaming metadata");
+    let mut staged_bytes = Vec::new();
+    write_streaming(&streaming, &mut staged_bytes, |section, sink| {
+        let source = input
+            .sections
+            .iter()
+            .find(|candidate| candidate.name == section.name)
+            .expect("streaming plan section originates from tiny input");
+        sink.write_all(&source.bytes)
+            .map_err(|error| FnlpqWriteError::Io {
+                operation: "write synthetic staged streaming section",
+                detail: error.to_string(),
+            })
+    })
+    .expect("synthetic streamed stage is complete");
+
+    let reloaded = FnlpqArtifact::from_bytes(staged_bytes.clone())
+        .expect("complete synthetic streamed stage reloads through the checked reader");
+    assert_eq!(reloaded.tensors().len(), input.tensors.len());
+    for source in &input.tensors {
+        let reloaded_tensor = reloaded
+            .tensors()
+            .iter()
+            .find(|candidate| candidate.name == source.name)
+            .expect("every declared tensor survives staged reload");
+        assert_eq!(reloaded_tensor.shape, source.shape);
+        assert_eq!(reloaded_tensor.quantization, source.quantization);
+        assert_eq!(
+            reloaded_tensor.canonical_logical_sha256,
+            source.canonical_logical_sha256
+        );
+
+        let digest = logical_tensor_sha256(
+            &reloaded_tensor.name,
+            &reloaded_tensor.canonical_dtype,
+            &reloaded_tensor.shape,
+            &reloaded_tensor.quantization,
+            checked_mapping_bytes(
+                &reloaded,
+                reloaded_tensor.data.section_ordinal,
+                reloaded_tensor.data.offset,
+                reloaded_tensor.data.len,
+            ),
+            checked_mapping_bytes(
+                &reloaded,
+                reloaded_tensor.scale.section_ordinal,
+                reloaded_tensor.scale.offset,
+                reloaded_tensor.scale.len,
+            ),
+            checked_mapping_bytes(
+                &reloaded,
+                reloaded_tensor.row_sum.section_ordinal,
+                reloaded_tensor.row_sum.offset,
+                reloaded_tensor.row_sum.len,
+            ),
+        )
+        .expect("reloaded logical tensor has a valid canonical identity");
+        assert_eq!(hex(&digest), reloaded_tensor.canonical_logical_sha256);
+    }
+    assert_eq!(
+        reloaded
+            .reserialize()
+            .expect("reloaded synthetic stage reserializes"),
+        staged_bytes,
+        "synthetic staged reload must reconstruct the exact canonical bytes"
+    );
 }
 
 #[test]
