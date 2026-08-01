@@ -86,6 +86,18 @@ checkpoint window:
    JSONL, with zero dependency cycles and no unresolved dead-closed blockers;
 3. a live MCP Agent Mail register → exact-path reserve → release round trip.
 
+The current working snapshot would fail that coordination gate. A direct read
+of the exported graph during the 2026-07-31 audit found five closed issues with
+non-closed blocking dependencies: `franken_nlp-6gi` still depends on open
+`franken_nlp-8pt`; `franken_nlp-6wt` on open `franken_nlp-9tn`;
+`franken_nlp-72s` on open `franken_nlp-3pe`, `5vu`, `7xa`, `80o`, `8pt`,
+`bky`, `bvq`, and `r32`; `franken_nlp-n27` on open `upv` and `uxw`; and
+`franken_nlp-o2y` on open `cwr6`, `oma`, and `uxw`. The parent
+`franken_nlp-mzr` is also closed while child `franken_nlp-mzr.1` remains
+blocked. These observations do not authorize this documentation owner to edit
+Bead state. The controller must adjudicate them and retain a newly flushed
+graph showing no dead-closed blockers before selecting a DSR checkpoint.
+
 If Mail is degraded, bead-assignee locking may keep non-overlapping code-first
 work moving, but it does not satisfy this live wiring receipt. Proof-sensitive
 closures remain blocked until the live round trip is restored or the owner
