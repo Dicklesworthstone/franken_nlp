@@ -18,6 +18,7 @@ use crate::{
         logical_model_sha256, validate_authority_identifier, write_streaming,
     },
     artifact::package::{PackageRequest, package_model, verify_model_package},
+    artifact::fs_tx::open_ratified_model_root,
     artifact::packing::{NativePackingTarget, TILE_TABLE_VERSION_V1},
     artifact::quantize::{GenericPanelBytes, encode_generic_panel},
     artifact::reader::FnlpqArtifact,
