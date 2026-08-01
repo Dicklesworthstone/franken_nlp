@@ -362,10 +362,7 @@ fn schema_and_unpopulated_commands_are_data_only_and_golden_frozen() {
                 assert_eq!(document["allocations"], Value::from("none"));
                 assert_eq!(document["context_tokens"], Value::from(8_192));
                 assert_eq!(document["batch_rows"], Value::from(64));
-                assert_eq!(
-                    document["quantization"],
-                    Value::from("int8-f32-scales")
-                );
+                assert_eq!(document["quantization"], Value::from("int8-f32-scales"));
                 assert_eq!(
                     document["terms"]["kv_payload_bytes"],
                     Value::from(64_u64 * 8_192 * 90_112)

@@ -833,7 +833,10 @@ pub fn write_command<W: Write, D: Write>(
                 schema_version: ROBOT_SCHEMA_VERSION,
                 thread_inventory: orchestrator::installed_process_resources()
                     .as_deref()
-                    .map_or_else(ThreadInventoryDocument::not_installed, ThreadInventoryDocument::from_resources),
+                    .map_or_else(
+                        ThreadInventoryDocument::not_installed,
+                        ThreadInventoryDocument::from_resources,
+                    ),
             },
         ),
         RobotCommand::Backends => write_json_document(

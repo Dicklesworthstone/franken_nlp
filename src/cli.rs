@@ -1797,9 +1797,8 @@ mod tests {
 
     use super::{
         Cli, Command, KvCacheQuantization, LogicalTensorFirstPass, ModelsSubcommand,
-        ReleaseSubcommand, RobotSubcommand,
-        cli_main_with_reader, confirm_convert, conversion_receipt_path, conversion_staging_path,
-        validate_generic_tensor_authorities,
+        ReleaseSubcommand, RobotSubcommand, cli_main_with_reader, confirm_convert,
+        conversion_receipt_path, conversion_staging_path, validate_generic_tensor_authorities,
     };
     use crate::artifact::converter::{
         ConvertArch, ConvertRequest, GenericPayloadPlan, GenericTensorLayout, OutputRange,
@@ -2130,7 +2129,13 @@ mod tests {
         assert_eq!(request.batch_rows, 64);
         assert_eq!(request.kv_quantization, KvCacheQuantization::Int8F32Scales);
         assert_eq!(request.local_memory_budget_bytes, Some(999_999_999_999));
-        assert_eq!(request.fixed_residency.expect("fixed terms exist").mapped_bytes, 1_000);
+        assert_eq!(
+            request
+                .fixed_residency
+                .expect("fixed terms exist")
+                .mapped_bytes,
+            1_000
+        );
         assert_eq!(
             request
                 .fixed_residency
