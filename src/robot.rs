@@ -566,6 +566,249 @@ struct BackendsDocument {
     status: &'static str,
 }
 
+#[derive(Serialize)]
+struct ResidencyDocument {
+    status: &'static str,
+    mapped_bytes: Option<u64>,
+    resident_bytes: Option<u64>,
+}
+
+impl ResidencyDocument {
+    fn fixed(terms: orchestrator::AdmissionTerms) -> Self {
+        Self {
+            status: if terms.fixed_resident_bytes.is_some() {
+                "configured"
+            } else {
+                "unconfigured"
+            },
+            mapped_bytes: terms.fixed_mapped_bytes,
+            resident_bytes: terms.fixed_resident_bytes,
+        }
+    }
+
+    fn replicated(terms: orchestrator::AdmissionTerms) -> Self {
+        Self {
+            status: "configured",
+            mapped_bytes: Some(terms.replicated_weight_mapped_bytes),
+            resident_bytes: Some(terms.replicated_weight_resident_bytes),
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            status: "unavailable",
+            mapped_bytes: None,
+            resident_bytes: None,
+        }
+    }
+}
+
+/// Every plan term is rendered even when a required physical fact is not yet
+/// configured. `null` is an explicit unknown, never zero bytes.
+#[derive(Serialize)]
+struct PlanTermsDocument {
+    memory_budget_total_bytes: Option<u64>,
+    memory_reserve_os_bytes: u64,
+    fixed_residency: ResidencyDocument,
+    elastic_cache_bytes: Option<u64>,
+    replicated_weight_residency: ResidencyDocument,
+    kv_payload_bytes: Option<u64>,
+    kv_scale_bytes: Option<u64>,
+    kv_page_metadata_bytes: Option<u64>,
+    activation_bytes: Option<u64>,
+    full_logit_bytes: Option<u64>,
+    grammar_state_bytes: Option<u64>,
+    source_state_bytes: Option<u64>,
+    queue_bytes: Option<u64>,
+    output_buffer_bytes: Option<u64>,
+    unmodeled_emergency_reserve_bytes: Option<u64>,
+    safety_margin_bytes: Option<u64>,
+    committed_bytes: Option<u64>,
+    peak_bytes: Option<u64>,
+    aggregate_available_ledger_bytes: Option<u64>,
+}
+
+impl PlanTermsDocument {
+    fn from_certificate(
+        certificate: &orchestrator::AdmissionCertificate,
+        aggregate_available_ledger_bytes: Option<u64>,
+    ) -> Self {
+        let request = certificate.request();
+        let terms = certificate.terms();
+        Self {
+            memory_budget_total_bytes: request.local_memory_budget_bytes,
+            memory_reserve_os_bytes: terms.os_reserve_bytes,
+            fixed_residency: ResidencyDocument::fixed(terms),
+            elastic_cache_bytes: Some(terms.elastic_cache_bytes),
+            replicated_weight_residency: ResidencyDocument::replicated(terms),
+            kv_payload_bytes: Some(terms.kv_payload_bytes),
+            kv_scale_bytes: Some(terms.kv_scale_bytes),
+            kv_page_metadata_bytes: terms.kv_page_metadata_bytes,
+            activation_bytes: Some(terms.activation_bytes),
+            full_logit_bytes: Some(terms.full_logit_bytes),
+            grammar_state_bytes: Some(terms.grammar_state_bytes),
+            source_state_bytes: Some(terms.source_state_bytes),
+            queue_bytes: Some(terms.queue_bytes),
+            output_buffer_bytes: Some(terms.output_buffer_bytes),
+            unmodeled_emergency_reserve_bytes: Some(terms.unmodeled_emergency_reserve_bytes),
+            safety_margin_bytes: Some(terms.safety_margin_bytes),
+            committed_bytes: terms.committed_bytes,
+            peak_bytes: terms.peak_bytes,
+            aggregate_available_ledger_bytes,
+        }
+    }
+
+    fn unavailable(request: orchestrator::AdmissionRequest) -> Self {
+        Self {
+            memory_budget_total_bytes: request.local_memory_budget_bytes,
+            memory_reserve_os_bytes: request.os_reserve_bytes,
+            fixed_residency: ResidencyDocument::unavailable(),
+            elastic_cache_bytes: None,
+            replicated_weight_residency: ResidencyDocument::unavailable(),
+            kv_payload_bytes: None,
+            kv_scale_bytes: None,
+            kv_page_metadata_bytes: None,
+            activation_bytes: None,
+            full_logit_bytes: None,
+            grammar_state_bytes: None,
+            source_state_bytes: None,
+            queue_bytes: None,
+            output_buffer_bytes: None,
+            unmodeled_emergency_reserve_bytes: None,
+            safety_margin_bytes: None,
+            committed_bytes: None,
+            peak_bytes: None,
+            aggregate_available_ledger_bytes: None,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct PlanRejectionDocument {
+    code: &'static str,
+    first_violated_term: Option<&'static str>,
+}
+
+impl PlanRejectionDocument {
+    fn from_rejection(rejection: orchestrator::AdmissionRejection) -> Self {
+        Self {
+            code: rejection.as_str(),
+            first_violated_term: rejection.first_violated_term().map(|term| term.as_str()),
+        }
+    }
+
+    fn from_build_error(error: orchestrator::AdmissionBuildError) -> Self {
+        match error {
+            orchestrator::AdmissionBuildError::ZeroBatchRows => Self {
+                code: "zero_batch_rows",
+                first_violated_term: None,
+            },
+            orchestrator::AdmissionBuildError::ArithmeticOverflow { term } => Self {
+                code: "arithmetic_overflow",
+                first_violated_term: Some(term.as_str()),
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct PlanDocument {
+    aggregate_status: &'static str,
+    allocations: &'static str,
+    batch_rows: u64,
+    context_tokens: u64,
+    kind: &'static str,
+    quantization: &'static str,
+    rejection: Option<PlanRejectionDocument>,
+    schema_version: u32,
+    status: &'static str,
+    terms: PlanTermsDocument,
+    thread_inventory: ThreadInventoryDocument,
+}
+
+fn unconfigured_thread_inventory() -> orchestrator::ThreadInventory {
+    orchestrator::ThreadInventory {
+        runtime_workers: 0,
+        blocking_coordinators: 0,
+        scoped_cpu_children_per_coordinator: 0,
+        helper_threads: 0,
+        total_runnable_threads: 0,
+    }
+}
+
+fn plan_document(request: orchestrator::AdmissionRequest) -> io::Result<PlanDocument> {
+    let resources = orchestrator::installed_process_resources();
+    let certificate = match orchestrator::AdmissionCertificate::build(
+        request,
+        resources.as_deref().map_or_else(
+            unconfigured_thread_inventory,
+            orchestrator::EngineResources::thread_inventory,
+        ),
+    ) {
+        Ok(certificate) => certificate,
+        Err(error) => {
+            return Ok(PlanDocument {
+                aggregate_status: "not_installed",
+                allocations: "none",
+                batch_rows: request.batch_rows,
+                context_tokens: request.context_tokens,
+                kind: "robot_plan",
+                quantization: request.kv_quantization.as_str(),
+                rejection: Some(PlanRejectionDocument::from_build_error(error)),
+                schema_version: ROBOT_SCHEMA_VERSION,
+                status: "refused",
+                terms: PlanTermsDocument::unavailable(request),
+                thread_inventory: ThreadInventoryDocument::not_installed(),
+            });
+        }
+    };
+    let local_decision = certificate.local_decision();
+    let (decision, aggregate_status, aggregate_available_ledger_bytes, thread_inventory) =
+        if let Some(resources) = resources.as_deref() {
+            let aggregate_available_ledger_bytes = resources
+                .available_memory_bytes()
+                .map_err(io::Error::other)?;
+            let decision = resources
+                .preflight_admission(&certificate)
+                .map_err(io::Error::other)?;
+            (
+                decision,
+                decision.status(),
+                Some(aggregate_available_ledger_bytes),
+                ThreadInventoryDocument::from_resources(resources),
+            )
+        } else {
+            (
+                local_decision,
+                "not_installed",
+                None,
+                ThreadInventoryDocument::not_installed(),
+            )
+        };
+    let status = if aggregate_status == "not_installed"
+        && decision == orchestrator::AdmissionDecision::Admitted
+    {
+        "not_installed"
+    } else {
+        decision.status()
+    };
+    Ok(PlanDocument {
+        aggregate_status,
+        allocations: "none",
+        batch_rows: request.batch_rows,
+        context_tokens: request.context_tokens,
+        kind: "robot_plan",
+        quantization: request.kv_quantization.as_str(),
+        rejection: decision
+            .rejection()
+            .map(PlanRejectionDocument::from_rejection),
+        schema_version: ROBOT_SCHEMA_VERSION,
+        status,
+        terms: PlanTermsDocument::from_certificate(&certificate, aggregate_available_ledger_bytes),
+        thread_inventory,
+    })
+}
+
 fn write_json_document<W: Write, T: Serialize>(writer: &mut W, document: &T) -> io::Result<()> {
     serde_json::to_writer(&mut *writer, document).map_err(io::Error::other)?;
     writer.write_all(b"\n")
@@ -602,5 +845,9 @@ pub fn write_command<W: Write, D: Write>(
                 status: "populated",
             },
         ),
+        RobotCommand::Plan(request) => {
+            let document = plan_document(request)?;
+            write_json_document(writer, &document)
+        }
     }
 }
