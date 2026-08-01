@@ -477,6 +477,8 @@ pub enum MemoryClass {
     GrammarCache,
     JobBuffers,
     Staging,
+    /// Explicit capacity retained for modeled safety and emergency terms.
+    AdmissionReserve,
 }
 
 impl MemoryClass {
@@ -491,6 +493,7 @@ impl MemoryClass {
             Self::GrammarCache => "grammar_cache",
             Self::JobBuffers => "job_buffers",
             Self::Staging => "staging",
+            Self::AdmissionReserve => "admission_reserve",
         }
     }
 }
@@ -758,6 +761,20 @@ impl MemoryLedger {
             by_class,
         }
     }
+
+    /// Read available aggregate capacity without constructing a diagnostic
+    /// snapshot or allocating a per-class map. Robot planning uses this
+    /// observation only; reservation remains authoritative under races.
+    fn available_bytes(&self) -> Result<u64, ReservationError> {
+        let state = lock_unpoisoned(&self.state);
+        let occupied = state
+            .reserved_bytes
+            .checked_add(state.committed_bytes)
+            .ok_or(ReservationError::ArithmeticOverflow)?;
+        self.ceiling_bytes
+            .checked_sub(occupied)
+            .ok_or(ReservationError::LedgerInvariant { obligation_id: 0 })
+    }
 }
 
 /// An uncommitted allocation admission obligation.
@@ -886,6 +903,955 @@ impl Drop for CommittedMemory {
     fn drop(&mut self) {
         if let Some(ledger) = self.ledger.take() {
             ledger.release_committed(self.obligation_id);
+        }
+    }
+}
+
+/// The product-default usable context limit. Nanbeige's observed 262,144
+/// position limit is not an admission promise.
+pub const DEFAULT_CONTEXT_TOKEN_CAP: u64 = 8_192;
+/// Logical bf16 K/V bytes across the model's 44 K/V slots for one token in
+/// one sequence: `44 * 2 * 8 * 128 * 2`.
+pub const BF16_KV_BYTES_PER_TOKEN: u64 = 180_224;
+/// Payload bytes for an int8 K/V cache token before scales and allocator
+/// metadata.
+pub const INT8_KV_PAYLOAD_BYTES_PER_TOKEN: u64 = 90_112;
+/// Per-token f32 K/V-scale storage for an int8 cache.
+pub const INT8_KV_F32_SCALE_BYTES_PER_TOKEN: u64 = 2_816;
+/// Per-token f16 K/V-scale storage for an int8 cache.
+pub const INT8_KV_F16_SCALE_BYTES_PER_TOKEN: u64 = 1_408;
+/// One dense f32 lm-head row over the fixed 166,144-token vocabulary.
+pub const FULL_F32_LOGIT_ROW_BYTES: u64 = 664_576;
+
+/// K/V-cache representation selected by an immutable artifact/profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KvCacheQuantization {
+    Bf16,
+    Int8F32Scales,
+    Int8F16Scales,
+}
+
+impl KvCacheQuantization {
+    /// Stable CLI, robot, and receipt spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
+            Self::Int8F32Scales => "int8-f32-scales",
+            Self::Int8F16Scales => "int8-f16-scales",
+        }
+    }
+
+    /// Parse only the closed cache-accounting profiles.
+    pub const fn parse(value: &str) -> Option<Self> {
+        match value {
+            "bf16" => Some(Self::Bf16),
+            "int8" | "int8-f32-scales" => Some(Self::Int8F32Scales),
+            "int8-f16-scales" => Some(Self::Int8F16Scales),
+            _ => None,
+        }
+    }
+
+    const fn payload_bytes_per_token(self) -> u64 {
+        match self {
+            Self::Bf16 => BF16_KV_BYTES_PER_TOKEN,
+            Self::Int8F32Scales | Self::Int8F16Scales => INT8_KV_PAYLOAD_BYTES_PER_TOKEN,
+        }
+    }
+
+    const fn scale_bytes_per_token(self) -> u64 {
+        match self {
+            Self::Bf16 => 0,
+            Self::Int8F32Scales => INT8_KV_F32_SCALE_BYTES_PER_TOKEN,
+            Self::Int8F16Scales => INT8_KV_F16_SCALE_BYTES_PER_TOKEN,
+        }
+    }
+}
+
+/// Exact mapped and resident accounting for one file-backed or owned memory
+/// region. Mapped virtual bytes and committed resident bytes are intentionally
+/// separate; a plan must not substitute one for the other.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidencyAccounting {
+    pub mapped_bytes: u64,
+    pub resident_bytes: u64,
+}
+
+impl ResidencyAccounting {
+    /// Construct a region whose resident commitment cannot exceed its mapping.
+    pub const fn new(mapped_bytes: u64, resident_bytes: u64) -> Option<Self> {
+        if resident_bytes <= mapped_bytes {
+            Some(Self {
+                mapped_bytes,
+                resident_bytes,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Inputs to the checked, allocation-free admission certificate calculation.
+///
+/// The caller must attach exact fixed residency and page metadata before this
+/// plan can admit a request. The defaults intentionally leave those two facts
+/// unconfigured so an estimator cannot turn a model-free command into a false
+/// memory promise.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdmissionRequest {
+    pub context_tokens: u64,
+    pub batch_rows: u64,
+    pub kv_quantization: KvCacheQuantization,
+    pub local_memory_budget_bytes: Option<u64>,
+    pub os_reserve_bytes: u64,
+    pub fixed_residency: Option<ResidencyAccounting>,
+    pub elastic_cache_bytes: u64,
+    pub replicated_weight_residency: ResidencyAccounting,
+    pub kv_page_metadata_bytes_per_token: Option<u64>,
+    pub activation_bytes_per_row: u64,
+    pub grammar_state_bytes_per_row: u64,
+    pub source_state_bytes_per_row: u64,
+    pub queue_bytes_per_row: u64,
+    pub output_buffer_bytes_per_row: u64,
+    pub unmodeled_emergency_reserve_bytes: u64,
+    pub safety_margin_bytes: u64,
+}
+
+impl AdmissionRequest {
+    /// Start a decode admission plan with the stable context cap and an
+    /// explicit 64 MiB safety/emergency envelope. Fixed residency, page-table,
+    /// and allocator-padding facts remain deliberately unconfigured.
+    pub const fn decode(
+        context_tokens: u64,
+        batch_rows: u64,
+        kv_quantization: KvCacheQuantization,
+    ) -> Self {
+        Self {
+            context_tokens,
+            batch_rows,
+            kv_quantization,
+            local_memory_budget_bytes: None,
+            os_reserve_bytes: 0,
+            fixed_residency: None,
+            elastic_cache_bytes: 0,
+            replicated_weight_residency: ResidencyAccounting {
+                mapped_bytes: 0,
+                resident_bytes: 0,
+            },
+            kv_page_metadata_bytes_per_token: None,
+            activation_bytes_per_row: 0,
+            grammar_state_bytes_per_row: 0,
+            source_state_bytes_per_row: 0,
+            queue_bytes_per_row: 0,
+            output_buffer_bytes_per_row: 0,
+            unmodeled_emergency_reserve_bytes: 64 * 1024 * 1024,
+            safety_margin_bytes: 64 * 1024 * 1024,
+        }
+    }
+
+    pub const fn with_local_memory_budget(mut self, bytes: u64) -> Self {
+        self.local_memory_budget_bytes = Some(bytes);
+        self
+    }
+
+    pub const fn with_os_reserve(mut self, bytes: u64) -> Self {
+        self.os_reserve_bytes = bytes;
+        self
+    }
+
+    pub const fn with_fixed_residency(mut self, residency: ResidencyAccounting) -> Self {
+        self.fixed_residency = Some(residency);
+        self
+    }
+
+    pub const fn with_elastic_cache(mut self, bytes: u64) -> Self {
+        self.elastic_cache_bytes = bytes;
+        self
+    }
+
+    pub const fn with_replicated_weight_residency(
+        mut self,
+        residency: ResidencyAccounting,
+    ) -> Self {
+        self.replicated_weight_residency = residency;
+        self
+    }
+
+    pub const fn with_kv_page_metadata_per_token(mut self, bytes: u64) -> Self {
+        self.kv_page_metadata_bytes_per_token = Some(bytes);
+        self
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub const fn with_elastic_rows(
+        mut self,
+        activation_bytes_per_row: u64,
+        grammar_state_bytes_per_row: u64,
+        source_state_bytes_per_row: u64,
+        queue_bytes_per_row: u64,
+        output_buffer_bytes_per_row: u64,
+    ) -> Self {
+        self.activation_bytes_per_row = activation_bytes_per_row;
+        self.grammar_state_bytes_per_row = grammar_state_bytes_per_row;
+        self.source_state_bytes_per_row = source_state_bytes_per_row;
+        self.queue_bytes_per_row = queue_bytes_per_row;
+        self.output_buffer_bytes_per_row = output_buffer_bytes_per_row;
+        self
+    }
+
+    pub const fn with_reserves(
+        mut self,
+        unmodeled_emergency_reserve_bytes: u64,
+        safety_margin_bytes: u64,
+    ) -> Self {
+        self.unmodeled_emergency_reserve_bytes = unmodeled_emergency_reserve_bytes;
+        self.safety_margin_bytes = safety_margin_bytes;
+        self
+    }
+}
+
+/// A named certificate term. The order is the deterministic first-violation
+/// order used for a refusal explanation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionTerm {
+    OsReserve,
+    FixedResidency,
+    ElasticCache,
+    ReplicatedWeightResidency,
+    KvPayload,
+    KvScales,
+    KvPageMetadata,
+    ActivationRows,
+    FullLogitRows,
+    GrammarState,
+    SourceState,
+    QueueBuffers,
+    OutputBuffers,
+    UnmodeledEmergencyReserve,
+    SafetyMargin,
+}
+
+impl AdmissionTerm {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OsReserve => "os_reserve",
+            Self::FixedResidency => "fixed_residency",
+            Self::ElasticCache => "elastic_cache",
+            Self::ReplicatedWeightResidency => "replicated_weight_residency",
+            Self::KvPayload => "kv_payload",
+            Self::KvScales => "kv_scales",
+            Self::KvPageMetadata => "kv_page_metadata",
+            Self::ActivationRows => "activation_rows",
+            Self::FullLogitRows => "full_logit_rows",
+            Self::GrammarState => "grammar_state",
+            Self::SourceState => "source_state",
+            Self::QueueBuffers => "queue_buffers",
+            Self::OutputBuffers => "output_buffers",
+            Self::UnmodeledEmergencyReserve => "unmodeled_emergency_reserve",
+            Self::SafetyMargin => "safety_margin",
+        }
+    }
+}
+
+/// Computed bytes for every named admission term. `None` means a required
+/// physical fact was not supplied, never that the term was silently ignored.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdmissionTerms {
+    pub os_reserve_bytes: u64,
+    pub fixed_mapped_bytes: Option<u64>,
+    pub fixed_resident_bytes: Option<u64>,
+    pub elastic_cache_bytes: u64,
+    pub replicated_weight_mapped_bytes: u64,
+    pub replicated_weight_resident_bytes: u64,
+    pub kv_payload_bytes: u64,
+    pub kv_scale_bytes: u64,
+    pub kv_page_metadata_bytes: Option<u64>,
+    pub activation_bytes: u64,
+    pub full_logit_bytes: u64,
+    pub grammar_state_bytes: u64,
+    pub source_state_bytes: u64,
+    pub queue_bytes: u64,
+    pub output_buffer_bytes: u64,
+    pub unmodeled_emergency_reserve_bytes: u64,
+    pub safety_margin_bytes: u64,
+    /// Allocatable process-ledger commitment; excludes the OS reserve.
+    pub committed_bytes: Option<u64>,
+    /// Full process peak, including the non-allocatable OS reserve.
+    pub peak_bytes: Option<u64>,
+}
+
+/// Checked-arithmetic failures never wrap an admission term into a smaller
+/// value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionBuildError {
+    ZeroBatchRows,
+    ArithmeticOverflow { term: AdmissionTerm },
+}
+
+impl fmt::Display for AdmissionBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroBatchRows => formatter.write_str("admission batch_rows must be non-zero"),
+            Self::ArithmeticOverflow { term } => write!(
+                formatter,
+                "admission arithmetic overflow while calculating {}",
+                term.as_str()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AdmissionBuildError {}
+
+/// A concrete refusal emitted before any request allocation happens.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionRejection {
+    ContextCapExceeded {
+        requested_tokens: u64,
+        cap_tokens: u64,
+    },
+    FixedResidencyUnconfigured,
+    KvPageMetadataUnconfigured,
+    MemoryBudgetUnconfigured,
+    LocalBudgetExceeded {
+        first_violated_term: AdmissionTerm,
+        required_peak_bytes: u64,
+        budget_bytes: u64,
+    },
+    AggregateCapacityExceeded {
+        first_violated_term: AdmissionTerm,
+        requested_ledger_bytes: u64,
+        available_ledger_bytes: u64,
+        ledger_ceiling_bytes: u64,
+    },
+}
+
+impl AdmissionRejection {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ContextCapExceeded { .. } => "context_cap_exceeded",
+            Self::FixedResidencyUnconfigured => "fixed_residency_unconfigured",
+            Self::KvPageMetadataUnconfigured => "kv_page_metadata_unconfigured",
+            Self::MemoryBudgetUnconfigured => "memory_budget_unconfigured",
+            Self::LocalBudgetExceeded { .. } => "local_budget_exceeded",
+            Self::AggregateCapacityExceeded { .. } => "aggregate_capacity_exceeded",
+        }
+    }
+
+    pub const fn first_violated_term(self) -> Option<AdmissionTerm> {
+        match self {
+            Self::LocalBudgetExceeded {
+                first_violated_term,
+                ..
+            }
+            | Self::AggregateCapacityExceeded {
+                first_violated_term,
+                ..
+            } => Some(first_violated_term),
+            Self::ContextCapExceeded { .. }
+            | Self::FixedResidencyUnconfigured
+            | Self::KvPageMetadataUnconfigured
+            | Self::MemoryBudgetUnconfigured => None,
+        }
+    }
+}
+
+impl fmt::Display for AdmissionRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ContextCapExceeded {
+                requested_tokens,
+                cap_tokens,
+            } => write!(
+                formatter,
+                "context request {requested_tokens} exceeds default admitted cap {cap_tokens}"
+            ),
+            Self::FixedResidencyUnconfigured => formatter
+                .write_str("fixed mapped/resident model and packing accounting is not configured"),
+            Self::KvPageMetadataUnconfigured => formatter.write_str(
+                "KV allocator padding and page-table bytes per token are not configured",
+            ),
+            Self::MemoryBudgetUnconfigured => {
+                formatter.write_str("local memory budget is not configured")
+            }
+            Self::LocalBudgetExceeded {
+                first_violated_term,
+                required_peak_bytes,
+                budget_bytes,
+            } => write!(
+                formatter,
+                "local memory budget first exceeds at {} required_peak={} budget={}",
+                first_violated_term.as_str(),
+                required_peak_bytes,
+                budget_bytes,
+            ),
+            Self::AggregateCapacityExceeded {
+                first_violated_term,
+                requested_ledger_bytes,
+                available_ledger_bytes,
+                ledger_ceiling_bytes,
+            } => write!(
+                formatter,
+                "aggregate memory ledger first exceeds at {} requested={} available={} ceiling={}",
+                first_violated_term.as_str(),
+                requested_ledger_bytes,
+                available_ledger_bytes,
+                ledger_ceiling_bytes,
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AdmissionRejection {}
+
+/// Result of a local or process-aggregate preflight.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionDecision {
+    Admitted,
+    Refused(AdmissionRejection),
+}
+
+impl AdmissionDecision {
+    pub const fn status(self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::Refused(_) => "refused",
+        }
+    }
+
+    pub const fn rejection(self) -> Option<AdmissionRejection> {
+        match self {
+            Self::Admitted => None,
+            Self::Refused(rejection) => Some(rejection),
+        }
+    }
+}
+
+/// An allocation-free, replayable statement of one request or bounded batch's
+/// complete memory and thread envelope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdmissionCertificate {
+    request: AdmissionRequest,
+    thread_inventory: ThreadInventory,
+    terms: AdmissionTerms,
+}
+
+impl AdmissionCertificate {
+    /// Calculate all known terms with checked arithmetic. This performs no
+    /// memory reservation and no model, allocator, or filesystem operation.
+    pub fn build(
+        request: AdmissionRequest,
+        thread_inventory: ThreadInventory,
+    ) -> Result<Self, AdmissionBuildError> {
+        if request.batch_rows == 0 {
+            return Err(AdmissionBuildError::ZeroBatchRows);
+        }
+        let token_rows = request
+            .context_tokens
+            .checked_mul(request.batch_rows)
+            .ok_or(AdmissionBuildError::ArithmeticOverflow {
+                term: AdmissionTerm::KvPayload,
+            })?;
+        let kv_payload_bytes = token_rows
+            .checked_mul(request.kv_quantization.payload_bytes_per_token())
+            .ok_or(AdmissionBuildError::ArithmeticOverflow {
+                term: AdmissionTerm::KvPayload,
+            })?;
+        let kv_scale_bytes = token_rows
+            .checked_mul(request.kv_quantization.scale_bytes_per_token())
+            .ok_or(AdmissionBuildError::ArithmeticOverflow {
+                term: AdmissionTerm::KvScales,
+            })?;
+        let kv_page_metadata_bytes = request
+            .kv_page_metadata_bytes_per_token
+            .map(|bytes| {
+                token_rows
+                    .checked_mul(bytes)
+                    .ok_or(AdmissionBuildError::ArithmeticOverflow {
+                        term: AdmissionTerm::KvPageMetadata,
+                    })
+            })
+            .transpose()?;
+        let activation_bytes = checked_row_bytes(
+            request.batch_rows,
+            request.activation_bytes_per_row,
+            AdmissionTerm::ActivationRows,
+        )?;
+        let full_logit_bytes = checked_row_bytes(
+            request.batch_rows,
+            FULL_F32_LOGIT_ROW_BYTES,
+            AdmissionTerm::FullLogitRows,
+        )?;
+        let grammar_state_bytes = checked_row_bytes(
+            request.batch_rows,
+            request.grammar_state_bytes_per_row,
+            AdmissionTerm::GrammarState,
+        )?;
+        let source_state_bytes = checked_row_bytes(
+            request.batch_rows,
+            request.source_state_bytes_per_row,
+            AdmissionTerm::SourceState,
+        )?;
+        let queue_bytes = checked_row_bytes(
+            request.batch_rows,
+            request.queue_bytes_per_row,
+            AdmissionTerm::QueueBuffers,
+        )?;
+        let output_buffer_bytes = checked_row_bytes(
+            request.batch_rows,
+            request.output_buffer_bytes_per_row,
+            AdmissionTerm::OutputBuffers,
+        )?;
+        let terms = AdmissionTerms {
+            os_reserve_bytes: request.os_reserve_bytes,
+            fixed_mapped_bytes: request.fixed_residency.map(|value| value.mapped_bytes),
+            fixed_resident_bytes: request.fixed_residency.map(|value| value.resident_bytes),
+            elastic_cache_bytes: request.elastic_cache_bytes,
+            replicated_weight_mapped_bytes: request.replicated_weight_residency.mapped_bytes,
+            replicated_weight_resident_bytes: request.replicated_weight_residency.resident_bytes,
+            kv_payload_bytes,
+            kv_scale_bytes,
+            kv_page_metadata_bytes,
+            activation_bytes,
+            full_logit_bytes,
+            grammar_state_bytes,
+            source_state_bytes,
+            queue_bytes,
+            output_buffer_bytes,
+            unmodeled_emergency_reserve_bytes: request.unmodeled_emergency_reserve_bytes,
+            safety_margin_bytes: request.safety_margin_bytes,
+            committed_bytes: None,
+            peak_bytes: None,
+        };
+        let (committed_bytes, peak_bytes) = complete_totals(terms)?;
+        Ok(Self {
+            request,
+            thread_inventory,
+            terms: AdmissionTerms {
+                committed_bytes,
+                peak_bytes,
+                ..terms
+            },
+        })
+    }
+
+    pub const fn request(&self) -> AdmissionRequest {
+        self.request
+    }
+
+    pub const fn thread_inventory(&self) -> ThreadInventory {
+        self.thread_inventory
+    }
+
+    pub const fn terms(&self) -> AdmissionTerms {
+        self.terms
+    }
+
+    /// Apply the request-local cap and explicit local budget.
+    pub fn local_decision(&self) -> AdmissionDecision {
+        if self.request.context_tokens > DEFAULT_CONTEXT_TOKEN_CAP {
+            return AdmissionDecision::Refused(AdmissionRejection::ContextCapExceeded {
+                requested_tokens: self.request.context_tokens,
+                cap_tokens: DEFAULT_CONTEXT_TOKEN_CAP,
+            });
+        }
+        if self.terms.fixed_resident_bytes.is_none() {
+            return AdmissionDecision::Refused(AdmissionRejection::FixedResidencyUnconfigured);
+        }
+        if self.terms.kv_page_metadata_bytes.is_none() {
+            return AdmissionDecision::Refused(AdmissionRejection::KvPageMetadataUnconfigured);
+        }
+        let Some(budget_bytes) = self.request.local_memory_budget_bytes else {
+            return AdmissionDecision::Refused(AdmissionRejection::MemoryBudgetUnconfigured);
+        };
+        let required_peak_bytes = self
+            .terms
+            .peak_bytes
+            .expect("complete terms have a peak after residency and metadata checks");
+        if required_peak_bytes > budget_bytes {
+            return AdmissionDecision::Refused(AdmissionRejection::LocalBudgetExceeded {
+                first_violated_term: self.first_peak_term_over(budget_bytes),
+                required_peak_bytes,
+                budget_bytes,
+            });
+        }
+        AdmissionDecision::Admitted
+    }
+
+    /// Apply an observed aggregate-ledger availability after the local
+    /// certificate has passed. This remains a preflight; the real reservation
+    /// below is still authoritative under racing callers.
+    pub fn aggregate_decision(
+        &self,
+        available_ledger_bytes: u64,
+        ledger_ceiling_bytes: u64,
+    ) -> AdmissionDecision {
+        if let decision @ AdmissionDecision::Refused(_) = self.local_decision() {
+            return decision;
+        }
+        let requested_ledger_bytes = self
+            .terms
+            .committed_bytes
+            .expect("locally admitted certificate has complete ledger bytes");
+        if requested_ledger_bytes > available_ledger_bytes {
+            let occupied_ledger_bytes = ledger_ceiling_bytes.saturating_sub(available_ledger_bytes);
+            return AdmissionDecision::Refused(AdmissionRejection::AggregateCapacityExceeded {
+                first_violated_term: self
+                    .first_ledger_term_over(occupied_ledger_bytes, ledger_ceiling_bytes),
+                requested_ledger_bytes,
+                available_ledger_bytes,
+                ledger_ceiling_bytes,
+            });
+        }
+        AdmissionDecision::Admitted
+    }
+
+    fn first_peak_term_over(&self, budget_bytes: u64) -> AdmissionTerm {
+        first_term_over_from(0, budget_bytes, self.peak_terms())
+            .expect("known peak must exceed the supplied local budget")
+    }
+
+    fn first_ledger_term_over(
+        &self,
+        occupied_ledger_bytes: u64,
+        ledger_ceiling_bytes: u64,
+    ) -> AdmissionTerm {
+        first_term_over_from(
+            occupied_ledger_bytes,
+            ledger_ceiling_bytes,
+            self.ledger_terms(),
+        )
+        .expect("aggregate capacity failure has a violating ledger term")
+    }
+
+    fn peak_terms(&self) -> [(AdmissionTerm, u64); 15] {
+        let terms = self.terms;
+        [
+            (AdmissionTerm::OsReserve, terms.os_reserve_bytes),
+            (
+                AdmissionTerm::FixedResidency,
+                terms.fixed_resident_bytes.unwrap_or(0),
+            ),
+            (AdmissionTerm::ElasticCache, terms.elastic_cache_bytes),
+            (
+                AdmissionTerm::ReplicatedWeightResidency,
+                terms.replicated_weight_resident_bytes,
+            ),
+            (AdmissionTerm::KvPayload, terms.kv_payload_bytes),
+            (AdmissionTerm::KvScales, terms.kv_scale_bytes),
+            (
+                AdmissionTerm::KvPageMetadata,
+                terms.kv_page_metadata_bytes.unwrap_or(0),
+            ),
+            (AdmissionTerm::ActivationRows, terms.activation_bytes),
+            (AdmissionTerm::FullLogitRows, terms.full_logit_bytes),
+            (AdmissionTerm::GrammarState, terms.grammar_state_bytes),
+            (AdmissionTerm::SourceState, terms.source_state_bytes),
+            (AdmissionTerm::QueueBuffers, terms.queue_bytes),
+            (AdmissionTerm::OutputBuffers, terms.output_buffer_bytes),
+            (
+                AdmissionTerm::UnmodeledEmergencyReserve,
+                terms.unmodeled_emergency_reserve_bytes,
+            ),
+            (AdmissionTerm::SafetyMargin, terms.safety_margin_bytes),
+        ]
+    }
+
+    fn ledger_terms(&self) -> [(AdmissionTerm, u64); 14] {
+        let terms = self.terms;
+        [
+            (
+                AdmissionTerm::FixedResidency,
+                terms.fixed_resident_bytes.unwrap_or(0),
+            ),
+            (AdmissionTerm::ElasticCache, terms.elastic_cache_bytes),
+            (
+                AdmissionTerm::ReplicatedWeightResidency,
+                terms.replicated_weight_resident_bytes,
+            ),
+            (AdmissionTerm::KvPayload, terms.kv_payload_bytes),
+            (AdmissionTerm::KvScales, terms.kv_scale_bytes),
+            (
+                AdmissionTerm::KvPageMetadata,
+                terms.kv_page_metadata_bytes.unwrap_or(0),
+            ),
+            (AdmissionTerm::ActivationRows, terms.activation_bytes),
+            (AdmissionTerm::FullLogitRows, terms.full_logit_bytes),
+            (AdmissionTerm::GrammarState, terms.grammar_state_bytes),
+            (AdmissionTerm::SourceState, terms.source_state_bytes),
+            (AdmissionTerm::QueueBuffers, terms.queue_bytes),
+            (AdmissionTerm::OutputBuffers, terms.output_buffer_bytes),
+            (
+                AdmissionTerm::UnmodeledEmergencyReserve,
+                terms.unmodeled_emergency_reserve_bytes,
+            ),
+            (AdmissionTerm::SafetyMargin, terms.safety_margin_bytes),
+        ]
+    }
+
+    fn charges(&self) -> AdmissionCharges {
+        let terms = self.terms;
+        AdmissionCharges {
+            weights: terms
+                .fixed_resident_bytes
+                .unwrap_or(0)
+                .checked_add(terms.replicated_weight_resident_bytes)
+                .expect("certificate totals prevent weight charge overflow"),
+            prefix_cache: terms.elastic_cache_bytes,
+            kv_pages: terms
+                .kv_payload_bytes
+                .checked_add(terms.kv_scale_bytes)
+                .and_then(|total| total.checked_add(terms.kv_page_metadata_bytes.unwrap_or(0)))
+                .expect("certificate totals prevent KV charge overflow"),
+            activation_scratch: terms.activation_bytes,
+            logit_scratch: terms.full_logit_bytes,
+            grammar_cache: terms.grammar_state_bytes,
+            job_buffers: terms
+                .source_state_bytes
+                .checked_add(terms.queue_bytes)
+                .and_then(|total| total.checked_add(terms.output_buffer_bytes))
+                .expect("certificate totals prevent job-buffer charge overflow"),
+            admission_reserve: terms
+                .unmodeled_emergency_reserve_bytes
+                .checked_add(terms.safety_margin_bytes)
+                .expect("certificate totals prevent reserve charge overflow"),
+        }
+    }
+}
+
+fn checked_row_bytes(
+    rows: u64,
+    bytes_per_row: u64,
+    term: AdmissionTerm,
+) -> Result<u64, AdmissionBuildError> {
+    rows.checked_mul(bytes_per_row)
+        .ok_or(AdmissionBuildError::ArithmeticOverflow { term })
+}
+
+fn complete_totals(
+    terms: AdmissionTerms,
+) -> Result<(Option<u64>, Option<u64>), AdmissionBuildError> {
+    let (Some(fixed_resident_bytes), Some(kv_page_metadata_bytes)) =
+        (terms.fixed_resident_bytes, terms.kv_page_metadata_bytes)
+    else {
+        return Ok((None, None));
+    };
+    let ledger_terms = [
+        (AdmissionTerm::FixedResidency, fixed_resident_bytes),
+        (AdmissionTerm::ElasticCache, terms.elastic_cache_bytes),
+        (
+            AdmissionTerm::ReplicatedWeightResidency,
+            terms.replicated_weight_resident_bytes,
+        ),
+        (AdmissionTerm::KvPayload, terms.kv_payload_bytes),
+        (AdmissionTerm::KvScales, terms.kv_scale_bytes),
+        (AdmissionTerm::KvPageMetadata, kv_page_metadata_bytes),
+        (AdmissionTerm::ActivationRows, terms.activation_bytes),
+        (AdmissionTerm::FullLogitRows, terms.full_logit_bytes),
+        (AdmissionTerm::GrammarState, terms.grammar_state_bytes),
+        (AdmissionTerm::SourceState, terms.source_state_bytes),
+        (AdmissionTerm::QueueBuffers, terms.queue_bytes),
+        (AdmissionTerm::OutputBuffers, terms.output_buffer_bytes),
+        (
+            AdmissionTerm::UnmodeledEmergencyReserve,
+            terms.unmodeled_emergency_reserve_bytes,
+        ),
+        (AdmissionTerm::SafetyMargin, terms.safety_margin_bytes),
+    ];
+    let mut committed_bytes = 0_u64;
+    for (term, bytes) in ledger_terms {
+        committed_bytes = committed_bytes
+            .checked_add(bytes)
+            .ok_or(AdmissionBuildError::ArithmeticOverflow { term })?;
+    }
+    let peak_bytes = committed_bytes.checked_add(terms.os_reserve_bytes).ok_or(
+        AdmissionBuildError::ArithmeticOverflow {
+            term: AdmissionTerm::OsReserve,
+        },
+    )?;
+    Ok((Some(committed_bytes), Some(peak_bytes)))
+}
+
+fn first_term_over_from<const N: usize>(
+    start_bytes: u64,
+    ceiling_bytes: u64,
+    terms: [(AdmissionTerm, u64); N],
+) -> Option<AdmissionTerm> {
+    let mut total = start_bytes;
+    for (term, bytes) in terms {
+        total = total.checked_add(bytes)?;
+        if total > ceiling_bytes {
+            return Some(term);
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AdmissionCharges {
+    weights: u64,
+    prefix_cache: u64,
+    kv_pages: u64,
+    activation_scratch: u64,
+    logit_scratch: u64,
+    grammar_cache: u64,
+    job_buffers: u64,
+    admission_reserve: u64,
+}
+
+/// Failure while turning a preflight certificate into owned ledger
+/// obligations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionError {
+    Refused(AdmissionRejection),
+    Reservation(ReservationError),
+}
+
+impl fmt::Display for AdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Refused(error) => error.fmt(formatter),
+            Self::Reservation(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for AdmissionError {}
+
+/// All uncommitted ledger obligations for one admission certificate. Call
+/// [`Self::commit`] only after the caller has acquired every represented
+/// resource; call [`Self::abort`] on cancellation or allocation failure.
+#[derive(Debug)]
+pub struct AdmissionReservation {
+    weights: Option<MemoryReservation>,
+    prefix_cache: Option<MemoryReservation>,
+    kv_pages: Option<MemoryReservation>,
+    activation_scratch: Option<MemoryReservation>,
+    logit_scratch: Option<MemoryReservation>,
+    grammar_cache: Option<MemoryReservation>,
+    job_buffers: Option<MemoryReservation>,
+    admission_reserve: Option<MemoryReservation>,
+}
+
+impl AdmissionReservation {
+    fn empty() -> Self {
+        Self {
+            weights: None,
+            prefix_cache: None,
+            kv_pages: None,
+            activation_scratch: None,
+            logit_scratch: None,
+            grammar_cache: None,
+            job_buffers: None,
+            admission_reserve: None,
+        }
+    }
+
+    /// Restore every reservation exactly, including when cancellation arrives
+    /// after only a prefix of the certificate has been allocated.
+    pub fn abort(mut self) -> Result<(), ReservationError> {
+        self.abort_all()
+    }
+
+    /// Commit all owned obligations. The returned guard holds every ledger
+    /// charge until it is released or dropped after request drain.
+    pub fn commit(mut self) -> Result<CommittedAdmission, AdmissionError> {
+        let mut committed = CommittedAdmission::empty();
+        for (reservation, target) in [
+            (&mut self.weights, &mut committed.weights),
+            (&mut self.prefix_cache, &mut committed.prefix_cache),
+            (&mut self.kv_pages, &mut committed.kv_pages),
+            (
+                &mut self.activation_scratch,
+                &mut committed.activation_scratch,
+            ),
+            (&mut self.logit_scratch, &mut committed.logit_scratch),
+            (&mut self.grammar_cache, &mut committed.grammar_cache),
+            (&mut self.job_buffers, &mut committed.job_buffers),
+            (
+                &mut self.admission_reserve,
+                &mut committed.admission_reserve,
+            ),
+        ] {
+            if let Some(reservation) = reservation.take() {
+                match reservation.commit() {
+                    Ok(memory) => *target = Some(memory),
+                    Err(error) => {
+                        committed.release();
+                        let _ = self.abort_all();
+                        return Err(AdmissionError::Reservation(error));
+                    }
+                }
+            }
+        }
+        Ok(committed)
+    }
+
+    fn abort_all(&mut self) -> Result<(), ReservationError> {
+        let mut first_error = None;
+        for reservation in [
+            &mut self.weights,
+            &mut self.prefix_cache,
+            &mut self.kv_pages,
+            &mut self.activation_scratch,
+            &mut self.logit_scratch,
+            &mut self.grammar_cache,
+            &mut self.job_buffers,
+            &mut self.admission_reserve,
+        ] {
+            if let Some(reservation) = reservation.take()
+                && let Err(error) = reservation.abort()
+            {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+/// The committed counterpart to [`AdmissionReservation`]. Its fields are
+/// private so a request cannot release one certificate term while retaining
+/// another and silently falsify its capacity claim.
+#[derive(Debug)]
+pub struct CommittedAdmission {
+    weights: Option<CommittedMemory>,
+    prefix_cache: Option<CommittedMemory>,
+    kv_pages: Option<CommittedMemory>,
+    activation_scratch: Option<CommittedMemory>,
+    logit_scratch: Option<CommittedMemory>,
+    grammar_cache: Option<CommittedMemory>,
+    job_buffers: Option<CommittedMemory>,
+    admission_reserve: Option<CommittedMemory>,
+}
+
+impl CommittedAdmission {
+    fn empty() -> Self {
+        Self {
+            weights: None,
+            prefix_cache: None,
+            kv_pages: None,
+            activation_scratch: None,
+            logit_scratch: None,
+            grammar_cache: None,
+            job_buffers: None,
+            admission_reserve: None,
+        }
+    }
+
+    /// Release every committed certificate term before normal request drop.
+    pub fn release(mut self) {
+        for memory in [
+            &mut self.weights,
+            &mut self.prefix_cache,
+            &mut self.kv_pages,
+            &mut self.activation_scratch,
+            &mut self.logit_scratch,
+            &mut self.grammar_cache,
+            &mut self.job_buffers,
+            &mut self.admission_reserve,
+        ] {
+            if let Some(memory) = memory.take() {
+                memory.release();
+            }
         }
     }
 }
@@ -1351,6 +2317,267 @@ impl<T> CapacityOneReceiver<T> {
 }
 
 #[cfg(feature = "asupersync-runtime")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EntryGateState {
+    Waiting,
+    Released,
+    Aborted,
+}
+
+/// A count-independent entry gate: if a foundation spawn refusal occurs while
+/// formation is being created, the coordinator can still wake every already
+/// formed worker into the non-fallible abort path before the scoped join.
+#[cfg(feature = "asupersync-runtime")]
+#[derive(Debug)]
+struct EntryGate {
+    state: Mutex<EntryGateState>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(feature = "asupersync-runtime")]
+impl EntryGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(EntryGateState::Waiting),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn wait(&self) -> bool {
+        let mut state = lock_unpoisoned(&self.state);
+        while *state == EntryGateState::Waiting {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *state == EntryGateState::Released
+    }
+
+    fn release(&self) {
+        let mut state = lock_unpoisoned(&self.state);
+        if *state == EntryGateState::Waiting {
+            *state = EntryGateState::Released;
+            self.changed.notify_all();
+        }
+    }
+
+    fn abort(&self) {
+        let mut state = lock_unpoisoned(&self.state);
+        if *state == EntryGateState::Waiting {
+            *state = EntryGateState::Aborted;
+            self.changed.notify_all();
+        }
+    }
+}
+
+/// Typed execution result for the feature-gated native CPU team seam.
+///
+/// The outer task handle still preserves asupersync's cancellation/panic join
+/// outcome. This inner result records the scoped CPU outcome without flattening
+/// it into a generic application error.
+#[cfg(feature = "asupersync-runtime")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SealedTeamRunError {
+    Protocol(SealedTeamError),
+    ScopeCancelled { detail: String },
+    ScopePanicked { worker_ordinal: usize, detail: String },
+    ScopeWorkerCapExceeded { cap: usize },
+}
+
+#[cfg(feature = "asupersync-runtime")]
+impl fmt::Display for SealedTeamRunError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Protocol(error) => error.fmt(formatter),
+            Self::ScopeCancelled { detail } => {
+                write!(formatter, "sealed scoped-CPU team cancelled: {detail}")
+            }
+            Self::ScopePanicked {
+                worker_ordinal,
+                detail,
+            } => write!(
+                formatter,
+                "sealed scoped-CPU worker {worker_ordinal} panicked: {detail}"
+            ),
+            Self::ScopeWorkerCapExceeded { cap } => {
+                write!(formatter, "sealed scoped-CPU team exceeded child cap {cap}")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "asupersync-runtime")]
+impl std::error::Error for SealedTeamRunError {}
+
+/// Refusal before the one permitted `spawn_blocking` crossing can be admitted.
+#[cfg(feature = "asupersync-runtime")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SealedTeamLaunchError {
+    MissingRequestContext,
+    SpawnBlocking { detail: String },
+}
+
+#[cfg(feature = "asupersync-runtime")]
+impl fmt::Display for SealedTeamLaunchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingRequestContext => formatter.write_str(
+                "sealed scoped-CPU team requires an asupersync request context",
+            ),
+            Self::SpawnBlocking { detail } => {
+                write!(formatter, "sealed scoped-CPU team spawn_blocking refused: {detail}")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "asupersync-runtime")]
+impl std::error::Error for SealedTeamLaunchError {}
+
+#[cfg(feature = "asupersync-runtime")]
+impl SealedCpuTeam {
+    /// Reconcile the model only after `Cx::scoped_cpu` has returned, which is
+    /// the foundation's join guarantee for every child, including panicking or
+    /// cancellation-observing children that could not report their own exit.
+    fn reconcile_after_scoped_join(
+        &self,
+        default_reason: TeamDrainReason,
+    ) -> Result<SealedTeamSnapshot, SealedTeamError> {
+        {
+            let mut state = lock_unpoisoned(&self.state);
+            if state.phase == SealedTeamPhase::Joined {
+                return Ok(snapshot_from_sealed_team_state(&state));
+            }
+            state.phase = SealedTeamPhase::Draining;
+            state.drain_reason.get_or_insert(default_reason);
+            for worker_state in state.workers.values_mut() {
+                *worker_state = SealedTeamWorkerState::Exited;
+            }
+        }
+        self.join()?;
+        Ok(self.snapshot())
+    }
+}
+
+#[cfg(feature = "asupersync-runtime")]
+fn snapshot_from_sealed_team_state(state: &SealedTeamState) -> SealedTeamSnapshot {
+    let formed_children = state.workers.len();
+    let running_children = state
+        .workers
+        .values()
+        .filter(|worker| **worker == SealedTeamWorkerState::Running)
+        .count();
+    let exited_children = state
+        .workers
+        .values()
+        .filter(|worker| **worker == SealedTeamWorkerState::Exited)
+        .count();
+    SealedTeamSnapshot {
+        phase: state.phase,
+        expected_children: state.expected_children,
+        formed_children,
+        running_children,
+        exited_children,
+        drain_reason: state.drain_reason,
+    }
+}
+
+#[cfg(feature = "asupersync-runtime")]
+fn run_sealed_cpu_checkpoint_team(
+    blocking_cx: &asupersync::cx::Cx,
+    child_count: usize,
+) -> Result<SealedTeamSnapshot, SealedTeamRunError> {
+    use asupersync::cx::ScopedCpuError;
+
+    let team = Arc::new(SealedCpuTeam::new(child_count));
+    let gate = Arc::new(EntryGate::new());
+    let scope_result = blocking_cx.scoped_cpu(child_count, |scope| {
+        let mut workers = Vec::with_capacity(child_count);
+        for _ in 0..child_count {
+            workers.push(team.form_worker().map_err(SealedTeamRunError::Protocol)?);
+        }
+        for worker in workers {
+            let worker_team = Arc::clone(&team);
+            let worker_gate = Arc::clone(&gate);
+            if let Err(error) = scope.spawn(move |cpu_cx| {
+                if !worker_gate.wait() {
+                    return;
+                }
+                if worker_team.worker_started(worker).is_err() {
+                    return;
+                }
+                if cpu_cx.checkpoint().is_err() {
+                    worker_team.begin_drain(TeamDrainReason::Cancelled);
+                }
+                if worker_team.snapshot().phase == SealedTeamPhase::Running
+                    && cpu_cx.checkpoint().is_err()
+                {
+                    worker_team.begin_drain(TeamDrainReason::Cancelled);
+                }
+                let _ = worker_team.worker_exited(worker);
+            }) {
+                team.begin_drain(TeamDrainReason::CoordinatorPanicked);
+                gate.abort();
+                return Err(match error {
+                    ScopedCpuError::WorkerCapExceeded { cap } => {
+                        SealedTeamRunError::ScopeWorkerCapExceeded { cap }
+                    }
+                    ScopedCpuError::Cancelled(error) => SealedTeamRunError::ScopeCancelled {
+                        detail: error.to_string(),
+                    },
+                    ScopedCpuError::ChildPanicked { child, message } => {
+                        SealedTeamRunError::ScopePanicked {
+                            worker_ordinal: child,
+                            detail: message,
+                        }
+                    }
+                });
+            }
+        }
+        if let Err(error) = team.seal() {
+            team.begin_drain(TeamDrainReason::CoordinatorPanicked);
+            gate.abort();
+            return Err(SealedTeamRunError::Protocol(error));
+        }
+        if let Err(error) = team.release_workers() {
+            team.begin_drain(TeamDrainReason::CoordinatorPanicked);
+            gate.abort();
+            return Err(SealedTeamRunError::Protocol(error));
+        }
+        gate.release();
+        Ok(())
+    });
+
+    match scope_result {
+        Ok(Ok(())) => team
+            .reconcile_after_scoped_join(TeamDrainReason::Completed)
+            .map_err(SealedTeamRunError::Protocol),
+        Ok(Err(error)) => {
+            let _ = team.reconcile_after_scoped_join(TeamDrainReason::CoordinatorPanicked);
+            Err(error)
+        }
+        Err(ScopedCpuError::Cancelled(error)) => {
+            let _ = team.reconcile_after_scoped_join(TeamDrainReason::Cancelled);
+            Err(SealedTeamRunError::ScopeCancelled {
+                detail: error.to_string(),
+            })
+        }
+        Err(ScopedCpuError::ChildPanicked { child, message }) => {
+            let _ = team.reconcile_after_scoped_join(TeamDrainReason::WorkerPanicked);
+            Err(SealedTeamRunError::ScopePanicked {
+                worker_ordinal: child,
+                detail: message,
+            })
+        }
+        Err(ScopedCpuError::WorkerCapExceeded { cap }) => {
+            let _ = team.reconcile_after_scoped_join(TeamDrainReason::CoordinatorPanicked);
+            Err(SealedTeamRunError::ScopeWorkerCapExceeded { cap })
+        }
+    }
+}
+
+#[cfg(feature = "asupersync-runtime")]
 struct RuntimeHost {
     runtime: asupersync::runtime::Runtime,
     blocking_pool: asupersync::runtime::blocking_pool::BlockingPoolHandle,
@@ -1519,6 +2746,98 @@ impl EngineResources {
         self.memory.snapshot()
     }
 
+    /// Read remaining aggregate allocation capacity without building the
+    /// diagnostic snapshot map. This is safe for an allocation-free plan
+    /// preview, but callers must still reserve because other engines can race.
+    pub fn available_memory_bytes(&self) -> Result<u64, ReservationError> {
+        self.memory.available_bytes()
+    }
+
+    /// Evaluate a complete certificate against the current process ledger
+    /// without reserving or allocating. A subsequent reservation is required
+    /// before any request resource becomes visible.
+    pub fn preflight_admission(
+        &self,
+        certificate: &AdmissionCertificate,
+    ) -> Result<AdmissionDecision, ReservationError> {
+        Ok(certificate.aggregate_decision(
+            self.available_memory_bytes()?,
+            self.config.memory_ceiling_bytes,
+        ))
+    }
+
+    fn reserve_admission(
+        &self,
+        engine_lease_id: u64,
+        certificate: &AdmissionCertificate,
+    ) -> Result<AdmissionReservation, AdmissionError> {
+        match self
+            .preflight_admission(certificate)
+            .map_err(AdmissionError::Reservation)?
+        {
+            AdmissionDecision::Admitted => {}
+            AdmissionDecision::Refused(rejection) => {
+                return Err(AdmissionError::Refused(rejection));
+            }
+        }
+        let charges = certificate.charges();
+        let mut reservation = AdmissionReservation::empty();
+        for (slot, memory_class, bytes) in [
+            (
+                &mut reservation.weights,
+                MemoryClass::Weights,
+                charges.weights,
+            ),
+            (
+                &mut reservation.prefix_cache,
+                MemoryClass::PrefixCache,
+                charges.prefix_cache,
+            ),
+            (
+                &mut reservation.kv_pages,
+                MemoryClass::KvPages,
+                charges.kv_pages,
+            ),
+            (
+                &mut reservation.activation_scratch,
+                MemoryClass::ActivationScratch,
+                charges.activation_scratch,
+            ),
+            (
+                &mut reservation.logit_scratch,
+                MemoryClass::LogitScratch,
+                charges.logit_scratch,
+            ),
+            (
+                &mut reservation.grammar_cache,
+                MemoryClass::GrammarCache,
+                charges.grammar_cache,
+            ),
+            (
+                &mut reservation.job_buffers,
+                MemoryClass::JobBuffers,
+                charges.job_buffers,
+            ),
+            (
+                &mut reservation.admission_reserve,
+                MemoryClass::AdmissionReserve,
+                charges.admission_reserve,
+            ),
+        ] {
+            if bytes == 0 {
+                continue;
+            }
+            match self.memory.reserve(engine_lease_id, memory_class, bytes) {
+                Ok(memory) => *slot = Some(memory),
+                Err(error) => {
+                    let _ = reservation.abort_all();
+                    return Err(AdmissionError::Reservation(error));
+                }
+            }
+        }
+        Ok(reservation)
+    }
+
     /// Acquire one engine lease. An engine cannot own an independent memory or
     /// runtime domain.
     pub fn acquire_lease(self: &Arc<Self>) -> EngineLease {
@@ -1633,6 +2952,16 @@ impl EngineLease {
             .reserve(self.lease_id, memory_class, bytes)
     }
 
+    /// Turn a complete local and aggregate admission certificate into owned
+    /// two-phase process-ledger obligations. The caller must commit only after
+    /// allocation succeeds, or abort on cancellation/error before allocation.
+    pub fn reserve_admission(
+        &self,
+        certificate: &AdmissionCertificate,
+    ) -> Result<AdmissionReservation, AdmissionError> {
+        self.resources.reserve_admission(self.lease_id, certificate)
+    }
+
     pub fn resources(&self) -> &Arc<EngineResources> {
         &self.resources
     }
@@ -1645,6 +2974,38 @@ impl EngineLease {
     /// process resources; only the closure's actual completion drops the guard.
     pub fn register_blocking_closure(&self) -> BlockingClosureGuard {
         self.resources.register_blocking_closure(self.lease_id)
+    }
+
+    /// Launch the one permitted blocking closure for a bounded sealed CPU
+    /// checkpoint team. The returned task remains owned by the request region;
+    /// its physical closure retains the completion guard until `scoped_cpu`
+    /// has joined every fixed child and the closure returns.
+    ///
+    /// This is the foundation seam, not a scheduler shortcut: callers supply
+    /// the already-admitted child count, and later stage schedulers attach
+    /// their capacity-one command/reply loops without creating another team.
+    #[cfg(feature = "asupersync-runtime")]
+    pub fn spawn_sealed_cpu_checkpoint_team(
+        &self,
+        child_count: usize,
+    ) -> Result<
+        asupersync::runtime::TaskHandle<Result<SealedTeamSnapshot, SealedTeamRunError>>,
+        SealedTeamLaunchError,
+    > {
+        use asupersync::cx::Cx;
+
+        let completion_guard = self.register_blocking_closure();
+        self.resources.runtime().block_on(async move {
+            let request_cx = Cx::current().ok_or(SealedTeamLaunchError::MissingRequestContext)?;
+            request_cx
+                .spawn_blocking(move |blocking_cx| {
+                    let _completion_guard = completion_guard;
+                    run_sealed_cpu_checkpoint_team(&blocking_cx, child_count)
+                })
+                .map_err(|error| SealedTeamLaunchError::SpawnBlocking {
+                    detail: error.to_string(),
+                })
+        })
     }
 }
 
@@ -2127,6 +3488,195 @@ mod tests {
                 wrapper_cancelled_closures: 0,
             },
             "only actual completion clears the outstanding drain entry"
+        );
+    }
+
+    fn admission_config(memory_ceiling_bytes: u64) -> ResourceHostConfig {
+        ResourceHostConfig::new(
+            RuntimePreset::LowLatency,
+            4,
+            2,
+            3,
+            1,
+            32,
+            memory_ceiling_bytes,
+            LeakResponsePolicy::RecordAndEscalate,
+        )
+        .expect("admission test config is valid")
+    }
+
+    fn complete_admission_request(
+        context_tokens: u64,
+        batch_rows: u64,
+        budget_bytes: u64,
+    ) -> AdmissionRequest {
+        AdmissionRequest::decode(context_tokens, batch_rows, KvCacheQuantization::Bf16)
+            .with_local_memory_budget(budget_bytes)
+            .with_fixed_residency(
+                ResidencyAccounting::new(100, 100).expect("resident bytes fit mapping"),
+            )
+            .with_kv_page_metadata_per_token(0)
+            .with_reserves(0, 0)
+    }
+
+    #[test]
+    fn certificate_computes_every_term_and_thread_inventory_independently() {
+        let host = admission_config(u64::MAX);
+        let request = AdmissionRequest::decode(2, 3, KvCacheQuantization::Bf16)
+            .with_local_memory_budget(u64::MAX)
+            .with_os_reserve(11)
+            .with_fixed_residency(
+                ResidencyAccounting::new(1_000, 800).expect("resident bytes fit mapping"),
+            )
+            .with_elastic_cache(13)
+            .with_replicated_weight_residency(
+                ResidencyAccounting::new(20, 19).expect("resident bytes fit mapping"),
+            )
+            .with_kv_page_metadata_per_token(7)
+            .with_elastic_rows(23, 29, 31, 37, 41)
+            .with_reserves(43, 47);
+        let certificate = AdmissionCertificate::build(
+            request,
+            host.thread_inventory().expect("thread inventory fits"),
+        )
+        .expect("term arithmetic fits");
+        let terms = certificate.terms();
+        assert_eq!(terms.fixed_mapped_bytes, Some(1_000));
+        assert_eq!(terms.fixed_resident_bytes, Some(800));
+        assert_eq!(terms.elastic_cache_bytes, 13);
+        assert_eq!(terms.replicated_weight_mapped_bytes, 20);
+        assert_eq!(terms.replicated_weight_resident_bytes, 19);
+        assert_eq!(terms.kv_payload_bytes, 6 * BF16_KV_BYTES_PER_TOKEN);
+        assert_eq!(terms.kv_scale_bytes, 0);
+        assert_eq!(terms.kv_page_metadata_bytes, Some(42));
+        assert_eq!(terms.activation_bytes, 3 * 23);
+        assert_eq!(terms.full_logit_bytes, 3 * FULL_F32_LOGIT_ROW_BYTES);
+        assert_eq!(terms.grammar_state_bytes, 3 * 29);
+        assert_eq!(terms.source_state_bytes, 3 * 31);
+        assert_eq!(terms.queue_bytes, 3 * 37);
+        assert_eq!(terms.output_buffer_bytes, 3 * 41);
+        assert_eq!(terms.unmodeled_emergency_reserve_bytes, 43);
+        assert_eq!(terms.safety_margin_bytes, 47);
+        assert_eq!(terms.os_reserve_bytes, 11);
+        assert_eq!(certificate.thread_inventory().runtime_workers, 4);
+        assert_eq!(certificate.thread_inventory().blocking_coordinators, 2);
+        assert_eq!(
+            certificate
+                .thread_inventory()
+                .scoped_cpu_children_per_coordinator,
+            3
+        );
+        assert_eq!(certificate.thread_inventory().helper_threads, 1);
+        assert_eq!(certificate.thread_inventory().total_runnable_threads, 13);
+        assert_eq!(certificate.local_decision(), AdmissionDecision::Admitted);
+    }
+
+    #[test]
+    fn certificate_keeps_the_8192_and_64_row_kv_numbers_exact() {
+        let inventory = admission_config(u64::MAX)
+            .thread_inventory()
+            .expect("thread inventory fits");
+        let one = AdmissionCertificate::build(
+            complete_admission_request(DEFAULT_CONTEXT_TOKEN_CAP, 1, u64::MAX),
+            inventory,
+        )
+        .expect("8192-row certificate fits arithmetic");
+        assert_eq!(one.terms().kv_payload_bytes, 1_476_395_008);
+        assert_eq!(one.terms().kv_payload_bytes, 1_408 * 1024 * 1024);
+
+        let sixty_four = AdmissionCertificate::build(
+            complete_admission_request(DEFAULT_CONTEXT_TOKEN_CAP, 64, u64::MAX),
+            inventory,
+        )
+        .expect("64-row certificate fits arithmetic");
+        assert_eq!(sixty_four.terms().kv_payload_bytes, 94_489_280_512);
+        assert_eq!(sixty_four.terms().kv_payload_bytes, 88 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn certificate_abort_restores_the_exact_process_ledger_balance() {
+        let config = admission_config(1_000_000);
+        let inventory = config.thread_inventory().expect("thread inventory fits");
+        let resources = Arc::new(EngineResources::new_for_test(config, inventory));
+        let certificate = AdmissionCertificate::build(
+            complete_admission_request(1, 1, 1_000_000),
+            resources.thread_inventory(),
+        )
+        .expect("certificate fits arithmetic");
+        let expected = certificate
+            .terms()
+            .committed_bytes
+            .expect("complete certificate has ledger bytes");
+        let lease = resources.acquire_lease();
+        let reservation = lease
+            .reserve_admission(&certificate)
+            .expect("complete certificate reserves before allocation");
+        assert_eq!(resources.memory_snapshot().reserved_bytes, expected);
+        reservation
+            .abort()
+            .expect("cancellation restores every two-phase obligation");
+        let snapshot = resources.memory_snapshot();
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.committed_bytes, 0);
+        assert_eq!(snapshot.outstanding_obligations, 0);
+    }
+
+    #[test]
+    fn aggregate_multi_engine_admission_cannot_double_promise_process_memory() {
+        let config = admission_config(1_000_000);
+        let inventory = config.thread_inventory().expect("thread inventory fits");
+        let resources = Arc::new(EngineResources::new_for_test(config, inventory));
+        let certificate = AdmissionCertificate::build(
+            complete_admission_request(1, 1, 1_000_000),
+            resources.thread_inventory(),
+        )
+        .expect("certificate fits arithmetic");
+        let first_engine = resources.acquire_lease();
+        let second_engine = resources.acquire_lease();
+        let committed = first_engine
+            .reserve_admission(&certificate)
+            .expect("first engine reserves the aggregate capacity")
+            .commit()
+            .expect("first engine commits after allocation");
+        assert!(matches!(
+            second_engine.reserve_admission(&certificate),
+            Err(AdmissionError::Refused(
+                AdmissionRejection::AggregateCapacityExceeded { .. }
+            ))
+        ));
+        committed.release();
+        second_engine
+            .reserve_admission(&certificate)
+            .expect("release makes the same process capacity available again")
+            .abort()
+            .expect("second engine cancellation restores the aggregate ledger");
+        let snapshot = resources.memory_snapshot();
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.committed_bytes, 0);
+    }
+
+    #[test]
+    fn certificate_refuses_missing_authority_and_checked_overflow_without_wrapping() {
+        let inventory = admission_config(u64::MAX)
+            .thread_inventory()
+            .expect("thread inventory fits");
+        let incomplete = AdmissionCertificate::build(
+            AdmissionRequest::decode(1, 1, KvCacheQuantization::Bf16),
+            inventory,
+        )
+        .expect("known partial terms fit arithmetic");
+        assert_eq!(
+            incomplete.local_decision(),
+            AdmissionDecision::Refused(AdmissionRejection::FixedResidencyUnconfigured)
+        );
+        assert_eq!(
+            AdmissionCertificate::build(
+                AdmissionRequest::decode(u64::MAX, 2, KvCacheQuantization::Bf16),
+                inventory,
+            ),
+            Err(AdmissionBuildError::ArithmeticOverflow {
+                term: AdmissionTerm::KvPayload
+            })
         );
     }
 }
