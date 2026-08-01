@@ -507,8 +507,9 @@ mod tests {
             .collect::<Vec<_>>();
 
         for sequence_len in [1, 2, 15, 16, 17, 63, 64, 65] {
-            let observed = eager_gqa_attention_from_cache_prefix(&query, &cache, slot, sequence_len)
-                .expect("valid causal cache prefix");
+            let observed =
+                eager_gqa_attention_from_cache_prefix(&query, &cache, slot, sequence_len)
+                    .expect("valid causal cache prefix");
             for query_head in 0..QUERY_HEAD_COUNT {
                 let kv_head = kv_head_for_query(query_head).expect("all 48 query heads map");
                 let kv_start = kv_head * NANBEIGE_HEAD_DIM;
@@ -585,6 +586,55 @@ mod tests {
                 expected: 2,
                 actual: 1,
             })
+        );
+    }
+
+    #[test]
+    fn online_softmax_matches_two_pass_nonfinite_and_signed_zero_behavior() {
+        let two_pass_positive_infinity = softmax_f32_cast_back(&[f32::INFINITY, 0.0])
+            .expect("nonempty two-pass positive-infinity vector");
+        assert!(
+            two_pass_positive_infinity
+                .iter()
+                .all(|value| value.to_f32().is_nan())
+        );
+        let mut online_positive_infinity = OnlineSoftmaxF32::new(1);
+        online_positive_infinity
+            .observe_bf16_bits(f32::INFINITY, &[bf16_bits(2.0)])
+            .expect("positive-infinity score is representable");
+        online_positive_infinity
+            .observe_bf16_bits(0.0, &[bf16_bits(4.0)])
+            .expect("finite follower is representable");
+        assert!(
+            online_positive_infinity
+                .finish()
+                .expect("nonempty online positive-infinity reduction")[0]
+                .is_nan()
+        );
+
+        let two_pass_negative_infinity = softmax_f32_cast_back(&[f32::NEG_INFINITY])
+            .expect("nonempty two-pass negative-infinity vector");
+        assert!(two_pass_negative_infinity[0].to_f32().is_nan());
+        let mut online_negative_infinity = OnlineSoftmaxF32::new(1);
+        online_negative_infinity
+            .observe_bf16_bits(f32::NEG_INFINITY, &[bf16_bits(2.0)])
+            .expect("negative-infinity score is representable");
+        assert!(
+            online_negative_infinity
+                .finish()
+                .expect("nonempty online negative-infinity reduction")[0]
+                .is_nan()
+        );
+
+        let mut online_negative_zero = OnlineSoftmaxF32::new(1);
+        online_negative_zero
+            .observe_bf16_bits(-0.0, &[bf16_bits(5.0)])
+            .expect("negative-zero score is representable");
+        assert_eq!(
+            online_negative_zero
+                .finish()
+                .expect("nonempty online negative-zero reduction"),
+            vec![5.0],
         );
     }
 
