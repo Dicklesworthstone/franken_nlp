@@ -170,6 +170,8 @@ fn page_admission_refuses_atomically_before_any_slab_is_assigned() {
     ));
     assert_eq!(cache.pool_stats().live_slab_count, 0);
     assert_eq!(cache.pool_stats().live_payload_bytes, 0);
+    assert_eq!(cache.pool_stats().allocation_events, 0);
+    assert_eq!(cache.pool_stats().retained_reference_count, Some(0));
 }
 
 #[test]

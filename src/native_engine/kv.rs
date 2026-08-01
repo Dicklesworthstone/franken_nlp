@@ -802,6 +802,31 @@ impl KvSlabPool {
         Ok(())
     }
 
+    /// Proves an entire multi-slab acquisition can update accounting first.
+    ///
+    /// Callers use this before a logical page allocation or COW replacement,
+    /// so an accounting overflow cannot leave a partially assigned page whose
+    /// slabs are not yet reachable from a page table.
+    fn require_acquire_capacity(&self, requested: usize) -> Result<(), KvSlabError> {
+        self.require_free(requested)?;
+        let requested_payload_bytes = requested
+            .checked_mul(self.slab_payload_bytes)
+            .ok_or(KvSlabError::AdmissionArithmeticOverflow {
+                positions: requested,
+            })?;
+        self.live_payload_bytes
+            .checked_add(requested_payload_bytes)
+            .ok_or(KvSlabError::AdmissionArithmeticOverflow {
+                positions: self.live_slab_count,
+            })?;
+        self.allocation_events
+            .checked_add(requested)
+            .ok_or(KvSlabError::AdmissionArithmeticOverflow {
+                positions: self.allocation_events,
+            })?;
+        Ok(())
+    }
+
     fn slab(&self, slab_id: KvSlabId) -> Result<&KvPhysicalSlab, KvSlabError> {
         self.slabs.get(slab_id.0).ok_or(KvSlabError::UnknownSlab {
             slab_id: slab_id.0,
@@ -833,7 +858,7 @@ impl KvSlabPool {
                 loop_layer_count: key.loop_layer_count,
             });
         }
-        self.require_free(1)?;
+        self.require_acquire_capacity(1)?;
         let live_payload_bytes = self
             .live_payload_bytes
             .checked_add(self.slab_payload_bytes)
@@ -1315,7 +1340,7 @@ impl KvSlabCache {
             })?;
         let mut slabs = [[KvSlabId(usize::MAX); 2]; KV_SLOT_COUNT];
         let mut pool = self.pool.borrow_mut();
-        pool.require_free(KV_SLABS_PER_LOGICAL_PAGE)?;
+        pool.require_acquire_capacity(KV_SLABS_PER_LOGICAL_PAGE)?;
         for slot in 0..KV_SLOT_COUNT {
             for vector in [KvVector::Key, KvVector::Value] {
                 let key = KvSlabKey::new(
@@ -1351,7 +1376,7 @@ impl KvSlabCache {
         if !needs_copy {
             return Ok(());
         }
-        pool.require_free(KV_SLABS_PER_LOGICAL_PAGE)?;
+        pool.require_acquire_capacity(KV_SLABS_PER_LOGICAL_PAGE)?;
         let mut replacement = old_slabs;
         for slot in 0..KV_SLOT_COUNT {
             for vector in [KvVector::Key, KvVector::Value] {
