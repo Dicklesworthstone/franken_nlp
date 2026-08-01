@@ -19,6 +19,23 @@ The required retained DSR terminal receipt schema is:
 DSR_CHECKPOINT source_sha=<40-lower-hex> source_tree=clean production_graph=production entrypoint=scripts/check.sh dsr_run_id=<stable-id> result=PASS|FAIL
 ```
 
+At the current implementation snapshot, that receipt cannot yet be minted:
+
+- `Cargo.toml` does not define the named `production` feature;
+- `scripts/check.sh` invokes Cargo on the default feature graph rather than the
+  named release graph;
+- the release-graph dependency-policy script has not landed, so the check
+  entrypoint cannot yet reject Rayon or multiple `asupersync` sources in the
+  selected product closure; and
+- `.github/workflows/ci.yml` still auto-triggers the non-authoritative check on
+  pushes and pull requests, contrary to the DSR-only operating rule. The file
+  must be made inert through its separately assigned implementation authority;
+  this documentation record does not authorize changing or deleting it.
+
+These are setup blockers, not reasons to run the default graph and annotate the
+result. No DSR execution should be requested until one immutable commit contains
+the exact graph and fail-closed checks described above.
+
 The receipt also retains the expanded recipe/command, DSR version, dated Rust
 toolchain identity, host and target triples, start/end times, exit code, the
 complete `scripts/check.sh` transcript, and its final `CHECK RESULT=PASS|FAIL`
