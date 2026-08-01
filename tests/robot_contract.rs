@@ -1,6 +1,9 @@
 use std::{env, ffi::OsStr, fs, path::PathBuf};
 
-use franken_nlp::robot::{self, RobotCommand, RobotConvertStageEvent, RobotEvent, RobotEventType};
+use franken_nlp::{
+    orchestrator::{AdmissionRequest, KvCacheQuantization, ResidencyAccounting},
+    robot::{self, RobotCommand, RobotConvertStageEvent, RobotEvent, RobotEventType},
+};
 use serde_json::Value;
 
 const GOLDEN_PATH: &str = "tests/fixtures/robot_schema.golden.json";
@@ -248,6 +251,15 @@ fn schema_and_unpopulated_commands_are_data_only_and_golden_frozen() {
         RobotCommand::Schema,
         RobotCommand::Health,
         RobotCommand::Backends,
+        RobotCommand::Plan(
+            AdmissionRequest::decode(8_192, 64, KvCacheQuantization::Int8F32Scales)
+                .with_local_memory_budget(u64::MAX)
+                .with_fixed_residency(
+                    ResidencyAccounting::new(1, 1).expect("resident bytes fit mapping"),
+                )
+                .with_kv_page_metadata_per_token(0)
+                .with_reserves(0, 0),
+        ),
     ] {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -289,7 +301,7 @@ fn schema_and_unpopulated_commands_are_data_only_and_golden_frozen() {
                         Value::from("no measurement — conservative default")
                     );
                 }
-            } else {
+            } else if command == RobotCommand::Health {
                 assert_eq!(document["kind"], Value::from("robot_health"));
                 assert_eq!(
                     document["capabilities"]["status"],
@@ -345,6 +357,33 @@ fn schema_and_unpopulated_commands_are_data_only_and_golden_frozen() {
                         );
                     }
                 }
+            } else {
+                assert_eq!(document["kind"], Value::from("robot_plan"));
+                assert_eq!(document["allocations"], Value::from("none"));
+                assert_eq!(document["context_tokens"], Value::from(8_192));
+                assert_eq!(document["batch_rows"], Value::from(64));
+                assert_eq!(
+                    document["quantization"],
+                    Value::from("int8-f32-scales")
+                );
+                assert_eq!(
+                    document["terms"]["kv_payload_bytes"],
+                    Value::from(64_u64 * 8_192 * 90_112)
+                );
+                assert_eq!(
+                    document["terms"]["kv_scale_bytes"],
+                    Value::from(64_u64 * 8_192 * 2_816)
+                );
+                assert_eq!(
+                    document["terms"]["full_logit_bytes"],
+                    Value::from(64_u64 * 664_576)
+                );
+                assert_eq!(document["terms"]["committed_bytes"].is_u64(), true);
+                assert_eq!(document["terms"]["peak_bytes"].is_u64(), true);
+                assert!(matches!(
+                    document["aggregate_status"].as_str(),
+                    Some("not_installed" | "admitted" | "refused")
+                ));
             }
         }
     }

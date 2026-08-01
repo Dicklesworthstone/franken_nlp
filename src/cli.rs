@@ -1796,7 +1796,8 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        Cli, Command, LogicalTensorFirstPass, ModelsSubcommand, ReleaseSubcommand,
+        Cli, Command, KvCacheQuantization, LogicalTensorFirstPass, ModelsSubcommand,
+        ReleaseSubcommand, RobotSubcommand,
         cli_main_with_reader, confirm_convert, conversion_receipt_path, conversion_staging_path,
         validate_generic_tensor_authorities,
     };
@@ -2092,5 +2093,51 @@ mod tests {
             stage.file_name().and_then(|name| name.to_str()),
             Some(".nanbeige.fnlpq.fnlpq-stage.0")
         );
+    }
+
+    #[test]
+    fn robot_plan_accepts_memory_budget_alias_and_preserves_explicit_terms() {
+        let parsed = Cli::try_parse_from([
+            "fnlp",
+            "robot",
+            "plan",
+            "--ctx",
+            "8192",
+            "--batch",
+            "64",
+            "--quant",
+            "int8",
+            "--memory-budget",
+            "999999999999",
+            "--fixed-mapped-bytes",
+            "1000",
+            "--fixed-resident-bytes",
+            "900",
+            "--kv-page-metadata-per-token",
+            "7",
+        ])
+        .expect("robot plan accepts the documented budget alias");
+        let Some(Command::Robot {
+            command: RobotSubcommand::Plan(command),
+        }) = parsed.command
+        else {
+            panic!("robot plan must parse to its typed command");
+        };
+        let request = command
+            .admission_request()
+            .expect("complete plan values convert to admission request");
+        assert_eq!(request.context_tokens, 8_192);
+        assert_eq!(request.batch_rows, 64);
+        assert_eq!(request.kv_quantization, KvCacheQuantization::Int8F32Scales);
+        assert_eq!(request.local_memory_budget_bytes, Some(999_999_999_999));
+        assert_eq!(request.fixed_residency.expect("fixed terms exist").mapped_bytes, 1_000);
+        assert_eq!(
+            request
+                .fixed_residency
+                .expect("fixed terms exist")
+                .resident_bytes,
+            900
+        );
+        assert_eq!(request.kv_page_metadata_bytes_per_token, Some(7));
     }
 }
