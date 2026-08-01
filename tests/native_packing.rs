@@ -140,6 +140,50 @@ fn dispatch_refuses_cross_arch_fallback_and_names_the_derive_command() {
 }
 
 #[test]
+fn derived_artifact_is_never_admitted_as_a_new_generic_root() {
+    let generic = generic_root(37);
+    let derived =
+        derive_native_packing(generic, NativePackingTarget::X86Avx2, TILE_TABLE_VERSION_V1)
+            .expect("synthetic native cache");
+
+    assert!(matches!(
+        derive_native_packing(
+            derived.bytes,
+            NativePackingTarget::X86Vnni256,
+            TILE_TABLE_VERSION_V1,
+        ),
+        Err(PackingError::GenericRoot { detail })
+            if detail == "root already contains a native packing payload"
+    ));
+}
+
+#[test]
+fn verification_refuses_a_different_native_target() {
+    let generic_bytes = generic_root(41);
+    let generic = FnlpqArtifact::from_bytes(generic_bytes.clone())
+        .expect("synthetic Generic root must validate");
+    let derived = derive_native_packing(
+        generic_bytes,
+        NativePackingTarget::X86Avx2,
+        TILE_TABLE_VERSION_V1,
+    )
+    .expect("synthetic AVX2 native cache");
+    let checked = FnlpqArtifact::from_bytes(derived.bytes)
+        .expect("synthetic AVX2 native cache must validate");
+
+    assert!(matches!(
+        verify_derived_packing(
+            &generic,
+            &checked,
+            NativePackingTarget::Aarch64Sdot,
+            TILE_TABLE_VERSION_V1,
+        ),
+        Err(PackingError::NativePayload { detail })
+            if detail.contains("does not match target aarch64-sdot")
+    ));
+}
+
+#[test]
 fn closed_cli_target_spellings_do_not_accept_envelope_aliases() {
     for target in NativePackingTarget::ALL {
         assert_eq!(
