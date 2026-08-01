@@ -470,6 +470,32 @@ pub fn verify_derived_packing(
             ),
         });
     }
+    let installed = derived
+        .select_packing(target.arch_target())
+        .map_err(|error| PackingError::NativePayload {
+            detail: format!(
+                "derived cache does not install target {}: {error}",
+                target.cli_name()
+            ),
+        })?;
+    if installed.id != packing_id {
+        return Err(PackingError::NativePayload {
+            detail: format!(
+                "installed packing id {} does not match payload id {packing_id}",
+                installed.id
+            ),
+        });
+    }
+    if installed.representations.len() != 1
+        || installed.representations[0].section_ordinal != native_section.ordinal
+    {
+        return Err(PackingError::NativePayload {
+            detail: format!(
+                "installed packing {} must bind exactly native section ordinal {}",
+                installed.id, native_section.ordinal
+            ),
+        });
+    }
     let bytes = derived
         .section_bytes(native_section.ordinal)
         .ok_or_else(|| PackingError::NativePayload {
