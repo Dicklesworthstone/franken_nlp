@@ -637,6 +637,11 @@ impl KvSlabPool {
             .ok_or(KvSlabError::AdmissionArithmeticOverflow {
                 positions: page_tokens,
             })?;
+        slab_capacity.checked_mul(slab_payload_bytes).ok_or(
+            KvSlabError::AdmissionArithmeticOverflow {
+                positions: slab_capacity,
+            },
+        )?;
         let mut slabs = Vec::new();
         slabs
             .try_reserve_exact(slab_capacity)
@@ -724,6 +729,18 @@ impl KvSlabPool {
             });
         }
         self.require_free(1)?;
+        let live_payload_bytes = self
+            .live_payload_bytes
+            .checked_add(self.slab_payload_bytes)
+            .ok_or(KvSlabError::AdmissionArithmeticOverflow {
+                positions: self.live_slab_count,
+            })?;
+        let allocation_events = self
+            .allocation_events
+            .checked_add(1)
+            .ok_or(KvSlabError::AdmissionArithmeticOverflow {
+                positions: self.allocation_events,
+            })?;
         let slab_id = self
             .free
             .pop()
@@ -736,8 +753,8 @@ impl KvSlabPool {
         slab.references = 1;
         slab.sealed = false;
         self.live_slab_count += 1;
-        self.live_payload_bytes += self.slab_payload_bytes;
-        self.allocation_events += 1;
+        self.live_payload_bytes = live_payload_bytes;
+        self.allocation_events = allocation_events;
         Ok(slab_id)
     }
 
