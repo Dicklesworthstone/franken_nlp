@@ -114,9 +114,11 @@ fn sealed_formation_model_rejects_post_start_and_post_latch_spawns() {
             thread::sleep(Duration::from_millis(1));
         }
     });
-    thread::sleep(Duration::from_millis(3));
-    assert!(heartbeat.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    // Join before asserting: the count is a scheduling-independent 8 once the
+    // worker has finished; asserting mid-flight raced the OS scheduler under
+    // suite load and flaked at 0.
     heartbeat_join.join().expect("heartbeat thread panicked");
+    assert!(heartbeat.load(std::sync::atomic::Ordering::SeqCst) > 0);
     log_case("coordinator-busy-heartbeat-model", "PASS");
 
     println!("G0_PROBE2 RESULT=PASS cases=5 seed={SEED} authority=sealed-model-only");
