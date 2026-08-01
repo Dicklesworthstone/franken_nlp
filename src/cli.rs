@@ -623,6 +623,9 @@ fn run_streaming_convert(
         Ok(value) => value,
         Err(error) => return emit_streaming_refusal("digest-staging", error),
     };
+    if let Err(error) = publish_explicit_conversion_stage(&staging_output, &request.output) {
+        return emit_streaming_refusal("publish-explicit-output", error);
+    }
     let receipt = match write_conversion_receipt_sidecar(
         request,
         prepared,
@@ -639,9 +642,6 @@ fn run_streaming_convert(
         receipt.staging_path.display(),
         receipt.sha256,
     );
-    if let Err(error) = publish_explicit_conversion_stage(&staging_output, &request.output) {
-        return emit_streaming_refusal("publish-explicit-output", error);
-    }
     emit_converted_unqualified(
         &request.output,
         &staging_output,
@@ -872,9 +872,8 @@ struct WrittenConversionReceipt {
     sha256: String,
 }
 
-/// Serialize, reload, and publish the canonical receipt before exposing its
-/// paired explicit artifact.  The receipt is a conversion record only; it
-/// deliberately does not activate or qualify the artifact.
+/// Construct the typed conversion receipt from the completed explicit-output
+/// conversion facts, then write its canonical sidecar after artifact publish.
 fn write_conversion_receipt_sidecar(
     request: &ConvertRequest,
     prepared: &PreparedConversionInput,
@@ -917,10 +916,19 @@ fn write_conversion_receipt_sidecar(
         artifact_raw_sha256: artifact_raw_sha256.to_owned(),
         license_bundle_sha256: hex_lower(&written.license_bundle_sha256),
     };
+    write_canonical_receipt_sidecar(&request.output, &receipt)
+}
+
+/// Write the canonical receipt beside a published explicit output, then prove
+/// the retained sidecar still parses through the typed canonical boundary.
+fn write_canonical_receipt_sidecar(
+    output: &Path,
+    receipt: &ConversionReceipt,
+) -> Result<WrittenConversionReceipt, String> {
     let json = receipt
         .canonical_json()
         .map_err(|error| format!("serialize conversion receipt: {error}"))?;
-    let destination = conversion_receipt_path(&request.output)?;
+    let destination = conversion_receipt_path(output)?;
     let (staging_path, mut file) = create_conversion_receipt_stage(&destination)?;
     file.write_all(json.as_bytes())
         .map_err(|error| format!("write staged receipt {}: {error}", staging_path.display()))?;
@@ -1788,9 +1796,11 @@ fn emit_schema_error(mode: &str, error: &SchemaError) {
 mod tests {
     use std::{
         ffi::OsString,
+        fs,
         io::Cursor,
         path::{Path, PathBuf},
         process::ExitCode,
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     use clap::{Parser, error::ErrorKind};
@@ -1799,10 +1809,12 @@ mod tests {
         Cli, Command, KvCacheQuantization, LogicalTensorFirstPass, ModelsSubcommand,
         ReleaseSubcommand, RobotSubcommand, cli_main_with_reader, confirm_convert,
         conversion_receipt_path, conversion_staging_path, validate_generic_tensor_authorities,
+        write_canonical_receipt_sidecar,
     };
     use crate::artifact::converter::{
-        ConvertArch, ConvertRequest, GenericPayloadPlan, GenericTensorLayout, OutputRange,
-        StorageStage, expected_nanbeige42_census,
+        CONVERSION_ARTIFACT_FORMAT, CONVERSION_RECEIPT_SCHEMA, ConversionReceipt, ConvertArch,
+        ConvertRequest, GENERIC_PACKING_V1, GenericPayloadPlan, GenericTensorLayout, OutputRange,
+        PINNED_SOURCE_MANIFEST_SHA256, PORTABLE_QUANT_V1, StorageStage, expected_nanbeige42_census,
     };
     use crate::artifact::format::validate_authority_identifier;
     use crate::artifact::safetensors::{SafetensorDtype, TensorCensusEntry};
@@ -1868,6 +1880,52 @@ mod tests {
         assert_ne!(
             conversion_receipt_path(Path::new("/models/output.fnlpq")),
             Ok(PathBuf::from("/models/output.fnlpq"))
+        );
+    }
+
+    #[test]
+    fn conversion_receipt_sidecar_exists_and_parses_after_canonical_write() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock is after Unix epoch")
+            .as_nanos();
+        let output = std::env::temp_dir().join(format!(
+            "franken-nlp-conversion-receipt-{}-{nonce}.fnlpq",
+            std::process::id()
+        ));
+        let receipt = ConversionReceipt {
+            receipt_schema: CONVERSION_RECEIPT_SCHEMA.to_owned(),
+            model_id: "Nanbeige4.2-3B".to_owned(),
+            model_revision: "f56ec5a9650268aa098496734743c25ea778bd2d".to_owned(),
+            artifact_format: CONVERSION_ARTIFACT_FORMAT.to_owned(),
+            source_manifest_sha256: PINNED_SOURCE_MANIFEST_SHA256.to_owned(),
+            target_arch: "generic".to_owned(),
+            source_root_sha256: "a".repeat(64),
+            census_sha256: "b".repeat(64),
+            logical_model_sha256: "f".repeat(64),
+            converter_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            recipe_id: "nanbeige42-int8-v1".to_owned(),
+            rounding_id: PORTABLE_QUANT_V1.to_owned(),
+            packing_id: GENERIC_PACKING_V1.to_owned(),
+            measured_peak_rss_bytes: 10,
+            measured_scratch_bytes: 4,
+            peak_rss_cap_bytes: 10,
+            final_disk_bytes: 20,
+            measured_disk_bytes: 20,
+            output_len: 20,
+            fnlpq_file_sha256: "c".repeat(64),
+            artifact_raw_sha256: "e".repeat(64),
+            license_bundle_sha256: "d".repeat(64),
+        };
+        let written = write_canonical_receipt_sidecar(&output, &receipt)
+            .expect("canonical receipt sidecar writes beside explicit output");
+        assert!(written.destination.is_file());
+        let sidecar = fs::read_to_string(&written.destination)
+            .expect("retained conversion receipt sidecar reads");
+        assert_eq!(
+            ConversionReceipt::parse_canonical_json(&sidecar)
+                .expect("retained sidecar parses canonically"),
+            receipt
         );
     }
 
