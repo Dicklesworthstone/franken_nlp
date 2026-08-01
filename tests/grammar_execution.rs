@@ -217,6 +217,21 @@ fn sparse_projection_equals_masked_full_projection_and_never_invents_audit_field
 }
 
 #[test]
+fn sparse_and_full_projection_break_equal_logit_ties_by_token_id() {
+    let legal = mask(&[1, 3]);
+    let logits = [0.0, 7.0, 99.0, 7.0, -1.0, -2.0, -3.0, -4.0];
+    let full = FullProjection::new(legal.clone(), true)
+        .select(&logits)
+        .expect("full masked projection chooses a legal row");
+    let sparse = ProjectLegal::from_mask(&legal)
+        .select(&logits)
+        .expect("sparse projection chooses a legal row");
+    assert_eq!(full.token_id, 1);
+    assert_eq!(sparse.token_id, 1);
+    assert_eq!(sparse.token_id, full.token_id);
+}
+
+#[test]
 fn forced_witness_requires_every_processor_and_disables_on_any_unknown_semantics() {
     let both = mask(&[2, 3]);
     for changed_processor in 0..6 {
