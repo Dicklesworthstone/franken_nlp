@@ -3530,6 +3530,49 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn sealed_cpu_team_joins_before_its_completion_latch_releases() {
+        let config = config();
+        let inventory = config.thread_inventory().expect("inventory is valid");
+        let resources = Arc::new(EngineResources::new_for_test(config, inventory));
+        let lease = resources.acquire_lease();
+
+        assert_eq!(
+            lease
+                .spawn_sealed_cpu_checkpoint_team(0)
+                .expect_err("zero width cannot omit the coordinator"),
+            SealedTeamLaunchError::InvalidTeamWidth
+        );
+        assert_eq!(
+            resources.outstanding_closure_snapshot().active_closures,
+            0,
+            "a pre-entry refusal must not retain a completion latch"
+        );
+
+        let mut handle = lease
+            .spawn_sealed_cpu_checkpoint_team(4)
+            .expect("one coordinator and three sealed children launch");
+        let joined = resources.runtime().block_on(async {
+            let request_cx = asupersync::cx::Cx::current()
+                .expect("runtime block_on installs the ambient request context");
+            handle.join(&request_cx).await
+        });
+        let snapshot = joined
+            .expect("blocking wrapper joins without a task failure")
+            .expect("sealed scoped CPU region completes");
+        assert_eq!(snapshot.phase, SealedTeamPhase::Joined);
+        assert_eq!(snapshot.expected_children, 3);
+        assert_eq!(snapshot.formed_children, 3);
+        assert_eq!(snapshot.exited_children, 3);
+        assert_eq!(snapshot.drain_reason, Some(TeamDrainReason::Completed));
+        assert_eq!(
+            resources.outstanding_closure_snapshot().active_closures,
+            0,
+            "the physical closure drops its latch only after the scoped join"
+        );
+    }
+
     fn admission_config(memory_ceiling_bytes: u64) -> ResourceHostConfig {
         ResourceHostConfig::new(
             RuntimePreset::LowLatency,
