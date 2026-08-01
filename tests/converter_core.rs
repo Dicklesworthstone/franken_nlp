@@ -4,9 +4,10 @@
 use franken_nlp::artifact::converter::{
     BF16_VERBATIM_V1, CONVERSION_RECEIPT_SCHEMA, ConversionReceipt, ConversionSourceManifest,
     ConvertArch, ConvertRequest, ConverterError, DEFAULT_PANEL_BYTES, GENERIC_PACKING_V1,
-    OutputRange, OutputRangePlan, PINNED_LOGICAL_PAYLOAD_BYTES, PORTABLE_QUANT_V1, StorageStage,
-    expected_nanbeige42_census, plan_generic_payload, prepare_convert_request, remap_tensor_name,
-    validate_nanbeige42_census, validate_pinned_logical_payload_bytes,
+    OutputRange, OutputRangePlan, PINNED_LOGICAL_PAYLOAD_BYTES, PINNED_SOURCE_MANIFEST_SHA256,
+    PORTABLE_QUANT_V1, StorageStage, expected_nanbeige42_census, plan_generic_payload,
+    prepare_convert_request, remap_tensor_name, validate_nanbeige42_census,
+    validate_pinned_logical_payload_bytes,
 };
 use franken_nlp::artifact::safetensors::TensorCensusEntry;
 
@@ -150,8 +151,11 @@ fn receipt_requires_every_identity_and_serializes_canonically() {
         model_id: "Nanbeige4.2-3B".to_owned(),
         model_revision: "f56ec5a9650268aa098496734743c25ea778bd2d".to_owned(),
         artifact_format: "fnlpq-v1".to_owned(),
+        source_manifest_sha256: PINNED_SOURCE_MANIFEST_SHA256.to_owned(),
+        target_arch: "generic".to_owned(),
         source_root_sha256: "a".repeat(64),
         census_sha256: "b".repeat(64),
+        logical_model_sha256: "f".repeat(64),
         converter_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
         recipe_id: "nanbeige42-int8-v1".to_owned(),
         rounding_id: "portable-quant-v1".to_owned(),
@@ -266,6 +270,18 @@ fn receipt_requires_every_identity_and_serializes_canonically() {
         })
     );
 
+    let collapsed_file_digests = ConversionReceipt {
+        artifact_raw_sha256: receipt.fnlpq_file_sha256.clone(),
+        ..receipt.clone()
+    };
+    assert_eq!(
+        collapsed_file_digests.canonical_json(),
+        Err(ConverterError::ReceiptField {
+            field: "artifact_raw_sha256",
+            detail: "must remain distinct from the domain-framed fnlpq_file_sha256".to_owned(),
+        })
+    );
+
     let malformed_commit = ConversionReceipt {
         converter_commit: "unbound-converter".to_owned(),
         ..receipt
@@ -286,8 +302,11 @@ fn receipt_parser_rejects_duplicate_missing_and_wrongly_typed_schema_fields() {
         model_id: "Nanbeige4.2-3B".to_owned(),
         model_revision: "f56ec5a9650268aa098496734743c25ea778bd2d".to_owned(),
         artifact_format: "fnlpq-v1".to_owned(),
+        source_manifest_sha256: PINNED_SOURCE_MANIFEST_SHA256.to_owned(),
+        target_arch: "generic".to_owned(),
         source_root_sha256: "a".repeat(64),
         census_sha256: "b".repeat(64),
+        logical_model_sha256: "f".repeat(64),
         converter_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
         recipe_id: "nanbeige42-int8-v1".to_owned(),
         rounding_id: "portable-quant-v1".to_owned(),
@@ -393,8 +412,11 @@ fn receipt_parser_requires_the_complete_pinned_schema_and_identities() {
         model_id: "Nanbeige4.2-3B".to_owned(),
         model_revision: "f56ec5a9650268aa098496734743c25ea778bd2d".to_owned(),
         artifact_format: "fnlpq-v1".to_owned(),
+        source_manifest_sha256: PINNED_SOURCE_MANIFEST_SHA256.to_owned(),
+        target_arch: "generic".to_owned(),
         source_root_sha256: "a".repeat(64),
         census_sha256: "b".repeat(64),
+        logical_model_sha256: "f".repeat(64),
         converter_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
         recipe_id: "nanbeige42-int8-v1".to_owned(),
         rounding_id: "portable-quant-v1".to_owned(),
@@ -417,8 +439,11 @@ fn receipt_parser_requires_the_complete_pinned_schema_and_identities() {
         "model_id",
         "model_revision",
         "artifact_format",
+        "source_manifest_sha256",
+        "target_arch",
         "source_root_sha256",
         "census_sha256",
+        "logical_model_sha256",
         "converter_commit",
         "recipe_id",
         "rounding_id",
@@ -452,6 +477,11 @@ fn receipt_parser_requires_the_complete_pinned_schema_and_identities() {
         ("model_id", "other-model"),
         ("model_revision", "0000000000000000000000000000000000000000"),
         ("artifact_format", "fnlpq-v2"),
+        (
+            "source_manifest_sha256",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        ),
+        ("target_arch", "x86-avx2"),
     ] {
         let mut tampered =
             serde_json::from_str::<serde_json::Value>(&canonical).expect("canonical receipt");
@@ -471,6 +501,8 @@ fn receipt_parser_requires_the_complete_pinned_schema_and_identities() {
                         "model_id" => "Nanbeige4.2-3B",
                         "model_revision" => "f56ec5a9650268aa098496734743c25ea778bd2d",
                         "artifact_format" => "fnlpq-v1",
+                        "source_manifest_sha256" => PINNED_SOURCE_MANIFEST_SHA256,
+                        "target_arch" => "generic",
                         _ => unreachable!("only pinned identity fields are tested"),
                     }
                 ),

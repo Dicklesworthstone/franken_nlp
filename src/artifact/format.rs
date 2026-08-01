@@ -37,6 +37,8 @@ pub const MAX_ALIGNMENT: u64 = 4_096;
 /// Domain labels for every v1 artifact identity.  Writer, reader, converter,
 /// and receipts must call this registry rather than restating a near-match.
 pub mod digest_domain {
+    /// Identity of the ordered source tensor census.
+    pub const CENSUS: &str = "fnlpq-census-v1";
     /// Identity of the canonical source-closure manifest bytes.
     pub const SOURCE_ROOT: &str = "fnlpq-source-root-v1";
     /// Identity of one materialized semantic source.

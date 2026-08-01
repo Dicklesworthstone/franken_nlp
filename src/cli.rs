@@ -17,8 +17,8 @@ use crate::{
         StreamingSection, StreamingSectionHasher, TensorInput, digest_domain, framed_sha256,
         logical_model_sha256, validate_authority_identifier, write_streaming,
     },
-    artifact::package::{PackageRequest, package_model, verify_model_package},
     artifact::fs_tx::open_ratified_model_root,
+    artifact::package::{PackageRequest, package_model, verify_model_package},
     artifact::packing::{NativePackingTarget, TILE_TABLE_VERSION_V1},
     artifact::quantize::{GenericPanelBytes, encode_generic_panel},
     artifact::reader::FnlpqArtifact,
@@ -872,7 +872,7 @@ fn streaming_small_section(
 ) -> Result<StreamingSection, String> {
     let stored_len =
         u64::try_from(bytes.len()).map_err(|_| format!("{name} length does not fit u64"))?;
-    let stored_sha256 = framed_sha256("fnlpq-section-v1", &[name.as_bytes(), bytes])
+    let stored_sha256 = framed_sha256(digest_domain::SECTION, &[name.as_bytes(), bytes])
         .map_err(|error| format!("{name} section identity: {error}"))?;
     Ok(streaming_section(
         name,

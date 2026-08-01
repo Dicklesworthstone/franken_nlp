@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::artifact::format::source_root_sha256;
+use crate::artifact::format::{digest_domain, source_root_sha256};
 use crate::artifact::quantize::{GenericPanelBytes, QuantizeError, encode_generic_panel};
 use crate::artifact::safetensors::{
     CensusDiff, RowPanel, SafetensorDtype, SafetensorsError, SafetensorsRangeIndex, SourceClosure,
@@ -50,8 +50,8 @@ pub const BF16_VERBATIM_V1: &str = "bf16-verbatim-v1";
 /// The only Generic packing declaration emitted by the initial converter.
 pub const GENERIC_PACKING_V1: &str = "generic-v1";
 /// The only canonical JSON schema emitted for conversion receipts.
-pub const CONVERSION_RECEIPT_SCHEMA: &str = "fnlp-conversion-receipt-v2";
-/// Exact artifact schema recorded in a v2 conversion receipt.
+pub const CONVERSION_RECEIPT_SCHEMA: &str = "fnlp-conversion-receipt-v3";
+/// Exact artifact schema recorded in a v3 conversion receipt.
 pub const CONVERSION_ARTIFACT_FORMAT: &str = "fnlpq-v1";
 
 /// The only source-to-artifact target admitted by `fnlp convert`.
@@ -1336,10 +1336,17 @@ pub struct ConversionReceipt {
     pub model_revision: String,
     /// Exact artifact envelope version emitted by the converter.
     pub artifact_format: String,
+    /// Raw SHA-256 of the canonical checked-in source-manifest bytes.
+    pub source_manifest_sha256: String,
+    /// The only source-to-artifact target admitted by the recipe.
+    pub target_arch: String,
     /// Framed ordered source-file identity.
     pub source_root_sha256: String,
     /// Framed complete 201-tensor source census identity.
     pub census_sha256: String,
+    /// Header logical-model identity, which binds model authority, ordered
+    /// tensors, and all materialized semantic source bytes.
+    pub logical_model_sha256: String,
     /// Exact converter source revision/commit supplied by the build layer.
     pub converter_commit: String,
     /// Frozen recipe identity passed via `--recipe`.
@@ -1390,6 +1397,12 @@ impl ConversionReceipt {
                 self.artifact_format.as_str(),
                 CONVERSION_ARTIFACT_FORMAT,
             ),
+            (
+                "source_manifest_sha256",
+                self.source_manifest_sha256.as_str(),
+                PINNED_SOURCE_MANIFEST_SHA256,
+            ),
+            ("target_arch", self.target_arch.as_str(), "generic"),
         ] {
             if actual != expected {
                 return Err(ConverterError::ReceiptField {
@@ -1401,6 +1414,7 @@ impl ConversionReceipt {
         for (field, value) in [
             ("source_root_sha256", self.source_root_sha256.as_str()),
             ("census_sha256", self.census_sha256.as_str()),
+            ("logical_model_sha256", self.logical_model_sha256.as_str()),
             ("fnlpq_file_sha256", self.fnlpq_file_sha256.as_str()),
             ("artifact_raw_sha256", self.artifact_raw_sha256.as_str()),
             ("license_bundle_sha256", self.license_bundle_sha256.as_str()),
@@ -1411,6 +1425,12 @@ impl ConversionReceipt {
                     detail: "must be a lowercase SHA-256".to_owned(),
                 });
             }
+        }
+        if self.fnlpq_file_sha256 == self.artifact_raw_sha256 {
+            return Err(ConverterError::ReceiptField {
+                field: "artifact_raw_sha256",
+                detail: "must remain distinct from the domain-framed fnlpq_file_sha256".to_owned(),
+            });
         }
         if !is_lower_git_commit(&self.converter_commit) {
             return Err(ConverterError::ReceiptField {
@@ -2742,7 +2762,8 @@ fn source_root_digest(manifest: &ConversionSourceManifest) -> Result<String, Con
 
 fn census_digest(census: &[TensorCensusEntry]) -> Result<String, ConverterError> {
     let mut hasher = Sha256::new();
-    hasher.update(b"fnlpq-census-v1\0");
+    hasher.update(digest_domain::CENSUS.as_bytes());
+    hasher.update([0]);
     let count = u64::try_from(census.len()).map_err(|_| ConverterError::Arithmetic {
         invariant: "census tensor count",
     })?;
