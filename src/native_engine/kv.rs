@@ -35,6 +35,8 @@ pub const KV_SLABS_PER_LOGICAL_PAGE: usize = KV_SLOT_COUNT * 2;
 /// Bytes in one bf16 K-or-V slab for one layer slot and 16 token positions.
 pub const KV_BF16_SLAB_BYTES: usize =
     KV_LOGICAL_PAGE_TOKENS * KV_ELEMENTS_PER_POSITION * size_of::<u16>();
+/// Required alignment for every physical K/V vector in a bf16 slab.
+pub const KV_SLAB_VECTOR_ALIGNMENT_BYTES: usize = 64;
 /// Payload bytes in one 16-token logical page across all 44 K/V slots.
 pub const KV_BF16_LOGICAL_PAGE_BYTES: usize = KV_BYTES_PER_TOKEN * KV_LOGICAL_PAGE_TOKENS;
 /// Int8 K/V payload bytes per token before scale and page-table accounting.
@@ -867,6 +869,21 @@ impl KvSlabPool {
     fn refcount(&self, slab_id: KvSlabId) -> Result<usize, KvSlabError> {
         Ok(self.slab(slab_id)?.references)
     }
+
+    fn vector_alignment_offset(
+        &self,
+        slab_id: KvSlabId,
+        position_in_slab: usize,
+    ) -> Result<usize, KvSlabError> {
+        let vector = self
+            .slab(slab_id)?
+            .vectors
+            .get(position_in_slab)
+            .ok_or(KvSlabError::UnknownSlab {
+                slab_id: slab_id.0,
+            })?;
+        Ok((vector.values.as_ptr() as usize) % KV_SLAB_VECTOR_ALIGNMENT_BYTES)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1147,6 +1164,24 @@ impl KvSlabCache {
     ) -> Result<usize, KvSlabError> {
         let slab_id = self.slab_id_at(slot, position, vector)?;
         self.pool.borrow().refcount(slab_id)
+    }
+
+    /// Returns a completed vector's byte-address modulo the required alignment.
+    ///
+    /// A result of zero is the 64-byte alignment invariant consumed by the
+    /// K/V scan kernels; this method exposes an auditable value rather than a
+    /// raw pointer or mutable slab storage.
+    pub fn vector_alignment_offset_at(
+        &self,
+        slot: usize,
+        position: usize,
+        vector: KvVector,
+    ) -> Result<usize, KvSlabError> {
+        let slab_id = self.slab_id_at(slot, position, vector)?;
+        let page = &self.pages[position / self.page_tokens];
+        self.pool
+            .borrow()
+            .vector_alignment_offset(slab_id, position - page.token_start)
     }
 
     fn allocate_page(&mut self, page_index: usize) -> Result<(), KvSlabError> {

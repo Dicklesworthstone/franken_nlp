@@ -4,7 +4,8 @@ use franken_nlp::native_engine::kv::{
     KV_BF16_LOGICAL_PAGE_BYTES, KV_BF16_SLAB_BYTES, KV_BYTES_PER_TOKEN,
     KV_INT8_F16_SCALE_BYTES_PER_TOKEN, KV_INT8_F32_SCALE_BYTES_PER_TOKEN,
     KV_INT8_PAYLOAD_BYTES_PER_TOKEN, KV_LOGICAL_PAGE_TOKENS, KV_SLOT_COUNT,
-    KV_SLABS_PER_LOGICAL_PAGE, KvSlabCache, KvSlabDtype, KvSlabError, KvSlabKey, KvVector,
+    KV_SLABS_PER_LOGICAL_PAGE, KV_SLAB_VECTOR_ALIGNMENT_BYTES, KvSlabCache, KvSlabDtype,
+    KvSlabError, KvSlabKey, KvVector,
 };
 
 fn append_prepared_position(cache: &mut KvSlabCache, position: usize, marker: u16) {
@@ -27,6 +28,7 @@ fn baseline_slab_geometry_is_the_44_slot_byte_certificate() {
     assert_eq!(KV_LOGICAL_PAGE_TOKENS, 16);
     assert_eq!(KV_SLABS_PER_LOGICAL_PAGE, 88);
     assert_eq!(KV_BF16_SLAB_BYTES, 32 * 1024);
+    assert_eq!(KV_SLAB_VECTOR_ALIGNMENT_BYTES, 64);
     assert_eq!(KV_BF16_LOGICAL_PAGE_BYTES, 2_883_584);
     assert_eq!(KV_BF16_LOGICAL_PAGE_BYTES * 4, 11 * 1024 * 1024);
 
@@ -90,6 +92,11 @@ fn prepared_append_uses_only_preallocated_aligned_slabs() {
         .expect("completed V data is addressable by logical slot and position");
     assert_eq!(key, [43; 1_024]);
     assert_eq!(value, [1_043; 1_024]);
+    assert_eq!(
+        cache.vector_alignment_offset_at(43, 0, KvVector::Key),
+        Ok(0),
+        "safe aligned-vector storage keeps every K address on a 64-byte boundary"
+    );
 }
 
 #[test]
