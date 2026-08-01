@@ -148,6 +148,7 @@ fn renderer_is_deterministic_across_typed_modes() {
                     id: Some("call-1".to_owned()),
                     name: "fixture_lookup".to_owned(),
                     arguments: json!({"key":"loop"}),
+                    arguments_as_supplied: None,
                 }],
                 tool_results: Vec::new(),
             },
@@ -363,6 +364,7 @@ fn tool_branches_and_adjacent_results_are_structurally_distinct() {
         id: Some("call-1".to_owned()),
         name: "lookup".to_owned(),
         arguments: json!({"key":"value"}),
+        arguments_as_supplied: None,
     };
     let conversation = Conversation {
         messages: vec![
@@ -415,6 +417,50 @@ fn tool_branches_and_adjacent_results_are_structurally_distinct() {
     assert_ne!(xml, json);
     assert_eq!(xml.matches(&format!("{IM_START}user")).count(), 1);
     assert!(xml.contains("first\n</tool_response>\n<tool_response>"));
+}
+
+#[test]
+fn json_tool_call_preserves_validated_argument_text_spelling() {
+    let supplied_arguments = "{\n  \"beta\": 2,\n  \"alpha\": [1, 2]\n}";
+    let input = json!({
+        "messages": [{
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "arguments": supplied_arguments,
+                },
+            }],
+        }],
+    })
+    .to_string();
+    let conversation = Conversation::from_json(&input)
+        .expect("a valid JSON-object argument string crosses the typed boundary");
+
+    let rendered = TemplateBuilder::with_options(RenderOptions {
+        add_generation_prompt: false,
+        tool_format: ToolFormat::Json,
+        ..RenderOptions::default()
+    })
+    .render(&conversation)
+    .expect("the JSON tool-call branch renders");
+
+    let expected_call = [
+        "<tool_call>\n{\"name\": \"lookup\", \"arguments\": ",
+        supplied_arguments,
+        "}\n</tool_call>",
+    ]
+    .concat();
+    assert!(
+        rendered.contains(&expected_call),
+        "the pinned string-arguments branch must preserve supplied JSON spelling"
+    );
+    assert!(
+        !rendered.contains(r#"{"name": "lookup", "arguments": {"alpha": [1, 2], "beta": 2}}"#),
+        "the string-arguments branch must not replace supplied JSON with a serializer form"
+    );
 }
 
 fn pinned_tokenizer() -> SpBpeTokenizer {

@@ -394,8 +394,15 @@ pub struct ToolCall {
     pub id: Option<String>,
     /// Declared function name.
     pub name: String,
-    /// Structured function arguments.
+    /// Validated structured function arguments.
     pub arguments: Value,
+    /// Original JSON-object text supplied by an OpenAI-style function wrapper.
+    ///
+    /// The pinned JSON tool-call branch emits a string `arguments` value
+    /// verbatim. This field retains that spelling after it has been validated
+    /// into [`Self::arguments`]; typed callers normally leave it as `None`.
+    #[serde(skip)]
+    pub arguments_as_supplied: Option<String>,
 }
 
 impl ToolCall {
@@ -411,6 +418,23 @@ impl ToolCall {
                 index,
                 reason: "tool-call arguments must be a JSON object".to_owned(),
             });
+        }
+        if let Some(original) = &self.arguments_as_supplied {
+            let parsed = crate::canonjson::parse_str(original).map_err(|error| {
+                TemplateError::InvalidMessage {
+                    index,
+                    reason: format!(
+                        "tool-call original arguments must be duplicate-key-free JSON ({error})"
+                    ),
+                }
+            })?;
+            if parsed != self.arguments {
+                return Err(TemplateError::InvalidMessage {
+                    index,
+                    reason: "tool-call original arguments must match structured arguments"
+                        .to_owned(),
+                });
+            }
         }
         Ok(())
     }
@@ -861,7 +885,11 @@ fn render_tool_calls(
                 output.push_str("<tool_call>\n{\"name\": ");
                 render_json_string(output, &call.name)?;
                 output.push_str(", \"arguments\": ");
-                render_jinja_json(output, &call.arguments)?;
+                if let Some(original) = &call.arguments_as_supplied {
+                    output.push_str(original);
+                } else {
+                    render_jinja_json(output, &call.arguments)?;
+                }
                 output.push_str("}\n</tool_call>");
             }
         }
@@ -1143,16 +1171,17 @@ fn parse_tool_calls(value: &Value, path: &str) -> Result<Vec<ToolCall>, Template
             )?;
             reject_unknown_keys(function, &["name", "arguments"], &function_path)?;
             let arguments = required_value(function, "arguments", &function_path)?;
-            let arguments = match arguments {
+            let (arguments, arguments_as_supplied) = match arguments {
                 Value::String(encoded) => {
-                    crate::canonjson::parse_str(encoded).map_err(|error| {
+                    let parsed = crate::canonjson::parse_str(encoded).map_err(|error| {
                         TemplateError::InvalidShape {
                             path: format!("{function_path}.arguments"),
                             expected: format!("duplicate-key-free JSON object ({error})"),
                         }
-                    })?
+                    })?;
+                    (parsed, Some(encoded.clone()))
                 }
-                value => value.clone(),
+                value => (value.clone(), None),
             };
             let call = ToolCall {
                 id: object
@@ -1168,6 +1197,7 @@ fn parse_tool_calls(value: &Value, path: &str) -> Result<Vec<ToolCall>, Template
                     .transpose()?,
                 name: required_string(function, "name", &function_path)?,
                 arguments,
+                arguments_as_supplied,
             };
             call.validate(index)?;
             Ok(call)
