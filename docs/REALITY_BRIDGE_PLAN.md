@@ -4,6 +4,50 @@ Produced by the orchestrator's full reality-check pass (code audit by independen
 agent + bead-coverage cross-check + campaign evidence). Revised in place; do not fork this
 document.
 
+## 0. Proof-state correction — 2026-08-01
+
+The implementation inventory and bridge ordering below remain useful, but the original
+`WORKING`, `proven`, `green`, and `closed` labels are **not acceptance authority**. A fresh
+literal-contract audit found that they merged code-first/static progress with DSR,
+model-gated, host-gated, and release evidence that does not yet exist. Until the affected
+rows are rewritten individually, interpret those labels as **CODE-FIRST IMPLEMENTED OR
+STRUCTURALLY EXERCISED; ACCEPTANCE OPEN**.
+
+Current load-bearing corrections:
+
+- No retained DSR `scripts/check.sh` receipt exists for the current immutable source SHA.
+  Local Cargo, direct RCH, and GitHub Actions results are non-authoritative for this campaign;
+  GitHub Actions is disabled. One occasional isolated DSR checkpoint is run only after the
+  moving shared tree reaches a deliberately selected stable SHA.
+- The oracle binds the ten-file data closure, but `trust_remote_code=True` also executes
+  `configuration_nanbeige.py` and `modeling_nanbeige.py`. Those executed files, the import
+  closure, the generator, environment, and source tree are not yet sealed together in one
+  replayable model-present receipt. Existing floor/trace/fixture transcripts therefore do
+  not authorize downstream L1-L4 promotion.
+- The current L2 harness is a useful scaffold, not a 44+2 parity award: absent-model and
+  synthetic legs can succeed without a real comparison, and the retained coverage does not
+  yet span both required profiles and every named phase/KV/loop-boundary surface.
+- `.fnlpq` reader/writer/converter/package components contain substantial real code, but the
+  canonical envelope/digest authority is internally inconsistent, the production model-root
+  opener intentionally refuses, the converter does not complete staged reload + strict
+  receipt + reconstruction/selftest + atomic activation, and release packaging has not been
+  proven on a validated real canonical Generic artifact.
+- `scripts/fetch_model.sh` has a retained Unix-path transcript, but shell/PowerShell parity,
+  pre-transfer redirect refusal, the executable source closure, and a full Windows receipt
+  remain open.
+- `fnlp pull`, `install.sh`, and `install.ps1` are still absent. The required end-user flow
+  remains: install the exact binary, delegate all model acquisition to that binary's
+  release-bound `fnlp pull`, stream-verify every fixed 1,957,046,720-byte part (except the
+  tail), reassemble, validate, derive native packing, and atomically activate.
+- Eleven Beads are presently marked closed even though each has a newer retained final audit
+  comment saying `KEEP OPEN` or `KEEP OPEN/BLOCKED`; five also retain live open blockers.
+  Their closure status and every readiness result derived from it are challenged. Only work
+  that remains ready after honoring those blockers may be scheduled.
+
+These corrections preserve all implemented code and ambition. They change only the evidence
+grade: code-first progress is valuable, but it cannot mint DSR, model, host, platform, or
+publisher proof.
+
 ## 1. The honest verdict
 
 **franken_nlp today is a proven reference-numerics + artifact platform, not yet a usable
