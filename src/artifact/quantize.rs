@@ -12,6 +12,13 @@ use super::converter::StorageStage;
 
 /// The largest signed magnitude emitted by the portable int8 recipe.
 pub const PORTABLE_I8_MAX_MAGNITUDE: i8 = 127;
+/// Canonical finite scale attached to an all-zero quantized row.
+///
+/// A zero row reconstructs exactly from all-zero int8 values with any finite
+/// positive scale. The artifact reader deliberately rejects non-positive
+/// scales, so the conversion recipe selects this one exact value rather than
+/// emitting an otherwise ambiguous `+0.0` sidecar.
+pub const PORTABLE_I8_ZERO_ROW_SCALE: f32 = 1.0;
 
 /// One canonical Generic section triplet produced for a bounded tensor panel.
 ///
@@ -38,7 +45,7 @@ pub struct QuantizedI8Rows {
     pub columns: usize,
     /// Row-major signed Generic bytes, with zero point zero.
     pub values: Vec<i8>,
-    /// One non-negative f32 scale per output channel.
+    /// One finite positive f32 scale per output channel.
     pub scales: Vec<f32>,
     /// One exact signed-byte sum per output channel for offset-domain kernels.
     pub row_sums: Vec<i32>,
@@ -134,11 +141,12 @@ impl Error for QuantizeError {}
 
 /// Quantize a row-major f32 matrix with the portable per-output-channel recipe.
 ///
-/// The scale is `max(abs(row))/127` for each nonzero row, otherwise positive
-/// and negative source zero both produce the canonical `+0.0` scale and all
-/// zero bytes.  Values are divided by that scale, clamped to `[-127, 127]`,
-/// and rounded to nearest with ties-to-even.  The function performs no native
-/// packing; its row-major output is the only canonical Generic ordering.
+/// The scale is `max(abs(row))/127` for each nonzero row. A row containing
+/// only positive and/or negative zero produces all zero bytes and the fixed
+/// positive [`PORTABLE_I8_ZERO_ROW_SCALE`] sidecar. Values are divided by their
+/// scale, clamped to `[-127, 127]`, and rounded to nearest with ties-to-even.
+/// The function performs no native packing; its row-major output is the only
+/// canonical Generic ordering.
 pub fn quantize_per_output_channel_i8(
     source: &[f32],
     rows: usize,
@@ -180,7 +188,7 @@ pub fn quantize_per_output_channel_i8(
         }
 
         if max_magnitude == 0.0 {
-            scales.push(0.0);
+            scales.push(PORTABLE_I8_ZERO_ROW_SCALE);
             values.extend(std::iter::repeat_n(0_i8, columns));
             row_sums.push(0);
             continue;
@@ -325,7 +333,7 @@ fn round_from_lower(lower: i32, fractional: f32) -> i32 {
 mod tests {
     use super::{
         encode_generic_panel, quantize_per_output_channel_i8, round_nearest_ties_even,
-        QuantizeError, PORTABLE_I8_MAX_MAGNITUDE,
+        QuantizeError, PORTABLE_I8_MAX_MAGNITUDE, PORTABLE_I8_ZERO_ROW_SCALE,
     };
     use crate::artifact::converter::StorageStage;
 
@@ -345,12 +353,12 @@ mod tests {
     }
 
     #[test]
-    fn zero_row_has_canonical_positive_zero_scale() {
+    fn zero_row_has_canonical_positive_scale() {
         let output = quantize_per_output_channel_i8(&[-0.0, 0.0, -0.0], 1, 3)
             .expect("finite zero row quantizes");
         assert_eq!(output.values, vec![0, 0, 0]);
-        assert_eq!(output.scales, vec![0.0]);
-        assert_eq!(output.scales[0].to_bits(), 0);
+        assert_eq!(output.scales, vec![PORTABLE_I8_ZERO_ROW_SCALE]);
+        assert_eq!(output.scales[0].to_bits(), 1.0_f32.to_bits());
         assert_eq!(output.row_sums, vec![0]);
     }
 
