@@ -8,9 +8,27 @@
 //! deliberately not adapted here: artifact schema and transaction authority
 //! remain unresolved.
 
-use std::{collections::BTreeMap, error::Error, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+    fs::File,
+    io::Read,
+    path::Path,
+};
 
-use crate::artifact::converter::{BF16_VERBATIM_V1, PORTABLE_QUANT_V1, StorageStage};
+use sha2::{Digest, Sha256};
+
+use crate::artifact::{
+    converter::{
+        BF16_VERBATIM_V1, PORTABLE_QUANT_V1, StorageStage, expected_nanbeige42_census,
+        remap_tensor_name,
+    },
+    format::{
+        FORMAT_VERSION, MAGIC, MAX_ENTRIES, MAX_HEADER_BYTES, PRELUDE_BYTES,
+        SECTION_DIRECTORY_ENTRY_BYTES,
+    },
+};
 
 use super::{
     tensor::Bf16,
@@ -19,6 +37,15 @@ use super::{
 
 const NANBEIGE_MODEL_ID: &str = "Nanbeige4.2-3B";
 const SYNTHETIC_SCOPE: &str = "scope=synthetic evidence=non_authoritative";
+const FORENSIC_SCOPE: &str = "scope=real-artifact-forensic evidence=non_authoritative";
+
+/// Maximum bytes the bounded forensic census may read from a real artifact.
+///
+/// This is a metadata-I/O cap, not a resident-set measurement or a production
+/// admission limit.  It covers the fixed prelude, maximum header, and maximum
+/// 80-byte current-writer directory only; it never authorizes payload reads.
+pub const FORENSIC_METADATA_READ_CAP: usize =
+    PRELUDE_BYTES + MAX_HEADER_BYTES as usize + MAX_ENTRIES * SECTION_DIRECTORY_ENTRY_BYTES;
 
 /// One Generic mapping selected from a checked tensor declaration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -350,6 +377,440 @@ pub struct LoadedArtifactWeights {
     pub weights: ArtifactWeightSet,
     /// Declared synthetic-memory facts; never a real-data RSS receipt.
     pub receipt: ArtifactLoadReceipt,
+}
+
+/// Metadata observed from the current writer's 80-byte directory representation.
+///
+/// This is a read-only forensic record.  It does not validate canonical JSON,
+/// section payload digests, activation identity, transaction state, or any
+/// native-engine equivalence condition; therefore it is never artifact
+/// acceptance evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForensicArtifactCensus {
+    /// Observed regular-file byte length.
+    pub observed_file_bytes: u64,
+    /// Fixed prelude's declared file length.
+    pub declared_file_bytes: u64,
+    /// Header bytes read after the bounded prelude.
+    pub header_bytes: u64,
+    /// Directory bytes read after the header.
+    pub directory_bytes: u64,
+    /// Total metadata bytes read by this forensic walk.
+    pub metadata_bytes_read: u64,
+    /// Declared binary-directory entry count.
+    pub section_count: u64,
+    /// Declared header tensor count.
+    pub tensor_count: u64,
+    /// Header model identifier observed without activation.
+    pub model_id: String,
+    /// Header revision observed without activation.
+    pub revision: String,
+    /// Header recipe spelling observed without selecting a recipe authority.
+    pub recipe_id: String,
+    /// Source-root digest spelling observed without authenticating a source closure.
+    pub source_root_sha256: String,
+    /// Logical-model digest spelling observed without authenticating payloads.
+    pub logical_model_sha256: String,
+    /// Count by header `canonical_dtype` spelling.
+    pub canonical_dtype_counts: BTreeMap<String, usize>,
+    /// Count by header Generic quantization spelling.
+    pub quantization_counts: BTreeMap<String, usize>,
+    /// Tensors that can be decoded individually as bf16-verbatim values.
+    pub bf16_verbatim_tensor_count: usize,
+    /// Tensors whose comparison route, if an executable profile is later added,
+    /// is the portable int8 profile rather than the bf16 eager profile.
+    pub portable_quant_tensor_count: usize,
+}
+
+/// Read a bounded, non-accepting census from the current 80-byte-directory writer output.
+///
+/// This function intentionally does not call `FnlpqArtifact::open_owned`, does
+/// not read a section payload, and does not choose an OQ-31 authority.  It is a
+/// temporary forensic observation of the exact bytes a current writer emitted;
+/// production admission must use the future ratified streaming reader instead.
+pub fn scan_current_80_byte_forensic_census<F>(
+    path: impl AsRef<Path>,
+    mut stage_line: F,
+) -> Result<ForensicArtifactCensus, ArtifactBridgeError>
+where
+    F: FnMut(&str),
+{
+    let path = path.as_ref();
+    let symlink_metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| forensic_io("inspect artifact path", error))?;
+    if symlink_metadata.file_type().is_symlink() || !symlink_metadata.file_type().is_file() {
+        return Err(ArtifactBridgeError::Source {
+            tensor: "<artifact>".to_owned(),
+            detail: "forensic input must be a non-symlink regular file".to_owned(),
+        });
+    }
+    let observed_file_bytes = symlink_metadata.len();
+    let mut file = File::open(path).map_err(|error| forensic_io("open artifact", error))?;
+    let mut prelude = [0_u8; PRELUDE_BYTES];
+    file.read_exact(&mut prelude)
+        .map_err(|error| forensic_io("read fixed prelude", error))?;
+    if prelude[..8] != MAGIC {
+        return Err(forensic_prelude(
+            "magic",
+            "does not match current writer magic",
+        ));
+    }
+    let version = u32::from_le_bytes(prelude[8..12].try_into().expect("fixed prelude"));
+    if version != FORMAT_VERSION {
+        return Err(forensic_prelude(
+            "format_version",
+            &format!("observed {version}, expected current writer {FORMAT_VERSION}"),
+        ));
+    }
+    let required_flags = u32::from_le_bytes(prelude[12..16].try_into().expect("fixed prelude"));
+    if required_flags != 0 {
+        return Err(forensic_prelude(
+            "required_flags",
+            &format!("observed nonzero value {required_flags}"),
+        ));
+    }
+    let header_len = u64::from_le_bytes(prelude[16..24].try_into().expect("fixed prelude"));
+    let section_count = u64::from_le_bytes(prelude[24..32].try_into().expect("fixed prelude"));
+    let tensor_count = u64::from_le_bytes(prelude[32..40].try_into().expect("fixed prelude"));
+    let declared_file_bytes =
+        u64::from_le_bytes(prelude[40..48].try_into().expect("fixed prelude"));
+    let header_sha256: [u8; 32] = prelude[48..80].try_into().expect("fixed prelude");
+    if header_len > MAX_HEADER_BYTES {
+        return Err(forensic_prelude(
+            "header_len",
+            &format!("observed {header_len}, cap {MAX_HEADER_BYTES}"),
+        ));
+    }
+    let section_count_usize = usize::try_from(section_count)
+        .map_err(|_| forensic_prelude("section_count", "does not fit host usize"))?;
+    if section_count_usize > MAX_ENTRIES {
+        return Err(forensic_prelude(
+            "section_count",
+            &format!("observed {section_count}, cap {MAX_ENTRIES}"),
+        ));
+    }
+    if declared_file_bytes != observed_file_bytes {
+        return Err(forensic_prelude(
+            "file_len",
+            &format!("declared {declared_file_bytes}, observed {observed_file_bytes}"),
+        ));
+    }
+    let directory_bytes = section_count
+        .checked_mul(SECTION_DIRECTORY_ENTRY_BYTES as u64)
+        .ok_or_else(|| forensic_prelude("section_count", "directory byte count overflow"))?;
+    let metadata_bytes = (PRELUDE_BYTES as u64)
+        .checked_add(header_len)
+        .and_then(|value| value.checked_add(directory_bytes))
+        .ok_or_else(|| forensic_prelude("metadata", "metadata end overflow"))?;
+    let metadata_cap = u64::try_from(FORENSIC_METADATA_READ_CAP).expect("metadata cap fits u64");
+    if metadata_bytes > metadata_cap || metadata_bytes > observed_file_bytes {
+        return Err(forensic_prelude(
+            "metadata",
+            &format!(
+                "declared {metadata_bytes}, forensic cap {metadata_cap}, file {observed_file_bytes}"
+            ),
+        ));
+    }
+    stage_line(&format!(
+        "LOAD STAGE=forensic-prelude {FORENSIC_SCOPE} status=OBSERVED file_bytes={observed_file_bytes} header_bytes={header_len} sections={section_count} tensors={tensor_count}"
+    ));
+
+    let header_len_usize = usize::try_from(header_len)
+        .map_err(|_| forensic_prelude("header_len", "does not fit host usize"))?;
+    let mut header_bytes = vec![0_u8; header_len_usize];
+    file.read_exact(&mut header_bytes)
+        .map_err(|error| forensic_io("read bounded header", error))?;
+    let observed_header_sha256: [u8; 32] = Sha256::digest(&header_bytes).into();
+    if observed_header_sha256 != header_sha256 {
+        return Err(forensic_prelude(
+            "header_sha256",
+            "raw header digest mismatch",
+        ));
+    }
+    let header: serde_json::Value =
+        serde_json::from_slice(&header_bytes).map_err(|error| ArtifactBridgeError::Source {
+            tensor: "<header>".to_owned(),
+            detail: format!("forensic JSON parse failed: {error}"),
+        })?;
+    let mut directory = vec![
+        0_u8;
+        usize::try_from(directory_bytes).map_err(|_| {
+            forensic_prelude("directory_bytes", "does not fit host usize")
+        })?
+    ];
+    file.read_exact(&mut directory)
+        .map_err(|error| forensic_io("read bounded directory", error))?;
+    validate_forensic_directory(&directory, metadata_bytes, observed_file_bytes)?;
+    stage_line(&format!(
+        "LOAD STAGE=forensic-directory {FORENSIC_SCOPE} status=OBSERVED bytes={directory_bytes} payload_bytes_read=0"
+    ));
+
+    let model = header
+        .get("model")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| forensic_header("model", "missing object"))?;
+    let model_id = forensic_string(model, "model_id", "model")?;
+    let revision = forensic_string(model, "revision", "model")?;
+    let recipe_id = forensic_root_string(&header, "recipe_id")?;
+    let source_root_sha256 = forensic_root_string(&header, "source_root_sha256")?;
+    let logical_model_sha256 = forensic_root_string(&header, "logical_model_sha256")?;
+    let tensors = header
+        .get("tensors")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| forensic_header("tensors", "missing array"))?;
+    if u64::try_from(tensors.len()).ok() != Some(tensor_count) {
+        return Err(forensic_header(
+            "tensors",
+            &format!(
+                "prelude count {tensor_count}, header count {}",
+                tensors.len()
+            ),
+        ));
+    }
+    let expected = expected_internal_nanbeige42_census()?;
+    if model_id == NANBEIGE_MODEL_ID && tensors.len() != expected.len() {
+        return Err(forensic_header(
+            "tensors",
+            &format!(
+                "Nanbeige expected {} names, observed {}",
+                expected.len(),
+                tensors.len()
+            ),
+        ));
+    }
+    let mut seen_names = BTreeSet::new();
+    let mut canonical_dtype_counts = BTreeMap::new();
+    let mut quantization_counts = BTreeMap::new();
+    let mut bf16_verbatim_tensor_count = 0_usize;
+    let mut portable_quant_tensor_count = 0_usize;
+    for tensor in tensors {
+        let object = tensor
+            .as_object()
+            .ok_or_else(|| forensic_header("tensors[]", "entry is not an object"))?;
+        let name = forensic_string(object, "name", "tensors[]")?;
+        if !seen_names.insert(name.clone()) {
+            return Err(forensic_header(
+                "tensors[].name",
+                &format!("duplicate {name:?}"),
+            ));
+        }
+        let shape = forensic_shape(object, &name)?;
+        if model_id == NANBEIGE_MODEL_ID {
+            let expected_shape = expected.get(name.as_str()).ok_or_else(|| {
+                forensic_header(
+                    "tensors[].name",
+                    &format!("unexpected Nanbeige internal tensor {name:?}"),
+                )
+            })?;
+            if &shape != expected_shape {
+                return Err(forensic_header(
+                    "tensors[].shape",
+                    &format!("tensor {name:?}: expected {expected_shape:?}, observed {shape:?}"),
+                ));
+            }
+        }
+        let canonical_dtype = forensic_string(object, "canonical_dtype", "tensors[]")?;
+        *canonical_dtype_counts.entry(canonical_dtype).or_insert(0) += 1;
+        let generic = object
+            .get("generic")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| forensic_header("tensors[].generic", "missing object"))?;
+        let quantization = forensic_string(generic, "quantization", "tensors[].generic")?;
+        *quantization_counts.entry(quantization.clone()).or_insert(0) += 1;
+        match quantization.as_str() {
+            BF16_VERBATIM_V1 => bf16_verbatim_tensor_count += 1,
+            PORTABLE_QUANT_V1 => portable_quant_tensor_count += 1,
+            _ => {
+                return Err(forensic_header(
+                    "tensors[].generic.quantization",
+                    &format!("tensor {name:?} uses unknown spelling {quantization:?}"),
+                ));
+            }
+        }
+    }
+    if model_id == NANBEIGE_MODEL_ID && seen_names.len() == expected.len() {
+        for expected_name in expected.keys() {
+            if !seen_names.contains(expected_name) {
+                return Err(forensic_header(
+                    "tensors[].name",
+                    &format!("missing Nanbeige internal tensor {expected_name:?}"),
+                ));
+            }
+        }
+    }
+    stage_line(&format!(
+        "LOAD STAGE=forensic-census {FORENSIC_SCOPE} status=OBSERVED model_id={model_id} tensors={} bf16_verbatim={bf16_verbatim_tensor_count} portable_quant={portable_quant_tensor_count}",
+        tensors.len()
+    ));
+    stage_line(&format!(
+        "LOAD STAGE=l2-from-artifact {FORENSIC_SCOPE} status=BLOCKED comparison_profile=int8 reason=portable-quant-tensors-present-and-no-artifact-backed-int8-forward"
+    ));
+    Ok(ForensicArtifactCensus {
+        observed_file_bytes,
+        declared_file_bytes,
+        header_bytes: header_len,
+        directory_bytes,
+        metadata_bytes_read: metadata_bytes,
+        section_count,
+        tensor_count,
+        model_id,
+        revision,
+        recipe_id,
+        source_root_sha256,
+        logical_model_sha256,
+        canonical_dtype_counts,
+        quantization_counts,
+        bf16_verbatim_tensor_count,
+        portable_quant_tensor_count,
+    })
+}
+
+fn forensic_io(operation: &'static str, error: std::io::Error) -> ArtifactBridgeError {
+    ArtifactBridgeError::Source {
+        tensor: "<artifact>".to_owned(),
+        detail: format!("forensic {operation}: {error}"),
+    }
+}
+
+fn forensic_prelude(field: &str, reason: &str) -> ArtifactBridgeError {
+    ArtifactBridgeError::Source {
+        tensor: "<prelude>".to_owned(),
+        detail: format!("forensic {field}: {reason}"),
+    }
+}
+
+fn forensic_header(field: &str, reason: &str) -> ArtifactBridgeError {
+    ArtifactBridgeError::Source {
+        tensor: "<header>".to_owned(),
+        detail: format!("forensic {field}: {reason}"),
+    }
+}
+
+fn validate_forensic_directory(
+    directory: &[u8],
+    metadata_end: u64,
+    file_len: u64,
+) -> Result<(), ArtifactBridgeError> {
+    let mut ranges = Vec::with_capacity(directory.len() / SECTION_DIRECTORY_ENTRY_BYTES);
+    for (ordinal, entry) in directory
+        .chunks_exact(SECTION_DIRECTORY_ENTRY_BYTES)
+        .enumerate()
+    {
+        let flags = u32::from_le_bytes(entry[4..8].try_into().expect("fixed entry"));
+        let file_offset = u64::from_le_bytes(entry[16..24].try_into().expect("fixed entry"));
+        let stored_len = u64::from_le_bytes(entry[24..32].try_into().expect("fixed entry"));
+        let logical_len = u64::from_le_bytes(entry[32..40].try_into().expect("fixed entry"));
+        let alignment = u64::from_le_bytes(entry[40..48].try_into().expect("fixed entry"));
+        if flags != 0 || logical_len != stored_len || alignment == 0 || !alignment.is_power_of_two()
+        {
+            return Err(ArtifactBridgeError::Source {
+                tensor: "<directory>".to_owned(),
+                detail: format!("forensic entry {ordinal} violates current writer fixed fields"),
+            });
+        }
+        let end =
+            file_offset
+                .checked_add(stored_len)
+                .ok_or_else(|| ArtifactBridgeError::Source {
+                    tensor: "<directory>".to_owned(),
+                    detail: format!("forensic entry {ordinal} range end overflow"),
+                })?;
+        if file_offset < metadata_end || end > file_len {
+            return Err(ArtifactBridgeError::Source {
+                tensor: "<directory>".to_owned(),
+                detail: format!(
+                    "forensic entry {ordinal} range is outside file metadata/payload bounds"
+                ),
+            });
+        }
+        ranges.push((file_offset, end));
+    }
+    ranges.sort_unstable();
+    for pair in ranges.windows(2) {
+        if pair[0].1 > pair[1].0 {
+            return Err(ArtifactBridgeError::Source {
+                tensor: "<directory>".to_owned(),
+                detail: "forensic directory has overlapping payload ranges".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn expected_internal_nanbeige42_census() -> Result<BTreeMap<String, Vec<u32>>, ArtifactBridgeError>
+{
+    expected_nanbeige42_census()
+        .into_iter()
+        .map(|expected| {
+            let route = remap_tensor_name(&expected.name).map_err(|error| {
+                forensic_header(
+                    "expected-census",
+                    &format!("route unavailable for {}: {error}", expected.name),
+                )
+            })?;
+            let shape = expected
+                .shape
+                .into_iter()
+                .map(|dimension| {
+                    u32::try_from(dimension).map_err(|_| {
+                        forensic_header(
+                            "expected-census",
+                            "frozen shape does not fit artifact v1 u32 dimensions",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((route.internal_name, shape))
+        })
+        .collect()
+}
+
+fn forensic_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<String, ArtifactBridgeError> {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| forensic_header(context, &format!("missing string {key:?}")))
+}
+
+fn forensic_root_string(
+    header: &serde_json::Value,
+    key: &str,
+) -> Result<String, ArtifactBridgeError> {
+    header
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| forensic_header("header", &format!("missing string {key:?}")))
+}
+
+fn forensic_shape(
+    object: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> Result<Vec<u32>, ArtifactBridgeError> {
+    object
+        .get("shape")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            forensic_header("tensors[].shape", &format!("tensor {name:?} missing array"))
+        })?
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|dimension| u32::try_from(dimension).ok())
+                .ok_or_else(|| {
+                    forensic_header(
+                        "tensors[].shape",
+                        &format!("tensor {name:?} has non-u32 dimension"),
+                    )
+                })
+        })
+        .collect()
 }
 
 /// Refuse one-model artifact activation until OQ-31 and xmy authority are ratified.

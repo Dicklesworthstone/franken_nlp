@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use franken_nlp::artifact::converter::StorageStage;
 use franken_nlp::native_engine::{
     artifact_bridge::{
         ArtifactBridgeError, ArtifactIdentity, ArtifactLoadBudget, ArtifactTensorContract,
-        ArtifactTensorDescriptor, CheckedArtifactSource, TensorMapping, TensorMappingLengths,
-        load_nanbeige42, load_synthetic_with_contract,
+        ArtifactTensorDescriptor, CheckedArtifactSource, FORENSIC_METADATA_READ_CAP, TensorMapping,
+        TensorMappingLengths, load_nanbeige42, load_synthetic_with_contract,
+        scan_current_80_byte_forensic_census,
     },
     tensor::Bf16,
 };
@@ -18,6 +20,8 @@ struct StreamingFixture {
     chunk_bytes: usize,
     resident_envelope_bytes: u64,
 }
+
+const REAL_ARTIFACT: &str = "/tmp/fnlp-conversion/nanbeige4.2-3b.fnlpq-v1.int8.generic.fnlpq";
 
 impl StreamingFixture {
     fn expected() -> Self {
@@ -296,5 +300,57 @@ fn one_model_entry_refuses_unresolved_oq31_before_selecting_a_quantized_dtype() 
             "LOAD STAGE=activation scope=synthetic evidence=non_authoritative status=REFUSED reason=oq31-authority-unresolved"
                 .to_owned()
         ]
+    );
+}
+
+#[test]
+fn real_artifact_forensic_census_reads_only_bounded_metadata_when_model_is_present() {
+    let path = Path::new(REAL_ARTIFACT);
+    if !path.is_file() {
+        eprintln!(
+            "LOAD STAGE=forensic-census scope=real-artifact-forensic evidence=non_authoritative status=SKIPPED reason=model-artifact-unavailable"
+        );
+        return;
+    }
+    let mut lines = Vec::new();
+    let report = scan_current_80_byte_forensic_census(path, |line| lines.push(line.to_owned()))
+        .expect("current-writer artifact metadata has a bounded forensic census");
+    for line in &lines {
+        eprintln!("{line}");
+    }
+    assert_eq!(report.observed_file_bytes, 4_690_873_282);
+    assert_eq!(report.declared_file_bytes, 4_690_873_282);
+    assert_eq!(report.header_bytes, 87_571);
+    assert_eq!(report.section_count, 8);
+    assert_eq!(report.tensor_count, 201);
+    assert_eq!(report.model_id, "Nanbeige4.2-3B");
+    assert_eq!(report.revision, "f56ec5a9650268aa098496734743c25ea778bd2d");
+    assert_eq!(
+        report.source_root_sha256,
+        "71686a7075712c2b38e80fe387b9f23e3befac6e367bb4cb0d0ba5a90374c7fd"
+    );
+    assert_eq!(report.canonical_dtype_counts.get("bf16"), Some(&201));
+    assert_eq!(report.bf16_verbatim_tensor_count, 46);
+    assert_eq!(report.portable_quant_tensor_count, 155);
+    assert!(
+        report.metadata_bytes_read
+            <= u64::try_from(FORENSIC_METADATA_READ_CAP).expect("test cap fits u64"),
+        "bounded forensic metadata I/O must not become a whole-envelope read"
+    );
+    assert!(lines.iter().any(|line| {
+        line.contains("LOAD STAGE=forensic-prelude scope=real-artifact-forensic evidence=non_authoritative status=OBSERVED")
+    }));
+    assert!(lines.iter().any(|line| {
+        line.contains("LOAD STAGE=forensic-directory scope=real-artifact-forensic evidence=non_authoritative status=OBSERVED")
+    }));
+    assert!(lines.iter().any(|line| {
+        line.contains("LOAD STAGE=forensic-census scope=real-artifact-forensic evidence=non_authoritative status=OBSERVED")
+    }));
+    assert!(lines.iter().any(|line| {
+        line.contains("LOAD STAGE=l2-from-artifact scope=real-artifact-forensic evidence=non_authoritative status=BLOCKED comparison_profile=int8")
+    }));
+    eprintln!(
+        "LOAD STAGE=forensic-metadata-bound scope=real-artifact-forensic evidence=non_authoritative status=OBSERVED metadata_bytes_read={} cap={}",
+        report.metadata_bytes_read, FORENSIC_METADATA_READ_CAP
     );
 }
