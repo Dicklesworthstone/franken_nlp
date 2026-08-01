@@ -5,7 +5,7 @@ use franken_nlp::native_engine::kv::{
     KV_INT8_F16_SCALE_BYTES_PER_TOKEN, KV_INT8_F32_SCALE_BYTES_PER_TOKEN,
     KV_INT8_PAYLOAD_BYTES_PER_TOKEN, KV_LOGICAL_PAGE_TOKENS, KV_SLOT_COUNT,
     KV_SLABS_PER_LOGICAL_PAGE, KV_SLAB_VECTOR_ALIGNMENT_BYTES, KvSlabAdmission, KvSlabCache,
-    KvSlabDtype, KvSlabError, KvSlabKey, KvVector,
+    KvSlabDtype, KvSlabError, KvSlabKey, KvSlabPoolStats, KvVector,
 };
 
 fn append_prepared_position(cache: &mut KvSlabCache, position: usize, marker: u16) {
@@ -19,6 +19,31 @@ fn append_prepared_position(cache: &mut KvSlabCache, position: usize, marker: u1
             .append(slot, position, &key, &value)
             .expect("prepared hot-loop K/V append must not allocate or fail");
     }
+}
+
+fn assert_pool_ledger_reconciles(stats: KvSlabPoolStats) {
+    assert_eq!(
+        stats.reserved_payload_bytes,
+        stats.slab_capacity * KV_BF16_SLAB_BYTES,
+        "pre-reserved pool bytes are the exact sum of physical slabs"
+    );
+    assert_eq!(
+        stats.live_payload_bytes,
+        stats.live_slab_count * KV_BF16_SLAB_BYTES,
+        "live ledger bytes are the exact sum of retained physical slabs"
+    );
+    assert_eq!(
+        stats.free_slab_count + stats.live_slab_count,
+        stats.slab_capacity,
+        "every pre-reserved slab is either free or reachable from a page table"
+    );
+    let references = stats
+        .retained_reference_count
+        .expect("bounded lifecycle test must retain a representable refcount total");
+    assert!(
+        references >= stats.live_slab_count,
+        "each live slab retains at least one deterministic page-table reference"
+    );
 }
 
 #[test]
@@ -92,6 +117,7 @@ fn typed_admission_constructs_an_exactly_priced_pre_reserved_pool() {
     assert_eq!(stats.live_slab_count, 0);
     assert_eq!(stats.free_slab_count, admission.reserved_slab_count());
     assert_eq!(stats.retained_reference_count, Some(0));
+    assert_pool_ledger_reconciles(stats);
 }
 
 #[test]
@@ -139,6 +165,7 @@ fn prepared_append_uses_only_preallocated_aligned_slabs() {
         after_append.retained_reference_count,
         Some(KV_SLABS_PER_LOGICAL_PAGE)
     );
+    assert_pool_ledger_reconciles(after_append);
 
     let mut key = [0_u16; 1_024];
     let mut value = [0_u16; 1_024];
@@ -172,6 +199,7 @@ fn page_admission_refuses_atomically_before_any_slab_is_assigned() {
     assert_eq!(cache.pool_stats().live_payload_bytes, 0);
     assert_eq!(cache.pool_stats().allocation_events, 0);
     assert_eq!(cache.pool_stats().retained_reference_count, Some(0));
+    assert_pool_ledger_reconciles(cache.pool_stats());
 }
 
 #[test]
@@ -191,6 +219,7 @@ fn forked_tail_cow_releases_only_the_cancelled_fork_slabs() {
         fork.pool_stats().retained_reference_count,
         Some(KV_SLABS_PER_LOGICAL_PAGE * 2)
     );
+    assert_pool_ledger_reconciles(fork.pool_stats());
 
     fork.prepare_append(3)
         .expect("fork-tail COW is prepared outside the append loop");
@@ -199,6 +228,7 @@ fn forked_tail_cow_releases_only_the_cancelled_fork_slabs() {
         fork.pool_stats().retained_reference_count,
         Some(KV_SLABS_PER_LOGICAL_PAGE * 2)
     );
+    assert_pool_ledger_reconciles(fork.pool_stats());
     append_prepared_position(&mut fork, 3, 99);
 
     let mut parent_key = [0_u16; 1_024];
@@ -216,6 +246,7 @@ fn forked_tail_cow_releases_only_the_cancelled_fork_slabs() {
         retained.retained_reference_count,
         Some(KV_SLABS_PER_LOGICAL_PAGE)
     );
+    assert_pool_ledger_reconciles(retained);
     assert_eq!(parent.refcount_at(0, 0, KvVector::Key), Ok(1));
 }
 
@@ -242,6 +273,7 @@ fn parent_append_after_fork_cows_the_sealed_page_before_writing() {
         after_parent_cow.retained_reference_count,
         Some(KV_SLABS_PER_LOGICAL_PAGE * 2)
     );
+    assert_pool_ledger_reconciles(after_parent_cow);
     assert_eq!(parent.refcount_at(7, 2, KvVector::Value), Ok(1));
     assert_eq!(fork.refcount_at(7, 2, KvVector::Value), Ok(1));
 
@@ -262,4 +294,5 @@ fn parent_append_after_fork_cows_the_sealed_page_before_writing() {
         parent_only.retained_reference_count,
         Some(KV_SLABS_PER_LOGICAL_PAGE)
     );
+    assert_pool_ledger_reconciles(parent_only);
 }
