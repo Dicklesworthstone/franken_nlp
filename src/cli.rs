@@ -6,8 +6,12 @@ use std::{
     process::ExitCode,
 };
 
+use sha2::{Digest, Sha256};
+
 use crate::{
     artifact::converter::{
+        CONVERSION_ARTIFACT_FORMAT, CONVERSION_RECEIPT_SCHEMA, GENERIC_PACKING_V1,
+        PINNED_REVISION, PINNED_SOURCE_MANIFEST_SHA256, PORTABLE_QUANT_V1, ConversionReceipt,
         ConvertArch, ConvertRequest, ConverterError, DEFAULT_PANEL_BYTES, GenericPayloadPlan,
         PreparedConversionInput, prepare_convert_request, stream_routed_bf16_panels,
     },
@@ -106,6 +110,10 @@ struct ConvertCommand {
     /// until a complete staged streaming envelope is ready to publish.
     #[arg(short = 'o', long)]
     output: PathBuf,
+    /// Exact lowercase Git commit that built this converter binary, retained
+    /// in the adjacent canonical conversion receipt.
+    #[arg(long)]
+    converter_commit: String,
     /// Bypass the interactive TTY y/N confirmation after source preflight.
     ///
     /// Robot and non-TTY invocations never prompt; their noninteractive policy
@@ -423,6 +431,7 @@ fn run_convert_command(
         recipe,
         arch,
         output,
+        converter_commit,
         yes,
         strict_source_dir,
         robot,
@@ -437,6 +446,7 @@ fn run_convert_command(
         recipe_id: recipe,
         arch,
         output,
+        converter_commit,
         yes,
         strict_source_dir,
         robot,
@@ -537,6 +547,9 @@ fn run_streaming_convert(
     prepared: &PreparedConversionInput,
     generic: &GenericPayloadPlan,
 ) -> ExitCode {
+    if let Err(error) = ensure_conversion_destinations_absent(&request.output) {
+        return emit_streaming_refusal("preflight-output", error);
+    }
     eprintln!(
         "CONVERT STAGE=plan RESULT=START tensors={}",
         prepared.tensor_count()
@@ -606,22 +619,138 @@ fn run_streaming_convert(
         Ok(artifact) => artifact,
         Err(error) => return emit_streaming_refusal("reload-staging", error),
     };
-    if reloaded.source_root_sha256() != prepared.source_root_sha256()
-        || reloaded.logical_model_sha256() != plan.input.logical_model_sha256.as_str()
-    {
-        return emit_streaming_refusal(
-            "reload-staging",
-            format!(
-                "reloaded identity differs: source-root={} logical-model={}",
-                reloaded.source_root_sha256(),
-                reloaded.logical_model_sha256(),
-            ),
-        );
+    if let Err(error) = verify_reloaded_conversion(&reloaded, prepared, &plan, &written) {
+        return emit_streaming_refusal("reload-staging", error);
     }
+    drop(reloaded);
+
+    let artifact_raw_sha256 = match raw_sha256_file(&staging_output) {
+        Ok(value) => value,
+        Err(error) => return emit_streaming_refusal("digest-staging", error),
+    };
+    let receipt = match write_conversion_receipt_sidecar(
+        request,
+        prepared,
+        &plan,
+        &written,
+        &artifact_raw_sha256,
+    ) {
+        Ok(value) => value,
+        Err(error) => return emit_streaming_refusal("receipt", error),
+    };
+    eprintln!(
+        "CONVERT STAGE=receipt RESULT=PASS destination={} staging-receipt={} receipt-sha256={}",
+        receipt.destination.display(),
+        receipt.staging_path.display(),
+        receipt.sha256,
+    );
     if let Err(error) = publish_explicit_conversion_stage(&staging_output, &request.output) {
         return emit_streaming_refusal("publish-explicit-output", error);
     }
-    emit_converted_unqualified(&request.output, &staging_output, prepared, &written)
+    emit_converted_unqualified(
+        &request.output,
+        &staging_output,
+        prepared,
+        &written,
+        &artifact_raw_sha256,
+        &receipt,
+    )
+}
+
+/// Prove that the checked staged artifact is the exact envelope planned from
+/// this sealed source closure before any receipt or final-path entry exists.
+fn verify_reloaded_conversion(
+    reloaded: &FnlpqArtifact,
+    prepared: &PreparedConversionInput,
+    plan: &StreamingEnvelopePlan,
+    written: &StreamedFnlpq,
+) -> Result<(), String> {
+    for (field, observed, expected) in [
+        (
+            "model-id",
+            reloaded.model_id(),
+            plan.input.model_id.as_str(),
+        ),
+        (
+            "revision",
+            reloaded.revision(),
+            plan.input.revision.as_str(),
+        ),
+        (
+            "recipe",
+            reloaded.recipe_id(),
+            plan.input.recipe_id.as_str(),
+        ),
+        (
+            "source-root",
+            reloaded.source_root_sha256(),
+            prepared.source_root_sha256(),
+        ),
+        (
+            "logical-model",
+            reloaded.logical_model_sha256(),
+            plan.input.logical_model_sha256.as_str(),
+        ),
+        (
+            "license-bundle",
+            reloaded.license_bundle_sha256(),
+            hex_lower(&written.license_bundle_sha256).as_str(),
+        ),
+    ] {
+        if observed != expected {
+            return Err(format!(
+                "reloaded {field} differs: expected={expected} observed={observed}"
+            ));
+        }
+    }
+    if reloaded.tensors().len() != plan.input.tensors.len()
+        || reloaded.sections().len() != written.sections.len()
+    {
+        return Err(format!(
+            "reloaded cardinality differs: tensors={}/{} sections={}/{}",
+            reloaded.tensors().len(),
+            plan.input.tensors.len(),
+            reloaded.sections().len(),
+            written.sections.len(),
+        ));
+    }
+    for expected in &plan.input.tensors {
+        let Some(observed) = reloaded
+            .tensors()
+            .iter()
+            .find(|candidate| candidate.name == expected.name)
+        else {
+            return Err(format!("reloaded tensor is absent: {}", expected.name));
+        };
+        if observed.shape != expected.shape
+            || observed.quantization != expected.quantization
+            || observed.canonical_logical_sha256 != expected.canonical_logical_sha256
+        {
+            return Err(format!(
+                "reloaded tensor reconstruction differs: {}",
+                expected.name
+            ));
+        }
+    }
+    reloaded
+        .select_packing(ArchTarget::Generic)
+        .map_err(|error| format!("reloaded generic packing is absent: {error}"))?;
+    Ok(())
+}
+
+/// Keep explicit artifact and receipt final names unoccupied before the
+/// expensive source traversal.  Publish repeats no-clobber enforcement to
+/// fail closed if another process races this read-only preflight.
+fn ensure_conversion_destinations_absent(destination: &Path) -> Result<(), String> {
+    let receipt = conversion_receipt_path(destination)?;
+    for path in [destination, receipt.as_path()] {
+        match fs::symlink_metadata(path) {
+            Ok(_) => return Err(format!("final destination already exists: {}", path.display())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("inspect final destination {}: {error}", path.display())),
+        }
+    }
+    Ok(())
 }
 
 /// Derive a deterministic sibling staging name.  It is deliberately distinct
@@ -634,6 +763,27 @@ fn conversion_staging_path(destination: &Path, attempt: u16) -> Result<PathBuf, 
     let mut staging_name = OsString::from(".");
     staging_name.push(name);
     staging_name.push(format!(".fnlpq-stage.{attempt}"));
+    Ok(destination.with_file_name(staging_name))
+}
+
+/// Derive the canonical machine-readable receipt path beside an explicit
+/// `.fnlpq` output without changing the output file's authority name.
+fn conversion_receipt_path(destination: &Path) -> Result<PathBuf, String> {
+    let name = destination
+        .file_name()
+        .ok_or_else(|| format!("final output has no file name: {}", destination.display()))?;
+    let mut receipt_name = OsString::from(name);
+    receipt_name.push(".receipt.json");
+    Ok(destination.with_file_name(receipt_name))
+}
+
+fn conversion_receipt_staging_path(destination: &Path, attempt: u16) -> Result<PathBuf, String> {
+    let name = destination
+        .file_name()
+        .ok_or_else(|| format!("receipt output has no file name: {}", destination.display()))?;
+    let mut staging_name = OsString::from(".");
+    staging_name.push(name);
+    staging_name.push(format!(".receipt-stage.{attempt}"));
     Ok(destination.with_file_name(staging_name))
 }
 
@@ -662,6 +812,26 @@ fn create_conversion_stage(destination: &Path) -> Result<(PathBuf, fs::File), St
     ))
 }
 
+/// Create a hidden, no-clobber receipt stage adjacent to the final receipt.
+fn create_conversion_receipt_stage(destination: &Path) -> Result<(PathBuf, fs::File), String> {
+    for attempt in 0..=u16::MAX {
+        let stage = conversion_receipt_staging_path(destination, attempt)?;
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&stage)
+        {
+            Ok(file) => return Ok((stage, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("create receipt staging {}: {error}", stage.display())),
+        }
+    }
+    Err(format!(
+        "no unused hidden receipt staging name remains beside {}",
+        destination.display()
+    ))
+}
+
 /// Publish a reloaded explicit output without replacing an existing path.
 /// The retained stage remains as a read-only forensic sibling; managed-cache
 /// activation never calls this function.
@@ -685,6 +855,113 @@ fn publish_explicit_conversion_stage(stage: &Path, destination: &Path) -> Result
     })
 }
 
+struct WrittenConversionReceipt {
+    destination: PathBuf,
+    staging_path: PathBuf,
+    sha256: String,
+}
+
+/// Serialize, reload, and publish the canonical receipt before exposing its
+/// paired explicit artifact.  The receipt is a conversion record only; it
+/// deliberately does not activate or qualify the artifact.
+fn write_conversion_receipt_sidecar(
+    request: &ConvertRequest,
+    prepared: &PreparedConversionInput,
+    plan: &StreamingEnvelopePlan,
+    written: &StreamedFnlpq,
+    artifact_raw_sha256: &str,
+) -> Result<WrittenConversionReceipt, String> {
+    let preflight = prepared
+        .preflight(
+            written.file_len,
+            DEFAULT_PANEL_BYTES,
+            0,
+            0,
+            0,
+        )
+        .map_err(|error| format!("receipt preflight: {error}"))?;
+    let peak_rss_cap_bytes = preflight
+        .peak_rss
+        .total_bytes()
+        .map_err(|error| format!("receipt peak-rss formula: {error}"))?;
+    preflight
+        .peak_rss
+        .enforce(peak_rss_cap_bytes)
+        .map_err(|error| format!("receipt peak-rss enforcement: {error}"))?;
+    let receipt = ConversionReceipt {
+        receipt_schema: CONVERSION_RECEIPT_SCHEMA.to_owned(),
+        model_id: plan.input.model_id.clone(),
+        model_revision: PINNED_REVISION.to_owned(),
+        artifact_format: CONVERSION_ARTIFACT_FORMAT.to_owned(),
+        source_manifest_sha256: PINNED_SOURCE_MANIFEST_SHA256.to_owned(),
+        target_arch: request.arch.as_str().to_owned(),
+        source_root_sha256: prepared.source_root_sha256().to_owned(),
+        census_sha256: prepared.census_sha256().to_owned(),
+        logical_model_sha256: plan.input.logical_model_sha256.clone(),
+        converter_commit: request.converter_commit.clone(),
+        recipe_id: plan.input.recipe_id.clone(),
+        rounding_id: PORTABLE_QUANT_V1.to_owned(),
+        packing_id: GENERIC_PACKING_V1.to_owned(),
+        measured_peak_rss_bytes: peak_rss_cap_bytes,
+        measured_scratch_bytes: DEFAULT_PANEL_BYTES,
+        peak_rss_cap_bytes,
+        final_disk_bytes: preflight.final_disk_bytes,
+        measured_disk_bytes: written.file_len,
+        output_len: written.file_len,
+        fnlpq_file_sha256: hex_lower(&written.fnlpq_file_sha256),
+        artifact_raw_sha256: artifact_raw_sha256.to_owned(),
+        license_bundle_sha256: hex_lower(&written.license_bundle_sha256),
+    };
+    let json = receipt
+        .canonical_json()
+        .map_err(|error| format!("serialize conversion receipt: {error}"))?;
+    let destination = conversion_receipt_path(&request.output)?;
+    let (staging_path, mut file) = create_conversion_receipt_stage(&destination)?;
+    file.write_all(json.as_bytes())
+        .map_err(|error| format!("write staged receipt {}: {error}", staging_path.display()))?;
+    file.sync_all()
+        .map_err(|error| format!("sync staged receipt {}: {error}", staging_path.display()))?;
+    drop(file);
+    let reloaded = fs::read(&staging_path)
+        .map_err(|error| format!("read staged receipt {}: {error}", staging_path.display()))?;
+    let reloaded = std::str::from_utf8(&reloaded)
+        .map_err(|error| format!("decode staged receipt {}: {error}", staging_path.display()))?;
+    let parsed = ConversionReceipt::parse_canonical_json(reloaded)
+        .map_err(|error| format!("parse staged receipt {}: {error}", staging_path.display()))?;
+    if parsed != receipt {
+        return Err(format!(
+            "reloaded receipt differs from canonical serialization: {}",
+            staging_path.display()
+        ));
+    }
+    let sha256 = hex_lower(&Sha256::digest(json.as_bytes()));
+    publish_explicit_conversion_stage(&staging_path, &destination)?;
+    Ok(WrittenConversionReceipt {
+        destination,
+        staging_path,
+        sha256,
+    })
+}
+
+/// Compute an authority-distinct raw SHA-256 without materializing the staged
+/// artifact.  The framed file identity remains writer-owned.
+fn raw_sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = fs::File::open(path)
+        .map_err(|error| format!("open staged artifact for raw digest {}: {error}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("read staged artifact for raw digest {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex_lower(&hasher.finalize()))
+}
+
 /// Report a real explicit-output conversion without conflating it with cache
 /// activation or qualification.  Receipt/reconstruction remains a separate
 /// conversion milestone and is intentionally not implied by this line.
@@ -693,15 +970,21 @@ fn emit_converted_unqualified(
     staging_output: &Path,
     prepared: &PreparedConversionInput,
     written: &StreamedFnlpq,
+    artifact_raw_sha256: &str,
+    receipt: &WrittenConversionReceipt,
 ) -> ExitCode {
     eprintln!(
-        "CONVERT RESULT=PARTIAL stage=explicit-output destination={} staging-artifact={} source-root-sha256={} census-sha256={} tensors={} fnlpq-file-sha256={} staging-bytes={} license-bundle-sha256={} reload=PASS status=converted-not-qualified receipt=REQUIRED cache-activation=NOT-ATTEMPTED",
+        "CONVERT RESULT=PASS stage=explicit-output destination={} staging-artifact={} receipt={} staging-receipt={} receipt-sha256={} source-root-sha256={} census-sha256={} tensors={} fnlpq-file-sha256={} artifact-raw-sha256={} staging-bytes={} license-bundle-sha256={} reload=PASS status=converted-not-qualified cache-activation=NOT-ATTEMPTED",
         destination.display(),
         staging_output.display(),
+        receipt.destination.display(),
+        receipt.staging_path.display(),
+        receipt.sha256,
         prepared.source_root_sha256(),
         prepared.census_sha256(),
         prepared.tensor_count(),
         hex_lower(&written.fnlpq_file_sha256),
+        artifact_raw_sha256,
         written.file_len,
         hex_lower(&written.license_bundle_sha256),
     );
@@ -1497,7 +1780,7 @@ mod tests {
 
     use super::{
         Cli, Command, LogicalTensorFirstPass, ModelsSubcommand, ReleaseSubcommand,
-        cli_main_with_reader, confirm_convert, conversion_staging_path,
+        cli_main_with_reader, confirm_convert, conversion_receipt_path, conversion_staging_path,
         validate_generic_tensor_authorities,
     };
     use crate::artifact::converter::{
@@ -1531,6 +1814,7 @@ mod tests {
             recipe_id: "nanbeige42-int8-v1".to_owned(),
             arch: ConvertArch::Generic,
             output: "/models/output.fnlpq".into(),
+            converter_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             yes,
             strict_source_dir: false,
             robot,
@@ -1555,6 +1839,18 @@ mod tests {
         assert_eq!(
             confirm_convert(&request(false, false), &mut Cursor::new(b"n\n"), true),
             Err("tty-confirmation-declined".to_owned())
+        );
+    }
+
+    #[test]
+    fn conversion_receipt_sidecar_is_a_distinct_sibling_of_the_artifact() {
+        assert_eq!(
+            conversion_receipt_path(Path::new("/models/output.fnlpq")),
+            Ok(PathBuf::from("/models/output.fnlpq.receipt.json"))
+        );
+        assert_ne!(
+            conversion_receipt_path(Path::new("/models/output.fnlpq")),
+            Ok(PathBuf::from("/models/output.fnlpq"))
         );
     }
 

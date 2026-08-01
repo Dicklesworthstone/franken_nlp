@@ -8,12 +8,13 @@
 use std::io::{self, Write};
 
 use serde::Serialize;
+use serde_json::{Value, json};
 
 use crate::{native_engine::dispatch, orchestrator};
 
-/// Schema v2 adds the additive `convert_stage` event used by `fnlp convert
-/// --robot`. Existing event names and fields retain their v1 spelling.
-pub const ROBOT_SCHEMA_VERSION: u32 = 2;
+/// Schema v3 adds the non-allocating admission-plan response. Existing event
+/// names and fields retain their v2 spelling.
+pub const ROBOT_SCHEMA_VERSION: u32 = 3;
 
 /// A stable robot event name. Do not rename an event without a schema-version
 /// bump and a reviewed golden update.
@@ -402,6 +403,7 @@ pub enum RobotCommand {
     Schema,
     Health,
     Backends,
+    Plan(orchestrator::AdmissionRequest),
 }
 
 /// One discriminated schema covers every document the robot surface emits.
@@ -410,7 +412,44 @@ pub enum RobotCommand {
 const ROBOT_SCHEMA_JSON: &str = r#"{"$id":"https://franken-nlp.dev/schema/robot/v2","$schema":"https://json-schema.org/draft/2020-12/schema","oneOf":[{"additionalProperties":false,"allOf":[{"if":{"properties":{"event":{"const":"doc_error"}}},"then":{"required":["input_line","request_seq"]}},{"if":{"properties":{"event":{"enum":["doc","token","run_complete"]}}},"then":{"required":["request_seq"]}},{"if":{"properties":{"event":{"const":"convert_stage"}}},"then":{"required":["command","result","stage"]}}],"properties":{"byte_offset":{"minimum":0,"type":"integer"},"caller_id":{"minLength":1,"type":"string"},"census_sha256":{"pattern":"^[0-9a-f]{64}$","type":"string"},"command":{"const":"convert","type":"string"},"destination":{"type":"string"},"event":{"enum":["run_start","stage","doc","doc_error","token","flush","run_complete","run_error","convert_stage"],"type":"string"},"fnlpq_file_sha256":{"pattern":"^[0-9a-f]{64}$","type":"string"},"input_line":{"minimum":1,"type":"integer"},"json_path":{"type":"string"},"license_bundle_sha256":{"pattern":"^[0-9a-f]{64}$","type":"string"},"reason":{"type":"string"},"request_seq":{"minimum":0,"type":"integer"},"result":{"minLength":1,"type":"string"},"schema_version":{"const":2,"type":"integer"},"sections":{"minimum":0,"type":"integer"},"source":{"type":"string"},"source_manifest":{"type":"string"},"source_root_sha256":{"pattern":"^[0-9a-f]{64}$","type":"string"},"stage":{"minLength":1,"type":"string"},"staging_artifact":{"type":"string"},"staging_bytes":{"minimum":0,"type":"integer"},"status":{"type":"string"},"tensors":{"minimum":0,"type":"integer"}},"required":["event","schema_version"],"type":"object"},{"additionalProperties":false,"properties":{"capabilities":{"type":"object"},"kind":{"const":"robot_health","type":"string"},"schema_version":{"const":2,"type":"integer"},"thread_inventory":{"type":"object"}},"required":["capabilities","kind","schema_version","thread_inventory"],"type":"object"},{"additionalProperties":false,"properties":{"backends":{"type":"object"},"kind":{"const":"robot_backends","type":"string"},"schema_version":{"const":2,"type":"integer"},"status":{"const":"populated","type":"string"}},"required":["backends","kind","schema_version","status"],"type":"object"}],"title":"franken_nlp robot NDJSON v2","x_fnlp_robot":{"commands":{"backends":{"fields":["architecture","backends","kind","schema_version","status"],"kind":"robot_backends","status":"populated"},"convert":{"fields":["command","stage","result","source","source_manifest","destination","staging_artifact","source_root_sha256","census_sha256","tensors","sections","fnlpq_file_sha256","staging_bytes","license_bundle_sha256","reason"],"kind":"robot_convert_stage","status":"partial"},"health":{"fields":["capabilities","kind","schema_version","thread_inventory"],"kind":"robot_health","status":"conditional"},"schema":{"kind":"robot_schema"}},"exit_code_authority":"src/error.rs::EXIT_CODE_TABLE","request_seq_events":["doc","doc_error","token","run_complete"],"stderr":"diagnostics_only","stdout":"data_only","volatile_fields":[]}}"#;
 
 pub fn schema_json_bytes() -> Vec<u8> {
-    let mut result = ROBOT_SCHEMA_JSON.as_bytes().to_vec();
+    let mut schema: Value = serde_json::from_str(ROBOT_SCHEMA_JSON)
+        .expect("the checked-in robot schema template must remain valid JSON");
+    schema["$id"] = Value::from("https://franken-nlp.dev/schema/robot/v3");
+    schema["title"] = Value::from("franken_nlp robot NDJSON v3");
+    for response in schema["oneOf"]
+        .as_array_mut()
+        .expect("robot schema template must have response variants")
+    {
+        response["properties"]["schema_version"]["const"] = Value::from(ROBOT_SCHEMA_VERSION);
+    }
+    schema["oneOf"]
+        .as_array_mut()
+        .expect("robot schema template must have response variants")
+        .push(json!({
+            "additionalProperties": false,
+            "properties": {
+                "aggregate_status": {"enum": ["admitted", "refused", "not_installed"], "type": "string"},
+                "allocations": {"const": "none", "type": "string"},
+                "batch_rows": {"minimum": 1, "type": "integer"},
+                "context_tokens": {"minimum": 0, "type": "integer"},
+                "kind": {"const": "robot_plan", "type": "string"},
+                "quantization": {"enum": ["bf16", "int8-f32-scales", "int8-f16-scales"], "type": "string"},
+                "rejection": {"type": ["object", "null"]},
+                "schema_version": {"const": ROBOT_SCHEMA_VERSION, "type": "integer"},
+                "status": {"enum": ["admitted", "refused", "not_installed"], "type": "string"},
+                "terms": {"type": "object"},
+                "thread_inventory": {"type": "object"}
+            },
+            "required": ["aggregate_status", "allocations", "batch_rows", "context_tokens", "kind", "quantization", "schema_version", "status", "terms", "thread_inventory"],
+            "type": "object"
+        }));
+    schema["x_fnlp_robot"]["commands"]["plan"] = json!({
+        "fields": ["allocations", "context_tokens", "batch_rows", "quantization", "thread_inventory", "terms", "status", "aggregate_status", "rejection", "kind", "schema_version"],
+        "kind": "robot_plan",
+        "status": "partial"
+    });
+    let mut result = serde_json::to_vec(&schema)
+        .expect("the checked-in robot schema template must be serializable");
     result.push(b'\n');
     result
 }
