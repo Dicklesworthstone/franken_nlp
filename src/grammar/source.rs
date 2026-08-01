@@ -687,8 +687,13 @@ mod tests {
             .expect("valid field bounds");
         assert!(run.legal_next_bytes()[usize::from(b'e')]);
         assert!(!run.legal_next_bytes()[usize::from(b'z')]);
-        run.push_bytes("e\u{301}c".as_bytes())
-            .expect("the logical unescaped bytes occur in the source");
+        run.push_byte(b'e')
+            .expect("the first logical byte occurs in the source");
+        run.push_bytes(&[0xcc])
+            .expect("a byte-fallback piece may end inside a UTF-8 scalar");
+        assert!(run.legal_next_bytes()[0x81]);
+        run.push_bytes(&[0x81, b'c'])
+            .expect("the final byte-fallback piece reaches a logical UTF-8 boundary");
         let matches = run.finish().expect("substring must finish at a boundary");
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].byte_start, 8);
@@ -700,6 +705,22 @@ mod tests {
             .expect_err("off-source bytes cannot enter the source language");
         assert!(matches!(
             error,
+            SourceProductError::NoSourceContinuation { .. }
+        ));
+
+        let quoted_source = index("say \"e\"");
+        let logical_quote = quoted_source
+            .accept("\"e\"", VerbatimFieldSpec::all(16))
+            .expect("logical quote bytes occur in the source");
+        assert_eq!(
+            (logical_quote[0].byte_start, logical_quote[0].byte_end),
+            (4, 7)
+        );
+        let escaped_spelling = quoted_source
+            .accept(r#"\"e\""#, VerbatimFieldSpec::all(16))
+            .expect_err("the source machine sees logical bytes, never JSON escape spelling");
+        assert!(matches!(
+            escaped_spelling,
             SourceProductError::NoSourceContinuation { .. }
         ));
     }
