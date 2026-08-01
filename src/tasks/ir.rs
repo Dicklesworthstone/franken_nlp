@@ -139,7 +139,7 @@ impl ContinuationTrieReference {
 /// A bounded reference to grammar/execution-program data.  The runtime never
 /// receives a general-purpose evaluator through this type.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum GrammarReference {
     None,
     JsonSchema {
@@ -266,7 +266,7 @@ impl DistributionScale {
 
 /// The only decode contracts admitted to the task layer.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum DecodeStrategy {
     PrefillOnly {
         candidates: Vec<Candidate>,
@@ -755,8 +755,10 @@ impl TaskSpec {
                 "version must be a vN identifier".to_owned(),
             ));
         }
-        if self.presets.iter().any(|preset| preset.is_empty()) {
-            return Err(TaskIrError::TaskSpec("preset id is empty".to_owned()));
+        if self.presets.iter().any(|preset| !valid_identifier(preset)) {
+            return Err(TaskIrError::TaskSpec(
+                "preset id is not a stable identifier".to_owned(),
+            ));
         }
         Ok(())
     }
