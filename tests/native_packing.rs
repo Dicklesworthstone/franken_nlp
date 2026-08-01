@@ -1,13 +1,17 @@
 use franken_nlp::artifact::format::{
-    framed_sha256, logical_model_sha256, logical_tensor_sha256, write, ArchTarget, CanonicalDtype,
-    FnlpqWriterInput, PackingSetInput, SectionKind, SectionPayload, SectionRange, TensorInput,
+    ArchTarget, CanonicalDtype, FnlpqWriterInput, PackingSetInput, SectionKind, SectionPayload,
+    SectionRange, TensorInput, framed_sha256, logical_model_sha256, logical_tensor_sha256,
+    source_root_sha256, write,
 };
 use franken_nlp::artifact::packing::{
-    derive_native_packing, require_native_packing, verify_derived_packing, NativeCacheAddress,
-    NativePackingTarget, PackingError, TILE_TABLE_VERSION_V1,
+    NativeCacheAddress, NativePackingTarget, PackingError, TILE_TABLE_VERSION_V1,
+    derive_native_packing, require_native_packing, verify_derived_packing,
 };
 use franken_nlp::artifact::reader::FnlpqArtifact;
 use sha2::{Digest, Sha256};
+
+const SYNTHETIC_MODEL_ID: &str = "FnlpqNativePackingFixture";
+const PINNED_REVISION: &str = "f56ec5a9650268aa098496734743c25ea778bd2d";
 
 #[test]
 fn deterministic_synthetic_matrix_derives_and_recovers_all_five_targets() {
@@ -256,8 +260,8 @@ fn generic_root(seed: u64) -> Vec<u8> {
     )
     .expect("synthetic layer logical tensor identity");
     let logical_model_sha256 = logical_model_sha256(
-        "Nanbeige4.2-3B",
-        "f56ec5a9650268aa098496734743c25ea778bd2d",
+        SYNTHETIC_MODEL_ID,
+        PINNED_REVISION,
         &[embed_tensor_sha256, layer_tensor_sha256],
         &[
             ("model_config", br#"{"hidden_size":2}"#.as_slice()),
@@ -267,14 +271,16 @@ fn generic_root(seed: u64) -> Vec<u8> {
         ],
     )
     .expect("synthetic logical model identity");
+    let source_manifest = format!("synthetic-native-packing-source-manifest-v1:{seed}");
     let payload = [embed_payload.as_slice(), layer_payload.as_slice()].concat();
     let scales = [embed_scale.as_slice(), layer_scale.as_slice()].concat();
     let row_sums = [embed_row_sum.as_slice(), layer_row_sum.as_slice()].concat();
     write(&FnlpqWriterInput {
-        model_id: "FnlpqNativePackingFixture".to_owned(),
-        revision: "f56ec5a9650268aa098496734743c25ea778bd2d".to_owned(),
+        model_id: SYNTHETIC_MODEL_ID.to_owned(),
+        revision: PINNED_REVISION.to_owned(),
         recipe_id: "native-packing-fixture-v1".to_owned(),
-        source_root_sha256: format!("{seed:064x}"),
+        source_root_sha256: hex(&source_root_sha256(source_manifest.as_bytes())
+            .expect("synthetic source manifest admits the canonical identity")),
         logical_model_sha256: hex(&logical_model_sha256),
         sections: vec![
             SectionPayload::new(

@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use super::format::{
-    framed_sha256, validate_authority_identifier, write, ArchTarget, CanonicalDtype,
-    FnlpqWriterInput, PackingSetInput, SectionKind, SectionPayload, SectionRange, TensorInput,
+    ArchTarget, CanonicalDtype, FnlpqWriterInput, PackingSetInput, SectionKind, SectionPayload,
+    SectionRange, TensorInput, framed_sha256, validate_authority_identifier, write,
 };
 use super::reader::{CheckedMapping, FnlpqArtifact, FnlpqReadError};
 
@@ -242,10 +242,16 @@ impl fmt::Display for PackingError {
             Self::Format(error) => write!(formatter, "canonical fnlpq writer: {error}"),
             Self::NativePayload { detail } => write!(formatter, "native payload: {detail}"),
             Self::LogicalMismatch { tensor, component } => {
-                write!(formatter, "native reconstruction differs for tensor {tensor} {component}")
+                write!(
+                    formatter,
+                    "native reconstruction differs for tensor {tensor} {component}"
+                )
             }
             Self::MissingDerivation { command } => {
-                write!(formatter, "required native packing is absent; derive it with {command}")
+                write!(
+                    formatter,
+                    "required native packing is absent; derive it with {command}"
+                )
             }
             Self::Arithmetic { invariant } => {
                 write!(formatter, "checked arithmetic overflow for {invariant}")
