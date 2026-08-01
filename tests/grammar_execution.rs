@@ -417,6 +417,25 @@ fn sequential_forced_runs_checkpoint_before_long_run_tokens_and_never_report_par
 }
 
 #[test]
+fn forced_run_construction_requires_a_nonzero_explicit_bound() {
+    let witness = unique_witness(3);
+    let too_long =
+        ForcedRun::new_bounded(vec![3, 3], vec![witness.clone(), witness.clone()], None, 1)
+            .expect_err("teacher-fed runs must remain bounded");
+    assert_eq!(
+        too_long,
+        ExecutionCompileError::ForcedRunExceedsLimit {
+            token_count: 2,
+            max_tokens: 1
+        }
+    );
+    assert!(matches!(
+        ForcedRun::new_bounded(vec![3], vec![witness], None, 0),
+        Err(ExecutionCompileError::ZeroForcedRunLimit)
+    ));
+}
+
+#[test]
 fn schema_plan_covers_every_compiler_state_once() {
     let schema = compile_json_schema(
         r#"{"type":"string","maxLength":4}"#,
