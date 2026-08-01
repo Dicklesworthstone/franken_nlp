@@ -364,17 +364,14 @@ catch { Exit-Fetch 4 "revision lock busy or stale path=$script:LockDir; do not b
 Write-Log "LOCK RESULT=PASS path=$script:LockDir"
 
 $failed = $false
-$missingCount = 0
 foreach ($entry in $entries) {
     if ($CheckOnly) {
         Write-Log "CHECK_ONLY file=$($entry.Name) expected_bytes=$($entry.Length)"
         $checkPath = Join-Path $Dest $entry.Name
-        if (-not (Test-Path -LiteralPath $checkPath)) { $missingCount++ }
         if (-not (Test-VerifiedFile $checkPath $entry.Length $entry.Sha256)) { $failed = $true }
     } else { Download-One $entry $entries }
 }
 if ($failed) {
-    if ($CheckOnly -and $missingCount -eq $entries.Count) { Write-Log "CHECK_ONLY RESULT=SKIPPED_NO_MODEL files=0/$($entries.Count)"; Exit-Fetch 0 }
     Write-Log "CHECK_ONLY RESULT=FAIL files=$($entries.Count)/$($entries.Count)"; Exit-Fetch 1
 }
 if ($CheckOnly) { Write-Log "CHECK_ONLY RESULT=PASS files=$($entries.Count)/$($entries.Count)" }

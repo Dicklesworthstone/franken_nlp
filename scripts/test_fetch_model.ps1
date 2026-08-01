@@ -365,7 +365,7 @@ try {
     Stop-RetryServer
 
     $script:Cases++; $d9 = Join-Path $Work 'case9'; $status = Invoke-Fetch $d9 @('-CheckOnly')
-    if ($status -eq 0) { Pass '9' 'check-only-no-model-skip' } else { Fail '9' "check-only-no-model-skip exit=$status" }
+    if ($status -eq 1) { Pass '9' 'check-only-missing-closure-refusal' } else { Fail '9' "check-only-missing-closure-refusal exit=$status" }
 
     $script:Cases++; $d10 = Join-Path $Work 'case10'; $accepted = Start-RedirectServer 'us.aws.cdn.hf.co'
     if ($accepted -and (Invoke-RedirectPolicyFetch $d10 $accepted.ProxyPort $accepted.CaCertificate) -eq 0 -and (Get-FileHash (Join-Path $d10 'alpha.bin') -Algorithm SHA256).Hash.ToLowerInvariant() -eq $alphaSha) {

@@ -422,12 +422,10 @@ catalog_stats
 acquire_lock
 
 status=0
-missing_count=0
 while IFS='|' read -r file length digest; do
     [ -n "$file" ] || continue
     if [ "$CHECK_ONLY" -eq 1 ]; then
         log "CHECK_ONLY file=$file expected_bytes=$length"
-        if [ ! -e "$DEST/$file" ] && [ ! -L "$DEST/$file" ]; then missing_count=$((missing_count + 1)); fi
         if ! verify_file "$DEST/$file" "$length" "$digest"; then
             status=1
         fi
@@ -439,10 +437,6 @@ $(catalog_lines)
 EOF
 
 if [ "$status" -ne 0 ]; then
-    if [ "$CHECK_ONLY" -eq 1 ] && [ "$missing_count" -eq "$CATALOG_COUNT" ]; then
-        log "CHECK_ONLY RESULT=SKIPPED_NO_MODEL files=0/$CATALOG_COUNT"
-        finish 0
-    fi
     log "CHECK_ONLY RESULT=FAIL files=$CATALOG_COUNT/$CATALOG_COUNT"
     resume_guidance
     finish 1

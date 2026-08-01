@@ -211,9 +211,16 @@ printf 'url=http://127.0.0.1:1/alpha.bin\nrevision=%s\nname=alpha.bin\nbytes=%s\
 BAD_BASE=http://127.0.0.1:1
 if FNLP_FETCH_ALLOW_TEST_BASE_URL=1 "$FETCH" --dest "$DEST8" --catalog "$CATALOG" --test-base-url "$BAD_BASE" > "$WORK/case8.out" 2> "$WORK/case8.err"; then fail_case 8 interrupted-resume-guidance; elif grep -Fq "scripts/fetch_model.sh --dest '$DEST8'" "$WORK/case8.err" && grep -q 'journal_dir=' "$WORK/case8.err"; then pass_case 8 interrupted-resume-guidance; else fail_case 8 interrupted-resume-guidance; fi
 
-# 9. The model-gated check-only path is an honest no-model skip, not a cache hit.
+# 9. Check-only refuses an empty closure: exit zero means all catalogued files
+# verified, never merely that no model is installed.
 CASES=$((CASES + 1)); DEST9="$WORK/case9"
-if FNLP_FETCH_ALLOW_TEST_BASE_URL=1 "$FETCH" --dest "$DEST9" --catalog "$CATALOG" --test-base-url "$BASE" --check-only > "$WORK/case9.out" 2> "$WORK/case9.err" && grep -q 'CHECK_ONLY RESULT=SKIPPED_NO_MODEL' "$WORK/case9.err"; then pass_case 9 check-only-no-model-skip; else fail_case 9 check-only-no-model-skip; fi
+if FNLP_FETCH_ALLOW_TEST_BASE_URL=1 "$FETCH" --dest "$DEST9" --catalog "$CATALOG" --test-base-url "$BASE" --check-only > "$WORK/case9.out" 2> "$WORK/case9.err"; then
+    fail_case 9 check-only-missing-closure-refusal
+elif grep -q 'CHECK_ONLY RESULT=FAIL' "$WORK/case9.err" && grep -q 'VERIFY RESULT=FAIL file=alpha.bin' "$WORK/case9.err" && grep -q 'VERIFY RESULT=FAIL file=beta.bin' "$WORK/case9.err"; then
+    pass_case 9 check-only-missing-closure-refusal
+else
+    fail_case 9 check-only-missing-closure-refusal
+fi
 
 # 10. A local TLS redirect to an official regional Xet CDN host passes the real policy.
 CASES=$((CASES + 1)); DEST10="$WORK/case10"
