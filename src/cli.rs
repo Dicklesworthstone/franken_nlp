@@ -10,9 +10,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     artifact::converter::{
-        CONVERSION_ARTIFACT_FORMAT, CONVERSION_RECEIPT_SCHEMA, GENERIC_PACKING_V1,
-        PINNED_REVISION, PINNED_SOURCE_MANIFEST_SHA256, PORTABLE_QUANT_V1, ConversionReceipt,
-        ConvertArch, ConvertRequest, ConverterError, DEFAULT_PANEL_BYTES, GenericPayloadPlan,
+        CONVERSION_ARTIFACT_FORMAT, CONVERSION_RECEIPT_SCHEMA, ConversionReceipt, ConvertArch,
+        ConvertRequest, ConverterError, DEFAULT_PANEL_BYTES, GENERIC_PACKING_V1,
+        GenericPayloadPlan, PINNED_REVISION, PINNED_SOURCE_MANIFEST_SHA256, PORTABLE_QUANT_V1,
         PreparedConversionInput, prepare_convert_request, stream_routed_bf16_panels,
     },
     artifact::format::{
@@ -274,11 +274,10 @@ impl RobotPlanCommand {
             .ok_or("--quant must be bf16, int8, or int8-f16-scales")?;
         let fixed_residency = match (self.fixed_mapped_bytes, self.fixed_resident_bytes) {
             (None, None) => None,
-            (Some(mapped_bytes), Some(resident_bytes)) => {
-                Some(ResidencyAccounting::new(mapped_bytes, resident_bytes).ok_or(
-                    "--fixed-resident-bytes cannot exceed --fixed-mapped-bytes",
-                )?)
-            }
+            (Some(mapped_bytes), Some(resident_bytes)) => Some(
+                ResidencyAccounting::new(mapped_bytes, resident_bytes)
+                    .ok_or("--fixed-resident-bytes cannot exceed --fixed-mapped-bytes")?,
+            ),
             _ => {
                 return Err(
                     "--fixed-mapped-bytes and --fixed-resident-bytes must be supplied together",
@@ -466,7 +465,7 @@ fn run_convert_command(
                     prepared.census_sha256(),
                     prepared.tensor_count(),
                 );
-                emit_partial_convert_preflight(&prepared, &generic);
+                emit_convert_preflight(&prepared, &generic);
                 let confirmation = match confirm_convert(&request, input, stdin_is_terminal) {
                     Ok(mode) => mode,
                     Err(reason) => {
@@ -485,15 +484,11 @@ fn run_convert_command(
     }
 }
 
-/// Record the conversion facts available before the unavailable model-root
-/// staging capability can construct a final envelope. This is intentionally a
-/// partial preflight, not the final disk/RSS admission receipt.
-fn emit_partial_convert_preflight(
-    prepared: &PreparedConversionInput,
-    generic: &GenericPayloadPlan,
-) {
+/// Record source and Generic-plan facts before the explicit-output stage is
+/// created. The final receipt records the post-write disk and file identities.
+fn emit_convert_preflight(prepared: &PreparedConversionInput, generic: &GenericPayloadPlan) {
     eprintln!(
-        "CONVERT PREFLIGHT RESULT=PARTIAL closure-bytes={} generic-payload-bytes={} generic-scales-bytes={} generic-row-sums-bytes={} reason=final-envelope-and-ratified-staging-capability-unavailable",
+        "CONVERT PREFLIGHT RESULT=READY closure-bytes={} generic-payload-bytes={} generic-scales-bytes={} generic-row-sums-bytes={} explicit-output-stage=NOT-CREATED",
         prepared.closure_total_bytes(),
         generic.payload_bytes,
         generic.scale_bytes,
@@ -665,6 +660,7 @@ fn verify_reloaded_conversion(
     plan: &StreamingEnvelopePlan,
     written: &StreamedFnlpq,
 ) -> Result<(), String> {
+    let expected_license_bundle_sha256 = hex_lower(&written.license_bundle_sha256);
     for (field, observed, expected) in [
         (
             "model-id",
@@ -694,7 +690,7 @@ fn verify_reloaded_conversion(
         (
             "license-bundle",
             reloaded.license_bundle_sha256(),
-            hex_lower(&written.license_bundle_sha256).as_str(),
+            expected_license_bundle_sha256.as_str(),
         ),
     ] {
         if observed != expected {
@@ -745,9 +741,19 @@ fn ensure_conversion_destinations_absent(destination: &Path) -> Result<(), Strin
     let receipt = conversion_receipt_path(destination)?;
     for path in [destination, receipt.as_path()] {
         match fs::symlink_metadata(path) {
-            Ok(_) => return Err(format!("final destination already exists: {}", path.display())),
+            Ok(_) => {
+                return Err(format!(
+                    "final destination already exists: {}",
+                    path.display()
+                ));
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("inspect final destination {}: {error}", path.display())),
+            Err(error) => {
+                return Err(format!(
+                    "inspect final destination {}: {error}",
+                    path.display()
+                ));
+            }
         }
     }
     Ok(())
@@ -823,7 +829,12 @@ fn create_conversion_receipt_stage(destination: &Path) -> Result<(PathBuf, fs::F
         {
             Ok(file) => return Ok((stage, file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("create receipt staging {}: {error}", stage.display())),
+            Err(error) => {
+                return Err(format!(
+                    "create receipt staging {}: {error}",
+                    stage.display()
+                ));
+            }
         }
     }
     Err(format!(
@@ -872,13 +883,7 @@ fn write_conversion_receipt_sidecar(
     artifact_raw_sha256: &str,
 ) -> Result<WrittenConversionReceipt, String> {
     let preflight = prepared
-        .preflight(
-            written.file_len,
-            DEFAULT_PANEL_BYTES,
-            0,
-            0,
-            0,
-        )
+        .preflight(written.file_len, DEFAULT_PANEL_BYTES, 0, 0, 0)
         .map_err(|error| format!("receipt preflight: {error}"))?;
     let peak_rss_cap_bytes = preflight
         .peak_rss
@@ -946,14 +951,21 @@ fn write_conversion_receipt_sidecar(
 /// Compute an authority-distinct raw SHA-256 without materializing the staged
 /// artifact.  The framed file identity remains writer-owned.
 fn raw_sha256_file(path: &Path) -> Result<String, String> {
-    let mut file = fs::File::open(path)
-        .map_err(|error| format!("open staged artifact for raw digest {}: {error}", path.display()))?;
+    let mut file = fs::File::open(path).map_err(|error| {
+        format!(
+            "open staged artifact for raw digest {}: {error}",
+            path.display()
+        )
+    })?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 1024 * 1024];
     loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| format!("read staged artifact for raw digest {}: {error}", path.display()))?;
+        let read = file.read(&mut buffer).map_err(|error| {
+            format!(
+                "read staged artifact for raw digest {}: {error}",
+                path.display()
+            )
+        })?;
         if read == 0 {
             break;
         }
@@ -1774,7 +1786,12 @@ fn emit_schema_error(mode: &str, error: &SchemaError) {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, io::Cursor, path::Path, process::ExitCode};
+    use std::{
+        ffi::OsString,
+        io::Cursor,
+        path::{Path, PathBuf},
+        process::ExitCode,
+    };
 
     use clap::Parser;
 
