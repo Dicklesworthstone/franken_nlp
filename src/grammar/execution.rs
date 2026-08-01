@@ -504,6 +504,13 @@ pub enum ForcedPath {
 }
 
 impl ForcedRun {
+    /// Conservative default cap for a single teacher-fed run.
+    ///
+    /// Callers with a narrower request budget should use [`Self::new_bounded`]
+    /// and retain that cap in their request receipt.  This bound never permits
+    /// skipped transformer or KV work.
+    pub const DEFAULT_MAX_TOKENS: usize = 64;
+
     /// Build one forced run.  A unique byte suffix is intentionally not an
     /// input to this constructor: only exact token ids can enter the path.
     pub fn new(
@@ -511,8 +518,32 @@ impl ForcedRun {
         witnesses: Vec<ForcedTokenWitness>,
         requested_micro_prefill: Option<KvPointEqualityEvidence>,
     ) -> Result<Self, ExecutionCompileError> {
+        Self::new_bounded(
+            tokens,
+            witnesses,
+            requested_micro_prefill,
+            Self::DEFAULT_MAX_TOKENS,
+        )
+    }
+
+    /// Build one forced run under the caller's explicit token cap.
+    pub fn new_bounded(
+        tokens: Vec<u32>,
+        witnesses: Vec<ForcedTokenWitness>,
+        requested_micro_prefill: Option<KvPointEqualityEvidence>,
+        max_tokens: usize,
+    ) -> Result<Self, ExecutionCompileError> {
+        if max_tokens == 0 {
+            return Err(ExecutionCompileError::ZeroForcedRunLimit);
+        }
         if tokens.is_empty() {
             return Err(ExecutionCompileError::EmptyForcedRun);
+        }
+        if tokens.len() > max_tokens {
+            return Err(ExecutionCompileError::ForcedRunExceedsLimit {
+                token_count: tokens.len(),
+                max_tokens,
+            });
         }
         if tokens.len() != witnesses.len() {
             return Err(ExecutionCompileError::ForcedRunWitnessCountMismatch {
@@ -1173,6 +1204,11 @@ pub enum ExecutionCompileError {
         state_id: usize,
     },
     EmptyForcedRun,
+    ZeroForcedRunLimit,
+    ForcedRunExceedsLimit {
+        token_count: usize,
+        max_tokens: usize,
+    },
     ForcedRunWitnessCountMismatch {
         token_count: usize,
         witness_count: usize,
@@ -1233,6 +1269,14 @@ impl fmt::Display for ExecutionCompileError {
             Self::EmptyForcedRun => {
                 f.write_str("forced run must contain at least one exact token id")
             }
+            Self::ZeroForcedRunLimit => f.write_str("forced run token limit must be nonzero"),
+            Self::ForcedRunExceedsLimit {
+                token_count,
+                max_tokens,
+            } => write!(
+                f,
+                "forced run has {token_count} tokens and exceeds its explicit cap of {max_tokens}"
+            ),
             Self::ForcedRunWitnessCountMismatch {
                 token_count,
                 witness_count,
