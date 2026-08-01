@@ -204,6 +204,14 @@ validate_platform_surfaces() {
     python3 "${REPO_ROOT}/scripts/validate_platform_surfaces.py"
 }
 
+validate_tensor_census() {
+    command -v python3 >/dev/null 2>&1 || {
+        printf '%s\n' 'python3 is required for the tensor-census drift guard' >&2
+        return 1
+    }
+    python3 "${REPO_ROOT}/scripts/gen_tensor_census.py" --check-artifact
+}
+
 run_bounded_ubs() {
     if ! command -v ubs >/dev/null 2>&1; then
         printf 'UBS RESULT=SKIPPED_NO_UBS reason=binary-absent\n' >&2
@@ -249,6 +257,7 @@ run_optional_policy_section() {
 
 main() {
     run_section fmt cargo fmt --check
+    run_section tensor-census validate_tensor_census
     run_section cargo-check cargo_check_without_duplicate_target_warning
     run_section clippy cargo clippy --locked --all-targets -- -D warnings
     run_section test cargo test --locked

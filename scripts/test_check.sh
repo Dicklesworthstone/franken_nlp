@@ -5,6 +5,8 @@ set -euo pipefail
 
 readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly CHECK_SOURCE="${REPO_ROOT}/scripts/check.sh"
+readonly TENSOR_CENSUS_GENERATOR_SOURCE="${REPO_ROOT}/scripts/gen_tensor_census.py"
+readonly TENSOR_CENSUS_ARTIFACT_SOURCE="${REPO_ROOT}/docs/truth-pack/tensor_census.json"
 readonly SYSTEM_PATH="/usr/bin:/bin"
 
 CASE_COUNT=0
@@ -20,8 +22,10 @@ make_fixture_tree() {
     local case_name="$1"
     local fixture_root
     fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/franken-nlp-check-${case_name}.XXXXXX")"
-    mkdir -p "${fixture_root}/scripts" "${fixture_root}/bin" "${fixture_root}/docs"
+    mkdir -p "${fixture_root}/scripts" "${fixture_root}/bin" "${fixture_root}/docs/truth-pack"
     cp "${CHECK_SOURCE}" "${fixture_root}/scripts/check.sh"
+    cp "${TENSOR_CENSUS_GENERATOR_SOURCE}" "${fixture_root}/scripts/gen_tensor_census.py"
+    cp "${TENSOR_CENSUS_ARTIFACT_SOURCE}" "${fixture_root}/docs/truth-pack/tensor_census.json"
     chmod +x "${fixture_root}/scripts/check.sh"
     cat >"${fixture_root}/bin/cargo" <<'CARGO'
 #!/usr/bin/env bash
@@ -66,7 +70,7 @@ case_clean_scaffold() {
         fail_case clean-scaffold
         return
     fi
-    for section in fmt cargo-check clippy test doc-links; do
+    for section in fmt tensor-census cargo-check clippy test doc-links; do
         if ! assert_contains "${output_path}" "CHECK section=${section} result=PASS"; then
             fail_case clean-scaffold
             return
@@ -77,6 +81,23 @@ case_clean_scaffold() {
         return
     fi
     printf 'CHECK_SELFTEST case=clean-scaffold result=PASS scratch=%s\n' "${fixture_root}"
+}
+
+case_tensor_census_drift_fails_before_cargo() {
+    local fixture_root output_path
+    fixture_root="$(make_fixture_tree tensor-census-drift)"
+    output_path="${fixture_root}/tensor-census-drift.log"
+    printf '\n' >>"${fixture_root}/docs/truth-pack/tensor_census.json"
+    if run_fixture_check "${fixture_root}" "${output_path}" env; then
+        fail_case tensor-census-drift
+        return
+    fi
+    if ! assert_contains "${output_path}" 'CHECK section=tensor-census result=FAIL' \
+        || assert_contains "${output_path}" 'CHECK section=cargo-check result='; then
+        fail_case tensor-census-drift
+        return
+    fi
+    printf 'CHECK_SELFTEST case=tensor-census-drift result=PASS scratch=%s\n' "${fixture_root}"
 }
 
 case_fmt_failure_is_fail_fast() {
@@ -131,6 +152,7 @@ case_duplicate_target_warning_fails() {
 main() {
     for case_function in \
         case_clean_scaffold \
+        case_tensor_census_drift_fails_before_cargo \
         case_fmt_failure_is_fail_fast \
         case_dead_doc_link_fails \
         case_duplicate_target_warning_fails; do
