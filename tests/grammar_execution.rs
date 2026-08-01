@@ -358,8 +358,14 @@ fn forced_runs_default_to_sequential_and_micro_prefill_keeps_its_receipt() {
         other => panic!("expected FeedForced, got {other:?}"),
     }
 
-    let evidence = KvPointEqualityEvidence::new("hf-bf16-eager", "kv-44-slot-receipt")
-        .expect("receipt identity is explicit");
+    let evidence = KvPointEqualityEvidence::exact_44_slot(
+        "hf-bf16-eager",
+        "kv-44-slot-receipt",
+        2,
+        KvPointEqualityEvidence::REQUIRED_KV_SLOT_COUNT,
+        true,
+    )
+    .expect("receipt records exact equality across all required KV slots");
     let micro_prefill = compiler()
         .compile_state(ProductExecutionState {
             forced_path: Some(ForcedPath::Proven(
@@ -378,6 +384,30 @@ fn forced_runs_default_to_sequential_and_micro_prefill_keeps_its_receipt() {
         )),
         other => panic!("expected FeedForced, got {other:?}"),
     }
+}
+
+#[test]
+fn micro_prefill_evidence_refuses_partial_kv_coverage_or_nonexact_rows() {
+    assert!(matches!(
+        KvPointEqualityEvidence::exact_44_slot("hf-bf16-eager", "partial", 1, 43, true),
+        Err(ExecutionCompileError::IncompleteKvEqualityEvidence {
+            compared_kv_slot_count: 43,
+            every_kv_point_byte_exact: true
+        })
+    ));
+    assert!(matches!(
+        KvPointEqualityEvidence::exact_44_slot(
+            "hf-bf16-eager",
+            "nonexact",
+            1,
+            KvPointEqualityEvidence::REQUIRED_KV_SLOT_COUNT,
+            false,
+        ),
+        Err(ExecutionCompileError::IncompleteKvEqualityEvidence {
+            compared_kv_slot_count: 44,
+            every_kv_point_byte_exact: false
+        })
+    ));
 }
 
 #[test]

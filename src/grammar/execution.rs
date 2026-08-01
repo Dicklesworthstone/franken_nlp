@@ -442,22 +442,37 @@ impl Error for ForcedWitnessError {}
 pub struct KvPointEqualityEvidence {
     profile: String,
     receipt_id: String,
+    compared_token_count: usize,
 }
 
 impl KvPointEqualityEvidence {
-    /// Retain the named numerics profile and receipt selected by a model gate.
-    pub fn new(
+    /// Required Nanbeige cache depth: 22 layers across two decoder loops.
+    pub const REQUIRED_KV_SLOT_COUNT: usize = 44;
+
+    /// Retain a named model-gated receipt only when it reports byte-exact
+    /// equality at every required KV slot for at least one teacher-fed token.
+    pub fn exact_44_slot(
         profile: impl Into<String>,
         receipt_id: impl Into<String>,
+        compared_token_count: usize,
+        compared_kv_slot_count: usize,
+        every_kv_point_byte_exact: bool,
     ) -> Result<Self, ExecutionCompileError> {
         let profile = profile.into();
         let receipt_id = receipt_id.into();
-        if profile.trim().is_empty() || receipt_id.trim().is_empty() {
+        if profile.trim().is_empty() || receipt_id.trim().is_empty() || compared_token_count == 0 {
             return Err(ExecutionCompileError::EmptyKvEqualityEvidence);
+        }
+        if compared_kv_slot_count != Self::REQUIRED_KV_SLOT_COUNT || !every_kv_point_byte_exact {
+            return Err(ExecutionCompileError::IncompleteKvEqualityEvidence {
+                compared_kv_slot_count,
+                every_kv_point_byte_exact,
+            });
         }
         Ok(Self {
             profile,
             receipt_id,
+            compared_token_count,
         })
     }
 
@@ -471,6 +486,12 @@ impl KvPointEqualityEvidence {
     #[must_use]
     pub fn receipt_id(&self) -> &str {
         &self.receipt_id
+    }
+
+    /// Number of teacher-fed token positions covered by the retained receipt.
+    #[must_use]
+    pub const fn compared_token_count(&self) -> usize {
+        self.compared_token_count
     }
 }
 
@@ -1171,6 +1192,10 @@ impl Error for ProjectionError {}
 pub enum ExecutionCompileError {
     EmptyMeasurementIdentity,
     EmptyKvEqualityEvidence,
+    IncompleteKvEqualityEvidence {
+        compared_kv_slot_count: usize,
+        every_kv_point_byte_exact: bool,
+    },
     StateCountMismatch {
         expected_state_count: usize,
         actual_state_count: usize,
@@ -1229,6 +1254,14 @@ impl fmt::Display for ExecutionCompileError {
             Self::EmptyKvEqualityEvidence => {
                 f.write_str("micro-prefill evidence requires both profile and receipt id")
             }
+            Self::IncompleteKvEqualityEvidence {
+                compared_kv_slot_count,
+                every_kv_point_byte_exact,
+            } => write!(
+                f,
+                "micro-prefill evidence must byte-compare all {} KV slots (received {compared_kv_slot_count}, byte_exact={every_kv_point_byte_exact})",
+                KvPointEqualityEvidence::REQUIRED_KV_SLOT_COUNT
+            ),
             Self::StateCountMismatch {
                 expected_state_count,
                 actual_state_count,
