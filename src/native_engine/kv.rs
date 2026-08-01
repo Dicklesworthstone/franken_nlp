@@ -24,6 +24,162 @@ pub const KV_BYTES_PER_SLOT_POSITION: usize = 2 * KV_ELEMENTS_PER_POSITION * siz
 /// Nanbeige's 44-slot bf16 K/V footprint per token: 180,224 bytes / 176 KiB.
 pub const KV_BYTES_PER_TOKEN: usize = KV_SLOT_COUNT * KV_BYTES_PER_SLOT_POSITION;
 
+/// Logical token range used by the initial paged-KV candidate.
+///
+/// A logical page is an addressing/admission unit, never an instruction to
+/// allocate one monolithic 44-slot buffer. Physical slabs remain independently
+/// owned by a [`KvSlabKey`].
+pub const KV_LOGICAL_PAGE_TOKENS: usize = 16;
+/// Separate K and V slabs for every logical layer slot in the baseline layout.
+pub const KV_SLABS_PER_LOGICAL_PAGE: usize = KV_SLOT_COUNT * 2;
+/// Bytes in one bf16 K-or-V slab for one layer slot and 16 token positions.
+pub const KV_BF16_SLAB_BYTES: usize =
+    KV_LOGICAL_PAGE_TOKENS * KV_ELEMENTS_PER_POSITION * size_of::<u16>();
+/// Payload bytes in one 16-token logical page across all 44 K/V slots.
+pub const KV_BF16_LOGICAL_PAGE_BYTES: usize = KV_BYTES_PER_TOKEN * KV_LOGICAL_PAGE_TOKENS;
+/// Int8 K/V payload bytes per token before scale and page-table accounting.
+pub const KV_INT8_PAYLOAD_BYTES_PER_TOKEN: usize = KV_BYTES_PER_TOKEN / 2;
+/// Number of K/V scales per token in an int8 KV representation.
+pub const KV_INT8_SCALE_COUNT_PER_TOKEN: usize = KV_SLOT_COUNT * KV_HEAD_COUNT * 2;
+/// f32 scale bytes per int8 K/V token.
+pub const KV_INT8_F32_SCALE_BYTES_PER_TOKEN: usize =
+    KV_INT8_SCALE_COUNT_PER_TOKEN * size_of::<f32>();
+/// f16 scale bytes per int8 K/V token.
+pub const KV_INT8_F16_SCALE_BYTES_PER_TOKEN: usize =
+    KV_INT8_SCALE_COUNT_PER_TOKEN * size_of::<u16>();
+
+/// Storage representation selected for a physical K/V slab.
+///
+/// The current slab cache admits bf16 data only; the int8 variants exist now
+/// so their payload and scale charges remain structural rather than becoming a
+/// late unpriced execution path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KvSlabDtype {
+    /// Raw bf16 bit patterns, two bytes per element.
+    Bf16,
+    /// One-byte K/V payload with f32 scales.
+    Int8F32Scale,
+    /// One-byte K/V payload with f16 scales.
+    Int8F16Scale,
+}
+
+impl KvSlabDtype {
+    /// Payload and per-token scale bytes for the fixed 44-slot layout.
+    #[must_use]
+    pub const fn bytes_per_token(self) -> usize {
+        match self {
+            Self::Bf16 => KV_BYTES_PER_TOKEN,
+            Self::Int8F32Scale => {
+                KV_INT8_PAYLOAD_BYTES_PER_TOKEN + KV_INT8_F32_SCALE_BYTES_PER_TOKEN
+            }
+            Self::Int8F16Scale => {
+                KV_INT8_PAYLOAD_BYTES_PER_TOKEN + KV_INT8_F16_SCALE_BYTES_PER_TOKEN
+            }
+        }
+    }
+}
+
+/// Address and ownership identity for one independently reference-counted
+/// physical K/V slab.
+///
+/// `loop_layer_start` and `loop_layer_count` make grouping an explicit
+/// measured choice. The baseline allocator uses one logical layer and keeps K
+/// and V separate, so a 16-token group has 88 bf16 slabs rather than one
+/// all-44-slot allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KvSlabKey {
+    /// First logical token position covered by this slab.
+    pub token_start: usize,
+    /// Number of logical token positions represented by the slab.
+    pub token_count: usize,
+    /// First logical loop-layer slot covered by this slab.
+    pub loop_layer_start: usize,
+    /// Number of consecutive logical loop-layer slots in the grouping.
+    pub loop_layer_count: usize,
+    /// Whether this slab carries K or V values.
+    pub vector: KvVector,
+    /// Physical payload/scales representation.
+    pub dtype: KvSlabDtype,
+}
+
+impl KvSlabKey {
+    /// Builds and bounds-checks an independently charged slab identity.
+    pub fn new(
+        token_start: usize,
+        token_count: usize,
+        loop_layer_start: usize,
+        loop_layer_count: usize,
+        vector: KvVector,
+        dtype: KvSlabDtype,
+    ) -> Result<Self, KvSlabError> {
+        if token_count == 0 || loop_layer_count == 0 {
+            return Err(KvSlabError::InvalidSlabKey {
+                token_count,
+                loop_layer_start,
+                loop_layer_count,
+            });
+        }
+        token_start
+            .checked_add(token_count)
+            .ok_or(KvSlabError::AdmissionArithmeticOverflow {
+                positions: token_start,
+            })?;
+        let end = loop_layer_start.checked_add(loop_layer_count).ok_or(
+            KvSlabError::InvalidSlabKey {
+                token_count,
+                loop_layer_start,
+                loop_layer_count,
+            },
+        )?;
+        if end > KV_SLOT_COUNT {
+            return Err(KvSlabError::InvalidSlabKey {
+                token_count,
+                loop_layer_start,
+                loop_layer_count,
+            });
+        }
+        Ok(Self {
+            token_start,
+            token_count,
+            loop_layer_start,
+            loop_layer_count,
+            vector,
+            dtype,
+        })
+    }
+
+    /// Payload-plus-scale bytes charged by this slab, excluding page-table
+    /// metadata and allocator padding.
+    pub fn payload_bytes(self) -> Result<usize, KvSlabError> {
+        let bytes_per_slot_vector = self.dtype.bytes_per_token() / KV_SLABS_PER_LOGICAL_PAGE;
+        self.token_count
+            .checked_mul(self.loop_layer_count)
+            .and_then(|positions| positions.checked_mul(bytes_per_slot_vector))
+            .ok_or(KvSlabError::AdmissionArithmeticOverflow {
+                positions: self.token_count,
+            })
+    }
+}
+
+/// Typed failures from the refcounted slab protocol.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KvSlabError {
+    /// A requested slab has an empty or out-of-range logical slot grouping.
+    InvalidSlabKey {
+        /// Requested token-range length.
+        token_count: usize,
+        /// Requested first loop-layer slot.
+        loop_layer_start: usize,
+        /// Requested loop-layer grouping width.
+        loop_layer_count: usize,
+    },
+    /// A page or slab size cannot be represented in the fixed byte ledger.
+    AdmissionArithmeticOverflow {
+        /// Token position or range involved in the failed calculation.
+        positions: usize,
+    },
+}
+
 /// Returns Nanbeige's logical K/V slot for a physical layer and loop pass.
 #[must_use]
 pub const fn slot_for(loop_index: usize, layer_index: usize) -> Option<usize> {
