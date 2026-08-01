@@ -685,6 +685,10 @@ impl KvPhysicalSlab {
 /// Pool-wide byte/refcount evidence for a bf16 paged K/V cache.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KvSlabPoolStats {
+    /// Number of physical slabs pre-reserved by this pool at construction.
+    pub slab_capacity: usize,
+    /// Total bf16 payload bytes pre-reserved for this pool's slab capacity.
+    pub reserved_payload_bytes: usize,
     /// Physical slabs currently retained by one or more page tables.
     pub live_slab_count: usize,
     /// Preallocated physical slabs not currently assigned to a logical page.
@@ -693,6 +697,10 @@ pub struct KvSlabPoolStats {
     pub live_payload_bytes: usize,
     /// Logical slab acquisitions; this must not change during prepared appends.
     pub allocation_events: usize,
+    /// Sum of all live physical-slab references across forked page tables.
+    ///
+    /// `None` refuses to represent an aggregate that cannot fit in `usize`.
+    pub retained_reference_count: Option<usize>,
 }
 
 /// Pre-reserved, 64-byte-aligned physical bf16 K/V slab pool.
@@ -704,6 +712,7 @@ pub struct KvSlabPoolStats {
 pub struct KvSlabPool {
     page_tokens: usize,
     slab_payload_bytes: usize,
+    reserved_payload_bytes: usize,
     slabs: Vec<KvPhysicalSlab>,
     free: Vec<KvSlabId>,
     live_slab_count: usize,
@@ -726,7 +735,7 @@ impl KvSlabPool {
             .ok_or(KvSlabError::AdmissionArithmeticOverflow {
                 positions: page_tokens,
             })?;
-        slab_capacity.checked_mul(slab_payload_bytes).ok_or(
+        let reserved_payload_bytes = slab_capacity.checked_mul(slab_payload_bytes).ok_or(
             KvSlabError::AdmissionArithmeticOverflow {
                 positions: slab_capacity,
             },
@@ -751,6 +760,7 @@ impl KvSlabPool {
         Ok(Self {
             page_tokens,
             slab_payload_bytes,
+            reserved_payload_bytes,
             slabs,
             free,
             live_slab_count: 0,
@@ -769,10 +779,16 @@ impl KvSlabPool {
     #[must_use]
     pub fn stats(&self) -> KvSlabPoolStats {
         KvSlabPoolStats {
+            slab_capacity: self.slabs.len(),
+            reserved_payload_bytes: self.reserved_payload_bytes,
             live_slab_count: self.live_slab_count,
             free_slab_count: self.free.len(),
             live_payload_bytes: self.live_payload_bytes,
             allocation_events: self.allocation_events,
+            retained_reference_count: self
+                .slabs
+                .iter()
+                .try_fold(0_usize, |total, slab| total.checked_add(slab.references)),
         }
     }
 

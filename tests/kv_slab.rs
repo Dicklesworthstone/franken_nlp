@@ -87,8 +87,11 @@ fn typed_admission_constructs_an_exactly_priced_pre_reserved_pool() {
         .expect("cache construction consumes only the typed reservation");
     let stats = cache.pool_stats();
     assert_eq!(cache.capacity_positions(), 17);
+    assert_eq!(stats.slab_capacity, admission.reserved_slab_count());
+    assert_eq!(stats.reserved_payload_bytes, admission.reserved_bf16_bytes());
     assert_eq!(stats.live_slab_count, 0);
     assert_eq!(stats.free_slab_count, admission.reserved_slab_count());
+    assert_eq!(stats.retained_reference_count, Some(0));
 }
 
 #[test]
@@ -132,6 +135,10 @@ fn prepared_append_uses_only_preallocated_aligned_slabs() {
     assert_eq!(before_append.allocation_events, after_append.allocation_events);
     assert_eq!(after_append.live_slab_count, KV_SLABS_PER_LOGICAL_PAGE);
     assert_eq!(after_append.live_payload_bytes, KV_BF16_LOGICAL_PAGE_BYTES);
+    assert_eq!(
+        after_append.retained_reference_count,
+        Some(KV_SLABS_PER_LOGICAL_PAGE)
+    );
 
     let mut key = [0_u16; 1_024];
     let mut value = [0_u16; 1_024];
@@ -178,10 +185,18 @@ fn forked_tail_cow_releases_only_the_cancelled_fork_slabs() {
         .expect("a completed prefix can retain sealed slab references");
     assert_eq!(parent.refcount_at(0, 0, KvVector::Key), Ok(2));
     assert_eq!(fork.pool_stats().live_slab_count, KV_SLABS_PER_LOGICAL_PAGE);
+    assert_eq!(
+        fork.pool_stats().retained_reference_count,
+        Some(KV_SLABS_PER_LOGICAL_PAGE * 2)
+    );
 
     fork.prepare_append(3)
         .expect("fork-tail COW is prepared outside the append loop");
     assert_eq!(fork.pool_stats().live_slab_count, KV_SLABS_PER_LOGICAL_PAGE * 2);
+    assert_eq!(
+        fork.pool_stats().retained_reference_count,
+        Some(KV_SLABS_PER_LOGICAL_PAGE * 2)
+    );
     append_prepared_position(&mut fork, 3, 99);
 
     let mut parent_key = [0_u16; 1_024];
@@ -195,5 +210,9 @@ fn forked_tail_cow_releases_only_the_cancelled_fork_slabs() {
     let retained = parent.pool_stats();
     assert_eq!(retained.live_slab_count, KV_SLABS_PER_LOGICAL_PAGE);
     assert_eq!(retained.live_payload_bytes, KV_BF16_LOGICAL_PAGE_BYTES);
+    assert_eq!(
+        retained.retained_reference_count,
+        Some(KV_SLABS_PER_LOGICAL_PAGE)
+    );
     assert_eq!(parent.refcount_at(0, 0, KvVector::Key), Ok(1));
 }
