@@ -582,11 +582,13 @@ fn emit_streaming_refusal(stage: &str, error: impl std::fmt::Display) -> ExitCod
     ErrorCode::ArtifactIntegrityOrFormatOrVersion.as_process_exit()
 }
 
-struct MaterializedSources {
-    model_config: Vec<u8>,
-    tokenizer_model: Vec<u8>,
-    tokenizer_config: Vec<u8>,
-    chat_template: Vec<u8>,
+struct MaterializedSources<'a> {
+    // These borrow the prepared source snapshot so the envelope planner does
+    // not create a second tokenizer/config/template resident copy.
+    model_config: &'a [u8],
+    tokenizer_model: &'a [u8],
+    tokenizer_config: &'a [u8],
+    chat_template: &'a [u8],
     license_bundle: Vec<u8>,
 }
 
@@ -685,13 +687,13 @@ impl LogicalTensorFirstPass {
 
 fn read_materialized_sources(
     prepared: &PreparedConversionInput,
-) -> Result<MaterializedSources, String> {
+) -> Result<MaterializedSources<'_>, String> {
     let verified = prepared.materialized_sources();
     Ok(MaterializedSources {
-        model_config: verified.model_config.clone(),
-        tokenizer_model: verified.tokenizer_model.clone(),
-        tokenizer_config: verified.tokenizer_config.clone(),
-        chat_template: verified.chat_template.clone(),
+        model_config: &verified.model_config,
+        tokenizer_model: &verified.tokenizer_model,
+        tokenizer_config: &verified.tokenizer_config,
+        chat_template: &verified.chat_template,
         license_bundle: embedded_license_bundle()?,
     })
 }
@@ -714,7 +716,7 @@ fn embedded_license_bundle() -> Result<Vec<u8>, String> {
 fn build_streaming_envelope_plan(
     prepared: &PreparedConversionInput,
     generic: &GenericPayloadPlan,
-    materialized: &MaterializedSources,
+    materialized: &MaterializedSources<'_>,
 ) -> Result<StreamingEnvelopePlan, String> {
     validate_generic_tensor_authorities(generic)?;
     let (mut tensors, payload_sha256, scales_sha256, row_sums_sha256) =
@@ -727,10 +729,10 @@ fn build_streaming_envelope_plan(
     let logical_model_sha256 = logical_model_sha256(
         &tensor_digests,
         &[
-            ("model_config", materialized.model_config.as_slice()),
-            ("tokenizer_model", materialized.tokenizer_model.as_slice()),
-            ("tokenizer_config", materialized.tokenizer_config.as_slice()),
-            ("chat_template", materialized.chat_template.as_slice()),
+            ("model_config", materialized.model_config),
+            ("tokenizer_model", materialized.tokenizer_model),
+            ("tokenizer_config", materialized.tokenizer_config),
+            ("chat_template", materialized.chat_template),
         ],
     )
     .map_err(|error| format!("logical model identity: {error}"))?;
@@ -765,25 +767,25 @@ fn build_streaming_envelope_plan(
             TOKENIZER_MODEL_SECTION,
             SectionKind::TokenizerModel,
             32,
-            &materialized.tokenizer_model,
+            materialized.tokenizer_model,
         )?,
         streaming_small_section(
             MODEL_CONFIG_SECTION,
             SectionKind::ModelConfig,
             8,
-            &materialized.model_config,
+            materialized.model_config,
         )?,
         streaming_small_section(
             TOKENIZER_CONFIG_SECTION,
             SectionKind::TokenizerConfig,
             8,
-            &materialized.tokenizer_config,
+            materialized.tokenizer_config,
         )?,
         streaming_small_section(
             CHAT_TEMPLATE_SECTION,
             SectionKind::ChatTemplate,
             8,
-            &materialized.chat_template,
+            materialized.chat_template,
         )?,
         streaming_small_section(
             LICENSE_BUNDLE_SECTION,
@@ -1019,7 +1021,7 @@ fn emit_streaming_section(
     source_dir: &Path,
     prepared: &PreparedConversionInput,
     generic: &GenericPayloadPlan,
-    materialized: &MaterializedSources,
+    materialized: &MaterializedSources<'_>,
     section: &StreamingSection,
     sink: &mut dyn Write,
 ) -> Result<(), FnlpqWriteError> {
@@ -1049,16 +1051,16 @@ fn emit_streaming_section(
             GenericSection::RowSums,
         ),
         (SectionKind::TokenizerModel, TOKENIZER_MODEL_SECTION) => {
-            emit_materialized_section(section, &materialized.tokenizer_model, sink)
+            emit_materialized_section(section, materialized.tokenizer_model, sink)
         }
         (SectionKind::ModelConfig, MODEL_CONFIG_SECTION) => {
-            emit_materialized_section(section, &materialized.model_config, sink)
+            emit_materialized_section(section, materialized.model_config, sink)
         }
         (SectionKind::TokenizerConfig, TOKENIZER_CONFIG_SECTION) => {
-            emit_materialized_section(section, &materialized.tokenizer_config, sink)
+            emit_materialized_section(section, materialized.tokenizer_config, sink)
         }
         (SectionKind::ChatTemplate, CHAT_TEMPLATE_SECTION) => {
-            emit_materialized_section(section, &materialized.chat_template, sink)
+            emit_materialized_section(section, materialized.chat_template, sink)
         }
         (SectionKind::LicenseBundle, LICENSE_BUNDLE_SECTION) => {
             emit_materialized_section(section, &materialized.license_bundle, sink)

@@ -521,9 +521,11 @@ fn verify_source_member(
 }
 
 /// Snapshot the exact source members embedded into an artifact while the
-/// prepared closure is still being established. Each read is re-hashed against
-/// the accepted manifest; later conversion code consumes only these retained
-/// bytes rather than reopening configuration/tokenizer paths.
+/// prepared closure is still being established. Each member is opened,
+/// type/length-bound, then bounded-read and re-hashed from that opened handle
+/// before allocation-sized bytes are retained. Later conversion code consumes
+/// only these retained bytes rather than reopening configuration/tokenizer
+/// paths.
 fn snapshot_materialized_sources(
     source_dir: &Path,
     source: &VerifiedSourceClosure,
@@ -569,23 +571,100 @@ fn read_materialized_source_member(
             detail: "absent from verified source closure".to_owned(),
         })?;
     let path = source_dir.join(name);
-    let bytes = fs::read(&path).map_err(|error| ConverterError::Io {
+    let link_metadata = fs::symlink_metadata(&path).map_err(|error| ConverterError::SourceMissing {
         path: path.clone(),
-        operation: "snapshot verified materialized source",
+        expected: expected.name.clone(),
         detail: error.to_string(),
     })?;
-    let observed_len = u64::try_from(bytes.len()).map_err(|_| ConverterError::Arithmetic {
-        invariant: "materialized source bytes to u64",
+    if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
+        return Err(ConverterError::SourceNotRegular {
+            path,
+            expected: expected.name.clone(),
+        });
+    }
+    let mut file = File::open(&path).map_err(|error| ConverterError::Io {
+        path: path.clone(),
+        operation: "open materialized source member",
+        detail: error.to_string(),
     })?;
-    if observed_len != expected.bytes {
+    let opened_metadata = file.metadata().map_err(|error| ConverterError::Io {
+        path: path.clone(),
+        operation: "inspect opened materialized source member",
+        detail: error.to_string(),
+    })?;
+    if !opened_metadata.is_file() {
+        return Err(ConverterError::SourceNotRegular {
+            path,
+            expected: expected.name.clone(),
+        });
+    }
+    if opened_metadata.len() != expected.bytes {
         return Err(ConverterError::SourceLength {
             path,
             expected: expected.bytes,
-            actual: observed_len,
+            actual: opened_metadata.len(),
             next_command: "restore the pinned source closure and rerun fnlp convert".to_owned(),
         });
     }
-    let observed_sha256 = sha256_hex(&bytes);
+    let expected_len = usize::try_from(expected.bytes).map_err(|_| ConverterError::Arithmetic {
+        invariant: "materialized source expected bytes to usize",
+    })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(expected_len)
+        .map_err(|error| ConverterError::Io {
+            path: path.clone(),
+            operation: "reserve bounded materialized source",
+            detail: error.to_string(),
+        })?;
+    bytes.resize(expected_len, 0);
+    let mut hasher = Sha256::new();
+    let mut read_len = 0_usize;
+    while read_len != expected_len {
+        let read = file
+            .read(&mut bytes[read_len..])
+            .map_err(|error| ConverterError::Io {
+                path: path.clone(),
+                operation: "read bounded materialized source",
+                detail: error.to_string(),
+            })?;
+        if read == 0 {
+            let actual = u64::try_from(read_len).map_err(|_| ConverterError::Arithmetic {
+                invariant: "materialized source read bytes to u64",
+            })?;
+            return Err(ConverterError::SourceLength {
+                path,
+                expected: expected.bytes,
+                actual,
+                next_command: "restore the pinned source closure and rerun fnlp convert".to_owned(),
+            });
+        }
+        let next_len = read_len.checked_add(read).ok_or(ConverterError::Arithmetic {
+            invariant: "materialized source bounded read length",
+        })?;
+        hasher.update(&bytes[read_len..next_len]);
+        read_len = next_len;
+    }
+    let final_metadata = file.metadata().map_err(|error| ConverterError::Io {
+        path: path.clone(),
+        operation: "inspect materialized source after bounded read",
+        detail: error.to_string(),
+    })?;
+    if !final_metadata.is_file() {
+        return Err(ConverterError::SourceNotRegular {
+            path,
+            expected: expected.name.clone(),
+        });
+    }
+    if final_metadata.len() != expected.bytes {
+        return Err(ConverterError::SourceLength {
+            path,
+            expected: expected.bytes,
+            actual: final_metadata.len(),
+            next_command: "restore the pinned source closure and rerun fnlp convert".to_owned(),
+        });
+    }
+    let observed_sha256 = hex_lower(&hasher.finalize());
     if observed_sha256 != expected.sha256 {
         return Err(ConverterError::SourceDigest {
             path,
