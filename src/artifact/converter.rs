@@ -1150,9 +1150,10 @@ impl ConversionReceipt {
         if canonical.as_slice() != input.as_bytes() {
             return Err(ConverterError::ReceiptNonCanonical);
         }
-        let receipt = serde_json::from_value(value).map_err(|error| ConverterError::ReceiptParse {
-            detail: error.to_string(),
-        })?;
+        let receipt: Self =
+            serde_json::from_value(value).map_err(|error| ConverterError::ReceiptParse {
+                detail: error.to_string(),
+            })?;
         receipt.validate()?;
         Ok(receipt)
     }
