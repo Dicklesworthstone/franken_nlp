@@ -942,7 +942,7 @@ impl KvCacheQuantization {
     }
 
     /// Parse only the closed cache-accounting profiles.
-    pub const fn parse(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
             "bf16" => Some(Self::Bf16),
             "int8" | "int8-f32-scales" => Some(Self::Int8F32Scales),
