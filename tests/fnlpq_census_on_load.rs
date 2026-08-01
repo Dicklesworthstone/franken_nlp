@@ -1,4 +1,7 @@
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
 
 use franken_nlp::artifact::converter::expected_nanbeige42_census;
 use franken_nlp::artifact::format::{
@@ -12,6 +15,178 @@ use sha2::{Digest, Sha256};
 const PINNED_REVISION: &str = "f56ec5a9650268aa098496734743c25ea778bd2d";
 const BF16_RECIPE: &str = "bf16-verbatim-v1";
 const STRUCTURAL_CENSUS_RECIPE: &str = "census-structure-v1";
+const REAL_INT8_GENERIC_BYTES: u64 = 4_690_873_282;
+const REAL_INT8_GENERIC_RAW_SHA256: &str =
+    "15c57d4db1b635b84b84c73ec12e805fb4c383e99d17070dbbbbe8a8d741a1d7";
+const REAL_INT8_GENERIC_SOURCE_ROOT_SHA256: &str =
+    "71686a7075712c2b38e80fe387b9f23e3befac6e367bb4cb0d0ba5a90374c7fd";
+const REAL_INT8_GENERIC_LOGICAL_MODEL_SHA256: &str =
+    "1d24f68a8eecc89fe68450e19ec2c9d2959054f3fac28cf4f12d3fc3dd7daae8";
+const REAL_INT8_GENERIC_TOKENIZER_STORED_SHA256: &str =
+    "2e2501d35af4ee7434cb82c93f599f86201f6823d2afae9aaf1c6ae63f08dc3d";
+const REAL_INT8_GENERIC_LICENSE_BUNDLE_SHA256: &str =
+    "123d4a23b8edc328ba8fd52b802993408037891f38484e1a48a4d4022200713b";
+
+/// Executes only when an orchestrator provides the immutable converted
+/// artifact through `FNLP_REAL_FNLPQ`.  This is deliberately a reader gate,
+/// not a conversion-qualification claim: any checked-reader refusal is logged
+/// before the test fails and must be adjudicated as a converter/reader defect.
+#[test]
+fn real_int8_generic_artifact_checked_reader_gate_when_supplied() {
+    let Some(path) = std::env::var_os("FNLP_REAL_FNLPQ") else {
+        eprintln!(
+            "FNLPQ_REAL_READER RESULT=SKIPPED_NO_REAL_ARTIFACT reason=FNLP_REAL_FNLPQ-not-set"
+        );
+        return;
+    };
+    let path = Path::new(&path);
+    let metadata = std::fs::metadata(path).expect("real artifact metadata must be readable");
+    assert!(metadata.is_file(), "real artifact must be a regular file");
+    assert_eq!(
+        metadata.len(),
+        REAL_INT8_GENERIC_BYTES,
+        "real artifact byte count must bind this reader observation"
+    );
+    eprintln!(
+        "FNLPQ_REAL_READER stage=preflight verdict=OBSERVED bytes={} path={}",
+        metadata.len(),
+        path.display()
+    );
+
+    let observed_raw_sha256 = raw_sha256_file(path);
+    assert_eq!(
+        observed_raw_sha256, REAL_INT8_GENERIC_RAW_SHA256,
+        "real artifact raw SHA-256 must equal the supplied conversion output"
+    );
+    eprintln!(
+        "FNLPQ_REAL_READER stage=raw-file-digest verdict=OBSERVED algorithm=sha256-unframed value={observed_raw_sha256}"
+    );
+
+    let artifact = match FnlpqArtifact::open_owned(path) {
+        Ok(artifact) => artifact,
+        Err(error) => {
+            eprintln!(
+                "FNLPQ_REAL_READER RESULT=REFUSED stage=open_checked_reader error={error} scope=reader-only"
+            );
+            panic!("checked reader refused real artifact: {error}");
+        }
+    };
+    eprintln!(
+        "FNLPQ_REAL_READER stage=open_checked_reader verdict=ACCEPTED model_id={} revision={} recipe_id={}",
+        artifact.model_id(),
+        artifact.revision(),
+        artifact.recipe_id()
+    );
+
+    assert_eq!(artifact.prelude().file_len, REAL_INT8_GENERIC_BYTES);
+    assert_eq!(artifact.prelude().section_count, 8);
+    assert_eq!(artifact.prelude().tensor_count, 201);
+    assert_eq!(artifact.model_id(), "Nanbeige4.2-3B");
+    assert_eq!(artifact.revision(), PINNED_REVISION);
+    assert_eq!(
+        artifact.source_root_sha256(),
+        REAL_INT8_GENERIC_SOURCE_ROOT_SHA256
+    );
+    assert_eq!(
+        artifact.logical_model_sha256(),
+        REAL_INT8_GENERIC_LOGICAL_MODEL_SHA256
+    );
+    assert_eq!(
+        artifact.license_bundle_sha256(),
+        REAL_INT8_GENERIC_LICENSE_BUNDLE_SHA256
+    );
+
+    let expected = expected_nanbeige42_census();
+    assert_eq!(artifact.tensors().len(), expected.len());
+    let expected_by_name = expected
+        .iter()
+        .map(|tensor| (tensor.name.as_str(), tensor))
+        .collect::<BTreeMap<_, _>>();
+    for (ordinal, tensor) in artifact.tensors().iter().enumerate() {
+        let expected = expected_by_name
+            .get(tensor.name.as_str())
+            .expect("checked reader must refuse any tensor outside the frozen census");
+        let expected_shape = expected
+            .shape
+            .iter()
+            .map(|dimension| u32::try_from(*dimension).expect("frozen dimension fits v1"))
+            .collect::<Vec<_>>();
+        assert_eq!(tensor.canonical_dtype, "bf16", "tensor={}", tensor.name);
+        assert_eq!(tensor.shape, expected_shape, "tensor={}", tensor.name);
+        eprintln!(
+            "FNLPQ_REAL_READER stage=tensor ordinal={ordinal} name={} dtype={} shape={:?} logical_bytes={} quantization={} data_bytes={} scale_bytes={} row_sum_bytes={} logical_sha256={}",
+            tensor.name,
+            tensor.canonical_dtype,
+            tensor.shape,
+            tensor.logical_bytes,
+            tensor.quantization,
+            tensor.data.len,
+            tensor.scale.len,
+            tensor.row_sum.len,
+            tensor.canonical_logical_sha256,
+        );
+    }
+    eprintln!(
+        "FNLPQ_REAL_READER stage=census verdict=ACCEPTED tensors={} logical_model_sha256={}",
+        artifact.tensors().len(),
+        artifact.logical_model_sha256()
+    );
+
+    let mut tokenizer = None;
+    let mut license = None;
+    for section in artifact.sections() {
+        let bytes = artifact
+            .section_bytes(section.ordinal)
+            .expect("checked section bytes remain available");
+        assert_eq!(
+            u64::try_from(bytes.len()).expect("section byte length fits u64"),
+            section.stored_len,
+            "section={} must retain its checked length",
+            section.name
+        );
+        eprintln!(
+            "FNLPQ_REAL_READER stage=section ordinal={} name={} kind={} bytes={} stored_sha256={} raw_sha256={}",
+            section.ordinal,
+            section.name,
+            section.kind.header_name(),
+            section.stored_len,
+            hex(&section.stored_sha256),
+            hex(&Sha256::digest(bytes)),
+        );
+        if section.kind == SectionKind::TokenizerModel {
+            tokenizer = Some(section);
+        }
+        if section.kind == SectionKind::LicenseBundle {
+            license = Some(section);
+        }
+    }
+
+    let tokenizer = tokenizer.expect("v1 requires the embedded tokenizer section");
+    assert_eq!(
+        hex(&tokenizer.stored_sha256),
+        REAL_INT8_GENERIC_TOKENIZER_STORED_SHA256
+    );
+    let license = license.expect("v1 requires the embedded license section");
+    let license_bytes = artifact
+        .section_bytes(license.ordinal)
+        .expect("checked license bytes remain available");
+    assert_eq!(
+        framed_sha256_hex("fnlpq-license-bundle-v1", &[license_bytes])
+            .expect("fixed license identity framing is valid"),
+        artifact.license_bundle_sha256()
+    );
+    eprintln!(
+        "FNLPQ_REAL_READER stage=embedded-identities verdict=ACCEPTED tokenizer_stored_sha256={} license_bundle_sha256={}",
+        hex(&tokenizer.stored_sha256),
+        artifact.license_bundle_sha256()
+    );
+    eprintln!(
+        "FNLPQ_REAL_READER RESULT=CHECKED_ACCEPT scope=reader-only tensors={} sections={} raw_file_sha256={} conversion_qualified=false",
+        artifact.tensors().len(),
+        artifact.sections().len(),
+        observed_raw_sha256
+    );
+}
 
 #[test]
 fn complete_nanbeige_census_loads_and_missing_shape_and_name_drift_refuse() {
@@ -668,6 +843,22 @@ fn first_section_offset(bytes: &[u8]) -> usize {
             .expect("first directory entry"),
     ))
     .expect("fixture section offset fits host")
+}
+
+fn raw_sha256_file(path: &Path) -> String {
+    let mut file = File::open(path).expect("real artifact must open for raw SHA-256");
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .expect("real artifact raw SHA-256 read must succeed");
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    hex(&hasher.finalize())
 }
 
 fn hex(bytes: &[u8]) -> String {
