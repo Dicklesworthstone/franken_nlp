@@ -4,8 +4,21 @@ use franken_nlp::native_engine::kv::{
     KV_BF16_LOGICAL_PAGE_BYTES, KV_BF16_SLAB_BYTES, KV_BYTES_PER_TOKEN,
     KV_INT8_F16_SCALE_BYTES_PER_TOKEN, KV_INT8_F32_SCALE_BYTES_PER_TOKEN,
     KV_INT8_PAYLOAD_BYTES_PER_TOKEN, KV_LOGICAL_PAGE_TOKENS, KV_SLOT_COUNT,
-    KV_SLABS_PER_LOGICAL_PAGE, KvSlabDtype, KvSlabError, KvSlabKey, KvVector,
+    KV_SLABS_PER_LOGICAL_PAGE, KvSlabCache, KvSlabDtype, KvSlabError, KvSlabKey, KvVector,
 };
+
+fn append_prepared_position(cache: &mut KvSlabCache, position: usize, marker: u16) {
+    cache
+        .prepare_append(position)
+        .expect("the position is admitted at its page boundary");
+    for slot in 0..KV_SLOT_COUNT {
+        let key = [marker + slot as u16; 1_024];
+        let value = [marker + 1_000 + slot as u16; 1_024];
+        cache
+            .append(slot, position, &key, &value)
+            .expect("prepared hot-loop K/V append must not allocate or fail");
+    }
+}
 
 #[test]
 fn baseline_slab_geometry_is_the_44_slot_byte_certificate() {
@@ -43,4 +56,71 @@ fn slab_key_prices_one_vector_in_one_logical_layer_group() {
         KvSlabKey::new(usize::MAX, 1, 0, 1, KvVector::Key, KvSlabDtype::Bf16),
         Err(KvSlabError::AdmissionArithmeticOverflow { .. })
     ));
+}
+
+#[test]
+fn prepared_append_uses_only_preallocated_aligned_slabs() {
+    let mut cache = KvSlabCache::try_with_capacity(32, KV_SLABS_PER_LOGICAL_PAGE)
+        .expect("one logical page worth of slabs pre-reserves successfully");
+    cache
+        .prepare_append(0)
+        .expect("page admission happens before the hot loop");
+    let before_append = cache.pool_stats();
+    for slot in 0..KV_SLOT_COUNT {
+        let key = [slot as u16; 1_024];
+        let value = [1_000 + slot as u16; 1_024];
+        cache
+            .append(slot, 0, &key, &value)
+            .expect("prepared append writes only existing slabs");
+    }
+    let after_append = cache.pool_stats();
+
+    assert_eq!(cache.len_positions(), 1);
+    assert_eq!(before_append.allocation_events, after_append.allocation_events);
+    assert_eq!(after_append.live_slab_count, KV_SLABS_PER_LOGICAL_PAGE);
+    assert_eq!(after_append.live_payload_bytes, KV_BF16_LOGICAL_PAGE_BYTES);
+
+    let mut key = [0_u16; 1_024];
+    let mut value = [0_u16; 1_024];
+    cache
+        .copy_key_at(43, 0, &mut key)
+        .expect("completed K data is addressable by logical slot and position");
+    cache
+        .copy_value_at(43, 0, &mut value)
+        .expect("completed V data is addressable by logical slot and position");
+    assert_eq!(key, [43; 1_024]);
+    assert_eq!(value, [1_043; 1_024]);
+}
+
+#[test]
+fn forked_tail_cow_releases_only_the_cancelled_fork_slabs() {
+    let mut parent = KvSlabCache::try_with_capacity(32, KV_SLABS_PER_LOGICAL_PAGE * 2)
+        .expect("the pool reserves a parent page plus one COW tail");
+    for position in 0..3 {
+        append_prepared_position(&mut parent, position, 10 + position as u16);
+    }
+
+    let mut fork = parent
+        .try_fork()
+        .expect("a completed prefix can retain sealed slab references");
+    assert_eq!(parent.refcount_at(0, 0, KvVector::Key), Ok(2));
+    assert_eq!(fork.pool_stats().live_slab_count, KV_SLABS_PER_LOGICAL_PAGE);
+
+    fork.prepare_append(3)
+        .expect("fork-tail COW is prepared outside the append loop");
+    assert_eq!(fork.pool_stats().live_slab_count, KV_SLABS_PER_LOGICAL_PAGE * 2);
+    append_prepared_position(&mut fork, 3, 99);
+
+    let mut parent_key = [0_u16; 1_024];
+    parent
+        .copy_key_at(0, 2, &mut parent_key)
+        .expect("the parent retains its sealed prefix");
+    assert_eq!(parent_key, [12; 1_024]);
+    assert_eq!(fork.refcount_at(0, 3, KvVector::Key), Ok(1));
+
+    drop(fork);
+    let retained = parent.pool_stats();
+    assert_eq!(retained.live_slab_count, KV_SLABS_PER_LOGICAL_PAGE);
+    assert_eq!(retained.live_payload_bytes, KV_BF16_LOGICAL_PAGE_BYTES);
+    assert_eq!(parent.refcount_at(0, 0, KvVector::Key), Ok(1));
 }
