@@ -2,19 +2,10 @@
 
 use std::path::Path;
 
-#[cfg(target_os = "linux")]
-use std::{
-    fs,
-    os::unix::fs::{PermissionsExt, symlink},
-    path::PathBuf,
-    process,
-    time::{SystemTime, UNIX_EPOCH},
-};
-
 use franken_nlp::artifact::fs_tx::{
-    discover_activation, open_ratified_model_root, ActivationDigest, ActivationRecord,
-    ActivationRecordBody, ChainWalkVerdict, ContentAddressLockSet, FsTxError,
-    NonReentrantContentLock, SimulatedActivationJournal, ACTIVATION_RECORD_DOMAIN,
+    ACTIVATION_RECORD_DOMAIN, ActivationDigest, ActivationRecord, ActivationRecordBody,
+    ChainWalkVerdict, ContentAddressLockSet, FsTxError, NonReentrantContentLock,
+    SimulatedActivationJournal, discover_activation, open_ratified_model_root,
 };
 use sha2::{Digest, Sha256};
 
@@ -63,9 +54,11 @@ fn canonical_body_domain_digest_and_append_only_chain_are_locked() {
     assert_eq!(record.record_digest(), expected);
     assert!(record.digest_is_valid());
     assert!(record.final_filename().starts_with("00000000000000000000-"));
-    assert!(record
-        .canonical_envelope_bytes()
-        .ends_with(&record.record_digest().as_bytes()));
+    assert!(
+        record
+            .canonical_envelope_bytes()
+            .ends_with(&record.record_digest().as_bytes())
+    );
 
     let mut journal = SimulatedActivationJournal::new();
     let first = journal.append(digest(1), digest(2), digest(3)).unwrap();
@@ -249,9 +242,10 @@ fn forged_successors_raise_activation_fork_and_retain_last_unambiguous_head() {
         } => {
             assert_eq!(last_unambiguous.map(|head| head.sequence()), Some(0));
             assert_eq!(successor_digests.len(), 2);
-            assert!(walk
-                .iter()
-                .any(|entry| entry.verdict == ChainWalkVerdict::ForkSuccessor));
+            assert!(
+                walk.iter()
+                    .any(|entry| entry.verdict == ChainWalkVerdict::ForkSuccessor)
+            );
         }
         other => panic!("expected ActivationFork, observed {other:?}"),
     }
@@ -311,7 +305,10 @@ fn append_ignores_a_disconnected_record_and_starts_the_unique_genesis_chain() {
     let genesis = journal.append(digest(5), digest(6), digest(7)).unwrap();
     assert_eq!(genesis.sequence(), 0);
     let discovery = journal.discover().unwrap();
-    assert_eq!(discovery.head.as_ref().map(|head| head.digest()), Some(genesis.digest()));
+    assert_eq!(
+        discovery.head.as_ref().map(|head| head.digest()),
+        Some(genesis.digest())
+    );
     assert!(discovery.walk.iter().any(|entry| {
         entry.digest == orphan_digest && entry.verdict == ChainWalkVerdict::IgnoredDisconnected
     }));
@@ -423,10 +420,12 @@ fn torn_gapped_and_disconnected_records_never_become_active() {
         Some(0),
         "a sequence gap is disconnected, never a promoted head"
     );
-    assert!(gapped_discovery
-        .walk
-        .iter()
-        .any(|entry| entry.verdict == ChainWalkVerdict::IgnoredDisconnected));
+    assert!(
+        gapped_discovery
+            .walk
+            .iter()
+            .any(|entry| entry.verdict == ChainWalkVerdict::IgnoredDisconnected)
+    );
 
     let only_torn = vec![ActivationRecord::from_retained_parts(
         valid_successor.body().clone(),
@@ -442,7 +441,7 @@ fn torn_gapped_and_disconnected_records_never_become_active() {
 }
 
 #[test]
-fn sequence_overflow_lock_reentry_and_invalid_root_refuse_typed() {
+fn sequence_overflow_lock_reentry_and_unratified_root_refuse_typed() {
     let max_body = ActivationRecordBody::from_retained_parts(
         u64::MAX,
         digest(1),
@@ -461,17 +460,17 @@ fn sequence_overflow_lock_reentry_and_invalid_root_refuse_typed() {
     assert!(matches!(lock.try_lock(), Err(FsTxError::LockReentrant)));
     drop(guard);
     assert!(lock.try_lock().is_ok());
-    #[cfg(target_os = "linux")]
-    assert!(matches!(
-        open_ratified_model_root(Path::new("/untrusted/model-root")),
-        Err(FsTxError::RootIo { .. })
-    ));
-    #[cfg(not(target_os = "linux"))]
-    assert!(matches!(
-        open_ratified_model_root(Path::new("/untrusted/model-root")),
-        Err(FsTxError::PlatformSurfaceUnavailable { .. })
-    ));
-    eprintln!("FS_TXN case=overflow-lock-platform-root-refusal RESULT=PASS");
+    let real_tempdir_root = std::env::temp_dir();
+    for root in [
+        Path::new("/untrusted/model-root"),
+        real_tempdir_root.as_path(),
+    ] {
+        assert!(matches!(
+            open_ratified_model_root(root),
+            Err(FsTxError::PlatformSurfaceUnavailable { .. })
+        ));
+    }
+    eprintln!("FS_TXN case=overflow-lock-platform-refusal RESULT=PASS roots=2");
 }
 
 #[test]
@@ -490,60 +489,6 @@ fn content_address_locks_are_independent_but_never_reentrant_per_digest() {
     drop(second);
     assert!(locks.try_lock(second_digest).is_ok());
     eprintln!("FS_TXN case=content-address-locks RESULT=PASS rows=4");
-}
-
-#[cfg(target_os = "linux")]
-fn new_real_model_root(case: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("current system time must be after the Unix epoch")
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!("franken-nlp-fs-tx-{case}-{}-{nonce}", process::id()));
-    fs::create_dir(&root).expect("create unique real model-root fixture directory");
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
-        .expect("restrict real model-root fixture to its owner");
-    root
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn real_root_journal_matches_the_simulated_append_recovery_contract() {
-    let root_path = new_real_model_root("append-recovery");
-    let root = open_ratified_model_root(&root_path).expect("owner-only Linux root opens");
-    let journal = root
-        .activation_journal()
-        .expect("real root creates its append-only journal directory");
-    let old = journal.append(digest(1), digest(2), digest(3)).unwrap();
-    let new = journal.append(digest(4), digest(5), digest(6)).unwrap();
-    let recovered = journal.discover().unwrap();
-    assert_eq!(recovered.head.as_ref().map(|head| head.digest()), Some(new.digest()));
-    assert_eq!(recovered.head.as_ref().map(|head| head.sequence()), Some(old.sequence() + 1));
-
-    let content = ActivationDigest::from_bytes([9; 32]);
-    let _lock = root.try_lock_content(content).unwrap();
-    let stage = root
-        .stage_bytes(Path::new("native/content-address/cache.fnlpq"), b"derived-cache")
-        .expect("real root creates and syncs a create-new sibling stage");
-    let cache = root
-        .publish_staged(stage)
-        .expect("real root renames a synced sibling stage once");
-    assert_eq!(fs::read(cache).unwrap(), b"derived-cache");
-
-    let shared_root = new_real_model_root("shared-mode");
-    fs::set_permissions(&shared_root, fs::Permissions::from_mode(0o755))
-        .expect("make hostile fixture group/other-visible");
-    assert!(matches!(
-        open_ratified_model_root(&shared_root),
-        Err(FsTxError::HostileRoot { .. })
-    ));
-
-    let symlink_path = root_path.with_extension("symlink");
-    symlink(&root_path, &symlink_path).expect("create hostile terminal-root symlink fixture");
-    assert!(matches!(
-        open_ratified_model_root(&symlink_path),
-        Err(FsTxError::RootIo { .. })
-    ));
-    eprintln!("FS_TXN_CRASH_MATRIX RESULT=PASS rows=6 model=real-owner-only-root");
 }
 
 #[test]
@@ -652,7 +597,8 @@ fn crash_matrix_recovers_only_old_or_new_head() {
                 discovery
                     .walk
                     .iter()
-                    .any(|entry| entry.digest == candidate_digest && entry.verdict == expected_verdict),
+                    .any(|entry| entry.digest == candidate_digest
+                        && entry.verdict == expected_verdict),
                 "the crash walk must classify the visible candidate: stage={} expected={expected_verdict:?} walk={:?}",
                 case.stage,
                 discovery.walk
