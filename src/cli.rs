@@ -6,27 +6,27 @@ use std::{
     process::ExitCode,
 };
 
-use clap::{CommandFactory, Parser, Subcommand};
 use crate::{
     artifact::converter::{
-        prepare_convert_request, stream_routed_bf16_panels, ConvertArch, ConvertRequest,
-        ConverterError, GenericPayloadPlan, PreparedConversionInput, DEFAULT_PANEL_BYTES,
+        ConvertArch, ConvertRequest, ConverterError, DEFAULT_PANEL_BYTES, GenericPayloadPlan,
+        PreparedConversionInput, prepare_convert_request, stream_routed_bf16_panels,
     },
     artifact::format::{
-        framed_sha256, logical_model_sha256, validate_authority_identifier, write_streaming,
         ArchTarget, CanonicalDtype, FnlpqStreamingInput, FnlpqWriteError,
-        LogicalTensorStreamingHasher, PackingSetInput, SectionKind, SectionRange, StreamingSection,
-        StreamedFnlpq, StreamingSectionHasher, TensorInput,
+        LogicalTensorStreamingHasher, PackingSetInput, SectionKind, SectionRange, StreamedFnlpq,
+        StreamingSection, StreamingSectionHasher, TensorInput, framed_sha256, logical_model_sha256,
+        validate_authority_identifier, write_streaming,
     },
     artifact::fs_tx::open_ratified_model_root,
-    artifact::package::{package_model, verify_model_package, PackageRequest},
+    artifact::package::{PackageRequest, package_model, verify_model_package},
     artifact::packing::{NativePackingTarget, TILE_TABLE_VERSION_V1},
-    artifact::quantize::{encode_generic_panel, GenericPanelBytes},
+    artifact::quantize::{GenericPanelBytes, encode_generic_panel},
     artifact::safetensors::{RowPanel, TensorCensusEntry},
     error::ErrorCode,
-    grammar::{compile_json_schema, CompileLimits, CompiledSchema, SchemaError},
+    grammar::{CompileLimits, CompiledSchema, SchemaError, compile_json_schema},
     robot::{self, RobotCommand},
 };
+use clap::{CommandFactory, Parser, Subcommand};
 
 const GENERIC_PAYLOAD_SECTION: &str = "generic-payload";
 const GENERIC_SCALES_SECTION: &str = "generic-scales";
@@ -901,9 +901,7 @@ fn first_pass_generic_identities(
             std::slice::from_ref(entry),
             std::slice::from_ref(route),
             std::slice::from_ref(panel_plan),
-            |source_entry, panel| {
-                prepared.read_verified_panel(&source_entry.name, panel)
-            },
+            |source_entry, panel| prepared.read_verified_panel(&source_entry.name, panel),
             |source_entry, source_route, panel, source_bf16, decoded_f32| {
                 let encoded = encode_streaming_panel(
                     source_entry,
@@ -1088,13 +1086,14 @@ fn emit_generic_section(
     sink: &mut dyn Write,
     target: GenericSection,
 ) -> Result<(), FnlpqWriteError> {
-    let (census, routes, panels) = prepared.checked_plan_parts().map_err(|error| {
-        FnlpqWriteError::StoredIdentity {
-            section: section.name.clone(),
-            expected: "validated prepared conversion plan".to_owned(),
-            actual: error.to_string(),
-        }
-    })?;
+    let (census, routes, panels) =
+        prepared
+            .checked_plan_parts()
+            .map_err(|error| FnlpqWriteError::StoredIdentity {
+                section: section.name.clone(),
+                expected: "validated prepared conversion plan".to_owned(),
+                actual: error.to_string(),
+            })?;
     if census.len() != generic.tensors.len() {
         return Err(FnlpqWriteError::StoredIdentity {
             section: section.name.clone(),
@@ -1135,9 +1134,7 @@ fn emit_generic_section(
             std::slice::from_ref(entry),
             std::slice::from_ref(route),
             std::slice::from_ref(panel_plan),
-            |source_entry, panel| {
-                prepared.read_verified_panel(&source_entry.name, panel)
-            },
+            |source_entry, panel| prepared.read_verified_panel(&source_entry.name, panel),
             |source_entry, source_route, panel, source_bf16, decoded_f32| {
                 let encoded = encode_streaming_panel(
                     source_entry,
@@ -1174,8 +1171,7 @@ fn emit_generic_section(
             detail: error.to_string(),
         })?;
         let completed = index + 1;
-        if completed % EMISSION_PROGRESS_TENSOR_INTERVAL == 0 || completed == census.len()
-        {
+        if completed % EMISSION_PROGRESS_TENSOR_INTERVAL == 0 || completed == census.len() {
             eprintln!(
                 "CONVERT STAGE=emission section={} tensors={}/{}",
                 section.name,
@@ -1364,9 +1360,9 @@ mod tests {
     use clap::Parser;
 
     use super::{
+        Cli, Command, LogicalTensorFirstPass, ModelsSubcommand, ReleaseSubcommand,
         cli_main_with_reader, confirm_convert, conversion_staging_path,
-        require_streaming_conversion_root, validate_generic_tensor_authorities, Cli, Command,
-        LogicalTensorFirstPass, ModelsSubcommand, ReleaseSubcommand,
+        require_streaming_conversion_root, validate_generic_tensor_authorities,
     };
     use crate::artifact::converter::{
         ConvertArch, ConvertRequest, GenericPayloadPlan, GenericTensorLayout, OutputRange,
@@ -1487,16 +1483,18 @@ mod tests {
                 command: ModelsSubcommand::Derive(_)
             })
         ));
-        assert!(Cli::try_parse_from([
-            "fnlp",
-            "models",
-            "derive",
-            "--generic",
-            "/models/generic.fnlpq",
-            "--arch",
-            "x86-avx2",
-        ])
-        .is_err());
+        assert!(
+            Cli::try_parse_from([
+                "fnlp",
+                "models",
+                "derive",
+                "--generic",
+                "/models/generic.fnlpq",
+                "--arch",
+                "x86-avx2",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

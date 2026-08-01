@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::artifact::quantize::{encode_generic_panel, GenericPanelBytes, QuantizeError};
+use crate::artifact::quantize::{GenericPanelBytes, QuantizeError, encode_generic_panel};
 use crate::artifact::safetensors::{
     CensusDiff, RowPanel, SafetensorDtype, SafetensorsError, SafetensorsRangeIndex, SourceClosure,
     SourceDigest, TensorCensusEntry, TensorExpectation, diff_census_entries,
@@ -469,11 +469,12 @@ fn verify_source_member(
     expected: &SourceFileSpec,
 ) -> Result<VerifiedSourceFile, ConverterError> {
     let path = source_dir.join(&expected.name);
-    let link_metadata = fs::symlink_metadata(&path).map_err(|error| ConverterError::SourceMissing {
-        path: path.clone(),
-        expected: expected.name.clone(),
-        detail: error.to_string(),
-    })?;
+    let link_metadata =
+        fs::symlink_metadata(&path).map_err(|error| ConverterError::SourceMissing {
+            path: path.clone(),
+            expected: expected.name.clone(),
+            detail: error.to_string(),
+        })?;
     if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
         return Err(ConverterError::SourceNotRegular {
             path,
@@ -571,11 +572,12 @@ fn read_materialized_source_member(
             detail: "absent from verified source closure".to_owned(),
         })?;
     let path = source_dir.join(name);
-    let link_metadata = fs::symlink_metadata(&path).map_err(|error| ConverterError::SourceMissing {
-        path: path.clone(),
-        expected: expected.name.clone(),
-        detail: error.to_string(),
-    })?;
+    let link_metadata =
+        fs::symlink_metadata(&path).map_err(|error| ConverterError::SourceMissing {
+            path: path.clone(),
+            expected: expected.name.clone(),
+            detail: error.to_string(),
+        })?;
     if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
         return Err(ConverterError::SourceNotRegular {
             path,
@@ -639,9 +641,11 @@ fn read_materialized_source_member(
                 next_command: "restore the pinned source closure and rerun fnlp convert".to_owned(),
             });
         }
-        let next_len = read_len.checked_add(read).ok_or(ConverterError::Arithmetic {
-            invariant: "materialized source bounded read length",
-        })?;
+        let next_len = read_len
+            .checked_add(read)
+            .ok_or(ConverterError::Arithmetic {
+                invariant: "materialized source bounded read length",
+            })?;
         hasher.update(&bytes[read_len..next_len]);
         read_len = next_len;
     }
@@ -1668,11 +1672,15 @@ pub fn transform_routed_panel(
                 .to_owned(),
         });
     };
-    let columns = entry.shape[1..].iter().try_fold(1_u64, |product, dimension| {
-        product.checked_mul(*dimension).ok_or(ConverterError::Arithmetic {
-            invariant: "routed panel column product",
-        })
-    })?;
+    let columns = entry.shape[1..]
+        .iter()
+        .try_fold(1_u64, |product, dimension| {
+            product
+                .checked_mul(*dimension)
+                .ok_or(ConverterError::Arithmetic {
+                    invariant: "routed panel column product",
+                })
+        })?;
     let rows = usize::try_from(row_count).map_err(|_| ConverterError::Arithmetic {
         invariant: "routed panel rows to usize",
     })?;
@@ -1700,7 +1708,13 @@ pub fn stream_routed_bf16_panels<R, C>(
 ) -> Result<Bf16PanelStreamReport, ConverterError>
 where
     R: FnMut(&TensorCensusEntry, RowPanel) -> Result<Vec<u8>, ConverterError>,
-    C: FnMut(&TensorCensusEntry, &TensorRoute, RowPanel, &[u8], &[f32]) -> Result<(), ConverterError>,
+    C: FnMut(
+        &TensorCensusEntry,
+        &TensorRoute,
+        RowPanel,
+        &[u8],
+        &[f32],
+    ) -> Result<(), ConverterError>,
 {
     if census.len() != routes.len() || census.len() != panels.len() {
         return Err(ConverterError::PipelinePlanCount {
@@ -1741,11 +1755,10 @@ where
             |panel| read_panel(entry, panel),
             |panel, source_bytes, f32_work| {
                 consume(entry, route, panel, source_bytes, f32_work)?;
-                let source_bytes_len = u64::try_from(source_bytes.len()).map_err(|_| {
-                    ConverterError::Arithmetic {
+                let source_bytes_len =
+                    u64::try_from(source_bytes.len()).map_err(|_| ConverterError::Arithmetic {
                         invariant: "routed panel source bytes to u64",
-                    }
-                })?;
+                    })?;
                 let f32_work_bytes = u64::try_from(f32_work.len())
                     .map_err(|_| ConverterError::Arithmetic {
                         invariant: "routed panel f32 elements to u64",
@@ -1760,18 +1773,16 @@ where
                     .ok_or(ConverterError::Arithmetic {
                         invariant: "routed panel count",
                     })?;
-                report.source_bytes = report
-                    .source_bytes
-                    .checked_add(source_bytes_len)
-                    .ok_or(ConverterError::Arithmetic {
+                report.source_bytes = report.source_bytes.checked_add(source_bytes_len).ok_or(
+                    ConverterError::Arithmetic {
                         invariant: "routed source byte count",
-                    })?;
-                report.f32_work_bytes = report
-                    .f32_work_bytes
-                    .checked_add(f32_work_bytes)
-                    .ok_or(ConverterError::Arithmetic {
+                    },
+                )?;
+                report.f32_work_bytes = report.f32_work_bytes.checked_add(f32_work_bytes).ok_or(
+                    ConverterError::Arithmetic {
                         invariant: "routed f32 work byte count",
-                    })?;
+                    },
+                )?;
                 Ok(())
             },
         )?;
@@ -1795,16 +1806,20 @@ pub fn stream_prepared_bf16_panels<C>(
     consume: C,
 ) -> Result<Bf16PanelStreamReport, ConverterError>
 where
-    C: FnMut(&TensorCensusEntry, &TensorRoute, RowPanel, &[u8], &[f32]) -> Result<(), ConverterError>,
+    C: FnMut(
+        &TensorCensusEntry,
+        &TensorRoute,
+        RowPanel,
+        &[u8],
+        &[f32],
+    ) -> Result<(), ConverterError>,
 {
     let (census, routes, panels) = prepared.checked_plan_parts()?;
     stream_routed_bf16_panels(
         census,
         routes,
         panels,
-        |entry, panel| {
-            prepared.read_verified_panel(&entry.name, panel)
-        },
+        |entry, panel| prepared.read_verified_panel(&entry.name, panel),
         consume,
     )
 }
@@ -2959,11 +2974,41 @@ mod tests {
         assert_eq!(
             observed,
             vec![
-                ("model.embed_tokens.weight".to_owned(), "embed".to_owned(), 0, 4, 2),
-                ("model.embed_tokens.weight".to_owned(), "embed".to_owned(), 1, 4, 2),
-                ("model.embed_tokens.weight".to_owned(), "embed".to_owned(), 2, 4, 2),
-                ("model.norm.weight".to_owned(), "final_norm".to_owned(), 0, 4, 2),
-                ("model.norm.weight".to_owned(), "final_norm".to_owned(), 1, 4, 2),
+                (
+                    "model.embed_tokens.weight".to_owned(),
+                    "embed".to_owned(),
+                    0,
+                    4,
+                    2
+                ),
+                (
+                    "model.embed_tokens.weight".to_owned(),
+                    "embed".to_owned(),
+                    1,
+                    4,
+                    2
+                ),
+                (
+                    "model.embed_tokens.weight".to_owned(),
+                    "embed".to_owned(),
+                    2,
+                    4,
+                    2
+                ),
+                (
+                    "model.norm.weight".to_owned(),
+                    "final_norm".to_owned(),
+                    0,
+                    4,
+                    2
+                ),
+                (
+                    "model.norm.weight".to_owned(),
+                    "final_norm".to_owned(),
+                    1,
+                    4,
+                    2
+                ),
             ]
         );
     }

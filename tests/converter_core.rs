@@ -2,8 +2,8 @@
 //! model-gated in `scripts/e2e_convert_roundtrip.sh`.
 
 use franken_nlp::artifact::converter::{
-    BF16_VERBATIM_V1, ConversionReceipt, ConversionSourceManifest, ConvertArch, ConvertRequest,
-    ConverterError, CONVERSION_RECEIPT_SCHEMA, DEFAULT_PANEL_BYTES, OutputRange, OutputRangePlan,
+    BF16_VERBATIM_V1, CONVERSION_RECEIPT_SCHEMA, ConversionReceipt, ConversionSourceManifest,
+    ConvertArch, ConvertRequest, ConverterError, DEFAULT_PANEL_BYTES, OutputRange, OutputRangePlan,
     PINNED_LOGICAL_PAYLOAD_BYTES, PORTABLE_QUANT_V1, StorageStage, expected_nanbeige42_census,
     plan_generic_payload, prepare_convert_request, remap_tensor_name, validate_nanbeige42_census,
     validate_pinned_logical_payload_bytes,
@@ -89,9 +89,11 @@ fn census_validation_reports_a_clean_round_trip() {
         })
         .collect();
 
-    assert!(validate_nanbeige42_census(&actual)
-        .expect("matching census")
-        .is_match());
+    assert!(
+        validate_nanbeige42_census(&actual)
+            .expect("matching census")
+            .is_match()
+    );
     assert_eq!(
         validate_pinned_logical_payload_bytes(&actual).expect("pinned payload total"),
         PINNED_LOGICAL_PAYLOAD_BYTES
@@ -171,8 +173,8 @@ fn receipt_requires_every_identity_and_serializes_canonically() {
         ConversionReceipt::parse_canonical_json(&format!("{json}\n")),
         Err(ConverterError::ReceiptNonCanonical)
     );
-    let mut unknown_field = serde_json::from_str::<serde_json::Value>(&json)
-        .expect("canonical receipt is JSON");
+    let mut unknown_field =
+        serde_json::from_str::<serde_json::Value>(&json).expect("canonical receipt is JSON");
     unknown_field
         .as_object_mut()
         .expect("receipt root is an object")
@@ -255,8 +257,8 @@ fn receipt_parser_rejects_duplicate_missing_and_wrongly_typed_schema_fields() {
         Err(ConverterError::ReceiptJson(_))
     ));
 
-    let mut missing_output_sha256 = serde_json::from_str::<serde_json::Value>(&canonical)
-        .expect("canonical receipt is JSON");
+    let mut missing_output_sha256 =
+        serde_json::from_str::<serde_json::Value>(&canonical).expect("canonical receipt is JSON");
     missing_output_sha256
         .as_object_mut()
         .expect("receipt root is an object")
@@ -268,12 +270,15 @@ fn receipt_parser_rejects_duplicate_missing_and_wrongly_typed_schema_fields() {
         Err(ConverterError::ReceiptParse { .. })
     ));
 
-    let mut numeric_source_root = serde_json::from_str::<serde_json::Value>(&canonical)
-        .expect("canonical receipt is JSON");
+    let mut numeric_source_root =
+        serde_json::from_str::<serde_json::Value>(&canonical).expect("canonical receipt is JSON");
     numeric_source_root
         .as_object_mut()
         .expect("receipt root is an object")
-        .insert("source_root_sha256".to_owned(), serde_json::Value::from(7_u64));
+        .insert(
+            "source_root_sha256".to_owned(),
+            serde_json::Value::from(7_u64),
+        );
     let numeric_source_root = franken_nlp::canonjson::canonical_string(&numeric_source_root)
         .expect("wrong-type hostile receipt stays canonical JSON");
     assert!(matches!(

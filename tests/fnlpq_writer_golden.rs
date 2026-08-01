@@ -1,13 +1,13 @@
 use std::io::Write;
 
+use franken_nlp::artifact::format::LogicalTensorStreamingHasher;
+use franken_nlp::artifact::format::StreamingSectionHasher;
 use franken_nlp::artifact::format::{
     ArchTarget, CanonicalDtype, FnlpqWriteError, FnlpqWriterInput, PackingSetInput, SectionKind,
     SectionPayload, SectionRange, decode_prelude, encode_f32_scales, framed_sha256,
     framed_sha256_hex, logical_model_sha256 as compute_logical_model_sha256, logical_tensor_sha256,
     streaming_input_from_materialized, write, write_streaming,
 };
-use franken_nlp::artifact::format::LogicalTensorStreamingHasher;
-use franken_nlp::artifact::format::StreamingSectionHasher;
 use franken_nlp::artifact::reader::FnlpqArtifact;
 use franken_nlp::canonjson;
 use serde::Serialize;
@@ -146,7 +146,9 @@ fn checked_mapping_bytes(
         .expect("checked mapping section remains available");
     let start = usize::try_from(offset).expect("checked mapping offset fits usize");
     let len = usize::try_from(len).expect("checked mapping length fits usize");
-    let end = start.checked_add(len).expect("checked mapping end fits usize");
+    let end = start
+        .checked_add(len)
+        .expect("checked mapping end fits usize");
     section
         .get(start..end)
         .expect("checked mapping range remains available")
@@ -223,9 +225,7 @@ fn incremental_section_hasher_matches_the_framed_v1_identity() {
         .expect("bounded framed section identity");
     let mut incremental = StreamingSectionHasher::new("generic-payload", bytes.len() as u64)
         .expect("bounded section declaration");
-    incremental
-        .write(&bytes[..7])
-        .expect("first payload chunk");
+    incremental.write(&bytes[..7]).expect("first payload chunk");
     incremental
         .write(&bytes[7..])
         .expect("second payload chunk");
@@ -235,8 +235,8 @@ fn incremental_section_hasher_matches_the_framed_v1_identity() {
 
 #[test]
 fn incremental_section_hasher_rejects_overflow_before_digesting() {
-    let mut incremental = StreamingSectionHasher::new("generic-payload", 2)
-        .expect("bounded section declaration");
+    let mut incremental =
+        StreamingSectionHasher::new("generic-payload", 2).expect("bounded section declaration");
 
     assert!(matches!(
         incremental.write(b"abc"),
@@ -344,7 +344,10 @@ fn streaming_writer_matches_the_materialized_v1_oracle_byte_for_byte() {
     assert_eq!(streamed.file_len as usize, materialized.bytes.len());
     assert_eq!(streamed.fnlpq_file_sha256, materialized.fnlpq_file_sha256);
     assert_eq!(streamed.packing_set_sha256, materialized.packing_set_sha256);
-    assert_eq!(streamed.license_bundle_sha256, materialized.license_bundle_sha256);
+    assert_eq!(
+        streamed.license_bundle_sha256,
+        materialized.license_bundle_sha256
+    );
 }
 
 #[test]
@@ -432,32 +435,37 @@ fn streaming_writer_rejects_a_short_second_pass_section() {
         .name
         .clone();
     let mut streamed_bytes = Vec::new();
-    let error = write_streaming(&streaming, &mut streamed_bytes, |section, sink| {
-        let source = input
-            .sections
-            .iter()
-            .find(|candidate| candidate.name == section.name)
-            .expect("streaming plan section originates from tiny input");
-        let bytes = if section.name == expected_section {
-            let short_len = source.bytes.len().checked_sub(1).ok_or_else(|| {
-                FnlpqWriteError::Missing {
-                    field: "synthetic generic tensor payload byte",
-                    value: section.name.clone(),
-                }
-            })?;
-            source.bytes.get(..short_len).ok_or_else(|| FnlpqWriteError::Missing {
-                field: "synthetic short streaming section range",
-                value: section.name.clone(),
-            })?
-        } else {
-            &source.bytes
-        };
-        sink.write_all(bytes).map_err(|error| FnlpqWriteError::Io {
-            operation: "write short synthetic streaming section",
-            detail: error.to_string(),
+    let error =
+        write_streaming(&streaming, &mut streamed_bytes, |section, sink| {
+            let source = input
+                .sections
+                .iter()
+                .find(|candidate| candidate.name == section.name)
+                .expect("streaming plan section originates from tiny input");
+            let bytes =
+                if section.name == expected_section {
+                    let short_len = source.bytes.len().checked_sub(1).ok_or_else(|| {
+                        FnlpqWriteError::Missing {
+                            field: "synthetic generic tensor payload byte",
+                            value: section.name.clone(),
+                        }
+                    })?;
+                    source
+                        .bytes
+                        .get(..short_len)
+                        .ok_or_else(|| FnlpqWriteError::Missing {
+                            field: "synthetic short streaming section range",
+                            value: section.name.clone(),
+                        })?
+                } else {
+                    &source.bytes
+                };
+            sink.write_all(bytes).map_err(|error| FnlpqWriteError::Io {
+                operation: "write short synthetic streaming section",
+                detail: error.to_string(),
+            })
         })
-    })
-    .expect_err("a short second pass must not mint an artifact identity");
+        .expect_err("a short second pass must not mint an artifact identity");
 
     assert!(matches!(
         error,
@@ -490,10 +498,12 @@ fn streaming_writer_rejects_a_tampered_second_pass_section() {
             .expect("streaming plan section originates from tiny input");
         (if section.name == expected_section {
             let mut tampered = source.bytes.clone();
-            let first = tampered.first_mut().ok_or_else(|| FnlpqWriteError::Missing {
-                field: "synthetic generic tensor payload byte",
-                value: section.name.clone(),
-            })?;
+            let first = tampered
+                .first_mut()
+                .ok_or_else(|| FnlpqWriteError::Missing {
+                    field: "synthetic generic tensor payload byte",
+                    value: section.name.clone(),
+                })?;
             *first ^= 1;
             sink.write_all(&tampered)
         } else {
