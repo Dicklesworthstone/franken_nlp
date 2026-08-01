@@ -19,7 +19,7 @@ use crate::{
         framed_sha256, logical_model_sha256, validate_authority_identifier, write_streaming,
         ArchTarget, CanonicalDtype, FnlpqStreamingInput, FnlpqWriteError,
         LogicalTensorStreamingHasher, PackingSetInput, SectionKind, SectionRange, StreamingSection,
-        StreamingSectionHasher, TensorInput,
+        StreamedFnlpq, StreamingSectionHasher, TensorInput,
     },
     artifact::fs_tx::open_ratified_model_root,
     artifact::package::{package_model, verify_model_package, PackageRequest},
@@ -386,31 +386,41 @@ fn run_streaming_convert(
         );
     }
     drop(output);
-    if let Err(error) = publish_staged_output(&staging_output, &request.output) {
-        return emit_streaming_refusal("publish-output", error);
-    }
-    let output_len = match fs::metadata(&request.output) {
+    let staged_len = match fs::metadata(&staging_output) {
         Ok(metadata) => metadata.len(),
         Err(error) => {
             return emit_streaming_refusal(
-                "inspect-output",
-                format!("stat {}: {error}", request.output.display()),
+                "inspect-staging",
+                format!("stat {}: {error}", staging_output.display()),
             );
         }
     };
-    if output_len != written.file_len {
+    if staged_len != written.file_len {
         return emit_streaming_refusal(
-            "inspect-output",
+            "inspect-staging",
             format!(
-                "output length mismatch: expected={} observed={output_len}",
+                "staging length mismatch: expected={} observed={staged_len}",
                 written.file_len
             ),
         );
     }
+    emit_unpublished_streaming_blocked(&request.output, &staging_output, prepared, &written)
+}
+
+/// Fail closed after a streamed stage is fully durable.  `fs_tx` has not yet
+/// supplied the non-replacing activation plus retained reload/receipt path
+/// required to expose a canonical artifact, so this CLI must not turn a
+/// staged file into a public output by using raw filesystem primitives.
+fn emit_unpublished_streaming_blocked(
+    destination: &Path,
+    staging_output: &Path,
+    prepared: &PreparedConversionInput,
+    written: &StreamedFnlpq,
+) -> ExitCode {
     eprintln!(
-        "CONVERT RESULT=PASS stage=streaming-envelope artifact={} staging-artifact={} source-root-sha256={} census-sha256={} tensors={} fnlpq-file-sha256={} output-bytes={} license-bundle-sha256={}",
-        request.output.display(),
+        "CONVERT RESULT=BLOCKED stage=activation staging-artifact={} destination={} source-root-sha256={} census-sha256={} tensors={} fnlpq-file-sha256={} staging-bytes={} license-bundle-sha256={} reason=ratified-fs-tx-activation-reload-and-receipt-path-unavailable; no-final-output-created",
         staging_output.display(),
+        destination.display(),
         prepared.source.source_root_sha256,
         prepared.census_sha256,
         prepared.census.len(),
@@ -418,7 +428,7 @@ fn run_streaming_convert(
         written.file_len,
         hex_lower(&written.license_bundle_sha256),
     );
-    ExitCode::SUCCESS
+    ErrorCode::AdmissionOrResourceLimit.as_process_exit()
 }
 
 /// Derive a deterministic sibling staging name.  It is deliberately distinct
@@ -452,20 +462,6 @@ fn create_conversion_stage(destination: &Path) -> Result<(PathBuf, fs::File), St
         "all 1025 retained staging names are occupied for destination {}",
         destination.display()
     ))
-}
-
-/// Publish a completed stage without a clobbering rename.  A hard-link create
-/// is atomic with respect to the final pathname and fails if it already
-/// exists; the staged entry is intentionally retained for audit rather than
-/// deleted by this CLI layer.
-fn publish_staged_output(stage: &Path, destination: &Path) -> Result<(), String> {
-    fs::hard_link(stage, destination).map_err(|error| {
-        format!(
-            "link completed stage {} to previously absent destination {}: {error}",
-            stage.display(),
-            destination.display(),
-        )
-    })
 }
 
 fn emit_streaming_refusal(stage: &str, error: impl std::fmt::Display) -> ExitCode {
@@ -511,7 +507,10 @@ impl LogicalTensorFirstPass {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let input = TensorInput {
-            name: layout.internal_name.clone(),
+            // The artifact authority is the frozen source-census name.  The
+            // converter's internal route is a distinct implementation detail
+            // and cannot replace this externally validated identity.
+            name: layout.source_name.clone(),
             canonical_dtype: CanonicalDtype::Bf16,
             shape: shape.clone(),
             canonical_logical_sha256: String::new(),
@@ -750,7 +749,7 @@ fn build_streaming_envelope_plan(
 /// that point would waste a complete model traversal on a malformed header.
 fn validate_generic_tensor_authorities(generic: &GenericPayloadPlan) -> Result<(), String> {
     for layout in &generic.tensors {
-        validate_authority_identifier("tensor.name", &layout.internal_name)
+        validate_authority_identifier("tensor.name", &layout.source_name)
             .map_err(|error| format!("invalid planned tensor {}: {error}", layout.source_name))?;
     }
     Ok(())
@@ -1302,11 +1301,12 @@ mod tests {
 
     use super::{
         cli_main_with_reader, conversion_staging_path, validate_generic_tensor_authorities, Cli,
-        Command, ModelsSubcommand, ReleaseSubcommand,
+        Command, LogicalTensorFirstPass, ModelsSubcommand, ReleaseSubcommand,
     };
     use crate::artifact::converter::{
         GenericPayloadPlan, GenericTensorLayout, OutputRange, StorageStage,
     };
+    use crate::artifact::safetensors::{SafetensorDtype, TensorCensusEntry};
 
     #[test]
     fn schema_dash_uses_the_injected_reader() {
@@ -1421,7 +1421,7 @@ mod tests {
     fn invalid_planned_tensor_name_refuses_before_source_traversal() {
         let invalid_plan = GenericPayloadPlan {
             tensors: vec![GenericTensorLayout {
-                source_name: "model.layers.0.self_attn.k_proj.weight".to_owned(),
+                source_name: "model.layers[0].self_attn.k_proj.weight".to_owned(),
                 internal_name: "layer[0].attn.k".to_owned(),
                 stage: StorageStage::Int8Stage2B,
                 shape: vec![1, 1],
@@ -1450,6 +1450,76 @@ mod tests {
         let error = validate_generic_tensor_authorities(&invalid_plan)
             .expect_err("an invalid header authority must reject before a source pass");
         assert!(error.contains("invalid tensor.name authority identifier"));
+    }
+
+    #[test]
+    fn internal_route_spelling_is_not_the_artifact_tensor_authority() {
+        let plan = GenericPayloadPlan {
+            tensors: vec![GenericTensorLayout {
+                source_name: "model.layers.0.self_attn.k_proj.weight".to_owned(),
+                internal_name: "layer[0].attn.k".to_owned(),
+                stage: StorageStage::Int8Stage2B,
+                shape: vec![1, 1],
+                quantization: "portable-int8-row-v1".to_owned(),
+                data: OutputRange {
+                    name: "layer[0].attn.k.data".to_owned(),
+                    offset: 0,
+                    len: 1,
+                },
+                scale: OutputRange {
+                    name: "layer[0].attn.k.scale".to_owned(),
+                    offset: 0,
+                    len: 4,
+                },
+                row_sum: OutputRange {
+                    name: "layer[0].attn.k.row_sum".to_owned(),
+                    offset: 0,
+                    len: 4,
+                },
+            }],
+            payload_bytes: 1,
+            scale_bytes: 4,
+            row_sum_bytes: 4,
+        };
+
+        validate_generic_tensor_authorities(&plan)
+            .expect("the source census name, not a route nickname, reaches the artifact header");
+    }
+
+    #[test]
+    fn logical_tensor_header_uses_the_source_census_authority() {
+        let entry = TensorCensusEntry {
+            name: "model.layers.0.self_attn.k_proj.weight".to_owned(),
+            dtype: SafetensorDtype::Bf16,
+            shape: vec![1, 1],
+            len: 2,
+        };
+        let layout = GenericTensorLayout {
+            source_name: entry.name.clone(),
+            internal_name: "layer[0].attn.k".to_owned(),
+            stage: StorageStage::Int8Stage2B,
+            shape: entry.shape.clone(),
+            quantization: "portable-int8-row-v1".to_owned(),
+            data: OutputRange {
+                name: "layer[0].attn.k.data".to_owned(),
+                offset: 0,
+                len: 1,
+            },
+            scale: OutputRange {
+                name: "layer[0].attn.k.scale".to_owned(),
+                offset: 0,
+                len: 4,
+            },
+            row_sum: OutputRange {
+                name: "layer[0].attn.k.row_sum".to_owned(),
+                offset: 0,
+                len: 4,
+            },
+        };
+
+        let tensor = LogicalTensorFirstPass::new(&entry, &layout)
+            .expect("source-census tensor declaration is structurally valid");
+        assert_eq!(tensor.input.name, entry.name);
     }
 
     #[test]

@@ -702,7 +702,11 @@ pub struct PreparedConversionInput {
 pub struct GenericTensorLayout {
     /// Exact source tensor name in the checked safetensors census.
     pub source_name: String,
-    /// Canonical internal tensor identity in the artifact header.
+    /// Canonical internal tensor identity used to route converter panels.
+    ///
+    /// The artifact header deliberately uses `source_name`: its frozen
+    /// census is an external authority, while this route name is local
+    /// converter implementation detail.
     pub internal_name: String,
     /// Frozen converter route that determines the Generic representation.
     pub stage: StorageStage,
