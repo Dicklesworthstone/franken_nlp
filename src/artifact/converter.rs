@@ -14,7 +14,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -46,6 +46,8 @@ pub const PINNED_CONVERSION_RECIPE: &str = "nanbeige42-int8-v1";
 pub const PORTABLE_QUANT_V1: &str = "portable-quant-v1";
 /// Canonical Generic encoding for source-preserved BF16 tensors.
 pub const BF16_VERBATIM_V1: &str = "bf16-verbatim-v1";
+/// The only canonical JSON schema emitted for conversion receipts.
+pub const CONVERSION_RECEIPT_SCHEMA: &str = "fnlp-conversion-receipt-v1";
 
 /// The only source-to-artifact target admitted by `fnlp convert`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1019,8 +1021,11 @@ impl PreparedConversionInput {
 
 /// A machine-readable conversion receipt prepared before activation.  It has
 /// no optional identity fields: an incomplete receipt is not serializable.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConversionReceipt {
+    /// Fixed schema discriminator for a retained conversion receipt.
+    pub receipt_schema: String,
     /// Framed ordered source-file identity.
     pub source_root_sha256: String,
     /// Framed complete 201-tensor source census identity.
@@ -1035,10 +1040,14 @@ pub struct ConversionReceipt {
     pub packing_id: String,
     /// Measured/proxy peak enforced against the printed formula.
     pub measured_peak_rss_bytes: u64,
+    /// Largest explicitly measured conversion scratch allocation.
+    pub measured_scratch_bytes: u64,
     /// Printed formula cap.
     pub peak_rss_cap_bytes: u64,
     /// Exact final disk requirement observed by preflight.
     pub final_disk_bytes: u64,
+    /// Observed durable staged artifact length before activation.
+    pub measured_disk_bytes: u64,
     /// Exact activated artifact length.
     pub output_len: u64,
     /// Exact completed `.fnlpq` file SHA-256.
@@ -1051,6 +1060,12 @@ impl ConversionReceipt {
     /// Reject incomplete or non-canonical identities before the receipt can be
     /// written alongside an activation journal.
     pub fn validate(&self) -> Result<(), ConverterError> {
+        if self.receipt_schema != CONVERSION_RECEIPT_SCHEMA {
+            return Err(ConverterError::ReceiptField {
+                field: "receipt_schema",
+                detail: format!("expected {CONVERSION_RECEIPT_SCHEMA}"),
+            });
+        }
         for (field, value) in [
             ("source_root_sha256", self.source_root_sha256.as_str()),
             ("census_sha256", self.census_sha256.as_str()),
@@ -1088,10 +1103,22 @@ impl ConversionReceipt {
                 cap: self.peak_rss_cap_bytes,
             });
         }
-        if self.final_disk_bytes < self.output_len {
+        if self.measured_scratch_bytes > self.measured_peak_rss_bytes {
+            return Err(ConverterError::ReceiptField {
+                field: "measured_scratch_bytes",
+                detail: "must not exceed measured_peak_rss_bytes".to_owned(),
+            });
+        }
+        if self.measured_disk_bytes != self.output_len {
+            return Err(ConverterError::ReceiptField {
+                field: "measured_disk_bytes",
+                detail: "must equal output_len for the single staged artifact".to_owned(),
+            });
+        }
+        if self.final_disk_bytes < self.measured_disk_bytes {
             return Err(ConverterError::ReceiptField {
                 field: "final_disk_bytes",
-                detail: "must cover output_len".to_owned(),
+                detail: "must cover measured_disk_bytes".to_owned(),
             });
         }
         Ok(())
@@ -1100,7 +1127,23 @@ impl ConversionReceipt {
     /// Canonical NDJSON-ready receipt bytes, after completeness validation.
     pub fn canonical_json(&self) -> Result<String, ConverterError> {
         self.validate()?;
-        canonjson::canonical_string(self).map_err(ConverterError::ManifestJson)
+        canonjson::canonical_string(self).map_err(ConverterError::ReceiptJson)
+    }
+
+    /// Parse only canonical JSON receipt bytes through the duplicate-key
+    /// rejecting repository boundary.
+    pub fn parse_canonical_json(input: &str) -> Result<Self, ConverterError> {
+        let value = canonjson::parse_str_with_limits(input, ParseLimits::default())
+            .map_err(ConverterError::ReceiptJson)?;
+        let canonical = canonjson::canonical_bytes(&value).map_err(ConverterError::ReceiptJson)?;
+        if canonical.as_slice() != input.as_bytes() {
+            return Err(ConverterError::ReceiptNonCanonical);
+        }
+        let receipt = serde_json::from_value(value).map_err(|error| ConverterError::ReceiptParse {
+            detail: error.to_string(),
+        })?;
+        receipt.validate()?;
+        Ok(receipt)
     }
 }
 
@@ -1815,6 +1858,8 @@ pub enum ConverterError {
     },
     /// Bounded canonical JSON parser rejection.
     ManifestJson(canonjson::CanonJsonError),
+    /// Bounded canonical JSON parser rejection for a conversion receipt.
+    ReceiptJson(canonjson::CanonJsonError),
     /// Manifest schema/type/key validation failure.
     ManifestSchema { path: String, detail: String },
     /// Manifest itself exceeded its bounded input cap.
@@ -1950,6 +1995,10 @@ pub enum ConverterError {
     ActivationProtocolUnavailable { destination: PathBuf },
     /// Required machine receipt field was absent or malformed.
     ReceiptField { field: &'static str, detail: String },
+    /// A conversion receipt did not use the one canonical JSON spelling.
+    ReceiptNonCanonical,
+    /// A canonical conversion-receipt JSON value did not match its typed schema.
+    ReceiptParse { detail: String },
 }
 
 impl fmt::Display for ConverterError {
@@ -1964,6 +2013,7 @@ impl fmt::Display for ConverterError {
                 "convert argument {argument} mismatch: expected={expected} observed={actual}; next=run fnlp convert --recipe {PINNED_CONVERSION_RECIPE} --arch generic"
             ),
             Self::ManifestJson(error) => write!(formatter, "source manifest JSON: {error}"),
+            Self::ReceiptJson(error) => write!(formatter, "conversion receipt JSON: {error}"),
             Self::ManifestSchema { path, detail } => {
                 write!(formatter, "source manifest {path}: {detail}")
             }
@@ -2161,6 +2211,12 @@ impl fmt::Display for ConverterError {
             ),
             Self::ReceiptField { field, detail } => {
                 write!(formatter, "conversion receipt field {field}: {detail}")
+            }
+            Self::ReceiptNonCanonical => {
+                formatter.write_str("conversion receipt bytes are not canonical JSON")
+            }
+            Self::ReceiptParse { detail } => {
+                write!(formatter, "conversion receipt schema: {detail}")
             }
         }
     }

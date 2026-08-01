@@ -3,7 +3,7 @@
 
 use franken_nlp::artifact::converter::{
     BF16_VERBATIM_V1, ConversionReceipt, ConversionSourceManifest, ConvertArch, ConvertRequest,
-    ConverterError, DEFAULT_PANEL_BYTES, OutputRange, OutputRangePlan,
+    ConverterError, CONVERSION_RECEIPT_SCHEMA, DEFAULT_PANEL_BYTES, OutputRange, OutputRangePlan,
     PINNED_LOGICAL_PAYLOAD_BYTES, PORTABLE_QUANT_V1, StorageStage, expected_nanbeige42_census,
     plan_generic_payload, prepare_convert_request, remap_tensor_name, validate_nanbeige42_census,
     validate_pinned_logical_payload_bytes,
@@ -144,6 +144,7 @@ fn oq1_extra_is_a_design_assumption_abort_not_a_tolerated_extra() {
 #[test]
 fn receipt_requires_every_identity_and_serializes_canonically() {
     let receipt = ConversionReceipt {
+        receipt_schema: CONVERSION_RECEIPT_SCHEMA.to_owned(),
         source_root_sha256: "a".repeat(64),
         census_sha256: "b".repeat(64),
         converter_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
@@ -151,8 +152,10 @@ fn receipt_requires_every_identity_and_serializes_canonically() {
         rounding_id: "portable-quant-v1".to_owned(),
         packing_id: "generic-v1".to_owned(),
         measured_peak_rss_bytes: 10,
+        measured_scratch_bytes: 4,
         peak_rss_cap_bytes: 10,
         final_disk_bytes: 20,
+        measured_disk_bytes: 20,
         output_len: 20,
         output_sha256: "c".repeat(64),
         license_bundle_sha256: "d".repeat(64),
@@ -160,16 +163,49 @@ fn receipt_requires_every_identity_and_serializes_canonically() {
 
     let json = receipt.canonical_json().expect("complete receipt");
     assert!(json.contains("\"recipe_id\":\"nanbeige42-int8-v1\""));
+    assert_eq!(
+        ConversionReceipt::parse_canonical_json(&json).expect("canonical receipt parses"),
+        receipt
+    );
+    assert_eq!(
+        ConversionReceipt::parse_canonical_json(&format!("{json}\n")),
+        Err(ConverterError::ReceiptNonCanonical)
+    );
+    let mut unknown_field = serde_json::from_str::<serde_json::Value>(&json)
+        .expect("canonical receipt is JSON");
+    unknown_field
+        .as_object_mut()
+        .expect("receipt root is an object")
+        .insert("unexpected".to_owned(), serde_json::Value::Null);
+    let unknown_field = franken_nlp::canonjson::canonical_string(&unknown_field)
+        .expect("hostile unknown-field fixture is canonical JSON");
+    assert!(matches!(
+        ConversionReceipt::parse_canonical_json(&unknown_field),
+        Err(ConverterError::ReceiptParse { .. })
+    ));
 
     let undersized_disk = ConversionReceipt {
         output_len: 21,
+        measured_disk_bytes: 21,
         ..receipt.clone()
     };
     assert_eq!(
         undersized_disk.canonical_json(),
         Err(ConverterError::ReceiptField {
             field: "final_disk_bytes",
-            detail: "must cover output_len".to_owned(),
+            detail: "must cover measured_disk_bytes".to_owned(),
+        })
+    );
+
+    let excessive_scratch = ConversionReceipt {
+        measured_scratch_bytes: 11,
+        ..receipt.clone()
+    };
+    assert_eq!(
+        excessive_scratch.canonical_json(),
+        Err(ConverterError::ReceiptField {
+            field: "measured_scratch_bytes",
+            detail: "must not exceed measured_peak_rss_bytes".to_owned(),
         })
     );
 
