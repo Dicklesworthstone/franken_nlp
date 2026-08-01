@@ -147,6 +147,9 @@ fn oq1_extra_is_a_design_assumption_abort_not_a_tolerated_extra() {
 fn receipt_requires_every_identity_and_serializes_canonically() {
     let receipt = ConversionReceipt {
         receipt_schema: CONVERSION_RECEIPT_SCHEMA.to_owned(),
+        model_id: "Nanbeige4.2-3B".to_owned(),
+        model_revision: "f56ec5a9650268aa098496734743c25ea778bd2d".to_owned(),
+        artifact_format: "fnlpq-v1".to_owned(),
         source_root_sha256: "a".repeat(64),
         census_sha256: "b".repeat(64),
         converter_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
@@ -159,7 +162,8 @@ fn receipt_requires_every_identity_and_serializes_canonically() {
         final_disk_bytes: 20,
         measured_disk_bytes: 20,
         output_len: 20,
-        output_sha256: "c".repeat(64),
+        fnlpq_file_sha256: "c".repeat(64),
+        artifact_raw_sha256: "e".repeat(64),
         license_bundle_sha256: "d".repeat(64),
     };
 
@@ -224,6 +228,17 @@ fn receipt_requires_every_identity_and_serializes_canonically() {
                     .to_owned(),
         })
     );
+    let wrong_artifact_format = ConversionReceipt {
+        artifact_format: "fnlpq-v2".to_owned(),
+        ..receipt.clone()
+    };
+    assert_eq!(
+        wrong_artifact_format.canonical_json(),
+        Err(ConverterError::ReceiptField {
+            field: "artifact_format",
+            detail: "expected pinned identifier \"fnlpq-v1\", observed \"fnlpq-v2\"".to_owned(),
+        })
+    );
     let unpinned_rounding = ConversionReceipt {
         rounding_id: "other-rounding-v1".to_owned(),
         ..receipt.clone()
@@ -268,6 +283,9 @@ fn receipt_requires_every_identity_and_serializes_canonically() {
 fn receipt_parser_rejects_duplicate_missing_and_wrongly_typed_schema_fields() {
     let receipt = ConversionReceipt {
         receipt_schema: CONVERSION_RECEIPT_SCHEMA.to_owned(),
+        model_id: "Nanbeige4.2-3B".to_owned(),
+        model_revision: "f56ec5a9650268aa098496734743c25ea778bd2d".to_owned(),
+        artifact_format: "fnlpq-v1".to_owned(),
         source_root_sha256: "a".repeat(64),
         census_sha256: "b".repeat(64),
         converter_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
@@ -280,16 +298,18 @@ fn receipt_parser_rejects_duplicate_missing_and_wrongly_typed_schema_fields() {
         final_disk_bytes: 20,
         measured_disk_bytes: 20,
         output_len: 20,
-        output_sha256: "c".repeat(64),
+        fnlpq_file_sha256: "c".repeat(64),
+        artifact_raw_sha256: "e".repeat(64),
         license_bundle_sha256: "d".repeat(64),
     };
     let canonical = receipt
         .canonical_json()
         .expect("complete synthetic receipt serializes");
 
+    let receipt_schema_member = format!("\"receipt_schema\":\"{CONVERSION_RECEIPT_SCHEMA}\"");
     let duplicate_receipt_schema = canonical.replacen(
-        "\"receipt_schema\":\"fnlp-conversion-receipt-v1\"",
-        "\"receipt_schema\":\"fnlp-conversion-receipt-v1\",\"receipt_schema\":\"fnlp-conversion-receipt-v1\"",
+        &receipt_schema_member,
+        &format!("{receipt_schema_member},{receipt_schema_member}"),
         1,
     );
     assert!(matches!(
@@ -297,16 +317,17 @@ fn receipt_parser_rejects_duplicate_missing_and_wrongly_typed_schema_fields() {
         Err(ConverterError::ReceiptJson(_))
     ));
 
-    let mut missing_output_sha256 =
+    let mut missing_artifact_raw_sha256 =
         serde_json::from_str::<serde_json::Value>(&canonical).expect("canonical receipt is JSON");
-    missing_output_sha256
+    missing_artifact_raw_sha256
         .as_object_mut()
         .expect("receipt root is an object")
-        .remove("output_sha256");
-    let missing_output_sha256 = franken_nlp::canonjson::canonical_string(&missing_output_sha256)
-        .expect("missing-field hostile receipt stays canonical JSON");
+        .remove("artifact_raw_sha256");
+    let missing_artifact_raw_sha256 =
+        franken_nlp::canonjson::canonical_string(&missing_artifact_raw_sha256)
+            .expect("missing-field hostile receipt stays canonical JSON");
     assert!(matches!(
-        ConversionReceipt::parse_canonical_json(&missing_output_sha256),
+        ConversionReceipt::parse_canonical_json(&missing_artifact_raw_sha256),
         Err(ConverterError::ReceiptParse { .. })
     ));
 
@@ -325,6 +346,25 @@ fn receipt_parser_rejects_duplicate_missing_and_wrongly_typed_schema_fields() {
         ConversionReceipt::parse_canonical_json(&unpinned_recipe),
         Err(ConverterError::ReceiptField {
             field: "recipe_id",
+            ..
+        })
+    ));
+
+    let mut malformed_raw_sha256 =
+        serde_json::from_str::<serde_json::Value>(&canonical).expect("canonical receipt is JSON");
+    malformed_raw_sha256
+        .as_object_mut()
+        .expect("receipt root is an object")
+        .insert(
+            "artifact_raw_sha256".to_owned(),
+            serde_json::Value::from("not-a-sha256"),
+        );
+    let malformed_raw_sha256 = franken_nlp::canonjson::canonical_string(&malformed_raw_sha256)
+        .expect("malformed raw digest hostile receipt stays canonical JSON");
+    assert!(matches!(
+        ConversionReceipt::parse_canonical_json(&malformed_raw_sha256),
+        Err(ConverterError::ReceiptField {
+            field: "artifact_raw_sha256",
             ..
         })
     ));

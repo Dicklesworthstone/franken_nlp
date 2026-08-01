@@ -50,7 +50,9 @@ pub const BF16_VERBATIM_V1: &str = "bf16-verbatim-v1";
 /// The only Generic packing declaration emitted by the initial converter.
 pub const GENERIC_PACKING_V1: &str = "generic-v1";
 /// The only canonical JSON schema emitted for conversion receipts.
-pub const CONVERSION_RECEIPT_SCHEMA: &str = "fnlp-conversion-receipt-v1";
+pub const CONVERSION_RECEIPT_SCHEMA: &str = "fnlp-conversion-receipt-v2";
+/// Exact artifact schema recorded in a v2 conversion receipt.
+pub const CONVERSION_ARTIFACT_FORMAT: &str = "fnlpq-v1";
 
 /// The only source-to-artifact target admitted by `fnlp convert`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1328,6 +1330,12 @@ impl PreparedConversionInput {
 pub struct ConversionReceipt {
     /// Fixed schema discriminator for a retained conversion receipt.
     pub receipt_schema: String,
+    /// Exact model identifier bound into the artifact logical-model digest.
+    pub model_id: String,
+    /// Exact upstream model revision bound into the artifact logical-model digest.
+    pub model_revision: String,
+    /// Exact artifact envelope version emitted by the converter.
+    pub artifact_format: String,
     /// Framed ordered source-file identity.
     pub source_root_sha256: String,
     /// Framed complete 201-tensor source census identity.
@@ -1352,8 +1360,10 @@ pub struct ConversionReceipt {
     pub measured_disk_bytes: u64,
     /// Exact activated artifact length.
     pub output_len: u64,
-    /// Exact completed `.fnlpq` file SHA-256.
-    pub output_sha256: String,
+    /// Domain-framed `D("fnlpq-file-v1", exact file bytes)` identity.
+    pub fnlpq_file_sha256: String,
+    /// Raw SHA-256 of the exact staged artifact byte stream.
+    pub artifact_raw_sha256: String,
     /// Exact embedded Apache-2.0/attribution/notice identity.
     pub license_bundle_sha256: String,
 }
@@ -1368,10 +1378,31 @@ impl ConversionReceipt {
                 detail: format!("expected {CONVERSION_RECEIPT_SCHEMA}"),
             });
         }
+        for (field, actual, expected) in [
+            ("model_id", self.model_id.as_str(), "Nanbeige4.2-3B"),
+            (
+                "model_revision",
+                self.model_revision.as_str(),
+                PINNED_REVISION,
+            ),
+            (
+                "artifact_format",
+                self.artifact_format.as_str(),
+                CONVERSION_ARTIFACT_FORMAT,
+            ),
+        ] {
+            if actual != expected {
+                return Err(ConverterError::ReceiptField {
+                    field,
+                    detail: format!("expected pinned identifier {expected:?}, observed {actual:?}"),
+                });
+            }
+        }
         for (field, value) in [
             ("source_root_sha256", self.source_root_sha256.as_str()),
             ("census_sha256", self.census_sha256.as_str()),
-            ("output_sha256", self.output_sha256.as_str()),
+            ("fnlpq_file_sha256", self.fnlpq_file_sha256.as_str()),
+            ("artifact_raw_sha256", self.artifact_raw_sha256.as_str()),
             ("license_bundle_sha256", self.license_bundle_sha256.as_str()),
         ] {
             if !is_lower_sha256(value) {
