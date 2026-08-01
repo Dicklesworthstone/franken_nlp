@@ -192,8 +192,8 @@ fn page_admission_refuses_atomically_before_any_slab_is_assigned() {
         cache.prepare_append(0),
         Err(KvSlabError::PoolExhausted {
             requested: KV_SLABS_PER_LOGICAL_PAGE,
-            available: KV_SLABS_PER_LOGICAL_PAGE - 1,
-        })
+            available,
+        }) if available == KV_SLABS_PER_LOGICAL_PAGE - 1
     ));
     assert_eq!(cache.pool_stats().live_slab_count, 0);
     assert_eq!(cache.pool_stats().live_payload_bytes, 0);
