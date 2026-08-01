@@ -88,7 +88,7 @@ checkpoint window:
 
 The following paragraph is a **historical pre-repair finding**, superseded by
 the immutable closure-repair commit `3653d6449770a74a1e7e27f35d2f78a38834f62a`
-and the final audit graph commit `b5876bb080c661ce11a35b33164a98f9a0c907bb`
+and the final audit graph commit `53416a0ef186037033d13a7a94b124e81da5ab54`
 bound in `docs/REALITY_BRIDGE_PLAN.md`; it must not be read as
 current graph state. A direct read of the exported graph during the earlier
 2026-07-31 audit found five closed issues with

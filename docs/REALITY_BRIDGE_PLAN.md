@@ -6,9 +6,12 @@ document.
 
 **Audit binding.** The source/document census was read through immutable repository commit
 `1af4161e63532fd17c45e25a408865e2bb554a1b`; the final audit Bead graph is the separately
-immutable ledger commit `b5876bb080c661ce11a35b33164a98f9a0c907bb`, whose exported
+immutable ledger commit `53416a0ef186037033d13a7a94b124e81da5ab54`, whose exported
 `.beads/issues.jsonl` SHA-256 is
-`df9136cef793caa933d3191096b3ca15b44387949b7fcacbaa27ea605c746ddd`.
+`eafd7545c3f881e112be1ea952f0cbba9c5eb31f4ff4654b6d78e1e9bcca6b06`.
+Commit `b5876bb080c661ce11a35b33164a98f9a0c907bb` synchronized topology, status, and
+dependencies; the later `61073f0…` and `53416a0…` commits add only the final static-check
+findings on `k3i`, `r32`, and `xu1`, without changing graph counts or edges.
 The initial closure repair is preserved in `3653d6449770a74a1e7e27f35d2f78a38834f62a`.
 At the source binding, tracked source
 paths were clean while eleven audit-owned documentation paths were modified and the peer-owned
@@ -149,7 +152,7 @@ CLI command runs real model inference at the bound source snapshot.
 | Platform filesystem authority | **BLOCKED** | honest refusal behavior | real pull/derive/activation durability |
 | Publisher/repository state | **QUERIED `2026-08-01T03:16:55Z`: Actions enabled; immutable releases disabled** | the need for `wdne`, `i2o3`, and `w9e.1` | artifact authenticity, immutable publication, release certification, or later settings state |
 | Human/task-quality authority | **ABSENT** | synthetic mechanics only | extraction/NER/sentiment/classification quality or corpus acceptance |
-| Bead graph | **BOUND to `b5876bb…`: 184 total, 163 open, 16 blocked, 5 in progress, 0 closed** | ownership and prerequisite planning at that ledger commit | proof that any implementation gate passed or later graph state |
+| Bead graph | **BOUND to `53416a0…`: 184 total, 163 open, 16 blocked, 5 in progress, 0 closed** | ownership and prerequisite planning at that ledger commit; 184 nodes/554 edges, density 0.016452839, zero active cycles | proof that any implementation gate passed or later graph state |
 
 Every later report must preserve these separations. In particular, a local or synthetic test
 may be useful code-first evidence while its enclosing model/release gate remains open.
