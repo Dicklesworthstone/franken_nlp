@@ -188,9 +188,13 @@ Every platform facility is governed by the per-target [platform-surface registry
 
 The full specification lives in [`COMPREHENSIVE_PLAN_FOR_FRANKEN_NLP.md`](./COMPREHENSIVE_PLAN_FOR_FRANKEN_NLP.md): the evidence-state dossier, the exact loop/KV/norm contract, the artifact lifecycle, the AVX2/AVX-512 campaigns, the constrained-execution compiler, the verification authority table, the alien-artifact recommendation cards, the roadmap, and the research-decision register.
 
-## The task portfolio
+## The task portfolio (target 1.0 contract)
 
-Every task is available one-shot, as `--json`, and through the batch daemon; tasks graduate individually on locked scorecards (plan §9.6).
+At 1.0, every task below is available one-shot, as `--json`, and through the
+batch daemon; tasks graduate individually on locked scorecards (plan §9.6).
+These commands are not the current executable inventory. The implementation
+status near the top of this README and `WIRING.md` remain authoritative until
+the corresponding phase gates pass.
 
 | Command | What it does | Decode strategy |
 |---|---|---|
@@ -209,7 +213,7 @@ Every task is available one-shot, as `--json`, and through the batch daemon; tas
 
 **Deliberate non-goals:** POS tagging, dependency parsing, lemmatization (specialized classical tools are usually the right cost/latency choice; keep spaCy for that slice); embeddings (that's [frankensearch](https://github.com/Dicklesworthstone/frankensearch)'s job; `fnlp` interoperates over shared NDJSON conventions); training/fine-tuning; a model zoo.
 
-## How it compares
+## How it compares (target 1.0)
 
 Honest framing. `fnlp` is deliberately built as an NLP *product* around this specific model, rather than only as a chat/completion runtime.
 
@@ -225,9 +229,14 @@ Honest framing. `fnlp` is deliberately built as an NLP *product* around this spe
 | Semantic reasoning | Yes (3B-class, task-evaluated) | Yes | Yes | Statistical/transformer pipeline-dependent | Yes |
 | Default data path | Local/offline after pull | Local | Local | Local | Submitted to provider |
 
-## The `fnlp` CLI
+## The `fnlp` CLI (target contract)
 
-> Robot mode emits line-oriented, versioned NDJSON an agent can pipe and validate against a frozen contract (`fnlp robot schema`). stdout is data, stderr is diagnostics, exit codes are stable and documented, bare `fnlp` prints help and never opens a TUI.
+> The block below specifies the intended 1.0 surface; most commands shown are
+> not runnable today. The current executable inventory is listed near the top
+> of this README. At 1.0, robot mode emits line-oriented, versioned NDJSON an
+> agent can pipe and validate against a frozen contract (`fnlp robot schema`).
+> stdout is data, stderr is diagnostics, exit codes are stable and documented,
+> and bare `fnlp` prints help and never opens a TUI.
 
 ```bash
 # Tasks (each: --json, -o file, --think/--no-think; batch via `fnlp batch --task <t>`)
@@ -419,4 +428,4 @@ The **Nanbeige4.2-3B model weights**, and every transformed `.fnlpq` derivative 
 
 - [`COMPREHENSIVE_PLAN_FOR_FRANKEN_NLP.md`](./COMPREHENSIVE_PLAN_FOR_FRANKEN_NLP.md), the master plan: the evidence-state model dossier, the exact loop/KV/norm contract, the artifact lifecycle, the per-arch SIMD campaigns, the constrained-execution compiler, the batch/job fabric, the verification methodology, the alien-artifact recommendation cards, the phased roadmap, the risk register, and the research-decision register.
 - [`AGENTS.md`](./AGENTS.md), conventions for human and AI agents working in this codebase, including the engineering doctrine and the testing policy.
-- The review-provenance records: [`WIZARD_IDEAS_CC.md`](./WIZARD_IDEAS_CC.md), [`WIZARD_IDEAS_COD.md`](./WIZARD_IDEAS_COD.md), the cross-scores, the reactions, and [`DUELING_WIZARDS_REPORT.md`](./DUELING_WIZARDS_REPORT.md): historical snapshots; plan §10.6 records the authoritative dispositions.
+- The review-provenance records: [`WIZARD_IDEAS_CC.md`](./docs/misc/WIZARD_IDEAS_CC.md), [`WIZARD_IDEAS_COD.md`](./docs/misc/WIZARD_IDEAS_COD.md), the cross-scores, the reactions, and [`DUELING_WIZARDS_REPORT.md`](./docs/misc/DUELING_WIZARDS_REPORT.md): historical snapshots; plan §10.6 records the authoritative dispositions.
