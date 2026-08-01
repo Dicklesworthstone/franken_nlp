@@ -387,6 +387,99 @@ fn receipt_parser_rejects_duplicate_missing_and_wrongly_typed_schema_fields() {
 }
 
 #[test]
+fn receipt_parser_requires_the_complete_pinned_schema_and_identities() {
+    let receipt = ConversionReceipt {
+        receipt_schema: CONVERSION_RECEIPT_SCHEMA.to_owned(),
+        model_id: "Nanbeige4.2-3B".to_owned(),
+        model_revision: "f56ec5a9650268aa098496734743c25ea778bd2d".to_owned(),
+        artifact_format: "fnlpq-v1".to_owned(),
+        source_root_sha256: "a".repeat(64),
+        census_sha256: "b".repeat(64),
+        converter_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+        recipe_id: "nanbeige42-int8-v1".to_owned(),
+        rounding_id: "portable-quant-v1".to_owned(),
+        packing_id: "generic-v1".to_owned(),
+        measured_peak_rss_bytes: 10,
+        measured_scratch_bytes: 4,
+        peak_rss_cap_bytes: 10,
+        final_disk_bytes: 20,
+        measured_disk_bytes: 20,
+        output_len: 20,
+        fnlpq_file_sha256: "c".repeat(64),
+        artifact_raw_sha256: "e".repeat(64),
+        license_bundle_sha256: "d".repeat(64),
+    };
+    let canonical = receipt
+        .canonical_json()
+        .expect("complete synthetic receipt serializes");
+    let expected_fields = [
+        "receipt_schema",
+        "model_id",
+        "model_revision",
+        "artifact_format",
+        "source_root_sha256",
+        "census_sha256",
+        "converter_commit",
+        "recipe_id",
+        "rounding_id",
+        "packing_id",
+        "measured_peak_rss_bytes",
+        "measured_scratch_bytes",
+        "peak_rss_cap_bytes",
+        "final_disk_bytes",
+        "measured_disk_bytes",
+        "output_len",
+        "fnlpq_file_sha256",
+        "artifact_raw_sha256",
+        "license_bundle_sha256",
+    ];
+    for field in expected_fields {
+        let mut missing =
+            serde_json::from_str::<serde_json::Value>(&canonical).expect("canonical receipt");
+        missing
+            .as_object_mut()
+            .expect("receipt root is an object")
+            .remove(field);
+        let missing = franken_nlp::canonjson::canonical_string(&missing)
+            .expect("missing-field hostile receipt stays canonical JSON");
+        assert!(matches!(
+            ConversionReceipt::parse_canonical_json(&missing),
+            Err(ConverterError::ReceiptParse { .. })
+        ));
+    }
+
+    for (field, value) in [
+        ("model_id", "other-model"),
+        ("model_revision", "0000000000000000000000000000000000000000"),
+        ("artifact_format", "fnlpq-v2"),
+    ] {
+        let mut tampered =
+            serde_json::from_str::<serde_json::Value>(&canonical).expect("canonical receipt");
+        tampered
+            .as_object_mut()
+            .expect("receipt root is an object")
+            .insert(field.to_owned(), serde_json::Value::from(value));
+        let tampered = franken_nlp::canonjson::canonical_string(&tampered)
+            .expect("identity-tampered receipt stays canonical JSON");
+        assert_eq!(
+            ConversionReceipt::parse_canonical_json(&tampered),
+            Err(ConverterError::ReceiptField {
+                field,
+                detail: format!(
+                    "expected pinned identifier {expected:?}, observed {value:?}",
+                    expected = match field {
+                        "model_id" => "Nanbeige4.2-3B",
+                        "model_revision" => "f56ec5a9650268aa098496734743c25ea778bd2d",
+                        "artifact_format" => "fnlpq-v1",
+                        _ => unreachable!("only pinned identity fields are tested"),
+                    }
+                ),
+            })
+        );
+    }
+}
+
+#[test]
 fn cli_contract_admits_only_recipe_and_generic_arch() {
     let request = ConvertRequest {
         source_dir: "source".into(),
