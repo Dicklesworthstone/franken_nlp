@@ -3,10 +3,10 @@
 
 use franken_nlp::artifact::converter::{
     BF16_VERBATIM_V1, CONVERSION_RECEIPT_SCHEMA, ConversionReceipt, ConversionSourceManifest,
-    ConvertArch, ConvertRequest, ConverterError, DEFAULT_PANEL_BYTES, OutputRange, OutputRangePlan,
-    PINNED_LOGICAL_PAYLOAD_BYTES, PORTABLE_QUANT_V1, StorageStage, expected_nanbeige42_census,
-    plan_generic_payload, prepare_convert_request, remap_tensor_name, validate_nanbeige42_census,
-    validate_pinned_logical_payload_bytes,
+    ConvertArch, ConvertRequest, ConverterError, DEFAULT_PANEL_BYTES, GENERIC_PACKING_V1,
+    OutputRange, OutputRangePlan, PINNED_LOGICAL_PAYLOAD_BYTES, PORTABLE_QUANT_V1, StorageStage,
+    expected_nanbeige42_census, plan_generic_payload, prepare_convert_request, remap_tensor_name,
+    validate_nanbeige42_census, validate_pinned_logical_payload_bytes,
 };
 use franken_nlp::artifact::safetensors::TensorCensusEntry;
 
@@ -211,6 +211,46 @@ fn receipt_requires_every_identity_and_serializes_canonically() {
         })
     );
 
+    let unpinned_recipe = ConversionReceipt {
+        recipe_id: "other-recipe-v1".to_owned(),
+        ..receipt.clone()
+    };
+    assert_eq!(
+        unpinned_recipe.canonical_json(),
+        Err(ConverterError::ReceiptField {
+            field: "recipe_id",
+            detail:
+                "expected pinned identifier \"nanbeige42-int8-v1\", observed \"other-recipe-v1\""
+                    .to_owned(),
+        })
+    );
+    let unpinned_rounding = ConversionReceipt {
+        rounding_id: "other-rounding-v1".to_owned(),
+        ..receipt.clone()
+    };
+    assert_eq!(
+        unpinned_rounding.canonical_json(),
+        Err(ConverterError::ReceiptField {
+            field: "rounding_id",
+            detail:
+                "expected pinned identifier \"portable-quant-v1\", observed \"other-rounding-v1\""
+                    .to_owned(),
+        })
+    );
+    let unpinned_packing = ConversionReceipt {
+        packing_id: "other-packing-v1".to_owned(),
+        ..receipt.clone()
+    };
+    assert_eq!(
+        unpinned_packing.canonical_json(),
+        Err(ConverterError::ReceiptField {
+            field: "packing_id",
+            detail: format!(
+                "expected pinned identifier {GENERIC_PACKING_V1:?}, observed \"other-packing-v1\""
+            ),
+        })
+    );
+
     let malformed_commit = ConversionReceipt {
         converter_commit: "unbound-converter".to_owned(),
         ..receipt
@@ -268,6 +308,25 @@ fn receipt_parser_rejects_duplicate_missing_and_wrongly_typed_schema_fields() {
     assert!(matches!(
         ConversionReceipt::parse_canonical_json(&missing_output_sha256),
         Err(ConverterError::ReceiptParse { .. })
+    ));
+
+    let mut unpinned_recipe =
+        serde_json::from_str::<serde_json::Value>(&canonical).expect("canonical receipt is JSON");
+    unpinned_recipe
+        .as_object_mut()
+        .expect("receipt root is an object")
+        .insert(
+            "recipe_id".to_owned(),
+            serde_json::Value::from("unbound-recipe-v1"),
+        );
+    let unpinned_recipe = franken_nlp::canonjson::canonical_string(&unpinned_recipe)
+        .expect("unpinned recipe hostile receipt stays canonical JSON");
+    assert!(matches!(
+        ConversionReceipt::parse_canonical_json(&unpinned_recipe),
+        Err(ConverterError::ReceiptField {
+            field: "recipe_id",
+            ..
+        })
     ));
 
     let mut numeric_source_root =

@@ -47,6 +47,8 @@ pub const PINNED_CONVERSION_RECIPE: &str = "nanbeige42-int8-v1";
 pub const PORTABLE_QUANT_V1: &str = "portable-quant-v1";
 /// Canonical Generic encoding for source-preserved BF16 tensors.
 pub const BF16_VERBATIM_V1: &str = "bf16-verbatim-v1";
+/// The only Generic packing declaration emitted by the initial converter.
+pub const GENERIC_PACKING_V1: &str = "generic-v1";
 /// The only canonical JSON schema emitted for conversion receipts.
 pub const CONVERSION_RECEIPT_SCHEMA: &str = "fnlp-conversion-receipt-v1";
 
@@ -1385,15 +1387,19 @@ impl ConversionReceipt {
                 detail: "must be a lowercase 40-character Git commit".to_owned(),
             });
         }
-        for (field, value) in [
-            ("recipe_id", self.recipe_id.as_str()),
-            ("rounding_id", self.rounding_id.as_str()),
-            ("packing_id", self.packing_id.as_str()),
+        for (field, actual, expected) in [
+            (
+                "recipe_id",
+                self.recipe_id.as_str(),
+                PINNED_CONVERSION_RECIPE,
+            ),
+            ("rounding_id", self.rounding_id.as_str(), PORTABLE_QUANT_V1),
+            ("packing_id", self.packing_id.as_str(), GENERIC_PACKING_V1),
         ] {
-            if value.is_empty() || !value.is_ascii() {
+            if actual != expected {
                 return Err(ConverterError::ReceiptField {
                     field,
-                    detail: "must be non-empty ASCII".to_owned(),
+                    detail: format!("expected pinned identifier {expected:?}, observed {actual:?}"),
                 });
             }
         }
