@@ -49,10 +49,11 @@ pub const DEFAULT_SYSTEM_TEXT: &str = "你是南北阁，一款由BOSS直聘自�
 /// The pinned fallback system instruction for a tools-enabled conversation.
 const TOOL_SYSTEM_TEXT: &str = "你是一位工具函数调用专家，你会得到一个问题和一组可能的工具函数。根据问题，你需要进行一个或多个函数/工具调用以实现目的，请尽量尝试探索通过工具解决问题。\n如果没有一个函数可以使用，请直接使用自然语言回复用户。\n如果给定的问题缺少函数所需的参数，请使用自然语言进行提问，向用户询问必要信息。\n如果调用结果已经足够回答用户问题，请对历史结果进行总结，使用自然语言回复用户。";
 
-/// The fixed reminder substituted for the pinned non-text media kinds.
+/// The pinned reminder substituted for an image content part.
 ///
 /// The template is text-only; original media payloads are never rendered as
-/// model input.  The literal is a single fixture-governed control point.
+/// model input. Video and audio parts use their own type-named literals, exactly
+/// as the pinned template derives them.
 pub const MEDIA_REMINDER_TEXT: &str =
     "<reminder>You are unable to process this image because you don't have multi-modal input ability. Try different methods.</reminder>";
 
@@ -272,15 +273,15 @@ pub enum ContentPart {
     Image { source: Option<String> },
     /// Pinned image-url part; its payload becomes [`MEDIA_REMINDER_TEXT`].
     ImageUrl { source: Option<String> },
-    /// Pinned video part; its payload becomes [`MEDIA_REMINDER_TEXT`].
+    /// Pinned video part; its payload becomes the type-named video reminder.
     Video { source: Option<String> },
-    /// Pinned video-url part; its payload becomes [`MEDIA_REMINDER_TEXT`].
+    /// Pinned video-url part; its payload becomes the type-named video reminder.
     VideoUrl { source: Option<String> },
-    /// Pinned audio part; its payload becomes [`MEDIA_REMINDER_TEXT`].
+    /// Pinned audio part; its payload becomes the type-named audio reminder.
     Audio { source: Option<String> },
-    /// Pinned audio-url part; its payload becomes [`MEDIA_REMINDER_TEXT`].
+    /// Pinned audio-url part; its payload becomes the type-named audio reminder.
     AudioUrl { source: Option<String> },
-    /// Pinned input-audio part; its payload becomes [`MEDIA_REMINDER_TEXT`].
+    /// Pinned input-audio part; its payload becomes the type-named audio reminder.
     InputAudio { source: Option<String> },
 }
 

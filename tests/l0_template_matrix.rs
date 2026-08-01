@@ -317,6 +317,45 @@ fn media_and_assistant_reasoning_follow_the_selected_mode() {
 }
 
 #[test]
+fn every_pinned_media_kind_keeps_its_template_derived_reminder_name() {
+    let image = MEDIA_REMINDER_TEXT;
+    let video = "<reminder>You are unable to process this video because you don't have multi-modal input ability. Try different methods.</reminder>";
+    let audio = "<reminder>You are unable to process this audio because you don't have multi-modal input ability. Try different methods.</reminder>";
+    let cases = vec![
+        ("image", ContentPart::Image { source: None }, image),
+        ("image_url", ContentPart::ImageUrl { source: None }, image),
+        ("video", ContentPart::Video { source: None }, video),
+        ("video_url", ContentPart::VideoUrl { source: None }, video),
+        ("audio", ContentPart::Audio { source: None }, audio),
+        ("audio_url", ContentPart::AudioUrl { source: None }, audio),
+        ("input_audio", ContentPart::InputAudio { source: None }, audio),
+    ];
+
+    for (kind, part, reminder) in cases {
+        let conversation = Conversation::new(vec![Message {
+            role: MessageRole::User,
+            content: MessageContent::Parts(vec![part]),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+        }]);
+        let rendered = TemplateBuilder::with_options(RenderOptions {
+            add_generation_prompt: false,
+            ..RenderOptions::default()
+        })
+        .render(&conversation)
+        .expect("every pinned media kind renders a trusted reminder");
+        assert_eq!(
+            rendered,
+            format!(
+                "{IM_START}system\n{DEFAULT_SYSTEM_TEXT}{IM_END}\n{IM_START}user\n{reminder}{IM_END}\n"
+            ),
+            "the {kind} part must retain the pinned template media type"
+        );
+    }
+}
+
+#[test]
 fn tool_branches_and_adjacent_results_are_structurally_distinct() {
     let tool_call = ToolCall {
         id: Some("call-1".to_owned()),
