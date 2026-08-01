@@ -1589,6 +1589,12 @@ mod tests {
         assert!(canonical.contains("prompt_template_sha256"));
         assert!(canonical.contains("recipe_id"));
         assert!(canonical.contains("numerics_profile"));
+        assert!(canonical.contains("thinking_mode"));
+        assert!(canonical.contains("schema_version"));
+        assert!(canonical.contains("task_spec_version"));
+        assert!(canonical.contains("calibration_digest"));
+        assert!(canonical.contains("decision_policy_digest"));
+        assert!(canonical.contains("deterministic_token_counts"));
         assert!(!canonical.contains("telemetry"));
         assert!(observed.contains("telemetry"));
         assert!(observed.contains("transient_run_id"));
