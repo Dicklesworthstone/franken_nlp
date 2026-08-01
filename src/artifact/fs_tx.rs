@@ -12,12 +12,10 @@ use std::{
     collections::BTreeSet,
     error::Error,
     fmt,
-    fs::File,
-    path::{Path, PathBuf},
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    path::{Component, Path, PathBuf},
 };
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::fs::OpenOptions;
 
 use sha2::{Digest, Sha256};
 
@@ -45,6 +43,24 @@ impl ActivationDigest {
     #[must_use]
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
+    }
+
+    /// Parses one canonical lowercase SHA-256 hexadecimal content address.
+    pub fn parse_hex(value: &str) -> Result<Self, FsTxError> {
+        if value.len() != ACTIVATION_DIGEST_BYTES * 2
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(FsTxError::InvalidContentAddress);
+        }
+        let mut bytes = [0_u8; ACTIVATION_DIGEST_BYTES];
+        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+            let high = hex_value(pair[0]).ok_or(FsTxError::InvalidContentAddress)?;
+            let low = hex_value(pair[1]).ok_or(FsTxError::InvalidContentAddress)?;
+            bytes[index] = (high << 4) | low;
+        }
+        Ok(Self(bytes))
     }
 
     /// Returns the fixed-width digest bytes.
@@ -460,6 +476,8 @@ pub enum FsTxError {
     },
     /// The opened root was not an owner-only directory suitable for mutation.
     HostileRoot { reason: &'static str },
+    /// A caller supplied a non-canonical content-address lock identity.
+    InvalidContentAddress,
     /// One process attempted to take the same non-reentrant content lock twice.
     LockReentrant,
     /// A monotonic activation sequence would wrap at `u64::MAX`.
@@ -501,6 +519,9 @@ impl fmt::Display for FsTxError {
             }
             Self::HostileRoot { reason } => {
                 write!(formatter, "FS_TXN refused: hostile model root: {reason}")
+            }
+            Self::InvalidContentAddress => {
+                formatter.write_str("FS_TXN refused: content address is not lowercase SHA-256")
             }
             Self::LockReentrant => formatter.write_str("FS_TXN refused: content lock re-entry"),
             Self::SequenceOverflow => {
@@ -559,6 +580,14 @@ impl Error for FsTxError {}
 pub struct RatifiedModelRoot {
     directory: File,
     root: PathBuf,
+    content_locks: ContentAddressLockSet,
+}
+
+/// A fully synced, not-yet-published sibling stage owned by one model root.
+#[derive(Debug)]
+pub struct StagedModelFile {
+    final_path: PathBuf,
+    stage_path: PathBuf,
 }
 
 impl RatifiedModelRoot {
@@ -578,63 +607,314 @@ impl RatifiedModelRoot {
                 detail: error.to_string(),
             })
     }
-}
 
-/// Opens a mutable model root without following its terminal path component.
-///
-/// Linux and macOS use their documented `O_NOFOLLOW` flag through safe
-/// `OpenOptionsExt::custom_flags`, then inspect the *opened* handle.  There is
-/// intentionally no `symlink_metadata`-then-open preflight.  Other targets
-/// retain the typed refusal until an equally safe reviewed surface exists.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub fn open_ratified_model_root(root: &Path) -> Result<RatifiedModelRoot, FsTxError> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    /// Acquires the one process-local mutation scope for `content_digest`.
+    ///
+    /// A caller retains this guard until the staged file is published or the
+    /// attempt refuses; a second scope for the same content address fails
+    /// typed rather than silently sharing a staging path.
+    pub fn try_lock_content(
+        &self,
+        content_digest: ActivationDigest,
+    ) -> Result<ContentAddressLockGuard<'_>, FsTxError> {
+        self.content_locks.try_lock(content_digest)
+    }
 
-    #[cfg(target_os = "linux")]
-    const O_NOFOLLOW: i32 = 0o400000;
-    #[cfg(target_os = "macos")]
-    const O_NOFOLLOW: i32 = 0x0100;
+    /// Derives a relative path only when it stays beneath this admitted root.
+    pub fn relative_path(&self, candidate: &Path) -> Result<PathBuf, FsTxError> {
+        let relative = candidate
+            .strip_prefix(&self.root)
+            .map_err(|_| FsTxError::HostileRoot {
+                reason: "path is outside the admitted model root",
+            })?;
+        validate_relative_path(relative)?;
+        Ok(relative.to_path_buf())
+    }
 
-    let directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NOFOLLOW)
-        .open(root)
-        .map_err(|error| FsTxError::RootIo {
-            operation: "open model-root directory without following symlink",
+    /// Reads a checked regular file beneath the admitted model root without
+    /// following its terminal path component.
+    pub fn read_regular_file(&self, relative: &Path) -> Result<Vec<u8>, FsTxError> {
+        let path = self.absolute_relative_path(relative)?;
+        let file = open_without_follow(&path, "open model-root regular file")?;
+        let metadata = file.metadata().map_err(|error| FsTxError::RootIo {
+            operation: "inspect opened model-root regular file",
             detail: error.to_string(),
         })?;
-    let metadata = directory.metadata().map_err(|error| FsTxError::RootIo {
-        operation: "inspect opened model-root directory",
-        detail: error.to_string(),
-    })?;
-    if !metadata.file_type().is_dir() {
-        return Err(FsTxError::HostileRoot {
-            reason: "root is not a directory",
-        });
+        if !metadata.file_type().is_file() {
+            return Err(FsTxError::HostileRoot {
+                reason: "model-root target is not a regular file",
+            });
+        }
+        let mut bytes = Vec::new();
+        let mut reader = file;
+        reader.read_to_end(&mut bytes).map_err(|error| FsTxError::RootIo {
+            operation: "read model-root regular file",
+            detail: error.to_string(),
+        })?;
+        Ok(bytes)
     }
 
-    // The mode is read from the opened directory handle, never from a path
-    // which could be swapped before use.  A mutable model root must be
-    // exclusive to its owner: no group or other principal receives any access.
-    let mode = metadata.mode();
-    if mode & 0o077 != 0 || mode & 0o700 != 0o700 {
-        return Err(FsTxError::HostileRoot {
-            reason: "root permissions are not owner-only rwx",
-        });
+    /// Creates, writes, and syncs a private sibling stage for a previously
+    /// absent immutable target.  The returned value can only be published by
+    /// [`Self::publish_staged`].
+    pub fn stage_bytes(&self, final_relative: &Path, bytes: &[u8]) -> Result<StagedModelFile, FsTxError> {
+        let final_path = self.absolute_relative_path(final_relative)?;
+        let parent = final_path.parent().ok_or(FsTxError::HostileRoot {
+            reason: "model-root final target has no parent",
+        })?;
+        self.ensure_relative_directories(final_relative.parent())?;
+        let filename = final_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or(FsTxError::HostileRoot {
+                reason: "model-root final target has no Unicode filename",
+            })?;
+        let stage_path = parent.join(format!(".{filename}.fnlp-stage"));
+        let mut stage = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&stage_path)
+            .map_err(|error| FsTxError::RootIo {
+                operation: "create-new model-root staging file",
+                detail: error.to_string(),
+            })?;
+        stage.write_all(bytes).map_err(|error| FsTxError::RootIo {
+            operation: "write model-root staging file",
+            detail: error.to_string(),
+        })?;
+        stage.sync_all().map_err(|error| FsTxError::RootIo {
+            operation: "sync model-root staging file",
+            detail: error.to_string(),
+        })?;
+        drop(stage);
+        Ok(StagedModelFile {
+            final_path,
+            stage_path,
+        })
     }
 
-    Ok(RatifiedModelRoot {
-        directory,
-        root: root.to_path_buf(),
-    })
+    /// Publishes a fully synced sibling stage at a previously absent immutable
+    /// name and then syncs its parent directory.  Both names share one parent,
+    /// so the rename is necessarily same-filesystem.
+    pub fn publish_staged(&self, stage: StagedModelFile) -> Result<PathBuf, FsTxError> {
+        match fs::symlink_metadata(&stage.final_path) {
+            Ok(_) => {
+                let filename = stage
+                    .final_path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("<non-utf8>")
+                    .to_owned();
+                return Err(FsTxError::FinalNameExists { filename });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(FsTxError::RootIo {
+                    operation: "inspect immutable model-root final target",
+                    detail: error.to_string(),
+                });
+            }
+        }
+        fs::rename(&stage.stage_path, &stage.final_path).map_err(|error| FsTxError::RootIo {
+            operation: "rename synced model-root stage to immutable final",
+            detail: error.to_string(),
+        })?;
+        let parent = stage.final_path.parent().ok_or(FsTxError::HostileRoot {
+            reason: "model-root final target has no parent after staging",
+        })?;
+        sync_directory_at(parent)?;
+        Ok(stage.final_path)
+    }
+
+    /// Opens the one append-only activation journal for this model root.
+    pub fn activation_journal(&self) -> Result<FilesystemActivationJournal<'_>, FsTxError> {
+        self.ensure_relative_directories(Some(Path::new(ACTIVATION_JOURNAL_DIRECTORY)))?;
+        Ok(FilesystemActivationJournal { root: self })
+    }
+
+    fn absolute_relative_path(&self, relative: &Path) -> Result<PathBuf, FsTxError> {
+        validate_relative_path(relative)?;
+        Ok(self.root.join(relative))
+    }
+
+    fn ensure_relative_directories(&self, relative: Option<&Path>) -> Result<(), FsTxError> {
+        let Some(relative) = relative else {
+            return Ok(());
+        };
+        validate_relative_path(relative)?;
+        let mut current = self.root.clone();
+        for component in relative.components() {
+            let Component::Normal(name) = component else {
+                return Err(FsTxError::HostileRoot {
+                    reason: "model-root directory component is not normal",
+                });
+            };
+            current.push(name);
+            match fs::create_dir(&current) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(FsTxError::RootIo {
+                        operation: "create model-root directory",
+                        detail: error.to_string(),
+                    });
+                }
+            }
+            let directory = open_without_follow(&current, "open model-root child directory")?;
+            let metadata = directory.metadata().map_err(|error| FsTxError::RootIo {
+                operation: "inspect model-root child directory",
+                detail: error.to_string(),
+            })?;
+            if !metadata.file_type().is_dir() {
+                return Err(FsTxError::HostileRoot {
+                    reason: "model-root child target is not a directory",
+                });
+            }
+            sync_directory_at(current.parent().ok_or(FsTxError::HostileRoot {
+                reason: "model-root child directory has no parent",
+            })?)?;
+        }
+        Ok(())
+    }
 }
 
-/// Typed refusal for targets without the reviewed safe no-follow surface.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// Refuses mutable model-root access until a reviewed handle-relative,
+/// no-replace transaction surface exists.
+///
+/// The terminal `O_NOFOLLOW` experiment is deliberately insufficient: it
+/// cannot authenticate the effective owner/ACLs, anchor child operations to a
+/// directory handle, or provide a no-replace final rename.  Returning this
+/// capability would therefore overclaim platform authority.
 pub fn open_ratified_model_root(_root: &Path) -> Result<RatifiedModelRoot, FsTxError> {
     Err(FsTxError::PlatformSurfaceUnavailable {
         surface: "model-root owner-only lock/no-follow/durability",
     })
+}
+
+const ACTIVATION_JOURNAL_DIRECTORY: &str = ".fnlp-activation";
+
+fn validate_relative_path(relative: &Path) -> Result<(), FsTxError> {
+    if relative.as_os_str().is_empty()
+        || relative.components().any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(FsTxError::HostileRoot {
+            reason: "model-root path is not a nonempty relative normal-component path",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_without_follow(path: &Path, operation: &'static str) -> Result<File, FsTxError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    const O_NOFOLLOW: i32 = 0o400000;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| FsTxError::RootIo {
+            operation,
+            detail: error.to_string(),
+        })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_without_follow(_path: &Path, _operation: &'static str) -> Result<File, FsTxError> {
+    Err(FsTxError::PlatformSurfaceUnavailable {
+        surface: "model-root owner-only lock/no-follow/durability",
+    })
+}
+
+fn sync_directory_at(path: &Path) -> Result<(), FsTxError> {
+    open_without_follow(path, "open model-root directory for sync")?
+        .sync_all()
+        .map_err(|error| FsTxError::RootIo {
+            operation: "sync model-root directory",
+            detail: error.to_string(),
+        })
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// A filesystem-backed append-only activation journal below one admitted root.
+///
+/// Its public operations preserve the same canonical envelopes and recovery
+/// rules as [`SimulatedActivationJournal`], while the root capability owns the
+/// `create_new`, sync, same-directory rename, and directory-sync sequence.
+#[derive(Debug)]
+pub struct FilesystemActivationJournal<'root> {
+    root: &'root RatifiedModelRoot,
+}
+
+impl FilesystemActivationJournal<'_> {
+    /// Recovers the one unambiguous chain retained by this root.
+    pub fn discover(&self) -> Result<ActivationDiscovery, FsTxError> {
+        let relative_directory = Path::new(ACTIVATION_JOURNAL_DIRECTORY);
+        let directory = self.root.absolute_relative_path(relative_directory)?;
+        let entries = fs::read_dir(&directory).map_err(|error| FsTxError::RootIo {
+            operation: "enumerate activation journal directory",
+            detail: error.to_string(),
+        })?;
+        let mut records = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| FsTxError::RootIo {
+                operation: "read activation journal directory entry",
+                detail: error.to_string(),
+            })?;
+            let filename = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| FsTxError::HostileRoot {
+                    reason: "activation journal entry name is not Unicode",
+                })?;
+            if filename.starts_with('.') {
+                // A synced but unpublished `create_new` stage is never a
+                // recovery candidate.  It remains forensic evidence only.
+                continue;
+            }
+            let relative = relative_directory.join(&filename);
+            let envelope = self.root.read_regular_file(&relative)?;
+            let record = ActivationRecord::parse_canonical_envelope(&envelope)?;
+            record.validate_final_filename(&filename)?;
+            records.push(record);
+        }
+        discover_activation(&records)
+    }
+
+    /// Appends one immutable activation or rollback record under the journal's
+    /// dedicated non-reentrant mutation scope.
+    pub fn append(
+        &self,
+        artifact_digest: ActivationDigest,
+        native_digest: ActivationDigest,
+        config_digest: ActivationDigest,
+    ) -> Result<ActivationHead, FsTxError> {
+        let _journal_lock = self.root.try_lock_content(ActivationDigest::from_bytes([0; 32]))?;
+        let body = match self.discover()?.head {
+            Some(previous) => ActivationRecordBody::successor(
+                &previous.record,
+                artifact_digest,
+                native_digest,
+                config_digest,
+            )?,
+            None => ActivationRecordBody::genesis(artifact_digest, native_digest, config_digest),
+        };
+        let record = ActivationRecord::new(body);
+        let final_relative = Path::new(ACTIVATION_JOURNAL_DIRECTORY).join(record.final_filename());
+        let stage = self
+            .root
+            .stage_bytes(&final_relative, &record.canonical_envelope_bytes())?;
+        self.root.publish_staged(stage)?;
+        Ok(ActivationHead { record })
+    }
 }
 
 /// A safe in-memory stand-in for the create-new/sync/rename journal protocol.
