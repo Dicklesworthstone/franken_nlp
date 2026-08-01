@@ -213,6 +213,52 @@ fn streaming_bridge_refuses_tampered_row_sum_after_checked_sidecar_decode() {
 }
 
 #[test]
+fn streaming_bridge_refuses_nonfinite_quantization_scale_at_the_sidecar_stage() {
+    let mut fixture = StreamingFixture::expected();
+    fixture
+        .mappings
+        .get_mut("model.layers.0.self_attn.q_proj.weight")
+        .expect("quantized mapping")[1] =
+        [f32::INFINITY.to_le_bytes(), 0.5_f32.to_le_bytes()].concat();
+    let error = load_with_contract(
+        &fixture,
+        ArtifactLoadBudget::streaming_only(28, 3),
+        &contracts(),
+        |_| {},
+    )
+    .expect_err("nonfinite scales are never materialized into the quantized set");
+    assert!(matches!(
+        error,
+        ArtifactBridgeError::Tensor {
+            ref tensor,
+            stage: "scales",
+            ..
+        } if tensor == "model.layers.0.self_attn.q_proj.weight"
+    ));
+}
+
+#[test]
+fn streaming_bridge_refuses_a_source_chunk_larger_than_its_admitted_scratch_bound() {
+    let mut fixture = StreamingFixture::expected();
+    fixture.chunk_bytes = 4;
+    let error = load_with_contract(
+        &fixture,
+        ArtifactLoadBudget::streaming_only(28, 3),
+        &contracts(),
+        |_| {},
+    )
+    .expect_err("a source chunk may not exceed the bridge scratch budget");
+    assert_eq!(
+        error,
+        ArtifactBridgeError::Memory {
+            subject: "stream-chunk-bytes",
+            observed: 4,
+            limit: 3,
+        }
+    );
+}
+
+#[test]
 fn streaming_only_budget_refuses_a_reader_style_resident_envelope_before_allocation() {
     let mut fixture = StreamingFixture::expected();
     fixture.resident_envelope_bytes = 4_690_873_282;
