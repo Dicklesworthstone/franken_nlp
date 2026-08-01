@@ -28,6 +28,16 @@
 > Mail wiring exist. Even a green code receipt is separate from model-present,
 > target-host performance/platform, artifact, and human-review gates.
 
+> **Current executable surface (static source inventory).** The binary presently
+> exposes `robot schema|health|backends`, `schema check|sample`, a provisional
+> `convert` path, unqualified release-package scaffolding, and a
+> `models derive` path that deliberately refuses until the owner-only model-root
+> transaction surface is ratified. It does **not** yet expose `pull`, model
+> inference or task commands, `batch`, durable `job`, `doctor`,
+> `eval|calibrate|qualify`, or installers. Existing converter/package code is
+> useful code-first progress, not a qualified model artifact or publication
+> path. The examples below remain the disclosed 1.0 target contract.
+
 ---
 
 ## TL;DR

@@ -16,33 +16,41 @@ STRUCTURALLY EXERCISED; ACCEPTANCE OPEN**.
 Current load-bearing corrections:
 
 - No retained DSR `scripts/check.sh` receipt exists for the current immutable source SHA.
-  Local Cargo, direct RCH, and GitHub Actions results are non-authoritative for this campaign;
-  GitHub Actions is disabled. One occasional isolated DSR checkpoint is run only after the
-  moving shared tree reaches a deliberately selected stable SHA.
-- The oracle binds the ten-file data closure, but `trust_remote_code=True` also executes
-  `configuration_nanbeige.py` and `modeling_nanbeige.py`. Those executed files, the import
-  closure, the generator, environment, and source tree are not yet sealed together in one
-  replayable model-present receipt. Existing floor/trace/fixture transcripts therefore do
-  not authorize downstream L1-L4 promotion.
-- The current L2 harness is a useful scaffold, not a 44+2 parity award: absent-model and
-  synthetic legs can succeed without a real comparison, and the retained coverage does not
-  yet span both required profiles and every named phase/KV/loop-boundary surface.
+  Local Cargo, direct RCH, and GitHub Actions results are non-authoritative for this campaign.
+  The owner policy disables GitHub Actions, but the retained workflow still auto-triggers on
+  push/pull request and must be made inert. One occasional isolated DSR checkpoint is run only
+  after the moving shared tree reaches a deliberately selected stable SHA and the named
+  `production` feature graph exists.
+- A real CPU/eager smoke now verifies the complete ten-file source closure before model load.
+  The retained five-process × two-thread-count nondeterminism campaign predates that
+  verification, however, and its own authority record said the model closure was not yet
+  verified. The current oracle record explicitly keeps that floor historical. Exact stable
+  prefixes and parity gates therefore require a new full-source-bound floor campaign.
+- The later source-bound trace capture is valuable: all nine trace indexes retain 268 prefill
+  and 268 append records, including 44 post-layer states, two post-loop norm states, and 44
+  K/V slots per phase; a fresh static audit matched all 4,824 retained sidecar digests. It is
+  not yet a 44+2 parity award because it imports the historical floor, and the committed
+  fixture-verification receipt predates the trace regeneration and no longer identifies the
+  current manifest.
 - `.fnlpq` reader/writer/converter/package components contain substantial real code, but the
   canonical envelope/digest authority is internally inconsistent, the production model-root
   opener intentionally refuses, the converter does not complete staged reload + strict
   receipt + reconstruction/selftest + atomic activation, and release packaging has not been
   proven on a validated real canonical Generic artifact.
-- `scripts/fetch_model.sh` has a retained Unix-path transcript, but shell/PowerShell parity,
-  pre-transfer redirect refusal, the executable source closure, and a full Windows receipt
-  remain open.
+- The fetchers implement the pinned ten-file/8,360,887,509-byte closure and retain useful
+  fixture coverage, but both Unix and PowerShell `--check-only` paths currently return exit 0
+  when all ten files are absent. That contradicts the verification contract (`0` means
+  complete/verified) and can counterfeit success for an exit-code-only caller. Trusted custom
+  catalog parity, pre-contact redirect refusal, real full-closure transcripts, and a full
+  Windows receipt also remain open.
 - `fnlp pull`, `install.sh`, and `install.ps1` are still absent. The required end-user flow
   remains: install the exact binary, delegate all model acquisition to that binary's
   release-bound `fnlp pull`, stream-verify every fixed 1,957,046,720-byte part (except the
   tail), reassemble, validate, derive native packing, and atomically activate.
-- Eleven Beads are presently marked closed even though each has a newer retained final audit
-  comment saying `KEEP OPEN` or `KEEP OPEN/BLOCKED`; five also retain live open blockers.
-  Their closure status and every readiness result derived from it are challenged. Only work
-  that remains ready after honoring those blockers may be scheduled.
+- Several Beads remain marked closed despite newer retained `KEEP OPEN` or
+  `KEEP OPEN/BLOCKED` audit comments and/or live open blockers. Their closure status and every
+  readiness result derived from it are challenged. Only work that remains ready after honoring
+  the literal dependency and proof contracts may be scheduled.
 
 These corrections preserve all implemented code and ambition. They change only the evidence
 grade: code-first progress is valuable, but it cannot mint DSR, model, host, platform, or
@@ -50,22 +58,25 @@ publisher proof.
 
 ## 1. The honest verdict
 
-**franken_nlp today is a proven reference-numerics + artifact platform, not yet a usable
-product.** The suite is 44/44 green and nothing in it is fake — but the aggregate delivers
-roughly the bottom third of the README's promise stack:
+**franken_nlp today is a substantial code-first reference/artifact scaffold, not yet a usable
+or proved product.** No clean-SHA DSR code receipt exists, the production feature graph is not
+wired, and model, artifact, platform, performance, publisher, and human-release gates remain
+independent and open.
 
-**Genuinely WORKING (evidence-backed):**
-- Truth pack + pinned oracle closure (zero nondeterminism floor; field-identical recreation).
-- The bf16 reference forward pass — embedding → 22×2 loop → GQA 48:8 @128 → RoPE θ=7e7
-  split-half → SwiGLU → both post-loop norms → lm_head — **L2-exact at all 44 executions + 2
-  norm states** against the oracle. This is the project's crown jewel and it is real.
-- The artifact layer: `.fnlpq` v1 streaming writer + hostile-input checked reader, the
-  three-pass streaming converter (`fnlp convert` — first real artifact emitting right now:
-  census/plan/emission staged, both identity anchors reproduced 4×), release
-  packaging/verification, canonjson chokepoint, execution identity, receipts, calibration
-  math, independent validators, grammar compiler + vocab masks, SentencePiece BPE tokenizer,
-  chat-template renderer, G0 probe foundations, OQ-35 census, resource broker/memory ledger.
-- `scripts/fetch_model.sh` (proven end-to-end this campaign).
+**Valuable evidence-bearing work that must be preserved and requalified:**
+- A hash-locked CPU/eager environment and a real full-ten-file source-bound smoke transcript.
+- A complete source-bound HF trace corpus for eager bf16, diagnostic f32, and variance-only
+  SDPA, with internally consistent 44-execution + two-norm/KV sidecars. Its imported
+  nondeterminism floor and retained verification receipt are stale, so it is structural/model
+  evidence rather than an L2 native-parity award.
+- Substantial `.fnlpq` writer, reader, converter, packager, canonical-JSON, execution-identity,
+  receipt, calibration, validation, grammar, tokenizer/template, resource-broker, and memory
+  ledger code. The envelope authority is split, the owned reader is not a production-scale
+  admitted reader, conversion stops before qualified reload/selftest/receipt/activation, and
+  packaging accepts unqualified inputs; none is release authority yet.
+- Pinned source-fetch implementations and fixture transcripts. Their empty-cache success exit,
+  cross-shell policy/evidence gaps, and missing real full-closure receipts must be corrected
+  before source acquisition closes.
 
 **REAL but UNWIRED (library code with zero in-src consumers — ~7,900 LOC, ~22% of src):**
 tokenizer (asset not embedded), template, grammar masks, validation, receipts, calibration,
