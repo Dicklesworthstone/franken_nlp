@@ -5,9 +5,12 @@
 //! one value so every later `.fnlpq` artifact check compares the same tokenizer
 //! that produced token ids.  The actual pinned byte inclusion belongs to the
 //! truth-pack fixture closure; this module deliberately never substitutes a
-//! fallback tokenizer when those bytes are unavailable.
+//! fallback tokenizer when those bytes are unavailable. The embedded model
+//! bytes are Apache-2.0 model material; the exact notice, Nanbeige attribution,
+//! and modification notice remain in `docs/truth-pack/license/` and travel in
+//! each checked artifact's license bundle.
 
-use std::{error::Error, fmt};
+use std::{collections::BTreeMap, error::Error, fmt};
 
 use sha2::{Digest, Sha256};
 
@@ -17,9 +20,25 @@ use crate::artifact::{
 };
 
 use super::{
-    bpe::{BpeBuildError, SpBpeTokenizer},
+    bpe::{AddedToken, BpeBuildError, SpBpeTokenizer},
     sp_model::{SpmError, parse_spm_model},
 };
+
+/// Exact pinned SentencePiece bytes compiled into every product binary.
+pub const PINNED_TOKENIZER_MODEL_BYTES: &[u8] =
+    include_bytes!("../../assets/nanbeige4.2-3b/tokenizer.model");
+
+/// Exact pinned post-SentencePiece token registry compiled into the binary.
+pub const PINNED_ADDED_TOKENS_BYTES: &[u8] =
+    include_bytes!("../../assets/nanbeige4.2-3b/added_tokens.json");
+
+/// Exact tokenizer configuration bytes compiled with the tokenizer authority.
+pub const PINNED_TOKENIZER_CONFIG_BYTES: &[u8] =
+    include_bytes!("../../assets/nanbeige4.2-3b/tokenizer_config.json");
+
+/// Exact special-token map bytes compiled with the tokenizer authority.
+pub const PINNED_SPECIAL_TOKENS_MAP_BYTES: &[u8] =
+    include_bytes!("../../assets/nanbeige4.2-3b/special_tokens_map.json");
 
 /// Failures while turning the binary's embedded `tokenizer.model` bytes into
 /// the exact SentencePiece BPE surface.
@@ -27,6 +46,8 @@ use super::{
 pub enum EmbeddedTokenizerError {
     /// The owned minimal protobuf reader rejected the claimed tokenizer bytes.
     Model(SpmError),
+    /// The exact added-token registry was not an object of token surface to ID.
+    AddedTokenRegistry(serde_json::Error),
     /// The parsed model could not provide a safe BPE surface.
     Bpe(BpeBuildError),
 }
@@ -35,6 +56,9 @@ impl fmt::Display for EmbeddedTokenizerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Model(error) => write!(formatter, "embedded tokenizer model rejected: {error}"),
+            Self::AddedTokenRegistry(error) => {
+                write!(formatter, "embedded added-token registry rejected: {error}")
+            }
             Self::Bpe(error) => write!(
                 formatter,
                 "embedded tokenizer BPE surface rejected: {error}"
@@ -47,6 +71,7 @@ impl Error for EmbeddedTokenizerError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Model(error) => Some(error),
+            Self::AddedTokenRegistry(error) => Some(error),
             Self::Bpe(error) => Some(error),
         }
     }
@@ -105,10 +130,35 @@ pub struct EmbeddedTokenizer {
 }
 
 impl EmbeddedTokenizer {
+    /// Construct the product tokenizer from the pinned, compiled asset closure.
+    pub fn pinned() -> Result<Self, EmbeddedTokenizerError> {
+        Self::from_bytes_with_added_tokens(PINNED_TOKENIZER_MODEL_BYTES, PINNED_ADDED_TOKENS_BYTES)
+    }
+
     /// Parse and retain exactly the binary-embedded tokenizer bytes.
+    ///
+    /// This lower-level constructor is useful only for synthetic tests that
+    /// have no post-SentencePiece token registry. Product call sites use
+    /// [`Self::pinned`] so added-token precedence remains part of L0 behavior.
     pub fn from_bytes(bytes: &'static [u8]) -> Result<Self, EmbeddedTokenizerError> {
+        Self::from_bytes_with_added_tokens(bytes, b"{}")
+    }
+
+    /// Parse immutable tokenizer bytes with their exact added-token registry.
+    pub fn from_bytes_with_added_tokens(
+        bytes: &'static [u8],
+        added_tokens: &'static [u8],
+    ) -> Result<Self, EmbeddedTokenizerError> {
         let model = parse_spm_model(bytes).map_err(EmbeddedTokenizerError::Model)?;
-        let tokenizer = SpBpeTokenizer::from_model(model).map_err(EmbeddedTokenizerError::Bpe)?;
+        let added_by_surface: BTreeMap<String, u32> = serde_json::from_slice(added_tokens)
+            .map_err(EmbeddedTokenizerError::AddedTokenRegistry)?;
+        let tokenizer = SpBpeTokenizer::with_added_tokens(
+            model,
+            added_by_surface
+                .into_iter()
+                .map(|(content, id)| AddedToken::new(content, id)),
+        )
+        .map_err(EmbeddedTokenizerError::Bpe)?;
         Ok(Self {
             bytes,
             sha256: Sha256::digest(bytes).into(),

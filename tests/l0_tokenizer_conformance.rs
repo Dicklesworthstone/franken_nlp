@@ -9,6 +9,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use franken_nlp::native_engine::lmhead::NANBEIGE_VOCAB_SIZE;
 use franken_nlp::tokenizer::{
     bpe::{AddedToken, DecodeBytesError, DecodeTextError, EncodeOptions, SpBpeTokenizer},
+    embedded::{
+        EmbeddedTokenizer, PINNED_ADDED_TOKENS_BYTES, PINNED_SPECIAL_TOKENS_MAP_BYTES,
+        PINNED_TOKENIZER_CONFIG_BYTES,
+    },
     sp_model::{NormalizerFacts, PieceType, SpecialPieceIds, SpmModel, SpmPiece, parse_spm_model},
 };
 use serde::Deserialize;
@@ -410,13 +414,27 @@ fn pinned_slow_reference_vocabulary_is_token_id_exact() {
         "embedding width is 128-aligned"
     );
 
-    let tokenizer = SpBpeTokenizer::with_added_tokens(
-        model,
-        added_by_surface
-            .iter()
-            .map(|(surface, id)| AddedToken::new(surface.clone(), *id)),
-    )
-    .expect("the pinned SentencePiece and added-token registries must build a tokenizer");
+    let embedded = EmbeddedTokenizer::pinned()
+        .expect("the hash-checked compiled tokenizer asset closure must build");
+    assert_eq!(
+        embedded.bytes(),
+        PINNED_TOKENIZER_MODEL,
+        "compiled tokenizer.model bytes must equal the frozen L0 fixture"
+    );
+    assert_eq!(
+        PINNED_ADDED_TOKENS_BYTES, PINNED_ADDED_TOKENS,
+        "compiled added-token bytes must equal the frozen L0 fixture"
+    );
+    assert_eq!(
+        PINNED_TOKENIZER_CONFIG_BYTES, PINNED_TOKENIZER_CONFIG,
+        "compiled tokenizer config bytes must equal the frozen L0 fixture"
+    );
+    assert_eq!(
+        digest_hex(PINNED_SPECIAL_TOKENS_MAP_BYTES),
+        "b718fce2b7a8940ffeddc1e67f3b092cc0d13ac885c63a021528786f8c4cf6c0",
+        "compiled special-token map bytes must equal the truth-pack pin"
+    );
+    let tokenizer = embedded.tokenizer();
     assert_eq!(
         tokenizer.piece_count(),
         SP_PIECE_COUNT,

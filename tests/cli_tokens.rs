@@ -243,3 +243,13 @@ fn invalid_embedded_tokenizer_bytes_are_rejected_without_a_fallback() {
     ));
     eprintln!("CLI_TOKENS PREWRITE=PASS boundary=embedded-parse-fail-closed");
 }
+
+#[test]
+fn invalid_embedded_added_token_registry_is_rejected_without_a_fallback() {
+    let error = EmbeddedTokenizer::from_bytes_with_added_tokens(test_model_bytes(), b"{")
+        .expect_err("malformed added-token bytes must not select another tokenizer");
+    assert!(matches!(
+        error,
+        franken_nlp::tokenizer::embedded::EmbeddedTokenizerError::AddedTokenRegistry(_)
+    ));
+}
