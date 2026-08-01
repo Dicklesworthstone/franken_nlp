@@ -9,9 +9,8 @@ use std::{
 use clap::{CommandFactory, Parser, Subcommand};
 use crate::{
     artifact::converter::{
-        plan_generic_payload, prepare_convert_request, stream_routed_bf16_panels, ConvertArch,
-        ConvertRequest, ConverterError, GenericPayloadPlan, PreparedConversionInput,
-        DEFAULT_PANEL_BYTES,
+        prepare_convert_request, stream_routed_bf16_panels, ConvertArch, ConvertRequest,
+        ConverterError, GenericPayloadPlan, PreparedConversionInput, DEFAULT_PANEL_BYTES,
     },
     artifact::format::{
         framed_sha256, logical_model_sha256, validate_authority_identifier, write_streaming,
@@ -105,10 +104,10 @@ struct ConvertCommand {
     /// until a complete staged streaming envelope is ready to publish.
     #[arg(short = 'o', long)]
     output: PathBuf,
-    /// Explicitly acknowledge conversion before any source closure is opened.
+    /// Bypass the interactive TTY y/N confirmation after source preflight.
     ///
-    /// The interactive confirmation surface is not implemented yet, so this
-    /// flag is currently required rather than silently ignored.
+    /// Robot and non-TTY invocations never prompt; their noninteractive policy
+    /// is recorded in the conversion stage transcript.
     #[arg(long)]
     yes: bool,
     /// Reject all otherwise-unrelated source-directory entries.
@@ -332,13 +331,13 @@ fn run_convert_command(
         request.source_manifest.display(),
     );
     match prepare_convert_request(&request, DEFAULT_PANEL_BYTES) {
-        Ok(prepared) => match plan_generic_payload(&prepared.census, &prepared.routes) {
+        Ok(prepared) => match prepared.generic_payload_plan() {
             Ok(generic) => {
                 eprintln!(
                     "CONVERT STAGE=census RESULT=END source-root-sha256={} census-sha256={} tensors={}",
-                    prepared.source.source_root_sha256,
-                    prepared.census_sha256,
-                    prepared.census.len(),
+                    prepared.source_root_sha256(),
+                    prepared.census_sha256(),
+                    prepared.tensor_count(),
                 );
                 emit_partial_convert_preflight(&prepared, &generic);
                 let confirmation = match confirm_convert(&request, input, stdin_is_terminal) {
@@ -368,7 +367,7 @@ fn emit_partial_convert_preflight(
 ) {
     eprintln!(
         "CONVERT PREFLIGHT RESULT=PARTIAL closure-bytes={} generic-payload-bytes={} generic-scales-bytes={} generic-row-sums-bytes={} reason=final-envelope-and-ratified-staging-capability-unavailable",
-        prepared.source.manifest.closure_total_bytes,
+        prepared.closure_total_bytes(),
         generic.payload_bytes,
         generic.scale_bytes,
         generic.row_sum_bytes,
@@ -426,7 +425,7 @@ fn run_streaming_convert(
     }
     eprintln!(
         "CONVERT STAGE=plan RESULT=START tensors={}",
-        prepared.census.len()
+        prepared.tensor_count()
     );
     let materialized = match read_materialized_sources(prepared) {
         Ok(value) => value,
@@ -449,7 +448,7 @@ fn run_streaming_convert(
         "CONVERT STAGE=emission RESULT=START staging={} destination={} tensors={}",
         staging_output.display(),
         request.output.display(),
-        prepared.census.len(),
+        prepared.tensor_count(),
     );
     let written = match write_streaming(&plan.input, &mut output, |section, sink| {
         emit_streaming_section(
@@ -522,9 +521,9 @@ fn emit_streaming_activation_blocked(
     eprintln!(
         "CONVERT RESULT=BLOCKED stage=activation destination={} source-root-sha256={} census-sha256={} tensors={} reason={error}; no-staging-output-created; no-final-output-created",
         destination.display(),
-        prepared.source.source_root_sha256,
-        prepared.census_sha256,
-        prepared.census.len(),
+        prepared.source_root_sha256(),
+        prepared.census_sha256(),
+        prepared.tensor_count(),
     );
     ErrorCode::AdmissionOrResourceLimit.as_process_exit()
 }
@@ -543,9 +542,9 @@ fn emit_unpublished_streaming_blocked(
         "CONVERT RESULT=BLOCKED stage=activation staging-artifact={} destination={} source-root-sha256={} census-sha256={} tensors={} fnlpq-file-sha256={} staging-bytes={} license-bundle-sha256={} reason=ratified-fs-tx-activation-reload-and-receipt-path-unavailable; no-final-output-created",
         staging_output.display(),
         destination.display(),
-        prepared.source.source_root_sha256,
-        prepared.census_sha256,
-        prepared.census.len(),
+        prepared.source_root_sha256(),
+        prepared.census_sha256(),
+        prepared.tensor_count(),
         hex_lower(&written.fnlpq_file_sha256),
         written.file_len,
         hex_lower(&written.license_bundle_sha256),
@@ -798,7 +797,7 @@ fn build_streaming_envelope_plan(
             model_id: "Nanbeige4.2-3B".to_owned(),
             revision: crate::artifact::converter::PINNED_REVISION.to_owned(),
             recipe_id: crate::artifact::converter::PINNED_CONVERSION_RECIPE.to_owned(),
-            source_root_sha256: prepared.source.source_root_sha256.clone(),
+            source_root_sha256: prepared.source_root_sha256().to_owned(),
             logical_model_sha256: hex_lower(&logical_model_sha256),
             sections,
             tensors: tensors.into_iter().map(|(tensor, _)| tensor).collect(),
@@ -869,15 +868,15 @@ fn first_pass_generic_identities(
     prepared: &PreparedConversionInput,
     generic: &GenericPayloadPlan,
 ) -> Result<(Vec<(TensorInput, [u8; 32])>, [u8; 32], [u8; 32], [u8; 32]), String> {
-    if prepared.census.len() != prepared.routes.len()
-        || prepared.census.len() != prepared.panels.len()
-        || prepared.census.len() != generic.tensors.len()
-    {
+    let (census, routes, panels) = prepared
+        .checked_plan_parts()
+        .map_err(|error| format!("validate prepared conversion plan: {error}"))?;
+    if census.len() != generic.tensors.len() {
         return Err(format!(
             "streaming plan count mismatch: census={} routes={} panels={} generic={}",
-            prepared.census.len(),
-            prepared.routes.len(),
-            prepared.panels.len(),
+            census.len(),
+            routes.len(),
+            panels.len(),
             generic.tensors.len(),
         ));
     }
@@ -889,10 +888,10 @@ fn first_pass_generic_identities(
         .map_err(|error| format!("start generic row-sums identity: {error}"))?;
     let mut tensors = Vec::with_capacity(generic.tensors.len());
 
-    for index in 0..prepared.census.len() {
-        let entry = &prepared.census[index];
-        let route = &prepared.routes[index];
-        let panel_plan = &prepared.panels[index];
+    for index in 0..census.len() {
+        let entry = &census[index];
+        let route = &routes[index];
+        let panel_plan = &panels[index];
         let layout = &generic.tensors[index];
         validate_generic_layout(entry, route, layout)?;
         let mut tensor = LogicalTensorFirstPass::new(entry, layout)?;
@@ -1087,18 +1086,22 @@ fn emit_generic_section(
     sink: &mut dyn Write,
     target: GenericSection,
 ) -> Result<(), FnlpqWriteError> {
-    if prepared.census.len() != prepared.routes.len()
-        || prepared.census.len() != prepared.panels.len()
-        || prepared.census.len() != generic.tensors.len()
-    {
+    let (census, routes, panels) = prepared.checked_plan_parts().map_err(|error| {
+        FnlpqWriteError::StoredIdentity {
+            section: section.name.clone(),
+            expected: "validated prepared conversion plan".to_owned(),
+            actual: error.to_string(),
+        }
+    })?;
+    if census.len() != generic.tensors.len() {
         return Err(FnlpqWriteError::StoredIdentity {
             section: section.name.clone(),
             expected: "prepared conversion arrays with equal lengths".to_owned(),
             actual: format!(
                 "census={} routes={} panels={} generic={}",
-                prepared.census.len(),
-                prepared.routes.len(),
-                prepared.panels.len(),
+                census.len(),
+                routes.len(),
+                panels.len(),
                 generic.tensors.len(),
             ),
         });
@@ -1116,10 +1119,10 @@ fn emit_generic_section(
         });
     }
     let mut observed_len = 0_u64;
-    for index in 0..prepared.census.len() {
-        let entry = &prepared.census[index];
-        let route = &prepared.routes[index];
-        let panel_plan = &prepared.panels[index];
+    for index in 0..census.len() {
+        let entry = &census[index];
+        let route = &routes[index];
+        let panel_plan = &panels[index];
         validate_generic_layout(entry, route, &generic.tensors[index]).map_err(|detail| {
             FnlpqWriteError::Tensor {
                 tensor: entry.name.clone(),
@@ -1169,13 +1172,13 @@ fn emit_generic_section(
             detail: error.to_string(),
         })?;
         let completed = index + 1;
-        if completed % EMISSION_PROGRESS_TENSOR_INTERVAL == 0 || completed == prepared.census.len()
+        if completed % EMISSION_PROGRESS_TENSOR_INTERVAL == 0 || completed == census.len()
         {
             eprintln!(
                 "CONVERT STAGE=emission section={} tensors={}/{}",
                 section.name,
                 completed,
-                prepared.census.len(),
+                census.len(),
             );
         }
     }

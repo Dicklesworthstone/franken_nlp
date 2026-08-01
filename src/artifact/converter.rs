@@ -770,18 +770,18 @@ pub fn validate_nanbeige42_census(
 /// rejected before any tensor is routed or decoded.
 pub struct PreparedConversionInput {
     /// Ten-file source closure evidence in manifest order.
-    pub source: VerifiedSourceClosure,
+    source: VerifiedSourceClosure,
     /// Checked source facts in canonical tensor-name order.
-    pub census: Vec<TensorCensusEntry>,
+    census: Vec<TensorCensusEntry>,
     /// One complete route for every census entry.
-    pub routes: Vec<TensorRoute>,
+    routes: Vec<TensorRoute>,
     /// One bounded row-panel plan for every source tensor.
-    pub panels: Vec<PanelPlan>,
+    panels: Vec<PanelPlan>,
     /// Checked total BF16 source payload across the complete census.  This is
     /// the fixed denominator for progress and ETA accounting.
-    pub logical_payload_bytes: u64,
+    logical_payload_bytes: u64,
     /// Domain-framed exact source census identity.
-    pub census_sha256: String,
+    census_sha256: String,
     /// Exact configuration/tokenizer/template bytes snapshotted and
     /// re-authenticated during preparation.
     materialized_sources: VerifiedMaterializedSources,
@@ -1059,6 +1059,94 @@ pub fn validate_pinned_logical_payload_bytes(
 }
 
 impl PreparedConversionInput {
+    /// Return the authenticated source-root identity retained by preparation.
+    pub(crate) fn source_root_sha256(&self) -> &str {
+        &self.source.source_root_sha256
+    }
+
+    /// Return the authenticated source-census identity retained by preparation.
+    pub(crate) fn census_sha256(&self) -> &str {
+        &self.census_sha256
+    }
+
+    /// Return the complete count of authenticated source tensors.
+    pub(crate) fn tensor_count(&self) -> usize {
+        self.census.len()
+    }
+
+    /// Return the closure size authenticated by the pinned manifest.
+    pub(crate) fn closure_total_bytes(&self) -> u64 {
+        self.source.manifest.closure_total_bytes
+    }
+
+    /// Recheck and expose the immutable conversion plan as read-only slices.
+    ///
+    /// The authority-bearing plan fields are private so callers cannot replace
+    /// one route, panel, census member, or digest after source preparation.
+    /// Internal consumers must enter through this accessor, which rejects
+    /// mismatched cardinality, noncanonical routes, duplicate route names, or
+    /// a panel bound to a different source tensor before any traversal starts.
+    pub(crate) fn checked_plan_parts(
+        &self,
+    ) -> Result<(&[TensorCensusEntry], &[TensorRoute], &[PanelPlan]), ConverterError> {
+        if self.census.len() != self.routes.len() || self.census.len() != self.panels.len() {
+            return Err(ConverterError::PipelinePlanCount {
+                census: self.census.len(),
+                routes: self.routes.len(),
+                panels: self.panels.len(),
+            });
+        }
+        let observed_payload_bytes = self.census.iter().try_fold(0_u64, |total, entry| {
+            total
+                .checked_add(entry.len)
+                .ok_or(ConverterError::Arithmetic {
+                    invariant: "prepared conversion plan logical payload bytes",
+                })
+        })?;
+        if observed_payload_bytes != self.logical_payload_bytes {
+            return Err(ConverterError::PipelinePlanAlignment {
+                tensor: "<prepared-census>".to_owned(),
+                detail: format!(
+                    "logical payload bytes differ: prepared={} observed={observed_payload_bytes}",
+                    self.logical_payload_bytes
+                ),
+            });
+        }
+
+        let mut internal_names = BTreeSet::new();
+        for ((entry, route), panel) in self.census.iter().zip(&self.routes).zip(&self.panels) {
+            if route != &remap_tensor_name(&entry.name)? {
+                return Err(ConverterError::PipelinePlanAlignment {
+                    tensor: entry.name.clone(),
+                    detail: "route differs from canonical mapping".to_owned(),
+                });
+            }
+            if !internal_names.insert(route.internal_name.clone()) {
+                return Err(ConverterError::PipelinePlanAlignment {
+                    tensor: entry.name.clone(),
+                    detail: format!("duplicate internal tensor name {}", route.internal_name),
+                });
+            }
+            if panel.tensor != entry.name {
+                return Err(ConverterError::PipelinePlanAlignment {
+                    tensor: entry.name.clone(),
+                    detail: format!(
+                        "panel is bound to source tensor {} instead of {}",
+                        panel.tensor, entry.name
+                    ),
+                });
+            }
+        }
+
+        Ok((&self.census, &self.routes, &self.panels))
+    }
+
+    /// Build the Generic payload layout from the retained, checked plan.
+    pub(crate) fn generic_payload_plan(&self) -> Result<GenericPayloadPlan, ConverterError> {
+        let (census, routes, _) = self.checked_plan_parts()?;
+        plan_generic_payload(census, routes)
+    }
+
     /// Read one bounded BF16 panel through the sealed safetensors session that
     /// was authenticated while preparing this conversion.
     ///
@@ -1090,16 +1178,15 @@ impl PreparedConversionInput {
         parser_metadata_bytes: u64,
         margin_bytes: u64,
     ) -> Result<ConversionPreflight, ConverterError> {
-        let largest_source_panel_bytes = self
-            .panels
+        let (_, _, panels) = self.checked_plan_parts()?;
+        let largest_source_panel_bytes = panels
             .iter()
             .map(|plan| plan.largest_source_panel_bytes)
             .max()
             .ok_or(ConverterError::Arithmetic {
                 invariant: "largest source panel with empty census",
             })?;
-        let largest_f32_panel_bytes = self
-            .panels
+        let largest_f32_panel_bytes = panels
             .iter()
             .map(|plan| plan.largest_f32_panel_bytes)
             .max()
@@ -1121,7 +1208,7 @@ impl PreparedConversionInput {
                     invariant: "preflight final disk bytes",
                 })?;
         Ok(ConversionPreflight {
-            closure_bytes_to_read: self.source.manifest.closure_total_bytes,
+            closure_bytes_to_read: self.closure_total_bytes(),
             staged_output_bytes,
             peak_rss,
             final_disk_bytes,
@@ -1631,10 +1718,11 @@ pub fn stream_prepared_bf16_panels<C>(
 where
     C: FnMut(&TensorCensusEntry, &TensorRoute, RowPanel, &[u8], &[f32]) -> Result<(), ConverterError>,
 {
+    let (census, routes, panels) = prepared.checked_plan_parts()?;
     stream_routed_bf16_panels(
-        &prepared.census,
-        &prepared.routes,
-        &prepared.panels,
+        census,
+        routes,
+        panels,
         |entry, panel| {
             prepared.read_verified_panel(&entry.name, panel)
         },
