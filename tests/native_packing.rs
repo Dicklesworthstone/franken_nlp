@@ -126,24 +126,37 @@ fn closed_cli_target_spellings_do_not_accept_envelope_aliases() {
 }
 
 fn generic_root(seed: u64) -> Vec<u8> {
-    let payload = pseudo_random_bytes(seed, 4);
+    let embed_payload = pseudo_random_bytes(seed, 4);
+    let layer_payload = pseudo_random_bytes(seed.wrapping_add(1), 4);
     // The checked reader validates every scale as finite and strictly
-    // positive.  Keep tensor payload/row-sum bytes synthetic while giving the
+    // positive. Keep tensor payload/row-sum bytes synthetic while giving each
     // one-group fixture a canonical valid f32 scale.
-    let scales = 0.5_f32.to_le_bytes().to_vec();
-    let row_sums = pseudo_random_bytes(seed.wrapping_add(2), 4);
-    let tensor_sha256 = logical_tensor_sha256(
+    let embed_scale = 0.5_f32.to_le_bytes();
+    let layer_scale = 0.25_f32.to_le_bytes();
+    let embed_row_sum = pseudo_random_bytes(seed.wrapping_add(2), 4);
+    let layer_row_sum = pseudo_random_bytes(seed.wrapping_add(3), 4);
+    let embed_tensor_sha256 = logical_tensor_sha256(
         "model.embed_tokens.weight",
         "bf16",
         &[2],
         "bf16-verbatim-v1",
-        &payload,
-        &scales,
-        &row_sums,
+        &embed_payload,
+        &embed_scale,
+        &embed_row_sum,
     )
-    .expect("synthetic logical tensor identity");
+    .expect("synthetic embedding logical tensor identity");
+    let layer_tensor_sha256 = logical_tensor_sha256(
+        "model.layers.0.mlp.down_proj.weight",
+        "bf16",
+        &[2],
+        "bf16-verbatim-v1",
+        &layer_payload,
+        &layer_scale,
+        &layer_row_sum,
+    )
+    .expect("synthetic layer logical tensor identity");
     let logical_model_sha256 = logical_model_sha256(
-        &[tensor_sha256],
+        &[embed_tensor_sha256, layer_tensor_sha256],
         &[
             ("model_config", br#"{"hidden_size":2}"#.as_slice()),
             ("tokenizer_model", &[0x50, 0x4b, 0x03, 0x04]),
@@ -152,6 +165,9 @@ fn generic_root(seed: u64) -> Vec<u8> {
         ],
     )
     .expect("synthetic logical model identity");
+    let payload = [embed_payload.as_slice(), layer_payload.as_slice()].concat();
+    let scales = [embed_scale.as_slice(), layer_scale.as_slice()].concat();
+    let row_sums = [embed_row_sum.as_slice(), layer_row_sum.as_slice()].concat();
     write(&FnlpqWriterInput {
         model_id: "FnlpqNativePackingFixture".to_owned(),
         revision: "f56ec5a9650268aa098496734743c25ea778bd2d".to_owned(),
@@ -208,16 +224,28 @@ fn generic_root(seed: u64) -> Vec<u8> {
                 16,
             ),
         ],
-        tensors: vec![TensorInput {
-            name: "model.embed_tokens.weight".to_owned(),
-            canonical_dtype: CanonicalDtype::Bf16,
-            shape: vec![2],
-            canonical_logical_sha256: hex(&tensor_sha256),
-            quantization: "bf16-verbatim-v1".to_owned(),
-            data: SectionRange::new("generic-payload", 0, 4),
-            scale: SectionRange::new("generic-scales", 0, 4),
-            row_sum: SectionRange::new("generic-row-sums", 0, 4),
-        }],
+        tensors: vec![
+            TensorInput {
+                name: "model.embed_tokens.weight".to_owned(),
+                canonical_dtype: CanonicalDtype::Bf16,
+                shape: vec![2],
+                canonical_logical_sha256: hex(&embed_tensor_sha256),
+                quantization: "bf16-verbatim-v1".to_owned(),
+                data: SectionRange::new("generic-payload", 0, 4),
+                scale: SectionRange::new("generic-scales", 0, 4),
+                row_sum: SectionRange::new("generic-row-sums", 0, 4),
+            },
+            TensorInput {
+                name: "model.layers.0.mlp.down_proj.weight".to_owned(),
+                canonical_dtype: CanonicalDtype::Bf16,
+                shape: vec![2],
+                canonical_logical_sha256: hex(&layer_tensor_sha256),
+                quantization: "bf16-verbatim-v1".to_owned(),
+                data: SectionRange::new("generic-payload", 4, 4),
+                scale: SectionRange::new("generic-scales", 4, 4),
+                row_sum: SectionRange::new("generic-row-sums", 4, 4),
+            },
+        ],
         packing_sets: vec![PackingSetInput {
             id: "generic".to_owned(),
             target: ArchTarget::Generic,
