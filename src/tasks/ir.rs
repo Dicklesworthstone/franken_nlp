@@ -698,7 +698,7 @@ impl From<IdentityError> for TaskIrError {
 impl TaskIrError {
     /// The task/recipe compile failure category at the public error boundary.
     #[must_use]
-    pub const fn into_fnlp_error(self) -> FnlpError {
+    pub fn into_fnlp_error(self) -> FnlpError {
         FnlpError::SchemaOrRecipeCompile {
             category: "task_ir_validation",
         }

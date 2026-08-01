@@ -170,7 +170,7 @@ impl BuiltInTask {
 
     /// Static registry dispatch, intentionally with no wildcard arm.
     #[must_use]
-    pub const fn spec(self) -> &'static TaskSpec {
+    pub fn spec(self) -> &'static TaskSpec {
         match self {
             Self::Extract => &EXTRACT_SPEC,
             Self::Ner => &NER_SPEC,
