@@ -56,6 +56,25 @@ asset inventory; and online plus network-denied verification of the exported
 signature/provenance bundle. Missing tooling or key material blocks release; it
 does not weaken the recipe or convert publisher authentication into checksums.
 
+GitHub release immutability is another prerequisite, not a substitute for that
+DSR provenance bundle. The repository API reported `enabled=false` and
+`enforced_by_owner=false` for immutable releases during the 2026-07-31 audit,
+so the first publication remains blocked until the owner enables the setting
+and the release recipe retains a fresh state query. The recipe creates a draft,
+uploads only the explicit receipted inventory, verifies the remote inventory,
+and publishes only after every other gate passes. Publication must make the tag
+and assets immutable and create GitHub's release attestation; the retained
+online checks are `gh release verify <tag>` plus one
+`gh release verify-asset <tag> <local-path>` invocation for every asset. This
+is GitHub's immutable-release attestation, not a GitHub Actions build
+attestation, and it does not authorize an Actions workflow.
+
+The canonical model part size, 1,957,046,720 bytes, is 190,436,928 bytes below
+GitHub's currently documented strict 2-GiB per-asset ceiling. The release job
+still rechecks the live limit and rejects every non-tail part whose length is
+not exact; a changed hosting policy blocks publication rather than silently
+changing the artifact recipe.
+
 The controller also retains a fresh coordination snapshot from the same
 checkpoint window:
 
