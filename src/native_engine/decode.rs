@@ -751,8 +751,9 @@ impl DecodeStepControl for NeverCancelled {
 mod tests {
     use super::{
         DecodeError, DecodeFinishReason, DecodeParams, DecodeStopPolicy, empty_output,
-        finish_reason_after_commit, validate_context_budget,
+        finish_reason_after_commit, full_vocabulary_logprob, validate_context_budget,
     };
+    use serde_json::json;
 
     #[test]
     fn budget_allows_the_first_token_without_an_extra_kv_append() {
@@ -773,18 +774,31 @@ mod tests {
         let mut params = DecodeParams::hf_bf16_greedy(7, 2);
         params.stop = DecodeStopPolicy {
             eos_token_ids: vec![9],
-            stop_sequences: vec!["\u{2026}".as_bytes().to_vec()],
+            stop_sequences: vec![vec![0xe2, 0x80, 0xa6]],
             min_new_tokens: 2,
         };
         let mut output = empty_output(&params, "hf-bf16-eager");
         output.emitted_token_ids.push(9);
-        output.decoded_bytes = "\u{2026}".as_bytes().to_vec();
+        output.decoded_bytes = vec![0xe2, 0x80];
         assert_eq!(finish_reason_after_commit(&output, &params, 9), None);
 
         output.emitted_token_ids.push(10);
+        output.decoded_bytes.push(0xa6);
         assert_eq!(
             finish_reason_after_commit(&output, &params, 10),
             Some(DecodeFinishReason::StopSequence)
+        );
+    }
+
+    #[test]
+    fn eos_has_priority_over_the_same_step_output_budget() {
+        let mut params = DecodeParams::hf_bf16_greedy(7, 1);
+        params.stop.eos_token_ids.push(9);
+        let mut output = empty_output(&params, "hf-bf16-eager");
+        output.emitted_token_ids.push(9);
+        assert_eq!(
+            finish_reason_after_commit(&output, &params, 9),
+            Some(DecodeFinishReason::Eos)
         );
     }
 
@@ -808,5 +822,49 @@ mod tests {
             params.validate_for_eager_greedy(),
             Err(DecodeError::EmptyStopSequence)
         );
+    }
+
+    #[test]
+    fn frozen_request_and_output_wire_shapes_remain_reviewable() {
+        let params = DecodeParams::hf_bf16_greedy(41, 2);
+        assert_eq!(
+            serde_json::to_value(&params).expect("serialize frozen decode params"),
+            json!({
+                "schema_version": 1,
+                "request_seq": 41,
+                "max_new_tokens": 2,
+                "stop": {
+                    "eos_token_ids": [],
+                    "stop_sequences": [],
+                    "min_new_tokens": 0,
+                },
+                "sampling": {"kind": "greedy"},
+                "thinking": null,
+                "capture_logprobs": false,
+                "numerics_profile": "hf_bf16_eager",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(empty_output(&params, "hf-bf16-eager"))
+                .expect("serialize frozen decode output"),
+            json!({
+                "schema_version": 1,
+                "request_seq": 41,
+                "numerics_profile": "hf-bf16-eager",
+                "emitted_token_ids": [],
+                "decoded_bytes": [],
+                "finish_reason": "budget",
+                "token_logprobs": null,
+                "logprob_score_space": null,
+                "cancellation": null,
+            })
+        );
+    }
+
+    #[test]
+    fn full_vocabulary_logprob_is_named_and_finite() {
+        let observed = full_vocabulary_logprob(&[0.0, 0.0], 0)
+            .expect("finite logits must have a full-vocabulary logprob");
+        assert!((observed + std::f32::consts::LN_2).abs() < 1.0e-6);
     }
 }
