@@ -1,32 +1,41 @@
 # ADR-0031: FNLPQ v1 envelope authority and hostile-input review
 
-- Status: ratified design contract; code-first, batch-test pending
+- Status: **AUTHORITY CONFLICT / REOPENED** — retained as a JSON-only design
+  candidate, not implementation authority. It conflicts with the 80-byte-per-entry
+  and 256-byte-per-entry binary-directory records. `franken_nlp-g6f` may compare
+  and regenerate evidence; only the owner ratifies the chosen authority.
+- Historical status claim (challenged): ratified design contract; code-first,
+  batch-test pending
 - Decision id: OQ-31
 - Date: 2026-07-31
 - Scope: the `.fnlpq` container for Nanbeige4.2-3B at
   `f56ec5a9650268aa098496734743c25ea778bd2d`
 - Implements: [FNLPQ envelope v1](../formats/fnlpq-envelope-v1.md)
 
-## Review method and evidence
+All decisions and fixture hashes below are historical evidence for this
+candidate; none is a current writer/reader or acceptance authority.
+
+## Historical candidate review method and evidence
 
 This is an independent format review. It derives its decisions from the OQ-31
 bead's stated container contract and hostile-input requirements, not from a
 writer, reader, packer, or pull implementation. The review deliberately
 assumes an attacker can control every byte of a purported artifact.
 
-The successor fixtures are part of this decision. Their committed SHA-256
-values are recorded below after their exact bytes are finalized:
+Mutable working-tree paths cannot identify this historical candidate. Its
+recoverable snapshot is commit `c161e496010206643297eb2f6f21c991ebbb7b1c`:
 
-| Artifact | SHA-256 | Purpose |
+| Artifact at `c161e496…` | Git blob | Recomputed raw SHA-256 |
 | --- | --- | --- |
-| `tests/fixtures/fnlpq/field_inventory.json` | `85b6d69f0c6cd546d12fec51090a77781c9d1b02787281db9bd17b4ba42a5e69` | Golden prelude/header inventory for the writer and reader. |
-| `tests/fixtures/fnlpq/hostile_cases.json` | `8f3d695c40bee52f5bdb8ed17ce021f55f3ccb4178626258b496660fd4696520` | Stable hostile-input corpus checklist for the reader. |
+| `docs/formats/fnlpq-envelope-v1.md` | `4b81a3790a9a3361324b48c231282e0e1d8dd3a2` | `7634912db82732d827f5bc0c1f918d2245bedf7d945856e62222704365d55857` |
+| `tests/fixtures/fnlpq/field_inventory.json` | `75e643b2b88716141c989cbe289e2dad5d181f1c` | `098bb4421b4e0ec35e5c148e3ecacb0e3a36d2b0be7f3d4455d622fb379c0d58` |
+| `tests/fixtures/fnlpq/hostile_cases.json` | `154788dea44ccbbbccfe5e90e5baf3fb0262e0b2` | `c62a38d93b7d896718c79599d41801043fd841fa3860ab36730494df97e2a81f` |
 
-The batch verifier must recompute these values from the committed fixtures
-before it cites this ADR as green evidence. A mismatch is a format-fixture
-change and requires review rather than a silent digest edit.
+The earlier table's fixture hashes were not reproducible from any committed
+version in this repository and are withdrawn rather than silently refreshed.
+The immutable blobs preserve the proposal only; they cannot make this ADR green.
 
-## Decision 1: canonical header is the sole range directory
+## Historical candidate decision 1: canonical header is the sole range directory
 
 The 80-byte prelude and the canonical, ASCII JSON header are the sole
 authority for the file's declared structure and section ranges. The header's
@@ -48,7 +57,7 @@ Killed alternative: JSON sections containing base64 payloads. It was rejected
 because it duplicates bytes, blurs size accounting, accepts many spellings of
 the same data, and weakens pre-allocation limits.
 
-## Decision 2: six non-interchangeable identities
+## Historical candidate decision 2: six non-interchangeable identities
 
 The following names are normative and all use the exact domain-framed
 algorithms in the envelope specification. `semantic_digest` is retired and
@@ -74,7 +83,7 @@ because source provenance, logical semantics, host-specific representation,
 legal material, a container byte stream, and a release manifest have different
 mutation and verification scopes.
 
-## Decision 3: canonical JSON and duplicate rejection are parse-time security
+## Historical candidate decision 3: canonical JSON and duplicate rejection
 
 Header JSON is restricted to the pinned canonical ASCII profile. Object keys
 are unique and byte-sorted; integers are finite, unsigned, base-10 values;
@@ -96,7 +105,7 @@ Killed alternative: accepting equivalent JSON spellings and normalizing them.
 It was rejected because header hash/replay identity would become parser-defined
 rather than byte-defined.
 
-## Decision 4: packing sets make multiplicity and architecture explicit
+## Historical candidate decision 4: packing sets make multiplicity and architecture explicit
 
 A packing set can contain multiple physical representations only when every
 representation is listed with its target, recipe id, section name, and exact
@@ -118,7 +127,7 @@ Killed alternative: arch-mismatch fallback to any available representation.
 It was rejected because it makes performance, memory, and numerics claims
 depend on undeclared host behavior.
 
-## Decision 5: pre-allocation bounds and canonical physical layout
+## Historical candidate decision 5: pre-allocation bounds and canonical physical layout
 
 The reader validates magic, version, required flags, exact regular-file length,
 and all fixed prelude fields before allocating a header, a section list, a
@@ -143,7 +152,7 @@ Killed alternative: permit arbitrary ignored gaps and trailing bytes. It was
 rejected because an unsigned opaque region makes file identity and forensic
 inspection ambiguous.
 
-## Resolution checklist
+## Historical candidate resolution checklist (withdrawn)
 
 | OQ-31 clause | Resolution | Named killed alternative |
 | --- | --- | --- |
@@ -153,9 +162,10 @@ inspection ambiguous.
 | Packing multiplicity | Explicit targets, representations, and duplicate byte costs; hard mismatch error. | Opaque best packing; silent fallback. |
 | Malformed limits | Prelude-first checked caps and canonical zero-padded layout. | Pre-allocation parsing; ignored gaps/trailing bytes. |
 
-## Registry disposition
+## Historical registry disposition (withdrawn)
 
-`OQ-31` changes from `OPEN` to `RESOLVED` for the frozen v1 envelope contract
-defined here. It is not an implementation or release-certification result:
-writer/reader/puller successors remain blocked on their own named fixtures,
-hostile cases, and batch verification evidence.
+This candidate previously asserted that `OQ-31` changed from `OPEN` to
+`RESOLVED`. That assertion is withdrawn. OQ-31 is `AUTHORITY CONFLICT /
+REOPENED`; writer/reader/converter/package/pull acceptance remains frozen until
+the owner ratifies one candidate, `franken_nlp-g6f` records/regenerates that
+choice, and the others become historical records.

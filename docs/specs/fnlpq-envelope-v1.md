@@ -1,11 +1,18 @@
-# FNLPQ envelope v1
+# Historical candidate: FNLPQ envelope v1 (80-byte-per-entry directory)
 
-Status: frozen OQ-31 input for the `franken_nlp-rsk` writer and
-`franken_nlp-vk7` reader beads.  Any semantic change requires an owner-approved
-plan-revision event; an implementation must not silently reinterpret this
-document.
+> **AUTHORITY CONFLICT — DO NOT IMPLEMENT OR ACCEPT AGAINST THIS RECORD.**
+> `franken_nlp-g6f` is reopened because this 80-byte-per-entry-directory contract conflicts
+> with both `docs/fnlpq-envelope-v1.md` (256-byte-per-entry binary table) and
+> `docs/formats/fnlpq-envelope-v1.md` (JSON-only ranges). Until one owner-ratified
+> contract is selected and the other two are explicitly marked historical, all
+> three are non-authoritative design candidates and writer/reader/package/pull
+> acceptance is blocked.
 
-## Scope and authority
+Historical status claim (challenged): frozen OQ-31 input for the
+`franken_nlp-rsk` writer and `franken_nlp-vk7` reader beads. The required
+owner-approved reconciliation has not occurred.
+
+## Historical candidate: scope and authority
 
 This format carries one Nanbeige4.2-3B artifact.  It is deliberately a small,
 strict binary envelope: the prelude and binary section directory are the sole
@@ -17,7 +24,7 @@ The only supported v1 file is a regular file.  The reader must reject a
 symlink, device, directory, or file whose observed length differs from the
 prelude's `file_len`.
 
-## Byte layout
+## Historical candidate: byte layout
 
 All fixed-width integers are unsigned little-endian.  The file is exactly:
 
@@ -92,7 +99,7 @@ to the first section and between adjacent sections must be the minimum bytes
 needed to satisfy the following section's declared alignment and must contain
 only zero bytes.  There is no arbitrary prefix, payload, or trailing padding.
 
-## Canonical header JSON
+## Historical candidate: canonical header JSON
 
 The header is UTF-8 without a BOM and is the exact byte sequence covered by
 `header_sha256`.  It is canonical only when all of the following hold:
@@ -141,7 +148,7 @@ tensor sections.  A native set may bind one or more
 `NATIVE_PACKING_PAYLOAD` entries.  A packing set is capped at 16
 representations, and the artifact is capped at 16 packing sets.
 
-## Digest domains
+## Historical candidate: digest domains
 
 All named identities use this domain framing:
 
@@ -168,7 +175,7 @@ change only `packing_set_sha256`, `fnlpq_file_sha256`, and the release identity;
 it must not change `logical_model_sha256`.  A notice-only correction may change
 only `license_bundle_sha256`, `fnlpq_file_sha256`, and the release identity.
 
-## Reader order and hard limits
+## Historical candidate: reader order and hard limits
 
 Before any variable-sized allocation, the reader reads only the fixed prelude,
 validates magic/version/flags, obtains the actual regular-file length, compares
@@ -200,7 +207,7 @@ section-gap calculations use checked arithmetic.  The reader reports the exact
 field, section name/ordinal, or byte range that failed; a generic
 "invalid fnlpq" error is insufficient.
 
-## Packing and dispatch rule
+## Historical candidate: packing and dispatch rule
 
 A `PackingSet` is an explicit inventory, not a promise that a host can consume
 an arbitrary representation.  Every retained representation pays its own
@@ -212,7 +219,7 @@ qualified native packing.  The generic representation remains the universal
 declared fallback only when it is installed and is an approved route for the
 requested operation.
 
-## Successor fixtures
+## Historical candidate: successor fixtures
 
 `tests/fixtures/fnlpq/field_inventory.json` is the writer's golden field
 inventory.  `tests/fixtures/fnlpq/hostile_cases.json` is the reader's required

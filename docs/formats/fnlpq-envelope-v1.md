@@ -1,10 +1,17 @@
-# FNLPQ envelope v1
+# Historical candidate: FNLPQ envelope v1 (JSON-only ranges)
 
-Status: frozen by ADR-0031 for writer/reader implementation. Any semantic
-change requires a new format-version decision, updated golden fixtures, and a
-plan-revision event; it is not a compatibility shim.
+> **AUTHORITY CONFLICT — DO NOT IMPLEMENT OR ACCEPT AGAINST THIS RECORD.**
+> `franken_nlp-g6f` is reopened because this JSON-only range contract conflicts
+> with both `docs/specs/fnlpq-envelope-v1.md` (80-byte-per-entry binary directory) and
+> `docs/fnlpq-envelope-v1.md` (256-byte-per-entry binary table). Until one owner-ratified
+> contract is selected and the other two are explicitly marked historical, all
+> three are non-authoritative design candidates and writer/reader/package/pull
+> acceptance is blocked.
 
-## 1. Physical file layout
+Historical status claim (challenged): frozen by ADR-0031 for writer/reader
+implementation. A new format decision and regenerated fixtures are now required.
+
+## Historical candidate 1: physical file layout
 
 An FNLPQ v1 file is exactly:
 
@@ -34,7 +41,7 @@ is allocated. The implementation rejects a non-regular file, a physical length
 different from `file_len`, or a `file_len` over the v1 total-file cap before
 parsing the header.
 
-## 2. Canonical header profile
+## Historical candidate 2: canonical header profile
 
 The header is UTF-8 but constrained to printable ASCII bytes `0x20..=0x7e`.
 It has no BOM and no whitespace outside strings. It is an object encoded with:
@@ -88,7 +95,7 @@ capped at `2^48` elements and `logical_bytes` must equal twice that product.
 The header's tensor descriptors identify the source logical tensor set; they do
 not embed those tensor bytes.
 
-## 3. Section table and canonical ranges
+## Historical candidate 3: section table and canonical ranges
 
 `sections` is the only section table. A section object has exactly these
 lexicographically ordered keys:
@@ -128,7 +135,7 @@ bytes; `tokenizer_model` carries exact tokenizer bytes. `license_text`,
 `attribution`, and `modification_notice` carry the legal bundle's exact bytes.
 No section is compressed or base64-encoded in v1.
 
-## 4. Digest domains
+## Historical candidate 4: digest domains
 
 All records use unsigned lengths encoded as `u64` little-endian and byte
 strings prefixed by their length. The ASCII domain marker ends in one `0x00`.
@@ -149,7 +156,7 @@ The header's `digests` object contains exactly these six names. A native
 repacking must preserve `logical_model_sha256`; a legal-notice-only correction
 must preserve both `logical_model_sha256` and every packing-set digest.
 
-## 5. Packing-set contract
+## Historical candidate 5: packing-set contract
 
 Each packing set has exactly `id`, `recipe`, `representations`, `stored_bytes`,
 and `target`. `id`, `recipe`, and `target` use the ASCII identifier grammar.
@@ -163,7 +170,7 @@ with the active target. If one does not exist, it returns
 `RequiredDerivation { tensor, requested_target, available_targets }`; a generic
 or other-architecture representation is never an implicit fallback.
 
-## 6. Reader rejection order and diagnostics
+## Historical candidate 6: reader rejection order and diagnostics
 
 The reader must reject in this order where applicable:
 

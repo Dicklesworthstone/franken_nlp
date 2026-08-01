@@ -1,14 +1,23 @@
-# FNLPQ Envelope v1
+# Historical candidate: FNLPQ Envelope v1 (256-byte-per-entry table)
 
-Status: frozen by OQ-31 for the writer and reader beads. A change to this
-document is a plan-revision event and requires a renewed independent review.
+> **AUTHORITY CONFLICT — DO NOT IMPLEMENT OR ACCEPT AGAINST THIS RECORD.**
+> `franken_nlp-g6f` is reopened because this 256-byte-per-entry-table contract conflicts
+> with both `docs/specs/fnlpq-envelope-v1.md` (80-byte-per-entry directory) and
+> `docs/formats/fnlpq-envelope-v1.md` (JSON-only ranges). Until one owner-ratified
+> contract is selected and the other two are explicitly marked historical, all
+> three are non-authoritative design candidates and writer/reader/package/pull
+> acceptance is blocked.
+
+Historical status claim (challenged): frozen by OQ-31 for the writer and reader
+beads. A change to this document was described as a plan-revision event requiring
+a renewed independent review; that review is now required.
 
 This is the container for Nanbeige4.2-3B at source revision
 `f56ec5a9650268aa098496734743c25ea778bd2d`. It describes 201 logical tensors,
 the exact materialized tokenizer/config/template inputs, and the legal bundle.
 It does not make a claim about parity or a converter result.
 
-## Layout and authority
+## Historical candidate: layout and authority
 
 The file is, in order:
 
@@ -32,7 +41,7 @@ digest is deliberately external to the file (in the converter receipt and
 release manifest) because including a digest of the whole file in the file
 would be self-referential.
 
-## Fixed prelude
+## Historical candidate: fixed prelude
 
 `PRELUDE_LEN` is exactly 80 bytes. Every reserved byte described below must be
 zero; this rule permits a reader to reject a file that only resembles v1.
@@ -61,7 +70,7 @@ must be within `file_len`. The parser has a hard total mapped-byte cap equal to
 `MAX_FILE_LEN`; an implementation may map less, but may never map or allocate
 from an unvalidated declared range.
 
-## Binary section table
+## Historical candidate: binary section table
 
 `SECTION_ENTRY_LEN` is exactly 256 bytes. The table follows the header without
 padding and is itself authenticated by `section_table_sha256` in the header.
@@ -107,7 +116,7 @@ each dimension is at most `4,294,967,295`, and their checked byte product is at
 most `17,179,869,184`. This permits the 8,339,601,408-byte bf16 logical
 payload while bounding hostile shape claims.
 
-## Canonical header JSON
+## Historical candidate: canonical header JSON
 
 The header is UTF-8 and is accepted only when it is already its canonical
 serialization. Its grammar permits objects, arrays, booleans, `null`, unsigned
@@ -143,7 +152,7 @@ The top-level object has exactly these fields:
 The header does not contain `fnlpq_file_sha256` or `release_manifest_sha256`.
 Those identities are recorded by their enclosing receipt or release manifest.
 
-## Digest domains
+## Historical candidate: digest domains
 
 Every digest is SHA-256 of a domain tag terminated by `00`, followed by framed
 records. Every variable-length field is framed by its unsigned little-endian
@@ -167,7 +176,7 @@ notice-only correction changes `license_bundle_sha256`, `fnlpq_file_sha256`,
 and `release_manifest_sha256`, but not source-root, logical-model, or packing
 identities.
 
-## Packing sets and dispatch
+## Historical candidate: packing sets and dispatch
 
 A `PackingSet` can contain multiple representations only when its
 `explicit_byte_total` equals the checked sum of its referenced table payload
@@ -178,7 +187,7 @@ An architecture mismatch is a hard `FNLPQ_ARCH_MISMATCH` error that names the
 missing required derivation; it never silently uses a generic or wrong-ISA
 fallback.
 
-## Required validation order
+## Historical candidate: required validation order
 
 1. Open a non-symlink regular file and obtain its actual length.
 2. Validate all fixed prelude fields and fixed caps before allocation.
