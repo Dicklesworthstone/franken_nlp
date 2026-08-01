@@ -385,6 +385,12 @@ pub enum ForcedDisableReason {
     MicroPrefillNotVerified,
 }
 
+impl ForcedDisableReason {
+    fn requires_full_projection(&self) -> bool {
+        matches!(self, Self::ProjectionTelemetryRequested)
+    }
+}
+
 /// Errors in the witness request itself, before any forced optimization.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ForcedWitnessError {
@@ -542,6 +548,37 @@ impl ForcedRun {
         &self.witnesses
     }
 
+    /// Sequentially visit forced token ids with mandatory cancellation
+    /// checkpoints.  The visitor is where the caller performs the ordinary
+    /// one-token transformer/KV update; this helper never treats a forced id
+    /// as permission to skip model work.
+    pub fn visit_sequentially<F, C>(
+        &self,
+        checkpoint_interval_tokens: usize,
+        mut checkpoint: C,
+        mut visit_token: F,
+    ) -> Result<(), ForcedRunVisitError>
+    where
+        F: FnMut(u32),
+        C: FnMut(ForcedRunProgress) -> bool,
+    {
+        if checkpoint_interval_tokens == 0 {
+            return Err(ForcedRunVisitError::InvalidCheckpointInterval);
+        }
+        for (next_token_index, &token_id) in self.tokens.iter().enumerate() {
+            if next_token_index % checkpoint_interval_tokens == 0
+                && !checkpoint(ForcedRunProgress {
+                    next_token_index,
+                    total_token_count: self.tokens.len(),
+                })
+            {
+                return Err(ForcedRunVisitError::CancelledBeforeToken { next_token_index });
+            }
+            visit_token(token_id);
+        }
+        Ok(())
+    }
+
     fn strategy(&self) -> (ForcedFeedStrategy, Option<ForcedDisableReason>) {
         match &self.requested_micro_prefill {
             Some(evidence) if self.tokens.len() > 1 => (
@@ -558,6 +595,38 @@ impl ForcedRun {
         }
     }
 }
+
+/// Source-free progress provided to a forced-run cancellation checkpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ForcedRunProgress {
+    /// Index of the next token whose 44-layer/KV update has not started.
+    pub next_token_index: usize,
+    /// Total bounded token count in this exact run.
+    pub total_token_count: usize,
+}
+
+/// Forced-run traversal refuses partial successful execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ForcedRunVisitError {
+    InvalidCheckpointInterval,
+    CancelledBeforeToken { next_token_index: usize },
+}
+
+impl fmt::Display for ForcedRunVisitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidCheckpointInterval => {
+                f.write_str("forced-run checkpoint interval must be nonzero")
+            }
+            Self::CancelledBeforeToken { next_token_index } => write!(
+                f,
+                "forced run cancelled before token index {next_token_index}; no partial success was returned"
+            ),
+        }
+    }
+}
+
+impl Error for ForcedRunVisitError {}
 
 /// The source-product state supplied by the separately gated grounding path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -992,14 +1061,18 @@ impl ExecutionCompiler {
         fallback_reason: Option<ForcedDisableReason>,
     ) -> CompiledExecutionState {
         let legal_row_count = legal_tokens.legal_ids().count();
-        let primitive = if self.sparse_threshold.selects_sparse(legal_row_count) {
-            ExecutionPrimitive::ProjectLegal(ProjectLegal::from_mask(&legal_tokens))
-        } else {
-            ExecutionPrimitive::FullProjection(FullProjection::new(
-                legal_tokens,
-                self.collect_full_projection_audit,
-            ))
-        };
+        let requires_full_projection = fallback_reason
+            .as_ref()
+            .is_some_and(ForcedDisableReason::requires_full_projection);
+        let primitive =
+            if !requires_full_projection && self.sparse_threshold.selects_sparse(legal_row_count) {
+                ExecutionPrimitive::ProjectLegal(ProjectLegal::from_mask(&legal_tokens))
+            } else {
+                ExecutionPrimitive::FullProjection(FullProjection::new(
+                    legal_tokens,
+                    self.collect_full_projection_audit,
+                ))
+            };
         self.compiled(
             state_id,
             legal_row_count,

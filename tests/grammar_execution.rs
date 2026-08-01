@@ -5,9 +5,9 @@ use franken_nlp::grammar::{
     execution::{
         AdditionalProcessor, DiagnosticValue, EosTransition, ExecutionCompileError,
         ExecutionCompiler, ExecutionPrimitive, ForcedDisableReason, ForcedPath, ForcedRun,
-        ForcedTokenWitness, ForcedWitnessOutcome, ForcedWitnessRequest, FullProjection,
-        KvPointEqualityEvidence, PayloadTokenAlphabet, ProductExecutionState, ProjectLegal,
-        ProjectionTelemetry, SourceProductState, SparseProjectionThreshold,
+        ForcedRunVisitError, ForcedTokenWitness, ForcedWitnessOutcome, ForcedWitnessRequest,
+        FullProjection, KvPointEqualityEvidence, PayloadTokenAlphabet, ProductExecutionState,
+        ProjectLegal, ProjectionTelemetry, SourceProductState, SparseProjectionThreshold,
     },
     mask::DenseTokenMask,
 };
@@ -245,6 +245,18 @@ fn forced_witness_requires_every_processor_and_disables_on_any_unknown_semantics
             ForcedDisableReason::ProjectionTelemetryRequested
         ))
     ));
+    let telemetry_projection = compiler()
+        .compile_state(ProductExecutionState {
+            forced_path: Some(ForcedPath::Disabled(
+                ForcedDisableReason::ProjectionTelemetryRequested,
+            )),
+            ..state(10, &[3])
+        })
+        .expect("requested logprobs retain a projection path");
+    assert!(matches!(
+        telemetry_projection.primitive(),
+        ExecutionPrimitive::FullProjection(_)
+    ));
 
     let mut unsupported = witness_request(
         mask(&[3]),
@@ -366,6 +378,42 @@ fn forced_runs_default_to_sequential_and_micro_prefill_keeps_its_receipt() {
         )),
         other => panic!("expected FeedForced, got {other:?}"),
     }
+}
+
+#[test]
+fn sequential_forced_runs_checkpoint_before_long_run_tokens_and_never_report_partial_success() {
+    let witness = unique_witness(3);
+    let run = ForcedRun::new(
+        vec![3, 3, 3, 3, 3],
+        vec![
+            witness.clone(),
+            witness.clone(),
+            witness.clone(),
+            witness.clone(),
+            witness,
+        ],
+        None,
+    )
+    .expect("every exact token has a matching witness");
+    let mut fed = Vec::new();
+    let cancelled = run
+        .visit_sequentially(
+            2,
+            |progress| progress.next_token_index < 4,
+            |token_id| fed.push(token_id),
+        )
+        .expect_err("checkpoint cancellation must refuse partial success");
+    assert_eq!(fed, vec![3, 3, 3, 3]);
+    assert_eq!(
+        cancelled,
+        ForcedRunVisitError::CancelledBeforeToken {
+            next_token_index: 4
+        }
+    );
+    assert!(matches!(
+        run.visit_sequentially(0, |_| true, |_| {}),
+        Err(ForcedRunVisitError::InvalidCheckpointInterval)
+    ));
 }
 
 #[test]
