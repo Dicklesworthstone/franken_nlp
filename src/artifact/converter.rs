@@ -469,12 +469,28 @@ fn verify_source_member(
     expected: &SourceFileSpec,
 ) -> Result<VerifiedSourceFile, ConverterError> {
     let path = source_dir.join(&expected.name);
-    let metadata = fs::symlink_metadata(&path).map_err(|error| ConverterError::SourceMissing {
+    let link_metadata = fs::symlink_metadata(&path).map_err(|error| ConverterError::SourceMissing {
         path: path.clone(),
         expected: expected.name.clone(),
         detail: error.to_string(),
     })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
+        return Err(ConverterError::SourceNotRegular {
+            path,
+            expected: expected.name.clone(),
+        });
+    }
+    let mut file = File::open(&path).map_err(|error| ConverterError::Io {
+        path: path.clone(),
+        operation: "open source member",
+        detail: error.to_string(),
+    })?;
+    let metadata = file.metadata().map_err(|error| ConverterError::Io {
+        path: path.clone(),
+        operation: "inspect opened source member",
+        detail: error.to_string(),
+    })?;
+    if !metadata.is_file() {
         return Err(ConverterError::SourceNotRegular {
             path,
             expected: expected.name.clone(),
@@ -488,11 +504,6 @@ fn verify_source_member(
             next_command: "restore the pinned source closure and rerun fnlp convert".to_owned(),
         });
     }
-    let mut file = File::open(&path).map_err(|error| ConverterError::Io {
-        path: path.clone(),
-        operation: "open source member",
-        detail: error.to_string(),
-    })?;
     let actual = stream_sha256(&mut file, &path)?;
     if actual != expected.sha256 {
         return Err(ConverterError::SourceDigest {
