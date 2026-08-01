@@ -296,3 +296,32 @@ fn parent_append_after_fork_cows_the_sealed_page_before_writing() {
     );
     assert_pool_ledger_reconciles(parent_only);
 }
+
+#[test]
+fn fork_sealed_page_refuses_direct_append_until_cow_is_prepared() {
+    let mut parent = KvSlabCache::try_with_capacity(16, KV_SLABS_PER_LOGICAL_PAGE * 2)
+        .expect("the pool has room for one sealed page and one COW page");
+    append_prepared_position(&mut parent, 0, 12);
+    let fork = parent
+        .try_fork()
+        .expect("forking seals the completed page before either branch can write it");
+
+    let before = parent.pool_stats();
+    let key = [7_u16; 1_024];
+    let value = [8_u16; 1_024];
+    assert_eq!(
+        parent.append(0, 1, &key, &value),
+        Err(KvSlabError::PositionNotPrepared {
+            expected: 1,
+            received: 1,
+        })
+    );
+    let after = parent.pool_stats();
+    assert_eq!(after, before);
+    assert_pool_ledger_reconciles(after);
+
+    let mut fork_key = [0_u16; 1_024];
+    fork.copy_key_at(0, 0, &mut fork_key)
+        .expect("failed direct parent write cannot alter the fork's sealed prefix");
+    assert_eq!(fork_key, [12; 1_024]);
+}
