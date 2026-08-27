@@ -536,6 +536,84 @@ fn confirm_convert(
         Err("tty-confirmation-declined".to_owned())
     }
 }
+/// Best-effort RAII cleanup for one hidden, non-replacing conversion staging file.
+///
+/// A successful [`publish_explicit_conversion_stage`] promotes the staging file
+/// to a read-only forensic sibling by hard-linking it to the final destination.
+/// Once promoted, the file MUST be retained: a dropped guard on a promoted
+/// file is a no-op so the forensic copy survives every normal exit path.
+///
+/// On any earlier failure, the guard unlinks the staging file even if the
+/// publish step made it read-only. This closes the bug class where every
+/// refusal path between [`create_conversion_stage`] and a successful
+/// publish left an orphan `.{name}.fnlpq-stage.*` (or
+/// `.{name}.receipt-stage.*`) behind, silently filling the cache directory
+/// on repeated failed conversions.
+struct ConversionStagingGuard {
+    path: Option<PathBuf>,
+}
+
+impl ConversionStagingGuard {
+    /// Wraps a freshly created staging path. The guard is armed and will
+    /// unlink the file on drop unless [`Self::take`] or [`Self::defuse`]
+    /// is called first.
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    /// The wrapped staging path, without disarming the guard.
+    #[must_use]
+    fn path(&self) -> &Path {
+        self.path
+            .as_deref()
+            .expect("conversion staging guard polled after take or drop")
+    }
+
+    /// Consume the guard and return the wrapped path. The caller takes
+    /// ownership of the file; the guard's drop is a no-op. Use this after
+    /// a successful publish so the forensic copy survives.
+    fn take(mut self) -> PathBuf {
+        self.path
+            .take()
+            .expect("conversion staging guard take after drop")
+    }
+
+    /// Disarm the guard without returning the path. Useful when the caller
+    /// no longer needs the path value but still wants the drop to be a no-op.
+    fn defuse(mut self) {
+        self.path = None;
+    }
+
+    /// Best-effort RAII cleanup helper. Unlinks the staging file unless
+    /// [`Self::take`] or [`Self::defuse`] has already disarmed the guard.
+    /// When the publish step has made the file read-only, the read-only
+    /// flag is cleared first so the unlink can succeed; if clearing or
+    /// unlinking fails the error is swallowed because Drop has no
+    /// recoverable failure path.
+    fn unlink_staging(&self, path: &Path) {
+        if let Ok(metadata) = std::fs::symlink_metadata(path) {
+            if metadata.file_type().is_symlink() {
+                let _ = std::fs::remove_file(path);
+                return;
+            }
+            let mut permissions = metadata.permissions();
+            if permissions.readonly() {
+                permissions.set_readonly(false);
+                let _ = std::fs::set_permissions(path, permissions);
+            }
+        }
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+
+impl Drop for ConversionStagingGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            self.unlink_staging(&path);
+        }
+    }
+}
 
 fn run_streaming_convert(
     request: &ConvertRequest,
@@ -562,13 +640,17 @@ fn run_streaming_convert(
         plan.input.tensors.len(),
         plan.input.sections.len(),
     );
-    let (staging_output, mut output) = match create_conversion_stage(&request.output) {
+    let (staging_path, mut output) = match create_conversion_stage(&request.output) {
         Ok(stage) => stage,
         Err(error) => return emit_streaming_refusal("create-staging", error),
     };
+    // The cleanup guard owns the path; on any early return the staging file
+    // is unlinked. After a successful publish we transfer the path out of
+    // the guard so the forensic copy survives.
+    let mut staging_guard = ConversionStagingGuard::new(staging_path);
     eprintln!(
         "CONVERT STAGE=emission RESULT=START staging={} destination={} tensors={}",
-        staging_output.display(),
+        staging_guard.path().display(),
         request.output.display(),
         prepared.tensor_count(),
     );
@@ -588,16 +670,16 @@ fn run_streaming_convert(
     if let Err(error) = output.sync_all() {
         return emit_streaming_refusal(
             "sync-staging",
-            format!("sync {}: {error}", staging_output.display()),
+            format!("sync {}: {error}", staging_guard.path().display()),
         );
     }
     drop(output);
-    let staged_len = match fs::metadata(&staging_output) {
+    let staged_len = match fs::metadata(staging_guard.path()) {
         Ok(metadata) => metadata.len(),
         Err(error) => {
             return emit_streaming_refusal(
                 "inspect-staging",
-                format!("stat {}: {error}", staging_output.display()),
+                format!("stat {}: {error}", staging_guard.path().display()),
             );
         }
     };
@@ -610,7 +692,7 @@ fn run_streaming_convert(
             ),
         );
     }
-    let reloaded = match FnlpqArtifact::open_owned(&staging_output) {
+    let reloaded = match FnlpqArtifact::open_owned(staging_guard.path()) {
         Ok(artifact) => artifact,
         Err(error) => return emit_streaming_refusal("reload-staging", error),
     };
@@ -619,13 +701,17 @@ fn run_streaming_convert(
     }
     drop(reloaded);
 
-    let artifact_raw_sha256 = match raw_sha256_file(&staging_output) {
+    let artifact_raw_sha256 = match raw_sha256_file(staging_guard.path()) {
         Ok(value) => value,
         Err(error) => return emit_streaming_refusal("digest-staging", error),
     };
-    if let Err(error) = publish_explicit_conversion_stage(&staging_output, &request.output) {
+    if let Err(error) = publish_explicit_conversion_stage(staging_guard.path(), &request.output) {
         return emit_streaming_refusal("publish-explicit-output", error);
     }
+    // Publish succeeded: the staging file is now read-only and hard-linked
+    // to the final destination. Take the path out of the guard so the
+    // forensic copy survives; the guard's drop becomes a no-op.
+    let staging_path = staging_guard.take();
     let receipt = match write_conversion_receipt_sidecar(
         request,
         prepared,
@@ -644,7 +730,7 @@ fn run_streaming_convert(
     );
     emit_converted_unqualified(
         &request.output,
-        &staging_output,
+        &staging_path,
         prepared,
         &written,
         &artifact_raw_sha256,
@@ -930,25 +1016,33 @@ fn write_canonical_receipt_sidecar(
         .map_err(|error| format!("serialize conversion receipt: {error}"))?;
     let destination = conversion_receipt_path(output)?;
     let (staging_path, mut file) = create_conversion_receipt_stage(&destination)?;
+    // The cleanup guard owns the path; on any early return the staged
+    // receipt is unlinked. After a successful publish we transfer the path
+    // out of the guard so the forensic copy survives.
+    let mut receipt_guard = ConversionStagingGuard::new(staging_path);
     file.write_all(json.as_bytes())
-        .map_err(|error| format!("write staged receipt {}: {error}", staging_path.display()))?;
+        .map_err(|error| format!("write staged receipt {}: {error}", receipt_guard.path().display()))?;
     file.sync_all()
-        .map_err(|error| format!("sync staged receipt {}: {error}", staging_path.display()))?;
+        .map_err(|error| format!("sync staged receipt {}: {error}", receipt_guard.path().display()))?;
     drop(file);
-    let reloaded = fs::read(&staging_path)
-        .map_err(|error| format!("read staged receipt {}: {error}", staging_path.display()))?;
+    let reloaded = fs::read(receipt_guard.path())
+        .map_err(|error| format!("read staged receipt {}: {error}", receipt_guard.path().display()))?;
     let reloaded = std::str::from_utf8(&reloaded)
-        .map_err(|error| format!("decode staged receipt {}: {error}", staging_path.display()))?;
+        .map_err(|error| format!("decode staged receipt {}: {error}", receipt_guard.path().display()))?;
     let parsed = ConversionReceipt::parse_canonical_json(reloaded)
-        .map_err(|error| format!("parse staged receipt {}: {error}", staging_path.display()))?;
+        .map_err(|error| format!("parse staged receipt {}: {error}", receipt_guard.path().display()))?;
     if &parsed != receipt {
         return Err(format!(
             "reloaded receipt differs from canonical serialization: {}",
-            staging_path.display()
+            receipt_guard.path().display()
         ));
     }
     let sha256 = hex_lower(&Sha256::digest(json.as_bytes()));
-    publish_explicit_conversion_stage(&staging_path, &destination)?;
+    publish_explicit_conversion_stage(receipt_guard.path(), &destination)?;
+    // Publish succeeded: the receipt staging is now read-only and
+    // hard-linked to the canonical receipt path. Take the path out of the
+    // guard so the forensic copy survives.
+    let staging_path = receipt_guard.take();
     Ok(WrittenConversionReceipt {
         destination,
         staging_path,
@@ -2226,5 +2320,93 @@ mod tests {
             900
         );
         assert_eq!(request.kv_page_metadata_bytes_per_token, Some(7));
+    }
+
+    /// A staging file created on the armed path is unlinked when the guard
+    /// drops, closing the bug class where every refusal path between
+    /// `create_conversion_stage` and a successful publish left an orphan
+    /// `.{name}.fnlpq-stage.*` behind.
+    #[test]
+    fn armed_conversion_staging_guard_unlinks_on_drop() {
+        let staging_dir = std::env::temp_dir().join(format!(
+            "fnlp-cr-001-armed-drop-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&staging_dir).expect("create scratch dir");
+        let staging_path = staging_dir.join("artifact.fnlpq-stage.0");
+        fs::write(&staging_path, b"partial streaming bytes").expect("seed staging file");
+
+        {
+            let _guard = super::ConversionStagingGuard::new(staging_path.clone());
+        }
+        assert!(
+            !staging_path.exists(),
+            "armed guard must unlink the staging file on drop; left {}",
+            staging_path.display()
+        );
+        let _ = fs::remove_dir_all(&staging_dir);
+    }
+
+    /// A staging file promoted by `publish_explicit_conversion_stage` is
+    /// read-only; an armed guard dropped after publish must still clear the
+    /// read-only flag and unlink the file when the publish step itself
+    /// failed and the caller never defused the guard.
+    #[test]
+    fn armed_guard_unlinks_read_only_staging_after_publish_failure() {
+        let staging_dir = std::env::temp_dir().join(format!(
+            "fnlp-cr-001-readonly-drop-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&staging_dir).expect("create scratch dir");
+        let staging_path = staging_dir.join("artifact.fnlpq-stage.0");
+        fs::write(&staging_path, b"forensic copy").expect("seed staging file");
+        let mut permissions = fs::metadata(&staging_path)
+            .expect("stat staging")
+            .permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&staging_path, permissions).expect("make read-only");
+
+        {
+            let _guard = super::ConversionStagingGuard::new(staging_path.clone());
+        }
+        assert!(
+            !staging_path.exists(),
+            "armed guard must clear read-only and unlink on drop; left {}",
+            staging_path.display()
+        );
+        let _ = fs::remove_dir_all(&staging_dir);
+    }
+
+    /// A defused guard does not unlink the file: a successful publish path
+    /// keeps the forensic copy intact, and the guard's drop is a no-op.
+    #[test]
+    fn defused_guard_preserves_the_staging_file() {
+        let staging_dir = std::env::temp_dir().join(format!(
+            "fnlp-cr-001-defuse-keep-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&staging_dir).expect("create scratch dir");
+        let staging_path = staging_dir.join("artifact.fnlpq-stage.0");
+        fs::write(&staging_path, b"forensic copy").expect("seed staging file");
+
+        {
+            let guard = super::ConversionStagingGuard::new(staging_path.clone());
+            guard.defuse();
+        }
+        assert!(
+            staging_path.exists(),
+            "defused guard must not unlink the staging file; missing {}",
+            staging_path.display()
+        );
+        let _ = fs::remove_dir_all(&staging_dir);
     }
 }
