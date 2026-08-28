@@ -1284,6 +1284,11 @@ impl CalibrationArtifact {
             if indicator.trim().is_empty() {
                 return Err(CalibrationError::EmptyField("shift indicator"));
             }
+            if indicator.chars().any(|character| character.is_control()) {
+                return Err(CalibrationError::EmptyField(
+                    "shift indicator (control characters rejected to keep diagnostic lines parseable)",
+                ));
+            }
             return Ok(self.invalidated(&format!("distribution shift: {indicator}")));
         }
         if calibrated_probability < acceptance_threshold {

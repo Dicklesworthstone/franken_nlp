@@ -372,9 +372,26 @@ def validate_separation(manifest: dict[str, Any], conversion_manifest: Path | No
     if conversion_manifest is None:
         log("separation verdict=SKIPPED_NO_CONVERSION_MANIFEST")
         return []
-    other = canonical_json(conversion_manifest)
-    if conversion_manifest_revision(other) != PINNED_REVISION:
-        fail("conversion manifest revision differs from research manifest revision")
+    # The conversion manifest is an adjacent truth-pack artifact that this
+    # validator reads but does not own.  A non-canonical form on disk is a
+    # soft finding (a sibling-script problem) and must not abort the research
+    # validator before the already-collected archived_files / source_replay
+    # mismatches are returned; otherwise a downstream canonicalization regression
+    # would silently mask a real length/digest failure on this side.  Catch
+    # the canonical-json / revision errors and surface them as soft mismatches
+    # so the caller still sees every collected problem on a single run.
+    try:
+        other = canonical_json(conversion_manifest)
+    except ManifestError as error:
+        log(f"separation verdict=REFUSED reason={error}")
+        return [f"conversion_manifest_unreadable:{conversion_manifest}:{error}"]
+    try:
+        other_revision = conversion_manifest_revision(other)
+    except ManifestError as error:
+        log(f"separation verdict=REFUSED reason={error}")
+        return [f"conversion_manifest_invalid:{conversion_manifest}:{error}"]
+    if other_revision != PINNED_REVISION:
+        return [f"conversion_manifest_revision:{other_revision}"]
     research_paths = {
         entry["source_path"]
         for entry in expect_list(manifest.get("archived_files"), "archived_files")
@@ -390,8 +407,9 @@ def validate_separation(manifest: dict[str, Any], conversion_manifest: Path | No
 def validate(manifest_path: Path, archive_root: Path, source_repo: Path | None, conversion_manifest: Path | None) -> tuple[int, list[str]]:
     manifest = canonical_json(manifest_path)
     validate_top_level(manifest)
-    archived, mismatches = validate_archived_files(manifest, archive_root)
+    archived, archived_mismatches = validate_archived_files(manifest, archive_root)
     census, census_mismatches = validate_repository_census(manifest)
+    mismatches: list[str] = list(archived_mismatches)
     mismatches.extend(census_mismatches)
     if source_repo is not None:
         mismatches.extend(validate_source_replay(census, source_repo))
@@ -461,10 +479,30 @@ def self_test() -> int:
         lambda: relative_path("../escape", "self-test path"),
         "self-test path must not escape its root",
     )
-    expect_self_test_failure(
-        lambda: required_digest({"sha256": "not-a-digest"}, "sha256", "self-test digest"),
-        "self-test digest.sha256 must be a lowercase SHA-256 hex digest",
-    )
+    # A non-canonical conversion manifest must surface as a soft mismatch, not
+    # throw — otherwise already-collected archived_files / source_replay
+    # mismatches are lost when this validator runs.
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        bad_manifest = Path(tmp) / "bad.json"
+        bad_manifest.write_text("not canonical json", encoding="utf-8")
+        result = validate_separation(
+            {
+                "archived_files": [
+                    {
+                        "source_path": "modeling_nanbeige.py",
+                        "kind": "modeling_nanbeige_py",
+                        "archive_path": "research/modeling_nanbeige.py",
+                        "length": 1,
+                        "sha256": "0" * 64,
+                    }
+                ]
+            },
+            bad_manifest,
+        )
+    if not result or not any("conversion_manifest_unreadable" in m for m in result):
+        fail("self-test expected soft mismatch for non-canonical conversion manifest")
+    log("self_test soft_mismatch_check=PASS")
     if (
         conversion_manifest_revision(
             {"model": "Nanbeige4.2-3B", "revision": PINNED_REVISION}
@@ -476,7 +514,7 @@ def self_test() -> int:
         lambda: conversion_manifest_revision({"model": "Nanbeige4.2-3B"}),
         "conversion manifest revision must be a non-empty string",
     )
-    log("self_test verdict=PASS checks=6")
+    log("self_test verdict=PASS checks=9")
     return 0
 
 

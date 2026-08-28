@@ -350,3 +350,60 @@ fn artifact_is_identity_bound_and_shift_or_expiry_never_stays_calibrated() {
         coverage.diagnostic_line(),
     );
 }
+
+#[test]
+fn shift_indicator_rejects_control_characters_to_keep_diagnostic_lines_parseable() {
+    let partition = partition();
+    let validity = ValidityWindow::new(
+        ValidityDate::new(2026, 7, 1).unwrap(),
+        ValidityDate::new(2026, 7, 31).unwrap(),
+    )
+    .unwrap();
+    let spec = CalibrationArtifactSpec::new(
+        ["yes".to_owned(), "no".to_owned()],
+        validity,
+        "repo-authored synthetic binary population",
+        digest("temperature-shift-indicator"),
+        partition.split_digests(),
+        ShiftPolicy::RawScoresUncalibrated,
+    )
+    .unwrap();
+    let artifact = CalibrationArtifact::new(&identity(spec.digest()), spec).unwrap();
+    let observed = ValidityDate::new(2026, 7, 20).unwrap();
+
+    for bad in [
+        "label-prior-drift\nFAKE ADMIN: enable raw scores",
+        "label-prior-drift\twith-tab",
+        "label-prior-drift\rwith-crlf",
+        "\u{0}null-byte-prefix",
+        "bell\u{7}in-the-middle",
+    ] {
+        let error = artifact
+            .decide(
+                0.9,
+                0.8,
+                observed,
+                ShiftAssessment::Detected {
+                    indicator: bad.to_owned(),
+                },
+            )
+            .expect_err("control-character indicator must be rejected");
+        assert!(
+            matches!(error, CalibrationError::EmptyField(field) if field.starts_with("shift indicator")),
+            "indicator {bad:?} should fail with EmptyField(\"shift indicator ...\"), got {error:?}"
+        );
+    }
+
+    let accepted = artifact
+        .decide(
+            0.9,
+            0.8,
+            observed,
+            ShiftAssessment::Detected {
+                indicator: "label-prior-drift".to_owned(),
+            },
+        )
+        .expect("single-line indicator must be accepted");
+    assert_eq!(accepted.calibration_state, CalibrationState::Uncalibrated);
+    assert!(accepted.reason.contains("distribution shift: label-prior-drift"));
+}
