@@ -15,10 +15,10 @@ use std::{
 };
 
 use franken_nlp::{
-    artifact::converter::{verify_source_closure, ConversionSourceManifest},
+    artifact::converter::{ConversionSourceManifest, verify_source_closure},
     native_engine::{
         hf_bf16_eager::{
-            HfBf16EagerEngine, HfBf16EagerForward, HfBf16EagerWeights, HF_BF16_EAGER_PROFILE,
+            HF_BF16_EAGER_PROFILE, HfBf16EagerEngine, HfBf16EagerForward, HfBf16EagerWeights,
         },
         kv::{KV_SLOT_COUNT, LOOP_COUNT, PHYSICAL_LAYER_COUNT},
         tensor::Bf16,

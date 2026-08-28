@@ -3,9 +3,9 @@
 use franken_nlp::native_engine::kv::{
     KV_BF16_LOGICAL_PAGE_BYTES, KV_BF16_SLAB_BYTES, KV_BYTES_PER_TOKEN,
     KV_INT8_F16_SCALE_BYTES_PER_TOKEN, KV_INT8_F32_SCALE_BYTES_PER_TOKEN,
-    KV_INT8_PAYLOAD_BYTES_PER_TOKEN, KV_LOGICAL_PAGE_TOKENS, KV_SLOT_COUNT,
-    KV_SLABS_PER_LOGICAL_PAGE, KV_SLAB_VECTOR_ALIGNMENT_BYTES, KvSlabAdmission, KvSlabCache,
-    KvSlabDtype, KvSlabError, KvSlabKey, KvSlabPoolStats, KvVector,
+    KV_INT8_PAYLOAD_BYTES_PER_TOKEN, KV_LOGICAL_PAGE_TOKENS, KV_SLAB_VECTOR_ALIGNMENT_BYTES,
+    KV_SLABS_PER_LOGICAL_PAGE, KV_SLOT_COUNT, KvSlabAdmission, KvSlabCache, KvSlabDtype,
+    KvSlabError, KvSlabKey, KvSlabPoolStats, KvVector,
 };
 
 fn append_prepared_position(cache: &mut KvSlabCache, position: usize, marker: u16) {
@@ -113,7 +113,10 @@ fn typed_admission_constructs_an_exactly_priced_pre_reserved_pool() {
     let stats = cache.pool_stats();
     assert_eq!(cache.capacity_positions(), 17);
     assert_eq!(stats.slab_capacity, admission.reserved_slab_count());
-    assert_eq!(stats.reserved_payload_bytes, admission.reserved_bf16_bytes());
+    assert_eq!(
+        stats.reserved_payload_bytes,
+        admission.reserved_bf16_bytes()
+    );
     assert_eq!(stats.live_slab_count, 0);
     assert_eq!(stats.free_slab_count, admission.reserved_slab_count());
     assert_eq!(stats.retained_reference_count, Some(0));
@@ -158,7 +161,10 @@ fn prepared_append_uses_only_preallocated_aligned_slabs() {
     let after_append = cache.pool_stats();
 
     assert_eq!(cache.len_positions(), 1);
-    assert_eq!(before_append.allocation_events, after_append.allocation_events);
+    assert_eq!(
+        before_append.allocation_events,
+        after_append.allocation_events
+    );
     assert_eq!(after_append.live_slab_count, KV_SLABS_PER_LOGICAL_PAGE);
     assert_eq!(after_append.live_payload_bytes, KV_BF16_LOGICAL_PAGE_BYTES);
     assert_eq!(
@@ -223,7 +229,10 @@ fn forked_tail_cow_releases_only_the_cancelled_fork_slabs() {
 
     fork.prepare_append(3)
         .expect("fork-tail COW is prepared outside the append loop");
-    assert_eq!(fork.pool_stats().live_slab_count, KV_SLABS_PER_LOGICAL_PAGE * 2);
+    assert_eq!(
+        fork.pool_stats().live_slab_count,
+        KV_SLABS_PER_LOGICAL_PAGE * 2
+    );
     assert_eq!(
         fork.pool_stats().retained_reference_count,
         Some(KV_SLABS_PER_LOGICAL_PAGE * 2)

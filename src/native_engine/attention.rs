@@ -1,10 +1,10 @@
 //! Eager 48:8 grouped-query attention for `hf-bf16-eager`.
 
+use super::tensor::{Bf16, cast_f32_to_bf16};
 use super::{
     kv::{KV_ELEMENTS_PER_POSITION, KvCache, KvCacheError},
     rope::NANBEIGE_HEAD_DIM,
 };
-use super::tensor::{Bf16, cast_f32_to_bf16};
 
 /// Query heads in Nanbeige4.2-3B.
 pub const QUERY_HEAD_COUNT: usize = 48;
@@ -82,10 +82,7 @@ pub fn softmax_f32_cast_back(scores: &[f32]) -> Result<Vec<Bf16>, AttentionError
 /// score before the softmax upcast.  This scalar reference preserves those
 /// two observable boundaries; the reduction microarchitecture remains a
 /// separately fixture-gated conformance question.
-pub fn qk_score_bf16_cast_points(
-    query: &[Bf16],
-    key: &[Bf16],
-) -> Result<Bf16, AttentionError> {
+pub fn qk_score_bf16_cast_points(query: &[Bf16], key: &[Bf16]) -> Result<Bf16, AttentionError> {
     if query.len() != NANBEIGE_HEAD_DIM {
         return Err(AttentionError::HeadDimension {
             expected: NANBEIGE_HEAD_DIM,
@@ -142,11 +139,7 @@ impl OnlineSoftmaxF32 {
     }
 
     /// Absorbs a cache-resident bf16 value vector at one score position.
-    pub fn observe_bf16_bits(
-        &mut self,
-        score: f32,
-        values: &[u16],
-    ) -> Result<(), AttentionError> {
+    pub fn observe_bf16_bits(&mut self, score: f32, values: &[u16]) -> Result<(), AttentionError> {
         if values.len() != self.weighted_values.len() {
             return Err(AttentionError::HeadDimension {
                 expected: self.weighted_values.len(),
@@ -418,8 +411,7 @@ pub fn online_gqa_attention_from_cache_prefix(
                 let value = cache.value_at(slot, position)?;
                 reduction.observe_bf16_bits(score, &value[kv_start..kv_end])?;
             }
-            output[query_start..query_end]
-                .copy_from_slice(&cast_f32_to_bf16(&reduction.finish()?));
+            output[query_start..query_end].copy_from_slice(&cast_f32_to_bf16(&reduction.finish()?));
         }
     }
     Ok(output)
@@ -552,9 +544,8 @@ mod tests {
                             .map(Bf16::from_bits),
                     );
                     values.extend(
-                        cache
-                            .value_at(slot, position)
-                            .expect("resident edge value")[kv_start..kv_end]
+                        cache.value_at(slot, position).expect("resident edge value")
+                            [kv_start..kv_end]
                             .iter()
                             .copied()
                             .map(Bf16::from_bits),
@@ -598,7 +589,10 @@ mod tests {
         reduction
             .observe_bf16_bits(0.0, &[bf16_bits(4.0), bf16_bits(10.0)])
             .expect("second 128-wide analogue value is accepted");
-        assert_eq!(reduction.finish().expect("nonempty reduction"), vec![3.0, 8.0]);
+        assert_eq!(
+            reduction.finish().expect("nonempty reduction"),
+            vec![3.0, 8.0]
+        );
     }
 
     #[test]

@@ -12,9 +12,7 @@ use crate::artifact::safetensors::{
 };
 
 use super::{
-    attention::{
-        AttentionError, eager_gqa_attention_from_cache,
-    },
+    attention::{AttentionError, eager_gqa_attention_from_cache},
     kv::{
         KV_ELEMENTS_PER_POSITION, KV_SLOT_COUNT, KvCache, KvCacheError, LOOP_COUNT,
         PHYSICAL_LAYER_COUNT, slot_for,

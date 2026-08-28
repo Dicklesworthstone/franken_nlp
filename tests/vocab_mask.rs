@@ -10,8 +10,7 @@ use franken_nlp::{
     grammar::mask::{
         ByteState, DetokenizationTransducer, MaskCacheDisposition, MaskCacheError,
         MaskCacheMaterializationError, MaskOracleError, MaskWorkLimits,
-        NANBEIGE_MASK_BYTES_PER_STATE, SchemaMaskCache, SchemaMaskKey, VocabMaskOracle,
-        VocabTrie,
+        NANBEIGE_MASK_BYTES_PER_STATE, SchemaMaskCache, SchemaMaskKey, VocabMaskOracle, VocabTrie,
     },
     tokenizer::{
         bpe::{AddedToken, SpBpeTokenizer},

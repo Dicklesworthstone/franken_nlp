@@ -135,11 +135,13 @@ fn routed_int8_panel_refuses_a_tampered_decoded_element_before_quantization() {
             &ONE_ROW_BF16,
             &tampered,
         ),
-        Err(ConverterError::Quantize(QuantizeError::DecodedBf16Mismatch {
-            element: 2,
-            expected_bits: 0x3f00_0000,
-            observed_bits: 0x7fc0_0000,
-        }))
+        Err(ConverterError::Quantize(
+            QuantizeError::DecodedBf16Mismatch {
+                element: 2,
+                expected_bits: 0x3f00_0000,
+                observed_bits: 0x7fc0_0000,
+            }
+        ))
     );
 }
 

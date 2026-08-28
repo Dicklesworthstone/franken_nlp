@@ -54,8 +54,7 @@ const TOOL_SYSTEM_TEXT: &str = "你是一位工具函数调用专家，你会得
 /// The template is text-only; original media payloads are never rendered as
 /// model input. Video and audio parts use their own type-named literals, exactly
 /// as the pinned template derives them.
-pub const MEDIA_REMINDER_TEXT: &str =
-    "<reminder>You are unable to process this image because you don't have multi-modal input ability. Try different methods.</reminder>";
+pub const MEDIA_REMINDER_TEXT: &str = "<reminder>You are unable to process this image because you don't have multi-modal input ability. Try different methods.</reminder>";
 
 /// A complete conversation passed to the fixed chat-template builder.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

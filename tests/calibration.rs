@@ -1,15 +1,15 @@
 use franken_nlp::{
     calibration::{
-        bootstrap_locked_test_confidence_intervals, report_locked_test, BinaryLabel,
-        BootstrapConfig, CalibrationArtifact, CalibrationArtifactSpec, CalibrationError,
-        CalibrationState, ConformalModel, ExchangeabilityMemo, IsotonicModel, LabeledScore,
-        ShiftAssessment, ShiftPolicy, SplitMembership, SplitName, TemperatureModel, ValidityDate,
-        ValidityWindow,
+        BinaryLabel, BootstrapConfig, CalibrationArtifact, CalibrationArtifactSpec,
+        CalibrationError, CalibrationState, ConformalModel, ExchangeabilityMemo, IsotonicModel,
+        LabeledScore, ShiftAssessment, ShiftPolicy, SplitMembership, SplitName, TemperatureModel,
+        ValidityDate, ValidityWindow, bootstrap_locked_test_confidence_intervals,
+        report_locked_test,
     },
     error::StructuredTaskStatus,
     execution_identity::{
-        ExecutionIdentity, NumericsProfile, Sha256Digest, ThinkingMode, ToolMode,
-        EXECUTION_IDENTITY_SCHEMA_VERSION,
+        EXECUTION_IDENTITY_SCHEMA_VERSION, ExecutionIdentity, NumericsProfile, Sha256Digest,
+        ThinkingMode, ToolMode,
     },
 };
 
@@ -198,9 +198,11 @@ fn locked_test_bootstrap_intervals_are_replayable_and_never_hide_undefined_risk(
     )
     .unwrap();
     assert_eq!(undefined_risk.selective_risk, None);
-    assert!(undefined_risk
-        .diagnostic_line()
-        .contains("selective_risk=not_computed"));
+    assert!(
+        undefined_risk
+            .diagnostic_line()
+            .contains("selective_risk=not_computed")
+    );
     assert!(matches!(
         BootstrapConfig::new(1, 0.95, 0),
         Err(CalibrationError::InvalidBootstrapResamples)
@@ -226,10 +228,12 @@ fn conformal_requires_a_named_exchangeability_memo_and_scopes_coverage() {
     .unwrap();
     let conformal = ConformalModel::fit(partition.calibration(), Some(memo), 0.25).unwrap();
     assert_eq!(conformal.fitted_rows(), 4);
-    assert!(conformal
-        .prediction_set(0.8)
-        .unwrap()
-        .contains(&BinaryLabel::Positive));
+    assert!(
+        conformal
+            .prediction_set(0.8)
+            .unwrap()
+            .contains(&BinaryLabel::Positive)
+    );
     let coverage = conformal
         .coverage_on_locked_test(partition.locked_test())
         .unwrap();
@@ -405,5 +409,9 @@ fn shift_indicator_rejects_control_characters_to_keep_diagnostic_lines_parseable
         )
         .expect("single-line indicator must be accepted");
     assert_eq!(accepted.calibration_state, CalibrationState::Uncalibrated);
-    assert!(accepted.reason.contains("distribution shift: label-prior-drift"));
+    assert!(
+        accepted
+            .reason
+            .contains("distribution shift: label-prior-drift")
+    );
 }

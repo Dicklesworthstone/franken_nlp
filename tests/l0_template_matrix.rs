@@ -8,9 +8,9 @@ use std::collections::BTreeMap;
 
 use franken_nlp::{
     template::{
-        AssistantReasoning, ContentPart, Conversation, Message, MessageContent, MessageRole,
-        RenderOptions, TemplateBuilder, ToolCall, ToolDefinition, ToolFormat, ToolResult,
-        DEFAULT_SYSTEM_TEXT, IM_END, IM_START, MEDIA_REMINDER_TEXT, THINK_END, THINK_START,
+        AssistantReasoning, ContentPart, Conversation, DEFAULT_SYSTEM_TEXT, IM_END, IM_START,
+        MEDIA_REMINDER_TEXT, Message, MessageContent, MessageRole, RenderOptions, THINK_END,
+        THINK_START, TemplateBuilder, ToolCall, ToolDefinition, ToolFormat, ToolResult,
     },
     tokenizer::{
         bpe::{AddedToken, EncodeOptions, SpBpeTokenizer},
@@ -104,17 +104,21 @@ fn typed_rejections_happen_before_the_tokenizer_boundary() {
         r#"{"messages":[{"role":"user","content":[{"type":"pdf","url":"x"}]}]}"#,
     )
     .expect_err("unknown media kinds must reject");
-    assert!(error
-        .to_string()
-        .contains("text, image, image_url, video, video_url, audio, audio_url, or input_audio"));
+    assert!(
+        error
+            .to_string()
+            .contains("text, image, image_url, video, video_url, audio, audio_url, or input_audio")
+    );
 
     let error = Conversation::from_json(
         r#"{"messages":[{"role":"assistant","content":"","tool_calls":[{"type":"function","function":{"name":"lookup","arguments":"[]"}}]}]}"#,
     )
     .expect_err("non-object tool-call arguments must reject");
-    assert!(error
-        .to_string()
-        .contains("tool-call arguments must be a JSON object"));
+    assert!(
+        error
+            .to_string()
+            .contains("tool-call arguments must be a JSON object")
+    );
 
     let conversation = Conversation::from_json(
         r#"{"messages":[{"role":"user","content":["bare text",{"type":"image"}]}]}"#,
@@ -270,9 +274,11 @@ fn first_system_position_and_tool_definition_formats_are_explicit() {
     })
     .render(&non_leading_system)
     .expect_err("non-leading systems must reject before rendering");
-    assert!(error
-        .to_string()
-        .contains("system message must be at the beginning"));
+    assert!(
+        error
+            .to_string()
+            .contains("system message must be at the beginning")
+    );
 }
 
 #[test]

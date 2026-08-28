@@ -235,26 +235,25 @@ pub fn encode_generic_panel(
     rows: usize,
     columns: usize,
 ) -> Result<GenericPanelBytes, QuantizeError> {
-    let expected_f32_values = rows
-        .checked_mul(columns)
-        .ok_or(QuantizeError::PanelShape {
-            rows,
-            columns,
-            expected_bf16_bytes: usize::MAX,
-            observed_bf16_bytes: source_bf16.len(),
-            expected_f32_values: usize::MAX,
-            observed_f32_values: decoded_f32.len(),
-        })?;
-    let expected_bf16_bytes = expected_f32_values
-        .checked_mul(2)
-        .ok_or(QuantizeError::PanelShape {
-            rows,
-            columns,
-            expected_bf16_bytes: usize::MAX,
-            observed_bf16_bytes: source_bf16.len(),
-            expected_f32_values,
-            observed_f32_values: decoded_f32.len(),
-        })?;
+    let expected_f32_values = rows.checked_mul(columns).ok_or(QuantizeError::PanelShape {
+        rows,
+        columns,
+        expected_bf16_bytes: usize::MAX,
+        observed_bf16_bytes: source_bf16.len(),
+        expected_f32_values: usize::MAX,
+        observed_f32_values: decoded_f32.len(),
+    })?;
+    let expected_bf16_bytes =
+        expected_f32_values
+            .checked_mul(2)
+            .ok_or(QuantizeError::PanelShape {
+                rows,
+                columns,
+                expected_bf16_bytes: usize::MAX,
+                observed_bf16_bytes: source_bf16.len(),
+                expected_f32_values,
+                observed_f32_values: decoded_f32.len(),
+            })?;
     if source_bf16.len() != expected_bf16_bytes || decoded_f32.len() != expected_f32_values {
         return Err(QuantizeError::PanelShape {
             rows,
@@ -332,8 +331,8 @@ fn round_from_lower(lower: i32, fractional: f32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        encode_generic_panel, quantize_per_output_channel_i8, round_nearest_ties_even,
-        QuantizeError, PORTABLE_I8_MAX_MAGNITUDE, PORTABLE_I8_ZERO_ROW_SCALE,
+        PORTABLE_I8_MAX_MAGNITUDE, PORTABLE_I8_ZERO_ROW_SCALE, QuantizeError, encode_generic_panel,
+        quantize_per_output_channel_i8, round_nearest_ties_even,
     };
     use crate::artifact::converter::StorageStage;
 
@@ -400,26 +399,14 @@ mod tests {
     #[test]
     fn bf16_stage_keeps_source_bytes_and_int8_stage_emits_generic_metadata() {
         let source = [0x80, 0x3f, 0x80, 0xbf];
-        let bf16 = encode_generic_panel(
-            StorageStage::Bf16Verbatim,
-            &source,
-            &[1.0, -1.0],
-            1,
-            2,
-        )
-        .expect("exact BF16 source panel is copied");
+        let bf16 = encode_generic_panel(StorageStage::Bf16Verbatim, &source, &[1.0, -1.0], 1, 2)
+            .expect("exact BF16 source panel is copied");
         assert_eq!(bf16.data, source);
         assert!(bf16.scales.is_empty());
         assert!(bf16.row_sums.is_empty());
 
-        let int8 = encode_generic_panel(
-            StorageStage::Int8Stage2A,
-            &source,
-            &[1.0, -1.0],
-            1,
-            2,
-        )
-        .expect("finite panel quantizes");
+        let int8 = encode_generic_panel(StorageStage::Int8Stage2A, &source, &[1.0, -1.0], 1, 2)
+            .expect("finite panel quantizes");
         assert_eq!(int8.data, vec![127, 129]);
         assert_eq!(
             int8.scales,
@@ -430,14 +417,8 @@ mod tests {
 
     #[test]
     fn panel_geometry_refuses_before_stage_selection() {
-        let error = encode_generic_panel(
-            StorageStage::Int8Stage2B,
-            &[0, 0],
-            &[0.0, 1.0],
-            1,
-            2,
-        )
-        .expect_err("BF16 source and decoded work must share the declared shape");
+        let error = encode_generic_panel(StorageStage::Int8Stage2B, &[0, 0], &[0.0, 1.0], 1, 2)
+            .expect_err("BF16 source and decoded work must share the declared shape");
         assert!(matches!(error, QuantizeError::PanelShape { .. }));
     }
 
@@ -451,6 +432,9 @@ mod tests {
             2,
         )
         .expect_err("a substituted work panel must not enter quantization");
-        assert!(matches!(error, QuantizeError::DecodedBf16Mismatch { element: 1, .. }));
+        assert!(matches!(
+            error,
+            QuantizeError::DecodedBf16Mismatch { element: 1, .. }
+        ));
     }
 }

@@ -3,8 +3,8 @@
 //! `fnlp convert`; the real closure conversion remains controller-owned.
 
 use franken_nlp::artifact::converter::{
-    remap_tensor_name, stream_routed_bf16_panels, transform_routed_panel, ConverterError,
-    PanelPlan, StorageStage,
+    ConverterError, PanelPlan, StorageStage, remap_tensor_name, stream_routed_bf16_panels,
+    transform_routed_panel,
 };
 use franken_nlp::artifact::quantize::encode_generic_panel;
 use franken_nlp::artifact::safetensors::{RowPanel, SafetensorDtype, TensorCensusEntry};
@@ -106,7 +106,11 @@ fn routed_stream_applies_each_storage_stage_without_retaining_the_tensor() {
 
     let scale_bytes = (1.0_f32 / 127.0).to_bits().to_le_bytes();
     for (source_name, generic) in produced.iter().skip(1) {
-        assert_eq!(generic.data, vec![127_u8, 129, 64, 192], "route={source_name}");
+        assert_eq!(
+            generic.data,
+            vec![127_u8, 129, 64, 192],
+            "route={source_name}"
+        );
         assert_eq!(generic.scales, scale_bytes.to_vec(), "route={source_name}");
         assert_eq!(
             generic.row_sums,

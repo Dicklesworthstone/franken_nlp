@@ -47,8 +47,10 @@ fn formation_seal_refuses_post_start_and_post_latch_workers() {
         })
     ));
 
-    team.release_workers().expect("sealed team releases entry gate");
-    team.worker_started(first).expect("first worker starts after gate");
+    team.release_workers()
+        .expect("sealed team releases entry gate");
+    team.worker_started(first)
+        .expect("first worker starts after gate");
     team.worker_started(second)
         .expect("second worker starts after gate");
     team.begin_drain(TeamDrainReason::Cancelled);
@@ -113,8 +115,10 @@ fn first_drain_cause_survives_sibling_shutdown() {
 
     team.begin_drain(TeamDrainReason::WorkerPanicked);
     team.begin_drain(TeamDrainReason::Cancelled);
-    team.worker_exited(worker).expect("worker exits during drain");
-    team.join().expect("latch fires after the joined worker exits");
+    team.worker_exited(worker)
+        .expect("worker exits during drain");
+    team.join()
+        .expect("latch fires after the joined worker exits");
 
     assert_eq!(
         team.snapshot().drain_reason,
@@ -155,7 +159,8 @@ fn bounded_model_enumerates_all_terminal_drain_reasons_without_late_spawn() {
                 phase: SealedTeamPhase::Draining,
             })
         ));
-        team.worker_exited(worker).expect("worker exits at drain boundary");
+        team.worker_exited(worker)
+            .expect("worker exits at drain boundary");
         team.join().expect("all children join before latch fires");
         assert_eq!(team.snapshot().drain_reason, Some(reason));
     }

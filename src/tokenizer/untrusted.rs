@@ -73,8 +73,15 @@ impl<'tokenizer, 'registry> UntrustedDocumentEncoder<'tokenizer, 'registry> {
 
         for (offset, &id) in ids.iter().enumerate() {
             if let Some(control) = self.template_controls.entry(id) {
+                // The reported offset is the position of the offending token in
+                // the encoded id stream, NOT a byte offset into the source.
+                // The current encode API does not surface per-token byte spans;
+                // computing a true byte offset would require an
+                // `encode_byte_fallback_with_offsets` helper. Until that is
+                // added, callers must interpret the field as a token index and
+                // recompute the byte range from the id stream if they need it.
                 return Err(UntrustedDocumentError::ForbiddenControl {
-                    byte_offset: offset,
+                    token_offset: offset,
                     context: context_window(bytes, offset),
                     id,
                     piece_text: control.surface.clone(),
@@ -104,10 +111,12 @@ impl<'tokenizer, 'registry> UntrustedDocumentEncoder<'tokenizer, 'registry> {
 /// Typed preflight rejection.  There is no lossy/drop/substitution branch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UntrustedDocumentError {
-    Encode(EncodeError),
-    Decode(DecodeBytesError),
     ForbiddenControl {
-        byte_offset: usize,
+        /// Index of the offending token in the encoded id stream, NOT a byte
+        /// offset into the source. The current encode API does not surface
+        /// per-token byte spans; callers needing a byte range must recompute
+        /// it from the id stream.
+        token_offset: usize,
         context: Vec<u8>,
         id: u32,
         piece_text: String,
@@ -120,18 +129,14 @@ pub enum UntrustedDocumentError {
 }
 
 impl fmt::Display for UntrustedDocumentError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Encode(error) => error.fmt(formatter),
-            Self::Decode(error) => error.fmt(formatter),
             Self::ForbiddenControl {
-                byte_offset,
+                token_offset,
                 context,
                 id,
                 piece_text,
             } => write!(
                 formatter,
-                "UNTRUSTED violation id={id} piece={piece_text:?} byte_offset={byte_offset} context_hex={}",
+                "UNTRUSTED violation id={id} piece={piece_text:?} token_offset={token_offset} context_hex={}",
                 hex(context)
             ),
             Self::BytePreservation {

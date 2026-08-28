@@ -387,7 +387,9 @@ impl fmt::Display for ResourceConfigError {
         match self {
             Self::ZeroThreadLimit { field } => write!(formatter, "{field} must be non-zero"),
             Self::ZeroMemoryCeiling => formatter.write_str("memory_ceiling_bytes must be non-zero"),
-            Self::ThreadEnvelopeOverflow => formatter.write_str("thread envelope arithmetic overflow"),
+            Self::ThreadEnvelopeOverflow => {
+                formatter.write_str("thread envelope arithmetic overflow")
+            }
             Self::ThreadEnvelopeExceedsCeiling { required, ceiling } => write!(
                 formatter,
                 "thread envelope requires {required} runnable threads but ceiling is {ceiling}"
@@ -431,7 +433,9 @@ pub enum ResourceBrokerError {
 impl fmt::Display for ResourceBrokerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidConfig(error) => write!(formatter, "invalid resource host config: {error}"),
+            Self::InvalidConfig(error) => {
+                write!(formatter, "invalid resource host config: {error}")
+            }
             Self::ConfigConflict(error) => error.fmt(formatter),
             Self::Runtime(error) => error.fmt(formatter),
         }
@@ -563,9 +567,15 @@ pub enum ReservationError {
         ceiling_bytes: u64,
     },
     ArithmeticOverflow,
-    UnknownObligation { obligation_id: u64 },
-    InvalidTransition { obligation_id: u64 },
-    LedgerInvariant { obligation_id: u64 },
+    UnknownObligation {
+        obligation_id: u64,
+    },
+    InvalidTransition {
+        obligation_id: u64,
+    },
+    LedgerInvariant {
+        obligation_id: u64,
+    },
 }
 
 impl fmt::Display for ReservationError {
@@ -584,10 +594,16 @@ impl fmt::Display for ReservationError {
                 write!(formatter, "unknown reservation obligation {obligation_id}")
             }
             Self::InvalidTransition { obligation_id } => {
-                write!(formatter, "invalid reservation transition for obligation {obligation_id}")
+                write!(
+                    formatter,
+                    "invalid reservation transition for obligation {obligation_id}"
+                )
             }
             Self::LedgerInvariant { obligation_id } => {
-                write!(formatter, "memory ledger invariant failed for obligation {obligation_id}")
+                write!(
+                    formatter,
+                    "memory ledger invariant failed for obligation {obligation_id}"
+                )
             }
         }
     }
@@ -2017,7 +2033,10 @@ impl fmt::Display for SealedTeamError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::FormationFull { expected_children } => {
-                write!(formatter, "sealed team formation already has {expected_children} children")
+                write!(
+                    formatter,
+                    "sealed team formation already has {expected_children} children"
+                )
             }
             Self::SpawnAfterSeal { phase } => write!(
                 formatter,
@@ -2050,11 +2069,9 @@ impl fmt::Display for SealedTeamError {
             Self::WorkerNotRunning { ordinal } => {
                 write!(formatter, "sealed team worker {ordinal} is not running")
             }
-            Self::JoinBeforeDrain { phase } => write!(
-                formatter,
-                "sealed team cannot join from {}",
-                phase.as_str()
-            ),
+            Self::JoinBeforeDrain { phase } => {
+                write!(formatter, "sealed team cannot join from {}", phase.as_str())
+            }
             Self::JoinBeforeWorkersExit {
                 expected_children,
                 exited_children,
@@ -2307,7 +2324,10 @@ impl std::error::Error for CapacityOneLaneError {}
 
 pub fn capacity_one_lane<T>() -> (CapacityOneSender<T>, CapacityOneReceiver<T>) {
     let (sender, receiver) = mpsc::sync_channel(1);
-    (CapacityOneSender { sender }, CapacityOneReceiver { receiver })
+    (
+        CapacityOneSender { sender },
+        CapacityOneReceiver { receiver },
+    )
 }
 
 /// Translate the process' effective compute-team width into the child cap for
@@ -2429,14 +2449,23 @@ fn drain_sealed_team_workers(command_senders: &mut Vec<CapacityOneSender<SealedT
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SealedTeamRunError {
     Protocol(SealedTeamError),
-    ScopeCancelled { detail: String },
-    ScopePanicked { worker_ordinal: usize, detail: String },
-    ScopeWorkerCapExceeded { cap: usize },
+    ScopeCancelled {
+        detail: String,
+    },
+    ScopePanicked {
+        worker_ordinal: usize,
+        detail: String,
+    },
+    ScopeWorkerCapExceeded {
+        cap: usize,
+    },
     CommandLane {
         worker_ordinal: usize,
         error: CapacityOneLaneError,
     },
-    ReplyLaneDisconnected { worker_ordinal: usize },
+    ReplyLaneDisconnected {
+        worker_ordinal: usize,
+    },
     UnexpectedReply {
         expected_worker_ordinal: usize,
         actual_worker_ordinal: usize,
@@ -2495,9 +2524,7 @@ fn drain_reason_for_run_error(error: &SealedTeamRunError) -> TeamDrainReason {
         SealedTeamRunError::Protocol(_)
         | SealedTeamRunError::ScopeWorkerCapExceeded { .. }
         | SealedTeamRunError::CommandLane { .. }
-        | SealedTeamRunError::UnexpectedReply { .. } => {
-            TeamDrainReason::CoordinatorPanicked
-        }
+        | SealedTeamRunError::UnexpectedReply { .. } => TeamDrainReason::CoordinatorPanicked,
     }
 }
 
@@ -2517,11 +2544,14 @@ impl fmt::Display for SealedTeamLaunchError {
             Self::InvalidTeamWidth => {
                 formatter.write_str("sealed scoped-CPU team width must include its coordinator")
             }
-            Self::MissingRequestContext => formatter.write_str(
-                "sealed scoped-CPU team requires an asupersync request context",
-            ),
+            Self::MissingRequestContext => {
+                formatter.write_str("sealed scoped-CPU team requires an asupersync request context")
+            }
             Self::SpawnBlocking { detail } => {
-                write!(formatter, "sealed scoped-CPU team spawn_blocking refused: {detail}")
+                write!(
+                    formatter,
+                    "sealed scoped-CPU team spawn_blocking refused: {detail}"
+                )
             }
         }
     }
@@ -2697,12 +2727,10 @@ fn run_sealed_cpu_checkpoint_team(
                 detail: error.to_string(),
             });
         }
-        eprintln!(
-            "SEALED_TEAM STAGE=COORDINATOR RESULT=CHECKPOINTED child_count={child_count}",
-        );
+        eprintln!("SEALED_TEAM STAGE=COORDINATOR RESULT=CHECKPOINTED child_count={child_count}",);
         for worker_ordinal in 0..command_senders.len() {
-            if let Err(error) = command_senders[worker_ordinal]
-                .try_send(SealedTeamCommand::Checkpoint)
+            if let Err(error) =
+                command_senders[worker_ordinal].try_send(SealedTeamCommand::Checkpoint)
             {
                 let reason = match error {
                     CapacityOneLaneError::Full => TeamDrainReason::CoordinatorPanicked,
@@ -2853,10 +2881,7 @@ impl RuntimeHost {
     ) -> Result<Self, RuntimeHostError> {
         use std::time::Duration;
 
-        use asupersync::{
-            runtime::RuntimeBuilder,
-            types::CancelAttributionConfig,
-        };
+        use asupersync::{runtime::RuntimeBuilder, types::CancelAttributionConfig};
 
         let builder = match config.runtime_preset {
             RuntimePreset::CurrentThread => RuntimeBuilder::current_thread(),
@@ -3161,9 +3186,7 @@ impl EngineResources {
         };
         eprintln!(
             "ENGINE_RESOURCES CLOSURE_COMPLETE closure_id={} engine_lease_id={} wrapper_cancelled={}",
-            closure_id,
-            closure.engine_lease_id,
-            closure.wrapper_cancelled,
+            closure_id, closure.engine_lease_id, closure.wrapper_cancelled,
         );
     }
 
@@ -3343,7 +3366,8 @@ impl ResourceBroker {
         };
         #[cfg(not(test))]
         let resources = Arc::new(
-            EngineResources::new(requested, thread_inventory).map_err(ResourceBrokerError::Runtime)?,
+            EngineResources::new(requested, thread_inventory)
+                .map_err(ResourceBrokerError::Runtime)?,
         );
         *installed = Some(Arc::clone(&resources));
         Ok(resources)
@@ -3453,9 +3477,9 @@ impl fmt::Display for ReentrantCall {
             Self::RuntimeWorker => formatter.write_str(
                 "ReentrantCall: synchronous NlpEngine entry from a runtime worker is refused",
             ),
-            Self::NestedSyncCall => formatter.write_str(
-                "ReentrantCall: nested synchronous NlpEngine entry is refused",
-            ),
+            Self::NestedSyncCall => {
+                formatter.write_str("ReentrantCall: nested synchronous NlpEngine entry is refused")
+            }
         }
     }
 }
@@ -3532,7 +3556,9 @@ impl fmt::Display for EngineBuildError {
 impl std::error::Error for EngineBuildError {}
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
@@ -3681,7 +3707,10 @@ mod tests {
         let snapshot = resources.memory_snapshot();
         assert_eq!(snapshot.reserved_bytes, 0);
         assert_eq!(snapshot.committed_bytes, 600);
-        assert_eq!(snapshot.by_class[&MemoryClass::Weights].committed_bytes, 600);
+        assert_eq!(
+            snapshot.by_class[&MemoryClass::Weights].committed_bytes,
+            600
+        );
         committed.release();
         let snapshot = resources.memory_snapshot();
         assert_eq!(snapshot.committed_bytes, 0);
@@ -3695,7 +3724,10 @@ mod tests {
             .reserve(7, MemoryClass::Staging, 10)
             .expect("reservation fits");
         let panic = catch_unwind(AssertUnwindSafe(|| drop(reservation)));
-        assert!(panic.is_err(), "lab policy must panic on an obligation leak");
+        assert!(
+            panic.is_err(),
+            "lab policy must panic on an obligation leak"
+        );
         let snapshot = ledger.snapshot();
         assert_eq!(snapshot.reserved_bytes, 0);
         assert_eq!(snapshot.committed_bytes, 0);

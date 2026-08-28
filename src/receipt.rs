@@ -204,7 +204,11 @@ impl ReceiptIdentity {
             .map_err(ReceiptError::Identity)?;
         let (receipt_identity, value) = match disclosure {
             IdentityDisclosure::Public => (
-                Some(execution.receipt_identity().map_err(ReceiptError::Identity)?),
+                Some(
+                    execution
+                        .receipt_identity()
+                        .map_err(ReceiptError::Identity)?,
+                ),
                 Sha256Digest::of_bytes(&canonical),
             ),
             IdentityDisclosure::Committed => {
@@ -304,10 +308,16 @@ fn commitment_message(
     entity_kind: &str,
     bytes: &[u8],
 ) -> Result<Vec<u8>, ReceiptError> {
-    let capacity = [domain.tag().len(), namespace.len(), entity_kind.len(), bytes.len(), 32]
-        .into_iter()
-        .try_fold(0_usize, |total, length| total.checked_add(length))
-        .ok_or(ReceiptError::CommitmentTooLarge)?;
+    let capacity = [
+        domain.tag().len(),
+        namespace.len(),
+        entity_kind.len(),
+        bytes.len(),
+        32,
+    ]
+    .into_iter()
+    .try_fold(0_usize, |total, length| total.checked_add(length))
+    .ok_or(ReceiptError::CommitmentTooLarge)?;
     let mut message = Vec::with_capacity(capacity);
     append_commitment_field(&mut message, domain.tag().as_bytes())?;
     append_commitment_field(&mut message, namespace.as_bytes())?;
@@ -418,9 +428,7 @@ impl ReceiptContent {
             let value_matches_kind = match item.kind {
                 ContentKind::Absent => item.value.is_none(),
                 ContentKind::PublicSha256 => item.value.is_some(),
-                ContentKind::HmacSha256 => {
-                    self.commitment_key_id.is_some() && item.value.is_some()
-                }
+                ContentKind::HmacSha256 => self.commitment_key_id.is_some() && item.value.is_some(),
             };
             if !value_matches_kind {
                 return Err(ReceiptError::InvalidContentItem { kind: item.kind });
@@ -731,9 +739,9 @@ fn validate_identifier(field: &'static str, value: &str) -> Result<(), ReceiptEr
     let valid_first = bytes
         .first()
         .is_some_and(|byte| byte.is_ascii_alphanumeric());
-    let valid_rest = bytes.iter().all(|byte| {
-        byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'/' | b'-')
-    });
+    let valid_rest = bytes
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'/' | b'-'));
     if !valid_first || !valid_rest || bytes.len() > 256 {
         return Err(ReceiptError::InvalidField {
             field,
@@ -909,7 +917,12 @@ mod tests {
             .commit(CommitmentDomain::Input, "receipt-fixture", "input", private)
             .expect("input commitment");
         let output = key
-            .commit(CommitmentDomain::Output, "receipt-fixture", "output", private)
+            .commit(
+                CommitmentDomain::Output,
+                "receipt-fixture",
+                "output",
+                private,
+            )
             .expect("output commitment");
         assert_ne!(input.hmac_sha256, output.hmac_sha256);
 

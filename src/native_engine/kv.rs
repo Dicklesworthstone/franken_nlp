@@ -100,16 +100,13 @@ pub struct KvSlabAdmission {
 
 impl KvSlabAdmission {
     /// Prices `positions` using a checked baseline 44-slot bf16 layout.
-    pub fn try_for_positions(
-        positions: usize,
-        page_tokens: usize,
-    ) -> Result<Self, KvSlabError> {
+    pub fn try_for_positions(positions: usize, page_tokens: usize) -> Result<Self, KvSlabError> {
         if page_tokens == 0 {
             return Err(KvSlabError::InvalidPageTokens { page_tokens });
         }
-        let logical_bf16_bytes = positions.checked_mul(KV_BYTES_PER_TOKEN).ok_or(
-            KvSlabError::AdmissionArithmeticOverflow { positions },
-        )?;
+        let logical_bf16_bytes = positions
+            .checked_mul(KV_BYTES_PER_TOKEN)
+            .ok_or(KvSlabError::AdmissionArithmeticOverflow { positions })?;
         let completed_pages = positions / page_tokens;
         let reserved_page_count = completed_pages
             .checked_add(usize::from(positions % page_tokens != 0))
@@ -213,13 +210,14 @@ impl KvSlabKey {
             .ok_or(KvSlabError::AdmissionArithmeticOverflow {
                 positions: token_start,
             })?;
-        let end = loop_layer_start.checked_add(loop_layer_count).ok_or(
-            KvSlabError::InvalidSlabKey {
-                token_count,
-                loop_layer_start,
-                loop_layer_count,
-            },
-        )?;
+        let end =
+            loop_layer_start
+                .checked_add(loop_layer_count)
+                .ok_or(KvSlabError::InvalidSlabKey {
+                    token_count,
+                    loop_layer_start,
+                    loop_layer_count,
+                })?;
         if end > KV_SLOT_COUNT {
             return Err(KvSlabError::InvalidSlabKey {
                 token_count,
@@ -669,13 +667,14 @@ impl KvPhysicalSlab {
                 actual: output.len(),
             });
         }
-        let source = self.vectors.get(position_in_slab).ok_or(
-            KvSlabError::NonAppendSlabPosition {
-                slot,
-                expected_position: self.vectors.len(),
-                received_position: position_in_slab,
-            },
-        )?;
+        let source =
+            self.vectors
+                .get(position_in_slab)
+                .ok_or(KvSlabError::NonAppendSlabPosition {
+                    slot,
+                    expected_position: self.vectors.len(),
+                    received_position: position_in_slab,
+                })?;
         output.copy_from_slice(&source.values);
         let _ = vector;
         Ok(())
@@ -809,36 +808,34 @@ impl KvSlabPool {
     /// slabs are not yet reachable from a page table.
     fn require_acquire_capacity(&self, requested: usize) -> Result<(), KvSlabError> {
         self.require_free(requested)?;
-        let requested_payload_bytes = requested
-            .checked_mul(self.slab_payload_bytes)
-            .ok_or(KvSlabError::AdmissionArithmeticOverflow {
+        let requested_payload_bytes = requested.checked_mul(self.slab_payload_bytes).ok_or(
+            KvSlabError::AdmissionArithmeticOverflow {
                 positions: requested,
-            })?;
+            },
+        )?;
         self.live_payload_bytes
             .checked_add(requested_payload_bytes)
             .ok_or(KvSlabError::AdmissionArithmeticOverflow {
                 positions: self.live_slab_count,
             })?;
-        self.allocation_events
-            .checked_add(requested)
-            .ok_or(KvSlabError::AdmissionArithmeticOverflow {
+        self.allocation_events.checked_add(requested).ok_or(
+            KvSlabError::AdmissionArithmeticOverflow {
                 positions: self.allocation_events,
-            })?;
+            },
+        )?;
         Ok(())
     }
 
     fn slab(&self, slab_id: KvSlabId) -> Result<&KvPhysicalSlab, KvSlabError> {
-        self.slabs.get(slab_id.0).ok_or(KvSlabError::UnknownSlab {
-            slab_id: slab_id.0,
-        })
+        self.slabs
+            .get(slab_id.0)
+            .ok_or(KvSlabError::UnknownSlab { slab_id: slab_id.0 })
     }
 
     fn slab_mut(&mut self, slab_id: KvSlabId) -> Result<&mut KvPhysicalSlab, KvSlabError> {
         self.slabs
             .get_mut(slab_id.0)
-            .ok_or(KvSlabError::UnknownSlab {
-                slab_id: slab_id.0,
-            })
+            .ok_or(KvSlabError::UnknownSlab { slab_id: slab_id.0 })
     }
 
     fn acquire(&mut self, key: KvSlabKey) -> Result<KvSlabId, KvSlabError> {
@@ -865,12 +862,11 @@ impl KvSlabPool {
             .ok_or(KvSlabError::AdmissionArithmeticOverflow {
                 positions: self.live_slab_count,
             })?;
-        let allocation_events = self
-            .allocation_events
-            .checked_add(1)
-            .ok_or(KvSlabError::AdmissionArithmeticOverflow {
+        let allocation_events = self.allocation_events.checked_add(1).ok_or(
+            KvSlabError::AdmissionArithmeticOverflow {
                 positions: self.allocation_events,
-            })?;
+            },
+        )?;
         let slab_id = self
             .free
             .pop()
@@ -893,9 +889,7 @@ impl KvSlabPool {
         slab.references = slab
             .references
             .checked_add(1)
-            .ok_or(KvSlabError::SlabRefcountOverflow {
-                slab_id: slab_id.0,
-            })?;
+            .ok_or(KvSlabError::SlabRefcountOverflow { slab_id: slab_id.0 })?;
         slab.sealed = true;
         Ok(())
     }
@@ -903,9 +897,7 @@ impl KvSlabPool {
     fn release(&mut self, slab_id: KvSlabId) -> Result<(), KvSlabError> {
         let slab = self.slab_mut(slab_id)?;
         if slab.references == 0 {
-            return Err(KvSlabError::SlabRefcountUnderflow {
-                slab_id: slab_id.0,
-            });
+            return Err(KvSlabError::SlabRefcountUnderflow { slab_id: slab_id.0 });
         }
         slab.references -= 1;
         if slab.references == 0 {
@@ -927,9 +919,7 @@ impl KvSlabPool {
     fn key(&self, slab_id: KvSlabId) -> Result<KvSlabKey, KvSlabError> {
         self.slab(slab_id)?
             .key
-            .ok_or(KvSlabError::UnknownSlab {
-                slab_id: slab_id.0,
-            })
+            .ok_or(KvSlabError::UnknownSlab { slab_id: slab_id.0 })
     }
 
     fn copy_contents(
@@ -1007,9 +997,7 @@ impl KvSlabPool {
             .slab(slab_id)?
             .vectors
             .get(position_in_slab)
-            .ok_or(KvSlabError::UnknownSlab {
-                slab_id: slab_id.0,
-            })?;
+            .ok_or(KvSlabError::UnknownSlab { slab_id: slab_id.0 })?;
         Ok((vector.values.as_ptr() as usize) % KV_SLAB_VECTOR_ALIGNMENT_BYTES)
     }
 }
@@ -1199,9 +1187,12 @@ impl KvSlabCache {
             });
         }
         let page_index = position / self.page_tokens;
-        let page = self.pages.get(page_index).ok_or(KvSlabError::PageCapacityExceeded {
-            capacity_positions: self.max_positions,
-        })?;
+        let page = self
+            .pages
+            .get(page_index)
+            .ok_or(KvSlabError::PageCapacityExceeded {
+                capacity_positions: self.max_positions,
+            })?;
         let position_in_slab = position - page.token_start;
         let key_slab = page.slabs[slot][slab_vector_index(KvVector::Key)];
         let value_slab = page.slabs[slot][slab_vector_index(KvVector::Value)];
@@ -1259,21 +1250,19 @@ impl KvSlabCache {
             return Err(KvSlabError::ForkDuringAppend { position });
         }
         let mut pages = Vec::new();
-        pages
-            .try_reserve_exact(self.pages.len())
-            .map_err(|_| KvSlabError::PoolAllocationRefused {
+        pages.try_reserve_exact(self.pages.len()).map_err(|_| {
+            KvSlabError::PoolAllocationRefused {
                 slab_capacity: self.pages.len() * KV_SLABS_PER_LOGICAL_PAGE,
                 page_tokens: self.page_tokens,
-            })?;
+            }
+        })?;
         pages.extend_from_slice(&self.pages);
         let mut pool = self.pool.borrow_mut();
         for page in &pages {
             for slabs in &page.slabs {
                 for slab_id in slabs {
                     if pool.refcount(*slab_id)? == usize::MAX {
-                        return Err(KvSlabError::SlabRefcountOverflow {
-                            slab_id: slab_id.0,
-                        });
+                        return Err(KvSlabError::SlabRefcountOverflow { slab_id: slab_id.0 });
                     }
                 }
             }
@@ -1333,11 +1322,11 @@ impl KvSlabCache {
                 received: page_index * self.page_tokens,
             });
         }
-        let token_start = page_index
-            .checked_mul(self.page_tokens)
-            .ok_or(KvSlabError::AdmissionArithmeticOverflow {
+        let token_start = page_index.checked_mul(self.page_tokens).ok_or(
+            KvSlabError::AdmissionArithmeticOverflow {
                 positions: page_index,
-            })?;
+            },
+        )?;
         let mut slabs = [[KvSlabId(usize::MAX); 2]; KV_SLOT_COUNT];
         let mut pool = self.pool.borrow_mut();
         pool.require_acquire_capacity(KV_SLABS_PER_LOGICAL_PAGE)?;
@@ -1360,9 +1349,12 @@ impl KvSlabCache {
     }
 
     fn copy_page_tail_if_shared(&mut self, page_index: usize) -> Result<(), KvSlabError> {
-        let page = self.pages.get_mut(page_index).ok_or(KvSlabError::PageCapacityExceeded {
-            capacity_positions: self.max_positions,
-        })?;
+        let page = self
+            .pages
+            .get_mut(page_index)
+            .ok_or(KvSlabError::PageCapacityExceeded {
+                capacity_positions: self.max_positions,
+            })?;
         let old_slabs = page.slabs;
         let mut pool = self.pool.borrow_mut();
         let mut needs_copy = false;
@@ -1419,13 +1411,9 @@ impl KvSlabCache {
         }
         let slab_id = self.slab_id_at(slot, position, vector)?;
         let page = &self.pages[position / self.page_tokens];
-        self.pool.borrow().copy_vector(
-            slab_id,
-            slot,
-            position - page.token_start,
-            vector,
-            output,
-        )
+        self.pool
+            .borrow()
+            .copy_vector(slab_id, slot, position - page.token_start, vector, output)
     }
 
     fn slab_id_at(

@@ -8,8 +8,8 @@ use std::{
 
 use franken_nlp::native_engine::{
     rope::{
-        RopeError, RopeProjectionVariant, RopeTablesF32, DEFAULT_ADMITTED_CONTEXT_CAP,
-        NANBEIGE_HEAD_DIM, NANBEIGE_ROPE_THETA,
+        DEFAULT_ADMITTED_CONTEXT_CAP, NANBEIGE_HEAD_DIM, NANBEIGE_ROPE_THETA, RopeError,
+        RopeProjectionVariant, RopeTablesF32,
     },
     tensor::Bf16,
 };
@@ -356,10 +356,12 @@ fn hf_bf16_eager_rope_application_matches_captured_qk_head() {
         "the fresh capture receipt must stay bound to the source manifest that names both weight shards"
     );
     assert_eq!(receipt.oracle_env_record_sha256.len(), 64);
-    assert!(receipt
-        .oracle_env_record_sha256
-        .bytes()
-        .all(|byte| byte.is_ascii_hexdigit()));
+    assert!(
+        receipt
+            .oracle_env_record_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    );
 
     let mut query = parse_bf16_vector(
         &application.query_input_bf16_hex,
@@ -463,11 +465,13 @@ fn hf_bf16_eager_rope_decode_append_matches_captured_qk_head() {
         "the decode capture receipt must stay bound to the source manifest that names both weight shards"
     );
     assert_eq!(fixture.receipt.oracle_env_record_sha256.len(), 64);
-    assert!(fixture
-        .receipt
-        .oracle_env_record_sha256
-        .bytes()
-        .all(|byte| byte.is_ascii_hexdigit()));
+    assert!(
+        fixture
+            .receipt
+            .oracle_env_record_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    );
 
     let mut query = parse_bf16_vector(
         &application.query_input_bf16_hex,

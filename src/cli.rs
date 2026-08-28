@@ -492,17 +492,13 @@ fn run_convert_command(
         },
         Err(error) => emit_convert_refusal(error),
     }
- }
+}
 
 /// Emit a `convert_stage` robot event to stdout when `request.robot` is true;
 /// a no-op otherwise. Mirrors the human `CONVERT STAGE=... RESULT=...`
 /// transcript and lets consumers of `fnlp convert --robot` see the same
 /// stage boundaries the schema advertises.
-fn emit_convert_robot_stage(
-    request: &ConvertRequest,
-    stage: &str,
-    result: &str,
-) {
+fn emit_convert_robot_stage(request: &ConvertRequest, stage: &str, result: &str) {
     if !request.robot {
         return;
     }
@@ -636,8 +632,6 @@ impl ConversionStagingGuard {
         let _ = std::fs::remove_file(path);
     }
 }
-
-
 
 fn run_streaming_convert(
     request: &ConvertRequest,
@@ -1048,17 +1042,37 @@ fn write_canonical_receipt_sidecar(
     // receipt is unlinked. After a successful publish we transfer the path
     // out of the guard so the forensic copy survives.
     let mut receipt_guard = ConversionStagingGuard::new(staging_path);
-    file.write_all(json.as_bytes())
-        .map_err(|error| format!("write staged receipt {}: {error}", receipt_guard.path().display()))?;
-    file.sync_all()
-        .map_err(|error| format!("sync staged receipt {}: {error}", receipt_guard.path().display()))?;
+    file.write_all(json.as_bytes()).map_err(|error| {
+        format!(
+            "write staged receipt {}: {error}",
+            receipt_guard.path().display()
+        )
+    })?;
+    file.sync_all().map_err(|error| {
+        format!(
+            "sync staged receipt {}: {error}",
+            receipt_guard.path().display()
+        )
+    })?;
     drop(file);
-    let reloaded = fs::read(receipt_guard.path())
-        .map_err(|error| format!("read staged receipt {}: {error}", receipt_guard.path().display()))?;
-    let reloaded = std::str::from_utf8(&reloaded)
-        .map_err(|error| format!("decode staged receipt {}: {error}", receipt_guard.path().display()))?;
-    let parsed = ConversionReceipt::parse_canonical_json(reloaded)
-        .map_err(|error| format!("parse staged receipt {}: {error}", receipt_guard.path().display()))?;
+    let reloaded = fs::read(receipt_guard.path()).map_err(|error| {
+        format!(
+            "read staged receipt {}: {error}",
+            receipt_guard.path().display()
+        )
+    })?;
+    let reloaded = std::str::from_utf8(&reloaded).map_err(|error| {
+        format!(
+            "decode staged receipt {}: {error}",
+            receipt_guard.path().display()
+        )
+    })?;
+    let parsed = ConversionReceipt::parse_canonical_json(reloaded).map_err(|error| {
+        format!(
+            "parse staged receipt {}: {error}",
+            receipt_guard.path().display()
+        )
+    })?;
     if &parsed != receipt {
         return Err(format!(
             "reloaded receipt differs from canonical serialization: {}",

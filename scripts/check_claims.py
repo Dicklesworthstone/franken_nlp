@@ -86,7 +86,7 @@ R4_REQUIRED_FIELDS = (
     "Admission boundary outcomes",
 )
 DEFAULT_CONTEXT_CAP = 8_192
-NUMERIC_RE = re.compile(r"(?<![A-Za-z_])\d+(?:[.,]\d+)?(?:\s*(?:%|×|x|tok/s|KiB|MiB|GiB|GB|B))?", re.IGNORECASE)
+NUMERIC_RE = re.compile(r"(?<![A-Za-z_0-9])\d+(?:[.,]\d+)?(?:\s*(?:%|×|x|tok/s|KiB|MiB|GiB|GB|B))?", re.IGNORECASE)
 SUPERLATIVE_RE = re.compile(
     r"\b(?:best|fastest|faster|smallest|largest|lowest|highest|only|exact|verified|proven|guaranteed|deterministic|secure|safe)\b",
     re.IGNORECASE,
