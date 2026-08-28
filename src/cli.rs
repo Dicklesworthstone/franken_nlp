@@ -30,7 +30,7 @@ use crate::{
     error::ErrorCode,
     grammar::{CompileLimits, CompiledSchema, SchemaError, compile_json_schema},
     orchestrator::{AdmissionRequest, KvCacheQuantization, ResidencyAccounting},
-    robot::{self, RobotCommand},
+    robot::{self, RobotCommand, RobotConvertStageEvent},
 };
 use clap::{CommandFactory, Parser, Subcommand};
 
@@ -463,6 +463,7 @@ fn run_convert_command(
         request.source_dir.display(),
         request.source_manifest.display(),
     );
+    emit_convert_robot_stage(&request, "census", "START");
     match prepare_convert_request(&request, DEFAULT_PANEL_BYTES) {
         Ok(prepared) => match prepared.generic_payload_plan() {
             Ok(generic) => {
@@ -472,6 +473,7 @@ fn run_convert_command(
                     prepared.census_sha256(),
                     prepared.tensor_count(),
                 );
+                emit_convert_robot_stage(&request, "census", "END");
                 emit_convert_preflight(&prepared, &generic);
                 let confirmation = match confirm_convert(&request, input, stdin_is_terminal) {
                     Ok(mode) => mode,
@@ -483,11 +485,33 @@ fn run_convert_command(
                     }
                 };
                 eprintln!("CONVERT STAGE=confirmation RESULT={confirmation}");
+                emit_convert_robot_stage(&request, "confirmation", confirmation);
                 run_streaming_convert(&request, &prepared, &generic)
             }
             Err(error) => emit_convert_refusal(error),
         },
         Err(error) => emit_convert_refusal(error),
+    }
+ }
+
+/// Emit a `convert_stage` robot event to stdout when `request.robot` is true;
+/// a no-op otherwise. Mirrors the human `CONVERT STAGE=... RESULT=...`
+/// transcript and lets consumers of `fnlp convert --robot` see the same
+/// stage boundaries the schema advertises.
+fn emit_convert_robot_stage(
+    request: &ConvertRequest,
+    stage: &str,
+    result: &str,
+) {
+    if !request.robot {
+        return;
+    }
+    let event = RobotConvertStageEvent::new(stage, result)
+        .with_source(request.source_dir.display().to_string())
+        .with_source_manifest(request.source_manifest.display().to_string())
+        .with_destination(request.output.display().to_string());
+    if let Err(error) = robot::write_convert_stage_event(&mut io::stdout().lock(), &event) {
+        eprintln!("CONVERT ROBOT RESULT=FAIL stage={stage} reason={error}");
     }
 }
 
@@ -614,13 +638,6 @@ impl ConversionStagingGuard {
 }
 
 
-impl Drop for ConversionStagingGuard {
-    fn drop(&mut self) {
-        if let Some(path) = self.path.take() {
-            self.unlink_staging(&path);
-        }
-    }
-}
 
 fn run_streaming_convert(
     request: &ConvertRequest,
@@ -634,6 +651,7 @@ fn run_streaming_convert(
         "CONVERT STAGE=plan RESULT=START tensors={}",
         prepared.tensor_count()
     );
+    emit_convert_robot_stage(request, "plan", "START");
     let materialized = match read_materialized_sources(prepared) {
         Ok(value) => value,
         Err(error) => return emit_streaming_refusal("materialized-sources", error),
@@ -647,6 +665,7 @@ fn run_streaming_convert(
         plan.input.tensors.len(),
         plan.input.sections.len(),
     );
+    emit_convert_robot_stage(request, "plan", "END");
     let (staging_path, mut output) = match create_conversion_stage(&request.output) {
         Ok(stage) => stage,
         Err(error) => return emit_streaming_refusal("create-staging", error),
@@ -661,6 +680,7 @@ fn run_streaming_convert(
         request.output.display(),
         prepared.tensor_count(),
     );
+    emit_convert_robot_stage(request, "emission", "START");
     let written = match write_streaming(&plan.input, &mut output, |section, sink| {
         emit_streaming_section(
             &request.source_dir,
@@ -735,6 +755,7 @@ fn run_streaming_convert(
         receipt.staging_path.display(),
         receipt.sha256,
     );
+    emit_convert_robot_stage(request, "receipt", "PASS");
     emit_converted_unqualified(
         &request.output,
         &staging_path,
