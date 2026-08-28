@@ -666,7 +666,14 @@ impl MetadataStore {
     /// Persists a numeric metric when persistence is enabled.
     pub fn record_metric(&self, record: MetricMetadata) -> Result<(), StorageError> {
         match self {
-            Self::Disabled => Ok(()),
+            // The `record` parameter is intentionally consumed only by the
+            // feature-gated `Enabled` arm. Acknowledging it here silences the
+            // default-build `unused_variable` warning without renaming the
+            // public-API parameter.
+            Self::Disabled => {
+                let _ = record;
+                Ok(())
+            }
             #[cfg(feature = "metadata-store")]
             Self::Enabled(store) => store.record_metric(record),
         }
@@ -675,7 +682,10 @@ impl MetadataStore {
     /// Persists a typed error summary when persistence is enabled.
     pub fn record_error(&self, record: ErrorMetadata) -> Result<(), StorageError> {
         match self {
-            Self::Disabled => Ok(()),
+            Self::Disabled => {
+                let _ = record;
+                Ok(())
+            }
             #[cfg(feature = "metadata-store")]
             Self::Enabled(store) => store.record_error(record),
         }
@@ -684,7 +694,10 @@ impl MetadataStore {
     /// Reads a stored job state without exposing arbitrary database values.
     pub fn job_state(&self, job_id: MetadataId) -> Result<Option<JobState>, StorageError> {
         match self {
-            Self::Disabled => Ok(None),
+            Self::Disabled => {
+                let _ = job_id;
+                Ok(None)
+            }
             #[cfg(feature = "metadata-store")]
             Self::Enabled(store) => store.job_state(job_id),
         }
@@ -693,7 +706,10 @@ impl MetadataStore {
     /// Reads a stored item state without exposing arbitrary database values.
     pub fn item_state(&self, item_id: MetadataId) -> Result<Option<JobState>, StorageError> {
         match self {
-            Self::Disabled => Ok(None),
+            Self::Disabled => {
+                let _ = item_id;
+                Ok(None)
+            }
             #[cfg(feature = "metadata-store")]
             Self::Enabled(store) => store.item_state(item_id),
         }

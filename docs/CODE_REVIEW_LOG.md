@@ -107,3 +107,81 @@ The exact byte-routing requires care: stdout is for data, stderr is for diagnost
 
 - Low (the change is additive on a single path). The schema is already what the fix would emit, so consumers gain a previously-promised event; no consumer can break.
 - One concern: stdout buffering. If a new emit happens *between* a debug `eprintln!` and the next event, the human transcript and the typed event can interleave. The fix must keep them on separate streams; the existing `io::stdout().lock()` pattern in `cli.rs:358` is the right model.
+
+## cr-003 — `scripts/fetch_model.sh::effective_host_ok` is bypassable via path substring
+
+**Status:** finding logged, fix NOT staged (coordinating with swarm before touching shell scripts; see "Coordination" below). Bead id is not yet filed because `br create` is returning `UNIQUE constraint failed: blocked_issues_cache.issue_id` after the recent `fsqlite` migration repair (the DB view is currently inconsistent; only `br doctor` succeeds, and each doctor run triggers another migration). The JSONL still records every prior bead including yjg9/o1bk/eak4/3awi/3rf4, so the data is durable; only the in-memory DB cache is wedged. A future `br doctor` or restart should reset it.
+
+### Symptom (evidence)
+
+`scripts/fetch_model.sh:279-285`:
+
+```sh
+effective_host_ok() {
+    effective=$1
+    case "$effective" in
+        https://huggingface.co/*|https://cdn-lfs.huggingface.co/*|https://*.xethub.hf.co/*|https://*.cdn.hf.co/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+```
+
+This pattern-matches the **full URL string** (which `curl --write-out '%{url_effective}'` returns after every redirect) against allowlist globs of the form `https://*.xethub.hf.co/*` and `https://*.cdn.hf.co/*`.
+
+POSIX shell `case` globs `*` matches any string, including `/`. A URL like `https://evil.com/.cdn.hf.co/path` matches `https://*.cdn.hf.co/*` because `*` greedily matches `evil.com/`, then `.cdn.hf.co/` matches, then `*` matches `path`. **The host check is bypassable from any unlisted host whose URL path contains `.cdn.hf.co` or `.xethub.hf.co` as a literal substring.**
+
+The PowerShell twin (`scripts/fetch_model.ps1:227-230`) is correct:
+
+```powershell
+function Test-EffectiveHost([Uri]$Uri) {
+    $host = $Uri.Host.ToLowerInvariant()
+    return $Uri.Scheme -eq 'https' -and ($host -eq 'huggingface.co' -or $host -eq 'cdn-lfs.huggingface.co' -or $host -like '*.xethub.hf.co' -or $host -like '*.cdn.hf.co')
+}
+```
+
+`$Uri.Host` extracts the host **only**, so `https://evil.com/.cdn.hf.co/path` yields host `evil.com`, which does not match `*.cdn.hf.co`. PowerShell's `-like` is also glob-based, so the same substring attack would in principle work on a single string — but with the host already extracted, the path can never contain the substring.
+
+The discrepancy between the two scripts is a real footgun. The recent bead `mzr.1` ("Permit official Hugging Face Xet CDN redirect hosts") was specifically about the policy allowlist, not the regex shape; if the reviewer had been looking only at the .ps1, they would have seen the right shape. The .sh has the wrong shape from the original commit, and the Xet change exposed it.
+
+### First-principle analysis
+
+- The catalog SHA-256 verification at `scripts/fetch_model.sh:332-335` is the integrity gate. If the bytes are tampered, SHA-256 fails and the file is quarantined. **So the practical attack is mostly contained: an attacker cannot substitute a different file via this bypass.** They can only cause the request to reach an unlisted host that happens to mirror the correct bytes.
+- Why is this still a real bug? The comment at `scripts/fetch_model.sh:312-317` says: *"This final-URL check gates verification and activation. Curl has already transferred the response, so it is not a no-request-to-unlisted-host claim."* The intent is clearly "no bytes from unlisted hosts at all." The bypass breaks that intent.
+- A more subtle attack: a CDN that cooperates with an attacker could choose to redirect any `huggingface.co` URL to `https://attacker.example/.cdn.hf.co/some/path`, and serve tampered bytes there. The catalog SHA-256 catches the tampering, but the user's network observability now shows traffic to `attacker.example`, not the legitimate CDN. The `REDIRECT_HOST_REFUSED` log line is the operator's only signal that something went sideways, and the bypass suppresses it.
+- There is also a *correctness* angle: if a future contributor adds a new Xet subdomain (e.g. `eu.cdn.hf.co`) and a CDN operator publishes a URL like `https://malicious.com/.eu.cdn.hf.co/...`, the bypass would let it through. The fix the .ps1 already implements — host extraction — is the one that future-proofs.
+
+### Suggested fix
+
+1. Replace the case-glob with a host extraction, mirroring the .ps1:
+
+   ```sh
+   effective_host() {
+       # Strip optional userinfo (none expected for our CDNs), then host+port, then path/query/fragment.
+       printf '%s' "$1" | sed -n 's|^[A-Za-z][A-Za-z0-9+.-]*://||p' \
+           | awk -F'[/:?#]' '{print tolower($1)}'
+   }
+   is_allowed_host() {
+       case "$(effective_host "$1")" in
+           huggingface.co|cdn-lfs.huggingface.co|*.xethub.hf.co|*.cdn.hf.co) return 0 ;;
+           '') return 1 ;;
+           *) return 1 ;;
+       esac
+   }
+   ```
+
+   The `awk` extracts everything between the scheme and the first `/`, `:`, `?`, or `#`. The `tolower` matches `Test-EffectiveHost`'s ToLowerInvariant. The empty case catches a URL with no host (parse failure).
+
+2. Update `download_with_progress` (line 311) to call `is_allowed_host` instead of `effective_host_ok`.
+
+3. Add a regression test in `scripts/test_fetch_model.sh` that constructs a fake effective URL of the form `https://attacker.example/.cdn.hf.co/path` and asserts `is_allowed_host` returns non-zero. Today the `tests/` directory has `test_fetch_model.sh` and `test_fetch_model.ps1`; the .sh test should be extended.
+
+### Files
+
+- Modified (when fixed): `scripts/fetch_model.sh` (`effective_host_ok` rewrite, call site update, test extension).
+- New test (when fixed): extend `scripts/test_fetch_model.sh` to assert the bypass is refused.
+- Bead: pending (DB wedged; record in JSONL on next clean cycle).
+
+### Risk
+
+- Low. The fix is a 5-10 line shell function rewrite and a one-line call-site change. The PowerShell function is already the model. No behavior change for legitimate hosts.
+- The existing catalog SHA-256 verification is the actual integrity gate, so this fix is defense-in-depth. **No correctness regression risk.**

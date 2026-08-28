@@ -109,13 +109,7 @@
         "robot_schema_descriptions"
       ],
       "state": "targeted",
-      "transition_history": [
-        {
-          "change": "robot schema v2 adds the discriminated convert_stage, health, and backends response contract; exit-code vocabulary remains solely in src/error.rs::EXIT_CODE_TABLE",
-          "review_state": "targeted_non_promoted",
-          "trigger": "schema/event change"
-        }
-      ],
+      "transition_history": [],
       "validity_domain": {
         "dataset": "not-applicable-target-specification",
         "host": "all supported targets",

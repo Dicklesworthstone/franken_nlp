@@ -394,6 +394,13 @@ fn run_models_derive(command: ModelsDeriveCommand) -> ExitCode {
             return ErrorCode::Usage.as_process_exit();
         }
     };
+    // `open_ratified_model_root` is platform-surface-gated to always return
+    // `Err` (see docs/PLATFORM_SURFACES.md and src/artifact/fs_tx.rs), so the
+    // `if let Err` pattern is structurally irrefutable. We need `error` inside
+    // the body to render the refusal log; `let-else` would not bind the
+    // pattern variable into the else-block, so we silence the lint with an
+    // explicit `#[allow]` rather than rewrite the divergence handler.
+    #[allow(irrefutable_let_patterns)]
     if let Err(error) = open_ratified_model_root(&command.model_dir) {
         eprintln!(
             "MODELS_DERIVE RESULT=REFUSED stage=model-root generic={} model_dir={} arch={} tile_table_version={} reason={error}",

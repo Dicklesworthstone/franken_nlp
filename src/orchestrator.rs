@@ -594,7 +594,14 @@ impl fmt::Display for ReservationError {
 }
 
 impl std::error::Error for ReservationError {}
-
+// Every public/private method on `MemoryLedger` is only reachable through
+// `EngineResources::new` and `new_for_test`, both of which are gated behind
+// `#[cfg(feature = "asupersync-runtime")]` and `#[cfg(all(test, ...))]`
+// respectively. A default `cargo check` (no features, no tests) therefore
+// reports the entire impl as dead. The structural design is correct; the
+// allow attribute names that as the intended feature-gating rather than a
+// mistake.
+#[allow(dead_code)]
 impl MemoryLedger {
     fn new(ceiling_bytes: u64, leak_response_policy: LeakResponsePolicy) -> Self {
         Self {
