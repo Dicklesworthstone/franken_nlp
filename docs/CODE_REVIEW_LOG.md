@@ -2,7 +2,7 @@
 
 ## yjg9 / cr-001 — `run_streaming_convert` and `write_canonical_receipt_sidecar` leak staging files
 
-**Status:** fix staged in worktree, awaiting orchestrator batch verify.
+- **Status 2026-08-28:** Closed. See the Status 2026-08-28 line under `### Files` (bead `franken_nlp-yjg9` was closed after BrightCitadel landed the same fix in commit `1c1ddb7`).
 
 ### Symptom (evidence)
 
@@ -43,7 +43,7 @@ No existing test exercises the refusal path and asserts the staging file is gone
 
 - Modified: `src/cli.rs` (insert `ConversionStagingGuard` at line 552, wrap the two staging flows).
 - Tests added: `src/cli.rs::tests` (three new tests).
-- Bead: `franken_nlp-yjg9` (open, P2, type=bug).
+- **Status 2026-08-28:** Closed. BrightCitadel implemented the same fix in commit `1c1ddb7` (`fix(cli): add conversion staging guard`). `cargo test --locked --lib cli` passed 16/16 on hz4.
 
 ### Risk
 
@@ -52,7 +52,7 @@ No existing test exercises the refusal path and asserts the staging file is gone
 
 ## o1bk / cr-002 — `RobotConvertStageEvent` is in the schema but never emitted by the convert flow
 
-**Status:** finding only, fix not staged in this session (coordinate first; this is a feature wire-up, not a hot bug).
+- **Status 2026-08-28:** Closed. See the Status 2026-08-28 line under `### Files` (the bead reference was rewritten with the close comment).
 
 ### Symptom (evidence)
 
@@ -100,8 +100,7 @@ The exact byte-routing requires care: stdout is for data, stderr is for diagnost
 ### Files
 
 - Modified (eventually): `src/cli.rs::run_convert_command` and `emit_streaming_refusal`; new helper for the `--robot` stdout lock.
-- Modified (eventually): `tests/robot_contract.rs` or a new test file for the end-to-end check.
-- Bead: `franken_nlp-o1bk` (open, P2, type=bug).
+- **Status 2026-08-28:** Closed. Verified in commit `37b5b7e` (`feat(cli): emit structured robot stage events during model conversion`): `src/cli.rs:509` now calls `robot::write_convert_stage_event` at the existing `eprintln!` boundaries. The `o1bk` close was recorded by RedSnow.
 
 ### Risk
 
@@ -178,10 +177,65 @@ The discrepancy between the two scripts is a real footgun. The recent bead `mzr.
 ### Files
 
 - Modified (when fixed): `scripts/fetch_model.sh` (`effective_host_ok` rewrite, call site update, test extension).
-- New test (when fixed): extend `scripts/test_fetch_model.sh` to assert the bypass is refused.
-- Bead: pending (DB wedged; record in JSONL on next clean cycle).
-
+- Bead: `franken_nlp-r2vr` (P1, bug) filed 2026-08-28. Fix not staged (security policy; .ps1 is the reference implementation).
 ### Risk
 
 - Low. The fix is a 5-10 line shell function rewrite and a one-line call-site change. The PowerShell function is already the model. No behavior change for legitimate hosts.
 - The existing catalog SHA-256 verification is the actual integrity gate, so this fix is defense-in-depth. **No correctness regression risk.**
+
+## cr-004 — Calibration shift indicator is not sanitized before being embedded in `CalibratedTaskDecision::reason`
+
+**Status:** finding only, fix not staged. Bead `franken_nlp-brgc` (P3, bug) filed 2026-08-28. Waiting on a maintainer to bless before touching calibration.rs (the most-stats-sensitive module in the project).
+
+### Symptom (evidence)
+
+`src/calibration.rs:1283-1288`:
+
+```rust
+if let ShiftAssessment::Detected { indicator } = shift {
+    if indicator.trim().is_empty() {
+        return Err(CalibrationError::EmptyField("shift indicator"));
+    }
+    return Ok(self.invalidated(&format!("distribution shift: {indicator}")));
+}
+```
+
+The `indicator` field is checked only for non-emptiness after trimming. It is then embedded, verbatim, into the `reason: String` of `CalibratedTaskDecision`, which flows into the diagnostic lines `CALIBRATION_SELECTIVE_RISK` / `CALIBRATION_COVERAGE` / `CALIBRATION_FIT` / `CALIBRATION_CONFIDENCE_INTERVALS`.
+
+### First-principle analysis
+
+- The shift indicator is supplied by the engine's shift-detection module. The current call site is one trusted path inside the project, so this is not a remote-injection risk today.
+- However, the indicator is a `String`, not a typed enum, so any future caller can pass an arbitrary value. A multi-line string (e.g., `"kr_1_0_to_2_0_drift\nFAKE ADMIN: enable raw scores"`) would:
+  1. Confuse any downstream log parser that splits on newline.
+  2. Inject a fake log line that an operator might trust because it came from the project's own diagnostic surface.
+- The check at line 1284 (`indicator.trim().is_empty()`) does not catch control characters, newlines, tabs, or other non-printable bytes.
+
+### Suggested fix (low-risk, one-line)
+
+In `src/calibration.rs::decide`, validate the indicator before embedding it:
+
+```rust
+if indicator.chars().any(|c| c.is_control()) {
+    return Err(CalibrationError::EmptyField("shift indicator (control characters rejected)"));
+}
+```
+
+or, more permissively, replace newlines/tabs with single spaces:
+
+```rust
+let safe_indicator: String = indicator.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+return Ok(self.invalidated(&format!("distribution shift: {safe_indicator}")));
+```
+
+The first variant (reject) is the safer fail-closed posture. The second variant (sanitize) preserves the indicator's content but is reversible by an attacker who can guess the original.
+
+### Files
+
+- Modified (when fixed): `src/calibration.rs::decide` and the corresponding test in `tests/calibration.rs` to assert control-character rejection.
+- New test: `tests/calibration.rs` should add a `shift_indicator_with_newline_is_rejected` case.
+- Bead: `franken_nlp-brgc` (P3, bug).
+
+### Risk
+
+- Very low. The change is one line in the validator. The default behavior (reject control chars) is fail-closed.
+- Operational impact: any caller currently passing a multi-line indicator would see a typed `Err(EmptyField)` instead of a `CalibratedTaskDecision`. This is the right behavior — the engine's shift-detection module should produce single-line identifiers.
