@@ -111,6 +111,8 @@ impl<'tokenizer, 'registry> UntrustedDocumentEncoder<'tokenizer, 'registry> {
 /// Typed preflight rejection.  There is no lossy/drop/substitution branch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UntrustedDocumentError {
+    Encode(EncodeError),
+    Decode(DecodeBytesError),
     ForbiddenControl {
         /// Index of the offending token in the encoded id stream, NOT a byte
         /// offset into the source. The current encode API does not surface
@@ -129,6 +131,10 @@ pub enum UntrustedDocumentError {
 }
 
 impl fmt::Display for UntrustedDocumentError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Encode(error) => error.fmt(formatter),
+            Self::Decode(error) => error.fmt(formatter),
             Self::ForbiddenControl {
                 token_offset,
                 context,
