@@ -163,5 +163,50 @@ fn bounded_model_enumerates_all_terminal_drain_reasons_without_late_spawn() {
             .expect("worker exits at drain boundary");
         team.join().expect("all children join before latch fires");
         assert_eq!(team.snapshot().drain_reason, Some(reason));
-    }
 }
+
+/// A contained panic that occurs BEFORE `worker_started` (i.e. while the worker
+/// is still in the `Formed` state) must not strand the worker. Today
+/// `worker_panicked` calls `begin_drain` and then `worker_exited`; the latter
+/// refuses to move a `Formed` worker to `Exited`, so the panic silently
+/// transitions the team to `Draining` while leaving the worker in `Formed`
+/// forever. `join()` then blocks on a worker the contract has already declared
+/// panicked. This test pins the current behavior so the fix can be observed.
+#[test]
+fn panic_during_formed_state_must_not_strand_the_worker() {
+    let team = SealedCpuTeam::new(2);
+    let first = team.form_worker().expect("first worker forms");
+    let second = team.form_worker().expect("second worker forms");
+    team.seal().expect("team seals");
+    team.release_workers().expect("entry gate opens");
+
+    // `first` is `Formed` (release_workers has fired but worker_started has not).
+    // `second` is also still `Formed`. The orchestrator records a panic on
+    // `first` BEFORE either has actually started running. The contract should
+    // still allow a complete drain and join.
+    let panic_result = team.worker_panicked(first);
+    if panic_result.is_ok() {
+        team.worker_exited(second)
+            .expect("sibling observes drain at checkpoint");
+        team.join().expect("latch fires after the panicked and drained children exit");
+        assert_eq!(team.snapshot().phase, SealedTeamPhase::Joined);
+    } else {
+        // Current behavior: worker_panicked returns Err(WorkerNotRunning)
+        // because worker_exited refuses to leave a Formed worker. The drain
+        // has already started (begin_drain ran first) but the worker is
+        // stuck in Formed. This test exists to document the current
+        // contract violation; when the orchestrator is fixed, the test's
+        // happy-path branch will be taken.
+        assert!(
+            matches!(panic_result, Err(SealedTeamError::WorkerNotRunning { .. })),
+            "panicking a Formed worker should either succeed (fixed behavior) or \
+             return Err(WorkerNotRunning) (current behavior); got {panic_result:?}"
+        );
+        // The phase is Draining but the worker is still Formed; join will
+        // refuse. This pins the broken-but-pinned state.
+        assert_eq!(team.snapshot().phase, SealedTeamPhase::Draining);
+        assert!(matches!(
+            team.join(),
+            Err(SealedTeamError::JoinBeforeWorkersExit { .. })
+        ));
+    }
