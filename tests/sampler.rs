@@ -20,6 +20,32 @@ fn seed_parser_freezes_lower_hex_and_decimal_u64_expansion() {
 }
 
 #[test]
+fn seed_parser_trims_surrounding_whitespace() {
+    let hex = "000000000000000000000000000000000000000000000000000000000000002a";
+    // Trailing newline (the most common shell here-doc and env-var case).
+    assert_eq!(
+        Seed256::parse_cli(&format!("{hex}\n")).unwrap().to_lower_hex(),
+        hex,
+    );
+    // Leading and trailing whitespace.
+    assert_eq!(
+        Seed256::parse_cli(&format!("  {hex}  ")).unwrap().to_lower_hex(),
+        hex,
+    );
+    // Trailing tab.
+    assert_eq!(
+        Seed256::parse_cli(&format!("{hex}\t")).unwrap().to_lower_hex(),
+        hex,
+    );
+    // Decimal form with trailing newline.
+    assert!(Seed256::parse_cli("42\n").is_ok());
+    // Whitespace-only is still rejected.
+    assert!(Seed256::parse_cli("   \n  ").is_err());
+    // Genuinely wrong hex with whitespace is still rejected.
+    assert!(Seed256::parse_cli(&format!("{}B\n", "a".repeat(63))).is_err());
+}
+
+#[test]
 fn draw_digest_is_length_framed_and_addressable() {
     assert_eq!(SAMPLER_VERSION, "fnlp-sampler-v1");
     let mut seed_bytes = [0_u8; 32];

@@ -37,22 +37,26 @@ impl Seed256 {
     }
 
     /// Parses either 64 lowercase hexadecimal characters or a decimal `u64`.
+    ///
+    /// Env-var and CLI-arg callers commonly append a trailing newline or
+    /// other whitespace; trim before the length check so a single-character
+    /// mistake at the shell level does not reject a valid seed.
     pub fn parse_cli(value: &str) -> Result<Self, SeedParseError> {
-        if value.len() == 64 {
+        let trimmed = value.trim();
+        if trimmed.len() == 64 {
             let mut bytes = [0_u8; 32];
             for (index, destination) in bytes.iter_mut().enumerate() {
                 let offset = index * 2;
-                let high = hex_nibble(value.as_bytes()[offset])?;
-                let low = hex_nibble(value.as_bytes()[offset + 1])?;
+                let high = hex_nibble(trimmed.as_bytes()[offset])?;
+                let low = hex_nibble(trimmed.as_bytes()[offset + 1])?;
                 *destination = (high << 4) | low;
             }
             return Ok(Self(bytes));
         }
-
-        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        if trimmed.is_empty() || !trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(SeedParseError::InvalidForm);
         }
-        let parsed = value
+        let parsed = trimmed
             .parse::<u64>()
             .map_err(|_| SeedParseError::DecimalOutOfRange)?;
         Ok(Self::from_u64(parsed))
