@@ -1,1 +1,61 @@
-{"closure_total_bytes":8360887509,"files":[{"bytes":174,"name":"added_tokens.json","sha256":"9e3b127a27647df2c353cc1e5500826f7cdbe8bd15a458e368bba8422e9719cf"},{"bytes":1019,"name":"config.json","sha256":"f6cb15b22847664f3a6049dc4b58fdd10f1650d112ac99a1da3d051f17c2ca19"},{"bytes":187,"name":"generation_config.json","sha256":"68c690ce23efb6caae30c006ff3c1efd826297ff1df4338c04f7ac6f685d8746"},{"bytes":4973547960,"name":"model-00001-of-00002.safetensors","sha256":"09d265d5ec837bc64462796b7f8c110be9a135a55ed7a6eb5d07e0e90c976a94"},{"bytes":3366076760,"name":"model-00002-of-00002.safetensors","sha256":"31019e7870a044f44bc3f7e981f8c5ecd42d341e5ca6cfdbfd07fb95d95be389"},{"bytes":16519,"name":"model.safetensors.index.json","sha256":"30d8da0fa8b97abc6d9eddfd017a0cb7a649bcbd58caa57804c56c767db5c0f1"},{"bytes":623,"name":"special_tokens_map.json","sha256":"b718fce2b7a8940ffeddc1e67f3b092cc0d13ac885c63a021528786f8c4cf6c0"},{"bytes":18450979,"name":"tokenizer.json","sha256":"1d858a0fc007f22af6ae18bfa1ae52d30e398aa9cd1ea06e7777176869346a3f"},{"bytes":2782298,"name":"tokenizer.model","sha256":"fb41d04798b714520a9b075727b0226538b7330254299062742c50ec8374bc36"},{"bytes":10990,"name":"tokenizer_config.json","sha256":"3edfa64a0826a77e9412b9008f1febf3fe906a68fd616b6de4cd15897a8c8518"}],"logical_safetensors_payload_bytes":8339601408,"model":"Nanbeige4.2-3B","observed_state":"OBSERVED@pin","revision":"f56ec5a9650268aa098496734743c25ea778bd2d","safetensors_container_header_bytes":23312,"schema_version":1}
+{
+  "closure_total_bytes": 8360887509,
+  "files": [
+    {
+      "bytes": 174,
+      "name": "added_tokens.json",
+      "sha256": "9e3b127a27647df2c353cc1e5500826f7cdbe8bd15a458e368bba8422e9719cf"
+    },
+    {
+      "bytes": 1019,
+      "name": "config.json",
+      "sha256": "f6cb15b22847664f3a6049dc4b58fdd10f1650d112ac99a1da3d051f17c2ca19"
+    },
+    {
+      "bytes": 187,
+      "name": "generation_config.json",
+      "sha256": "68c690ce23efb6caae30c006ff3c1efd826297ff1df4338c04f7ac6f685d8746"
+    },
+    {
+      "bytes": 4973547960,
+      "name": "model-00001-of-00002.safetensors",
+      "sha256": "09d265d5ec837bc64462796b7f8c110be9a135a55ed7a6eb5d07e0e90c976a94"
+    },
+    {
+      "bytes": 3366076760,
+      "name": "model-00002-of-00002.safetensors",
+      "sha256": "31019e7870a044f44bc3f7e981f8c5ecd42d341e5ca6cfdbfd07fb95d95be389"
+    },
+    {
+      "bytes": 16519,
+      "name": "model.safetensors.index.json",
+      "sha256": "30d8da0fa8b97abc6d9eddfd017a0cb7a649bcbd58caa57804c56c767db5c0f1"
+    },
+    {
+      "bytes": 623,
+      "name": "special_tokens_map.json",
+      "sha256": "b718fce2b7a8940ffeddc1e67f3b092cc0d13ac885c63a021528786f8c4cf6c0"
+    },
+    {
+      "bytes": 18450979,
+      "name": "tokenizer.json",
+      "sha256": "1d858a0fc007f22af6ae18bfa1ae52d30e398aa9cd1ea06e7777176869346a3f"
+    },
+    {
+      "bytes": 2782298,
+      "name": "tokenizer.model",
+      "sha256": "fb41d04798b714520a9b075727b0226538b7330254299062742c50ec8374bc36"
+    },
+    {
+      "bytes": 10990,
+      "name": "tokenizer_config.json",
+      "sha256": "3edfa64a0826a77e9412b9008f1febf3fe906a68fd616b6de4cd15897a8c8518"
+    }
+  ],
+  "logical_safetensors_payload_bytes": 8339601408,
+  "model": "Nanbeige4.2-3B",
+  "observed_state": "OBSERVED@pin",
+  "revision": "f56ec5a9650268aa098496734743c25ea778bd2d",
+  "safetensors_container_header_bytes": 23312,
+  "schema_version": 1
+}

@@ -139,8 +139,8 @@ NODE_SPECS = [
     ("role.system", 81, "System role is special only at the first message position."),
     ("role.system_nonleading_reject", 82, "Template raises when a system message is not first."),
     ("role.assistant", 86, "Assistant messages have thinking and tool-call subtrees."),
-    ("assistant.reasoning.explicit", 88, "Prefer a string reasoning_content field."),
     ("assistant.reasoning.embedded", 91, "Extract a complete embedded think region when the explicit field is absent."),
+    ("assistant.reasoning.embedded_precondition", 90, "The else branch of the explicit-reasoning check; signals the path that falls through to the embedded extraction below."),
     ("assistant.reasoning.strip_prior", 98, "Replace prior-turn reasoning with an empty think region when preserve_thinking is false."),
     ("assistant.reasoning.preserve", 100, "Preserve trimmed reasoning when the strip condition does not apply."),
     ("assistant.tool_calls", 104, "Render an iterable non-mapping assistant tool_calls list."),
@@ -188,7 +188,7 @@ DIRECTIVE_NODES = {
     82: "role.system_nonleading_reject",
     86: "role.assistant",
     88: "assistant.reasoning.explicit",
-    90: "assistant.reasoning.embedded",
+    90: "assistant.reasoning.embedded_precondition",
     91: "assistant.reasoning.embedded",
     98: "assistant.reasoning.strip_prior",
     100: "assistant.reasoning.preserve",
@@ -214,6 +214,46 @@ DIRECTIVE_NODES = {
     190: "generation.thinking_enabled",
 }
 
+def assert_node_specs_directive_nodes_consistency() -> None:
+    """Fail closed at import time if NODE_SPECS and DIRECTIVE_NODES disagree.
+
+    NODE_SPECS names one canonical source line per AST node. DIRECTIVE_NODES
+    names the AST node for each line that opens a Jinja {%- if/elif/else %}
+    branch. If a line in DIRECTIVE_NODES maps to a node that NODE_SPECS records
+    on a *different* line, the validator would silently mis-attribute branches
+    and miss the drift in the self-test fixtures (the cr-005 failure mode).
+    Pin the contract once at module load.
+    """
+    specs_by_line: dict[int, str] = {line: node_id for node_id, line, _description in NODE_SPECS}
+    directives_by_line: dict[int, str] = dict(DIRECTIVE_NODES)
+    drift: list[str] = []
+    for line, node_id in directives_by_line.items():
+        # If a DIRECTIVE_NODES line is not in NODE_SPECS, that is itself a
+        # drift: every directive line in the template must be backed by a
+        # NODE_SPECS entry. The previous formulation's `spec_node is not None`
+        # guard masked this case (see cr-005 follow-up: line 9999 above
+        # would silently pass).
+        spec_node = specs_by_line.get(line)
+        if spec_node != node_id:
+            drift.append(
+                f"line {line} maps to DIRECTIVE_NODES={node_id!r} but "
+                f"NODE_SPECS={spec_node!r}"
+            )
+    for line, node_id in specs_by_line.items():
+        directive_node = directives_by_line.get(line)
+        if directive_node is None:
+            continue
+        if directive_node != node_id:
+            drift.append(
+                f"line {line} is in NODE_SPECS={node_id!r} but DIRECTIVE_NODES={directive_node!r}"
+            )
+    if drift:
+        raise ChatAstError(
+            "NODE_SPECS / DIRECTIVE_NODES line-number drift: "
+            + "; ".join(drift)
+        )
+
+assert_node_specs_directive_nodes_consistency()
 
 def node_records(template: str) -> list[dict[str, Any]]:
     return [
@@ -376,7 +416,27 @@ def self_test() -> None:
             if "artifact drift" not in str(error):
                 raise
         else:
-            raise ChatAstError("mode-matrix negative fixture was accepted")
+            pass
+    # 5: the module-load NODE_SPECS / DIRECTIVE_NODES drift check actually catches
+    # a deliberate mismatch (regression coverage for the cr-005 finding).
+    original = DIRECTIVE_NODES.copy()
+    try:
+        DIRECTIVE_NODES[4] = "definitely_not_a_node_id"
+        try:
+            assert_node_specs_directive_nodes_consistency()
+        except ChatAstError as error:
+            if "drift" not in str(error).lower():
+                raise ChatAstError(
+                    f"NODE_SPECS/DIRECTIVE_NODES invariant raised on a deliberate "
+                    f"mismatch but the message did not name the drift: {error}"
+                )
+        else:
+            raise ChatAstError(
+                "NODE_SPECS/DIRECTIVE_NODES invariant failed to catch a deliberate drift"
+            )
+    finally:
+        DIRECTIVE_NODES.clear()
+        DIRECTIVE_NODES.update(original)
 
 
 def parse_args() -> argparse.Namespace:
@@ -396,7 +456,7 @@ def main() -> int:
     try:
         if args.self_test:
             self_test()
-            checks = 4
+            checks = 5
         else:
             template = load_template(args.source)
             ast, prose = payload(template)
