@@ -139,6 +139,7 @@ NODE_SPECS = [
     ("role.system", 81, "System role is special only at the first message position."),
     ("role.system_nonleading_reject", 82, "Template raises when a system message is not first."),
     ("role.assistant", 86, "Assistant messages have thinking and tool-call subtrees."),
+    ("assistant.reasoning.explicit", 88, "Prefer a string reasoning_content field."),
     ("assistant.reasoning.embedded", 91, "Extract a complete embedded think region when the explicit field is absent."),
     ("assistant.reasoning.embedded_precondition", 90, "The else branch of the explicit-reasoning check; signals the path that falls through to the embedded extraction below."),
     ("assistant.reasoning.strip_prior", 98, "Replace prior-turn reasoning with an empty think region when preserve_thinking is false."),

@@ -297,7 +297,7 @@
     {
       "branch_id": "template-line-90",
       "mapped_node_ids": [
-        "assistant.reasoning.embedded"
+        "assistant.reasoning.embedded_precondition"
       ],
       "source_span": {
         "end_byte": 4360,
@@ -1484,6 +1484,17 @@
         "quoted_template": "            {%- if '</think>' in content %}",
         "start_byte": 4361,
         "start_line": 91
+      }
+    },
+    {
+      "description": "The else branch of the explicit-reasoning check; signals the path that falls through to the embedded extraction below.",
+      "id": "assistant.reasoning.embedded_precondition",
+      "source_span": {
+        "end_byte": 4360,
+        "end_line": 90,
+        "quoted_template": "        {%- else %}",
+        "start_byte": 4341,
+        "start_line": 90
       }
     },
     {
