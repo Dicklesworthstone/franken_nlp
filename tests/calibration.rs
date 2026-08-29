@@ -381,6 +381,13 @@ fn shift_indicator_rejects_control_characters_to_keep_diagnostic_lines_parseable
         "label-prior-drift\rwith-crlf",
         "\u{0}null-byte-prefix",
         "bell\u{7}in-the-middle",
+        // Unicode LINE SEPARATOR (U+2028) and PARAGRAPH SEPARATOR (U+2029)
+        // are not classified as `char::is_control()` in Rust (they are Zl/Zp,
+        // not C0/C1/Cf), but they terminate lines in most log parsers and would
+        // therefore still inject a fake log line. The decide() check must reject
+        // them explicitly; this test pins that contract.
+        "label-prior-drift\u{2028}FAKE LINE SEPARATOR",
+        "label-prior-drift\u{2029}FAKE PARAGRAPH SEPARATOR",
     ] {
         let error = artifact
             .decide(

@@ -1284,7 +1284,16 @@ impl CalibrationArtifact {
             if indicator.trim().is_empty() {
                 return Err(CalibrationError::EmptyField("shift indicator"));
             }
-            if indicator.chars().any(|character| character.is_control()) {
+            // `is_control()` covers C0/C1 + Cf (format) but the Zl category
+            // (LINE SEPARATOR, U+2028) and Zp category (PARAGRAPH SEPARATOR,
+            // U+2029) are not part of the control set yet still terminate
+            // a line in most log parsers. Reject them explicitly so an
+            // indicator cannot inject a fake log line through the diagnostic
+            // reason field.
+            if indicator
+                .chars()
+                .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}'))
+            {
                 return Err(CalibrationError::EmptyField(
                     "shift indicator (control characters rejected to keep diagnostic lines parseable)",
                 ));
