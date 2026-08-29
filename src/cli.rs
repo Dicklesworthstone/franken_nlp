@@ -1146,12 +1146,24 @@ fn emit_converted_unqualified(
     );
     ExitCode::SUCCESS
 }
-
-fn emit_streaming_refusal(stage: &str, error: impl std::fmt::Display) -> ExitCode {
+fn emit_streaming_refusal(
+    request: &ConvertRequest,
+    stage: &str,
+    error: impl std::fmt::Display,
+) -> ExitCode {
     eprintln!("CONVERT RESULT=FAIL stage={stage} reason={error}");
+    if request.robot {
+        let _ = robot::write_convert_stage_event(
+            &mut io::stdout().lock(),
+            &RobotConvertStageEvent::new(stage, "FAIL")
+                .with_source(request.source_dir.display().to_string())
+                .with_source_manifest(request.source_manifest.display().to_string())
+                .with_destination(request.output.display().to_string())
+                .with_reason(error.to_string()),
+        );
+    }
     ErrorCode::ArtifactIntegrityOrFormatOrVersion.as_process_exit()
 }
-
 struct MaterializedSources<'a> {
     // These borrow the prepared source snapshot so the envelope planner does
     // not create a second tokenizer/config/template resident copy.
