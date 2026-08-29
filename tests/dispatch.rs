@@ -238,3 +238,41 @@ fn host_report_covers_every_fixed_shape_regime_and_tier() {
         report.architecture
     );
 }
+
+#[test]
+fn kernel_tier_from_str_trims_surrounding_whitespace() {
+    use std::str::FromStr;
+    // Canonical exact strings still parse.
+    for exact in [
+        "a1_smmla",
+        "a2_dotprod",
+        "a3_autovec",
+        "x1a_avx512_vnni_zmm",
+        "x1b_avx512_vnni_ymm",
+        "x2_avx_vnni",
+        "x3a_avx2_low7_high_bit",
+        "x3b_avx2_widened_i16",
+        "s_scalar_i32",
+    ] {
+        let tier = KernelTier::from_str(exact)
+            .unwrap_or_else(|_| panic!("exact id {exact:?} must parse"));
+        assert_eq!(tier.id(), exact);
+    }
+    // Trailing-newline inputs parse to the same tier — this is the env-var
+    // path for FNLP_FORCE_TIER, which commonly picks up a trailing newline
+    // from `env -i bash -c`. Same for leading/trailing whitespace and tabs.
+    for (variant, trimmed) in [
+        ("a1_smmla\n", "a1_smmla"),
+        ("x3a_avx2_low7_high_bit\n", "x3a_avx2_low7_high_bit"),
+        ("  s_scalar_i32  ", "s_scalar_i32"),
+        ("x2_avx_vnni\t", "x2_avx_vnni"),
+    ] {
+        let tier = KernelTier::from_str(variant)
+            .unwrap_or_else(|_| panic!("variant {variant:?} must parse after trim"));
+        assert_eq!(tier.id(), trimmed, "trimmed id must match");
+    }
+    // Genuinely unknown values still fail (the error preserves the original
+    // casing so operators can debug typos).
+    assert!(KernelTier::from_str("nonsense\n").is_err());
+    assert!(KernelTier::from_str("  unknown  ").is_err());
+}

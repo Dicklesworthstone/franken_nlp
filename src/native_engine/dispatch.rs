@@ -276,13 +276,19 @@ impl FromStr for KernelTier {
     type Err = ParseTierError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
+        // Env-var and CLI-arg callers commonly append whitespace (notably
+        // a trailing newline from `env -i bash -c`). Trim before comparing
+        // so the documented contract — "Stable parser for `--force-tier` and
+        // `FNLP_FORCE_TIER` values" — is satisfied across the common
+        // trailing-whitespace inputs as well as the canonical exact strings.
+        let trimmed = value.trim();
         for tier in Self::ALL {
-            if value == tier.id() {
+            if trimmed == tier.id() {
                 return Ok(tier);
             }
         }
         Err(ParseTierError {
-            value: value.to_owned(),
+            value: trimmed.to_owned(),
         })
     }
 }
