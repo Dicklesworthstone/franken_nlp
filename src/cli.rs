@@ -639,7 +639,7 @@ fn run_streaming_convert(
     generic: &GenericPayloadPlan,
 ) -> ExitCode {
     if let Err(error) = ensure_conversion_destinations_absent(&request.output) {
-        return emit_streaming_refusal("preflight-output", error);
+        return emit_streaming_refusal(request, "preflight-output", error);
     }
     eprintln!(
         "CONVERT STAGE=plan RESULT=START tensors={}",
@@ -648,11 +648,11 @@ fn run_streaming_convert(
     emit_convert_robot_stage(request, "plan", "START");
     let materialized = match read_materialized_sources(prepared) {
         Ok(value) => value,
-        Err(error) => return emit_streaming_refusal("materialized-sources", error),
+        Err(error) => return emit_streaming_refusal(request, "materialized-sources", error),
     };
     let plan = match build_streaming_envelope_plan(prepared, generic, &materialized) {
         Ok(value) => value,
-        Err(error) => return emit_streaming_refusal("streaming-first-pass", error),
+        Err(error) => return emit_streaming_refusal(request, "streaming-first-pass", error),
     };
     eprintln!(
         "CONVERT STAGE=plan RESULT=END tensors={} sections={}",
@@ -662,7 +662,7 @@ fn run_streaming_convert(
     emit_convert_robot_stage(request, "plan", "END");
     let (staging_path, mut output) = match create_conversion_stage(&request.output) {
         Ok(stage) => stage,
-        Err(error) => return emit_streaming_refusal("create-staging", error),
+        Err(error) => return emit_streaming_refusal(request, "create-staging", error),
     };
     // The cleanup guard owns the path; on any early return the staging file
     // is unlinked. After a successful publish we transfer the path out of
@@ -686,10 +686,10 @@ fn run_streaming_convert(
         )
     }) {
         Ok(value) => value,
-        Err(error) => return emit_streaming_refusal("streaming-envelope", error),
+        Err(error) => return emit_streaming_refusal(request, "streaming-envelope", error),
     };
     if let Err(error) = output.sync_all() {
-        return emit_streaming_refusal(
+        return emit_streaming_refusal(request, 
             "sync-staging",
             format!("sync {}: {error}", staging_guard.path().display()),
         );
@@ -698,14 +698,14 @@ fn run_streaming_convert(
     let staged_len = match fs::metadata(staging_guard.path()) {
         Ok(metadata) => metadata.len(),
         Err(error) => {
-            return emit_streaming_refusal(
+            return emit_streaming_refusal(request, 
                 "inspect-staging",
                 format!("stat {}: {error}", staging_guard.path().display()),
             );
         }
     };
     if staged_len != written.file_len {
-        return emit_streaming_refusal(
+        return emit_streaming_refusal(request, 
             "inspect-staging",
             format!(
                 "staging length mismatch: expected={} observed={staged_len}",
@@ -715,19 +715,19 @@ fn run_streaming_convert(
     }
     let reloaded = match FnlpqArtifact::open_owned(staging_guard.path()) {
         Ok(artifact) => artifact,
-        Err(error) => return emit_streaming_refusal("reload-staging", error),
+        Err(error) => return emit_streaming_refusal(request, "reload-staging", error),
     };
     if let Err(error) = verify_reloaded_conversion(&reloaded, prepared, &plan, &written) {
-        return emit_streaming_refusal("reload-staging", error);
+        return emit_streaming_refusal(request, "reload-staging", error);
     }
     drop(reloaded);
 
     let artifact_raw_sha256 = match raw_sha256_file(staging_guard.path()) {
         Ok(value) => value,
-        Err(error) => return emit_streaming_refusal("digest-staging", error),
+        Err(error) => return emit_streaming_refusal(request, "digest-staging", error),
     };
     if let Err(error) = publish_explicit_conversion_stage(staging_guard.path(), &request.output) {
-        return emit_streaming_refusal("publish-explicit-output", error);
+        return emit_streaming_refusal(request, "publish-explicit-output", error);
     }
     // Publish succeeded: the staging file is now read-only and hard-linked
     // to the final destination. Take the path out of the guard so the
@@ -741,7 +741,7 @@ fn run_streaming_convert(
         &artifact_raw_sha256,
     ) {
         Ok(value) => value,
-        Err(error) => return emit_streaming_refusal("receipt", error),
+        Err(error) => return emit_streaming_refusal(request, "receipt", error),
     };
     eprintln!(
         "CONVERT STAGE=receipt RESULT=PASS destination={} staging-receipt={} receipt-sha256={}",
