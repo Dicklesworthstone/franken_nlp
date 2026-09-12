@@ -1,4 +1,4 @@
-//! OQ-35 census — runtime-semantics items observable without a live runtime.
+//! OQ-35 census — pure and native-runtime semantic observations at the pin.
 //!
 //! Verdict vocabulary (bead franken_nlp-idt): every census item is either
 //! RATIFIED at the pin with the observation logged, or ABSENT_WITH_FALLBACK
@@ -261,55 +261,108 @@ fn preset_builder_values_observed_on_constructed_runtimes() {
     );
 }
 
-/// `Cx::current()` retains the default `Cx<cap::All>` static type even while a
-/// restricted context changes the capability *metadata* it reports. That
-/// metadata observation is not an authority boundary: at this pin the
-/// underlying handles used by `now`, random, and spawn do not consult it.
-/// Product code must therefore pass an explicit narrowed `Cx` to leaves and
-/// must never use ambient lookup as least-authority enforcement.
+/// A capability snapshot alone proves neither enforcement nor its absence.
+/// Exercise actual native timer access and task admission at each reviewed
+/// pin. Product leaves still receive explicit narrowed contexts; this census
+/// does not establish a complete runtime isolation boundary.
 #[test]
-fn ambient_current_capability_snapshot_is_not_authority_enforcement() {
-    let full = Cx::for_testing();
-    let _outer = Cx::set_current(Some(full.clone()));
+fn ambient_current_authority_matches_the_reviewed_pin() {
+    use asupersync::runtime::{RuntimeBuilder, SpawnError};
+    use std::time::Duration;
 
-    let unrestricted: Cx = Cx::current().expect("outer full context is installed");
-    let unrestricted_capabilities = unrestricted.capabilities();
-    assert!(unrestricted_capabilities.spawn);
-    assert!(unrestricted_capabilities.time);
-    assert!(unrestricted_capabilities.entropy);
-    assert!(unrestricted_capabilities.io);
-    assert!(unrestricted_capabilities.remote);
-
-    let leaf: Cx<cap::None> = full.restrict::<cap::None>();
-    {
-        let _restriction = leaf.set_current_restricted();
-        let ambient: Cx = Cx::current().expect("restricted context remains installed");
-        let _: Cx<cap::All> = ambient.clone();
-        let capabilities = ambient.capabilities();
-
-        // This proves only the present metadata observation. It must not be
-        // promoted to an effects-enforcement claim: `ambient` is statically
-        // all-capability and its privileged methods use their stored handles.
-        assert!(!capabilities.spawn, "restricted metadata omits SPAWN");
-        assert!(!capabilities.time, "restricted metadata omits TIME");
-        assert!(!capabilities.entropy, "restricted metadata omits RANDOM");
-        assert!(!capabilities.io, "restricted metadata omits IO");
-        assert!(!capabilities.remote, "restricted metadata omits REMOTE");
-    }
-
-    let restored: Cx = Cx::current().expect("outer full context is restored");
-    let restored_capabilities = restored.capabilities();
-    assert!(restored_capabilities.spawn);
-    assert!(restored_capabilities.time);
-    assert!(restored_capabilities.entropy);
-    assert!(restored_capabilities.io);
-    assert!(restored_capabilities.remote);
-
-    census(
-        "ambient-current-authority",
-        "ABSENT_WITH_FALLBACK",
-        "current-returns-static-all;restricted-capabilities-are-metadata-only;fallback=explicit-narrowed-cx-parameter-no-ambient-leaf-lookup",
+    const LEGACY_PIN: &str = "362dc5b174427f66cfa76ab2bdd68cce1a95c6cc";
+    const RELEASE_PIN: &str = "78b64636e99fea4ea2d868096576021dd3b8e519";
+    let dependency = include_str!("../../../Cargo.toml")
+        .lines()
+        .find(|line| line.starts_with("asupersync = "))
+        .expect("the direct runtime dependency is recorded");
+    let release_pin = dependency.contains(RELEASE_PIN);
+    assert!(
+        release_pin || dependency.contains(LEGACY_PIN),
+        "review changed pin semantics before extending this census: {dependency}"
     );
+
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("native runtime");
+    runtime.block_on(runtime.handle().spawn(async move {
+        let full = Cx::current().expect("native task context");
+        let full_capabilities = full.capabilities();
+        let depth = Cx::restriction_depth();
+        assert!(full_capabilities.spawn);
+        assert!(full.timer_driver().is_some(), "positive timer control");
+        let factories = Arc::new(AtomicUsize::new(0));
+
+        let (retained, admission) = {
+            let _restriction = full.restrict::<cap::None>().set_current_restricted();
+            let ambient: Cx<cap::All> = Cx::current().expect("restricted ambient context");
+            let capabilities = ambient.capabilities();
+            assert!(!capabilities.spawn);
+            assert!(!capabilities.time);
+            assert!(!capabilities.entropy);
+            assert!(!capabilities.io);
+            assert!(!capabilities.remote);
+            assert!(ambient.timer_driver().is_none());
+            let witness = Arc::clone(&factories);
+            let admission = ambient.spawn(move |_| {
+                witness.fetch_add(1, Ordering::SeqCst);
+                async { 17_u32 }
+            });
+            (ambient, admission)
+        };
+        assert_eq!(Cx::restriction_depth(), depth);
+        assert_eq!(Cx::current().unwrap().capabilities(), full_capabilities);
+        assert_eq!(retained.task_id(), full.task_id());
+        assert_eq!(retained.region_id(), full.region_id());
+        assert_eq!(retained.budget(), full.budget());
+        assert!(retained.timer_driver().is_none());
+
+        if release_pin {
+            assert!(matches!(admission, Err(SpawnError::RuntimeUnavailable)));
+            assert_eq!(factories.load(Ordering::SeqCst), 0);
+        } else {
+            let mut child = admission.expect("legacy pin admits masked SPAWN");
+            let value = asupersync::time::timeout(
+                full.now(), Duration::from_secs(5), child.join(&full),
+            )
+            .await
+            .expect("legacy admission completes within the census deadline")
+            .expect("legacy child joins");
+            assert_eq!(value, 17);
+            assert_eq!(factories.load(Ordering::SeqCst), 1);
+        }
+
+        {
+            let _reinstalled = Cx::set_current(Some(retained));
+            let current = Cx::current().expect("retained context reinstalled");
+            assert_eq!(current.capabilities().spawn, !release_pin);
+            assert_eq!(current.timer_driver().is_some(), !release_pin);
+        }
+        assert_eq!(Cx::restriction_depth(), depth);
+        assert_eq!(Cx::current().unwrap().capabilities(), full_capabilities);
+        let mut child = full
+            .spawn(|cx| async move {
+                cx.checkpoint().expect("authorized child remains live");
+                42_u32
+            })
+            .expect("full-context positive admission control");
+        let value = asupersync::time::timeout(
+            full.now(), Duration::from_secs(5), child.join(&full),
+        )
+        .await
+        .expect("positive control completes within the census deadline")
+        .expect("positive control joins");
+        assert_eq!(value, 42);
+        census(
+            "ambient-current-authority",
+            if release_pin { "RATIFIED" } else { "ABSENT_WITH_FALLBACK" },
+            if release_pin {
+                "native-timer+spawn-refusal;factory-not-entered;retained-mask+guard-restoration;explicit-narrowed-leaves-still-required;no-complete-isolation-claim"
+            } else {
+                "native-timer-refusal;spawn-admitted;set_current-restores-all;fallback=explicit-narrowed-leaves;no-complete-isolation-claim"
+            },
+        );
+    }));
 }
 
 /// `ExecPlan::first_ok` is not the sequential mirror fallback required by

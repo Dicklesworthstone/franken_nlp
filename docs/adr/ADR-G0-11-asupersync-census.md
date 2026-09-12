@@ -10,7 +10,7 @@
   "fallback": null,
   "g0_item": {"name": "asupersync leverage census", "probe": 11},
   "host_pin": {"applicability": "pin-specific semantic census; no host-sensitive performance conclusion"},
-  "killed_alternatives": [{"name": "ambient Cx::current() as a least-authority boundary", "reason": "Cx::current() returns Cx<cap::All>; the capability metadata snapshot does not control the underlying now/random/spawn handles"}, {"name": "short-circuit first_ok mirror", "reason": "the pin drives all ExecPlan::first_ok children before input-order selection"}, {"name": "cast acknowledgement as commit", "reason": "cast().await and try_cast acknowledge mailbox admission only"}],
+  "killed_alternatives": [{"name": "ambient Cx::current() as a complete least-authority boundary", "reason": "At the selected 362dc5b pin, timer_driver and io do check runtime masks, but spawn does not and set_current restores all bits. Static return type or snapshot alone cannot establish either enforcement or its absence."}, {"name": "short-circuit first_ok mirror", "reason": "the pin drives all ExecPlan::first_ok children before input-order selection"}, {"name": "cast acknowledgement as commit", "reason": "cast().await and try_cast acknowledge mailbox admission only"}],
   "source_pin": {"asupersync": "362dc5b174427f66cfa76ab2bdd68cce1a95c6cc"},
   "status": "BLOCKED",
   "x_executable_verdicts": [{"commit": "8dce5ac369ec8cdecd68ac1e17ccd2a17e89509a", "items": ["cancelkind-eleven", "first-ok-sequential", "budget-typed", "preset-values", "execplan-first-ok"], "path": "tests/g0/asupersync_census/runtime_semantics.rs", "scope": "historical pin-scoped observations only; its current-no-regain assertion is superseded and must not be replayed as ambient-authority evidence"}, {"commit": "f234750aacf27ffe0c5ea53a43d0f6cf5f167fe9", "items": ["ambient-current-authority"], "path": "tests/g0/asupersync_census/runtime_semantics.rs", "scope": "corrected ABSENT_WITH_FALLBACK observation: Cx::current() retains static all capability and the restricted metadata snapshot is not effect enforcement"}, {"commit": "2f23773b05c3108b7cbf2168d74a4e7014fb8d8f", "items": ["cast-async-ack", "try-cast-policies"], "path": "tests/g0/asupersync_census/gen_server_semantics.rs", "scope": "Lab mailbox acknowledgement and declared overflow observations"}, {"commit": "f7f2076f1c2b12a25417afeba9163f52a48b9d97", "items": ["lab-determinism", "obligation-leak-policy", "lab-crashpack"], "path": "tests/g0/asupersync_census/lab_determinism.rs", "scope": "Lab replay, leak-policy, and crashpack material observations"}, {"commit": "41d0aa36b1cc3e3bef4928c909623f1b10feb141", "items": ["compile-fail-suite"], "path": "tests/g0/asupersync_census/compile_fail.rs", "scope": "static narrowing and absent generic current API only; no ambient authority proof"}, {"commit": "37e4dbaab1aa7912929e13a8f50c40ba5128bff7", "items": ["dpor-explorer", "tla-export"], "path": "tests/g0/asupersync_census/explorer_tla.rs", "scope": "bounded DPOR-style coverage and TLA export only; no exhaustive or TLC claim"}],
@@ -27,12 +27,42 @@ and retains the audited-plan revision separately. This ADR adopts neither a
 new dependency nor a new feature: it documents the evidence boundary of the
 already locked suite selection.
 
+The September 12 migration review supersedes the earlier metadata-only
+authority inference in `x_executable_verdicts`. Direct inspection of this
+selected pin found mask checks in `timer_driver` and `io`, an unguarded spawn
+gateway, and `set_current` installing an all-capability frame. Published
+0.5.0 at `78b64636e99fea4ea2d868096576021dd3b8e519` additionally gates the
+spawn gateway and retains the captured mask when reinstalling a context.
+These are source observations, not executed consumer evidence.
+
+`ambient_current_authority_matches_the_reviewed_pin` now has explicit
+expectations for both reviewed revisions: real native positive controls,
+timer refusal, task factory admission or refusal, retained context identity,
+and restoration after guard drop. It refuses an unreviewed pin. This revised
+census is **PREPARED_UNRUN**; the source hashes below do not supply a retained
+transcript or supersede the historical execution record. The compile-fail
+helper also refuses a directory containing multiple Asupersync libraries
+instead of selecting one by filename order. The controller must give that
+lane an isolated target directory.
+
+Native runtime contexts carry an I/O driver but do not install a public
+`IoCap`. An `io().is_none()` assertion on those contexts would therefore be a
+vacuous refusal check; the IO mask observation above remains source-only and
+is not included in this native census verdict.
+
+The migration bead is `franken_nlp-ya4f`. Cargo and SUITE still select the old
+revision while the immutable suite and root-patch closure are reconciled.
+The runtime-wide scoped CPU ceiling is opt-in at published 0.5.0: its default
+is unbounded, so this migration does not require changing the existing sealed
+team or its process thread inventory. No numerical or model pin is advanced
+by this census repair.
+
 The feature-gated `g0_asupersync_census` target contains executable pin
 observations and absence records for the following areas:
 
 | Area | Observed contract | Executable probe |
 | --- | --- | --- |
-| Authority | `restrict` cannot widen statically. Ambient `Cx::current()` is `Cx<cap::All>` and its capability snapshot is metadata, not effect enforcement; the required fallback is an explicit narrowed `Cx` parameter with no ambient leaf lookup. | `runtime_semantics.rs`, `compile_fail.rs` |
+| Authority | Static narrowing and native effects are separate checks. The selected old pin masks timer/IO handles but permits masked spawn and widens on `set_current`; the prepared 0.5 census expects both latter gaps closed. Native replay remains pending; leaves still receive explicit narrowed contexts. | `runtime_semantics.rs`, `compile_fail.rs` |
 | Outcomes | `first_ok_outcomes` classifies completed outcomes in input order; `ExecPlan::first_ok` drives all children. | `runtime_semantics.rs` |
 | Messaging | `cast().await` and accepted `try_cast` acknowledge enqueue only; `Reject` reports full and `DropOldest` is explicitly lossy. | `gen_server_semantics.rs` |
 | Cancellation/budgets/presets | Eleven `CancelKind` values, typed budget shapes, and concrete runtime preset values are observable. | `runtime_semantics.rs` |
@@ -54,8 +84,8 @@ Source-digest key:
 
 | Key | SHA-256 | Source |
 | --- | --- | --- |
-| R | `08a1021d83e728115e151a00d84061a87907654f9451b1a96a87f3a5a8c15568` | `tests/g0/asupersync_census/runtime_semantics.rs` |
-| C | `abae26b3c891eec6d1286320fd04914b9d981966cbada64c51ec16f078f9bd50` | `tests/g0/asupersync_census/compile_fail.rs` |
+| R | `e1a401407c6b0814b10d0e012e51ac015564e30600599f2af54d0e3968972f72` | `tests/g0/asupersync_census/runtime_semantics.rs` |
+| C | `74457e5943bf8425a308e52d110d0aaa141349c8c241c089c9bf223dff5b5ff0` | `tests/g0/asupersync_census/compile_fail.rs` |
 | W | `a4fe807d006e05bf26c48c222829698fc0654c4af0fc514b0270d1aa00d89f0a` | `tests/g0/compile_fail/capability_widening.rs` |
 | N | `a60d3a1da485b6cfc7313def50a146052d6ec0ec15bb14cc5be8d76584b9c724` | `tests/g0/compile_fail/cx_current_regain.rs` |
 | G | `85b88cdca830fed52ddc6cd46080128d8dc31109753b04dab278de05cf652567` | `tests/g0/asupersync_census/gen_server_semantics.rs` |
@@ -68,7 +98,7 @@ committed source or retained receipt exists to bind the corresponding claim.
 | Contract item | Verdict | Source digest or gap | Required fallback / limit |
 | --- | --- | --- | --- |
 | Static `Cx::restrict` narrowing | RATIFIED (source-only) | C + W | Pass an explicit narrowed `Cx`; no product alias is adopted. |
-| Ambient `Cx::current()` least authority | ABSENT_WITH_FALLBACK | R | Explicit narrowed `Cx` parameter; prohibit ambient leaf lookup. |
+| Ambient `Cx::current()` native effect census | PREPARED_UNRUN | R | Replay the selected pin's positive/negative controls. Explicit narrowed leaf contexts remain required; no complete isolation claim. |
 | Project capability aliases (pull/inference/greedy/leaf) | ABSENT_WITH_FALLBACK | no artifact | Define and compile-check project aliases before use. |
 | Typed `Budget` and `CapabilityBudget` shapes | RATIFIED (source-only) | R | Pin type presence only; no complete project budget claim. |
 | Project unit conversion and typed-budget meet mapping | ABSENT_WITH_FALLBACK | no artifact | Checked project-unit conversion plus cleanup-reserve cases. |
@@ -95,8 +125,8 @@ These are narrower than product readiness. In particular, `budget-typed` does
 not freeze a FrankenNLP project-unit conversion, and `obligation-leak-policy`
 does not adopt a production reservation/escalation protocol. The static
 compile-fail fixture and the runtime `Cx::current()` observation are
-deliberately separate. The latter is an `ABSENT_WITH_FALLBACK` authority row,
-not a ratified runtime least-authority mechanism.
+deliberately separate. The revised native census is `PREPARED_UNRUN`, not a
+ratified runtime least-authority mechanism.
 
 ## Supplemental adoption boundaries
 

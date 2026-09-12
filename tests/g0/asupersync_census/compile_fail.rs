@@ -4,9 +4,9 @@
 //! release-graph dependency for a UI-test helper. Each fixture is compiled
 //! against the exact `asupersync` rlib that built this feature-gated target.
 //! This target proves only a static narrowing boundary. It does not establish
-//! that ambient `Cx::current()` enforces reduced effects: the pin returns
-//! `Cx<cap::All>` there, so product leaves must receive an explicit narrowed
-//! context instead.
+//! that ambient `Cx::current()` enforces reduced effects. Its static
+//! `Cx<cap::All>` return type also does not prove enforcement is absent;
+//! `runtime_semantics` probes actual native effects separately.
 
 use std::{
     env,
@@ -54,9 +54,12 @@ fn asupersync_rlib(dependency_dir: &Path) -> PathBuf {
         })
         .collect::<Vec<_>>();
     candidates.sort();
-    candidates
-        .pop()
-        .expect("feature-gated census target links one asupersync rlib")
+    assert_eq!(
+        candidates.len(),
+        1,
+        "census requires one unambiguous asupersync artifact; use the isolated census target directory, found: {candidates:?}"
+    );
+    candidates.pop().expect("one checked asupersync artifact")
 }
 
 fn compile_failure(case: &CompileFailCase, dependency_dir: &Path, asupersync: &Path) -> String {
