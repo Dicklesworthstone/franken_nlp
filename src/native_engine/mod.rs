@@ -8,6 +8,7 @@ pub mod constrained_sparse;
 pub mod decode;
 pub mod diagnostic_f32;
 pub mod dispatch;
+pub mod generation;
 pub mod hf_bf16_eager;
 pub mod int8;
 pub mod kv;
