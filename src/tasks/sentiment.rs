@@ -6,9 +6,11 @@
 
 mod distribution;
 mod native;
+mod planning;
 pub use distribution::{
     SentimentAnchor, SentimentAxis, SentimentAxisInput, SentimentDecision,
     SentimentDimension, SentimentError, SentimentLimits, SentimentLogits,
     SentimentOptions, SentimentPlan, SentimentPolicy, SentimentResult, SentimentWork,
 };
 pub use native::{EagerSentimentRun, SENTIMENT_NATIVE_EXECUTION, SentimentNativeError};
+pub use planning::{SENTIMENT_PROMPT_VERSION, SentimentPlanner, SentimentPlanningError, SentimentRequest};
