@@ -10,6 +10,9 @@ pub mod union;
 pub mod pseudonym;
 pub mod actions;
 pub mod pipeline;
+pub mod native;
+
+pub use pipeline::{RedactionRequest, redact_rules, redact_with_ner};
 
 /// Type names are stable inputs to policy and pseudonym domain separation.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
