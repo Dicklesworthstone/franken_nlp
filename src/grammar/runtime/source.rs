@@ -45,6 +45,12 @@ impl JsonProgram {
     #[must_use]
     pub fn requires_source(&self) -> bool { self.schema.requires_verbatim_source() }
 
+    /// Borrow immutable structural/schema annotations for downstream field
+    /// traversal. This exposes no automaton state, acceptance flag or source
+    /// index, and does not replace validate_json (including scalar-length caps).
+    #[must_use]
+    pub fn declarative_schema(&self) -> &SchemaNode { self.schema.root() }
+
     /// Return all exact occurrences using the validation-owned matcher, not
     /// the suffix index used to constrain token selection. Failure is atomic.
     pub fn source_fields(&self, text: &str) -> Result<Vec<SourceFieldEvidence>, SchemaError> {

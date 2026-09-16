@@ -31,6 +31,7 @@ use crate::{
 use super::ir::{DecodeStrategy, DependencyScope, FinitePostcondition, GrammarReference, PromptSegmentKind, ScoreSpace, TaskIR, TaskPlan};
 
 pub mod grounded;
+pub mod semantic;
 pub use grounded::{SourceDocument, SourceDocumentEncoder};
 
 /// Explicit sampler policy; this path does not accept seeded or thinking modes.
