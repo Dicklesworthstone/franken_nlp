@@ -6,6 +6,7 @@ pub mod mask;
 pub mod runtime;
 pub mod schema;
 pub mod source;
+pub mod source_index;
 
 pub use compiler::{
     AutomatonEstimate, CompileLimits, CompiledSchema, MASK_BYTES_PER_STATE, SchemaNode,
