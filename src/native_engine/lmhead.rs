@@ -3,6 +3,8 @@
 use super::tensor::Bf16;
 use super::weights::{Bf16Matrix, WeightShapeError};
 
+pub mod scoring;
+
 /// Nanbeige's fixed untied vocabulary projection width.
 pub const NANBEIGE_VOCAB_SIZE: usize = 166_144;
 /// Exported f32 logits for the fixed vocabulary: 166,144 × 4 bytes.
