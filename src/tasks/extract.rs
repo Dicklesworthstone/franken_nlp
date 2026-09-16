@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn full_result_envelope_not_only_json_is_byte_bounded() {
         let p = plan(&task(SCHEMA, 7, 8), SCHEMA);
-        assert!(matches!(p.finalize(output("true")), Err(ExtractError::OutputBudgetExceeded));
+        assert!(matches!(p.finalize(output("true")), Err(ExtractError::OutputBudgetExceeded)));
     }
     #[test]
     fn identity_binding_detects_task_prompt_schema_options_and_tokenizer_drift() {
