@@ -9,6 +9,7 @@ pub mod error;
 pub mod execution_identity;
 pub mod grammar;
 pub mod jobs;
+mod local_io;
 pub mod native_engine;
 pub mod orchestrator;
 pub mod receipt;
@@ -18,6 +19,7 @@ pub mod storage;
 pub mod tasks;
 pub mod template;
 pub mod textutil;
+mod text_cli;
 pub mod tokenizer;
 pub mod validation;
 

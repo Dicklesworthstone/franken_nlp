@@ -14,7 +14,7 @@ mod existing {
 }
 
 fn definition() -> clap::Command {
-    existing::definition().subcommand(crate::redaction_cli::definition())
+    existing::definition().subcommand(crate::redaction_cli::definition()).subcommands(crate::text_cli::definitions())
 }
 
 pub fn cli_main() -> ExitCode {
@@ -26,8 +26,8 @@ pub fn cli_main() -> ExitCode {
             if !error.use_stderr() { return if error.print().is_ok() { ExitCode::SUCCESS } else { ErrorCode::Generic.as_process_exit() }; }
             // Never echo arbitrary argv values into redaction diagnostics. Key
             // bytes have no argv option, even on an invalid invocation.
-            if args.get(1).is_some_and(|s| s == "redact") {
-                eprintln!("fnlp redact: invalid arguments; run 'fnlp redact --help'");
+            if args.get(1).and_then(|s| s.to_str()).is_some_and(|s| s == "redact" || crate::text_cli::TextCommand::recognizes(s)) {
+                eprintln!("fnlp: invalid task arguments; run the task command with --help");
             } else { let _ = error.print(); }
             return ErrorCode::Usage.as_process_exit();
         }
@@ -48,6 +48,14 @@ pub fn cli_main() -> ExitCode {
         };
         return crate::redaction_cli::run(options, &mut input, &mut io::stdout().lock(), &mut io::stderr().lock());
     }
+    if let Some((name, matches)) = matches.subcommand() {
+        if crate::text_cli::TextCommand::recognizes(name) {
+            let task = match crate::text_cli::TextCommand::from_matches(name, matches) {
+                Ok(task) => task, Err(_) => return ErrorCode::Usage.as_process_exit(),
+            };
+            return task.run(&mut input, &mut io::stdout().lock(), &mut io::stderr().lock());
+        }
+    }
     existing::dispatch(args, &mut input, terminal)
 }
 
@@ -58,7 +66,7 @@ mod task_dispatch_tests {
     fn new_task_and_existing_commands_share_root_help() {
         let mut root = definition();
         let help = root.render_long_help().to_string();
-        for name in ["redact", "schema", "robot", "convert", "release", "models"] { assert!(help.contains(name)); }
+        for name in ["redact", "tokens", "split", "normalize", "schema", "robot", "convert", "release", "models"] { assert!(help.contains(name)); }
         assert!(root.try_get_matches_from(["fnlp", "redact", "--rules-only"]).is_ok());
     }
     #[test]
