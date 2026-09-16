@@ -29,6 +29,8 @@ use super::{
     weights::{Bf16Matrix, WeightShapeError},
 };
 
+pub mod candidate_scoring;
+
 /// The execution-identity label selected by this exact cast schedule.
 pub const HF_BF16_EAGER_PROFILE: &str = "hf-bf16-eager";
 
