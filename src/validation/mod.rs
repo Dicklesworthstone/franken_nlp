@@ -5,6 +5,7 @@
 //! `SchemaNode` as an immutable description, but it must not
 //! reuse grammar automata, masks, transitions, or acceptance code.
 
+pub mod grounded_fields;
 pub mod json;
 pub mod offsets;
 pub mod schema;

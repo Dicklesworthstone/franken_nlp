@@ -4,17 +4,22 @@
 //! supplies its missing byte transitions. A clone owns only a bounded parser
 //! stack; schema/literal data are borrowed, and generated documents are never
 //! copied into vocabulary-trie states. Every accepted prefix has a completion
-//! within the output-byte bound. Source products remain explicitly refused.
+//! within the output-byte bound. Bound source fields additionally advance a
+//! request-owned substring cursor; unbound source annotations still refuse.
 
 use std::collections::BTreeMap;
 
 use crate::validation::{JsonValue as ValidationValue, JsonLimits, parse_json_with_limits, validate_value};
 
 use super::{
-    compiler::{CompileLimits, CompiledSchema, SchemaNode, compile_json_schema},
+    compiler::{CompileLimits, CompiledSchema, SchemaNode, SourceAnnotation, compile_json_schema},
     mask::ByteState,
+    source_index::{SourceCursor, SourceLanguage},
     schema::{IntegerValue, JsonValue, ScalarValue, SchemaError, escape_json_string, parse_json},
 };
+
+mod source;
+pub use source::{SOURCE_JSON_RUNTIME_VERSION, SourceRuntimeLimits};
 
 /// Versioned canonical byte-language and code-point length semantics.
 pub const JSON_RUNTIME_VERSION: &str = "canonical-json-runtime-v1";
@@ -32,7 +37,7 @@ struct Property {
 enum Kind {
     Object(Vec<Property>),
     Array { child: usize, maximum: usize },
-    String { max_bytes: usize, max_chars: usize },
+    String { max_bytes: usize, max_chars: usize, verbatim: bool },
     Number { integer: bool },
     Literals(Vec<Vec<u8>>),
 }
@@ -52,6 +57,7 @@ pub struct JsonProgram {
     max_output_bytes: usize,
     lengths: BTreeMap<String, usize>,
     exponents: Vec<(i32, Vec<u8>)>,
+    source: Option<source::SourceBinding>,
 }
 
 impl JsonProgram {
@@ -63,6 +69,10 @@ impl JsonProgram {
     /// and let the compiler enforce every other keyword and deployment cap.
     /// The original schema, not this normalization, belongs in request identity.
     pub fn compile(source: &str, limits: CompileLimits) -> Result<Self, SchemaError> {
+        Self::compile_bound(source, limits, None)
+    }
+
+    fn compile_bound(source: &str, limits: CompileLimits, binding: Option<source::SourceBinding>) -> Result<Self, SchemaError> {
         if source.len() > limits.max_schema_bytes {
             return Err(resource("schema byte limit exceeded"));
         }
@@ -75,18 +85,18 @@ impl JsonProgram {
         let mut compiler_limits = limits;
         compiler_limits.max_schema_bytes = normalized.len();
         let schema = compile_json_schema(&normalized, compiler_limits)?;
-        if schema.requires_verbatim_source() {
+        if schema.requires_verbatim_source() && binding.is_none() {
             return Err(SchemaError::UnsupportedKeyword {
                 pointer: "$".to_owned(), keyword: "runtime source-product gate".to_owned(),
             });
         }
         let mut nodes = Vec::new();
-        let root = build(schema.root(), "$", &lengths, &mut nodes, limits.max_states, 0)?;
+        let root = build(schema.root(), "$", &lengths, &mut nodes, limits.max_states, 0, binding.as_ref().map(|b| &b.language))?;
         if nodes[root].minimum > limits.max_output_bytes {
             return Err(resource("no JSON value fits output byte limit"));
         }
         Ok(Self {
-            schema, nodes, root, max_output_bytes: limits.max_output_bytes, lengths,
+            schema, nodes, root, max_output_bytes: limits.max_output_bytes, lengths, source: binding,
             exponents: (-308..=308).map(|e: i32| (e, e.to_string().into_bytes())).collect(),
         })
     }
@@ -105,6 +115,11 @@ impl JsonProgram {
     /// Independent whole-value verification, never acceptance by parser state.
     /// The existing validator receives schema data, not transitions or masks.
     pub fn validate_json(&self, text: &str) -> Result<(), SchemaError> {
+        let value = self.validated_value(text)?;
+        self.source_fields_for_value(&value).map(|_| ())
+    }
+
+    fn validated_value(&self, text: &str) -> Result<ValidationValue, SchemaError> {
         if text.len() > self.max_output_bytes { return Err(resource("output byte limit exceeded")); }
         let value = parse_json_with_limits(text, JsonLimits {
             max_input_bytes: self.max_output_bytes,
@@ -114,7 +129,8 @@ impl JsonProgram {
         }).map_err(|_| invalid("independent JSON parsing failed"))?;
         validate_value(self.schema.root(), &value)
             .map_err(|_| invalid("independent JSON validation failed"))?;
-        validate_lengths(self.schema.root(), &value, "$", &self.lengths)
+        validate_lengths(self.schema.root(), &value, "$", &self.lengths)?;
+        Ok(value)
     }
 }
 
@@ -161,7 +177,7 @@ fn render(value: &JsonValue) -> String {
     }
 }
 
-fn build(schema: &SchemaNode, path: &str, lengths: &BTreeMap<String, usize>, nodes: &mut Vec<Node>, cap: usize, depth: usize) -> Result<usize, SchemaError> {
+fn build(schema: &SchemaNode, path: &str, lengths: &BTreeMap<String, usize>, nodes: &mut Vec<Node>, cap: usize, depth: usize, source: Option<&SourceLanguage>) -> Result<usize, SchemaError> {
     if depth > MAX_DEPTH || nodes.len() >= cap { return Err(resource("runtime schema state limit exceeded")); }
     let literals = |values: &[ScalarValue]| {
         let mut bytes: Vec<_> = values.iter().map(|v| v.canonical_json().into_bytes()).collect();
@@ -174,23 +190,32 @@ fn build(schema: &SchemaNode, path: &str, lengths: &BTreeMap<String, usize>, nod
             for (name, child) in properties {
                 fields.push(Property {
                     key: format!("{}:", escape_json_string(name)).into_bytes(),
-                    child: build(child, &child_path(path, name), lengths, nodes, cap, depth + 1)?,
+                    child: build(child, &child_path(path, name), lengths, nodes, cap, depth + 1, source)?,
                     required: required.contains(name),
                 });
             }
             Kind::Object(fields)
         }
         SchemaNode::Array { items, max_items } => Kind::Array {
-            child: build(items, &format!("{path}/items"), lengths, nodes, cap, depth + 1)?, maximum: *max_items,
+            child: build(items, &format!("{path}/items"), lengths, nodes, cap, depth + 1, source)?, maximum: *max_items,
         },
-        SchemaNode::String { max_bytes, allowed, .. } => {
+        SchemaNode::String { max_bytes, allowed, source: annotation } => {
+            let verbatim = *annotation == SourceAnnotation::Verbatim;
             let max_chars = lengths.get(path).copied().unwrap_or(usize::MAX);
             if let Some(values) = allowed {
                 if values.iter().any(|v| matches!(v, ScalarValue::String(s) if s.chars().count() > max_chars)) {
                     return Err(invalid("enum/const exceeds maxLength"));
                 }
-                literals(values)
-            } else { Kind::String { max_bytes: *max_bytes, max_chars } }
+                if verbatim {
+                    let index = source.ok_or_else(|| invalid("source annotation has no binding"))?;
+                    let filtered: Vec<_> = values.iter().filter(|v| {
+                        let ScalarValue::String(text) = v else { return false; };
+                        let mut cursor = index.cursor();
+                        text.bytes().all(|b| cursor.push_byte(b)) && cursor.is_accepting()
+                    }).cloned().collect();
+                    literals(&filtered)
+                } else { literals(values) }
+            } else { Kind::String { max_bytes: *max_bytes, max_chars, verbatim } }
         }
         SchemaNode::Number { integer, allowed } => match allowed {
             Some(values) => literals(values), None => Kind::Number { integer: *integer },
@@ -244,7 +269,7 @@ fn validate_lengths(schema: &SchemaNode, value: &ValidationValue, path: &str, le
 }
 
 #[derive(Clone, Debug)]
-enum Frame {
+enum Frame<'a> {
     Value(usize),
     ObjectNext { node: usize, next: usize, close: bool },
     ObjectAfter { node: usize, next: usize },
@@ -252,7 +277,7 @@ enum Frame {
     ArrayNext { node: usize, count: usize, close: bool },
     ArrayAfter { node: usize, count: usize },
     Literal { node: usize, choices: Vec<usize>, position: usize },
-    String { node: usize, bytes: usize, chars: usize, mode: StringMode },
+    String { node: usize, bytes: usize, chars: usize, mode: StringMode, source: Option<SourceCursor<'a>> },
     Number { integer: bool, bytes: [u8; NUMBER_BYTES], len: usize, tail: usize },
 }
 
@@ -268,12 +293,12 @@ enum StringMode {
 #[derive(Clone, Debug)]
 pub struct JsonState<'a> {
     program: &'a JsonProgram,
-    stack: Vec<Frame>,
+    stack: Vec<Frame<'a>>,
     used: usize,
     failed: bool,
 }
 
-impl JsonState<'_> {
+impl<'a> JsonState<'a> {
     /// Acceptance allows EOS; it does not automatically truncate a number or
     /// an enum whose accepted spelling prefixes another accepted spelling.
     #[must_use]
@@ -309,7 +334,7 @@ impl JsonState<'_> {
         }
         bytes
     }
-    fn frame_minimum(&self, frame: &Frame) -> Option<usize> {
+    fn frame_minimum(&self, frame: &Frame<'_>) -> Option<usize> {
         Some(match frame {
             Frame::Value(node) => self.program.nodes[*node].minimum,
             Frame::ObjectAfter { node, next } => self.object_tail(*node, *next, true),
@@ -328,8 +353,9 @@ impl JsonState<'_> {
             Frame::ArrayNext { node, close, .. } => if *close { 1 } else { self.program.nodes[self.array(*node).0].minimum + 1 },
             Frame::ArrayAfter { .. } => 1,
             Frame::Literal { node, choices, position } => choices.iter().map(|&i| self.literals(*node)[i].len() - position).min()?,
-            Frame::String { mode, .. } => 1 + match mode {
-                StringMode::Plain => 0, StringMode::Escape => 1,
+            Frame::String { mode, source, .. } => 1 + match mode {
+                StringMode::Plain => 0,
+                StringMode::Escape => match source { Some(cursor) => source::escape_tail(cursor)?, None => 1 },
                 StringMode::Unicode { position, .. } => 4 - position,
                 StringMode::Utf8 { remaining, .. } => usize::from(*remaining),
             },
@@ -351,9 +377,10 @@ impl JsonState<'_> {
                         if byte != b'[' { return false; }
                         self.stack.push(Frame::ArrayNext { node, count: 0, close: true }); return true;
                     }
-                    Kind::String { .. } => {
+                    Kind::String { verbatim, .. } => {
                         if byte != b'"' { return false; }
-                        self.stack.push(Frame::String { node, bytes: 0, chars: 0, mode: StringMode::Plain }); return true;
+                        let source = if *verbatim { self.program.source.as_ref().map(|b| b.language.cursor()) } else { None };
+                        self.stack.push(Frame::String { node, bytes: 0, chars: 0, mode: StringMode::Plain, source }); return true;
                     }
                     Kind::Number { integer } => self.stack.push(Frame::Number { integer: *integer, bytes: [0; NUMBER_BYTES], len: 0, tail: 1 }),
                     Kind::Literals(values) => self.stack.push(Frame::Literal { node, choices: (0..values.len()).collect(), position: 0 }),
@@ -404,8 +431,9 @@ impl JsonState<'_> {
                     }
                     return true;
                 }
-                Frame::String { node, mut bytes, mut chars, mode } => {
-                    let Kind::String { max_bytes, max_chars } = self.program.nodes[node].kind else { unreachable!("string frame") };
+                Frame::String { node, mut bytes, mut chars, mode, mut source } => {
+                    if source.as_mut().is_some_and(|cursor| !source::advance(cursor, mode, byte)) { return false; }
+                    let Kind::String { max_bytes, max_chars, .. } = self.program.nodes[node].kind else { unreachable!("string frame") };
                     let room = bytes < max_bytes && chars < max_chars;
                     let next_mode = match mode {
                         StringMode::Plain => match byte {
@@ -446,7 +474,7 @@ impl JsonState<'_> {
                             else { StringMode::Utf8 { remaining: remaining - 1, width, low: 0x80, high: 0xbf } }
                         }
                     };
-                    self.stack.push(Frame::String { node, bytes, chars, mode: next_mode }); return true;
+                    self.stack.push(Frame::String { node, bytes, chars, mode: next_mode, source }); return true;
                 }
                 Frame::Number { integer, mut bytes, len, tail } => {
                     if !matches!(byte, b'0'..=b'9' | b'-' | b'.' | b'e') {
