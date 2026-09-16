@@ -12,6 +12,7 @@ pub mod jobs;
 pub mod native_engine;
 pub mod orchestrator;
 pub mod receipt;
+mod redaction_cli;
 pub mod robot;
 pub mod storage;
 pub mod tasks;
