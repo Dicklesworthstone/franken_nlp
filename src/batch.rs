@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::{canonjson, native_engine::decode::{DecodeCancellationKind, DecodeStepControl}};
 
 pub mod extract;
+pub mod generation;
 pub mod judge;
 mod framing;
 mod output;
@@ -137,6 +138,16 @@ impl BatchItemFailure {
     pub fn fatal(fault: impl Into<BatchFault>) -> Self { Self { fault: fault.into(), stop: true } }
 }
 
+/// Engine-assigned delivery coordinates. Not deserializable from task_args,
+/// and NEVER a semantic sampling address, cache key, or admission certificate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatchRequestContext {
+    pub request_seq: u64,
+    pub epoch: u64,
+    pub input_line: u64,
+    pub byte_offset: u64,
+}
+
 /// Trusted embedding boundary, not an executable recipe deserialized from input.
 /// Implementations must be ITEM-LOCAL, prepare without model work, return a
 /// sound work ceiling, enforce it on execution, and bound their result storage.
@@ -150,6 +161,13 @@ pub trait BatchProcessor {
     fn planned_work(&self, prepared: &Self::Prepared) -> BatchWork;
     fn execute<C: DecodeStepControl>(&mut self, prepared: Self::Prepared, control: &mut C)
         -> Result<Self::Output, BatchItemFailure>;
+    /// The runner uses this entrypoint after reserving aggregate work. Existing
+    /// processors retain their behavior; generation can echo the real sequence
+    /// without deriving it from caller IDs or adding it to the sampling key.
+    fn execute_with_context<C: DecodeStepControl>(&mut self, prepared: Self::Prepared,
+        _context: BatchRequestContext, control: &mut C) -> Result<Self::Output, BatchItemFailure> {
+        self.execute(prepared, control)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -265,7 +283,9 @@ fn run<R: BufRead, W: Write, P: BatchProcessor, C: DecodeStepControl>(reader: &m
         };
         checkpoint(control)?;
         summary.reserved_work = total; // No refunds, including failed attempts.
-        match processor.execute(prepared, control) {
+        let context = BatchRequestContext { request_seq: summary.requests, epoch: *epoch,
+            input_line: frame.line, byte_offset: frame.offset };
+        match processor.execute_with_context(prepared, context, control) {
             Ok(result) => {
                 let mut event = Event::new("doc", *epoch, summary.requests);
                 event.caller_id = Some(&id); event.input_line = Some(frame.line);
