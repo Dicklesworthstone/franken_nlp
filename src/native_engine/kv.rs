@@ -293,7 +293,6 @@ pub enum KvSlabError {
     PoolAllocationRefused {
         /// Number of physical slabs requested at pool construction.
         slab_capacity: usize,
-        /// Logical positions held by each physical slab.
         page_tokens: usize,
     },
     /// A token position was not admitted/prepared at its page boundary.
@@ -1449,5 +1448,93 @@ impl Drop for KvSlabCache {
                 }
             }
         }
+    }
+}
+
+/// Rewinding is a completed-sequence operation, never a way to repair a
+/// partially executed token or make unwritten K/V visible.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KvRewindError {
+    IncompletePosition { slot: usize },
+    BeyondCompleted { requested: usize, completed: usize },
+}
+impl std::fmt::Display for KvRewindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IncompletePosition { .. } => f.write_str("cannot rewind an incomplete 44-slot position"),
+            Self::BeyondCompleted { .. } => f.write_str("cannot rewind beyond completed KV positions"),
+        }
+    }
+}
+impl std::error::Error for KvRewindError {}
+
+impl KvCache {
+    /// Retain exactly the already-completed prefix in all 44 slots. This
+    /// performs no allocation, copies no prefix bytes, and preserves every
+    /// engine-build buffer and its capacity. Discarded suffix positions become
+    /// unreadable and must be recomputed before any later attention read.
+    ///
+    /// Validate every slot before changing any of them. A partial token is an
+    /// error; callers must abort/clear such a sequence, not pretend it completed.
+    /// This is destructive single-sequence backtracking, NOT a retained fork
+    /// or a reusable cross-request prefix identity. It does not zeroize storage.
+    pub fn rewind_completed(&mut self, positions: usize) -> Result<(), KvRewindError> {
+        let elements = self.slots[0].keys.len();
+        for (slot, values) in self.slots.iter().enumerate() {
+            if values.keys.len() != elements || values.values.len() != elements
+                || elements % KV_ELEMENTS_PER_POSITION != 0 {
+                return Err(KvRewindError::IncompletePosition { slot });
+            }
+        }
+        let completed = elements / KV_ELEMENTS_PER_POSITION;
+        if positions > completed {
+            return Err(KvRewindError::BeyondCompleted { requested: positions, completed });
+        }
+        // positions <= completed proves this multiplication cannot exceed the
+        // existing Vec length; it is not an unchecked allocation calculation.
+        let keep = positions * KV_ELEMENTS_PER_POSITION;
+        for slot in &mut self.slots {
+            slot.keys.truncate(keep);
+            slot.values.truncate(keep);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod rewind_tests {
+    use super::*;
+    fn append_position(cache: &mut KvCache, position: usize, tag: u16) {
+        for slot in 0..KV_SLOT_COUNT {
+            cache.append(slot, position, &[tag; KV_ELEMENTS_PER_POSITION], &[tag + 1; KV_ELEMENTS_PER_POSITION]).unwrap();
+        }
+    }
+    #[test]
+    fn rewind_reuses_capacity_and_never_exposes_the_discarded_branch() {
+        let mut cache = KvCache::try_with_capacity(4).unwrap();
+        append_position(&mut cache, 0, 10); append_position(&mut cache, 1, 20);
+        let pointers: Vec<_> = cache.slots.iter().map(|s| (s.keys.as_ptr(), s.values.as_ptr(), s.keys.capacity(), s.values.capacity())).collect();
+        cache.rewind_completed(1).unwrap();
+        assert!(cache.all_slots_have_len(1));
+        for slot in 0..KV_SLOT_COUNT {
+            assert_eq!(cache.key_at(slot, 0).unwrap(), &[10; KV_ELEMENTS_PER_POSITION]);
+            assert!(cache.key_at(slot, 1).is_err());
+        }
+        append_position(&mut cache, 1, 30);
+        assert_eq!(pointers, cache.slots.iter().map(|s| (s.keys.as_ptr(), s.values.as_ptr(), s.keys.capacity(), s.values.capacity())).collect::<Vec<_>>());
+        for slot in 0..KV_SLOT_COUNT { assert_eq!(cache.value_at(slot, 1).unwrap(), &[31; KV_ELEMENTS_PER_POSITION]); }
+    }
+    #[test]
+    fn invalid_and_partial_rewinds_leave_every_slot_unchanged() {
+        let mut cache = KvCache::try_with_capacity(2).unwrap();
+        append_position(&mut cache, 0, 10);
+        let before = cache.clone();
+        assert!(matches!(cache.rewind_completed(2), Err(KvRewindError::BeyondCompleted { .. })));
+        assert_eq!(cache, before);
+        cache.append(0, 1, &[20; KV_ELEMENTS_PER_POSITION], &[21; KV_ELEMENTS_PER_POSITION]).unwrap();
+        let before = cache.clone();
+        assert!(matches!(cache.rewind_completed(0), Err(KvRewindError::IncompletePosition { .. })));
+        assert_eq!(cache, before);
+        cache.clear(); cache.rewind_completed(0).unwrap();
     }
 }
