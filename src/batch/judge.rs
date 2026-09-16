@@ -1,7 +1,7 @@
 //! Stream raw pairwise/rubric/faithfulness requests through the existing pinned
 //! task planner and one ALREADY admitted eager engine. No loader or alternate
 //! judge implementation. The host's actual admission guard remains live until
-//! native execution, independent result validation and logical KV cleanup end.
+//! native completion, result validation AND delivery by the batch writer.
 
 use crate::{
     execution_identity::{ExecutionIdentity, NumericsProfile, ThinkingMode, ToolMode},
@@ -12,6 +12,7 @@ use crate::{
         PairwisePolicy, RubricDefinition, RubricPolicy, FaithfulnessPolicy}},
 };
 use super::*;
+pub use super::output::GuardedOutput;
 
 /// `text` supplies A in pairwise mode, the rubric document, or the complete
 /// faithfulness source. All other task data have the SAME types and semantics
@@ -103,7 +104,7 @@ impl<'p, 'e, A: JudgeBatchAdmission> NativeJudgeBatch<'p, 'e, A> {
 impl<A: JudgeBatchAdmission> BatchProcessor for NativeJudgeBatch<'_, '_, A> {
     type Args = JudgeBatchArgs;
     type Prepared = PreparedBatchJudge;
-    type Output = EagerJudgeRun<JudgeResult>;
+    type Output = GuardedOutput<EagerJudgeRun<JudgeResult>, A::Guard>;
     fn prepare(&mut self, document: BatchDocument<Self::Args>) -> Result<Self::Prepared, BatchItemFailure> {
         let prepared = self.compiler.prepare(document)?;
         // Capacity/full-reservation checks have no model calls or mutations.
@@ -116,9 +117,7 @@ impl<A: JudgeBatchAdmission> BatchProcessor for NativeJudgeBatch<'_, '_, A> {
     fn planned_work(&self, prepared: &Self::Prepared) -> BatchWork { prepared.work }
     fn execute<C: DecodeStepControl>(&mut self, prepared: Self::Prepared, control: &mut C)
         -> Result<Self::Output, BatchItemFailure> {
-        let (identity, _guard) = self.admission.admit(prepared.execution_identity(), prepared.work)?;
-        // _guard is a binding, not a discarded '_' pattern. It stays alive
-        // across native execution, validation and cleanup, including errors.
+        let (identity, guard) = self.admission.admit(prepared.execution_identity(), prepared.work)?;
         prepared.plan.verify_identity(&identity).map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
         let budget = prefix_budget(prepared.work);
         prepared.plan.preflight_eager(&identity, self.engine, budget).map_err(native_failure)?;
@@ -132,7 +131,9 @@ impl<A: JudgeBatchAdmission> BatchProcessor for NativeJudgeBatch<'_, '_, A> {
             || run.native_work.projected_logits != prepared.work.projected_logits {
             return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
         }
-        Ok(run)
+        // Preserve output-memory/admission ownership until the stream has
+        // serialized, written and flushed this result, including sink errors.
+        Ok(GuardedOutput::new(run, guard))
     }
 }
 fn prefix_budget(work: BatchWork) -> PrefixBudget {

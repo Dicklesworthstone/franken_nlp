@@ -23,8 +23,13 @@ malformed controls produce one correlated `doc_error`. Empty LF/CRLF lines
 are ignored. Source text is never trimmed, normalized or retokenized here.
 An unterminated final record is processed at EOF.
 
-Every complete nonempty physical record receives a checked sequence before
-parsing. Caller IDs are echoed only after strict envelope/ID validation.
+A checked sequence is assigned as soon as nonempty payload is established,
+BEFORE parsing and even if a later read/input-budget check fails. A single
+leading CR waits until it is known not to be empty CRLF. Sequence overflow
+ends admission without wrapping. Input-limit accounting consumes only up to
+the admitted ceiling and does not vary with the reader's buffer capacity.
+Caller IDs are echoed only after strict envelope/ID validation.
+
 Events carry protocol, schema_version, execution, event, epoch, request_seq;
 document events additionally carry input_line, byte_offset and caller_id when
 known. Success embeds the typed task result, preserving extraction JSON as an
@@ -54,10 +59,12 @@ These epochs are not corpus-global resolve transactions or durable snapshots.
 
 Output is size-preflighted, canonicalized and staged as a complete bounded
 record before touching the writer. Ordinary records cannot consume the small
-reserved terminal-event allowance. Partial writes and flush failures poison
-the stream: no retry, further input, or appended run_error is attempted on
-that unknown output prefix. Writer flush proves neither downstream processing
-nor persistence. Raw stdout is not an exactly-once or resumable job protocol.
+reserved terminal-event allowance. The original typed value, not the size
+pass's JSON, reaches the canonical serializer so NaN/Infinity cannot silently
+become null. Partial writes and flush failures poison the stream: no retry,
+further input, or appended run_error is attempted on that unknown output prefix.
+Writer flush proves neither downstream processing nor persistence. Raw stdout
+is not an exactly-once or resumable job protocol.
 
 Cooperative checkpoints run between records, during chunked reads and inside
 native execution. A blocking I/O operation cannot be preempted by a checkpoint.
@@ -97,9 +104,16 @@ and its actual admission hook. The hook receives the proposed complete private
 identity and work ceiling, returning the identity admitted by the host plus
 the host's real RAII guard. There is NO default hook inventing authorization.
 It is an embedding seam to the ratified admission path, not a local replacement
-PermitBroker. The guard stays alive through native execution, independent
-validation and logical KV cleanup. Returned identities are compared exactly;
-no model/backend/task field is silently repaired at execution time.
+PermitBroker. Returned identities are compared exactly; no model/backend/task
+field is silently repaired at execution time.
+
+Both native adapters return a `GuardedOutput`, re-exported from judge/extract.
+It serializes exactly the inner task result, never the guard. The host's guard
+moves with successful result storage through serialization, write_all AND flush;
+only then does the runner drop the result before its guard and admit the next
+record. Failed serialization/delivery follows the same drop ownership. A native
+error releases its guard only after compute cleanup. This closes the output
+reservation gap between inference completion and downstream backpressure.
 
 The stream charges an aggregate forward/projection ceiling before each
 attempt. Failed attempts are not refunded and flush does not replenish work.
@@ -119,10 +133,12 @@ existing prefix-session and constrained-decoder guards, never simulated here.
 
 ## Source regression coverage and remaining work
 
-Twenty-one added source cases cover framing, Unicode, malformed/oversized
-records, duplicate epochs, budgets, partial output failure, cancellation,
+Twenty-nine added source cases cover framing, Unicode, malformed/oversized
+records, duplicate epochs, budgets, partial output/flush failures, cancellation,
 actual pinned judge planning/scoring with synthetic logits, schema precision,
-source bindings and native failure classification. They remain UNRUN.
+source bindings, native failure classification, guard lifetime through delivery,
+nonfinite output refusal, terminal-output reservation and sequence overflow.
+They remain UNRUN.
 
 Still separate: inference CLI/model-activation integration, a frozen robot
 schema extension, supervised async I/O, completion-order parallel scheduling,

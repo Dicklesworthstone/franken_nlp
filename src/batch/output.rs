@@ -3,6 +3,21 @@ use super::*;
 /// Kept unused by ordinary records so resource failure can emit run_error.
 pub(super) const TERMINAL_RESERVE: usize = 2048;
 
+/// Carry the embedding host's output/admission reservation through delivery,
+/// not just through inference. Wire serialization is exactly the inner result;
+/// guard types require no Serialize/Debug implementation and never enter JSON.
+/// Fields drop in declaration order: result storage is freed before its guard.
+pub struct GuardedOutput<T, G> { result: T, _guard: G }
+impl<T, G> GuardedOutput<T, G> {
+    pub(crate) fn new(result: T, guard: G) -> Self { Self { result, _guard: guard } }
+    pub fn result(&self) -> &T { &self.result }
+}
+impl<T: Serialize, G> Serialize for GuardedOutput<T, G> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.result.serialize(serializer)
+    }
+}
+
 #[derive(Serialize)]
 pub(super) struct Event<'a, T: Serialize> {
     protocol: &'static str,
@@ -77,3 +92,6 @@ impl Write for Counter {
     }
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
+
+#[cfg(test)]
+mod tests;

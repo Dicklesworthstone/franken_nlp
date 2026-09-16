@@ -16,8 +16,8 @@ use crate::{
         PINNED_ADDED_TOKENS_BYTES, PINNED_TOKENIZER_CONFIG_BYTES, PINNED_SPECIAL_TOKENS_MAP_BYTES}, specials::TemplateControlIds},
 };
 use super::*;
-/// The same embedding admission hook/guard works for both native task families.
-pub use super::judge::JudgeBatchAdmission as ExtractionBatchAdmission;
+/// Shared embedding admission and result-ownership surfaces for both families.
+pub use super::judge::{JudgeBatchAdmission as ExtractionBatchAdmission, GuardedOutput};
 
 pub const EXTRACTION_BATCH_PROMPT: &str = "extract-segmented-schema-and-source-v1";
 const SCHEMA_SLOT: &str = "FNLP_EXTRACT_SCHEMA_0_967a";
@@ -210,7 +210,9 @@ impl<'e, 'v, A: ExtractionBatchAdmission> NativeExtractionBatch<'e, 'v, A> {
     pub fn reserved_mask_visits(&self) -> u64 { self.masks.max_visits_per_run - self.remaining_mask_visits }
 }
 impl<A: ExtractionBatchAdmission> BatchProcessor for NativeExtractionBatch<'_, '_, A> {
-    type Args = ExtractionBatchArgs; type Prepared = PreparedBatchExtraction; type Output = ExtractResult;
+    type Args = ExtractionBatchArgs;
+    type Prepared = PreparedBatchExtraction;
+    type Output = GuardedOutput<ExtractResult, A::Guard>;
     fn prepare(&mut self, document: BatchDocument<Self::Args>) -> Result<Self::Prepared, BatchItemFailure> {
         if self.remaining_mask_visits < self.masks.max_visits_per_item { return Err(BatchItemFailure::reject(BatchCode::WorkLimit)); }
         let prepared = self.compiler.prepare(document)?; prepared.preflight(self.engine)?; Ok(prepared)
@@ -219,7 +221,7 @@ impl<A: ExtractionBatchAdmission> BatchProcessor for NativeExtractionBatch<'_, '
     fn execute<C: DecodeStepControl>(&mut self, prepared: Self::Prepared, control: &mut C) -> Result<Self::Output, BatchItemFailure> {
         self.remaining_mask_visits = self.remaining_mask_visits.checked_sub(self.masks.max_visits_per_item)
             .ok_or_else(|| BatchItemFailure::reject(BatchCode::WorkLimit))?;
-        let (identity, _guard) = self.admission.admit(prepared.execution_identity(), prepared.work)?;
+        let (identity, guard) = self.admission.admit(prepared.execution_identity(), prepared.work)?;
         prepared.verify_identity(&identity).map_err(BatchItemFailure::fatal)?;
         prepared.preflight(self.engine)?;
         let work = JsonWorkBudget { max_forward_positions: prepared.work.forward_positions,
@@ -235,7 +237,9 @@ impl<A: ExtractionBatchAdmission> BatchProcessor for NativeExtractionBatch<'_, '
             || actual.projected_logits > prepared.work.projected_logits || actual.mask_node_visit_charge > self.masks.max_visits_per_item {
             return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
         }
-        Ok(result)
+        // Transfer the guard with the result. It cannot release output-memory
+        // authority between inference completion and writer acknowledgement.
+        Ok(GuardedOutput::new(result, guard))
     }
 }
 fn execution_failure(error: ExtractError) -> BatchItemFailure {
