@@ -3,6 +3,7 @@
 pub mod artifact_bridge;
 pub mod attention;
 pub mod batchsched;
+pub mod constrained;
 pub mod decode;
 pub mod diagnostic_f32;
 pub mod dispatch;

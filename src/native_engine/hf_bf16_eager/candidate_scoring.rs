@@ -218,7 +218,7 @@ impl DecodeStepControl for Continue {
 
 /// Only a freshly admitted empty engine enters this guard. Clear on ordinary
 /// errors, cancellation, and unwinding, while retaining preallocated buffers.
-struct ClearCache<'a>(&'a mut HfBf16EagerEngine);
+pub(crate) struct ClearCache<'a>(pub(crate) &'a mut HfBf16EagerEngine);
 impl Drop for ClearCache<'_> {
     fn drop(&mut self) { self.0.kv_cache.clear(); }
 }
