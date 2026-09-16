@@ -28,6 +28,10 @@ pub const DECODE_SCHEMA_VERSION: u32 = 1;
 /// this typed event into its NDJSON line.
 pub const DECODE_TOKEN_EVENT_SCHEMA_VERSION: u32 = 2;
 
+mod prefill;
+
+use prefill::{PrefillOutcome, prefill_last};
+
 const MAX_STOP_SEQUENCES: usize = 64;
 const MAX_STOP_SEQUENCE_BYTES: usize = 4 * 1024;
 
@@ -330,6 +334,14 @@ impl DecodeByteDecoder for SpBpeTokenizer {
 pub trait DecodeStepControl {
     /// Return a cancellation chain to stop before the pending token commits.
     fn checkpoint(&mut self, next_token_index: usize) -> Option<DecodeCancellationKind>;
+
+    /// Check before each prompt-token forward. Existing controls delegate to
+    /// `checkpoint(0)` because no generated token has committed yet. Override
+    /// this hook for separate prefill work accounting; checkpoint calls are
+    /// not a once-per-generated-token notification protocol.
+    fn prefill_checkpoint(&mut self, _next_prompt_token_index: usize) -> Option<DecodeCancellationKind> {
+        self.checkpoint(0)
+    }
 }
 
 /// Typed refusals from the eager greedy loop.
@@ -526,23 +538,26 @@ pub fn greedy_decode_with_hooks<D: DecodeByteDecoder, S: DecodeEventSink, C: Dec
         return Ok(output);
     }
 
-    let prefill = engine.prefill(prompt_token_ids)?;
-    let mut selected = checked_greedy_token(
-        prefill
-            .last()
-            .expect("nonempty prompt produces one eager forward per token")
-            .greedy_token,
-    )?;
-    let mut selected_logprob = if params.capture_logprobs {
-        Some(full_vocabulary_logprob(
-            &prefill
-                .last()
-                .expect("nonempty prompt produces one eager forward per token")
-                .logits,
-            selected,
-        )?)
-    } else {
-        None
+    // The oracle's `prefill` intentionally collects every trace. Generation
+    // instead releases each intermediate forward before computing the next.
+    let (mut selected, mut selected_logprob) = {
+        let forward = match prefill_last(prompt_token_ids, control, |token| {
+            engine.decode(token).map_err(DecodeError::from)
+        })? {
+            PrefillOutcome::Complete(forward) => forward,
+            PrefillOutcome::Cancelled(kind) => {
+                output.finish_reason = DecodeFinishReason::Cancelled;
+                output.cancellation = Some(kind);
+                return Ok(output);
+            }
+        };
+        let selected = checked_greedy_token(forward.greedy_token)?;
+        let logprob = if params.capture_logprobs {
+            Some(full_vocabulary_logprob(&forward.logits, selected)?)
+        } else {
+            None
+        };
+        (selected, logprob)
     };
 
     loop {
@@ -709,23 +724,29 @@ fn full_vocabulary_logprob(logits: &[f32], selected: u32) -> Result<f32, DecodeE
             detail: format!("selected token {selected} has non-finite logit"),
         });
     }
-    let maximum = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    if !maximum.is_finite() {
+    if logits.iter().any(|logit| !logit.is_finite()) {
         return Err(DecodeError::LogprobUnavailable {
-            detail: "full vocabulary has no finite maximum logit".to_owned(),
+            detail: "full vocabulary contains a non-finite raw logit".to_owned(),
         });
     }
+    let maximum = logits.iter().copied().map(f64::from).fold(f64::NEG_INFINITY, f64::max);
     let exp_sum = logits
         .iter()
         .copied()
-        .map(|logit| f64::from(logit - maximum).exp())
+        .map(|logit| (f64::from(logit) - maximum).exp())
         .sum::<f64>();
     if !exp_sum.is_finite() || exp_sum <= 0.0 {
         return Err(DecodeError::LogprobUnavailable {
             detail: "full vocabulary log-sum-exp is non-finite".to_owned(),
         });
     }
-    Ok((f64::from(selected_logit - maximum) - exp_sum.ln()) as f32)
+    let logprob = ((f64::from(selected_logit) - maximum) - exp_sum.ln()) as f32;
+    if !logprob.is_finite() {
+        return Err(DecodeError::LogprobUnavailable {
+            detail: "full vocabulary logprob does not fit the finite f32 output field".to_owned(),
+        });
+    }
+    Ok(logprob)
 }
 
 fn deliver_stream_event<S: DecodeEventSink>(
