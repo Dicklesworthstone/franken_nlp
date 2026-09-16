@@ -9,6 +9,7 @@ use std::{collections::BTreeSet, error::Error, fmt, io::{BufRead, Write}};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::{canonjson, native_engine::decode::{DecodeCancellationKind, DecodeStepControl}};
 
+pub mod judge;
 mod framing;
 mod output;
 use framing::{Frame, read_frame};
@@ -166,7 +167,7 @@ pub struct BatchSummary {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BatchRunError { pub fault: BatchFault, pub summary: BatchSummary }
 impl fmt::Display for BatchRunError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.fault.fmt(f) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{}", self.fault) }
 }
 impl Error for BatchRunError {}
 
