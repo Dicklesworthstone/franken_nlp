@@ -9,6 +9,7 @@ use std::{collections::BTreeSet, error::Error, fmt, io::{BufRead, Write}};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::{canonjson, native_engine::decode::{DecodeCancellationKind, DecodeStepControl}};
 
+pub mod extract;
 pub mod judge;
 mod framing;
 mod output;
@@ -221,8 +222,8 @@ fn run<R: BufRead, W: Write, P: BatchProcessor, C: DecodeStepControl>(reader: &m
             return Ok(());
         };
         if frame.bytes.is_empty() && !frame.oversized { continue; }
-        summary.requests = summary.requests.checked_add(1).ok_or(BatchCode::SequenceOverflow)?;
-        if summary.requests > limits.max_requests { return Err(BatchCode::RequestLimit.into()); }
+        // Framing assigns the sequence as soon as nonempty payload is known,
+        // so even a later read/budget error cannot masquerade as the prior item.
         let document = match parse::<P::Args>(&frame, limits) {
             Ok(Command::Flush) => {
                 flush(sink, summary, epoch, false)?;
