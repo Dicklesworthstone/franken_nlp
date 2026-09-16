@@ -21,6 +21,7 @@ use crate::{
 use super::{BuiltInTask, extract::SourceDocumentEncoder,
     ir::{DecodeBudget, DecodeStrategy, DependencyScope, FinitePostcondition, GrammarReference, PlanContext,
         PromptSegment, PromptSegmentKind, TaskBudget, TaskIR, TaskPlan, TokenSequence}};
+mod bounds;
 
 pub const CHAT_PROMPT_VERSION: &str = "pinned-segmented-chat-no-thinking-no-tools-v1";
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -153,6 +154,9 @@ impl ChatPlanner {
     }
     fn compile(&self, kind: BuiltInTask, item: &str, sample: u64, messages: &[ChatMessage],
         options: &GenerationOptions, budget: TaskBudget) -> Result<PreparedChat, ChatError> {
+        // Reject invalid/oversized caller-owned option collections before
+        // rendering, tokenizing messages or cloning them into a sealed plan.
+        options.validate(self.limits.generation)?;
         validate_messages(messages, self.limits)?;
         budget.validate().map_err(|_| ChatError::Limit("task budget"))?;
         let ceiling = self.ceiling;
@@ -270,9 +274,7 @@ impl PreparedChat {
             numerics_profile: raw.numerics_profile, request_seq: raw.request_seq, sample_index: raw.sample_index, content,
             token_ids: raw.token_ids, finish_reason: raw.finish_reason, effective_seed: raw.effective_seed,
             token_logprobs: raw.token_logprobs, logprob_score_space: raw.logprob_score_space, native_work: raw.native_work };
-        if canonjson::canonical_bytes(&result).map_err(|_| ChatError::Serialization)?.len() as u64 > self.task.ir().budget().max_output_bytes {
-            return Err(ChatError::Limit("complete result bytes"));
-        }
+        bounds::result(&result, self.task.ir().budget().max_output_bytes)?;
         Ok(result)
     }
 }

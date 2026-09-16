@@ -18,6 +18,7 @@ use super::{
     kv::KV_BYTES_PER_TOKEN, lmhead::NANBEIGE_VOCAB_SIZE,
     sampler::{Seed256, StableRequestKey, SAMPLER_VERSION},
 };
+mod config;
 mod policy;
 #[cfg(test)] mod tests;
 
@@ -60,6 +61,9 @@ pub struct GenerationOptions {
     pub repetition_penalty_milli: u32,
     pub presence_penalty_milli: i32,
     pub frequency_penalty_milli: i32,
+    /// Wire keys must be canonical unsigned decimal token IDs. Alternate
+    /// spellings cannot collapse two distinct JSON keys into one token policy.
+    #[serde(deserialize_with = "config::deserialize_bias")]
     pub logit_bias_milli: BTreeMap<u32, i32>,
     pub sampling: GenerationSampling,
 }
@@ -69,6 +73,13 @@ impl GenerationOptions {
             banned_token_ids: Vec::new(), stop_suffixes: Vec::new(), capture_logprobs: false,
             repetition_penalty_milli: 1000, presence_penalty_milli: 0, frequency_penalty_milli: 0,
             logit_bias_milli: BTreeMap::new(), sampling: GenerationSampling::Greedy }
+    }
+    /// Check caller-owned option sizes and domains without cloning options,
+    /// rendering/tokenizing text, allocating a sampler or touching the engine.
+    pub fn validate(&self, limits: GenerationLimits) -> Result<(), GenerationError> {
+        policy::validate(self, limits)?;
+        if policy::workspace_bytes()? > limits.max_sampler_bytes { return Err(GenerationError::Limit("sampler storage")); }
+        Ok(())
     }
 }
 
@@ -177,7 +188,7 @@ impl GenerationPlan {
             || prompt.iter().any(|&id| id as usize >= NANBEIGE_VOCAB_SIZE) {
             return Err(GenerationError::Contract("prompt"));
         }
-        policy::validate(&options, limits)?;
+        options.validate(limits)?;
         options.eos_token_ids.sort_unstable(); options.eos_token_ids.dedup();
         options.banned_token_ids.sort_unstable(); options.banned_token_ids.dedup();
         let positions = prompt.len().checked_add(options.max_new_tokens - 1)
@@ -186,9 +197,10 @@ impl GenerationPlan {
             projected_logits: positions.checked_mul(NANBEIGE_VOCAB_SIZE as u64).ok_or(GenerationError::Limit("logits"))?,
             sampled_steps: if matches!(&options.sampling, GenerationSampling::Seeded { .. }) { options.max_new_tokens as u64 } else { 0 } };
         let sampler_bytes = policy::workspace_bytes()?;
-        if sampler_bytes > limits.max_sampler_bytes { return Err(GenerationError::Limit("sampler storage")); }
         identity.prompt_digest = digest(&prompt)?;
-        identity.decision_policy_digest = digest(&(PROCESSOR_VERSION, &options))?;
+        // Item/sample selection affects addressed draws, so admission/resume
+        // identity must bind it too, not just the decoder's private request key.
+        identity.decision_policy_digest = digest(&(GENERATION_VERSION, PROCESSOR_VERSION, &options, item_id, sample_index))?;
         identity.sampler_version = match &options.sampling {
             GenerationSampling::Greedy => "fnlp-greedy-v1", GenerationSampling::Seeded { .. } => SAMPLER_VERSION,
         }.to_owned();

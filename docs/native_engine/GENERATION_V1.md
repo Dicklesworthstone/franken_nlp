@@ -26,14 +26,19 @@ The completed result includes the seed as 64 lowercase hex characters.
 
 The private stable request key binds the exact prompt, complete effective
 options, declared artifact/backend identity, task and stable caller/job item ID.
-The draw adds sample_index, autoregressive step and draw_index zero. Physical
-batch row, transport request_seq and flush epoch are not sampling coordinates.
-The private key and raw content-derived identity never enter results or errors.
+Item ID and sample_index also bind the admitted decision-policy identity: the
+host cannot admit one sample/item and unknowingly execute another. The draw
+adds sample_index, autoregressive step and draw_index zero. Physical batch row,
+transport request_seq and flush epoch are not sampling coordinates. The private
+key and raw content-derived identity never enter results or errors.
 
 The versioned processor order is static bans and minimum-length EOS exclusion,
 repetition penalty, presence penalty, frequency penalty, logit bias, temperature,
 top-k, then top-p. Counts include prompt and already committed output tokens.
 Settings have explicit bounded fixed-point wire forms. Bias cannot unban tokens.
+Bias-map keys must be canonical unsigned decimal token IDs; alternate spellings
+such as `1` and `01` cannot silently collapse into one token policy. The decoder
+also rejects oversized bias maps, out-of-vocabulary IDs and invalid bias values.
 Sampling rejects nonfinite raw logits even at banned rows. Greedy ties retain
 the lowest token ID. Sampled ranking and half-open interval arithmetic use the
 existing pinned sampler rules; these are named semantics, not an HF-parity award.
@@ -88,7 +93,9 @@ Chat accepts an optional first system message, then alternating user/assistant
 messages ending in user. It refuses malformed roles, oversized messages/history,
 context overflow and task budgets above the frozen host ceiling. It does not
 truncate or summarize history implicitly. Every request cold-prefills its full
-transcript; no cross-request prefix cache is asserted.
+transcript; no cross-request prefix cache is asserted. GenerationOptions has a
+model-free, non-cloning validation entrypoint; the planner checks it before
+rendering/tokenizing any message or cloning options into a sealed plan.
 
 The trusted template renderer sees only authored placeholders and explicit role
 enums. Each caller message is separately exact-byte encoded without privileged
@@ -103,8 +110,11 @@ FreeText TaskIR. The prepared task retains its pinned decoder, so execution
 cannot silently swap tokenizers. Finalization independently checks envelope,
 termination/EOS, exact decoded bytes, full-vocabulary score fields, actual work,
 seed and the complete response byte limit. Invalid/incomplete UTF-8 is a typed
-no-result, never lossy replacement. Results carry untrusted assistant content,
-not executable tools or exposed private execution identities.
+no-result, never lossy replacement. A nonallocating serialization-size pass
+refuses amplified responses before building their canonical JSON storage; the
+original typed value still receives canonical validation and exact size checks.
+Results carry untrusted assistant content, not executable tools or exposed
+private execution identities.
 
 ## NDJSON integration
 
@@ -140,10 +150,12 @@ model loading, interactive terminal UI or production CLI activation is added.
 
 ## Source regressions
 
-Twenty-four added source cases cover processor order, exact/full nucleus versus
+Thirty-one added source cases cover processor order, exact/full nucleus versus
 top-k, EOS and byte stops, stream failure, cancellation, transport-independent
 sampled replay, work limits, pinned message encoding, role/history refusal,
 request identity binding, independent finalization, actual batch request-context
 propagation and compatibility with pre-existing BatchProcessor implementations.
+They also cover canonical bias-key spelling, stable item/sample admission
+binding, cancellation during sink reservation and output-size preflight.
 They remain UNRUN. Real-model tests and empirical quality/throughput evidence
 are separate requirements, not inferred from these source cases.
