@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::validation::grounded_fields::VerifiedSourceSpan;
 
 pub mod detectors;
+pub mod union;
 
 /// Type names are stable inputs to policy and pseudonym domain separation.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
