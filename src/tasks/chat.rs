@@ -11,7 +11,8 @@ use crate::{
     canonjson, execution_identity::{ExecutionIdentity, NumericsProfile, Sha256Digest, ThinkingMode, ToolMode},
     native_engine::{decode::{DecodeEventSink, DecodeScoreSpace, DecodeStepControl},
         generation::{GeneratedSequence, GenerationBudget, GenerationError, GenerationFinish, GenerationLimits,
-            GenerationOptions, GenerationPlan, GenerationSampling, GenerationWork, GENERATION_VERSION},
+            GenerationOptions, GenerationPlan, GenerationSampling, GenerationWork, GENERATION_VERSION,
+            batched::BATCH_GENERATION_VERSION},
         hf_bf16_eager::{HfBf16EagerEngine, HF_BF16_EAGER_PROFILE}, lmhead::NANBEIGE_VOCAB_SIZE,
         sampler::Seed256},
     template::{Conversation, Message, MessageRole, RenderOptions, TemplateBuilder, ToolFormat, IM_START, IM_END, THINK_START, THINK_END},
@@ -21,6 +22,7 @@ use crate::{
 use super::{BuiltInTask, extract::SourceDocumentEncoder,
     ir::{DecodeBudget, DecodeStrategy, DependencyScope, FinitePostcondition, GrammarReference, PlanContext,
         PromptSegment, PromptSegmentKind, TaskBudget, TaskIR, TaskPlan, TokenSequence}};
+pub mod batched;
 mod bounds;
 
 pub const CHAT_PROMPT_VERSION: &str = "pinned-segmented-chat-no-thinking-no-tools-v1";
@@ -240,7 +242,9 @@ impl PreparedChat {
         let p = self.native.options();
         let expected_seed = match &p.sampling { GenerationSampling::Greedy => None,
             GenerationSampling::Seeded { effective_seed, .. } => Some(Seed256::from(*effective_seed).to_lower_hex()) };
-        if raw.schema_version != 1 || raw.execution != GENERATION_VERSION || raw.numerics_profile != HF_BF16_EAGER_PROFILE
+        let selective_projection = raw.execution == BATCH_GENERATION_VERSION;
+        if raw.schema_version != 1 || (raw.execution != GENERATION_VERSION && !selective_projection)
+            || raw.numerics_profile != HF_BF16_EAGER_PROFILE
             || raw.sample_index != self.sample_index || raw.effective_seed != expected_seed
             || raw.token_ids.len() > p.max_new_tokens || raw.content_bytes.len() > p.max_output_bytes
             || raw.token_ids.iter().any(|&id| id as usize >= NANBEIGE_VOCAB_SIZE || p.banned_token_ids.binary_search(&id).is_ok()) {
@@ -261,8 +265,11 @@ impl PreparedChat {
             .ok_or(ChatError::NoResult("work arithmetic"))?;
         let positions = self.native.prompt_tokens().checked_add(proposals).and_then(|n| n.checked_sub(1)).ok_or(ChatError::NoResult("work arithmetic"))? as u64;
         let sampled = if expected_seed.is_some() { proposals as u64 } else { 0 };
+        // Batch execution intentionally skips intermediate prompt lm heads.
+        // Do not weaken the denominator check or rewrite work to look scalar.
+        let projection_rows = if selective_projection { proposals as u64 } else { positions };
         if raw.native_work.forward_positions != positions || positions > self.native.planned_work().forward_positions
-            || positions.checked_mul(NANBEIGE_VOCAB_SIZE as u64) != Some(raw.native_work.projected_logits)
+            || projection_rows.checked_mul(NANBEIGE_VOCAB_SIZE as u64) != Some(raw.native_work.projected_logits)
             || raw.native_work.sampled_steps != sampled { return Err(ChatError::NoResult("native work")); }
         match (&raw.token_logprobs, raw.logprob_score_space, p.capture_logprobs) {
             (Some(scores), Some(DecodeScoreSpace::FullVocabularyLogSoftmax), true)
