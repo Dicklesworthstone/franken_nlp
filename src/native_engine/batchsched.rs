@@ -27,6 +27,7 @@ use super::{
 };
 mod kernels;
 mod linear;
+mod model;
 mod pool;
 #[cfg(test)] mod tests;
 
@@ -169,7 +170,7 @@ pub struct EagerBatchEngine<'weights> {
 }
 impl<'weights> EagerBatchEngine<'weights> {
     pub fn new(weights: &'weights HfBf16EagerWeights, envelope: BatchEnvelope) -> Result<Self, BatchError> {
-        weights.validate()?;
+        model::validate(weights)?;
         let cap = *envelope.capacities.iter().max().ok_or(BatchError::Contract("empty envelope"))?;
         let rope = RopeTablesF32::nanbeige(cap).map_err(HfBf16EagerError::from)?;
         let pool = pool::SequencePool::new(&envelope.capacities)?;
@@ -177,6 +178,11 @@ impl<'weights> EagerBatchEngine<'weights> {
     }
     pub fn profile(&self) -> &'static str { HF_BF16_EAGER_PROFILE }
     pub fn envelope(&self) -> &BatchEnvelope { &self.envelope }
+    /// Check all planned rows before opening any of them. A busy slot is not
+    /// implicitly reset, and the complete requested context must fit its cap.
+    pub fn preflight_sequence_slot(&self, slot: usize, required_positions: usize) -> Result<(), BatchError> {
+        self.pool.preflight_slot(slot, required_positions)
+    }
     pub fn open_sequence(&mut self, slot: usize) -> Result<BatchSequence, BatchError> { self.pool.open(slot) }
     pub fn close_sequence(&mut self, sequence: BatchSequence) -> Result<(), BatchError> { self.pool.close(sequence) }
     pub fn sequence_len(&self, sequence: BatchSequence) -> Result<usize, BatchError> { self.pool.len(sequence) }

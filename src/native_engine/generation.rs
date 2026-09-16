@@ -18,7 +18,9 @@ use super::{
     kv::KV_BYTES_PER_TOKEN, lmhead::NANBEIGE_VOCAB_SIZE,
     sampler::{Seed256, StableRequestKey, SAMPLER_VERSION},
 };
+pub mod batched;
 mod config;
+mod cursor;
 mod policy;
 #[cfg(test)] mod tests;
 
@@ -118,7 +120,8 @@ pub enum GenerationFinish { Eos, StopSuffix, TokenLimit, ByteLimit }
 /// A completed sequence, never a cancellation disguised as successful output.
 /// token_ids includes terminal EOS; content_bytes excludes EOS. Stop suffixes
 /// remain. Token events concatenate to exactly content_bytes. Raw scores include
-/// a scored EOS, with its actual full-vocabulary denominator.
+/// a scored EOS, with its actual full-vocabulary denominator. `execution` names
+/// whether intermediate prompt positions also computed a full vocabulary row.
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GeneratedSequence {
@@ -256,68 +259,22 @@ impl GenerationPlan {
             guard.0.decode(token).map(|row| row.logits).map_err(GenerationError::Engine)
         })
     }
+    /// The scalar and grouped drivers share this exact cursor/sampler/stop
+    /// state machine. Scalar eager still projects every prompt position; the
+    /// grouped driver skips only intermediate prompt lm-heads and records that.
     fn run<D: DecodeByteDecoder, S: DecodeEventSink, C: DecodeStepControl,
         F: FnMut(u32) -> Result<Vec<f32>, GenerationError>>(&self, decoder: &D, request_seq: u64,
         sink: &mut S, control: &mut C, mut forward: F) -> Result<GeneratedSequence, GenerationError> {
-        let p = &self.options;
-        let mut workspace = policy::Workspace::new(&self.prompt)?;
-        let mut out = GeneratedSequence { schema_version: 1, execution: GENERATION_VERSION.to_owned(),
-            numerics_profile: HF_BF16_EAGER_PROFILE.to_owned(), request_seq, sample_index: self.sample_index,
-            token_ids: reserved(p.max_new_tokens)?, content_bytes: Vec::new(), finish_reason: GenerationFinish::TokenLimit,
-            effective_seed: match &p.sampling { GenerationSampling::Greedy => None,
-                GenerationSampling::Seeded { effective_seed, .. } => Some(Seed256::from(*effective_seed).to_lower_hex()) },
-            token_logprobs: if p.capture_logprobs { Some(reserved(p.max_new_tokens)?) } else { None },
-            logprob_score_space: p.capture_logprobs.then_some(DecodeScoreSpace::FullVocabularyLogSoftmax),
-            native_work: GenerationWork::default() };
-        let mut logits = Vec::new();
-        for (index, &token) in self.prompt.iter().enumerate() {
-            if let Some(cause) = control.prefill_checkpoint(index) { return Err(GenerationError::Cancelled(cause)); }
-            drop(logits); logits = forward(token)?; check_logits(&logits)?;
-            out.native_work.forward_positions += 1;
+        let mut row = cursor::Cursor::new(self, request_seq, GENERATION_VERSION)?;
+        while !row.done {
+            row.before_forward(control)?;
+            let (token, needs_selection) = row.next_token()?;
+            let logits = forward(token)?;
+            check_logits(&logits)?;
+            row.record_forward(true)?;
+            if needs_selection { row.emit_next(&logits, decoder, sink, control)?; }
         }
-        for index in 0..p.max_new_tokens {
-            checkpoint(control, index)?;
-            let selected = workspace.select(&logits, p, self.key, self.sample_index, index as u64)?;
-            if matches!(&p.sampling, GenerationSampling::Seeded { .. }) { out.native_work.sampled_steps += 1; }
-            let eos = p.eos_token_ids.binary_search(&selected).is_ok();
-            let score = if p.capture_logprobs { Some(raw_logprob(&logits, selected)?) } else { None };
-            out.token_ids.push(selected);
-            let decoded = if eos { std::mem::take(&mut out.content_bytes) } else {
-                decoder.decode_token_ids(&out.token_ids).map_err(|_| GenerationError::Decoder)?
-            };
-            let old_len = if eos { decoded.len() } else { out.content_bytes.len() };
-            if !eos && !decoded.starts_with(&out.content_bytes) { return Err(GenerationError::DecoderNotPrefixStable); }
-            if decoded.len() > p.max_output_bytes {
-                out.token_ids.pop(); out.finish_reason = GenerationFinish::ByteLimit;
-                out.native_work.projected_logits = out.native_work.forward_positions * NANBEIGE_VOCAB_SIZE as u64;
-                return Ok(out);
-            }
-            let mut delta = reserved(decoded.len() - old_len)?; delta.extend_from_slice(&decoded[old_len..]);
-            let event = DecodeTokenEvent { schema_version: DECODE_TOKEN_EVENT_SCHEMA_VERSION, request_seq,
-                token_index: index, token_id: selected, decoded_bytes: delta, logprob: score };
-            checkpoint(control, index)?;
-            let permit = sink.reserve(&event).map_err(|_| GenerationError::Stream)?;
-            // A cancellation arriving while the bounded sink waits aborts the
-            // permit rather than publishing a token after the terminal cause.
-            checkpoint(control, index)?;
-            sink.permit(permit, event).map_err(|_| GenerationError::Stream)?;
-            out.content_bytes = decoded;
-            if let Some(scores) = &mut out.token_logprobs { scores.push(score.ok_or(GenerationError::InvalidLogits)?); }
-            workspace.commit(selected)?;
-            let finish = if eos { Some(GenerationFinish::Eos) }
-                else if index + 1 >= p.min_new_tokens && p.stop_suffixes.iter().any(|s| out.content_bytes.ends_with(s)) {
-                    Some(GenerationFinish::StopSuffix)
-                } else if index + 1 == p.max_new_tokens { Some(GenerationFinish::TokenLimit) } else { None };
-            if let Some(finish) = finish {
-                out.finish_reason = finish;
-                out.native_work.projected_logits = out.native_work.forward_positions * NANBEIGE_VOCAB_SIZE as u64;
-                return Ok(out);
-            }
-            checkpoint(control, index + 1)?;
-            drop(logits); logits = forward(selected)?; check_logits(&logits)?;
-            out.native_work.forward_positions += 1;
-        }
-        Err(GenerationError::Contract("unreachable generation termination"))
+        row.finish()
     }
 }
 fn checkpoint<C: DecodeStepControl>(control: &mut C, index: usize) -> Result<(), GenerationError> {

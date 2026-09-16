@@ -16,6 +16,13 @@ impl SequencePool {
         }
         Ok(Self { domain, rows })
     }
+    pub fn preflight_slot(&self, slot: usize, required_positions: usize) -> Result<(), BatchError> {
+        let row = self.rows.get(slot).ok_or(BatchError::StaleSequence)?;
+        if row.active { return Err(BatchError::SequenceBusy); }
+        if required_positions == 0 || required_positions > row.cache.capacity_positions() { return Err(BatchError::ContextFull); }
+        if !row.cache.all_slots_have_len(0) { return Err(BatchError::Contract("idle cache not empty")); }
+        Ok(())
+    }
     pub fn validate(&self, sequence: BatchSequence) -> Result<usize, BatchError> {
         let row = self.rows.get(sequence.slot).ok_or(BatchError::StaleSequence)?;
         if sequence.domain != self.domain || !row.active || row.generation != sequence.generation {
