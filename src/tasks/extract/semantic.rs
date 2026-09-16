@@ -17,7 +17,9 @@ use crate::{
 };
 use super::{ExtractError, ExtractPlan, ExtractResult, SourceDocument};
 mod claims;
+mod native;
 pub use claims::{ClaimPathStep, ClaimRule, ClaimValueKind, CLAIM_RENDER_VERSION};
+pub use native::{SemanticNativeError, SemanticNativeRun, SEMANTIC_NATIVE_EXECUTION};
 use claims::RenderedField;
 
 pub const SEMANTIC_VERIFICATION_VERSION: &str = "extract-explicit-correlated-faithfulness-v1";
@@ -146,6 +148,15 @@ impl ExtractPlan {
             return Err(SemanticError::Contract("explicit experimental opt-in and supported semantic specification required"));
         }
         claims::check_id(&spec.revision)?; spec.judge_policy.validate()?;
+        spec.judge_budget.validate().map_err(|_| SemanticError::Contract("invalid semantic judge budget"))?;
+        let judge_base = judge_context.execution_identity();
+        let b = spec.judge_budget; let c = *judge_context.budget_ceiling();
+        if judge_base.task_spec != "judge-v1" || judge_base.template_digest != *planner.template_digest()
+            || judge_base.tokenizer_digest != planner.tokenizer_digest()
+            || b.max_input_tokens > c.max_input_tokens || b.max_output_tokens > c.max_output_tokens
+            || b.max_output_bytes > c.max_output_bytes || b.max_grammar_states > c.max_grammar_states || b.max_kv_bytes > c.max_kv_bytes {
+            return Err(SemanticError::Contract("semantic judge context or budget differs from pinned planner"));
+        }
         self.verify_identity(extraction_identity)?;
         if self.task_identity != "extract-v1" || task.task_spec_identity() != "extract-v1"
             || task.ir().digest().map_err(|_| SemanticError::Serialization)? != self.taskir_digest {
@@ -156,7 +167,7 @@ impl ExtractPlan {
             || source.text().is_empty() || source.text().len() != source.token_ids().len() {
             return Err(SemanticError::Contract("semantic source does not bind the complete extraction document"));
         }
-        ensure_same_engine(extraction_identity, judge_context.execution_identity())?;
+        ensure_same_engine(extraction_identity, judge_base)?;
         if extraction.output.json.len() > limits.max_input_json_bytes || extraction.output.token_ids.len() > self.options.max_new_tokens {
             return Err(SemanticError::Limit("extraction_input"));
         }
@@ -267,3 +278,6 @@ fn add_work(a: ScoringWork, b: ScoringWork) -> Result<ScoringWork, SemanticError
         scored_edges: a.scored_edges.checked_add(b.scored_edges).ok_or(SemanticError::Limit("edges"))?,
         projected_logits: a.projected_logits.checked_add(b.projected_logits).ok_or(SemanticError::Limit("projected_logits"))? })
 }
+
+#[cfg(test)]
+mod tests;

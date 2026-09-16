@@ -1,7 +1,8 @@
-//! Raw faithfulness requests use the SAME pinned planner, identity admission,
-//! finite scoring and native execution routes as the other judge modes.
+//! Raw faithfulness and preflight for complete native second-reader batches.
+//! Uses the shared pinned planner, identities, scorer and native engine.
 use super::*;
-use crate::tasks::{extract::SourceDocumentEncoder, judge::partition_evidence};
+use crate::{tasks::{extract::SourceDocumentEncoder, judge::partition_evidence},
+    native_engine::{hf_bf16_eager::candidate_scoring::PrefixScoringError, kv::KV_BYTES_PER_TOKEN}};
 
 pub(super) struct FaithfulnessCompiler {
     pub(super) fragments: Vec<Vec<u32>>,
@@ -28,8 +29,6 @@ impl FaithfulnessCompiler {
         if spans.len() > 1 {
             for span in &spans { lengths.push(add(span.byte_end - span.byte_start, claim.len(), "input_bytes")?); }
         }
-        // Charge full-source and EVERY evidence prefill before either text is
-        // copied/encoded. No prompt overflow causes a silent truncated source.
         check_prompt_lengths(&lengths, &self.fragments, budget, limits)?;
         let cap = budget.max_input_tokens as usize;
         let source = self.encoder.encode(source, cap, cap).map_err(|_| JudgeError::Contract("faithfulness source encoding"))?;
@@ -43,6 +42,40 @@ impl FaithfulnessCompiler {
             }
         }
         FaithfulnessPlan::from_task_plans(&tasks, &source, &claim, eos, controls, policy, limits)
+    }
+}
+
+impl PreparedJudge {
+    /// Exact cold-head work for the current prefix executor. This is a resource
+    /// bound, not model admission or a measured latency/performance claim.
+    pub fn planned_native_budget(&self) -> Result<PrefixBudget, JudgeNativeError> {
+        let bundle = self.executable.bundle(); let mut positions = 0_u64;
+        for head in &bundle.heads {
+            let continuations = head.work.prefix_evaluations.checked_sub(1).ok_or(PrefixScoringError::InvalidExecution)?;
+            let head_positions = head.prompt_len.checked_add(continuations).ok_or(PrefixScoringError::ArithmeticOverflow)?;
+            positions = positions.checked_add(head_positions as u64).ok_or(PrefixScoringError::ArithmeticOverflow)?;
+        }
+        Ok(PrefixBudget { max_forward_positions: positions, max_projected_logits: bundle.work.projected_logits })
+    }
+    /// No callbacks or mutation. Batch callers can preflight ALL later field
+    /// plans before the first model forward, not discover a bad second context
+    /// only after spending the first field's work.
+    pub fn preflight_eager(&self, admitted: &ExecutionIdentity, engine: &HfBf16EagerEngine, budget: PrefixBudget)
+        -> Result<(), JudgeNativeError> {
+        self.verify_identity(admitted)?;
+        if !engine.kv_cache().all_slots_have_len(0) { return Err(PrefixScoringError::EngineAlreadyPrimed.into()); }
+        let capacity = engine.kv_cache().capacity_positions();
+        let reservation = (capacity as u64).checked_mul(KV_BYTES_PER_TOKEN as u64).ok_or(PrefixScoringError::ArithmeticOverflow)?;
+        for head in &self.executable.bundle().heads {
+            let required = head.prompt_len.checked_add(head.max_prefix).ok_or(PrefixScoringError::ArithmeticOverflow)?;
+            if required > capacity { return Err(PrefixScoringError::ContextBudget.into()); }
+            if reservation > head.ir.budget().max_kv_bytes { return Err(PrefixScoringError::KvBudget.into()); }
+        }
+        let planned = self.planned_native_budget()?;
+        if planned.max_forward_positions > budget.max_forward_positions || planned.max_projected_logits > budget.max_projected_logits {
+            return Err(PrefixScoringError::WorkBudget.into());
+        }
+        Ok(())
     }
 }
 
@@ -105,5 +138,13 @@ mod tests {
         let changed = p.plan(&JudgeRequest::Faithfulness { source: "abcdefghij".to_owned(), claim: "A claim <think>".to_owned(), policy, budget: budget() },
             &PlanContext::new(&identity(&p), budget()).unwrap(), JudgeLimits::default()).unwrap();
         assert_ne!(a.execution_identity().decision_policy_digest, changed.execution_identity().decision_policy_digest);
+    }
+    #[test]
+    fn native_admission_bound_charges_all_prompts_but_not_eos_forwards() {
+        let p = planner(); let plan = prepared(&p, "abcdefghij");
+        let bound = plan.planned_native_budget().unwrap();
+        let prompts: usize = plan.executable.bundle().heads.iter().map(|h| h.prompt_len).sum();
+        assert_eq!(bound.max_forward_positions, prompts as u64 + 9);
+        assert_eq!(bound.max_projected_logits, 12 * NANBEIGE_VOCAB_SIZE as u64);
     }
 }

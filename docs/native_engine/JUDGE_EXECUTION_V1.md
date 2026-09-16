@@ -1,15 +1,17 @@
-# Native pairwise and rubric judging
+# Native pairwise, rubric and faithfulness judging
 
-The former `tasks::judge` stub now has two executable task paths: two-order
-pairwise preference and independent ordinal rubric criteria. Both accept
-already-compiled judge-v1 TaskPlans or raw text through `JudgePlanner`.
-They reuse the existing CandidateScorer and admitted HfBf16EagerEngine.
+The former `tasks::judge` stub now has three implemented task paths: two-order
+pairwise preference, independent ordinal rubric criteria and source-bound
+faithfulness. They accept compiled judge-v1 TaskPlans or raw text through
+`JudgePlanner` and reuse CandidateScorer and the admitted HfBf16EagerEngine.
 
 This is source implementation, not runtime qualification. Compilation, builds,
 tests, harnesses, DSR, real-model quality, conformance and benchmarks have NOT
-been run for this change. No inference CLI command, model activation gate or
-process-admission bypass is enabled. Faithfulness/evidence-span selection and
-`extract --verify-semantic` are not implemented by this change.
+been run for these changes. No inference CLI command, model activation gate or
+process-admission bypass is enabled. The native/library faithfulness and
+experimental extraction second-reader APIs are described in
+[Faithfulness and semantic extraction](FAITHFULNESS_AND_SEMANTIC_EXTRACTION_V1.md).
+The planned `extract --verify-semantic` CLI flag is not activated here.
 
 ## Pairwise preference
 
@@ -76,56 +78,69 @@ Origin declarations, definitions, order-independent criterion metadata, scale
 and weights are bound into the private identity. They do not create a quality
 qualification, calibration artifact or provenance certificate.
 
+## Faithfulness
+
+`FaithfulnessPlan` scores the claim against the complete source and, when the
+source needs more than one bounded window, every window in its exact partition.
+It returns an entailed/contradicted/unsupported model relation or an explicit
+policy abstention. Accepted support or contradiction requires matching local
+evidence and no policy-passing contrary window. Quotes and byte/scalar offsets
+are independently checked against original source bytes. Membership is not
+proof of semantic support. Missing local evidence and conflicting judgments
+abstain; timeouts or failed heads remain errors rather than unsupported labels.
+
 ## Raw text and identity
 
-`JudgeRequest` is a strict tagged enum with `pairwise` and `rubric` modes.
-`JudgeRequest::from_json(source, max_request_bytes)` checks input size before
-JSON parsing, rejects duplicate keys through canonjson, and rejects unknown
-fields through the typed request schema.
+`JudgeRequest` is a strict tagged enum with `pairwise`, `rubric` and
+`faithfulness` modes. `JudgeRequest::from_json(source, max_request_bytes)` checks
+input size before JSON parsing, rejects duplicate keys through canonjson, and
+rejects unknown fields through the typed request schema.
 
-`JudgePlanner::pinned(controls, eos)` constructs the pinned embedded tokenizer
-once and compiles fixed templates with the existing TemplateBuilder. Thinking
-is disabled and no tools are declared. The planner binds all ten supported
-rubric-scale template variants, exact answer continuations, archived controls,
-EOS and all four pinned tokenizer assets in a content-free template digest.
+`JudgePlanner::pinned(controls, eos)` constructs reusable pinned tokenizers and
+fixed templates with the existing TemplateBuilder. Thinking is disabled and
+no tools are declared. The planner binds all ten rubric-scale template variants,
+faithfulness scaffolds, exact answer continuations, archived controls, EOS and
+all four pinned tokenizer assets in a content-free template digest. The expanded
+prompt-family identity is `judge-segmented-pairwise-ordinal-faithfulness-v2`.
+Old prepared identities do not silently gain the new template binding.
 
 The renderer sees ONLY trusted instructions and internal placeholders.
-Criteria, candidate answers, rubric descriptions and documents use the existing
-byte-preserving UntrustedDocumentEncoder. Their literal role/thinking marker
-spellings remain ordinary bytes. The typed token segments are never flattened
+Criteria, candidate answers, rubric descriptions, sources and claims use the
+existing byte-preserving untrusted encoding path. Their literal role/thinking
+marker spellings remain ordinary bytes. Typed token segments are never flattened
 and retokenized; the first trusted segment inserts BOS once, later fragments
-suppress BOS/EOS insertion. Numeric and A/B continuations are exact byte-fallback
-tokens, without standalone BPE dummy-prefix assumptions.
+suppress BOS/EOS insertion. Numeric, A/B and E/C/U continuations are exact
+byte-fallback tokens, without standalone BPE dummy-prefix assumptions.
 
 Before source token allocation, planning counts source BYTES (one fallback
-ID per byte), all trusted overheads, every presentation order and every rubric
-criterion against per-head and aggregate prompt ceilings. Source text is not
-trimmed, normalized or silently truncated. Private encoding diagnostics are
-mapped to fixed safe categories rather than exposing source context windows.
+ID per byte), all trusted overheads and every presentation order, criterion or
+evidence head against per-head and aggregate prompt ceilings. Source text is
+not trimmed, normalized or silently truncated. Private encoding diagnostics
+map to fixed safe categories rather than exposing source context windows.
 Marker containment does not prove immunity to semantic prompt injection.
 
-The caller sets the planner template/tokenizer digests on its judge-v1
-execution identity before constructing PlanContext. Planning checks the task,
-tokenizer, template, eager numerics profile, BF16 KV, disabled thinking and no
-tools. TaskPlan compilation retains the context's budget ceilings.
+The caller sets planner template/tokenizer digests on its judge-v1 execution
+identity before constructing PlanContext. Planning checks the task, tokenizer,
+template, eager numerics profile, BF16 KV, disabled thinking and no tools.
+TaskPlan compilation retains the context's budget ceilings.
 
 The resulting `PreparedJudge` retains a complete immutable ExecutionIdentity.
-It fills task-owned aggregate TaskIR, exact prompt, schema/rubric and decision
-policy bindings plus the scoring version; artifact/model/backend authority
-remains caller-owned. The caller admits its engine against that identity.
-Every PreparedJudge execution compares the supplied admitted identity with the
-entire retained identity BEFORE callbacks or engine mutation; mismatches are
-refused, not repaired. Neither the identity nor unkeyed prompt/source digests
-are serialized into judge results. Calibration remains explicitly unqualified.
+It fills task-owned aggregate TaskIR, exact prompt, schema and decision-policy
+bindings plus the scoring version; artifact/model/backend authority remains
+caller-owned. The caller admits its engine against that identity. Execution
+compares the supplied admitted identity with the entire retained identity BEFORE
+callbacks or engine mutation; mismatches are refused, not repaired. Neither
+private identities nor unkeyed prompt/source digests enter judge results.
+Calibration remains explicitly unqualified.
 
 ## Native execution and integration
 
-The adapter preflights every head's context capacity, the complete engine KV
+The adapter preflights every head's context capacity, complete engine KV
 reservation and aggregate forward/projection work before the first forward.
 Each exact prompt prefills once; EagerPrefixSession reuses continuation prefixes
-within that head. Between distinct heads, logical KV is cleared while retaining
-the existing buffers and weights. No second KV cache, model clone or runtime
-is introduced. A nonempty caller cache is refused without mutation.
+within that head. Between distinct heads, logical KV clears while retaining
+existing buffers and weights. No second KV cache, model clone or runtime is
+introduced. A nonempty caller cache is refused without mutation.
 
 For head i with P_i prompt tokens and U_i distinct nonempty continuation
 prefixes, native forward work is sum(P_i+U_i). Full-vocabulary projection work
@@ -134,12 +149,18 @@ These are algorithmic counts, not measured throughput. Each head receives its
 exact share of the preflighted aggregate budget. Actual forwards, prefix calls
 and projected rows must match the plan before a result is returned.
 
+`PreparedJudge::planned_native_budget` reports this cold-head resource bound.
+`preflight_eager` checks the identity, empty engine, every head's context and
+full KV reservation without mutation or callbacks. Multi-field callers use
+it to check all later requests before starting the first request; it does not
+replace artifact/model/process admission.
+
 Cancellation uses the caller's prefill channel because candidate scoring does
 not commit generated tokens. Typed cancellation/native causes survive wrapping.
-The existing prefix-session drop/error cleanup owns logical KV reset. A failure
-in any head aborts the entire comparison or rubric; no partial result is emitted.
-Output ceilings cover raw task results, the tagged JudgeResult, and the full
-EagerJudgeRun wrapper including native-work metadata.
+The existing prefix-session drop/error cleanup owns logical KV reset. Failure
+in any head aborts the task; no partial success is emitted. Output ceilings
+cover raw task results, the tagged JudgeResult, and the full EagerJudgeRun
+wrapper including native-work metadata.
 
 Integration sequence:
 
@@ -153,7 +174,8 @@ Integration sequence:
    prefix_budget, &mut control)`. Non-native providers implement JudgeLogits
    and use `prepared.execute` with the same identity check.
 
-There are twenty new source regression tests: eight pairwise, three native
-accounting, four rubric aggregation and five text-planning/identity tests.
-All remain UNRUN. They do not establish task accuracy, calibration, positional
-bias removal on real models, provenance clearance, or performance superiority.
+The original twenty pairwise/rubric/native/planning source regression tests
+are retained. Additional faithfulness and extraction cases are documented in
+the companion note. All remain UNRUN. They do not establish task accuracy,
+calibration, positional-bias removal on real models, provenance clearance,
+factual-support quality, or performance superiority.
