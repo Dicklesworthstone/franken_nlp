@@ -4,6 +4,7 @@ use super::tensor::Bf16;
 use super::weights::{Bf16Matrix, WeightShapeError};
 
 pub mod scoring;
+pub mod selected;
 
 /// Nanbeige's fixed untied vocabulary projection width.
 pub const NANBEIGE_VOCAB_SIZE: usize = 166_144;
