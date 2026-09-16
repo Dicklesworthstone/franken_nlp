@@ -1,0 +1,21 @@
+{
+  "profile": "ascii-contact-ip-luhn-iso-date-v1",
+  "cases": [
+    {"id":"email-plus-unicode-context","enabled":["email"],"source":"上海 a+b@example.org.","expected":[["email","a+b@example.org"]]},
+    {"id":"email-invalid-domain","enabled":["email"],"source":"a@-bad.org a@bad..org .a@example.org","expected":[]},
+    {"id":"fullwidth-at-not-normalized","enabled":["email"],"source":"alice＠example.org","expected":[]},
+    {"id":"zero-width-break-partial-ascii-match","enabled":["email"],"source":"ali\u200bce@example.org","expected":[["email","ce@example.org"]]},
+    {"id":"phone-international","enabled":["phone"],"source":"call +1 (212) 555-0199.","expected":[["phone","+1 (212) 555-0199"]]},
+    {"id":"phone-too-short","enabled":["phone"],"source":"123-45","expected":[]},
+    {"id":"phone-date-is-not-phone","enabled":["phone"],"source":"born 2000-02-29","expected":[]},
+    {"id":"card-luhn-valid","enabled":["credit_card"],"source":"4111-1111-1111-1111","expected":[["credit_card","4111-1111-1111-1111"]]},
+    {"id":"card-luhn-invalid","enabled":["credit_card"],"source":"4111-1111-1111-1112","expected":[]},
+    {"id":"card-unicode-digits-not-normalized","enabled":["credit_card"],"source":"４１１１１１１１１１１１１１１１","expected":[]},
+    {"id":"ip-v4-and-v6","enabled":["ip_address"],"source":"127.0.0.1 [2001:db8::1]","expected":[["ip_address","127.0.0.1"],["ip_address","2001:db8::1"]]},
+    {"id":"ip-invalid-octet","enabled":["ip_address"],"source":"999.1.2.3","expected":[]},
+    {"id":"url-query-credentials","enabled":["url"],"source":"HTTPS://user:pass@example.org/private?x=1.","expected":[["url","HTTPS://user:pass@example.org/private?x=1"]]},
+    {"id":"url-empty-authority","enabled":["url"],"source":"https:///foo","expected":[]},
+    {"id":"calendar-valid-leap","enabled":["date"],"source":"2000-02-29","expected":[["date","2000-02-29"]]},
+    {"id":"calendar-invalid-leap","enabled":["date"],"source":"1900-02-29","expected":[]}
+  ]
+}
