@@ -49,6 +49,11 @@ impl<'a, T: Serialize> Event<'a, T> {
             event, epoch, request_seq, caller_id: None, input_line: None, byte_offset: None,
             result: None, reserved_work: None, error: None, summary: None, eof: None }
     }
+    /// Library execution variants share framing/schema, not execution claims.
+    /// The legacy constructor keeps the serial label byte-for-byte unchanged.
+    pub fn with_execution(mut self, execution: &'static str) -> Self {
+        self.execution = execution; self
+    }
 }
 
 pub(super) struct Sink<'a, W> { writer: &'a mut W, limits: BatchLimits, emitted: u64, poisoned: bool }

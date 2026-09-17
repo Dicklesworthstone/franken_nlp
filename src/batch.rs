@@ -11,6 +11,7 @@ use crate::{canonjson, native_engine::decode::{DecodeCancellationKind, DecodeSte
 
 pub mod extract;
 pub mod generation;
+pub mod grouped;
 pub mod judge;
 mod framing;
 mod output;
