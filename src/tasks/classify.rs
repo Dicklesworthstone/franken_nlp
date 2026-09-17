@@ -393,3 +393,15 @@ mod tests {
         assert!(!String::from_utf8(bytes).unwrap().contains("confidence"));
     }
 }
+
+// Raw-text requests share the exact continuation scorer above. Multi-label
+// decisions are independent binary heads, never an exclusive-score relabeling.
+mod planning;
+mod native;
+pub use planning::{
+    CLASSIFICATION_PROMPT_VERSION, ClassificationLabel, ClassificationLimits,
+    ClassificationMode, ClassificationPlanner, ClassificationPlanningError,
+    ClassificationRequest, ClassificationTaskResult, MultiLabelDecision,
+    MultiLabelLabelResult, MultiLabelResult, PreparedClassification,
+};
+pub use native::{CLASSIFICATION_NATIVE_EXECUTION, ClassificationNativeError, EagerClassificationRun};
