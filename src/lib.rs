@@ -5,6 +5,7 @@ pub mod batch;
 pub mod calibration;
 pub mod canonjson;
 pub mod cli;
+pub mod corpus;
 pub mod error;
 pub mod execution_identity;
 pub mod grammar;
