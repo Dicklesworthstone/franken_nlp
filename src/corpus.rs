@@ -3,6 +3,7 @@
 //! job, cache authority, or a second model backend.
 
 pub mod entities;
+pub mod entity_stream;
 pub mod native_resolve;
 pub mod native_summary;
 pub mod resolution_stream;

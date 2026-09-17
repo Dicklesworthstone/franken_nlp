@@ -120,14 +120,19 @@ impl PreparedEntityCorpus<'_> {
         engine: &mut HfBf16EagerEngine, vocabulary: &ExtractionVocabulary,
         mut admission: A, run_guard: G, control: &mut C,
     ) -> Result<GuardedOutput<EntityCorpusResult, (Vec<A::Guard>, Vec<A::Guard>, G)>, EntityCorpusError> {
+        // Locals drop before parameters. Move source ownership after the run
+        // guard so even an immediate cancellation/refusal frees source storage
+        // before releasing the host reservation.
+        let run_guard = run_guard;
+        let corpus = self;
         resolve::checkpoint(control)?;
         if !engine.kv_cache().all_slots_have_len(0) { return Err(EntityCorpusError::Accounting); }
         let capacity = engine.kv_cache().capacity_positions() as u64;
         let kv = capacity.checked_mul(KV_BYTES_PER_TOKEN as u64).ok_or(EntityCorpusError::WorkBudget)?;
-        if capacity < self.maximum_ner_positions || kv > self.config.ner_budget.max_kv_bytes
-            || kv > self.config.native.per_head.max_kv_bytes { return Err(EntityCorpusError::WorkBudget); }
-        let ner_guard_bytes = guard_bytes::<A::Guard>(self.documents.len(), self.config.max_retained_guard_bytes)?;
-        let Self { documents, compiler, resolver, resolution_identity, config, ner_work, mask_visits, .. } = self;
+        if capacity < corpus.maximum_ner_positions || kv > corpus.config.ner_budget.max_kv_bytes
+            || kv > corpus.config.native.per_head.max_kv_bytes { return Err(EntityCorpusError::WorkBudget); }
+        let ner_guard_bytes = guard_bytes::<A::Guard>(corpus.documents.len(), corpus.config.max_retained_guard_bytes)?;
+        let Self { documents, compiler, resolver, resolution_identity, config, ner_work, mask_visits, .. } = corpus;
         let maps = {
             let mut processor = NativeSourceBatch::new(compiler, engine, vocabulary,
                 BorrowAdmission(&mut admission), config.masks)?;
@@ -232,7 +237,6 @@ pub struct EntityCorpusResult {
     pub schema_version: u32,
     pub execution: &'static str,
     pub extraction_task: &'static str,
-    /// Canonically ordered, including documents that yielded zero mentions.
     pub documents: Vec<EntityDocumentReceipt>,
     pub ner_reserved_work: BatchWork,
     pub ner_actual_work: BatchWork,
