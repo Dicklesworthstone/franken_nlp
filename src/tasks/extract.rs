@@ -156,8 +156,13 @@ impl ExtractPlan {
     ) -> Result<Self, ExtractError> {
         let ir = task.ir();
         ir.validate().map_err(|_| ExtractError::Contract("invalid TaskIR"))?;
-        if !matches!(task_identity, "extract-v1" | "ner-v1") || task.task_spec_identity() != task_identity || !matches!(ir.decode_strategy(), DecodeStrategy::ConstrainedJson) {
+        if !matches!(task_identity, "extract-v1" | "ner-v1" | "keyphrases-v1" | "summarize-v1" | "answer-v1")
+            || task.task_spec_identity() != task_identity || !matches!(ir.decode_strategy(), DecodeStrategy::ConstrainedJson)
+        {
             return Err(ExtractError::Contract("source task requires matching constrained_json TaskIR"));
+        }
+        if task_identity != "extract-v1" && source.is_none() {
+            return Err(ExtractError::Contract("source task requires an exact bound document"));
         }
         if source.is_some() { grounded::check_source_postconditions(ir)?; } else { check_postconditions(ir)?; }
         if ir.dependency_scope() != DependencyScope::ItemLocal {
