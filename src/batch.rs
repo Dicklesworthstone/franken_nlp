@@ -9,6 +9,7 @@ use std::{collections::BTreeSet, error::Error, fmt, io::{BufRead, Write}};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::{canonjson, native_engine::decode::{DecodeCancellationKind, DecodeStepControl}};
 
+pub mod classify;
 pub mod extract;
 pub mod generation;
 pub mod grouped;

@@ -208,7 +208,10 @@ impl ClassificationPlanner {
                 let rows: Vec<_> = labels.iter().zip(&codes).map(|(l, code)| Entry { code, id: &l.id, description: &l.description }).collect();
                 check_metadata(&rows, metadata_room)?;
                 let record = canonjson::canonical_bytes(&rows).map_err(|_| ClassificationPlanningError::Serialization)?;
-                let candidates = labels.iter().zip(&codes).map(|(l, code)| self.candidate(&l.id, code)).collect::<Result<Vec<_>, _>>()?;
+                // TaskIR identifiers have a deliberately narrower alphabet than
+                // user labels. Never weaken that ABI or normalize a user ID.
+                let candidates = codes.iter().enumerate().map(|(index, code)|
+                    self.candidate(&internal_label_id(index), code)).collect::<Result<Vec<_>, _>>()?;
                 (record, candidates, None)
             } else {
                 check_metadata(labels[index], metadata_room)?;
@@ -325,7 +328,8 @@ impl PreparedClassification {
         let result = match self.mode {
             ClassificationMode::Exclusive => {
                 if outputs.len() != 1 || outputs[0].0.is_some() { return Err(ClassificationPlanningError::Accounting.into()); }
-                ClassificationTaskResult::Exclusive(outputs.pop().ok_or_else(|| E::from(ClassificationPlanningError::Accounting))?.1)
+                let result = outputs.pop().ok_or_else(|| E::from(ClassificationPlanningError::Accounting))?.1;
+                ClassificationTaskResult::Exclusive(restore_label_ids(result, &self.labels).map_err(E::from)?)
             }
             ClassificationMode::MultiLabel => {
                 if outputs.len() != self.labels.len() { return Err(ClassificationPlanningError::Accounting.into()); }
@@ -379,6 +383,31 @@ pub struct MultiLabelResult {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "mode", content = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClassificationTaskResult { Exclusive(ClassificationResult), MultiLabel(MultiLabelResult) }
+
+/// Internal IDs satisfy TaskIR's closed lowercase/digit ABI. Numeric width
+/// preserves canonical user-label ordering, including Unicode and spaces.
+fn internal_label_id(index: usize) -> String { format!("label-{index:04}") }
+fn restore_label_ids(mut result: ClassificationResult, labels: &[String])
+    -> Result<ClassificationResult, ClassificationPlanningError> {
+    let restore = |id: &str| -> Result<String, ClassificationPlanningError> {
+        let index = id.strip_prefix("label-").and_then(|s| s.parse::<usize>().ok())
+            .filter(|&index| index < labels.len() && internal_label_id(index) == id)
+            .ok_or(ClassificationPlanningError::Accounting)?;
+        Ok(labels[index].clone())
+    };
+    if result.scores.candidates.len() != labels.len() || result.ranking.len() != labels.len() {
+        return Err(ClassificationPlanningError::Accounting);
+    }
+    // The existing finalizer has already validated complete canonical order,
+    // lengths and weights. Restore ONLY names, never prune or rescore anything.
+    for (index, candidate) in result.scores.candidates.iter_mut().enumerate() {
+        if candidate.id != internal_label_id(index) { return Err(ClassificationPlanningError::Accounting); }
+        candidate.id = labels[index].clone();
+    }
+    for id in &mut result.ranking { *id = restore(id)?; }
+    if let Some(id) = &mut result.selected_id { *id = restore(id)?; }
+    Ok(result)
+}
 
 fn checked_labels(r: &ClassificationRequest, limits: ClassificationLimits) -> Result<Vec<&ClassificationLabel>, ClassificationPlanningError> {
     if r.document.is_empty() || r.labels.is_empty() || (r.mode == ClassificationMode::Exclusive && r.labels.len() < 2) {

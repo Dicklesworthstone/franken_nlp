@@ -242,3 +242,31 @@ fn escaped_label_metadata_is_bounded_before_canonical_allocation() {
     assert_eq!(check_metadata(&label, 200), Err(ClassificationPlanningError::ContextBudget));
     assert!(check_metadata(&label, 1024).is_ok());
 }
+
+#[test]
+fn arbitrary_user_labels_round_trip_without_weakening_taskir_identifier_rules() {
+    let (p, id) = fixture(); let mut r = request(ClassificationMode::Exclusive);
+    r.labels = ["Support ticket", "étiquette", "<think>", "UPPER_CASE"].iter().map(|label|
+        ClassificationLabel { id: (*label).to_owned(), description: "category".to_owned() }).collect();
+    let prepared = plan(&p, &id, &r);
+    let DecodeStrategy::PrefillOnly { candidates } = prepared.heads[0].task.ir().decode_strategy() else { panic!("finite task"); };
+    for (index, candidate) in candidates.iter().enumerate() { assert_eq!(candidate.id(), internal_label_id(index)); }
+    let result = prepared.execute_heads::<ClassificationPlanningError, _>(|head| score(head, None)).unwrap();
+    let ClassificationTaskResult::Exclusive(result) = result else { panic!("exclusive result"); };
+    let mut expected: Vec<_> = r.labels.iter().map(|l| l.id.clone()).collect(); expected.sort();
+    assert_eq!(result.ranking, expected); assert_eq!(result.selected_id.as_deref(), Some(expected[0].as_str()));
+    assert_eq!(result.scores.candidates.iter().map(|s| s.id.clone()).collect::<Vec<_>>(), expected);
+    assert!(result.scores.candidates.iter().all(|s| !s.id.starts_with("label-")));
+}
+
+#[test]
+fn restored_user_label_bytes_count_against_the_complete_output_limit() {
+    let (p, id) = fixture(); let mut r = request(ClassificationMode::Exclusive);
+    r.labels[0].id = "A".repeat(200); r.labels[1].id = "B".repeat(200);
+    let mut prepared = plan(&p, &id, &r);
+    let internal = prepared.heads[0].classifier.finalize(score(&prepared.heads[0], None).unwrap()).unwrap();
+    let cap = canonjson::canonical_bytes(&ClassificationTaskResult::Exclusive(internal)).unwrap().len() as u64;
+    prepared.budget.max_output_bytes = cap;
+    assert!(matches!(prepared.execute_heads::<ClassificationPlanningError, _>(|head| score(head, None)),
+        Err(ClassificationPlanningError::OutputBudget)));
+}
