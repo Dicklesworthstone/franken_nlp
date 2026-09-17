@@ -16,6 +16,8 @@ use crate::native_engine::batchsched::{
     BatchControl, BatchError, BatchProjection, BatchSequence, BatchToken, EagerBatchEngine, MAX_BATCH_ROWS,
 };
 
+pub mod refill;
+
 pub const BATCH_GENERATION_VERSION: &str = "eager-addressed-batch-generation-v1";
 
 /// The host's exact admitted request plus a selected empty physical cache slot.
