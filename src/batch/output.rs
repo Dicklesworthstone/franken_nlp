@@ -11,6 +11,10 @@ pub struct GuardedOutput<T, G> { result: T, _guard: G }
 impl<T, G> GuardedOutput<T, G> {
     pub(crate) fn new(result: T, guard: G) -> Self { Self { result, _guard: guard } }
     pub fn result(&self) -> &T { &self.result }
+    /// Internal composition transfers BOTH owned values. The corpus adapter
+    /// retains the guard through reduction and wraps it with the final result;
+    /// extracting only the result and releasing its authority is not exposed.
+    pub(crate) fn into_parts(self) -> (T, G) { (self.result, self._guard) }
 }
 impl<T: Serialize, G> Serialize for GuardedOutput<T, G> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
