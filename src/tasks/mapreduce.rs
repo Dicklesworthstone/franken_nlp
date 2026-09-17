@@ -10,6 +10,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::validation::grounded_fields::VerifiedSourceSpan;
 
+pub mod execution;
+pub use execution::{
+    ExecutionError, ExecutionLimits, MapOutput, MapReduceResult, MapReduceTask,
+    ReduceInput, ReductionNode, ReductionPolicy, ReductionWarning, TaskStage, execute,
+};
+
 pub const CHUNK_PROFILE: &str = "source-partition-token-shrink-v1";
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ITEMS: usize = 1_000_000;
@@ -223,7 +229,7 @@ fn preferred_end(source: &str, start: usize, end: usize) -> usize {
     source.as_bytes()[start..end].iter().enumerate().rev().find_map(|(index, byte)| {
         let point = start + index + 1;
         (point - start >= (end - start) / 2
-            && matches!(byte, b' ' | b'\t' | b'\n' | b'\r')
+            && matches!(*byte, b' ' | b'\t' | b'\n' | b'\r')
             && !(*byte == b'\r' && source.as_bytes().get(point) == Some(&b'\n')))
             .then_some(point)
     }).unwrap_or(end)
