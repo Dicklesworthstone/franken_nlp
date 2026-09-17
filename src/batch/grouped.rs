@@ -13,6 +13,7 @@
 //! command (or select width one); this blocking API has no hidden latency timer.
 
 use super::*;
+pub mod generation;
 
 pub const GROUPED_EXECUTION: &str = "ordered-cohort-no-retry-v1";
 pub const MAX_GROUP_RECORDS: usize = 128;
