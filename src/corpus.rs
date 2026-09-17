@@ -2,6 +2,7 @@
 //! native task implementations; they do not create a loader, runtime, durable
 //! job, cache authority, or a second model backend.
 
+pub mod entities;
 pub mod native_resolve;
 pub mod native_summary;
 pub mod resolution_stream;
