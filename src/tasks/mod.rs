@@ -10,15 +10,18 @@ use crate::error::FnlpError;
 
 pub mod chat;
 pub mod classify;
+pub mod corpus_keyphrases;
 pub mod extract;
 pub mod ir;
 pub mod judge;
+pub mod keyphrases;
 pub mod mapreduce;
 pub mod ner;
 pub mod presets;
 pub mod recipe;
 pub mod redact;
 pub mod sentiment;
+pub mod summarize;
 
 pub use ir::{DecodeOutput, IndependentValidator, PlanContext, TaskPlan, TaskSpec};
 
@@ -215,5 +218,11 @@ mod tests {
             assert_eq!(spec.name(), expected_name);
             assert_eq!(spec.identity(), format!("{expected_name}-v1"));
         }
+    }
+
+    #[test]
+    fn source_portfolio_versions_match_the_closed_registry() {
+        assert_eq!(BuiltInTask::Keyphrases.spec().identity(), keyphrases::KEYPHRASES_TASK_VERSION);
+        assert_eq!(BuiltInTask::Summarize.spec().identity(), summarize::SUMMARIZE_TASK_VERSION);
     }
 }
