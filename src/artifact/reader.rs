@@ -14,6 +14,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::Mutex;
 
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -25,7 +26,7 @@ use crate::artifact::format::{
     MAX_ALIGNMENT, MAX_ENTRIES, MAX_FILE_BYTES, MAX_HEADER_BYTES, PRELUDE_BYTES, PackingSetInput,
     SECTION_DIRECTORY_ENTRY_BYTES, SectionKind, SectionPayload, SectionRange, TensorInput,
     digest_domain, framed_sha256, logical_model_sha256, logical_tensor_sha256,
-    validate_f32_scale_bytes, validate_generic_sidecar_cardinality, write,
+    validate_f32_scale_bytes, validate_generic_sidecar_cardinality, write, StreamingSectionHasher,
 };
 use crate::canonjson::{self, ParseLimits};
 
@@ -121,6 +122,183 @@ pub struct FnlpqArtifact {
     prelude: CheckedPrelude,
     header: CheckedHeader,
     sections: Vec<CheckedSection>,
+}
+
+/// Bounded file-backed reader for the current internal v1 candidate.
+///
+/// Unlike [FnlpqArtifact], this type never retains the full artifact envelope.
+/// It validates the bounded canonical metadata and range topology up front,
+/// then verifies a complete stored section with bounded scratch before serving
+/// mapping bytes from that section. It is deliberately NOT an activation
+/// capability while OQ-31 and filesystem immutability authority remain open.
+pub struct FnlpqRangeReader {
+    file: Mutex<File>,
+    prelude: CheckedPrelude,
+    header: CheckedHeader,
+    sections: Vec<CheckedSection>,
+}
+
+/// Select one of a tensor's three Generic mappings without exposing unchecked
+/// offsets to callers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckedTensorMapping {
+    Data,
+    Scale,
+    RowSum,
+}
+
+impl FnlpqRangeReader {
+    /// Open only a non-symlink regular file and retain bounded metadata.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, FnlpqReadError> {
+        if env::var_os("FNLP_MMAP").as_deref() == Some(std::ffi::OsStr::new("1")) {
+            return Err(FnlpqReadError::MmapUnavailable);
+        }
+        let path = path.as_ref();
+        let link_metadata = fs::symlink_metadata(path).map_err(|error| FnlpqReadError::Io {
+            operation: "symlink_metadata",
+            detail: error.to_string(),
+        })?;
+        if link_metadata.file_type().is_symlink() || !link_metadata.file_type().is_file() {
+            return Err(FnlpqReadError::Io {
+                operation: "regular-file check",
+                detail: "artifact must be a non-symlink regular file".to_owned(),
+            });
+        }
+        let mut file = File::open(path).map_err(|error| FnlpqReadError::Io {
+            operation: "open range reader",
+            detail: error.to_string(),
+        })?;
+        let observed_len = file.metadata().map_err(|error| FnlpqReadError::Io {
+            operation: "range-reader metadata",
+            detail: error.to_string(),
+        })?.len();
+        let mut fixed = [0_u8; PRELUDE_BYTES];
+        file.read_exact(&mut fixed).map_err(|error| FnlpqReadError::Io {
+            operation: "read range-reader prelude",
+            detail: error.to_string(),
+        })?;
+        let prelude = validate_prelude(&fixed, observed_len)?;
+        let mut header_bytes = vec![0_u8; usize_from_u64(prelude.header_len, "range-reader header_len")?];
+        file.read_exact(&mut header_bytes).map_err(|error| FnlpqReadError::Io {
+            operation: "read range-reader header",
+            detail: error.to_string(),
+        })?;
+        let header_sha256: [u8; 32] = Sha256::digest(&header_bytes).into();
+        if header_sha256 != prelude.header_sha256 {
+            return Err(header_error("prelude.header_sha256", "range-reader header digest mismatch"));
+        }
+        let header = parse_header(&header_bytes, &prelude)?;
+        let directory_len = prelude.section_count
+            .checked_mul(SECTION_DIRECTORY_ENTRY_BYTES as u64)
+            .ok_or_else(|| header_error("section_count", "range-reader directory length overflow"))?;
+        let mut directory = vec![0_u8; usize_from_u64(directory_len, "range-reader directory_len")?];
+        file.read_exact(&mut directory).map_err(|error| FnlpqReadError::Io {
+            operation: "read range-reader directory",
+            detail: error.to_string(),
+        })?;
+        let metadata_end = checked_metadata_end(&prelude)?;
+        let sections = parse_directory_metadata(&directory, metadata_end, &prelude, &header)?;
+        validate_zero_alignment_gaps(&mut file, metadata_end, &sections)?;
+        validate_header_relationships_metadata(&header, &sections)?;
+        let final_len = file.metadata().map_err(|error| FnlpqReadError::Io {
+            operation: "range-reader post-open metadata",
+            detail: error.to_string(),
+        })?.len();
+        if final_len != observed_len {
+            return Err(FnlpqReadError::Io {
+                operation: "range-reader file-length stability",
+                detail: format!("changed during preflight: before={observed_len} after={final_len}"),
+            });
+        }
+        Ok(Self { file: Mutex::new(file), prelude, header, sections })
+    }
+
+    pub fn prelude(&self) -> &CheckedPrelude { &self.prelude }
+    pub fn model_id(&self) -> &str { &self.header.model_id }
+    pub fn revision(&self) -> &str { &self.header.revision }
+    pub fn recipe_id(&self) -> &str { &self.header.recipe_id }
+    pub fn source_root_sha256(&self) -> &str { &self.header.source_root_sha256 }
+    pub fn logical_model_sha256(&self) -> &str { &self.header.logical_model_sha256 }
+    pub fn tensors(&self) -> &[CheckedTensor] { &self.header.tensors }
+    pub fn sections(&self) -> &[CheckedSection] { &self.sections }
+
+    /// Verify the complete containing section using bounded scratch, then read
+    /// one bounded mapping chunk. The full section is never retained.
+    pub fn read_mapping_chunk(
+        &self,
+        tensor_name: &str,
+        which: CheckedTensorMapping,
+        relative_offset: u64,
+        output: &mut [u8],
+    ) -> Result<usize, FnlpqReadError> {
+        let tensor = self.header.tensors.binary_search_by(|t| t.name.as_str().cmp(tensor_name))
+            .ok().and_then(|index| self.header.tensors.get(index))
+            .ok_or_else(|| header_error("tensor mapping", format!("unknown tensor {tensor_name:?}")))?;
+        let mapping = match which {
+            CheckedTensorMapping::Data => &tensor.data,
+            CheckedTensorMapping::Scale => &tensor.scale,
+            CheckedTensorMapping::RowSum => &tensor.row_sum,
+        };
+        if relative_offset > mapping.len {
+            return Err(header_error("tensor mapping", "relative offset exceeds mapping length"));
+        }
+        let section = section_for(&self.sections, mapping.section_ordinal, "range-reader mapping")?;
+        self.verify_section(section)?;
+        let remaining = mapping.len - relative_offset;
+        let take = usize::try_from(remaining.min(output.len() as u64))
+            .map_err(|_| section_error(section, "mapping chunk does not fit host usize"))?;
+        if take == 0 { return Ok(0); }
+        let absolute = section.file_offset.checked_add(mapping.offset)
+            .and_then(|v| v.checked_add(relative_offset))
+            .ok_or_else(|| section_error(section, "mapping absolute offset overflow"))?;
+        let mut file = self.file.lock().map_err(|_| FnlpqReadError::Io {
+            operation: "range-reader file lock",
+            detail: "poisoned file mutex".to_owned(),
+        })?;
+        file.seek(SeekFrom::Start(absolute)).map_err(|error| FnlpqReadError::Io {
+            operation: "seek mapping chunk",
+            detail: error.to_string(),
+        })?;
+        file.read_exact(&mut output[..take]).map_err(|error| FnlpqReadError::Io {
+            operation: "read mapping chunk",
+            detail: error.to_string(),
+        })?;
+        Ok(take)
+    }
+
+    fn verify_section(&self, section: &CheckedSection) -> Result<(), FnlpqReadError> {
+        const SCRATCH: usize = 64 * 1024;
+        let mut file = self.file.lock().map_err(|_| FnlpqReadError::Io {
+            operation: "range-reader file lock",
+            detail: "poisoned file mutex".to_owned(),
+        })?;
+        file.seek(SeekFrom::Start(section.file_offset)).map_err(|error| FnlpqReadError::Io {
+            operation: "seek section verification",
+            detail: error.to_string(),
+        })?;
+        let mut hasher = StreamingSectionHasher::new(&section.name, section.stored_len)
+            .map_err(|error| section_error(section, error.to_string()))?;
+        let mut scratch = [0_u8; SCRATCH];
+        let mut remaining = section.stored_len;
+        while remaining != 0 {
+            let take = usize::try_from(remaining.min(SCRATCH as u64))
+                .map_err(|_| section_error(section, "section chunk does not fit host usize"))?;
+            file.read_exact(&mut scratch[..take]).map_err(|error| FnlpqReadError::Io {
+                operation: "verify section bytes",
+                detail: error.to_string(),
+            })?;
+            hasher.write(&scratch[..take]).map_err(|error| section_error(section, error.to_string()))?;
+            remaining -= take as u64;
+        }
+        let observed = hasher.finish().map_err(|error| section_error(section, error.to_string()))?;
+        if observed != section.stored_sha256 {
+            return Err(section_error(section, format!(
+                "stored_sha256 mismatch expected={} actual={}",
+                hex_lower(&section.stored_sha256), hex_lower(&observed)
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Fixed prelude fields after their version and file-length checks succeed.
@@ -1251,6 +1429,135 @@ fn parse_directory(
         });
     }
     Ok(output)
+}
+
+fn parse_directory_metadata(
+    directory: &[u8],
+    metadata_end: u64,
+    prelude: &CheckedPrelude,
+    header: &CheckedHeader,
+) -> Result<Vec<CheckedSection>, FnlpqReadError> {
+    let expected_len = prelude.section_count
+        .checked_mul(SECTION_DIRECTORY_ENTRY_BYTES as u64)
+        .ok_or_else(|| header_error("section_count", "directory length overflow"))?;
+    if directory.len() as u64 != expected_len {
+        return Err(header_error("directory", "bounded directory length mismatch"));
+    }
+    let mut output = Vec::with_capacity(prelude.section_count as usize);
+    let mut previous_end = metadata_end;
+    for (ordinal, entry) in directory.chunks_exact(SECTION_DIRECTORY_ENTRY_BYTES).enumerate() {
+        let kind = section_kind_code(u32::from_le_bytes(entry[..4].try_into().expect("fixed entry")), ordinal)?;
+        let flags = u32::from_le_bytes(entry[4..8].try_into().expect("fixed entry"));
+        if flags != 0 { return Err(directory_error(ordinal, "flags", "unknown required flags")); }
+        let name_index = u64::from_le_bytes(entry[8..16].try_into().expect("fixed entry"));
+        if name_index != ordinal as u64 { return Err(directory_error(ordinal, "name_index", "must equal header section ordinal")); }
+        let file_offset = u64::from_le_bytes(entry[16..24].try_into().expect("fixed entry"));
+        let stored_len = u64::from_le_bytes(entry[24..32].try_into().expect("fixed entry"));
+        let logical_len = u64::from_le_bytes(entry[32..40].try_into().expect("fixed entry"));
+        if logical_len != stored_len { return Err(directory_error(ordinal, "logical_len", "compression is not supported in v1")); }
+        if stored_len > section_cap(kind) { return Err(directory_error(ordinal, "stored_len", "section length exceeds its v1 cap")); }
+        let alignment = u64::from_le_bytes(entry[40..48].try_into().expect("fixed entry"));
+        if !valid_alignment(alignment) { return Err(directory_error(ordinal, "alignment", "must be a power of two in 1..=4096")); }
+        let expected_offset = align_up(previous_end, alignment).map_err(|reason| directory_error(ordinal, "file_offset", reason))?;
+        if file_offset != expected_offset { return Err(directory_error(ordinal, "file_offset", format!("expected minimum aligned offset {expected_offset}, found {file_offset}"))); }
+        let file_end = file_offset.checked_add(stored_len).ok_or_else(|| directory_error(ordinal, "file_offset/stored_len", "range overflow"))?;
+        if file_end > prelude.file_len { return Err(directory_error(ordinal, "file_offset/stored_len", "range exceeds prelude.file_len")); }
+        let header_section = header.sections.get(ordinal).ok_or_else(|| directory_error(ordinal, "name_index", "header section ordinal missing"))?;
+        if header_section.kind != kind { return Err(directory_error(ordinal, "kind", format!("disagrees with header kind {}", header_section.kind.header_name()))); }
+        let mut stored_sha256 = [0_u8; 32];
+        stored_sha256.copy_from_slice(&entry[48..80]);
+        output.push(CheckedSection {
+            ordinal: ordinal as u64, name: header_section.name.clone(), kind,
+            file_offset, stored_len, alignment, stored_sha256,
+        });
+        previous_end = file_end;
+    }
+    if previous_end != prelude.file_len {
+        return Err(directory_error(prelude.section_count as usize - 1, "trailing_padding",
+            format!("section end {previous_end} differs from file_len {}", prelude.file_len)));
+    }
+    Ok(output)
+}
+
+fn validate_zero_alignment_gaps(
+    file: &mut File,
+    metadata_end: u64,
+    sections: &[CheckedSection],
+) -> Result<(), FnlpqReadError> {
+    let mut previous_end = metadata_end;
+    let mut scratch = [0_u8; MAX_ALIGNMENT as usize];
+    for section in sections {
+        let gap = section.file_offset.checked_sub(previous_end)
+            .ok_or_else(|| section_error(section, "section begins before previous range ends"))?;
+        if gap > MAX_ALIGNMENT {
+            return Err(section_error(section, "alignment gap exceeds maximum alignment"));
+        }
+        if gap != 0 {
+            file.seek(SeekFrom::Start(previous_end)).map_err(|error| FnlpqReadError::Io {
+                operation: "seek alignment gap", detail: error.to_string(),
+            })?;
+            let count = usize_from_u64(gap, "alignment gap")?;
+            file.read_exact(&mut scratch[..count]).map_err(|error| FnlpqReadError::Io {
+                operation: "read alignment gap", detail: error.to_string(),
+            })?;
+            if scratch[..count].iter().any(|&byte| byte != 0) {
+                return Err(section_error(section, format!("nonzero alignment gap [{previous_end},{})", section.file_offset)));
+            }
+        }
+        previous_end = section.file_offset + section.stored_len;
+    }
+    Ok(())
+}
+
+fn validate_header_relationships_metadata(
+    header: &CheckedHeader,
+    sections: &[CheckedSection],
+) -> Result<(), FnlpqReadError> {
+    for source in &header.sources {
+        let section = section_for(sections, source.section_ordinal, "materialized source")?;
+        let expected_kind = match source.name.as_str() {
+            "model_config" => SectionKind::ModelConfig,
+            "tokenizer_model" => SectionKind::TokenizerModel,
+            "tokenizer_config" => SectionKind::TokenizerConfig,
+            "chat_template" => SectionKind::ChatTemplate,
+            _ => unreachable!("parse_sources validates the closed source name set"),
+        };
+        if section.kind != expected_kind || source.sha256 != hex_lower(&section.stored_sha256) {
+            return Err(section_error(section, format!("materialized source {} disagrees with directory", source.name)));
+        }
+    }
+    let mut ranges: BTreeMap<u64, Vec<(&str, u64, u64)>> = BTreeMap::new();
+    for tensor in &header.tensors {
+        for (mapping_name, mapping, expected_kind) in [
+            ("data", &tensor.data, SectionKind::GenericTensorPayload),
+            ("scale", &tensor.scale, SectionKind::GenericTensorScales),
+            ("row_sum", &tensor.row_sum, SectionKind::GenericTensorRowSums),
+        ] {
+            let section = section_for(sections, mapping.section_ordinal, mapping_name)?;
+            if section.kind != expected_kind {
+                return Err(section_error(section, format!("tensor {} {mapping_name} mapping targets wrong section kind", tensor.name)));
+            }
+            let end = mapping.offset.checked_add(mapping.len)
+                .ok_or_else(|| section_error(section, format!("tensor {} {mapping_name} range overflow", tensor.name)))?;
+            if end > section.stored_len {
+                return Err(section_error(section, format!("tensor {} {mapping_name} range exceeds section length {}", tensor.name, section.stored_len)));
+            }
+            if mapping.len != 0 { ranges.entry(mapping.section_ordinal).or_default().push((tensor.name.as_str(), mapping.offset, end)); }
+        }
+        validate_generic_sidecar_cardinality(&tensor.name, tensor.scale.len, tensor.row_sum.len)
+            .map_err(|error| header_error(format!("{}/generic", tensor.name), error.to_string()))?;
+    }
+    for (ordinal, mut claimed) in ranges {
+        claimed.sort_by_key(|(_, start, _)| *start);
+        for pair in claimed.windows(2) {
+            if pair[0].2 > pair[1].1 {
+                let section = section_for(sections, ordinal, "tensor overlap")?;
+                return Err(section_error(section, format!("tensor mappings overlap: {} and {}", pair[0].0, pair[1].0)));
+            }
+        }
+    }
+    validate_packing_sets(header, sections)?;
+    validate_nanbeige42_census(header)
 }
 
 fn validate_header_relationships(
