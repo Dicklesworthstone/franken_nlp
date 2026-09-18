@@ -157,6 +157,9 @@ impl JudgePlanner {
             return Err(JudgeError::Contract("judge EOS or archived control census"));
         }
         let tokenizer = EmbeddedTokenizer::pinned().map_err(|_| JudgeError::Contract("pinned judge tokenizer"))?;
+        if tokenizer.eos_token_id() != Some(eos) {
+            return Err(JudgeError::Contract("judge EOS differs from tokenizer configuration"));
+        }
         for marker in [IM_START, IM_END, THINK_START, THINK_END] {
             let ids = tokenizer.tokenizer().encode_ids_with_options(marker, EncodeOptions { add_bos: false, add_eos: false })
                 .map_err(|_| JudgeError::Contract("trusted marker encoding"))?;
