@@ -50,6 +50,8 @@ pub enum EmbeddedTokenizerError {
     AddedTokenRegistry(serde_json::Error),
     /// The parsed model could not provide a safe BPE surface.
     Bpe(BpeBuildError),
+    /// Pinned tokenizer_config/special-token assets disagree or are incomplete.
+    Configuration(String),
 }
 
 impl fmt::Display for EmbeddedTokenizerError {
@@ -63,6 +65,10 @@ impl fmt::Display for EmbeddedTokenizerError {
                 formatter,
                 "embedded tokenizer BPE surface rejected: {error}"
             ),
+            Self::Configuration(detail) => write!(
+                formatter,
+                "embedded tokenizer configuration rejected: {detail}"
+            ),
         }
     }
 }
@@ -73,6 +79,7 @@ impl Error for EmbeddedTokenizerError {
             Self::Model(error) => Some(error),
             Self::AddedTokenRegistry(error) => Some(error),
             Self::Bpe(error) => Some(error),
+            Self::Configuration(_) => None,
         }
     }
 }
@@ -127,12 +134,40 @@ pub struct EmbeddedTokenizer {
     bytes: &'static [u8],
     sha256: [u8; 32],
     tokenizer: SpBpeTokenizer,
+    configured_bos_id: i32,
+    configured_eos_id: i32,
 }
 
 impl EmbeddedTokenizer {
     /// Construct the product tokenizer from the pinned, compiled asset closure.
     pub fn pinned() -> Result<Self, EmbeddedTokenizerError> {
-        Self::from_bytes_with_added_tokens(PINNED_TOKENIZER_MODEL_BYTES, PINNED_ADDED_TOKENS_BYTES)
+        let model = parse_spm_model(PINNED_TOKENIZER_MODEL_BYTES)
+            .map_err(EmbeddedTokenizerError::Model)?;
+        let added_by_surface: BTreeMap<String, u32> =
+            serde_json::from_slice(PINNED_ADDED_TOKENS_BYTES)
+                .map_err(EmbeddedTokenizerError::AddedTokenRegistry)?;
+        let (configured_bos_id, configured_eos_id) =
+            pinned_configured_ids(&added_by_surface)?;
+        let tokenizer = SpBpeTokenizer::with_added_tokens_and_special_ids(
+            model,
+            added_by_surface
+                .into_iter()
+                .map(|(content, id)| AddedToken::new(content, id)),
+            i32::try_from(configured_bos_id).map_err(|_| {
+                EmbeddedTokenizerError::Configuration("BOS id exceeds i32".to_owned())
+            })?,
+            i32::try_from(configured_eos_id).map_err(|_| {
+                EmbeddedTokenizerError::Configuration("EOS id exceeds i32".to_owned())
+            })?,
+        )
+        .map_err(EmbeddedTokenizerError::Bpe)?;
+        Ok(Self {
+            bytes: PINNED_TOKENIZER_MODEL_BYTES,
+            sha256: Sha256::digest(PINNED_TOKENIZER_MODEL_BYTES).into(),
+            configured_bos_id: tokenizer.configured_bos_id(),
+            configured_eos_id: tokenizer.configured_eos_id(),
+            tokenizer,
+        })
     }
 
     /// Parse and retain exactly the binary-embedded tokenizer bytes.
@@ -162,6 +197,8 @@ impl EmbeddedTokenizer {
         Ok(Self {
             bytes,
             sha256: Sha256::digest(bytes).into(),
+            configured_bos_id: tokenizer.configured_bos_id(),
+            configured_eos_id: tokenizer.configured_eos_id(),
             tokenizer,
         })
     }
@@ -188,6 +225,18 @@ impl EmbeddedTokenizer {
     #[must_use]
     pub const fn tokenizer(&self) -> &SpBpeTokenizer {
         &self.tokenizer
+    }
+
+    /// tokenizer_config/special-map BOS used by the product tokenizer.
+    #[must_use]
+    pub fn bos_token_id(&self) -> Option<u32> {
+        u32::try_from(self.configured_bos_id).ok()
+    }
+
+    /// tokenizer_config/special-map EOS used by generation/scoring.
+    #[must_use]
+    pub fn eos_token_id(&self) -> Option<u32> {
+        u32::try_from(self.configured_eos_id).ok()
     }
 
     /// Refuse an artifact whose checked `TOKENIZER_MODEL` section differs from
@@ -270,6 +319,47 @@ impl Error for VerifyArtifactTokenizerError {
             Self::Integrity(error) => Some(error),
         }
     }
+}
+
+fn pinned_configured_ids(
+    added_by_surface: &BTreeMap<String, u32>,
+) -> Result<(u32, u32), EmbeddedTokenizerError> {
+    let config: serde_json::Value = serde_json::from_slice(PINNED_TOKENIZER_CONFIG_BYTES)
+        .map_err(|error| EmbeddedTokenizerError::Configuration(format!("tokenizer_config JSON: {error}")))?;
+    let special: serde_json::Value = serde_json::from_slice(PINNED_SPECIAL_TOKENS_MAP_BYTES)
+        .map_err(|error| EmbeddedTokenizerError::Configuration(format!("special_tokens_map JSON: {error}")))?;
+    let string = |root: &serde_json::Value, key: &str| -> Result<String, EmbeddedTokenizerError> {
+        root.get(key).and_then(serde_json::Value::as_str).map(str::to_owned)
+            .ok_or_else(|| EmbeddedTokenizerError::Configuration(format!("missing string {key}")))
+    };
+    let mapped_content = |key: &str| -> Result<String, EmbeddedTokenizerError> {
+        special.get(key).and_then(serde_json::Value::as_object)
+            .and_then(|object| object.get("content"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| EmbeddedTokenizerError::Configuration(format!("missing special_tokens_map {key}.content")))
+    };
+    if config.get("add_bos_token").and_then(serde_json::Value::as_bool) != Some(true)
+        || config.get("add_eos_token").and_then(serde_json::Value::as_bool) != Some(false)
+    {
+        return Err(EmbeddedTokenizerError::Configuration(
+            "EncodeOptions defaults disagree with tokenizer_config add_bos/add_eos".to_owned(),
+        ));
+    }
+    let bos = string(&config, "bos_token")?;
+    let eos = string(&config, "eos_token")?;
+    if bos != mapped_content("bos_token")? || eos != mapped_content("eos_token")? {
+        return Err(EmbeddedTokenizerError::Configuration(
+            "tokenizer_config and special_tokens_map BOS/EOS surfaces disagree".to_owned(),
+        ));
+    }
+    let bos_id = added_by_surface.get(&bos).copied().ok_or_else(|| {
+        EmbeddedTokenizerError::Configuration(format!("configured BOS surface {bos:?} is absent from added-token registry"))
+    })?;
+    let eos_id = added_by_surface.get(&eos).copied().ok_or_else(|| {
+        EmbeddedTokenizerError::Configuration(format!("configured EOS surface {eos:?} is absent from added-token registry"))
+    })?;
+    Ok((bos_id, eos_id))
 }
 
 fn digest_hex(digest: &[u8; 32]) -> String {
