@@ -154,8 +154,8 @@ impl ClassificationPlanner {
         }
         let mut templates = Vec::new();
         for instruction in [EXCLUSIVE, MULTI] {
-            let fragments = render(instruction)?.into_iter().enumerate().map(|(index, text)|
-                tokenizer.tokenizer().encode_ids_with_options(&text, EncodeOptions { add_bos: index == 0, add_eos: false })
+            let fragments = render(instruction)?.into_iter().map(|text|
+                tokenizer.tokenizer().encode_ids_with_options(&text, EncodeOptions { add_bos: false, add_eos: false })
                     .map_err(|_| ClassificationPlanningError::Tokenizer)).collect::<Result<Vec<_>, _>>()?;
             templates.push(fragments);
         }
