@@ -303,8 +303,8 @@ fn render_fragments(body: &str, slots: usize) -> Result<Vec<String>, JudgeError>
     Ok(fragments)
 }
 fn tokenize_fragments(tokenizer: &EmbeddedTokenizer, fragments: Vec<String>) -> Result<Vec<Vec<u32>>, JudgeError> {
-    fragments.iter().enumerate().map(|(i, s)| tokenizer.tokenizer().encode_ids_with_options(s,
-        EncodeOptions { add_bos: i == 0, add_eos: false }).map_err(|_| JudgeError::Contract("judge trusted fragment encoding"))).collect()
+    fragments.iter().map(|s| tokenizer.tokenizer().encode_ids_with_options(s,
+        EncodeOptions { add_bos: false, add_eos: false }).map_err(|_| JudgeError::Contract("judge trusted fragment encoding"))).collect()
 }
 fn check_prompt_lengths(data: &[usize], fragments: &[Vec<u32>], budget: TaskBudget, limits: JudgeLimits) -> Result<(), JudgeError> {
     let overhead = fragments.iter().try_fold(0_usize, |n, s| add(n, s.len(), "prompt_tokens"))?;
