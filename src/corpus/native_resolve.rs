@@ -113,8 +113,8 @@ impl ResolutionPlanner {
                 .map_err(|_| NativeResolveError::Contract)?;
             if ids.len() != 1 || !controls.entry(ids[0]).is_some_and(|e| e.surface == marker) { return Err(NativeResolveError::Contract); }
         }
-        let fragments = render_fragments()?.iter().enumerate().map(|(i, text)|
-            tokenizer.tokenizer().encode_ids_with_options(text, EncodeOptions { add_bos: i == 0, add_eos: false })
+        let fragments = render_fragments()?.iter().map(|text|
+            tokenizer.tokenizer().encode_ids_with_options(text, EncodeOptions { add_bos: false, add_eos: false })
                 .map_err(|_| NativeResolveError::Contract)).collect::<Result<Vec<_>, _>>()?;
         let mut candidates = Vec::new();
         for (name, label) in LABELS {
