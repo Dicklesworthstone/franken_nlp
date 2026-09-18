@@ -229,6 +229,36 @@ impl FnlpqRangeReader {
     pub fn tensors(&self) -> &[CheckedTensor] { &self.header.tensors }
     pub fn sections(&self) -> &[CheckedSection] { &self.sections }
 
+    /// Raw SHA-256 of one already preflighted stored section, computed with
+    /// bounded scratch. This is distinct from the directory's domain-framed
+    /// stored identity and is useful for matching embedded source assets.
+    pub fn raw_section_sha256(&self, ordinal: u64) -> Result<[u8; 32], FnlpqReadError> {
+        const SCRATCH: usize = 64 * 1024;
+        let section = section_for(&self.sections, ordinal, "raw section digest")?;
+        let mut file = self.file.lock().map_err(|_| FnlpqReadError::Io {
+            operation: "range-reader file lock",
+            detail: "poisoned file mutex".to_owned(),
+        })?;
+        file.seek(SeekFrom::Start(section.file_offset)).map_err(|error| FnlpqReadError::Io {
+            operation: "seek raw section digest",
+            detail: error.to_string(),
+        })?;
+        let mut hasher = Sha256::new();
+        let mut scratch = [0_u8; SCRATCH];
+        let mut remaining = section.stored_len;
+        while remaining != 0 {
+            let take = usize::try_from(remaining.min(SCRATCH as u64))
+                .map_err(|_| section_error(section, "raw digest chunk does not fit host usize"))?;
+            file.read_exact(&mut scratch[..take]).map_err(|error| FnlpqReadError::Io {
+                operation: "read raw section digest",
+                detail: error.to_string(),
+            })?;
+            hasher.update(&scratch[..take]);
+            remaining -= take as u64;
+        }
+        Ok(hasher.finalize().into())
+    }
+
     /// Stream one selected mapping after open-time verification of every
     /// stored section. The opened file remains locked for this mapping cursor;
     /// no section-sized buffer or repeated section hash is created.
