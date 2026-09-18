@@ -78,7 +78,7 @@ impl From<LinearError> for StrictInt8Error {
 pub enum CurrentCandidateInt8Error {
     Artifact(ArtifactBridgeError),
     Tokenizer(EmbeddedTokenizerError),
-    TokenizerMismatch,
+    TokenizerMismatch(&'static str),
     Engine(StrictInt8Error),
 }
 impl fmt::Display for CurrentCandidateInt8Error {
@@ -86,7 +86,7 @@ impl fmt::Display for CurrentCandidateInt8Error {
         match self {
             Self::Artifact(error) => write!(f, "current-candidate artifact load failed: {error}"),
             Self::Tokenizer(error) => write!(f, "current-candidate tokenizer build failed: {error}"),
-            Self::TokenizerMismatch => f.write_str("current-candidate artifact tokenizer differs from binary tokenizer"),
+            Self::TokenizerMismatch(component) => write!(f, "current-candidate artifact {component} differs from binary tokenizer authority"),
             Self::Engine(error) => write!(f, "current-candidate int8 engine bind failed: {error}"),
         }
     }
@@ -96,7 +96,7 @@ impl Error for CurrentCandidateInt8Error {
         match self {
             Self::Artifact(error) => Some(error),
             Self::Tokenizer(error) => Some(error),
-            Self::TokenizerMismatch => None,
+            Self::TokenizerMismatch(_) => None,
             Self::Engine(error) => Some(error),
         }
     }
@@ -132,7 +132,10 @@ impl CurrentCandidateInt8Model {
         let tokenizer = EmbeddedTokenizer::pinned()?;
         let source = CurrentCandidateArtifactSource::open(path)?;
         if source.tokenizer_model_sha256()? != tokenizer.sha256() {
-            return Err(CurrentCandidateInt8Error::TokenizerMismatch);
+            return Err(CurrentCandidateInt8Error::TokenizerMismatch("tokenizer.model"));
+        }
+        if source.tokenizer_config_sha256()? != tokenizer.tokenizer_config_sha256() {
+            return Err(CurrentCandidateInt8Error::TokenizerMismatch("tokenizer_config.json"));
         }
         let loaded = source.materialize_nanbeige42(budget, stage_line)?;
         Ok(Self { tokenizer, loaded })
