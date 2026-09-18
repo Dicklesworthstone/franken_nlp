@@ -99,6 +99,9 @@ impl ExtractionBatchPlanner {
             return Err(BatchCode::Admission.into());
         }
         let tokenizer = EmbeddedTokenizer::pinned().map_err(|_| BatchCode::Planning)?;
+        if tokenizer.eos_token_id() != Some(eos) {
+            return Err(BatchCode::Admission.into());
+        }
         for marker in [IM_START, IM_END, THINK_START, THINK_END] {
             let ids = tokenizer.tokenizer().encode_ids_with_options(marker, EncodeOptions { add_bos: false, add_eos: false })
                 .map_err(|_| BatchCode::Planning)?;
