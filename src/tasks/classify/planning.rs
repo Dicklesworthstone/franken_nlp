@@ -173,6 +173,16 @@ impl ClassificationPlanner {
     pub fn plan_with_control<C: DecodeStepControl>(&self, request: &ClassificationRequest,
         context: &PlanContext<'_>, limits: ClassificationLimits, control: &mut C)
         -> Result<PreparedClassification, ClassificationPlanningError> {
+        self.plan_with_profile(request, context, limits, control, NumericsProfile::HfBf16Eager)
+    }
+    /// Internal closed-profile compiler. Public int8 planning wraps the result
+    /// in its distinct type; caller identities are checked, never relabeled.
+    pub(super) fn plan_with_profile<C: DecodeStepControl>(&self, request: &ClassificationRequest,
+        context: &PlanContext<'_>, limits: ClassificationLimits, control: &mut C, profile: NumericsProfile)
+        -> Result<PreparedClassification, ClassificationPlanningError> {
+        if !matches!(&profile, NumericsProfile::HfBf16Eager | NumericsProfile::StrictQuantized { version: 1 }) {
+            return Err(ClassificationPlanningError::Identity);
+        }
         limits.validate()?; checkpoint(control)?;
         request.budget.validate().map_err(|_| ClassificationPlanningError::InvalidLimits)?;
         request.policy.validate()?;
@@ -180,8 +190,12 @@ impl ClassificationPlanner {
         base.validate().map_err(|_| ClassificationPlanningError::Identity)?;
         check_output(base, 16_384)?;
         if base.task_spec != "classify-v1" || base.template_digest != self.template_digest
-            || base.tokenizer_digest != self.tokenizer_digest() || base.numerics_profile != NumericsProfile::HfBf16Eager
+            || base.tokenizer_digest != self.tokenizer_digest() || base.numerics_profile != profile
             || base.kv_dtype != "bf16" || base.thinking_mode != ThinkingMode::Disabled || base.tool_mode != ToolMode::None {
+            return Err(ClassificationPlanningError::Identity);
+        }
+        if matches!(&profile, NumericsProfile::StrictQuantized { .. })
+            && base.backend_semantic_version != crate::native_engine::strict_int8::STRICT_INT8_EXECUTION {
             return Err(ClassificationPlanningError::Identity);
         }
         if !budget_fits(request.budget, *context.budget_ceiling()) { return Err(ClassificationPlanningError::InvalidLimits); }
@@ -273,6 +287,10 @@ impl ClassificationPlanner {
         identity.grammar_compiler_version = "candidate-full-vocabulary-trie-v1".to_owned();
         identity.sampler_version = "classification-scored-eos-no-sampling-v1".to_owned();
         identity.decision_policy_digest = digest(&(request.mode, request.policy, ClassificationCalibration::Uncalibrated))?;
+        if matches!(&profile, NumericsProfile::StrictQuantized { .. }) {
+            identity.decision_policy_digest = digest(&(identity.decision_policy_digest,
+                crate::native_engine::strict_int8::scoring::INT8_SCORING_EXECUTION))?;
+        }
         identity.validate().map_err(|_| ClassificationPlanningError::Identity)?;
         checkpoint(control)?;
         Ok(PreparedClassification { heads, labels: label_ids, mode: request.mode,

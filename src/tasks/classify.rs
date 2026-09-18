@@ -407,3 +407,4 @@ pub use planning::{
 pub use native::{CLASSIFICATION_NATIVE_EXECUTION, ClassificationNativeError, EagerClassificationRun};
 mod model;
 pub use model::ClassificationLogits;
+pub mod quantized;
