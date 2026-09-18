@@ -226,7 +226,9 @@ pub struct SpBpeTokenizer {
     byte_pieces: [Option<u32>; 256],
     injected_by_text: Vec<AddedToken>,
     injected_by_id: BTreeMap<u32, String>,
-    special_ids: SpecialPieceIds,
+    trainer_special_ids: SpecialPieceIds,
+    configured_bos_id: i32,
+    configured_eos_id: i32,
 }
 
 impl SpBpeTokenizer {
@@ -239,6 +241,21 @@ impl SpBpeTokenizer {
     pub fn with_added_tokens(
         model: SpmModel,
         added_tokens: impl IntoIterator<Item = AddedToken>,
+    ) -> Result<Self, BpeBuildError> {
+        let configured_bos_id = model.special_ids.bos_id;
+        let configured_eos_id = model.special_ids.eos_id;
+        Self::with_added_tokens_and_special_ids(
+            model, added_tokens, configured_bos_id, configured_eos_id,
+        )
+    }
+
+    /// Build with tokenizer-configured BOS/EOS IDs that may intentionally
+    /// differ from SentencePiece trainer defaults.
+    pub fn with_added_tokens_and_special_ids(
+        model: SpmModel,
+        added_tokens: impl IntoIterator<Item = AddedToken>,
+        configured_bos_id: i32,
+        configured_eos_id: i32,
     ) -> Result<Self, BpeBuildError> {
         if !model.normalizer.is_identity || !model.normalizer.precompiled_charsmap_is_empty {
             return Err(BpeBuildError::NonIdentityNormalizer);
@@ -335,7 +352,9 @@ impl SpBpeTokenizer {
             byte_pieces,
             injected_by_text,
             injected_by_id,
-            special_ids: model.special_ids,
+            trainer_special_ids: model.special_ids,
+            configured_bos_id,
+            configured_eos_id,
         })
     }
 
@@ -343,6 +362,15 @@ impl SpBpeTokenizer {
     pub fn piece_count(&self) -> usize {
         self.pieces.len()
     }
+
+    #[must_use]
+    pub fn configured_bos_id(&self) -> i32 { self.configured_bos_id }
+
+    #[must_use]
+    pub fn configured_eos_id(&self) -> i32 { self.configured_eos_id }
+
+    #[must_use]
+    pub fn trainer_special_ids(&self) -> SpecialPieceIds { self.trainer_special_ids }
 
     /// Encodes text with the pinned default `add_bos=true`, `add_eos=false`.
     pub fn encode_ids(&self, input: &str) -> Result<Vec<u32>, EncodeError> {
@@ -461,14 +489,14 @@ impl SpBpeTokenizer {
     fn prefix_ids(&self, options: EncodeOptions) -> Result<Vec<u32>, EncodeError> {
         let mut ids = Vec::new();
         if options.add_bos {
-            ids.push(self.configured_id("bos_id", self.special_ids.bos_id)?);
+            ids.push(self.configured_id("bos_id", self.configured_bos_id)?);
         }
         Ok(ids)
     }
 
     fn suffix_ids(&self, ids: &mut Vec<u32>, options: EncodeOptions) -> Result<(), EncodeError> {
         if options.add_eos {
-            ids.push(self.configured_id("eos_id", self.special_ids.eos_id)?);
+            ids.push(self.configured_id("eos_id", self.configured_eos_id)?);
         }
         Ok(())
     }
