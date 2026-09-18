@@ -200,6 +200,13 @@ impl FnlpqRangeReader {
         let sections = parse_directory_metadata(&directory, metadata_end, &prelude, &header)?;
         validate_zero_alignment_gaps(&mut file, metadata_end, &sections)?;
         validate_header_relationships_metadata(&header, &sections)?;
+        // This candidate reader has no filesystem immutability capability yet,
+        // so it is not activation authority. Still, hash each stored section
+        // exactly once before any mapping can be served. This keeps real-model
+        // rehearsal O(file_bytes), rather than O(tensors * section_bytes).
+        for section in &sections {
+            verify_section_locked(&mut file, section)?;
+        }
         let final_len = file.metadata().map_err(|error| FnlpqReadError::Io {
             operation: "range-reader post-open metadata",
             detail: error.to_string(),
@@ -222,9 +229,9 @@ impl FnlpqRangeReader {
     pub fn tensors(&self) -> &[CheckedTensor] { &self.header.tensors }
     pub fn sections(&self) -> &[CheckedSection] { &self.sections }
 
-    /// Verify the complete containing section once, keep the opened file
-    /// locked, then stream only the selected mapping. No section-sized buffer
-    /// or repeated full-section hash is created for mapping chunks.
+    /// Stream one selected mapping after open-time verification of every
+    /// stored section. The opened file remains locked for this mapping cursor;
+    /// no section-sized buffer or repeated section hash is created.
     pub fn open_mapping(
         &self,
         tensor_name: &str,
@@ -243,7 +250,6 @@ impl FnlpqRangeReader {
             operation: "range-reader file lock",
             detail: "poisoned file mutex".to_owned(),
         })?;
-        verify_section_locked(&mut file, section)?;
         let absolute = section.file_offset.checked_add(mapping.offset)
             .ok_or_else(|| section_error(section, "mapping absolute offset overflow"))?;
         file.seek(SeekFrom::Start(absolute)).map_err(|error| FnlpqReadError::Io {
