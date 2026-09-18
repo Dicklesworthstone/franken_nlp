@@ -15,7 +15,7 @@ use std::{error::Error, fmt, path::Path};
 use serde::{Deserialize, Serialize};
 use super::{
     artifact_bridge::{ArtifactBridgeError, ArtifactIdentity, ArtifactLoadBudget, ArtifactLoadReceipt,
-        LoadedArtifactWeights, load_current_candidate_nanbeige42},
+        CurrentCandidateArtifactSource, LoadedArtifactWeights},
     attention::{QUERY_HEAD_COUNT, eager_gqa_attention_from_cache},
     decode::{DecodeCancellationKind, DecodeStepControl},
     kv::{KV_BYTES_PER_TOKEN, KV_SLOT_COUNT, PHYSICAL_LAYER_COUNT, KvCache, slot_for},
@@ -31,6 +31,7 @@ use super::{
 mod weights;
 pub use weights::Int8WeightView;
 use weights::Int8Layer;
+use crate::tokenizer::embedded::{EmbeddedTokenizer, EmbeddedTokenizerError};
 
 pub const STRICT_INT8_PROFILE: &str = "strict-quantized-v1";
 pub const STRICT_INT8_EXECUTION: &str = "portable-int8-bf16-rails-eager-gqa-v1";
@@ -76,23 +77,35 @@ impl From<LinearError> for StrictInt8Error {
 #[derive(Debug)]
 pub enum CurrentCandidateInt8Error {
     Artifact(ArtifactBridgeError),
+    Tokenizer(EmbeddedTokenizerError),
+    TokenizerMismatch,
     Engine(StrictInt8Error),
 }
 impl fmt::Display for CurrentCandidateInt8Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Artifact(error) => write!(f, "current-candidate artifact load failed: {error}"),
+            Self::Tokenizer(error) => write!(f, "current-candidate tokenizer build failed: {error}"),
+            Self::TokenizerMismatch => f.write_str("current-candidate artifact tokenizer differs from binary tokenizer"),
             Self::Engine(error) => write!(f, "current-candidate int8 engine bind failed: {error}"),
         }
     }
 }
 impl Error for CurrentCandidateInt8Error {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self { Self::Artifact(error) => Some(error), Self::Engine(error) => Some(error) }
+        match self {
+            Self::Artifact(error) => Some(error),
+            Self::Tokenizer(error) => Some(error),
+            Self::TokenizerMismatch => None,
+            Self::Engine(error) => Some(error),
+        }
     }
 }
 impl From<ArtifactBridgeError> for CurrentCandidateInt8Error {
     fn from(error: ArtifactBridgeError) -> Self { Self::Artifact(error) }
+}
+impl From<EmbeddedTokenizerError> for CurrentCandidateInt8Error {
+    fn from(error: EmbeddedTokenizerError) -> Self { Self::Tokenizer(error) }
 }
 impl From<StrictInt8Error> for CurrentCandidateInt8Error {
     fn from(error: StrictInt8Error) -> Self { Self::Engine(error) }
@@ -102,6 +115,7 @@ impl From<StrictInt8Error> for CurrentCandidateInt8Error {
 /// only borrowed strict-int8 engines; it is not an activation or admission
 /// certificate and carries the current-candidate evidence grade.
 pub struct CurrentCandidateInt8Model {
+    tokenizer: EmbeddedTokenizer,
     loaded: LoadedArtifactWeights,
 }
 impl CurrentCandidateInt8Model {
@@ -115,11 +129,18 @@ impl CurrentCandidateInt8Model {
     where
         F: FnMut(&str),
     {
-        Ok(Self { loaded: load_current_candidate_nanbeige42(path, budget, stage_line)? })
+        let tokenizer = EmbeddedTokenizer::pinned()?;
+        let source = CurrentCandidateArtifactSource::open(path)?;
+        if source.tokenizer_model_sha256()? != tokenizer.sha256() {
+            return Err(CurrentCandidateInt8Error::TokenizerMismatch);
+        }
+        let loaded = source.materialize_nanbeige42(budget, stage_line)?;
+        Ok(Self { tokenizer, loaded })
     }
 
     pub fn artifact_identity(&self) -> &ArtifactIdentity { self.loaded.weights.identity() }
     pub fn load_receipt(&self) -> ArtifactLoadReceipt { self.loaded.receipt }
+    pub fn tokenizer(&self) -> &EmbeddedTokenizer { &self.tokenizer }
 
     /// Create one semantic engine borrowing this model's already-materialized
     /// weights. The caller still owns request/runtime/resource admission.
