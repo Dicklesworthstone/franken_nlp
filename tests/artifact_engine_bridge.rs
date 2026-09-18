@@ -64,7 +64,9 @@ impl StreamingFixture {
                 },
                 ArtifactTensorDescriptor {
                     name: "model.layers.0.self_attn.q_proj.weight".to_owned(),
-                    canonical_dtype: "i8".to_owned(),
+                    // Logical source dtype remains BF16; portable int8 is the
+                    // Generic representation selected by quantization.
+                    canonical_dtype: "bf16".to_owned(),
                     shape: vec![2, 2],
                     quantization: "portable-quant-v1".to_owned(),
                     mapping_lengths: TensorMappingLengths {
