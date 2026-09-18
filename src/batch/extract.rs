@@ -118,9 +118,9 @@ impl ExtractionBatchPlanner {
         let tail = rendered.strip_prefix(&global).ok_or(BatchCode::Planning)?;
         let (before_schema, rest) = tail.split_once(SCHEMA_SLOT).ok_or(BatchCode::Planning)?;
         let (before_source, after_source) = rest.split_once(SOURCE_SLOT).ok_or(BatchCode::Planning)?;
-        let fragments = [global.as_str(), before_schema, before_source, after_source].iter().enumerate()
-            .map(|(index, text)| tokenizer.tokenizer().encode_ids_with_options(text,
-                EncodeOptions { add_bos: index == 0, add_eos: false }).map_err(|_| BatchCode::Planning.into()))
+        let fragments = [global.as_str(), before_schema, before_source, after_source].iter()
+            .map(|text| tokenizer.tokenizer().encode_ids_with_options(text,
+                EncodeOptions { add_bos: false, add_eos: false }).map_err(|_| BatchCode::Planning.into()))
             .collect::<Result<Vec<_>, BatchFault>>()?;
         if fragments.iter().any(Vec::is_empty) { return Err(BatchCode::Planning.into()); }
         let census: Vec<_> = controls.entries().iter().map(|e| (e.id, e.special, e.surface.as_str())).collect();
