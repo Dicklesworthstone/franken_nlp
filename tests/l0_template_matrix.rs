@@ -14,6 +14,7 @@ use franken_nlp::{
     },
     tokenizer::{
         bpe::{AddedToken, EncodeOptions, SpBpeTokenizer},
+        embedded::EmbeddedTokenizer,
         sp_model::parse_spm_model,
     },
 };
@@ -544,6 +545,34 @@ fn render_options(value: &serde_json::Map<String, serde_json::Value>) -> RenderO
             .unwrap_or(false),
         tool_format,
     }
+}
+
+#[test]
+fn rendered_chat_template_owns_its_leading_control_without_extra_bos() {
+    let rendered = TemplateBuilder::with_options(RenderOptions {
+        add_generation_prompt: true,
+        enable_thinking: false,
+        ..RenderOptions::default()
+    })
+    .render(&Conversation::new(vec![Message::text(MessageRole::User, "hello")]))
+    .expect("canonical chat template renders");
+    assert!(rendered.starts_with(IM_START));
+
+    let embedded = EmbeddedTokenizer::pinned().expect("pinned tokenizer closure builds");
+    let canonical = embedded.tokenizer().encode_ids_with_options(
+        &rendered,
+        EncodeOptions { add_bos: false, add_eos: false },
+    ).expect("rendered prompt tokenizes without special insertion");
+    assert_eq!(canonical.first().copied(), Some(166_100));
+    assert_ne!(canonical.get(1).copied(), Some(166_100),
+        "canonical templated prompt must contain exactly one leading im_start");
+
+    let noncanonical = embedded.tokenizer().encode_ids_with_options(
+        &rendered,
+        EncodeOptions { add_bos: true, add_eos: false },
+    ).expect("explicit BOS insertion is representable for direct-text paths");
+    assert_eq!(noncanonical.get(..2), Some(&[166_100, 166_100][..]),
+        "adding BOS after rendering duplicates the template-owned im_start");
 }
 
 #[test]
