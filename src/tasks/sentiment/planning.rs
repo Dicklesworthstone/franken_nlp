@@ -135,9 +135,11 @@ impl SentimentPlanner {
             }
         }
         let global_bytes = render_global()?;
-        // Insert the pinned BOS once, only on the first trusted segment.
+        // Canonical card/reference flow renders the chat template first and
+        // then tokenizes it with add_special_tokens=false. The rendered text
+        // already begins with <|im_start|>; adding configured BOS duplicates it.
         let global = tokenizer.tokenizer().encode_ids_with_options(&global_bytes,
-            EncodeOptions { add_bos: true, add_eos: false }).map_err(|_| SentimentPlanningError::Tokenizer)?;
+            EncodeOptions { add_bos: false, add_eos: false }).map_err(|_| SentimentPlanningError::Tokenizer)?;
         let mut axes = Vec::new();
         for axis in SentimentAxis::ALL {
             let (instruction, scaffold) = render_axis(axis, &global_bytes)?;
