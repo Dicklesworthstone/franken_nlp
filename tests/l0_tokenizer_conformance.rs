@@ -434,7 +434,21 @@ fn pinned_slow_reference_vocabulary_is_token_id_exact() {
         "b718fce2b7a8940ffeddc1e67f3b092cc0d13ac885c63a021528786f8c4cf6c0",
         "compiled special-token map bytes must equal the truth-pack pin"
     );
+    assert_eq!(embedded.bos_token_id(), Some(166_100), "product BOS comes from tokenizer_config/special map");
+    assert_eq!(embedded.eos_token_id(), Some(166_101), "product EOS comes from tokenizer_config/special map");
     let tokenizer = embedded.tokenizer();
+    assert_eq!(tokenizer.trainer_special_ids().bos_id, 1, "SentencePiece trainer BOS remains distinct evidence");
+    assert_eq!(tokenizer.trainer_special_ids().eos_id, 2, "SentencePiece trainer EOS remains distinct evidence");
+    assert_eq!(
+        tokenizer.encode_ids_with_options("", EncodeOptions { add_bos: true, add_eos: false }).unwrap(),
+        vec![166_100],
+        "configured BOS, not trainer BOS, must prefix product encodes",
+    );
+    assert_eq!(
+        tokenizer.encode_ids_with_options("", EncodeOptions { add_bos: false, add_eos: true }).unwrap(),
+        vec![166_101],
+        "configured EOS, not trainer EOS, must suffix requested encodes",
+    );
     assert_eq!(
         tokenizer.piece_count(),
         SP_PIECE_COUNT,
