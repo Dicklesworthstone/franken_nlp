@@ -285,7 +285,8 @@ struct Executor<'a, C> {
     ledger: &'a mut ProjectionLedger, control: &'a mut C, completed: usize, norms: usize,
 }
 impl<'w, C: DecodeStepControl> LayerExecutor<Int8Layer<'w>> for Executor<'_, C> {
-    type Hidden = Vec<Bf16>; type Error = StrictInt8Error;
+    type Hidden = Vec<Bf16>;
+    type Error = StrictInt8Error;
     fn layer_forward(&mut self, binding: &LayerBinding<'_, Int8Layer<'w>>, hidden: &mut Self::Hidden,
         positions: PositionContext, cache: &mut KvCache) -> Result<(), Self::Error> {
         if slot_for(binding.loop_index(), binding.layer_index()) != Some(binding.kv_slot())
@@ -352,3 +353,4 @@ fn poll<C: DecodeStepControl>(control: &mut C) -> Result<(), StrictInt8Error> {
 }
 
 #[cfg(test)] mod tests;
+pub mod scoring;
