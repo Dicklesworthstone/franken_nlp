@@ -820,8 +820,8 @@ fn forensic_shape(
 ///
 /// This is intentionally non-authoritative while OQ-31 is unresolved. It exists
 /// to exercise the real converted bytes through the native model without a
-/// whole-artifact allocation. Every mapping chunk is served only after the
-/// range reader verifies its complete containing stored section.
+/// whole-artifact allocation. The range reader authenticates every stored
+/// section once during bounded open-time preflight before mappings are served.
 pub struct CurrentCandidateArtifactSource {
     reader: FnlpqRangeReader,
     identity: ArtifactIdentity,
@@ -1210,11 +1210,14 @@ fn validate_contract(
                 }
             }
         };
-        let (expected_dtype, expected_quantization) = match expected.stage {
-            StorageStage::Bf16Verbatim => ("bf16", BF16_VERBATIM_V1),
-            StorageStage::Int8Stage2A | StorageStage::Int8Stage2B | StorageStage::Int8Stage2C => {
-                ("i8", PORTABLE_QUANT_V1)
-            }
+        // canonical_dtype describes the logical source tensor, not its
+        // Generic storage representation. Nanbeige source tensors are BF16
+        // even when their Generic payload is portable int8; quantization and
+        // mapping lengths carry the physical representation contract.
+        let expected_dtype = "bf16";
+        let expected_quantization = match expected.stage {
+            StorageStage::Bf16Verbatim => BF16_VERBATIM_V1,
+            StorageStage::Int8Stage2A | StorageStage::Int8Stage2B | StorageStage::Int8Stage2C => PORTABLE_QUANT_V1,
         };
         if actual.canonical_dtype != expected_dtype
             || actual.quantization != expected_quantization
