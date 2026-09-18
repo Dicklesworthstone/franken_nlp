@@ -11,10 +11,11 @@
 //! primitives still allocate bounded scratch; this is not an allocator-free,
 //! SIMD, batching, performance, or process-RSS claim.
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, path::Path};
 use serde::{Deserialize, Serialize};
 use super::{
-    artifact_bridge::ArtifactIdentity,
+    artifact_bridge::{ArtifactBridgeError, ArtifactIdentity, ArtifactLoadBudget, ArtifactLoadReceipt,
+        LoadedArtifactWeights, load_current_candidate_nanbeige42},
     attention::{QUERY_HEAD_COUNT, eager_gqa_attention_from_cache},
     decode::{DecodeCancellationKind, DecodeStepControl},
     kv::{KV_BYTES_PER_TOKEN, KV_SLOT_COUNT, PHYSICAL_LAYER_COUNT, KvCache, slot_for},
@@ -68,6 +69,69 @@ impl From<LinearError> for StrictInt8Error {
     }
 }
 
+/// Integration error for the real-file current-candidate rehearsal path.
+///
+/// This does not imply artifact activation authority; the file bridge remains
+/// explicitly non-authoritative until OQ-31 and model-root activation close.
+#[derive(Debug)]
+pub enum CurrentCandidateInt8Error {
+    Artifact(ArtifactBridgeError),
+    Engine(StrictInt8Error),
+}
+impl fmt::Display for CurrentCandidateInt8Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Artifact(error) => write!(f, "current-candidate artifact load failed: {error}"),
+            Self::Engine(error) => write!(f, "current-candidate int8 engine bind failed: {error}"),
+        }
+    }
+}
+impl Error for CurrentCandidateInt8Error {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self { Self::Artifact(error) => Some(error), Self::Engine(error) => Some(error) }
+    }
+}
+impl From<ArtifactBridgeError> for CurrentCandidateInt8Error {
+    fn from(error: ArtifactBridgeError) -> Self { Self::Artifact(error) }
+}
+impl From<StrictInt8Error> for CurrentCandidateInt8Error {
+    fn from(error: StrictInt8Error) -> Self { Self::Engine(error) }
+}
+
+/// Owned real-file model rehearsal. It owns materialized weights and can mint
+/// only borrowed strict-int8 engines; it is not an activation or admission
+/// certificate and carries the current-candidate evidence grade.
+pub struct CurrentCandidateInt8Model {
+    loaded: LoadedArtifactWeights,
+}
+impl CurrentCandidateInt8Model {
+    /// Stream the current internal fnlpq candidate into typed model weights.
+    /// No whole-artifact allocation is used.
+    pub fn load<F>(
+        path: impl AsRef<Path>,
+        budget: ArtifactLoadBudget,
+        stage_line: F,
+    ) -> Result<Self, CurrentCandidateInt8Error>
+    where
+        F: FnMut(&str),
+    {
+        Ok(Self { loaded: load_current_candidate_nanbeige42(path, budget, stage_line)? })
+    }
+
+    pub fn artifact_identity(&self) -> &ArtifactIdentity { self.loaded.weights.identity() }
+    pub fn load_receipt(&self) -> ArtifactLoadReceipt { self.loaded.receipt }
+
+    /// Create one semantic engine borrowing this model's already-materialized
+    /// weights. The caller still owns request/runtime/resource admission.
+    pub fn engine(
+        &self,
+        context: usize,
+        memory: Int8MemoryBudget,
+    ) -> Result<StrictInt8Engine<'_>, CurrentCandidateInt8Error> {
+        let weights = Int8WeightView::from_materialized(&self.loaded.weights)?;
+        Ok(StrictInt8Engine::new(weights, context, memory)?)
+    }
+}
 /// Payload ceilings checked BEFORE KV/RoPE/workspace allocation. The embedding
 /// host separately admits source-owned weights, allocator overhead and output.
 /// These are not a PermitBroker replacement or a measured peak-RSS assertion.
