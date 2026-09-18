@@ -123,6 +123,9 @@ impl ChatPlanner {
             return Err(ChatError::Limit("planner limits"));
         }
         let tokenizer = Arc::new(EmbeddedTokenizer::pinned().map_err(|_| ChatError::Encoding)?);
+        if tokenizer.eos_token_id() != Some(eos) {
+            return Err(ChatError::Contract("chat EOS differs from tokenizer configuration"));
+        }
         for marker in [IM_START, IM_END, THINK_START, THINK_END] {
             let ids = tokenizer.tokenizer().encode_ids_with_options(marker, EncodeOptions { add_bos: false, add_eos: false })
                 .map_err(|_| ChatError::Encoding)?;
