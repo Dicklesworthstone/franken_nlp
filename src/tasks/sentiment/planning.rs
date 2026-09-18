@@ -121,6 +121,9 @@ impl SentimentPlanner {
             return Err(SentimentError::InvalidPolicy.into());
         }
         let tokenizer = EmbeddedTokenizer::pinned().map_err(|_| SentimentPlanningError::Tokenizer)?;
+        if tokenizer.eos_token_id() != Some(options.eos_token_id) {
+            return Err(SentimentPlanningError::ControlRegistry);
+        }
         let no_specials = EncodeOptions { add_bos: false, add_eos: false };
         // This check is a required subset of the supplied archive, never an
         // alternative forbidden alphabet for untrusted-document encoding.
