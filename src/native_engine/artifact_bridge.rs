@@ -26,7 +26,7 @@ use crate::artifact::{
     },
     format::{
         FORMAT_VERSION, MAGIC, MAX_ENTRIES, MAX_HEADER_BYTES, PRELUDE_BYTES,
-        SECTION_DIRECTORY_ENTRY_BYTES,
+        SECTION_DIRECTORY_ENTRY_BYTES, SectionKind,
     },
     reader::{CheckedTensorMapping, FnlpqRangeReader},
 };
@@ -861,6 +861,43 @@ impl CurrentCandidateArtifactSource {
         }
         Ok(Self { reader, identity, tensors })
     }
+
+    /// Raw embedded tokenizer.model identity from this already-preflighted
+    /// artifact. This does not reopen or rescan the model payload sections.
+    pub fn tokenizer_model_sha256(&self) -> Result<[u8; 32], ArtifactBridgeError> {
+        let section = self.reader.sections().iter()
+            .find(|section| section.kind == SectionKind::TokenizerModel)
+            .ok_or_else(|| ArtifactBridgeError::Source {
+                tensor: "<tokenizer_model>".to_owned(),
+                detail: "artifact has no TOKENIZER_MODEL section".to_owned(),
+            })?;
+        self.reader.raw_section_sha256(section.ordinal).map_err(|error| ArtifactBridgeError::Source {
+            tensor: "<tokenizer_model>".to_owned(),
+            detail: error.to_string(),
+        })
+    }
+
+    /// Materialize this exact already-opened source with the frozen Nanbeige
+    /// tensor contract. Keeping the source open lets callers bind auxiliary
+    /// identities (notably tokenizer.model) before weight allocation without
+    /// parsing and hashing the full artifact a second time.
+    pub fn materialize_nanbeige42<F>(
+        &self,
+        budget: ArtifactLoadBudget,
+        mut stage_line: F,
+    ) -> Result<LoadedArtifactWeights, ArtifactBridgeError>
+    where
+        F: FnMut(&str),
+    {
+        if self.identity().model_id != NANBEIGE_MODEL_ID {
+            return Err(ArtifactBridgeError::ModelId { observed: self.identity().model_id.clone() });
+        }
+        let contract = current_nanbeige42_contract()?;
+        stage_line(&format!("LOAD STAGE=range-source {CURRENT_CANDIDATE_SCOPE} status=BEGIN tensors={}", contract.len()));
+        let loaded = load_with_contract(self, budget, &contract, CURRENT_CANDIDATE_SCOPE, &mut stage_line)?;
+        stage_line(&format!("LOAD STAGE=range-source {CURRENT_CANDIDATE_SCOPE} status=PASS tensors={}", contract.len()));
+        Ok(loaded)
+    }
 }
 
 impl CheckedArtifactSource for CurrentCandidateArtifactSource {
@@ -944,14 +981,7 @@ where
     F: FnMut(&str),
 {
     let source = CurrentCandidateArtifactSource::open(path)?;
-    if source.identity().model_id != NANBEIGE_MODEL_ID {
-        return Err(ArtifactBridgeError::ModelId { observed: source.identity().model_id.clone() });
-    }
-    let contract = current_nanbeige42_contract()?;
-    stage_line(&format!("LOAD STAGE=range-source {CURRENT_CANDIDATE_SCOPE} status=BEGIN tensors={}", contract.len()));
-    let loaded = load_with_contract(&source, budget, &contract, CURRENT_CANDIDATE_SCOPE, &mut stage_line)?;
-    stage_line(&format!("LOAD STAGE=range-source {CURRENT_CANDIDATE_SCOPE} status=PASS tensors={}", contract.len()));
-    Ok(loaded)
+    source.materialize_nanbeige42(budget, &mut stage_line)
 }
 
 fn current_nanbeige42_contract() -> Result<Vec<ArtifactTensorContract>, ArtifactBridgeError> {
