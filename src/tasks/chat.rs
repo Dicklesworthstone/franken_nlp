@@ -179,14 +179,16 @@ impl ChatPlanner {
             ChatRole::System => MessageRole::System, ChatRole::User => MessageRole::User, ChatRole::Assistant => MessageRole::Assistant,
         }, slot.clone())).collect();
         let rendered = render(&authored)?;
-        let mut tail = rendered.as_str(); let mut segments = Vec::new(); let mut first = true;
+        // Reference flow is apply_chat_template(tokenize=false), followed by
+        // tokenization with add_special_tokens=false. The template itself owns
+        // the leading <|im_start|>; never prepend configured BOS here.
+        let mut tail = rendered.as_str(); let mut segments = Vec::new();
         let mut token_total = 0_usize;
         let cap = (budget.max_input_tokens as usize).min(self.limits.generation.max_prompt_tokens);
         for (message, slot) in messages.iter().zip(&placeholders) {
             let (before, rest) = tail.split_once(slot).ok_or(ChatError::Contract("template placeholder"))?;
-            let scaffold = self.tokenizer.tokenizer().encode_ids_with_options(before, EncodeOptions { add_bos: first, add_eos: false })
+            let scaffold = self.tokenizer.tokenizer().encode_ids_with_options(before, EncodeOptions { add_bos: false, add_eos: false })
                 .map_err(|_| ChatError::Encoding)?;
-            first = false;
             token_total = add_tokens(token_total, scaffold.len(), cap)?;
             let source = self.encoder.encode(&message.content, self.limits.max_message_bytes, cap.saturating_sub(token_total))
                 .map_err(|_| ChatError::Encoding)?;
