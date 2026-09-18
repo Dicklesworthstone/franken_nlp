@@ -14,7 +14,7 @@ impl<'a> Cursor<'a> {
     pub fn new(plan: &'a GenerationPlan, request_seq: u64, execution: &'static str) -> Result<Self, GenerationError> {
         let p = &plan.options;
         let output = GeneratedSequence {
-            schema_version: 1, execution: execution.to_owned(), numerics_profile: HF_BF16_EAGER_PROFILE.to_owned(),
+            schema_version: 1, execution: execution.to_owned(), numerics_profile: plan.identity.numerics_profile.label(),
             request_seq, sample_index: plan.sample_index, token_ids: reserved(p.max_new_tokens)?, content_bytes: Vec::new(),
             finish_reason: GenerationFinish::TokenLimit,
             effective_seed: match &p.sampling { GenerationSampling::Greedy => None,

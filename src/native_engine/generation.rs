@@ -6,6 +6,8 @@
 //! caller owns process/model admission, output delivery and panic supervision.
 //! Unlike the legacy raw greedy seam, EOS has no content bytes; byte-stop
 //! suffixes retain their bytes. No tools, thinking mode or hidden retries exist.
+//! The quantized module reuses this compiler/cursor through a distinct plan
+//! type, so a quantized plan cannot enter an eager or grouped-eager driver.
 
 use std::{collections::BTreeMap, error::Error, fmt};
 use serde::{Deserialize, Serialize};
@@ -19,6 +21,7 @@ use super::{
     sampler::{Seed256, StableRequestKey, SAMPLER_VERSION},
 };
 pub mod batched;
+pub mod quantized;
 mod config;
 mod cursor;
 mod policy;
@@ -165,6 +168,17 @@ impl fmt::Display for GenerationError {
 }
 impl Error for GenerationError {}
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum GenerationBackend { Eager, Int8 }
+impl GenerationBackend {
+    fn profile(self) -> NumericsProfile {
+        match self { Self::Eager => NumericsProfile::HfBf16Eager, Self::Int8 => NumericsProfile::StrictQuantized { version: 1 } }
+    }
+    fn version(self) -> &'static str {
+        match self { Self::Eager => GENERATION_VERSION, Self::Int8 => quantized::INT8_GENERATION_VERSION }
+    }
+}
+
 /// Immutable private compiled input. No Debug/Deserialize/Serialize: neither
 /// source tokens nor the raw content-derived sampling key enter telemetry.
 pub struct GenerationPlan {
@@ -176,13 +190,23 @@ impl GenerationPlan {
     /// preserving artifact/backend facts. This does not activate a model or
     /// certify their truth. The host must admit the resulting exact identity.
     /// item_id is a stable caller/job id, never a physical row/request sequence.
-    pub fn compile(prompt: Vec<u32>, mut options: GenerationOptions, mut identity: ExecutionIdentity,
+    pub fn compile(prompt: Vec<u32>, options: GenerationOptions, identity: ExecutionIdentity,
         item_id: &str, sample_index: u64, limits: GenerationLimits) -> Result<Self, GenerationError> {
+        Self::compile_for_backend(prompt, options, identity, item_id, sample_index, limits, GenerationBackend::Eager)
+    }
+    /// Only closed, statically typed native drivers may select this backend.
+    /// Eager identity/key bytes retain their previous version and framing.
+    fn compile_for_backend(prompt: Vec<u32>, mut options: GenerationOptions, mut identity: ExecutionIdentity,
+        item_id: &str, sample_index: u64, limits: GenerationLimits, backend: GenerationBackend) -> Result<Self, GenerationError> {
         identity.validate().map_err(|_| GenerationError::Identity)?;
         if !matches!(identity.task_spec.as_str(), "generate-v1" | "chat-v1")
-            || identity.numerics_profile != NumericsProfile::HfBf16Eager || identity.kv_dtype != "bf16"
+            || identity.numerics_profile != backend.profile() || identity.kv_dtype != "bf16"
             || identity.thinking_mode != ThinkingMode::Disabled || identity.tool_mode != ToolMode::None {
             return Err(GenerationError::Contract("task/profile/thinking/tools"));
+        }
+        if backend == GenerationBackend::Int8
+            && identity.backend_semantic_version != super::strict_int8::STRICT_INT8_EXECUTION {
+            return Err(GenerationError::Identity);
         }
         if item_id.is_empty() || item_id.len() > 256 || item_id.chars().any(char::is_control) {
             return Err(GenerationError::Contract("stable item id"));
@@ -196,18 +220,20 @@ impl GenerationPlan {
         options.banned_token_ids.sort_unstable(); options.banned_token_ids.dedup();
         let positions = prompt.len().checked_add(options.max_new_tokens - 1)
             .and_then(|n| u64::try_from(n).ok()).ok_or(GenerationError::Limit("positions"))?;
+        let head_positions = if backend == GenerationBackend::Eager { positions } else { options.max_new_tokens as u64 };
         let bound = GenerationWork { forward_positions: positions,
-            projected_logits: positions.checked_mul(NANBEIGE_VOCAB_SIZE as u64).ok_or(GenerationError::Limit("logits"))?,
+            projected_logits: head_positions.checked_mul(NANBEIGE_VOCAB_SIZE as u64).ok_or(GenerationError::Limit("logits"))?,
             sampled_steps: if matches!(&options.sampling, GenerationSampling::Seeded { .. }) { options.max_new_tokens as u64 } else { 0 } };
         let sampler_bytes = policy::workspace_bytes()?;
         identity.prompt_digest = digest(&prompt)?;
         // Item/sample selection affects addressed draws, so admission/resume
         // identity must bind it too, not just the decoder's private request key.
-        identity.decision_policy_digest = digest(&(GENERATION_VERSION, PROCESSOR_VERSION, &options, item_id, sample_index))?;
+        let version = backend.version();
+        identity.decision_policy_digest = digest(&(version, PROCESSOR_VERSION, &options, item_id, sample_index))?;
         identity.sampler_version = match &options.sampling {
             GenerationSampling::Greedy => "fnlp-greedy-v1", GenerationSampling::Seeded { .. } => SAMPLER_VERSION,
         }.to_owned();
-        let bytes = canonjson::canonical_bytes(&(GENERATION_VERSION, PROCESSOR_VERSION, &identity, &prompt, &options, item_id))
+        let bytes = canonjson::canonical_bytes(&(version, PROCESSOR_VERSION, &identity, &prompt, &options, item_id))
             .map_err(|_| GenerationError::Identity)?;
         let key = StableRequestKey::from_canonical_digest(Sha256::digest(&bytes).into());
         Ok(Self { prompt, options, identity, key, sample_index, bound, sampler_bytes })
@@ -228,6 +254,7 @@ impl GenerationPlan {
     pub fn preflight_eager(&self, admitted: &ExecutionIdentity, engine: &HfBf16EagerEngine,
         budget: GenerationBudget) -> Result<(), GenerationError> {
         self.verify_identity(admitted)?;
+        if self.identity.numerics_profile != NumericsProfile::HfBf16Eager { return Err(GenerationError::Identity); }
         if !engine.kv_cache().all_slots_have_len(0) { return Err(GenerationError::EngineAlreadyPrimed); }
         if engine.profile() != HF_BF16_EAGER_PROFILE { return Err(GenerationError::Identity); }
         let capacity = engine.kv_cache().capacity_positions() as u64;

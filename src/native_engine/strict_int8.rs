@@ -200,6 +200,11 @@ pub struct Int8Session<'run, 'weights, C: DecodeStepControl> {
     hidden: Option<Vec<Bf16>>, work: Int8Work,
 }
 impl<C: DecodeStepControl> Int8Session<'_, '_, C> {
+    /// Native task drivers borrow the same controller for sampler/stream
+    /// checkpoints. No second controller or independently renewable budget.
+    pub(crate) fn control(&mut self) -> &mut C { &mut *self.control }
+    /// A task-level failure after model work is fatal to this session too.
+    pub(crate) fn abort(&mut self) { self.engine.state.poisoned = true; }
     pub fn work(&self) -> Int8Work {
         Int8Work { projections: self.ledger.reserved(), ..self.work }
     }
@@ -269,7 +274,11 @@ impl<C: DecodeStepControl> Int8Session<'_, '_, C> {
 impl<C: DecodeStepControl> Drop for Int8Session<'_, '_, C> {
     fn drop(&mut self) { end_session(&mut self.engine.cache, &mut self.engine.state); }
 }
-fn end_session(cache: &mut KvCache, state: &mut RunState) { cache.clear(); state.active = false; }
+fn end_session(cache: &mut KvCache, state: &mut RunState) {
+    // Also covers an unwind in a task's sampler/decoder/sink BETWEEN forwards.
+    state.poisoned |= std::thread::panicking();
+    cache.clear(); state.active = false;
+}
 
 struct Executor<'a, C> {
     final_norm: &'a [Bf16], rope: &'a RopeTablesF32, activation: &'a mut ActivationBuffer,

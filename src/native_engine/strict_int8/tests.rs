@@ -97,3 +97,21 @@ fn projection_cancellation_keeps_its_typed_cause() {
     assert_eq!(StrictInt8Error::from(LinearError::Cancelled(DecodeCancellationKind::Shutdown)),
         StrictInt8Error::Cancelled(DecodeCancellationKind::Shutdown));
 }
+#[test]
+fn unwind_between_native_calls_clears_kv_and_poison_is_not_reset() {
+    struct Cleanup<'a> { cache: &'a mut KvCache, state: &'a mut RunState }
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) { end_session(self.cache, self.state); }
+    }
+    let mut cache = KvCache::try_with_capacity(1).unwrap();
+    let bits = vec![0; K];
+    for slot in 0..KV_SLOT_COUNT { cache.append(slot, 0, &bits, &bits).unwrap(); }
+    let mut state = RunState::default(); state.open().unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = Cleanup { cache: &mut cache, state: &mut state };
+        panic!("synthetic task callback unwind between forwards");
+    }));
+    assert!(result.is_err()); assert!(cache.all_slots_have_len(0));
+    assert!(state.poisoned); assert!(!state.active);
+    assert_eq!(state.open(), Err(StrictInt8Error::EngineUnavailable));
+}
