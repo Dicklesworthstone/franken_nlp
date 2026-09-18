@@ -214,3 +214,4 @@ fn native_failure(e: ClassificationNativeError) -> BatchItemFailure {
 
 #[cfg(test)]
 mod tests;
+pub mod quantized;
