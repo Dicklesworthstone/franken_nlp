@@ -505,10 +505,10 @@ impl SpBpeTokenizer {
         let configured_id = id;
         let id = u32::try_from(id)
             .map_err(|_| EncodeError::ConfiguredSpecialIdOutOfRange { field, id })?;
-        if usize::try_from(id)
+        let base_piece = usize::try_from(id)
             .ok()
-            .is_none_or(|index| index >= self.pieces.len())
-        {
+            .is_some_and(|index| index < self.pieces.len());
+        if !base_piece && !self.injected_by_id.contains_key(&id) {
             return Err(EncodeError::ConfiguredSpecialIdOutOfRange {
                 field,
                 id: configured_id,
