@@ -28,6 +28,7 @@ use crate::artifact::{
         FORMAT_VERSION, MAGIC, MAX_ENTRIES, MAX_HEADER_BYTES, PRELUDE_BYTES,
         SECTION_DIRECTORY_ENTRY_BYTES,
     },
+    reader::{CheckedTensorMapping, FnlpqRangeReader},
 };
 
 use super::{
@@ -38,6 +39,8 @@ use super::{
 const NANBEIGE_MODEL_ID: &str = "Nanbeige4.2-3B";
 const SYNTHETIC_SCOPE: &str = "scope=synthetic evidence=non_authoritative";
 const FORENSIC_SCOPE: &str = "scope=real-artifact-forensic evidence=non_authoritative";
+const CURRENT_CANDIDATE_SCOPE: &str = "scope=real-artifact-current-candidate evidence=non_authoritative";
+const FILE_SOURCE_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Maximum bytes the bounded forensic census may read from a real artifact.
 ///
@@ -813,6 +816,155 @@ fn forensic_shape(
         .collect()
 }
 
+/// File-backed source over the current internal writer candidate.
+///
+/// This is intentionally non-authoritative while OQ-31 is unresolved. It exists
+/// to exercise the real converted bytes through the native model without a
+/// whole-artifact allocation. Every mapping chunk is served only after the
+/// range reader verifies its complete containing stored section.
+pub struct CurrentCandidateArtifactSource {
+    reader: FnlpqRangeReader,
+    identity: ArtifactIdentity,
+    tensors: Vec<ArtifactTensorDescriptor>,
+}
+
+impl CurrentCandidateArtifactSource {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, ArtifactBridgeError> {
+        let reader = FnlpqRangeReader::open(path).map_err(|error| ArtifactBridgeError::Source {
+            tensor: "<artifact>".to_owned(),
+            detail: error.to_string(),
+        })?;
+        let identity = ArtifactIdentity {
+            model_id: reader.model_id().to_owned(),
+            revision: reader.revision().to_owned(),
+            recipe_id: reader.recipe_id().to_owned(),
+            source_root_sha256: reader.source_root_sha256().to_owned(),
+            logical_model_sha256: reader.logical_model_sha256().to_owned(),
+        };
+        let mut tensors = Vec::new();
+        tensors.try_reserve_exact(reader.tensors().len()).map_err(|error| ArtifactBridgeError::Memory {
+            subject: "artifact-descriptor-reservation",
+            observed: reader.tensors().len() as u64,
+            limit: error.capacity().unwrap_or(0) as u64,
+        })?;
+        for tensor in reader.tensors() {
+            tensors.push(ArtifactTensorDescriptor {
+                name: tensor.name.clone(),
+                canonical_dtype: tensor.canonical_dtype.clone(),
+                shape: tensor.shape.clone(),
+                quantization: tensor.quantization.clone(),
+                mapping_lengths: TensorMappingLengths {
+                    data: tensor.data.len,
+                    scale: tensor.scale.len,
+                    row_sum: tensor.row_sum.len,
+                },
+            });
+        }
+        Ok(Self { reader, identity, tensors })
+    }
+}
+
+impl CheckedArtifactSource for CurrentCandidateArtifactSource {
+    fn identity(&self) -> &ArtifactIdentity { &self.identity }
+    fn tensors(&self) -> &[ArtifactTensorDescriptor] { &self.tensors }
+    fn resident_envelope_bytes(&self) -> u64 { 0 }
+
+    fn stream_mapping(
+        &self,
+        tensor: &ArtifactTensorDescriptor,
+        mapping: TensorMapping,
+        visitor: &mut dyn FnMut(&[u8]) -> Result<(), ArtifactBridgeError>,
+    ) -> Result<(), ArtifactBridgeError> {
+        let expected = self.tensors.binary_search_by(|candidate| candidate.name.as_str().cmp(tensor.name.as_str()))
+            .ok().and_then(|index| self.tensors.get(index))
+            .filter(|candidate| *candidate == tensor)
+            .ok_or_else(|| ArtifactBridgeError::Source {
+                tensor: tensor.name.clone(),
+                detail: "descriptor was not issued by this artifact source".to_owned(),
+            })?;
+        let which = match mapping {
+            TensorMapping::Data => CheckedTensorMapping::Data,
+            TensorMapping::Scale => CheckedTensorMapping::Scale,
+            TensorMapping::RowSum => CheckedTensorMapping::RowSum,
+        };
+        let total = expected.mapping_lengths.for_mapping(mapping);
+        let mut offset = 0_u64;
+        let mut buffer = [0_u8; FILE_SOURCE_CHUNK_BYTES];
+        while offset != total {
+            let read = self.reader.read_mapping_chunk(&tensor.name, which, offset, &mut buffer)
+                .map_err(|error| ArtifactBridgeError::Source {
+                    tensor: tensor.name.clone(),
+                    detail: format!("{} range read failed: {error}", mapping.stage_name()),
+                })?;
+            if read == 0 {
+                return Err(ArtifactBridgeError::Source {
+                    tensor: tensor.name.clone(),
+                    detail: format!("{} range ended before declared length", mapping.stage_name()),
+                });
+            }
+            visitor(&buffer[..read])?;
+            offset = offset.checked_add(read as u64).ok_or_else(|| ArtifactBridgeError::Source {
+                tensor: tensor.name.clone(),
+                detail: format!("{} streamed byte count overflow", mapping.stage_name()),
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Materialize the current internal 80-byte-directory candidate from a real
+/// file into the existing native weight set, without granting activation
+/// authority. This is a model-integration/evidence path only: OQ-31, trusted
+/// model-root activation, publication receipts and production admission remain
+/// independent blockers.
+pub fn load_current_candidate_nanbeige42<F>(
+    path: impl AsRef<Path>,
+    budget: ArtifactLoadBudget,
+    mut stage_line: F,
+) -> Result<LoadedArtifactWeights, ArtifactBridgeError>
+where
+    F: FnMut(&str),
+{
+    let source = CurrentCandidateArtifactSource::open(path)?;
+    if source.identity().model_id != NANBEIGE_MODEL_ID {
+        return Err(ArtifactBridgeError::ModelId { observed: source.identity().model_id.clone() });
+    }
+    let contract = current_nanbeige42_contract()?;
+    stage_line(&format!("LOAD STAGE=range-source {CURRENT_CANDIDATE_SCOPE} status=BEGIN tensors={}", contract.len()));
+    let loaded = load_with_contract(&source, budget, &contract, CURRENT_CANDIDATE_SCOPE, &mut stage_line)?;
+    stage_line(&format!("LOAD STAGE=range-source {CURRENT_CANDIDATE_SCOPE} status=PASS tensors={}", contract.len()));
+    Ok(loaded)
+}
+
+fn current_nanbeige42_contract() -> Result<Vec<ArtifactTensorContract>, ArtifactBridgeError> {
+    let expected = expected_nanbeige42_census();
+    let mut contract = Vec::new();
+    contract.try_reserve_exact(expected.len()).map_err(|_| ArtifactBridgeError::Memory {
+        subject: "artifact-contract-reservation",
+        observed: expected.len() as u64,
+        limit: expected.len() as u64,
+    })?;
+    for tensor in expected {
+        let route = remap_tensor_name(&tensor.name).map_err(|error| ArtifactBridgeError::Census {
+            tensor: tensor.name.clone(),
+            reason: error.to_string(),
+        })?;
+        let shape = tensor.shape.into_iter().map(|dimension| {
+            u32::try_from(dimension).map_err(|_| ArtifactBridgeError::Census {
+                tensor: tensor.name.clone(),
+                reason: "frozen shape does not fit artifact v1 u32 dimension".to_owned(),
+            })
+        }).collect::<Result<Vec<_>, _>>()?;
+        contract.push(ArtifactTensorContract {
+            source_name: tensor.name,
+            internal_name: route.internal_name,
+            shape,
+            stage: route.stage,
+        });
+    }
+    Ok(contract)
+}
+
 /// Refuse one-model artifact activation until OQ-31 and xmy authority are ratified.
 ///
 /// The model-id check keeps the refusal named; revision, recipe, source-root,
@@ -856,6 +1008,20 @@ where
     S: CheckedArtifactSource,
     F: FnMut(&str),
 {
+    load_with_contract(source, budget, contract, SYNTHETIC_SCOPE, &mut stage_line)
+}
+
+fn load_with_contract<S, F>(
+    source: &S,
+    budget: ArtifactLoadBudget,
+    contract: &[ArtifactTensorContract],
+    scope: &str,
+    stage_line: &mut F,
+) -> Result<LoadedArtifactWeights, ArtifactBridgeError>
+where
+    S: CheckedArtifactSource,
+    F: FnMut(&str),
+{
     let resident_envelope_bytes = source.resident_envelope_bytes();
     if resident_envelope_bytes > budget.max_resident_envelope_bytes {
         return Err(ArtifactBridgeError::Memory {
@@ -865,7 +1031,7 @@ where
         });
     }
     stage_line(&format!(
-        "LOAD STAGE=preflight {SYNTHETIC_SCOPE} status=BEGIN"
+        "LOAD STAGE=preflight {scope} status=BEGIN"
     ));
     let descriptors = index_descriptors(source.tensors())?;
     validate_contract(&descriptors, contract)?;
@@ -891,7 +1057,7 @@ where
         });
     }
     stage_line(&format!(
-        "LOAD STAGE=census {SYNTHETIC_SCOPE} status=PASS tensors={} declared_mapping_bytes={weight_bytes}",
+        "LOAD STAGE=census {scope} status=PASS tensors={} declared_mapping_bytes={weight_bytes}",
         contract.len()
     ));
 
@@ -923,7 +1089,7 @@ where
             }
         }
         stage_line(&format!(
-            "LOAD STAGE=tensor {SYNTHETIC_SCOPE} status=PASS tensor={} route={} storage={}",
+            "LOAD STAGE=tensor {scope} status=PASS tensor={} route={} storage={}",
             expected.source_name,
             expected.internal_name,
             expected.stage.as_str()
@@ -935,7 +1101,7 @@ where
         declared_source_resident_bytes: resident_envelope_bytes,
     };
     stage_line(&format!(
-        "LOAD STAGE=complete {SYNTHETIC_SCOPE} status=PASS bf16_tensors={} quantized_tensors={} modeled_declared_bytes_without_overhead={}",
+        "LOAD STAGE=complete {scope} status=PASS bf16_tensors={} quantized_tensors={} modeled_declared_bytes_without_overhead={}",
         bf16.len(),
         quantized.len(),
         receipt
