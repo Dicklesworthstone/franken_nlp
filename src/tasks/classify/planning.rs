@@ -142,6 +142,9 @@ impl ClassificationPlanner {
         if controls.ids().iter().any(|&id| id as usize >= NANBEIGE_VOCAB_SIZE)
             || !controls.entry(eos).is_some_and(|e| e.special) { return Err(ClassificationPlanningError::ControlRegistry); }
         let tokenizer = EmbeddedTokenizer::pinned().map_err(|_| ClassificationPlanningError::Tokenizer)?;
+        if tokenizer.eos_token_id() != Some(eos) {
+            return Err(ClassificationPlanningError::ControlRegistry);
+        }
         for marker in [IM_START, IM_END, THINK_START, THINK_END] {
             let ids = tokenizer.tokenizer().encode_ids_with_options(marker, EncodeOptions { add_bos: false, add_eos: false })
                 .map_err(|_| ClassificationPlanningError::Tokenizer)?;
