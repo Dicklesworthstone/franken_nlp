@@ -287,8 +287,8 @@ impl SourceTaskPlanner {
             // byte admission through the pre-encoded corpus factory entrypoint.
             return Err(SourcePlanningError::InputBudget);
         }
-        let fragments = render_fragments(kind, schema)?.iter().enumerate().map(|(index, text)|
-            self.tokenizer.tokenizer().encode_ids_with_options(text, EncodeOptions { add_bos: index == 0, add_eos: false })
+        let fragments = render_fragments(kind, schema)?.iter().map(|text|
+            self.tokenizer.tokenizer().encode_ids_with_options(text, EncodeOptions { add_bos: false, add_eos: false })
                 .map_err(|_| SourcePlanningError::Contract("source trusted fragment tokenization")))
             .collect::<Result<Vec<_>, _>>()?;
         let prompt_tokens = fragments.iter().try_fold(document.total_token_count(), |total, ids| total.checked_add(ids.len()))
