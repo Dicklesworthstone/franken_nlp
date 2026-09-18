@@ -14,7 +14,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -222,15 +222,14 @@ impl FnlpqRangeReader {
     pub fn tensors(&self) -> &[CheckedTensor] { &self.header.tensors }
     pub fn sections(&self) -> &[CheckedSection] { &self.sections }
 
-    /// Verify the complete containing section using bounded scratch, then read
-    /// one bounded mapping chunk. The full section is never retained.
-    pub fn read_mapping_chunk(
+    /// Verify the complete containing section once, keep the opened file
+    /// locked, then stream only the selected mapping. No section-sized buffer
+    /// or repeated full-section hash is created for mapping chunks.
+    pub fn open_mapping(
         &self,
         tensor_name: &str,
         which: CheckedTensorMapping,
-        relative_offset: u64,
-        output: &mut [u8],
-    ) -> Result<usize, FnlpqReadError> {
+    ) -> Result<VerifiedMappingReader<'_>, FnlpqReadError> {
         let tensor = self.header.tensors.binary_search_by(|t| t.name.as_str().cmp(tensor_name))
             .ok().and_then(|index| self.header.tensors.get(index))
             .ok_or_else(|| header_error("tensor mapping", format!("unknown tensor {tensor_name:?}")))?;
@@ -239,66 +238,78 @@ impl FnlpqRangeReader {
             CheckedTensorMapping::Scale => &tensor.scale,
             CheckedTensorMapping::RowSum => &tensor.row_sum,
         };
-        if relative_offset > mapping.len {
-            return Err(header_error("tensor mapping", "relative offset exceeds mapping length"));
-        }
         let section = section_for(&self.sections, mapping.section_ordinal, "range-reader mapping")?;
-        self.verify_section(section)?;
-        let remaining = mapping.len - relative_offset;
-        let take = usize::try_from(remaining.min(output.len() as u64))
-            .map_err(|_| section_error(section, "mapping chunk does not fit host usize"))?;
-        if take == 0 { return Ok(0); }
-        let absolute = section.file_offset.checked_add(mapping.offset)
-            .and_then(|v| v.checked_add(relative_offset))
-            .ok_or_else(|| section_error(section, "mapping absolute offset overflow"))?;
         let mut file = self.file.lock().map_err(|_| FnlpqReadError::Io {
             operation: "range-reader file lock",
             detail: "poisoned file mutex".to_owned(),
         })?;
+        verify_section_locked(&mut file, section)?;
+        let absolute = section.file_offset.checked_add(mapping.offset)
+            .ok_or_else(|| section_error(section, "mapping absolute offset overflow"))?;
         file.seek(SeekFrom::Start(absolute)).map_err(|error| FnlpqReadError::Io {
-            operation: "seek mapping chunk",
+            operation: "seek verified mapping",
             detail: error.to_string(),
         })?;
-        file.read_exact(&mut output[..take]).map_err(|error| FnlpqReadError::Io {
-            operation: "read mapping chunk",
+        Ok(VerifiedMappingReader { file, remaining: mapping.len })
+    }
+}
+
+/// A verified bounded mapping cursor. The file lock remains held from complete
+/// containing-section verification through the last mapping read so another
+/// caller through this reader cannot interleave seeks or reads.
+pub struct VerifiedMappingReader<'a> {
+    file: MutexGuard<'a, File>,
+    remaining: u64,
+}
+
+impl VerifiedMappingReader<'_> {
+    pub fn remaining(&self) -> u64 { self.remaining }
+
+    pub fn read_chunk(&mut self, output: &mut [u8]) -> Result<usize, FnlpqReadError> {
+        if self.remaining == 0 || output.is_empty() { return Ok(0); }
+        let take = usize::try_from(self.remaining.min(output.len() as u64)).map_err(|_| {
+            FnlpqReadError::Io {
+                operation: "verified mapping chunk length",
+                detail: "mapping chunk does not fit host usize".to_owned(),
+            }
+        })?;
+        self.file.read_exact(&mut output[..take]).map_err(|error| FnlpqReadError::Io {
+            operation: "read verified mapping chunk",
             detail: error.to_string(),
         })?;
+        self.remaining -= take as u64;
         Ok(take)
     }
+}
 
-    fn verify_section(&self, section: &CheckedSection) -> Result<(), FnlpqReadError> {
-        const SCRATCH: usize = 64 * 1024;
-        let mut file = self.file.lock().map_err(|_| FnlpqReadError::Io {
-            operation: "range-reader file lock",
-            detail: "poisoned file mutex".to_owned(),
-        })?;
-        file.seek(SeekFrom::Start(section.file_offset)).map_err(|error| FnlpqReadError::Io {
-            operation: "seek section verification",
+fn verify_section_locked(file: &mut File, section: &CheckedSection) -> Result<(), FnlpqReadError> {
+    const SCRATCH: usize = 64 * 1024;
+    file.seek(SeekFrom::Start(section.file_offset)).map_err(|error| FnlpqReadError::Io {
+        operation: "seek section verification",
+        detail: error.to_string(),
+    })?;
+    let mut hasher = StreamingSectionHasher::new(&section.name, section.stored_len)
+        .map_err(|error| section_error(section, error.to_string()))?;
+    let mut scratch = [0_u8; SCRATCH];
+    let mut remaining = section.stored_len;
+    while remaining != 0 {
+        let take = usize::try_from(remaining.min(SCRATCH as u64))
+            .map_err(|_| section_error(section, "section chunk does not fit host usize"))?;
+        file.read_exact(&mut scratch[..take]).map_err(|error| FnlpqReadError::Io {
+            operation: "verify section bytes",
             detail: error.to_string(),
         })?;
-        let mut hasher = StreamingSectionHasher::new(&section.name, section.stored_len)
-            .map_err(|error| section_error(section, error.to_string()))?;
-        let mut scratch = [0_u8; SCRATCH];
-        let mut remaining = section.stored_len;
-        while remaining != 0 {
-            let take = usize::try_from(remaining.min(SCRATCH as u64))
-                .map_err(|_| section_error(section, "section chunk does not fit host usize"))?;
-            file.read_exact(&mut scratch[..take]).map_err(|error| FnlpqReadError::Io {
-                operation: "verify section bytes",
-                detail: error.to_string(),
-            })?;
-            hasher.write(&scratch[..take]).map_err(|error| section_error(section, error.to_string()))?;
-            remaining -= take as u64;
-        }
-        let observed = hasher.finish().map_err(|error| section_error(section, error.to_string()))?;
-        if observed != section.stored_sha256 {
-            return Err(section_error(section, format!(
-                "stored_sha256 mismatch expected={} actual={}",
-                hex_lower(&section.stored_sha256), hex_lower(&observed)
-            )));
-        }
-        Ok(())
+        hasher.write(&scratch[..take]).map_err(|error| section_error(section, error.to_string()))?;
+        remaining -= take as u64;
     }
+    let observed = hasher.finish().map_err(|error| section_error(section, error.to_string()))?;
+    if observed != section.stored_sha256 {
+        return Err(section_error(section, format!(
+            "stored_sha256 mismatch expected={} actual={}",
+            hex_lower(&section.stored_sha256), hex_lower(&observed)
+        )));
+    }
+    Ok(())
 }
 
 /// Fixed prelude fields after their version and file-length checks succeed.
