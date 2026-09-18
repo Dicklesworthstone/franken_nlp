@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 
 use crate::artifact::{
     format::SectionKind,
-    reader::{FnlpqArtifact, FnlpqReadError},
+    reader::{FnlpqArtifact, FnlpqRangeReader, FnlpqReadError},
 };
 
 use super::{
@@ -216,16 +216,32 @@ impl EmbeddedTokenizer {
         Ok(())
     }
 
-    /// Open and validate an artifact, then bind its tokenizer bytes to this
-    /// executable's embedded tokenizer.
+    /// Open the bounded file-backed reader and bind the artifact tokenizer
+    /// identity to this executable without retaining the complete model file.
     pub fn verify_artifact_path(
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<(), VerifyArtifactTokenizerError> {
         let artifact =
-            FnlpqArtifact::open_owned(path).map_err(VerifyArtifactTokenizerError::Read)?;
-        self.verify_artifact(&artifact)
-            .map_err(VerifyArtifactTokenizerError::Integrity)
+            FnlpqRangeReader::open(path).map_err(VerifyArtifactTokenizerError::Read)?;
+        let section = artifact
+            .sections()
+            .iter()
+            .find(|section| section.kind == SectionKind::TokenizerModel)
+            .ok_or(TokenizerArtifactIntegrityError::MissingTokenizerModelSection)
+            .map_err(VerifyArtifactTokenizerError::Integrity)?;
+        let artifact_sha256 = artifact
+            .raw_section_sha256(section.ordinal)
+            .map_err(VerifyArtifactTokenizerError::Read)?;
+        if artifact_sha256 != self.sha256 {
+            return Err(VerifyArtifactTokenizerError::Integrity(
+                TokenizerArtifactIntegrityError::DigestMismatch {
+                    binary_sha256: self.sha256,
+                    artifact_sha256,
+                },
+            ));
+        }
+        Ok(())
     }
 }
 
