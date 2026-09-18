@@ -20,5 +20,6 @@ pub mod portable_int8;
 pub mod quant_algebra;
 pub mod rope;
 pub mod sampler;
+pub mod strict_int8;
 pub mod tensor;
 pub mod weights;
