@@ -16,6 +16,7 @@ pub mod layer;
 pub mod lmhead;
 pub mod looprun;
 pub mod nn;
+pub mod portable_int8;
 pub mod quant_algebra;
 pub mod rope;
 pub mod sampler;
