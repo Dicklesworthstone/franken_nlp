@@ -865,14 +865,27 @@ impl CurrentCandidateArtifactSource {
     /// Raw embedded tokenizer.model identity from this already-preflighted
     /// artifact. This does not reopen or rescan the model payload sections.
     pub fn tokenizer_model_sha256(&self) -> Result<[u8; 32], ArtifactBridgeError> {
+        self.raw_section_sha256(SectionKind::TokenizerModel, "<tokenizer_model>")
+    }
+
+    /// Raw tokenizer_config.json identity from this same preflighted artifact.
+    pub fn tokenizer_config_sha256(&self) -> Result<[u8; 32], ArtifactBridgeError> {
+        self.raw_section_sha256(SectionKind::TokenizerConfig, "<tokenizer_config>")
+    }
+
+    fn raw_section_sha256(
+        &self,
+        kind: SectionKind,
+        label: &'static str,
+    ) -> Result<[u8; 32], ArtifactBridgeError> {
         let section = self.reader.sections().iter()
-            .find(|section| section.kind == SectionKind::TokenizerModel)
+            .find(|section| section.kind == kind)
             .ok_or_else(|| ArtifactBridgeError::Source {
-                tensor: "<tokenizer_model>".to_owned(),
-                detail: "artifact has no TOKENIZER_MODEL section".to_owned(),
+                tensor: label.to_owned(),
+                detail: format!("artifact has no {} section", kind.header_name()),
             })?;
         self.reader.raw_section_sha256(section.ordinal).map_err(|error| ArtifactBridgeError::Source {
-            tensor: "<tokenizer_model>".to_owned(),
+            tensor: label.to_owned(),
             detail: error.to_string(),
         })
     }
