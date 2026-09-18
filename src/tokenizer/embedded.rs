@@ -215,6 +215,12 @@ impl EmbeddedTokenizer {
         self.sha256
     }
 
+    /// SHA-256 of the exact tokenizer_config.json compiled into this binary.
+    #[must_use]
+    pub fn tokenizer_config_sha256(&self) -> [u8; 32] {
+        Sha256::digest(PINNED_TOKENIZER_CONFIG_BYTES).into()
+    }
+
     /// Lowercase hexadecimal SHA-256 of [`Self::bytes`].
     #[must_use]
     pub fn sha256_hex(&self) -> String {
@@ -346,6 +352,51 @@ fn pinned_configured_ids(
             "EncodeOptions defaults disagree with tokenizer_config add_bos/add_eos".to_owned(),
         ));
     }
+    let decoder = config.get("added_tokens_decoder")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| EmbeddedTokenizerError::Configuration(
+            "missing tokenizer_config added_tokens_decoder".to_owned()
+        ))?;
+    let mut added_by_id = BTreeMap::new();
+    for (surface, &id) in added_by_surface {
+        if added_by_id.insert(id, surface.as_str()).is_some() {
+            return Err(EmbeddedTokenizerError::Configuration(
+                "added-token registry contains duplicate ids".to_owned()
+            ));
+        }
+        let metadata = decoder.get(&id.to_string())
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| EmbeddedTokenizerError::Configuration(
+                format!("tokenizer_config missing added token id {id}")
+            ))?;
+        if metadata.get("content").and_then(serde_json::Value::as_str) != Some(surface.as_str()) {
+            return Err(EmbeddedTokenizerError::Configuration(
+                format!("tokenizer_config added token id {id} has a different surface")
+            ));
+        }
+    }
+    let minimum_added_id = added_by_id.keys().next().copied().ok_or_else(|| {
+        EmbeddedTokenizerError::Configuration("pinned added-token registry is empty".to_owned())
+    })?;
+    for (id, metadata) in decoder {
+        let Ok(id) = id.parse::<u32>() else {
+            return Err(EmbeddedTokenizerError::Configuration(
+                "tokenizer_config added-token key is not a u32".to_owned()
+            ));
+        };
+        if id >= minimum_added_id {
+            let content = metadata.get("content").and_then(serde_json::Value::as_str)
+                .ok_or_else(|| EmbeddedTokenizerError::Configuration(
+                    format!("tokenizer_config added token id {id} lacks content")
+                ))?;
+            if added_by_id.get(&id).copied() != Some(content) {
+                return Err(EmbeddedTokenizerError::Configuration(
+                    format!("tokenizer_config and added_tokens.json diverge at id {id}")
+                ));
+            }
+        }
+    }
+
     let bos = string(&config, "bos_token")?;
     let eos = string(&config, "eos_token")?;
     if bos != mapped_content("bos_token")? || eos != mapped_content("eos_token")? {
