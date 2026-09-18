@@ -842,10 +842,9 @@ impl CurrentCandidateArtifactSource {
             logical_model_sha256: reader.logical_model_sha256().to_owned(),
         };
         let mut tensors = Vec::new();
-        tensors.try_reserve_exact(reader.tensors().len()).map_err(|error| ArtifactBridgeError::Memory {
-            subject: "artifact-descriptor-reservation",
-            observed: reader.tensors().len() as u64,
-            limit: error.capacity().unwrap_or(0) as u64,
+        tensors.try_reserve_exact(reader.tensors().len()).map_err(|error| ArtifactBridgeError::Source {
+            tensor: "<artifact>".to_owned(),
+            detail: format!("descriptor allocation refused: {error}"),
         })?;
         for tensor in reader.tensors() {
             tensors.push(ArtifactTensorDescriptor {
@@ -888,14 +887,27 @@ impl CheckedArtifactSource for CurrentCandidateArtifactSource {
             TensorMapping::RowSum => CheckedTensorMapping::RowSum,
         };
         let total = expected.mapping_lengths.for_mapping(mapping);
-        let mut offset = 0_u64;
+        let mut mapping_reader = self.reader.open_mapping(&tensor.name, which)
+            .map_err(|error| ArtifactBridgeError::Source {
+                tensor: tensor.name.clone(),
+                detail: format!("{} verification failed: {error}", mapping.stage_name()),
+            })?;
+        if mapping_reader.remaining() != total {
+            return Err(ArtifactBridgeError::Source {
+                tensor: tensor.name.clone(),
+                detail: format!(
+                    "{} verified length {} differs from descriptor {}",
+                    mapping.stage_name(), mapping_reader.remaining(), total
+                ),
+            });
+        }
+        let mut observed = 0_u64;
         let mut buffer = [0_u8; FILE_SOURCE_CHUNK_BYTES];
-        while offset != total {
-            let read = self.reader.read_mapping_chunk(&tensor.name, which, offset, &mut buffer)
-                .map_err(|error| ArtifactBridgeError::Source {
-                    tensor: tensor.name.clone(),
-                    detail: format!("{} range read failed: {error}", mapping.stage_name()),
-                })?;
+        while mapping_reader.remaining() != 0 {
+            let read = mapping_reader.read_chunk(&mut buffer).map_err(|error| ArtifactBridgeError::Source {
+                tensor: tensor.name.clone(),
+                detail: format!("{} range read failed: {error}", mapping.stage_name()),
+            })?;
             if read == 0 {
                 return Err(ArtifactBridgeError::Source {
                     tensor: tensor.name.clone(),
@@ -903,10 +915,16 @@ impl CheckedArtifactSource for CurrentCandidateArtifactSource {
                 });
             }
             visitor(&buffer[..read])?;
-            offset = offset.checked_add(read as u64).ok_or_else(|| ArtifactBridgeError::Source {
+            observed = observed.checked_add(read as u64).ok_or_else(|| ArtifactBridgeError::Source {
                 tensor: tensor.name.clone(),
                 detail: format!("{} streamed byte count overflow", mapping.stage_name()),
             })?;
+        }
+        if observed != total {
+            return Err(ArtifactBridgeError::Source {
+                tensor: tensor.name.clone(),
+                detail: format!("{} expected {total} bytes, observed {observed}", mapping.stage_name()),
+            });
         }
         Ok(())
     }
@@ -939,10 +957,9 @@ where
 fn current_nanbeige42_contract() -> Result<Vec<ArtifactTensorContract>, ArtifactBridgeError> {
     let expected = expected_nanbeige42_census();
     let mut contract = Vec::new();
-    contract.try_reserve_exact(expected.len()).map_err(|_| ArtifactBridgeError::Memory {
-        subject: "artifact-contract-reservation",
-        observed: expected.len() as u64,
-        limit: expected.len() as u64,
+    contract.try_reserve_exact(expected.len()).map_err(|error| ArtifactBridgeError::Source {
+        tensor: "<contract>".to_owned(),
+        detail: format!("contract allocation refused: {error}"),
     })?;
     for tensor in expected {
         let route = remap_tensor_name(&tensor.name).map_err(|error| ArtifactBridgeError::Census {
