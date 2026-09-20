@@ -19,6 +19,7 @@ use crate::{
 };
 
 pub mod redact;
+pub mod tokens;
 
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const TASK_ARGUMENT_BYTES: usize = 64 * 1024;
@@ -26,7 +27,7 @@ const TASK_ARGUMENT_BYTES: usize = 64 * 1024;
 const ENVELOPE_RESERVE: usize = 2048;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum TextBatchTask { Normalize, Split, RedactRules }
+pub enum TextBatchTask { Normalize, Split, RedactRules, Tokens }
 
 fn default_chunk_bytes() -> usize { 4096 }
 
@@ -45,6 +46,9 @@ pub enum TextBatchOptions {
     RedactRules {
         #[serde(default)] options: redact::RulesOnlyOptions,
     },
+    Tokens {
+        #[serde(default)] options: tokens::TokenBatchOptions,
+    },
 }
 impl TextBatchOptions {
     pub fn for_task(task: TextBatchTask) -> Self {
@@ -54,11 +58,13 @@ impl TextBatchOptions {
             },
             TextBatchTask::Split => Self::Split { max_chunk_bytes: default_chunk_bytes() },
             TextBatchTask::RedactRules => Self::RedactRules { options: Default::default() },
+            TextBatchTask::Tokens => Self::Tokens { options: Default::default() },
         }
     }
     pub fn task(&self) -> TextBatchTask {
         match self { Self::Normalize { .. } => TextBatchTask::Normalize,
-            Self::Split { .. } => TextBatchTask::Split, Self::RedactRules { .. } => TextBatchTask::RedactRules }
+            Self::Split { .. } => TextBatchTask::Split, Self::RedactRules { .. } => TextBatchTask::RedactRules,
+            Self::Tokens { .. } => TextBatchTask::Tokens }
     }
     fn validate(&self) -> Result<(), BatchFault> {
         if let Self::Split { max_chunk_bytes } = self {
@@ -83,6 +89,7 @@ pub struct TextBatchOutput {
 
 pub struct TextBatchProcessor {
     defaults: TextBatchOptions, budget: TextBudget, redaction: redact::RedactionState,
+    tokens: tokens::TokenState,
 }
 impl TextBatchProcessor {
     pub fn new(defaults: TextBatchOptions, budget: TextBudget) -> Result<Self, BatchFault> {
@@ -95,7 +102,7 @@ impl TextBatchProcessor {
         if defaults.task() == TextBatchTask::RedactRules && budget.max_items == 0 {
             return Err(BatchCode::InvalidLimits.into());
         }
-        Ok(Self { defaults, budget, redaction: redact::RedactionState::new(limits)? })
+        Ok(Self { defaults, budget, redaction: redact::RedactionState::new(limits)?, tokens: Default::default() })
     }
     pub fn rule_work_remaining(&self) -> u64 { self.redaction.remaining() }
 }
@@ -111,6 +118,7 @@ impl BatchProcessor for TextBatchProcessor {
         if document.text.len() > self.budget.max_input_bytes {
             return Err(BatchItemFailure::reject(BatchCode::DocumentLimit));
         }
+        if let TextBatchOptions::Tokens { options } = &options { options.admit(&document.text, self.budget)?; }
         Ok(PreparedText { text: document.text, options })
     }
     fn planned_work(&self, _: &Self::Prepared) -> BatchWork { BatchWork::default() }
@@ -133,6 +141,10 @@ impl BatchProcessor for TextBatchProcessor {
             TextBatchOptions::RedactRules { options } => {
                 let value = self.redaction.execute(&prepared.text, &options, self.budget, control)?;
                 owned_result("redact_rules", &value, self.budget.max_output_bytes)?
+            }
+            TextBatchOptions::Tokens { options } => {
+                let value = self.tokens.execute(&prepared.text, options, self.budget, control)?;
+                owned_result("tokens", &value, self.budget.max_output_bytes)?
             }
         };
         checkpoint(control)?;
@@ -159,16 +171,19 @@ fn text_failure(error: TextError) -> BatchItemFailure {
     BatchItemFailure::reject(code)
 }
 fn owned_result(task: &'static str, value: &impl Serialize, cap: usize) -> Result<TextBatchOutput, BatchItemFailure> {
-    // Task implementations already bound their result storage. This one-record
-    // owned representation does not retain a reference into the input buffer.
-    let result = serde_json::to_value(value).map_err(|_| BatchItemFailure::reject(BatchCode::Serialization))?;
-    let output = TextBatchOutput { schema_version: 1, task, result };
+    // Reject an oversized complete envelope before cloning task results into
+    // serde_json::Value. The final batch sink still checks canonical bytes.
+    #[derive(Serialize)]
+    struct BorrowedOutput<'a, T: Serialize> { schema_version: u32, task: &'static str, result: &'a T }
+    let borrowed = BorrowedOutput { schema_version: 1, task, result: value };
     let mut counter = SizeCounter { remaining: cap, exceeded: false };
-    if serde_json::to_writer(&mut counter, &output).is_err() {
+    if serde_json::to_writer(&mut counter, &borrowed).is_err() {
         return Err(BatchItemFailure::reject(if counter.exceeded { BatchCode::OutputLineLimit } else { BatchCode::Serialization }));
     }
-    Ok(output)
+    let result = serde_json::to_value(value).map_err(|_| BatchItemFailure::reject(BatchCode::Serialization))?;
+    Ok(TextBatchOutput { schema_version: 1, task, result })
 }
+
 struct SizeCounter { remaining: usize, exceeded: bool }
 impl Write for SizeCounter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -197,7 +212,7 @@ pub(crate) struct BatchCommand {
     #[arg(long, default_value_t = 4096)] max_epoch_ids: usize,
     /// Maximum retained caller-ID bytes between flush controls.
     #[arg(long, default_value_t = 256 * 1024)] max_epoch_id_bytes: usize,
-    /// Maximum normalization edits or split chunks in one document.
+    /// Maximum tokens, normalization edits, split chunks or redaction detections per document.
     #[arg(long, default_value_t = 16_384)] max_items: usize,
     /// Rules-only detection ceiling per document and per residual scan.
     #[arg(long, default_value_t = 4096)] max_detections: usize,
@@ -210,7 +225,7 @@ pub(crate) struct BatchCommand {
 pub(crate) fn definition() -> clap::Command {
     BatchCommand::augment_args(clap::Command::new("batch"))
         .about("Process bounded NDJSON documents with model-free tasks")
-        .after_help("Input: {\"id\":\"doc-1\",\"text\":\"original UTF-8\",\"task_args\":null}. Optional task_args is a complete override with kind=normalize, split or redact_rules. --task redact-rules uses only the declared rules, not person/org/location NER; verification always reruns that rule set before publication. task_args.options may set action=mask|placeholder, rules={enabled:[email,phone,url,ip_address,credit_card,date]}, and include_map=true. Default rules omit dates. A clean declared scan is not a guarantee of no PII; Unicode obfuscations may be missed. Pseudonymization and keys are not accepted in this stream. {\"flush\":true} acknowledges the epoch and permits ID reuse. Output uses fnlp-item-local-batch-v1, not robot schema. One document is live; each event is flushed before further input. Empty LF/CRLF records are ignored; malformed records get typed errors and processing continues. Any rejected document makes the process exit nonzero, even when run_complete is emitted. No weights, network, background pool, file output or implicit persistence. A complete run requires its terminal event; a terminated process may have delivered only a prefix.")
+        .after_help("Input: {\"id\":\"doc-1\",\"text\":\"original UTF-8\",\"task_args\":null}. Optional task_args is a complete override with kind=normalize, split, tokens or redact_rules. --task tokens uses exact pinned L0 BPE with BOS and without EOS by default; BPE documents over 4096 bytes are refused, never truncated or silently encoded differently. task_args.options may set include_ids=true and encoding={kind:pinned_bpe,add_bos:false,add_eos:true} or encoding={kind:byte_fallback}. Byte fallback omits special insertion and verifies exact byte decode. Token IDs are sensitive result content. This is tokenizer inspection, not untrusted prompt construction. --task redact-rules uses only the declared rules, not person/org/location NER; verification always reruns that rule set before publication. task_args.options may set action=mask|placeholder, rules={enabled:[email,phone,url,ip_address,credit_card,date]}, and include_map=true. Default rules omit dates. A clean declared scan is not a guarantee of no PII; Unicode obfuscations may be missed. Pseudonymization and keys are not accepted in this stream. {\"flush\":true} acknowledges the epoch and permits ID reuse. Output uses fnlp-item-local-batch-v1, not robot schema. One document is live; each event is flushed before further input. Empty LF/CRLF records are ignored; malformed records get typed errors and processing continues. Any rejected document makes the process exit nonzero, even when run_complete is emitted. No weights, network, background pool, file output or implicit persistence. A complete run requires its terminal event; a terminated process may have delivered only a prefix.")
 }
 impl BatchCommand {
     fn configure(&self) -> Result<(TextBatchProcessor, BatchLimits), ErrorCode> {
@@ -225,7 +240,7 @@ impl BatchCommand {
             // Non-model processors never claim or consume native forward work.
             max_work: BatchWork::default(), ..BatchLimits::default()
         };
-        limits.validate().map_err(|_| ErrorCode::Usage)?;
+        limits.validate().map_err(|_| BatchCode::InvalidLimits).map_err(|_| ErrorCode::Usage)?;
         let defaults = match &self.task_args {
             None => TextBatchOptions::for_task(self.task),
             Some(path) => {
