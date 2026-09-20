@@ -10,6 +10,7 @@ mod native;
 mod pairwise;
 mod planning;
 mod rubric;
+pub use planning::quantized;
 
 pub use common::{JudgeError, JudgeLimits, JudgeLogits};
 pub use faithfulness::{FaithfulnessAbstention, FaithfulnessAssessment, FaithfulnessEvidence,

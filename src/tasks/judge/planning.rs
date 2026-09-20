@@ -27,6 +27,7 @@ use super::{
     FaithfulnessPlan, FaithfulnessPolicy, FaithfulnessResult, FAITHFULNESS_VERSION,
 };
 mod faithfulness;
+pub mod quantized;
 use faithfulness::FaithfulnessCompiler;
 
 pub const JUDGE_PROMPT_VERSION: &str = "judge-segmented-pairwise-ordinal-faithfulness-v2";
@@ -128,6 +129,9 @@ impl PreparedJudge {
     pub fn execute_eager_with_control<C: DecodeStepControl>(&self, admitted: &ExecutionIdentity,
         engine: &mut HfBf16EagerEngine, budget: PrefixBudget, control: &mut C)
         -> Result<EagerJudgeRun<JudgeResult>, JudgeNativeError> {
+        if self.identity.numerics_profile != NumericsProfile::HfBf16Eager {
+            return Err(JudgeError::Contract("eager judge requires its eager profile").into());
+        }
         self.verify_identity(admitted)?;
         let (scores, work) = native::score_bundle(self.executable.bundle(), engine, budget, control)?;
         native::wrap(self.executable.bundle(), self.executable.finish(scores)?, work)
@@ -200,7 +204,13 @@ impl JudgePlanner {
 
     pub fn plan(&self, request: &JudgeRequest, context: &PlanContext<'_>, limits: JudgeLimits)
         -> Result<PreparedJudge, JudgeError> {
-        self.check_context(context)?;
+        self.plan_with_profile(request, context, limits, NumericsProfile::HfBf16Eager)
+    }
+    // Only the private INT8 wrapper can obtain a non-eager inner plan. There
+    // is no public conversion from it to PreparedJudge or an eager executor.
+    fn plan_with_profile(&self, request: &JudgeRequest, context: &PlanContext<'_>,
+        limits: JudgeLimits, profile: NumericsProfile) -> Result<PreparedJudge, JudgeError> {
+        self.check_context(context, profile)?;
         let budget = request.budget();
         budget.validate().map_err(|_| JudgeError::Contract("judge task budget"))?;
         if !fits(budget, *context.budget_ceiling()) { return Err(JudgeError::Limit("plan_context")); }
@@ -256,10 +266,10 @@ impl JudgePlanner {
         identity.validate().map_err(|_| JudgeError::Contract("prepared judge identity"))?;
         Ok(PreparedJudge { executable, identity })
     }
-    fn check_context(&self, context: &PlanContext<'_>) -> Result<(), JudgeError> {
+    fn check_context(&self, context: &PlanContext<'_>, profile: NumericsProfile) -> Result<(), JudgeError> {
         let id = context.execution_identity();
         if id.task_spec != "judge-v1" || id.template_digest != self.template_digest
-            || id.tokenizer_digest != self.tokenizer_digest() || id.numerics_profile != NumericsProfile::HfBf16Eager
+            || id.tokenizer_digest != self.tokenizer_digest() || id.numerics_profile != profile
             || id.kv_dtype != "bf16" || id.thinking_mode != ThinkingMode::Disabled || id.tool_mode != ToolMode::None {
             return Err(JudgeError::Contract("judge context task, template, tokenizer or mode"));
         }
