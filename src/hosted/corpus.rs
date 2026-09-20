@@ -2,6 +2,8 @@
 //! No user-defined admission provider, per-document runtime or model reload.
 
 use super::*;
+mod classify;
+pub use classify::ClassificationCorpusConfig;
 use std::io::{BufRead, Write};
 use crate::{
     batch::{self, BatchCode, BatchItemFailure, BatchLimits, BatchSummary,
