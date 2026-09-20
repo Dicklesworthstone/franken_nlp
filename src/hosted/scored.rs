@@ -5,7 +5,8 @@ use super::*;
 use crate::{
     native_engine::strict_int8::scoring::Int8ScoringBudget,
     tasks::{classify::quantized::{Int8ClassificationError, Int8ClassificationRun, PreparedInt8Classification},
-        ir::TaskBudget},
+        ir::TaskBudget,
+        judge::quantized::{Int8JudgeError, Int8JudgeRun, PreparedInt8Judge}},
 };
 
 impl NlpEngine {
@@ -38,6 +39,42 @@ impl NlpEngine {
             if result.model_work != work || engine.value.is_poisoned()
                 || !engine.value.kv_cache().all_slots_have_len(0) {
                 return Err(HostedError::Classification(Int8ClassificationError::Accounting));
+            }
+            drop(engine);
+            let committed = output.commit()?;
+            drop(lease);
+            Ok(GuardedOutput::new(result, committed))
+        })
+    }
+
+    /// Execute both pairwise orders, every rubric criterion or the complete
+    /// full-source/evidence bundle on the shared resident INT8 model. A failed
+    /// head never becomes a partial judgment, and scores are not truth claims.
+    pub fn execute_int8_judge(&self, model: &ResidentInt8,
+        prepared: PreparedInt8Judge, native: NativeLimits, cancellation: CancellationToken)
+        -> Result<HostedOutput<Int8JudgeRun>, HostedError> {
+        dispatch::preflight(self, native.run)?;
+        self.check_resident_domain(model)?;
+        check_model_identity(model.artifact_identity(), prepared.execution_identity())?;
+        let required = requirements(native)?;
+        let task = prepared.task_budget();
+        check_capacity(prepared.required_context(), task, native.context_tokens, required.kv_bytes)?;
+        let work = prepared.planned_work();
+        let lease = self.resources().acquire_lease();
+        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
+        let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch,
+            sum(&[required.rope_bytes, required.scratch_payload_bound, native.allocator_reserve_bytes])?)?;
+        let output = output_claim(&lease, prepared.max_result_bytes(), u64::from(task.max_output_tokens))?;
+        let model = model.clone();
+        dispatch::run(self, native.run, cancellation, move |control| {
+            let mut engine = allocate_native(kv, workspace, || model.inner.loaded.value
+                .engine(native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
+            let result = prepared.execute_with_control(prepared.execution_identity(), &mut engine.value,
+                Int8ScoringBudget { native: Int8RunBudget::exact(work), max_kv_bytes: required.kv_bytes }, control)
+                .map_err(HostedError::Judge)?;
+            if result.model_work != work || result.head_count != prepared.head_count()
+                || engine.value.is_poisoned() || !engine.value.kv_cache().all_slots_have_len(0) {
+                return Err(HostedError::Judge(Int8JudgeError::Accounting));
             }
             drop(engine);
             let committed = output.commit()?;
@@ -109,4 +146,19 @@ mod tests {
         send::<Int8ClassificationRun>();
         send::<Arc<crate::tasks::classify::ClassificationPlanner>>();
     }
+    #[test]
+    fn judge_errors_preserve_typed_causes_and_safe_display() {
+        let error = HostedError::Judge(Int8JudgeError::Identity);
+        assert!(error.source().is_some());
+        assert_eq!(error.to_string(), format!("{error:?}"));
+        assert_eq!(error.to_string(), "hosted native judgment failed");
+    }
+    #[test]
+    fn judge_plans_and_results_can_be_owned_by_the_blocking_closure() {
+        fn send<T: Send + 'static>() {}
+        send::<PreparedInt8Judge>();
+        send::<Int8JudgeRun>();
+        send::<Arc<crate::tasks::judge::JudgePlanner>>();
+    }
+
 }

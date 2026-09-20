@@ -25,7 +25,7 @@ pub enum JudgeBatchArgs {
     Faithfulness { claim: String, policy: FaithfulnessPolicy, budget: TaskBudget },
 }
 impl JudgeBatchArgs {
-    fn into_request(self, text: String) -> JudgeRequest {
+    pub(crate) fn into_request(self, text: String) -> JudgeRequest {
         match self {
             Self::Pairwise { criterion, b, policy, budget } => JudgeRequest::Pairwise { criterion, a: text, b, policy, budget },
             Self::Rubric { rubric, policy, budget } => JudgeRequest::Rubric { document: text, rubric, policy, budget },

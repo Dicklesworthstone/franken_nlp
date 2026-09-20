@@ -4,6 +4,8 @@
 use super::*;
 mod classify;
 pub use classify::ClassificationCorpusConfig;
+mod judge;
+pub use judge::JudgeCorpusConfig;
 use std::io::{BufRead, Write};
 use crate::{
     batch::{self, BatchCode, BatchItemFailure, BatchLimits, BatchSummary,
