@@ -9,6 +9,8 @@ pub mod corpus;
 pub mod error;
 pub mod execution_identity;
 pub mod grammar;
+#[cfg(feature = "asupersync-runtime")]
+pub mod hosted;
 pub mod jobs;
 mod local_io;
 pub mod native_engine;
