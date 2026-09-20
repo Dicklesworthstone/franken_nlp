@@ -18,6 +18,7 @@ use crate::{
 use super::*;
 /// Shared embedding admission and result-ownership surfaces for both families.
 pub use super::judge::{JudgeBatchAdmission as ExtractionBatchAdmission, GuardedOutput};
+pub mod quantized;
 
 pub const EXTRACTION_BATCH_PROMPT: &str = "extract-segmented-schema-and-source-v1";
 const SCHEMA_SLOT: &str = "FNLP_EXTRACT_SCHEMA_0_967a";
@@ -88,11 +89,29 @@ impl ExtractionBatchPlanner {
     /// Bind TASK-owned template/tokenizer fields while preserving the caller's
     /// declared artifact/model/backend facts. This is planning, not activation.
     /// Execution later verifies the complete prepared identity without repairs.
-    pub fn pinned(controls: &TemplateControlIds, eos: u32, mut identity: ExecutionIdentity,
+    pub fn pinned(controls: &TemplateControlIds, eos: u32, identity: ExecutionIdentity,
         ceiling: TaskBudget, compiler_limits: CompileLimits, source_limits: SourceRuntimeLimits,
         defaults: Option<ExtractionBatchArgs>) -> Result<Self, BatchFault> {
+        Self::pinned_for_backend(controls, eos, identity, ceiling, compiler_limits, source_limits, defaults, ExtractionBackend::Eager)
+    }
+    // The two public planner types choose the native contract before any
+    // tokenization. No temporary BF16 identity or executable-plan conversion.
+    #[allow(clippy::too_many_arguments)]
+    fn pinned_for_backend(controls: &TemplateControlIds, eos: u32, mut identity: ExecutionIdentity,
+        ceiling: TaskBudget, compiler_limits: CompileLimits, source_limits: SourceRuntimeLimits,
+        defaults: Option<ExtractionBatchArgs>, backend: ExtractionBackend) -> Result<Self, BatchFault> {
+        if defaults.as_ref().is_some_and(|args| args.schema.len() > compiler_limits.max_schema_bytes) {
+            return Err(BatchCode::InvalidLimits.into());
+        }
+        let profile = match backend {
+            ExtractionBackend::Eager => NumericsProfile::HfBf16Eager,
+            ExtractionBackend::Int8 => {
+                crate::native_engine::constrained_int8::check_profile(&identity).map_err(|_| BatchCode::Admission)?;
+                NumericsProfile::StrictQuantized { version: 1 }
+            }
+        };
         ceiling.validate().map_err(|_| BatchCode::InvalidLimits)?;
-        if identity.task_spec != "extract-v1" || identity.numerics_profile != NumericsProfile::HfBf16Eager
+        if identity.task_spec != "extract-v1" || identity.numerics_profile != profile
             || identity.kv_dtype != "bf16" || identity.thinking_mode != ThinkingMode::Disabled || identity.tool_mode != ToolMode::None
             || controls.ids().iter().any(|&id| id as usize >= NANBEIGE_VOCAB_SIZE)
             || !controls.entry(eos).is_some_and(|e| e.special) {
@@ -139,6 +158,22 @@ impl ExtractionBatchPlanner {
         } else { BatchItemFailure { fault, stop: false } })
     }
     fn prepare_inner(&self, document: BatchDocument<ExtractionBatchArgs>) -> Result<PreparedBatchExtraction, BatchFault> {
+        let ExtractionInput { task, source, schema, options, grounded, prompt_tokens } = self.prepare_input(document)?;
+        let plan = if grounded {
+            ExtractPlan::from_task_plan_with_source(&task, &schema, options, self.compiler_limits, &self.controls, &source, self.source_limits)
+        } else { ExtractPlan::from_task_plan(&task, &schema, options, self.compiler_limits, &self.controls) }
+            .map_err(|e| if matches!(e, ExtractError::AllocationRefused) { BatchCode::Allocation } else { BatchCode::Planning })?;
+        let identity = plan.bind_identity(self.identity.clone()).map_err(|_| BatchCode::Admission)?;
+        // Universal decoder currently projects every prompt/continuation
+        // forward. Reserve the maximum including EOS selection but no EOS feed.
+        let forward = prompt_tokens.checked_add(u64::from(task.ir().budget().max_output_tokens) - 1).ok_or(BatchCode::WorkLimit)?;
+        let work = BatchWork { forward_positions: forward,
+            projected_logits: forward.checked_mul(NANBEIGE_VOCAB_SIZE as u64).ok_or(BatchCode::WorkLimit)? };
+        Ok(PreparedBatchExtraction { plan, task, source, identity, work, prompt_tokens })
+    }
+    // Only raw prompt/schema/source construction is shared. Each backend
+    // separately seals its own executable plan, policy and work accounting.
+    fn prepare_input(&self, document: BatchDocument<ExtractionBatchArgs>) -> Result<ExtractionInput, BatchFault> {
         let args = document.task_args.or_else(|| self.defaults.clone()).ok_or(BatchCode::Planning)?;
         let b = args.budget; let c = self.ceiling;
         b.validate().map_err(|_| BatchCode::Planning)?;
@@ -172,18 +207,15 @@ impl ExtractionBatchPlanner {
         let context = PlanContext::new(&self.identity, self.ceiling).map_err(|_| BatchCode::Admission)?;
         let task = TaskPlan::new(BuiltInTask::Extract.spec(), &context, ir).map_err(|_| BatchCode::Planning)?;
         let options = JsonDecodeOptions { max_new_tokens: b.max_output_tokens as usize, eos_token_id: self.eos, excluded_token_ids: Default::default() };
-        let plan = if grounded {
-            ExtractPlan::from_task_plan_with_source(&task, &args.schema, options, self.compiler_limits, &self.controls, &source, self.source_limits)
-        } else { ExtractPlan::from_task_plan(&task, &args.schema, options, self.compiler_limits, &self.controls) }
-            .map_err(|e| if matches!(e, ExtractError::AllocationRefused) { BatchCode::Allocation } else { BatchCode::Planning })?;
-        let identity = plan.bind_identity(self.identity.clone()).map_err(|_| BatchCode::Admission)?;
-        // Universal decoder currently projects every prompt/continuation
-        // forward. Reserve the maximum including EOS selection but no EOS feed.
-        let forward = (prompt as u64).checked_add(u64::from(b.max_output_tokens) - 1).ok_or(BatchCode::WorkLimit)?;
-        let work = BatchWork { forward_positions: forward,
-            projected_logits: forward.checked_mul(NANBEIGE_VOCAB_SIZE as u64).ok_or(BatchCode::WorkLimit)? };
-        Ok(PreparedBatchExtraction { plan, task, source, identity, work, prompt_tokens: prompt as u64 })
+        Ok(ExtractionInput { task, source, schema: args.schema, options, grounded, prompt_tokens: prompt as u64 })
     }
+}
+
+#[derive(Clone, Copy)]
+enum ExtractionBackend { Eager, Int8 }
+struct ExtractionInput {
+    task: TaskPlan, source: SourceDocument, schema: String, options: JsonDecodeOptions,
+    grounded: bool, prompt_tokens: u64,
 }
 
 /// Independent nonrenewable mask-work allowance. It survives flush epochs,
