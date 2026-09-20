@@ -12,6 +12,7 @@ use crate::{
 };
 use super::*;
 pub use super::output::GuardedOutput;
+pub mod quantized;
 
 /// Additional typed-argument cap, also applied to trusted embedding defaults
 /// BEFORE they can be cloned into each document. The transport has its own
