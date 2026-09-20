@@ -14,7 +14,8 @@ mod existing {
 }
 
 fn definition() -> clap::Command {
-    existing::definition().subcommand(crate::redaction_cli::definition()).subcommands(crate::text_cli::definitions())
+    existing::definition().subcommand(crate::redaction_cli::definition())
+        .subcommands(crate::text_cli::definitions()).subcommand(crate::text_batch::definition())
 }
 
 pub fn cli_main() -> ExitCode {
@@ -26,7 +27,7 @@ pub fn cli_main() -> ExitCode {
             if !error.use_stderr() { return if error.print().is_ok() { ExitCode::SUCCESS } else { ErrorCode::Generic.as_process_exit() }; }
             // Never echo arbitrary argv values into redaction diagnostics. Key
             // bytes have no argv option, even on an invalid invocation.
-            if args.get(1).and_then(|s| s.to_str()).is_some_and(|s| s == "redact" || crate::text_cli::TextCommand::recognizes(s)) {
+            if args.get(1).and_then(|s| s.to_str()).is_some_and(|s| s == "redact" || s == "batch" || crate::text_cli::TextCommand::recognizes(s)) {
                 eprintln!("fnlp: invalid task arguments; run the task command with --help");
             } else { let _ = error.print(); }
             return ErrorCode::Usage.as_process_exit();
@@ -41,6 +42,13 @@ pub fn cli_main() -> ExitCode {
     let stdin = io::stdin();
     let terminal = stdin.is_terminal();
     let mut input = stdin.lock();
+    if let Some(("batch", matches)) = matches.subcommand() {
+        let options = match crate::text_batch::BatchCommand::from_arg_matches(matches) {
+            Ok(options) => options,
+            Err(_) => return ErrorCode::Usage.as_process_exit(),
+        };
+        return options.run(&mut input, &mut io::stdout().lock(), &mut io::stderr().lock());
+    }
     if let Some(("redact", matches)) = matches.subcommand() {
         let options = match RedactCommand::from_arg_matches(matches) {
             Ok(options) => options,
@@ -66,8 +74,14 @@ mod task_dispatch_tests {
     fn new_task_and_existing_commands_share_root_help() {
         let mut root = definition();
         let help = root.render_long_help().to_string();
-        for name in ["redact", "tokens", "split", "normalize", "schema", "robot", "convert", "release", "models"] { assert!(help.contains(name)); }
+        for name in ["redact", "tokens", "split", "normalize", "batch", "schema", "robot", "convert", "release", "models"] { assert!(help.contains(name)); }
         assert!(root.try_get_matches_from(["fnlp", "redact", "--rules-only"]).is_ok());
+    }
+    #[test]
+    fn batch_tasks_share_root_dispatch_without_replacing_existing_commands() {
+        for task in ["normalize", "split"] {
+            assert!(definition().try_get_matches_from(["fnlp", "batch", "--task", task]).is_ok());
+        }
     }
     #[test]
     fn existing_schema_arguments_still_parse() {

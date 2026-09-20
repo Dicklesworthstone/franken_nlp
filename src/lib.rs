@@ -20,6 +20,7 @@ pub mod storage;
 pub mod tasks;
 pub mod template;
 pub mod textutil;
+pub mod text_batch;
 mod text_cli;
 pub mod tokenizer;
 pub mod validation;
