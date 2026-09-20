@@ -93,6 +93,11 @@ pub(super) fn preflight(engine: &NlpEngine, limits: RunLimits) -> Result<(), Hos
 // Field order matters on a queued task that is discarded WITHOUT invocation:
 // captured buffers/reservations drop before its completion signal fires.
 struct Package<F, T> { work: F, signal: Completion<T> }
+impl<F, T> Package<F, T> {
+    // Consume the WHOLE package at invocation, forcing closure capture of the
+    // aggregate rather than allowing disjoint field capture to reorder drops.
+    fn into_parts(self) -> (F, Completion<T>) { (self.work, self.signal) }
+}
 struct Completion<T> {
     cleanup: Option<Pending>,
     tracking: Option<Arc<BlockingClosureGuard>>,
@@ -127,7 +132,7 @@ where T: Send + 'static, F: FnOnce(&mut RunControl) -> Result<T, HostedError> + 
     let wrapper = catch_unwind(AssertUnwindSafe(|| engine.resources().runtime().block_on(async move {
         let request_cx = Cx::current().ok_or(HostedError::MissingRuntimeContext)?;
         let mut handle = request_cx.spawn_blocking(move |blocking_cx| {
-            let Package { work, signal } = package;
+            let (work, signal) = package.into_parts();
             // The catch encloses all native work, scope exit and buffer drops.
             // The public error does not copy panic text into task output.
             let result = catch_unwind(AssertUnwindSafe(|| {

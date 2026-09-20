@@ -137,7 +137,7 @@ impl Error for BatchFault {}
 #[derive(Clone, Copy, Debug)]
 pub struct BatchItemFailure { pub fault: BatchFault, pub stop: bool }
 impl BatchItemFailure {
-    pub fn reject(code: BatchCode) -> Self { Self { fault: code.into(), stop: false } }
+    pub fn reject(fault: impl Into<BatchFault>) -> Self { Self { fault: fault.into(), stop: false } }
     pub fn fatal(fault: impl Into<BatchFault>) -> Self { Self { fault: fault.into(), stop: true } }
 }
 

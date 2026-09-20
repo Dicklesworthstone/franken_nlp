@@ -87,3 +87,20 @@ fn unwind_restores_native_entry_marker() {
     assert!(result.is_err());
     assert!(!INSIDE_NATIVE.with(Cell::get));
 }
+
+#[test]
+fn discarded_pool_closure_captures_the_whole_drop_ordered_package() {
+    let count = Arc::new(AtomicUsize::new(0));
+    let probe = Probe(Arc::clone(&count));
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let package = Package::<_, ()> { work: move || drop(probe),
+        signal: Completion { cleanup: None, tracking: None, sender: Some(sender) } };
+    let closure = move || {
+        let (work, signal) = package.into_parts();
+        work(); signal.finish(Ok(()));
+    };
+    drop(closure);
+    assert!(receiver.recv().unwrap().is_none());
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert!(receiver.recv().is_err());
+}

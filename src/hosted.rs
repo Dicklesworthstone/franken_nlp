@@ -23,6 +23,7 @@ use crate::{
         extract::{ExtractionVocabulary, quantized::{Int8ExtractPlan, Int8ExtractRun, Int8ExtractError}}},
 };
 mod dispatch;
+pub mod corpus;
 pub use dispatch::{CancellationToken, RunControl, RunStop};
 
 /// Finite cooperative execution limits, including time spent awaiting the pool.
@@ -84,6 +85,8 @@ pub enum HostedError {
     Native(StrictInt8Error),
     Chat(Int8ChatError),
     Extraction(Int8ExtractError),
+    BatchSetup(crate::batch::BatchFault),
+    Batch(crate::batch::BatchRunError),
 }
 impl fmt::Display for HostedError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -105,6 +108,8 @@ impl fmt::Display for HostedError {
             Self::Native(_) => "hosted native engine construction failed",
             Self::Chat(_) => "hosted native generation or chat failed",
             Self::Extraction(_) => "hosted native extraction failed",
+            Self::BatchSetup(_) => "hosted corpus setup refused",
+            Self::Batch(_) => "hosted corpus failed; inspect the retained summary",
         })
     }
 }
@@ -117,7 +122,7 @@ impl Error for HostedError {
             Self::Reservation(e) => Some(e), Self::Spawn(e) => Some(e),
             Self::Join { source, .. } => Some(source), Self::Scope { source, .. } => Some(source),
             Self::Model(e) => Some(e), Self::Native(e) => Some(e), Self::Chat(e) => Some(e),
-            Self::Extraction(e) => Some(e), _ => None,
+            Self::Extraction(e) => Some(e), Self::BatchSetup(e) => Some(e), Self::Batch(e) => Some(e), _ => None,
         }
     }
 }
@@ -240,6 +245,7 @@ impl NlpEngine {
     /// Execute a compiled schema/source task through the same pool and ledger.
     /// The vocabulary is caller-provided immutable preparation, not rebuilt for
     /// every document. It remains owned until the physical invocation drains.
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_int8_extract(&self, model: &ResidentInt8, prepared: Int8ExtractPlan,
         vocabulary: Arc<ExtractionVocabulary>, native: NativeLimits,
         mask_limits: crate::grammar::mask::MaskWorkLimits, max_mask_node_visits: u64,

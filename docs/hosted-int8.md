@@ -98,3 +98,66 @@ reservation refusal and synchronous re-entry, checking drain and ledger balance.
 It requires no model file and cannot produce an inference-success fixture.
 Rust compilation/tests, controller DSR, real-model runs and performance
 measurements were not executed in the implementation session.
+
+## Whole-corpus methods with built-in admission
+
+`NlpEngine::batch_int8_chat` accepts a shared `Int8ChatPlanner`, optional
+`GenerationBatchArgs` defaults, `Int8BatchLimits`, `CorpusLimits`, and owned
+reader/writer values. `NlpEngine::batch_int8_extract` takes an owned
+`Int8ExtractionBatchPlanner`, shared `ExtractionVocabulary`, corresponding
+`Int8ExtractionBatchLimits`, the same corpus envelope, and owned IO. Both take
+a charged `ResidentInt8` and explicit `CancellationToken`.
+
+Unlike the lower-level adapters, neither method asks the caller to implement
+an admission trait. Both use a concrete admission provider backed by the same
+`EngineLease` and process ledger. Each stream builds one native engine, then
+retains its KV/workspace and the model/vocabulary across all documents. There
+is one blocking crossing and one coordinator-only native scope for the entire
+bounded corpus, not one per document. No neural batch-M, cache-sharing or
+parallel-throughput claim is implied by resident stream execution.
+
+`CorpusLimits` combines `NativeLimits`, the existing bounded `BatchLimits`,
+an explicit preparation reserve and an explicit IO-buffer reserve. Both
+reserves must be nonzero. A conservative checked staging model additionally
+prices line/JSON copies, complete output-line staging and the epoch-ID tree.
+Source/schema/TaskIR compiler memory and any whole-corpus reader or collecting
+writer must be priced by the embedder; a cursor containing the whole input is
+not assumed free. These remain modeled ledger commitments, not an allocator
+interceptor or proof that unknown reader/writer/allocator behavior obeys a
+measured RSS ceiling.
+
+The stream's buffers and preparation reserve are owned together before the
+pool admission. Per-document admission checks the actual resident model,
+strict profile, full KV charge, sampler capacity and maximum result size. It
+then reserves result storage in the real ledger. The output remains a live
+reservation through allocation and final write/flush; because admission
+precedes allocation, it does not falsely claim an allocation has committed.
+The existing GuardedOutput drops result bytes before the reservation's explicit
+abort/release. Corpus-wide KV and sampler storage are not charged again for
+every item. Model and mask work retain their existing nonrefundable ledgers,
+and epoch flush cannot renew wall-time/checkpoint limits or memory authority.
+
+Readers and writers must be `Send + 'static`; they move into the real blocking
+closure, so there is no unsafe borrowing across threads. They are dropped
+before the completion signal. A discarded queued closure captures its complete
+drop-ordered package rather than independently capturing buffer/guard fields.
+The public API returns only the fixed-size `BatchSummary`, not an unaccounted
+collecting writer. External sharing/retention performed by a caller-supplied
+IO implementation remains that caller's responsibility.
+
+A returned summary means the runner reached EOF and flushed its terminal
+record; `summary.failed` still reports document refusals. `HostedError::Batch`
+retains the actual `BatchRunError` and summary. Broken output is never retried
+or followed by an invented error record. Runtime-wrapper failure or late
+cancellation can still make the enclosing call fail after bytes were delivered;
+those bytes are not retracted and no additional terminal record is appended.
+Callers must check both host completion and per-document status. This is not
+an exactly-once delivery, downstream acknowledgement or durable-job API.
+
+Additional regression cases cover concrete admission inputs, profile/model
+mismatch, complete KV/sampler accounting, output limits, checked corpus memory,
+retained summaries, and discarded-closure capture order. The shared rejection
+constructor now accepts either BatchCode or BatchFault, fixing the extraction
+planner's incompatible call without discarding typed fault metadata. The
+existing framing/runner body is otherwise byte-for-byte unchanged. These added
+Rust cases also remain unexecuted in the implementation session.
