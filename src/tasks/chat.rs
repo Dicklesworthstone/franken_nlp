@@ -23,6 +23,7 @@ use super::{BuiltInTask, extract::SourceDocumentEncoder,
     ir::{DecodeBudget, DecodeStrategy, DependencyScope, FinitePostcondition, GrammarReference, PlanContext,
         PromptSegment, PromptSegmentKind, TaskBudget, TaskIR, TaskPlan, TokenSequence}};
 pub mod batched;
+pub mod quantized;
 mod bounds;
 
 pub const CHAT_PROMPT_VERSION: &str = "pinned-segmented-chat-no-thinking-no-tools-v1";
@@ -110,13 +111,23 @@ pub struct ChatResult {
 }
 
 impl ChatPlanner {
-    pub fn pinned(controls: &TemplateControlIds, eos: u32, mut identity: ExecutionIdentity,
+    pub fn pinned(controls: &TemplateControlIds, eos: u32, identity: ExecutionIdentity,
         ceiling: TaskBudget, limits: ChatLimits) -> Result<Self, ChatError> {
+        Self::pinned_for_backend(controls, eos, identity, ceiling, limits, ChatBackend::Eager)
+    }
+    // Only the closed, typed planner constructors select a backend. Never
+    // temporarily relabel an INT8 identity as BF16 to reuse prompt compilation.
+    fn pinned_for_backend(controls: &TemplateControlIds, eos: u32, mut identity: ExecutionIdentity,
+        ceiling: TaskBudget, limits: ChatLimits, backend: ChatBackend) -> Result<Self, ChatError> {
         identity.validate().map_err(|_| ChatError::Identity)?;
         ceiling.validate().map_err(|_| ChatError::Limit("host task ceiling"))?;
-        if identity.numerics_profile != NumericsProfile::HfBf16Eager || identity.kv_dtype != "bf16"
+        if identity.numerics_profile != backend.profile() || identity.kv_dtype != "bf16"
             || identity.thinking_mode != ThinkingMode::Disabled || identity.tool_mode != ToolMode::None {
             return Err(ChatError::Contract("profile/thinking/tools"));
+        }
+        if backend == ChatBackend::Int8
+            && identity.backend_semantic_version != crate::native_engine::strict_int8::STRICT_INT8_EXECUTION {
+            return Err(ChatError::Identity);
         }
         if limits.max_messages == 0 || limits.max_messages > 128 || limits.max_message_bytes == 0
             || limits.max_total_message_bytes == 0 || limits.generation.max_prompt_tokens == 0 {
@@ -159,6 +170,13 @@ impl ChatPlanner {
     }
     fn compile(&self, kind: BuiltInTask, item: &str, sample: u64, messages: &[ChatMessage],
         options: &GenerationOptions, budget: TaskBudget) -> Result<PreparedChat, ChatError> {
+        let input = self.compile_input(kind, messages, options, budget)?;
+        let native = GenerationPlan::compile(input.prompt, input.options, input.identity,
+            item, sample, self.limits.generation)?;
+        Ok(PreparedChat { task: input.task, native, tokenizer: Arc::clone(&self.tokenizer), sample_index: sample })
+    }
+    fn compile_input(&self, kind: BuiltInTask, messages: &[ChatMessage], options: &GenerationOptions,
+        budget: TaskBudget) -> Result<ChatInput, ChatError> {
         // Reject invalid/oversized caller-owned option collections before
         // rendering, tokenizing messages or cloning them into a sealed plan.
         options.validate(self.limits.generation)?;
@@ -217,8 +235,7 @@ impl ChatPlanner {
         // Request options cannot turn role/thinking controls back on. Exact
         // rendered scaffold controls remain allowed only in the input prompt.
         effective.banned_token_ids.extend(self.controls.ids().iter().copied().filter(|&id| id != self.eos));
-        let native = GenerationPlan::compile(prompt, effective, identity, item, sample, self.limits.generation)?;
-        Ok(PreparedChat { task, native, tokenizer: Arc::clone(&self.tokenizer), sample_index: sample })
+        Ok(ChatInput { task, prompt, options: effective, identity })
     }
 }
 impl PreparedChat {
@@ -244,12 +261,46 @@ impl PreparedChat {
         self.finish(raw)
     }
     fn finish(&self, raw: GeneratedSequence) -> Result<ChatResult, ChatError> {
-        let p = self.native.options();
+        ChatCompletion { task: &self.task, tokenizer: &self.tokenizer, options: self.native.options(),
+            sample_index: self.sample_index, prompt_tokens: self.native.prompt_tokens(),
+            max_forward_positions: self.native.planned_work().forward_positions, backend: ChatBackend::Eager }.finish(raw)
+    }
+}
+
+struct ChatInput {
+    task: TaskPlan, prompt: Vec<u32>, options: GenerationOptions, identity: ExecutionIdentity,
+}
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ChatBackend { Eager, Int8 }
+impl ChatBackend {
+    fn profile(self) -> NumericsProfile {
+        match self { Self::Eager => NumericsProfile::HfBf16Eager, Self::Int8 => NumericsProfile::StrictQuantized { version: 1 } }
+    }
+    fn label(self) -> &'static str {
+        match self { Self::Eager => HF_BF16_EAGER_PROFILE, Self::Int8 => crate::native_engine::strict_int8::STRICT_INT8_PROFILE }
+    }
+    fn accepts(self, execution: &str) -> bool {
+        match self {
+            Self::Eager => execution == GENERATION_VERSION || execution == BATCH_GENERATION_VERSION,
+            Self::Int8 => execution == crate::native_engine::generation::quantized::INT8_GENERATION_VERSION,
+        }
+    }
+}
+
+// Independent task checks shared across explicitly separated native drivers.
+// An arbitrary wire profile/version cannot select different validation rules.
+struct ChatCompletion<'a> {
+    task: &'a TaskPlan, tokenizer: &'a EmbeddedTokenizer, options: &'a GenerationOptions,
+    sample_index: u64, prompt_tokens: usize, max_forward_positions: u64, backend: ChatBackend,
+}
+impl ChatCompletion<'_> {
+    fn finish(self, raw: GeneratedSequence) -> Result<ChatResult, ChatError> {
+        let p = self.options;
         let expected_seed = match &p.sampling { GenerationSampling::Greedy => None,
             GenerationSampling::Seeded { effective_seed, .. } => Some(Seed256::from(*effective_seed).to_lower_hex()) };
-        let selective_projection = raw.execution == BATCH_GENERATION_VERSION;
-        if raw.schema_version != 1 || (raw.execution != GENERATION_VERSION && !selective_projection)
-            || raw.numerics_profile != HF_BF16_EAGER_PROFILE
+        let selective_projection = self.backend == ChatBackend::Int8 || raw.execution == BATCH_GENERATION_VERSION;
+        if raw.schema_version != 1 || !self.backend.accepts(&raw.execution)
+            || raw.numerics_profile != self.backend.label()
             || raw.sample_index != self.sample_index || raw.effective_seed != expected_seed
             || raw.token_ids.len() > p.max_new_tokens || raw.content_bytes.len() > p.max_output_bytes
             || raw.token_ids.iter().any(|&id| id as usize >= NANBEIGE_VOCAB_SIZE || p.banned_token_ids.binary_search(&id).is_ok()) {
@@ -268,12 +319,12 @@ impl PreparedChat {
         if decoded != raw.content_bytes { return Err(ChatError::NoResult("exact content bytes")); }
         let proposals = raw.token_ids.len().checked_add(usize::from(raw.finish_reason == GenerationFinish::ByteLimit))
             .ok_or(ChatError::NoResult("work arithmetic"))?;
-        let positions = self.native.prompt_tokens().checked_add(proposals).and_then(|n| n.checked_sub(1)).ok_or(ChatError::NoResult("work arithmetic"))? as u64;
+        let positions = self.prompt_tokens.checked_add(proposals).and_then(|n| n.checked_sub(1)).ok_or(ChatError::NoResult("work arithmetic"))? as u64;
         let sampled = if expected_seed.is_some() { proposals as u64 } else { 0 };
-        // Batch execution intentionally skips intermediate prompt lm heads.
+        // Batched eager and INT8 execution skip intermediate prompt lm heads.
         // Do not weaken the denominator check or rewrite work to look scalar.
         let projection_rows = if selective_projection { proposals as u64 } else { positions };
-        if raw.native_work.forward_positions != positions || positions > self.native.planned_work().forward_positions
+        if raw.native_work.forward_positions != positions || positions > self.max_forward_positions
             || projection_rows.checked_mul(NANBEIGE_VOCAB_SIZE as u64) != Some(raw.native_work.projected_logits)
             || raw.native_work.sampled_steps != sampled { return Err(ChatError::NoResult("native work")); }
         match (&raw.token_logprobs, raw.logprob_score_space, p.capture_logprobs) {
