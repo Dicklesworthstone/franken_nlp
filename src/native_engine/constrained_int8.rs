@@ -242,7 +242,14 @@ fn select(logits: &[f32], mask: &DenseTokenMask, accepting: bool, options: &Json
 fn drive<V, D, T, E, F>(prompt: &[u32], program: &JsonProgram, vocabulary: &V,
     options: &JsonDecodeOptions, budget: Int8JsonBudget, driver: &mut D, finalize: F) -> Result<T, E>
 where V: Vocabulary, D: Driver, E: From<Int8JsonError>, F: FnOnce(Int8JsonRun) -> Result<T, E> {
-    let result = run(prompt, program, vocabulary, options, budget, driver).map_err(E::from).and_then(finalize);
+    let result = run(prompt, program, vocabulary, options, budget, driver).map_err(E::from).and_then(|run| {
+        let next_token = run.output.token_ids.len();
+        let output = finalize(run)?;
+        if let Some(cause) = driver.control().checkpoint(next_token) {
+            return Err(E::from(JsonDecodeError::Cancelled(cause).into()));
+        }
+        Ok(output)
+    });
     if result.is_err() { driver.abort(); }
     result
 }

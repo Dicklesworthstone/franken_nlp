@@ -222,3 +222,40 @@ fn successful_replay_has_identical_content_and_complete_work() {
     }
     assert_eq!(outputs[0], outputs[1]);
 }
+
+#[test]
+fn cancellation_after_finalization_is_not_a_successful_result() {
+    let p = program(r#"{"type":"boolean"}"#); let v = table(&[b"", b"true"]);
+    let mut d = Script::new(vec![0.0, 1.0]); d.control.step = Some(2);
+    let mut finalized = false;
+    let result: Result<(), Int8JsonError> = drive(&[1], &p, &v, &options(2), budget(1, 2, 2), &mut d, |_| {
+        finalized = true; Ok(())
+    });
+    assert!(finalized); assert!(d.aborted); assert!(result.unwrap_err().cancellation().is_some());
+}
+
+#[test]
+fn profile_and_actual_weight_identity_must_both_match() {
+    let digest = Sha256Digest::of_bytes(b"synthetic-model");
+    let identity = ExecutionIdentity {
+        schema_version: 1, source_revision: "fixture".to_owned(), logical_model_digest: digest,
+        artifact_format: "fixture".to_owned(), quant_recipe: "portable-quant-v1".to_owned(), packing_set_digest: digest,
+        tokenizer_digest: digest, template_digest: digest, task_spec: "extract-v1".to_owned(), taskir_digest: digest,
+        prompt_digest: digest, grammar_compiler_version: "fixture".to_owned(), schema_digest: digest,
+        numerics_profile: NumericsProfile::StrictQuantized { version: 1 }, kv_dtype: "bf16".to_owned(),
+        sampler_version: "fixture".to_owned(), thinking_mode: ThinkingMode::Disabled, tool_mode: ToolMode::None,
+        calibration_digest: digest, decision_policy_digest: digest, backend_semantic_version: STRICT_INT8_EXECUTION.to_owned(),
+        host_class: None, compiler_identity: None,
+    };
+    let source = ArtifactIdentity { model_id: "Nanbeige4.2-3B".to_owned(), revision: identity.source_revision.clone(),
+        recipe_id: identity.quant_recipe.clone(), source_root_sha256: digest.to_hex(), logical_model_sha256: digest.to_hex() };
+    check_model(&identity, &source).unwrap();
+    for axis in 0..4 {
+        let mut bad = source.clone();
+        match axis { 0 => bad.model_id = "other".to_owned(), 1 => bad.revision = "other".to_owned(),
+            2 => bad.recipe_id = "other".to_owned(), _ => bad.logical_model_sha256 = Sha256Digest::of_bytes(b"other").to_hex() }
+        assert!(check_model(&identity, &bad).is_err());
+    }
+    let mut bad = identity; bad.numerics_profile = NumericsProfile::HfBf16Eager;
+    assert!(check_model(&bad, &source).is_err());
+}

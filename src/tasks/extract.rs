@@ -31,6 +31,7 @@ use crate::{
 use super::ir::{DecodeStrategy, DependencyScope, FinitePostcondition, GrammarReference, PromptSegmentKind, ScoreSpace, TaskIR, TaskPlan};
 
 pub mod grounded;
+pub mod quantized;
 pub mod semantic;
 pub use grounded::{SourceDocument, SourceDocumentEncoder};
 
@@ -281,7 +282,13 @@ impl ExtractPlan {
     }
 
     fn finalize(&self, output: JsonDecodeOutput) -> Result<ExtractResult, ExtractError> {
-        if output.schema_version != 1 || output.numerics_profile != HF_BF16_EAGER_PROFILE
+        self.finalize_profile(output, HF_BF16_EAGER_PROFILE)
+    }
+
+    // Only closed native task drivers choose this profile. Public eager
+    // finalization retains its exact original profile refusal.
+    fn finalize_profile(&self, output: JsonDecodeOutput, profile: &str) -> Result<ExtractResult, ExtractError> {
+        if output.schema_version != 1 || output.numerics_profile != profile
             || output.token_ids.is_empty() || output.token_ids.len() > self.options.max_new_tokens
             || output.token_ids.last() != Some(&self.options.eos_token_id)
         { return Err(ExtractError::InvalidResult); }
