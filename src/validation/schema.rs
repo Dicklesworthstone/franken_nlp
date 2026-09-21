@@ -17,9 +17,9 @@ pub enum ValidationErrorKind {
     Grounding,
 }
 
-/// A safe-to-log validation failure.  It identifies a pointer and location but
-/// never retains the complete untrusted document or private source text.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// A validation failure with safe default formatting and explicit access to
+/// private pointer metadata. Property names must not escape through logging.
+#[derive(Clone, Eq, PartialEq)]
 pub struct ValidationError {
     kind: ValidationErrorKind,
     pointer: String,
@@ -33,6 +33,8 @@ impl ValidationError {
         self.kind
     }
 
+    /// Explicit diagnostic access. This may contain untrusted property names
+    /// or caller-supplied grounding pointers, including terminal controls.
     pub fn pointer(&self) -> &str {
         &self.pointer
     }
@@ -77,7 +79,7 @@ impl ValidationError {
 
 impl fmt::Display for ValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "validation {:?} at {}", self.kind, self.pointer)?;
+        write!(formatter, "validation {:?}", self.kind)?;
         if let Some(byte_offset) = self.byte_offset {
             write!(formatter, " byte {byte_offset}")?;
         }
@@ -85,6 +87,12 @@ impl fmt::Display for ValidationError {
             write!(formatter, " scalar {scalar_offset}")?;
         }
         write!(formatter, ": {}", self.expected)
+    }
+}
+
+impl fmt::Debug for ValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
     }
 }
 
@@ -393,5 +401,65 @@ fn parent_pointer(pointer: &str) -> String {
         "$".to_owned()
     } else {
         pointer[..index].to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grammar::{CompileLimits, compile_json_schema};
+
+    fn assert_private(error: &ValidationError) {
+        assert!(error.pointer().contains("PRIVATE"));
+        for rendered in [format!("{error}"), format!("{error:?}"), format!("{error:#?}")] {
+            assert!(!rendered.contains("PRIVATE"));
+            assert!(!rendered.chars().any(char::is_control));
+            assert!(rendered.contains(error.expected()));
+        }
+    }
+
+    #[test]
+    fn unexpected_property_errors_keep_locations_but_do_not_log_names() {
+        let schema = compile_json_schema(
+            r#"{"type":"object","additionalProperties":false,"properties":{}}"#,
+            CompileLimits::default(),
+        ).unwrap();
+        let input = r#"{"PRIVATE\n\u001b[31m/é~":0}"#;
+        let error = validate_json(schema.root(), input).unwrap_err();
+        let offset = input.rfind('0').unwrap();
+        assert_eq!(error.kind(), ValidationErrorKind::Constraint);
+        assert_eq!(error.pointer(), "/PRIVATE\n\u{001b}[31m~1é~0");
+        assert_eq!(error.byte_offset(), Some(offset));
+        assert_eq!(error.scalar_offset(), Some(input[..offset].chars().count()));
+        assert_private(&error);
+    }
+
+    #[test]
+    fn parser_error_conversion_does_not_reintroduce_private_names() {
+        let original = super::super::parse_json(r#"{"PRIVATE\n\u001b":tru}"#).unwrap_err();
+        let pointer = original.pointer().to_owned();
+        let offset = original.byte_offset();
+        let error = ValidationError::from(original);
+        assert_eq!(error.kind(), ValidationErrorKind::Parse);
+        assert_eq!(error.pointer(), pointer);
+        assert_eq!(error.byte_offset(), Some(offset));
+        assert_private(&error);
+    }
+
+    #[test]
+    fn caller_supplied_grounding_pointers_are_private_diagnostics_too() {
+        let schema = compile_json_schema(
+            r#"{"type":"string","x-fnlp-source":"verbatim"}"#,
+            CompileLimits::default(),
+        ).unwrap();
+        let grounding = GroundedValue {
+            json_pointer: "/PRIVATE\n\u{001b}[31m",
+            source: "PRIVATE_SOURCE",
+            span: SourceSpan::new(0, 1, 0, 1),
+        };
+        let error = validate_with_grounding(schema.root(), r#""a""#, &[grounding]).unwrap_err();
+        assert_eq!(error.kind(), ValidationErrorKind::Grounding);
+        assert_eq!(error.pointer(), grounding.json_pointer);
+        assert_private(&error);
     }
 }
