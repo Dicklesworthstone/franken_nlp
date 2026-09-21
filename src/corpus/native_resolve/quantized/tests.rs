@@ -269,3 +269,20 @@ fn typed_cancellation_survives_source_planning_and_scorer_wrappers() {
         assert_eq!(format!("{e}"), format!("{e:?}"));
     }
 }
+
+#[test]
+fn no_model_finalization_cannot_skip_required_comparisons() {
+    let p = planner(); let d = docs(); let plan = core(&d);
+    assert!(matches!(prepared(&p, &plan).finalize_without_model(&mut Continue), Err(Int8ResolveError::Accounting)));
+    let d = &d[..1]; let plan = core(d);
+    let run = prepared(&p, &plan).finalize_without_model(&mut Continue).unwrap();
+    assert!(!run.model_evaluated); assert_eq!(run.head_count, 0); assert_eq!(run.result.clusters.len(), 1);
+}
+#[test]
+fn no_model_finalization_still_observes_cancellation() {
+    struct Stop;
+    impl DecodeStepControl for Stop { fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { Some(DecodeCancellationKind::Shutdown) } }
+    let p = planner(); let d = docs(); let plan = core(&d[..1]);
+    let error = prepared(&p, &plan).finalize_without_model(&mut Stop).err().unwrap();
+    assert_eq!(error.cancellation(), Some(DecodeCancellationKind::Shutdown));
+}

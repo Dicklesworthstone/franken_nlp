@@ -176,6 +176,17 @@ impl PreparedInt8Resolution<'_, '_, '_> {
         }
         Ok(())
     }
+    /// A source-validated graph without candidate pairs needs no native KV,
+    /// scratch or engine. This cannot skip any required comparison: nonempty
+    /// commitments are refused, not replaced with lexical merge decisions.
+    pub fn finalize_without_model<C: DecodeStepControl>(self, control: &mut C)
+        -> Result<Int8ResolutionRun, Int8ResolveError> {
+        if self.pair_count() != 0 || self.work != Int8Work::default() {
+            return Err(Int8ResolveError::Accounting);
+        }
+        self.execute_heads(&[], control, |_, _, _, _, _| Err(Int8ResolveError::Accounting))
+    }
+
     /// The caller keeps process/preparation/output reservations through actual
     /// delivery. This borrows one native engine and discards every partial
     /// assessment on failure. No loader, runtime, retries or pair-local budget
