@@ -21,6 +21,8 @@ use crate::{
     },
 };
 
+pub mod long;
+
 pub const INT8_SOURCE_EXECUTION: &str = "portable-int8-source-portfolio-v1";
 
 /// Debug/Display redact nested source/compiler content. Typed causes remain
