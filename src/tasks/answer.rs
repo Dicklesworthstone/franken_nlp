@@ -308,9 +308,13 @@ fn citation(quote: String, pointer: &str, proof: SourceFieldEvidence, passages: 
 // decoder's independently verified ExtractResult in production.
 fn finalize(raw: ExtractResult, passages: &[PassageLayout], options: AnswerOptions,
     max_bytes: u64) -> Result<AnswerResult, AnswerError> {
+    finalize_profile(raw, passages, options, max_bytes, HF_BF16_EAGER_PROFILE)
+}
+fn finalize_profile(raw: ExtractResult, passages: &[PassageLayout], options: AnswerOptions,
+    max_bytes: u64, expected_profile: &str) -> Result<AnswerResult, AnswerError> {
     options.validate()?;
     if passages.is_empty() || raw.schema_version != 2 || raw.task_spec_version != ANSWER_TASK_VERSION
-        || raw.output.schema_version != 1 || raw.output.numerics_profile != HF_BF16_EAGER_PROFILE
+        || raw.output.schema_version != 1 || raw.output.numerics_profile != expected_profile
         || raw.score_space != ScoreSpace::NotComputed || raw.grounding != ExtractionGrounding::SourceMembership
     { return Err(AnswerError::InvalidResult); }
     let cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
@@ -510,6 +514,13 @@ mod tests {
         for absent in ["confidence", "prompt_digest", "document_digest"] { assert!(!json.contains(absent)); }
     }
     #[test]
+    fn eager_answer_finalizer_still_rejects_quantized_output() {
+        let c = context(&[("p", "Alice")]);
+        let mut value = raw(&c, ABSTAIN);
+        value.output.numerics_profile = crate::native_engine::strict_int8::STRICT_INT8_PROFILE.to_owned();
+        assert!(finalize(value, &c.passages, options(), 16384).is_err());
+    }
+    #[test]
     fn wrong_task_duplicate_keys_and_cancellation_cannot_become_abstention() {
         let c = context(&[("p", "Alice")]);
         for mode in 0..3 {
@@ -522,5 +533,21 @@ mod tests {
         use crate::native_engine::{constrained::JsonDecodeError, decode::DecodeCancellationKind};
         let error: AnswerError = ExtractError::Decode(JsonDecodeError::Cancelled(DecodeCancellationKind::Deadline)).into();
         assert!(matches!(error, AnswerError::Extraction(ExtractError::Decode(JsonDecodeError::Cancelled(DecodeCancellationKind::Deadline)))));
+    }
+}
+
+// The source planner transfers only passage metadata after compiling the
+// shared source grammar. No second retained question/source/token buffer.
+pub(super) struct Int8AnswerFinalizer { passages: Vec<PassageLayout> }
+impl AnswerContext {
+    pub(super) fn into_int8_finalizer(self) -> Int8AnswerFinalizer {
+        Int8AnswerFinalizer { passages: self.passages }
+    }
+}
+impl Int8AnswerFinalizer {
+    pub(super) fn finish(&self, raw: ExtractResult, options: AnswerOptions, max_bytes: u64)
+        -> Result<AnswerResult, AnswerError> {
+        finalize_profile(raw, &self.passages, options, max_bytes,
+            crate::native_engine::strict_int8::STRICT_INT8_PROFILE)
     }
 }

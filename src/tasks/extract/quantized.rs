@@ -97,6 +97,16 @@ impl Int8ExtractPlan {
         Ok(Self { extraction, identity, work })
     }
 
+    // Called only while compiling a shipped source task, before admission.
+    // The same resulting identity then reaches every layer unchanged.
+    pub(crate) fn with_finalizer_version(mut self, version: &'static str) -> Result<Self, Int8ExtractError> {
+        self.identity.decision_policy_digest = Sha256Digest::of_bytes(&canonjson::canonical_bytes(&(
+            "int8-built-in-finalizer-v1", version, self.identity.decision_policy_digest,
+        )).map_err(|_| ExtractError::Serialization)?);
+        self.identity.validate().map_err(|_| Int8ExtractError::Identity)?;
+        Ok(self)
+    }
+
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     pub fn prompt_tokens(&self) -> usize { self.extraction.prompt.len() }
     pub fn options(&self) -> &JsonDecodeOptions { &self.extraction.options }
@@ -114,16 +124,29 @@ impl Int8ExtractPlan {
     }
 
     pub fn execute<C: DecodeStepControl>(&self, engine: &mut StrictInt8Engine<'_>, admitted: &ExecutionIdentity,
-        vocabulary: &ExtractionVocabulary, mut budget: Int8JsonBudget, control: &mut C)
+        vocabulary: &ExtractionVocabulary, budget: Int8JsonBudget, control: &mut C)
         -> Result<Int8ExtractRun, Int8ExtractError> {
-        self.verify_identity(admitted)?;
+        self.execute_with(engine, admitted, vocabulary, budget, control, Ok)
+    }
+
+    /// Statically composed built-in finalization remains INSIDE the native
+    /// session. Semantic/output failure and late cancellation poison/drain it;
+    /// no caller-defined public callback can manufacture a native result.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_with<C, T, E, F>(&self, engine: &mut StrictInt8Engine<'_>,
+        admitted: &ExecutionIdentity, vocabulary: &ExtractionVocabulary,
+        mut budget: Int8JsonBudget, control: &mut C, finalize: F) -> Result<T, E>
+    where C: DecodeStepControl, E: From<Int8ExtractError> + From<Int8JsonError>,
+        F: FnOnce(Int8ExtractRun) -> Result<T, E> {
+        self.verify_identity(admitted).map_err(E::from)?;
         if vocabulary.controls != self.extraction.controls {
-            return Err(ExtractError::Contract("vocabulary control registry differs from int8 plan").into());
+            return Err(E::from(Int8ExtractError::from(ExtractError::Contract(
+                "vocabulary control registry differs from int8 plan"))));
         }
         budget.json.max_kv_bytes = budget.json.max_kv_bytes.min(self.extraction.max_kv_bytes);
         constrained_int8::decode_json_int8_with(engine, admitted, &self.extraction.prompt,
             &self.extraction.program, &vocabulary.oracle, &self.extraction.options, budget, control,
-            |run| self.finalize(run))
+            |run| finalize(self.finalize(run).map_err(E::from)?))
     }
 
     fn finalize(&self, run: Int8JsonRun) -> Result<Int8ExtractRun, Int8ExtractError> {
@@ -148,7 +171,7 @@ impl Int8ExtractPlan {
 // Check the OUTER envelope, including all source evidence and model work. The
 // bounded counting pass precedes canonical tree/byte allocation. Only trusted
 // statically typed result serializers reach this internal boundary.
-fn check_size(value: &impl Serialize, cap: u64) -> Result<(), ExtractError> {
+pub(crate) fn check_size(value: &impl Serialize, cap: u64) -> Result<(), ExtractError> {
     struct Counter { remaining: u64, overflow: bool }
     impl Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {

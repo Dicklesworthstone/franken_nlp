@@ -197,7 +197,7 @@ fn citation(quote: String, pointer: &str, proof: SourceFieldEvidence, max_scalar
 
 // Only the shared decoder's independently verified source result can reach this
 // private conversion in production. Parsing never promotes caller-provided JSON.
-fn finalize(raw: ExtractResult, options: SummaryOptions, max_bytes: u64) -> Result<SummaryResult, SummaryError> {
+pub(super) fn finalize(raw: ExtractResult, options: SummaryOptions, max_bytes: u64) -> Result<SummaryResult, SummaryError> {
     options.validate()?;
     if raw.schema_version != 2 || raw.task_spec_version != SUMMARIZE_TASK_VERSION
         || raw.score_space != ScoreSpace::NotComputed || raw.grounding != ExtractionGrounding::SourceMembership

@@ -205,7 +205,7 @@ impl NerPlan {
 
 // Private conversion: only the extraction core's independently verified result
 // reaches this from production. No public deserialize-to-authority shortcut.
-fn finalize(raw: ExtractResult, options: &NerOptions, max_bytes: u64) -> Result<NerResult, NerError> {
+pub(super) fn finalize(raw: ExtractResult, options: &NerOptions, max_bytes: u64) -> Result<NerResult, NerError> {
     if raw.schema_version != 2 || raw.task_spec_version != NER_TASK_VERSION
         || raw.score_space != ScoreSpace::NotComputed || raw.grounding != ExtractionGrounding::SourceMembership
     { return Err(NerError::InvalidResult); }

@@ -163,7 +163,7 @@ impl KeyphrasePlan {
 
 // Only independently source-verified decoder output reaches this in production.
 // Deserializing a KeyphraseResult never grants execution or evidence authority.
-fn finalize(raw: ExtractResult, options: KeyphraseOptions, max_bytes: u64) -> Result<KeyphraseResult, KeyphraseError> {
+pub(super) fn finalize(raw: ExtractResult, options: KeyphraseOptions, max_bytes: u64) -> Result<KeyphraseResult, KeyphraseError> {
     options.validate()?;
     if raw.schema_version != 2 || raw.task_spec_version != KEYPHRASES_TASK_VERSION
         || raw.score_space != ScoreSpace::NotComputed || raw.grounding != ExtractionGrounding::SourceMembership
