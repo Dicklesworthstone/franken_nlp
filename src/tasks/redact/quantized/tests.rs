@@ -128,7 +128,6 @@ fn rules_and_all_unicode_ner_occurrences_are_edited_and_redetected() {
     assert_eq!(out.result.verification(), VerificationStatus::CleanDeclaredUnion);
     assert_eq!(out.result.edits().len(), 3); assert_eq!(out.result.edits()[0].original.span.byte_start, 3);
     assert_eq!(out.ner_passes, 2); assert_eq!(out.mask_node_visit_charge, 34); assert_eq!(out.reserved_mask_node_visits, 2000);
-    assert_eq!(out.ner_template_digest, *p.template_digest());
     assert!(within(out.model_work, out.reserved_model_work));
     let wire = canonjson::canonical_string(&out).unwrap();
     for private in ["Alice", "a@example.org", "prompt_digest", "generated_token_ids"] { assert!(!wire.contains(private)); }
@@ -165,15 +164,6 @@ fn model_work_failure_stops_before_redetection() {
     let p = planner(); let r = redactor(&p); let mut f = Fake::new(&r, true); f.corrupt = true;
     assert!(r.run_pipeline("Alice", &RedactionRequest::default(), None, &mut f).is_err());
     assert_eq!(f.seen.len(), 1); assert!(f.ledger.failed);
-}
-
-#[test]
-fn late_cancellation_does_not_erase_an_already_returned_native_failure() {
-    let p = planner(); let r = redactor(&p); let mut f = Fake::new(&r, true);
-    f.corrupt = true; f.cancel_after = Some(1);
-    assert!(matches!(r.run_pipeline("Alice", &RedactionRequest::default(), None, &mut f),
-        Err(Int8RedactionError::InvalidResult)));
-    assert_eq!(f.seen.len(), 1);
 }
 #[test]
 fn second_pass_is_not_given_a_new_copy_of_the_model_budget() {

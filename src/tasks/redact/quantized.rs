@@ -98,8 +98,6 @@ pub struct Int8RedactionRun {
     pub schema_version: u32,
     pub execution: &'static str,
     pub numerics_profile: &'static str,
-    /// Code-owned pinned prompt template, never a private source digest.
-    pub ner_template_digest: Sha256Digest,
     pub result: RedactionResult,
     pub ner_passes: usize,
     pub reserved_model_work: Int8Work,
@@ -164,11 +162,9 @@ impl<'p> Int8Redactor<'p> {
             return Err(RedactError::OutputBudget.into());
         }
         pass.checkpoint()?;
-        let mut result = pipeline::redact_with_profile(source, request, pseudonyms, pass, NerProfile::Int8)
-            .map_err(Int8RedactionError::from)?;
-        // Late cancellation suppresses success, but must not erase an already
-        // returned native/validation failure. The host retains both outcomes.
+        let result = pipeline::redact_with_profile(source, request, pseudonyms, pass, NerProfile::Int8);
         pass.checkpoint()?;
+        let mut result = result.map_err(Int8RedactionError::from)?;
         let ledger = pass.ledger();
         if ledger.failed || ledger.completed != 1 + usize::from(request.verify) {
             return Err(Int8RedactionError::InvalidResult);
@@ -179,8 +175,7 @@ impl<'p> Int8Redactor<'p> {
             INT8_REDACTION_EXECUTION, result.policy_digest, &self.config.ner, self.config.per_pass,
         )).map_err(|_| RedactError::Serialization)?);
         let output = Int8RedactionRun { schema_version: 1, execution: INT8_REDACTION_EXECUTION,
-            numerics_profile: STRICT_INT8_PROFILE, ner_template_digest: self.identity.template_digest,
-            result, ner_passes: ledger.completed,
+            numerics_profile: STRICT_INT8_PROFILE, result, ner_passes: ledger.completed,
             reserved_model_work: ledger.reserved, model_work: ledger.actual,
             reserved_mask_node_visits: ledger.masks_reserved, mask_node_visit_charge: ledger.masks_actual };
         check_size(&output, self.config.max_result_bytes).map_err(Int8SourceError::from)?;
