@@ -326,8 +326,9 @@ pub enum JsonParseErrorKind {
     Resource,
 }
 
-/// Typed parser error with a byte location but never a private input echo.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Typed parser error with a byte location and private pointer metadata.
+/// Default formatting never echoes untrusted property names or controls.
+#[derive(Clone, Eq, PartialEq)]
 pub struct JsonParseError {
     kind: JsonParseErrorKind,
     pointer: String,
@@ -340,6 +341,8 @@ impl JsonParseError {
         self.kind
     }
 
+    /// Explicit diagnostic access. Property names are untrusted input and may
+    /// contain private text or terminal controls; do not log this by default.
     pub fn pointer(&self) -> &str {
         &self.pointer
     }
@@ -357,9 +360,15 @@ impl fmt::Display for JsonParseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "validation JSON {:?} at {} (byte {}): {}",
-            self.kind, self.pointer, self.byte_offset, self.reason
+            "validation JSON {:?} (byte {}): {}",
+            self.kind, self.byte_offset, self.reason
         )
+    }
+}
+
+impl fmt::Debug for JsonParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
     }
 }
 
@@ -416,6 +425,9 @@ fn parse_json_with_locations_and_limits(
         offset: 0,
         limits,
         locations: BTreeMap::new(),
+        location_cursor: JsonLocation { byte_offset: 0, scalar_offset: 0 },
+        #[cfg(test)]
+        location_scan_bytes: 0,
     }
     .parse_document()
 }
@@ -425,9 +437,23 @@ struct Parser<'a> {
     offset: usize,
     limits: JsonLimits,
     locations: BTreeMap<String, JsonLocation>,
+    // Parsing never backtracks. Count source scalars only between successive
+    // value starts, rather than rescanning the whole prefix for every node.
+    location_cursor: JsonLocation,
+    #[cfg(test)]
+    location_scan_bytes: usize,
 }
 
 impl<'a> Parser<'a> {
+    fn current_location(&mut self) -> JsonLocation {
+        let traversed = &self.input[self.location_cursor.byte_offset..self.offset];
+        #[cfg(test)]
+        { self.location_scan_bytes += traversed.len(); }
+        self.location_cursor.scalar_offset += traversed.chars().count();
+        self.location_cursor.byte_offset = self.offset;
+        self.location_cursor
+    }
+
     fn parse_document(mut self) -> Result<ParsedJson, JsonParseError> {
         self.skip_whitespace();
         let value = self.parse_value(0, "$")?;
@@ -454,12 +480,10 @@ impl<'a> Parser<'a> {
             ));
         }
         self.skip_whitespace();
+        let location = self.current_location();
         self.locations
             .entry(pointer.to_owned())
-            .or_insert(JsonLocation {
-                byte_offset: self.offset,
-                scalar_offset: self.input[..self.offset].chars().count(),
-            });
+            .or_insert(location);
         match self.peek() {
             Some(b'{') => self.parse_object(depth + 1, pointer),
             Some(b'[') => self.parse_array(depth + 1, pointer),
@@ -869,5 +893,114 @@ fn pointer_index(parent: &str, index: usize) -> String {
         format!("/{index}")
     } else {
         format!("{parent}/{index}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nested_locations_count_original_unicode_and_escape_bytes_exactly() {
+        let input = " \n{\"é/~\": [\"🦀\", \"\\uD83D\\uDE00\", {}, []], \"last\": false } ";
+        let parsed = parse_json_with_locations(input).unwrap();
+        let expected = [
+            ("$", input.find('{').unwrap()),
+            ("/é~1~0", input.find('[').unwrap()),
+            ("/é~1~0/0", input.find("\"🦀\"").unwrap()),
+            ("/é~1~0/1", input.find("\"\\uD83D").unwrap()),
+            ("/é~1~0/2", input.find("{}").unwrap()),
+            ("/é~1~0/3", input.find("[]").unwrap()),
+            ("/last", input.find("false").unwrap()),
+        ];
+        assert_eq!(parsed.locations.len(), expected.len());
+        for (pointer, byte_offset) in expected {
+            assert_eq!(parsed.locations[pointer], JsonLocation {
+                byte_offset,
+                scalar_offset: input[..byte_offset].chars().count(),
+            });
+        }
+    }
+
+    #[test]
+    fn many_values_do_not_rescan_a_large_prefix_for_locations() {
+        let count = JsonLimits::default().max_container_entries;
+        let padding = " ".repeat(128 * 1024);
+        let values = vec!["0"; count].join(",");
+        let input = format!("[{padding}{values}]");
+        assert!(input.len() <= JsonLimits::default().max_input_bytes);
+        let mut parser = Parser {
+            input: &input,
+            offset: 0,
+            limits: JsonLimits::default(),
+            locations: BTreeMap::new(),
+            location_cursor: JsonLocation { byte_offset: 0, scalar_offset: 0 },
+            location_scan_bytes: 0,
+        };
+        parser.parse_value(0, "$").unwrap();
+        assert_eq!(parser.offset, input.len());
+        assert_eq!(parser.locations.len(), count + 1);
+        for index in 0..count {
+            let byte_offset = 1 + padding.len() + 2 * index;
+            assert_eq!(parser.locations[&format!("/{index}")], JsonLocation {
+                byte_offset,
+                scalar_offset: byte_offset,
+            });
+        }
+        // Count bytes in the actual slices consumed by current_location,
+        // rather than relying on a timing threshold or a replacement parser.
+        assert_eq!(parser.location_scan_bytes, input.len() - 2);
+        let end = parser.current_location();
+        assert_eq!(end.byte_offset, input.len());
+        assert_eq!(end.scalar_offset, input.len());
+        assert_eq!(parser.location_scan_bytes, input.len());
+        assert_eq!(parser.current_location(), end);
+        assert_eq!(parser.location_scan_bytes, input.len());
+    }
+
+    #[test]
+    fn malformed_values_after_unicode_keep_the_same_byte_location() {
+        let input = r#"["é", "\uD83D\uDE00", {"x":}]"#;
+        let error = parse_json(input).unwrap_err();
+        assert_eq!(error.kind(), JsonParseErrorKind::Syntax);
+        assert_eq!(error.pointer(), "/2/x");
+        assert_eq!(error.byte_offset(), input.find('}').unwrap());
+    }
+
+    #[test]
+    fn private_property_names_never_escape_parser_error_formatting() {
+        let cases = [
+            (r#"{"PRIVATE\n\u001b[31m/é~":tru}"#, JsonParseErrorKind::Syntax),
+            (
+                r#"{"PRIVATE\n\u001b[31m/é~":0,"PRIVATE\n\u001b[31m/é~":1}"#,
+                JsonParseErrorKind::DuplicateKey,
+            ),
+            (r#"{"PRIVATE\n\u001b[31m/é~":1e309}"#, JsonParseErrorKind::Numeric),
+        ];
+        for (input, kind) in cases {
+            let error = parse_json(input).unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.pointer(), "/PRIVATE\n\u{001b}[31m~1é~0");
+            assert!(error.byte_offset() <= input.len());
+            for rendered in [format!("{error}"), format!("{error:?}"), format!("{error:#?}")] {
+                assert!(!rendered.contains("PRIVATE"));
+                assert!(!rendered.contains('é'));
+                assert!(!rendered.chars().any(char::is_control));
+                assert!(rendered.contains(error.reason()));
+            }
+        }
+    }
+
+    #[test]
+    fn resource_errors_keep_private_pointer_access_without_reflecting_it() {
+        let input = r#"{"PRIVATE\n\u001b[31m":null}"#;
+        let error = parse_json_with_limits(input, JsonLimits {
+            max_depth: 0,
+            ..JsonLimits::default()
+        }).unwrap_err();
+        assert_eq!(error.kind(), JsonParseErrorKind::Resource);
+        assert_eq!(error.pointer(), "/PRIVATE\n\u{001b}[31m");
+        assert!(!format!("{error} {error:?}").contains("PRIVATE"));
+        assert!(!format!("{error} {error:?}").chars().any(char::is_control));
     }
 }
