@@ -25,6 +25,8 @@ use super::resolve::{self, AnchoredMention, BidirectionalScores, PairLogProbabil
     ResolutionPair, ResolutionPlan, ResolutionResult, ResolveError, RESOLVE_VERSION};
 pub use crate::batch::judge::{JudgeBatchAdmission as ResolveAdmission, GuardedOutput};
 
+pub mod quantized;
+
 pub const RESOLVE_SCORER_VERSION: &str = "resolve-full-vocab-eos-two-orders-v1";
 pub const RESOLVE_PROMPT_VERSION: &str = "resolve-exact-context-segments-v1";
 const SLOTS: [&str; 2] = ["FNLP_RESOLVE_FIRST_49c8", "FNLP_RESOLVE_SECOND_73d1"];
@@ -143,10 +145,17 @@ impl ResolutionPlanner {
     pub fn prepare<'a, 'p, 's, C: DecodeStepControl>(&'a self, plan: &'p ResolutionPlan<'s>,
         identity: &ExecutionIdentity, limits: NativeResolveLimits, control: &mut C)
         -> Result<PreparedNativeResolution<'a, 'p, 's>, NativeResolveError> {
+        self.prepare_profile(plan, identity, limits, control, NumericsProfile::HfBf16Eager)
+    }
+    // Shared token/TaskIR compiler only. Public eager preparation stays eager;
+    // the quantized child keeps its profile-specific executable sealed.
+    fn prepare_profile<'a, 'p, 's, C: DecodeStepControl>(&'a self, plan: &'p ResolutionPlan<'s>,
+        identity: &ExecutionIdentity, limits: NativeResolveLimits, control: &mut C, profile: NumericsProfile)
+        -> Result<PreparedNativeResolution<'a, 'p, 's>, NativeResolveError> {
         limits.validate()?; resolve::checkpoint(control)?;
         identity.validate().map_err(|_| NativeResolveError::Contract)?;
         if identity.task_spec != RESOLVE_VERSION || identity.template_digest != self.template_digest
-            || identity.tokenizer_digest != self.tokenizer_digest() || identity.numerics_profile != NumericsProfile::HfBf16Eager
+            || identity.tokenizer_digest != self.tokenizer_digest() || identity.numerics_profile != profile
             || identity.kv_dtype != "bf16" || identity.thinking_mode != ThinkingMode::Disabled || identity.tool_mode != ToolMode::None
             || canonjson::canonical_bytes(identity).map_err(|_| NativeResolveError::Serialization)?.len() > 16_384 {
             return Err(NativeResolveError::Contract);
