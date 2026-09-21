@@ -64,6 +64,32 @@ Any failure returns no partial document result. The host must discard a failed
 native invocation and retain its resource/output ownership through actual
 delivery, as for the existing single-source task.
 
+## Process-hosted entrypoint
+
+`NlpEngine::map_int8_source` accepts an owned original `String`, the resident
+`ResidentInt8`, pinned planner/vocabulary Arcs, a `hosted::SourceMapConfig`, and
+one cancellation token. It performs partitioning and complete task planning
+inside the existing process-owned blocking invocation, under the same deadline
+and checkpoint budget as native inference and coordinate projection. It does
+not call the single-request host once per chunk.
+
+The host verifies the fixed task, strict backend, resident resource domain,
+physical model identity, pinned planner assets, complete KV capacity and
+explicit preparation/reduction headroom. Source `String` capacity is charged,
+not only its visible byte length. Complete planning precedes native-engine
+construction. Native KV, RoPE and scratch are reserved once; transient native
+results, original-coordinate copies and retained reduction-frontier storage are
+priced using the actual partition size. Retained prepared grammars/prompts and
+metadata require the explicit preparation reservation; these modeled amounts
+are not measured RSS or an allocator-level guarantee.
+
+Every prepared identity is checked before the first forward. All preparation,
+engine, admitted-identity and reduction scratch storage drains before physical
+completion. The returned `HostedOutput<Int8SourceMapRun>` keeps the separate
+output charge through the caller's serialization/delivery and offers no
+unguarded ownership escape. Native/reduction failures use the typed
+`HostedError::SourceMap`; default formatting does not expose source content.
+
 ## Evidence boundary
 
 This is library implementation, with regression source for real pinned planning

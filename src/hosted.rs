@@ -26,6 +26,8 @@ mod dispatch;
 mod scored;
 mod source;
 pub use source::SourceLimits;
+mod source_map;
+pub use source_map::SourceMapConfig;
 pub mod corpus;
 pub use dispatch::{CancellationToken, RunControl, RunStop};
 
@@ -91,6 +93,7 @@ pub enum HostedError {
     Classification(crate::tasks::classify::quantized::Int8ClassificationError),
     Judge(crate::tasks::judge::quantized::Int8JudgeError),
     Source(crate::tasks::source_planning::quantized::Int8SourceError),
+    SourceMap(crate::tasks::source_planning::quantized::long::Int8SourceMapError),
     BatchSetup(crate::batch::BatchFault),
     Batch(crate::batch::BatchRunError),
 }
@@ -117,6 +120,7 @@ impl fmt::Display for HostedError {
             Self::Classification(_) => "hosted native classification failed",
             Self::Judge(_) => "hosted native judgment failed",
             Self::Source(_) => "hosted native source task failed",
+            Self::SourceMap(_) => "hosted native source map failed",
             Self::BatchSetup(_) => "hosted corpus setup refused",
             Self::Batch(_) => "hosted corpus failed; inspect the retained summary",
         })
@@ -131,6 +135,7 @@ impl Error for HostedError {
             Self::Reservation(e) => Some(e), Self::Spawn(e) => Some(e),
             Self::Join { source, .. } => Some(source), Self::Scope { source, .. } => Some(source),
             Self::Model(e) => Some(e), Self::Native(e) => Some(e), Self::Chat(e) => Some(e),
+            Self::SourceMap(e) => Some(e),
             Self::Source(e) => Some(e), Self::Judge(e) => Some(e), Self::Classification(e) => Some(e), Self::Extraction(e) => Some(e), Self::BatchSetup(e) => Some(e), Self::Batch(e) => Some(e), _ => None,
         }
     }
