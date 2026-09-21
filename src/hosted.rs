@@ -24,6 +24,8 @@ use crate::{
 };
 mod dispatch;
 mod scored;
+mod redact;
+pub use redact::{RedactConfig, RedactionPseudonyms};
 mod resolve;
 pub use resolve::ResolveConfig;
 mod source;
@@ -97,6 +99,7 @@ pub enum HostedError {
     Source(crate::tasks::source_planning::quantized::Int8SourceError),
     SourceMap(crate::tasks::source_planning::quantized::long::Int8SourceMapError),
     Resolution(crate::corpus::native_resolve::quantized::Int8ResolveError),
+    Redaction(crate::tasks::redact::quantized::Int8RedactionError),
     BatchSetup(crate::batch::BatchFault),
     Batch(crate::batch::BatchRunError),
 }
@@ -125,6 +128,7 @@ impl fmt::Display for HostedError {
             Self::Source(_) => "hosted native source task failed",
             Self::SourceMap(_) => "hosted native source map failed",
             Self::Resolution(_) => "hosted native entity resolution failed",
+            Self::Redaction(_) => "hosted native redaction failed",
             Self::BatchSetup(_) => "hosted corpus setup refused",
             Self::Batch(_) => "hosted corpus failed; inspect the retained summary",
         })
@@ -140,6 +144,7 @@ impl Error for HostedError {
             Self::Join { source, .. } => Some(source), Self::Scope { source, .. } => Some(source),
             Self::Model(e) => Some(e), Self::Native(e) => Some(e), Self::Chat(e) => Some(e),
             Self::SourceMap(e) => Some(e), Self::Resolution(e) => Some(e),
+            Self::Redaction(e) => Some(e),
             Self::Source(e) => Some(e), Self::Judge(e) => Some(e), Self::Classification(e) => Some(e), Self::Extraction(e) => Some(e), Self::BatchSetup(e) => Some(e), Self::Batch(e) => Some(e), _ => None,
         }
     }
