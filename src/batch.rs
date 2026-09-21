@@ -161,6 +161,14 @@ pub trait BatchProcessor {
     type Prepared;
     type Output: Serialize;
     fn prepare(&mut self, document: BatchDocument<Self::Args>) -> Result<Self::Prepared, BatchItemFailure>;
+    /// Lend the SAME run control to bounded planning, without refreshing its
+    /// deadline/checkpoint budget. Legacy processors keep their prepare path.
+    /// A planner may checkpoint around tokenizer/grammar calls; those calls and
+    /// arbitrary blocking I/O are not thereby made internally preemptible.
+    fn prepare_with_control<C: DecodeStepControl>(&mut self, document: BatchDocument<Self::Args>,
+        _control: &mut C) -> Result<Self::Prepared, BatchItemFailure> {
+        self.prepare(document)
+    }
     fn planned_work(&self, prepared: &Self::Prepared) -> BatchWork;
     fn execute<C: DecodeStepControl>(&mut self, prepared: Self::Prepared, control: &mut C)
         -> Result<Self::Output, BatchItemFailure>;
@@ -271,7 +279,7 @@ fn run<R: BufRead, W: Write, P: BatchProcessor, C: DecodeStepControl>(reader: &m
             reject(sink, summary, *epoch, &frame, Some(&id), BatchCode::DocumentLimit.into())?; continue;
         }
         checkpoint(control)?;
-        let prepared = match processor.prepare(document) {
+        let prepared = match processor.prepare_with_control(document, control) {
             Ok(plan) => plan,
             Err(error) => {
                 reject(sink, summary, *epoch, &frame, Some(&id), error.fault)?;
