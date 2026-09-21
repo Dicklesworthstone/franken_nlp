@@ -5,7 +5,7 @@ use std::{collections::BTreeSet, error::Error, fmt};
 use serde::{Deserialize, Serialize};
 use crate::{tasks::ner::{EntityType, NerResult}, validation::grounded_fields::GroundingBudget};
 use super::{RedactError, actions::{ActionPolicy, EditBudget, RedactionResult, VerificationStatus, apply},
-    detectors::{RuleSet, RuleBudget}, pseudonym::Pseudonyms, union::{DetectedDocument, RedactionRegion}};
+    detectors::{RuleSet, RuleBudget}, pseudonym::Pseudonyms, union::{DetectedDocument, NerProfile, RedactionRegion}};
 
 /// Static adapter contract, not a recipe/plugin execution hook. Each call must
 /// plan from the supplied source; the pipeline independently checks returned
@@ -81,6 +81,13 @@ pub fn redact_rules(
 pub fn redact_with_ner<P: NerPass>(
     source: &str, request: &RedactionRequest, pseudonyms: Option<&Pseudonyms<'_>>, model: &mut P,
 ) -> Result<RedactionResult, PipelineError<P::Error>> {
+    redact_with_profile(source, request, pseudonyms, model, NerProfile::Eager)
+}
+
+pub(super) fn redact_with_profile<P: NerPass>(
+    source: &str, request: &RedactionRequest, pseudonyms: Option<&Pseudonyms<'_>>, model: &mut P,
+    profile: NerProfile,
+) -> Result<RedactionResult, PipelineError<P::Error>> {
     request.actions.check_key(pseudonyms)?;
     request.rules.validate()?;
     if source.len() > request.rule_budget.max_input_bytes { return Err(RedactError::InputBudget.into()); }
@@ -88,7 +95,7 @@ pub fn redact_with_ner<P: NerPass>(
     if types.is_empty() { return Err(RedactError::InvalidOptions.into()); }
     let first = model.run(source).map_err(PipelineError::Model)?;
     if model.types() != &types { return Err(RedactError::InvalidNerEvidence.into()); }
-    let document = DetectedDocument::with_ner(source, &request.rules, request.rule_budget, &first, &types, request.grounding_budget)?;
+    let document = DetectedDocument::with_ner_profile(source, &request.rules, request.rule_budget, &first, &types, request.grounding_budget, profile)?;
     drop(first);
     let mut output = apply(&document, &request.actions, pseudonyms, request.edit_budget)?;
     drop(document);
@@ -97,7 +104,7 @@ pub fn redact_with_ner<P: NerPass>(
         // offset, or successful original-source receipt is reused.
         let second = model.run(&output.text).map_err(PipelineError::Model)?;
         if model.types() != &types { return Err(RedactError::InvalidNerEvidence.into()); }
-        let residual = DetectedDocument::with_ner(&output.text, &request.rules, request.rule_budget, &second, &types, request.grounding_budget)?;
+        let residual = DetectedDocument::with_ner_profile(&output.text, &request.rules, request.rule_budget, &second, &types, request.grounding_budget, profile)?;
         require_clean::<P::Error>(residual, request.edit_budget.max_output_bytes)?;
         output.verification = VerificationStatus::CleanDeclaredUnion;
     }

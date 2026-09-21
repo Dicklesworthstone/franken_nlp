@@ -13,6 +13,18 @@ use super::{Detection, Detector, PiiKind, RedactError, detectors::{RuleSet, Rule
 
 pub const OVERLAP_POLICY: &str = "overlap-connected-union-v1";
 
+/// Selected by a typed pipeline, never inferred from a caller's receipt.
+#[derive(Clone, Copy)]
+pub(super) enum NerProfile { Eager, Int8 }
+impl NerProfile {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Eager => HF_BF16_EAGER_PROFILE,
+            Self::Int8 => crate::native_engine::strict_int8::STRICT_INT8_PROFILE,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RedactionRegion {
@@ -44,11 +56,19 @@ impl<'a> DetectedDocument<'a> {
     /// not proof of complete PII recall.
     pub fn with_ner(
         source: &'a str, rules: &RuleSet, budget: RuleBudget, result: &NerResult,
+        model_types: &BTreeSet<EntityType>, grounding: GroundingBudget,
+    ) -> Result<Self, RedactError> {
+        Self::with_ner_profile(source, rules, budget, result, model_types, grounding, NerProfile::Eager)
+    }
+
+    pub(super) fn with_ner_profile(
+        source: &'a str, rules: &RuleSet, budget: RuleBudget, result: &NerResult,
         model_types: &BTreeSet<EntityType>, mut grounding: GroundingBudget,
+        profile: NerProfile,
     ) -> Result<Self, RedactError> {
         if model_types.is_empty() || result.schema_version != 1
             || result.task_spec_version != NER_TASK_VERSION
-            || result.numerics_profile != HF_BF16_EAGER_PROFILE
+            || result.numerics_profile != profile.label()
             || result.score_space != ScoreSpace::NotComputed
             || result.grounding != ExtractionGrounding::SourceMembership
             || result.entities.len() > grounding.max_fields {
