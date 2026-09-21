@@ -6,6 +6,8 @@ mod classify;
 pub use classify::ClassificationCorpusConfig;
 mod judge;
 pub use judge::JudgeCorpusConfig;
+mod source;
+pub use source::SourceCorpusConfig;
 use std::io::{BufRead, Write};
 use crate::{
     batch::{self, BatchCode, BatchItemFailure, BatchLimits, BatchSummary,
