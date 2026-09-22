@@ -12,6 +12,7 @@ pub mod actions;
 pub mod pipeline;
 pub mod native;
 pub mod quantized;
+pub mod batch;
 
 pub use pipeline::{RedactionRequest, redact_rules, redact_with_ner};
 
