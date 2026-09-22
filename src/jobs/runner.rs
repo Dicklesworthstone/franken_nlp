@@ -10,6 +10,8 @@ use crate::{batch::{BatchDocument, BatchFault, BatchItemFailure, BatchProcessor,
 use serde::Serialize;
 use std::{error::Error, fmt, path::Path};
 
+pub mod source;
+
 pub const OWNED_BATCH_PROTOCOL: &str = "fnlp-owned-batch-v1";
 
 /// Trusted embedding interface, like BatchProcessor, NOT model authority.

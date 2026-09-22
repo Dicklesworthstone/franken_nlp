@@ -43,6 +43,55 @@ owner's existing protected result/recovery path. Materialization is explicit,
 complete-population-only, and never replaces an unrelated existing output.
 Raw stdout and downstream consumers gain no exactly-once delivery guarantee.
 
+## Native INT8 source portfolio
+
+`jobs::runner::source::Int8SourceJobProcessor` implements this boundary for
+NER, keyphrases, cited summarization, and passage QA. Its constructor borrows the
+host's `SourceTaskPlanner`, resident `StrictInt8Engine`, and immutable
+`ExtractionVocabulary`; it takes the existing `Int8SourceBatchAdmission` host,
+not a replacement permit provider. It constructs `NativeInt8SourceBatch` from
+the same private identity, task ceiling, planning limits, native limits, and
+default arguments recorded in its sealed recipe. It creates no model loader,
+runtime, executor or worker pool. This is the serial native embedding API,
+not a newly activated CLI or asupersync-hosted convenience entrypoint.
+
+The recipe binds the source execution/prompt/runtime versions, item-local
+scope, every compiler limit, complete source/grounding budget, all task and
+model budgets, both mask ceilings and checkpoint cadence, and defaults. The
+non-serializable limit structs are exhaustively destructured, so adding a new
+field cannot silently omit it from the job contract. Per-item arguments remain
+in the exact frozen request envelopes. The existing native planner and driver
+still construct the actual per-item identity, check the host's admitted
+identity, validate model/vocabulary and observed work, and finish task
+finalization and cancellation inside the native session. Guarded results pass
+unchanged to the spool/journal commit; JSON is not reparsed or substituted.
+
+The native adapter's process-local run ceilings coexist with (and may be
+stricter than) the immutable lifetime job ceilings. On restart, the newly
+constructed native adapter has fresh local counters but cannot bypass the
+persisted six-axis job debit or attempt cap. A poisoned engine is not reset by
+job recovery; its cleanup/replacement remains the host's responsibility.
+
+Embedding sequence, using host-owned values and error handling:
+
+```rust,ignore
+let processor = Int8SourceJobProcessor::new(
+    planner, identity, task_ceiling, planning_limits, defaults,
+    engine, vocabulary, admission, native_limits,
+)?;
+let mut job = JobRunner::create(
+    private_directory, protected_key, job_id, job_limits,
+    &original_envelopes, processor, control,
+)?;
+let progress = job.run(control)?;
+job.materialize_ordered(control)?;
+```
+
+For restart use `JobRunner::resume` with the same entire original population,
+contract and protected key, a fresh clean processor, and an explicit `TailPolicy`.
+Neither constructing the processor nor completing a storage fixture certifies
+model quality, activation, process memory admission or physical crash durability.
+
 ## Trust and memory boundaries
 
 `DurableBatchProcessor` is a trusted embedding interface, NOT an admission
@@ -68,7 +117,10 @@ checkpoints; interrupted/uninterrupted ordered equivalence; skipped committed
 work; late cancellation; serialization and recoverable processor failures;
 six-axis and attempt-budget persistence; recipe/identity/limits/population
 mismatches; and complete-envelope rejection before filesystem side effects.
-These tests are fixtures, not native accuracy or filesystem crash qualification.
+Seven native contract-test sources additionally cover all compiler/planning,
+model/mask and task-budget axes, complete default options, typed source-budget
+projection, and the concrete adapter trait boundary. These tests are fixtures,
+not native accuracy or filesystem crash qualification.
 
 The public CLI dispatcher, input spooling, external-sort populations,
 partition/corpus-global execution, live controller/DSR/Beads/bv/Agent-Mail
