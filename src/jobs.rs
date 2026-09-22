@@ -20,6 +20,8 @@ mod journal;
 mod owned;
 #[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub use owned::{Attempt, JobProgress, OwnedJob, TailPolicy};
+#[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub mod runner;
 
 /// No filesystem is touched merely by importing or constructing a manifest.
 pub const OWNED_JOBS_AVAILABLE: bool = cfg!(all(feature = "metadata-store", target_os = "linux",
