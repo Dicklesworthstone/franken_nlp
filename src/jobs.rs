@@ -11,6 +11,7 @@ use std::{error::Error, fmt};
 mod commitment;
 mod manifest;
 mod frame;
+pub mod population;
 pub use commitment::{Commitment, JobId, JobSecret};
 pub use manifest::{FrozenManifest, JobContract, JobInput, JobLimits, JobWork};
 
