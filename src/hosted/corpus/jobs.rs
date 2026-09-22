@@ -3,6 +3,8 @@
 //! Input ingestion, journal lifetime, native work and optional publication all
 //! finish inside one physical invocation before its completion is observable.
 use super::*;
+mod manage;
+pub use manage::{JobManagementLimits, StoredJobOperation, StoredJobRequest};
 use crate::{
     jobs::{JobError, JobId, JobLimits, JobProgress, JobSecret, TailPolicy,
         population::{JobPopulation, PopulationReadLimits},

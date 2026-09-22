@@ -12,6 +12,9 @@ pub mod grammar;
 #[cfg(feature = "asupersync-runtime")]
 pub mod hosted;
 pub mod jobs;
+#[cfg(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod job_cli;
 mod local_io;
 pub mod native_engine;
 pub mod orchestrator;

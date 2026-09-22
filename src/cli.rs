@@ -14,8 +14,12 @@ mod existing {
 }
 
 fn definition() -> clap::Command {
-    existing::definition().subcommand(crate::redaction_cli::definition())
-        .subcommands(crate::text_cli::definitions()).subcommand(crate::text_batch::definition())
+    let command = existing::definition().subcommand(crate::redaction_cli::definition())
+        .subcommands(crate::text_cli::definitions()).subcommand(crate::text_batch::definition());
+    #[cfg(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let command = command.subcommand(crate::job_cli::definition());
+    command
 }
 
 pub fn cli_main() -> ExitCode {
@@ -27,7 +31,7 @@ pub fn cli_main() -> ExitCode {
             if !error.use_stderr() { return if error.print().is_ok() { ExitCode::SUCCESS } else { ErrorCode::Generic.as_process_exit() }; }
             // Never echo arbitrary argv values into redaction diagnostics. Key
             // bytes have no argv option, even on an invalid invocation.
-            if args.get(1).and_then(|s| s.to_str()).is_some_and(|s| s == "redact" || s == "batch" || crate::text_cli::TextCommand::recognizes(s)) {
+            if args.get(1).and_then(|s| s.to_str()).is_some_and(|s| s == "redact" || s == "batch" || s == "job" || crate::text_cli::TextCommand::recognizes(s)) {
                 eprintln!("fnlp: invalid task arguments; run the task command with --help");
             } else { let _ = error.print(); }
             return ErrorCode::Usage.as_process_exit();
@@ -38,6 +42,15 @@ pub fn cli_main() -> ExitCode {
         return if command.write_help(&mut out).and_then(|()| writeln!(out)).and_then(|()| out.flush()).is_ok() {
             ExitCode::SUCCESS
         } else { ErrorCode::Generic.as_process_exit() };
+    }
+    #[cfg(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")))]
+    if let Some(("job", matches)) = matches.subcommand() {
+        let options = match crate::job_cli::JobCommand::from_arg_matches(matches) {
+            Ok(options) => options,
+            Err(_) => return ErrorCode::Usage.as_process_exit(),
+        };
+        return options.run(&mut io::stdout().lock(), &mut io::stderr().lock());
     }
     let stdin = io::stdin();
     let terminal = stdin.is_terminal();
@@ -87,5 +100,11 @@ mod task_dispatch_tests {
     fn existing_schema_arguments_still_parse() {
         assert!(definition().try_get_matches_from(["fnlp", "schema", "check", "-"]).is_ok());
         assert!(definition().try_get_matches_from(["fnlp", "robot", "schema"]).is_ok());
+    }
+    #[test]
+    fn stored_job_commands_are_present_only_with_the_actual_host_and_storage_profile() {
+        let supported = cfg!(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")));
+        assert_eq!(definition().try_get_matches_from(["fnlp", "job", "schema"]).is_ok(), supported);
     }
 }
