@@ -20,7 +20,7 @@ mod journal;
 #[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod owned;
 #[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub use owned::{Attempt, JobProgress, OwnedJob, TailPolicy};
+pub use owned::{Attempt, JobProgress, OwnedJob, StoredJob, StoredJobReport, TailPolicy};
 #[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub mod runner;
 

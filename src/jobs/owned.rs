@@ -7,6 +7,9 @@ use crate::{local_io::JobFiles, native_engine::decode::DecodeStepControl};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+mod stored;
+pub use stored::{StoredJob, StoredJobReport};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TailPolicy {
     /// Diagnose without modifying an uncommitted/torn suffix.
