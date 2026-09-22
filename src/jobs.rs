@@ -1,6 +1,11 @@
-//! Bounded replay contracts and authenticated framing for opt-in owned jobs.
-//! Complete population freeze and private commitments create no runtime or
-//! journal authority; durable storage is supplied by the owning job layer.
+//! Opt-in, item-local owned jobs. Content never enters the metadata-only store.
+//!
+//! Freeze the full replay contract and ordered input population before opening
+//! a job. An owned job reserves work durably before execution, syncs each result
+//! frame before committing its journal pointer, and materializes only verified
+//! committed pointers. It creates no runtime, worker, scheduler, or retry loop.
+//! Arbitrary stdout is not an exactly-once destination. See
+//! `docs/owned-jobs.md` for the platform, privacy and host-admission boundaries.
 
 use std::{error::Error, fmt};
 mod commitment;
@@ -8,6 +13,17 @@ mod manifest;
 mod frame;
 pub use commitment::{Commitment, JobId, JobSecret};
 pub use manifest::{FrozenManifest, JobContract, JobInput, JobLimits, JobWork};
+
+#[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod journal;
+#[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod owned;
+#[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub use owned::{Attempt, JobProgress, OwnedJob, TailPolicy};
+
+/// No filesystem is touched merely by importing or constructing a manifest.
+pub const OWNED_JOBS_AVAILABLE: bool = cfg!(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")));
 
 /// Field names only: diagnostics never expose old/new private commitments.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

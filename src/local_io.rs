@@ -38,6 +38,9 @@ mod platform {
     const PATH_ONLY: i32 = 1 << 21;
     static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
 
+    #[cfg(feature = "metadata-store")]
+    pub(crate) mod jobs;
+
     fn io<T>(value: std::io::Result<T>) -> Result<T, LocalIoError> { value.map_err(|_| LocalIoError::Io) }
     fn fd_path(file: &File) -> PathBuf { PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())) }
     fn identity(meta: &Metadata) -> (u64, u64) { (meta.dev(), meta.ino()) }
@@ -129,6 +132,12 @@ mod platform {
             Ok(self.name == other.name && same_file(&self.parent, &other.parent)?)
         }
         pub(crate) fn stage(self, bytes: &[u8]) -> Result<StagedOutput, LocalIoError> {
+            self.stage_with(|file| io(file.write_all(bytes)))
+        }
+        /// Stream bounded caller-owned output into the same protected staging
+        /// transaction. The closure runs once; file sync precedes publication.
+        pub(crate) fn stage_with(self, write: impl FnOnce(&mut File) -> Result<(), LocalIoError>)
+            -> Result<StagedOutput, LocalIoError> {
             for _ in 0..128 {
                 let sequence = NEXT_STAGE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
                     .map_err(|_| LocalIoError::StageExhausted)?;
@@ -143,7 +152,7 @@ mod platform {
                 };
                 let mut stage = StagedOutput { destination: self, name, file };
                 io(stage.file.set_permissions(fs::Permissions::from_mode(0o600)))?;
-                io(stage.file.write_all(bytes))?;
+                write(&mut stage.file)?;
                 io(stage.file.sync_all())?;
                 stage.check_stage()?;
                 return Ok(stage);
@@ -287,3 +296,6 @@ mod platform {
     impl StagedOutput { pub(crate) fn publish(self) -> Result<(), LocalIoError> { Err(LocalIoError::UnsupportedProfile) } }
 }
 pub(super) use platform::{Destination, open_document, open_key, same_file};
+
+#[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) use platform::jobs::JobFiles;
