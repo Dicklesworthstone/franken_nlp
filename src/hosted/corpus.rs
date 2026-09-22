@@ -8,6 +8,8 @@ mod judge;
 pub use judge::JudgeCorpusConfig;
 mod source;
 pub use source::SourceCorpusConfig;
+#[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub mod jobs;
 mod redact;
 pub use redact::RedactionCorpusConfig;
 use std::io::{BufRead, Write};
