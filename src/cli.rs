@@ -53,16 +53,18 @@ pub fn cli_main() -> ExitCode {
         };
         return options.run(&mut io::stdout().lock(), &mut io::stderr().lock());
     }
-    let stdin = io::stdin();
-    let terminal = stdin.is_terminal();
-    let mut input = stdin.lock();
+    // Candidate corpus execution transfers owned IO into the blocking pool.
+    // Holding a caller-thread stdio lock here would deadlock its worker.
     if let Some(("candidate", matches)) = matches.subcommand() {
         let options = match crate::candidate_cli::CandidateCommand::from_matches(matches) {
             Ok(options) => options,
             Err(_) => return ErrorCode::Usage.as_process_exit(),
         };
-        return options.run(&mut input, &mut io::stdout().lock(), &mut io::stderr().lock());
+        return options.run_stdio();
     }
+    let stdin = io::stdin();
+    let terminal = stdin.is_terminal();
+    let mut input = stdin.lock();
     if let Some(("batch", matches)) = matches.subcommand() {
         let options = match crate::text_batch::BatchCommand::from_arg_matches(matches) {
             Ok(options) => options,
@@ -111,10 +113,20 @@ mod task_dispatch_tests {
     }
     #[test]
     fn candidate_commands_are_explicit_and_do_not_replace_certified_task_names() {
-        for task in ["generate", "chat"] {
+        for task in ["generate", "chat", "ner", "keyphrases", "summarize", "answer"] {
             assert!(definition().try_get_matches_from(["fnlp", "candidate", task,
                 "--model", "local.fnlpq", "--memory-mib", "8192"]).is_ok());
         }
+    }
+    #[test]
+    fn native_candidate_batch_is_separate_from_model_free_text_batch() {
+        for task in ["ner", "keyphrases", "summarize", "answer"] {
+            let matches = definition().try_get_matches_from(["fnlp", "candidate", "batch",
+                "--task", task, "--model", "local.fnlpq", "--memory-mib", "8192"]).unwrap();
+            let ("candidate", inner) = matches.subcommand().unwrap() else { panic!("wrong route") };
+            assert!(crate::candidate_cli::CandidateCommand::from_matches(inner).is_ok());
+        }
+        assert!(definition().try_get_matches_from(["fnlp", "batch", "--task", "normalize"]).is_ok());
     }
     #[test]
     fn stored_job_commands_are_present_only_with_the_actual_host_and_storage_profile() {

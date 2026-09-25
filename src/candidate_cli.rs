@@ -20,6 +20,7 @@ mod runtime;
 #[cfg(test)]
 mod tests;
 mod source;
+mod batch;
 
 const MIB: u64 = 1024 * 1024;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -81,14 +82,16 @@ pub(crate) struct CandidateArgs {
 pub(crate) enum CandidateCommand {
     Text { task: Task, args: CandidateArgs },
     Source(source::SourceCommand),
+    Batch(batch::BatchCommand),
 }
 
 pub(crate) fn definition() -> clap::Command {
     clap::Command::new("candidate")
         .about("Explicit non-certified local INT8 inference (requires asupersync-runtime)")
-        .long_about("Execute an explicitly selected local current-candidate INT8 artifact. This is not release activation, publisher authentication, numerical qualification or a production certification. No network, automatic download, thinking mode or tool execution is available. Output is one completed JSON object, not a token stream.")
+        .long_about("Execute an explicitly selected local current-candidate INT8 artifact. This is not release activation, publisher authentication, numerical qualification or a production certification. No network, automatic download, thinking mode or tool execution is available. Single requests emit a completed JSON object; batch emits ordered candidate-framed NDJSON, not token events.")
         .subcommand_required(true)
         .subcommands(source::definitions())
+        .subcommand(batch::definition())
         .subcommand(CandidateArgs::augment_args(clap::Command::new("generate")
             .about("Generate from a bounded UTF-8 prompt using the pinned chat template")))
         .subcommand(CandidateArgs::augment_args(clap::Command::new("chat")
@@ -99,6 +102,9 @@ impl CandidateCommand {
     pub(crate) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let (name, matches) = matches.subcommand().ok_or_else(||
             clap::Error::raw(clap::error::ErrorKind::MissingSubcommand, "candidate task required"))?;
+        if name == "batch" {
+            return batch::BatchCommand::from_arg_matches(matches).map(Self::Batch);
+        }
         if let Some(kind) = source::Kind::named(name) {
             return source::SourceCommand::from_matches(kind, matches).map(Self::Source);
         }
@@ -108,6 +114,15 @@ impl CandidateCommand {
             _ => return Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "candidate task refused")),
         };
         Ok(Self::Text { task, args: CandidateArgs::from_arg_matches(matches)? })
+    }
+
+    /// Called BEFORE the root dispatcher acquires any stdio locks. Batch
+    /// transfers owned handles into the one hosted blocking invocation.
+    pub(crate) fn run_stdio(self) -> ExitCode {
+        match self {
+            Self::Batch(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
+            other => other.run(&mut io::stdin(), &mut io::stdout(), &mut io::stderr()),
+        }
     }
 
     pub(crate) fn run(self, input: &mut impl Read, output: &mut impl Write,
@@ -127,6 +142,9 @@ impl CandidateCommand {
     fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
         let (task, args) = match self {
             Self::Source(command) => return command.execute(input, output),
+            // A borrowed stream cannot outlive the hosted blocking closure.
+            // The executable dispatcher always takes run_stdio for batch.
+            Self::Batch(_) => return Err(CandidateError::Arguments),
             Self::Text { task, args } => (task, args),
         };
         let limits = args.validate()?;
@@ -274,7 +292,7 @@ enum CandidateError {
     Arguments,
     #[cfg(not(feature = "asupersync-runtime"))]
     Unavailable,
-    Input, Memory, Runtime, Model, Identity, Planning, Timeout, Execution, Output,
+    Input, Memory, Runtime, Model, Identity, Planning, Timeout, Execution, Output, Batch,
 }
 impl CandidateError {
     fn message(self) -> &'static str {
@@ -291,6 +309,7 @@ impl CandidateError {
             Self::Timeout => "cooperative request deadline expired; no result published",
             Self::Execution => "native execution failed or was cancelled; no result published",
             Self::Output => "completed result could not be delivered",
+            Self::Batch => "corpus stopped or contains failed records; earlier completed frames may exist",
         }
     }
     fn exit_code(self) -> ExitCode {
