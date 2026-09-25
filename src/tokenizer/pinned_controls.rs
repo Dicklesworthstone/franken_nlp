@@ -58,10 +58,13 @@ fn from_sources(config: &[u8], specials: &[u8], added: &[u8])
     verify(config, 10_990, CONFIG_SHA256)?;
     verify(specials, 623, SPECIALS_SHA256)?;
     verify(added, 174, ADDED_SHA256)?;
-    // These are exact digest-verified bytes, not untrusted JSON. The returned
-    // archives still go through the existing duplicate/subset validator.
-    let config: Value = serde_json::from_slice(config)
-        .map_err(|_| refused("pinned tokenizer configuration is not JSON"))?;
+    // Even immutable metadata uses the repository's one rejecting JSON
+    // boundary. Returned archives also pass the duplicate/subset validator.
+    let text = std::str::from_utf8(config)
+        .map_err(|_| refused("pinned tokenizer configuration is not UTF-8"))?;
+    let config = crate::canonjson::parse_str_with_limits(text, crate::canonjson::ParseLimits {
+        max_depth: 8, max_string_bytes: 10_990,
+    }).map_err(|_| refused("pinned tokenizer configuration is not JSON"))?;
     let decoder = config.get("added_tokens_decoder").and_then(Value::as_object)
         .ok_or_else(|| refused("missing pinned token decoder"))?;
     let mut special_entries = Vec::new();

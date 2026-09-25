@@ -3,6 +3,7 @@
 pub mod artifact;
 pub mod batch;
 pub mod calibration;
+mod candidate_cli;
 pub mod canonjson;
 pub mod cli;
 pub mod corpus;

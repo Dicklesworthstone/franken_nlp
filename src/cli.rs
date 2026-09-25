@@ -15,7 +15,8 @@ mod existing {
 
 fn definition() -> clap::Command {
     let command = existing::definition().subcommand(crate::redaction_cli::definition())
-        .subcommands(crate::text_cli::definitions()).subcommand(crate::text_batch::definition());
+        .subcommands(crate::text_cli::definitions()).subcommand(crate::text_batch::definition())
+        .subcommand(crate::candidate_cli::definition());
     #[cfg(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")))]
     let command = command.subcommand(crate::job_cli::definition());
@@ -31,7 +32,7 @@ pub fn cli_main() -> ExitCode {
             if !error.use_stderr() { return if error.print().is_ok() { ExitCode::SUCCESS } else { ErrorCode::Generic.as_process_exit() }; }
             // Never echo arbitrary argv values into redaction diagnostics. Key
             // bytes have no argv option, even on an invalid invocation.
-            if args.get(1).and_then(|s| s.to_str()).is_some_and(|s| s == "redact" || s == "batch" || s == "job" || crate::text_cli::TextCommand::recognizes(s)) {
+            if args.get(1).and_then(|s| s.to_str()).is_some_and(|s| s == "redact" || s == "batch" || s == "job" || s == "candidate" || crate::text_cli::TextCommand::recognizes(s)) {
                 eprintln!("fnlp: invalid task arguments; run the task command with --help");
             } else { let _ = error.print(); }
             return ErrorCode::Usage.as_process_exit();
@@ -55,6 +56,13 @@ pub fn cli_main() -> ExitCode {
     let stdin = io::stdin();
     let terminal = stdin.is_terminal();
     let mut input = stdin.lock();
+    if let Some(("candidate", matches)) = matches.subcommand() {
+        let options = match crate::candidate_cli::CandidateCommand::from_matches(matches) {
+            Ok(options) => options,
+            Err(_) => return ErrorCode::Usage.as_process_exit(),
+        };
+        return options.run(&mut input, &mut io::stdout().lock(), &mut io::stderr().lock());
+    }
     if let Some(("batch", matches)) = matches.subcommand() {
         let options = match crate::text_batch::BatchCommand::from_arg_matches(matches) {
             Ok(options) => options,
@@ -87,7 +95,7 @@ mod task_dispatch_tests {
     fn new_task_and_existing_commands_share_root_help() {
         let mut root = definition();
         let help = root.render_long_help().to_string();
-        for name in ["redact", "tokens", "split", "normalize", "batch", "schema", "robot", "convert", "release", "models"] { assert!(help.contains(name)); }
+        for name in ["redact", "tokens", "split", "normalize", "batch", "schema", "robot", "convert", "release", "models", "candidate"] { assert!(help.contains(name)); }
         assert!(root.try_get_matches_from(["fnlp", "redact", "--rules-only"]).is_ok());
     }
     #[test]
@@ -100,6 +108,13 @@ mod task_dispatch_tests {
     fn existing_schema_arguments_still_parse() {
         assert!(definition().try_get_matches_from(["fnlp", "schema", "check", "-"]).is_ok());
         assert!(definition().try_get_matches_from(["fnlp", "robot", "schema"]).is_ok());
+    }
+    #[test]
+    fn candidate_commands_are_explicit_and_do_not_replace_certified_task_names() {
+        for task in ["generate", "chat"] {
+            assert!(definition().try_get_matches_from(["fnlp", "candidate", task,
+                "--model", "local.fnlpq", "--memory-mib", "8192"]).is_ok());
+        }
     }
     #[test]
     fn stored_job_commands_are_present_only_with_the_actual_host_and_storage_profile() {
