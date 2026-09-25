@@ -6,7 +6,10 @@ pub(super) fn args(extra: &[&str]) -> CandidateArgs {
     let mut argv = vec!["candidate", "generate", "--model", "local-candidate.fnlpq", "--memory-mib", "8192"];
     argv.extend_from_slice(extra);
     let matches = definition().try_get_matches_from(argv).unwrap();
-    CandidateCommand::from_matches(&matches).unwrap().args
+    match CandidateCommand::from_matches(&matches).unwrap() {
+        CandidateCommand::Text { args, .. } => args,
+        _ => panic!("generation selected a source command"),
+    }
 }
 
 #[test]
@@ -17,8 +20,9 @@ fn both_commands_require_an_explicit_model_and_memory_authority() {
         assert!(definition().try_get_matches_from(["candidate", task, "--memory-mib", "8192"]).is_err());
         let matches = definition().try_get_matches_from([
             "candidate", task, "--model", "m", "--memory-mib", "8192", "input.txt"]).unwrap();
-        assert_eq!(CandidateCommand::from_matches(&matches).unwrap().task,
-            if task == "chat" { Task::Chat } else { Task::Generate });
+        let CandidateCommand::Text { task: selected, .. } = CandidateCommand::from_matches(&matches).unwrap()
+            else { panic!("wrong task family") };
+        assert_eq!(selected, if task == "chat" { Task::Chat } else { Task::Generate });
     }
 }
 
@@ -159,7 +163,7 @@ fn unavailable_build_never_reads_input_or_produces_output() {
     impl Read for NoRead {
         fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("unavailable build read private input") }
     }
-    let command = CandidateCommand { task: Task::Generate, args: args(&[]) };
+    let command = CandidateCommand::Text { task: Task::Generate, args: args(&[]) };
     let mut output = Vec::new();
     assert_eq!(command.execute(&mut NoRead, &mut output), Err(CandidateError::Unavailable));
     assert!(output.is_empty());

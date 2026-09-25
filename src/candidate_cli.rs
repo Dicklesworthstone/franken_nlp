@@ -19,6 +19,7 @@ use crate::{canonjson, error::ErrorCode,
 mod runtime;
 #[cfg(test)]
 mod tests;
+mod source;
 
 const MIB: u64 = 1024 * 1024;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -26,7 +27,7 @@ const MAX_CONTENT_BYTES: usize = 1024 * 1024;
 const SAMPLER_BYTES: u64 = 32 * MIB;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Task { Generate, Chat }
+pub(crate) enum Task { Generate, Chat }
 
 #[derive(Args)]
 pub(crate) struct CandidateArgs {
@@ -77,13 +78,17 @@ pub(crate) struct CandidateArgs {
     logprobs: bool,
 }
 
-pub(crate) struct CandidateCommand { task: Task, args: CandidateArgs }
+pub(crate) enum CandidateCommand {
+    Text { task: Task, args: CandidateArgs },
+    Source(source::SourceCommand),
+}
 
 pub(crate) fn definition() -> clap::Command {
     clap::Command::new("candidate")
         .about("Explicit non-certified local INT8 inference (requires asupersync-runtime)")
         .long_about("Execute an explicitly selected local current-candidate INT8 artifact. This is not release activation, publisher authentication, numerical qualification or a production certification. No network, automatic download, thinking mode or tool execution is available. Output is one completed JSON object, not a token stream.")
         .subcommand_required(true)
+        .subcommands(source::definitions())
         .subcommand(CandidateArgs::augment_args(clap::Command::new("generate")
             .about("Generate from a bounded UTF-8 prompt using the pinned chat template")))
         .subcommand(CandidateArgs::augment_args(clap::Command::new("chat")
@@ -94,12 +99,15 @@ impl CandidateCommand {
     pub(crate) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let (name, matches) = matches.subcommand().ok_or_else(||
             clap::Error::raw(clap::error::ErrorKind::MissingSubcommand, "candidate task required"))?;
+        if let Some(kind) = source::Kind::named(name) {
+            return source::SourceCommand::from_matches(kind, matches).map(Self::Source);
+        }
         let task = match name {
             "generate" => Task::Generate,
             "chat" => Task::Chat,
             _ => return Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "candidate task refused")),
         };
-        Ok(Self { task, args: CandidateArgs::from_arg_matches(matches)? })
+        Ok(Self::Text { task, args: CandidateArgs::from_arg_matches(matches)? })
     }
 
     pub(crate) fn run(self, input: &mut impl Read, output: &mut impl Write,
@@ -117,12 +125,16 @@ impl CandidateCommand {
     }
 
     fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
-        let limits = self.args.validate()?;
+        let (task, args) = match self {
+            Self::Source(command) => return command.execute(input, output),
+            Self::Text { task, args } => (task, args),
+        };
+        let limits = args.validate()?;
         #[cfg(feature = "asupersync-runtime")]
-        { runtime::execute(self.task, self.args, limits, input, output) }
+        { runtime::execute(task, args, limits, input, output) }
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-            let _ = (self.task, limits, input, output);
+            let _ = (task, limits, input, output);
             // Feature refusal is BEFORE opening even the input or model path.
             Err(CandidateError::Unavailable)
         }
@@ -270,12 +282,12 @@ impl CandidateError {
             Self::Arguments => "invalid or inconsistent finite limits/options",
             #[cfg(not(feature = "asupersync-runtime"))]
             Self::Unavailable => "this build requires the asupersync-runtime feature for candidate inference",
-            Self::Input => "input refused: check byte limits, UTF-8 and the chat message-array contract",
+            Self::Input => "input refused: check byte limits, UTF-8 and the selected task input/options contract",
             Self::Memory => "process preparation memory admission failed",
             Self::Runtime => "process runtime initialization refused",
             Self::Model => "explicit local current-candidate model loading refused",
             Self::Identity => "candidate model identity changed or is incompatible",
-            Self::Planning => "prompt or generation contract refused before weight loading",
+            Self::Planning => "prompt, schema or task contract refused before weight loading",
             Self::Timeout => "cooperative request deadline expired; no result published",
             Self::Execution => "native execution failed or was cancelled; no result published",
             Self::Output => "completed result could not be delivered",
