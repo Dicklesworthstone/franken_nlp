@@ -11,6 +11,7 @@ use serde::Serialize;
 use std::{error::Error, fmt, path::Path};
 
 pub mod source;
+pub mod extract;
 
 pub const OWNED_BATCH_PROTOCOL: &str = "fnlp-owned-batch-v1";
 

@@ -4,6 +4,7 @@
 //! finish inside one physical invocation before its completion is observable.
 use super::*;
 mod manage;
+mod extract;
 pub use manage::{JobManagementLimits, StoredJobOperation, StoredJobRequest};
 use crate::{
     jobs::{JobError, JobId, JobLimits, JobProgress, JobSecret, TailPolicy,
@@ -163,7 +164,7 @@ impl NlpEngine {
 }
 
 // Shared ordered job lifecycle, not a public fake-native injection surface.
-// Production reaches this only with Int8SourceJobProcessor + CorpusAdmission.
+// Production uses only the sealed source/extraction processors + CorpusAdmission.
 fn run_population<P: DurableBatchProcessor, C: DecodeStepControl>(request: SourceJobRequest,
     population: &JobPopulation, processor: P, control: &mut C) -> Result<JobProgress, JobRunError> {
     let SourceJobRequest { root, key, job_id, limits, mode, materialize } = request;

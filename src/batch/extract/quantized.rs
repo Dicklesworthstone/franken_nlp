@@ -23,6 +23,9 @@ pub struct PreparedInt8BatchExtraction {
     source: SourceDocument,
 }
 impl Int8ExtractionBatchPlanner {
+    /// Template/tokenizer-bound factory identity, not a prepared item identity.
+    /// Durable hosts freeze this actual compiler binding along with its recipe.
+    pub fn base_execution_identity(&self) -> &ExecutionIdentity { &self.compiler.identity }
     pub fn pinned(controls: &TemplateControlIds, eos: u32, identity: ExecutionIdentity,
         ceiling: TaskBudget, compiler_limits: CompileLimits, source_limits: SourceRuntimeLimits,
         defaults: Option<ExtractionBatchArgs>) -> Result<Self, BatchFault> {
@@ -98,7 +101,7 @@ pub struct Int8ExtractionBatchLimits {
     pub masks: ExtractionMaskBudget,
 }
 impl Int8ExtractionBatchLimits {
-    fn validate(self) -> Result<(), BatchFault> {
+    pub(crate) fn validate(self) -> Result<(), BatchFault> {
         let w = self.max_model_work; let m = self.masks;
         if w.forward_positions == 0 || w.projected_logits == 0 || w.attention_pairs == 0
             || w.projections.dot_products == 0 || w.projections.multiply_accumulates == 0
