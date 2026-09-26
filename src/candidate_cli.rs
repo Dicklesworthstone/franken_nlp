@@ -26,6 +26,7 @@ mod scored_batch;
 mod extract;
 mod jobs;
 mod map;
+mod judge;
 
 const MIB: u64 = 1024 * 1024;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -90,6 +91,7 @@ pub(crate) enum CandidateCommand {
     Scored(scored::ScoredCommand),
     Extract(extract::ExtractCommand),
     Map(map::MapCommand),
+    Judge(judge::JudgeCommand),
     Batch(batch::BatchCommand),
     ScoreBatch(scored_batch::ScoreBatchCommand),
     Job(jobs::JobCommand),
@@ -107,6 +109,7 @@ pub(crate) fn definition() -> clap::Command {
         .subcommand(extract::definition())
         .subcommand(jobs::definition())
         .subcommand(map::definition())
+        .subcommand(judge::definition())
         .subcommand(CandidateArgs::augment_args(clap::Command::new("generate")
             .about("Generate from a bounded UTF-8 prompt using the pinned chat template")))
         .subcommand(CandidateArgs::augment_args(clap::Command::new("chat")
@@ -117,6 +120,9 @@ impl CandidateCommand {
     pub(crate) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let (name, matches) = matches.subcommand().ok_or_else(||
             clap::Error::raw(clap::error::ErrorKind::MissingSubcommand, "candidate task required"))?;
+        if name == "judge" {
+            return judge::JudgeCommand::from_arg_matches(matches).map(Self::Judge);
+        }
         if name == "map" {
             return map::MapCommand::from_arg_matches(matches).map(Self::Map);
         }
@@ -177,6 +183,7 @@ impl CandidateCommand {
             Self::Scored(command) => return command.execute(input, output),
             Self::Extract(command) => return command.execute(input, output),
             Self::Map(command) => return command.execute(input, output),
+            Self::Judge(command) => return command.execute(input, output),
             // A borrowed stream cannot outlive the hosted blocking closure.
             // The executable dispatcher always takes run_stdio for batch.
             Self::Batch(_) | Self::ScoreBatch(_) | Self::Job(_) => return Err(CandidateError::Arguments),
