@@ -52,6 +52,12 @@ pub struct JobHostLimits {
     pub serialization_reserve_bytes: u64,
 }
 impl JobHostLimits {
+    /// Checked job-buffer commitment used by this host, excluding native KV,
+    /// workspace and per-result claims. Entrypoints may reject impossible
+    /// admission before loading weights; this neither reserves nor grants RAM.
+    pub fn required_buffer_bytes(self, job: JobLimits) -> Result<u64, HostedJobError> {
+        self.reservation_bytes(job)
+    }
     fn reservation_bytes(self, job: JobLimits) -> Result<u64, HostedJobError> {
         self.native.run.validate()?; self.transport.validate()?; job.validate()?;
         if self.preparation_reserve_bytes == 0 || self.io_reserve_bytes == 0

@@ -24,6 +24,7 @@ mod batch;
 mod scored;
 mod scored_batch;
 mod extract;
+mod jobs;
 
 const MIB: u64 = 1024 * 1024;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -89,6 +90,7 @@ pub(crate) enum CandidateCommand {
     Extract(extract::ExtractCommand),
     Batch(batch::BatchCommand),
     ScoreBatch(scored_batch::ScoreBatchCommand),
+    Job(jobs::JobCommand),
 }
 
 pub(crate) fn definition() -> clap::Command {
@@ -101,6 +103,7 @@ pub(crate) fn definition() -> clap::Command {
         .subcommand(batch::definition())
         .subcommand(scored_batch::definition())
         .subcommand(extract::definition())
+        .subcommand(jobs::definition())
         .subcommand(CandidateArgs::augment_args(clap::Command::new("generate")
             .about("Generate from a bounded UTF-8 prompt using the pinned chat template")))
         .subcommand(CandidateArgs::augment_args(clap::Command::new("chat")
@@ -111,6 +114,9 @@ impl CandidateCommand {
     pub(crate) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let (name, matches) = matches.subcommand().ok_or_else(||
             clap::Error::raw(clap::error::ErrorKind::MissingSubcommand, "candidate task required"))?;
+        if name == "job" {
+            return jobs::JobCommand::from_arg_matches(matches).map(Self::Job);
+        }
         if name == "score-batch" {
             return scored_batch::ScoreBatchCommand::from_arg_matches(matches).map(Self::ScoreBatch);
         }
@@ -140,6 +146,7 @@ impl CandidateCommand {
         match self {
             Self::Batch(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::ScoreBatch(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
+            Self::Job(command) => command.run_owned(io::stdin(), &mut io::stdout(), &mut io::stderr()),
             other => other.run(&mut io::stdin(), &mut io::stdout(), &mut io::stderr()),
         }
     }
@@ -165,7 +172,7 @@ impl CandidateCommand {
             Self::Extract(command) => return command.execute(input, output),
             // A borrowed stream cannot outlive the hosted blocking closure.
             // The executable dispatcher always takes run_stdio for batch.
-            Self::Batch(_) | Self::ScoreBatch(_) => return Err(CandidateError::Arguments),
+            Self::Batch(_) | Self::ScoreBatch(_) | Self::Job(_) => return Err(CandidateError::Arguments),
             Self::Text { task, args } => (task, args),
         };
         let limits = args.validate()?;

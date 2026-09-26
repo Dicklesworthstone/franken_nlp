@@ -3,6 +3,9 @@ pub(super) mod source_tasks;
 pub(super) mod batch_tasks;
 pub(super) mod scored_tasks;
 pub(super) mod extraction;
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(super) mod owned_jobs;
 use std::{fs::File, time::{Duration, Instant}};
 use super::*;
 use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
