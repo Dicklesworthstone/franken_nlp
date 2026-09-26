@@ -28,6 +28,7 @@ mod jobs;
 mod map;
 mod judge;
 mod redact;
+mod resolve;
 
 const MIB: u64 = 1024 * 1024;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -94,6 +95,7 @@ pub(crate) enum CandidateCommand {
     Map(map::MapCommand),
     Judge(judge::JudgeCommand),
     Redact(redact::RedactCommand),
+    Resolve(resolve::ResolveCommand),
     Batch(batch::BatchCommand),
     ScoreBatch(scored_batch::ScoreBatchCommand),
     Job(jobs::JobCommand),
@@ -113,6 +115,7 @@ pub(crate) fn definition() -> clap::Command {
         .subcommand(map::definition())
         .subcommand(judge::definition())
         .subcommand(redact::definition())
+        .subcommand(resolve::definition())
         .subcommand(CandidateArgs::augment_args(clap::Command::new("generate")
             .about("Generate from a bounded UTF-8 prompt using the pinned chat template")))
         .subcommand(CandidateArgs::augment_args(clap::Command::new("chat")
@@ -123,6 +126,9 @@ impl CandidateCommand {
     pub(crate) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let (name, matches) = matches.subcommand().ok_or_else(||
             clap::Error::raw(clap::error::ErrorKind::MissingSubcommand, "candidate task required"))?;
+        if name == "resolve" {
+            return resolve::ResolveCommand::from_arg_matches(matches).map(Self::Resolve);
+        }
         if name == "redact" {
             return redact::RedactCommand::from_arg_matches(matches).map(Self::Redact);
         }
@@ -191,6 +197,7 @@ impl CandidateCommand {
             Self::Map(command) => return command.execute(input, output),
             Self::Judge(command) => return command.execute(input, output),
             Self::Redact(command) => return command.execute(input, output),
+            Self::Resolve(command) => return command.execute(input, output),
             // A borrowed stream cannot outlive the hosted blocking closure.
             // The executable dispatcher always takes run_stdio for batch.
             Self::Batch(_) | Self::ScoreBatch(_) | Self::Job(_) => return Err(CandidateError::Arguments),

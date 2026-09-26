@@ -6,6 +6,7 @@ pub(super) mod extraction;
 pub(super) mod map_tasks;
 pub(super) mod judgment;
 pub(super) mod redaction;
+pub(super) mod resolution;
 #[cfg(all(feature = "metadata-store", target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(super) mod owned_jobs;

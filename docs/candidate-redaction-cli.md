@@ -15,9 +15,10 @@ fnlp candidate redact document.txt --action placeholder \
 
 Input is exact UTF-8 from a file or omitted/`-` for stdin. One completed JSON
 response contains candidate provenance and the native redaction result. Only
-final transformed text is returned: intermediate NER transcripts, original
-values and rejected partially redacted documents are not exported. Output and
-preparation charges survive complete serialization, writing and flushing.
+final transformed text is returned. Intermediate NER transcripts and rejected
+partially redacted documents are not exported; maps do not copy detected original
+values. Undetected content can remain in the edited text. Output and preparation
+charges survive complete serialization, writing and flushing.
 
 ## Scope and verification
 
