@@ -29,6 +29,16 @@ impl Int8ExtractionBatchPlanner {
         Ok(Self { compiler: ExtractionBatchPlanner::pinned_for_backend(controls, eos, identity,
             ceiling, compiler_limits, source_limits, defaults, ExtractionBackend::Int8)? })
     }
+    /// Observe the caller's SAME control before and after bounded schema/source
+    /// preparation. No fresh quota/deadline or no-op control is constructed.
+    /// Tokenizer/compiler calls themselves are not internally preemptible.
+    pub fn prepare_with_control<C: DecodeStepControl>(&self, document: BatchDocument<ExtractionBatchArgs>,
+        control: &mut C) -> Result<PreparedInt8BatchExtraction, BatchItemFailure> {
+        preparation_checkpoint(control)?;
+        let result = self.prepare(document);
+        preparation_checkpoint(control)?;
+        result
+    }
     pub fn prepare(&self, document: BatchDocument<ExtractionBatchArgs>) -> Result<PreparedInt8BatchExtraction, BatchItemFailure> {
         let input = self.compiler.prepare_input(document).map_err(planning_fault)?;
         let ExtractionInput { task, source, schema, options, grounded, .. } = input;
@@ -45,6 +55,10 @@ impl Int8ExtractionBatchPlanner {
 impl PreparedInt8BatchExtraction {
     pub fn execution_identity(&self) -> &ExecutionIdentity { self.plan.execution_identity() }
     pub fn extraction_plan(&self) -> &Int8ExtractPlan { &self.plan }
+    /// Transfer the exact sealed executable to a single-request host without
+    /// copying tokens, recompiling a grammar or changing admission identity.
+    /// The plan owns its source binding; the extra inspection copies can drop.
+    pub fn into_extraction_plan(self) -> Int8ExtractPlan { self.plan }
     pub fn task_plan(&self) -> &TaskPlan { &self.task }
     pub fn source(&self) -> &SourceDocument { &self.source }
     pub fn planned_work(&self) -> Int8Work { self.plan.planned_work() }
@@ -125,6 +139,18 @@ impl<A: Int8ExtractionBatchAdmission> BatchProcessor for NativeInt8ExtractionBat
         self.run.failed = true;
         let result = (|| {
             let prepared = self.compiler.prepare(document)?;
+            preflight(&prepared, &self.driver)?;
+            Ok(prepared)
+        })();
+        if !result.as_ref().is_err_and(|e: &BatchItemFailure| e.stop) { self.run.failed = false; }
+        result
+    }
+    fn prepare_with_control<C: DecodeStepControl>(&mut self, document: BatchDocument<Self::Args>,
+        control: &mut C) -> Result<Self::Prepared, BatchItemFailure> {
+        self.run.ready()?;
+        self.run.failed = true;
+        let result = (|| {
+            let prepared = self.compiler.prepare_with_control(document, control)?;
             preflight(&prepared, &self.driver)?;
             Ok(prepared)
         })();
@@ -261,6 +287,12 @@ fn valid_result(prepared: &PreparedInt8BatchExtraction, result: &Int8ExtractRun,
         && expected == Some(result.model_work) && fits(result.model_work, prepared.planned_work())
         && out.forward_positions == result.model_work.forward_positions
         && out.projected_logits == result.model_work.projected_logits && out.mask_node_visit_charge <= masks
+}
+fn preparation_checkpoint<C: DecodeStepControl>(control: &mut C) -> Result<(), BatchItemFailure> {
+    match control.prefill_checkpoint(0) {
+        Some(cause) => Err(BatchItemFailure::fatal(BatchFault::cancelled(cause))),
+        None => Ok(()),
+    }
 }
 fn planning_fault(fault: BatchFault) -> BatchItemFailure {
     if matches!(fault.code, BatchCode::Allocation | BatchCode::InvalidExecution | BatchCode::Admission | BatchCode::Serialization) {

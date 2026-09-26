@@ -22,6 +22,7 @@ mod tests;
 mod source;
 mod batch;
 mod scored;
+mod extract;
 
 const MIB: u64 = 1024 * 1024;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -84,6 +85,7 @@ pub(crate) enum CandidateCommand {
     Text { task: Task, args: CandidateArgs },
     Source(source::SourceCommand),
     Scored(scored::ScoredCommand),
+    Extract(extract::ExtractCommand),
     Batch(batch::BatchCommand),
 }
 
@@ -95,6 +97,7 @@ pub(crate) fn definition() -> clap::Command {
         .subcommands(source::definitions())
         .subcommands(scored::definitions())
         .subcommand(batch::definition())
+        .subcommand(extract::definition())
         .subcommand(CandidateArgs::augment_args(clap::Command::new("generate")
             .about("Generate from a bounded UTF-8 prompt using the pinned chat template")))
         .subcommand(CandidateArgs::augment_args(clap::Command::new("chat")
@@ -105,6 +108,9 @@ impl CandidateCommand {
     pub(crate) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let (name, matches) = matches.subcommand().ok_or_else(||
             clap::Error::raw(clap::error::ErrorKind::MissingSubcommand, "candidate task required"))?;
+        if name == "extract" {
+            return extract::ExtractCommand::from_arg_matches(matches).map(Self::Extract);
+        }
         if name == "batch" {
             return batch::BatchCommand::from_arg_matches(matches).map(Self::Batch);
         }
@@ -149,6 +155,7 @@ impl CandidateCommand {
         let (task, args) = match self {
             Self::Source(command) => return command.execute(input, output),
             Self::Scored(command) => return command.execute(input, output),
+            Self::Extract(command) => return command.execute(input, output),
             // A borrowed stream cannot outlive the hosted blocking closure.
             // The executable dispatcher always takes run_stdio for batch.
             Self::Batch(_) => return Err(CandidateError::Arguments),

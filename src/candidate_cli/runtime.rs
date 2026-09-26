@@ -2,6 +2,7 @@
 pub(super) mod source_tasks;
 pub(super) mod batch_tasks;
 pub(super) mod scored_tasks;
+pub(super) mod extraction;
 use std::{fs::File, time::{Duration, Instant}};
 use super::*;
 use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
