@@ -205,10 +205,24 @@ impl SentimentPlanner {
     /// scalar fallback, or flatten-and-retokenize retry is permitted.
     pub fn plan(&self, request: &SentimentRequest, context: &PlanContext<'_>, limits: SentimentLimits)
         -> Result<SentimentPlan, SentimentPlanningError> {
+        self.plan_for_profile(request, context, limits, NumericsProfile::HfBf16Eager)
+    }
+
+    // Only the two typed public entrypoints choose a profile. In particular,
+    // INT8 preparation never temporarily rewrites a BF16 execution identity.
+    pub(super) fn plan_for_profile(&self, request: &SentimentRequest,
+        context: &PlanContext<'_>, limits: SentimentLimits, profile: NumericsProfile)
+        -> Result<SentimentPlan, SentimentPlanningError> {
         let identity = context.execution_identity();
+        if !matches!(&profile, NumericsProfile::HfBf16Eager | NumericsProfile::StrictQuantized { version: 1 })
+            || (matches!(&profile, NumericsProfile::StrictQuantized { .. })
+                && (identity.backend_semantic_version != crate::native_engine::strict_int8::STRICT_INT8_EXECUTION
+                    || identity.kv_dtype != "bf16")) {
+            return Err(SentimentPlanningError::Identity);
+        }
         if identity.task_spec != "sentiment-v1" || identity.template_digest != self.template_digest
             || identity.tokenizer_digest != self.tokenizer_digest()
-            || identity.numerics_profile != NumericsProfile::HfBf16Eager
+            || identity.numerics_profile != profile
             || identity.thinking_mode != ThinkingMode::Disabled || identity.tool_mode != ToolMode::None {
             return Err(SentimentPlanningError::Identity);
         }
