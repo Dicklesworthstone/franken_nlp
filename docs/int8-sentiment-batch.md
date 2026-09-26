@@ -38,3 +38,25 @@ ownership, accounting, identity, per-record overrides and failure transitions.
 The fixture is not neural inference. Rust compilation/tests, full-model runs,
 quality/performance and controller DSR qualification were not executed while
 implementing this module. Candidate and release evidence grades remain unchanged.
+
+## Process-hosted execution
+
+With `asupersync-runtime`, `NlpEngine::batch_int8_sentiment` accepts a charged
+`ResidentInt8`, shared `SentimentPlanner`, `hosted::corpus::SentimentCorpusConfig`
+(the same typed batch configuration), `CorpusLimits`, owned IO and cancellation.
+The process host supplies concrete ledger-backed admission, loads no additional
+weights, constructs one native engine and retains it through the stream. Whole
+KV capacity and complete output bounds are checked before allocation; inputs,
+workspace and output retain the existing physical-completion ownership rules.
+
+The host supports the library's named scoring modes without pretending selected
+logit rows are generated tokens. Complete sentiment result storage is reserved
+as a whole. No native scoring mode becomes calibrated confidence by being hosted.
+The CLI's scored stream chooses full-vocabulary candidate/EOS scoring explicitly.
+
+Classification corpus preparation now also borrows its real run controller,
+rather than creating a fresh no-op controller. A final checkpoint before handing
+off completed classification output retains late cancellation. The standalone
+uncontrolled planner entry remains available for compatibility. Added host and
+classification-control tests are model-free sources; Rust execution and DSR
+qualification remain pending, not inferred from source or hash checks.

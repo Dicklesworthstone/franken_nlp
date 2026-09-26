@@ -57,10 +57,18 @@ impl<'p> Int8ClassificationBatchPlanner<'p> {
         Ok(Self { planner, identity, ceiling, limits, defaults, binding })
     }
     pub fn prepare(&self, document: BatchDocument<ClassificationBatchArgs>) -> Result<PreparedInt8BatchClassification, BatchItemFailure> {
+        self.prepare_with_control(document, &mut Continue)
+    }
+    /// Corpus callers lend their actual controller; standalone prepare retains
+    /// its explicitly uncontrolled compatibility behavior.
+    pub fn prepare_with_control<C: DecodeStepControl>(&self, document: BatchDocument<ClassificationBatchArgs>,
+        control: &mut C) -> Result<PreparedInt8BatchClassification, BatchItemFailure> {
+        checkpoint(control)?;
         let args = document.task_args.or_else(|| self.defaults.clone()).ok_or_else(|| BatchItemFailure::reject(BatchCode::Planning))?;
         let context = PlanContext::new(&self.identity, self.ceiling).map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
-        let plan = self.planner.plan_int8_with_control(&args.into_request(document.text), &context, self.limits, &mut Continue)
+        let plan = self.planner.plan_int8_with_control(&args.into_request(document.text), &context, self.limits, control)
             .map_err(planning_failure)?;
+        checkpoint(control)?;
         Ok(PreparedInt8BatchClassification { plan, factory_binding: self.binding })
     }
     fn verify(&self, prepared: &PreparedInt8BatchClassification) -> Result<(), BatchItemFailure> {
@@ -87,12 +95,23 @@ impl<A: Int8ClassificationAdmission> BatchProcessor for NativeInt8Classification
     type Prepared = PreparedInt8BatchClassification;
     type Output = GuardedOutput<Int8ClassificationRun, A::Guard>;
     fn prepare(&mut self, document: BatchDocument<Self::Args>) -> Result<Self::Prepared, BatchItemFailure> {
+        self.prepare_with_control(document, &mut Continue)
+    }
+    fn prepare_with_control<C: DecodeStepControl>(&mut self, document: BatchDocument<Self::Args>,
+        control: &mut C) -> Result<Self::Prepared, BatchItemFailure> {
         self.ledger.ready()?;
-        let prepared = self.compiler.prepare(document)?;
-        subtract(self.ledger.remaining, prepared.model_work())?;
-        prepared.plan.preflight(prepared.execution_identity(), self.engine, budget(&prepared.plan))
-            .map_err(planning_failure)?;
-        Ok(prepared)
+        // A panic during compilation must not leave the adapter reusable.
+        self.ledger.state = State::Running;
+        let result = (|| {
+            let prepared = self.compiler.prepare_with_control(document, control)?;
+            subtract(self.ledger.remaining, prepared.model_work())?;
+            prepared.plan.preflight(prepared.execution_identity(), self.engine, budget(&prepared.plan))
+                .map_err(planning_failure)?;
+            checkpoint(control)?;
+            Ok(prepared)
+        })();
+        self.ledger.finish(result.as_ref().err());
+        result
     }
     fn planned_work(&self, prepared: &Self::Prepared) -> BatchWork { transport_work(prepared.model_work()) }
     fn execute<C: DecodeStepControl>(&mut self, prepared: Self::Prepared, control: &mut C)
@@ -119,6 +138,8 @@ where F: FnOnce(&ExecutionIdentity, &mut C) -> Result<T, BatchItemFailure> {
     plan.verify_identity(&admitted).map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
     checkpoint(control)?;
     let value = execute(&admitted, control)?;
+    // A deadline expiring during finalization suppresses the completed value.
+    checkpoint(control)?;
     Ok(GuardedOutput::new(value, guard))
 }
 fn budget(plan: &PreparedInt8Classification) -> Int8ScoringBudget {
@@ -177,3 +198,5 @@ struct Continue;
 impl DecodeStepControl for Continue { fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None } }
 
 #[cfg(test)] mod tests;
+
+#[cfg(test)] mod control_tests;
