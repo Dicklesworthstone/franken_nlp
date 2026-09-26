@@ -1,4 +1,5 @@
 //! Candidate classification/sentiment reuse the same admitted model and host.
+pub(in crate::candidate_cli) mod batch;
 use super::*;
 use super::source_tasks::Session;
 use crate::{
