@@ -9,6 +9,7 @@ use crate::{
 };
 use source::{Kind, SourceHostArgs};
 mod writer;
+mod extraction;
 pub(super) use writer::CandidateWriter;
 #[cfg(test)] mod tests;
 
@@ -22,14 +23,21 @@ pub(crate) struct BatchCommand {
     /// NDJSON {id,text,task_args?} records; '-' reads stdin. No whole-file buffering.
     #[arg(default_value = "-")]
     pub(super) input: PathBuf,
-    #[arg(long, value_parser = ["ner", "keyphrases", "summarize", "answer"])]
+    #[arg(long, value_parser = ["ner", "keyphrases", "summarize", "answer", "extract"])]
     pub(super) task: String,
     #[command(flatten)]
     pub(super) host: SourceHostArgs,
-    /// Optional bounded local SourceBatchArgs JSON. QA without defaults requires
-    /// per-record task_args with explicit evidence passages and finite budgets.
+    /// Optional bounded local SourceBatchArgs or ExtractionBatchArgs JSON.
+    /// Without defaults, QA/extract records require complete typed task_args.
     #[arg(long, value_name = "FILE")]
     pub(super) defaults: Option<PathBuf>,
+    /// Extract only: a shared exact local schema, using the CLI task budget.
+    /// Otherwise supply --defaults or a complete schema in every task_args.
+    #[arg(long, value_name = "FILE", conflicts_with = "defaults")]
+    pub(super) schema: Option<PathBuf>,
+    /// Extract only: bind the shared schema's verbatim fields to EACH document.
+    #[arg(long, requires = "schema")]
+    pub(super) source_membership: bool,
     /// Nonempty records, including malformed documents and flush commands.
     #[arg(long, default_value_t = 1000)]
     pub(super) max_requests: u64,
@@ -54,19 +62,21 @@ pub(super) struct CorpusEnvelope {
 
 pub(super) fn definition() -> clap::Command {
     BatchCommand::augment_args(clap::Command::new("batch")
-        .about("Process bounded source-task NDJSON using one resident candidate model")
-        .long_about("Run one fixed source task over bounded ordered NDJSON. Each event carries non-authoritative candidate provenance. Weights and the native engine are reused; this is serial item-local execution, not parallel/GEMM batching or a durable job. Earlier completed records remain valid if later records fail. Any document failure produces a nonzero process exit."))
+        .about("Process bounded schema/source-task NDJSON using one resident candidate model")
+        .long_about("Run one fixed task over bounded ordered NDJSON. Each event carries non-authoritative candidate provenance. Weights and the native engine are reused; this is serial item-local execution, not parallel/GEMM batching or a durable job. Earlier completed records remain valid if later records fail. Any document failure produces a nonzero process exit."))
 }
 impl BatchCommand {
     pub(super) fn kind(&self) -> Result<Kind, CandidateError> {
         Kind::named(&self.task).ok_or(CandidateError::Arguments)
     }
     pub(super) fn task(&self) -> Result<BuiltInTask, CandidateError> {
+        if self.task == "extract" { return Ok(BuiltInTask::Extract); }
         Ok(match self.kind()? { Kind::Ner => BuiltInTask::Ner, Kind::Keyphrases => BuiltInTask::Keyphrases,
             Kind::Summarize => BuiltInTask::Summarize, Kind::Answer => BuiltInTask::Answer })
     }
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits, CorpusEnvelope), CandidateError> {
-        self.kind()?;
+        self.task()?;
+        self.validate_extraction_flags()?;
         let (args, limits) = self.host.common(self.input.clone())?;
         if self.max_requests == 0 || self.max_requests > 100_000
             || self.max_line_bytes < self.host.max_input_bytes || self.max_line_bytes > 4 * 1024 * 1024

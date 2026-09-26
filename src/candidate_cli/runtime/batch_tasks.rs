@@ -7,6 +7,7 @@ use crate::{
 };
 use crate::candidate_cli::batch::{self as command, BatchCommand, CandidateWriter, CorpusEnvelope, IO_BUFFER_BYTES};
 use super::source_tasks::{Session, planner, source_identity};
+mod extraction;
 
 #[derive(Serialize)]
 struct Provenance<'a> {
@@ -26,6 +27,9 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static, W: Write + Sen
     command: BatchCommand, args: CandidateArgs, limits: Limits, envelope: CorpusEnvelope,
     mut input: R, output: W,
 ) -> Result<(), CandidateError> {
+    if command.task == "extract" {
+        return extraction::execute(command, args, limits, envelope, input, output);
+    }
     let session = Session::new(&args, limits)?;
     let raw_defaults = command.defaults.as_ref()
         .map(|path| session.read(path, &mut input, MAX_SOURCE_ARGUMENT_BYTES)).transpose()?;
