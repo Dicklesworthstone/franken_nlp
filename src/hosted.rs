@@ -24,6 +24,8 @@ use crate::{
 };
 mod dispatch;
 mod scored;
+mod sentiment;
+pub use sentiment::SentimentHostLimits;
 mod redact;
 pub use redact::{RedactConfig, RedactionPseudonyms};
 mod resolve;
@@ -96,6 +98,7 @@ pub enum HostedError {
     Extraction(Int8ExtractError),
     Classification(crate::tasks::classify::quantized::Int8ClassificationError),
     Judge(crate::tasks::judge::quantized::Int8JudgeError),
+    Sentiment(crate::tasks::sentiment::quantized::Int8SentimentError),
     Source(crate::tasks::source_planning::quantized::Int8SourceError),
     SourceMap(crate::tasks::source_planning::quantized::long::Int8SourceMapError),
     Resolution(crate::corpus::native_resolve::quantized::Int8ResolveError),
@@ -125,6 +128,7 @@ impl fmt::Display for HostedError {
             Self::Extraction(_) => "hosted native extraction failed",
             Self::Classification(_) => "hosted native classification failed",
             Self::Judge(_) => "hosted native judgment failed",
+            Self::Sentiment(_) => "hosted native sentiment failed",
             Self::Source(_) => "hosted native source task failed",
             Self::SourceMap(_) => "hosted native source map failed",
             Self::Resolution(_) => "hosted native entity resolution failed",
@@ -144,7 +148,7 @@ impl Error for HostedError {
             Self::Join { source, .. } => Some(source), Self::Scope { source, .. } => Some(source),
             Self::Model(e) => Some(e), Self::Native(e) => Some(e), Self::Chat(e) => Some(e),
             Self::SourceMap(e) => Some(e), Self::Resolution(e) => Some(e),
-            Self::Redaction(e) => Some(e),
+            Self::Redaction(e) => Some(e), Self::Sentiment(e) => Some(e),
             Self::Source(e) => Some(e), Self::Judge(e) => Some(e), Self::Classification(e) => Some(e), Self::Extraction(e) => Some(e), Self::BatchSetup(e) => Some(e), Self::Batch(e) => Some(e), _ => None,
         }
     }
