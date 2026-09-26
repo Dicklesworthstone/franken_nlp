@@ -1,6 +1,7 @@
 //! One-shot candidate CLI on the existing process resource host.
 pub(super) mod source_tasks;
 pub(super) mod batch_tasks;
+pub(super) mod scored_tasks;
 use std::{fs::File, time::{Duration, Instant}};
 use super::*;
 use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,

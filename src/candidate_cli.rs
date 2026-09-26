@@ -21,6 +21,7 @@ mod runtime;
 mod tests;
 mod source;
 mod batch;
+mod scored;
 
 const MIB: u64 = 1024 * 1024;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -82,6 +83,7 @@ pub(crate) struct CandidateArgs {
 pub(crate) enum CandidateCommand {
     Text { task: Task, args: CandidateArgs },
     Source(source::SourceCommand),
+    Scored(scored::ScoredCommand),
     Batch(batch::BatchCommand),
 }
 
@@ -91,6 +93,7 @@ pub(crate) fn definition() -> clap::Command {
         .long_about("Execute an explicitly selected local current-candidate INT8 artifact. This is not release activation, publisher authentication, numerical qualification or a production certification. No network, automatic download, thinking mode or tool execution is available. Single requests emit a completed JSON object; batch emits ordered candidate-framed NDJSON, not token events.")
         .subcommand_required(true)
         .subcommands(source::definitions())
+        .subcommands(scored::definitions())
         .subcommand(batch::definition())
         .subcommand(CandidateArgs::augment_args(clap::Command::new("generate")
             .about("Generate from a bounded UTF-8 prompt using the pinned chat template")))
@@ -107,6 +110,9 @@ impl CandidateCommand {
         }
         if let Some(kind) = source::Kind::named(name) {
             return source::SourceCommand::from_matches(kind, matches).map(Self::Source);
+        }
+        if let Some(kind) = scored::Kind::named(name) {
+            return scored::ScoredCommand::from_matches(kind, matches).map(Self::Scored);
         }
         let task = match name {
             "generate" => Task::Generate,
@@ -142,6 +148,7 @@ impl CandidateCommand {
     fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
         let (task, args) = match self {
             Self::Source(command) => return command.execute(input, output),
+            Self::Scored(command) => return command.execute(input, output),
             // A borrowed stream cannot outlive the hosted blocking closure.
             // The executable dispatcher always takes run_stdio for batch.
             Self::Batch(_) => return Err(CandidateError::Arguments),
