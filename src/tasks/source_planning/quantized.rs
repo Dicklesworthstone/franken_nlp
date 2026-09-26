@@ -22,6 +22,7 @@ use crate::{
 };
 
 pub mod long;
+pub mod capacity;
 
 pub const INT8_SOURCE_EXECUTION: &str = "portable-int8-source-portfolio-v1";
 
