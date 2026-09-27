@@ -1,5 +1,6 @@
 //! Owned long-document planning and native map/merge on the existing host.
 use super::*;
+mod summary;
 use crate::{
     native_engine::{constrained_int8, lmhead::NANBEIGE_VOCAB_SIZE},
     tasks::{ir::{PlanContext, TaskBudget}, source_planning::{SourcePlanningLimits, SourceTaskPlanner,

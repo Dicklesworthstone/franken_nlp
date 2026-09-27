@@ -1,6 +1,7 @@
 //! One long original document, losslessly partitioned before native map/merge.
-//! No linguistic-boundary, global synthesis, global ranking or recall claims.
+//! Optional evidence-union ranking is distinct from neural global synthesis.
 use super::*;
+pub(super) mod summary;
 use serde::de::DeserializeOwned;
 use crate::{native_engine::{portable_int8::ProjectionWork, strict_int8::Int8Work},
     tasks::{BuiltInTask, mapreduce::{ChunkLimits, ExecutionLimits},
@@ -22,6 +23,8 @@ pub(crate) struct MapCommand {
     /// to each chunk; input bytes apply to the complete original document.
     #[command(flatten)]
     pub(super) host: source::SourceHostArgs,
+    #[command(flatten)]
+    pub(super) summary: summary::SummaryArgs,
     /// Complete typed options for the selected task; never prompt instructions.
     #[arg(long, value_name = "FILE")]
     pub(super) options: Option<PathBuf>,
@@ -62,7 +65,7 @@ pub(crate) struct MapCommand {
 pub(super) fn definition() -> clap::Command {
     MapCommand::augment_args(clap::Command::new("map")
         .about("Process a long document with source-aligned, independent native chunk results")
-        .long_about("Losslessly partition one UTF-8 document using the actual pinned task scaffold and source encoder, then run NER, keyphrases or cited summaries on one resident candidate model. Output retains ordered independent chunk results and original-document coordinates. This is not a global synthesized summary, global entity census, global ranking, overlapping-window analysis or single-context-equivalence claim. No partial success is published."))
+        .long_about("Losslessly partition one UTF-8 document using the actual pinned task scaffold and source encoder, then run NER, keyphrases or cited summaries on one resident candidate model. By default output retains ordered independent chunk results and original-document coordinates; it is not a global synthesized summary, global entity census or global ranking. Add --reduce-summary with --task summarize for exact bullet/evidence union and a final document-wide ranking of existing bullets, without a neural synthesis pass. Neither mode establishes overlapping-window analysis or single-context equivalence. No partial success is published."))
 }
 
 impl MapCommand {
@@ -72,6 +75,7 @@ impl MapCommand {
     }
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), CandidateError> {
         self.kind()?;
+        self.summary.validate(&self.task, self.max_map_result_bytes)?;
         let (args, limits) = self.host.common(self.input.clone())?;
         if self.host.max_input_bytes < 4 || !(1..=MAX_CHUNKS).contains(&self.max_chunks)
             || !(1..=1_000_000).contains(&self.max_tokenizer_calls)

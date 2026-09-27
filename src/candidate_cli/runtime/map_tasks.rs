@@ -1,5 +1,6 @@
 //! Long-document candidate inference on the existing charged map/merge host.
 use super::*;
+mod summary;
 use std::sync::Arc;
 use super::source_tasks::{Session, planner, source_identity};
 use crate::{candidate_cli::map::MapCommand,
@@ -65,6 +66,8 @@ pub(in crate::candidate_cli) fn execute(command: MapCommand, args: CandidateArgs
     let capacity = planner.int8_map_capacity_with_control(&task, budget, &context,
         command.host.planning(), &mut session.control()).map_err(|_| CandidateError::Planning)?;
     let mapping = command.mapping(capacity)?;
+    let summary = command.summary.limits(command.max_map_result_bytes)?;
+    if let Some(limits) = summary { limits.validate(mapping).map_err(|_| CandidateError::Planning)?; }
     let expected = preflight(&text, &planner, &command, capacity, mapping, budget, &mut session.control())?;
     session.remaining()?;
     // No weights until the complete partition and all five work axes fit.
@@ -73,17 +76,27 @@ pub(in crate::candidate_cli) fn execute(command: MapCommand, args: CandidateArgs
     let config = SourceMapConfig { identity, task, budget, planning: command.host.planning(), mapping,
         native: session.native(&args)?, preparation_reserve_bytes: limits.preparation_bytes,
         reduction_reserve_bytes: command.reduction_reserve_mib.checked_mul(MIB).ok_or(CandidateError::Arguments)? };
+    if let Some(limits) = summary {
+        let result = session.engine.summarize_int8_source(&model, text, Arc::new(planner), Arc::new(vocabulary),
+            config, limits, cancellation).map_err(|_| CandidateError::Execution)?;
+        summary::check_completed(&expected, result.result(), limits.max_bullets)?;
+        return deliver(&session, &facts, &result, command.max_map_result_bytes + 4096, output);
+    }
     let result = session.engine.map_int8_source(&model, text, Arc::new(planner), Arc::new(vocabulary),
         config, cancellation).map_err(|_| CandidateError::Execution)?;
-    session.remaining()?;
     check_completed(&expected, result.result())?;
+    deliver(&session, &facts, &result, command.max_map_result_bytes + 4096, output)
+}
+fn deliver<T: Serialize>(session: &Session, facts: &ArtifactIdentity, result: &T,
+    cap: usize, output: &mut impl Write) -> Result<(), CandidateError> {
+    session.remaining()?;
     let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
         evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,
         source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
-        quant_recipe: &facts.recipe_id, output: &result };
+        quant_recipe: &facts.recipe_id, output: result };
     // Both host output ownership and the CLI's aggregate staging reservation
     // remain live through complete serialization, external write and flush.
-    publish(&response, command.max_map_result_bytes + 4096, output)
+    publish(&response, cap, output)
 }
 
 fn check_completed(expected: &Preflight, result: &Int8SourceMapRun) -> Result<(), CandidateError> {
