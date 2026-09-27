@@ -1,5 +1,6 @@
 //! Model-backed detector-union redaction. Only completed edited text is exported.
 use super::*;
+pub(super) mod long;
 use clap::ValueEnum;
 use crate::tasks::{ner::NerOptions, redact::{PiiKind, RedactionRequest,
     actions::RedactionAction, pseudonym::PseudonymKey}};
@@ -24,6 +25,8 @@ pub(crate) struct RedactCommand {
     pub(super) input: PathBuf,
     #[command(flatten)]
     pub(super) host: SourceHostArgs,
+    #[command(flatten)]
+    pub(super) long: long::LongArgs,
     /// Mask never expands the detected source; placeholders/pseudonyms may expand it.
     #[arg(long, value_enum, default_value = "mask")]
     action: Action,
@@ -61,11 +64,12 @@ pub(crate) struct RedactCommand {
 pub(super) fn definition() -> clap::Command {
     RedactCommand::augment_args(clap::Command::new("redact")
         .about("Redact with native source-bound NER plus rules; verify the edited text afresh")
-        .after_help("Verification covers only the selected detector union, not all PII. Model omissions and Unicode obfuscations remain possible. Pseudonyms are not anonymization. This candidate command emits one completed JSON object, never intermediate NER text. Pseudonymization always uses full 256-bit HMAC; raw key bytes have no argv option. The independent fnlp redact --rules-only command remains model-free."))
+        .after_help("Verification covers only the selected detector union, not all PII. Model omissions and Unicode obfuscations remain possible. Pseudonyms are not anonymization. This candidate command emits one completed JSON object, never intermediate NER text. Pseudonymization always uses full 256-bit HMAC; raw key bytes have no argv option. Add --chunked for long documents: rules scan whole text while NER uses source-aligned chunks, then verification re-chunks the actual edited text. NER chunk boundaries may split entities; whole-operation work limits never renew per chunk. The independent fnlp redact --rules-only command remains model-free."))
 }
 impl RedactCommand {
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), CandidateError> {
         let (common, limits) = self.host.common(self.input.clone())?;
+        self.long.validate(&self.host, limits)?;
         if self.rules.is_empty() || !(1..=16_384).contains(&self.max_detections)
             || self.max_rule_work == 0 || self.max_rule_work > 1_000_000_000_000
             || self.ner_options.as_ref().is_some_and(|p| p.as_os_str().is_empty() || p.as_os_str() == "-") {

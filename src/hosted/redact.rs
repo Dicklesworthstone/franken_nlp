@@ -1,5 +1,6 @@
 //! One process-owned redaction invocation, including fresh NER verification.
 use super::*;
+mod long;
 use crate::{
     native_engine::constrained_int8,
     tasks::{ner::NER_TASK_VERSION, source_planning::SourceTaskPlanner,
@@ -8,15 +9,16 @@ use crate::{
             quantized::{Int8Redactor, Int8RedactionConfig, Int8RedactionError, Int8RedactionRun}}},
 };
 
-/// The two NER passes share one recipe, engine, deadline and work ledger.
-/// Preparation must cover the planner/vocabulary, temporary encoded sources,
-/// grammar state, configuration and allocator overhead. Editing headroom covers
-/// rule/union vectors, replacement strings, maps and occurrence verification.
+/// The two NER stages share one recipe, engine, deadline and work ledger.
+/// The default detector is the unchanged short-document path; the concrete
+/// LongRedactionConfig specialization admits source-aligned NER maps instead.
+/// Preparation covers planner/vocabulary, encoded sources, grammars and slack.
+/// Editing headroom covers rules, unions, replacements, maps and verification.
 /// Both are explicit modeled reservations, not measured/enforced RSS limits.
-pub struct RedactConfig {
+pub struct RedactConfig<D = Int8RedactionConfig> {
     pub ner_identity: ExecutionIdentity,
     pub request: RedactionRequest,
-    pub detector: Int8RedactionConfig,
+    pub detector: D,
     pub native: NativeLimits,
     pub preparation_reserve_bytes: u64,
     pub edit_reserve_bytes: u64,
@@ -30,11 +32,11 @@ pub struct RedactionPseudonyms {
     pub key: Arc<PseudonymKey>,
     pub namespace: String,
 }
-struct RedactInput {
+struct RedactInput<D = Int8RedactionConfig> {
     source: String,
     planner: Arc<SourceTaskPlanner>,
     vocabulary: Arc<ExtractionVocabulary>,
-    config: RedactConfig,
+    config: RedactConfig<D>,
     pseudonyms: Option<RedactionPseudonyms>,
 }
 
@@ -128,7 +130,7 @@ fn validate(config: &RedactConfig, source_bytes: usize, tokenizer: Sha256Digest,
     }
     Ok(())
 }
-fn input_bytes(source: &String, config: &RedactConfig, secret: Option<&RedactionPseudonyms>) -> Result<u64, HostedError> {
+fn input_bytes<D>(source: &String, config: &RedactConfig<D>, secret: Option<&RedactionPseudonyms>) -> Result<u64, HostedError> {
     let secret_bytes = if let Some(secret) = secret {
         if secret.namespace.is_empty() || secret.namespace.len() > 256 { return Err(redaction_error(RedactError::InvalidOptions)); }
         // Key block/id are bounded by PseudonymKey construction. This prices

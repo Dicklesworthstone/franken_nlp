@@ -1,5 +1,6 @@
 //! One charged native redactor; original and verification passes share a ceiling.
 use super::*;
+mod long;
 use std::sync::Arc;
 use super::source_tasks::{Session, planner, source_identity};
 use crate::{candidate_cli::redact::{self as command, RedactCommand},
@@ -67,6 +68,11 @@ pub(in crate::candidate_cli) fn execute(command: RedactCommand, common: Candidat
     let facts = session.facts(&common)?;
     let (planner, vocabulary) = planner()?;
     let identity = source_identity(&facts, &planner, BuiltInTask::Ner)?;
+    if command.long.chunked {
+        return long::execute(&command, &common, limits, &session, long::Input {
+            source: text, ner, request, secret, facts, planner, vocabulary, identity,
+        }, output);
+    }
     let detector = detector(&text, ner, &request, &identity, &planner, &command, limits, &mut session.control())?;
     session.remaining()?;
     let cancellation = CancellationToken::default();
