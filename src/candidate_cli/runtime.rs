@@ -7,6 +7,7 @@ pub(super) mod map_tasks;
 pub(super) mod judgment;
 pub(super) mod redaction;
 pub(super) mod resolution;
+pub(super) mod streaming;
 #[cfg(all(feature = "metadata-store", target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(super) mod owned_jobs;
@@ -56,31 +57,7 @@ pub(super) fn execute(task: Task, args: CandidateArgs, limits: Limits,
         let source = CurrentCandidateArtifactSource::open(&args.model).map_err(|_| CandidateError::Model)?;
         source.identity().clone()
     };
-    let identity = candidate_identity(&facts)?;
-    let controls = pinned_controls::pinned().map_err(|_| CandidateError::Identity)?;
-    let eos = controls.template_controls().entries().iter()
-        .find(|entry| entry.special && entry.surface == crate::template::IM_END)
-        .map(|entry| entry.id).ok_or(CandidateError::Identity)?;
-    let budget = TaskBudget {
-        max_input_tokens: u32::try_from(limits.max_prompt_tokens).map_err(|_| CandidateError::Arguments)?,
-        max_output_tokens: u32::try_from(args.max_new_tokens).map_err(|_| CandidateError::Arguments)?,
-        max_output_bytes: limits.result_bytes as u64, max_grammar_states: 1,
-        max_kv_bytes: limits.kv_bytes,
-    };
-    let planner = Int8ChatPlanner::pinned(controls.template_controls(), eos, identity, budget,
-        ChatLimits { max_messages: 128, max_message_bytes: args.max_input_bytes,
-            max_total_message_bytes: args.max_input_bytes, generation: args.generation_limits(limits) })
-        .map_err(|_| CandidateError::Planning)?;
-    let options = args.options(eos)?;
-    let prepared = match messages {
-        Some(messages) => planner.plan_chat(&ChatRequest { item_id: "cli".to_owned(), sample_index: 0,
-            messages, generation: options, budget }),
-        None => planner.plan_generate(&GenerateRequest { item_id: "cli".to_owned(), sample_index: 0,
-            prompt: text, generation: options, budget }),
-    }.map_err(|_| CandidateError::Planning)?;
-    if prepared.planned_work().forward_positions > args.context_tokens as u64 {
-        return Err(CandidateError::Planning);
-    }
+    let prepared = streaming::prepare(&args, limits, text, messages, &facts)?;
     let cancellation = CancellationToken::default();
     let model = engine.load_current_candidate_int8(args.model.clone(), LoadLimits {
         artifact: ArtifactLoadBudget::streaming_only(limits.weight_bytes, 64 * 1024),

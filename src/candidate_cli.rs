@@ -29,6 +29,7 @@ mod map;
 mod judge;
 mod redact;
 mod resolve;
+mod stream;
 
 const MIB: u64 = 1024 * 1024;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -100,12 +101,13 @@ pub(crate) enum CandidateCommand {
     ScoreBatch(scored_batch::ScoreBatchCommand),
     Job(jobs::JobCommand),
     ScoreJob(jobs::scored::ScoreJobCommand),
+    Stream(stream::StreamCommand),
 }
 
 pub(crate) fn definition() -> clap::Command {
     clap::Command::new("candidate")
         .about("Explicit non-certified local INT8 inference (requires asupersync-runtime)")
-        .long_about("Execute an explicitly selected local current-candidate INT8 artifact. This is not release activation, publisher authentication, numerical qualification or a production certification. No network, automatic download, thinking mode or tool execution is available. Single requests emit a completed JSON object; batch emits ordered candidate-framed NDJSON, not token events.")
+        .long_about("Execute an explicitly selected local current-candidate INT8 artifact. This is not release activation, publisher authentication, numerical qualification or a production certification. No network, automatic download, thinking mode or tool execution is available. Single requests emit a completed JSON object; batch emits ordered candidate-framed NDJSON, not token events. The explicit stream generate/chat route emits provisional token NDJSON with a required final completion frame.")
         .subcommand_required(true)
         .subcommands(source::definitions())
         .subcommands(scored::definitions())
@@ -118,6 +120,7 @@ pub(crate) fn definition() -> clap::Command {
         .subcommand(judge::definition())
         .subcommand(redact::definition())
         .subcommand(resolve::definition())
+        .subcommand(stream::definition())
         .subcommand(CandidateArgs::augment_args(clap::Command::new("generate")
             .about("Generate from a bounded UTF-8 prompt using the pinned chat template")))
         .subcommand(CandidateArgs::augment_args(clap::Command::new("chat")
@@ -128,6 +131,9 @@ impl CandidateCommand {
     pub(crate) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let (name, matches) = matches.subcommand().ok_or_else(||
             clap::Error::raw(clap::error::ErrorKind::MissingSubcommand, "candidate task required"))?;
+        if name == "stream" {
+            return stream::StreamCommand::from_arg_matches(matches).map(Self::Stream);
+        }
         if name == "resolve" {
             return resolve::ResolveCommand::from_arg_matches(matches).map(Self::Resolve);
         }
@@ -177,6 +183,7 @@ impl CandidateCommand {
             Self::ScoreBatch(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::Job(command) => command.run_owned(io::stdin(), &mut io::stdout(), &mut io::stderr()),
             Self::ScoreJob(command) => command.run_owned(io::stdin(), &mut io::stdout(), &mut io::stderr()),
+            Self::Stream(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             other => other.run(&mut io::stdin(), &mut io::stdout(), &mut io::stderr()),
         }
     }
@@ -205,8 +212,8 @@ impl CandidateCommand {
             Self::Redact(command) => return command.execute(input, output),
             Self::Resolve(command) => return command.execute(input, output),
             // A borrowed stream cannot outlive the hosted blocking closure.
-            // The executable dispatcher always takes run_stdio for batch/jobs.
-            Self::Batch(_) | Self::ScoreBatch(_) | Self::Job(_) | Self::ScoreJob(_) => return Err(CandidateError::Arguments),
+            // The executable dispatcher always takes run_stdio for owned IO.
+            Self::Batch(_) | Self::ScoreBatch(_) | Self::Job(_) | Self::ScoreJob(_) | Self::Stream(_) => return Err(CandidateError::Arguments),
             Self::Text { task, args } => (task, args),
         };
         let limits = args.validate()?;
