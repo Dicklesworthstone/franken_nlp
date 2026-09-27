@@ -1,5 +1,6 @@
 //! Complete source/graph/scoring preflight before weights, one native snapshot.
 use super::*;
+mod entities;
 use std::sync::Arc;
 use super::source_tasks::Session;
 use crate::{candidate_cli::resolve::ResolveCommand,
@@ -35,6 +36,7 @@ fn check_result(result: &Int8ResolutionRun, expected: Expected) -> Result<(), Ca
 
 pub(in crate::candidate_cli) fn execute(command: ResolveCommand, common: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
+    if command.discovery.discover_entities { return entities::execute(command, common, limits, input, output); }
     let session = Session::new(&common, limits)?;
     let lease = session.engine.resources().acquire_lease();
     // A separate modeled commitment covers the temporary preflight graph. It

@@ -1,6 +1,7 @@
 //! One process-owned snapshot: source verification, pair planning, INT8 scoring
 //! and conservative complete-link clustering, with output ownership retained.
 use super::*;
+mod entities;
 use std::mem::size_of;
 use crate::{
     corpus::{

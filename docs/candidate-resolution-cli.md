@@ -11,6 +11,10 @@ model and a process memory ceiling.
 fnlp candidate resolve snapshot.json --model ./model.fnlpq --memory-mib 8192
 ```
 
+This page describes the default explicit-mention mode. For raw documents, use
+`--discover-entities`; see [automatic entity discovery](candidate-entity-discovery.md)
+for its NER input, whole-operation limits and no-model behavior.
+
 The input is one JSON object (not NDJSON). Omit the path or use `-` for stdin.
 An explicit options object selects the blocking and uncalibrated margin policy:
 
@@ -51,8 +55,8 @@ Document IDs must be unique. Duplicate mention records, unknown JSON fields,
 duplicate keys (including escaped aliases), invalid policies and oversized
 graphs are rejected. Input cannot provide model identities, scores or budgets.
 
-Mentions are explicit inputs. This command does not discover omitted mentions
-or silently run NER. Existing NER results can supply their exact occurrence
+Without `--discover-entities`, mentions are explicit inputs; this mode does not
+discover omitted mentions or silently run NER. Existing NER results can supply their exact occurrence
 spans: expand every occurrence into a separate mention and retain the unchanged
 original document. Source membership proves location, not correct recognition.
 

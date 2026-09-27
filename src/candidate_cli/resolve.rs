@@ -6,11 +6,14 @@ use crate::{batch::BatchWork,
         native_resolve::{NativeResolveLimits, quantized::Int8ResolveLimits}},
 };
 use scored::ScoredArgs;
+pub(super) mod discovery;
 
 #[derive(Args)]
 pub(crate) struct ResolveCommand {
     #[command(flatten)]
     pub(super) host: ScoredArgs,
+    #[command(flatten)]
+    pub(super) discovery: discovery::DiscoveryArgs,
     #[arg(long, default_value_t = 256)]
     max_documents: usize,
     #[arg(long, default_value_t = 4096)]
@@ -39,7 +42,7 @@ pub(super) struct Input {
 pub(super) fn definition() -> clap::Command {
     ResolveCommand::augment_args(clap::Command::new("resolve")
         .about("Resolve exact source-anchored mentions across a bounded document snapshot")
-        .after_help("Input is {documents:[{id,text,mentions:[{entity_type,surface,span}]}],options:{blocking,context_scalars,minimum_margin_milli}}. Original source and byte/scalar offsets are required. Lexical overlap only selects candidates; both model presentation orders must agree, and complete-link clustering refuses missing or conflicting cross-pairs. Scores are uncalibrated and cluster IDs are snapshot-local. This command does not discover missing mentions or truncate an oversized graph."))
+        .after_help("Input is {documents:[{id,text,mentions:[{entity_type,surface,span}]}],options:{blocking,context_scalars,minimum_margin_milli}}. Original source and byte/scalar offsets are required. Lexical overlap only selects candidates; both model presentation orders must agree, and complete-link clustering refuses missing or conflicting cross-pairs. Scores are uncalibrated and cluster IDs are snapshot-local. Add --discover-entities for raw {id,text} documents and optional top-level ner options. Without that flag, explicit mentions are required. Neither mode truncates an oversized graph."))
 }
 impl ResolveCommand {
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), CandidateError> {
@@ -51,11 +54,13 @@ impl ResolveCommand {
             return Err(CandidateError::Arguments);
         }
         let bytes = self.graph_reserve_mib.checked_mul(MIB).ok_or(CandidateError::Arguments)?;
+        let discovery_bytes = self.discovery.extra_graph_bytes(self.host.context_tokens)?;
         let floor = (self.max_documents as u64).checked_mul(128)
             .and_then(|n| n.checked_add(self.max_mentions as u64 * 1024))
             .and_then(|n| n.checked_add(self.max_pairs as u64 * 4096))
             .and_then(|n| n.checked_add(self.host.max_result_bytes as u64 * 16))
-            .and_then(|n| n.checked_add(MIB)).ok_or(CandidateError::Arguments)?;
+            .and_then(|n| n.checked_add(MIB))
+            .and_then(|n| n.checked_add(discovery_bytes)).ok_or(CandidateError::Arguments)?;
         if bytes < floor || bytes > limits.memory_bytes { return Err(CandidateError::Arguments); }
         Ok((common, limits))
     }
