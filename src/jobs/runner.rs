@@ -12,6 +12,7 @@ use std::{error::Error, fmt, path::Path};
 
 pub mod source;
 pub mod extract;
+pub mod scored;
 
 pub const OWNED_BATCH_PROTOCOL: &str = "fnlp-owned-batch-v1";
 
@@ -151,7 +152,8 @@ impl<'items, 'bytes, P: DurableBatchProcessor> JobRunner<'items, 'bytes, P> {
         let result = self.job.materialize_ordered(control)?;
         self.stopped = false; Ok(result)
     }
-    pub fn verify<C: DecodeStepControl>(&mut self, control: &mut C) -> Result<JobProgress, JobRunError> {
+    pub fn verify<C: DecodeStepControl>(&mut self, control: &mut C)
+        -> Result<JobProgress, JobRunError> {
         if self.is_stopped() { return Err(JobRunError::Stopped); }
         self.stopped = true;
         let result = self.job.verify(control)?;
