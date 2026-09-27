@@ -20,12 +20,14 @@ use crate::{
 
 /// Opt-in complete cited-summary reduction; the default ordered map is unchanged.
 pub mod summary;
+/// Question-aware passage planning and evidence-preserving answer collection.
+pub mod question;
 
 pub const INT8_SOURCE_MAP_EXECUTION: &str = "portable-int8-source-map-ordered-merge-v1";
 const MAX_SOURCE_CHUNKS: usize = 256;
 
-/// Options apply independently to EACH chunk. QA is deliberately excluded:
-/// passage/question semantics cannot be obtained by slicing arbitrary text.
+/// Options apply independently to EACH chunk. Question-aware QA has a separate
+/// SourceQuestion planner; arbitrary source-only maps cannot acquire QA semantics.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "task", content = "options", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceMapTask { Ner(NerOptions), Keyphrases(KeyphraseOptions), Summarize(SummaryOptions) }
@@ -215,23 +217,7 @@ impl PreparedInt8SourceMap<'_> {
     /// last chunk is checked before the first forward, including full resident
     /// KV pricing. The caller retains its process/output guards through delivery.
     pub fn preflight(&self, admitted: &[ExecutionIdentity], engine: &StrictInt8Engine<'_>) -> Result<(), Int8SourceMapError> {
-        verify_identities(&self.plans, admitted)?;
-        if engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) { return Err(Int8SourceMapError::Admission); }
-        let capacity = engine.kv_cache().capacity_positions() as u64;
-        let resident = capacity.checked_mul(KV_BYTES_PER_TOKEN as u64).ok_or(Int8SourceMapError::Admission)?;
-        for (plan, identity) in self.plans.iter().zip(admitted) {
-            constrained_int8::check_profile(identity).map_err(Int8SourceError::from)?;
-            let model = engine.artifact_identity();
-            if model.model_id != "Nanbeige4.2-3B" || model.revision != identity.source_revision
-                || model.recipe_id != identity.quant_recipe
-                || Sha256Digest::from_hex(&model.logical_model_sha256).ok() != Some(identity.logical_model_digest) {
-                return Err(Int8SourceMapError::Admission);
-            }
-            if plan.planned_work().forward_positions > capacity || resident > plan.task_budget().max_kv_bytes {
-                return Err(Int8SourceMapError::Admission);
-            }
-        }
-        Ok(())
+        preflight_plans(&self.plans, admitted, engine)
     }
 
     pub fn execute_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
@@ -264,6 +250,26 @@ impl PreparedInt8SourceMap<'_> {
         size.map_err(Int8SourceError::from)?;
         Ok(result)
     }
+}
+fn preflight_plans(plans: &[PreparedInt8SourceTask], admitted: &[ExecutionIdentity],
+    engine: &StrictInt8Engine<'_>) -> Result<(), Int8SourceMapError> {
+    verify_identities(plans, admitted)?;
+    if engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) { return Err(Int8SourceMapError::Admission); }
+    let capacity = engine.kv_cache().capacity_positions() as u64;
+    let resident = capacity.checked_mul(KV_BYTES_PER_TOKEN as u64).ok_or(Int8SourceMapError::Admission)?;
+    for (plan, identity) in plans.iter().zip(admitted) {
+        constrained_int8::check_profile(identity).map_err(Int8SourceError::from)?;
+        let model = engine.artifact_identity();
+        if model.model_id != "Nanbeige4.2-3B" || model.revision != identity.source_revision
+            || model.recipe_id != identity.quant_recipe
+            || Sha256Digest::from_hex(&model.logical_model_sha256).ok() != Some(identity.logical_model_digest) {
+            return Err(Int8SourceMapError::Admission);
+        }
+        if plan.planned_work().forward_positions > capacity || resident > plan.task_budget().max_kv_bytes {
+            return Err(Int8SourceMapError::Admission);
+        }
+    }
+    Ok(())
 }
 fn verify_identities(plans: &[PreparedInt8SourceTask], admitted: &[ExecutionIdentity]) -> Result<(), Int8SourceMapError> {
     if plans.is_empty() || plans.len() != admitted.len() { return Err(Int8SourceMapError::Admission); }
@@ -352,7 +358,7 @@ fn check_run(plan: &PreparedInt8SourceTask, run: &Int8SourceTaskRun, mask_cap: u
         SourceTaskResult::Ner(r) => (&r.task_spec_version, &r.numerics_profile, &r.generated_token_ids, r.forward_positions, r.projected_logits),
         SourceTaskResult::Keyphrases(r) => (&r.task_spec_version, &r.numerics_profile, &r.generated_token_ids, r.forward_positions, r.projected_logits),
         SourceTaskResult::Summarize(r) => (&r.task_spec_version, &r.numerics_profile, &r.generated_token_ids, r.forward_positions, r.projected_logits),
-        SourceTaskResult::Answer(_) => return Err(Int8SourceError::InvalidResult),
+        SourceTaskResult::Answer(r) => (&r.task_spec_version, &r.numerics_profile, &r.generated_token_ids, r.forward_positions, r.projected_logits),
     };
     let expected = constrained_int8::planned_work(plan.prompt_tokens(), ids.len()).map_err(|_| Int8SourceError::InvalidResult)?;
     if run.schema_version != 1 || run.execution != INT8_SOURCE_EXECUTION
@@ -368,7 +374,7 @@ fn mask_charge(result: &SourceTaskResult) -> Result<u64, Int8SourceError> {
     match result { SourceTaskResult::Ner(r) => Ok(r.mask_node_visit_charge),
         SourceTaskResult::Keyphrases(r) => Ok(r.mask_node_visit_charge),
         SourceTaskResult::Summarize(r) => Ok(r.mask_node_visit_charge),
-        SourceTaskResult::Answer(_) => Err(Int8SourceError::InvalidResult) }
+        SourceTaskResult::Answer(r) => Ok(r.mask_node_visit_charge) }
 }
 fn original_spans<F: FnMut() -> Result<(), Int8SourceError>>(plan: &ChunkPlan<'_>, chunk: &SourceChunk<'_>,
     result: &SourceTaskResult, checkpoint: &mut F) -> Result<Vec<OriginalSourceSpans>, Int8SourceError> {
