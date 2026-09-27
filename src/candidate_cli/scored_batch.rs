@@ -94,49 +94,55 @@ impl ScoreBatchCommand {
     /// Parse run settings before opening model metadata. Defaults cannot
     /// supply a document, budget or executable identity; the CLI owns ceilings.
     pub(super) fn parse_defaults(&self, json: Option<&str>, budget: TaskBudget) -> Result<Defaults, CandidateError> {
-        let value = json.map(|text| {
-            if text.len() > DEFAULTS_BYTES { return Err(CandidateError::Input); }
-            canonjson::parse_str_with_limits(text, canonjson::ParseLimits {
-                max_depth: 8, max_string_bytes: DEFAULTS_BYTES,
-            }).map_err(|_| CandidateError::Input)
-        }).transpose()?;
-        Ok(match self.kind()? {
-            Kind::Classify => {
-                let Some(value) = value else { return Ok(Defaults::Classify(None)); };
-                let input: ClassificationDefaults = serde_json::from_value(value).map_err(|_| CandidateError::Input)?;
-                let l = self.host.classification_limits();
-                if input.labels.is_empty() || input.labels.len() > l.max_labels
-                    || (input.mode == ClassificationMode::Exclusive && input.labels.len() < 2)
-                    || input.policy.minimum_candidate_weight_ppm > 1_000_000 || input.policy.minimum_margin_ppm > 1_000_000 {
-                    return Err(CandidateError::Input);
-                }
-                let mut ids = std::collections::BTreeSet::new(); let mut bytes = 0_usize;
-                for label in &input.labels {
-                    bytes = bytes.checked_add(label.id.len()).and_then(|n| n.checked_add(label.description.len()))
-                        .ok_or(CandidateError::Input)?;
-                    if label.id.trim().is_empty() || label.id.len() > l.max_label_id_bytes
-                        || label.description.len() > l.max_label_description_bytes || bytes > l.max_total_label_bytes
-                        || label.id.chars().any(char::is_control) || !ids.insert(label.id.as_str()) {
-                        return Err(CandidateError::Input);
-                    }
-                }
-                drop(ids);
-                Defaults::Classify(Some(ClassificationBatchArgs { labels: input.labels,
-                    mode: input.mode, policy: input.policy, budget }))
-            }
-            Kind::Sentiment => {
-                let input = match value { Some(value) => serde_json::from_value::<SentimentDefaults>(value)
-                    .map_err(|_| CandidateError::Input)?, None => SentimentDefaults::default() };
-                if input.axes.is_empty() || input.axes.len() > 4
-                    || input.axes.iter().enumerate().any(|(i, axis)| input.axes[..i].contains(axis))
-                    || input.policy.minimum_peak_weight_ppm > 1_000_000
-                    || input.policy.maximum_normalized_entropy_ppm > 1_000_000 {
-                    return Err(CandidateError::Input);
-                }
-                Defaults::Sentiment { args: SentimentBatchArgs { axes: input.axes, budget }, policy: input.policy }
-            }
-        })
+        parse_defaults(self.kind()?, &self.host, json, budget)
     }
+}
+/// Shared by live and durable scoring. Retention cannot change option parsing,
+/// candidate policies, fallback axes or the caller's exact label spellings.
+pub(super) fn parse_defaults(kind: Kind, host: &ScoredArgs, json: Option<&str>, budget: TaskBudget)
+    -> Result<Defaults, CandidateError> {
+    let value = json.map(|text| {
+        if text.len() > DEFAULTS_BYTES { return Err(CandidateError::Input); }
+        canonjson::parse_str_with_limits(text, canonjson::ParseLimits {
+            max_depth: 8, max_string_bytes: DEFAULTS_BYTES,
+        }).map_err(|_| CandidateError::Input)
+    }).transpose()?;
+    Ok(match kind {
+        Kind::Classify => {
+            let Some(value) = value else { return Ok(Defaults::Classify(None)); };
+            let input: ClassificationDefaults = serde_json::from_value(value).map_err(|_| CandidateError::Input)?;
+            let l = host.classification_limits();
+            if input.labels.is_empty() || input.labels.len() > l.max_labels
+                || (input.mode == ClassificationMode::Exclusive && input.labels.len() < 2)
+                || input.policy.minimum_candidate_weight_ppm > 1_000_000 || input.policy.minimum_margin_ppm > 1_000_000 {
+                return Err(CandidateError::Input);
+            }
+            let mut ids = std::collections::BTreeSet::new(); let mut bytes = 0_usize;
+            for label in &input.labels {
+                bytes = bytes.checked_add(label.id.len()).and_then(|n| n.checked_add(label.description.len()))
+                    .ok_or(CandidateError::Input)?;
+                if label.id.trim().is_empty() || label.id.len() > l.max_label_id_bytes
+                    || label.description.len() > l.max_label_description_bytes || bytes > l.max_total_label_bytes
+                    || label.id.chars().any(char::is_control) || !ids.insert(label.id.as_str()) {
+                    return Err(CandidateError::Input);
+                }
+            }
+            drop(ids);
+            Defaults::Classify(Some(ClassificationBatchArgs { labels: input.labels,
+                mode: input.mode, policy: input.policy, budget }))
+        }
+        Kind::Sentiment => {
+            let input = match value { Some(value) => serde_json::from_value::<SentimentDefaults>(value)
+                .map_err(|_| CandidateError::Input)?, None => SentimentDefaults::default() };
+            if input.axes.is_empty() || input.axes.len() > 4
+                || input.axes.iter().enumerate().any(|(i, axis)| input.axes[..i].contains(axis))
+                || input.policy.minimum_peak_weight_ppm > 1_000_000
+                || input.policy.maximum_normalized_entropy_ppm > 1_000_000 {
+                return Err(CandidateError::Input);
+            }
+            Defaults::Sentiment { args: SentimentBatchArgs { axes: input.axes, budget }, policy: input.policy }
+        }
+    })
 }
 pub(super) enum Defaults {
     Classify(Option<ClassificationBatchArgs>),

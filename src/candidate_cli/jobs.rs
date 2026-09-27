@@ -7,6 +7,7 @@ use clap::Subcommand;
 use crate::jobs::{JobId, JobLimits};
 use super::source::SourceHostArgs;
 mod config;
+pub(super) mod scored;
 pub(super) use config::{Defaults, load_defaults, native_limits, parse_limits};
 #[cfg(test)] pub(super) mod tests;
 

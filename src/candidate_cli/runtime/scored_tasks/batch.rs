@@ -8,25 +8,30 @@ use crate::{
     hosted::corpus::{CorpusLimits, ClassificationCorpusConfig, SentimentCorpusConfig},
 };
 
-enum Corpus {
+pub(in crate::candidate_cli) enum Corpus {
     Classify(Arc<ClassificationPlanner>, ClassificationCorpusConfig),
     Sentiment(Arc<SentimentPlanner>, SentimentCorpusConfig),
 }
 fn configure(command: &ScoreBatchCommand, facts: &ArtifactIdentity, limits: Limits, defaults: Defaults)
     -> Result<Corpus, CandidateError> {
+    configure_scored(command.kind()?, &command.host, facts, limits, defaults)
+}
+/// Identical pinned compiler and score-space selection for streams and jobs.
+pub(in crate::candidate_cli) fn configure_scored(kind: Kind, host: &ScoredArgs,
+    facts: &ArtifactIdentity, limits: Limits, defaults: Defaults) -> Result<Corpus, CandidateError> {
     let mut identity = candidate_identity(facts)?;
     let registry = pinned_controls::pinned().map_err(|_| CandidateError::Identity)?;
     let controls = registry.template_controls();
     let eos = controls.entries().iter().find(|e| e.special && e.surface == crate::template::IM_END)
         .map(|e| e.id).ok_or(CandidateError::Identity)?;
-    let ceiling = command.host.budget(limits);
-    let work = command.host.work_ceiling();
-    match (command.kind()?, defaults) {
+    let ceiling = host.budget(limits);
+    let work = host.work_ceiling();
+    match (kind, defaults) {
         (Kind::Classify, Defaults::Classify(defaults)) => {
             let planner = Arc::new(ClassificationPlanner::pinned(controls, eos).map_err(|_| CandidateError::Planning)?);
             identity.task_spec = "classify-v1".to_owned();
             identity.template_digest = *planner.template_digest(); identity.tokenizer_digest = planner.tokenizer_digest();
-            let planning = command.host.classification_limits();
+            let planning = host.classification_limits();
             // Fixed configuration checks only: no invented document stands in
             // for future records. Actual prompt plans compile per item.
             Int8ClassificationBatchPlanner::new(&planner, identity.clone(), ceiling, planning, defaults.clone())
@@ -42,7 +47,7 @@ fn configure(command: &ScoreBatchCommand, facts: &ArtifactIdentity, limits: Limi
             identity.task_spec = "sentiment-v1".to_owned();
             identity.template_digest = *planner.template_digest(); identity.tokenizer_digest = planner.tokenizer_digest();
             let config = SentimentCorpusConfig { identity, task_ceiling: ceiling,
-                planning: command.host.sentiment_limits(), defaults: Some(args),
+                planning: host.sentiment_limits(), defaults: Some(args),
                 max_item_work: work, max_model_work: work };
             config.validate(&planner).map_err(|_| CandidateError::Planning)?;
             Ok(Corpus::Sentiment(planner, config))

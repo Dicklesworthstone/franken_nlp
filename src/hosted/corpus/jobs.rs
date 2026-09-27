@@ -5,6 +5,7 @@
 use super::*;
 mod manage;
 mod extract;
+mod scored;
 pub use manage::{JobManagementLimits, StoredJobOperation, StoredJobRequest};
 use crate::{
     jobs::{JobError, JobId, JobLimits, JobProgress, JobSecret, TailPolicy,
@@ -170,7 +171,7 @@ impl NlpEngine {
 }
 
 // Shared ordered job lifecycle, not a public fake-native injection surface.
-// Production uses only the sealed source/extraction processors + CorpusAdmission.
+// Production uses sealed source/extraction/scored processors + process admission.
 fn run_population<P: DurableBatchProcessor, C: DecodeStepControl>(request: SourceJobRequest,
     population: &JobPopulation, processor: P, control: &mut C) -> Result<JobProgress, JobRunError> {
     let SourceJobRequest { root, key, job_id, limits, mode, materialize } = request;

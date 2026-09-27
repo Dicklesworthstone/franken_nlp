@@ -99,6 +99,7 @@ pub(crate) enum CandidateCommand {
     Batch(batch::BatchCommand),
     ScoreBatch(scored_batch::ScoreBatchCommand),
     Job(jobs::JobCommand),
+    ScoreJob(jobs::scored::ScoreJobCommand),
 }
 
 pub(crate) fn definition() -> clap::Command {
@@ -112,6 +113,7 @@ pub(crate) fn definition() -> clap::Command {
         .subcommand(scored_batch::definition())
         .subcommand(extract::definition())
         .subcommand(jobs::definition())
+        .subcommand(jobs::scored::definition())
         .subcommand(map::definition())
         .subcommand(judge::definition())
         .subcommand(redact::definition())
@@ -137,6 +139,9 @@ impl CandidateCommand {
         }
         if name == "map" {
             return map::MapCommand::from_arg_matches(matches).map(Self::Map);
+        }
+        if name == "score-job" {
+            return jobs::scored::ScoreJobCommand::from_arg_matches(matches).map(Self::ScoreJob);
         }
         if name == "job" {
             return jobs::JobCommand::from_arg_matches(matches).map(Self::Job);
@@ -171,6 +176,7 @@ impl CandidateCommand {
             Self::Batch(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::ScoreBatch(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::Job(command) => command.run_owned(io::stdin(), &mut io::stdout(), &mut io::stderr()),
+            Self::ScoreJob(command) => command.run_owned(io::stdin(), &mut io::stdout(), &mut io::stderr()),
             other => other.run(&mut io::stdin(), &mut io::stdout(), &mut io::stderr()),
         }
     }
@@ -199,8 +205,8 @@ impl CandidateCommand {
             Self::Redact(command) => return command.execute(input, output),
             Self::Resolve(command) => return command.execute(input, output),
             // A borrowed stream cannot outlive the hosted blocking closure.
-            // The executable dispatcher always takes run_stdio for batch.
-            Self::Batch(_) | Self::ScoreBatch(_) | Self::Job(_) => return Err(CandidateError::Arguments),
+            // The executable dispatcher always takes run_stdio for batch/jobs.
+            Self::Batch(_) | Self::ScoreBatch(_) | Self::Job(_) | Self::ScoreJob(_) => return Err(CandidateError::Arguments),
             Self::Text { task, args } => (task, args),
         };
         let limits = args.validate()?;
