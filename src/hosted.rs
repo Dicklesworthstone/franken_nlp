@@ -34,6 +34,8 @@ mod source;
 pub use source::SourceLimits;
 mod source_map;
 pub use source_map::SourceMapConfig;
+mod stream;
+pub use stream::{ChatStreamLimits, HostedChatStream};
 pub mod corpus;
 pub use dispatch::{CancellationToken, RunControl, RunStop};
 
