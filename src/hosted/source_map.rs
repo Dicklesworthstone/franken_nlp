@@ -1,6 +1,7 @@
 //! Owned long-document planning and native map/merge on the existing host.
 use super::*;
 mod summary;
+mod question;
 use crate::{
     native_engine::{constrained_int8, lmhead::NANBEIGE_VOCAB_SIZE},
     tasks::{ir::{PlanContext, TaskBudget}, source_planning::{SourcePlanningLimits, SourceTaskPlanner,
@@ -12,9 +13,9 @@ use crate::{
 /// Arcs and configuration metadata. Reduction headroom prices non-payload
 /// objects/allocator overhead in addition to the modeled payload reservation.
 /// Neither reservation is an allocator interceptor or an observed RSS bound.
-pub struct SourceMapConfig {
+pub struct SourceMapConfig<T = SourceMapTask> {
     pub identity: ExecutionIdentity,
-    pub task: SourceMapTask,
+    pub task: T,
     pub budget: TaskBudget,
     pub planning: SourcePlanningLimits,
     pub mapping: Int8SourceMapLimits,
@@ -22,11 +23,11 @@ pub struct SourceMapConfig {
     pub preparation_reserve_bytes: u64,
     pub reduction_reserve_bytes: u64,
 }
-struct SourceMapInput {
+struct SourceMapInput<T = SourceMapTask> {
     source: String,
     planner: Arc<SourceTaskPlanner>,
     vocabulary: Arc<ExtractionVocabulary>,
-    config: SourceMapConfig,
+    config: SourceMapConfig<T>,
 }
 
 impl NlpEngine {
@@ -96,15 +97,19 @@ impl NlpEngine {
 }
 
 fn validate(config: &SourceMapConfig, source_bytes: usize, kv_bytes: u64) -> Result<(), HostedError> {
-    config.native.run.validate()?;
-    config.budget.validate().map_err(|_| HostedError::Limits("source map task budget"))?;
-    config.identity.validate().map_err(|_| HostedError::ModelIdentity)?;
-    constrained_int8::check_profile(&config.identity).map_err(|_| HostedError::ModelIdentity)?;
+    validate_common(config, source_bytes, kv_bytes)?;
     let task = match &config.task {
         SourceMapTask::Ner(_) => "ner-v1", SourceMapTask::Keyphrases(_) => "keyphrases-v1",
         SourceMapTask::Summarize(_) => "summarize-v1",
     };
     if config.identity.task_spec != task { return Err(HostedError::ModelIdentity); }
+    Ok(())
+}
+fn validate_common<T>(config: &SourceMapConfig<T>, source_bytes: usize, kv_bytes: u64) -> Result<(), HostedError> {
+    config.native.run.validate()?;
+    config.budget.validate().map_err(|_| HostedError::Limits("source map task budget"))?;
+    config.identity.validate().map_err(|_| HostedError::ModelIdentity)?;
+    constrained_int8::check_profile(&config.identity).map_err(|_| HostedError::ModelIdentity)?;
     if source_bytes == 0 || source_bytes > config.mapping.chunks.max_input_bytes
         || config.preparation_reserve_bytes == 0 || config.reduction_reserve_bytes == 0
         || config.planning.max_context_tokens > config.native.context_tokens
@@ -123,7 +128,7 @@ fn check_assets(identity: &ExecutionIdentity, tokenizer: Sha256Digest, template:
     }
     Ok(())
 }
-fn reduction_bytes(config: &SourceMapConfig, chunks: usize) -> Result<u64, HostedError> {
+fn reduction_bytes<T>(config: &SourceMapConfig<T>, chunks: usize) -> Result<u64, HostedError> {
     if chunks == 0 || chunks > config.mapping.chunks.max_chunks || chunks > 256 {
         return Err(HostedError::Limits("source map partition cardinality"));
     }

@@ -2,6 +2,7 @@
 //! Optional evidence-union ranking is distinct from neural global synthesis.
 use super::*;
 pub(super) mod summary;
+pub(super) mod question;
 use serde::de::DeserializeOwned;
 use crate::{native_engine::{portable_int8::ProjectionWork, strict_int8::Int8Work},
     tasks::{BuiltInTask, mapreduce::{ChunkLimits, ExecutionLimits},
@@ -17,7 +18,7 @@ pub(crate) struct MapCommand {
     /// One exact UTF-8 document, not NDJSON; '-' reads stdin.
     #[arg(default_value = "-")]
     pub(super) input: PathBuf,
-    #[arg(long, value_parser = ["ner", "keyphrases", "summarize"])]
+    #[arg(long, value_parser = ["ner", "keyphrases", "summarize", "answer"])]
     pub(super) task: String,
     /// Shared context/model resources. Output-token and result limits apply
     /// to each chunk; input bytes apply to the complete original document.
@@ -25,6 +26,8 @@ pub(crate) struct MapCommand {
     pub(super) host: source::SourceHostArgs,
     #[command(flatten)]
     pub(super) summary: summary::SummaryArgs,
+    #[command(flatten)]
+    pub(super) question: question::QuestionArgs,
     /// Complete typed options for the selected task; never prompt instructions.
     #[arg(long, value_name = "FILE")]
     pub(super) options: Option<PathBuf>,
@@ -65,16 +68,17 @@ pub(crate) struct MapCommand {
 pub(super) fn definition() -> clap::Command {
     MapCommand::augment_args(clap::Command::new("map")
         .about("Process a long document with source-aligned, independent native chunk results")
-        .long_about("Losslessly partition one UTF-8 document using the actual pinned task scaffold and source encoder, then run NER, keyphrases or cited summaries on one resident candidate model. By default output retains ordered independent chunk results and original-document coordinates; it is not a global synthesized summary, global entity census or global ranking. Add --reduce-summary with --task summarize for exact bullet/evidence union and a final document-wide ranking of existing bullets, without a neural synthesis pass. Neither mode establishes overlapping-window analysis or single-context equivalence. No partial success is published."))
+        .long_about("Losslessly partition one UTF-8 document using the actual pinned task scaffold and source encoder, then run NER, keyphrases or cited summaries on one resident candidate model. By default output retains ordered independent chunk results and original-document coordinates; it is not a global synthesized summary, global entity census or global ranking. Add --reduce-summary with --task summarize for exact bullet/evidence union and a final document-wide ranking of existing bullets, without a neural synthesis pass. Use --task answer --question FILE for independent passage-scoped QA with original-source citations; all differing answer texts remain visible without majority voting or a global answer. No mode establishes overlapping-window analysis or single-context equivalence. No partial success is published."))
 }
 
 impl MapCommand {
     pub(super) fn kind(&self) -> Result<BuiltInTask, CandidateError> {
         match self.task.as_str() { "ner" => Ok(BuiltInTask::Ner), "keyphrases" => Ok(BuiltInTask::Keyphrases),
-            "summarize" => Ok(BuiltInTask::Summarize), _ => Err(CandidateError::Arguments) }
+            "summarize" => Ok(BuiltInTask::Summarize), "answer" => Ok(BuiltInTask::Answer), _ => Err(CandidateError::Arguments) }
     }
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), CandidateError> {
         self.kind()?;
+        self.question.validate(&self.task)?;
         self.summary.validate(&self.task, self.max_map_result_bytes)?;
         let (args, limits) = self.host.common(self.input.clone())?;
         if self.host.max_input_bytes < 4 || !(1..=MAX_CHUNKS).contains(&self.max_chunks)
@@ -155,13 +159,16 @@ impl MapCommand {
             reserved_tokens: capacity.reserved_tokens(), max_chunks: self.max_chunks,
             max_tokenizer_calls: self.max_tokenizer_calls,
         }).map_err(|_| CandidateError::Planning)?;
-        Ok(Int8SourceMapLimits { chunks,
+        Ok(self.mapping_limits(chunks))
+    }
+    pub(super) fn mapping_limits(&self, chunks: ChunkLimits) -> Int8SourceMapLimits {
+        Int8SourceMapLimits { chunks,
             reduction: ExecutionLimits { map_batch_chunks: 1, reduce_fan_in: 8,
                 max_reduction_levels: 8, max_task_calls: 1024,
                 max_value_bytes: self.max_map_result_bytes, max_live_value_bytes: self.max_live_value_bytes,
                 max_total_value_bytes: self.max_total_value_bytes, max_result_bytes: self.max_map_result_bytes },
             max_model_work: self.work_ceiling(), mask_limits: self.host.masks(),
-            mask_visits_per_chunk: self.host.max_mask_node_visits, max_mask_visits: self.max_total_mask_node_visits })
+            mask_visits_per_chunk: self.host.max_mask_node_visits, max_mask_visits: self.max_total_mask_node_visits }
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
         let (args, limits) = self.validate()?;

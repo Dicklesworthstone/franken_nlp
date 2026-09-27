@@ -21,8 +21,8 @@ fn all_three_tasks_require_explicit_task_model_and_memory() {
         "--memory-mib", "8192"]).is_err());
 }
 #[test]
-fn qa_generation_schema_and_sampling_cannot_enter_a_source_map() {
-    for task in ["answer", "generate", "extract", "classify"] {
+fn generation_schema_and_sampling_cannot_enter_a_source_map() {
+    for task in ["generate", "extract", "classify"] {
         assert!(super::super::definition().try_get_matches_from(["candidate", "map", "--task", task,
             "--model", "m", "--memory-mib", "8192"]).is_err());
     }
