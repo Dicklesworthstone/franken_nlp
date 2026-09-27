@@ -106,7 +106,7 @@ pub const fn kind_for(kind: EntityType) -> PiiKind {
     }
 }
 
-fn merge(detections: &[Detection]) -> Result<Vec<RedactionRegion>, RedactError> {
+pub(super) fn merge(detections: &[Detection]) -> Result<Vec<RedactionRegion>, RedactError> {
     let mut order = Vec::new();
     order.try_reserve_exact(detections.len()).map_err(|_| RedactError::AllocationRefused)?;
     order.extend(detections);
