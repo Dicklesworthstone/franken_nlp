@@ -18,6 +18,9 @@ use crate::{
     validation::grounded_fields::VerifiedSourceSpan,
 };
 
+/// Opt-in complete cited-summary reduction; the default ordered map is unchanged.
+pub mod summary;
+
 pub const INT8_SOURCE_MAP_EXECUTION: &str = "portable-int8-source-map-ordered-merge-v1";
 const MAX_SOURCE_CHUNKS: usize = 256;
 

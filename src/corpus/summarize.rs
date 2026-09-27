@@ -165,6 +165,7 @@ pub struct CorpusSummaryTask<P> {
     options: SummaryOptions,
     limits: CorpusSummaryLimits,
     scan_remaining: u64,
+    strict_int8: bool,
     next_chunk: usize,
     failed: bool,
 }
@@ -172,7 +173,14 @@ impl<P: SummaryPass> CorpusSummaryTask<P> {
     pub fn new(pass: P, limits: CorpusSummaryLimits) -> Result<Self, SummaryError> {
         limits.validate()?;
         let options = pass.options(); options.validate()?;
-        Ok(Self { pass, options, limits, scan_remaining: limits.max_scan_steps, next_chunk: 0, failed: false })
+        Ok(Self { pass, options, limits, scan_remaining: limits.max_scan_steps, strict_int8: false, next_chunk: 0, failed: false })
+    }
+    /// Only the native INT8 composition selects this rail. It still verifies
+    /// each unchanged result; no eager result is relabeled to pass validation.
+    pub(crate) fn new_int8(pass: P, limits: CorpusSummaryLimits) -> Result<Self, SummaryError> {
+        let mut task = Self::new(pass, limits)?;
+        task.strict_int8 = true;
+        Ok(task)
     }
     pub fn scan_steps_remaining(&self) -> u64 { self.scan_remaining }
     pub fn pass(&self) -> &P { &self.pass }
@@ -195,8 +203,12 @@ impl<P: SummaryPass> MapReduceTask for CorpusSummaryTask<P> {
         for chunk in chunks {
             if chunk.id() != self.next_chunk { return Err(CorpusSummaryError::Summary(SummaryError::InvalidResult)); }
             let raw = self.pass.run(chunk).map_err(CorpusSummaryError::Pass)?;
-            let value = map_value(chunk, raw, self.options, self.limits, &mut self.scan_remaining)
-                .map_err(CorpusSummaryError::Summary)?;
+            let value = if self.strict_int8 {
+                map_value_for_profile(chunk, raw, self.options, self.limits, &mut self.scan_remaining,
+                    crate::native_engine::strict_int8::STRICT_INT8_PROFILE)
+            } else {
+                map_value(chunk, raw, self.options, self.limits, &mut self.scan_remaining)
+            }.map_err(CorpusSummaryError::Summary)?;
             self.next_chunk = self.next_chunk.checked_add(1).ok_or(CorpusSummaryError::Summary(SummaryError::InvalidResult))?;
             outputs.push(MapOutput { chunk_id: chunk.id(), value });
         }
@@ -213,8 +225,12 @@ impl<P: SummaryPass> MapReduceTask for CorpusSummaryTask<P> {
 
 fn map_value(chunk: &SourceChunk<'_>, raw: SummaryResult, options: SummaryOptions,
     limits: CorpusSummaryLimits, remaining: &mut u64) -> Result<SummaryAggregate, SummaryError> {
+    map_value_for_profile(chunk, raw, options, limits, remaining, HF_BF16_EAGER_PROFILE)
+}
+fn map_value_for_profile(chunk: &SourceChunk<'_>, raw: SummaryResult, options: SummaryOptions,
+    limits: CorpusSummaryLimits, remaining: &mut u64, profile: &'static str) -> Result<SummaryAggregate, SummaryError> {
     if raw.schema_version != 1 || raw.task_spec_version != SUMMARIZE_TASK_VERSION
-        || raw.numerics_profile != HF_BF16_EAGER_PROFILE || raw.score_space != ScoreSpace::NotComputed
+        || raw.numerics_profile != profile || raw.score_space != ScoreSpace::NotComputed
         || raw.citation_guarantee != CitationGuarantee::StructuralSourceMembership
         || raw.semantic_support != SummarySemanticSupport::NotAssessed || raw.bullets.len() > options.max_bullets
     { return Err(SummaryError::InvalidResult); }
