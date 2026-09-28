@@ -102,9 +102,17 @@ pub(super) fn final_answer<C: DecodeStepControl>(source: &str, raw: AnswerResult
         let mut spans = Vec::new(); let mut next = 0_usize;
         for (passage, origins) in evidence.passages.iter().zip(&evidence.origins) {
             checkpoint(control)?;
-            // Answer's source grammar sees a join, but citations must occur
-            // WHOLLY in an admitted evidence passage. Join-spanning text fails.
-            for local in scan(&passage.text, &citation.quote, remaining)? {
+            // A citation must occur in at least ONE evidence passage, not EVERY
+            // passage. A charged no-match scan is ordinary absence; all other
+            // failures remain fatal. Continue through later passages to verify
+            // every reported occurrence and charge all verification work.
+            let local_spans = match scan_occurrences(&passage.text, &citation.quote, remaining) {
+                Ok(spans) => spans,
+                Err(FieldGroundingError::Absent) => continue,
+                Err(error) => return Err(scan_error(error)),
+            };
+            // Never scan a synthetic join: matches must fit wholly in a passage.
+            for local in local_spans {
                 let reported = citation.spans.get(next).ok_or_else(invalid)?;
                 if reported.passage_id != passage.id || reported.span != local { return Err(invalid()); }
                 next = next.checked_add(1).ok_or_else(invalid)?;
@@ -135,11 +143,16 @@ fn occurrence(count: usize) -> SourceOccurrence {
     if count == 1 { SourceOccurrence::Anchored } else { SourceOccurrence::Ambiguous }
 }
 fn scan(source: &str, quote: &str, budget: &mut GroundingBudget) -> Result<Vec<VerifiedSourceSpan>, Int8SourceMapError> {
-    scan_occurrences(source, quote, budget).map_err(|e| match e {
+    // Collection requires the quote to occur in its declared original chunk.
+    // Only final_answer's search across DIFFERENT evidence passages skips Absent.
+    scan_occurrences(source, quote, budget).map_err(scan_error)
+}
+fn scan_error(error: FieldGroundingError) -> Int8SourceMapError {
+    match error {
         FieldGroundingError::AllocationRefused => Int8SourceMapError::Allocation,
         FieldGroundingError::WorkBudget | FieldGroundingError::MatchBudget | FieldGroundingError::FieldBudget => Int8SourceMapError::WorkLimit,
         _ => invalid(),
-    })
+    }
 }
 fn lift(local: VerifiedSourceSpan, origin: VerifiedSourceSpan) -> Result<VerifiedSourceSpan, Int8SourceMapError> {
     if local.byte_start >= local.byte_end || local.scalar_start >= local.scalar_end { return Err(invalid()); }
@@ -150,3 +163,5 @@ fn lift(local: VerifiedSourceSpan, origin: VerifiedSourceSpan) -> Result<Verifie
     if span.byte_end > origin.byte_end || span.scalar_end > origin.scalar_end { return Err(invalid()); }
     Ok(span)
 }
+
+#[cfg(test)] mod tests;
