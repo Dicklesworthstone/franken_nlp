@@ -1,9 +1,10 @@
 //! Question-aware document QA on the existing charged process-owned host.
-//! No extra model, runtime, retrieval, majority vote or global answer synthesis.
+//! Independent answers remain the default; synthesis has its own explicit API.
 use super::*;
 use crate::{native_engine::decode::DecodeStepControl,
     tasks::{answer::ANSWER_TASK_VERSION, source_planning::quantized::{Int8SourceError,
         long::question::{SourceQuestion, Int8QuestionRun}}}};
+mod synthesis;
 
 impl NlpEngine {
     /// Apply one question to every nonblank source chunk and retain all passage

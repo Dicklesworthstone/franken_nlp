@@ -2,6 +2,7 @@
 use super::*;
 use crate::{tasks::{answer::AnswerOptions, source_planning::quantized::long::question::SourceQuestion},
     validation::grounded_fields::GroundingBudget};
+pub(in crate::candidate_cli) mod synthesis;
 
 pub(in crate::candidate_cli) const QUESTION_BYTES: usize = source::OPTIONS_BYTES;
 
@@ -11,10 +12,14 @@ pub(in crate::candidate_cli) struct QuestionArgs {
     /// reserved for the original document. This is private data, not a template.
     #[arg(long, value_name = "FILE")]
     question: Option<PathBuf>,
+    #[command(flatten)]
+    pub synthesis: synthesis::SynthesisArgs,
     /// Independent citation-verification fields across ALL passages (default 4096).
+    /// Synthesis shares this allowance rather than acquiring a fresh one.
     #[arg(long, requires = "question")]
     max_qa_citations: Option<usize>,
     /// Exact occurrence spans across ALL passage citations (default 16384).
+    /// Evidence rechecks and synthesis occurrence fanout also consume this cap.
     #[arg(long, requires = "question")]
     max_qa_evidence_spans: Option<usize>,
     /// Nonrenewable independent verification scan work (default 67108864).
@@ -23,6 +28,7 @@ pub(in crate::candidate_cli) struct QuestionArgs {
 }
 impl QuestionArgs {
     pub(super) fn validate(&self, task: &str) -> Result<(), CandidateError> {
+        self.synthesis.validate(task)?;
         let has_limits = self.max_qa_citations.is_some() || self.max_qa_evidence_spans.is_some()
             || self.max_qa_scan_steps.is_some();
         if task != "answer" {

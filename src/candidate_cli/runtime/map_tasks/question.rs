@@ -2,9 +2,11 @@
 use super::*;
 use crate::{candidate_cli::map::question::QUESTION_BYTES,
     tasks::BuiltInTask};
+mod synthesis;
 
 pub(super) fn execute(command: MapCommand, args: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
+    if command.question.synthesis.synthesize_answer { return synthesis::execute(command, args, limits, input, output); }
     // First local owner: all question/source/planner/result storage drops before
     // the CLI's preparation charge, including any error before model loading.
     let session = Session::new(&args, limits)?;
