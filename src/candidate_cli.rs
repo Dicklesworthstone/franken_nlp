@@ -184,6 +184,7 @@ impl CandidateCommand {
             Self::Job(command) => command.run_owned(io::stdin(), &mut io::stdout(), &mut io::stderr()),
             Self::ScoreJob(command) => command.run_owned(io::stdin(), &mut io::stdout(), &mut io::stderr()),
             Self::Stream(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
+            Self::Redact(command) if command.corpus.ndjson => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             other => other.run(&mut io::stdin(), &mut io::stdout(), &mut io::stderr()),
         }
     }

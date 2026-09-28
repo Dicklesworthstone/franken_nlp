@@ -1,6 +1,7 @@
 //! One charged native redactor; original and verification passes share a ceiling.
 use super::*;
 mod long;
+pub(in crate::candidate_cli) mod corpus;
 use std::sync::Arc;
 use super::source_tasks::{Session, planner, source_identity};
 use crate::{candidate_cli::redact::{self as command, RedactCommand},

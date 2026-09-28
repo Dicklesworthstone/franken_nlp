@@ -1,6 +1,7 @@
 //! Model-backed detector-union redaction. Only completed edited text is exported.
 use super::*;
 pub(super) mod long;
+pub(super) mod corpus;
 use clap::ValueEnum;
 use crate::tasks::{ner::NerOptions, redact::{PiiKind, RedactionRequest,
     actions::RedactionAction, pseudonym::PseudonymKey}};
@@ -20,13 +21,16 @@ impl Rule {
 
 #[derive(Args)]
 pub(crate) struct RedactCommand {
-    /// Exact UTF-8 source; '-' reads stdin unless stdin is the private key source.
+    /// Exact UTF-8 source, or {id,text,task_args?} records with --ndjson.
+    /// '-' reads stdin unless stdin is the private key source.
     #[arg(default_value = "-")]
     pub(super) input: PathBuf,
     #[command(flatten)]
     pub(super) host: SourceHostArgs,
     #[command(flatten)]
     pub(super) long: long::LongArgs,
+    #[command(flatten)]
+    pub(super) corpus: corpus::CorpusArgs,
     /// Mask never expands the detected source; placeholders/pseudonyms may expand it.
     #[arg(long, value_enum, default_value = "mask")]
     action: Action,
@@ -53,7 +57,7 @@ pub(crate) struct RedactCommand {
     expected_key_commitment: Option<String>,
     #[arg(long, default_value_t = 4096)]
     max_detections: usize,
-    /// Conservative work ceiling for EACH of at most two rule scans.
+    /// Conservative work ceiling for EACH of at most two rule scans per document.
     #[arg(long, default_value_t = 128 * 1024 * 1024)]
     max_rule_work: u64,
     /// Separately modeled rule/edit/coordinate memory retained by the native host.
@@ -64,7 +68,7 @@ pub(crate) struct RedactCommand {
 pub(super) fn definition() -> clap::Command {
     RedactCommand::augment_args(clap::Command::new("redact")
         .about("Redact with native source-bound NER plus rules; verify the edited text afresh")
-        .after_help("Verification covers only the selected detector union, not all PII. Model omissions and Unicode obfuscations remain possible. Pseudonyms are not anonymization. This candidate command emits one completed JSON object, never intermediate NER text. Pseudonymization always uses full 256-bit HMAC; raw key bytes have no argv option. Add --chunked for long documents: rules scan whole text while NER uses source-aligned chunks, then verification re-chunks the actual edited text. NER chunk boundaries may split entities; whole-operation work limits never renew per chunk. The independent fnlp redact --rules-only command remains model-free."))
+        .after_help("Verification covers only the selected detector union, not all PII. Model omissions and Unicode obfuscations remain possible. Pseudonyms are not anonymization. By default this candidate command emits one completed JSON object, never intermediate NER text. Pseudonymization always uses full 256-bit HMAC; raw key bytes have no argv option. Add --chunked for long documents: rules scan whole text while NER uses source-aligned chunks, then verification re-chunks the actual edited text. NER chunk boundaries may split entities; per-document work ceilings never renew per chunk. Add --ndjson for an owned corpus stream with one resident engine, fixed policy/key scope and independent whole-corpus ceilings. Completed document events remain valid if later records fail; any failed record yields a nonzero exit. Records cannot override actions, keys, types, chunking or verification. The independent fnlp redact --rules-only command remains model-free."))
 }
 impl RedactCommand {
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), CandidateError> {
@@ -94,6 +98,7 @@ impl RedactCommand {
             || !s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))) {
             return Err(CandidateError::Arguments);
         }
+        self.corpus.validate(self, limits)?;
         Ok((common, limits))
     }
     pub(super) fn request(&self) -> RedactionRequest {
@@ -125,6 +130,9 @@ impl RedactCommand {
         Ok(Some((key, self.namespace.clone().ok_or(CandidateError::Arguments)?)))
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
+        // Owned corpus IO must enter through run_stdio/run_owned, never a
+        // borrowed handle, collecting adapter or detached forwarding thread.
+        if self.corpus.ndjson { return Err(CandidateError::Arguments); }
         let (common, limits) = self.validate()?;
         #[cfg(feature = "asupersync-runtime")]
         { runtime::redaction::execute(self, common, limits, input, output) }
