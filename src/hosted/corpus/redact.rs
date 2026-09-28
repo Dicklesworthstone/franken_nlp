@@ -1,6 +1,7 @@
 //! One process-owned invocation for an entire INT8 redaction stream.
 //! Reuse corpus IO ownership, resident weights, native scratch and admission.
 use super::*;
+mod long;
 use crate::tasks::{
     source_planning::SourceTaskPlanner,
     redact::{RedactError, RedactionRequest, pseudonym::Pseudonyms,
@@ -9,9 +10,10 @@ use crate::tasks::{
 
 /// Explicit item policy plus whole-stream work ceilings. Preparation and IO
 /// storage are priced by CorpusLimits; rule/union/edit allocation headroom is
-/// separate. No field is a measured RSS guarantee or a deserialized permit.
-pub struct RedactionCorpusConfig {
-    pub batch: Int8RedactionBatchConfig,
+/// separate. The default keeps short documents; LongRedactionBatchConfig selects
+/// the concrete chunked-document entry point. Neither is a deserialized permit.
+pub struct RedactionCorpusConfig<B = Int8RedactionBatchConfig> {
+    pub batch: B,
     pub edit_reserve_bytes: u64,
 }
 

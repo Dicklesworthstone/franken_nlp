@@ -14,8 +14,14 @@ pub mod native;
 pub mod quantized;
 pub mod long;
 pub mod batch;
+pub mod corpus;
 
 pub use pipeline::{RedactionRequest, redact_rules, redact_with_ner};
+
+// Preserve typed native/redaction causes when composing document/corpus APIs.
+impl From<quantized::Int8RedactionError> for long::LongRedactionError {
+    fn from(error: quantized::Int8RedactionError) -> Self { Self::Redaction(error) }
+}
 
 /// Type names are stable inputs to policy and pseudonym domain separation.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
