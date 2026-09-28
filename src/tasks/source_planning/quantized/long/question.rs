@@ -14,6 +14,8 @@ use crate::{
 
 mod planning;
 mod execution;
+/// Explicit evidence-only neural synthesis; independent passage QA is unchanged.
+pub mod synthesis;
 
 pub const INT8_QUESTION_EXECUTION: &str = "portable-int8-question-independent-passages-v1";
 // Stable LOCAL passage id; the coordinator, not a model-supplied id, owns the
