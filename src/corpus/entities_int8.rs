@@ -33,6 +33,7 @@ use super::{
     resolve::{self, ResolutionDocument, ResolutionPlan, ResolveError, ResolveLimits, ResolveOptions},
 };
 mod grounding;
+pub mod long;
 
 pub const INT8_ENTITY_EXECUTION: &str = "portable-int8-ner-to-complete-corpus-resolution-v1";
 
@@ -172,7 +173,6 @@ impl PreparedInt8EntityCorpus {
         }
         Ok(bytes)
     }
-
     /// Reuse ONE actual strict-INT8 engine for every NER pass and pair head.
     /// Consumes the snapshot; failed or unwound operations cannot be retried
     /// through this value with renewed allowances. Caller discards a failed
