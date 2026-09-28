@@ -5,16 +5,21 @@ use crate::{batch::source::SourceMaskBudget,
     grammar::{CompileLimits, mask::MaskWorkLimits, runtime::SourceRuntimeLimits},
     tasks::{ir::TaskBudget, ner::NerOptions, source_planning::SourcePlanningLimits},
     validation::grounded_fields::GroundingBudget};
+pub(in crate::candidate_cli) mod long;
 
 #[derive(Args)]
 pub(in crate::candidate_cli) struct DiscoveryArgs {
     /// Discover source-constrained NER mentions before resolving the raw snapshot.
     #[arg(long)]
     pub discover_entities: bool,
-    /// Per-document constrained NER tokens including EOS; not the pair-label depth.
+    #[command(flatten)]
+    pub long: long::DiscoveryChunkArgs,
+    /// NER tokens including EOS per document, or per chunk with --chunked.
+    /// This is not the pair-label depth.
     #[arg(long, default_value_t = 256)]
     max_ner_tokens: usize,
-    /// NER grammar-mask visits per document; also bounded across the snapshot.
+    /// NER mask visits per document, or per chunk with --chunked.
+    /// The independent whole-snapshot mask ceiling never renews.
     #[arg(long, default_value_t = 1_000_000_000)]
     max_ner_mask_node_visits: u64,
     #[arg(long, default_value_t = 1_000_000_000_000)]
@@ -34,13 +39,14 @@ pub(in crate::candidate_cli) struct RawInput {
 }
 impl DiscoveryArgs {
     pub(super) fn extra_graph_bytes(&self, context: usize) -> Result<u64, CandidateError> {
+        let chunks = self.long.extra_graph_bytes(self.discover_entities)?;
         if !self.discover_entities { return Ok(0); }
         if !(1..=1024).contains(&self.max_ner_tokens) || self.max_ner_tokens >= context
             || !(2_000_000..=1_000_000_000_000).contains(&self.max_ner_mask_node_visits)
             || self.max_snapshot_mask_node_visits < self.max_ner_mask_node_visits
             || self.max_snapshot_mask_node_visits > 1_000_000_000_000_000
             || !(1..=64 * 1024 * 1024).contains(&self.max_expanded_bytes) { return Err(CandidateError::Arguments); }
-        (self.max_expanded_bytes as u64).checked_mul(2).ok_or(CandidateError::Arguments)
+        (self.max_expanded_bytes as u64).checked_mul(2).and_then(|n| n.checked_add(chunks)).ok_or(CandidateError::Arguments)
     }
     pub(in crate::candidate_cli) fn input(&self, command: &ResolveCommand, text: &str) -> Result<RawInput, CandidateError> {
         if !self.discover_entities || text.len() > command.host.max_input_bytes { return Err(CandidateError::Input); }
@@ -54,10 +60,14 @@ impl DiscoveryArgs {
         let mut ids = std::collections::BTreeSet::new(); let mut bytes = 0_usize;
         for document in &input.documents {
             if document.id.is_empty() || document.id.len() > 256 || document.id.chars().any(char::is_control)
-                || !ids.insert(document.id.as_str()) { return Err(CandidateError::Input); }
+                || !ids.insert(document.id.as_str()) || (self.long.chunked && document.text.is_empty()) {
+                return Err(CandidateError::Input);
+            }
             bytes = bytes.checked_add(document.id.len()).and_then(|n| n.checked_add(document.text.len()))
                 .filter(|&n| n <= self.max_expanded_bytes).ok_or(CandidateError::Input)?;
         }
+        // In chunked mode this is only a lower bound. Exact chunk counts and
+        // all mask/native reservations are checked for the snapshot in preflight.
         let masks = (input.documents.len() as u64).checked_mul(self.max_ner_mask_node_visits)
             .ok_or(CandidateError::Input)?;
         if masks > self.max_snapshot_mask_node_visits { return Err(CandidateError::Input); }

@@ -3,6 +3,7 @@
 use super::super::*;
 use crate::{corpus::{entities_int8::{Int8EntityConfig, Int8EntityError, Int8EntityRun, PreparedInt8EntityCorpus},
     native_resolve::quantized::Int8ResolveError}, tasks::source_planning::quantized::Int8SourceError};
+mod long;
 
 struct Input { prepared: Option<PreparedInt8EntityCorpus>, vocabulary: Arc<ExtractionVocabulary> }
 impl NlpEngine {

@@ -2,6 +2,7 @@
 use super::*;
 use crate::{corpus::entities_int8::{self, PreparedInt8EntityCorpus, Int8EntityRun, INT8_ENTITY_EXECUTION},
     native_engine::strict_int8::STRICT_INT8_PROFILE, tasks::BuiltInTask};
+mod long;
 
 #[derive(Clone, Copy)]
 struct Expected { documents: usize, ner_work: Int8Work, mask_visits: u64 }
@@ -21,6 +22,7 @@ fn check_result(result: &Int8EntityRun, expected: Expected) -> Result<(), Candid
 }
 pub(super) fn execute(command: ResolveCommand, common: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
+    if command.discovery.long.chunked { return long::execute(command, common, limits, input, output); }
     let session = Session::new(&common, limits)?;
     let text = session.read(&common.input, input, common.max_input_bytes)?;
     let raw = command.discovery.input(&command, &text)?;
