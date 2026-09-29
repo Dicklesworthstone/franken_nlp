@@ -12,6 +12,8 @@ use crate::native_engine::{
     strict_int8::{Int8Work, StrictInt8Engine, STRICT_INT8_PROFILE},
 };
 
+mod completed;
+
 pub const INT8_EXTRACT_VERSION: &str = "strict-int8-schema-source-extraction-v1";
 
 #[derive(Debug)]

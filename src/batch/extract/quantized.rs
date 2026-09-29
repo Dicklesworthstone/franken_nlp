@@ -14,6 +14,9 @@ use crate::{
     tasks::extract::quantized::{Int8ExtractError, Int8ExtractPlan, Int8ExtractRun, INT8_EXTRACT_VERSION},
 };
 
+/// Complete-document schema extraction with shared native and reduction budgets.
+pub mod long;
+
 /// Owns the shared prompt compiler privately; no eager planner/plan conversion
 /// or Deref can route a quantized identity through BF16 execution.
 pub struct Int8ExtractionBatchPlanner { compiler: ExtractionBatchPlanner }
