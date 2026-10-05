@@ -2,9 +2,12 @@
 use super::*;
 use crate::{corpus::summarize::CorpusSummaryLimits,
     tasks::source_planning::quantized::long::summary::Int8SummaryLimits};
+pub(in crate::candidate_cli) mod synthesis;
 
 #[derive(Args)]
 pub(in crate::candidate_cli) struct SummaryArgs {
+    #[command(flatten)]
+    pub synthesis: synthesis::SynthesisArgs,
     /// Union exact summary bullets and evidence, then rank the complete document.
     /// Requires --task summarize; this is not an additional neural synthesis pass.
     #[arg(long)]
@@ -27,6 +30,7 @@ pub(in crate::candidate_cli) struct SummaryArgs {
 }
 impl SummaryArgs {
     pub(super) fn validate(&self, task: &str, bytes: usize) -> Result<(), CandidateError> {
+        self.synthesis.validate(task, self.reduce_summary)?;
         if self.reduce_summary && task != "summarize" { return Err(CandidateError::Arguments); }
         self.limits(bytes).map(|_| ())
     }

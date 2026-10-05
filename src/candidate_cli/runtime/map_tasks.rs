@@ -3,6 +3,7 @@ use super::*;
 mod summary;
 mod question;
 mod extraction;
+mod synthesis;
 use std::sync::Arc;
 use super::source_tasks::{Session, planner, source_identity};
 use crate::{candidate_cli::map::MapCommand,
@@ -58,6 +59,9 @@ pub(in crate::candidate_cli) fn execute(command: MapCommand, args: CandidateArgs
     }
     if command.kind()? == crate::tasks::BuiltInTask::Extract {
         return extraction::execute(command, args, limits, input, output);
+    }
+    if command.summary.synthesis.synthesize_summary {
+        return synthesis::execute(command, args, limits, input, output);
     }
     let session = Session::new(&args, limits)?;
     let text = session.read(&command.input, input, args.max_input_bytes)?;

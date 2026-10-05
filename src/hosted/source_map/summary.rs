@@ -7,6 +7,7 @@ use crate::{
     tasks::{mapreduce::ExecutionError, source_planning::quantized::{Int8SourceError,
         long::summary::{Int8CorpusSummaryError, Int8CorpusSummaryRun, Int8SummaryLimits}}},
 };
+mod synthesis;
 
 impl NlpEngine {
     /// Map all original chunks with the resident INT8 model and produce one
