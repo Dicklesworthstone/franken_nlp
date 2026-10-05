@@ -167,3 +167,4 @@ impl<C: DecodeStepControl> GroupDriver for Int8CohortSession<'_, '_, C> {
     fn abort(&mut self) { Int8CohortSession::abort(self); }
 }
 #[cfg(test)] mod tests;
+pub mod packed;
