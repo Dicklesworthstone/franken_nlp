@@ -33,6 +33,8 @@ pub use resolve::ResolveConfig;
 mod source;
 pub use source::SourceLimits;
 mod source_map;
+mod extraction_map;
+pub use extraction_map::ExtractionMapConfig;
 pub use source_map::SourceMapConfig;
 mod stream;
 pub use stream::{ChatStreamLimits, HostedChatStream};
