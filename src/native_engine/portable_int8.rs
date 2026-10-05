@@ -16,6 +16,8 @@ use super::{
     tensor::Bf16,
 };
 
+pub mod batch;
+
 pub const PORTABLE_INT8_LINEAR_VERSION: &str = "portable-s8-dynamic-rne-fixed-epilogue-v1";
 const ROWS_PER_CHECKPOINT: usize = 32;
 
