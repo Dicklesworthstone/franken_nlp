@@ -1,11 +1,12 @@
-//! Sequential hosted requests with one resident candidate model and one deadline.
-//! This is corpus reuse, not a claim of grouped/native-parallel throughput.
+//! Hosted text corpus requests with one resident model and one deadline.
+//! Serial by default; explicit document cohorts use shared-weight INT8 work.
 use super::*;
 use super::source_tasks::Session;
 use crate::candidate_cli::text_batch::{self as wire, Content, Ledger, Output, Record,
     ReservedWork, TextBatchCommand, FOOTER_BYTES, PROTOCOL};
 use crate::tasks::chat::quantized::PreparedInt8Chat;
 use std::io::{BufRead, BufReader};
+mod cohort;
 
 pub(in crate::candidate_cli) fn execute(command: TextBatchCommand, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
@@ -49,6 +50,7 @@ impl Planner {
 
 fn run(session: &Session, command: &TextBatchCommand, limits: Limits,
     input: &mut impl BufRead, output: &mut impl Write) -> Result<(), CandidateError> {
+    if let Some(width) = command.cohort_rows { return cohort::run(session, command, limits, input, output, width); }
     let args = &command.common;
     let mut input_bytes = 0;
     let mut transport = Output::new(output, command.max_total_output_bytes);

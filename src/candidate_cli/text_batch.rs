@@ -17,6 +17,10 @@ pub(crate) struct TextBatchCommand {
     /// Shared per-record generation and host options; input is an NDJSON file.
     #[command(flatten)]
     pub(super) common: CandidateArgs,
+    /// Explicit cross-document INT8 groups, 1..=64. Omitted keeps serial records.
+    /// A cohort shares one checkpoint budget; cannot combine with prefill-rows.
+    #[arg(long, value_name = "ROWS")]
+    pub(super) cohort_rows: Option<usize>,
     /// Whole-corpus record ceiling. IDs are retained only for duplicate refusal.
     #[arg(long, default_value_t = 1000)]
     pub(super) max_records: u64,
@@ -37,12 +41,18 @@ pub(crate) struct TextBatchCommand {
 pub(super) fn definition() -> clap::Command {
     TextBatchCommand::augment_args(clap::Command::new("text-batch")
         .about("Generate or chat over bounded NDJSON with one resident local INT8 model")
-        .long_about("Explicit non-certified local candidate only. Each generate record is {\"id\":\"unique\",\"prompt\":\"...\"}; chat uses a messages array instead. Optional sample_index is a u64. IDs, not physical row positions, address seeded draws. Generation options apply to every record. max-input-bytes includes each record's JSON framing; max-checkpoints is per record; timeout-seconds covers the entire invocation. One model is loaded lazily and reused, with fresh request state. Output is completed-result NDJSON, never provisional tokens. The batch_complete frame plus successful process exit is required for whole-corpus success. Invalid input, duplicate IDs, budgets, native failure or a broken output stream stop the corpus without retries; earlier completed records remain valid. Empty input completes without opening the model. Blocking IO is cooperative, not preemptible. No network or tool execution."))
+        .long_about("Explicit non-certified local candidate only. Each generate record is {\"id\":\"unique\",\"prompt\":\"...\"}; chat uses a messages array instead. Optional sample_index is a u64. IDs, not physical row positions, address seeded draws. Generation options apply to every record. max-input-bytes includes each record's JSON framing; max-checkpoints is per native invocation (one record by default, one whole cohort with --cohort-rows); timeout-seconds covers the entire invocation. One model is loaded lazily and reused, with fresh request state. --cohort-rows explicitly groups 1..=64 documents with independent KV and shared-weight computation; it cannot combine with --prefill-rows. Preparation, simultaneous sampler/KV and all retained outputs must fit the memory ledger. Output is ordered completed-result NDJSON, never provisional tokens. The batch_complete frame plus successful process exit is required for whole-corpus success. Invalid input, duplicate IDs, budgets, native failure or a broken output stream stop the corpus without retries; earlier completed records remain valid. A cohort must fully execute and validate before its first result is published. Empty input completes without opening the model. Blocking IO is cooperative, not preemptible. No network or tool execution."))
 }
 
 impl TextBatchCommand {
     pub(super) fn validate(&self) -> Result<Limits, CandidateError> {
         let limits = self.common.validate()?;
+        if let Some(rows) = self.cohort_rows {
+            if rows == 0 || rows > crate::native_engine::portable_int8::batch::MAX_BATCH_ROWS
+                || self.common.policy.prefill()?.is_some() {
+                return Err(CandidateError::Arguments);
+            }
+        }
         if self.max_records == 0 || self.max_records > 1_000_000
             || self.max_total_input_bytes == 0 || self.max_total_input_bytes > 16 * 1024 * MIB
             || self.max_total_output_bytes < FOOTER_BYTES as u64
@@ -50,12 +60,19 @@ impl TextBatchCommand {
             || self.max_total_forward_positions == 0 || self.max_total_projected_logits == 0 {
             return Err(CandidateError::Arguments);
         }
+        // Shared tokenizer and whole-corpus ID set remain single charges;
+        // all simultaneously retained document plans and staging scale by M.
         // Conservative declared payload model, not allocator/RSS certification.
-        // Price the bounded ID set in addition to existing planner/IO staging.
+        let rows = self.cohort_rows.unwrap_or(1) as u64;
+        let inputs = (self.common.max_input_bytes as u64).checked_mul(32)
+            .and_then(|bytes| bytes.checked_mul(rows)).ok_or(CandidateError::Arguments)?;
+        let staging = (limits.result_bytes as u64).checked_add(8192)
+            .and_then(|bytes| bytes.checked_mul(2)).and_then(|bytes| bytes.checked_mul(rows))
+            .ok_or(CandidateError::Arguments)?;
         let floor = self.max_records.checked_mul(1024)
             .and_then(|n| n.checked_add(128 * MIB))
-            .and_then(|n| n.checked_add(self.common.max_input_bytes as u64 * 32))
-            .and_then(|n| n.checked_add((limits.result_bytes as u64 + 8192) * 2))
+            .and_then(|n| n.checked_add(inputs))
+            .and_then(|n| n.checked_add(staging))
             .and_then(|n| n.checked_add(65_536)).ok_or(CandidateError::Arguments)?;
         if floor > limits.preparation_bytes { return Err(CandidateError::Arguments); }
         Ok(limits)
@@ -266,3 +283,4 @@ mod tests {
         output.write_all(b"{}\n").unwrap(); assert_eq!(output.written, 7);
     }
 }
+#[cfg(test)] mod cohort_tests;
