@@ -2,14 +2,14 @@
 //!
 //! Structured/scored task commands do not expose these switches. Stops use
 //! the native exact-suffix contract: bytes are retained and streaming never
-//! retracts content. Minimum length suppresses EOS, not byte stops or budgets.
+//! retracts content. Minimum length delays EOS and byte-stop completion, not budgets.
 use super::{CandidateError, GenerationOptions};
 use clap::Args;
 use crate::native_engine::lmhead::NANBEIGE_VOCAB_SIZE;
 
 #[derive(Args)]
 pub(super) struct GenerationPolicyArgs {
-    /// Minimum non-EOS output tokens. Stops and resource ceilings still apply.
+    /// Minimum output tokens before EOS or stop-suffix completion. Hard limits still apply.
     #[arg(long, default_value_t = 0)]
     min_new_tokens: usize,
     /// Exact UTF-8 suffix checked after each token; matching bytes are retained.

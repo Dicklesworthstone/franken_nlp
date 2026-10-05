@@ -20,6 +20,7 @@ mod runtime;
 #[cfg(test)]
 mod tests;
 mod generation_policy;
+mod text_batch;
 mod source;
 mod batch;
 mod scored;
@@ -93,6 +94,7 @@ pub(crate) struct CandidateArgs {
 
 pub(crate) enum CandidateCommand {
     Text { task: Task, args: CandidateArgs },
+    TextBatch(text_batch::TextBatchCommand),
     Source(source::SourceCommand),
     Scored(scored::ScoredCommand),
     Extract(extract::ExtractCommand),
@@ -124,6 +126,7 @@ pub(crate) fn definition() -> clap::Command {
         .subcommand(redact::definition())
         .subcommand(resolve::definition())
         .subcommand(stream::definition())
+        .subcommand(text_batch::definition())
         .subcommand(CandidateArgs::augment_args(clap::Command::new("generate")
             .about("Generate from a bounded UTF-8 prompt using the pinned chat template")))
         .subcommand(CandidateArgs::augment_args(clap::Command::new("chat")
@@ -134,6 +137,9 @@ impl CandidateCommand {
     pub(crate) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let (name, matches) = matches.subcommand().ok_or_else(||
             clap::Error::raw(clap::error::ErrorKind::MissingSubcommand, "candidate task required"))?;
+        if name == "text-batch" {
+            return text_batch::TextBatchCommand::from_arg_matches(matches).map(Self::TextBatch);
+        }
         if name == "stream" {
             return stream::StreamCommand::from_arg_matches(matches).map(Self::Stream);
         }
@@ -208,6 +214,7 @@ impl CandidateCommand {
 
     fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
         let (task, args) = match self {
+            Self::TextBatch(command) => return command.execute(input, output),
             Self::Source(command) => return command.execute(input, output),
             Self::Scored(command) => return command.execute(input, output),
             Self::Extract(command) => return command.execute(input, output),
