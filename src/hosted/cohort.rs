@@ -6,8 +6,8 @@ use crate::{native_engine::{portable_int8::batch::MAX_BATCH_ROWS, strict_int8::{
 
 #[derive(Clone, Copy, Debug)]
 pub struct ChatCohortLimits {
-    /// context_tokens is a PER-ROW ceiling. Actual row capacities are derived
-    /// from each immutable plan, rather than padding all KV to this maximum.
+    /// context_tokens is a PER-ROW ceiling. Fixed cohorts derive each capacity;
+    /// refilling epochs reserve the maximum planned context in each live slot.
     pub native: NativeLimits,
     /// Aggregate simultaneous sampler workspaces, not one row's allowance.
     pub max_sampler_bytes: u64,
@@ -130,3 +130,4 @@ fn build_input(prepared: Vec<PreparedInt8Chat>, limits: ChatCohortLimits) -> Res
     Ok(Input { prepared, contexts, work, sampler_bytes, output_tokens })
 }
 #[cfg(test)] mod tests;
+mod refill;
