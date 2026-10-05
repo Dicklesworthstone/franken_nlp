@@ -442,3 +442,4 @@ fn poll<C: DecodeStepControl>(control: &mut C) -> Result<(), StrictInt8Error> {
 
 #[cfg(test)] mod tests;
 pub mod scoring;
+pub mod prefill;
