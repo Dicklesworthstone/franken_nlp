@@ -10,6 +10,9 @@ use crate::corpus::summarize::{CorpusSummaryError, CorpusSummaryLimits, CorpusSu
     CorpusSummaryTask, SummaryPass, check_bytes};
 use crate::tasks::{mapreduce::CHUNK_PROFILE, summarize::SummaryResult};
 
+/// Separate opt-in neural synthesis from verified verbatim map evidence.
+pub mod synthesis;
+
 pub const INT8_CORPUS_SUMMARY_EXECUTION: &str = "portable-int8-cited-summary-map-exact-reduce-v1";
 
 /// These bounds constrain the complete document, independently of each native
