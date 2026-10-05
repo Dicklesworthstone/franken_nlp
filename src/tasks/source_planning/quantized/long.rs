@@ -20,6 +20,8 @@ use crate::{
 
 /// Opt-in complete cited-summary reduction; the default ordered map is unchanged.
 pub mod summary;
+/// Exact document-wide keyphrase ranking over all native map candidates.
+pub mod keyphrase_reduction;
 /// Question-aware passage planning and evidence-preserving answer collection.
 pub mod question;
 

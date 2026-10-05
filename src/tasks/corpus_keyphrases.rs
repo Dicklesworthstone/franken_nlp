@@ -51,7 +51,7 @@ impl Default for CorpusKeyphraseLimits {
     }
 }
 impl CorpusKeyphraseLimits {
-    fn validate(self) -> Result<(), KeyphraseError> {
+    pub fn validate(self) -> Result<(), KeyphraseError> {
         if !(1..=65_536).contains(&self.max_unique_phrases)
             || !(1..=1_000_000).contains(&self.max_evidence_spans)
             || !(1..=64 * 1024 * 1024).contains(&self.max_value_bytes) || self.max_scan_work == 0
@@ -87,6 +87,7 @@ pub struct KeyphraseAggregate {
 }
 impl KeyphraseAggregate {
     pub fn phrases(&self) -> &[CorpusPhrase] { &self.phrases }
+    pub fn mapped_chunks(&self) -> usize { self.mapped_chunks }
     pub fn into_ranked(mut self, max_phrases: usize, max_bytes: usize) -> Result<CorpusKeyphraseResult, KeyphraseError> {
         if !(1..=4096).contains(&max_phrases) || !(1..=64 * 1024 * 1024).contains(&max_bytes) {
             return Err(KeyphraseError::InvalidOptions);
@@ -146,16 +147,27 @@ pub struct CorpusKeyphraseTask<P> {
     options: KeyphraseOptions,
     limits: CorpusKeyphraseLimits,
     scan_remaining: u64,
+    // Chosen by the concrete adapter, never inferred from a returned receipt.
+    profile: &'static str,
     failed: bool,
 }
 impl<P: KeyphrasePass> CorpusKeyphraseTask<P> {
     pub fn new(pass: P, limits: CorpusKeyphraseLimits) -> Result<Self, KeyphraseError> {
+        Self::with_profile(pass, limits, HF_BF16_EAGER_PROFILE)
+    }
+    /// Internal strict-INT8 adapter. The eager constructor remains eager-only;
+    /// no receipt is rewritten to pass another numerics profile's verifier.
+    pub(crate) fn new_int8(pass: P, limits: CorpusKeyphraseLimits) -> Result<Self, KeyphraseError> {
+        Self::with_profile(pass, limits, crate::native_engine::strict_int8::STRICT_INT8_PROFILE)
+    }
+    fn with_profile(pass: P, limits: CorpusKeyphraseLimits, profile: &'static str) -> Result<Self, KeyphraseError> {
         limits.validate()?;
         let options = pass.options(); options.validate()?;
-        Ok(Self { pass, options, limits, scan_remaining: limits.max_scan_work, failed: false })
+        Ok(Self { pass, options, limits, scan_remaining: limits.max_scan_work, profile, failed: false })
     }
     pub fn scan_work_remaining(&self) -> u64 { self.scan_remaining }
     pub fn pass(&self) -> &P { &self.pass }
+    pub(crate) fn into_pass(self) -> P { self.pass }
 }
 impl<P: KeyphrasePass> MapReduceTask for CorpusKeyphraseTask<P> {
     type Value = KeyphraseAggregate;
@@ -172,7 +184,7 @@ impl<P: KeyphrasePass> MapReduceTask for CorpusKeyphraseTask<P> {
         // no batched-GEMM claim; the outer map batch is an orchestration batch.
         for chunk in chunks {
             let raw = self.pass.run(chunk)?;
-            let value = map_value(chunk, raw, self.options, self.limits, &mut self.scan_remaining)?;
+            let value = map_value(chunk, raw, self.options, self.limits, &mut self.scan_remaining, self.profile)?;
             outputs.push(MapOutput { chunk_id: chunk.id(), value });
         }
         self.failed = false;
@@ -188,9 +200,9 @@ impl<P: KeyphrasePass> MapReduceTask for CorpusKeyphraseTask<P> {
 }
 
 fn map_value(chunk: &SourceChunk<'_>, raw: KeyphraseResult, options: KeyphraseOptions,
-    limits: CorpusKeyphraseLimits, scan_remaining: &mut u64) -> Result<KeyphraseAggregate, KeyphraseError> {
+    limits: CorpusKeyphraseLimits, scan_remaining: &mut u64, profile: &str) -> Result<KeyphraseAggregate, KeyphraseError> {
     if raw.schema_version != 1 || raw.task_spec_version != KEYPHRASES_TASK_VERSION
-        || raw.numerics_profile != HF_BF16_EAGER_PROFILE || raw.ranking_policy != KEYPHRASES_RANKING
+        || raw.numerics_profile != profile || raw.ranking_policy != KEYPHRASES_RANKING
         || raw.score_space != ScoreSpace::NotComputed || raw.grounding != ExtractionGrounding::SourceMembership
         || raw.phrases.len() > options.max_phrases || raw.phrases.len() > limits.max_unique_phrases
     { return Err(KeyphraseError::InvalidResult); }
@@ -265,7 +277,7 @@ fn copy_text(text: &str) -> Result<String, KeyphraseError> {
     copy.try_reserve_exact(text.len()).map_err(|_| KeyphraseError::AllocationRefused)?;
     copy.push_str(text); Ok(copy)
 }
-fn check_bytes(value: &impl Serialize, cap: usize) -> Result<(), KeyphraseError> {
+pub(crate) fn check_bytes(value: &impl Serialize, cap: usize) -> Result<(), KeyphraseError> {
     if canonjson::canonical_bytes(value).map_err(|_| KeyphraseError::Serialization)?.len() > cap {
         return Err(KeyphraseError::OutputBudgetExceeded);
     }
@@ -517,7 +529,8 @@ mod tests {
             match mode { 0 => { raw.phrases[0].spans.pop(); },
                 1 => { raw.phrases.push(raw.phrases[0].clone()); raw.phrases[1].rank = 2; },
                 _ => raw.phrases[0].rank = 2 }
-            assert!(map_value(chunk, raw, KeyphraseOptions::default(), CorpusKeyphraseLimits::default(), &mut 1_000_000).is_err());
+            assert!(map_value(chunk, raw, KeyphraseOptions::default(), CorpusKeyphraseLimits::default(),
+                &mut 1_000_000, HF_BF16_EAGER_PROFILE).is_err());
         }
     }
     #[test]
