@@ -80,7 +80,8 @@ impl ScoredArgs {
             max_output_bytes: self.max_result_bytes, max_input_bytes: self.max_input_bytes,
             max_weight_mib: self.max_weight_mib, preparation_mib: self.preparation_mib,
             timeout_seconds: self.timeout_seconds, max_checkpoints: self.max_checkpoints,
-            seed: None, temperature_milli: None, top_k: None, top_p_ppm: None, logprobs: false };
+            seed: None, temperature_milli: None, top_k: None, top_p_ppm: None, logprobs: false,
+            policy: generation_policy::GenerationPolicyArgs::default() };
         let limits = common.validate()?;
         // In addition to the shared floor, price the worst permitted repeated
         // exact prompt/IR copies; user input cannot buy an uncharged head set.

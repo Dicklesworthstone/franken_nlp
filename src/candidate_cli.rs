@@ -19,6 +19,7 @@ use crate::{canonjson, error::ErrorCode,
 mod runtime;
 #[cfg(test)]
 mod tests;
+mod generation_policy;
 mod source;
 mod batch;
 mod scored;
@@ -86,6 +87,8 @@ pub(crate) struct CandidateArgs {
     /// Include raw full-vocabulary log-probabilities, not confidence scores.
     #[arg(long)]
     logprobs: bool,
+    #[command(flatten)]
+    policy: generation_policy::GenerationPolicyArgs,
 }
 
 pub(crate) enum CandidateCommand {
@@ -280,6 +283,7 @@ impl CandidateArgs {
 
     fn options(&self, eos: u32) -> Result<GenerationOptions, CandidateError> {
         let mut options = GenerationOptions::greedy(self.max_new_tokens, self.max_output_bytes, eos);
+        self.policy.apply(&mut options)?;
         options.capture_logprobs = self.logprobs;
         options.sampling = match &self.seed {
             Some(seed) => GenerationSampling::Seeded { effective_seed: parse_seed(seed)?,
