@@ -53,10 +53,13 @@ pub(in crate::candidate_cli) fn execute<W: Write + Send + 'static>(task: Task, a
     let sink = TokenSink::new(output, task, bounds, &facts, eos, args.seed.clone())?;
     let cancellation = CancellationToken::default();
     let model = session.load(&args, limits, &facts, cancellation.clone())?;
-    let mut completed = session.engine.execute_int8_chat_stream(&model, prepared, 1,
-        ChatStreamLimits { native: session.native(&args)?, max_sampler_bytes: SAMPLER_BYTES,
-            preparation_reserve_bytes: limits.preparation_bytes, sink_reserve_bytes: bounds.sink_memory_bytes },
-        sink, cancellation).map_err(host_failure)?;
+    let stream_limits = ChatStreamLimits { native: session.native(&args)?, max_sampler_bytes: SAMPLER_BYTES,
+        preparation_reserve_bytes: limits.preparation_bytes, sink_reserve_bytes: bounds.sink_memory_bytes };
+    let mut completed = match args.policy.prefill()? {
+        Some(prefill) => session.engine.execute_int8_chat_stream_layer_major(&model, prepared, 1,
+            stream_limits, prefill, sink, cancellation),
+        None => session.engine.execute_int8_chat_stream(&model, prepared, 1, stream_limits, sink, cancellation),
+    }.map_err(host_failure)?;
     // No native callback can mint the terminal frame. This point is AFTER the
     // physical scope joins and dispatch's cancellation/stop precedence resolves.
     session.remaining()?;

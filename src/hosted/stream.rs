@@ -2,7 +2,7 @@
 //! Events are provisional. Only the returned, validated completion can authorize
 //! a terminal success frame, and it is returned AFTER the hosted scope drains.
 use super::*;
-use crate::{native_engine::{decode::DecodeEventSink, strict_int8::Int8Work}, tasks::ir::TaskBudget};
+use crate::{native_engine::{decode::DecodeEventSink, strict_int8::{Int8Work, prefill::Int8PrefillLimits}}, tasks::ir::TaskBudget};
 
 /// Caller-priced retained preparation and sink memory, not an RSS guarantee.
 /// A channel/sink must bound its own buffers and include them in this reserve.
@@ -65,11 +65,31 @@ impl NlpEngine {
         request_seq: u64, limits: ChatStreamLimits, sink: S, cancellation: CancellationToken)
         -> Result<HostedChatStream<S>, HostedError>
     where S: DecodeEventSink + Send + 'static {
+        self.run_int8_chat_stream(model, prepared, request_seq, limits, None, sink, cancellation)
+    }
+
+    /// Explicit candidate layer-major prefill with the ordinary streaming
+    /// protocol. Extra native scratch is admitted independently of sink and
+    /// preparation storage, and remains charged through physical drain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_int8_chat_stream_layer_major<S>(&self, model: &ResidentInt8, prepared: PreparedInt8Chat,
+        request_seq: u64, limits: ChatStreamLimits, prefill: Int8PrefillLimits, sink: S,
+        cancellation: CancellationToken) -> Result<HostedChatStream<S>, HostedError>
+    where S: DecodeEventSink + Send + 'static {
+        self.run_int8_chat_stream(model, prepared, request_seq, limits, Some(prefill), sink, cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_int8_chat_stream<S>(&self, model: &ResidentInt8, prepared: PreparedInt8Chat,
+        request_seq: u64, limits: ChatStreamLimits, prefill: Option<Int8PrefillLimits>, sink: S,
+        cancellation: CancellationToken) -> Result<HostedChatStream<S>, HostedError>
+    where S: DecodeEventSink + Send + 'static {
         dispatch::preflight(self, limits.native.run)?;
         self.check_resident_domain(model)?;
         check_model_identity(model.artifact_identity(), prepared.execution_identity())?;
         let retained_bytes = limits.retained_bytes()?;
         let required = requirements(limits.native)?;
+        let extra = prefill_extra(prefill)?;
         let work = prepared.planned_work();
         capacity(request_seq, limits.native.context_tokens, required.kv_bytes,
             *prepared.task_plan().ir().budget(), work, prepared.native_plan().sampler_bytes(), limits.max_sampler_bytes)?;
@@ -80,7 +100,7 @@ impl NlpEngine {
             || Ok(StreamInput { prepared: Some(prepared), sink }))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-            sum(&[required.rope_bytes, required.scratch_payload_bound,
+            sum(&[required.rope_bytes, required.scratch_payload_bound, extra,
                 limits.max_sampler_bytes, limits.native.allocator_reserve_bytes])?)?;
         let task = input.value.prepared.as_ref().ok_or(HostedError::CompletionMissing)?.task_plan().ir().budget();
         let output = output_claim(&lease, task.max_output_bytes, u64::from(task.max_output_tokens))?;
@@ -90,10 +110,14 @@ impl NlpEngine {
             let prepared = input.value.prepared.take().ok_or(HostedError::CompletionMissing)?;
             let mut engine = allocate_native(kv, scratch, || model.inner.loaded.value
                 .engine(limits.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-            let result = prepared.execute_with_sink(prepared.execution_identity(), &mut engine.value,
-                request_seq, Int8GenerationBudget { native: Int8RunBudget::exact(work),
-                    max_kv_bytes: required.kv_bytes, max_sampler_bytes: limits.max_sampler_bytes },
-                &mut input.value.sink, control).map_err(HostedError::Chat)?;
+            let budget = Int8GenerationBudget { native: Int8RunBudget::exact(work),
+                max_kv_bytes: required.kv_bytes, max_sampler_bytes: limits.max_sampler_bytes };
+            let result = match prefill {
+                Some(prefill) => prepared.execute_layer_major_with_sink(prepared.execution_identity(), &mut engine.value,
+                    request_seq, budget, prefill, &mut input.value.sink, control),
+                None => prepared.execute_with_sink(prepared.execution_identity(), &mut engine.value,
+                    request_seq, budget, &mut input.value.sink, control),
+            }.map_err(HostedError::Chat)?;
             // Independent UTF-8/control/work/result validation has completed.
             // Still NO terminal success: dispatch owns cancellation and drain.
             drop(engine);
@@ -103,6 +127,10 @@ impl NlpEngine {
             Ok(HostedChatStream { output: GuardedOutput::new(result, committed), input })
         })
     }
+}
+
+fn prefill_extra(prefill: Option<Int8PrefillLimits>) -> Result<u64, HostedError> {
+    prefill.map(Int8PrefillLimits::validate).transpose().map(|bytes| bytes.unwrap_or(0)).map_err(HostedError::Native)
 }
 
 fn capacity(sequence: u64, context: usize, kv: u64, task: TaskBudget, work: Int8Work,
@@ -164,5 +192,29 @@ mod tests {
         }
         fn send<T: Send + 'static>() {}
         send::<StreamInput<Sink>>(); send::<HostedChatStream<Sink>>();
+    }
+    #[test]
+    fn grouped_stream_scratch_is_additional_to_unchanged_sink_preparation_and_native_storage() {
+        let required = requirements(native()).unwrap();
+        let ordinary = sum(&[required.rope_bytes, required.scratch_payload_bound,
+            limits().max_sampler_bytes, native().allocator_reserve_bytes]).unwrap();
+        assert_eq!(prefill_extra(None).unwrap(), 0);
+        for rows in [1, 4, 64] {
+            let extra = Int8PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
+            let p = Int8PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: extra };
+            let charged = sum(&[ordinary, prefill_extra(Some(p)).unwrap()]).unwrap();
+            assert_eq!(charged - ordinary, extra);
+            assert_eq!(limits().retained_bytes().unwrap(), 257 << 20);
+        }
+    }
+    #[test]
+    fn invalid_or_underpriced_grouped_stream_cannot_reach_native_allocation() {
+        for rows in [0, 65, usize::MAX] {
+            assert!(prefill_extra(Some(Int8PrefillLimits { max_batch_rows: rows,
+                max_extra_scratch_bytes: u64::MAX })).is_err());
+        }
+        let bytes = Int8PrefillLimits::required_extra_scratch_bytes(4).unwrap();
+        assert!(prefill_extra(Some(Int8PrefillLimits { max_batch_rows: 4, max_extra_scratch_bytes: bytes - 1 })).is_err());
+        assert!(sum(&[u64::MAX, bytes]).is_err());
     }
 }

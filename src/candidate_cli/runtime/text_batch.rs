@@ -75,8 +75,8 @@ fn run(session: &Session, command: &TextBatchCommand, limits: Limits,
         transport.admit_frame(frame_cap)?;
         if model.is_none() { model = Some(session.load(args, limits, &facts, cancellation.clone())?); }
         let resident = model.as_ref().ok_or(CandidateError::Model)?;
-        let result = session.engine.execute_int8_chat(resident, prepared, ledger.records,
-            session.native(args)?, SAMPLER_BYTES, cancellation.clone()).map_err(|_| CandidateError::Execution)?;
+        let result = execute_chat(&session.engine, resident, prepared, ledger.records,
+            session.native(args)?, args, cancellation.clone())?;
         session.remaining()?;
         let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
             evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,

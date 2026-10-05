@@ -26,6 +26,34 @@ uses the absolute source position, including an existing prefix and the second
 loop. Intermediate prompt/morsel positions never project the lm-head. The
 last prompt position projects once; generation then uses ordinary token steps.
 
+## Explicit candidate CLI
+
+A build with `asupersync-runtime` and an existing local candidate artifact may
+select `--prefill-rows ROWS` for buffered generate/chat, live token streaming,
+or each independent record in text-batch. Omitting the switch preserves the
+sequential path. Supplying 1 explicitly exercises the layer-major implementation
+with one row. Row counts outside 1..=64 are refused before input or model IO.
+The example width is illustrative, not a benchmark-selected recommendation.
+
+```sh
+fnlp candidate generate prompt.txt --model local.fnlpq --memory-mib 8192 --prefill-rows 8
+fnlp candidate stream generate prompt.txt --model local.fnlpq --memory-mib 8192 --prefill-rows 8
+fnlp candidate text-batch prompts.ndjson --task generate --model local.fnlpq --memory-mib 8192 --prefill-rows 8
+```
+
+Chat uses the same switch with its existing JSON message-array input. Text-batch
+retains one resident model and sequential independent records; the new switch
+batches prompt positions WITHIN each record, not documents. Generation controls,
+seed addressing, corpus budgets, provisional token frames and required completion
+frames are unchanged. The switch is not offered to structured/scored commands
+whose execution paths have not been connected to this strategy.
+
+The CLI derives extra scratch from the selected row ceiling; callers cannot
+supply a smaller charge. The host must admit that memory in addition to the
+ordinary model, KV, native workspace, preparation, sampler and output charges.
+An admission or grouped-execution failure does not trigger a hidden sequential
+retry. No benchmark win, model fidelity or release activation is inferred.
+
 ## Hosted use
 
 Given an existing host, resident model, prepared chat/generate plan and native
@@ -52,8 +80,9 @@ BEFORE dispatch and retains the charge until physical native cleanup. Direct
 session/plan/task callers must supply equivalent admission themselves; the
 numeric limits are not permits and are not an OS RSS guarantee. Task-level
 `execute_layer_major_with_sink` additionally supports provisional token events
-under the existing reserve/permit contract. No new CLI switch is introduced by
-this increment.
+under the existing reserve/permit contract. Hosted streaming is available through
+`NlpEngine::execute_int8_chat_stream_layer_major`; its sink and preparation
+charges survive until final publication, independently of native scratch.
 
 ## Invariants and limits
 

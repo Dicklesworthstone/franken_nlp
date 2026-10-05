@@ -5,10 +5,15 @@
 //! retracts content. Minimum length delays EOS and byte-stop completion, not budgets.
 use super::{CandidateError, GenerationOptions};
 use clap::Args;
-use crate::native_engine::lmhead::NANBEIGE_VOCAB_SIZE;
+use crate::native_engine::{lmhead::NANBEIGE_VOCAB_SIZE, strict_int8::prefill::Int8PrefillLimits};
 
 #[derive(Args)]
 pub(super) struct GenerationPolicyArgs {
+    /// Explicit candidate layer-major prompt execution, 1..=64 rows per morsel.
+    /// Omitted keeps sequential prefill. Extra scratch is process-admitted.
+    /// This does not batch documents or claim a measured speedup.
+    #[arg(long, value_name = "ROWS")]
+    prefill_rows: Option<usize>,
     /// Minimum output tokens before EOS or stop-suffix completion. Hard limits still apply.
     #[arg(long, default_value_t = 0)]
     min_new_tokens: usize,
@@ -37,7 +42,7 @@ pub(super) struct GenerationPolicyArgs {
 
 impl Default for GenerationPolicyArgs {
     fn default() -> Self {
-        Self { min_new_tokens: 0, stop_suffixes: Vec::new(), banned_token_ids: Vec::new(),
+        Self { prefill_rows: None, min_new_tokens: 0, stop_suffixes: Vec::new(), banned_token_ids: Vec::new(),
             repetition_penalty_milli: 1000, presence_penalty_milli: 0,
             frequency_penalty_milli: 0, logit_bias: Vec::new() }
     }
@@ -58,7 +63,18 @@ fn parse_bias(value: &str) -> Result<TokenBias, &'static str> {
 }
 
 impl GenerationPolicyArgs {
+    /// Physical scheduling choice, not a new semantic generation option. The
+    /// host reserves the derived extra payload; argv cannot underprice it.
+    pub(super) fn prefill(&self) -> Result<Option<Int8PrefillLimits>, CandidateError> {
+        self.prefill_rows.map(|rows| {
+            let bytes = Int8PrefillLimits::required_extra_scratch_bytes(rows)
+                .map_err(|_| CandidateError::Arguments)?;
+            Ok(Int8PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: bytes })
+        }).transpose()
+    }
+
     pub(super) fn apply(&self, options: &mut GenerationOptions) -> Result<(), CandidateError> {
+        self.prefill()?;
         // Check variable-sized inputs BEFORE copying them into native options.
         // The host's existing preparation reserve covers this bounded policy.
         if self.min_new_tokens > options.max_new_tokens || self.stop_suffixes.len() > 64
@@ -188,6 +204,53 @@ mod tests {
         for task in ["ner", "keyphrases", "summarize", "answer", "classify", "sentiment"] {
             assert!(definition().try_get_matches_from(["candidate", task,
                 "--model", "local.fnlpq", "--memory-mib", "8192", "--stop", "END"]).is_err());
+        }
+    }
+
+    #[test]
+    fn layer_major_prefill_is_explicit_and_does_not_rewrite_generation_semantics() {
+        for task in ["generate", "chat"] {
+            let sequential = args(task, &[]);
+            assert!(sequential.policy.prefill().unwrap().is_none());
+            for width in ["1", "4", "64"] {
+                let grouped = args(task, &["--prefill-rows", width]);
+                assert!(grouped.validate().is_ok());
+                let limits = grouped.policy.prefill().unwrap().unwrap();
+                assert_eq!(limits.max_batch_rows, width.parse::<usize>().unwrap());
+                assert_eq!(limits.validate().unwrap(), limits.max_extra_scratch_bytes);
+                assert!(grouped.options(166_101).unwrap() == sequential.options(166_101).unwrap());
+            }
+        }
+    }
+    #[test]
+    fn invalid_prefill_rows_refuse_during_shared_pre_io_validation() {
+        for width in ["0", "65", "1000000"] {
+            assert!(args("generate", &["--prefill-rows", width]).validate().is_err());
+        }
+    }
+    #[test]
+    fn streamed_and_corpus_commands_receive_the_same_explicit_prefill_choice() {
+        for task in ["generate", "chat"] {
+            let stream = definition().try_get_matches_from(["candidate", "stream", task,
+                "--model", "local.fnlpq", "--memory-mib", "8192", "--prefill-rows", "4"]).unwrap();
+            let (_, operation) = stream.subcommand().unwrap();
+            let (_, inner) = operation.subcommand().unwrap();
+            let parsed = crate::candidate_cli::stream::StreamArgs::from_arg_matches(inner).unwrap();
+            assert!(parsed.validate().is_ok());
+            assert_eq!(parsed.common.policy.prefill().unwrap().unwrap().max_batch_rows, 4);
+            let corpus = definition().try_get_matches_from(["candidate", "text-batch", "--task", task,
+                "--model", "local.fnlpq", "--memory-mib", "8192", "--prefill-rows", "4"]).unwrap();
+            let (_, inner) = corpus.subcommand().unwrap();
+            let parsed = CandidateArgs::from_arg_matches(inner).unwrap();
+            assert!(parsed.validate().is_ok());
+            assert_eq!(parsed.policy.prefill().unwrap().unwrap().max_batch_rows, 4);
+        }
+    }
+    #[test]
+    fn unimplemented_structured_prefill_routes_cannot_silently_ignore_the_switch() {
+        for task in ["ner", "keyphrases", "summarize", "answer", "classify", "sentiment"] {
+            assert!(definition().try_get_matches_from(["candidate", task,
+                "--model", "local.fnlpq", "--memory-mib", "8192", "--prefill-rows", "4"]).is_err());
         }
     }
 }

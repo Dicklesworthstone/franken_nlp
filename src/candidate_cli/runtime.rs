@@ -72,11 +72,11 @@ pub(super) fn execute(task: Task, args: CandidateArgs, limits: Limits,
     // ALL retained facts (including source-root identity), not just a filename.
     // The host independently checks the prepared plan against resident weights.
     if model.artifact_identity() != &facts { return Err(CandidateError::Identity); }
-    let result = engine.execute_int8_chat(&model, prepared, 1, NativeLimits {
+    let result = execute_chat(&engine, &model, prepared, 1, NativeLimits {
         context_tokens: args.context_tokens, allocator_reserve_bytes: 64 * MIB,
         run: RunLimits { max_elapsed: remaining()?, max_checkpoints: args.max_checkpoints,
             cleanup_reserve_bytes: 65_536 },
-    }, SAMPLER_BYTES, cancellation).map_err(|_| CandidateError::Execution)?;
+    }, &args, cancellation)?;
     remaining()?;
     let response = CandidateResponse { schema_version: 1,
         scope: "real-artifact-current-candidate", evidence: "non_authoritative",
@@ -87,6 +87,19 @@ pub(super) fn execute(task: Task, args: CandidateArgs, limits: Limits,
     // Keep both the hosted output charge and preparation/staging charge alive
     // until serialization, external delivery and flush have actually finished.
     publish(&response, limits.result_bytes + 4096, output)
+}
+
+/// Buffered and corpus requests use one explicit strategy choice. No retry or
+/// fallback can hide a grouped execution failure or evade scratch admission.
+pub(super) fn execute_chat(engine: &NlpEngine, model: &crate::hosted::ResidentInt8,
+    prepared: crate::tasks::chat::quantized::PreparedInt8Chat, request_seq: u64,
+    native: NativeLimits, args: &CandidateArgs, cancellation: CancellationToken)
+    -> Result<crate::hosted::HostedOutput<crate::tasks::chat::quantized::Int8ChatResult>, CandidateError> {
+    match args.policy.prefill()? {
+        Some(prefill) => engine.execute_int8_chat_layer_major(model, prepared, request_seq,
+            native, SAMPLER_BYTES, prefill, cancellation),
+        None => engine.execute_int8_chat(model, prepared, request_seq, native, SAMPLER_BYTES, cancellation),
+    }.map_err(|_| CandidateError::Execution)
 }
 
 #[derive(Serialize)]
