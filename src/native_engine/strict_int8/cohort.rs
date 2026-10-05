@@ -245,3 +245,4 @@ fn reserve<T>(count: usize) -> Result<Vec<T>, StrictInt8Error> {
     let mut values = Vec::new(); values.try_reserve_exact(count).map_err(|_| StrictInt8Error::Allocation)?; Ok(values)
 }
 #[cfg(test)] mod tests;
+pub mod packed;

@@ -70,20 +70,42 @@ fn project_group<C: DecodeStepControl>(matrix: QuantizedLinear<'_>, inputs: &[Ac
     matrix.project_batch_bf16_into(inputs, LinearRows::All, &mut output, ledger, control)?; Ok(output)
 }
 
+/// Check a complete address program before its first append. Repeated sequence
+/// slots are permitted ONLY for consecutive positions in one contiguous run.
+/// Neither positions nor documents are padded, broadcast, sorted or repaired.
+fn check_addresses(steps: &[CohortToken], positions: &[usize], slot: usize,
+    sequences: &[Sequence]) -> Result<(), StrictInt8Error> {
+    check_count(steps.len())?;
+    if positions.len() != steps.len() { return Err(StrictInt8Error::Input); }
+    let mut previous = None;
+    let mut expected = 0;
+    for (step, &position) in steps.iter().zip(positions) {
+        if step.sequence >= sequences.len() || previous.is_some_and(|prior| prior > step.sequence) {
+            return Err(StrictInt8Error::Input);
+        }
+        let cache = &sequences[step.sequence].cache;
+        if previous != Some(step.sequence) {
+            expected = cache.len_for_slot(slot).map_err(|_| StrictInt8Error::Cache)?;
+        }
+        if position != expected { return Err(StrictInt8Error::Cache); }
+        if position >= cache.capacity_positions() { return Err(StrictInt8Error::Context); }
+        expected = position.checked_add(1).ok_or(StrictInt8Error::Context)?;
+        previous = Some(step.sequence);
+    }
+    Ok(())
+}
+
 /// No padded or broadcast attention. Validate the complete ragged address set
-/// before the first KV write; each row then uses the existing scalar primitive.
+/// before the first KV write; each token then uses the existing scalar primitive.
+/// In a packed prompt, a later token is not appended until the previous token's
+/// attention has completed. Other documents never enter that cache.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn attend_sequences<C: DecodeStepControl>(query: &mut [Bf16], key: &mut [Bf16], value: &[Bf16],
     steps: &[CohortToken], positions: &[usize], slot: usize, rope: &RopeTablesF32,
     sequences: &mut [Sequence], control: &mut C) -> Result<Vec<Bf16>, StrictInt8Error> {
-    check_indices(steps.iter().map(|step| step.sequence), sequences.len())?;
-    if positions.len() != steps.len() || query.len() != steps.len() * Q
-        || key.len() != steps.len() * K || value.len() != steps.len() * K { return Err(StrictInt8Error::Input); }
-    for (step, &position) in steps.iter().zip(positions) {
-        let cache = &sequences[step.sequence].cache;
-        if position >= cache.capacity_positions() { return Err(StrictInt8Error::Context); }
-        if cache.len_for_slot(slot).map_err(|_| StrictInt8Error::Cache)? != position { return Err(StrictInt8Error::Cache); }
-    }
+    check_addresses(steps, positions, slot, sequences)?;
+    if query.len() != steps.len() * Q || key.len() != steps.len() * K
+        || value.len() != steps.len() * K { return Err(StrictInt8Error::Input); }
     let mut output = filled(query.len(), Bf16::from_bits(0))?;
     let mut key_bits = filled(K, 0_u16)?; let mut value_bits = filled(K, 0_u16)?;
     for (index, (step, &position)) in steps.iter().zip(positions).enumerate() {
