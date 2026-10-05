@@ -8,6 +8,8 @@ use crate::{
     validation::grounded_fields::{GroundingBudget, SourceOccurrence, scan_occurrences, FieldGroundingError},
 };
 mod evidence;
+/// Separate opt-in hierarchical quote compression; the single-pass API is unchanged.
+pub mod hierarchy;
 
 pub const INT8_SUMMARY_SYNTHESIS_EXECUTION: &str = "portable-int8-verbatim-evidence-summary-synthesis-v1";
 const SEMANTICS: &str = "summary-from-collected-quotes-not-full-document-equivalence-v1";
