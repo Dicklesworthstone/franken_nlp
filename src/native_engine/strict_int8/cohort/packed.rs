@@ -95,3 +95,4 @@ fn check_runs(runs: &[CohortTokenRun<'_>], sequences: usize, limits: Int8Prefill
 }
 
 #[cfg(test)] mod tests;
+pub mod refill;
