@@ -358,3 +358,5 @@ fn check_model_identity(model: &ArtifactIdentity, identity: &ExecutionIdentity) 
 
 #[cfg(test)] mod tests;
 mod prefill;
+mod cohort;
+pub use cohort::ChatCohortLimits;
