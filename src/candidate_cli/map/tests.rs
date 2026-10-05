@@ -21,12 +21,13 @@ fn all_three_tasks_require_explicit_task_model_and_memory() {
         "--memory-mib", "8192"]).is_err());
 }
 #[test]
-fn generation_schema_and_sampling_cannot_enter_a_source_map() {
+fn unsupported_tasks_missing_schema_and_sampling_are_refused() {
+    assert!(command("ner", &["--schema", "private"]).validate().is_err());
     for task in ["generate", "extract", "classify"] {
         assert!(super::super::definition().try_get_matches_from(["candidate", "map", "--task", task,
             "--model", "m", "--memory-mib", "8192"]).is_err());
     }
-    for flag in ["--seed", "--schema", "--top-k", "--instruction"] {
+    for flag in ["--seed", "--top-k", "--instruction"] {
         assert!(super::super::definition().try_get_matches_from(["candidate", "map", "--task", "ner",
             "--model", "m", "--memory-mib", "8192", flag, "private"]).is_err());
     }

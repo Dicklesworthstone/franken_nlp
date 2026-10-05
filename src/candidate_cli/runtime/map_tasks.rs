@@ -2,6 +2,7 @@
 use super::*;
 mod summary;
 mod question;
+mod extraction;
 use std::sync::Arc;
 use super::source_tasks::{Session, planner, source_identity};
 use crate::{candidate_cli::map::MapCommand,
@@ -54,6 +55,9 @@ pub(in crate::candidate_cli) fn execute(command: MapCommand, args: CandidateArgs
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
     if command.kind()? == crate::tasks::BuiltInTask::Answer {
         return question::execute(command, args, limits, input, output);
+    }
+    if command.kind()? == crate::tasks::BuiltInTask::Extract {
+        return extraction::execute(command, args, limits, input, output);
     }
     let session = Session::new(&args, limits)?;
     let text = session.read(&command.input, input, args.max_input_bytes)?;

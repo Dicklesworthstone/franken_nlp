@@ -3,6 +3,7 @@
 use super::*;
 pub(super) mod summary;
 pub(super) mod question;
+pub(super) mod extraction;
 use serde::de::DeserializeOwned;
 use crate::{native_engine::{portable_int8::ProjectionWork, strict_int8::Int8Work},
     tasks::{BuiltInTask, mapreduce::{ChunkLimits, ExecutionLimits},
@@ -18,7 +19,7 @@ pub(crate) struct MapCommand {
     /// One exact UTF-8 document, not NDJSON; '-' reads stdin.
     #[arg(default_value = "-")]
     pub(super) input: PathBuf,
-    #[arg(long, value_parser = ["ner", "keyphrases", "summarize", "answer"])]
+    #[arg(long, value_parser = ["ner", "keyphrases", "summarize", "answer", "extract"])]
     pub(super) task: String,
     /// Shared context/model resources. Output-token and result limits apply
     /// to each chunk; input bytes apply to the complete original document.
@@ -28,6 +29,8 @@ pub(crate) struct MapCommand {
     pub(super) summary: summary::SummaryArgs,
     #[command(flatten)]
     pub(super) question: question::QuestionArgs,
+    #[command(flatten)]
+    pub(super) extraction: extraction::ExtractionArgs,
     /// Complete typed options for the selected task; never prompt instructions.
     #[arg(long, value_name = "FILE")]
     pub(super) options: Option<PathBuf>,
@@ -68,17 +71,20 @@ pub(crate) struct MapCommand {
 pub(super) fn definition() -> clap::Command {
     MapCommand::augment_args(clap::Command::new("map")
         .about("Process a long document with source-aligned, independent native chunk results")
-        .long_about("Losslessly partition one UTF-8 document using the actual pinned task scaffold and source encoder, then run NER, keyphrases or cited summaries on one resident candidate model. By default output retains ordered independent chunk results and original-document coordinates; it is not a global synthesized summary, global entity census or global ranking. Add --reduce-summary with --task summarize for exact bullet/evidence union and a final document-wide ranking of existing bullets, without a neural synthesis pass. Use --task answer --question FILE for independent passage-scoped QA with original-source citations; all differing answer texts remain visible without majority voting or a global answer. No mode establishes overlapping-window analysis or single-context equivalence. No partial success is published."))
+        .long_about("Losslessly partition one UTF-8 document using the actual pinned task scaffold and source encoder, then run NER, keyphrases or cited summaries on one resident candidate model. By default output retains ordered independent chunk results and original-document coordinates; it is not a global synthesized summary, global entity census or global ranking. Add --reduce-summary with --task summarize for exact bullet/evidence union and a final document-wide ranking of existing bullets, without a neural synthesis pass. Use --task answer --question FILE for independent passage-scoped QA with original-source citations; all differing answer texts remain visible without majority voting or a global answer. Use --task extract --schema FILE for independent exact-schema JSON strings; --source-membership adds verbatim source evidence in original coordinates. Required fields must be satisfiable in each chunk; independent objects are never merged or repaired. No mode establishes overlapping-window analysis or single-context equivalence. No partial success is published."))
 }
 
 impl MapCommand {
     pub(super) fn kind(&self) -> Result<BuiltInTask, CandidateError> {
         match self.task.as_str() { "ner" => Ok(BuiltInTask::Ner), "keyphrases" => Ok(BuiltInTask::Keyphrases),
-            "summarize" => Ok(BuiltInTask::Summarize), "answer" => Ok(BuiltInTask::Answer), _ => Err(CandidateError::Arguments) }
+            "summarize" => Ok(BuiltInTask::Summarize), "answer" => Ok(BuiltInTask::Answer),
+            "extract" => Ok(BuiltInTask::Extract), _ => Err(CandidateError::Arguments) }
     }
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), CandidateError> {
         self.kind()?;
         self.question.validate(&self.task)?;
+        self.extraction.validate(&self.task)?;
+        if self.task == "extract" && self.options.is_some() { return Err(CandidateError::Arguments); }
         self.summary.validate(&self.task, self.max_map_result_bytes)?;
         let (args, limits) = self.host.common(self.input.clone())?;
         if self.host.max_input_bytes < 4 || !(1..=MAX_CHUNKS).contains(&self.max_chunks)
@@ -105,6 +111,7 @@ impl MapCommand {
         // tokenizer and a byte count masquerading as a whole-document charge.
         let per_chunk = (self.host.context_tokens as u64).checked_mul(32)
             .and_then(|n| n.checked_add(u64::from(self.host.max_grammar_states).checked_mul(512)?))
+            .and_then(|n| n.checked_add(self.extraction.schema_reserve_per_chunk()))
             .ok_or(CandidateError::Arguments)?;
         let floor = per_chunk.checked_mul(self.max_chunks as u64)
             .and_then(|n| n.checked_add(256 * MIB))
