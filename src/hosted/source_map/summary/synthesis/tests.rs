@@ -68,3 +68,26 @@ fn evidence_limits_cannot_exceed_source_preparation_or_be_zero() {
         assert!(validate_synthesis(&c, 10, 1024).is_err(), "{axis}");
     }
 }
+#[test]
+fn hierarchy_prices_every_retained_native_pass_not_only_the_final_summary() {
+    use crate::tasks::source_planning::quantized::long::summary::synthesis::hierarchy::SummaryHierarchyLimits;
+    let c = config();
+    let h = SummaryHierarchyLimits { max_passes: 4, max_levels: 3, ..SummaryHierarchyLimits::default() };
+    let per_pass = c.budget.max_output_bytes * 4 + u64::from(c.budget.max_output_tokens) * 8;
+    assert_eq!(hierarchy::hierarchy_bytes(&c, 3, h).unwrap(),
+        synthesis_bytes(&c, 3).unwrap() + 3 * per_pass + 4 * 256 + 3 * 128);
+    let more = SummaryHierarchyLimits { max_passes: 5, ..h };
+    assert_eq!(hierarchy::hierarchy_bytes(&c, 3, more).unwrap() - hierarchy::hierarchy_bytes(&c, 3, h).unwrap(), per_pass + 256);
+    // More levels do not replenish the verification/evidence ledgers.
+    let deep = SummaryHierarchyLimits { max_levels: 4, ..h };
+    assert_eq!(hierarchy::hierarchy_bytes(&c, 3, deep).unwrap() - hierarchy::hierarchy_bytes(&c, 3, h).unwrap(), 128);
+}
+#[test]
+fn hierarchical_memory_arithmetic_and_invalid_caps_fail_closed() {
+    use crate::tasks::source_planning::quantized::long::summary::synthesis::hierarchy::SummaryHierarchyLimits;
+    let h = SummaryHierarchyLimits::default();
+    assert!(hierarchy::hierarchy_bytes(&config(), 0, h).is_err());
+    assert!(hierarchy::hierarchy_bytes(&config(), 3, SummaryHierarchyLimits { max_passes: 0, ..h }).is_err());
+    let mut c = config(); c.budget.max_output_bytes = u64::MAX / 8;
+    assert!(hierarchy::hierarchy_bytes(&c, 3, h).is_err());
+}

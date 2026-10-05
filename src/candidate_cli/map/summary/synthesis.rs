@@ -1,17 +1,21 @@
 //! Explicit neural synthesis; never an implicit replacement for exact ranking.
 use super::*;
+pub(in crate::candidate_cli) mod hierarchy;
 use crate::{tasks::{summarize::SummaryOptions, source_planning::SourcePlanningLimits,
     source_planning::quantized::long::summary::synthesis::{SourceSummarySynthesis, SummarySynthesisLimits}},
     validation::grounded_fields::GroundingBudget};
 
 #[derive(Args)]
 pub(in crate::candidate_cli) struct SynthesisArgs {
-    /// Run an additional neural summary over verified source quotes from ALL
-    /// chunk summaries. No generated map bullet is used as a source fact.
-    /// All evidence must fit: overflow fails rather than selecting a subset.
+    /// Run neural summary synthesis over verified source quotes from ALL chunk
+    /// summaries. No generated map bullet is used as a source fact. By default
+    /// all evidence must fit one context; --hierarchical-summary opts into loss.
     #[arg(long, conflicts_with = "reduce_summary")]
     pub synthesize_summary: bool,
-    /// Final neural bullet cap; omitted uses the per-chunk SummaryOptions cap.
+    #[command(flatten)]
+    pub(in crate::candidate_cli) hierarchy: hierarchy::HierarchyArgs,
+    /// Neural bullet cap for the final and any explicitly enabled reduce passes.
+    /// Omitted uses the per-chunk SummaryOptions cap.
     #[arg(long, requires = "synthesize_summary")]
     synthesis_bullets: Option<usize>,
     /// Distinct (chunk, quote) segments, default 256; duplicates are reverified.
@@ -21,7 +25,7 @@ pub(in crate::candidate_cli) struct SynthesisArgs {
     /// Actual prompt/token/context fit is checked independently before synthesis.
     #[arg(long, requires = "synthesize_summary")]
     max_synthesis_evidence_bytes: Option<usize>,
-    /// Independent collection + final-lift field checks, default 4096.
+    /// Independent collection + citation-lift field checks, default 4096.
     #[arg(long, requires = "synthesize_summary")]
     max_synthesis_fields: Option<usize>,
     /// Aggregate scan matches AND original-coordinate fanout, default 16384.
@@ -33,6 +37,7 @@ pub(in crate::candidate_cli) struct SynthesisArgs {
 }
 impl SynthesisArgs {
     pub(in crate::candidate_cli) fn validate(&self, task: &str, reduce: bool) -> Result<(), CandidateError> {
+        self.hierarchy.limits(self.synthesize_summary)?;
         let supplied = self.synthesis_bullets.is_some() || self.max_synthesis_evidence_segments.is_some()
             || self.max_synthesis_evidence_bytes.is_some() || self.max_synthesis_fields.is_some()
             || self.max_synthesis_matches.is_some() || self.max_synthesis_scan_steps.is_some();
@@ -46,6 +51,7 @@ impl SynthesisArgs {
     }
     pub(in crate::candidate_cli) fn check_planning(&self, planning: SourcePlanningLimits) -> Result<(), CandidateError> {
         if !self.synthesize_summary { return Err(CandidateError::Arguments); }
+        self.hierarchy.limits(self.synthesize_summary)?;
         self.limits(planning).map(|_| ())
     }
     fn limits(&self, planning: SourcePlanningLimits) -> Result<SummarySynthesisLimits, CandidateError> {

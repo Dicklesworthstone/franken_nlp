@@ -24,7 +24,7 @@ pub struct SummaryHierarchyLimits {
 }
 impl Default for SummaryHierarchyLimits {
     fn default() -> Self {
-        Self { max_levels: 8, max_passes: 32, max_tokenizer_calls: 8192, max_tokenizer_bytes: 64 * 1024 * 1024 }
+        Self { max_levels: 8, max_passes: 16, max_tokenizer_calls: 8192, max_tokenizer_bytes: 64 * 1024 * 1024 }
     }
 }
 impl SummaryHierarchyLimits {

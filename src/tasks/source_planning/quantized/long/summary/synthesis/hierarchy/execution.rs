@@ -26,6 +26,10 @@ impl Driver for Native<'_, '_> {
         let context = PlanContext::new(self.identity, self.budget).map_err(|_| Int8SourceMapError::Admission)?;
         let request = SourceTaskRequest::Summarize { document: copy(text)?, options: self.options, budget: self.budget };
         let plan = self.planner.plan_int8_with_control(&request, &context, self.planning, control)?;
+        // Recheck the actual dynamic plan against its reserved five-axis slot
+        // BEFORE inference, in addition to its exact prompt/context compilation.
+        let (_, ceiling) = reserve(self.budget, self.planning, self.mapping)?;
+        if !within(plan.planned_work(), ceiling) { return Err(Int8SourceMapError::WorkLimit); }
         preflight_plans(std::slice::from_ref(&plan), std::slice::from_ref(plan.execution_identity()), self.engine)?;
         let mut native = NativeDriver { engine: self.engine, vocabulary: self.vocabulary, control, limits: self.mapping };
         let run = native.run(&plan, plan.execution_identity())?;
@@ -104,14 +108,16 @@ pub(super) fn reduce<C: DecodeStepControl, D: Driver>(source: &str, mut frontier
             let bullets = evidence::lift_summary(source, raw, &window, request.synthesis_options, remaining, control)?;
             let masks = mask_charge(&native.result)?;
             if masks > expected.discovery.synthesis_masks { return Err(Int8SourceMapError::WorkLimit); }
+            let pass = SummaryHierarchyPass { level, group: group_index, input_segments: group.segments,
+                input_bytes: group.bytes, input_tokens: group.tokens, planned_model_work: planned, native, bullets };
+            receipt::verify_pass(&expected, &pass)?;
             out.planned = add_work(out.planned, planned).ok_or(Int8SourceMapError::WorkLimit)?;
-            out.actual = add_work(out.actual, native.model_work).ok_or(Int8SourceMapError::WorkLimit)?;
+            out.actual = add_work(out.actual, pass.native.model_work).ok_or(Int8SourceMapError::WorkLimit)?;
             out.masks = out.masks.checked_add(masks).ok_or(Int8SourceMapError::WorkLimit)?;
             // The only inter-level transport is the complete set of lifted
             // citations selected by this group. Never include bullet prose.
-            if !terminal { next.append_verified(source, &bullets, request.synthesis_options, request.limits, remaining, control)?; }
-            out.passes.push(SummaryHierarchyPass { level, group: group_index, input_segments: group.segments,
-                input_bytes: group.bytes, input_tokens: group.tokens, planned_model_work: planned, native, bullets });
+            if !terminal { next.append_verified(source, &pass.bullets, request.synthesis_options, request.limits, remaining, control)?; }
+            out.passes.push(pass);
             extract_int8::check_size(&out.passes, max_result_bytes).map_err(Int8SourceError::from)?;
             checkpoint(control)?;
         }

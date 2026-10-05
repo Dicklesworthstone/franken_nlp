@@ -81,3 +81,11 @@ original contains no useful information. Citation existence establishes structur
 source membership, not semantic entailment; output remains `non_authoritative`
 with semantic support unassessed. Full-document recall and single-context
  equivalence are not established.
+
+## Explicit multi-context alternative
+
+Adding `--hierarchical-summary` opts into a separate bounded, lossy multi-level
+quote-selection policy. It does not change this single-pass contract or silently
+retry failures. See [candidate-summary-hierarchy.md](candidate-summary-hierarchy.md)
+for its pass/depth reservations, exact-token grouping, retained lineage and
+original-document citation guarantees.
