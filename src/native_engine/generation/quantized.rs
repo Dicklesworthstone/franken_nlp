@@ -196,3 +196,4 @@ impl<C: DecodeStepControl> Driver for Int8Session<'_, '_, C> {
 
 #[cfg(test)] mod tests;
 mod prefill;
+pub mod cohort;
