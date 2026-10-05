@@ -1,6 +1,6 @@
 //! Owned resource admission and physical drain for cross-document INT8 chat.
 use super::*;
-use crate::{native_engine::{portable_int8::batch::MAX_BATCH_ROWS, strict_int8::Int8Work,
+use crate::{native_engine::{portable_int8::batch::MAX_BATCH_ROWS, strict_int8::{Int8Work, prefill::Int8PrefillLimits},
     generation::quantized::cohort::Int8CohortBudget},
     tasks::chat::quantized::cohort::{self as task, Int8ChatCohortRequest, Int8ChatCohortBudget, Int8ChatCohortResult}};
 
@@ -32,9 +32,26 @@ impl NlpEngine {
     pub fn execute_int8_chat_cohort(&self, model: &ResidentInt8, prepared: Vec<PreparedInt8Chat>,
         first_request_seq: u64, limits: ChatCohortLimits, cancellation: CancellationToken)
         -> Result<HostedOutput<Int8ChatCohortResult>, HostedError> {
+        self.run_int8_chat_cohort(model, prepared, first_request_seq, limits, None, cancellation)
+    }
+
+    /// Combine cross-document batching with fair layer-major prompt morsels.
+    /// max_batch_rows is the TOTAL number of prompt/decode token rows per pack,
+    /// not a multiplier per document. Additional scratch is separately priced
+    /// and retained through physical drain. Ordinary cohort defaults are intact.
+    pub fn execute_int8_chat_cohort_packed(&self, model: &ResidentInt8, prepared: Vec<PreparedInt8Chat>,
+        first_request_seq: u64, limits: ChatCohortLimits, prefill: Int8PrefillLimits,
+        cancellation: CancellationToken) -> Result<HostedOutput<Int8ChatCohortResult>, HostedError> {
+        self.run_int8_chat_cohort(model, prepared, first_request_seq, limits, Some(prefill), cancellation)
+    }
+
+    fn run_int8_chat_cohort(&self, model: &ResidentInt8, prepared: Vec<PreparedInt8Chat>,
+        first_request_seq: u64, limits: ChatCohortLimits, prefill: Option<Int8PrefillLimits>,
+        cancellation: CancellationToken) -> Result<HostedOutput<Int8ChatCohortResult>, HostedError> {
         dispatch::preflight(self, limits.native.run)?;
         self.check_resident_domain(model)?;
         validate_limits(limits, prepared.len(), first_request_seq)?;
+        let extra_scratch = packed_scratch(prefill)?;
         for plan in &prepared { check_model_identity(model.artifact_identity(), plan.execution_identity())?; }
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, limits.preparation_reserve_bytes)?,
@@ -42,8 +59,7 @@ impl NlpEngine {
         let required = Int8MemoryRequirement::for_cohort(&input.value.contexts).map_err(HostedError::Native)?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
         let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-            sum(&[required.rope_bytes, required.scratch_payload_bound, input.value.sampler_bytes,
-                limits.native.allocator_reserve_bytes])?)?;
+            workspace_bytes(required, input.value.sampler_bytes, limits.native.allocator_reserve_bytes, extra_scratch)?)?;
         let output = output_claim(&lease, limits.max_result_bytes, input.value.output_tokens)?;
         let model = model.clone();
         dispatch::run(self, limits.native.run, cancellation, move |control| {
@@ -64,12 +80,22 @@ impl NlpEngine {
             let budget = Int8ChatCohortBudget { generation: Int8CohortBudget {
                 native: Int8RunBudget::exact(input.value.work), max_kv_bytes: required.kv_bytes,
                 max_sampler_bytes: input.value.sampler_bytes }, max_result_bytes: limits.max_result_bytes };
-            let result = task::execute(&mut engine.value, &requests, budget, control).map_err(HostedError::Chat)?;
+            let result = match prefill {
+                Some(prefill) => task::packed::execute(&mut engine.value, &requests, budget, prefill, control),
+                None => task::execute(&mut engine.value, &requests, budget, control),
+            }.map_err(HostedError::Chat)?;
             drop(requests); drop(engine); drop(input);
             let committed = output.commit()?; drop(lease);
             Ok(GuardedOutput::new(result, committed))
         })
     }
+}
+fn packed_scratch(prefill: Option<Int8PrefillLimits>) -> Result<u64, HostedError> {
+    match prefill { Some(limits) => limits.validate().map_err(HostedError::Native), None => Ok(0) }
+}
+fn workspace_bytes(required: Int8MemoryRequirement, sampler: u64, allocator: u64, extra: u64)
+    -> Result<u64, HostedError> {
+    sum(&[required.rope_bytes, required.scratch_payload_bound, sampler, allocator, extra])
 }
 fn validate_limits(limits: ChatCohortLimits, count: usize, first: u64) -> Result<(), HostedError> {
     limits.native.run.validate()?;

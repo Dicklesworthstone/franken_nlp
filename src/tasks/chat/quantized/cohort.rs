@@ -91,3 +91,4 @@ impl DecodeEventSink for Discard {
     fn permit(&mut self, _: (), _: crate::native_engine::decode::DecodeTokenEvent) -> Result<(), Self::Error> { Ok(()) }
 }
 #[cfg(test)] mod tests;
+pub mod packed;
