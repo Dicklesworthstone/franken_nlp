@@ -76,7 +76,7 @@ fn retired_work_remains_in_the_epoch_ledger_after_slot_reuse() {
     let first = Int8Work::for_sequence(0, 2, V).unwrap();
     let next = Int8Work::for_sequence(0, 1, V).unwrap();
     let maximum = epoch_budget(&[budget(5), budget(3)]).unwrap();
-    let mut ledger = ProjectionLedger::new(maximum.max_projection_work);
+    let ledger = ProjectionLedger::new(maximum.max_projection_work);
     // Check the exact cumulative arithmetic without a synthetic native receipt.
     let total = first.checked_add(next).unwrap();
     assert!(total.projections.fits(maximum.max_projection_work));

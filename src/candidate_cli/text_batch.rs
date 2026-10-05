@@ -18,9 +18,13 @@ pub(crate) struct TextBatchCommand {
     #[command(flatten)]
     pub(super) common: CandidateArgs,
     /// Explicit cross-document INT8 groups, 1..=64. Omitted keeps serial records.
-    /// One checkpoint budget per cohort; prefill-rows bounds total packed tokens.
+    /// With active-rows this is the bounded preplanned request-window size.
     #[arg(long, value_name = "ROWS")]
     pub(super) cohort_rows: Option<usize>,
+    /// Opt into FIFO slot refill with at most this many live KV/sampler slots.
+    /// Requires cohort-rows; accepts 1..=cohort-rows. All queued output is retained.
+    #[arg(long, value_name = "ROWS")]
+    pub(super) active_rows: Option<usize>,
     /// Whole-corpus record ceiling. IDs are retained only for duplicate refusal.
     #[arg(long, default_value_t = 1000)]
     pub(super) max_records: u64,
@@ -41,7 +45,7 @@ pub(crate) struct TextBatchCommand {
 pub(super) fn definition() -> clap::Command {
     TextBatchCommand::augment_args(clap::Command::new("text-batch")
         .about("Generate or chat over bounded NDJSON with one resident local INT8 model")
-        .long_about("Explicit non-certified local candidate only. Each generate record is {\"id\":\"unique\",\"prompt\":\"...\"}; chat uses a messages array instead. Optional sample_index is a u64. IDs, not physical row positions, address seeded draws. Generation options apply to every record. max-input-bytes includes each record's JSON framing; max-checkpoints is per native invocation (one record by default, one whole cohort with --cohort-rows); timeout-seconds covers the entire invocation. One model is loaded lazily and reused, with fresh request state. --cohort-rows explicitly groups 1..=64 documents with independent KV and shared-weight computation. Combining --prefill-rows bounds the TOTAL prompt/decode token rows per native pack, not tokens per document; finite round-robin morsels let short documents decode alongside long prompts. Preparation, simultaneous sampler/KV, extra packed scratch and all retained outputs must fit the memory ledger. Output is ordered completed-result NDJSON, never provisional tokens. The batch_complete frame plus successful process exit is required for whole-corpus success. Invalid input, duplicate IDs, budgets, native failure or a broken output stream stop the corpus without retries; earlier completed records remain valid. A cohort must fully execute and validate before its first result is published. Empty input completes without opening the model. Blocking IO is cooperative, not preemptible. No network or tool execution."))
+        .long_about("Explicit non-certified local candidate only. Each generate record is {\"id\":\"unique\",\"prompt\":\"...\"}; chat uses a messages array instead. Optional sample_index is a u64. IDs, not physical row positions, address seeded draws. Generation options apply to every record. max-input-bytes includes each record's JSON framing; max-checkpoints is per native invocation (one record by default, one whole cohort/window with --cohort-rows); timeout-seconds covers the entire invocation. One model is loaded lazily and reused. --cohort-rows groups 1..=64 documents. With --active-rows N, that group becomes a bounded preplanned FIFO window with N live KV/sampler slots: a finished slot refills while other requests continue. N must be 1..=cohort-rows. Refilling slots each reserve the longest queued context. --prefill-rows bounds TOTAL prompt/decode token rows per pack, not tokens per document; when refilling, omission uses the actual live-slot ceiling as the token width. Preparation and all retained outputs still scale with the entire queued window, not active-rows; extra packed scratch is separately admitted. Without active-rows the existing fixed-cohort modes are unchanged. Output is ordered completed-result NDJSON, never provisional tokens. Every request in the current window must finish and validate before its first result is published. The batch_complete frame plus successful process exit is required for whole-corpus success. Invalid input, duplicate IDs, budgets, native failure or a broken output stream stop the corpus without retries; earlier completed windows remain valid. No slot refill renews work or checkpoint budgets. Empty input completes without opening the model. Input is read in bounded windows, not during native execution. Blocking IO is cooperative, not preemptible. No network or tool execution."))
 }
 
 impl TextBatchCommand {
@@ -53,6 +57,7 @@ impl TextBatchCommand {
                 return Err(CandidateError::Arguments);
             }
         }
+        self.refill_strategy(self.cohort_rows.unwrap_or(1))?;
         if self.max_records == 0 || self.max_records > 1_000_000
             || self.max_total_input_bytes == 0 || self.max_total_input_bytes > 16 * 1024 * MIB
             || self.max_total_output_bytes < FOOTER_BYTES as u64
@@ -284,3 +289,4 @@ mod tests {
     }
 }
 #[cfg(test)] mod cohort_tests;
+mod refill;

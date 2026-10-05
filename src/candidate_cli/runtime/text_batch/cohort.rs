@@ -7,6 +7,7 @@ use crate::{hosted::ChatCohortLimits, native_engine::portable_int8::batch::MAX_B
 pub(super) fn run(session: &Session, command: &TextBatchCommand, limits: Limits,
     input: &mut impl BufRead, output: &mut impl Write, width: usize) -> Result<(), CandidateError> {
     if width == 0 || width > MAX_BATCH_ROWS { return Err(CandidateError::Arguments); }
+    command.refill_strategy(width)?;
     let prefill = command.common.policy.prefill()?;
     let args = &command.common;
     let mut input_bytes = 0;
@@ -26,21 +27,27 @@ pub(super) fn run(session: &Session, command: &TextBatchCommand, limits: Limits,
         let batch = collect(first, input, &planner, command, &mut ledger, &mut input_bytes,
             width, &mut || session.remaining().map(|_| ()))?;
         let count = batch.ids.len();
-        // Admit the WHOLE cohort, not M independent checks against unchanged
-        // remaining bytes. The footer allowance is retained exactly once.
+        let refill = command.refill_strategy(count)?;
+        let active_count = refill.as_ref().map_or(count, |(active, _)| *active);
+        // Admit the WHOLE queued window, never just the smaller live-slot set.
+        // The footer allowance is retained exactly once across all results.
         transport.admit_frame(delivery_bytes(count, frame_cap)?)?;
-        let max_sampler_bytes = SAMPLER_BYTES.checked_mul(count as u64).ok_or(CandidateError::Memory)?;
+        let max_sampler_bytes = SAMPLER_BYTES.checked_mul(active_count as u64).ok_or(CandidateError::Memory)?;
         let max_result_bytes = (limits.result_bytes as u64).checked_mul(count as u64)
             .and_then(|bytes| bytes.checked_add(4096)).ok_or(CandidateError::Memory)?;
         if model.is_none() { model = Some(session.load(args, limits, &facts, cancellation.clone())?); }
         let resident = model.as_ref().ok_or(CandidateError::Model)?;
         let cohort_limits = ChatCohortLimits { native: session.native(args)?, max_sampler_bytes,
             preparation_reserve_bytes: limits.preparation_bytes, max_result_bytes };
-        let result = match prefill {
-            Some(prefill) => session.engine.execute_int8_chat_cohort_packed(resident, batch.prepared,
-                batch.first_request_seq, cohort_limits, prefill, cancellation.clone()),
-            None => session.engine.execute_int8_chat_cohort(resident, batch.prepared,
-                batch.first_request_seq, cohort_limits, cancellation.clone()),
+        let result = match refill {
+            Some((active, prefill)) => session.engine.execute_int8_chat_refilling(resident, batch.prepared,
+                batch.first_request_seq, cohort_limits, active, prefill, cancellation.clone()),
+            None => match prefill {
+                Some(prefill) => session.engine.execute_int8_chat_cohort_packed(resident, batch.prepared,
+                    batch.first_request_seq, cohort_limits, prefill, cancellation.clone()),
+                None => session.engine.execute_int8_chat_cohort(resident, batch.prepared,
+                    batch.first_request_seq, cohort_limits, cancellation.clone()),
+            },
         }.map_err(|_| CandidateError::Execution)?;
         session.remaining()?;
         let completed = &result.result().results;
@@ -116,3 +123,4 @@ fn delivery_bytes(count: usize, frame_cap: usize) -> Result<usize, CandidateErro
     count.checked_mul(frame_cap).ok_or(CandidateError::Output)
 }
 #[cfg(test)] mod tests;
+#[cfg(test)] mod refill_tests;
