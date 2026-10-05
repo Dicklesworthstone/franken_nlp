@@ -146,3 +146,4 @@ impl PreparedInt8Chat {
 }
 
 #[cfg(test)] pub(crate) mod tests;
+mod prefill;
