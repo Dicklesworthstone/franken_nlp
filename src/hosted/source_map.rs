@@ -2,6 +2,7 @@
 use super::*;
 mod summary;
 mod question;
+mod keyphrase_reduction;
 use crate::{
     native_engine::{constrained_int8, lmhead::NANBEIGE_VOCAB_SIZE},
     tasks::{ir::{PlanContext, TaskBudget}, source_planning::{SourcePlanningLimits, SourceTaskPlanner,

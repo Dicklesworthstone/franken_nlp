@@ -4,6 +4,7 @@ use super::*;
 pub(super) mod summary;
 pub(super) mod question;
 pub(super) mod extraction;
+pub(super) mod keyphrase_reduction;
 use serde::de::DeserializeOwned;
 use crate::{native_engine::{portable_int8::ProjectionWork, strict_int8::Int8Work},
     tasks::{BuiltInTask, mapreduce::{ChunkLimits, ExecutionLimits},
@@ -27,6 +28,8 @@ pub(crate) struct MapCommand {
     pub(super) host: source::SourceHostArgs,
     #[command(flatten)]
     pub(super) summary: summary::SummaryArgs,
+    #[command(flatten)]
+    pub(super) keyphrases: keyphrase_reduction::KeyphraseReductionArgs,
     #[command(flatten)]
     pub(super) question: question::QuestionArgs,
     #[command(flatten)]
@@ -71,7 +74,7 @@ pub(crate) struct MapCommand {
 pub(super) fn definition() -> clap::Command {
     MapCommand::augment_args(clap::Command::new("map")
         .about("Process a long document with source-aligned, independent native chunk results")
-        .long_about("Losslessly partition one UTF-8 document using the actual pinned task scaffold and source encoder, then run NER, keyphrases or cited summaries on one resident candidate model. By default output retains ordered independent chunk results and original-document coordinates; it is not a global synthesized summary, global entity census or global ranking. Add --reduce-summary with --task summarize for exact bullet/evidence union and a final document-wide ranking of existing bullets, without a neural synthesis pass. Use --task answer --question FILE for independent passage-scoped QA with original-source citations; all differing answer texts remain visible without majority voting or a global answer. Use --task extract --schema FILE for independent exact-schema JSON strings; --source-membership adds verbatim source evidence in original coordinates. Required fields must be satisfiable in each chunk; independent objects are never merged or repaired. No mode establishes overlapping-window analysis or single-context equivalence. No partial success is published."))
+        .long_about("Losslessly partition one UTF-8 document using the actual pinned task scaffold and source encoder, then run NER, keyphrases or cited summaries on one resident candidate model. By default output retains ordered independent chunk results and original-document coordinates; it is not a global synthesized summary, global entity census or global ranking. Add --reduce-summary with --task summarize for exact bullet/evidence union and a final document-wide ranking of existing bullets, without a neural synthesis pass. Add --reduce-keyphrases with --task keyphrases for exact phrase/evidence union and one document-wide support/rank ordering; --document-keyphrases controls final top-k, never intermediate pruning. Use --task answer --question FILE for independent passage-scoped QA with original-source citations; all differing answer texts remain visible without majority voting or a global answer. Use --task extract --schema FILE for independent exact-schema JSON strings; --source-membership adds verbatim source evidence in original coordinates. Required fields must be satisfiable in each chunk; independent objects are never merged or repaired. No mode establishes overlapping-window analysis or single-context equivalence. No partial success is published."))
 }
 
 impl MapCommand {
@@ -86,6 +89,7 @@ impl MapCommand {
         self.extraction.validate(&self.task)?;
         if self.task == "extract" && self.options.is_some() { return Err(CandidateError::Arguments); }
         self.summary.validate(&self.task, self.max_map_result_bytes)?;
+        self.keyphrases.validate(&self.task, self.max_map_result_bytes)?;
         let (args, limits) = self.host.common(self.input.clone())?;
         if self.host.max_input_bytes < 4 || !(1..=MAX_CHUNKS).contains(&self.max_chunks)
             || !(1..=1_000_000).contains(&self.max_tokenizer_calls)

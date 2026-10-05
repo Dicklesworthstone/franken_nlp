@@ -4,6 +4,7 @@ mod summary;
 mod question;
 mod extraction;
 mod synthesis;
+mod keyphrase_reduction;
 use std::sync::Arc;
 use super::source_tasks::{Session, planner, source_identity};
 use crate::{candidate_cli::map::MapCommand,
@@ -80,6 +81,8 @@ pub(in crate::candidate_cli) fn execute(command: MapCommand, args: CandidateArgs
     let mapping = command.mapping(capacity)?;
     let summary = command.summary.limits(command.max_map_result_bytes)?;
     if let Some(limits) = summary { limits.validate(mapping).map_err(|_| CandidateError::Planning)?; }
+    let keyphrases = command.keyphrases.limits(command.max_map_result_bytes)?;
+    if let Some(limits) = keyphrases { limits.validate(mapping).map_err(|_| CandidateError::Planning)?; }
     let expected = preflight(&text, &planner, &command, capacity, mapping, budget, &mut session.control())?;
     session.remaining()?;
     // No weights until the complete partition and all five work axes fit.
@@ -92,6 +95,12 @@ pub(in crate::candidate_cli) fn execute(command: MapCommand, args: CandidateArgs
         let result = session.engine.summarize_int8_source(&model, text, Arc::new(planner), Arc::new(vocabulary),
             config, limits, cancellation).map_err(|_| CandidateError::Execution)?;
         summary::check_completed(&expected, result.result(), limits.max_bullets)?;
+        return deliver(&session, &facts, &result, command.max_map_result_bytes + 4096, output);
+    }
+    if let Some(limits) = keyphrases {
+        let result = session.engine.keyphrases_int8_source(&model, text, Arc::new(planner), Arc::new(vocabulary),
+            config, limits, cancellation).map_err(|_| CandidateError::Execution)?;
+        keyphrase_reduction::check_completed(&expected, result.result(), limits)?;
         return deliver(&session, &facts, &result, command.max_map_result_bytes + 4096, output);
     }
     let result = session.engine.map_int8_source(&model, text, Arc::new(planner), Arc::new(vocabulary),
