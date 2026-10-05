@@ -18,7 +18,7 @@ pub(crate) struct TextBatchCommand {
     #[command(flatten)]
     pub(super) common: CandidateArgs,
     /// Explicit cross-document INT8 groups, 1..=64. Omitted keeps serial records.
-    /// A cohort shares one checkpoint budget; cannot combine with prefill-rows.
+    /// One checkpoint budget per cohort; prefill-rows bounds total packed tokens.
     #[arg(long, value_name = "ROWS")]
     pub(super) cohort_rows: Option<usize>,
     /// Whole-corpus record ceiling. IDs are retained only for duplicate refusal.
@@ -41,15 +41,15 @@ pub(crate) struct TextBatchCommand {
 pub(super) fn definition() -> clap::Command {
     TextBatchCommand::augment_args(clap::Command::new("text-batch")
         .about("Generate or chat over bounded NDJSON with one resident local INT8 model")
-        .long_about("Explicit non-certified local candidate only. Each generate record is {\"id\":\"unique\",\"prompt\":\"...\"}; chat uses a messages array instead. Optional sample_index is a u64. IDs, not physical row positions, address seeded draws. Generation options apply to every record. max-input-bytes includes each record's JSON framing; max-checkpoints is per native invocation (one record by default, one whole cohort with --cohort-rows); timeout-seconds covers the entire invocation. One model is loaded lazily and reused, with fresh request state. --cohort-rows explicitly groups 1..=64 documents with independent KV and shared-weight computation; it cannot combine with --prefill-rows. Preparation, simultaneous sampler/KV and all retained outputs must fit the memory ledger. Output is ordered completed-result NDJSON, never provisional tokens. The batch_complete frame plus successful process exit is required for whole-corpus success. Invalid input, duplicate IDs, budgets, native failure or a broken output stream stop the corpus without retries; earlier completed records remain valid. A cohort must fully execute and validate before its first result is published. Empty input completes without opening the model. Blocking IO is cooperative, not preemptible. No network or tool execution."))
+        .long_about("Explicit non-certified local candidate only. Each generate record is {\"id\":\"unique\",\"prompt\":\"...\"}; chat uses a messages array instead. Optional sample_index is a u64. IDs, not physical row positions, address seeded draws. Generation options apply to every record. max-input-bytes includes each record's JSON framing; max-checkpoints is per native invocation (one record by default, one whole cohort with --cohort-rows); timeout-seconds covers the entire invocation. One model is loaded lazily and reused, with fresh request state. --cohort-rows explicitly groups 1..=64 documents with independent KV and shared-weight computation. Combining --prefill-rows bounds the TOTAL prompt/decode token rows per native pack, not tokens per document; finite round-robin morsels let short documents decode alongside long prompts. Preparation, simultaneous sampler/KV, extra packed scratch and all retained outputs must fit the memory ledger. Output is ordered completed-result NDJSON, never provisional tokens. The batch_complete frame plus successful process exit is required for whole-corpus success. Invalid input, duplicate IDs, budgets, native failure or a broken output stream stop the corpus without retries; earlier completed records remain valid. A cohort must fully execute and validate before its first result is published. Empty input completes without opening the model. Blocking IO is cooperative, not preemptible. No network or tool execution."))
 }
 
 impl TextBatchCommand {
     pub(super) fn validate(&self) -> Result<Limits, CandidateError> {
         let limits = self.common.validate()?;
+        let _ = self.common.policy.prefill()?;
         if let Some(rows) = self.cohort_rows {
-            if rows == 0 || rows > crate::native_engine::portable_int8::batch::MAX_BATCH_ROWS
-                || self.common.policy.prefill()?.is_some() {
+            if rows == 0 || rows > crate::native_engine::portable_int8::batch::MAX_BATCH_ROWS {
                 return Err(CandidateError::Arguments);
             }
         }

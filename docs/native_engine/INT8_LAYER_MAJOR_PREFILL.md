@@ -41,12 +41,20 @@ fnlp candidate stream generate prompt.txt --model local.fnlpq --memory-mib 8192 
 fnlp candidate text-batch prompts.ndjson --task generate --model local.fnlpq --memory-mib 8192 --prefill-rows 8
 ```
 
-Chat uses the same switch with its existing JSON message-array input. Text-batch
-retains one resident model and sequential independent records; the new switch
-batches prompt positions WITHIN each record, not documents. Generation controls,
-seed addressing, corpus budgets, provisional token frames and required completion
-frames are unchanged. The switch is not offered to structured/scored commands
-whose execution paths have not been connected to this strategy.
+Chat uses the same switch with its existing JSON message-array input. Without
+`--cohort-rows`, text-batch retains one resident model and sequential independent
+records; prefill-rows batches prompt positions WITHIN each record, not documents.
+Generation controls, seed addressing, corpus budgets, provisional token frames
+and required completion frames are unchanged. The switch is not offered to
+structured/scored commands whose execution paths have not been connected to it.
+
+Text-batch can also combine `--cohort-rows 4 --prefill-rows 16`. That distinct
+packed-cohort path admits four documents and at most sixteen TOTAL prompt/decode
+token rows per native invocation, not sixteen per document. Short documents can
+decode alongside longer prompt morsels using bounded round-robin allocation.
+See `INT8_COHORTS.md` for the hosted entry, independent scratch admission, physical
+schedule accounting and unchanged ordered transport contract. Neither strategy
+has yet passed full-model or performance qualification.
 
 The CLI derives extra scratch from the selected row ceiling; callers cannot
 supply a smaller charge. The host must admit that memory in addition to the
@@ -98,7 +106,8 @@ Any failure after native work starts poisons the session; RAII clears all 44
 logical KV slots. A failed prompt emits no token. Later token events remain
 provisional until independent task finalization and host drain succeed.
 
-This is single-sequence prompt batching, not cross-document decode batching,
+The single-sequence entry described here is not cross-document decode batching,
 a parallel scheduler, SIMD dispatch, qualified artifact activation or a speed
-claim. Shared-weight integer projections and causal-attention fixtures provide
-code paths for subsequent model-present and hardware qualification.
+claim. The separately selected packed-cohort entry combines prompt and document
+batching without adding a worker team. Shared-weight integer projections and
+causal-attention fixtures provide code paths for subsequent qualification.

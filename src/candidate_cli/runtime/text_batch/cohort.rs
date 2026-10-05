@@ -6,9 +6,8 @@ use crate::{hosted::ChatCohortLimits, native_engine::portable_int8::batch::MAX_B
 
 pub(super) fn run(session: &Session, command: &TextBatchCommand, limits: Limits,
     input: &mut impl BufRead, output: &mut impl Write, width: usize) -> Result<(), CandidateError> {
-    if width == 0 || width > MAX_BATCH_ROWS || command.common.policy.prefill()?.is_some() {
-        return Err(CandidateError::Arguments);
-    }
+    if width == 0 || width > MAX_BATCH_ROWS { return Err(CandidateError::Arguments); }
+    let prefill = command.common.policy.prefill()?;
     let args = &command.common;
     let mut input_bytes = 0;
     let mut transport = Output::new(output, command.max_total_output_bytes);
@@ -35,10 +34,14 @@ pub(super) fn run(session: &Session, command: &TextBatchCommand, limits: Limits,
             .and_then(|bytes| bytes.checked_add(4096)).ok_or(CandidateError::Memory)?;
         if model.is_none() { model = Some(session.load(args, limits, &facts, cancellation.clone())?); }
         let resident = model.as_ref().ok_or(CandidateError::Model)?;
-        let result = session.engine.execute_int8_chat_cohort(resident, batch.prepared,
-            batch.first_request_seq, ChatCohortLimits { native: session.native(args)?,
-                max_sampler_bytes, preparation_reserve_bytes: limits.preparation_bytes, max_result_bytes },
-            cancellation.clone()).map_err(|_| CandidateError::Execution)?;
+        let cohort_limits = ChatCohortLimits { native: session.native(args)?, max_sampler_bytes,
+            preparation_reserve_bytes: limits.preparation_bytes, max_result_bytes };
+        let result = match prefill {
+            Some(prefill) => session.engine.execute_int8_chat_cohort_packed(resident, batch.prepared,
+                batch.first_request_seq, cohort_limits, prefill, cancellation.clone()),
+            None => session.engine.execute_int8_chat_cohort(resident, batch.prepared,
+                batch.first_request_seq, cohort_limits, cancellation.clone()),
+        }.map_err(|_| CandidateError::Execution)?;
         session.remaining()?;
         let completed = &result.result().results;
         if completed.len() != count || completed.iter().enumerate()

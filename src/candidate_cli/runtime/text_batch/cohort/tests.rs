@@ -76,3 +76,24 @@ fn exhausted_preparation_deadline_stops_without_consuming_more_rows() {
         &mut || Err(CandidateError::Timeout)).is_err());
     assert_eq!(ledger.records, 0); assert_eq!(bytes, consumed); assert_eq!(input.position(), consumed);
 }
+#[test]
+fn packed_strategy_preserves_partial_tail_plans_and_whole_corpus_work() {
+    let ordinary = command(&[]); let ordinary_planner = planner(&ordinary);
+    for width in ["1", "4", "64"] {
+        let selected = command(&["--prefill-rows", width]); let selected_planner = planner(&selected);
+        let mut input = Cursor::new(line("a") + &line("b")); let mut bytes = 0; let mut ledger = Ledger::default();
+        let first = read_record(&mut input, &selected, &mut bytes).unwrap().unwrap();
+        let cohort = collect(first, &mut input, &selected_planner, &selected, &mut ledger, &mut bytes, 3,
+            &mut || Ok(())).unwrap();
+        assert!(cohort.eof); assert_eq!(cohort.ids, ["a", "b"]); assert_eq!(ledger.records, 2);
+        let mut positions = 0; let mut logits = 0;
+        for (id, prepared) in cohort.ids.iter().zip(&cohort.prepared) {
+            let record = wire::parse_record(ordinary.task, &line(id), ordinary.common.max_input_bytes).unwrap();
+            let (_, scalar) = ordinary_planner.prepare(record).unwrap();
+            assert_eq!(prepared.execution_identity(), scalar.execution_identity());
+            assert_eq!(prepared.planned_work(), scalar.planned_work());
+            positions += scalar.planned_work().forward_positions; logits += scalar.planned_work().projected_logits;
+        }
+        assert_eq!(ledger.work.forward_positions, positions); assert_eq!(ledger.work.projected_logits, logits);
+    }
+}
