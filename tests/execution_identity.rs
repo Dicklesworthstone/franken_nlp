@@ -274,3 +274,66 @@ fn notice_only_provenance_change_never_changes_any_execution_projection() {
         );
     }
 }
+
+#[test]
+fn serde_identity_round_trips_its_canonical_map_and_is_strict() {
+    let identity = identity();
+    let value = serde_json::to_value(&identity).expect("serialize identity");
+    assert_eq!(
+        serde_json::to_vec(&value).expect("value bytes"),
+        identity.canonical_json_bytes().expect("canonical bytes"),
+        "serde form is the canonical field map"
+    );
+    let back: ExecutionIdentity = serde_json::from_value(value.clone()).expect("round trip");
+    assert_eq!(back, identity);
+
+    let refuse = |mutate: &dyn Fn(&mut serde_json::Map<String, serde_json::Value>)| {
+        let mut map = value.as_object().expect("object").clone();
+        mutate(&mut map);
+        serde_json::from_value::<ExecutionIdentity>(serde_json::Value::Object(map)).is_err()
+    };
+    // A missing nullable field is refused even where `None` would be valid:
+    // non-fast profiles carry no host context.
+    let plain = ExecutionIdentity::new(ExecutionIdentity {
+        numerics_profile: NumericsProfile::HfBf16Eager,
+        host_class: None,
+        compiler_identity: None,
+        ..identity.clone()
+    })
+    .expect("plain profile is valid");
+    let mut plain_map = serde_json::to_value(&plain).expect("serialize plain");
+    assert_eq!(
+        serde_json::from_value::<ExecutionIdentity>(plain_map.clone()).expect("plain round trip"),
+        plain
+    );
+    plain_map
+        .as_object_mut()
+        .expect("object")
+        .remove("host_class");
+    assert!(
+        serde_json::from_value::<ExecutionIdentity>(plain_map).is_err(),
+        "a missing nullable field is refused"
+    );
+    assert!(
+        refuse(&|m| {
+            m.remove("kv_dtype");
+        }),
+        "a missing field is refused"
+    );
+    assert!(
+        refuse(&|m| {
+            m.insert("extra".into(), serde_json::json!(1));
+        }),
+        "unknown field"
+    );
+    assert!(refuse(&|m| {
+        m.insert("numerics_profile".into(), serde_json::json!("fast-v01"));
+    }));
+    assert!(refuse(&|m| {
+        m.insert("thinking_mode".into(), serde_json::json!("Enabled"));
+    }));
+    // Validation still applies: the fast profile requires its host context.
+    assert!(refuse(&|m| {
+        m.insert("host_class".into(), serde_json::Value::Null);
+    }));
+}

@@ -239,7 +239,11 @@ impl<'de> Deserialize<'de> for ExecutionIdentity {
             calibration_digest: Sha256Digest,
             decision_policy_digest: Sha256Digest,
             backend_semantic_version: String,
+            // `Option` fields are otherwise optional under serde's derive; the
+            // canonical map always carries them (null when absent).
+            #[serde(deserialize_with = "Option::deserialize")]
             host_class: Option<String>,
+            #[serde(deserialize_with = "Option::deserialize")]
             compiler_identity: Option<String>,
         }
         use serde::de::Error;
