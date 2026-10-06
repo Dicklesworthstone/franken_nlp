@@ -15,6 +15,8 @@ use super::{Int8RunBudget, Int8Session, Int8Work, StrictInt8Engine, StrictInt8Er
     DEFAULT_ADMITTED_CONTEXT_CAP, ProjectionWork, LinearRows, DecodeStepControl,
     DecodeCancellationKind, decoder_projection_work};
 
+pub mod prefill;
+
 pub const INT8_SCORING_EXECUTION: &str = "portable-int8-single-kv-candidate-trie-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -220,7 +222,7 @@ impl<D: Driver> PrefixEvaluator<'_, D> {
         self.poisoned = true; // Unwind cannot leave a retryable half-transition.
         self.driver.rewind(retain)?;
         self.rewound = add(self.rewound, (current - retain) as u64)?;
-        if !self.primed { for &token in self.prompt { self.driver.append(token)?; } }
+        if !self.primed { self.driver.append_prompt(self.prompt)?; }
         // After any rewind at least one new token recomputes the correct hidden
         // state. No stale descendant hidden is used for an ancestor projection.
         for &token in &prefix[common..] { self.driver.append(token)?; }
@@ -248,6 +250,10 @@ trait Driver {
     fn position(&self) -> Result<usize, Int8ScoringError>;
     fn rewind(&mut self, retain: usize) -> Result<(), Int8ScoringError>;
     fn append(&mut self, token: u32) -> Result<(), Int8ScoringError>;
+    fn append_prompt(&mut self, prompt: &[u32]) -> Result<(), Int8ScoringError> {
+        for &token in prompt { self.append(token)?; }
+        Ok(())
+    }
     fn logits(&mut self, rows: LinearRows<'_>) -> Result<Vec<f32>, Int8ScoringError>;
     fn work(&self) -> Int8Work;
     fn abort(&mut self);
