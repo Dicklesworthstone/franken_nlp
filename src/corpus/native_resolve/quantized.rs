@@ -11,6 +11,7 @@ use crate::native_engine::{
     constrained_int8,
     decode::DecodeCancellationKind,
     strict_int8::{Int8RunBudget, Int8Work, StrictInt8Engine, StrictInt8Error, STRICT_INT8_PROFILE,
+        prefill::Int8PrefillLimits,
         scoring::{self, CandidateSchedule, Int8CandidateRun, Int8ScoringBudget,
             Int8ScoringError, INT8_SCORING_EXECUTION}},
 };
@@ -194,14 +195,28 @@ impl PreparedInt8Resolution<'_, '_, '_> {
     pub fn execute_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
         engine: &mut StrictInt8Engine<'_>, budget: Int8ScoringBudget, control: &mut C)
         -> Result<Int8ResolutionRun, Int8ResolveError> {
+        self.execute_with_prefill(admitted, engine, budget, None, control)
+    }
+    /// Group each pair/order's prompt without skipping either order, altering
+    /// source commitments, or changing complete-link decisions. The caller
+    /// retains the extra scratch reservation for the entire snapshot execution.
+    pub fn execute_layer_major_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
+        engine: &mut StrictInt8Engine<'_>, budget: Int8ScoringBudget,
+        prefill: Int8PrefillLimits, control: &mut C) -> Result<Int8ResolutionRun, Int8ResolveError> {
+        self.execute_with_prefill(admitted, engine, budget, Some(prefill), control)
+    }
+    fn execute_with_prefill<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
+        engine: &mut StrictInt8Engine<'_>, budget: Int8ScoringBudget,
+        prefill: Option<Int8PrefillLimits>, control: &mut C) -> Result<Int8ResolutionRun, Int8ResolveError> {
+        if let Some(limits) = prefill { limits.validate()?; }
         self.preflight(admitted, engine, budget, control)?;
         let planner = self.inner.planner;
         let kv_cap = budget.max_kv_bytes.min(self.task_budget().max_kv_bytes);
         let head_output = self.task_budget().max_output_bytes;
         self.execute_heads(admitted, control, |_, _, prompt, schedule, control| {
-            let run = scoring::execute_compiled(prompt, &planner.scorer, ScoringMode::FullVocabulary,
+            let run = scoring::prefill::execute_compiled_with_prefill(prompt, &planner.scorer, ScoringMode::FullVocabulary,
                 schedule, head_output, engine,
-                Int8ScoringBudget { native: Int8RunBudget::exact(schedule.model), max_kv_bytes: kv_cap }, control)?;
+                Int8ScoringBudget { native: Int8RunBudget::exact(schedule.model), max_kv_bytes: kv_cap }, prefill, control)?;
             if engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) {
                 return Err(Int8ResolveError::Accounting);
             }

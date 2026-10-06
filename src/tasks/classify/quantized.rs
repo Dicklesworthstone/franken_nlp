@@ -11,6 +11,7 @@ use crate::{canonjson, execution_identity::{ExecutionIdentity, NumericsProfile, 
     native_engine::{artifact_bridge::ArtifactIdentity, decode::{DecodeCancellationKind, DecodeStepControl},
         lmhead::scoring::ScoringMode,
         strict_int8::{Int8RunBudget, Int8Work, StrictInt8Engine, StrictInt8Error, STRICT_INT8_EXECUTION, STRICT_INT8_PROFILE,
+            prefill::Int8PrefillLimits,
             scoring::{self, CandidateSchedule, Int8CandidateRun, Int8ScoringBudget, Int8ScoringError, INT8_SCORING_EXECUTION}}},
     tasks::ir::{DecodeStrategy, PlanContext, TaskBudget}};
 use super::{ClassificationLimits, ClassificationPlanner, ClassificationPlanningError, ClassificationRequest,
@@ -123,16 +124,30 @@ impl PreparedInt8Classification {
     pub fn execute_with_control<C: DecodeStepControl>(&self, admitted: &ExecutionIdentity,
         engine: &mut StrictInt8Engine<'_>, budget: Int8ScoringBudget, control: &mut C)
         -> Result<Int8ClassificationRun, Int8ClassificationError> {
+        self.execute_with_prefill(admitted, engine, budget, None, control)
+    }
+    /// Opt-in prompt morsels for every independent head. The existing sealed
+    /// identity, full-vocabulary probability space and finalizer are unchanged.
+    /// The caller must admit extra scratch once, retained through all heads.
+    pub fn execute_layer_major_with_control<C: DecodeStepControl>(&self, admitted: &ExecutionIdentity,
+        engine: &mut StrictInt8Engine<'_>, budget: Int8ScoringBudget,
+        prefill: Int8PrefillLimits, control: &mut C) -> Result<Int8ClassificationRun, Int8ClassificationError> {
+        self.execute_with_prefill(admitted, engine, budget, Some(prefill), control)
+    }
+    fn execute_with_prefill<C: DecodeStepControl>(&self, admitted: &ExecutionIdentity,
+        engine: &mut StrictInt8Engine<'_>, budget: Int8ScoringBudget,
+        prefill: Option<Int8PrefillLimits>, control: &mut C) -> Result<Int8ClassificationRun, Int8ClassificationError> {
+        if let Some(limits) = prefill { limits.validate()?; }
         planning::checkpoint(control)?;
         self.preflight(admitted, engine, budget)?;
         self.execute_heads(control, |_, head, schedule, control| {
             let mut prompt = planning::reserved(head.prompt_len)?;
             prompt.extend(head.task.ir().prompt_segments().iter().flat_map(|s| s.token_ids().iter().copied()));
             if prompt.len() != head.prompt_len { return Err(Int8ClassificationError::Accounting); }
-            let run = scoring::execute_compiled(&prompt, &head.classifier.scorer, ScoringMode::FullVocabulary,
+            let run = scoring::prefill::execute_compiled_with_prefill(&prompt, &head.classifier.scorer, ScoringMode::FullVocabulary,
                 schedule, self.inner.budget.max_output_bytes, engine,
                 Int8ScoringBudget { native: Int8RunBudget::exact(schedule.model),
-                    max_kv_bytes: budget.max_kv_bytes.min(self.inner.budget.max_kv_bytes) }, control)?;
+                    max_kv_bytes: budget.max_kv_bytes.min(self.inner.budget.max_kv_bytes) }, prefill, control)?;
             if !engine.kv_cache().all_slots_have_len(0) { return Err(Int8ClassificationError::Accounting); }
             Ok(run)
         })

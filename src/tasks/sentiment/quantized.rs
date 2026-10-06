@@ -14,6 +14,7 @@ use crate::{
         decode::{DecodeCancellationKind, DecodeStepControl},
         lmhead::scoring::{ScoringMode, ScoringWork},
         strict_int8::{Int8RunBudget, Int8Work, StrictInt8Engine, StrictInt8Error, STRICT_INT8_PROFILE,
+            prefill::Int8PrefillLimits,
             scoring::{self, CandidateSchedule, Int8CandidateRun, Int8ScoringBudget,
                 Int8ScoringError, INT8_SCORING_EXECUTION}},
     },
@@ -162,6 +163,20 @@ impl PreparedInt8Sentiment {
     pub fn execute_with_control<C: DecodeStepControl>(&self, admitted: &ExecutionIdentity,
         engine: &mut StrictInt8Engine<'_>, budget: Int8ScoringBudget, control: &mut C)
         -> Result<Int8SentimentRun, Int8SentimentError> {
+        self.execute_with_prefill(admitted, engine, budget, None, control)
+    }
+    /// Group each axis's prompt without changing score space, anchor language,
+    /// cross-axis independence or sealed identity. Extra scratch is host-owned
+    /// and can be reused across sequential heads, never concurrent heads.
+    pub fn execute_layer_major_with_control<C: DecodeStepControl>(&self, admitted: &ExecutionIdentity,
+        engine: &mut StrictInt8Engine<'_>, budget: Int8ScoringBudget,
+        prefill: Int8PrefillLimits, control: &mut C) -> Result<Int8SentimentRun, Int8SentimentError> {
+        self.execute_with_prefill(admitted, engine, budget, Some(prefill), control)
+    }
+    fn execute_with_prefill<C: DecodeStepControl>(&self, admitted: &ExecutionIdentity,
+        engine: &mut StrictInt8Engine<'_>, budget: Int8ScoringBudget,
+        prefill: Option<Int8PrefillLimits>, control: &mut C) -> Result<Int8SentimentRun, Int8SentimentError> {
+        if let Some(limits) = prefill { limits.validate()?; }
         checkpoint(control)?;
         self.preflight(admitted, engine, budget)?;
         self.execute_heads(control, |head, mode, schedule, control| {
@@ -169,11 +184,11 @@ impl PreparedInt8Sentiment {
             prompt.try_reserve_exact(head.prompt_len).map_err(|_| Int8SentimentError::Allocation)?;
             prompt.extend(head.ir.prompt_segments().iter().flat_map(|s| s.token_ids().iter().copied()));
             if prompt.len() != head.prompt_len { return Err(Int8SentimentError::Accounting); }
-            let run = scoring::execute_compiled(&prompt, &head.scorer, mode, schedule,
+            let run = scoring::prefill::execute_compiled_with_prefill(&prompt, &head.scorer, mode, schedule,
                 self.max_result_bytes(), engine, Int8ScoringBudget {
                     native: Int8RunBudget::exact(schedule.model),
                     max_kv_bytes: budget.max_kv_bytes.min(self.budget.max_kv_bytes),
-                }, control)?;
+                }, prefill, control)?;
             if engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) {
                 return Err(Int8SentimentError::Accounting);
             }
