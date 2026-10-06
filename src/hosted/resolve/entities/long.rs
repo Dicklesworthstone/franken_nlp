@@ -8,6 +8,8 @@ impl NlpEngine {
     /// preflighted; one grammar is rebuilt at a time and checked against its
     /// private witness. The same resident engine then scores the original-source
     /// graph. Output authority survives serialization and actual delivery.
+    /// Grouped prompt workspace is derived from the prepared plan and remains
+    /// charged through all NER chunks, pair heads and complete finalization.
     #[allow(clippy::too_many_arguments)]
     pub fn execute_int8_document_entities(&self, model: &ResidentInt8, prepared: PreparedInt8DocumentEntityCorpus,
         vocabulary: Arc<ExtractionVocabulary>, native: NativeLimits, preparation_reserve_bytes: u64,
@@ -21,6 +23,8 @@ impl NlpEngine {
         let config = &prepared.config().entities;
         validate(config, prepared.required_ner_context_tokens(), native,
             preparation_reserve_bytes, graph_reserve_bytes, required.kv_bytes)?;
+        let scratch_bytes = crate::hosted::scored::scoring_scratch(sum(&[required.rope_bytes,
+            required.scratch_payload_bound, native.allocator_reserve_bytes])?, prepared.prefill_limits())?;
         let bytes = sum(&[prepared.retained_input_bytes().map_err(execution_error)?, preparation_reserve_bytes])?;
         // Same peak as one short NER task, plus the complete expanded graph.
         // No retained array of chunk grammars, native transcripts or map values.
@@ -40,8 +44,7 @@ impl NlpEngine {
                 allocate(output, || prepared.finalize_without_model(control).map_err(execution_error))?
             } else {
                 let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-                let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-                    sum(&[required.rope_bytes, required.scratch_payload_bound, native.allocator_reserve_bytes])?)?;
+                let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, scratch_bytes)?;
                 let mut engine = allocate_native(kv, scratch, || model.inner.loaded.value
                     .engine(native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
                 let prepared = input.value.prepared.take().ok_or(HostedError::CompletionMissing)?;

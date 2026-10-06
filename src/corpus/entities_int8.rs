@@ -18,7 +18,7 @@ use crate::{
         kv::KV_BYTES_PER_TOKEN,
         portable_int8::ProjectionWork,
         strict_int8::{Int8RunBudget, Int8Work, StrictInt8Engine, StrictInt8Error,
-            STRICT_INT8_PROFILE, scoring::Int8ScoringBudget},
+            STRICT_INT8_PROFILE, scoring::Int8ScoringBudget, prefill::Int8PrefillLimits},
     },
     tasks::{extract::ExtractionVocabulary, ir::{PlanContext, TaskBudget},
         ner::{NerOptions, NerResult, NER_TASK_VERSION},
@@ -33,6 +33,7 @@ use super::{
     resolve::{self, ResolutionDocument, ResolutionPlan, ResolveError, ResolveLimits, ResolveOptions},
 };
 mod grounding;
+mod prefill;
 pub mod long;
 
 pub const INT8_ENTITY_EXECUTION: &str = "portable-int8-ner-to-complete-corpus-resolution-v1";
@@ -118,6 +119,7 @@ pub struct PreparedInt8EntityCorpus {
     mask_visits: u64,
     maximum_ner_positions: usize,
     input_bytes: usize,
+    prefill: Option<Int8PrefillLimits>,
 }
 
 /// Plan EVERY document before any neural call. The graph cannot be known until
@@ -150,9 +152,18 @@ pub fn prepare_int8_entities<C: DecodeStepControl>(mut documents: Vec<EntityDocu
     }
     resolve::checkpoint(control)?;
     Ok(PreparedInt8EntityCorpus { inputs, source, resolver, source_identity, resolution_identity,
-        config, ner_work, mask_visits, maximum_ner_positions, input_bytes })
+        config, ner_work, mask_visits, maximum_ner_positions, input_bytes, prefill: None })
 }
 impl PreparedInt8EntityCorpus {
+    /// Select physical prompt scheduling before transferring this consumed
+    /// snapshot to its admission owner. Applies to BOTH NER and pair scoring;
+    /// exact identities, source witnesses and work budgets are unchanged.
+    pub fn with_layer_major_prefill(mut self, limits: Int8PrefillLimits) -> Result<Self, Int8EntityError> {
+        prefill::configure(&mut self.prefill, limits)?;
+        Ok(self)
+    }
+    /// The host must price and retain this extra workspace through all stages.
+    pub fn prefill_limits(&self) -> Option<Int8PrefillLimits> { self.prefill }
     pub fn document_count(&self) -> usize { self.inputs.len() }
     pub fn input_bytes(&self) -> usize { self.input_bytes }
     pub fn ner_reserved_work(&self) -> Int8Work { self.ner_work }
@@ -182,17 +193,17 @@ impl PreparedInt8EntityCorpus {
         resolve::checkpoint(control)?;
         check_engine(&self, engine)?;
         let Self { inputs, source, resolver, source_identity, resolution_identity,
-            config, ner_work, mask_visits, .. } = self;
+            config, ner_work, mask_visits, prefill, .. } = self;
         let maps = collect(inputs, &config, control, |input, control| {
             let plan = source_plan(&input.document.text, &source, &source_identity, &config, control)?;
             check_rebuilt(input, &plan)?;
             let work = input.work;
-            let result = plan.execute_with_control(plan.execution_identity(), engine, vocabulary,
+            let result = prefill::source(&plan, engine, vocabulary,
                 Int8JsonBudget { native: Int8RunBudget::exact(work), json: JsonWorkBudget {
                     max_forward_positions: work.forward_positions, max_projected_logits: work.projected_logits,
                     max_kv_bytes: config.ner_budget.max_kv_bytes,
                     max_total_mask_node_visits: config.masks.max_visits_per_item, mask_limits: config.masks.per_mask,
-                } }, control)?;
+                } }, prefill, control)?;
             if engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) { return Err(Int8EntityError::Accounting); }
             Ok(result)
         })?;
@@ -211,9 +222,9 @@ impl PreparedInt8EntityCorpus {
         let resolution = if prepared.pair_count() == 0 {
             prepared.finalize_without_model(control)?
         } else {
-            prepared.execute_with_control(&admitted, engine, Int8ScoringBudget {
+            prefill::resolution(prepared, &admitted, engine, Int8ScoringBudget {
                 native: Int8RunBudget::exact(pair_work), max_kv_bytes: config.scoring.planning.per_head.max_kv_bytes,
-            }, control)?
+            }, prefill, control)?
         };
         drop(plan);
         finish(maps, resolution, ner_work, mask_visits, &config, control)

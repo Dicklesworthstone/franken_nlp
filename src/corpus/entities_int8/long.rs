@@ -27,6 +27,7 @@ pub struct PreparedInt8DocumentEntityCorpus {
     source_identity: ExecutionIdentity, resolution_identity: ExecutionIdentity,
     config: Int8DocumentEntityConfig, ner_work: Int8Work, masks: u64,
     chunks: usize, maximum_positions: usize, input_bytes: usize,
+    prefill: Option<Int8PrefillLimits>,
 }
 
 /// Partition with the pinned source encoder and exact trusted scaffold pricing.
@@ -78,7 +79,7 @@ pub fn prepare_int8_document_entities<C: DecodeStepControl>(mut documents: Vec<E
     }
     resolve::checkpoint(control)?;
     Ok(PreparedInt8DocumentEntityCorpus { inputs, source, resolver, source_identity, resolution_identity,
-        config, ner_work, masks, chunks: count, maximum_positions, input_bytes })
+        config, ner_work, masks, chunks: count, maximum_positions, input_bytes, prefill: None })
 }
 fn validate_partition(config: &Int8DocumentEntityConfig) -> Result<(), Int8EntityError> {
     config.chunks.effective_token_limit().map_err(partition_error)?;
@@ -114,6 +115,14 @@ fn partition_error(error: MapReduceError) -> Int8EntityError {
     }
 }
 impl PreparedInt8DocumentEntityCorpus {
+    /// Group every NER chunk prompt and every resolution prompt under one
+    /// pre-admission scheduling choice. Original chunk extents, identities,
+    /// source coordinates and nonrenewable work reservations are untouched.
+    pub fn with_layer_major_prefill(mut self, limits: Int8PrefillLimits) -> Result<Self, Int8EntityError> {
+        prefill::configure(&mut self.prefill, limits)?;
+        Ok(self)
+    }
+    pub fn prefill_limits(&self) -> Option<Int8PrefillLimits> { self.prefill }
     pub fn document_count(&self) -> usize { self.inputs.len() }
     pub fn chunk_count(&self) -> usize { self.chunks }
     pub fn input_bytes(&self) -> usize { self.input_bytes }
@@ -143,18 +152,18 @@ impl PreparedInt8DocumentEntityCorpus {
         resolve::checkpoint(control)?;
         check_native(&self, engine)?;
         let Self { inputs, source, resolver, source_identity, resolution_identity,
-            config, ner_work, masks, chunks, .. } = self;
+            config, ner_work, masks, chunks, prefill, .. } = self;
         let (maps, geometry) = collect_chunks(inputs, &config.entities, control, |input, control| {
             let plan = source_plan(&input.document.text, &source, &source_identity, &config.entities, control)?;
             check_rebuilt(input, &plan)?;
             let work = input.work;
-            let result = plan.execute_with_control(plan.execution_identity(), engine, vocabulary,
+            let result = prefill::source(&plan, engine, vocabulary,
                 Int8JsonBudget { native: Int8RunBudget::exact(work), json: JsonWorkBudget {
                     max_forward_positions: work.forward_positions, max_projected_logits: work.projected_logits,
                     max_kv_bytes: config.entities.ner_budget.max_kv_bytes,
                     max_total_mask_node_visits: config.entities.masks.max_visits_per_item,
                     mask_limits: config.entities.masks.per_mask,
-                } }, control)?;
+                } }, prefill, control)?;
             if engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) { return Err(Int8EntityError::Accounting); }
             Ok(result)
         })?;
@@ -171,9 +180,9 @@ impl PreparedInt8DocumentEntityCorpus {
         let resolution = if prepared.pair_count() == 0 {
             prepared.finalize_without_model(control)?
         } else {
-            prepared.execute_with_control(&admitted, engine, Int8ScoringBudget {
+            prefill::resolution(prepared, &admitted, engine, Int8ScoringBudget {
                 native: Int8RunBudget::exact(pair_work), max_kv_bytes: config.entities.scoring.planning.per_head.max_kv_bytes,
-            }, control)?
+            }, prefill, control)?
         };
         drop(admitted); drop(plan);
         let output = finish(maps, resolution, ner_work, masks, &config.entities, control)?;
