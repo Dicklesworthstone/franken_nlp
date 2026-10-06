@@ -129,6 +129,8 @@ pub(in crate::candidate_cli) fn execute(command: SourceCommand, args: CandidateA
     let (planner, vocabulary) = planner()?;
     session.remaining()?;
     let prepared = prepare(&planner, &facts, &request, &command.args.host, &mut session.control())?;
+    // The mode and row ceiling enter the sealed policy before native admission.
+    let prepared = command.args.head.source(prepared)?;
     session.remaining()?;
     let cancellation = CancellationToken::default();
     let model = session.load(&args, limits, &facts, cancellation.clone())?;
@@ -191,5 +193,31 @@ mod tests {
         let mut control = PreparationControl { started: Instant::now(), elapsed_limit: Duration::ZERO };
         assert_eq!(control.checkpoint(0), Some(DecodeCancellationKind::Deadline));
         assert!(prepare(&planner, &facts(), &request, &cmd.args.host, &mut control).is_err());
+    }
+    #[test]
+    fn explicit_cli_head_choice_seals_all_four_real_plans_before_host_transfer() {
+        let (planner, _) = planner().unwrap();
+        let default_head = crate::candidate_cli::extract::selected::SelectedRowsArgs::default();
+        for kind in [Kind::Ner, Kind::Keyphrases, Kind::Summarize, Kind::Answer] {
+            let cmd = command::tests::command(kind.name(), &["--selected-rows", "32"]);
+            let (_, limits) = cmd.args.host.common(cmd.args.input.clone()).unwrap();
+            let text = if kind == Kind::Answer {
+                r#"{"question":"Who?","passages":[{"id":"p1","text":"Alice"}]}"#.to_owned()
+            } else { "Alice <tool_call> é 上海".to_owned() };
+            let request = command::request(kind, text, None, cmd.args.host.task_budget(limits), 65536).unwrap();
+            let mut control = PreparationControl { started: Instant::now(), elapsed_limit: Duration::from_secs(3600) };
+            let prepared = prepare(&planner, &facts(), &request, &cmd.args.host, &mut control).unwrap();
+            let id = prepared.execution_identity().clone(); let work = prepared.planned_work();
+            let unchanged = default_head.source(prepared).unwrap();
+            assert_eq!(unchanged.execution_identity(), &id); assert_eq!(unchanged.planned_work(), work);
+            let selected = cmd.args.head.source(unchanged).unwrap();
+            assert_eq!(selected.selected_rows().unwrap().max_rows_per_step, 32);
+            assert_eq!(selected.planned_work().forward_positions, work.forward_positions);
+            assert_eq!(selected.planned_work().projected_logits, cmd.args.host.max_new_tokens as u64 * 32);
+            assert_eq!(selected.execution_identity().prompt_digest, id.prompt_digest);
+            assert_eq!(selected.execution_identity().schema_digest, id.schema_digest);
+            assert!(selected.verify_identity(&id).is_err());
+            selected.verify_identity(selected.execution_identity()).unwrap();
+        }
     }
 }

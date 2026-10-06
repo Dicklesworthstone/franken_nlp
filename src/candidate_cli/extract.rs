@@ -5,6 +5,7 @@ use crate::{
     grammar::{CompileLimits, runtime::JsonProgram},
 };
 use source::SourceHostArgs;
+pub(super) mod selected;
 
 pub(super) const SCHEMA_BYTES: usize = 64 * 1024;
 
@@ -15,6 +16,8 @@ pub(crate) struct ExtractCommand {
     pub(super) input: PathBuf,
     #[command(flatten)]
     pub(super) host: SourceHostArgs,
+    #[command(flatten)]
+    pub(super) head: selected::SelectedRowsArgs,
     /// Bounded local JSON schema file, never a URL or stdin. Exact numbers are retained.
     #[arg(long, value_name = "FILE")]
     pub(super) schema: PathBuf,
@@ -27,10 +30,11 @@ pub(crate) struct ExtractCommand {
 pub(super) fn definition() -> clap::Command {
     ExtractCommand::augment_args(clap::Command::new("extract")
         .about("Extract using an exact local JSON schema and constrained INT8 decoding")
-        .long_about("Compile a bounded user schema and exact source before loading weights. The supported schema subset is the existing grammar compiler's; unsupported keywords fail closed. Schema validity does not prove extracted facts. Use --source-membership for explicit verbatim source fields. No sampling, repair retry, remote schema resolution or semantic-verification claim is available."))
+        .long_about("Compile a bounded user schema and exact source before loading weights. The supported schema subset is the existing grammar compiler's; unsupported keywords fail closed. Schema validity does not prove extracted facts. Use --source-membership for explicit verbatim source fields. --selected-rows explicitly projects the complete legal grammar set instead of the full vocabulary, with a per-step row ceiling that refuses rather than prunes. EOS remains a scored choice; no speed or parity qualification is implied. No sampling, repair retry, remote schema resolution or semantic-verification claim is available."))
 }
 impl ExtractCommand {
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), CandidateError> {
+        self.head.limits()?;
         check_schema_path(&self.schema)?;
         self.host.common(self.input.clone())
     }

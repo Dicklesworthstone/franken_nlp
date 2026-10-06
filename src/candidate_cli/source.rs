@@ -109,6 +109,8 @@ pub(super) struct SourceArgs {
     pub input: PathBuf,
     #[command(flatten)]
     pub host: SourceHostArgs,
+    #[command(flatten)]
+    pub head: super::extract::selected::SelectedRowsArgs,
     /// Optional local JSON file containing the selected task's complete options.
     /// Defaults are used only when omitted; unknown/partial options are rejected.
     #[arg(long, value_name = "FILE")]
@@ -129,6 +131,7 @@ impl SourceCommand {
         Ok(Self { kind, args: SourceArgs::from_arg_matches(matches)? })
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
+        self.args.head.limits()?;
         let (common, limits) = self.args.host.common(self.args.input.clone())?;
         if self.args.options.as_ref().is_some_and(|path| path.as_os_str().is_empty() || path.as_os_str() == "-") {
             return Err(CandidateError::Arguments);

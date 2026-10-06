@@ -61,13 +61,15 @@ pub(in crate::candidate_cli) fn execute(command: ExtractCommand, args: Candidate
     let facts = session.facts(&args)?;
     let compiler = planner(&facts, &command.host, limits, None)?;
     let prepared = prepare(&compiler, document, request, &command.host, &mut session.control())?;
+    // Seal the explicit head choice BEFORE loading/admitting native execution.
+    let prepared = command.head.extraction(prepared.into_extraction_plan())?;
     drop(compiler);
     session.remaining()?;
     let vocabulary = vocabulary()?;
     session.remaining()?;
     let cancellation = CancellationToken::default();
     let model = session.load(&args, limits, &facts, cancellation.clone())?;
-    let result = session.engine.execute_int8_extract(&model, prepared.into_extraction_plan(), vocabulary,
+    let result = session.engine.execute_int8_extract(&model, prepared, vocabulary,
         session.native(&args)?, command.host.masks(), command.host.max_mask_node_visits, cancellation)
         .map_err(|_| CandidateError::Execution)?;
     session.remaining()?;

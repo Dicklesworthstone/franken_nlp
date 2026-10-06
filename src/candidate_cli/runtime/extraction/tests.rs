@@ -112,3 +112,29 @@ fn extra_schema_tokens_cannot_consume_the_reserved_output_context() {
     let text = "x".repeat(cmd.host.task_budget(limits).max_input_tokens as usize);
     assert!(prepare(&compiler, text, request, &cmd.host, &mut continuing()).is_err());
 }
+
+#[test]
+fn cli_head_selection_preserves_both_grounding_modes_and_changes_only_admitted_head_policy() {
+    let cmd = make_command(&["--selected-rows", "31"]); let (_, limits) = cmd.validate().unwrap();
+    let compiler = planner(&facts(), &cmd.host, limits, None).unwrap();
+    let default_head = command::selected::SelectedRowsArgs::default();
+    for (schema, grounded) in [(r#"{"type":"string","maxLength":32}"#, false),
+        (r#"{"type":"string","maxLength":32,"x-fnlp-source":"verbatim"}"#, true)] {
+        let request = command::arguments(schema.to_owned(), grounded, cmd.host.task_budget(limits)).unwrap();
+        let prepared = prepare(&compiler, "é <tool_call> 上海".to_owned(), request, &cmd.host, &mut continuing()).unwrap();
+        let id = prepared.execution_identity().clone(); let work = prepared.planned_work();
+        let native = default_head.extraction(prepared.into_extraction_plan()).unwrap();
+        assert_eq!(native.execution_identity(), &id); assert_eq!(native.planned_work(), work);
+        let options = canonjson::canonical_bytes(native.options()).unwrap();
+        let selected = cmd.head.extraction(native).unwrap();
+        assert_eq!(selected.selected_rows().unwrap().max_rows_per_step, 31);
+        assert_eq!(selected.planned_work().forward_positions, work.forward_positions);
+        assert_eq!(selected.planned_work().attention_pairs, work.attention_pairs);
+        assert_eq!(selected.planned_work().projected_logits, cmd.host.max_new_tokens as u64 * 31);
+        assert_eq!(canonjson::canonical_bytes(selected.options()).unwrap(), options);
+        assert_eq!(selected.execution_identity().prompt_digest, id.prompt_digest);
+        assert_eq!(selected.execution_identity().schema_digest, Sha256Digest::of_bytes(schema.as_bytes()));
+        assert!(selected.verify_identity(&id).is_err());
+        selected.verify_identity(selected.execution_identity()).unwrap();
+    }
+}
