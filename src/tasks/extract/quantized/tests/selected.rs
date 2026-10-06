@@ -100,8 +100,8 @@ fn sparse_source_evidence_keeps_all_occurrences_and_rejects_off_source_bytes() {
 
 #[test]
 fn sparse_results_preserve_exact_decimal_strings_and_whole_envelope_limits() {
-    let decimal = "12345678901234567890123456789012345678";
-    let mut p = plan(r#"{"type":"integer"}"#).with_selected_rows(limits(3)).unwrap();
+    let decimal = "1.2345678901234567890123456789012345678e37";
+    let mut p = plan(r#"{"type":"number"}"#).with_selected_rows(limits(3)).unwrap();
     let run = p.finalize(sparse_raw(&p, decimal, 3)).unwrap();
     assert_eq!(run.result.output.json, decimal);
     let cap = canonjson::canonical_bytes(&run).unwrap().len() as u64;
@@ -120,5 +120,17 @@ fn sparse_selection_does_not_weaken_profile_control_or_schema_checks() {
             1 => { run.output.token_ids.pop(); }, 2 => run.output.token_ids[0] = 3,
             3 => run.output.json = "null".to_owned(), _ => run.output.json = "tru".to_owned() }
         assert!(p.finalize(run).is_err());
+    }
+}
+
+#[test]
+fn selected_rows_do_not_expand_the_64_bit_integer_domain() {
+    let p = plan(r#"{"type":"integer"}"#).with_selected_rows(limits(3)).unwrap();
+    for integer in ["-9223372036854775808", "9007199254740993", "18446744073709551615"] {
+        let run = p.finalize(sparse_raw(&p, integer, 3)).unwrap();
+        assert_eq!(run.result.output.json, integer); p.verify_completed(&run).unwrap();
+    }
+    for outside in ["-9223372036854775809", "18446744073709551616", "1.2345678901234567890123456789012345678e37"] {
+        assert!(p.finalize(sparse_raw(&p, outside, 3)).is_err());
     }
 }

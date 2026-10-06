@@ -184,8 +184,12 @@ fn complete_outer_envelope_has_an_exact_byte_limit_including_model_work_and_evid
 
 #[test]
 fn exact_decimal_text_is_not_rounded_through_a_float_value() {
-    let p = plan(r#"{"type":"integer"}"#);
-    let decimal = "12345678901234567890123456789012345678";
+    let p = plan(r#"{"type":"number"}"#);
+    let decimal = "1.2345678901234567890123456789012345678e37";
+    // The grammar's integer domain is i64/u64; larger exact decimals use
+    // its normalized scientific number language, not a wider integer schema.
+    let mut state = p.extraction.program.initial_state();
+    assert!(state.consume_bytes(decimal.as_bytes()) && state.is_accepting());
     let out = p.finalize(raw(&p, decimal)).unwrap();
     assert_eq!(out.result.output.json, decimal);
 }
@@ -208,4 +212,17 @@ fn result_replay_is_canonical_without_exporting_private_identity_or_confidence()
         assert!(!a.contains(forbidden));
     }
 }
+
+#[test]
+fn integer_finalization_keeps_64_bit_boundaries_and_precision_above_f64() {
+    let p = plan(r#"{"type":"integer"}"#);
+    for integer in ["-9223372036854775808", "9007199254740993", "18446744073709551615"] {
+        assert_eq!(p.finalize(raw(&p, integer)).unwrap().result.output.json, integer);
+    }
+    for outside in ["-9223372036854775809", "18446744073709551616",
+        "12345678901234567890123456789012345678", "1.2345678901234567890123456789012345678e37"] {
+        assert!(p.finalize(raw(&p, outside)).is_err());
+    }
+}
+
 mod selected;

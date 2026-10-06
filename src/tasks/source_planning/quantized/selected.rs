@@ -121,6 +121,18 @@ mod tests {
     }
     #[test]
     fn all_four_existing_source_finalizers_keep_identical_semantics_under_new_execution_labels() {
+        // Projection work is intentionally different and is part of the typed
+        // result, not just its outer native envelope. Verify it independently
+        // before comparing EVERY other field; do not erase or forge real work.
+        let semantic = |mut result: SourceTaskResult, projected: u64| {
+            let reported = match &mut result {
+                SourceTaskResult::Ner(r) => &mut r.projected_logits,
+                SourceTaskResult::Keyphrases(r) => &mut r.projected_logits,
+                SourceTaskResult::Summarize(r) => &mut r.projected_logits,
+                SourceTaskResult::Answer(r) => &mut r.projected_logits,
+            };
+            assert_eq!(*reported, projected); *reported = 0; result
+        };
         let planner = planner();
         for (request, source, json) in fixtures() {
             let dense = prepare(&planner, &request);
@@ -128,7 +140,10 @@ mod tests {
             let a = dense.finish(raw(&dense, &request, source, json)).unwrap();
             let b = sparse.finish(raw(&sparse, &request, source, json)).unwrap();
             assert_eq!(a.execution, INT8_SOURCE_EXECUTION); assert_eq!(b.execution, INT8_SPARSE_SOURCE_EXECUTION);
-            assert_eq!(canonjson::canonical_bytes(&a.result).unwrap(), canonjson::canonical_bytes(&b.result).unwrap());
+            assert_eq!(a.model_work.projected_logits, 2 * crate::native_engine::lmhead::NANBEIGE_VOCAB_SIZE as u64);
+            assert_eq!(b.model_work.projected_logits, 3);
+            assert_eq!(canonjson::canonical_bytes(&semantic(a.result.clone(), a.model_work.projected_logits)).unwrap(),
+                canonjson::canonical_bytes(&semantic(b.result.clone(), b.model_work.projected_logits)).unwrap());
             assert!(b.model_work.projected_logits < a.model_work.projected_logits);
             assert!(dense.finish(raw(&sparse, &request, source, json)).is_err());
             assert!(sparse.finish(raw(&dense, &request, source, json)).is_err());

@@ -97,8 +97,8 @@ fn independent_source_occurrences_and_input_order_survive_cohort_finalization() 
 }
 #[test]
 fn exact_decimal_strings_do_not_pass_through_a_float_value() {
-    let plans = [plan(r#"{"type":"integer"}"#, None, true)]; let requests = requests(&plans);
-    let number = "12345678901234567890123456789012345678";
+    let plans = [plan(r#"{"type":"number"}"#, None, true)]; let requests = requests(&plans);
+    let number = "1.2345678901234567890123456789012345678e37";
     let out = finish(&requests, raw(&requests, &[number]), 1 << 20).unwrap();
     assert_eq!(out.sequences[0].result.output.json, number);
 }
@@ -129,4 +129,16 @@ fn complete_outer_result_has_an_exact_bound_and_keeps_semantic_keys_unchanged() 
     assert!(finish(&requests, raw(&requests, &["true"]), cap).is_ok());
     assert!(finish(&requests, raw(&requests, &["true"]), cap - 1).is_err());
     assert_eq!(before, canonjson::canonical_bytes(plans[0].execution_identity()).unwrap());
+}
+
+#[test]
+fn a_decimal_cannot_expand_the_integer_domain_for_an_entire_cohort() {
+    let plans = [plan(r#"{"type":"integer"}"#, None, true), plan(r#"{"type":"integer"}"#, None, true)];
+    let requests = requests(&plans);
+    let accepted = ["-9223372036854775808", "18446744073709551615"];
+    let out = finish(&requests, raw(&requests, &accepted), 1 << 20).unwrap();
+    for (row, expected) in out.sequences.iter().zip(accepted) { assert_eq!(row.result.output.json, expected); }
+    for outside in ["-9223372036854775809", "18446744073709551616", "1.2345678901234567890123456789012345678e37"] {
+        assert!(finish(&requests, raw(&requests, &[accepted[0], outside]), 1 << 20).is_err());
+    }
 }
