@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::{
-    native_engine::strict_int8::scoring::Int8ScoringBudget,
+    native_engine::strict_int8::{scoring::Int8ScoringBudget, prefill::Int8PrefillLimits},
     tasks::{classify::quantized::{Int8ClassificationError, Int8ClassificationRun, PreparedInt8Classification},
         ir::TaskBudget,
         judge::quantized::{Int8JudgeError, Int8JudgeRun, PreparedInt8Judge}},
@@ -17,6 +17,19 @@ impl NlpEngine {
     pub fn execute_int8_classify(&self, model: &ResidentInt8,
         prepared: PreparedInt8Classification, native: NativeLimits,
         cancellation: CancellationToken) -> Result<HostedOutput<Int8ClassificationRun>, HostedError> {
+        self.execute_int8_classify_scheduled(model, prepared, native, None, cancellation)
+    }
+    /// Explicit grouped-prompt classification. Additional workspace is charged
+    /// once to this process, reused by sequential heads, and retained with the
+    /// native engine until all head/result checks finish. No new runtime.
+    pub fn execute_int8_classify_layer_major(&self, model: &ResidentInt8,
+        prepared: PreparedInt8Classification, native: NativeLimits, prefill: Int8PrefillLimits,
+        cancellation: CancellationToken) -> Result<HostedOutput<Int8ClassificationRun>, HostedError> {
+        self.execute_int8_classify_scheduled(model, prepared, native, Some(prefill), cancellation)
+    }
+    fn execute_int8_classify_scheduled(&self, model: &ResidentInt8,
+        prepared: PreparedInt8Classification, native: NativeLimits, prefill: Option<Int8PrefillLimits>,
+        cancellation: CancellationToken) -> Result<HostedOutput<Int8ClassificationRun>, HostedError> {
         dispatch::preflight(self, native.run)?;
         self.check_resident_domain(model)?;
         check_model_identity(model.artifact_identity(), prepared.execution_identity())?;
@@ -24,26 +37,33 @@ impl NlpEngine {
         let task = prepared.task_budget();
         check_capacity(prepared.required_context(), task, native.context_tokens, required.kv_bytes)?;
         let work = prepared.planned_work();
+        let scratch_bytes = scoring_scratch(sum(&[required.rope_bytes, required.scratch_payload_bound,
+            native.allocator_reserve_bytes])?, prefill)?;
         let lease = self.resources().acquire_lease();
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-        let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-            sum(&[required.rope_bytes, required.scratch_payload_bound, native.allocator_reserve_bytes])?)?;
+        let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch, scratch_bytes)?;
         let output = output_claim(&lease, task.max_output_bytes, u64::from(task.max_output_tokens))?;
         let model = model.clone();
         dispatch::run(self, native.run, cancellation, move |control| {
             let mut engine = allocate_native(kv, workspace, || model.inner.loaded.value
                 .engine(native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-            let result = prepared.execute_with_control(prepared.execution_identity(), &mut engine.value,
-                Int8ScoringBudget { native: Int8RunBudget::exact(work), max_kv_bytes: required.kv_bytes }, control)
-                .map_err(HostedError::Classification)?;
-            if result.model_work != work || engine.value.is_poisoned()
-                || !engine.value.kv_cache().all_slots_have_len(0) {
-                return Err(HostedError::Classification(Int8ClassificationError::Accounting));
-            }
+            // allocate() drops a result before its reservation on commit failure.
+            let result = allocate(output, || {
+                let budget = Int8ScoringBudget { native: Int8RunBudget::exact(work), max_kv_bytes: required.kv_bytes };
+                let result = match prefill {
+                    Some(prefill) => prepared.execute_layer_major_with_control(prepared.execution_identity(),
+                        &mut engine.value, budget, prefill, control),
+                    None => prepared.execute_with_control(prepared.execution_identity(), &mut engine.value, budget, control),
+                }.map_err(HostedError::Classification)?;
+                if result.model_work != work || result.head_count != prepared.head_count()
+                    || engine.value.is_poisoned() || !engine.value.kv_cache().all_slots_have_len(0) {
+                    return Err(HostedError::Classification(Int8ClassificationError::Accounting));
+                }
+                Ok(result)
+            })?;
             drop(engine);
-            let committed = output.commit()?;
             drop(lease);
-            Ok(GuardedOutput::new(result, committed))
+            Ok(GuardedOutput::new(result.value, result._memory))
         })
     }
 
@@ -53,6 +73,18 @@ impl NlpEngine {
     pub fn execute_int8_judge(&self, model: &ResidentInt8,
         prepared: PreparedInt8Judge, native: NativeLimits, cancellation: CancellationToken)
         -> Result<HostedOutput<Int8JudgeRun>, HostedError> {
+        self.execute_int8_judge_scheduled(model, prepared, native, None, cancellation)
+    }
+    /// Group prompts while retaining the same full-bundle admission, finalizer,
+    /// cancellation region and guarded output. This is not head/document batching.
+    pub fn execute_int8_judge_layer_major(&self, model: &ResidentInt8,
+        prepared: PreparedInt8Judge, native: NativeLimits, prefill: Int8PrefillLimits,
+        cancellation: CancellationToken) -> Result<HostedOutput<Int8JudgeRun>, HostedError> {
+        self.execute_int8_judge_scheduled(model, prepared, native, Some(prefill), cancellation)
+    }
+    fn execute_int8_judge_scheduled(&self, model: &ResidentInt8,
+        prepared: PreparedInt8Judge, native: NativeLimits, prefill: Option<Int8PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedOutput<Int8JudgeRun>, HostedError> {
         dispatch::preflight(self, native.run)?;
         self.check_resident_domain(model)?;
         check_model_identity(model.artifact_identity(), prepared.execution_identity())?;
@@ -60,28 +92,42 @@ impl NlpEngine {
         let task = prepared.task_budget();
         check_capacity(prepared.required_context(), task, native.context_tokens, required.kv_bytes)?;
         let work = prepared.planned_work();
+        let scratch_bytes = scoring_scratch(sum(&[required.rope_bytes, required.scratch_payload_bound,
+            native.allocator_reserve_bytes])?, prefill)?;
         let lease = self.resources().acquire_lease();
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-        let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-            sum(&[required.rope_bytes, required.scratch_payload_bound, native.allocator_reserve_bytes])?)?;
+        let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch, scratch_bytes)?;
         let output = output_claim(&lease, prepared.max_result_bytes(), u64::from(task.max_output_tokens))?;
         let model = model.clone();
         dispatch::run(self, native.run, cancellation, move |control| {
             let mut engine = allocate_native(kv, workspace, || model.inner.loaded.value
                 .engine(native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-            let result = prepared.execute_with_control(prepared.execution_identity(), &mut engine.value,
-                Int8ScoringBudget { native: Int8RunBudget::exact(work), max_kv_bytes: required.kv_bytes }, control)
-                .map_err(HostedError::Judge)?;
-            if result.model_work != work || result.head_count != prepared.head_count()
-                || engine.value.is_poisoned() || !engine.value.kv_cache().all_slots_have_len(0) {
-                return Err(HostedError::Judge(Int8JudgeError::Accounting));
-            }
+            let result = allocate(output, || {
+                let budget = Int8ScoringBudget { native: Int8RunBudget::exact(work), max_kv_bytes: required.kv_bytes };
+                let result = match prefill {
+                    Some(prefill) => prepared.execute_layer_major_with_control(prepared.execution_identity(),
+                        &mut engine.value, budget, prefill, control),
+                    None => prepared.execute_with_control(prepared.execution_identity(), &mut engine.value, budget, control),
+                }.map_err(HostedError::Judge)?;
+                if result.model_work != work || result.head_count != prepared.head_count()
+                    || engine.value.is_poisoned() || !engine.value.kv_cache().all_slots_have_len(0) {
+                    return Err(HostedError::Judge(Int8JudgeError::Accounting));
+                }
+                Ok(result)
+            })?;
             drop(engine);
-            let committed = output.commit()?;
             drop(lease);
-            Ok(GuardedOutput::new(result, committed))
+            Ok(GuardedOutput::new(result.value, result._memory))
         })
     }
+}
+
+/// Shared by scored task hosts. The native row geometry derives the payload;
+/// callers cannot discount existing scratch or underprice the extra workspace.
+/// This validates arithmetic only; each host must hold its actual reservation.
+pub(super) fn scoring_scratch(ordinary: u64, prefill: Option<Int8PrefillLimits>) -> Result<u64, HostedError> {
+    let extra = prefill.map(Int8PrefillLimits::validate).transpose().map_err(HostedError::Native)?.unwrap_or(0);
+    sum(&[ordinary, extra])
 }
 
 // The engine allocates its FULL admitted KV capacity. Checking only the
@@ -160,5 +206,36 @@ mod tests {
         send::<Int8JudgeRun>();
         send::<Arc<crate::tasks::judge::JudgePlanner>>();
     }
-
+    #[test]
+    fn grouped_scoring_preserves_all_existing_scratch_and_adds_derived_payload() {
+        let ordinary = 12_345_u64;
+        assert_eq!(scoring_scratch(ordinary, None).unwrap(), ordinary);
+        for rows in [1, 4, 64] {
+            let extra = Int8PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
+            let limits = Int8PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: extra };
+            assert_eq!(scoring_scratch(ordinary, Some(limits)).unwrap(), ordinary + extra);
+        }
+    }
+    #[test]
+    fn scoring_workspace_cannot_be_underpriced_or_overflow_the_process_ledger() {
+        let extra = Int8PrefillLimits::required_extra_scratch_bytes(4).unwrap();
+        let limits = Int8PrefillLimits { max_batch_rows: 4, max_extra_scratch_bytes: extra };
+        assert!(scoring_scratch(1, Some(Int8PrefillLimits { max_extra_scratch_bytes: extra - 1, ..limits })).is_err());
+        assert_eq!(scoring_scratch(u64::MAX - extra, Some(limits)).unwrap(), u64::MAX);
+        assert!(scoring_scratch(u64::MAX - extra + 1, Some(limits)).is_err());
+    }
+    #[test]
+    fn scored_hosts_refuse_invalid_prefill_geometry_before_reserving() {
+        for rows in [0, 65, usize::MAX] {
+            assert!(scoring_scratch(1024, Some(Int8PrefillLimits {
+                max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX,
+            })).is_err());
+        }
+    }
+    #[test]
+    fn an_oversized_allowance_does_not_replace_the_geometry_derived_charge() {
+        let limits = Int8PrefillLimits { max_batch_rows: 4, max_extra_scratch_bytes: u64::MAX };
+        let extra = Int8PrefillLimits::required_extra_scratch_bytes(4).unwrap();
+        assert_eq!(scoring_scratch(8192, Some(limits)).unwrap(), 8192 + extra);
+    }
 }

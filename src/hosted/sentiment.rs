@@ -1,6 +1,6 @@
 //! Independent affect heads on the existing charged resident model/runtime.
 use super::*;
-use crate::{native_engine::strict_int8::{Int8Work, scoring::Int8ScoringBudget},
+use crate::{native_engine::strict_int8::{Int8Work, scoring::Int8ScoringBudget, prefill::Int8PrefillLimits},
     tasks::{ir::TaskBudget, sentiment::quantized::{PreparedInt8Sentiment, Int8SentimentRun, Int8SentimentError}}};
 
 /// Whole-bundle compute and caller-priced input ownership. Preparation is a
@@ -19,28 +19,44 @@ impl NlpEngine {
     pub fn execute_int8_sentiment(&self, model: &ResidentInt8, prepared: PreparedInt8Sentiment,
         limits: SentimentHostLimits, cancellation: CancellationToken)
         -> Result<HostedOutput<Int8SentimentRun>, HostedError> {
+        self.execute_int8_sentiment_scheduled(model, prepared, limits, None, cancellation)
+    }
+    /// Explicit grouped prompt scheduling with additional process-admitted
+    /// scratch. The same one-region invocation owns every independent axis.
+    pub fn execute_int8_sentiment_layer_major(&self, model: &ResidentInt8, prepared: PreparedInt8Sentiment,
+        limits: SentimentHostLimits, prefill: Int8PrefillLimits, cancellation: CancellationToken)
+        -> Result<HostedOutput<Int8SentimentRun>, HostedError> {
+        self.execute_int8_sentiment_scheduled(model, prepared, limits, Some(prefill), cancellation)
+    }
+    fn execute_int8_sentiment_scheduled(&self, model: &ResidentInt8, prepared: PreparedInt8Sentiment,
+        limits: SentimentHostLimits, prefill: Option<Int8PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedOutput<Int8SentimentRun>, HostedError> {
         dispatch::preflight(self, limits.native.run)?;
         self.check_resident_domain(model)?;
         check_model_identity(model.artifact_identity(), prepared.execution_identity())?;
         let required = requirements(limits.native)?;
         let work = prepared.planned_work();
         validate(limits, prepared.task_budget(), prepared.required_context(), required.kv_bytes, work)?;
+        let scratch_bytes = super::scored::scoring_scratch(sum(&[required.rope_bytes,
+            required.scratch_payload_bound, limits.native.allocator_reserve_bytes])?, prefill)?;
         let lease = self.resources().acquire_lease();
         let output = output_claim(&lease, prepared.max_result_bytes(), u64::from(prepared.task_budget().max_output_tokens))?;
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, limits.preparation_reserve_bytes)?,
             || Ok(prepared))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-        let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-            sum(&[required.rope_bytes, required.scratch_payload_bound, limits.native.allocator_reserve_bytes])?)?;
+        let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, scratch_bytes)?;
         let model = model.clone();
         dispatch::run(self, limits.native.run, cancellation, move |control| {
             let input = input; // capture storage and its charge as one ordered aggregate
             let mut engine = allocate_native(kv, scratch, || model.inner.loaded.value
                 .engine(limits.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
             let result = allocate(output, || {
-                let result = input.value.execute_with_control(input.value.execution_identity(), &mut engine.value,
-                    Int8ScoringBudget { native: Int8RunBudget::exact(work), max_kv_bytes: required.kv_bytes }, control)
-                    .map_err(HostedError::Sentiment)?;
+                let budget = Int8ScoringBudget { native: Int8RunBudget::exact(work), max_kv_bytes: required.kv_bytes };
+                let result = match prefill {
+                    Some(prefill) => input.value.execute_layer_major_with_control(input.value.execution_identity(),
+                        &mut engine.value, budget, prefill, control),
+                    None => input.value.execute_with_control(input.value.execution_identity(), &mut engine.value, budget, control),
+                }.map_err(HostedError::Sentiment)?;
                 if result.model_work != work || result.head_count != input.value.head_count()
                     || engine.value.is_poisoned() || !engine.value.kv_cache().all_slots_have_len(0) {
                     return Err(HostedError::Sentiment(Int8SentimentError::Accounting));

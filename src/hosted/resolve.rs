@@ -8,7 +8,8 @@ use crate::{
         native_resolve::{ResolutionPlanner, quantized::{Int8ResolveError, Int8ResolveLimits, Int8ResolutionRun}},
         resolve::{ResolutionDocument, MentionInput, ResolutionPlan, ResolveOptions, ResolveLimits, ResolveError, RESOLVE_VERSION},
     },
-    native_engine::{constrained_int8, decode::DecodeStepControl, strict_int8::scoring::Int8ScoringBudget},
+    native_engine::{constrained_int8, decode::DecodeStepControl,
+        strict_int8::{scoring::Int8ScoringBudget, prefill::Int8PrefillLimits}},
 };
 
 /// Fixed snapshot policy and complete work ceilings, not per-pair defaults.
@@ -40,11 +41,26 @@ impl NlpEngine {
     pub fn resolve_int8(&self, model: &ResidentInt8, documents: Vec<ResolutionDocument>,
         planner: Arc<ResolutionPlanner>, config: ResolveConfig, cancellation: CancellationToken)
         -> Result<HostedOutput<Int8ResolutionRun>, HostedError> {
+        self.resolve_int8_scheduled(model, documents, planner, config, None, cancellation)
+    }
+    /// Group each comparison prompt with process-admitted scratch. The empty
+    /// candidate graph still allocates no native engine, KV or extra scratch.
+    pub fn resolve_int8_layer_major(&self, model: &ResidentInt8, documents: Vec<ResolutionDocument>,
+        planner: Arc<ResolutionPlanner>, config: ResolveConfig, prefill: Int8PrefillLimits,
+        cancellation: CancellationToken) -> Result<HostedOutput<Int8ResolutionRun>, HostedError> {
+        self.resolve_int8_scheduled(model, documents, planner, config, Some(prefill), cancellation)
+    }
+    fn resolve_int8_scheduled(&self, model: &ResidentInt8, documents: Vec<ResolutionDocument>,
+        planner: Arc<ResolutionPlanner>, config: ResolveConfig, prefill: Option<Int8PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedOutput<Int8ResolutionRun>, HostedError> {
         dispatch::preflight(self, config.native.run)?;
         self.check_resident_domain(model)?;
         check_model_identity(model.artifact_identity(), &config.identity)?;
         let required = requirements(config.native)?;
         validate(&config, planner.tokenizer_digest(), planner.template_digest(), required.kv_bytes)?;
+        // Check geometry now, reserve lazily only if the graph needs scoring.
+        let scratch_bytes = super::scored::scoring_scratch(sum(&[required.rope_bytes,
+            required.scratch_payload_bound, config.native.allocator_reserve_bytes])?, prefill)?;
         let bytes = sum(&[input_payload(&documents, config.graph)?, config.preparation_reserve_bytes])?;
         let run = config.native.run;
         let lease = self.resources().acquire_lease();
@@ -86,13 +102,17 @@ impl NlpEngine {
                     admitted.push(identity.clone());
                 }
                 let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-                let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-                    sum(&[required.rope_bytes, required.scratch_payload_bound, config.native.allocator_reserve_bytes])?)?;
+                let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, scratch_bytes)?;
                 let mut engine = allocate_native(kv, scratch, || model.inner.loaded.value
                     .engine(config.native.context_tokens, memory_budget(required)).map_err(HostedError::Model))?;
-                let result = allocate(output, || prepared.execute_with_control(&admitted, &mut engine.value,
-                    Int8ScoringBudget { native: Int8RunBudget::exact(work), max_kv_bytes: required.kv_bytes }, control)
-                    .map_err(HostedError::Resolution))?;
+                let result = allocate(output, || {
+                    let budget = Int8ScoringBudget { native: Int8RunBudget::exact(work), max_kv_bytes: required.kv_bytes };
+                    match prefill {
+                        Some(prefill) => prepared.execute_layer_major_with_control(&admitted,
+                            &mut engine.value, budget, prefill, control),
+                        None => prepared.execute_with_control(&admitted, &mut engine.value, budget, control),
+                    }.map_err(HostedError::Resolution)
+                })?;
                 drop(engine);
                 drop(admitted);
                 result
