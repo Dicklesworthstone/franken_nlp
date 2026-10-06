@@ -9,11 +9,11 @@ impl Int8ExtractPlan {
     pub(crate) fn verify_completed(&self, run: &Int8ExtractRun) -> Result<(), Int8ExtractError> {
         // Bound both the original envelope and the temporary validation copy.
         check_size(run, self.max_result_bytes())?;
-        if run.schema_version != 1 || run.execution != INT8_EXTRACT_VERSION {
+        if run.schema_version != 1 || run.execution != self.execution_version() {
             return Err(ExtractError::InvalidResult.into());
         }
         let output = &run.result.output;
-        let work = constrained_int8::planned_work(self.prompt_tokens(), output.token_ids.len())?;
+        let work = self.completed_work(output.token_ids.len(), output.projected_logits)?;
         if work != run.model_work || output.forward_positions != work.forward_positions
             || output.projected_logits != work.projected_logits {
             return Err(Int8JsonError::WorkMismatch.into());

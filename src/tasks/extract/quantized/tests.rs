@@ -208,3 +208,4 @@ fn result_replay_is_canonical_without_exporting_private_identity_or_confidence()
         assert!(!a.contains(forbidden));
     }
 }
+mod selected;

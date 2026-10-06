@@ -5,6 +5,7 @@
 //! checks only requested logits; it makes no claim about unrequested rows and
 //! does not replace the full-vocabulary reference or certify model parity.
 use super::*;
+mod selection;
 
 pub const INT8_SPARSE_JSON_EXECUTION: &str = "portable-int8-grammar-first-selected-rows-v1";
 
@@ -111,9 +112,9 @@ fn poll<C: DecodeStepControl>(control: &mut C, step: usize) -> Result<(), Int8Js
     match control.checkpoint(step) { Some(cause) => Err(JsonDecodeError::Cancelled(cause).into()), None => Ok(()) }
 }
 
-/// Enumerate the ENTIRE legal set in canonical token-ID order. The first pass
-/// rejects oversized sets before allocating/projecting; the second fills the
-/// exactly sized array. No sort, sampling policy, or physical-row address exists.
+/// A materialized test oracle for exhaustive comparison with full argmax.
+/// Production instead counts once and projects bounded stack-sized chunks.
+#[cfg(test)]
 fn legal_rows<C: DecodeStepControl>(mask: &DenseTokenMask, accepting: bool,
     options: &JsonDecodeOptions, cap: usize, control: &mut C, step: usize) -> Result<Vec<u32>, Int8JsonError> {
     let legal = |id: u32| if id == options.eos_token_id { accepting }
@@ -186,13 +187,11 @@ fn run<V: Vocabulary, D: Driver>(prompt: &[u32], program: &JsonProgram, vocabula
             .ok_or(JsonDecodeError::BudgetExceeded("mask work"))?;
         let mask = vocabulary.mask(&state, budget.json.mask_limits, driver.control(), step)?;
         if mask.vocab_size() != vocabulary.width() { return Err(JsonDecodeError::IllegalTransition.into()); }
-        let rows = legal_rows(&mask, state.is_accepting(), options, limits.max_rows_per_step, driver.control(), step)?;
-        projected = projected.checked_add(rows.len()).filter(|&n| n as u64 <= budget.json.max_projected_logits)
-            .ok_or(JsonDecodeError::BudgetExceeded("selected projection work"))?;
-        poll(driver.control(), step)?;
-        let logits = driver.logits(&rows)?;
-        let selected = select(&rows, &logits)?;
-        drop(logits); drop(rows); drop(mask);
+        let remaining = budget.json.max_projected_logits.checked_sub(projected as u64).ok_or(Int8JsonError::WorkMismatch)?;
+        let (selected, count) = selection::project(&mask, state.is_accepting(), options,
+            limits.max_rows_per_step, remaining, driver, step)?;
+        projected = projected.checked_add(count).ok_or(StrictInt8Error::Work)?;
+        drop(mask);
         poll(driver.control(), step)?;
         tokens.push(selected);
         if selected == options.eos_token_id {

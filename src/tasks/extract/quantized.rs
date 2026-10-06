@@ -8,11 +8,14 @@
 use std::io::{self, Write};
 use super::*;
 use crate::native_engine::{
-    constrained_int8::{self, INT8_JSON_EXECUTION, Int8JsonBudget, Int8JsonError, Int8JsonRun},
+    constrained_int8::{self, INT8_JSON_EXECUTION, Int8JsonBudget, Int8JsonError, Int8JsonRun,
+        sparse as selected_head},
     strict_int8::{Int8Work, StrictInt8Engine, STRICT_INT8_PROFILE},
 };
 
 mod completed;
+mod projection;
+pub use projection::INT8_SPARSE_EXTRACT_VERSION;
 
 pub const INT8_EXTRACT_VERSION: &str = "strict-int8-schema-source-extraction-v1";
 
@@ -62,6 +65,7 @@ pub struct Int8ExtractPlan {
     extraction: ExtractPlan,
     identity: ExecutionIdentity,
     work: Int8Work,
+    selected_rows: Option<selected_head::Int8JsonSparseLimits>,
 }
 impl Int8ExtractPlan {
     pub fn from_task_plan(task: &TaskPlan, schema: &str, options: JsonDecodeOptions,
@@ -96,7 +100,7 @@ impl Int8ExtractPlan {
             INT8_EXTRACT_VERSION, INT8_JSON_EXECUTION, extraction.policy_digest,
         )).map_err(|_| ExtractError::Serialization)?);
         identity.validate().map_err(|_| Int8ExtractError::Identity)?;
-        Ok(Self { extraction, identity, work })
+        Ok(Self { extraction, identity, work, selected_rows: None })
     }
 
     // Called only while compiling a shipped source task, before admission.
@@ -146,24 +150,26 @@ impl Int8ExtractPlan {
                 "vocabulary control registry differs from int8 plan"))));
         }
         budget.json.max_kv_bytes = budget.json.max_kv_bytes.min(self.extraction.max_kv_bytes);
-        constrained_int8::decode_json_int8_with(engine, admitted, &self.extraction.prompt,
-            &self.extraction.program, &vocabulary.oracle, &self.extraction.options, budget, control,
-            |run| finalize(self.finalize(run).map_err(E::from)?))
+        let finish = |run| finalize(self.finalize(run).map_err(E::from)?);
+        match self.selected_rows {
+            Some(limits) => selected_head::decode_json_int8_sparse_with(engine, admitted, &self.extraction.prompt,
+                &self.extraction.program, &vocabulary.oracle, &self.extraction.options, budget, limits, control, finish),
+            None => constrained_int8::decode_json_int8_with(engine, admitted, &self.extraction.prompt,
+                &self.extraction.program, &vocabulary.oracle, &self.extraction.options, budget, control, finish),
+        }
     }
 
     fn finalize(&self, run: Int8JsonRun) -> Result<Int8ExtractRun, Int8ExtractError> {
-        if run.schema_version != 1 || run.execution != INT8_JSON_EXECUTION {
+        if run.schema_version != 1 || run.execution != self.native_execution_version() {
             return Err(ExtractError::InvalidResult.into());
         }
-        let count = run.output.token_ids.len();
-        if count == 0 || count > self.options().max_new_tokens { return Err(ExtractError::InvalidResult.into()); }
-        let expected = constrained_int8::planned_work(self.prompt_tokens(), count)?;
+        let expected = self.completed_work(run.output.token_ids.len(), run.output.projected_logits)?;
         if run.model_work != expected || run.output.forward_positions != expected.forward_positions
             || run.output.projected_logits != expected.projected_logits {
             return Err(Int8JsonError::WorkMismatch.into());
         }
         let result = self.extraction.finalize_profile(run.output, STRICT_INT8_PROFILE)?;
-        let output = Int8ExtractRun { schema_version: 1, execution: INT8_EXTRACT_VERSION.to_owned(),
+        let output = Int8ExtractRun { schema_version: 1, execution: self.execution_version().to_owned(),
             result, model_work: run.model_work };
         check_size(&output, self.max_result_bytes())?;
         Ok(output)
