@@ -180,9 +180,9 @@ fn failed_close_or_replacement_open_cannot_restart_or_retry_a_request() {
 fn sink_failure_aborts_before_slot_reuse_and_is_not_a_document_success() {
     struct Broken;
     impl DecodeEventSink for Broken {
-        type Permit = (); type Error = ();
-        fn reserve(&mut self, _: &DecodeTokenEvent) -> Result<(), ()> { Err(()) }
-        fn permit(&mut self, _: (), _: DecodeTokenEvent) -> Result<(), ()> { panic!("failed reserve must not deliver") }
+        type Permit = (); type Error = &'static str;
+        fn reserve(&mut self, _: &DecodeTokenEvent) -> Result<(), &'static str> { Err("sink broken") }
+        fn permit(&mut self, _: (), _: DecodeTokenEvent) -> Result<(), &'static str> { panic!("failed reserve must not deliver") }
     }
     let plans = [plan("a", vec![5], GenerationOptions::greedy(1, 100, 0)), plan("b", vec![6], GenerationOptions::greedy(1, 100, 0))];
     let slots = [0, 0]; let mut rows = cursors(&plans); let mut forward = Fake::new(&slots);

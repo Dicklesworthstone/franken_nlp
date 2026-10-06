@@ -163,6 +163,7 @@ fn bounded_model_enumerates_all_terminal_drain_reasons_without_late_spawn() {
             .expect("worker exits at drain boundary");
         team.join().expect("all children join before latch fires");
         assert_eq!(team.snapshot().drain_reason, Some(reason));
+    }
 }
 
 /// A contained panic that occurs BEFORE `worker_started` (i.e. while the worker
@@ -188,7 +189,8 @@ fn panic_during_formed_state_must_not_strand_the_worker() {
     if panic_result.is_ok() {
         team.worker_exited(second)
             .expect("sibling observes drain at checkpoint");
-        team.join().expect("latch fires after the panicked and drained children exit");
+        team.join()
+            .expect("latch fires after the panicked and drained children exit");
         assert_eq!(team.snapshot().phase, SealedTeamPhase::Joined);
     } else {
         // Current behavior: worker_panicked returns Err(WorkerNotRunning)
@@ -210,3 +212,4 @@ fn panic_during_formed_state_must_not_strand_the_worker() {
             Err(SealedTeamError::JoinBeforeWorkersExit { .. })
         ));
     }
+}

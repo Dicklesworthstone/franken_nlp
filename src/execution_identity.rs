@@ -105,6 +105,35 @@ impl NumericsProfile {
     pub fn requires_host_context(&self) -> bool {
         matches!(self, Self::Fast { .. })
     }
+
+    /// Parse a [`Self::label`]; only the exact canonical spelling is accepted
+    /// (no leading zeros, case or whitespace variants).
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        let parsed = match label {
+            "hf-bf16-eager" => Self::HfBf16Eager,
+            "diagnostic-f32" => Self::DiagnosticF32,
+            _ => {
+                if let Some(version) = label.strip_prefix("strict-quantized-v") {
+                    Self::StrictQuantized {
+                        version: version.parse().ok()?,
+                    }
+                } else {
+                    Self::Fast {
+                        version: label.strip_prefix("fast-v")?.parse().ok()?,
+                    }
+                }
+            }
+        };
+        (parsed.label() == label).then_some(parsed)
+    }
+}
+
+/// Serializes as its canonical [`NumericsProfile::label`].
+impl Serialize for NumericsProfile {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.label())
+    }
 }
 
 /// Whether trusted template code enabled model thinking markers.
@@ -167,6 +196,91 @@ pub struct ExecutionIdentity {
     pub backend_semantic_version: String,
     pub host_class: Option<String>,
     pub compiler_identity: Option<String>,
+}
+
+/// Serializes as the canonical field map: the same fields and values
+/// [`ExecutionIdentity::canonical_json_bytes`] encodes. Serde-based canonical
+/// encoders that embed an identity (batch factory bindings, receipts) therefore
+/// bind its complete semantics, never a second, drifting encoding. Serde has
+/// no domain error here, so it does not re-run `validate`; identities are
+/// validated when built with [`ExecutionIdentity::new`].
+impl Serialize for ExecutionIdentity {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.canonical_fields().serialize(serializer)
+    }
+}
+
+/// Strict inverse of the [`Serialize`] impl: exactly the canonical field map
+/// (unknown or missing fields are refused), labels that re-render
+/// byte-identically, then the same validation as [`ExecutionIdentity::new`].
+impl<'de> Deserialize<'de> for ExecutionIdentity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Canonical {
+            schema_version: u32,
+            source_revision: String,
+            logical_model_digest: Sha256Digest,
+            artifact_format: String,
+            quant_recipe: String,
+            packing_set_digest: Sha256Digest,
+            tokenizer_digest: Sha256Digest,
+            template_digest: Sha256Digest,
+            task_spec: String,
+            taskir_digest: Sha256Digest,
+            prompt_digest: Sha256Digest,
+            grammar_compiler_version: String,
+            schema_digest: Sha256Digest,
+            numerics_profile: String,
+            kv_dtype: String,
+            sampler_version: String,
+            thinking_mode: String,
+            tool_mode: String,
+            calibration_digest: Sha256Digest,
+            decision_policy_digest: Sha256Digest,
+            backend_semantic_version: String,
+            host_class: Option<String>,
+            compiler_identity: Option<String>,
+        }
+        use serde::de::Error;
+        let c = Canonical::deserialize(deserializer)?;
+        let numerics_profile = NumericsProfile::from_label(&c.numerics_profile)
+            .ok_or_else(|| D::Error::custom("unknown numerics_profile label"))?;
+        let thinking_mode = [ThinkingMode::Disabled, ThinkingMode::Enabled]
+            .into_iter()
+            .find(|mode| mode.label() == c.thinking_mode)
+            .ok_or_else(|| D::Error::custom("unknown thinking_mode label"))?;
+        let tool_mode = [ToolMode::None, ToolMode::Xml, ToolMode::Json]
+            .into_iter()
+            .find(|mode| mode.label() == c.tool_mode)
+            .ok_or_else(|| D::Error::custom("unknown tool_mode label"))?;
+        Self::new(Self {
+            schema_version: c.schema_version,
+            source_revision: c.source_revision,
+            logical_model_digest: c.logical_model_digest,
+            artifact_format: c.artifact_format,
+            quant_recipe: c.quant_recipe,
+            packing_set_digest: c.packing_set_digest,
+            tokenizer_digest: c.tokenizer_digest,
+            template_digest: c.template_digest,
+            task_spec: c.task_spec,
+            taskir_digest: c.taskir_digest,
+            prompt_digest: c.prompt_digest,
+            grammar_compiler_version: c.grammar_compiler_version,
+            schema_digest: c.schema_digest,
+            numerics_profile,
+            kv_dtype: c.kv_dtype,
+            sampler_version: c.sampler_version,
+            thinking_mode,
+            tool_mode,
+            calibration_digest: c.calibration_digest,
+            decision_policy_digest: c.decision_policy_digest,
+            backend_semantic_version: c.backend_semantic_version,
+            host_class: c.host_class,
+            compiler_identity: c.compiler_identity,
+        })
+        .map_err(|error| D::Error::custom(format!("invalid execution identity: {error:?}")))
+    }
 }
 
 impl ExecutionIdentity {
