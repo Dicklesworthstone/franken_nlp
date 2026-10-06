@@ -131,3 +131,4 @@ fn build_input(prepared: Vec<PreparedInt8Chat>, limits: ChatCohortLimits) -> Res
 }
 #[cfg(test)] mod tests;
 mod refill;
+mod structured;

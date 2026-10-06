@@ -24,6 +24,7 @@ use crate::{
 
 pub mod long;
 pub mod capacity;
+pub mod cohort;
 mod selected;
 pub use selected::INT8_SPARSE_SOURCE_EXECUTION;
 

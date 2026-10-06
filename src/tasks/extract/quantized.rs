@@ -15,6 +15,7 @@ use crate::native_engine::{
 
 mod completed;
 mod projection;
+pub mod cohort;
 pub use projection::INT8_SPARSE_EXTRACT_VERSION;
 
 pub const INT8_EXTRACT_VERSION: &str = "strict-int8-schema-source-extraction-v1";
