@@ -113,20 +113,28 @@ pub(crate) fn decode_json_int8_with<C, T, E, F>(
     budget: Int8JsonBudget, control: &mut C, finalize: F,
 ) -> Result<T, E>
 where C: DecodeStepControl, E: From<Int8JsonError>, F: FnOnce(Int8JsonRun) -> Result<T, E> {
-    check_model(identity, engine.artifact_identity()).map_err(E::from)?;
-    if engine.profile() != STRICT_INT8_PROFILE || engine.is_poisoned() {
-        return Err(E::from(StrictInt8Error::EngineUnavailable.into()));
-    }
-    if !engine.kv_cache().all_slots_have_len(0) {
-        return Err(E::from(JsonDecodeError::EngineAlreadyPrimed.into()));
-    }
-    if vocabulary.width() != NANBEIGE_VOCAB_SIZE {
-        return Err(E::from(JsonDecodeError::InvalidRequest("model/tokenizer vocabulary mismatch").into()));
-    }
-    let work = preflight(prompt, vocabulary, options, budget).map_err(E::from)?;
-    check_capacity(work, engine.kv_cache().capacity_positions(), budget.json.max_kv_bytes).map_err(E::from)?;
+    check_request(engine, identity, prompt, vocabulary, options, budget).map_err(E::from)?;
     let mut session = engine.session(budget.native, control).map_err(Int8JsonError::from).map_err(E::from)?;
     drive(prompt, program, vocabulary, options, budget, &mut session, finalize)
+}
+
+// Shared by serial and layer-major execution. Neither route may bypass model,
+// empty-cache, vocabulary, whole-request work or resident-capacity validation.
+fn check_request(engine: &StrictInt8Engine<'_>, identity: &ExecutionIdentity, prompt: &[u32],
+    vocabulary: &VocabMaskOracle, options: &JsonDecodeOptions, budget: Int8JsonBudget)
+    -> Result<(), Int8JsonError> {
+    check_model(identity, engine.artifact_identity())?;
+    if engine.profile() != STRICT_INT8_PROFILE || engine.is_poisoned() {
+        return Err(StrictInt8Error::EngineUnavailable.into());
+    }
+    if !engine.kv_cache().all_slots_have_len(0) {
+        return Err(JsonDecodeError::EngineAlreadyPrimed.into());
+    }
+    if vocabulary.width() != NANBEIGE_VOCAB_SIZE {
+        return Err(JsonDecodeError::InvalidRequest("model/tokenizer vocabulary mismatch").into());
+    }
+    let work = preflight(prompt, vocabulary, options, budget)?;
+    check_capacity(work, engine.kv_cache().capacity_positions(), budget.json.max_kv_bytes)
 }
 
 pub(crate) fn check_profile(identity: &ExecutionIdentity) -> Result<(), Int8JsonError> {
@@ -185,6 +193,15 @@ trait Driver {
     type Control: DecodeStepControl;
     fn control(&mut self) -> &mut Self::Control;
     fn append(&mut self, token: u32) -> Result<(), Int8JsonError>;
+    fn append_prompt(&mut self, prompt: &[u32]) -> Result<(), Int8JsonError> {
+        for (index, &token) in prompt.iter().enumerate() {
+            if let Some(cause) = self.control().prefill_checkpoint(index) {
+                return Err(JsonDecodeError::Cancelled(cause).into());
+            }
+            self.append(token)?;
+        }
+        Ok(())
+    }
     fn logits(&mut self) -> Result<Vec<f32>, Int8JsonError>;
     fn work(&self) -> Int8Work;
     fn abort(&mut self);
@@ -260,10 +277,7 @@ fn run<V: Vocabulary, D: Driver>(prompt: &[u32], program: &JsonProgram, vocabula
     tokens.try_reserve_exact(options.max_new_tokens).map_err(|_| JsonDecodeError::AllocationRefused)?;
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(program.max_output_bytes()).map_err(|_| JsonDecodeError::AllocationRefused)?;
-    for (index, &token) in prompt.iter().enumerate() {
-        if let Some(cause) = driver.control().prefill_checkpoint(index) { return Err(JsonDecodeError::Cancelled(cause).into()); }
-        driver.append(token)?;
-    }
+    driver.append_prompt(prompt)?;
     let mut logits = driver.logits()?;
     checked_logits(&logits, vocabulary.width())?;
     let mut positions = prompt.len() as u64;
@@ -310,3 +324,4 @@ fn run<V: Vocabulary, D: Driver>(prompt: &[u32], program: &JsonProgram, vocabula
 
 #[cfg(test)] mod tests;
 pub mod sparse;
+pub mod prefill;
