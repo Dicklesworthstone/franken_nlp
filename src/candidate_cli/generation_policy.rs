@@ -1,7 +1,7 @@
 //! Bounded CLI controls for the existing identity-bound generation processor.
 //!
 //! Structured/scored tasks do not inherit free-text sampling controls; source
-//! tasks separately expose their supported prefill scheduling option. Stops use
+//! and scored tasks separately expose supported prefill scheduling options. Stops use
 //! the native exact-suffix contract: bytes are retained and streaming never
 //! retracts content. Minimum length delays EOS and byte-stop completion, not budgets.
 use super::{CandidateError, GenerationOptions};
@@ -248,10 +248,15 @@ mod tests {
         }
     }
     #[test]
-    fn unimplemented_scored_prefill_routes_cannot_silently_ignore_the_switch() {
+    fn scored_routes_use_separate_prefill_controls_without_free_text_policy() {
         for task in ["classify", "sentiment"] {
-            assert!(definition().try_get_matches_from(["candidate", task,
-                "--model", "local.fnlpq", "--memory-mib", "8192", "--prefill-rows", "4"]).is_err());
+            let matches = definition().try_get_matches_from(["candidate", task,
+                "--model", "local.fnlpq", "--memory-mib", "8192", "--prefill-rows", "4"]).unwrap();
+            let CandidateCommand::Scored(command) = CandidateCommand::from_matches(&matches).unwrap() else { unreachable!() };
+            assert_eq!(command.prefill.limits().unwrap().unwrap().max_batch_rows, 4);
+            let (common, _) = command.args.common().unwrap();
+            assert!(common.policy.prefill().unwrap().is_none());
+            assert!(common.options(166_101).unwrap() == GenerationOptions::greedy(common.max_new_tokens, common.max_output_bytes, 166_101));
         }
     }
 }

@@ -36,7 +36,11 @@ fn check_result(result: &Int8ResolutionRun, expected: Expected) -> Result<(), Ca
 
 pub(in crate::candidate_cli) fn execute(command: ResolveCommand, common: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
-    if command.discovery.discover_entities { return entities::execute(command, common, limits, input, output); }
+    let prefill = command.prefill.limits()?;
+    if command.discovery.discover_entities {
+        if prefill.is_some() { return Err(CandidateError::Arguments); }
+        return entities::execute(command, common, limits, input, output);
+    }
     let session = Session::new(&common, limits)?;
     let lease = session.engine.resources().acquire_lease();
     // A separate modeled commitment covers the temporary preflight graph. It
@@ -74,11 +78,16 @@ pub(in crate::candidate_cli) fn execute(command: ResolveCommand, common: Candida
     // Owned source and the same immutable planner enter the existing host. It
     // independently revalidates all anchors and admits every exact pair before
     // the first forward; no per-pair load, partial response or renewed quota.
-    let result = session.engine.resolve_int8(&model, population.documents, Arc::new(planner), ResolveConfig {
+    let config = ResolveConfig {
         identity, options: population.options, graph: command.graph(), scoring,
         native: session.native(&common)?, preparation_reserve_bytes: limits.preparation_bytes,
         graph_reserve_bytes: command.graph_reserve_mib * MIB,
-    }, cancellation).map_err(|_| CandidateError::Execution)?;
+    };
+    let planner = Arc::new(planner);
+    let result = match prefill {
+        Some(prefill) => session.engine.resolve_int8_layer_major(&model, population.documents, planner, config, prefill, cancellation),
+        None => session.engine.resolve_int8(&model, population.documents, planner, config, cancellation),
+    }.map_err(|_| CandidateError::Execution)?;
     check_result(result.result(), expected)?;
     deliver(&session, &facts, &result, command.host.max_result_bytes + 4096, output)
 }

@@ -9,6 +9,8 @@ use crate::{batch::BatchWork,
         sentiment::{SentimentAxis, SentimentLimits, SentimentPolicy, SentimentRequest}},
 };
 
+pub(super) mod prefill;
+
 const MAX_LABELS: usize = 128;
 const MAX_LABEL_BYTES: usize = 64 * 1024;
 const SCORING_NODES: usize = 4096;
@@ -129,17 +131,24 @@ impl ScoredArgs {
     }
 }
 
-pub(crate) struct ScoredCommand { pub(super) kind: Kind, pub(super) args: ScoredArgs }
+pub(crate) struct ScoredCommand {
+    pub(super) kind: Kind,
+    pub(super) args: ScoredArgs,
+    pub(super) prefill: prefill::ScoringPrefillArgs,
+}
 pub(super) fn definitions() -> Vec<clap::Command> {
     [("classify", "Score every label exactly; exclusive or independent multi-label decisions"),
         ("sentiment", "Score independent affect dimensions; uncalibrated, not psychological measurements")]
-        .into_iter().map(|(name, about)| ScoredArgs::augment_args(clap::Command::new(name).about(about))).collect()
+        .into_iter().map(|(name, about)| prefill::ScoringPrefillArgs::augment_args(
+            ScoredArgs::augment_args(clap::Command::new(name).about(about)))).collect()
 }
 impl ScoredCommand {
     pub(super) fn from_matches(kind: Kind, matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-        Ok(Self { kind, args: ScoredArgs::from_arg_matches(matches)? })
+        Ok(Self { kind, args: ScoredArgs::from_arg_matches(matches)?,
+            prefill: prefill::ScoringPrefillArgs::from_arg_matches(matches)? })
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
+        self.prefill.limits()?;
         let (common, limits) = self.args.common()?;
         #[cfg(feature = "asupersync-runtime")]
         { runtime::scored_tasks::execute(self, common, limits, input, output) }

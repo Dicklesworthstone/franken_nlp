@@ -32,6 +32,7 @@ fn poll(control: &mut impl DecodeStepControl) -> Result<(), CandidateError> {
 
 pub(in crate::candidate_cli) fn execute(command: JudgeCommand, args: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
+    let prefill = command.prefill.limits()?;
     // Session owns preparation before any request/tokenizer allocations and
     // survives native execution and the completed response's external delivery.
     let session = Session::new(&args, limits)?;
@@ -44,8 +45,11 @@ pub(in crate::candidate_cli) fn execute(command: JudgeCommand, args: CandidateAr
     session.remaining()?;
     let cancellation = CancellationToken::default();
     let model = session.load(&args, limits, &facts, cancellation.clone())?;
-    let result = session.engine.execute_int8_judge(&model, plan, session.native(&args)?, cancellation)
-        .map_err(|_| CandidateError::Execution)?;
+    let native = session.native(&args)?;
+    let result = match prefill {
+        Some(prefill) => session.engine.execute_int8_judge_layer_major(&model, plan, native, prefill, cancellation),
+        None => session.engine.execute_int8_judge(&model, plan, native, cancellation),
+    }.map_err(|_| CandidateError::Execution)?;
     session.remaining()?;
     let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
         evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,

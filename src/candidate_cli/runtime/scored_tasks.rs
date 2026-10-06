@@ -53,6 +53,7 @@ fn prepare(request: &Request, facts: &ArtifactIdentity, args: &ScoredArgs, contr
 
 pub(in crate::candidate_cli) fn execute(command: ScoredCommand, common: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
+    let prefill = command.prefill.limits()?;
     // Session precedes every input, planner and output allocation. Its modeled
     // preparation charge survives all returned failures and final delivery.
     let session = Session::new(&common, limits)?;
@@ -68,15 +69,22 @@ pub(in crate::candidate_cli) fn execute(command: ScoredCommand, common: Candidat
     let cap = command.args.max_result_bytes + 4096;
     match prepared {
         Prepared::Classify(plan) => {
-            let result = session.engine.execute_int8_classify(&model, plan, session.native(&common)?, cancellation)
-                .map_err(|_| CandidateError::Execution)?;
+            let native = session.native(&common)?;
+            let result = match prefill {
+                Some(prefill) => session.engine.execute_int8_classify_layer_major(&model, plan, native, prefill, cancellation),
+                None => session.engine.execute_int8_classify(&model, plan, native, cancellation),
+            }.map_err(|_| CandidateError::Execution)?;
             deliver(&session, &facts, &result, cap, output)
         }
         Prepared::Sentiment(plan) => {
-            let result = session.engine.execute_int8_sentiment(&model, plan, SentimentHostLimits {
+            let host = SentimentHostLimits {
                 native: session.native(&common)?, preparation_reserve_bytes: limits.preparation_bytes,
                 max_model_work: command.args.work_ceiling(),
-            }, cancellation).map_err(|_| CandidateError::Execution)?;
+            };
+            let result = match prefill {
+                Some(prefill) => session.engine.execute_int8_sentiment_layer_major(&model, plan, host, prefill, cancellation),
+                None => session.engine.execute_int8_sentiment(&model, plan, host, cancellation),
+            }.map_err(|_| CandidateError::Execution)?;
             deliver(&session, &facts, &result, cap, output)
         }
     }

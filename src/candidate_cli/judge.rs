@@ -4,12 +4,14 @@ use serde::Deserialize;
 use crate::{native_engine::lmhead::scoring::ScoringLimits,
     tasks::{ir::TaskBudget, judge::{JudgeLimits, JudgeRequest, PairwisePolicy,
         RubricDefinition, RubricPolicy, FaithfulnessPolicy, partition_evidence}}};
-use super::scored::ScoredArgs;
+use super::scored::{ScoredArgs, prefill::ScoringPrefillArgs};
 
 #[derive(Args)]
 pub(crate) struct JudgeCommand {
     #[command(flatten)]
     pub(super) args: ScoredArgs,
+    #[command(flatten)]
+    pub(super) prefill: ScoringPrefillArgs,
 }
 
 pub(super) fn definition() -> clap::Command {
@@ -19,6 +21,7 @@ pub(super) fn definition() -> clap::Command {
 }
 impl JudgeCommand {
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
+        self.prefill.limits()?;
         let (common, limits) = self.args.common()?;
         #[cfg(feature = "asupersync-runtime")]
         { runtime::judgment::execute(self, common, limits, input, output) }
