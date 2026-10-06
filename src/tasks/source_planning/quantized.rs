@@ -14,15 +14,18 @@ use crate::{
     tasks::{
         answer::{Int8AnswerFinalizer, ANSWER_TASK_VERSION},
         extract::{ExtractResult, quantized::{self as extract_int8, Int8ExtractPlan, Int8ExtractRun,
-            Int8ExtractError, INT8_EXTRACT_VERSION}},
+            Int8ExtractError}},
         keyphrases::{self, KEYPHRASES_TASK_VERSION},
         ner::{self, NER_TASK_VERSION},
         summarize::{self, SUMMARIZE_TASK_VERSION},
     },
 };
+#[cfg(test)] use crate::tasks::extract::quantized::INT8_EXTRACT_VERSION;
 
 pub mod long;
 pub mod capacity;
+mod selected;
+pub use selected::INT8_SPARSE_SOURCE_EXECUTION;
 
 pub const INT8_SOURCE_EXECUTION: &str = "portable-int8-source-portfolio-v1";
 
@@ -176,11 +179,11 @@ impl PreparedInt8SourceTask {
         self.extraction.execute_with(engine, admitted, vocabulary, work, control, |raw| self.finish(raw))
     }
     fn finish(&self, raw: Int8ExtractRun) -> Result<Int8SourceTaskRun, Int8SourceError> {
-        if raw.schema_version != 1 || raw.execution != INT8_EXTRACT_VERSION {
+        if raw.schema_version != 1 || raw.execution != self.extraction.execution_version() {
             return Err(Int8SourceError::InvalidResult);
         }
         let result = self.finalizer.finish(raw.result, self.max_result_bytes())?;
-        let run = Int8SourceTaskRun { schema_version: 1, execution: INT8_SOURCE_EXECUTION.to_owned(),
+        let run = Int8SourceTaskRun { schema_version: 1, execution: self.execution_version().to_owned(),
             result, model_work: raw.model_work };
         extract_int8::check_size(&run, self.max_result_bytes())?;
         Ok(run)
