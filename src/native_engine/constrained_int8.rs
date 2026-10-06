@@ -309,3 +309,4 @@ fn run<V: Vocabulary, D: Driver>(prompt: &[u32], program: &JsonProgram, vocabula
 }
 
 #[cfg(test)] mod tests;
+pub mod sparse;
