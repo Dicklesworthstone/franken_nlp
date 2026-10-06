@@ -6,6 +6,7 @@
 //! does not replace the full-vocabulary reference or certify model parity.
 use super::*;
 mod selection;
+pub mod prefill;
 pub mod cohort;
 
 pub const INT8_SPARSE_JSON_EXECUTION: &str = "portable-int8-grammar-first-selected-rows-v1";
@@ -45,20 +46,26 @@ pub(crate) fn decode_json_int8_sparse_with<C, T, E, F>(engine: &mut StrictInt8En
     vocabulary: &VocabMaskOracle, options: &JsonDecodeOptions, budget: Int8JsonBudget,
     limits: Int8JsonSparseLimits, control: &mut C, finalize: F) -> Result<T, E>
 where C: DecodeStepControl, E: From<Int8JsonError>, F: FnOnce(Int8JsonRun) -> Result<T, E> {
-    check_model(identity, engine.artifact_identity()).map_err(E::from)?;
-    if engine.profile() != STRICT_INT8_PROFILE || engine.is_poisoned() {
-        return Err(E::from(StrictInt8Error::EngineUnavailable.into()));
-    }
-    if !engine.kv_cache().all_slots_have_len(0) {
-        return Err(E::from(JsonDecodeError::EngineAlreadyPrimed.into()));
-    }
-    if vocabulary.width() != NANBEIGE_VOCAB_SIZE {
-        return Err(E::from(JsonDecodeError::InvalidRequest("model/tokenizer vocabulary mismatch").into()));
-    }
-    let work = preflight(prompt, vocabulary, options, budget, limits).map_err(E::from)?;
-    check_capacity(work, engine.kv_cache().capacity_positions(), budget.json.max_kv_bytes).map_err(E::from)?;
+    check_request(engine, identity, prompt, vocabulary, options, budget, limits).map_err(E::from)?;
     let mut session = engine.session(budget.native, control).map_err(Int8JsonError::from).map_err(E::from)?;
     drive(prompt, program, vocabulary, options, budget, limits, &mut session, finalize)
+}
+
+fn check_request(engine: &StrictInt8Engine<'_>, identity: &ExecutionIdentity, prompt: &[u32],
+    vocabulary: &VocabMaskOracle, options: &JsonDecodeOptions, budget: Int8JsonBudget,
+    limits: Int8JsonSparseLimits) -> Result<(), Int8JsonError> {
+    check_model(identity, engine.artifact_identity())?;
+    if engine.profile() != STRICT_INT8_PROFILE || engine.is_poisoned() {
+        return Err(StrictInt8Error::EngineUnavailable.into());
+    }
+    if !engine.kv_cache().all_slots_have_len(0) {
+        return Err(JsonDecodeError::EngineAlreadyPrimed.into());
+    }
+    if vocabulary.width() != NANBEIGE_VOCAB_SIZE {
+        return Err(JsonDecodeError::InvalidRequest("model/tokenizer vocabulary mismatch").into());
+    }
+    let work = preflight(prompt, vocabulary, options, budget, limits)?;
+    check_capacity(work, engine.kv_cache().capacity_positions(), budget.json.max_kv_bytes)
 }
 
 fn preflight<V: Vocabulary>(prompt: &[u32], vocabulary: &V, options: &JsonDecodeOptions,
@@ -95,6 +102,15 @@ trait Driver {
     type Control: DecodeStepControl;
     fn control(&mut self) -> &mut Self::Control;
     fn append(&mut self, token: u32) -> Result<(), Int8JsonError>;
+    fn append_prompt(&mut self, prompt: &[u32]) -> Result<(), Int8JsonError> {
+        for (index, &token) in prompt.iter().enumerate() {
+            if let Some(cause) = self.control().prefill_checkpoint(index) {
+                return Err(JsonDecodeError::Cancelled(cause).into());
+            }
+            self.append(token)?;
+        }
+        Ok(())
+    }
     fn logits(&mut self, rows: &[u32]) -> Result<Vec<f32>, Int8JsonError>;
     fn work(&self) -> Int8Work;
     fn abort(&mut self);
@@ -173,10 +189,7 @@ fn run<V: Vocabulary, D: Driver>(prompt: &[u32], program: &JsonProgram, vocabula
     tokens.try_reserve_exact(options.max_new_tokens).map_err(|_| JsonDecodeError::AllocationRefused)?;
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(program.max_output_bytes()).map_err(|_| JsonDecodeError::AllocationRefused)?;
-    for (index, &token) in prompt.iter().enumerate() {
-        if let Some(cause) = driver.control().prefill_checkpoint(index) { return Err(JsonDecodeError::Cancelled(cause).into()); }
-        driver.append(token)?;
-    }
+    driver.append_prompt(prompt)?;
     let mut positions = prompt.len();
     let mut projected = 0_usize;
     let mut charged = 0_u64;

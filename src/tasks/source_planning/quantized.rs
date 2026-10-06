@@ -179,6 +179,16 @@ impl PreparedInt8SourceTask {
         checkpoint(control)?;
         self.extraction.execute_with(engine, admitted, vocabulary, work, control, |raw| self.finish(raw))
     }
+    /// The same source/task finalizer runs inside the grouped native session.
+    /// Full and selected-row head policies both compose with this scheduling
+    /// option. Extra workspace must be held by the embedding admission owner.
+    pub fn execute_layer_major_with_control<C: DecodeStepControl>(&self, admitted: &ExecutionIdentity,
+        engine: &mut StrictInt8Engine<'_>, vocabulary: &ExtractionVocabulary, work: Int8JsonBudget,
+        prefill: crate::native_engine::strict_int8::prefill::Int8PrefillLimits,
+        control: &mut C) -> Result<Int8SourceTaskRun, Int8SourceError> {
+        checkpoint(control)?;
+        self.extraction.execute_layer_major_with(engine, admitted, vocabulary, work, prefill, control, |raw| self.finish(raw))
+    }
     fn finish(&self, raw: Int8ExtractRun) -> Result<Int8SourceTaskRun, Int8SourceError> {
         if raw.schema_version != 1 || raw.execution != self.extraction.execution_version() {
             return Err(Int8SourceError::InvalidResult);

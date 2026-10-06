@@ -15,6 +15,7 @@ use crate::native_engine::{
 
 mod completed;
 mod projection;
+mod prefill;
 pub mod cohort;
 pub use projection::INT8_SPARSE_EXTRACT_VERSION;
 
@@ -142,22 +143,10 @@ impl Int8ExtractPlan {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn execute_with<C, T, E, F>(&self, engine: &mut StrictInt8Engine<'_>,
         admitted: &ExecutionIdentity, vocabulary: &ExtractionVocabulary,
-        mut budget: Int8JsonBudget, control: &mut C, finalize: F) -> Result<T, E>
+        budget: Int8JsonBudget, control: &mut C, finalize: F) -> Result<T, E>
     where C: DecodeStepControl, E: From<Int8ExtractError> + From<Int8JsonError>,
         F: FnOnce(Int8ExtractRun) -> Result<T, E> {
-        self.verify_identity(admitted).map_err(E::from)?;
-        if vocabulary.controls != self.extraction.controls {
-            return Err(E::from(Int8ExtractError::from(ExtractError::Contract(
-                "vocabulary control registry differs from int8 plan"))));
-        }
-        budget.json.max_kv_bytes = budget.json.max_kv_bytes.min(self.extraction.max_kv_bytes);
-        let finish = |run| finalize(self.finalize(run).map_err(E::from)?);
-        match self.selected_rows {
-            Some(limits) => selected_head::decode_json_int8_sparse_with(engine, admitted, &self.extraction.prompt,
-                &self.extraction.program, &vocabulary.oracle, &self.extraction.options, budget, limits, control, finish),
-            None => constrained_int8::decode_json_int8_with(engine, admitted, &self.extraction.prompt,
-                &self.extraction.program, &vocabulary.oracle, &self.extraction.options, budget, control, finish),
-        }
+        self.execute_with_prefill(engine, admitted, vocabulary, budget, None, control, finalize)
     }
 
     fn finalize(&self, run: Int8JsonRun) -> Result<Int8ExtractRun, Int8ExtractError> {
