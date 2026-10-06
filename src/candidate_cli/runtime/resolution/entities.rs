@@ -22,6 +22,7 @@ fn check_result(result: &Int8EntityRun, expected: Expected) -> Result<(), Candid
 }
 pub(super) fn execute(command: ResolveCommand, common: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
+    let prefill = command.prefill.limits()?;
     if command.discovery.long.chunked { return long::execute(command, common, limits, input, output); }
     let session = Session::new(&common, limits)?;
     let text = session.read(&common.input, input, common.max_input_bytes)?;
@@ -36,6 +37,12 @@ pub(super) fn execute(command: ResolveCommand, common: CandidateArgs, limits: Li
     // these witnesses through the host handoff; no borrowed source can drift.
     let prepared = entities_int8::prepare_int8_entities(raw.documents, Arc::new(source), source_identity,
         Arc::new(resolver), resolution_identity, config, &mut session.control()).map_err(|_| CandidateError::Planning)?;
+    // Bind once before model admission. The host derives and retains this
+    // workspace for BOTH NER and resolution, rather than a stage-local flag.
+    let prepared = match prefill {
+        Some(limits) => prepared.with_layer_major_prefill(limits).map_err(|_| CandidateError::Planning)?,
+        None => prepared,
+    };
     let expected = Expected::of(&prepared);
     if expected.documents == 0 {
         let result = prepared.finalize_without_model(&mut session.control()).map_err(|_| CandidateError::Execution)?;

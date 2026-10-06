@@ -7,6 +7,7 @@ use crate::{candidate_cli::CandidateError, native_engine::strict_int8::prefill::
 pub(in crate::candidate_cli) struct ScoringPrefillArgs {
     /// Opt into layer-major INT8 prompt processing, 1..=64 tokens per morsel.
     /// Each scoring head keeps its complete candidate language and work budget.
+    /// Entity discovery also applies this schedule to every NER prompt/chunk.
     /// Extra scratch is process-admitted; omitted keeps serial prompt execution.
     #[arg(long, value_name = "ROWS")]
     prefill_rows: Option<usize>,
@@ -100,10 +101,17 @@ mod tests {
         assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
     #[test]
-    fn automatic_entity_discovery_cannot_ignore_an_unsupported_override() {
-        let error = definition().try_get_matches_from(["candidate", "resolve", "--model", "missing.fnlpq",
-            "--memory-mib", "8192", "--prefill-rows", "4", "--discover-entities"]).unwrap_err();
-        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    fn automatic_entity_discovery_accepts_explicit_prefill_for_whole_and_chunked_documents() {
+        for chunked in [false, true] {
+            for width in ["1", "4", "64"] {
+                let mut extra = vec!["--discover-entities", "--prefill-rows", width, "--graph-reserve-mib", "256"];
+                if chunked { extra.push("--chunked"); }
+                let CandidateCommand::Resolve(command) = command("resolve", &extra) else { unreachable!() };
+                assert!(command.validate().is_ok());
+                assert!(command.discovery.discover_entities); assert_eq!(command.discovery.long.chunked, chunked);
+                assert_eq!(command.prefill.limits().unwrap().unwrap().max_batch_rows, width.parse::<usize>().unwrap());
+            }
+        }
     }
     #[test]
     fn scored_scheduling_never_exposes_free_generation_controls() {
@@ -113,5 +121,27 @@ mod tests {
                     "--memory-mib", "8192", "--prefill-rows", "4", switch, "1"]).is_err());
             }
         }
+    }
+    #[test]
+    fn discovery_rejects_bad_prefill_before_any_document_or_model_read() {
+        struct NeverRead;
+        impl Read for NeverRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("discovery must validate before IO") }
+        }
+        for chunked in [false, true] {
+            for width in ["0", "65"] {
+                let mut extra = vec!["--discover-entities", "--prefill-rows", width];
+                if chunked { extra.push("--chunked"); }
+                let CandidateCommand::Resolve(command) = command("resolve", &extra) else { unreachable!() };
+                let mut output = Vec::new();
+                assert!(matches!(command.execute(&mut NeverRead, &mut output), Err(CandidateError::Arguments)));
+                assert!(output.is_empty());
+            }
+        }
+    }
+    #[test]
+    fn prefill_does_not_implicitly_enable_discovery_for_chunked_requests() {
+        assert!(definition().try_get_matches_from(["candidate", "resolve", "--model", "missing.fnlpq",
+            "--memory-mib", "8192", "--prefill-rows", "4", "--chunked"]).is_err());
     }
 }

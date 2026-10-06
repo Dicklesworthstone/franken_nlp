@@ -44,13 +44,11 @@ pub(super) struct Input {
 pub(super) fn definition() -> clap::Command {
     ResolveCommand::augment_args(clap::Command::new("resolve")
         .about("Resolve exact source-anchored mentions across a bounded document snapshot")
-        .after_help("Input is {documents:[{id,text,mentions:[{entity_type,surface,span}]}],options:{blocking,context_scalars,minimum_margin_milli}}. Original source and byte/scalar offsets are required. Lexical overlap only selects candidates; both model presentation orders must agree, and complete-link clustering refuses missing or conflicting cross-pairs. Scores are uncalibrated and cluster IDs are snapshot-local. Add --discover-entities for raw {id,text} documents and optional top-level ner options. Without that flag, explicit mentions are required. Neither mode truncates an oversized graph. --prefill-rows currently requires explicit mentions; it cannot be combined with --discover-entities."))
-        .mut_arg("prefill_rows", |arg| arg.conflicts_with("discover_entities"))
+        .after_help("Input is {documents:[{id,text,mentions:[{entity_type,surface,span}]}],options:{blocking,context_scalars,minimum_margin_milli}}. Original source and byte/scalar offsets are required. Lexical overlap only selects candidates; both model presentation orders must agree, and complete-link clustering refuses missing or conflicting cross-pairs. Scores are uncalibrated and cluster IDs are snapshot-local. Add --discover-entities for raw {id,text} documents and optional top-level ner options. Without that flag, explicit mentions are required. Neither mode truncates an oversized graph. --prefill-rows applies to every pair-scoring prompt and, with discovery, every NER prompt or NER chunk. It changes neither the chunk partition nor the whole-snapshot work allowance."))
 }
 impl ResolveCommand {
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), CandidateError> {
-        let prefill = self.prefill.limits()?;
-        if prefill.is_some() && self.discovery.discover_entities { return Err(CandidateError::Arguments); }
+        self.prefill.limits()?;
         let (common, limits) = self.host.common()?;
         if !(1..=4096).contains(&self.max_documents) || !(1..=16_384).contains(&self.max_mentions)
             || self.max_pairs > 65_536 || self.max_pair_visits == 0 || self.max_pair_visits > 1_000_000_000
