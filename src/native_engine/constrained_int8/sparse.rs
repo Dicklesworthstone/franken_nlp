@@ -6,6 +6,7 @@
 //! does not replace the full-vocabulary reference or certify model parity.
 use super::*;
 mod selection;
+pub mod cohort;
 
 pub const INT8_SPARSE_JSON_EXECUTION: &str = "portable-int8-grammar-first-selected-rows-v1";
 
