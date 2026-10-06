@@ -118,6 +118,7 @@ fn prepare(planner: &SourceTaskPlanner, facts: &ArtifactIdentity, request: &Sour
 
 pub(in crate::candidate_cli) fn execute(command: SourceCommand, args: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
+    let prefill = command.args.prefill.limits()?;
     let session = Session::new(&args, limits)?;
     let text = session.read(&command.args.input, input, args.max_input_bytes)?;
     let options = command.args.options.as_ref()
@@ -134,10 +135,16 @@ pub(in crate::candidate_cli) fn execute(command: SourceCommand, args: CandidateA
     session.remaining()?;
     let cancellation = CancellationToken::default();
     let model = session.load(&args, limits, &facts, cancellation.clone())?;
-    let result = session.engine.execute_int8_source(&model, prepared, Arc::new(vocabulary), SourceLimits {
+    let native_limits = SourceLimits {
         native: session.native(&args)?, preparation_reserve_bytes: limits.preparation_bytes,
         mask_limits: command.args.host.masks(), max_mask_node_visits: command.args.host.max_mask_node_visits,
-    }, cancellation).map_err(|_| CandidateError::Execution)?;
+    };
+    let vocabulary = Arc::new(vocabulary);
+    let result = match prefill {
+        Some(prefill) => session.engine.execute_int8_source_layer_major(&model, prepared,
+            vocabulary, native_limits, prefill, cancellation),
+        None => session.engine.execute_int8_source(&model, prepared, vocabulary, native_limits, cancellation),
+    }.map_err(|_| CandidateError::Execution)?;
     session.remaining()?;
     let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
         evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,
@@ -218,6 +225,29 @@ mod tests {
             assert_eq!(selected.execution_identity().schema_digest, id.schema_digest);
             assert!(selected.verify_identity(&id).is_err());
             selected.verify_identity(selected.execution_identity()).unwrap();
+        }
+    }
+    #[test]
+    fn prefill_scheduling_composes_with_sealed_heads_without_changing_task_identity() {
+        let (planner, _) = planner().unwrap();
+        for kind in [Kind::Ner, Kind::Keyphrases, Kind::Summarize, Kind::Answer] {
+            let cmd = command::tests::command(kind.name(), &["--prefill-rows", "4", "--selected-rows", "32"]);
+            let (_, limits) = cmd.args.host.common(cmd.args.input.clone()).unwrap();
+            let text = if kind == Kind::Answer {
+                r#"{"question":"Who?","passages":[{"id":"p1","text":"Alice"}]}"#.to_owned()
+            } else { "Alice é 上海".to_owned() };
+            let request = command::request(kind, text, None, cmd.args.host.task_budget(limits), 65536).unwrap();
+            let mut control = PreparationControl { started: Instant::now(), elapsed_limit: Duration::from_secs(3600) };
+            let prepared = cmd.args.head.source(prepare(&planner, &facts(), &request, &cmd.args.host, &mut control).unwrap()).unwrap();
+            let identity = prepared.execution_identity().clone(); let work = prepared.planned_work();
+            let prefill = cmd.args.prefill.limits().unwrap().unwrap();
+            assert_eq!(prefill.max_batch_rows, 4); prefill.validate().unwrap();
+            assert_eq!(prepared.selected_rows().unwrap().max_rows_per_step, 32);
+            prepared.verify_identity(&identity).unwrap(); assert_eq!(prepared.planned_work(), work);
+            let serial = command::tests::command(kind.name(), &["--selected-rows", "32"]);
+            let other = serial.args.head.source(prepare(&planner, &facts(), &request, &serial.args.host, &mut control).unwrap()).unwrap();
+            assert!(serial.args.prefill.limits().unwrap().is_none());
+            assert_eq!(other.execution_identity(), &identity); assert_eq!(other.planned_work(), work);
         }
     }
 }

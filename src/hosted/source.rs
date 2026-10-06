@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     grammar::mask::MaskWorkLimits,
-    native_engine::{constrained::JsonWorkBudget, strict_int8::Int8Work},
+    native_engine::{constrained::JsonWorkBudget, strict_int8::{Int8Work, prefill::Int8PrefillLimits}},
     tasks::{ir::TaskBudget, source_planning::quantized::{
         Int8SourceTaskRun, PreparedInt8SourceTask}},
 };
@@ -33,20 +33,37 @@ impl NlpEngine {
     pub fn execute_int8_source(&self, model: &ResidentInt8, prepared: PreparedInt8SourceTask,
         vocabulary: Arc<ExtractionVocabulary>, limits: SourceLimits, cancellation: CancellationToken)
         -> Result<HostedOutput<Int8SourceTaskRun>, HostedError> {
+        self.execute_int8_source_inner(model, prepared, vocabulary, limits, None, cancellation)
+    }
+
+    /// Opt-in source-task prefill using bounded layer-major INT8 prompt morsels.
+    /// The derived extra workspace is charged to the SAME process ledger and
+    /// retained with native scratch through task finalization and physical
+    /// completion. Neither the serial default nor the sealed head policy changes.
+    pub fn execute_int8_source_layer_major(&self, model: &ResidentInt8, prepared: PreparedInt8SourceTask,
+        vocabulary: Arc<ExtractionVocabulary>, limits: SourceLimits, prefill: Int8PrefillLimits,
+        cancellation: CancellationToken) -> Result<HostedOutput<Int8SourceTaskRun>, HostedError> {
+        self.execute_int8_source_inner(model, prepared, vocabulary, limits, Some(prefill), cancellation)
+    }
+
+    fn execute_int8_source_inner(&self, model: &ResidentInt8, prepared: PreparedInt8SourceTask,
+        vocabulary: Arc<ExtractionVocabulary>, limits: SourceLimits, prefill: Option<Int8PrefillLimits>,
+        cancellation: CancellationToken) -> Result<HostedOutput<Int8SourceTaskRun>, HostedError> {
         dispatch::preflight(self, limits.native.run)?;
         self.check_resident_domain(model)?;
         check_model_identity(model.artifact_identity(), prepared.execution_identity())?;
         let required = requirements(limits.native)?;
         let work = prepared.planned_work();
         validate(limits, prepared.task_budget(), work, required.kv_bytes)?;
+        let scratch_bytes = source_scratch(sum(&[required.rope_bytes, required.scratch_payload_bound,
+            limits.native.allocator_reserve_bytes])?, prefill)?;
         let lease = self.resources().acquire_lease();
         let output = output_claim(&lease, prepared.max_result_bytes(),
             u64::from(prepared.task_budget().max_output_tokens))?;
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers,
             limits.preparation_reserve_bytes)?, || Ok(SourceInput { prepared, vocabulary }))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-        let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-            sum(&[required.rope_bytes, required.scratch_payload_bound, limits.native.allocator_reserve_bytes])?)?;
+        let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, scratch_bytes)?;
         let model = model.clone();
         dispatch::run(self, limits.native.run, cancellation, move |control| {
             // Capture the entire Charged aggregate, not separately captured
@@ -62,15 +79,26 @@ impl NlpEngine {
             // allocate() preserves the output claim through native execution,
             // source validation, typed finalization and post-result commit. A
             // commit failure drops the result before returning its charge.
-            let result = allocate(output, || input.value.prepared.execute_with_control(
-                input.value.prepared.execution_identity(), &mut engine.value, &input.value.vocabulary, budget, control)
-                .map_err(HostedError::Source))?;
+            let result = allocate(output, || match prefill {
+                Some(prefill) => input.value.prepared.execute_layer_major_with_control(
+                    input.value.prepared.execution_identity(), &mut engine.value, &input.value.vocabulary,
+                    budget, prefill, control),
+                None => input.value.prepared.execute_with_control(input.value.prepared.execution_identity(),
+                    &mut engine.value, &input.value.vocabulary, budget, control),
+            }.map_err(HostedError::Source))?;
             drop(engine);
             drop(input);
             drop(lease);
             Ok(GuardedOutput::new(result.value, result._memory))
         })
     }
+}
+
+// Validate before acquiring request reservations. The native geometry owns
+// the derived payload bound; callers cannot underprice it with a small cap.
+fn source_scratch(ordinary: u64, prefill: Option<Int8PrefillLimits>) -> Result<u64, HostedError> {
+    let extra = prefill.map(Int8PrefillLimits::validate).transpose().map_err(HostedError::Native)?.unwrap_or(0);
+    sum(&[ordinary, extra])
 }
 
 fn validate(limits: SourceLimits, budget: TaskBudget, work: Int8Work, actual_kv_bytes: u64)
@@ -129,5 +157,29 @@ mod tests {
     fn preparation_capture_and_native_output_can_cross_the_owned_runtime_boundary() {
         fn send<T: Send + 'static>() {}
         send::<SourceInput>(); send::<Int8SourceTaskRun>();
+    }
+    #[test]
+    fn source_prefill_adds_its_derived_payload_without_discounting_native_scratch() {
+        let ordinary = 123_456_u64;
+        assert_eq!(source_scratch(ordinary, None).unwrap(), ordinary);
+        for rows in [1, 4, 64] {
+            let extra = Int8PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
+            let limits = Int8PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: extra };
+            assert_eq!(source_scratch(ordinary, Some(limits)).unwrap(), ordinary + extra);
+            let short = Int8PrefillLimits { max_extra_scratch_bytes: extra - 1, ..limits };
+            assert!(source_scratch(ordinary, Some(short)).is_err());
+        }
+    }
+    #[test]
+    fn invalid_prefill_geometry_and_aggregate_scratch_overflow_refuse() {
+        for rows in [0, 65, usize::MAX] {
+            assert!(source_scratch(1, Some(Int8PrefillLimits {
+                max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX,
+            })).is_err());
+        }
+        let limits = Int8PrefillLimits { max_batch_rows: 4,
+            max_extra_scratch_bytes: Int8PrefillLimits::required_extra_scratch_bytes(4).unwrap() };
+        assert!(source_scratch(u64::MAX, Some(limits)).is_err());
+        assert_eq!(source_scratch(u64::MAX, None).unwrap(), u64::MAX);
     }
 }

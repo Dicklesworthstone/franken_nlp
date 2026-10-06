@@ -1,6 +1,7 @@
 //! Bounded CLI controls for the existing identity-bound generation processor.
 //!
-//! Structured/scored task commands do not expose these switches. Stops use
+//! Structured/scored tasks do not inherit free-text sampling controls; source
+//! tasks separately expose their supported prefill scheduling option. Stops use
 //! the native exact-suffix contract: bytes are retained and streaming never
 //! retracts content. Minimum length delays EOS and byte-stop completion, not budgets.
 use super::{CandidateError, GenerationOptions};
@@ -247,8 +248,8 @@ mod tests {
         }
     }
     #[test]
-    fn unimplemented_structured_prefill_routes_cannot_silently_ignore_the_switch() {
-        for task in ["ner", "keyphrases", "summarize", "answer", "classify", "sentiment"] {
+    fn unimplemented_scored_prefill_routes_cannot_silently_ignore_the_switch() {
+        for task in ["classify", "sentiment"] {
             assert!(definition().try_get_matches_from(["candidate", task,
                 "--model", "local.fnlpq", "--memory-mib", "8192", "--prefill-rows", "4"]).is_err());
         }
