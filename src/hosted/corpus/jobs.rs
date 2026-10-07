@@ -172,7 +172,7 @@ impl NlpEngine {
 
 // Shared ordered job lifecycle, not a public fake-native injection surface.
 // Production uses sealed source/extraction/scored processors + process admission.
-fn run_population<P: DurableBatchProcessor, C: DecodeStepControl>(request: SourceJobRequest,
+pub(super) fn run_population<P: DurableBatchProcessor, C: DecodeStepControl>(request: SourceJobRequest,
     population: &JobPopulation, processor: P, control: &mut C) -> Result<JobProgress, JobRunError> {
     let SourceJobRequest { root, key, job_id, limits, mode, materialize } = request;
     let inputs = population.borrowed_inputs()?;

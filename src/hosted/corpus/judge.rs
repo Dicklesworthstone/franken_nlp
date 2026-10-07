@@ -2,12 +2,16 @@
 //! One resident native engine; complete per-document judgments, no retries.
 
 use super::*;
+mod planning;
+#[cfg(test)] use crate::native_engine::decode::DecodeCancellationKind;
+#[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod jobs;
 use crate::{
     batch::{BatchDocument, BatchFault, BatchProcessor, BatchWork, judge::JudgeBatchArgs},
     native_engine::{constrained_int8::check_profile,
-        decode::{DecodeCancellationKind, DecodeStepControl},
+        decode::DecodeStepControl,
         lmhead::scoring::ScoringError,
-        strict_int8::{StrictInt8Engine, scoring::{Int8ScoringBudget, Int8ScoringError}}},
+        strict_int8::{StrictInt8Engine, prefill::Int8PrefillLimits, scoring::{Int8ScoringBudget, Int8ScoringError}}},
     tasks::{ir::{PlanContext, TaskBudget}, judge::{JudgeError, JudgeLimits, JudgePlanner,
         quantized::{Int8JudgeError, Int8JudgeRun, PreparedInt8Judge}}},
 };
@@ -33,22 +37,39 @@ impl NlpEngine {
         planner: Arc<JudgePlanner>, config: JudgeCorpusConfig, limits: CorpusLimits,
         reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        self.batch_int8_judge_scheduled(model, planner, config, limits, None, reader, writer, cancellation)
+    }
+    /// Bounded prompt groups for every comparison order, criterion and evidence
+    /// window. This does not batch documents or change the score space.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int8_judge_layer_major<R, W>(&self, model: &ResidentInt8,
+        planner: Arc<JudgePlanner>, config: JudgeCorpusConfig, limits: CorpusLimits,
+        prefill: Int8PrefillLimits, reader: R, writer: W, cancellation: CancellationToken)
+        -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        self.batch_int8_judge_scheduled(model, planner, config, limits, Some(prefill), reader, writer, cancellation)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn batch_int8_judge_scheduled<R, W>(&self, model: &ResidentInt8,
+        planner: Arc<JudgePlanner>, config: JudgeCorpusConfig, limits: CorpusLimits,
+        prefill: Option<Int8PrefillLimits>, reader: R, writer: W, cancellation: CancellationToken)
+        -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
         dispatch::preflight(self, limits.native.run)?;
         self.check_resident_domain(model)?;
         check_model_identity(model.artifact_identity(), &config.identity)?;
-        check_binding(&config.identity, planner.template_digest(), planner.tokenizer_digest())?;
-        config.task_ceiling.validate().map_err(|_| HostedError::Limits("judge corpus task ceiling"))?;
-        validate_work(config.max_model_work)?;
+        config.validate(&planner)?;
         let required = requirements(limits.native)?;
         if required.kv_bytes > config.task_ceiling.max_kv_bytes {
             return Err(HostedError::Limits("judge corpus whole KV allocation"));
         }
+        let scratch_bytes = crate::hosted::scored::scoring_scratch(sum(&[required.rope_bytes,
+            required.scratch_payload_bound, limits.native.allocator_reserve_bytes])?, prefill)?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, limits.reservation_bytes()?)?,
             || Ok(StreamInput { planner: Some((planner, config)), reader, writer }))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-        let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-            sum(&[required.rope_bytes, required.scratch_payload_bound, limits.native.allocator_reserve_bytes])?)?;
+        let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch, scratch_bytes)?;
         let model = model.clone();
         dispatch::run(self, limits.native.run, cancellation, move |control| {
             // Preserve the entire storage-before-charge package if queued work
@@ -63,7 +84,7 @@ impl NlpEngine {
             let result = {
                 let ledger = WorkLedger::new(config.max_model_work);
                 let mut processor = JudgeProcessor { planner: &planner, config,
-                    engine: &mut engine.value, admission, ledger };
+                    engine: &mut engine.value, admission, ledger, prefill };
                 batch::run_ndjson(&mut input.value.reader, &mut input.value.writer,
                     &mut processor, limits.transport, control).map_err(HostedError::Batch)
             };
@@ -90,29 +111,29 @@ struct JudgeProcessor<'p, 'e, 'w, 'a> {
     engine: &'e mut StrictInt8Engine<'w>,
     admission: CorpusAdmission<'a>,
     ledger: WorkLedger,
+    prefill: Option<Int8PrefillLimits>,
 }
 impl BatchProcessor for JudgeProcessor<'_, '_, '_, '_> {
     type Args = JudgeBatchArgs;
     type Prepared = PreparedInt8Judge;
     type Output = GuardedOutput<Int8JudgeRun, Pending>;
 
-    fn prepare(&mut self, document: BatchDocument<Self::Args>) -> Result<Self::Prepared, BatchItemFailure> {
+    fn prepare(&mut self, _: BatchDocument<Self::Args>) -> Result<Self::Prepared, BatchItemFailure> {
+        // Both stream and durable runners supply the SAME invocation control.
+        // Refuse an uncontrolled caller rather than invent an unlimited one.
+        Err(BatchItemFailure::fatal(BatchCode::InvalidExecution))
+    }
+    fn prepare_with_control<C: DecodeStepControl>(&mut self, document: BatchDocument<Self::Args>, control: &mut C)
+        -> Result<Self::Prepared, BatchItemFailure> {
         self.ledger.ready()?;
-        let args = document.task_args.or_else(|| self.config.defaults.clone())
-            .ok_or_else(|| BatchItemFailure::reject(BatchCode::Planning))?;
-        let context = PlanContext::new(&self.config.identity, self.config.task_ceiling)
-            .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
-        // The common runner checks cancellation around prepare. Its current
-        // trait does not lend control during planning; do not invent a renewed
-        // run budget or claim preemption within the bounded legacy tokenizer.
-        let prepared = self.planner.plan_int8_with_control(&args.into_request(document.text),
-            &context, self.config.planning, &mut PlanningControl).map_err(planning_failure)?;
+        let prepared = planning::prepare(self.planner, &self.config, document, control)?;
         self.ledger.preview(prepared.planned_work())?;
         if prepared.max_result_bytes() > self.admission.output_bytes {
             return Err(BatchItemFailure::reject(BatchCode::OutputLineLimit));
         }
         prepared.preflight(prepared.execution_identity(), self.engine,
             scoring_budget(&prepared, self.admission.kv_bytes)).map_err(planning_failure)?;
+        checkpoint(control)?;
         Ok(prepared)
     }
     fn planned_work(&self, prepared: &Self::Prepared) -> BatchWork {
@@ -129,8 +150,11 @@ impl BatchProcessor for JudgeProcessor<'_, '_, '_, '_> {
             let (admitted, guard) = self.admission.admit_output(prepared.execution_identity(),
                 prepared.planned_work(), self.admission.kv_bytes, 0, prepared.max_result_bytes())?;
             checkpoint(control)?;
-            let run = prepared.execute_with_control(&admitted, self.engine,
-                scoring_budget(&prepared, self.admission.kv_bytes), control);
+            let budget = scoring_budget(&prepared, self.admission.kv_bytes);
+            let run = match self.prefill {
+                Some(limits) => prepared.execute_layer_major_with_control(&admitted, self.engine, budget, limits, control),
+                None => prepared.execute_with_control(&admitted, self.engine, budget, control),
+            };
             let healthy = !self.engine.is_poisoned() && self.engine.kv_cache().all_slots_have_len(0);
             let run = run.map_err(|error| execution_outcome_failure(error, healthy))?;
             if !healthy || run.model_work != prepared.planned_work() || run.head_count != prepared.head_count() {
@@ -145,10 +169,6 @@ impl BatchProcessor for JudgeProcessor<'_, '_, '_, '_> {
 }
 fn scoring_budget(plan: &PreparedInt8Judge, allocated_kv: u64) -> Int8ScoringBudget {
     Int8ScoringBudget { native: Int8RunBudget::exact(plan.planned_work()), max_kv_bytes: allocated_kv }
-}
-struct PlanningControl;
-impl DecodeStepControl for PlanningControl {
-    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }
 }
 fn checkpoint<C: DecodeStepControl>(control: &mut C) -> Result<(), BatchItemFailure> {
     match control.prefill_checkpoint(0) {
