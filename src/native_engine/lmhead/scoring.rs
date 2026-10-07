@@ -13,6 +13,9 @@ use crate::tasks::ir::{Candidate, ScoreSpace};
 
 use super::NANBEIGE_VOCAB_SIZE;
 
+pub mod cursor;
+pub use cursor::{CandidateScoreCursor, CandidateScoreRequest};
+
 /// Terminal estimator used only by `sequence_score_softmax`.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -94,6 +97,7 @@ pub enum ScoringError {
     EosInsideContinuation,
     AllocationRefused,
     ProjectionFailed,
+    CursorState,
     ProjectionLength { expected: usize, actual: usize },
     NonFiniteLogit { row: usize },
 }
@@ -112,6 +116,7 @@ impl fmt::Display for ScoringError {
             Self::EosInsideContinuation => f.write_str("EOS is reserved for explicit termination"),
             Self::AllocationRefused => f.write_str("candidate scoring allocation refused"),
             Self::ProjectionFailed => f.write_str("candidate model projection failed"),
+            Self::CursorState => f.write_str("candidate scoring cursor is incomplete, poisoned or out of order"),
             Self::ProjectionLength { expected, actual } => {
                 write!(f, "candidate projection has {actual} rows; expected {expected}")
             }
@@ -290,9 +295,22 @@ impl CandidateScorer {
             max_projected_logits: limits.max_projected_logits })
     }
 
-    /// Score every terminal, evaluating each distinct nonterminal prefix once.
-    /// Any failed projection rejects the whole result; no partial success.
-    pub fn score<M: CandidateLogits>(
+    /// Score every terminal through the same split-phase cursor used by native
+    /// cohorts. The callback API remains serial; no raw logits are retained.
+    pub fn score<M: CandidateLogits>(&self, model: &mut M, mode: ScoringMode)
+        -> Result<CandidateScores, ScoringError> {
+        let mut cursor = self.cursor(mode)?;
+        while let Some(request) = cursor.request()? {
+            let ordinal = request.ordinal;
+            let logits = model.project(request.prefix, request.rows).map_err(|_| ScoringError::ProjectionFailed)?;
+            cursor.accept(ordinal, &logits)?;
+        }
+        cursor.finish()
+    }
+
+    /// Frozen pre-cursor implementation used only as a differential test oracle.
+    #[cfg(test)]
+    fn score_serial_reference<M: CandidateLogits>(
         &self,
         model: &mut M,
         mode: ScoringMode,
