@@ -95,6 +95,7 @@ pub(crate) struct CandidateArgs {
 pub(crate) enum CandidateCommand {
     Text { task: Task, args: CandidateArgs },
     TextBatch(text_batch::TextBatchCommand),
+    TextJob(jobs::generation::TextJobCommand),
     Source(source::SourceCommand),
     Scored(scored::ScoredCommand),
     Extract(extract::ExtractCommand),
@@ -127,6 +128,7 @@ pub(crate) fn definition() -> clap::Command {
         .subcommand(resolve::definition())
         .subcommand(stream::definition())
         .subcommand(text_batch::definition())
+        .subcommand(jobs::generation::definition())
         .subcommand(CandidateArgs::augment_args(clap::Command::new("generate")
             .about("Generate from a bounded UTF-8 prompt using the pinned chat template")))
         .subcommand(CandidateArgs::augment_args(clap::Command::new("chat")
@@ -137,6 +139,9 @@ impl CandidateCommand {
     pub(crate) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let (name, matches) = matches.subcommand().ok_or_else(||
             clap::Error::raw(clap::error::ErrorKind::MissingSubcommand, "candidate task required"))?;
+        if name == "text-job" {
+            return jobs::generation::TextJobCommand::from_arg_matches(matches).map(Self::TextJob);
+        }
         if name == "text-batch" {
             return text_batch::TextBatchCommand::from_arg_matches(matches).map(Self::TextBatch);
         }
@@ -192,6 +197,7 @@ impl CandidateCommand {
             Self::ScoreBatch(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::Job(command) => command.run_owned(io::stdin(), &mut io::stdout(), &mut io::stderr()),
             Self::ScoreJob(command) => command.run_owned(io::stdin(), &mut io::stdout(), &mut io::stderr()),
+            Self::TextJob(command) => command.run_owned(io::stdin(), &mut io::stdout(), &mut io::stderr()),
             Self::Stream(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::Redact(command) if command.corpus.ndjson => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             other => other.run(&mut io::stdin(), &mut io::stdout(), &mut io::stderr()),
@@ -224,7 +230,7 @@ impl CandidateCommand {
             Self::Resolve(command) => return command.execute(input, output),
             // A borrowed stream cannot outlive the hosted blocking closure.
             // The executable dispatcher always takes run_stdio for owned IO.
-            Self::Batch(_) | Self::ScoreBatch(_) | Self::Job(_) | Self::ScoreJob(_) | Self::Stream(_) => return Err(CandidateError::Arguments),
+            Self::Batch(_) | Self::ScoreBatch(_) | Self::Job(_) | Self::ScoreJob(_) | Self::TextJob(_) | Self::Stream(_) => return Err(CandidateError::Arguments),
             Self::Text { task, args } => (task, args),
         };
         let limits = args.validate()?;

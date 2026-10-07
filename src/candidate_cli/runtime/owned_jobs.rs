@@ -1,6 +1,7 @@
 //! Explicit candidate job execution; stored data never becomes stdout content.
 use super::*;
 pub(in crate::candidate_cli) mod scored;
+pub(in crate::candidate_cli) mod generation;
 use std::{io::{BufRead, BufReader}, sync::Arc};
 use super::source_tasks::{Session, source_identity};
 use crate::{
