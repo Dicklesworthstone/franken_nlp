@@ -19,7 +19,7 @@ pub(in crate::candidate_cli) struct CorpusArgs {
     /// Whole-stream input bytes in MiB, including blank/oversized lines (default 1024).
     #[arg(long, requires = "ndjson")]
     max_input_mib: Option<u64>,
-    /// All output bytes in MiB, including provenance and terminal frames (default 1024).
+    /// All live output bytes, or combined retained spool/materialization caps (default 1024 MiB).
     #[arg(long, requires = "ndjson")]
     max_output_mib: Option<u64>,
     /// NDJSON bytes before LF, including JSON syntax/escaping (default 1048576).
@@ -132,10 +132,14 @@ fn tighten(total: &mut u64, cap: Option<u64>, item: u64) -> Result<(), Candidate
 impl RedactCommand {
     pub(in crate::candidate_cli) fn run_owned<R: Read + Send + 'static, W: Write + Send + 'static>(self,
         input: R, output: W, diagnostics: &mut impl Write) -> ExitCode {
+        let retained = self.retention.store_results;
         match self.execute_owned(input, output) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 let _ = writeln!(diagnostics, "fnlp candidate redact: {}", error.message());
+                if retained {
+                    let _ = writeln!(diagnostics, "Durable progress may exist; preserve original inputs and keys, and explicitly authenticate/resume. No rollback is implied.");
+                }
                 error.exit_code()
             }
         }
@@ -144,6 +148,10 @@ impl RedactCommand {
         -> Result<(), CandidateError> {
         let (common, limits) = self.validate()?;
         let envelope = self.corpus.envelope(&self, limits)?;
+        if self.retention.store_results && !cfg!(all(feature = "asupersync-runtime", feature = "metadata-store",
+            target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))) {
+            return Err(CandidateError::Unavailable);
+        }
         #[cfg(feature = "asupersync-runtime")]
         { runtime::redaction::corpus::execute(self, common, limits, envelope, input, output) }
         #[cfg(not(feature = "asupersync-runtime"))]
