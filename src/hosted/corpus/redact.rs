@@ -2,6 +2,8 @@
 //! Reuse corpus IO ownership, resident weights, native scratch and admission.
 use super::*;
 mod long;
+#[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod jobs;
 use crate::tasks::{
     source_planning::SourceTaskPlanner,
     redact::{RedactError, RedactionRequest, pseudonym::Pseudonyms,
@@ -24,8 +26,8 @@ impl NlpEngine {
     /// every document and flush. Input task_args cannot change that policy.
     ///
     /// The host owns one runtime invocation and one native allocation for the
-    /// whole stream. No per-document host call, model reload, new scheduler,
-    /// rules-only fallback, durable resume or public CLI activation is implied.
+    /// whole stream. No per-document host call, model reload, new scheduler or
+    /// rules-only fallback. Retention uses the separate job_int8_redact method.
     #[allow(clippy::too_many_arguments)]
     pub fn batch_int8_redact<R, W>(&self, model: &ResidentInt8,
         planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
