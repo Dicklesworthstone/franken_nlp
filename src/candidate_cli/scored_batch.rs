@@ -4,16 +4,32 @@ use serde::Deserialize;
 use crate::{batch::{BatchLimits, BatchWork, classify::ClassificationBatchArgs},
     tasks::{classify::{ClassificationLabel, ClassificationMode, ClassificationPolicy},
         sentiment::{SentimentAxis, SentimentPolicy, batch::SentimentBatchArgs}, ir::TaskBudget}};
-use super::{scored::{Kind, ScoredArgs}, batch::{FRAME_ALLOWANCE, IO_BUFFER_BYTES}};
+use super::{scored::{ScoredArgs, prefill::ScoringPrefillArgs}, batch::{FRAME_ALLOWANCE, IO_BUFFER_BYTES}};
+use crate::native_engine::strict_int8::prefill::Int8PrefillLimits;
+
+mod judge;
+
+/// Bulk-task selection is distinct from the single classify/sentiment parser.
+/// Adding a bulk task must not make the single-request parser accept it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ScoreTask { Classify, Sentiment, Judge }
+impl ScoreTask {
+    pub(super) fn named(name: &str) -> Option<Self> {
+        match name { "classify" => Some(Self::Classify), "sentiment" => Some(Self::Sentiment),
+            "judge" => Some(Self::Judge), _ => None }
+    }
+}
 
 pub(super) const DEFAULTS_BYTES: usize = 1024 * 1024;
 
 #[derive(Args)]
 pub(crate) struct ScoreBatchCommand {
-    #[arg(long, value_parser = ["classify", "sentiment"])]
+    #[arg(long, value_parser = ["classify", "sentiment", "judge"])]
     pub(super) task: String,
     #[command(flatten)]
     pub(super) host: ScoredArgs,
+    #[command(flatten)]
+    pub(super) prefill: ScoringPrefillArgs,
     /// Local task settings, without document, budget, model or execution identity.
     #[arg(long, value_name = "FILE")]
     pub(super) defaults: Option<PathBuf>,
@@ -35,16 +51,19 @@ pub(super) struct ScoreEnvelope {
 }
 pub(super) fn definition() -> clap::Command {
     ScoreBatchCommand::augment_args(clap::Command::new("score-batch")
-        .about("Classify or score sentiment with one resident candidate INT8 model")
-        .long_about("Run a fixed finite-scoring task over bounded ordered NDJSON. All five model-work limits are WHOLE-RUN ceilings, not renewed per document or flush. Full-vocabulary candidate/EOS scoring, no generated-label shortcut, no network and no calibrated-confidence claim. Every event retains non-authoritative candidate provenance; any failed document causes a nonzero exit."))
+        .about("Classify, score sentiment or judge with one resident candidate INT8 model")
+        .long_about("Run a fixed finite-scoring task over bounded ordered NDJSON. All five model-work limits are WHOLE-RUN ceilings, not renewed per document or flush. Full-vocabulary candidate/EOS scoring, no generated-label shortcut, no network and no calibrated-confidence claim. Judge mode supports pairwise, rubric and whole-source faithfulness; text supplies A, the document or the complete source. --prefill-rows is an explicit judge-only grouped-prompt schedule; omitted preserves serial execution. Every event retains non-authoritative candidate provenance; any failed document causes a nonzero exit."))
         .mut_arg("input", |arg| arg.help("NDJSON {id,text,task_args?} records; '-' reads stdin without whole-file buffering"))
 }
 impl ScoreBatchCommand {
-    pub(super) fn kind(&self) -> Result<Kind, CandidateError> {
-        Kind::named(&self.task).ok_or(CandidateError::Arguments)
+    pub(super) fn kind(&self) -> Result<ScoreTask, CandidateError> {
+        ScoreTask::named(&self.task).ok_or(CandidateError::Arguments)
+    }
+    pub(super) fn prefill_limits(&self) -> Result<Option<Int8PrefillLimits>, CandidateError> {
+        corpus_prefill(self.kind()?, &self.prefill)
     }
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits, ScoreEnvelope), CandidateError> {
-        self.kind()?;
+        self.prefill_limits()?;
         let (args, limits) = self.host.common()?;
         if !(1..=100_000).contains(&self.max_requests)
             || self.max_line_bytes < self.host.max_input_bytes || self.max_line_bytes > 4 * 1024 * 1024
@@ -97,9 +116,18 @@ impl ScoreBatchCommand {
         parse_defaults(self.kind()?, &self.host, json, budget)
     }
 }
+/// Scheduling is explicit task capability, never silently inherited by a
+/// corpus adapter that cannot implement it. Resolve before any input/model IO.
+pub(super) fn corpus_prefill(kind: ScoreTask, args: &ScoringPrefillArgs)
+    -> Result<Option<Int8PrefillLimits>, CandidateError> {
+    let limits = args.limits()?;
+    if limits.is_some() && kind != ScoreTask::Judge { return Err(CandidateError::Arguments); }
+    Ok(limits)
+}
+
 /// Shared by live and durable scoring. Retention cannot change option parsing,
 /// candidate policies, fallback axes or the caller's exact label spellings.
-pub(super) fn parse_defaults(kind: Kind, host: &ScoredArgs, json: Option<&str>, budget: TaskBudget)
+pub(super) fn parse_defaults(kind: ScoreTask, host: &ScoredArgs, json: Option<&str>, budget: TaskBudget)
     -> Result<Defaults, CandidateError> {
     let value = json.map(|text| {
         if text.len() > DEFAULTS_BYTES { return Err(CandidateError::Input); }
@@ -107,8 +135,10 @@ pub(super) fn parse_defaults(kind: Kind, host: &ScoredArgs, json: Option<&str>, 
             max_depth: 8, max_string_bytes: DEFAULTS_BYTES,
         }).map_err(|_| CandidateError::Input)
     }).transpose()?;
+    budget.validate().map_err(|_| CandidateError::Arguments)?;
     Ok(match kind {
-        Kind::Classify => {
+        ScoreTask::Judge => return judge::defaults(value, host, budget),
+        ScoreTask::Classify => {
             let Some(value) = value else { return Ok(Defaults::Classify(None)); };
             let input: ClassificationDefaults = serde_json::from_value(value).map_err(|_| CandidateError::Input)?;
             let l = host.classification_limits();
@@ -131,7 +161,7 @@ pub(super) fn parse_defaults(kind: Kind, host: &ScoredArgs, json: Option<&str>, 
             Defaults::Classify(Some(ClassificationBatchArgs { labels: input.labels,
                 mode: input.mode, policy: input.policy, budget }))
         }
-        Kind::Sentiment => {
+        ScoreTask::Sentiment => {
             let input = match value { Some(value) => serde_json::from_value::<SentimentDefaults>(value)
                 .map_err(|_| CandidateError::Input)?, None => SentimentDefaults::default() };
             if input.axes.is_empty() || input.axes.len() > 4
@@ -145,6 +175,7 @@ pub(super) fn parse_defaults(kind: Kind, host: &ScoredArgs, json: Option<&str>, 
     })
 }
 pub(super) enum Defaults {
+    Judge(Option<crate::batch::judge::JudgeBatchArgs>),
     Classify(Option<ClassificationBatchArgs>),
     Sentiment { args: SentimentBatchArgs, policy: SentimentPolicy },
 }

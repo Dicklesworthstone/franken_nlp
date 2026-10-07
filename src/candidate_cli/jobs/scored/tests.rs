@@ -19,8 +19,8 @@ pub(in crate::candidate_cli) fn args(task: &str, extra: &[&str]) -> ScoreJobArgs
     command("start", task, extra).into_parts().1
 }
 #[test]
-fn both_scored_tasks_have_distinct_start_and_authenticated_resume_routes() {
-    for task in ["classify", "sentiment"] {
+fn all_scored_tasks_have_distinct_start_and_authenticated_resume_routes() {
+    for task in ["classify", "sentiment", "judge"] {
         let (mode, args) = command("start", task, &[]).into_parts();
         assert!(matches!(mode, RunMode::Start)); args.validate().unwrap();
         let (mode, args) = command("resume", task, &[]).into_parts();
@@ -39,7 +39,7 @@ fn scoring_jobs_cannot_accept_generation_schema_mask_or_start_repair_switches() 
         assert!(parse("start", "classify", &[flag, value]).is_err(), "{flag}");
     }
     assert!(parse("start", "classify", &["--discard-uncommitted-tail"]).is_err());
-    for task in ["generate", "extract", "ner", "judge"] {
+    for task in ["generate", "extract", "ner"] {
         assert!(parse("start", task, &[]).is_err());
     }
 }
@@ -94,9 +94,68 @@ fn unavailable_profile_refuses_before_key_defaults_input_or_output_io() {
         fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("output write") }
         fn flush(&mut self) -> io::Result<()> { panic!("output flush") }
     }
-    for task in ["classify", "sentiment"] {
+    for task in ["classify", "sentiment", "judge"] {
         let a = args(task, &["--defaults", "never-open.json"]);
         let error = execute_owned(RunMode::Start, a, NoIo, &mut NoIo).unwrap_err();
         assert_eq!(error.code, "owned_score_job_profile_unavailable");
+    }
+}
+
+#[test]
+fn retained_judge_defaults_are_identical_to_the_live_pipe_and_keep_host_budget() {
+    let job = args("judge", &[]); let (_, limits) = job.validate().unwrap(); let budget = job.host.budget(limits);
+    let live = crate::candidate_cli::scored_batch::tests::command("judge", &[]);
+    let text = r#"{"mode":"pairwise","criterion":"Exact facts","b":"Private café 上海","policy":{"minimum_margin_milli":100,"maximum_order_disagreement_milli":20000}}"#;
+    let scored_batch::Defaults::Judge(Some(a)) = job.parse_defaults(Some(text), budget).unwrap()
+        else { panic!("job defaults") };
+    let scored_batch::Defaults::Judge(Some(b)) = live.parse_defaults(Some(text), budget).unwrap()
+        else { panic!("live defaults") };
+    assert_eq!(serde_json::to_value(a).unwrap(), serde_json::to_value(b).unwrap());
+    let mut injected: serde_json::Value = serde_json::from_str(text).unwrap();
+    injected["budget"] = serde_json::to_value(budget).unwrap();
+    assert!(job.parse_defaults(Some(&injected.to_string()), budget).is_err());
+    assert!(matches!(job.parse_defaults(None, budget).unwrap(), scored_batch::Defaults::Judge(None)));
+}
+#[test]
+fn judgment_retention_and_transport_cannot_bypass_consent_or_native_ceilings() {
+    let mut a = args("judge", &[]); a.store_results = false; assert!(a.validate().is_err());
+    let a = args("judge", &[]);
+    let b = args("judge", &["--max-input-lines", "200000", "--max-stream-mib", "128"]);
+    a.validate().unwrap(); b.validate().unwrap();
+    assert_eq!(a.host.work_ceiling(), b.host.work_ceiling());
+    assert!(parse("start", "judge", &["--discard-uncommitted-tail"]).is_err());
+    assert!(parse("resume", "judge", &["--prefill-rows", "4"]).is_ok());
+}
+
+#[test]
+fn judgment_job_start_and_resume_preserve_the_same_explicit_schedule() {
+    let serial = args("judge", &[]);
+    assert!(serial.prefill_limits().unwrap().is_none());
+    for operation in ["start", "resume"] {
+        for rows in ["1", "4", "64"] {
+            let (_, a) = command(operation, "judge", &["--prefill-rows", rows]).into_parts();
+            let (_, l) = a.validate().unwrap();
+            let schedule = a.prefill_limits().unwrap().unwrap();
+            assert_eq!(schedule.max_batch_rows, rows.parse::<usize>().unwrap());
+            assert_eq!(schedule.max_extra_scratch_bytes, schedule.validate().unwrap());
+            assert_eq!(a.host.work_ceiling(), serial.host.work_ceiling());
+            assert_eq!(a.host.budget(l), serial.host.budget(serial.validate().unwrap().1));
+        }
+    }
+}
+#[test]
+fn unsupported_or_invalid_job_prefill_refuses_before_key_and_population_io() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("input read") } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("output write") }
+        fn flush(&mut self) -> io::Result<()> { panic!("output flush") }
+    }
+    for operation in ["start", "resume"] {
+        for (task, rows) in [("judge", "0"), ("judge", "65"), ("classify", "4"), ("sentiment", "4")] {
+            let (mode, a) = command(operation, task, &["--prefill-rows", rows]).into_parts();
+            assert!(a.validate().is_err());
+            assert!(execute_owned(mode, a, NoIo, &mut NoIo).is_err());
+        }
     }
 }

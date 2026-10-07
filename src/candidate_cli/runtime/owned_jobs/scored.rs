@@ -24,6 +24,7 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     common: CandidateArgs, limits: Limits, input: R, output: &mut impl Write) -> Result<(), Failure> {
     // First local owner: settings, planners, reader and report drop before the
     // CLI preparation charge. The host separately owns the transferred state.
+    let prefill = args.prefill_limits()?;
     let session = Session::new(&common, limits)?;
     let lifetime = command::parse_limits(&read_config(&session, &args.limits_file, command::LIMIT_BYTES)?)?;
     result_ceiling(&args, lifetime)?;
@@ -54,6 +55,12 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
             config, request, host, reader, cancellation),
         Corpus::Sentiment(planner, config) => session.engine.job_int8_sentiment(&model, planner,
             config, request, host, reader, cancellation),
+        Corpus::Judge(planner, config) => match prefill {
+            Some(prefill) => session.engine.job_int8_judge_layer_major(&model, planner,
+                config, request, host, prefill, reader, cancellation),
+            None => session.engine.job_int8_judge(&model, planner,
+                config, request, host, reader, cancellation),
+        },
     }.map_err(host_failure)?;
     session.remaining()?;
     let report = progress_report(progress, job_id, lifetime, materialize, mode, &args.task)?;

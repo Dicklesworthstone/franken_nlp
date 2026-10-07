@@ -3,21 +3,23 @@ use super::*;
 use std::{io::{BufRead, BufReader}, sync::Arc};
 use crate::{
     batch::classify::quantized::Int8ClassificationBatchPlanner,
-    candidate_cli::{scored::Kind, scored_batch::{ScoreBatchCommand, ScoreEnvelope, Defaults, DEFAULTS_BYTES},
+    candidate_cli::{scored_batch::{ScoreTask, ScoreBatchCommand, ScoreEnvelope, Defaults, DEFAULTS_BYTES},
         batch::{CandidateWriter, IO_BUFFER_BYTES, completed}},
-    hosted::corpus::{CorpusLimits, ClassificationCorpusConfig, SentimentCorpusConfig},
+    tasks::judge::JudgePlanner,
+    hosted::corpus::{CorpusLimits, ClassificationCorpusConfig, SentimentCorpusConfig, JudgeCorpusConfig},
 };
 
 pub(in crate::candidate_cli) enum Corpus {
     Classify(Arc<ClassificationPlanner>, ClassificationCorpusConfig),
     Sentiment(Arc<SentimentPlanner>, SentimentCorpusConfig),
+    Judge(Arc<JudgePlanner>, JudgeCorpusConfig),
 }
 fn configure(command: &ScoreBatchCommand, facts: &ArtifactIdentity, limits: Limits, defaults: Defaults)
     -> Result<Corpus, CandidateError> {
     configure_scored(command.kind()?, &command.host, facts, limits, defaults)
 }
 /// Identical pinned compiler and score-space selection for streams and jobs.
-pub(in crate::candidate_cli) fn configure_scored(kind: Kind, host: &ScoredArgs,
+pub(in crate::candidate_cli) fn configure_scored(kind: ScoreTask, host: &ScoredArgs,
     facts: &ArtifactIdentity, limits: Limits, defaults: Defaults) -> Result<Corpus, CandidateError> {
     let mut identity = candidate_identity(facts)?;
     let registry = pinned_controls::pinned().map_err(|_| CandidateError::Identity)?;
@@ -27,7 +29,7 @@ pub(in crate::candidate_cli) fn configure_scored(kind: Kind, host: &ScoredArgs,
     let ceiling = host.budget(limits);
     let work = host.work_ceiling();
     match (kind, defaults) {
-        (Kind::Classify, Defaults::Classify(defaults)) => {
+        (ScoreTask::Classify, Defaults::Classify(defaults)) => {
             let planner = Arc::new(ClassificationPlanner::pinned(controls, eos).map_err(|_| CandidateError::Planning)?);
             identity.task_spec = "classify-v1".to_owned();
             identity.template_digest = *planner.template_digest(); identity.tokenizer_digest = planner.tokenizer_digest();
@@ -40,7 +42,7 @@ pub(in crate::candidate_cli) fn configure_scored(kind: Kind, host: &ScoredArgs,
                 identity, task_ceiling: ceiling, planning, defaults, max_model_work: work,
             }))
         }
-        (Kind::Sentiment, Defaults::Sentiment { args, policy }) => {
+        (ScoreTask::Sentiment, Defaults::Sentiment { args, policy }) => {
             let planner = Arc::new(SentimentPlanner::pinned(controls, SentimentOptions {
                 mode: ScoringMode::FullVocabulary, eos_token_id: eos, policy,
             }).map_err(|_| CandidateError::Planning)?);
@@ -51,6 +53,15 @@ pub(in crate::candidate_cli) fn configure_scored(kind: Kind, host: &ScoredArgs,
                 max_item_work: work, max_model_work: work };
             config.validate(&planner).map_err(|_| CandidateError::Planning)?;
             Ok(Corpus::Sentiment(planner, config))
+        }
+        (ScoreTask::Judge, Defaults::Judge(defaults)) => {
+            let planner = Arc::new(JudgePlanner::pinned(controls, eos).map_err(|_| CandidateError::Planning)?);
+            identity.task_spec = "judge-v1".to_owned();
+            identity.template_digest = *planner.template_digest(); identity.tokenizer_digest = planner.tokenizer_digest();
+            let config = JudgeCorpusConfig { identity, task_ceiling: ceiling,
+                planning: crate::candidate_cli::judge::planning_limits(host, ceiling), defaults, max_model_work: work };
+            config.validate(&planner).map_err(|_| CandidateError::Planning)?;
+            Ok(Corpus::Judge(planner, config))
         }
         _ => Err(CandidateError::Arguments),
     }
@@ -65,8 +76,9 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static, W: Write + Sen
     command: ScoreBatchCommand, args: CandidateArgs, limits: Limits, envelope: ScoreEnvelope,
     mut input: R, output: W,
 ) -> Result<(), CandidateError> {
-    // Session is declared first: preparation authority outlives every local
+    // Session is the first owning local: preparation authority outlives every
     // setting, planner, source metadata, input buffer and output staging value.
+    let prefill = command.prefill_limits()?;
     let session = Session::new(&args, limits)?;
     let raw_defaults = command.defaults.as_ref()
         .map(|path| session.read(path, &mut input, DEFAULTS_BYTES)).transpose()?;
@@ -93,6 +105,12 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static, W: Write + Sen
             corpus_limits, reader, writer, cancellation),
         Corpus::Sentiment(planner, config) => session.engine.batch_int8_sentiment(&model, planner, config,
             corpus_limits, reader, writer, cancellation),
+        Corpus::Judge(planner, config) => match prefill {
+            Some(prefill) => session.engine.batch_int8_judge_layer_major(&model, planner, config,
+                corpus_limits, prefill, reader, writer, cancellation),
+            None => session.engine.batch_int8_judge(&model, planner, config,
+                corpus_limits, reader, writer, cancellation),
+        },
     }.map_err(|_| CandidateError::Batch)?;
     // Earlier complete records may exist. Never append a second terminal event,
     // retry a poisoned sink or conflate EOF with every document succeeding.
@@ -100,3 +118,5 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static, W: Write + Sen
 }
 
 #[cfg(test)] mod tests;
+
+#[cfg(test)] mod judge_tests;

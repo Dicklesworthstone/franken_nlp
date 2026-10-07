@@ -1,6 +1,6 @@
 //! Explicit retained finite-score jobs; separate from the live score-batch pipe.
 use super::*;
-use crate::candidate_cli::{scored::{Kind, ScoredArgs}, scored_batch};
+use crate::candidate_cli::{scored::ScoredArgs, scored_batch::{self, ScoreTask}};
 
 #[derive(Args)]
 pub(crate) struct ScoreJobCommand {
@@ -8,7 +8,7 @@ pub(crate) struct ScoreJobCommand {
 }
 #[derive(Subcommand)]
 enum ScoreOperation {
-    /// Start a NEW native classification/sentiment job; retain private results.
+    /// Start a NEW native classification/sentiment/judgment job; retain private results.
     Start(ScoreJobArgs),
     /// Authenticate the COMPLETE original population and run only pending items.
     Resume(ScoreResumeArgs),
@@ -21,9 +21,10 @@ struct ScoreResumeArgs {
 }
 #[derive(Args)]
 pub(in crate::candidate_cli) struct ScoreJobArgs {
-    #[arg(long, value_parser = ["classify", "sentiment"])]
+    #[arg(long, value_parser = ["classify", "sentiment", "judge"])]
     pub task: String,
     #[command(flatten)] pub host: ScoredArgs,
+    #[command(flatten)] pub prefill: crate::candidate_cli::scored::prefill::ScoringPrefillArgs,
     /// Required consent to retain private native output in the protected spool.
     #[arg(long)] pub store_results: bool,
     /// Existing owner-only directory. Never created or adopted automatically.
@@ -45,11 +46,15 @@ pub(in crate::candidate_cli) struct ScoreJobArgs {
     #[arg(long, default_value_t = 16)] pub serialization_memory_mib: u64,
 }
 impl ScoreJobArgs {
-    pub(in crate::candidate_cli) fn kind(&self) -> Result<Kind, Failure> {
-        Kind::named(&self.task).ok_or_else(|| Failure::usage("score_job_task"))
+    pub(in crate::candidate_cli) fn kind(&self) -> Result<ScoreTask, Failure> {
+        ScoreTask::named(&self.task).ok_or_else(|| Failure::usage("score_job_task"))
+    }
+    pub(in crate::candidate_cli) fn prefill_limits(&self)
+        -> Result<Option<crate::native_engine::strict_int8::prefill::Int8PrefillLimits>, Failure> {
+        scored_batch::corpus_prefill(self.kind()?, &self.prefill).map_err(Into::into)
     }
     pub(in crate::candidate_cli) fn validate(&self) -> Result<(CandidateArgs, Limits), Failure> {
-        self.kind()?;
+        self.prefill_limits()?;
         let local = |p: &std::path::Path| !p.as_os_str().is_empty() && p.as_os_str() != "-";
         if !self.store_results || !local(&self.job_dir) || !local(&self.key_file) || !local(&self.limits_file)
             || self.defaults.as_ref().is_some_and(|p| !local(p))
@@ -74,8 +79,8 @@ impl ScoreJobArgs {
 
 pub(in crate::candidate_cli) fn definition() -> clap::Command {
     ScoreJobCommand::augment_args(clap::Command::new("score-job")
-        .about("Start or resume retained native classification/sentiment corpus jobs")
-        .long_about("Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64. The input is the COMPLETE original NDJSON {id,text,task_args?} population, including on resume. Uses the same full-vocabulary scorers and defaults as score-batch; no generated-label shortcut or calibrated-confidence claim. All scoring flags and defaults are frozen for resume. Lifetime work and failed attempts remain debited. Explicit --store-results, protected directory, original secret and immutable JobLimits are mandatory. Stdout is metadata only, not private document scores. No automatic retry or input spooling."))
+        .about("Start or resume retained native classification/sentiment/judgment corpus jobs")
+        .long_about("Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64. The input is the COMPLETE original NDJSON {id,text,task_args?} population, including on resume. Uses the same full-vocabulary scorers and defaults as score-batch; no generated-label shortcut or calibrated-confidence claim. All scoring flags and defaults are frozen for resume. Judge jobs accept --prefill-rows for bounded grouped prompts; the effective schedule is also frozen and cannot change on resume. Other tasks refuse that option. Lifetime work and failed attempts remain debited. Explicit --store-results, protected directory, original secret and immutable JobLimits are mandatory. Stdout is metadata only, not private document scores. No automatic retry or input spooling."))
 }
 impl ScoreJobCommand {
     fn into_parts(self) -> (RunMode, ScoreJobArgs) {

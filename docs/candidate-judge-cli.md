@@ -126,9 +126,13 @@ No provisional heads, private prompt fingerprints or nested parser diagnostics
 are printed. Output retains `scope=real-artifact-current-candidate` and
 `evidence=non_authoritative`.
 
-This is a single-request command. Existing map, durable-job, source/extraction
-batch and score-batch routes are preserved; judge batch is not added here.
-Without `asupersync-runtime`, execution refuses before input or model IO.
+This remains a single-request command. For ordered corpora use
+`candidate score-batch --task judge`; for explicit retained work use
+`candidate score-job start/resume --task judge`. See
+[candidate-judge-corpus.md](candidate-judge-corpus.md) for defaults, per-record
+arguments and authenticated resume. Existing source/extraction and
+classification/sentiment routes are unchanged. Without `asupersync-runtime`,
+execution refuses before input or model IO.
 
 ## Validation scope
 
