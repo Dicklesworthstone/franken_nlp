@@ -1,7 +1,7 @@
 //! Exact private replay contract; no caller-supplied receipt or native factory.
 use super::*;
 use crate::{jobs::manifest::bounded_json,
-    native_engine::{generation::{GenerationLimits, PROCESSOR_VERSION, quantized::INT8_GENERATION_VERSION}, sampler::SAMPLER_VERSION},
+    native_engine::{generation::{GenerationLimits, GenerationSampling, PROCESSOR_VERSION, quantized::INT8_GENERATION_VERSION}, sampler::SAMPLER_VERSION},
     tasks::chat::CHAT_PROMPT_VERSION};
 
 #[derive(Serialize)]
@@ -32,7 +32,7 @@ impl GenerationJobRecipe {
         let Int8BatchLimits { max_sampler_bytes, max_model_work } = config.native;
         let recipe = Self { version: 1, input_profile: "id-text-history-sample-v1", dependency_scope: "item-local",
             execution: INT8_GENERATION_VERSION, prompt_version: CHAT_PROMPT_VERSION,
-            sampler_version: SAMPLER_VERSION, processor_version: PROCESSOR_VERSION,
+            sampler_version: match &config.generation.sampling {\n                GenerationSampling::Greedy => "fnlp-greedy-v1",\n                GenerationSampling::Seeded { .. } => SAMPLER_VERSION,\n            }, processor_version: PROCESSOR_VERSION,
             addressing: "exact-item-id-and-sample-index; original-ordinal-delivery; no-attempt-reseed-v1",
             task: config.task, generation: config.generation, budget: config.budget,
             planning: config.planning.into(), max_model_work, max_sampler_bytes };
