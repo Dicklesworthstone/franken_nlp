@@ -1,5 +1,5 @@
 //! Complete finite-head tasks on the existing process-owned INT8 invocation.
-//! Context capacity is the largest live head, NOT aggregate forward work.
+//! Serial context capacity is the largest live head, NOT aggregate forward work.
 
 use super::*;
 use crate::{
@@ -8,6 +8,7 @@ use crate::{
         ir::TaskBudget,
         judge::quantized::{Int8JudgeError, Int8JudgeRun, PreparedInt8Judge}},
 };
+mod cohort;
 
 impl NlpEngine {
     /// Execute exclusive or independent multi-label classification. The sealed
@@ -227,9 +228,7 @@ mod tests {
     #[test]
     fn scored_hosts_refuse_invalid_prefill_geometry_before_reserving() {
         for rows in [0, 65, usize::MAX] {
-            assert!(scoring_scratch(1024, Some(Int8PrefillLimits {
-                max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX,
-            })).is_err());
+            assert!(scoring_scratch(1024, Some(Int8PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX })).is_err());
         }
     }
     #[test]
