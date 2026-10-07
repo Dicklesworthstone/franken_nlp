@@ -50,11 +50,7 @@ impl NlpEngine {
                 batch::run_ndjson(&mut input.value.reader, &mut input.value.writer, &mut processor,
                     limits.transport, control).map_err(HostedError::Batch)
             };
-            drop(engine);
-            drop(context);
-            drop(secret);
-            drop(vocabulary);
-            drop(planner);
+            drop(engine); drop(context); drop(secret); drop(vocabulary); drop(planner);
             drop(input); // Owned IO and compiler storage before the charge/physical handoff.
             drop(lease);
             result
@@ -72,7 +68,7 @@ fn validate(config: &RedactionCorpusConfig<LongRedactionBatchConfig>, limits: Co
     }
     Ok(())
 }
-fn temporary_bytes(detector: &LongRedactionConfig, edit: u64) -> Result<u64, HostedError> {
+pub(super) fn temporary_bytes(detector: &LongRedactionConfig, edit: u64) -> Result<u64, HostedError> {
     let count = detector.mapping.chunks.max_chunks;
     if edit == 0 || !(1..=256).contains(&count) || detector.mapping.reduction.max_live_value_bytes == 0 {
         return Err(HostedError::Limits("document redaction corpus finite map frontier"));

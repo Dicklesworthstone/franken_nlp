@@ -9,14 +9,15 @@ use crate::{
     tasks::redact::batch::{RedactionBatchArgs, Int8RedactionBatchAdmission},
 };
 mod recipe;
+mod long;
 use recipe::{RedactionJobRecipe, RECIPE_BYTES};
 
 impl NlpEngine {
     /// Create or explicitly resume one item-local redaction job. Original
     /// inputs, model, all policies/limits and the ACTUAL pseudonym key/scope
-    /// authenticate before repair or inference. Only fully verified edited
-    /// documents may commit. The supplied request is explicit retention consent;
-    /// stored results and optional coordinate maps remain sensitive content.
+    /// authenticate before repair or inference. Only complete edited results
+    /// meeting the declared verification policy may commit. The request is
+    /// explicit retention consent; results and optional maps remain sensitive.
     #[allow(clippy::too_many_arguments)]
     pub fn job_int8_redact<R>(&self, model: &ResidentInt8,
         planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
@@ -46,8 +47,7 @@ impl NlpEngine {
         let completed = dispatch::run(self, limits.native.run, cancellation, move |control| {
             // Capture the entire charged owner, also on queued cancellation.
             let mut input = input;
-            let (planner, vocabulary, config, secret, request) = input.value.planner.take()
-                .ok_or(HostedError::CompletionMissing)?;
+            let (planner, vocabulary, config, secret, request) = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
             let context = pseudonym_context(secret.as_ref(), &config.batch.request)?;
             let identity = config.batch.ner_identity.clone();
             let recipe = RedactionJobRecipe::short(&config.batch, context.as_ref())?;
@@ -94,9 +94,7 @@ impl<P: Native> BatchProcessor for RedactionJob<P> {
     type Args = RedactionBatchArgs;
     type Prepared = P::Prepared;
     type Output = P::Output;
-    fn prepare(&mut self, document: BatchDocument<Self::Args>) -> Result<Self::Prepared, BatchItemFailure> {
-        self.native.prepare(document)
-    }
+    fn prepare(&mut self, document: BatchDocument<Self::Args>) -> Result<Self::Prepared, BatchItemFailure> { self.native.prepare(document) }
     fn prepare_with_control<C: DecodeStepControl>(&mut self, document: BatchDocument<Self::Args>, control: &mut C)
         -> Result<Self::Prepared, BatchItemFailure> { self.native.prepare_with_control(document, control) }
     fn planned_work(&self, plan: &Self::Prepared) -> BatchWork { self.native.planned_work(plan) }

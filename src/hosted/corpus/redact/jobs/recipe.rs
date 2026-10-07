@@ -4,9 +4,11 @@ use super::*;
 use serde::Serialize;
 use crate::{
     grammar::{CompileLimits, mask::MaskWorkLimits, runtime::{SourceRuntimeLimits, SOURCE_JSON_RUNTIME_VERSION}},
-    tasks::{ir::TaskBudget, ner::NerOptions,
-        source_planning::{SourcePlanningLimits, SOURCE_PROMPT_VERSION},
+    tasks::{ir::TaskBudget, ner::NerOptions, mapreduce::{ChunkLimits, ExecutionLimits, CHUNK_PROFILE},
+        source_planning::{SourcePlanningLimits, SOURCE_PROMPT_VERSION,
+            quantized::long::{Int8SourceMapLimits, INT8_SOURCE_MAP_EXECUTION}},
         redact::{actions::ACTION_POLICY_VERSION, detectors::RULE_PROFILE, union::OVERLAP_POLICY,
+            corpus::LongRedactionBatchConfig, long::{LongRedactionConfig, LONG_REDACTION_EXECUTION},
             pseudonym::{PseudonymIdentity, PseudonymEncoding}, quantized::{Int8RedactionConfig, INT8_REDACTION_EXECUTION}}},
 };
 
@@ -22,11 +24,27 @@ pub(super) struct RedactionJobRecipe {
     item_work: JobWork,
     pub(super) max_result_bytes: u64,
 }
+// Untagged serialization preserves the original short-job recipe byte shape.
+// The top-level execution version distinguishes short and chunked pipelines.
 #[derive(Serialize)]
-struct DetectorRecipe {
+#[serde(untagged)]
+enum DetectorRecipe { Short(ShortDetector), Long(LongDetector) }
+#[derive(Serialize)]
+struct ShortDetector {
     ner: NerOptions, per_pass: TaskBudget, planning: PlanningRecipe,
     max_model_work: Int8Work, mask_limits: MaskRecipe, mask_visits_per_pass: u64,
     max_mask_visits: u64, max_result_bytes: u64,
+}
+#[derive(Serialize)]
+struct LongDetector {
+    ner: NerOptions, per_chunk: TaskBudget, planning: PlanningRecipe,
+    mapping: MapRecipe, max_result_bytes: u64,
+}
+#[derive(Serialize)]
+struct MapRecipe {
+    execution: &'static str, chunk_profile: &'static str, reduction_profile: &'static str,
+    chunks: ChunkLimits, reduction: ExecutionLimits, max_model_work: Int8Work,
+    mask_limits: MaskRecipe, mask_visits_per_chunk: u64, max_mask_visits: u64,
 }
 #[derive(Serialize)]
 struct PlanningRecipe {
@@ -56,14 +74,28 @@ impl From<MaskWorkLimits> for MaskRecipe {
         Self { max_trie_node_visits, checkpoint_interval_nodes }
     }
 }
+impl From<Int8SourceMapLimits> for MapRecipe {
+    fn from(limits: Int8SourceMapLimits) -> Self {
+        let Int8SourceMapLimits { chunks, reduction, max_model_work, mask_limits,
+            mask_visits_per_chunk, max_mask_visits } = limits;
+        Self { execution: INT8_SOURCE_MAP_EXECUTION, chunk_profile: CHUNK_PROFILE,
+            reduction_profile: crate::tasks::mapreduce::execution::EXECUTION_PROFILE,
+            chunks, reduction, max_model_work, mask_limits: mask_limits.into(), mask_visits_per_chunk, max_mask_visits }
+    }
+}
+fn key_identity(request: &RedactionRequest, context: Option<&Pseudonyms<'_>>)
+    -> Result<Option<PseudonymIdentity>, HostedError> {
+    request.actions.check_key(context).map_err(|e| HostedError::Redaction(e.into()))?;
+    if context.is_some_and(|c| c.identity().encoding != PseudonymEncoding::Full256) {
+        return Err(HostedError::Limits("retained redaction requires one full256 scope"));
+    }
+    Ok(context.map(|c| c.identity().clone()))
+}
 impl RedactionJobRecipe {
     pub(super) fn short(config: &Int8RedactionBatchConfig, context: Option<&Pseudonyms<'_>>)
         -> Result<Self, HostedError> {
         bounded(&config.request)?; bounded(&config.detector.ner)?;
-        config.request.actions.check_key(context).map_err(|e| HostedError::Redaction(e.into()))?;
-        if context.is_some_and(|c| c.identity().encoding != PseudonymEncoding::Full256) {
-            return Err(HostedError::Limits("retained redaction requires one full256 scope"));
-        }
+        let pseudonyms = key_identity(&config.request, context)?;
         // Destructure all non-serializable fields: new native/compiler limits
         // must be deliberately added to this authenticated projection.
         let Int8RedactionConfig { ner, per_pass, planning, max_model_work, mask_limits,
@@ -74,12 +106,31 @@ impl RedactionJobRecipe {
         let recipe = Self { version: 1, dependency_scope: "item-local", execution: INT8_REDACTION_EXECUTION,
             prompt_version: SOURCE_PROMPT_VERSION, source_runtime: SOURCE_JSON_RUNTIME_VERSION,
             action_version: ACTION_POLICY_VERSION, rule_version: RULE_PROFILE, overlap_version: OVERLAP_POLICY,
-            detector: DetectorRecipe { ner: ner.clone(), per_pass: *per_pass, planning: (*planning).into(),
+            detector: DetectorRecipe::Short(ShortDetector { ner: ner.clone(), per_pass: *per_pass, planning: (*planning).into(),
                 max_model_work: *max_model_work, mask_limits: (*mask_limits).into(),
-                mask_visits_per_pass: *mask_visits_per_pass, max_mask_visits: *max_mask_visits, max_result_bytes: *max_result_bytes },
+                mask_visits_per_pass: *mask_visits_per_pass, max_mask_visits: *max_mask_visits, max_result_bytes: *max_result_bytes }),
             request: config.request.clone(), max_model_work: config.max_model_work, max_mask_visits: config.max_mask_visits,
-            pseudonyms: context.map(|c| c.identity().clone()),
-            item_work: JobWork { model: *max_model_work, mask_node_visits: masks }, max_result_bytes: *max_result_bytes };
+            pseudonyms, item_work: JobWork { model: *max_model_work, mask_node_visits: masks }, max_result_bytes: *max_result_bytes };
+        bounded(&recipe)?;
+        Ok(recipe)
+    }
+    pub(super) fn long(config: &LongRedactionBatchConfig, context: Option<&Pseudonyms<'_>>)
+        -> Result<Self, HostedError> {
+        bounded(&config.request)?; bounded(&config.detector.ner)?;
+        let pseudonyms = key_identity(&config.request, context)?;
+        let LongRedactionConfig { ner, per_chunk, planning, mapping, max_result_bytes } = &config.detector;
+        let work = config.item_model_work();
+        if work.projected_logits == 0 || mapping.max_mask_visits == 0 || mapping.max_mask_visits > config.max_mask_visits {
+            return Err(HostedError::Limits("redaction job complete map work"));
+        }
+        let recipe = Self { version: 1, dependency_scope: "item-local", execution: LONG_REDACTION_EXECUTION,
+            prompt_version: SOURCE_PROMPT_VERSION, source_runtime: SOURCE_JSON_RUNTIME_VERSION,
+            action_version: ACTION_POLICY_VERSION, rule_version: RULE_PROFILE, overlap_version: OVERLAP_POLICY,
+            detector: DetectorRecipe::Long(LongDetector { ner: ner.clone(), per_chunk: *per_chunk,
+                planning: (*planning).into(), mapping: (*mapping).into(), max_result_bytes: *max_result_bytes }),
+            request: config.request.clone(), max_model_work: config.max_model_work, max_mask_visits: config.max_mask_visits,
+            pseudonyms, item_work: JobWork { model: work, mask_node_visits: mapping.max_mask_visits },
+            max_result_bytes: *max_result_bytes };
         bounded(&recipe)?;
         Ok(recipe)
     }
