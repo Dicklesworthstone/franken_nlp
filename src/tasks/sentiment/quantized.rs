@@ -22,6 +22,7 @@ use crate::{
 };
 use super::{SentimentLimits, SentimentPlan, SentimentPlanner, SentimentPlanningError,
     SentimentRequest, SentimentResult, SentimentError, distribution::HeadPlan};
+mod cohort;
 
 pub const INT8_SENTIMENT_EXECUTION: &str = "portable-int8-independent-affect-heads-v1";
 const SAMPLER_VERSION: &str = "sentiment-complete-candidate-eos-v1";

@@ -9,6 +9,7 @@ use crate::{execution_identity::{ExecutionIdentity, Sha256Digest},
         lmhead::scoring::CandidateScoreCursor, portable_int8::batch::MAX_BATCH_ROWS,
         strict_int8::cohort::{CohortToken, Int8CohortEngine, branching::Int8BranchSession}}};
 mod execution;
+pub(crate) mod task;
 
 pub const INT8_SCORING_COHORT_EXECUTION: &str = "portable-int8-independent-candidate-cohort-v1";
 

@@ -16,6 +16,7 @@ use crate::{canonjson, execution_identity::{ExecutionIdentity, NumericsProfile, 
     tasks::ir::{DecodeStrategy, PlanContext, TaskBudget}};
 use super::{ClassificationLimits, ClassificationPlanner, ClassificationPlanningError, ClassificationRequest,
     ClassificationTaskResult, PreparedClassification, planning::{self, ClassificationHead}};
+mod cohort;
 
 pub const INT8_CLASSIFICATION_EXECUTION: &str = "portable-int8-independent-classification-heads-v1";
 
@@ -66,8 +67,9 @@ pub struct Int8ClassificationRun {
 }
 
 /// Exact request-owned bundle. Schedules add small work records, not duplicate
-/// prompt/scorer/weight storage. Only one flattened token vector is live at a
-/// time during execution. No conversion or Deref exposes the private inner plan.
+/// prompt/scorer/weight storage. Serial execution flattens one prompt at a time;
+/// explicit cohort execution requires admission for all live head prompts/KV.
+/// No conversion or Deref exposes the private inner plan.
 pub struct PreparedInt8Classification {
     inner: PreparedClassification,
     schedules: Vec<CandidateSchedule>,

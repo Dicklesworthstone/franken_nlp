@@ -13,6 +13,7 @@ use crate::native_engine::{
         scoring::{self, CandidateSchedule, Int8CandidateRun, Int8ScoringBudget,
             Int8ScoringError, INT8_SCORING_EXECUTION}},
 };
+mod cohort;
 
 pub const INT8_JUDGE_EXECUTION: &str = "portable-int8-complete-judge-prefix-heads-v1";
 
