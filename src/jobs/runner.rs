@@ -13,6 +13,7 @@ use std::{error::Error, fmt, path::Path};
 pub mod source;
 pub mod extract;
 pub mod scored;
+pub mod generation;
 
 pub const OWNED_BATCH_PROTOCOL: &str = "fnlp-owned-batch-v1";
 

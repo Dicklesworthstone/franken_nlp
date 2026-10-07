@@ -67,6 +67,9 @@ impl Int8ChatPlanner {
         let compiler = ChatPlanner::pinned_for_backend(controls, eos, identity, ceiling, limits, ChatBackend::Int8)?;
         Ok(Self { compiler })
     }
+    /// Actual immutable model/template/tokenizer binding after pinned setup.
+    /// This is a planning context, not a completed request or activation proof.
+    pub fn execution_identity(&self) -> &ExecutionIdentity { &self.compiler.identity }
     pub fn plan_chat(&self, request: &ChatRequest) -> Result<PreparedInt8Chat, Int8ChatError> {
         self.compile(BuiltInTask::Chat, &request.item_id, request.sample_index,
             &request.messages, &request.generation, request.budget)
