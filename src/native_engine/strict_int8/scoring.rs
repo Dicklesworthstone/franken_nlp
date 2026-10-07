@@ -16,18 +16,20 @@ use super::{Int8RunBudget, Int8Session, Int8Work, StrictInt8Engine, StrictInt8Er
     DecodeCancellationKind, decoder_projection_work};
 
 pub mod prefill;
+pub mod cohort;
 
 pub const INT8_SCORING_EXECUTION: &str = "portable-int8-single-kv-candidate-trie-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Int8ScoringError {
-    Input, Traversal, Accounting, Allocation, OutputBudget, Serialization,
+    Input, Identity, Traversal, Accounting, Allocation, OutputBudget, Serialization,
     Scoring(ScoringError), Native(StrictInt8Error),
 }
 impl fmt::Display for Int8ScoringError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Input => "int8 scoring requires a bounded exact prompt and finite language",
+            Self::Identity => "int8 scoring model or execution identity differs",
             Self::Traversal => "int8 scorer diverged from prefix-first traversal",
             Self::Accounting => "int8 scorer work disagrees with its complete language",
             Self::Allocation => "int8 scorer bounded allocation refused",

@@ -8,6 +8,7 @@
 use super::*;
 use crate::native_engine::portable_int8::batch::MAX_BATCH_ROWS;
 mod execution;
+pub(crate) mod branching;
 
 pub const INT8_COHORT_EXECUTION: &str = "portable-int8-ragged-sequence-cohort-v1";
 
@@ -144,13 +145,9 @@ impl<C: DecodeStepControl> Int8CohortSession<'_, '_, C> {
     /// Complete, reconciled per-sequence work. Partial native failures cannot
     /// be presented as successful completed per-row execution receipts.
     pub fn work(&self, sequence: usize) -> Result<Int8Work, StrictInt8Error> {
-        self.engine.state.check()?;
-        let sum = self.accounts.iter().try_fold(ProjectionWork::default(), |sum, row|
-            sum.checked_add(row.work.projections))?;
-        if sum != self.ledger.reserved() { return Err(StrictInt8Error::Boundary); }
-        let row = self.accounts.get(sequence).ok_or(StrictInt8Error::Input)?;
-        if self.position(sequence)? as u64 != row.work.forward_positions { return Err(StrictInt8Error::Boundary); }
-        Ok(row.work)
+        // Ordinary generation/refill sessions still require strictly growing
+        // positions. Only the private branching owner can supply rewind counts.
+        branching::work_at(self, sequence, 0)
     }
     /// One shared-weight decoder step over any nonempty active subset. Prompt
     /// rows and decode rows can coexist because each carries its own causal KV
