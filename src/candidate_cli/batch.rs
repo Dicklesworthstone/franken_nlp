@@ -10,6 +10,7 @@ use crate::{
 use source::{Kind, SourceHostArgs};
 mod writer;
 mod extraction;
+mod document;
 pub(super) use writer::CandidateWriter;
 #[cfg(test)] mod tests;
 
@@ -27,6 +28,8 @@ pub(crate) struct BatchCommand {
     pub(super) task: String,
     #[command(flatten)]
     pub(super) host: SourceHostArgs,
+    #[command(flatten)]
+    pub(super) document: document::DocumentArgs,
     /// Optional bounded local SourceBatchArgs or ExtractionBatchArgs JSON.
     /// Without defaults, QA/extract records require complete typed task_args.
     #[arg(long, value_name = "FILE")]
@@ -63,7 +66,7 @@ pub(super) struct CorpusEnvelope {
 pub(super) fn definition() -> clap::Command {
     BatchCommand::augment_args(clap::Command::new("batch")
         .about("Process bounded schema/source-task NDJSON using one resident candidate model")
-        .long_about("Run one fixed task over bounded ordered NDJSON. Each event carries non-authoritative candidate provenance. Weights and the native engine are reused; this is serial item-local execution, not parallel/GEMM batching or a durable job. Earlier completed records remain valid if later records fail. Any document failure produces a nonzero process exit."))
+        .long_about("Run one fixed task over bounded ordered NDJSON. Each event carries non-authoritative candidate provenance. Weights and the native engine are reused; this is serial item-local execution, not parallel/GEMM batching or a durable job. Earlier completed records remain valid if later records fail. Any document failure produces a nonzero process exit. Add --task extract --chunked --schema FILE for complete documents larger than one context. Each successful record retains independent exact-schema JSON strings for every chunk and original-coordinate verbatim evidence when --source-membership is selected. Required fields must be satisfiable per chunk; objects are never merged or repaired. Chunked records cannot override the shared schema or budgets in task_args. No partial document success is emitted."))
 }
 impl BatchCommand {
     pub(super) fn kind(&self) -> Result<Kind, CandidateError> {
@@ -118,7 +121,8 @@ impl BatchCommand {
         // copies, compiler state and output separately.
         let io_bytes = (transport.max_output_line_bytes as u64).checked_add(FRAME_ALLOWANCE)
             .and_then(|n| n.checked_add(IO_BUFFER_BYTES as u64 * 2)).ok_or(CandidateError::Arguments)?;
-        Ok((args, limits, CorpusEnvelope { transport, native, output_bytes, io_bytes }))
+        let envelope = self.document_envelope(limits, CorpusEnvelope { transport, native, output_bytes, io_bytes })?;
+        Ok((args, limits, envelope))
     }
     pub(super) fn load_defaults(&self, text: Option<&str>, ceiling: TaskBudget)
         -> Result<Option<SourceBatchArgs>, CandidateError> {
