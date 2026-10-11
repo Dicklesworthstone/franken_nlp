@@ -109,14 +109,17 @@ fn forced_unsupported_tier_fails_before_selection() {
 }
 
 #[test]
-fn forced_detected_unimplemented_tier_fails_without_entering_a_kernel() {
+fn forced_detected_unimplemented_operation_fails_without_entering_a_kernel() {
     let dispatcher = Dispatcher::new(
         x86((true, false, false, false, false)),
         DispatchTable::default(),
     );
+    // X3a now owns INT8 bodies, but that never grants an INT4 implementation.
+    let int4_key = DispatchKey::new(KernelOperation::Int4Gemv, DispatchRegime::DecodeGemv,
+        KernelShape { k: 2, m: 1, n: 1 });
     assert_eq!(
         dispatcher
-            .select(key(), Some(KernelTier::X3aAvx2Low7HighBit))
+            .select(int4_key, Some(KernelTier::X3aAvx2Low7HighBit))
             .unwrap_err(),
         DispatchError::ForcedTierUnimplemented {
             requested: KernelTier::X3aAvx2Low7HighBit,

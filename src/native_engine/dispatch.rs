@@ -10,6 +10,7 @@ use std::{fmt, str::FromStr, sync::OnceLock};
 use serde::{Deserialize, Serialize};
 
 use super::int8::{self, Int8KernelError, MODEL_KS, MODEL_NS};
+mod execution;
 
 /// Fixed native-kernel entry points supported by the dispatcher.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -204,6 +205,10 @@ impl KernelTier {
             (Self::Scalar, KernelOperation::Int8Gemm) => "s_scalar_i32_int8_gemm",
             (Self::Scalar, KernelOperation::Int8Gemv) => "s_scalar_i32_int8_gemv",
             (Self::Scalar, KernelOperation::Int4Gemv) => "s_scalar_i32_int4_gemv",
+            (Self::X3aAvx2Low7HighBit, KernelOperation::Int8Gemm) => "x3a_avx2_low7_high_bit_int8_gemm",
+            (Self::X3aAvx2Low7HighBit, KernelOperation::Int8Gemv) => "x3a_avx2_low7_high_bit_int8_gemv",
+            (Self::X3bAvx2WidenedI16, KernelOperation::Int8Gemm) => "x3b_avx2_widened_i16_int8_gemm",
+            (Self::X3bAvx2WidenedI16, KernelOperation::Int8Gemv) => "x3b_avx2_widened_i16_int8_gemv",
             (Self::A1Smmla, _) => "a1_smmla_pending",
             (Self::A2Dotprod, _) => "a2_dotprod_pending",
             (Self::A3Autovec, _) => "a3_autovec_pending",
@@ -215,9 +220,19 @@ impl KernelTier {
         }
     }
 
+    /// At least one operation has a body on this compilation target. This is
+    /// not a runtime capability, performance, parity or all-operations award.
     #[must_use]
     pub const fn is_implemented(self) -> bool {
-        matches!(self, Self::Scalar)
+        matches!(self, Self::Scalar) || (cfg!(target_arch = "x86_64")
+            && matches!(self, Self::X3aAvx2Low7HighBit | Self::X3bAvx2WidenedI16))
+    }
+
+    /// INT8 registration never silently authorizes an INT4 implementation.
+    #[must_use]
+    pub const fn supports_operation(self, operation: KernelOperation) -> bool {
+        self.is_implemented()
+            && (!matches!(operation, KernelOperation::Int4Gemv) || matches!(self, Self::Scalar))
     }
 
     #[must_use]
@@ -349,8 +364,8 @@ pub fn host_features() -> DetectedFeatures {
     *HOST_FEATURES.get_or_init(DetectedFeatures::detect)
 }
 
-/// Tile geometry selected with a backend.  Scalar uses `1×1×1`; future SIMD
-/// rows must carry their exact measured geometry rather than inherit it.
+/// Tile geometry selected with a backend. Scalar uses `1×1×1`; the AVX2
+/// row-major dot leaves use `1×1×32`, independently of matrix M/N tails.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TileGeometry {
@@ -487,6 +502,8 @@ pub enum DispatchError {
         detail: String,
     },
     ScalarKernel(Int8KernelError),
+    CpuKernel(super::simd::CpuKernelError),
+    AllocationRefused,
 }
 
 impl fmt::Display for DispatchError {
@@ -504,13 +521,15 @@ impl fmt::Display for DispatchError {
             Self::ForcedTierUnimplemented { requested } => {
                 write!(
                     formatter,
-                    "forced tier {requested} has no registered kernel implementation"
+                    "forced tier {requested} has no registered implementation for this operation"
                 )
             }
             Self::InvalidMeasurement { detail } => {
                 write!(formatter, "invalid measured dispatch row: {detail}")
             }
             Self::ScalarKernel(error) => error.fmt(formatter),
+            Self::CpuKernel(error) => error.fmt(formatter),
+            Self::AllocationRefused => formatter.write_str("dispatched INT8 output allocation refused"),
         }
     }
 }
@@ -523,7 +542,9 @@ impl From<Int8KernelError> for DispatchError {
     }
 }
 
-/// Dispatch policy with injected detection for deterministic tests.
+/// Dispatch policy with injected detection for deterministic tests. Executable
+/// entry points independently check the real CPU; synthetic feature reports
+/// can exercise selection policy but never authorize unsupported instructions.
 #[derive(Clone, Debug)]
 pub struct Dispatcher {
     features: DetectedFeatures,
@@ -551,8 +572,8 @@ impl Dispatcher {
         candidate_tiers(self.features)
     }
 
-    /// Select a tier.  A forced unsupported tier fails before table lookup;
-    /// a forced detected-but-not-yet-registered SIMD tier also fails safely.
+    /// Select a tier without executing instructions. Forced unsupported
+    /// operations fail before dispatch; INT8 does not imply INT4 registration.
     pub fn select(
         &self,
         key: DispatchKey,
@@ -566,14 +587,23 @@ impl Dispatcher {
                     detected: candidates,
                 });
             }
-            if !requested.is_implemented() {
+            if !requested.supports_operation(key.operation) {
                 return Err(DispatchError::ForcedTierUnimplemented { requested });
             }
-            return Ok(scalar_selection(key, candidates));
+            if requested == KernelTier::Scalar { return Ok(scalar_selection(key, candidates)); }
+            execution::check_key(requested, key)?;
+            return Ok(DispatchSelection {
+                candidates, key, kernel_id: requested.kernel_id(key.operation),
+                provenance: SelectionProvenance::ConservativeDefault {
+                    detail: "explicit forced tier — unmeasured, unqualified candidate",
+                },
+                tier: requested, tile: execution::tile(requested),
+            });
         }
 
         if let Some(row) = self.table.matching(key) {
-            if candidates.contains(&row.selected_tier) && row.selected_tier.is_implemented() {
+            if candidates.contains(&row.selected_tier) && row.selected_tier.supports_operation(key.operation) {
+                execution::check_key(row.selected_tier, key)?;
                 return Ok(DispatchSelection {
                     candidates,
                     key,
@@ -594,8 +624,9 @@ impl Dispatcher {
         Ok(scalar_selection(key, candidates))
     }
 
-    /// Safe int8 GEMM entry point.  Tier beads register their exact kernels
-    /// here only after their differential proof; today this executes S.
+    /// Safe int8 GEMM entry point. The selected tier is the body executed,
+    /// not a report attached to scalar substitution. No measured rows ship by
+    /// default; explicit native candidates remain independently qualified work.
     pub fn int8_gemm(
         &self,
         activations: &[i8],
@@ -608,7 +639,7 @@ impl Dispatcher {
     ) -> Result<Dispatched<Vec<i32>>, DispatchError> {
         let key = DispatchKey::new(KernelOperation::Int8Gemm, regime, KernelShape { k, m, n });
         let selection = self.select(key, forced)?;
-        let output = int8::gemm_s8s8(activations, m, k, weights, n)?;
+        let output = execution::gemm(selection.tier, activations, m, k, weights, n)?;
         Ok(Dispatched { output, selection })
     }
 
@@ -631,11 +662,15 @@ impl Dispatcher {
             },
         );
         let selection = self.select(key, forced)?;
-        let output = int8::gemv_s8s8(input, weights, n)?;
+        let output = if selection.tier == KernelTier::Scalar {
+            int8::gemv_s8s8(input, weights, n)?
+        } else {
+            execution::gemm(selection.tier, input, 1, input.len(), weights, n)?
+        };
         Ok(Dispatched { output, selection })
     }
 
-    /// Safe int4-to-int8 GEMV entry point.
+    /// Safe int4-to-int8 GEMV entry point. AVX2 INT4 remains a typed refusal.
     pub fn int4_gemv(
         &self,
         input: &[i8],
@@ -675,7 +710,8 @@ pub struct BackendReport {
     pub selections: Vec<DispatchSelection>,
 }
 
-/// Registry entry reported even before an ISA tier supplies a kernel body.
+/// Registry entry: registered means at least one operation has a body. Use
+/// KernelTier::supports_operation for operation-specific availability.
 #[derive(Clone, Debug, Serialize)]
 pub struct TierReport {
     pub detected: bool,
@@ -775,6 +811,7 @@ fn validate_row(row: &DispatchRow) -> Result<(), DispatchError> {
             detail: "tile dimensions must be non-zero".to_owned(),
         });
     }
+    execution::validate_tile(row)?;
     for (index, candidate) in row.wider_tier_losses.iter().enumerate() {
         if candidate.median_ns == 0 {
             return Err(DispatchError::InvalidMeasurement {
