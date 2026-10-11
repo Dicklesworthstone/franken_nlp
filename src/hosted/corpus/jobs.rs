@@ -7,6 +7,7 @@ mod manage;
 mod extract;
 mod scored;
 mod generation;
+mod source_document;
 pub use manage::{JobManagementLimits, StoredJobOperation, StoredJobRequest};
 use crate::{
     jobs::{JobError, JobId, JobLimits, JobProgress, JobSecret, TailPolicy,
