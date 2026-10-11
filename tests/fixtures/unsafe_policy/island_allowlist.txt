@@ -1,5 +1,6 @@
 # Relative `src/` paths permitted to use `#![allow(unsafe_code)]`.
 # Each island retains explicit unsafe-op proofs and differential tests.
-# X3a/X3b: actual OS-aware AVX2 detection, bounded K, complete unaligned
-# blocks and scalar tails. No model/performance/dispatch award is implied.
+# Actual OS-aware ISA detection, bounded K, complete unaligned blocks and
+# scalar tails. No model/performance/dispatch award is implied.
 src/native_engine/simd/avx2.rs
+src/native_engine/simd/neon.rs

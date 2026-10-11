@@ -16,7 +16,7 @@ mod existing {
 fn definition() -> clap::Command {
     let candidate = crate::candidate_cli::definition().arg(clap::Arg::new("int8-kernel")
         .long("int8-kernel").global(true).value_name("KERNEL")
-        .value_parser(["s_scalar_i32", "x3a_avx2_low7_high_bit", "x3b_avx2_widened_i16"])
+        .value_parser(crate::native_engine::simd::Int8KernelKind::ALL.map(|kind| kind.id()))
         .help("Explicit experimental CPU kernel for native INT8 projections; scalar remains the default"));
     let command = existing::definition().subcommand(crate::redaction_cli::definition())
         .subcommands(crate::text_cli::definitions()).subcommand(crate::text_batch::definition())

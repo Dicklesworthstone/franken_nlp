@@ -1,34 +1,44 @@
 //! Explicit, bounded CPU INT8 kernels; capability is not a dispatch policy.
 //!
-//! X3a and X3b implement plan 6.5 / beads fms and 3am independently. They
-//! consume borrowed row-major bytes, not a newly ratified packing format.
-//! Default selection remains scalar. Construction checks the REAL host, not
-//! a caller-supplied feature report; the executable handle cannot be forged
-//! through Deserialize. No kernel allocates, spawns, reads configuration, or
-//! changes the canonical floating-point epilogue.
+//! CPU leaves consume borrowed row-major bytes, not a newly ratified packing
+//! format. Scalar remains the default. Construction checks the REAL host, not
+//! a caller-supplied feature report; executable handles cannot be forged with
+//! Deserialize. No kernel allocates, spawns, reads configuration, or changes
+//! the canonical floating-point epilogue. ARM A2 and A3 are independent bodies.
 
 use std::{error::Error, fmt, str::FromStr};
 use super::{int8::{self, Int8KernelError}, quant_algebra::MAX_MODEL_K};
 
 #[cfg(target_arch = "x86_64")]
 mod avx2;
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+mod neon;
+#[cfg(any(target_arch = "aarch64", test))]
+mod autovec;
 pub mod config;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod arm_tests;
 
 /// Maximum simultaneously accumulated activation rows in a shared-weight leaf.
 pub const MAX_COHORT_ROWS: usize = 4;
 
 /// These are implementation identifiers, not measured dispatch winners.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Int8KernelKind { Scalar, Avx2Low7HighBit, Avx2WidenedI16 }
+pub enum Int8KernelKind {
+    Scalar, Avx2Low7HighBit, Avx2WidenedI16, Aarch64Dotprod, Aarch64Autovec,
+}
 impl Int8KernelKind {
-    pub const ALL: [Self; 3] = [Self::Scalar, Self::Avx2Low7HighBit, Self::Avx2WidenedI16];
+    pub const ALL: [Self; 5] = [Self::Scalar, Self::Avx2Low7HighBit, Self::Avx2WidenedI16,
+        Self::Aarch64Dotprod, Self::Aarch64Autovec];
     pub const fn id(self) -> &'static str {
         match self {
             Self::Scalar => "s_scalar_i32",
             Self::Avx2Low7HighBit => "x3a_avx2_low7_high_bit",
             Self::Avx2WidenedI16 => "x3b_avx2_widened_i16",
+            Self::Aarch64Dotprod => "a2_dotprod",
+            Self::Aarch64Autovec => "a3_autovec",
         }
     }
 }
@@ -71,6 +81,10 @@ enum Implementation {
     Scalar,
     #[cfg(target_arch = "x86_64")]
     Avx2(avx2::Avx2Kernel),
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    Dotprod(neon::DotprodKernel),
+    #[cfg(target_arch = "aarch64")]
+    Autovec,
 }
 
 /// An immutable, hardware-checked executable handle. It contains no weights,
@@ -82,19 +96,31 @@ impl Default for Int8Kernel {
 }
 impl Int8Kernel {
     pub const fn scalar() -> Self { Self { implementation: Implementation::Scalar } }
-    /// Never substitute scalar when an explicit ISA request is unavailable.
+    /// Never substitute another tier for an unavailable explicit request.
+    /// ARM dotprod is compiled only on little-endian targets, matching stdarch.
     pub fn detect(kind: Int8KernelKind) -> Result<Self, CpuKernelError> {
-        if kind == Int8KernelKind::Scalar { return Ok(Self::scalar()); }
-        #[cfg(target_arch = "x86_64")]
-        { return Ok(Self { implementation: Implementation::Avx2(avx2::Avx2Kernel::detect(kind)?) }); }
-        #[cfg(not(target_arch = "x86_64"))]
-        { Err(CpuKernelError::UnsupportedIsa) }
+        match kind {
+            Int8KernelKind::Scalar => Ok(Self::scalar()),
+            #[cfg(target_arch = "x86_64")]
+            Int8KernelKind::Avx2Low7HighBit | Int8KernelKind::Avx2WidenedI16 =>
+                Ok(Self { implementation: Implementation::Avx2(avx2::Avx2Kernel::detect(kind)?) }),
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            Int8KernelKind::Aarch64Dotprod =>
+                Ok(Self { implementation: Implementation::Dotprod(neon::DotprodKernel::detect()?) }),
+            #[cfg(target_arch = "aarch64")]
+            Int8KernelKind::Aarch64Autovec => Ok(Self { implementation: Implementation::Autovec }),
+            _ => Err(CpuKernelError::UnsupportedIsa),
+        }
     }
     pub fn kind(self) -> Int8KernelKind {
         match self.implementation {
             Implementation::Scalar => Int8KernelKind::Scalar,
             #[cfg(target_arch = "x86_64")]
             Implementation::Avx2(kernel) => kernel.kind(),
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            Implementation::Dotprod(_) => Int8KernelKind::Aarch64Dotprod,
+            #[cfg(target_arch = "aarch64")]
+            Implementation::Autovec => Int8KernelKind::Aarch64Autovec,
         }
     }
     /// Full signed-byte domain, including -128 on BOTH operands. Empty dots
@@ -107,22 +133,24 @@ impl Int8Kernel {
             Implementation::Scalar => int8::dot_s8s8(input, weights).map_err(CpuKernelError::Scalar),
             #[cfg(target_arch = "x86_64")]
             Implementation::Avx2(kernel) => kernel.dot(input, weights),
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            Implementation::Dotprod(kernel) => {
+                let mut output = [0]; kernel.dot_rows_into(&[input], weights, &mut output)?; Ok(output[0])
+            }
+            #[cfg(target_arch = "aarch64")]
+            Implementation::Autovec => {
+                let mut output = [0]; autovec::dot_rows_into(&[input], weights, &mut output)?; Ok(output[0])
+            }
         }
     }
     /// Evaluate up to four independently borrowed activation rows against ONE
-    /// weight row. AVX2 loads each weight block once for the whole cohort. Rows
-    /// need not be contiguous or aligned and may alias each other/weights.
+    /// weight row. Vector leaves share weight blocks across the whole cohort.
+    /// Rows need not be contiguous or aligned and may alias each other/weights.
     /// Check ALL lengths before any output write; K remains independently
     /// bounded for each accumulator, never one reduction across documents.
     pub fn dot_rows_into(self, inputs: &[&[i8]], weights: &[i8], output: &mut [i32])
         -> Result<(), CpuKernelError> {
-        if inputs.len() > MAX_COHORT_ROWS || inputs.len() != output.len() {
-            return Err(CpuKernelError::Shape);
-        }
-        if weights.len() > MAX_MODEL_K { return Err(CpuKernelError::ReductionTooLong); }
-        if inputs.iter().any(|input| input.len() != weights.len()) {
-            return Err(CpuKernelError::LengthMismatch);
-        }
+        check_rows(inputs, weights, output.len())?;
         match self.implementation {
             Implementation::Scalar => {
                 for (input, value) in inputs.iter().zip(output) {
@@ -132,6 +160,10 @@ impl Int8Kernel {
             }
             #[cfg(target_arch = "x86_64")]
             Implementation::Avx2(kernel) => kernel.dot_rows_into(inputs, weights, output),
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            Implementation::Dotprod(kernel) => kernel.dot_rows_into(inputs, weights, output),
+            #[cfg(target_arch = "aarch64")]
+            Implementation::Autovec => autovec::dot_rows_into(inputs, weights, output),
         }
     }
     /// A(M,K) times transpose(W(N,K)) -> row-major C(M,N). All shape and
@@ -154,4 +186,12 @@ impl Int8Kernel {
         }
         Ok(())
     }
+}
+
+/// Shared safe boundary, also called by each ARM leaf before target entry.
+fn check_rows(inputs: &[&[i8]], weights: &[i8], output_len: usize) -> Result<(), CpuKernelError> {
+    if inputs.len() > MAX_COHORT_ROWS || inputs.len() != output_len { return Err(CpuKernelError::Shape); }
+    if weights.len() > MAX_MODEL_K { return Err(CpuKernelError::ReductionTooLong); }
+    if inputs.iter().any(|input| input.len() != weights.len()) { return Err(CpuKernelError::LengthMismatch); }
+    Ok(())
 }
