@@ -15,6 +15,8 @@ use crate::{
         SourceOccurrence, FieldGroundingError, scan_occurrences},
 };
 mod execution;
+/// Bounded corpus transport over complete documents and one native driver.
+pub mod stream;
 
 pub const INT8_EXTRACTION_MAP_EXECUTION: &str = "portable-int8-exact-schema-document-map-v1";
 const SEMANTICS: &str = "independent-chunk-json-no-global-object-merge-v1";
