@@ -7,6 +7,7 @@ use clap::Subcommand;
 use crate::jobs::{JobId, JobLimits};
 use super::source::SourceHostArgs;
 mod config;
+pub(super) mod document;
 pub(super) mod scored;
 pub(super) mod generation;
 pub(super) use config::{Defaults, load_defaults, native_limits, parse_limits};
@@ -57,6 +58,10 @@ pub(super) struct JobArgs {
     #[arg(long, conflicts_with = "schema")] pub defaults: Option<PathBuf>,
     /// Shared exact local schema for --task extract only; alternatively use task_args.
     #[arg(long, conflicts_with = "defaults")] pub schema: Option<PathBuf>,
+    /// Extract only: immutable whole-document chunk/reduction/verification JSON.
+    /// Requires one shared schema; each journal result contains all chunk values.
+    #[arg(long, requires = "schema", conflicts_with = "defaults")]
+    pub document_config: Option<PathBuf>,
     #[arg(long, requires = "schema")] pub source_membership: bool,
     /// Publish verified materialized.ndjson after ALL items commit; never replace.
     #[arg(long)] pub materialize: bool,
@@ -77,13 +82,15 @@ impl RunMode {
 pub(super) fn definition() -> clap::Command {
     JobCommand::augment_args(clap::Command::new("job")
         .about("Start or resume explicitly retained, non-certified native corpus jobs")
-        .long_about("Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. Store private results only with --store-results, a protected existing directory, original key, random job ID and immutable limits. Resume requires the complete original input and unchanged task/model recipe. Stdout contains metadata only; errors may follow durable progress. No automatic retry, input spooling, directory/key creation or release activation."))
+        .long_about("Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. Store private results only with --store-results, a protected existing directory, original key, random job ID and immutable limits. Resume requires the complete original input and unchanged task/model recipe. Stdout contains metadata only; errors may follow durable progress. No automatic retry, input spooling, directory/key creation or release activation. Add --task extract --schema FILE --document-config FILE to retain and resume complete documents larger than one context. One journal result contains independent exact-schema chunk values, never a repaired global object or a partial document. Document settings and the shared schema must remain unchanged on resume."))
 }
 impl JobArgs {
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), Failure> {
         let local = |p: &std::path::Path| !p.as_os_str().is_empty() && p.as_os_str() != "-";
         if !self.store_results || !local(&self.job_dir) || !local(&self.key_file) || !local(&self.limits_file)
             || self.defaults.as_ref().is_some_and(|p| !local(p)) || self.schema.as_ref().is_some_and(|p| !local(p))
+            || self.document_config.as_ref().is_some_and(|p| !local(p))
+            || self.document_config.is_some() && (self.task != "extract" || self.schema.is_none() || self.defaults.is_some())
             || self.defaults.is_some() && self.schema.is_some() || self.source_membership && self.schema.is_none()
             || self.task != "extract" && (self.schema.is_some() || self.source_membership)
             || !(1..=1024 * 1024).contains(&self.max_stream_mib)
