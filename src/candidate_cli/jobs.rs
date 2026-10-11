@@ -8,6 +8,7 @@ use crate::jobs::{JobId, JobLimits};
 use super::source::SourceHostArgs;
 mod config;
 pub(super) mod document;
+pub(super) mod source_document;
 pub(super) mod scored;
 pub(super) mod generation;
 pub(super) use config::{Defaults, load_defaults, native_limits, parse_limits};
@@ -62,6 +63,10 @@ pub(super) struct JobArgs {
     /// Requires one shared schema; each journal result contains all chunk values.
     #[arg(long, requires = "schema", conflicts_with = "defaults")]
     pub document_config: Option<PathBuf>,
+    /// NER/keyphrases/summarize only: immutable whole-document map settings.
+    /// Uses fixed task defaults; records cannot replace options or budgets.
+    #[arg(long, conflicts_with_all = ["document_config", "schema", "source_membership"])]
+    pub source_document_config: Option<PathBuf>,
     #[arg(long, requires = "schema")] pub source_membership: bool,
     /// Publish verified materialized.ndjson after ALL items commit; never replace.
     #[arg(long)] pub materialize: bool,
@@ -82,7 +87,7 @@ impl RunMode {
 pub(super) fn definition() -> clap::Command {
     JobCommand::augment_args(clap::Command::new("job")
         .about("Start or resume explicitly retained, non-certified native corpus jobs")
-        .long_about("Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. Store private results only with --store-results, a protected existing directory, original key, random job ID and immutable limits. Resume requires the complete original input and unchanged task/model recipe. Stdout contains metadata only; errors may follow durable progress. No automatic retry, input spooling, directory/key creation or release activation. Add --task extract --schema FILE --document-config FILE to retain and resume complete documents larger than one context. One journal result contains independent exact-schema chunk values, never a repaired global object or a partial document. Document settings and the shared schema must remain unchanged on resume."))
+        .long_about("Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. Store private results only with --store-results, a protected existing directory, original key, random job ID and immutable limits. Resume requires the complete original input and unchanged task/model recipe. Stdout contains metadata only; errors may follow durable progress. No automatic retry, input spooling, directory/key creation or release activation. Add --task extract --schema FILE --document-config FILE to retain and resume complete documents larger than one context. One journal result contains independent exact-schema chunk values, never a repaired global object or a partial document. Document settings and the shared schema must remain unchanged on resume. For --task ner, keyphrases or summarize, use --source-document-config FILE instead: fixed task options, complete source-aligned chunk maps and one durable result per original document, without global reranking or summary synthesis."))
 }
 impl JobArgs {
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), Failure> {
@@ -99,6 +104,7 @@ impl JobArgs {
             return Err(Failure::usage("explicit_storage_or_job_options"));
         }
         self.task_kind()?;
+        source_document::validate_mode(self)?;
         let (common, limits) = self.host.common(self.input.clone()).map_err(Failure::from)?;
         for mib in [self.journal_memory_mib, self.serialization_memory_mib] {
             if mib.checked_mul(MIB).is_none_or(|bytes| bytes > limits.memory_bytes) {

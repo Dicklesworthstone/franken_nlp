@@ -3,9 +3,11 @@ use super::*;
 pub(in crate::candidate_cli) mod scored;
 pub(in crate::candidate_cli) mod generation;
 mod document;
+mod source_document;
 use std::{io::{BufRead, BufReader}, sync::Arc};
 use super::source_tasks::{Session, source_identity};
 use crate::jobs::runner::extract::document::Int8DocumentExtractionJobPlanner;
+use crate::jobs::runner::source::document::Int8SourceDocumentJobPlanner;
 use crate::{
     candidate_cli::{jobs::{self as command, Defaults, Failure, JobArgs, RunMode}, extract as schema_cli},
     batch::{BatchCode, extract::quantized::Int8ExtractionBatchLimits, source::quantized as source_batch},
@@ -23,11 +25,13 @@ enum PreparedJob {
     Source { planner: Arc<SourceTaskPlanner>, config: SourceCorpusConfig },
     Extract(Int8ExtractionJobPlanner),
     Document { planner: Int8DocumentExtractionJobPlanner, reduction_reserve_bytes: u64 },
+    SourceDocument { planner: Int8SourceDocumentJobPlanner, reduction_reserve_bytes: u64 },
 }
 fn prepare(args: &JobArgs, facts: &ArtifactIdentity, ceiling: TaskBudget, defaults: Defaults,
     native: Int8ExtractionBatchLimits, control: &mut impl DecodeStepControl)
     -> Result<(PreparedJob, Arc<ExtractionVocabulary>), Failure> {
     if args.document_config.is_some() { return Err(Failure::usage("document_job_configuration_missing")); }
+    if args.source_document_config.is_some() { return Err(Failure::usage("source_document_job_configuration_missing")); }
     checkpoint(control)?;
     let registry = pinned_controls::pinned().map_err(|_| CandidateError::Identity)?;
     let controls = registry.template_controls();
@@ -108,12 +112,16 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     let schema = args.schema.as_ref().map(|path| read_config(&session, path, schema_cli::SCHEMA_BYTES)).transpose()?;
     let raw_document = args.document_config.as_ref()
         .map(|path| read_config(&session, path, command::document::DOCUMENT_BYTES)).transpose()?;
+    let raw_source_document = args.source_document_config.as_ref()
+        .map(|path| read_config(&session, path, command::source_document::CONFIG_BYTES)).transpose()?;
     let ceiling = args.host.task_budget(limits);
     let defaults = command::load_defaults(&args, ceiling, defaults.as_deref(), schema)?;
     let facts = session.facts(&common)?;
-    let (prepared, vocabulary) = match raw_document.as_deref() {
-        Some(text) => document::prepare(&args, &facts, ceiling, defaults, text, lifetime, limits, &mut session.control())?,
-        None => prepare(&args, &facts, ceiling, defaults, native, &mut session.control())?,
+    let (prepared, vocabulary) = match (raw_document.as_deref(), raw_source_document.as_deref()) {
+        (Some(text), None) => document::prepare(&args, &facts, ceiling, defaults, text, lifetime, limits, &mut session.control())?,
+        (None, Some(text)) => source_document::prepare(&args, &facts, defaults, text, lifetime, limits, &mut session.control())?,
+        (None, None) => prepare(&args, &facts, ceiling, defaults, native, &mut session.control())?,
+        (Some(_), Some(_)) => return Err(Failure::usage("source_document_job_options")),
     };
     // Only owned IO crosses the worker boundary; root CLI must hold no stdio
     // locks. This does NOT persist the original population for future resume.
@@ -138,6 +146,8 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
         PreparedJob::Extract(planner) => session.engine.job_int8_extract(&model, planner,
             vocabulary, request, host, reader, cancellation),
         PreparedJob::Document { planner, reduction_reserve_bytes } => session.engine.job_int8_extract_document(&model,
+            planner, vocabulary, request, host, reduction_reserve_bytes, reader, cancellation),
+        PreparedJob::SourceDocument { planner, reduction_reserve_bytes } => session.engine.job_int8_source_document(&model,
             planner, vocabulary, request, host, reduction_reserve_bytes, reader, cancellation),
     }.map_err(host_failure)?;
     session.remaining()?;
