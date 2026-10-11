@@ -12,6 +12,7 @@ use super::{int8::{self, Int8KernelError}, quant_algebra::MAX_MODEL_K};
 
 #[cfg(target_arch = "x86_64")]
 mod avx2;
+pub mod config;
 #[cfg(test)]
 mod tests;
 

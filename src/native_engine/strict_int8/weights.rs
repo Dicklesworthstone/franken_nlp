@@ -3,7 +3,8 @@
 //! reader, envelope interpretation, activation capability or dequantized copy.
 
 use super::*;
-use crate::native_engine::{artifact_bridge::{ArtifactBf16Tensor, ArtifactIdentity, ArtifactWeightSet}, weights::Bf16Matrix};
+use crate::native_engine::{artifact_bridge::{ArtifactBf16Tensor, ArtifactIdentity, ArtifactWeightSet}, weights::Bf16Matrix,
+    simd::{Int8Kernel, Int8KernelKind, config::process_kernel}};
 
 pub(super) struct Int8Layer<'a> {
     pub norm1: &'a [Bf16], pub norm2: &'a [Bf16],
@@ -52,8 +53,26 @@ impl<'a> Int8WeightView<'a> {
             });
         }
         Ok(Self { identity: source.identity(), embeddings, final_norm, head,
-            layers: layers.try_into().map_err(|_| StrictInt8Error::Weights)? })
+            layers: layers.try_into().map_err(|_| StrictInt8Error::Weights)? }.with_kernel(process_kernel()))
     }
+    /// Apply one detected kernel to every decoder projection and the lm-head.
+    /// This moves only borrowed views, before they enter an engine/session;
+    /// both loop passes and grouped/cohort paths borrow these same matrices.
+    /// Strict integer/epilogue semantics and artifact identity are unchanged.
+    pub fn with_kernel(mut self, kernel: Int8Kernel) -> Self {
+        for layer in &mut self.layers {
+            layer.q = layer.q.with_kernel(kernel);
+            layer.k = layer.k.with_kernel(kernel);
+            layer.v = layer.v.with_kernel(kernel);
+            layer.o = layer.o.with_kernel(kernel);
+            layer.gate = layer.gate.with_kernel(kernel);
+            layer.up = layer.up.with_kernel(kernel);
+            layer.down = layer.down.with_kernel(kernel);
+        }
+        self.head = self.head.with_kernel(kernel);
+        self
+    }
+    pub fn kernel_kind(&self) -> Int8KernelKind { self.head.kernel_kind() }
     pub fn artifact_identity(&self) -> &ArtifactIdentity { self.identity }
 }
 fn norm<'a>(source: &'a ArtifactWeightSet, name: &str) -> Result<&'a [Bf16], StrictInt8Error> {

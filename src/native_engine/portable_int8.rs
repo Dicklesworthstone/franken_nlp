@@ -1,9 +1,9 @@
 //! Executable portable int8 linear algebra over borrowed Generic rows.
 //!
-//! This is a code-first scalar implementation, NOT artifact activation, a
-//! dispatch award, or a BF16 fidelity claim. It never expands the weight matrix
-//! to floats. The caller owns process admission and the cancellation controller.
-//! Activation storage is provisioned once and reusable across Q/K/V or gate/up.
+//! Scalar remains the default; a caller may explicitly install a checked CPU
+//! kernel handle. This is NOT artifact activation, a dispatch award, or a BF16
+//! fidelity claim. Weights never expand to floats. The caller owns admission
+//! and cancellation. Activation storage is reusable across Q/K/V or gate/up.
 
 use std::{error::Error, fmt};
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,7 @@ use super::{
     int8::{Int8KernelError, dequantize_i32_fixed, dot_s8s8},
     lmhead::NANBEIGE_VOCAB_SIZE,
     quant_algebra::{EpilogueScales, MAX_MODEL_K},
+    simd::{CpuKernelError, Int8Kernel, Int8KernelKind},
     tensor::Bf16,
 };
 
@@ -25,7 +26,7 @@ const ROWS_PER_CHECKPOINT: usize = 32;
 pub enum LinearError {
     Shape, WeightScale, RowSum, Activation, ScaleUnderflow, Workspace,
     Selection, OutputShape, WorkBudget, Allocation, NonFiniteOutput,
-    Kernel(Int8KernelError), Cancelled(DecodeCancellationKind),
+    Kernel(Int8KernelError), CpuKernel(CpuKernelError), Cancelled(DecodeCancellationKind),
 }
 impl fmt::Display for LinearError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -42,6 +43,7 @@ impl fmt::Display for LinearError {
             Self::Allocation => "portable int8 workspace allocation refused",
             Self::NonFiniteOutput => "portable int8 projection is not finite in its output dtype",
             Self::Kernel(_) => "portable int8 canonical integer or scale stage failed",
+            Self::CpuKernel(_) => "portable int8 selected CPU kernel refused the reduction",
             Self::Cancelled(_) => "portable int8 projection cancelled",
         })
     }
@@ -164,7 +166,9 @@ impl LinearRows<'_> {
 /// A view does not authenticate a file, choose an envelope authority or clone
 /// weights. Full i8 bit patterns, including -128, retain exact scalar semantics.
 #[derive(Clone, Copy)]
-pub struct QuantizedLinear<'a> { rows: usize, columns: usize, values: &'a [i8], scales: &'a [f32] }
+pub struct QuantizedLinear<'a> {
+    rows: usize, columns: usize, values: &'a [i8], scales: &'a [f32], kernel: Int8Kernel,
+}
 impl<'a> QuantizedLinear<'a> {
     pub fn checked(rows: usize, columns: usize, values: &'a [i8], scales: &'a [f32], sums: &[i32])
         -> Result<Self, LinearError> {
@@ -177,11 +181,15 @@ impl<'a> QuantizedLinear<'a> {
             let actual: i64 = row.iter().map(|&value| i64::from(value)).sum();
             if actual != i64::from(sum) { return Err(LinearError::RowSum); }
         }
-        Ok(Self { rows, columns, values, scales })
+        Ok(Self { rows, columns, values, scales, kernel: Int8Kernel::scalar() })
     }
     pub fn from_portable(matrix: &'a PortableQuantizedMatrix) -> Result<Self, LinearError> {
         Self::checked(matrix.rows(), matrix.columns(), matrix.values(), matrix.row_scales(), matrix.row_sums())
     }
+    /// Select an already hardware-checked executable without copying weights,
+    /// changing quantization, or moving any fixed floating-point cast boundary.
+    pub fn with_kernel(mut self, kernel: Int8Kernel) -> Self { self.kernel = kernel; self }
+    pub fn kernel_kind(self) -> Int8KernelKind { self.kernel.kind() }
     pub fn rows(self) -> usize { self.rows }
     pub fn columns(self) -> usize { self.columns }
     pub fn project_f32_into<C: DecodeStepControl>(&self, input: &ActivationBuffer, rows: LinearRows<'_>,
@@ -208,7 +216,12 @@ impl<'a> QuantizedLinear<'a> {
             if index % ROWS_PER_CHECKPOINT == 0 { poll(control)?; }
             let row = rows.row(index);
             let start = row * self.columns;
-            let accumulator = dot_s8s8(values, &self.values[start..start + self.columns])?;
+            let weights = &self.values[start..start + self.columns];
+            let accumulator = if self.kernel.kind() == Int8KernelKind::Scalar {
+                dot_s8s8(values, weights)?
+            } else {
+                self.kernel.dot(values, weights).map_err(LinearError::CpuKernel)?
+            };
             let result = dequantize_i32_fixed(accumulator, EpilogueScales {
                 activation: input.scale()?, row: self.scales[row], column: 1.0, group: 1.0,
             })?;

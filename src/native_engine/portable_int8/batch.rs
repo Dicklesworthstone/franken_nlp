@@ -1,10 +1,10 @@
 //! Shared-weight, activation-row-tiled INT8 projections.
 //!
-//! The kernel borrows the existing checked Generic matrix. Each weight value
-//! feeds up to four independent accumulators before the next K coordinate is
-//! loaded. Every accumulator traverses K in the scalar order and uses the
-//! SAME fixed dequantization epilogue; no floating reduction crosses rows.
-//! No weights are expanded, no workers spawn, and no hot allocation occurs.
+//! The kernel borrows the existing checked Generic matrix. The scalar route
+//! feeds each weight to up to four independent accumulators; explicit CPU
+//! kernels evaluate those same cohort rows through their checked INT8 leaves.
+//! Every row uses the SAME fixed dequantization epilogue; no floating reduction
+//! crosses rows. No weights expand, workers spawn, or hot allocation occurs.
 //! Source implementation only: no measured throughput or parity award.
 use super::*;
 
@@ -62,9 +62,15 @@ impl QuantizedLinear<'_> {
                 }
                 // Checked K <= MAX_MODEL_K. Even the full i8 domain has
                 // |partial sum| <= K*16384 < i32::MAX; no saturating arithmetic.
-                for (k, &weight) in weights.iter().enumerate() {
-                    let weight = i32::from(weight);
-                    for lane in 0..cohort.len() { sums[lane] += i32::from(activations[lane][k]) * weight; }
+                if self.kernel.kind() == Int8KernelKind::Scalar {
+                    for (k, &weight) in weights.iter().enumerate() {
+                        let weight = i32::from(weight);
+                        for lane in 0..cohort.len() { sums[lane] += i32::from(activations[lane][k]) * weight; }
+                    }
+                } else {
+                    for lane in 0..cohort.len() {
+                        sums[lane] = self.kernel.dot(activations[lane], weights).map_err(LinearError::CpuKernel)?;
+                    }
                 }
                 for lane in 0..cohort.len() {
                     let value = dequantize_i32_fixed(sums[lane], EpilogueScales {

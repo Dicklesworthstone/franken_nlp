@@ -14,9 +14,13 @@ mod existing {
 }
 
 fn definition() -> clap::Command {
+    let candidate = crate::candidate_cli::definition().arg(clap::Arg::new("int8-kernel")
+        .long("int8-kernel").global(true).value_name("KERNEL")
+        .value_parser(["s_scalar_i32", "x3a_avx2_low7_high_bit", "x3b_avx2_widened_i16"])
+        .help("Explicit experimental CPU kernel for native INT8 projections; scalar remains the default"));
     let command = existing::definition().subcommand(crate::redaction_cli::definition())
         .subcommands(crate::text_cli::definitions()).subcommand(crate::text_batch::definition())
-        .subcommand(crate::candidate_cli::definition());
+        .subcommand(candidate);
     #[cfg(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")))]
     let command = command.subcommand(crate::job_cli::definition());
@@ -56,6 +60,19 @@ pub fn cli_main() -> ExitCode {
     // Candidate corpus execution transfers owned IO into the blocking pool.
     // Holding a caller-thread stdio lock here would deadlock its worker.
     if let Some(("candidate", matches)) = matches.subcommand() {
+        // CPU admission happens BEFORE reading input, loading weights, spawning
+        // native work, or taking a stdio lock. This policy is immutable once
+        // model binding begins; no hot loop consults environment or globals.
+        if let Some(value) = matches.get_one::<String>("int8-kernel") {
+            use crate::native_engine::simd::{Int8KernelKind, config::configure_process_kernel};
+            let selected = value.parse::<Int8KernelKind>().ok()
+                .and_then(|kind| configure_process_kernel(kind).ok());
+            let Some(kind) = selected else {
+                eprintln!("fnlp candidate: requested INT8 kernel is unavailable or process policy is already fixed");
+                return ErrorCode::Usage.as_process_exit();
+            };
+            eprintln!("fnlp candidate: int8_kernel={kind} selection=explicit_unqualified");
+        }
         let options = match crate::candidate_cli::CandidateCommand::from_matches(matches) {
             Ok(options) => options,
             Err(_) => return ErrorCode::Usage.as_process_exit(),
@@ -133,5 +150,34 @@ mod task_dispatch_tests {
         let supported = cfg!(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")));
         assert_eq!(definition().try_get_matches_from(["fnlp", "job", "schema"]).is_ok(), supported);
+    }
+    #[test]
+    fn explicit_kernel_is_global_within_candidate_and_survives_task_parsing() {
+        for kind in crate::native_engine::simd::Int8KernelKind::ALL {
+            for task in ["generate", "chat", "ner", "keyphrases", "summarize", "answer"] {
+                for before in [true, false] {
+                    let mut args = vec!["fnlp", "candidate"];
+                    if before { args.extend(["--int8-kernel", kind.id()]); }
+                    args.extend([task, "--model", "local.fnlpq", "--memory-mib", "8192"]);
+                    if !before { args.extend(["--int8-kernel", kind.id()]); }
+                    let matches = definition().try_get_matches_from(args).unwrap();
+                    let ("candidate", inner) = matches.subcommand().unwrap() else { panic!("wrong route") };
+                    assert_eq!(inner.get_one::<String>("int8-kernel").map(String::as_str), Some(kind.id()));
+                    assert!(crate::candidate_cli::CandidateCommand::from_matches(inner).is_ok());
+                }
+            }
+        }
+    }
+    #[test]
+    fn kernel_policy_is_not_an_ambient_option_or_automatic_fastest_choice() {
+        for bad in ["auto", "fastest", "avx2", "x3b_avx2_widened_i16 "] {
+            assert!(definition().try_get_matches_from(["fnlp", "candidate", "generate",
+                "--model", "local.fnlpq", "--memory-mib", "8192", "--int8-kernel", bad]).is_err());
+        }
+        assert!(definition().try_get_matches_from(["fnlp", "--int8-kernel", "s_scalar_i32", "tokens"]).is_err());
+        assert!(definition().try_get_matches_from(["fnlp", "tokens", "--int8-kernel", "s_scalar_i32"]).is_err());
+        let matches = definition().try_get_matches_from(["fnlp", "candidate", "generate",
+            "--model", "local.fnlpq", "--memory-mib", "8192"]).unwrap();
+        assert!(matches.subcommand().unwrap().1.get_one::<String>("int8-kernel").is_none());
     }
 }
