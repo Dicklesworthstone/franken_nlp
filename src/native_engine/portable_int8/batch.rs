@@ -1,8 +1,8 @@
 //! Shared-weight, activation-row-tiled INT8 projections.
 //!
-//! The kernel borrows the existing checked Generic matrix. The scalar route
-//! feeds each weight to up to four independent accumulators; explicit CPU
-//! kernels evaluate those same cohort rows through their checked INT8 leaves.
+//! Both the scalar and explicit AVX2 paths feed each loaded weight to up to
+//! four independent activation accumulators. The AVX2 cohort leaves reuse the
+//! vector weight block (and X3a correction) across all live rows in a tile.
 //! Every row uses the SAME fixed dequantization epilogue; no floating reduction
 //! crosses rows. No weights expand, workers spawn, or hot allocation occurs.
 //! Source implementation only: no measured throughput or parity award.
@@ -10,7 +10,7 @@ use super::*;
 
 /// Finite activation cohort ceiling, independent of the selected output width.
 pub const MAX_BATCH_ROWS: usize = 64;
-const TILE_ROWS: usize = 4;
+const TILE_ROWS: usize = crate::native_engine::simd::MAX_COHORT_ROWS;
 pub const BATCH_LINEAR_VERSION: &str = "portable-s8-shared-weight-m4-fixed-epilogue-v1";
 
 impl QuantizedLinear<'_> {
@@ -68,9 +68,8 @@ impl QuantizedLinear<'_> {
                         for lane in 0..cohort.len() { sums[lane] += i32::from(activations[lane][k]) * weight; }
                     }
                 } else {
-                    for lane in 0..cohort.len() {
-                        sums[lane] = self.kernel.dot(activations[lane], weights).map_err(LinearError::CpuKernel)?;
-                    }
+                    self.kernel.dot_rows_into(&activations[..cohort.len()], weights,
+                        &mut sums[..cohort.len()]).map_err(LinearError::CpuKernel)?;
                 }
                 for lane in 0..cohort.len() {
                     let value = dequantize_i32_fixed(sums[lane], EpilogueScales {

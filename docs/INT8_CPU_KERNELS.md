@@ -45,15 +45,29 @@ hardware-checked `Int8Kernel` to `Int8WeightView::with_kernel` before engine
 construction. Both options borrow the existing weights rather than copying or
 expanding them. Leaf kernels neither spawn workers nor inspect the environment.
 
+`Int8Kernel::dot_rows_into` evaluates up to four independent borrowed activation
+rows against one weight row. Its AVX2 bodies load each complete vector weight
+block once for the cohort; X3a also shares its offset-correction reduction.
+The existing grouped `QuantizedLinear` projections use this leaf whenever an
+AVX2 kernel was explicitly selected. Every row retains its own accumulator,
+scale and BF16 cast. Tail cohorts of one, two or three rows and noncontiguous,
+unaligned, read-only aliased inputs are supported without a packing copy.
+This optimizes already-selected grouped execution; it does not silently turn
+serial requests into a batch or introduce another scheduler. The dispatcher's
+standalone GEMM convenience route retains its separately reported 1x1x32 tile.
+
 ## Evidence boundary
 
 The Rust differential definitions exercise scalar/i64 agreement, every byte
 pair, full model reduction sizes, unaligned vector tails, scalar/BF16 projection
 bits, selected-row behavior, grouped execution and cancellation/work accounting.
 They have not been compiled or executed in the implementation environment.
-An independent local C translation of the two instruction algorithms completed
-82,541 differential cases with zero mismatches under UBSan, including protected
-page endings for every length from zero through 10,752. That is an arithmetic
-and memory-access cross-check of the C translation, not Rust, DSR, model parity,
-Apple/Zen host performance, or a Bead/release gate receipt. Those gates remain
-independent and must be run against the actual Rust source and target hosts.
+An independent local C translation of the two single-row instruction algorithms
+completed 82,541 differential cases with zero mismatches under UBSan, including
+protected page endings for every length from zero through 10,752. The separate
+shared-weight translation completed 121,092 cohort cases, checking 401,418
+output rows with zero mismatches, including 43,012 protected-page shapes across
+all four cohort sizes and every supported reduction length. These are arithmetic
+and memory-access cross-checks of the C translations, not Rust, DSR, model
+parity, Apple/Zen host performance, or Bead/release gate receipts. Those gates
+remain independent and must run against the actual Rust source and target hosts.

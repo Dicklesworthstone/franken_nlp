@@ -16,6 +16,9 @@ pub mod config;
 #[cfg(test)]
 mod tests;
 
+/// Maximum simultaneously accumulated activation rows in a shared-weight leaf.
+pub const MAX_COHORT_ROWS: usize = 4;
+
 /// These are implementation identifiers, not measured dispatch winners.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Int8KernelKind { Scalar, Avx2Low7HighBit, Avx2WidenedI16 }
@@ -104,6 +107,31 @@ impl Int8Kernel {
             Implementation::Scalar => int8::dot_s8s8(input, weights).map_err(CpuKernelError::Scalar),
             #[cfg(target_arch = "x86_64")]
             Implementation::Avx2(kernel) => kernel.dot(input, weights),
+        }
+    }
+    /// Evaluate up to four independently borrowed activation rows against ONE
+    /// weight row. AVX2 loads each weight block once for the whole cohort. Rows
+    /// need not be contiguous or aligned and may alias each other/weights.
+    /// Check ALL lengths before any output write; K remains independently
+    /// bounded for each accumulator, never one reduction across documents.
+    pub fn dot_rows_into(self, inputs: &[&[i8]], weights: &[i8], output: &mut [i32])
+        -> Result<(), CpuKernelError> {
+        if inputs.len() > MAX_COHORT_ROWS || inputs.len() != output.len() {
+            return Err(CpuKernelError::Shape);
+        }
+        if weights.len() > MAX_MODEL_K { return Err(CpuKernelError::ReductionTooLong); }
+        if inputs.iter().any(|input| input.len() != weights.len()) {
+            return Err(CpuKernelError::LengthMismatch);
+        }
+        match self.implementation {
+            Implementation::Scalar => {
+                for (input, value) in inputs.iter().zip(output) {
+                    *value = int8::dot_s8s8(input, weights).map_err(CpuKernelError::Scalar)?;
+                }
+                Ok(())
+            }
+            #[cfg(target_arch = "x86_64")]
+            Implementation::Avx2(kernel) => kernel.dot_rows_into(inputs, weights, output),
         }
     }
     /// A(M,K) times transpose(W(N,K)) -> row-major C(M,N). All shape and

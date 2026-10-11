@@ -8,7 +8,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::arch::x86_64::*;
-use super::{CpuKernelError, Int8KernelKind, MAX_MODEL_K};
+use super::{CpuKernelError, Int8KernelKind, MAX_COHORT_ROWS, MAX_MODEL_K};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Avx2Kernel { kind: Int8KernelKind }
@@ -21,6 +21,32 @@ impl Avx2Kernel {
         Ok(Self { kind })
     }
     pub(super) fn kind(self) -> Int8KernelKind { self.kind }
+    pub(super) fn dot_rows_into(self, inputs: &[&[i8]], weights: &[i8], output: &mut [i32])
+        -> Result<(), CpuKernelError> {
+        if inputs.len() > MAX_COHORT_ROWS || inputs.len() != output.len() { return Err(CpuKernelError::Shape); }
+        if weights.len() > MAX_MODEL_K { return Err(CpuKernelError::ReductionTooLong); }
+        if inputs.iter().any(|input| input.len() != weights.len()) { return Err(CpuKernelError::LengthMismatch); }
+        if inputs.is_empty() { return Ok(()); }
+        // SAFETY: this private handle proves real AVX2 support. All input rows
+        // have the same bounded K as weights. The closed match instantiates only
+        // M=1..4 and always with EXACTLY M valid slices; the output stays local.
+        let sums = unsafe {
+            match (self.kind, inputs.len()) {
+                (Int8KernelKind::Avx2Low7HighBit, 1) => low7_rows::<1>(inputs, weights),
+                (Int8KernelKind::Avx2Low7HighBit, 2) => low7_rows::<2>(inputs, weights),
+                (Int8KernelKind::Avx2Low7HighBit, 3) => low7_rows::<3>(inputs, weights),
+                (Int8KernelKind::Avx2Low7HighBit, 4) => low7_rows::<4>(inputs, weights),
+                (Int8KernelKind::Avx2WidenedI16, 1) => widened_rows::<1>(inputs, weights),
+                (Int8KernelKind::Avx2WidenedI16, 2) => widened_rows::<2>(inputs, weights),
+                (Int8KernelKind::Avx2WidenedI16, 3) => widened_rows::<3>(inputs, weights),
+                (Int8KernelKind::Avx2WidenedI16, 4) => widened_rows::<4>(inputs, weights),
+                _ => unreachable!("sealed AVX2 cohort construction"),
+            }
+        };
+        output.copy_from_slice(&sums[..inputs.len()]);
+        Ok(())
+    }
+
     pub(super) fn dot(self, input: &[i8], weights: &[i8]) -> Result<i32, CpuKernelError> {
         if input.len() != weights.len() { return Err(CpuKernelError::LengthMismatch); }
         if input.len() > MAX_MODEL_K { return Err(CpuKernelError::ReductionTooLong); }
@@ -117,5 +143,94 @@ unsafe fn widened_i16(input: &[i8], weights: &[i8]) -> i32 {
         for value in high_lanes { result += value; }
         for index in end..input.len() { result += i32::from(input[index]) * i32::from(weights[index]); }
         result
+    }
+}
+
+
+// Independent per-document accumulators, common weight bytes and correction.
+// The pair/whole-dot bounds above apply to EACH row, not M times one i32 sum.
+#[target_feature(enable = "avx2")]
+unsafe fn low7_rows<const M: usize>(inputs: &[&[i8]], weights: &[i8]) -> [i32; MAX_COHORT_ROWS] {
+    let end = weights.len() / 32 * 32;
+    // SAFETY: the closed caller proves AVX2, M=1..4, inputs.len()==M and equal
+    // bounded K for every row. All vector loads stay within complete 32-byte
+    // blocks. Each storeu targets one local eight-i32 array. No padding or
+    // alignment is assumed; tail indices are in-bounds on every original row.
+    unsafe {
+        let sign = _mm256_set1_epi8(i8::MIN);
+        let low_mask = _mm256_set1_epi8(127);
+        let ones8 = _mm256_set1_epi8(1);
+        let ones16 = _mm256_set1_epi16(1);
+        let zero = _mm256_setzero_si256();
+        let mut low = [zero; M];
+        let mut high = [zero; M];
+        let mut sums = zero;
+        for start in (0..end).step_by(32) {
+            let w = _mm256_loadu_si256(weights.as_ptr().add(start).cast());
+            sums = _mm256_add_epi32(sums, _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, w), ones16));
+            for row in 0..M {
+                let x = _mm256_loadu_si256(inputs[row].as_ptr().add(start).cast());
+                let u = _mm256_xor_si256(x, sign);
+                let lo = _mm256_and_si256(u, low_mask);
+                let hi = _mm256_and_si256(_mm256_srli_epi16::<7>(u), ones8);
+                low[row] = _mm256_add_epi32(low[row], _mm256_madd_epi16(_mm256_maddubs_epi16(lo, w), ones16));
+                high[row] = _mm256_add_epi32(high[row], _mm256_madd_epi16(_mm256_maddubs_epi16(hi, w), ones16));
+            }
+        }
+        let mut correction = [0_i32; 8];
+        _mm256_storeu_si256(correction.as_mut_ptr().cast(), sums);
+        let mut output = [0_i32; MAX_COHORT_ROWS];
+        for row in 0..M {
+            let mut low_lanes = [0_i32; 8];
+            let mut high_lanes = [0_i32; 8];
+            _mm256_storeu_si256(low_lanes.as_mut_ptr().cast(), low[row]);
+            _mm256_storeu_si256(high_lanes.as_mut_ptr().cast(), high[row]);
+            for lane in 0..8 {
+                output[row] += low_lanes[lane] + 128 * high_lanes[lane] - 128 * correction[lane];
+            }
+        }
+        for index in end..weights.len() {
+            let w = i32::from(weights[index]);
+            for row in 0..M { output[row] += i32::from(inputs[row][index]) * w; }
+        }
+        output
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn widened_rows<const M: usize>(inputs: &[&[i8]], weights: &[i8]) -> [i32; MAX_COHORT_ROWS] {
+    let end = weights.len() / 32 * 32;
+    // SAFETY: the caller proves real AVX2, M=1..4, exactly M input rows, and
+    // equal bounded K. Both 16-byte halves of each load fit inside the complete
+    // 32-byte block, including on the last row. Storeu writes only local arrays
+    // of eight i32 values. Scalar tails never read beyond a row or weights.
+    unsafe {
+        let zero = _mm256_setzero_si256();
+        let mut lower = [zero; M];
+        let mut upper = [zero; M];
+        for start in (0..end).step_by(32) {
+            let w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(weights.as_ptr().add(start).cast()));
+            let w1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(weights.as_ptr().add(start + 16).cast()));
+            for row in 0..M {
+                let x0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(inputs[row].as_ptr().add(start).cast()));
+                let x1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(inputs[row].as_ptr().add(start + 16).cast()));
+                lower[row] = _mm256_add_epi32(lower[row], _mm256_madd_epi16(x0, w0));
+                upper[row] = _mm256_add_epi32(upper[row], _mm256_madd_epi16(x1, w1));
+            }
+        }
+        let mut output = [0_i32; MAX_COHORT_ROWS];
+        for row in 0..M {
+            let mut low_lanes = [0_i32; 8];
+            let mut high_lanes = [0_i32; 8];
+            _mm256_storeu_si256(low_lanes.as_mut_ptr().cast(), lower[row]);
+            _mm256_storeu_si256(high_lanes.as_mut_ptr().cast(), upper[row]);
+            for value in low_lanes { output[row] += value; }
+            for value in high_lanes { output[row] += value; }
+        }
+        for index in end..weights.len() {
+            let w = i32::from(weights[index]);
+            for row in 0..M { output[row] += i32::from(inputs[row][index]) * w; }
+        }
+        output
     }
 }

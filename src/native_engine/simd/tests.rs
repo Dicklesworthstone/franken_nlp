@@ -145,3 +145,97 @@ fn explicit_kind_roundtrip_and_executable_handle_is_send_sync() {
     send_sync::<Int8Kernel>();
     assert_eq!(Int8Kernel::default().kind(), Int8KernelKind::Scalar);
 }
+
+fn check_cohort(kernels: &[Int8Kernel], inputs: &[&[i8]], weights: &[i8]) {
+    let expected: Vec<i32> = inputs.iter().map(|input| oracle(input, weights)).collect();
+    for &kernel in kernels {
+        let mut output = vec![919_i32; inputs.len()];
+        kernel.dot_rows_into(inputs, weights, &mut output).unwrap();
+        assert_eq!(output, expected, "tier={} M={} K={}", kernel.kind(), inputs.len(), weights.len());
+    }
+}
+
+#[test]
+fn shared_weight_cohorts_cover_every_row_count_unaligned_tail_and_model_k() {
+    let kernels = kernels(); let mut seed = 0x567a_c098_199d_2213;
+    let storage: Vec<Vec<i8>> = (0..MAX_COHORT_ROWS).map(|_|
+        (0..MAX_MODEL_K + 32).map(|_| next(&mut seed)).collect()).collect();
+    let weights: Vec<i8> = (0..MAX_MODEL_K + 32).map(|_| next(&mut seed)).collect();
+    for m in 0..=MAX_COHORT_ROWS {
+        for offset in 0..32 {
+            for k in (0..96).chain(int8::MODEL_KS) {
+                let inputs: Vec<&[i8]> = storage[..m].iter().enumerate().map(|(row, data)| {
+                    let start = (offset + row * 7) % 32; &data[start..start + k]
+                }).collect();
+                check_cohort(&kernels, &inputs, &weights[31 - offset..31 - offset + k]);
+            }
+        }
+    }
+}
+
+#[test]
+fn shared_correction_is_exact_for_every_byte_pair_and_independent_row_signs() {
+    let kernels = kernels();
+    for x in -128_i16..=127 {
+        let first = [x as i8; 32]; let inverse = [!(x as i8); 32];
+        let minimum = [-128; 32]; let maximum = [127; 32];
+        let inputs: [&[i8]; 4] = [&first, &minimum, &maximum, &inverse];
+        for w in -128_i16..=127 { check_cohort(&kernels, &inputs, &[w as i8; 32]); }
+    }
+}
+
+#[test]
+fn maximum_k_accumulates_independently_without_multiplying_the_i32_bound_by_rows() {
+    let kernels = kernels();
+    let storage: Vec<Vec<i8>> = [-128, -127, 0, 127].into_iter().map(|v| vec![v; MAX_MODEL_K]).collect();
+    let inputs: Vec<&[i8]> = storage.iter().map(Vec::as_slice).collect();
+    for w in [-128, -127, -1, 0, 1, 127] { check_cohort(&kernels, &inputs, &vec![w; MAX_MODEL_K]); }
+}
+
+#[test]
+fn every_cohort_shape_is_checked_before_the_first_output_write() {
+    for kernel in kernels() {
+        let good = [1_i8; 32]; let bad = [1_i8; 31];
+        let mut output = [919_i32; 4];
+        assert_eq!(kernel.dot_rows_into(&[&good[..], &good[..], &good[..], &bad[..]], &good, &mut output), Err(CpuKernelError::LengthMismatch));
+        assert_eq!(output, [919; 4]);
+        assert_eq!(kernel.dot_rows_into(&[&good[..]; 4], &good, &mut output[..3]), Err(CpuKernelError::Shape));
+        assert_eq!(output, [919; 4]);
+        let mut too_many = [919_i32; 5];
+        assert_eq!(kernel.dot_rows_into(&[&good[..]; 5], &good, &mut too_many), Err(CpuKernelError::Shape));
+        assert_eq!(too_many, [919; 5]);
+        let long = vec![1_i8; MAX_MODEL_K + 1];
+        assert_eq!(kernel.dot_rows_into(&[long.as_slice()], &long, &mut output[..1]), Err(CpuKernelError::ReductionTooLong));
+        assert_eq!(output, [919; 4]);
+        kernel.dot_rows_into(&[], &good, &mut []).unwrap();
+    }
+}
+
+#[test]
+fn read_only_activation_and_weight_aliases_are_legal_and_unchanged() {
+    let bytes = [-128_i8; 65];
+    for kernel in kernels() {
+        let mut output = [0_i32; 4];
+        kernel.dot_rows_into(&[&bytes[..]; 4], &bytes, &mut output).unwrap();
+        assert_eq!(output, [65 * 16384; 4]);
+        assert_eq!(bytes, [-128; 65]);
+    }
+}
+
+#[test]
+fn row_permutation_and_reusing_a_handle_cannot_mix_document_accumulators() {
+    let storage: Vec<Vec<i8>> = (0..4).map(|row|
+        (0..67).map(|i| ((i * 29 + row * 73) % 256) as u8 as i8).collect()).collect();
+    let weights: Vec<i8> = (0..67).map(|i| ((i * 53 + 128) % 256) as u8 as i8).collect();
+    let inputs: Vec<&[i8]> = storage.iter().map(Vec::as_slice).collect();
+    let order = [2, 0, 3, 1]; let permuted: Vec<_> = order.iter().map(|&i| inputs[i]).collect();
+    for kernel in kernels() {
+        let mut a = [0_i32; 4]; let mut b = [0_i32; 4];
+        kernel.dot_rows_into(&inputs, &weights, &mut a).unwrap();
+        kernel.dot_rows_into(&permuted, &weights, &mut b).unwrap();
+        for row in 0..4 { assert_eq!(b[row], a[order[row]]); }
+        kernel.dot_rows_into(&[inputs[1]], &weights, &mut b[..1]).unwrap();
+        assert_eq!(b[0], a[1]);
+        assert_eq!(&b[1..], &[a[order[1]], a[order[2]], a[order[3]]]);
+    }
+}
