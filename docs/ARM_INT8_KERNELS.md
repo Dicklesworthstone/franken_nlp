@@ -41,11 +41,34 @@ nightly `stdarch_neon_i8mm` feature only on that target; other targets do not
 receive the feature attribute. Unsafe operations remain confined to the two
 enumerated ARM files, behind actual CPU checks and explicit bounds proofs.
 
+## Dispatch and reporting
+
+The existing `Dispatcher::int8_gemm` and `int8_gemv` entrypoints execute A1/A2/A3
+when explicitly forced or selected by a supplied compatible measurement row.
+Each result identifies the body actually used and its maximum tile geometry;
+no scalar result is relabeled as an ARM execution. The execution boundary
+independently detects the real host, so an injected feature report cannot
+mint a foreign-architecture or unsupported-ISA handle. `dotprod` and `i8mm`
+remain separate capabilities. Inapplicable compilation targets report no body.
+
+`robot backends` reports ARM implementations as registered on their applicable
+targets without changing the report schema. Registration means source exists,
+not that qualification or a performance comparison passed. No measurement rows
+are installed by this change: an empty table still selects scalar. INT8
+registration does not authorize an ARM INT4 path; explicit INT4 requests fail,
+and unavailable table entries fall back with conservative-default provenance.
+Measurement rows naming a tile with no corresponding body are rejected.
+
+## Evidence boundary
+
 The safe A3 arithmetic has portable test definitions; ISA cases skip explicitly
 on unsupported test hosts. Dense tests cover SMMLA operand/result layout,
 row/column/K tails, unaligned views, batch permutation, shape-before-write
-rejection and extreme independent accumulators. Existing exhaustive scalar/i64,
-native projection and CLI matrix definitions enumerate all new kinds.
+rejection and extreme independent accumulators. Dispatch tests cover actual
+forced/table execution, hostile injected capabilities, operation isolation,
+allocation failures, target-specific registry state and unchanged defaults.
+Existing exhaustive scalar/i64, native projection and CLI matrix definitions
+enumerate all new kinds; immutable process-policy tests include all candidates.
 Compilation, Rust tests, model parity, code-generation inspection and target-host
 benchmarks were not run in this implementation session. These are code-first
 candidates, not closure of the full hpt/g2n offline-packed-panel/performance gates.

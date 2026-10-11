@@ -57,7 +57,8 @@ mod tests {
     fn a_late_change_never_replaces_a_bound_default() {
         let cell = OnceLock::new();
         let _ = cell.get_or_init(Int8Kernel::scalar);
-        for kind in [Int8KernelKind::Avx2Low7HighBit, Int8KernelKind::Avx2WidenedI16] {
+        for kind in Int8KernelKind::ALL {
+            if kind == Int8KernelKind::Scalar { continue; }
             match Int8Kernel::detect(kind) {
                 Ok(kernel) => {
                     assert_eq!(install(&cell, kernel), Err(KernelConfigurationError::AlreadyConfigured {

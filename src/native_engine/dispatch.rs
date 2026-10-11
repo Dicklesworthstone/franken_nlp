@@ -209,6 +209,12 @@ impl KernelTier {
             (Self::X3aAvx2Low7HighBit, KernelOperation::Int8Gemv) => "x3a_avx2_low7_high_bit_int8_gemv",
             (Self::X3bAvx2WidenedI16, KernelOperation::Int8Gemm) => "x3b_avx2_widened_i16_int8_gemm",
             (Self::X3bAvx2WidenedI16, KernelOperation::Int8Gemv) => "x3b_avx2_widened_i16_int8_gemv",
+            (Self::A1Smmla, KernelOperation::Int8Gemm) => "a1_smmla_int8_gemm",
+            (Self::A1Smmla, KernelOperation::Int8Gemv) => "a1_smmla_int8_gemv",
+            (Self::A2Dotprod, KernelOperation::Int8Gemm) => "a2_dotprod_int8_gemm",
+            (Self::A2Dotprod, KernelOperation::Int8Gemv) => "a2_dotprod_int8_gemv",
+            (Self::A3Autovec, KernelOperation::Int8Gemm) => "a3_autovec_int8_gemm",
+            (Self::A3Autovec, KernelOperation::Int8Gemv) => "a3_autovec_int8_gemv",
             (Self::A1Smmla, _) => "a1_smmla_pending",
             (Self::A2Dotprod, _) => "a2_dotprod_pending",
             (Self::A3Autovec, _) => "a3_autovec_pending",
@@ -224,8 +230,13 @@ impl KernelTier {
     /// not a runtime capability, performance, parity or all-operations award.
     #[must_use]
     pub const fn is_implemented(self) -> bool {
-        matches!(self, Self::Scalar) || (cfg!(target_arch = "x86_64")
-            && matches!(self, Self::X3aAvx2Low7HighBit | Self::X3bAvx2WidenedI16))
+        match self {
+            Self::Scalar => true,
+            Self::X3aAvx2Low7HighBit | Self::X3bAvx2WidenedI16 => cfg!(target_arch = "x86_64"),
+            Self::A1Smmla | Self::A2Dotprod => cfg!(all(target_arch = "aarch64", target_endian = "little")),
+            Self::A3Autovec => cfg!(target_arch = "aarch64"),
+            _ => false,
+        }
     }
 
     /// INT8 registration never silently authorizes an INT4 implementation.
@@ -364,8 +375,9 @@ pub fn host_features() -> DetectedFeatures {
     *HOST_FEATURES.get_or_init(DetectedFeatures::detect)
 }
 
-/// Tile geometry selected with a backend. Scalar uses `1×1×1`; the AVX2
-/// row-major dot leaves use `1×1×32`, independently of matrix M/N tails.
+/// Maximum implemented tile geometry, including short M/N/K cleanup paths.
+/// In (M,N,K) order: scalar (1,1,1), AVX2 (1,1,32), ARM SMMLA (4,2,8),
+/// and ARM SDOT/autovec (4,1,16). Geometry is not a throughput measurement.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TileGeometry {
@@ -670,7 +682,7 @@ impl Dispatcher {
         Ok(Dispatched { output, selection })
     }
 
-    /// Safe int4-to-int8 GEMV entry point. AVX2 INT4 remains a typed refusal.
+    /// Safe int4-to-int8 GEMV entry point. Non-scalar INT4 remains a typed refusal.
     pub fn int4_gemv(
         &self,
         input: &[i8],

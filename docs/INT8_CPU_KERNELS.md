@@ -4,7 +4,9 @@ The current candidate engine can use the scalar reference, AVX2 X3a
 low-7/high-bit decomposition, or AVX2 X3b signed-i16 widening. The AVX2
 implementations are experimental code-first candidates, not measured dispatch
 winners, model-quality certificates, or release qualification. Scalar remains
-the default. Other ISA tiers and SIMD INT4 execution remain separate work.
+the default. ARM64 SMMLA, SDOT and safe-autovec candidates are documented in
+[ARM_INT8_KERNELS.md](ARM_INT8_KERNELS.md). VNNI tiers and SIMD INT4 execution
+remain separate work.
 
 ## Candidate CLI
 

@@ -10,17 +10,29 @@
 use std::arch::x86_64::*;
 use super::{CpuKernelError, Int8KernelKind, MAX_COHORT_ROWS, MAX_MODEL_K};
 
+// The executable island holds only its two actual implementations. Expanding
+// the public cross-architecture catalog cannot create an invalid AVX2 state or
+// leave a target-function match non-exhaustive on x86 builds.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Avx2Kernel { kind: Int8KernelKind }
+enum Avx2Implementation { Low7HighBit, WidenedI16 }
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Avx2Kernel { implementation: Avx2Implementation }
 impl Avx2Kernel {
     pub(super) fn detect(kind: Int8KernelKind) -> Result<Self, CpuKernelError> {
-        if !matches!(kind, Int8KernelKind::Avx2Low7HighBit | Int8KernelKind::Avx2WidenedI16) {
-            return Err(CpuKernelError::UnknownKind);
-        }
+        let implementation = match kind {
+            Int8KernelKind::Avx2Low7HighBit => Avx2Implementation::Low7HighBit,
+            Int8KernelKind::Avx2WidenedI16 => Avx2Implementation::WidenedI16,
+            _ => return Err(CpuKernelError::UnknownKind),
+        };
         if !std::arch::is_x86_feature_detected!("avx2") { return Err(CpuKernelError::UnsupportedIsa); }
-        Ok(Self { kind })
+        Ok(Self { implementation })
     }
-    pub(super) fn kind(self) -> Int8KernelKind { self.kind }
+    pub(super) fn kind(self) -> Int8KernelKind {
+        match self.implementation {
+            Avx2Implementation::Low7HighBit => Int8KernelKind::Avx2Low7HighBit,
+            Avx2Implementation::WidenedI16 => Int8KernelKind::Avx2WidenedI16,
+        }
+    }
     pub(super) fn dot_rows_into(self, inputs: &[&[i8]], weights: &[i8], output: &mut [i32])
         -> Result<(), CpuKernelError> {
         if inputs.len() > MAX_COHORT_ROWS || inputs.len() != output.len() { return Err(CpuKernelError::Shape); }
@@ -31,16 +43,16 @@ impl Avx2Kernel {
         // have the same bounded K as weights. The closed match instantiates only
         // M=1..4 and always with EXACTLY M valid slices; the output stays local.
         let sums = unsafe {
-            match (self.kind, inputs.len()) {
-                (Int8KernelKind::Avx2Low7HighBit, 1) => low7_rows::<1>(inputs, weights),
-                (Int8KernelKind::Avx2Low7HighBit, 2) => low7_rows::<2>(inputs, weights),
-                (Int8KernelKind::Avx2Low7HighBit, 3) => low7_rows::<3>(inputs, weights),
-                (Int8KernelKind::Avx2Low7HighBit, 4) => low7_rows::<4>(inputs, weights),
-                (Int8KernelKind::Avx2WidenedI16, 1) => widened_rows::<1>(inputs, weights),
-                (Int8KernelKind::Avx2WidenedI16, 2) => widened_rows::<2>(inputs, weights),
-                (Int8KernelKind::Avx2WidenedI16, 3) => widened_rows::<3>(inputs, weights),
-                (Int8KernelKind::Avx2WidenedI16, 4) => widened_rows::<4>(inputs, weights),
-                _ => unreachable!("sealed AVX2 cohort construction"),
+            match (self.implementation, inputs.len()) {
+                (Avx2Implementation::Low7HighBit, 1) => low7_rows::<1>(inputs, weights),
+                (Avx2Implementation::Low7HighBit, 2) => low7_rows::<2>(inputs, weights),
+                (Avx2Implementation::Low7HighBit, 3) => low7_rows::<3>(inputs, weights),
+                (Avx2Implementation::Low7HighBit, 4) => low7_rows::<4>(inputs, weights),
+                (Avx2Implementation::WidenedI16, 1) => widened_rows::<1>(inputs, weights),
+                (Avx2Implementation::WidenedI16, 2) => widened_rows::<2>(inputs, weights),
+                (Avx2Implementation::WidenedI16, 3) => widened_rows::<3>(inputs, weights),
+                (Avx2Implementation::WidenedI16, 4) => widened_rows::<4>(inputs, weights),
+                _ => unreachable!("checked AVX2 cohort size"),
             }
         };
         output.copy_from_slice(&sums[..inputs.len()]);
@@ -54,10 +66,9 @@ impl Avx2Kernel {
         // AVX2 detection. Equal slice lengths and the arithmetic bound are checked
         // above; neither target function writes to either immutable input slice.
         let value = unsafe {
-            match self.kind {
-                Int8KernelKind::Avx2Low7HighBit => low7_high_bit(input, weights),
-                Int8KernelKind::Avx2WidenedI16 => widened_i16(input, weights),
-                Int8KernelKind::Scalar => unreachable!("sealed AVX2 constructor"),
+            match self.implementation {
+                Avx2Implementation::Low7HighBit => low7_high_bit(input, weights),
+                Avx2Implementation::WidenedI16 => widened_i16(input, weights),
             }
         };
         Ok(value)
@@ -232,5 +243,17 @@ unsafe fn widened_rows<const M: usize>(inputs: &[&[i8]], weights: &[i8]) -> [i32
             for row in 0..M { output[row] += i32::from(inputs[row][index]) * w; }
         }
         output
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+    #[test]
+    fn non_avx_catalog_entries_cannot_construct_an_avx_handle() {
+        for kind in Int8KernelKind::ALL {
+            if matches!(kind, Int8KernelKind::Avx2Low7HighBit | Int8KernelKind::Avx2WidenedI16) { continue; }
+            assert!(matches!(Avx2Kernel::detect(kind), Err(CpuKernelError::UnknownKind)));
+        }
     }
 }

@@ -11,12 +11,19 @@ fn native_kind(tier: KernelTier) -> Option<Int8KernelKind> {
     match tier {
         KernelTier::X3aAvx2Low7HighBit => Some(Int8KernelKind::Avx2Low7HighBit),
         KernelTier::X3bAvx2WidenedI16 => Some(Int8KernelKind::Avx2WidenedI16),
+        KernelTier::A1Smmla => Some(Int8KernelKind::Aarch64Smmla),
+        KernelTier::A2Dotprod => Some(Int8KernelKind::Aarch64Dotprod),
+        KernelTier::A3Autovec => Some(Int8KernelKind::Aarch64Autovec),
         _ => None,
     }
 }
+/// Maximum live tile capacity. The corresponding implementation owns every
+/// short M/N/K tail, including GEMV's M=1, without padding caller matrices.
 pub(super) const fn tile(tier: KernelTier) -> TileGeometry {
     match tier {
         KernelTier::X3aAvx2Low7HighBit | KernelTier::X3bAvx2WidenedI16 => TileGeometry { k: 32, m: 1, n: 1 },
+        KernelTier::A1Smmla => TileGeometry { k: 8, m: 4, n: 2 },
+        KernelTier::A2Dotprod | KernelTier::A3Autovec => TileGeometry { k: 16, m: 4, n: 1 },
         _ => TileGeometry::scalar(),
     }
 }
@@ -31,7 +38,7 @@ pub(super) fn validate_tile(row: &DispatchRow) -> Result<(), DispatchError> {
         && matches!(row.key.operation, KernelOperation::Int8Gemm | KernelOperation::Int8Gemv)
         && row.tile != tile(row.selected_tier) {
         return Err(DispatchError::InvalidMeasurement {
-            detail: "AVX2 row-major INT8 measurements must name the implemented 1x1x32 tile".to_owned(),
+            detail: "native INT8 measurements must name the implemented tile".to_owned(),
         });
     }
     Ok(())
