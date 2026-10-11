@@ -4,3 +4,4 @@
 # scalar tails. No model/performance/dispatch award is implied.
 src/native_engine/simd/avx2.rs
 src/native_engine/simd/neon.rs
+src/native_engine/simd/smmla.rs
