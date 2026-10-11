@@ -5,8 +5,8 @@ use crate::{
     batch::extract::{ExtractionBatchArgs, quantized::{Int8ExtractionBatchPlanner,
         long::{Int8ExtractionMapLimits, Int8ExtractionMapRun}}},
     native_engine::{constrained_int8, decode::DecodeStepControl},
-    tasks::source_planning::quantized::{Int8SourceError, long::Int8SourceMapError},
-    validation::grounded_fields::{SourceFieldEvidence, SourceOccurrence},
+    tasks::{ir::TaskBudget, source_planning::quantized::{Int8SourceError, long::Int8SourceMapError}},
+    validation::grounded_fields::{SourceFieldEvidence, VerifiedSourceSpan},
 };
 
 /// Explicit whole-document admission. The compiler's immutable base identity
@@ -137,25 +137,30 @@ fn input_bytes(source_capacity: usize, config: &ExtractionMapConfig) -> Result<u
     sum(&[source_capacity as u64, config.request.schema.capacity() as u64, config.preparation_reserve_bytes])
 }
 fn reduction_bytes(config: &ExtractionMapConfig, chunks: usize) -> Result<u64, HostedError> {
-    if chunks == 0 || chunks > config.limits.mapping.chunks.max_chunks || chunks > 256 {
-        return Err(HostedError::Limits("extraction map partition cardinality"));
+    document_workspace_bytes(config.request.budget, config.limits, chunks, config.reduction_reserve_bytes)
+}
+/// Shared by single-document and corpus hosts. A stream reserves its maximum
+/// possible document frontier ONCE, not fresh per-row independent allowances.
+pub(super) fn document_workspace_bytes(budget: TaskBudget, limits: Int8ExtractionMapLimits,
+    chunks: usize, reserve: u64) -> Result<u64, HostedError> {
+    if chunks == 0 || chunks > limits.mapping.chunks.max_chunks || chunks > 256 || reserve == 0 {
+        return Err(HostedError::Limits("extraction map partition cardinality or reserve"));
     }
-    let b = config.request.budget;
-    let native = b.max_output_bytes.checked_mul(chunks as u64)
+    let native = budget.max_output_bytes.checked_mul(chunks as u64)
         .ok_or(HostedError::Limits("extraction map native result arithmetic"))?;
-    let staged = sum(&[native, config.limits.mapping.reduction.max_live_value_bytes as u64])?
+    let staged = sum(&[native, limits.mapping.reduction.max_live_value_bytes as u64])?
         .checked_mul(4).ok_or(HostedError::Limits("extraction map staging arithmetic"))?;
-    let tokens = u64::from(b.max_output_tokens).checked_mul(chunks as u64)
+    let tokens = u64::from(budget.max_output_tokens).checked_mul(chunks as u64)
         .and_then(|n| n.checked_mul(8)).ok_or(HostedError::Limits("extraction map token arithmetic"))?;
-    // A coordinate scan may allocate its complete temporary match vector before
-    // serialization rejects an oversized result. Price that vector AND the
-    // retained original-coordinate evidence, not just the final JSON cap.
-    let v = config.limits.verification;
+    // Coordinate vectors contain FOUR usize coordinates per match, not the
+    // small Anchored/Ambiguous enum tag. Price both the temporary scan vector
+    // and retained lifted spans before a serialized-size check can reject them.
+    let v = limits.verification;
     let fields = (v.max_fields as u64).checked_mul(std::mem::size_of::<SourceFieldEvidence>() as u64)
         .ok_or(HostedError::Limits("extraction map field arithmetic"))?;
-    let spans = (v.max_matches as u64).checked_mul(std::mem::size_of::<SourceOccurrence>() as u64)
+    let spans = (v.max_matches as u64).checked_mul(std::mem::size_of::<VerifiedSourceSpan>() as u64)
         .and_then(|n| n.checked_mul(2)).ok_or(HostedError::Limits("extraction map occurrence arithmetic"))?;
-    sum(&[staged, tokens, fields, spans, config.reduction_reserve_bytes])
+    sum(&[staged, tokens, fields, spans, reserve])
 }
 fn poll(control: &mut impl DecodeStepControl) -> Result<(), HostedError> {
     match control.prefill_checkpoint(0) {

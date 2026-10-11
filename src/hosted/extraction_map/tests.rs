@@ -110,14 +110,19 @@ fn schema_capacity_not_only_schema_length_is_charged() {
 fn reduction_charges_native_results_and_temporary_coordinate_scan_storage() {
     let c = config(); let count = 3;
     let fields = 32 * std::mem::size_of::<SourceFieldEvidence>() as u64;
-    let spans = 128 * std::mem::size_of::<SourceOccurrence>() as u64 * 2;
+    // Independent layout floor: a match stores byte start/end AND scalar
+    // start/end. Counting the occurrence enum instead would undercharge it.
+    let coordinate_bytes = 4 * std::mem::size_of::<usize>() as u64;
+    assert!(std::mem::size_of::<VerifiedSourceSpan>() as u64 >= coordinate_bytes);
+    let spans = 128 * std::mem::size_of::<VerifiedSourceSpan>() as u64 * 2;
     assert_eq!(reduction_bytes(&c, count).unwrap(),
         (4096 * count as u64 + 8192) * 4 + 16 * count as u64 * 8 + fields + spans + 4096);
     assert!(reduction_bytes(&c, 0).is_err());
     assert!(reduction_bytes(&c, 17).is_err());
     let mut more = config(); more.limits.verification.max_matches += 1;
     assert_eq!(reduction_bytes(&more, count).unwrap() - reduction_bytes(&c, count).unwrap(),
-        2 * std::mem::size_of::<SourceOccurrence>() as u64);
+        2 * std::mem::size_of::<VerifiedSourceSpan>() as u64);
+    assert!(spans >= 128 * 2 * coordinate_bytes);
 }
 #[test]
 fn reduction_arithmetic_never_wraps_into_a_smaller_reservation() {
