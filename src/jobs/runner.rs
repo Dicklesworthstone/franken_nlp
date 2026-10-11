@@ -29,6 +29,12 @@ pub trait DurableBatchProcessor: BatchProcessor {
     type Recipe: Serialize + ?Sized;
     fn execution_identity(&self) -> &ExecutionIdentity;
     fn job_recipe(&self) -> &Self::Recipe;
+    /// Validate relationships between this immutable recipe and the immutable
+    /// journal limits before create/resume touches storage. For example, a
+    /// per-attempt verification allowance must fit across ALL durable attempts,
+    /// including failed attempts from previous process invocations. This hook
+    /// grants no authority and never replaces OwnedJob's persisted work checks.
+    fn validate_job_limits(&self, _limits: JobLimits) -> Result<(), BatchFault> { Ok(()) }
     fn durable_work(&self, prepared: &Self::Prepared) -> Result<JobWork, BatchItemFailure>;
     fn max_result_bytes(&self, prepared: &Self::Prepared) -> u64;
 }
@@ -166,6 +172,7 @@ fn freeze<P: DurableBatchProcessor, C: DecodeStepControl>(key: &JobSecret, job_i
     limits: JobLimits, inputs: &[JobInput<'_>], processor: &P, control: &mut C)
     -> Result<FrozenManifest, JobRunError> {
     limits.validate()?;
+    processor.validate_job_limits(limits).map_err(JobRunError::Processor)?;
     // Freeze first bounds the TOTAL population before envelope parsing. It
     // retains only keyed metadata and performs no filesystem/native work.
     let recipe = Recipe { protocol: OWNED_BATCH_PROTOCOL,

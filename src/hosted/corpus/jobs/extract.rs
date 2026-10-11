@@ -1,6 +1,7 @@
 //! Authenticated schema-extraction jobs on one real hosted native invocation.
 use super::*;
 use crate::jobs::runner::extract::{Int8ExtractionJobPlanner, Int8ExtractionJobProcessor};
+mod document;
 
 impl NlpEngine {
     /// Create/resume raw-schema extraction with the same owner-only retention
