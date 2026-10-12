@@ -1,10 +1,12 @@
 //! Whole-source document jobs on the same process-owned native invocation.
 use super::*;
 use crate::jobs::runner::source::document::{Int8SourceDocumentJobPlanner,
-    Int8SourceDocumentJobProcessor, SourceDocumentAdmission, SourceDocumentBatchAdmission};
+    Int8SourceDocumentJobProcessor, SourceDocumentAdmission, SourceDocumentBatchAdmission,
+    reduction::Int8ReducedSourceDocumentJobProcessor};
 
 impl NlpEngine {
     /// Create/resume original-document NER, keyphrase or cited-summary maps.
+    /// An explicitly reduced factory selects whole-document summaries/rankings.
     /// All chunk identities and the complete output are admitted together. The
     /// same engine serves every pending document; no nested runtime or retry.
     #[allow(clippy::too_many_arguments)]
@@ -46,9 +48,15 @@ impl NlpEngine {
                 inner: CorpusAdmission { lease: &lease, model: model.artifact_identity(),
                     kv_bytes: required.kv_bytes, sampler_bytes: 0, output_bytes: request.limits.max_result_bytes as u64 } };
             let result = (|| {
-                let processor = Int8SourceDocumentJobProcessor::new(&planner, &mut engine.value,
-                    &vocabulary, admission).map_err(JobRunError::Processor)?;
-                run_population(request, &population, processor, control)
+                if planner.reduction_policy().is_some() {
+                    let processor = Int8ReducedSourceDocumentJobProcessor::new(&planner, &mut engine.value,
+                        &vocabulary, admission).map_err(JobRunError::Processor)?;
+                    run_population(request, &population, processor, control)
+                } else {
+                    let processor = Int8SourceDocumentJobProcessor::new(&planner, &mut engine.value,
+                        &vocabulary, admission).map_err(JobRunError::Processor)?;
+                    run_population(request, &population, processor, control)
+                }
             })();
             // Runner/journal/spool and guarded results finish inside the call.
             // Native and retained preparation storage drop BEFORE their charge.

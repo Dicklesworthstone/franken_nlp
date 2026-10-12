@@ -12,6 +12,7 @@ use crate::{
             Int8SourceMapLimits, Int8SourceMapRun, PreparedInt8SourceMap, SourceMapTask}},
     tokenizer::specials::TemplateControlIds,
 };
+pub mod reduction;
 // Reuse the all-identities/whole-output admission contract, NOT extraction's
 // task-specific host implementation. The source host checks its fixed task.
 pub use crate::batch::extract::quantized::long::stream::{
@@ -36,6 +37,9 @@ pub struct Int8SourceDocumentJobRecipe {
     reduction: ExecutionLimits,
     document_ceiling: JobWork,
     mask_visits_per_chunk: u64,
+    // Omission preserves ordinary v1 map-job commitments exactly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reduction_task: Option<reduction::SourceDocumentReduction>,
 }
 
 /// Owns the actual pinned source compiler and the SAME settings that are frozen.
@@ -88,7 +92,7 @@ impl Int8SourceDocumentJobPlanner {
             source: Int8SourceJobRecipe::new(budget, planning, native, Some(defaults)),
             chunks: mapping.chunks, reduction: mapping.reduction,
             document_ceiling: JobWork { model: mapping.max_model_work, mask_node_visits: mapping.max_mask_visits },
-            mask_visits_per_chunk: mapping.mask_visits_per_chunk };
+            mask_visits_per_chunk: mapping.mask_visits_per_chunk, reduction_task: None };
         bounded_json(&recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
         poll(control).map_err(|e| e.fault)?;
         Ok(Self { source, identity, task, budget, planning, mapping, limits, recipe, owner: Arc::new(()) })
@@ -111,8 +115,10 @@ impl Int8SourceDocumentJobPlanner {
         }
         let context = PlanContext::new(&self.identity, self.budget)
             .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
-        self.source.plan_int8_map_with_control(source, &self.task, self.budget, &context,
-            self.planning, self.mapping, control).map_err(map_failure)
+        let plan = self.source.plan_int8_map_with_control(source, &self.task, self.budget, &context,
+            self.planning, self.mapping, control).map_err(map_failure)?;
+        if let Some(policy) = self.reduction_policy() { policy.check_plan(&plan)?; }
+        Ok(plan)
     }
     /// No model or filesystem work. Owns the exact text and private identity
     /// snapshot; reconstruction avoids a self-referential prepared object.
@@ -166,6 +172,8 @@ pub struct Int8SourceDocumentJobProcessor<'p, 'e, 'w, 'v, A: SourceDocumentBatch
 impl<'p, 'e, 'w, 'v, A: SourceDocumentBatchAdmission> Int8SourceDocumentJobProcessor<'p, 'e, 'w, 'v, A> {
     pub fn new(planner: &'p Int8SourceDocumentJobPlanner, engine: &'e mut StrictInt8Engine<'w>,
         vocabulary: &'v ExtractionVocabulary, admission: A) -> Result<Self, BatchFault> {
+        // A reduced recipe must never execute through the ordinary map route.
+        if planner.reduction_policy().is_some() { return Err(BatchCode::InvalidLimits.into()); }
         check_capacity(planner, engine).map_err(|e| e.fault)?;
         Ok(Self { planner, engine, vocabulary, admission, ledger: Ledger::default() })
     }
