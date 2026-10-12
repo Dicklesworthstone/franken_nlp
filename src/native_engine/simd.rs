@@ -30,10 +30,11 @@ pub const MAX_COHORT_ROWS: usize = 4;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Int8KernelKind {
     Scalar, Avx2Low7HighBit, Avx2WidenedI16, Aarch64Dotprod, Aarch64Autovec, Aarch64Smmla,
+    AvxVnni,
 }
 impl Int8KernelKind {
-    pub const ALL: [Self; 6] = [Self::Scalar, Self::Avx2Low7HighBit, Self::Avx2WidenedI16,
-        Self::Aarch64Dotprod, Self::Aarch64Autovec, Self::Aarch64Smmla];
+    pub const ALL: [Self; 7] = [Self::Scalar, Self::Avx2Low7HighBit, Self::Avx2WidenedI16,
+        Self::Aarch64Dotprod, Self::Aarch64Autovec, Self::Aarch64Smmla, Self::AvxVnni];
     pub const fn id(self) -> &'static str {
         match self {
             Self::Scalar => "s_scalar_i32",
@@ -42,6 +43,7 @@ impl Int8KernelKind {
             Self::Aarch64Dotprod => "a2_dotprod",
             Self::Aarch64Autovec => "a3_autovec",
             Self::Aarch64Smmla => "a1_smmla",
+            Self::AvxVnni => "x2_avx_vnni",
         }
     }
 }
@@ -107,7 +109,7 @@ impl Int8Kernel {
         match kind {
             Int8KernelKind::Scalar => Ok(Self::scalar()),
             #[cfg(target_arch = "x86_64")]
-            Int8KernelKind::Avx2Low7HighBit | Int8KernelKind::Avx2WidenedI16 =>
+            Int8KernelKind::Avx2Low7HighBit | Int8KernelKind::Avx2WidenedI16 | Int8KernelKind::AvxVnni =>
                 Ok(Self { implementation: Implementation::Avx2(avx2::Avx2Kernel::detect(kind)?) }),
             #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             Int8KernelKind::Aarch64Dotprod =>
@@ -183,10 +185,10 @@ impl Int8Kernel {
         }
     }
     /// A(M,K) times transpose(W(N,K)) -> row-major C(M,N). All shape and
-    /// reduction checks precede the first output write. ARM SDOT/autovec use
-    /// four-row shared-weight tiles; SMMLA uses four-row/two-column tiles with
-    /// register-only operand assembly. No packed matrix or scratch allocation.
-    /// Orchestration owns admission and cancellation for this finite leaf.
+    /// reduction checks precede the first output write. SDOT/autovec/AVX-VNNI
+    /// use four-row shared-weight tiles; SMMLA uses four-row/two-column tiles.
+    /// No packed matrix or scratch allocation. Orchestration owns admission
+    /// and cancellation for this finite leaf.
     pub fn gemm_into(self, activations: &[i8], m: usize, k: usize, weights: &[i8],
         n: usize, output: &mut [i32]) -> Result<(), CpuKernelError> {
         check_matrix(activations.len(), m, k, weights.len(), n, output.len())?;
@@ -195,7 +197,8 @@ impl Int8Kernel {
         if let Implementation::Smmla(kernel) = self.implementation {
             return kernel.gemm_into(activations, m, k, weights, n, output);
         }
-        if matches!(self.kind(), Int8KernelKind::Aarch64Dotprod | Int8KernelKind::Aarch64Autovec) {
+        if matches!(self.kind(), Int8KernelKind::Aarch64Dotprod | Int8KernelKind::Aarch64Autovec
+            | Int8KernelKind::AvxVnni) {
             return self.gemm_rows_into(activations, m, k, weights, n, output);
         }
         // Preserve the scalar and AVX2 convenience route and its reported tile.
@@ -225,7 +228,7 @@ impl Int8Kernel {
     }
 }
 
-/// Shared safe boundary, also called by each ARM leaf before target entry.
+/// Shared safe boundary, also called by ARM leaves before target entry.
 fn check_rows(inputs: &[&[i8]], weights: &[i8], output_len: usize) -> Result<(), CpuKernelError> {
     if inputs.len() > MAX_COHORT_ROWS || inputs.len() != output_len { return Err(CpuKernelError::Shape); }
     if weights.len() > MAX_MODEL_K { return Err(CpuKernelError::ReductionTooLong); }

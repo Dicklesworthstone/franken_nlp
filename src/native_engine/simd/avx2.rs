@@ -1,20 +1,18 @@
-//! Enumerated AVX2 island. No public unsafe API or speculative ISA execution.
+//! Enumerated x86 SIMD island. No public unsafe API or speculative execution.
 //!
-//! The only constructor checks std's actual OS-aware AVX2 detection. Both
-//! slices are rechecked before entering target-feature code. Complete 32-byte
-//! blocks use unaligned loads; the remainder uses scalar indexing, never a
-//! masked or oversized load. K <= 10752 bounds EVERY partial and final i32 sum.
+//! Construction checks std's actual OS-aware features for the chosen body.
+//! Slices are rechecked before target entry. Complete vectors use unaligned
+//! loads; short tails use scalar indexing. K <= 10752 bounds every i32 sum.
 #![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::arch::x86_64::*;
 use super::{CpuKernelError, Int8KernelKind, MAX_COHORT_ROWS, MAX_MODEL_K};
 
-// The executable island holds only its two actual implementations. Expanding
-// the public cross-architecture catalog cannot create an invalid AVX2 state or
-// leave a target-function match non-exhaustive on x86 builds.
+// Private state contains only executable x86 algorithms, not the public
+// cross-architecture catalog. The historical module/type name is retained.
 #[derive(Clone, Copy, Debug)]
-enum Avx2Implementation { Low7HighBit, WidenedI16 }
+enum Avx2Implementation { Low7HighBit, WidenedI16, AvxVnni }
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Avx2Kernel { implementation: Avx2Implementation }
 impl Avx2Kernel {
@@ -22,6 +20,10 @@ impl Avx2Kernel {
         let implementation = match kind {
             Int8KernelKind::Avx2Low7HighBit => Avx2Implementation::Low7HighBit,
             Int8KernelKind::Avx2WidenedI16 => Avx2Implementation::WidenedI16,
+            Int8KernelKind::AvxVnni => {
+                if !std::arch::is_x86_feature_detected!("avxvnni") { return Err(CpuKernelError::UnsupportedIsa); }
+                Avx2Implementation::AvxVnni
+            }
             _ => return Err(CpuKernelError::UnknownKind),
         };
         if !std::arch::is_x86_feature_detected!("avx2") { return Err(CpuKernelError::UnsupportedIsa); }
@@ -31,6 +33,7 @@ impl Avx2Kernel {
         match self.implementation {
             Avx2Implementation::Low7HighBit => Int8KernelKind::Avx2Low7HighBit,
             Avx2Implementation::WidenedI16 => Int8KernelKind::Avx2WidenedI16,
+            Avx2Implementation::AvxVnni => Int8KernelKind::AvxVnni,
         }
     }
     pub(super) fn dot_rows_into(self, inputs: &[&[i8]], weights: &[i8], output: &mut [i32])
@@ -39,9 +42,9 @@ impl Avx2Kernel {
         if weights.len() > MAX_MODEL_K { return Err(CpuKernelError::ReductionTooLong); }
         if inputs.iter().any(|input| input.len() != weights.len()) { return Err(CpuKernelError::LengthMismatch); }
         if inputs.is_empty() { return Ok(()); }
-        // SAFETY: this private handle proves real AVX2 support. All input rows
-        // have the same bounded K as weights. The closed match instantiates only
-        // M=1..4 and always with EXACTLY M valid slices; the output stays local.
+        // SAFETY: the private handle proves the selected body's real CPU
+        // features (AVX-VNNI additionally for X2). All rows have equal bounded K.
+        // The closed match instantiates M=1..4 with exactly M valid slices.
         let sums = unsafe {
             match (self.implementation, inputs.len()) {
                 (Avx2Implementation::Low7HighBit, 1) => low7_rows::<1>(inputs, weights),
@@ -52,7 +55,11 @@ impl Avx2Kernel {
                 (Avx2Implementation::WidenedI16, 2) => widened_rows::<2>(inputs, weights),
                 (Avx2Implementation::WidenedI16, 3) => widened_rows::<3>(inputs, weights),
                 (Avx2Implementation::WidenedI16, 4) => widened_rows::<4>(inputs, weights),
-                _ => unreachable!("checked AVX2 cohort size"),
+                (Avx2Implementation::AvxVnni, 1) => avx_vnni_rows::<1>(inputs, weights),
+                (Avx2Implementation::AvxVnni, 2) => avx_vnni_rows::<2>(inputs, weights),
+                (Avx2Implementation::AvxVnni, 3) => avx_vnni_rows::<3>(inputs, weights),
+                (Avx2Implementation::AvxVnni, 4) => avx_vnni_rows::<4>(inputs, weights),
+                _ => unreachable!("checked x86 cohort size"),
             }
         };
         output.copy_from_slice(&sums[..inputs.len()]);
@@ -62,13 +69,13 @@ impl Avx2Kernel {
     pub(super) fn dot(self, input: &[i8], weights: &[i8]) -> Result<i32, CpuKernelError> {
         if input.len() != weights.len() { return Err(CpuKernelError::LengthMismatch); }
         if input.len() > MAX_MODEL_K { return Err(CpuKernelError::ReductionTooLong); }
-        // SAFETY: the private handle can only be constructed after real OS-aware
-        // AVX2 detection. Equal slice lengths and the arithmetic bound are checked
-        // above; neither target function writes to either immutable input slice.
+        // SAFETY: the private handle proves actual features for this body;
+        // equal slice lengths and bounded K are checked before entry.
         let value = unsafe {
             match self.implementation {
                 Avx2Implementation::Low7HighBit => low7_high_bit(input, weights),
                 Avx2Implementation::WidenedI16 => widened_i16(input, weights),
+                Avx2Implementation::AvxVnni => avx_vnni_rows::<1>(&[input], weights)[0],
             }
         };
         Ok(value)
@@ -246,13 +253,52 @@ unsafe fn widened_rows<const M: usize>(inputs: &[&[i8]], weights: &[i8]) -> [i32
     }
 }
 
+// X2: u=x XOR 0x80; dot(x,w)=dot(u,w)-128*sum(w). The non-saturating
+// VEX intrinsic is _mm256_dpbusd_avx_epi32, NOT the AVX-512 EVEX spelling.
+// K<=10752 bounds raw sums by 350945280, correction by 176160768, and their
+// conservative combined magnitude by 527106048. All partials fit i32.
+#[target_feature(enable = "avx2,avxvnni")]
+unsafe fn avx_vnni_rows<const M: usize>(inputs: &[&[i8]], weights: &[i8]) -> [i32; MAX_COHORT_ROWS] {
+    let end = weights.len() / 32 * 32;
+    // SAFETY: caller proves AVX2+AVX-VNNI, M=1..4 and equal bounded lengths.
+    // Loads read only contained complete 32-byte blocks. Stores write exactly
+    // eight i32s into local arrays. No alignment/padding; tails use indexing.
+    unsafe {
+        let sign = _mm256_set1_epi32(i32::from_le_bytes([0x80; 4]));
+        let ones = _mm256_set1_epi32(0x0101_0101);
+        let mut raw = [_mm256_setzero_si256(); M];
+        let mut sums = _mm256_setzero_si256();
+        for start in (0..end).step_by(32) {
+            let w = _mm256_loadu_si256(weights.as_ptr().add(start).cast());
+            sums = _mm256_dpbusd_avx_epi32(sums, ones, w);
+            for row in 0..M {
+                let x = _mm256_loadu_si256(inputs[row].as_ptr().add(start).cast());
+                raw[row] = _mm256_dpbusd_avx_epi32(raw[row], _mm256_xor_si256(x, sign), w);
+            }
+        }
+        let mut correction = [0_i32; 8];
+        _mm256_storeu_si256(correction.as_mut_ptr().cast(), sums);
+        let mut output = [0_i32; MAX_COHORT_ROWS];
+        for row in 0..M {
+            let mut lanes = [0_i32; 8];
+            _mm256_storeu_si256(lanes.as_mut_ptr().cast(), raw[row]);
+            for lane in 0..8 { output[row] += lanes[lane] - 128 * correction[lane]; }
+        }
+        for index in end..weights.len() {
+            let w = i32::from(weights[index]);
+            for row in 0..M { output[row] += i32::from(inputs[row][index]) * w; }
+        }
+        output
+    }
+}
+
 #[cfg(test)]
 mod catalog_tests {
     use super::*;
     #[test]
-    fn non_avx_catalog_entries_cannot_construct_an_avx_handle() {
+    fn non_x86_catalog_entries_cannot_construct_an_x86_handle() {
         for kind in Int8KernelKind::ALL {
-            if matches!(kind, Int8KernelKind::Avx2Low7HighBit | Int8KernelKind::Avx2WidenedI16) { continue; }
+            if matches!(kind, Int8KernelKind::Avx2Low7HighBit | Int8KernelKind::Avx2WidenedI16 | Int8KernelKind::AvxVnni) { continue; }
             assert!(matches!(Avx2Kernel::detect(kind), Err(CpuKernelError::UnknownKind)));
         }
     }
