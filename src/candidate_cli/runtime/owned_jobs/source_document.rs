@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     candidate_cli::jobs::source_document as settings,
     batch::source::SourceBatchArgs,
-    jobs::runner::source::document::Int8SourceDocumentJobPlanner,
+    jobs::runner::source::document::{Int8SourceDocumentJobPlanner, reduction::SourceDocumentReduction},
     tasks::source_planning::quantized::long::SourceMapTask,
 };
 
@@ -24,6 +24,7 @@ pub(super) fn prepare(args: &JobArgs, facts: &ArtifactIdentity, defaults: Defaul
     };
     if name != args.task { return Err(Failure::usage("source_document_job_task_mismatch")); }
     let (mapping, reduction_reserve_bytes) = settings::load(text, args, budget, lifetime, limits)?;
+    let reduction = settings::load_reduction(text, &args.task, mapping, lifetime)?;
     checkpoint(control)?;
     let registry = pinned_controls::pinned().map_err(|_| CandidateError::Identity)?;
     let controls = registry.template_controls();
@@ -35,6 +36,13 @@ pub(super) fn prepare(args: &JobArgs, facts: &ArtifactIdentity, defaults: Defaul
     // temporary document is needed to derive the exact source scaffold budget.
     let planner = Int8SourceDocumentJobPlanner::pinned(controls, eos, identity, task, budget,
         args.host.planning(), mapping, lifetime, control).map_err(planner_failure)?;
+    let planner = match reduction {
+        None => planner,
+        Some(settings::reduction::PreparedReduction::Summary { limits, max_lifetime_scan_work }) =>
+            planner.with_reduction(SourceDocumentReduction::Summary { limits, max_lifetime_scan_work }).map_err(planner_failure)?,
+        Some(settings::reduction::PreparedReduction::Keyphrases { limits, max_lifetime_scan_work }) =>
+            planner.with_reduction(SourceDocumentReduction::Keyphrases { limits, max_lifetime_scan_work }).map_err(planner_failure)?,
+    };
     checkpoint(control)?;
     let vocabulary = Arc::new(ExtractionVocabulary::pinned(controls).map_err(|_| CandidateError::Planning)?);
     checkpoint(control)?;

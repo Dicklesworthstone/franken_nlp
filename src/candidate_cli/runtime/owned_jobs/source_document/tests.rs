@@ -87,3 +87,57 @@ fn cancellation_is_preserved_before_configuration_and_inside_factory_error_mappi
     let error = planner_failure(crate::batch::BatchFault::cancelled(DecodeCancellationKind::Deadline));
     assert_eq!(error.exit, ErrorCode::BudgetOrTimeout); assert_eq!(error.code, "job_execution_budget");
 }
+
+fn reduced_settings(task: &str, maximum: usize) -> String {
+    let mut value: serde_json::Value = serde_json::from_str(&settings(64)).unwrap();
+    let aggregation = if task == "summarize" {
+        serde_json::json!({"max_unique_bullets":256,"max_citations":1024,"max_evidence_spans":4096,
+            "max_value_bytes":1048576,"max_scan_steps":100000})
+    } else {
+        serde_json::json!({"max_unique_phrases":256,"max_evidence_spans":4096,"max_value_bytes":1048576,"max_scan_work":100000})
+    };
+    value["reduction"] = serde_json::json!({"schema_version":1,"task":task,"aggregation":aggregation,
+        "max_result_bytes":2097152,"max_lifetime_scan_work":100000 * lifetime().max_attempts});
+    value["reduction"][if task == "summarize" { "max_bullets" } else { "max_phrases" }] = serde_json::json!(maximum);
+    value.to_string()
+}
+fn reduced_factory(a: &JobArgs, text: &str) -> Int8SourceDocumentJobPlanner {
+    let (_, limits) = a.validate().unwrap();
+    let (prepared, _) = prepare(a, &facts(), defaults(a, limits), text, lifetime(), limits, &mut Continue).unwrap();
+    let PreparedJob::SourceDocument { planner, .. } = prepared else { panic!("document route") }; planner
+}
+#[test]
+fn cli_reductions_bind_the_native_reducers_without_changing_map_work() {
+    for task in ["summarize", "keyphrases"] {
+        let a = args(task); let (_, limits) = a.validate().unwrap();
+        let plain = factory(&a, 64, defaults(&a, limits)); let p = reduced_factory(&a, &reduced_settings(task, 8));
+        assert!(plain.reduction_policy().is_none()); assert!(p.reduction_policy().is_some());
+        let doc = || BatchDocument::<SourceDocumentArgs> { id: "d".into(), text: "é Alice Bob 上海".into(), task_args: None };
+        let before = plain.prepare_with_control(doc(), &mut Continue).unwrap();
+        let after = p.prepare_with_control(doc(), &mut Continue).unwrap();
+        assert_eq!(before.planned_work(), after.planned_work()); assert_eq!(before.execution_identities(), after.execution_identities());
+        assert_ne!(canonjson::canonical_bytes(plain.job_recipe()).unwrap(), canonjson::canonical_bytes(p.job_recipe()).unwrap());
+    }
+}
+#[test]
+fn cli_final_selection_is_repeatable_and_changes_the_resume_recipe() {
+    for task in ["summarize", "keyphrases"] {
+        let a = args(task); let p = reduced_factory(&a, &reduced_settings(task, 8));
+        let again = reduced_factory(&a, &reduced_settings(task, 8));
+        let changed = reduced_factory(&a, &reduced_settings(task, 1));
+        assert_eq!(canonjson::canonical_bytes(p.job_recipe()).unwrap(), canonjson::canonical_bytes(again.job_recipe()).unwrap());
+        assert_ne!(canonjson::canonical_bytes(p.job_recipe()).unwrap(), canonjson::canonical_bytes(changed.job_recipe()).unwrap());
+    }
+}
+#[test]
+fn invalid_reduction_cannot_silently_fall_back_to_ordinary_maps() {
+    let a = args("summarize"); let (_, limits) = a.validate().unwrap();
+    for task in ["summarize", "keyphrases"] {
+        let text = reduced_settings(task, 0);
+        assert!(prepare(&a, &facts(), defaults(&a, limits), &text, lifetime(), limits, &mut Continue).is_err());
+    }
+    let mut text: serde_json::Value = serde_json::from_str(&reduced_settings("summarize", 8)).unwrap();
+    text["reduction"]["max_lifetime_scan_work"] = serde_json::json!(1);
+    let error = prepare(&a, &facts(), defaults(&a, limits), &text.to_string(), lifetime(), limits, &mut Continue).err().unwrap();
+    assert_eq!(error.code, "source_document_reduction_lifetime");
+}

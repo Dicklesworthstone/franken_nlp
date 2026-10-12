@@ -1,5 +1,11 @@
 # Resumable whole-document source tasks
 
+This page describes the default independent-map mode. An optional `reduction`
+object in the same document configuration now enables one selected cited summary
+or one document-wide keyphrase ranking per durable result; see
+[Durable document reduction](owned-document-reduction.md). Omitting that object
+preserves the behavior and recipe described below.
+
 `fnlp candidate job start|resume --task ner|keyphrases|summarize
 --source-document-config FILE` runs the existing native source mapper over each
 complete original document and retains one durable result per document. It adds

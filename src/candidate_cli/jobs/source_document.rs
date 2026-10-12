@@ -6,6 +6,7 @@ use crate::{
         source_planning::quantized::long::Int8SourceMapLimits},
     batch::source::{SourceMaskBudget, quantized::{Int8SourceBatchLimits, validate_limits}},
 };
+pub(in crate::candidate_cli) mod reduction;
 
 pub(in crate::candidate_cli) const CONFIG_BYTES: usize = 16 * 1024;
 const MAX_RESULT: usize = 64 * 1024 * 1024;
@@ -21,11 +22,18 @@ struct SourceDocumentSettings {
     max_live_value_bytes: usize,
     max_total_value_bytes: usize,
     reduction_reserve_mib: u64,
+    /// Absent means the original independent-map result and v1 job recipe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reduction: Option<reduction::ReductionSettings>,
 }
 fn parse(text: &str) -> Result<SourceDocumentSettings, Failure> {
     if text.is_empty() || text.len() > CONFIG_BYTES { return Err(Failure::usage("source_document_job_configuration")); }
     let value = canonjson::parse_str_with_limits(text, canonjson::ParseLimits { max_depth: 4, max_string_bytes: 4096 })
         .map_err(|_| Failure::usage("source_document_job_configuration"))?;
+    // An explicitly supplied policy cannot silently turn into map-only mode.
+    if value.get("reduction").is_some_and(serde_json::Value::is_null) {
+        return Err(Failure::usage("source_document_job_configuration"));
+    }
     serde_json::from_value(value).map_err(|_| Failure::usage("source_document_job_configuration"))
 }
 pub(in crate::candidate_cli) fn validate_mode(args: &JobArgs) -> Result<(), Failure> {
@@ -39,6 +47,12 @@ pub(in crate::candidate_cli) fn validate_mode(args: &JobArgs) -> Result<(), Fail
     Ok(())
 }
 
+/// The same bounded immutable text is used for map settings and reduction.
+/// Parsing grants no execution authority; the owned factory revalidates it.
+pub(in crate::candidate_cli) fn load_reduction(text: &str, task: &str, mapping: Int8SourceMapLimits,
+    lifetime: JobLimits) -> Result<Option<reduction::PreparedReduction>, Failure> {
+    parse(text)?.reduction.map(|policy| policy.validate(task, mapping, lifetime)).transpose()
+}
 pub(in crate::candidate_cli) fn load(text: &str, args: &JobArgs, budget: TaskBudget,
     lifetime: JobLimits, limits: Limits) -> Result<(Int8SourceMapLimits, u64), Failure> {
     validate_mode(args)?;
@@ -97,6 +111,7 @@ pub(in crate::candidate_cli) fn load(text: &str, args: &JobArgs, budget: TaskBud
         mask_visits_per_chunk: host.max_mask_node_visits, max_mask_visits: masks,
     };
     mapping.chunks.effective_token_limit().map_err(|_| Failure::usage("source_document_job_context"))?;
+    if let Some(policy) = d.reduction { policy.validate(&args.task, mapping, lifetime)?; }
     Ok((mapping, reserve))
 }
 

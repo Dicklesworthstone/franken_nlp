@@ -9,7 +9,7 @@ fn lifetime() -> JobLimits {
 fn settings() -> SourceDocumentSettings {
     SourceDocumentSettings { schema_version: 1, max_chunks: 8, max_chunk_bytes: 8,
         max_tokenizer_calls: 1024, max_result_bytes: 4 << 20, max_live_value_bytes: 16 << 20,
-        max_total_value_bytes: 64 << 20, reduction_reserve_mib: 64 }
+        max_total_value_bytes: 64 << 20, reduction_reserve_mib: 64, reduction: None }
 }
 fn text() -> String { serde_json::to_string(&settings()).unwrap() }
 fn load_default(args: &JobArgs, text: &str, lifetime: JobLimits) -> Result<(Int8SourceMapLimits, u64), Failure> {
