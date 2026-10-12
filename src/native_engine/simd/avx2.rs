@@ -12,21 +12,30 @@ use super::{CpuKernelError, Int8KernelKind, MAX_COHORT_ROWS, MAX_MODEL_K};
 // Private state contains only executable x86 algorithms, not the public
 // cross-architecture catalog. The historical module/type name is retained.
 #[derive(Clone, Copy, Debug)]
-enum Avx2Implementation { Low7HighBit, WidenedI16, AvxVnni }
+enum Avx2Implementation { Low7HighBit, WidenedI16, AvxVnni, VnniYmm, VnniZmm }
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Avx2Kernel { implementation: Avx2Implementation }
 impl Avx2Kernel {
     pub(super) fn detect(kind: Int8KernelKind) -> Result<Self, CpuKernelError> {
-        let implementation = match kind {
-            Int8KernelKind::Avx2Low7HighBit => Avx2Implementation::Low7HighBit,
-            Int8KernelKind::Avx2WidenedI16 => Avx2Implementation::WidenedI16,
-            Int8KernelKind::AvxVnni => {
-                if !std::arch::is_x86_feature_detected!("avxvnni") { return Err(CpuKernelError::UnsupportedIsa); }
-                Avx2Implementation::AvxVnni
-            }
+        let (implementation, supported) = match kind {
+            Int8KernelKind::Avx2Low7HighBit => (Avx2Implementation::Low7HighBit,
+                std::arch::is_x86_feature_detected!("avx2")),
+            Int8KernelKind::Avx2WidenedI16 => (Avx2Implementation::WidenedI16,
+                std::arch::is_x86_feature_detected!("avx2")),
+            Int8KernelKind::AvxVnni => (Avx2Implementation::AvxVnni,
+                std::arch::is_x86_feature_detected!("avx2")
+                    && std::arch::is_x86_feature_detected!("avxvnni")),
+            Int8KernelKind::Avx512VnniYmm => (Avx2Implementation::VnniYmm,
+                std::arch::is_x86_feature_detected!("avx2")
+                    && std::arch::is_x86_feature_detected!("avx512f")
+                    && std::arch::is_x86_feature_detected!("avx512vnni")
+                    && std::arch::is_x86_feature_detected!("avx512vl")),
+            Int8KernelKind::Avx512VnniZmm => (Avx2Implementation::VnniZmm,
+                std::arch::is_x86_feature_detected!("avx512f")
+                    && std::arch::is_x86_feature_detected!("avx512vnni")),
             _ => return Err(CpuKernelError::UnknownKind),
         };
-        if !std::arch::is_x86_feature_detected!("avx2") { return Err(CpuKernelError::UnsupportedIsa); }
+        if !supported { return Err(CpuKernelError::UnsupportedIsa); }
         Ok(Self { implementation })
     }
     pub(super) fn kind(self) -> Int8KernelKind {
@@ -34,6 +43,8 @@ impl Avx2Kernel {
             Avx2Implementation::Low7HighBit => Int8KernelKind::Avx2Low7HighBit,
             Avx2Implementation::WidenedI16 => Int8KernelKind::Avx2WidenedI16,
             Avx2Implementation::AvxVnni => Int8KernelKind::AvxVnni,
+            Avx2Implementation::VnniYmm => Int8KernelKind::Avx512VnniYmm,
+            Avx2Implementation::VnniZmm => Int8KernelKind::Avx512VnniZmm,
         }
     }
     pub(super) fn dot_rows_into(self, inputs: &[&[i8]], weights: &[i8], output: &mut [i32])
@@ -42,9 +53,9 @@ impl Avx2Kernel {
         if weights.len() > MAX_MODEL_K { return Err(CpuKernelError::ReductionTooLong); }
         if inputs.iter().any(|input| input.len() != weights.len()) { return Err(CpuKernelError::LengthMismatch); }
         if inputs.is_empty() { return Ok(()); }
-        // SAFETY: the private handle proves the selected body's real CPU
-        // features (AVX-VNNI additionally for X2). All rows have equal bounded K.
-        // The closed match instantiates M=1..4 with exactly M valid slices.
+        // SAFETY: the private handle proves every actual CPU feature required
+        // by its selected body. All rows have equal bounded K. This closed
+        // match instantiates M=1..4 with exactly M valid slices for every body.
         let sums = unsafe {
             match (self.implementation, inputs.len()) {
                 (Avx2Implementation::Low7HighBit, 1) => low7_rows::<1>(inputs, weights),
@@ -59,6 +70,14 @@ impl Avx2Kernel {
                 (Avx2Implementation::AvxVnni, 2) => avx_vnni_rows::<2>(inputs, weights),
                 (Avx2Implementation::AvxVnni, 3) => avx_vnni_rows::<3>(inputs, weights),
                 (Avx2Implementation::AvxVnni, 4) => avx_vnni_rows::<4>(inputs, weights),
+                (Avx2Implementation::VnniYmm, 1) => evex_ymm_rows::<1>(inputs, weights),
+                (Avx2Implementation::VnniYmm, 2) => evex_ymm_rows::<2>(inputs, weights),
+                (Avx2Implementation::VnniYmm, 3) => evex_ymm_rows::<3>(inputs, weights),
+                (Avx2Implementation::VnniYmm, 4) => evex_ymm_rows::<4>(inputs, weights),
+                (Avx2Implementation::VnniZmm, 1) => evex_zmm_rows::<1>(inputs, weights),
+                (Avx2Implementation::VnniZmm, 2) => evex_zmm_rows::<2>(inputs, weights),
+                (Avx2Implementation::VnniZmm, 3) => evex_zmm_rows::<3>(inputs, weights),
+                (Avx2Implementation::VnniZmm, 4) => evex_zmm_rows::<4>(inputs, weights),
                 _ => unreachable!("checked x86 cohort size"),
             }
         };
@@ -76,6 +95,8 @@ impl Avx2Kernel {
                 Avx2Implementation::Low7HighBit => low7_high_bit(input, weights),
                 Avx2Implementation::WidenedI16 => widened_i16(input, weights),
                 Avx2Implementation::AvxVnni => avx_vnni_rows::<1>(&[input], weights)[0],
+                Avx2Implementation::VnniYmm => evex_ymm_rows::<1>(&[input], weights)[0],
+                Avx2Implementation::VnniZmm => evex_zmm_rows::<1>(&[input], weights)[0],
             }
         };
         Ok(value)
@@ -292,13 +313,66 @@ unsafe fn avx_vnni_rows<const M: usize>(inputs: &[&[i8]], weights: &[i8]) -> [i3
     }
 }
 
+// Two separately target-gated EVEX bodies. They use the same exact signed
+// correction and per-accumulator bounds as X2, but different vector widths.
+// This macro selects intrinsics at compile time, never in the hot K loop.
+macro_rules! evex_body {
+    ($name:ident, $features:literal, $width:literal, $lanes:literal,
+        $zero:ident, $splat:ident, $load:ident, $store:ident, $xor:ident, $dot:ident) => {
+        #[target_feature(enable = $features)]
+        unsafe fn $name<const M: usize>(inputs: &[&[i8]], weights: &[i8]) -> [i32; MAX_COHORT_ROWS] {
+            let end = weights.len() / $width * $width;
+            // SAFETY: caller proves every feature named above, M=1..4, and
+            // equal bounded K. Loads cover only complete contained vectors.
+            // Stores target local arrays of exactly $lanes i32s. No padding
+            // or alignment is assumed. Short tails use checked signed indexing.
+            unsafe {
+                let sign = $splat(i32::from_le_bytes([0x80; 4]));
+                let ones = $splat(0x0101_0101);
+                let mut raw = [$zero(); M];
+                let mut sums = $zero();
+                for start in (0..end).step_by($width) {
+                    let w = $load(weights.as_ptr().add(start).cast());
+                    sums = $dot(sums, ones, w);
+                    for row in 0..M {
+                        let x = $load(inputs[row].as_ptr().add(start).cast());
+                        raw[row] = $dot(raw[row], $xor(x, sign), w);
+                    }
+                }
+                let mut correction = [0_i32; $lanes];
+                $store(correction.as_mut_ptr().cast(), sums);
+                let mut output = [0_i32; MAX_COHORT_ROWS];
+                for row in 0..M {
+                    let mut lanes = [0_i32; $lanes];
+                    $store(lanes.as_mut_ptr().cast(), raw[row]);
+                    for lane in 0..$lanes { output[row] += lanes[lane] - 128 * correction[lane]; }
+                }
+                for index in end..weights.len() {
+                    let w = i32::from(weights[index]);
+                    for row in 0..M { output[row] += i32::from(inputs[row][index]) * w; }
+                }
+                output
+            }
+        }
+    };
+}
+evex_body!(evex_ymm_rows, "avx2,avx512f,avx512vnni,avx512vl", 32, 8,
+    _mm256_setzero_si256, _mm256_set1_epi32, _mm256_loadu_si256,
+    _mm256_storeu_si256, _mm256_xor_si256, _mm256_dpbusd_epi32);
+// Dword splats, full-vector loads and XOR need AVX512F, not AVX512BW/VL.
+// X1a therefore does not accidentally acquire a byte-mask or VL dependency.
+evex_body!(evex_zmm_rows, "avx512f,avx512vnni", 64, 16,
+    _mm512_setzero_si512, _mm512_set1_epi32, _mm512_loadu_si512,
+    _mm512_storeu_si512, _mm512_xor_si512, _mm512_dpbusd_epi32);
+
 #[cfg(test)]
 mod catalog_tests {
     use super::*;
     #[test]
     fn non_x86_catalog_entries_cannot_construct_an_x86_handle() {
         for kind in Int8KernelKind::ALL {
-            if matches!(kind, Int8KernelKind::Avx2Low7HighBit | Int8KernelKind::Avx2WidenedI16 | Int8KernelKind::AvxVnni) { continue; }
+            if matches!(kind, Int8KernelKind::Avx2Low7HighBit | Int8KernelKind::Avx2WidenedI16
+                | Int8KernelKind::AvxVnni | Int8KernelKind::Avx512VnniYmm | Int8KernelKind::Avx512VnniZmm) { continue; }
             assert!(matches!(Avx2Kernel::detect(kind), Err(CpuKernelError::UnknownKind)));
         }
     }

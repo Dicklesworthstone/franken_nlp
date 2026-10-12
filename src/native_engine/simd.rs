@@ -4,7 +4,7 @@
 //! format. Scalar remains the default. Construction checks the REAL host, not
 //! a caller-supplied feature report; executable handles cannot be forged with
 //! Deserialize. No kernel allocates, spawns, reads configuration, or changes
-//! the canonical floating-point epilogue. ARM A1/A2/A3 are independent bodies.
+//! the canonical floating-point epilogue. ISA candidates have distinct bodies.
 
 use std::{error::Error, fmt, str::FromStr};
 use super::{int8::{self, Int8KernelError}, quant_algebra::MAX_MODEL_K};
@@ -30,11 +30,12 @@ pub const MAX_COHORT_ROWS: usize = 4;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Int8KernelKind {
     Scalar, Avx2Low7HighBit, Avx2WidenedI16, Aarch64Dotprod, Aarch64Autovec, Aarch64Smmla,
-    AvxVnni,
+    AvxVnni, Avx512VnniYmm, Avx512VnniZmm,
 }
 impl Int8KernelKind {
-    pub const ALL: [Self; 7] = [Self::Scalar, Self::Avx2Low7HighBit, Self::Avx2WidenedI16,
-        Self::Aarch64Dotprod, Self::Aarch64Autovec, Self::Aarch64Smmla, Self::AvxVnni];
+    pub const ALL: [Self; 9] = [Self::Scalar, Self::Avx2Low7HighBit, Self::Avx2WidenedI16,
+        Self::Aarch64Dotprod, Self::Aarch64Autovec, Self::Aarch64Smmla, Self::AvxVnni,
+        Self::Avx512VnniYmm, Self::Avx512VnniZmm];
     pub const fn id(self) -> &'static str {
         match self {
             Self::Scalar => "s_scalar_i32",
@@ -44,6 +45,8 @@ impl Int8KernelKind {
             Self::Aarch64Autovec => "a3_autovec",
             Self::Aarch64Smmla => "a1_smmla",
             Self::AvxVnni => "x2_avx_vnni",
+            Self::Avx512VnniYmm => "x1b_avx512_vnni_ymm",
+            Self::Avx512VnniZmm => "x1a_avx512_vnni_zmm",
         }
     }
 }
@@ -109,7 +112,8 @@ impl Int8Kernel {
         match kind {
             Int8KernelKind::Scalar => Ok(Self::scalar()),
             #[cfg(target_arch = "x86_64")]
-            Int8KernelKind::Avx2Low7HighBit | Int8KernelKind::Avx2WidenedI16 | Int8KernelKind::AvxVnni =>
+            Int8KernelKind::Avx2Low7HighBit | Int8KernelKind::Avx2WidenedI16 | Int8KernelKind::AvxVnni
+                | Int8KernelKind::Avx512VnniYmm | Int8KernelKind::Avx512VnniZmm =>
                 Ok(Self { implementation: Implementation::Avx2(avx2::Avx2Kernel::detect(kind)?) }),
             #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             Int8KernelKind::Aarch64Dotprod =>
@@ -185,7 +189,7 @@ impl Int8Kernel {
         }
     }
     /// A(M,K) times transpose(W(N,K)) -> row-major C(M,N). All shape and
-    /// reduction checks precede the first output write. SDOT/autovec/AVX-VNNI
+    /// reduction checks precede the first output write. SDOT/autovec/VNNI
     /// use four-row shared-weight tiles; SMMLA uses four-row/two-column tiles.
     /// No packed matrix or scratch allocation. Orchestration owns admission
     /// and cancellation for this finite leaf.
@@ -198,7 +202,7 @@ impl Int8Kernel {
             return kernel.gemm_into(activations, m, k, weights, n, output);
         }
         if matches!(self.kind(), Int8KernelKind::Aarch64Dotprod | Int8KernelKind::Aarch64Autovec
-            | Int8KernelKind::AvxVnni) {
+            | Int8KernelKind::AvxVnni | Int8KernelKind::Avx512VnniYmm | Int8KernelKind::Avx512VnniZmm) {
             return self.gemm_rows_into(activations, m, k, weights, n, output);
         }
         // Preserve the scalar and AVX2 convenience route and its reported tile.
