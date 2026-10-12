@@ -4,6 +4,7 @@ use std::{ffi::OsString, io::{self, BufRead, IsTerminal, Write}, process::ExitCo
 use clap::FromArgMatches;
 use crate::{error::ErrorCode, redaction_cli::RedactCommand};
 
+mod selftest;
 mod existing {
     include!("cli_existing.rs");
 
@@ -18,7 +19,9 @@ fn definition() -> clap::Command {
         .long("int8-kernel").global(true).value_name("KERNEL")
         .value_parser(crate::native_engine::simd::Int8KernelKind::ALL.map(|kind| kind.id()))
         .help("Explicit experimental CPU kernel for native INT8 projections; scalar remains the default"));
-    let command = existing::definition().subcommand(crate::redaction_cli::definition())
+    let command = existing::definition()
+        .mut_subcommand("robot", |robot| robot.subcommand(selftest::definition()))
+        .subcommand(crate::redaction_cli::definition())
         .subcommands(crate::text_cli::definitions()).subcommand(crate::text_batch::definition())
         .subcommand(candidate);
     #[cfg(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
@@ -47,6 +50,13 @@ pub fn cli_main() -> ExitCode {
         return if command.write_help(&mut out).and_then(|()| writeln!(out)).and_then(|()| out.flush()).is_ok() {
             ExitCode::SUCCESS
         } else { ErrorCode::Generic.as_process_exit() };
+    }
+    // The finite synthetic diagnostic is model-free and never reads stdin or
+    // enters the candidate inference/runtime route. Existing robot dispatch stays intact.
+    if let Some(("robot", robot)) = matches.subcommand() {
+        if let Some(("selftest", options)) = robot.subcommand() {
+            return selftest::run(options, &mut io::stdout().lock(), &mut io::stderr().lock());
+        }
     }
     #[cfg(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -179,5 +189,26 @@ mod task_dispatch_tests {
         let matches = definition().try_get_matches_from(["fnlp", "candidate", "generate",
             "--model", "local.fnlpq", "--memory-mib", "8192"]).unwrap();
         assert!(matches.subcommand().unwrap().1.get_one::<String>("int8-kernel").is_none());
+    }
+    #[test]
+    fn robot_selftest_is_model_free_and_preserves_existing_robot_commands() {
+        for command in ["schema", "health", "backends", "selftest"] {
+            assert!(definition().try_get_matches_from(["fnlp", "robot", command]).is_ok());
+        }
+        assert!(definition().try_get_matches_from(["fnlp", "robot", "selftest", "--schema"]).is_ok());
+        for tier in crate::native_engine::dispatch::KernelTier::ALL {
+            assert!(definition().try_get_matches_from(["fnlp", "robot", "selftest", "--tier", tier.id(), "--details"]).is_ok());
+        }
+    }
+    #[test]
+    fn selftest_options_do_not_become_ambient_model_or_robot_policy() {
+        for args in [vec!["fnlp", "robot", "selftest", "--model", "local.fnlpq"],
+            vec!["fnlp", "robot", "selftest", "--tier", "auto"],
+            vec!["fnlp", "robot", "selftest", "--schema", "--details"],
+            vec!["fnlp", "robot", "selftest", "--schema", "--tier", "s_scalar_i32"],
+            vec!["fnlp", "robot", "backends", "--details"],
+            vec!["fnlp", "tokens", "--tier", "s_scalar_i32"]] {
+            assert!(definition().try_get_matches_from(args).is_err());
+        }
     }
 }
