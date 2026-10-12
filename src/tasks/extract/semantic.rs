@@ -18,6 +18,8 @@ use crate::{
 use super::{ExtractError, ExtractPlan, ExtractResult, SourceDocument};
 mod claims;
 mod native;
+/// Native INT8 extraction plus an explicitly configured correlated second reader.
+pub mod int8;
 pub use claims::{ClaimPathStep, ClaimRule, ClaimValueKind, CLAIM_RENDER_VERSION};
 pub use native::{SemanticNativeError, SemanticNativeRun, SEMANTIC_NATIVE_EXECUTION};
 use claims::RenderedField;

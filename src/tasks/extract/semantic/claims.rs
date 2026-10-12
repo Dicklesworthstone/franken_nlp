@@ -36,6 +36,20 @@ pub(super) struct RenderedField {
 
 pub(super) fn render_fields(schema: &SchemaNode, value: &JsonValue, rules: &[ClaimRule], limits: SemanticLimits)
     -> Result<Vec<RenderedField>, SemanticError> {
+    let by_path = compile_rules(schema, rules, limits)?;
+    let mut walk = Walker { rules: by_path, limits, fields: Vec::new(), visited: 0, claim_bytes: 0 };
+    walk.walk(schema, value, "$", &mut Vec::new())?;
+    Ok(walk.fields)
+}
+
+/// Validate the real schema/rule contract before extraction has produced any
+/// values. No placeholder extraction, source, judge prompt or receipt is made.
+pub(super) fn validate_rules(schema: &SchemaNode, rules: &[ClaimRule], limits: SemanticLimits)
+    -> Result<(), SemanticError> {
+    compile_rules(schema, rules, limits).map(|_| ())
+}
+fn compile_rules<'a>(schema: &SchemaNode, rules: &'a [ClaimRule], limits: SemanticLimits)
+    -> Result<BTreeMap<Vec<ClaimPathStep>, &'a ClaimRule>, SemanticError> {
     if rules.len() > limits.max_fields { return Err(SemanticError::Limit("claim_rules")); }
     let mut by_path = BTreeMap::new(); let mut ids = std::collections::BTreeSet::new();
     let mut template_bytes = 0_usize;
@@ -66,9 +80,7 @@ pub(super) fn render_fields(schema: &SchemaNode, value: &JsonValue, rules: &[Cla
             return Err(SemanticError::Contract("duplicate claim rule identifier or schema path"));
         }
     }
-    let mut walk = Walker { rules: by_path, limits, fields: Vec::new(), visited: 0, claim_bytes: 0 };
-    walk.walk(schema, value, "$", &mut Vec::new())?;
-    Ok(walk.fields)
+    Ok(by_path)
 }
 fn kind(node: &SchemaNode) -> Option<ClaimValueKind> {
     match node { SchemaNode::String { .. } => Some(ClaimValueKind::String),
@@ -205,5 +217,13 @@ mod tests {
         let value = parse_json("[1,2]").unwrap();
         let limits = SemanticLimits { max_fields: 1, ..SemanticLimits::default() };
         assert!(render_fields(schema.root(), &value, &[], limits).is_err());
+    }
+    #[test]
+    fn preflight_validates_rules_without_a_placeholder_extraction() {
+        let schema = compile_json_schema(r#"{"type":"number"}"#, CompileLimits::default()).unwrap();
+        validate_rules(schema.root(), &[rule(vec![], ClaimValueKind::Number)], SemanticLimits::default()).unwrap();
+        assert!(validate_rules(schema.root(), &[rule(vec![], ClaimValueKind::String)], SemanticLimits::default()).is_err());
+        let rules = [rule(vec![], ClaimValueKind::Number), rule(vec![], ClaimValueKind::Number)];
+        assert!(validate_rules(schema.root(), &rules, SemanticLimits::default()).is_err());
     }
 }
