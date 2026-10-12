@@ -215,6 +215,12 @@ impl KernelTier {
             (Self::A2Dotprod, KernelOperation::Int8Gemv) => "a2_dotprod_int8_gemv",
             (Self::A3Autovec, KernelOperation::Int8Gemm) => "a3_autovec_int8_gemm",
             (Self::A3Autovec, KernelOperation::Int8Gemv) => "a3_autovec_int8_gemv",
+            (Self::X1aAvx512VnniZmm, KernelOperation::Int8Gemm) => "x1a_avx512_vnni_zmm_int8_gemm",
+            (Self::X1aAvx512VnniZmm, KernelOperation::Int8Gemv) => "x1a_avx512_vnni_zmm_int8_gemv",
+            (Self::X1bAvx512VnniYmm, KernelOperation::Int8Gemm) => "x1b_avx512_vnni_ymm_int8_gemm",
+            (Self::X1bAvx512VnniYmm, KernelOperation::Int8Gemv) => "x1b_avx512_vnni_ymm_int8_gemv",
+            (Self::X2AvxVnni, KernelOperation::Int8Gemm) => "x2_avx_vnni_int8_gemm",
+            (Self::X2AvxVnni, KernelOperation::Int8Gemv) => "x2_avx_vnni_int8_gemv",
             (Self::A1Smmla, _) => "a1_smmla_pending",
             (Self::A2Dotprod, _) => "a2_dotprod_pending",
             (Self::A3Autovec, _) => "a3_autovec_pending",
@@ -232,10 +238,10 @@ impl KernelTier {
     pub const fn is_implemented(self) -> bool {
         match self {
             Self::Scalar => true,
-            Self::X3aAvx2Low7HighBit | Self::X3bAvx2WidenedI16 => cfg!(target_arch = "x86_64"),
+            Self::X3aAvx2Low7HighBit | Self::X3bAvx2WidenedI16 | Self::X2AvxVnni
+                | Self::X1aAvx512VnniZmm | Self::X1bAvx512VnniYmm => cfg!(target_arch = "x86_64"),
             Self::A1Smmla | Self::A2Dotprod => cfg!(all(target_arch = "aarch64", target_endian = "little")),
             Self::A3Autovec => cfg!(target_arch = "aarch64"),
-            _ => false,
         }
     }
 
@@ -263,12 +269,13 @@ impl KernelTier {
             }
             Self::X1bAvx512VnniYmm => {
                 features.architecture == Architecture::X86_64
+                    && features.x86_avx2
                     && features.x86_avx512f
                     && features.x86_avx512vnni
                     && features.x86_avx512vl
             }
             Self::X2AvxVnni => {
-                features.architecture == Architecture::X86_64 && features.x86_avxvnni
+                features.architecture == Architecture::X86_64 && features.x86_avx2 && features.x86_avxvnni
             }
             Self::X3aAvx2Low7HighBit | Self::X3bAvx2WidenedI16 => {
                 features.architecture == Architecture::X86_64 && features.x86_avx2
@@ -377,7 +384,8 @@ pub fn host_features() -> DetectedFeatures {
 
 /// Maximum implemented tile geometry, including short M/N/K cleanup paths.
 /// In (M,N,K) order: scalar (1,1,1), AVX2 (1,1,32), ARM SMMLA (4,2,8),
-/// and ARM SDOT/autovec (4,1,16). Geometry is not a throughput measurement.
+/// ARM SDOT/autovec (4,1,16), VNNI X2/X1b (4,1,32), and VNNI X1a (4,1,64).
+/// Geometry is not a throughput measurement.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TileGeometry {

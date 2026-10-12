@@ -5,8 +5,10 @@ low-7/high-bit decomposition, or AVX2 X3b signed-i16 widening. The AVX2
 implementations are experimental code-first candidates, not measured dispatch
 winners, model-quality certificates, or release qualification. Scalar remains
 the default. ARM64 SMMLA, SDOT and safe-autovec candidates are documented in
-[ARM_INT8_KERNELS.md](ARM_INT8_KERNELS.md). VNNI tiers and SIMD INT4 execution
-remain separate work.
+[ARM_INT8_KERNELS.md](ARM_INT8_KERNELS.md). Distinct VEX AVX-VNNI and 256/512-bit
+EVEX VNNI candidates are documented in [VNNI_INT8_KERNELS.md](VNNI_INT8_KERNELS.md).
+They share the explicit candidate-selection and real-host dispatch boundaries.
+SIMD INT4 execution remains separate work.
 
 ## Candidate CLI
 
@@ -56,7 +58,7 @@ scale and BF16 cast. Tail cohorts of one, two or three rows and noncontiguous,
 unaligned, read-only aliased inputs are supported without a packing copy.
 This optimizes already-selected grouped execution; it does not silently turn
 serial requests into a batch or introduce another scheduler. The dispatcher's
-standalone GEMM convenience route retains its separately reported 1x1x32 tile.
+standalone AVX2 GEMM convenience route retains its separately reported 1x1x32 tile.
 
 ## Evidence boundary
 
@@ -70,6 +72,6 @@ protected page endings for every length from zero through 10,752. The separate
 shared-weight translation completed 121,092 cohort cases, checking 401,418
 output rows with zero mismatches, including 43,012 protected-page shapes across
 all four cohort sizes and every supported reduction length. These are arithmetic
-and memory-access cross-checks of the C translations, not Rust, DSR, model
-parity, Apple/Zen host performance, or Bead/release gate receipts. Those gates
-remain independent and must run against the actual Rust source and target hosts.
+and memory-access cross-checks of the AVX2 C translations, not VNNI, Rust, DSR,
+model parity, Apple/Zen host performance, or Bead/release gate receipts. Those
+gates remain independent and must run against the actual source and target hosts.

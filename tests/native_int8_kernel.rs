@@ -30,7 +30,7 @@ fn input(k: usize, row: usize) -> ActivationBuffer {
 #[test]
 fn selected_and_full_f32_and_bf16_projections_preserve_exact_scalar_bits() {
     let kernels = kernels();
-    for k in [1, 31, 32, 33, 3072, 6144, 10752] {
+    for k in [1, 31, 32, 33, 63, 64, 65, 127, 128, 129, 3072, 6144, 10752] {
         let weights: Vec<_> = (0..7 * k).map(|i| ((i * 53 + 128) % 256) as u8 as i8).collect();
         let sums: Vec<i32> = weights.chunks(k).map(|r| r.iter().map(|&v| i32::from(v)).sum()).collect();
         let scales = [0.03125, 0.1, 0.3, 0.5, 0.75, 1.0, 1.25];
@@ -61,7 +61,7 @@ fn selected_and_full_f32_and_bf16_projections_preserve_exact_scalar_bits() {
 
 #[test]
 fn grouped_prefill_and_skinny_decode_use_the_selected_kernel_with_identical_epilogues() {
-    for k in [31, 32, 33, 3072] {
+    for k in [31, 32, 33, 63, 64, 65, 127, 128, 129, 3072] {
         let weights: Vec<_> = (0..3 * k).map(|i| ((i * 29 + 127) % 256) as u8 as i8).collect();
         let sums: Vec<i32> = weights.chunks(k).map(|r| r.iter().map(|&v| i32::from(v)).sum()).collect();
         let scalar = QuantizedLinear::checked(3, k, &weights, &[0.5, 0.1, 0.25], &sums).unwrap();

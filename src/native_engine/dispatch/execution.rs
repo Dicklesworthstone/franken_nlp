@@ -11,10 +11,13 @@ fn native_kind(tier: KernelTier) -> Option<Int8KernelKind> {
     match tier {
         KernelTier::X3aAvx2Low7HighBit => Some(Int8KernelKind::Avx2Low7HighBit),
         KernelTier::X3bAvx2WidenedI16 => Some(Int8KernelKind::Avx2WidenedI16),
+        KernelTier::X2AvxVnni => Some(Int8KernelKind::AvxVnni),
+        KernelTier::X1aAvx512VnniZmm => Some(Int8KernelKind::Avx512VnniZmm),
+        KernelTier::X1bAvx512VnniYmm => Some(Int8KernelKind::Avx512VnniYmm),
         KernelTier::A1Smmla => Some(Int8KernelKind::Aarch64Smmla),
         KernelTier::A2Dotprod => Some(Int8KernelKind::Aarch64Dotprod),
         KernelTier::A3Autovec => Some(Int8KernelKind::Aarch64Autovec),
-        _ => None,
+        KernelTier::Scalar => None,
     }
 }
 /// Maximum live tile capacity. The corresponding implementation owns every
@@ -22,9 +25,11 @@ fn native_kind(tier: KernelTier) -> Option<Int8KernelKind> {
 pub(super) const fn tile(tier: KernelTier) -> TileGeometry {
     match tier {
         KernelTier::X3aAvx2Low7HighBit | KernelTier::X3bAvx2WidenedI16 => TileGeometry { k: 32, m: 1, n: 1 },
+        KernelTier::X2AvxVnni | KernelTier::X1bAvx512VnniYmm => TileGeometry { k: 32, m: 4, n: 1 },
+        KernelTier::X1aAvx512VnniZmm => TileGeometry { k: 64, m: 4, n: 1 },
         KernelTier::A1Smmla => TileGeometry { k: 8, m: 4, n: 2 },
         KernelTier::A2Dotprod | KernelTier::A3Autovec => TileGeometry { k: 16, m: 4, n: 1 },
-        _ => TileGeometry::scalar(),
+        KernelTier::Scalar => TileGeometry::scalar(),
     }
 }
 pub(super) fn check_key(tier: KernelTier, key: DispatchKey) -> Result<(), DispatchError> {
