@@ -60,6 +60,26 @@ An explicitly requested unsupported tier yields verdict `unsupported` and exit 2
 Integer/route failures and execution/output failures exit 1. Command-line usage
 errors exit 2. A partial transcript or a missing terminal record is not a pass.
 
+## Backend-matrix driver
+
+```sh
+FNLP_BIN=/path/to/already-built/fnlp scripts/e2e_backends_matrix.sh
+```
+
+The driver now invokes `robot selftest --details`, not `robot backends` inventory.
+Its jq verifier requires the exact case population for every passed tier,
+matching requested/observed kernel names, real hex output checksums, complete
+counts and one terminal pass. Missing/duplicate cases, omitted tiers, native
+failure records, unsupported-feature contradictions, unknown suite versions,
+and the historical `scalar-reference` placeholder checksums are rejected.
+The pipeline also preserves a nonzero binary exit even if its stdout claims pass.
+
+On success stdout carries the selftest protocol records, not the old invented
+fixed-shape rows; stderr carries an `E2E_SUMMARY` with explicit
+`scope=finite_synthetic_int8`. Consumers must check the process exit as well as
+the complete transcript. This driver does not build or fetch a binary and does
+not establish full fixed-N coverage or supersede the controller-owned DSR gate.
+
 ## Scope and implementation status
 
 A selftest pass covers only the finite, versioned synthetic integer cases that
@@ -72,4 +92,5 @@ bead-specific qualification requirements remain separate.
 This implementation adds a callable library engine, a real CLI route and
 regression definitions. Compilation, Rust tests and execution of the new
 selftest were not run in the implementation session; source/API and diff review
-are not passing validation receipts.
+are not passing validation receipts. The revised driver passed `bash -n` syntax
+checking only; its jq validation and native end-to-end run remain unexecuted.
