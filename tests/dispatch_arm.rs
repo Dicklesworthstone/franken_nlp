@@ -1,5 +1,8 @@
 //! ARM dispatch executes the reported body; injected features are not ISA authority.
 //! Measurement rows here are synthetic routing fixtures, never benchmark evidence.
+#[path = "support/packed_int4_dispatch.rs"]
+mod packed_int4;
+
 use franken_nlp::native_engine::{
     dispatch::{Architecture, DetectedFeatures, DispatchError, DispatchKey, DispatchRegime,
         DispatchRow, DispatchTable, Dispatcher, KernelOperation, KernelShape, KernelTier,
@@ -111,21 +114,8 @@ fn invented_arm_feature_reports_cannot_mint_a_foreign_or_unsupported_executable(
 }
 
 #[test]
-fn int8_registration_does_not_authorize_arm_int4_or_fake_a_measured_result() {
-    for (tier, _) in ARM {
-        assert!(!tier.supports_operation(KernelOperation::Int4Gemv));
-        let key = DispatchKey::new(KernelOperation::Int4Gemv, DispatchRegime::DecodeGemv,
-            KernelShape { k: 4, m: 1, n: 1 });
-        let dispatcher = Dispatcher::new(synthetic_arm(true, true),
-            DispatchTable::from_rows(vec![fixture(tier, key)]).unwrap());
-        assert_eq!(dispatcher.int4_gemv(&[1, 2, 3, 4], &[0x78, 0xf0], 1,
-            DispatchRegime::DecodeGemv, Some(tier)).unwrap_err(), DispatchError::ForcedTierUnimplemented { requested: tier });
-        let fallback = dispatcher.int4_gemv(&[1, 2, 3, 4], &[0x78, 0xf0], 1,
-            DispatchRegime::DecodeGemv, None).unwrap();
-        assert_eq!(fallback.selection.tier, KernelTier::Scalar);
-        assert_eq!(fallback.output, [2]);
-        assert!(matches!(fallback.selection.provenance, SelectionProvenance::ConservativeDefault { .. }));
-    }
+fn packed_int4_dispatch_uses_real_arm_leaves_and_operation_specific_rows() {
+    packed_int4::verify(&ARM, synthetic_arm(true, true));
 }
 
 #[test]

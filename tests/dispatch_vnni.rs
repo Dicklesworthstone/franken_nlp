@@ -1,5 +1,8 @@
 //! VNNI dispatch definitions: reported tier, actual body and capability boundary.
 //! Every table here is a synthetic policy fixture, NOT performance evidence.
+#[path = "support/packed_int4_dispatch.rs"]
+mod packed_int4;
+
 use franken_nlp::native_engine::{
     dispatch::{Architecture, DetectedFeatures, DispatchError, DispatchKey, DispatchRegime,
         DispatchRow, DispatchTable, Dispatcher, KernelOperation, KernelShape, KernelTier,
@@ -148,19 +151,8 @@ fn all_feature_combinations_keep_vex_evex_width_and_architecture_independent() {
 }
 
 #[test]
-fn vnni_int8_registration_cannot_relabel_scalar_int4_as_vnni() {
-    for (tier, _) in TIERS {
-        assert!(!tier.supports_operation(KernelOperation::Int4Gemv));
-        let key = DispatchKey::new(KernelOperation::Int4Gemv, DispatchRegime::DecodeGemv,
-            KernelShape { k: 4, m: 1, n: 1 });
-        let dispatcher = Dispatcher::new(features(31, Architecture::X86_64),
-            DispatchTable::from_rows(vec![row(tier, key)]).unwrap());
-        assert_eq!(dispatcher.int4_gemv(&[1, 2, 3, 4], &[0x78, 0xf0], 1,
-            DispatchRegime::DecodeGemv, Some(tier)).unwrap_err(), DispatchError::ForcedTierUnimplemented { requested: tier });
-        let result = dispatcher.int4_gemv(&[1, 2, 3, 4], &[0x78, 0xf0], 1, DispatchRegime::DecodeGemv, None).unwrap();
-        assert_eq!(result.output, [2]); assert_eq!(result.selection.tier, KernelTier::Scalar);
-        assert!(matches!(result.selection.provenance, SelectionProvenance::ConservativeDefault { .. }));
-    }
+fn packed_int4_dispatch_uses_real_vnni_leaves_and_operation_specific_rows() {
+    packed_int4::verify(&TIERS, features(31, Architecture::X86_64));
 }
 
 #[test]

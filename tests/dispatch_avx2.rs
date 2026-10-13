@@ -1,5 +1,8 @@
 //! Forced and table-selected dispatch must execute the reported INT8 body.
 //! Synthetic table values below are policy fixtures, never performance evidence.
+#[path = "support/packed_int4_dispatch.rs"]
+mod packed_int4;
+
 use franken_nlp::native_engine::{
     dispatch::{Architecture, DetectedFeatures, DispatchError, DispatchKey, DispatchRegime,
         DispatchRow, DispatchTable, Dispatcher, KernelOperation, KernelShape, KernelTier,
@@ -97,20 +100,8 @@ fn injected_feature_reports_cannot_authorize_unsupported_machine_instructions() 
 }
 
 #[test]
-fn int8_registration_never_becomes_an_int4_body_or_a_fake_table_selection() {
-    for (tier, _) in TIERS {
-        assert!(!tier.supports_operation(KernelOperation::Int4Gemv));
-        let key = DispatchKey::new(KernelOperation::Int4Gemv, DispatchRegime::DecodeGemv,
-            KernelShape { k: 4, m: 1, n: 1 });
-        let dispatcher = Dispatcher::new(synthetic_avx2(), DispatchTable::from_rows(vec![row(tier, key)]).unwrap());
-        assert_eq!(dispatcher.int4_gemv(&[1, 2, 3, 4], &[0x78, 0xf0], 1,
-            DispatchRegime::DecodeGemv, Some(tier)).unwrap_err(), DispatchError::ForcedTierUnimplemented { requested: tier });
-        let fallback = dispatcher.int4_gemv(&[1, 2, 3, 4], &[0x78, 0xf0], 1,
-            DispatchRegime::DecodeGemv, None).unwrap();
-        assert_eq!(fallback.selection.tier, KernelTier::Scalar);
-        assert_eq!(fallback.output, [2]);
-        assert!(matches!(fallback.selection.provenance, SelectionProvenance::ConservativeDefault { .. }));
-    }
+fn packed_int4_dispatch_uses_real_avx2_leaves_and_operation_specific_rows() {
+    packed_int4::verify(&TIERS, synthetic_avx2());
 }
 
 #[test]

@@ -221,14 +221,14 @@ impl KernelTier {
             (Self::X1bAvx512VnniYmm, KernelOperation::Int8Gemv) => "x1b_avx512_vnni_ymm_int8_gemv",
             (Self::X2AvxVnni, KernelOperation::Int8Gemm) => "x2_avx_vnni_int8_gemm",
             (Self::X2AvxVnni, KernelOperation::Int8Gemv) => "x2_avx_vnni_int8_gemv",
-            (Self::A1Smmla, _) => "a1_smmla_pending",
-            (Self::A2Dotprod, _) => "a2_dotprod_pending",
-            (Self::A3Autovec, _) => "a3_autovec_pending",
-            (Self::X1aAvx512VnniZmm, _) => "x1a_avx512_vnni_zmm_pending",
-            (Self::X1bAvx512VnniYmm, _) => "x1b_avx512_vnni_ymm_pending",
-            (Self::X2AvxVnni, _) => "x2_avx_vnni_pending",
-            (Self::X3aAvx2Low7HighBit, _) => "x3a_avx2_low7_high_bit_pending",
-            (Self::X3bAvx2WidenedI16, _) => "x3b_avx2_widened_i16_pending",
+            (Self::A1Smmla, KernelOperation::Int4Gemv) => "a1_smmla_int4_unpack_gemv_v1",
+            (Self::A2Dotprod, KernelOperation::Int4Gemv) => "a2_dotprod_int4_unpack_gemv_v1",
+            (Self::A3Autovec, KernelOperation::Int4Gemv) => "a3_autovec_int4_unpack_gemv_v1",
+            (Self::X1aAvx512VnniZmm, KernelOperation::Int4Gemv) => "x1a_avx512_vnni_zmm_int4_unpack_gemv_v1",
+            (Self::X1bAvx512VnniYmm, KernelOperation::Int4Gemv) => "x1b_avx512_vnni_ymm_int4_unpack_gemv_v1",
+            (Self::X2AvxVnni, KernelOperation::Int4Gemv) => "x2_avx_vnni_int4_unpack_gemv_v1",
+            (Self::X3aAvx2Low7HighBit, KernelOperation::Int4Gemv) => "x3a_avx2_low7_high_bit_int4_unpack_gemv_v1",
+            (Self::X3bAvx2WidenedI16, KernelOperation::Int4Gemv) => "x3b_avx2_widened_i16_int4_unpack_gemv_v1",
         }
     }
 
@@ -245,11 +245,13 @@ impl KernelTier {
         }
     }
 
-    /// INT8 registration never silently authorizes an INT4 implementation.
+    /// Packed INT4 has its own bounded unpacking driver; registration alone
+    /// is not parity, performance, model or artifact qualification.
     #[must_use]
     pub const fn supports_operation(self, operation: KernelOperation) -> bool {
-        self.is_implemented()
-            && (!matches!(operation, KernelOperation::Int4Gemv) || matches!(self, Self::Scalar))
+        match operation {
+            KernelOperation::Int8Gemm | KernelOperation::Int8Gemv | KernelOperation::Int4Gemv => self.is_implemented(),
+        }
     }
 
     #[must_use]
@@ -549,7 +551,7 @@ impl fmt::Display for DispatchError {
             }
             Self::ScalarKernel(error) => error.fmt(formatter),
             Self::CpuKernel(error) => error.fmt(formatter),
-            Self::AllocationRefused => formatter.write_str("dispatched INT8 output allocation refused"),
+            Self::AllocationRefused => formatter.write_str("dispatched integer-kernel allocation refused"),
         }
     }
 }
@@ -593,7 +595,7 @@ impl Dispatcher {
     }
 
     /// Select a tier without executing instructions. Forced unsupported
-    /// operations fail before dispatch; INT8 does not imply INT4 registration.
+    /// operations fail before dispatch; INT4 measurements remain operation-specific.
     pub fn select(
         &self,
         key: DispatchKey,
@@ -617,7 +619,7 @@ impl Dispatcher {
                 provenance: SelectionProvenance::ConservativeDefault {
                     detail: "explicit forced tier — unmeasured, unqualified candidate",
                 },
-                tier: requested, tile: execution::tile(requested),
+                tier: requested, tile: execution::operation_tile(requested, key.operation),
             });
         }
 
@@ -690,7 +692,8 @@ impl Dispatcher {
         Ok(Dispatched { output, selection })
     }
 
-    /// Safe int4-to-int8 GEMV entry point. Non-scalar INT4 remains a typed refusal.
+    /// Safe packed-INT4 GEMV. Native tiers expand only a K-wide row, then
+    /// execute the reported integer leaf. Scalar remains the unmeasured default.
     pub fn int4_gemv(
         &self,
         input: &[i8],
@@ -709,7 +712,7 @@ impl Dispatcher {
             },
         );
         let selection = self.select(key, forced)?;
-        let output = int8::gemv_int4_s8(input, packed_weights, n)?;
+        let output = execution::int4_gemv(selection.tier, input, packed_weights, n)?;
         Ok(Dispatched { output, selection })
     }
 }

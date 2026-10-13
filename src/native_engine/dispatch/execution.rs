@@ -2,7 +2,7 @@
 //! synthetic DetectedFeatures value must NEVER mint a target-feature handle.
 use super::{DispatchError, DispatchKey, DispatchRow, KernelOperation, KernelTier, TileGeometry};
 use crate::native_engine::{
-    int8,
+    int4::PackedInt4Kernel, int8,
     quant_algebra::MAX_MODEL_K,
     simd::{CpuKernelError, Int8Kernel, Int8KernelKind},
 };
@@ -32,6 +32,16 @@ pub(super) const fn tile(tier: KernelTier) -> TileGeometry {
         KernelTier::Scalar => TileGeometry::scalar(),
     }
 }
+/// Packed GEMV exposes one activation/weight row at a time, even when the
+/// underlying INT8 GEMM supports larger M/N tiles. Measurement geometry must
+/// describe the executed packed operation, not its unpacked sibling.
+pub(super) const fn operation_tile(tier: KernelTier, operation: KernelOperation) -> TileGeometry {
+    let native = tile(tier);
+    match operation {
+        KernelOperation::Int4Gemv => TileGeometry { k: native.k, m: 1, n: 1 },
+        KernelOperation::Int8Gemm | KernelOperation::Int8Gemv => native,
+    }
+}
 pub(super) fn check_key(tier: KernelTier, key: DispatchKey) -> Result<(), DispatchError> {
     if native_kind(tier).is_some() && key.shape.k > MAX_MODEL_K {
         return Err(DispatchError::CpuKernel(CpuKernelError::ReductionTooLong));
@@ -40,10 +50,9 @@ pub(super) fn check_key(tier: KernelTier, key: DispatchKey) -> Result<(), Dispat
 }
 pub(super) fn validate_tile(row: &DispatchRow) -> Result<(), DispatchError> {
     if native_kind(row.selected_tier).is_some()
-        && matches!(row.key.operation, KernelOperation::Int8Gemm | KernelOperation::Int8Gemv)
-        && row.tile != tile(row.selected_tier) {
+        && row.tile != operation_tile(row.selected_tier, row.key.operation) {
         return Err(DispatchError::InvalidMeasurement {
-            detail: "native INT8 measurements must name the implemented tile".to_owned(),
+            detail: "native measurements must name the implemented operation tile".to_owned(),
         });
     }
     Ok(())
@@ -69,5 +78,28 @@ pub(super) fn gemm(tier: KernelTier, activations: &[i8], m: usize, k: usize,
     output.try_reserve_exact(length).map_err(|_| DispatchError::AllocationRefused)?;
     output.resize(length, 0);
     kernel.gemm_into(activations, m, k, weights, n, &mut output).map_err(DispatchError::CpuKernel)?;
+    Ok(output)
+}
+
+/// Packed weights remain packed except for a K-byte row workspace. The
+/// scalar fallback keeps its original unbounded scalar arithmetic contract.
+/// Neither forcing nor a synthetic table can bypass real hardware admission.
+pub(super) fn int4_gemv(tier: KernelTier, input: &[i8], packed: &[u8], n: usize)
+    -> Result<Vec<i32>, DispatchError> {
+    if tier == KernelTier::Scalar { return Ok(int8::gemv_int4_s8(input, packed, n)?); }
+    let kind = native_kind(tier).ok_or(DispatchError::ForcedTierUnimplemented { requested: tier })?;
+    let kernel = PackedInt4Kernel::detect(kind).map_err(DispatchError::CpuKernel)?;
+    let k = PackedInt4Kernel::scratch_len(input.len()).map_err(DispatchError::CpuKernel)?;
+    let weights = n.checked_mul(k).ok_or(DispatchError::CpuKernel(CpuKernelError::Shape))?;
+    if weights % 2 != 0 || packed.len() != weights / 2 {
+        return Err(DispatchError::CpuKernel(CpuKernelError::Shape));
+    }
+    let mut output = Vec::new();
+    output.try_reserve_exact(n).map_err(|_| DispatchError::AllocationRefused)?;
+    output.resize(n, 0);
+    let mut scratch = Vec::new();
+    scratch.try_reserve_exact(k).map_err(|_| DispatchError::AllocationRefused)?;
+    scratch.resize(k, 0);
+    kernel.gemv_into(input, packed, n, &mut output, &mut scratch).map_err(DispatchError::CpuKernel)?;
     Ok(output)
 }

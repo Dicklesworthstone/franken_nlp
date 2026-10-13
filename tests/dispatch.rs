@@ -109,22 +109,26 @@ fn forced_unsupported_tier_fails_before_selection() {
 }
 
 #[test]
-fn forced_detected_unimplemented_operation_fails_without_entering_a_kernel() {
+fn packed_int4_policy_is_target_specific_and_does_not_execute_instructions() {
     let dispatcher = Dispatcher::new(
         x86((true, false, false, false, false)),
         DispatchTable::default(),
     );
-    // X3a now owns INT8 bodies, but that never grants an INT4 implementation.
     let int4_key = DispatchKey::new(KernelOperation::Int4Gemv, DispatchRegime::DecodeGemv,
         KernelShape { k: 2, m: 1, n: 1 });
-    assert_eq!(
-        dispatcher
-            .select(int4_key, Some(KernelTier::X3aAvx2Low7HighBit))
-            .unwrap_err(),
-        DispatchError::ForcedTierUnimplemented {
-            requested: KernelTier::X3aAvx2Low7HighBit,
-        }
-    );
+    let tier = KernelTier::X3aAvx2Low7HighBit;
+    let result = dispatcher.select(int4_key, Some(tier));
+    if cfg!(target_arch = "x86_64") {
+        // This is selection policy, not authority to execute AVX2. The native
+        // boundary independently checks the real host before touching a leaf.
+        let selected = result.unwrap();
+        assert_eq!(selected.tier, tier);
+        assert_eq!(selected.kernel_id, tier.kernel_id(KernelOperation::Int4Gemv));
+        assert_eq!(selected.tile, TileGeometry { k: 32, m: 1, n: 1 });
+        assert!(matches!(selected.provenance, SelectionProvenance::ConservativeDefault { .. }));
+    } else {
+        assert_eq!(result.unwrap_err(), DispatchError::ForcedTierUnimplemented { requested: tier });
+    }
 }
 
 #[test]
