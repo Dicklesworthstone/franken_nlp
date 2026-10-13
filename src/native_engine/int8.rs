@@ -246,26 +246,24 @@ pub fn unpack_int4_to_i8(packed: &[u8]) -> Vec<i8> {
     unpacked
 }
 
-/// Int4 weights are unpacked to i8 then use the exact scalar i8 GEMV path.
+/// Exact scalar packed-INT4 GEMV with constant unpacking workspace.
+///
+/// Validate the complete flat layout before allocating output. Decode signed
+/// nibbles directly in increasing K order, including odd-K rows that share a
+/// packed byte. Unlike native handles this reference keeps its unbounded K
+/// contract and reports the first checked i32 overflow, rather than wrapping.
 pub fn gemv_int4_s8(
     input: &[i8],
     packed_weights: &[u8],
     n: usize,
 ) -> Result<Vec<i32>, Int8KernelError> {
-    let expected_weights = checked_len(n, input.len())?;
-    let unpacked = unpack_int4_to_i8(packed_weights);
-    if unpacked.len() != expected_weights {
-        return Err(Int8KernelError::Int4Layout {
-            expected_weights,
-            observed_weights: unpacked.len(),
-        });
-    }
+    check_int4_layout(packed_weights, checked_len(n, input.len())?)?;
     if input.is_empty() {
         return Ok(vec![0; n]);
     }
     let mut output = Vec::with_capacity(n);
-    for row in unpacked.chunks_exact(input.len()) {
-        output.push(dot_int4_grouped_s8_unpacked(input, row, input.len())?);
+    for row in 0..n {
+        output.push(dot_packed_s8(input, packed_weights, row * input.len())?);
     }
     Ok(output)
 }
@@ -274,45 +272,53 @@ pub fn gemv_int4_s8(
 ///
 /// The packing format supplies the group width. The final partial may be a
 /// tail; ordering is always increasing logical group index, independently of
-/// how a future SIMD tier packs bytes.
+/// how a future SIMD tier packs bytes. Only group partials are allocated, never
+/// an expanded copy of the weights. This integer sum does not apply scales.
 pub fn dot_int4_grouped_s8(
     input: &[i8],
     packed_weights: &[u8],
     group_width: usize,
 ) -> Result<i32, Int8KernelError> {
-    let unpacked = unpack_int4_to_i8(packed_weights);
-    if unpacked.len() != input.len() {
-        return Err(Int8KernelError::Int4Layout {
-            expected_weights: input.len(),
-            observed_weights: unpacked.len(),
-        });
-    }
-    dot_int4_grouped_s8_unpacked(input, &unpacked, group_width)
-}
-
-fn dot_int4_grouped_s8_unpacked(
-    input: &[i8],
-    weights: &[i8],
-    group_width: usize,
-) -> Result<i32, Int8KernelError> {
+    check_int4_layout(packed_weights, input.len())?;
     if group_width == 0 {
         return Err(Int8KernelError::Int4GroupWidth { group_width });
     }
-    if input.len() != weights.len() {
-        return Err(Int8KernelError::LengthMismatch {
-            operand: "int4 grouped weights",
-            expected: input.len(),
-            observed: weights.len(),
-        });
-    }
     let mut partials = Vec::with_capacity(input.len().div_ceil(group_width));
-    for (activation_group, weight_group) in
-        input.chunks(group_width).zip(weights.chunks(group_width))
-    {
-        partials.push(dot_s8s8(activation_group, weight_group)?);
+    for (group, activations) in input.chunks(group_width).enumerate() {
+        partials.push(dot_packed_s8(activations, packed_weights, group * group_width)?);
     }
     quant_algebra::sum_int4_groups_in_fixed_order(&partials)
         .map_err(Int8KernelError::CanonicalAlgebra)
+}
+
+fn check_int4_layout(packed: &[u8], expected_weights: usize) -> Result<(), Int8KernelError> {
+    let observed_weights = checked_len(packed.len(), 2)?;
+    if observed_weights != expected_weights {
+        return Err(Int8KernelError::Int4Layout { expected_weights, observed_weights });
+    }
+    Ok(())
+}
+
+/// Private callers first validate the whole packed range. The logical offset
+/// and each addition are bounded by that range; offset may name a high nibble.
+/// Overflow indices remain local to the row/group, exactly like dot_s8s8.
+fn dot_packed_s8(input: &[i8], packed: &[u8], offset: usize) -> Result<i32, Int8KernelError> {
+    let mut accumulator = 0_i32;
+    #[cfg(debug_assertions)]
+    let mut shadow = 0_i64;
+    for (k_index, &activation) in input.iter().enumerate() {
+        let logical = offset + k_index;
+        let weight = sign_extend_int4(packed[logical / 2] >> ((logical % 2) * 4));
+        let product = i32::from(activation) * i32::from(weight);
+        accumulator = accumulator.checked_add(product)
+            .ok_or(Int8KernelError::AccumulatorOverflow { operation: "s8*s8 dot", k_index })?;
+        #[cfg(debug_assertions)]
+        {
+            shadow += i64::from(activation) * i64::from(weight);
+            debug_assert_eq!(i64::from(accumulator), shadow, "i64 shadow differs at K={k_index}");
+        }
+    }
+    Ok(accumulator)
 }
 
 /// Tier-S's only float dequantization epilogue.
