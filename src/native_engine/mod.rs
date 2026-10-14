@@ -24,6 +24,7 @@ pub mod rope;
 pub mod sampler;
 pub mod selftest;
 pub mod simd;
+pub mod strict_int4;
 pub mod strict_int8;
 pub mod tensor;
 pub mod weights;
