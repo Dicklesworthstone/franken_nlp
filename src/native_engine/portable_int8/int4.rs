@@ -9,6 +9,7 @@ use super::*;
 use crate::native_engine::int4::PackedInt4Kernel;
 
 pub mod convert;
+pub mod cohort;
 
 pub const PORTABLE_INT4_LINEAR_VERSION: &str = "portable-s4-group-f32-dynamic-s8-rne-v1";
 
@@ -88,9 +89,7 @@ impl<'a> GroupedInt4Linear<'a> {
         output: &mut [Bf16], scratch: &mut [i8], ledger: &mut ProjectionLedger, control: &mut C)
         -> Result<(), GroupedInt4Error> {
         self.project(input, rows, output.len(), scratch, ledger, control, |index, value| {
-            let cast = Bf16::from_f32(value);
-            if !cast.to_f32().is_finite() { return Err(LinearError::NonFiniteOutput); }
-            output[index] = cast; Ok(())
+            output[index] = checked_bf16(value)?; Ok(())
         })
     }
     fn project<C: DecodeStepControl>(&self, input: &ActivationBuffer, rows: LinearRows<'_>, length: usize,
@@ -114,14 +113,7 @@ impl<'a> GroupedInt4Linear<'a> {
                 let mut dot = [0_i32];
                 self.kernel.dot_rows_range_into(&[&input_values[start..start + width]], self.packed,
                     row * self.columns + start, width, &mut dot, scratch).map_err(LinearError::CpuKernel)?;
-                let partial = dequantize_i32_fixed(dot[0], EpilogueScales {
-                    activation: activation_scale, row: 1.0, column: 1.0,
-                    group: self.scales[row * self.groups + group],
-                }).map_err(LinearError::from)?;
-                // Do not sum the integer groups first, factor out unequal
-                // scales, change reduction order, or cast each partial to BF16.
-                total += partial;
-                if !total.is_finite() { return Err(LinearError::NonFiniteOutput.into()); }
+                accumulate_group(&mut total, dot[0], activation_scale, self.scales[row * self.groups + group])?;
                 since_poll = (since_poll + 1) % ROWS_PER_CHECKPOINT;
             }
             store(index, total)?;
@@ -129,6 +121,18 @@ impl<'a> GroupedInt4Linear<'a> {
         poll(control)?;
         Ok(())
     }
+}
+
+// Serial and cohort execution share the exact same floating program. Never
+// sum integer groups first, factor unequal scales, or cast partials to BF16.
+fn accumulate_group(total: &mut f32, dot: i32, activation: f32, group: f32) -> Result<(), LinearError> {
+    let partial = dequantize_i32_fixed(dot, EpilogueScales { activation, row: 1.0, column: 1.0, group })?;
+    *total += partial;
+    if total.is_finite() { Ok(()) } else { Err(LinearError::NonFiniteOutput) }
+}
+fn checked_bf16(value: f32) -> Result<Bf16, LinearError> {
+    let cast = Bf16::from_f32(value);
+    if cast.to_f32().is_finite() { Ok(cast) } else { Err(LinearError::NonFiniteOutput) }
 }
 
 #[cfg(test)]
