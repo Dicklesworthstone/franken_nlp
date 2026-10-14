@@ -3,6 +3,7 @@
 //! The common loop runner owns 22 -> norm -> 22 -> norm and all 44 KV slots.
 
 use std::{error::Error, fmt};
+use serde::{Deserialize, Serialize};
 use super::{
     attention::{QUERY_HEAD_COUNT, eager_gqa_attention_from_cache},
     decode::{DecodeCancellationKind, DecodeStepControl},
@@ -25,7 +26,9 @@ pub use weights::{Int4ModelError, Int4ModelIdentity, Int4ModelLoadBudget,
     Int4ModelLoadRequirement, Int4ModelWeights};
 use weights::{Int4Layer, PROJECTION_SHAPES};
 
-pub const STRICT_INT4_PROFILE: &str = "strict-grouped-int4-bf16-rails-v1";
+// Version 1 remains the existing INT8 program. Version 2 names this distinct
+// grouped-INT4 candidate in the central ExecutionIdentity profile namespace.
+pub const STRICT_INT4_PROFILE: &str = "strict-quantized-v2";
 pub const STRICT_INT4_EXECUTION: &str = "grouped-int4-bf16-rails-eager-gqa-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,7 +70,8 @@ impl From<LinearError> for StrictInt4Error {
 
 /// Includes all group dots in both loop passes, all unpadded projection MACs,
 /// and each QK/value-vector pair. Not a measured instruction/traffic count.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Int4Work {
     pub forward_positions: u64, pub projected_logits: u64, pub attention_pairs: u64,
     pub projections: ProjectionWork,
@@ -192,6 +196,10 @@ pub struct Int4Session<'run, 'weights, C: DecodeStepControl> {
     hidden: Option<Vec<Bf16>>, work: Int4Work,
 }
 impl<C: DecodeStepControl> Int4Session<'_, '_, C> {
+    /// Native task drivers share the same admitted checkpoint controller.
+    pub(crate) fn control(&mut self) -> &mut C { &mut *self.control }
+    /// A decoder/sink failure after native work also invalidates the session.
+    pub(crate) fn abort(&mut self) { self.engine.state.poisoned = true; }
     pub fn work(&self) -> Int4Work { Int4Work { projections: self.ledger.reserved(), ..self.work } }
     pub fn position(&self) -> Result<usize, StrictInt4Error> {
         self.engine.state.check()?;

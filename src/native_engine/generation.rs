@@ -21,6 +21,7 @@ use super::{
     sampler::{Seed256, StableRequestKey, SAMPLER_VERSION},
 };
 pub mod batched;
+pub mod grouped_int4;
 pub mod quantized;
 mod config;
 mod cursor;
@@ -169,13 +170,16 @@ impl fmt::Display for GenerationError {
 impl Error for GenerationError {}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum GenerationBackend { Eager, Int8 }
+enum GenerationBackend { Eager, Int8, GroupedInt4 }
 impl GenerationBackend {
     fn profile(self) -> NumericsProfile {
-        match self { Self::Eager => NumericsProfile::HfBf16Eager, Self::Int8 => NumericsProfile::StrictQuantized { version: 1 } }
+        match self { Self::Eager => NumericsProfile::HfBf16Eager,
+            Self::Int8 => NumericsProfile::StrictQuantized { version: 1 },
+            Self::GroupedInt4 => NumericsProfile::StrictQuantized { version: 2 } }
     }
     fn version(self) -> &'static str {
-        match self { Self::Eager => GENERATION_VERSION, Self::Int8 => quantized::INT8_GENERATION_VERSION }
+        match self { Self::Eager => GENERATION_VERSION, Self::Int8 => quantized::INT8_GENERATION_VERSION,
+            Self::GroupedInt4 => grouped_int4::INT4_GENERATION_VERSION }
     }
 }
 
@@ -206,6 +210,10 @@ impl GenerationPlan {
         }
         if backend == GenerationBackend::Int8
             && identity.backend_semantic_version != super::strict_int8::STRICT_INT8_EXECUTION {
+            return Err(GenerationError::Identity);
+        }
+        if backend == GenerationBackend::GroupedInt4
+            && identity.backend_semantic_version != super::strict_int4::STRICT_INT4_EXECUTION {
             return Err(GenerationError::Identity);
         }
         if item_id.is_empty() || item_id.len() > 256 || item_id.chars().any(char::is_control) {

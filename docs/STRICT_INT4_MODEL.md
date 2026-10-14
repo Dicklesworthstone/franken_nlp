@@ -42,8 +42,9 @@ A failure returns no partial model.
 The private-field `Int4ModelIdentity` binds the prepared source root, pinned
 revision, candidate profile, group width, tensor roles, and actual converted
 weight/scale and BF16 bits. Kernel choice is excluded. This candidate content
-fingerprint is deliberately NOT called the canonical logical-model digest or a
-task `ExecutionIdentity`; it must not silently enter ordinary cache/job receipts.
+fingerprint is not a canonical fnlpq logical-model digest. The explicit
+generation adapter below binds it into the central `ExecutionIdentity` only
+under its separate source-candidate format and profile namespace.
 
 ## Execution
 
@@ -111,7 +112,39 @@ controller must arm it on an admitted model-present DSR host with
 `FNLP_INT4_TEST_SOURCE_DIR` and `FNLP_INT4_TEST_SOURCE_MANIFEST`. Missing variables
 fail when that test is explicitly selected; an ignored test is not model proof.
 
+## Identity-bound generation
+
+`generation::grouped_int4::Int4GenerationPlan` connects the real engine to the
+existing generation compiler, sampler, processors and streaming cursor. The
+central numerical profile is now `strict-quantized-v2`; version 1 stays INT8.
+This naming change also changes the model content fingerprint, which includes
+the profile. It is a distinct candidate program, not a quality ratification.
+
+The host explicitly chooses that profile, `STRICT_INT4_EXECUTION`, and BF16 KV,
+then calls `bind_candidate_model` with the actual model identity before request
+compilation. That call preserves host-owned tokenizer/template/task fields and
+binds source revision, complete content, group-specific recipe, and packed
+layout under `fnlp-int4-source-candidate-v1`, never `fnlpq-v1`. Compilation
+requires the same group width. Execution checks every admitted identity field
+and compares the bound content and partition with the actual borrowed engine.
+Neither the eager nor INT8 plan type accepts this profile.
+
+Greedy and explicitly seeded generation reuse the same EOS, penalties, top-k,
+top-p, minimum length, suffix-stop, raw full-vocabulary logprob, byte budget,
+and reserve/permit output code as existing generation. Only the final prompt
+position projects the head. Each generation run prices all decoder/group/head
+work, position-dependent attention, complete KV capacity and sampler storage
+before opening its session. The result includes actual `Int4Work`, checked
+against the cursor's completed forwards and projections. Source text and exact
+prompt tokens are not exposed by the private plan.
+
+Decoder/sink/native errors abort the session without retry; unwinds clear KV
+and poison the engine through the existing guard. Earlier stream events may
+already have been delivered, but a failed run never returns a success receipt.
+The host owns tokenizer/decoder authenticity, runtime admission and publication.
+
 Code landing does not establish compilation, native execution, whole-model
 quality, performance, or platform evidence. Canonical artifact serialization,
-ordinary CLI/NlpEngine activation, and task ExecutionIdentity integration remain
-separate work. This module does not add a `--int4` switch or promote a release.
+ordinary CLI/NlpEngine activation, chat-template integration, structured NLP
+tasks and grouped generation scheduling remain separate work. This module
+does not add a `--int4` switch or promote a release.

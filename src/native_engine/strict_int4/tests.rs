@@ -163,4 +163,39 @@ fn model_present_prefill_append_sparse_full_and_session_cleanup_agree() {
         assert_eq!(session.logits(rows).unwrap(), expected); assert_eq!(session.work(), work);
     }
     assert!(engine.kv_cache().all_slots_have_len(0));
+
+    // Exact-token/source-backed generation integration, not tokenizer or task
+    // quality. Only the real loaded model can enter this public execute path.
+    use crate::execution_identity::{ExecutionIdentity, NumericsProfile, Sha256Digest, ThinkingMode, ToolMode};
+    use crate::native_engine::{decode::DecodeByteDecoder,
+        generation::{GenerationLimits, GenerationOptions,
+            grouped_int4::{bind_candidate_model, Int4GenerationPlan, Int4GenerationBudget}}};
+    struct IdBytes;
+    impl DecodeByteDecoder for IdBytes {
+        type Error = std::convert::Infallible;
+        fn decode_token_ids(&self, ids: &[u32]) -> Result<Vec<u8>, Self::Error> {
+            Ok(ids.iter().flat_map(|id| id.to_le_bytes()).collect())
+        }
+    }
+    let d = Sha256Digest::of_bytes(b"model-gated-exact-id-fixture-not-tokenizer-authority");
+    let identity = ExecutionIdentity { schema_version: 1, source_revision: "unbound".to_owned(), logical_model_digest: d,
+        artifact_format: "unbound".to_owned(), quant_recipe: "unbound".to_owned(), packing_set_digest: d,
+        tokenizer_digest: d, template_digest: d, task_spec: "generate-v1".to_owned(), taskir_digest: d,
+        prompt_digest: d, grammar_compiler_version: "none".to_owned(), schema_digest: d,
+        numerics_profile: NumericsProfile::StrictQuantized { version: 2 }, kv_dtype: "bf16".to_owned(),
+        sampler_version: "uncompiled".to_owned(), thinking_mode: ThinkingMode::Disabled, tool_mode: ToolMode::None,
+        calibration_digest: d, decision_policy_digest: d, backend_semantic_version: STRICT_INT4_EXECUTION.to_owned(),
+        host_class: None, compiler_identity: None };
+    let bound = bind_candidate_model(identity, weights.identity()).unwrap();
+    assert_eq!(bound.tokenizer_digest, d); assert_eq!(bound.template_digest, d);
+    let plan = Int4GenerationPlan::compile(vec![1, 2], GenerationOptions::greedy(1, 4, 0), bound,
+        128, "exact-id-fixture", 0, GenerationLimits::default()).unwrap();
+    let budget = Int4GenerationBudget { native: Int4RunBudget::exact(plan.planned_work()),
+        max_kv_bytes: memory.kv_bytes, max_sampler_bytes: plan.sampler_bytes() };
+    let a = plan.execute(plan.execution_identity(), &mut engine, &IdBytes, 1, budget, &mut control).unwrap();
+    let b = plan.execute(plan.execution_identity(), &mut engine, &IdBytes, 7, budget, &mut control).unwrap();
+    assert_eq!(a.sequence.token_ids, b.sequence.token_ids);
+    assert_eq!(a.model_work, plan.planned_work()); assert_eq!(a.model_work, b.model_work);
+    assert_eq!(a.sequence.numerics_profile, STRICT_INT4_PROFILE);
+    assert!(engine.kv_cache().all_slots_have_len(0)); assert!(!engine.is_poisoned());
 }
