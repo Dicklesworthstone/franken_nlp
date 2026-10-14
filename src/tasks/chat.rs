@@ -24,6 +24,7 @@ use super::{BuiltInTask, extract::SourceDocumentEncoder,
         PromptSegment, PromptSegmentKind, TaskBudget, TaskIR, TaskPlan, TokenSequence}};
 pub mod batched;
 pub mod quantized;
+pub mod grouped_int4;
 mod bounds;
 
 pub const CHAT_PROMPT_VERSION: &str = "pinned-segmented-chat-no-thinking-no-tools-v1";
@@ -127,6 +128,10 @@ impl ChatPlanner {
         }
         if backend == ChatBackend::Int8
             && identity.backend_semantic_version != crate::native_engine::strict_int8::STRICT_INT8_EXECUTION {
+            return Err(ChatError::Identity);
+        }
+        if backend == ChatBackend::GroupedInt4
+            && identity.backend_semantic_version != crate::native_engine::strict_int4::STRICT_INT4_EXECUTION {
             return Err(ChatError::Identity);
         }
         if limits.max_messages == 0 || limits.max_messages > 128 || limits.max_message_bytes == 0
@@ -271,18 +276,23 @@ struct ChatInput {
     task: TaskPlan, prompt: Vec<u32>, options: GenerationOptions, identity: ExecutionIdentity,
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum ChatBackend { Eager, Int8 }
+enum ChatBackend { Eager, Int8, GroupedInt4 }
 impl ChatBackend {
     fn profile(self) -> NumericsProfile {
-        match self { Self::Eager => NumericsProfile::HfBf16Eager, Self::Int8 => NumericsProfile::StrictQuantized { version: 1 } }
+        match self { Self::Eager => NumericsProfile::HfBf16Eager,
+            Self::Int8 => NumericsProfile::StrictQuantized { version: 1 },
+            Self::GroupedInt4 => NumericsProfile::StrictQuantized { version: 2 } }
     }
     fn label(self) -> &'static str {
-        match self { Self::Eager => HF_BF16_EAGER_PROFILE, Self::Int8 => crate::native_engine::strict_int8::STRICT_INT8_PROFILE }
+        match self { Self::Eager => HF_BF16_EAGER_PROFILE,
+            Self::Int8 => crate::native_engine::strict_int8::STRICT_INT8_PROFILE,
+            Self::GroupedInt4 => crate::native_engine::strict_int4::STRICT_INT4_PROFILE }
     }
     fn accepts(self, execution: &str) -> bool {
         match self {
             Self::Eager => execution == GENERATION_VERSION || execution == BATCH_GENERATION_VERSION,
             Self::Int8 => execution == crate::native_engine::generation::quantized::INT8_GENERATION_VERSION,
+            Self::GroupedInt4 => execution == crate::native_engine::generation::grouped_int4::INT4_GENERATION_VERSION,
         }
     }
 }
@@ -298,7 +308,8 @@ impl ChatCompletion<'_> {
         let p = self.options;
         let expected_seed = match &p.sampling { GenerationSampling::Greedy => None,
             GenerationSampling::Seeded { effective_seed, .. } => Some(Seed256::from(*effective_seed).to_lower_hex()) };
-        let selective_projection = self.backend == ChatBackend::Int8 || raw.execution == BATCH_GENERATION_VERSION;
+        let selective_projection = matches!(self.backend, ChatBackend::Int8 | ChatBackend::GroupedInt4)
+            || raw.execution == BATCH_GENERATION_VERSION;
         if raw.schema_version != 1 || !self.backend.accepts(&raw.execution)
             || raw.numerics_profile != self.backend.label()
             || raw.sample_index != self.sample_index || raw.effective_seed != expected_seed
@@ -321,7 +332,7 @@ impl ChatCompletion<'_> {
             .ok_or(ChatError::NoResult("work arithmetic"))?;
         let positions = self.prompt_tokens.checked_add(proposals).and_then(|n| n.checked_sub(1)).ok_or(ChatError::NoResult("work arithmetic"))? as u64;
         let sampled = if expected_seed.is_some() { proposals as u64 } else { 0 };
-        // Batched eager and INT8 execution skip intermediate prompt lm heads.
+        // Batched eager and quantized execution skip intermediate prompt lm heads.
         // Do not weaken the denominator check or rewrite work to look scalar.
         let projection_rows = if selective_projection { proposals as u64 } else { positions };
         if raw.native_work.forward_positions != positions || positions > self.max_forward_positions
