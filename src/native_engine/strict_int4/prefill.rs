@@ -24,7 +24,7 @@ impl Int4PrefillLimits {
         // Conservative bound for simultaneously live BF16 rails, activation
         // bytes, descriptors and finite projection tiles. Allocator slack,
         // model, KV, RoPE and attention scratch remain separately priced.
-        (rows as u64).checked_mul((32 * I * size_of::<f32>() + 4096) as u64)
+        (rows as u64).checked_mul((32 * I * std::mem::size_of::<f32>() + 4096) as u64)
             .ok_or(StrictInt4Error::Memory)
     }
     pub fn validate(self) -> Result<u64, StrictInt4Error> {

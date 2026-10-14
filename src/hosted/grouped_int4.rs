@@ -5,6 +5,7 @@ use super::*;
 use crate::native_engine::strict_int4::weights::snapshot::Int4SnapshotError;
 mod snapshot;
 mod classify;
+mod prefill;
 use crate::tasks::classify::grouped_int4::Int4ClassificationError;
 use crate::{
     artifact::converter::{ConversionSourceManifest, ConverterError, prepare_nanbeige42_input},
@@ -143,39 +144,8 @@ impl NlpEngine {
     pub fn execute_int4_chat(&self, model: &ResidentInt4, prepared: PreparedInt4Chat,
         request_seq: u64, native: NativeLimits, max_sampler_bytes: u64, kernel: PackedInt4Kernel,
         cancellation: CancellationToken) -> Result<HostedOutput<Int4ChatResult>, HostedError> {
-        dispatch::preflight(self, native.run)?;
-        if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
-        let width = model.model_identity().group_width();
-        let rebound = bind_candidate_model(prepared.execution_identity().clone(), model.model_identity())
-            .map_err(|_| HostedError::ModelIdentity)?;
-        if prepared.native_plan().group_width() != width || &rebound != prepared.execution_identity() {
-            return Err(HostedError::ModelIdentity);
-        }
-        let required = native_requirements(&prepared, request_seq, native, max_sampler_bytes)?;
-        let work = prepared.planned_work();
-        let lease = self.resources().acquire_lease();
-        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-        let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-            sum(&[required.rope_bytes, required.scratch_payload_bound, max_sampler_bytes, native.allocator_reserve_bytes])?)?;
-        let output = output_claim(&lease, prepared.task_plan().ir().budget().max_output_bytes,
-            u64::from(prepared.task_plan().ir().budget().max_output_tokens))?;
-        let model = model.clone();
-        dispatch::run(self, native.run, cancellation, move |control| {
-            let mut engine = allocate_native(kv, workspace, || {
-                StrictInt4Engine::new(&model.inner.loaded.value, native.context_tokens, Int4MemoryBudget {
-                    max_kv_bytes: required.kv_bytes, max_rope_bytes: required.rope_bytes,
-                    max_scratch_payload_bytes: required.scratch_payload_bound,
-                }).map(|engine| engine.with_kernel(kernel)).map_err(native_error)
-            })?;
-            let budget = Int4GenerationBudget { native: Int4RunBudget::exact(work),
-                max_kv_bytes: required.kv_bytes, max_sampler_bytes };
-            let result = prepared.execute(prepared.execution_identity(), &mut engine.value, request_seq, budget, control)
-                .map_err(chat_error)?;
-            drop(engine);
-            let committed = output.commit()?;
-            drop(lease);
-            Ok(GuardedOutput::new(result, committed))
-        })
+        prefill::execute(self, model, prepared, request_seq, native, max_sampler_bytes,
+            kernel, None, cancellation)
     }
 }
 fn native_requirements(prepared: &PreparedInt4Chat, sequence: u64, native: NativeLimits,

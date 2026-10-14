@@ -232,4 +232,6 @@ impl<C: DecodeStepControl> Driver for Int4Session<'_, '_, C> {
     fn abort(&mut self) { Int4Session::abort(self); }
 }
 
+mod prefill;
+
 #[cfg(test)] mod tests;

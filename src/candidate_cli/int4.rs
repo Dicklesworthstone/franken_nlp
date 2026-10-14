@@ -1,10 +1,11 @@
 //! Explicit source-candidate INT4 tasks. Never an INT8 artifact alias.
 use super::*;
 use crate::native_engine::{int4::PackedInt4Kernel, simd::Int8KernelKind,
-    strict_int4::{Int4MemoryRequirement, Int4ModelLoadRequirement,
+    strict_int4::{Int4MemoryRequirement, Int4ModelLoadRequirement, prefill::Int4PrefillLimits,
         weights::snapshot::{Int4SnapshotBudget, Int4SnapshotPin, Int4SnapshotRequirements}}};
 
 mod classify;
+mod prefill;
 #[cfg(feature = "asupersync-runtime")]
 mod runtime;
 #[cfg(test)]
@@ -98,12 +99,10 @@ pub(super) struct Int4Command { task: Int4Task, args: Int4Args }
 
 pub(super) fn definition() -> clap::Command {
     let task = |name: &'static str, about: &'static str| Int4Args::augment_args(clap::Command::new(name).about(about))
-        // This scheduling option belongs to INT8 only. Keep the parser's field
-        // available to the shared policy type, but never advertise or ignore it.
-        .mut_arg("prefill_rows", |arg| arg.hide(true));
+        .mut_arg("prefill_rows", |arg| arg.help("Explicit grouped-INT4 layer-major prompt execution, 1..=64 rows; extra workspace is process-admitted"));
     clap::Command::new("source-int4")
         .about("Run candidate INT4 tasks from pinned sources or a digest-pinned local snapshot")
-        .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Sequential native execution defaults to scalar; --kernel explicitly selects an existing hardware-checked integer leaf. No automatic selection, fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Emits one completed JSON object, not provisional token events.")
+        .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Sequential native execution defaults to scalar; --kernel explicitly selects an existing hardware-checked integer leaf. Text tasks can opt in to bounded layer-major prompt execution with --prefill-rows; classification cannot. No automatic selection, fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Emits one completed JSON object, not provisional token events.")
         .subcommand_required(true)
         .subcommand(task("generate", "Generate from a bounded UTF-8 prompt using the pinned template"))
         .subcommand(task("chat", "Complete a bounded JSON system/user/assistant transcript"))
@@ -141,6 +140,8 @@ struct Int4Limits {
     snapshot_pin: Option<Int4SnapshotPin>, snapshot_need: Int4SnapshotRequirements,
     /// Real-host-checked executable handle, not a serialized capability report.
     kernel: PackedInt4Kernel,
+    /// Explicit physical text-prompt schedule; independently priced in the execution stage.
+    prefill: Option<Int4PrefillLimits>,
     /// Lower bound for these declared simultaneous reservations. Host admission
     /// independently enforces all runtime/domain obligations; this is not RSS.
     minimum_memory_bytes: u64,
@@ -154,8 +155,9 @@ fn mib(value: u64) -> Result<u64, CandidateError> {
 impl Int4Args {
     fn validate(&self) -> Result<Int4Limits, CandidateError> {
         if self.max_new_tokens == 0 || self.max_new_tokens > 1024 || self.max_new_tokens > self.context_tokens
-            || self.max_output_bytes == 0 || self.max_output_bytes > MAX_CONTENT_BYTES
-            || self.policy.prefill()?.is_some() { return Err(CandidateError::Arguments); }
+            || self.max_output_bytes == 0 || self.max_output_bytes > MAX_CONTENT_BYTES {
+            return Err(CandidateError::Arguments);
+        }
         let result_bytes = self.max_output_bytes.checked_mul(8)
             .and_then(|n| n.checked_add(self.max_new_tokens.checked_mul(64)?))
             .and_then(|n| n.checked_add(65_536)).ok_or(CandidateError::Arguments)?;
@@ -171,6 +173,11 @@ impl Int4Args {
     fn validate_storage(&self, result_bytes: usize, output_tokens: usize, max_prompt_tokens: usize,
         sampler_bytes: u64, extra_preparation_bytes: u64) -> Result<Int4Limits, CandidateError> {
         let snapshot_pin = self.checked_model_input()?;
+        let prefill = self.prefill()?;
+        // Scored tasks declare no sampler; prefill is not silently inherited
+        // through their shared parser, including programmatic construction.
+        if sampler_bytes == 0 && prefill.is_some() { return Err(CandidateError::Arguments); }
+        let extra_scratch = prefill.map(|limits| limits.max_extra_scratch_bytes).unwrap_or(0);
         let kernel = PackedInt4Kernel::detect(self.kernel).map_err(|_| CandidateError::Arguments)?;
         if self.input.as_os_str().is_empty()
             || self.max_input_bytes == 0 || self.max_input_bytes > MAX_INPUT_BYTES
@@ -208,12 +215,12 @@ impl Int4Args {
         // retains its own separately charged serialization staging.
         let output_charge = sum(&[result_bytes as u64 * 4, output_tokens as u64 * 8, 4096])?;
         let execute_stage = sum(&[native.kv_bytes, native.rope_bytes, native.scratch_payload_bound,
-            sampler_bytes, ALLOCATOR_BYTES, output_charge])?;
+            sampler_bytes, ALLOCATOR_BYTES, output_charge, extra_scratch])?;
         let minimum_memory_bytes = sum(&[preparation_bytes, resident,
             load_stage.max(save_stage).max(execute_stage), CLEANUP_BYTES])?;
         if minimum_memory_bytes > memory_bytes { return Err(CandidateError::Arguments); }
         Ok(Int4Limits { memory_bytes, preparation_bytes, source_preparation_bytes, max_load_bytes,
-            result_bytes, max_prompt_tokens, load, native, snapshot_pin, snapshot_need, kernel, minimum_memory_bytes })
+            result_bytes, max_prompt_tokens, load, native, snapshot_pin, snapshot_need, kernel, prefill, minimum_memory_bytes })
     }
     // Recheck the exclusive source/snapshot contract for programmatically
     // constructed arguments too, before input IO or caller-sized allocations.
@@ -235,7 +242,7 @@ impl Int4Args {
             max_output_bytes: self.max_output_bytes, max_sampler_bytes: SAMPLER_BYTES }
     }
     fn options(&self, eos: u32) -> Result<GenerationOptions, CandidateError> {
-        if self.policy.prefill()?.is_some() { return Err(CandidateError::Arguments); }
+        self.prefill()?;
         let mut options = GenerationOptions::greedy(self.max_new_tokens, self.max_output_bytes, eos);
         self.policy.apply(&mut options)?;
         options.capture_logprobs = self.logprobs;

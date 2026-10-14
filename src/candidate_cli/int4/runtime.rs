@@ -30,12 +30,16 @@ impl Prepared {
         match self { Self::Text(plan) => plan.execution_identity(), Self::Classify(plan) => plan.execution_identity() }
     }
     fn execute(self, engine: &NlpEngine, model: &ResidentInt4, native: NativeLimits,
-        kernel: PackedInt4Kernel, cancellation: CancellationToken) -> Result<Completed, CandidateError> {
-        match self {
-            Self::Text(plan) => engine.execute_int4_chat(model, plan, 1, native, SAMPLER_BYTES,
+        kernel: PackedInt4Kernel, prefill: Option<Int4PrefillLimits>, cancellation: CancellationToken)
+        -> Result<Completed, CandidateError> {
+        match (self, prefill) {
+            (Self::Text(plan), None) => engine.execute_int4_chat(model, plan, 1, native, SAMPLER_BYTES,
                 kernel, cancellation).map(Completed::Text),
-            Self::Classify(plan) => engine.execute_int4_classify(model, plan, native,
+            (Self::Text(plan), Some(limits)) => engine.execute_int4_chat_layer_major(model, plan, 1, native,
+                SAMPLER_BYTES, kernel, limits, cancellation).map(Completed::Text),
+            (Self::Classify(plan), None) => engine.execute_int4_classify(model, plan, native,
                 kernel, cancellation).map(Completed::Classify),
+            (Self::Classify(_), Some(_)) => return Err(CandidateError::Arguments),
         }.map_err(|_| CandidateError::Execution)
     }
 }
@@ -48,7 +52,9 @@ impl DecodeStepControl for DeadlineControl {
 
 pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
-    if limits.minimum_memory_bytes > limits.memory_bytes || limits.kernel.kind() != args.kernel {
+    if limits.minimum_memory_bytes > limits.memory_bytes || limits.kernel.kind() != args.kernel
+        || !prefill::matches(&args, limits)?
+        || (matches!(task, Int4Task::Classify(_)) && limits.prefill.is_some()) {
         return Err(CandidateError::Arguments);
     }
     let started = Instant::now();
@@ -110,7 +116,7 @@ pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
         context_tokens: args.context_tokens, allocator_reserve_bytes: ALLOCATOR_BYTES,
         run: RunLimits { max_elapsed: remaining()?, max_checkpoints: args.max_checkpoints,
             cleanup_reserve_bytes: CLEANUP_BYTES },
-    }, limits.kernel, cancellation)?;
+    }, limits.kernel, limits.prefill, cancellation)?;
     remaining()?;
     let content = identity.logical_model_digest.to_hex();
     let response = SourceResponse {

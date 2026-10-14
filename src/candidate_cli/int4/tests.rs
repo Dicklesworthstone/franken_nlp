@@ -42,7 +42,7 @@ fn default_options_use_the_same_pinned_greedy_contract_and_group_aware_requireme
 }
 
 #[test]
-fn invalid_limits_eos_and_unsupported_prefill_refuse_before_input_or_model_io() {
+fn invalid_limits_eos_and_prefill_rows_refuse_before_input_or_model_io() {
     for extra in [vec!["--group-width", "0"], vec!["--group-width", "10753"],
         vec!["--context-tokens", "0"], vec!["--context-tokens", "1"],
         vec!["--max-new-tokens", "0"], vec!["--max-new-tokens", "1025"],
@@ -51,7 +51,7 @@ fn invalid_limits_eos_and_unsupported_prefill_refuse_before_input_or_model_io() 
         vec!["--max-load-mib", "1"], vec!["--source-preparation-mib", "127"],
         vec!["--preparation-mib", "1"], vec!["--timeout-seconds", "0"],
         vec!["--load-checkpoints", "1"], vec!["--max-checkpoints", "1"],
-        vec!["--ban-token", "166101"], vec!["--prefill-rows", "4"],
+        vec!["--ban-token", "166101"], vec!["--prefill-rows", "0"], vec!["--prefill-rows", "65"],
         vec!["--min-new-tokens", "129"], vec!["--stop", ""],
     ] {
         let mut output = Vec::new();
