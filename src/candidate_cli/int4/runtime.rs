@@ -2,12 +2,51 @@
 use super::*;
 use std::{fs::File, time::{Duration, Instant}};
 use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
-    hosted::{CancellationToken, Int4LoadLimits, NativeLimits, RunLimits},
-    native_engine::{int4::PackedInt4Kernel, strict_int4::{Int4ModelLoadBudget,
-        weights::snapshot::INT4_SNAPSHOT_VERSION}},
-    tasks::{chat::{ChatLimits, ChatRequest, GenerateRequest, grouped_int4::Int4ChatPlanner}, ir::TaskBudget}};
+    execution_identity::ExecutionIdentity,
+    hosted::{CancellationToken, HostedOutput, Int4LoadLimits, NativeLimits, ResidentInt4, RunLimits},
+    native_engine::{decode::{DecodeCancellationKind, DecodeStepControl}, int4::PackedInt4Kernel,
+        strict_int4::{Int4ModelLoadBudget, weights::snapshot::INT4_SNAPSHOT_VERSION}},
+    tasks::{chat::{ChatLimits, ChatRequest, GenerateRequest,
+            grouped_int4::{Int4ChatPlanner, Int4ChatResult, PreparedInt4Chat}},
+        classify::{ClassificationRequest,
+            grouped_int4::{Int4ClassificationPlanner, Int4ClassificationRun, PreparedInt4Classification}},
+        ir::TaskBudget}};
 
-pub(super) fn execute(task: Task, args: Int4Args, limits: Int4Limits,
+// Typed task alternatives share one loader, preparation guard and publication
+// envelope. Only real hosted execution can construct the guarded completion.
+enum Input { Text(TextInput), Classify(ClassificationRequest, classify::ScoringArgs) }
+enum Prepared { Text(PreparedInt4Chat), Classify(PreparedInt4Classification) }
+enum Completed { Text(HostedOutput<Int4ChatResult>), Classify(HostedOutput<Int4ClassificationRun>) }
+impl Serialize for Completed {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Text(result) => result.result().serialize(serializer),
+            Self::Classify(result) => result.result().serialize(serializer),
+        }
+    }
+}
+impl Prepared {
+    fn identity(&self) -> &ExecutionIdentity {
+        match self { Self::Text(plan) => plan.execution_identity(), Self::Classify(plan) => plan.execution_identity() }
+    }
+    fn execute(self, engine: &NlpEngine, model: &ResidentInt4, native: NativeLimits,
+        cancellation: CancellationToken) -> Result<Completed, CandidateError> {
+        match self {
+            Self::Text(plan) => engine.execute_int4_chat(model, plan, 1, native, SAMPLER_BYTES,
+                PackedInt4Kernel::scalar(), cancellation).map(Completed::Text),
+            Self::Classify(plan) => engine.execute_int4_classify(model, plan, native,
+                PackedInt4Kernel::scalar(), cancellation).map(Completed::Classify),
+        }.map_err(|_| CandidateError::Execution)
+    }
+}
+struct DeadlineControl { started: Instant, deadline: Duration }
+impl DecodeStepControl for DeadlineControl {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+        (self.started.elapsed() >= self.deadline).then_some(DecodeCancellationKind::Deadline)
+    }
+}
+
+pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
     if limits.minimum_memory_bytes > limits.memory_bytes { return Err(CandidateError::Arguments); }
     let started = Instant::now();
@@ -32,7 +71,11 @@ pub(super) fn execute(task: Task, args: Int4Args, limits: Int4Limits,
         let mut file = File::open(&args.input).map_err(|_| CandidateError::Input)?;
         read_input(&mut file, args.max_input_bytes)?
     };
-    let request = parse_input(task, text, args.max_input_bytes)?;
+    let request = match task {
+        Int4Task::Text(task) => Input::Text(parse_input(task, text, args.max_input_bytes)?),
+        Int4Task::Classify(scoring) => Input::Classify(
+            classify::parse_request(&text, scoring.budget(limits), args.max_input_bytes)?, scoring),
+    };
     remaining()?;
     let cancellation = CancellationToken::default();
     // Snapshot failure is terminal. Never catch it to convert a source, read a
@@ -47,41 +90,25 @@ pub(super) fn execute(task: Task, args: Int4Args, limits: Int4Limits,
         _ => return Err(CandidateError::Arguments),
     }.map_err(|_| CandidateError::Model)?;
     remaining()?;
-    let budget = TaskBudget {
-        max_input_tokens: u32::try_from(limits.max_prompt_tokens).map_err(|_| CandidateError::Arguments)?,
-        max_output_tokens: u32::try_from(args.max_new_tokens).map_err(|_| CandidateError::Arguments)?,
-        max_output_bytes: limits.result_bytes as u64, max_grammar_states: 1,
-        max_kv_bytes: limits.native.kv_bytes,
-    };
-    // The model owns its recomputed content fingerprint, whether converted or
-    // restored. Never fabricate a pre-load identity to make a planning claim.
-    // Input bytes/JSON/roles/options were checked earlier; exact token planning is here.
-    let planner = Int4ChatPlanner::for_model(model.model_identity(), budget, ChatLimits {
-        max_messages: 128, max_message_bytes: args.max_input_bytes,
-        max_total_message_bytes: args.max_input_bytes, generation: args.generation_limits(limits),
-    }).map_err(|_| CandidateError::Planning)?;
-    let options = args.options(planner.eos_token_id())?;
-    let prepared = match request {
-        TextInput::Generate(prompt) => planner.plan_generate(&GenerateRequest {
-            item_id: "cli".to_owned(), sample_index: 0, prompt, generation: options, budget }),
-        TextInput::Chat(messages) => planner.plan_chat(&ChatRequest {
-            item_id: "cli".to_owned(), sample_index: 0, messages, generation: options, budget }),
-    }.map_err(|_| CandidateError::Planning)?;
-    let identity = prepared.execution_identity().clone();
+    // The actual model owns its recomputed fingerprint. No fabricated pre-load
+    // identity is used for token planning. Wire shape/labels were checked above.
+    let prepared = prepare(request, &model, &args, limits, &mut DeadlineControl { started, deadline })?;
+    remaining()?;
+    let identity = prepared.identity().clone();
     let mut snapshot = limits.snapshot_pin.map(|_| SnapshotRecord::new("loaded", limits.snapshot_need));
     if let Some(path) = &args.save_snapshot {
-        // Source-only opt-in; save after successful task planning, but before
-        // generation. A complete file is preserved even if generation later fails.
+        // Save only after complete task planning and all work-axis checks.
+        // Preserve a complete file if execution fails, and partial files on IO failure.
         let pin = engine.save_int4_snapshot(&model, path.clone(), limits.snapshot_budget(false)?,
             snapshot_run(&args, remaining()?), cancellation.clone()).map_err(|_| CandidateError::Model)?;
         if pin != model.model_identity().snapshot_pin() { return Err(CandidateError::Identity); }
         snapshot = Some(SnapshotRecord::new("saved", limits.snapshot_need));
     }
-    let result = engine.execute_int4_chat(&model, prepared, 1, NativeLimits {
+    let result = prepared.execute(&engine, &model, NativeLimits {
         context_tokens: args.context_tokens, allocator_reserve_bytes: ALLOCATOR_BYTES,
         run: RunLimits { max_elapsed: remaining()?, max_checkpoints: args.max_checkpoints,
             cleanup_reserve_bytes: CLEANUP_BYTES },
-    }, SAMPLER_BYTES, PackedInt4Kernel::scalar(), cancellation).map_err(|_| CandidateError::Execution)?;
+    }, cancellation)?;
     remaining()?;
     let content = identity.logical_model_digest.to_hex();
     let response = SourceResponse {
@@ -90,11 +117,47 @@ pub(super) fn execute(task: Task, args: Int4Args, limits: Int4Limits,
         source_root_sha256: model.model_identity().source_root_sha256(),
         model_content_sha256: &content, candidate_format: &identity.artifact_format,
         quant_recipe: &identity.quant_recipe, group_width: model.model_identity().group_width(),
-        output: result.result(), snapshot,
+        output: &result, snapshot,
     };
-    // Both charges remain live here. The wrapper is explicitly source-candidate
-    // evidence, not a canonical fnlpq digest, release receipt or activation claim.
+    // Completed retains the exact hosted output guard while Serialize borrows
+    // its result. No unguarded JSON value or partially completed head escapes.
     publish(&response, limits.result_bytes + 4096, output)
+}
+
+fn prepare(request: Input, model: &ResidentInt4, args: &Int4Args, limits: Int4Limits,
+    control: &mut DeadlineControl) -> Result<Prepared, CandidateError> {
+    match request {
+        Input::Text(request) => {
+            let budget = TaskBudget {
+                max_input_tokens: u32::try_from(limits.max_prompt_tokens).map_err(|_| CandidateError::Arguments)?,
+                max_output_tokens: u32::try_from(args.max_new_tokens).map_err(|_| CandidateError::Arguments)?,
+                max_output_bytes: limits.result_bytes as u64, max_grammar_states: 1,
+                max_kv_bytes: limits.native.kv_bytes,
+            };
+            let planner = Int4ChatPlanner::for_model(model.model_identity(), budget, ChatLimits {
+                max_messages: 128, max_message_bytes: args.max_input_bytes,
+                max_total_message_bytes: args.max_input_bytes, generation: args.generation_limits(limits),
+            }).map_err(|_| CandidateError::Planning)?;
+            let options = args.options(planner.eos_token_id())?;
+            let plan = match request {
+                TextInput::Generate(prompt) => planner.plan_generate(&GenerateRequest {
+                    item_id: "cli".to_owned(), sample_index: 0, prompt, generation: options, budget }),
+                TextInput::Chat(messages) => planner.plan_chat(&ChatRequest {
+                    item_id: "cli".to_owned(), sample_index: 0, messages, generation: options, budget }),
+            }.map_err(|_| CandidateError::Planning)?;
+            Ok(Prepared::Text(plan))
+        }
+        Input::Classify(request, scoring) => {
+            let planner = Int4ClassificationPlanner::for_model(model.model_identity(), scoring.budget(limits),
+                scoring.classification_limits(args)).map_err(|_| CandidateError::Planning)?;
+            let plan = planner.plan_with_control(&request, control).map_err(|error| {
+                if error.cancellation() == Some(DecodeCancellationKind::Deadline) { CandidateError::Timeout }
+                else { CandidateError::Planning }
+            })?;
+            scoring.admit_plan(plan.required_context(), args.context_tokens, plan.planned_work())?;
+            Ok(Prepared::Classify(plan))
+        }
+    }
 }
 
 fn load_limits(args: &Int4Args, limits: Int4Limits, remaining: Duration) -> Int4LoadLimits {
@@ -127,6 +190,13 @@ struct SourceResponse<'a, T: Serialize> {
     // model_content_sha256 is the independently recomputed model identity.
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<SnapshotRecord>,
+}
+
+// Existing model-present text fixtures use the same extended runtime path.
+#[cfg(test)]
+pub(super) fn execute(task: Task, args: Int4Args, limits: Int4Limits,
+    input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
+    execute_task(Int4Task::Text(task), args, limits, input, output)
 }
 
 #[cfg(test)]

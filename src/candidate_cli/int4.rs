@@ -1,8 +1,9 @@
-//! Explicit source-candidate INT4 text/chat. Never an INT8 artifact alias.
+//! Explicit source-candidate INT4 tasks. Never an INT8 artifact alias.
 use super::*;
 use crate::native_engine::strict_int4::{Int4MemoryRequirement, Int4ModelLoadRequirement,
     weights::snapshot::{Int4SnapshotBudget, Int4SnapshotPin, Int4SnapshotRequirements}};
 
+mod classify;
 #[cfg(feature = "asupersync-runtime")]
 mod runtime;
 #[cfg(test)]
@@ -32,7 +33,7 @@ struct Int4Args {
     #[arg(long, value_name = "HEX", requires = "snapshot")]
     expected_model_sha256: Option<String>,
     /// Save the converted model to a NEW local snapshot. Never overwrites an existing path.
-    /// A saved file remains if later generation fails; partial files are also preserved on error.
+    /// A saved file remains if the later task fails; partial files are also preserved on error.
     #[arg(long, value_name = "NEW_FILE", conflicts_with = "snapshot")]
     save_snapshot: Option<PathBuf>,
     /// Process memory-ledger ceiling in MiB; not an operating-system RSS cap.
@@ -86,7 +87,9 @@ struct Int4Args {
     policy: generation_policy::GenerationPolicyArgs,
 }
 
-pub(super) struct Int4Command { task: Task, args: Int4Args }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Int4Task { Text(Task), Classify(classify::ScoringArgs) }
+pub(super) struct Int4Command { task: Int4Task, args: Int4Args }
 
 pub(super) fn definition() -> clap::Command {
     let task = |name: &'static str, about: &'static str| Int4Args::augment_args(clap::Command::new(name).about(about))
@@ -94,24 +97,32 @@ pub(super) fn definition() -> clap::Command {
         // available to the shared policy type, but never advertise or ignore it.
         .mut_arg("prefill_rows", |arg| arg.hide(true));
     clap::Command::new("source-int4")
-        .about("Run candidate INT4 text/chat from pinned sources or a digest-pinned local snapshot")
-        .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Uses scalar sequential prefill/decode; no fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Emits one completed JSON object, not provisional token events.")
+        .about("Run candidate INT4 tasks from pinned sources or a digest-pinned local snapshot")
+        .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Uses scalar sequential native execution; no fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Emits one completed JSON object, not provisional token events.")
         .subcommand_required(true)
         .subcommand(task("generate", "Generate from a bounded UTF-8 prompt using the pinned template"))
         .subcommand(task("chat", "Complete a bounded JSON system/user/assistant transcript"))
+        .subcommand(classify::definition())
 }
 impl Int4Command {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let (name, matches) = matches.subcommand().ok_or_else(||
             clap::Error::raw(clap::error::ErrorKind::MissingSubcommand, "source-int4 task required"))?;
-        let task = match name { "generate" => Task::Generate, "chat" => Task::Chat,
-            _ => return Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source-int4 task refused")) };
+        let task = match name {
+            "generate" => Int4Task::Text(Task::Generate),
+            "chat" => Int4Task::Text(Task::Chat),
+            "classify" => Int4Task::Classify(classify::ScoringArgs::from_matches(matches)?),
+            _ => return Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source-int4 task refused")),
+        };
         Ok(Self { task, args: Int4Args::from_arg_matches(matches)? })
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
-        let limits = self.args.validate()?;
+        let limits = match self.task {
+            Int4Task::Text(_) => self.args.validate()?,
+            Int4Task::Classify(scoring) => scoring.validate(&self.args)?,
+        };
         #[cfg(feature = "asupersync-runtime")]
-        { runtime::execute(self.task, self.args, limits, input, output) }
+        { runtime::execute_task(self.task, self.args, limits, input, output) }
         #[cfg(not(feature = "asupersync-runtime"))]
         { let _ = (self, limits, input, output); Err(CandidateError::Unavailable) }
     }
@@ -135,16 +146,31 @@ fn mib(value: u64) -> Result<u64, CandidateError> {
 }
 impl Int4Args {
     fn validate(&self) -> Result<Int4Limits, CandidateError> {
+        if self.max_new_tokens == 0 || self.max_new_tokens > 1024 || self.max_new_tokens > self.context_tokens
+            || self.max_output_bytes == 0 || self.max_output_bytes > MAX_CONTENT_BYTES
+            || self.policy.prefill()?.is_some() { return Err(CandidateError::Arguments); }
+        let result_bytes = self.max_output_bytes.checked_mul(8)
+            .and_then(|n| n.checked_add(self.max_new_tokens.checked_mul(64)?))
+            .and_then(|n| n.checked_add(65_536)).ok_or(CandidateError::Arguments)?;
+        let limits = self.validate_storage(result_bytes, self.max_new_tokens,
+            self.context_tokens - self.max_new_tokens + 1, SAMPLER_BYTES, 0)?;
+        let options = self.options(166_101)?;
+        if options.banned_token_ids.contains(&166_101) { return Err(CandidateError::Arguments); }
+        options.validate(self.generation_limits(limits)).map_err(|_| CandidateError::Arguments)?;
+        Ok(limits)
+    }
+    // Common model/storage arithmetic only. Scored tasks provide their actual
+    // complete-result depth/bytes and repeated-prompt allowance, with no sampler.
+    fn validate_storage(&self, result_bytes: usize, output_tokens: usize, max_prompt_tokens: usize,
+        sampler_bytes: u64, extra_preparation_bytes: u64) -> Result<Int4Limits, CandidateError> {
         let snapshot_pin = self.checked_model_input()?;
         if self.input.as_os_str().is_empty()
             || self.max_input_bytes == 0 || self.max_input_bytes > MAX_INPUT_BYTES
-            || self.max_output_bytes == 0 || self.max_output_bytes > MAX_CONTENT_BYTES
-            || self.max_new_tokens == 0 || self.max_new_tokens > 1024 || self.max_new_tokens > self.context_tokens
+            || max_prompt_tokens == 0 || max_prompt_tokens > self.context_tokens
             || self.timeout_seconds == 0 || self.timeout_seconds > 86_400
             || !(2..=1_000_000_000_000).contains(&self.load_checkpoints)
             || !(2..=1_000_000_000_000).contains(&self.snapshot_checkpoints)
-            || !(2..=1_000_000_000_000).contains(&self.max_checkpoints)
-            || self.policy.prefill()?.is_some() {
+            || !(2..=1_000_000_000_000).contains(&self.max_checkpoints) {
             return Err(CandidateError::Arguments);
         }
         let load = Int4ModelLoadRequirement::for_group_width(self.group_width).map_err(|_| CandidateError::Arguments)?;
@@ -162,11 +188,8 @@ impl Int4Args {
             || sum(&[load.weight_payload_bytes, peak_codec_scratch])? > max_load_bytes {
             return Err(CandidateError::Arguments);
         }
-        let result_bytes = self.max_output_bytes.checked_mul(8)
-            .and_then(|n| n.checked_add(self.max_new_tokens.checked_mul(64)?))
-            .and_then(|n| n.checked_add(65_536)).ok_or(CandidateError::Arguments)?;
         let preparation_floor = sum(&[128 * MIB, self.max_input_bytes as u64 * 32,
-            (result_bytes as u64 + 4096) * 2])?;
+            (result_bytes as u64 + 4096) * 2, extra_preparation_bytes])?;
         if preparation_bytes < preparation_floor { return Err(CandidateError::Arguments); }
         let resident = sum(&[load.weight_payload_bytes, ALLOCATOR_BYTES])?;
         let load_stage = if snapshot_pin.is_some() { snapshot_need.scratch_bytes }
@@ -175,19 +198,14 @@ impl Int4Args {
         // Matches the hosted output charge: four complete result payloads,
         // token/score vectors, and fixed bookkeeping. The CLI additionally
         // retains its own separately charged serialization staging.
-        let output_charge = sum(&[result_bytes as u64 * 4, self.max_new_tokens as u64 * 8, 4096])?;
+        let output_charge = sum(&[result_bytes as u64 * 4, output_tokens as u64 * 8, 4096])?;
         let execute_stage = sum(&[native.kv_bytes, native.rope_bytes, native.scratch_payload_bound,
-            SAMPLER_BYTES, ALLOCATOR_BYTES, output_charge])?;
+            sampler_bytes, ALLOCATOR_BYTES, output_charge])?;
         let minimum_memory_bytes = sum(&[preparation_bytes, resident,
             load_stage.max(save_stage).max(execute_stage), CLEANUP_BYTES])?;
         if minimum_memory_bytes > memory_bytes { return Err(CandidateError::Arguments); }
-        let limits = Int4Limits { memory_bytes, preparation_bytes, source_preparation_bytes, max_load_bytes,
-            result_bytes, max_prompt_tokens: self.context_tokens - self.max_new_tokens + 1,
-            load, native, snapshot_pin, snapshot_need, minimum_memory_bytes };
-        let options = self.options(166_101)?;
-        if options.banned_token_ids.contains(&166_101) { return Err(CandidateError::Arguments); }
-        options.validate(self.generation_limits(limits)).map_err(|_| CandidateError::Arguments)?;
-        Ok(limits)
+        Ok(Int4Limits { memory_bytes, preparation_bytes, source_preparation_bytes, max_load_bytes,
+            result_bytes, max_prompt_tokens, load, native, snapshot_pin, snapshot_need, minimum_memory_bytes })
     }
     // Recheck the exclusive source/snapshot contract for programmatically
     // constructed arguments too, before input IO or caller-sized allocations.

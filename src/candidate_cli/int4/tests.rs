@@ -25,8 +25,8 @@ fn command_requires_explicit_source_manifest_and_process_budget_not_an_int8_arti
         vec!["candidate", "source-int4", "chat", "--source-dir", "d", "--source-manifest", "m"],
         vec!["candidate", "source-int4", "generate", "--model", "candidate.fnlpq", "--memory-mib", "8192"],
     ] { assert!(crate::candidate_cli::definition().try_get_matches_from(argv).is_err()); }
-    assert_eq!(command("generate", &[]).task, Task::Generate);
-    assert_eq!(command("chat", &[]).task, Task::Chat);
+    assert_eq!(command("generate", &[]).task, Int4Task::Text(Task::Generate));
+    assert_eq!(command("chat", &[]).task, Int4Task::Text(Task::Chat));
 }
 
 #[test]
