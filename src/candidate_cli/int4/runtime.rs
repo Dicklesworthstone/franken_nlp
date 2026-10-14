@@ -3,7 +3,8 @@ use super::*;
 use std::{fs::File, time::{Duration, Instant}};
 use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
     hosted::{CancellationToken, Int4LoadLimits, NativeLimits, RunLimits},
-    native_engine::{int4::PackedInt4Kernel, strict_int4::Int4ModelLoadBudget},
+    native_engine::{int4::PackedInt4Kernel, strict_int4::{Int4ModelLoadBudget,
+        weights::snapshot::INT4_SNAPSHOT_VERSION}},
     tasks::{chat::{ChatLimits, ChatRequest, GenerateRequest, grouped_int4::Int4ChatPlanner}, ir::TaskBudget}};
 
 pub(super) fn execute(task: Task, args: Int4Args, limits: Int4Limits,
@@ -34,11 +35,17 @@ pub(super) fn execute(task: Task, args: Int4Args, limits: Int4Limits,
     let request = parse_input(task, text, args.max_input_bytes)?;
     remaining()?;
     let cancellation = CancellationToken::default();
-    let load = load_limits(&args, limits, remaining()?);
-    // No candidate fnlpq reader, catalog lookup, caller identity, weight clone
-    // or uncharged alternate constructor can reach this dispatch branch.
-    let model = engine.load_source_candidate_int4(args.source_dir.clone(), args.source_manifest.clone(),
-        args.group_width, load, cancellation.clone()).map_err(|_| CandidateError::Model)?;
+    // Snapshot failure is terminal. Never catch it to convert a source, read a
+    // header as its own trust anchor, look up a catalog, or change the group width.
+    let model = match (&args.snapshot, limits.snapshot_pin) {
+        (Some(path), Some(pin)) => engine.load_int4_snapshot(path.clone(), pin, limits.snapshot_budget(true)?,
+            ALLOCATOR_BYTES, snapshot_run(&args, remaining()?), cancellation.clone()),
+        (None, None) => engine.load_source_candidate_int4(
+            args.source_dir.clone().ok_or(CandidateError::Arguments)?,
+            args.source_manifest.clone().ok_or(CandidateError::Arguments)?,
+            args.group_width, load_limits(&args, limits, remaining()?), cancellation.clone()),
+        _ => return Err(CandidateError::Arguments),
+    }.map_err(|_| CandidateError::Model)?;
     remaining()?;
     let budget = TaskBudget {
         max_input_tokens: u32::try_from(limits.max_prompt_tokens).map_err(|_| CandidateError::Arguments)?,
@@ -46,9 +53,9 @@ pub(super) fn execute(task: Task, args: Int4Args, limits: Int4Limits,
         max_output_bytes: limits.result_bytes as u64, max_grammar_states: 1,
         max_kv_bytes: limits.native.kv_bytes,
     };
-    // The real quantized content fingerprint exists only after conversion.
-    // Never fabricate a pre-load identity to make a planning claim. Input
-    // bytes/JSON/roles/options were checked earlier; exact token planning is here.
+    // The model owns its recomputed content fingerprint, whether converted or
+    // restored. Never fabricate a pre-load identity to make a planning claim.
+    // Input bytes/JSON/roles/options were checked earlier; exact token planning is here.
     let planner = Int4ChatPlanner::for_model(model.model_identity(), budget, ChatLimits {
         max_messages: 128, max_message_bytes: args.max_input_bytes,
         max_total_message_bytes: args.max_input_bytes, generation: args.generation_limits(limits),
@@ -61,6 +68,15 @@ pub(super) fn execute(task: Task, args: Int4Args, limits: Int4Limits,
             item_id: "cli".to_owned(), sample_index: 0, messages, generation: options, budget }),
     }.map_err(|_| CandidateError::Planning)?;
     let identity = prepared.execution_identity().clone();
+    let mut snapshot = limits.snapshot_pin.map(|_| SnapshotRecord::new("loaded", limits.snapshot_need));
+    if let Some(path) = &args.save_snapshot {
+        // Source-only opt-in; save after successful task planning, but before
+        // generation. A complete file is preserved even if generation later fails.
+        let pin = engine.save_int4_snapshot(&model, path.clone(), limits.snapshot_budget(false)?,
+            snapshot_run(&args, remaining()?), cancellation.clone()).map_err(|_| CandidateError::Model)?;
+        if pin != model.model_identity().snapshot_pin() { return Err(CandidateError::Identity); }
+        snapshot = Some(SnapshotRecord::new("saved", limits.snapshot_need));
+    }
     let result = engine.execute_int4_chat(&model, prepared, 1, NativeLimits {
         context_tokens: args.context_tokens, allocator_reserve_bytes: ALLOCATOR_BYTES,
         run: RunLimits { max_elapsed: remaining()?, max_checkpoints: args.max_checkpoints,
@@ -74,7 +90,7 @@ pub(super) fn execute(task: Task, args: Int4Args, limits: Int4Limits,
         source_root_sha256: model.model_identity().source_root_sha256(),
         model_content_sha256: &content, candidate_format: &identity.artifact_format,
         quant_recipe: &identity.quant_recipe, group_width: model.model_identity().group_width(),
-        output: result.result(),
+        output: result.result(), snapshot,
     };
     // Both charges remain live here. The wrapper is explicitly source-candidate
     // evidence, not a canonical fnlpq digest, release receipt or activation claim.
@@ -91,12 +107,26 @@ fn load_limits(args: &Int4Args, limits: Int4Limits, remaining: Duration) -> Int4
             cleanup_reserve_bytes: CLEANUP_BYTES },
     }
 }
+fn snapshot_run(args: &Int4Args, remaining: Duration) -> RunLimits {
+    RunLimits { max_elapsed: remaining, max_checkpoints: args.snapshot_checkpoints, cleanup_reserve_bytes: CLEANUP_BYTES }
+}
+#[derive(Serialize)]
+struct SnapshotRecord { operation: &'static str, format: &'static str, file_bytes: u64 }
+impl SnapshotRecord {
+    fn new(operation: &'static str, need: Int4SnapshotRequirements) -> Self {
+        Self { operation, format: INT4_SNAPSHOT_VERSION, file_bytes: need.file_bytes }
+    }
+}
 #[derive(Serialize)]
 struct SourceResponse<'a, T: Serialize> {
     schema_version: u32, scope: &'static str, evidence: &'static str,
     model_id: &'static str, source_revision: &'a str, source_root_sha256: &'a str,
     model_content_sha256: &'a str, candidate_format: &'a str, quant_recipe: &'a str,
     group_width: usize, output: &'a T,
+    // No path, arbitrary file-supplied facts or duplicate trust pin. The outer
+    // model_content_sha256 is the independently recomputed model identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot: Option<SnapshotRecord>,
 }
 
 #[cfg(test)]
@@ -125,15 +155,36 @@ mod tests {
             evidence: "non_authoritative", model_id: "Nanbeige4.2-3B", source_revision: "fixture",
             source_root_sha256: "fixture-source", model_content_sha256: "fixture-content",
             candidate_format: "fnlp-int4-source-candidate-v1", quant_recipe: "fixture:group=128",
-            group_width: 128, output: &output };
+            group_width: 128, output: &output, snapshot: None };
         let mut bytes = Vec::new();
         publish(&response, 4096, &mut bytes).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["output"], output);
         assert_eq!(value["evidence"], "non_authoritative");
         assert_eq!(value["group_width"], 128);
-        for absent in ["logical_model_sha256", "prompt_digest", "source_dir", "source_manifest"] {
+        for absent in ["logical_model_sha256", "prompt_digest", "source_dir", "source_manifest", "snapshot"] {
             assert!(value.get(absent).is_none());
+        }
+    }
+    #[test]
+    fn snapshot_response_binds_operation_and_length_without_changing_native_output() {
+        let need = Int4SnapshotRequirements::for_group_width(128).unwrap();
+        let output = serde_json::json!({"result":{"content":"A"},"model_work":{"attention_pairs":7}});
+        for operation in ["saved", "loaded"] {
+            let response = SourceResponse { schema_version: 1, scope: "real-source-current-candidate-int4",
+                evidence: "non_authoritative", model_id: "Nanbeige4.2-3B", source_revision: "fixture",
+                source_root_sha256: "fixture-source", model_content_sha256: "fixture-content",
+                candidate_format: "fnlp-int4-source-candidate-v1", quant_recipe: "fixture:group=128",
+                group_width: 128, output: &output, snapshot: Some(SnapshotRecord::new(operation, need)) };
+            let mut bytes = Vec::new(); publish(&response, 4096, &mut bytes).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["output"], output);
+            assert_eq!(value["snapshot"]["operation"], operation);
+            assert_eq!(value["snapshot"]["format"], INT4_SNAPSHOT_VERSION);
+            assert_eq!(value["snapshot"]["file_bytes"], need.file_bytes);
+            assert_eq!(value["snapshot"].as_object().unwrap().len(), 3);
+            let mut refused = Vec::new(); assert!(publish(&response, 1, &mut refused).is_err());
+            assert!(refused.is_empty());
         }
     }
     #[test]
@@ -148,7 +199,7 @@ mod tests {
         for task in [Task::Generate, Task::Chat] {
             let mut args = super::super::tests::args("generate", &["--context-tokens", "256",
                 "--max-new-tokens", "4", "--max-output-bytes", "256"]);
-            args.source_dir = PathBuf::from(&source); args.source_manifest = PathBuf::from(&manifest);
+            args.source_dir = Some(PathBuf::from(&source)); args.source_manifest = Some(PathBuf::from(&manifest));
             args.memory_mib = memory;
             let text = match task {
                 Task::Generate => prompt.to_owned(),

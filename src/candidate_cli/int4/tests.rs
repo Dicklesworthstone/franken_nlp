@@ -61,7 +61,7 @@ fn invalid_limits_eos_and_unsupported_prefill_refuse_before_input_or_model_io() 
     for axis in 0..4 {
         let mut command = command("generate", &[]);
         match axis { 0 => command.args.memory_mib = 0, 1 => command.args.memory_mib = u64::MAX,
-            2 => command.args.max_load_mib = u64::MAX, _ => command.args.source_dir.clear() }
+            2 => command.args.max_load_mib = u64::MAX, _ => command.args.source_dir = None }
         assert_eq!(command.execute(&mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
     }
 }
