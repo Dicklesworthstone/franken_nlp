@@ -23,6 +23,8 @@ use crate::{
         extract::{ExtractionVocabulary, quantized::{Int8ExtractPlan, Int8ExtractRun, Int8ExtractError}}},
 };
 mod dispatch;
+mod grouped_int4;
+pub use grouped_int4::{Int4HostError, Int4LoadLimits, Int4LoadRequirements, ResidentInt4};
 mod scored;
 mod sentiment;
 pub use sentiment::SentimentHostLimits;
@@ -99,6 +101,7 @@ pub enum HostedError {
     Model(CurrentCandidateInt8Error),
     Native(StrictInt8Error),
     Chat(Int8ChatError),
+    Int4(Int4HostError),
     Extraction(Int8ExtractError),
     Classification(crate::tasks::classify::quantized::Int8ClassificationError),
     Judge(crate::tasks::judge::quantized::Int8JudgeError),
@@ -129,6 +132,7 @@ impl fmt::Display for HostedError {
             Self::Model(_) => "current-candidate model loading failed",
             Self::Native(_) => "hosted native engine construction failed",
             Self::Chat(_) => "hosted native generation or chat failed",
+            Self::Int4(_) => "hosted source-candidate INT4 loading or execution failed",
             Self::Extraction(_) => "hosted native extraction failed",
             Self::Classification(_) => "hosted native classification failed",
             Self::Judge(_) => "hosted native judgment failed",
@@ -151,6 +155,7 @@ impl Error for HostedError {
             Self::Reservation(e) => Some(e), Self::Spawn(e) => Some(e),
             Self::Join { source, .. } => Some(source), Self::Scope { source, .. } => Some(source),
             Self::Model(e) => Some(e), Self::Native(e) => Some(e), Self::Chat(e) => Some(e),
+            Self::Int4(e) => Some(e),
             Self::SourceMap(e) => Some(e), Self::Resolution(e) => Some(e),
             Self::Redaction(e) => Some(e), Self::Sentiment(e) => Some(e),
             Self::Source(e) => Some(e), Self::Judge(e) => Some(e), Self::Classification(e) => Some(e), Self::Extraction(e) => Some(e), Self::BatchSetup(e) => Some(e), Self::Batch(e) => Some(e), _ => None,
