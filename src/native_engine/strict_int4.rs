@@ -23,6 +23,7 @@ use super::{
 
 pub mod weights;
 pub mod scoring;
+pub mod prefill;
 pub use weights::{Int4ModelError, Int4ModelIdentity, Int4ModelLoadBudget,
     Int4ModelLoadRequirement, Int4ModelWeights};
 use weights::{Int4Layer, PROJECTION_SHAPES};

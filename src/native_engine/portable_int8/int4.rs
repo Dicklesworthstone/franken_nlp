@@ -10,6 +10,7 @@ use crate::native_engine::int4::PackedInt4Kernel;
 
 pub mod convert;
 pub mod cohort;
+pub mod batch;
 
 pub const PORTABLE_INT4_LINEAR_VERSION: &str = "portable-s4-group-f32-dynamic-s8-rne-v1";
 
