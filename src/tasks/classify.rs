@@ -408,3 +408,4 @@ pub use native::{CLASSIFICATION_NATIVE_EXECUTION, ClassificationNativeError, Eag
 mod model;
 pub use model::ClassificationLogits;
 pub mod quantized;
+pub mod grouped_int4;

@@ -178,14 +178,21 @@ impl ClassificationPlanner {
         -> Result<PreparedClassification, ClassificationPlanningError> {
         self.plan_with_profile(request, context, limits, control, NumericsProfile::HfBf16Eager)
     }
-    /// Internal closed-profile compiler. Public int8 planning wraps the result
+    /// Internal closed-profile compiler. Native task planning wraps the result
     /// in its distinct type; caller identities are checked, never relabeled.
     pub(super) fn plan_with_profile<C: DecodeStepControl>(&self, request: &ClassificationRequest,
         context: &PlanContext<'_>, limits: ClassificationLimits, control: &mut C, profile: NumericsProfile)
         -> Result<PreparedClassification, ClassificationPlanningError> {
-        if !matches!(&profile, NumericsProfile::HfBf16Eager | NumericsProfile::StrictQuantized { version: 1 }) {
-            return Err(ClassificationPlanningError::Identity);
-        }
+        let backend = match &profile {
+            NumericsProfile::HfBf16Eager => None,
+            NumericsProfile::StrictQuantized { version: 1 } => Some((
+                crate::native_engine::strict_int8::STRICT_INT8_EXECUTION,
+                crate::native_engine::strict_int8::scoring::INT8_SCORING_EXECUTION)),
+            NumericsProfile::StrictQuantized { version: 2 } => Some((
+                crate::native_engine::strict_int4::STRICT_INT4_EXECUTION,
+                crate::native_engine::strict_int4::scoring::INT4_SCORING_EXECUTION)),
+            _ => return Err(ClassificationPlanningError::Identity),
+        };
         limits.validate()?; checkpoint(control)?;
         request.budget.validate().map_err(|_| ClassificationPlanningError::InvalidLimits)?;
         request.policy.validate()?;
@@ -197,8 +204,7 @@ impl ClassificationPlanner {
             || base.kv_dtype != "bf16" || base.thinking_mode != ThinkingMode::Disabled || base.tool_mode != ToolMode::None {
             return Err(ClassificationPlanningError::Identity);
         }
-        if matches!(&profile, NumericsProfile::StrictQuantized { .. })
-            && base.backend_semantic_version != crate::native_engine::strict_int8::STRICT_INT8_EXECUTION {
+        if backend.is_some_and(|(native, _)| base.backend_semantic_version != native) {
             return Err(ClassificationPlanningError::Identity);
         }
         if !budget_fits(request.budget, *context.budget_ceiling()) { return Err(ClassificationPlanningError::InvalidLimits); }
@@ -290,9 +296,8 @@ impl ClassificationPlanner {
         identity.grammar_compiler_version = "candidate-full-vocabulary-trie-v1".to_owned();
         identity.sampler_version = "classification-scored-eos-no-sampling-v1".to_owned();
         identity.decision_policy_digest = digest(&(request.mode, request.policy, ClassificationCalibration::Uncalibrated))?;
-        if matches!(&profile, NumericsProfile::StrictQuantized { .. }) {
-            identity.decision_policy_digest = digest(&(identity.decision_policy_digest,
-                crate::native_engine::strict_int8::scoring::INT8_SCORING_EXECUTION))?;
+        if let Some((_, scoring)) = backend {
+            identity.decision_policy_digest = digest(&(identity.decision_policy_digest, scoring))?;
         }
         identity.validate().map_err(|_| ClassificationPlanningError::Identity)?;
         checkpoint(control)?;
