@@ -142,3 +142,5 @@ impl PreparedInt4Chat {
 }
 
 #[cfg(test)] mod tests;
+
+mod model;
