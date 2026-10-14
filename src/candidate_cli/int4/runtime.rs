@@ -30,12 +30,12 @@ impl Prepared {
         match self { Self::Text(plan) => plan.execution_identity(), Self::Classify(plan) => plan.execution_identity() }
     }
     fn execute(self, engine: &NlpEngine, model: &ResidentInt4, native: NativeLimits,
-        cancellation: CancellationToken) -> Result<Completed, CandidateError> {
+        kernel: PackedInt4Kernel, cancellation: CancellationToken) -> Result<Completed, CandidateError> {
         match self {
             Self::Text(plan) => engine.execute_int4_chat(model, plan, 1, native, SAMPLER_BYTES,
-                PackedInt4Kernel::scalar(), cancellation).map(Completed::Text),
+                kernel, cancellation).map(Completed::Text),
             Self::Classify(plan) => engine.execute_int4_classify(model, plan, native,
-                PackedInt4Kernel::scalar(), cancellation).map(Completed::Classify),
+                kernel, cancellation).map(Completed::Classify),
         }.map_err(|_| CandidateError::Execution)
     }
 }
@@ -48,7 +48,9 @@ impl DecodeStepControl for DeadlineControl {
 
 pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
-    if limits.minimum_memory_bytes > limits.memory_bytes { return Err(CandidateError::Arguments); }
+    if limits.minimum_memory_bytes > limits.memory_bytes || limits.kernel.kind() != args.kernel {
+        return Err(CandidateError::Arguments);
+    }
     let started = Instant::now();
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
@@ -108,7 +110,7 @@ pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
         context_tokens: args.context_tokens, allocator_reserve_bytes: ALLOCATOR_BYTES,
         run: RunLimits { max_elapsed: remaining()?, max_checkpoints: args.max_checkpoints,
             cleanup_reserve_bytes: CLEANUP_BYTES },
-    }, cancellation)?;
+    }, limits.kernel, cancellation)?;
     remaining()?;
     let content = identity.logical_model_digest.to_hex();
     let response = SourceResponse {
@@ -117,7 +119,7 @@ pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
         source_root_sha256: model.model_identity().source_root_sha256(),
         model_content_sha256: &content, candidate_format: &identity.artifact_format,
         quant_recipe: &identity.quant_recipe, group_width: model.model_identity().group_width(),
-        output: &result, snapshot,
+        output: &result, snapshot, integer_kernel: kernel_record(limits.kernel),
     };
     // Completed retains the exact hosted output guard while Serialize borrows
     // its result. No unguarded JSON value or partially completed head escapes.
@@ -190,6 +192,13 @@ struct SourceResponse<'a, T: Serialize> {
     // model_content_sha256 is the independently recomputed model identity.
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<SnapshotRecord>,
+    // Physical integer leaf, NOT model identity, packing, quality or timing.
+    // Omit the scalar default to preserve the existing response contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    integer_kernel: Option<&'static str>,
+}
+fn kernel_record(kernel: PackedInt4Kernel) -> Option<&'static str> {
+    (kernel.kind() != Int8KernelKind::Scalar).then_some(kernel.kind().id())
 }
 
 // Existing model-present text fixtures use the same extended runtime path.
@@ -225,14 +234,14 @@ mod tests {
             evidence: "non_authoritative", model_id: "Nanbeige4.2-3B", source_revision: "fixture",
             source_root_sha256: "fixture-source", model_content_sha256: "fixture-content",
             candidate_format: "fnlp-int4-source-candidate-v1", quant_recipe: "fixture:group=128",
-            group_width: 128, output: &output, snapshot: None };
+            group_width: 128, output: &output, snapshot: None, integer_kernel: None };
         let mut bytes = Vec::new();
         publish(&response, 4096, &mut bytes).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["output"], output);
         assert_eq!(value["evidence"], "non_authoritative");
         assert_eq!(value["group_width"], 128);
-        for absent in ["logical_model_sha256", "prompt_digest", "source_dir", "source_manifest", "snapshot"] {
+        for absent in ["logical_model_sha256", "prompt_digest", "source_dir", "source_manifest", "snapshot", "integer_kernel"] {
             assert!(value.get(absent).is_none());
         }
     }
@@ -245,7 +254,7 @@ mod tests {
                 evidence: "non_authoritative", model_id: "Nanbeige4.2-3B", source_revision: "fixture",
                 source_root_sha256: "fixture-source", model_content_sha256: "fixture-content",
                 candidate_format: "fnlp-int4-source-candidate-v1", quant_recipe: "fixture:group=128",
-                group_width: 128, output: &output, snapshot: Some(SnapshotRecord::new(operation, need)) };
+                group_width: 128, output: &output, snapshot: Some(SnapshotRecord::new(operation, need)), integer_kernel: None };
             let mut bytes = Vec::new(); publish(&response, 4096, &mut bytes).unwrap();
             let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(value["output"], output);
@@ -256,6 +265,41 @@ mod tests {
             let mut refused = Vec::new(); assert!(publish(&response, 1, &mut refused).is_err());
             assert!(refused.is_empty());
         }
+    }
+    #[test]
+    fn physical_kernel_metadata_is_checked_separate_and_default_omitted() {
+        let output = serde_json::json!({"head_count":2,"model_work":{"attention_pairs":7}});
+        for kind in Int8KernelKind::ALL {
+            let Ok(kernel) = PackedInt4Kernel::detect(kind) else { continue; };
+            let response = SourceResponse { schema_version: 1, scope: "real-source-current-candidate-int4",
+                evidence: "non_authoritative", model_id: "Nanbeige4.2-3B", source_revision: "fixture",
+                source_root_sha256: "fixture-source", model_content_sha256: "fixture-content",
+                candidate_format: "fnlp-int4-source-candidate-v1", quant_recipe: "fixture:group=128",
+                group_width: 128, output: &output, snapshot: None, integer_kernel: kernel_record(kernel) };
+            let mut bytes = Vec::new(); publish(&response, 4096, &mut bytes).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["output"], output);
+            assert_eq!(value["model_content_sha256"], "fixture-content");
+            assert_eq!(value["quant_recipe"], "fixture:group=128");
+            if kind == Int8KernelKind::Scalar { assert!(value.get("integer_kernel").is_none()); }
+            else { assert_eq!(value["integer_kernel"], kind.id()); }
+            assert!(value.get("qualified").is_none());
+            assert!(value.get("speedup").is_none());
+        }
+    }
+    #[test]
+    fn a_changed_cli_kernel_cannot_reuse_another_admitted_handle_before_io() {
+        struct NoRead;
+        impl Read for NoRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> { panic!("mismatched kernel reached input"); }
+        }
+        let mut args = super::super::tests::args("generate", &[]);
+        let limits = args.validate().unwrap();
+        args.kernel = Int8KernelKind::Avx2WidenedI16;
+        let mut output = Vec::new();
+        assert_eq!(execute_task(Int4Task::Text(Task::Generate), args, limits, &mut NoRead, &mut output),
+            Err(CandidateError::Arguments));
+        assert!(output.is_empty());
     }
     #[test]
     #[ignore = "requires controller-admitted pinned source and full-model CLI execution"]

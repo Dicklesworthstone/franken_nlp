@@ -74,6 +74,46 @@ label. Model content and group width derive from verified resident weights.
 No source paths, private prompt digests or arbitrary loader diagnostics are
 published. No label result is published before every head and finalizer succeeds.
 
+## Explicit integer kernels
+
+`source-int4 classify`, `generate` and `chat` also accept `--kernel ID`. The
+default is `s_scalar_i32`. A requested non-scalar kernel is checked against the
+actual CPU before input, model loading or snapshot persistence; an unsupported
+request fails instead of silently selecting scalar or another instruction set.
+There is no `auto` option, environment-driven override or measured-winner claim.
+
+The IDs are the existing native implementation identifiers:
+
+| Family | Exact IDs |
+| --- | --- |
+| Scalar | `s_scalar_i32` |
+| x86 AVX2 | `x3a_avx2_low7_high_bit`, `x3b_avx2_widened_i16` |
+| x86 VNNI | `x2_avx_vnni`, `x1b_avx512_vnni_ymm`, `x1a_avx512_vnni_zmm` |
+| AArch64 | `a2_dotprod`, `a3_autovec`, `a1_smmla` |
+
+For example, on a host supporting the requested AVX2 implementation:
+
+```sh
+fnlp candidate source-int4 classify request.json \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256_FROM_TRUSTED_CONVERSION" \
+  --memory-mib 8192 --group-width 128 --kernel x3b_avx2_widened_i16
+```
+
+The private admission record retains the actual checked executable handle and
+passes that exact handle into the existing hosted engine. This changes only
+the integer reduction implementation, not the model fingerprint, group layout,
+floating epilogues, scoring or generation policy. The same group scratch,
+algorithmic-work counters and memory ceilings apply. Sequential prefill and
+head scheduling are unchanged; choosing a kernel does not enable batching.
+
+Non-scalar responses add `integer_kernel` to the outer candidate envelope,
+derived from the checked handle. It is physical-execution metadata, not a
+packing identity, speed measurement or qualification receipt. Scalar responses
+omit the field, including when scalar is explicitly selected. The complete
+guarded task result stays under `output`; snapshots and their independent pins
+remain portable between supported kernel selections.
+
 ## Task and host API
 
 `tasks::classify::grouped_int4::Int4ClassificationPlanner::for_model` builds a
@@ -164,6 +204,18 @@ identity separation, all compute axes, late cancellation, CLI source/snapshot
 modes, wire refusal, unsupported controls and process-memory arithmetic.
 Model-present tests require the pinned local source closure and controller
 admission. Synthetic tests are not full-model inference evidence.
+
+Kernel regression sources check all nine canonical IDs on all three commands,
+real-host admission or refusal before IO, unchanged memory/option contracts,
+and optional physical metadata. An explicitly ignored full-model CLI test
+compares source/scalar classification with snapshot/SIMD classification, then
+checks completion of an independent multi-label bundle using the same snapshot.
+It requires `FNLP_INT4_TEST_SOURCE_DIR`, `FNLP_INT4_TEST_SOURCE_MANIFEST`,
+`FNLP_INT4_TEST_MEMORY_MIB`, an available non-scalar `FNLP_INT4_TEST_KERNEL`, and
+`FNLP_INT4_TEST_CLASSIFICATION_SNAPSHOT` naming a NEW destination. It preserves
+that snapshot even on later failure; it never deletes or overwrites a file.
+The pin comes from the successful verified source conversion, never the file
+being reloaded. This test has not been run.
 
 The CLI addition was source-reviewed with independent memory-arithmetic checks.
 Rust compilation, Rust tests, full-model execution, DSR, numerical qualification,

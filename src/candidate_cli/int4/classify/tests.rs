@@ -172,3 +172,55 @@ fn unavailable_runtime_never_reads_input_or_sources_or_emits_stdout() {
     assert_eq!(command(&[]).execute(&mut NoRead, &mut output), Err(CandidateError::Unavailable));
     assert!(output.is_empty());
 }
+
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+#[ignore = "requires controller-admitted pinned sources, a fresh snapshot and an available explicit SIMD kernel"]
+fn source_scalar_and_pinned_snapshot_simd_classification_match_and_complete_all_heads() {
+    let source = std::env::var("FNLP_INT4_TEST_SOURCE_DIR").expect("explicit pinned source directory required");
+    let manifest = std::env::var("FNLP_INT4_TEST_SOURCE_MANIFEST").expect("explicit pinned manifest required");
+    let memory: u64 = std::env::var("FNLP_INT4_TEST_MEMORY_MIB").expect("explicit memory ceiling required")
+        .parse().expect("memory ceiling must be MiB");
+    let snapshot = std::env::var("FNLP_INT4_TEST_CLASSIFICATION_SNAPSHOT").expect("explicit new snapshot path required");
+    assert!(!std::path::Path::new(&snapshot).exists(), "test requires a new destination; nothing is deleted");
+    let kind: Int8KernelKind = std::env::var("FNLP_INT4_TEST_KERNEL").expect("explicit SIMD kernel required")
+        .parse().expect("canonical kernel ID required");
+    assert_ne!(kind, Int8KernelKind::Scalar);
+    PackedInt4Kernel::detect(kind).expect("requested SIMD kernel must be available on the actual test host");
+
+    let mut convert = command(&["--save-snapshot", &snapshot]);
+    convert.args.source_dir = Some(PathBuf::from(&source));
+    convert.args.source_manifest = Some(PathBuf::from(&manifest));
+    convert.args.memory_mib = memory;
+    let text = request_json("exclusive");
+    let mut bytes = Vec::new();
+    convert.execute(&mut text.as_bytes(), &mut bytes).unwrap();
+    let scalar: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(scalar.get("integer_kernel").is_none());
+    assert_eq!(scalar["snapshot"]["operation"], "saved");
+    assert_eq!(scalar["output"]["head_count"], 1);
+    // The trust pin comes from successful verified source conversion, NOT the
+    // snapshot header or an unauthenticated checksum from that same file.
+    let pin = scalar["model_content_sha256"].as_str().unwrap().to_owned();
+    for mode in ["exclusive", "multi_label"] {
+        let mut reload = parsed(&["--snapshot", &snapshot, "--expected-model-sha256", &pin,
+            "--kernel", kind.id()]).unwrap();
+        reload.args.memory_mib = memory;
+        assert!(reload.args.source_dir.is_none()); assert!(reload.args.source_manifest.is_none());
+        let text = request_json(mode); let mut bytes = Vec::new();
+        reload.execute(&mut text.as_bytes(), &mut bytes).unwrap();
+        let selected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(selected["integer_kernel"], kind.id());
+        assert_eq!(selected["snapshot"]["operation"], "loaded");
+        assert_eq!(selected["model_content_sha256"], pin);
+        assert_eq!(selected["output"]["numerics_profile"], "strict-quantized-v2");
+        assert_eq!(selected["output"]["result"]["mode"], mode);
+        if mode == "exclusive" { assert_eq!(selected["output"], scalar["output"]); }
+        else {
+            assert_eq!(selected["output"]["head_count"], 2);
+            assert_eq!(selected["output"]["result"]["result"]["labels"].as_array().unwrap().len(), 2);
+        }
+    }
+    // The explicitly requested snapshot is preserved, including on a later
+    // failed assertion. No model-quality or performance claim is inferred.
+}

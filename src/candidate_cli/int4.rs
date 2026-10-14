@@ -1,7 +1,8 @@
 //! Explicit source-candidate INT4 tasks. Never an INT8 artifact alias.
 use super::*;
-use crate::native_engine::strict_int4::{Int4MemoryRequirement, Int4ModelLoadRequirement,
-    weights::snapshot::{Int4SnapshotBudget, Int4SnapshotPin, Int4SnapshotRequirements}};
+use crate::native_engine::{int4::PackedInt4Kernel, simd::Int8KernelKind,
+    strict_int4::{Int4MemoryRequirement, Int4ModelLoadRequirement,
+        weights::snapshot::{Int4SnapshotBudget, Int4SnapshotPin, Int4SnapshotRequirements}}};
 
 mod classify;
 #[cfg(feature = "asupersync-runtime")]
@@ -42,6 +43,10 @@ struct Int4Args {
     /// Contiguous group width; the exact partition enters model identity and work.
     #[arg(long, default_value_t = 128)]
     group_width: usize,
+    /// Exact integer kernel ID, hardware checked before IO. Unsupported requests never fall back.
+    /// Examples: s_scalar_i32, x3b_avx2_widened_i16, x2_avx_vnni, a2_dotprod.
+    #[arg(long, value_name = "ID", default_value_t = Int8KernelKind::Scalar)]
+    kernel: Int8KernelKind,
     #[arg(long, default_value_t = 2048)]
     context_tokens: usize,
     #[arg(long, default_value_t = 128)]
@@ -98,7 +103,7 @@ pub(super) fn definition() -> clap::Command {
         .mut_arg("prefill_rows", |arg| arg.hide(true));
     clap::Command::new("source-int4")
         .about("Run candidate INT4 tasks from pinned sources or a digest-pinned local snapshot")
-        .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Uses scalar sequential native execution; no fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Emits one completed JSON object, not provisional token events.")
+        .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Sequential native execution defaults to scalar; --kernel explicitly selects an existing hardware-checked integer leaf. No automatic selection, fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Emits one completed JSON object, not provisional token events.")
         .subcommand_required(true)
         .subcommand(task("generate", "Generate from a bounded UTF-8 prompt using the pinned template"))
         .subcommand(task("chat", "Complete a bounded JSON system/user/assistant transcript"))
@@ -134,6 +139,8 @@ struct Int4Limits {
     max_load_bytes: u64, result_bytes: usize, max_prompt_tokens: usize,
     load: Int4ModelLoadRequirement, native: Int4MemoryRequirement,
     snapshot_pin: Option<Int4SnapshotPin>, snapshot_need: Int4SnapshotRequirements,
+    /// Real-host-checked executable handle, not a serialized capability report.
+    kernel: PackedInt4Kernel,
     /// Lower bound for these declared simultaneous reservations. Host admission
     /// independently enforces all runtime/domain obligations; this is not RSS.
     minimum_memory_bytes: u64,
@@ -164,6 +171,7 @@ impl Int4Args {
     fn validate_storage(&self, result_bytes: usize, output_tokens: usize, max_prompt_tokens: usize,
         sampler_bytes: u64, extra_preparation_bytes: u64) -> Result<Int4Limits, CandidateError> {
         let snapshot_pin = self.checked_model_input()?;
+        let kernel = PackedInt4Kernel::detect(self.kernel).map_err(|_| CandidateError::Arguments)?;
         if self.input.as_os_str().is_empty()
             || self.max_input_bytes == 0 || self.max_input_bytes > MAX_INPUT_BYTES
             || max_prompt_tokens == 0 || max_prompt_tokens > self.context_tokens
@@ -205,7 +213,7 @@ impl Int4Args {
             load_stage.max(save_stage).max(execute_stage), CLEANUP_BYTES])?;
         if minimum_memory_bytes > memory_bytes { return Err(CandidateError::Arguments); }
         Ok(Int4Limits { memory_bytes, preparation_bytes, source_preparation_bytes, max_load_bytes,
-            result_bytes, max_prompt_tokens, load, native, snapshot_pin, snapshot_need, minimum_memory_bytes })
+            result_bytes, max_prompt_tokens, load, native, snapshot_pin, snapshot_need, kernel, minimum_memory_bytes })
     }
     // Recheck the exclusive source/snapshot contract for programmatically
     // constructed arguments too, before input IO or caller-sized allocations.

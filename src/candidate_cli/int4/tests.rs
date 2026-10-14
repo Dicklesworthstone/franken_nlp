@@ -151,3 +151,69 @@ fn feature_refusal_does_not_touch_source_input_or_stdout() {
         assert!(output.is_empty());
     }
 }
+
+#[test]
+fn every_task_defaults_to_scalar_and_parses_only_canonical_explicit_kernel_ids() {
+    for task in ["generate", "chat", "classify"] {
+        assert_eq!(command(task, &[]).args.kernel, Int8KernelKind::Scalar);
+        for kind in Int8KernelKind::ALL {
+            assert_eq!(command(task, &["--kernel", kind.id()]).args.kernel, kind);
+        }
+        for id in ["auto", "fastest", "scalar", "avx2", "X2_AVX_VNNI", ""] {
+            let argv = ["candidate", "source-int4", task, "--source-dir", "d",
+                "--source-manifest", "m", "--memory-mib", "8192", "--kernel", id];
+            assert!(crate::candidate_cli::definition().try_get_matches_from(argv).is_err());
+        }
+    }
+}
+
+#[test]
+fn exact_host_detection_authorizes_a_kernel_or_refuses_before_any_input() {
+    for task in ["generate", "chat", "classify"] {
+        for kind in Int8KernelKind::ALL {
+            let command = command(task, &["--kernel", kind.id()]);
+            let admission = match command.task {
+                Int4Task::Text(_) => command.args.validate(),
+                Int4Task::Classify(scoring) => scoring.validate(&command.args),
+            };
+            match PackedInt4Kernel::detect(kind) {
+                Ok(checked) => {
+                    assert_eq!(checked.kind(), kind);
+                    assert_eq!(admission.unwrap().kernel.kind(), kind);
+                }
+                Err(_) => {
+                    assert!(matches!(admission, Err(CandidateError::Arguments)));
+                    let mut output = Vec::new();
+                    assert_eq!(command.execute(&mut NoRead, &mut output), Err(CandidateError::Arguments));
+                    assert!(output.is_empty());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn physical_kernel_selection_does_not_change_layout_memory_or_generation_options() {
+    for task in ["generate", "chat", "classify"] {
+        let baseline = command(task, &[]);
+        let limits = |command: &Int4Command| match command.task {
+            Int4Task::Text(_) => command.args.validate().unwrap(),
+            Int4Task::Classify(scoring) => scoring.validate(&command.args).unwrap(),
+        };
+        let storage = |limits: Int4Limits| (limits.memory_bytes, limits.preparation_bytes,
+            limits.source_preparation_bytes, limits.max_load_bytes, limits.result_bytes,
+            limits.max_prompt_tokens, limits.minimum_memory_bytes);
+        let expected = limits(&baseline);
+        for kind in Int8KernelKind::ALL {
+            if PackedInt4Kernel::detect(kind).is_err() { continue; }
+            let selected = command(task, &["--kernel", kind.id()]);
+            let actual = limits(&selected);
+            assert_eq!(storage(actual), storage(expected));
+            assert_eq!(actual.load, expected.load);
+            assert_eq!(actual.native, expected.native);
+            assert_eq!(actual.snapshot_pin, expected.snapshot_pin);
+            assert_eq!(actual.snapshot_need.file_bytes, expected.snapshot_need.file_bytes);
+            assert!(selected.args.options(166_101).unwrap() == baseline.args.options(166_101).unwrap());
+        }
+    }
+}
