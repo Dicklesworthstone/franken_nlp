@@ -85,6 +85,29 @@ impl PackedInt4Kernel {
         Ok(())
     }
 
+    /// Evaluate one logical nibble range for up to four activation rows.
+    /// Group/row boundaries may share a byte, including a high-nibble start.
+    /// Only the requested range is unpacked. All operand, output, range and
+    /// workspace checks precede scratch or output writes. This is an integer
+    /// reduction: callers must scale distinct groups before summing them.
+    pub fn dot_rows_range_into(self, inputs: &[&[i8]], packed_weights: &[u8],
+        nibble_offset: usize, k: usize, output: &mut [i32], scratch: &mut [i8])
+        -> Result<(), CpuKernelError> {
+        Self::scratch_len(k)?;
+        let total = packed_weights.len().checked_mul(2).ok_or(CpuKernelError::Shape)?;
+        let end = nibble_offset.checked_add(k).ok_or(CpuKernelError::Shape)?;
+        if end > total || inputs.len() > MAX_COHORT_ROWS || output.len() != inputs.len()
+            || scratch.len() < k { return Err(CpuKernelError::Shape); }
+        if inputs.iter().any(|input| input.len() != k) { return Err(CpuKernelError::LengthMismatch); }
+        if inputs.is_empty() { return Ok(()); }
+        for (index, weight) in scratch[..k].iter_mut().enumerate() {
+            let at = nibble_offset + index;
+            let nibble = (packed_weights[at / 2] >> ((at % 2) * 4)) & 0x0f;
+            *weight = ((nibble as i8) << 4) >> 4;
+        }
+        self.inner.dot_rows_into(inputs, &scratch[..k], output)
+    }
+
     /// GEMV with the same exact packed layout and K-byte scratch contract.
     pub fn gemv_into(self, input: &[i8], packed_weights: &[u8], n: usize,
         output: &mut [i32], scratch: &mut [i8]) -> Result<(), CpuKernelError> {

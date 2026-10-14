@@ -18,6 +18,8 @@ use super::{
 };
 
 pub mod batch;
+/// Group-scaled packed INT4 weights sharing the activation and work rails.
+pub mod int4;
 
 pub const PORTABLE_INT8_LINEAR_VERSION: &str = "portable-s8-dynamic-rne-fixed-epilogue-v1";
 const ROWS_PER_CHECKPOINT: usize = 32;
