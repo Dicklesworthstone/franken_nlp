@@ -32,6 +32,7 @@ mod judge;
 mod redact;
 mod resolve;
 mod stream;
+mod int4;
 
 const MIB: u64 = 1024 * 1024;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -94,6 +95,7 @@ pub(crate) struct CandidateArgs {
 
 pub(crate) enum CandidateCommand {
     Text { task: Task, args: CandidateArgs },
+    SourceInt4(int4::Int4Command),
     TextBatch(text_batch::TextBatchCommand),
     TextJob(jobs::generation::TextJobCommand),
     Source(source::SourceCommand),
@@ -112,9 +114,10 @@ pub(crate) enum CandidateCommand {
 
 pub(crate) fn definition() -> clap::Command {
     clap::Command::new("candidate")
-        .about("Explicit non-certified local INT8 inference (requires asupersync-runtime)")
-        .long_about("Execute an explicitly selected local current-candidate INT8 artifact. This is not release activation, publisher authentication, numerical qualification or a production certification. No network, automatic download, thinking mode or tool execution is available. Single requests emit a completed JSON object; batch emits ordered candidate-framed NDJSON, not token events. The explicit stream generate/chat route emits provisional token NDJSON with a required final completion frame.")
+        .about("Explicit non-certified local inference (requires asupersync-runtime)")
+        .long_about("Execute an explicitly selected local current-candidate INT8 artifact, or use source-int4 to convert a pinned local source in memory. This is not release activation, publisher authentication, numerical qualification or a production certification. No network, automatic download, thinking mode or tool execution is available. Single requests emit a completed JSON object; batch emits ordered candidate-framed NDJSON, not token events. The explicit stream generate/chat route emits provisional token NDJSON with a required final completion frame.")
         .subcommand_required(true)
+        .subcommand(int4::definition())
         .subcommands(source::definitions())
         .subcommands(scored::definitions())
         .subcommand(batch::definition())
@@ -139,6 +142,9 @@ impl CandidateCommand {
     pub(crate) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let (name, matches) = matches.subcommand().ok_or_else(||
             clap::Error::raw(clap::error::ErrorKind::MissingSubcommand, "candidate task required"))?;
+        if name == "source-int4" {
+            return int4::Int4Command::from_matches(matches).map(Self::SourceInt4);
+        }
         if name == "text-job" {
             return jobs::generation::TextJobCommand::from_arg_matches(matches).map(Self::TextJob);
         }
@@ -220,6 +226,7 @@ impl CandidateCommand {
 
     fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
         let (task, args) = match self {
+            Self::SourceInt4(command) => return command.execute(input, output),
             Self::TextBatch(command) => return command.execute(input, output),
             Self::Source(command) => return command.execute(input, output),
             Self::Scored(command) => return command.execute(input, output),
@@ -392,7 +399,7 @@ impl CandidateError {
             Self::Runtime => "process runtime initialization refused",
             Self::Model => "explicit local current-candidate model loading refused",
             Self::Identity => "candidate model identity changed or is incompatible",
-            Self::Planning => "prompt, schema or task contract refused before weight loading",
+            Self::Planning => "prompt, schema or task contract refused; no result published",
             Self::Timeout => "cooperative request deadline expired; no result published",
             Self::Execution => "native execution failed or was cancelled; no result published",
             Self::Output => "completed result could not be delivered",
