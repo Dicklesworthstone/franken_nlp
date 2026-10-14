@@ -334,3 +334,6 @@ mod tests {
         assert_ne!(base, digest("source-a", 128, b"q", 0x8000));
     }
 }
+
+/// Digest-pinned local candidate snapshots; never canonical FNLPQ activation.
+pub mod snapshot;

@@ -179,3 +179,5 @@ fn checkpoint<E, C: DecodeStepControl>(control: &mut C) -> Result<(), Int4Conver
 
 #[cfg(test)]
 mod tests;
+
+mod restore;
