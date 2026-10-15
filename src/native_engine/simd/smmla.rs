@@ -59,7 +59,7 @@ impl SmmlaKernel {
         Ok(())
     }
 
-    fn tile(self, inputs: &[&[i8]], weights: &[&[i8]]) -> Result<[i32; TILE_VALUES], CpuKernelError> {
+    pub(super) fn tile(self, inputs: &[&[i8]], weights: &[&[i8]]) -> Result<[i32; TILE_VALUES], CpuKernelError> {
         if inputs.is_empty() || weights.is_empty() || weights.len() > TILE_COLUMNS {
             return Err(CpuKernelError::Shape);
         }

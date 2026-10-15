@@ -18,6 +18,7 @@ mod smmla;
 #[cfg(any(target_arch = "aarch64", test))]
 mod autovec;
 pub mod config;
+pub mod tiles;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
