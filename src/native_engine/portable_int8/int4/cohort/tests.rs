@@ -28,8 +28,9 @@ fn compare(m: usize, k: usize, width: usize, kernel: PackedInt4Kernel) {
     let scales: Vec<_> = (0..n * k.div_ceil(width)).map(|i| (i % 11 + 1) as f32 / 64.0).collect();
     let view = GroupedInt4Linear::checked(n, k, width, &packed, &scales).unwrap().with_kernel(kernel);
     let inputs = inputs(m, k);
-    let masks = [LinearRows::Selected(&[0, 2, 5]), LinearRows::All,
+    let catalog = [LinearRows::Selected(&[0, 2, 5]), LinearRows::All,
         LinearRows::Selected(&[1, 2]), LinearRows::Selected(&[0, 4, 5])];
+    let masks: Vec<_> = (0..m).map(|row| catalog[row % catalog.len()]).collect();
     let mut expected = Vec::new();
     for row in 0..m {
         let mut out = vec![0.0; masks[row].checked_count(n).unwrap()];
@@ -62,7 +63,9 @@ fn compare(m: usize, k: usize, width: usize, kernel: PackedInt4Kernel) {
 
 #[test]
 fn ragged_masks_and_independent_scales_match_serial_across_group_and_model_tails() {
-    for m in [1, 2, 3, MAX_INT4_COHORT_ROWS] {
+    // Retain the original full-model fixture population; wide cohorts below
+    // exercise their separate request-count and merge/tile boundaries.
+    for m in [1, 2, 3, MAX_COHORT_ROWS] {
         for k in [1, 3, 33, 130, 3072, MAX_MODEL_K] {
             for width in [1, 3, 32, 128, MAX_MODEL_K] { compare(m, k, width, PackedInt4Kernel::scalar()); }
         }
@@ -163,4 +166,78 @@ fn nonfinite_group_sums_and_bf16_casts_refuse_the_whole_epoch() {
     let mut members = [Int4ProjectionRow { input: &input, selection: LinearRows::All, output: &mut output, ledger: &mut ledger }];
     assert!(view.project_cohort_bf16_into(&mut members, &mut [0], &mut Control::default()).is_err());
     assert_eq!(output, [Bf16::from_f32(42.0)]); assert_eq!(ledger.reserved(), work);
+}
+
+#[test]
+fn wide_sparse_cohorts_cross_hardware_tiles_without_combining_requests() {
+    assert_eq!(MAX_INT4_COHORT_ROWS, 64);
+    for kind in Int8KernelKind::ALL {
+        match PackedInt4Kernel::detect(kind) {
+            Ok(kernel) => { for m in [5, 17, 33, MAX_INT4_COHORT_ROWS] {
+                for k in [3, 65, 130] { for width in [3, 16, 32] { compare(m, k, width, kernel); } }
+            } }
+            Err(CpuKernelError::UnsupportedIsa) => eprintln!("INT4_WIDE_COHORT tier={kind} RESULT=SKIPPED_UNSUPPORTED_ISA"),
+            Err(error) => panic!("unexpected kernel refusal: {error}"),
+        }
+    }
+}
+
+#[test]
+fn last_of_64_cannot_use_another_members_surplus_or_mutate_earlier_outputs() {
+    let view = GroupedInt4Linear::checked(2, 2, 1, &[0x11; 2], &[1.0; 4]).unwrap();
+    let work = view.planned_work(LinearRows::All).unwrap();
+    let surplus = ProjectionWork { dot_products: work.dot_products * 100, multiply_accumulates: work.multiply_accumulates * 100 };
+    for mode in 0..6 {
+        let mut inputs = inputs(64, 2); let mut outputs = [[42.0; 2]; 64];
+        let mut budgets: Vec<_> = (0..64).map(|_| ProjectionLedger::new(surplus)).collect();
+        if mode == 0 { assert!(inputs[63].encode_f32(&[f32::NAN; 2]).is_err()); }
+        if mode == 1 { budgets[63] = ProjectionLedger::new(ProjectionWork { dot_products: work.dot_products - 1, ..work }); }
+        if mode == 2 { budgets[63] = ProjectionLedger::new(ProjectionWork { multiply_accumulates: work.multiply_accumulates - 1, ..work }); }
+        let mut members: Vec<_> = inputs.iter().zip(outputs.iter_mut()).zip(budgets.iter_mut()).enumerate()
+            .map(|(i, ((input, out), ledger))| Int4ProjectionRow { input,
+                selection: if i == 63 && mode == 3 { LinearRows::Selected(&[1, 0]) } else { LinearRows::All },
+                output: if i == 63 && mode == 4 { &mut out[..1] } else { &mut out[..] }, ledger }).collect();
+        let mut scratch = [99]; let mut control = Control::default();
+        assert!(view.project_cohort_f32_into(&mut members,
+            if mode == 5 { &mut [] } else { &mut scratch }, &mut control).is_err());
+        drop(members);
+        assert_eq!(outputs, [[42.0; 2]; 64]); assert_eq!(scratch, [99]); assert_eq!(control.polls, 0);
+        assert!(budgets.iter().all(|ledger| ledger.reserved() == ProjectionWork::default()));
+    }
+}
+
+#[test]
+fn cancellation_inside_one_prepared_group_retains_all_64_full_reservations() {
+    let view = GroupedInt4Linear::checked(2, 7, 3, &[0x11; 7], &[1.0; 6]).unwrap();
+    let inputs = inputs(64, 7); let work = view.planned_work(LinearRows::All).unwrap();
+    for cancel in [1, 2] {
+        let mut outputs = [[42.0; 2]; 64]; let mut scratch = [99; 3];
+        let mut budgets: Vec<_> = (0..64).map(|_| ProjectionLedger::new(work)).collect();
+        let mut members: Vec<_> = inputs.iter().zip(outputs.iter_mut()).zip(budgets.iter_mut())
+            .map(|((input, output), ledger)| Int4ProjectionRow { input, selection: LinearRows::All, output, ledger }).collect();
+        let mut control = Control { polls: 0, cancel: Some(cancel) };
+        assert_eq!(view.project_cohort_f32_into(&mut members, &mut scratch, &mut control),
+            Err(GroupedInt4Error::Linear(LinearError::Cancelled(DecodeCancellationKind::User))));
+        drop(members);
+        assert_eq!(outputs, [[42.0; 2]; 64]); assert_eq!(control.polls, cancel);
+        assert!(budgets.iter().all(|ledger| ledger.reserved() == work));
+        if cancel == 1 { assert_eq!(scratch, [99; 3]); }
+    }
+}
+
+#[test]
+fn wide_union_does_not_project_an_unselected_overflowing_weight_row() {
+    let view = GroupedInt4Linear::checked(4, 2, 2, &[0x11, 0x11, 0x11, 0x77], &[1.0, 2.0, 3.0, f32::MAX]).unwrap();
+    let mut input = ActivationBuffer::try_new(2).unwrap(); input.encode_f32(&[127.0; 2]).unwrap();
+    let masks = [LinearRows::Selected(&[0, 2]), LinearRows::Selected(&[1, 2])];
+    let mut outputs = [[0.0; 2]; 64];
+    let mut budgets: Vec<_> = (0..64).map(|i| ProjectionLedger::new(view.planned_work(masks[i % 2]).unwrap())).collect();
+    let mut members: Vec<_> = outputs.iter_mut().zip(budgets.iter_mut()).enumerate()
+        .map(|(i, (output, ledger))| Int4ProjectionRow { input: &input, selection: masks[i % 2], output, ledger }).collect();
+    view.project_cohort_f32_into(&mut members, &mut [0; 2], &mut Control::default()).unwrap();
+    drop(members);
+    for (i, output) in outputs.iter().enumerate() {
+        assert_eq!(*output, if i % 2 == 0 { [254.0, 762.0] } else { [508.0, 762.0] });
+        assert_eq!(budgets[i].reserved(), view.planned_work(masks[i % 2]).unwrap());
+    }
 }

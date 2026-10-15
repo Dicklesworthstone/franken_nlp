@@ -1,11 +1,13 @@
 //! Allocation-free shared-group projection for a finite independent cohort.
 //! Requests may select different sorted vocabulary rows. A bounded merge visits
-//! only their union, unpacks each group once for its active lanes, and retains
-//! each lane's original group order, activation scale, output index and budget.
+//! only their union. Each group is unpacked once for all interested members,
+//! then evaluated in four-row hardware tiles with independent sums and budgets.
 
 use super::*;
+use crate::native_engine::simd::MAX_COHORT_ROWS;
 
-pub const MAX_INT4_COHORT_ROWS: usize = crate::native_engine::simd::MAX_COHORT_ROWS;
+/// Logical request limit, independent of the integer leaf's four-row tile.
+pub const MAX_INT4_COHORT_ROWS: usize = super::batch::MAX_INT4_BATCH_ROWS;
 
 /// Output remains private staging until the entire epoch succeeds. A failed
 /// epoch invalidates ALL outputs, including earlier completed cells. The host
@@ -69,23 +71,30 @@ impl GroupedInt4Linear<'_> {
             }
             let mut totals = [0.0_f32; MAX_INT4_COHORT_ROWS];
             for group in 0..self.groups {
-                // Never execute more than this many actual group dots between
-                // polls, even when the tile population changes with the mask.
-                if since_poll + lane_count > ROWS_PER_CHECKPOINT { poll(control)?; since_poll = 0; }
+                // Poll before preparation when the first tile needs a fresh
+                // quantum. The prepared borrow survives later tile checkpoints.
+                let first_lanes = lane_count.min(MAX_COHORT_ROWS);
+                if since_poll + first_lanes > ROWS_PER_CHECKPOINT { poll(control)?; since_poll = 0; }
                 let start = group * self.group_width;
                 let width = self.group_width.min(self.columns - start);
-                let mut activations: [&[i8]; MAX_INT4_COHORT_ROWS] = [&[]; MAX_INT4_COHORT_ROWS];
-                let mut dots = [0_i32; MAX_INT4_COHORT_ROWS];
-                for lane in 0..lane_count {
-                    activations[lane] = &inputs[lanes[lane]][start..start + width];
-                }
-                self.kernel.dot_rows_range_into(&activations[..lane_count], self.packed,
-                    next * self.columns + start, width, &mut dots[..lane_count], scratch).map_err(LinearError::CpuKernel)?;
+                let prepared = self.kernel.prepare_range(self.packed, next * self.columns + start,
+                    width, scratch).map_err(LinearError::CpuKernel)?;
                 let weight_scale = self.scales[next * self.groups + group];
-                for lane in 0..lane_count {
-                    accumulate_group(&mut totals[lane], dots[lane], activation_scales[lanes[lane]], weight_scale)?;
+                for base in (0..lane_count).step_by(MAX_COHORT_ROWS) {
+                    let live = (lane_count - base).min(MAX_COHORT_ROWS);
+                    if since_poll + live > ROWS_PER_CHECKPOINT { poll(control)?; since_poll = 0; }
+                    let mut activations: [&[i8]; MAX_COHORT_ROWS] = [&[]; MAX_COHORT_ROWS];
+                    let mut dots = [0_i32; MAX_COHORT_ROWS];
+                    for lane in 0..live {
+                        activations[lane] = &inputs[lanes[base + lane]][start..start + width];
+                    }
+                    prepared.dot_rows_into(&activations[..live], &mut dots[..live]).map_err(LinearError::CpuKernel)?;
+                    for lane in 0..live {
+                        accumulate_group(&mut totals[base + lane], dots[lane],
+                            activation_scales[lanes[base + lane]], weight_scale)?;
+                    }
+                    since_poll += live;
                 }
-                since_poll += lane_count;
             }
             for lane in 0..lane_count {
                 let member = lanes[lane];
