@@ -18,6 +18,7 @@ use super::{
 };
 
 pub mod batch;
+mod tiles;
 /// Group-scaled packed INT4 weights sharing the activation and work rails.
 pub mod int4;
 
@@ -214,6 +215,9 @@ impl<'a> QuantizedLinear<'a> {
         let count = rows.checked_count(self.rows)?;
         if count != length { return Err(LinearError::OutputShape); }
         ledger.charge(ProjectionWork::for_shape(count, self.columns)?)?;
+        if self.kernel.tile_columns() > 1 {
+            return self.project_paired(std::slice::from_ref(input), rows, count, control, store);
+        }
         for index in 0..count {
             if index % ROWS_PER_CHECKPOINT == 0 { poll(control)?; }
             let row = rows.row(index);

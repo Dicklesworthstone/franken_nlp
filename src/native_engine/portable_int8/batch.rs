@@ -1,11 +1,10 @@
 //! Shared-weight, activation-row-tiled INT8 projections.
 //!
-//! Both the scalar and explicit AVX2 paths feed each loaded weight to up to
-//! four independent activation accumulators. The AVX2 cohort leaves reuse the
-//! vector weight block (and X3a correction) across all live rows in a tile.
-//! Every row uses the SAME fixed dequantization epilogue; no floating reduction
-//! crosses rows. No weights expand, workers spawn, or hot allocation occurs.
-//! Source implementation only: no measured throughput or parity award.
+//! The selected CPU body owns its row/column tile. SMMLA pairs two real
+//! selected weight rows; one-column bodies retain the shared-weight row loop.
+//! Every output uses the SAME fixed dequantization epilogue; no floating
+//! reduction crosses rows. No weights expand, workers spawn, or hot allocation
+//! occurs. Source implementation only: no measured throughput or parity award.
 use super::*;
 
 /// Finite activation cohort ceiling, independent of the selected output width.
@@ -48,6 +47,9 @@ impl QuantizedLinear<'_> {
             input.scale()?;
         }
         ledger.charge(ProjectionWork::for_shape(total, self.columns)?)?;
+        if self.kernel.tile_columns() > 1 {
+            return self.project_paired(inputs, rows, count, control, store);
+        }
         let mut since_checkpoint = ROWS_PER_CHECKPOINT;
         for output_column in 0..count {
             let row = rows.row(output_column);
