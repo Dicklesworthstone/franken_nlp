@@ -145,3 +145,4 @@ impl PreparedInt4Chat {
 
 mod model;
 mod prefill;
+pub mod batch;
