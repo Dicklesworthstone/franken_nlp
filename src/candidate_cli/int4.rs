@@ -6,6 +6,7 @@ use crate::native_engine::{int4::PackedInt4Kernel, simd::Int8KernelKind,
 
 mod classify;
 mod prefill;
+mod batch;
 #[cfg(feature = "asupersync-runtime")]
 mod runtime;
 #[cfg(test)]
@@ -95,32 +96,41 @@ struct Int4Args {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Int4Task { Text(Task), Classify(classify::ScoringArgs) }
-pub(super) struct Int4Command { task: Int4Task, args: Int4Args }
+pub(super) struct Int4Command { task: Int4Task, args: Int4Args, batch: Option<batch::BatchArgs> }
 
 pub(super) fn definition() -> clap::Command {
     let task = |name: &'static str, about: &'static str| Int4Args::augment_args(clap::Command::new(name).about(about))
         .mut_arg("prefill_rows", |arg| arg.help("Explicit grouped-INT4 layer-major prompt execution, 1..=64 rows; extra workspace is process-admitted"));
     clap::Command::new("source-int4")
         .about("Run candidate INT4 tasks from pinned sources or a digest-pinned local snapshot")
-        .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Sequential native execution defaults to scalar; --kernel explicitly selects an existing hardware-checked integer leaf. Text tasks can opt in to bounded layer-major prompt execution with --prefill-rows; classification cannot. No automatic selection, fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Emits one completed JSON object, not provisional token events.")
+        .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Sequential native execution defaults to scalar; --kernel explicitly selects an existing hardware-checked integer leaf. Text tasks can opt in to bounded layer-major prompt execution with --prefill-rows; classification cannot. text-batch instead runs one finite NDJSON cohort through shared-model generation and emits one completed aggregate JSON object. No automatic selection, fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Emits completed JSON, not provisional token events.")
         .subcommand_required(true)
         .subcommand(task("generate", "Generate from a bounded UTF-8 prompt using the pinned template"))
         .subcommand(task("chat", "Complete a bounded JSON system/user/assistant transcript"))
         .subcommand(classify::definition())
+        .subcommand(batch::definition())
 }
 impl Int4Command {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let (name, matches) = matches.subcommand().ok_or_else(||
             clap::Error::raw(clap::error::ErrorKind::MissingSubcommand, "source-int4 task required"))?;
+        if name == "text-batch" {
+            let batch = batch::BatchArgs::from_arg_matches(matches)?;
+            return Ok(Self { task: Int4Task::Text(batch.task()), args: Int4Args::from_arg_matches(matches)?, batch: Some(batch) });
+        }
         let task = match name {
             "generate" => Int4Task::Text(Task::Generate),
             "chat" => Int4Task::Text(Task::Chat),
             "classify" => Int4Task::Classify(classify::ScoringArgs::from_matches(matches)?),
             _ => return Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source-int4 task refused")),
         };
-        Ok(Self { task, args: Int4Args::from_arg_matches(matches)? })
+        Ok(Self { task, args: Int4Args::from_arg_matches(matches)?, batch: None })
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
+        if let Some(batch) = self.batch {
+            if self.task != Int4Task::Text(batch.task()) { return Err(CandidateError::Arguments); }
+            return batch.execute(self.args, input, output);
+        }
         let limits = match self.task {
             Int4Task::Text(_) => self.args.validate()?,
             Int4Task::Classify(scoring) => scoring.validate(&self.args)?,

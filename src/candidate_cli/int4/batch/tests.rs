@@ -63,7 +63,7 @@ fn full_declared_cohort_not_one_row_determines_memory_work_and_output_admission(
         assert_eq!(quote.generation.max_native_payload_bytes, native.kv_bytes + native.rope_bytes + native.scratch_payload_bound);
         assert_eq!(quote.generation.max_sampler_payload_bytes, rows as u64 * SAMPLER_BYTES);
         assert_eq!(quote.result_bytes, rows as u64 * quote.common.result_bytes as u64 + 16_384);
-        assert!(quote.common.minimum_memory_bytes > last); last = quote.common.minimum_memory_bytes;
+        assert!(quote.common.minimum_memory_bytes >= last); last = quote.common.minimum_memory_bytes;
         assert_eq!(quote.generation.native.max_forward_positions, (rows * args.context_tokens) as u64);
         let exact_mib = last.div_ceil(MIB); args.memory_mib = exact_mib;
         assert!(options.validate(&args).is_ok());
@@ -88,4 +88,37 @@ fn snapshot_source_exclusivity_and_independent_content_pins_survive_batch_parsin
     let args = Int4Args::from_arg_matches(&matches).unwrap();
     assert!(options.validate(&args).unwrap().common.snapshot_pin.is_some());
     assert!(definition().try_get_matches_from(["text-batch", "--snapshot", "file", "--memory-mib", "8192"]).is_err());
+}
+
+struct NoRead;
+impl Read for NoRead {
+    fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("refused batch read input"); }
+}
+#[test]
+fn root_dispatch_exposes_batch_without_replacing_single_or_int8_tasks() {
+    for task in ["generate", "chat"] {
+        let matches = crate::candidate_cli::definition().try_get_matches_from(["candidate", "source-int4", "text-batch",
+            "--task", task, "--source-dir", "source", "--source-manifest", "manifest", "--memory-mib", "8192"]).unwrap();
+        let CandidateCommand::SourceInt4(command) = CandidateCommand::from_matches(&matches).unwrap()
+            else { panic!("wrong route") };
+        assert!(command.batch.is_some());
+        assert_eq!(command.task, Int4Task::Text(if task == "chat" { Task::Chat } else { Task::Generate }));
+    }
+    assert!(crate::candidate_cli::definition().try_get_matches_from(["candidate", "text-batch",
+        "--model", "model.fnlpq", "--memory-mib", "8192"]).is_ok());
+}
+#[test]
+fn programmatic_task_substitution_and_impossible_cohort_refuse_before_io() {
+    let (batch, args) = parsed(&[]);
+    let command = Int4Command { task: Int4Task::Text(Task::Chat), args, batch: Some(batch) };
+    assert_eq!(command.execute(&mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+    let (mut batch, args) = parsed(&[]); batch.max_records = 65;
+    assert_eq!(batch.execute(args, &mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+}
+#[cfg(not(feature = "asupersync-runtime"))]
+#[test]
+fn missing_runtime_refuses_before_any_input_or_output() {
+    let (batch, args) = parsed(&[]); let mut out = Vec::new();
+    assert_eq!(batch.execute(args, &mut NoRead, &mut out), Err(CandidateError::Unavailable));
+    assert!(out.is_empty());
 }

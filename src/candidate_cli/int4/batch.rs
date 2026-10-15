@@ -9,6 +9,9 @@ use crate::native_engine::{
     lmhead::NANBEIGE_VOCAB_SIZE,
 };
 
+#[cfg(feature = "asupersync-runtime")]
+mod runtime;
+
 pub(super) const PROTOCOL: &str = "fnlp-source-int4-text-batch-v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
@@ -45,6 +48,17 @@ fn times(a: u64, b: u64) -> Result<u64, CandidateError> {
     a.checked_mul(b).ok_or(CandidateError::Arguments)
 }
 impl BatchArgs {
+    pub(super) fn task(self) -> Task {
+        match self.task { BatchTask::Generate => Task::Generate, BatchTask::Chat => Task::Chat }
+    }
+    pub(super) fn execute(self, args: Int4Args, input: &mut impl Read, output: &mut impl Write)
+        -> Result<(), CandidateError> {
+        let limits = self.validate(&args)?;
+        #[cfg(feature = "asupersync-runtime")]
+        { runtime::execute(args, self, limits, input, output) }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        { let _ = (args, limits, input, output); Err(CandidateError::Unavailable) }
+    }
     pub(super) fn validate(self, args: &Int4Args) -> Result<BatchLimits, CandidateError> {
         if self.max_records == 0 || self.max_records > MAX_INT4_SEQUENCES
             || self.max_total_input_bytes == 0 || self.max_total_input_bytes > 64 * MIB
