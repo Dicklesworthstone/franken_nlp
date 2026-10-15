@@ -233,5 +233,6 @@ impl<C: DecodeStepControl> Driver for Int4Session<'_, '_, C> {
 }
 
 mod prefill;
+pub mod batch;
 
 #[cfg(test)] mod tests;
