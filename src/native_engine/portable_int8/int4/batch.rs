@@ -1,9 +1,10 @@
-//! Bounded prompt-row projections sharing packed group reductions.
+//! Bounded prompt-row projections sharing each unpacked group across the batch.
 //!
-//! One aggregate ledger prices every row before any output write. Integer
-//! leaves share weights across up to four lanes; each lane keeps the scalar
-//! activation scale, increasing-group sum and single final BF16 cast. No
-//! allocation, padding, dense dequantization, dispatch policy or thread spawn.
+//! One aggregate ledger prices every row before any output write. A packed
+//! group is prepared ONCE, then borrowed by every four-row integer tile, with
+//! checkpoints between tiles. Each row retains increasing-group f32 summation
+//! and its own activation scale; BF16 is cast once after the complete row.
+//! No allocation, padding, dense weight expansion, dispatch or thread spawn.
 use super::*;
 use crate::native_engine::simd::MAX_COHORT_ROWS;
 
@@ -49,26 +50,33 @@ impl GroupedInt4Linear<'_> {
         let mut since_poll = ROWS_PER_CHECKPOINT;
         for index in 0..count {
             let row = rows.row(index);
-            for base in (0..inputs.len()).step_by(MAX_COHORT_ROWS) {
-                let lanes = (inputs.len() - base).min(MAX_COHORT_ROWS);
-                let mut totals = [0.0_f32; MAX_COHORT_ROWS];
-                for group in 0..self.groups {
+            // Only one output column's totals are live, not an M*N matrix.
+            // Keep each row's f32 accumulator across its increasing groups.
+            let mut totals = [0.0_f32; MAX_INT4_BATCH_ROWS];
+            for group in 0..self.groups {
+                let first_lanes = inputs.len().min(MAX_COHORT_ROWS);
+                if since_poll + first_lanes > ROWS_PER_CHECKPOINT { poll(control)?; since_poll = 0; }
+                let start = group * self.group_width;
+                let width = self.group_width.min(self.columns - start);
+                let prepared = self.kernel.prepare_range(self.packed, row * self.columns + start,
+                    width, scratch).map_err(LinearError::CpuKernel)?;
+                let weight_scale = self.scales[row * self.groups + group];
+                for base in (0..inputs.len()).step_by(MAX_COHORT_ROWS) {
+                    let lanes = (inputs.len() - base).min(MAX_COHORT_ROWS);
+                    // A large batch never creates a 64-dot cancellation gap.
                     if since_poll + lanes > ROWS_PER_CHECKPOINT { poll(control)?; since_poll = 0; }
-                    let start = group * self.group_width;
-                    let width = self.group_width.min(self.columns - start);
                     let mut tile: [&[i8]; MAX_COHORT_ROWS] = [&[]; MAX_COHORT_ROWS];
                     let mut dots = [0_i32; MAX_COHORT_ROWS];
                     for lane in 0..lanes { tile[lane] = &values[base + lane][start..start + width]; }
-                    self.kernel.dot_rows_range_into(&tile[..lanes], self.packed,
-                        row * self.columns + start, width, &mut dots[..lanes], scratch).map_err(LinearError::CpuKernel)?;
-                    let weight_scale = self.scales[row * self.groups + group];
+                    prepared.dot_rows_into(&tile[..lanes], &mut dots[..lanes]).map_err(LinearError::CpuKernel)?;
                     for lane in 0..lanes {
-                        accumulate_group(&mut totals[lane], dots[lane], scales[base + lane], weight_scale)?;
+                        accumulate_group(&mut totals[base + lane], dots[lane], scales[base + lane], weight_scale)?;
                     }
                     since_poll += lanes;
                 }
-                for lane in 0..lanes { store((base + lane) * count + index, totals[lane])?; }
             }
+            // No partially accumulated group sum is cast or written out.
+            for lane in 0..inputs.len() { store(lane * count + index, totals[lane])?; }
         }
         poll(control)?;
         Ok(())
