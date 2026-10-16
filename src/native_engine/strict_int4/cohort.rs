@@ -7,6 +7,7 @@
 use super::*;
 use crate::native_engine::portable_int8::int4::batch::MAX_INT4_BATCH_ROWS;
 mod execution;
+pub mod packed;
 
 pub const INT4_COHORT_EXECUTION: &str = "grouped-int4-ragged-sequence-cohort-v1";
 pub const MAX_INT4_SEQUENCES: usize = MAX_INT4_BATCH_ROWS;

@@ -73,16 +73,29 @@ fn encode_norms<C: DecodeStepControl>(hidden: &[Vec<Bf16>], scale: &[Bf16],
     for (row, input) in hidden.iter().zip(activations) { poll(control)?; input.encode_bf16(&norm(row, scale)?)?; }
     Ok(())
 }
-/// Validate even the LAST sequence address before touching any cache. Unlike a
-/// prompt morsel, this step has at most one token per independent sequence.
+/// Validate the COMPLETE pack before cache mutation. A repeated sequence is
+/// legal only in its contiguous, increasing-position run. Later positions are
+/// checked against a virtual append cursor, not against a prematurely filled
+/// real cache. The ordinary append_group boundary still requires unique slots.
 fn check_addresses(steps: &[Int4CohortToken], positions: &[usize], slot: usize,
     sequences: &[Sequence]) -> Result<(), StrictInt4Error> {
-    check_indices(steps.iter().map(|step| step.sequence), sequences.len())?;
-    if positions.len() != steps.len() { return Err(StrictInt4Error::Input); }
+    if steps.is_empty() || steps.len() > MAX_INT4_BATCH_ROWS || positions.len() != steps.len() {
+        return Err(StrictInt4Error::Input);
+    }
+    let mut previous = None;
+    let mut expected = 0_usize;
     for (step, &position) in steps.iter().zip(positions) {
+        if step.sequence >= sequences.len() || previous.is_some_and(|prior| prior > step.sequence) {
+            return Err(StrictInt4Error::Input);
+        }
         let cache = &sequences[step.sequence].cache;
-        if cache.len_for_slot(slot).map_err(|_| StrictInt4Error::Cache)? != position { return Err(StrictInt4Error::Cache); }
+        if previous != Some(step.sequence) {
+            expected = cache.len_for_slot(slot).map_err(|_| StrictInt4Error::Cache)?;
+        }
+        if position != expected { return Err(StrictInt4Error::Cache); }
         if position >= cache.capacity_positions() { return Err(StrictInt4Error::Context); }
+        expected = position.checked_add(1).ok_or(StrictInt4Error::Context)?;
+        previous = Some(step.sequence);
     }
     Ok(())
 }
