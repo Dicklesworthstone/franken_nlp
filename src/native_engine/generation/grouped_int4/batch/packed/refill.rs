@@ -6,22 +6,18 @@ use crate::native_engine::strict_int4::cohort::packed::refill::{
     Int4RefillSession, RefillAdmission, RefillRetirement, INT4_REFILL_EXECUTION,
 };
 
-pub fn preflight(engine: &Int4CohortEngine<'_>, requests: &[Int4BatchGenerationRequest<'_>],
+pub fn requirements(requests: &[Int4BatchGenerationRequest<'_>], contexts: &[usize],
     budget: Int4BatchGenerationBudget, limits: Int4PrefillLimits)
     -> Result<Int4BatchGenerationRequirements, Int4GenerationError> {
     limits.validate()?;
-    engine.check_idle()?;
-    let slots = engine.sequence_count();
-    if requests.is_empty() || requests.len() > 1_000_000 || slots == 0
-        || slots > requests.len() || slots > MAX_INT4_SEQUENCES {
+    if requests.is_empty() || requests.len() > 1_000_000 || contexts.is_empty()
+        || contexts.len() > requests.len() || contexts.len() > MAX_INT4_SEQUENCES {
         return Err(GenerationError::Contract("INT4 refill geometry").into());
     }
     let first = requests[0].plan;
     let mut planned = Int4Work::default();
     let mut output = 0_u64;
     let mut largest_sampler = 0_u64;
-    let mut contexts = reserved(slots)?;
-    for slot in 0..slots { contexts.push(engine.capacity(slot)?); }
     for (index, request) in requests.iter().enumerate() {
         request.plan.verify_identity(request.admitted_identity)?;
         if request.plan.group_width != first.group_width
@@ -32,10 +28,7 @@ pub fn preflight(engine: &Int4CohortEngine<'_>, requests: &[Int4BatchGenerationR
             || requests[..index].iter().any(|prior| prior.request_seq == request.request_seq) {
             return Err(GenerationError::Contract("INT4 refill delivery sequence").into());
         }
-        check_model(request.admitted_identity, request.plan.group_width, engine.model_identity())?;
-        // Completion order is data-dependent. Every request must fit every
-        // recyclable physical slot, not merely the slot initially assigned.
-        for &context in &contexts {
+        for &context in contexts {
             check_bounds(request.plan.work, request.plan.sampler_bytes(), context, request.budget)?;
         }
         planned = planned.checked_add(request.plan.work)?;
@@ -47,11 +40,11 @@ pub fn preflight(engine: &Int4CohortEngine<'_>, requests: &[Int4BatchGenerationR
         output = plus(output, 4096)?;
     }
     check_work(planned, budget.native)?;
-    let mut native = Int4MemoryRequirement::for_cohort(&contexts, first.group_width)?;
+    let mut native = Int4MemoryRequirement::for_cohort(contexts, first.group_width)?;
     let extra = limits.validate()?;
     native.scratch_payload_bound = plus(native.scratch_payload_bound, extra)?;
     let native_payload_bytes = plus(plus(native.kv_bytes, native.rope_bytes)?, native.scratch_payload_bound)?;
-    let sampler_payload_bytes = times(largest_sampler, slots as u64)?;
+    let sampler_payload_bytes = times(largest_sampler, contexts.len() as u64)?;
     if native_payload_bytes > budget.max_native_payload_bytes
         || sampler_payload_bytes > budget.max_sampler_payload_bytes
         || output > budget.max_output_payload_bytes {
@@ -61,6 +54,22 @@ pub fn preflight(engine: &Int4CohortEngine<'_>, requests: &[Int4BatchGenerationR
         planned_work: planned, group_width: first.group_width, native,
         native_payload_bytes, sampler_payload_bytes, output_payload_upper_bytes: output,
     })
+}
+
+pub fn preflight(engine: &Int4CohortEngine<'_>, requests: &[Int4BatchGenerationRequest<'_>],
+    budget: Int4BatchGenerationBudget, limits: Int4PrefillLimits)
+    -> Result<Int4BatchGenerationRequirements, Int4GenerationError> {
+    engine.check_idle()?;
+    let slots = engine.sequence_count();
+    if slots == 0 || slots > requests.len() || slots > MAX_INT4_SEQUENCES {
+        return Err(GenerationError::Contract("INT4 refill slot count").into());
+    }
+    let mut contexts = reserved(slots)?;
+    for slot in 0..slots { contexts.push(engine.capacity(slot)?); }
+    for request in requests {
+        check_model(request.admitted_identity, request.plan.group_width, engine.model_identity())?;
+    }
+    requirements(requests, &contexts, budget, limits)
 }
 
 pub fn execute<D: DecodeByteDecoder, C: DecodeStepControl>(engine: &mut Int4CohortEngine<'_>,
@@ -198,7 +207,7 @@ fn drive<'a, D: DecodeByteDecoder, S: DecodeEventSink, B: RefillDriver>(
     result
 }
 
-fn expected_steps(prompts: &[usize], forwards: &[u64], slots: usize, width: usize)
+pub(crate) fn expected_steps(prompts: &[usize], forwards: &[u64], slots: usize, width: usize)
     -> Result<u64, Int4GenerationError> {
     if prompts.is_empty() || prompts.len() != forwards.len() || slots == 0 || slots > prompts.len()
         || slots > MAX_INT4_SEQUENCES || width == 0 || width > MAX_INT4_SEQUENCES {

@@ -159,4 +159,6 @@ fn finish_with_schedule(requests: &[Int4ChatBatchRequest<'_>], raw: Int4BatchGen
     Ok(output)
 }
 
+pub mod refill;
 #[cfg(test)] mod tests;
+
