@@ -3,7 +3,7 @@ use super::*;
 use std::io::{BufReader, Cursor};
 
 fn options(rows: usize) -> CorpusArgs {
-    CorpusArgs { task: BatchTask::Generate, cohort_rows: rows, max_records: 1000,
+    CorpusArgs { task: BatchTask::Generate, cohort_rows: rows, active_rows: None, max_records: 1000,
         max_total_input_bytes: 1 << 20, max_total_output_bytes: 1 << 20,
         max_total_forward_positions: u64::MAX, max_total_projected_logits: u64::MAX,
         max_total_attention_pairs: u64::MAX, max_total_group_dots: u64::MAX,
@@ -173,4 +173,19 @@ fn cumulative_output_admission_preserves_space_for_the_terminal_frame() {
     assert!(out.admit_frame(1).is_err());
     out.write_all(&vec![0; wire::FOOTER_BYTES]).unwrap();
     assert!(out.write_all(b"x").is_err());
+}
+
+#[test]
+fn active_rows_is_a_bounded_subset_of_each_corpus_window() {
+    let mut opts = options(8);
+    for rows in [1, 2, 8] {
+        opts.active_rows = Some(rows);
+        assert!(opts.check().is_ok());
+    }
+    for rows in [0, 9, usize::MAX] {
+        opts.active_rows = Some(rows);
+        assert!(opts.check().is_err());
+    }
+    opts.active_rows = None;
+    assert!(opts.check().is_ok());
 }

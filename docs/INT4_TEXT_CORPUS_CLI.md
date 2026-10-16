@@ -11,7 +11,7 @@ The existing `text-batch` command remains a single aggregate-result operation.
 fnlp candidate source-int4 text-corpus requests.ndjson --task generate \
   --snapshot model.int4snap --expected-model-sha256 "$MODEL_SHA256" \
   --memory-mib 8192 --context-tokens 512 --max-new-tokens 32 \
-  --cohort-rows 8 --max-records 1000 --prefill-rows 32
+  --cohort-rows 8 --active-rows 4 --max-records 1000 --prefill-rows 32
 ```
 
 Use the existing `asupersync-runtime` build. `MODEL_SHA256` is an independently
@@ -44,7 +44,11 @@ are delivery addresses and do not enter the sampler's semantic key.
 Each window executes through one existing supervised hosted batch call. Without
 `--prefill-rows`, it advances one token per unfinished sequence per native pass.
 With it, the existing fair packed driver admits at most that many total token
-rows per pass. Windows reuse the same model/planner, not each other's KV state.
+rows per pass. Supplying `--active-rows N` additionally recycles N physical
+KV/sampler slots through the already-preplanned window; it requires
+`--prefill-rows`, accepts 1..=cohort-rows, and never changes request identity,
+result order, or per-request work ceilings. A short final window uses at most its
+actual membership. Windows reuse the same model/planner, not each other's KV state.
 All per-request generation options, task ceilings, numerical profiles, kernel
 checks and finalizers remain unchanged. `--kernel` is explicit; scalar stays the
 default. There is no dynamic slot refill or per-record policy override.
@@ -80,8 +84,10 @@ this zero-count footer. This is not a durable job or an exactly-once pipe receip
 
 `--max-records` defaults to 1000 and is capped at one million. The complete seen-ID
 set is separately included in the preparation floor (a conservative 1024-byte
-allowance per permitted ID). Native/KV/sampler/raw-result storage scales with
-`--cohort-rows`, not the corpus size. Current-window byte staging and optional
+allowance per permitted ID). Without refill, native KV/sampler storage scales with `--cohort-rows`, not the
+corpus size. With `--active-rows`, KV and sampler residency scale with that live
+slot count while retained raw/final result bounds and logical work still cover
+the complete preplanned window. Current-window byte staging and optional
 packed rails retain their existing independent reservations. Declared capacities
 are admitted even for a shorter final window. Preparation and allocator reserves
 are modeled commitments, not measured or operating-system-enforced RSS limits.
@@ -122,5 +128,7 @@ file was rejected by the connector and is not part of this change; no missing
 module reference was retained. Real corpus/model execution, full-vs-windowed
 model parity, hosted cancellation/IO failure campaigns and performance evidence
 remain outstanding. No numerical qualification, speedup or release-gate closure
-is asserted. Dynamic refill, durable resume, dedicated signal integration and
-per-record generation overrides remain separate work.
+is asserted. Cross-window dynamic refill, durable resume, dedicated signal integration and
+per-record generation overrides remain separate work. Refill is currently
+bounded to one already-read corpus window; it does not read new records during
+native execution.

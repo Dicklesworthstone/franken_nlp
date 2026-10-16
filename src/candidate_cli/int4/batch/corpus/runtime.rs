@@ -32,7 +32,7 @@ pub(super) fn execute(args: Int4Args, options: CorpusArgs, quoted: CorpusLimits,
         .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
     let mut processor = NativeWindows { engine: &engine, args: &args, limits: limits.window,
         started, deadline, cancellation: CancellationToken::default(), model: None, planner: None,
-        first_execution: true };
+        first_execution: true, active_rows: options.active_rows };
     processor.remaining()?;
     if args.input.as_os_str() == "-" {
         stream::drive(&mut processor, &mut BufReader::with_capacity(8192, input), output,
@@ -48,6 +48,7 @@ struct NativeWindows<'a> {
     engine: &'a NlpEngine, args: &'a Int4Args, limits: BatchLimits,
     started: Instant, deadline: Duration, cancellation: CancellationToken,
     model: Option<ResidentInt4>, planner: Option<Int4ChatPlanner>, first_execution: bool,
+    active_rows: Option<usize>,
 }
 impl NativeWindows<'_> {
     fn remaining(&self) -> Result<Duration, CandidateError> {
@@ -100,9 +101,11 @@ impl stream::Processor for NativeWindows<'_> {
             allocator_reserve_bytes: ALLOCATOR_BYTES,
             run: batch_runtime::stage_run(self.remaining()?, self.args.max_checkpoints),
         };
-        let quote = match self.limits.common.prefill {
-            None => limits.requirements(&members),
-            Some(prefill) => limits.requirements_packed(&members, prefill),
+        let quote = match (self.active_rows, self.limits.common.prefill) {
+            (Some(active), Some(prefill)) => limits.requirements_refill(&members, active.min(members.len()), prefill),
+            (Some(_), None) => return Err(CandidateError::Arguments),
+            (None, None) => limits.requirements(&members),
+            (None, Some(prefill)) => limits.requirements_packed(&members, prefill),
         }.map_err(|_| CandidateError::Planning)?;
         Ok(stream::Prepared { value: NativePrepared { members, items, identity, limits },
             planned: quote.generation.planned_work })
@@ -129,10 +132,14 @@ impl stream::Processor for NativeWindows<'_> {
             self.first_execution = false;
         }
         prepared.limits.run.max_elapsed = self.remaining()?;
-        let result = match self.limits.common.prefill {
-            None => self.engine.execute_int4_chat_batch(model, prepared.members, prepared.limits,
+        let result = match (self.active_rows, self.limits.common.prefill) {
+            (Some(active), Some(prefill)) => self.engine.execute_int4_chat_refilling(model, prepared.members,
+                prepared.limits, self.limits.common.kernel, active.min(prepared.items.len()), prefill,
+                self.cancellation.clone()),
+            (Some(_), None) => return Err(CandidateError::Arguments),
+            (None, None) => self.engine.execute_int4_chat_batch(model, prepared.members, prepared.limits,
                 self.limits.common.kernel, self.cancellation.clone()),
-            Some(prefill) => self.engine.execute_int4_chat_batch_packed(model, prepared.members, prepared.limits,
+            (None, Some(prefill)) => self.engine.execute_int4_chat_batch_packed(model, prepared.members, prepared.limits,
                 self.limits.common.kernel, prefill, self.cancellation.clone()),
         }.map_err(|_| CandidateError::Execution)?;
         self.remaining()?;

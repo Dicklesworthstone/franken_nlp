@@ -19,6 +19,10 @@ pub(in crate::candidate_cli::int4) struct CorpusArgs {
     /// Simultaneously prepared/executed documents, 1..=64, not total records.
     #[arg(long, default_value_t = 8)]
     cohort_rows: usize,
+    /// Recyclable live KV/sampler slots inside one preplanned window.
+    /// Requires --prefill-rows; 1..=cohort-rows. Omit for fixed membership.
+    #[arg(long)]
+    active_rows: Option<usize>,
     /// Whole-invocation record/seen-ID bound. IDs never reset between windows.
     #[arg(long, default_value_t = 1000)]
     max_records: u64,
@@ -50,7 +54,7 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
         .mut_arg("input", |arg| arg.help("NDJSON file or '-' for stdin; read only one bounded cohort at a time"))
         .mut_arg("max_checkpoints", |arg| arg.help("Native checkpoint allowance per window; charged in full to max-total-execution-checkpoints before execution"))
         .mut_arg("prefill_rows", |arg| arg.help("Optional maximum TOTAL prompt/decode token rows per packed pass; 1..=64, independently admitted"))
-        .long_about("Non-certified source/snapshot INT4 corpus execution. Generate records have unique id, prompt and optional sample_index; chat uses messages. One model is loaded lazily and reused across bounded --cohort-rows windows. --max-records bounds the entire invocation and its seen-ID set; IDs never reset across windows. The current window must parse, plan and pass cumulative work/output admission before saving or inference. Each window uses the existing ordinary or --prefill-rows packed batch host and all independent task finalizers. Emit canonical window_complete NDJSON only after a whole window succeeds; require the final corpus_complete frame AND process exit 0 for whole-corpus success. Later failures leave earlier completed windows but never emit a success footer or retry. Global input/output, forward/head/attention/group-dot/MAC and reserved checkpoint ceilings never renew per window. Empty input completes without loading or saving a model. Source/snapshot exclusivity and independent pins are unchanged. No dynamic slot refill, per-record policy overrides, durable resume, inference network or tools. Blocking IO is cooperative, not preemptible.")
+        .long_about("Non-certified source/snapshot INT4 corpus execution. Generate records have unique id, prompt and optional sample_index; chat uses messages. One model is loaded lazily and reused across bounded --cohort-rows windows. --max-records bounds the entire invocation and its seen-ID set; IDs never reset across windows. The current window must parse, plan and pass cumulative work/output admission before saving or inference. Each window uses the existing ordinary or --prefill-rows packed batch host and all independent task finalizers. Emit canonical window_complete NDJSON only after a whole window succeeds; require the final corpus_complete frame AND process exit 0 for whole-corpus success. Later failures leave earlier completed windows but never emit a success footer or retry. Global input/output, forward/head/attention/group-dot/MAC and reserved checkpoint ceilings never renew per window. Empty input completes without loading or saving a model. Source/snapshot exclusivity and independent pins are unchanged. --active-rows N (with --prefill-rows) reuses N physical KV/sampler slots within each already-bounded window; immutable per-request work remains charged for the whole window. No per-record policy overrides, durable resume, inference network or tools. Blocking IO is cooperative, not preemptible.")
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -67,6 +71,7 @@ impl CorpusArgs {
     }
     fn check(self) -> Result<(), CandidateError> {
         if self.cohort_rows == 0 || self.cohort_rows > MAX_INT4_SEQUENCES
+            || self.active_rows.is_some_and(|rows| rows == 0 || rows > self.cohort_rows)
             || self.max_records == 0 || self.max_records > MAX_CORPUS_RECORDS
             || self.max_total_input_bytes == 0 || self.max_total_input_bytes > MAX_TRANSPORT_BYTES
             || self.max_total_output_bytes < wire::FOOTER_BYTES as u64
@@ -94,7 +99,29 @@ impl CorpusArgs {
         // seen-ID population. Native/KV/sampler charges scale with cohort_rows,
         // NOT max_records. The ID-set allowance is modeled payload, not RSS.
         let extra = sum(&[times(self.max_records, 1024)?, (2 * FRAME_ALLOWANCE + 8192) as u64])?;
-        let window = self.window_args().validate_with_preparation(args, extra)?;
+        let mut window = self.window_args().validate_with_preparation(args, extra)?;
+        if let Some(active) = self.active_rows {
+            let prefill = window.common.prefill.ok_or(CandidateError::Arguments)?;
+            let contexts = [args.context_tokens; MAX_INT4_SEQUENCES];
+            let native = Int4MemoryRequirement::for_cohort(&contexts[..active], args.group_width)
+                .map_err(|_| CandidateError::Arguments)?;
+            let native_payload = sum(&[native.kv_bytes, native.rope_bytes,
+                native.scratch_payload_bound, prefill.validate().map_err(|_| CandidateError::Arguments)?])?;
+            let sampler = times(active as u64, SAMPLER_BYTES)?;
+            window.generation.max_native_payload_bytes = native_payload;
+            window.generation.max_sampler_payload_bytes = sampler;
+            let tokens = times(self.cohort_rows as u64, args.max_new_tokens as u64)?;
+            let output_charge = sum(&[times(window.result_bytes, 4)?, times(tokens, 8)?, 4096])?;
+            let resident = sum(&[window.common.load.weight_payload_bytes, ALLOCATOR_BYTES])?;
+            let loading = if window.common.snapshot_pin.is_some() { window.common.snapshot_need.scratch_bytes }
+                else { sum(&[window.common.source_preparation_bytes, window.common.load.scratch_payload_bytes])? };
+            let saving = if args.save_snapshot.is_some() { window.common.snapshot_need.scratch_bytes } else { 0 };
+            let execution = sum(&[native_payload, sampler, window.generation.max_output_payload_bytes,
+                ALLOCATOR_BYTES, output_charge])?;
+            window.common.minimum_memory_bytes = sum(&[window.common.preparation_bytes, resident,
+                loading.max(saving).max(execution), CLEANUP_BYTES])?;
+            if window.common.minimum_memory_bytes > window.common.memory_bytes { return Err(CandidateError::Arguments); }
+        }
         let frame_bytes = window.publication_bytes.checked_add(FRAME_ALLOWANCE).ok_or(CandidateError::Arguments)?;
         Ok(CorpusLimits { window, frame_bytes })
     }
