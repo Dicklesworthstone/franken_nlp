@@ -11,6 +11,7 @@ use crate::native_engine::{
 
 #[cfg(feature = "asupersync-runtime")]
 mod runtime;
+pub(super) mod corpus;
 
 pub(super) const PROTOCOL: &str = "fnlp-source-int4-text-batch-v1";
 
@@ -60,6 +61,11 @@ impl BatchArgs {
         { let _ = (args, limits, input, output); Err(CandidateError::Unavailable) }
     }
     pub(super) fn validate(self, args: &Int4Args) -> Result<BatchLimits, CandidateError> {
+        self.validate_with_preparation(args, 0)
+    }
+    // Corpus windows retain a bounded whole-run ID set and their framing in
+    // the same preparation reservation; they do not enlarge native row counts.
+    fn validate_with_preparation(self, args: &Int4Args, extra_preparation: u64) -> Result<BatchLimits, CandidateError> {
         if self.max_records == 0 || self.max_records > MAX_INT4_SEQUENCES
             || self.max_total_input_bytes == 0 || self.max_total_input_bytes > 64 * MIB {
             return Err(CandidateError::Arguments);
@@ -86,7 +92,7 @@ impl BatchArgs {
             .map_err(|_| CandidateError::Arguments)?;
         let preparation_floor = sum(&[128 * MIB,
             times(times(rows, args.max_input_bytes as u64)?, 32)?,
-            times(sum(&[publication_bytes as u64, 4096])?, 2)?, 65_536])?;
+            times(sum(&[publication_bytes as u64, 4096])?, 2)?, 65_536, extra_preparation])?;
         if common.preparation_bytes < preparation_floor { return Err(CandidateError::Arguments); }
         // Count the actual complete phase occupancies, never sum mutually exclusive
         // load/save/execute scratch and never price a batch as a single sequence.
