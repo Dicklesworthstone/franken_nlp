@@ -112,3 +112,51 @@ fn changed_last_admission_or_duplicate_event_address_is_not_silently_rebound() {
     requests[1].admitted_identity = &other;
     assert!(requirements(&requests, &contexts, limits()).is_err());
 }
+
+fn packed_limits(width: usize) -> Int4PrefillLimits {
+    Int4PrefillLimits { max_batch_rows: width,
+        max_extra_scratch_bytes: Int4PrefillLimits::required_extra_scratch_bytes(width).unwrap() }
+}
+fn packed_raw(plans: &[PreparedInt4Chat], eos: u32, width: usize) -> Int4BatchGenerationOutput {
+    let mut value = raw(plans, eos);
+    let prompts: Vec<_> = plans.iter().map(|p| p.native.prompt_tokens()).collect();
+    let forwards: Vec<_> = value.runs.iter().map(|r| r.model_work.forward_positions).collect();
+    value.execution = INT4_PACKED_COHORT_EXECUTION;
+    value.group_steps = native::packed::expected_group_steps(&prompts, &forwards, width).unwrap();
+    value
+}
+#[test]
+fn packed_finalization_preserves_results_but_independently_replays_the_new_schedule() {
+    let (plans, eos) = fixture(); let requests = requests(&plans);
+    let expected = finish(&requests, raw(&plans, eos), limits().max_result_bytes).unwrap();
+    for width in [1, 4, 16, 64] {
+        let output = finish_with_schedule(&requests, packed_raw(&plans, eos, width), limits().max_result_bytes,
+            Some(packed_limits(width))).unwrap();
+        assert!(output.results == expected.results); assert_eq!(output.model_work, expected.model_work);
+        assert_eq!(output.execution, INT4_PACKED_COHORT_EXECUTION);
+        for axis in 0..3 {
+            let mut altered = packed_raw(&plans, eos, width);
+            match axis { 0 => altered.group_steps += 1, 1 => altered.execution = INT4_BATCH_GENERATION_VERSION,
+                _ => altered.runs[1].sequence.content_bytes = b"wrong content".to_vec() }
+            assert!(finish_with_schedule(&requests, altered, limits().max_result_bytes, Some(packed_limits(width))).is_err());
+        }
+        assert!(finish(&requests, packed_raw(&plans, eos, width), limits().max_result_bytes).is_err());
+    }
+}
+#[test]
+fn packed_task_requirements_add_workspace_without_weakening_row_or_wrapper_limits() {
+    let (plans, _) = fixture(); let requests = requests(&plans);
+    let contexts: Vec<_> = plans.iter().map(|p| p.planned_work().forward_positions as usize).collect();
+    let base = requirements(&requests, &contexts, limits()).unwrap();
+    for width in [1, 4, 64] {
+        let prefill = packed_limits(width); let mut exact = limits();
+        exact.generation.max_native_payload_bytes = base.native_payload_bytes + prefill.validate().unwrap();
+        let need = requirements_packed(&requests, &contexts, exact, prefill).unwrap();
+        assert_eq!(need.planned_work, base.planned_work); assert_eq!(need.native.kv_bytes, base.native.kv_bytes);
+        exact.generation.max_native_payload_bytes -= 1;
+        assert!(requirements_packed(&requests, &contexts, exact, prefill).is_err());
+        assert!(requirements_packed(&requests, &[8192, 8192], limits(), prefill).is_err());
+        let mut short = limits(); short.max_result_bytes -= 1;
+        assert!(requirements_packed(&requests, &contexts, short, prefill).is_err());
+    }
+}

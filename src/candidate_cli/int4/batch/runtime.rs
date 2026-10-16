@@ -16,6 +16,7 @@ pub(super) fn execute(args: Int4Args, batch: BatchArgs, limits: BatchLimits,
     let fresh = batch.validate(&args)?;
     if fresh.common.minimum_memory_bytes != limits.common.minimum_memory_bytes
         || fresh.publication_bytes != limits.publication_bytes
+        || !super::super::prefill::matches(&args, limits.common)?
         || limits.common.kernel.kind() != args.kernel { return Err(CandidateError::Arguments); }
     let limits = fresh;
     let started = Instant::now(); let deadline = Duration::from_secs(args.timeout_seconds);
@@ -50,7 +51,10 @@ pub(super) fn execute(args: Int4Args, batch: BatchArgs, limits: BatchLimits,
     };
     // Native/task bounds are checked on ALL real compiled plans before save
     // or execution. The host independently repeats these checks at reservation.
-    host_limits.requirements(&members).map_err(|_| CandidateError::Planning)?;
+    match limits.common.prefill {
+        None => host_limits.requirements(&members),
+        Some(prefill) => host_limits.requirements_packed(&members, prefill),
+    }.map_err(|_| CandidateError::Planning)?;
     let mut snapshot = limits.common.snapshot_pin.map(|_| Snapshot { operation: "loaded",
         format: INT4_SNAPSHOT_VERSION, file_bytes: limits.common.snapshot_need.file_bytes });
     if let Some(path) = &args.save_snapshot {
@@ -61,8 +65,11 @@ pub(super) fn execute(args: Int4Args, batch: BatchArgs, limits: BatchLimits,
             file_bytes: limits.common.snapshot_need.file_bytes });
     }
     host_limits.run.max_elapsed = remaining()?;
-    let result = engine.execute_int4_chat_batch(&model, members, host_limits, limits.common.kernel, cancellation)
-        .map_err(|_| CandidateError::Execution)?;
+    let result = match limits.common.prefill {
+        None => engine.execute_int4_chat_batch(&model, members, host_limits, limits.common.kernel, cancellation),
+        Some(prefill) => engine.execute_int4_chat_batch_packed(&model, members, host_limits,
+            limits.common.kernel, prefill, cancellation),
+    }.map_err(|_| CandidateError::Execution)?;
     remaining()?;
     // The guard is live while its result is borrowed for serialization. No
     // prefix is emitted if any member fails planning/execution/finalization.

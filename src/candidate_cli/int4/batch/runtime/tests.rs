@@ -102,3 +102,40 @@ fn aggregate_publication_keeps_mapping_and_native_output_and_refuses_partial_ser
     }
     assert!(publish(&response, 4096, &mut FlushFailure).is_err());
 }
+
+#[test]
+fn packed_cli_quote_covers_real_host_admission_and_counts_extra_rails_once() {
+    let (_, _, _, planner) = fixture();
+    for width in [1, 4, 16, 64] {
+        let text = width.to_string();
+        let matches = definition().try_get_matches_from(["text-batch", "--source-dir", "source",
+            "--source-manifest", "manifest", "--memory-mib", "65536", "--preparation-mib", "4096",
+            "--context-tokens", "256", "--max-new-tokens", "4", "--max-output-bytes", "64",
+            "--prefill-rows", &text]).unwrap();
+        let batch = BatchArgs::from_arg_matches(&matches).unwrap();
+        let args = Int4Args::from_arg_matches(&matches).unwrap();
+        let limits = batch.validate(&args).unwrap();
+        let prefill = limits.common.prefill.unwrap();
+        for names in [vec!["a"], vec!["a", "b"], vec!["a", "b", "c", "d", "e", "f", "g", "h"]] {
+            let (members, _) = prepare(records(&names), &planner, &args, limits.common, || Ok(())).unwrap();
+            let host = Int4BatchHostLimits { task: Int4ChatBatchLimits { generation: limits.generation,
+                max_result_bytes: limits.result_bytes }, allocator_reserve_bytes: ALLOCATOR_BYTES,
+                run: stage_run(Duration::from_secs(1), 1_000_000) };
+            let base = host.requirements(&members).unwrap();
+            let packed = host.requirements_packed(&members, prefill).unwrap();
+            let extra = prefill.validate().unwrap();
+            assert_eq!(packed.workspace_bytes, base.workspace_bytes + extra);
+            assert_eq!(packed.generation.native_payload_bytes, base.generation.native_payload_bytes + extra);
+            assert_eq!(packed.generation.native.kv_bytes, base.generation.native.kv_bytes);
+            assert_eq!(packed.generation.planned_work, base.generation.planned_work);
+            assert!(packed.generation.native_payload_bytes <= limits.generation.max_native_payload_bytes);
+            let actual = sum(&[packed.generation.native.kv_bytes, packed.workspace_bytes,
+                limits.result_bytes * 4, packed.max_output_tokens * 8, 4096]).unwrap();
+            let always = limits.common.preparation_bytes + limits.common.load.weight_payload_bytes + ALLOCATOR_BYTES + CLEANUP_BYTES;
+            assert!(always + actual <= limits.common.minimum_memory_bytes);
+            let mut short = host;
+            short.task.generation.max_native_payload_bytes = packed.generation.native_payload_bytes - 1;
+            assert!(short.requirements_packed(&members, prefill).is_err());
+        }
+    }
+}

@@ -33,8 +33,8 @@ pub(super) fn definition() -> clap::Command {
     BatchArgs::augment_args(Int4Args::augment_args(clap::Command::new("text-batch")
         .about("Execute one bounded NDJSON generate/chat cohort on a shared INT4 model")))
         .mut_arg("input", |arg| arg.help("NDJSON file, or '-' for stdin; the complete nonempty cohort is read before model loading"))
-        .mut_arg("prefill_rows", |arg| arg.hide(true).help("Not supported by fixed-cohort INT4 text-batch"))
-        .long_about("Explicit non-certified fixed-cohort INT4 execution. Input is 1..=max-records NDJSON records: {\"id\":\"unique\",\"prompt\":\"...\"} for generate; chat uses a messages array. Optional sample_index is a u64. Shared CLI generation options apply independently to each row; IDs, not row order, address seeded draws. --context-tokens is the allocated per-row capacity and --max-input-bytes includes one line's JSON/newlines. All rows, samplers and retained results are admitted together. --max-checkpoints covers the entire native cohort, never each row. Read, validate and plan the entire input before one shared-model execution; emit one completed JSON batch only after every task finalizes. No provisional token events, successful-prefix result, automatic refill or retry. --prefill-rows is refused: this route advances one prompt/feedback token per unfinished sequence per tick. Sources/snapshot pins and optional save behavior match the single-request source-int4 commands. Blocking IO is cooperative, not preemptible.")
+        .mut_arg("prefill_rows", |arg| arg.help("Explicit packed prompt/decode schedule: at most this many TOTAL tokens per pass, 1..=64; extra workspace is admitted"))
+        .long_about("Explicit non-certified fixed-cohort INT4 execution. Input is 1..=max-records NDJSON records: {\"id\":\"unique\",\"prompt\":\"...\"} for generate; chat uses a messages array. Optional sample_index is a u64. Shared CLI generation options apply independently to each row; IDs, not row order, address seeded draws. --context-tokens is the allocated per-row capacity and --max-input-bytes includes one line's JSON/newlines. All rows, samplers and retained results are admitted together. --max-checkpoints covers the entire native cohort, never each row or pack. By default advance one prompt/feedback token per unfinished sequence per tick. --prefill-rows N instead bounds TOTAL prompt/decode tokens per layer-major pack; it rotates fairly even when N is smaller than the cohort and never batches unsampled feedback. Read, validate and plan the entire input before one shared-model execution; emit one completed JSON batch only after every task finalizes. No provisional token events, successful-prefix result, automatic refill or retry. Sources/snapshot pins and optional save behavior match the single-request source-int4 commands. Blocking IO is cooperative, not preemptible.")
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -61,8 +61,7 @@ impl BatchArgs {
     }
     pub(super) fn validate(self, args: &Int4Args) -> Result<BatchLimits, CandidateError> {
         if self.max_records == 0 || self.max_records > MAX_INT4_SEQUENCES
-            || self.max_total_input_bytes == 0 || self.max_total_input_bytes > 64 * MIB
-            || args.prefill()?.is_some() {
+            || self.max_total_input_bytes == 0 || self.max_total_input_bytes > 64 * MIB {
             return Err(CandidateError::Arguments);
         }
         // Retain source/snapshot exclusivity, real CPU checks and policy bounds.
@@ -71,7 +70,11 @@ impl BatchArgs {
         let contexts = [args.context_tokens; MAX_INT4_SEQUENCES];
         let native = Int4MemoryRequirement::for_cohort(&contexts[..self.max_records], args.group_width)
             .map_err(|_| CandidateError::Arguments)?;
-        let native_payload = sum(&[native.kv_bytes, native.rope_bytes, native.scratch_payload_bound])?;
+        // TOTAL token width is independent of document count. These packed
+        // rails coexist with the ordinary cohort, not one extra copy per row.
+        let extra = common.prefill.map(Int4PrefillLimits::validate).transpose()
+            .map_err(|_| CandidateError::Arguments)?.unwrap_or(0);
+        let native_payload = sum(&[native.kv_bytes, native.rope_bytes, native.scratch_payload_bound, extra])?;
         let sampler = times(rows, SAMPLER_BYTES)?;
         let tokens = times(rows, args.max_new_tokens as u64)?;
         let raw_per_row = sum(&[times(args.max_output_bytes as u64, 3)?,

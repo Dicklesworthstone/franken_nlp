@@ -76,7 +76,9 @@ fn invalid_width_prefill_or_undersized_preparation_refuses_before_reading() {
     let (mut options, mut args) = parsed(&[]);
     for rows in [0, 65, usize::MAX] { options.max_records = rows; assert!(options.validate(&args).is_err()); }
     options.max_records = 64; args.preparation_mib = 128; assert!(options.validate(&args).is_err());
-    let (options, args) = parsed(&["--prefill-rows", "4"]); assert!(options.validate(&args).is_err());
+    for width in ["0", "65"] {
+        let (options, args) = parsed(&["--prefill-rows", width]); assert!(options.validate(&args).is_err());
+    }
     let (options, mut args) = parsed(&[]); args.max_input_bytes = usize::MAX; assert!(options.validate(&args).is_err());
 }
 #[test]
@@ -118,7 +120,42 @@ fn programmatic_task_substitution_and_impossible_cohort_refuse_before_io() {
 #[cfg(not(feature = "asupersync-runtime"))]
 #[test]
 fn missing_runtime_refuses_before_any_input_or_output() {
-    let (batch, args) = parsed(&[]); let mut out = Vec::new();
-    assert_eq!(batch.execute(args, &mut NoRead, &mut out), Err(CandidateError::Unavailable));
-    assert!(out.is_empty());
+    for flags in [vec![], vec!["--prefill-rows", "4"]] {
+        let (batch, args) = parsed(&flags); let mut out = Vec::new();
+        assert_eq!(batch.execute(args, &mut NoRead, &mut out), Err(CandidateError::Unavailable));
+        assert!(out.is_empty());
+    }
+}
+#[test]
+fn packed_width_prices_one_total_token_workspace_without_changing_semantic_options() {
+    for rows in [1, 4, 64] {
+        let row = rows.to_string(); let (base, args) = parsed(&["--max-records", &row]);
+        let ordinary = base.validate(&args).unwrap(); let options = args.options(166_101).unwrap();
+        for width in [1, 4, 16, 64] {
+            let width_text = width.to_string();
+            let (batch, args) = parsed(&["--max-records", &row, "--prefill-rows", &width_text]);
+            let packed = batch.validate(&args).unwrap();
+            let prefill = packed.common.prefill.unwrap();
+            assert_eq!(prefill.max_batch_rows, width);
+            assert_eq!(packed.generation.max_native_payload_bytes,
+                ordinary.generation.max_native_payload_bytes + prefill.validate().unwrap());
+            assert_eq!(packed.generation.max_sampler_payload_bytes, ordinary.generation.max_sampler_payload_bytes);
+            assert_eq!(packed.generation.max_output_payload_bytes, ordinary.generation.max_output_payload_bytes);
+            assert_eq!(packed.generation.native.max_forward_positions, ordinary.generation.native.max_forward_positions);
+            assert_eq!(packed.publication_bytes, ordinary.publication_bytes);
+            assert!(args.options(166_101).unwrap() == options);
+        }
+    }
+}
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn stale_packed_quote_is_rejected_before_input_even_when_load_phase_dominates_memory() {
+    for axis in 0..3 {
+        let (batch, args) = parsed(&["--prefill-rows", "4"]);
+        let mut quote = batch.validate(&args).unwrap();
+        match axis { 0 => quote.common.prefill = None,
+            1 => quote.common.prefill.as_mut().unwrap().max_batch_rows = 1,
+            _ => quote.common.prefill.as_mut().unwrap().max_extra_scratch_bytes -= 1 }
+        assert_eq!(super::runtime::execute(args, batch, quote, &mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+    }
 }

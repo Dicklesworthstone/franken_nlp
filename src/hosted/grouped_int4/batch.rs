@@ -3,7 +3,7 @@
 use super::*;
 use crate::{
     native_engine::{generation::grouped_int4::batch::Int4BatchGenerationRequirements,
-        strict_int4::cohort::{Int4CohortEngine, MAX_INT4_SEQUENCES}},
+        strict_int4::{prefill::Int4PrefillLimits, cohort::{Int4CohortEngine, MAX_INT4_SEQUENCES}}},
     tasks::chat::grouped_int4::batch::{self as task, Int4ChatBatchRequest, Int4ChatBatchLimits, Int4ChatBatchResult},
 };
 
@@ -30,6 +30,14 @@ impl Int4BatchHostLimits {
     /// Pure quotation; no model access or reservations. Model/domain checks
     /// still precede allocation in execute_int4_chat_batch.
     pub fn requirements(self, members: &[Int4ChatBatchMember]) -> Result<Int4BatchHostRequirements, HostedError> {
+        self.requirements_for_schedule(members, None)
+    }
+    pub fn requirements_packed(self, members: &[Int4ChatBatchMember], prefill: Int4PrefillLimits)
+        -> Result<Int4BatchHostRequirements, HostedError> {
+        self.requirements_for_schedule(members, Some(prefill))
+    }
+    fn requirements_for_schedule(self, members: &[Int4ChatBatchMember], prefill: Option<Int4PrefillLimits>)
+        -> Result<Int4BatchHostRequirements, HostedError> {
         self.run.validate()?;
         if self.allocator_reserve_bytes == 0 { return Err(HostedError::Limits("allocator reserve")); }
         let requests = bindings(members)?;
@@ -39,7 +47,10 @@ impl Int4BatchHostLimits {
             contexts[index] = member.context_tokens;
             tokens = sum(&[tokens, u64::from(member.prepared.task_plan().ir().budget().max_output_tokens)])?;
         }
-        let generation = task::requirements(&requests, &contexts[..members.len()], self.task).map_err(chat_error)?;
+        let generation = match prefill {
+            None => task::requirements(&requests, &contexts[..members.len()], self.task),
+            Some(limits) => task::requirements_packed(&requests, &contexts[..members.len()], self.task, limits),
+        }.map_err(chat_error)?;
         let workspace_bytes = workspace_bytes(generation, self.allocator_reserve_bytes)?;
         Ok(Int4BatchHostRequirements { generation, workspace_bytes, max_output_tokens: tokens })
     }
@@ -53,43 +64,59 @@ impl NlpEngine {
     pub fn execute_int4_chat_batch(&self, model: &ResidentInt4, members: Vec<Int4ChatBatchMember>,
         limits: Int4BatchHostLimits, kernel: PackedInt4Kernel, cancellation: CancellationToken)
         -> Result<HostedOutput<Int4ChatBatchResult>, HostedError> {
-        dispatch::preflight(self, limits.run)?;
-        if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
-        let required = limits.requirements(&members)?;
-        for member in &members {
-            let rebound = bind_candidate_model(member.prepared.execution_identity().clone(), model.model_identity())
-                .map_err(|_| HostedError::ModelIdentity)?;
-            if &rebound != member.prepared.execution_identity()
-                || member.prepared.native_plan().group_width() != model.model_identity().group_width() {
-                return Err(HostedError::ModelIdentity);
-            }
-        }
-        let lease = self.resources().acquire_lease();
-        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.generation.native.kv_bytes)?;
-        let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.workspace_bytes)?;
-        let output = output_claim(&lease, limits.task.max_result_bytes, required.max_output_tokens)?;
-        let model = model.clone();
-        dispatch::run(self, limits.run, cancellation, move |control| {
-            checkpoint(control)?;
-            let mut contexts = [0_usize; MAX_INT4_SEQUENCES];
-            for (index, member) in members.iter().enumerate() { contexts[index] = member.context_tokens; }
-            let need = required.generation.native;
-            let mut engine = allocate_native(kv, workspace, || {
-                Int4CohortEngine::new(&model.inner.loaded.value, &contexts[..members.len()], Int4MemoryBudget {
-                    max_kv_bytes: need.kv_bytes, max_rope_bytes: need.rope_bytes,
-                    max_scratch_payload_bytes: need.scratch_payload_bound,
-                }).map(|engine| engine.with_kernel(kernel)).map_err(native_error)
-            })?;
-            let requests = bindings(&members)?;
-            let result = task::execute(&mut engine.value, &requests, limits.task, control).map_err(chat_error)?;
-            // Drop the entire cohort before publishing its aggregate output.
-            // The closure still owns the prepared prompts, model and lease.
-            drop(engine);
-            let committed = output.commit()?;
-            drop(lease);
-            Ok(GuardedOutput::new(result, committed))
-        })
+        execute(self, model, members, limits, kernel, None, cancellation)
     }
+    /// Opt in to total-token prompt packs spanning the fixed cohort. Additional
+    /// workspace is reserved in the SAME process domain and held by the same
+    /// physical invocation; no extra per-pack quota, worker or runtime is created.
+    pub fn execute_int4_chat_batch_packed(&self, model: &ResidentInt4, members: Vec<Int4ChatBatchMember>,
+        limits: Int4BatchHostLimits, kernel: PackedInt4Kernel, prefill: Int4PrefillLimits,
+        cancellation: CancellationToken) -> Result<HostedOutput<Int4ChatBatchResult>, HostedError> {
+        execute(self, model, members, limits, kernel, Some(prefill), cancellation)
+    }
+}
+fn execute(host: &NlpEngine, model: &ResidentInt4, members: Vec<Int4ChatBatchMember>,
+    limits: Int4BatchHostLimits, kernel: PackedInt4Kernel, prefill: Option<Int4PrefillLimits>,
+    cancellation: CancellationToken) -> Result<HostedOutput<Int4ChatBatchResult>, HostedError> {
+    dispatch::preflight(host, limits.run)?;
+    if !Arc::ptr_eq(host.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
+    let required = limits.requirements_for_schedule(&members, prefill)?;
+    for member in &members {
+        let rebound = bind_candidate_model(member.prepared.execution_identity().clone(), model.model_identity())
+            .map_err(|_| HostedError::ModelIdentity)?;
+        if &rebound != member.prepared.execution_identity()
+            || member.prepared.native_plan().group_width() != model.model_identity().group_width() {
+            return Err(HostedError::ModelIdentity);
+        }
+    }
+    let lease = host.resources().acquire_lease();
+    let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.generation.native.kv_bytes)?;
+    let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.workspace_bytes)?;
+    let output = output_claim(&lease, limits.task.max_result_bytes, required.max_output_tokens)?;
+    let model = model.clone();
+    dispatch::run(host, limits.run, cancellation, move |control| {
+        checkpoint(control)?;
+        let mut contexts = [0_usize; MAX_INT4_SEQUENCES];
+        for (index, member) in members.iter().enumerate() { contexts[index] = member.context_tokens; }
+        let need = required.generation.native;
+        let mut engine = allocate_native(kv, workspace, || {
+            Int4CohortEngine::new(&model.inner.loaded.value, &contexts[..members.len()], Int4MemoryBudget {
+                max_kv_bytes: need.kv_bytes, max_rope_bytes: need.rope_bytes,
+                max_scratch_payload_bytes: need.scratch_payload_bound,
+            }).map(|engine| engine.with_kernel(kernel)).map_err(native_error)
+        })?;
+        let requests = bindings(&members)?;
+        let result = match prefill {
+            None => task::execute(&mut engine.value, &requests, limits.task, control),
+            Some(prefill) => task::execute_packed(&mut engine.value, &requests, limits.task, prefill, control),
+        }.map_err(chat_error)?;
+        // Packed local rails have drained too. No guard is released merely
+        // because an async wrapper stopped waiting for its physical closure.
+        drop(engine);
+        let committed = output.commit()?;
+        drop(lease);
+        Ok(GuardedOutput::new(result, committed))
+    })
 }
 
 fn bindings(members: &[Int4ChatBatchMember]) -> Result<Vec<Int4ChatBatchRequest<'_>>, HostedError> {
@@ -110,6 +137,7 @@ fn bindings(members: &[Int4ChatBatchMember]) -> Result<Vec<Int4ChatBatchRequest<
 fn workspace_bytes(need: Int4BatchGenerationRequirements, allocator: u64) -> Result<u64, HostedError> {
     // Raw generation payload can coexist with finalized chat results; it has
     // its own charge, in addition to output_claim's serialization allowance.
+    // Packed requirements already contain their extra rails exactly once.
     sum(&[need.native.rope_bytes, need.native.scratch_payload_bound,
         need.sampler_payload_bytes, need.output_payload_upper_bytes, allocator])
 }
