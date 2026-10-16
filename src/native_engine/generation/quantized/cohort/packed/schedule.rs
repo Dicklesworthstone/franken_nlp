@@ -1,11 +1,12 @@
 //! Finite round-robin token allocation and receipt replay. No token contents,
 //! request IDs, random draws, worker numbers or elapsed time enter this policy.
+//! Shared by INT8 and INT4 packed generation; no kernel/profile state is read.
 use super::*;
 
 /// At most width grants, each to the next non-exhausted document. A decode row
 /// advertises exactly ONE available token; prompt rows can advertise a morsel.
 /// Returns per-document counts and the next fairness cursor, without mutation.
-pub(super) fn allocate(available: &[usize], next: usize, width: usize)
+pub(crate) fn allocate(available: &[usize], next: usize, width: usize)
     -> Result<([usize; MAX_BATCH_ROWS], usize), Int8GenerationError> {
     if available.is_empty() || available.len() > MAX_BATCH_ROWS || next >= available.len()
         || width == 0 || width > MAX_BATCH_ROWS || available.iter().all(|&n| n == 0) {

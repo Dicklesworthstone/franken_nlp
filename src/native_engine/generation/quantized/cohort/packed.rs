@@ -5,7 +5,7 @@
 use super::*;
 use crate::native_engine::strict_int8::{prefill::Int8PrefillLimits,
     cohort::packed::{CohortTokenRun, INT8_PACKED_COHORT_EXECUTION}};
-mod schedule;
+pub(crate) mod schedule;
 pub(crate) use schedule::expected_group_steps;
 
 pub fn execute<D: DecodeByteDecoder, C: DecodeStepControl>(engine: &mut Int8CohortEngine<'_>,

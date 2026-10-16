@@ -6,6 +6,7 @@ use crate::native_engine::strict_int4::{
     Int4MemoryRequirement,
     cohort::{Int4CohortEngine, Int4CohortSession, Int4CohortToken, MAX_INT4_SEQUENCES},
 };
+pub mod packed;
 
 pub const INT4_BATCH_GENERATION_VERSION: &str = "grouped-int4-ragged-generation-v1";
 
