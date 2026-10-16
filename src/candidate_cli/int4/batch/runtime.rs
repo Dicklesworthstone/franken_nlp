@@ -42,7 +42,7 @@ pub(super) fn execute(args: Int4Args, batch: BatchArgs, limits: BatchLimits,
     let model = load(&engine, &args, limits.common, remaining()?, cancellation.clone())?;
     remaining()?;
     let planner = planner(&model, &args, limits.common)?;
-    let (members, items) = prepare(records, &planner, &args, limits.common, || remaining().map(|_| ()))?;
+    let (members, items) = prepare(records, &planner, &args, limits.common, 1, || remaining().map(|_| ()))?;
     let identity = members.first().ok_or(CandidateError::Input)?.prepared.execution_identity().clone();
     let mut host_limits = Int4BatchHostLimits {
         task: Int4ChatBatchLimits { generation: limits.generation, max_result_bytes: limits.result_bytes },
@@ -85,10 +85,10 @@ pub(super) fn execute(args: Int4Args, batch: BatchArgs, limits: BatchLimits,
     publish(&response, limits.publication_bytes, output)
 }
 
-fn stage_run(remaining: Duration, checkpoints: u64) -> RunLimits {
+pub(super) fn stage_run(remaining: Duration, checkpoints: u64) -> RunLimits {
     RunLimits { max_elapsed: remaining, max_checkpoints: checkpoints, cleanup_reserve_bytes: CLEANUP_BYTES }
 }
-fn load(engine: &NlpEngine, args: &Int4Args, limits: Int4Limits, remaining: Duration,
+pub(super) fn load(engine: &NlpEngine, args: &Int4Args, limits: Int4Limits, remaining: Duration,
     cancellation: CancellationToken) -> Result<ResidentInt4, CandidateError> {
     match (&args.snapshot, limits.snapshot_pin) {
         (Some(path), Some(pin)) => engine.load_int4_snapshot(path.clone(), pin, limits.snapshot_budget(true)?,
@@ -115,23 +115,26 @@ fn chat_limits(args: &Int4Args, limits: Int4Limits) -> ChatLimits {
     ChatLimits { max_messages: 128, max_message_bytes: args.max_input_bytes,
         max_total_message_bytes: args.max_input_bytes, generation: args.generation_limits(limits) }
 }
-fn planner(model: &ResidentInt4, args: &Int4Args, limits: Int4Limits) -> Result<Int4ChatPlanner, CandidateError> {
+pub(super) fn planner(model: &ResidentInt4, args: &Int4Args, limits: Int4Limits) -> Result<Int4ChatPlanner, CandidateError> {
     Int4ChatPlanner::for_model(model.model_identity(), task_budget(args, limits)?, chat_limits(args, limits))
         .map_err(|_| CandidateError::Planning)
 }
 #[derive(Serialize)]
-struct Item { id: String, sample_index: u64, request_seq: u64 }
-fn prepare(records: Vec<Record>, planner: &Int4ChatPlanner, args: &Int4Args, limits: Int4Limits,
-    mut checkpoint: impl FnMut() -> Result<(), CandidateError>)
+pub(super) struct Item { pub(super) id: String, pub(super) sample_index: u64, pub(super) request_seq: u64 }
+/// Delivery positions may start after previous corpus windows. They never enter
+/// the model-bound item/sample key. Check the complete range before planning.
+pub(super) fn prepare(records: Vec<Record>, planner: &Int4ChatPlanner, args: &Int4Args, limits: Int4Limits,
+    first_sequence: u64, mut checkpoint: impl FnMut() -> Result<(), CandidateError>)
     -> Result<(Vec<Int4ChatBatchMember>, Vec<Item>), CandidateError> {
-    if records.is_empty() || records.len() > MAX_INT4_SEQUENCES { return Err(CandidateError::Input); }
+    if records.is_empty() || records.len() > MAX_INT4_SEQUENCES || first_sequence == 0
+        || first_sequence.checked_add(records.len() as u64 - 1).is_none() { return Err(CandidateError::Input); }
     let mut members = Vec::new(); let mut items = Vec::new();
     members.try_reserve_exact(records.len()).map_err(|_| CandidateError::Memory)?;
     items.try_reserve_exact(records.len()).map_err(|_| CandidateError::Memory)?;
     let options = args.options(planner.eos_token_id())?; let budget = task_budget(args, limits)?;
     for (index, record) in records.into_iter().enumerate() {
         checkpoint()?;
-        let request_seq = index as u64 + 1;
+        let request_seq = first_sequence.checked_add(index as u64).ok_or(CandidateError::Input)?;
         let prepared = match record.content {
             wire::Content::Generate(prompt) => planner.plan_generate(&GenerateRequest {
                 item_id: record.id.clone(), sample_index: record.sample_index, prompt, generation: options.clone(), budget }),
@@ -144,16 +147,20 @@ fn prepare(records: Vec<Record>, planner: &Int4ChatPlanner, args: &Int4Args, lim
     checkpoint()?;
     Ok((members, items))
 }
+#[derive(Clone, Copy, Serialize)]
+pub(super) struct Snapshot {
+    pub(super) operation: &'static str, pub(super) format: &'static str, pub(super) file_bytes: u64,
+}
 #[derive(Serialize)]
-struct Snapshot { operation: &'static str, format: &'static str, file_bytes: u64 }
-#[derive(Serialize)]
-struct Response<'a, T: Serialize> {
-    schema_version: u32, protocol: &'static str, scope: &'static str, evidence: &'static str,
-    model_id: &'static str, source_revision: &'a str, source_root_sha256: &'a str,
-    model_content_sha256: &'a str, candidate_format: &'a str, quant_recipe: &'a str,
-    group_width: usize, integer_kernel: &'static str, items: &'a [Item], output: &'a T,
+pub(super) struct Response<'a, T: Serialize> {
+    pub(super) schema_version: u32, pub(super) protocol: &'static str,
+    pub(super) scope: &'static str, pub(super) evidence: &'static str,
+    pub(super) model_id: &'static str, pub(super) source_revision: &'a str, pub(super) source_root_sha256: &'a str,
+    pub(super) model_content_sha256: &'a str, pub(super) candidate_format: &'a str, pub(super) quant_recipe: &'a str,
+    pub(super) group_width: usize, pub(super) integer_kernel: &'static str,
+    pub(super) items: &'a [Item], pub(super) output: &'a T,
     #[serde(skip_serializing_if = "Option::is_none")]
-    snapshot: Option<Snapshot>,
+    pub(super) snapshot: Option<Snapshot>,
 }
 
 #[cfg(test)] mod tests;

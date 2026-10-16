@@ -96,26 +96,42 @@ struct Int4Args {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Int4Task { Text(Task), Classify(classify::ScoringArgs) }
-pub(super) struct Int4Command { task: Int4Task, args: Int4Args, batch: Option<batch::BatchArgs> }
+#[derive(Clone, Copy)]
+enum Int4BatchCommand { Fixed(batch::BatchArgs), Corpus(batch::corpus::CorpusArgs) }
+impl Int4BatchCommand {
+    fn task(self) -> Task {
+        match self { Self::Fixed(args) => args.task(), Self::Corpus(args) => args.task() }
+    }
+    fn execute(self, args: Int4Args, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
+        match self { Self::Fixed(batch) => batch.execute(args, input, output),
+            Self::Corpus(corpus) => corpus.execute(args, input, output) }
+    }
+}
+pub(super) struct Int4Command { task: Int4Task, args: Int4Args, batch: Option<Int4BatchCommand> }
 
 pub(super) fn definition() -> clap::Command {
     let task = |name: &'static str, about: &'static str| Int4Args::augment_args(clap::Command::new(name).about(about))
         .mut_arg("prefill_rows", |arg| arg.help("Explicit grouped-INT4 layer-major prompt execution, 1..=64 rows; extra workspace is process-admitted"));
     clap::Command::new("source-int4")
         .about("Run candidate INT4 tasks from pinned sources or a digest-pinned local snapshot")
-        .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Sequential native execution defaults to scalar; --kernel explicitly selects an existing hardware-checked integer leaf. Text tasks can opt in to bounded layer-major prompt execution with --prefill-rows; classification cannot. text-batch instead runs one finite NDJSON cohort through shared-model generation and emits one completed aggregate JSON object. No automatic selection, fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Emits completed JSON, not provisional token events.")
+        .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Sequential native execution defaults to scalar; --kernel explicitly selects an existing hardware-checked integer leaf. Text tasks can opt in to bounded layer-major prompt execution with --prefill-rows; classification cannot. text-batch runs one finite NDJSON cohort and emits one completed aggregate JSON object. text-corpus processes bounded windows with one resident model and cumulative budgets, emitting completed-window NDJSON with a required corpus_complete footer. No automatic selection, fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Outputs are completed results, not provisional token events.")
         .subcommand_required(true)
         .subcommand(task("generate", "Generate from a bounded UTF-8 prompt using the pinned template"))
         .subcommand(task("chat", "Complete a bounded JSON system/user/assistant transcript"))
         .subcommand(classify::definition())
         .subcommand(batch::definition())
+        .subcommand(batch::corpus::definition())
 }
 impl Int4Command {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let (name, matches) = matches.subcommand().ok_or_else(||
             clap::Error::raw(clap::error::ErrorKind::MissingSubcommand, "source-int4 task required"))?;
-        if name == "text-batch" {
-            let batch = batch::BatchArgs::from_arg_matches(matches)?;
+        let batch = match name {
+            "text-batch" => Some(Int4BatchCommand::Fixed(batch::BatchArgs::from_arg_matches(matches)?)),
+            "text-corpus" => Some(Int4BatchCommand::Corpus(batch::corpus::CorpusArgs::from_arg_matches(matches)?)),
+            _ => None,
+        };
+        if let Some(batch) = batch {
             return Ok(Self { task: Int4Task::Text(batch.task()), args: Int4Args::from_arg_matches(matches)?, batch: Some(batch) });
         }
         let task = match name {

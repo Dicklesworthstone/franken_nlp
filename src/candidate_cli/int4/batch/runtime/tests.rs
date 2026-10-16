@@ -40,8 +40,8 @@ fn records(order: &[&str]) -> Vec<Record> {
 #[test]
 fn record_identity_and_shared_policy_survive_real_pinned_batch_planning() {
     let (_, mut args, limits, planner) = fixture(); args.seed = Some("ab".repeat(32));
-    let (a, ids) = prepare(records(&["first", "second"]), &planner, &args, limits.common, || Ok(())).unwrap();
-    let (b, reversed) = prepare(records(&["second", "first"]), &planner, &args, limits.common, || Ok(())).unwrap();
+    let (a, ids) = prepare(records(&["first", "second"]), &planner, &args, limits.common, 1, || Ok(())).unwrap();
+    let (b, reversed) = prepare(records(&["second", "first"]), &planner, &args, limits.common, 1, || Ok(())).unwrap();
     assert_eq!(ids[0].id, "first"); assert_eq!(ids[0].sample_index, 17); assert_eq!(ids[0].request_seq, 1);
     assert_eq!(reversed[1].id, "first"); assert_eq!(reversed[1].request_seq, 2);
     assert_eq!(a[0].prepared.execution_identity(), b[1].prepared.execution_identity());
@@ -52,7 +52,7 @@ fn record_identity_and_shared_policy_survive_real_pinned_batch_planning() {
 #[test]
 fn declared_cli_budget_covers_real_host_quote_without_borrowing_per_member_capacity() {
     let (_, args, limits, planner) = fixture();
-    let (members, _) = prepare(records(&["a", "b"]), &planner, &args, limits.common, || Ok(())).unwrap();
+    let (members, _) = prepare(records(&["a", "b"]), &planner, &args, limits.common, 1, || Ok(())).unwrap();
     let host = Int4BatchHostLimits { task: Int4ChatBatchLimits { generation: limits.generation,
         max_result_bytes: limits.result_bytes }, allocator_reserve_bytes: ALLOCATOR_BYTES,
         run: stage_run(Duration::from_secs(1), 1_000_000) };
@@ -75,9 +75,9 @@ fn a_late_planning_or_deadline_failure_cannot_return_a_prepared_prefix() {
     let (_, args, limits, planner) = fixture();
     let mut input = records(&["a", "b"]);
     input[1].content = wire::Content::Generate("hello ".repeat(400));
-    assert!(matches!(prepare(input, &planner, &args, limits.common, || Ok(())), Err(CandidateError::Planning)));
+    assert!(matches!(prepare(input, &planner, &args, limits.common, 1, || Ok(())), Err(CandidateError::Planning)));
     let mut calls = 0;
-    assert!(matches!(prepare(records(&["a", "b"]), &planner, &args, limits.common, || {
+    assert!(matches!(prepare(records(&["a", "b"]), &planner, &args, limits.common, 1, || {
         calls += 1; if calls == 2 { Err(CandidateError::Timeout) } else { Ok(()) }
     }), Err(CandidateError::Timeout)));
 }
@@ -117,7 +117,7 @@ fn packed_cli_quote_covers_real_host_admission_and_counts_extra_rails_once() {
         let limits = batch.validate(&args).unwrap();
         let prefill = limits.common.prefill.unwrap();
         for names in [vec!["a"], vec!["a", "b"], vec!["a", "b", "c", "d", "e", "f", "g", "h"]] {
-            let (members, _) = prepare(records(&names), &planner, &args, limits.common, || Ok(())).unwrap();
+            let (members, _) = prepare(records(&names), &planner, &args, limits.common, 1, || Ok(())).unwrap();
             let host = Int4BatchHostLimits { task: Int4ChatBatchLimits { generation: limits.generation,
                 max_result_bytes: limits.result_bytes }, allocator_reserve_bytes: ALLOCATOR_BYTES,
                 run: stage_run(Duration::from_secs(1), 1_000_000) };

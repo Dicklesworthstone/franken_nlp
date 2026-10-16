@@ -3,6 +3,9 @@
 use super::*;
 use std::collections::BTreeSet;
 use crate::native_engine::portable_int8::ProjectionWork;
+mod stream;
+#[cfg(feature = "asupersync-runtime")]
+mod runtime;
 
 pub(in crate::candidate_cli::int4) const CORPUS_PROTOCOL: &str = "fnlp-source-int4-text-corpus-v1";
 const MAX_CORPUS_RECORDS: u64 = 1_000_000;
@@ -41,9 +44,27 @@ pub(in crate::candidate_cli::int4) struct CorpusArgs {
     max_total_execution_checkpoints: u64,
 }
 
+pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
+    CorpusArgs::augment_args(Int4Args::augment_args(clap::Command::new("text-corpus")
+        .about("Process bounded NDJSON windows with one resident INT4 model and cumulative budgets")))
+        .mut_arg("input", |arg| arg.help("NDJSON file or '-' for stdin; read only one bounded cohort at a time"))
+        .mut_arg("max_checkpoints", |arg| arg.help("Native checkpoint allowance per window; charged in full to max-total-execution-checkpoints before execution"))
+        .mut_arg("prefill_rows", |arg| arg.help("Optional maximum TOTAL prompt/decode token rows per packed pass; 1..=64, independently admitted"))
+        .long_about("Non-certified source/snapshot INT4 corpus execution. Generate records have unique id, prompt and optional sample_index; chat uses messages. One model is loaded lazily and reused across bounded --cohort-rows windows. --max-records bounds the entire invocation and its seen-ID set; IDs never reset across windows. The current window must parse, plan and pass cumulative work/output admission before saving or inference. Each window uses the existing ordinary or --prefill-rows packed batch host and all independent task finalizers. Emit canonical window_complete NDJSON only after a whole window succeeds; require the final corpus_complete frame AND process exit 0 for whole-corpus success. Later failures leave earlier completed windows but never emit a success footer or retry. Global input/output, forward/head/attention/group-dot/MAC and reserved checkpoint ceilings never renew per window. Empty input completes without loading or saving a model. Source/snapshot exclusivity and independent pins are unchanged. No dynamic slot refill, per-record policy overrides, durable resume, inference network or tools. Blocking IO is cooperative, not preemptible.")
+}
+
 #[derive(Clone, Copy, Debug)]
 struct CorpusLimits { window: BatchLimits, frame_bytes: usize }
 impl CorpusArgs {
+    pub(in crate::candidate_cli::int4) fn task(self) -> Task { self.window_args().task() }
+    pub(in crate::candidate_cli::int4) fn execute(self, args: Int4Args,
+        input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
+        let limits = self.validate(&args)?;
+        #[cfg(feature = "asupersync-runtime")]
+        { runtime::execute(args, self, limits, input, output).map_err(|_| CandidateError::Batch) }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        { let _ = (args, limits, input, output); Err(CandidateError::Unavailable) }
+    }
     fn check(self) -> Result<(), CandidateError> {
         if self.cohort_rows == 0 || self.cohort_rows > MAX_INT4_SEQUENCES
             || self.max_records == 0 || self.max_records > MAX_CORPUS_RECORDS
