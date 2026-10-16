@@ -161,3 +161,5 @@ pub(crate) fn expected_group_steps(prompts: &[usize], forwards: &[u64], width: u
     schedule::expected_group_steps(prompts, forwards, width).map_err(|_| Int4GenerationError::WorkMismatch)
 }
 #[cfg(test)] mod tests;
+pub mod refill;
+
