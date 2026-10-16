@@ -99,3 +99,5 @@ fn check_runs(runs: &[Int4TokenRun<'_>], sequences: usize, limits: Int4PrefillLi
 }
 
 #[cfg(test)] mod tests;
+pub mod refill;
+
