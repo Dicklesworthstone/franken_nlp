@@ -175,7 +175,7 @@ fn content_digest(model: &Int4ModelIdentity) -> Result<Sha256Digest, Int4Generat
     }
     Sha256Digest::from_hex(&hex).map_err(|_| Int4GenerationError::ModelIdentity)
 }
-fn check_contract(identity: &ExecutionIdentity, width: usize) -> Result<(), Int4GenerationError> {
+pub(crate) fn check_contract(identity: &ExecutionIdentity, width: usize) -> Result<(), Int4GenerationError> {
     check_opt_in(identity)?;
     if width == 0 || width > MAX_MODEL_K || identity.source_revision != PINNED_REVISION
         || identity.artifact_format != INT4_SOURCE_FORMAT || identity.quant_recipe != recipe(width)
@@ -184,7 +184,7 @@ fn check_contract(identity: &ExecutionIdentity, width: usize) -> Result<(), Int4
     }
     Ok(())
 }
-fn check_model(identity: &ExecutionIdentity, width: usize, model: &Int4ModelIdentity) -> Result<(), Int4GenerationError> {
+pub(crate) fn check_model(identity: &ExecutionIdentity, width: usize, model: &Int4ModelIdentity) -> Result<(), Int4GenerationError> {
     check_model_facts(identity, width, model.group_width(), model.profile(), content_digest(model)?)
 }
 fn check_model_facts(identity: &ExecutionIdentity, width: usize, actual_width: usize,

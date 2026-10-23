@@ -1,0 +1,157 @@
+//! Schema/source extraction bound to the actual grouped-INT4 model.
+//!
+//! The existing extraction compiler and independent validator remain the
+//! authority for JSON, exact decimals and source coordinates. This adapter
+//! seals the distinct native profile and complete group-aware work; it never
+//! converts an INT8/BF16 executable or accepts a caller-supplied native result.
+
+use super::*;
+use crate::native_engine::{
+    constrained_int4::{self, INT4_JSON_EXECUTION, Int4JsonBudget, Int4JsonError, Int4JsonRun},
+    strict_int4::{Int4Work, StrictInt4Engine, STRICT_INT4_PROFILE},
+};
+
+pub const INT4_EXTRACT_VERSION: &str = "grouped-int4-schema-source-extraction-v1";
+
+#[derive(Debug)]
+pub enum Int4ExtractError { Extraction(ExtractError), Native(Int4JsonError), Identity }
+impl fmt::Display for Int4ExtractError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Extraction(e) => write!(f, "INT4 extraction refused: {e}"),
+            Self::Native(e) => write!(f, "INT4 extraction execution refused: {e}"),
+            Self::Identity => f.write_str("INT4 extraction model, partition or admitted identity differs"),
+        }
+    }
+}
+impl Error for Int4ExtractError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self { Self::Extraction(e) => Some(e), Self::Native(e) => Some(e), Self::Identity => None }
+    }
+}
+impl From<ExtractError> for Int4ExtractError { fn from(e: ExtractError) -> Self { Self::Extraction(e) } }
+impl From<Int4JsonError> for Int4ExtractError { fn from(e: Int4JsonError) -> Self { Self::Native(e) } }
+impl Int4ExtractError {
+    pub fn cancellation(&self) -> Option<crate::native_engine::decode::DecodeCancellationKind> {
+        match self {
+            Self::Native(e) => e.cancellation(),
+            Self::Extraction(ExtractError::Decode(JsonDecodeError::Cancelled(cause))) => Some(*cause),
+            _ => None,
+        }
+    }
+}
+
+/// A completed independently checked result; source membership is a byte/span
+/// guarantee, not extraction accuracy. Private prompt/source digests remain
+/// in the sealed plan and are never exported as public content fingerprints.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Int4ExtractRun {
+    pub schema_version: u32,
+    pub execution: String,
+    pub group_width: usize,
+    pub result: ExtractResult,
+    pub model_work: Int4Work,
+}
+
+/// Private immutable tokens, schema, source automaton and complete identity.
+/// No wire constructor, Debug, Deref or coercion into another native profile.
+pub struct Int4ExtractPlan {
+    extraction: ExtractPlan,
+    identity: ExecutionIdentity,
+    group_width: usize,
+    work: Int4Work,
+}
+impl Int4ExtractPlan {
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_task_plan(task: &TaskPlan, schema: &str, options: JsonDecodeOptions,
+        limits: CompileLimits, controls: &TemplateControlIds, identity: ExecutionIdentity,
+        group_width: usize) -> Result<Self, Int4ExtractError> {
+        Self::compile(task, schema, options, limits, controls, None, identity, group_width)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_task_plan_with_source(task: &TaskPlan, schema: &str, options: JsonDecodeOptions,
+        limits: CompileLimits, controls: &TemplateControlIds, source: &SourceDocument,
+        source_limits: SourceRuntimeLimits, identity: ExecutionIdentity, group_width: usize)
+        -> Result<Self, Int4ExtractError> {
+        Self::compile(task, schema, options, limits, controls, Some((source, source_limits)), identity, group_width)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compile(task: &TaskPlan, schema: &str, options: JsonDecodeOptions, limits: CompileLimits,
+        controls: &TemplateControlIds, source: Option<(&SourceDocument, SourceRuntimeLimits)>,
+        mut identity: ExecutionIdentity, group_width: usize) -> Result<Self, Int4ExtractError> {
+        // Refuse profile, candidate namespace and group mismatch BEFORE any
+        // source copies or grammar construction. Model identity is rechecked
+        // against actual resident weights by the native execution boundary.
+        constrained_int4::check_profile(&identity, group_width)?;
+        if identity.task_spec != "extract-v1" { return Err(Int4ExtractError::Identity); }
+        let extraction = ExtractPlan::from_builtin(task, schema, options, limits, controls, source, "extract-v1")?;
+        let work = constrained_int4::planned_work(group_width, extraction.prompt.len(), extraction.options.max_new_tokens)?;
+        identity.taskir_digest = extraction.taskir_digest;
+        identity.prompt_digest = extraction.prompt_digest;
+        identity.schema_digest = extraction.schema_digest;
+        identity.grammar_compiler_version = extraction.program.version().to_owned();
+        identity.sampler_version = EXTRACT_SAMPLER_VERSION.to_owned();
+        identity.tokenizer_digest = Sha256Digest::of_bytes(PINNED_TOKENIZER_MODEL_BYTES);
+        identity.decision_policy_digest = Sha256Digest::of_bytes(&canonjson::canonical_bytes(&(
+            INT4_EXTRACT_VERSION, INT4_JSON_EXECUTION, group_width, extraction.policy_digest,
+        )).map_err(|_| ExtractError::Serialization)?);
+        identity.validate().map_err(|_| Int4ExtractError::Identity)?;
+        Ok(Self { extraction, identity, group_width, work })
+    }
+
+    pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
+    pub fn prompt_tokens(&self) -> usize { self.extraction.prompt.len() }
+    pub fn options(&self) -> &JsonDecodeOptions { &self.extraction.options }
+    pub fn group_width(&self) -> usize { self.group_width }
+    pub fn planned_work(&self) -> Int4Work { self.work }
+    pub fn max_result_bytes(&self) -> u64 { self.extraction.max_result_bytes }
+    pub fn max_kv_bytes(&self) -> u64 { self.extraction.max_kv_bytes }
+
+    /// All artifact, layout, task, policy and calibration fields are checked.
+    /// Execution never repairs a caller's partially matching admission key.
+    pub fn verify_identity(&self, admitted: &ExecutionIdentity) -> Result<(), Int4ExtractError> {
+        constrained_int4::check_profile(admitted, self.group_width)?;
+        let actual = canonjson::canonical_bytes(admitted).map_err(|_| Int4ExtractError::Identity)?;
+        let expected = canonjson::canonical_bytes(&self.identity).map_err(|_| Int4ExtractError::Identity)?;
+        if actual != expected { return Err(Int4ExtractError::Identity); }
+        Ok(())
+    }
+
+    pub fn execute<C: DecodeStepControl>(&self, engine: &mut StrictInt4Engine<'_>,
+        admitted: &ExecutionIdentity, vocabulary: &ExtractionVocabulary, mut budget: Int4JsonBudget,
+        control: &mut C) -> Result<Int4ExtractRun, Int4ExtractError> {
+        self.verify_identity(admitted)?;
+        if vocabulary.controls != self.extraction.controls {
+            return Err(ExtractError::Contract("vocabulary control registry differs from INT4 plan").into());
+        }
+        budget.json.max_kv_bytes = budget.json.max_kv_bytes.min(self.extraction.max_kv_bytes);
+        // The native session owns cleanup and remains live throughout source
+        // validation, complete-result accounting and the final checkpoint.
+        constrained_int4::decode_json_int4_with(engine, admitted, &self.extraction.prompt,
+            &self.extraction.program, &vocabulary.oracle, &self.extraction.options, budget,
+            control, |run| self.finalize(run))
+    }
+
+    fn finalize(&self, run: Int4JsonRun) -> Result<Int4ExtractRun, Int4ExtractError> {
+        if run.schema_version != 1 || run.execution != INT4_JSON_EXECUTION || run.group_width != self.group_width {
+            return Err(ExtractError::InvalidResult.into());
+        }
+        let expected = constrained_int4::planned_work(self.group_width, self.prompt_tokens(), run.output.token_ids.len())?;
+        if run.model_work != expected || run.output.forward_positions != expected.forward_positions
+            || run.output.projected_logits != expected.projected_logits {
+            return Err(Int4JsonError::WorkMismatch.into());
+        }
+        let result = self.extraction.finalize_profile(run.output, STRICT_INT4_PROFILE)?;
+        let output = Int4ExtractRun { schema_version: 1, execution: INT4_EXTRACT_VERSION.to_owned(),
+            group_width: self.group_width, result, model_work: run.model_work };
+        // This existing bounded serializer accepts only trusted typed values;
+        // it counts the OUTER envelope before allocating canonical JSON.
+        super::quantized::check_size(&output, self.max_result_bytes())?;
+        Ok(output)
+    }
+}
+
+#[cfg(test)] mod tests;

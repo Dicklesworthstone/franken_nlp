@@ -18,6 +18,7 @@ use crate::{
 use super::*;
 /// Shared embedding admission and result-ownership surfaces for both families.
 pub use super::judge::{JudgeBatchAdmission as ExtractionBatchAdmission, GuardedOutput};
+pub mod grouped_int4;
 pub mod quantized;
 
 pub const EXTRACTION_BATCH_PROMPT: &str = "extract-segmented-schema-and-source-v1";
@@ -94,7 +95,7 @@ impl ExtractionBatchPlanner {
         defaults: Option<ExtractionBatchArgs>) -> Result<Self, BatchFault> {
         Self::pinned_for_backend(controls, eos, identity, ceiling, compiler_limits, source_limits, defaults, ExtractionBackend::Eager)
     }
-    // The two public planner types choose the native contract before any
+    // Public planner types choose the native contract before any
     // tokenization. No temporary BF16 identity or executable-plan conversion.
     #[allow(clippy::too_many_arguments)]
     fn pinned_for_backend(controls: &TemplateControlIds, eos: u32, mut identity: ExecutionIdentity,
@@ -108,6 +109,10 @@ impl ExtractionBatchPlanner {
             ExtractionBackend::Int8 => {
                 crate::native_engine::constrained_int8::check_profile(&identity).map_err(|_| BatchCode::Admission)?;
                 NumericsProfile::StrictQuantized { version: 1 }
+            }
+            ExtractionBackend::Int4 { group_width } => {
+                crate::native_engine::constrained_int4::check_profile(&identity, group_width).map_err(|_| BatchCode::Admission)?;
+                NumericsProfile::StrictQuantized { version: 2 }
             }
         };
         ceiling.validate().map_err(|_| BatchCode::InvalidLimits)?;
@@ -212,7 +217,7 @@ impl ExtractionBatchPlanner {
 }
 
 #[derive(Clone, Copy)]
-enum ExtractionBackend { Eager, Int8 }
+enum ExtractionBackend { Eager, Int8, Int4 { group_width: usize } }
 struct ExtractionInput {
     task: TaskPlan, source: SourceDocument, schema: String, options: JsonDecodeOptions,
     grounded: bool, prompt_tokens: u64,

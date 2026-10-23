@@ -31,6 +31,7 @@ use crate::{
 use super::ir::{DecodeStrategy, DependencyScope, FinitePostcondition, GrammarReference, PromptSegmentKind, ScoreSpace, TaskIR, TaskPlan};
 
 pub mod grounded;
+pub mod grouped_int4;
 pub mod quantized;
 pub mod semantic;
 pub use grounded::{SourceDocument, SourceDocumentEncoder};
