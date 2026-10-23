@@ -3,17 +3,17 @@
 use super::*;
 use crate::{
     batch::{BatchLimits as TransportLimits, BatchWork,
-        extract::{ExtractionBatchArgs, ExtractionBatchGrounding, ExtractionMaskBudget,
+        extract::{ExtractionBatchArgs, ExtractionMaskBudget,
             grouped_int4::Int4ExtractionBatchLimits}},
     candidate_cli::batch::{FRAME_ALLOWANCE, IO_BUFFER_BYTES},
-    grammar::runtime::JsonProgram,
     native_engine::{constrained_int4, strict_int4::Int4Work},
     tasks::ir::TaskBudget,
-    validation::{JsonLimits, JsonValue, parse_json_with_limits},
 };
 
 #[cfg(feature = "asupersync-runtime")]
 mod runtime;
+#[cfg(test)]
+use crate::batch::extract::ExtractionBatchGrounding;
 #[cfg(test)]
 mod tests;
 
@@ -126,20 +126,7 @@ impl BatchArgs {
     /// EACH real document later; an invented preflight source proves nothing.
     pub(super) fn load_defaults(&self, schema: String, ceiling: TaskBudget)
         -> Result<ExtractionBatchArgs, CandidateError> {
-        ceiling.validate().map_err(|_| CandidateError::Planning)?;
-        let request = crate::candidate_cli::extract::arguments(schema,
-            self.extraction.source_membership(), ceiling)?;
-        let declaration = parse_json_with_limits(&request.schema, JsonLimits {
-            max_input_bytes: crate::candidate_cli::extract::SCHEMA_BYTES,
-            max_string_lexeme_bytes: crate::candidate_cli::extract::SCHEMA_BYTES,
-            ..JsonLimits::default()
-        }).map_err(|_| CandidateError::Planning)?;
-        if !matches!(declaration, JsonValue::Object(_)) { return Err(CandidateError::Planning); }
-        if request.grounding == ExtractionBatchGrounding::Structural {
-            JsonProgram::compile(&request.schema, self.extraction.compiler())
-                .map_err(|_| CandidateError::Planning)?;
-        }
-        Ok(request)
+        self.extraction.shared_defaults(schema, ceiling)
     }
 
     pub(super) fn execute_owned<R: Read + Send + 'static, W: Write + Send + 'static>(

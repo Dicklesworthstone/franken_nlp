@@ -94,7 +94,28 @@ impl ExtractionArgs {
     }
     pub(super) fn mask_visits(&self) -> u64 { self.max_mask_node_visits }
     pub(super) fn schema_path(&self) -> &std::path::Path { &self.schema }
+    #[cfg(test)]
     pub(super) fn source_membership(&self) -> bool { self.source_membership }
+
+    /// Preserve exact shared schema bytes without inventing a source document.
+    /// Source membership compiles against EACH original job/corpus document.
+    pub(super) fn shared_defaults(&self, schema: String, ceiling: TaskBudget)
+        -> Result<ExtractionBatchArgs, CandidateError> {
+        ceiling.validate().map_err(|_| CandidateError::Planning)?;
+        let request = crate::candidate_cli::extract::arguments(schema, self.source_membership, ceiling)?;
+        let declaration = crate::validation::parse_json_with_limits(&request.schema, crate::validation::JsonLimits {
+            max_input_bytes: crate::candidate_cli::extract::SCHEMA_BYTES,
+            max_string_lexeme_bytes: crate::candidate_cli::extract::SCHEMA_BYTES,
+            ..crate::validation::JsonLimits::default()
+        }).map_err(|_| CandidateError::Planning)?;
+        if !matches!(declaration, crate::validation::JsonValue::Object(_)) {
+            return Err(CandidateError::Planning);
+        }
+        if request.grounding == ExtractionBatchGrounding::Structural {
+            JsonProgram::compile(&request.schema, self.compiler()).map_err(|_| CandidateError::Planning)?;
+        }
+        Ok(request)
+    }
 
     /// Reject unsupported/duplicate schema keys and impossible source products
     /// before any model file is opened. Keep exact numbers as original bytes.

@@ -33,8 +33,9 @@
 > scaffolding, and explicit local inference and corpus routes under `candidate`.
 > Candidate execution requires the `asupersync-runtime` feature. The
 > `candidate source-int4` namespace includes generation/chat, classification,
-> single-document extraction, text cohorts/corpora, and
-> [ordered extraction batches](#implemented-candidate-int4-extraction-batches).
+> single-document extraction, text cohorts/corpora,
+> [ordered extraction batches](#implemented-candidate-int4-extraction-batches), and
+> [durable extraction jobs](#implemented-candidate-int4-extraction-jobs).
 > Candidate results retain their explicit provenance; build verification,
 > model quality and release qualification remain separate pending gates.
 > The top-level task, batch and job examples below remain the disclosed 1.0
@@ -346,8 +347,79 @@ and malformed input. Native work, mask visits, checkpoints and total input/
 output budgets span the entire run and do not renew at flush boundaries.
 Memory admission includes the resident model, full context, preparation,
 transport staging and guarded results. Execution is sequential and blocking
-IO observes cancellation cooperatively; durable resume and parallel extraction
-scheduling remain separate work.
+IO observes cancellation cooperatively. For retained results and explicit
+resume, use the separate extraction-job surface below.
+
+## Implemented candidate INT4 extraction jobs
+
+`fnlp candidate source-int4 extract-job start|resume` connects the same
+native schema/source extraction to the authenticated owned-job runner.
+This candidate route requires both `metadata-store` and
+`asupersync-runtime` on Linux x86-64 or AArch64. It accepts either the
+explicit pinned source closure or an independently digest-pinned INT4 snapshot.
+
+Prepare an existing protected job directory, a protected key file containing
+exactly 32 random raw bytes, a random 128-bit job ID encoded as 32 lowercase
+hexadecimal characters, and an immutable `JobLimits` JSON file. The command
+requires explicit `--store-results` consent and creates neither the directory
+nor the secret. See [owned job storage](docs/owned-jobs.md) for the existing
+storage and verification contract.
+
+```bash
+fnlp candidate source-int4 extract-job start documents.ndjson \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$EXPECTED_MODEL_SHA256" \
+  --schema extraction.schema.json \
+  --memory-mib 8192 \
+  --store-results \
+  --job-dir /private/extraction-job \
+  --job-id "$JOB_ID" \
+  --key-file /private/extraction-job.key \
+  --limits extraction-job-limits.json \
+  --materialize
+```
+
+Use the same arguments with `resume` in place of `start` and provide the
+**complete original NDJSON population**, including already committed items.
+Inputs are retained in admitted memory during the invocation; the command does
+not persist the population for future recovery. The protected journal binds
+the original input bytes/order/IDs, exact shared schema and source policy,
+actual model/group/strict-v2 identity, compiler settings, and lifetime limits.
+Changing that contract refuses before replay or orphan-tail repair.
+Non-null `task_args` and live-stream flush controls are rejected.
+
+Each pending item is durably debited before native execution. Its result
+frame is synchronized before the journal commits its pointer. Resume skips
+committed ordinals, while work spent on interrupted attempts remains spent.
+Uncommitted spool bytes or interrupted stages require the explicit
+resume-only `--discard-uncommitted-tail` flag; authentication still happens
+first. No failed task is retained as a successful result.
+
+The limits file supplies all five native lifetime work counters plus mask
+visits. Group-dependent INT4 dot counts are copied exactly into the existing
+journal counter shape; use `JobWork::from_int4` with an actual group-aware
+`Int4Work` quote when constructing limits through the library. Population,
+attempt, stream and checkpoint allowances do not multiply or renew those
+counters. This route's `--max-input-bytes` bounds each **complete NDJSON
+envelope**, and immutable `max_input_bytes_per_item` must fit within it.
+Memory admission includes the complete frozen population, journal and JSON
+staging, both preparation lifetimes, resident model, full context and guarded
+results; increase `--memory-mib` only within the host's available capacity.
+
+Stdout contains a bounded metadata completion with
+`protocol: "fnlp-candidate-int4-extract-job-v1"`, candidate provenance and
+authenticated progress. Private output stays in the owner-only spool;
+`--materialize` publishes verified ordered `materialized.ndjson` after all
+items commit. Existing stored-job status, verification and materialization
+remain available independently of model loading. A failed acknowledgement
+does not imply rollback; inspect the protected job or resume explicitly.
+
+The library entry point is `NlpEngine::job_int4_extract`, with a sealed
+`Int4ExtractionJobPlanner`, charged resident model, caller-owned input,
+explicit `SourceJobRequest`, and `JobHostLimits`. It uses one physical
+blocking invocation and retains ownership through native cleanup and durable
+publication. The command and API remain source-inventoried candidate features:
+build, model-present correctness, crash and quality qualification are pending.
 
 ## Installation
 

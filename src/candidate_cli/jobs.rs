@@ -160,7 +160,7 @@ impl JobCommand {
         }
     }
 }
-fn parse_job_id(text: &str) -> Result<JobId, String> {
+pub(super) fn parse_job_id(text: &str) -> Result<JobId, String> {
     if text.len() != 32 || !text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
         return Err("expected 32 lowercase hexadecimal characters".to_owned());
     }

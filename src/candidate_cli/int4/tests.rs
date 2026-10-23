@@ -177,6 +177,7 @@ fn exact_host_detection_authorizes_a_kernel_or_refuses_before_any_input() {
                 Int4Task::Classify(scoring) => scoring.validate(&command.args),
                 Int4Task::Extract(extraction) => extraction.validate(&command.args),
                 Int4Task::ExtractBatch(batch) => batch.validate(&command.args).map(|limits| limits.common),
+                Int4Task::ExtractJob => Err(CandidateError::Arguments),
             };
             match PackedInt4Kernel::detect(kind) {
                 Ok(checked) => {
@@ -203,6 +204,7 @@ fn physical_kernel_selection_does_not_change_layout_memory_or_generation_options
             Int4Task::Classify(scoring) => scoring.validate(&command.args).unwrap(),
             Int4Task::Extract(extraction) => extraction.validate(&command.args).unwrap(),
             Int4Task::ExtractBatch(batch) => batch.validate(&command.args).unwrap().common,
+            Int4Task::ExtractJob => panic!("job is not a single-task kernel fixture"),
         };
         let storage = |limits: Int4Limits| (limits.memory_bytes, limits.preparation_bytes,
             limits.source_preparation_bytes, limits.max_load_bytes, limits.result_bytes,

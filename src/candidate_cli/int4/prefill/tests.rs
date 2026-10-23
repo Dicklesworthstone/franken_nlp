@@ -36,7 +36,7 @@ fn text_prefill_is_explicit_bounded_and_never_accepted_for_classification() {
         Int4Task::Classify(scoring) => scoring, _ => unreachable!(),
     };
     let args = parsed("generate", &["--prefill-rows", "4", "--preparation-mib", "512"]).unwrap().args;
-    let command = Int4Command { task: Int4Task::Classify(scoring), args, batch: None };
+    let command = Int4Command { task: Int4Task::Classify(scoring), args, batch: None, job: None };
     assert_eq!(command.execute(&mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
 }
 fn set_mode(args: &mut Int4Args, mode: usize) {

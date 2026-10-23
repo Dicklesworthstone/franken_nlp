@@ -112,7 +112,7 @@ fn root_dispatch_exposes_batch_without_replacing_single_or_int8_tasks() {
 #[test]
 fn programmatic_task_substitution_and_impossible_cohort_refuse_before_io() {
     let (batch, args) = parsed(&[]);
-    let command = Int4Command { task: Int4Task::Text(Task::Chat), args, batch: Some(Int4BatchCommand::Fixed(batch)) };
+    let command = Int4Command { task: Int4Task::Text(Task::Chat), args, batch: Some(Int4BatchCommand::Fixed(batch)), job: None };
     assert_eq!(command.execute(&mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
     let (mut batch, args) = parsed(&[]); batch.max_records = 65;
     assert_eq!(batch.execute(args, &mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));

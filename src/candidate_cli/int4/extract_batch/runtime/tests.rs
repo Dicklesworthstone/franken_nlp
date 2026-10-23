@@ -22,7 +22,7 @@ impl Write for NoIo {
 
 #[test]
 fn owned_boundary_rechecks_options_before_paths_runtime_or_stream_io() {
-    let Int4Command { task: Int4Task::ExtractBatch(batch), mut args, batch: None } = command(&[])
+    let Int4Command { task: Int4Task::ExtractBatch(batch), mut args, batch: None, job: None } = command(&[])
         else { panic!("wrong task"); };
     let quoted = batch.validate(&args).unwrap();
     args.seed = Some("ab".repeat(32));

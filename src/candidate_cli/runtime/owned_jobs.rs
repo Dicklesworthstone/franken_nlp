@@ -90,7 +90,7 @@ fn preflight_memory(host: JobHostLimits, job: JobLimits, limits: Limits) -> Resu
     }
     Ok(())
 }
-fn open_mode(mode: RunMode) -> JobOpenMode {
+pub(in crate::candidate_cli) fn open_mode(mode: RunMode) -> JobOpenMode {
     match mode {
         RunMode::Start => JobOpenMode::Create,
         RunMode::Resume { discard_uncommitted: false } => JobOpenMode::Resume(TailPolicy::Refuse),
@@ -162,12 +162,12 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
 }
 
 #[derive(Serialize)]
-struct ProgressReport<'a> {
+pub(in crate::candidate_cli) struct ProgressReport<'a> {
     operation: &'static str, task: &'a str, status: &'static str, job_id: String,
     items: u64, committed: u64, attempts: u64, reserved_work: JobWork,
     committed_spool_bytes: u64, materialized: bool,
 }
-fn progress_report(p: JobProgress, expected: JobId, limits: JobLimits, materialize: bool,
+pub(in crate::candidate_cli) fn progress_report(p: JobProgress, expected: JobId, limits: JobLimits, materialize: bool,
     mode: RunMode, task: &str) -> Result<ProgressReport<'_>, Failure> {
     if p.job_id != expected || p.items == 0 || p.items > limits.max_items || p.committed != p.items
         || p.attempts < p.committed || p.attempts > limits.max_attempts
@@ -185,7 +185,7 @@ fn cancelled(cause: DecodeCancellationKind) -> Failure {
     Failure { exit: if budget { ErrorCode::BudgetOrTimeout } else { ErrorCode::Cancelled },
         code: if budget { "job_execution_budget" } else { "job_cancelled" } }
 }
-fn job_failure(error: JobError) -> Failure {
+pub(in crate::candidate_cli) fn job_failure(error: JobError) -> Failure {
     let (exit, code) = match error {
         JobError::Cancelled(c) => return cancelled(c),
         JobError::Authentication | JobError::Corrupt => (ErrorCode::ArtifactIntegrityOrFormatOrVersion, "job_integrity"),
@@ -203,7 +203,7 @@ fn job_failure(error: JobError) -> Failure {
     };
     Failure { exit, code }
 }
-fn host_failure(error: HostedJobError) -> Failure {
+pub(in crate::candidate_cli) fn host_failure(error: HostedJobError) -> Failure {
     match error {
         HostedJobError::Job(JobRunError::Storage(e)) => job_failure(e),
         HostedJobError::Job(JobRunError::InvalidEnvelope) => Failure { exit: ErrorCode::InputDecodeOrParse, code: "job_envelope" },
