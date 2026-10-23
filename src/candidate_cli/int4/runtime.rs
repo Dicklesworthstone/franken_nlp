@@ -1,8 +1,10 @@
 //! End-to-end source verification, charged loading, planning and INT4 execution.
 use super::*;
-use std::{fs::File, time::{Duration, Instant}};
+use std::{fs::File, sync::Arc, time::{Duration, Instant}};
 use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
     execution_identity::ExecutionIdentity,
+    batch::{BatchDocument, extract::{ExtractionBatchArgs, grouped_int4::Int4ExtractionBatchPlanner}},
+    grammar::mask::MaskWorkLimits,
     hosted::{CancellationToken, HostedOutput, Int4LoadLimits, NativeLimits, ResidentInt4, RunLimits},
     native_engine::{decode::{DecodeCancellationKind, DecodeStepControl}, int4::PackedInt4Kernel,
         strict_int4::{Int4ModelLoadBudget, weights::snapshot::INT4_SNAPSHOT_VERSION}},
@@ -10,24 +12,43 @@ use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, Me
             grouped_int4::{Int4ChatPlanner, Int4ChatResult, PreparedInt4Chat}},
         classify::{ClassificationRequest,
             grouped_int4::{Int4ClassificationPlanner, Int4ClassificationRun, PreparedInt4Classification}},
+        extract::{ExtractionVocabulary, grouped_int4::{Int4ExtractPlan, Int4ExtractRun}},
         ir::TaskBudget}};
 
 // Typed task alternatives share one loader, preparation guard and publication
 // envelope. Only real hosted execution can construct the guarded completion.
-enum Input { Text(TextInput), Classify(ClassificationRequest, classify::ScoringArgs) }
-enum Prepared { Text(PreparedInt4Chat), Classify(PreparedInt4Classification) }
-enum Completed { Text(HostedOutput<Int4ChatResult>), Classify(HostedOutput<Int4ClassificationRun>) }
+enum Input {
+    Text(TextInput),
+    Classify(ClassificationRequest, classify::ScoringArgs),
+    Extract { document: String, request: ExtractionBatchArgs, options: extract::ExtractionArgs },
+}
+enum Prepared {
+    Text(PreparedInt4Chat),
+    Classify(PreparedInt4Classification),
+    Extract { plan: Int4ExtractPlan, vocabulary: Arc<ExtractionVocabulary>,
+        masks: MaskWorkLimits, max_mask_node_visits: u64 },
+}
+enum Completed {
+    Text(HostedOutput<Int4ChatResult>),
+    Classify(HostedOutput<Int4ClassificationRun>),
+    Extract(HostedOutput<Int4ExtractRun>),
+}
 impl Serialize for Completed {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             Self::Text(result) => result.result().serialize(serializer),
             Self::Classify(result) => result.result().serialize(serializer),
+            Self::Extract(result) => result.result().serialize(serializer),
         }
     }
 }
 impl Prepared {
     fn identity(&self) -> &ExecutionIdentity {
-        match self { Self::Text(plan) => plan.execution_identity(), Self::Classify(plan) => plan.execution_identity() }
+        match self {
+            Self::Text(plan) => plan.execution_identity(),
+            Self::Classify(plan) => plan.execution_identity(),
+            Self::Extract { plan, .. } => plan.execution_identity(),
+        }
     }
     fn execute(self, engine: &NlpEngine, model: &ResidentInt4, native: NativeLimits,
         kernel: PackedInt4Kernel, prefill: Option<Int4PrefillLimits>, cancellation: CancellationToken)
@@ -39,7 +60,10 @@ impl Prepared {
                 SAMPLER_BYTES, kernel, limits, cancellation).map(Completed::Text),
             (Self::Classify(plan), None) => engine.execute_int4_classify(model, plan, native,
                 kernel, cancellation).map(Completed::Classify),
-            (Self::Classify(_), Some(_)) => return Err(CandidateError::Arguments),
+            (Self::Extract { plan, vocabulary, masks, max_mask_node_visits }, None) =>
+                engine.execute_int4_extract(model, plan, vocabulary, native, masks,
+                    max_mask_node_visits, kernel, cancellation).map(Completed::Extract),
+            (Self::Classify(_) | Self::Extract { .. }, Some(_)) => return Err(CandidateError::Arguments),
         }.map_err(|_| CandidateError::Execution)
     }
 }
@@ -54,7 +78,7 @@ pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
     if limits.minimum_memory_bytes > limits.memory_bytes || limits.kernel.kind() != args.kernel
         || !prefill::matches(&args, limits)?
-        || (matches!(task, Int4Task::Classify(_)) && limits.prefill.is_some()) {
+        || (!matches!(&task, Int4Task::Text(_)) && limits.prefill.is_some()) {
         return Err(CandidateError::Arguments);
     }
     let started = Instant::now();
@@ -83,6 +107,13 @@ pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
         Int4Task::Text(task) => Input::Text(parse_input(task, text, args.max_input_bytes)?),
         Int4Task::Classify(scoring) => Input::Classify(
             classify::parse_request(&text, scoring.budget(limits), args.max_input_bytes)?, scoring),
+        Int4Task::Extract(options) => {
+            remaining()?;
+            let mut file = File::open(options.schema_path()).map_err(|_| CandidateError::Input)?;
+            let schema = read_input(&mut file, crate::candidate_cli::extract::SCHEMA_BYTES)?;
+            let request = options.check_schema(schema, &text, options.budget(&args, limits))?;
+            Input::Extract { document: text, request, options }
+        }
     };
     remaining()?;
     let cancellation = CancellationToken::default();
@@ -164,6 +195,32 @@ fn prepare(request: Input, model: &ResidentInt4, args: &Int4Args, limits: Int4Li
             })?;
             scoring.admit_plan(plan.required_context(), args.context_tokens, plan.planned_work())?;
             Ok(Prepared::Classify(plan))
+        }
+        Input::Extract { document, request, options } => {
+            let planner = Int4ExtractionBatchPlanner::for_model(model.model_identity(), options.budget(args, limits),
+                options.compiler(), options.source_limits(), None).map_err(|_| CandidateError::Planning)?;
+            let prepared = planner.prepare_with_control(BatchDocument {
+                id: "cli".to_owned(), text: document, task_args: Some(request),
+            }, control).map_err(|error| match error.fault.cancellation {
+                Some(DecodeCancellationKind::Deadline | DecodeCancellationKind::Timeout) => CandidateError::Timeout,
+                Some(_) => CandidateError::Execution,
+                None => CandidateError::Planning,
+            })?;
+            if prepared.planned_work().forward_positions > args.context_tokens as u64 {
+                return Err(CandidateError::Planning);
+            }
+            prepared.verify_identity(prepared.execution_identity()).map_err(|_| CandidateError::Identity)?;
+            drop(planner);
+            let controls = crate::tokenizer::pinned_controls::pinned().map_err(|_| CandidateError::Identity)?;
+            let vocabulary = ExtractionVocabulary::pinned(controls.template_controls())
+                .map(Arc::new).map_err(|_| CandidateError::Planning)?;
+            if let Some(cause) = control.checkpoint(0) {
+                return Err(if matches!(cause, DecodeCancellationKind::Deadline | DecodeCancellationKind::Timeout) {
+                    CandidateError::Timeout
+                } else { CandidateError::Execution });
+            }
+            Ok(Prepared::Extract { plan: prepared.into_extraction_plan(), vocabulary,
+                masks: options.masks(), max_mask_node_visits: options.mask_visits() })
         }
     }
 }
@@ -307,6 +364,58 @@ mod tests {
             Err(CandidateError::Arguments));
         assert!(output.is_empty());
     }
+    #[test]
+    fn complete_extraction_serialization_retains_exact_json_and_source_offsets() {
+        // Publication must retain the native JSON text as a string. A
+        // serde_json::Value round trip over this inner value would round the
+        // numeric constant whose spelling is part of the extraction contract.
+        let exact = "{\"value\":12345678901234567890123456789012345678}";
+        let output = serde_json::json!({
+            "schema_version":1,
+            "group_width":128,
+            "result":{"output":{"json":exact},"source_fields":[{"byte_start":4,"byte_end":10}]},
+            "model_work":{"forward_positions":19}
+        });
+        let response = SourceResponse { schema_version: 1, scope: "real-source-current-candidate-int4",
+            evidence: "non_authoritative", model_id: "Nanbeige4.2-3B", source_revision: "fixture",
+            source_root_sha256: "fixture-source", model_content_sha256: "fixture-content",
+            candidate_format: "fnlp-int4-source-candidate-v1", quant_recipe: "fixture:group=128",
+            group_width: 128, output: &output, snapshot: None, integer_kernel: None };
+        let mut bytes = Vec::new(); publish(&response, 4096, &mut bytes).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["output"]["result"]["output"]["json"].as_str(), Some(exact));
+        assert_eq!(value["output"]["result"]["source_fields"][0]["byte_start"], 4);
+        assert_eq!(value["output"]["model_work"]["forward_positions"], 19);
+        let mut refused = Vec::new();
+        assert!(publish(&response, 1, &mut refused).is_err());
+        assert!(refused.is_empty());
+    }
+    #[test]
+    #[ignore = "requires controller-admitted pinned source and an explicit local extraction schema fixture"]
+    fn model_present_source_cli_extraction_is_independently_validated() {
+        let source = std::env::var("FNLP_INT4_TEST_SOURCE_DIR").expect("explicit source directory required");
+        let manifest = std::env::var("FNLP_INT4_TEST_SOURCE_MANIFEST").expect("explicit pinned manifest required");
+        let schema = std::env::var("FNLP_INT4_TEST_EXTRACTION_SCHEMA").expect("explicit local schema required");
+        let memory = std::env::var("FNLP_INT4_TEST_MEMORY_MIB").expect("explicit memory ceiling required");
+        let matches = crate::candidate_cli::definition().try_get_matches_from([
+            "candidate", "source-int4", "extract", "--source-dir", &source, "--source-manifest", &manifest,
+            "--memory-mib", &memory, "--schema", &schema, "--context-tokens", "1024", "--max-new-tokens", "128",
+        ]).unwrap();
+        let CandidateCommand::SourceInt4(command) = CandidateCommand::from_matches(&matches).unwrap()
+            else { panic!("wrong extraction route"); };
+        let Int4Task::Extract(options) = &command.task else { panic!("wrong task"); };
+        let program = crate::grammar::runtime::JsonProgram::compile(
+            &std::fs::read_to_string(&schema).unwrap(), options.compiler()).unwrap();
+        let mut output = Vec::new();
+        command.execute(&mut "Alice works in Shanghai.".as_bytes(), &mut output).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value["evidence"], "non_authoritative");
+        assert_eq!(value["output"]["execution"], crate::tasks::extract::grouped_int4::INT4_EXTRACT_VERSION);
+        assert_eq!(value["output"]["result"]["output"]["numerics_profile"],
+            crate::native_engine::strict_int4::STRICT_INT4_PROFILE);
+        program.validate_json(value["output"]["result"]["output"]["json"].as_str().unwrap()).unwrap();
+    }
+
     #[test]
     #[ignore = "requires controller-admitted pinned source and full-model CLI execution"]
     fn model_present_source_cli_generate_and_chat_publish_matching_greedy_output() {

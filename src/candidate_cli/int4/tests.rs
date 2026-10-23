@@ -172,9 +172,10 @@ fn exact_host_detection_authorizes_a_kernel_or_refuses_before_any_input() {
     for task in ["generate", "chat", "classify"] {
         for kind in Int8KernelKind::ALL {
             let command = command(task, &["--kernel", kind.id()]);
-            let admission = match command.task {
+            let admission = match &command.task {
                 Int4Task::Text(_) => command.args.validate(),
                 Int4Task::Classify(scoring) => scoring.validate(&command.args),
+                Int4Task::Extract(extraction) => extraction.validate(&command.args),
             };
             match PackedInt4Kernel::detect(kind) {
                 Ok(checked) => {
@@ -196,9 +197,10 @@ fn exact_host_detection_authorizes_a_kernel_or_refuses_before_any_input() {
 fn physical_kernel_selection_does_not_change_layout_memory_or_generation_options() {
     for task in ["generate", "chat", "classify"] {
         let baseline = command(task, &[]);
-        let limits = |command: &Int4Command| match command.task {
+        let limits = |command: &Int4Command| match &command.task {
             Int4Task::Text(_) => command.args.validate().unwrap(),
             Int4Task::Classify(scoring) => scoring.validate(&command.args).unwrap(),
+            Int4Task::Extract(extraction) => extraction.validate(&command.args).unwrap(),
         };
         let storage = |limits: Int4Limits| (limits.memory_bytes, limits.preparation_bytes,
             limits.source_preparation_bytes, limits.max_load_bytes, limits.result_bytes,
