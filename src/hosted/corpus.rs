@@ -43,7 +43,7 @@ pub struct CorpusLimits {
     pub io_reserve_bytes: u64,
 }
 impl CorpusLimits {
-    fn reservation_bytes(self) -> Result<u64, HostedError> {
+    pub(super) fn reservation_bytes(self) -> Result<u64, HostedError> {
         self.native.run.validate()?;
         self.transport.validate().map_err(HostedError::BatchSetup)?;
         if self.preparation_reserve_bytes == 0 || self.io_reserve_bytes == 0 {

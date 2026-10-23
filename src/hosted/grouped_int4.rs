@@ -6,6 +6,7 @@ use crate::native_engine::strict_int4::weights::snapshot::Int4SnapshotError;
 mod snapshot;
 mod classify;
 mod extract;
+mod corpus;
 mod prefill;
 pub mod batch;
 use crate::tasks::classify::grouped_int4::Int4ClassificationError;
