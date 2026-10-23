@@ -129,15 +129,36 @@ impl CurrentCandidateInt8Model {
     where
         F: FnMut(&str),
     {
+        Self::load_with_checkpoint(path, budget, stage_line, || None)
+    }
+
+    /// Use caller-owned control throughout artifact preflight, identity binding
+    /// and tensor materialization. Checkpoints run on this same thread; an
+    /// individual filesystem call or embedded-tokenizer parse is synchronous.
+    pub fn load_with_checkpoint<F>(
+        path: impl AsRef<Path>,
+        budget: ArtifactLoadBudget,
+        stage_line: F,
+        mut checkpoint: impl FnMut() -> Option<DecodeCancellationKind>,
+    ) -> Result<Self, CurrentCandidateInt8Error>
+    where
+        F: FnMut(&str),
+    {
+        if let Some(cause) = checkpoint() {
+            return Err(ArtifactBridgeError::Cancelled(cause).into());
+        }
         let tokenizer = EmbeddedTokenizer::pinned()?;
-        let source = CurrentCandidateArtifactSource::open(path)?;
-        if source.tokenizer_model_sha256()? != tokenizer.sha256() {
+        let source = CurrentCandidateArtifactSource::open_with_checkpoint(path, &mut checkpoint)?;
+        if source.tokenizer_model_sha256_with_checkpoint(&mut checkpoint)? != tokenizer.sha256() {
             return Err(CurrentCandidateInt8Error::TokenizerMismatch("tokenizer.model"));
         }
-        if source.tokenizer_config_sha256()? != tokenizer.tokenizer_config_sha256() {
+        if source.tokenizer_config_sha256_with_checkpoint(&mut checkpoint)? != tokenizer.tokenizer_config_sha256() {
             return Err(CurrentCandidateInt8Error::TokenizerMismatch("tokenizer_config.json"));
         }
-        let loaded = source.materialize_nanbeige42(budget, stage_line)?;
+        let loaded = source.materialize_nanbeige42_with_checkpoint(budget, stage_line, &mut checkpoint)?;
+        if let Some(cause) = checkpoint() {
+            return Err(ArtifactBridgeError::Cancelled(cause).into());
+        }
         Ok(Self { tokenizer, loaded })
     }
 

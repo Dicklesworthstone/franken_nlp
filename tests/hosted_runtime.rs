@@ -3,7 +3,8 @@
 use std::{path::PathBuf, sync::{Mutex, OnceLock}, time::Duration};
 use franken_nlp::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy,
     hosted::{HostedError, LoadLimits, RunLimits, CancellationToken},
-    native_engine::{artifact_bridge::ArtifactLoadBudget, decode::DecodeCancellationKind}};
+    native_engine::{artifact_bridge::{ArtifactBridgeError, ArtifactLoadBudget},
+        decode::DecodeCancellationKind, strict_int8::CurrentCandidateInt8Error}};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 static ENGINE: OnceLock<NlpEngine> = OnceLock::new();
@@ -67,5 +68,31 @@ fn synchronous_reentry_is_rejected_before_new_reservations_or_work() {
     let _entry = engine.enter_sync_call().unwrap();
     let error = engine.load_current_candidate_int8(missing(), limits(), CancellationToken::default()).err().unwrap();
     assert!(matches!(error, HostedError::Reentrant));
+    assert_drained(engine);
+}
+
+#[test]
+fn checkpoint_budget_stops_inside_candidate_loading_and_drains_every_guard() {
+    let _serial = SERIAL.lock().unwrap();
+    let engine = engine();
+    let mut limits = limits();
+    // Dispatch consumes the first checkpoint and model loading the second.
+    // The reader must then stop before the absent artifact path is inspected.
+    limits.run.max_checkpoints = 2;
+    let error = engine.load_current_candidate_int8(
+        missing(), limits, CancellationToken::default(),
+    ).err().unwrap();
+    match error {
+        HostedError::Stopped { stop, task_error } => {
+            assert_eq!(stop.kind, DecodeCancellationKind::PollQuota);
+            assert!(matches!(
+                task_error.as_deref(),
+                Some(HostedError::Model(CurrentCandidateInt8Error::Artifact(
+                    ArtifactBridgeError::Cancelled(DecodeCancellationKind::PollQuota)
+                )))
+            ), "loader must retain its typed cancellation: {task_error:?}");
+        }
+        other => panic!("loading ignored the caller's checkpoint budget: {other}"),
+    }
     assert_drained(engine);
 }

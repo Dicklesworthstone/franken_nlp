@@ -214,9 +214,10 @@ pub type HostedOutput<T> = GuardedOutput<T, CommittedMemory>;
 impl NlpEngine {
     /// Stream an explicitly selected local candidate file on the real blocking
     /// pool. No download, active-catalog lookup, default-model substitution or
-    /// publisher-authenticity claim is performed. Loading is not interruptible
-    /// inside the existing reader; cancellation is observed before/after it,
-    /// and the synchronous method still waits for its physical cleanup.
+    /// publisher-authenticity claim is performed. Artifact reads, hashing and
+    /// tensor materialization check caller control between bounded chunks.
+    /// Individual filesystem calls and metadata parsing remain synchronous;
+    /// this method waits for physical cleanup before returning a cancellation.
     pub fn load_current_candidate_int8(&self, path: PathBuf, limits: LoadLimits,
         cancellation: CancellationToken) -> Result<ResidentInt8, HostedError> {
         dispatch::preflight(self, limits.run)?;
@@ -230,9 +231,11 @@ impl NlpEngine {
         let lease = self.resources().acquire_lease();
         let resident = Pending::reserve(&lease, MemoryClass::Weights, resident_bytes)?;
         let staging = Pending::reserve(&lease, MemoryClass::Staging, limits.artifact.max_stream_chunk_bytes)?;
-        dispatch::run(self, limits.run, cancellation, move |_control| {
-            let loaded = allocate(resident, || CurrentCandidateInt8Model::load(path, limits.artifact, |_| {})
-                .map_err(HostedError::Model))?;
+        dispatch::run(self, limits.run, cancellation, move |control| {
+            let loaded = allocate(resident, || CurrentCandidateInt8Model::load_with_checkpoint(
+                path, limits.artifact, |_| {},
+                || crate::native_engine::decode::DecodeStepControl::checkpoint(control, 0),
+            ).map_err(HostedError::Model))?;
             drop(staging);
             Ok(ResidentInt8 { inner: Arc::new(ResidentModel { loaded, lease }) })
         })

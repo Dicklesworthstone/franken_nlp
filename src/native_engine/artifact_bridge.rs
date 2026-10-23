@@ -28,10 +28,11 @@ use crate::artifact::{
         FORMAT_VERSION, MAGIC, MAX_ENTRIES, MAX_HEADER_BYTES, PRELUDE_BYTES,
         SECTION_DIRECTORY_ENTRY_BYTES, SectionKind,
     },
-    reader::{CheckedTensorMapping, FnlpqRangeReader},
+    reader::{CheckedTensorMapping, FnlpqRangeReader, FnlpqReadError},
 };
 
 use super::{
+    decode::DecodeCancellationKind,
     tensor::Bf16,
     weights::{Bf16Matrix, WeightShapeError},
 };
@@ -294,6 +295,8 @@ impl ArtifactLoadReceipt {
 /// Loader failures with the responsible source tensor and stage preserved.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArtifactBridgeError {
+    /// A caller-owned request checkpoint stopped bounded artifact work.
+    Cancelled(DecodeCancellationKind),
     /// The artifact did not identify the only supported model.
     ModelId { observed: String },
     /// Current OQ-31 schema and artifact-activation authority is unresolved.
@@ -321,6 +324,7 @@ pub enum ArtifactBridgeError {
 impl fmt::Display for ArtifactBridgeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled(cause) => write!(formatter, "artifact engine load cancelled: {cause:?}"),
             Self::ModelId { observed } => {
                 write!(
                     formatter,
@@ -372,6 +376,25 @@ impl fmt::Display for ArtifactBridgeError {
 }
 
 impl Error for ArtifactBridgeError {}
+
+fn load_checkpoint(
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
+) -> Result<(), ArtifactBridgeError> {
+    match checkpoint() {
+        Some(cause) => Err(ArtifactBridgeError::Cancelled(cause)),
+        None => Ok(()),
+    }
+}
+
+fn artifact_read_error(tensor: &str, error: FnlpqReadError) -> ArtifactBridgeError {
+    match error {
+        FnlpqReadError::Cancelled(cause) => ArtifactBridgeError::Cancelled(cause),
+        error => ArtifactBridgeError::Source {
+            tensor: tensor.to_owned(),
+            detail: error.to_string(),
+        },
+    }
+}
 
 /// The result of one checked materialization pass.
 #[derive(Clone, Debug, PartialEq)]
@@ -830,10 +853,18 @@ pub struct CurrentCandidateArtifactSource {
 
 impl CurrentCandidateArtifactSource {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ArtifactBridgeError> {
-        let reader = FnlpqRangeReader::open(path).map_err(|error| ArtifactBridgeError::Source {
-            tensor: "<artifact>".to_owned(),
-            detail: error.to_string(),
-        })?;
+        Self::open_with_checkpoint(path, || None)
+    }
+
+    /// Preflight this candidate while preserving caller-owned cancellation.
+    /// Section reads and hashing use bounded chunks on the calling thread.
+    pub fn open_with_checkpoint(
+        path: impl AsRef<Path>,
+        mut checkpoint: impl FnMut() -> Option<DecodeCancellationKind>,
+    ) -> Result<Self, ArtifactBridgeError> {
+        let reader = FnlpqRangeReader::open_with_checkpoint(path, &mut checkpoint)
+            .map_err(|error| artifact_read_error("<artifact>", error))?;
+        load_checkpoint(&mut checkpoint)?;
         let identity = ArtifactIdentity {
             model_id: reader.model_id().to_owned(),
             revision: reader.revision().to_owned(),
@@ -847,6 +878,7 @@ impl CurrentCandidateArtifactSource {
             detail: format!("descriptor allocation refused: {error}"),
         })?;
         for tensor in reader.tensors() {
+            load_checkpoint(&mut checkpoint)?;
             tensors.push(ArtifactTensorDescriptor {
                 name: tensor.name.clone(),
                 canonical_dtype: tensor.canonical_dtype.clone(),
@@ -859,35 +891,52 @@ impl CurrentCandidateArtifactSource {
                 },
             });
         }
+        load_checkpoint(&mut checkpoint)?;
         Ok(Self { reader, identity, tensors })
     }
 
     /// Raw embedded tokenizer.model identity from this already-preflighted
     /// artifact. This does not reopen or rescan the model payload sections.
     pub fn tokenizer_model_sha256(&self) -> Result<[u8; 32], ArtifactBridgeError> {
-        self.raw_section_sha256(SectionKind::TokenizerModel, "<tokenizer_model>")
+        self.tokenizer_model_sha256_with_checkpoint(|| None)
+    }
+
+    /// Bind the tokenizer model identity with bounded cancellation checkpoints.
+    pub fn tokenizer_model_sha256_with_checkpoint(
+        &self,
+        mut checkpoint: impl FnMut() -> Option<DecodeCancellationKind>,
+    ) -> Result<[u8; 32], ArtifactBridgeError> {
+        self.raw_section_sha256(SectionKind::TokenizerModel, "<tokenizer_model>", &mut checkpoint)
     }
 
     /// Raw tokenizer_config.json identity from this same preflighted artifact.
     pub fn tokenizer_config_sha256(&self) -> Result<[u8; 32], ArtifactBridgeError> {
-        self.raw_section_sha256(SectionKind::TokenizerConfig, "<tokenizer_config>")
+        self.tokenizer_config_sha256_with_checkpoint(|| None)
+    }
+
+    /// Bind the tokenizer configuration with bounded cancellation checkpoints.
+    pub fn tokenizer_config_sha256_with_checkpoint(
+        &self,
+        mut checkpoint: impl FnMut() -> Option<DecodeCancellationKind>,
+    ) -> Result<[u8; 32], ArtifactBridgeError> {
+        self.raw_section_sha256(SectionKind::TokenizerConfig, "<tokenizer_config>", &mut checkpoint)
     }
 
     fn raw_section_sha256(
         &self,
         kind: SectionKind,
         label: &'static str,
+        checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
     ) -> Result<[u8; 32], ArtifactBridgeError> {
+        load_checkpoint(checkpoint)?;
         let section = self.reader.sections().iter()
             .find(|section| section.kind == kind)
             .ok_or_else(|| ArtifactBridgeError::Source {
                 tensor: label.to_owned(),
                 detail: format!("artifact has no {} section", kind.header_name()),
             })?;
-        self.reader.raw_section_sha256(section.ordinal).map_err(|error| ArtifactBridgeError::Source {
-            tensor: label.to_owned(),
-            detail: error.to_string(),
-        })
+        self.reader.raw_section_sha256_with_checkpoint(section.ordinal, checkpoint)
+            .map_err(|error| artifact_read_error(label, error))
     }
 
     /// Materialize this exact already-opened source with the frozen Nanbeige
@@ -897,17 +946,35 @@ impl CurrentCandidateArtifactSource {
     pub fn materialize_nanbeige42<F>(
         &self,
         budget: ArtifactLoadBudget,
-        mut stage_line: F,
+        stage_line: F,
     ) -> Result<LoadedArtifactWeights, ArtifactBridgeError>
     where
         F: FnMut(&str),
     {
+        self.materialize_nanbeige42_with_checkpoint(budget, stage_line, || None)
+    }
+
+    /// Materialize bounded tensor chunks under the same caller-owned control
+    /// used during artifact preflight and tokenizer identity binding.
+    pub fn materialize_nanbeige42_with_checkpoint<F>(
+        &self,
+        budget: ArtifactLoadBudget,
+        mut stage_line: F,
+        mut checkpoint: impl FnMut() -> Option<DecodeCancellationKind>,
+    ) -> Result<LoadedArtifactWeights, ArtifactBridgeError>
+    where
+        F: FnMut(&str),
+    {
+        load_checkpoint(&mut checkpoint)?;
         if self.identity().model_id != NANBEIGE_MODEL_ID {
             return Err(ArtifactBridgeError::ModelId { observed: self.identity().model_id.clone() });
         }
         let contract = current_nanbeige42_contract()?;
         stage_line(&format!("LOAD STAGE=range-source {CURRENT_CANDIDATE_SCOPE} status=BEGIN tensors={}", contract.len()));
-        let loaded = load_with_contract(self, budget, &contract, CURRENT_CANDIDATE_SCOPE, &mut stage_line)?;
+        let loaded = load_with_contract(
+            self, budget, &contract, CURRENT_CANDIDATE_SCOPE, &mut stage_line, &mut checkpoint,
+        )?;
+        load_checkpoint(&mut checkpoint)?;
         stage_line(&format!("LOAD STAGE=range-source {CURRENT_CANDIDATE_SCOPE} status=PASS tensors={}", contract.len()));
         Ok(loaded)
     }
@@ -1062,13 +1129,31 @@ pub fn load_synthetic_with_contract<S, F>(
     source: &S,
     budget: ArtifactLoadBudget,
     contract: &[ArtifactTensorContract],
-    mut stage_line: F,
+    stage_line: F,
 ) -> Result<LoadedArtifactWeights, ArtifactBridgeError>
 where
     S: CheckedArtifactSource,
     F: FnMut(&str),
 {
-    load_with_contract(source, budget, contract, SYNTHETIC_SCOPE, &mut stage_line)
+    load_synthetic_with_contract_with_checkpoint(source, budget, contract, stage_line, || None)
+}
+
+/// Exercise caller-controlled materialization with a synthetic tensor contract.
+#[doc(hidden)]
+pub fn load_synthetic_with_contract_with_checkpoint<S, F>(
+    source: &S,
+    budget: ArtifactLoadBudget,
+    contract: &[ArtifactTensorContract],
+    mut stage_line: F,
+    mut checkpoint: impl FnMut() -> Option<DecodeCancellationKind>,
+) -> Result<LoadedArtifactWeights, ArtifactBridgeError>
+where
+    S: CheckedArtifactSource,
+    F: FnMut(&str),
+{
+    load_with_contract(
+        source, budget, contract, SYNTHETIC_SCOPE, &mut stage_line, &mut checkpoint,
+    )
 }
 
 fn load_with_contract<S, F>(
@@ -1077,11 +1162,13 @@ fn load_with_contract<S, F>(
     contract: &[ArtifactTensorContract],
     scope: &str,
     stage_line: &mut F,
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
 ) -> Result<LoadedArtifactWeights, ArtifactBridgeError>
 where
     S: CheckedArtifactSource,
     F: FnMut(&str),
 {
+    load_checkpoint(checkpoint)?;
     let resident_envelope_bytes = source.resident_envelope_bytes();
     if resident_envelope_bytes > budget.max_resident_envelope_bytes {
         return Err(ArtifactBridgeError::Memory {
@@ -1125,6 +1212,7 @@ where
     let mut quantized = BTreeMap::new();
     let mut largest_stream_chunk_bytes = 0_u64;
     for expected in contract {
+        load_checkpoint(checkpoint)?;
         let descriptor = descriptors
             .get(expected.source_name.as_str())
             .expect("validate_contract requires every contract descriptor");
@@ -1135,6 +1223,7 @@ where
                     descriptor,
                     budget.max_stream_chunk_bytes,
                     &mut largest_stream_chunk_bytes,
+                    checkpoint,
                 )?;
                 bf16.insert(expected.internal_name.clone(), value);
             }
@@ -1144,6 +1233,7 @@ where
                     descriptor,
                     budget.max_stream_chunk_bytes,
                     &mut largest_stream_chunk_bytes,
+                    checkpoint,
                 )?;
                 quantized.insert(expected.internal_name.clone(), value);
             }
@@ -1155,6 +1245,7 @@ where
             expected.stage.as_str()
         ));
     }
+    load_checkpoint(checkpoint)?;
     let receipt = ArtifactLoadReceipt {
         declared_mapping_bytes: weight_bytes,
         largest_stream_chunk_bytes,
@@ -1322,12 +1413,14 @@ fn decode_bf16_tensor<S: CheckedArtifactSource>(
     descriptor: &ArtifactTensorDescriptor,
     max_stream_chunk_bytes: u64,
     largest_stream_chunk_bytes: &mut u64,
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
 ) -> Result<ArtifactBf16Tensor, ArtifactBridgeError> {
     let values = decode_bf16_mapping(
         source,
         descriptor,
         max_stream_chunk_bytes,
         largest_stream_chunk_bytes,
+        checkpoint,
     )?;
     match descriptor.shape.as_slice() {
         [length] => {
@@ -1362,9 +1455,11 @@ fn decode_bf16_mapping<S: CheckedArtifactSource>(
     descriptor: &ArtifactTensorDescriptor,
     max_stream_chunk_bytes: u64,
     largest_stream_chunk_bytes: &mut u64,
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
 ) -> Result<Vec<Bf16>, ArtifactBridgeError> {
     let expected_values =
         checked_usize(checked_scalar_count(descriptor)?, &descriptor.name, "bf16")?;
+    load_checkpoint(checkpoint)?;
     let mut values = Vec::new();
     values
         .try_reserve_exact(expected_values)
@@ -1405,6 +1500,7 @@ fn decode_bf16_mapping<S: CheckedArtifactSource>(
             }
             Ok(())
         },
+        checkpoint,
     )?;
     if pending.is_some() || values.len() != expected_values {
         return Err(ArtifactBridgeError::Tensor {
@@ -1425,6 +1521,7 @@ fn decode_quantized_matrix<S: CheckedArtifactSource>(
     descriptor: &ArtifactTensorDescriptor,
     max_stream_chunk_bytes: u64,
     largest_stream_chunk_bytes: &mut u64,
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
 ) -> Result<PortableQuantizedMatrix, ArtifactBridgeError> {
     let [rows, columns] = descriptor.shape.as_slice() else {
         return Err(ArtifactBridgeError::Tensor {
@@ -1448,6 +1545,7 @@ fn decode_quantized_matrix<S: CheckedArtifactSource>(
         max_stream_chunk_bytes,
         largest_stream_chunk_bytes,
         expected_values,
+        checkpoint,
     )?;
     let row_scales = decode_f32_mapping(
         source,
@@ -1455,6 +1553,7 @@ fn decode_quantized_matrix<S: CheckedArtifactSource>(
         max_stream_chunk_bytes,
         largest_stream_chunk_bytes,
         rows,
+        checkpoint,
     )?;
     let row_sums = decode_i32_mapping(
         source,
@@ -1462,10 +1561,23 @@ fn decode_quantized_matrix<S: CheckedArtifactSource>(
         max_stream_chunk_bytes,
         largest_stream_chunk_bytes,
         rows,
+        checkpoint,
     )?;
+    // Row-sum verification revisits the full weight payload after streaming.
+    // Bound that CPU work too, including rows wider than a single read chunk.
+    load_checkpoint(checkpoint)?;
+    let mut unchecked_values = 0_usize;
     for (row_index, (row, &declared_sum)) in values.chunks_exact(columns).zip(&row_sums).enumerate()
     {
-        let observed_sum = row.iter().fold(0_i64, |sum, &value| sum + i64::from(value));
+        let mut observed_sum = 0_i64;
+        for chunk in row.chunks(FILE_SOURCE_CHUNK_BYTES) {
+            if unchecked_values + chunk.len() > FILE_SOURCE_CHUNK_BYTES {
+                load_checkpoint(checkpoint)?;
+                unchecked_values = 0;
+            }
+            observed_sum = chunk.iter().fold(observed_sum, |sum, &value| sum + i64::from(value));
+            unchecked_values += chunk.len();
+        }
         if observed_sum != i64::from(declared_sum) {
             return Err(ArtifactBridgeError::Tensor {
                 tensor: descriptor.name.clone(),
@@ -1476,6 +1588,7 @@ fn decode_quantized_matrix<S: CheckedArtifactSource>(
             });
         }
     }
+    load_checkpoint(checkpoint)?;
     Ok(PortableQuantizedMatrix {
         rows,
         columns,
@@ -1491,7 +1604,9 @@ fn decode_i8_mapping<S: CheckedArtifactSource>(
     max_stream_chunk_bytes: u64,
     largest_stream_chunk_bytes: &mut u64,
     expected_values: usize,
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
 ) -> Result<Vec<i8>, ArtifactBridgeError> {
+    load_checkpoint(checkpoint)?;
     let mut values = Vec::new();
     values
         .try_reserve_exact(expected_values)
@@ -1517,6 +1632,7 @@ fn decode_i8_mapping<S: CheckedArtifactSource>(
             }
             Ok(())
         },
+        checkpoint,
     )?;
     if values.len() != expected_values {
         return Err(ArtifactBridgeError::Tensor {
@@ -1537,6 +1653,7 @@ fn decode_f32_mapping<S: CheckedArtifactSource>(
     max_stream_chunk_bytes: u64,
     largest_stream_chunk_bytes: &mut u64,
     expected_values: usize,
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
 ) -> Result<Vec<f32>, ArtifactBridgeError> {
     decode_fixed_width_mapping(
         source,
@@ -1552,6 +1669,7 @@ fn decode_f32_mapping<S: CheckedArtifactSource>(
             }
             Ok(value)
         },
+        checkpoint,
     )
 }
 
@@ -1561,6 +1679,7 @@ fn decode_i32_mapping<S: CheckedArtifactSource>(
     max_stream_chunk_bytes: u64,
     largest_stream_chunk_bytes: &mut u64,
     expected_values: usize,
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
 ) -> Result<Vec<i32>, ArtifactBridgeError> {
     decode_fixed_width_mapping(
         source,
@@ -1570,9 +1689,12 @@ fn decode_i32_mapping<S: CheckedArtifactSource>(
         largest_stream_chunk_bytes,
         expected_values,
         |bytes| Ok(i32::from_le_bytes(bytes)),
+        checkpoint,
     )
 }
 
+// Keep the checked mapping, byte budget and caller control explicit at this boundary.
+#[allow(clippy::too_many_arguments)]
 fn decode_fixed_width_mapping<S, T, D>(
     source: &S,
     descriptor: &ArtifactTensorDescriptor,
@@ -1581,11 +1703,13 @@ fn decode_fixed_width_mapping<S, T, D>(
     largest_stream_chunk_bytes: &mut u64,
     expected_values: usize,
     mut decode: D,
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
 ) -> Result<Vec<T>, ArtifactBridgeError>
 where
     S: CheckedArtifactSource,
     D: FnMut([u8; 4]) -> Result<T, String>,
 {
+    load_checkpoint(checkpoint)?;
     let mut values = Vec::new();
     values
         .try_reserve_exact(expected_values)
@@ -1625,6 +1749,7 @@ where
             }
             Ok(())
         },
+        checkpoint,
     )?;
     if pending_len != 0 || values.len() != expected_values {
         return Err(ArtifactBridgeError::Tensor {
@@ -1646,14 +1771,17 @@ fn stream_mapping<S, F>(
     max_stream_chunk_bytes: u64,
     largest_stream_chunk_bytes: &mut u64,
     mut consume: F,
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
 ) -> Result<(), ArtifactBridgeError>
 where
     S: CheckedArtifactSource,
     F: FnMut(&[u8]) -> Result<(), ArtifactBridgeError>,
 {
+    load_checkpoint(checkpoint)?;
     let expected_bytes = descriptor.mapping_lengths.for_mapping(mapping);
     let mut observed_bytes = 0_u64;
     source.stream_mapping(descriptor, mapping, &mut |chunk| {
+        load_checkpoint(checkpoint)?;
         let chunk_len = u64::try_from(chunk.len()).map_err(|_| ArtifactBridgeError::Tensor {
             tensor: descriptor.name.clone(),
             stage: mapping.stage_name(),
@@ -1682,8 +1810,10 @@ where
             });
         }
         *largest_stream_chunk_bytes = (*largest_stream_chunk_bytes).max(chunk_len);
-        consume(chunk)
+        consume(chunk)?;
+        load_checkpoint(checkpoint)
     })?;
+    load_checkpoint(checkpoint)?;
     if observed_bytes != expected_bytes {
         return Err(ArtifactBridgeError::Tensor {
             tensor: descriptor.name.clone(),

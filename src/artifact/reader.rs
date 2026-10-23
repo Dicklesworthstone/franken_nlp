@@ -29,6 +29,9 @@ use crate::artifact::format::{
     validate_f32_scale_bytes, validate_generic_sidecar_cardinality, write, StreamingSectionHasher,
 };
 use crate::canonjson::{self, ParseLimits};
+use crate::native_engine::decode::DecodeCancellationKind;
+
+const RANGE_READ_CHUNK_BYTES: usize = 64 * 1024;
 
 const REQUIRED_KINDS: [SectionKind; 8] = [
     SectionKind::GenericTensorPayload,
@@ -44,6 +47,8 @@ const REQUIRED_KINDS: [SectionKind; 8] = [
 /// Typed, location-bearing failures from the untrusted artifact boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FnlpqReadError {
+    /// A caller-owned request checkpoint stopped bounded file work.
+    Cancelled(DecodeCancellationKind),
     /// Filesystem I/O or regular-file checks failed before parsing.
     Io {
         operation: &'static str,
@@ -79,6 +84,7 @@ pub enum FnlpqReadError {
 impl fmt::Display for FnlpqReadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled(cause) => write!(formatter, "fnlpq read cancelled: {cause:?}"),
             Self::Io { operation, detail } => write!(formatter, "fnlpq {operation}: {detail}"),
             Self::MmapUnavailable => formatter.write_str(
                 "FNLP_MMAP=1 requested, but no ratified safe mmap surface is available; use owned-buffer mode",
@@ -150,6 +156,18 @@ pub enum CheckedTensorMapping {
 impl FnlpqRangeReader {
     /// Open only a non-symlink regular file and retain bounded metadata.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, FnlpqReadError> {
+        Self::open_with_checkpoint(path, || None)
+    }
+
+    /// Open and authenticate the candidate with caller-owned cancellation and
+    /// budget checks before file access and at every bounded read/hash chunk.
+    /// Filesystem calls and the capped metadata parser are synchronous; this
+    /// does not promise to preempt a blocked operating-system read.
+    pub fn open_with_checkpoint(
+        path: impl AsRef<Path>,
+        mut checkpoint: impl FnMut() -> Option<DecodeCancellationKind>,
+    ) -> Result<Self, FnlpqReadError> {
+        read_checkpoint(&mut checkpoint)?;
         if env::var_os("FNLP_MMAP").as_deref() == Some(std::ffi::OsStr::new("1")) {
             return Err(FnlpqReadError::MmapUnavailable);
         }
@@ -179,33 +197,34 @@ impl FnlpqRangeReader {
         })?;
         let prelude = validate_prelude(&fixed, observed_len)?;
         let mut header_bytes = vec![0_u8; usize_from_u64(prelude.header_len, "range-reader header_len")?];
-        file.read_exact(&mut header_bytes).map_err(|error| FnlpqReadError::Io {
-            operation: "read range-reader header",
-            detail: error.to_string(),
-        })?;
-        let header_sha256: [u8; 32] = Sha256::digest(&header_bytes).into();
+        read_exact_with_checkpoint(&mut file, &mut header_bytes, "read range-reader header", &mut checkpoint)?;
+        let mut header_hasher = Sha256::new();
+        for chunk in header_bytes.chunks(RANGE_READ_CHUNK_BYTES) {
+            read_checkpoint(&mut checkpoint)?;
+            header_hasher.update(chunk);
+        }
+        let header_sha256: [u8; 32] = header_hasher.finalize().into();
         if header_sha256 != prelude.header_sha256 {
             return Err(header_error("prelude.header_sha256", "range-reader header digest mismatch"));
         }
+        read_checkpoint(&mut checkpoint)?;
         let header = parse_header(&header_bytes, &prelude)?;
+        read_checkpoint(&mut checkpoint)?;
         let directory_len = prelude.section_count
             .checked_mul(SECTION_DIRECTORY_ENTRY_BYTES as u64)
             .ok_or_else(|| header_error("section_count", "range-reader directory length overflow"))?;
         let mut directory = vec![0_u8; usize_from_u64(directory_len, "range-reader directory_len")?];
-        file.read_exact(&mut directory).map_err(|error| FnlpqReadError::Io {
-            operation: "read range-reader directory",
-            detail: error.to_string(),
-        })?;
+        read_exact_with_checkpoint(&mut file, &mut directory, "read range-reader directory", &mut checkpoint)?;
         let metadata_end = checked_metadata_end(&prelude)?;
         let sections = parse_directory_metadata(&directory, metadata_end, &prelude, &header)?;
-        validate_zero_alignment_gaps(&mut file, metadata_end, &sections)?;
+        validate_zero_alignment_gaps(&mut file, metadata_end, &sections, &mut checkpoint)?;
         validate_header_relationships_metadata(&header, &sections)?;
         // This candidate reader has no filesystem immutability capability yet,
         // so it is not activation authority. Still, hash each stored section
         // exactly once before any mapping can be served. This keeps real-model
         // rehearsal O(file_bytes), rather than O(tensors * section_bytes).
         for section in &sections {
-            verify_section_locked(&mut file, section)?;
+            verify_section_locked(&mut file, section, &mut checkpoint)?;
         }
         let final_len = file.metadata().map_err(|error| FnlpqReadError::Io {
             operation: "range-reader post-open metadata",
@@ -217,6 +236,7 @@ impl FnlpqRangeReader {
                 detail: format!("changed during preflight: before={observed_len} after={final_len}"),
             });
         }
+        read_checkpoint(&mut checkpoint)?;
         Ok(Self { file: Mutex::new(file), prelude, header, sections })
     }
 
@@ -233,7 +253,17 @@ impl FnlpqRangeReader {
     /// bounded scratch. This is distinct from the directory's domain-framed
     /// stored identity and is useful for matching embedded source assets.
     pub fn raw_section_sha256(&self, ordinal: u64) -> Result<[u8; 32], FnlpqReadError> {
-        const SCRATCH: usize = 64 * 1024;
+        self.raw_section_sha256_with_checkpoint(ordinal, || None)
+    }
+
+    /// Hash one auxiliary section without hiding a long read from the
+    /// enclosing request's cancellation and checkpoint budget.
+    pub fn raw_section_sha256_with_checkpoint(
+        &self,
+        ordinal: u64,
+        mut checkpoint: impl FnMut() -> Option<DecodeCancellationKind>,
+    ) -> Result<[u8; 32], FnlpqReadError> {
+        read_checkpoint(&mut checkpoint)?;
         let section = section_for(&self.sections, ordinal, "raw section digest")?;
         let mut file = self.file.lock().map_err(|_| FnlpqReadError::Io {
             operation: "range-reader file lock",
@@ -244,10 +274,11 @@ impl FnlpqRangeReader {
             detail: error.to_string(),
         })?;
         let mut hasher = Sha256::new();
-        let mut scratch = [0_u8; SCRATCH];
+        let mut scratch = [0_u8; RANGE_READ_CHUNK_BYTES];
         let mut remaining = section.stored_len;
         while remaining != 0 {
-            let take = usize::try_from(remaining.min(SCRATCH as u64))
+            read_checkpoint(&mut checkpoint)?;
+            let take = usize::try_from(remaining.min(RANGE_READ_CHUNK_BYTES as u64))
                 .map_err(|_| section_error(section, "raw digest chunk does not fit host usize"))?;
             file.read_exact(&mut scratch[..take]).map_err(|error| FnlpqReadError::Io {
                 operation: "read raw section digest",
@@ -256,6 +287,7 @@ impl FnlpqRangeReader {
             hasher.update(&scratch[..take]);
             remaining -= take as u64;
         }
+        read_checkpoint(&mut checkpoint)?;
         Ok(hasher.finalize().into())
     }
 
@@ -318,18 +350,23 @@ impl VerifiedMappingReader<'_> {
     }
 }
 
-fn verify_section_locked(file: &mut File, section: &CheckedSection) -> Result<(), FnlpqReadError> {
-    const SCRATCH: usize = 64 * 1024;
+fn verify_section_locked(
+    file: &mut (impl Read + Seek),
+    section: &CheckedSection,
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
+) -> Result<(), FnlpqReadError> {
+    read_checkpoint(checkpoint)?;
     file.seek(SeekFrom::Start(section.file_offset)).map_err(|error| FnlpqReadError::Io {
         operation: "seek section verification",
         detail: error.to_string(),
     })?;
     let mut hasher = StreamingSectionHasher::new(&section.name, section.stored_len)
         .map_err(|error| section_error(section, error.to_string()))?;
-    let mut scratch = [0_u8; SCRATCH];
+    let mut scratch = [0_u8; RANGE_READ_CHUNK_BYTES];
     let mut remaining = section.stored_len;
     while remaining != 0 {
-        let take = usize::try_from(remaining.min(SCRATCH as u64))
+        read_checkpoint(checkpoint)?;
+        let take = usize::try_from(remaining.min(RANGE_READ_CHUNK_BYTES as u64))
             .map_err(|_| section_error(section, "section chunk does not fit host usize"))?;
         file.read_exact(&mut scratch[..take]).map_err(|error| FnlpqReadError::Io {
             operation: "verify section bytes",
@@ -338,6 +375,7 @@ fn verify_section_locked(file: &mut File, section: &CheckedSection) -> Result<()
         hasher.write(&scratch[..take]).map_err(|error| section_error(section, error.to_string()))?;
         remaining -= take as u64;
     }
+    read_checkpoint(checkpoint)?;
     let observed = hasher.finish().map_err(|error| section_error(section, error.to_string()))?;
     if observed != section.stored_sha256 {
         return Err(section_error(section, format!(
@@ -346,6 +384,31 @@ fn verify_section_locked(file: &mut File, section: &CheckedSection) -> Result<()
         )));
     }
     Ok(())
+}
+
+fn read_checkpoint(
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
+) -> Result<(), FnlpqReadError> {
+    match checkpoint() {
+        Some(cause) => Err(FnlpqReadError::Cancelled(cause)),
+        None => Ok(()),
+    }
+}
+
+fn read_exact_with_checkpoint(
+    file: &mut impl Read,
+    bytes: &mut [u8],
+    operation: &'static str,
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
+) -> Result<(), FnlpqReadError> {
+    for chunk in bytes.chunks_mut(RANGE_READ_CHUNK_BYTES) {
+        read_checkpoint(checkpoint)?;
+        file.read_exact(chunk).map_err(|error| FnlpqReadError::Io {
+            operation,
+            detail: error.to_string(),
+        })?;
+    }
+    read_checkpoint(checkpoint)
 }
 
 /// Fixed prelude fields after their version and file-length checks succeed.
@@ -1530,10 +1593,12 @@ fn validate_zero_alignment_gaps(
     file: &mut File,
     metadata_end: u64,
     sections: &[CheckedSection],
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
 ) -> Result<(), FnlpqReadError> {
     let mut previous_end = metadata_end;
     let mut scratch = [0_u8; MAX_ALIGNMENT as usize];
     for section in sections {
+        read_checkpoint(checkpoint)?;
         let gap = section.file_offset.checked_sub(previous_end)
             .ok_or_else(|| section_error(section, "section begins before previous range ends"))?;
         if gap > MAX_ALIGNMENT {
@@ -1544,9 +1609,7 @@ fn validate_zero_alignment_gaps(
                 operation: "seek alignment gap", detail: error.to_string(),
             })?;
             let count = usize_from_u64(gap, "alignment gap")?;
-            file.read_exact(&mut scratch[..count]).map_err(|error| FnlpqReadError::Io {
-                operation: "read alignment gap", detail: error.to_string(),
-            })?;
+            read_exact_with_checkpoint(file, &mut scratch[..count], "read alignment gap", checkpoint)?;
             if scratch[..count].iter().any(|&byte| byte != 0) {
                 return Err(section_error(section, format!("nonzero alignment gap [{previous_end},{})", section.file_offset)));
             }
@@ -2296,4 +2359,104 @@ struct PackingDigestRepresentation<'a> {
     byte_cost: u64,
     section_name: &'a str,
     stored_sha256: &'a str,
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    struct UnreachablePath;
+
+    impl AsRef<Path> for UnreachablePath {
+        fn as_ref(&self) -> &Path {
+            panic!("cancelled preflight must not inspect the artifact path")
+        }
+    }
+
+    #[test]
+    fn cancelled_preflight_preserves_every_cause_before_touching_the_path() {
+        for cause in [
+            DecodeCancellationKind::User,
+            DecodeCancellationKind::Timeout,
+            DecodeCancellationKind::Deadline,
+            DecodeCancellationKind::PollQuota,
+            DecodeCancellationKind::CostBudget,
+            DecodeCancellationKind::FailFast,
+            DecodeCancellationKind::RaceLost,
+            DecodeCancellationKind::ParentCancelled,
+            DecodeCancellationKind::ResourceUnavailable,
+            DecodeCancellationKind::Shutdown,
+            DecodeCancellationKind::LinkedExit,
+        ] {
+            let error = FnlpqRangeReader::open_with_checkpoint(UnreachablePath, || Some(cause))
+                .err()
+                .expect("pre-cancelled input is rejected before filesystem access");
+            assert_eq!(error, FnlpqReadError::Cancelled(cause));
+        }
+    }
+
+    #[test]
+    fn metadata_read_stops_before_the_next_bounded_chunk() {
+        let bytes = vec![0x5a_u8; RANGE_READ_CHUNK_BYTES * 3 + 7];
+        let mut reader = Cursor::new(bytes.as_slice());
+        let mut output = vec![0_u8; bytes.len()];
+        let mut checkpoints = 0;
+        let error = read_exact_with_checkpoint(
+            &mut reader,
+            &mut output,
+            "test metadata",
+            &mut || {
+                checkpoints += 1;
+                (checkpoints == 3).then_some(DecodeCancellationKind::Deadline)
+            },
+        ).unwrap_err();
+        assert_eq!(error, FnlpqReadError::Cancelled(DecodeCancellationKind::Deadline));
+        assert_eq!(reader.position(), (RANGE_READ_CHUNK_BYTES * 2) as u64);
+        assert!(output[RANGE_READ_CHUNK_BYTES * 2..].iter().all(|&byte| byte == 0));
+    }
+
+    fn section(bytes: &[u8]) -> CheckedSection {
+        let name = "cancel-test-payload";
+        let mut hash = StreamingSectionHasher::new(name, bytes.len() as u64).unwrap();
+        hash.write(bytes).unwrap();
+        CheckedSection {
+            ordinal: 0,
+            name: name.to_owned(),
+            kind: SectionKind::GenericTensorPayload,
+            file_offset: 0,
+            stored_len: bytes.len() as u64,
+            alignment: 1,
+            stored_sha256: hash.finish().unwrap(),
+        }
+    }
+
+    #[test]
+    fn section_authentication_stops_between_bounded_hash_chunks() {
+        let bytes = vec![0x5a_u8; RANGE_READ_CHUNK_BYTES * 3 + 7];
+        let section = section(&bytes);
+        let mut reader = Cursor::new(bytes.as_slice());
+        let mut checkpoints = 0;
+        let error = verify_section_locked(&mut reader, &section, &mut || {
+            checkpoints += 1;
+            (checkpoints == 4).then_some(DecodeCancellationKind::User)
+        }).unwrap_err();
+        assert_eq!(error, FnlpqReadError::Cancelled(DecodeCancellationKind::User));
+        assert_eq!(reader.position(), (RANGE_READ_CHUNK_BYTES * 2) as u64);
+    }
+
+    #[test]
+    fn section_authentication_keeps_the_same_digest_when_control_continues() {
+        let bytes = vec![0xa5_u8; RANGE_READ_CHUNK_BYTES * 3 + 7];
+        let section = section(&bytes);
+        let mut reader = Cursor::new(bytes.as_slice());
+        let mut checkpoints = 0;
+        verify_section_locked(&mut reader, &section, &mut || {
+            checkpoints += 1;
+            None
+        }).expect("checkpoints must not alter the framed stored-section digest");
+        assert_eq!(reader.position(), bytes.len() as u64);
+        assert!(checkpoints >= 5);
+    }
 }

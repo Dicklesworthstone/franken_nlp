@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -6,9 +7,11 @@ use franken_nlp::native_engine::{
     artifact_bridge::{
         ArtifactBridgeError, ArtifactIdentity, ArtifactLoadBudget, ArtifactTensorContract,
         ArtifactTensorDescriptor, CheckedArtifactSource, FORENSIC_METADATA_READ_CAP, TensorMapping,
-        TensorMappingLengths, load_nanbeige42, load_synthetic_with_contract,
+        TensorMappingLengths, CurrentCandidateArtifactSource, load_nanbeige42,
+        load_synthetic_with_contract, load_synthetic_with_contract_with_checkpoint,
         scan_current_80_byte_forensic_census,
     },
+    decode::DecodeCancellationKind,
     tensor::Bf16,
 };
 
@@ -355,4 +358,151 @@ fn real_artifact_forensic_census_reads_only_bounded_metadata_when_model_is_prese
         "LOAD STAGE=forensic-metadata-bound scope=real-artifact-forensic evidence=non_authoritative status=OBSERVED metadata_bytes_read={} cap={}",
         report.metadata_bytes_read, FORENSIC_METADATA_READ_CAP
     );
+}
+
+struct ObservedSource {
+    inner: StreamingFixture,
+    chunks: Cell<usize>,
+    completed_mappings: Cell<usize>,
+}
+
+impl ObservedSource {
+    fn new(inner: StreamingFixture) -> Self {
+        Self { inner, chunks: Cell::new(0), completed_mappings: Cell::new(0) }
+    }
+}
+
+impl CheckedArtifactSource for ObservedSource {
+    fn identity(&self) -> &ArtifactIdentity {
+        self.inner.identity()
+    }
+
+    fn tensors(&self) -> &[ArtifactTensorDescriptor] {
+        self.inner.tensors()
+    }
+
+    fn resident_envelope_bytes(&self) -> u64 {
+        self.inner.resident_envelope_bytes()
+    }
+
+    fn stream_mapping(
+        &self,
+        tensor: &ArtifactTensorDescriptor,
+        mapping: TensorMapping,
+        visitor: &mut dyn FnMut(&[u8]) -> Result<(), ArtifactBridgeError>,
+    ) -> Result<(), ArtifactBridgeError> {
+        self.inner.stream_mapping(tensor, mapping, &mut |chunk| {
+            self.chunks.set(self.chunks.get() + 1);
+            visitor(chunk)
+        })?;
+        self.completed_mappings.set(self.completed_mappings.get() + 1);
+        Ok(())
+    }
+}
+
+#[test]
+fn candidate_preflight_preserves_reader_cancellation_as_a_typed_cause() {
+    let error = CurrentCandidateArtifactSource::open_with_checkpoint(
+        Path::new("cancelled-candidate-must-not-be-opened.fnlpq"),
+        || Some(DecodeCancellationKind::ParentCancelled),
+    ).err().expect("preflight must stop before any path inspection");
+    assert_eq!(error, ArtifactBridgeError::Cancelled(DecodeCancellationKind::ParentCancelled));
+}
+
+#[test]
+fn bridge_cancellation_precedes_census_and_never_requests_a_mapping() {
+    let source = ObservedSource::new(StreamingFixture::expected());
+    let error = load_synthetic_with_contract_with_checkpoint(
+        &source,
+        ArtifactLoadBudget::streaming_only(28, 3),
+        &[],
+        |_| panic!("pre-cancelled materialization must not emit a passing stage"),
+        || Some(DecodeCancellationKind::CostBudget),
+    ).unwrap_err();
+    assert_eq!(error, ArtifactBridgeError::Cancelled(DecodeCancellationKind::CostBudget));
+    assert_eq!(source.chunks.get(), 0);
+    assert_eq!(source.completed_mappings.get(), 0);
+}
+
+#[test]
+fn bridge_cancellation_during_a_mapping_stops_before_the_next_chunk() {
+    let source = ObservedSource::new(StreamingFixture::expected());
+    let mut lines = Vec::new();
+    let error = load_synthetic_with_contract_with_checkpoint(
+        &source,
+        ArtifactLoadBudget::streaming_only(28, 3),
+        &contracts(),
+        |line| lines.push(line.to_owned()),
+        || (source.chunks.get() >= 2).then_some(DecodeCancellationKind::Timeout),
+    ).unwrap_err();
+    assert_eq!(error, ArtifactBridgeError::Cancelled(DecodeCancellationKind::Timeout));
+    assert_eq!(source.chunks.get(), 2);
+    assert_eq!(source.completed_mappings.get(), 0);
+    assert!(!lines.iter().any(|line| line.contains("STAGE=tensor") || line.contains("STAGE=complete")));
+}
+
+#[test]
+fn continuing_control_preserves_weights_identity_receipt_and_stage_evidence() {
+    let fixture = StreamingFixture::expected();
+    let mut original_lines = Vec::new();
+    let original = load_synthetic_with_contract(
+        &fixture,
+        ArtifactLoadBudget::streaming_only(28, 3),
+        &contracts(),
+        |line| original_lines.push(line.to_owned()),
+    ).unwrap();
+    let mut controlled_lines = Vec::new();
+    let mut checkpoints = 0;
+    let controlled = load_synthetic_with_contract_with_checkpoint(
+        &fixture,
+        ArtifactLoadBudget::streaming_only(28, 3),
+        &contracts(),
+        |line| controlled_lines.push(line.to_owned()),
+        || { checkpoints += 1; None },
+    ).unwrap();
+    assert_eq!(controlled, original);
+    assert_eq!(controlled_lines, original_lines);
+    assert!(checkpoints > 4, "control must run inside tensor materialization");
+}
+
+#[test]
+fn wide_row_sum_validation_remains_cancellable_after_all_mappings_are_read() {
+    let mut fixture = StreamingFixture::expected();
+    let mut contract = contracts()[1].clone();
+    let columns = 3 * 64 * 1024 + 7;
+    contract.shape = vec![1, columns as u32];
+    let descriptor = &mut fixture.tensors[1];
+    descriptor.shape = contract.shape.clone();
+    descriptor.mapping_lengths = TensorMappingLengths {
+        data: columns as u64,
+        scale: 4,
+        row_sum: 4,
+    };
+    fixture.tensors.remove(0);
+    fixture.mappings.insert(contract.source_name.clone(), [
+        vec![1; columns],
+        1.0_f32.to_le_bytes().to_vec(),
+        // A full uninterruptible row scan would report this mismatch instead.
+        0_i32.to_le_bytes().to_vec(),
+    ]);
+    fixture.chunk_bytes = 64 * 1024;
+    let source = ObservedSource::new(fixture);
+    let mut after_mapping_checkpoints = 0;
+    let error = load_synthetic_with_contract_with_checkpoint(
+        &source,
+        ArtifactLoadBudget::streaming_only(columns as u64 + 8, 64 * 1024),
+        &[contract],
+        |_| {},
+        || {
+            if source.completed_mappings.get() == 3 {
+                after_mapping_checkpoints += 1;
+                if after_mapping_checkpoints == 3 {
+                    return Some(DecodeCancellationKind::PollQuota);
+                }
+            }
+            None
+        },
+    ).unwrap_err();
+    assert_eq!(source.completed_mappings.get(), 3);
+    assert_eq!(error, ArtifactBridgeError::Cancelled(DecodeCancellationKind::PollQuota));
 }
