@@ -13,7 +13,8 @@ use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, Me
         classify::{ClassificationRequest,
             grouped_int4::{Int4ClassificationPlanner, Int4ClassificationRun, PreparedInt4Classification}},
         extract::{ExtractionVocabulary, grouped_int4::{Int4ExtractPlan, Int4ExtractRun}},
-        ir::TaskBudget}};
+        ir::{PlanContext, TaskBudget}, source_planning::{SourceTaskRequest,
+            grouped_int4::{PreparedInt4SourceTask, Int4SourceTaskRun}}}};
 
 // Typed task alternatives share one loader, preparation guard and publication
 // envelope. Only real hosted execution can construct the guarded completion.
@@ -21,17 +22,21 @@ enum Input {
     Text(TextInput),
     Classify(ClassificationRequest, classify::ScoringArgs),
     Extract { document: String, request: ExtractionBatchArgs, options: extract::ExtractionArgs },
+    Source { request: SourceTaskRequest, options: source::SourceArgs },
 }
 enum Prepared {
     Text(PreparedInt4Chat),
     Classify(PreparedInt4Classification),
     Extract { plan: Int4ExtractPlan, vocabulary: Arc<ExtractionVocabulary>,
         masks: MaskWorkLimits, max_mask_node_visits: u64 },
+    Source { plan: PreparedInt4SourceTask, vocabulary: Arc<ExtractionVocabulary>,
+        masks: MaskWorkLimits, max_mask_node_visits: u64 },
 }
 enum Completed {
     Text(HostedOutput<Int4ChatResult>),
     Classify(HostedOutput<Int4ClassificationRun>),
     Extract(HostedOutput<Int4ExtractRun>),
+    Source(HostedOutput<Int4SourceTaskRun>),
 }
 impl Serialize for Completed {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -39,6 +44,7 @@ impl Serialize for Completed {
             Self::Text(result) => result.result().serialize(serializer),
             Self::Classify(result) => result.result().serialize(serializer),
             Self::Extract(result) => result.result().serialize(serializer),
+            Self::Source(result) => result.result().serialize(serializer),
         }
     }
 }
@@ -48,6 +54,7 @@ impl Prepared {
             Self::Text(plan) => plan.execution_identity(),
             Self::Classify(plan) => plan.execution_identity(),
             Self::Extract { plan, .. } => plan.execution_identity(),
+            Self::Source { plan, .. } => plan.execution_identity(),
         }
     }
     fn execute(self, engine: &NlpEngine, model: &ResidentInt4, native: NativeLimits,
@@ -63,7 +70,10 @@ impl Prepared {
             (Self::Extract { plan, vocabulary, masks, max_mask_node_visits }, None) =>
                 engine.execute_int4_extract(model, plan, vocabulary, native, masks,
                     max_mask_node_visits, kernel, cancellation).map(Completed::Extract),
-            (Self::Classify(_) | Self::Extract { .. }, Some(_)) => return Err(CandidateError::Arguments),
+            (Self::Source { plan, vocabulary, masks, max_mask_node_visits }, None) =>
+                engine.execute_int4_source_task(model, plan, vocabulary, native, masks,
+                    max_mask_node_visits, kernel, cancellation).map(Completed::Source),
+            (Self::Classify(_) | Self::Extract { .. } | Self::Source { .. }, Some(_)) => return Err(CandidateError::Arguments),
         }.map_err(|_| CandidateError::Execution)
     }
 }
@@ -76,7 +86,7 @@ impl DecodeStepControl for DeadlineControl {
 
 pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
-    if matches!(&task, Int4Task::ExtractBatch(_) | Int4Task::ExtractJob)
+    if matches!(&task, Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ExtractJob)
         || limits.minimum_memory_bytes > limits.memory_bytes || limits.kernel.kind() != args.kernel
         || !prefill::matches(&args, limits)?
         || (!matches!(&task, Int4Task::Text(_)) && limits.prefill.is_some()) {
@@ -115,7 +125,17 @@ pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
             let request = options.check_schema(schema, &text, options.budget(&args, limits))?;
             Input::Extract { document: text, request, options }
         }
-        Int4Task::ExtractBatch(_) | Int4Task::ExtractJob => return Err(CandidateError::Arguments),
+        Int4Task::Source(kind, options) => {
+            remaining()?;
+            let option_json = options.options_path().map(|path| {
+                let mut file = File::open(path).map_err(|_| CandidateError::Input)?;
+                read_input(&mut file, crate::candidate_cli::source::OPTIONS_BYTES)
+            }).transpose()?;
+            let request = crate::candidate_cli::source::request(kind, text, option_json.as_deref(),
+                options.budget(&args, limits), args.max_input_bytes)?;
+            Input::Source { request, options }
+        }
+        Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ExtractJob => return Err(CandidateError::Arguments),
     };
     remaining()?;
     let cancellation = CancellationToken::default();
@@ -214,6 +234,31 @@ fn prepare(request: Input, model: &ResidentInt4, args: &Int4Args, limits: Int4Li
                 } else { CandidateError::Execution });
             }
             Ok(Prepared::Extract { plan: prepared.into_extraction_plan(), vocabulary,
+                masks: options.masks(), max_mask_node_visits: options.mask_visits() })
+        }
+        Input::Source { request, options } => {
+            if let Some(cause) = control.checkpoint(0) {
+                return Err(if matches!(cause, DecodeCancellationKind::Deadline | DecodeCancellationKind::Timeout) {
+                    CandidateError::Timeout
+                } else { CandidateError::Execution });
+            }
+            let (planner, vocabulary) = source::planner()?;
+            let identity = source::identity(model.model_identity(), &planner, request.task())?;
+            let context = PlanContext::new(&identity, options.budget(args, limits))
+                .map_err(|_| CandidateError::Planning)?;
+            let prepared = planner.plan_int4_with_control(&request, &context, options.planning(args),
+                model.model_identity().group_width(), control).map_err(|error| {
+                    match error.cancellation() {
+                        Some(DecodeCancellationKind::Deadline | DecodeCancellationKind::Timeout) => CandidateError::Timeout,
+                        Some(_) => CandidateError::Execution,
+                        None => CandidateError::Planning,
+                    }
+                })?;
+            if prepared.planned_work().forward_positions > args.context_tokens as u64 {
+                return Err(CandidateError::Planning);
+            }
+            prepared.verify_identity(prepared.execution_identity()).map_err(|_| CandidateError::Identity)?;
+            Ok(Prepared::Source { plan: prepared, vocabulary: Arc::new(vocabulary),
                 masks: options.masks(), max_mask_node_visits: options.mask_visits() })
         }
     }

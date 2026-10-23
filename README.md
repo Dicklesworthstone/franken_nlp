@@ -33,7 +33,8 @@
 > scaffolding, and explicit local inference and corpus routes under `candidate`.
 > Candidate execution requires the `asupersync-runtime` feature. The
 > `candidate source-int4` namespace includes generation/chat, classification,
-> single-document extraction, text cohorts/corpora,
+> single-document extraction, [NER/keyphrases/cited summaries/passage QA](#implemented-candidate-int4-source-tasks),
+> text cohorts/corpora,
 > [ordered extraction batches](#implemented-candidate-int4-extraction-batches), and
 > [durable extraction jobs](#implemented-candidate-int4-extraction-jobs).
 > Candidate results retain their explicit provenance; build verification,
@@ -420,6 +421,109 @@ explicit `SourceJobRequest`, and `JobHostLimits`. It uses one physical
 blocking invocation and retains ownership through native cleanup and durable
 publication. The command and API remain source-inventoried candidate features:
 build, model-present correctness, crash and quality qualification are pending.
+
+## Implemented candidate INT4 source tasks
+
+`fnlp candidate source-int4 ner|keyphrases|summarize|answer` now uses the
+pinned source-task prompts and independent task finalizers with the grouped
+INT4 native engine. These commands require `asupersync-runtime`, explicit
+source-conversion or snapshot inputs, and a process memory ceiling, just like
+the existing INT4 extraction path.
+
+```bash
+fnlp candidate source-int4 ner document.txt \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$EXPECTED_MODEL_SHA256" \
+  --memory-mib 8192
+```
+
+Use `keyphrases` or `summarize` with the same document input. The alternative
+model route is `--source-dir DIR --source-manifest FILE`; it also accepts
+`--save-snapshot NEW_FILE`. Keep `--group-width` consistent with the selected
+conversion. The expected snapshot digest comes from an independently trusted
+conversion record.
+
+NER returns typed mentions with all exact matching byte and Unicode-scalar
+intervals; repeated mentions remain explicitly ambiguous. Keyphrases retain
+exact source text and occurrence evidence. Summary bullets carry byte-verified
+source citations. Answer citations must fit inside an original passage and
+cannot cross a passage separator or quote the question as evidence. Citation
+membership establishes a structural guarantee; factual support and task
+quality require separate evaluation. A successful answer may abstain with an
+explicitly uncalibrated signal. Native, budget or citation failure returns an
+error and never becomes a successful abstention.
+
+Single-request `answer` reads a JSON object instead of plain document text:
+
+```json
+{"question":"Where does Alice work?","passages":[{"id":"p1","text":"Alice works in Shanghai."}]}
+```
+
+```bash
+fnlp candidate source-int4 answer question.json \
+  --source-dir /models/Nanbeige4.2-3B \
+  --source-manifest /models/nanbeige-source-manifest.json \
+  --memory-mib 8192
+```
+
+Each task accepts `--options FILE` with its complete typed options. For
+example, an NER options file can contain
+`{"types":["person","location"],"max_entities":8,"max_mention_scalars":128}`.
+Unknown fields, duplicate keys and incomplete options reject. Source bytes,
+including whitespace, Unicode and literal control-marker text, stay intact.
+The trusted planner excludes template control tokens from untrusted input.
+The bounded commands use constrained greedy decoding with thinking disabled.
+`--max-new-tokens` includes terminal EOS; `--max-result-bytes` bounds the whole
+typed result. Prompt plus reserved output must fit the selected context.
+
+### Ordered INT4 source-task batches
+
+`ner-batch`, `keyphrases-batch`, `summarize-batch` and `answer-batch` reuse one
+resident model, native engine and vocabulary throughout an ordered NDJSON run:
+
+```bash
+fnlp candidate source-int4 keyphrases-batch documents.ndjson \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$EXPECTED_MODEL_SHA256" \
+  --memory-mib 8192 --max-requests 1000 \
+  --max-total-input-bytes 67108864 --max-total-output-bytes 67108864 \
+  > phrases.ndjson
+```
+
+For NER, keyphrases and summary, the ordinary record is `{"id":"d1","text":"..."}`.
+Shipped options apply unless a complete typed `task_args` or `--defaults FILE`
+supplies bounded alternatives. Batch defaults use `SourceBatchArgs`, including
+the task selector, options and budget; they differ from the single-request
+`--options` file. Records cannot switch task families or raise admitted
+budgets. The fixed resident context must remain fully covered by each
+record's KV budget.
+
+For `answer-batch`, each record's `text` is the **question** and its
+`task_args.passages` holds the separate evidence. There is no implicit QA
+passage default. This complete example uses the default 2048-token context
+and 512-token output allowance:
+
+```jsonl
+{"id":"q1","text":"Where does Alice work?","task_args":{"task":"answer","passages":[{"id":"p1","text":"Alice works in Shanghai."}],"options":{"max_answer_scalars":2048,"max_citations":8,"max_quote_scalars":256},"budget":{"max_input_tokens":1536,"max_output_tokens":512,"max_output_bytes":1048576,"max_grammar_states":4096,"max_kv_bytes":369098752}}}
+```
+
+Output frames use `protocol: "fnlp-candidate-int4-source-batch-v1"` and keep
+the canonical inner event under `record`. Every frame names the fixed task,
+actual model-content digest, group width, kernel and candidate provenance.
+`{"flush":true}` completes an epoch before IDs may be reused. Native work,
+mask visits, checkpoints and total transport allowances remain cumulative
+across epochs. **Whole-run success requires `record.event: "run_complete"`
+and exit code 0.** Earlier completed records remain valid after a later
+failure, and any failed document makes the process exit nonzero.
+
+The library surfaces are `SourceTaskPlanner::plan_int4_with_control`,
+`NlpEngine::execute_int4_source_task`, and `NlpEngine::batch_int4_source` with
+`Int4SourceCorpusConfig`. Execution identities retain strict-quantized-v2,
+the actual model/group partition and task-specific prompt, grammar and policy
+digests. This addition covers bounded single-context tasks and ordered
+item-local streams. INT4 long-document map/reduce and source-task durable jobs
+remain separate work. Build verification, model-present correctness and
+quality qualification remain pending gates.
 
 ## Installation
 
