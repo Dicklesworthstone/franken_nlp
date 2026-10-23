@@ -67,7 +67,7 @@ impl Int4ExtractPlan {
     pub fn from_task_plan(task: &TaskPlan, schema: &str, options: JsonDecodeOptions,
         limits: CompileLimits, controls: &TemplateControlIds, identity: ExecutionIdentity,
         group_width: usize) -> Result<Self, Int4ExtractError> {
-        Self::compile(task, schema, options, limits, controls, None, identity, group_width)
+        Self::from_builtin(task, schema, options, limits, controls, None, "extract-v1", identity, group_width)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -75,19 +75,19 @@ impl Int4ExtractPlan {
         limits: CompileLimits, controls: &TemplateControlIds, source: &SourceDocument,
         source_limits: SourceRuntimeLimits, identity: ExecutionIdentity, group_width: usize)
         -> Result<Self, Int4ExtractError> {
-        Self::compile(task, schema, options, limits, controls, Some((source, source_limits)), identity, group_width)
+        Self::from_builtin(task, schema, options, limits, controls, Some((source, source_limits)), "extract-v1", identity, group_width)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn compile(task: &TaskPlan, schema: &str, options: JsonDecodeOptions, limits: CompileLimits,
+    pub(crate) fn from_builtin(task: &TaskPlan, schema: &str, options: JsonDecodeOptions, limits: CompileLimits,
         controls: &TemplateControlIds, source: Option<(&SourceDocument, SourceRuntimeLimits)>,
-        mut identity: ExecutionIdentity, group_width: usize) -> Result<Self, Int4ExtractError> {
+        task_identity: &'static str, mut identity: ExecutionIdentity, group_width: usize) -> Result<Self, Int4ExtractError> {
         // Refuse profile, candidate namespace and group mismatch BEFORE any
         // source copies or grammar construction. Model identity is rechecked
         // against actual resident weights by the native execution boundary.
         constrained_int4::check_profile(&identity, group_width)?;
-        if identity.task_spec != "extract-v1" { return Err(Int4ExtractError::Identity); }
-        let extraction = ExtractPlan::from_builtin(task, schema, options, limits, controls, source, "extract-v1")?;
+        if identity.task_spec != task_identity { return Err(Int4ExtractError::Identity); }
+        let extraction = ExtractPlan::from_builtin(task, schema, options, limits, controls, source, task_identity)?;
         let work = constrained_int4::planned_work(group_width, extraction.prompt.len(), extraction.options.max_new_tokens)?;
         identity.taskir_digest = extraction.taskir_digest;
         identity.prompt_digest = extraction.prompt_digest;
@@ -100,6 +100,16 @@ impl Int4ExtractPlan {
         )).map_err(|_| ExtractError::Serialization)?);
         identity.validate().map_err(|_| Int4ExtractError::Identity)?;
         Ok(Self { extraction, identity, group_width, work })
+    }
+
+    // Built-in task finalization is part of the admitted policy, not a
+    // post-execution relabeling of a generic extraction result.
+    pub(crate) fn with_finalizer_version(mut self, version: &'static str) -> Result<Self, Int4ExtractError> {
+        self.identity.decision_policy_digest = Sha256Digest::of_bytes(&canonjson::canonical_bytes(&(
+            "int4-built-in-finalizer-v1", version, self.identity.decision_policy_digest,
+        )).map_err(|_| ExtractError::Serialization)?);
+        self.identity.validate().map_err(|_| Int4ExtractError::Identity)?;
+        Ok(self)
     }
 
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
@@ -121,18 +131,31 @@ impl Int4ExtractPlan {
     }
 
     pub fn execute<C: DecodeStepControl>(&self, engine: &mut StrictInt4Engine<'_>,
-        admitted: &ExecutionIdentity, vocabulary: &ExtractionVocabulary, mut budget: Int4JsonBudget,
+        admitted: &ExecutionIdentity, vocabulary: &ExtractionVocabulary, budget: Int4JsonBudget,
         control: &mut C) -> Result<Int4ExtractRun, Int4ExtractError> {
-        self.verify_identity(admitted)?;
+        self.execute_with(engine, admitted, vocabulary, budget, control, Ok)
+    }
+
+    /// Compose only shipped task finalizers inside the exclusive native
+    /// session. A semantic/output refusal and late cancellation still abort
+    /// and drain every KV slot before host reservations can be released.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_with<C, T, E, F>(&self, engine: &mut StrictInt4Engine<'_>,
+        admitted: &ExecutionIdentity, vocabulary: &ExtractionVocabulary, mut budget: Int4JsonBudget,
+        control: &mut C, finalize: F) -> Result<T, E>
+    where C: DecodeStepControl, E: From<Int4ExtractError> + From<Int4JsonError>,
+        F: FnOnce(Int4ExtractRun) -> Result<T, E> {
+        self.verify_identity(admitted).map_err(E::from)?;
         if vocabulary.controls != self.extraction.controls {
-            return Err(ExtractError::Contract("vocabulary control registry differs from INT4 plan").into());
+            return Err(E::from(Int4ExtractError::from(ExtractError::Contract(
+                "vocabulary control registry differs from INT4 plan"))));
         }
         budget.json.max_kv_bytes = budget.json.max_kv_bytes.min(self.extraction.max_kv_bytes);
         // The native session owns cleanup and remains live throughout source
         // validation, complete-result accounting and the final checkpoint.
         constrained_int4::decode_json_int4_with(engine, admitted, &self.extraction.prompt,
             &self.extraction.program, &vocabulary.oracle, &self.extraction.options, budget,
-            control, |run| self.finalize(run))
+            control, |run| finalize(self.finalize(run).map_err(E::from)?))
     }
 
     fn finalize(&self, run: Int4JsonRun) -> Result<Int4ExtractRun, Int4ExtractError> {

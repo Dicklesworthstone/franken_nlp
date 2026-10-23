@@ -551,3 +551,19 @@ impl Int8AnswerFinalizer {
             crate::native_engine::strict_int8::STRICT_INT8_PROFILE)
     }
 }
+
+// A distinct finalizer keeps strict-v2 passage QA from accepting an INT8 or
+// BF16 result. Only the source planner can obtain the original passage table.
+pub(super) struct Int4AnswerFinalizer { passages: Vec<PassageLayout> }
+impl AnswerContext {
+    pub(super) fn into_int4_finalizer(self) -> Int4AnswerFinalizer {
+        Int4AnswerFinalizer { passages: self.passages }
+    }
+}
+impl Int4AnswerFinalizer {
+    pub(super) fn finish(&self, raw: ExtractResult, options: AnswerOptions, max_bytes: u64)
+        -> Result<AnswerResult, AnswerError> {
+        finalize_profile(raw, &self.passages, options, max_bytes,
+            crate::native_engine::strict_int4::STRICT_INT4_PROFILE)
+    }
+}
