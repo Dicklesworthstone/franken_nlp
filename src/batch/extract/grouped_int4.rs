@@ -13,7 +13,13 @@ use crate::{
     tokenizer::pinned_controls,
 };
 
-pub struct Int4ExtractionBatchPlanner { compiler: ExtractionBatchPlanner, group_width: usize }
+mod native;
+pub use native::{Int4ExtractionAdmission, Int4ExtractionBatchAdmission, Int4ExtractionBatchLimits,
+    NativeInt4ExtractionBatch};
+
+pub struct Int4ExtractionBatchPlanner {
+    compiler: ExtractionBatchPlanner, group_width: usize, shared_defaults_only: bool,
+}
 pub struct PreparedInt4BatchExtraction {
     plan: Int4ExtractPlan,
     task: TaskPlan,
@@ -53,10 +59,20 @@ impl Int4ExtractionBatchPlanner {
         ceiling: TaskBudget, compiler_limits: CompileLimits, source_limits: SourceRuntimeLimits,
         defaults: Option<ExtractionBatchArgs>) -> Result<Self, BatchFault> {
         Ok(Self { compiler: ExtractionBatchPlanner::pinned_for_backend(controls, eos, identity,
-            ceiling, compiler_limits, source_limits, defaults, ExtractionBackend::Int4 { group_width })?, group_width })
+            ceiling, compiler_limits, source_limits, defaults, ExtractionBackend::Int4 { group_width })?,
+            group_width, shared_defaults_only: false })
     }
     pub fn base_execution_identity(&self) -> &ExecutionIdentity { &self.compiler.identity }
     pub fn group_width(&self) -> usize { self.group_width }
+
+    /// Seal a shared schema/grounding/budget policy for the whole input stream.
+    /// Every explicit task_args override is rejected before document encoding
+    /// or schema/source compilation; ordinary planners retain override support.
+    pub fn require_shared_defaults(mut self) -> Result<Self, BatchFault> {
+        if self.compiler.defaults.is_none() { return Err(BatchCode::InvalidLimits.into()); }
+        self.shared_defaults_only = true;
+        Ok(self)
+    }
 
     /// The SAME caller control brackets bounded tokenization/schema work; no
     /// new deadline, poll quota or no-op controller is installed here.
@@ -68,6 +84,9 @@ impl Int4ExtractionBatchPlanner {
         result
     }
     pub fn prepare(&self, document: BatchDocument<ExtractionBatchArgs>) -> Result<PreparedInt4BatchExtraction, BatchItemFailure> {
+        if self.shared_defaults_only && document.task_args.is_some() {
+            return Err(BatchItemFailure::reject(BatchCode::InvalidEnvelope));
+        }
         let input = self.compiler.prepare_input(document).map_err(planning_fault)?;
         let ExtractionInput { task, source, schema, options, grounded, .. } = input;
         let c = &self.compiler;
