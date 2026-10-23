@@ -35,8 +35,9 @@
 > `candidate source-int4` namespace includes generation/chat, classification,
 > single-document extraction, [NER/keyphrases/cited summaries/passage QA](#implemented-candidate-int4-source-tasks),
 > text cohorts/corpora,
-> [ordered extraction batches](#implemented-candidate-int4-extraction-batches), and
-> [durable extraction jobs](#implemented-candidate-int4-extraction-jobs).
+> [ordered extraction batches](#implemented-candidate-int4-extraction-batches),
+> [durable extraction jobs](#implemented-candidate-int4-extraction-jobs), and
+> [whole-document extraction](#implemented-candidate-int4-whole-document-extraction).
 > Candidate results retain their explicit provenance; build verification,
 > model quality and release qualification remain separate pending gates.
 > The top-level task, batch and job examples below remain the disclosed 1.0
@@ -521,9 +522,76 @@ The library surfaces are `SourceTaskPlanner::plan_int4_with_control`,
 `Int4SourceCorpusConfig`. Execution identities retain strict-quantized-v2,
 the actual model/group partition and task-specific prompt, grammar and policy
 digests. This addition covers bounded single-context tasks and ordered
-item-local streams. INT4 long-document map/reduce and source-task durable jobs
-remain separate work. Build verification, model-present correctness and
+item-local streams. Long-document variants of these four source tasks and
+their durable jobs remain separate work. Build verification, model-present correctness and
 quality qualification remain pending gates.
+
+## Implemented candidate INT4 whole-document extraction
+
+`fnlp candidate source-int4 extract-map` applies one exact schema to every
+chunk of a complete UTF-8 document. The pinned source encoder derives a
+lossless partition, and the planner checks each chunk against the actual
+schema and prompt capacity. All chunks and cumulative work are admitted
+before the first native forward. One resident model and engine serve the
+whole document, and only a fully verified completed result is published.
+
+For example, this bounded schema permits a list of exact source strings in
+each chunk:
+
+```json
+{"type":"array","maxItems":8,"items":{"type":"string","maxLength":128,"x-fnlp-source":"verbatim"}}
+```
+
+```bash
+fnlp candidate source-int4 extract-map long-document.txt \
+  --schema exact-spans.schema.json --source-membership \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$EXPECTED_MODEL_SHA256" \
+  --memory-mib 8192 --max-chunks 64 \
+  --max-input-bytes 1048576 --max-map-result-bytes 16777216 \
+  > document-result.json
+```
+
+Use `--source-dir DIR --source-manifest FILE` for source conversion instead.
+Optional `--save-snapshot NEW_FILE` occurs after the complete document
+preflights; a later task failure preserves the completed snapshot. All model
+inputs remain explicit candidate inputs with the actual model digest, group
+width and kernel carried in output provenance.
+
+The result retains an ordered sequence of **independent exact-schema JSON
+strings**, chunk byte/scalar ranges, cumulative native work and source
+evidence. Exact decimal spelling in schema-constrained JSON survives. With
+`--source-membership`, each extracted value is checked against every compatible
+occurrence **within the chunk that produced it**, and those intervals are
+lifted to original-document coordinates. It does not discover occurrences in
+other chunks from which that value was not extracted. Repeated occurrences
+stay explicit; Unicode-scalar coordinates are distinct from byte coordinates.
+
+Each chunk must independently satisfy the schema. For example, a required
+verbatim constant present in only one chunk makes the complete request fail;
+the command does not invent the field in other chunks, skip them, or repair
+their outputs. Independent objects are not combined into a global object.
+Chunked inference also has no overlapping-window or single-context equivalence
+guarantee.
+
+`--max-result-bytes` bounds each typed chunk result, while
+`--max-map-result-bytes` bounds the complete document result. `--max-chunks`,
+`--max-chunk-bytes` and `--max-tokenizer-calls` bound partition planning.
+Native work ceilings cover forward positions, projected logits, attention
+pairs, actual group-dependent dot products and multiply-accumulates.
+`--max-total-mask-node-visits`, source field/occurrence verification budgets,
+and live/total reduction bytes remain nonrenewable across chunks. Exceeding a
+limit returns an error without publishing a successful prefix.
+
+The CLI admits storage for every prepared schema/prompt, the whole reduction
+frontier, complete occurrence vectors and final output, in addition to the
+resident model and full context. Its default preparation reserve is 1024 MiB;
+larger chunk counts or evidence/output limits may require an explicit larger
+reserve and process memory ceiling. The library equivalents are
+`Int4ExtractionBatchPlanner::plan_document_with_control` and
+`NlpEngine::extract_int4_document` with `Int4ExtractionMapConfig`. This is
+source-inventoried candidate functionality; build, model-present correctness
+and quality qualification remain pending.
 
 ## Installation
 

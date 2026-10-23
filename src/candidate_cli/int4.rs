@@ -8,6 +8,7 @@ mod classify;
 mod extract;
 mod extract_batch;
 mod extract_job;
+mod extract_map;
 mod source;
 mod source_batch;
 mod prefill;
@@ -105,6 +106,7 @@ enum Int4Task {
     Source(crate::candidate_cli::source::Kind, source::SourceArgs),
     SourceBatch(source_batch::BatchArgs),
     ExtractBatch(extract_batch::BatchArgs),
+    ExtractMap(extract_map::MapArgs),
     ExtractJob,
 }
 #[derive(Clone, Copy)]
@@ -136,6 +138,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(extract::definition())
         .subcommand(extract_batch::definition())
         .subcommand(extract_job::definition())
+        .subcommand(extract_map::definition())
         .subcommands(source::definitions())
         .subcommands(source_batch::definitions())
         .subcommand(batch::definition())
@@ -163,6 +166,7 @@ impl Int4Command {
             "classify" => Int4Task::Classify(classify::ScoringArgs::from_matches(matches)?),
             "extract" => Int4Task::Extract(extract::ExtractionArgs::from_matches(matches)?),
             "extract-batch" => Int4Task::ExtractBatch(extract_batch::BatchArgs::from_matches(matches)?),
+            "extract-map" => Int4Task::ExtractMap(extract_map::MapArgs::from_matches(matches)?),
             "ner" | "keyphrases" | "summarize" | "answer" => Int4Task::Source(
                 crate::candidate_cli::source::Kind::named(name).ok_or_else(||
                     clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source task refused"))?,
@@ -203,13 +207,17 @@ impl Int4Command {
             if self.task != Int4Task::Text(batch.task()) { return Err(CandidateError::Arguments); }
             return batch.execute(self.args, input, output);
         }
+        if let Int4Task::ExtractMap(options) = self.task {
+            return options.execute(self.args, input, output);
+        }
         let limits = match &self.task {
             Int4Task::Text(_) => self.args.validate()?,
             Int4Task::Classify(scoring) => scoring.validate(&self.args)?,
             Int4Task::Extract(extraction) => extraction.validate(&self.args)?,
             Int4Task::Source(_, source) => source.validate(&self.args)?,
             // The blocking stream must own its input and writer through cleanup.
-            Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ExtractJob => return Err(CandidateError::Arguments),
+            Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ExtractMap(_)
+                | Int4Task::ExtractJob => return Err(CandidateError::Arguments),
         };
         #[cfg(feature = "asupersync-runtime")]
         { runtime::execute_task(self.task, self.args, limits, input, output) }

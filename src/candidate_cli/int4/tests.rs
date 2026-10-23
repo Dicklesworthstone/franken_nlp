@@ -178,6 +178,7 @@ fn exact_host_detection_authorizes_a_kernel_or_refuses_before_any_input() {
                 Int4Task::Extract(extraction) => extraction.validate(&command.args),
                 Int4Task::Source(_, source) => source.validate(&command.args),
                 Int4Task::ExtractBatch(batch) => batch.validate(&command.args).map(|limits| limits.common),
+                Int4Task::ExtractMap(map) => map.validate(&command.args).map(|limits| limits.common),
                 Int4Task::SourceBatch(batch) => batch.validate(&command.args).map(|limits| limits.common),
                 Int4Task::ExtractJob => Err(CandidateError::Arguments),
             };
@@ -207,6 +208,7 @@ fn physical_kernel_selection_does_not_change_layout_memory_or_generation_options
             Int4Task::Extract(extraction) => extraction.validate(&command.args).unwrap(),
             Int4Task::Source(_, source) => source.validate(&command.args).unwrap(),
             Int4Task::ExtractBatch(batch) => batch.validate(&command.args).unwrap().common,
+            Int4Task::ExtractMap(map) => map.validate(&command.args).unwrap().common,
             Int4Task::SourceBatch(batch) => batch.validate(&command.args).unwrap().common,
             Int4Task::ExtractJob => panic!("job is not a single-task kernel fixture"),
         };
