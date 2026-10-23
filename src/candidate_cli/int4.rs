@@ -12,6 +12,7 @@ mod extract_map;
 mod source;
 mod source_batch;
 mod source_job;
+mod source_map;
 mod prefill;
 mod batch;
 #[cfg(feature = "asupersync-runtime")]
@@ -106,6 +107,7 @@ enum Int4Task {
     Text(Task), Classify(classify::ScoringArgs), Extract(extract::ExtractionArgs),
     Source(crate::candidate_cli::source::Kind, source::SourceArgs),
     SourceBatch(source_batch::BatchArgs),
+    SourceMap(source_map::MapArgs),
     ExtractBatch(extract_batch::BatchArgs),
     ExtractMap(extract_map::MapArgs),
     ExtractJob,
@@ -136,7 +138,7 @@ pub(super) fn definition() -> clap::Command {
         .mut_arg("prefill_rows", |arg| arg.help("Explicit grouped-INT4 layer-major prompt execution, 1..=64 rows; extra workspace is process-admitted"));
     clap::Command::new("source-int4")
         .about("Run candidate INT4 tasks from pinned sources or a digest-pinned local snapshot")
-        .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Sequential native execution defaults to scalar; --kernel explicitly selects an existing hardware-checked integer leaf. Text tasks can opt in to bounded layer-major prompt execution with --prefill-rows; structured tasks cannot. text-batch runs one finite NDJSON cohort and emits one completed aggregate JSON object. text-corpus processes bounded windows with one resident model and cumulative budgets, emitting completed-window NDJSON with a required corpus_complete footer. extract-batch streams documents under one shared schema through one resident model and engine. ner, keyphrases, summarize and answer preserve their source-task semantics; their -batch commands run ordered typed source-task NDJSON. Every ordered batch requires run_complete plus exit 0 for whole-run success. extract-job start/resume retains ordered extraction results in an explicit protected spool. ner-job, keyphrases-job, summarize-job and answer-job provide the same opt-in durable start/resume contract for source tasks. Resume authenticates the complete original population, exact task configuration, model/group identity and immutable lifetime limits. No automatic selection, fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Outputs are completed results, not provisional token events.")
+        .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Sequential native execution defaults to scalar; --kernel explicitly selects an existing hardware-checked integer leaf. Text tasks can opt in to bounded layer-major prompt execution with --prefill-rows; structured tasks cannot. text-batch runs one finite NDJSON cohort and emits one completed aggregate JSON object. text-corpus processes bounded windows with one resident model and cumulative budgets, emitting completed-window NDJSON with a required corpus_complete footer. extract-batch streams documents under one shared schema through one resident model and engine. ner, keyphrases, summarize and answer preserve their source-task semantics; their -batch commands run ordered typed source-task NDJSON. Every ordered batch requires run_complete plus exit 0 for whole-run success. ner-map and keyphrases-map process every chunk of a complete document with original-coordinate evidence; summarize-map produces a deterministic exact cited bullet union. All map commands preflight the complete document and publish one completed result. extract-job start/resume retains ordered extraction results in an explicit protected spool. ner-job, keyphrases-job, summarize-job and answer-job provide the same opt-in durable start/resume contract for source tasks. Resume authenticates the complete original population, exact task configuration, model/group identity and immutable lifetime limits. No automatic selection, fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Outputs are completed results, not provisional token events.")
         .subcommand_required(true)
         .subcommand(task("generate", "Generate from a bounded UTF-8 prompt using the pinned template"))
         .subcommand(task("chat", "Complete a bounded JSON system/user/assistant transcript"))
@@ -148,6 +150,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommands(source::definitions())
         .subcommands(source_batch::definitions())
         .subcommands(source_job::definitions())
+        .subcommands(source_map::definitions())
         .subcommand(batch::definition())
         .subcommand(batch::corpus::definition())
 }
@@ -184,6 +187,11 @@ impl Int4Command {
                 crate::candidate_cli::source::Kind::named(name).ok_or_else(||
                     clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source task refused"))?,
                 source::SourceArgs::from_matches(matches)?),
+            "ner-map" | "keyphrases-map" | "summarize-map" => {
+                let kind = crate::candidate_cli::source::Kind::named(name.trim_end_matches("-map"))
+                    .ok_or_else(|| clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source map task refused"))?;
+                Int4Task::SourceMap(source_map::MapArgs::from_matches(kind, matches)?)
+            }
             "ner-batch" | "keyphrases-batch" | "summarize-batch" | "answer-batch" => {
                 let kind = crate::candidate_cli::source::Kind::named(name.trim_end_matches("-batch"))
                     .ok_or_else(|| clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source batch task refused"))?;
@@ -227,13 +235,16 @@ impl Int4Command {
         if let Int4Task::ExtractMap(options) = self.task {
             return options.execute(self.args, input, output);
         }
+        if let Int4Task::SourceMap(options) = self.task {
+            return options.execute(self.args, input, output);
+        }
         let limits = match &self.task {
             Int4Task::Text(_) => self.args.validate()?,
             Int4Task::Classify(scoring) => scoring.validate(&self.args)?,
             Int4Task::Extract(extraction) => extraction.validate(&self.args)?,
             Int4Task::Source(_, source) => source.validate(&self.args)?,
             // The blocking stream must own its input and writer through cleanup.
-            Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ExtractMap(_)
+            Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
                 | Int4Task::ExtractJob | Int4Task::SourceJob => return Err(CandidateError::Arguments),
         };
         #[cfg(feature = "asupersync-runtime")]

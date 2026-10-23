@@ -523,9 +523,142 @@ The library surfaces are `SourceTaskPlanner::plan_int4_with_control`,
 `Int4SourceCorpusConfig`. Execution identities retain strict-quantized-v2,
 the actual model/group partition and task-specific prompt, grammar and policy
 digests. This addition covers bounded single-context tasks and ordered
-item-local streams. Their opt-in durable jobs are described below; long-document
-variants of these four source tasks remain separate work. Build verification,
-model-present correctness and quality qualification remain pending gates.
+item-local streams. Their opt-in durable jobs and the complete-document NER,
+keyphrase and cited-summary routes are described below. Passage QA remains
+explicitly passage-based. Build verification, model-present correctness and
+quality qualification remain pending gates.
+
+## Implemented candidate INT4 whole-document source tasks
+
+The three commands `fnlp candidate source-int4 ner-map`, `keyphrases-map`
+and `summarize-map` process **one complete UTF-8 document**. The pinned
+tokenizer partitions the source without normalization or omission, including
+whitespace and CR/LF. The exact selected task, options, schema and prompt
+scaffold determine each chunk's available context. All chunks and their
+combined work preflight before the first native forward.
+
+`ner-map` retains typed entity results and all independently verified
+compatible occurrences within each contributing chunk, lifted to the
+original document's byte and Unicode-scalar coordinates. `keyphrases-map`
+retains exact-source phrases and their per-chunk ranks; it does not invent a
+global phrase ranking. Both outputs preserve the complete ordered chunk
+population and its lineage.
+
+For example, process a document from the pinned local conversion sources:
+
+```bash
+fnlp candidate source-int4 ner-map report.txt \
+  --source-dir /models/Nanbeige4.2-3B \
+  --source-manifest /models/nanbeige-source-manifest.json \
+  --memory-mib 8192 --group-width 128 \
+  --max-chunks 64 --max-input-bytes 1048576
+```
+
+Use a previously converted, independently pinned snapshot for repeated
+document processing:
+
+```bash
+fnlp candidate source-int4 keyphrases-map report.txt \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --memory-mib 8192 --group-width 128
+```
+
+The optional local `--options FILE` uses the selected task's **complete**
+single-source options. Examples are
+`{"types":["person","organization","location"],"max_entities":64,"max_mention_scalars":256}`
+for NER and `{"max_phrases":16,"max_phrase_scalars":256}` for
+keyphrases. Unknown keys, duplicate keys, partial options and task switching
+are refused. Free-text generation controls and prefill overrides are not
+accepted.
+
+### Complete cited-summary union
+
+`summarize-map` executes the cited summary task on every chunk, independently
+checks source membership, and returns one deterministic ranked union.
+Only **exact bullet text** deduplicates candidates. All independently
+verified citations survive intermediate reductions; the final
+`--max-summary-bullets` cap is applied once after every chunk completes.
+Ranking uses distinct supporting chunk count, local rank sum, earliest
+source occurrence, and then exact bullet text as a deterministic tie-break.
+
+For a `summary-options.json` file:
+
+```json
+{"max_bullets":8,"max_bullet_scalars":512,"max_citations_per_bullet":4,"max_quote_scalars":256}
+```
+
+```bash
+fnlp candidate source-int4 summarize-map report.txt \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --memory-mib 8192 --group-width 128 \
+  --options summary-options.json \
+  --max-summary-bullets 12
+```
+
+Here the options file permits up to eight bullets **per chunk**, while the
+command permits twelve bullets in the complete final union. The independent
+summary aggregation budgets default to 4,096 unique bullets, 16,384
+citations, 65,536 evidence spans, 4 MiB of aggregate value storage and
+536,870,912 verification scan steps. Their explicit switches are
+`--max-summary-unique-bullets`, `--max-summary-citations`,
+`--max-summary-evidence-spans`, `--max-summary-value-bytes` and
+`--max-summary-scan-steps`. These switches are accepted only for
+`summarize-map`.
+
+This is deterministic reduction of independently generated cited bullets.
+It performs no neural hierarchical synthesis, paraphrase reconciliation or
+contradiction resolution. Citation validity proves structural source
+membership; semantic support and quality remain unassessed. Chunk boundaries
+may split context, and support frequency is not calibrated importance or
+confidence. The output retains these limitations and reports any final
+omitted-bullet count.
+
+### Complete-document limits and delivery
+
+The default original-source byte ceiling is 1 MiB, the chunk ceiling is 64,
+and tokenization is bounded to 8,192 calls. `--max-chunk-bytes` can impose an
+additional byte cap. These are independent ceilings: a document below the
+byte limit can still exceed the number of chunks or task context capacity.
+No truncation or successful-prefix result is substituted when a limit fails.
+
+`--max-result-bytes` bounds each chunk result (1 MiB by default);
+`--max-map-result-bytes` bounds the whole document output (16 MiB by default).
+The reduction frontier has separate `--max-live-value-bytes` and
+`--max-total-value-bytes` limits. Preparation defaults to 1,024 MiB, plus a
+64 MiB reduction reserve. CLI admission prices all retained preparations,
+the original source, full map/frontier/evidence workspace and guarded final
+output; the host independently reserves the corresponding ledger charges.
+Raising aggregate summary/evidence limits may require a larger
+`--reduction-reserve-mib` and `--memory-mib`. These are modeled memory
+reservations, not measured RSS guarantees.
+
+The five explicit native work ceilings are `--max-forward-positions`,
+`--max-projected-logits`, `--max-attention-pairs`, `--max-dot-products` and
+`--max-multiply-accumulates`. Dot products count the actual selected INT4
+group partition. `--max-mask-node-visits` bounds each chunk's grammar work;
+`--max-total-mask-node-visits` is the nonrenewable complete-document
+allowance. Independent map verification uses `--max-source-fields`,
+`--max-source-evidence-spans` and `--max-source-scan-steps`; summary
+reverification has its separate complete-document budgets above. None of
+these aggregate work allowances renews for another chunk.
+
+Successful stdout is one bounded JSON object with protocol
+`fnlp-candidate-int4-source-map-v1`, actual model/group/kernel provenance
+and the complete result under `output`. Any failed chunk, incomplete
+population, cancellation, invalid citation or failed reduction prevents
+publication. Output staging, write and flush retain the hosted output
+guard; a write or flush error remains a failure. Optional
+`--save-snapshot NEW_FILE` runs only after complete source preflight; a
+completed snapshot survives a later task error.
+
+The library surfaces are `SourceTaskPlanner::plan_int4_map_with_control`,
+`NlpEngine::map_int4_source`, and `NlpEngine::summarize_int4_source`, with
+`Int4SourceMapConfig` and `Int4SummaryLimits`. This remains the explicit
+source-inventoried candidate rail. Model-present execution, quality,
+performance and release qualification have not been established by these
+implementation fixtures.
 
 ## Implemented candidate INT4 source-task jobs
 

@@ -1,0 +1,205 @@
+//! Real pinned task/chunk preparation only; no fixture claims native inference.
+use super::*;
+use crate::{
+    artifact::converter::PINNED_REVISION,
+    execution_identity::{ExecutionIdentity, NumericsProfile, Sha256Digest, ThinkingMode, ToolMode},
+    native_engine::{generation::grouped_int4::INT4_SOURCE_FORMAT,
+        portable_int8::int4::convert::GROUPED_INT4_RECIPE, strict_int4::STRICT_INT4_EXECUTION},
+    tokenizer::pinned_controls,
+};
+
+fn fixture(kind: Kind, width: usize) -> (SourceTaskPlanner, Int4SourceMapConfig, Option<Int4SummaryLimits>) {
+    let width_arg = width.to_string();
+    let command = super::super::tests::command(kind,
+        &["--max-chunk-bytes", "16", "--max-new-tokens", "16", "--group-width", &width_arg]);
+    let Int4Task::SourceMap(options) = command.task else { panic!("wrong source map task"); };
+    let limits = options.validate(&command.args).unwrap();
+    let budget = options.source.budget(&command.args, limits.common);
+    let controls = pinned_controls::pinned().unwrap();
+    let eos = controls.template_controls().entries().iter()
+        .find(|entry| entry.special && entry.surface == crate::template::IM_END).unwrap().id;
+    let planner = SourceTaskPlanner::pinned(controls.template_controls(), eos).unwrap();
+    let d = Sha256Digest::of_bytes(b"metadata-only-INT4-source-map-CLI-fixture");
+    let packing = Sha256Digest::of_bytes(&canonjson::canonical_bytes(&(
+        INT4_SOURCE_FORMAT, "low-nibble-first-no-padding-f32le-scales-v1", d, width,
+    )).unwrap());
+    let identity = ExecutionIdentity {
+        schema_version: 1, source_revision: PINNED_REVISION.to_owned(), logical_model_digest: d,
+        artifact_format: INT4_SOURCE_FORMAT.to_owned(), quant_recipe: format!("{GROUPED_INT4_RECIPE}:group={width}"),
+        packing_set_digest: packing, tokenizer_digest: planner.tokenizer_digest(), template_digest: *planner.template_digest(),
+        task_spec: source::task(kind).spec().identity(), taskir_digest: d, prompt_digest: d,
+        grammar_compiler_version: "uncompiled".to_owned(), schema_digest: d,
+        numerics_profile: NumericsProfile::StrictQuantized { version: 2 }, kv_dtype: "bf16".to_owned(),
+        sampler_version: "uncompiled".to_owned(), thinking_mode: ThinkingMode::Disabled, tool_mode: ToolMode::None,
+        calibration_digest: d, decision_policy_digest: d, backend_semantic_version: STRICT_INT4_EXECUTION.to_owned(),
+        host_class: None, compiler_identity: None,
+    };
+    let (_, task) = options.request(SOURCE.to_owned(), None, budget, command.args.max_input_bytes).unwrap();
+    let config = Int4SourceMapConfig { identity, task, budget, planning: options.source.planning(&command.args),
+        mapping: limits.mapping, native: NativeLimits { context_tokens: command.args.context_tokens,
+            allocator_reserve_bytes: ALLOCATOR_BYTES, run: RunLimits { max_elapsed: Duration::from_secs(1),
+                max_checkpoints: 1000, cleanup_reserve_bytes: CLEANUP_BYTES } },
+        preparation_reserve_bytes: limits.common.preparation_bytes, reduction_reserve_bytes: limits.reduction_reserve_bytes };
+    (planner, config, limits.summary)
+}
+struct Control { calls: usize, stop_at: usize, cause: DecodeCancellationKind }
+impl DecodeStepControl for Control {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+        self.calls += 1; (self.calls >= self.stop_at).then_some(self.cause)
+    }
+}
+fn continuing() -> Control { Control { calls: 0, stop_at: usize::MAX, cause: DecodeCancellationKind::PollQuota } }
+const SOURCE: &str = "é\r\n上海 source <tool_call> and another paragraph\r\n";
+
+#[test]
+fn all_tasks_preflight_every_original_byte_and_keep_real_grouped_work() {
+    for kind in [Kind::Ner, Kind::Keyphrases, Kind::Summarize] {
+        let (planner, config, summary) = fixture(kind, 32);
+        let expected = preflight(SOURCE, &planner, &config, 32, summary, &mut continuing()).unwrap();
+        assert!(expected.chunk_count() > 1);
+        assert_eq!((expected.source_span().byte_start, expected.source_span().byte_end), (0, SOURCE.len()));
+        assert_eq!((expected.source_span().scalar_start, expected.source_span().scalar_end), (0, SOURCE.chars().count()));
+        assert_eq!(expected.group_width(), 32);
+        let context = PlanContext::new(&config.identity, config.budget).unwrap();
+        let second = planner.plan_int4_map_with_control(SOURCE, &config.task, config.budget, &context,
+            config.planning, config.mapping, 32, &mut continuing()).unwrap();
+        assert_eq!(second.preflight_metadata(), expected);
+        assert_eq!(second.execution_identities().len(), expected.chunk_count());
+        assert_eq!(expected.reserved_mask_visits(), config.mapping.mask_visits_per_chunk * expected.chunk_count() as u64);
+        for identity in second.execution_identities() {
+            assert_eq!(identity.task_spec, source::task(kind).spec().identity());
+            assert_eq!(identity.numerics_profile, NumericsProfile::StrictQuantized { version: 2 });
+        }
+        let (planner, config, summary) = fixture(kind, 128);
+        let larger = preflight(SOURCE, &planner, &config, 128, summary, &mut continuing()).unwrap();
+        assert_eq!(expected.planned_work().forward_positions, larger.planned_work().forward_positions);
+        assert_eq!(expected.planned_work().projections.multiply_accumulates, larger.planned_work().projections.multiply_accumulates);
+        assert!(expected.planned_work().projections.dot_products > larger.planned_work().projections.dot_products);
+    }
+}
+
+#[test]
+fn whole_document_native_and_mask_allowances_cannot_restart_per_chunk() {
+    let (planner, mut config, _) = fixture(Kind::Ner, 32);
+    let expected = preflight(SOURCE, &planner, &config, 32, None, &mut continuing()).unwrap();
+    let original = config.mapping;
+    for axis in 0..6 {
+        config.mapping = original;
+        config.mapping.max_model_work = expected.planned_work();
+        config.mapping.max_mask_visits = expected.reserved_mask_visits();
+        match axis {
+            0 => config.mapping.max_model_work.forward_positions -= 1,
+            1 => config.mapping.max_model_work.projected_logits -= 1,
+            2 => config.mapping.max_model_work.attention_pairs -= 1,
+            3 => config.mapping.max_model_work.projections.dot_products -= 1,
+            4 => config.mapping.max_model_work.projections.multiply_accumulates -= 1,
+            _ => config.mapping.max_mask_visits -= 1,
+        }
+        assert_eq!(preflight(SOURCE, &planner, &config, 32, None, &mut continuing()), Err(CandidateError::Planning));
+    }
+    config.mapping.max_model_work = expected.planned_work();
+    config.mapping.max_mask_visits = expected.reserved_mask_visits();
+    assert_eq!(preflight(SOURCE, &planner, &config, 32, None, &mut continuing()).unwrap(), expected);
+}
+
+#[test]
+fn summary_final_top_k_never_changes_the_complete_map_population() {
+    let (planner, config, summary) = fixture(Kind::Summarize, 32);
+    let expected = preflight(SOURCE, &planner, &config, 32, summary, &mut continuing()).unwrap();
+    let mut one = summary.unwrap(); one.max_bullets = 1;
+    assert_eq!(preflight(SOURCE, &planner, &config, 32, Some(one), &mut continuing()).unwrap(), expected);
+    one.aggregation.max_unique_bullets = 0;
+    assert_eq!(preflight(SOURCE, &planner, &config, 32, Some(one), &mut continuing()), Err(CandidateError::Planning));
+    let (planner, config, _) = fixture(Kind::Ner, 32);
+    assert_eq!(preflight(SOURCE, &planner, &config, 32, summary, &mut continuing()), Err(CandidateError::Planning));
+}
+
+#[test]
+fn source_cannot_be_truncated_or_normalized_to_force_context_fit() {
+    let (planner, mut config, summary) = fixture(Kind::Keyphrases, 32);
+    assert_eq!(preflight("", &planner, &config, 32, summary, &mut continuing()), Err(CandidateError::Input));
+    config.mapping.chunks.max_chunks = 1;
+    assert_eq!(preflight(SOURCE, &planner, &config, 32, summary, &mut continuing()), Err(CandidateError::Planning));
+    config.mapping.chunks.max_chunks = 64;
+    let source = "é\r\n                 上海";
+    let expected = preflight(source, &planner, &config, 32, summary, &mut continuing()).unwrap();
+    assert!(expected.chunk_count() > 1);
+    assert_eq!(expected.source_span().byte_end, source.len());
+    assert_eq!(expected.source_span().scalar_end, source.chars().count());
+    config.mapping.chunks.max_input_bytes = source.len() - 1;
+    assert_eq!(preflight(source, &planner, &config, 32, summary, &mut continuing()), Err(CandidateError::Planning));
+}
+
+#[test]
+fn caller_cancellation_survives_the_last_preflight_checkpoint() {
+    let (planner, config, summary) = fixture(Kind::Summarize, 32);
+    let mut complete = continuing();
+    preflight(SOURCE, &planner, &config, 32, summary, &mut complete).unwrap();
+    assert!(complete.calls > 2);
+    for stop_at in [1, 2, complete.calls] {
+        let mut control = Control { stop_at, ..continuing() };
+        assert_eq!(preflight(SOURCE, &planner, &config, 32, summary, &mut control), Err(CandidateError::Execution));
+    }
+    for cause in [DecodeCancellationKind::Deadline, DecodeCancellationKind::Timeout] {
+        let mut control = Control { calls: 0, stop_at: 1, cause };
+        assert_eq!(preflight(SOURCE, &planner, &config, 32, summary, &mut control), Err(CandidateError::Timeout));
+        let context = PlanContext::new(&config.identity, config.budget).unwrap();
+        let error = planner.plan_int4_map_with_control(SOURCE, &config.task, config.budget, &context,
+            config.planning, config.mapping, 32, &mut Control { calls: 0, stop_at: 1, cause }).err().unwrap();
+        assert_eq!(execution_error(HostedError::Int4(Int4HostError::SourceMap(error))), CandidateError::Timeout);
+    }
+    complete.stop_at = complete.calls + 1;
+    assert_eq!(preflight(SOURCE, &planner, &config, 32, summary, &mut complete), Err(CandidateError::Execution));
+}
+
+#[test]
+fn full_host_workspace_matches_cli_for_maps_and_final_summary() {
+    for kind in [Kind::Ner, Kind::Keyphrases, Kind::Summarize] {
+        let (_, config, _) = fixture(kind, 128);
+        for chunks in [1, config.mapping.chunks.max_chunks] {
+            assert_eq!(config.workspace_bytes(chunks).unwrap(),
+                workspace_bytes(config.budget, config.mapping, chunks, config.reduction_reserve_bytes).unwrap());
+        }
+        let command = super::super::tests::command(kind, &[]);
+        let Int4Task::SourceMap(options) = command.task else { panic!("wrong task"); };
+        let limits = options.validate(&command.args).unwrap();
+        // Chunk byte/output-token choices may alter preparation or output
+        // bytes, so compare the exact matching budget as well as maximum count.
+        let mut quoted = config;
+        quoted.budget = options.source.budget(&command.args, limits.common);
+        quoted.mapping = limits.mapping;
+        assert_eq!(quoted.workspace_bytes(limits.mapping.chunks.max_chunks).unwrap(), limits.workspace_bytes);
+    }
+}
+
+#[test]
+fn complete_publication_keeps_provenance_and_original_coordinates_and_refuses_oversize() {
+    let output = serde_json::json!({"fixture_only":true,"source_span":{"byte_start":0,"byte_end":17,
+        "scalar_start":0,"scalar_end":11},"mapped_chunks":2,"bullets":[
+            {"text":"Untrusted <tool_call>","evidence":[{"chunk_id":1,"quote":"上海","byte_start":8,"byte_end":14}]}]});
+    let provenance = Provenance { protocol: "fnlp-candidate-int4-source-map-v1", schema_version: 1,
+        scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "summarize",
+        model_id: "Nanbeige4.2-3B", source_revision: "fixture", source_root_sha256: "fixture-source",
+        model_content_sha256: "fixture-model", candidate_format: INT4_SOURCE_FORMAT,
+        quant_recipe: "fixture:group=32", group_width: 32, integer_kernel: "s_scalar_i32", snapshot: None };
+    let response = Response { provenance: &provenance, output: &output };
+    let mut bytes = Vec::new(); publish(&response, 4096, &mut bytes).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["output"], output);
+    assert_eq!(value["evidence"], "non_authoritative");
+    assert_eq!(value["task"], "summarize");
+    for absent in ["source_dir", "source_manifest", "options", "snapshot_path", "prompt_digest"] {
+        assert!(value.get(absent).is_none());
+    }
+    let mut refused = Vec::new();
+    assert_eq!(publish(&response, 1, &mut refused), Err(CandidateError::Output));
+    assert!(refused.is_empty());
+    struct FlushFailure(Vec<u8>);
+    impl Write for FlushFailure {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> { self.0.extend_from_slice(bytes); Ok(bytes.len()) }
+        fn flush(&mut self) -> io::Result<()> { Err(io::Error::other("fixture flush failure")) }
+    }
+    let mut failed = FlushFailure(Vec::new());
+    assert_eq!(publish(&response, 4096, &mut failed), Err(CandidateError::Output));
+    assert!(!failed.0.is_empty(), "transport failure is not a successful task response");
+}
