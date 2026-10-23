@@ -165,5 +165,9 @@ fn admission_failure(error: HostedError) -> BatchItemFailure {
     }
 }
 
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod jobs;
+
 #[cfg(test)]
 mod tests;
