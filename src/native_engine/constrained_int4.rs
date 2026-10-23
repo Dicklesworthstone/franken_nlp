@@ -307,3 +307,4 @@ fn run<V: Vocabulary, D: Driver>(group_width: usize, prompt: &[u32], program: &J
     Err(JsonDecodeError::BudgetExceeded("output tokens").into())
 }
 
+#[cfg(test)] mod tests;
