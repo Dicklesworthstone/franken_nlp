@@ -6,6 +6,7 @@ use crate::native_engine::{int4::PackedInt4Kernel, simd::Int8KernelKind,
 
 mod classify;
 mod extract;
+mod extract_batch;
 mod prefill;
 mod batch;
 #[cfg(feature = "asupersync-runtime")]
@@ -96,7 +97,10 @@ struct Int4Args {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum Int4Task { Text(Task), Classify(classify::ScoringArgs), Extract(extract::ExtractionArgs) }
+enum Int4Task {
+    Text(Task), Classify(classify::ScoringArgs), Extract(extract::ExtractionArgs),
+    ExtractBatch(extract_batch::BatchArgs),
+}
 #[derive(Clone, Copy)]
 enum Int4BatchCommand { Fixed(batch::BatchArgs), Corpus(batch::corpus::CorpusArgs) }
 impl Int4BatchCommand {
@@ -115,12 +119,13 @@ pub(super) fn definition() -> clap::Command {
         .mut_arg("prefill_rows", |arg| arg.help("Explicit grouped-INT4 layer-major prompt execution, 1..=64 rows; extra workspace is process-admitted"));
     clap::Command::new("source-int4")
         .about("Run candidate INT4 tasks from pinned sources or a digest-pinned local snapshot")
-        .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Sequential native execution defaults to scalar; --kernel explicitly selects an existing hardware-checked integer leaf. Text tasks can opt in to bounded layer-major prompt execution with --prefill-rows; classification and extraction cannot. text-batch runs one finite NDJSON cohort and emits one completed aggregate JSON object. text-corpus processes bounded windows with one resident model and cumulative budgets, emitting completed-window NDJSON with a required corpus_complete footer. No automatic selection, fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Outputs are completed results, not provisional token events.")
+        .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Sequential native execution defaults to scalar; --kernel explicitly selects an existing hardware-checked integer leaf. Text tasks can opt in to bounded layer-major prompt execution with --prefill-rows; classification and extraction cannot. text-batch runs one finite NDJSON cohort and emits one completed aggregate JSON object. text-corpus processes bounded windows with one resident model and cumulative budgets, emitting completed-window NDJSON with a required corpus_complete footer. extract-batch streams documents under one shared schema through one resident model and engine, with ordered result/error frames and a required run_complete plus exit 0. No automatic selection, fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Outputs are completed results, not provisional token events.")
         .subcommand_required(true)
         .subcommand(task("generate", "Generate from a bounded UTF-8 prompt using the pinned template"))
         .subcommand(task("chat", "Complete a bounded JSON system/user/assistant transcript"))
         .subcommand(classify::definition())
         .subcommand(extract::definition())
+        .subcommand(extract_batch::definition())
         .subcommand(batch::definition())
         .subcommand(batch::corpus::definition())
 }
@@ -141,9 +146,27 @@ impl Int4Command {
             "chat" => Int4Task::Text(Task::Chat),
             "classify" => Int4Task::Classify(classify::ScoringArgs::from_matches(matches)?),
             "extract" => Int4Task::Extract(extract::ExtractionArgs::from_matches(matches)?),
+            "extract-batch" => Int4Task::ExtractBatch(extract_batch::BatchArgs::from_matches(matches)?),
             _ => return Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source-int4 task refused")),
         };
         Ok(Self { task, args: Int4Args::from_arg_matches(matches)?, batch: None })
+    }
+    /// Corpus execution owns both streams until the hosted invocation drains.
+    pub(super) fn run_owned<R: Read + Send + 'static, W: Write + Send + 'static>(
+        self, mut input: R, mut output: W, diagnostics: &mut impl Write,
+    ) -> ExitCode {
+        let result = match self {
+            Self { task: Int4Task::ExtractBatch(options), args, batch: None } =>
+                options.execute_owned(args, input, output),
+            command => command.execute(&mut input, &mut output),
+        };
+        match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                let _ = writeln!(diagnostics, "fnlp candidate: {}", error.message());
+                error.exit_code()
+            }
+        }
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
         if let Some(batch) = self.batch {
@@ -154,6 +177,8 @@ impl Int4Command {
             Int4Task::Text(_) => self.args.validate()?,
             Int4Task::Classify(scoring) => scoring.validate(&self.args)?,
             Int4Task::Extract(extraction) => extraction.validate(&self.args)?,
+            // The blocking stream must own its input and writer through cleanup.
+            Int4Task::ExtractBatch(_) => return Err(CandidateError::Arguments),
         };
         #[cfg(feature = "asupersync-runtime")]
         { runtime::execute_task(self.task, self.args, limits, input, output) }

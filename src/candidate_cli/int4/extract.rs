@@ -94,6 +94,7 @@ impl ExtractionArgs {
     }
     pub(super) fn mask_visits(&self) -> u64 { self.max_mask_node_visits }
     pub(super) fn schema_path(&self) -> &std::path::Path { &self.schema }
+    pub(super) fn source_membership(&self) -> bool { self.source_membership }
 
     /// Reject unsupported/duplicate schema keys and impossible source products
     /// before any model file is opened. Keep exact numbers as original bytes.

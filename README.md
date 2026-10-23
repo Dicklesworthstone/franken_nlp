@@ -28,15 +28,17 @@
 > Mail wiring exist. Even a green code receipt is separate from model-present,
 > target-host performance/platform, artifact, and human-review gates.
 
-> **Current executable surface (static source inventory).** The binary presently
-> exposes `robot schema|health|backends`, `schema check|sample`, a provisional
-> `convert` path, unqualified release-package scaffolding, and a
-> `models derive` path that deliberately refuses until the owner-only model-root
-> transaction surface is ratified. It does **not** yet expose `pull`, model
-> inference or task commands, `batch`, durable `job`, `doctor`,
-> `eval|calibrate|qualify`, or installers. Existing converter/package code is
-> useful code-first progress, not a qualified model artifact or publication
-> path. The examples below remain the disclosed 1.0 target contract.
+> **Current executable surface (static source inventory).** The binary includes
+> `robot schema|health|backends`, `schema check|sample`, conversion/package
+> scaffolding, and explicit local inference and corpus routes under `candidate`.
+> Candidate execution requires the `asupersync-runtime` feature. The
+> `candidate source-int4` namespace includes generation/chat, classification,
+> single-document extraction, text cohorts/corpora, and
+> [ordered extraction batches](#implemented-candidate-int4-extraction-batches).
+> Candidate results retain their explicit provenance; build verification,
+> model quality and release qualification remain separate pending gates.
+> The top-level task, batch and job examples below remain the disclosed 1.0
+> target contract.
 
 ---
 
@@ -275,6 +277,77 @@ fnlp doctor                          # idempotent self-check/repair
 # Phase-7 research surfaces (plan-staged, evidence-gated):
 #   fnlp audit plan/grade · fnlp job partition/merge · fnlp resident start
 ```
+
+### Implemented candidate INT4 extraction batches
+
+`fnlp candidate source-int4 extract-batch` connects the native constrained
+extractor to an ordered NDJSON stream. It keeps one model, native engine and
+vocabulary resident for the run and compiles the shared schema against each
+document. This path requires a candidate build with `asupersync-runtime`.
+
+Each input document supplies `id` and exact UTF-8 `text`. IDs must be unique
+within an epoch; an explicit flush starts a new epoch after delivery completes:
+
+```jsonl
+{"id":"ticket-1","text":"Alice works in Shanghai."}
+{"flush":true}
+{"id":"ticket-1","text":"Bob works in Paris."}
+```
+
+Run a local pinned source closure with a shared schema:
+
+```bash
+fnlp candidate source-int4 extract-batch documents.ndjson \
+  --source-dir /models/Nanbeige4.2-3B \
+  --source-manifest /models/nanbeige-source-manifest.json \
+  --schema extraction.schema.json \
+  --memory-mib 8192 \
+  --max-requests 1000 \
+  --max-total-input-bytes 67108864 \
+  --max-total-output-bytes 67108864 \
+  > results.ndjson
+```
+
+Use `-` instead of the input filename for stdin. Add `--source-membership`
+when the schema has `x-fnlp-source: "verbatim"` fields; those fields are bound
+to each document's original bytes and retain matching source offsets. Schema
+and source-membership validation establish structural and byte-level evidence;
+semantic accuracy still requires task evaluation. Any non-null per-record
+`task_args` is rejected before document tokenization, including an override
+that repeats the shared schema.
+
+A saved candidate snapshot can serve the same command:
+
+```bash
+fnlp candidate source-int4 extract-batch documents.ndjson \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$EXPECTED_MODEL_SHA256" \
+  --schema extraction.schema.json \
+  --memory-mib 8192
+```
+
+The expected digest must come from an independently trusted conversion record.
+Keep `--group-width` consistent with that conversion. Source conversion also
+accepts `--save-snapshot NEW_FILE`; an existing path is refused.
+
+Every output line wraps a canonical inner event under `record` and carries
+`protocol: "fnlp-candidate-int4-extract-batch-v1"`, the actual model-content
+digest, group width, kernel and candidate provenance. Successful documents
+emit `record.event: "doc"`; recoverable refusals emit `"doc_error"`. A drained
+stream ends with `"run_complete"`, whose summary includes succeeded and failed
+counts. **Whole-run success requires both `run_complete` and exit code 0.**
+A run with any failed document returns a nonzero exit even after normal EOF.
+Fatal errors emit `"run_error"` when the output is still writable; a partial
+write stops output without appending another terminal frame.
+
+`--max-input-bytes` and `--max-line-bytes` bound each document and transport
+record. `--max-requests` counts all nonempty records, including flush controls
+and malformed input. Native work, mask visits, checkpoints and total input/
+output budgets span the entire run and do not renew at flush boundaries.
+Memory admission includes the resident model, full context, preparation,
+transport staging and guarded results. Execution is sequential and blocking
+IO observes cancellation cooperatively; durable resume and parallel extraction
+scheduling remain separate work.
 
 ## Installation
 

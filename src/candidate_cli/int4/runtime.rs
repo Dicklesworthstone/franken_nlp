@@ -76,7 +76,8 @@ impl DecodeStepControl for DeadlineControl {
 
 pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
-    if limits.minimum_memory_bytes > limits.memory_bytes || limits.kernel.kind() != args.kernel
+    if matches!(&task, Int4Task::ExtractBatch(_))
+        || limits.minimum_memory_bytes > limits.memory_bytes || limits.kernel.kind() != args.kernel
         || !prefill::matches(&args, limits)?
         || (!matches!(&task, Int4Task::Text(_)) && limits.prefill.is_some()) {
         return Err(CandidateError::Arguments);
@@ -114,20 +115,13 @@ pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
             let request = options.check_schema(schema, &text, options.budget(&args, limits))?;
             Input::Extract { document: text, request, options }
         }
+        Int4Task::ExtractBatch(_) => return Err(CandidateError::Arguments),
     };
     remaining()?;
     let cancellation = CancellationToken::default();
     // Snapshot failure is terminal. Never catch it to convert a source, read a
     // header as its own trust anchor, look up a catalog, or change the group width.
-    let model = match (&args.snapshot, limits.snapshot_pin) {
-        (Some(path), Some(pin)) => engine.load_int4_snapshot(path.clone(), pin, limits.snapshot_budget(true)?,
-            ALLOCATOR_BYTES, snapshot_run(&args, remaining()?), cancellation.clone()),
-        (None, None) => engine.load_source_candidate_int4(
-            args.source_dir.clone().ok_or(CandidateError::Arguments)?,
-            args.source_manifest.clone().ok_or(CandidateError::Arguments)?,
-            args.group_width, load_limits(&args, limits, remaining()?), cancellation.clone()),
-        _ => return Err(CandidateError::Arguments),
-    }.map_err(|_| CandidateError::Model)?;
+    let model = load_model(&engine, &args, limits, remaining()?, cancellation.clone())?;
     remaining()?;
     // The actual model owns its recomputed fingerprint. No fabricated pre-load
     // identity is used for token planning. Wire shape/labels were checked above.
@@ -223,6 +217,21 @@ fn prepare(request: Input, model: &ResidentInt4, args: &Int4Args, limits: Int4Li
                 masks: options.masks(), max_mask_node_visits: options.mask_visits() })
         }
     }
+}
+
+/// Source and snapshot loading share the same checked limits for single and
+/// corpus extraction. A failed snapshot never falls back to another source.
+pub(super) fn load_model(engine: &NlpEngine, args: &Int4Args, limits: Int4Limits,
+    remaining: Duration, cancellation: CancellationToken) -> Result<ResidentInt4, CandidateError> {
+    match (&args.snapshot, limits.snapshot_pin) {
+        (Some(path), Some(pin)) => engine.load_int4_snapshot(path.clone(), pin, limits.snapshot_budget(true)?,
+            ALLOCATOR_BYTES, snapshot_run(args, remaining), cancellation),
+        (None, None) => engine.load_source_candidate_int4(
+            args.source_dir.clone().ok_or(CandidateError::Arguments)?,
+            args.source_manifest.clone().ok_or(CandidateError::Arguments)?,
+            args.group_width, load_limits(args, limits, remaining), cancellation),
+        _ => return Err(CandidateError::Arguments),
+    }.map_err(|_| CandidateError::Model)
 }
 
 fn load_limits(args: &Int4Args, limits: Int4Limits, remaining: Duration) -> Int4LoadLimits {

@@ -199,6 +199,7 @@ impl CandidateCommand {
     /// transfers owned handles into the one hosted blocking invocation.
     pub(crate) fn run_stdio(self) -> ExitCode {
         match self {
+            Self::SourceInt4(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::Batch(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::ScoreBatch(command) => command.run_owned(io::stdin(), io::stdout(), &mut io::stderr()),
             Self::Job(command) => command.run_owned(io::stdin(), &mut io::stdout(), &mut io::stderr()),
