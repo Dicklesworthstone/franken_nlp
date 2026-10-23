@@ -21,6 +21,8 @@ use serde::Serialize;
 /// Whole-document jobs are a distinct frozen recipe, not an implicit change
 /// to the existing single-context extraction job contract.
 pub mod document;
+/// Fixed shared-schema jobs using the distinct grouped-INT4 execution profile.
+pub mod grouped_int4;
 
 /// Only a keyed commitment to this private projection enters the journal.
 /// Never Deserialize/Debug or turn it into an alternate executable recipe.

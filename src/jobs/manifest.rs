@@ -1,6 +1,9 @@
 //! A bounded complete-population freeze, not the live batch epoch ID window.
 use super::{Commitment, JobError, JobId, JobSecret, MismatchField};
-use crate::{canonjson, execution_identity::ExecutionIdentity, native_engine::strict_int8::Int8Work};
+use crate::{
+    canonjson, execution_identity::ExecutionIdentity,
+    native_engine::{strict_int4::Int4Work, strict_int8::Int8Work},
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, io::Write};
 
@@ -10,6 +13,25 @@ use std::{collections::BTreeSet, io::Write};
 #[serde(deny_unknown_fields)]
 pub struct JobWork { pub model: Int8Work, pub mask_node_visits: u64 }
 impl JobWork {
+    /// Lossless accounting projection into the existing journal counter shape.
+    /// The historical field type is Int8Work, but these are five integer work
+    /// counters, not an executable profile or a model identity. Copy grouped
+    /// INT4 dots/MACs exactly; never recompute them with INT8 shape formulas.
+    /// The frozen execution identity and recipe retain the actual INT4 model,
+    /// partition and strict-v2 semantics. This changes no journal wire schema.
+    pub fn from_int4(model: Int4Work, mask_node_visits: u64) -> Self {
+        Self { model: Int8Work { forward_positions: model.forward_positions,
+            projected_logits: model.projected_logits, attention_pairs: model.attention_pairs,
+            projections: model.projections }, mask_node_visits }
+    }
+    /// Recover the same five counters for an explicitly INT4 native ceiling.
+    /// This grants no execution authority and does not convert an INT8 model;
+    /// the real native boundary still checks model/group/profile and budgets.
+    pub fn int4_model_work(self) -> Int4Work {
+        Int4Work { forward_positions: self.model.forward_positions,
+            projected_logits: self.model.projected_logits, attention_pairs: self.model.attention_pairs,
+            projections: self.model.projections }
+    }
     pub fn checked_add(self, other: Self) -> Result<Self, JobError> {
         Ok(Self { model: self.model.checked_add(other.model).map_err(|_| JobError::WorkLimit)?,
             mask_node_visits: self.mask_node_visits.checked_add(other.mask_node_visits).ok_or(JobError::WorkLimit)? })
