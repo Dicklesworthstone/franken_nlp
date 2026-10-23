@@ -157,6 +157,9 @@ impl<E: Error + 'static> Error for CorpusSummaryError<E> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum NativeSummaryProfile { Eager, Int8, Int4 }
+
 /// Feed to tasks::mapreduce::execute. All intermediate candidates survive or
 /// execution fails, so successful final selection is independent of fan-in.
 /// A failed map/reduce (including an unwind) permanently poisons this instance.
@@ -165,7 +168,7 @@ pub struct CorpusSummaryTask<P> {
     options: SummaryOptions,
     limits: CorpusSummaryLimits,
     scan_remaining: u64,
-    strict_int8: bool,
+    profile: NativeSummaryProfile,
     next_chunk: usize,
     failed: bool,
 }
@@ -173,13 +176,20 @@ impl<P: SummaryPass> CorpusSummaryTask<P> {
     pub fn new(pass: P, limits: CorpusSummaryLimits) -> Result<Self, SummaryError> {
         limits.validate()?;
         let options = pass.options(); options.validate()?;
-        Ok(Self { pass, options, limits, scan_remaining: limits.max_scan_steps, strict_int8: false, next_chunk: 0, failed: false })
+        Ok(Self { pass, options, limits, scan_remaining: limits.max_scan_steps, profile: NativeSummaryProfile::Eager, next_chunk: 0, failed: false })
     }
     /// Only the native INT8 composition selects this rail. It still verifies
     /// each unchanged result; no eager result is relabeled to pass validation.
     pub(crate) fn new_int8(pass: P, limits: CorpusSummaryLimits) -> Result<Self, SummaryError> {
         let mut task = Self::new(pass, limits)?;
-        task.strict_int8 = true;
+        task.profile = NativeSummaryProfile::Int8;
+        Ok(task)
+    }
+    /// Only the native grouped-INT4 composition selects strict-v2 validation.
+    /// An INT8 or eager result cannot be relabeled into this private rail.
+    pub(crate) fn new_int4(pass: P, limits: CorpusSummaryLimits) -> Result<Self, SummaryError> {
+        let mut task = Self::new(pass, limits)?;
+        task.profile = NativeSummaryProfile::Int4;
         Ok(task)
     }
     pub fn scan_steps_remaining(&self) -> u64 { self.scan_remaining }
@@ -203,11 +213,12 @@ impl<P: SummaryPass> MapReduceTask for CorpusSummaryTask<P> {
         for chunk in chunks {
             if chunk.id() != self.next_chunk { return Err(CorpusSummaryError::Summary(SummaryError::InvalidResult)); }
             let raw = self.pass.run(chunk).map_err(CorpusSummaryError::Pass)?;
-            let value = if self.strict_int8 {
-                map_value_for_profile(chunk, raw, self.options, self.limits, &mut self.scan_remaining,
-                    crate::native_engine::strict_int8::STRICT_INT8_PROFILE)
-            } else {
-                map_value(chunk, raw, self.options, self.limits, &mut self.scan_remaining)
+            let value = match self.profile {
+                NativeSummaryProfile::Eager => map_value(chunk, raw, self.options, self.limits, &mut self.scan_remaining),
+                NativeSummaryProfile::Int8 => map_value_for_profile(chunk, raw, self.options, self.limits,
+                    &mut self.scan_remaining, crate::native_engine::strict_int8::STRICT_INT8_PROFILE),
+                NativeSummaryProfile::Int4 => map_value_for_profile(chunk, raw, self.options, self.limits,
+                    &mut self.scan_remaining, crate::native_engine::strict_int4::STRICT_INT4_PROFILE),
             }.map_err(CorpusSummaryError::Summary)?;
             self.next_chunk = self.next_chunk.checked_add(1).ok_or(CorpusSummaryError::Summary(SummaryError::InvalidResult))?;
             outputs.push(MapOutput { chunk_id: chunk.id(), value });

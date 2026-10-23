@@ -23,6 +23,9 @@ use crate::{
     },
 };
 
+pub mod capacity;
+pub mod long;
+
 pub const INT4_SOURCE_EXECUTION: &str = "grouped-int4-source-portfolio-v1";
 
 /// Default diagnostics redact source/compiler content. Explicit diagnostic
