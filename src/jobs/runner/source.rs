@@ -18,6 +18,7 @@ use crate::{
 };
 use serde::Serialize;
 pub mod document;
+pub mod grouped_int4;
 
 /// A sealed, serializable contract projection. Not Deserialize, not a task
 /// factory, and deliberately not Debug: defaults can contain private passages.
