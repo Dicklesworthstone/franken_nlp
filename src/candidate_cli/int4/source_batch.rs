@@ -109,59 +109,7 @@ impl BatchArgs {
     }
     pub(super) fn load_defaults(&self, text: Option<&str>, ceiling: TaskBudget, max_input_bytes: usize)
         -> Result<Option<SourceBatchArgs>, CandidateError> {
-        let defaults = match text {
-            Some(text) => {
-                if text.len() > MAX_SOURCE_ARGUMENT_BYTES { return Err(CandidateError::Input); }
-                let value = canonjson::parse_str_with_limits(text, canonjson::ParseLimits {
-                    max_depth: 16, max_string_bytes: MAX_SOURCE_ARGUMENT_BYTES,
-                }).map_err(|_| CandidateError::Input)?;
-                Some(serde_json::from_value::<SourceBatchArgs>(value).map_err(|_| CandidateError::Input)?)
-            }
-            None => match self.kind {
-                Kind::Ner => Some(SourceBatchArgs::Ner { options: NerOptions::default(), budget: ceiling }),
-                Kind::Keyphrases => Some(SourceBatchArgs::Keyphrases { options: KeyphraseOptions::default(), budget: ceiling }),
-                Kind::Summarize => Some(SourceBatchArgs::Summarize { options: SummaryOptions::default(), budget: ceiling }),
-                Kind::Answer => None,
-            },
-        };
-        if let Some(defaults) = &defaults { self.validate_defaults(defaults, ceiling, max_input_bytes)?; }
-        Ok(defaults)
-    }
-    fn validate_defaults(&self, defaults: &SourceBatchArgs, ceiling: TaskBudget, max_input_bytes: usize)
-        -> Result<(), CandidateError> {
-        let (kind, budget) = match defaults {
-            SourceBatchArgs::Ner { options, budget } => {
-                options.schema_source().map_err(|_| CandidateError::Planning)?; (Kind::Ner, budget)
-            }
-            SourceBatchArgs::Keyphrases { options, budget } => {
-                options.schema_source().map_err(|_| CandidateError::Planning)?; (Kind::Keyphrases, budget)
-            }
-            SourceBatchArgs::Summarize { options, budget } => {
-                options.schema_source().map_err(|_| CandidateError::Planning)?; (Kind::Summarize, budget)
-            }
-            SourceBatchArgs::Answer { passages, options, budget } => {
-                options.schema_source().map_err(|_| CandidateError::Planning)?;
-                if passages.is_empty() || passages.len() > crate::candidate_cli::source::MAX_PASSAGES {
-                    return Err(CandidateError::Input);
-                }
-                let mut ids = std::collections::BTreeSet::new();
-                let mut bytes = 0_usize;
-                for passage in passages {
-                    if passage.id.is_empty() || passage.id.len() > 128 || passage.id.chars().any(char::is_control)
-                        || !ids.insert(passage.id.as_str()) { return Err(CandidateError::Input); }
-                    bytes = bytes.checked_add(passage.id.len()).and_then(|n| n.checked_add(passage.text.len()))
-                        .filter(|&n| n <= max_input_bytes).ok_or(CandidateError::Input)?;
-                }
-                (Kind::Answer, budget)
-            }
-        };
-        budget.validate().map_err(|_| CandidateError::Planning)?;
-        if kind != self.kind || budget.max_input_tokens > ceiling.max_input_tokens
-            || budget.max_output_tokens > ceiling.max_output_tokens || budget.max_output_bytes > ceiling.max_output_bytes
-            || budget.max_grammar_states > ceiling.max_grammar_states || budget.max_kv_bytes != ceiling.max_kv_bytes {
-            return Err(CandidateError::Planning);
-        }
-        Ok(())
+        load_defaults(self.kind, text, ceiling, max_input_bytes)
     }
     pub(super) fn execute_owned<R: Read + Send + 'static, W: Write + Send + 'static>(
         self, args: Int4Args, input: R, output: W,
@@ -173,6 +121,65 @@ impl BatchArgs {
         { let _ = (self, args, limits, input, output); Err(CandidateError::Unavailable) }
     }
 }
+/// Shared exact parser for ordered streams and durable source-task jobs.
+/// Defaults may carry private QA passages; do not log or publish this value.
+pub(super) fn load_defaults(kind: Kind, text: Option<&str>, ceiling: TaskBudget, max_input_bytes: usize)
+    -> Result<Option<SourceBatchArgs>, CandidateError> {
+    let defaults = match text {
+        Some(text) => {
+            if text.len() > MAX_SOURCE_ARGUMENT_BYTES { return Err(CandidateError::Input); }
+            let value = canonjson::parse_str_with_limits(text, canonjson::ParseLimits {
+                max_depth: 16, max_string_bytes: MAX_SOURCE_ARGUMENT_BYTES,
+            }).map_err(|_| CandidateError::Input)?;
+            Some(serde_json::from_value::<SourceBatchArgs>(value).map_err(|_| CandidateError::Input)?)
+        }
+        None => match kind {
+            Kind::Ner => Some(SourceBatchArgs::Ner { options: NerOptions::default(), budget: ceiling }),
+            Kind::Keyphrases => Some(SourceBatchArgs::Keyphrases { options: KeyphraseOptions::default(), budget: ceiling }),
+            Kind::Summarize => Some(SourceBatchArgs::Summarize { options: SummaryOptions::default(), budget: ceiling }),
+            Kind::Answer => None,
+        },
+    };
+    if let Some(defaults) = &defaults { validate_defaults(kind, defaults, ceiling, max_input_bytes)?; }
+    Ok(defaults)
+}
+fn validate_defaults(kind: Kind, defaults: &SourceBatchArgs, ceiling: TaskBudget, max_input_bytes: usize)
+    -> Result<(), CandidateError> {
+    let (actual_kind, budget) = match defaults {
+        SourceBatchArgs::Ner { options, budget } => {
+            options.schema_source().map_err(|_| CandidateError::Planning)?; (Kind::Ner, budget)
+        }
+        SourceBatchArgs::Keyphrases { options, budget } => {
+            options.schema_source().map_err(|_| CandidateError::Planning)?; (Kind::Keyphrases, budget)
+        }
+        SourceBatchArgs::Summarize { options, budget } => {
+            options.schema_source().map_err(|_| CandidateError::Planning)?; (Kind::Summarize, budget)
+        }
+        SourceBatchArgs::Answer { passages, options, budget } => {
+            options.schema_source().map_err(|_| CandidateError::Planning)?;
+            if passages.is_empty() || passages.len() > crate::candidate_cli::source::MAX_PASSAGES {
+                return Err(CandidateError::Input);
+            }
+            let mut ids = std::collections::BTreeSet::new();
+            let mut bytes = 0_usize;
+            for passage in passages {
+                if passage.id.is_empty() || passage.id.len() > 128 || passage.id.chars().any(char::is_control)
+                    || !ids.insert(passage.id.as_str()) { return Err(CandidateError::Input); }
+                bytes = bytes.checked_add(passage.id.len()).and_then(|n| n.checked_add(passage.text.len()))
+                    .filter(|&n| n <= max_input_bytes).ok_or(CandidateError::Input)?;
+            }
+            (Kind::Answer, budget)
+        }
+    };
+    budget.validate().map_err(|_| CandidateError::Planning)?;
+    if actual_kind != kind || budget.max_input_tokens > ceiling.max_input_tokens
+        || budget.max_output_tokens > ceiling.max_output_tokens || budget.max_output_bytes > ceiling.max_output_bytes
+        || budget.max_grammar_states > ceiling.max_grammar_states || budget.max_kv_bytes != ceiling.max_kv_bytes {
+        return Err(CandidateError::Planning);
+    }
+    Ok(())
+}
+
 fn times(value: u64, count: u64) -> Result<u64, CandidateError> {
     value.checked_mul(count).ok_or(CandidateError::Arguments)
 }

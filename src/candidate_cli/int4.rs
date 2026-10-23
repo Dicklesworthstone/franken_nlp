@@ -11,6 +11,7 @@ mod extract_job;
 mod extract_map;
 mod source;
 mod source_batch;
+mod source_job;
 mod prefill;
 mod batch;
 #[cfg(feature = "asupersync-runtime")]
@@ -108,6 +109,7 @@ enum Int4Task {
     ExtractBatch(extract_batch::BatchArgs),
     ExtractMap(extract_map::MapArgs),
     ExtractJob,
+    SourceJob,
 }
 #[derive(Clone, Copy)]
 enum Int4BatchCommand { Fixed(batch::BatchArgs), Corpus(batch::corpus::CorpusArgs) }
@@ -120,9 +122,13 @@ impl Int4BatchCommand {
             Self::Corpus(corpus) => corpus.execute(args, input, output) }
     }
 }
+enum Int4JobCommand {
+    Extraction(extract_job::JobCommand),
+    Source(source_job::JobCommand),
+}
 pub(super) struct Int4Command {
     task: Int4Task, args: Int4Args, batch: Option<Int4BatchCommand>,
-    job: Option<extract_job::JobCommand>,
+    job: Option<Int4JobCommand>,
 }
 
 pub(super) fn definition() -> clap::Command {
@@ -130,7 +136,7 @@ pub(super) fn definition() -> clap::Command {
         .mut_arg("prefill_rows", |arg| arg.help("Explicit grouped-INT4 layer-major prompt execution, 1..=64 rows; extra workspace is process-admitted"));
     clap::Command::new("source-int4")
         .about("Run candidate INT4 tasks from pinned sources or a digest-pinned local snapshot")
-        .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Sequential native execution defaults to scalar; --kernel explicitly selects an existing hardware-checked integer leaf. Text tasks can opt in to bounded layer-major prompt execution with --prefill-rows; structured tasks cannot. text-batch runs one finite NDJSON cohort and emits one completed aggregate JSON object. text-corpus processes bounded windows with one resident model and cumulative budgets, emitting completed-window NDJSON with a required corpus_complete footer. extract-batch streams documents under one shared schema through one resident model and engine. ner, keyphrases, summarize and answer preserve their source-task semantics; their -batch commands run ordered typed source-task NDJSON. Every ordered batch requires run_complete plus exit 0 for whole-run success. extract-job start/resume retains ordered results in an explicit protected spool and resumes only after authenticating the original population, exact schema and immutable lifetime limits. No automatic selection, fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Outputs are completed results, not provisional token events.")
+        .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Sequential native execution defaults to scalar; --kernel explicitly selects an existing hardware-checked integer leaf. Text tasks can opt in to bounded layer-major prompt execution with --prefill-rows; structured tasks cannot. text-batch runs one finite NDJSON cohort and emits one completed aggregate JSON object. text-corpus processes bounded windows with one resident model and cumulative budgets, emitting completed-window NDJSON with a required corpus_complete footer. extract-batch streams documents under one shared schema through one resident model and engine. ner, keyphrases, summarize and answer preserve their source-task semantics; their -batch commands run ordered typed source-task NDJSON. Every ordered batch requires run_complete plus exit 0 for whole-run success. extract-job start/resume retains ordered extraction results in an explicit protected spool. ner-job, keyphrases-job, summarize-job and answer-job provide the same opt-in durable start/resume contract for source tasks. Resume authenticates the complete original population, exact task configuration, model/group identity and immutable lifetime limits. No automatic selection, fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Outputs are completed results, not provisional token events.")
         .subcommand_required(true)
         .subcommand(task("generate", "Generate from a bounded UTF-8 prompt using the pinned template"))
         .subcommand(task("chat", "Complete a bounded JSON system/user/assistant transcript"))
@@ -141,6 +147,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(extract_map::definition())
         .subcommands(source::definitions())
         .subcommands(source_batch::definitions())
+        .subcommands(source_job::definitions())
         .subcommand(batch::definition())
         .subcommand(batch::corpus::definition())
 }
@@ -150,7 +157,13 @@ impl Int4Command {
             clap::Error::raw(clap::error::ErrorKind::MissingSubcommand, "source-int4 task required"))?;
         if name == "extract-job" {
             let (job, args) = extract_job::JobCommand::from_matches(matches)?;
-            return Ok(Self { task: Int4Task::ExtractJob, args, batch: None, job: Some(job) });
+            return Ok(Self { task: Int4Task::ExtractJob, args, batch: None, job: Some(Int4JobCommand::Extraction(job)) });
+        }
+        if matches!(name, "ner-job" | "keyphrases-job" | "summarize-job" | "answer-job") {
+            let kind = crate::candidate_cli::source::Kind::named(name.trim_end_matches("-job"))
+                .ok_or_else(|| clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source job task refused"))?;
+            let (job, args) = source_job::JobCommand::from_matches(kind, matches)?;
+            return Ok(Self { task: Int4Task::SourceJob, args, batch: None, job: Some(Int4JobCommand::Source(job)) });
         }
         let batch = match name {
             "text-batch" => Some(Int4BatchCommand::Fixed(batch::BatchArgs::from_arg_matches(matches)?)),
@@ -185,7 +198,9 @@ impl Int4Command {
         self, mut input: R, mut output: W, diagnostics: &mut impl Write,
     ) -> ExitCode {
         let result = match self {
-            Self { task: Int4Task::ExtractJob, args, batch: None, job: Some(job) } =>
+            Self { task: Int4Task::ExtractJob, args, batch: None, job: Some(Int4JobCommand::Extraction(job)) } =>
+                return job.run_owned(args, input, &mut output, diagnostics),
+            Self { task: Int4Task::SourceJob, args, batch: None, job: Some(Int4JobCommand::Source(job)) } =>
                 return job.run_owned(args, input, &mut output, diagnostics),
             Self { task: Int4Task::ExtractBatch(options), args, batch: None, job: None } =>
                 options.execute_owned(args, input, output),
@@ -202,7 +217,9 @@ impl Int4Command {
         }
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
-        if self.job.is_some() || self.task == Int4Task::ExtractJob { return Err(CandidateError::Arguments); }
+        if self.job.is_some() || matches!(self.task, Int4Task::ExtractJob | Int4Task::SourceJob) {
+            return Err(CandidateError::Arguments);
+        }
         if let Some(batch) = self.batch {
             if self.task != Int4Task::Text(batch.task()) { return Err(CandidateError::Arguments); }
             return batch.execute(self.args, input, output);
@@ -217,7 +234,7 @@ impl Int4Command {
             Int4Task::Source(_, source) => source.validate(&self.args)?,
             // The blocking stream must own its input and writer through cleanup.
             Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ExtractMap(_)
-                | Int4Task::ExtractJob => return Err(CandidateError::Arguments),
+                | Int4Task::ExtractJob | Int4Task::SourceJob => return Err(CandidateError::Arguments),
         };
         #[cfg(feature = "asupersync-runtime")]
         { runtime::execute_task(self.task, self.args, limits, input, output) }

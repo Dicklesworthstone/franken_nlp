@@ -86,7 +86,7 @@ impl DecodeStepControl for DeadlineControl {
 
 pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
-    if matches!(&task, Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ExtractMap(_) | Int4Task::ExtractJob)
+    if matches!(&task, Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ExtractMap(_) | Int4Task::ExtractJob | Int4Task::SourceJob)
         || limits.minimum_memory_bytes > limits.memory_bytes || limits.kernel.kind() != args.kernel
         || !prefill::matches(&args, limits)?
         || (!matches!(&task, Int4Task::Text(_)) && limits.prefill.is_some()) {
@@ -136,7 +136,7 @@ pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
             Input::Source { request, options }
         }
         Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ExtractMap(_)
-            | Int4Task::ExtractJob => return Err(CandidateError::Arguments),
+            | Int4Task::ExtractJob | Int4Task::SourceJob => return Err(CandidateError::Arguments),
     };
     remaining()?;
     let cancellation = CancellationToken::default();

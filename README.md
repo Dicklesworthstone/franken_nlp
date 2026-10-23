@@ -36,7 +36,8 @@
 > single-document extraction, [NER/keyphrases/cited summaries/passage QA](#implemented-candidate-int4-source-tasks),
 > text cohorts/corpora,
 > [ordered extraction batches](#implemented-candidate-int4-extraction-batches),
-> [durable extraction jobs](#implemented-candidate-int4-extraction-jobs), and
+> [durable extraction jobs](#implemented-candidate-int4-extraction-jobs),
+> [durable source-task jobs](#implemented-candidate-int4-source-task-jobs), and
 > [whole-document extraction](#implemented-candidate-int4-whole-document-extraction).
 > Candidate results retain their explicit provenance; build verification,
 > model quality and release qualification remain separate pending gates.
@@ -522,9 +523,122 @@ The library surfaces are `SourceTaskPlanner::plan_int4_with_control`,
 `Int4SourceCorpusConfig`. Execution identities retain strict-quantized-v2,
 the actual model/group partition and task-specific prompt, grammar and policy
 digests. This addition covers bounded single-context tasks and ordered
-item-local streams. Long-document variants of these four source tasks and
-their durable jobs remain separate work. Build verification, model-present correctness and
-quality qualification remain pending gates.
+item-local streams. Their opt-in durable jobs are described below; long-document
+variants of these four source tasks remain separate work. Build verification,
+model-present correctness and quality qualification remain pending gates.
+
+## Implemented candidate INT4 source-task jobs
+
+`fnlp candidate source-int4 ner-job|keyphrases-job|summarize-job|answer-job`
+adds explicit `start` and `resume` operations for the four source-task families.
+One resident INT4 model serves the complete frozen population through the
+existing authenticated owned-job runner. Both pinned source conversion and
+independently digest-pinned snapshots are supported. This route requires
+`metadata-store` and `asupersync-runtime` on Linux x86-64 or AArch64.
+
+Prepare the same protected directory, random job ID, protected 32-byte raw
+secret, and immutable `JobLimits` file used by
+[INT4 extraction jobs](#implemented-candidate-int4-extraction-jobs).
+For a small job of at most three items, this complete limits file provides
+explicit ceilings. The work values are allowances, not measured inference
+costs; set the required ceilings before starting and preserve them on resume:
+
+```json
+{
+  "max_items": 3,
+  "max_id_bytes": 128,
+  "max_input_bytes_per_item": 65536,
+  "max_snapshot_bytes": 1048576,
+  "max_result_bytes": 1048576,
+  "max_spool_bytes": 16777216,
+  "max_materialized_bytes": 16777216,
+  "max_journal_bytes": 67108864,
+  "max_attempts": 6,
+  "max_work": {
+    "model": {
+      "forward_positions": 131072,
+      "projected_logits": 10000000000,
+      "attention_pairs": 1000000000000,
+      "projections": {
+        "dot_products": 10000000000000000,
+        "multiply_accumulates": 10000000000000000
+      }
+    },
+    "mask_node_visits": 12000000000
+  }
+}
+```
+
+Save it as `ner-job-limits.json`. Retention remains explicit:
+
+```bash
+fnlp candidate source-int4 ner-job start documents.ndjson \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$EXPECTED_MODEL_SHA256" \
+  --memory-mib 8192 \
+  --store-results \
+  --job-dir /private/ner-job \
+  --job-id "$JOB_ID" \
+  --key-file /private/ner-job.key \
+  --limits ner-job-limits.json \
+  --materialize
+```
+
+Use the same arguments and complete original population with `resume`.
+Already committed items remain in that input and are skipped after
+authentication. The command admits the population in memory; it does not
+persist the input for future recovery. IDs must be unique across the whole
+population, and live-stream `flush` controls are refused.
+
+Records use the same typed `{id,text,task_args?}` contract as
+[ordered source-task batches](#ordered-int4-source-task-batches).
+`--defaults FILE` supplies complete `SourceBatchArgs`, including its task
+selector, options and budget. The task is fixed by the command, and record
+arguments may tighten admitted task limits while retaining the exact full
+resident KV allowance. For QA, `text` is the question; its separately typed
+passages must be present in each record's arguments or in an explicitly
+supplied defaults file. `--options` is refused here because it lacks the
+complete durable task contract.
+
+For example, an `answer-job` record using the default 2048-token context and
+512-token output allowance is:
+
+```jsonl
+{"id":"q1","text":"Where does Alice work?","task_args":{"task":"answer","passages":[{"id":"p1","text":"Alice works in Shanghai."}],"options":{"max_answer_scalars":2048,"max_citations":8,"max_quote_scalars":256},"budget":{"max_input_tokens":1536,"max_output_tokens":512,"max_output_bytes":1048576,"max_grammar_states":4096,"max_kv_bytes":369098752}}}
+```
+
+Resume binds the original input bytes, IDs and order, actual model/group
+identity, source-task policy, task options, private defaults and all compiler
+settings. A changed QA passage, task budget or recipe refuses before replay
+or orphan-tail repair. Private defaults and source content participate in
+keyed commitments inside the protected job; they are not exposed as raw
+content hashes or copied into progress reports.
+
+The immutable limits file controls all five native work axes plus mask
+visits across the job's lifetime. Interrupted attempts remain debited, and
+larger invocation deadlines, input limits or attempt counts do not replenish
+work. Pending outputs pass the same source-task finalizers before the
+runner syncs the result frame and commits its journal pointer. Admission
+retains result storage through that durable commit. A failed inference or
+citation check never becomes successful QA abstention.
+
+Stdout uses `protocol: "fnlp-candidate-int4-source-job-v1"` and contains the
+fixed task, public model provenance and authenticated progress only.
+Private results stay in the owner-only spool. `--materialize` publishes
+verified ordered `materialized.ndjson` only after every item commits.
+Existing stored-job status, verification and materialization commands work
+without loading the model. Failed final output delivery or a deadline after
+commit does not imply rollback; inspect or explicitly resume the job.
+`--discard-uncommitted-tail` remains an explicit resume-only policy.
+
+The library entry points are the sealed `Int4SourceJobPlanner::for_model`
+and `NlpEngine::job_int4_source`, with `SourceJobRequest` and
+`JobHostLimits`. Planning binds the real resident model and complete fixed
+context before input/storage access. One physical hosted invocation owns
+population ingestion, authenticated resume, native execution, durable commit
+and optional materialization. These are candidate source-inventoried
+features; build, model-present correctness, crash and quality qualification
+remain pending.
 
 ## Implemented candidate INT4 whole-document extraction
 

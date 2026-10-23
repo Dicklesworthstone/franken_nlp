@@ -24,7 +24,7 @@ fn command(retain: bool) -> Int4Command {
     command
 }
 fn parts() -> (JobCommand, Int4Args) {
-    let Int4Command { task: Int4Task::ExtractJob, args, batch: None, job: Some(job) } = command(true)
+    let Int4Command { task: Int4Task::ExtractJob, args, batch: None, job: Some(Int4JobCommand::Extraction(job)) } = command(true)
         else { panic!("job route lost its owned command"); };
     (job, args)
 }
