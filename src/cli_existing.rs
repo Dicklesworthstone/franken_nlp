@@ -25,7 +25,7 @@ use crate::{
     artifact::package::{PackageRequest, package_model, verify_model_package},
     artifact::packing::{NativePackingTarget, TILE_TABLE_VERSION_V1},
     artifact::quantize::{GenericPanelBytes, encode_generic_panel},
-    artifact::reader::FnlpqArtifact,
+    artifact::reader::FnlpqRangeReader,
     artifact::safetensors::{RowPanel, TensorCensusEntry},
     error::ErrorCode,
     grammar::{CompileLimits, CompiledSchema, SchemaError, compile_json_schema},
@@ -713,7 +713,7 @@ fn run_streaming_convert(
             ),
         );
     }
-    let reloaded = match FnlpqArtifact::open_owned(staging_guard.path()) {
+    let reloaded = match FnlpqRangeReader::open(staging_guard.path()) {
         Ok(artifact) => artifact,
         Err(error) => return emit_streaming_refusal(request, "reload-staging", error),
     };
@@ -762,8 +762,10 @@ fn run_streaming_convert(
 
 /// Prove that the checked staged artifact is the exact envelope planned from
 /// this sealed source closure before any receipt or final-path entry exists.
+/// Range open has recomputed logical tensors/model, scales, packing and license
+/// identities with bounded scratch; reload never retains the artifact image.
 fn verify_reloaded_conversion(
-    reloaded: &FnlpqArtifact,
+    reloaded: &FnlpqRangeReader,
     prepared: &PreparedConversionInput,
     plan: &StreamingEnvelopePlan,
     written: &StreamedFnlpq,

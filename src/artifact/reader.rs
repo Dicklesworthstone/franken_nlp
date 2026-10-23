@@ -25,8 +25,10 @@ use crate::artifact::format::{
     ArchTarget, BF16_VERBATIM_V1, CanonicalDtype, FORMAT_VERSION, FnlpqWriterInput, MAGIC,
     MAX_ALIGNMENT, MAX_ENTRIES, MAX_FILE_BYTES, MAX_HEADER_BYTES, PRELUDE_BYTES, PackingSetInput,
     SECTION_DIRECTORY_ENTRY_BYTES, SectionKind, SectionPayload, SectionRange, TensorInput,
-    digest_domain, framed_sha256, logical_model_sha256, logical_tensor_sha256,
-    validate_f32_scale_bytes, validate_generic_sidecar_cardinality, write, StreamingSectionHasher,
+    digest_domain, framed_sha256, framed_stream_field_prefix, framed_stream_hasher,
+    logical_model_sha256, logical_model_sha256_from_source_digests, logical_tensor_sha256,
+    validate_f32_scale_bytes, validate_generic_sidecar_cardinality, write,
+    LogicalTensorStreamingHasher, StreamingSectionHasher,
 };
 use crate::canonjson::{self, ParseLimits};
 use crate::native_engine::decode::DecodeCancellationKind;
@@ -133,9 +135,10 @@ pub struct FnlpqArtifact {
 /// Bounded file-backed reader for the current internal v1 candidate.
 ///
 /// Unlike [FnlpqArtifact], this type never retains the full artifact envelope.
-/// It validates the bounded canonical metadata and range topology up front,
-/// then verifies a complete stored section with bounded scratch before serving
-/// mapping bytes from that section. It is deliberately NOT an activation
+/// It validates bounded canonical metadata, range topology, stored sections,
+/// scale encodings and every reconstructible semantic identity before serving
+/// mappings. Payload and auxiliary-section verification use bounded scratch.
+/// It is deliberately NOT an activation
 /// capability while OQ-31 and filesystem immutability authority remain open.
 pub struct FnlpqRangeReader {
     file: Mutex<File>,
@@ -226,6 +229,7 @@ impl FnlpqRangeReader {
         for section in &sections {
             verify_section_locked(&mut file, section, &mut checkpoint)?;
         }
+        validate_header_identities_streaming(&mut file, &header, &sections, &mut checkpoint)?;
         let final_len = file.metadata().map_err(|error| FnlpqReadError::Io {
             operation: "range-reader post-open metadata",
             detail: error.to_string(),
@@ -246,8 +250,21 @@ impl FnlpqRangeReader {
     pub fn recipe_id(&self) -> &str { &self.header.recipe_id }
     pub fn source_root_sha256(&self) -> &str { &self.header.source_root_sha256 }
     pub fn logical_model_sha256(&self) -> &str { &self.header.logical_model_sha256 }
+    pub fn packing_set_sha256(&self) -> &str { &self.header.packing_set_sha256 }
+    pub fn license_bundle_sha256(&self) -> &str { &self.header.license_bundle_sha256 }
     pub fn tensors(&self) -> &[CheckedTensor] { &self.header.tensors }
     pub fn sections(&self) -> &[CheckedSection] { &self.sections }
+
+    /// Select an explicitly retained and identity-checked packing. This never
+    /// derives a representation or grants artifact activation authority.
+    pub fn select_packing(&self, target: ArchTarget) -> Result<&CheckedPackingSet, FnlpqReadError> {
+        let requested_target = target.header_name().to_owned();
+        self.header.packing_sets.iter().find(|set| set.target == requested_target)
+            .ok_or_else(|| FnlpqReadError::MissingPackingDerivation {
+                requested_target,
+                available_ids: self.header.packing_sets.iter().map(|set| set.id.clone()).collect(),
+            })
+    }
 
     /// Raw SHA-256 of one already preflighted stored section, computed with
     /// bounded scratch. This is distinct from the directory's domain-framed
@@ -322,9 +339,9 @@ impl FnlpqRangeReader {
     }
 }
 
-/// A verified bounded mapping cursor. The file lock remains held from complete
-/// containing-section verification through the last mapping read so another
-/// caller through this reader cannot interleave seeks or reads.
+/// A bounded mapping cursor issued only after open-time stored and semantic
+/// verification. Its file lock prevents callers through this reader from
+/// interleaving cursor seeks or reads; external file immutability is not claimed.
 pub struct VerifiedMappingReader<'a> {
     file: MutexGuard<'a, File>,
     remaining: u64,
@@ -1973,51 +1990,7 @@ fn validate_header_identities(
         ));
     }
 
-    let digest_view: Vec<_> = header
-        .packing_sets
-        .iter()
-        .map(|set| {
-            let mut representations: Vec<_> = set
-                .representations
-                .iter()
-                .map(|representation| {
-                    let section = section_for(
-                        sections,
-                        representation.section_ordinal,
-                        "packing digest representation",
-                    )?;
-                    Ok(PackingDigestRepresentation {
-                        byte_cost: representation.byte_cost,
-                        section_name: section.name.as_str(),
-                        stored_sha256: representation.sha256.as_str(),
-                    })
-                })
-                .collect::<Result<_, FnlpqReadError>>()?;
-            representations.sort_by(|left, right| {
-                left.section_name
-                    .as_bytes()
-                    .cmp(right.section_name.as_bytes())
-            });
-            Ok(PackingDigestSet {
-                id: set.id.as_str(),
-                representations,
-                target: set.target.as_str(),
-            })
-        })
-        .collect::<Result<_, FnlpqReadError>>()?;
-    let canonical = canonjson::canonical_bytes(&digest_view)
-        .map_err(|error| header_error("packing_set_sha256", error.to_string()))?;
-    let observed_packing = framed_sha256(
-        digest_domain::PACKING_SET,
-        &[header.recipe_id.as_bytes(), &canonical],
-    )
-    .map_err(|error| header_error("packing_set_sha256", error.to_string()))?;
-    if hex_lower(&observed_packing) != header.packing_set_sha256 {
-        return Err(header_error(
-            "packing_set_sha256",
-            "does not bind declared targets, byte costs, and section digests",
-        ));
-    }
+    validate_packing_set_identity(header, sections)?;
     let tensor_digests = header
         .tensors
         .iter()
@@ -2078,6 +2051,218 @@ fn validate_header_identities(
         ));
     }
     Ok(())
+}
+
+fn validate_packing_set_identity(
+    header: &CheckedHeader,
+    sections: &[CheckedSection],
+) -> Result<(), FnlpqReadError> {
+    let digest_view: Vec<_> = header
+        .packing_sets
+        .iter()
+        .map(|set| {
+            let mut representations: Vec<_> = set
+                .representations
+                .iter()
+                .map(|representation| {
+                    let section = section_for(
+                        sections,
+                        representation.section_ordinal,
+                        "packing digest representation",
+                    )?;
+                    Ok(PackingDigestRepresentation {
+                        byte_cost: representation.byte_cost,
+                        section_name: section.name.as_str(),
+                        stored_sha256: representation.sha256.as_str(),
+                    })
+                })
+                .collect::<Result<_, FnlpqReadError>>()?;
+            representations.sort_by(|left, right| {
+                left.section_name
+                    .as_bytes()
+                    .cmp(right.section_name.as_bytes())
+            });
+            Ok(PackingDigestSet {
+                id: set.id.as_str(),
+                representations,
+                target: set.target.as_str(),
+            })
+        })
+        .collect::<Result<_, FnlpqReadError>>()?;
+    let canonical = canonjson::canonical_bytes(&digest_view)
+        .map_err(|error| header_error("packing_set_sha256", error.to_string()))?;
+    let observed_packing = framed_sha256(
+        digest_domain::PACKING_SET,
+        &[header.recipe_id.as_bytes(), &canonical],
+    )
+    .map_err(|error| header_error("packing_set_sha256", error.to_string()))?;
+    if hex_lower(&observed_packing) != header.packing_set_sha256 {
+        return Err(header_error(
+            "packing_set_sha256",
+            "does not bind declared targets, byte costs, and section digests",
+        ));
+    }
+    Ok(())
+}
+
+/// Check the same semantic identities as the owned reader without retaining
+/// tensor images or auxiliary-section payloads. Stored-section hashes alone
+/// cannot authenticate the header's logical model, packing or license claims.
+fn validate_header_identities_streaming(
+    file: &mut (impl Read + Seek),
+    header: &CheckedHeader,
+    sections: &[CheckedSection],
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
+) -> Result<(), FnlpqReadError> {
+    read_checkpoint(checkpoint)?;
+    let license = sections.iter().find(|section| section.kind == SectionKind::LicenseBundle)
+        .ok_or_else(|| header_error("license_bundle_sha256", "required license section is absent"))?;
+    let observed_license = stream_section_identity(
+        file, license, digest_domain::LICENSE_BUNDLE, &[], checkpoint,
+    )?;
+    if hex_lower(&observed_license) != header.license_bundle_sha256 {
+        return Err(section_error(license, "license_bundle_sha256 does not bind exact license bytes"));
+    }
+    read_checkpoint(checkpoint)?;
+    validate_packing_set_identity(header, sections)?;
+    read_checkpoint(checkpoint)?;
+
+    let mut tensor_digests = Vec::new();
+    tensor_digests.try_reserve_exact(header.tensors.len())
+        .map_err(|error| header_error("logical tensor identity", format!("digest allocation refused: {error}")))?;
+    for tensor in &header.tensors {
+        read_checkpoint(checkpoint)?;
+        let observed = stream_tensor_identity(file, tensor, sections, checkpoint)?;
+        let actual = hex_lower(&observed);
+        if actual != tensor.canonical_logical_sha256 {
+            return Err(header_error(
+                format!("tensors/{}/canonical_logical_sha256", tensor.name),
+                format!("first divergent logical record expected={} actual={actual}", tensor.canonical_logical_sha256),
+            ));
+        }
+        tensor_digests.push(observed);
+    }
+    let mut source_digests = Vec::new();
+    source_digests.try_reserve_exact(header.sources.len())
+        .map_err(|error| header_error("logical materialized source", format!("digest allocation refused: {error}")))?;
+    for source in &header.sources {
+        read_checkpoint(checkpoint)?;
+        let section = section_for(sections, source.section_ordinal, "logical materialized source")?;
+        source_digests.push(stream_section_identity(
+            file, section, digest_domain::MATERIALIZED_SOURCE, &[source.name.as_bytes()], checkpoint,
+        )?);
+    }
+    read_checkpoint(checkpoint)?;
+    let observed = logical_model_sha256_from_source_digests(
+        &header.model_id, &header.revision, &tensor_digests, &source_digests,
+    ).map_err(|error| header_error("logical_model_sha256", error.to_string()))?;
+    let actual = hex_lower(&observed);
+    if actual != header.logical_model_sha256 {
+        return Err(header_error(
+            "logical_model_sha256",
+            format!("first divergent logical record expected={} actual={actual}", header.logical_model_sha256),
+        ));
+    }
+    read_checkpoint(checkpoint)
+}
+
+fn stream_tensor_identity(
+    file: &mut (impl Read + Seek),
+    tensor: &CheckedTensor,
+    sections: &[CheckedSection],
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
+) -> Result<[u8; 32], FnlpqReadError> {
+    let mut hasher = LogicalTensorStreamingHasher::new(
+        &tensor.name, &tensor.canonical_dtype, &tensor.shape, &tensor.quantization,
+        tensor.data.len, tensor.scale.len, tensor.row_sum.len,
+    ).map_err(|error| header_error("logical tensor identity", error.to_string()))?;
+    for (mapping_name, mapping) in [
+        ("data", &tensor.data), ("scale", &tensor.scale), ("row_sum", &tensor.row_sum),
+    ] {
+        let section = section_for(sections, mapping.section_ordinal, mapping_name)?;
+        visit_section_range(file, section, mapping.offset, mapping.len, checkpoint, |bytes| {
+            let written = match mapping_name {
+                "data" => hasher.write_data(bytes),
+                "scale" => {
+                    // Metadata checked f32 alignment, and the fixed read chunk
+                    // is a multiple of four, so no scale word crosses callbacks.
+                    validate_f32_scale_bytes(bytes).map_err(|error| section_error(
+                        section, format!("tensor {} scale encoding: {error}", tensor.name),
+                    ))?;
+                    hasher.write_scale(bytes)
+                }
+                _ => hasher.write_row_sum(bytes),
+            };
+            written.map_err(|error| header_error(
+                format!("tensors/{}/{}", tensor.name, mapping_name), error.to_string(),
+            ))
+        })?;
+    }
+    hasher.finish().map_err(|error| header_error("logical tensor identity", error.to_string()))
+}
+
+/// The shared format framing prefixes each field with its full declared
+/// length. Only the final field is streamed; preceding fields are bounded
+/// canonical metadata. No section-sized allocation is required.
+fn stream_section_identity(
+    file: &mut (impl Read + Seek),
+    section: &CheckedSection,
+    domain: &str,
+    preceding: &[&[u8]],
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
+) -> Result<[u8; 32], FnlpqReadError> {
+    read_checkpoint(checkpoint)?;
+    let fields = u64::try_from(preceding.len()).ok().and_then(|n| n.checked_add(1))
+        .ok_or_else(|| section_error(section, "identity field-count overflow"))?;
+    let mut hasher = framed_stream_hasher(domain, fields);
+    for field in preceding {
+        let len = u64::try_from(field.len())
+            .map_err(|_| section_error(section, "identity field length does not fit u64"))?;
+        framed_stream_field_prefix(&mut hasher, len);
+        hasher.update(field);
+    }
+    framed_stream_field_prefix(&mut hasher, section.stored_len);
+    visit_section_range(file, section, 0, section.stored_len, checkpoint, |bytes| {
+        hasher.update(bytes);
+        Ok(())
+    })?;
+    Ok(hasher.finalize().into())
+}
+
+/// Range admission is repeated at the read seam. Every read and hash update
+/// consumes at most one fixed chunk before the caller's next checkpoint.
+fn visit_section_range(
+    file: &mut (impl Read + Seek),
+    section: &CheckedSection,
+    offset: u64,
+    len: u64,
+    checkpoint: &mut dyn FnMut() -> Option<DecodeCancellationKind>,
+    mut visit: impl FnMut(&[u8]) -> Result<(), FnlpqReadError>,
+) -> Result<(), FnlpqReadError> {
+    read_checkpoint(checkpoint)?;
+    let end = offset.checked_add(len)
+        .filter(|&end| end <= section.stored_len)
+        .ok_or_else(|| section_error(section, "semantic mapping exceeds checked section range"))?;
+    let absolute = section.file_offset.checked_add(offset)
+        .ok_or_else(|| section_error(section, "semantic mapping absolute offset overflow"))?;
+    section.file_offset.checked_add(end)
+        .ok_or_else(|| section_error(section, "semantic mapping absolute end overflow"))?;
+    file.seek(SeekFrom::Start(absolute)).map_err(|error| FnlpqReadError::Io {
+        operation: "seek semantic identity range", detail: error.to_string(),
+    })?;
+    let mut scratch = [0_u8; RANGE_READ_CHUNK_BYTES];
+    let mut remaining = len;
+    while remaining != 0 {
+        read_checkpoint(checkpoint)?;
+        let take = usize::try_from(remaining.min(RANGE_READ_CHUNK_BYTES as u64))
+            .map_err(|_| section_error(section, "semantic identity chunk does not fit host usize"))?;
+        file.read_exact(&mut scratch[..take]).map_err(|error| FnlpqReadError::Io {
+            operation: "read semantic identity range", detail: error.to_string(),
+        })?;
+        visit(&scratch[..take])?;
+        remaining -= take as u64;
+    }
+    read_checkpoint(checkpoint)
 }
 
 fn mapping_bytes<'a>(
@@ -2458,5 +2643,133 @@ mod cancellation_tests {
         }).expect("checkpoints must not alter the framed stored-section digest");
         assert_eq!(reader.position(), bytes.len() as u64);
         assert!(checkpoints >= 5);
+    }
+}
+
+#[cfg(test)]
+mod semantic_range_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    struct BoundedReader {
+        inner: Cursor<Vec<u8>>,
+        largest_read: usize,
+    }
+    impl Read for BoundedReader {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            assert!(output.len() <= RANGE_READ_CHUNK_BYTES, "semantic verification must stay bounded");
+            self.largest_read = self.largest_read.max(output.len());
+            self.inner.read(output)
+        }
+    }
+    impl Seek for BoundedReader {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(position)
+        }
+    }
+    struct UnreachableReader;
+    impl Read for UnreachableReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("refused semantic range must not read")
+        }
+    }
+    impl Seek for UnreachableReader {
+        fn seek(&mut self, _: SeekFrom) -> std::io::Result<u64> {
+            panic!("refused semantic range must not seek")
+        }
+    }
+    fn section(ordinal: u64, name: &str, kind: SectionKind, offset: u64, len: u64) -> CheckedSection {
+        CheckedSection { ordinal, name: name.to_owned(), kind, file_offset: offset,
+            stored_len: len, alignment: 1, stored_sha256: [0; 32] }
+    }
+    fn tensor_fixture() -> (Vec<u8>, Vec<CheckedSection>, CheckedTensor) {
+        let data_len = RANGE_READ_CHUNK_BYTES * 2 + 6;
+        let sidecar_len = RANGE_READ_CHUNK_BYTES + 4;
+        let mut bytes = vec![0x3f; data_len];
+        for _ in 0..sidecar_len / 4 { bytes.extend_from_slice(&0.5_f32.to_le_bytes()); }
+        bytes.resize(data_len + 2 * sidecar_len, 0);
+        let sections = vec![
+            section(0, "data", SectionKind::GenericTensorPayload, 0, data_len as u64),
+            section(1, "scales", SectionKind::GenericTensorScales, data_len as u64, sidecar_len as u64),
+            section(2, "rows", SectionKind::GenericTensorRowSums, (data_len + sidecar_len) as u64, sidecar_len as u64),
+        ];
+        let tensor = CheckedTensor {
+            name: "fixture.weight".to_owned(), canonical_dtype: "bf16".to_owned(),
+            shape: vec![(data_len / 2) as u32], canonical_logical_sha256: String::new(),
+            logical_bytes: data_len as u64, quantization: BF16_VERBATIM_V1.to_owned(),
+            data: CheckedMapping { section_ordinal: 0, offset: 0, len: data_len as u64 },
+            scale: CheckedMapping { section_ordinal: 1, offset: 0, len: sidecar_len as u64 },
+            row_sum: CheckedMapping { section_ordinal: 2, offset: 0, len: sidecar_len as u64 },
+        };
+        (bytes, sections, tensor)
+    }
+
+    #[test]
+    fn tensor_identity_matches_owned_formula_with_bounded_data_and_sidecar_reads() {
+        let (bytes, sections, tensor) = tensor_fixture();
+        let data_end = tensor.data.len as usize;
+        let scale_end = data_end + tensor.scale.len as usize;
+        let expected = logical_tensor_sha256(&tensor.name, &tensor.canonical_dtype, &tensor.shape,
+            &tensor.quantization, &bytes[..data_end], &bytes[data_end..scale_end], &bytes[scale_end..]).unwrap();
+        let mut reader = BoundedReader { inner: Cursor::new(bytes), largest_read: 0 };
+        let observed = stream_tensor_identity(&mut reader, &tensor, &sections, &mut || None).unwrap();
+        assert_eq!(observed, expected);
+        assert_eq!(reader.largest_read, RANGE_READ_CHUNK_BYTES);
+    }
+
+    #[test]
+    fn auxiliary_identities_match_owned_framing_without_retaining_sections() {
+        let bytes = vec![0x57; RANGE_READ_CHUNK_BYTES * 3 + 7];
+        let expected_source = framed_sha256(digest_domain::MATERIALIZED_SOURCE, &[b"tokenizer_model", &bytes]).unwrap();
+        let expected_license = framed_sha256(digest_domain::LICENSE_BUNDLE, &[&bytes]).unwrap();
+        let section = section(0, "auxiliary", SectionKind::TokenizerModel, 0, bytes.len() as u64);
+        let mut reader = BoundedReader { inner: Cursor::new(bytes), largest_read: 0 };
+        assert_eq!(stream_section_identity(&mut reader, &section, digest_domain::MATERIALIZED_SOURCE,
+            &[b"tokenizer_model"], &mut || None).unwrap(), expected_source);
+        assert_eq!(stream_section_identity(&mut reader, &section, digest_domain::LICENSE_BUNDLE,
+            &[], &mut || None).unwrap(), expected_license);
+        assert_eq!(reader.largest_read, RANGE_READ_CHUNK_BYTES);
+    }
+
+    #[test]
+    fn every_nonpositive_or_nonfinite_scale_is_rejected_after_a_chunk_boundary() {
+        for invalid in [0.0_f32, -0.0, -1.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            let (mut bytes, sections, tensor) = tensor_fixture();
+            let offset = tensor.data.len as usize + RANGE_READ_CHUNK_BYTES;
+            bytes[offset..offset + 4].copy_from_slice(&invalid.to_le_bytes());
+            let error = stream_tensor_identity(&mut Cursor::new(bytes), &tensor, &sections, &mut || None).unwrap_err();
+            assert!(matches!(error, FnlpqReadError::Section { ref reason, .. } if reason.contains("scale encoding")));
+        }
+    }
+
+    #[test]
+    fn semantic_hash_cancellation_stops_before_the_next_read_and_keeps_its_cause() {
+        for cause in [DecodeCancellationKind::PollQuota, DecodeCancellationKind::CostBudget,
+            DecodeCancellationKind::User, DecodeCancellationKind::Deadline] {
+            let (bytes, sections, tensor) = tensor_fixture();
+            let mut reader = BoundedReader { inner: Cursor::new(bytes), largest_read: 0 };
+            let mut polls = 0;
+            let error = stream_tensor_identity(&mut reader, &tensor, &sections, &mut || {
+                polls += 1;
+                (polls == 4).then_some(cause)
+            }).unwrap_err();
+            assert_eq!(error, FnlpqReadError::Cancelled(cause));
+            assert_eq!(reader.inner.position(), (2 * RANGE_READ_CHUNK_BYTES) as u64);
+        }
+    }
+
+    #[test]
+    fn precancelled_auxiliary_hash_and_invalid_ranges_do_not_touch_io() {
+        let section = section(0, "auxiliary", SectionKind::LicenseBundle, 0, 8);
+        let error = stream_section_identity(&mut UnreachableReader, &section, digest_domain::LICENSE_BUNDLE,
+            &[], &mut || Some(DecodeCancellationKind::Shutdown)).unwrap_err();
+        assert_eq!(error, FnlpqReadError::Cancelled(DecodeCancellationKind::Shutdown));
+        for (offset, len) in [(0, 9), (8, 1), (u64::MAX, 1)] {
+            assert!(visit_section_range(&mut UnreachableReader, &section, offset, len, &mut || None,
+                |_| panic!("invalid range must not reach visitor")).is_err());
+        }
+        let overflow = CheckedSection { file_offset: u64::MAX - 2, ..section };
+        assert!(visit_section_range(&mut UnreachableReader, &overflow, 0, 8, &mut || None,
+            |_| panic!("overflow must not reach visitor")).is_err());
     }
 }

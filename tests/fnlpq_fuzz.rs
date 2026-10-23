@@ -386,3 +386,195 @@ fn hex(bytes: &[u8]) -> String {
     }
     output
 }
+
+/// Exercise the production file-backed open path, using only a tiny fixture
+/// owned by this test. No full-model or platform activation claim is made.
+fn with_range_artifact<T>(
+    bytes: &[u8],
+    check: impl FnOnce(Result<franken_nlp::artifact::reader::FnlpqRangeReader, FnlpqReadError>) -> T,
+) -> T {
+    use std::{fs::OpenOptions, io::Write, sync::atomic::{AtomicU64, Ordering}};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    struct Fixture(PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+    }
+    let path = std::env::temp_dir().join(format!(
+        "fnlpq-semantic-range-{}-{}.fnlpq", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed),
+    ));
+    let mut file = OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+    let fixture = Fixture(path); // Cleanup authority follows successful create_new only.
+    file.write_all(bytes).unwrap();
+    drop(file);
+    check(franken_nlp::artifact::reader::FnlpqRangeReader::open(&fixture.0))
+}
+
+fn fixture_header(bytes: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(&bytes[80..directory_start(bytes)]).unwrap()
+}
+fn replace_fixture_header(bytes: &mut [u8], header: &serde_json::Value) {
+    use sha2::{Digest, Sha256};
+    let end = directory_start(bytes);
+    let encoded = franken_nlp::canonjson::canonical_bytes(header).unwrap();
+    assert_eq!(encoded.len(), end - 80, "digest-only mutations preserve directory offsets");
+    bytes[80..end].copy_from_slice(&encoded);
+    bytes[48..80].copy_from_slice(&Sha256::digest(&encoded));
+}
+fn fixture_section(bytes: &[u8], ordinal: usize) -> &[u8] {
+    let entry = directory_start(bytes) + ordinal * 80;
+    let start = u64_at(bytes, entry + 16) as usize;
+    let len = u64_at(bytes, entry + 24) as usize;
+    &bytes[start..start + len]
+}
+
+/// Update every physical consistency link after a payload mutation. Logical
+/// tensor/model/license identities deliberately stay unchanged unless the
+/// caller explicitly rebinds them. A stored-hash rejection cannot mask the
+/// semantic verification under test.
+fn refresh_fixture_physical_identities(bytes: &mut [u8]) -> serde_json::Value {
+    let mut header = fixture_header(bytes);
+    let directory = directory_start(bytes);
+    let sections = header["sections"].as_array().unwrap().clone();
+    let mut stored = Vec::new();
+    for (ordinal, section) in sections.iter().enumerate() {
+        let digest = framed_sha256("fnlpq-section-v1", &[
+            section["name"].as_str().unwrap().as_bytes(), fixture_section(bytes, ordinal),
+        ]).unwrap();
+        bytes[directory + ordinal * 80 + 48..directory + ordinal * 80 + 80].copy_from_slice(&digest);
+        stored.push(hex(&digest));
+    }
+    for source in header["materialized_sources"].as_array_mut().unwrap() {
+        source["sha256"] = stored[source["section_ordinal"].as_u64().unwrap() as usize].clone().into();
+    }
+    for set in header["packing_sets"].as_array_mut().unwrap() {
+        for representation in set["representations"].as_array_mut().unwrap() {
+            representation["sha256"] = stored[representation["section_ordinal"].as_u64().unwrap() as usize].clone().into();
+        }
+    }
+    let mut sets = Vec::new();
+    for set in header["packing_sets"].as_array().unwrap() {
+        let mut representations = Vec::new();
+        for representation in set["representations"].as_array().unwrap() {
+            let ordinal = representation["section_ordinal"].as_u64().unwrap() as usize;
+            representations.push(serde_json::json!({
+                "byte_cost": representation["byte_cost"],
+                "section_name": sections[ordinal]["name"],
+                "stored_sha256": representation["sha256"],
+            }));
+        }
+        representations.sort_by(|a, b| a["section_name"].as_str().unwrap().as_bytes()
+            .cmp(b["section_name"].as_str().unwrap().as_bytes()));
+        sets.push(serde_json::json!({
+            "id": set["id"], "representations": representations, "target": set["target"],
+        }));
+    }
+    let canonical = franken_nlp::canonjson::canonical_bytes(&sets).unwrap();
+    header["packing_set_sha256"] = hex(&framed_sha256("fnlpq-packing-set-v1", &[
+        header["recipe_id"].as_str().unwrap().as_bytes(), &canonical,
+    ]).unwrap()).into();
+    header
+}
+
+#[test]
+fn range_open_matches_owned_semantic_identity_and_packing_selection() {
+    for seed in [1, 2, 0x6d2f_5a83_1b94_c0de] {
+        let bytes = generated_valid_artifact(seed);
+        let owned = FnlpqArtifact::from_bytes(bytes.clone()).unwrap();
+        with_range_artifact(&bytes, |result| {
+            let range = result.unwrap_or_else(|error| panic!("valid range fixture refused: {error}"));
+            assert_eq!(range.model_id(), owned.model_id());
+            assert_eq!(range.revision(), owned.revision());
+            assert_eq!(range.recipe_id(), owned.recipe_id());
+            assert_eq!(range.source_root_sha256(), owned.source_root_sha256());
+            assert_eq!(range.logical_model_sha256(), owned.logical_model_sha256());
+            assert_eq!(range.packing_set_sha256(), owned.packing_set_sha256());
+            assert_eq!(range.license_bundle_sha256(), owned.license_bundle_sha256());
+            assert_eq!(range.tensors(), owned.tensors());
+            assert_eq!(range.sections(), owned.sections());
+            assert_eq!(range.select_packing(ArchTarget::Generic).unwrap(), owned.select_packing(ArchTarget::Generic).unwrap());
+            assert!(matches!(range.select_packing(ArchTarget::Aarch64Sdot),
+                Err(FnlpqReadError::MissingPackingDerivation { .. })));
+        });
+    }
+}
+
+#[test]
+fn range_open_rejects_forged_semantic_digests_even_with_valid_header_and_stored_hashes() {
+    for field in ["license_bundle_sha256", "packing_set_sha256", "logical_model_sha256", "canonical_logical_sha256"] {
+        let mut bytes = golden_bytes();
+        let mut header = fixture_header(&bytes);
+        if field == "canonical_logical_sha256" { header["tensors"][0][field] = "0".repeat(64).into(); }
+        else { header[field] = "0".repeat(64).into(); }
+        replace_fixture_header(&mut bytes, &header);
+        let owned_error = FnlpqArtifact::from_bytes(bytes.clone()).unwrap_err();
+        assert!(owned_error.to_string().contains(field), "{owned_error}");
+        with_range_artifact(&bytes, |result| {
+            let error = result.err().expect("forged semantic identity must fail file-backed open");
+            assert!(error.to_string().contains(field), "{error}");
+        });
+    }
+}
+
+#[test]
+fn physical_rehash_cannot_hide_changed_tensor_semantic_source_or_license_bytes() {
+    let valid = golden_bytes();
+    let original = FnlpqArtifact::from_bytes(valid.clone()).unwrap();
+    for (kind, expected) in [
+        (SectionKind::GenericTensorPayload, "canonical_logical_sha256"),
+        (SectionKind::GenericTensorRowSums, "canonical_logical_sha256"),
+        (SectionKind::TokenizerModel, "logical_model_sha256"),
+        (SectionKind::ModelConfig, "logical_model_sha256"),
+        (SectionKind::TokenizerConfig, "logical_model_sha256"),
+        (SectionKind::ChatTemplate, "logical_model_sha256"),
+        (SectionKind::LicenseBundle, "license_bundle_sha256"),
+    ] {
+        let mut bytes = valid.clone();
+        let section = original.sections().iter().find(|section| section.kind == kind).unwrap();
+        bytes[section.file_offset as usize] ^= 1;
+        let header = refresh_fixture_physical_identities(&mut bytes);
+        replace_fixture_header(&mut bytes, &header);
+        let owned_error = FnlpqArtifact::from_bytes(bytes.clone()).unwrap_err();
+        assert!(owned_error.to_string().contains(expected), "{owned_error}");
+        with_range_artifact(&bytes, |result| {
+            let error = result.err().expect("physical identities cannot replace semantic identities");
+            assert!(error.to_string().contains(expected), "{error}");
+        });
+    }
+}
+
+#[test]
+fn range_open_rejects_invalid_scales_even_when_all_declared_digests_match_the_bytes() {
+    let valid = golden_bytes();
+    let original = FnlpqArtifact::from_bytes(valid.clone()).unwrap();
+    let scale = original.sections().iter().find(|section| section.kind == SectionKind::GenericTensorScales).unwrap();
+    for invalid in [0.0_f32, -0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let mut bytes = valid.clone();
+        let offset = scale.file_offset as usize;
+        bytes[offset..offset + 4].copy_from_slice(&invalid.to_le_bytes());
+        let mut header = refresh_fixture_physical_identities(&mut bytes);
+        let mut tensor_digests = Vec::new();
+        for (index, tensor) in original.tensors().iter().enumerate() {
+            let mapping = |range: &franken_nlp::artifact::reader::CheckedMapping| {
+                let section = fixture_section(&bytes, range.section_ordinal as usize);
+                &section[range.offset as usize..(range.offset + range.len) as usize]
+            };
+            let digest = logical_tensor_sha256(&tensor.name, &tensor.canonical_dtype, &tensor.shape,
+                &tensor.quantization, mapping(&tensor.data), mapping(&tensor.scale), mapping(&tensor.row_sum)).unwrap();
+            header["tensors"][index]["canonical_logical_sha256"] = hex(&digest).into();
+            tensor_digests.push(digest);
+        }
+        let sources: Vec<_> = header["materialized_sources"].as_array().unwrap().iter().map(|source| (
+            source["name"].as_str().unwrap(),
+            fixture_section(&bytes, source["section_ordinal"].as_u64().unwrap() as usize),
+        )).collect();
+        let model_digest = logical_model_sha256(original.model_id(), original.revision(), &tensor_digests, &sources).unwrap();
+        header["logical_model_sha256"] = hex(&model_digest).into();
+        replace_fixture_header(&mut bytes, &header);
+        let owned_error = FnlpqArtifact::from_bytes(bytes.clone()).unwrap_err();
+        assert!(owned_error.to_string().contains("scale encoding"), "{owned_error}");
+        with_range_artifact(&bytes, |result| {
+            let error = result.err().expect("matching digests cannot make an invalid scale executable");
+            assert!(error.to_string().contains("scale encoding"), "{error}");
+        });
+    }
+}

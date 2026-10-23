@@ -983,7 +983,21 @@ pub fn logical_model_sha256(
         .iter()
         .map(|(name, bytes)| materialized_source_sha256(name, bytes))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut fields = Vec::with_capacity(4 + tensor_digests.len() + source_digests.len());
+    logical_model_sha256_from_source_digests(model_id, revision, tensor_digests, &source_digests)
+}
+
+/// Internal bounded-reader composition of the SAME logical-model identity.
+/// Source digests must be computed over the exact materialized section bytes
+/// using the materialized-source domain, in the canonical source order.
+pub(crate) fn logical_model_sha256_from_source_digests(
+    model_id: &str,
+    revision: &str,
+    tensor_digests: &[[u8; 32]],
+    source_digests: &[[u8; 32]],
+) -> Result<[u8; 32], FnlpqWriteError> {
+    validate_authority("model_id", model_id)?;
+    validate_revision(revision)?;
+    let mut fields = Vec::with_capacity(6 + tensor_digests.len() + source_digests.len());
     fields.push(b"model_id".as_slice());
     fields.push(model_id.as_bytes());
     fields.push(b"revision".as_slice());
@@ -1486,7 +1500,7 @@ fn resolve_written_sections(
     Ok(written)
 }
 
-fn framed_stream_hasher(tag: &str, field_count: u64) -> Sha256 {
+pub(crate) fn framed_stream_hasher(tag: &str, field_count: u64) -> Sha256 {
     let mut hasher = Sha256::new();
     hasher.update(tag.as_bytes());
     hasher.update([0]);
@@ -1494,7 +1508,7 @@ fn framed_stream_hasher(tag: &str, field_count: u64) -> Sha256 {
     hasher
 }
 
-fn framed_stream_field_prefix(hasher: &mut Sha256, field_len: u64) {
+pub(crate) fn framed_stream_field_prefix(hasher: &mut Sha256, field_len: u64) {
     hasher.update(field_len.to_le_bytes());
 }
 
