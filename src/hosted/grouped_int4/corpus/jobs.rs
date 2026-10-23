@@ -1,6 +1,7 @@
 //! Authenticated resumable extraction on the charged grouped-INT4 host.
 //! The existing runner owns retention, work debits and publication ordering.
 use super::*;
+mod source;
 use crate::{
     hosted::corpus::jobs::{HostedJobError, JobHostLimits, SourceJobRequest, run_population},
     jobs::{JobLimits, JobProgress, population::JobPopulation,
