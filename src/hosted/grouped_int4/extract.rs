@@ -68,7 +68,7 @@ impl NlpEngine {
 
 fn extraction_error(error: Int4ExtractError) -> HostedError { HostedError::Int4(Int4HostError::Extraction(error)) }
 
-fn requirements(work: Int4Work, width: usize, max_kv_bytes: u64, native: NativeLimits,
+pub(super) fn requirements(work: Int4Work, width: usize, max_kv_bytes: u64, native: NativeLimits,
     masks: MaskWorkLimits, max_mask_node_visits: u64) -> Result<Int4MemoryRequirement, HostedError> {
     native.run.validate()?;
     if work.forward_positions == 0 || work.forward_positions > native.context_tokens as u64

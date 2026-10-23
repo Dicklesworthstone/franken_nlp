@@ -13,8 +13,8 @@ pub const INT4_COHORT_EXECUTION: &str = "grouped-int4-ragged-sequence-cohort-v1"
 pub const MAX_INT4_SEQUENCES: usize = MAX_INT4_BATCH_ROWS;
 
 impl Int4Work {
-    /// Add independent sequences' work, not their lengths before computing
-    /// attention triangles. No cross-document attention is priced or executed.
+    /// Add independent sequences' or heads' work, not their lengths before
+    /// computing attention triangles. No cross-document attention is priced.
     pub fn checked_add(self, other: Self) -> Result<Self, StrictInt4Error> {
         Ok(Self {
             forward_positions: self.forward_positions.checked_add(other.forward_positions).ok_or(StrictInt4Error::Work)?,

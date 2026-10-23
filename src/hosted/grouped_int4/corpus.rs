@@ -3,6 +3,8 @@
 //! blocking invocation. Corpus and mask budgets never renew at an epoch.
 
 use super::*;
+mod source;
+pub use source::Int4SourceCorpusConfig;
 use std::io::{BufRead, Write};
 use crate::{
     batch::{self as stream, BatchCode, BatchItemFailure, BatchSummary,
@@ -111,9 +113,16 @@ impl Int4ExtractionBatchAdmission for CorpusAdmission<'_> {
 
     fn admit(&mut self, request: Int4ExtractionAdmission<'_>)
         -> Result<(ExecutionIdentity, Self::Guard), BatchItemFailure> {
+        self.admit_for_task(request, "extract-v1")
+    }
+}
+impl CorpusAdmission<'_> {
+    fn admit_for_task(&self, request: Int4ExtractionAdmission<'_>, task_spec: &str)
+        -> Result<(ExecutionIdentity, Pending), BatchItemFailure> {
         constrained_int4::check_model(request.identity, self.model)
             .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
-        check_request(self.model.group_width(), self.kv_bytes, self.output_bytes, self.masks, &request)?;
+        check_request_for_task(self.model.group_width(), self.kv_bytes, self.output_bytes,
+            self.masks, &request, task_spec)?;
         let tokens = request.model_work.projected_logits / NANBEIGE_VOCAB_SIZE as u64;
         // Keep the reservation live through result allocation, serialization
         // and writer delivery. Allocation has not happened at admission, so
@@ -124,11 +133,19 @@ impl Int4ExtractionBatchAdmission for CorpusAdmission<'_> {
     }
 }
 
+#[cfg(test)]
 fn check_request(width: usize, kv_bytes: u64, output_bytes: u64,
     masks: ExtractionMaskBudget, request: &Int4ExtractionAdmission<'_>) -> Result<(), BatchItemFailure> {
+    check_request_for_task(width, kv_bytes, output_bytes, masks, request, "extract-v1")
+}
+
+fn check_request_for_task(width: usize, kv_bytes: u64, output_bytes: u64,
+    masks: ExtractionMaskBudget, request: &Int4ExtractionAdmission<'_>, task_spec: &str)
+    -> Result<(), BatchItemFailure> {
     constrained_int4::check_profile(request.identity, width)
         .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
-    if request.identity.task_spec != "extract-v1" || request.kv_reservation_bytes != kv_bytes {
+    if !matches!(task_spec, "extract-v1" | "ner-v1" | "keyphrases-v1" | "summarize-v1" | "answer-v1")
+        || request.identity.task_spec != task_spec || request.kv_reservation_bytes != kv_bytes {
         return Err(BatchItemFailure::fatal(BatchCode::Admission));
     }
     if request.mask_node_visits == 0 || request.mask_node_visits != masks.max_visits_per_item

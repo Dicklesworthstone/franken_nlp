@@ -157,17 +157,6 @@ impl CandidateSchedule {
     }
 }
 
-/// Sum independent heads without inventing cross-head causal attention.
-impl Int4Work {
-    pub fn checked_add(self, other: Self) -> Result<Self, StrictInt4Error> {
-        let sum = |a: u64, b: u64| a.checked_add(b).ok_or(StrictInt4Error::Work);
-        Ok(Self { forward_positions: sum(self.forward_positions, other.forward_positions)?,
-            projected_logits: sum(self.projected_logits, other.projected_logits)?,
-            attention_pairs: sum(self.attention_pairs, other.attention_pairs)?,
-            projections: self.projections.checked_add(other.projections)? })
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_compiled<C: DecodeStepControl>(prompt: &[u32], scorer: &CandidateScorer,
     mode: ScoringMode, schedule: CandidateSchedule, max_output_bytes: u64,

@@ -6,7 +6,9 @@ use crate::native_engine::strict_int4::weights::snapshot::Int4SnapshotError;
 mod snapshot;
 mod classify;
 mod extract;
+mod source;
 mod corpus;
+pub use corpus::Int4SourceCorpusConfig;
 mod prefill;
 pub mod batch;
 use crate::tasks::classify::grouped_int4::Int4ClassificationError;
@@ -67,6 +69,7 @@ pub enum Int4HostError {
     Source(ConverterError), Model(Int4ModelError), Native(StrictInt4Error), Chat(Int4ChatError),
     Snapshot(Int4SnapshotError), Classification(Int4ClassificationError),
     Extraction(crate::tasks::extract::grouped_int4::Int4ExtractError),
+    SourceTask(crate::tasks::source_planning::grouped_int4::Int4SourceError),
 }
 impl fmt::Display for Int4HostError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -78,6 +81,7 @@ impl fmt::Display for Int4HostError {
             Self::Snapshot(_) => "INT4 local snapshot loading or persistence refused",
             Self::Classification(_) => "INT4 classification execution or finalization refused",
             Self::Extraction(_) => "INT4 schema extraction execution or finalization refused",
+            Self::SourceTask(_) => "INT4 source task execution or finalization refused",
         })
     }
 }
@@ -88,7 +92,7 @@ impl Error for Int4HostError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self { Self::Source(e) => Some(e), Self::Model(e) => Some(e), Self::Native(e) => Some(e),
             Self::Chat(e) => Some(e), Self::Snapshot(e) => Some(e), Self::Classification(e) => Some(e),
-            Self::Extraction(e) => Some(e) }
+            Self::Extraction(e) => Some(e), Self::SourceTask(e) => Some(e) }
     }
 }
 fn source_error(error: ConverterError) -> HostedError { HostedError::Int4(Int4HostError::Source(error)) }

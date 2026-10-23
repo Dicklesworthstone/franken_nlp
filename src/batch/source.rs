@@ -17,6 +17,7 @@ use super::*;
 pub use super::judge::{JudgeBatchAdmission as SourceBatchAdmission, GuardedOutput};
 pub use super::extract::ExtractionMaskBudget as SourceMaskBudget;
 pub mod quantized;
+pub mod grouped_int4;
 
 /// BatchDocument.text is the source for NER/keyphrases/summarize, or the
 /// QUESTION for answer. QA passages stay separately typed in task_args.
