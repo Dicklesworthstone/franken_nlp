@@ -155,7 +155,7 @@ fn fits(work: Int4Work, ceiling: Int4Work) -> bool {
 
 // This private seam exercises lifecycle faults without fabricating a public
 // model or allowing callers to supply their own completed native result.
-trait Driver {
+pub(super) trait Driver {
     fn capacity(&self) -> usize;
     fn group_width(&self) -> usize;
     fn clean(&self) -> bool;
@@ -163,8 +163,9 @@ trait Driver {
         identity: &ExecutionIdentity, budget: Int4JsonBudget, control: &mut C)
         -> Result<Int4ExtractRun, Int4ExtractError>;
 }
-struct NativeDriver<'e, 'weights, 'v> {
-    engine: &'e mut StrictInt4Engine<'weights>, vocabulary: &'v ExtractionVocabulary,
+pub(super) struct NativeDriver<'e, 'weights, 'v> {
+    pub(super) engine: &'e mut StrictInt4Engine<'weights>,
+    pub(super) vocabulary: &'v ExtractionVocabulary,
 }
 impl Driver for NativeDriver<'_, '_, '_> {
     fn capacity(&self) -> usize { self.engine.kv_cache().capacity_positions() }
@@ -178,7 +179,7 @@ impl Driver for NativeDriver<'_, '_, '_> {
         prepared.plan.execute(self.engine, identity, self.vocabulary, budget, control)
     }
 }
-fn preflight(prepared: &PreparedInt4BatchExtraction, driver: &impl Driver) -> Result<u64, BatchItemFailure> {
+pub(super) fn preflight(prepared: &PreparedInt4BatchExtraction, driver: &impl Driver) -> Result<u64, BatchItemFailure> {
     if !driver.clean() { return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)); }
     if prepared.plan.group_width() != driver.group_width() {
         return Err(BatchItemFailure::fatal(BatchCode::Admission));
@@ -191,7 +192,7 @@ fn preflight(prepared: &PreparedInt4BatchExtraction, driver: &impl Driver) -> Re
     }
     Ok(required.kv_bytes)
 }
-fn native_budget(prepared: &PreparedInt4BatchExtraction, masks: ExtractionMaskBudget) -> Int4JsonBudget {
+pub(super) fn native_budget(prepared: &PreparedInt4BatchExtraction, masks: ExtractionMaskBudget) -> Int4JsonBudget {
     let work = prepared.planned_work();
     Int4JsonBudget { native: Int4RunBudget::exact(work), json: JsonWorkBudget {
         max_forward_positions: work.forward_positions, max_projected_logits: work.projected_logits,
@@ -236,7 +237,7 @@ fn execute_admitted<D: Driver, A: Int4ExtractionBatchAdmission, C: DecodeStepCon
         }
     }
 }
-fn valid_result(prepared: &PreparedInt4BatchExtraction, result: &Int4ExtractRun, masks: u64) -> bool {
+pub(super) fn valid_result(prepared: &PreparedInt4BatchExtraction, result: &Int4ExtractRun, masks: u64) -> bool {
     let out = &result.result.output;
     let options = prepared.plan.options();
     let expected = constrained_int4::planned_work(prepared.plan.group_width(),

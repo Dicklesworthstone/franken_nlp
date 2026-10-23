@@ -14,6 +14,8 @@ use crate::{
 };
 
 mod native;
+/// Whole-document exact-schema extraction with original source coordinates.
+pub mod long;
 pub use native::{Int4ExtractionAdmission, Int4ExtractionBatchAdmission, Int4ExtractionBatchLimits,
     NativeInt4ExtractionBatch};
 

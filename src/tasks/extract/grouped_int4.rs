@@ -130,6 +130,28 @@ impl Int4ExtractPlan {
         Ok(())
     }
 
+    /// Recheck a composed result against this sealed schema/source before
+    /// lifting coordinates or reducing it. This internal verifier does not
+    /// authenticate a serialized receipt or replace native execution.
+    pub(crate) fn verify_completed(&self, run: &Int4ExtractRun) -> Result<(), Int4ExtractError> {
+        // Bound the original envelope before the temporary validation copy.
+        super::quantized::check_size(run, self.max_result_bytes())?;
+        if run.schema_version != 1 || run.execution != INT4_EXTRACT_VERSION || run.group_width != self.group_width {
+            return Err(ExtractError::InvalidResult.into());
+        }
+        let output = &run.result.output;
+        let expected = constrained_int4::planned_work(self.group_width, self.prompt_tokens(), output.token_ids.len())?;
+        if run.model_work != expected || output.forward_positions != expected.forward_positions
+            || output.projected_logits != expected.projected_logits {
+            return Err(Int4JsonError::WorkMismatch.into());
+        }
+        // Independently recheck exact decimal JSON, schema, EOS/control IDs,
+        // profile, source membership and every local occurrence coordinate.
+        let checked = self.extraction.finalize_profile(output.clone(), STRICT_INT4_PROFILE)?;
+        if checked != run.result { return Err(ExtractError::InvalidResult.into()); }
+        Ok(())
+    }
+
     pub fn execute<C: DecodeStepControl>(&self, engine: &mut StrictInt4Engine<'_>,
         admitted: &ExecutionIdentity, vocabulary: &ExtractionVocabulary, budget: Int4JsonBudget,
         control: &mut C) -> Result<Int4ExtractRun, Int4ExtractError> {
