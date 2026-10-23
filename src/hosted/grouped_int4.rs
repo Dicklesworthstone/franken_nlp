@@ -9,6 +9,8 @@ mod extract;
 mod extraction_map;
 pub use extraction_map::Int4ExtractionMapConfig;
 mod source;
+mod source_map;
+pub use source_map::Int4SourceMapConfig;
 mod corpus;
 pub use corpus::Int4SourceCorpusConfig;
 mod prefill;
@@ -73,6 +75,8 @@ pub enum Int4HostError {
     Extraction(crate::tasks::extract::grouped_int4::Int4ExtractError),
     ExtractionMap(crate::batch::extract::grouped_int4::long::Int4ExtractionMapError),
     SourceTask(crate::tasks::source_planning::grouped_int4::Int4SourceError),
+    SourceMap(crate::tasks::source_planning::grouped_int4::long::Int4SourceMapError),
+    SourceSummary(crate::tasks::source_planning::grouped_int4::long::summary::Int4CorpusSummaryError),
 }
 impl fmt::Display for Int4HostError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -86,6 +90,8 @@ impl fmt::Display for Int4HostError {
             Self::Extraction(_) => "INT4 schema extraction execution or finalization refused",
             Self::ExtractionMap(_) => "INT4 complete-document extraction or reduction refused",
             Self::SourceTask(_) => "INT4 source task execution or finalization refused",
+            Self::SourceMap(_) => "INT4 complete-document source mapping refused",
+            Self::SourceSummary(_) => "INT4 complete-document cited-summary reduction refused",
         })
     }
 }
@@ -96,7 +102,8 @@ impl Error for Int4HostError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self { Self::Source(e) => Some(e), Self::Model(e) => Some(e), Self::Native(e) => Some(e),
             Self::Chat(e) => Some(e), Self::Snapshot(e) => Some(e), Self::Classification(e) => Some(e),
-            Self::Extraction(e) => Some(e), Self::ExtractionMap(e) => Some(e), Self::SourceTask(e) => Some(e) }
+            Self::Extraction(e) => Some(e), Self::ExtractionMap(e) => Some(e), Self::SourceTask(e) => Some(e),
+            Self::SourceMap(e) => Some(e), Self::SourceSummary(e) => Some(e) }
     }
 }
 fn source_error(error: ConverterError) -> HostedError { HostedError::Int4(Int4HostError::Source(error)) }
