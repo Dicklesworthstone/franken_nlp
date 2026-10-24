@@ -137,7 +137,7 @@ fn free_text_candidate_language_and_invalid_resources_refuse_before_private_io()
     for flags in [vec!["--max-candidate-tokens", "2"], vec!["--max-new-tokens", "128"],
         vec!["--max-output-bytes", "65536"], vec!["--logprobs"], vec!["--prefill-rows", "1"],
         vec!["--seed", "ab"], vec!["--min-new-tokens", "0"], vec!["--stop", "END"],
-        vec!["--ban-token", "7"], vec!["--logit-bias", "7=0"], vec!["--discover-entities"]] {
+        vec!["--ban-token", "7"], vec!["--logit-bias", "7=0"]] {
         let mut all = vec!["--source-dir", "d", "--source-manifest", "m"]; all.extend(flags);
         assert!(parsed(&all).is_err());
     }

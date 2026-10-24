@@ -5,6 +5,7 @@ use crate::{batch::BatchWork,
     corpus::{resolve::{ResolutionDocument, ResolveOptions, ResolveLimits},
         native_resolve::{NativeResolveLimits, grouped_int4::Int4ResolveLimits}},
 };
+mod discovery;
 
 #[cfg(feature = "asupersync-runtime")]
 mod runtime;
@@ -32,7 +33,9 @@ struct GraphArgs {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct ResolveArgs { scoring: classify::ScoringArgs, graph: GraphArgs }
+pub(super) struct ResolveArgs {
+    scoring: classify::ScoringArgs, graph: GraphArgs, discovery: discovery::DiscoveryArgs,
+}
 
 // Deliberately no Debug: original documents and mention surfaces are private.
 #[derive(Deserialize)]
@@ -43,13 +46,16 @@ struct Population {
 }
 
 pub(super) fn definition() -> clap::Command {
-    GraphArgs::augment_args(classify::definition().name("resolve")
+    let command = GraphArgs::augment_args(classify::definition().name("resolve")
         .about("Resolve exact source-anchored mentions across a complete snapshot with native INT4")
-        .long_about("Read one bounded JSON object containing original documents, anchored mentions and an explicit lexical/context/margin policy. Lexical overlap selects candidates only. Every pair is scored in both presentation orders with the exact A/B/C-plus-EOS language and full-vocabulary denominators. Complete-link clustering refuses missing, conflicting or uncertain cross-pairs. The whole graph, every source anchor and all five native work axes are admitted before the first forward. Source conversion and independently digest-pinned snapshots use the same actual model identity. Empty candidate graphs allocate no native engine, KV or scratch after model loading. Scores are uncalibrated and cluster IDs are snapshot-local. No automatic entity discovery, generation controls, prefill override, thinking, tools, truncation or backend fallback. Blocking IO observes the total deadline cooperatively.")
+        .long_about("Read one bounded JSON object containing original documents, anchored mentions and an explicit lexical/context/margin policy. Add --discover-entities for raw {id,text} documents and optional top-level ner options; add --chunked to discover mentions across every original source chunk. Lexical overlap selects candidates only. Every pair is scored in both presentation orders with the exact A/B/C-plus-EOS language and full-vocabulary denominators. Complete-link clustering refuses missing, conflicting or uncertain cross-pairs. Supplied anchors and their complete graph preflight before model IO. Discovery instead preflights all NER chunks, verifies every recovered occurrence against original text, then plans the complete pair graph under the same remaining five-axis budget. No NER reservation is refunded after early EOS. Source conversion and digest-pinned snapshots use the same actual model identity. Empty supplied-mention graphs allocate no native engine/KV/scratch after model loading; raw nonempty documents always require NER. Scores are uncalibrated, chunk boundaries may miss entities and cluster IDs are snapshot-local. No generation controls, prefill override, thinking, tools, truncation or backend fallback. Blocking IO observes the total deadline cooperatively.")
         .mut_arg("input", |arg| arg.help("JSON {documents:[{id,text,mentions:[{entity_type,surface,span}]}],options:{blocking,context_scalars,minimum_margin_milli}}; '-' reads stdin"))
         .mut_arg("max_candidate_tokens", |arg| arg.default_value("2").hide(true))
+        .mut_arg("max_projected_logits", |arg| arg.default_value("10000000000"))
+        .mut_arg("max_dot_products", |arg| arg.default_value("100000000000000"))
         .mut_arg("max_result_bytes", |arg| arg.help("Complete native resolution result; candidate provenance is additional"))
-        .mut_arg("max_forward_positions", |arg| arg.help("Whole-snapshot native forward ceiling, shared by every pair and both presentation orders")))
+        .mut_arg("max_forward_positions", |arg| arg.help("Whole-snapshot native forward ceiling, shared by all discovery chunks, pairs and both presentation orders")));
+    discovery::DiscoveryArgs::augment_args(command)
 }
 impl ResolveArgs {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
@@ -57,7 +63,8 @@ impl ResolveArgs {
             return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
                 "INT4 resolution uses a fixed label-plus-EOS language"));
         }
-        Ok(Self { scoring: classify::ScoringArgs::from_matches(matches)?, graph: GraphArgs::from_arg_matches(matches)? })
+        Ok(Self { scoring: classify::ScoringArgs::from_matches(matches)?, graph: GraphArgs::from_arg_matches(matches)?,
+            discovery: discovery::DiscoveryArgs::from_arg_matches(matches)? })
     }
     pub(super) fn validate(self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
         let mut limits = self.scoring.validate(args)?;
@@ -71,21 +78,23 @@ impl ResolveArgs {
         }
         let graph_bytes = self.graph_bytes()?;
         let graph_floor = sum(&[g.max_documents as u64 * 128, g.max_mentions as u64 * 1024,
-            g.max_pairs as u64 * 4096, limits.result_bytes as u64 * 16, MIB])?;
+            g.max_pairs as u64 * 4096, limits.result_bytes as u64 * 16, MIB,
+            self.discovery.extra_graph_bytes(self, args)?])?;
         if graph_bytes < graph_floor { return Err(CandidateError::Arguments); }
+        self.discovery.check_preparation(self, args, limits)?;
         // The CLI keeps its input/planning/publication owner. The host separately
         // retains the moved document capacities, its pinned planner/preparation
         // and complete graph until physical completion. This is a conservative
         // declared reservation quote, not an OS RSS estimate.
         limits.minimum_memory_bytes = sum(&[limits.minimum_memory_bytes, limits.preparation_bytes,
-            graph_bytes, self.host_input_bytes(args)?])?;
+            graph_bytes, self.host_input_bytes(args)?, self.discovery.temporary_bytes(limits)?])?;
         if limits.minimum_memory_bytes > limits.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(limits)
     }
     fn graph_bytes(self) -> Result<u64, CandidateError> { mib(self.graph.graph_reserve_mib) }
     fn host_input_bytes(self, args: &Int4Args) -> Result<u64, CandidateError> {
         sum(&[args.max_input_bytes as u64 * 32, self.graph.max_documents as u64 * 128,
-            self.graph.max_mentions as u64 * 256])
+            self.graph.max_mentions as u64 * 256, self.discovery.witness_bytes(self)])
     }
     fn graph_limits(self, args: &Int4Args, limits: Int4Limits) -> ResolveLimits {
         ResolveLimits { max_documents: self.graph.max_documents, max_mentions: self.graph.max_mentions,

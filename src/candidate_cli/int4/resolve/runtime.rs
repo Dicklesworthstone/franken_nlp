@@ -12,6 +12,7 @@ use crate::{
         strict_int4::{Int4ModelIdentity, Int4Work, STRICT_INT4_EXECUTION, STRICT_INT4_PROFILE,
             scoring::INT4_SCORING_EXECUTION, weights::snapshot::INT4_SNAPSHOT_VERSION}},
 };
+mod discovery;
 
 struct DeadlineControl { started: Instant, deadline: Duration }
 impl DecodeStepControl for DeadlineControl {
@@ -49,6 +50,11 @@ fn execution_error(error: HostedError) -> CandidateError {
         HostedError::Int4(Int4HostError::Resolution(error)) => {
             if let Some(cause) = error.cancellation() { return cancelled(cause); }
             match error { Int4ResolveError::Identity => CandidateError::Identity, _ => CandidateError::Execution }
+        }
+        HostedError::Int4(Int4HostError::Entities(error)) => {
+            if let Some(cause) = error.cancellation() { return cancelled(cause); }
+            match error { crate::corpus::entities_int4::Int4EntityError::Identity => CandidateError::Identity,
+                _ => CandidateError::Execution }
         }
         HostedError::Reservation(_) => CandidateError::Memory,
         HostedError::ModelIdentity | HostedError::ResourceDomain => CandidateError::Identity,
@@ -97,6 +103,7 @@ fn check_result(result: &Int4ResolutionRun, expected: Expected) -> Result<(), Ca
 
 pub(super) fn execute(args: Int4Args, command: ResolveArgs, _admitted: Int4Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
+    if command.discovery.discover_entities { return discovery::execute(args, command, input, output); }
     let started = Instant::now();
     let limits = command.validate(&args)?;
     let deadline = Duration::from_secs(args.timeout_seconds);

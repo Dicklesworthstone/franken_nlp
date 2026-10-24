@@ -599,7 +599,9 @@ controller gates.
 **already anchored entity mentions** through the native grouped-INT4 scorer.
 It uses the same original-source verification, lexical candidate selection,
 two-presentation-order policy and deterministic complete-link clustering as
-the existing resolution task. It does not discover mentions automatically.
+the existing resolution task. Add **`--discover-entities`** to discover mentions
+from raw original documents first, or combine it with **`--chunked`** for
+documents that require multiple source-aligned NER passes.
 
 Input is one JSON object. Every mention supplies its exact surface and both
 UTF-8 byte and Unicode-scalar offsets in its original document:
@@ -664,7 +666,7 @@ requires an accepted comparison for every cross-cluster pair, so a missing,
 conflicting or uncertain pair prevents that merge. A shared spelling alone
 does not establish identity.
 
-The command validates all original anchors, unique document IDs and the
+In supplied-mention mode, the command validates all original anchors, unique document IDs and the
 complete lexical graph before model IO. It then authenticates the loaded
 model/group identity and plans every scoring head before native execution.
 `--max-forward-positions`, `--max-projected-logits`, `--max-attention-pairs`,
@@ -688,9 +690,109 @@ private corpus commitments or source/snapshot file paths as provenance.
 The default kernel remains scalar; `--kernel` explicitly selects an existing
 hardware-checked integer implementation. There is no fallback to another
 precision or model source, and generation, sampling and `--prefill-rows`
-controls are rejected. On the source route, `--save-snapshot NEW_FILE` saves
-only after complete task admission; that explicit file remains if subsequent
-inference or output delivery fails.
+controls are rejected. In supplied-mention mode on the source route,
+`--save-snapshot NEW_FILE` saves only after complete task admission; that
+explicit file remains if subsequent inference or output delivery fails.
+
+### Discover mentions from raw original documents
+
+With `--discover-entities`, omit `mentions` and supply raw `{id,text}` records.
+The optional `ner` object uses the existing closed NER options; omitting it
+selects person, organization and location with the task's existing limits:
+
+```json
+{
+  "documents": [
+    {"id": "meeting", "text": "Élan met Ada. Ada waved."},
+    {"id": "staff", "text": "Élan works here. Ada works there."}
+  ],
+  "options": {
+    "blocking": "exact_surface",
+    "context_scalars": 128,
+    "minimum_margin_milli": 1000
+  },
+  "ner": {
+    "types": ["person", "organization"],
+    "max_entities": 16,
+    "max_mention_scalars": 128
+  }
+}
+```
+
+For `documents.json` in that shape:
+
+```bash
+fnlp candidate source-int4 resolve documents.json --discover-entities \
+  --snapshot /data/nanbeige.group128.snapshot \
+  --expected-model-sha256 "$TRUSTED_MODEL_CONTENT_SHA256" \
+  --group-width 128 --memory-mib 16384 --context-tokens 2048
+```
+
+Without `--chunked`, each complete document must fit its NER context. Chunked
+mode partitions every original document using the pinned tokenizer and actual
+task-prompt capacity. The following example declares larger finite work
+allowances and explicitly limits the entire population to 128 NER chunks:
+
+```bash
+fnlp candidate source-int4 resolve documents.json --discover-entities --chunked \
+  --snapshot /data/nanbeige.group128.snapshot \
+  --expected-model-sha256 "$TRUSTED_MODEL_CONTENT_SHA256" \
+  --group-width 128 --memory-mib 16384 --context-tokens 2048 \
+  --max-input-bytes 1048576 --graph-reserve-mib 128 \
+  --max-ner-tokens 256 --max-ner-chunk-bytes 4096 \
+  --max-ner-chunks 64 --max-snapshot-ner-chunks 128 \
+  --max-snapshot-mask-node-visits 128000000000 \
+  --max-forward-positions 2097152 --max-projected-logits 10000000000 \
+  --max-attention-pairs 10000000000000 --max-dot-products 1000000000000000 \
+  --max-multiply-accumulates 100000000000000000
+```
+
+These are admission ceilings, not a promise that any corpus fits. The actual
+token layout, group width, source grammar, entity count and resulting pair
+graph determine required work. The shared **resolution-specific defaults**
+for supplied mentions and discovery are 131,072 forward positions,
+10,000,000,000 projected logits, 100,000,000,000 attention pairs,
+100,000,000,000,000 grouped dot products and 1,000,000,000,000,000 multiply
+accumulates. Classification keeps its own defaults. Neither resolution mode
+multiplies these allowances by documents, chunks, pairs or orders.
+
+Discovery has an independent `--max-ner-tokens` limit, default 256 including
+EOS, while pair labels retain their fixed two-token depth. Every NER pass has
+`--max-ner-mask-node-visits`, default 1,000,000,000, and every pass together
+shares `--max-snapshot-mask-node-visits`, default 1,000,000,000,000. Chunked
+defaults are 64 chunks per original document and 1,024 per snapshot, but the
+native work and mask ceilings can refuse a population well before those count
+limits. `--max-expanded-bytes` bounds original text plus expanded mentions
+separately from the encoded JSON input; its default is 16 MiB. All NER
+occurrence recovery shares one independent grounding ledger, capped at one
+million fields, `--max-mentions` matches and `--max-scan-steps` scan work; graph
+anchor validation has its own bounded scan allowance.
+
+The pipeline preflights **every NER document/chunk before its first native
+forward**, retains compact private witnesses, and executes one source grammar
+at a time. It independently rechecks all recovered occurrences and translates
+chunk offsets back to exact byte/scalar positions in the original documents.
+Only then is the complete lexical pair graph available. Every pair and both
+orders must fit the remainder after **all NER work was reserved**; early EOS
+does not refund unused NER capacity to pair scoring. Clustering runs once on
+that complete original-document snapshot. A later pair-budget failure returns
+no completed result even when earlier NER passes succeeded.
+
+Raw nonempty documents always run NER; absence of caller-supplied mentions is
+not evidence that no entities exist. An explicitly empty `documents` array
+authenticates the chosen model and configuration but needs no native passes.
+Repeated compatible occurrences are retained with their original coordinates.
+Chunk boundaries can split entities, NER can omit mentions or assign incorrect
+types, and lexical blocking can miss aliases; structural source membership
+does not certify recall or identity accuracy.
+
+The completed response uses `fnlp-candidate-int4-entities-v1`. It includes
+per-document/per-chunk extents and work, total reserved versus actual NER and
+pair work, and the final resolution. It publishes no intermediate NER transcript
+or partial cluster result. Both source and snapshot routes share the same
+pipeline. On the source route, `--save-snapshot` runs after every NER chunk is
+preflighted; a later discovery, graph, pair-work or publication failure leaves
+that explicitly requested snapshot in place.
 
 Pair scores remain **uncalibrated**, lexical blocking may miss aliases, and
 cluster IDs have meaning only within the current snapshot. This is candidate
