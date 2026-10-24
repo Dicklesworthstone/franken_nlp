@@ -33,11 +33,13 @@
 > scaffolding, and explicit local inference and corpus routes under `candidate`.
 > Candidate execution requires the `asupersync-runtime` feature. The
 > `candidate source-int4` namespace includes generation/chat, classification,
+> [independent dimensional sentiment](#implemented-candidate-int4-dimensional-sentiment),
 > single-document extraction, [NER/keyphrases/cited summaries/passage QA](#implemented-candidate-int4-source-tasks),
 > text cohorts/corpora,
 > [ordered extraction batches](#implemented-candidate-int4-extraction-batches),
 > [durable extraction jobs](#implemented-candidate-int4-extraction-jobs),
-> [durable source-task jobs](#implemented-candidate-int4-source-task-jobs), and
+> [durable source-task jobs](#implemented-candidate-int4-source-task-jobs),
+> [complete-document question answering](#implemented-candidate-int4-complete-document-question-answering), and
 > [whole-document extraction](#implemented-candidate-int4-whole-document-extraction).
 > Candidate results retain their explicit provenance; build verification,
 > model quality and release qualification remain separate pending gates.
@@ -424,6 +426,87 @@ blocking invocation and retains ownership through native cleanup and durable
 publication. The command and API remain source-inventoried candidate features:
 build, model-present correctness, crash and quality qualification are pending.
 
+## Implemented candidate INT4 dimensional sentiment
+
+`fnlp candidate source-int4 sentiment` scores **independent affect dimensions**
+on the native grouped-INT4 engine. It uses the existing bounded typed sentiment
+JSON contract, the source-conversion or independently pinned snapshot loader,
+and the resource host. It requires the `asupersync-runtime` feature.
+
+For example, save this request as `sentiment.json`:
+
+```json
+{
+  "document": "The result was useful, although the delay was frustrating.",
+  "axes": ["valence", "arousal", "dominance", "approach"],
+  "policy": {
+    "minimum_peak_weight_ppm": 600000,
+    "maximum_normalized_entropy_ppm": 700000
+  }
+}
+```
+
+Then run it against pinned local conversion sources:
+
+```bash
+fnlp candidate source-int4 sentiment sentiment.json \
+  --source-dir /models/Nanbeige4.2-3B \
+  --source-manifest /models/nanbeige-source-manifest.json \
+  --memory-mib 8192 --group-width 128
+```
+
+Alternatively, use `--snapshot FILE --expected-model-sha256 HEX` with an
+independent trusted content pin. `--save-snapshot NEW_FILE` on the source route
+saves only after the complete sentiment plan passes all native work checks.
+There is no automatic model selection, download or backend fallback.
+
+Each axis has a distinct trusted prompt and complete five-bin candidate
+language. The anchors are valence **negative → positive**, arousal **calm →
+activated**, dominance **powerless → in control**, and approach **withdrawal →
+approach**. Coordinates are normalized to `[-1,+1]`; serialized anchor
+coordinates use integer milliunits `[-1000,+1000]`. Omitting `axes` requests all
+four. Duplicate or unknown axes are rejected, and the result uses canonical
+axis order. Source bytes remain exact, including Unicode and text resembling
+control syntax; request JSON cannot override model identity, prompts, score
+space, EOS, native work, or task budgets.
+
+Every candidate includes its terminal EOS. Each scoring position uses the
+**full vocabulary denominator**; all candidates and the named normalization
+scope remain in the result. The engine runs each axis in its own native
+session and clears logical KV between axes. Candidate weights normalize
+separately within each dimension, so the result is not a joint emotion
+distribution. It preserves the distribution mean, standard deviation,
+normalized entropy, modal coordinate and explicit decision for every axis.
+The supplied policy thresholds are uncalibrated cutoffs: a diffuse dimension
+can abstain with no `estimate` while retaining its distribution. Omitting
+`policy` uses zero minimum peak weight and maximum normalized entropy of
+1000000. These quantities are not calibrated confidence or psychological
+measurements.
+
+All requested heads preflight before the first native forward. The existing
+`--max-forward-positions`, `--max-projected-logits`, `--max-attention-pairs`,
+`--max-dot-products`, and `--max-multiply-accumulates` ceilings bound the
+**complete bundle**, including the actual group-dependent dot count; they
+never renew for another axis. `--max-candidate-tokens` includes scored EOS.
+`--context-tokens` bounds the largest live head, while memory admission prices
+its full KV allocation, native scratch, two simultaneous preparation owners,
+the full result and bounded serialization staging. Free-generation and
+prefill controls are refused.
+
+One `fnlp-candidate-int4-sentiment-v1` JSON response retains native
+strict-quantized-v2 provenance, actual model/group identity, all dimensions,
+complete work and rewind receipts. The hosted output guard and CLI preparation
+charge survive writing and flushing. A failed head, cancellation or exhausted
+budget returns no partial bundle and never turns into a successful abstention.
+Public provenance omits the document, private prompts and local paths. The
+whole-invocation deadline observes blocking IO cooperatively.
+
+Library callers use `Int4SentimentPlanner::for_model`, its
+`plan_with_control`, and `NlpEngine::execute_int4_sentiment` with
+`Int4SentimentHostLimits`. Parser, admission and native fixtures are authored;
+compilation, model-present correctness and quality qualification remain
+pending controller-selected gates.
+
 ## Implemented candidate INT4 source tasks
 
 `fnlp candidate source-int4 ner|keyphrases|summarize|answer` now uses the
@@ -532,7 +615,7 @@ quality qualification remain pending gates.
 
 `fnlp candidate source-int4 answer-map` asks **one exact question of every
 nonblank chunk of one complete UTF-8 document**. The question comes from the
-private `--question FILE` (at most 64 KiB); document input may be a file or
+private `--question FILE` (at most 16 KiB); document input may be a file or
 `-` for stdin. Question and document bytes are retained without normalization.
 The pinned tokenizer, trusted template, actual question and complete typed
 answer options determine each chunk's available context. All chunks and their
@@ -572,7 +655,7 @@ documents are refused.
 The independent complete-document citation budget uses `--max-qa-citations`
 (default 4096), `--max-qa-evidence-spans` (16384), and `--max-qa-scan-steps`
 (67108864). These limits never renew for another chunk. Existing map limits
-also bound all five native work axes, cumulative mask visits, source fields,
+also bound all five native work axes, cumulative mask visits,
 chunk count and full-result bytes. Admission prices both preparation owners,
 full KV, original-passage and lifted evidence, reduction, and publication.
 The guarded output survives bounded staging, writing and flushing of one

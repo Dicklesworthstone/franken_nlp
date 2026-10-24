@@ -49,7 +49,7 @@ impl ScoringArgs {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         if TEXT_ONLY.iter().any(|id| matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine)) {
             return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
-                "INT4 classification does not accept generation or prefill controls"));
+                "INT4 finite-candidate tasks do not accept generation or prefill controls"));
         }
         Self::from_arg_matches(matches)
     }
@@ -86,6 +86,20 @@ impl ScoringArgs {
             scoring: ScoringLimits { max_candidates: 128, max_total_tokens: 4095, max_nodes: 4096,
                 max_depth: self.max_candidate_tokens, max_candidate_id_bytes: 64,
                 max_projected_logits: self.max_projected_logits } }
+    }
+    pub(super) fn sentiment_limits(self, args: &Int4Args) -> crate::tasks::sentiment::SentimentLimits {
+        crate::tasks::sentiment::SentimentLimits {
+            per_axis: self.classification_limits(args).scoring,
+            max_total_prompt_tokens: self.max_forward_positions as usize,
+            max_total_candidate_tokens: 4096, max_total_nodes: 4100,
+            max_total_projected_logits: self.max_projected_logits,
+            max_output_bytes: self.max_result_bytes as u64,
+        }
+    }
+    pub(super) fn work_ceiling(self) -> Int4Work {
+        Int4Work { forward_positions: self.max_forward_positions, projected_logits: self.max_projected_logits,
+            attention_pairs: self.max_attention_pairs, projections: ProjectionWork {
+                dot_products: self.max_dot_products, multiply_accumulates: self.max_multiply_accumulates } }
     }
     pub(super) fn admit_plan(self, context: usize, capacity: usize, work: Int4Work) -> Result<(), CandidateError> {
         if context == 0 || context > capacity || work.forward_positions > self.max_forward_positions
