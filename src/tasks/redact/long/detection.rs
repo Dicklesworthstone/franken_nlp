@@ -1,17 +1,17 @@
 //! Detector constructor for one COMPLETE original source. NER evidence remains
 //! chunk-local until independently rescanned; rule detectors never see chunks.
 use std::collections::BTreeSet;
-use crate::{native_engine::strict_int8::STRICT_INT8_PROFILE,
-    tasks::{extract::ExtractionGrounding, ir::ScoreSpace, ner::{NerOptions, NerResult, NER_TASK_VERSION}},
+use crate::{tasks::{extract::ExtractionGrounding, ir::ScoreSpace, ner::{NerOptions, NerResult, NER_TASK_VERSION}},
     validation::grounded_fields::{GroundingBudget, SourceOccurrence, VerifiedSourceSpan, scan_occurrences}};
 use super::super::{Detection, Detector, RedactError, RedactionRequest,
-    detectors::{self, RuleSet}, union::{self, DetectedDocument}};
+    detectors::{self, RuleSet}, union::{self, DetectedDocument, NerProfile}};
 
-pub(super) struct Detections<'s> {
+pub(in crate::tasks::redact) struct Detections<'s> {
     source: &'s str,
     hits: Vec<Detection>,
     rules: RuleSet,
     options: NerOptions,
+    profile: NerProfile,
     max_detections: usize,
     next_chunk: usize,
     byte_end: usize,
@@ -20,9 +20,13 @@ pub(super) struct Detections<'s> {
 }
 impl<'s> Detections<'s> {
     pub fn new(source: &'s str, request: &RedactionRequest, options: &NerOptions) -> Result<Self, RedactError> {
+        Self::with_profile(source, request, options, NerProfile::Int8)
+    }
+    pub fn with_profile(source: &'s str, request: &RedactionRequest, options: &NerOptions,
+        profile: NerProfile) -> Result<Self, RedactError> {
         options.validate().map_err(|_| RedactError::InvalidOptions)?;
         let hits = detectors::detect(source, &request.rules, request.rule_budget)?;
-        Ok(Self { source, hits, rules: request.rules.clone(), options: options.clone(),
+        Ok(Self { source, hits, rules: request.rules.clone(), options: options.clone(), profile,
             max_detections: request.rule_budget.max_detections, next_chunk: 0, byte_end: 0, scalar_end: 0, failed: false })
     }
     pub fn push(&mut self, chunk_id: usize, origin: VerifiedSourceSpan, result: &NerResult,
@@ -33,7 +37,7 @@ impl<'s> Detections<'s> {
             || origin.byte_start >= origin.byte_end { return Err(RedactError::InvalidSpan); }
         let text = self.source.get(origin.byte_start..origin.byte_end).ok_or(RedactError::InvalidSpan)?;
         if origin.scalar_start.checked_add(text.chars().count()) != Some(origin.scalar_end) { return Err(RedactError::InvalidSpan); }
-        if result.schema_version != 1 || result.task_spec_version != NER_TASK_VERSION || result.numerics_profile != STRICT_INT8_PROFILE
+        if result.schema_version != 1 || result.task_spec_version != NER_TASK_VERSION || result.numerics_profile != self.profile.label()
             || result.score_space != ScoreSpace::NotComputed || result.grounding != ExtractionGrounding::SourceMembership
             || result.entities.len() > self.options.max_entities { return Err(RedactError::InvalidNerEvidence); }
         grounding.max_fields = grounding.max_fields.checked_sub(result.entities.len()).ok_or(RedactError::DetectionBudget)?;

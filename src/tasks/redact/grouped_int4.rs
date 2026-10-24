@@ -21,6 +21,9 @@ use super::{RedactError, actions::RedactionResult,
 
 pub const INT4_REDACTION_EXECUTION: &str = "grouped-int4-ner-rules-redetect-v1";
 
+/// Complete-document rules plus native NER chunks and fresh verification.
+pub mod long;
+
 /// Per-pass preparation limits and nonrenewable complete-operation ceilings.
 /// Rules, source verification and edits keep the request's independent bounds.
 #[derive(Clone, Debug)]

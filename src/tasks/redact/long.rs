@@ -14,7 +14,7 @@ use crate::{
 };
 use super::{RedactError, RedactionRequest, actions::{self, RedactionResult, VerificationStatus},
     pipeline::LeakReport, pseudonym::Pseudonyms, quantized::Int8RedactionError, union::DetectedDocument};
-mod detection;
+pub(super) mod detection;
 
 pub const LONG_REDACTION_EXECUTION: &str = "portable-int8-whole-rules-chunk-ner-redetect-v1";
 

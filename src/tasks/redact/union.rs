@@ -17,7 +17,7 @@ pub const OVERLAP_POLICY: &str = "overlap-connected-union-v1";
 #[derive(Clone, Copy)]
 pub(super) enum NerProfile { Eager, Int8, Int4 }
 impl NerProfile {
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             Self::Eager => HF_BF16_EAGER_PROFILE,
             Self::Int8 => crate::native_engine::strict_int8::STRICT_INT8_PROFILE,
