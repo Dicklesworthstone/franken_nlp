@@ -1,5 +1,8 @@
 //! Complete-document redaction streams on one charged resident INT4 engine.
 use super::*;
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod jobs;
 use std::io::{BufRead, Write};
 use crate::{
     batch::{self as stream, BatchCode, BatchItemFailure, BatchSummary},
