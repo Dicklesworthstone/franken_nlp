@@ -4,6 +4,7 @@
 
 pub mod entities;
 pub mod entities_int8;
+pub mod entities_int4;
 pub mod entity_stream;
 pub mod native_resolve;
 pub mod native_summary;
