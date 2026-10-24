@@ -26,6 +26,7 @@ use super::resolve::{self, AnchoredMention, BidirectionalScores, PairLogProbabil
 pub use crate::batch::judge::{JudgeBatchAdmission as ResolveAdmission, GuardedOutput};
 
 pub mod quantized;
+pub mod grouped_int4;
 
 pub const RESOLVE_SCORER_VERSION: &str = "resolve-full-vocab-eos-two-orders-v1";
 pub const RESOLVE_PROMPT_VERSION: &str = "resolve-exact-context-segments-v1";
