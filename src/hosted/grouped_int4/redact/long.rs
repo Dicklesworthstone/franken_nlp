@@ -131,9 +131,12 @@ fn document_requirements(config: &RedactConfig<Int4LongRedactionConfig>, source_
 }
 
 fn document_temporary_bytes(config: &RedactConfig<Int4LongRedactionConfig>) -> Result<u64, HostedError> {
-    let detector = &config.detector;
+    document_workspace_bytes(&config.detector, config.edit_reserve_bytes)
+}
+pub(super) fn document_workspace_bytes(detector: &Int4LongRedactionConfig, edit_reserve_bytes: u64)
+    -> Result<u64, HostedError> {
     let count = detector.mapping.chunks.max_chunks;
-    if !(1..=256).contains(&count) || detector.mapping.reduction.max_live_value_bytes == 0 {
+    if edit_reserve_bytes == 0 || !(1..=256).contains(&count) || detector.mapping.reduction.max_live_value_bytes == 0 {
         return Err(HostedError::Limits("INT4 document redaction finite map frontier"));
     }
     let multiply = |a: u64, b: u64| a.checked_mul(b)
@@ -148,7 +151,7 @@ fn document_temporary_bytes(config: &RedactConfig<Int4LongRedactionConfig>) -> R
         std::mem::size_of::<SourceFieldEvidence>() as u64)?;
     let spans = multiply(multiply(detector.mapping.verification.max_matches as u64,
         std::mem::size_of::<VerifiedSourceSpan>() as u64)?, 2)?;
-    sum(&[staged, tokens, fields, spans, config.edit_reserve_bytes])
+    sum(&[staged, tokens, fields, spans, edit_reserve_bytes])
 }
 
 fn validate_completed(run: &Int4LongRedactionRun, config: &RedactConfig<Int4LongRedactionConfig>,

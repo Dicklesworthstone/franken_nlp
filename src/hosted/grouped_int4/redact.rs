@@ -1,6 +1,7 @@
 //! One owned native INT4 redaction invocation, including fresh verification.
 use super::*;
 mod long;
+mod corpus;
 use crate::{
     native_engine::{constrained_int4, strict_int4::{Int4Work, STRICT_INT4_PROFILE}},
     tasks::{extract::ExtractionVocabulary, ner::NER_TASK_VERSION, source_planning::SourceTaskPlanner,
