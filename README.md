@@ -36,6 +36,7 @@
 > [independent dimensional sentiment](#implemented-candidate-int4-dimensional-sentiment),
 > [pairwise, rubric and faithfulness judgment](#implemented-candidate-int4-judgment),
 > [verified NER and rule redaction](#implemented-candidate-int4-redaction),
+> [complete-document redaction](#implemented-candidate-int4-complete-document-redaction),
 > single-document extraction, [NER/keyphrases/cited summaries/passage QA](#implemented-candidate-int4-source-tasks),
 > text cohorts/corpora,
 > [ordered extraction batches](#implemented-candidate-int4-extraction-batches),
@@ -682,6 +683,86 @@ Library callers use `Int4Redactor` and `NlpEngine::redact_int4` with
 `RedactConfig<Int4RedactionConfig>`, the actual resident model, pinned planner
 and vocabulary, and optional `RedactionPseudonyms`. Compilation, model-present
 execution and quality qualification remain pending controller-selected gates.
+
+## Implemented candidate INT4 complete-document redaction
+
+`fnlp candidate source-int4 redact-document` extends native redaction to a
+complete document that spans multiple NER contexts. It losslessly partitions
+the exact UTF-8 source with the pinned encoder and typed NER prompt capacity,
+while deterministic rules scan the **whole original text**. An email, URL or
+other selected rule pattern crossing a neural chunk boundary remains visible
+to its rule scanner.
+
+```bash
+fnlp candidate source-int4 redact-document transcript.txt \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$EXPECTED_MODEL_SHA256" \
+  --memory-mib 8192 \
+  --max-ner-chunks 64 \
+  --max-total-mask-node-visits 256000000000
+```
+
+The source-conversion alternative uses the same `--source-dir`,
+`--source-manifest`, `--group-width` and explicit kernel contract as
+single-context redaction. Masking remains the default. `--action placeholder`,
+`--action pseudonymize`, `--ner-options`, rule selection and sensitive
+`--include-map` use the same policy. Full256 pseudonymization still accepts a
+binary key only from stdin with a separate document file; an expected key
+commitment is checked before document IO.
+
+Every original chunk is compiled and admitted before the first native forward.
+Each returned NER mention is independently rescanned within its producing
+chunk, its exact byte/scalar coordinates are lifted into the complete source,
+and contiguous chunk coverage is checked before one transactional edit.
+Intermediate NER transcripts are discarded before publication.
+
+Verification is on by default. It re-tokenizes and re-partitions the **actual
+edited bytes**, reruns the same NER types plus whole-text rules, and requires
+the complete selected union to be clean. Original partitions and successful
+original-stage receipts are never reused as transformed-source evidence.
+`--no-verify` explicitly skips that second stage. A failed chunk, residual
+detection or exhausted budget produces no partial document result. Neural
+chunk boundaries can still split entities; detector recall and anonymity are
+not established by a clean declared-union scan.
+
+`--max-forward-positions`, `--max-projected-logits`, `--max-attention-pairs`,
+`--max-dot-products`, `--max-multiply-accumulates` and
+`--max-total-mask-node-visits` cover **both stages together** and never renew
+per chunk. Attention is accounted for independent contexts, with the actual
+group-dependent projection cost. `--max-source-fields`,
+`--max-source-evidence-spans` and `--max-source-scan-steps` bound each of
+the two independent verification pools: map-coordinate validation and
+destructive-offset rescanning. Each pool is cumulative across both stages and
+has its own reported usage.
+
+`--max-input-bytes` bounds the original document; transformed planning has
+a separately bounded envelope that permits replacement expansion.
+`--max-ner-chunks`, `--max-ner-chunk-bytes` and
+`--max-ner-tokenizer-calls` bound each partition. `--max-ner-map-bytes`
+bounds one complete intermediate map; live and cumulative reduction bounds
+are twice and four times that value. Final output retains its own
+`--max-result-bytes` limit. Nothing is silently truncated.
+
+The default input ceiling is 1 MiB and the preparation reserve is 1024 MiB.
+Admission prices every possible chunk grammar, full resident KV, both
+preparation lifetimes, captured source/key metadata, one complete live map
+including evidence lifts, and explicit edit workspace. The original and
+transformed maps run sequentially. Source-route `--save-snapshot NEW_FILE`
+starts after complete original-source preflight; the unknown transformed map
+must later fit the remaining operation budget.
+
+One `fnlp-candidate-int4-redact-document-v1` response preserves final edited
+text, public policy, optional coordinate maps, original/transformed geometry,
+actual model/group identity, stage and aggregate work, and both verification
+usage totals. Private source/prompts and local paths do not enter provenance.
+Preparation and hosted output guards survive complete staging, writing and
+flushing. This command processes one document; it does not retain a job.
+
+Library callers use `Int4DocumentRedactor`, `Int4LongRedactionConfig` and
+`NlpEngine::redact_int4_document` with the actual resident model and pinned
+planner/vocabulary. Source, admission and receipt fixtures are authored;
+compilation, model-present execution and quality qualification remain pending
+controller-selected gates.
 
 ## Implemented candidate INT4 source tasks
 

@@ -111,6 +111,7 @@ enum Int4Task {
     Sentiment(sentiment::SentimentArgs),
     Judge(judge::JudgeArgs),
     Redact(redact::RedactArgs),
+    RedactDocument(redact::long::DocumentArgs),
     Source(crate::candidate_cli::source::Kind, source::SourceArgs),
     SourceBatch(source_batch::BatchArgs),
     SourceMap(source_map::MapArgs),
@@ -152,6 +153,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(sentiment::definition())
         .subcommand(judge::definition())
         .subcommand(redact::definition())
+        .subcommand(redact::long::definition())
         .subcommand(extract::definition())
         .subcommand(extract_batch::definition())
         .subcommand(extract_job::definition())
@@ -192,6 +194,7 @@ impl Int4Command {
             "sentiment" => Int4Task::Sentiment(sentiment::SentimentArgs::from_matches(matches)?),
             "judge" => Int4Task::Judge(judge::JudgeArgs::from_matches(matches)?),
             "redact" => Int4Task::Redact(redact::RedactArgs::from_matches(matches)?),
+            "redact-document" => Int4Task::RedactDocument(redact::long::DocumentArgs::from_matches(matches)?),
             "extract" => Int4Task::Extract(extract::ExtractionArgs::from_matches(matches)?),
             "extract-batch" => Int4Task::ExtractBatch(extract_batch::BatchArgs::from_matches(matches)?),
             "extract-map" => Int4Task::ExtractMap(extract_map::MapArgs::from_matches(matches)?),
@@ -259,13 +262,16 @@ impl Int4Command {
         if let Int4Task::Redact(options) = self.task {
             return options.execute(self.args, input, output);
         }
+        if let Int4Task::RedactDocument(options) = self.task {
+            return options.execute(self.args, input, output);
+        }
         let limits = match &self.task {
             Int4Task::Text(_) => self.args.validate()?,
             Int4Task::Classify(scoring) => scoring.validate(&self.args)?,
             Int4Task::Extract(extraction) => extraction.validate(&self.args)?,
             Int4Task::Source(_, source) => source.validate(&self.args)?,
             // The blocking stream must own its input and writer through cleanup.
-            Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::Sentiment(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
+            Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::Sentiment(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
                 | Int4Task::ExtractJob | Int4Task::SourceJob => return Err(CandidateError::Arguments),
         };
         #[cfg(feature = "asupersync-runtime")]

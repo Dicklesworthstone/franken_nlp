@@ -1,5 +1,6 @@
 //! Bounded native INT4 NER/rule union with fresh transformed-source verification.
 use super::*;
+pub(super) mod long;
 use crate::{
     candidate_cli::redact::{self as shared, Action, Rule},
     tasks::redact::{RedactionRequest, actions::RedactionAction, pseudonym::PseudonymKey},
