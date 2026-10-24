@@ -10,14 +10,15 @@ use crate::{
     validation::grounded_fields::{SourceFieldEvidence, VerifiedSourceSpan},
 };
 mod summary;
+mod question;
 
 /// One original document, fixed task/model and nonrenewable work envelope.
 /// Preparation prices all retained prompts/grammars, tokenizer/vocabulary
 /// owners and configuration. Reduction reserve prices metadata/allocator
 /// overhead beyond the explicit result/frontier/evidence payload floor.
-pub struct Int4SourceMapConfig {
+pub struct Int4SourceMapConfig<T = SourceMapTask> {
     pub identity: ExecutionIdentity,
-    pub task: SourceMapTask,
+    pub task: T,
     pub budget: TaskBudget,
     pub planning: SourcePlanningLimits,
     pub mapping: Int4SourceMapLimits,
@@ -25,7 +26,7 @@ pub struct Int4SourceMapConfig {
     pub preparation_reserve_bytes: u64,
     pub reduction_reserve_bytes: u64,
 }
-impl Int4SourceMapConfig {
+impl<T> Int4SourceMapConfig<T> {
     /// Checked complete-frontier quote shared with CLI preflight. This is not
     /// a memory permit or an observed RSS limit; the host reserves it below.
     pub fn workspace_bytes(&self, chunks: usize) -> Result<u64, HostedError> {
@@ -47,11 +48,11 @@ impl Int4SourceMapConfig {
         sum(&[staged, tokens, fields, spans, self.reduction_reserve_bytes])
     }
 }
-struct SourceMapInput {
+struct SourceMapInput<T = SourceMapTask> {
     source: String,
     planner: Arc<SourceTaskPlanner>,
     vocabulary: Arc<ExtractionVocabulary>,
-    config: Int4SourceMapConfig,
+    config: Int4SourceMapConfig<T>,
 }
 
 impl NlpEngine {
@@ -130,15 +131,23 @@ impl NlpEngine {
 
 fn map_requirements(config: &Int4SourceMapConfig, source_bytes: usize, width: usize,
     planner: &SourceTaskPlanner) -> Result<Int4MemoryRequirement, HostedError> {
-    config.native.run.validate()?;
-    config.budget.validate().map_err(|_| HostedError::Limits("INT4 source map task budget"))?;
-    config.identity.validate().map_err(|_| HostedError::ModelIdentity)?;
-    constrained_int4::check_profile(&config.identity, width).map_err(|_| HostedError::ModelIdentity)?;
+    let required = common_requirements(config, source_bytes, width, planner)?;
     let task = match &config.task {
         SourceMapTask::Ner(_) => "ner-v1", SourceMapTask::Keyphrases(_) => "keyphrases-v1",
         SourceMapTask::Summarize(_) => "summarize-v1",
     };
-    if config.identity.task_spec != task || config.identity.tokenizer_digest != planner.tokenizer_digest()
+    if config.identity.task_spec != task {
+        return Err(HostedError::ModelIdentity);
+    }
+    Ok(required)
+}
+fn common_requirements<T>(config: &Int4SourceMapConfig<T>, source_bytes: usize, width: usize,
+    planner: &SourceTaskPlanner) -> Result<Int4MemoryRequirement, HostedError> {
+    config.native.run.validate()?;
+    config.budget.validate().map_err(|_| HostedError::Limits("INT4 source map task budget"))?;
+    config.identity.validate().map_err(|_| HostedError::ModelIdentity)?;
+    constrained_int4::check_profile(&config.identity, width).map_err(|_| HostedError::ModelIdentity)?;
+    if config.identity.tokenizer_digest != planner.tokenizer_digest()
         || config.identity.template_digest != *planner.template_digest() {
         return Err(HostedError::ModelIdentity);
     }

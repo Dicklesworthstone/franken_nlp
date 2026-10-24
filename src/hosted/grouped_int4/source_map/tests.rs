@@ -11,7 +11,7 @@ use crate::{
     validation::grounded_fields::GroundingBudget,
 };
 
-fn fixture(task: SourceMapTask, width: usize) -> (SourceTaskPlanner, Int4SourceMapConfig) {
+pub(super) fn fixture(task: SourceMapTask, width: usize) -> (SourceTaskPlanner, Int4SourceMapConfig) {
     let controls = crate::tokenizer::pinned_controls::pinned().unwrap();
     let eos = controls.template_controls().entries().iter()
         .find(|entry| entry.special && entry.surface == crate::template::IM_END).unwrap().id;
