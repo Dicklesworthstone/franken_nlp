@@ -7,6 +7,7 @@ use crate::native_engine::{int4::PackedInt4Kernel, simd::Int8KernelKind,
 mod classify;
 mod sentiment;
 mod judge;
+mod resolve;
 mod redact;
 mod extract;
 mod extract_batch;
@@ -110,6 +111,7 @@ enum Int4Task {
     Text(Task), Classify(classify::ScoringArgs), Extract(extract::ExtractionArgs),
     Sentiment(sentiment::SentimentArgs),
     Judge(judge::JudgeArgs),
+    Resolve(resolve::ResolveArgs),
     Redact(redact::RedactArgs),
     RedactDocument(redact::long::DocumentArgs),
     RedactCorpus(redact::long::corpus::CorpusArgs),
@@ -155,6 +157,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(classify::definition())
         .subcommand(sentiment::definition())
         .subcommand(judge::definition())
+        .subcommand(resolve::definition())
         .subcommand(redact::definition())
         .subcommand(redact::long::definition())
         .subcommand(redact::long::corpus::definition())
@@ -202,6 +205,7 @@ impl Int4Command {
             "classify" => Int4Task::Classify(classify::ScoringArgs::from_matches(matches)?),
             "sentiment" => Int4Task::Sentiment(sentiment::SentimentArgs::from_matches(matches)?),
             "judge" => Int4Task::Judge(judge::JudgeArgs::from_matches(matches)?),
+            "resolve" => Int4Task::Resolve(resolve::ResolveArgs::from_matches(matches)?),
             "redact" => Int4Task::Redact(redact::RedactArgs::from_matches(matches)?),
             "redact-document" => Int4Task::RedactDocument(redact::long::DocumentArgs::from_matches(matches)?),
             "redact-corpus" => Int4Task::RedactCorpus(redact::long::corpus::CorpusArgs::from_matches(matches)?),
@@ -273,6 +277,9 @@ impl Int4Command {
         if let Int4Task::Judge(options) = self.task {
             return options.execute(self.args, input, output);
         }
+        if let Int4Task::Resolve(options) = self.task {
+            return options.execute(self.args, input, output);
+        }
         if let Int4Task::Redact(options) = self.task {
             return options.execute(self.args, input, output);
         }
@@ -285,7 +292,7 @@ impl Int4Command {
             Int4Task::Extract(extraction) => extraction.validate(&self.args)?,
             Int4Task::Source(_, source) => source.validate(&self.args)?,
             // The blocking stream must own its input and writer through cleanup.
-            Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::Sentiment(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
+            Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::Resolve(_) | Int4Task::Sentiment(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
                 | Int4Task::ExtractJob | Int4Task::SourceJob | Int4Task::RedactJob => return Err(CandidateError::Arguments),
         };
         #[cfg(feature = "asupersync-runtime")]

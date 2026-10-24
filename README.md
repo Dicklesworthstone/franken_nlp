@@ -593,6 +593,112 @@ Library callers use `Int4JudgePlanner::for_model`, `plan_with_control`, and
 model-present execution and quality qualification remain pending the authorized
 controller gates.
 
+## Implemented candidate INT4 entity resolution
+
+`fnlp candidate source-int4 resolve` resolves a complete, bounded snapshot of
+**already anchored entity mentions** through the native grouped-INT4 scorer.
+It uses the same original-source verification, lexical candidate selection,
+two-presentation-order policy and deterministic complete-link clustering as
+the existing resolution task. It does not discover mentions automatically.
+
+Input is one JSON object. Every mention supplies its exact surface and both
+UTF-8 byte and Unicode-scalar offsets in its original document:
+
+```json
+{
+  "documents": [
+    {
+      "id": "meeting",
+      "text": "Élan met Ada.",
+      "mentions": [
+        {
+          "entity_type": "person",
+          "surface": "Élan",
+          "span": {"byte_start": 0, "byte_end": 5, "scalar_start": 0, "scalar_end": 4}
+        }
+      ]
+    },
+    {
+      "id": "staff",
+      "text": "Élan works here.",
+      "mentions": [
+        {
+          "entity_type": "person",
+          "surface": "Élan",
+          "span": {"byte_start": 0, "byte_end": 5, "scalar_start": 0, "scalar_end": 4}
+        }
+      ]
+    }
+  ],
+  "options": {
+    "blocking": "exact_surface",
+    "context_scalars": 128,
+    "minimum_margin_milli": 1000
+  }
+}
+```
+
+Save this request as `mentions.json`, then select explicit pinned sources or
+an independently digest-pinned local candidate snapshot:
+
+```bash
+fnlp candidate source-int4 resolve mentions.json \
+  --source-dir /data/nanbeige-pinned \
+  --source-manifest /data/nanbeige-source-manifest.json \
+  --memory-mib 16384 --context-tokens 2048 \
+  --max-documents 256 --max-mentions 4096 --max-pairs 256
+
+fnlp candidate source-int4 resolve mentions.json \
+  --snapshot /data/nanbeige.group128.snapshot \
+  --expected-model-sha256 "$TRUSTED_MODEL_CONTENT_SHA256" \
+  --group-width 128 --memory-mib 16384 --context-tokens 2048
+```
+
+`blocking` is explicitly `exact_surface` or `ascii_word_overlap`; the latter
+is a named ASCII heuristic, not Unicode normalization. Lexical overlap only
+selects comparisons. Each selected pair is scored in **both presentation
+orders**, using the exact three-label-plus-EOS language and full-vocabulary
+sequence probabilities. Both orders must independently clear the chosen
+margin before a positive identity edge is accepted. Complete-link clustering
+requires an accepted comparison for every cross-cluster pair, so a missing,
+conflicting or uncertain pair prevents that merge. A shared spelling alone
+does not establish identity.
+
+The command validates all original anchors, unique document IDs and the
+complete lexical graph before model IO. It then authenticates the loaded
+model/group identity and plans every scoring head before native execution.
+`--max-forward-positions`, `--max-projected-logits`, `--max-attention-pairs`,
+`--max-dot-products` and `--max-multiply-accumulates` each bound the **whole
+snapshot**; pairs and presentation orders never renew those allowances.
+Oversized graphs, invalid anchors, exhausted budgets or a failed head produce
+no successful partial result. `--max-pairs 0` permits a snapshot only when its
+validated graph has no candidate pairs. Such a snapshot still authenticates
+and loads the selected model, but allocates no native scoring engine, KV or
+scratch and reports `model_evaluated: false` with its singleton clusters.
+
+`--graph-reserve-mib` separately prices graph and clustering storage, while
+`--preparation-mib` covers pinned planning and publication buffers. These are
+process-ledger reservations, not measured RSS guarantees. Native output and
+the CLI staging owner remain charged through the final write and flush. Only
+one completed `fnlp-candidate-int4-resolve-v1` response is emitted. It contains
+model/group/kernel provenance, canonical mentions, both-order judgments and
+snapshot-local clusters; it does not expose original full documents, prompts,
+private corpus commitments or source/snapshot file paths as provenance.
+
+The default kernel remains scalar; `--kernel` explicitly selects an existing
+hardware-checked integer implementation. There is no fallback to another
+precision or model source, and generation, sampling and `--prefill-rows`
+controls are rejected. On the source route, `--save-snapshot NEW_FILE` saves
+only after complete task admission; that explicit file remains if subsequent
+inference or output delivery fails.
+
+Pair scores remain **uncalibrated**, lexical blocking may miss aliases, and
+cluster IDs have meaning only within the current snapshot. This is candidate
+implementation code: native model execution, scalar/SIMD agreement, task
+quality and controller-selected production checks still require their named
+validation gates. Local INT4 snapshots do not become canonical FNLPQ releases
+or active installed models through this command.
+
 ## Implemented candidate INT4 redaction
 
 `fnlp candidate source-int4 redact` combines native grouped-INT4 NER with
