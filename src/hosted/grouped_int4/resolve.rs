@@ -1,6 +1,7 @@
 //! One owned INT4 corpus snapshot: source verification, both presentation
 //! orders of every comparison, and deterministic complete-link clustering.
 use super::*;
+mod entities;
 use crate::{
     corpus::{
         native_resolve::{ResolutionPlanner,
