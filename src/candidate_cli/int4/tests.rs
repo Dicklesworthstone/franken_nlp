@@ -154,7 +154,7 @@ fn feature_refusal_does_not_touch_source_input_or_stdout() {
 
 #[test]
 fn every_task_defaults_to_scalar_and_parses_only_canonical_explicit_kernel_ids() {
-    for task in ["generate", "chat", "classify", "sentiment"] {
+    for task in ["generate", "chat", "classify", "sentiment", "judge"] {
         assert_eq!(command(task, &[]).args.kernel, Int8KernelKind::Scalar);
         for kind in Int8KernelKind::ALL {
             assert_eq!(command(task, &["--kernel", kind.id()]).args.kernel, kind);
@@ -169,13 +169,14 @@ fn every_task_defaults_to_scalar_and_parses_only_canonical_explicit_kernel_ids()
 
 #[test]
 fn exact_host_detection_authorizes_a_kernel_or_refuses_before_any_input() {
-    for task in ["generate", "chat", "classify", "sentiment"] {
+    for task in ["generate", "chat", "classify", "sentiment", "judge"] {
         for kind in Int8KernelKind::ALL {
             let command = command(task, &["--kernel", kind.id()]);
             let admission = match &command.task {
                 Int4Task::Text(_) => command.args.validate(),
                 Int4Task::Classify(scoring) => scoring.validate(&command.args),
                 Int4Task::Sentiment(sentiment) => sentiment.validate(&command.args),
+                Int4Task::Judge(judge) => judge.validate(&command.args),
                 Int4Task::Extract(extraction) => extraction.validate(&command.args),
                 Int4Task::Source(_, source) => source.validate(&command.args),
                 Int4Task::ExtractBatch(batch) => batch.validate(&command.args).map(|limits| limits.common),
@@ -202,12 +203,13 @@ fn exact_host_detection_authorizes_a_kernel_or_refuses_before_any_input() {
 
 #[test]
 fn physical_kernel_selection_does_not_change_layout_memory_or_generation_options() {
-    for task in ["generate", "chat", "classify", "sentiment"] {
+    for task in ["generate", "chat", "classify", "sentiment", "judge"] {
         let baseline = command(task, &[]);
         let limits = |command: &Int4Command| match &command.task {
             Int4Task::Text(_) => command.args.validate().unwrap(),
             Int4Task::Classify(scoring) => scoring.validate(&command.args).unwrap(),
             Int4Task::Sentiment(sentiment) => sentiment.validate(&command.args).unwrap(),
+            Int4Task::Judge(judge) => judge.validate(&command.args).unwrap(),
             Int4Task::Extract(extraction) => extraction.validate(&command.args).unwrap(),
             Int4Task::Source(_, source) => source.validate(&command.args).unwrap(),
             Int4Task::ExtractBatch(batch) => batch.validate(&command.args).unwrap().common,

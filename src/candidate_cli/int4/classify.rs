@@ -96,6 +96,18 @@ impl ScoringArgs {
             max_output_bytes: self.max_result_bytes as u64,
         }
     }
+    pub(super) fn judge_limits(self, budget: TaskBudget) -> crate::tasks::judge::JudgeLimits {
+        let nodes = budget.max_grammar_states as usize;
+        crate::tasks::judge::JudgeLimits {
+            per_head: ScoringLimits { max_candidates: 33, max_total_tokens: nodes.saturating_sub(1),
+                max_nodes: nodes, max_depth: self.max_candidate_tokens, max_candidate_id_bytes: 64,
+                max_projected_logits: self.max_projected_logits },
+            max_total_prompt_tokens: self.max_forward_positions as usize,
+            max_total_candidate_tokens: nodes,
+            max_total_projected_logits: self.max_projected_logits,
+            max_output_bytes: self.max_result_bytes as u64,
+        }
+    }
     pub(super) fn work_ceiling(self) -> Int4Work {
         Int4Work { forward_positions: self.max_forward_positions, projected_logits: self.max_projected_logits,
             attention_pairs: self.max_attention_pairs, projections: ProjectionWork {

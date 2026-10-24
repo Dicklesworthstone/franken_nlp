@@ -34,6 +34,7 @@
 > Candidate execution requires the `asupersync-runtime` feature. The
 > `candidate source-int4` namespace includes generation/chat, classification,
 > [independent dimensional sentiment](#implemented-candidate-int4-dimensional-sentiment),
+> [pairwise, rubric and faithfulness judgment](#implemented-candidate-int4-judgment),
 > single-document extraction, [NER/keyphrases/cited summaries/passage QA](#implemented-candidate-int4-source-tasks),
 > text cohorts/corpora,
 > [ordered extraction batches](#implemented-candidate-int4-extraction-batches),
@@ -506,6 +507,87 @@ Library callers use `Int4SentimentPlanner::for_model`, its
 `Int4SentimentHostLimits`. Parser, admission and native fixtures are authored;
 compilation, model-present correctness and quality qualification remain
 pending controller-selected gates.
+
+## Implemented candidate INT4 judgment
+
+`fnlp candidate source-int4 judge` runs **pairwise, rubric and faithfulness**
+judgment on the native grouped-INT4 engine. It uses the existing typed judge
+request contract and requires `asupersync-runtime`, explicit source or
+independently pinned snapshot input, and a process memory ceiling.
+
+For example, save this pairwise request as `judge.json`:
+
+```json
+{
+  "mode": "pairwise",
+  "criterion": "Prefer the answer that directly addresses the question.",
+  "a": "The office opens at nine.",
+  "b": "The office is a large building.",
+  "policy": {
+    "minimum_margin_milli": 100,
+    "maximum_order_disagreement_milli": 1000
+  }
+}
+```
+
+```bash
+fnlp candidate source-int4 judge judge.json \
+  --source-dir /models/Nanbeige4.2-3B \
+  --source-manifest /models/nanbeige-source-manifest.json \
+  --memory-mib 8192 --group-width 128
+```
+
+Use `--snapshot FILE --expected-model-sha256 HEX` for reload with an independent
+trusted model-content pin. The source route also accepts `--save-snapshot NEW_FILE`;
+saving starts only after the complete judgment passes native work and context
+admission. `--kernel ID` explicitly selects an available integer kernel; the
+default is scalar and an unsupported selection is refused.
+
+The request's `mode` selects one complete judgment:
+
+- **Pairwise:** `criterion`, `a`, `b`, and an explicit policy. Both presentation
+  orders are scored and the shared finalizer averages their log-odds margins.
+  `minimum_margin_milli` and `maximum_order_disagreement_milli` are milli-log-odds
+  thresholds, not probability weights. Insufficient margin or excessive order
+  disagreement produces an explicit uncalibrated abstention.
+- **Rubric:** `document`, `rubric`, and an explicit policy. The rubric carries
+  `schema_version`, `revision`, `declared_origin_digest`, `scale_maximum`, and
+  criteria with `id`, `description`, and positive `weight`. Every criterion
+  completes before aggregation. The policy specifies `minimum_peak_weight_ppm`
+  and `maximum_normalized_entropy_ppm`. Caller-declared rubric provenance does
+  not establish publisher authentication or qualification.
+- **Faithfulness:** `source`, `claim`, and an explicit policy containing
+  `minimum_candidate_weight_ppm`, `minimum_margin_milli`, `evidence_window_bytes`,
+  `max_evidence_windows`, and `max_evidence_spans`. The complete source must fit;
+  it is judged together with every deterministic evidence window. A single
+  window covering the whole source shares that one head. Evidence retains
+  independently checked original byte/scalar spans and exact quotes. Conflicting
+  evidence can abstain. This is an uncalibrated model judgment, not a factuality
+  certificate or independent proof from a second reader.
+
+Every candidate includes scored terminal EOS and uses the full vocabulary
+denominator. Source text remains byte-preserving; the request cannot supply
+model identity, prompt templates, score-space overrides, work receipts or task
+budgets. Each head starts with clean logical KV, and all heads preflight before
+the first forward. `--max-forward-positions`, `--max-projected-logits`,
+`--max-attention-pairs`, `--max-dot-products`, and `--max-multiply-accumulates`
+bound the entire judgment. Limits never renew for another order, criterion or
+window. Memory admission prices full resident KV, scratch, both preparation
+owners, the complete result and publication staging. Generation and prefill
+controls are refused.
+
+The one `fnlp-candidate-int4-judge-v1` response preserves the selected mode,
+strict-quantized-v2 profile, actual model/group identity, every native result,
+and complete work/rewind accounting. Private input and local paths are omitted
+from provenance; faithfulness quotes remain intentional result content.
+Execution failure publishes no partial judgment. Output and preparation guards
+remain alive through bounded serialization, writing and flushing, and writer
+failures are reported. Blocking IO observes the overall deadline cooperatively.
+
+Library callers use `Int4JudgePlanner::for_model`, `plan_with_control`, and
+`NlpEngine::execute_int4_judge` with `Int4JudgeHostLimits`. Compilation,
+model-present execution and quality qualification remain pending the authorized
+controller gates.
 
 ## Implemented candidate INT4 source tasks
 
