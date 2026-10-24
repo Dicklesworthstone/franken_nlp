@@ -11,6 +11,7 @@ mod pairwise;
 mod planning;
 mod rubric;
 pub use planning::quantized;
+pub use planning::grouped_int4;
 
 pub use common::{JudgeError, JudgeLimits, JudgeLogits};
 pub use faithfulness::{FaithfulnessAbstention, FaithfulnessAssessment, FaithfulnessEvidence,

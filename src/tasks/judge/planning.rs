@@ -27,6 +27,7 @@ use super::{
     FaithfulnessPlan, FaithfulnessPolicy, FaithfulnessResult, FAITHFULNESS_VERSION,
 };
 mod faithfulness;
+pub mod grouped_int4;
 pub mod quantized;
 use faithfulness::FaithfulnessCompiler;
 
@@ -206,7 +207,7 @@ impl JudgePlanner {
         -> Result<PreparedJudge, JudgeError> {
         self.plan_with_profile(request, context, limits, NumericsProfile::HfBf16Eager)
     }
-    // Only the private INT8 wrapper can obtain a non-eager inner plan. There
+    // Only the private native wrappers can obtain a non-eager inner plan. There
     // is no public conversion from it to PreparedJudge or an eager executor.
     fn plan_with_profile(&self, request: &JudgeRequest, context: &PlanContext<'_>,
         limits: JudgeLimits, profile: NumericsProfile) -> Result<PreparedJudge, JudgeError> {
