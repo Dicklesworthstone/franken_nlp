@@ -25,7 +25,7 @@ use crate::{
 mod dispatch;
 mod grouped_int4;
 pub use grouped_int4::{Int4HostError, Int4LoadLimits, Int4LoadRequirements, Int4ExtractionMapConfig,
-    Int4SourceCorpusConfig, Int4SourceMapConfig, Int4SentimentHostLimits, ResidentInt4};
+    Int4SourceCorpusConfig, Int4SourceMapConfig, Int4SentimentHostLimits, Int4JudgeHostLimits, ResidentInt4};
 mod scored;
 mod sentiment;
 pub use sentiment::SentimentHostLimits;

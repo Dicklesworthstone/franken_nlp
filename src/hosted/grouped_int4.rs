@@ -7,6 +7,8 @@ mod snapshot;
 mod classify;
 mod sentiment;
 pub use sentiment::Int4SentimentHostLimits;
+mod judge;
+pub use judge::Int4JudgeHostLimits;
 mod extract;
 mod extraction_map;
 pub use extraction_map::Int4ExtractionMapConfig;
@@ -75,6 +77,7 @@ pub enum Int4HostError {
     Source(ConverterError), Model(Int4ModelError), Native(StrictInt4Error), Chat(Int4ChatError),
     Snapshot(Int4SnapshotError), Classification(Int4ClassificationError),
     Sentiment(crate::tasks::sentiment::grouped_int4::Int4SentimentError),
+    Judge(crate::tasks::judge::grouped_int4::Int4JudgeError),
     Extraction(crate::tasks::extract::grouped_int4::Int4ExtractError),
     ExtractionMap(crate::batch::extract::grouped_int4::long::Int4ExtractionMapError),
     SourceTask(crate::tasks::source_planning::grouped_int4::Int4SourceError),
@@ -91,6 +94,7 @@ impl fmt::Display for Int4HostError {
             Self::Snapshot(_) => "INT4 local snapshot loading or persistence refused",
             Self::Classification(_) => "INT4 classification execution or finalization refused",
             Self::Sentiment(_) => "INT4 sentiment execution or finalization refused",
+            Self::Judge(_) => "INT4 complete judgment execution or finalization refused",
             Self::Extraction(_) => "INT4 schema extraction execution or finalization refused",
             Self::ExtractionMap(_) => "INT4 complete-document extraction or reduction refused",
             Self::SourceTask(_) => "INT4 source task execution or finalization refused",
@@ -106,7 +110,7 @@ impl Error for Int4HostError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self { Self::Source(e) => Some(e), Self::Model(e) => Some(e), Self::Native(e) => Some(e),
             Self::Chat(e) => Some(e), Self::Snapshot(e) => Some(e), Self::Classification(e) => Some(e),
-            Self::Sentiment(e) => Some(e),
+            Self::Sentiment(e) => Some(e), Self::Judge(e) => Some(e),
             Self::Extraction(e) => Some(e), Self::ExtractionMap(e) => Some(e), Self::SourceTask(e) => Some(e),
             Self::SourceMap(e) => Some(e), Self::SourceSummary(e) => Some(e) }
     }
