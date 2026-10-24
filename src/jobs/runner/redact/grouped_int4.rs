@@ -166,3 +166,4 @@ fn checkpoint(control: &mut impl DecodeStepControl) -> Result<(), BatchItemFailu
     }
 }
 
+#[cfg(test)] mod tests;

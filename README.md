@@ -38,6 +38,7 @@
 > [verified NER and rule redaction](#implemented-candidate-int4-redaction),
 > [complete-document redaction](#implemented-candidate-int4-complete-document-redaction),
 > [resident redaction corpora](#implemented-candidate-int4-redaction-corpora),
+> [durable redaction jobs](#implemented-candidate-int4-redaction-jobs),
 > single-document extraction, [NER/keyphrases/cited summaries/passage QA](#implemented-candidate-int4-source-tasks),
 > text cohorts/corpora,
 > [ordered extraction batches](#implemented-candidate-int4-extraction-batches),
@@ -846,6 +847,146 @@ work, and its transformed partition is planned freshly. Library callers use
 `NlpEngine::batch_int4_redact_documents` with owned reader/writer handles.
 Source and resource fixtures are authored; compilation, model-present
 execution and quality qualification remain pending controller-selected gates.
+
+## Implemented candidate INT4 redaction jobs
+
+`fnlp candidate source-int4 redact-job start|resume` retains complete-document
+redaction through the existing authenticated owned-job runner. One resident
+INT4 model serves the complete population. Rules scan whole documents, native
+NER processes source-aligned chunks, and fresh detection on the actual edited
+text remains the default. The route requires `metadata-store` and
+`asupersync-runtime` on Linux x86-64 or AArch64.
+
+Prepare an existing protected job directory, a protected file containing
+exactly 32 random raw bytes for job authentication, a random 128-bit job ID
+encoded as 32 lowercase hexadecimal characters, and an immutable
+`JobLimits` JSON file. The command requires explicit `--store-results`
+consent and creates neither the directory nor the secret. The existing
+[owned-job storage contract](docs/owned-jobs.md) supplies the journal, keyed
+commitments, spool-first commit protocol and verified materialization.
+
+For example, save these complete lifetime allowances as
+`redact-job-limits.json`. They accommodate six reservations of the default
+complete-document work envelope; they are ceilings, not measured costs or
+a promise that every document fits its context, result or chunk limits:
+
+```json
+{
+  "max_items": 3,
+  "max_id_bytes": 128,
+  "max_input_bytes_per_item": 2098176,
+  "max_snapshot_bytes": 33554432,
+  "max_result_bytes": 1048576,
+  "max_spool_bytes": 16777216,
+  "max_materialized_bytes": 16777216,
+  "max_journal_bytes": 67108864,
+  "max_attempts": 6,
+  "max_work": {
+    "model": {
+      "forward_positions": 1572864,
+      "projected_logits": 60000000000,
+      "attention_pairs": 6000000000000,
+      "projections": {
+        "dot_products": 60000000000000000,
+        "multiply_accumulates": 60000000000000000
+      }
+    },
+    "mask_node_visits": 1536000000000
+  }
+}
+```
+
+Input is the complete ordered `{id,text,task_args?}` population. IDs must be
+unique across that whole population. `task_args` may be absent, null or an
+empty object; records cannot override the fixed redaction policy. Durable
+input rejects live-stream flush controls, whitespace-only records and malformed
+envelopes. For example:
+
+```jsonl
+{"id":"first","text":"Contact alice@example.org about the request."}
+{"id":"second","text":"Contact bob@example.org about the follow-up.","task_args":{}}
+```
+
+```bash
+fnlp candidate source-int4 redact-job start documents.ndjson \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$EXPECTED_MODEL_SHA256" \
+  --memory-mib 16384 \
+  --store-results \
+  --job-dir /private/redaction-job \
+  --job-id "$JOB_ID" \
+  --key-file /private/redaction-job.key \
+  --limits redact-job-limits.json \
+  --materialize
+```
+
+Use the same arguments with `resume` in place of `start` and supply the
+**complete original population**, including committed items. Inputs remain in
+admitted memory during the invocation; they are not saved for future recovery.
+Resume authenticates original envelope bytes, IDs and order, the actual
+model/group/strict-v2 identity, decoded source cap, NER options, rules, actions,
+chunking, both verification policies and limits, and the actual pseudonym key
+commitment/scope. Reformatting an input envelope or changing that contract
+refuses before job repair or native work. Already committed ordinals are
+skipped after authentication.
+
+`--max-input-bytes` bounds each decoded **original document** independently.
+The limits file's `max_input_bytes_per_item` bounds the encoded JSON envelope,
+including syntax and escapes, so it may be larger. Transformed text uses its
+separately admitted result envelope and is freshly partitioned for verification.
+The same `--ner-options`, rule, action, map, chunk, native-work and grounding
+flags as `redact-document` select one immutable per-document policy.
+`--no-verify` remains an explicit opt-out.
+
+For pseudonymization, add `--action pseudonymize --key-stdin`, a nonsecret
+`--key-id`, a `--namespace`, and optionally the independently retained
+`--expected-key-commitment`. Supply the population as a file and pipe the
+separate binary pseudonym key through stdin. The existing `--key-file` is
+always the independent job-authentication secret. It is never substituted
+for the pseudonym key. One full256 HMAC scope applies to every item and
+resume, and its expected commitment is checked before population IO.
+Pseudonyms and a clean declared-detector scan do not establish anonymization
+or detector recall; retained edited text and coordinate maps remain sensitive.
+
+All five native counters and mask visits come directly from immutable
+`JobLimits.max_work`. Population size, attempts and per-invocation transport
+or checkpoint allowances do not multiply or renew them. The whole declared
+original-plus-verification envelope is durably reserved before an attempt,
+including a verification prompt that can only be planned from the actual
+edited text. Failed or interrupted attempts retain that debit. No failed or
+partial redaction becomes a committed successful result.
+
+Memory admission includes the complete frozen population and ID index,
+journal and serialization staging, private recipe, both preparation owners,
+full resident KV, complete-map/edit workspace, secret metadata and guarded
+results. One physical hosted invocation owns population ingestion, native
+work, journal/spool lifetime and optional materialization through cleanup.
+Each complete result stays charged through spool sync and journal acknowledgement.
+
+Stdout contains only a bounded completion report with
+`protocol: "fnlp-candidate-int4-redact-job-v1"`, public model provenance,
+`redaction_mode: "complete_document"` and authenticated progress.
+Private results remain in the explicit owner-only spool. `--materialize`
+publishes ordered `materialized.ndjson` only after all items commit;
+existing stored-job status, verification and materialization remain available
+without loading the model. Report delivery failure or a deadline after commit
+does not imply rollback. Preserve the population and both key scopes, inspect
+the protected job and resume explicitly. Uncommitted tails or interrupted
+stages require resume-only `--discard-uncommitted-tail`; authentication precedes
+that repair. Mismatch diagnostics name only the affected contract field.
+
+Source conversion and independently pinned snapshots use the same model path.
+An explicit source-route `--save-snapshot NEW_FILE` occurs during setup,
+before population authentication; the new model snapshot remains if the later
+job fails. It is separate from durable job commits.
+
+Library callers use `Int4RedactionJobConfig` and
+`NlpEngine::job_int4_redact_document` with the existing
+`SourceJobRequest`, `JobHostLimits` and
+`RedactionCorpusConfig` wrappers. No parallel job storage format or implicit
+input spool is introduced. Fixtures cover authority, resource, privacy and
+resume contracts; compilation, model-present execution, crash recovery and
+quality qualification remain pending controller-selected gates.
 
 ## Implemented candidate INT4 source tasks
 

@@ -120,6 +120,7 @@ enum Int4Task {
     ExtractMap(extract_map::MapArgs),
     ExtractJob,
     SourceJob,
+    RedactJob,
 }
 #[derive(Clone, Copy)]
 enum Int4BatchCommand { Fixed(batch::BatchArgs), Corpus(batch::corpus::CorpusArgs) }
@@ -135,6 +136,7 @@ impl Int4BatchCommand {
 enum Int4JobCommand {
     Extraction(extract_job::JobCommand),
     Source(source_job::JobCommand),
+    Redaction(redact::long::jobs::JobCommand),
 }
 pub(super) struct Int4Command {
     task: Int4Task, args: Int4Args, batch: Option<Int4BatchCommand>,
@@ -146,7 +148,7 @@ pub(super) fn definition() -> clap::Command {
         .mut_arg("prefill_rows", |arg| arg.help("Explicit grouped-INT4 layer-major prompt execution, 1..=64 rows; extra workspace is process-admitted"));
     clap::Command::new("source-int4")
         .about("Run candidate INT4 tasks from pinned sources or a digest-pinned local snapshot")
-        .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Sequential native execution defaults to scalar; --kernel explicitly selects an existing hardware-checked integer leaf. Text tasks can opt in to bounded layer-major prompt execution with --prefill-rows; structured tasks cannot. text-batch runs one finite NDJSON cohort and emits one completed aggregate JSON object. text-corpus processes bounded windows with one resident model and cumulative budgets, emitting completed-window NDJSON with a required corpus_complete footer. extract-batch streams documents under one shared schema through one resident model and engine. ner, keyphrases, summarize and answer preserve their source-task semantics; their -batch commands run ordered typed source-task NDJSON. Every ordered batch requires run_complete plus exit 0 for whole-run success. ner-map and keyphrases-map process every chunk of a complete document with original-coordinate evidence; summarize-map produces a deterministic exact cited bullet union. All map commands preflight the complete document and publish one completed result. extract-job start/resume retains ordered extraction results in an explicit protected spool. ner-job, keyphrases-job, summarize-job and answer-job provide the same opt-in durable start/resume contract for source tasks. Resume authenticates the complete original population, exact task configuration, model/group identity and immutable lifetime limits. No automatic selection, fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Outputs are completed results, not provisional token events.")
+        .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Sequential native execution defaults to scalar; --kernel explicitly selects an existing hardware-checked integer leaf. Text tasks can opt in to bounded layer-major prompt execution with --prefill-rows; structured tasks cannot. text-batch runs one finite NDJSON cohort and emits one completed aggregate JSON object. text-corpus processes bounded windows with one resident model and cumulative budgets, emitting completed-window NDJSON with a required corpus_complete footer. extract-batch streams documents under one shared schema through one resident model and engine. ner, keyphrases, summarize and answer preserve their source-task semantics; their -batch commands run ordered typed source-task NDJSON. Every ordered batch requires run_complete plus exit 0 for whole-run success. ner-map and keyphrases-map process every chunk of a complete document with original-coordinate evidence; summarize-map produces a deterministic exact cited bullet union. All map commands preflight the complete document and publish one completed result. extract-job start/resume retains ordered extraction results in an explicit protected spool. ner-job, keyphrases-job, summarize-job and answer-job provide the same opt-in durable start/resume contract for source tasks. redact-job start/resume retains complete-document edits under one authenticated detector, action and key scope, with metadata-only stdout. Resume authenticates the complete original population, exact task configuration, model/group identity and immutable lifetime limits. No automatic selection, fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Outputs are completed results, not provisional token events.")
         .subcommand_required(true)
         .subcommand(task("generate", "Generate from a bounded UTF-8 prompt using the pinned template"))
         .subcommand(task("chat", "Complete a bounded JSON system/user/assistant transcript"))
@@ -156,6 +158,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(redact::definition())
         .subcommand(redact::long::definition())
         .subcommand(redact::long::corpus::definition())
+        .subcommand(redact::long::jobs::definition())
         .subcommand(extract::definition())
         .subcommand(extract_batch::definition())
         .subcommand(extract_job::definition())
@@ -171,6 +174,10 @@ impl Int4Command {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let (name, matches) = matches.subcommand().ok_or_else(||
             clap::Error::raw(clap::error::ErrorKind::MissingSubcommand, "source-int4 task required"))?;
+        if name == "redact-job" {
+            let (job, args) = redact::long::jobs::JobCommand::from_matches(matches)?;
+            return Ok(Self { task: Int4Task::RedactJob, args, batch: None, job: Some(Int4JobCommand::Redaction(job)) });
+        }
         if name == "extract-job" {
             let (job, args) = extract_job::JobCommand::from_matches(matches)?;
             return Ok(Self { task: Int4Task::ExtractJob, args, batch: None, job: Some(Int4JobCommand::Extraction(job)) });
@@ -228,6 +235,8 @@ impl Int4Command {
                 return job.run_owned(args, input, &mut output, diagnostics),
             Self { task: Int4Task::SourceJob, args, batch: None, job: Some(Int4JobCommand::Source(job)) } =>
                 return job.run_owned(args, input, &mut output, diagnostics),
+            Self { task: Int4Task::RedactJob, args, batch: None, job: Some(Int4JobCommand::Redaction(job)) } =>
+                return job.run_owned(args, input, &mut output, diagnostics),
             Self { task: Int4Task::ExtractBatch(options), args, batch: None, job: None } =>
                 options.execute_owned(args, input, output),
             Self { task: Int4Task::SourceBatch(options), args, batch: None, job: None } =>
@@ -245,7 +254,7 @@ impl Int4Command {
         }
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
-        if self.job.is_some() || matches!(self.task, Int4Task::ExtractJob | Int4Task::SourceJob) {
+        if self.job.is_some() || matches!(self.task, Int4Task::ExtractJob | Int4Task::SourceJob | Int4Task::RedactJob) {
             return Err(CandidateError::Arguments);
         }
         if let Some(batch) = self.batch {
@@ -277,7 +286,7 @@ impl Int4Command {
             Int4Task::Source(_, source) => source.validate(&self.args)?,
             // The blocking stream must own its input and writer through cleanup.
             Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::Sentiment(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
-                | Int4Task::ExtractJob | Int4Task::SourceJob => return Err(CandidateError::Arguments),
+                | Int4Task::ExtractJob | Int4Task::SourceJob | Int4Task::RedactJob => return Err(CandidateError::Arguments),
         };
         #[cfg(feature = "asupersync-runtime")]
         { runtime::execute_task(self.task, self.args, limits, input, output) }
