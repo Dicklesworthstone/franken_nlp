@@ -35,6 +35,7 @@
 > `candidate source-int4` namespace includes generation/chat, classification,
 > [independent dimensional sentiment](#implemented-candidate-int4-dimensional-sentiment),
 > [pairwise, rubric and faithfulness judgment](#implemented-candidate-int4-judgment),
+> [verified NER and rule redaction](#implemented-candidate-int4-redaction),
 > single-document extraction, [NER/keyphrases/cited summaries/passage QA](#implemented-candidate-int4-source-tasks),
 > text cohorts/corpora,
 > [ordered extraction batches](#implemented-candidate-int4-extraction-batches),
@@ -588,6 +589,99 @@ Library callers use `Int4JudgePlanner::for_model`, `plan_with_control`, and
 `NlpEngine::execute_int4_judge` with `Int4JudgeHostLimits`. Compilation,
 model-present execution and quality qualification remain pending the authorized
 controller gates.
+
+## Implemented candidate INT4 redaction
+
+`fnlp candidate source-int4 redact` combines native grouped-INT4 NER with
+deterministic rules, edits the original UTF-8 document, and by default runs a
+**fresh model and rule pass on the actual transformed text**. This bounded
+single-document route requires `asupersync-runtime`, explicit model input and a
+process memory ceiling.
+
+```bash
+fnlp candidate source-int4 redact transcript.txt \
+  --source-dir /models/Nanbeige4.2-3B \
+  --source-manifest /models/nanbeige-source-manifest.json \
+  --memory-mib 8192 --group-width 128
+```
+
+The default action is `mask`. The default rule union covers email, phone, URL,
+IP address and credit card patterns; `--rules email,phone,url,ip-address,credit-card,date`
+also selects dates. Native detection defaults to person, organization and
+location. `--ner-options FILE` accepts a complete typed `NerOptions` JSON
+object of at most 16 KiB, for example:
+
+```json
+{"types":["person","organization","location"],"max_entities":128,"max_mention_scalars":128}
+```
+
+Unknown or duplicate fields, incomplete options and prompt/budget overrides
+are refused. The command independently verifies native occurrences against the
+exact original source before forming the detector union. Overlapping regions
+are edited together; untouched text stays byte-exact. `--action placeholder`
+uses typed placeholders. `--include-map` explicitly adds sensitive
+original/output byte and Unicode-scalar coordinates without copying raw
+original values into the map.
+
+`--action pseudonymize` uses all 256 bits of HMAC-SHA-256 and accepts a
+caller-supplied high-entropy binary key only through inherited stdin. Supply
+32–4096 raw bytes without trimming and put the document in a separate file:
+
+```bash
+fnlp candidate source-int4 redact transcript.txt \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$EXPECTED_MODEL_SHA256" \
+  --memory-mib 8192 \
+  --action pseudonymize --key-stdin \
+  --key-id rotation-1 --namespace customer-set \
+  < /private/redaction.key
+```
+
+`--expected-key-commitment HEX` optionally requires a previously saved HMAC
+commitment. The key scope and commitment are checked before document IO.
+There is no raw-key argv option. Masking and placeholders can read document
+stdin with `-`; stdin cannot carry both document and key. Public pseudonym
+identity includes the key label, encoding and keyed commitments. Raw keys,
+namespace, document contents, local paths and private NER transcripts are
+omitted from provenance.
+
+Verification repeats the same selected NER types and rules against freshly
+planned transformed text. Any residual declared detection, failed source
+validation, exhausted budget or cancelled pass returns no redacted result.
+`--no-verify` explicitly skips the second pass and reports
+`not_requested`. Successful verification reports `clean_declared_union` for
+that detector scope; missed PII can remain and pseudonymization is not
+anonymization.
+
+`--max-input-bytes` bounds the original document. Both original and transformed
+prompts must fit `--context-tokens` with the full `--max-new-tokens` allowance,
+including terminal EOS. Expanded placeholders or pseudonyms can therefore
+refuse verification rather than truncate. This route has no chunked, corpus
+or durable-job mode. It uses one whole-operation ceiling for all five native
+work axes and cumulative mask visits across the selected one or two passes;
+each context is independently reset. Rule scans retain their explicit
+`--max-rule-work` and `--max-detections` bounds. Memory admission includes the
+resident model, full KV, native scratch, both preparation owners, captured
+source, explicit `--edit-reserve-mib` workspace and bounded final serialization.
+
+Both source conversion and independently pinned snapshots bind the actual
+model and group width. `--save-snapshot NEW_FILE` on the source route starts
+only after original-source planning and the complete-operation work bound
+pass admission. `--kernel ID` selects an available kernel explicitly; the
+default is scalar and unsupported choices refuse.
+
+One `fnlp-candidate-int4-redact-v1` JSON response contains final edited text,
+public policy and optional coordinate maps, actual strict-quantized-v2
+model/group provenance, and complete native/mask work receipts. Intermediate
+NER results and rejected transformed text never reach the output writer.
+Preparation and hosted output ownership survive complete serialization,
+writing and flushing; output failures are reported. The whole-invocation
+deadline observes blocking IO cooperatively.
+
+Library callers use `Int4Redactor` and `NlpEngine::redact_int4` with
+`RedactConfig<Int4RedactionConfig>`, the actual resident model, pinned planner
+and vocabulary, and optional `RedactionPseudonyms`. Compilation, model-present
+execution and quality qualification remain pending controller-selected gates.
 
 ## Implemented candidate INT4 source tasks
 

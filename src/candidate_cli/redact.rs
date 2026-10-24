@@ -10,10 +10,10 @@ use source::SourceHostArgs;
 
 #[derive(Clone, Copy, Eq, PartialEq, ValueEnum)]
 pub(super) enum Action { Mask, Placeholder, Pseudonymize }
-#[derive(Clone, Copy, ValueEnum)]
-enum Rule { Email, Phone, Url, IpAddress, CreditCard, Date }
+#[derive(Clone, Copy, Eq, PartialEq, ValueEnum)]
+pub(super) enum Rule { Email, Phone, Url, IpAddress, CreditCard, Date }
 impl Rule {
-    fn kind(self) -> PiiKind {
+    pub(super) fn kind(self) -> PiiKind {
         match self { Self::Email => PiiKind::Email, Self::Phone => PiiKind::Phone,
             Self::Url => PiiKind::Url, Self::IpAddress => PiiKind::IpAddress,
             Self::CreditCard => PiiKind::CreditCard, Self::Date => PiiKind::Date }
@@ -87,20 +87,8 @@ impl RedactCommand {
             .and_then(|n| n.checked_add(self.host.max_result_bytes as u64 * 16))
             .and_then(|n| n.checked_add(MIB)).ok_or(CandidateError::Arguments)?;
         if edit < floor || edit > limits.memory_bytes { return Err(CandidateError::Arguments); }
-        if self.action == Action::Pseudonymize {
-            if !self.key_stdin || self.input.as_os_str() == "-"
-                || self.key_id.as_ref().is_none_or(|id| id.is_empty() || id.len() > 128
-                    || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)))
-                || self.namespace.as_ref().is_none_or(|s| s.is_empty() || s.len() > 256) {
-                return Err(CandidateError::Arguments);
-            }
-        } else if self.key_stdin || self.key_id.is_some() || self.namespace.is_some() || self.expected_key_commitment.is_some() {
-            return Err(CandidateError::Arguments);
-        }
-        if self.expected_key_commitment.as_ref().is_some_and(|s| s.len() != 64
-            || !s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))) {
-            return Err(CandidateError::Arguments);
-        }
+        validate_key_scope(self.action, &self.input, self.key_stdin, self.key_id.as_deref(),
+            self.namespace.as_deref(), self.expected_key_commitment.as_deref())?;
         self.corpus.validate(self, limits)?;
         self.retention.validate(self.corpus.ndjson, limits)?;
         Ok((common, limits))
@@ -125,13 +113,8 @@ impl RedactCommand {
         request
     }
     pub(super) fn key(&self, input: &mut impl Read) -> Result<Option<(PseudonymKey, String)>, CandidateError> {
-        if !self.key_stdin { return Ok(None); }
-        let id = self.key_id.as_deref().ok_or(CandidateError::Arguments)?;
-        let key = PseudonymKey::from_reader(input, id).map_err(|_| CandidateError::Input)?;
-        if let Some(expected) = &self.expected_key_commitment {
-            key.require_commitment(expected).map_err(|_| CandidateError::Identity)?;
-        }
-        Ok(Some((key, self.namespace.clone().ok_or(CandidateError::Arguments)?)))
+        read_key(input, self.key_stdin, self.key_id.as_deref(), self.namespace.as_deref(),
+            self.expected_key_commitment.as_deref())
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
         // Owned corpus IO must enter through run_stdio/run_owned, never a
@@ -143,6 +126,34 @@ impl RedactCommand {
         #[cfg(not(feature = "asupersync-runtime"))]
         { let _ = (self, common, limits, input, output); Err(CandidateError::Unavailable) }
     }
+}
+/// One private-key contract for the INT8 and grouped-INT4 redaction commands.
+/// No backend may relax stdin separation or accept raw key bytes in argv.
+pub(super) fn validate_key_scope(action: Action, input: &std::path::Path, key_stdin: bool,
+    key_id: Option<&str>, namespace: Option<&str>, expected: Option<&str>) -> Result<(), CandidateError> {
+    if action == Action::Pseudonymize {
+        if !key_stdin || input.as_os_str() == "-"
+            || key_id.is_none_or(|id| id.is_empty() || id.len() > 128
+                || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)))
+            || namespace.is_none_or(|s| s.is_empty() || s.len() > 256) {
+            return Err(CandidateError::Arguments);
+        }
+    } else if key_stdin || key_id.is_some() || namespace.is_some() || expected.is_some() {
+        return Err(CandidateError::Arguments);
+    }
+    if expected.is_some_and(|s| s.len() != 64
+        || !s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))) {
+        return Err(CandidateError::Arguments);
+    }
+    Ok(())
+}
+pub(super) fn read_key(input: &mut impl Read, key_stdin: bool, key_id: Option<&str>,
+    namespace: Option<&str>, expected: Option<&str>) -> Result<Option<(PseudonymKey, String)>, CandidateError> {
+    if !key_stdin { return Ok(None); }
+    let key = PseudonymKey::from_reader(input, key_id.ok_or(CandidateError::Arguments)?)
+        .map_err(|_| CandidateError::Input)?;
+    if let Some(expected) = expected { key.require_commitment(expected).map_err(|_| CandidateError::Identity)?; }
+    Ok(Some((key, namespace.ok_or(CandidateError::Arguments)?.to_owned())))
 }
 pub(super) fn ner_options(json: Option<&str>) -> Result<NerOptions, CandidateError> {
     let options = match json {

@@ -7,6 +7,7 @@ use crate::native_engine::{int4::PackedInt4Kernel, simd::Int8KernelKind,
 mod classify;
 mod sentiment;
 mod judge;
+mod redact;
 mod extract;
 mod extract_batch;
 mod extract_job;
@@ -109,6 +110,7 @@ enum Int4Task {
     Text(Task), Classify(classify::ScoringArgs), Extract(extract::ExtractionArgs),
     Sentiment(sentiment::SentimentArgs),
     Judge(judge::JudgeArgs),
+    Redact(redact::RedactArgs),
     Source(crate::candidate_cli::source::Kind, source::SourceArgs),
     SourceBatch(source_batch::BatchArgs),
     SourceMap(source_map::MapArgs),
@@ -149,6 +151,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(classify::definition())
         .subcommand(sentiment::definition())
         .subcommand(judge::definition())
+        .subcommand(redact::definition())
         .subcommand(extract::definition())
         .subcommand(extract_batch::definition())
         .subcommand(extract_job::definition())
@@ -188,6 +191,7 @@ impl Int4Command {
             "classify" => Int4Task::Classify(classify::ScoringArgs::from_matches(matches)?),
             "sentiment" => Int4Task::Sentiment(sentiment::SentimentArgs::from_matches(matches)?),
             "judge" => Int4Task::Judge(judge::JudgeArgs::from_matches(matches)?),
+            "redact" => Int4Task::Redact(redact::RedactArgs::from_matches(matches)?),
             "extract" => Int4Task::Extract(extract::ExtractionArgs::from_matches(matches)?),
             "extract-batch" => Int4Task::ExtractBatch(extract_batch::BatchArgs::from_matches(matches)?),
             "extract-map" => Int4Task::ExtractMap(extract_map::MapArgs::from_matches(matches)?),
@@ -252,13 +256,16 @@ impl Int4Command {
         if let Int4Task::Judge(options) = self.task {
             return options.execute(self.args, input, output);
         }
+        if let Int4Task::Redact(options) = self.task {
+            return options.execute(self.args, input, output);
+        }
         let limits = match &self.task {
             Int4Task::Text(_) => self.args.validate()?,
             Int4Task::Classify(scoring) => scoring.validate(&self.args)?,
             Int4Task::Extract(extraction) => extraction.validate(&self.args)?,
             Int4Task::Source(_, source) => source.validate(&self.args)?,
             // The blocking stream must own its input and writer through cleanup.
-            Int4Task::Judge(_) | Int4Task::Sentiment(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
+            Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::Sentiment(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
                 | Int4Task::ExtractJob | Int4Task::SourceJob => return Err(CandidateError::Arguments),
         };
         #[cfg(feature = "asupersync-runtime")]
