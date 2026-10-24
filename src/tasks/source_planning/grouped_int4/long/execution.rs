@@ -220,6 +220,12 @@ pub(super) fn check_run(plan: &PreparedInt4SourceTask, run: &Int4SourceTaskRun, 
             }
             (r.schema_version, &r.task_spec_version, &r.numerics_profile, &r.generated_token_ids, r.forward_positions, r.projected_logits)
         }
+        (Finalizer::Answer(_, options), SourceTaskResult::Answer(r)) => {
+            if r.citations.len() > options.max_citations {
+                return Err(Int4SourceError::InvalidResult);
+            }
+            (r.schema_version, &r.task_spec_version, &r.numerics_profile, &r.generated_token_ids, r.forward_positions, r.projected_logits)
+        }
         _ => return Err(Int4SourceError::InvalidResult),
     };
     let options = plan.extraction.options();

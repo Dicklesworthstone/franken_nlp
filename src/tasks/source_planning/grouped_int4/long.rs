@@ -15,6 +15,8 @@ use crate::{
 };
 mod execution;
 pub mod summary;
+/// Question-aware passage planning and complete original-source answer collection.
+pub mod question;
 
 pub const INT4_SOURCE_MAP_EXECUTION: &str = "grouped-int4-source-document-map-v1";
 const SEMANTICS: &str = "independent-chunks-no-cross-chunk-reasoning-v1";
