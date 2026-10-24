@@ -12,6 +12,7 @@ pub mod actions;
 pub mod pipeline;
 pub mod native;
 pub mod quantized;
+pub mod grouped_int4;
 pub mod long;
 pub mod batch;
 pub mod corpus;
