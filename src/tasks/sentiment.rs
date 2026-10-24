@@ -15,4 +15,5 @@ pub use distribution::{
 pub use native::{EagerSentimentRun, SENTIMENT_NATIVE_EXECUTION, SentimentNativeError};
 pub use planning::{SENTIMENT_PROMPT_VERSION, SentimentPlanner, SentimentPlanningError, SentimentRequest};
 pub mod quantized;
+pub mod grouped_int4;
 pub mod batch;

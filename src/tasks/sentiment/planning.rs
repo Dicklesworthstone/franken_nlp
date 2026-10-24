@@ -208,16 +208,23 @@ impl SentimentPlanner {
         self.plan_for_profile(request, context, limits, NumericsProfile::HfBf16Eager)
     }
 
-    // Only the two typed public entrypoints choose a profile. In particular,
-    // INT8 preparation never temporarily rewrites a BF16 execution identity.
+    // Only the typed public entrypoints choose a profile. Quantized planning
+    // checks the requested backend without rewriting an eager identity.
     pub(super) fn plan_for_profile(&self, request: &SentimentRequest,
         context: &PlanContext<'_>, limits: SentimentLimits, profile: NumericsProfile)
         -> Result<SentimentPlan, SentimentPlanningError> {
         let identity = context.execution_identity();
-        if !matches!(&profile, NumericsProfile::HfBf16Eager | NumericsProfile::StrictQuantized { version: 1 })
-            || (matches!(&profile, NumericsProfile::StrictQuantized { .. })
-                && (identity.backend_semantic_version != crate::native_engine::strict_int8::STRICT_INT8_EXECUTION
-                    || identity.kv_dtype != "bf16")) {
+        let backend_matches = match &profile {
+            NumericsProfile::HfBf16Eager => true,
+            NumericsProfile::StrictQuantized { version: 1 } =>
+                identity.backend_semantic_version == crate::native_engine::strict_int8::STRICT_INT8_EXECUTION
+                    && identity.kv_dtype == "bf16",
+            NumericsProfile::StrictQuantized { version: 2 } =>
+                identity.backend_semantic_version == crate::native_engine::strict_int4::STRICT_INT4_EXECUTION
+                    && identity.kv_dtype == "bf16",
+            _ => false,
+        };
+        if !backend_matches {
             return Err(SentimentPlanningError::Identity);
         }
         if identity.task_spec != "sentiment-v1" || identity.template_digest != self.template_digest
