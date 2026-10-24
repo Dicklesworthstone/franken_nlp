@@ -187,7 +187,7 @@ impl Int4Command {
                 crate::candidate_cli::source::Kind::named(name).ok_or_else(||
                     clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source task refused"))?,
                 source::SourceArgs::from_matches(matches)?),
-            "ner-map" | "keyphrases-map" | "summarize-map" => {
+            "ner-map" | "keyphrases-map" | "summarize-map" | "answer-map" => {
                 let kind = crate::candidate_cli::source::Kind::named(name.trim_end_matches("-map"))
                     .ok_or_else(|| clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source map task refused"))?;
                 Int4Task::SourceMap(source_map::MapArgs::from_matches(kind, matches)?)

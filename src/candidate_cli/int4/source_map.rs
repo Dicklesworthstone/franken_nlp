@@ -10,6 +10,7 @@ use crate::{
     validation::grounded_fields::{GroundingBudget, SourceFieldEvidence, VerifiedSourceSpan},
 };
 
+mod question;
 #[cfg(feature = "asupersync-runtime")]
 mod runtime;
 #[cfg(test)]
@@ -21,6 +22,7 @@ pub(super) struct MapArgs {
     pub source: source::SourceArgs,
     mapping: MappingArgs,
     summary: Option<SummaryArgs>,
+    question: Option<question::QuestionArgs>,
 }
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
 struct MappingArgs {
@@ -85,12 +87,14 @@ struct SummaryArgs {
     max_summary_scan_steps: u64,
 }
 pub(super) fn definitions() -> Vec<clap::Command> {
-    [(Kind::Ner, "ner-map"), (Kind::Keyphrases, "keyphrases-map"), (Kind::Summarize, "summarize-map")]
+    [(Kind::Ner, "ner-map"), (Kind::Keyphrases, "keyphrases-map"),
+        (Kind::Summarize, "summarize-map"), (Kind::Answer, "answer-map")]
         .into_iter().map(|(kind, name)| {
             let about = match kind {
                 Kind::Ner => "Find entities throughout a complete document with original-coordinate source evidence",
                 Kind::Keyphrases => "Extract keyphrases from every chunk of a complete document",
-                _ => "Summarize every chunk and rank one exact cited bullet union",
+                Kind::Summarize => "Summarize every chunk and rank one exact cited bullet union",
+                Kind::Answer => "Ask one question of every chunk and preserve all original-source evidence",
             };
             let command = MappingArgs::augment_args(source::definition(kind).name(name).about(about)
                 .long_about("Losslessly partition one complete UTF-8 document with the pinned source encoder and the exact typed task/schema/template capacity. Preflight and admit ALL chunks before the first native forward. NER and keyphrases retain independent chunk results and exact original-document occurrence spans; local keyphrase ranks are not a global ranking. summarize-map returns one deterministic exact-bullet/evidence union, preserving every candidate through intermediate reduction and applying --max-summary-bullets only at the complete final root. Citation membership does not prove semantic entailment; there is no neural hierarchical synthesis or contradiction reconciliation. --options supplies the selected task's complete per-chunk options. Native work, mask visits, source verification and reducer verification never renew per chunk. A failed chunk or insufficient budget produces no partial document result. Source conversion and digest-pinned snapshot reload share the same checked path. Blocking IO observes the end-to-end deadline cooperatively.")
@@ -99,7 +103,11 @@ pub(super) fn definitions() -> Vec<clap::Command> {
                 .mut_arg("preparation_mib", |arg| arg.default_value("1024"))
                 .mut_arg("max_mask_node_visits", |arg| arg.help("Mask allowance per chunk; --max-total-mask-node-visits bounds the whole document"))
                 .mut_arg("max_checkpoints", |arg| arg.help("Cooperative allowance for hosted whole-document preparation, maps and reduction")));
-            if kind == Kind::Summarize { SummaryArgs::augment_args(command) } else { command }
+            match kind {
+                Kind::Summarize => SummaryArgs::augment_args(command),
+                Kind::Answer => question::definition(command),
+                _ => command,
+            }
         }).collect()
 }
 #[derive(Clone, Copy, Debug)]
@@ -113,18 +121,16 @@ pub(super) struct MapLimits {
 }
 impl MapArgs {
     pub(super) fn from_matches(kind: Kind, matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-        if kind == Kind::Answer {
-            return Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand,
-                "passage QA is not a whole-document map task"));
-        }
         Ok(Self { kind, source: source::SourceArgs::from_matches(matches)?,
             mapping: MappingArgs::from_arg_matches(matches)?,
-            summary: if kind == Kind::Summarize { Some(SummaryArgs::from_arg_matches(matches)?) } else { None } })
+            summary: if kind == Kind::Summarize { Some(SummaryArgs::from_arg_matches(matches)?) } else { None },
+            question: if kind == Kind::Answer { Some(question::QuestionArgs::from_arg_matches(matches)?) } else { None } })
     }
     pub(super) fn validate(&self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
         let m = self.mapping;
         let mut common = self.source.validate(args)?;
-        if self.kind == Kind::Answer || (self.kind == Kind::Summarize) != self.summary.is_some()
+        if (self.kind == Kind::Answer) != self.question.is_some()
+            || (self.kind == Kind::Summarize) != self.summary.is_some()
             || args.max_input_bytes < 4 || !(1..=256).contains(&m.max_chunks)
             || !(1..=1_000_000).contains(&m.max_tokenizer_calls)
             || m.max_chunk_bytes.is_some_and(|n| !(4..=MAX_INPUT_BYTES).contains(&n))
@@ -144,6 +150,7 @@ impl MapArgs {
         }
         let reduction_reserve_bytes = mib(m.reduction_reserve_mib)?;
         let mapping = self.mapping_limits(args)?;
+        if let Some(question) = &self.question { question.validate()?; }
         let summary = self.summary.map(|s| s.limits(mapping)).transpose()?;
         if let Some(summary) = summary {
             // In addition to the host's full map/frontier payload, price the
@@ -161,13 +168,22 @@ impl MapArgs {
         // until complete execution finishes. Actual host planning is separate.
         let per_chunk = sum(&[args.context_tokens as u64 * 32,
             u64::from(budget.max_grammar_states) * 512, shared::OPTIONS_BYTES as u64 * 2])?;
+        let question_preparation = if self.question.is_some() {
+            times(question::QUESTION_BYTES as u64, (m.max_chunks as u64 + 1) * 4)?
+        } else { 0 };
         let preparation_floor = sum(&[times(per_chunk, m.max_chunks as u64)?, 256 * MIB,
-            args.max_input_bytes as u64 * 64, (m.max_map_result_bytes as u64 + 4096) * 2])?;
+            args.max_input_bytes as u64 * 64, (m.max_map_result_bytes as u64 + 4096) * 2,
+            question_preparation])?;
         if common.preparation_bytes < preparation_floor { return Err(CandidateError::Arguments); }
-        let workspace_bytes = workspace_bytes(budget, mapping, m.max_chunks, reduction_reserve_bytes)?;
+        let workspace_bytes = match &self.question {
+            Some(question) => question::workspace_bytes(budget, mapping, m.max_chunks,
+                reduction_reserve_bytes, question.verification()?)?,
+            None => workspace_bytes(budget, mapping, m.max_chunks, reduction_reserve_bytes)?,
+        };
         let tokens = if summary.is_some() { 0 } else { times(m.max_chunks as u64, u64::from(budget.max_output_tokens))? };
         let output = sum(&[m.max_map_result_bytes as u64 * 4, times(tokens, 8)?, 4096])?;
-        let input = sum(&[args.max_input_bytes as u64 + 1, common.preparation_bytes])?;
+        let question_input = if self.question.is_some() { question::QUESTION_BYTES as u64 + 1 } else { 0 };
+        let input = sum(&[args.max_input_bytes as u64 + 1, question_input, common.preparation_bytes])?;
         // CLI preparation stays alive through publication while the host owns
         // a separately charged source/preparation capture and complete output.
         common.minimum_memory_bytes = sum(&[common.minimum_memory_bytes, input, workspace_bytes, output])?;

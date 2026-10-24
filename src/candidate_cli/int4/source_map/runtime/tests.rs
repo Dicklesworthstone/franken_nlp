@@ -203,3 +203,119 @@ fn complete_publication_keeps_provenance_and_original_coordinates_and_refuses_ov
     assert_eq!(publish(&response, 4096, &mut failed), Err(CandidateError::Output));
     assert!(!failed.0.is_empty(), "transport failure is not a successful task response");
 }
+
+fn question_fixture(width: usize) -> (SourceTaskPlanner, Int4SourceMapConfig<SourceQuestion>, MapLimits) {
+    let (planner, base, _) = fixture(Kind::Ner, width);
+    let width_arg = width.to_string();
+    let command = super::super::tests::command(Kind::Answer,
+        &["--question", "private-question.txt", "--max-chunk-bytes", "16",
+            "--max-new-tokens", "16", "--group-width", &width_arg]);
+    let Int4Task::SourceMap(options) = command.task else { panic!("wrong QA dispatcher"); };
+    let limits = options.validate(&command.args).unwrap();
+    let task = options.question.as_ref().unwrap().task("What happened in 上海?".to_owned(), None).unwrap();
+    let mut identity = base.identity;
+    identity.task_spec = source::task(Kind::Answer).spec().identity();
+    (planner, configuration(identity, task, &command.args, &options, limits, Duration::from_secs(1)), limits)
+}
+
+#[test]
+fn document_qa_preflight_matches_every_fully_compiled_chunk_and_original_coordinate() {
+    let (planner, config, _) = question_fixture(32);
+    let expected = question_preflight(SOURCE, &planner, &config, 32, &mut continuing()).unwrap();
+    assert!(expected.chunk_count() > 1);
+    assert_eq!(expected.source_span().byte_end, SOURCE.len());
+    assert_eq!(expected.source_span().scalar_end, SOURCE.chars().count());
+    assert_eq!(expected.native_chunks() + expected.whitespace_chunks(), expected.chunk_count());
+    let context = PlanContext::new(&config.identity, config.budget).unwrap();
+    let compiled = planner.plan_int4_question_with_control(SOURCE, &config.task, config.budget,
+        &context, config.planning, config.mapping, 32, &mut continuing()).unwrap();
+    assert_eq!(compiled.preflight_metadata(), expected);
+    assert_eq!(compiled.execution_identities().len(), expected.native_chunks());
+    for identity in compiled.execution_identities() {
+        assert_eq!(identity.task_spec, source::task(Kind::Answer).spec().identity());
+        assert_eq!(identity.numerics_profile, NumericsProfile::StrictQuantized { version: 2 });
+    }
+    let (planner, wider, _) = question_fixture(128);
+    let wide = question_preflight(SOURCE, &planner, &wider, 128, &mut continuing()).unwrap();
+    assert_eq!(expected.planned_work().forward_positions, wide.planned_work().forward_positions);
+    assert_eq!(expected.planned_work().projections.multiply_accumulates,
+        wide.planned_work().projections.multiply_accumulates);
+    assert!(expected.planned_work().projections.dot_products > wide.planned_work().projections.dot_products);
+}
+
+#[test]
+fn document_qa_complete_work_and_mask_caps_cannot_restart_for_another_passage() {
+    let (planner, mut config, _) = question_fixture(32);
+    let expected = question_preflight(SOURCE, &planner, &config, 32, &mut continuing()).unwrap();
+    let original = config.mapping;
+    for axis in 0..6 {
+        config.mapping = original;
+        config.mapping.max_model_work = expected.planned_work();
+        config.mapping.max_mask_visits = expected.reserved_mask_visits();
+        match axis {
+            0 => config.mapping.max_model_work.forward_positions -= 1,
+            1 => config.mapping.max_model_work.projected_logits -= 1,
+            2 => config.mapping.max_model_work.attention_pairs -= 1,
+            3 => config.mapping.max_model_work.projections.dot_products -= 1,
+            4 => config.mapping.max_model_work.projections.multiply_accumulates -= 1,
+            _ => config.mapping.max_mask_visits -= 1,
+        }
+        assert_eq!(question_preflight(SOURCE, &planner, &config, 32, &mut continuing()),
+            Err(CandidateError::Planning));
+    }
+    config.mapping.max_model_work = expected.planned_work();
+    config.mapping.max_mask_visits = expected.reserved_mask_visits();
+    assert_eq!(question_preflight(SOURCE, &planner, &config, 32, &mut continuing()).unwrap(), expected);
+}
+
+#[test]
+fn document_qa_refuses_empty_source_and_preserves_typed_cancellation() {
+    let (planner, config, _) = question_fixture(32);
+    assert_eq!(question_preflight("", &planner, &config, 32, &mut continuing()), Err(CandidateError::Input));
+    assert!(question_preflight(" \t\r\n", &planner, &config, 32, &mut continuing()).is_err());
+    let mut complete = continuing();
+    question_preflight(SOURCE, &planner, &config, 32, &mut complete).unwrap();
+    for stop_at in [1, complete.calls] {
+        assert_eq!(question_preflight(SOURCE, &planner, &config, 32,
+            &mut Control { stop_at, ..continuing() }), Err(CandidateError::Execution));
+    }
+    for cause in [DecodeCancellationKind::Deadline, DecodeCancellationKind::Timeout] {
+        assert_eq!(question_preflight(SOURCE, &planner, &config, 32,
+            &mut Control { calls: 0, stop_at: 1, cause }), Err(CandidateError::Timeout));
+    }
+}
+
+#[test]
+fn qa_host_workspace_prices_both_original_passage_and_lifted_document_evidence() {
+    let (_, config, limits) = question_fixture(128);
+    for chunks in [1, config.mapping.chunks.max_chunks] {
+        assert_eq!(config.question_workspace_bytes(chunks).unwrap(), question::workspace_bytes(
+            config.budget, config.mapping, chunks, config.reduction_reserve_bytes,
+            config.task.verification).unwrap());
+        assert!(config.question_workspace_bytes(chunks).unwrap() > config.workspace_bytes(chunks).unwrap());
+    }
+    assert_eq!(config.question_workspace_bytes(config.mapping.chunks.max_chunks).unwrap(), limits.workspace_bytes);
+}
+
+#[test]
+fn document_qa_publication_exports_neither_private_question_nor_question_path() {
+    let output = serde_json::json!({"fixture_only":true,"source_span":{"byte_start":0,"byte_end":23,
+        "scalar_start":0,"scalar_end":19},"chunks":[{"chunk_id":0,"answer":"上海",
+        "evidence":[{"byte_start":7,"byte_end":13,"scalar_start":7,"scalar_end":9}]}]});
+    let provenance = Provenance { protocol: "fnlp-candidate-int4-document-qa-v1", schema_version: 1,
+        scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "answer",
+        model_id: "Nanbeige4.2-3B", source_revision: "fixture", source_root_sha256: "fixture-source",
+        model_content_sha256: "fixture-model", candidate_format: INT4_SOURCE_FORMAT,
+        quant_recipe: "fixture:group=32", group_width: 32, integer_kernel: "s_scalar_i32", snapshot: None };
+    let response = Response { provenance: &provenance, output: &output };
+    let mut bytes = Vec::new(); publish(&response, 4096, &mut bytes).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["protocol"], "fnlp-candidate-int4-document-qa-v1");
+    assert_eq!(value["output"], output);
+    for absent in ["question", "question_path", "options", "source_dir", "source_manifest", "prompt_digest"] {
+        assert!(value.get(absent).is_none());
+    }
+    let mut refused = Vec::new();
+    assert_eq!(publish(&response, 1, &mut refused), Err(CandidateError::Output));
+    assert!(refused.is_empty());
+}

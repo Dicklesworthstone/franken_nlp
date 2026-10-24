@@ -2,7 +2,7 @@ use super::*;
 
 pub(super) fn command(kind: Kind, extra: &[&str]) -> Int4Command {
     let name = match kind { Kind::Ner => "ner-map", Kind::Keyphrases => "keyphrases-map",
-        Kind::Summarize => "summarize-map", Kind::Answer => panic!("QA has no map CLI") };
+        Kind::Summarize => "summarize-map", Kind::Answer => "answer-map" };
     let mut argv = vec!["candidate", "source-int4", name, "--source-dir", "explicit-source",
         "--source-manifest", "explicit-manifest.json", "--memory-mib", "8192"];
     argv.extend_from_slice(extra);

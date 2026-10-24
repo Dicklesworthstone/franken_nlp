@@ -524,9 +524,67 @@ The library surfaces are `SourceTaskPlanner::plan_int4_with_control`,
 the actual model/group partition and task-specific prompt, grammar and policy
 digests. This addition covers bounded single-context tasks and ordered
 item-local streams. Their opt-in durable jobs and the complete-document NER,
-keyphrase and cited-summary routes are described below. Passage QA remains
-explicitly passage-based. Build verification, model-present correctness and
+keyphrase, cited-summary and question-answering routes are described below.
+Build verification, model-present correctness and
 quality qualification remain pending gates.
+
+## Implemented candidate INT4 complete-document question answering
+
+`fnlp candidate source-int4 answer-map` asks **one exact question of every
+nonblank chunk of one complete UTF-8 document**. The question comes from the
+private `--question FILE` (at most 64 KiB); document input may be a file or
+`-` for stdin. Question and document bytes are retained without normalization.
+The pinned tokenizer, trusted template, actual question and complete typed
+answer options determine each chunk's available context. All chunks and their
+combined native work preflight before the first forward.
+
+For example, use an independently pinned local candidate snapshot:
+
+```bash
+fnlp candidate source-int4 answer-map report.txt \
+  --question question.txt \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --memory-mib 8192 --group-width 128
+```
+
+The same command accepts `--source-dir DIR --source-manifest FILE` for explicit
+source conversion. Optional `--save-snapshot NEW_FILE` persists the loaded
+model only after complete-document preflight. A saved model remains a complete
+candidate snapshot even if later question execution fails.
+
+The result preserves every chunk in original order: native answers, explicit
+uncalibrated model abstentions, and whitespace-only chunks. Each citation keeps
+every compatible occurrence within its contributing chunk, lifted to original
+document byte and Unicode-scalar coordinates. Different answers remain visible;
+there is no majority vote, selected global answer, retrieval, or cross-chunk
+neural synthesis. Citation checks establish source membership, not semantic
+entailment. A decoding failure, cancellation or exhausted budget returns no
+document result and never becomes an abstention. Empty or wholly whitespace
+documents are refused.
+
+`--options FILE` supplies the complete per-chunk `AnswerOptions` object:
+
+```json
+{"max_answer_scalars":2048,"max_citations":8,"max_quote_scalars":256}
+```
+
+The independent complete-document citation budget uses `--max-qa-citations`
+(default 4096), `--max-qa-evidence-spans` (16384), and `--max-qa-scan-steps`
+(67108864). These limits never renew for another chunk. Existing map limits
+also bound all five native work axes, cumulative mask visits, source fields,
+chunk count and full-result bytes. Admission prices both preparation owners,
+full KV, original-passage and lifted evidence, reduction, and publication.
+The guarded output survives bounded staging, writing and flushing of one
+`fnlp-candidate-int4-document-qa-v1` JSON response; question text and paths are
+not included in public provenance. Source parsing and blocking IO observe the
+end-to-end deadline cooperatively.
+
+Library callers use `SourceTaskPlanner::preflight_int4_question_with_control`,
+`SourceTaskPlanner::plan_int4_question_with_control`, and
+`NlpEngine::answer_int4_document` with `Int4SourceMapConfig<SourceQuestion>`.
+This is a candidate feature; compilation, model-present correctness and
+quality qualification remain pending controller-selected gates.
 
 ## Implemented candidate INT4 whole-document source tasks
 

@@ -1,15 +1,32 @@
-//! Whole-source preflight followed by one guarded native map or summary.
+//! Whole-source preflight followed by one guarded native map, summary or QA.
 use super::*;
 use std::{sync::Arc, time::{Duration, Instant}};
 use crate::{
     NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
+    execution_identity::ExecutionIdentity,
     hosted::{CancellationToken, HostedError, Int4HostError, Int4SourceMapConfig, NativeLimits, RunLimits},
     native_engine::{decode::{DecodeCancellationKind, DecodeStepControl},
         strict_int4::weights::snapshot::INT4_SNAPSHOT_VERSION},
     tasks::{ir::PlanContext, source_planning::{SourceTaskPlanner,
-        grouped_int4::long::{Int4SourceMapError, Int4SourceMapPreflight}}},
+        grouped_int4::long::{Int4SourceMapError, Int4SourceMapPreflight,
+            question::{SourceQuestion, Int4QuestionPreflight}}}},
 };
 
+enum Request { Map(SourceMapTask), Question(SourceQuestion) }
+enum Prepared {
+    Map(Int4SourceMapConfig, Int4SourceMapPreflight),
+    Question(Int4SourceMapConfig<SourceQuestion>, Int4QuestionPreflight),
+}
+fn configuration<T>(identity: ExecutionIdentity, task: T, args: &Int4Args,
+    options: &MapArgs, limits: MapLimits, elapsed: Duration) -> Int4SourceMapConfig<T> {
+    Int4SourceMapConfig { identity, task, budget: options.source.budget(args, limits.common),
+        planning: options.source.planning(args), mapping: limits.mapping,
+        native: NativeLimits { context_tokens: args.context_tokens, allocator_reserve_bytes: ALLOCATOR_BYTES,
+            run: RunLimits { max_elapsed: elapsed, max_checkpoints: args.max_checkpoints,
+                cleanup_reserve_bytes: CLEANUP_BYTES } },
+        preparation_reserve_bytes: limits.common.preparation_bytes,
+        reduction_reserve_bytes: limits.reduction_reserve_bytes }
+}
 struct DeadlineControl { started: Instant, deadline: Duration }
 impl DecodeStepControl for DeadlineControl {
     fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
@@ -27,6 +44,14 @@ fn preflight(source: &str, planner: &SourceTaskPlanner, config: &Int4SourceMapCo
     // Only bounded geometry/work metadata survives. The host replans the same
     // original document under its own charge before native work can start.
     Ok(prepared.preflight_metadata())
+}
+fn question_preflight(source: &str, planner: &SourceTaskPlanner,
+    config: &Int4SourceMapConfig<SourceQuestion>, width: usize, control: &mut impl DecodeStepControl)
+    -> Result<Int4QuestionPreflight, CandidateError> {
+    if source.is_empty() { return Err(CandidateError::Input); }
+    let context = PlanContext::new(&config.identity, config.budget).map_err(|_| CandidateError::Planning)?;
+    planner.preflight_int4_question_with_control(source, &config.task, config.budget, &context,
+        config.planning, config.mapping, width, control).map_err(planning_error)
 }
 fn cancelled(cause: DecodeCancellationKind) -> CandidateError {
     match cause {
@@ -79,7 +104,16 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
             .map_err(|_| CandidateError::Input)?, args.max_input_bytes)? };
     remaining()?;
     let budget = options.source.budget(&args, common);
-    let (text, task) = options.request(text, option_json.as_deref(), budget, args.max_input_bytes)?;
+    let (text, task) = if let Some(question) = &options.question {
+        if text.trim().is_empty() { return Err(CandidateError::Input); }
+        let question_text = read_input(&mut crate::local_io::open_document(question.path())
+            .map_err(|_| CandidateError::Input)?, question::QUESTION_BYTES)?;
+        remaining()?;
+        (text, Request::Question(question.task(question_text, option_json.as_deref())?))
+    } else {
+        let (text, task) = options.request(text, option_json.as_deref(), budget, args.max_input_bytes)?;
+        (text, Request::Map(task))
+    };
     drop(option_json);
     remaining()?;
     let cancellation = CancellationToken::default();
@@ -87,16 +121,26 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     remaining()?;
     let (planner, vocabulary) = source::planner()?;
     let identity = source::identity(model.model_identity(), &planner, source::task(options.kind))?;
-    let mut config = Int4SourceMapConfig { identity: identity.clone(), task, budget,
-        planning: options.source.planning(&args), mapping: limits.mapping,
-        native: NativeLimits { context_tokens: args.context_tokens, allocator_reserve_bytes: ALLOCATOR_BYTES,
-            run: RunLimits { max_elapsed: remaining()?, max_checkpoints: args.max_checkpoints,
-                cleanup_reserve_bytes: CLEANUP_BYTES } },
-        preparation_reserve_bytes: common.preparation_bytes, reduction_reserve_bytes: limits.reduction_reserve_bytes };
-    if config.workspace_bytes(limits.mapping.chunks.max_chunks).map_err(|_| CandidateError::Memory)?
-        != limits.workspace_bytes { return Err(CandidateError::Memory); }
-    let expected = preflight(&text, &planner, &config, model.model_identity().group_width(),
-        limits.summary, &mut DeadlineControl { started, deadline })?;
+    let prepared = match task {
+        Request::Map(task) => {
+            let config = configuration(identity.clone(), task, &args, &options, limits, remaining()?);
+            if config.workspace_bytes(limits.mapping.chunks.max_chunks).map_err(|_| CandidateError::Memory)?
+                != limits.workspace_bytes { return Err(CandidateError::Memory); }
+            let expected = preflight(&text, &planner, &config, model.model_identity().group_width(),
+                limits.summary, &mut DeadlineControl { started, deadline })?;
+            Prepared::Map(config, expected)
+        }
+        Request::Question(task) => {
+            let config = configuration(identity.clone(), task, &args, &options, limits, remaining()?);
+            if config.question_workspace_bytes(limits.mapping.chunks.max_chunks)
+                .map_err(|_| CandidateError::Memory)? != limits.workspace_bytes {
+                return Err(CandidateError::Memory);
+            }
+            let expected = question_preflight(&text, &planner, &config,
+                model.model_identity().group_width(), &mut DeadlineControl { started, deadline })?;
+            Prepared::Question(config, expected)
+        }
+    };
     remaining()?;
     let mut snapshot = common.snapshot_pin.map(|_| SnapshotRecord::new("loaded", common.snapshot_need));
     if let Some(path) = &args.save_snapshot {
@@ -108,32 +152,46 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         if pin != model.model_identity().snapshot_pin() { return Err(CandidateError::Identity); }
         snapshot = Some(SnapshotRecord::new("saved", common.snapshot_need));
     }
-    config.native.run.max_elapsed = remaining()?;
     let content = identity.logical_model_digest.to_hex();
     let provenance = Provenance {
-        protocol: "fnlp-candidate-int4-source-map-v1", schema_version: 1,
+        protocol: if options.kind == Kind::Answer { "fnlp-candidate-int4-document-qa-v1" }
+            else { "fnlp-candidate-int4-source-map-v1" }, schema_version: 1,
         scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: options.kind.name(),
         model_id: "Nanbeige4.2-3B", source_revision: &identity.source_revision,
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(), snapshot,
     };
-    if let Some(summary) = limits.summary {
-        let result = engine.summarize_int4_source(&model, text, Arc::new(planner), Arc::new(vocabulary),
-            config, summary, common.kernel, cancellation).map_err(execution_error)?;
-        expected.verify_summary_completed(result.result()).map_err(|_| CandidateError::Execution)?;
-        remaining()?;
-        publish(&Response { provenance: &provenance, output: result.result() },
-            limits.max_result_bytes + 4096, output)
-    } else {
-        let result = engine.map_int4_source(&model, text, Arc::new(planner), Arc::new(vocabulary),
-            config, common.kernel, cancellation).map_err(execution_error)?;
-        expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
-        remaining()?;
-        // One complete bounded response; the native output guard survives
-        // staging, write AND flush. No successful prefix is published.
-        publish(&Response { provenance: &provenance, output: result.result() },
-            limits.max_result_bytes + 4096, output)
+    match prepared {
+        Prepared::Map(mut config, expected) => {
+            config.native.run.max_elapsed = remaining()?;
+            if let Some(summary) = limits.summary {
+                let result = engine.summarize_int4_source(&model, text, Arc::new(planner), Arc::new(vocabulary),
+                    config, summary, common.kernel, cancellation).map_err(execution_error)?;
+                expected.verify_summary_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+                remaining()?;
+                publish(&Response { provenance: &provenance, output: result.result() },
+                    limits.max_result_bytes + 4096, output)
+            } else {
+                let result = engine.map_int4_source(&model, text, Arc::new(planner), Arc::new(vocabulary),
+                    config, common.kernel, cancellation).map_err(execution_error)?;
+                expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+                remaining()?;
+                publish(&Response { provenance: &provenance, output: result.result() },
+                    limits.max_result_bytes + 4096, output)
+            }
+        }
+        Prepared::Question(mut config, expected) => {
+            config.native.run.max_elapsed = remaining()?;
+            let result = engine.answer_int4_document(&model, text, Arc::new(planner), Arc::new(vocabulary),
+                config, common.kernel, cancellation).map_err(execution_error)?;
+            expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+            remaining()?;
+            // The hosted output guard survives staging, write AND flush.
+            // Native failure cannot publish a successful prefix or abstention.
+            publish(&Response { provenance: &provenance, output: result.result() },
+                limits.max_result_bytes + 4096, output)
+        }
     }
 }
 #[derive(Serialize)]
