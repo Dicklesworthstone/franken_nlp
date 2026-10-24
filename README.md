@@ -37,6 +37,7 @@
 > [pairwise, rubric and faithfulness judgment](#implemented-candidate-int4-judgment),
 > [verified NER and rule redaction](#implemented-candidate-int4-redaction),
 > [complete-document redaction](#implemented-candidate-int4-complete-document-redaction),
+> [resident redaction corpora](#implemented-candidate-int4-redaction-corpora),
 > single-document extraction, [NER/keyphrases/cited summaries/passage QA](#implemented-candidate-int4-source-tasks),
 > text cohorts/corpora,
 > [ordered extraction batches](#implemented-candidate-int4-extraction-batches),
@@ -763,6 +764,88 @@ Library callers use `Int4DocumentRedactor`, `Int4LongRedactionConfig` and
 planner/vocabulary. Source, admission and receipt fixtures are authored;
 compilation, model-present execution and quality qualification remain pending
 controller-selected gates.
+
+## Implemented candidate INT4 redaction corpora
+
+`fnlp candidate source-int4 redact-corpus` streams ordered documents through
+one resident grouped-INT4 model, native allocation, fixed detector policy and
+pseudonym scope. Each record uses the complete-document redactor, so both
+single-context and longer documents follow the same checked path. This route
+requires `asupersync-runtime`.
+
+For example, `documents.ndjson` can contain:
+
+```jsonl
+{"id":"first","text":"Contact alice@example.org about the request."}
+{"flush":true}
+{"id":"second","text":"Contact bob@example.org about the follow-up.","task_args":{}}
+```
+
+```bash
+fnlp candidate source-int4 redact-corpus documents.ndjson \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$EXPECTED_MODEL_SHA256" \
+  --memory-mib 8192 \
+  --max-requests 1000 \
+  --max-total-input-bytes 67108864 \
+  --max-total-output-bytes 67108864
+```
+
+Document actions, NER types, selected rules, maps, chunking and verification
+are chosen once with the same flags as `redact-document`.
+`task_args` must be absent, null or an empty object; a record cannot change
+the action, key, namespace, entity types, work policy or verification mode.
+Fresh transformed-text NER and whole-source rule verification remain the
+default. Full256 pseudonymization reads one binary key from inherited stdin
+with a separate corpus file, and checks its expected commitment before
+opening or reading the corpus. Flush controls never replace that key scope.
+
+`--max-input-bytes` bounds each decoded original document, while
+`--max-line-bytes` bounds the complete JSON envelope before LF, including
+escaping and a trailing CR. The default line ceiling is 4 MiB. Total input
+counts blank and oversized records as well. `--max-requests` counts nonempty
+records, including malformed records and explicit flush controls.
+Caller IDs are output metadata; duplicate IDs are rejected within one epoch.
+
+The complete per-document five-axis and mask envelope is debited before
+native execution. Admitted failures do not refund that authority.
+`--max-corpus-forward-positions`, `--max-corpus-projected-logits`,
+`--max-corpus-attention-pairs`, `--max-corpus-dot-products`,
+`--max-corpus-multiply-accumulates` and `--max-corpus-mask-node-visits`
+can tighten the ceilings derived from the item envelope and request count.
+Those whole-stream counters and the hosted deadline/checkpoint allowance
+never renew per document or flush. Each document also keeps its complete
+original/transformed work and two verification-pool bounds.
+
+The host owns the incremental reader, writer, planner, key and native engine
+through physical cleanup. It retains full KV and map/edit workspace, with
+explicit transport buffers, duplicate-ID storage, both preparation lifetimes
+and guarded per-document results. It does not collect the corpus or create a
+new runtime/model for every record.
+
+Every completed event is wrapped with
+`protocol: "fnlp-candidate-int4-redact-corpus-v1"` and actual model/group/kernel
+provenance; the native event remains under `record`. Completed results contain
+only final edited text, public policy, optional coordinate maps and bounded
+receipts. Original text, private prompts, raw keys, namespace and local paths
+do not enter provenance. Failed rows export fixed errors without rejected
+transformed text.
+
+Require **`run_complete` and exit status 0** for whole-run success.
+Earlier completed records remain valid if a later record fails; any failed
+record produces a nonzero exit. Writer failure poisons the stream, so the
+command does not retry an uncertain event or append another terminal record.
+A flush acknowledges the local writer and does not imply durable retention.
+This route has no resume or retained-job mode.
+
+Source conversion and independently pinned snapshots share the same path.
+Source-route `--save-snapshot NEW_FILE` follows fixed-policy/model admission;
+each streamed original document is then fully preflighted before its native
+work, and its transformed partition is planned freshly. Library callers use
+`NativeInt4DocumentRedactionBatch`, `Int4DocumentRedactionBatchConfig` and
+`NlpEngine::batch_int4_redact_documents` with owned reader/writer handles.
+Source and resource fixtures are authored; compilation, model-present
+execution and quality qualification remain pending controller-selected gates.
 
 ## Implemented candidate INT4 source tasks
 

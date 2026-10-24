@@ -112,6 +112,7 @@ enum Int4Task {
     Judge(judge::JudgeArgs),
     Redact(redact::RedactArgs),
     RedactDocument(redact::long::DocumentArgs),
+    RedactCorpus(redact::long::corpus::CorpusArgs),
     Source(crate::candidate_cli::source::Kind, source::SourceArgs),
     SourceBatch(source_batch::BatchArgs),
     SourceMap(source_map::MapArgs),
@@ -154,6 +155,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(judge::definition())
         .subcommand(redact::definition())
         .subcommand(redact::long::definition())
+        .subcommand(redact::long::corpus::definition())
         .subcommand(extract::definition())
         .subcommand(extract_batch::definition())
         .subcommand(extract_job::definition())
@@ -195,6 +197,7 @@ impl Int4Command {
             "judge" => Int4Task::Judge(judge::JudgeArgs::from_matches(matches)?),
             "redact" => Int4Task::Redact(redact::RedactArgs::from_matches(matches)?),
             "redact-document" => Int4Task::RedactDocument(redact::long::DocumentArgs::from_matches(matches)?),
+            "redact-corpus" => Int4Task::RedactCorpus(redact::long::corpus::CorpusArgs::from_matches(matches)?),
             "extract" => Int4Task::Extract(extract::ExtractionArgs::from_matches(matches)?),
             "extract-batch" => Int4Task::ExtractBatch(extract_batch::BatchArgs::from_matches(matches)?),
             "extract-map" => Int4Task::ExtractMap(extract_map::MapArgs::from_matches(matches)?),
@@ -228,6 +231,8 @@ impl Int4Command {
             Self { task: Int4Task::ExtractBatch(options), args, batch: None, job: None } =>
                 options.execute_owned(args, input, output),
             Self { task: Int4Task::SourceBatch(options), args, batch: None, job: None } =>
+                options.execute_owned(args, input, output),
+            Self { task: Int4Task::RedactCorpus(options), args, batch: None, job: None } =>
                 options.execute_owned(args, input, output),
             command => command.execute(&mut input, &mut output),
         };
@@ -271,7 +276,7 @@ impl Int4Command {
             Int4Task::Extract(extraction) => extraction.validate(&self.args)?,
             Int4Task::Source(_, source) => source.validate(&self.args)?,
             // The blocking stream must own its input and writer through cleanup.
-            Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::Sentiment(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
+            Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::Sentiment(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
                 | Int4Task::ExtractJob | Int4Task::SourceJob => return Err(CandidateError::Arguments),
         };
         #[cfg(feature = "asupersync-runtime")]

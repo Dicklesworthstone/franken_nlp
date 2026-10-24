@@ -1,5 +1,6 @@
 //! Complete-document INT4 redaction with independent original/transformed maps.
 use super::*;
+pub(in crate::candidate_cli::int4) mod corpus;
 use crate::{
     native_engine::{lmhead::NANBEIGE_VOCAB_SIZE, portable_int8::ProjectionWork, strict_int4::Int4Work},
     tasks::{ir::TaskBudget, mapreduce::{ChunkLimits, ExecutionLimits}, ner::NerOptions,
