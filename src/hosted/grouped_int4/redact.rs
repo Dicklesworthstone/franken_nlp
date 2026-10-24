@@ -1,5 +1,6 @@
 //! One owned native INT4 redaction invocation, including fresh verification.
 use super::*;
+mod long;
 use crate::{
     native_engine::{constrained_int4, strict_int4::{Int4Work, STRICT_INT4_PROFILE}},
     tasks::{extract::ExtractionVocabulary, ner::NER_TASK_VERSION, source_planning::SourceTaskPlanner,
@@ -8,11 +9,11 @@ use crate::{
                 Int4RedactionError, Int4RedactionRun, INT4_REDACTION_EXECUTION}}},
 };
 
-struct RedactInput {
+struct RedactInput<D = Int4RedactionConfig> {
     source: String,
     planner: Arc<SourceTaskPlanner>,
     vocabulary: Arc<ExtractionVocabulary>,
-    config: RedactConfig<Int4RedactionConfig>,
+    config: RedactConfig<D>,
     pseudonyms: Option<RedactionPseudonyms>,
 }
 impl NlpEngine {
@@ -132,7 +133,7 @@ fn requirements(config: &RedactConfig<Int4RedactionConfig>, source_bytes: usize,
     }
     Ok(required)
 }
-fn input_bytes(source: &String, config: &RedactConfig<Int4RedactionConfig>,
+fn input_bytes<D>(source: &String, config: &RedactConfig<D>,
     secret: Option<&RedactionPseudonyms>) -> Result<u64, HostedError> {
     let secret_bytes = if let Some(secret) = secret {
         if secret.namespace.is_empty() || secret.namespace.len() > 256 {
@@ -156,3 +157,4 @@ fn within(a: Int4Work, b: Int4Work) -> bool {
 
 #[cfg(test)]
 mod tests;
+
