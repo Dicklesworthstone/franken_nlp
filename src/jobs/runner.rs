@@ -14,6 +14,7 @@ pub mod source;
 pub mod extract;
 pub mod scored;
 pub mod generation;
+pub mod redact;
 
 pub const OWNED_BATCH_PROTOCOL: &str = "fnlp-owned-batch-v1";
 
