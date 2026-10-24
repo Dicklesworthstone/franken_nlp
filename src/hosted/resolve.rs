@@ -151,7 +151,7 @@ fn allocation_bytes(capacity: usize, element: usize) -> Result<u64, HostedError>
 }
 /// Price actual Vec/String CAPACITY, including empty spare capacity and nested
 /// mention vectors. Logical input limits remain independent of allocation size.
-fn input_payload(documents: &Vec<ResolutionDocument>, limits: ResolveLimits) -> Result<u64, HostedError> {
+pub(super) fn input_payload(documents: &Vec<ResolutionDocument>, limits: ResolveLimits) -> Result<u64, HostedError> {
     if documents.len() > limits.max_documents || documents.len() > 65_536 {
         return Err(HostedError::Limits("resolution document count"));
     }
