@@ -12,6 +12,8 @@ use crate::tasks::{
 
 mod planning;
 mod execution;
+/// Opt-in native answer synthesis using verified verbatim passage evidence.
+pub mod synthesis;
 
 pub const INT4_QUESTION_EXECUTION: &str = "grouped-int4-question-independent-passages-v1";
 const QUESTION_SEMANTICS: &str = "independent-passage-answers-no-global-selection-v1";
