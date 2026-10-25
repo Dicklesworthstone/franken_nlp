@@ -444,3 +444,158 @@ fn synthesized_summary_publication_has_its_own_protocol_and_no_private_inputs() 
     assert_eq!(publish(&response, 1, &mut refused), Err(CandidateError::Output));
     assert!(refused.is_empty());
 }
+
+fn question_synthesis_fixture(width: usize) -> (SourceTaskPlanner, Int4SourceMapConfig<SourceQuestionSynthesis>) {
+    let (planner, config, _) = question_fixture(width);
+    let request = SourceQuestionSynthesis { question: config.task,
+        limits: crate::tasks::source_planning::grouped_int4::long::question::synthesis::QuestionSynthesisLimits {
+            max_evidence_passages: 32, max_evidence_bytes: 16384 } };
+    (planner, Int4SourceMapConfig { identity: config.identity, task: request, budget: config.budget,
+        planning: config.planning, mapping: config.mapping, native: config.native,
+        preparation_reserve_bytes: config.preparation_reserve_bytes,
+        reduction_reserve_bytes: config.reduction_reserve_bytes })
+}
+
+#[test]
+fn answer_synthesis_preflight_keeps_the_complete_question_population_and_final_reserve() {
+    let (planner, config) = question_synthesis_fixture(32);
+    let expected = question_synthesis_preflight(SOURCE, &planner, &config, 32, &mut continuing()).unwrap();
+    let discovery = expected.discovery();
+    assert!(discovery.chunk_count() > 1);
+    assert_eq!(discovery.source_span().byte_end, SOURCE.len());
+    assert_eq!(discovery.source_span().scalar_end, SOURCE.chars().count());
+    assert_eq!(discovery.group_width(), 32);
+    assert!(discovery.native_chunks() > 0);
+    let final_pass = expected.synthesis_reserved_work();
+    let total = expected.reserved_model_work().unwrap();
+    let maps = discovery.planned_work();
+    assert_eq!(total.forward_positions, maps.forward_positions + final_pass.forward_positions);
+    assert_eq!(total.projected_logits, maps.projected_logits + final_pass.projected_logits);
+    assert_eq!(total.attention_pairs, maps.attention_pairs + final_pass.attention_pairs);
+    assert_eq!(total.projections.dot_products, maps.projections.dot_products + final_pass.projections.dot_products);
+    assert_eq!(total.projections.multiply_accumulates,
+        maps.projections.multiply_accumulates + final_pass.projections.multiply_accumulates);
+    assert_eq!(expected.reserved_mask_visits().unwrap(),
+        discovery.reserved_mask_visits() + config.mapping.mask_visits_per_chunk);
+    assert_eq!(question_synthesis_preflight(SOURCE, &planner, &config, 32, &mut continuing()).unwrap(), expected);
+}
+
+#[test]
+fn complete_qa_and_final_answer_cannot_each_spend_the_full_work_ceiling() {
+    let (planner, mut config) = question_synthesis_fixture(32);
+    let expected = question_synthesis_preflight(SOURCE, &planner, &config, 32, &mut continuing()).unwrap();
+    let work = expected.reserved_model_work().unwrap();
+    let masks = expected.reserved_mask_visits().unwrap();
+    for axis in 0..6 {
+        config.mapping.max_model_work = work;
+        config.mapping.max_mask_visits = masks;
+        match axis {
+            0 => config.mapping.max_model_work.forward_positions -= 1,
+            1 => config.mapping.max_model_work.projected_logits -= 1,
+            2 => config.mapping.max_model_work.attention_pairs -= 1,
+            3 => config.mapping.max_model_work.projections.dot_products -= 1,
+            4 => config.mapping.max_model_work.projections.multiply_accumulates -= 1,
+            _ => config.mapping.max_mask_visits -= 1,
+        }
+        assert_eq!(question_synthesis_preflight(SOURCE, &planner, &config, 32, &mut continuing()),
+            Err(CandidateError::Planning));
+    }
+    config.mapping.max_model_work = work;
+    config.mapping.max_mask_visits = masks;
+    assert_eq!(question_synthesis_preflight(SOURCE, &planner, &config, 32, &mut continuing()).unwrap(), expected);
+}
+
+#[test]
+fn question_synthesis_group_work_and_host_workspace_use_exact_finite_quotes() {
+    let mut previous = None;
+    for width in [16, 32, 128] {
+        let (planner, config) = question_synthesis_fixture(width);
+        let expected = question_synthesis_preflight(SOURCE, &planner, &config, width, &mut continuing()).unwrap();
+        let final_pass = expected.synthesis_reserved_work();
+        if let Some(old) = previous {
+            let old: Int4Work = old;
+            assert!(old.projections.dot_products > final_pass.projections.dot_products);
+            assert_eq!(old.projections.multiply_accumulates, final_pass.projections.multiply_accumulates);
+            assert_eq!(old.forward_positions, final_pass.forward_positions);
+        }
+        previous = Some(final_pass);
+        for chunks in [1, config.mapping.chunks.max_chunks] {
+            assert_eq!(config.question_synthesis_workspace_bytes(chunks).unwrap(),
+                question::synthesis::workspace_bytes(config.budget, config.mapping, chunks,
+                    config.reduction_reserve_bytes, config.task.question.verification, config.task.limits).unwrap());
+            assert!(config.question_synthesis_workspace_bytes(chunks).unwrap() > config.workspace_bytes(chunks).unwrap());
+        }
+    }
+}
+
+#[test]
+fn question_synthesis_empty_input_overflow_and_cancellation_never_become_abstention() {
+    let (planner, mut config) = question_synthesis_fixture(32);
+    assert_eq!(question_synthesis_preflight("", &planner, &config, 32, &mut continuing()), Err(CandidateError::Input));
+    config.mapping.chunks.max_chunks = 1;
+    assert_eq!(question_synthesis_preflight(SOURCE, &planner, &config, 32, &mut continuing()), Err(CandidateError::Planning));
+    config.mapping.chunks.max_chunks = 64;
+    for (cause, error) in [(DecodeCancellationKind::Deadline, CandidateError::Timeout),
+        (DecodeCancellationKind::Timeout, CandidateError::Timeout),
+        (DecodeCancellationKind::PollQuota, CandidateError::Execution),
+        (DecodeCancellationKind::ResourceUnavailable, CandidateError::Execution)] {
+        let mut control = Control { calls: 0, stop_at: 1, cause };
+        assert_eq!(question_synthesis_preflight(SOURCE, &planner, &config, 32, &mut control), Err(error));
+    }
+}
+
+#[test]
+fn synthesized_answer_protocol_stages_complete_output_without_private_question_or_paths() {
+    let output = serde_json::json!({"fixture_only":true,"synthesis":{"status":"answered","answer":"上海",
+        "citations":[{"quote":"上海","spans":[{"byte_start":4,"byte_end":10,
+            "scalar_start":3,"scalar_end":5}]}]},"calibration":"uncalibrated"});
+    let provenance = Provenance { protocol: "fnlp-candidate-int4-answer-synthesis-v1", schema_version: 1,
+        scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "answer",
+        model_id: "Nanbeige4.2-3B", source_revision: "fixture", source_root_sha256: "fixture-source",
+        model_content_sha256: "fixture-model", candidate_format: INT4_SOURCE_FORMAT,
+        quant_recipe: "fixture:group=32", group_width: 32, integer_kernel: "s_scalar_i32", snapshot: None };
+    let response = Response { provenance: &provenance, output: &output };
+    let mut bytes = Vec::new(); publish(&response, 4096, &mut bytes).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["protocol"], "fnlp-candidate-int4-answer-synthesis-v1");
+    assert_eq!(value["output"], output);
+    for absent in ["question", "question_path", "source", "options", "source_dir", "source_manifest", "prompt_digest"] {
+        assert!(value.get(absent).is_none());
+    }
+    let mut refused = Vec::new();
+    assert_eq!(publish(&response, 1, &mut refused), Err(CandidateError::Output));
+    assert!(refused.is_empty());
+}
+
+#[test]
+fn expanded_answer_evidence_cap_reaches_cli_preflight_host_and_actual_source_planner() {
+    let (planner, base) = question_synthesis_fixture(32);
+    let mut command = super::super::tests::command(Kind::Answer,
+        &["--question", "q", "--synthesize-answer", "--max-synthesis-passages", "128",
+            "--max-new-tokens", "16", "--group-width", "32"]);
+    // The explicit population cap is 128; this 64-passage source exceeds the
+    // old 32 limit while fitting the native 8192-context admission ceiling.
+    // The canonical manifest itself consumes byte-before-token authority.
+    command.args.context_tokens = 8192;
+    command.args.memory_mib = 16384;
+    let Int4Task::SourceMap(options) = command.task else { panic!("wrong task"); };
+    let limits = options.validate(&command.args).unwrap();
+    let question = options.question.as_ref().unwrap();
+    let task = question.synthesis_request(question.task("What happened?".to_owned(), None).unwrap(),
+        options.planning(&command.args)).unwrap();
+    let config = configuration(base.identity, task, &command.args, &options, limits, Duration::from_secs(1));
+    assert_eq!(config.planning.max_passages, 128);
+    assert_eq!(config.task.limits.max_evidence_passages, 128);
+    assert_eq!(config.question_synthesis_workspace_bytes(config.mapping.chunks.max_chunks).unwrap(), limits.workspace_bytes);
+    question_synthesis_preflight(SOURCE, &planner, &config, 32, &mut continuing()).unwrap();
+    let passages = (0..64).map(|index| crate::tasks::answer::AnswerPassage {
+        id: format!("e{index}"), text: "fact".to_owned(),
+    }).collect();
+    let request = SourceTaskRequest::Answer { question: "What happened?".to_owned(), passages,
+        options: config.task.question.options, budget: config.budget };
+    let context = PlanContext::new(&config.identity, config.budget).unwrap();
+    let prepared = planner.plan_int4_with_control(&request, &context, config.planning, 32, &mut continuing()).unwrap();
+    assert_eq!(prepared.group_width(), 32);
+    let mut ordinary = config.planning; ordinary.max_passages = shared::MAX_PASSAGES;
+    assert!(planner.plan_int4_with_control(&request, &context, ordinary, 32, &mut continuing()).is_err());
+}

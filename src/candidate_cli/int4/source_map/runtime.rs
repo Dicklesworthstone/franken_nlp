@@ -9,20 +9,25 @@ use crate::{
         strict_int4::weights::snapshot::INT4_SNAPSHOT_VERSION},
     tasks::{ir::PlanContext, source_planning::{SourceTaskPlanner,
         grouped_int4::long::{Int4SourceMapError, Int4SourceMapPreflight,
-            question::{SourceQuestion, Int4QuestionPreflight},
+            question::{SourceQuestion, Int4QuestionPreflight,
+                synthesis::{SourceQuestionSynthesis, Int4QuestionSynthesisPreflight}},
             summary::synthesis::{SourceSummarySynthesis, Int4SummarySynthesisPreflight}}}},
 };
 
-enum Request { Map(SourceMapTask), Question(SourceQuestion), SummarySynthesis(SourceSummarySynthesis) }
+enum Request {
+    Map(SourceMapTask), Question(SourceQuestion), SummarySynthesis(SourceSummarySynthesis),
+    QuestionSynthesis(SourceQuestionSynthesis),
+}
 enum Prepared {
     Map(Int4SourceMapConfig, Int4SourceMapPreflight),
     Question(Int4SourceMapConfig<SourceQuestion>, Int4QuestionPreflight),
     SummarySynthesis(Int4SourceMapConfig<SourceSummarySynthesis>, Int4SummarySynthesisPreflight),
+    QuestionSynthesis(Int4SourceMapConfig<SourceQuestionSynthesis>, Int4QuestionSynthesisPreflight),
 }
 fn configuration<T>(identity: ExecutionIdentity, task: T, args: &Int4Args,
     options: &MapArgs, limits: MapLimits, elapsed: Duration) -> Int4SourceMapConfig<T> {
     Int4SourceMapConfig { identity, task, budget: options.source.budget(args, limits.common),
-        planning: options.source.planning(args), mapping: limits.mapping,
+        planning: options.planning(args), mapping: limits.mapping,
         native: NativeLimits { context_tokens: args.context_tokens, allocator_reserve_bytes: ALLOCATOR_BYTES,
             run: RunLimits { max_elapsed: elapsed, max_checkpoints: args.max_checkpoints,
                 cleanup_reserve_bytes: CLEANUP_BYTES } },
@@ -65,6 +70,14 @@ fn summary_synthesis_preflight(source: &str, planner: &SourceTaskPlanner,
     // Every real map and the maximum-context final pass are reserved together.
     // The generated quote document is checked separately once it exists.
     Ok(prepared.preflight_metadata())
+}
+fn question_synthesis_preflight(source: &str, planner: &SourceTaskPlanner,
+    config: &Int4SourceMapConfig<SourceQuestionSynthesis>, width: usize, control: &mut impl DecodeStepControl)
+    -> Result<Int4QuestionSynthesisPreflight, CandidateError> {
+    if source.is_empty() { return Err(CandidateError::Input); }
+    let context = PlanContext::new(&config.identity, config.budget).map_err(|_| CandidateError::Planning)?;
+    planner.preflight_int4_question_synthesis_with_control(source, &config.task, config.budget,
+        &context, config.planning, config.mapping, width, control).map_err(planning_error)
 }
 fn cancelled(cause: DecodeCancellationKind) -> CandidateError {
     match cause {
@@ -122,12 +135,16 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         let question_text = read_input(&mut crate::local_io::open_document(question.path())
             .map_err(|_| CandidateError::Input)?, question::QUESTION_BYTES)?;
         remaining()?;
-        (text, Request::Question(question.task(question_text, option_json.as_deref())?))
+        let task = question.task(question_text, option_json.as_deref())?;
+        let task = if limits.question_synthesis.is_some() {
+            Request::QuestionSynthesis(question.synthesis_request(task, options.planning(&args))?)
+        } else { Request::Question(task) };
+        (text, task)
     } else {
         let (text, task) = options.request(text, option_json.as_deref(), budget, args.max_input_bytes)?;
         let task = match (options.summary, task) {
             (Some(summary), SourceMapTask::Summarize(map_options)) if summary.synthesis.synthesize_summary =>
-                Request::SummarySynthesis(summary.synthesis.request(map_options, options.source.planning(&args))?),
+                Request::SummarySynthesis(summary.synthesis.request(map_options, options.planning(&args))?),
             (_, task) => Request::Map(task),
         };
         (text, task)
@@ -168,6 +185,16 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
                 model.model_identity().group_width(), &mut DeadlineControl { started, deadline })?;
             Prepared::SummarySynthesis(config, expected)
         }
+        Request::QuestionSynthesis(task) => {
+            let config = configuration(identity.clone(), task, &args, &options, limits, remaining()?);
+            if config.question_synthesis_workspace_bytes(limits.mapping.chunks.max_chunks)
+                .map_err(|_| CandidateError::Memory)? != limits.workspace_bytes {
+                return Err(CandidateError::Memory);
+            }
+            let expected = question_synthesis_preflight(&text, &planner, &config,
+                model.model_identity().group_width(), &mut DeadlineControl { started, deadline })?;
+            Prepared::QuestionSynthesis(config, expected)
+        }
     };
     remaining()?;
     let mut snapshot = common.snapshot_pin.map(|_| SnapshotRecord::new("loaded", common.snapshot_need));
@@ -183,7 +210,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     }
     let content = identity.logical_model_digest.to_hex();
     let provenance = Provenance {
-        protocol: if options.kind == Kind::Answer { "fnlp-candidate-int4-document-qa-v1" }
+        protocol: if limits.question_synthesis.is_some() { "fnlp-candidate-int4-answer-synthesis-v1" }
+            else if options.kind == Kind::Answer { "fnlp-candidate-int4-document-qa-v1" }
             else if limits.synthesis.is_some() { "fnlp-candidate-int4-summary-synthesis-v1" }
             else { "fnlp-candidate-int4-source-map-v1" }, schema_version: 1,
         scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: options.kind.name(),
@@ -225,6 +253,15 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         Prepared::SummarySynthesis(mut config, expected) => {
             config.native.run.max_elapsed = remaining()?;
             let result = engine.synthesize_int4_source_summary(&model, text, Arc::new(planner), Arc::new(vocabulary),
+                config, common.kernel, cancellation).map_err(execution_error)?;
+            expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+            remaining()?;
+            publish(&Response { provenance: &provenance, output: result.result() },
+                limits.max_result_bytes + 4096, output)
+        }
+        Prepared::QuestionSynthesis(mut config, expected) => {
+            config.native.run.max_elapsed = remaining()?;
+            let result = engine.synthesize_int4_document_answer(&model, text, Arc::new(planner), Arc::new(vocabulary),
                 config, common.kernel, cancellation).map_err(execution_error)?;
             expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
             remaining()?;

@@ -1327,7 +1327,7 @@ source conversion. Optional `--save-snapshot NEW_FILE` persists the loaded
 model only after complete-document preflight. A saved model remains a complete
 candidate snapshot even if later question execution fails.
 
-The result preserves every chunk in original order: native answers, explicit
+The default result preserves every chunk in original order: native answers, explicit
 uncalibrated model abstentions, and whitespace-only chunks. Each citation keeps
 every compatible occurrence within its contributing chunk, lifted to original
 document byte and Unicode-scalar coordinates. Different answers remain visible;
@@ -1359,6 +1359,65 @@ Library callers use `SourceTaskPlanner::preflight_int4_question_with_control`,
 `NlpEngine::answer_int4_document` with `Int4SourceMapConfig<SourceQuestion>`.
 This is a candidate feature; compilation, model-present correctness and
 quality qualification remain pending controller-selected gates.
+
+### INT4 neural answer synthesis
+
+Add `--synthesize-answer` to `answer-map` to request one final native answer
+from **all collected verbatim source evidence**. The original question and
+typed answer options are reused. Generated chunk answers remain visible in
+the completed output but never enter the final prompt as source facts.
+
+```bash
+fnlp candidate source-int4 answer-map report.txt \
+  --question question.txt --synthesize-answer \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --memory-mib 8192 --group-width 128 \
+  --max-synthesis-passages 32 --max-synthesis-evidence-bytes 16384 \
+  --max-total-mask-node-visits 130000000000
+```
+
+The passage cap defaults to 32 and can explicitly rise to 1,024 through
+`--max-synthesis-passages` for larger evidence populations. That cap applies
+only to the synthesis request; ordinary passage QA keeps its existing limit.
+The logical quote-byte cap defaults to
+`min(--max-input-bytes, 16384)`. Every distinct `(chunk, quote)` passage must
+fit both limits, plus the actual question, manifest, token and context
+capacity. There is no top-k quote selection, silent truncation or automatic
+fallback to a subset. The byte cap alone does not ensure context fit.
+Insufficient room produces no document result.
+
+All map passes and the maximum-context final pass are reserved together
+before the first forward on the actual model's five INT4 work axes and the
+same total mask allowance. The `--max-qa-*` citation-verification counters
+span discovery, quote collection and original-coordinate citation lifting;
+they do not renew for synthesis. Memory admission includes all map results,
+quote passages, verifier owners, temporary final decoding and guarded output.
+One hosted invocation retains the same resident model and native allocation.
+
+The completed `fnlp-candidate-int4-answer-synthesis-v1` response keeps every
+chunk answer and adds the final answer, abstention or explicit
+`no_evidence_collected` status. Empty evidence skips the final neural pass;
+a failure never becomes an abstention. Final citations preserve every exact
+original-source occurrence reachable through the collected quotes. Neither
+generated chunk answers nor invented offsets can establish citation authority.
+Work and verification receipts show both discovery and synthesis usage.
+
+Answerability remains `uncalibrated`, citation membership is structural, and
+semantic support remains `not_assessed`. The selected quotes may miss relevant
+context; synthesis does not establish full-document equivalence, recall,
+factual correctness or contradiction resolution. The unchanged default
+`answer-map` behavior still returns independent answers only.
+
+Library callers use
+`SourceTaskPlanner::preflight_int4_question_synthesis_with_control`,
+`SourceTaskPlanner::plan_int4_question_synthesis_with_control` and
+`NlpEngine::synthesize_int4_document_answer` with
+`Int4SourceMapConfig<SourceQuestionSynthesis>`. Both source conversion and
+independently pinned snapshots follow this path. An explicitly requested
+snapshot is saved after complete-map and reserved-final-pass preflight and
+survives later evidence-fit failure. Compilation, native execution and task
+quality remain pending their named validation gates.
 
 ## Implemented candidate INT4 whole-document source tasks
 
@@ -1453,8 +1512,8 @@ omitted-bullet count.
 **complete set of independently verified verbatim source quotes** collected
 from every chunk summary. The generated map bullet text never enters the
 evidence document. Duplicate quotes are verified before deduplication, and
-every final citation is lifted back to all compatible occurrences within
-the contributing original chunks, using exact byte and Unicode-scalar
+every final citation is lifted back to all compatible occurrences reachable
+through those quotes in the contributing original chunks, using exact byte and Unicode-scalar
 coordinates. The independent map summaries remain in the completed result.
 
 ```bash

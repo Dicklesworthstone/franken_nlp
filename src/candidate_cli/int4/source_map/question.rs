@@ -3,6 +3,8 @@ use super::*;
 use crate::tasks::{answer::AnswerOptions,
     source_planning::grouped_int4::long::question::SourceQuestion};
 
+pub(super) mod synthesis;
+
 pub(super) const QUESTION_BYTES: usize = shared::OPTIONS_BYTES;
 
 #[derive(Args, Clone, Eq, PartialEq)]
@@ -19,12 +21,14 @@ pub(super) struct QuestionArgs {
     /// Nonrenewable citation verification scan work across the complete document.
     #[arg(long, default_value_t = 67_108_864)]
     max_qa_scan_steps: u64,
+    #[command(flatten)]
+    synthesis: synthesis::SynthesisArgs,
 }
 impl std::fmt::Debug for QuestionArgs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("QuestionArgs") }
 }
 pub(super) fn definition(command: clap::Command) -> clap::Command {
-    QuestionArgs::augment_args(command.long_about("Ask one exact question from --question FILE of every nonblank chunk of one complete UTF-8 document. The question, options, source manifest and trusted template determine the actual context capacity. All chunks and combined native work preflight before the first forward. Keep every per-chunk answer, explicit uncalibrated abstention, and whitespace-only chunk in original order, without majority voting or a global answer. Citations retain every compatible original-document byte and Unicode-scalar occurrence. A failed chunk, cancellation or exceeded budget returns no document result; failure never becomes abstention. --options is the complete AnswerOptions JSON object, independent of the complete-document --max-qa-* verification ceilings. Questions and options are private local files; '-' is reserved for document stdin. Source conversion and independently pinned snapshot loading share the same path. No retrieval, answer synthesis, semantic support guarantee, tools, or thinking mode is implied."))
+    QuestionArgs::augment_args(command.long_about("Ask one exact question from --question FILE of every nonblank chunk of one complete UTF-8 document. The default preserves independent chunk answers without selecting a global answer. --synthesize-answer explicitly adds one native answer pass over ALL independently verified verbatim quotes collected from those answers; generated answer prose is never used as source evidence. Evidence passage, byte, question/manifest/token and context limits must all fit, without top-k truncation. Discovery and synthesis share one nonrenewable five-axis native work ceiling, mask allowance and --max-qa-* verification budget. Every per-chunk answer, explicit uncalibrated abstention and whitespace-only chunk remains in original order. Final citations lift to every evidence-reachable original-document byte and Unicode-scalar occurrence. A failed chunk, cancellation or exceeded budget returns no document result; failure never becomes abstention. --options is the complete AnswerOptions JSON object. Questions and options are private local files; '-' is reserved for document stdin. Source conversion and independently pinned snapshot loading share the same path. Optional snapshot save follows complete-map and reserved-synthesis preflight and survives later evidence-fit failure. No retrieval, calibrated answerability, semantic support guarantee, full-document equivalence, tools, or thinking mode is implied."))
 }
 impl QuestionArgs {
     pub(super) fn validate(&self) -> Result<(), CandidateError> {
@@ -32,9 +36,24 @@ impl QuestionArgs {
             return Err(CandidateError::Arguments);
         }
         self.verification()?;
+        self.synthesis.validate()?;
         Ok(())
     }
     pub(super) fn path(&self) -> &std::path::Path { &self.question }
+    pub(super) fn planning(&self, planning: crate::tasks::source_planning::SourcePlanningLimits)
+        -> crate::tasks::source_planning::SourcePlanningLimits {
+        self.synthesis.planning(planning)
+    }
+    pub(super) fn synthesis_limits(&self, planning: crate::tasks::source_planning::SourcePlanningLimits)
+        -> Result<Option<crate::tasks::source_planning::grouped_int4::long::question::synthesis::QuestionSynthesisLimits>, CandidateError> {
+        self.synthesis.limits(planning)
+    }
+    #[cfg(feature = "asupersync-runtime")]
+    pub(super) fn synthesis_request(&self, question: SourceQuestion,
+        planning: crate::tasks::source_planning::SourcePlanningLimits)
+        -> Result<crate::tasks::source_planning::grouped_int4::long::question::synthesis::SourceQuestionSynthesis, CandidateError> {
+        self.synthesis.request(question, planning)
+    }
     pub(super) fn verification(&self) -> Result<GroundingBudget, CandidateError> {
         let verification = GroundingBudget { max_fields: self.max_qa_citations,
             max_matches: self.max_qa_evidence_spans, max_scan_steps: self.max_qa_scan_steps };

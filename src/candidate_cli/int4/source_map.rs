@@ -107,7 +107,7 @@ pub(super) fn definitions() -> Vec<clap::Command> {
                 .mut_arg("max_mask_node_visits", |arg| arg.help("Mask allowance per chunk; --max-total-mask-node-visits bounds the whole document"))
                 .mut_arg("max_checkpoints", |arg| arg.help("Cooperative allowance for hosted whole-document preparation, maps and reduction")));
             match kind {
-                Kind::Summarize => SummaryArgs::augment_args(command.long_about("Summarize every chunk of one complete UTF-8 document. The default keeps an exact cited bullet union and applies --max-summary-bullets only at the final root. --synthesize-summary instead adds one native pass over ALL independently verified verbatim source quotes from the complete map. Generated map bullets never become factual source evidence; no quote is ranked away to fit. The complete evidence must fit its byte, segment, token and context ceilings or the command returns no result. Every final citation lifts back to all compatible original-document byte and Unicode-scalar occurrences. Discovery plus synthesis shares one five-axis native work ceiling, mask allowance and independent verification budget. Structural source membership does not establish entailment, full-document equivalence or recall. Source conversion and digest-pinned snapshot reload share this checked path; optional snapshot save follows complete-map and reserved-synthesis preflight, and survives later evidence-fit or task failure. --options remains the complete per-map SummaryOptions JSON; --synthesis-bullets optionally changes only the final neural bullet cap. No hierarchical compression or contradiction reconciliation is implied.")),
+                Kind::Summarize => SummaryArgs::augment_args(command.long_about("Summarize every chunk of one complete UTF-8 document. The default keeps an exact cited bullet union and applies --max-summary-bullets only at the final root. --synthesize-summary instead adds one native pass over ALL independently verified verbatim source quotes from the complete map. Generated map bullets never become factual source evidence; no quote is ranked away to fit. The complete evidence must fit its byte, segment, token and context ceilings or the command returns no result. Every final citation lifts back to all evidence-reachable original-document byte and Unicode-scalar occurrences. Discovery plus synthesis shares one five-axis native work ceiling, mask allowance and independent verification budget. Structural source membership does not establish entailment, full-document equivalence or recall. Source conversion and digest-pinned snapshot reload share this checked path; optional snapshot save follows complete-map and reserved-synthesis preflight, and survives later evidence-fit or task failure. --options remains the complete per-map SummaryOptions JSON; --synthesis-bullets optionally changes only the final neural bullet cap. No hierarchical compression or contradiction reconciliation is implied.")),
                 Kind::Answer => question::definition(command),
                 _ => command,
             }
@@ -119,11 +119,16 @@ pub(super) struct MapLimits {
     pub mapping: Int4SourceMapLimits,
     pub summary: Option<Int4SummaryLimits>,
     pub synthesis: Option<crate::tasks::source_planning::grouped_int4::long::summary::synthesis::SummarySynthesisLimits>,
+    pub question_synthesis: Option<crate::tasks::source_planning::grouped_int4::long::question::synthesis::QuestionSynthesisLimits>,
     pub reduction_reserve_bytes: u64,
     pub max_result_bytes: usize,
     pub workspace_bytes: u64,
 }
 impl MapArgs {
+    fn planning(&self, args: &Int4Args) -> crate::tasks::source_planning::SourcePlanningLimits {
+        let planning = self.source.planning(args);
+        self.question.as_ref().map_or(planning, |question| question.planning(planning))
+    }
     pub(super) fn from_matches(kind: Kind, matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         Ok(Self { kind, source: source::SourceArgs::from_matches(matches)?,
             mapping: MappingArgs::from_arg_matches(matches)?,
@@ -156,7 +161,11 @@ impl MapArgs {
         let mapping = self.mapping_limits(args)?;
         if let Some(question) = &self.question { question.validate()?; }
         let synthesis = match self.summary {
-            Some(s) => s.synthesis.limits(self.source.planning(args))?,
+            Some(s) => s.synthesis.limits(self.planning(args))?,
+            None => None,
+        };
+        let question_synthesis = match &self.question {
+            Some(question) => question.synthesis_limits(self.planning(args))?,
             None => None,
         };
         let summary = self.summary.filter(|s| !s.synthesis.synthesize_summary)
@@ -178,16 +187,22 @@ impl MapArgs {
         let per_chunk = sum(&[args.context_tokens as u64 * 32,
             u64::from(budget.max_grammar_states) * 512, shared::OPTIONS_BYTES as u64 * 2])?;
         let question_preparation = if self.question.is_some() {
-            times(question::QUESTION_BYTES as u64, (m.max_chunks as u64 + 1) * 4)?
+            times(question::QUESTION_BYTES as u64,
+                (m.max_chunks as u64 + 1 + u64::from(question_synthesis.is_some())) * 4)?
         } else { 0 };
-        let preparation_passes = m.max_chunks as u64 + u64::from(synthesis.is_some());
+        let preparation_passes = m.max_chunks as u64
+            + u64::from(synthesis.is_some() || question_synthesis.is_some());
         let preparation_floor = sum(&[times(per_chunk, preparation_passes)?, 256 * MIB,
             args.max_input_bytes as u64 * 64, (m.max_map_result_bytes as u64 + 4096) * 2,
             question_preparation])?;
         if common.preparation_bytes < preparation_floor { return Err(CandidateError::Arguments); }
         let workspace_bytes = match &self.question {
-            Some(question) => question::workspace_bytes(budget, mapping, m.max_chunks,
-                reduction_reserve_bytes, question.verification()?)?,
+            Some(question) => match question_synthesis {
+                Some(synthesis) => question::synthesis::workspace_bytes(budget, mapping, m.max_chunks,
+                    reduction_reserve_bytes, question.verification()?, synthesis)?,
+                None => question::workspace_bytes(budget, mapping, m.max_chunks,
+                    reduction_reserve_bytes, question.verification()?)?,
+            },
             None => match synthesis {
                 Some(synthesis) => synthesis::workspace_bytes(budget, mapping, m.max_chunks,
                     reduction_reserve_bytes, synthesis)?,
@@ -203,7 +218,7 @@ impl MapArgs {
         // a separately charged source/preparation capture and complete output.
         common.minimum_memory_bytes = sum(&[common.minimum_memory_bytes, input, workspace_bytes, output])?;
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
-        Ok(MapLimits { common, mapping, summary, synthesis, reduction_reserve_bytes,
+        Ok(MapLimits { common, mapping, summary, synthesis, question_synthesis, reduction_reserve_bytes,
             max_result_bytes: m.max_map_result_bytes, workspace_bytes })
     }
     fn mapping_limits(&self, args: &Int4Args) -> Result<Int4SourceMapLimits, CandidateError> {
