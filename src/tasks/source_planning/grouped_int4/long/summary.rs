@@ -8,6 +8,9 @@ use crate::{
     tasks::{mapreduce::CHUNK_PROFILE, summarize::{SummaryResult, CitationGuarantee, SummarySemanticSupport}},
 };
 
+/// Opt-in native synthesis from the complete set of verified map quotations.
+pub mod synthesis;
+
 pub const INT4_CORPUS_SUMMARY_EXECUTION: &str = "grouped-int4-cited-summary-map-exact-reduce-v1";
 const SUMMARY_SEMANTICS: &str = "exact-bullet-evidence-union-no-neural-synthesis-v1";
 
