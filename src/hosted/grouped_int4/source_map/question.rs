@@ -6,6 +6,7 @@ use crate::tasks::{
     source_planning::grouped_int4::long::question::{Int4QuestionRun, SourceQuestion},
     summarize::SourceCitation,
 };
+mod synthesis;
 
 impl Int4SourceMapConfig<SourceQuestion> {
     /// Complete frontier plus native local, independent scan and lifted
