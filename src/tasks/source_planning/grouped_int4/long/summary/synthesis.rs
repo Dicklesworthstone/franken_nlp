@@ -7,6 +7,8 @@ use crate::{
     tasks::summarize::{CitedBullet, SourceCitation},
 };
 mod evidence;
+/// Explicit lossy quote selection across several bounded synthesis levels.
+pub mod hierarchy;
 
 pub const INT4_SUMMARY_SYNTHESIS_EXECUTION: &str = "grouped-int4-verbatim-evidence-summary-synthesis-v1";
 const SEMANTICS: &str = "summary-from-collected-quotes-not-full-document-equivalence-v1";

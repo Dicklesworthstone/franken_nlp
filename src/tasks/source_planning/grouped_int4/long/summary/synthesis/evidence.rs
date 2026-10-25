@@ -4,8 +4,9 @@
 use super::*;
 use std::collections::BTreeSet;
 
-struct Segment { extent: VerifiedSourceSpan, origins: Vec<VerifiedSourceSpan> }
-pub(super) struct Collection { pub(super) text: String, segments: Vec<Segment> }
+// Private to synthesis: hierarchical transport preserves these verified origins.
+pub(super) struct Segment { pub(super) extent: VerifiedSourceSpan, pub(super) origins: Vec<VerifiedSourceSpan> }
+pub(super) struct Collection { pub(super) text: String, pub(super) segments: Vec<Segment> }
 impl Collection { pub(super) fn segment_count(&self) -> usize { self.segments.len() } }
 
 pub(super) fn collect<C: DecodeStepControl>(source: &str, value: &SourceMapValue, options: SummaryOptions,
