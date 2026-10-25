@@ -47,7 +47,8 @@
 > [complete-document question answering](#implemented-candidate-int4-complete-document-question-answering), and
 > [whole-document extraction](#implemented-candidate-int4-whole-document-extraction).
 > Complete-document summaries also support [explicit neural synthesis from
-> verified source quotes](#int4-neural-summary-synthesis).
+> verified source quotes](#int4-neural-summary-synthesis), including
+> [bounded hierarchical quote selection](#int4-hierarchical-summary-synthesis).
 > Candidate results retain their explicit provenance; build verification,
 > model quality and release qualification remain separate pending gates.
 > The top-level task, batch and job examples below remain the disclosed 1.0
@@ -1569,6 +1570,76 @@ Library callers use
 after all map prompts and final-pass reserves preflight; a saved snapshot
 survives a later evidence-fit failure. These implementation fixtures do not
 establish model quality, runtime parity or release qualification.
+
+### INT4 hierarchical summary synthesis
+
+`summarize-map --synthesize-summary --hierarchical-summary` handles collected
+evidence that needs more than one synthesis context. It explicitly opts into
+**lossy quote selection across bounded levels**. Single-pass synthesis keeps
+its all-evidence-fit requirement and never switches to this mode automatically.
+
+At each level, the pinned source encoder partitions the complete ordered
+evidence frontier into context-sized groups. Every group is planned before
+that level's first forward. Each group produces a cited summary; only the
+independently verified original-source quotes selected by those summaries
+enter the next level. Generated assertions never become source evidence.
+All groups are processed, but source quotes not selected by an intermediate
+summary can be lost. This tradeoff is recorded in the result's semantics.
+
+```bash
+fnlp candidate source-int4 summarize-map report.txt \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --memory-mib 8192 --group-width 128 \
+  --options summary-options.json \
+  --synthesize-summary --hierarchical-summary --synthesis-bullets 6 \
+  --summary-max-levels 8 --summary-max-passes 16 \
+  --max-synthesis-evidence-segments 256 \
+  --max-synthesis-evidence-bytes 65536 \
+  --max-total-mask-node-visits 160000000000
+```
+
+The example's total mask allowance prices 64 maps plus 16 additional passes
+at the default per-pass ceiling. Work limits remain finite and shared;
+requesting more passes does not multiply the five native work ceilings or
+the total mask allowance. Every permitted pass is reserved at maximum context
+before discovery, including the final pass. Unused map tokens and smaller
+later frontiers do not renew that allowance.
+
+| Control | Default | Maximum | Scope |
+|---|---:|---:|---|
+| `--summary-max-levels` | 8 | 16 | All reduction levels, including the final single-group level |
+| `--summary-max-passes` | 16 | 256 | Every additional native pass across every level, including final |
+| `--summary-max-tokenizer-calls` | 8,192 | 65,536 | Additional exact-token grouping calls across all levels |
+| `--summary-max-tokenizer-bytes` | 67,108,864 | 1,000,000,000 | Total input bytes examined by those grouping calls |
+
+The synthesis evidence caps bound every complete frontier; independent
+verification caps are shared across discovery and every level.
+`--synthesis-bullets` applies to each hierarchy pass as well as the final
+summary; the map options remain unchanged. An individual quote that cannot
+fit, exhausted levels or passes, exhausted verification/grouping work, or a
+frontier that cannot make progress returns no document result. There is no
+partial successful hierarchy. Empty or exhausted evidence is reported
+explicitly without inventing a final native pass.
+
+The completed response uses `fnlp-candidate-int4-summary-hierarchy-v1` and
+retains all original map results, every hierarchy pass with local and
+original-coordinate citations, level boundaries, actual and reserved work,
+verification usage and grouping counts. `output.final_pass` identifies the
+final entry in `output.passes`; its `bullets` are the final summary. A null
+final-pass index means no final summary was produced from the evidence.
+Public provenance omits private source/prompt identities. Memory admission
+includes retained pass outputs, source-evidence frontiers and the private
+plan witnesses used to check complete levels.
+
+Library callers use `SourceTaskPlanner::plan_int4_summary_hierarchy_with_control`
+and `NlpEngine::synthesize_int4_source_summary_hierarchy`, supplying
+`SummaryHierarchyLimits` alongside `Int4SourceMapConfig<SourceSummarySynthesis>`.
+One hosted invocation and native allocation cover the complete hierarchy.
+Original-source membership remains structural; this mode does not establish
+semantic entailment, recall, factual correctness or full-document equivalence.
+Compilation, model-present execution, parity and task quality remain pending
+their named validation gates.
 
 ### Complete-document limits and delivery
 

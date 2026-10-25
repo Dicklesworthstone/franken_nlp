@@ -11,7 +11,8 @@ use crate::{
         grouped_int4::long::{Int4SourceMapError, Int4SourceMapPreflight,
             question::{SourceQuestion, Int4QuestionPreflight,
                 synthesis::{SourceQuestionSynthesis, Int4QuestionSynthesisPreflight}},
-            summary::synthesis::{SourceSummarySynthesis, Int4SummarySynthesisPreflight}}}},
+            summary::synthesis::{SourceSummarySynthesis, Int4SummarySynthesisPreflight,
+                hierarchy::{SummaryHierarchyLimits, Int4SummaryHierarchyPreflight}}}}},
 };
 
 enum Request {
@@ -22,6 +23,7 @@ enum Prepared {
     Map(Int4SourceMapConfig, Int4SourceMapPreflight),
     Question(Int4SourceMapConfig<SourceQuestion>, Int4QuestionPreflight),
     SummarySynthesis(Int4SourceMapConfig<SourceSummarySynthesis>, Int4SummarySynthesisPreflight),
+    SummaryHierarchy(Int4SourceMapConfig<SourceSummarySynthesis>, Int4SummaryHierarchyPreflight),
     QuestionSynthesis(Int4SourceMapConfig<SourceQuestionSynthesis>, Int4QuestionSynthesisPreflight),
 }
 fn configuration<T>(identity: ExecutionIdentity, task: T, args: &Int4Args,
@@ -78,6 +80,18 @@ fn question_synthesis_preflight(source: &str, planner: &SourceTaskPlanner,
     let context = PlanContext::new(&config.identity, config.budget).map_err(|_| CandidateError::Planning)?;
     planner.preflight_int4_question_synthesis_with_control(source, &config.task, config.budget,
         &context, config.planning, config.mapping, width, control).map_err(planning_error)
+}
+fn summary_hierarchy_preflight(source: &str, planner: &SourceTaskPlanner,
+    config: &Int4SourceMapConfig<SourceSummarySynthesis>, hierarchy: SummaryHierarchyLimits,
+    width: usize, control: &mut impl DecodeStepControl)
+    -> Result<Int4SummaryHierarchyPreflight, CandidateError> {
+    if source.is_empty() { return Err(CandidateError::Input); }
+    let context = PlanContext::new(&config.identity, config.budget).map_err(|_| CandidateError::Planning)?;
+    let prepared = planner.plan_int4_summary_hierarchy_with_control(source, config.task, hierarchy,
+        config.budget, &context, config.planning, config.mapping, width, control).map_err(planning_error)?;
+    // Every permitted hierarchy pass is reserved before the first map starts.
+    // Complete future levels are planned when their exact quoted evidence exists.
+    Ok(prepared.preflight_metadata())
 }
 fn cancelled(cause: DecodeCancellationKind) -> CandidateError {
     match cause {
@@ -177,13 +191,23 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         }
         Request::SummarySynthesis(task) => {
             let config = configuration(identity.clone(), task, &args, &options, limits, remaining()?);
-            if config.summary_synthesis_workspace_bytes(limits.mapping.chunks.max_chunks)
-                .map_err(|_| CandidateError::Memory)? != limits.workspace_bytes {
-                return Err(CandidateError::Memory);
+            if let Some(hierarchy) = limits.hierarchy {
+                if config.summary_hierarchy_workspace_bytes(limits.mapping.chunks.max_chunks, hierarchy)
+                    .map_err(|_| CandidateError::Memory)? != limits.workspace_bytes {
+                    return Err(CandidateError::Memory);
+                }
+                let expected = summary_hierarchy_preflight(&text, &planner, &config, hierarchy,
+                    model.model_identity().group_width(), &mut DeadlineControl { started, deadline })?;
+                Prepared::SummaryHierarchy(config, expected)
+            } else {
+                if config.summary_synthesis_workspace_bytes(limits.mapping.chunks.max_chunks)
+                    .map_err(|_| CandidateError::Memory)? != limits.workspace_bytes {
+                    return Err(CandidateError::Memory);
+                }
+                let expected = summary_synthesis_preflight(&text, &planner, &config,
+                    model.model_identity().group_width(), &mut DeadlineControl { started, deadline })?;
+                Prepared::SummarySynthesis(config, expected)
             }
-            let expected = summary_synthesis_preflight(&text, &planner, &config,
-                model.model_identity().group_width(), &mut DeadlineControl { started, deadline })?;
-            Prepared::SummarySynthesis(config, expected)
         }
         Request::QuestionSynthesis(task) => {
             let config = configuration(identity.clone(), task, &args, &options, limits, remaining()?);
@@ -212,6 +236,7 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     let provenance = Provenance {
         protocol: if limits.question_synthesis.is_some() { "fnlp-candidate-int4-answer-synthesis-v1" }
             else if options.kind == Kind::Answer { "fnlp-candidate-int4-document-qa-v1" }
+            else if limits.hierarchy.is_some() { "fnlp-candidate-int4-summary-hierarchy-v1" }
             else if limits.synthesis.is_some() { "fnlp-candidate-int4-summary-synthesis-v1" }
             else { "fnlp-candidate-int4-source-map-v1" }, schema_version: 1,
         scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: options.kind.name(),
@@ -263,6 +288,16 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
             config.native.run.max_elapsed = remaining()?;
             let result = engine.synthesize_int4_document_answer(&model, text, Arc::new(planner), Arc::new(vocabulary),
                 config, common.kernel, cancellation).map_err(execution_error)?;
+            expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+            remaining()?;
+            publish(&Response { provenance: &provenance, output: result.result() },
+                limits.max_result_bytes + 4096, output)
+        }
+        Prepared::SummaryHierarchy(mut config, expected) => {
+            config.native.run.max_elapsed = remaining()?;
+            let result = engine.synthesize_int4_source_summary_hierarchy(&model, text,
+                Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), common.kernel, cancellation)
+                .map_err(execution_error)?;
             expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
             remaining()?;
             publish(&Response { provenance: &provenance, output: result.result() },

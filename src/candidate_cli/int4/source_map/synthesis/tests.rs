@@ -53,7 +53,7 @@ fn synthesis_controls_are_exclusive_to_explicit_summary_synthesis() {
         "--max-summary-value-bytes", "--max-summary-scan-steps"] {
         assert!(parsed("summarize-map", &["--synthesize-summary", flag, "1"]).is_err());
     }
-    assert!(parsed("summarize-map", &["--synthesize-summary", "--hierarchical-summary"]).is_err());
+    assert!(parsed("summarize-map", &["--hierarchical-summary"]).is_err());
     let (mut map, args) = arguments(&["--synthesis-bullets", "2"]);
     map.summary.as_mut().unwrap().synthesis.synthesize_summary = false;
     assert_eq!(map.validate(&args).unwrap_err(), CandidateError::Arguments);

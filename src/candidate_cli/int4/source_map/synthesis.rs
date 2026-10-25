@@ -2,6 +2,7 @@
 use super::*;
 use crate::tasks::{summarize::SummaryOptions, source_planning::{SourcePlanningLimits,
     grouped_int4::long::summary::synthesis::{SourceSummarySynthesis, SummarySynthesisLimits}}};
+pub(super) mod hierarchy;
 
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SynthesisArgs {
@@ -9,7 +10,10 @@ pub(super) struct SynthesisArgs {
     /// source quote. Generated map bullets are never source evidence.
     #[arg(long)]
     pub synthesize_summary: bool,
-    /// Final neural bullet cap; omitted preserves the per-chunk options cap.
+    #[command(flatten)]
+    hierarchy: hierarchy::HierarchyArgs,
+    /// Neural bullet cap for the final and any explicitly enabled hierarchy
+    /// passes; omitted preserves the per-chunk options cap.
     #[arg(long, requires = "synthesize_summary")]
     synthesis_bullets: Option<usize>,
     /// Maximum distinct (chunk, quote) segments; default 256, with no truncation.
@@ -30,8 +34,13 @@ pub(super) struct SynthesisArgs {
     max_synthesis_scan_steps: Option<u64>,
 }
 impl SynthesisArgs {
+    pub(super) fn hierarchy(self)
+        -> Result<Option<crate::tasks::source_planning::grouped_int4::long::summary::synthesis::hierarchy::SummaryHierarchyLimits>, CandidateError> {
+        self.hierarchy.limits(self.synthesize_summary)
+    }
     pub(super) fn limits(self, planning: SourcePlanningLimits)
         -> Result<Option<SummarySynthesisLimits>, CandidateError> {
+        self.hierarchy()?;
         let supplied = self.synthesis_bullets.is_some() || self.max_synthesis_evidence_segments.is_some()
             || self.max_synthesis_evidence_bytes.is_some() || self.max_synthesis_fields.is_some()
             || self.max_synthesis_matches.is_some() || self.max_synthesis_scan_steps.is_some();

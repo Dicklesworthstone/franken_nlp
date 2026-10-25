@@ -599,3 +599,153 @@ fn expanded_answer_evidence_cap_reaches_cli_preflight_host_and_actual_source_pla
     let mut ordinary = config.planning; ordinary.max_passages = shared::MAX_PASSAGES;
     assert!(planner.plan_int4_with_control(&request, &context, ordinary, 32, &mut continuing()).is_err());
 }
+
+#[test]
+fn hierarchy_preflight_reserves_every_allowed_pass_before_discovery() {
+    let (planner, config) = synthesis_fixture(32);
+    let limits = SummaryHierarchyLimits::default();
+    let single = summary_synthesis_preflight(SOURCE, &planner, &config, 32, &mut continuing()).unwrap();
+    let expected = summary_hierarchy_preflight(SOURCE, &planner, &config, limits, 32, &mut continuing()).unwrap();
+    assert_eq!(expected.group_width(), 32);
+    assert_eq!(expected.source_span(), single.source_span());
+    assert_eq!(expected.chunk_count(), single.chunk_count());
+    assert_eq!(expected.limits(), limits);
+    let maps = single.discovery().planned_work();
+    let pass = single.synthesis_reserved_work();
+    let count = limits.max_passes as u64;
+    let total = expected.reserved_model_work();
+    assert_eq!(total.forward_positions, maps.forward_positions + count * pass.forward_positions);
+    assert_eq!(total.projected_logits, maps.projected_logits + count * pass.projected_logits);
+    assert_eq!(total.attention_pairs, maps.attention_pairs + count * pass.attention_pairs);
+    assert_eq!(total.projections.dot_products, maps.projections.dot_products + count * pass.projections.dot_products);
+    assert_eq!(total.projections.multiply_accumulates,
+        maps.projections.multiply_accumulates + count * pass.projections.multiply_accumulates);
+    assert_eq!(expected.reserved_mask_visits(),
+        single.discovery().reserved_mask_visits() + count * config.mapping.mask_visits_per_chunk);
+}
+
+#[test]
+fn one_allowed_hierarchy_pass_reserves_the_same_native_work_as_explicit_single_synthesis() {
+    let (planner, config) = synthesis_fixture(128);
+    let hierarchy = SummaryHierarchyLimits { max_passes: 1, max_levels: 1, ..SummaryHierarchyLimits::default() };
+    let single = summary_synthesis_preflight(SOURCE, &planner, &config, 128, &mut continuing()).unwrap();
+    let grouped = summary_hierarchy_preflight(SOURCE, &planner, &config, hierarchy, 128, &mut continuing()).unwrap();
+    assert_eq!(grouped.reserved_model_work(), single.reserved_model_work().unwrap());
+    assert_eq!(grouped.reserved_mask_visits(), single.reserved_mask_visits().unwrap());
+    assert_eq!(grouped.chunk_count(), single.chunk_count());
+    assert_eq!(grouped.source_span(), single.source_span());
+    assert_eq!(grouped.limits().max_levels, 1);
+}
+
+#[test]
+fn hierarchy_cannot_renew_any_work_axis_or_masks_for_a_later_level() {
+    let (planner, mut config) = synthesis_fixture(32);
+    let hierarchy = SummaryHierarchyLimits { max_passes: 3, ..SummaryHierarchyLimits::default() };
+    let expected = summary_hierarchy_preflight(SOURCE, &planner, &config, hierarchy, 32, &mut continuing()).unwrap();
+    let work = expected.reserved_model_work();
+    let masks = expected.reserved_mask_visits();
+    for axis in 0..6 {
+        config.mapping.max_model_work = work;
+        config.mapping.max_mask_visits = masks;
+        match axis {
+            0 => config.mapping.max_model_work.forward_positions -= 1,
+            1 => config.mapping.max_model_work.projected_logits -= 1,
+            2 => config.mapping.max_model_work.attention_pairs -= 1,
+            3 => config.mapping.max_model_work.projections.dot_products -= 1,
+            4 => config.mapping.max_model_work.projections.multiply_accumulates -= 1,
+            _ => config.mapping.max_mask_visits -= 1,
+        }
+        assert_eq!(summary_hierarchy_preflight(SOURCE, &planner, &config, hierarchy, 32, &mut continuing()),
+            Err(CandidateError::Planning));
+    }
+    config.mapping.max_model_work = work; config.mapping.max_mask_visits = masks;
+    assert_eq!(summary_hierarchy_preflight(SOURCE, &planner, &config, hierarchy, 32, &mut continuing()).unwrap(), expected);
+}
+
+#[test]
+fn hierarchy_host_workspace_and_actual_group_dot_reservations_match_cli() {
+    let hierarchy = SummaryHierarchyLimits::default();
+    let mut previous = None;
+    for width in [16, 32, 128] {
+        let (planner, config) = synthesis_fixture(width);
+        let expected = summary_hierarchy_preflight(SOURCE, &planner, &config, hierarchy, width, &mut continuing()).unwrap();
+        let total = expected.reserved_model_work();
+        if let Some(old) = previous {
+            let old: Int4Work = old;
+            assert!(old.projections.dot_products > total.projections.dot_products);
+            assert_eq!(old.projections.multiply_accumulates, total.projections.multiply_accumulates);
+            assert_eq!(old.forward_positions, total.forward_positions);
+        }
+        previous = Some(total);
+        for chunks in [1, config.mapping.chunks.max_chunks] {
+            assert_eq!(config.summary_hierarchy_workspace_bytes(chunks, hierarchy).unwrap(),
+                synthesis::hierarchy::workspace_bytes(config.budget, config.mapping, chunks,
+                    config.reduction_reserve_bytes, config.task.limits, hierarchy).unwrap());
+            assert!(config.summary_hierarchy_workspace_bytes(chunks, hierarchy).unwrap()
+                > config.summary_synthesis_workspace_bytes(chunks).unwrap());
+        }
+    }
+}
+
+#[test]
+fn default_work_caps_fit_sixty_four_max_context_maps_and_sixteen_hierarchy_passes() {
+    for width in [16, 32, 128] {
+        let width_arg = width.to_string();
+        let command = super::super::tests::command(Kind::Summarize,
+            &["--synthesize-summary", "--hierarchical-summary", "--group-width", &width_arg,
+                "--max-total-mask-node-visits", "160000000000"]);
+        let Int4Task::SourceMap(options) = command.task else { panic!("wrong task"); };
+        let limits = options.validate(&command.args).unwrap();
+        let passes = (limits.mapping.chunks.max_chunks + limits.hierarchy.unwrap().max_passes) as u64;
+        assert_eq!(passes, 80);
+        let per_pass = crate::native_engine::constrained_int4::planned_work(width,
+            command.args.context_tokens - command.args.max_new_tokens, command.args.max_new_tokens).unwrap();
+        let cap = limits.mapping.max_model_work;
+        assert!(passes * per_pass.forward_positions <= cap.forward_positions);
+        assert!(passes * per_pass.projected_logits <= cap.projected_logits);
+        assert!(passes * per_pass.attention_pairs <= cap.attention_pairs);
+        assert!(passes * per_pass.projections.dot_products <= cap.projections.dot_products);
+        assert!(passes * per_pass.projections.multiply_accumulates <= cap.projections.multiply_accumulates);
+        assert_eq!(passes * limits.mapping.mask_visits_per_chunk, limits.mapping.max_mask_visits);
+    }
+}
+
+#[test]
+fn hierarchy_preflight_refuses_empty_source_invalid_limits_and_cancellation() {
+    let (planner, config) = synthesis_fixture(32);
+    let hierarchy = SummaryHierarchyLimits::default();
+    assert_eq!(summary_hierarchy_preflight("", &planner, &config, hierarchy, 32, &mut continuing()), Err(CandidateError::Input));
+    let mut invalid = hierarchy; invalid.max_passes = 0;
+    assert_eq!(summary_hierarchy_preflight(SOURCE, &planner, &config, invalid, 32, &mut continuing()), Err(CandidateError::Planning));
+    for (cause, error) in [(DecodeCancellationKind::Deadline, CandidateError::Timeout),
+        (DecodeCancellationKind::Timeout, CandidateError::Timeout),
+        (DecodeCancellationKind::PollQuota, CandidateError::Execution),
+        (DecodeCancellationKind::ResourceUnavailable, CandidateError::Execution)] {
+        let mut control = Control { calls: 0, stop_at: 1, cause };
+        assert_eq!(summary_hierarchy_preflight(SOURCE, &planner, &config, hierarchy, 32, &mut control), Err(error));
+    }
+}
+
+#[test]
+fn hierarchy_publication_retains_final_pass_selection_and_all_pass_receipts() {
+    let output = serde_json::json!({"fixture_only":true,"final_pass":1,"passes":[
+        {"level":0,"group":0,"bullets":[{"text":"intermediate"}]},
+        {"level":1,"group":0,"bullets":[{"text":"final"}]}],
+        "semantics":"lossy-quote-selection-every-level-not-full-document-equivalence-v1"});
+    let provenance = Provenance { protocol: "fnlp-candidate-int4-summary-hierarchy-v1", schema_version: 1,
+        scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "summarize",
+        model_id: "Nanbeige4.2-3B", source_revision: "fixture", source_root_sha256: "fixture-source",
+        model_content_sha256: "fixture-model", candidate_format: INT4_SOURCE_FORMAT,
+        quant_recipe: "fixture:group=32", group_width: 32, integer_kernel: "s_scalar_i32", snapshot: None };
+    let response = Response { provenance: &provenance, output: &output };
+    let mut bytes = Vec::new(); publish(&response, 4096, &mut bytes).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["protocol"], "fnlp-candidate-int4-summary-hierarchy-v1");
+    assert_eq!(value["output"], output);
+    for absent in ["source", "source_dir", "source_manifest", "options", "prompt_digest"] {
+        assert!(value.get(absent).is_none());
+    }
+    let mut refused = Vec::new();
+    assert_eq!(publish(&response, 1, &mut refused), Err(CandidateError::Output));
+    assert!(refused.is_empty());
+}
