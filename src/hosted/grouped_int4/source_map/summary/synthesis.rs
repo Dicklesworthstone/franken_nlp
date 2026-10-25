@@ -6,6 +6,7 @@ use crate::tasks::{
     },
     summarize::SUMMARIZE_TASK_VERSION,
 };
+mod hierarchy;
 
 impl Int4SourceMapConfig<SourceSummarySynthesis> {
     /// Complete discovery frontier, one final native transcript, quote copies,
