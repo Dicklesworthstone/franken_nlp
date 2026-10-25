@@ -46,6 +46,8 @@
 > [durable source-task jobs](#implemented-candidate-int4-source-task-jobs),
 > [complete-document question answering](#implemented-candidate-int4-complete-document-question-answering), and
 > [whole-document extraction](#implemented-candidate-int4-whole-document-extraction).
+> Complete-document summaries also support [explicit neural synthesis from
+> verified source quotes](#int4-neural-summary-synthesis).
 > Candidate results retain their explicit provenance; build verification,
 > model quality and release qualification remain separate pending gates.
 > The top-level task, batch and job examples below remain the disclosed 1.0
@@ -1404,7 +1406,7 @@ accepted.
 
 ### Complete cited-summary union
 
-`summarize-map` executes the cited summary task on every chunk, independently
+By default, `summarize-map` executes the cited summary task on every chunk, independently
 checks source membership, and returns one deterministic ranked union.
 Only **exact bullet text** deduplicates candidates. All independently
 verified citations survive intermediate reductions; the final
@@ -1437,13 +1439,77 @@ citations, 65,536 evidence spans, 4 MiB of aggregate value storage and
 `--max-summary-scan-steps`. These switches are accepted only for
 `summarize-map`.
 
-This is deterministic reduction of independently generated cited bullets.
+This default mode is deterministic reduction of independently generated cited bullets.
 It performs no neural hierarchical synthesis, paraphrase reconciliation or
 contradiction resolution. Citation validity proves structural source
 membership; semantic support and quality remain unassessed. Chunk boundaries
 may split context, and support frequency is not calibrated importance or
 confidence. The output retains these limitations and reports any final
 omitted-bullet count.
+
+### INT4 neural summary synthesis
+
+`summarize-map --synthesize-summary` adds one native summary pass over the
+**complete set of independently verified verbatim source quotes** collected
+from every chunk summary. The generated map bullet text never enters the
+evidence document. Duplicate quotes are verified before deduplication, and
+every final citation is lifted back to all compatible occurrences within
+the contributing original chunks, using exact byte and Unicode-scalar
+coordinates. The independent map summaries remain in the completed result.
+
+```bash
+fnlp candidate source-int4 summarize-map report.txt \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --memory-mib 8192 --group-width 128 \
+  --options summary-options.json \
+  --synthesize-summary --synthesis-bullets 6 \
+  --max-synthesis-evidence-segments 256 \
+  --max-synthesis-evidence-bytes 65536 \
+  --max-total-mask-node-visits 130000000000
+```
+
+The same flags accept the explicit `--source-dir` / `--source-manifest`
+conversion route. `--options` controls each map summary;
+`--synthesis-bullets` changes only the final neural bullet cap and otherwise
+inherits the options file's cap. The exact-union `--max-summary-*` controls
+conflict with synthesis so they cannot be silently ignored.
+
+This mode does not select a top-k subset of quotes to force context fit.
+All collected evidence, including separators, must fit the declared segment
+and byte ceilings and the actual final prompt/token/context capacity. A
+single-pass overflow fails with no document result. The byte limit alone
+does not guarantee token fit. Empty evidence is reported explicitly without
+a fabricated final model pass. Native failure, malformed evidence or budget
+exhaustion is never converted to an empty successful summary.
+
+Discovery and the final pass share the five complete-document work ceilings
+and `--max-total-mask-node-visits`. A maximum-context final pass is reserved
+before discovery starts; unused map decoding work does not create a new
+allowance. The example's mask ceiling accommodates 64 maps plus one final
+pass at the default per-pass ceiling. Independent verification also stays
+nonrenewable across discovery, evidence collection and citation lifting:
+`--max-synthesis-fields`, `--max-synthesis-matches` and
+`--max-synthesis-scan-steps` default to 4,096 fields, 16,384 occurrence checks
+and 67,108,864 scan steps. The map verification limits may tighten that same
+allowance. Synthesis preparation, evidence copies, verifier storage and final
+output are included in the modeled memory admission.
+
+Successful stdout uses `fnlp-candidate-int4-summary-synthesis-v1`. It reports
+the original map results, final bullets, actual and reserved native work,
+mask work, evidence cardinality and verification usage. Citation membership
+is structural; semantic support remains `not_assessed`. Collected evidence
+may omit relevant source context, and this mode does not claim full-document
+equivalence, factual correctness, recall or contradiction resolution.
+Hierarchical quote compression is not enabled by this flag.
+
+Library callers use
+`SourceTaskPlanner::plan_int4_summary_synthesis_with_control` and
+`NlpEngine::synthesize_int4_source_summary` with
+`Int4SourceMapConfig<SourceSummarySynthesis>`. Optional snapshot saving occurs
+after all map prompts and final-pass reserves preflight; a saved snapshot
+survives a later evidence-fit failure. These implementation fixtures do not
+establish model quality, runtime parity or release qualification.
 
 ### Complete-document limits and delivery
 

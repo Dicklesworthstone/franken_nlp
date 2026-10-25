@@ -9,13 +9,15 @@ use crate::{
         strict_int4::weights::snapshot::INT4_SNAPSHOT_VERSION},
     tasks::{ir::PlanContext, source_planning::{SourceTaskPlanner,
         grouped_int4::long::{Int4SourceMapError, Int4SourceMapPreflight,
-            question::{SourceQuestion, Int4QuestionPreflight}}}},
+            question::{SourceQuestion, Int4QuestionPreflight},
+            summary::synthesis::{SourceSummarySynthesis, Int4SummarySynthesisPreflight}}}},
 };
 
-enum Request { Map(SourceMapTask), Question(SourceQuestion) }
+enum Request { Map(SourceMapTask), Question(SourceQuestion), SummarySynthesis(SourceSummarySynthesis) }
 enum Prepared {
     Map(Int4SourceMapConfig, Int4SourceMapPreflight),
     Question(Int4SourceMapConfig<SourceQuestion>, Int4QuestionPreflight),
+    SummarySynthesis(Int4SourceMapConfig<SourceSummarySynthesis>, Int4SummarySynthesisPreflight),
 }
 fn configuration<T>(identity: ExecutionIdentity, task: T, args: &Int4Args,
     options: &MapArgs, limits: MapLimits, elapsed: Duration) -> Int4SourceMapConfig<T> {
@@ -52,6 +54,17 @@ fn question_preflight(source: &str, planner: &SourceTaskPlanner,
     let context = PlanContext::new(&config.identity, config.budget).map_err(|_| CandidateError::Planning)?;
     planner.preflight_int4_question_with_control(source, &config.task, config.budget, &context,
         config.planning, config.mapping, width, control).map_err(planning_error)
+}
+fn summary_synthesis_preflight(source: &str, planner: &SourceTaskPlanner,
+    config: &Int4SourceMapConfig<SourceSummarySynthesis>, width: usize, control: &mut impl DecodeStepControl)
+    -> Result<Int4SummarySynthesisPreflight, CandidateError> {
+    if source.is_empty() { return Err(CandidateError::Input); }
+    let context = PlanContext::new(&config.identity, config.budget).map_err(|_| CandidateError::Planning)?;
+    let prepared = planner.plan_int4_summary_synthesis_with_control(source, config.task, config.budget,
+        &context, config.planning, config.mapping, width, control).map_err(planning_error)?;
+    // Every real map and the maximum-context final pass are reserved together.
+    // The generated quote document is checked separately once it exists.
+    Ok(prepared.preflight_metadata())
 }
 fn cancelled(cause: DecodeCancellationKind) -> CandidateError {
     match cause {
@@ -112,7 +125,12 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         (text, Request::Question(question.task(question_text, option_json.as_deref())?))
     } else {
         let (text, task) = options.request(text, option_json.as_deref(), budget, args.max_input_bytes)?;
-        (text, Request::Map(task))
+        let task = match (options.summary, task) {
+            (Some(summary), SourceMapTask::Summarize(map_options)) if summary.synthesis.synthesize_summary =>
+                Request::SummarySynthesis(summary.synthesis.request(map_options, options.source.planning(&args))?),
+            (_, task) => Request::Map(task),
+        };
+        (text, task)
     };
     drop(option_json);
     remaining()?;
@@ -140,12 +158,23 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
                 model.model_identity().group_width(), &mut DeadlineControl { started, deadline })?;
             Prepared::Question(config, expected)
         }
+        Request::SummarySynthesis(task) => {
+            let config = configuration(identity.clone(), task, &args, &options, limits, remaining()?);
+            if config.summary_synthesis_workspace_bytes(limits.mapping.chunks.max_chunks)
+                .map_err(|_| CandidateError::Memory)? != limits.workspace_bytes {
+                return Err(CandidateError::Memory);
+            }
+            let expected = summary_synthesis_preflight(&text, &planner, &config,
+                model.model_identity().group_width(), &mut DeadlineControl { started, deadline })?;
+            Prepared::SummarySynthesis(config, expected)
+        }
     };
     remaining()?;
     let mut snapshot = common.snapshot_pin.map(|_| SnapshotRecord::new("loaded", common.snapshot_need));
     if let Some(path) = &args.save_snapshot {
-        // Persist only after the COMPLETE original source and all native work
-        // preflight. This complete model file survives later task failure.
+        // Persist only after the COMPLETE original source maps and, if enabled,
+        // the maximum-context synthesis work preflight. Generated evidence fit
+        // is checked later. This complete model file survives task failure.
         let pin = engine.save_int4_snapshot(&model, path.clone(), common.snapshot_budget(false)?,
             RunLimits { max_elapsed: remaining()?, max_checkpoints: args.snapshot_checkpoints,
                 cleanup_reserve_bytes: CLEANUP_BYTES }, cancellation.clone()).map_err(|_| CandidateError::Model)?;
@@ -155,6 +184,7 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     let content = identity.logical_model_digest.to_hex();
     let provenance = Provenance {
         protocol: if options.kind == Kind::Answer { "fnlp-candidate-int4-document-qa-v1" }
+            else if limits.synthesis.is_some() { "fnlp-candidate-int4-summary-synthesis-v1" }
             else { "fnlp-candidate-int4-source-map-v1" }, schema_version: 1,
         scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: options.kind.name(),
         model_id: "Nanbeige4.2-3B", source_revision: &identity.source_revision,
@@ -189,6 +219,15 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
             remaining()?;
             // The hosted output guard survives staging, write AND flush.
             // Native failure cannot publish a successful prefix or abstention.
+            publish(&Response { provenance: &provenance, output: result.result() },
+                limits.max_result_bytes + 4096, output)
+        }
+        Prepared::SummarySynthesis(mut config, expected) => {
+            config.native.run.max_elapsed = remaining()?;
+            let result = engine.synthesize_int4_source_summary(&model, text, Arc::new(planner), Arc::new(vocabulary),
+                config, common.kernel, cancellation).map_err(execution_error)?;
+            expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+            remaining()?;
             publish(&Response { provenance: &provenance, output: result.result() },
                 limits.max_result_bytes + 4096, output)
         }

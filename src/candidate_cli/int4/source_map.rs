@@ -11,6 +11,7 @@ use crate::{
 };
 
 mod question;
+mod synthesis;
 #[cfg(feature = "asupersync-runtime")]
 mod runtime;
 #[cfg(test)]
@@ -71,20 +72,22 @@ struct MappingArgs {
 struct SummaryArgs {
     /// Final global bullet cap, applied once after all candidates are merged.
     /// Per-chunk summary options remain controlled by --options.
-    #[arg(long, default_value_t = 12)]
+    #[arg(long, default_value_t = 12, conflicts_with = "synthesize_summary")]
     max_summary_bullets: usize,
-    #[arg(long, default_value_t = 4096)]
+    #[arg(long, default_value_t = 4096, conflicts_with = "synthesize_summary")]
     max_summary_unique_bullets: usize,
-    #[arg(long, default_value_t = 16384)]
+    #[arg(long, default_value_t = 16384, conflicts_with = "synthesize_summary")]
     max_summary_citations: usize,
-    #[arg(long, default_value_t = 65536)]
+    #[arg(long, default_value_t = 65536, conflicts_with = "synthesize_summary")]
     max_summary_evidence_spans: usize,
     /// Both canonical and conservatively charged stored aggregate values.
-    #[arg(long, default_value_t = 4_194_304)]
+    #[arg(long, default_value_t = 4_194_304, conflicts_with = "synthesize_summary")]
     max_summary_value_bytes: usize,
     /// Independent reducer reverification work, never reset between chunks.
-    #[arg(long, default_value_t = 536_870_912)]
+    #[arg(long, default_value_t = 536_870_912, conflicts_with = "synthesize_summary")]
     max_summary_scan_steps: u64,
+    #[command(flatten)]
+    synthesis: synthesis::SynthesisArgs,
 }
 pub(super) fn definitions() -> Vec<clap::Command> {
     [(Kind::Ner, "ner-map"), (Kind::Keyphrases, "keyphrases-map"),
@@ -93,7 +96,7 @@ pub(super) fn definitions() -> Vec<clap::Command> {
             let about = match kind {
                 Kind::Ner => "Find entities throughout a complete document with original-coordinate source evidence",
                 Kind::Keyphrases => "Extract keyphrases from every chunk of a complete document",
-                Kind::Summarize => "Summarize every chunk and rank one exact cited bullet union",
+                Kind::Summarize => "Summarize every chunk with an exact cited union or explicit neural synthesis",
                 Kind::Answer => "Ask one question of every chunk and preserve all original-source evidence",
             };
             let command = MappingArgs::augment_args(source::definition(kind).name(name).about(about)
@@ -104,7 +107,7 @@ pub(super) fn definitions() -> Vec<clap::Command> {
                 .mut_arg("max_mask_node_visits", |arg| arg.help("Mask allowance per chunk; --max-total-mask-node-visits bounds the whole document"))
                 .mut_arg("max_checkpoints", |arg| arg.help("Cooperative allowance for hosted whole-document preparation, maps and reduction")));
             match kind {
-                Kind::Summarize => SummaryArgs::augment_args(command),
+                Kind::Summarize => SummaryArgs::augment_args(command.long_about("Summarize every chunk of one complete UTF-8 document. The default keeps an exact cited bullet union and applies --max-summary-bullets only at the final root. --synthesize-summary instead adds one native pass over ALL independently verified verbatim source quotes from the complete map. Generated map bullets never become factual source evidence; no quote is ranked away to fit. The complete evidence must fit its byte, segment, token and context ceilings or the command returns no result. Every final citation lifts back to all compatible original-document byte and Unicode-scalar occurrences. Discovery plus synthesis shares one five-axis native work ceiling, mask allowance and independent verification budget. Structural source membership does not establish entailment, full-document equivalence or recall. Source conversion and digest-pinned snapshot reload share this checked path; optional snapshot save follows complete-map and reserved-synthesis preflight, and survives later evidence-fit or task failure. --options remains the complete per-map SummaryOptions JSON; --synthesis-bullets optionally changes only the final neural bullet cap. No hierarchical compression or contradiction reconciliation is implied.")),
                 Kind::Answer => question::definition(command),
                 _ => command,
             }
@@ -115,6 +118,7 @@ pub(super) struct MapLimits {
     pub common: Int4Limits,
     pub mapping: Int4SourceMapLimits,
     pub summary: Option<Int4SummaryLimits>,
+    pub synthesis: Option<crate::tasks::source_planning::grouped_int4::long::summary::synthesis::SummarySynthesisLimits>,
     pub reduction_reserve_bytes: u64,
     pub max_result_bytes: usize,
     pub workspace_bytes: u64,
@@ -151,7 +155,12 @@ impl MapArgs {
         let reduction_reserve_bytes = mib(m.reduction_reserve_mib)?;
         let mapping = self.mapping_limits(args)?;
         if let Some(question) = &self.question { question.validate()?; }
-        let summary = self.summary.map(|s| s.limits(mapping)).transpose()?;
+        let synthesis = match self.summary {
+            Some(s) => s.synthesis.limits(self.source.planning(args))?,
+            None => None,
+        };
+        let summary = self.summary.filter(|s| !s.synthesis.synthesize_summary)
+            .map(|s| s.limits(mapping)).transpose()?;
         if let Some(summary) = summary {
             // In addition to the host's full map/frontier payload, price the
             // independent summary verifier and aggregate owners explicitly.
@@ -171,16 +180,22 @@ impl MapArgs {
         let question_preparation = if self.question.is_some() {
             times(question::QUESTION_BYTES as u64, (m.max_chunks as u64 + 1) * 4)?
         } else { 0 };
-        let preparation_floor = sum(&[times(per_chunk, m.max_chunks as u64)?, 256 * MIB,
+        let preparation_passes = m.max_chunks as u64 + u64::from(synthesis.is_some());
+        let preparation_floor = sum(&[times(per_chunk, preparation_passes)?, 256 * MIB,
             args.max_input_bytes as u64 * 64, (m.max_map_result_bytes as u64 + 4096) * 2,
             question_preparation])?;
         if common.preparation_bytes < preparation_floor { return Err(CandidateError::Arguments); }
         let workspace_bytes = match &self.question {
             Some(question) => question::workspace_bytes(budget, mapping, m.max_chunks,
                 reduction_reserve_bytes, question.verification()?)?,
-            None => workspace_bytes(budget, mapping, m.max_chunks, reduction_reserve_bytes)?,
+            None => match synthesis {
+                Some(synthesis) => synthesis::workspace_bytes(budget, mapping, m.max_chunks,
+                    reduction_reserve_bytes, synthesis)?,
+                None => workspace_bytes(budget, mapping, m.max_chunks, reduction_reserve_bytes)?,
+            },
         };
-        let tokens = if summary.is_some() { 0 } else { times(m.max_chunks as u64, u64::from(budget.max_output_tokens))? };
+        let tokens = if summary.is_some() { 0 }
+            else { times(preparation_passes, u64::from(budget.max_output_tokens))? };
         let output = sum(&[m.max_map_result_bytes as u64 * 4, times(tokens, 8)?, 4096])?;
         let question_input = if self.question.is_some() { question::QUESTION_BYTES as u64 + 1 } else { 0 };
         let input = sum(&[args.max_input_bytes as u64 + 1, question_input, common.preparation_bytes])?;
@@ -188,7 +203,7 @@ impl MapArgs {
         // a separately charged source/preparation capture and complete output.
         common.minimum_memory_bytes = sum(&[common.minimum_memory_bytes, input, workspace_bytes, output])?;
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
-        Ok(MapLimits { common, mapping, summary, reduction_reserve_bytes,
+        Ok(MapLimits { common, mapping, summary, synthesis, reduction_reserve_bytes,
             max_result_bytes: m.max_map_result_bytes, workspace_bytes })
     }
     fn mapping_limits(&self, args: &Int4Args) -> Result<Int4SourceMapLimits, CandidateError> {
