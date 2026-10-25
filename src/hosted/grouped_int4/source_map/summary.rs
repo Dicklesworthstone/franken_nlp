@@ -3,6 +3,7 @@ use super::*;
 use crate::tasks::source_planning::grouped_int4::long::summary::{
     Int4CorpusSummaryError, Int4CorpusSummaryRun, Int4SummaryLimits,
 };
+mod synthesis;
 
 impl NlpEngine {
     /// Summarize every original chunk and return one deterministic ranked
