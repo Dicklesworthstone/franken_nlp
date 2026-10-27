@@ -3,6 +3,7 @@ use super::*;
 use crate::tasks::source_planning::grouped_int4::long::question::synthesis::{
     Int4QuestionSynthesisRun, SourceQuestionSynthesis,
 };
+mod hierarchy;
 
 impl Int4SourceMapConfig<SourceQuestionSynthesis> {
     /// Charge all source/question maps, verbatim evidence and its origin fanout,
