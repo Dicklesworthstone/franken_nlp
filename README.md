@@ -2325,6 +2325,111 @@ reserve and process memory ceiling. The library equivalents are
 source-inventoried candidate functionality; build, model-present correctness
 and quality qualification remain pending.
 
+## Implemented candidate INT4 durable whole-document schema extraction
+
+`fnlp candidate source-int4 extract-document-job start|resume` runs the same
+complete-document extraction pipeline as `extract-map` inside an authenticated
+retained job. Each original document is one atomic durable item. The full
+population shares one resident model, one exact raw schema and one fixed set
+of chunking, work and verification limits. This route requires `metadata-store`
+and `asupersync-runtime` on Linux x86-64 or AArch64.
+
+Supply the **complete original NDJSON population on every invocation**, even
+when resuming after some documents have already committed:
+
+```json
+{"id":"document-1","text":"The complete original UTF-8 source document."}
+{"id":"document-2","text":"A second complete document.","task_args":{}}
+```
+
+The `text` field is the original document. `task_args` may only be absent,
+null or an empty object: individual records cannot replace the schema,
+grounding policy, budgets or task. The complete population is admitted before
+execution; duplicate IDs, unknown fields, malformed later records and
+per-record overrides refuse. Input documents are not silently saved for a
+future resume.
+
+Create the protected storage described in [owned job storage](docs/owned-jobs.md),
+and use the complete `document-job-limits.json` example from the whole-document
+jobs section above. Those explicit ceilings support this invocation's selected
+eight-chunk configuration; they are allowances, not measured cost estimates or
+a promise that a particular document or population fits. Using the bounded
+`exact-spans.schema.json` example from the preceding section:
+
+```bash
+fnlp candidate source-int4 extract-document-job start documents.ndjson \
+  --schema exact-spans.schema.json --source-membership \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$EXPECTED_MODEL_SHA256" \
+  --memory-mib 16384 --max-chunks 8 \
+  --store-results \
+  --job-dir /private/extraction-document-job \
+  --job-id "$JOB_ID" \
+  --key-file /private/extraction-document-job.key \
+  --limits document-job-limits.json \
+  --materialize
+```
+
+Replace `start` with `resume`, preserving the full original population, exact
+schema bytes and all immutable settings. Source conversion is also supported
+with `--source-dir DIR --source-manifest FILE`. Optional `--save-snapshot`
+follows immutable planner admission and precedes population execution; the
+completed independent model file survives later authentication or execution
+failure. A supplied snapshot always requires its independent model digest pin.
+
+Every document's chunks must all finish and independently verify before that
+document commits. Retained values preserve independent exact-schema JSON
+strings and chunk lineage; they are not merged into an arbitrary global
+object. With `--source-membership`, compatible occurrences are independently
+checked within each originating chunk and lifted to original UTF-8 byte and
+Unicode-scalar coordinates. This does not discover occurrences in chunks from
+which the value was not extracted. Required fields must be satisfiable in
+every chunk. Source membership establishes neither semantic accuracy nor
+single-context equivalence.
+
+The five `extract-map` native work axes and `--max-total-mask-node-visits`
+remain per-document ceilings that must fit the unchanged job-wide `max_work`.
+Actual group-dependent INT4 work is reserved durably before execution.
+Independent field verification also has three explicit immutable lifetime
+caps, authenticated with the exact schema and document recipe:
+
+| Flag | Default lifetime cap |
+|---|---:|
+| `--max-lifetime-extraction-fields` | 4,096,000 |
+| `--max-lifetime-extraction-evidence-spans` | 16,384,000 |
+| `--max-lifetime-extraction-scan-steps` | 67,108,864,000 |
+
+Each corresponding per-document `--max-extraction-*` limit multiplied by
+`JobLimits.max_attempts` must fit its lifetime cap, including failed attempts.
+Resume cannot renew work, masks, attempts or verification. Already committed
+documents are skipped; an interrupted document starts again in full, retaining
+the previous attempt's debit. Uncommitted spool tails require the explicit
+resume-only `--discard-uncommitted-tail` policy after authentication.
+
+Memory admission includes the complete population, resident native engine,
+all prepared chunk programs, extraction/evidence frontier, complete original
+document result, journal and protected spool serialization. The complete
+NDJSON record, including JSON escaping, must fit the stored input byte limit.
+`--max-result-bytes` is the per-chunk result cap; `--max-map-result-bytes` is
+the whole-document cap and must fit `JobLimits.max_result_bytes`.
+
+Stdout uses `fnlp-candidate-int4-extract-document-job-v1`, identifies the durable
+unit as `complete_original_document` and reports public model provenance and
+authenticated progress. Schema bytes, original source and extracted values
+stay out of that report. Result guards remain alive through spool
+synchronization and journal acknowledgement. `--materialize` publishes verified
+`materialized.ndjson` after all documents commit. Stored-job status, verification
+and materialization commands remain usable without loading the model; a final
+report-write failure does not imply rollback.
+
+Library callers construct `Int4DocumentExtractionJobPlanner::for_model` with
+the actual model identity, fixed `ExtractionBatchArgs`, compiler/source limits,
+document limits, `JobLimits` and lifetime `GroundingBudget`, then call
+`NlpEngine::job_int4_extract_document` with `SourceJobRequest` and
+`JobHostLimits`. This is source-inventoried candidate functionality. Compilation,
+native correctness, crash recovery, parity and task quality remain unqualified
+until their named validation gates run.
+
 ## Installation
 
 **1. Install script: *not yet available*.** The planned script installs and SHA-256-verifies the `fnlp` binary, then offers (interactive `y/N`; `--with-model` / `--no-pull` in automation) to run the installed binary's own `fnlp pull`; shell never touches model bytes itself. It is deliberately not shown as a runnable command: `install.sh` does not exist yet and there are no release binaries for it to install. This section becomes a command again when Phase 6 ships one.

@@ -15,6 +15,7 @@ mod extract;
 mod extract_batch;
 mod extract_job;
 mod extract_map;
+mod extract_document_job;
 mod source;
 mod source_batch;
 mod source_job;
@@ -125,6 +126,7 @@ enum Int4Task {
     ExtractBatch(extract_batch::BatchArgs),
     ExtractMap(extract_map::MapArgs),
     ExtractJob,
+    ExtractDocumentJob,
     ScoredJob,
     SourceJob,
     DocumentJob,
@@ -143,6 +145,7 @@ impl Int4BatchCommand {
 }
 enum Int4JobCommand {
     Extraction(extract_job::JobCommand),
+    ExtractionDocument(extract_document_job::JobCommand),
     Scored(scored_job::JobCommand),
     Source(source_job::JobCommand),
     Document(document_job::JobCommand),
@@ -177,6 +180,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(extract_batch::definition())
         .subcommand(extract_job::definition())
         .subcommand(extract_map::definition())
+        .subcommand(extract_document_job::definition())
         .subcommands(source::definitions())
         .subcommands(source_batch::definitions())
         .subcommands(source_job::definitions())
@@ -195,6 +199,11 @@ impl Int4Command {
         if name == "extract-job" {
             let (job, args) = extract_job::JobCommand::from_matches(matches)?;
             return Ok(Self { task: Int4Task::ExtractJob, args, batch: None, job: Some(Int4JobCommand::Extraction(job)) });
+        }
+        if name == "extract-document-job" {
+            let (job, args) = extract_document_job::JobCommand::from_matches(matches)?;
+            return Ok(Self { task: Int4Task::ExtractDocumentJob, args, batch: None,
+                job: Some(Int4JobCommand::ExtractionDocument(job)) });
         }
         if name == "score-job" {
             let (job, args) = scored_job::JobCommand::from_matches(matches)?;
@@ -257,6 +266,8 @@ impl Int4Command {
         let result = match self {
             Self { task: Int4Task::ExtractJob, args, batch: None, job: Some(Int4JobCommand::Extraction(job)) } =>
                 return job.run_owned(args, input, &mut output, diagnostics),
+            Self { task: Int4Task::ExtractDocumentJob, args, batch: None, job: Some(Int4JobCommand::ExtractionDocument(job)) } =>
+                return job.run_owned(args, input, &mut output, diagnostics),
             Self { task: Int4Task::ScoredJob, args, batch: None, job: Some(Int4JobCommand::Scored(job)) } =>
                 return job.run_owned(args, input, &mut output, diagnostics),
             Self { task: Int4Task::SourceJob, args, batch: None, job: Some(Int4JobCommand::Source(job)) } =>
@@ -284,7 +295,7 @@ impl Int4Command {
         }
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
-        if self.job.is_some() || matches!(self.task, Int4Task::ExtractJob | Int4Task::ScoredJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob) {
+        if self.job.is_some() || matches!(self.task, Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob) {
             return Err(CandidateError::Arguments);
         }
         if let Some(batch) = self.batch {
@@ -319,7 +330,7 @@ impl Int4Command {
             Int4Task::Source(_, source) => source.validate(&self.args)?,
             // The blocking stream must own its input and writer through cleanup.
             Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::Resolve(_) | Int4Task::Sentiment(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ScoredBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
-                | Int4Task::ExtractJob | Int4Task::ScoredJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob => return Err(CandidateError::Arguments),
+                | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob => return Err(CandidateError::Arguments),
         };
         #[cfg(feature = "asupersync-runtime")]
         { runtime::execute_task(self.task, self.args, limits, input, output) }
