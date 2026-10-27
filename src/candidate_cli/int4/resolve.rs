@@ -6,6 +6,7 @@ use crate::{batch::BatchWork,
         native_resolve::{NativeResolveLimits, grouped_int4::Int4ResolveLimits}},
 };
 mod discovery;
+pub(super) mod corpus;
 
 #[cfg(feature = "asupersync-runtime")]
 mod runtime;

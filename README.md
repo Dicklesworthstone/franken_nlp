@@ -37,6 +37,7 @@
 > [independent dimensional sentiment](#implemented-candidate-int4-dimensional-sentiment),
 > [pairwise, rubric and faithfulness judgment](#implemented-candidate-int4-judgment),
 > [resident classification, sentiment and judgment streams](#implemented-candidate-int4-scoring-batches),
+> [resident entity-resolution corpora](#implemented-candidate-int4-entity-resolution-corpora),
 > [verified NER and rule redaction](#implemented-candidate-int4-redaction),
 > [complete-document redaction](#implemented-candidate-int4-complete-document-redaction),
 > [resident redaction corpora](#implemented-candidate-int4-redaction-corpora),
@@ -1096,6 +1097,105 @@ implementation code: native model execution, scalar/SIMD agreement, task
 quality and controller-selected production checks still require their named
 validation gates. Local INT4 snapshots do not become canonical FNLPQ releases
 or active installed models through this command.
+
+## Implemented candidate INT4 entity-resolution corpora
+
+`fnlp candidate source-int4 resolve-corpus` discovers and resolves entities from
+bounded raw-document NDJSON while keeping **one model and one native engine
+resident across document groups**. It requires `asupersync-runtime`, explicit
+source or snapshot selection, `--discover-entities`, and a fixed `--policy FILE`.
+Add `--chunked` to discover mentions across every admitted source chunk before
+resolving the complete group.
+
+Save the fixed NER and resolution policies in `entity-policy.json`:
+
+```json
+{
+  "ner": {
+    "types": ["person", "organization"],
+    "max_entities": 8,
+    "max_mention_scalars": 64
+  },
+  "options": {
+    "blocking": "exact_surface",
+    "context_scalars": 128,
+    "minimum_margin_milli": 1000
+  }
+}
+```
+
+Input records contain exactly `id` and `text`, or the exact flush control:
+
+```jsonl
+{"id":"meeting","text":"Élan met Ada."}
+{"id":"staff","text":"Élan works here."}
+{"flush":true}
+{"id":"meeting","text":"Ada joined the next meeting."}
+```
+
+```bash
+fnlp candidate source-int4 resolve-corpus documents.ndjson \
+  --discover-entities --chunked --policy entity-policy.json \
+  --snapshot /data/nanbeige.group128.snapshot \
+  --expected-model-sha256 "$TRUSTED_MODEL_CONTENT_SHA256" \
+  --group-width 128 --memory-mib 16384 --context-tokens 2048 \
+  --max-input-bytes 1048576 --graph-reserve-mib 128 \
+  --max-documents 256 --max-records 1000 --max-snapshots 1000 \
+  > resolved-epochs.ndjson
+```
+
+The source-conversion route replaces `--snapshot` and its independent digest
+pin with `--source-dir` and `--source-manifest`. Optional `--save-snapshot`
+persists that explicitly requested conversion after fixed-policy authentication
+and before corpus input; the snapshot remains if later input or inference fails.
+
+Each explicit flush produces one completed epoch, including an empty epoch.
+EOF produces another epoch only when documents remain. IDs must be unique
+within an epoch and may be reused after its completed flush. Every nonempty
+document goes through native NER, followed by original-coordinate occurrence
+verification and both-order scoring of the complete lexical candidate graph.
+An epoch is published only after its entire discovery and resolution succeeds.
+**Clusters are local to one epoch:** documents separated by a flush are not
+compared, and cluster IDs do not identify a corpus-wide or durable entity.
+
+The same invocation owns all lifetime allowances; flushing does not renew them:
+
+| Scope | Bounds |
+|---|---|
+| Each epoch | Original input bytes, document and mention counts, expanded bytes, chunks, candidate pairs, graph scans/checks, and complete result bytes |
+| Each document or chunk | Document bytes, NER tokens, source-mask work, and native context capacity |
+| Entire invocation | All five model-work counters, total mask reservations, grounding fields/matches/scans, records, snapshots, total input/output bytes, checkpoints, and elapsed time |
+
+The existing `--max-snapshot-mask-node-visits` option is a **whole-invocation**
+ceiling on this command. `--max-grounding-fields`, `--max-grounding-matches`
+and `--max-grounding-scan-steps` independently bound occurrence recovery across
+all epochs. Native NER and mask reservations are never refunded after early
+EOS. `--max-total-output-bytes` includes a separately reserved terminal footer;
+an epoch cannot consume the space needed to complete the run. These limits
+admit work and storage; they do not promise that a given population will fit.
+
+Output uses `fnlp-raw-entity-corpus-v1`. Each `corpus` event includes its epoch,
+record sequence, actual candidate model/source/group/kernel provenance, and a
+complete native result under `result.output`. Whole-run success requires both
+**`run_complete` and exit 0**. The footer is written only after hosted work has
+physically drained. Malformed later input, exhausted budgets, cancellation,
+failed inference, partial writes or failed flushes stop the stream without
+retrying output or emitting a success footer. Earlier completely delivered
+epochs remain valid within their own scope. Content-free errors go to stderr.
+
+Embedders can call `NlpEngine::execute_int4_entity_corpus` and consume
+`HostedInt4EntityCorpus::finish()` after examining its summary. The host prices
+parser/input storage, source witnesses, graph/output staging, complete native
+KV/scratch and cleanup before execution, and retains writer guards through
+terminal delivery. Blocking IO observes cancellation cooperatively.
+
+This is candidate implementation code. Source review and bounded protocol,
+admission and lifetime-ledger fixtures accompany the change. Compilation and
+test execution require the controller-selected DSR checkpoint; the ignored
+model-present fixture separately covers repeated native epochs, late input
+failure, lifetime-mask exhaustion, broken writers and cancellation/drain.
+NER recall, entity-identity accuracy, scalar/SIMD parity and release
+qualification remain separate evidence gates.
 
 ## Implemented candidate INT4 redaction
 

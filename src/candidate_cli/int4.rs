@@ -122,6 +122,7 @@ enum Int4Task {
     Judge(judge::JudgeArgs),
     ScoredBatch(scored_batch::BatchArgs),
     Resolve(resolve::ResolveArgs),
+    ResolveCorpus(resolve::corpus::CorpusArgs),
     Redact(redact::RedactArgs),
     RedactDocument(redact::long::DocumentArgs),
     RedactCorpus(redact::long::corpus::CorpusArgs),
@@ -180,6 +181,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(scored_job::definition())
         .subcommand(document_job::definition())
         .subcommand(resolve::definition())
+        .subcommand(resolve::corpus::definition())
         .subcommand(redact::definition())
         .subcommand(redact::long::definition())
         .subcommand(redact::long::corpus::definition())
@@ -253,6 +255,7 @@ impl Int4Command {
             "judge" => Int4Task::Judge(judge::JudgeArgs::from_matches(matches)?),
             "score-batch" => Int4Task::ScoredBatch(scored_batch::BatchArgs::from_matches(matches)?),
             "resolve" => Int4Task::Resolve(resolve::ResolveArgs::from_matches(matches)?),
+            "resolve-corpus" => Int4Task::ResolveCorpus(resolve::corpus::CorpusArgs::from_matches(matches)?),
             "redact" => Int4Task::Redact(redact::RedactArgs::from_matches(matches)?),
             "redact-document" => Int4Task::RedactDocument(redact::long::DocumentArgs::from_matches(matches)?),
             "redact-corpus" => Int4Task::RedactCorpus(redact::long::corpus::CorpusArgs::from_matches(matches)?),
@@ -285,6 +288,8 @@ impl Int4Command {
         let result = match self {
             Self { task: Int4Task::Stream(task, options), args, batch: None, job: None } =>
                 return options.run_owned(task, args, input, output, diagnostics),
+            Self { task: Int4Task::ResolveCorpus(options), args, batch: None, job: None } =>
+                return options.run_owned(args, input, output, diagnostics),
             Self { task: Int4Task::TextJob, args, batch: None, job: Some(Int4JobCommand::Generation(job)) } =>
                 return job.run_owned(args, input, &mut output, diagnostics),
             Self { task: Int4Task::ExtractJob, args, batch: None, job: Some(Int4JobCommand::Extraction(job)) } =>
@@ -318,7 +323,7 @@ impl Int4Command {
         }
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
-        if self.job.is_some() || matches!(self.task, Int4Task::Stream(..) | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob) {
+        if self.job.is_some() || matches!(self.task, Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob) {
             return Err(CandidateError::Arguments);
         }
         if let Some(batch) = self.batch {
@@ -355,7 +360,7 @@ impl Int4Command {
             Int4Task::Extract(extraction) => extraction.validate(&self.args)?,
             Int4Task::Source(_, source) => source.validate(&self.args)?,
             // The blocking stream must own its input and writer through cleanup.
-            Int4Task::Stream(..) | Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::Semantic(_) | Int4Task::Resolve(_) | Int4Task::Sentiment(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ScoredBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
+            Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::Semantic(_) | Int4Task::Resolve(_) | Int4Task::Sentiment(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ScoredBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
                 | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob => return Err(CandidateError::Arguments),
         };
         #[cfg(feature = "asupersync-runtime")]

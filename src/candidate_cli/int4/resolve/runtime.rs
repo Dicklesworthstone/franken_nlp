@@ -61,7 +61,7 @@ fn execution_error(error: HostedError) -> CandidateError {
         _ => CandidateError::Execution,
     }
 }
-fn planner(model: &Int4ModelIdentity) -> Result<(ResolutionPlanner, ExecutionIdentity), CandidateError> {
+pub(in crate::candidate_cli::int4::resolve) fn planner(model: &Int4ModelIdentity) -> Result<(ResolutionPlanner, ExecutionIdentity), CandidateError> {
     let registry = crate::tokenizer::pinned_controls::pinned().map_err(|_| CandidateError::Identity)?;
     let controls = registry.template_controls();
     let mut ends = controls.entries().iter().filter(|entry| entry.special && entry.surface == crate::template::IM_END);
