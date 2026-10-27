@@ -721,6 +721,110 @@ native planners. CLI, native ledger and host fixtures are authored; compilation,
 model-present execution and quality qualification remain pending the authorized
 controller gates.
 
+## Implemented candidate INT4 scoring jobs
+
+`fnlp candidate source-int4 score-job start|resume --task classify|sentiment|judge`
+connects the same complete native scoring bundles to the authenticated owned-job
+runner. It retains completed item results and resumes pending items with one
+resident grouped-INT4 model. The route requires `metadata-store` and
+`asupersync-runtime` on Linux x86-64 or AArch64.
+
+Use the same `labels.json` and `{id,text,task_args?}` records described above.
+Prepare an existing protected job directory, a protected key file containing
+exactly 32 random **raw bytes**, a random 128-bit job ID represented by 32
+lowercase hexadecimal characters, and an immutable `JobLimits` JSON file.
+The command requires `--store-results`; it creates neither the directory nor
+the key. See [owned job storage](docs/owned-jobs.md) for the storage contract.
+
+For example, `scoring-job-limits.json` can declare these finite ceilings:
+
+```json
+{
+  "max_items": 1000,
+  "max_id_bytes": 128,
+  "max_input_bytes_per_item": 65536,
+  "max_snapshot_bytes": 67108864,
+  "max_result_bytes": 1048576,
+  "max_spool_bytes": 1073741824,
+  "max_materialized_bytes": 1073741824,
+  "max_journal_bytes": 67108864,
+  "max_attempts": 1100,
+  "max_work": {
+    "model": {
+      "forward_positions": 1310720,
+      "projected_logits": 1000000000,
+      "attention_pairs": 1000000000000,
+      "projections": {
+        "dot_products": 1000000000000,
+        "multiply_accumulates": 10000000000000000
+      }
+    },
+    "mask_node_visits": 0
+  }
+}
+```
+
+These are work and storage limits, not a prediction of how many documents will
+fit. Actual complete-head work must fit the remaining budget for every item.
+
+```bash
+fnlp candidate source-int4 score-job start documents.ndjson \
+  --task classify --defaults labels.json \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --memory-mib 16384 --group-width 128 \
+  --store-results --job-dir /private/scoring-job \
+  --job-id "$JOB_ID" --key-file /private/scoring-job.key \
+  --limits scoring-job-limits.json --materialize
+```
+
+Use `resume` in place of `start`, with the same settings and the **complete
+original population**, including committed records. IDs are unique across the
+whole frozen population; live-stream flush controls are refused. Inputs are
+admitted in memory for the invocation and are not persisted for future recovery.
+Per-record `task_args` keeps the existing typed contract and replaces complete
+shared defaults. Sentiment mode, terminal EOS and policy remain run-wide.
+
+The five scoring work flags now bound **each item**, including all its heads.
+The immutable limits file supplies the **whole-job lifetime ceiling**; every
+per-item ceiling must fit it, and `mask_node_visits` must be zero because these
+tasks use finite scoring. The recipe binds all per-item planner limits, defaults,
+policies, prompt versions and actual model/group identity. Changing either the
+recipe or the original input bytes/order/IDs refuses authenticated resume.
+Neither additional items, attempts, transport capacity nor another invocation
+renews persisted work. Actual grouped INT4 dot counts are preserved exactly.
+
+Each attempt is durably debited before native execution. Complete results are
+synchronized to the spool before their journal pointer is committed. Resume
+skips committed ordinals; interrupted attempts retain their debit. Repair of
+uncommitted tails or stages requires the explicit resume-only
+`--discard-uncommitted-tail` flag and follows original-contract authentication.
+Failed or incomplete native bundles never become committed successful results.
+
+Source conversion using `--source-dir` plus `--source-manifest` is also
+supported. Optional `--save-snapshot NEW_FILE` follows shared-default and
+model-bound factory admission; a completed snapshot remains if subsequent
+population authentication or execution fails. Memory admission includes the
+whole population, journal and serializer staging, both preparation owners,
+resident model, full KV capacity and guarded result delivery.
+
+Stdout contains only candidate provenance and authenticated progress under
+`fnlp-candidate-int4-score-job-v1`. Private results remain in the protected
+spool; source text, shared defaults and private recipe bytes are omitted from
+completion metadata and journal content. `--materialize` publishes
+verified ordered `materialized.ndjson` only after all items commit. Existing
+stored-job status, verification and materialization work without loading the
+model. Report-delivery failure can follow durable progress and does not imply
+rollback; inspect the protected job or resume explicitly.
+
+Library callers construct `Int4ScoredJobPlanner` from an actual
+`Int4ClassificationPlanner`, `Int4SentimentPlanner` or `Int4JudgePlanner`, typed
+defaults and `Int4ScoredBatchLimits`, then call `NlpEngine::job_int4_scored` with
+`SourceJobRequest` and `JobHostLimits`. The durable trait is sealed to those
+three native planners. This route uses the existing job format and serial
+native execution. Fixtures are authored; compilation, model-present execution,
+crash qualification, task quality and performance remain pending their gates.
+
 ## Implemented candidate INT4 entity resolution
 
 `fnlp candidate source-int4 resolve` resolves a complete, bounded snapshot of

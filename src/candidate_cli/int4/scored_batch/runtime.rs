@@ -13,7 +13,7 @@ use crate::{
         sentiment::{SentimentOptions, SentimentPolicy, grouped_int4::Int4SentimentPlanner}},
 };
 
-fn sentiment_options(policy: SentimentPolicy) -> Result<SentimentOptions, CandidateError> {
+pub(in crate::candidate_cli::int4) fn sentiment_options(policy: SentimentPolicy) -> Result<SentimentOptions, CandidateError> {
     let controls = crate::tokenizer::pinned_controls::pinned().map_err(|_| CandidateError::Identity)?;
     let mut ends = controls.template_controls().entries().iter()
         .filter(|entry| entry.special && entry.surface == crate::template::IM_END);

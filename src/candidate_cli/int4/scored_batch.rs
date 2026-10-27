@@ -10,7 +10,7 @@ use crate::{
 };
 
 #[cfg(feature = "asupersync-runtime")]
-mod runtime;
+pub(super) mod runtime;
 #[cfg(test)]
 mod tests;
 
