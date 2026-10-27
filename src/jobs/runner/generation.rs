@@ -16,6 +16,7 @@ use crate::{
 };
 mod recipe;
 pub use recipe::GenerationJobRecipe;
+pub mod grouped_int4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
