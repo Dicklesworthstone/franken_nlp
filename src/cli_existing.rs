@@ -24,6 +24,7 @@ use crate::{
     artifact::fs_tx::open_ratified_model_root,
     artifact::package::{PackageRequest, package_model, verify_model_package},
     artifact::packing::{NativePackingTarget, TILE_TABLE_VERSION_V1},
+    artifact::pull::{LocalReconstructRequest, reconstruct_local_release},
     artifact::quantize::{GenericPanelBytes, encode_generic_panel},
     artifact::reader::FnlpqRangeReader,
     artifact::safetensors::{RowPanel, TensorCensusEntry},
@@ -130,8 +131,29 @@ struct ConvertCommand {
 
 #[derive(Subcommand)]
 enum ModelsSubcommand {
+    /// Reconstruct a verified Generic artifact from explicit local release parts.
+    Reconstruct(ModelsReconstructCommand),
     /// Derive one target-specific native cache from an immutable Generic root.
     Derive(ModelsDeriveCommand),
+}
+
+#[derive(clap::Args)]
+struct ModelsReconstructCommand {
+    /// Canonical release manifest acquired through the release channel.
+    #[arg(long)]
+    manifest: PathBuf,
+    /// Independently trusted domain-separated manifest SHA-256.
+    #[arg(long)]
+    manifest_sha256: String,
+    /// Directory containing the exact immutable .partNN members.
+    #[arg(long)]
+    parts_dir: PathBuf,
+    /// New staging pathname in the same directory as --output.
+    #[arg(long)]
+    staging_output: PathBuf,
+    /// New final Generic .fnlpq pathname; existing files are never replaced.
+    #[arg(long)]
+    output: PathBuf,
 }
 
 #[derive(clap::Args)]
@@ -382,7 +404,35 @@ fn cli_main_with_reader_and_terminal(
 
 fn run_models_command(command: ModelsSubcommand) -> ExitCode {
     match command {
+        ModelsSubcommand::Reconstruct(command) => run_models_reconstruct(command),
         ModelsSubcommand::Derive(command) => run_models_derive(command),
+    }
+}
+
+fn run_models_reconstruct(command: ModelsReconstructCommand) -> ExitCode {
+    match reconstruct_local_release(&LocalReconstructRequest {
+        manifest: command.manifest,
+        expected_release_manifest_sha256: command.manifest_sha256,
+        parts_dir: command.parts_dir,
+        staging_output: command.staging_output,
+        output: command.output,
+    }) {
+        Ok(report) => {
+            eprintln!(
+                "MODELS_RECONSTRUCT RESULT=PASS output={} staging={} artifact_bytes={} artifact_sha256={} manifest_sha256={} parts={} directory_durability=unconfirmed",
+                report.output.display(),
+                report.staging_output.display(),
+                report.artifact_bytes,
+                report.artifact_sha256,
+                report.release_manifest_sha256,
+                report.part_count,
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("MODELS_RECONSTRUCT RESULT=FAIL reason={error}");
+            ErrorCode::ArtifactIntegrityOrFormatOrVersion.as_process_exit()
+        }
     }
 }
 
@@ -2118,6 +2168,48 @@ mod tests {
                 command: ReleaseSubcommand::VerifyModelPackage { .. }
             })
         ));
+    }
+
+    #[test]
+    fn models_reconstruct_requires_manifest_pin_parts_staging_and_final_paths() {
+        let parsed = Cli::try_parse_from([
+            "fnlp",
+            "models",
+            "reconstruct",
+            "--manifest",
+            "/release/model.manifest.json",
+            "--manifest-sha256",
+            "abababababababababababababababababababababababababababababababab",
+            "--parts-dir",
+            "/release",
+            "--staging-output",
+            "/models/model.fnlpq.stage",
+            "--output",
+            "/models/model.fnlpq",
+        ])
+        .expect("local reconstruction accepts every explicit authority");
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Models {
+                command: ModelsSubcommand::Reconstruct(_)
+            })
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "fnlp",
+                "models",
+                "reconstruct",
+                "--manifest",
+                "/release/model.manifest.json",
+                "--parts-dir",
+                "/release",
+                "--staging-output",
+                "/models/model.fnlpq.stage",
+                "--output",
+                "/models/model.fnlpq",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
