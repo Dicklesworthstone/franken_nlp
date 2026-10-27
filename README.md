@@ -2642,6 +2642,116 @@ no-thinking/no-tools generation contract. Library callers construct
 This is source-inventoried candidate functionality; build, model-present
 correctness, crash recovery, determinism and quality gates remain pending.
 
+## Experimental candidate INT4 extraction second reader
+
+`fnlp candidate source-int4 extract-semantic` combines real schema-constrained
+INT4 extraction with the existing full-source faithfulness judge. It preserves
+the original extraction, including exact JSON and native/source evidence, and
+adds per-field `entailed`, `contradicted`, `unsupported`, or `not_checked`
+diagnostics. The same model performs both passes. These are explicitly
+uncalibrated, correlated signals; the command never repairs a field,
+automatically accepts a document, or certifies factual correctness. Ordinary
+`extract`, extraction batches and extraction jobs keep their existing behavior.
+
+The command requires a local `--semantic-options` file containing the complete
+`tasks::extract::semantic::grouped_int4::Int4SemanticOptions` contract, including
+`experimental_opt_in: true`. Claim rules identify a typed schema path and a
+scalar kind, then render `prefix + exact canonical JSON scalar + suffix`.
+String quotes and exact decimals are retained; no generated interpretation of
+the field name supplies a claim. Rules cannot target a verbatim source field.
+Null, verbatim, unmapped and empty values are `not_checked`; absent optional
+properties are not invented. A judge abstention also remains `not_checked`.
+
+For an extraction schema with an integer property named `amount`, an explicit
+experimental options file can be:
+
+```json
+{
+  "specification": {
+    "schema_version": 1,
+    "experimental_opt_in": true,
+    "revision": "amount-review-v1",
+    "claims": [{
+      "id": "amount-v1",
+      "path": [{"kind": "property", "name": "amount"}],
+      "value_kind": "integer",
+      "prefix": "The source states that the amount is ",
+      "suffix": "."
+    }],
+    "judge_policy": {
+      "minimum_candidate_weight_ppm": 0,
+      "minimum_margin_milli": 0,
+      "evidence_window_bytes": 8192,
+      "max_evidence_windows": 8,
+      "max_evidence_spans": 8
+    },
+    "judge_budget": {
+      "max_input_tokens": 1985,
+      "max_output_tokens": 64,
+      "max_output_bytes": 65536,
+      "max_grammar_states": 4096,
+      "max_kv_bytes": 369098752
+    }
+  },
+  "limits": {
+    "max_fields": 4,
+    "max_claim_bytes": 4096,
+    "max_total_claim_bytes": 16384,
+    "max_template_bytes": 65536,
+    "max_walk_nodes": 1024,
+    "max_input_json_bytes": 1048576,
+    "max_total_prompt_tokens": 8192,
+    "max_total_projected_logits": 100000000,
+    "max_output_bytes": 4194304
+  },
+  "max_model_work": {
+    "forward_positions": 100000,
+    "projected_logits": 100000000,
+    "attention_pairs": 1000000000000,
+    "projections": {
+      "dot_products": 10000000000000,
+      "multiply_accumulates": 1000000000000000
+    }
+  }
+}
+```
+
+These numbers are explicit resource ceilings and an uncalibrated example
+policy, not a performance estimate or a recommended acceptance threshold. The
+KV allowance above prices the complete 2,048-token resident context and must
+match `--context-tokens`. The judge must fit the whole source and every selected
+evidence window; a long source is refused rather than truncated or retrieved
+selectively. Increase limits only when the intended complete request fits the
+process memory and work budget.
+
+```bash
+fnlp candidate source-int4 extract-semantic document.txt \
+  --source-dir ./pinned-source \
+  --source-manifest ./conversion-source.json \
+  --memory-mib 8192 --context-tokens 2048 \
+  --schema ./amount.schema.json \
+  --semantic-options ./amount-semantic.json
+```
+
+Digest-pinned `--snapshot FILE --expected-model-sha256 HEX` uses the same path.
+Optional source `--save-snapshot NEW_FILE` follows fixed schema/rule/policy and
+complete memory preflight. Field claims and their native plans are produced
+only after extraction, so later dynamic-plan refusal can leave a valid saved
+snapshot. Every field judge must compile and preflight before any second-reader
+forward. The original maximum extraction work plus all complete field judgments
+share the five-axis `max_model_work` ceiling; early EOS never refunds the first
+stage. Any field failure returns no combined result.
+
+Memory admission includes full context KV, all retained field-source copies,
+prompt/candidate graphs, simultaneous judge results, and the final combined
+output. `--max-result-bytes` bounds the original extraction;
+`limits.max_output_bytes` bounds the combined result. The completed guarded
+output carries candidate model provenance without private configuration paths
+or prompt digests. There are no partial-field events, repair retries, sampling,
+thinking, tool execution, durable checkpoints, or inference network access.
+Compilation, fixtures, model-present behavior and incremental error-catching
+value remain unverified until their separate controller/evaluation gates run.
+
 ## Installation
 
 **1. Install script: *not yet available*.** The planned script installs and SHA-256-verifies the `fnlp` binary, then offers (interactive `y/N`; `--with-model` / `--no-pull` in automation) to run the installed binary's own `fnlp pull`; shell never touches model bytes itself. It is deliberately not shown as a runnable command: `install.sh` does not exist yet and there are no release binaries for it to install. This section becomes a command again when Phase 6 ships one.
