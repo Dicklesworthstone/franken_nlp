@@ -23,6 +23,7 @@ use crate::{
 };
 use serde::Serialize;
 use std::sync::Arc;
+pub mod document;
 
 const INPUT_POLICY: &str = "typed-source-records-fixed-task-full-resident-kv-v1";
 
