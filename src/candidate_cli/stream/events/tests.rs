@@ -282,3 +282,123 @@ fn sink_policy_must_match_the_exact_admitted_output_contract() {
         assert!(TokenSink::new(Vec::new(), Task::Generate, bounds(false), &facts(), &policy).is_err(), "axis {axis}");
     }
 }
+
+// These private framing fixtures deliberately do not manufacture an
+// Int4ModelIdentity. The product constructor accepts only real loaded weights;
+// model-present stream equality is exercised by the separate ignored CLI test.
+fn int4_provenance(width: usize) -> Provenance {
+    Provenance::Int4 { model_id: "Nanbeige4.2-3B",
+        source_revision: crate::artifact::converter::PINNED_REVISION,
+        source_root_sha256: "ab".repeat(32), model_content_sha256: "cd".repeat(32),
+        candidate_format: INT4_SOURCE_FORMAT,
+        quant_recipe: format!("{}:group={width}",
+            crate::native_engine::portable_int8::int4::convert::GROUPED_INT4_RECIPE), group_width: width }
+}
+fn int4_sink(scores: bool, width: usize) -> TokenSink<Vec<u8>> {
+    TokenSink::with_provenance(Vec::new(), Task::Generate, bounds(scores),
+        int4_provenance(width), &options(scores)).unwrap()
+}
+fn int4_completion<W: Write>(s: &TokenSink<W>, finish: GenerationFinish, width: usize) -> Int4ChatResult {
+    let mut chat = completion(s, finish).result;
+    chat.execution = INT4_GENERATION_VERSION.to_owned();
+    chat.numerics_profile = STRICT_INT4_PROFILE.to_owned();
+    let model_work = Int4Work::for_sequence(width, 0, chat.native_work.forward_positions as usize,
+        chat.native_work.projected_logits as usize).unwrap();
+    Int4ChatResult { schema_version: 1, result: chat, model_work }
+}
+
+#[test]
+fn int4_frames_retain_candidate_identity_and_exact_complete_task_result() {
+    for width in [3, 128] {
+        let mut policy = options(true);
+        policy.sampling = GenerationSampling::Seeded { effective_seed: [7; 32],
+            temperature_milli: 700, top_k: Some(8), top_p_ppm: 900_000 };
+        let mut s = TokenSink::with_provenance(Vec::new(), Task::Chat, bounds(true),
+            int4_provenance(width), &policy).unwrap();
+        push(&mut s, event(0, 1, &[0xc3], true));
+        push(&mut s, event(1, 2, &[0xa9], true));
+        push(&mut s, event(2, 166101, b"", true));
+        let result = int4_completion(&s, GenerationFinish::Eos, width);
+        s.finish_int4(&result).unwrap();
+        let rows = rows(&s.writer);
+        assert_eq!(rows.len(), 5);
+        for row in &rows {
+            assert_eq!(row["protocol"], PROTOCOL);
+            assert_eq!(row["scope"], "real-source-current-candidate-int4");
+            assert_eq!(row["evidence"], "non_authoritative");
+            assert_eq!(row["candidate_format"], INT4_SOURCE_FORMAT);
+            assert_eq!(row["group_width"], width);
+            assert_eq!(row["model_content_sha256"], "cd".repeat(32));
+            assert_eq!(row["source_root_sha256"], "ab".repeat(32));
+            assert!(row.get("logical_model_sha256").is_none());
+            assert!(row.get("prompt_digest").is_none());
+            assert!(row.get("input").is_none());
+        }
+        assert_eq!(rows[4]["data"], serde_json::to_value(result).unwrap());
+        assert_eq!(rows[4]["provisional"], false);
+        assert_eq!(rows[4]["data"]["result"]["effective_seed"], "07".repeat(32));
+    }
+}
+
+#[test]
+fn int4_completion_rejects_other_profiles_group_partitions_and_changed_work_axes() {
+    for axis in 0..9 {
+        let mut s = int4_sink(false, 128);
+        push(&mut s, event(0, 166101, b"", false));
+        let before = s.writer.clone();
+        let mut result = int4_completion(&s, GenerationFinish::Eos, 128);
+        match axis {
+            0 => result.model_work.forward_positions += 1,
+            1 => result.model_work.projected_logits += 1,
+            2 => result.model_work.attention_pairs += 1,
+            3 => result.model_work.projections.dot_products += 1,
+            4 => result.model_work.projections.multiply_accumulates += 1,
+            5 => result.model_work = int4_completion(&s, GenerationFinish::Eos, 64).model_work,
+            6 => result.result.execution = INT8_GENERATION_VERSION.to_owned(),
+            7 => result.result.numerics_profile = STRICT_INT8_PROFILE.to_owned(),
+            _ => result.schema_version += 1,
+        }
+        assert!(s.finish_int4(&result).is_err(), "axis {axis}");
+        assert_eq!(s.writer, before);
+        assert!(s.finish_int4(&int4_completion(&s, GenerationFinish::Eos, 128)).is_err());
+    }
+}
+
+#[test]
+fn streams_cannot_exchange_completions_between_int8_and_int4_backends() {
+    let mut a = int4_sink(false, 128);
+    push(&mut a, event(0, 166101, b"", false));
+    let before = a.writer.clone();
+    assert!(a.finish(&completion(&a, GenerationFinish::Eos)).is_err());
+    assert_eq!(a.writer, before);
+    let mut b = sink(false);
+    push(&mut b, event(0, 166101, b"", false));
+    let before = b.writer.clone();
+    assert!(b.finish_int4(&int4_completion(&b, GenerationFinish::Eos, 128)).is_err());
+    assert_eq!(b.writer, before);
+}
+
+#[test]
+fn int4_stop_suffix_and_output_failure_use_the_same_no_retry_protocol() {
+    let mut policy = options(false);
+    policy.min_new_tokens = 2;
+    policy.stop_suffixes = vec![b"END".to_vec()];
+    let mut s = TokenSink::with_provenance(Vec::new(), Task::Generate, bounds(false),
+        int4_provenance(128), &policy).unwrap();
+    push(&mut s, event(0, 1, b"E", false));
+    push(&mut s, event(1, 2, b"ND", false));
+    s.finish_int4(&int4_completion(&s, GenerationFinish::StopSuffix, 128)).unwrap();
+    assert_eq!(rows(&s.writer).last().unwrap()["data"]["result"]["content"], "END");
+
+    for fail_flush in [false, true] {
+        let writer = Broken { bytes: Vec::new(), calls: 0, flushes: 0, fail_flush };
+        let mut s = TokenSink::with_provenance(writer, Task::Generate, bounds(false),
+            int4_provenance(128), &policy).unwrap();
+        let e = event(0, 1, b"E", false);
+        let permit = s.reserve(&e).unwrap();
+        assert!(s.permit(permit, e).is_err());
+        let before = (s.writer.calls, s.writer.flushes, s.writer.bytes.len());
+        assert!(s.finish_int4(&int4_completion(&s, GenerationFinish::ByteLimit, 128)).is_err());
+        assert_eq!(before, (s.writer.calls, s.writer.flushes, s.writer.bytes.len()));
+    }
+}

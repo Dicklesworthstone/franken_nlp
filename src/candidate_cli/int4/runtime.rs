@@ -16,6 +16,8 @@ use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, Me
         ir::{PlanContext, TaskBudget}, source_planning::{SourceTaskRequest,
             grouped_int4::{PreparedInt4SourceTask, Int4SourceTaskRun}}}};
 
+pub(super) mod streaming;
+
 // Typed task alternatives share one loader, preparation guard and publication
 // envelope. Only real hosted execution can construct the guarded completion.
 enum Input {
@@ -86,7 +88,7 @@ impl DecodeStepControl for DeadlineControl {
 
 pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
-    if matches!(&task, Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::Semantic(_) | Int4Task::Resolve(_) | Int4Task::Sentiment(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ScoredBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_) | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob)
+    if matches!(&task, Int4Task::Stream(..) | Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::Semantic(_) | Int4Task::Resolve(_) | Int4Task::Sentiment(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ScoredBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_) | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob)
         || limits.minimum_memory_bytes > limits.memory_bytes || limits.kernel.kind() != args.kernel
         || !prefill::matches(&args, limits)?
         || (!matches!(&task, Int4Task::Text(_)) && limits.prefill.is_some()) {
@@ -135,7 +137,7 @@ pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
                 options.budget(&args, limits), args.max_input_bytes)?;
             Input::Source { request, options }
         }
-        Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::Semantic(_) | Int4Task::Resolve(_) | Int4Task::Sentiment(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ScoredBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
+        Int4Task::Stream(..) | Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::Semantic(_) | Int4Task::Resolve(_) | Int4Task::Sentiment(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ScoredBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
             | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob => return Err(CandidateError::Arguments),
     };
     remaining()?;
@@ -269,6 +271,15 @@ fn prepare(request: Input, model: &ResidentInt4, args: &Int4Args, limits: Int4Li
 /// corpus extraction. A failed snapshot never falls back to another source.
 pub(super) fn load_model(engine: &NlpEngine, args: &Int4Args, limits: Int4Limits,
     remaining: Duration, cancellation: CancellationToken) -> Result<ResidentInt4, CandidateError> {
+    load_model_with_failure(engine, args, limits, remaining, cancellation, |_| CandidateError::Model)
+}
+
+/// The source/snapshot contract is identical for every delivery mode. A
+/// streaming caller retains the typed host outcome instead of collapsing a
+/// cancelled load into an ordinary model-format error.
+fn load_model_with_failure<E: From<CandidateError>>(engine: &NlpEngine, args: &Int4Args,
+    limits: Int4Limits, remaining: Duration, cancellation: CancellationToken,
+    failure: impl FnOnce(crate::hosted::HostedError) -> E) -> Result<ResidentInt4, E> {
     match (&args.snapshot, limits.snapshot_pin) {
         (Some(path), Some(pin)) => engine.load_int4_snapshot(path.clone(), pin, limits.snapshot_budget(true)?,
             ALLOCATOR_BYTES, snapshot_run(args, remaining), cancellation),
@@ -276,8 +287,8 @@ pub(super) fn load_model(engine: &NlpEngine, args: &Int4Args, limits: Int4Limits
             args.source_dir.clone().ok_or(CandidateError::Arguments)?,
             args.source_manifest.clone().ok_or(CandidateError::Arguments)?,
             args.group_width, load_limits(args, limits, remaining), cancellation),
-        _ => return Err(CandidateError::Arguments),
-    }.map_err(|_| CandidateError::Model)
+        _ => return Err(CandidateError::Arguments.into()),
+    }.map_err(failure)
 }
 
 fn load_limits(args: &Int4Args, limits: Int4Limits, remaining: Duration) -> Int4LoadLimits {

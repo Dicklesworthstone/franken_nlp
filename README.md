@@ -32,7 +32,8 @@
 > `robot schema|health|backends`, `schema check|sample`, conversion/package
 > scaffolding, and explicit local inference and corpus routes under `candidate`.
 > Candidate execution requires the `asupersync-runtime` feature. The
-> `candidate source-int4` namespace includes generation/chat, classification,
+> `candidate source-int4` namespace includes generation/chat,
+> [live token streaming](#implemented-candidate-int4-token-streaming), classification,
 > [independent dimensional sentiment](#implemented-candidate-int4-dimensional-sentiment),
 > [pairwise, rubric and faithfulness judgment](#implemented-candidate-int4-judgment),
 > [resident classification, sentiment and judgment streams](#implemented-candidate-int4-scoring-batches),
@@ -295,6 +296,69 @@ fnlp doctor                          # idempotent self-check/repair
 # Phase-7 research surfaces (plan-staged, evidence-gated):
 #   fnlp audit plan/grade · fnlp job partition/merge · fnlp resident start
 ```
+
+## Implemented candidate INT4 token streaming
+
+`fnlp candidate source-int4 stream generate|chat` exposes live native token
+events for explicit INT4 source conversion or a digest-pinned local snapshot.
+It uses the same model, pinned text planner, generation policy and final task
+validator as buffered INT4 generation. The candidate build requires
+`asupersync-runtime`.
+
+```bash
+fnlp candidate source-int4 stream generate prompt.txt \
+  --source-dir /models/Nanbeige4.2-3B \
+  --source-manifest /models/nanbeige-source-manifest.json \
+  --memory-mib 8192 \
+  --max-new-tokens 128 \
+  --max-stream-bytes 16777216
+
+fnlp candidate source-int4 stream chat messages.json \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$EXPECTED_MODEL_SHA256" \
+  --memory-mib 8192 \
+  --prefill-rows 4 \
+  --logprobs
+```
+
+Use `-` for stdin. Chat accepts the existing bounded JSON message array.
+The snapshot digest must come from an independently trusted conversion record;
+`--group-width` must match that model. Source conversion can also use
+`--save-snapshot NEW_FILE`. A failed snapshot load remains an error.
+
+Each canonical NDJSON frame uses `protocol: "fnlp-candidate-token-stream-v1"`
+and `scope: "real-source-current-candidate-int4"`. Frames carry the actual
+model-content fingerprint, source root, group width and candidate recipe.
+The sequence is `run_start`, provisional `token` events, then `run_complete`.
+Token payloads contain exact `decoded_bytes` arrays; individual tokens can
+split a UTF-8 character. Concatenate these bytes before decoding text.
+The terminal `data` is the complete native task result returned by buffered
+execution, including token IDs, finish reason, optional raw full-vocabulary
+log probabilities and grouped model-work counts.
+
+**Success requires `run_complete` and exit code 0.** The terminal is emitted
+only after task validation, native cleanup and the host's final cancellation
+decision. EOS, EOF and provisional tokens alone do not authorize completion.
+The sink reconciles every delivered token, byte and score before writing the
+terminal. A partial write or failed flush permanently ends delivery; no retry
+or success footer follows it. Errors produce a content-free `run_error` on
+stderr with the typed exit category.
+
+Seeded sampling, `--stop`, `--min-new-tokens`, penalties and token bans retain
+buffered semantics. Exact stop bytes remain in the output, including stops
+split across token boundaries. `--max-output-bytes` bounds generated content;
+`--max-stream-bytes` separately bounds the entire transport and reserves space
+for the terminal result. Admission includes full native buffers, optional
+prefill scratch, retained preparation, sink storage and output. Blocking
+writes apply backpressure to native execution.
+
+Embedding applications can use `NlpEngine::execute_int4_chat_stream` or
+`execute_int4_chat_stream_layer_major`. Their `HostedInt4ChatStream` completion
+retains the sink and its memory charge through final publication.
+The retained regression fixtures cover framing and failure boundaries; a
+separate model-present fixture compares buffered and streamed execution.
+Compilation, test execution and model qualification remain pending the
+controller's required DSR and model gates.
 
 ### Implemented candidate INT4 extraction batches
 
