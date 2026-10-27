@@ -26,6 +26,7 @@ mod dispatch;
 mod grouped_int4;
 pub use grouped_int4::{Int4HostError, Int4LoadLimits, Int4LoadRequirements, Int4ExtractionMapConfig,
     Int4SourceCorpusConfig, Int4SourceMapConfig, Int4SentimentHostLimits, Int4JudgeHostLimits,
+    Int4SemanticHostLimits, Int4SemanticHostRequirements,
     Int4ResolveConfig, ResidentInt4};
 mod scored;
 mod sentiment;

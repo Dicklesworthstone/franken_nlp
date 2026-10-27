@@ -13,6 +13,8 @@ mod resolve;
 pub use resolve::Int4ResolveConfig;
 mod redact;
 mod extract;
+mod semantic;
+pub use semantic::{Int4SemanticHostLimits, Int4SemanticHostRequirements};
 mod extraction_map;
 pub use extraction_map::Int4ExtractionMapConfig;
 mod source;
@@ -89,6 +91,7 @@ pub enum Int4HostError {
     Entities(crate::corpus::entities_int4::Int4EntityError),
     Redaction(crate::tasks::redact::grouped_int4::Int4RedactionError),
     Extraction(crate::tasks::extract::grouped_int4::Int4ExtractError),
+    SemanticExtraction(crate::tasks::extract::semantic::grouped_int4::Int4SemanticError),
     ExtractionMap(crate::batch::extract::grouped_int4::long::Int4ExtractionMapError),
     SourceTask(crate::tasks::source_planning::grouped_int4::Int4SourceError),
     SourceMap(crate::tasks::source_planning::grouped_int4::long::Int4SourceMapError),
@@ -110,6 +113,7 @@ impl fmt::Display for Int4HostError {
             Self::Entities(_) => "INT4 original-document entity discovery or resolution refused",
             Self::Redaction(_) => "INT4 redaction detection, editing or verification refused",
             Self::Extraction(_) => "INT4 schema extraction execution or finalization refused",
+            Self::SemanticExtraction(_) => "INT4 extraction second-reader execution or finalization refused",
             Self::ExtractionMap(_) => "INT4 complete-document extraction or reduction refused",
             Self::SourceTask(_) => "INT4 source task execution or finalization refused",
             Self::SourceMap(_) => "INT4 complete-document source mapping refused",
@@ -128,6 +132,7 @@ impl Error for Int4HostError {
             Self::Sentiment(e) => Some(e), Self::Judge(e) => Some(e), Self::Resolution(e) => Some(e),
             Self::Entities(e) => Some(e), Self::Redaction(e) => Some(e),
             Self::Extraction(e) => Some(e), Self::ExtractionMap(e) => Some(e), Self::SourceTask(e) => Some(e),
+            Self::SemanticExtraction(e) => Some(e),
             Self::SourceMap(e) => Some(e), Self::SourceSummary(e) => Some(e), Self::SourceKeyphrases(e) => Some(e) }
     }
 }
