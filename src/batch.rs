@@ -14,6 +14,7 @@ pub mod extract;
 pub mod generation;
 pub mod grouped;
 pub mod judge;
+pub mod scored_int4;
 pub mod source;
 mod framing;
 mod output;
