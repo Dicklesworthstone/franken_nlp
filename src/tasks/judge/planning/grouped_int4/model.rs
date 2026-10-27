@@ -24,6 +24,9 @@ impl Int4JudgePlanner {
     /// Model/asset-bound base; each prepared plan binds its whole request.
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     pub fn group_width(&self) -> usize { self.model.group_width() }
+    pub(crate) fn semantic_configuration(&self) -> (TaskBudget, JudgeLimits) {
+        (self.ceiling, self.limits)
+    }
     #[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub(crate) fn durable_configuration(&self) -> (TaskBudget, JudgeLimits) {
         (self.ceiling, self.limits)
@@ -36,6 +39,23 @@ impl Int4JudgePlanner {
         let context = PlanContext::new(&self.identity, self.ceiling)
             .map_err(|_| JudgeError::Contract("judge plan context"))?;
         self.compiler.plan_int4_with_control(request, &context, self.limits, &self.model, control)
+    }
+    /// A composed second reader can only tighten prompt/logit work. Model,
+    /// task ceiling and every other complete-head limit remain factory-owned.
+    pub(crate) fn plan_semantic_with_control<C: DecodeStepControl>(&self, request: &JudgeRequest,
+        prompt_tokens: usize, projected_logits: u64, control: &mut C)
+        -> Result<PreparedInt4Judge, Int4JudgeError> {
+        if !matches!(request, JudgeRequest::Faithfulness { .. }) {
+            return Err(JudgeError::Contract("semantic reader requires faithfulness").into());
+        }
+        let limits = JudgeLimits {
+            max_total_prompt_tokens: self.limits.max_total_prompt_tokens.min(prompt_tokens),
+            max_total_projected_logits: self.limits.max_total_projected_logits.min(projected_logits),
+            ..self.limits
+        };
+        let context = PlanContext::new(&self.identity, self.ceiling)
+            .map_err(|_| JudgeError::Contract("judge plan context"))?;
+        self.compiler.plan_int4_with_control(request, &context, limits, &self.model, control)
     }
 }
 fn uncompiled_identity(compiler: &JudgePlanner) -> ExecutionIdentity {

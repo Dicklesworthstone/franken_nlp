@@ -152,6 +152,25 @@ impl Int4ExtractPlan {
         Ok(())
     }
 
+    /// Internal semantic composition may inspect the compiled schema only
+    /// while the original task and complete byte-token source remain attached.
+    /// This does not expose an eager executable or accept a replacement schema.
+    pub(crate) fn semantic_schema(&self, task: &TaskPlan, source: &SourceDocument)
+        -> Result<&crate::grammar::SchemaNode, Int4ExtractError> {
+        if self.extraction.task_identity != "extract-v1" || task.task_spec_identity() != "extract-v1"
+            || task.ir().digest().map_err(|_| ExtractError::Serialization)? != self.extraction.taskir_digest {
+            return Err(Int4ExtractError::Identity);
+        }
+        let mut documents = task.ir().prompt_segments().iter()
+            .filter(|segment| segment.kind() == PromptSegmentKind::Document);
+        if documents.next().is_none_or(|segment| segment.token_ids() != source.token_ids())
+            || documents.next().is_some() || source.text().is_empty()
+            || source.text().len() != source.token_ids().len() {
+            return Err(Int4ExtractError::Identity);
+        }
+        Ok(self.extraction.program.declarative_schema())
+    }
+
     pub fn execute<C: DecodeStepControl>(&self, engine: &mut StrictInt4Engine<'_>,
         admitted: &ExecutionIdentity, vocabulary: &ExtractionVocabulary, budget: Int4JsonBudget,
         control: &mut C) -> Result<Int4ExtractRun, Int4ExtractError> {

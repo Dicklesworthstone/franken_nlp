@@ -20,6 +20,8 @@ mod claims;
 mod native;
 /// Native INT8 extraction plus an explicitly configured correlated second reader.
 pub mod int8;
+/// Model-bound grouped-INT4 extraction and explicit correlated second reading.
+pub mod grouped_int4;
 pub use claims::{ClaimPathStep, ClaimRule, ClaimValueKind, CLAIM_RENDER_VERSION};
 pub use native::{SemanticNativeError, SemanticNativeRun, SEMANTIC_NATIVE_EXECUTION};
 use claims::RenderedField;
