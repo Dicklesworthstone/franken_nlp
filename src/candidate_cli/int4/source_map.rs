@@ -121,6 +121,7 @@ pub(super) struct MapLimits {
     pub synthesis: Option<crate::tasks::source_planning::grouped_int4::long::summary::synthesis::SummarySynthesisLimits>,
     pub question_synthesis: Option<crate::tasks::source_planning::grouped_int4::long::question::synthesis::QuestionSynthesisLimits>,
     pub hierarchy: Option<crate::tasks::source_planning::grouped_int4::long::summary::synthesis::hierarchy::SummaryHierarchyLimits>,
+    pub question_hierarchy: Option<crate::tasks::source_planning::grouped_int4::long::question::synthesis::hierarchy::QuestionHierarchyLimits>,
     pub reduction_reserve_bytes: u64,
     pub max_result_bytes: usize,
     pub workspace_bytes: u64,
@@ -173,6 +174,10 @@ impl MapArgs {
             Some(summary) => summary.synthesis.hierarchy()?,
             None => None,
         };
+        let question_hierarchy = match &self.question {
+            Some(question) => question.hierarchy()?,
+            None => None,
+        };
         let summary = self.summary.filter(|s| !s.synthesis.synthesize_summary)
             .map(|s| s.limits(mapping)).transpose()?;
         if let Some(summary) = summary {
@@ -191,12 +196,16 @@ impl MapArgs {
         // until complete execution finishes. Actual host planning is separate.
         let per_chunk = sum(&[args.context_tokens as u64 * 32,
             u64::from(budget.max_grammar_states) * 512, shared::OPTIONS_BYTES as u64 * 2])?;
+        let synthesis_passes = match (hierarchy, question_hierarchy) {
+            (Some(hierarchy), None) => hierarchy.max_passes as u64,
+            (None, Some(hierarchy)) => hierarchy.max_passes as u64,
+            (None, None) => u64::from(synthesis.is_some() || question_synthesis.is_some()),
+            _ => return Err(CandidateError::Arguments),
+        };
         let question_preparation = if self.question.is_some() {
             times(question::QUESTION_BYTES as u64,
-                (m.max_chunks as u64 + 1 + u64::from(question_synthesis.is_some())) * 4)?
+                (m.max_chunks as u64 + 1 + synthesis_passes) * 4)?
         } else { 0 };
-        let synthesis_passes = hierarchy.map_or(u64::from(synthesis.is_some() || question_synthesis.is_some()),
-            |hierarchy| hierarchy.max_passes as u64);
         let preparation_passes = m.max_chunks as u64 + synthesis_passes;
         let preparation_floor = sum(&[times(per_chunk, preparation_passes)?, 256 * MIB,
             args.max_input_bytes as u64 * 64, (m.max_map_result_bytes as u64 + 4096) * 2,
@@ -204,8 +213,12 @@ impl MapArgs {
         if common.preparation_bytes < preparation_floor { return Err(CandidateError::Arguments); }
         let workspace_bytes = match &self.question {
             Some(question) => match question_synthesis {
-                Some(synthesis) => question::synthesis::workspace_bytes(budget, mapping, m.max_chunks,
-                    reduction_reserve_bytes, question.verification()?, synthesis)?,
+                Some(synthesis) => match question_hierarchy {
+                    Some(hierarchy) => question::synthesis::hierarchy::workspace_bytes(budget, mapping, m.max_chunks,
+                        reduction_reserve_bytes, question.verification()?, synthesis, hierarchy)?,
+                    None => question::synthesis::workspace_bytes(budget, mapping, m.max_chunks,
+                        reduction_reserve_bytes, question.verification()?, synthesis)?,
+                },
                 None => question::workspace_bytes(budget, mapping, m.max_chunks,
                     reduction_reserve_bytes, question.verification()?)?,
             },
@@ -228,7 +241,7 @@ impl MapArgs {
         // a separately charged source/preparation capture and complete output.
         common.minimum_memory_bytes = sum(&[common.minimum_memory_bytes, input, workspace_bytes, output])?;
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
-        Ok(MapLimits { common, mapping, summary, synthesis, question_synthesis, hierarchy, reduction_reserve_bytes,
+        Ok(MapLimits { common, mapping, summary, synthesis, question_synthesis, hierarchy, question_hierarchy, reduction_reserve_bytes,
             max_result_bytes: m.max_map_result_bytes, workspace_bytes })
     }
     fn mapping_limits(&self, args: &Int4Args) -> Result<Int4SourceMapLimits, CandidateError> {

@@ -49,6 +49,9 @@
 > Complete-document summaries also support [explicit neural synthesis from
 > verified source quotes](#int4-neural-summary-synthesis), including
 > [bounded hierarchical quote selection](#int4-hierarchical-summary-synthesis).
+> Complete-document answers support [final evidence synthesis](#int4-neural-answer-synthesis)
+> and [explicit hierarchical answer synthesis](#int4-hierarchical-answer-synthesis)
+> when the collected quotations exceed one context.
 > Candidate results retain their explicit provenance; build verification,
 > model quality and release qualification remain separate pending gates.
 > The top-level task, batch and job examples below remain the disclosed 1.0
@@ -1419,6 +1422,84 @@ independently pinned snapshots follow this path. An explicitly requested
 snapshot is saved after complete-map and reserved-final-pass preflight and
 survives later evidence-fit failure. Compilation, native execution and task
 quality remain pending their named validation gates.
+
+### INT4 hierarchical answer synthesis
+
+Add `--hierarchical-answer` alongside `--synthesize-answer` to reduce a larger
+collected evidence set through bounded, question-aware levels. Every native
+pass receives the **same original question and typed answer options**, plus
+verified source quotations. Generated answers remain output data; their prose
+never becomes evidence for the next level.
+
+```bash
+fnlp candidate source-int4 answer-map report.txt \
+  --question question.txt --synthesize-answer --hierarchical-answer \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --memory-mib 8192 --group-width 128 \
+  --max-synthesis-passages 256 --max-synthesis-evidence-bytes 65536 \
+  --answer-max-levels 8 --answer-max-passes 16 \
+  --max-total-mask-node-visits 160000000000
+```
+
+The complete initial evidence population must fit `--max-synthesis-passages`
+and `--max-synthesis-evidence-bytes`; hierarchy does not bypass those caps or
+silently discard evidence to enter the first level. Each level partitions its
+entire ordered frontier into groups that fit the **actual question, canonical
+passage manifest, joined quotation bytes, exact tokens and context**. A single
+quotation that cannot fit is refused without splitting or truncation. All
+groups in a level are prepared and authenticated before that level's first
+native forward. Only independently verified quotations selected by those
+groups enter the next level, retaining their reachable original-document byte
+and Unicode-scalar origins.
+
+This is explicitly **lossy evidence selection**. An intermediate answer can
+omit relevant quotations or abstain on a group even when a broader context
+could support an answer. Hierarchy therefore does not establish recall,
+full-document equivalence, factual correctness or contradiction resolution.
+Citation validity remains structural, semantic support remains `not_assessed`,
+and answerability remains `uncalibrated`.
+
+Hierarchy controls require `--hierarchical-answer`; that flag in turn requires
+`--synthesize-answer`. Neither single-pass synthesis nor independent chunk QA
+automatically falls back to hierarchy.
+
+| Control | Default | Maximum | Scope |
+|---|---:|---:|---|
+| `--answer-max-levels` | 8 | 16 | Includes the final single-group level |
+| `--answer-max-passes` | 16 | 256 | All additional native passes, including final |
+| `--answer-max-tokenizer-calls` | 8,192 | 65,536 | Exact grouping attempts across all levels |
+| `--answer-max-tokenizer-bytes` | 67,108,864 | 1,000,000,000 | Grouping bytes, including repeated question and canonical manifests |
+
+Every limit must be positive. The five native work ceilings, total mask
+allowance, and `--max-qa-*` verification counters remain shared across discovery
+and all levels. Every permitted additional pass is reserved at maximum context
+before discovery. The example explicitly raises total masks to cover the
+default ceiling of 64 map calls plus 16 additional passes; it does not multiply
+any work allowance automatically. Memory admission includes retained native
+pass transcripts, original-source citation fanout, evidence frontiers and
+complete-level planning witnesses. Exhausted limits, nonprogress, failed
+verification, cancellation or native failure produces no complete result.
+
+The `fnlp-candidate-int4-answer-hierarchy-v1` response retains every discovery
+result, every native hierarchy pass, lifted citations, level geometry and
+cumulative work receipts. `output.final_pass` indexes the final entry in
+`output.passes`; its `answer` field is the final cited answer or model
+abstention. The result distinguishes four outcomes: `answered`, `abstained`,
+`no_evidence_collected`, and `evidence_exhausted`. The latter means intermediate
+passes left no quotations for another level; it does not assert calibrated
+unanswerability. Both empty-evidence outcomes have no final pass.
+
+Library callers use
+`SourceTaskPlanner::preflight_int4_question_hierarchy_with_control`,
+`SourceTaskPlanner::plan_int4_question_hierarchy_with_control`, and
+`NlpEngine::synthesize_int4_document_answer_hierarchy` with
+`Int4SourceMapConfig<SourceQuestionSynthesis>` plus `QuestionHierarchyLimits`.
+The completed run's `answer()` accessor returns the final `SynthesisAnswer`
+when a final pass exists. Explicit source conversion and independently pinned
+snapshot loading share this path. Optional snapshot save follows complete-map
+and all-permitted-pass preflight and survives later task failure. Compilation,
+native execution and task quality remain pending controller-selected gates.
 
 ## Implemented candidate INT4 whole-document source tasks
 

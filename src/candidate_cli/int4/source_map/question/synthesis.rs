@@ -3,6 +3,8 @@ use super::*;
 use crate::tasks::source_planning::{SourcePlanningLimits,
     grouped_int4::long::question::synthesis::{QuestionSynthesisLimits, SourceQuestionSynthesis}};
 
+pub(in super::super) mod hierarchy;
+
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SynthesisArgs {
     /// Add one native answer pass over ALL collected, verified source quotes.
@@ -16,6 +18,8 @@ pub(super) struct SynthesisArgs {
     /// manifest, token and context fit must also pass independently.
     #[arg(long, requires = "synthesize_answer")]
     max_synthesis_evidence_bytes: Option<usize>,
+    #[command(flatten)]
+    hierarchy: hierarchy::HierarchyArgs,
 }
 impl SynthesisArgs {
     pub(super) fn validate(self) -> Result<(), CandidateError> {
@@ -25,7 +29,12 @@ impl SynthesisArgs {
             || self.max_synthesis_evidence_bytes.is_some_and(|n| !(1..=MAX_INPUT_BYTES).contains(&n)) {
             return Err(CandidateError::Arguments);
         }
+        self.hierarchy()?;
         Ok(())
+    }
+    pub(super) fn hierarchy(self)
+        -> Result<Option<crate::tasks::source_planning::grouped_int4::long::question::synthesis::hierarchy::QuestionHierarchyLimits>, CandidateError> {
+        self.hierarchy.limits(self.synthesize_answer)
     }
     pub(super) fn planning(self, mut planning: SourcePlanningLimits) -> SourcePlanningLimits {
         if self.synthesize_answer {
