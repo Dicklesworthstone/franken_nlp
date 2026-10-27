@@ -156,7 +156,7 @@ fn validate(config: &Int4ExtractionMapConfig, identity: &ExecutionIdentity, widt
 fn input_bytes(source_capacity: usize, config: &Int4ExtractionMapConfig) -> Result<u64, HostedError> {
     sum(&[source_capacity as u64, config.request.schema.capacity() as u64, config.preparation_reserve_bytes])
 }
-fn document_workspace_bytes(budget: TaskBudget, limits: Int4ExtractionMapLimits,
+pub(super) fn document_workspace_bytes(budget: TaskBudget, limits: Int4ExtractionMapLimits,
     chunks: usize, reserve: u64) -> Result<u64, HostedError> {
     if chunks == 0 || chunks > limits.mapping.chunks.max_chunks || chunks > 256 || reserve == 0 {
         return Err(HostedError::Limits("INT4 extraction map partition cardinality or reserve"));
