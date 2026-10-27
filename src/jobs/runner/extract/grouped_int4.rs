@@ -19,6 +19,9 @@ use crate::{
 };
 use serde::Serialize;
 
+/// Durable complete-document extraction with exact native chunk accounting.
+pub mod document;
+
 const INPUT_POLICY: &str = "fixed-shared-schema-no-record-overrides-v1";
 
 /// Only a keyed commitment to these private settings enters the journal.
