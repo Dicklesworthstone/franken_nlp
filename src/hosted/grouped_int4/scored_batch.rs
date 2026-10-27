@@ -83,7 +83,7 @@ fn requirements(width: usize, work: Int4ScoredBatchLimits, limits: CorpusLimits)
     Ok(Requirements { native, workspace_bytes, input_bytes })
 }
 
-struct ScoredAdmission<'a> {
+pub(super) struct ScoredAdmission<'a> {
     lease: &'a EngineLease,
     model: &'a Int4ModelIdentity,
     context: usize,
@@ -91,6 +91,17 @@ struct ScoredAdmission<'a> {
     max_item_work: Int4Work,
     task_spec: &'static str,
     output_bytes: u64,
+}
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+impl<'a> ScoredAdmission<'a> {
+    /// Shared only with the owned-job host. The same concrete admission and
+    /// guarded complete-result contract applies to stream and durable delivery.
+    pub(super) fn for_job(lease: &'a EngineLease, model: &'a Int4ModelIdentity,
+        context: usize, kv_bytes: u64, max_item_work: Int4Work,
+        task_spec: &'static str, output_bytes: u64) -> Self {
+        Self { lease, model, context, kv_bytes, max_item_work, task_spec, output_bytes }
+    }
 }
 impl Int4ScoredBatchAdmission for ScoredAdmission<'_> {
     type Guard = Pending;
