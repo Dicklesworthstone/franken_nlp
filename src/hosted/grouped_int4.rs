@@ -20,6 +20,7 @@ mod source_map;
 pub use source_map::Int4SourceMapConfig;
 mod corpus;
 pub use corpus::Int4SourceCorpusConfig;
+mod scored_batch;
 mod prefill;
 pub mod batch;
 use crate::tasks::classify::grouped_int4::Int4ClassificationError;
