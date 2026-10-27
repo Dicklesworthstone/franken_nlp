@@ -24,6 +24,10 @@ impl Int4JudgePlanner {
     /// Model/asset-bound base; each prepared plan binds its whole request.
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     pub fn group_width(&self) -> usize { self.model.group_width() }
+    #[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(crate) fn durable_configuration(&self) -> (TaskBudget, JudgeLimits) {
+        (self.ceiling, self.limits)
+    }
     pub fn plan(&self, request: &JudgeRequest) -> Result<PreparedInt4Judge, Int4JudgeError> {
         self.plan_with_control(request, &mut Continue)
     }

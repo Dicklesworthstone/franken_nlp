@@ -24,6 +24,10 @@ impl Int4SentimentPlanner {
     }
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     pub fn group_width(&self) -> usize { self.model.group_width() }
+    #[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(crate) fn durable_configuration(&self) -> (TaskBudget, SentimentLimits) {
+        (self.ceiling, self.limits)
+    }
     pub fn plan(&self, request: &SentimentRequest) -> Result<PreparedInt4Sentiment, Int4SentimentError> {
         self.plan_with_control(request, &mut Continue)
     }

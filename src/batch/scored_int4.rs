@@ -82,6 +82,7 @@ impl<P: Int4ScoredTask> PreparedInt4Scored<P> {
     pub fn execution_identity(&self) -> &ExecutionIdentity { P::facts(&self.plan).identity }
     pub fn model_work(&self) -> Int4Work { P::facts(&self.plan).model_work }
     pub fn head_count(&self) -> usize { P::facts(&self.plan).head_count }
+    pub fn max_result_bytes(&self) -> u64 { P::facts(&self.plan).max_result_bytes }
 }
 
 /// A genuine embedding admission hook supplies a guard through sink delivery.

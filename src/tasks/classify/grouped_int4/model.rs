@@ -28,6 +28,10 @@ impl Int4ClassificationPlanner {
     /// task adds its complete prompt, label, score-space and policy bindings.
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     pub fn group_width(&self) -> usize { self.model.group_width() }
+    #[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(crate) fn durable_configuration(&self) -> (TaskBudget, ClassificationLimits) {
+        (self.ceiling, self.limits)
+    }
     pub fn plan(&self, request: &ClassificationRequest) -> Result<PreparedInt4Classification, Int4ClassificationError> {
         self.plan_with_control(request, &mut Continue)
     }
