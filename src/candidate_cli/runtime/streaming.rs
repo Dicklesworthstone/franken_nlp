@@ -48,9 +48,7 @@ pub(in crate::candidate_cli) fn execute<W: Write + Send + 'static>(task: Task, a
     let facts = session.facts(&args)?;
     let prepared = prepare(&args, limits, text, messages, &facts)?;
     session.remaining()?;
-    let eos = prepared.native_plan().options().eos_token_ids.first().copied()
-        .ok_or_else(|| Failure::usage("stream_eos_contract"))?;
-    let sink = TokenSink::new(output, task, bounds, &facts, eos, args.seed.clone())?;
+    let sink = TokenSink::new(output, task, bounds, &facts, prepared.native_plan().options())?;
     let cancellation = CancellationToken::default();
     let model = session.load(&args, limits, &facts, cancellation.clone())?;
     let stream_limits = ChatStreamLimits { native: session.native(&args)?, max_sampler_bytes: SAMPLER_BYTES,

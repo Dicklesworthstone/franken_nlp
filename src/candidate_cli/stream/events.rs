@@ -7,7 +7,7 @@ use crate::{execution_identity::Sha256Digest,
     native_engine::{artifact_bridge::ArtifactIdentity,
         decode::{DecodeEventSink, DecodeTokenEvent, DecodeScoreSpace, DECODE_TOKEN_EVENT_SCHEMA_VERSION},
         generation::{GenerationFinish, quantized::INT8_GENERATION_VERSION},
-        lmhead::NANBEIGE_VOCAB_SIZE, strict_int8::STRICT_INT8_PROFILE},
+        lmhead::NANBEIGE_VOCAB_SIZE, sampler::Seed256, strict_int8::STRICT_INT8_PROFILE},
     tasks::chat::quantized::Int8ChatResult};
 
 #[derive(Serialize)]
@@ -42,7 +42,8 @@ pub(in crate::candidate_cli) struct TokenSink<W> {
     writer: W, provenance: Provenance, task: &'static str, bounds: StreamBounds,
     owner: Arc<()>, state: State, emitted: u64,
     token_ids: Vec<u32>, bytes: Vec<u8>, scores: Option<Vec<f32>>,
-    eos: u32, saw_eos: bool, expected_seed: Option<String>,
+    eos: u32, saw_eos: bool, saw_stop: bool, expected_seed: Option<String>,
+    min_new_tokens: usize, stop_suffixes: Vec<Vec<u8>>,
 }
 fn reserved<T>(count: usize) -> Result<Vec<T>, Failure> {
     let mut values = Vec::new();
@@ -51,7 +52,17 @@ fn reserved<T>(count: usize) -> Result<Vec<T>, Failure> {
 }
 impl<W: Write> TokenSink<W> {
     pub(in crate::candidate_cli) fn new(writer: W, task: Task, bounds: StreamBounds,
-        facts: &ArtifactIdentity, eos: u32, seed: Option<String>) -> Result<Self, Failure> {
+        facts: &ArtifactIdentity, options: &GenerationOptions) -> Result<Self, Failure> {
+        options.validate(GenerationLimits { max_prompt_tokens: 8192, max_new_tokens: bounds.tokens,
+            max_output_bytes: bounds.content_bytes, max_sampler_bytes: SAMPLER_BYTES })
+            .map_err(|_| Failure::usage("stream_generation_policy"))?;
+        let [eos] = options.eos_token_ids.as_slice() else {
+            return Err(Failure::usage("stream_eos_contract"));
+        };
+        let seed = match &options.sampling {
+            GenerationSampling::Greedy => None,
+            GenerationSampling::Seeded { effective_seed, .. } => Some(Seed256::from(*effective_seed).to_lower_hex()),
+        };
         // Runtime also checks these actual artifact facts before loading. The
         // sink independently bounds its repeated public provenance fields.
         if facts.model_id != "Nanbeige4.2-3B"
@@ -59,12 +70,13 @@ impl<W: Write> TokenSink<W> {
             || facts.recipe_id.is_empty() || facts.recipe_id.len() > 256
             || Sha256Digest::from_hex(&facts.source_root_sha256).is_err()
             || Sha256Digest::from_hex(&facts.logical_model_sha256).is_err()
-            || eos as usize >= NANBEIGE_VOCAB_SIZE
+            || *eos as usize >= NANBEIGE_VOCAB_SIZE
+            || options.max_new_tokens != bounds.tokens || options.max_output_bytes != bounds.content_bytes
+            || options.capture_logprobs != bounds.capture_logprobs
             || bounds.tokens == 0 || bounds.tokens > 1024
             || bounds.content_bytes == 0 || bounds.content_bytes > MAX_CONTENT_BYTES
             || bounds.event_bytes < FRAME_BYTES || bounds.terminal_bytes < FRAME_BYTES
-            || bounds.stream_bytes < bounds.terminal_bytes as u64 + FRAME_BYTES as u64
-            || seed.as_ref().is_some_and(|s| parse_seed(s).is_err()) {
+            || bounds.stream_bytes < bounds.terminal_bytes as u64 + FRAME_BYTES as u64 {
             return Err(Failure::usage("stream_contract"));
         }
         Ok(Self { writer, provenance: Provenance { model_id: facts.model_id.clone(),
@@ -74,7 +86,8 @@ impl<W: Write> TokenSink<W> {
             owner: Arc::new(()), state: State::Fresh, emitted: 0,
             token_ids: reserved(bounds.tokens)?, bytes: reserved(bounds.content_bytes)?,
             scores: if bounds.capture_logprobs { Some(reserved(bounds.tokens)?) } else { None },
-            eos, saw_eos: false, expected_seed: seed })
+            eos: *eos, saw_eos: false, saw_stop: false, expected_seed: seed,
+            min_new_tokens: options.min_new_tokens, stop_suffixes: options.stop_suffixes.clone() })
     }
     fn frame<T: Serialize>(&self, event: &'static str, provisional: bool, data: &T,
         cap: usize) -> Result<Vec<u8>, Failure> {
@@ -95,7 +108,9 @@ impl<W: Write> TokenSink<W> {
         if event.schema_version != DECODE_TOKEN_EVENT_SCHEMA_VERSION || event.request_seq != 1
             || event.token_index != self.token_ids.len() || event.token_id as usize >= NANBEIGE_VOCAB_SIZE
             || self.token_ids.len() >= self.bounds.tokens || bytes > self.bounds.content_bytes
-            || !score_ok || self.saw_eos || (event.token_id == self.eos && !event.decoded_bytes.is_empty()) {
+            || !score_ok || self.saw_eos || self.saw_stop
+            || (event.token_id == self.eos && (!event.decoded_bytes.is_empty()
+                || self.token_ids.len() < self.min_new_tokens)) {
             return Err(Failure::output("stream_token_contract"));
         }
         Ok(())
@@ -138,10 +153,9 @@ impl<W: Write> TokenSink<W> {
         };
         let termination = match r.finish_reason {
             GenerationFinish::Eos => self.saw_eos,
-            GenerationFinish::TokenLimit => !self.saw_eos && self.token_ids.len() == self.bounds.tokens,
-            GenerationFinish::ByteLimit => !self.saw_eos && self.token_ids.len() < self.bounds.tokens,
-            // No stop-suffix option exists on this CLI route.
-            GenerationFinish::StopSuffix => false,
+            GenerationFinish::StopSuffix => !self.saw_eos && self.saw_stop,
+            GenerationFinish::TokenLimit => !self.saw_eos && !self.saw_stop && self.token_ids.len() == self.bounds.tokens,
+            GenerationFinish::ByteLimit => !self.saw_eos && !self.saw_stop && self.token_ids.len() < self.bounds.tokens,
         };
         if result.schema_version != 1 || r.schema_version != 1 || r.task != self.task
             || r.execution != INT8_GENERATION_VERSION || r.numerics_profile != STRICT_INT8_PROFILE
@@ -183,6 +197,12 @@ impl<W: Write> DecodeEventSink for TokenSink<W> {
         self.bytes.extend_from_slice(&event.decoded_bytes); self.token_ids.push(event.token_id);
         if let (Some(scores), Some(score)) = (&mut self.scores, event.logprob) { scores.push(score); }
         self.saw_eos = event.token_id == self.eos;
+        // Match the native cursor's priority: EOS, then a qualifying suffix,
+        // then token capacity. Stops retain all delivered bytes, even when a
+        // UTF-8 suffix spans several token events. Before the minimum they do
+        // not terminate, and a hard byte/token budget may still end the run.
+        self.saw_stop = !self.saw_eos && self.token_ids.len() >= self.min_new_tokens
+            && self.stop_suffixes.iter().any(|suffix| self.bytes.ends_with(suffix));
         self.emitted = permit.next_total; self.state = State::Open; Ok(())
     }
 }

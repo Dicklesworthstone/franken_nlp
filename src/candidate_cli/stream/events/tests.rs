@@ -12,7 +12,12 @@ fn bounds(scores: bool) -> StreamBounds {
         event_bytes: 4352, terminal_bytes: 16 * 1024, stream_bytes: 256 * 1024, sink_memory_bytes: 1 << 20 }
 }
 fn sink(scores: bool) -> TokenSink<Vec<u8>> {
-    TokenSink::new(Vec::new(), Task::Generate, bounds(scores), &facts(), 166101, None).unwrap()
+    TokenSink::new(Vec::new(), Task::Generate, bounds(scores), &facts(), &options(scores)).unwrap()
+}
+fn options(scores: bool) -> GenerationOptions {
+    let mut options = GenerationOptions::greedy(4, 64, 166101);
+    options.capture_logprobs = scores;
+    options
 }
 fn event(index: usize, id: u32, bytes: &[u8], scores: bool) -> DecodeTokenEvent {
     DecodeTokenEvent { schema_version: DECODE_TOKEN_EVENT_SCHEMA_VERSION, request_seq: 1,
@@ -166,7 +171,7 @@ impl Write for Broken {
 fn partial_write_and_flush_failures_are_permanent_and_never_retried() {
     for fail_flush in [false, true] {
         let writer = Broken { bytes: Vec::new(), calls: 0, flushes: 0, fail_flush };
-        let mut s = TokenSink::new(writer, Task::Generate, bounds(false), &facts(), 166101, None).unwrap();
+        let mut s = TokenSink::new(writer, Task::Generate, bounds(false), &facts(), &options(false)).unwrap();
         let e = event(0, 1, b"a", false); let p = s.reserve(&e).unwrap();
         let error = s.permit(p, e.clone()).unwrap_err(); assert_eq!(error.code, "stream_output_io");
         assert!(!error.to_string().contains("private"));
@@ -178,9 +183,102 @@ fn partial_write_and_flush_failures_are_permanent_and_never_retried() {
 }
 #[test]
 fn seeded_chat_keeps_provenance_and_final_seed_without_exposing_prompt_identity() {
-    let mut s = TokenSink::new(Vec::new(), Task::Chat, bounds(false), &facts(), 166101, Some("07".repeat(32))).unwrap();
+    let mut options = options(false);
+    options.sampling = GenerationSampling::Seeded { effective_seed: [7; 32],
+        temperature_milli: 1000, top_k: None, top_p_ppm: 1_000_000 };
+    let mut s = TokenSink::new(Vec::new(), Task::Chat, bounds(false), &facts(), &options).unwrap();
     push(&mut s, event(0, 166101, b"", false)); s.finish(&completion(&s, GenerationFinish::Eos)).unwrap();
     let r = rows(&s.writer); assert_eq!(r[2]["data"]["result"]["effective_seed"], "07".repeat(32));
     assert!(r.iter().all(|row| row["task"] == "chat-v1" && row["source_root_sha256"] == "ab".repeat(32)));
     for row in r { assert!(row.get("prompt_digest").is_none()); assert!(row.get("input").is_none()); }
+}
+
+#[test]
+fn exact_stop_suffix_split_across_utf8_tokens_can_complete_without_retracting_bytes() {
+    let mut policy = options(true);
+    policy.stop_suffixes = vec!["終".as_bytes().to_vec()];
+    let mut s = TokenSink::new(Vec::new(), Task::Generate, bounds(true), &facts(), &policy).unwrap();
+    push(&mut s, event(0, 1, &[0xe7], true));
+    push(&mut s, event(1, 2, &[0xb5], true));
+    assert!(!s.saw_stop);
+    push(&mut s, event(2, 3, &[0x82], true));
+    assert!(s.saw_stop);
+    let result = completion(&s, GenerationFinish::StopSuffix);
+    s.finish(&result).unwrap();
+    let rows = rows(&s.writer);
+    assert_eq!(rows.last().unwrap()["data"]["result"]["content"], "終");
+    assert_eq!(rows.last().unwrap()["data"]["result"]["finish_reason"], "stop_suffix");
+    assert_eq!(rows.last().unwrap()["data"], serde_json::to_value(result).unwrap());
+}
+
+#[test]
+fn minimum_tokens_delay_suffix_and_eos_but_do_not_override_hard_limits() {
+    let mut policy = options(false);
+    policy.min_new_tokens = 3;
+    policy.stop_suffixes = vec![b"x".to_vec()];
+    let mut s = TokenSink::new(Vec::new(), Task::Generate, bounds(false), &facts(), &policy).unwrap();
+    push(&mut s, event(0, 1, b"x", false));
+    assert!(!s.saw_stop);
+    push(&mut s, event(1, 2, b"y", false));
+    push(&mut s, event(2, 1, b"x", false));
+    assert!(s.saw_stop);
+    s.finish(&completion(&s, GenerationFinish::StopSuffix)).unwrap();
+
+    let mut early = TokenSink::new(Vec::new(), Task::Generate, bounds(false), &facts(), &policy).unwrap();
+    assert!(early.reserve(&event(0, 166101, b"", false)).is_err());
+    assert!(early.writer.is_empty());
+    let mut eos = TokenSink::new(Vec::new(), Task::Generate, bounds(false), &facts(), &policy).unwrap();
+    for index in 0..3 { push(&mut eos, event(index, 1, b"a", false)); }
+    push(&mut eos, event(3, 166101, b"", false));
+    eos.finish(&completion(&eos, GenerationFinish::Eos)).unwrap();
+
+    let mut bytes = TokenSink::new(Vec::new(), Task::Generate, bounds(false), &facts(), &policy).unwrap();
+    push(&mut bytes, event(0, 1, b"x", false));
+    bytes.finish(&completion(&bytes, GenerationFinish::ByteLimit)).unwrap();
+    policy.min_new_tokens = policy.max_new_tokens;
+    let mut tokens = TokenSink::new(Vec::new(), Task::Generate, bounds(false), &facts(), &policy).unwrap();
+    for index in 0..4 { push(&mut tokens, event(index, 1, b"a", false)); }
+    tokens.finish(&completion(&tokens, GenerationFinish::TokenLimit)).unwrap();
+}
+
+#[test]
+fn qualifying_suffix_wins_at_token_capacity_and_forbids_later_events() {
+    let mut policy = options(false);
+    policy.stop_suffixes = vec![b"aaaa".to_vec()];
+    let make = || {
+        let mut s = TokenSink::new(Vec::new(), Task::Generate, bounds(false), &facts(), &policy).unwrap();
+        for index in 0..4 { push(&mut s, event(index, 1, b"a", false)); }
+        s
+    };
+    let mut s = make();
+    s.finish(&completion(&s, GenerationFinish::StopSuffix)).unwrap();
+    let mut wrong = make();
+    let before = wrong.writer.clone();
+    assert!(wrong.finish(&completion(&wrong, GenerationFinish::TokenLimit)).is_err());
+    assert_eq!(wrong.writer, before);
+
+    policy.stop_suffixes = vec![b"a".to_vec()];
+    let mut s = TokenSink::new(Vec::new(), Task::Generate, bounds(false), &facts(), &policy).unwrap();
+    push(&mut s, event(0, 1, b"a", false));
+    let before = s.writer.clone();
+    assert!(s.reserve(&event(1, 166101, b"", false)).is_err());
+    assert_eq!(s.writer, before);
+    assert!(s.finish(&completion(&s, GenerationFinish::StopSuffix)).is_err());
+}
+
+#[test]
+fn sink_policy_must_match_the_exact_admitted_output_contract() {
+    for axis in 0..7 {
+        let mut policy = options(false);
+        match axis {
+            0 => policy.max_new_tokens -= 1,
+            1 => policy.max_output_bytes -= 1,
+            2 => policy.capture_logprobs = true,
+            3 => policy.eos_token_ids.push(166100),
+            4 => policy.min_new_tokens = 5,
+            5 => policy.stop_suffixes.push(Vec::new()),
+            _ => policy.stop_suffixes.push(vec![b'x'; 4097]),
+        }
+        assert!(TokenSink::new(Vec::new(), Task::Generate, bounds(false), &facts(), &policy).is_err(), "axis {axis}");
+    }
 }
