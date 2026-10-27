@@ -27,6 +27,8 @@ mod scored_batch;
     any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod scored_job;
 mod prefill;
+mod stream;
+pub use stream::HostedInt4ChatStream;
 pub mod batch;
 use crate::tasks::classify::grouped_int4::Int4ClassificationError;
 use crate::{
