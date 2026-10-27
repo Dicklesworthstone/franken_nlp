@@ -5,6 +5,8 @@ use super::*;
 use super::super::execution::{NativeDriver, SourceDriver, check_run, preflight};
 use crate::native_engine::portable_int8::ProjectionWork;
 mod evidence;
+/// Explicit bounded, lossy quotation selection for over-context QA evidence.
+pub mod hierarchy;
 
 pub const INT4_QUESTION_SYNTHESIS_EXECUTION: &str = "grouped-int4-question-verbatim-evidence-synthesis-v1";
 const SEMANTICS: &str = "answer-from-collected-quotes-not-full-document-equivalence-v1";
