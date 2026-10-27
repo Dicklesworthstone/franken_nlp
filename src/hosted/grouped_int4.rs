@@ -10,7 +10,8 @@ pub use sentiment::Int4SentimentHostLimits;
 mod judge;
 pub use judge::Int4JudgeHostLimits;
 mod resolve;
-pub use resolve::Int4ResolveConfig;
+pub use resolve::{Int4ResolveConfig, HostedInt4EntityCorpus, Int4EntityCorpusError,
+    Int4EntityCorpusHostConfig, Int4EntityCorpusHostRequirements, Int4EntityCorpusSummary};
 mod redact;
 mod extract;
 mod semantic;

@@ -2,6 +2,9 @@
 //! orders of every comparison, and deterministic complete-link clustering.
 use super::*;
 mod entities;
+mod corpus;
+pub use corpus::{HostedInt4EntityCorpus, Int4EntityCorpusError, Int4EntityCorpusHostConfig,
+    Int4EntityCorpusHostRequirements, Int4EntityCorpusSummary};
 use crate::{
     corpus::{
         native_resolve::{ResolutionPlanner,

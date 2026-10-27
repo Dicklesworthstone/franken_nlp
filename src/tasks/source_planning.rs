@@ -86,7 +86,7 @@ impl Default for SourcePlanningLimits {
     }
 }
 impl SourcePlanningLimits {
-    fn validate(self) -> Result<(), SourcePlanningError> {
+    pub(crate) fn validate(self) -> Result<(), SourcePlanningError> {
         if !(1..=64 * 1024 * 1024).contains(&self.max_input_bytes)
             || !(1..=262_144).contains(&self.max_context_tokens) || !(1..=1024).contains(&self.max_passages)
         { return Err(SourcePlanningError::Contract("invalid source planning limits")); }

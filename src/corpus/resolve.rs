@@ -83,7 +83,7 @@ impl Default for ResolveLimits {
     }
 }
 impl ResolveLimits {
-    fn validate(self, options: ResolveOptions) -> Result<(), ResolveError> {
+    pub(crate) fn validate(self, options: ResolveOptions) -> Result<(), ResolveError> {
         if !(1..=65_536).contains(&self.max_documents) || !(1..=65_536).contains(&self.max_mentions)
             || !(1..=64 * 1024 * 1024).contains(&self.max_input_bytes)
             || !(1..=16_384).contains(&self.max_surface_bytes) || !(1..=128).contains(&self.max_keys_per_mention)

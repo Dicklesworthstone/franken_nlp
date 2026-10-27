@@ -83,7 +83,7 @@ impl NlpEngine {
     }
 }
 
-fn requirements(config: &Int4EntityConfig, ner_context: usize, native: NativeLimits,
+pub(super) fn requirements(config: &Int4EntityConfig, ner_context: usize, native: NativeLimits,
     preparation: u64, graph: u64, width: usize) -> Result<(Int4MemoryRequirement, u64), HostedError> {
     native.run.validate()?;
     config.validate().map_err(execution_error)?;
@@ -99,7 +99,7 @@ fn requirements(config: &Int4EntityConfig, ner_context: usize, native: NativeLim
     Ok((required, scratch))
 }
 
-fn temporary_bytes(config: &Int4EntityConfig, graph: u64) -> Result<u64, HostedError> {
+pub(super) fn temporary_bytes(config: &Int4EntityConfig, graph: u64) -> Result<u64, HostedError> {
     // At most one source grammar/native result is resident at a time. Graph
     // storage separately owns the expanded mentions and compact chunk receipts.
     let result = config.ner_budget.max_output_bytes.checked_mul(4)
@@ -110,12 +110,13 @@ fn temporary_bytes(config: &Int4EntityConfig, graph: u64) -> Result<u64, HostedE
 }
 
 #[derive(Clone, Copy)]
-struct Expected {
-    width: usize, documents: usize, chunks: usize, ner_work: Int4Work,
-    masks: u64, max_model_work: Int4Work, chunked: bool,
+pub(super) struct Expected {
+    pub(super) width: usize, pub(super) documents: usize, pub(super) chunks: usize,
+    pub(super) ner_work: Int4Work, pub(super) masks: u64,
+    pub(super) max_model_work: Int4Work, pub(super) chunked: bool,
 }
 
-fn check_result(result: &Int4EntityRun, expected: Expected) -> Result<(), HostedError> {
+pub(super) fn check_result(result: &Int4EntityRun, expected: Expected) -> Result<(), HostedError> {
     let resolution = &result.resolution;
     let heads = resolution.result.judgments.len().checked_mul(2)
         .ok_or_else(|| execution_error(Int4EntityError::Accounting))?;
@@ -138,7 +139,7 @@ fn check_result(result: &Int4EntityRun, expected: Expected) -> Result<(), Hosted
     Ok(())
 }
 
-fn execution_error(error: Int4EntityError) -> HostedError { HostedError::Int4(Int4HostError::Entities(error)) }
+pub(super) fn execution_error(error: Int4EntityError) -> HostedError { HostedError::Int4(Int4HostError::Entities(error)) }
 
 #[cfg(test)]
 mod tests;

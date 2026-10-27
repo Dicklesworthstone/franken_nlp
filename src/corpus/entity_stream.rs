@@ -109,7 +109,7 @@ pub fn run_ndjson<R: BufRead, W: Write, P: EntitySnapshotProcessor, C: DecodeSte
     if !documents.is_empty() { publish(&mut documents, writer, processor, limits, &mut summary, true, control)?; }
     Ok(summary)
 }
-fn validate<E>(l: EntityStreamLimits) -> Result<(), EntityStreamError<E>> {
+pub(crate) fn validate<E>(l: EntityStreamLimits) -> Result<(), EntityStreamError<E>> {
     if !(1..=64 * 1024 * 1024).contains(&l.max_line_bytes) || !(1..=64 * 1024 * 1024).contains(&l.max_document_bytes)
         || !(1..=64 * 1024 * 1024).contains(&l.max_corpus_bytes) || !(1..=65_536).contains(&l.max_documents)
         || l.max_input_bytes == 0 || l.max_records == 0 || l.max_snapshots == 0
