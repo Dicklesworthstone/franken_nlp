@@ -2106,6 +2106,158 @@ and optional materialization. These are candidate source-inventoried
 features; build, model-present correctness, crash and quality qualification
 remain pending.
 
+## Implemented candidate INT4 whole-document jobs
+
+`fnlp candidate source-int4 document-job start|resume ner|keyphrases|summarize|answer`
+connects the complete-document INT4 pipelines to authenticated durable jobs.
+Each original document is one atomic job item, including every chunk and
+selected reduction pass. One resident model and native engine serve the
+complete original population. This route requires `metadata-store` and
+`asupersync-runtime` on Linux x86-64 or AArch64, and supports pinned source
+conversion or an independently digest-pinned candidate snapshot.
+
+Choose the source task after `start` or `resume`; its existing map options
+remain available without accepting another task family's flags:
+
+| Task and additional flags | Complete-document result |
+|---|---|
+| `ner` | Independent entity results for every chunk, with original-coordinate occurrences |
+| `keyphrases` | Independent exact-source keyphrases per chunk; no global phrase ranking |
+| `summarize --map-only` | Independent cited chunk summaries |
+| `summarize` | Deterministic cited-bullet union with final global selection |
+| `summarize --synthesize-summary` | One neural summary pass over all collected verified quotes |
+| `summarize --synthesize-summary --hierarchical-summary` | Bounded, explicitly lossy quote-selection levels and final summary |
+| `answer --question FILE` | Independent question-aware answers from every nonblank source chunk |
+| `answer --question FILE --synthesize-answer` | One answer pass over all collected verified quotes |
+| `answer --question FILE --synthesize-answer --hierarchical-answer` | Bounded quote-selection levels preserving the original question, followed by a final answer |
+
+The input is the **complete original NDJSON population on every invocation**,
+including committed records when resuming:
+
+```json
+{"id":"document-1","text":"The complete original UTF-8 source document."}
+{"id":"document-2","text":"A second complete source document.","task_args":{}}
+```
+
+`text` always contains the complete source document. For `answer`, the exact
+private question comes from the separate `--question` file and applies to
+every document. `task_args` may be absent, null or an empty object; task choices,
+options, questions and budgets are fixed for the entire job. `--options FILE`
+accepts the selected family's complete typed options. Duplicate IDs anywhere
+in the population, live-stream flush controls, unknown fields and per-record
+task overrides refuse. Inputs are admitted in memory and are not saved for
+future resume by this command.
+
+Prepare the existing protected job directory, random job ID and protected
+32-byte raw secret described in [owned job storage](docs/owned-jobs.md).
+Here is a complete example limits file, `document-job-limits.json`, for a
+small population. The numbers are explicit allowances, not measured cost
+estimates or a promise that a particular document fits:
+
+```json
+{
+  "max_items": 3,
+  "max_id_bytes": 128,
+  "max_input_bytes_per_item": 1048576,
+  "max_snapshot_bytes": 4194304,
+  "max_result_bytes": 16777216,
+  "max_spool_bytes": 268435456,
+  "max_materialized_bytes": 268435456,
+  "max_journal_bytes": 67108864,
+  "max_attempts": 6,
+  "max_work": {
+    "model": {
+      "forward_positions": 262144,
+      "projected_logits": 10000000000,
+      "attention_pairs": 1000000000000,
+      "projections": {
+        "dot_products": 10000000000000000,
+        "multiply_accumulates": 10000000000000000
+      }
+    },
+    "mask_node_visits": 128000000000
+  }
+}
+```
+
+Start a retained summary job:
+
+```bash
+fnlp candidate source-int4 document-job start summarize documents.ndjson \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$EXPECTED_MODEL_SHA256" \
+  --memory-mib 16384 \
+  --max-chunks 8 \
+  --store-results \
+  --job-dir /private/document-job \
+  --job-id "$JOB_ID" \
+  --key-file /private/document-job.key \
+  --limits document-job-limits.json \
+  --materialize
+```
+
+Replace `start` with `resume` and provide the same original population and
+settings. Resume authenticates original bytes, order and IDs; real model,
+group width and compiler identity; exact private question/options; chunking,
+reduction and hierarchy configuration; and every immutable lifetime ceiling
+before replay or tail repair. `--discard-uncommitted-tail` is an explicit
+resume-only policy. Already committed documents are skipped; an interrupted
+document starts again as a complete document, with its previous attempt's
+work still debited. There is no chunk-level or hierarchy-level checkpoint.
+
+The five map work flags and `--max-total-mask-node-visits` are per-document
+ceilings and must fit the unchanged job-wide `max_work`. Every permitted
+synthesis or hierarchy pass is reserved before discovery. Native work,
+including actual INT4 group dot products, is durably debited before execution.
+Neither the number of chunks, a larger population, nor another invocation
+multiplies the stored lifetime allowance.
+
+Independent original-source verification has separate, immutable lifetime
+caps. These fixed defaults are authenticated along with the task recipe:
+
+| Flag | Default lifetime cap |
+|---|---:|
+| `--max-lifetime-source-fields` | 4,096,000 |
+| `--max-lifetime-source-matches` | 16,384,000 |
+| `--max-lifetime-source-scan-steps` | 67,108,864,000 |
+| `--max-lifetime-summary-scan-steps` | 536,870,912,000 |
+
+For each axis, the selected per-document verification limit multiplied by
+`JobLimits.max_attempts` must fit its explicit lifetime cap. Summary synthesis
+uses its shared synthesis verification budget, and all question routes use
+their shared `--max-qa-*` budget. Deterministic summary selection additionally
+checks its independent reducer scan budget. Failed attempts count too.
+Increasing `max_attempts` or changing these caps cannot renew an existing job;
+the original contract must match exactly.
+
+Admission includes the full population, native allocation, maximum document
+frontier, all permitted pass results, citation-verification storage, protected
+spool serialization and journal memory. `--max-map-result-bytes` must fit the
+stored per-item result ceiling; `--max-result-bytes` remains the per-chunk or
+per-pass cap. The input byte ceiling bounds a complete NDJSON record, including
+JSON escaping and envelope fields. These are modeled memory reservations,
+not measured RSS guarantees. Optional `--save-snapshot` follows immutable
+factory admission and precedes population execution; the saved model remains
+if later authentication or document execution fails.
+
+Stdout uses `fnlp-candidate-int4-document-job-v1` with task, document mode,
+`durable_unit: "complete_original_document"`, public model provenance and
+authenticated progress only. Private source text, questions and results stay
+out of that report. Result guards survive spool synchronization and journal
+acknowledgement. `--materialize` publishes verified `materialized.ndjson` after
+all original documents commit, and existing stored-job verification and
+materialization commands work without loading the model. A final report-write
+failure does not imply rollback.
+
+Library callers construct `Int4SourceDocumentJobPlanner::for_model` with the
+actual model identity, `Int4SourceDocumentTask`, compiler, exact budgets and
+`Int4SourceDocumentLifetime`, then call `NlpEngine::job_int4_source_document`
+with `SourceJobRequest` and `JobHostLimits`. This reuses the existing native
+document executors and durable runner. Hierarchy remains explicitly lossy;
+source membership does not establish semantic entailment or full-context
+equivalence. Compilation, native execution, crash recovery, parity and task
+quality still require their named validation gates.
+
 ## Implemented candidate INT4 whole-document extraction
 
 `fnlp candidate source-int4 extract-map` applies one exact schema to every

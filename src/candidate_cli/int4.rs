@@ -19,6 +19,7 @@ mod source;
 mod source_batch;
 mod source_job;
 mod source_map;
+mod document_job;
 mod prefill;
 mod batch;
 #[cfg(feature = "asupersync-runtime")]
@@ -126,6 +127,7 @@ enum Int4Task {
     ExtractJob,
     ScoredJob,
     SourceJob,
+    DocumentJob,
     RedactJob,
 }
 #[derive(Clone, Copy)]
@@ -143,6 +145,7 @@ enum Int4JobCommand {
     Extraction(extract_job::JobCommand),
     Scored(scored_job::JobCommand),
     Source(source_job::JobCommand),
+    Document(document_job::JobCommand),
     Redaction(redact::long::jobs::JobCommand),
 }
 pub(super) struct Int4Command {
@@ -164,6 +167,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(judge::definition())
         .subcommand(scored_batch::definition())
         .subcommand(scored_job::definition())
+        .subcommand(document_job::definition())
         .subcommand(resolve::definition())
         .subcommand(redact::definition())
         .subcommand(redact::long::definition())
@@ -195,6 +199,10 @@ impl Int4Command {
         if name == "score-job" {
             let (job, args) = scored_job::JobCommand::from_matches(matches)?;
             return Ok(Self { task: Int4Task::ScoredJob, args, batch: None, job: Some(Int4JobCommand::Scored(job)) });
+        }
+        if name == "document-job" {
+            let (job, args) = document_job::JobCommand::from_matches(matches)?;
+            return Ok(Self { task: Int4Task::DocumentJob, args, batch: None, job: Some(Int4JobCommand::Document(job)) });
         }
         if matches!(name, "ner-job" | "keyphrases-job" | "summarize-job" | "answer-job") {
             let kind = crate::candidate_cli::source::Kind::named(name.trim_end_matches("-job"))
@@ -253,6 +261,8 @@ impl Int4Command {
                 return job.run_owned(args, input, &mut output, diagnostics),
             Self { task: Int4Task::SourceJob, args, batch: None, job: Some(Int4JobCommand::Source(job)) } =>
                 return job.run_owned(args, input, &mut output, diagnostics),
+            Self { task: Int4Task::DocumentJob, args, batch: None, job: Some(Int4JobCommand::Document(job)) } =>
+                return job.run_owned(args, input, &mut output, diagnostics),
             Self { task: Int4Task::RedactJob, args, batch: None, job: Some(Int4JobCommand::Redaction(job)) } =>
                 return job.run_owned(args, input, &mut output, diagnostics),
             Self { task: Int4Task::ExtractBatch(options), args, batch: None, job: None } =>
@@ -274,7 +284,7 @@ impl Int4Command {
         }
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
-        if self.job.is_some() || matches!(self.task, Int4Task::ExtractJob | Int4Task::ScoredJob | Int4Task::SourceJob | Int4Task::RedactJob) {
+        if self.job.is_some() || matches!(self.task, Int4Task::ExtractJob | Int4Task::ScoredJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob) {
             return Err(CandidateError::Arguments);
         }
         if let Some(batch) = self.batch {
@@ -309,7 +319,7 @@ impl Int4Command {
             Int4Task::Source(_, source) => source.validate(&self.args)?,
             // The blocking stream must own its input and writer through cleanup.
             Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::Resolve(_) | Int4Task::Sentiment(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ScoredBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
-                | Int4Task::ExtractJob | Int4Task::ScoredJob | Int4Task::SourceJob | Int4Task::RedactJob => return Err(CandidateError::Arguments),
+                | Int4Task::ExtractJob | Int4Task::ScoredJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob => return Err(CandidateError::Arguments),
         };
         #[cfg(feature = "asupersync-runtime")]
         { runtime::execute_task(self.task, self.args, limits, input, output) }

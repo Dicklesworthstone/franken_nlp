@@ -127,7 +127,7 @@ pub(super) struct MapLimits {
     pub workspace_bytes: u64,
 }
 impl MapArgs {
-    fn planning(&self, args: &Int4Args) -> crate::tasks::source_planning::SourcePlanningLimits {
+    pub(super) fn planning(&self, args: &Int4Args) -> crate::tasks::source_planning::SourcePlanningLimits {
         let planning = self.source.planning(args);
         self.question.as_ref().map_or(planning, |question| question.planning(planning))
     }
@@ -138,6 +138,17 @@ impl MapArgs {
             question: if kind == Kind::Answer { Some(question::QuestionArgs::from_arg_matches(matches)?) } else { None } })
     }
     pub(super) fn validate(&self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
+        self.validate_mode(args, false)
+    }
+    pub(super) fn validate_document_job(&self, args: &Int4Args, map_only: bool)
+        -> Result<MapLimits, CandidateError> {
+        if map_only && (self.kind != Kind::Summarize
+            || self.summary.is_none_or(|summary| summary.synthesis.synthesize_summary)) {
+            return Err(CandidateError::Arguments);
+        }
+        self.validate_mode(args, map_only)
+    }
+    fn validate_mode(&self, args: &Int4Args, map_only: bool) -> Result<MapLimits, CandidateError> {
         let m = self.mapping;
         let mut common = self.source.validate(args)?;
         if (self.kind == Kind::Answer) != self.question.is_some()
@@ -178,7 +189,7 @@ impl MapArgs {
             Some(question) => question.hierarchy()?,
             None => None,
         };
-        let summary = self.summary.filter(|s| !s.synthesis.synthesize_summary)
+        let summary = self.summary.filter(|s| !s.synthesis.synthesize_summary && !map_only)
             .map(|s| s.limits(mapping)).transpose()?;
         if let Some(summary) = summary {
             // In addition to the host's full map/frontier payload, price the
@@ -243,6 +254,62 @@ impl MapArgs {
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(MapLimits { common, mapping, summary, synthesis, question_synthesis, hierarchy, question_hierarchy, reduction_reserve_bytes,
             max_result_bytes: m.max_map_result_bytes, workspace_bytes })
+    }
+    pub(super) fn question_path(&self) -> Option<&std::path::Path> {
+        self.question.as_ref().map(question::QuestionArgs::path)
+    }
+    pub(super) fn document_verification(&self, limits: MapLimits) -> Result<GroundingBudget, CandidateError> {
+        if let Some(question) = &self.question { question.verification() }
+        else { Ok(limits.synthesis.map_or(limits.mapping.verification, |synthesis| synthesis.verification)) }
+    }
+    /// Build the immutable task from real typed settings. No placeholder
+    /// document or caller-supplied execution identity participates here.
+    #[cfg(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(super) fn document_task(&self, args: &Int4Args, limits: MapLimits,
+        raw: Option<&str>, question_text: Option<String>)
+        -> Result<crate::jobs::runner::source::grouped_int4::document::Int4SourceDocumentTask, CandidateError> {
+        use crate::{jobs::runner::source::grouped_int4::document::Int4SourceDocumentTask as Task,
+            tasks::{ner::NerOptions, keyphrases::KeyphraseOptions, summarize::SummaryOptions}};
+        let planning = self.planning(args);
+        if let Some(question) = &self.question {
+            let question_task = question.task(question_text.ok_or(CandidateError::Input)?, raw)?;
+            if limits.question_synthesis.is_some() {
+                let request = question.synthesis_request(question_task, planning)?;
+                return Ok(match limits.question_hierarchy {
+                    Some(limits) => Task::QuestionHierarchy { request, limits },
+                    None => Task::QuestionSynthesis(request),
+                });
+            }
+            return Ok(Task::Question(question_task));
+        }
+        if question_text.is_some() { return Err(CandidateError::Arguments); }
+        Ok(match self.kind {
+            Kind::Ner => {
+                let options = shared::options::<NerOptions>(raw)?;
+                options.schema_source().map_err(|_| CandidateError::Planning)?;
+                Task::Map(SourceMapTask::Ner(options))
+            }
+            Kind::Keyphrases => {
+                let options = shared::options::<KeyphraseOptions>(raw)?;
+                options.schema_source().map_err(|_| CandidateError::Planning)?;
+                Task::Map(SourceMapTask::Keyphrases(options))
+            }
+            Kind::Summarize => {
+                let options = shared::options::<SummaryOptions>(raw)?;
+                options.schema_source().map_err(|_| CandidateError::Planning)?;
+                if let Some(summary) = self.summary.filter(|summary| summary.synthesis.synthesize_summary) {
+                    let request = summary.synthesis.request(options, planning)?;
+                    match limits.hierarchy {
+                        Some(limits) => Task::SummaryHierarchy { request, limits },
+                        None => Task::SummarySynthesis(request),
+                    }
+                } else if let Some(limits) = limits.summary {
+                    Task::Summary { options, limits }
+                } else { Task::Map(SourceMapTask::Summarize(options)) }
+            }
+            Kind::Answer => return Err(CandidateError::Arguments),
+        })
     }
     fn mapping_limits(&self, args: &Int4Args) -> Result<Int4SourceMapLimits, CandidateError> {
         let m = self.mapping;

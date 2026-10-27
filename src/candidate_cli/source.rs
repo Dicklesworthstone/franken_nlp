@@ -150,7 +150,7 @@ impl SourceCommand {
 
 /// Parse the full typed options through the rejecting JSON boundary. A file
 /// cannot supply a task selector, instruction, budget or replacement identity.
-fn options<T: DeserializeOwned + Default>(json: Option<&str>) -> Result<T, CandidateError> {
+pub(super) fn options<T: DeserializeOwned + Default>(json: Option<&str>) -> Result<T, CandidateError> {
     match json {
         None => Ok(T::default()),
         Some(json) => {
