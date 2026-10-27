@@ -12,11 +12,11 @@ enum Input {
     Faithfulness { claim: String, policy: FaithfulnessPolicy },
 }
 
-pub(super) fn defaults(value: Option<serde_json::Value>, host: &ScoredArgs, budget: TaskBudget)
+pub(super) fn defaults(value: Option<serde_json::Value>, max_input_bytes: usize, budget: TaskBudget)
     -> Result<Defaults, CandidateError> {
     let Some(value) = value else { return Ok(Defaults::Judge(None)); };
     let input: Input = serde_json::from_value(value).map_err(|_| CandidateError::Input)?;
-    let text = |s: &str| !s.is_empty() && s.len() <= host.max_input_bytes;
+    let text = |s: &str| !s.is_empty() && s.len() <= max_input_bytes;
     let args = match input {
         Input::Pairwise { criterion, b, policy } => {
             if !text(&criterion) || !text(&b) { return Err(CandidateError::Input); }

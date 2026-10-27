@@ -2,7 +2,7 @@
 use super::*;
 use serde::Deserialize;
 use crate::{batch::{BatchLimits, BatchWork, classify::ClassificationBatchArgs},
-    tasks::{classify::{ClassificationLabel, ClassificationMode, ClassificationPolicy},
+    tasks::{classify::{ClassificationLabel, ClassificationLimits, ClassificationMode, ClassificationPolicy},
         sentiment::{SentimentAxis, SentimentPolicy, batch::SentimentBatchArgs}, ir::TaskBudget}};
 use super::{scored::{ScoredArgs, prefill::ScoringPrefillArgs}, batch::{FRAME_ALLOWANCE, IO_BUFFER_BYTES}};
 use crate::native_engine::strict_int8::prefill::Int8PrefillLimits;
@@ -129,6 +129,13 @@ pub(super) fn corpus_prefill(kind: ScoreTask, args: &ScoringPrefillArgs)
 /// candidate policies, fallback axes or the caller's exact label spellings.
 pub(super) fn parse_defaults(kind: ScoreTask, host: &ScoredArgs, json: Option<&str>, budget: TaskBudget)
     -> Result<Defaults, CandidateError> {
+    parse_defaults_with_limits(kind, host.classification_limits(), host.max_input_bytes, json, budget)
+}
+
+/// Native INT8 and INT4 callers share one rejecting task-data parser. Only
+/// typed task limits and the caller-owned budget cross this boundary.
+pub(super) fn parse_defaults_with_limits(kind: ScoreTask, classification: ClassificationLimits,
+    max_input_bytes: usize, json: Option<&str>, budget: TaskBudget) -> Result<Defaults, CandidateError> {
     let value = json.map(|text| {
         if text.len() > DEFAULTS_BYTES { return Err(CandidateError::Input); }
         canonjson::parse_str_with_limits(text, canonjson::ParseLimits {
@@ -137,11 +144,11 @@ pub(super) fn parse_defaults(kind: ScoreTask, host: &ScoredArgs, json: Option<&s
     }).transpose()?;
     budget.validate().map_err(|_| CandidateError::Arguments)?;
     Ok(match kind {
-        ScoreTask::Judge => return judge::defaults(value, host, budget),
+        ScoreTask::Judge => return judge::defaults(value, max_input_bytes, budget),
         ScoreTask::Classify => {
             let Some(value) = value else { return Ok(Defaults::Classify(None)); };
             let input: ClassificationDefaults = serde_json::from_value(value).map_err(|_| CandidateError::Input)?;
-            let l = host.classification_limits();
+            let l = classification;
             if input.labels.is_empty() || input.labels.len() > l.max_labels
                 || (input.mode == ClassificationMode::Exclusive && input.labels.len() < 2)
                 || input.policy.minimum_candidate_weight_ppm > 1_000_000 || input.policy.minimum_margin_ppm > 1_000_000 {

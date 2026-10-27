@@ -35,6 +35,7 @@
 > `candidate source-int4` namespace includes generation/chat, classification,
 > [independent dimensional sentiment](#implemented-candidate-int4-dimensional-sentiment),
 > [pairwise, rubric and faithfulness judgment](#implemented-candidate-int4-judgment),
+> [resident classification, sentiment and judgment streams](#implemented-candidate-int4-scoring-batches),
 > [verified NER and rule redaction](#implemented-candidate-int4-redaction),
 > [complete-document redaction](#implemented-candidate-int4-complete-document-redaction),
 > [resident redaction corpora](#implemented-candidate-int4-redaction-corpora),
@@ -596,6 +597,127 @@ failures are reported. Blocking IO observes the overall deadline cooperatively.
 
 Library callers use `Int4JudgePlanner::for_model`, `plan_with_control`, and
 `NlpEngine::execute_int4_judge` with `Int4JudgeHostLimits`. Compilation,
+model-present execution and quality qualification remain pending the authorized
+controller gates.
+
+## Implemented candidate INT4 scoring batches
+
+`fnlp candidate source-int4 score-batch --task classify|sentiment|judge` runs
+ordered finite-scoring requests through **one resident grouped-INT4 model and
+one serial native engine**. The command requires `asupersync-runtime`, explicit
+source or independently pinned snapshot input, and a process memory ceiling.
+The selected task remains fixed for the whole invocation.
+
+For classification, save shared settings as `labels.json`:
+
+```json
+{
+  "labels": [
+    {"id": "complaint", "description": "Reports a problem or dissatisfaction."},
+    {"id": "question", "description": "Asks for information or assistance."}
+  ],
+  "mode": "exclusive",
+  "policy": {
+    "minimum_candidate_weight_ppm": 600000,
+    "minimum_margin_ppm": 100000
+  }
+}
+```
+
+Use ordinary bounded NDJSON records in `documents.ndjson`:
+
+```jsonl
+{"id":"case-1","text":"The replacement arrived damaged."}
+{"id":"case-2","text":"When does the office open?"}
+{"flush":true}
+{"id":"case-1","text":"How can I change the delivery address?"}
+```
+
+```bash
+fnlp candidate source-int4 score-batch documents.ndjson \
+  --task classify --defaults labels.json \
+  --source-dir /models/Nanbeige4.2-3B \
+  --source-manifest /models/nanbeige-source-manifest.json \
+  --memory-mib 8192 --group-width 128 \
+  --max-requests 1000 --max-total-input-bytes 67108864 \
+  --max-total-output-bytes 67108864
+```
+
+Use `-` or omit the input path for stdin. Replace the two source flags with
+`--snapshot FILE --expected-model-sha256 HEX` for read-only reload with an
+independent trusted model-content pin. `--save-snapshot NEW_FILE` on the source
+route begins only after shared defaults and the model-bound task factory have
+been admitted. Records are still planned incrementally; a complete saved model
+remains if a later record fails. There is no download, automatic model selection
+or backend fallback.
+
+Shared defaults are a bounded private JSON file, with duplicate keys and unknown
+fields rejected. They contain task settings and receive the CLI-owned task
+budget; they cannot provide a document, budget, model or execution identity.
+
+| Fixed task | Shared defaults | Meaning of each record's `text` |
+| --- | --- | --- |
+| `classify` | `labels`, optional `mode` and `policy`; defaults are optional if each record provides its complete typed arguments | The document scored against every label |
+| `sentiment` | Optional `axes` and `policy`; omission requests all four axes with the existing default policy | The document scored independently on the requested affect dimensions |
+| `judge` | Pairwise `mode`, `criterion`, `b`, `policy`; rubric `mode`, `rubric`, `policy`; or faithfulness `mode`, `claim`, `policy` | Candidate A, the rubric document, or the complete faithfulness source, respectively |
+
+A record may supply `task_args`. A non-null object replaces the **complete**
+shared arguments; it does not merge selected fields. It uses the existing
+typed `ClassificationBatchArgs`, `SentimentBatchArgs` or `JudgeBatchArgs`
+contract, including its task budget, which cannot exceed the run's host
+authority. Omitted or null `task_args` uses the shared defaults. Classification
+and judgment without either source of complete arguments produce a per-item
+planning error. Sentiment axes may vary per record, but its scoring mode,
+terminal EOS and policy remain fixed by the run. A record cannot switch the
+selected task family, replace prompt templates or choose another model.
+
+Every candidate includes scored terminal EOS and uses the full vocabulary
+denominator. Classification retains every label; sentiment retains independent
+dimension distributions and decisions; judgment retains both pairwise orders,
+all rubric criteria, or the whole-source and evidence-window heads. Every head
+of one item preflights before its first native forward. Logical KV is cleared
+between heads and items. Failed execution never becomes a successful abstention.
+This is serial execution with resident weights; it does not select a shared
+layer-major prompt schedule. Generation, sampling and `--prefill-rows` controls
+are refused.
+
+The five native work flags, `--max-forward-positions`, `--max-projected-logits`,
+`--max-attention-pairs`, `--max-dot-products` and `--max-multiply-accumulates`,
+bound the **entire stream**. Another item or flush does not renew them, and
+increasing `--max-requests` grants no additional compute. Every complete plan
+must fit both its per-item ceiling and the remaining invocation ledger before
+execution. Work accounting includes actual group-dependent dot products.
+`--max-checkpoints` and the overall deadline are likewise finite for the
+invocation; blocking reads and writes observe cancellation cooperatively.
+
+The default transport accepts at most 1000 nonempty records and 64 MiB each of
+input and output. `--max-requests` includes malformed records and flush controls.
+Input accounting includes discarded oversized lines, blank lines and line
+terminators. `--max-line-bytes` defaults to 1 MiB and cannot exceed 4 MiB;
+`--max-input-bytes` separately bounds each decoded document. `--max-result-bytes`
+bounds each complete scored result, with transport and candidate framing priced
+separately. Memory admission includes the full resident KV allocation, native
+scratch, both preparation owners, bounded transport copies, retained defaults
+and output staging. A hosted output guard remains alive through delivery of
+each complete result.
+
+Each result, error, flush or terminal event carries
+`fnlp-candidate-int4-score-batch-v1` candidate provenance with actual model,
+group, kernel and optional snapshot metadata. The inner native record is
+wrapped without reserializing its numbers. Private paths and prompts are omitted
+from provenance; labels and evidence quotes remain intentional result content.
+A complete event is flushed before the next record is read. IDs may be reused
+only after a completed `{"flush":true}` boundary. Earlier completed results
+remain usable if a later item fails, but whole-run success requires both the
+`run_complete` record **and exit status zero**. A fully drained stream containing
+rejected items still exits unsuccessfully. This command provides no durable
+resume protocol and makes no accuracy or calibrated-confidence claim.
+
+Library callers wrap an existing model-bound `Int4ClassificationPlanner`,
+`Int4SentimentPlanner` or `Int4JudgePlanner` in `Int4ScoredBatchPlanner` with
+`Int4ScoredBatchLimits`, then call `NlpEngine::batch_int4_scored` with owned
+reader/writer and `CorpusLimits`. The task trait is sealed to these three
+native planners. CLI, native ledger and host fixtures are authored; compilation,
 model-present execution and quality qualification remain pending the authorized
 controller gates.
 
