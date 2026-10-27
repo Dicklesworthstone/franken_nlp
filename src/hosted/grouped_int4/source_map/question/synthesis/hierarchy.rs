@@ -4,7 +4,7 @@ use crate::tasks::source_planning::grouped_int4::long::question::synthesis::hier
     Int4QuestionHierarchyRun, QuestionHierarchyLimits,
 };
 
-impl Int4SourceMapConfig<SourceQuestionSynthesis> {
+impl<T: std::borrow::Borrow<SourceQuestionSynthesis>> Int4SourceMapConfig<T> {
     /// Reserve every permitted native answer transcript and complete-level
     /// planning witness. Evidence and verification limits remain shared by the
     /// entire invocation; these checked reserves are not measured RSS claims.

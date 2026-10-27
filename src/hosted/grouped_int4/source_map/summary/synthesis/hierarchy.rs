@@ -4,7 +4,7 @@ use crate::tasks::source_planning::grouped_int4::long::summary::synthesis::hiera
     Int4SummaryHierarchyRun, SummaryHierarchyLimits,
 };
 
-impl Int4SourceMapConfig<SourceSummarySynthesis> {
+impl<T: std::borrow::Borrow<SourceSummarySynthesis>> Int4SourceMapConfig<T> {
     /// Price every permitted native transcript plus complete-level planning
     /// witnesses. Evidence and verification allowances stay shared across all
     /// levels. These are checked admission reserves, not measured RSS bounds.

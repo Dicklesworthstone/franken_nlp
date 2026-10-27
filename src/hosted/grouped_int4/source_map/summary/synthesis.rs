@@ -8,14 +8,14 @@ use crate::tasks::{
 };
 mod hierarchy;
 
-impl Int4SourceMapConfig<SourceSummarySynthesis> {
+impl<T: std::borrow::Borrow<SourceSummarySynthesis>> Int4SourceMapConfig<T> {
     /// Complete discovery frontier, one final native transcript, quote copies,
     /// prefix tables and original-coordinate occurrence fanout. This checked
     /// admission quote is shared with CLI preflight; it is not measured RSS.
     pub fn summary_synthesis_workspace_bytes(&self, chunks: usize) -> Result<u64, HostedError> {
         let mul = |a: u64, b: u64| a.checked_mul(b)
             .ok_or(HostedError::Limits("INT4 summary synthesis workspace arithmetic"));
-        let limits = self.task.limits;
+        let limits = self.task.borrow().limits;
         sum(&[
             self.workspace_bytes(chunks)?,
             mul(self.budget.max_output_bytes, 4)?,

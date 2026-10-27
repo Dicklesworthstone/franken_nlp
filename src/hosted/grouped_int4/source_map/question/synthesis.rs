@@ -5,15 +5,16 @@ use crate::tasks::source_planning::grouped_int4::long::question::synthesis::{
 };
 mod hierarchy;
 
-impl Int4SourceMapConfig<SourceQuestionSynthesis> {
+impl<T: std::borrow::Borrow<SourceQuestionSynthesis>> Int4SourceMapConfig<T> {
     /// Charge all source/question maps, verbatim evidence and its origin fanout,
     /// independent occurrence scans and the temporary final native transcript.
     /// The final result keeps text/citations, so native token storage is temporary.
     pub fn question_synthesis_workspace_bytes(&self, chunks: usize) -> Result<u64, HostedError> {
         let mul = |a: u64, b: u64| a.checked_mul(b)
             .ok_or(HostedError::Limits("INT4 answer synthesis workspace arithmetic"));
-        let verification = self.task.question.verification;
-        let limits = self.task.limits;
+        let task = self.task.borrow();
+        let verification = task.question.verification;
+        let limits = task.limits;
         let fields = mul(verification.max_fields as u64,
             (std::mem::size_of::<PassageCitation>() + std::mem::size_of::<SourceCitation>()) as u64)?;
         let spans = mul(verification.max_matches as u64,
