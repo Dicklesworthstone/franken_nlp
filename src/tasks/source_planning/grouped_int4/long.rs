@@ -15,6 +15,8 @@ use crate::{
 };
 mod execution;
 pub mod summary;
+/// Complete document-wide exact keyphrase union and deterministic final ranking.
+pub mod keyphrases;
 /// Question-aware passage planning and complete original-source answer collection.
 pub mod question;
 

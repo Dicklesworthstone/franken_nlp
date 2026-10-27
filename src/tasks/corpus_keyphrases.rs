@@ -160,6 +160,11 @@ impl<P: KeyphrasePass> CorpusKeyphraseTask<P> {
     pub(crate) fn new_int8(pass: P, limits: CorpusKeyphraseLimits) -> Result<Self, KeyphraseError> {
         Self::with_profile(pass, limits, crate::native_engine::strict_int8::STRICT_INT8_PROFILE)
     }
+    /// Internal grouped-INT4 adapter. Native results retain their strict-v2
+    /// profile; eager/INT8 constructors keep their existing profile contracts.
+    pub(crate) fn new_int4(pass: P, limits: CorpusKeyphraseLimits) -> Result<Self, KeyphraseError> {
+        Self::with_profile(pass, limits, crate::native_engine::strict_int4::STRICT_INT4_PROFILE)
+    }
     fn with_profile(pass: P, limits: CorpusKeyphraseLimits, profile: &'static str) -> Result<Self, KeyphraseError> {
         limits.validate()?;
         let options = pass.options(); options.validate()?;
