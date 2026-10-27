@@ -23,6 +23,7 @@ mod source_map;
 mod document_job;
 mod prefill;
 mod batch;
+mod text_job;
 #[cfg(feature = "asupersync-runtime")]
 mod runtime;
 #[cfg(test)]
@@ -125,6 +126,7 @@ enum Int4Task {
     SourceMap(source_map::MapArgs),
     ExtractBatch(extract_batch::BatchArgs),
     ExtractMap(extract_map::MapArgs),
+    TextJob,
     ExtractJob,
     ExtractDocumentJob,
     ScoredJob,
@@ -144,6 +146,7 @@ impl Int4BatchCommand {
     }
 }
 enum Int4JobCommand {
+    Generation(text_job::JobCommand),
     Extraction(extract_job::JobCommand),
     ExtractionDocument(extract_document_job::JobCommand),
     Scored(scored_job::JobCommand),
@@ -187,11 +190,16 @@ pub(super) fn definition() -> clap::Command {
         .subcommands(source_map::definitions())
         .subcommand(batch::definition())
         .subcommand(batch::corpus::definition())
+        .subcommand(text_job::definition())
 }
 impl Int4Command {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let (name, matches) = matches.subcommand().ok_or_else(||
             clap::Error::raw(clap::error::ErrorKind::MissingSubcommand, "source-int4 task required"))?;
+        if name == "text-job" {
+            let (job, args) = text_job::JobCommand::from_matches(matches)?;
+            return Ok(Self { task: Int4Task::TextJob, args, batch: None, job: Some(Int4JobCommand::Generation(job)) });
+        }
         if name == "redact-job" {
             let (job, args) = redact::long::jobs::JobCommand::from_matches(matches)?;
             return Ok(Self { task: Int4Task::RedactJob, args, batch: None, job: Some(Int4JobCommand::Redaction(job)) });
@@ -264,6 +272,8 @@ impl Int4Command {
         self, mut input: R, mut output: W, diagnostics: &mut impl Write,
     ) -> ExitCode {
         let result = match self {
+            Self { task: Int4Task::TextJob, args, batch: None, job: Some(Int4JobCommand::Generation(job)) } =>
+                return job.run_owned(args, input, &mut output, diagnostics),
             Self { task: Int4Task::ExtractJob, args, batch: None, job: Some(Int4JobCommand::Extraction(job)) } =>
                 return job.run_owned(args, input, &mut output, diagnostics),
             Self { task: Int4Task::ExtractDocumentJob, args, batch: None, job: Some(Int4JobCommand::ExtractionDocument(job)) } =>
@@ -295,7 +305,7 @@ impl Int4Command {
         }
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
-        if self.job.is_some() || matches!(self.task, Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob) {
+        if self.job.is_some() || matches!(self.task, Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob) {
             return Err(CandidateError::Arguments);
         }
         if let Some(batch) = self.batch {
@@ -330,7 +340,7 @@ impl Int4Command {
             Int4Task::Source(_, source) => source.validate(&self.args)?,
             // The blocking stream must own its input and writer through cleanup.
             Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::Resolve(_) | Int4Task::Sentiment(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ScoredBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
-                | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob => return Err(CandidateError::Arguments),
+                | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob => return Err(CandidateError::Arguments),
         };
         #[cfg(feature = "asupersync-runtime")]
         { runtime::execute_task(self.task, self.args, limits, input, output) }

@@ -41,7 +41,7 @@
 > [resident redaction corpora](#implemented-candidate-int4-redaction-corpora),
 > [durable redaction jobs](#implemented-candidate-int4-redaction-jobs),
 > single-document extraction, [NER/keyphrases/cited summaries/passage QA](#implemented-candidate-int4-source-tasks),
-> text cohorts/corpora,
+> text cohorts/corpora, [durable generation/chat jobs](#implemented-candidate-int4-generation-and-chat-jobs),
 > [ordered extraction batches](#implemented-candidate-int4-extraction-batches),
 > [durable extraction jobs](#implemented-candidate-int4-extraction-jobs),
 > [durable source-task jobs](#implemented-candidate-int4-source-task-jobs),
@@ -2520,6 +2520,127 @@ document limits, `JobLimits` and lifetime `GroundingBudget`, then call
 `JobHostLimits`. This is source-inventoried candidate functionality. Compilation,
 native correctness, crash recovery, parity and task quality remain unqualified
 until their named validation gates run.
+
+## Implemented candidate INT4 generation and chat jobs
+
+`fnlp candidate source-int4 text-job start|resume generate|chat` retains
+complete native generation results in the authenticated job spool. This route
+requires `metadata-store` and `asupersync-runtime` on Linux x86-64 or AArch64.
+It accepts the same pinned source conversion and independently digest-pinned
+snapshot inputs as the existing INT4 text commands. One resident model serves
+all pending items, through one owned physical invocation.
+
+Supply the **complete original population** on both start and resume, including
+already committed items. The wire format is `{id,text,task_args?}` NDJSON:
+
+```jsonl
+{"id":"message-1","text":"Write a short welcome message."}
+{"id":"message-2","text":"Suggest three titles for an article about local NLP.","task_args":{"sample_index":1}}
+```
+
+For `chat`, `text` is the final user turn. Optional `history` preserves the
+preceding system/user/assistant transcript exactly:
+
+```jsonl
+{"id":"conversation-1","text":"What should I do next?","task_args":{"sample_index":0,"history":[{"role":"system","content":"Give concise practical advice."},{"role":"user","content":"I have collected the documents."},{"role":"assistant","content":"Check the documents for duplicates."}]}}
+```
+
+History must obey the existing chat role order; it is never repaired or
+shortened. `generate` refuses nonempty history. `task_args` can contain only
+`sample_index` and `history`: per-item sampling, model, budget, task or tool
+overrides are refused. This route does not accept the `text-batch`
+prompt/messages format; retained populations also reject flush controls.
+
+The owner supplies an existing protected job directory, a random 128-bit
+job ID, and a protected file containing exactly 32 raw job-authentication key
+bytes. The key is separate from a generation seed. A complete limits file
+such as `text-job-limits.json` fixes the lifetime admission policy:
+
+```json
+{
+  "max_items": 3,
+  "max_id_bytes": 128,
+  "max_input_bytes_per_item": 65536,
+  "max_snapshot_bytes": 4194304,
+  "max_result_bytes": 1048576,
+  "max_spool_bytes": 16777216,
+  "max_materialized_bytes": 16777216,
+  "max_journal_bytes": 67108864,
+  "max_attempts": 6,
+  "max_work": {
+    "model": {
+      "forward_positions": 16384,
+      "projected_logits": 1000000000,
+      "attention_pairs": 1000000000000,
+      "projections": {
+        "dot_products": 10000000000000,
+        "multiply_accumulates": 1000000000000000
+      }
+    },
+    "mask_node_visits": 0
+  }
+}
+```
+
+These are finite example ceilings, not measured work or throughput claims.
+Library callers can derive structural group-aware work with `Int4Work` and
+`JobWork::from_int4`; INT8 projection counts are not a substitute. All five
+native counters must be positive and grammar-mask work must be zero.
+
+```bash
+fnlp candidate source-int4 text-job start generate prompts.ndjson \
+  --source-dir /models/nanbeige42 \
+  --source-manifest /models/source-manifest.json \
+  --memory-mib 8192 --context-tokens 512 --max-new-tokens 32 \
+  --max-output-bytes 4096 \
+  --store-results --job-dir /private/text-job \
+  --job-id "$JOB_ID" --key-file /private/text-job.key \
+  --limits text-job-limits.json --materialize
+```
+
+Use the same arguments with `resume` instead of `start`; use `chat` for a
+population of chat turns. Snapshot loading uses `--snapshot FILE` plus an
+independently trusted `--expected-model-sha256` in place of the two source
+flags. Exact model content and group width must still match. Optional source
+`--save-snapshot NEW_FILE` runs only after native factory and host memory
+preflight; an existing output path is refused.
+
+No seed means greedy execution. Explicit `--seed` takes exactly 64 lowercase
+hexadecimal digits and is frozen with temperature/top-k/top-p, minimum length,
+exact stop suffixes, penalties, token bans, logit biases, logprob capture,
+context and output limits. Resume authenticates those options, exact original
+input bytes/order/IDs and the complete lifetime limits before replay or tail
+repair. Seeded draws remain addressed by the stable item ID and sample index;
+attempt numbers and delivery order never reseed them.
+
+Each attempt durably reserves its complete planned native work before the
+first token. EOS, stops, cancellation and failed execution never refund that
+reservation. Population size, allowed attempts, transport limits and a later
+invocation never multiply or replenish the lifetime work cap. A result commits
+only after the whole item succeeds, with spool synchronization before journal
+acknowledgement. Resume skips committed original ordinals and explicitly retries
+pending whole items; there are no token-level checkpoints or automatic retries.
+Uncommitted tails require resume-only `--discard-uncommitted-tail`, after
+authentication. Original inputs remain the caller's recovery responsibility.
+
+Stdout uses `fnlp-candidate-int4-text-job-v1` and contains public candidate
+provenance plus authenticated progress. Prompts, histories, seeds, generated
+text, token IDs and logprobs stay out of that report. `--store-results`
+explicitly authorizes private result retention; `--materialize` publishes
+verified ordered `materialized.ndjson` only after all original items commit.
+Stored-job status/verify/materialize remain available independently of model
+loading. A final report failure does not imply that durable progress rolled back.
+
+Memory admission covers the entire frozen population, journal/serialization,
+CLI and hosted preparation, resident weights, full context KV, native sampler,
+workspace and guarded complete result. The current retained adapter is serial
+and rejects `--prefill-rows` or cohort scheduling. It uses the existing pinned
+no-thinking/no-tools generation contract. Library callers construct
+`Int4GenerationJobPlanner::for_model` with the actual model identity,
+`Int4GenerationJobConfig` and exact `JobLimits`, then call
+`NlpEngine::job_int4_generation` with `SourceJobRequest` and `JobHostLimits`.
+This is source-inventoried candidate functionality; build, model-present
+correctness, crash recovery, determinism and quality gates remain pending.
 
 ## Installation
 
