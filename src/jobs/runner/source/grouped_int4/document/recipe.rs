@@ -1,6 +1,7 @@
 //! Exhaustive private projections for exact keyed resume commitments.
 use super::*;
 use crate::corpus::summarize::{CorpusSummaryLimits, SUMMARY_REDUCTION_POLICY};
+use crate::tasks::corpus_keyphrases::{CorpusKeyphraseLimits, CORPUS_KEYPHRASE_POLICY};
 
 #[derive(Serialize)]
 pub struct Int4SourceDocumentJobRecipe {
@@ -53,6 +54,24 @@ struct SummaryLimitsRecipe {
     max_bullets: usize,
     max_result_bytes: usize,
 }
+#[derive(Serialize)]
+struct KeyphraseLimitsRecipe {
+    policy: &'static str,
+    max_unique_phrases: usize,
+    max_evidence_spans: usize,
+    max_value_bytes: usize,
+    max_scan_work: u64,
+    max_phrases: usize,
+    max_result_bytes: usize,
+}
+impl From<Int4KeyphraseLimits> for KeyphraseLimitsRecipe {
+    fn from(value: Int4KeyphraseLimits) -> Self {
+        let Int4KeyphraseLimits { aggregation, max_phrases, max_result_bytes } = value;
+        let CorpusKeyphraseLimits { max_unique_phrases, max_evidence_spans, max_value_bytes, max_scan_work } = aggregation;
+        Self { policy: CORPUS_KEYPHRASE_POLICY, max_unique_phrases, max_evidence_spans,
+            max_value_bytes, max_scan_work, max_phrases, max_result_bytes }
+    }
+}
 impl From<Int4SummaryLimits> for SummaryLimitsRecipe {
     fn from(value: Int4SummaryLimits) -> Self {
         let Int4SummaryLimits { aggregation, max_bullets, max_result_bytes } = value;
@@ -97,6 +116,7 @@ impl<'a> From<&'a SourceQuestionSynthesis> for QuestionSynthesisRecipe<'a> {
 #[serde(tag = "mode", rename_all = "snake_case")]
 enum TaskRecipe<'a> {
     Map { task: &'a SourceMapTask },
+    Keyphrases { options: KeyphraseOptions, limits: KeyphraseLimitsRecipe, max_lifetime_scan_work: u64 },
     Summary { options: SummaryOptions, limits: SummaryLimitsRecipe },
     Question { request: QuestionRecipe<'a> },
     SummarySynthesis { request: SummarySynthesisRecipe },
@@ -107,6 +127,8 @@ enum TaskRecipe<'a> {
 fn serialize_task<S: serde::Serializer>(task: &Int4SourceDocumentTask, serializer: S) -> Result<S::Ok, S::Error> {
     let recipe = match task {
         Int4SourceDocumentTask::Map(task) => TaskRecipe::Map { task },
+        Int4SourceDocumentTask::Keyphrases { options, limits, max_lifetime_scan_work } => TaskRecipe::Keyphrases {
+            options: *options, limits: (*limits).into(), max_lifetime_scan_work: *max_lifetime_scan_work },
         Int4SourceDocumentTask::Summary { options, limits } => TaskRecipe::Summary {
             options: *options, limits: (*limits).into() },
         Int4SourceDocumentTask::Question(question) => TaskRecipe::Question { request: question.into() },

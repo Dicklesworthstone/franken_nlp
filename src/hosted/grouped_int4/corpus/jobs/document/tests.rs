@@ -155,6 +155,21 @@ fn aggregate_document_work_is_not_mistaken_for_one_native_context() {
 }
 
 #[test]
+fn ranked_keyphrases_keep_complete_chunk_work_without_retained_native_tokens() {
+    let (budget, _, mapping, _, _) = fixture();
+    let mut id = identity(); id.task_spec = "keyphrases-v1".to_owned();
+    let ids = [id.clone(), id];
+    let mut req = request(&ids, mapping, budget.max_kv_bytes);
+    req.max_output_tokens = 0;
+    assert!(req.model_work.forward_positions > mapping.chunks.context_tokens as u64);
+    assert!(check_document_request(WIDTH, "keyphrases-v1", budget.max_kv_bytes,
+        mapping, 65536, 0, &req).is_ok());
+    req.max_output_tokens = 1;
+    assert!(check_document_request(WIDTH, "keyphrases-v1", budget.max_kv_bytes,
+        mapping, 65536, 0, &req).is_err());
+}
+
+#[test]
 fn every_initial_identity_is_checked_and_blank_qa_chunks_need_no_fake_identity() {
     let (budget, _, mapping, _, _) = fixture();
     let ids = [identity()];

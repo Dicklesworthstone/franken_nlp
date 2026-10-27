@@ -4,11 +4,14 @@
 use super::*;
 use crate::{
     native_engine::constrained_int4,
-    tasks::{answer::AnswerOptions, ir::PlanContext, mapreduce::{ChunkLimits, ExecutionLimits, CHUNK_PROFILE},
+    tasks::{answer::AnswerOptions, ir::PlanContext, keyphrases::KeyphraseOptions,
+        mapreduce::{ChunkLimits, ExecutionLimits, CHUNK_PROFILE},
         summarize::SummaryOptions,
         source_planning::grouped_int4::long::{Int4SourceMapError, Int4SourceMapLimits,
             Int4SourceMapPreflight, Int4SourceMapRun, PreparedInt4SourceMap, SourceMapTask,
             INT4_SOURCE_MAP_EXECUTION,
+            keyphrases::{Int4CorpusKeyphraseError, Int4CorpusKeyphraseRun, Int4KeyphraseLimits,
+                INT4_CORPUS_KEYPHRASE_EXECUTION},
             summary::{Int4CorpusSummaryError, Int4CorpusSummaryRun, Int4SummaryLimits,
                 INT4_CORPUS_SUMMARY_EXECUTION,
                 synthesis::{Int4SummarySynthesisPreflight, Int4SummarySynthesisRun,
@@ -37,6 +40,9 @@ pub use execution::{Int4SourceDocumentAdmission, Int4SourceDocumentBatchAdmissio
 /// questions deliberately have neither Debug nor a deserializable factory.
 pub enum Int4SourceDocumentTask {
     Map(SourceMapTask),
+    /// Complete exact-text/evidence union, ranked only at the final root.
+    /// The independent reducer scan ceiling includes every durable attempt.
+    Keyphrases { options: KeyphraseOptions, limits: Int4KeyphraseLimits, max_lifetime_scan_work: u64 },
     Summary { options: SummaryOptions, limits: Int4SummaryLimits },
     Question(SourceQuestion),
     SummarySynthesis(SourceSummarySynthesis),
@@ -48,7 +54,7 @@ impl Int4SourceDocumentTask {
     fn kind(&self) -> BuiltInTask {
         match self {
             Self::Map(SourceMapTask::Ner(_)) => BuiltInTask::Ner,
-            Self::Map(SourceMapTask::Keyphrases(_)) => BuiltInTask::Keyphrases,
+            Self::Map(SourceMapTask::Keyphrases(_)) | Self::Keyphrases { .. } => BuiltInTask::Keyphrases,
             Self::Map(SourceMapTask::Summarize(_)) | Self::Summary { .. }
                 | Self::SummarySynthesis(_) | Self::SummaryHierarchy { .. } => BuiltInTask::Summarize,
             Self::Question(_) | Self::QuestionSynthesis(_) | Self::QuestionHierarchy { .. } => BuiltInTask::Answer,
@@ -57,6 +63,7 @@ impl Int4SourceDocumentTask {
     fn execution(&self) -> &'static str {
         match self {
             Self::Map(_) => INT4_SOURCE_MAP_EXECUTION,
+            Self::Keyphrases { .. } => INT4_CORPUS_KEYPHRASE_EXECUTION,
             Self::Summary { .. } => INT4_CORPUS_SUMMARY_EXECUTION,
             Self::Question(_) => INT4_QUESTION_EXECUTION,
             Self::SummarySynthesis(_) => INT4_SUMMARY_SYNTHESIS_EXECUTION,
@@ -67,7 +74,7 @@ impl Int4SourceDocumentTask {
     }
     fn verification(&self, mapping: Int4SourceMapLimits) -> GroundingBudget {
         match self {
-            Self::Map(_) | Self::Summary { .. } => mapping.verification,
+            Self::Map(_) | Self::Keyphrases { .. } | Self::Summary { .. } => mapping.verification,
             Self::SummarySynthesis(request) | Self::SummaryHierarchy { request, .. } => request.limits.verification,
             Self::Question(question) => question.verification,
             Self::QuestionSynthesis(request) | Self::QuestionHierarchy { request, .. } => request.question.verification,
@@ -76,12 +83,30 @@ impl Int4SourceDocumentTask {
     fn summary_scan_steps(&self) -> u64 {
         match self { Self::Summary { limits, .. } => limits.aggregation.max_scan_steps, _ => 0 }
     }
+    fn verify_lifetime(&self, mapping: Int4SourceMapLimits, lifetime: Int4SourceDocumentLifetime,
+        attempts: u64) -> Result<(), BatchFault> {
+        verify_lifetime(self.verification(mapping), self.summary_scan_steps(), lifetime, attempts)?;
+        if let Self::Keyphrases { limits, max_lifetime_scan_work, .. } = self {
+            // The persisted attempt count covers failures, cancellation and
+            // uncertain acknowledgements too. Keep this new allowance inside
+            // the new task variant so existing recipe bytes remain unchanged.
+            if limits.aggregation.max_scan_work.checked_mul(attempts)
+                .is_none_or(|work| work > *max_lifetime_scan_work) {
+                return Err(BatchCode::InvalidLimits.into());
+            }
+        }
+        Ok(())
+    }
     fn validate(&self, planning: SourcePlanningLimits, mapping: Int4SourceMapLimits) -> Result<(), BatchFault> {
         let invalid = |_| BatchFault::from(BatchCode::InvalidLimits);
         match self {
             Self::Map(SourceMapTask::Ner(options)) => options.validate().map_err(invalid)?,
             Self::Map(SourceMapTask::Keyphrases(options)) => options.validate().map_err(|_| BatchCode::InvalidLimits)?,
             Self::Map(SourceMapTask::Summarize(options)) => options.validate().map_err(|_| BatchCode::InvalidLimits)?,
+            Self::Keyphrases { options, limits, .. } => {
+                options.validate().map_err(|_| BatchCode::InvalidLimits)?;
+                limits.validate(mapping).map_err(|_| BatchCode::InvalidLimits)?;
+            }
             Self::Summary { options, limits } => {
                 options.validate().map_err(|_| BatchCode::InvalidLimits)?;
                 limits.validate(mapping).map_err(|_| BatchCode::InvalidLimits)?;
@@ -112,8 +137,9 @@ fn validate_question(question: &SourceQuestion, planning: SourcePlanningLimits) 
 }
 
 /// Explicit lifetime authority for independent original-coordinate verification
-/// and the exact summary reducer. These ceilings are never multiplied into new
-/// authority on resume; the persisted attempt counter must fit them up front.
+/// and the exact summary reducer. Ranked keyphrases carry their additional
+/// reducer ceiling in the task variant, preserving this existing recipe shape.
+/// The persisted attempt counter must fit every ceiling up front.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct Int4SourceDocumentLifetime {
     pub verification: GroundingBudget,
@@ -160,11 +186,12 @@ impl Int4SourceDocumentJobPlanner {
         }
         task.validate(source.planning, mapping)?;
         let result_bytes = match &task {
+            Int4SourceDocumentTask::Keyphrases { limits, .. } => limits.max_result_bytes,
             Int4SourceDocumentTask::Summary { limits, .. } => limits.max_result_bytes,
             _ => mapping.reduction.max_result_bytes,
         };
         if result_bytes > limits.max_result_bytes { return Err(BatchCode::InvalidLimits.into()); }
-        verify_lifetime(task.verification(mapping), task.summary_scan_steps(), lifetime, limits.max_attempts)?;
+        task.verify_lifetime(mapping, lifetime, limits.max_attempts)?;
         let group_width = source.recipe.group_width;
         let recipe = Int4SourceDocumentJobRecipe::new(source.recipe, task, mapping, lifetime, limits.max_attempts)?;
         Ok(Self { planner: source.planner, identity: source.identity, group_width, budget,
@@ -179,11 +206,13 @@ impl Int4SourceDocumentJobPlanner {
     pub fn task(&self) -> &Int4SourceDocumentTask { &self.recipe.task }
     pub fn job_recipe(&self) -> &Int4SourceDocumentJobRecipe { &self.recipe }
     pub fn max_result_bytes(&self) -> u64 {
-        match self.task() { Int4SourceDocumentTask::Summary { limits, .. } => limits.max_result_bytes as u64,
+        match self.task() {
+            Int4SourceDocumentTask::Keyphrases { limits, .. } => limits.max_result_bytes as u64,
+            Int4SourceDocumentTask::Summary { limits, .. } => limits.max_result_bytes as u64,
             _ => self.mapping.reduction.max_result_bytes as u64 }
     }
     /// Retained native token arrays in the final result. Discovery QA and exact
-    /// summary selection omit transcripts; their temporary storage is separate.
+    /// summary/keyphrase selection omit transcripts; their temporary storage is separate.
     pub fn output_token_ceiling(&self) -> Result<u64, BatchFault> {
         self.output_tokens(self.mapping.chunks.max_chunks)
     }
@@ -201,8 +230,7 @@ impl Int4SourceDocumentJobPlanner {
     }
     pub fn check_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> {
         if limits != self.limits { return Err(BatchCode::InvalidLimits.into()); }
-        verify_lifetime(self.task().verification(self.mapping), self.task().summary_scan_steps(),
-            self.recipe.lifetime, limits.max_attempts)
+        self.task().verify_lifetime(self.mapping, self.recipe.lifetime, limits.max_attempts)
     }
     fn owns(&self, prepared: &PreparedInt4SourceDocument) -> Result<(), BatchItemFailure> {
         if !Arc::ptr_eq(&self.owner, &prepared.owner) { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
@@ -281,6 +309,12 @@ fn map_failure(error: Int4SourceMapError) -> BatchItemFailure {
 fn summary_failure(error: Int4CorpusSummaryError) -> BatchItemFailure {
     if let Some(cause) = error.cancellation() { return BatchItemFailure::fatal(BatchFault::cancelled(cause)); }
     BatchItemFailure::fatal(if matches!(error, Int4CorpusSummaryError::InvalidLimits) {
+        BatchCode::InvalidLimits
+    } else { BatchCode::InvalidExecution })
+}
+fn keyphrase_failure(error: Int4CorpusKeyphraseError) -> BatchItemFailure {
+    if let Some(cause) = error.cancellation() { return BatchItemFailure::fatal(BatchFault::cancelled(cause)); }
+    BatchItemFailure::fatal(if matches!(error, Int4CorpusKeyphraseError::InvalidLimits) {
         BatchCode::InvalidLimits
     } else { BatchCode::InvalidExecution })
 }

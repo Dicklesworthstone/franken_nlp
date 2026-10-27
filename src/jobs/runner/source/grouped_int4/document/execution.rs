@@ -27,6 +27,7 @@ pub trait Int4SourceDocumentBatchAdmission {
 #[serde(untagged)]
 pub enum Int4SourceDocumentRun {
     Map(Int4SourceMapRun),
+    Keyphrases(Int4CorpusKeyphraseRun),
     Summary(Int4CorpusSummaryRun),
     Question(Int4QuestionRun),
     SummarySynthesis(Int4SummarySynthesisRun),

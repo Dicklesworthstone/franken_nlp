@@ -11,6 +11,7 @@ use crate::{
 };
 mod summary;
 mod question;
+mod keyphrases;
 
 /// One original document, fixed task/model and nonrenewable work envelope.
 /// Preparation prices all retained prompts/grammars, tokenizer/vocabulary

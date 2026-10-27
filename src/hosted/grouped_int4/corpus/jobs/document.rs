@@ -37,6 +37,8 @@ impl Int4SourceDocumentJobPlanner {
         match self.task() {
             Int4SourceDocumentTask::Map(_) | Int4SourceDocumentTask::Summary { .. } =>
                 quote_config(self, (), native, reduction_reserve_bytes).workspace_bytes(chunks),
+            Int4SourceDocumentTask::Keyphrases { limits, .. } =>
+                quote_config(self, (), native, reduction_reserve_bytes).keyphrase_workspace_bytes(chunks, *limits),
             Int4SourceDocumentTask::Question(question) =>
                 quote_config(self, question, native, reduction_reserve_bytes).question_workspace_bytes(chunks),
             Int4SourceDocumentTask::SummarySynthesis(request) =>
@@ -66,7 +68,8 @@ fn quote_config<T>(planner: &Int4SourceDocumentJobPlanner, task: T,
 
 impl NlpEngine {
     /// Run or resume complete original documents through the existing INT4
-    /// map, summary-selection, cited-synthesis and hierarchical QA pipelines.
+    /// map, keyphrase-ranking, summary-selection, cited-synthesis and
+    /// hierarchical QA pipelines.
     /// Each document commits one complete result; intermediate chunks/passes
     /// are never exposed as separately resumable or successful partial items.
     ///

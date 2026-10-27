@@ -9,6 +9,7 @@ use crate::{
     tasks::{keyphrases::KeyphraseOptions, ner::NerOptions},
     tokenizer::{embedded::EmbeddedTokenizer, pinned_controls},
 };
+mod keyphrases;
 
 const WIDTH: usize = 32;
 const SOURCE: &str = "éabc----βdef";

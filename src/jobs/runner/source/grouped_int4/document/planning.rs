@@ -4,6 +4,7 @@ use super::*;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Expected {
     Map(Int4SourceMapPreflight),
+    Keyphrases(Int4SourceMapPreflight),
     Summary(Int4SourceMapPreflight),
     Question(Int4QuestionPreflight),
     SummarySynthesis(Int4SummarySynthesisPreflight),
@@ -14,7 +15,7 @@ pub(super) enum Expected {
 impl Expected {
     pub(super) fn chunk_count(self) -> usize {
         match self {
-            Self::Map(p) | Self::Summary(p) => p.chunk_count(),
+            Self::Map(p) | Self::Keyphrases(p) | Self::Summary(p) => p.chunk_count(),
             Self::Question(p) => p.chunk_count(),
             Self::SummarySynthesis(p) => p.chunk_count(),
             Self::SummaryHierarchy(p) => p.chunk_count(),
@@ -32,7 +33,7 @@ impl Expected {
     }
     fn group_width(self) -> usize {
         match self {
-            Self::Map(p) | Self::Summary(p) => p.group_width(),
+            Self::Map(p) | Self::Keyphrases(p) | Self::Summary(p) => p.group_width(),
             Self::Question(p) => p.group_width(),
             Self::SummarySynthesis(p) => p.group_width(),
             Self::SummaryHierarchy(p) => p.group_width(),
@@ -42,7 +43,7 @@ impl Expected {
     }
     pub(super) fn work(self) -> Result<JobWork, BatchItemFailure> {
         let (model, masks) = match self {
-            Self::Map(p) | Self::Summary(p) => (p.planned_work(), p.reserved_mask_visits()),
+            Self::Map(p) | Self::Keyphrases(p) | Self::Summary(p) => (p.planned_work(), p.reserved_mask_visits()),
             Self::Question(p) => (p.planned_work(), p.reserved_mask_visits()),
             Self::SummarySynthesis(p) => (p.reserved_model_work().map_err(map_failure)?,
                 p.reserved_mask_visits().map_err(map_failure)?),
@@ -57,6 +58,13 @@ impl Expected {
         -> Result<(), BatchItemFailure> {
         match (self, run) {
             (Self::Map(p), Int4SourceDocumentRun::Map(run)) => p.verify_completed(run).map_err(map_failure),
+            (Self::Keyphrases(p), Int4SourceDocumentRun::Keyphrases(run)) => {
+                p.verify_keyphrases_completed(run).map_err(keyphrase_failure)?;
+                let Int4SourceDocumentTask::Keyphrases { limits, .. } = task else {
+                    return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
+                };
+                verify_keyphrase_limits(run, *limits)
+            }
             (Self::Summary(p), Int4SourceDocumentRun::Summary(run)) => {
                 p.verify_summary_completed(run).map_err(summary_failure)?;
                 let Int4SourceDocumentTask::Summary { limits, .. } = task else {
@@ -78,8 +86,28 @@ impl Expected {
     }
 }
 
+fn verify_keyphrase_limits(run: &Int4CorpusKeyphraseRun, limits: Int4KeyphraseLimits)
+    -> Result<(), BatchItemFailure> {
+    let phrases = &run.keyphrases;
+    if run.requested_max_phrases != limits.max_phrases
+        || phrases.phrases.len() > limits.max_phrases
+        || run.verification_scan_work > limits.aggregation.max_scan_work
+        || phrases.phrases.len().checked_add(phrases.omitted_candidates)
+            .is_none_or(|count| count > limits.aggregation.max_unique_phrases) {
+        return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
+    }
+    let spans = phrases.phrases.iter().flat_map(|phrase| &phrase.evidence)
+        .try_fold(0_usize, |count, evidence| count.checked_add(evidence.spans.len()));
+    if spans.is_none_or(|count| count > limits.aggregation.max_evidence_spans) {
+        return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
+    }
+    crate::tasks::corpus_keyphrases::check_bytes(run, limits.max_result_bytes)
+        .map_err(|_| BatchItemFailure::fatal(BatchCode::OutputLineLimit))
+}
+
 pub(super) enum NativePlan<'s> {
     Map(PreparedInt4SourceMap<'s>),
+    Keyphrases(PreparedInt4SourceMap<'s>, Int4KeyphraseLimits),
     Summary(PreparedInt4SourceMap<'s>, Int4SummaryLimits),
     Question(PreparedInt4Question<'s>),
     SummarySynthesis(PreparedInt4SummarySynthesis<'s>),
@@ -91,6 +119,7 @@ impl NativePlan<'_> {
     fn expected(&self) -> Expected {
         match self {
             Self::Map(p) => Expected::Map(p.preflight_metadata()),
+            Self::Keyphrases(p, _) => Expected::Keyphrases(p.preflight_metadata()),
             Self::Summary(p, _) => Expected::Summary(p.preflight_metadata()),
             Self::Question(p) => Expected::Question(p.preflight_metadata()),
             Self::SummarySynthesis(p) => Expected::SummarySynthesis(p.preflight_metadata()),
@@ -101,7 +130,7 @@ impl NativePlan<'_> {
     }
     fn max_kv_bytes(&self) -> u64 {
         match self {
-            Self::Map(p) | Self::Summary(p, _) => p.max_kv_bytes(),
+            Self::Map(p) | Self::Keyphrases(p, _) | Self::Summary(p, _) => p.max_kv_bytes(),
             Self::Question(p) => p.max_kv_bytes(),
             Self::SummarySynthesis(p) => p.max_kv_bytes(),
             Self::SummaryHierarchy(p) => p.max_kv_bytes(),
@@ -111,7 +140,7 @@ impl NativePlan<'_> {
     }
     fn identities<C: DecodeStepControl>(&self, control: &mut C) -> Result<Vec<ExecutionIdentity>, BatchItemFailure> {
         match self {
-            Self::Map(p) | Self::Summary(p, _) => copy_identities(p.execution_identities(), control),
+            Self::Map(p) | Self::Keyphrases(p, _) | Self::Summary(p, _) => copy_identities(p.execution_identities(), control),
             Self::Question(p) => copy_identities(p.execution_identities(), control),
             Self::SummarySynthesis(p) => copy_identities(p.execution_identities(), control),
             Self::SummaryHierarchy(p) => copy_identities(p.execution_identities(), control),
@@ -147,7 +176,7 @@ impl NativePlan<'_> {
                 .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
         }
         match self {
-            Self::Map(p) | Self::Summary(p, _) => p.preflight(identities, engine).map_err(map_failure),
+            Self::Map(p) | Self::Keyphrases(p, _) | Self::Summary(p, _) => p.preflight(identities, engine).map_err(map_failure),
             Self::Question(p) => p.preflight(identities, engine).map_err(map_failure),
             _ => Ok(()),
         }
@@ -158,6 +187,8 @@ impl NativePlan<'_> {
         match self {
             Self::Map(p) => p.execute_with_control(admitted, engine, vocabulary, control)
                 .map(Int4SourceDocumentRun::Map).map_err(map_failure),
+            Self::Keyphrases(p, limits) => p.execute_keyphrases_with_control(admitted, engine, vocabulary, limits, control)
+                .map(Int4SourceDocumentRun::Keyphrases).map_err(keyphrase_failure),
             Self::Summary(p, limits) => p.execute_summary_with_control(admitted, engine, vocabulary, limits, control)
                 .map(Int4SourceDocumentRun::Summary).map_err(summary_failure),
             Self::Question(p) => p.execute_with_control(admitted, engine, vocabulary, control)
@@ -193,6 +224,12 @@ impl Int4SourceDocumentJobPlanner {
         let plan = match self.task() {
             Int4SourceDocumentTask::Map(task) => NativePlan::Map(self.planner.plan_int4_map_with_control(
                 source, task, self.budget, &context, self.planning, self.mapping, width, control).map_err(map_failure)?),
+            Int4SourceDocumentTask::Keyphrases { options, limits, .. } => {
+                let plan = self.planner.plan_int4_map_with_control(source, &SourceMapTask::Keyphrases(*options),
+                    self.budget, &context, self.planning, self.mapping, width, control).map_err(map_failure)?;
+                plan.check_keyphrases(*limits).map_err(keyphrase_failure)?;
+                NativePlan::Keyphrases(plan, *limits)
+            }
             Int4SourceDocumentTask::Summary { options, limits } => {
                 let plan = self.planner.plan_int4_map_with_control(source, &SourceMapTask::Summarize(*options),
                     self.budget, &context, self.planning, self.mapping, width, control).map_err(map_failure)?;
