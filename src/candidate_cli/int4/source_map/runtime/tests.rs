@@ -115,6 +115,59 @@ fn summary_final_top_k_never_changes_the_complete_map_population() {
 }
 
 #[test]
+fn ranked_keyphrase_top_k_keeps_every_original_chunk_and_rejects_foreign_tasks() {
+    let (planner, config, _) = fixture(Kind::Keyphrases, 32);
+    let mut limits = Int4KeyphraseLimits::default();
+    let expected = keyphrase_preflight(SOURCE, &planner, &config, 32, limits, &mut continuing()).unwrap();
+    assert!(expected.chunk_count() > 1); assert_eq!(expected.source_span().byte_end, SOURCE.len());
+    assert_eq!(expected.source_span().scalar_end, SOURCE.chars().count());
+    assert_eq!(expected.group_width(), 32);
+    limits.max_phrases = 1;
+    assert_eq!(keyphrase_preflight(SOURCE, &planner, &config, 32, limits, &mut continuing()).unwrap(), expected);
+    assert_eq!(preflight(SOURCE, &planner, &config, 32, None, &mut continuing()).unwrap(), expected);
+    let (planner, foreign, _) = fixture(Kind::Ner, 32);
+    assert_eq!(keyphrase_preflight(SOURCE, &planner, &foreign, 32, limits, &mut continuing()),
+        Err(CandidateError::Planning));
+}
+
+#[test]
+fn ranked_keyphrase_workspace_matches_host_for_the_complete_aggregate() {
+    let (_, mut config, _) = fixture(Kind::Keyphrases, 128);
+    let command = super::super::tests::command(Kind::Keyphrases, &["--reduce-keyphrases",
+        "--max-unique-keyphrases", "100", "--max-keyphrase-evidence-spans", "2000"]);
+    let Int4Task::SourceMap(options) = command.task else { panic!("wrong ranked keyphrase task"); };
+    let limits = options.validate(&command.args).unwrap(); let aggregation = limits.keyphrases.unwrap();
+    config.budget = options.source.budget(&command.args, limits.common);
+    config.mapping = limits.mapping; config.reduction_reserve_bytes = limits.reduction_reserve_bytes;
+    for chunks in [1, config.mapping.chunks.max_chunks] {
+        assert_eq!(config.keyphrase_workspace_bytes(chunks, aggregation).unwrap(),
+            keyphrases::workspace_bytes(config.budget, config.mapping, chunks,
+                config.reduction_reserve_bytes, aggregation).unwrap());
+    }
+    assert_eq!(config.keyphrase_workspace_bytes(config.mapping.chunks.max_chunks, aggregation).unwrap(),
+        limits.workspace_bytes);
+    assert!(config.keyphrase_workspace_bytes(0, aggregation).is_err());
+}
+
+#[test]
+fn ranked_keyphrase_cancellation_is_never_mapped_to_successful_empty_results() {
+    use crate::tasks::source_planning::grouped_int4::long::keyphrases::Int4CorpusKeyphraseError;
+    let (planner, config, _) = fixture(Kind::Keyphrases, 32);
+    for cause in [DecodeCancellationKind::Deadline, DecodeCancellationKind::Timeout, DecodeCancellationKind::PollQuota] {
+        let expected = if cause == DecodeCancellationKind::PollQuota { CandidateError::Execution }
+            else { CandidateError::Timeout };
+        let mut control = Control { calls: 0, stop_at: 1, cause };
+        assert_eq!(keyphrase_preflight(SOURCE, &planner, &config, 32, Int4KeyphraseLimits::default(), &mut control),
+            Err(expected));
+        let context = PlanContext::new(&config.identity, config.budget).unwrap();
+        let error = planner.plan_int4_map_with_control(SOURCE, &config.task, config.budget, &context,
+            config.planning, config.mapping, 32, &mut Control { calls: 0, stop_at: 1, cause }).err().unwrap();
+        assert_eq!(execution_error(HostedError::Int4(Int4HostError::SourceKeyphrases(
+            Int4CorpusKeyphraseError::Map(error)))), expected);
+    }
+}
+
+#[test]
 fn source_cannot_be_truncated_or_normalized_to_force_context_fit() {
     let (planner, mut config, summary) = fixture(Kind::Keyphrases, 32);
     assert_eq!(preflight("", &planner, &config, 32, summary, &mut continuing()), Err(CandidateError::Input));

@@ -1738,10 +1738,11 @@ combined work preflight before the first native forward.
 
 `ner-map` retains typed entity results and all independently verified
 compatible occurrences within each contributing chunk, lifted to the
-original document's byte and Unicode-scalar coordinates. `keyphrases-map`
-retains exact-source phrases and their per-chunk ranks; it does not invent a
-global phrase ranking. Both outputs preserve the complete ordered chunk
-population and its lineage.
+original document's byte and Unicode-scalar coordinates. By default,
+`keyphrases-map` retains exact-source phrases and their per-chunk ranks.
+Both default outputs preserve the complete ordered chunk population and its
+lineage. Explicit `--reduce-keyphrases` selects the global exact ranking
+described below.
 
 For example, process a document from the pinned local conversion sources:
 
@@ -1770,6 +1771,66 @@ for NER and `{"max_phrases":16,"max_phrase_scalars":256}` for
 keyphrases. Unknown keys, duplicate keys, partial options and task switching
 are refused. Free-text generation controls and prefill overrides are not
 accepted.
+
+### Complete exact keyphrase ranking
+
+`keyphrases-map --reduce-keyphrases` executes native extraction on every
+original chunk, independently verifies source membership and returns one
+deterministic document-wide ranking. Only byte-identical phrases merge;
+case, whitespace and Unicode spelling remain exact. All candidates and
+their original-coordinate evidence survive every intermediate reduction.
+`--document-keyphrases` selects the final top-k once, after the complete
+original chunk population has finished.
+
+```bash
+fnlp candidate source-int4 keyphrases-map report.txt \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --memory-mib 8192 --group-width 128 \
+  --reduce-keyphrases --document-keyphrases 12
+```
+
+The optional `--options FILE` still controls each native chunk independently.
+For example, `{"max_phrases":16,"max_phrase_scalars":256}` permits sixteen
+proposals per chunk while the command above retains twelve final phrases.
+Candidates are ordered by distinct supporting-chunk count descending, sum
+of local ranks ascending, earliest original byte offset ascending, then
+exact lexical bytes. Repeated occurrences in one chunk retain all their
+verified spans but contribute one support vote. This deterministic policy
+does not perform neural reranking or assign calibrated probabilities.
+
+| Ranked-mode flag | Default | Scope |
+|---|---:|---|
+| `--document-keyphrases` | 16 | Final selected phrases |
+| `--max-unique-keyphrases` | 4,096 | Complete union before final selection |
+| `--max-keyphrase-evidence-spans` | 65,536 | Complete original-coordinate occurrence evidence |
+| `--max-keyphrase-value-bytes` | 4,194,304 | Aggregate value and conservative stored-field charge |
+| `--max-keyphrase-scan-work` | 536,870,912 | Independent reducer source reverification across all chunks |
+| `--max-keyphrase-result-bytes` | 4,194,304 | Complete ranked-document result envelope |
+
+These flags require explicit `--reduce-keyphrases` and are accepted only by
+the keyphrase task. Aggregate and full result caps must fit the map/reduction
+frontier configured by `--max-map-result-bytes`; `--max-result-bytes` remains
+the native per-chunk output cap. Source-field verification, all five INT4
+work axes and masks retain their separate complete-document ceilings.
+Exhausting the candidate, evidence or scan budget returns no complete result;
+the reducer never makes the request fit by pruning intermediate candidates.
+
+The `fnlp-candidate-int4-keyphrase-ranking-v1` envelope retains exact phrase
+text, original UTF-8 byte and Unicode-scalar spans, chunk support, local-rank
+sums, omitted-candidate count and complete work accounting. It retains no
+native token transcripts. Memory admission still includes native outputs and
+the complete candidate/evidence frontier during execution. Source conversion
+and independently pinned snapshots use the same path, and optional snapshot
+save follows complete-document preflight.
+
+Library callers use `Int4KeyphraseLimits` and
+`NlpEngine::reduce_int4_keyphrases_document` with `Int4SourceMapConfig`.
+The complete native candidate union is deterministic for fixed native
+outputs; model selection is not a recall guarantee, chunk boundaries may
+split phrases, and single-context equivalence remains unestablished.
+Compilation, native correctness, parity and task quality remain pending
+their named validation gates.
 
 ### Complete cited-summary union
 
@@ -2123,6 +2184,7 @@ remain available without accepting another task family's flags:
 |---|---|
 | `ner` | Independent entity results for every chunk, with original-coordinate occurrences |
 | `keyphrases` | Independent exact-source keyphrases per chunk; no global phrase ranking |
+| `keyphrases --reduce-keyphrases` | Complete exact candidate union, verified original-coordinate evidence and one final global ranking |
 | `summarize --map-only` | Independent cited chunk summaries |
 | `summarize` | Deterministic cited-bullet union with final global selection |
 | `summarize --synthesize-summary` | One neural summary pass over all collected verified quotes |
@@ -2221,6 +2283,7 @@ caps. These fixed defaults are authenticated along with the task recipe:
 | `--max-lifetime-source-matches` | 16,384,000 |
 | `--max-lifetime-source-scan-steps` | 67,108,864,000 |
 | `--max-lifetime-summary-scan-steps` | 536,870,912,000 |
+| `--max-lifetime-keyphrase-scan-work` (ranked keyphrases only) | 536,870,912,000 |
 
 For each axis, the selected per-document verification limit multiplied by
 `JobLimits.max_attempts` must fit its explicit lifetime cap. Summary synthesis
@@ -2230,11 +2293,39 @@ checks its independent reducer scan budget. Failed attempts count too.
 Increasing `max_attempts` or changing these caps cannot renew an existing job;
 the original contract must match exactly.
 
+For durable global keyphrase ranking, select `keyphrases --reduce-keyphrases`
+after `start` or `resume`; all ranked-mode flags above remain available:
+
+```bash
+fnlp candidate source-int4 document-job start keyphrases documents.ndjson \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$EXPECTED_MODEL_SHA256" \
+  --memory-mib 16384 --max-chunks 8 \
+  --reduce-keyphrases --document-keyphrases 12 \
+  --max-lifetime-keyphrase-scan-work 536870912000 \
+  --store-results \
+  --job-dir /private/keyphrase-document-job \
+  --job-id "$JOB_ID" \
+  --key-file /private/keyphrase-document-job.key \
+  --limits document-job-limits.json \
+  --materialize
+```
+
+The keyphrase reducer's per-document `--max-keyphrase-scan-work` multiplied
+by stored `max_attempts` must fit its explicit lifetime cap. Both are part
+of the authenticated recipe alongside native options and final selection
+limits; retry or resume never renews that work. Each whole document remains
+atomic. Retained results contain the ranked envelope and evidence without
+native token transcripts; metadata stdout identifies `document_mode` as
+`keyphrase_ranking`. Raw `keyphrases` keeps its original independent-map
+behavior and does not acquire a ranking or a new authenticated scan field.
+
 Admission includes the full population, native allocation, maximum document
 frontier, all permitted pass results, citation-verification storage, protected
-spool serialization and journal memory. `--max-map-result-bytes` must fit the
-stored per-item result ceiling; `--max-result-bytes` remains the per-chunk or
-per-pass cap. The input byte ceiling bounds a complete NDJSON record, including
+spool serialization and journal memory. The selected complete result cap must
+fit the stored per-item ceiling: `--max-keyphrase-result-bytes` for ranked
+keyphrases, or `--max-map-result-bytes` for the other modes.
+`--max-result-bytes` remains the per-chunk or per-pass cap. The input byte ceiling bounds a complete NDJSON record, including
 JSON escaping and envelope fields. These are modeled memory reservations,
 not measured RSS guarantees. Optional `--save-snapshot` follows immutable
 factory admission and precedes population execution; the saved model remains

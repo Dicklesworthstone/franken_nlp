@@ -4,6 +4,7 @@ use super::*;
 pub(super) const MODES: &[(&str, &[&str], &str)] = &[
     ("ner", &[], "source_map"),
     ("keyphrases", &[], "source_map"),
+    ("keyphrases", &["--reduce-keyphrases"], "keyphrase_ranking"),
     ("summarize", &["--map-only"], "source_map"),
     ("summarize", &[], "summary_selection"),
     ("summarize", &["--synthesize-summary"], "summary_synthesis"),
@@ -158,6 +159,51 @@ fn verification_and_summary_reverification_never_renew_on_retry_or_resume() {
     let per = GroundingBudget { max_fields: 1, max_matches: 1, max_scan_steps: u64::MAX };
     assert!(c.args.lifetime.check(per, 0, 2).is_err());
     assert!(c.args.lifetime.check(c.args.map.document_verification(map).unwrap(), 0, 0).is_err());
+}
+
+#[test]
+fn ranked_keyphrase_reverification_has_a_separate_immutable_lifetime_bound() {
+    for operation in ["start", "resume"] {
+        let (mut c, args) = command(operation, "keyphrases", &["--reduce-keyphrases"]);
+        let map = c.args.validate(&args).unwrap(); let fixed = lifetime(&args, map);
+        let scan_work = map.keyphrases.unwrap().aggregation.max_scan_work;
+        c.args.keyphrase_lifetime.as_mut().unwrap().max_lifetime_keyphrase_scan_work =
+            Some(scan_work * fixed.max_attempts);
+        assert!(c.args.lifetime_limits(&args, map, fixed).is_ok());
+        c.args.keyphrase_lifetime.as_mut().unwrap().max_lifetime_keyphrase_scan_work =
+            Some(scan_work * fixed.max_attempts - 1);
+        assert_eq!(c.args.lifetime_limits(&args, map, fixed).unwrap_err().code, "lifetime_keyphrase_scan_work");
+        let mut overflow = map; overflow.keyphrases.as_mut().unwrap().aggregation.max_scan_work = u64::MAX;
+        assert_eq!(c.args.lifetime_limits(&args, overflow, fixed).unwrap_err().code, "lifetime_keyphrase_scan_work");
+    }
+    let (raw, args) = command("start", "keyphrases", &[]); let map = raw.args.validate(&args).unwrap();
+    assert!(map.keyphrases.is_none()); assert_eq!(raw.args.mode_name(map), "source_map");
+    assert!(raw.args.lifetime_limits(&args, map, lifetime(&args, map)).is_ok());
+}
+
+#[test]
+fn keyphrase_ranking_and_lifetime_flags_cannot_silently_change_other_document_modes() {
+    for (task, flags) in [("ner", vec!["--reduce-keyphrases"]),
+        ("summarize", vec!["--max-lifetime-keyphrase-scan-work", "1"]),
+        ("answer", vec!["--reduce-keyphrases"]),
+        ("keyphrases", vec!["--max-lifetime-keyphrase-scan-work", "1"])] {
+        let mut words = argv("start", task); words.extend(flags.into_iter().map(str::to_owned));
+        assert!(parse(words).is_err());
+    }
+    let (c, args) = command("resume", "keyphrases", &["--reduce-keyphrases", "--max-lifetime-keyphrase-scan-work", "0"]);
+    assert_eq!(c.execute_owned(args, NoIo, &mut NoIo).unwrap_err().code, "lifetime_keyphrase_scan_work");
+}
+
+#[test]
+fn retained_keyphrase_limit_is_the_complete_ranked_envelope_not_the_raw_map_frontier() {
+    let (c, args) = command("resume", "keyphrases", &["--reduce-keyphrases", "--max-keyphrase-result-bytes", "2097152"]);
+    let map = c.args.validate(&args).unwrap();
+    assert_eq!(map.mapping.reduction.max_result_bytes, 16_777_216);
+    assert_eq!(map.max_result_bytes, 2_097_152); assert_eq!(c.args.mode_name(map), "keyphrase_ranking");
+    let fixed = lifetime(&args, map);
+    assert!(c.args.lifetime_limits(&args, map, fixed).is_ok());
+    let mut undersized = fixed; undersized.max_result_bytes -= 1;
+    assert_eq!(c.args.lifetime_limits(&args, map, undersized).unwrap_err().code, "stored_document_result_ceiling");
 }
 #[test]
 fn selected_task_verification_is_authoritative_instead_of_unused_map_defaults() {

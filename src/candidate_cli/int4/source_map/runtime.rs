@@ -56,6 +56,18 @@ fn preflight(source: &str, planner: &SourceTaskPlanner, config: &Int4SourceMapCo
     // original document under its own charge before native work can start.
     Ok(prepared.preflight_metadata())
 }
+fn keyphrase_preflight(source: &str, planner: &SourceTaskPlanner, config: &Int4SourceMapConfig,
+    width: usize, aggregation: Int4KeyphraseLimits, control: &mut impl DecodeStepControl)
+    -> Result<Int4SourceMapPreflight, CandidateError> {
+    if source.is_empty() { return Err(CandidateError::Input); }
+    let context = PlanContext::new(&config.identity, config.budget).map_err(|_| CandidateError::Planning)?;
+    let prepared = planner.plan_int4_map_with_control(source, &config.task, config.budget, &context,
+        config.planning, config.mapping, width, control).map_err(planning_error)?;
+    prepared.check_keyphrases(aggregation).map_err(|_| CandidateError::Planning)?;
+    // Final top-k changes only publication; every original chunk remains in
+    // this preflight and the complete candidate union survives reduction.
+    Ok(prepared.preflight_metadata())
+}
 fn question_preflight(source: &str, planner: &SourceTaskPlanner,
     config: &Int4SourceMapConfig<SourceQuestion>, width: usize, control: &mut impl DecodeStepControl)
     -> Result<Int4QuestionPreflight, CandidateError> {
@@ -124,6 +136,8 @@ fn execution_error(error: HostedError) -> CandidateError {
             error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution),
         HostedError::Int4(Int4HostError::SourceSummary(error)) =>
             error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution),
+        HostedError::Int4(Int4HostError::SourceKeyphrases(error)) =>
+            error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution),
         HostedError::Reservation(_) => CandidateError::Memory,
         HostedError::ModelIdentity | HostedError::ResourceDomain => CandidateError::Identity,
         _ => CandidateError::Execution,
@@ -186,10 +200,19 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     let prepared = match task {
         Request::Map(task) => {
             let config = configuration(identity.clone(), task, &args, &options, limits, remaining()?);
-            if config.workspace_bytes(limits.mapping.chunks.max_chunks).map_err(|_| CandidateError::Memory)?
-                != limits.workspace_bytes { return Err(CandidateError::Memory); }
-            let expected = preflight(&text, &planner, &config, model.model_identity().group_width(),
-                limits.summary, &mut DeadlineControl { started, deadline })?;
+            let expected = if let Some(aggregation) = limits.keyphrases {
+                if config.keyphrase_workspace_bytes(limits.mapping.chunks.max_chunks, aggregation)
+                    .map_err(|_| CandidateError::Memory)? != limits.workspace_bytes {
+                    return Err(CandidateError::Memory);
+                }
+                keyphrase_preflight(&text, &planner, &config, model.model_identity().group_width(),
+                    aggregation, &mut DeadlineControl { started, deadline })?
+            } else {
+                if config.workspace_bytes(limits.mapping.chunks.max_chunks).map_err(|_| CandidateError::Memory)?
+                    != limits.workspace_bytes { return Err(CandidateError::Memory); }
+                preflight(&text, &planner, &config, model.model_identity().group_width(),
+                    limits.summary, &mut DeadlineControl { started, deadline })?
+            };
             Prepared::Map(config, expected)
         }
         Request::Question(task) => {
@@ -262,6 +285,7 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
             else if options.kind == Kind::Answer { "fnlp-candidate-int4-document-qa-v1" }
             else if limits.hierarchy.is_some() { "fnlp-candidate-int4-summary-hierarchy-v1" }
             else if limits.synthesis.is_some() { "fnlp-candidate-int4-summary-synthesis-v1" }
+            else if limits.keyphrases.is_some() { "fnlp-candidate-int4-keyphrase-ranking-v1" }
             else { "fnlp-candidate-int4-source-map-v1" }, schema_version: 1,
         scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: options.kind.name(),
         model_id: "Nanbeige4.2-3B", source_revision: &identity.source_revision,
@@ -272,7 +296,14 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     match prepared {
         Prepared::Map(mut config, expected) => {
             config.native.run.max_elapsed = remaining()?;
-            if let Some(summary) = limits.summary {
+            if let Some(aggregation) = limits.keyphrases {
+                let result = engine.reduce_int4_keyphrases_document(&model, text, Arc::new(planner), Arc::new(vocabulary),
+                    config, aggregation, common.kernel, cancellation).map_err(execution_error)?;
+                expected.verify_keyphrases_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+                remaining()?;
+                publish(&Response { provenance: &provenance, output: result.result() },
+                    limits.max_result_bytes + 4096, output)
+            } else if let Some(summary) = limits.summary {
                 let result = engine.summarize_int4_source(&model, text, Arc::new(planner), Arc::new(vocabulary),
                     config, summary, common.kernel, cancellation).map_err(execution_error)?;
                 expected.verify_summary_completed(result.result()).map_err(|_| CandidateError::Execution)?;

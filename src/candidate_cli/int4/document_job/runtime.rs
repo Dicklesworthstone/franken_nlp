@@ -38,7 +38,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
         read_config(path, crate::candidate_cli::source::OPTIONS_BYTES, &remaining)).transpose()?;
     let question = job.map.question_path().map(|path|
         read_config(path, crate::candidate_cli::source::OPTIONS_BYTES, &remaining)).transpose()?;
-    let task = job.map.document_task(&args, map, options.as_deref(), question)?;
+    let task = job.map.document_task(&args, map, options.as_deref(), question, job.keyphrase_scan_cap())?;
     drop(options);
     let document_mode = job.mode_name(map);
     let budget = job.map.source.budget(&args, common);

@@ -9,7 +9,7 @@ fn every_cli_mode_builds_the_real_typed_document_task_without_placeholder_source
     for &(task, flags, mode) in MODES {
         let (c, args) = command("start", task, flags); let map = c.args.validate(&args).unwrap();
         let question = (task == "answer").then(|| exact_question.to_owned());
-        let prepared = c.args.map.document_task(&args, map, None, question).unwrap();
+        let prepared = c.args.map.document_task(&args, map, None, question, c.args.keyphrase_scan_cap()).unwrap();
         match (prepared, mode) {
             (Int4SourceDocumentTask::Map(task), "source_map") => {
                 assert_eq!(matches!(task, crate::tasks::source_planning::grouped_int4::long::SourceMapTask::Summarize(_)),
@@ -17,6 +17,10 @@ fn every_cli_mode_builds_the_real_typed_document_task_without_placeholder_source
             }
             (Int4SourceDocumentTask::Summary { options, limits }, "summary_selection") => {
                 assert_eq!(options.max_bullets, 8); assert_eq!(limits.max_bullets, 12);
+            }
+            (Int4SourceDocumentTask::Keyphrases { options, limits, max_lifetime_scan_work }, "keyphrase_ranking") => {
+                assert_eq!(options.max_phrases, 16); assert_eq!(limits.max_phrases, 16);
+                assert_eq!(max_lifetime_scan_work, c.args.keyphrase_scan_cap());
             }
             (Int4SourceDocumentTask::SummarySynthesis(request), "summary_synthesis") => {
                 assert_eq!(request.map_options.max_bullets, 8); assert_eq!(request.synthesis_options.max_bullets, 8);
@@ -45,10 +49,10 @@ fn private_options_reject_duplicate_unknown_partial_or_external_authority() {
             r#"{"max_phrases":2,"\u006dax_phrases":3,"max_phrase_scalars":24}"#,
             r#"{"question":"substituted","passages":[]}"#] {
             let question = (task == "answer").then(|| "Private exact question?".to_owned());
-            assert!(c.args.map.document_task(&args, map, Some(json), question).is_err());
+            assert!(c.args.map.document_task(&args, map, Some(json), question, c.args.keyphrase_scan_cap()).is_err());
         }
-        if task == "answer" { assert!(c.args.map.document_task(&args, map, None, None).is_err()); }
-        else { assert!(c.args.map.document_task(&args, map, None, Some("foreign question".to_owned())).is_err()); }
+        if task == "answer" { assert!(c.args.map.document_task(&args, map, None, None, c.args.keyphrase_scan_cap()).is_err()); }
+        else { assert!(c.args.map.document_task(&args, map, None, Some("foreign question".to_owned()), c.args.keyphrase_scan_cap()).is_err()); }
     }
 }
 #[test]
@@ -58,10 +62,28 @@ fn source_and_neural_summary_options_remain_separate_inside_the_frozen_task() {
     let map = c.args.validate(&args).unwrap();
     let json = r#"{"max_bullets":2,"max_bullet_scalars":80,"max_citations_per_bullet":1,"max_quote_scalars":24}"#;
     let Int4SourceDocumentTask::SummaryHierarchy { request, limits } =
-        c.args.map.document_task(&args, map, Some(json), None).unwrap() else { panic!("wrong summary route"); };
+        c.args.map.document_task(&args, map, Some(json), None, c.args.keyphrase_scan_cap()).unwrap()
+        else { panic!("wrong summary route"); };
     assert_eq!(request.map_options.max_bullets, 2); assert_eq!(request.synthesis_options.max_bullets, 3);
     assert_eq!(request.map_options.max_quote_scalars, request.synthesis_options.max_quote_scalars);
     assert_eq!(limits.max_levels, 2); assert_eq!(limits.max_passes, 4);
+}
+
+#[test]
+fn ranked_keyphrase_task_freezes_native_options_global_selection_and_lifetime_scan_work() {
+    let (c, args) = command("resume", "keyphrases", &["--reduce-keyphrases", "--document-keyphrases", "3",
+        "--max-keyphrase-scan-work", "10000", "--max-lifetime-keyphrase-scan-work", "60000"]);
+    let map = c.args.validate(&args).unwrap();
+    let json = r#"{"max_phrases":7,"max_phrase_scalars":24}"#;
+    let Int4SourceDocumentTask::Keyphrases { options, limits, max_lifetime_scan_work } =
+        c.args.map.document_task(&args, map, Some(json), None, c.args.keyphrase_scan_cap()).unwrap()
+        else { panic!("wrong ranked keyphrase durable task"); };
+    assert_eq!(options.max_phrases, 7); assert_eq!(options.max_phrase_scalars, 24);
+    assert_eq!(limits.max_phrases, 3); assert_eq!(limits.aggregation.max_scan_work, 10000);
+    assert_eq!(max_lifetime_scan_work, 60000);
+    assert!(c.args.map.document_task(&args, map, Some(json), None, 0).is_err());
+    assert!(c.args.map.document_task(&args, map, Some(r#"{"max_phrases":3,"max_phrases":7}"#),
+        None, c.args.keyphrase_scan_cap()).is_err());
 }
 #[test]
 fn runtime_rechecks_consent_before_host_key_question_or_input_access() {

@@ -23,6 +23,14 @@ pub(super) struct JobArgs {
     map_only: bool,
     storage: StorageArgs,
     lifetime: LifetimeArgs,
+    keyphrase_lifetime: Option<KeyphraseLifetimeArgs>,
+}
+#[derive(Args, Clone, Copy)]
+struct KeyphraseLifetimeArgs {
+    /// Immutable independent keyphrase-union scan work across ALL attempts.
+    /// Default 536870912000; only applies with --reduce-keyphrases.
+    #[arg(long, requires = "reduce_keyphrases")]
+    max_lifetime_keyphrase_scan_work: Option<u64>,
 }
 #[derive(Args, Clone, Copy)]
 struct LifetimeArgs {
@@ -66,12 +74,14 @@ pub(super) fn definition() -> clap::Command {
         let tasks = [Kind::Ner, Kind::Keyphrases, Kind::Summarize, Kind::Answer]
             .into_iter().zip(source_map::definitions()).map(|(kind, command)| {
                 let command = LifetimeArgs::augment_args(StorageArgs::augment_args(command.name(kind.name())
-                    .long_about("Retain and resume COMPLETE original documents with one fixed INT4 source task. Supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation, including resume. text is the original source document; answer uses one separate exact --question file for the entire job. Task arguments may only be absent, null or an empty object. Each document commits atomically after every map and selected reduction pass; individual chunks are not checkpoints. NER/keyphrases retain independent chunk results, summarize defaults to deterministic cited-bullet selection, and answer defaults to independent question-aware chunk answers. Explicit synthesis/hierarchy flags use the same native pipelines as the single-document map commands. Requires --store-results, protected existing --job-dir and --key-file, exact --job-id, and immutable --limits. Five native work axes, masks, independent verification, original question/options and all hierarchy limits are authenticated and never renewed on resume. Every allowed synthesis pass is reserved before discovery; failed attempts remain debited. Stdout contains metadata only. --materialize publishes verified retained results after every original document commits. Hierarchies are explicitly lossy, structural citations do not establish semantic support, and inference failure is never successful abstention. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
+                    .long_about("Retain and resume COMPLETE original documents with one fixed INT4 source task. Supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation, including resume. text is the original source document; answer uses one separate exact --question file for the entire job. Task arguments may only be absent, null or an empty object. Each document commits atomically after every map and selected reduction pass; individual chunks are not checkpoints. NER/keyphrases default to independent chunk results; keyphrases --reduce-keyphrases preserves the complete exact candidate union and applies final global ranking once. Ranked phrases retain original-coordinate evidence without native token transcripts; their independent lifetime scan-work cap is authenticated. Summarize defaults to deterministic cited-bullet selection, and answer defaults to independent question-aware chunk answers. Explicit synthesis/hierarchy flags use the same native pipelines as the single-document map commands. Requires --store-results, protected existing --job-dir and --key-file, exact --job-id, and immutable --limits. Five native work axes, masks, independent verification, original question/options and all reduction/hierarchy limits are authenticated and never renewed on resume. Every allowed synthesis pass is reserved before discovery; failed attempts remain debited. Stdout contains metadata only. --materialize publishes verified retained results after every original document commits. Hierarchies are explicitly lossy, structural citations do not establish semantic support, and inference failure is never successful abstention. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
                     .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population, also on resume; '-' reads stdin"))
                     .mut_arg("max_input_bytes", |arg| arg.help("Outer ceiling for a complete NDJSON record and decoded source; immutable stored input ceiling must fit"))
-                    .mut_arg("max_map_result_bytes", |arg| arg.help("Complete original-document result cap; must fit immutable JobLimits.max_result_bytes"))
+                    .mut_arg("max_map_result_bytes", |arg| arg.help("Raw map/reduction frontier cap; selected complete-document output must fit immutable JobLimits.max_result_bytes"))
                     .mut_arg("max_checkpoints", |arg| arg.help("Cooperative allowance for this invocation; durable work and attempts never renew"))))
                     .mut_arg("store_results", |arg| arg.help("Required consent to retain private complete-document results in the protected spool"));
+                let command = if kind == Kind::Keyphrases { KeyphraseLifetimeArgs::augment_args(command) }
+                    else { command };
                 let command = if kind == Kind::Summarize {
                     command.arg(clap::Arg::new("map_only").long("map-only").action(clap::ArgAction::SetTrue)
                         .conflicts_with_all(["synthesize_summary", "max_summary_bullets", "max_summary_unique_bullets",
@@ -116,6 +126,12 @@ impl JobArgs {
             return Err(Failure::usage("explicit_document_job_storage"));
         }
         let map = self.map.validate_document_job(args, self.map_only)?;
+        if (self.map.kind == Kind::Keyphrases) != self.keyphrase_lifetime.is_some()
+            || self.keyphrase_lifetime.is_some_and(|lifetime|
+                lifetime.max_lifetime_keyphrase_scan_work == Some(0)
+                || (map.keyphrases.is_none() && lifetime.max_lifetime_keyphrase_scan_work.is_some())) {
+            return Err(Failure::usage("lifetime_keyphrase_scan_work"));
+        }
         for mib in [s.journal_memory_mib, s.serialization_memory_mib] {
             if mib.checked_mul(MIB).is_none_or(|bytes| bytes > map.common.memory_bytes) {
                 return Err(Failure::usage("document_job_memory"));
@@ -136,6 +152,10 @@ impl JobArgs {
         if !work.fits(job.max_work) { return Err(Failure::usage("lifetime_document_work_limits")); }
         self.lifetime.check(self.map.document_verification(map)?,
             map.summary.map_or(0, |summary| summary.aggregation.max_scan_steps), job.max_attempts)?;
+        if map.keyphrases.is_some_and(|limits| limits.aggregation.max_scan_work.checked_mul(job.max_attempts)
+            .is_none_or(|total| total > self.keyphrase_scan_cap())) {
+            return Err(Failure::usage("lifetime_keyphrase_scan_work"));
+        }
         let transport = PopulationReadLimits { max_stream_bytes: product(self.storage.max_stream_mib, MIB)?,
             max_lines: self.storage.max_input_lines };
         transport.validate().map_err(|_| Failure::usage("job_transport"))?;
@@ -167,7 +187,12 @@ impl JobArgs {
         else if limits.hierarchy.is_some() { "summary_hierarchy" }
         else if limits.synthesis.is_some() { "summary_synthesis" }
         else if limits.summary.is_some() { "summary_selection" }
+        else if limits.keyphrases.is_some() { "keyphrase_ranking" }
         else { "source_map" }
+    }
+    fn keyphrase_scan_cap(&self) -> u64 {
+        self.keyphrase_lifetime.and_then(|limits| limits.max_lifetime_keyphrase_scan_work)
+            .unwrap_or(536_870_912_000)
     }
 }
 impl JobCommand {
@@ -183,7 +208,10 @@ impl JobCommand {
         };
         let args = JobArgs { map: MapArgs::from_matches(kind, matches)?,
             map_only: kind == Kind::Summarize && matches.get_flag("map_only"),
-            storage: StorageArgs::from_arg_matches(matches)?, lifetime: LifetimeArgs::from_arg_matches(matches)? };
+            storage: StorageArgs::from_arg_matches(matches)?, lifetime: LifetimeArgs::from_arg_matches(matches)?,
+            keyphrase_lifetime: if kind == Kind::Keyphrases {
+                Some(KeyphraseLifetimeArgs::from_arg_matches(matches)?)
+            } else { None } };
         Ok((Self { mode, args }, Int4Args::from_arg_matches(matches)?))
     }
     pub(super) fn run_owned<R: Read + Send + 'static>(self, args: Int4Args, input: R,

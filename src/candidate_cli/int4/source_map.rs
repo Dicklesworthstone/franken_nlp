@@ -6,12 +6,13 @@ use crate::{
     native_engine::{lmhead::NANBEIGE_VOCAB_SIZE, portable_int8::ProjectionWork, strict_int4::Int4Work},
     tasks::{ir::TaskBudget, mapreduce::{ChunkLimits, ExecutionLimits},
         source_planning::{SourceTaskRequest, grouped_int4::long::{Int4SourceMapLimits,
-            SourceMapTask, summary::Int4SummaryLimits}}},
+            SourceMapTask, summary::Int4SummaryLimits, keyphrases::Int4KeyphraseLimits}}},
     validation::grounded_fields::{GroundingBudget, SourceFieldEvidence, VerifiedSourceSpan},
 };
 
 mod question;
 mod synthesis;
+mod keyphrases;
 #[cfg(feature = "asupersync-runtime")]
 mod runtime;
 #[cfg(test)]
@@ -23,6 +24,7 @@ pub(super) struct MapArgs {
     pub source: source::SourceArgs,
     mapping: MappingArgs,
     summary: Option<SummaryArgs>,
+    keyphrases: Option<keyphrases::KeyphraseArgs>,
     question: Option<question::QuestionArgs>,
 }
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,6 +109,7 @@ pub(super) fn definitions() -> Vec<clap::Command> {
                 .mut_arg("max_mask_node_visits", |arg| arg.help("Mask allowance per chunk; --max-total-mask-node-visits bounds the whole document"))
                 .mut_arg("max_checkpoints", |arg| arg.help("Cooperative allowance for hosted whole-document preparation, maps and reduction")));
             match kind {
+                Kind::Keyphrases => keyphrases::definition(command),
                 Kind::Summarize => SummaryArgs::augment_args(command.long_about("Summarize every chunk of one complete UTF-8 document. The default keeps an exact cited bullet union and applies --max-summary-bullets only at the final root. --synthesize-summary instead adds one native pass over ALL independently verified verbatim source quotes from the complete map; all evidence must fit the final context or the command returns no result. Adding --hierarchical-summary explicitly enables bounded, lossy quote-selection levels: each level partitions its entire evidence frontier into exact context-sized groups, and only independently verified original-source quotes selected by those groups enter the next level. Generated bullet prose never becomes factual source evidence. Exhausted levels, passes, grouping work or verification, an oversized single quote, or nonprogress returns no complete summary. Every final citation lifts back to all evidence-reachable original-document byte and Unicode-scalar occurrences. Discovery and ALL synthesis passes share one five-axis work ceiling, mask allowance and verification budget; every allowed pass is reserved before discovery. Structural membership does not establish entailment, full-document equivalence, recall or contradiction reconciliation. Source conversion and digest-pinned snapshot reload share this checked path. Optional snapshot save follows complete-map and reserved-synthesis preflight and survives later task failure. --options controls map summaries; --synthesis-bullets controls the final and explicitly enabled hierarchy passes.")),
                 Kind::Answer => question::definition(command),
                 _ => command,
@@ -118,6 +121,7 @@ pub(super) struct MapLimits {
     pub common: Int4Limits,
     pub mapping: Int4SourceMapLimits,
     pub summary: Option<Int4SummaryLimits>,
+    pub keyphrases: Option<Int4KeyphraseLimits>,
     pub synthesis: Option<crate::tasks::source_planning::grouped_int4::long::summary::synthesis::SummarySynthesisLimits>,
     pub question_synthesis: Option<crate::tasks::source_planning::grouped_int4::long::question::synthesis::QuestionSynthesisLimits>,
     pub hierarchy: Option<crate::tasks::source_planning::grouped_int4::long::summary::synthesis::hierarchy::SummaryHierarchyLimits>,
@@ -135,6 +139,7 @@ impl MapArgs {
         Ok(Self { kind, source: source::SourceArgs::from_matches(matches)?,
             mapping: MappingArgs::from_arg_matches(matches)?,
             summary: if kind == Kind::Summarize { Some(SummaryArgs::from_arg_matches(matches)?) } else { None },
+            keyphrases: if kind == Kind::Keyphrases { Some(keyphrases::KeyphraseArgs::from_arg_matches(matches)?) } else { None },
             question: if kind == Kind::Answer { Some(question::QuestionArgs::from_arg_matches(matches)?) } else { None } })
     }
     pub(super) fn validate(&self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
@@ -153,6 +158,7 @@ impl MapArgs {
         let mut common = self.source.validate(args)?;
         if (self.kind == Kind::Answer) != self.question.is_some()
             || (self.kind == Kind::Summarize) != self.summary.is_some()
+            || (self.kind == Kind::Keyphrases) != self.keyphrases.is_some()
             || args.max_input_bytes < 4 || !(1..=256).contains(&m.max_chunks)
             || !(1..=1_000_000).contains(&m.max_tokenizer_calls)
             || m.max_chunk_bytes.is_some_and(|n| !(4..=MAX_INPUT_BYTES).contains(&n))
@@ -172,6 +178,7 @@ impl MapArgs {
         }
         let reduction_reserve_bytes = mib(m.reduction_reserve_mib)?;
         let mapping = self.mapping_limits(args)?;
+        let keyphrases = self.keyphrases.map(|settings| settings.limits(mapping)).transpose()?.flatten();
         if let Some(question) = &self.question { question.validate()?; }
         let synthesis = match self.summary {
             Some(s) => s.synthesis.limits(self.planning(args))?,
@@ -240,20 +247,25 @@ impl MapArgs {
                     None => synthesis::workspace_bytes(budget, mapping, m.max_chunks,
                         reduction_reserve_bytes, synthesis)?,
                 },
-                None => workspace_bytes(budget, mapping, m.max_chunks, reduction_reserve_bytes)?,
+                None => match keyphrases {
+                    Some(keyphrases) => keyphrases::workspace_bytes(budget, mapping, m.max_chunks,
+                        reduction_reserve_bytes, keyphrases)?,
+                    None => workspace_bytes(budget, mapping, m.max_chunks, reduction_reserve_bytes)?,
+                },
             },
         };
-        let tokens = if summary.is_some() { 0 }
+        let tokens = if summary.is_some() || keyphrases.is_some() { 0 }
             else { times(preparation_passes, u64::from(budget.max_output_tokens))? };
-        let output = sum(&[m.max_map_result_bytes as u64 * 4, times(tokens, 8)?, 4096])?;
+        let max_result_bytes = keyphrases.map_or(m.max_map_result_bytes, |limits| limits.max_result_bytes);
+        let output = sum(&[max_result_bytes as u64 * 4, times(tokens, 8)?, 4096])?;
         let question_input = if self.question.is_some() { question::QUESTION_BYTES as u64 + 1 } else { 0 };
         let input = sum(&[args.max_input_bytes as u64 + 1, question_input, common.preparation_bytes])?;
         // CLI preparation stays alive through publication while the host owns
         // a separately charged source/preparation capture and complete output.
         common.minimum_memory_bytes = sum(&[common.minimum_memory_bytes, input, workspace_bytes, output])?;
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
-        Ok(MapLimits { common, mapping, summary, synthesis, question_synthesis, hierarchy, question_hierarchy, reduction_reserve_bytes,
-            max_result_bytes: m.max_map_result_bytes, workspace_bytes })
+        Ok(MapLimits { common, mapping, summary, keyphrases, synthesis, question_synthesis, hierarchy, question_hierarchy,
+            reduction_reserve_bytes, max_result_bytes, workspace_bytes })
     }
     pub(super) fn question_path(&self) -> Option<&std::path::Path> {
         self.question.as_ref().map(question::QuestionArgs::path)
@@ -267,7 +279,7 @@ impl MapArgs {
     #[cfg(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub(super) fn document_task(&self, args: &Int4Args, limits: MapLimits,
-        raw: Option<&str>, question_text: Option<String>)
+        raw: Option<&str>, question_text: Option<String>, max_lifetime_keyphrase_scan_work: u64)
         -> Result<crate::jobs::runner::source::grouped_int4::document::Int4SourceDocumentTask, CandidateError> {
         use crate::{jobs::runner::source::grouped_int4::document::Int4SourceDocumentTask as Task,
             tasks::{ner::NerOptions, keyphrases::KeyphraseOptions, summarize::SummaryOptions}};
@@ -293,7 +305,10 @@ impl MapArgs {
             Kind::Keyphrases => {
                 let options = shared::options::<KeyphraseOptions>(raw)?;
                 options.schema_source().map_err(|_| CandidateError::Planning)?;
-                Task::Map(SourceMapTask::Keyphrases(options))
+                if let Some(limits) = limits.keyphrases {
+                    if max_lifetime_keyphrase_scan_work == 0 { return Err(CandidateError::Arguments); }
+                    Task::Keyphrases { options, limits, max_lifetime_scan_work: max_lifetime_keyphrase_scan_work }
+                } else { Task::Map(SourceMapTask::Keyphrases(options)) }
             }
             Kind::Summarize => {
                 let options = shared::options::<SummaryOptions>(raw)?;
