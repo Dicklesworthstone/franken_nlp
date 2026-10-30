@@ -25,7 +25,7 @@ use crate::artifact::{
         remap_tensor_name,
     },
     format::{
-        FORMAT_VERSION, MAGIC, MAX_ENTRIES, MAX_HEADER_BYTES, PRELUDE_BYTES,
+        FORMAT_VERSION, MAGIC, MAX_ENTRIES, MAX_FILE_BYTES, MAX_HEADER_BYTES, PRELUDE_BYTES,
         SECTION_DIRECTORY_ENTRY_BYTES, SectionKind,
     },
     reader::{CheckedTensorMapping, FnlpqRangeReader, FnlpqReadError},
@@ -42,6 +42,25 @@ const SYNTHETIC_SCOPE: &str = "scope=synthetic evidence=non_authoritative";
 const FORENSIC_SCOPE: &str = "scope=real-artifact-forensic evidence=non_authoritative";
 const CURRENT_CANDIDATE_SCOPE: &str = "scope=real-artifact-current-candidate evidence=non_authoritative";
 const FILE_SOURCE_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Conservative finite checkpoint allowance for this candidate's complete
+/// authentication and materialization, derived from its observed file length.
+///
+/// The reader checks nonoverlapping Generic mappings and four distinct source
+/// sections before semantic hashing. Sixteen polls per 64-KiB file chunk cover
+/// stored/semantic identities, tokenizer binding, two materialization polls
+/// per chunk and bounded row-sum verification. The entry allowance covers
+/// alignment, partial mapping chunks, descriptors and fixed stage boundaries.
+/// This is a work ceiling, not permission to skip a check or extend a deadline.
+pub fn current_candidate_load_checkpoints(file_bytes: u64) -> Result<u64, ArtifactBridgeError> {
+    if file_bytes == 0 || file_bytes > MAX_FILE_BYTES {
+        return Err(ArtifactBridgeError::Memory {
+            subject: "candidate-file-bytes", observed: file_bytes, limit: MAX_FILE_BYTES,
+        });
+    }
+    Ok(file_bytes.div_ceil(FILE_SOURCE_CHUNK_BYTES as u64) * 16
+        + MAX_ENTRIES as u64 * 32 + 1024)
+}
 
 /// Maximum bytes the bounded forensic census may read from a real artifact.
 ///
@@ -852,6 +871,9 @@ pub struct CurrentCandidateArtifactSource {
 }
 
 impl CurrentCandidateArtifactSource {
+    /// Exact regular-file length authenticated by the retained range reader.
+    pub fn file_bytes(&self) -> u64 { self.reader.prelude().file_len }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ArtifactBridgeError> {
         Self::open_with_checkpoint(path, || None)
     }

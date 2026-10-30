@@ -13,7 +13,7 @@ use crate::{
     execution_identity::{ExecutionIdentity, Sha256Digest},
     batch::generation::GuardedOutput,
     native_engine::{
-        artifact_bridge::{ArtifactLoadBudget, ArtifactIdentity},
+        artifact_bridge::{ArtifactLoadBudget, ArtifactIdentity, CurrentCandidateArtifactSource},
         generation::quantized::Int8GenerationBudget,
         constrained_int8::Int8JsonBudget,
         strict_int8::{CurrentCandidateInt8Model, CurrentCandidateInt8Error,
@@ -225,6 +225,27 @@ impl NlpEngine {
     /// this method waits for physical cleanup before returning a cancellation.
     pub fn load_current_candidate_int8(&self, path: PathBuf, limits: LoadLimits,
         cancellation: CancellationToken) -> Result<ResidentInt8, HostedError> {
+        self.load_candidate_int8(limits, cancellation, move |control| {
+            CurrentCandidateInt8Model::load_with_checkpoint(path, limits.artifact, |_| {},
+                || crate::native_engine::decode::DecodeStepControl::checkpoint(control, 0))
+        })
+    }
+
+    /// Materialize a caller-authenticated candidate through the same admitted
+    /// blocking path. The source owns its checked file descriptor; neither
+    /// metadata planning nor this transfer causes a second full-file preflight.
+    /// Caller-owned preparation memory must cover the source until transfer.
+    pub fn load_checked_current_candidate_int8(&self, source: CurrentCandidateArtifactSource,
+        limits: LoadLimits, cancellation: CancellationToken) -> Result<ResidentInt8, HostedError> {
+        self.load_candidate_int8(limits, cancellation, move |control| {
+            CurrentCandidateInt8Model::from_checked_source_with_checkpoint(source, limits.artifact, |_| {},
+                || crate::native_engine::decode::DecodeStepControl::checkpoint(control, 0))
+        })
+    }
+
+    fn load_candidate_int8<F>(&self, limits: LoadLimits, cancellation: CancellationToken,
+        load: F) -> Result<ResidentInt8, HostedError>
+    where F: FnOnce(&mut RunControl) -> Result<CurrentCandidateInt8Model, CurrentCandidateInt8Error> + Send + 'static {
         dispatch::preflight(self, limits.run)?;
         if limits.artifact.max_weight_bytes == 0 || limits.artifact.max_stream_chunk_bytes == 0
             || limits.artifact.max_resident_envelope_bytes != 0 || limits.tokenizer_and_metadata_bytes == 0
@@ -237,10 +258,7 @@ impl NlpEngine {
         let resident = Pending::reserve(&lease, MemoryClass::Weights, resident_bytes)?;
         let staging = Pending::reserve(&lease, MemoryClass::Staging, limits.artifact.max_stream_chunk_bytes)?;
         dispatch::run(self, limits.run, cancellation, move |control| {
-            let loaded = allocate(resident, || CurrentCandidateInt8Model::load_with_checkpoint(
-                path, limits.artifact, |_| {},
-                || crate::native_engine::decode::DecodeStepControl::checkpoint(control, 0),
-            ).map_err(HostedError::Model))?;
+            let loaded = allocate(resident, || load(control).map_err(HostedError::Model))?;
             drop(staging);
             Ok(ResidentInt8 { inner: Arc::new(ResidentModel { loaded, lease }) })
         })

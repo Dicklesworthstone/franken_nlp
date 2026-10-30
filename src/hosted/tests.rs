@@ -2,6 +2,14 @@ use super::*;
 use crate::execution_identity::{NumericsProfile, ThinkingMode, ToolMode};
 
 #[test]
+fn checked_artifact_ownership_can_cross_the_existing_blocking_boundary() {
+    fn send<T: Send + 'static>() {}
+    send::<CurrentCandidateArtifactSource>();
+    let _path = NlpEngine::load_current_candidate_int8;
+    let _checked = NlpEngine::load_checked_current_candidate_int8;
+}
+
+#[test]
 fn finite_limits_and_all_memory_sums_reject_zero_or_overflow() {
     assert!(RunLimits { max_elapsed: Duration::ZERO, max_checkpoints: 10, cleanup_reserve_bytes: 65536 }.validate().is_err());
     assert!(RunLimits { max_elapsed: Duration::from_secs(1), max_checkpoints: 1, cleanup_reserve_bytes: 65536 }.validate().is_err());

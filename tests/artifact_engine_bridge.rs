@@ -7,7 +7,7 @@ use franken_nlp::native_engine::{
     artifact_bridge::{
         ArtifactBridgeError, ArtifactIdentity, ArtifactLoadBudget, ArtifactTensorContract,
         ArtifactTensorDescriptor, CheckedArtifactSource, FORENSIC_METADATA_READ_CAP, TensorMapping,
-        TensorMappingLengths, CurrentCandidateArtifactSource, load_nanbeige42,
+        TensorMappingLengths, CurrentCandidateArtifactSource, current_candidate_load_checkpoints, load_nanbeige42,
         load_synthetic_with_contract, load_synthetic_with_contract_with_checkpoint,
         scan_current_80_byte_forensic_census,
     },
@@ -25,6 +25,25 @@ struct StreamingFixture {
 }
 
 const REAL_ARTIFACT: &str = "/tmp/fnlp-conversion/nanbeige4.2-3b.fnlpq-v1.int8.generic.fnlpq";
+
+#[test]
+fn candidate_loading_quote_covers_multigigabyte_streams_and_rejects_invalid_lengths() {
+    let gib = 1_u64 << 30;
+    let mut previous = 0;
+    for bytes in [1, 64 * 1024, 64 * 1024 + 1, gib, 6 * gib, 64 * gib] {
+        let checkpoints = current_candidate_load_checkpoints(bytes).unwrap();
+        assert!(checkpoints >= previous);
+        assert!(checkpoints > 64);
+        // Includes multiple complete passes, mapping callbacks and row-sum
+        // CPU work, rather than one poll for each tensor or a native-step cap.
+        assert!(checkpoints > bytes.div_ceil(64 * 1024) * 6);
+        assert!(checkpoints < 20_000_000);
+        previous = checkpoints;
+    }
+    for invalid in [0, 64 * gib + 1, u64::MAX] {
+        assert!(current_candidate_load_checkpoints(invalid).is_err());
+    }
+}
 
 impl StreamingFixture {
     fn expected() -> Self {

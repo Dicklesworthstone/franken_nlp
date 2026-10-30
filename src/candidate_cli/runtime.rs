@@ -25,59 +25,20 @@ use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, Me
 
 pub(super) fn execute(task: Task, args: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
-    let started = Instant::now();
-    let elapsed_limit = Duration::from_secs(args.timeout_seconds);
-    let remaining = || elapsed_limit.checked_sub(started.elapsed())
-        .filter(|duration| !duration.is_zero()).ok_or(CandidateError::Timeout);
-    let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
-        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: limits.memory_bytes,
-        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
-    }).build().map_err(|_| CandidateError::Runtime)?;
-    let lease = engine.resources().acquire_lease();
-    // Declared before every preparation allocation: drops AFTER input,
-    // metadata, planners and completed-result staging on every return path.
-    let _preparation = lease.reserve(MemoryClass::JobBuffers, limits.preparation_bytes)
-        .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
-    let text = if args.input.as_os_str() == "-" {
-        read_input(input, args.max_input_bytes)?
-    } else {
-        let mut file = File::open(&args.input).map_err(|_| CandidateError::Input)?;
-        read_input(&mut file, args.max_input_bytes)?
-    };
+    // The same owned startup path serves buffered text, streams and source
+    // tasks. Its preparation charge outlives checked metadata and all staging.
+    let session = source_tasks::Session::new(&args, limits)?;
+    let text = session.read(&args.input, input, args.max_input_bytes)?;
     let messages = match task {
         Task::Chat => Some(parse_messages(&text, args.max_input_bytes)?),
         Task::Generate => None,
     };
-    remaining()?;
-    // Read the checked current-candidate metadata without materializing any
-    // model weights. The source reader performs its own bounded verification.
-    // It is dropped before loading, so no duplicate envelope is retained.
-    let facts = {
-        let source = CurrentCandidateArtifactSource::open(&args.model).map_err(|_| CandidateError::Model)?;
-        source.identity().clone()
-    };
+    let facts = session.facts(&args)?;
     let prepared = streaming::prepare(&args, limits, text, messages, &facts)?;
     let cancellation = CancellationToken::default();
-    let model = engine.load_current_candidate_int8(args.model.clone(), LoadLimits {
-        artifact: ArtifactLoadBudget::streaming_only(limits.weight_bytes, 64 * 1024),
-        tokenizer_and_metadata_bytes: 128 * MIB, allocator_reserve_bytes: 64 * MIB,
-        // Loader checkpoints are a separately declared finite stage budget;
-        // they do not replenish the native execution checkpoint allowance.
-        run: RunLimits { max_elapsed: remaining()?, max_checkpoints: 64,
-            cleanup_reserve_bytes: 65_536 },
-    }, cancellation.clone()).map_err(|_| CandidateError::Model)?;
-    // A pathname can change between metadata inspection and loading. Compare
-    // ALL retained facts (including source-root identity), not just a filename.
-    // The host independently checks the prepared plan against resident weights.
-    if model.artifact_identity() != &facts { return Err(CandidateError::Identity); }
-    let result = execute_chat(&engine, &model, prepared, 1, NativeLimits {
-        context_tokens: args.context_tokens, allocator_reserve_bytes: 64 * MIB,
-        run: RunLimits { max_elapsed: remaining()?, max_checkpoints: args.max_checkpoints,
-            cleanup_reserve_bytes: 65_536 },
-    }, &args, cancellation)?;
-    remaining()?;
+    let model = session.load(&args, limits, &facts, cancellation.clone())?;
+    let result = execute_chat(&session.engine, &model, prepared, 1, session.native(&args)?, &args, cancellation)?;
+    session.remaining()?;
     let response = CandidateResponse { schema_version: 1,
         scope: "real-artifact-current-candidate", evidence: "non_authoritative",
         model_id: &facts.model_id, source_revision: &facts.revision,

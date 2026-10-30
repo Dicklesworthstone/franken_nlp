@@ -1,9 +1,11 @@
 //! Source tasks on the existing hosted INT8 path, with one end-to-end deadline.
 use super::*;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::{Arc, Mutex}};
 use crate::{CommittedMemory,
-    hosted::{ResidentInt8, SourceLimits},
-    native_engine::decode::{DecodeCancellationKind, DecodeStepControl},
+    hosted::{HostedError, ResidentInt8, SourceLimits},
+    native_engine::{artifact_bridge::{ArtifactBridgeError, current_candidate_load_checkpoints},
+        strict_int8::CurrentCandidateInt8Error,
+        decode::{DecodeCancellationKind, DecodeStepControl}},
     tasks::{BuiltInTask, extract::ExtractionVocabulary, ir::PlanContext,
         source_planning::{SourceTaskPlanner, SourceTaskRequest, quantized::PreparedInt8SourceTask}},
 };
@@ -13,6 +15,9 @@ use crate::candidate_cli::source::{self as command, SourceCommand, SourceHostArg
 /// allocations then drop before the preparation charge, including on errors.
 /// No uncharged resident model or independent runtime is created here.
 pub(super) struct Session {
+    // Metadata/file ownership drops before its preparation reservation. The
+    // source is moved out before entering any hosted blocking invocation.
+    checked_source: Mutex<Option<(PathBuf, CurrentCandidateArtifactSource)>>,
     _preparation: CommittedMemory,
     pub engine: NlpEngine,
     started: Instant,
@@ -30,7 +35,7 @@ impl Session {
         let lease = engine.resources().acquire_lease();
         let preparation = lease.reserve(MemoryClass::JobBuffers, limits.preparation_bytes)
             .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
-        Ok(Self { _preparation: preparation, engine, started,
+        Ok(Self { checked_source: Mutex::new(None), _preparation: preparation, engine, started,
             elapsed_limit: Duration::from_secs(args.timeout_seconds) })
     }
     pub(super) fn remaining(&self) -> Result<Duration, CandidateError> {
@@ -47,12 +52,16 @@ impl Session {
     }
     pub(super) fn facts(&self, args: &CandidateArgs) -> Result<ArtifactIdentity, CandidateError> {
         self.remaining()?;
-        let facts = {
-            let source = CurrentCandidateArtifactSource::open(&args.model).map_err(|_| CandidateError::Model)?;
-            source.identity().clone()
-        };
+        let mut held = self.checked_source.lock().map_err(|_| CandidateError::Model)?;
+        if let Some((path, source)) = held.as_ref() {
+            if path != &args.model { return Err(CandidateError::Identity); }
+            return Ok(source.identity().clone());
+        }
+        let source = inspect(&args.model, &mut self.control())?;
+        let facts = source.identity().clone();
         self.remaining()?;
         candidate_identity(&facts)?;
+        *held = Some((args.model.clone(), source));
         Ok(facts)
     }
     pub(super) fn native(&self, args: &CandidateArgs) -> Result<NativeLimits, CandidateError> {
@@ -62,20 +71,59 @@ impl Session {
     }
     pub(super) fn load(&self, args: &CandidateArgs, limits: Limits, facts: &ArtifactIdentity,
         cancellation: CancellationToken) -> Result<ResidentInt8, CandidateError> {
-        let model = self.engine.load_current_candidate_int8(args.model.clone(), LoadLimits {
+        self.remaining()?;
+        let (path, source) = self.checked_source.lock().map_err(|_| CandidateError::Model)?
+            .take().ok_or(CandidateError::Identity)?;
+        if path != args.model || source.identity() != facts { return Err(CandidateError::Identity); }
+        let max_checkpoints = current_candidate_load_checkpoints(source.file_bytes()).map_err(artifact_error)?;
+        let model = self.engine.load_checked_current_candidate_int8(source, LoadLimits {
             artifact: ArtifactLoadBudget::streaming_only(limits.weight_bytes, 64 * 1024),
             tokenizer_and_metadata_bytes: 128 * MIB, allocator_reserve_bytes: 64 * MIB,
-            run: RunLimits { max_elapsed: self.remaining()?, max_checkpoints: 64, cleanup_reserve_bytes: 65_536 },
-        }, cancellation).map_err(|_| CandidateError::Model)?;
+            run: RunLimits { max_elapsed: self.remaining()?, max_checkpoints, cleanup_reserve_bytes: 65_536 },
+        }, cancellation).map_err(load_error)?;
         self.remaining()?;
-        // The two independent opens may see different files. Include source
-        // root and recipe, not just logical weights, in the comparison.
+        // Plans and weights bind the same held file, including source root and
+        // recipe. The host independently checks the plan against resident data.
         if model.artifact_identity() != facts { return Err(CandidateError::Identity); }
         Ok(model)
     }
     pub(super) fn control(&self) -> PreparationControl {
         PreparationControl { started: self.started, elapsed_limit: self.elapsed_limit }
     }
+}
+
+fn cancelled(cause: DecodeCancellationKind) -> CandidateError {
+    match cause {
+        DecodeCancellationKind::Deadline | DecodeCancellationKind::Timeout => CandidateError::Timeout,
+        _ => CandidateError::Execution,
+    }
+}
+fn artifact_error(error: ArtifactBridgeError) -> CandidateError {
+    match error { ArtifactBridgeError::Cancelled(cause) => cancelled(cause), _ => CandidateError::Model }
+}
+fn load_error(error: HostedError) -> CandidateError {
+    match error {
+        HostedError::Stopped { stop, .. } => cancelled(stop.kind),
+        HostedError::Join { physical_error: Some(error), .. }
+            | HostedError::Scope { physical_error: Some(error), .. } => load_error(*error),
+        HostedError::Model(CurrentCandidateInt8Error::Artifact(error)) => artifact_error(error),
+        HostedError::Reservation(_) => CandidateError::Memory,
+        _ => CandidateError::Model,
+    }
+}
+
+fn inspect(path: &std::path::Path, control: &mut impl DecodeStepControl)
+    -> Result<CurrentCandidateArtifactSource, CandidateError> {
+    if let Some(cause) = control.checkpoint(0) { return Err(cancelled(cause)); }
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| CandidateError::Model)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() { return Err(CandidateError::Model); }
+    let mut remaining = current_candidate_load_checkpoints(metadata.len()).map_err(artifact_error)?;
+    CurrentCandidateArtifactSource::open_with_checkpoint(path, || {
+        if let Some(cause) = control.checkpoint(0) { return Some(cause); }
+        if remaining == 0 { return Some(DecodeCancellationKind::PollQuota); }
+        remaining -= 1;
+        None
+    }).map_err(artifact_error)
 }
 
 pub(super) struct PreparationControl { started: Instant, elapsed_limit: Duration }
@@ -159,6 +207,22 @@ pub(in crate::candidate_cli) fn execute(command: SourceCommand, args: CandidateA
 mod tests {
     use super::*;
     use crate::candidate_cli::source::Kind;
+    #[test]
+    fn artifact_inspection_observes_every_stop_before_path_access() {
+        struct Stop(DecodeCancellationKind);
+        impl DecodeStepControl for Stop {
+            fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { Some(self.0) }
+        }
+        use DecodeCancellationKind::*;
+        for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast,
+            RaceLost, ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+            let error = inspect(std::path::Path::new("must-not-open-cancelled-candidate.fnlpq"),
+                &mut Stop(cause)).err().expect("stop precedes any model access");
+            assert_eq!(error, cancelled(cause));
+            assert_eq!(load_error(HostedError::Model(CurrentCandidateInt8Error::Artifact(
+                ArtifactBridgeError::Cancelled(cause)))), cancelled(cause));
+        }
+    }
     fn facts() -> ArtifactIdentity {
         ArtifactIdentity { model_id: "Nanbeige4.2-3B".to_owned(),
             revision: "f56ec5a9650268aa098496734743c25ea778bd2d".to_owned(),

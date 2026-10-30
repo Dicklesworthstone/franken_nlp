@@ -34,7 +34,12 @@ use franken_nlp::{
         },
         reader::FnlpqRangeReader,
     },
-    native_engine::decode::DecodeCancellationKind,
+    native_engine::{
+        artifact_bridge::{ArtifactBridgeError, ArtifactLoadBudget, CheckedArtifactSource,
+            CurrentCandidateArtifactSource, current_candidate_load_checkpoints},
+        decode::DecodeCancellationKind,
+        strict_int8::{CurrentCandidateInt8Error, CurrentCandidateInt8Model},
+    },
 };
 use sha2::{Digest, Sha256};
 
@@ -48,6 +53,57 @@ const CONFIG: &[u8] = b"{}";
 const TOKENIZER: &[u8] = &[0x0a];
 const TEMPLATE: &[u8] = b"structural reconstruction fixture";
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn checked_candidate_startup_exceeds_the_old_64_poll_limit_and_fits_its_byte_quote() {
+    let fixture = Fixture::new("candidate-startup-budget");
+    let path = fixture.root.join(LOGICAL_NAME);
+    let mut old_budget = 64_u64;
+    let error = CurrentCandidateArtifactSource::open_with_checkpoint(&path, || {
+        if old_budget == 0 { return Some(DecodeCancellationKind::PollQuota); }
+        old_budget -= 1; None
+    }).err().expect("even this structural fixture exceeds the old fixed allowance");
+    assert_eq!(error, ArtifactBridgeError::Cancelled(DecodeCancellationKind::PollQuota));
+    let quoted = current_candidate_load_checkpoints(fixture.artifact.len() as u64).unwrap();
+    let mut polls = 0;
+    let source = CurrentCandidateArtifactSource::open_with_checkpoint(&path, || {
+        polls += 1;
+        (polls > quoted).then_some(DecodeCancellationKind::PollQuota)
+    }).expect("complete stored and semantic authentication fits its finite quote");
+    assert!(polls > 64 && polls < quoted);
+    assert_eq!(source.file_bytes(), fixture.artifact.len() as u64);
+    assert_eq!(source.identity().logical_model_sha256, fixture.manifest.digests.logical_model_sha256);
+    let error = CurrentCandidateInt8Model::from_checked_source_with_checkpoint(source,
+        ArtifactLoadBudget::streaming_only(1, 64 * 1024),
+        |_| panic!("cancelled handoff must not materialize any weights"),
+        || Some(DecodeCancellationKind::Shutdown),
+    ).err().expect("cancellation survives the source-owning model boundary");
+    assert!(matches!(error, CurrentCandidateInt8Error::Artifact(
+        ArtifactBridgeError::Cancelled(DecodeCancellationKind::Shutdown))));
+}
+
+#[cfg(unix)]
+#[test]
+fn checked_source_handoff_keeps_its_authenticated_descriptor_after_path_replacement() {
+    let fixture = Fixture::new("candidate-held-descriptor");
+    let path = fixture.root.join(LOGICAL_NAME);
+    let source = CurrentCandidateArtifactSource::open(&path).unwrap();
+    let identity = source.identity().clone();
+    let retained = fixture.root.join("retained-original.fnlpq");
+    fs::rename(&path, &retained).unwrap();
+    fs::write(&path, b"replacement must never become the inspected model").unwrap();
+    assert_eq!(source.identity(), &identity);
+    let tokenizer_digest: [u8; 32] = Sha256::digest(TOKENIZER).into();
+    assert_eq!(source.tokenizer_model_sha256().unwrap(), tokenizer_digest);
+    // This intentionally non-runnable fixture must fail tokenizer binding on
+    // the held original. Reopening the replacement would fail artifact parsing
+    // instead; no weakened model or synthetic success is accepted.
+    let error = CurrentCandidateInt8Model::from_checked_source_with_checkpoint(source,
+        ArtifactLoadBudget::streaming_only(1, 64 * 1024), |_| {}, || None,
+    ).err().expect("structural tokenizer is not the pinned runnable tokenizer");
+    assert!(matches!(error, CurrentCandidateInt8Error::TokenizerMismatch("tokenizer.model")));
+    assert_eq!(fs::read(&path).unwrap(), b"replacement must never become the inspected model");
+}
 
 #[test]
 fn fresh_package_reconstruction_publishes_exact_checked_bytes() {

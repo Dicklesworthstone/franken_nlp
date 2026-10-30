@@ -147,8 +147,28 @@ impl CurrentCandidateInt8Model {
         if let Some(cause) = checkpoint() {
             return Err(ArtifactBridgeError::Cancelled(cause).into());
         }
-        let tokenizer = EmbeddedTokenizer::pinned()?;
         let source = CurrentCandidateArtifactSource::open_with_checkpoint(path, &mut checkpoint)?;
+        Self::from_checked_source_with_checkpoint(source, budget, stage_line, checkpoint)
+    }
+
+    /// Consume the exact source whose metadata the caller already inspected.
+    /// Authentication is not repeated and no pathname is reopened. Tokenizer
+    /// binding, the frozen tensor census, payload lengths and row sums still
+    /// pass before a model is returned. The caller keeps the backing file
+    /// stable through completion, as required by the candidate range reader.
+    pub fn from_checked_source_with_checkpoint<F>(
+        source: CurrentCandidateArtifactSource,
+        budget: ArtifactLoadBudget,
+        stage_line: F,
+        mut checkpoint: impl FnMut() -> Option<DecodeCancellationKind>,
+    ) -> Result<Self, CurrentCandidateInt8Error>
+    where
+        F: FnMut(&str),
+    {
+        if let Some(cause) = checkpoint() {
+            return Err(ArtifactBridgeError::Cancelled(cause).into());
+        }
+        let tokenizer = EmbeddedTokenizer::pinned()?;
         if source.tokenizer_model_sha256_with_checkpoint(&mut checkpoint)? != tokenizer.sha256() {
             return Err(CurrentCandidateInt8Error::TokenizerMismatch("tokenizer.model"));
         }
