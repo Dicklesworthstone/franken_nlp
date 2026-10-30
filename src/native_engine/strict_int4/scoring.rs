@@ -16,6 +16,7 @@ use super::{Int4RunBudget, Int4Session, Int4Work, StrictInt4Engine, StrictInt4Er
     DecodeCancellationKind, scale_work};
 
 pub mod prefill;
+pub mod cohort;
 
 pub const INT4_SCORING_EXECUTION: &str = "grouped-int4-single-kv-candidate-trie-v1";
 
