@@ -11,6 +11,7 @@ use crate::{canonjson, execution_identity::{ExecutionIdentity, NumericsProfile},
         generation::grouped_int4::bind_candidate_model,
         lmhead::scoring::ScoringMode,
         strict_int4::{Int4ModelIdentity, Int4RunBudget, Int4Work, StrictInt4Engine, StrictInt4Error, STRICT_INT4_PROFILE,
+            prefill::Int4PrefillLimits,
             scoring::{self, CandidateSchedule, Int4CandidateRun, Int4ScoringBudget, Int4ScoringError, INT4_SCORING_EXECUTION}}},
     tasks::ir::{DecodeStrategy, PlanContext, TaskBudget}};
 use super::{ClassificationLimits, ClassificationPlanner, ClassificationPlanningError, ClassificationRequest,
@@ -131,16 +132,30 @@ impl PreparedInt4Classification {
     pub fn execute_with_control<C: DecodeStepControl>(&self, admitted: &ExecutionIdentity,
         engine: &mut StrictInt4Engine<'_>, budget: Int4ScoringBudget, control: &mut C)
         -> Result<Int4ClassificationRun, Int4ClassificationError> {
+        self.execute_with_prefill(admitted, engine, budget, None, control)
+    }
+    /// Group each independent head's prompt while preserving its complete
+    /// language and full-vocabulary denominator. The host reserves the extra
+    /// scratch once and retains it through every head and physical drain.
+    pub fn execute_layer_major_with_control<C: DecodeStepControl>(&self, admitted: &ExecutionIdentity,
+        engine: &mut StrictInt4Engine<'_>, budget: Int4ScoringBudget,
+        prefill: Int4PrefillLimits, control: &mut C) -> Result<Int4ClassificationRun, Int4ClassificationError> {
+        self.execute_with_prefill(admitted, engine, budget, Some(prefill), control)
+    }
+    fn execute_with_prefill<C: DecodeStepControl>(&self, admitted: &ExecutionIdentity,
+        engine: &mut StrictInt4Engine<'_>, budget: Int4ScoringBudget,
+        prefill: Option<Int4PrefillLimits>, control: &mut C) -> Result<Int4ClassificationRun, Int4ClassificationError> {
+        if let Some(limits) = prefill { limits.validate()?; }
         planning::checkpoint(control)?;
         self.preflight(admitted, engine, budget)?;
         self.execute_heads(control, |_, head, schedule, control| {
             let mut prompt = planning::reserved(head.prompt_len)?;
             prompt.extend(head.task.ir().prompt_segments().iter().flat_map(|s| s.token_ids().iter().copied()));
             if prompt.len() != head.prompt_len { return Err(Int4ClassificationError::Accounting); }
-            let run = scoring::execute_compiled(&prompt, &head.classifier.scorer, ScoringMode::FullVocabulary,
+            let run = scoring::prefill::execute_compiled_with_prefill(&prompt, &head.classifier.scorer, ScoringMode::FullVocabulary,
                 schedule, self.inner.budget.max_output_bytes, engine,
                 Int4ScoringBudget { native: Int4RunBudget::exact(schedule.model),
-                    max_kv_bytes: budget.max_kv_bytes.min(self.inner.budget.max_kv_bytes) }, control)?;
+                    max_kv_bytes: budget.max_kv_bytes.min(self.inner.budget.max_kv_bytes) }, prefill, control)?;
             if engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) {
                 return Err(Int4ClassificationError::Accounting);
             }

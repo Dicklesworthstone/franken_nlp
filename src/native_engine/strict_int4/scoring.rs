@@ -15,6 +15,8 @@ use super::{Int4RunBudget, Int4Session, Int4Work, StrictInt4Engine, StrictInt4Er
     DEFAULT_ADMITTED_CONTEXT_CAP, MAX_MODEL_K, LinearRows, DecodeStepControl,
     DecodeCancellationKind, scale_work};
 
+pub mod prefill;
+
 pub const INT4_SCORING_EXECUTION: &str = "grouped-int4-single-kv-candidate-trie-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -219,7 +221,7 @@ impl<D: Driver> PrefixEvaluator<'_, D> {
         self.poisoned = true;
         self.driver.rewind(retain)?;
         self.rewound = add(self.rewound, (current - retain) as u64)?;
-        if !self.primed { for &token in self.prompt { self.driver.append(token)?; } }
+        if !self.primed { self.driver.append_prompt(self.prompt)?; }
         // Strictly increasing traversal guarantees a new token after a rewind.
         // It recomputes hidden state; stale descendant hidden is never reused.
         for &token in &prefix[common..] { self.driver.append(token)?; }
@@ -248,6 +250,10 @@ trait Driver {
     fn position(&self) -> Result<usize, Int4ScoringError>;
     fn rewind(&mut self, retain: usize) -> Result<(), Int4ScoringError>;
     fn append(&mut self, token: u32) -> Result<(), Int4ScoringError>;
+    fn append_prompt(&mut self, prompt: &[u32]) -> Result<(), Int4ScoringError> {
+        for &token in prompt { self.append(token)?; }
+        Ok(())
+    }
     fn logits(&mut self, rows: LinearRows<'_>) -> Result<Vec<f32>, Int4ScoringError>;
     fn work(&self) -> Int4Work;
     fn abort(&mut self);

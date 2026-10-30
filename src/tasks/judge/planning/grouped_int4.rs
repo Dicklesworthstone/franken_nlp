@@ -10,6 +10,7 @@ use crate::native_engine::{
     lmhead::scoring::ScoringMode,
     strict_int4::{Int4ModelIdentity, Int4RunBudget, Int4Work, StrictInt4Engine,
         StrictInt4Error, STRICT_INT4_EXECUTION, STRICT_INT4_PROFILE,
+        prefill::Int4PrefillLimits,
         scoring::{self, CandidateSchedule, Int4CandidateRun, Int4ScoringBudget,
             Int4ScoringError, INT4_SCORING_EXECUTION}},
 };
@@ -153,16 +154,31 @@ impl PreparedInt4Judge {
     pub fn execute_with_control<C: DecodeStepControl>(&self, admitted: &ExecutionIdentity,
         engine: &mut StrictInt4Engine<'_>, budget: Int4ScoringBudget, control: &mut C)
         -> Result<Int4JudgeRun, Int4JudgeError> {
+        self.execute_with_prefill(admitted, engine, budget, None, control)
+    }
+    /// Group the initial prompt of every order, criterion and evidence head.
+    /// All heads and total work preflight before the first forward; one head
+    /// failure still discards the complete judgment. Extra scratch requires a
+    /// separate caller-owned reservation retained through physical drain.
+    pub fn execute_layer_major_with_control<C: DecodeStepControl>(&self, admitted: &ExecutionIdentity,
+        engine: &mut StrictInt4Engine<'_>, budget: Int4ScoringBudget,
+        prefill: Int4PrefillLimits, control: &mut C) -> Result<Int4JudgeRun, Int4JudgeError> {
+        self.execute_with_prefill(admitted, engine, budget, Some(prefill), control)
+    }
+    fn execute_with_prefill<C: DecodeStepControl>(&self, admitted: &ExecutionIdentity,
+        engine: &mut StrictInt4Engine<'_>, budget: Int4ScoringBudget,
+        prefill: Option<Int4PrefillLimits>, control: &mut C) -> Result<Int4JudgeRun, Int4JudgeError> {
+        if let Some(limits) = prefill { limits.validate()?; }
         checkpoint(control)?;
         self.preflight(admitted, engine, budget)?;
         self.evaluate_heads(control, |_, head, schedule, control| {
             let mut prompt = reserved(head.prompt_len)?;
             prompt.extend(head.ir.prompt_segments().iter().flat_map(|s| s.token_ids().iter().copied()));
             if prompt.len() != head.prompt_len { return Err(Int4JudgeError::Accounting); }
-            let run = scoring::execute_compiled(&prompt, &head.scorer, ScoringMode::FullVocabulary,
+            let run = scoring::prefill::execute_compiled_with_prefill(&prompt, &head.scorer, ScoringMode::FullVocabulary,
                 schedule, self.max_result_bytes(), engine,
                 Int4ScoringBudget { native: Int4RunBudget::exact(schedule.model),
-                    max_kv_bytes: budget.max_kv_bytes.min(head.ir.budget().max_kv_bytes) }, control)?;
+                    max_kv_bytes: budget.max_kv_bytes.min(head.ir.budget().max_kv_bytes) }, prefill, control)?;
             if engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) {
                 return Err(Int4JudgeError::Accounting);
             }

@@ -14,6 +14,7 @@ use crate::{
         lmhead::scoring::{ScoringMode, ScoringWork},
         strict_int4::{Int4ModelIdentity, Int4RunBudget, Int4Work, StrictInt4Engine,
             StrictInt4Error, STRICT_INT4_PROFILE,
+            prefill::Int4PrefillLimits,
             scoring::{self, CandidateSchedule, Int4CandidateRun, Int4ScoringBudget,
                 Int4ScoringError, INT4_SCORING_EXECUTION}},
     },
@@ -179,17 +180,31 @@ impl PreparedInt4Sentiment {
     pub fn execute_with_control<C: DecodeStepControl>(&self, admitted: &ExecutionIdentity,
         engine: &mut StrictInt4Engine<'_>, budget: Int4ScoringBudget, control: &mut C)
         -> Result<Int4SentimentRun, Int4SentimentError> {
+        self.execute_with_prefill(admitted, engine, budget, None, control)
+    }
+    /// Execute bounded prompt morsels for each independent axis. Candidate
+    /// denominators, frozen run policy and aggregate work remain unchanged.
+    /// The caller must admit extra scratch through all heads and drain.
+    pub fn execute_layer_major_with_control<C: DecodeStepControl>(&self, admitted: &ExecutionIdentity,
+        engine: &mut StrictInt4Engine<'_>, budget: Int4ScoringBudget,
+        prefill: Int4PrefillLimits, control: &mut C) -> Result<Int4SentimentRun, Int4SentimentError> {
+        self.execute_with_prefill(admitted, engine, budget, Some(prefill), control)
+    }
+    fn execute_with_prefill<C: DecodeStepControl>(&self, admitted: &ExecutionIdentity,
+        engine: &mut StrictInt4Engine<'_>, budget: Int4ScoringBudget,
+        prefill: Option<Int4PrefillLimits>, control: &mut C) -> Result<Int4SentimentRun, Int4SentimentError> {
+        if let Some(limits) = prefill { limits.validate()?; }
         checkpoint(control)?;
         self.preflight(admitted, engine, budget)?;
         self.execute_heads(control, |head, mode, schedule, control| {
             let mut prompt = reserved(head.prompt_len)?;
             prompt.extend(head.ir.prompt_segments().iter().flat_map(|s| s.token_ids().iter().copied()));
             if prompt.len() != head.prompt_len { return Err(Int4SentimentError::Accounting); }
-            let run = scoring::execute_compiled(&prompt, &head.scorer, mode, schedule,
+            let run = scoring::prefill::execute_compiled_with_prefill(&prompt, &head.scorer, mode, schedule,
                 self.max_result_bytes(), engine, Int4ScoringBudget {
                     native: Int4RunBudget::exact(schedule.model),
                     max_kv_bytes: budget.max_kv_bytes.min(self.budget.max_kv_bytes),
-                }, control)?;
+                }, prefill, control)?;
             if engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) {
                 return Err(Int4SentimentError::Accounting);
             }
