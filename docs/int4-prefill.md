@@ -37,6 +37,10 @@ option with complete task and native work admission. Scored corpus/job commands,
 resolution, extraction and source tasks still reject it, including
 programmatically constructed requests. There is no silently ignored option.
 
+The separate [scoring-cohort mode](int4-scoring-cohorts.md) groups independent
+heads with `--cohort-heads N`. It cannot be combined with `--prefill-rows` and
+prices all simultaneously retained KV, prompts and cursors.
+
 For an existing digest-pinned INT4 snapshot and a typed classification request:
 
 ```sh

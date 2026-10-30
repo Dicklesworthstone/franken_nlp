@@ -76,6 +76,13 @@ See [INT4 prefill](int4-prefill.md) for memory, cancellation and qualification
 boundaries. This option currently applies to the one-off classify, sentiment
 and judge commands; scored corpus and retained-job workflows remain serial.
 
+`--cohort-heads N` instead executes every head simultaneously, up to the explicit
+1..64 head ceiling. It admits the sum of their KV capacities and retains the
+same independent label scoring and finalizer. It cannot be combined with
+`--prefill-rows`; a task exceeding the declared head ceiling refuses before
+model loading. See [INT4 scoring cohorts](int4-scoring-cohorts.md) for complete
+memory and output semantics.
+
 The command emits one completed source-candidate JSON envelope. Its `output`
 is the complete `Int4ClassificationRun`; provenance retains the existing
 `real-source-current-candidate-int4` scope and `non_authoritative` evidence

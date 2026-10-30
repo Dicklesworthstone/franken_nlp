@@ -68,6 +68,7 @@ pub(super) fn execute(args: Int4Args, command: SentimentArgs, _admitted: Int4Lim
     remaining()?;
     let budget = command.scoring.budget(limits);
     let (request, policy) = parse_request(&text, budget, args.max_input_bytes)?;
+    command.scoring.admit_heads(request.axes.len())?;
     drop(text);
     remaining()?;
     let cancellation = CancellationToken::default();
@@ -79,6 +80,7 @@ pub(super) fn execute(args: Int4Args, command: SentimentArgs, _admitted: Int4Lim
     let plan = planner.plan_with_control(&request, &mut DeadlineControl { started, deadline })
         .map_err(planning_error)?;
     command.scoring.admit_plan(plan.required_context(), args.context_tokens, plan.planned_work())?;
+    command.scoring.admit_heads(plan.head_count())?;
     if plan.group_width() != model.model_identity().group_width() || plan.head_count() != request.axes.len() {
         return Err(CandidateError::Identity);
     }
@@ -103,10 +105,14 @@ pub(super) fn execute(args: Int4Args, command: SentimentArgs, _admitted: Int4Lim
                 cleanup_reserve_bytes: CLEANUP_BYTES } },
         preparation_reserve_bytes: limits.preparation_bytes, max_model_work: command.scoring.work_ceiling(),
     };
-    let result = match limits.prefill {
-        None => engine.execute_int4_sentiment(&model, plan, host, limits.kernel, cancellation),
-        Some(prefill) => engine.execute_int4_sentiment_layer_major(&model, plan, host,
-            limits.kernel, prefill, cancellation),
+    let result = match limits.cohort {
+        Some(_) => engine.execute_int4_sentiment_cohort(&model, plan, host.native,
+            limits.preparation_bytes, host.max_model_work, limits.kernel, cancellation).map(cohort::Completion::Cohort),
+        None => match limits.prefill {
+            None => engine.execute_int4_sentiment(&model, plan, host, limits.kernel, cancellation),
+            Some(prefill) => engine.execute_int4_sentiment_layer_major(&model, plan, host,
+                limits.kernel, prefill, cancellation),
+        }.map(cohort::Completion::Serial),
     }.map_err(execution_error)?;
     if result.result().model_work != expected_work || result.result().head_count != expected_heads
         || result.result().group_width != model.model_identity().group_width() {
@@ -124,7 +130,8 @@ pub(super) fn execute(args: Int4Args, command: SentimentArgs, _admitted: Int4Lim
     };
     // Retain the host's complete output and the CLI preparation guards through
     // bounded staging, writing and flushing. Failed heads emit no prefix.
-    publish(&Response { provenance: &provenance, output: result.result() }, limits.result_bytes + 4096, output)
+    let response = Response { provenance: &provenance, output: result.result() };
+    publish(&cohort::Response { response: &response, cohort: result.summary() }, limits.result_bytes + 4096, output)
 }
 
 #[derive(Serialize)]

@@ -23,6 +23,7 @@ mod source_job;
 mod source_map;
 mod document_job;
 mod prefill;
+mod cohort;
 mod batch;
 mod text_job;
 mod stream;
@@ -380,6 +381,8 @@ struct Int4Limits {
     kernel: PackedInt4Kernel,
     /// Explicit physical prompt schedule; independently priced in the execution stage.
     prefill: Option<Int4PrefillLimits>,
+    /// Explicit simultaneous scoring-head ceiling and transient workspace.
+    cohort: Option<cohort::Admission>,
     /// Lower bound for these declared simultaneous reservations. Host admission
     /// independently enforces all runtime/domain obligations; this is not RSS.
     minimum_memory_bytes: u64,
@@ -422,8 +425,15 @@ impl Int4Args {
     fn validate_storage_with_prefill(&self, result_bytes: usize, output_tokens: usize,
         max_prompt_tokens: usize, sampler_bytes: u64, extra_preparation_bytes: u64)
         -> Result<Int4Limits, CandidateError> {
+        self.validate_storage_scheduled(result_bytes, output_tokens, max_prompt_tokens,
+            sampler_bytes, extra_preparation_bytes, None)
+    }
+    fn validate_storage_scheduled(&self, result_bytes: usize, output_tokens: usize,
+        max_prompt_tokens: usize, sampler_bytes: u64, extra_preparation_bytes: u64,
+        cohort: Option<cohort::Admission>) -> Result<Int4Limits, CandidateError> {
         let snapshot_pin = self.checked_model_input()?;
         let prefill = self.prefill()?;
+        if cohort.is_some() && (prefill.is_some() || sampler_bytes != 0) { return Err(CandidateError::Arguments); }
         let extra_scratch = prefill.map(|limits| limits.max_extra_scratch_bytes).unwrap_or(0);
         let kernel = PackedInt4Kernel::detect(self.kernel).map_err(|_| CandidateError::Arguments)?;
         if self.input.as_os_str().is_empty()
@@ -436,8 +446,10 @@ impl Int4Args {
             return Err(CandidateError::Arguments);
         }
         let load = Int4ModelLoadRequirement::for_group_width(self.group_width).map_err(|_| CandidateError::Arguments)?;
-        let native = Int4MemoryRequirement::for_context(self.context_tokens, self.group_width)
-            .map_err(|_| CandidateError::Arguments)?;
+        let native = match cohort {
+            None => Int4MemoryRequirement::for_context(self.context_tokens, self.group_width),
+            Some(admission) => admission.native(self.context_tokens, self.group_width),
+        }.map_err(|_| CandidateError::Arguments)?;
         let memory_bytes = mib(self.memory_mib)?;
         let preparation_bytes = mib(self.preparation_mib)?;
         let source_preparation_bytes = mib(self.source_preparation_mib)?;
@@ -461,13 +473,15 @@ impl Int4Args {
         // token/score vectors, and fixed bookkeeping. The CLI additionally
         // retains its own separately charged serialization staging.
         let output_charge = sum(&[result_bytes as u64 * 4, output_tokens as u64 * 8, 4096])?;
+        let cohort_input = cohort.map(|admission| sum(&[preparation_bytes, admission.workspace_bytes]))
+            .transpose()?.unwrap_or(0);
         let execute_stage = sum(&[native.kv_bytes, native.rope_bytes, native.scratch_payload_bound,
-            sampler_bytes, ALLOCATOR_BYTES, output_charge, extra_scratch])?;
+            sampler_bytes, ALLOCATOR_BYTES, output_charge, extra_scratch, cohort_input])?;
         let minimum_memory_bytes = sum(&[preparation_bytes, resident,
             load_stage.max(save_stage).max(execute_stage), CLEANUP_BYTES])?;
         if minimum_memory_bytes > memory_bytes { return Err(CandidateError::Arguments); }
         Ok(Int4Limits { memory_bytes, preparation_bytes, source_preparation_bytes, max_load_bytes,
-            result_bytes, max_prompt_tokens, load, native, snapshot_pin, snapshot_need, kernel, prefill, minimum_memory_bytes })
+            result_bytes, max_prompt_tokens, load, native, snapshot_pin, snapshot_need, kernel, prefill, cohort, minimum_memory_bytes })
     }
     // Recheck the exclusive source/snapshot contract for programmatically
     // constructed arguments too, before input IO or caller-sized allocations.

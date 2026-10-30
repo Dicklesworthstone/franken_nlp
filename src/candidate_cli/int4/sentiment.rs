@@ -27,7 +27,9 @@ impl SentimentArgs {
         // CLI preparation retains the typed input, planner and publication
         // staging while the host independently owns the compiled bundle.
         // Full context KV and native output are already priced by storage.
-        limits.minimum_memory_bytes = sum(&[limits.minimum_memory_bytes, limits.preparation_bytes])?;
+        if limits.cohort.is_none() {
+            limits.minimum_memory_bytes = sum(&[limits.minimum_memory_bytes, limits.preparation_bytes])?;
+        }
         if limits.minimum_memory_bytes > limits.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(limits)
     }

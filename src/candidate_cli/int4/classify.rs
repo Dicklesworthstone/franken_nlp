@@ -17,6 +17,9 @@ const TEXT_ONLY: &[&str] = &[
 
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ScoringArgs {
+    /// Explicit simultaneous-head execution; every head must fit this ceiling.
+    #[arg(long, value_name = "N", hide = true, conflicts_with = "prefill_rows")]
+    cohort_heads: Option<usize>,
     /// Maximum candidate depth INCLUDING its scored EOS, not generated text.
     #[arg(long, default_value_t = 16)]
     max_candidate_tokens: usize,
@@ -50,10 +53,13 @@ pub(super) fn definition() -> clap::Command {
 pub(super) fn prefill_definition(command: clap::Command) -> clap::Command {
     command.mut_arg("prefill_rows", |arg| arg.hide(false)
         .help("Explicit INT4 layer-major prompt execution, 1..=64 rows; extra workspace is admitted once and reused between scoring heads"))
+        .mut_arg("cohort_heads", |arg| arg.hide(false)
+            .help("Execute all scoring heads together, up to N (1..=64); admits simultaneous KV and cursor storage, no serial fallback"))
 }
 impl ScoringArgs {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-        if matches.value_source("prefill_rows") == Some(clap::parser::ValueSource::CommandLine) {
+        if ["prefill_rows", "cohort_heads"].iter()
+            .any(|id| matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine)) {
             return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
                 "this INT4 scored workflow requires sequential prompt execution"));
         }
@@ -68,7 +74,7 @@ impl ScoringArgs {
         Self::from_arg_matches(matches)
     }
     pub(super) fn validate(self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
-        if args.prefill()?.is_some() { return Err(CandidateError::Arguments); }
+        if args.prefill()?.is_some() || self.cohort_heads.is_some() { return Err(CandidateError::Arguments); }
         self.validate_with_prefill(args)
     }
     pub(super) fn validate_with_prefill(self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
@@ -88,8 +94,18 @@ impl ScoringArgs {
         // Bound repeated document/prompt/IR storage by the aggregate forward
         // ceiling, not by input bytes or just the longest live native context.
         let extra = sum(&[128 * MIB, self.max_forward_positions * 32, self.max_result_bytes as u64 * 16])?;
-        args.validate_storage_with_prefill(self.max_result_bytes, self.max_candidate_tokens,
-            args.context_tokens - self.max_candidate_tokens + 1, 0, extra)
+        args.validate_storage_scheduled(self.max_result_bytes, self.max_candidate_tokens,
+            args.context_tokens - self.max_candidate_tokens + 1, 0, extra, self.cohort_admission()?)
+    }
+    pub(super) fn cohort_admission(self) -> Result<Option<cohort::Admission>, CandidateError> {
+        self.cohort_heads.map(|heads| cohort::Admission::new(heads, self.work_ceiling(),
+            self.max_result_bytes as u64)).transpose()
+    }
+    pub(super) fn admit_heads(self, count: usize) -> Result<(), CandidateError> {
+        if self.cohort_heads.is_some_and(|cap| count == 0 || count > cap) {
+            return Err(CandidateError::Planning);
+        }
+        Ok(())
     }
     pub(super) fn budget(self, limits: Int4Limits) -> TaskBudget {
         TaskBudget { max_input_tokens: limits.max_prompt_tokens as u32,

@@ -36,7 +36,7 @@ enum Prepared {
 }
 enum Completed {
     Text(HostedOutput<Int4ChatResult>),
-    Classify(HostedOutput<Int4ClassificationRun>),
+    Classify(cohort::Completion<Int4ClassificationRun>),
     Extract(HostedOutput<Int4ExtractRun>),
     Source(HostedOutput<Int4SourceTaskRun>),
 }
@@ -50,6 +50,11 @@ impl Serialize for Completed {
         }
     }
 }
+impl Completed {
+    fn cohort(&self) -> Option<cohort::Summary<'_>> {
+        match self { Self::Classify(result) => result.summary(), _ => None }
+    }
+}
 impl Prepared {
     fn identity(&self) -> &ExecutionIdentity {
         match self {
@@ -60,17 +65,26 @@ impl Prepared {
         }
     }
     fn execute(self, engine: &NlpEngine, model: &ResidentInt4, native: NativeLimits,
-        kernel: PackedInt4Kernel, prefill: Option<Int4PrefillLimits>, cancellation: CancellationToken)
+        limits: Int4Limits, cancellation: CancellationToken)
         -> Result<Completed, CandidateError> {
-        match (self, prefill) {
+        let kernel = limits.kernel;
+        if let Some(admission) = limits.cohort {
+            let Self::Classify(plan) = self else { return Err(CandidateError::Arguments); };
+            if plan.head_count() > admission.heads { return Err(CandidateError::Planning); }
+            let work = plan.planned_work();
+            return engine.execute_int4_classify_cohort(model, plan, native, limits.preparation_bytes,
+                work, kernel, cancellation).map(|result| Completed::Classify(cohort::Completion::Cohort(result)))
+                .map_err(|_| CandidateError::Execution);
+        }
+        match (self, limits.prefill) {
             (Self::Text(plan), None) => engine.execute_int4_chat(model, plan, 1, native, SAMPLER_BYTES,
                 kernel, cancellation).map(Completed::Text),
             (Self::Text(plan), Some(limits)) => engine.execute_int4_chat_layer_major(model, plan, 1, native,
                 SAMPLER_BYTES, kernel, limits, cancellation).map(Completed::Text),
             (Self::Classify(plan), None) => engine.execute_int4_classify(model, plan, native,
-                kernel, cancellation).map(Completed::Classify),
+                kernel, cancellation).map(|result| Completed::Classify(cohort::Completion::Serial(result))),
             (Self::Classify(plan), Some(limits)) => engine.execute_int4_classify_layer_major(model, plan, native,
-                kernel, limits, cancellation).map(Completed::Classify),
+                kernel, limits, cancellation).map(|result| Completed::Classify(cohort::Completion::Serial(result))),
             (Self::Extract { plan, vocabulary, masks, max_mask_node_visits }, None) =>
                 engine.execute_int4_extract(model, plan, vocabulary, native, masks,
                     max_mask_node_visits, kernel, cancellation).map(Completed::Extract),
@@ -93,6 +107,7 @@ pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
     if matches!(&task, Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::Semantic(_) | Int4Task::Resolve(_) | Int4Task::Sentiment(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ScoredBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_) | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob)
         || limits.minimum_memory_bytes > limits.memory_bytes || limits.kernel.kind() != args.kernel
         || !prefill::matches(&args, limits)?
+        || !cohort::matches(&task, &args, limits)?
         || (!matches!(&task, Int4Task::Text(_) | Int4Task::Classify(_)) && limits.prefill.is_some()) {
         return Err(CandidateError::Arguments);
     }
@@ -120,8 +135,14 @@ pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
     };
     let request = match task {
         Int4Task::Text(task) => Input::Text(parse_input(task, text, args.max_input_bytes)?),
-        Int4Task::Classify(scoring) => Input::Classify(
-            classify::parse_request(&text, scoring.budget(limits), args.max_input_bytes)?, scoring),
+        Int4Task::Classify(scoring) => {
+            let request = classify::parse_request(&text, scoring.budget(limits), args.max_input_bytes)?;
+            scoring.admit_heads(match request.mode {
+                crate::tasks::classify::ClassificationMode::Exclusive => 1,
+                crate::tasks::classify::ClassificationMode::MultiLabel => request.labels.len(),
+            })?;
+            Input::Classify(request, scoring)
+        }
         Int4Task::Extract(options) => {
             remaining()?;
             let mut file = File::open(options.schema_path()).map_err(|_| CandidateError::Input)?;
@@ -166,7 +187,7 @@ pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
         context_tokens: args.context_tokens, allocator_reserve_bytes: ALLOCATOR_BYTES,
         run: RunLimits { max_elapsed: remaining()?, max_checkpoints: args.max_checkpoints,
             cleanup_reserve_bytes: CLEANUP_BYTES },
-    }, limits.kernel, limits.prefill, cancellation)?;
+    }, limits, cancellation)?;
     remaining()?;
     let content = identity.logical_model_digest.to_hex();
     let response = SourceResponse {
@@ -179,7 +200,7 @@ pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
     };
     // Completed retains the exact hosted output guard while Serialize borrows
     // its result. No unguarded JSON value or partially completed head escapes.
-    publish(&response, limits.result_bytes + 4096, output)
+    publish(&cohort::Response { response: &response, cohort: result.cohort() }, limits.result_bytes + 4096, output)
 }
 
 fn prepare(request: Input, model: &ResidentInt4, args: &Int4Args, limits: Int4Limits,
@@ -213,6 +234,7 @@ fn prepare(request: Input, model: &ResidentInt4, args: &Int4Args, limits: Int4Li
                 else { CandidateError::Planning }
             })?;
             scoring.admit_plan(plan.required_context(), args.context_tokens, plan.planned_work())?;
+            scoring.admit_heads(plan.head_count())?;
             Ok(Prepared::Classify(plan))
         }
         Input::Extract { document, request, options } => {

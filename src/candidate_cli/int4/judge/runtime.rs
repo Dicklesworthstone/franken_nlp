@@ -66,6 +66,7 @@ pub(super) fn execute(args: Int4Args, command: JudgeArgs, _admitted: Int4Limits,
     let budget = command.scoring.budget(limits);
     let request = parse_request(&text, budget, args.max_input_bytes)?;
     let (mode, expected_heads) = request_shape(&request)?;
+    command.scoring.admit_heads(expected_heads)?;
     drop(text);
     remaining()?;
     let cancellation = CancellationToken::default();
@@ -79,6 +80,7 @@ pub(super) fn execute(args: Int4Args, command: JudgeArgs, _admitted: Int4Limits,
     let plan = planner.plan_with_control(&request, &mut DeadlineControl { started, deadline })
         .map_err(planning_error)?;
     command.scoring.admit_plan(plan.required_context(), args.context_tokens, plan.planned_work())?;
+    command.scoring.admit_heads(plan.head_count())?;
     if plan.group_width() != model.model_identity().group_width() || plan.head_count() != expected_heads {
         return Err(CandidateError::Identity);
     }
@@ -102,10 +104,14 @@ pub(super) fn execute(args: Int4Args, command: JudgeArgs, _admitted: Int4Limits,
                 cleanup_reserve_bytes: CLEANUP_BYTES } },
         preparation_reserve_bytes: limits.preparation_bytes, max_model_work: command.scoring.work_ceiling(),
     };
-    let result = match limits.prefill {
-        None => engine.execute_int4_judge(&model, plan, host, limits.kernel, cancellation),
-        Some(prefill) => engine.execute_int4_judge_layer_major(&model, plan, host,
-            limits.kernel, prefill, cancellation),
+    let result = match limits.cohort {
+        Some(_) => engine.execute_int4_judge_cohort(&model, plan, host.native,
+            limits.preparation_bytes, host.max_model_work, limits.kernel, cancellation).map(cohort::Completion::Cohort),
+        None => match limits.prefill {
+            None => engine.execute_int4_judge(&model, plan, host, limits.kernel, cancellation),
+            Some(prefill) => engine.execute_int4_judge_layer_major(&model, plan, host,
+                limits.kernel, prefill, cancellation),
+        }.map(cohort::Completion::Serial),
     }.map_err(execution_error)?;
     if result.result().schema_version != 1 || result.result().execution != INT4_JUDGE_EXECUTION
         || result.result().numerics_profile != STRICT_INT4_PROFILE || result_mode(&result.result().result) != mode
@@ -125,7 +131,8 @@ pub(super) fn execute(args: Int4Args, command: JudgeArgs, _admitted: Int4Limits,
     };
     // Both guards survive bounded staging, writing and flushing. Inference
     // failure never emits a prefix; a writer error remains an output failure.
-    publish(&Response { provenance: &provenance, output: result.result() }, limits.result_bytes + 4096, output)
+    let response = Response { provenance: &provenance, output: result.result() };
+    publish(&cohort::Response { response: &response, cohort: result.summary() }, limits.result_bytes + 4096, output)
 }
 
 #[derive(Serialize)]

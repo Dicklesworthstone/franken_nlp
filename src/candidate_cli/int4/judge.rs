@@ -26,7 +26,9 @@ impl JudgeArgs {
         let mut limits = self.scoring.validate_with_prefill(args)?;
         // CLI input/planning/publication and hosted compiled input remain
         // separate charged owners during the complete native invocation.
-        limits.minimum_memory_bytes = sum(&[limits.minimum_memory_bytes, limits.preparation_bytes])?;
+        if limits.cohort.is_none() {
+            limits.minimum_memory_bytes = sum(&[limits.minimum_memory_bytes, limits.preparation_bytes])?;
+        }
         if limits.minimum_memory_bytes > limits.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(limits)
     }
