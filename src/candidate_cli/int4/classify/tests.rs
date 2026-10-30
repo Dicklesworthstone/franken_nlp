@@ -61,7 +61,7 @@ fn explicit_generation_flags_are_refused_even_at_their_default_values() {
     let seed = "ab".repeat(32);
     for flags in [vec!["--max-new-tokens", "128"], vec!["--max-output-bytes", "65536"],
         vec!["--seed", &seed], vec!["--temperature-milli", "1000"], vec!["--top-k", "20"],
-        vec!["--top-p-ppm", "1000000"], vec!["--logprobs"], vec!["--prefill-rows", "1"],
+        vec!["--top-p-ppm", "1000000"], vec!["--logprobs"],
         vec!["--min-new-tokens", "0"], vec!["--stop", "END"], vec!["--ban-token", "7"],
         vec!["--repetition-penalty-milli", "1000"], vec!["--presence-penalty-milli", "0"],
         vec!["--frequency-penalty-milli", "0"], vec!["--logit-bias", "7=0"]] {

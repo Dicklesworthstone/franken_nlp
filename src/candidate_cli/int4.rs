@@ -169,12 +169,12 @@ pub(super) fn definition() -> clap::Command {
         .mut_arg("prefill_rows", |arg| arg.help("Explicit grouped-INT4 layer-major prompt execution, 1..=64 rows; extra workspace is process-admitted"));
     clap::Command::new("source-int4")
         .about("Run candidate INT4 tasks from pinned sources or a digest-pinned local snapshot")
-        .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Sequential native execution defaults to scalar; --kernel explicitly selects an existing hardware-checked integer leaf. Text tasks can opt in to bounded layer-major prompt execution with --prefill-rows; structured tasks cannot. stream generate/chat emits bounded provisional token NDJSON and requires a final run_complete after native drain. text-batch runs one finite NDJSON cohort and emits one completed aggregate JSON object. text-corpus processes bounded windows with one resident model and cumulative budgets, emitting completed-window NDJSON with a required corpus_complete footer. extract-batch streams documents under one shared schema through one resident model and engine. ner, keyphrases, summarize and answer preserve their source-task semantics; their -batch commands run ordered typed source-task NDJSON. Every ordered batch requires run_complete plus exit 0 for whole-run success. ner-map and keyphrases-map process every chunk of a complete document with original-coordinate evidence; summarize-map produces a deterministic exact cited bullet union. All map commands preflight the complete document and publish one completed result. extract-job start/resume retains ordered extraction results in an explicit protected spool. ner-job, keyphrases-job, summarize-job and answer-job provide the same opt-in durable start/resume contract for source tasks. redact-job start/resume retains complete-document edits under one authenticated detector, action and key scope, with metadata-only stdout. Resume authenticates the complete original population, exact task configuration, model/group identity and immutable lifetime limits. No automatic selection, fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Other routes publish completed task or corpus results.")
+        .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Sequential native execution defaults to scalar; --kernel explicitly selects an existing hardware-checked integer leaf. Text tasks and one-off classify, sentiment and judge can opt in to bounded layer-major prompt execution with --prefill-rows; extraction, source tasks and scored corpus/job workflows retain sequential prompts. stream generate/chat emits bounded provisional token NDJSON and requires a final run_complete after native drain. text-batch runs one finite NDJSON cohort and emits one completed aggregate JSON object. text-corpus processes bounded windows with one resident model and cumulative budgets, emitting completed-window NDJSON with a required corpus_complete footer. extract-batch streams documents under one shared schema through one resident model and engine. ner, keyphrases, summarize and answer preserve their source-task semantics; their -batch commands run ordered typed source-task NDJSON. Every ordered batch requires run_complete plus exit 0 for whole-run success. ner-map and keyphrases-map process every chunk of a complete document with original-coordinate evidence; summarize-map produces a deterministic exact cited bullet union. All map commands preflight the complete document and publish one completed result. extract-job start/resume retains ordered extraction results in an explicit protected spool. ner-job, keyphrases-job, summarize-job and answer-job provide the same opt-in durable start/resume contract for source tasks. redact-job start/resume retains complete-document edits under one authenticated detector, action and key scope, with metadata-only stdout. Resume authenticates the complete original population, exact task configuration, model/group identity and immutable lifetime limits. No automatic selection, fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Other routes publish completed task or corpus results.")
         .subcommand_required(true)
         .subcommand(task("generate", "Generate from a bounded UTF-8 prompt using the pinned template"))
         .subcommand(task("chat", "Complete a bounded JSON system/user/assistant transcript"))
         .subcommand(stream::definition())
-        .subcommand(classify::definition())
+        .subcommand(classify::prefill_definition(classify::definition()))
         .subcommand(sentiment::definition())
         .subcommand(judge::definition())
         .subcommand(scored_batch::definition())
@@ -250,7 +250,7 @@ impl Int4Command {
         let task = match name {
             "generate" => Int4Task::Text(Task::Generate),
             "chat" => Int4Task::Text(Task::Chat),
-            "classify" => Int4Task::Classify(classify::ScoringArgs::from_matches(matches)?),
+            "classify" => Int4Task::Classify(classify::ScoringArgs::from_matches_with_prefill(matches)?),
             "sentiment" => Int4Task::Sentiment(sentiment::SentimentArgs::from_matches(matches)?),
             "judge" => Int4Task::Judge(judge::JudgeArgs::from_matches(matches)?),
             "score-batch" => Int4Task::ScoredBatch(scored_batch::BatchArgs::from_matches(matches)?),
@@ -356,7 +356,7 @@ impl Int4Command {
         }
         let limits = match &self.task {
             Int4Task::Text(_) => self.args.validate()?,
-            Int4Task::Classify(scoring) => scoring.validate(&self.args)?,
+            Int4Task::Classify(scoring) => scoring.validate_with_prefill(&self.args)?,
             Int4Task::Extract(extraction) => extraction.validate(&self.args)?,
             Int4Task::Source(_, source) => source.validate(&self.args)?,
             // The blocking stream must own its input and writer through cleanup.
@@ -378,7 +378,7 @@ struct Int4Limits {
     snapshot_pin: Option<Int4SnapshotPin>, snapshot_need: Int4SnapshotRequirements,
     /// Real-host-checked executable handle, not a serialized capability report.
     kernel: PackedInt4Kernel,
-    /// Explicit physical text-prompt schedule; independently priced in the execution stage.
+    /// Explicit physical prompt schedule; independently priced in the execution stage.
     prefill: Option<Int4PrefillLimits>,
     /// Lower bound for these declared simultaneous reservations. Host admission
     /// independently enforces all runtime/domain obligations; this is not RSS.
@@ -410,11 +410,20 @@ impl Int4Args {
     // complete-result depth/bytes and repeated-prompt allowance, with no sampler.
     fn validate_storage(&self, result_bytes: usize, output_tokens: usize, max_prompt_tokens: usize,
         sampler_bytes: u64, extra_preparation_bytes: u64) -> Result<Int4Limits, CandidateError> {
+        // Existing structured and corpus callers retain their serial-only
+        // contract, including when constructed without the CLI parser.
+        if sampler_bytes == 0 && self.prefill()?.is_some() { return Err(CandidateError::Arguments); }
+        self.validate_storage_with_prefill(result_bytes, output_tokens, max_prompt_tokens,
+            sampler_bytes, extra_preparation_bytes)
+    }
+    // Only callers with an actual grouped execution route enter this variant.
+    // Prefill storage participates in the execution-stage peak, rather than
+    // being added after the load/save/execute maximum has already been chosen.
+    fn validate_storage_with_prefill(&self, result_bytes: usize, output_tokens: usize,
+        max_prompt_tokens: usize, sampler_bytes: u64, extra_preparation_bytes: u64)
+        -> Result<Int4Limits, CandidateError> {
         let snapshot_pin = self.checked_model_input()?;
         let prefill = self.prefill()?;
-        // Scored tasks declare no sampler; prefill is not silently inherited
-        // through their shared parser, including programmatic construction.
-        if sampler_bytes == 0 && prefill.is_some() { return Err(CandidateError::Arguments); }
         let extra_scratch = prefill.map(|limits| limits.max_extra_scratch_bytes).unwrap_or(0);
         let kernel = PackedInt4Kernel::detect(self.kernel).map_err(|_| CandidateError::Arguments)?;
         if self.input.as_os_str().is_empty()

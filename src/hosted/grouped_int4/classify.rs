@@ -1,7 +1,7 @@
 //! Complete exclusive/multi-label tasks on one charged resident INT4 model.
 //! No sampler, uncharged model import, second runtime or cross-head KV fork.
 use super::*;
-use crate::{native_engine::strict_int4::scoring::Int4ScoringBudget,
+use crate::{native_engine::strict_int4::{prefill::Int4PrefillLimits, scoring::Int4ScoringBudget},
     tasks::{classify::grouped_int4::{self, Int4ClassificationError, Int4ClassificationRun, PreparedInt4Classification},
         ir::TaskBudget}};
 
@@ -14,11 +14,25 @@ impl NlpEngine {
     pub fn execute_int4_classify(&self, model: &ResidentInt4, prepared: PreparedInt4Classification,
         native: NativeLimits, kernel: PackedInt4Kernel, cancellation: CancellationToken)
         -> Result<HostedOutput<Int4ClassificationRun>, HostedError> {
+        self.execute_int4_classify_scheduled(model, prepared, native, kernel, None, cancellation)
+    }
+    /// Opt in to bounded layer-major prompts for every classification head.
+    /// Extra workspace is admitted once alongside full native/output storage;
+    /// all work and result ownership remain within the same physical call.
+    pub fn execute_int4_classify_layer_major(&self, model: &ResidentInt4, prepared: PreparedInt4Classification,
+        native: NativeLimits, kernel: PackedInt4Kernel, prefill: Int4PrefillLimits,
+        cancellation: CancellationToken) -> Result<HostedOutput<Int4ClassificationRun>, HostedError> {
+        self.execute_int4_classify_scheduled(model, prepared, native, kernel, Some(prefill), cancellation)
+    }
+    fn execute_int4_classify_scheduled(&self, model: &ResidentInt4, prepared: PreparedInt4Classification,
+        native: NativeLimits, kernel: PackedInt4Kernel, prefill: Option<Int4PrefillLimits>,
+        cancellation: CancellationToken) -> Result<HostedOutput<Int4ClassificationRun>, HostedError> {
         dispatch::preflight(self, native.run)?;
         if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
         grouped_int4::check_model(prepared.execution_identity(), model.model_identity()).map_err(classification_error)?;
         if prepared.group_width() != model.model_identity().group_width() { return Err(HostedError::ModelIdentity); }
         let (required, scratch) = requirements(prepared.required_context(), prepared.task_budget(), native, prepared.group_width())?;
+        let scratch = super::prefill::with_extra_workspace(scratch, prefill)?;
         let work = prepared.planned_work();
         let task = prepared.task_budget();
         let lease = self.resources().acquire_lease();
@@ -36,9 +50,12 @@ impl NlpEngine {
             // Commit failure drops the actual result before releasing its
             // output reservation. All earlier head results are held privately.
             let result = allocate(output, || {
-                let result = prepared.execute_with_control(prepared.execution_identity(), &mut engine.value,
-                    Int4ScoringBudget { native: Int4RunBudget::exact(work), max_kv_bytes: required.kv_bytes }, control)
-                    .map_err(classification_error)?;
+                let budget = Int4ScoringBudget { native: Int4RunBudget::exact(work), max_kv_bytes: required.kv_bytes };
+                let result = match prefill {
+                    None => prepared.execute_with_control(prepared.execution_identity(), &mut engine.value, budget, control),
+                    Some(limits) => prepared.execute_layer_major_with_control(prepared.execution_identity(),
+                        &mut engine.value, budget, limits, control),
+                }.map_err(classification_error)?;
                 if result.model_work != work || result.head_count != prepared.head_count()
                     || result.group_width != prepared.group_width()
                     || engine.value.is_poisoned() || !engine.value.kv_cache().all_slots_have_len(0) {
@@ -130,5 +147,16 @@ mod tests {
         fn send<T: Send + 'static>() {}
         send::<PreparedInt4Classification>(); send::<Int4ClassificationRun>();
         send::<Int4ClassificationPlanner>();
+        let _grouped = NlpEngine::execute_int4_classify_layer_major;
+    }
+    #[test]
+    fn grouped_prompts_add_one_workspace_without_changing_full_kv_capacity() {
+        let (required, base) = requirements(100, task(), native(), 32).unwrap();
+        for rows in [1, 4, 64] {
+            let extra = Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
+            let limits = Int4PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: extra };
+            assert_eq!(super::super::prefill::with_extra_workspace(base, Some(limits)).unwrap(), base + extra);
+            assert_eq!(required.kv_bytes, task().max_kv_bytes);
+        }
     }
 }

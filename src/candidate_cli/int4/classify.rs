@@ -45,15 +45,33 @@ pub(super) fn definition() -> clap::Command {
     for &id in TEXT_ONLY { command = command.mut_arg(id, |arg| arg.hide(true)); }
     ScoringArgs::augment_args(command)
 }
+/// Reveal scheduling only on tasks wired to grouped native scoring.
+/// Shared corpus/job/resolution definitions retain their serial policy.
+pub(super) fn prefill_definition(command: clap::Command) -> clap::Command {
+    command.mut_arg("prefill_rows", |arg| arg.hide(false)
+        .help("Explicit INT4 layer-major prompt execution, 1..=64 rows; extra workspace is admitted once and reused between scoring heads"))
+}
 impl ScoringArgs {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-        if TEXT_ONLY.iter().any(|id| matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine)) {
+        if matches.value_source("prefill_rows") == Some(clap::parser::ValueSource::CommandLine) {
             return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
-                "INT4 finite-candidate tasks do not accept generation or prefill controls"));
+                "this INT4 scored workflow requires sequential prompt execution"));
+        }
+        Self::from_matches_with_prefill(matches)
+    }
+    pub(super) fn from_matches_with_prefill(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        if TEXT_ONLY.iter().filter(|&&id| id != "prefill_rows")
+            .any(|id| matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine)) {
+            return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
+                "INT4 finite-candidate tasks do not accept generation controls"));
         }
         Self::from_arg_matches(matches)
     }
     pub(super) fn validate(self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
+        if args.prefill()?.is_some() { return Err(CandidateError::Arguments); }
+        self.validate_with_prefill(args)
+    }
+    pub(super) fn validate_with_prefill(self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
         if !(2..=64).contains(&self.max_candidate_tokens) || self.max_candidate_tokens >= args.context_tokens
             || !(1..=MAX_CONTENT_BYTES).contains(&self.max_result_bytes)
             || !(1..=16 * 1024 * 1024).contains(&self.max_forward_positions)
@@ -70,7 +88,7 @@ impl ScoringArgs {
         // Bound repeated document/prompt/IR storage by the aggregate forward
         // ceiling, not by input bytes or just the longest live native context.
         let extra = sum(&[128 * MIB, self.max_forward_positions * 32, self.max_result_bytes as u64 * 16])?;
-        args.validate_storage(self.max_result_bytes, self.max_candidate_tokens,
+        args.validate_storage_with_prefill(self.max_result_bytes, self.max_candidate_tokens,
             args.context_tokens - self.max_candidate_tokens + 1, 0, extra)
     }
     pub(super) fn budget(self, limits: Int4Limits) -> TaskBudget {

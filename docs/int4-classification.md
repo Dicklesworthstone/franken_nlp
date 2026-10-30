@@ -64,8 +64,17 @@ prompt/IR storage bounded by aggregate forward positions, not just input bytes.
 Increasing that forward ceiling can require increasing preparation and process
 memory. The host charges the complete allocated KV capacity and output, but no
 sampler. Generation controls such as `--seed`, `--stop`, `--logprobs`,
-`--max-new-tokens`, `--max-output-bytes` and `--prefill-rows` are rejected, even
+`--max-new-tokens` and `--max-output-bytes` are rejected, even
 when explicitly supplied with default values. Use the scored-task flags instead.
+
+`--prefill-rows N` explicitly groups each scoring head's prompt into at most
+1 through 64 rows per native pass. Continuation scoring, EOS, probability
+denominators, work totals and the completed result remain unchanged. Extra
+scratch is admitted once and reused across independent heads; the host holds
+it through physical completion. Omitting the flag keeps sequential prompts.
+See [INT4 prefill](int4-prefill.md) for memory, cancellation and qualification
+boundaries. This option currently applies to the one-off classify, sentiment
+and judge commands; scored corpus and retained-job workflows remain serial.
 
 The command emits one completed source-candidate JSON envelope. Its `output`
 is the complete `Int4ClassificationRun`; provenance retains the existing

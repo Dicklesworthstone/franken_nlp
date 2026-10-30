@@ -11,7 +11,7 @@ mod tests;
 pub(super) struct JudgeArgs { scoring: classify::ScoringArgs }
 
 pub(super) fn definition() -> clap::Command {
-    classify::definition().name("judge")
+    classify::prefill_definition(classify::definition()).name("judge")
         .about("Run complete pairwise, rubric or faithfulness judgment with native grouped INT4")
         .long_about("Judge one bounded typed JSON request in pairwise, rubric or faithfulness mode with an explicit uncalibrated policy. Pairwise scores both presentation orders; rubric scores every criterion; faithfulness requires the full source to fit and retains every evidence window. Candidates include terminal EOS and full-vocabulary denominators. All heads, context, and five native work axes preflight before the first forward. No sampling, free text, thinking, tools, prompt/model overrides or silent backend fallback. Source conversion and independently digest-pinned snapshots share the same execution path. Only the completed judgment is published; one head failure publishes no partial result. Faithfulness is a model judgment, not a factuality certificate. Blocking IO observes the end-to-end deadline cooperatively.")
         .mut_arg("input", |arg| arg.help("Bounded pairwise/rubric/faithfulness JSON object; '-' reads stdin"))
@@ -20,10 +20,10 @@ pub(super) fn definition() -> clap::Command {
 }
 impl JudgeArgs {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-        Ok(Self { scoring: classify::ScoringArgs::from_matches(matches)? })
+        Ok(Self { scoring: classify::ScoringArgs::from_matches_with_prefill(matches)? })
     }
     pub(super) fn validate(self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
-        let mut limits = self.scoring.validate(args)?;
+        let mut limits = self.scoring.validate_with_prefill(args)?;
         // CLI input/planning/publication and hosted compiled input remain
         // separate charged owners during the complete native invocation.
         limits.minimum_memory_bytes = sum(&[limits.minimum_memory_bytes, limits.preparation_bytes])?;

@@ -1,7 +1,8 @@
 # Explicit grouped-INT4 prompt prefill
 
-`fnlp candidate source-int4 generate` and `chat` now accept `--prefill-rows N`
-for bounded layer-major execution of a single prompt. The value is 1 through
+`fnlp candidate source-int4 generate`, `chat`, `classify`, `sentiment` and
+`judge` accept `--prefill-rows N` for bounded layer-major prompt execution.
+Scored tasks group each independent head's prompt. The value is 1 through
 64. Without this flag the existing sequential path is unchanged. This is an
 explicit non-certified candidate, not automatic dispatch, a benchmark result,
 a numerical qualification, or an INT8 fallback.
@@ -31,8 +32,23 @@ Source verification, independent snapshot pins, optional create-new snapshot
 saving, tokenizer/template binding, input validation and the completed JSON
 envelope remain unchanged. A snapshot failure never starts source conversion.
 Prefill does not add a stream, a multi-request batch command or a new runtime.
-Classification still rejects `--prefill-rows`, including programmatically
-constructed scored requests. There is no silently ignored scheduling option.
+One-off classification, sentiment and judgment use the same explicit scheduling
+option with complete task and native work admission. Scored corpus/job commands,
+resolution, extraction and source tasks still reject it, including
+programmatically constructed requests. There is no silently ignored option.
+
+For an existing digest-pinned INT4 snapshot and a typed classification request:
+
+```sh
+fnlp candidate source-int4 classify request.json \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256_FROM_TRUSTED_CONVERSION" \
+  --memory-mib 8192 --group-width 128 --prefill-rows 4
+```
+
+The `sentiment` and `judge` commands accept the same option with their existing
+typed request files. Their complete multi-head preparation remains independently
+charged; every head must pass admission before the first model forward.
 
 ## Native execution and numerical contract
 
@@ -63,6 +79,14 @@ independent result finalizer. Model fingerprints, semantic execution identity,
 profile and completed result fields do not change with prompt scheduling.
 Algorithmic group-dot/MAC/attention counts still describe the same work, not a
 claim about retired instructions, memory traffic or speed.
+
+Finite-candidate scoring groups only the initial prompt of each head. The shared
+candidate scorer still owns every continuation, terminal EOS edge, probability
+denominator and trie branch. Backtracking retains one live KV branch, and heads
+clear their KV state before the next head. Classifications, independent sentiment
+axes, both pairwise judgment orders, rubric criteria and faithfulness evidence
+retain their original finalizers and exact whole-bundle work allowances. The
+same completed result contract applies to serial and grouped execution.
 
 ## Memory and cancellation
 
@@ -98,6 +122,12 @@ The explicit alternatives are:
 - `Int4GenerationPlan::execute_layer_major` / `execute_layer_major_with_sink`.
 - `PreparedInt4Chat::execute_layer_major` / `execute_layer_major_with_sink`.
 - `NlpEngine::execute_int4_chat_layer_major` for charged hosted execution.
+- `Int4CandidatePlan::execute_layer_major` for exact finite-language scoring.
+- `PreparedInt4Classification`, `PreparedInt4Sentiment` and `PreparedInt4Judge`
+  expose `execute_layer_major_with_control`.
+- `NlpEngine::execute_int4_classify_layer_major`,
+  `execute_int4_sentiment_layer_major` and `execute_int4_judge_layer_major`
+  reserve the extra scratch before entering the existing blocking invocation.
 
 Lower-level limits describe payload ceilings; they are not a substitute for a
 resource-domain reservation. The hosted method shares one implementation with

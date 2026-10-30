@@ -1,4 +1,4 @@
-//! Physical prompt scheduling for text tasks only. No semantic-policy change.
+//! Physical prompt scheduling for explicitly supported tasks. No semantic-policy change.
 use super::*;
 
 impl Int4Args {

@@ -68,4 +68,18 @@ fn sealed_plans_results_and_limits_cross_the_owned_host_boundary() {
     fn send<T: Send + 'static>() {}
     send::<PreparedInt4Sentiment>(); send::<Int4SentimentPlanner>(); send::<Int4SentimentRun>(); send::<Int4SentimentHostLimits>();
     let _host = NlpEngine::execute_int4_sentiment;
+    let _grouped = NlpEngine::execute_int4_sentiment_layer_major;
+}
+#[test]
+fn grouped_axis_prompts_share_one_extra_workspace_without_renewing_work() {
+    let (mut limits, task, head) = fixture(32);
+    let complete = head.checked_add(head).unwrap().checked_add(head).unwrap();
+    limits.max_model_work = complete;
+    let (required, base) = requirements(limits, task, 64, 32, complete).unwrap();
+    for rows in [1, 4, 64] {
+        let extra = Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
+        let prefill = Int4PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: extra };
+        assert_eq!(super::super::prefill::with_extra_workspace(base, Some(prefill)).unwrap(), base + extra);
+        assert_eq!(required.kv_bytes, task.max_kv_bytes);
+    }
 }

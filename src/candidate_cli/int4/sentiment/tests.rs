@@ -87,7 +87,7 @@ fn wire_input_cannot_replace_native_semantics_or_duplicate_an_axis() {
 fn generation_switches_and_invalid_ceilings_refuse_before_any_input_or_model_io() {
     for flags in [vec!["--max-new-tokens", "128"], vec!["--max-output-bytes", "65536"],
         vec!["--seed", "ab"], vec!["--temperature-milli", "1000"], vec!["--top-k", "1"],
-        vec!["--logprobs"], vec!["--prefill-rows", "1"], vec!["--min-new-tokens", "0"],
+        vec!["--logprobs"], vec!["--min-new-tokens", "0"],
         vec!["--stop", "END"], vec!["--ban-token", "7"], vec!["--logit-bias", "7=0"]] {
         let mut all = vec!["--source-dir", "d", "--source-manifest", "m"];
         all.extend(flags); assert!(parsed(&all).is_err());

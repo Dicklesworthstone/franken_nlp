@@ -1,7 +1,7 @@
 //! Complete independent sentiment dimensions under one charged INT4 invocation.
 use super::*;
 use crate::{
-    native_engine::strict_int4::{Int4Work, scoring::Int4ScoringBudget},
+    native_engine::strict_int4::{Int4Work, prefill::Int4PrefillLimits, scoring::Int4ScoringBudget},
     tasks::{ir::TaskBudget, sentiment::grouped_int4::{self, Int4SentimentError,
         Int4SentimentRun, PreparedInt4Sentiment}},
 };
@@ -22,6 +22,18 @@ impl NlpEngine {
     pub fn execute_int4_sentiment(&self, model: &ResidentInt4, prepared: PreparedInt4Sentiment,
         limits: Int4SentimentHostLimits, kernel: PackedInt4Kernel, cancellation: CancellationToken)
         -> Result<HostedOutput<Int4SentimentRun>, HostedError> {
+        self.execute_int4_sentiment_scheduled(model, prepared, limits, kernel, None, cancellation)
+    }
+    /// Admit one extra prompt workspace for all independent axes. Scoring
+    /// denominators, whole-bundle work and guarded delivery stay unchanged.
+    pub fn execute_int4_sentiment_layer_major(&self, model: &ResidentInt4, prepared: PreparedInt4Sentiment,
+        limits: Int4SentimentHostLimits, kernel: PackedInt4Kernel, prefill: Int4PrefillLimits,
+        cancellation: CancellationToken) -> Result<HostedOutput<Int4SentimentRun>, HostedError> {
+        self.execute_int4_sentiment_scheduled(model, prepared, limits, kernel, Some(prefill), cancellation)
+    }
+    fn execute_int4_sentiment_scheduled(&self, model: &ResidentInt4, prepared: PreparedInt4Sentiment,
+        limits: Int4SentimentHostLimits, kernel: PackedInt4Kernel, prefill: Option<Int4PrefillLimits>,
+        cancellation: CancellationToken) -> Result<HostedOutput<Int4SentimentRun>, HostedError> {
         dispatch::preflight(self, limits.native.run)?;
         if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
         grouped_int4::check_model(prepared.execution_identity(), model.model_identity()).map_err(sentiment_error)?;
@@ -29,6 +41,7 @@ impl NlpEngine {
         let work = prepared.planned_work();
         let (required, scratch_bytes) = requirements(limits, prepared.task_budget(),
             prepared.required_context(), prepared.group_width(), work)?;
+        let scratch_bytes = super::prefill::with_extra_workspace(scratch_bytes, prefill)?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, limits.preparation_reserve_bytes)?,
             || Ok(prepared))?;
@@ -46,9 +59,12 @@ impl NlpEngine {
                 }).map(|engine| engine.with_kernel(kernel)).map_err(native_error)
             })?;
             let result = allocate(output, || {
-                let result = input.value.execute_with_control(input.value.execution_identity(), &mut engine.value,
-                    Int4ScoringBudget { native: Int4RunBudget::exact(work), max_kv_bytes: required.kv_bytes }, control)
-                    .map_err(sentiment_error)?;
+                let budget = Int4ScoringBudget { native: Int4RunBudget::exact(work), max_kv_bytes: required.kv_bytes };
+                let result = match prefill {
+                    None => input.value.execute_with_control(input.value.execution_identity(), &mut engine.value, budget, control),
+                    Some(limits) => input.value.execute_layer_major_with_control(input.value.execution_identity(),
+                        &mut engine.value, budget, limits, control),
+                }.map_err(sentiment_error)?;
                 if result.model_work != work || result.head_count != input.value.head_count()
                     || result.group_width != input.value.group_width()
                     || engine.value.is_poisoned() || !engine.value.kv_cache().all_slots_have_len(0) {

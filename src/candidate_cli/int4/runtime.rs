@@ -69,13 +69,15 @@ impl Prepared {
                 SAMPLER_BYTES, kernel, limits, cancellation).map(Completed::Text),
             (Self::Classify(plan), None) => engine.execute_int4_classify(model, plan, native,
                 kernel, cancellation).map(Completed::Classify),
+            (Self::Classify(plan), Some(limits)) => engine.execute_int4_classify_layer_major(model, plan, native,
+                kernel, limits, cancellation).map(Completed::Classify),
             (Self::Extract { plan, vocabulary, masks, max_mask_node_visits }, None) =>
                 engine.execute_int4_extract(model, plan, vocabulary, native, masks,
                     max_mask_node_visits, kernel, cancellation).map(Completed::Extract),
             (Self::Source { plan, vocabulary, masks, max_mask_node_visits }, None) =>
                 engine.execute_int4_source_task(model, plan, vocabulary, native, masks,
                     max_mask_node_visits, kernel, cancellation).map(Completed::Source),
-            (Self::Classify(_) | Self::Extract { .. } | Self::Source { .. }, Some(_)) => return Err(CandidateError::Arguments),
+            (Self::Extract { .. } | Self::Source { .. }, Some(_)) => return Err(CandidateError::Arguments),
         }.map_err(|_| CandidateError::Execution)
     }
 }
@@ -91,7 +93,7 @@ pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
     if matches!(&task, Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::Semantic(_) | Int4Task::Resolve(_) | Int4Task::Sentiment(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ScoredBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_) | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob)
         || limits.minimum_memory_bytes > limits.memory_bytes || limits.kernel.kind() != args.kernel
         || !prefill::matches(&args, limits)?
-        || (!matches!(&task, Int4Task::Text(_)) && limits.prefill.is_some()) {
+        || (!matches!(&task, Int4Task::Text(_) | Int4Task::Classify(_)) && limits.prefill.is_some()) {
         return Err(CandidateError::Arguments);
     }
     let started = Instant::now();

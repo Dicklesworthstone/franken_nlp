@@ -63,8 +63,11 @@ pub(super) fn execute(host: &NlpEngine, model: &ResidentInt4, prepared: Prepared
 }
 fn workspace_bytes(required: Int4MemoryRequirement, sampler: u64, allocator: u64,
     prefill: Option<Int4PrefillLimits>) -> Result<u64, HostedError> {
+    with_extra_workspace(sum(&[required.rope_bytes, required.scratch_payload_bound, sampler, allocator])?, prefill)
+}
+pub(super) fn with_extra_workspace(base: u64, prefill: Option<Int4PrefillLimits>) -> Result<u64, HostedError> {
     let extra = prefill.map(Int4PrefillLimits::validate).transpose().map_err(native_error)?.unwrap_or(0);
-    sum(&[required.rope_bytes, required.scratch_payload_bound, sampler, allocator, extra])
+    sum(&[base, extra])
 }
 
 #[cfg(test)]
@@ -96,5 +99,8 @@ mod tests {
             max_batch_rows: 4, max_extra_scratch_bytes: exact - 1 })).is_err());
         assert!(workspace_bytes(need, u64::MAX, 1, None).is_err());
         assert!(workspace_bytes(need, 1, u64::MAX, None).is_err());
+        assert_eq!(with_extra_workspace(17, None).unwrap(), 17);
+        assert!(with_extra_workspace(u64::MAX, Some(Int4PrefillLimits {
+            max_batch_rows: 4, max_extra_scratch_bytes: exact })).is_err());
     }
 }

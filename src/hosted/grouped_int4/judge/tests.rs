@@ -97,4 +97,18 @@ fn sealed_plan_and_complete_result_can_cross_the_owned_host_boundary() {
     send::<PreparedInt4Judge>(); send::<Int4JudgePlanner>();
     send::<Int4JudgeRun>(); send::<Int4JudgeHostLimits>();
     let _host = NlpEngine::execute_int4_judge;
+    let _grouped = NlpEngine::execute_int4_judge_layer_major;
+}
+#[test]
+fn every_judgment_head_reuses_one_admitted_prompt_workspace() {
+    let (mut limits, task, head) = fixture(32);
+    let complete = head.checked_add(head).unwrap().checked_add(head).unwrap();
+    limits.max_model_work = complete;
+    let (required, base) = requirements(limits, task, 64, 32, complete).unwrap();
+    for rows in [1, 4, 64] {
+        let extra = Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
+        let prefill = Int4PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: extra };
+        assert_eq!(super::super::prefill::with_extra_workspace(base, Some(prefill)).unwrap(), base + extra);
+        assert_eq!(required.kv_bytes, task.max_kv_bytes);
+    }
 }

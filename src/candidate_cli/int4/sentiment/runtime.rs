@@ -103,8 +103,11 @@ pub(super) fn execute(args: Int4Args, command: SentimentArgs, _admitted: Int4Lim
                 cleanup_reserve_bytes: CLEANUP_BYTES } },
         preparation_reserve_bytes: limits.preparation_bytes, max_model_work: command.scoring.work_ceiling(),
     };
-    let result = engine.execute_int4_sentiment(&model, plan, host, limits.kernel, cancellation)
-        .map_err(execution_error)?;
+    let result = match limits.prefill {
+        None => engine.execute_int4_sentiment(&model, plan, host, limits.kernel, cancellation),
+        Some(prefill) => engine.execute_int4_sentiment_layer_major(&model, plan, host,
+            limits.kernel, prefill, cancellation),
+    }.map_err(execution_error)?;
     if result.result().model_work != expected_work || result.result().head_count != expected_heads
         || result.result().group_width != model.model_identity().group_width() {
         return Err(CandidateError::Execution);

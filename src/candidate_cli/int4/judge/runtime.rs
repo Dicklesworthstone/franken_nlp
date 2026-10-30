@@ -102,8 +102,11 @@ pub(super) fn execute(args: Int4Args, command: JudgeArgs, _admitted: Int4Limits,
                 cleanup_reserve_bytes: CLEANUP_BYTES } },
         preparation_reserve_bytes: limits.preparation_bytes, max_model_work: command.scoring.work_ceiling(),
     };
-    let result = engine.execute_int4_judge(&model, plan, host, limits.kernel, cancellation)
-        .map_err(execution_error)?;
+    let result = match limits.prefill {
+        None => engine.execute_int4_judge(&model, plan, host, limits.kernel, cancellation),
+        Some(prefill) => engine.execute_int4_judge_layer_major(&model, plan, host,
+            limits.kernel, prefill, cancellation),
+    }.map_err(execution_error)?;
     if result.result().schema_version != 1 || result.result().execution != INT4_JUDGE_EXECUTION
         || result.result().numerics_profile != STRICT_INT4_PROFILE || result_mode(&result.result().result) != mode
         || result.result().model_work != expected_work || result.result().head_count != expected_heads

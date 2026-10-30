@@ -11,7 +11,7 @@ mod tests;
 pub(super) struct SentimentArgs { scoring: classify::ScoringArgs }
 
 pub(super) fn definition() -> clap::Command {
-    classify::definition().name("sentiment")
+    classify::prefill_definition(classify::definition()).name("sentiment")
         .about("Score independent affect dimensions with native grouped INT4")
         .long_about("Score the requested valence, arousal, dominance and approach axes as independent exact five-bin continuation languages. Input is the same bounded typed {document, axes?, policy?} JSON object as candidate sentiment. Each candidate includes terminal EOS and every probability uses the full vocabulary denominator. Axes retain separate distributions, means, dispersion, entropy and explicit uncalibrated abstention; no joint emotion simplex or psychological measurement is implied. All requested heads, context, and five native work axes preflight before the first forward. No sampling, free text, thinking, tools, prompt/model overrides or silent backend fallback. Source conversion and independently digest-pinned snapshots share the same path. Only the completed bundle is published; one head failure publishes no partial result. Blocking IO observes the end-to-end deadline cooperatively.")
         .mut_arg("input", |arg| arg.help("Bounded sentiment JSON object; '-' reads stdin"))
@@ -20,10 +20,10 @@ pub(super) fn definition() -> clap::Command {
 }
 impl SentimentArgs {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-        Ok(Self { scoring: classify::ScoringArgs::from_matches(matches)? })
+        Ok(Self { scoring: classify::ScoringArgs::from_matches_with_prefill(matches)? })
     }
     pub(super) fn validate(self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
-        let mut limits = self.scoring.validate(args)?;
+        let mut limits = self.scoring.validate_with_prefill(args)?;
         // CLI preparation retains the typed input, planner and publication
         // staging while the host independently owns the compiled bundle.
         // Full context KV and native output are already priced by storage.
