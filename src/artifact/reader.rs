@@ -185,14 +185,43 @@ impl FnlpqRangeReader {
                 detail: "artifact must be a non-symlink regular file".to_owned(),
             });
         }
-        let mut file = File::open(path).map_err(|error| FnlpqReadError::Io {
+        let file = File::open(path).map_err(|error| FnlpqReadError::Io {
             operation: "open range reader",
             detail: error.to_string(),
         })?;
-        let observed_len = file.metadata().map_err(|error| FnlpqReadError::Io {
+        Self::from_file_with_checkpoint(file, checkpoint)
+    }
+
+    /// Authenticate a caller-owned regular-file handle without reopening a
+    /// pathname. The descriptor is retained for all subsequent range reads.
+    ///
+    /// The caller still owns filesystem immutability and path-publication
+    /// policy; a held descriptor prevents path replacement from changing the
+    /// file being checked, but does not prevent another writer from changing
+    /// its contents. A cloned descriptor may share its cursor with the caller.
+    pub fn from_file_with_checkpoint(
+        mut file: File,
+        mut checkpoint: impl FnMut() -> Option<DecodeCancellationKind>,
+    ) -> Result<Self, FnlpqReadError> {
+        read_checkpoint(&mut checkpoint)?;
+        if env::var_os("FNLP_MMAP").as_deref() == Some(std::ffi::OsStr::new("1")) {
+            return Err(FnlpqReadError::MmapUnavailable);
+        }
+        let metadata = file.metadata().map_err(|error| FnlpqReadError::Io {
             operation: "range-reader metadata",
             detail: error.to_string(),
-        })?.len();
+        })?;
+        if !metadata.is_file() {
+            return Err(FnlpqReadError::Io {
+                operation: "range-reader regular-file check",
+                detail: "artifact handle must refer to a regular file".to_owned(),
+            });
+        }
+        let observed_len = metadata.len();
+        file.seek(SeekFrom::Start(0)).map_err(|error| FnlpqReadError::Io {
+            operation: "seek range-reader prelude",
+            detail: error.to_string(),
+        })?;
         let mut fixed = [0_u8; PRELUDE_BYTES];
         file.read_exact(&mut fixed).map_err(|error| FnlpqReadError::Io {
             operation: "read range-reader prelude",
