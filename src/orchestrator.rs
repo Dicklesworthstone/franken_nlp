@@ -215,6 +215,7 @@ pub struct ResourceHostConfig {
     pub runtime_preset: RuntimePreset,
     pub runtime_workers: usize,
     pub max_blocking_coordinators: usize,
+    /// Zero permits coordinator-only execution with no scoped child threads.
     pub scoped_cpu_children_per_coordinator: usize,
     pub helper_threads: usize,
     pub thread_ceiling: usize,
@@ -304,10 +305,6 @@ impl ResourceHostConfig {
         for (field, value) in [
             ("runtime_workers", self.runtime_workers),
             ("max_blocking_coordinators", self.max_blocking_coordinators),
-            (
-                "scoped_cpu_children_per_coordinator",
-                self.scoped_cpu_children_per_coordinator,
-            ),
             ("thread_ceiling", self.thread_ceiling),
         ] {
             if value == 0 {
@@ -3593,6 +3590,119 @@ mod tests {
         assert_eq!(inventory.scoped_cpu_children_per_coordinator, 3);
         assert_eq!(inventory.helper_threads, 1);
         assert_eq!(inventory.total_runnable_threads, 13);
+    }
+
+    fn coordinator_only_config() -> ResourceHostConfig {
+        ResourceHostConfig::for_preset(RuntimePreset::CurrentThread, 1, 0, 0, 2, 1_000)
+            .expect("one runtime worker and one blocking coordinator fit two threads")
+    }
+
+    #[test]
+    fn coordinator_only_host_installs_and_reuses_the_exact_two_thread_inventory() {
+        let config = coordinator_only_config();
+        let expected = ThreadInventory {
+            runtime_workers: 1,
+            blocking_coordinators: 1,
+            scoped_cpu_children_per_coordinator: 0,
+            helper_threads: 0,
+            total_runnable_threads: 2,
+        };
+        assert_eq!(config.thread_inventory().unwrap(), expected);
+        assert_eq!(scoped_cpu_child_cap(1), Some(0));
+        assert_eq!(scoped_cpu_child_cap(0), None);
+        let broker = ResourceBroker::isolated_for_test();
+        let installed = broker
+            .install(config)
+            .expect("serial candidate host installs");
+        let reused = broker
+            .install(config)
+            .expect("same host configuration reuses the domain");
+        assert!(Arc::ptr_eq(&installed, &reused));
+        assert_eq!(installed.config(), config);
+        assert_eq!(installed.thread_inventory(), expected);
+    }
+
+    #[test]
+    fn coordinator_only_admission_still_rejects_missing_capacity_and_overflow_before_install() {
+        let broker = ResourceBroker::isolated_for_test();
+        for field in [
+            "runtime_workers",
+            "max_blocking_coordinators",
+            "thread_ceiling",
+        ] {
+            let mut invalid = coordinator_only_config();
+            match field {
+                "runtime_workers" => invalid.runtime_workers = 0,
+                "max_blocking_coordinators" => invalid.max_blocking_coordinators = 0,
+                _ => invalid.thread_ceiling = 0,
+            }
+            assert_eq!(
+                broker.install(invalid).unwrap_err(),
+                ResourceBrokerError::InvalidConfig(ResourceConfigError::ZeroThreadLimit { field })
+            );
+        }
+        let mut invalid = coordinator_only_config();
+        invalid.memory_ceiling_bytes = 0;
+        assert_eq!(
+            broker.install(invalid).unwrap_err(),
+            ResourceBrokerError::InvalidConfig(ResourceConfigError::ZeroMemoryCeiling)
+        );
+        invalid = coordinator_only_config();
+        invalid.thread_ceiling = 1;
+        assert_eq!(
+            broker.install(invalid).unwrap_err(),
+            ResourceBrokerError::InvalidConfig(ResourceConfigError::ThreadEnvelopeExceedsCeiling {
+                required: 2,
+                ceiling: 1,
+            })
+        );
+        for axis in 0..3 {
+            invalid = coordinator_only_config();
+            invalid.thread_ceiling = usize::MAX;
+            match axis {
+                0 => invalid.runtime_workers = usize::MAX,
+                1 => invalid.helper_threads = usize::MAX,
+                _ => {
+                    invalid.max_blocking_coordinators = 2;
+                    invalid.scoped_cpu_children_per_coordinator = usize::MAX;
+                }
+            }
+            assert_eq!(
+                broker.install(invalid).unwrap_err(),
+                ResourceBrokerError::InvalidConfig(ResourceConfigError::ThreadEnvelopeOverflow)
+            );
+        }
+        assert!(
+            broker.installed().is_none(),
+            "invalid envelopes must never install a host"
+        );
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn coordinator_only_team_drains_without_forming_any_child() {
+        let broker = ResourceBroker::isolated_for_test();
+        let resources = broker.install(coordinator_only_config()).unwrap();
+        let lease = resources.acquire_lease();
+        let mut handle = lease
+            .spawn_sealed_cpu_checkpoint_team(1)
+            .expect("effective width one executes on the admitted coordinator");
+        let joined = resources.runtime().block_on(async {
+            let request_cx = asupersync::cx::Cx::current().expect("owned request context");
+            handle.join(&request_cx).await
+        });
+        let joined = joined
+            .expect("blocking wrapper joins")
+            .expect("coordinator-only scope completes");
+        assert_eq!(joined.phase, SealedTeamPhase::Joined);
+        assert_eq!(joined.expected_children, 0);
+        assert_eq!(joined.formed_children, 0);
+        assert_eq!(joined.exited_children, 0);
+        assert_eq!(joined.drain_reason, Some(TeamDrainReason::Completed));
+        assert_eq!(
+            resources.outstanding_closure_snapshot().active_closures,
+            0
+        );
     }
 
     #[test]
