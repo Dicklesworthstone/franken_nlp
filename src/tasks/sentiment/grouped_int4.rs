@@ -23,6 +23,7 @@ use crate::{
 use super::{SentimentError, SentimentLimits, SentimentOptions, SentimentPlan, SentimentPlanner,
     SentimentPlanningError, SentimentRequest, SentimentResult, distribution::HeadPlan};
 mod model;
+pub mod cohort;
 pub use model::Int4SentimentPlanner;
 
 pub const INT4_SENTIMENT_EXECUTION: &str = "grouped-int4-independent-affect-heads-v1";

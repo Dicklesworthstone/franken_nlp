@@ -203,5 +203,6 @@ fn check_work_ceiling(work: Int4Work, budget: Int4RunBudget) -> Result<(), Int4C
 }
 
 mod model;
+pub mod cohort;
 pub use model::Int4ClassificationPlanner;
 #[cfg(test)] mod tests;

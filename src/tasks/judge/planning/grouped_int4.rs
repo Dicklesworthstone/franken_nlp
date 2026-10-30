@@ -15,6 +15,7 @@ use crate::native_engine::{
             Int4ScoringError, INT4_SCORING_EXECUTION}},
 };
 mod model;
+pub mod cohort;
 pub use model::Int4JudgePlanner;
 
 pub const INT4_JUDGE_EXECUTION: &str = "grouped-int4-complete-judge-prefix-heads-v1";
