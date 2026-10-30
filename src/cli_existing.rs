@@ -24,7 +24,8 @@ use crate::{
     artifact::fs_tx::open_ratified_model_root,
     artifact::package::{PackageRequest, package_model, verify_model_package},
     artifact::packing::{NativePackingTarget, TILE_TABLE_VERSION_V1},
-    artifact::pull::{LocalReconstructRequest, reconstruct_local_release},
+    artifact::pull::{LocalReconstructOptions, LocalReconstructRequest, PullError,
+        reconstruct_local_release_with_options},
     artifact::quantize::{GenericPanelBytes, encode_generic_panel},
     artifact::reader::FnlpqRangeReader,
     artifact::safetensors::{RowPanel, TensorCensusEntry},
@@ -148,12 +149,18 @@ struct ModelsReconstructCommand {
     /// Directory containing the exact immutable .partNN members.
     #[arg(long)]
     parts_dir: PathBuf,
-    /// New staging pathname in the same directory as --output.
+    /// Staging pathname in the same directory as --output; new unless --resume.
     #[arg(long)]
     staging_output: PathBuf,
     /// New final Generic .fnlpq pathname; existing files are never replaced.
     #[arg(long)]
     output: PathBuf,
+    /// Re-verify and resume an existing staging file without truncating it.
+    #[arg(long)]
+    resume: bool,
+    /// Maximum new bytes to copy in this invocation; a stopped run retains staging.
+    #[arg(long)]
+    max_copy_bytes: Option<u64>,
 }
 
 #[derive(clap::Args)]
@@ -410,29 +417,49 @@ fn run_models_command(command: ModelsSubcommand) -> ExitCode {
 }
 
 fn run_models_reconstruct(command: ModelsReconstructCommand) -> ExitCode {
-    match reconstruct_local_release(&LocalReconstructRequest {
+    let options = LocalReconstructOptions {
+        resume: command.resume,
+        max_new_bytes: command.max_copy_bytes,
+    };
+    match reconstruct_local_release_with_options(&LocalReconstructRequest {
         manifest: command.manifest,
         expected_release_manifest_sha256: command.manifest_sha256,
         parts_dir: command.parts_dir,
         staging_output: command.staging_output,
         output: command.output,
-    }) {
+    }, &options, |_| None) {
         Ok(report) => {
             eprintln!(
-                "MODELS_RECONSTRUCT RESULT=PASS output={} staging={} artifact_bytes={} artifact_sha256={} manifest_sha256={} parts={} directory_durability=unconfirmed",
+                "MODELS_RECONSTRUCT RESULT=PASS output={} staging={} artifact_bytes={} artifact_sha256={} manifest_sha256={} parts={} resumed_bytes={} copied_bytes={} directory_durability=unconfirmed",
                 report.output.display(),
                 report.staging_output.display(),
                 report.artifact_bytes,
                 report.artifact_sha256,
                 report.release_manifest_sha256,
                 report.part_count,
+                report.resumed_bytes,
+                report.copied_bytes,
             );
             ExitCode::SUCCESS
         }
         Err(error) => {
             eprintln!("MODELS_RECONSTRUCT RESULT=FAIL reason={error}");
-            ErrorCode::ArtifactIntegrityOrFormatOrVersion.as_process_exit()
+            reconstruct_error_code(&error).as_process_exit()
         }
+    }
+}
+
+fn reconstruct_error_code(error: &PullError) -> ErrorCode {
+    use crate::native_engine::decode::DecodeCancellationKind;
+    match error {
+        PullError::CopyBudgetExceeded { .. } => ErrorCode::BudgetOrTimeout,
+        PullError::Cancelled { cause, .. } => match cause {
+            DecodeCancellationKind::Timeout | DecodeCancellationKind::Deadline
+                | DecodeCancellationKind::PollQuota | DecodeCancellationKind::CostBudget => ErrorCode::BudgetOrTimeout,
+            DecodeCancellationKind::ResourceUnavailable => ErrorCode::AdmissionOrResourceLimit,
+            _ => ErrorCode::Cancelled,
+        },
+        _ => ErrorCode::ArtifactIntegrityOrFormatOrVersion,
     }
 }
 
@@ -2210,6 +2237,45 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn models_reconstruct_resume_and_new_copy_budget_are_explicit() {
+        for (flags, resume, budget) in [
+            (vec![], false, None),
+            (vec!["--resume"], true, None),
+            (vec!["--max-copy-bytes", "137"], false, Some(137)),
+            (vec!["--resume", "--max-copy-bytes", "0"], true, Some(0)),
+        ] {
+            let mut args = vec!["fnlp", "models", "reconstruct", "--manifest", "/release/manifest.json",
+                "--manifest-sha256", "abababababababababababababababababababababababababababababababab",
+                "--parts-dir", "/release", "--staging-output", "/models/model.stage",
+                "--output", "/models/model.fnlpq"];
+            args.extend(flags);
+            let parsed = Cli::try_parse_from(args).unwrap();
+            let Some(Command::Models { command: ModelsSubcommand::Reconstruct(command) }) = parsed.command
+                else { panic!("wrong reconstruction route"); };
+            assert_eq!(command.resume, resume);
+            assert_eq!(command.max_copy_bytes, budget);
+        }
+    }
+
+    #[test]
+    fn models_reconstruct_budget_and_cancellation_keep_their_exit_categories() {
+        use crate::{artifact::pull::{LocalReconstructPhase, LocalReconstructProgress, PullError},
+            native_engine::decode::DecodeCancellationKind as Cause};
+        assert_eq!(super::reconstruct_error_code(&PullError::CopyBudgetExceeded {
+            limit: 137, copied_bytes: 137, retained_bytes: 137, artifact_bytes: 1000,
+        }), crate::error::ErrorCode::BudgetOrTimeout);
+        let progress = LocalReconstructProgress { phase: LocalReconstructPhase::VerifyPrefix,
+            part_index: Some(0), verified_prefix_bytes: 0, copied_bytes: 0, artifact_bytes: 1000 };
+        for (cause, code) in [(Cause::Deadline, crate::error::ErrorCode::BudgetOrTimeout),
+            (Cause::User, crate::error::ErrorCode::Cancelled),
+            (Cause::ResourceUnavailable, crate::error::ErrorCode::AdmissionOrResourceLimit)] {
+            assert_eq!(super::reconstruct_error_code(&PullError::Cancelled { cause, progress }), code);
+        }
+        assert_eq!(super::reconstruct_error_code(&PullError::ResumePrefixMismatch { part: 0, offset: 13 }),
+            crate::error::ErrorCode::ArtifactIntegrityOrFormatOrVersion);
     }
 
     #[test]
