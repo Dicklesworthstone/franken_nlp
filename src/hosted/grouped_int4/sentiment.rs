@@ -5,6 +5,8 @@ use crate::{
     tasks::{ir::TaskBudget, sentiment::grouped_int4::{self, Int4SentimentError,
         Int4SentimentRun, PreparedInt4Sentiment}},
 };
+mod long;
+pub use long::Int4SentimentMapHostConfig;
 
 /// Complete-bundle work and input ownership. Before transfer, callers admit
 /// the compiled plan's storage. The host retains its own explicit preparation

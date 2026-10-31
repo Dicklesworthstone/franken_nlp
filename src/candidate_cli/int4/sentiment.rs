@@ -43,7 +43,7 @@ impl SentimentArgs {
     }
 }
 
-fn parse_request(text: &str, budget: TaskBudget, cap: usize)
+pub(super) fn parse_request(text: &str, budget: TaskBudget, cap: usize)
     -> Result<(SentimentRequest, SentimentPolicy), CandidateError> {
     use crate::candidate_cli::scored::{self, Kind, Request};
     match scored::request(Kind::Sentiment, text, budget, cap)? {

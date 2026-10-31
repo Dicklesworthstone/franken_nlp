@@ -12,7 +12,7 @@ pub use assay_ner::{Int4NerAssayHostLimits, Int4NerAssayHostRequirements};
 mod assay_extract;
 pub use assay_extract::{Int4ExtractAssayHostLimits, Int4ExtractAssayHostRequirements};
 mod sentiment;
-pub use sentiment::Int4SentimentHostLimits;
+pub use sentiment::{Int4SentimentHostLimits, Int4SentimentMapHostConfig};
 mod judge;
 pub use judge::Int4JudgeHostLimits;
 mod resolve;
@@ -98,6 +98,7 @@ pub enum Int4HostError {
     Source(ConverterError), Model(Int4ModelError), Native(StrictInt4Error), Chat(Int4ChatError),
     Snapshot(Int4SnapshotError), Classification(Int4ClassificationError),
     Sentiment(crate::tasks::sentiment::grouped_int4::Int4SentimentError),
+    SentimentMap(crate::tasks::sentiment::grouped_int4::long::Int4SentimentMapError),
     Judge(crate::tasks::judge::grouped_int4::Int4JudgeError),
     Resolution(crate::corpus::native_resolve::grouped_int4::Int4ResolveError),
     Entities(crate::corpus::entities_int4::Int4EntityError),
@@ -120,6 +121,7 @@ impl fmt::Display for Int4HostError {
             Self::Snapshot(_) => "INT4 local snapshot loading or persistence refused",
             Self::Classification(_) => "INT4 classification execution or finalization refused",
             Self::Sentiment(_) => "INT4 sentiment execution or finalization refused",
+            Self::SentimentMap(_) => "INT4 complete-document sentiment mapping or aggregation refused",
             Self::Judge(_) => "INT4 complete judgment execution or finalization refused",
             Self::Resolution(_) => "INT4 entity resolution scoring or clustering refused",
             Self::Entities(_) => "INT4 original-document entity discovery or resolution refused",
@@ -141,7 +143,8 @@ impl Error for Int4HostError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self { Self::Source(e) => Some(e), Self::Model(e) => Some(e), Self::Native(e) => Some(e),
             Self::Chat(e) => Some(e), Self::Snapshot(e) => Some(e), Self::Classification(e) => Some(e),
-            Self::Sentiment(e) => Some(e), Self::Judge(e) => Some(e), Self::Resolution(e) => Some(e),
+            Self::Sentiment(e) => Some(e), Self::SentimentMap(e) => Some(e),
+            Self::Judge(e) => Some(e), Self::Resolution(e) => Some(e),
             Self::Entities(e) => Some(e), Self::Redaction(e) => Some(e),
             Self::Extraction(e) => Some(e), Self::ExtractionMap(e) => Some(e), Self::SourceTask(e) => Some(e),
             Self::SemanticExtraction(e) => Some(e),
