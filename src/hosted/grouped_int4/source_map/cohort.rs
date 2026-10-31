@@ -5,6 +5,7 @@ use crate::tasks::source_planning::grouped_int4::long::cohort::{
     Int4SourceMapCohortRequirement, Int4SourceMapCohortRun,
 };
 mod aggregate;
+pub(in crate::hosted::grouped_int4::source_map) mod synthesis;
 
 impl<T> Int4SourceMapConfig<T> {
     /// Pre-IO peak for a simultaneous native source-map window. Full document
@@ -21,6 +22,16 @@ impl<T> Int4SourceMapConfig<T> {
             max_output_tokens_per_chunk: u64::from(self.budget.max_output_tokens),
             max_result_bytes_per_chunk: self.budget.max_output_bytes,
         }.requirements(group_width).map_err(map_error)
+    }
+
+    /// Complete phase peak: discovery windows and the full dependent-pass
+    /// context execute sequentially under the same native resource owners.
+    /// Task KV authority remains per row and is never multiplied by batching.
+    pub fn synthesis_cohort_requirements(&self, group_width: usize)
+        -> Result<Int4SourceMapCohortRequirement, HostedError> {
+        self.cohort_requirements(group_width)?
+            .with_synthesis_context(self.native.context_tokens, group_width, self.budget.max_kv_bytes)
+            .map_err(map_error)
     }
 }
 

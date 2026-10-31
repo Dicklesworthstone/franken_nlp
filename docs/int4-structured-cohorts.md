@@ -158,6 +158,22 @@ shared-layer windows, then enter the same evidence collection, final synthesis
 and hierarchy reducers as serial discovery. Hierarchy passes remain scalar;
 every level still admits its complete frontier before its first forward.
 
+The hosted entrypoints share one physical resource owner and use the same
+task-specific configuration and hierarchy limits as their serial equivalents:
+
+- `NlpEngine::synthesize_int4_source_summary_cohorts`
+- `NlpEngine::synthesize_int4_source_summary_hierarchy_cohorts`
+- `NlpEngine::synthesize_int4_document_answer_cohorts`
+- `NlpEngine::synthesize_int4_document_answer_hierarchy_cohorts`
+
+`Int4SourceMapConfig::synthesis_cohort_requirements(group_width)` quotes the
+complete declared native phase peak. The host additionally reserves the full
+source and private question capture, preparation, evidence frontier, verifier
+storage and retained output. Summary output retains discovery transcripts plus
+one final pass or every permitted hierarchy pass. Flat answer output retains
+text and citations; hierarchical answer output also retains every additional
+pass's native transcript. Each mode charges those actual output obligations.
+
 Each result keeps the complete existing synthesis result under `.document` and
 reports only discovery's physical grouping under `.discovery_cohorts`. The
 generic envelope is `Int4SynthesisCohortRun<T>`; the four task-specific aliases

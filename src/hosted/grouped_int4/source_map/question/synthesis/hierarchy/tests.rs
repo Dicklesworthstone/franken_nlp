@@ -171,5 +171,28 @@ fn the_whole_private_owner_and_complete_result_cross_the_existing_host() {
     send::<Int4SourceMapConfig<SourceQuestionSynthesis>>();
     send::<Charged<SourceMapInput<SourceQuestionSynthesis>>>();
     send::<Int4QuestionHierarchyRun>();
+    send::<HostedOutput<Int4QuestionHierarchyCohortRun>>();
     let _method = NlpEngine::synthesize_int4_document_answer_hierarchy;
+    let _cohorts = NlpEngine::synthesize_int4_document_answer_hierarchy_cohorts;
+}
+
+#[test]
+fn discovery_cohort_adapter_keeps_question_and_all_retained_hierarchy_transcripts() {
+    use native_cohorts::SynthesisMode;
+    let (planner, mut config) = fixture(32);
+    let hierarchy = QuestionHierarchyLimits { max_passes: 4, max_levels: 3, ..Default::default() };
+    let budget = config.budget;
+    let workspace = config.question_hierarchy_workspace_bytes(7, hierarchy).unwrap();
+    config.mapping.reduction.map_batch_chunks = 4;
+    let row = hierarchy.requirements(&config, 32, 32, &planner).unwrap();
+    assert_eq!(config.synthesis_cohort_requirements(32).unwrap().native.kv_bytes, 4 * row.kv_bytes);
+    assert_eq!(hierarchy.workspace_bytes(&config, 7).unwrap(), workspace);
+    assert_eq!(hierarchy.output_tokens(&config, 7).unwrap(), 4 * u64::from(budget.max_output_tokens));
+    let mut question = String::with_capacity(8192); question.push_str("Who?");
+    config.task.question.question = question;
+    assert_eq!(hierarchy.input_bytes(4096, &config).unwrap(),
+        4096 + config.task.question.question.capacity() as u64 + config.preparation_reserve_bytes);
+    assert_eq!(config.budget, budget);
+    let invalid = QuestionHierarchyLimits { max_passes: 0, ..hierarchy };
+    assert!(invalid.requirements(&config, 32, 32, &planner).is_err());
 }

@@ -145,5 +145,25 @@ fn hierarchy_reuses_the_same_sendable_charged_owner_and_blocking_host() {
     fn send<T: Send + 'static>() {}
     send::<Charged<SourceMapInput<SourceSummarySynthesis>>>();
     send::<SummaryHierarchyLimits>();
+    send::<HostedOutput<Int4SummaryHierarchyCohortRun>>();
     let _method = NlpEngine::synthesize_int4_source_summary_hierarchy;
+    let _cohorts = NlpEngine::synthesize_int4_source_summary_hierarchy_cohorts;
+}
+
+#[test]
+fn discovery_cohort_adapter_keeps_every_hierarchy_pass_in_workspace_and_output() {
+    use native_cohorts::SynthesisMode;
+    let (planner, mut config) = fixture(32);
+    let hierarchy = SummaryHierarchyLimits { max_passes: 4, max_levels: 3, ..Default::default() };
+    let budget = config.budget;
+    let workspace = config.summary_hierarchy_workspace_bytes(7, hierarchy).unwrap();
+    config.mapping.reduction.map_batch_chunks = 4;
+    let row = hierarchy.requirements(&config, 32, 32, &planner).unwrap();
+    assert_eq!(config.synthesis_cohort_requirements(32).unwrap().native.kv_bytes, 4 * row.kv_bytes);
+    assert_eq!(hierarchy.workspace_bytes(&config, 7).unwrap(), workspace);
+    assert_eq!(hierarchy.output_tokens(&config, 7).unwrap(), 11 * u64::from(budget.max_output_tokens));
+    assert_eq!(hierarchy.input_bytes(8192, &config).unwrap(), 8192 + config.preparation_reserve_bytes);
+    assert_eq!(config.budget, budget);
+    let invalid = SummaryHierarchyLimits { max_passes: 0, ..hierarchy };
+    assert!(invalid.requirements(&config, 32, 32, &planner).is_err());
 }

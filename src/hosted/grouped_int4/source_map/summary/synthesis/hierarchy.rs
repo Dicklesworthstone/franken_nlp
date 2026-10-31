@@ -1,7 +1,8 @@
 //! Bounded evidence-only levels on one physically owned native INT4 engine.
 use super::*;
 use crate::tasks::source_planning::grouped_int4::long::summary::synthesis::hierarchy::{
-    Int4SummaryHierarchyRun, SummaryHierarchyLimits,
+    Int4SummaryHierarchyRun, SummaryHierarchyLimits, PreparedInt4SummaryHierarchy,
+    cohort::Int4SummaryHierarchyCohortRun,
 };
 
 impl<T: std::borrow::Borrow<SourceSummarySynthesis>> Int4SourceMapConfig<T> {
@@ -26,6 +27,18 @@ impl<T: std::borrow::Borrow<SourceSummarySynthesis>> Int4SourceMapConfig<T> {
 }
 
 impl NlpEngine {
+    /// Batch only the independent discovery maps of an explicitly bounded
+    /// quotation hierarchy. Every dependent level keeps its serial numerics,
+    /// complete evidence frontier, shared work budget and original citations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_int4_source_summary_hierarchy_cohorts(&self, model: &ResidentInt4,
+        source: String, planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: Int4SourceMapConfig<SourceSummarySynthesis>, hierarchy: SummaryHierarchyLimits,
+        kernel: PackedInt4Kernel, cancellation: CancellationToken)
+        -> Result<HostedOutput<Int4SummaryHierarchyCohortRun>, HostedError> {
+        native_cohorts::execute(self, model, source, planner, vocabulary, config, hierarchy, kernel, cancellation)
+    }
+
     /// Explicit lossy quotation selection over context-sized levels. Every
     /// level consumes its complete ordered frontier; only source-verified
     /// quotations may enter the next one. All native passes and their original
@@ -124,6 +137,53 @@ fn hierarchy_output_tokens(chunks: usize, per_pass: u32, hierarchy: SummaryHiera
     (chunks as u64).checked_add(hierarchy.max_passes as u64)
         .and_then(|count| count.checked_mul(u64::from(per_pass)))
         .ok_or(HostedError::Limits("INT4 summary hierarchy output token arithmetic"))
+}
+
+impl native_cohorts::SynthesisMode for SummaryHierarchyLimits {
+    type Task = SourceSummarySynthesis;
+    type Output = Int4SummaryHierarchyCohortRun;
+    type Prepared<'s> = PreparedInt4SummaryHierarchy<'s>;
+    fn requirements(self, config: &Int4SourceMapConfig<Self::Task>, source_bytes: usize,
+        width: usize, planner: &SourceTaskPlanner) -> Result<Int4MemoryRequirement, HostedError> {
+        hierarchy_requirements(config, self, source_bytes, width, planner)
+    }
+    fn input_bytes(self, source_capacity: usize, config: &Int4SourceMapConfig<Self::Task>)
+        -> Result<u64, HostedError> {
+        sum(&[source_capacity as u64, config.preparation_reserve_bytes])
+    }
+    fn workspace_bytes(self, config: &Int4SourceMapConfig<Self::Task>, chunks: usize) -> Result<u64, HostedError> {
+        config.summary_hierarchy_workspace_bytes(chunks, self)
+    }
+    fn output_tokens(self, config: &Int4SourceMapConfig<Self::Task>, chunks: usize) -> Result<u64, HostedError> {
+        hierarchy_output_tokens(chunks, config.budget.max_output_tokens, self)
+    }
+    fn prepare<'s, C: DecodeStepControl>(self, source: &'s str, planner: &SourceTaskPlanner,
+        config: &Int4SourceMapConfig<Self::Task>, context: &PlanContext<'_>, width: usize, control: &mut C)
+        -> Result<Self::Prepared<'s>, HostedError> {
+        planner.plan_int4_summary_hierarchy_with_control(source, config.task, self, config.budget,
+            context, config.planning, config.mapping, width, control).map_err(map_error)
+    }
+}
+impl native_cohorts::SynthesisPlan for PreparedInt4SummaryHierarchy<'_> {
+    type Output = Int4SummaryHierarchyCohortRun;
+    fn group_width(&self) -> usize { self.group_width() }
+    fn source_chunks(&self) -> usize { self.preflight_metadata().chunk_count() }
+    fn native_chunks(&self) -> usize { self.preflight_metadata().chunk_count() }
+    fn max_kv_bytes(&self) -> u64 { self.max_kv_bytes() }
+    fn max_result_bytes(&self) -> u64 { self.max_result_bytes() }
+    fn execution_identities(&self) -> impl ExactSizeIterator<Item = &ExecutionIdentity> { self.execution_identities() }
+    fn cohort_requirements(&self, context_limit: usize) -> Result<Int4SourceMapCohortRequirement, Int4SourceMapError> {
+        self.cohort_requirements(context_limit)
+    }
+    fn run<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity], planner: &SourceTaskPlanner,
+        weights: &Int4ModelWeights, vocabulary: &ExtractionVocabulary, budget: Int4SourceMapCohortBudget,
+        kernel: PackedInt4Kernel, control: &mut C) -> Result<Self::Output, HostedError> {
+        let expected = self.preflight_metadata();
+        let result = self.execute_cohorts_with_control(admitted, planner, weights, vocabulary, budget, kernel, control)
+            .map_err(map_error)?;
+        expected.verify_completed(&result.document).map_err(map_error)?;
+        Ok(result)
+    }
 }
 
 #[cfg(test)]

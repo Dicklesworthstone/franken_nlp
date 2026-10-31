@@ -163,5 +163,28 @@ fn whole_synthesis_capture_is_sendable_and_uses_existing_host() {
     fn send<T: Send + 'static>() {}
     send::<Int4SourceMapConfig<SourceSummarySynthesis>>();
     send::<Charged<SourceMapInput<SourceSummarySynthesis>>>();
+    send::<HostedOutput<Int4SummarySynthesisCohortRun>>();
     let _method = NlpEngine::synthesize_int4_source_summary;
+    let _cohorts = NlpEngine::synthesize_int4_source_summary_cohorts;
+}
+
+#[test]
+fn discovery_cohort_adapter_keeps_full_summary_frontier_and_final_transcript_charges() {
+    use native_cohorts::SynthesisMode;
+    for width in [32, 128] {
+        let (planner, mut config) = fixture(width);
+        let mode = SummarySynthesisMode;
+        let budget = config.budget;
+        let workspace = config.summary_synthesis_workspace_bytes(7).unwrap();
+        config.mapping.reduction.map_batch_chunks = 4;
+        let row = mode.requirements(&config, 32, width, &planner).unwrap();
+        let peak = config.synthesis_cohort_requirements(width).unwrap();
+        assert_eq!(peak.native.kv_bytes, 4 * row.kv_bytes);
+        assert_eq!(mode.workspace_bytes(&config, 7).unwrap(), workspace);
+        assert_eq!(mode.output_tokens(&config, 7).unwrap(), 8 * u64::from(budget.max_output_tokens));
+        assert_eq!(mode.input_bytes(8192, &config).unwrap(), 8192 + config.preparation_reserve_bytes);
+        assert_eq!(config.budget, budget);
+        config.task.synthesis_options.max_bullets = 0;
+        assert!(mode.requirements(&config, 32, width, &planner).is_err());
+    }
 }

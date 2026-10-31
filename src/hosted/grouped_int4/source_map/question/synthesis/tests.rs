@@ -177,5 +177,30 @@ fn entire_private_synthesis_owner_can_enter_the_existing_host() {
     fn send<T: Send + 'static>() {}
     send::<Int4SourceMapConfig<SourceQuestionSynthesis>>();
     send::<Charged<SourceMapInput<SourceQuestionSynthesis>>>();
+    send::<HostedOutput<Int4QuestionSynthesisCohortRun>>();
     let _method = NlpEngine::synthesize_int4_document_answer;
+    let _cohorts = NlpEngine::synthesize_int4_document_answer_cohorts;
+}
+
+#[test]
+fn discovery_cohort_adapter_keeps_private_question_capacity_and_complete_frontier() {
+    use native_cohorts::SynthesisMode;
+    for width in [32, 128] {
+        let (planner, mut config) = fixture(width);
+        let mode = QuestionSynthesisMode;
+        let budget = config.budget;
+        let workspace = config.question_synthesis_workspace_bytes(7).unwrap();
+        config.mapping.reduction.map_batch_chunks = 4;
+        let row = mode.requirements(&config, 32, width, &planner).unwrap();
+        assert_eq!(config.synthesis_cohort_requirements(width).unwrap().native.kv_bytes, 4 * row.kv_bytes);
+        assert_eq!(mode.workspace_bytes(&config, 7).unwrap(), workspace);
+        assert_eq!(mode.output_tokens(&config, 7).unwrap(), 0);
+        let mut question = String::with_capacity(8192); question.push_str("Who?");
+        config.task.question.question = question;
+        assert_eq!(mode.input_bytes(4096, &config).unwrap(),
+            4096 + config.task.question.question.capacity() as u64 + config.preparation_reserve_bytes);
+        assert_eq!(config.budget, budget);
+        config.task.question.verification.max_fields = 0;
+        assert!(mode.requirements(&config, 32, width, &planner).is_err());
+    }
 }

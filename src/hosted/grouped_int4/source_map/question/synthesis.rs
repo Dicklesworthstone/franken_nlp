@@ -1,7 +1,10 @@
 //! Physically owned discovery and a final evidence-only INT4 answer.
 use super::*;
-use crate::tasks::source_planning::grouped_int4::long::question::synthesis::{
-    Int4QuestionSynthesisRun, SourceQuestionSynthesis,
+use super::super::cohort::synthesis as native_cohorts;
+use crate::tasks::source_planning::grouped_int4::long::{
+    cohort::{Int4SourceMapCohortBudget, Int4SourceMapCohortRequirement},
+    question::synthesis::{Int4QuestionSynthesisRun, SourceQuestionSynthesis, PreparedInt4QuestionSynthesis,
+        cohort::Int4QuestionSynthesisCohortRun},
 };
 mod hierarchy;
 
@@ -32,6 +35,18 @@ impl<T: std::borrow::Borrow<SourceQuestionSynthesis>> Int4SourceMapConfig<T> {
 }
 
 impl NlpEngine {
+    /// Share native layers across the independent nonblank discovery chunks,
+    /// then answer from every verified quotation with the original serial pass.
+    /// Private question/source owners and full phase admission survive both.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_int4_document_answer_cohorts(&self, model: &ResidentInt4, source: String,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: Int4SourceMapConfig<SourceQuestionSynthesis>, kernel: PackedInt4Kernel,
+        cancellation: CancellationToken) -> Result<HostedOutput<Int4QuestionSynthesisCohortRun>, HostedError> {
+        native_cohorts::execute(self, model, source, planner, vocabulary, config,
+            QuestionSynthesisMode, kernel, cancellation)
+    }
+
     /// Answer a single private question using every collected verbatim citation
     /// from a complete source-document map. Map answers remain inspectable;
     /// they are never presented to the final model as factual source material.
@@ -136,6 +151,56 @@ fn synthesis_input_bytes(source_capacity: usize, config: &Int4SourceMapConfig<So
     -> Result<u64, HostedError> {
     sum(&[source_capacity as u64, config.task.question.question.capacity() as u64,
         config.preparation_reserve_bytes])
+}
+
+#[derive(Clone, Copy)]
+struct QuestionSynthesisMode;
+impl native_cohorts::SynthesisMode for QuestionSynthesisMode {
+    type Task = SourceQuestionSynthesis;
+    type Output = Int4QuestionSynthesisCohortRun;
+    type Prepared<'s> = PreparedInt4QuestionSynthesis<'s>;
+    fn requirements(self, config: &Int4SourceMapConfig<Self::Task>, source_bytes: usize,
+        width: usize, planner: &SourceTaskPlanner) -> Result<Int4MemoryRequirement, HostedError> {
+        synthesis_requirements(config, source_bytes, width, planner)
+    }
+    fn input_bytes(self, source_capacity: usize, config: &Int4SourceMapConfig<Self::Task>)
+        -> Result<u64, HostedError> {
+        synthesis_input_bytes(source_capacity, config)
+    }
+    fn workspace_bytes(self, config: &Int4SourceMapConfig<Self::Task>, chunks: usize) -> Result<u64, HostedError> {
+        config.question_synthesis_workspace_bytes(chunks)
+    }
+    fn output_tokens(self, _: &Int4SourceMapConfig<Self::Task>, _: usize) -> Result<u64, HostedError> {
+        // Neither discovery nor the flat final answer retains native token IDs.
+        Ok(0)
+    }
+    fn prepare<'s, C: DecodeStepControl>(self, source: &'s str, planner: &SourceTaskPlanner,
+        config: &Int4SourceMapConfig<Self::Task>, context: &PlanContext<'_>, width: usize, control: &mut C)
+        -> Result<Self::Prepared<'s>, HostedError> {
+        planner.plan_int4_question_synthesis_with_control(source, &config.task, config.budget,
+            context, config.planning, config.mapping, width, control).map_err(map_error)
+    }
+}
+impl native_cohorts::SynthesisPlan for PreparedInt4QuestionSynthesis<'_> {
+    type Output = Int4QuestionSynthesisCohortRun;
+    fn group_width(&self) -> usize { self.group_width() }
+    fn source_chunks(&self) -> usize { self.preflight_metadata().discovery().chunk_count() }
+    fn native_chunks(&self) -> usize { self.preflight_metadata().discovery().native_chunks() }
+    fn max_kv_bytes(&self) -> u64 { self.max_kv_bytes() }
+    fn max_result_bytes(&self) -> u64 { self.max_result_bytes() }
+    fn execution_identities(&self) -> impl ExactSizeIterator<Item = &ExecutionIdentity> { self.execution_identities() }
+    fn cohort_requirements(&self, context_limit: usize) -> Result<Int4SourceMapCohortRequirement, Int4SourceMapError> {
+        self.cohort_requirements(context_limit)
+    }
+    fn run<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity], planner: &SourceTaskPlanner,
+        weights: &Int4ModelWeights, vocabulary: &ExtractionVocabulary, budget: Int4SourceMapCohortBudget,
+        kernel: PackedInt4Kernel, control: &mut C) -> Result<Self::Output, HostedError> {
+        let expected = self.preflight_metadata();
+        let result = self.execute_cohorts_with_control(admitted, planner, weights, vocabulary, budget, kernel, control)
+            .map_err(map_error)?;
+        expected.verify_completed(&result.document).map_err(map_error)?;
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
