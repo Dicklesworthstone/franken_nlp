@@ -152,7 +152,7 @@ success; a drained stream can still contain rejected documents.
 ## Chunks of one long document
 
 `candidate source-int4 extract-map`, `ner-map`, `keyphrases-map` (including
-`--reduce-keyphrases`) and default `summarize-map` accept `--cohort-chunks N` to
+`--reduce-keyphrases`), default `summarize-map` and default `answer-map` accept `--cohort-chunks N` to
 apply native grouping to independently planned chunks of one complete document.
 `N` must be 1 through 64 and cannot exceed `--max-chunks`. The default remains
 serial.
@@ -168,6 +168,14 @@ ranked keyphrases retain the complete exact phrase/evidence union. Both aggregat
 modes perform deterministic document-wide ranking only after all chunks finish,
 with top-k applied once at the final root. A later chunk or reduction failure
 publishes no document result.
+
+Default `answer-map` uses one exact private question for every nonblank chunk
+and retains all independent answers and abstentions. Whitespace ranges remain
+in source order with no native answer, KV allocation or work charge. Only the
+nonblank plans within each logical source window form a native cohort; an
+all-whitespace window performs no native call. The planner does not pack native
+rows across an intervening source-window boundary. A wholly blank document
+continues to refuse before inference.
 
 The pre-IO quote covers the entire declared simultaneous window. The host
 checks all actual windows and retains componentwise peak native and decoder
@@ -193,7 +201,10 @@ and independently cited summary chunks; the original task finalizers still
 run inside the native session before original-coordinate map verification.
 The CLI keeps the document under `output` and reports the declared width and
 actual physical counts under `cohort_schedule`. Raw maps expose physical batch
-counts in `output.mapped.map_batches`; aggregate summaries and ranked keyphrases
+counts in `output.mapped.map_batches`; independent QA uses the same field for
+logical source windows. For QA, `cohort_schedule.physical.chunks` counts native
+passages and `cohort_schedule.physical.cohorts` excludes all-whitespace windows,
+so physical counts can be smaller. Aggregate summaries and ranked keyphrases
 use `output.map_batches`. Per-chunk identities and source semantics are unchanged.
 Width 1 explicitly selects the cohort path for comparison.
 
@@ -214,11 +225,32 @@ native token transcripts; those transient tokens remain funded until native
 execution and reduction complete. The hosted aggregate methods described above
 feed these reducers directly without retaining a separate raw-map document.
 
-Question-aware maps, neural summary/answer synthesis and durable document jobs
-retain their existing execution. Both direct argument parsing and owned job
+One-question document execution uses the same snapshot route:
+
+```sh
+fnlp candidate source-int4 answer-map report.txt \
+  --question question.txt \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256_FROM_TRUSTED_CONVERSION" \
+  --memory-mib 32768 --group-width 128 --cohort-chunks 4
+```
+
+Question cohorts retain the complete logical document frontier and the private
+question's preparation/capture allowance even when most chunks are whitespace.
+The `--max-qa-citations`, `--max-qa-evidence-spans` and `--max-qa-scan-steps`
+allowances never renew across windows. Every citation is still checked against
+its original passage; the question and passage manifest supply no citation
+authority. The final QA output contains answers and citations without native
+token transcripts. Those transient native results remain funded until execution
+and reduction complete. Question text and paths stay out of public provenance.
+
+Neural summary/answer synthesis and durable document jobs retain their existing
+execution. Both direct argument parsing and owned job
 admission refuse unsupported cohort requests. `summarize-map --cohort-chunks`
 conflicts with `--synthesize-summary` and `--hierarchical-summary`; those modes
-have separate reduction and synthesis budget contracts.
+have separate reduction and synthesis budget contracts. Likewise,
+`answer-map --cohort-chunks` conflicts with `--synthesize-answer` and
+`--hierarchical-answer`.
 
 All source-derived masks and occurrence state stay document-owned. Structural
 validity and exact source membership do not certify semantic accuracy or factual
@@ -240,3 +272,12 @@ complete candidate storage and guarded output/flush failures. An ignored
 model-present fixture compares raw maps, aggregate summaries and global
 keyphrase rankings at serial execution and cohort widths 1, 2 and 4, excluding
 only physical scheduling fields. These fixtures remain unrun.
+
+Question-specific regression source covers sparse native windows, all-whitespace
+windows, ragged tails, all answers/abstentions, private-question input accounting,
+invalid passage authority and complete Unicode occurrence lists. Its separate
+ignored model fixture compares serial execution and widths 1, 2 and 4, checking
+physical row/window counts against the original source partition while comparing
+the complete QA document apart from physical schedule fields. That fixture
+requires an explicit private question file in `FNLP_INT4_TEST_QUESTION` alongside
+the pinned snapshot, model digest, kernel and memory settings, and remains unrun.

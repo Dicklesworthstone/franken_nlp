@@ -223,6 +223,11 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         }
         Request::Question(task) => {
             let config = configuration(identity.clone(), task, &args, &options, limits, remaining()?);
+            if let Some(quote) = limits.cohort {
+                if config.cohort_requirements(args.group_width).map_err(|_| CandidateError::Memory)? != quote {
+                    return Err(CandidateError::Memory);
+                }
+            }
             if config.question_workspace_bytes(limits.mapping.chunks.max_chunks)
                 .map_err(|_| CandidateError::Memory)? != limits.workspace_bytes {
                 return Err(CandidateError::Memory);
@@ -356,14 +361,25 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         }
         Prepared::Question(mut config, expected) => {
             config.native.run.max_elapsed = remaining()?;
-            let result = engine.answer_int4_document(&model, text, Arc::new(planner), Arc::new(vocabulary),
-                config, common.kernel, cancellation).map_err(execution_error)?;
-            expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
-            remaining()?;
-            // The hosted output guard survives staging, write AND flush.
-            // Native failure cannot publish a successful prefix or abstention.
-            publish(&Response { provenance: &provenance, output: result.result() },
-                limits.max_result_bytes + 4096, output)
+            if let Some(chunks) = limits.cohort_chunks {
+                let result = engine.answer_int4_document_cohorts(&model, text, Arc::new(planner), Arc::new(vocabulary),
+                    config, common.kernel, cancellation).map_err(execution_error)?;
+                expected.verify_completed(&result.result().document).map_err(|_| CandidateError::Execution)?;
+                remaining()?;
+                // The document includes whitespace-only chunks; physical
+                // stats count only actual native rows and nonempty windows.
+                publish_cohort(&provenance, &result.result().document, &result.result().cohorts,
+                    chunks, limits.max_result_bytes + 4096, output)
+            } else {
+                let result = engine.answer_int4_document(&model, text, Arc::new(planner), Arc::new(vocabulary),
+                    config, common.kernel, cancellation).map_err(execution_error)?;
+                expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+                remaining()?;
+                // The hosted output guard survives staging, write AND flush.
+                // Native failure cannot publish a successful prefix or abstention.
+                publish(&Response { provenance: &provenance, output: result.result() },
+                    limits.max_result_bytes + 4096, output)
+            }
         }
         Prepared::SummarySynthesis(mut config, expected) => {
             config.native.run.max_elapsed = remaining()?;

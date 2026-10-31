@@ -18,6 +18,9 @@ fn complete_document_qa_requires_its_private_question_on_both_load_routes() {
     let source = map.validate(&args).unwrap();
     assert!(map.question.is_some());
     assert!(map.summary.is_none());
+    assert_eq!(source.cohort_chunks, None);
+    assert!(source.cohort.is_none());
+    assert_eq!(source.mapping.reduction.map_batch_chunks, 1);
     assert_eq!(args.max_input_bytes, 1_048_576);
     assert_eq!(map.question.as_ref().unwrap().path(), std::path::Path::new("private-question.txt"));
     assert!(!format!("{map:?}").contains("private-question"));
@@ -83,6 +86,22 @@ fn independent_complete_document_verification_bounds_refuse_before_io() {
 }
 
 #[test]
+fn invalid_question_cohort_width_and_complete_result_cap_refuse_before_private_io() {
+    for flags in [vec!["--cohort-chunks", "0"], vec!["--cohort-chunks", "65"],
+        vec!["--cohort-chunks", "2", "--max-chunks", "1"], vec!["--cohort-chunks", "64"],
+        vec!["--cohort-chunks", "4", "--max-qa-citations", "0"],
+        vec!["--cohort-chunks", "4", "--max-qa-evidence-spans", "0"],
+        vec!["--cohort-chunks", "4", "--max-qa-scan-steps", "0"]] {
+        let (map, mut args) = arguments(&flags); args.memory_mib = 262_144;
+        let mut output = Vec::new();
+        assert_eq!(map.execute(args, &mut NoRead, &mut output), Err(CandidateError::Arguments));
+        assert!(output.is_empty());
+    }
+    let (mut map, args) = arguments(&[]); map.cohort_chunks = Some(usize::MAX);
+    assert_eq!(map.execute(args, &mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+}
+
+#[test]
 fn qa_admission_prices_private_question_and_both_verifier_owners() {
     let (map, mut args) = arguments(&[]);
     let limits = map.validate(&args).unwrap();
@@ -96,6 +115,12 @@ fn qa_admission_prices_private_question_and_both_verifier_owners() {
     let single = map.source.validate(&args).unwrap();
     assert!(limits.common.minimum_memory_bytes > single.minimum_memory_bytes
         + single.preparation_bytes + limits.workspace_bytes + QUESTION_BYTES as u64);
+    let input = args.max_input_bytes as u64 + 1 + QUESTION_BYTES as u64 + 1 + limits.common.preparation_bytes;
+    let tokens = limits.mapping.chunks.max_chunks as u64 * u64::from(budget.max_output_tokens);
+    let output = limits.max_result_bytes as u64 * 4 + tokens * 8 + 4096;
+    assert_eq!(limits.common.minimum_memory_bytes,
+        single.minimum_memory_bytes + input + limits.workspace_bytes + output,
+        "omitting cohorts must preserve the existing serial admission quote");
     args.memory_mib = limits.common.minimum_memory_bytes.saturating_sub(1) / MIB;
     assert!(map.validate(&args).is_err());
     args.memory_mib = limits.common.minimum_memory_bytes.div_ceil(MIB);

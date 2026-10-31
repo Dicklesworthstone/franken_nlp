@@ -122,14 +122,18 @@ fn definitions_with_cohorts(cohorts: bool) -> Vec<clap::Command> {
                 Kind::Answer => question::definition(command),
                 _ => command,
             };
-            if cohorts && matches!(kind, Kind::Ner | Kind::Keyphrases | Kind::Summarize) {
+            if cohorts {
                 let command = command.arg(clap::Arg::new("cohort_chunks").long("cohort-chunks")
                     .value_name("N").value_parser(clap::value_parser!(usize))
                     .help("Share native decoder layers across up to N independent chunks (1..=64); serial if omitted")
-                    .long_help("Explicitly execute up to N independent source chunks through shared native INT4 decoder layers. N must be 1..64 and cannot exceed --max-chunks. All original chunk plans and the complete simultaneous native/decoder/output memory are admitted before inference; each actual window, including the final short one, has exact independent causal contexts. The original per-chunk task budgets, source evidence and complete-document work/reduction limits remain unchanged. Raw NER/keyphrase maps retain their independent native results. Default summarize-map and --reduce-keyphrases preserve the complete exact candidate/evidence union, apply final top-k only once and retain their existing aggregate output. Neural synthesis, hierarchy, question maps and durable document jobs do not accept this option."));
-                if kind == Kind::Summarize {
-                    command.mut_arg("cohort_chunks", |arg| arg.conflicts_with_all(["synthesize_summary", "hierarchical_summary"]))
-                } else { command }
+                    .long_help("Explicitly execute up to N independent source chunks through shared native INT4 decoder layers. N must be 1..64 and cannot exceed --max-chunks. All original chunk plans and the complete simultaneous native/decoder/output memory are admitted before inference; each actual window, including the final short one, has exact independent causal contexts. The original per-chunk task budgets, source evidence and complete-document work/reduction limits remain unchanged. Raw NER/keyphrase maps retain their independent native results. Default summarize-map and --reduce-keyphrases preserve the complete exact candidate/evidence union, apply final top-k only once and retain their existing aggregate output. Default answer-map preserves every independent answer, abstention and whitespace range; whitespace-only chunks use no native work, so physical cohort statistics count only nonblank chunks and windows. Neural synthesis, hierarchy and durable document jobs do not accept this option."));
+                match kind {
+                    Kind::Summarize => command.mut_arg("cohort_chunks", |arg|
+                        arg.conflicts_with_all(["synthesize_summary", "hierarchical_summary"])),
+                    Kind::Answer => command.mut_arg("cohort_chunks", |arg|
+                        arg.conflicts_with_all(["synthesize_answer", "hierarchical_answer"])),
+                    _ => command,
+                }
             } else { command }
         }).collect()
 }
@@ -179,8 +183,7 @@ impl MapArgs {
         if (self.kind == Kind::Answer) != self.question.is_some()
             || (self.kind == Kind::Summarize) != self.summary.is_some()
             || (self.kind == Kind::Keyphrases) != self.keyphrases.is_some()
-            || self.cohort_chunks.is_some_and(|n| !matches!(self.kind, Kind::Ner | Kind::Keyphrases | Kind::Summarize)
-                || !(1..=64).contains(&n) || n > m.max_chunks)
+            || self.cohort_chunks.is_some_and(|n| !(1..=64).contains(&n) || n > m.max_chunks)
             || args.max_input_bytes < 4 || !(1..=256).contains(&m.max_chunks)
             || !(1..=1_000_000).contains(&m.max_tokenizer_calls)
             || m.max_chunk_bytes.is_some_and(|n| !(4..=MAX_INPUT_BYTES).contains(&n))
@@ -280,7 +283,10 @@ impl MapArgs {
                 },
             },
         };
-        let tokens = if summary.is_some() || keyphrases.is_some() { 0 }
+        // QA keeps answers and citations, not native token transcripts. The
+        // cohort quote prices that exact output; the serial quote is retained.
+        let tokens = if summary.is_some() || keyphrases.is_some()
+            || (self.cohort_chunks.is_some() && self.question.is_some()) { 0 }
             else { times(preparation_passes, u64::from(budget.max_output_tokens))? };
         let max_result_bytes = keyphrases.map_or(m.max_map_result_bytes, |limits| limits.max_result_bytes);
         let output = sum(&[max_result_bytes as u64 * 4, times(tokens, 8)?, 4096])?;

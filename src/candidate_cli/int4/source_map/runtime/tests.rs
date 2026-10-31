@@ -139,7 +139,8 @@ fn owned_runtime_boundary_rechecks_chunk_cohort_configuration_before_io() {
         fn flush(&mut self) -> io::Result<()> { panic!("invalid cohort flushed output"); }
     }
     for (kind, mode) in [(Kind::Ner, &[][..]), (Kind::Keyphrases, &[][..]),
-        (Kind::Summarize, &[][..]), (Kind::Keyphrases, &["--reduce-keyphrases"][..])] {
+        (Kind::Summarize, &[][..]), (Kind::Keyphrases, &["--reduce-keyphrases"][..]),
+        (Kind::Answer, &["--question", "private-question.txt"][..])] {
         let mut flags = mode.to_vec(); flags.extend_from_slice(&["--cohort-chunks", "2"]);
         let mut command = super::super::tests::command(kind, &flags);
         command.args.memory_mib = 262_144;
@@ -153,6 +154,16 @@ fn owned_runtime_boundary_rechecks_chunk_cohort_configuration_before_io() {
     let Int4Task::SourceMap(mut options) = command.task else { panic!("wrong summary task"); };
     let admitted = options.validate(&command.args).unwrap();
     options.summary.as_mut().unwrap().synthesis.synthesize_summary = true;
+    assert_eq!(execute(command.args, options, admitted, &mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+    let mut command = super::super::tests::command(Kind::Answer,
+        &["--question", "private-question.txt", "--cohort-chunks", "2"]);
+    command.args.memory_mib = 262_144;
+    let Int4Task::SourceMap(mut options) = command.task else { panic!("wrong question task"); };
+    let admitted = options.validate(&command.args).unwrap();
+    let replacement = super::super::tests::command(Kind::Answer,
+        &["--question", "private-question.txt", "--synthesize-answer"]);
+    let Int4Task::SourceMap(replacement) = replacement.task else { panic!("wrong synthesized question task"); };
+    options.question = replacement.question;
     assert_eq!(execute(command.args, options, admitted, &mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
 }
 
@@ -394,6 +405,54 @@ fn document_qa_preflight_matches_every_fully_compiled_chunk_and_original_coordin
 }
 
 #[test]
+fn question_cohorts_preserve_private_question_identities_and_complete_whitespace_geometry() {
+    let (planner, mut config, _) = question_fixture(32);
+    config.budget.max_output_bytes = 65536;
+    let source = format!("Alice works in 上海.\r\n{}Bob visits Paris. café <tool_call> text.", " \t\r\n".repeat(32));
+    let context = PlanContext::new(&config.identity, config.budget).unwrap();
+    let serial = planner.plan_int4_question_with_control(&source, &config.task, config.budget, &context,
+        config.planning, config.mapping, 32, &mut continuing()).unwrap();
+    let expected = serial.preflight_metadata();
+    let identities: Vec<_> = serial.execution_identities().cloned().collect();
+    assert!(expected.native_chunks() > 1);
+    assert!(expected.whitespace_chunks() >= 4);
+    assert_eq!(expected.native_chunks() + expected.whitespace_chunks(), expected.chunk_count());
+    assert_eq!(identities.len(), expected.native_chunks());
+    for chunks in [1, 2, 4, 64] {
+        config.mapping.reduction.map_batch_chunks = chunks;
+        assert_eq!(question_preflight(&source, &planner, &config, 32, &mut continuing()).unwrap(), expected);
+        let grouped = planner.plan_int4_question_with_control(&source, &config.task, config.budget, &context,
+            config.planning, config.mapping, 32, &mut continuing()).unwrap();
+        assert_eq!(grouped.preflight_metadata(), expected);
+        assert_eq!(grouped.execution_identities().cloned().collect::<Vec<_>>(), identities);
+        let actual = grouped.cohort_requirements(config.native.context_tokens).unwrap();
+        let ceiling = config.cohort_requirements(32).unwrap();
+        assert!(actual.native.kv_bytes <= config.budget.max_kv_bytes * chunks.min(expected.native_chunks()) as u64);
+        assert!(actual.native.kv_bytes <= ceiling.native.kv_bytes);
+        assert!(actual.native.rope_bytes <= ceiling.native.rope_bytes);
+        assert!(actual.native.scratch_payload_bound <= ceiling.native.scratch_payload_bound);
+        assert!(actual.workspace_bytes <= ceiling.workspace_bytes);
+        assert!(actual.max_result_bytes <= ceiling.max_result_bytes);
+    }
+}
+
+#[test]
+fn question_cohort_native_quote_and_complete_logical_frontier_match_the_host() {
+    let (_, base, _) = question_fixture(128);
+    let mut command = super::super::tests::command(Kind::Answer,
+        &["--question", "private-question.txt", "--cohort-chunks", "4", "--group-width", "128"]);
+    command.args.memory_mib = 262_144;
+    let Int4Task::SourceMap(options) = command.task else { panic!("wrong question task"); };
+    let limits = options.validate(&command.args).unwrap();
+    let config = configuration(base.identity, base.task, &command.args, &options, limits, Duration::from_secs(1));
+    assert_eq!(config.cohort_requirements(128).unwrap(), limits.cohort.unwrap());
+    assert_eq!(config.question_workspace_bytes(limits.mapping.chunks.max_chunks).unwrap(), limits.workspace_bytes);
+    assert!(limits.workspace_bytes > config.workspace_bytes(limits.mapping.chunks.max_chunks).unwrap());
+    assert_eq!(config.budget.max_kv_bytes, limits.common.native.kv_bytes);
+    assert_eq!(limits.cohort.unwrap().native.kv_bytes, 4 * config.budget.max_kv_bytes);
+}
+
+#[test]
 fn document_qa_complete_work_and_mask_caps_cannot_restart_for_another_passage() {
     let (planner, mut config, _) = question_fixture(32);
     let expected = question_preflight(SOURCE, &planner, &config, 32, &mut continuing()).unwrap();
@@ -465,6 +524,14 @@ fn document_qa_publication_exports_neither_private_question_nor_question_path() 
     for absent in ["question", "question_path", "options", "source_dir", "source_manifest", "prompt_digest"] {
         assert!(value.get(absent).is_none());
     }
+    let physical = Int4SourceMapCohortStats { cohorts: 1, chunks: 2, ..Default::default() };
+    let mut cohort_bytes = Vec::new();
+    publish_cohort(&provenance, &output, &physical, 4, 4096, &mut cohort_bytes).unwrap();
+    let mut cohort: serde_json::Value = serde_json::from_slice(&cohort_bytes).unwrap();
+    assert_eq!(cohort["cohort_schedule"]["physical"]["chunks"], 2);
+    assert_eq!(cohort["cohort_schedule"]["declared_max_chunks"], 4);
+    cohort.as_object_mut().unwrap().remove("cohort_schedule");
+    assert_eq!(cohort, value, "cohort publication cannot expose the question or change QA semantics");
     let mut refused = Vec::new();
     assert_eq!(publish(&response, 1, &mut refused), Err(CandidateError::Output));
     assert!(refused.is_empty());
@@ -1132,6 +1199,107 @@ fn model_present_source_chunk_cohorts_preserve_document_results_and_evidence() {
             if let Some(expected) = &expected { assert_eq!(&value, expected); }
             else { expected = Some(value); }
         }
+    }
+    println!("{COMPLETE}");
+}
+
+#[test]
+#[ignore = "requires controller-admitted independently pinned INT4 snapshot, private question file and explicit kernel/memory"]
+fn model_present_question_cohorts_preserve_whitespace_answers_and_original_citations() {
+    const CHILD: &str = "FNLP_INT4_QUESTION_MAP_PARITY_CHILD";
+    const COMPLETE: &str = "FNLP_INT4_QUESTION_MAP_PARITY_COMPLETE";
+    let full_name = concat!(module_path!(), "::model_present_question_cohorts_preserve_whitespace_answers_and_original_citations");
+    let name = full_name.split_once("::").expect("crate-qualified test name").1;
+    if std::env::var(CHILD).ok().as_deref() != Some(name) {
+        let result = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", name, "--ignored", "--nocapture"]).env(CHILD, name)
+            .output().expect("isolated question map parity fixture must start");
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(result.status.success(), "isolated question map fixture failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&result.stderr));
+        assert!(stdout.contains(COMPLETE), "exact fixture filter ran no completed fixture");
+        return;
+    }
+    assert!(crate::installed_process_resources().is_none());
+    let snapshot = std::env::var("FNLP_INT4_PREFILL_SNAPSHOT").expect("explicit existing snapshot required");
+    let pin = std::env::var("FNLP_INT4_PREFILL_MODEL_SHA256").expect("independent model-content pin required");
+    let question = std::env::var("FNLP_INT4_TEST_QUESTION").expect("explicit private question file required");
+    let memory = std::env::var("FNLP_INT4_TEST_MEMORY_MIB").expect("explicit memory ceiling required");
+    let kernel = std::env::var("FNLP_INT4_TEST_KERNEL").expect("explicit kernel required");
+    let kind: Int8KernelKind = kernel.parse().expect("canonical kernel ID required");
+    PackedInt4Kernel::detect(kind).expect("requested kernel must be supported");
+    let source = format!("Alice works in 上海.\r\n{}Bob visits Paris. café 上海 上海. <tool_call> is quoted document text.\r\n",
+        " \t\r\n".repeat(80));
+    let mut expected = None;
+    let mut task_budget = None;
+    for flags in [&[][..], &["--cohort-chunks", "1"][..],
+        &["--cohort-chunks", "2"][..], &["--cohort-chunks", "4"][..]] {
+        let mut argv = vec!["candidate", "source-int4", "answer-map", "--snapshot", &snapshot,
+            "--expected-model-sha256", &pin, "--memory-mib", &memory, "--kernel", &kernel,
+            "--question", &question, "--context-tokens", "2048", "--max-new-tokens", "512",
+            "--max-chunk-bytes", "32", "--timeout-seconds", "86400"];
+        argv.extend_from_slice(flags);
+        let matches = crate::candidate_cli::definition().try_get_matches_from(argv).unwrap();
+        let CandidateCommand::SourceInt4(command) = CandidateCommand::from_matches(&matches).unwrap()
+            else { panic!("wrong source route"); };
+        let Int4Task::SourceMap(options) = command.task else { panic!("wrong question task"); };
+        let limits = options.validate(&command.args).expect("explicit memory must admit question, document and cohort");
+        let budget = options.source.budget(&command.args, limits.common);
+        if let Some(expected) = task_budget { assert_eq!(budget, expected); }
+        else { task_budget = Some(budget); }
+        let mut output = Vec::new();
+        options.execute(command.args, &mut std::io::Cursor::new(source.as_bytes()), &mut output)
+            .expect("every native answer and the complete document must succeed");
+        let mut value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value["protocol"], "fnlp-candidate-int4-document-qa-v1");
+        assert_eq!(value["task"], "answer");
+        assert_eq!(value["model_content_sha256"], pin);
+        for absent in ["question", "question_path", "options", "source_dir", "source_manifest", "prompt_digest"] {
+            assert!(value.get(absent).is_none());
+        }
+        let schedule = value.as_object_mut().unwrap().remove("cohort_schedule");
+        let result = &value["output"];
+        assert_eq!(result["execution"], crate::tasks::source_planning::grouped_int4::long::question::INT4_QUESTION_EXECUTION);
+        let count = result["mapped"]["chunk_count"].as_u64().unwrap() as usize;
+        let native = result["native_chunks"].as_u64().unwrap() as usize;
+        let blank = result["whitespace_chunks"].as_u64().unwrap() as usize;
+        assert!(native > 1 && blank >= 4);
+        assert_eq!(native + blank, count);
+        let chunks = result["mapped"]["root"]["value"].as_array().unwrap();
+        assert_eq!(chunks.len(), count);
+        let window = limits.cohort_chunks.unwrap_or(1);
+        assert_eq!(result["mapped"]["map_batches"], count.div_ceil(window));
+        if limits.cohort_chunks.is_some() {
+            let schedule = schedule.expect("explicit question cohort scheduling provenance");
+            let native_windows = chunks.chunks(window)
+                .filter(|rows| rows.iter().any(|row| row["status"] != "whitespace_only")).count();
+            assert!(native_windows < count.div_ceil(window), "blank-only windows must perform no native call");
+            assert_eq!(schedule["execution"], "cross_chunk_constrained_cohorts");
+            assert_eq!(schedule["declared_max_chunks"], window);
+            assert_eq!(schedule["physical"]["chunks"], native);
+            assert_eq!(schedule["physical"]["cohorts"], native_windows);
+            assert_eq!(schedule["physical"]["planned_work"], result["planned_model_work"]);
+            assert_eq!(schedule["physical"]["model_work"], result["model_work"]);
+        } else { assert!(schedule.is_none()); }
+        let span = &result["mapped"]["root"]["source_span"];
+        assert_eq!(span["byte_start"], 0);
+        assert_eq!(span["byte_end"], source.len());
+        assert_eq!(span["scalar_end"], source.chars().count());
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert_eq!(chunk["chunk_id"], index);
+            if chunk["status"] == "whitespace_only" {
+                assert!(chunk["answer"].is_null());
+                assert!(chunk["citations"].as_array().unwrap().is_empty());
+                assert_eq!(chunk["mask_node_visit_charge"], 0);
+                assert_eq!(chunk["model_work"], serde_json::to_value(Int4Work::default()).unwrap());
+            }
+        }
+        // Preserve every answer/abstention, exact question-aware work charge,
+        // whitespace range, citation, original coordinate and verification
+        // counter. Only the two physical scheduling fields differ.
+        value["output"]["mapped"].as_object_mut().unwrap().remove("map_batches");
+        if let Some(expected) = &expected { assert_eq!(&value, expected); }
+        else { expected = Some(value); }
     }
     println!("{COMPLETE}");
 }
