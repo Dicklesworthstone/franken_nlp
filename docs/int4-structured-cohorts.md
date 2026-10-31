@@ -1,0 +1,118 @@
+# Explicit INT4 structured cohorts
+
+`candidate source-int4 extract-batch` accepts `--cohort-documents N` to execute
+independent documents through one native shared-layer INT4 cohort. `N` is a
+ceiling from 1 through 64. The model remains resident across windows, and each
+window allocates its exact number of sequence contexts. Omitting the flag keeps
+the serial path.
+
+This is an explicit candidate path. The implementation and physical grouping
+counters do not establish numerical parity, task quality, or measured speedup.
+Those claims require separate controller-selected validation and model evidence.
+
+## Command line
+
+For an independently pinned existing snapshot:
+
+```sh
+fnlp candidate source-int4 extract-batch documents.ndjson \
+  --schema extraction.schema.json \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256_FROM_TRUSTED_CONVERSION" \
+  --memory-mib 32768 --group-width 128 --context-tokens 1024 \
+  --max-new-tokens 128 --cohort-documents 4
+```
+
+The source-conversion `--source-dir` and `--source-manifest` route is also
+supported. `--source-membership` binds annotated verbatim fields to each
+document's original bytes. The schema remains one exact shared declaration;
+non-null per-record `task_args` are rejected, including attempts to repeat or
+replace the schema or budget.
+
+Input uses the existing ordered NDJSON protocol:
+
+```json
+{"id":"first","text":"Alice works in Shanghai."}
+{"id":"second","text":"The invoice is due Friday."}
+{"flush":true}
+```
+
+A window executes when its document/error capacity is reached, at an explicit
+flush, or at EOF. Interactive producers must fill a window or send a flush
+before waiting for responses. There is no timer-driven partial-window execution.
+Malformed or rejected records occupy their original sequence positions. The
+duplicate-ID set resets only after the drained flush event has been delivered.
+The last input record need not end with a newline.
+
+Each document retains an independent prompt, grammar/source language, EOS,
+causal KV, and original task budget. Grouping does not widen a document's
+`TaskBudget` or change its TaskIR identity. Full-vocabulary greedy token
+selection remains the same: this option introduces no sparse projection,
+sampling, repair retry, or prompt-prefill selector.
+
+## Memory, work, and delivery
+
+The CLI and hosted stream use the same checked memory quote. It includes all
+declared simultaneous native contexts, shared activation/RoPE storage, the full
+prepared-document window plus one lookahead, source/grammar runtime state,
+decoder cursor workspace, transport and ID staging, and every retained result's
+output reservation. The maximum complete cohort result, including its envelope,
+is 64 MiB. A requested window that cannot fit refuses before input/model IO;
+its width is not silently reduced.
+
+`--preparation-mib` continues to be the per-document preparation estimate in the
+stream. A cohort prices `N + 1` such slots in addition to outer CLI preparation.
+Native and output storage are separately accounted. These are modeled payload
+and ownership limits, not an operating-system RSS guarantee.
+
+The five native work counters and the mask-visit allowance apply to the entire
+stream. A new document, cohort, or flush does not renew them. Native reservations
+and output guards remain owned through physical completion and writer flush.
+Failed native execution or independent finalization returns no partial group
+of successful results. Earlier fully delivered groups remain visible. A failed
+output write or flush stops the stream and never appends another terminal frame.
+
+Document results keep the existing extraction schema and semantics. Outer
+candidate provenance adds only the declared schedule:
+
+```json
+{
+  "cohort_schedule": {
+    "execution": "cross_document_constrained_cohorts",
+    "declared_max_documents": 4
+  }
+}
+```
+
+Inner records identify the transport as `ordered-cohort-no-retry-v1`; the task
+result's execution identifier remains unchanged. The declared limit is not an
+executed group count. Require `run_complete` and a zero exit status for whole-run
+success; a drained stream can still contain rejected documents.
+
+## Library surfaces
+
+- `NlpEngine::batch_int4_extract_cohorts` runs the ordered stream with bounded
+  native windows. Its return separates `BatchSummary` from invocation-wide
+  physical cohort statistics.
+- `NlpEngine::execute_int4_extract_cohort` executes an already prepared finite
+  collection of schema/source plans.
+- `NlpEngine::execute_int4_source_cohort` executes prepared NER, keyphrase,
+  summary, and passage-QA plans, including mixed source-task kinds.
+- The finite-plan methods use `SourceLimits`: context and mask limits are per
+  row, preparation covers **all** transferred plans and vocabulary/runtime
+  state, and one invocation deadline/checkpoint budget covers the collection.
+  The caller supplies the complete aggregate result cap.
+- Lower-level task cohort adapters preserve the original independent semantic
+  finalizers inside the native session. Each row must complete and validate;
+  there is no unrestricted successful prefix or unconstrained fallback.
+
+All source-derived masks and occurrence state stay document-owned. Structural
+validity and exact source membership do not certify semantic accuracy or factual
+support. The current CLI cohort route is extraction; source-task finite cohorts
+are library APIs, and durable jobs retain their existing execution paths.
+
+Focused regression source covers exact memory/KV admission, per-document budget
+stability, unchanged whole-run work, complete result bounds, source separation,
+and typed error isolation. Ignored full-model fixtures compare serial and cohort
+execution. Rust builds, tests, and model/performance qualification remain pending
+the repository's controller-selected DSR checkpoint.

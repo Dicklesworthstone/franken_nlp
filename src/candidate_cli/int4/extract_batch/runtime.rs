@@ -79,6 +79,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         model_content_sha256: &content, candidate_format: &identity.artifact_format,
         quant_recipe: &identity.quant_recipe, group_width: model.model_identity().group_width(),
         integer_kernel: common.kernel.kind().id(), task: "extract", snapshot,
+        cohort_schedule: limits.cohort_documents.map(CohortSchedule::new),
     };
     // This writer copies the canonical inner event without parsing its JSON
     // numbers. It stages one frame and permanently stops after partial IO.
@@ -91,8 +92,14 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         transport: limits.transport, preparation_reserve_bytes: limits.preparation_reserve_bytes,
         io_reserve_bytes: limits.io_bytes,
     };
-    let summary = engine.batch_int4_extract(&model, planner, vocabulary, limits.native,
-        corpus, common.kernel, reader, writer, cancellation).map_err(|_| CandidateError::Batch)?;
+    let summary = if let Some(max_documents) = limits.cohort_documents {
+        engine.batch_int4_extract_cohorts(&model, planner, vocabulary, limits.native,
+            corpus, max_documents, common.kernel, reader, writer, cancellation)
+            .map_err(|_| CandidateError::Batch)?.summary
+    } else {
+        engine.batch_int4_extract(&model, planner, vocabulary, limits.native,
+            corpus, common.kernel, reader, writer, cancellation).map_err(|_| CandidateError::Batch)?
+    };
     // Draining the protocol can still report failed documents. Never append
     // another stdout completion/error after the host's terminal frame.
     completed(summary)
@@ -125,6 +132,16 @@ struct Provenance<'a> {
     task: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<SnapshotRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cohort_schedule: Option<CohortSchedule>,
+}
+
+#[derive(Serialize)]
+struct CohortSchedule { execution: &'static str, declared_max_documents: usize }
+impl CohortSchedule {
+    fn new(declared_max_documents: usize) -> Self {
+        Self { execution: "cross_document_constrained_cohorts", declared_max_documents }
+    }
 }
 
 #[cfg(test)]

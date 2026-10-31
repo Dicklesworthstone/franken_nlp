@@ -55,6 +55,60 @@ fn source_and_independently_pinned_snapshot_share_the_same_schema_policy() {
 }
 
 #[test]
+fn explicit_cohorts_preserve_per_document_task_identity_and_whole_run_work() {
+    let (serial, mut args) = arguments(&["--max-requests", "8", "--max-result-bytes", "65536"]);
+    args.memory_mib = 262_144;
+    let serial_limits = serial.validate(&args).unwrap();
+    let serial_budget = serial.extraction.budget(&args, serial_limits.common);
+    for documents in [1, 2, 8, 64] {
+        let mut grouped = serial.clone(); grouped.stream.cohort_documents = Some(documents);
+        let limits = grouped.validate(&args).unwrap();
+        assert_eq!(limits.cohort_documents, Some(documents));
+        assert_eq!(limits.common.native, serial_limits.common.native);
+        assert_eq!(grouped.extraction.budget(&args, limits.common), serial_budget);
+        assert_eq!(limits.native.max_model_work, serial_limits.native.max_model_work);
+        assert_eq!(limits.native.masks.max_visits_per_item, serial_limits.native.masks.max_visits_per_item);
+        assert_eq!(limits.native.masks.max_visits_per_run, serial_limits.native.masks.max_visits_per_run);
+        assert_eq!(limits.native.masks.per_mask.max_trie_node_visits,
+            serial_limits.native.masks.per_mask.max_trie_node_visits);
+        assert_eq!(limits.transport, serial_limits.transport);
+    }
+}
+
+#[test]
+fn cohort_bounds_and_complete_output_peak_refuse_before_io() {
+    for documents in [0, 65, usize::MAX, 64] {
+        let (mut batch, mut args) = arguments(&[]);
+        args.memory_mib = 262_144; batch.stream.cohort_documents = Some(documents);
+        // The default one-MiB item output plus its frame cannot fit 64 rows
+        // under the native aggregate ceiling. Explicit windows never shrink.
+        assert_eq!(batch.execute_owned(args, NoRead, NoWrite), Err(CandidateError::Arguments));
+    }
+    let (batch, mut args) = arguments(&["--cohort-documents", "4"]);
+    args.memory_mib = 262_144;
+    let quote = batch.validate(&args).unwrap();
+    args.memory_mib = quote.common.minimum_memory_bytes.div_ceil(MIB);
+    batch.validate(&args).unwrap();
+    args.memory_mib -= 1;
+    assert_eq!(batch.execute_owned(args, NoRead, NoWrite), Err(CandidateError::Arguments));
+}
+
+#[test]
+fn cli_and_host_share_the_complete_window_plus_lookahead_memory_quote() {
+    let (batch, mut args) = arguments(&["--cohort-documents", "3"]);
+    args.memory_mib = 262_144;
+    let limits = batch.validate(&args).unwrap();
+    let quote = Int4ExtractionCohortMemoryLimits { max_documents: 3, context_tokens: args.context_tokens,
+        preparation_reserve_bytes: limits.preparation_reserve_bytes, io_reserve_bytes: limits.io_bytes,
+        allocator_reserve_bytes: ALLOCATOR_BYTES,
+    }.requirements(args.group_width, limits.native, limits.transport).unwrap();
+    assert_eq!(quote.native.kv_bytes, 3 * limits.common.native.kv_bytes);
+    assert!(quote.input_bytes >= 4 * limits.preparation_reserve_bytes);
+    let execution = quote.native.kv_bytes + quote.workspace_bytes + quote.input_bytes + quote.output_reservation_bytes;
+    assert_eq!(limits.common.minimum_memory_bytes, grouped_memory_floor(&args, limits.common, execution).unwrap());
+}
+
+#[test]
 fn explicit_generation_and_prefill_controls_do_not_leak_into_extraction_batch() {
     for flags in [vec!["--max-output-bytes", "65536"], vec!["--prefill-rows", "1"],
         vec!["--min-new-tokens", "0"], vec!["--logprobs"], vec!["--logit-bias", "42=0"]] {

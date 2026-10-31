@@ -4,7 +4,7 @@ use super::*;
 use crate::{
     batch::{BatchLimits as TransportLimits, BatchWork,
         extract::{ExtractionBatchArgs, ExtractionMaskBudget,
-            grouped_int4::Int4ExtractionBatchLimits}},
+            grouped_int4::{Int4ExtractionBatchLimits, memory::Int4ExtractionCohortMemoryLimits}}},
     candidate_cli::batch::{FRAME_ALLOWANCE, IO_BUFFER_BYTES},
     native_engine::{constrained_int4, strict_int4::Int4Work},
     tasks::ir::TaskBudget,
@@ -28,6 +28,10 @@ pub(super) struct BatchArgs {
 }
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
 struct StreamArgs {
+    /// Explicit shared-layer extraction over at most N documents (1..=64).
+    /// Interactive producers must fill a window or send a flush command.
+    #[arg(long, value_name = "N")]
+    cohort_documents: Option<usize>,
     /// Whole-stream nonempty records, including malformed input and flush commands.
     #[arg(long, default_value_t = 1000)]
     max_requests: u64,
@@ -45,7 +49,7 @@ struct StreamArgs {
 pub(super) fn definition() -> clap::Command {
     StreamArgs::augment_args(extract::definition().name("extract-batch")
         .about("Extract one shared schema from bounded NDJSON using one resident INT4 model")
-        .long_about("Process ordered {id,text} NDJSON and exact {\"flush\":true} controls with one resident source-converted or digest-pinned snapshot INT4 model. --schema supplies one exact shared schema; --source-membership binds its annotated verbatim fields to EACH original document. Any non-null task_args is rejected before document tokenization, even if it repeats the shared schema or budgets. Input is read incrementally and each result/error is flushed before reading the next record. IDs are unique within each bounded epoch and reset only after a completed flush. Every event has candidate provenance. Require run_complete AND exit 0 for whole-run success; run_complete alone reports a drained protocol and can include failed documents. Earlier complete results remain valid after a later failure. Native work, mask visits, checkpoints, input and output ceilings never renew per document or epoch. Execution is serial item-local full-vocabulary greedy extraction, with no sampler, repair retry, layer-major prefill, durable resume or semantic-accuracy claim. Blocking IO is cooperative, not preemptible.")
+        .long_about("Process ordered {id,text} NDJSON and exact {\"flush\":true} controls with one resident source-converted or digest-pinned snapshot INT4 model. --schema supplies one exact shared schema; --source-membership binds its annotated verbatim fields to EACH original document. Any non-null task_args is rejected before document tokenization, even if it repeats the shared schema or budgets. Execution is serial unless --cohort-documents N explicitly groups up to N complete documents through shared native decoder layers, with independent grammars, source masks and causal KV. The entire window and a lookahead plan are memory-admitted before IO. A partial window executes at flush or EOF; interactive producers must fill the window or send a flush before waiting. Results remain ordered. IDs are unique within each bounded epoch and reset only after a drained flush. Every event has candidate provenance. Require run_complete AND exit 0 for whole-run success; run_complete alone reports a drained protocol and can include failed documents. Earlier complete results remain valid after a later failure. Native work, mask visits, checkpoints, input and output ceilings never renew per document, cohort or epoch. Full-vocabulary greedy semantics and original task budgets are unchanged. No sampler, repair retry, sparse projection, layer-major prompt prefill, durable resume or semantic-accuracy claim. Blocking IO is cooperative, not preemptible.")
         .mut_arg("input", |arg| arg.help("NDJSON file, or '-' for stdin; read one bounded record at a time"))
         .mut_arg("max_input_bytes", |arg| arg.help("Maximum decoded UTF-8 document bytes per record"))
         .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoint allowance for the ENTIRE corpus execution")))
@@ -59,6 +63,7 @@ pub(super) struct BatchLimits {
     pub output_bytes: u64,
     pub io_bytes: u64,
     pub preparation_reserve_bytes: u64,
+    pub cohort_documents: Option<usize>,
 }
 impl BatchArgs {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
@@ -110,16 +115,27 @@ impl BatchArgs {
         let preparation_reserve_bytes = common.preparation_bytes;
         let io_bytes = sum(&[transport.max_output_line_bytes as u64, FRAME_ALLOWANCE,
             IO_BUFFER_BYTES as u64])?;
-        let corpus_reservation = sum(&[
-            times(transport.max_line_bytes as u64, 8)?,
-            times(transport.max_output_line_bytes as u64, 4)?,
-            times(transport.max_epoch_ids as u64, 128)?,
-            transport.max_epoch_id_bytes as u64, preparation_reserve_bytes, io_bytes,
-        ])?;
-        common.minimum_memory_bytes = sum(&[common.minimum_memory_bytes, corpus_reservation])?;
+        if let Some(max_documents) = stream.cohort_documents {
+            let quote = Int4ExtractionCohortMemoryLimits { max_documents, context_tokens: args.context_tokens,
+                preparation_reserve_bytes, io_reserve_bytes: io_bytes, allocator_reserve_bytes: ALLOCATOR_BYTES,
+            }.requirements(args.group_width, native, transport).map_err(|_| CandidateError::Arguments)?;
+            let execution = sum(&[quote.native.kv_bytes, quote.workspace_bytes,
+                quote.input_bytes, quote.output_reservation_bytes])?;
+            common.minimum_memory_bytes = grouped_memory_floor(args, common, execution)?;
+            // Keep common.native PER DOCUMENT: scheduling cannot raise the
+            // TaskBudget or change TaskIR identities for the same source/schema.
+        } else {
+            let corpus_reservation = sum(&[
+                times(transport.max_line_bytes as u64, 8)?,
+                times(transport.max_output_line_bytes as u64, 4)?,
+                times(transport.max_epoch_ids as u64, 128)?,
+                transport.max_epoch_id_bytes as u64, preparation_reserve_bytes, io_bytes,
+            ])?;
+            common.minimum_memory_bytes = sum(&[common.minimum_memory_bytes, corpus_reservation])?;
+        }
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(BatchLimits { common, transport, native, output_bytes: stream.max_total_output_bytes,
-            io_bytes, preparation_reserve_bytes })
+            io_bytes, preparation_reserve_bytes, cohort_documents: stream.cohort_documents })
     }
 
     /// Preserve exact schema bytes. Source membership is compiled against
@@ -138,6 +154,14 @@ impl BatchArgs {
         #[cfg(not(feature = "asupersync-runtime"))]
         { let _ = (self, args, limits, input, output); Err(CandidateError::Unavailable) }
     }
+}
+
+fn grouped_memory_floor(args: &Int4Args, common: Int4Limits, execution: u64) -> Result<u64, CandidateError> {
+    let resident = sum(&[common.load.weight_payload_bytes, ALLOCATOR_BYTES])?;
+    let loading = if common.snapshot_pin.is_some() { common.snapshot_need.scratch_bytes }
+        else { sum(&[common.source_preparation_bytes, common.load.scratch_payload_bytes])? };
+    let saving = if args.save_snapshot.is_some() { common.snapshot_need.scratch_bytes } else { 0 };
+    sum(&[common.preparation_bytes, resident, loading.max(saving).max(execution), CLEANUP_BYTES])
 }
 
 fn times(value: u64, count: u64) -> Result<u64, CandidateError> {

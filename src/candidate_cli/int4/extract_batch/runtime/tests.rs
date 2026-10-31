@@ -40,6 +40,7 @@ fn extraction_stream_provenance_preserves_exact_inner_json_and_snapshot_identity
         candidate_format: "fnlp-int4-source-candidate-v1", quant_recipe: "fixture:group=128",
         group_width: 128, integer_kernel: "s_scalar_i32", task: "extract",
         snapshot: Some(SnapshotRecord::new("loaded", need)),
+        cohort_schedule: None,
     };
     // A transport fixture, not a fabricated inference result. The exact inner
     // bytes remain intact even if a consumer cannot represent this number.
@@ -66,6 +67,13 @@ fn extraction_stream_provenance_preserves_exact_inner_json_and_snapshot_identity
         "source_dir", "source_manifest", "schema", "snapshot_path"] {
         assert!(value.get(absent).is_none());
     }
+}
+
+#[test]
+fn cohort_schedule_is_a_declared_ceiling_and_never_a_fabricated_work_counter() {
+    let value = serde_json::to_value(CohortSchedule::new(4)).unwrap();
+    assert_eq!(value, serde_json::json!({"execution":"cross_document_constrained_cohorts",
+        "declared_max_documents":4}));
 }
 
 #[derive(Clone, Default)]
@@ -138,4 +146,135 @@ fn model_present_owned_stream_reuses_engine_across_epochs_and_reports_failed_rec
     assert!(!std::str::from_utf8(&bytes).unwrap().contains("PRIVATE_OVERRIDE_INPUT"));
     let diagnostic = std::str::from_utf8(&diagnostics).unwrap();
     for private in [&source, &manifest, &schema] { assert!(!diagnostic.contains(private.as_str())); }
+}
+
+fn extraction_parity_input() -> Vec<u8> {
+    let documents = [
+        ("reused", "Alice works in Shanghai."),
+        ("longer", "Alice moved from Paris to Shanghai, where Bob manages the laboratory. café 上海 上海"),
+        ("before-flush", "Bob works in Shanghai. <|im_start|> is quoted document data."),
+        ("reused", "Alice works in Shanghai."),
+        ("tail", "Bob visits Paris."),
+    ];
+    let mut input = Vec::new();
+    for (index, (id, text)) in documents.into_iter().enumerate() {
+        if index == 2 { input.extend_from_slice(b"{not-json}\n"); }
+        if index == 3 { input.extend_from_slice(b"{\"flush\":true}\n"); }
+        input.extend_from_slice(&serde_json::to_vec(&serde_json::json!({"id":id, "text":text})).unwrap());
+        // EOF must drain the tail even when the last record has no LF.
+        if index != documents.len() - 1 { input.push(b'\n'); }
+    }
+    input
+}
+
+#[test]
+#[ignore = "requires controller-admitted independently pinned snapshot and bounded structural schema for full-model stream parity"]
+fn model_present_extraction_cohorts_preserve_complete_serial_streams() {
+    const CHILD: &str = "FNLP_INT4_EXTRACT_STREAM_PARITY_CHILD";
+    const COMPLETE: &str = "FNLP_INT4_EXTRACT_STREAM_PARITY_COMPLETE";
+    let full_name = concat!(module_path!(),
+        "::model_present_extraction_cohorts_preserve_complete_serial_streams");
+    let name = full_name.split_once("::").expect("crate-qualified test name").1;
+    if std::env::var(CHILD).ok().as_deref() != Some(name) {
+        // Own the first installation instead of inheriting another test's
+        // process-wide host budget or runtime preset.
+        let result = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", name, "--ignored", "--nocapture"]).env(CHILD, name)
+            .output().expect("isolated extraction parity fixture must start");
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(result.status.success(), "isolated extraction fixture failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&result.stderr));
+        assert!(stdout.contains(COMPLETE), "exact fixture filter ran no completed fixture");
+        return;
+    }
+    assert!(crate::installed_process_resources().is_none());
+    let snapshot = std::env::var("FNLP_INT4_PREFILL_SNAPSHOT").expect("explicit existing snapshot required");
+    let pin = std::env::var("FNLP_INT4_PREFILL_MODEL_SHA256").expect("independent model-content pin required");
+    let schema = std::env::var("FNLP_INT4_TEST_EXTRACTION_SCHEMA").expect("explicit bounded structural schema required");
+    let declaration = std::fs::read_to_string(&schema).expect("explicit schema must be readable");
+    let memory = std::env::var("FNLP_INT4_TEST_MEMORY_MIB").expect("explicit memory ceiling required");
+    let kernel = std::env::var("FNLP_INT4_TEST_KERNEL").expect("explicit kernel required");
+    let kind: Int8KernelKind = kernel.parse().expect("canonical kernel ID required");
+    PackedInt4Kernel::detect(kind).expect("requested kernel must be supported");
+    let input = extraction_parity_input();
+    let mut expected = None;
+    let mut task_budget = None;
+    // Width one exercises the cohort adapter itself. Width two fills a real
+    // window; width four also drains partial windows at flush and EOF.
+    for flags in [&[][..], &["--cohort-documents", "1"][..],
+        &["--cohort-documents", "2"][..], &["--cohort-documents", "4"][..]] {
+        let mut argv = vec!["candidate", "source-int4", "extract-batch",
+            "--snapshot", &snapshot, "--expected-model-sha256", &pin,
+            "--schema", &schema, "--memory-mib", &memory, "--kernel", &kernel,
+            "--context-tokens", "2048", "--max-new-tokens", "128",
+            "--max-requests", "7", "--timeout-seconds", "86400"];
+        argv.extend_from_slice(flags);
+        let matches = crate::candidate_cli::definition().try_get_matches_from(argv).unwrap();
+        let CandidateCommand::SourceInt4(command) = CandidateCommand::from_matches(&matches).unwrap()
+            else { panic!("wrong extraction route"); };
+        let Int4Command { task: Int4Task::ExtractBatch(batch), args, batch: None, job: None } = command
+            else { panic!("extraction stream task required"); };
+        let limits = batch.validate(&args).expect("explicit memory must admit the complete declared window");
+        let budget = batch.extraction.budget(&args, limits.common);
+        if let Some(expected) = task_budget { assert_eq!(budget, expected); }
+        else { task_budget = Some(budget); }
+        let program = JsonProgram::compile(&declaration, batch.extraction.compiler()).unwrap();
+        let output = SharedOutput::default();
+        // Malformed input is a failed record even when the protocol drains.
+        assert_eq!(batch.execute_owned(args, Cursor::new(input.clone()), output.clone()),
+            Err(CandidateError::Batch));
+        let bytes = output.0.lock().unwrap().clone();
+        assert!(bytes.ends_with(b"\n"));
+        let mut events = Vec::new();
+        for line in bytes.split(|&byte| byte == b'\n').filter(|line| !line.is_empty()) {
+            let mut value: serde_json::Value = serde_json::from_slice(line).unwrap();
+            assert_eq!(value["protocol"], "fnlp-candidate-int4-extract-batch-v1");
+            assert_eq!(value["task"], "extract");
+            assert_eq!(value["evidence"], "non_authoritative");
+            assert_eq!(value["model_content_sha256"], pin);
+            let schedule = value.as_object_mut().unwrap().remove("cohort_schedule");
+            if let Some(documents) = limits.cohort_documents {
+                assert_eq!(schedule, Some(serde_json::to_value(CohortSchedule::new(documents)).unwrap()));
+                assert_eq!(value["record"]["execution"], crate::batch::grouped::GROUPED_EXECUTION);
+            } else {
+                assert!(schedule.is_none());
+                assert_eq!(value["record"]["execution"], crate::batch::BATCH_EXECUTION);
+            }
+            // Keep every task result, exact JSON string, token, work counter,
+            // source field, offset, epoch, error and footer. Only the declared
+            // outer schedule and transport execution mode may differ.
+            value["record"].as_object_mut().unwrap().remove("execution");
+            events.push(value);
+        }
+        assert_eq!(events.first().unwrap()["record"]["event"], "run_start");
+        let documents: Vec<_> = events.iter().filter(|event| event["record"]["event"] == "doc").collect();
+        assert_eq!(documents.len(), 5);
+        assert_eq!(documents.iter().map(|event| event["record"]["request_seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(), [1, 2, 4, 6, 7]);
+        assert_eq!(documents[0]["record"]["caller_id"], documents[3]["record"]["caller_id"]);
+        assert_eq!(documents[0]["record"]["epoch"], 1);
+        assert_eq!(documents[3]["record"]["epoch"], 2);
+        assert_eq!(documents[0]["record"]["result"], documents[3]["record"]["result"]);
+        for document in &documents {
+            let result = &document["record"]["result"];
+            assert_eq!(result["execution"], crate::tasks::extract::grouped_int4::INT4_EXTRACT_VERSION);
+            assert_eq!(result["result"]["output"]["numerics_profile"],
+                crate::native_engine::strict_int4::STRICT_INT4_PROFILE);
+            program.validate_json(result["result"]["output"]["json"].as_str().unwrap()).unwrap();
+        }
+        let errors: Vec<_> = events.iter().filter(|event| event["record"]["event"] == "doc_error").collect();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["record"]["request_seq"], 3);
+        assert_eq!(errors[0]["record"]["error"]["code"], "invalid_json");
+        let footer = &events.last().expect("terminal event")["record"];
+        assert_eq!(footer["event"], "run_complete");
+        assert_eq!(footer["summary"]["input_bytes"], input.len());
+        assert_eq!(footer["summary"]["requests"], 7);
+        assert_eq!(footer["summary"]["succeeded"], 5);
+        assert_eq!(footer["summary"]["failed"], 1);
+        assert_eq!(footer["summary"]["flushes"], 2);
+        if let Some(expected) = &expected { assert_eq!(&events, expected); }
+        else { expected = Some(events); }
+    }
+    println!("{COMPLETE}");
 }
