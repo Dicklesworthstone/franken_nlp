@@ -56,9 +56,12 @@ fn every_map_uses_whole_document_limits_on_source_and_pinned_snapshot_routes() {
 }
 
 #[test]
-fn raw_chunk_cohorts_preserve_task_budgets_and_all_document_authority() {
-    for kind in [Kind::Ner, Kind::Keyphrases] {
-        let (serial, mut args) = arguments(kind, &["--max-result-bytes", "65536"]);
+fn chunk_cohorts_preserve_task_budgets_and_all_document_authority() {
+    for (kind, mode) in [(Kind::Ner, &[][..]), (Kind::Keyphrases, &[][..]),
+        (Kind::Summarize, &["--max-summary-bullets", "3"][..]),
+        (Kind::Keyphrases, &["--reduce-keyphrases", "--document-keyphrases", "3"][..])] {
+        let mut flags = mode.to_vec(); flags.extend_from_slice(&["--max-result-bytes", "65536"]);
+        let (serial, mut args) = arguments(kind, &flags);
         args.memory_mib = 262_144;
         let original = serial.validate(&args).unwrap();
         let budget = serial.source.budget(&args, original.common);
@@ -76,6 +79,21 @@ fn raw_chunk_cohorts_preserve_task_budgets_and_all_document_authority() {
                 original.mapping.mask_limits.max_trie_node_visits);
             assert_eq!(limits.mapping.verification, original.mapping.verification);
             assert_eq!(limits.workspace_bytes, original.workspace_bytes);
+            assert_eq!(limits.max_result_bytes, original.max_result_bytes);
+            if let Some(summary) = limits.summary {
+                let expected = original.summary.unwrap();
+                assert_eq!(summary.max_bullets, 3);
+                assert_eq!(summary.max_result_bytes, expected.max_result_bytes);
+                assert_eq!(summary.aggregation, expected.aggregation);
+            }
+            if let Some(keyphrases) = limits.keyphrases {
+                let expected = original.keyphrases.unwrap();
+                assert_eq!(keyphrases.max_phrases, 3);
+                assert_eq!(keyphrases.max_result_bytes, expected.max_result_bytes);
+                let (got, want) = (keyphrases.aggregation, expected.aggregation);
+                assert_eq!((got.max_unique_phrases, got.max_evidence_spans, got.max_value_bytes, got.max_scan_work),
+                    (want.max_unique_phrases, want.max_evidence_spans, want.max_value_bytes, want.max_scan_work));
+            }
             let mut reduction = limits.mapping.reduction;
             assert_eq!(reduction.map_batch_chunks, chunks);
             reduction.map_batch_chunks = 1;
@@ -89,9 +107,11 @@ fn raw_chunk_cohorts_preserve_task_budgets_and_all_document_authority() {
 
 #[test]
 fn complete_chunk_cohort_memory_is_admitted_before_source_snapshot_or_output_io() {
-    for kind in [Kind::Ner, Kind::Keyphrases] {
+    for (kind, mode) in [(Kind::Ner, &[][..]), (Kind::Keyphrases, &[][..]),
+        (Kind::Summarize, &[][..]), (Kind::Keyphrases, &["--reduce-keyphrases"][..])] {
         for snapshot in [false, true] {
-            let (map, mut args) = arguments(kind, &["--cohort-chunks", "4"]);
+            let mut flags = mode.to_vec(); flags.extend_from_slice(&["--cohort-chunks", "4"]);
+            let (map, mut args) = arguments(kind, &flags);
             args.memory_mib = 262_144;
             if snapshot {
                 args.source_dir = None; args.source_manifest = None;
@@ -105,8 +125,11 @@ fn complete_chunk_cohort_memory_is_admitted_before_source_snapshot_or_output_io(
                 max_result_bytes_per_chunk: budget.max_output_bytes,
             }.requirements(args.group_width).unwrap();
             assert_eq!(limits.cohort, Some(quote));
-            let tokens = map.mapping.max_chunks as u64 * u64::from(budget.max_output_tokens);
-            let output = (map.mapping.max_map_result_bytes as u64 + 4096) * 4 + tokens * 8 + 4096;
+            let tokens = if limits.summary.is_some() || limits.keyphrases.is_some() { 0 }
+                else { map.mapping.max_chunks as u64 * u64::from(budget.max_output_tokens) };
+            // Aggregates omit native transcripts from final output, while
+            // complete map tokens and all candidates remain in workspace.
+            let output = (limits.max_result_bytes as u64 + 4096) * 4 + tokens * 8 + 4096;
             let input = args.max_input_bytes as u64 + 1 + common.preparation_bytes;
             let execution = quote.native.kv_bytes + quote.native.rope_bytes + quote.native.scratch_payload_bound
                 + ALLOCATOR_BYTES + quote.workspace_bytes + input + limits.workspace_bytes + output;
@@ -124,9 +147,9 @@ fn complete_chunk_cohort_memory_is_admitted_before_source_snapshot_or_output_io(
 }
 
 #[test]
-fn unsupported_aggregate_summary_question_and_owned_job_routes_cannot_ignore_chunk_cohorts() {
+fn unsupported_synthesis_question_and_owned_job_routes_cannot_ignore_chunk_cohorts() {
     for command in definitions() {
-        let enabled = matches!(command.get_name(), "ner-map" | "keyphrases-map");
+        let enabled = matches!(command.get_name(), "ner-map" | "keyphrases-map" | "summarize-map");
         assert_eq!(command.get_arguments().any(|arg| arg.get_id() == "cohort_chunks"), enabled);
     }
     let jobs = super::super::document_job::definition();
@@ -136,18 +159,22 @@ fn unsupported_aggregate_summary_question_and_owned_job_routes_cannot_ignore_chu
                 "{} {} must not advertise unimplemented cohort jobs", operation.get_name(), task.get_name());
         }
     }
-    let mut keyphrases = definitions().into_iter().find(|c| c.get_name() == "keyphrases-map").unwrap();
-    assert!(keyphrases.try_get_matches_from_mut(["keyphrases-map", "--source-dir", "source",
-        "--source-manifest", "manifest", "--memory-mib", "8192", "--cohort-chunks", "2",
-        "--reduce-keyphrases"]).is_err());
-    for (kind, flags) in [(Kind::Summarize, &[][..]),
-        (Kind::Answer, &["--question", "private-question.txt"][..]),
-        (Kind::Keyphrases, &["--reduce-keyphrases"][..])] {
+    for flags in [&["--synthesize-summary"][..], &["--synthesize-summary", "--hierarchical-summary"][..]] {
+        let summary = definitions().into_iter().find(|c| c.get_name() == "summarize-map").unwrap();
+        let mut argv = vec!["summarize-map", "--source-dir", "source", "--source-manifest", "manifest",
+            "--memory-mib", "8192", "--cohort-chunks", "2"];
+        argv.extend_from_slice(flags);
+        assert!(summary.try_get_matches_from(argv).is_err());
+    }
+    for (kind, flags) in [(Kind::Summarize, &["--synthesize-summary"][..]),
+        (Kind::Summarize, &["--synthesize-summary", "--hierarchical-summary"][..]),
+        (Kind::Answer, &["--question", "private-question.txt"][..])] {
         let (mut map, args) = arguments(kind, flags); map.cohort_chunks = Some(2);
         assert_eq!(map.execute(args, &mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
     }
-    for kind in [Kind::Ner, Kind::Keyphrases] {
-        let (mut map, args) = arguments(kind, &[]);
+    for (kind, mode) in [(Kind::Ner, &[][..]), (Kind::Keyphrases, &[][..]),
+        (Kind::Summarize, &[][..]), (Kind::Keyphrases, &["--reduce-keyphrases"][..])] {
+        let (mut map, args) = arguments(kind, mode);
         map.validate_document_job(&args, false).unwrap();
         map.cohort_chunks = Some(1);
         assert!(map.validate_document_job(&args, false).is_err());
@@ -156,7 +183,7 @@ fn unsupported_aggregate_summary_question_and_owned_job_routes_cannot_ignore_chu
 
 #[test]
 fn invalid_chunk_width_and_complete_window_output_fail_before_io() {
-    for kind in [Kind::Ner, Kind::Keyphrases] {
+    for kind in KINDS {
         for flags in [vec!["--cohort-chunks", "0"], vec!["--cohort-chunks", "65"],
             vec!["--cohort-chunks", "2", "--max-chunks", "1"], vec!["--cohort-chunks", "64"]] {
             // Sixty-four one-MiB rows cannot fit their complete 64-MiB envelope.
@@ -307,9 +334,11 @@ fn unavailable_runtime_never_reads_options_document_or_model() {
         assert_eq!(command(kind, &[]).execute(&mut NoRead, &mut output), Err(CandidateError::Unavailable));
         assert!(output.is_empty());
     }
-    for kind in [Kind::Ner, Kind::Keyphrases] {
+    for (kind, mode) in [(Kind::Ner, &[][..]), (Kind::Keyphrases, &[][..]),
+        (Kind::Summarize, &[][..]), (Kind::Keyphrases, &["--reduce-keyphrases"][..])] {
         for chunks in ["1", "4"] {
-            let mut command = command(kind, &["--cohort-chunks", chunks]); command.args.memory_mib = 262_144;
+            let mut flags = mode.to_vec(); flags.extend_from_slice(&["--cohort-chunks", chunks]);
+            let mut command = command(kind, &flags); command.args.memory_mib = 262_144;
             let mut output = Vec::new();
             assert_eq!(command.execute(&mut NoRead, &mut output), Err(CandidateError::Unavailable));
             assert!(output.is_empty());

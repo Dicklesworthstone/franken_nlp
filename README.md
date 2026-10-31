@@ -1962,8 +1962,9 @@ keyphrases. Unknown keys, duplicate keys, partial options and task switching
 are refused. Free-text generation controls and prefill overrides are not
 accepted.
 
-For `ner-map` and raw `keyphrases-map`, `--cohort-chunks N` explicitly groups
-1 through 64 independent chunks through the native INT4 decoder. The width
+For `ner-map`, `keyphrases-map` (including `--reduce-keyphrases`) and default
+`summarize-map`, `--cohort-chunks N` explicitly groups 1 through 64 independent
+chunks through the native INT4 decoder. The width
 cannot exceed `--max-chunks`; the complete declared native/decoder window,
 all prepared chunks, reduction frontier and final output must fit admission.
 The final partial window uses its exact row count. Each chunk keeps its
@@ -1971,10 +1972,12 @@ original task budget, source grammar and causal context, and all original-source
 occurrences are independently verified and lifted through the existing reducer.
 Whole-document work, masks and verification allowances never renew per window.
 The original result remains under `output`; `cohort_schedule` carries the
-declared width and actual physical counts, while `output.mapped.map_batches`
-reflects the chosen schedule. Omitting the flag retains serial execution.
+declared width and actual physical counts. Raw maps expose the chosen schedule
+in `output.mapped.map_batches`; aggregate summaries and ranked keyphrases use
+`output.map_batches`. All aggregate candidates and evidence survive until the
+complete document's final selection. Omitting the flag retains serial execution.
 
-`--cohort-chunks` cannot be combined with `--reduce-keyphrases`; CLI summaries,
+`--cohort-chunks` cannot be combined with neural summary synthesis or hierarchy;
 QA and durable document jobs retain their existing execution paths. The
 library's `NlpEngine::map_int4_source_cohorts` additionally supports raw
 independent summary chunks through `SourceMapTask::Summarize`. It returns the
@@ -1999,13 +2002,17 @@ original chunk population has finished.
 fnlp candidate source-int4 keyphrases-map report.txt \
   --snapshot /models/nanbeige.int4.snapshot \
   --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
-  --memory-mib 8192 --group-width 128 \
-  --reduce-keyphrases --document-keyphrases 12
+  --memory-mib 32768 --group-width 128 \
+  --reduce-keyphrases --document-keyphrases 12 --cohort-chunks 4
 ```
 
 The optional `--options FILE` still controls each native chunk independently.
 For example, `{"max_phrases":16,"max_phrase_scalars":256}` permits sixteen
 proposals per chunk while the command above retains twelve final phrases.
+The cohort width shares native decoder layers across independent chunks; it
+does not prune their proposals or widen any chunk's task budget. The complete
+candidate/evidence frontier is admitted even when only one final phrase is
+requested. Omit `--cohort-chunks` for the original serial map execution.
 Candidates are ordered by distinct supporting-chunk count descending, sum
 of local ranks ascending, earliest original byte offset ascending, then
 exact lexical bytes. Repeated occurrences in one chunk retain all their
@@ -2060,6 +2067,12 @@ verified citations survive intermediate reductions; the final
 `--max-summary-bullets` cap is applied once after every chunk completes.
 Ranking uses distinct supporting chunk count, local rank sum, earliest
 source occurrence, and then exact bullet text as a deterministic tie-break.
+Add `--cohort-chunks N` to run the native maps in shared-layer windows before
+this same complete-document union. Every bullet and citation still reaches
+the reducer; `--max-summary-bullets` does not reduce the admitted map/frontier
+storage. Size `--memory-mib` for the complete simultaneous native window and
+retained evidence. This option is available for the default union, without
+`--synthesize-summary` or `--hierarchical-summary`.
 
 For a `summary-options.json` file:
 

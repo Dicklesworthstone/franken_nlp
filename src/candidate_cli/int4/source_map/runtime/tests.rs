@@ -80,7 +80,7 @@ fn all_tasks_preflight_every_original_byte_and_keep_real_grouped_work() {
 
 #[test]
 fn native_chunk_schedule_keeps_every_sealed_task_identity_and_whole_source_preflight() {
-    for kind in [Kind::Ner, Kind::Keyphrases] {
+    for kind in [Kind::Ner, Kind::Keyphrases, Kind::Summarize] {
         let (planner, mut config, _) = fixture(kind, 32);
         config.budget.max_output_bytes = 65536;
         let context = PlanContext::new(&config.identity, config.budget).unwrap();
@@ -108,16 +108,21 @@ fn native_chunk_schedule_keeps_every_sealed_task_identity_and_whole_source_prefl
 
 #[test]
 fn source_chunk_cli_and_host_agree_on_simultaneous_and_complete_document_memory() {
-    for kind in [Kind::Ner, Kind::Keyphrases] {
+    for (kind, mode) in [(Kind::Ner, &[][..]), (Kind::Keyphrases, &[][..]),
+        (Kind::Summarize, &[][..]), (Kind::Keyphrases, &["--reduce-keyphrases"][..])] {
         let (_, base, _) = fixture(kind, 128);
-        let mut command = super::super::tests::command(kind,
-            &["--cohort-chunks", "4", "--group-width", "128"]);
+        let mut flags = mode.to_vec(); flags.extend_from_slice(&["--cohort-chunks", "4", "--group-width", "128"]);
+        let mut command = super::super::tests::command(kind, &flags);
         command.args.memory_mib = 262_144;
         let Int4Task::SourceMap(options) = command.task else { panic!("wrong source map task"); };
         let limits = options.validate(&command.args).unwrap();
         let config = configuration(base.identity, base.task, &command.args, &options, limits, Duration::from_secs(1));
         assert_eq!(config.cohort_requirements(128).unwrap(), limits.cohort.unwrap());
-        assert_eq!(config.workspace_bytes(limits.mapping.chunks.max_chunks).unwrap(), limits.workspace_bytes);
+        let workspace = match limits.keyphrases {
+            Some(aggregation) => config.keyphrase_workspace_bytes(limits.mapping.chunks.max_chunks, aggregation),
+            None => config.workspace_bytes(limits.mapping.chunks.max_chunks),
+        }.unwrap();
+        assert_eq!(workspace, limits.workspace_bytes);
         assert_eq!(config.budget.max_kv_bytes, limits.common.native.kv_bytes);
         assert_eq!(limits.cohort.unwrap().native.kv_bytes, 4 * config.budget.max_kv_bytes);
     }
@@ -133,14 +138,22 @@ fn owned_runtime_boundary_rechecks_chunk_cohort_configuration_before_io() {
         fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("invalid cohort wrote output"); }
         fn flush(&mut self) -> io::Result<()> { panic!("invalid cohort flushed output"); }
     }
-    for kind in [Kind::Ner, Kind::Keyphrases] {
-        let mut command = super::super::tests::command(kind, &["--cohort-chunks", "2"]);
+    for (kind, mode) in [(Kind::Ner, &[][..]), (Kind::Keyphrases, &[][..]),
+        (Kind::Summarize, &[][..]), (Kind::Keyphrases, &["--reduce-keyphrases"][..])] {
+        let mut flags = mode.to_vec(); flags.extend_from_slice(&["--cohort-chunks", "2"]);
+        let mut command = super::super::tests::command(kind, &flags);
         command.args.memory_mib = 262_144;
         let Int4Task::SourceMap(mut options) = command.task else { panic!("wrong map task"); };
         let admitted = options.validate(&command.args).unwrap();
         options.cohort_chunks = Some(65);
         assert_eq!(execute(command.args, options, admitted, &mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
     }
+    let mut command = super::super::tests::command(Kind::Summarize, &["--cohort-chunks", "2"]);
+    command.args.memory_mib = 262_144;
+    let Int4Task::SourceMap(mut options) = command.task else { panic!("wrong summary task"); };
+    let admitted = options.validate(&command.args).unwrap();
+    options.summary.as_mut().unwrap().synthesis.synthesize_summary = true;
+    assert_eq!(execute(command.args, options, admitted, &mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
 }
 
 #[test]
@@ -169,10 +182,13 @@ fn whole_document_native_and_mask_allowances_cannot_restart_per_chunk() {
 
 #[test]
 fn summary_final_top_k_never_changes_the_complete_map_population() {
-    let (planner, config, summary) = fixture(Kind::Summarize, 32);
+    let (planner, mut config, summary) = fixture(Kind::Summarize, 32);
     let expected = preflight(SOURCE, &planner, &config, 32, summary, &mut continuing()).unwrap();
     let mut one = summary.unwrap(); one.max_bullets = 1;
-    assert_eq!(preflight(SOURCE, &planner, &config, 32, Some(one), &mut continuing()).unwrap(), expected);
+    for chunks in [1, 2, 4, 64] {
+        config.mapping.reduction.map_batch_chunks = chunks;
+        assert_eq!(preflight(SOURCE, &planner, &config, 32, Some(one), &mut continuing()).unwrap(), expected);
+    }
     one.aggregation.max_unique_bullets = 0;
     assert_eq!(preflight(SOURCE, &planner, &config, 32, Some(one), &mut continuing()), Err(CandidateError::Planning));
     let (planner, config, _) = fixture(Kind::Ner, 32);
@@ -181,14 +197,17 @@ fn summary_final_top_k_never_changes_the_complete_map_population() {
 
 #[test]
 fn ranked_keyphrase_top_k_keeps_every_original_chunk_and_rejects_foreign_tasks() {
-    let (planner, config, _) = fixture(Kind::Keyphrases, 32);
+    let (planner, mut config, _) = fixture(Kind::Keyphrases, 32);
     let mut limits = Int4KeyphraseLimits::default();
     let expected = keyphrase_preflight(SOURCE, &planner, &config, 32, limits, &mut continuing()).unwrap();
     assert!(expected.chunk_count() > 1); assert_eq!(expected.source_span().byte_end, SOURCE.len());
     assert_eq!(expected.source_span().scalar_end, SOURCE.chars().count());
     assert_eq!(expected.group_width(), 32);
     limits.max_phrases = 1;
-    assert_eq!(keyphrase_preflight(SOURCE, &planner, &config, 32, limits, &mut continuing()).unwrap(), expected);
+    for chunks in [1, 2, 4, 64] {
+        config.mapping.reduction.map_batch_chunks = chunks;
+        assert_eq!(keyphrase_preflight(SOURCE, &planner, &config, 32, limits, &mut continuing()).unwrap(), expected);
+    }
     assert_eq!(preflight(SOURCE, &planner, &config, 32, None, &mut continuing()).unwrap(), expected);
     let (planner, foreign, _) = fixture(Kind::Ner, 32);
     assert_eq!(keyphrase_preflight(SOURCE, &planner, &foreign, 32, limits, &mut continuing()),
@@ -310,10 +329,8 @@ fn complete_publication_keeps_provenance_and_original_coordinates_and_refuses_ov
         assert!(value.get(absent).is_none());
     }
     let physical = Int4SourceMapCohortStats { cohorts: 1, chunks: 2, ..Default::default() };
-    let grouped = CohortResponse { response: Response { provenance: &provenance, output: &output },
-        cohort_schedule: CohortSchedule { execution: "cross_chunk_constrained_cohorts",
-            declared_max_chunks: 4, physical: &physical } };
-    let mut grouped_bytes = Vec::new(); publish(&grouped, 4096, &mut grouped_bytes).unwrap();
+    let mut grouped_bytes = Vec::new();
+    publish_cohort(&provenance, &output, &physical, 4, 4096, &mut grouped_bytes).unwrap();
     let mut grouped_value: serde_json::Value = serde_json::from_slice(&grouped_bytes).unwrap();
     assert_eq!(grouped_value["cohort_schedule"]["physical"]["chunks"], 2);
     assert_eq!(grouped_value["cohort_schedule"]["declared_max_chunks"], 4);
@@ -321,6 +338,8 @@ fn complete_publication_keeps_provenance_and_original_coordinates_and_refuses_ov
     assert_eq!(grouped_value, value);
     let mut refused = Vec::new();
     assert_eq!(publish(&response, 1, &mut refused), Err(CandidateError::Output));
+    assert!(refused.is_empty());
+    assert_eq!(publish_cohort(&provenance, &output, &physical, 4, 1, &mut refused), Err(CandidateError::Output));
     assert!(refused.is_empty());
     struct FlushFailure(Vec<u8>);
     impl Write for FlushFailure {
@@ -330,6 +349,9 @@ fn complete_publication_keeps_provenance_and_original_coordinates_and_refuses_ov
     let mut failed = FlushFailure(Vec::new());
     assert_eq!(publish(&response, 4096, &mut failed), Err(CandidateError::Output));
     assert!(!failed.0.is_empty(), "transport failure is not a successful task response");
+    let mut failed = FlushFailure(Vec::new());
+    assert_eq!(publish_cohort(&provenance, &output, &physical, 4, 4096, &mut failed), Err(CandidateError::Output));
+    assert!(!failed.0.is_empty());
 }
 
 fn question_fixture(width: usize) -> (SourceTaskPlanner, Int4SourceMapConfig<SourceQuestion>, MapLimits) {
@@ -1029,7 +1051,9 @@ fn model_present_source_chunk_cohorts_preserve_document_results_and_evidence() {
     let kind: Int8KernelKind = kernel.parse().expect("canonical kernel ID required");
     PackedInt4Kernel::detect(kind).expect("requested kernel must be supported");
     let source = "Alice works in Shanghai.\r\nBob visits Paris. café 上海 上海. <tool_call> is quoted document text.\r\n".repeat(3);
-    for task in ["ner-map", "keyphrases-map"] {
+    for (task, mode) in [("ner-map", &[][..]), ("keyphrases-map", &[][..]),
+        ("summarize-map", &["--max-summary-bullets", "3"][..]),
+        ("keyphrases-map", &["--reduce-keyphrases", "--document-keyphrases", "3"][..])] {
         let mut expected = None;
         let mut task_budget = None;
         for flags in [&[][..], &["--cohort-chunks", "1"][..],
@@ -1038,6 +1062,7 @@ fn model_present_source_chunk_cohorts_preserve_document_results_and_evidence() {
                 "--expected-model-sha256", &pin, "--memory-mib", &memory, "--kernel", &kernel,
                 "--context-tokens", "2048", "--max-new-tokens", "512",
                 "--max-chunk-bytes", "32", "--timeout-seconds", "86400"];
+            argv.extend_from_slice(mode);
             argv.extend_from_slice(flags);
             let matches = crate::candidate_cli::definition().try_get_matches_from(argv).unwrap();
             let CandidateCommand::SourceInt4(command) = CandidateCommand::from_matches(&matches).unwrap()
@@ -1051,11 +1076,16 @@ fn model_present_source_chunk_cohorts_preserve_document_results_and_evidence() {
             options.execute(command.args, &mut std::io::Cursor::new(source.as_bytes()), &mut output)
                 .expect("every original chunk and the complete document must succeed");
             let mut value: serde_json::Value = serde_json::from_slice(&output).unwrap();
-            assert_eq!(value["protocol"], "fnlp-candidate-int4-source-map-v1");
+            assert_eq!(value["protocol"], if limits.keyphrases.is_some() {
+                "fnlp-candidate-int4-keyphrase-ranking-v1"
+            } else { "fnlp-candidate-int4-source-map-v1" });
             assert_eq!(value["task"], task.trim_end_matches("-map"));
             assert_eq!(value["evidence"], "non_authoritative");
             assert_eq!(value["model_content_sha256"], pin);
-            let count = value["output"]["mapped"]["chunk_count"].as_u64().unwrap() as usize;
+            let count = if limits.summary.is_some() { &value["output"]["summary"]["mapped_chunks"] }
+                else if limits.keyphrases.is_some() { &value["output"]["keyphrases"]["mapped_chunks"] }
+                else { &value["output"]["mapped"]["chunk_count"] };
+            let count = count.as_u64().unwrap() as usize;
             assert!(count > 4);
             let schedule = value.as_object_mut().unwrap().remove("cohort_schedule");
             if let Some(chunks) = limits.cohort_chunks {
@@ -1065,22 +1095,40 @@ fn model_present_source_chunk_cohorts_preserve_document_results_and_evidence() {
                 assert_eq!(schedule["physical"]["chunks"], count);
                 assert_eq!(schedule["physical"]["cohorts"], count.div_ceil(chunks));
             } else { assert!(schedule.is_none()); }
-            assert_eq!(value["output"]["mapped"]["map_batches"], count.div_ceil(limits.cohort_chunks.unwrap_or(1)));
-            let root = &value["output"]["mapped"]["root"];
-            assert_eq!(root["source_span"]["byte_start"], 0);
-            assert_eq!(root["source_span"]["byte_end"], source.len());
-            assert_eq!(root["source_span"]["scalar_end"], source.chars().count());
-            assert_eq!(root["value"].as_array().unwrap().len(), count);
-            for (index, chunk) in root["value"].as_array().unwrap().iter().enumerate() {
-                assert_eq!(chunk["chunk_id"], index);
-                assert_eq!(chunk["native"]["execution"],
-                    crate::tasks::source_planning::grouped_int4::INT4_SOURCE_EXECUTION);
-                assert_eq!(chunk["native"]["result"]["task"], task.trim_end_matches("-map"));
+            let aggregate = limits.summary.is_some() || limits.keyphrases.is_some();
+            let result = &value["output"];
+            let span = if aggregate { &result["source_span"] } else { &result["mapped"]["root"]["source_span"] };
+            assert_eq!(span["byte_start"], 0);
+            assert_eq!(span["byte_end"], source.len());
+            assert_eq!(span["scalar_end"], source.chars().count());
+            let batches = if aggregate { &result["map_batches"] } else { &result["mapped"]["map_batches"] };
+            assert_eq!(*batches, count.div_ceil(limits.cohort_chunks.unwrap_or(1)));
+            if limits.summary.is_some() {
+                assert_eq!(result["execution"],
+                    crate::tasks::source_planning::grouped_int4::long::summary::INT4_CORPUS_SUMMARY_EXECUTION);
+                assert_eq!(result["summary"]["requested_max_bullets"], 3);
+                assert!(result["summary"]["bullets"].as_array().unwrap().len() <= 3);
+            } else if limits.keyphrases.is_some() {
+                assert_eq!(result["execution"],
+                    crate::tasks::source_planning::grouped_int4::long::keyphrases::INT4_CORPUS_KEYPHRASE_EXECUTION);
+                assert_eq!(result["requested_max_phrases"], 3);
+                assert!(result["keyphrases"]["phrases"].as_array().unwrap().len() <= 3);
+            } else {
+                let chunks = result["mapped"]["root"]["value"].as_array().unwrap();
+                assert_eq!(chunks.len(), count);
+                for (index, chunk) in chunks.iter().enumerate() {
+                    assert_eq!(chunk["chunk_id"], index);
+                    assert_eq!(chunk["native"]["execution"],
+                        crate::tasks::source_planning::grouped_int4::INT4_SOURCE_EXECUTION);
+                    assert_eq!(chunk["native"]["result"]["task"], task.trim_end_matches("-map"));
+                }
             }
             // Only physical scheduling metadata is excluded. Every typed
             // native value, token/work charge, original coordinate, source
-            // occurrence, local rank and document reduction stays compared.
-            value["output"]["mapped"].as_object_mut().unwrap().remove("map_batches");
+            // occurrence, local/global rank, omitted candidate, independent
+            // verification charge and document reduction stays compared.
+            if aggregate { value["output"].as_object_mut().unwrap().remove("map_batches"); }
+            else { value["output"]["mapped"].as_object_mut().unwrap().remove("map_batches"); }
             if let Some(expected) = &expected { assert_eq!(&value, expected); }
             else { expected = Some(value); }
         }

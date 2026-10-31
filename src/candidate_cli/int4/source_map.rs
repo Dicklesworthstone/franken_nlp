@@ -122,13 +122,13 @@ fn definitions_with_cohorts(cohorts: bool) -> Vec<clap::Command> {
                 Kind::Answer => question::definition(command),
                 _ => command,
             };
-            if cohorts && matches!(kind, Kind::Ner | Kind::Keyphrases) {
+            if cohorts && matches!(kind, Kind::Ner | Kind::Keyphrases | Kind::Summarize) {
                 let command = command.arg(clap::Arg::new("cohort_chunks").long("cohort-chunks")
                     .value_name("N").value_parser(clap::value_parser!(usize))
                     .help("Share native decoder layers across up to N independent chunks (1..=64); serial if omitted")
-                    .long_help("Explicitly execute up to N independent source chunks through shared native INT4 decoder layers. N must be 1..64 and cannot exceed --max-chunks. All original chunk plans and the complete simultaneous native/decoder/output memory are admitted before inference; each actual window, including the final short one, has exact independent causal contexts. The original per-chunk task budgets, native results, source evidence and complete-document work/reduction limits remain unchanged. Available only for raw ner-map and keyphrases-map; keyphrase ranking, summaries, QA and durable document jobs retain their existing execution."));
-                if kind == Kind::Keyphrases {
-                    command.mut_arg("cohort_chunks", |arg| arg.conflicts_with("reduce_keyphrases"))
+                    .long_help("Explicitly execute up to N independent source chunks through shared native INT4 decoder layers. N must be 1..64 and cannot exceed --max-chunks. All original chunk plans and the complete simultaneous native/decoder/output memory are admitted before inference; each actual window, including the final short one, has exact independent causal contexts. The original per-chunk task budgets, source evidence and complete-document work/reduction limits remain unchanged. Raw NER/keyphrase maps retain their independent native results. Default summarize-map and --reduce-keyphrases preserve the complete exact candidate/evidence union, apply final top-k only once and retain their existing aggregate output. Neural synthesis, hierarchy, question maps and durable document jobs do not accept this option."));
+                if kind == Kind::Summarize {
+                    command.mut_arg("cohort_chunks", |arg| arg.conflicts_with_all(["synthesize_summary", "hierarchical_summary"]))
                 } else { command }
             } else { command }
         }).collect()
@@ -179,7 +179,7 @@ impl MapArgs {
         if (self.kind == Kind::Answer) != self.question.is_some()
             || (self.kind == Kind::Summarize) != self.summary.is_some()
             || (self.kind == Kind::Keyphrases) != self.keyphrases.is_some()
-            || self.cohort_chunks.is_some_and(|n| !matches!(self.kind, Kind::Ner | Kind::Keyphrases)
+            || self.cohort_chunks.is_some_and(|n| !matches!(self.kind, Kind::Ner | Kind::Keyphrases | Kind::Summarize)
                 || !(1..=64).contains(&n) || n > m.max_chunks)
             || args.max_input_bytes < 4 || !(1..=256).contains(&m.max_chunks)
             || !(1..=1_000_000).contains(&m.max_tokenizer_calls)
@@ -201,7 +201,6 @@ impl MapArgs {
         let reduction_reserve_bytes = mib(m.reduction_reserve_mib)?;
         let mapping = self.mapping_limits(args)?;
         let keyphrases = self.keyphrases.map(|settings| settings.limits(mapping)).transpose()?.flatten();
-        if self.cohort_chunks.is_some() && keyphrases.is_some() { return Err(CandidateError::Arguments); }
         if let Some(question) = &self.question { question.validate()?; }
         let synthesis = match self.summary {
             Some(s) => s.synthesis.limits(self.planning(args))?,
@@ -219,6 +218,10 @@ impl MapArgs {
             Some(question) => question.hierarchy()?,
             None => None,
         };
+        if self.cohort_chunks.is_some() && (synthesis.is_some() || hierarchy.is_some()
+            || question_synthesis.is_some() || question_hierarchy.is_some()) {
+            return Err(CandidateError::Arguments);
+        }
         let summary = self.summary.filter(|s| !s.synthesis.synthesize_summary && !map_only)
             .map(|s| s.limits(mapping)).transpose()?;
         if let Some(summary) = summary {

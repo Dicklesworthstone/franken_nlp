@@ -143,19 +143,23 @@ success; a drained stream can still contain rejected documents.
 
 ## Chunks of one long document
 
-`candidate source-int4 extract-map`, `ner-map` and raw `keyphrases-map` accept
-`--cohort-chunks N` to apply native grouping to independently planned chunks of
-one complete document. `N` must be 1 through 64 and cannot exceed `--max-chunks`.
-The default remains serial.
+`candidate source-int4 extract-map`, `ner-map`, `keyphrases-map` (including
+`--reduce-keyphrases`) and default `summarize-map` accept `--cohort-chunks N` to
+apply native grouping to independently planned chunks of one complete document.
+`N` must be 1 through 64 and cannot exceed `--max-chunks`. The default remains
+serial.
 
 The planner compiles every actual schema/source chunk before inference. Each
 row retains its exact task identity, output limits, source grammar and causal
 context. The final short window allocates its actual row count; it does not pad
 or duplicate source chunks. Every value and source occurrence then passes the
-existing independent validation and original-coordinate lifting. Reduction
-retains the ordered independent JSON or typed source-task values. It does not
-construct a merged global object, entity census or document-wide phrase ranking.
-A later chunk or reduction failure publishes no document result.
+existing independent validation and original-coordinate lifting. Raw extraction,
+NER and keyphrase maps retain the ordered independent JSON or typed source-task
+values. Default summaries retain the complete exact bullet/evidence union;
+ranked keyphrases retain the complete exact phrase/evidence union. Both aggregate
+modes perform deterministic document-wide ranking only after all chunks finish,
+with top-k applied once at the final root. A later chunk or reduction failure
+publishes no document result.
 
 The pre-IO quote covers the entire declared simultaneous window. The host
 checks all actual windows and retains componentwise peak native and decoder
@@ -180,16 +184,33 @@ memory/budget/result types. Supported raw library tasks are NER, keyphrases
 and independently cited summary chunks; the original task finalizers still
 run inside the native session before original-coordinate map verification.
 The CLI keeps the document under `output` and reports the declared width and
-actual physical counts under `cohort_schedule`. `output.mapped.map_batches`
-also reflects the chosen schedule; per-chunk identities and source semantics
-are unchanged. Width 1 explicitly selects the cohort path for comparison.
+actual physical counts under `cohort_schedule`. Raw maps expose physical batch
+counts in `output.mapped.map_batches`; aggregate summaries and ranked keyphrases
+use `output.map_batches`. Per-chunk identities and source semantics are unchanged.
+Width 1 explicitly selects the cohort path for comparison.
 
-`keyphrases-map --reduce-keyphrases`, `summarize-map`, question-aware maps,
-neural summary/answer synthesis and durable document jobs retain their existing
-execution. They do not advertise or silently ignore the new chunk option.
-Both direct argument parsing and owned job admission refuse unsupported cohort
-requests. The library's raw summary cohort result is not the CLI's aggregated
-summary or a replacement for its separate reduction/synthesis budget contracts.
+For example, retain twelve globally ranked phrases from complete native maps:
+
+```sh
+fnlp candidate source-int4 keyphrases-map report.txt \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256_FROM_TRUSTED_CONVERSION" \
+  --memory-mib 32768 --group-width 128 \
+  --reduce-keyphrases --document-keyphrases 12 --cohort-chunks 4
+```
+
+Summary and keyphrase aggregation retain their independent verification,
+candidate/evidence and final-result limits. A small final top-k cannot shrink
+the full transient native output or evidence frontier. Aggregate results omit
+native token transcripts; those transient tokens remain funded until native
+execution and reduction complete. The hosted aggregate methods described above
+feed these reducers directly without retaining a separate raw-map document.
+
+Question-aware maps, neural summary/answer synthesis and durable document jobs
+retain their existing execution. Both direct argument parsing and owned job
+admission refuse unsupported cohort requests. `summarize-map --cohort-chunks`
+conflicts with `--synthesize-summary` and `--hierarchical-summary`; those modes
+have separate reduction and synthesis budget contracts.
 
 All source-derived masks and occurrence state stay document-owned. Structural
 validity and exact source membership do not certify semantic accuracy or factual
@@ -203,3 +224,11 @@ tasks, including malformed rows, task-switch rejection, flush/ID reuse, separate
 QA passages and EOF without a trailing newline. Rust builds, tests, and
 model/performance qualification remain pending
 the repository's controller-selected DSR checkpoint.
+
+Chunk-aggregate regression source additionally covers exact union/ranking
+across widths and ragged tails, whole-batch identity/cardinality rejection,
+late invalid evidence and cancellation, cumulative verification exhaustion,
+complete candidate storage and guarded output/flush failures. An ignored
+model-present fixture compares raw maps, aggregate summaries and global
+keyphrase rankings at serial execution and cohort widths 1, 2 and 4, excluding
+only physical scheduling fields. These fixtures remain unrun.
