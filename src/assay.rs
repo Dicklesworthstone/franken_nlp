@@ -14,6 +14,7 @@ use crate::{
 };
 
 mod dataset;
+pub(crate) mod label_metrics;
 pub mod calibrate;
 pub mod qualify;
 pub mod native_classify;
@@ -124,8 +125,11 @@ pub struct BootstrapOptions {
 #[serde(deny_unknown_fields)]
 pub struct EvalOptions {
     pub minimum_samples: usize,
-    /// A row is accepted as a positive event when p(positive) >= this value.
-    /// This is not max(p,1-p) classification confidence.
+    /// Supplied binary events and native binary Assay accept p(positive) at
+    /// this threshold. Multiclass requires a native decision and top-label
+    /// weight at threshold. Multilabel requires every native head to decide
+    /// and every selected-side weight (p or 1-p) to reach threshold. These
+    /// uncalibrated weights do not claim correctness confidence.
     pub acceptance_threshold: f64,
     pub bootstrap: BootstrapOptions,
 }

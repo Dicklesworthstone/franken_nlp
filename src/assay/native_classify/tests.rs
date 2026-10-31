@@ -32,19 +32,20 @@ pub(super) fn gates() -> Gates {
 }
 pub(super) fn wire(gold: &[bool], policy: ClassificationPolicy) -> (SuiteManifest, Vec<Row>) {
     let mut rows = vec![Row { schema_version: 1, id: "private-development".to_owned(),
-        split: Split::Development, text: "PRIVATE_DEV é <|im_start|>".to_owned(), positive: true },
+        split: Split::Development, text: "PRIVATE_DEV é <|im_start|>".to_owned(), positive: Some(true), label: None, labels: None },
         Row { schema_version: 1, id: "private-calibration".to_owned(), split: Split::Calibration,
-            text: "PRIVATE_CAL 中文".to_owned(), positive: false }];
+            text: "PRIVATE_CAL 中文".to_owned(), positive: Some(false), label: None, labels: None }];
     let mut locked = Vec::new();
     for (index, &positive) in gold.iter().enumerate() {
         let id = format!("private-test-{index:03}"); locked.push(id.clone());
         rows.push(Row { schema_version: 1, id, split: Split::LockedTest,
-            text: format!("PRIVATE_LOCKED_{index} e\u{301} <think>data</think>"), positive });
+            text: format!("PRIVATE_LOCKED_{index} e\u{301} <think>data</think>"), positive: Some(positive), label: None, labels: None });
     }
     (SuiteManifest { schema_version: 1, task: NATIVE_TASK.to_owned(), dataset_id: "native-suite".to_owned(),
         dataset_version: "v1".to_owned(), named_population: "Owned fixture population".to_owned(),
-        positive_label: ClassificationLabel { id: "positive".to_owned(), description: "The positive event".to_owned() },
-        negative_label: ClassificationLabel { id: "negative".to_owned(), description: "The negative event".to_owned() },
+        positive_label: Some(ClassificationLabel { id: "positive".to_owned(), description: "The positive event".to_owned() }),
+        negative_label: Some(ClassificationLabel { id: "negative".to_owned(), description: "The negative event".to_owned() }),
+        labels: Vec::new(),
         policy, expected_input_sha256: Sha256Digest::of_bytes(b"unbound"),
         splits: SplitIds { development: vec![rows[0].id.clone()], calibration: vec![rows[1].id.clone()], locked_test: locked } }, rows)
 }
@@ -78,8 +79,8 @@ fn eos() -> u32 {
 }
 pub(super) fn run(manifest: &SuiteManifest, p: f64, width: usize) -> Int4ClassificationRun {
     let log = |value: f64| if value == 0.0 { -1000.0 } else { value.ln() };
-    let mut candidates = vec![CandidateScore { id: manifest.positive_label.id.clone(), scored_tokens: 2,
-        sequence_score: log(p), candidate_weight: p }, CandidateScore { id: manifest.negative_label.id.clone(),
+    let mut candidates = vec![CandidateScore { id: manifest.positive_label.as_ref().unwrap().id.clone(), scored_tokens: 2,
+        sequence_score: log(p), candidate_weight: p }, CandidateScore { id: manifest.negative_label.as_ref().unwrap().id.clone(),
             scored_tokens: 2, sequence_score: log(1.0 - p), candidate_weight: 1.0 - p }];
     candidates.sort_by(|a, b| a.id.cmp(&b.id));
     let mut ranking = candidates.iter().collect::<Vec<_>>();
@@ -113,7 +114,7 @@ fn replay_changed(dataset: &Dataset, probabilities: &[f64], subject: &str,
     let mut locked = 0;
     for (index, row) in dataset.rows().iter().enumerate() {
         let p = if row.split == Split::LockedTest { let p = probabilities[locked]; locked += 1; p }
-            else if row.positive { 0.0 } else { 1.0 }; // Deliberately wrong non-test scores.
+            else if row.positive.unwrap() { 0.0 } else { 1.0 }; // Deliberately wrong non-test scores.
         let mut identity = identity(row, subject); let mut budget = budget(); let mut output = run(dataset.manifest(), p, 128);
         change(index, &mut identity, &mut budget, &mut output);
         builder.accept_fixture(index, &identity, budget, work(128), 128, output).unwrap();

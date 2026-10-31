@@ -12,7 +12,7 @@ fn dataset() -> Dataset {
     for (index, &positive) in gold.iter().enumerate().skip(1) {
         let id = format!("private-calibration-{index:03}"); manifest.splits.calibration.push(id.clone());
         rows.push(Row { schema_version: 1, id, split: Split::Calibration,
-            text: format!("PRIVATE_EXTRA_CALIBRATION_{index} é"), positive });
+            text: format!("PRIVATE_EXTRA_CALIBRATION_{index} é"), positive: Some(positive), label: None, labels: None });
     }
     let (manifest, input) = native::encode(manifest, &rows);
     Dataset::parse(&manifest, &input, Limits::default()).unwrap()
@@ -63,6 +63,29 @@ fn parameters(fitted: &FitOutcome) -> serde_json::Value {
 }
 
 #[test]
+fn every_calibration_boundary_refuses_nonbinary_tasks_before_insufficient_data_or_fallback() {
+    use super::super::{TaskKind, taxonomy_tests::{vector_dataset, vector_replay}};
+    let binary_data = dataset();
+    let binary_replay = replay(&binary_data, &CALIBRATION, &LOCKED, "model-a");
+    let artifact = fit(&binary_replay, FitMethod::Isotonic, ShiftPolicy::RawScoresUncalibrated);
+    let application = load(&artifact, apply_options());
+    for kind in [TaskKind::Multiclass, TaskKind::Multilabel] {
+        let data = vector_dataset(kind, &[vec![0], vec![1], vec![2], vec![0], vec![2]]);
+        let replay = vector_replay(&data, &vec![vec![0.8, 0.1, 0.1]; 5], "model-a");
+        assert_eq!(fit_with_checkpoint::<AssayError>(&replay, &native::key(), "scope",
+            fit_options(FitMethod::Isotonic, ShiftPolicy::RawScoresUncalibrated), native::options(),
+            Limits::default(), &mut || Ok(())).err(), Some(AssayError::CalibrationBindingMismatch));
+        assert_eq!(application.validate_dataset(&data, &native::key(), "scope", Limits::default()),
+            Err(AssayError::CalibrationBindingMismatch));
+        assert_eq!(apply_with_checkpoint::<AssayError>(&replay, &application, &native::key(), "scope",
+            native::options(), Limits::default(), &mut || Ok(())).err(), Some(AssayError::CalibrationBindingMismatch));
+        assert_eq!(compare_with_checkpoint::<AssayError>(&replay, &replay, None, None, &native::key(), "scope", "host",
+            native::gates(), native::options(), Limits::default(), &mut || Ok(())).err(),
+            Some(AssayError::CalibrationBindingMismatch));
+    }
+}
+
+#[test]
 fn actual_replay_fit_reloads_exactly_and_retains_original_native_decisions() {
     let data = dataset(); let replay = replay(&data, &CALIBRATION, &LOCKED, "model-a");
     for method in [FitMethod::Isotonic, FitMethod::Temperature] {
@@ -88,7 +111,7 @@ fn actual_replay_fit_reloads_exactly_and_retains_original_native_decisions() {
 fn development_and_locked_test_changes_cannot_change_fitted_parameters() {
     let data = dataset(); let first = replay(&data, &CALIBRATION, &LOCKED, "model-a");
     let mut rows = data.rows().to_vec();
-    for row in &mut rows { if row.split != Split::Calibration { row.positive = !row.positive; } }
+    for row in &mut rows { if row.split != Split::Calibration { row.positive = row.positive.map(|value| !value); } }
     let (manifest, input) = native::encode(data.manifest().clone(), &rows);
     let changed = Dataset::parse(&manifest, &input, Limits::default()).unwrap();
     let other = replay(&changed, &CALIBRATION, &[0.3; 6], "model-a");
@@ -112,7 +135,7 @@ fn exact_model_observation_and_source_scope_mismatches_are_hard_errors_even_for_
             Limits::default(), &mut || Ok(())).err(), Some(AssayError::CalibrationBindingMismatch));
     }
     let mut rows = data.rows().to_vec();
-    let last = rows.last_mut().unwrap(); last.positive = !last.positive;
+    let last = rows.last_mut().unwrap(); last.positive = last.positive.map(|value| !value);
     let (manifest, input) = native::encode(data.manifest().clone(), &rows);
     let changed = Dataset::parse(&manifest, &input, Limits::default()).unwrap();
     assert_eq!(application.validate_dataset(&changed, &native::key(), "scope", Limits::default()),

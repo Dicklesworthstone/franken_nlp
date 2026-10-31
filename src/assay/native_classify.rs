@@ -1,4 +1,4 @@
-//! Actual native binary-classification replay over one frozen labeled corpus.
+//! Actual native classification replay over one frozen labeled corpus.
 //!
 //! Only the hosted native execution owner can construct a replay. Reports
 //! contain no document text, private row IDs or raw private content digests.
@@ -11,9 +11,10 @@ mod dataset;
 mod replay;
 mod report;
 pub mod calibrate;
-pub use dataset::{Dataset, Row, SuiteManifest};
+pub use dataset::{Dataset, Row, SuiteManifest, TaskKind};
+pub use crate::assay::label_metrics::{LabelMode, LabelMetrics, LabelSetMetrics};
 pub use report::{Bindings, ClassMetrics, ClassificationMetrics, Evaluation, EvaluationBody,
-    Gates, QualificationBody, QualificationReport, parse_gates};
+    Gates, NativeMetadata, QualificationBody, QualificationReport, parse_gates};
 pub(crate) use replay::{Collector, NativeReplay};
 pub(crate) use report::{compare_with_checkpoint, evaluate_with_checkpoint, validate_scope};
 #[cfg(test)]
@@ -21,8 +22,12 @@ pub(crate) use report::{compare, evaluate};
 
 pub const NATIVE_EVIDENCE: &str = "native_int4_classification_replay";
 pub const NATIVE_TASK: &str = "binary_classification";
+pub const MULTICLASS_TASK: &str = "multiclass_classification";
+pub const MULTILABEL_TASK: &str = "multilabel_classification";
+pub const MAX_LABELS: usize = 128;
 pub const EXECUTION_COLLECTION_FORMAT: &str = "ordered_full_execution_identity_sha256_framed_v1";
 pub const OBSERVATION_COLLECTION_FORMAT: &str = "ordered_native_binary_observations_sha256_framed_v1";
+pub const VECTOR_OBSERVATION_COLLECTION_FORMAT: &str = "ordered_native_label_vector_observations_sha256_framed_v1";
 
 /// Conservative payload/ownership quote for all retained score, row-ID,
 /// manifest, split-partition, bootstrap, commitment and report staging.
@@ -30,13 +35,21 @@ pub const OBSERVATION_COLLECTION_FORMAT: &str = "ordered_native_binary_observati
 /// the host admits those separately. The complete final output has its own
 /// delivery guard. This is not an operating-system RSS guarantee.
 pub fn required_replay_bytes(limits: Limits, arms: usize) -> Result<u64, AssayError> {
+    required_replay_bytes_for_labels(limits, arms, 2)
+}
+
+/// Extends the row/identity envelope by bounded scalar vectors per label. It
+/// never multiplies document IDs, source bytes or report copies by label count.
+pub fn required_replay_bytes_for_labels(limits: Limits, arms: usize, max_labels: usize)
+    -> Result<u64, AssayError> {
     limits.validate()?;
-    if !(1..=2).contains(&arms) { return Err(AssayError::Limits); }
+    if !(1..=2).contains(&arms) || !(1..=MAX_LABELS).contains(&max_labels) { return Err(AssayError::Limits); }
     let multiply = |a: u64, b: u64| a.checked_mul(b).ok_or(AssayError::Limits);
     let add = |a: u64, b: u64| a.checked_add(b).ok_or(AssayError::Limits);
     // IDs are capped at 256 bytes. This prices their retained copies in the
     // manifest, scores, partition sets and canonical commitment staging.
-    let rows = multiply(limits.max_rows as u64, 2048)?;
+    let row_bytes = add(2048, multiply(max_labels as u64, 32)?)?;
+    let rows = multiply(limits.max_rows as u64, row_bytes)?;
     let manifests = multiply(limits.max_manifest_bytes as u64, 8)?;
     let per_arm = add(add(rows, manifests)?, 65_536)?;
     let all_arms = multiply(per_arm, arms as u64)?;
@@ -56,3 +69,4 @@ fn reserved<T>(count: usize) -> Result<Vec<T>, AssayError> {
 }
 
 #[cfg(test)] mod tests;
+#[cfg(test)] mod taxonomy_tests;

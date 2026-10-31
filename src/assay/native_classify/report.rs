@@ -4,7 +4,8 @@ use crate::{calibration::CalibrationError,
     native_engine::strict_int4::Int4Work,
     receipt::{CommitmentDomain, CommitmentKey, ContentCommitment, ReceiptGrade}};
 use super::*;
-use super::super::{DatasetMetadata, Measurement, qualify::{GateResult, Decision, PairedSummary}};
+use super::super::{label_metrics::{self, LabelMode, LabelSetMetrics, Observation},
+    Measurement, qualify::{GateResult, Decision, PairedSummary}};
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -65,10 +66,31 @@ pub struct ClassificationMetrics {
     pub macro_f1: Option<f64>,
 }
 
+/// Public task metadata contains declared labels, never private source units.
+/// Binary serialization retains the existing positive/negative label fields.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeMetadata {
+    pub dataset_id: String,
+    pub dataset_version: String,
+    pub named_population: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positive_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negative_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    pub task_spec: String,
+    pub model_recipe_id: String,
+    pub prompt_template_sha256: crate::execution_identity::Sha256Digest,
+    pub numerics_profile: String,
+    pub thinking_mode: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Bindings {
-    pub metadata: DatasetMetadata,
+    pub metadata: NativeMetadata,
     pub suite: ContentCommitment,
     pub input: ContentCommitment,
     pub splits: SplitBindings,
@@ -92,6 +114,8 @@ pub struct EvaluationBody {
     pub options: EvalOptions,
     pub measurement: Measurement,
     pub classification: Option<ClassificationMetrics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label_set: Option<LabelSetMetrics>,
     pub executed_rows: usize,
     pub group_width: usize,
     pub model_work: Int4Work,
@@ -141,6 +165,9 @@ pub(crate) fn evaluate(replay: &NativeReplay, key: &CommitmentKey, namespace: &s
 pub(crate) fn evaluate_with_checkpoint<E>(replay: &NativeReplay, key: &CommitmentKey, namespace: &str,
     options: EvalOptions, limits: Limits, checkpoint: &mut impl FnMut() -> Result<(), E>) -> Result<Evaluation, E>
 where E: From<AssayError> + From<CalibrationError> {
+    if !replay.manifest.is_binary() {
+        return evaluate_labels_with_checkpoint(replay, key, namespace, options, limits, checkpoint);
+    }
     evaluate_transformed_with_checkpoint(replay, key, namespace, options, limits, &Ok,
         "uncalibrated_positive_candidate_weight_over_two_completed_labels; full_vocabulary_scored_eos", checkpoint)
 }
@@ -150,6 +177,7 @@ pub(super) fn evaluate_transformed_with_checkpoint<E>(replay: &NativeReplay, key
     options: EvalOptions, limits: Limits, transform: &impl Fn(f64) -> Result<f64, CalibrationError>,
     score_semantics: &str, checkpoint: &mut impl FnMut() -> Result<(), E>) -> Result<Evaluation, E>
 where E: From<AssayError> + From<CalibrationError> {
+    if !replay.manifest.is_binary() { return Err(AssayError::CalibrationBindingMismatch.into()); }
     validate_scope(namespace, None)?; options.validate(limits)?; replay.sizes.validate(limits)?;
     checkpoint()?;
     let bindings = bindings(replay, key, namespace, checkpoint)?;
@@ -165,7 +193,8 @@ where E: From<AssayError> + From<CalibrationError> {
         evidence: NATIVE_EVIDENCE.to_owned(), activation_authority: false, receipt_grade: ReceiptGrade::AuditOnly,
         score_semantics: score_semantics.to_owned(),
         classification_semantics: "native_sequence_score_argmax_then_lexical_label_id; task_policy_abstention; accuracy_correct_over_all_rows".to_owned(),
-        bindings, options, measurement, classification, executed_rows: replay.rows.len(), group_width: replay.group_width,
+        bindings, options, measurement, classification, label_set: None,
+        executed_rows: replay.rows.len(), group_width: replay.group_width,
         model_work: replay.model_work, rewound_positions: replay.rewound_positions };
     let seal = commit(key, namespace, "native_binary_evaluation_v1", &body, limits)?;
     let result = Evaluation { body, seal };
@@ -185,6 +214,10 @@ pub(crate) fn compare_with_checkpoint<E>(candidate: &NativeReplay, baseline: &Na
     key: &CommitmentKey, namespace: &str, host_scope: &str, gates: Gates, options: EvalOptions,
     limits: Limits, checkpoint: &mut impl FnMut() -> Result<(), E>) -> Result<QualificationReport, E>
 where E: From<AssayError> + From<CalibrationError> {
+    if !candidate.manifest.is_binary() || !baseline.manifest.is_binary() {
+        return compare_labels_with_checkpoint(candidate, baseline, key, namespace, host_scope,
+            gates, options, limits, checkpoint);
+    }
     let raw = "uncalibrated_positive_candidate_weight_over_two_completed_labels; full_vocabulary_scored_eos";
     compare_transformed_with_checkpoint(candidate, baseline, key, namespace, host_scope, gates, options, limits,
         &Ok, &Ok, raw, raw, checkpoint)
@@ -197,6 +230,9 @@ pub(super) fn compare_transformed_with_checkpoint<E>(candidate: &NativeReplay, b
     baseline_transform: &impl Fn(f64) -> Result<f64, CalibrationError>, candidate_semantics: &str,
     baseline_semantics: &str, checkpoint: &mut impl FnMut() -> Result<(), E>) -> Result<QualificationReport, E>
 where E: From<AssayError> + From<CalibrationError> {
+    if !candidate.manifest.is_binary() || !baseline.manifest.is_binary() {
+        return Err(AssayError::CalibrationBindingMismatch.into());
+    }
     validate_scope(namespace, Some(host_scope))?; gates.validate(limits)?; options.validate(limits)?;
     candidate.sizes.validate(limits)?; baseline.sizes.validate(limits)?;
     validate_pair(candidate, baseline, checkpoint)?;
@@ -215,29 +251,10 @@ where E: From<AssayError> + From<CalibrationError> {
         candidate_transform, candidate_semantics, checkpoint)?;
     let prior = evaluate_transformed_with_checkpoint(baseline, key, namespace, options, limits,
         baseline_transform, baseline_semantics, checkpoint)?;
-    let decision = match (&current.body.measurement, &prior.body.measurement) {
-        (Measurement::Measured { metrics: a }, Measurement::Measured { metrics: b }) => {
-            let a_class = current.body.classification.as_ref().ok_or(AssayError::Qualification)?;
-            let b_class = prior.body.classification.as_ref().ok_or(AssayError::Qualification)?;
-            let paired = paired_summary(candidate, baseline, count, candidate_transform, baseline_transform, checkpoint)?;
-            let reliability = &gates.reliability;
-            let comparisons = vec![
-                upper("brier_increase", Some(paired.mean_brier_change), reliability.max_brier_increase),
-                upper("ece_increase", Some(a.ece - b.ece), reliability.max_ece_increase),
-                upper("selective_risk", a.selective_risk, reliability.max_selective_risk),
-                lower("acceptance_rate", a.accepted as f64 / count as f64, reliability.min_acceptance_rate),
-                lower("accepted_rows", a.accepted as f64, reliability.minimum_accepted as f64),
-                upper("accuracy_decrease", Some(b_class.accuracy - a_class.accuracy), gates.max_accuracy_decrease),
-                upper("macro_f1_decrease", b_class.macro_f1.zip(a_class.macro_f1).map(|(b, a)| b - a),
-                    gates.max_macro_f1_decrease),
-            ];
-            if comparisons.iter().all(|gate| gate.passed) { Decision::Passed { comparisons, paired } }
-            else { Decision::Rejected { comparisons, paired } }
-        }
-        (Measurement::InsufficientData { .. }, Measurement::InsufficientData { .. }) =>
-            Decision::InsufficientData { rows: count, minimum_samples: options.minimum_samples },
-        _ => return Err(AssayError::Qualification.into()),
-    };
+    let paired = if matches!(&current.body.measurement, Measurement::Measured { .. }) {
+        Some(paired_summary(candidate, baseline, count, candidate_transform, baseline_transform, checkpoint)?)
+    } else { None };
+    let decision = qualification_decision(&current, &prior, paired, count, gates, options)?;
     let total_model_work = candidate.model_work.checked_add(baseline.model_work).map_err(|_| AssayError::InputLimit)?;
     let body = QualificationBody { schema_version: ASSAY_SCHEMA_VERSION, task: NATIVE_TASK.to_owned(),
         evidence: NATIVE_EVIDENCE.to_owned(), activation_authority: false, receipt_grade: ReceiptGrade::AuditOnly,
@@ -250,14 +267,142 @@ where E: From<AssayError> + From<CalibrationError> {
     super::super::render(&result, limits)?; checkpoint()?; Ok(result)
 }
 
+/// Both report families use the same gate arithmetic. Only the declared
+/// task-shaped loss and quality summaries differ; undefined metrics fail.
+fn qualification_decision(current: &Evaluation, prior: &Evaluation, paired: Option<PairedSummary>,
+    count: usize, gates: Gates, options: EvalOptions) -> Result<Decision, AssayError> {
+    Ok(match (&current.body.measurement, &prior.body.measurement) {
+        (Measurement::Measured { metrics: a }, Measurement::Measured { metrics: b }) => {
+            let quality = |report: &Evaluation| -> Result<(f64, Option<f64>), AssayError> {
+                match (&report.body.classification, &report.body.label_set) {
+                    (Some(value), None) => Ok((value.accuracy, value.macro_f1)),
+                    (None, Some(value)) => Ok((value.exact_match_accuracy, value.macro_f1)),
+                    _ => Err(AssayError::Qualification),
+                }
+            };
+            let (a_accuracy, a_f1) = quality(current)?;
+            let (b_accuracy, b_f1) = quality(prior)?;
+            let paired = paired.ok_or(AssayError::Qualification)?;
+            let reliability = &gates.reliability;
+            let comparisons = vec![
+                upper("brier_increase", Some(paired.mean_brier_change), reliability.max_brier_increase),
+                upper("ece_increase", Some(a.ece - b.ece), reliability.max_ece_increase),
+                upper("selective_risk", a.selective_risk, reliability.max_selective_risk),
+                lower("acceptance_rate", a.accepted as f64 / count as f64, reliability.min_acceptance_rate),
+                lower("accepted_rows", a.accepted as f64, reliability.minimum_accepted as f64),
+                upper("accuracy_decrease", Some(b_accuracy - a_accuracy), gates.max_accuracy_decrease),
+                upper("macro_f1_decrease", b_f1.zip(a_f1).map(|(b, a)| b - a),
+                    gates.max_macro_f1_decrease),
+            ];
+            if comparisons.iter().all(|gate| gate.passed) { Decision::Passed { comparisons, paired } }
+            else { Decision::Rejected { comparisons, paired } }
+        }
+        (Measurement::InsufficientData { .. }, Measurement::InsufficientData { .. }) =>
+            Decision::InsufficientData { rows: count, minimum_samples: options.minimum_samples },
+        _ => return Err(AssayError::Qualification),
+    })
+}
+
+fn label_mode(replay: &NativeReplay) -> Result<LabelMode, AssayError> {
+    match replay.manifest.task_kind()? {
+        TaskKind::Multiclass => Ok(LabelMode::Multiclass),
+        TaskKind::Multilabel => Ok(LabelMode::Multilabel),
+        TaskKind::Binary => Err(AssayError::Scope),
+    }
+}
+fn observation(row: &super::replay::ScoredRow) -> Observation<'_> {
+    Observation { positive: &row.positive, probability: &row.probability,
+        predicted: &row.predicted, top_label: row.top_label }
+}
+
+fn evaluate_labels_with_checkpoint<E: From<AssayError>>(replay: &NativeReplay, key: &CommitmentKey,
+    namespace: &str, options: EvalOptions, limits: Limits, checkpoint: &mut impl FnMut() -> Result<(), E>)
+    -> Result<Evaluation, E> {
+    validate_scope(namespace, None)?; replay.sizes.validate(limits)?;
+    options.validate_rows(replay.manifest.splits.locked_test.len(), limits)?;
+    let mode = label_mode(replay)?;
+    let bindings = bindings(replay, key, namespace, checkpoint)?;
+    let mut rows = reserved(replay.manifest.splits.locked_test.len())?;
+    for (index, row) in replay.rows.iter().enumerate() {
+        if index % 64 == 0 { checkpoint()?; }
+        if row.split == Split::LockedTest { rows.push(observation(row)); }
+    }
+    let mut labels = reserved(replay.manifest.label_count())?;
+    labels.extend(replay.manifest.labels().map(|label| label.id.as_str()));
+    let (measurement, label_set) = label_metrics::measure_with_checkpoint(mode, &labels, &rows,
+        options, limits, checkpoint)?;
+    let score_semantics = match mode {
+        LabelMode::Multiclass => "uncalibrated_candidate_weights; full_vocabulary_scored_eos; brier_half_sum_one_hot_squared_error; ece_top_label_10_equal_width_bins; selective_acceptance_native_decided_and_top_weight; bootstrap_whole_documents_splitmix64_percentile_v1",
+        LabelMode::Multilabel => "uncalibrated_independent_yes_weights; full_vocabulary_scored_eos_per_head; brier_mean_label_squared_error; ece_pooled_positive_label_events_10_equal_width_bins; selective_acceptance_all_native_heads_decided_and_each_selected_side_weight; selective_risk_exact_set_error; bootstrap_whole_documents_splitmix64_percentile_v1",
+    };
+    let body = EvaluationBody { schema_version: ASSAY_SCHEMA_VERSION, task: replay.manifest.task.clone(),
+        evidence: NATIVE_EVIDENCE.to_owned(), activation_authority: false, receipt_grade: ReceiptGrade::AuditOnly,
+        score_semantics: score_semantics.to_owned(),
+        classification_semantics: "native_sequence_score_argmax_then_lexical_id_per_head; task_policy_abstention; accuracy_complete_correct_set_over_all_documents; abstained_positive_labels_count_as_missed; undefined_label_f1_prevents_macro_f1".to_owned(),
+        bindings, options, measurement, classification: None, label_set, executed_rows: replay.rows.len(),
+        group_width: replay.group_width, model_work: replay.model_work, rewound_positions: replay.rewound_positions };
+    checkpoint()?;
+    let seal = commit(key, namespace, "native_label_set_evaluation_v1", &body, limits)?;
+    let result = Evaluation { body, seal }; super::super::render(&result, limits)?;
+    checkpoint()?; Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compare_labels_with_checkpoint<E: From<AssayError>>(candidate: &NativeReplay, baseline: &NativeReplay,
+    key: &CommitmentKey, namespace: &str, host_scope: &str, gates: Gates, options: EvalOptions,
+    limits: Limits, checkpoint: &mut impl FnMut() -> Result<(), E>) -> Result<QualificationReport, E> {
+    validate_scope(namespace, Some(host_scope))?; gates.validate(limits)?;
+    candidate.sizes.validate(limits)?; baseline.sizes.validate(limits)?;
+    validate_pair(candidate, baseline, checkpoint)?;
+    let mode = label_mode(candidate)?;
+    if mode != label_mode(baseline)? { return Err(AssayError::Scope.into()); }
+    let count = candidate.manifest.splits.locked_test.len(); options.validate_rows(count, limits)?;
+    if (count as u64).checked_mul(options.bootstrap.resamples as u64).and_then(|n| n.checked_mul(2))
+        .is_none_or(|draws| draws > limits.max_bootstrap_draws) { return Err(AssayError::InputLimit.into()); }
+    #[derive(Serialize)]
+    struct Policy<'a> { schema_version: u32, task: &'a str, gate_basis: &'static str,
+        declared_host_scope: &'a str, gates: Gates, options: EvalOptions }
+    let policy = Policy { schema_version: ASSAY_SCHEMA_VERSION, task: &candidate.manifest.task,
+        gate_basis: "point_estimates", declared_host_scope: host_scope, gates, options };
+    let policy_commitment = commit(key, namespace, "native_label_set_qualification_policy_v1", &policy, limits)?;
+    let current = evaluate_labels_with_checkpoint(candidate, key, namespace, options, limits, checkpoint)?;
+    let prior = evaluate_labels_with_checkpoint(baseline, key, namespace, options, limits, checkpoint)?;
+    let paired = if matches!(&current.body.measurement, Measurement::Measured { .. }) {
+        let mut summary = PairedSummary { rows: count, mean_brier_change: 0.0,
+            candidate_better: 0, candidate_worse: 0, equal: 0 };
+        for (index, (a, b)) in candidate.rows.iter().zip(&baseline.rows).enumerate() {
+            if index % 64 == 0 { checkpoint()?; }
+            if a.split != Split::LockedTest { continue; }
+            let change = label_metrics::brier_loss(mode, observation(a))?
+                - label_metrics::brier_loss(mode, observation(b))?;
+            summary.mean_brier_change += change;
+            if change < 0.0 { summary.candidate_better += 1; }
+            else if change > 0.0 { summary.candidate_worse += 1; } else { summary.equal += 1; }
+        }
+        summary.mean_brier_change /= count as f64; Some(summary)
+    } else { None };
+    let decision = qualification_decision(&current, &prior, paired, count, gates, options)?;
+    let body = QualificationBody { schema_version: ASSAY_SCHEMA_VERSION, task: candidate.manifest.task.clone(),
+        evidence: NATIVE_EVIDENCE.to_owned(), activation_authority: false, receipt_grade: ReceiptGrade::AuditOnly,
+        declared_host_scope: host_scope.to_owned(), host_scope_evidence: "caller_declared".to_owned(),
+        gate_basis: "point_estimates".to_owned(), gates, policy_commitment, candidate: current, baseline: prior,
+        decision, total_model_work: candidate.model_work.checked_add(baseline.model_work).map_err(|_| AssayError::InputLimit)? };
+    checkpoint()?;
+    let seal = commit(key, namespace, "native_label_set_qualification_v1", &body, limits)?;
+    let result = QualificationReport { body, seal }; super::super::render(&result, limits)?;
+    checkpoint()?; Ok(result)
+}
+
 pub(super) fn bindings<E>(replay: &NativeReplay, key: &CommitmentKey, namespace: &str,
     checkpoint: &mut impl FnMut() -> Result<(), E>) -> Result<Bindings, E>
 where E: From<AssayError> {
     let (suite, input, splits) = source_bindings(&replay.manifest, replay.input_digest, key, namespace, checkpoint)?;
     let id = &replay.first_identity;
-    let metadata = DatasetMetadata { dataset_id: replay.manifest.dataset_id.clone(),
+    let metadata = NativeMetadata { dataset_id: replay.manifest.dataset_id.clone(),
         dataset_version: replay.manifest.dataset_version.clone(), named_population: replay.manifest.named_population.clone(),
-        positive_label: replay.manifest.positive_label.id.clone(), negative_label: replay.manifest.negative_label.id.clone(),
+        positive_label: replay.manifest.positive_label.as_ref().map(|label| label.id.clone()),
+        negative_label: replay.manifest.negative_label.as_ref().map(|label| label.id.clone()),
+        labels: replay.manifest.labels.iter().map(|label| label.id.clone()).collect(),
         task_spec: id.task_spec.clone(), model_recipe_id: id.quant_recipe.clone(),
         prompt_template_sha256: id.template_digest, numerics_profile: id.numerics_profile.label(),
         thinking_mode: "disabled".to_owned() };
@@ -265,12 +410,15 @@ where E: From<AssayError> {
     // Never publish that raw digest or call it one synthetic ExecutionIdentity.
     let execution_collection = key.commit(CommitmentDomain::ExecutionIdentity, namespace,
         "native_execution_collection_sha256_binary_v1", &replay.executions).map_err(|_| AssayError::Commitment)?;
+    let binary = replay.manifest.is_binary();
     let observation_collection = key.commit(CommitmentDomain::Output, namespace,
-        "native_observation_collection_sha256_binary_v1", &replay.observations).map_err(|_| AssayError::Commitment)?;
+        if binary { "native_observation_collection_sha256_binary_v1" } else { "native_observation_collection_sha256_labels_v1" },
+        &replay.observations).map_err(|_| AssayError::Commitment)?;
     checkpoint()?;
     Ok(Bindings { metadata, suite, input, splits, execution_collection,
         execution_collection_format: EXECUTION_COLLECTION_FORMAT.to_owned(), execution_collection_rows: replay.rows.len(),
-        observation_collection, observation_collection_format: OBSERVATION_COLLECTION_FORMAT.to_owned(),
+        observation_collection, observation_collection_format: if binary { OBSERVATION_COLLECTION_FORMAT }
+            else { VECTOR_OBSERVATION_COLLECTION_FORMAT }.to_owned(),
         observation_collection_rows: replay.rows.len() })
 }
 
@@ -280,7 +428,8 @@ pub(super) fn source_bindings<E>(manifest: &SuiteManifest, input_digest: crate::
 where E: From<AssayError> {
     checkpoint()?;
     let suite = crate::canonjson::canonical_bytes(manifest).map_err(|_| AssayError::Commitment)?;
-    let suite = key.commit(CommitmentDomain::Configuration, namespace, "native_binary_suite_v1", &suite)
+    let suite = key.commit(CommitmentDomain::Configuration, namespace,
+        if manifest.is_binary() { "native_binary_suite_v1" } else { "native_label_set_suite_v1" }, &suite)
         .map_err(|_| AssayError::Commitment)?;
     let mut split = |name: &str, ids: &[String]| -> Result<ContentCommitment, E> {
         checkpoint()?;
@@ -303,7 +452,7 @@ fn classification<E>(replay: &NativeReplay, checkpoint: &mut impl FnMut() -> Res
     for (index, row) in replay.rows.iter().enumerate() {
         if index % 64 == 0 { checkpoint()?; }
         if row.split != Split::LockedTest { continue; }
-        match (row.positive, row.predicted) {
+        match (row.positive[0], row.predicted[0]) {
             (true, Some(true)) => tp += 1, (false, Some(true)) => fp += 1,
             (false, Some(false)) => tn += 1, (true, Some(false)) => fn_ += 1,
             (true, None) => ap += 1, (false, None) => an += 1,
@@ -348,9 +497,9 @@ where E: From<CalibrationError> {
     for (index, (a, b)) in a.rows.iter().zip(&b.rows).enumerate() {
         if index % 64 == 0 { checkpoint()?; }
         if a.split != Split::LockedTest { continue; }
-        let truth = if a.positive { 1.0 } else { 0.0 };
-        let candidate_error = candidate_transform(a.probability)? - truth;
-        let baseline_error = baseline_transform(b.probability)? - truth;
+        let truth = if a.positive[0] { 1.0 } else { 0.0 };
+        let candidate_error = candidate_transform(a.probability[0])? - truth;
+        let baseline_error = baseline_transform(b.probability[0])? - truth;
         let change = candidate_error * candidate_error - baseline_error * baseline_error;
         summary.mean_brier_change += change;
         if change < 0.0 { summary.candidate_better += 1; }
@@ -370,3 +519,5 @@ fn commit<T: Serialize>(key: &CommitmentKey, namespace: &str, kind: &str,
     let bytes = super::super::render(value, limits)?;
     key.commit(CommitmentDomain::Configuration, namespace, kind, &bytes).map_err(|_| AssayError::Commitment)
 }
+
+#[cfg(test)] mod tests;

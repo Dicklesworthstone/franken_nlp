@@ -146,6 +146,7 @@ pub(crate) fn fit_with_checkpoint<E>(replay: &NativeReplay, key: &CommitmentKey,
     fit: FitOptions, options: EvalOptions, limits: Limits, checkpoint: &mut impl FnMut() -> Result<(), E>)
     -> Result<FitOutcome, E>
 where E: From<AssayError> + From<CalibrationError> {
+    if !replay.manifest.is_binary() { return Err(AssayError::CalibrationBindingMismatch.into()); }
     report::validate_scope(namespace, None)?; validate_fit_options(fit, limits)?;
     replay.sizes.validate(limits)?; options.validate_rows(replay.manifest.splits.locked_test.len(), limits)?;
     let bindings = report::bindings(replay, key, namespace, checkpoint)?;
@@ -184,6 +185,7 @@ pub(crate) fn apply_with_checkpoint<E>(replay: &NativeReplay, application: &Prep
     key: &CommitmentKey, namespace: &str, options: EvalOptions, limits: Limits,
     checkpoint: &mut impl FnMut() -> Result<(), E>) -> Result<ApplicationOutcome, E>
 where E: From<AssayError> + From<CalibrationError> {
+    if !replay.manifest.is_binary() { return Err(AssayError::CalibrationBindingMismatch.into()); }
     report::validate_scope(namespace, None)?; replay.sizes.validate(limits)?;
     options.validate_rows(replay.manifest.splits.locked_test.len(), limits)?;
     let treatment = artifact::verify_replay(application, replay, key, namespace, limits, checkpoint)?;
@@ -209,6 +211,9 @@ pub(crate) fn compare_with_checkpoint<E>(candidate: &NativeReplay, baseline: &Na
     key: &CommitmentKey, namespace: &str, host_scope: &str, gates: Gates, options: EvalOptions,
     limits: Limits, checkpoint: &mut impl FnMut() -> Result<(), E>) -> Result<QualificationOutcome, E>
 where E: From<AssayError> + From<CalibrationError> {
+    if !candidate.manifest.is_binary() || !baseline.manifest.is_binary() {
+        return Err(AssayError::CalibrationBindingMismatch.into());
+    }
     report::validate_scope(namespace, Some(host_scope))?; gates.validate(limits)?;
     candidate.sizes.validate(limits)?; baseline.sizes.validate(limits)?;
     report::validate_pair(candidate, baseline, checkpoint)?;

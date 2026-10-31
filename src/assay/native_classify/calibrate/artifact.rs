@@ -133,6 +133,7 @@ impl PreparedApplication {
     /// Native execution and observation collections are checked after replay.
     pub fn validate_dataset(&self, dataset: &Dataset, key: &CommitmentKey, namespace: &str, limits: Limits)
         -> Result<(), AssayError> {
+        if !dataset.is_binary() { return Err(AssayError::CalibrationBindingMismatch); }
         report::validate_scope(namespace, None)?; self.validate_limits(limits)?; dataset.validate_limits(limits)?;
         authenticate(&self.artifact, key, namespace, limits)?;
         let body = &self.artifact.body;
@@ -188,6 +189,9 @@ fn validate_body(body: &ArtifactBody, limits: Limits) -> Result<(), AssayError> 
         || body.activation_authority || body.receipt_grade != ReceiptGrade::AuditOnly
         || body.development_rows == 0 || body.calibration_rows == 0 || body.locked_test_rows == 0 || total > limits.max_rows
         || body.bindings.execution_collection_rows != total || body.bindings.observation_collection_rows != total
+        || body.bindings.metadata.positive_label.is_none() || body.bindings.metadata.negative_label.is_none()
+        || body.bindings.metadata.positive_label == body.bindings.metadata.negative_label
+        || !body.bindings.metadata.labels.is_empty()
         || body.bindings.execution_collection_format != super::super::EXECUTION_COLLECTION_FORMAT
         || body.bindings.observation_collection_format != super::super::OBSERVATION_COLLECTION_FORMAT {
         return Err(AssayError::InvalidCalibration);
