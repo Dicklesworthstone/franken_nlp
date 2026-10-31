@@ -11,7 +11,7 @@ use crate::{
             Int4SourceMapPreflight, Int4SourceMapRun, PreparedInt4SourceMap, SourceMapTask,
             INT4_SOURCE_MAP_EXECUTION,
             cohort::{Int4SourceMapCohortBudget, Int4SourceMapCohortMemoryLimits,
-                Int4SourceMapCohortRequirement},
+                Int4SourceMapCohortRequirement, hierarchy::Int4HierarchyCohortSchedule},
             keyphrases::{Int4CorpusKeyphraseError, Int4CorpusKeyphraseRun, Int4KeyphraseLimits,
                 INT4_CORPUS_KEYPHRASE_EXECUTION},
             summary::{Int4CorpusSummaryError, Int4CorpusSummaryRun, Int4SummaryLimits,
@@ -211,30 +211,53 @@ impl Int4SourceDocumentJobPlanner {
     /// The existing immutable map width is also the native cohort ceiling;
     /// no document, work debit or spool commit is split into chunk attempts.
     pub fn with_chunk_cohorts(mut self) -> Result<Self, BatchFault> {
-        self.cohort_requirements()?;
         if !self.uses_chunk_cohorts() {
             self.recipe.enable_chunk_cohorts()?;
             // Previously prepared receipts belong to the old scheduling policy,
             // even when their semantic task and native work happen to be identical.
             self.owner = Arc::new(());
         }
+        self.cohort_requirements()?;
         Ok(self)
     }
     pub fn uses_chunk_cohorts(&self) -> bool { self.recipe.uses_chunk_cohorts() }
+    /// Independently batch evidence groups within each completely witnessed
+    /// hierarchy level. The private resume recipe authenticates this width.
+    pub fn with_hierarchy_cohorts(mut self, max_groups: usize) -> Result<Self, BatchFault> {
+        let max_passes = match self.task() {
+            Int4SourceDocumentTask::SummaryHierarchy { limits, .. } => limits.max_passes,
+            Int4SourceDocumentTask::QuestionHierarchy { limits, .. } => limits.max_passes,
+            _ => return Err(BatchCode::InvalidLimits.into()),
+        };
+        let schedule = Int4HierarchyCohortSchedule { max_groups, discovery_cohorts: self.uses_chunk_cohorts() };
+        schedule.validate(max_passes).map_err(|_| BatchCode::InvalidLimits)?;
+        if self.hierarchy_cohort_schedule() != Some(schedule) {
+            self.recipe.enable_hierarchy_cohorts(max_groups)?;
+            self.owner = Arc::new(());
+        }
+        self.cohort_requirements()?;
+        Ok(self)
+    }
+    pub fn hierarchy_cohort_schedule(&self) -> Option<Int4HierarchyCohortSchedule> {
+        self.recipe.hierarchy_cohort_schedule()
+    }
+    pub fn uses_native_cohorts(&self) -> bool {
+        self.uses_chunk_cohorts() || self.hierarchy_cohort_schedule().is_some()
+    }
     /// Static declared native/decoder peak for the whole job invocation.
     /// Actual document windows are checked against this ceiling before native
     /// execution. Per-row task KV and all lifetime work remain unchanged.
     pub fn cohort_requirements(&self) -> Result<Int4SourceMapCohortRequirement, BatchFault> {
-        let max_chunks = self.mapping.reduction.map_batch_chunks;
-        if max_chunks > self.mapping.chunks.max_chunks { return Err(BatchCode::InvalidLimits.into()); }
         let context = self.planning.max_context_tokens;
         let scalar = Int4MemoryRequirement::for_context(context, self.group_width)
             .map_err(|_| BatchCode::InvalidLimits)?;
         if scalar.kv_bytes != self.budget.max_kv_bytes { return Err(BatchCode::Admission.into()); }
-        let quote = Int4SourceMapCohortMemoryLimits { max_chunks, context_tokens: context,
-            max_output_tokens_per_chunk: u64::from(self.budget.max_output_tokens),
-            max_result_bytes_per_chunk: self.budget.max_output_bytes,
-        }.requirements(self.group_width).map_err(|_| BatchCode::InvalidLimits)?;
+        if let Some(schedule) = self.hierarchy_cohort_schedule() {
+            let discovery = if schedule.discovery_cohorts { Some(self.discovery_cohort_requirements()?) } else { None };
+            return schedule.requirements(discovery, context, self.group_width, self.budget)
+                .map_err(|_| BatchCode::InvalidLimits.into());
+        }
+        let quote = self.discovery_cohort_requirements()?;
         if matches!(self.task(), Int4SourceDocumentTask::SummarySynthesis(_)
             | Int4SourceDocumentTask::SummaryHierarchy { .. }
             | Int4SourceDocumentTask::QuestionSynthesis(_)
@@ -242,6 +265,16 @@ impl Int4SourceDocumentJobPlanner {
             quote.with_synthesis_context(context, self.group_width, self.budget.max_kv_bytes)
                 .map_err(|_| BatchCode::Admission.into())
         } else { Ok(quote) }
+    }
+    fn discovery_cohort_requirements(&self) -> Result<Int4SourceMapCohortRequirement, BatchFault> {
+        let max_chunks = self.mapping.reduction.map_batch_chunks;
+        if max_chunks > self.mapping.chunks.max_chunks { return Err(BatchCode::InvalidLimits.into()); }
+        let context = self.planning.max_context_tokens;
+        let quote = Int4SourceMapCohortMemoryLimits { max_chunks, context_tokens: context,
+            max_output_tokens_per_chunk: u64::from(self.budget.max_output_tokens),
+            max_result_bytes_per_chunk: self.budget.max_output_bytes,
+        }.requirements(self.group_width).map_err(|_| BatchCode::InvalidLimits)?;
+        Ok(quote)
     }
     pub fn max_result_bytes(&self) -> u64 {
         match self.task() {

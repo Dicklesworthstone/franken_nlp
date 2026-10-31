@@ -59,7 +59,8 @@ impl<'p, 'e, 'w, 'v, A: Int4SourceDocumentBatchAdmission> Int4SourceDocumentJobP
         vocabulary: &'v ExtractionVocabulary, budget: Int4SourceMapCohortBudget,
         kernel: PackedInt4Kernel, admission: A) -> Result<Self, BatchFault> {
         let required = planner.cohort_requirements()?;
-        Self::configured(planner, DocumentEngine::Cohorts { weights, budget, kernel, required }, vocabulary, admission)
+        let hierarchy = planner.hierarchy_cohort_schedule();
+        Self::configured(planner, DocumentEngine::Cohorts { weights, budget, kernel, required, hierarchy }, vocabulary, admission)
     }
     fn configured(planner: &'p Int4SourceDocumentJobPlanner, engine: DocumentEngine<'e, 'w>,
         vocabulary: &'v ExtractionVocabulary, admission: A) -> Result<Self, BatchFault> {
@@ -149,17 +150,19 @@ impl<A: Int4SourceDocumentBatchAdmission> DurableBatchProcessor for Int4SourceDo
 enum DocumentEngine<'e, 'w> {
     Serial(&'e mut StrictInt4Engine<'w>),
     Cohorts { weights: &'w Int4ModelWeights, budget: Int4SourceMapCohortBudget,
-        kernel: PackedInt4Kernel, required: Int4SourceMapCohortRequirement },
+        kernel: PackedInt4Kernel, required: Int4SourceMapCohortRequirement,
+        hierarchy: Option<Int4HierarchyCohortSchedule> },
 }
 impl DocumentEngine<'_, '_> {
     fn check_capacity(&self, planner: &Int4SourceDocumentJobPlanner) -> Result<u64, BatchItemFailure> {
         match self {
             Self::Serial(engine) => {
-                if planner.uses_chunk_cohorts() { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
+                if planner.uses_native_cohorts() { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
                 check_capacity(planner, engine)
             }
-            Self::Cohorts { weights, budget, required, .. } => {
-                if !planner.uses_chunk_cohorts() || budget.context_limit != planner.planning.max_context_tokens
+            Self::Cohorts { weights, budget, required, hierarchy, .. } => {
+                if !planner.uses_native_cohorts() || *hierarchy != planner.hierarchy_cohort_schedule()
+                    || budget.context_limit != planner.planning.max_context_tokens
                     || weights.group_width() != planner.group_width {
                     return Err(BatchItemFailure::fatal(BatchCode::Admission));
                 }
@@ -174,8 +177,8 @@ impl DocumentEngine<'_, '_> {
         identities: &[ExecutionIdentity], control: &mut C) -> Result<(), BatchItemFailure> {
         match self {
             Self::Serial(engine) => plan.preflight(identities, engine, control),
-            Self::Cohorts { weights, budget, required, .. } => {
-                let actual = plan.cohort_requirements(budget.context_limit)?;
+            Self::Cohorts { weights, budget, required, hierarchy, .. } => {
+                let actual = plan.cohort_requirements(budget.context_limit, *hierarchy)?;
                 check_cohort_peak(actual, *required)?;
                 check_cohort_budget(actual, *budget)?;
                 plan.preflight_cohorts(identities, weights, control)
@@ -187,8 +190,8 @@ impl DocumentEngine<'_, '_> {
         -> Result<Int4SourceDocumentRun, BatchItemFailure> {
         match self {
             Self::Serial(engine) => plan.execute(admitted, planner, engine, vocabulary, control),
-            Self::Cohorts { weights, budget, kernel, .. } =>
-                plan.execute_cohorts(admitted, planner, weights, vocabulary, *budget, *kernel, control),
+            Self::Cohorts { weights, budget, kernel, hierarchy, .. } =>
+                plan.execute_cohorts(admitted, planner, weights, vocabulary, *budget, *kernel, *hierarchy, control),
         }
     }
 }

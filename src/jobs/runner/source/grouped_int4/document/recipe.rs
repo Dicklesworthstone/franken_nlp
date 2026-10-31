@@ -20,7 +20,11 @@ pub struct Int4SourceDocumentJobRecipe {
     // recipe bytes and authenticated resume commitments stay unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     chunk_cohorts: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hierarchy_cohorts: Option<HierarchyCohortsRecipe>,
 }
+#[derive(Serialize)]
+struct HierarchyCohortsRecipe { execution: &'static str, max_groups: usize }
 impl Int4SourceDocumentJobRecipe {
     pub(super) fn new(source: Int4SourceJobRecipe, task: Int4SourceDocumentTask,
         mapping: Int4SourceMapLimits, lifetime: Int4SourceDocumentLifetime, max_attempts: u64)
@@ -33,7 +37,8 @@ impl Int4SourceDocumentJobRecipe {
             reservation_policy: "exact-discovery-and-complete-synthesis-reserve-per-durable-attempt-v1",
             source, mapping: MappingRecipe { chunks, reduction, max_model_work,
                 max_trie_node_visits, checkpoint_interval_nodes, mask_visits_per_chunk,
-                max_mask_visits, verification }, task, lifetime, max_attempts, chunk_cohorts: None };
+                max_mask_visits, verification }, task, lifetime, max_attempts,
+                chunk_cohorts: None, hierarchy_cohorts: None };
         // Question bytes, options and every nested limit stay in this private
         // projection. Only JobRunner's per-job keyed commitment is persisted.
         bounded_json(&recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
@@ -45,6 +50,16 @@ impl Int4SourceDocumentJobRecipe {
         Ok(())
     }
     pub(super) fn uses_chunk_cohorts(&self) -> bool { self.chunk_cohorts.is_some() }
+    pub(super) fn enable_hierarchy_cohorts(&mut self, max_groups: usize) -> Result<(), BatchFault> {
+        self.hierarchy_cohorts = Some(HierarchyCohortsRecipe {
+            execution: "native-document-hierarchy-group-cohorts-v1", max_groups });
+        bounded_json(self, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
+        Ok(())
+    }
+    pub(super) fn hierarchy_cohort_schedule(&self) -> Option<Int4HierarchyCohortSchedule> {
+        self.hierarchy_cohorts.as_ref().map(|recipe| Int4HierarchyCohortSchedule {
+            max_groups: recipe.max_groups, discovery_cohorts: self.uses_chunk_cohorts() })
+    }
 }
 #[derive(Serialize)]
 struct MappingRecipe {

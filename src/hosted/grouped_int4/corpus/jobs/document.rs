@@ -81,8 +81,8 @@ impl NlpEngine {
     /// nonrenewable across failures and resumes. The output guard survives
     /// spool sync and journal acknowledgement. Private questions, inputs and
     /// results are not emitted to stdout by this method.
-    /// A factory explicitly configured with `with_chunk_cohorts` executes
-    /// native discovery windows inside the same complete-document transaction;
+    /// Factories configured with chunk or hierarchy cohorts execute native
+    /// windows inside the same complete-document transaction;
     /// its authenticated schedule cannot be changed by resume.
     #[allow(clippy::too_many_arguments)]
     pub fn job_int4_source_document<R>(&self, model: &ResidentInt4,
@@ -105,10 +105,15 @@ impl NlpEngine {
         let mut required = document_requirements(model.model_identity().group_width(),
             planner.task_budget(), planner.planning_limits(), mapping, result_bytes,
             request.limits, limits, document_workspace, private_question_bytes(planner.task()))?;
-        let cohort = if planner.uses_chunk_cohorts() {
+        let cohort = if planner.uses_native_cohorts() {
             Some(planner.cohort_requirements().map_err(HostedError::BatchSetup)?)
         } else { None };
         if let Some(quote) = cohort { required.use_cohorts(quote, limits.native.allocator_reserve_bytes)?; }
+        if let Some(schedule) = planner.hierarchy_cohort_schedule() {
+            required.input_bytes = sum(&[required.input_bytes,
+                schedule.additional_preparation_bytes(limits.preparation_reserve_bytes)
+                    .map_err(|_| HostedError::Limits("INT4 hierarchy concurrent preparation reserve"))?])?;
+        }
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(DocumentJobInput { preparation: Some((planner, vocabulary, request)), reader }))?;

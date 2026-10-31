@@ -181,8 +181,15 @@ impl NativePlan<'_> {
             _ => Ok(()),
         }
     }
-    pub(super) fn cohort_requirements(&self, context: usize)
+    pub(super) fn cohort_requirements(&self, context: usize, hierarchy: Option<Int4HierarchyCohortSchedule>)
         -> Result<Int4SourceMapCohortRequirement, BatchItemFailure> {
+        if let Some(schedule) = hierarchy {
+            return match self {
+                Self::SummaryHierarchy(p) => p.hierarchy_cohort_requirements(context, schedule).map_err(map_failure),
+                Self::QuestionHierarchy(p) => p.hierarchy_cohort_requirements(context, schedule).map_err(map_failure),
+                _ => Err(BatchItemFailure::fatal(BatchCode::Admission)),
+            };
+        }
         match self {
             Self::Map(p) | Self::Keyphrases(p, _) | Self::Summary(p, _) => p.cohort_requirements(context),
             Self::Question(p) => p.cohort_requirements(context),
@@ -234,8 +241,20 @@ impl NativePlan<'_> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn execute_cohorts<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
         planner: &SourceTaskPlanner, weights: &Int4ModelWeights, vocabulary: &ExtractionVocabulary,
-        budget: Int4SourceMapCohortBudget, kernel: PackedInt4Kernel, control: &mut C)
+        budget: Int4SourceMapCohortBudget, kernel: PackedInt4Kernel,
+        hierarchy: Option<Int4HierarchyCohortSchedule>, control: &mut C)
         -> Result<Int4SourceDocumentRun, BatchItemFailure> {
+        if let Some(schedule) = hierarchy {
+            return match self {
+                Self::SummaryHierarchy(p) => p.execute_hierarchy_cohorts_with_control(
+                    admitted, planner, weights, vocabulary, schedule, budget, kernel, control)
+                    .map(|run| Int4SourceDocumentRun::SummaryHierarchy(run.document)).map_err(map_failure),
+                Self::QuestionHierarchy(p) => p.execute_hierarchy_cohorts_with_control(
+                    admitted, planner, weights, vocabulary, schedule, budget, kernel, control)
+                    .map(|run| Int4SourceDocumentRun::QuestionHierarchy(run.document)).map_err(map_failure),
+                _ => Err(BatchItemFailure::fatal(BatchCode::Admission)),
+            };
+        }
         match self {
             Self::Map(p) => p.execute_cohorts_with_control(admitted, weights, vocabulary, budget, kernel, control)
                 .map(|run| Int4SourceDocumentRun::Map(run.document)).map_err(map_failure),
