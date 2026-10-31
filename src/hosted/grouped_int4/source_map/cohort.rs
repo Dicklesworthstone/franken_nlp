@@ -3,6 +3,7 @@ use super::*;
 use crate::tasks::source_planning::grouped_int4::long::cohort::{
     Int4SourceMapCohortBudget, Int4SourceMapCohortMemoryLimits,
     Int4SourceMapCohortRequirement, Int4SourceMapCohortRun,
+    hierarchy::Int4HierarchyCohortSchedule,
 };
 mod aggregate;
 pub(in crate::hosted::grouped_int4::source_map) mod synthesis;
@@ -32,6 +33,14 @@ impl<T> Int4SourceMapConfig<T> {
         self.cohort_requirements(group_width)?
             .with_synthesis_context(self.native.context_tokens, group_width, self.budget.max_kv_bytes)
             .map_err(map_error)
+    }
+
+    /// Sequential discovery and hierarchy phases share one componentwise peak.
+    /// The hierarchy width is independent of the selected discovery schedule.
+    pub fn hierarchy_cohort_requirements(&self, group_width: usize, schedule: Int4HierarchyCohortSchedule)
+        -> Result<Int4SourceMapCohortRequirement, HostedError> {
+        let discovery = if schedule.discovery_cohorts { Some(self.cohort_requirements(group_width)?) } else { None };
+        schedule.requirements(discovery, self.native.context_tokens, group_width, self.budget).map_err(map_error)
     }
 }
 

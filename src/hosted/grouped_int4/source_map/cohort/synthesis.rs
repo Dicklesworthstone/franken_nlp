@@ -1,5 +1,5 @@
-//! Shared physical ownership for discovery cohorts followed by serial evidence
-//! synthesis. Closed, statically dispatched modes retain their original planners,
+//! Shared physical ownership for discovery and evidence-synthesis schedules.
+//! Closed, statically dispatched modes retain their original planners,
 //! verification, task limits and semantic receipts.
 use super::*;
 use crate::{
@@ -14,6 +14,10 @@ pub(in crate::hosted::grouped_int4::source_map) trait SynthesisMode: Copy + Send
 
     fn requirements(self, config: &Int4SourceMapConfig<Self::Task>, source_bytes: usize,
         width: usize, planner: &SourceTaskPlanner) -> Result<Int4MemoryRequirement, HostedError>;
+    fn cohort_requirements(self, config: &Int4SourceMapConfig<Self::Task>, width: usize)
+        -> Result<Int4SourceMapCohortRequirement, HostedError> {
+        config.synthesis_cohort_requirements(width)
+    }
     fn input_bytes(self, source_capacity: usize, config: &Int4SourceMapConfig<Self::Task>)
         -> Result<u64, HostedError>;
     fn workspace_bytes(self, config: &Int4SourceMapConfig<Self::Task>, chunks: usize)
@@ -26,6 +30,16 @@ pub(in crate::hosted::grouped_int4::source_map) trait SynthesisMode: Copy + Send
         -> Result<Self::Prepared<'s>, HostedError>;
 }
 
+#[derive(Clone, Copy)]
+pub(in crate::hosted::grouped_int4::source_map) struct GroupedHierarchy<H> {
+    pub limits: H,
+    pub schedule: Int4HierarchyCohortSchedule,
+}
+pub(in crate::hosted::grouped_int4::source_map) struct GroupedHierarchyPlan<P> {
+    pub prepared: P,
+    pub schedule: Int4HierarchyCohortSchedule,
+}
+
 pub(in crate::hosted::grouped_int4::source_map) trait SynthesisPlan: Sized {
     type Output: Send + 'static;
     fn group_width(&self) -> usize;
@@ -36,7 +50,7 @@ pub(in crate::hosted::grouped_int4::source_map) trait SynthesisPlan: Sized {
     fn execution_identities(&self) -> impl ExactSizeIterator<Item = &ExecutionIdentity>;
     fn cohort_requirements(&self, context_limit: usize) -> Result<Int4SourceMapCohortRequirement, Int4SourceMapError>;
     /// Execute the sealed plan and check its original complete semantic receipt
-    /// before returning the discovery-only physical ledger to the common owner.
+    /// before returning the selected phases' physical ledgers to the owner.
     #[allow(clippy::too_many_arguments)]
     fn run<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity], planner: &SourceTaskPlanner,
         weights: &Int4ModelWeights, vocabulary: &ExtractionVocabulary, budget: Int4SourceMapCohortBudget,
@@ -53,7 +67,7 @@ pub(in crate::hosted::grouped_int4::source_map) fn execute<M: SynthesisMode>(hos
     constrained_int4::check_model(&config.identity, model.model_identity()).map_err(|_| HostedError::ModelIdentity)?;
     let width = model.model_identity().group_width();
     let row = mode.requirements(&config, source.len(), width, &planner)?;
-    let ceiling = config.synthesis_cohort_requirements(width)?;
+    let ceiling = mode.cohort_requirements(&config, width)?;
     let bytes = mode.input_bytes(source.capacity(), &config)?;
     let run = config.native.run;
     let lease = host.resources().acquire_lease();
@@ -76,8 +90,8 @@ pub(in crate::hosted::grouped_int4::source_map) fn execute<M: SynthesisMode>(hos
             || row.kv_bytes > prepared.max_kv_bytes() {
             return Err(HostedError::ModelIdentity);
         }
-        // Even a short or sparse discovery window must admit the complete
-        // scalar context required by dependent evidence passes before inference.
+        // Short discovery windows never narrow the full contexts reserved for
+        // dependent scalar passes or independent hierarchy groups.
         let required = prepared.cohort_requirements(config.native.context_tokens).map_err(map_error)?;
         check_peak(required, ceiling)?;
         let reduction = Pending::reserve(&lease, MemoryClass::JobBuffers, mode.workspace_bytes(config, count)?)?;

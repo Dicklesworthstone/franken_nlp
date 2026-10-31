@@ -34,3 +34,19 @@ fn discovery_quote_cannot_authorize_an_underfunded_synthesis_context() {
     config.native.context_tokens += 1;
     assert!(config.synthesis_cohort_requirements(32).is_err());
 }
+
+#[test]
+fn hierarchy_group_peak_is_independent_of_discovery_width_and_original_task_authority() {
+    let (_, mut config) = fixture(SourceMapTask::Summarize(Default::default()), 32);
+    config.mapping.reduction.map_batch_chunks = 4;
+    let schedule = Int4HierarchyCohortSchedule { max_groups: 2, discovery_cohorts: false };
+    let groups = config.hierarchy_cohort_requirements(32, schedule).unwrap();
+    let discovery = config.cohort_requirements(32).unwrap();
+    let both = config.hierarchy_cohort_requirements(32,
+        Int4HierarchyCohortSchedule { discovery_cohorts: true, ..schedule }).unwrap();
+    assert_eq!(groups.native.kv_bytes, config.budget.max_kv_bytes * 2);
+    assert_eq!(both.native.kv_bytes, discovery.native.kv_bytes.max(groups.native.kv_bytes));
+    assert_eq!(both.workspace_bytes, discovery.workspace_bytes.max(groups.workspace_bytes));
+    config.budget.max_kv_bytes -= 1;
+    assert!(config.hierarchy_cohort_requirements(32, schedule).is_err());
+}

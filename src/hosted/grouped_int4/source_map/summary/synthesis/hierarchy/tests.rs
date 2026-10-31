@@ -21,6 +21,23 @@ fn fixture(width: usize) -> (SourceTaskPlanner, Int4SourceMapConfig<SourceSummar
 }
 
 #[test]
+fn grouped_summary_prices_concurrent_plans_without_renewing_frontiers_or_output() {
+    use native_cohorts::SynthesisMode;
+    let (planner, config) = fixture(32);
+    let limits = SummaryHierarchyLimits { max_passes: 4, ..Default::default() };
+    let mode = GroupedHierarchy { limits,
+        schedule: Int4HierarchyCohortSchedule { max_groups: 3, discovery_cohorts: false } };
+    mode.requirements(&config, 32, 32, &planner).unwrap();
+    assert_eq!(mode.input_bytes(4096, &config).unwrap(), 4096 + 3 * config.preparation_reserve_bytes);
+    assert_eq!(mode.workspace_bytes(&config, 2).unwrap(), config.summary_hierarchy_workspace_bytes(2, limits).unwrap());
+    assert_eq!(mode.output_tokens(&config, 2).unwrap(), hierarchy_output_tokens(2, config.budget.max_output_tokens, limits).unwrap());
+    let invalid = GroupedHierarchy { schedule: Int4HierarchyCohortSchedule { max_groups: 5, ..mode.schedule }, ..mode };
+    assert!(invalid.requirements(&config, 32, 32, &planner).is_err());
+    let mut config = config; config.preparation_reserve_bytes = u64::MAX / 2;
+    assert!(mode.input_bytes(4096, &config).is_err());
+}
+
+#[test]
 fn each_permitted_pass_prices_retained_output_and_complete_level_witnesses() {
     let (_, config) = fixture(32);
     let hierarchy = SummaryHierarchyLimits { max_passes: 4, max_levels: 3, ..Default::default() };

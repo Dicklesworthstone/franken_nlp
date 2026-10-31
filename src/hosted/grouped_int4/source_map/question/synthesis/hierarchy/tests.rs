@@ -27,6 +27,24 @@ fn fixture(width: usize) -> (SourceTaskPlanner, Int4SourceMapConfig<SourceQuesti
 }
 
 #[test]
+fn grouped_answer_prices_private_question_and_plans_but_only_retained_pass_tokens() {
+    use native_cohorts::SynthesisMode;
+    let (planner, mut config) = fixture(32);
+    let mut question = String::with_capacity(8192); question.push_str("Who?");
+    config.task.question.question = question;
+    let limits = QuestionHierarchyLimits { max_passes: 4, ..Default::default() };
+    let mode = GroupedHierarchy { limits,
+        schedule: Int4HierarchyCohortSchedule { max_groups: 3, discovery_cohorts: true } };
+    mode.requirements(&config, 32, 32, &planner).unwrap();
+    assert_eq!(mode.input_bytes(4096, &config).unwrap(),
+        4096 + config.task.question.question.capacity() as u64 + 3 * config.preparation_reserve_bytes);
+    assert_eq!(mode.workspace_bytes(&config, 2).unwrap(), config.question_hierarchy_workspace_bytes(2, limits).unwrap());
+    assert_eq!(mode.output_tokens(&config, 8).unwrap(), 4 * u64::from(config.budget.max_output_tokens));
+    let invalid = GroupedHierarchy { schedule: Int4HierarchyCohortSchedule { max_groups: 5, ..mode.schedule }, ..mode };
+    assert!(invalid.requirements(&config, 32, 32, &planner).is_err());
+}
+
+#[test]
 fn every_permitted_pass_prices_native_answers_and_level_witnesses() {
     let (_, config) = fixture(32);
     let hierarchy = QuestionHierarchyLimits { max_passes: 4, max_levels: 3, ..Default::default() };
