@@ -28,6 +28,7 @@ pub use grouped_int4::{Int4HostError, Int4LoadLimits, Int4LoadRequirements, Int4
     Int4SourceCorpusConfig, Int4SourceMapConfig, Int4SentimentHostLimits, Int4JudgeHostLimits,
     Int4SemanticHostLimits, Int4SemanticHostRequirements,
     Int4ScoredCohortHostLimits, Int4ScoredCohortBatchResult,
+    Int4AssayHostLimits, Int4AssayHostRequirements,
     Int4ExtractionCohortBatchResult, Int4SourceCohortBatchResult,
     Int4ResolveConfig, HostedInt4ChatStream, ResidentInt4, HostedInt4EntityCorpus,
     Int4EntityCorpusError, Int4EntityCorpusHostConfig, Int4EntityCorpusHostRequirements,
@@ -119,6 +120,7 @@ pub enum HostedError {
     Redaction(crate::tasks::redact::quantized::Int8RedactionError),
     BatchSetup(crate::batch::BatchFault),
     Batch(crate::batch::BatchRunError),
+    Assay(crate::assay::AssayError),
 }
 impl fmt::Display for HostedError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -150,6 +152,7 @@ impl fmt::Display for HostedError {
             Self::Redaction(_) => "hosted native redaction failed",
             Self::BatchSetup(_) => "hosted corpus setup refused",
             Self::Batch(_) => "hosted corpus failed; inspect the retained summary",
+            Self::Assay(_) => "hosted native evaluation or qualification refused",
         })
     }
 }
@@ -163,6 +166,7 @@ impl Error for HostedError {
             Self::Join { source, .. } => Some(source), Self::Scope { source, .. } => Some(source),
             Self::Model(e) => Some(e), Self::Native(e) => Some(e), Self::Chat(e) => Some(e),
             Self::Int4(e) => Some(e),
+            Self::Assay(e) => Some(e),
             Self::SourceMap(e) => Some(e), Self::Resolution(e) => Some(e),
             Self::Redaction(e) => Some(e), Self::Sentiment(e) => Some(e),
             Self::Source(e) => Some(e), Self::Judge(e) => Some(e), Self::Classification(e) => Some(e), Self::Extraction(e) => Some(e), Self::BatchSetup(e) => Some(e), Self::Batch(e) => Some(e), _ => None,
@@ -170,6 +174,12 @@ impl Error for HostedError {
     }
 }
 impl From<ReservationError> for HostedError { fn from(e: ReservationError) -> Self { Self::Reservation(e) } }
+impl From<crate::assay::AssayError> for HostedError {
+    fn from(error: crate::assay::AssayError) -> Self { Self::Assay(error) }
+}
+impl From<crate::calibration::CalibrationError> for HostedError {
+    fn from(_: crate::calibration::CalibrationError) -> Self { Self::Assay(crate::assay::AssayError::Calibration) }
+}
 
 /// A reservation that is explicitly aborted on every non-commit path. Drop
 /// does not trigger the underlying ledger's forgotten-obligation leak policy.

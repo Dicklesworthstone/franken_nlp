@@ -5,6 +5,8 @@ use super::*;
 use crate::native_engine::strict_int4::weights::snapshot::Int4SnapshotError;
 mod snapshot;
 mod classify;
+mod assay;
+pub use assay::{Int4AssayHostLimits, Int4AssayHostRequirements};
 mod sentiment;
 pub use sentiment::Int4SentimentHostLimits;
 mod judge;

@@ -1,8 +1,9 @@
-//! Bounded, user-owned evaluation of explicitly supplied binary-event scores.
+//! Bounded, user-owned evaluation of supplied scores and native task replays.
 //!
-//! These observations are caller data, not evidence of a native model replay.
-//! Reports bind private suite, input, split and execution identities using
-//! caller-owned HMAC keys. They never authorize model activation.
+//! The supplied-score surface identifies observations as caller data.
+//! `native_classify` reports only results collected by the actual native host.
+//! Both bind private suite, input, split and execution identities with
+//! caller-owned HMAC keys and never authorize model activation.
 
 use std::{error::Error, fmt, io::Write};
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,7 @@ use crate::{
 mod dataset;
 pub mod calibrate;
 pub mod qualify;
+pub mod native_classify;
 pub use dataset::{Dataset, DatasetBindings, DatasetMetadata, Observation, Split, SplitBindings, SplitIds, SuiteManifest};
 
 pub const ASSAY_SCHEMA_VERSION: u32 = 1;
@@ -105,6 +107,9 @@ impl fmt::Display for AssayError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(self.code()) }
 }
 impl Error for AssayError {}
+impl From<CalibrationError> for AssayError {
+    fn from(_: CalibrationError) -> Self { Self::Calibration }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -225,16 +230,33 @@ pub fn evaluate(dataset: &Dataset, key: &CommitmentKey, namespace: &str,
 pub fn measure(dataset: &Dataset, options: EvalOptions, limits: Limits,
     transform: impl Fn(f64) -> Result<f64, CalibrationError>) -> Result<Measurement, AssayError> {
     dataset.validate_limits(limits)?;
-    let locked = dataset.partition().locked_test();
+    measure_partition(dataset.partition(), options, limits, transform)
+}
+
+/// Common arithmetic over a validated split owner. Native replay constructs
+/// its own partition and never fabricates a supplied-score execution identity.
+pub(crate) fn measure_partition(partition: &calibration::CalibrationPartition,
+    options: EvalOptions, limits: Limits,
+    transform: impl Fn(f64) -> Result<f64, CalibrationError>) -> Result<Measurement, AssayError> {
+    measure_partition_with_checkpoint(partition, options, limits, transform, &mut || Ok(()))
+}
+
+pub(crate) fn measure_partition_with_checkpoint<E>(partition: &calibration::CalibrationPartition,
+    options: EvalOptions, limits: Limits, transform: impl Fn(f64) -> Result<f64, CalibrationError>,
+    checkpoint: &mut impl FnMut() -> Result<(), E>) -> Result<Measurement, E>
+where E: From<AssayError> + From<CalibrationError> {
+    let locked = partition.locked_test();
     options.validate_rows(locked.len(), limits)?;
+    checkpoint()?;
     if locked.len() < options.minimum_samples {
         return Ok(Measurement::InsufficientData { split: Split::LockedTest,
             rows: locked.len(), minimum_samples: options.minimum_samples });
     }
-    let (metrics, selective) = calibration::report_locked_test(locked, &transform, options.acceptance_threshold)
-        .map_err(|_| AssayError::Calibration)?;
-    let intervals = calibration::bootstrap_locked_test_confidence_intervals(locked, transform,
-        options.acceptance_threshold, options.bootstrap_config()?).map_err(|_| AssayError::Calibration)?;
+    let (metrics, selective) = calibration::report_locked_test_with_checkpoint(locked, &transform,
+        options.acceptance_threshold, checkpoint)?;
+    let intervals = calibration::bootstrap_locked_test_confidence_intervals_with_checkpoint(locked, transform,
+        options.acceptance_threshold, options.bootstrap_config()?, checkpoint)?;
+    checkpoint()?;
     Ok(Measurement::Measured { metrics: LockedTestMetrics { rows: metrics.rows,
         ece: metrics.ece, brier: metrics.brier, acceptance_threshold: selective.threshold,
         accepted: selective.accepted, abstained: selective.abstained, selective_risk: selective.risk,
