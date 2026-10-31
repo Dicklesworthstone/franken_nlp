@@ -94,6 +94,32 @@ fnlp models download-parts \
 
 The command installs one ordinary `EngineResources` host and runs the HTTP
 future on that owned runtime; it does not create a second nested runtime.
+
+For the complete remote-to-local-artifact candidate path, use:
+
+```sh
+fnlp models acquire \
+  --manifest /release/model.manifest.json \
+  --manifest-sha256 "$INDEPENDENT_MANIFEST_SHA256" \
+  --parts-dir /release/parts \
+  --staging-output /models/model.fnlpq.stage \
+  --output /models/model.fnlpq \
+  --memory-mib 256
+```
+
+`models acquire` first completes the exact same verified part acquisition and
+only then invokes the existing local reconstruction routine against those final
+part files. Network failure never enters reconstruction. Reconstruction failure
+does not relabel the downloaded parts as an active model; its staging file
+keeps the same forensic/resume semantics as `models reconstruct`.
+
+`--no-resume` disables reuse of both network partials and a pre-existing
+reconstruction staging file. Otherwise, reconstruction resumes only when the
+named staging file already exists; a fresh invocation uses create-new semantics.
+The network and reconstruction byte ceilings remain independent:
+`--max-download-bytes` bounds newly received bytes and `--max-copy-bytes`
+bounds newly appended reconstruction bytes.
+
 `--network-reserve-mib` (default 16) creates an explicit process-ledger
 reservation for HTTP/TLS/DNS/body bookkeeping. `--max-download-bytes` bounds
 new network bytes for resumable invocations. `--no-resume` refuses an

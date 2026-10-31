@@ -139,6 +139,8 @@ struct ConvertCommand {
 
 #[derive(Subcommand)]
 enum ModelsSubcommand {
+    /// Acquire parts and reconstruct one verified local Generic artifact; does not activate.
+    Acquire(ModelsAcquireCommand),
     /// Acquire verified immutable release parts over pinned HTTPS; does not activate.
     DownloadParts(ModelsDownloadPartsCommand),
     /// Reconstruct a verified Generic artifact from explicit local release parts.
@@ -164,6 +166,46 @@ struct ModelsDownloadPartsCommand {
     /// Maximum newly received bytes across this invocation.
     #[arg(long)]
     max_download_bytes: Option<u64>,
+    /// Process memory-ledger ceiling in MiB.
+    #[arg(long)]
+    memory_mib: u64,
+    /// Modeled HTTP/TLS/DNS/body bookkeeping reserve in MiB.
+    #[arg(long, default_value_t = 16)]
+    network_reserve_mib: u64,
+    /// Per-request timeout; every mirror attempt is independently bounded.
+    #[arg(long, default_value_t = 300)]
+    request_timeout_seconds: u64,
+    /// Maximum explicit absolute-HTTPS redirect hops per mirror.
+    #[arg(long, default_value_t = 5)]
+    max_redirects: u32,
+}
+
+#[derive(clap::Args)]
+struct ModelsAcquireCommand {
+    /// Canonical release manifest acquired through the release channel.
+    #[arg(long)]
+    manifest: PathBuf,
+    /// Independently trusted domain-separated manifest SHA-256.
+    #[arg(long)]
+    manifest_sha256: String,
+    /// Existing caller-controlled workspace for final .partNN and .partial files.
+    #[arg(long)]
+    parts_dir: PathBuf,
+    /// Staging Generic .fnlpq path, in the same directory as --output.
+    #[arg(long)]
+    staging_output: PathBuf,
+    /// New final Generic .fnlpq pathname; existing files are never replaced.
+    #[arg(long)]
+    output: PathBuf,
+    /// Disable reuse of both HTTP partials and an existing reconstruction staging file.
+    #[arg(long)]
+    no_resume: bool,
+    /// Maximum newly received network bytes across this invocation.
+    #[arg(long)]
+    max_download_bytes: Option<u64>,
+    /// Maximum new bytes copied from verified parts into reconstruction staging.
+    #[arg(long)]
+    max_copy_bytes: Option<u64>,
     /// Process memory-ledger ceiling in MiB.
     #[arg(long)]
     memory_mib: u64,
@@ -451,9 +493,109 @@ fn cli_main_with_reader_and_terminal(
 
 fn run_models_command(command: ModelsSubcommand) -> ExitCode {
     match command {
+        ModelsSubcommand::Acquire(command) => run_models_acquire(command),
         ModelsSubcommand::DownloadParts(command) => run_models_download_parts(command),
         ModelsSubcommand::Reconstruct(command) => run_models_reconstruct(command),
         ModelsSubcommand::Derive(command) => run_models_derive(command),
+    }
+}
+
+fn run_models_acquire(command: ModelsAcquireCommand) -> ExitCode {
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        let _ = command;
+        eprintln!("MODELS_ACQUIRE RESULT=REFUSED reason=asupersync-runtime-feature-disabled");
+        return ErrorCode::Generic.as_process_exit();
+    }
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        use std::time::Duration;
+        const MIB: u64 = 1024 * 1024;
+        let Some(memory_bytes) = command.memory_mib.checked_mul(MIB).filter(|&bytes| bytes != 0) else {
+            eprintln!("MODELS_ACQUIRE RESULT=REFUSED reason=invalid-memory-mib");
+            return ErrorCode::Usage.as_process_exit();
+        };
+        let Some(network_reserve_bytes) = command.network_reserve_mib.checked_mul(MIB).filter(|&bytes| bytes != 0) else {
+            eprintln!("MODELS_ACQUIRE RESULT=REFUSED reason=invalid-network-reserve-mib");
+            return ErrorCode::Usage.as_process_exit();
+        };
+        if command.request_timeout_seconds == 0 || command.max_redirects > 16 {
+            eprintln!("MODELS_ACQUIRE RESULT=REFUSED reason=invalid-network-limits");
+            return ErrorCode::Usage.as_process_exit();
+        }
+        let engine = match NlpEngine::builder().resource_config(ResourceHostConfig {
+            runtime_preset: RuntimePreset::CurrentThread,
+            runtime_workers: 1,
+            max_blocking_coordinators: 1,
+            scoped_cpu_children_per_coordinator: 0,
+            helper_threads: 0,
+            thread_ceiling: 2,
+            memory_ceiling_bytes: memory_bytes,
+            leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
+        }).build() {
+            Ok(engine) => engine,
+            Err(error) => {
+                eprintln!("MODELS_ACQUIRE RESULT=REFUSED stage=runtime reason={error}");
+                return ErrorCode::AdmissionOrResourceLimit.as_process_exit();
+            }
+        };
+        let transfer = NetworkPartsOptions {
+            resume: !command.no_resume,
+            max_new_bytes: command.max_download_bytes,
+            request_timeout: Duration::from_secs(command.request_timeout_seconds),
+            max_redirects: command.max_redirects,
+        };
+        let network = match engine.download_release_parts_candidate(
+            NetworkPartsRequest {
+                manifest: command.manifest.clone(),
+                expected_release_manifest_sha256: command.manifest_sha256.clone(),
+                parts_dir: command.parts_dir.clone(),
+            },
+            transfer,
+            NetworkPullHostOptions { network_reserve_bytes },
+        ) {
+            Ok(report) => report,
+            Err(error) => {
+                eprintln!("MODELS_ACQUIRE RESULT=FAIL stage=download reason={error}");
+                return network_download_error_code(&error).as_process_exit();
+            }
+        };
+        let reconstruct_resume = !command.no_resume && command.staging_output.exists();
+        let reconstruction = reconstruct_local_release_with_options(
+            &LocalReconstructRequest {
+                manifest: command.manifest,
+                expected_release_manifest_sha256: command.manifest_sha256,
+                parts_dir: command.parts_dir,
+                staging_output: command.staging_output,
+                output: command.output,
+            },
+            &LocalReconstructOptions {
+                resume: reconstruct_resume,
+                max_new_bytes: command.max_copy_bytes,
+            },
+            |_| None,
+        );
+        match reconstruction {
+            Ok(report) => {
+                eprintln!(
+                    "MODELS_ACQUIRE RESULT=PASS output={} artifact_bytes={} artifact_sha256={} manifest_sha256={} parts={} network_reused_bytes={} network_downloaded_bytes={} reconstruct_resumed_bytes={} reconstruct_copied_bytes={} directory_durability=unconfirmed activation_authority=false",
+                    report.output.display(),
+                    report.artifact_bytes,
+                    report.artifact_sha256,
+                    report.release_manifest_sha256,
+                    report.part_count,
+                    network.reused_bytes,
+                    network.downloaded_bytes,
+                    report.resumed_bytes,
+                    report.copied_bytes,
+                );
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("MODELS_ACQUIRE RESULT=FAIL stage=reconstruct reason={error}");
+                reconstruct_error_code(&error).as_process_exit()
+            }
+        }
     }
 }
 
@@ -2334,6 +2476,57 @@ mod tests {
                 command: ReleaseSubcommand::VerifyModelPackage { .. }
             })
         ));
+    }
+
+    #[test]
+    fn models_acquire_binds_network_and_reconstruction_authority_in_one_command() {
+        let parsed = Cli::try_parse_from([
+            "fnlp",
+            "models",
+            "acquire",
+            "--manifest",
+            "/release/model.manifest.json",
+            "--manifest-sha256",
+            "abababababababababababababababababababababababababababababababab",
+            "--parts-dir",
+            "/release/parts",
+            "--staging-output",
+            "/models/model.fnlpq.stage",
+            "--output",
+            "/models/model.fnlpq",
+            "--memory-mib",
+            "256",
+            "--network-reserve-mib",
+            "16",
+            "--max-download-bytes",
+            "1048576",
+            "--max-copy-bytes",
+            "1048576",
+        ])
+        .expect("remote acquisition plus reconstruction accepts every explicit authority");
+        let Some(Command::Models { command: ModelsSubcommand::Acquire(command) }) = parsed.command
+            else { panic!("wrong acquire route"); };
+        assert_eq!(command.memory_mib, 256);
+        assert_eq!(command.network_reserve_mib, 16);
+        assert_eq!(command.max_download_bytes, Some(1_048_576));
+        assert_eq!(command.max_copy_bytes, Some(1_048_576));
+        assert!(!command.no_resume);
+
+        assert!(Cli::try_parse_from([
+            "fnlp",
+            "models",
+            "acquire",
+            "--manifest",
+            "/release/model.manifest.json",
+            "--manifest-sha256",
+            "abababababababababababababababababababababababababababababababab",
+            "--parts-dir",
+            "/release/parts",
+            "--staging-output",
+            "/models/model.fnlpq.stage",
+            "--output",
+            "/models/model.fnlpq",
+        ]).is_err(), "memory admission must be explicit");
     }
 
     #[test]
