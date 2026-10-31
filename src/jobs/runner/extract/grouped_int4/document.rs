@@ -5,8 +5,11 @@ use super::*;
 use crate::{
     batch::extract::grouped_int4::long::{Int4ExtractionMapError, Int4ExtractionMapLimits,
         Int4ExtractionMappingLimits, Int4ExtractionMapPreflight, Int4ExtractionMapRun,
-        PreparedInt4ExtractionMap, INT4_EXTRACTION_MAP_EXECUTION},
-    native_engine::{constrained_int4, strict_int4::Int4MemoryRequirement},
+        PreparedInt4ExtractionMap, INT4_EXTRACTION_MAP_EXECUTION,
+        cohort::{Int4ExtractionMapCohortBudget, Int4ExtractionMapCohortMemoryLimits,
+            Int4ExtractionMapCohortRequirement}},
+    native_engine::{constrained_int4, int4::PackedInt4Kernel,
+        strict_int4::{Int4MemoryRequirement, Int4ModelWeights}},
     tasks::mapreduce::{ChunkLimits, ExecutionLimits, CHUNK_PROFILE},
     validation::grounded_fields::GroundingBudget,
 };
@@ -17,6 +20,8 @@ pub use crate::batch::extract::quantized::long::stream::ExtractionDocumentArgs;
 mod execution;
 pub use execution::{Int4ExtractionDocumentAdmission, Int4ExtractionDocumentBatchAdmission,
     Int4DocumentExtractionJobProcessor};
+
+const CHUNK_COHORT_SCHEDULE: &str = "native-document-chunk-cohorts-v1";
 
 /// Private immutable settings projected into JobRunner's keyed commitment.
 /// Exact schema bytes stay in the sealed extraction defaults, including number
@@ -39,6 +44,9 @@ pub struct Int4DocumentExtractionJobRecipe {
     verification: GroundingBudget,
     max_lifetime_verification: GroundingBudget,
     max_attempts: u64,
+    /// Absent preserves the exact original serial recipe commitment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chunk_cohorts: Option<&'static str>,
 }
 impl Int4DocumentExtractionJobRecipe {
     fn new(extraction: Int4ExtractionJobRecipe, document: Int4ExtractionMapLimits,
@@ -55,7 +63,7 @@ impl Int4DocumentExtractionJobRecipe {
             extraction, chunks, reduction, per_document_model_work: max_model_work,
             max_trie_node_visits, checkpoint_interval_nodes, mask_visits_per_chunk,
             max_mask_visits_per_document: max_mask_visits, verification,
-            max_lifetime_verification, max_attempts };
+            max_lifetime_verification, max_attempts, chunk_cohorts: None };
         bounded_json(&recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
         Ok(recipe)
     }
@@ -111,6 +119,32 @@ impl Int4DocumentExtractionJobPlanner {
     pub fn job_limits(&self) -> JobLimits { self.limits }
     pub fn request(&self) -> &ExtractionBatchArgs { &self.recipe.extraction.defaults }
     pub fn group_width(&self) -> usize { self.recipe.extraction.group_width }
+    /// Opt into native windows within each durable document attempt. The
+    /// already-authenticated map_batch_chunks fixes their maximum width.
+    pub fn with_chunk_cohorts(mut self) -> Result<Self, BatchFault> {
+        self.cohort_requirements()?;
+        if !self.uses_chunk_cohorts() {
+            self.recipe.chunk_cohorts = Some(CHUNK_COHORT_SCHEDULE);
+            bounded_json(&self.recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
+            // Prepared serial attempts cannot acquire the newly opted schedule.
+            self.owner = Arc::new(());
+        }
+        Ok(self)
+    }
+    pub fn uses_chunk_cohorts(&self) -> bool { self.recipe.chunk_cohorts == Some(CHUNK_COHORT_SCHEDULE) }
+    /// Static whole-window ownership for the complete job invocation. Short
+    /// documents and ragged final windows never reduce the host's reservation.
+    pub fn cohort_requirements(&self) -> Result<Int4ExtractionMapCohortRequirement, BatchFault> {
+        let mapping = self.document.mapping;
+        if mapping.reduction.map_batch_chunks > mapping.chunks.max_chunks {
+            return Err(BatchCode::InvalidLimits.into());
+        }
+        Int4ExtractionMapCohortMemoryLimits {
+            max_chunks: mapping.reduction.map_batch_chunks, context_tokens: mapping.chunks.context_tokens,
+            max_output_tokens_per_chunk: u64::from(self.document_budget().max_output_tokens),
+            max_result_bytes_per_chunk: self.document_budget().max_output_bytes,
+        }.requirements(self.group_width()).map_err(|error| map_failure(error).fault)
+    }
     pub fn max_result_bytes(&self) -> u64 { self.document.mapping.reduction.max_result_bytes as u64 }
     pub fn output_token_ceiling(&self) -> Result<u64, BatchFault> {
         self.output_tokens(self.document.mapping.chunks.max_chunks)

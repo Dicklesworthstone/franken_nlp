@@ -383,3 +383,114 @@ fn real_native_processor_factory_and_owned_preparation_satisfy_host_contracts() 
     durable::<Int4DocumentExtractionJobProcessor<'static, 'static, 'static, 'static, Admission>>();
     send::<Int4DocumentExtractionJobPlanner>(); send::<PreparedInt4ExtractionDocument>();
 }
+
+fn cohort_factory(chunks: usize, grounded: bool) -> Int4DocumentExtractionJobPlanner {
+    let mut map = mapping(); map.mapping.reduction.map_batch_chunks = chunks;
+    build(WIDTH, budget(), CompileLimits::default(), SourceRuntimeLimits::default(),
+        request(grounded), map, limits(), lifetime()).unwrap().with_chunk_cohorts().unwrap()
+}
+fn cohort_budget(factory: &Int4DocumentExtractionJobPlanner) -> Int4ExtractionMapCohortBudget {
+    let required = factory.cohort_requirements().unwrap();
+    Int4ExtractionMapCohortBudget { context_limit: factory.document.mapping.chunks.context_tokens,
+        native_memory: crate::native_engine::strict_int4::Int4MemoryBudget {
+            max_kv_bytes: required.native.kv_bytes, max_rope_bytes: required.native.rope_bytes,
+            max_scratch_payload_bytes: required.native.scratch_payload_bound },
+        max_workspace_bytes: required.workspace_bytes, max_result_bytes: required.max_result_bytes }
+}
+
+#[test]
+fn chunk_cohort_schedule_is_private_resume_authority_and_preserves_serial_recipe_bytes() {
+    let serial = factory(true);
+    let baseline = serde_json::to_value(serial.job_recipe()).unwrap();
+    assert!(baseline.get("chunk_cohorts").is_none());
+    let serial_binding = freeze(&serial);
+    let grouped = serial.with_chunk_cohorts().unwrap();
+    assert!(grouped.uses_chunk_cohorts());
+    let mut changed = serde_json::to_value(grouped.job_recipe()).unwrap();
+    assert_eq!(changed["chunk_cohorts"], CHUNK_COHORT_SCHEDULE);
+    changed.as_object_mut().unwrap().remove("chunk_cohorts");
+    assert_eq!(canonjson::canonical_bytes(&changed).unwrap(), canonjson::canonical_bytes(&baseline).unwrap());
+    assert_eq!(serial_binding.binding.compare(&freeze(&grouped).binding), Err(JobError::Mismatch(MismatchField::Recipe)));
+    assert_eq!(freeze(&grouped).binding.compare(&freeze(&cohort_factory(1, true)).binding), Ok(()));
+    assert_eq!(freeze(&grouped).binding.compare(&freeze(&cohort_factory(2, true)).binding),
+        Err(JobError::Mismatch(MismatchField::Recipe)));
+}
+
+#[test]
+fn opting_into_cohorts_invalidates_prepared_serial_ownership_without_changing_task_or_work() {
+    for grounded in [false, true] {
+        let serial = factory(grounded); let old = prepare(&serial, SOURCE);
+        let task = serial.document_budget(); let ceiling = serial.task_ceiling();
+        let grouped = serial.with_chunk_cohorts().unwrap();
+        assert_eq!(grouped.document_budget(), task); assert_eq!(grouped.task_ceiling(), ceiling);
+        assert!(grouped.owns(&old).is_err());
+        let fresh = prepare(&grouped, SOURCE);
+        assert_eq!(fresh.identities, old.identities); assert_eq!(fresh.work, old.work); assert_eq!(fresh.expected, old.expected);
+        grouped.owns(&fresh).unwrap();
+        // Reaffirming the same opted schedule grants no new identity or budget.
+        let grouped = grouped.with_chunk_cohorts().unwrap();
+        grouped.owns(&fresh).unwrap();
+        let plan = grouped.plan(SOURCE, &mut Continue).unwrap();
+        grouped.compare(&plan, &fresh, &mut Continue).unwrap();
+        assert_eq!(grouped.max_result_bytes(), mapping().mapping.reduction.max_result_bytes as u64);
+        assert_eq!(grouped.output_tokens(fresh.chunk_count()).unwrap(), 2 * u64::from(task.max_output_tokens));
+    }
+}
+
+#[test]
+fn static_cohort_admission_retains_all_declared_rows_for_short_and_ragged_documents() {
+    for width in [1, 2, 4, 8] {
+        let grouped = cohort_factory(width, true); let declared = grouped.cohort_requirements().unwrap();
+        let supplied = cohort_budget(&grouped);
+        assert_eq!(declared.native.kv_bytes, budget().max_kv_bytes * width as u64);
+        assert_eq!(execution::cohort_budget(&grouped, supplied).unwrap(), declared);
+        for source in ["Alice", SOURCE, "éabc----βdef----Carol"] {
+            let plan = grouped.plan(source, &mut Continue).unwrap();
+            let actual = plan.cohort_requirements(supplied.context_limit).unwrap();
+            execution::check_peak(actual, declared).unwrap();
+            assert!(actual.native.kv_bytes < declared.native.kv_bytes);
+            // Admission keeps the static peak, never the previous attempt's
+            // short-row quote; only the original per-row authority is bound.
+            assert_eq!(execution::cohort_budget(&grouped, supplied).unwrap().native.kv_bytes, declared.native.kv_bytes);
+            assert_eq!(plan.max_kv_bytes(), budget().max_kv_bytes);
+        }
+    }
+}
+
+#[test]
+fn every_cohort_memory_axis_and_original_context_must_fit_before_attempt_admission() {
+    let grouped = cohort_factory(4, false); let supplied = cohort_budget(&grouped);
+    for axis in 0..8 {
+        let mut short = supplied;
+        match axis {
+            0 => short.native_memory.max_kv_bytes -= 1,
+            1 => short.native_memory.max_rope_bytes -= 1,
+            2 => short.native_memory.max_scratch_payload_bytes -= 1,
+            3 => short.max_workspace_bytes -= 1,
+            4 => short.max_result_bytes -= 1,
+            5 => short.context_limit -= 1,
+            6 => short.context_limit += 1,
+            _ => short.max_result_bytes = crate::batch::extract::grouped_int4::memory::MAX_COHORT_RESULT_BYTES + 1,
+        }
+        let error = execution::cohort_budget(&grouped, short).err().unwrap();
+        assert!(error.stop); assert_eq!(error.fault.code, BatchCode::Admission, "axis {axis}");
+    }
+    assert!(execution::cohort_budget(&factory(false), supplied).is_err());
+}
+
+#[test]
+fn invalid_physical_chunk_width_does_not_become_a_durable_schedule() {
+    for width in [9, 65, 1024] {
+        let mut map = mapping(); map.mapping.reduction.map_batch_chunks = width;
+        let serial = build(WIDTH, budget(), CompileLimits::default(), SourceRuntimeLimits::default(),
+            request(false), map, limits(), lifetime()).unwrap();
+        assert!(!serial.uses_chunk_cohorts());
+        assert!(serial.with_chunk_cohorts().is_err());
+    }
+    // Width alone is part of the old serial recipe; it does not opt in.
+    let mut map = mapping(); map.mapping.reduction.map_batch_chunks = 4;
+    let serial = build(WIDTH, budget(), CompileLimits::default(), SourceRuntimeLimits::default(),
+        request(false), map, limits(), lifetime()).unwrap();
+    assert!(!serial.uses_chunk_cohorts());
+    assert!(execution::cohort_budget(&serial, cohort_budget(&cohort_factory(4, false))).is_err());
+}

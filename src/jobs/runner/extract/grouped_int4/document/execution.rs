@@ -1,4 +1,4 @@
-//! One real resident engine; the complete result guard survives durable sync.
+//! One closed native schedule; the complete result guard survives durable sync.
 use super::*;
 
 /// Admission receives every original ordered chunk identity and the actual
@@ -22,7 +22,7 @@ pub trait Int4ExtractionDocumentBatchAdmission {
 
 pub struct Int4DocumentExtractionJobProcessor<'p, 'e, 'w, 'v, A: Int4ExtractionDocumentBatchAdmission> {
     planner: &'p Int4DocumentExtractionJobPlanner,
-    engine: &'e mut StrictInt4Engine<'w>,
+    backend: Backend<'e, 'w>,
     vocabulary: &'v ExtractionVocabulary,
     admission: A,
     ledger: Ledger,
@@ -30,9 +30,21 @@ pub struct Int4DocumentExtractionJobProcessor<'p, 'e, 'w, 'v, A: Int4ExtractionD
 impl<'p, 'e, 'w, 'v, A: Int4ExtractionDocumentBatchAdmission> Int4DocumentExtractionJobProcessor<'p, 'e, 'w, 'v, A> {
     pub fn new(planner: &'p Int4DocumentExtractionJobPlanner, engine: &'e mut StrictInt4Engine<'w>,
         vocabulary: &'v ExtractionVocabulary, admission: A) -> Result<Self, BatchFault> {
-        check_capacity(planner, engine).map_err(|e| e.fault)?;
+        let backend = Backend::Serial(engine);
+        backend.check_capacity(planner).map_err(|e| e.fault)?;
         planner.check_job_limits(planner.limits)?;
-        Ok(Self { planner, engine, vocabulary, admission, ledger: Ledger::default() })
+        Ok(Self { planner, backend, vocabulary, admission, ledger: Ledger::default() })
+    }
+    /// The caller retains the declared complete native/decoder peak through
+    /// every document, cohort drain and durable acknowledgement. Each row keeps
+    /// its original task budget, and the spool retains the original map wire.
+    pub fn new_cohorts(planner: &'p Int4DocumentExtractionJobPlanner, weights: &'w Int4ModelWeights,
+        vocabulary: &'v ExtractionVocabulary, budget: Int4ExtractionMapCohortBudget,
+        kernel: PackedInt4Kernel, admission: A) -> Result<Self, BatchFault> {
+        let backend = Backend::Cohorts { weights, budget, kernel };
+        backend.check_capacity(planner).map_err(|e| e.fault)?;
+        planner.check_job_limits(planner.limits)?;
+        Ok(Self { planner, backend, vocabulary, admission, ledger: Ledger::default() })
     }
 }
 impl<A: Int4ExtractionDocumentBatchAdmission> BatchProcessor for Int4DocumentExtractionJobProcessor<'_, '_, '_, '_, A> {
@@ -49,7 +61,7 @@ impl<A: Int4ExtractionDocumentBatchAdmission> BatchProcessor for Int4DocumentExt
         -> Result<Self::Prepared, BatchItemFailure> {
         self.ledger.ready()?;
         self.ledger.failed = true;
-        check_capacity(self.planner, self.engine)?;
+        self.backend.check_capacity(self.planner)?;
         let prepared = self.planner.prepare_with_control(document, control)?;
         self.ledger.failed = false;
         Ok(prepared)
@@ -69,14 +81,10 @@ impl<A: Int4ExtractionDocumentBatchAdmission> BatchProcessor for Int4DocumentExt
         self.ledger.begin(prepared.work, context, self.planner.limits)?;
         self.planner.owns(&prepared)?;
         poll(control)?;
-        let kv = check_capacity(self.planner, self.engine)?;
+        let kv = self.backend.check_capacity(self.planner)?;
         let plan = self.planner.plan(&prepared.source, control)?;
         self.planner.compare(&plan, &prepared, control)?;
-        for identity in &prepared.identities {
-            poll(control)?;
-            constrained_int4::check_model(identity, self.engine.model_identity())
-                .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
-        }
+        self.backend.preflight(self.planner, &plan, &prepared.identities, control)?;
         let (admitted, guard) = self.admission.admit(Int4ExtractionDocumentAdmission {
             identities: &prepared.identities, model_work: prepared.work.int4_model_work(),
             mask_node_visits: prepared.work.mask_node_visits,
@@ -89,9 +97,9 @@ impl<A: Int4ExtractionDocumentBatchAdmission> BatchProcessor for Int4DocumentExt
         if admitted != prepared.identities { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
         // The actual native map authenticates EVERY full schema/source plan,
         // including the final chunk's KV, before the first model forward.
-        let output = plan.execute_with_control(&admitted, self.engine, self.vocabulary, control).map_err(map_failure)?;
+        let output = self.backend.execute(plan, &admitted, self.vocabulary, control)?;
         prepared.expected.verify_completed(&output).map_err(map_failure)?;
-        check_capacity(self.planner, self.engine)?;
+        self.backend.check_capacity(self.planner)?;
         poll(control)?;
         self.ledger.failed = false;
         // JobRunner retains this guard through serialization, spool sync and
@@ -107,11 +115,85 @@ impl<A: Int4ExtractionDocumentBatchAdmission> DurableBatchProcessor for Int4Docu
     fn durable_work(&self, prepared: &Self::Prepared) -> Result<JobWork, BatchItemFailure> {
         self.ledger.ready()?;
         self.planner.owns(prepared)?;
-        check_capacity(self.planner, self.engine)?;
+        self.backend.check_capacity(self.planner)?;
         if receipt_work(prepared.expected) != prepared.work { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
         Ok(prepared.work)
     }
     fn max_result_bytes(&self, _: &Self::Prepared) -> u64 { self.planner.max_result_bytes() }
+}
+
+/// A physical schedule is fixed by the private job recipe. No caller-supplied
+/// driver, result receipt or alternate model can enter the durable lifecycle.
+enum Backend<'e, 'w> {
+    Serial(&'e mut StrictInt4Engine<'w>),
+    Cohorts { weights: &'w Int4ModelWeights, budget: Int4ExtractionMapCohortBudget, kernel: PackedInt4Kernel },
+}
+impl Backend<'_, '_> {
+    fn model_identity(&self) -> &Int4ModelIdentity {
+        match self { Self::Serial(engine) => engine.model_identity(), Self::Cohorts { weights, .. } => weights.identity() }
+    }
+    fn check_capacity(&self, planner: &Int4DocumentExtractionJobPlanner) -> Result<u64, BatchItemFailure> {
+        match self {
+            Self::Serial(engine) if !planner.uses_chunk_cohorts() => check_capacity(planner, engine),
+            Self::Cohorts { weights, budget, .. } if planner.uses_chunk_cohorts() => {
+                constrained_int4::check_model(planner.execution_identity(), weights.identity())
+                    .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
+                if weights.group_width() != planner.group_width() {
+                    return Err(BatchItemFailure::fatal(BatchCode::Admission));
+                }
+                Ok(cohort_budget(planner, *budget)?.native.kv_bytes)
+            }
+            _ => Err(BatchItemFailure::fatal(BatchCode::Admission)),
+        }
+    }
+    fn preflight<C: DecodeStepControl>(&self, planner: &Int4DocumentExtractionJobPlanner,
+        plan: &PreparedInt4ExtractionMap<'_>, identities: &[ExecutionIdentity], control: &mut C)
+        -> Result<(), BatchItemFailure> {
+        for identity in identities {
+            poll(control)?;
+            constrained_int4::check_model(identity, self.model_identity())
+                .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
+        }
+        if let Self::Cohorts { budget, .. } = self {
+            let ceiling = cohort_budget(planner, *budget)?;
+            let required = plan.cohort_requirements(budget.context_limit).map_err(map_failure)?;
+            check_peak(required, ceiling)?;
+        }
+        poll(control)
+    }
+    fn execute<C: DecodeStepControl>(&mut self, plan: PreparedInt4ExtractionMap<'_>,
+        admitted: &[ExecutionIdentity], vocabulary: &ExtractionVocabulary, control: &mut C)
+        -> Result<Int4ExtractionMapRun, BatchItemFailure> {
+        match self {
+            Self::Serial(engine) => plan.execute_with_control(admitted, engine, vocabulary, control).map_err(map_failure),
+            Self::Cohorts { weights, budget, kernel } => plan.execute_cohorts_with_control(
+                admitted, weights, vocabulary, *budget, *kernel, control).map(|run| run.document).map_err(map_failure),
+        }
+    }
+}
+
+pub(super) fn cohort_budget(planner: &Int4DocumentExtractionJobPlanner, budget: Int4ExtractionMapCohortBudget)
+    -> Result<Int4ExtractionMapCohortRequirement, BatchItemFailure> {
+    if !planner.uses_chunk_cohorts() || budget.context_limit != planner.document.mapping.chunks.context_tokens
+        || budget.max_result_bytes > crate::batch::extract::grouped_int4::memory::MAX_COHORT_RESULT_BYTES {
+        return Err(BatchItemFailure::fatal(BatchCode::Admission));
+    }
+    let required = planner.cohort_requirements().map_err(BatchItemFailure::fatal)?;
+    let supplied = Int4ExtractionMapCohortRequirement { native: Int4MemoryRequirement {
+        kv_bytes: budget.native_memory.max_kv_bytes, rope_bytes: budget.native_memory.max_rope_bytes,
+        scratch_payload_bound: budget.native_memory.max_scratch_payload_bytes },
+        workspace_bytes: budget.max_workspace_bytes, max_result_bytes: budget.max_result_bytes };
+    check_peak(required, supplied)?;
+    Ok(required)
+}
+pub(super) fn check_peak(required: Int4ExtractionMapCohortRequirement, ceiling: Int4ExtractionMapCohortRequirement)
+    -> Result<(), BatchItemFailure> {
+    if required.native.kv_bytes > ceiling.native.kv_bytes || required.native.rope_bytes > ceiling.native.rope_bytes
+        || required.native.scratch_payload_bound > ceiling.native.scratch_payload_bound
+        || required.workspace_bytes > ceiling.workspace_bytes || required.max_result_bytes > ceiling.max_result_bytes {
+        return Err(BatchItemFailure::fatal(BatchCode::Admission));
+    }
+    Ok(())
 }
 
 #[derive(Default)]
