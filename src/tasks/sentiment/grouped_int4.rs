@@ -24,6 +24,8 @@ use super::{SentimentError, SentimentLimits, SentimentOptions, SentimentPlan, Se
     SentimentPlanningError, SentimentRequest, SentimentResult, distribution::HeadPlan};
 mod model;
 pub mod cohort;
+/// Whole-document maps with exact chunk provenance and explicit aggregation.
+pub mod long;
 pub use model::Int4SentimentPlanner;
 
 pub const INT4_SENTIMENT_EXECUTION: &str = "grouped-int4-independent-affect-heads-v1";

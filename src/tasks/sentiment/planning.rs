@@ -199,6 +199,43 @@ impl SentimentPlanner {
     #[must_use]
     pub fn tokenizer_digest(&self) -> Sha256Digest { Sha256Digest::of_bytes(PINNED_TOKENIZER_MODEL_BYTES) }
 
+    /// Exact source-byte capacity for the pinned, separately encoded document
+    /// segment. Candidate EOS is scored after the longest continuation; it is
+    /// included in the language depth cap but not appended to causal context.
+    pub(super) fn source_capacity(&self, axes: &[SentimentAxis], budget: TaskBudget,
+        ceiling: TaskBudget, limits: SentimentLimits, context_tokens: usize)
+        -> Result<usize, SentimentPlanningError> {
+        budget.validate().map_err(|_| SentimentPlanningError::Budget)?;
+        ceiling.validate().map_err(|_| SentimentPlanningError::Budget)?;
+        if !budget_fits(budget, ceiling) { return Err(SentimentPlanningError::Budget); }
+        let axes = checked_axes(axes)?;
+        let overheads = self.axis_overheads(&axes)?;
+        let maximum = overheads.iter().copied().max().ok_or(SentimentPlanningError::InvalidAxes)?;
+        let total = overheads.iter().try_fold(0_usize, |sum, &value|
+            sum.checked_add(value).ok_or(SentimentPlanningError::Budget))?;
+        let continuation = self.candidates.iter().map(|candidate| candidate.continuation().token_ids().len())
+            .max().ok_or(SentimentPlanningError::Budget)?;
+        let depth = continuation.checked_add(1).ok_or(SentimentPlanningError::Budget)?;
+        if depth > budget.max_output_tokens as usize || depth > limits.per_axis.max_depth {
+            return Err(SentimentPlanningError::Budget);
+        }
+        let per_axis = (budget.max_input_tokens as usize).checked_sub(maximum).ok_or(SentimentPlanningError::Budget)?;
+        let aggregate = limits.max_total_prompt_tokens.checked_sub(total).ok_or(SentimentPlanningError::Budget)? / axes.len();
+        let native = context_tokens.checked_sub(continuation).and_then(|n| n.checked_sub(maximum))
+            .ok_or(SentimentPlanningError::Budget)?;
+        let capacity = per_axis.min(aggregate).min(native);
+        if capacity == 0 { return Err(SentimentPlanningError::Budget); }
+        Ok(capacity)
+    }
+
+    fn axis_overheads(&self, axes: &[SentimentAxis]) -> Result<Vec<usize>, SentimentPlanningError> {
+        axes.iter().map(|axis| {
+            let template = &self.axes[*axis as usize];
+            self.global.len().checked_add(template.instruction.len())
+                .and_then(|n| n.checked_add(template.scaffold.len())).ok_or(SentimentPlanningError::Budget)
+        }).collect()
+    }
+
     /// Compile raw text into one registry-bound TaskIR per dimension and then
     /// the complete executable sentiment bundle. All source and aggregate
     /// prompt bounds are checked before byte-token allocation; no truncation,
@@ -239,11 +276,7 @@ impl SentimentPlanner {
         if !budget_fits(request.budget, *context.budget_ceiling()) {
             return Err(SentimentPlanningError::Budget);
         }
-        let overheads = axes.iter().map(|axis| {
-            let template = &self.axes[*axis as usize];
-            self.global.len().checked_add(template.instruction.len())
-                .and_then(|n| n.checked_add(template.scaffold.len())).ok_or(SentimentPlanningError::Budget)
-        }).collect::<Result<Vec<_>, _>>()?;
+        let overheads = self.axis_overheads(&axes)?;
         // The audited encoder uses one fallback token per source byte. Count
         // bytes, not Unicode scalar values, and include every axis's overhead.
         preflight_prompt_lengths(request.document.len(), &overheads,
