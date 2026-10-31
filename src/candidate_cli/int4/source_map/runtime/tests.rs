@@ -79,6 +79,71 @@ fn all_tasks_preflight_every_original_byte_and_keep_real_grouped_work() {
 }
 
 #[test]
+fn native_chunk_schedule_keeps_every_sealed_task_identity_and_whole_source_preflight() {
+    for kind in [Kind::Ner, Kind::Keyphrases] {
+        let (planner, mut config, _) = fixture(kind, 32);
+        config.budget.max_output_bytes = 65536;
+        let context = PlanContext::new(&config.identity, config.budget).unwrap();
+        let serial = planner.plan_int4_map_with_control(SOURCE, &config.task, config.budget, &context,
+            config.planning, config.mapping, 32, &mut continuing()).unwrap();
+        let expected = serial.preflight_metadata();
+        let identities: Vec<_> = serial.execution_identities().cloned().collect();
+        assert!(expected.chunk_count() > 2);
+        for chunks in [1, 2, 4, 64] {
+            config.mapping.reduction.map_batch_chunks = chunks;
+            let grouped = planner.plan_int4_map_with_control(SOURCE, &config.task, config.budget, &context,
+                config.planning, config.mapping, 32, &mut continuing()).unwrap();
+            assert_eq!(grouped.preflight_metadata(), expected);
+            assert_eq!(grouped.execution_identities().cloned().collect::<Vec<_>>(), identities);
+            let actual = grouped.cohort_requirements(config.native.context_tokens).unwrap();
+            let ceiling = config.cohort_requirements(32).unwrap();
+            assert!(actual.native.kv_bytes <= ceiling.native.kv_bytes);
+            assert!(actual.native.rope_bytes <= ceiling.native.rope_bytes);
+            assert!(actual.native.scratch_payload_bound <= ceiling.native.scratch_payload_bound);
+            assert!(actual.workspace_bytes <= ceiling.workspace_bytes);
+            assert!(actual.max_result_bytes <= ceiling.max_result_bytes);
+        }
+    }
+}
+
+#[test]
+fn source_chunk_cli_and_host_agree_on_simultaneous_and_complete_document_memory() {
+    for kind in [Kind::Ner, Kind::Keyphrases] {
+        let (_, base, _) = fixture(kind, 128);
+        let mut command = super::super::tests::command(kind,
+            &["--cohort-chunks", "4", "--group-width", "128"]);
+        command.args.memory_mib = 262_144;
+        let Int4Task::SourceMap(options) = command.task else { panic!("wrong source map task"); };
+        let limits = options.validate(&command.args).unwrap();
+        let config = configuration(base.identity, base.task, &command.args, &options, limits, Duration::from_secs(1));
+        assert_eq!(config.cohort_requirements(128).unwrap(), limits.cohort.unwrap());
+        assert_eq!(config.workspace_bytes(limits.mapping.chunks.max_chunks).unwrap(), limits.workspace_bytes);
+        assert_eq!(config.budget.max_kv_bytes, limits.common.native.kv_bytes);
+        assert_eq!(limits.cohort.unwrap().native.kv_bytes, 4 * config.budget.max_kv_bytes);
+    }
+}
+
+#[test]
+fn owned_runtime_boundary_rechecks_chunk_cohort_configuration_before_io() {
+    struct NoIo;
+    impl Read for NoIo {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("invalid cohort read source"); }
+    }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("invalid cohort wrote output"); }
+        fn flush(&mut self) -> io::Result<()> { panic!("invalid cohort flushed output"); }
+    }
+    for kind in [Kind::Ner, Kind::Keyphrases] {
+        let mut command = super::super::tests::command(kind, &["--cohort-chunks", "2"]);
+        command.args.memory_mib = 262_144;
+        let Int4Task::SourceMap(mut options) = command.task else { panic!("wrong map task"); };
+        let admitted = options.validate(&command.args).unwrap();
+        options.cohort_chunks = Some(65);
+        assert_eq!(execute(command.args, options, admitted, &mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
 fn whole_document_native_and_mask_allowances_cannot_restart_per_chunk() {
     let (planner, mut config, _) = fixture(Kind::Ner, 32);
     let expected = preflight(SOURCE, &planner, &config, 32, None, &mut continuing()).unwrap();
@@ -241,9 +306,19 @@ fn complete_publication_keeps_provenance_and_original_coordinates_and_refuses_ov
     assert_eq!(value["output"], output);
     assert_eq!(value["evidence"], "non_authoritative");
     assert_eq!(value["task"], "summarize");
-    for absent in ["source_dir", "source_manifest", "options", "snapshot_path", "prompt_digest"] {
+    for absent in ["source_dir", "source_manifest", "options", "snapshot_path", "prompt_digest", "cohort_schedule"] {
         assert!(value.get(absent).is_none());
     }
+    let physical = Int4SourceMapCohortStats { cohorts: 1, chunks: 2, ..Default::default() };
+    let grouped = CohortResponse { response: Response { provenance: &provenance, output: &output },
+        cohort_schedule: CohortSchedule { execution: "cross_chunk_constrained_cohorts",
+            declared_max_chunks: 4, physical: &physical } };
+    let mut grouped_bytes = Vec::new(); publish(&grouped, 4096, &mut grouped_bytes).unwrap();
+    let mut grouped_value: serde_json::Value = serde_json::from_slice(&grouped_bytes).unwrap();
+    assert_eq!(grouped_value["cohort_schedule"]["physical"]["chunks"], 2);
+    assert_eq!(grouped_value["cohort_schedule"]["declared_max_chunks"], 4);
+    grouped_value.as_object_mut().unwrap().remove("cohort_schedule");
+    assert_eq!(grouped_value, value);
     let mut refused = Vec::new();
     assert_eq!(publish(&response, 1, &mut refused), Err(CandidateError::Output));
     assert!(refused.is_empty());
@@ -927,6 +1002,90 @@ fn answer_hierarchy_invalid_source_limits_and_cancellation_never_publish_abstent
         let mut control = Control { calls: 0, stop_at: 1, cause };
         assert_eq!(question_hierarchy_preflight(SOURCE, &planner, &config, hierarchy, 32, &mut control), Err(error));
     }
+}
+
+#[test]
+#[ignore = "requires controller-admitted independently pinned complete INT4 snapshot and explicit kernel/memory"]
+fn model_present_source_chunk_cohorts_preserve_document_results_and_evidence() {
+    const CHILD: &str = "FNLP_INT4_SOURCE_MAP_PARITY_CHILD";
+    const COMPLETE: &str = "FNLP_INT4_SOURCE_MAP_PARITY_COMPLETE";
+    let full_name = concat!(module_path!(), "::model_present_source_chunk_cohorts_preserve_document_results_and_evidence");
+    let name = full_name.split_once("::").expect("crate-qualified test name").1;
+    if std::env::var(CHILD).ok().as_deref() != Some(name) {
+        let result = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", name, "--ignored", "--nocapture"]).env(CHILD, name)
+            .output().expect("isolated source map parity fixture must start");
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(result.status.success(), "isolated source map fixture failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&result.stderr));
+        assert!(stdout.contains(COMPLETE), "exact fixture filter ran no completed fixture");
+        return;
+    }
+    assert!(crate::installed_process_resources().is_none());
+    let snapshot = std::env::var("FNLP_INT4_PREFILL_SNAPSHOT").expect("explicit existing snapshot required");
+    let pin = std::env::var("FNLP_INT4_PREFILL_MODEL_SHA256").expect("independent model-content pin required");
+    let memory = std::env::var("FNLP_INT4_TEST_MEMORY_MIB").expect("explicit memory ceiling required");
+    let kernel = std::env::var("FNLP_INT4_TEST_KERNEL").expect("explicit kernel required");
+    let kind: Int8KernelKind = kernel.parse().expect("canonical kernel ID required");
+    PackedInt4Kernel::detect(kind).expect("requested kernel must be supported");
+    let source = "Alice works in Shanghai.\r\nBob visits Paris. café 上海 上海. <tool_call> is quoted document text.\r\n".repeat(3);
+    for task in ["ner-map", "keyphrases-map"] {
+        let mut expected = None;
+        let mut task_budget = None;
+        for flags in [&[][..], &["--cohort-chunks", "1"][..],
+            &["--cohort-chunks", "2"][..], &["--cohort-chunks", "4"][..]] {
+            let mut argv = vec!["candidate", "source-int4", task, "--snapshot", &snapshot,
+                "--expected-model-sha256", &pin, "--memory-mib", &memory, "--kernel", &kernel,
+                "--context-tokens", "2048", "--max-new-tokens", "512",
+                "--max-chunk-bytes", "32", "--timeout-seconds", "86400"];
+            argv.extend_from_slice(flags);
+            let matches = crate::candidate_cli::definition().try_get_matches_from(argv).unwrap();
+            let CandidateCommand::SourceInt4(command) = CandidateCommand::from_matches(&matches).unwrap()
+                else { panic!("wrong source map route"); };
+            let Int4Task::SourceMap(options) = command.task else { panic!("wrong map task"); };
+            let limits = options.validate(&command.args).expect("explicit memory must admit the complete document and cohort");
+            let budget = options.source.budget(&command.args, limits.common);
+            if let Some(expected) = task_budget { assert_eq!(budget, expected); }
+            else { task_budget = Some(budget); }
+            let mut output = Vec::new();
+            options.execute(command.args, &mut std::io::Cursor::new(source.as_bytes()), &mut output)
+                .expect("every original chunk and the complete document must succeed");
+            let mut value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(value["protocol"], "fnlp-candidate-int4-source-map-v1");
+            assert_eq!(value["task"], task.trim_end_matches("-map"));
+            assert_eq!(value["evidence"], "non_authoritative");
+            assert_eq!(value["model_content_sha256"], pin);
+            let count = value["output"]["mapped"]["chunk_count"].as_u64().unwrap() as usize;
+            assert!(count > 4);
+            let schedule = value.as_object_mut().unwrap().remove("cohort_schedule");
+            if let Some(chunks) = limits.cohort_chunks {
+                let schedule = schedule.expect("explicit cohort scheduling provenance");
+                assert_eq!(schedule["execution"], "cross_chunk_constrained_cohorts");
+                assert_eq!(schedule["declared_max_chunks"], chunks);
+                assert_eq!(schedule["physical"]["chunks"], count);
+                assert_eq!(schedule["physical"]["cohorts"], count.div_ceil(chunks));
+            } else { assert!(schedule.is_none()); }
+            assert_eq!(value["output"]["mapped"]["map_batches"], count.div_ceil(limits.cohort_chunks.unwrap_or(1)));
+            let root = &value["output"]["mapped"]["root"];
+            assert_eq!(root["source_span"]["byte_start"], 0);
+            assert_eq!(root["source_span"]["byte_end"], source.len());
+            assert_eq!(root["source_span"]["scalar_end"], source.chars().count());
+            assert_eq!(root["value"].as_array().unwrap().len(), count);
+            for (index, chunk) in root["value"].as_array().unwrap().iter().enumerate() {
+                assert_eq!(chunk["chunk_id"], index);
+                assert_eq!(chunk["native"]["execution"],
+                    crate::tasks::source_planning::grouped_int4::INT4_SOURCE_EXECUTION);
+                assert_eq!(chunk["native"]["result"]["task"], task.trim_end_matches("-map"));
+            }
+            // Only physical scheduling metadata is excluded. Every typed
+            // native value, token/work charge, original coordinate, source
+            // occurrence, local rank and document reduction stays compared.
+            value["output"]["mapped"].as_object_mut().unwrap().remove("map_batches");
+            if let Some(expected) = &expected { assert_eq!(&value, expected); }
+            else { expected = Some(value); }
+        }
+    }
+    println!("{COMPLETE}");
 }
 
 #[test]

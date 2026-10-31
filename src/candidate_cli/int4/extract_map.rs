@@ -14,13 +14,13 @@ mod runtime;
 mod tests;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct MapArgs { pub extraction: extract::ExtractionArgs, mapping: MappingArgs }
+pub(super) struct MapArgs {
+    pub extraction: extract::ExtractionArgs,
+    mapping: MappingArgs,
+    cohort_chunks: Option<usize>,
+}
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
 struct MappingArgs {
-    /// Explicit shared-layer extraction over at most N source chunks (1..=64).
-    /// The full document is still prepared and validated before inference.
-    #[arg(long, value_name = "N")]
-    cohort_chunks: Option<usize>,
     /// Fail if complete input requires more chunks; never truncate the source.
     #[arg(long, default_value_t = 64)]
     max_chunks: usize,
@@ -63,13 +63,24 @@ struct MappingArgs {
     max_extraction_scan_steps: u64,
 }
 pub(super) fn definition() -> clap::Command {
-    MappingArgs::augment_args(extract::definition().name("extract-map")
+    definition_with_cohorts(true)
+}
+pub(super) fn document_job_definition() -> clap::Command {
+    definition_with_cohorts(false)
+}
+fn definition_with_cohorts(cohorts: bool) -> clap::Command {
+    let command = MappingArgs::augment_args(extract::definition().name("extract-map")
         .about("Extract one exact schema over every chunk of a complete document using grouped INT4")
         .long_about("Losslessly partition one complete UTF-8 document with the pinned source encoder and actual schema/template prompt capacity. Compile and admit ALL chunks before the first native forward. Execution is serial unless --cohort-chunks N explicitly groups up to N independent chunks through shared native INT4 decoder layers; N must be 1..64 and cannot exceed --max-chunks. The complete window's native, decoder, output and reduction storage is admitted before IO, with exact native contexts for each actual window and the final partial window. Every chunk keeps its original task budget, grammar, source language and causal KV. Output retains each independent exact-schema JSON string and chunk byte/scalar lineage; --source-membership independently verifies all compatible verbatim occurrences within each chunk and lifts them to original-document coordinates. It does not find occurrences in other chunks from which the value was not extracted. Required fields must be satisfiable in each chunk. There is no merged global object, unconstrained repair, overlapping-window analysis or single-context equivalence claim. Work, mask, field/span verification, tokenization and reduction budgets are for the whole document and never renew per chunk or cohort. No partial document success is published. Source-conversion and digest-pinned snapshot routes share the same checked path. Blocking IO observes the end-to-end deadline cooperatively.")
         .mut_arg("input", |arg| arg.help("One complete UTF-8 document; '-' reads stdin; not NDJSON"))
         .mut_arg("max_input_bytes", |arg| arg.default_value("1048576").help("Maximum bytes of the COMPLETE original document"))
         .mut_arg("preparation_mib", |arg| arg.default_value("1024"))
-        .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoint allowance for hosted document preparation, chunks and reduction")))
+        .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoint allowance for hosted document preparation, chunks and reduction")));
+    if cohorts {
+        command.arg(clap::Arg::new("cohort_chunks").long("cohort-chunks")
+            .value_name("N").value_parser(clap::value_parser!(usize))
+            .help("Share native decoder layers across up to N independent chunks (1..=64); serial if omitted"))
+    } else { command }
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) struct MapLimits {
@@ -84,13 +95,20 @@ pub(super) struct MapLimits {
 impl MapArgs {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         Ok(Self { extraction: extract::ExtractionArgs::from_matches(matches)?,
-            mapping: MappingArgs::from_arg_matches(matches)? })
+            mapping: MappingArgs::from_arg_matches(matches)?,
+            cohort_chunks: matches.try_get_one::<usize>("cohort_chunks").ok().flatten().copied() })
+    }
+    pub(super) fn validate_document_job(&self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
+        // Durable chunk scheduling and its authenticated job configuration
+        // have not opted into native cohorts. Never silently execute serially.
+        if self.cohort_chunks.is_some() { return Err(CandidateError::Arguments); }
+        self.validate(args)
     }
     pub(super) fn validate(&self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
         let m = self.mapping;
         let mut common = self.extraction.validate(args)?;
         if args.max_input_bytes < 4 || !(1..=256).contains(&m.max_chunks)
-            || m.cohort_chunks.is_some_and(|n| !(1..=64).contains(&n) || n > m.max_chunks)
+            || self.cohort_chunks.is_some_and(|n| !(1..=64).contains(&n) || n > m.max_chunks)
             || !(1..=1_000_000).contains(&m.max_tokenizer_calls)
             || m.max_chunk_bytes.is_some_and(|n| !(4..=MAX_INPUT_BYTES).contains(&n))
             || [m.max_map_result_bytes, m.max_live_value_bytes, m.max_total_value_bytes]
@@ -126,7 +144,7 @@ impl MapArgs {
         // Over-counting the small per-chunk output reserve is conservative.
         let input = sum(&[args.max_input_bytes as u64 + 1,
             crate::candidate_cli::extract::SCHEMA_BYTES as u64 + 1, common.preparation_bytes])?;
-        let cohort = m.cohort_chunks.map(|max_chunks| Int4ExtractionMapCohortMemoryLimits {
+        let cohort = self.cohort_chunks.map(|max_chunks| Int4ExtractionMapCohortMemoryLimits {
             max_chunks, context_tokens: args.context_tokens,
             max_output_tokens_per_chunk: u64::from(budget.max_output_tokens),
             max_result_bytes_per_chunk: budget.max_output_bytes,
@@ -147,7 +165,7 @@ impl MapArgs {
         }
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(MapLimits { common, mapping, reduction_reserve_bytes, max_result_bytes: m.max_map_result_bytes,
-            workspace_bytes, cohort_chunks: m.cohort_chunks, cohort })
+            workspace_bytes, cohort_chunks: self.cohort_chunks, cohort })
     }
     fn mapping_limits(&self, args: &Int4Args) -> Result<Int4ExtractionMapLimits, CandidateError> {
         let m = self.mapping;
@@ -157,7 +175,7 @@ impl MapArgs {
             reserved_tokens: args.max_new_tokens, max_chunks: m.max_chunks, max_tokenizer_calls: m.max_tokenizer_calls };
         chunks.effective_token_limit().map_err(|_| CandidateError::Arguments)?;
         Ok(Int4ExtractionMapLimits { mapping: Int4ExtractionMappingLimits {
-            chunks, reduction: ExecutionLimits { map_batch_chunks: m.cohort_chunks.unwrap_or(1), reduce_fan_in: 8,
+            chunks, reduction: ExecutionLimits { map_batch_chunks: self.cohort_chunks.unwrap_or(1), reduce_fan_in: 8,
                 max_reduction_levels: 8, max_task_calls: 1024, max_value_bytes: m.max_map_result_bytes,
                 max_live_value_bytes: m.max_live_value_bytes, max_total_value_bytes: m.max_total_value_bytes,
                 max_result_bytes: m.max_map_result_bytes },

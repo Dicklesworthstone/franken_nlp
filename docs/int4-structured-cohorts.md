@@ -132,17 +132,19 @@ success; a drained stream can still contain rejected documents.
 
 ## Chunks of one long document
 
-`candidate source-int4 extract-map --cohort-chunks N` applies the same native
-grouping to independently planned chunks of one complete document. `N` must be
-1 through 64 and cannot exceed `--max-chunks`. The default remains serial.
+`candidate source-int4 extract-map`, `ner-map` and raw `keyphrases-map` accept
+`--cohort-chunks N` to apply native grouping to independently planned chunks of
+one complete document. `N` must be 1 through 64 and cannot exceed `--max-chunks`.
+The default remains serial.
 
 The planner compiles every actual schema/source chunk before inference. Each
 row retains its exact task identity, output limits, source grammar and causal
 context. The final short window allocates its actual row count; it does not pad
 or duplicate source chunks. Every value and source occurrence then passes the
 existing independent validation and original-coordinate lifting. Reduction
-retains the ordered independent JSON values without constructing a merged
-global object. A later chunk or reduction failure publishes no document result.
+retains the ordered independent JSON or typed source-task values. It does not
+construct a merged global object, entity census or document-wide phrase ranking.
+A later chunk or reduction failure publishes no document result.
 
 The pre-IO quote covers the entire declared simultaneous window. The host
 checks all actual windows and retains componentwise peak native and decoder
@@ -160,10 +162,23 @@ window width. Its result separates the original `.document` from `.cohorts`
 statistics. The lower-level prepared document exposes
 `cohort_requirements(context_limit)` and `execute_cohorts_with_control` for
 embedding hosts that supply the complete ownership and memory reservations.
+`NlpEngine::map_int4_source_cohorts` provides the equivalent source-task path
+with `Int4SourceMapConfig.mapping.reduction.map_batch_chunks`. Its lower-level
+prepared source map exposes the same two method names and source-specific
+memory/budget/result types. Supported raw library tasks are NER, keyphrases
+and independently cited summary chunks; the original task finalizers still
+run inside the native session before original-coordinate map verification.
 The CLI keeps the document under `output` and reports the declared width and
 actual physical counts under `cohort_schedule`. `output.mapped.map_batches`
 also reflects the chosen schedule; per-chunk identities and source semantics
 are unchanged. Width 1 explicitly selects the cohort path for comparison.
+
+`keyphrases-map --reduce-keyphrases`, `summarize-map`, question-aware maps,
+neural summary/answer synthesis and durable document jobs retain their existing
+execution. They do not advertise or silently ignore the new chunk option.
+Both direct argument parsing and owned job admission refuse unsupported cohort
+requests. The library's raw summary cohort result is not the CLI's aggregated
+summary or a replacement for its separate reduction/synthesis budget contracts.
 
 All source-derived masks and occurrence state stay document-owned. Structural
 validity and exact source membership do not certify semantic accuracy or factual

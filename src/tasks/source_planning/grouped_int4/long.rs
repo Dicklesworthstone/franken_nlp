@@ -14,6 +14,8 @@ use crate::{
         VerifiedSourceSpan, scan_occurrences},
 };
 mod execution;
+/// Shared native decoder layers over independently planned source chunks.
+pub mod cohort;
 pub mod summary;
 /// Complete document-wide exact keyphrase union and deterministic final ranking.
 pub mod keyphrases;

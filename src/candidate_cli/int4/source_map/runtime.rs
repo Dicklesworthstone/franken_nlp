@@ -9,6 +9,7 @@ use crate::{
         strict_int4::weights::snapshot::INT4_SNAPSHOT_VERSION},
     tasks::{ir::PlanContext, source_planning::{SourceTaskPlanner,
         grouped_int4::long::{Int4SourceMapError, Int4SourceMapPreflight,
+            cohort::Int4SourceMapCohortStats,
             question::{SourceQuestion, Int4QuestionPreflight,
                 synthesis::{SourceQuestionSynthesis, Int4QuestionSynthesisPreflight,
                     hierarchy::{QuestionHierarchyLimits, Int4QuestionHierarchyPreflight}}},
@@ -200,6 +201,11 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     let prepared = match task {
         Request::Map(task) => {
             let config = configuration(identity.clone(), task, &args, &options, limits, remaining()?);
+            if let Some(quote) = limits.cohort {
+                if config.cohort_requirements(args.group_width).map_err(|_| CandidateError::Memory)? != quote {
+                    return Err(CandidateError::Memory);
+                }
+            }
             let expected = if let Some(aggregation) = limits.keyphrases {
                 if config.keyphrase_workspace_bytes(limits.mapping.chunks.max_chunks, aggregation)
                     .map_err(|_| CandidateError::Memory)? != limits.workspace_bytes {
@@ -310,6 +316,19 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
                 remaining()?;
                 publish(&Response { provenance: &provenance, output: result.result() },
                     limits.max_result_bytes + 4096, output)
+            } else if let Some(chunks) = limits.cohort_chunks {
+                let result = engine.map_int4_source_cohorts(&model, text, Arc::new(planner), Arc::new(vocabulary),
+                    config, common.kernel, cancellation).map_err(execution_error)?;
+                expected.verify_completed(&result.result().document).map_err(|_| CandidateError::Execution)?;
+                remaining()?;
+                // Preserve the semantic document and keep its host guard live
+                // through complete serialization, write and flush. Only this
+                // outer scheduling field describes shared native execution.
+                publish(&CohortResponse {
+                    response: Response { provenance: &provenance, output: &result.result().document },
+                    cohort_schedule: CohortSchedule { execution: "cross_chunk_constrained_cohorts",
+                        declared_max_chunks: chunks, physical: &result.result().cohorts },
+                }, limits.max_result_bytes + 4096, output)
             } else {
                 let result = engine.map_int4_source(&model, text, Arc::new(planner), Arc::new(vocabulary),
                     config, common.kernel, cancellation).map_err(execution_error)?;
@@ -390,6 +409,18 @@ struct Response<'a, 'b, T: Serialize> {
     #[serde(flatten)]
     provenance: &'a Provenance<'b>,
     output: &'a T,
+}
+#[derive(Serialize)]
+struct CohortSchedule<'a> {
+    execution: &'static str,
+    declared_max_chunks: usize,
+    physical: &'a Int4SourceMapCohortStats,
+}
+#[derive(Serialize)]
+struct CohortResponse<'a, 'b, T: Serialize> {
+    #[serde(flatten)]
+    response: Response<'a, 'b, T>,
+    cohort_schedule: CohortSchedule<'a>,
 }
 
 #[cfg(test)]

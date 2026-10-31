@@ -1962,6 +1962,29 @@ keyphrases. Unknown keys, duplicate keys, partial options and task switching
 are refused. Free-text generation controls and prefill overrides are not
 accepted.
 
+For `ner-map` and raw `keyphrases-map`, `--cohort-chunks N` explicitly groups
+1 through 64 independent chunks through the native INT4 decoder. The width
+cannot exceed `--max-chunks`; the complete declared native/decoder window,
+all prepared chunks, reduction frontier and final output must fit admission.
+The final partial window uses its exact row count. Each chunk keeps its
+original task budget, source grammar and causal context, and all original-source
+occurrences are independently verified and lifted through the existing reducer.
+Whole-document work, masks and verification allowances never renew per window.
+The original result remains under `output`; `cohort_schedule` carries the
+declared width and actual physical counts, while `output.mapped.map_batches`
+reflects the chosen schedule. Omitting the flag retains serial execution.
+
+`--cohort-chunks` cannot be combined with `--reduce-keyphrases`; CLI summaries,
+QA and durable document jobs retain their existing execution paths. The
+library's `NlpEngine::map_int4_source_cohorts` additionally supports raw
+independent summary chunks through `SourceMapTask::Summarize`. It returns the
+complete `.document` and `.cohorts` statistics under one output guard, with
+`Int4SourceMapConfig.mapping.reduction.map_batch_chunks` selecting the window.
+This raw summary API does not perform the CLI's document-wide bullet union or
+neural synthesis. See [structured INT4 cohorts](docs/int4-structured-cohorts.md)
+for memory and ownership details. Numerical parity and performance remain
+unqualified until the named model-present validation runs.
+
 ### Complete exact keyphrase ranking
 
 `keyphrases-map --reduce-keyphrases` executes native extraction on every

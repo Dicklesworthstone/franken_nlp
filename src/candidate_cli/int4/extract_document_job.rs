@@ -59,7 +59,7 @@ impl LifetimeArgs {
 
 pub(super) fn definition() -> clap::Command {
     let operation = |name: &'static str, about: &'static str| {
-        let command = LifetimeArgs::augment_args(StorageArgs::augment_args(extract_map::definition()
+        let command = LifetimeArgs::augment_args(StorageArgs::augment_args(extract_map::document_job_definition()
             .name(name).about(about)
             .long_about("Retain and resume COMPLETE original documents using one fixed exact schema and the native INT4 extraction map pipeline. Supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation, including resume; text is the original document, never a pre-split chunk. Task arguments may only be absent, null or an empty object. Every chunk must finish and verify before its original document commits. Retained outputs contain independent exact chunk JSON values and original-document provenance; arbitrary schema values are not merged into a global object. Required schema fields must be satisfiable in every chunk. Optional --source-membership verifies every compatible occurrence within the originating chunk and lifts its offsets to the original document; it does not find occurrences in other chunks from which the value was not extracted or certify semantic accuracy. Requires --store-results, protected existing --job-dir and --key-file, exact --job-id and immutable --limits. The original schema bytes, chunking, all five native work axes, masks and explicit lifetime verification ceilings are authenticated and never renewed on resume; failed attempts remain debited. Stdout contains metadata only. --materialize publishes retained results after every original document commits. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
             .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population, also on resume; '-' reads stdin"))
@@ -103,7 +103,7 @@ impl JobArgs {
             || self.lifetime.max_lifetime_extraction_scan_steps == 0 {
             return Err(Failure::usage("explicit_extraction_document_job_storage"));
         }
-        let map = self.map.validate(args)?;
+        let map = self.map.validate_document_job(args)?;
         for mib in [s.journal_memory_mib, s.serialization_memory_mib] {
             if mib.checked_mul(MIB).is_none_or(|bytes| bytes > map.common.memory_bytes) {
                 return Err(Failure::usage("extraction_document_job_memory"));

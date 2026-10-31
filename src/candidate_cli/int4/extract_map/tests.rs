@@ -54,7 +54,7 @@ fn chunk_cohorts_preserve_original_task_budget_geometry_and_whole_document_limit
     let original = serial.validate(&args).unwrap();
     let budget = serial.extraction.budget(&args, original.common);
     for chunks in [1, 2, 8, 64] {
-        let mut grouped = serial.clone(); grouped.mapping.cohort_chunks = Some(chunks);
+        let mut grouped = serial.clone(); grouped.cohort_chunks = Some(chunks);
         let limits = grouped.validate(&args).unwrap();
         assert_eq!(limits.cohort_chunks, Some(chunks));
         assert_eq!(limits.common.native, original.common.native);
@@ -120,8 +120,35 @@ fn invalid_cohort_width_and_complete_cohort_result_refuse_before_input_or_schema
         assert_eq!(command.execute(&mut NoRead, &mut output), Err(CandidateError::Arguments));
         assert!(output.is_empty());
     }
-    let (mut map, args) = arguments(&[]); map.mapping.cohort_chunks = Some(usize::MAX);
+    let (mut map, args) = arguments(&[]); map.cohort_chunks = Some(usize::MAX);
     assert_eq!(map.execute(args, &mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+}
+
+#[test]
+fn retained_extraction_jobs_neither_advertise_nor_silently_ignore_chunk_cohorts() {
+    assert!(definition().get_arguments().any(|arg| arg.get_id() == "cohort_chunks"));
+    assert!(!document_job_definition().get_arguments().any(|arg| arg.get_id() == "cohort_chunks"));
+    for operation in super::super::extract_document_job::definition().get_subcommands() {
+        assert!(!operation.get_arguments().any(|arg| arg.get_id() == "cohort_chunks"),
+            "{} must not advertise an unsupported durable schedule", operation.get_name());
+    }
+    let base = ["extract-map", "--schema", "schema.json", "--source-dir", "source",
+        "--source-manifest", "manifest", "--memory-mib", "8192"];
+    let matches = document_job_definition().try_get_matches_from(base).unwrap();
+    let map = MapArgs::from_matches(&matches).unwrap();
+    let args = Int4Args::from_arg_matches(&matches).unwrap();
+    let serial = map.validate_document_job(&args).unwrap();
+    assert_eq!(serial.mapping.mapping.reduction.map_batch_chunks, 1);
+    assert!(serial.cohort.is_none());
+    let mut refused = base.to_vec(); refused.extend_from_slice(&["--cohort-chunks", "1"]);
+    assert!(document_job_definition().try_get_matches_from(refused).is_err());
+    let (mut map, mut args) = arguments(&[]); args.memory_mib = 262_144;
+    for chunks in [1, 2, 4] {
+        map.cohort_chunks = Some(chunks);
+        map.validate(&args).unwrap();
+        assert!(map.validate_document_job(&args).is_err(),
+            "programmatic cohort state must be rejected before durable job IO");
+    }
 }
 
 #[test]

@@ -212,7 +212,7 @@ fn changed_cohort_options_are_rechecked_before_private_files_or_runtime_access()
         let command = super::super::tests::command(&[]);
         let Int4Task::ExtractMap(mut options) = command.task else { panic!("wrong map task"); };
         let quote = options.validate(&command.args).unwrap();
-        options.mapping.cohort_chunks = Some(chunks);
+        options.cohort_chunks = Some(chunks);
         assert_eq!(execute(command.args, options, quote, &mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
     }
 }

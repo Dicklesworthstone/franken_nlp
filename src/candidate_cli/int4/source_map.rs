@@ -6,7 +6,8 @@ use crate::{
     native_engine::{lmhead::NANBEIGE_VOCAB_SIZE, portable_int8::ProjectionWork, strict_int4::Int4Work},
     tasks::{ir::TaskBudget, mapreduce::{ChunkLimits, ExecutionLimits},
         source_planning::{SourceTaskRequest, grouped_int4::long::{Int4SourceMapLimits,
-            SourceMapTask, summary::Int4SummaryLimits, keyphrases::Int4KeyphraseLimits}}},
+            SourceMapTask, summary::Int4SummaryLimits, keyphrases::Int4KeyphraseLimits,
+            cohort::{Int4SourceMapCohortMemoryLimits, Int4SourceMapCohortRequirement}}}},
     validation::grounded_fields::{GroundingBudget, SourceFieldEvidence, VerifiedSourceSpan},
 };
 
@@ -23,6 +24,7 @@ pub(super) struct MapArgs {
     pub kind: Kind,
     pub source: source::SourceArgs,
     mapping: MappingArgs,
+    cohort_chunks: Option<usize>,
     summary: Option<SummaryArgs>,
     keyphrases: Option<keyphrases::KeyphraseArgs>,
     question: Option<question::QuestionArgs>,
@@ -92,6 +94,12 @@ struct SummaryArgs {
     synthesis: synthesis::SynthesisArgs,
 }
 pub(super) fn definitions() -> Vec<clap::Command> {
+    definitions_with_cohorts(true)
+}
+pub(super) fn document_job_definitions() -> Vec<clap::Command> {
+    definitions_with_cohorts(false)
+}
+fn definitions_with_cohorts(cohorts: bool) -> Vec<clap::Command> {
     [(Kind::Ner, "ner-map"), (Kind::Keyphrases, "keyphrases-map"),
         (Kind::Summarize, "summarize-map"), (Kind::Answer, "answer-map")]
         .into_iter().map(|(kind, name)| {
@@ -108,12 +116,21 @@ pub(super) fn definitions() -> Vec<clap::Command> {
                 .mut_arg("preparation_mib", |arg| arg.default_value("1024"))
                 .mut_arg("max_mask_node_visits", |arg| arg.help("Mask allowance per chunk; --max-total-mask-node-visits bounds the whole document"))
                 .mut_arg("max_checkpoints", |arg| arg.help("Cooperative allowance for hosted whole-document preparation, maps and reduction")));
-            match kind {
+            let command = match kind {
                 Kind::Keyphrases => keyphrases::definition(command),
                 Kind::Summarize => SummaryArgs::augment_args(command.long_about("Summarize every chunk of one complete UTF-8 document. The default keeps an exact cited bullet union and applies --max-summary-bullets only at the final root. --synthesize-summary instead adds one native pass over ALL independently verified verbatim source quotes from the complete map; all evidence must fit the final context or the command returns no result. Adding --hierarchical-summary explicitly enables bounded, lossy quote-selection levels: each level partitions its entire evidence frontier into exact context-sized groups, and only independently verified original-source quotes selected by those groups enter the next level. Generated bullet prose never becomes factual source evidence. Exhausted levels, passes, grouping work or verification, an oversized single quote, or nonprogress returns no complete summary. Every final citation lifts back to all evidence-reachable original-document byte and Unicode-scalar occurrences. Discovery and ALL synthesis passes share one five-axis work ceiling, mask allowance and verification budget; every allowed pass is reserved before discovery. Structural membership does not establish entailment, full-document equivalence, recall or contradiction reconciliation. Source conversion and digest-pinned snapshot reload share this checked path. Optional snapshot save follows complete-map and reserved-synthesis preflight and survives later task failure. --options controls map summaries; --synthesis-bullets controls the final and explicitly enabled hierarchy passes.")),
                 Kind::Answer => question::definition(command),
                 _ => command,
-            }
+            };
+            if cohorts && matches!(kind, Kind::Ner | Kind::Keyphrases) {
+                let command = command.arg(clap::Arg::new("cohort_chunks").long("cohort-chunks")
+                    .value_name("N").value_parser(clap::value_parser!(usize))
+                    .help("Share native decoder layers across up to N independent chunks (1..=64); serial if omitted")
+                    .long_help("Explicitly execute up to N independent source chunks through shared native INT4 decoder layers. N must be 1..64 and cannot exceed --max-chunks. All original chunk plans and the complete simultaneous native/decoder/output memory are admitted before inference; each actual window, including the final short one, has exact independent causal contexts. The original per-chunk task budgets, native results, source evidence and complete-document work/reduction limits remain unchanged. Available only for raw ner-map and keyphrases-map; keyphrase ranking, summaries, QA and durable document jobs retain their existing execution."));
+                if kind == Kind::Keyphrases {
+                    command.mut_arg("cohort_chunks", |arg| arg.conflicts_with("reduce_keyphrases"))
+                } else { command }
+            } else { command }
         }).collect()
 }
 #[derive(Clone, Copy, Debug)]
@@ -129,6 +146,8 @@ pub(super) struct MapLimits {
     pub reduction_reserve_bytes: u64,
     pub max_result_bytes: usize,
     pub workspace_bytes: u64,
+    pub cohort_chunks: Option<usize>,
+    pub cohort: Option<Int4SourceMapCohortRequirement>,
 }
 impl MapArgs {
     pub(super) fn planning(&self, args: &Int4Args) -> crate::tasks::source_planning::SourcePlanningLimits {
@@ -138,6 +157,7 @@ impl MapArgs {
     pub(super) fn from_matches(kind: Kind, matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         Ok(Self { kind, source: source::SourceArgs::from_matches(matches)?,
             mapping: MappingArgs::from_arg_matches(matches)?,
+            cohort_chunks: matches.try_get_one::<usize>("cohort_chunks").ok().flatten().copied(),
             summary: if kind == Kind::Summarize { Some(SummaryArgs::from_arg_matches(matches)?) } else { None },
             keyphrases: if kind == Kind::Keyphrases { Some(keyphrases::KeyphraseArgs::from_arg_matches(matches)?) } else { None },
             question: if kind == Kind::Answer { Some(question::QuestionArgs::from_arg_matches(matches)?) } else { None } })
@@ -147,8 +167,8 @@ impl MapArgs {
     }
     pub(super) fn validate_document_job(&self, args: &Int4Args, map_only: bool)
         -> Result<MapLimits, CandidateError> {
-        if map_only && (self.kind != Kind::Summarize
-            || self.summary.is_none_or(|summary| summary.synthesis.synthesize_summary)) {
+        if self.cohort_chunks.is_some() || (map_only && (self.kind != Kind::Summarize
+            || self.summary.is_none_or(|summary| summary.synthesis.synthesize_summary))) {
             return Err(CandidateError::Arguments);
         }
         self.validate_mode(args, map_only)
@@ -159,6 +179,8 @@ impl MapArgs {
         if (self.kind == Kind::Answer) != self.question.is_some()
             || (self.kind == Kind::Summarize) != self.summary.is_some()
             || (self.kind == Kind::Keyphrases) != self.keyphrases.is_some()
+            || self.cohort_chunks.is_some_and(|n| !matches!(self.kind, Kind::Ner | Kind::Keyphrases)
+                || !(1..=64).contains(&n) || n > m.max_chunks)
             || args.max_input_bytes < 4 || !(1..=256).contains(&m.max_chunks)
             || !(1..=1_000_000).contains(&m.max_tokenizer_calls)
             || m.max_chunk_bytes.is_some_and(|n| !(4..=MAX_INPUT_BYTES).contains(&n))
@@ -179,6 +201,7 @@ impl MapArgs {
         let reduction_reserve_bytes = mib(m.reduction_reserve_mib)?;
         let mapping = self.mapping_limits(args)?;
         let keyphrases = self.keyphrases.map(|settings| settings.limits(mapping)).transpose()?.flatten();
+        if self.cohort_chunks.is_some() && keyphrases.is_some() { return Err(CandidateError::Arguments); }
         if let Some(question) = &self.question { question.validate()?; }
         let synthesis = match self.summary {
             Some(s) => s.synthesis.limits(self.planning(args))?,
@@ -262,10 +285,28 @@ impl MapArgs {
         let input = sum(&[args.max_input_bytes as u64 + 1, question_input, common.preparation_bytes])?;
         // CLI preparation stays alive through publication while the host owns
         // a separately charged source/preparation capture and complete output.
-        common.minimum_memory_bytes = sum(&[common.minimum_memory_bytes, input, workspace_bytes, output])?;
+        let cohort = self.cohort_chunks.map(|max_chunks| Int4SourceMapCohortMemoryLimits {
+            max_chunks, context_tokens: args.context_tokens,
+            max_output_tokens_per_chunk: u64::from(budget.max_output_tokens),
+            max_result_bytes_per_chunk: budget.max_output_bytes,
+        }.requirements(args.group_width).map_err(|_| CandidateError::Arguments)).transpose()?;
+        if let Some(quote) = cohort {
+            // The full document and decoder window coexist. The bounded host
+            // wrapper adds 4096 bytes under the same four-payload output claim.
+            let output = sum(&[output, 4096 * 4])?;
+            let execution = sum(&[quote.native.kv_bytes, quote.native.rope_bytes,
+                quote.native.scratch_payload_bound, ALLOCATOR_BYTES, quote.workspace_bytes,
+                input, workspace_bytes, output])?;
+            common.minimum_memory_bytes = grouped_memory_floor(args, common, execution)?;
+            // Keep common.native row-scoped so no task identity or work/KV
+            // authority changes when the scheduler groups neighboring chunks.
+        } else {
+            common.minimum_memory_bytes = sum(&[common.minimum_memory_bytes, input, workspace_bytes, output])?;
+        }
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(MapLimits { common, mapping, summary, keyphrases, synthesis, question_synthesis, hierarchy, question_hierarchy,
-            reduction_reserve_bytes, max_result_bytes, workspace_bytes })
+            reduction_reserve_bytes, max_result_bytes, workspace_bytes,
+            cohort_chunks: self.cohort_chunks, cohort })
     }
     pub(super) fn question_path(&self) -> Option<&std::path::Path> {
         self.question.as_ref().map(question::QuestionArgs::path)
@@ -336,7 +377,7 @@ impl MapArgs {
         // capacity, independently for the selected task and typed options.
         chunks.effective_token_limit().map_err(|_| CandidateError::Arguments)?;
         Ok(Int4SourceMapLimits {
-            chunks, reduction: ExecutionLimits { map_batch_chunks: 1, reduce_fan_in: 8,
+            chunks, reduction: ExecutionLimits { map_batch_chunks: self.cohort_chunks.unwrap_or(1), reduce_fan_in: 8,
                 max_reduction_levels: 8, max_task_calls: 1024, max_value_bytes: m.max_map_result_bytes,
                 max_live_value_bytes: m.max_live_value_bytes, max_total_value_bytes: m.max_total_value_bytes,
                 max_result_bytes: m.max_map_result_bytes },
@@ -383,6 +424,13 @@ impl SummaryArgs {
         limits.validate(mapping).map_err(|_| CandidateError::Arguments)?;
         Ok(limits)
     }
+}
+fn grouped_memory_floor(args: &Int4Args, common: Int4Limits, execution: u64) -> Result<u64, CandidateError> {
+    let resident = sum(&[common.load.weight_payload_bytes, ALLOCATOR_BYTES])?;
+    let loading = if common.snapshot_pin.is_some() { common.snapshot_need.scratch_bytes }
+        else { sum(&[common.source_preparation_bytes, common.load.scratch_payload_bytes])? };
+    let saving = if args.save_snapshot.is_some() { common.snapshot_need.scratch_bytes } else { 0 };
+    sum(&[common.preparation_bytes, resident, loading.max(saving).max(execution), CLEANUP_BYTES])
 }
 fn times(value: u64, count: u64) -> Result<u64, CandidateError> {
     value.checked_mul(count).ok_or(CandidateError::Arguments)

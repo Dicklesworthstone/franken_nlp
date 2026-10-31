@@ -107,15 +107,8 @@ impl PreparedInt4SourceMap<'_> {
         let mapped = mapped.map_err(Int4SourceMapError::Reduction)?;
         driver.borrow_mut().checkpoint()?;
         if task.next_chunk != self.plans.len() { return Err(Int4SourceError::InvalidResult.into()); }
-        let run = Int4SourceMapRun { schema_version: 1, execution: INT4_SOURCE_MAP_EXECUTION,
-            numerics_profile: STRICT_INT4_PROFILE, group_width: self.expected.group_width,
-            task_spec: self.expected.task_spec, semantics: SEMANTICS,
-            planned_model_work: self.expected.work, model_work: task.work,
-            reserved_mask_node_visits: self.expected.masks, mask_node_visit_charge: task.masks,
-            verification_used: SourceMapVerification::used(self.limits.verification, task.remaining)?,
-            untrusted_fields: ["mapped.root.value"], mapped };
-        self.expected.verify_completed(&run)?;
-        check_size(&run, self.max_result_bytes()).map_err(Int4SourceError::from)?;
+        let run = complete(self.expected, self.limits.verification, task.remaining,
+            task.work, task.masks, mapped, self.max_result_bytes())?;
         driver.borrow_mut().checkpoint()?;
         Ok(run)
     }
@@ -134,9 +127,7 @@ struct Executor<'a, D> {
 impl<D: SourceDriver> MapReduceTask for Executor<'_, D> {
     type Value = SourceMapValue;
     type Error = Int4SourceError;
-    fn policy(&self) -> ReductionPolicy {
-        ReductionPolicy { id: "lossless-source-order-chunk-results-v1", may_discard_information: false }
-    }
+    fn policy(&self) -> ReductionPolicy { policy() }
     fn map_batch(&mut self, chunks: &[SourceChunk<'_>]) -> Result<Vec<MapOutput<Self::Value>>, Self::Error> {
         let mut outputs = Vec::new();
         outputs.try_reserve_exact(chunks.len()).map_err(|_| SourcePlanningError::AllocationRefused)?;
@@ -147,14 +138,11 @@ impl<D: SourceDriver> MapReduceTask for Executor<'_, D> {
             let plan = self.plans.get(chunk.id()).ok_or(Int4SourceError::InvalidResult)?;
             let identity = self.admitted.get(chunk.id()).ok_or(Int4SourceError::InvalidResult)?;
             let native = driver.run(plan, identity)?;
-            check_run(plan, &native, self.mask_cap)?;
             if !driver.clean() { return Err(Int4SourceError::InvalidResult); }
             self.work = add_work(self.work, native.model_work).ok_or(Int4SourceError::InvalidResult)?;
             self.masks = self.masks.checked_add(mask_charge(&native.result)).ok_or(Int4SourceError::InvalidResult)?;
-            let original_spans = original_spans(chunk, &native.result, &mut self.remaining, &mut || driver.checkpoint())?;
-            outputs.push(MapOutput { chunk_id: chunk.id(), value: SourceMapValue {
-                chunks: vec![Arc::new(MappedSourceChunk { chunk_id: chunk.id(), source_span: chunk.span(), native, original_spans })],
-            } });
+            outputs.push(map_output(chunk, plan, native, self.mask_cap,
+                &mut self.remaining, &mut || driver.checkpoint())?);
             self.next_chunk += 1;
             driver.checkpoint()?;
         }
@@ -162,24 +150,56 @@ impl<D: SourceDriver> MapReduceTask for Executor<'_, D> {
     }
     fn reduce(&mut self, input: ReduceInput<'_, Self::Value>) -> Result<Self::Value, Self::Error> {
         let mut driver = self.driver.borrow_mut();
-        driver.checkpoint()?;
-        let count = input.children.iter().try_fold(0_usize, |n, child| n.checked_add(child.value().len()))
-            .ok_or(Int4SourceError::InvalidResult)?;
-        let mut chunks = Vec::new();
-        chunks.try_reserve_exact(count).map_err(|_| SourcePlanningError::AllocationRefused)?;
-        let mut next = input.children.first().ok_or(Int4SourceError::InvalidResult)?.chunk_range().start;
-        for child in input.children {
-            if child.chunk_range().start != next { return Err(Int4SourceError::InvalidResult); }
-            for chunk in &child.value().chunks {
-                driver.checkpoint()?;
-                if chunk.chunk_id != next { return Err(Int4SourceError::InvalidResult); }
-                chunks.push(Arc::clone(chunk)); next += 1;
-            }
-            if child.chunk_range().end != next { return Err(Int4SourceError::InvalidResult); }
-        }
-        driver.checkpoint()?;
-        Ok(SourceMapValue { chunks })
+        reduce(input, &mut || driver.checkpoint())
     }
+}
+
+pub(super) fn policy() -> ReductionPolicy {
+    ReductionPolicy { id: "lossless-source-order-chunk-results-v1", may_discard_information: false }
+}
+pub(super) fn map_output(chunk: &SourceChunk<'_>, plan: &PreparedInt4SourceTask,
+    native: Int4SourceTaskRun, mask_cap: u64, remaining: &mut GroundingBudget,
+    checkpoint: &mut impl FnMut() -> Result<(), Int4SourceError>)
+    -> Result<MapOutput<SourceMapValue>, Int4SourceError> {
+    check_run(plan, &native, mask_cap)?;
+    let original_spans = original_spans(chunk, &native.result, remaining, checkpoint)?;
+    Ok(MapOutput { chunk_id: chunk.id(), value: SourceMapValue {
+        chunks: vec![Arc::new(MappedSourceChunk { chunk_id: chunk.id(), source_span: chunk.span(), native, original_spans })],
+    } })
+}
+pub(super) fn reduce(input: ReduceInput<'_, SourceMapValue>,
+    checkpoint: &mut impl FnMut() -> Result<(), Int4SourceError>) -> Result<SourceMapValue, Int4SourceError> {
+    checkpoint()?;
+    let count = input.children.iter().try_fold(0_usize, |n, child| n.checked_add(child.value().len()))
+        .ok_or(Int4SourceError::InvalidResult)?;
+    let mut chunks = Vec::new();
+    chunks.try_reserve_exact(count).map_err(|_| SourcePlanningError::AllocationRefused)?;
+    let mut next = input.children.first().ok_or(Int4SourceError::InvalidResult)?.chunk_range().start;
+    for child in input.children {
+        if child.chunk_range().start != next { return Err(Int4SourceError::InvalidResult); }
+        for chunk in &child.value().chunks {
+            checkpoint()?;
+            if chunk.chunk_id != next { return Err(Int4SourceError::InvalidResult); }
+            chunks.push(Arc::clone(chunk)); next += 1;
+        }
+        if child.chunk_range().end != next { return Err(Int4SourceError::InvalidResult); }
+    }
+    checkpoint()?;
+    Ok(SourceMapValue { chunks })
+}
+pub(super) fn complete(expected: Int4SourceMapPreflight, verification: GroundingBudget,
+    remaining: GroundingBudget, work: Int4Work, masks: u64, mapped: MapReduceResult<SourceMapValue>, cap: u64)
+    -> Result<Int4SourceMapRun, Int4SourceMapError> {
+    let run = Int4SourceMapRun { schema_version: 1, execution: INT4_SOURCE_MAP_EXECUTION,
+        numerics_profile: STRICT_INT4_PROFILE, group_width: expected.group_width,
+        task_spec: expected.task_spec, semantics: SEMANTICS,
+        planned_model_work: expected.work, model_work: work,
+        reserved_mask_node_visits: expected.masks, mask_node_visit_charge: masks,
+        verification_used: SourceMapVerification::used(verification, remaining)?,
+        untrusted_fields: ["mapped.root.value"], mapped };
+    expected.verify_completed(&run)?;
+    check_size(&run, cap).map_err(Int4SourceError::from)?;
+    Ok(run)
 }
 
 pub(super) fn check_run(plan: &PreparedInt4SourceTask, run: &Int4SourceTaskRun, mask_cap: u64)
