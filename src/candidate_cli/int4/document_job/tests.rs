@@ -1,6 +1,8 @@
 //! UNRUN admission and privacy fixtures; no native document result is fabricated.
 use super::*;
 
+mod hierarchy_cohorts;
+
 pub(super) const MODES: &[(&str, &[&str], &str)] = &[
     ("ner", &[], "source_map"),
     ("keyphrases", &[], "source_map"),

@@ -54,6 +54,15 @@ policy and completed response. Structured tasks retain their greedy grammar
 decoder and independent source finalizers. Composed batch, map, retained-job,
 redaction and semantic workflows keep their existing prompt schedules.
 
+Whole-document maps have separate native scheduling choices:
+`--cohort-chunks N` groups independent discovery chunks, and
+`--cohort-hierarchy-groups N` groups independent evidence passes inside an
+explicit summary or answer hierarchy. The latter also applies to their
+complete-document jobs, with an authenticated schedule on resume. It requires
+the matching synthesis and hierarchy flags and never enables prompt prefill.
+See [structured INT4 cohorts](int4-structured-cohorts.md#native-hierarchy-group-cohorts)
+for allowed widths, complete memory admission and examples.
+
 ## Admission and delivery
 
 `--memory-mib` is a process ledger ceiling, not a promised OS RSS maximum.

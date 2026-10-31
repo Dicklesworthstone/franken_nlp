@@ -1,5 +1,7 @@
 use super::*;
 
+mod hierarchy_cohorts;
+
 pub(super) fn command(kind: Kind, extra: &[&str]) -> Int4Command {
     let name = match kind { Kind::Ner => "ner-map", Kind::Keyphrases => "keyphrases-map",
         Kind::Summarize => "summarize-map", Kind::Answer => "answer-map" };

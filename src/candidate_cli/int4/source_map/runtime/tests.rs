@@ -1,5 +1,6 @@
 //! Real pinned task/chunk preparation only; no fixture claims native inference.
 use super::*;
+mod hierarchy_cohorts;
 use crate::{
     artifact::converter::PINNED_REVISION,
     execution_identity::{ExecutionIdentity, NumericsProfile, Sha256Digest, ThinkingMode, ToolMode},

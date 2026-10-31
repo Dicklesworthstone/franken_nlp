@@ -9,7 +9,7 @@ use crate::{
         strict_int4::weights::snapshot::INT4_SNAPSHOT_VERSION},
     tasks::{ir::PlanContext, source_planning::{SourceTaskPlanner,
         grouped_int4::long::{Int4SourceMapError, Int4SourceMapPreflight,
-            cohort::Int4SourceMapCohortStats,
+            cohort::{Int4SourceMapCohortStats, hierarchy::Int4HierarchyCohortStats},
             question::{SourceQuestion, Int4QuestionPreflight,
                 synthesis::{SourceQuestionSynthesis, Int4QuestionSynthesisPreflight,
                     hierarchy::{QuestionHierarchyLimits, Int4QuestionHierarchyPreflight}}},
@@ -118,6 +118,24 @@ fn question_hierarchy_preflight(source: &str, planner: &SourceTaskPlanner,
     // Future groups also check the exact question and passage manifest.
     planner.preflight_int4_question_hierarchy_with_control(source, &config.task, hierarchy,
         config.budget, &context, config.planning, config.mapping, width, control).map_err(planning_error)
+}
+fn check_synthesis_schedule<T>(config: &Int4SourceMapConfig<T>, limits: MapLimits, width: usize)
+    -> Result<(), CandidateError> {
+    let quote = match limits.hierarchy_cohorts {
+        Some(schedule) => {
+            if schedule.discovery_cohorts != limits.cohort_chunks.is_some() { return Err(CandidateError::Memory); }
+            Some(config.hierarchy_cohort_requirements(width, schedule).map_err(|_| CandidateError::Memory)?)
+        },
+        None => limits.cohort_chunks.map(|_| config.synthesis_cohort_requirements(width))
+            .transpose().map_err(|_| CandidateError::Memory)?,
+    };
+    let preparation = limits.hierarchy_cohorts.map(|schedule|
+        schedule.additional_preparation_bytes(config.preparation_reserve_bytes))
+        .transpose().map_err(|_| CandidateError::Memory)?.unwrap_or(0);
+    if quote != limits.cohort || preparation != limits.hierarchy_preparation_bytes {
+        return Err(CandidateError::Memory);
+    }
+    Ok(())
 }
 fn cancelled(cause: DecodeCancellationKind) -> CandidateError {
     match cause {
@@ -238,11 +256,7 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         }
         Request::SummarySynthesis(task) => {
             let config = configuration(identity.clone(), task, &args, &options, limits, remaining()?);
-            if let Some(quote) = limits.cohort {
-                if config.synthesis_cohort_requirements(args.group_width).map_err(|_| CandidateError::Memory)? != quote {
-                    return Err(CandidateError::Memory);
-                }
-            }
+            check_synthesis_schedule(&config, limits, args.group_width)?;
             if let Some(hierarchy) = limits.hierarchy {
                 if config.summary_hierarchy_workspace_bytes(limits.mapping.chunks.max_chunks, hierarchy)
                     .map_err(|_| CandidateError::Memory)? != limits.workspace_bytes {
@@ -263,11 +277,7 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         }
         Request::QuestionSynthesis(task) => {
             let config = configuration(identity.clone(), task, &args, &options, limits, remaining()?);
-            if let Some(quote) = limits.cohort {
-                if config.synthesis_cohort_requirements(args.group_width).map_err(|_| CandidateError::Memory)? != quote {
-                    return Err(CandidateError::Memory);
-                }
-            }
+            check_synthesis_schedule(&config, limits, args.group_width)?;
             if let Some(hierarchy) = limits.question_hierarchy {
                 if config.question_hierarchy_workspace_bytes(limits.mapping.chunks.max_chunks, hierarchy)
                     .map_err(|_| CandidateError::Memory)? != limits.workspace_bytes {
@@ -431,7 +441,16 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         }
         Prepared::QuestionHierarchy(mut config, expected) => {
             config.native.run.max_elapsed = remaining()?;
-            if let Some(chunks) = limits.cohort_chunks {
+            if let Some(schedule) = limits.hierarchy_cohorts {
+                let result = engine.synthesize_int4_document_answer_hierarchy_grouped(&model, text,
+                    Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), schedule, common.kernel, cancellation)
+                    .map_err(execution_error)?;
+                expected.verify_completed(&result.result().document).map_err(|_| CandidateError::Execution)?;
+                remaining()?;
+                publish_hierarchy_cohorts(&provenance, &result.result().document,
+                    result.result().discovery_cohorts.as_ref(), &result.result().hierarchy_cohorts,
+                    limits.cohort_chunks, schedule, limits.max_result_bytes + 4096, output)
+            } else if let Some(chunks) = limits.cohort_chunks {
                 let result = engine.synthesize_int4_document_answer_hierarchy_cohorts(&model, text,
                     Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), common.kernel, cancellation)
                     .map_err(execution_error)?;
@@ -451,7 +470,16 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         }
         Prepared::SummaryHierarchy(mut config, expected) => {
             config.native.run.max_elapsed = remaining()?;
-            if let Some(chunks) = limits.cohort_chunks {
+            if let Some(schedule) = limits.hierarchy_cohorts {
+                let result = engine.synthesize_int4_source_summary_hierarchy_grouped(&model, text,
+                    Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), schedule, common.kernel, cancellation)
+                    .map_err(execution_error)?;
+                expected.verify_completed(&result.result().document).map_err(|_| CandidateError::Execution)?;
+                remaining()?;
+                publish_hierarchy_cohorts(&provenance, &result.result().document,
+                    result.result().discovery_cohorts.as_ref(), &result.result().hierarchy_cohorts,
+                    limits.cohort_chunks, schedule, limits.max_result_bytes + 4096, output)
+            } else if let Some(chunks) = limits.cohort_chunks {
                 let result = engine.synthesize_int4_source_summary_hierarchy_cohorts(&model, text,
                     Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), common.kernel, cancellation)
                     .map_err(execution_error)?;
@@ -518,6 +546,34 @@ fn publish_discovery_cohort<T: Serialize>(provenance: &Provenance<'_>, document:
     publish(&CohortResponse { response: Response { provenance, output: document },
         cohort_schedule: CohortSchedule { execution: "cross_chunk_constrained_discovery_cohorts",
             declared_max_chunks: chunks, physical } }, max_bytes, output)
+}
+#[derive(Serialize)]
+struct HierarchySchedule<'a> {
+    execution: &'static str,
+    declared_max_groups: usize,
+    physical: &'a Int4HierarchyCohortStats,
+}
+#[derive(Serialize)]
+struct HierarchyResponse<'a, 'b, T: Serialize> {
+    #[serde(flatten)]
+    response: Response<'a, 'b, T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cohort_schedule: Option<CohortSchedule<'a>>,
+    hierarchy_cohort_schedule: HierarchySchedule<'a>,
+}
+#[allow(clippy::too_many_arguments)]
+fn publish_hierarchy_cohorts<T: Serialize>(provenance: &Provenance<'_>, document: &T,
+    discovery: Option<&Int4SourceMapCohortStats>, hierarchy: &Int4HierarchyCohortStats,
+    chunks: Option<usize>, schedule: Int4HierarchyCohortSchedule, max_bytes: usize, output: &mut impl Write)
+    -> Result<(), CandidateError> {
+    if schedule.discovery_cohorts != chunks.is_some() || discovery.is_some() != chunks.is_some() {
+        return Err(CandidateError::Execution);
+    }
+    let cohort_schedule = discovery.zip(chunks).map(|(physical, declared_max_chunks)| CohortSchedule {
+        execution: "cross_chunk_constrained_discovery_cohorts", declared_max_chunks, physical });
+    publish(&HierarchyResponse { response: Response { provenance, output: document }, cohort_schedule,
+        hierarchy_cohort_schedule: HierarchySchedule { execution: "within_level_constrained_hierarchy_cohorts",
+            declared_max_groups: schedule.max_groups, physical: hierarchy } }, max_bytes, output)
 }
 
 #[cfg(test)]

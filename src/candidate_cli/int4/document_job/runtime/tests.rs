@@ -105,6 +105,25 @@ fn runtime_rechecks_cohort_static_admission_before_host_or_private_io() {
     }
 }
 #[test]
+fn runtime_rechecks_hierarchy_group_memory_and_population_owners_before_private_io() {
+    for &(task, mode, _) in MODES {
+        if !mode.iter().any(|flag| flag.starts_with("--hierarchical-")) { continue; }
+        for chunks in [false, true] {
+            let mut flags = mode.to_vec(); flags.extend(["--cohort-hierarchy-groups", "4"]);
+            if chunks { flags.extend(["--cohort-chunks", "2"]); }
+            let (c, mut args) = command("resume", task, &flags); let map = c.args.validate(&args).unwrap();
+            let fixed = lifetime(&args, map); let limits = c.args.lifetime_limits(&args, map, fixed).unwrap();
+            let host = host_limits(&args, limits, Duration::from_secs(30));
+            check_host_quote(host, fixed, limits.buffer_bytes).unwrap();
+            assert_eq!(host.preparation_reserve_bytes, map.common.preparation_bytes);
+            assert_eq!(map.hierarchy_cohorts.unwrap().additional_preparation_bytes(host.preparation_reserve_bytes).unwrap(),
+                map.hierarchy_preparation_bytes);
+            args.memory_mib = map.common.minimum_memory_bytes.div_ceil(MIB) - 1;
+            assert_eq!(execute(c.mode, args, c.args, map, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+        }
+    }
+}
+#[test]
 fn population_quote_matches_real_host_limits_and_retains_invocation_controls() {
     for &(task, flags, _) in MODES {
         for width in [None, Some("4")] {
@@ -154,7 +173,8 @@ fn metadata_reports_whole_document_progress_without_private_source_question_or_q
         model_id: "Nanbeige4.2-3B", source_revision: "fixture-public-revision", source_root_sha256: &source,
         model_content_sha256: &content, candidate_format: "fixture-candidate-format", quant_recipe: "fixture-grouped-int4",
         group_width: args.group_width, integer_kernel: map.common.kernel.kind().id(),
-        snapshot: Some(SnapshotRecord::new("loaded", map.common.snapshot_need)), chunk_schedule: None, output: &report,
+        snapshot: Some(SnapshotRecord::new("loaded", map.common.snapshot_need)), chunk_schedule: None,
+        hierarchy_schedule: None, output: &report,
     };
     let mut bytes = Vec::new(); publish(&response, job_cli::REPORT_BYTES, &mut bytes).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -164,6 +184,7 @@ fn metadata_reports_whole_document_progress_without_private_source_question_or_q
     assert_eq!(value["output"]["attempts"], 3); assert_eq!(value["output"]["committed"], 2);
     assert_eq!(value["output"]["reserved_work"], serde_json::to_value(fixed.max_work).unwrap());
     assert!(value.get("chunk_schedule").is_none());
+    assert!(value.get("hierarchy_schedule").is_none());
     for forbidden in ["text", "question", "quotes", "citations", "recipe", "options", "key", "job_dir", "results"] {
         assert!(value.get(forbidden).is_none()); assert!(value["output"].get(forbidden).is_none());
     }
@@ -176,4 +197,22 @@ fn metadata_reports_whole_document_progress_without_private_source_question_or_q
         "execution": "native_chunk_cohorts", "phase": "discovery", "declared_max_chunks": 4 }));
     assert_eq!(grouped["output"], value["output"]);
     assert_eq!(grouped["document_mode"], value["document_mode"]);
+    for discovery in [false, true] {
+        let mut flags = vec!["--synthesize-answer", "--hierarchical-answer", "--cohort-hierarchy-groups", "4"];
+        if discovery { flags.extend(["--cohort-chunks", "2"]); }
+        let (c, args) = command("resume", "answer", &flags); let map = c.args.validate(&args).unwrap();
+        response.chunk_schedule = ChunkSchedule::new(map);
+        response.hierarchy_schedule = HierarchySchedule::new(map);
+        let mut grouped = serde_json::to_value(&response).unwrap();
+        let hierarchy = grouped.as_object_mut().unwrap().remove("hierarchy_schedule").unwrap();
+        assert_eq!(hierarchy, serde_json::json!({ "execution": "native_hierarchy_group_cohorts",
+            "phase": "hierarchy", "declared_max_groups": 4 }));
+        let chunks = grouped.as_object_mut().unwrap().remove("chunk_schedule");
+        assert_eq!(chunks.is_some(), discovery);
+        if let Some(chunks) = chunks {
+            assert_eq!(chunks, serde_json::json!({ "execution": "native_chunk_cohorts",
+                "phase": "discovery", "declared_max_chunks": 2 }));
+        }
+        assert_eq!(grouped, value, "declared schedules cannot alter durable progress or publish actual phase statistics");
+    }
 }

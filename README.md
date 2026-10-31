@@ -1620,7 +1620,7 @@ additional scratch is admitted before native allocation, while task budgets,
 grammar/source masks, greedy decoding, scored EOS, evidence finalization and
 result envelopes retain their original contracts. Omitting the flag keeps
 sequential prompts. This option applies to these one-off commands; document
-cohorts keep their separate `--cohort-chunks` schedule. See
+cohorts use separate `--cohort-chunks` and `--cohort-hierarchy-groups` schedules. See
 [INT4 prefill](docs/int4-prefill.md) for examples, APIs and pending parity gates.
 
 NER returns typed mentions with all exact matching byte and Unicode-scalar
@@ -1952,10 +1952,14 @@ passes left no quotations for another level; it does not assert calibrated
 unanswerability. Both empty-evidence outcomes have no final pass.
 
 `--cohort-chunks N` also applies here: discovery chunks share native layers,
-then the original scalar hierarchy processes each complete evidence level.
+then the original scalar hierarchy processes each complete evidence level
+unless `--cohort-hierarchy-groups` is independently enabled.
 Every permitted pass's native transcript remains included in output admission.
 `NlpEngine::synthesize_int4_document_answer_hierarchy_cohorts` exposes this
 schedule through the library with separate `.discovery_cohorts` statistics.
+For native grouping within hierarchy levels, use
+`NlpEngine::synthesize_int4_document_answer_hierarchy_grouped` and the
+[hierarchy schedule](#native-cohorts-within-int4-hierarchy-levels) below.
 
 Library callers use
 `SourceTaskPlanner::preflight_int4_question_hierarchy_with_control`,
@@ -2300,15 +2304,70 @@ Library callers use `SourceTaskPlanner::plan_int4_summary_hierarchy_with_control
 and `NlpEngine::synthesize_int4_source_summary_hierarchy`, supplying
 `SummaryHierarchyLimits` alongside `Int4SourceMapConfig<SourceSummarySynthesis>`.
 One hosted invocation covers the complete hierarchy. Add `--cohort-chunks N`
-to batch discovery before the existing scalar hierarchy, or call
+alone to batch discovery before the existing scalar hierarchy, or call
 `NlpEngine::synthesize_int4_source_summary_hierarchy_cohorts`. Every original
 map and permitted hierarchy transcript remains funded. Native phase peaks are
 admitted together, with discovery engines drained before the scalar engine is
 allocated; `.discovery_cohorts` reports only discovery execution.
+The independent `--cohort-hierarchy-groups` option below also groups native
+passes within each hierarchy level.
 Original-source membership remains structural; this mode does not establish
 semantic entailment, recall, factual correctness or full-document equivalence.
 Compilation, model-present execution, parity and task quality remain pending
 their named validation gates.
+
+### Native cohorts within INT4 hierarchy levels
+
+`--cohort-hierarchy-groups N` groups independent evidence passes within each
+summary or answer hierarchy level through the native shared-layer decoder.
+It requires `--synthesize-summary --hierarchical-summary` or
+`--synthesize-answer --hierarchical-answer`. N must be positive, at most 64,
+and no greater than the selected `--summary-max-passes` or `--answer-max-passes`.
+The hierarchy width is independent of the discovery width:
+
+| Scheduling flags | Discovery | Hierarchy levels |
+|---|---|---|
+| Neither flag | Serial | Serial |
+| `--cohort-chunks 4` | Native windows of at most four chunks | Serial |
+| `--cohort-hierarchy-groups 2` | Serial | Native windows of at most two independent groups |
+| Both flags | Native chunk windows | Native group windows within each level |
+
+For example, combine four discovery rows with two hierarchy rows:
+
+```bash
+fnlp candidate source-int4 summarize-map report.txt \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --memory-mib 32768 --group-width 128 \
+  --synthesize-summary --hierarchical-summary \
+  --cohort-chunks 4 --cohort-hierarchy-groups 2 \
+  --summary-max-levels 8 --summary-max-passes 16 \
+  --max-total-mask-node-visits 160000000000
+```
+
+Every level is completely planned and authenticated before native execution.
+Each group keeps its own prompt, grammar, causal context and source finalizer;
+completed rows fold in original order, and the next level starts only after
+the current one finishes. All work, mask, evidence, verification and tokenizer
+ceilings still cover the complete document. Failed groups yield no partial
+hierarchy.
+
+Before discovery, memory admission covers the componentwise maximum of the
+selected discovery phase and N full-context hierarchy rows, including decoder
+workspace. It also reserves N−1 additional full preparation owners alongside
+the existing source, evidence, transcript and output owners. Consequently,
+larger group widths may require a larger `--memory-mib`; these are ledger
+reservations, not measured RSS or speed claims.
+
+The original semantic result remains under `output`. Standalone commands add
+`hierarchy_cohort_schedule` with `declared_max_groups` and actual hierarchy
+statistics; discovery statistics appear separately only when requested.
+Library callers use the two `*_hierarchy_grouped` host methods with
+`Int4HierarchyCohortSchedule { max_groups, discovery_cohorts }`; their result
+contains `.document`, optional `.discovery_cohorts`, and `.hierarchy_cohorts`.
+See [native hierarchy cohorts](docs/int4-structured-cohorts.md#native-hierarchy-group-cohorts)
+for the complete interface and an answer example. The new execution paths and
+regression sources remain unrun; they establish no parity or performance claim.
 
 ### Complete-document limits and delivery
 
@@ -2503,13 +2562,19 @@ remain available without accepting another task family's flags:
 
 Every mode also accepts `--cohort-chunks N`, where N is 1 through 64 and no
 greater than `--max-chunks`. This runs independent discovery/map chunks through
-shared native decoder layers; dependent synthesis and hierarchy passes retain
-their scalar execution. The complete declared native peak and decoder workspace
-are reserved together with the population, evidence and result storage. Each
+shared native decoder layers. The two explicit hierarchy modes independently
+accept `--cohort-hierarchy-groups N` to group evidence passes within each level,
+with N at most 64 and at most the hierarchy pass ceiling. Discovery stays
+serial when its flag is omitted. The complete native phase peak, decoder
+workspace and additional preparation owners are reserved together with the
+population, evidence and result storage. Each
 original document still commits only after all its required work completes.
-Choose the flag and width at `start`, then repeat them exactly at `resume`:
-both are bound into the private authenticated recipe. Existing serial jobs
-resume with the flag omitted. See [durable chunk cohorts](docs/int4-structured-cohorts.md#durable-complete-document-cohorts).
+Choose each schedule and width at `start`, then repeat them exactly at `resume`:
+they are bound into the private authenticated recipe. Existing jobs resume with
+the same original flags, and existing serial jobs omit both. Stdout reports
+only declared `chunk_schedule` and `hierarchy_schedule` metadata; stored results
+retain their original semantic envelope and contain no physical-statistics
+wrapper. See [durable document cohorts](docs/int4-structured-cohorts.md#durable-complete-document-cohorts).
 
 The input is the **complete original NDJSON population on every invocation**,
 including committed records when resuming:

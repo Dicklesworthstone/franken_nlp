@@ -7,7 +7,8 @@ use crate::{
     tasks::{ir::TaskBudget, mapreduce::{ChunkLimits, ExecutionLimits},
         source_planning::{SourceTaskRequest, grouped_int4::long::{Int4SourceMapLimits,
             SourceMapTask, summary::Int4SummaryLimits, keyphrases::Int4KeyphraseLimits,
-            cohort::{Int4SourceMapCohortMemoryLimits, Int4SourceMapCohortRequirement}}}},
+            cohort::{Int4SourceMapCohortMemoryLimits, Int4SourceMapCohortRequirement,
+                hierarchy::Int4HierarchyCohortSchedule}}}},
     validation::grounded_fields::{GroundingBudget, SourceFieldEvidence, VerifiedSourceSpan},
 };
 
@@ -25,6 +26,7 @@ pub(super) struct MapArgs {
     pub source: source::SourceArgs,
     mapping: MappingArgs,
     cohort_chunks: Option<usize>,
+    cohort_hierarchy_groups: Option<usize>,
     summary: Option<SummaryArgs>,
     keyphrases: Option<keyphrases::KeyphraseArgs>,
     question: Option<question::QuestionArgs>,
@@ -122,11 +124,18 @@ fn definitions_with_cohorts(cohorts: bool) -> Vec<clap::Command> {
                 Kind::Answer => question::definition(command),
                 _ => command,
             };
+            let command = if matches!(kind, Kind::Summarize | Kind::Answer) {
+                command.arg(clap::Arg::new("cohort_hierarchy_groups").long("cohort-hierarchy-groups")
+                    .value_name("N").value_parser(clap::value_parser!(usize))
+                    .requires(if kind == Kind::Summarize { "hierarchical_summary" } else { "hierarchical_answer" })
+                    .help("Share native layers across up to N independent groups within each hierarchy level (1..=64)")
+                    .long_help("Explicitly batch independent quote groups within each already-enabled hierarchy level. N must be 1..64 and cannot exceed the complete hierarchy pass ceiling. Every group in the level is planned and authenticated before any native group executes. Each row retains its exact prompt, source language, grammar, causal context and finalizer; results are folded in original group order, and the next level starts only after the entire current level finishes. All allowed passes, masks, evidence verification and tokenizer work share the original whole-document ceilings. The full simultaneous native, decoder and compiled-plan storage is admitted before discovery. Discovery stays serial unless --cohort-chunks is also supplied. No hierarchy level or native group becomes a partial success or durable checkpoint. Retained jobs authenticate this schedule and width on resume; stored semantic documents remain unchanged."))
+            } else { command };
             if cohorts {
                 command.arg(clap::Arg::new("cohort_chunks").long("cohort-chunks")
                     .value_name("N").value_parser(clap::value_parser!(usize))
                     .help("Share native decoder layers across up to N independent chunks (1..=64); serial if omitted")
-                    .long_help("Explicitly execute up to N independent source chunks through shared native INT4 decoder layers. N must be 1..64 and cannot exceed --max-chunks. All original chunk plans and the complete simultaneous native/decoder/output memory are admitted before inference; each actual window, including the final short one, has exact independent causal contexts. The original per-chunk task budgets, source evidence and complete-document work/reduction limits remain unchanged. Raw NER/keyphrase maps retain their independent native results. Default summarize-map and --reduce-keyphrases preserve the complete exact candidate/evidence union, apply final top-k only once and retain their existing aggregate output. Default answer-map preserves every independent answer, abstention and whitespace range; whitespace-only chunks use no native work, so physical cohort statistics count only nonblank chunks and windows. With neural summary or answer synthesis, including explicit hierarchy, only discovery maps share native layers; dependent evidence passes remain serial under the same complete invocation allowance. The full synthesis context is reserved before discovery even when actual discovery contexts are smaller. Single-document map output identifies discovery-only physical statistics. Retained document jobs authenticate the declared schedule and width for resume and commit only complete original documents; their stored semantic results contain no physical-statistics wrapper."))
+                    .long_help("Explicitly execute up to N independent source chunks through shared native INT4 decoder layers. N must be 1..64 and cannot exceed --max-chunks. All original chunk plans and the complete simultaneous native/decoder/output memory are admitted before inference; each actual window, including the final short one, has exact independent causal contexts. The original per-chunk task budgets, source evidence and complete-document work/reduction limits remain unchanged. Raw NER/keyphrase maps retain their independent native results. Default summarize-map and --reduce-keyphrases preserve the complete exact candidate/evidence union, apply final top-k only once and retain their existing aggregate output. Default answer-map preserves every independent answer, abstention and whitespace range; whitespace-only chunks use no native work, so physical cohort statistics count only nonblank chunks and windows. With neural summary or answer synthesis, this flag groups discovery maps; evidence passes remain serial unless --cohort-hierarchy-groups independently enables within-level grouping. All phases share the same complete invocation allowance. The full synthesis context is reserved before discovery even when actual discovery contexts are smaller. Single-document map output identifies discovery physical statistics separately from any hierarchy statistics. Retained document jobs authenticate the declared schedules and widths for resume and commit only complete original documents; their stored semantic results contain no physical-statistics wrapper."))
             } else { command }
         }).collect()
 }
@@ -145,6 +154,9 @@ pub(super) struct MapLimits {
     pub workspace_bytes: u64,
     pub cohort_chunks: Option<usize>,
     pub cohort: Option<Int4SourceMapCohortRequirement>,
+    pub hierarchy_cohorts: Option<Int4HierarchyCohortSchedule>,
+    /// Additional simultaneous plan/source owners beyond the existing reserve.
+    pub hierarchy_preparation_bytes: u64,
 }
 impl MapArgs {
     pub(super) fn planning(&self, args: &Int4Args) -> crate::tasks::source_planning::SourcePlanningLimits {
@@ -155,6 +167,7 @@ impl MapArgs {
         Ok(Self { kind, source: source::SourceArgs::from_matches(matches)?,
             mapping: MappingArgs::from_arg_matches(matches)?,
             cohort_chunks: matches.try_get_one::<usize>("cohort_chunks").ok().flatten().copied(),
+            cohort_hierarchy_groups: matches.try_get_one::<usize>("cohort_hierarchy_groups").ok().flatten().copied(),
             summary: if kind == Kind::Summarize { Some(SummaryArgs::from_arg_matches(matches)?) } else { None },
             keyphrases: if kind == Kind::Keyphrases { Some(keyphrases::KeyphraseArgs::from_arg_matches(matches)?) } else { None },
             question: if kind == Kind::Answer { Some(question::QuestionArgs::from_arg_matches(matches)?) } else { None } })
@@ -214,6 +227,16 @@ impl MapArgs {
             Some(question) => question.hierarchy()?,
             None => None,
         };
+        let hierarchy_cohorts = self.cohort_hierarchy_groups.map(|max_groups| -> Result<_, CandidateError> {
+            let max_passes = hierarchy.map(|limits| limits.max_passes)
+                .or(question_hierarchy.map(|limits| limits.max_passes)).ok_or(CandidateError::Arguments)?;
+            let schedule = Int4HierarchyCohortSchedule { max_groups, discovery_cohorts: self.cohort_chunks.is_some() };
+            schedule.validate(max_passes).map_err(|_| CandidateError::Arguments)?;
+            Ok(schedule)
+        }).transpose()?;
+        let hierarchy_preparation_bytes = hierarchy_cohorts.map(|schedule|
+            schedule.additional_preparation_bytes(common.preparation_bytes).map_err(|_| CandidateError::Arguments))
+            .transpose()?.unwrap_or(0);
         let summary = self.summary.filter(|s| !s.synthesis.synthesize_summary && !map_only)
             .map(|s| s.limits(mapping)).transpose()?;
         if let Some(summary) = summary {
@@ -276,7 +299,7 @@ impl MapArgs {
         // hierarchy also retains every dependent pass's native transcript.
         // Keep the existing serial quote and all summary transcript reserves.
         let tokens = if summary.is_some() || keyphrases.is_some() { 0 }
-            else if self.cohort_chunks.is_some() && self.question.is_some() {
+            else if (self.cohort_chunks.is_some() || hierarchy_cohorts.is_some()) && self.question.is_some() {
                 times(question_hierarchy.map_or(0, |limits| limits.max_passes as u64),
                     u64::from(budget.max_output_tokens))?
             } else { times(preparation_passes, u64::from(budget.max_output_tokens))? };
@@ -286,7 +309,7 @@ impl MapArgs {
         let input = sum(&[args.max_input_bytes as u64 + 1, question_input, common.preparation_bytes])?;
         // CLI preparation stays alive through publication while the host owns
         // a separately charged source/preparation capture and complete output.
-        let cohort = self.cohort_chunks.map(|max_chunks| {
+        let discovery_cohort = self.cohort_chunks.map(|max_chunks| {
             let quote = Int4SourceMapCohortMemoryLimits {
                 max_chunks, context_tokens: args.context_tokens,
                 max_output_tokens_per_chunk: u64::from(budget.max_output_tokens),
@@ -297,13 +320,18 @@ impl MapArgs {
                     .map_err(|_| CandidateError::Arguments)
             } else { Ok(quote) }
         }).transpose()?;
+        let cohort = match hierarchy_cohorts {
+            Some(schedule) => Some(schedule.requirements(discovery_cohort, args.context_tokens, args.group_width, budget)
+                .map_err(|_| CandidateError::Arguments)?),
+            None => discovery_cohort,
+        };
         if let Some(quote) = cohort {
             // Durable jobs retain the original semantic document only. One-off
             // maps also publish a bounded physical-statistics wrapper.
             let output = if document_job { output } else { sum(&[output, 4096 * 4])? };
             let execution = sum(&[quote.native.kv_bytes, quote.native.rope_bytes,
                 quote.native.scratch_payload_bound, ALLOCATOR_BYTES, quote.workspace_bytes,
-                input, workspace_bytes, output])?;
+                input, workspace_bytes, hierarchy_preparation_bytes, output])?;
             common.minimum_memory_bytes = grouped_memory_floor(args, common, execution)?;
             // Keep common.native row-scoped so no task identity or work/KV
             // authority changes when the scheduler groups neighboring chunks.
@@ -313,7 +341,7 @@ impl MapArgs {
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(MapLimits { common, mapping, summary, keyphrases, synthesis, question_synthesis, hierarchy, question_hierarchy,
             reduction_reserve_bytes, max_result_bytes, workspace_bytes,
-            cohort_chunks: self.cohort_chunks, cohort })
+            cohort_chunks: self.cohort_chunks, cohort, hierarchy_cohorts, hierarchy_preparation_bytes })
     }
     pub(super) fn question_path(&self) -> Option<&std::path::Path> {
         self.question.as_ref().map(question::QuestionArgs::path)

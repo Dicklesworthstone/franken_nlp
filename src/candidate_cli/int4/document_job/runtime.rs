@@ -55,9 +55,21 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
     let planner = if map.cohort_chunks.is_some() {
         planner.with_chunk_cohorts().map_err(|_| CandidateError::Planning)?
     } else { planner };
-    let cohort = planner.uses_chunk_cohorts().then(|| planner.cohort_requirements())
+    let planner = if let Some(schedule) = map.hierarchy_cohorts {
+        planner.with_hierarchy_cohorts(schedule.max_groups).map_err(|_| CandidateError::Planning)?
+    } else { planner };
+    if planner.hierarchy_cohort_schedule() != map.hierarchy_cohorts {
+        return Err(Failure::usage("document_job_hierarchy_schedule"));
+    }
+    let cohort = planner.uses_native_cohorts().then(|| planner.cohort_requirements())
         .transpose().map_err(|_| CandidateError::Memory)?;
     if cohort != map.cohort { return Err(Failure::usage("document_job_cohort_quote")); }
+    let hierarchy_preparation = planner.hierarchy_cohort_schedule().map(|schedule|
+        schedule.additional_preparation_bytes(common.preparation_bytes))
+        .transpose().map_err(|_| CandidateError::Memory)?.unwrap_or(0);
+    if hierarchy_preparation != map.hierarchy_preparation_bytes {
+        return Err(Failure::usage("document_job_hierarchy_preparation_quote"));
+    }
     planner.check_job_limits(lifetime).map_err(|_| CandidateError::Planning)?;
     let identity = planner.execution_identity().clone();
     let host = host_limits(&args, limits, remaining()?);
@@ -100,7 +112,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(),
-        snapshot, chunk_schedule: ChunkSchedule::new(map), output: &report,
+        snapshot, chunk_schedule: ChunkSchedule::new(map), hierarchy_schedule: HierarchySchedule::new(map), output: &report,
     };
     // A metadata write failure can follow durable commits. No private source,
     // question, quote, task options, filesystem path or key is published here.
@@ -154,6 +166,18 @@ impl ChunkSchedule {
     }
 }
 #[derive(Serialize)]
+struct HierarchySchedule {
+    execution: &'static str,
+    phase: &'static str,
+    declared_max_groups: usize,
+}
+impl HierarchySchedule {
+    fn new(map: MapLimits) -> Option<Self> {
+        map.hierarchy_cohorts.map(|schedule| Self { execution: "native_hierarchy_group_cohorts",
+            phase: "hierarchy", declared_max_groups: schedule.max_groups })
+    }
+}
+#[derive(Serialize)]
 struct Response<'a, T: Serialize> {
     protocol: &'static str, schema_version: u32, scope: &'static str, evidence: &'static str,
     task: &'static str, document_mode: &'static str, durable_unit: &'static str,
@@ -163,6 +187,8 @@ struct Response<'a, T: Serialize> {
     snapshot: Option<SnapshotRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     chunk_schedule: Option<ChunkSchedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hierarchy_schedule: Option<HierarchySchedule>,
     output: &'a T,
 }
 
