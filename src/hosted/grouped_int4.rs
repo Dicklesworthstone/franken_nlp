@@ -23,7 +23,7 @@ mod source;
 mod source_map;
 pub use source_map::Int4SourceMapConfig;
 mod corpus;
-pub use corpus::{Int4SourceCorpusConfig, Int4ExtractionCohortBatchResult};
+pub use corpus::{Int4SourceCorpusConfig, Int4ExtractionCohortBatchResult, Int4SourceCohortBatchResult};
 mod scored_batch;
 pub use scored_batch::{Int4ScoredCohortHostLimits, Int4ScoredCohortBatchResult};
 mod scored_cohort;

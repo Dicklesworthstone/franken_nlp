@@ -10,12 +10,12 @@ use crate::{artifact::converter::PINNED_REVISION, execution_identity::Sha256Dige
         keyphrases::{KeyphraseResult, KEYPHRASES_RANKING}, summarize::{CitationGuarantee, SummarySemanticSupport}},
     tokenizer::{embedded::EmbeddedTokenizer, pinned_controls}};
 
-fn planner() -> SourceTaskPlanner {
+pub(super) fn planner() -> SourceTaskPlanner {
     let tokenizer = EmbeddedTokenizer::pinned().unwrap();
     let controls = pinned_controls::pinned().unwrap();
     SourceTaskPlanner::pinned(controls.template_controls(), tokenizer.eos_token_id().unwrap()).unwrap()
 }
-fn budget() -> TaskBudget { TaskBudget { max_input_tokens: 4096, max_output_tokens: 128,
+pub(super) fn budget() -> TaskBudget { TaskBudget { max_input_tokens: 4096, max_output_tokens: 128,
     max_output_bytes: 65536, max_grammar_states: 8192, max_kv_bytes: 1 << 30 } }
 fn identity(p: &SourceTaskPlanner, kind: BuiltInTask) -> ExecutionIdentity {
     identity_for_width(p, kind, 32)
@@ -33,7 +33,7 @@ fn identity_for_width(p: &SourceTaskPlanner, kind: BuiltInTask, width: usize) ->
         thinking_mode: ThinkingMode::Disabled, tool_mode: ToolMode::None, calibration_digest: d,
         decision_policy_digest: d, backend_semantic_version: STRICT_INT4_EXECUTION.to_owned(), host_class: None, compiler_identity: None }
 }
-fn args(kind: BuiltInTask) -> SourceBatchArgs {
+pub(super) fn args(kind: BuiltInTask) -> SourceBatchArgs {
     match kind {
         BuiltInTask::Ner => SourceBatchArgs::Ner { options: NerOptions { max_entities: 4, max_mention_scalars: 32,
             ..Default::default() }, budget: budget() },
@@ -45,10 +45,10 @@ fn args(kind: BuiltInTask) -> SourceBatchArgs {
         _ => unreachable!(),
     }
 }
-fn compiler(p: &SourceTaskPlanner, kind: BuiltInTask) -> Int4SourceBatchPlanner<'_> {
+pub(super) fn compiler(p: &SourceTaskPlanner, kind: BuiltInTask) -> Int4SourceBatchPlanner<'_> {
     Int4SourceBatchPlanner::new(p, identity(p, kind), budget(), SourcePlanningLimits::default(), Some(args(kind)), 32).unwrap()
 }
-fn document() -> BatchDocument<SourceBatchArgs> {
+pub(super) fn document() -> BatchDocument<SourceBatchArgs> {
     BatchDocument { id: "item".to_owned(), text: "PRIVATE_SOURCE Alice <think> 上海".to_owned(), task_args: None }
 }
 fn limits() -> Int4SourceBatchLimits {

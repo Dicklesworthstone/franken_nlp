@@ -17,6 +17,22 @@ use crate::{
 pub use crate::batch::extract::grouped_int4::{Int4ExtractionAdmission as Int4SourceAdmission,
     Int4ExtractionBatchAdmission as Int4SourceBatchAdmission, Int4ExtractionBatchLimits as Int4SourceBatchLimits};
 
+mod cohort;
+pub use cohort::{NativeInt4SourceCohortBatch, PreparedInt4CohortSource};
+// Source and extraction rows share the same dense native decoder, transport
+// ownership and memory accounting. Keep one authoritative window quotation.
+pub use crate::batch::extract::grouped_int4::{
+    Int4ExtractionCohortBatchLimits as Int4SourceCohortBatchLimits,
+    Int4ExtractionCohortBatchStats as Int4SourceCohortBatchStats,
+};
+pub mod memory {
+    pub use crate::batch::extract::grouped_int4::memory::{
+        Int4ExtractionCohortMemoryLimits as Int4SourceCohortMemoryLimits,
+        Int4ExtractionCohortMemoryRequirement as Int4SourceCohortMemoryRequirement,
+        MAX_COHORT_RESULT_BYTES,
+    };
+}
+
 /// Additional cap for trusted defaults BEFORE per-document cloning. Transport
 /// line/depth/input bounds and source compiler limits remain independent.
 pub const MAX_SOURCE_ARGUMENT_BYTES: usize = 1024 * 1024;

@@ -178,3 +178,78 @@ fn input_storage_and_public_corpus_entrypoint_cross_one_owned_boundary() {
     assert_eq!(required.input_bytes, limits.reservation_bytes().unwrap());
     assert_eq!(required.native.kv_bytes, config.task_ceiling.max_kv_bytes);
 }
+
+#[test]
+fn source_cohort_admission_preserves_one_task_and_exact_row_kv_for_every_task_kind() {
+    let planner = planner();
+    for task in [BuiltInTask::Ner, BuiltInTask::Keyphrases, BuiltInTask::Summarize, BuiltInTask::Answer] {
+        let config = config(&planner, task, 32);
+        let task_spec = config.identity.task_spec.as_str();
+        let mut request = request(&config);
+        request.kv_reservation_bytes = request.model_work.forward_positions * KV_BYTES_PER_TOKEN as u64;
+        check_source_cohort_request(32, 4096, 65_536, masks(), &request, task_spec).unwrap();
+        for bytes in [0, request.kv_reservation_bytes - 1, config.task_ceiling.max_kv_bytes,
+            3 * request.kv_reservation_bytes, u64::MAX] {
+            let bad = Int4SourceAdmission { kv_reservation_bytes: bytes, ..request };
+            let error = check_source_cohort_request(32, 4096, 65_536, masks(), &bad, task_spec).unwrap_err();
+            assert!(error.stop); assert_eq!(error.fault.code, BatchCode::Admission);
+        }
+        let error = check_source_cohort_request(32, request.model_work.forward_positions as usize - 1,
+            65_536, masks(), &request, task_spec).unwrap_err();
+        assert!(error.stop); assert_eq!(error.fault.code, BatchCode::Admission);
+        let mut substituted = config.identity.clone(); substituted.task_spec = "extract-v1".to_owned();
+        let bad = Int4SourceAdmission { identity: &substituted, ..request };
+        assert!(check_source_cohort_request(32, 4096, 65_536, masks(), &bad, task_spec).unwrap_err().stop);
+        assert!(check_source_cohort_request(32, 4096, 65_536, masks(), &bad, "extract-v1").unwrap_err().stop);
+    }
+}
+
+#[test]
+fn cohort_window_quote_never_widens_a_document_task_budget() {
+    let planner = planner(); let config = config(&planner, BuiltInTask::Answer, 32);
+    let before = config.task_ceiling;
+    for count in [1, 2, 4, 64] {
+        let transport = BatchLimits { max_output_line_bytes: 65_536, ..BatchLimits::default() };
+        let quote = Int4SourceCohortMemoryLimits { max_documents: count, context_tokens: 4096,
+            preparation_reserve_bytes: 1024 * 1024, io_reserve_bytes: 65_536, allocator_reserve_bytes: 65_536 }
+            .requirements(32, config.native_work, transport).unwrap();
+        assert_eq!(quote.native.kv_bytes, config.task_ceiling.max_kv_bytes * count as u64);
+        assert!(quote.input_bytes > (count as u64 + 1) * 1024 * 1024);
+        assert!(quote.max_result_bytes > count as u64 * transport.max_output_line_bytes as u64);
+        config.validate_planning(&planner, 32, config.task_ceiling.max_kv_bytes).unwrap();
+        assert_eq!(config.task_ceiling, before);
+        if count > 1 { assert!(config.validate_planning(&planner, 32, quote.native.kv_bytes).is_err()); }
+    }
+    fn send<T: Send + 'static>() {}
+    send::<Int4SourceCohortBatchResult>();
+    let _entry = NlpEngine::batch_int4_source_cohorts::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
+}
+
+#[test]
+fn cohort_source_admission_rechecks_work_masks_and_output_before_native_execution() {
+    let planner = planner(); let config = config(&planner, BuiltInTask::Keyphrases, 32);
+    let make = || {
+        let mut request = request(&config);
+        request.kv_reservation_bytes = request.model_work.forward_positions * KV_BYTES_PER_TOKEN as u64;
+        request
+    };
+    for axis in 0..8 {
+        let mut request = make();
+        match axis {
+            0 => request.model_work.forward_positions += 1,
+            1 => request.model_work.projected_logits -= 1,
+            2 => request.model_work.attention_pairs -= 1,
+            3 => request.model_work.projections.dot_products -= 1,
+            4 => request.model_work.projections.multiply_accumulates -= 1,
+            5 => request.mask_node_visits -= 1,
+            6 => request.mask_limits.max_trie_node_visits += 1,
+            _ => request.mask_limits.checkpoint_interval_nodes += 1,
+        }
+        assert!(check_source_cohort_request(32, 4096, 65_536, masks(), &request,
+            &config.identity.task_spec).unwrap_err().stop, "axis {axis}");
+    }
+    let request = make();
+    let error = check_source_cohort_request(32, 4096, 65_535, masks(), &request,
+        &config.identity.task_spec).unwrap_err();
+    assert!(!error.stop); assert_eq!(error.fault.code, BatchCode::OutputLineLimit);
+}

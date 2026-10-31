@@ -33,6 +33,7 @@ fn all_four_batches_require_owned_execution_and_share_both_model_routes() {
         assert_eq!(command.execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
         let (batch, args) = arguments(name, &[]);
         let source = batch.validate(&args).unwrap();
+        assert_eq!(source.cohort_documents, None);
         assert_eq!(batch.kind.name(), name.trim_end_matches("-batch"));
         assert!(source.common.snapshot_pin.is_none());
         let matches = crate::candidate_cli::definition().try_get_matches_from([
@@ -46,6 +47,85 @@ fn all_four_batches_require_owned_execution_and_share_both_model_routes() {
         assert!(snapshot.common.snapshot_pin.is_some());
         assert_eq!(source.native.max_model_work, snapshot.native.max_model_work);
         assert_eq!(source.transport, snapshot.transport);
+    }
+}
+
+#[test]
+fn source_cohorts_preserve_each_task_budget_and_all_whole_stream_counters() {
+    for name in ["ner-batch", "keyphrases-batch", "summarize-batch", "answer-batch"] {
+        let (serial, mut args) = arguments(name, &["--max-requests", "8", "--max-result-bytes", "65536"]);
+        args.memory_mib = 262_144;
+        let serial_limits = serial.validate(&args).unwrap();
+        let serial_budget = serial.source.budget(&args, serial_limits.common);
+        for documents in [1, 2, 8, 64] {
+            let mut grouped = serial.clone(); grouped.stream.cohort_documents = Some(documents);
+            let limits = grouped.validate(&args).unwrap();
+            assert_eq!(limits.cohort_documents, Some(documents));
+            assert_eq!(limits.common.native, serial_limits.common.native);
+            assert_eq!(grouped.source.budget(&args, limits.common), serial_budget);
+            assert_eq!(limits.native.max_model_work, serial_limits.native.max_model_work);
+            assert_eq!(limits.native.masks.max_visits_per_item, serial_limits.native.masks.max_visits_per_item);
+            assert_eq!(limits.native.masks.max_visits_per_run, serial_limits.native.masks.max_visits_per_run);
+            assert_eq!(limits.native.masks.per_mask.max_trie_node_visits,
+                serial_limits.native.masks.per_mask.max_trie_node_visits);
+            assert_eq!(limits.transport, serial_limits.transport);
+            let defaults = grouped.load_defaults(None, serial_budget, args.max_input_bytes).unwrap();
+            if grouped.kind == Kind::Answer { assert!(defaults.is_none()); }
+            else {
+                assert_eq!(serde_json::to_value(defaults.unwrap()).unwrap(),
+                    serde_json::to_value(serial.load_defaults(None, serial_budget, args.max_input_bytes).unwrap().unwrap()).unwrap());
+            }
+        }
+    }
+}
+
+#[test]
+fn source_and_snapshot_cohorts_use_the_same_exact_window_quote() {
+    let digest = "ab".repeat(32);
+    for name in ["ner-batch", "keyphrases-batch", "summarize-batch", "answer-batch"] {
+        let (batch, mut args) = arguments(name, &["--cohort-documents", "3"]);
+        args.memory_mib = 262_144;
+        let source = batch.validate(&args).unwrap();
+        let matches = crate::candidate_cli::definition().try_get_matches_from([
+            "candidate", "source-int4", name, "--snapshot", "local.snapshot",
+            "--expected-model-sha256", &digest, "--memory-mib", "262144", "--cohort-documents", "3",
+        ]).unwrap();
+        let CandidateCommand::SourceInt4(snapshot_command) = CandidateCommand::from_matches(&matches).unwrap()
+            else { panic!("wrong snapshot corpus dispatcher"); };
+        let Int4Task::SourceBatch(snapshot_batch) = snapshot_command.task else { panic!("wrong snapshot corpus task"); };
+        let snapshot = snapshot_batch.validate(&snapshot_command.args).unwrap();
+        assert_eq!(source.native.max_model_work, snapshot.native.max_model_work);
+        assert_eq!(source.transport, snapshot.transport);
+        for limits in [source, snapshot] {
+            let quote = Int4SourceCohortMemoryLimits { max_documents: 3, context_tokens: args.context_tokens,
+                preparation_reserve_bytes: limits.preparation_reserve_bytes, io_reserve_bytes: limits.io_bytes,
+                allocator_reserve_bytes: ALLOCATOR_BYTES,
+            }.requirements(args.group_width, limits.native, limits.transport).unwrap();
+            assert_eq!(quote.native.kv_bytes, 3 * limits.common.native.kv_bytes);
+            assert!(quote.input_bytes >= 4 * limits.preparation_reserve_bytes);
+            let execution = quote.native.kv_bytes + quote.workspace_bytes + quote.input_bytes + quote.output_reservation_bytes;
+            assert_eq!(limits.common.minimum_memory_bytes, grouped_memory_floor(&args, limits.common, execution).unwrap());
+        }
+    }
+}
+
+#[test]
+fn source_cohort_width_complete_result_and_memory_limits_refuse_before_io() {
+    for name in ["ner-batch", "keyphrases-batch", "summarize-batch", "answer-batch"] {
+        for documents in [0, 65, usize::MAX, 64] {
+            let (mut batch, mut args) = arguments(name, &[]);
+            args.memory_mib = 262_144; batch.stream.cohort_documents = Some(documents);
+            // Even with enough process memory, 64 default one-MiB results
+            // plus their envelope exceed the complete group output ceiling.
+            assert_eq!(batch.execute_owned(args, NoRead, NoWrite), Err(CandidateError::Arguments));
+        }
+        let (batch, mut args) = arguments(name, &["--cohort-documents", "4"]);
+        args.memory_mib = 262_144;
+        let quote = batch.validate(&args).unwrap();
+        args.memory_mib = quote.common.minimum_memory_bytes.div_ceil(MIB);
+        batch.validate(&args).unwrap();
+        args.memory_mib -= 1;
+        assert_eq!(batch.execute_owned(args, NoRead, NoWrite), Err(CandidateError::Arguments));
     }
 }
 
@@ -178,7 +258,10 @@ fn source_options_and_text_controls_cannot_be_silently_ignored_by_corpus_routes(
 #[test]
 fn disabled_runtime_refuses_owned_streams_without_opening_defaults_or_models() {
     for name in ["ner-batch", "keyphrases-batch", "summarize-batch", "answer-batch"] {
-        let (batch, args) = arguments(name, &["--defaults", "private-defaults.json"]);
-        assert_eq!(batch.execute_owned(args, NoRead, NoWrite), Err(CandidateError::Unavailable));
+        for documents in [None, Some(4)] {
+            let (mut batch, mut args) = arguments(name, &["--defaults", "private-defaults.json"]);
+            args.memory_mib = 262_144; batch.stream.cohort_documents = documents;
+            assert_eq!(batch.execute_owned(args, NoRead, NoWrite), Err(CandidateError::Unavailable));
+        }
     }
 }

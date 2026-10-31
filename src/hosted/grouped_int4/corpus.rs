@@ -4,7 +4,7 @@
 
 use super::*;
 mod source;
-pub use source::Int4SourceCorpusConfig;
+pub use source::{Int4SourceCorpusConfig, Int4SourceCohortBatchResult};
 mod cohort;
 pub use cohort::Int4ExtractionCohortBatchResult;
 use std::io::{BufRead, Write};

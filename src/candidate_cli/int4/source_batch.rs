@@ -2,7 +2,8 @@
 use super::*;
 use crate::{
     batch::{BatchLimits as TransportLimits, BatchWork, source::{SourceBatchArgs, SourceMaskBudget,
-        grouped_int4::{Int4SourceBatchLimits, MAX_SOURCE_ARGUMENT_BYTES}}},
+        grouped_int4::{Int4SourceBatchLimits, MAX_SOURCE_ARGUMENT_BYTES,
+            memory::Int4SourceCohortMemoryLimits}}},
     candidate_cli::{batch::{FRAME_ALLOWANCE, IO_BUFFER_BYTES}, source::Kind},
     native_engine::{constrained_int4, strict_int4::Int4Work},
     tasks::{keyphrases::KeyphraseOptions, ner::NerOptions, summarize::SummaryOptions, ir::TaskBudget},
@@ -17,6 +18,10 @@ mod tests;
 pub(super) struct BatchArgs { pub kind: Kind, pub source: source::SourceArgs, stream: StreamArgs }
 #[derive(Args, Clone, Eq, PartialEq)]
 struct StreamArgs {
+    /// Explicit shared-layer source tasks over at most N documents (1..=64).
+    /// Interactive producers must fill a window or send a flush command.
+    #[arg(long, value_name = "N")]
+    cohort_documents: Option<usize>,
     /// Complete SourceBatchArgs JSON. Without it QA requires per-record task_args.
     #[arg(long, value_name = "FILE")]
     defaults: Option<PathBuf>,
@@ -41,7 +46,7 @@ pub(super) fn definitions() -> Vec<clap::Command> {
         (Kind::Summarize, "summarize-batch"), (Kind::Answer, "answer-batch")]
         .into_iter().map(|(kind, name)| StreamArgs::augment_args(source::definition(kind).name(name)
             .about("Run an ordered source-task NDJSON stream with one resident grouped-INT4 model")
-            .long_about("Run one fixed source task over ordered {id,text,task_args?} NDJSON and exact {\"flush\":true} controls. NER, keyphrases and summarize use shipped options unless --defaults or per-record typed task_args supplies explicit bounded options. For answer, text is the question and task_args supplies separately typed passages, options and budget; no passage set is invented or reused implicitly. Defaults files use complete SourceBatchArgs JSON, including its task selector and budget. A record cannot switch tasks or raise the CLI ceilings. Every completed event carries candidate provenance. Require run_complete AND exit 0 for whole-run success; earlier completed records remain valid if a later record fails. Native work, masks, checkpoints and transport ceilings span all epochs. Execution is serial item-local constrained decoding. Structural citations do not certify semantic support; failed inference is never abstention. Input/writer ownership survives cancellation until hosted cleanup.")
+            .long_about("Run one fixed source task over ordered {id,text,task_args?} NDJSON and exact {\"flush\":true} controls. NER, keyphrases and summarize use shipped options unless --defaults or per-record typed task_args supplies explicit bounded options. For answer, text is the question and task_args supplies separately typed passages, options and budget; no passage set is invented or reused implicitly. Defaults files use complete SourceBatchArgs JSON, including its task selector and budget. A record cannot switch tasks or raise the CLI ceilings. Execution is serial unless --cohort-documents N explicitly groups up to N complete documents through shared native decoder layers, preserving each original task budget, grammar, source/passages and causal KV. The entire window plus one lookahead is memory-admitted before IO. Partial windows execute at flush or EOF; interactive producers must fill a window or send a flush before waiting. Results and rejected records remain ordered, and IDs reset only after a drained flush. Every completed event carries candidate provenance. Require run_complete AND exit 0 for whole-run success; earlier completed groups remain valid if a later record fails. Native work, masks, checkpoints and transport ceilings span all documents, cohorts and epochs. Full-vocabulary greedy semantics are unchanged; there is no sparse projection, sampling, repair retry or prompt-prefill selector. Structural citations do not certify semantic support; failed inference is never abstention. Input/writer ownership survives cancellation until hosted cleanup. Blocking IO is cooperative, not preemptible.")
             .mut_arg("options", |arg| arg.hide(true))
             .mut_arg("input", |arg| arg.help("NDJSON file or '-' for stdin; each source record is bounded and read incrementally"))
             .mut_arg("max_input_bytes", |arg| arg.help("Maximum decoded document/question and passage input bytes per record"))
@@ -56,6 +61,7 @@ pub(super) struct BatchLimits {
     pub output_bytes: u64,
     pub io_bytes: u64,
     pub preparation_reserve_bytes: u64,
+    pub cohort_documents: Option<usize>,
 }
 impl BatchArgs {
     pub(super) fn from_matches(kind: Kind, matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
@@ -99,13 +105,24 @@ impl BatchArgs {
         native.validate().map_err(|_| CandidateError::Arguments)?;
         let preparation_reserve_bytes = common.preparation_bytes;
         let io_bytes = sum(&[transport.max_output_line_bytes as u64, FRAME_ALLOWANCE, IO_BUFFER_BYTES as u64])?;
-        let corpus_reservation = sum(&[times(transport.max_line_bytes as u64, 8)?,
-            times(transport.max_output_line_bytes as u64, 4)?, times(transport.max_epoch_ids as u64, 128)?,
-            transport.max_epoch_id_bytes as u64, preparation_reserve_bytes, io_bytes])?;
-        common.minimum_memory_bytes = sum(&[common.minimum_memory_bytes, corpus_reservation])?;
+        if let Some(max_documents) = stream.cohort_documents {
+            let quote = Int4SourceCohortMemoryLimits { max_documents, context_tokens: args.context_tokens,
+                preparation_reserve_bytes, io_reserve_bytes: io_bytes, allocator_reserve_bytes: ALLOCATOR_BYTES,
+            }.requirements(args.group_width, native, transport).map_err(|_| CandidateError::Arguments)?;
+            let execution = sum(&[quote.native.kv_bytes, quote.workspace_bytes,
+                quote.input_bytes, quote.output_reservation_bytes])?;
+            common.minimum_memory_bytes = grouped_memory_floor(args, common, execution)?;
+            // Retain the single-document native quote. A scheduling window
+            // cannot widen TaskBudget, change TaskIR, or share source authority.
+        } else {
+            let corpus_reservation = sum(&[times(transport.max_line_bytes as u64, 8)?,
+                times(transport.max_output_line_bytes as u64, 4)?, times(transport.max_epoch_ids as u64, 128)?,
+                transport.max_epoch_id_bytes as u64, preparation_reserve_bytes, io_bytes])?;
+            common.minimum_memory_bytes = sum(&[common.minimum_memory_bytes, corpus_reservation])?;
+        }
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(BatchLimits { common, transport, native, output_bytes: stream.max_total_output_bytes,
-            io_bytes, preparation_reserve_bytes })
+            io_bytes, preparation_reserve_bytes, cohort_documents: stream.cohort_documents })
     }
     pub(super) fn load_defaults(&self, text: Option<&str>, ceiling: TaskBudget, max_input_bytes: usize)
         -> Result<Option<SourceBatchArgs>, CandidateError> {
@@ -121,6 +138,15 @@ impl BatchArgs {
         { let _ = (self, args, limits, input, output); Err(CandidateError::Unavailable) }
     }
 }
+
+fn grouped_memory_floor(args: &Int4Args, common: Int4Limits, execution: u64) -> Result<u64, CandidateError> {
+    let resident = sum(&[common.load.weight_payload_bytes, ALLOCATOR_BYTES])?;
+    let loading = if common.snapshot_pin.is_some() { common.snapshot_need.scratch_bytes }
+        else { sum(&[common.source_preparation_bytes, common.load.scratch_payload_bytes])? };
+    let saving = if args.save_snapshot.is_some() { common.snapshot_need.scratch_bytes } else { 0 };
+    sum(&[common.preparation_bytes, resident, loading.max(saving).max(execution), CLEANUP_BYTES])
+}
+
 /// Shared exact parser for ordered streams and durable source-task jobs.
 /// Defaults may carry private QA passages; do not log or publish this value.
 pub(super) fn load_defaults(kind: Kind, text: Option<&str>, ceiling: TaskBudget, max_input_bytes: usize)

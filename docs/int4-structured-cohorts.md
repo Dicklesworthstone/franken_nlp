@@ -1,6 +1,7 @@
 # Explicit INT4 structured cohorts
 
-`candidate source-int4 extract-batch` accepts `--cohort-documents N` to execute
+`candidate source-int4 extract-batch`, `ner-batch`, `keyphrases-batch`,
+`summarize-batch` and `answer-batch` accept `--cohort-documents N` to execute
 independent documents through one native shared-layer INT4 cohort. `N` is a
 ceiling from 1 through 64. The model remains resident across windows, and each
 window allocates its exact number of sequence contexts. Omitting the flag keeps
@@ -28,6 +29,23 @@ supported. `--source-membership` binds annotated verbatim fields to each
 document's original bytes. The schema remains one exact shared declaration;
 non-null per-record `task_args` are rejected, including attempts to repeat or
 replace the schema or budget.
+
+The four source-task streams use the same option and window quotation:
+
+```sh
+fnlp candidate source-int4 ner-batch documents.ndjson \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256_FROM_TRUSTED_CONVERSION" \
+  --memory-mib 32768 --group-width 128 --context-tokens 1024 \
+  --max-new-tokens 128 --cohort-documents 4
+```
+
+Their existing typed `SourceBatchArgs` defaults and per-document overrides
+remain available. Overrides may tighten task budgets and change bounded task
+options, but cannot switch the stream's task kind or model. For `answer-batch`,
+each record's `text` is the question; its separate `task_args.passages` supplies
+the original evidence. Questions, passage IDs, quotes and repeated-occurrence
+coordinates stay independent across rows. No QA passage set is invented.
 
 Input uses the existing ordered NDJSON protocol:
 
@@ -72,7 +90,8 @@ Failed native execution or independent finalization returns no partial group
 of successful results. Earlier fully delivered groups remain visible. A failed
 output write or flush stops the stream and never appends another terminal frame.
 
-Document results keep the existing extraction schema and semantics. Outer
+Document results keep their existing extraction or source-task schema and
+semantics. Outer
 candidate provenance adds only the declared schedule:
 
 ```json
@@ -94,6 +113,11 @@ success; a drained stream can still contain rejected documents.
 - `NlpEngine::batch_int4_extract_cohorts` runs the ordered stream with bounded
   native windows. Its return separates `BatchSummary` from invocation-wide
   physical cohort statistics.
+- `NlpEngine::batch_int4_source_cohorts` runs the same ordered transport for a
+  fixed source-task family using `Int4SourceCorpusConfig`. Its
+  `Int4SourceCohortBatchResult` likewise separates `.summary` and `.cohorts`.
+  The source adapter reuses the extraction window memory quote and exact
+  native budget types, while retaining the original source-task finalizers.
 - `NlpEngine::execute_int4_extract_cohort` executes an already prepared finite
   collection of schema/source plans.
 - `NlpEngine::execute_int4_source_cohort` executes prepared NER, keyphrase,
@@ -108,11 +132,14 @@ success; a drained stream can still contain rejected documents.
 
 All source-derived masks and occurrence state stay document-owned. Structural
 validity and exact source membership do not certify semantic accuracy or factual
-support. The current CLI cohort route is extraction; source-task finite cohorts
-are library APIs, and durable jobs retain their existing execution paths.
+support. Durable jobs and complete-document chunk maps retain their existing
+execution paths.
 
 Focused regression source covers exact memory/KV admission, per-document budget
 stability, unchanged whole-run work, complete result bounds, source separation,
-and typed error isolation. Ignored full-model fixtures compare serial and cohort
-execution. Rust builds, tests, and model/performance qualification remain pending
+and typed error isolation. Ignored full-model fixtures compare complete serial
+and cohort NDJSON streams at widths 1, 2 and 4 for extraction and all four source
+tasks, including malformed rows, task-switch rejection, flush/ID reuse, separate
+QA passages and EOF without a trailing newline. Rust builds, tests, and
+model/performance qualification remain pending
 the repository's controller-selected DSR checkpoint.

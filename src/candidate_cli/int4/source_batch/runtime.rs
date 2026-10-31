@@ -70,6 +70,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(),
         task: batch.kind.name(), snapshot,
+        cohort_schedule: limits.cohort_documents.map(CohortSchedule::new),
     };
     let writer = CandidateWriter::new(output, &provenance, limits.transport.max_output_line_bytes, limits.output_bytes)?;
     let corpus = CorpusLimits {
@@ -79,8 +80,14 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         transport: limits.transport, preparation_reserve_bytes: limits.preparation_reserve_bytes,
         io_reserve_bytes: limits.io_bytes,
     };
-    let summary = engine.batch_int4_source(&model, Arc::new(planner), Arc::new(vocabulary), config,
-        corpus, common.kernel, reader, writer, cancellation).map_err(|_| CandidateError::Batch)?;
+    let summary = if let Some(max_documents) = limits.cohort_documents {
+        engine.batch_int4_source_cohorts(&model, Arc::new(planner), Arc::new(vocabulary), config,
+            corpus, max_documents, common.kernel, reader, writer, cancellation)
+            .map_err(|_| CandidateError::Batch)?.summary
+    } else {
+        engine.batch_int4_source(&model, Arc::new(planner), Arc::new(vocabulary), config,
+            corpus, common.kernel, reader, writer, cancellation).map_err(|_| CandidateError::Batch)?
+    };
     // The host already emitted the sole terminal protocol record; a failed
     // document changes process status without appending another stdout frame.
     completed(summary)
@@ -100,6 +107,15 @@ struct Provenance<'a> {
     group_width: usize, integer_kernel: &'static str, task: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<SnapshotRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cohort_schedule: Option<CohortSchedule>,
+}
+#[derive(Serialize)]
+struct CohortSchedule { execution: &'static str, declared_max_documents: usize }
+impl CohortSchedule {
+    fn new(declared_max_documents: usize) -> Self {
+        Self { execution: "cross_document_constrained_cohorts", declared_max_documents }
+    }
 }
 
 #[cfg(test)]

@@ -1649,7 +1649,8 @@ typed result. Prompt plus reserved output must fit the selected context.
 ### Ordered INT4 source-task batches
 
 `ner-batch`, `keyphrases-batch`, `summarize-batch` and `answer-batch` reuse one
-resident model, native engine and vocabulary throughout an ordered NDJSON run:
+resident model and vocabulary throughout an ordered NDJSON run. The default
+uses one serial native engine:
 
 ```bash
 fnlp candidate source-int4 keyphrases-batch documents.ndjson \
@@ -1660,13 +1661,35 @@ fnlp candidate source-int4 keyphrases-batch documents.ndjson \
   > phrases.ndjson
 ```
 
+Add `--cohort-documents N` (1 through 64) to execute independent documents
+through shared native INT4 layer/projection groups. For example:
+
+```bash
+fnlp candidate source-int4 keyphrases-batch documents.ndjson \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$EXPECTED_MODEL_SHA256" \
+  --memory-mib 32768 --context-tokens 1024 --max-new-tokens 128 \
+  --cohort-documents 4 > phrases.ndjson
+```
+
+Each row keeps its original prompt, source or QA passages, independent KV,
+grammar, task budget and finalizer. The CLI prices the complete declared
+window, one preparation lookahead and all retained results before input/model
+IO. A window that does not fit is refused; its width is never silently reduced.
+The complete cohort result, including its envelope, is limited to 64 MiB.
+Native contexts use exact prepared row sizes within that reservation.
+Interactive producers must fill a window or send `{"flush":true}` before
+waiting for output; EOF also drains the final partial window. See
+[structured INT4 cohorts](docs/int4-structured-cohorts.md) for memory,
+delivery and qualification details.
+
 For NER, keyphrases and summary, the ordinary record is `{"id":"d1","text":"..."}`.
 Shipped options apply unless a complete typed `task_args` or `--defaults FILE`
 supplies bounded alternatives. Batch defaults use `SourceBatchArgs`, including
 the task selector, options and budget; they differ from the single-request
 `--options` file. Records cannot switch task families or raise admitted
-budgets. The fixed resident context must remain fully covered by each
-record's KV budget.
+budgets. Each record must cover its native KV reservation; cohort-wide memory
+never becomes permission to widen an individual record's task budget.
 
 For `answer-batch`, each record's `text` is the **question** and its
 `task_args.passages` holds the separate evidence. There is no implicit QA
@@ -1688,7 +1711,10 @@ failure, and any failed document makes the process exit nonzero.
 
 The library surfaces are `SourceTaskPlanner::plan_int4_with_control`,
 `NlpEngine::execute_int4_source_task`, and `NlpEngine::batch_int4_source` with
-`Int4SourceCorpusConfig`. Execution identities retain strict-quantized-v2,
+`Int4SourceCorpusConfig`. `NlpEngine::batch_int4_source_cohorts` uses the same
+configuration and returns the ordinary stream summary plus separate physical
+grouping counters. Those counters do not establish measured throughput.
+Execution identities retain strict-quantized-v2,
 the actual model/group partition and task-specific prompt, grammar and policy
 digests. This addition covers bounded single-context tasks and ordered
 item-local streams. Their opt-in durable jobs and the complete-document NER,
