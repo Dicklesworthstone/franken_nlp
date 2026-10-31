@@ -252,6 +252,7 @@ pub async fn download_release_parts(
                 return Err(NetworkPullError::Digest { part: index, expected: part.sha256.clone(), observed });
             }
             publish_part(index, &staging_path, &final_path)?;
+            verify_final(index, part, &final_path)?;
             reused_total = reused_total.checked_add(part.bytes)
                 .ok_or(NetworkPullError::InvalidOptions("reused byte arithmetic overflow"))?;
             reports.push(NetworkPartReport {
@@ -326,6 +327,7 @@ pub async fn download_release_parts(
             return Err(NetworkPullError::Digest { part: index, expected: part.sha256.clone(), observed });
         }
         publish_part(index, &staging_path, &final_path)?;
+        verify_final(index, part, &final_path)?;
         reports.push(NetworkPartReport {
             part: index, name: part.name.clone(), bytes: part.bytes, sha256: part.sha256.clone(),
             state: NetworkPartState::Downloaded, mirror_index: Some(mirror_index), resumed_bytes: resumed,

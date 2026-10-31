@@ -79,6 +79,31 @@ can resume it. Cancellation similarly produces no success report.
 Final publication uses a no-replace hard link from the completed partial file.
 The partial is retained as forensic/resume evidence.
 
+## CLI surface
+
+With `asupersync-runtime` enabled, the process-owned runtime exposes the same
+transport through:
+
+```sh
+fnlp models download-parts \
+  --manifest /release/model.manifest.json \
+  --manifest-sha256 "$INDEPENDENT_MANIFEST_SHA256" \
+  --parts-dir /release/parts \
+  --memory-mib 256
+```
+
+The command installs one ordinary `EngineResources` host and runs the HTTP
+future on that owned runtime; it does not create a second nested runtime.
+`--network-reserve-mib` (default 16) creates an explicit process-ledger
+reservation for HTTP/TLS/DNS/body bookkeeping. `--max-download-bytes` bounds
+new network bytes for resumable invocations. `--no-resume` refuses an
+existing partial file instead of extending it. `--request-timeout-seconds`
+and `--max-redirects` are finite per-mirror controls.
+
+A successful command prints metadata only to stderr and exits zero after every
+part has a complete manifest digest. It still has
+`activation_authority=false`.
+
 ## What this does not claim
 
 This code closes the previously absent transport path, but the project still

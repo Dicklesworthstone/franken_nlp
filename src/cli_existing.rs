@@ -31,8 +31,15 @@ use crate::{
     artifact::safetensors::{RowPanel, TensorCensusEntry},
     error::ErrorCode,
     grammar::{CompileLimits, CompiledSchema, SchemaError, compile_json_schema},
-    orchestrator::{AdmissionRequest, KvCacheQuantization, ResidencyAccounting},
+    orchestrator::{AdmissionRequest, KvCacheQuantization, ResidencyAccounting,
+        ResourceHostConfig, RuntimePreset, LeakResponsePolicy},
     robot::{self, RobotCommand, RobotConvertStageEvent},
+    NlpEngine,
+};
+#[cfg(feature = "asupersync-runtime")]
+use crate::{
+    artifact::pull::http::{NetworkPartsOptions, NetworkPartsRequest, NetworkPullError},
+    hosted::{HostedError, HostedNetworkPullError, NetworkPullHostOptions},
 };
 use clap::{CommandFactory, Parser, Subcommand};
 
@@ -132,10 +139,43 @@ struct ConvertCommand {
 
 #[derive(Subcommand)]
 enum ModelsSubcommand {
+    /// Acquire verified immutable release parts over pinned HTTPS; does not activate.
+    DownloadParts(ModelsDownloadPartsCommand),
     /// Reconstruct a verified Generic artifact from explicit local release parts.
     Reconstruct(ModelsReconstructCommand),
     /// Derive one target-specific native cache from an immutable Generic root.
     Derive(ModelsDeriveCommand),
+}
+
+#[derive(clap::Args)]
+struct ModelsDownloadPartsCommand {
+    /// Canonical release manifest acquired through the release channel.
+    #[arg(long)]
+    manifest: PathBuf,
+    /// Independently trusted domain-separated manifest SHA-256.
+    #[arg(long)]
+    manifest_sha256: String,
+    /// Existing caller-controlled directory for final .partNN and .partial files.
+    #[arg(long)]
+    parts_dir: PathBuf,
+    /// Disable reuse of an existing .partial staging file.
+    #[arg(long)]
+    no_resume: bool,
+    /// Maximum newly received bytes across this invocation.
+    #[arg(long)]
+    max_download_bytes: Option<u64>,
+    /// Process memory-ledger ceiling in MiB.
+    #[arg(long)]
+    memory_mib: u64,
+    /// Modeled HTTP/TLS/DNS/body bookkeeping reserve in MiB.
+    #[arg(long, default_value_t = 16)]
+    network_reserve_mib: u64,
+    /// Per-request timeout; every mirror attempt is independently bounded.
+    #[arg(long, default_value_t = 300)]
+    request_timeout_seconds: u64,
+    /// Maximum explicit absolute-HTTPS redirect hops per mirror.
+    #[arg(long, default_value_t = 5)]
+    max_redirects: u32,
 }
 
 #[derive(clap::Args)]
@@ -411,8 +451,107 @@ fn cli_main_with_reader_and_terminal(
 
 fn run_models_command(command: ModelsSubcommand) -> ExitCode {
     match command {
+        ModelsSubcommand::DownloadParts(command) => run_models_download_parts(command),
         ModelsSubcommand::Reconstruct(command) => run_models_reconstruct(command),
         ModelsSubcommand::Derive(command) => run_models_derive(command),
+    }
+}
+
+fn run_models_download_parts(command: ModelsDownloadPartsCommand) -> ExitCode {
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        let _ = command;
+        eprintln!("MODELS_DOWNLOAD_PARTS RESULT=REFUSED reason=asupersync-runtime-feature-disabled");
+        return ErrorCode::Generic.as_process_exit();
+    }
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        use std::time::Duration;
+        const MIB: u64 = 1024 * 1024;
+        let Some(memory_bytes) = command.memory_mib.checked_mul(MIB).filter(|&bytes| bytes != 0) else {
+            eprintln!("MODELS_DOWNLOAD_PARTS RESULT=REFUSED reason=invalid-memory-mib");
+            return ErrorCode::Usage.as_process_exit();
+        };
+        let Some(network_reserve_bytes) = command.network_reserve_mib.checked_mul(MIB).filter(|&bytes| bytes != 0) else {
+            eprintln!("MODELS_DOWNLOAD_PARTS RESULT=REFUSED reason=invalid-network-reserve-mib");
+            return ErrorCode::Usage.as_process_exit();
+        };
+        if command.request_timeout_seconds == 0 || command.max_redirects > 16 {
+            eprintln!("MODELS_DOWNLOAD_PARTS RESULT=REFUSED reason=invalid-network-limits");
+            return ErrorCode::Usage.as_process_exit();
+        }
+        let engine = match NlpEngine::builder().resource_config(ResourceHostConfig {
+            runtime_preset: RuntimePreset::CurrentThread,
+            runtime_workers: 1,
+            max_blocking_coordinators: 1,
+            scoped_cpu_children_per_coordinator: 0,
+            helper_threads: 0,
+            thread_ceiling: 2,
+            memory_ceiling_bytes: memory_bytes,
+            leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
+        }).build() {
+            Ok(engine) => engine,
+            Err(error) => {
+                eprintln!("MODELS_DOWNLOAD_PARTS RESULT=REFUSED stage=runtime reason={error}");
+                return ErrorCode::AdmissionOrResourceLimit.as_process_exit();
+            }
+        };
+        let transfer = NetworkPartsOptions {
+            resume: !command.no_resume,
+            max_new_bytes: command.max_download_bytes,
+            request_timeout: Duration::from_secs(command.request_timeout_seconds),
+            max_redirects: command.max_redirects,
+        };
+        match engine.download_release_parts_candidate(
+            NetworkPartsRequest {
+                manifest: command.manifest,
+                expected_release_manifest_sha256: command.manifest_sha256,
+                parts_dir: command.parts_dir,
+            },
+            transfer,
+            NetworkPullHostOptions { network_reserve_bytes },
+        ) {
+            Ok(report) => {
+                eprintln!(
+                    "MODELS_DOWNLOAD_PARTS RESULT=PASS parts={} complete_bytes={} reused_bytes={} downloaded_bytes={} manifest_sha256={} activation_authority=false parts_dir={}",
+                    report.parts.len(),
+                    report.complete_bytes,
+                    report.reused_bytes,
+                    report.downloaded_bytes,
+                    report.release_manifest_sha256,
+                    report.parts_dir.display(),
+                );
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("MODELS_DOWNLOAD_PARTS RESULT=FAIL reason={error}");
+                network_download_error_code(&error).as_process_exit()
+            }
+        }
+    }
+}
+
+#[cfg(feature = "asupersync-runtime")]
+fn network_download_error_code(error: &HostedNetworkPullError) -> ErrorCode {
+    match error {
+        HostedNetworkPullError::Hosted(HostedError::Limits(_) | HostedError::Reservation(_)) =>
+            ErrorCode::AdmissionOrResourceLimit,
+        HostedNetworkPullError::Hosted(_) => ErrorCode::Generic,
+        HostedNetworkPullError::Transfer(NetworkPullError::DownloadBudgetExceeded { .. }) =>
+            ErrorCode::BudgetOrTimeout,
+        HostedNetworkPullError::Transfer(NetworkPullError::Cancelled { .. }) =>
+            ErrorCode::Cancelled,
+        HostedNetworkPullError::Transfer(NetworkPullError::InvalidOptions(_)) =>
+            ErrorCode::Usage,
+        HostedNetworkPullError::Transfer(NetworkPullError::PartsDirectory { .. }
+            | NetworkPullError::PartPath { .. } | NetworkPullError::ExistingPart { .. }
+            | NetworkPullError::Staging { .. }) => ErrorCode::AdmissionOrResourceLimit,
+        HostedNetworkPullError::Transfer(NetworkPullError::Manifest(_)
+            | NetworkPullError::Redirect { .. } | NetworkPullError::Response { .. }
+            | NetworkPullError::Digest { .. }) => ErrorCode::ArtifactIntegrityOrFormatOrVersion,
+        HostedNetworkPullError::Transfer(NetworkPullError::NoMirrors { .. }
+            | NetworkPullError::MirrorExhausted { .. } | NetworkPullError::Body { .. }) =>
+            ErrorCode::Generic,
     }
 }
 
