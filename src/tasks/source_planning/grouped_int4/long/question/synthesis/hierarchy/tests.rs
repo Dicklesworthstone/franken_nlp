@@ -5,24 +5,24 @@ use crate::{tasks::answer::PassageOccurrence,
     tasks::source_planning::grouped_int4::long::tests as maps};
 use std::collections::VecDeque;
 
-struct Control { calls: usize, stop: usize }
+pub(super) struct Control { calls: usize, stop: usize }
 impl DecodeStepControl for Control {
     fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
         self.calls += 1; (self.calls >= self.stop).then_some(DecodeCancellationKind::Deadline)
     }
 }
-fn go() -> Control { Control { calls: 0, stop: usize::MAX } }
+pub(super) fn go() -> Control { Control { calls: 0, stop: usize::MAX } }
 fn request() -> SourceQuestionSynthesis {
     SourceQuestionSynthesis { question: SourceQuestion { question: "Who is mentioned?".to_owned(),
         options: AnswerOptions::default(), verification: GroundingBudget::default() },
         limits: QuestionSynthesisLimits { max_evidence_passages: 32, max_evidence_bytes: 4096 } }
 }
-fn limits() -> QuestionHierarchyLimits { QuestionHierarchyLimits { max_passes: 4, ..QuestionHierarchyLimits::default() } }
+pub(super) fn limits() -> QuestionHierarchyLimits { QuestionHierarchyLimits { max_passes: 4, ..QuestionHierarchyLimits::default() } }
 fn identity(p: &SourceTaskPlanner, width: usize) -> ExecutionIdentity {
     let mut id = maps::identity(p, &SourceMapTask::Ner(NerOptions::default()), width);
     id.task_spec = ANSWER_TASK_VERSION.to_owned(); id
 }
-fn prepare<'s>(p: &SourceTaskPlanner, source: &'s str, mapping: Int4SourceMapLimits,
+pub(super) fn prepare<'s>(p: &SourceTaskPlanner, source: &'s str, mapping: Int4SourceMapLimits,
     hierarchy: QuestionHierarchyLimits, width: usize, control: &mut Control)
     -> Result<PreparedInt4QuestionHierarchy<'s>, Int4SourceMapError> {
     let id = identity(p, width); let budget = maps::budget();
@@ -65,7 +65,7 @@ impl SourceDriver for MapScript {
             result: SourceTaskResult::Answer(raw), model_work: work })
     }
 }
-const SOURCE: &str = "éabc----βdef";
+pub(super) const SOURCE: &str = "éabc----βdef";
 fn setup(empty: bool) -> (Int4QuestionHierarchyPreflight, Int4QuestionRun, evidence::Collection, GroundingBudget) {
     let p = maps::planner(); let prepared = prepare(&p, SOURCE, maps::limits(), limits(), 32, &mut go()).unwrap();
     let mut expected = prepared.expected;
@@ -88,13 +88,13 @@ fn setup(empty: bool) -> (Int4QuestionHierarchyPreflight, Int4QuestionRun, evide
     let evidence = evidence::collect(SOURCE, discovery.mapped.root().value(), expected.base.limits, &mut remaining, &mut go()).unwrap();
     (expected, discovery, evidence, remaining)
 }
-struct Script {
+pub(super) struct Script {
     expected: Int4QuestionHierarchyPreflight, question: String,
     inputs: Vec<Vec<AnswerPassage>>, preparations: Vec<Vec<AnswerPassage>>, events: Vec<&'static str>,
     full: bool, empty: bool, final_abstain: bool, fail_prepare: Option<usize>, fail_run: Option<usize>,
     zero_tokens: bool, count_error: bool, wrong_witness: bool,
 }
-fn script(expected: Int4QuestionHierarchyPreflight) -> Script {
+pub(super) fn script(expected: Int4QuestionHierarchyPreflight) -> Script {
     Script { expected, question: request().question.question, inputs: vec![], preparations: vec![], events: vec![],
         full: false, empty: false, final_abstain: false, fail_prepare: None, fail_run: None,
         zero_tokens: false, count_error: false, wrong_witness: false }
@@ -135,7 +135,7 @@ impl execution::Driver for Script {
 }
 // mode0=answered, mode1=no initial evidence, mode2=intermediate exhaustion,
 // mode3=final model abstention with a real final native pass.
-fn complete(mode: usize) -> (Int4QuestionHierarchyPreflight, Int4QuestionHierarchyRun) {
+pub(super) fn complete(mode: usize) -> (Int4QuestionHierarchyPreflight, Int4QuestionHierarchyRun) {
     let (expected, discovery, collection, mut remaining) = setup(mode == 1); let initial = EvidenceSize::of(&collection);
     let mut driver = script(expected); driver.empty = mode == 2; driver.final_abstain = mode == 3;
     let reduced = execution::reduce(SOURCE, collection, expected, 16 << 20, &mut remaining, &mut driver, &mut go()).unwrap();

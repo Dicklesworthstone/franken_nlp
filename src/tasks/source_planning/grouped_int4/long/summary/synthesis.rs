@@ -7,6 +7,8 @@ use crate::{
     tasks::summarize::{CitedBullet, SourceCitation},
 };
 mod evidence;
+/// Native discovery cohorts followed by the same quote-only synthesis pass.
+pub mod cohort;
 /// Explicit lossy quote selection across several bounded synthesis levels.
 pub mod hierarchy;
 
@@ -204,22 +206,52 @@ fn subtract(a: Int4Work, b: Int4Work) -> Result<Int4Work, Int4SourceMapError> {
         projections: ProjectionWork { dot_products: sub(a.projections.dot_products, b.projections.dot_products)?,
             multiply_accumulates: sub(a.projections.multiply_accumulates, b.projections.multiply_accumulates)? } })
 }
-impl PreparedInt4SummarySynthesis<'_> {
+impl<'s> PreparedInt4SummarySynthesis<'s> {
     pub fn preflight_metadata(&self) -> Int4SummarySynthesisPreflight { self.expected }
     pub fn execution_identities(&self) -> impl ExactSizeIterator<Item = &ExecutionIdentity> { self.map.execution_identities() }
     pub fn max_result_bytes(&self) -> u64 { self.mapping.reduction.max_result_bytes as u64 }
     pub fn max_kv_bytes(&self) -> u64 { self.budget.max_kv_bytes }
     pub fn group_width(&self) -> usize { self.expected.group_width() }
+    fn check_planner(&self, planner: &SourceTaskPlanner) -> Result<(), Int4SourceMapError> {
+        if planner.tokenizer_digest() != self.identity.tokenizer_digest || *planner.template_digest() != self.identity.template_digest {
+            return Err(Int4SourceMapError::Admission);
+        }
+        Ok(())
+    }
+    fn into_parts(self) -> (PreparedInt4SourceMap<'s>, SummarySynthesisTail<'s>) {
+        let Self { source, map, identity, budget, planning, mapping, request, expected } = self;
+        (map, SummarySynthesisTail { source, identity, budget, planning, mapping, request, expected })
+    }
     pub fn execute_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
         planner: &SourceTaskPlanner, engine: &mut StrictInt4Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
         -> Result<Int4SummarySynthesisRun, Int4SourceMapError> {
         checkpoint(control)?;
-        if planner.tokenizer_digest() != self.identity.tokenizer_digest || *planner.template_digest() != self.identity.template_digest {
-            return Err(Int4SourceMapError::Admission);
-        }
+        self.check_planner(planner)?;
         self.map.preflight(admitted, engine)?;
-        let Self { source, map, identity, budget, planning, mapping, request, expected } = self;
+        let (map, tail) = self.into_parts();
         let discovery = map.execute_with_control(admitted, engine, vocabulary, control)?;
+        let mapping = tail.mapping;
+        tail.execute(discovery, planner, |plan, control| run_final(plan, engine, vocabulary, mapping, control), control)
+    }
+}
+
+/// The sealed state remaining after discovery has been consumed. Both native
+/// schedules enter this one evidence/verification/finalization implementation.
+struct SummarySynthesisTail<'s> {
+    source: &'s str,
+    identity: ExecutionIdentity,
+    budget: TaskBudget,
+    planning: SourcePlanningLimits,
+    mapping: Int4SourceMapLimits,
+    request: SourceSummarySynthesis,
+    expected: Int4SummarySynthesisPreflight,
+}
+impl SummarySynthesisTail<'_> {
+    fn execute<C: DecodeStepControl, F>(self, discovery: Int4SourceMapRun,
+        planner: &SourceTaskPlanner, run: F, control: &mut C)
+        -> Result<Int4SummarySynthesisRun, Int4SourceMapError>
+        where F: FnOnce(&PreparedInt4SourceTask, &mut C) -> Result<Int4SourceTaskRun, Int4SourceMapError> {
+        let Self { source, identity, budget, planning, mapping, request, expected } = self;
         expected.discovery.verify_completed(&discovery)?;
         let mut remaining = remaining_verification(request.limits.verification, discovery.verification_used)?;
         let collection = evidence::collect(source, discovery.mapped.root().value(), request.map_options,
@@ -232,11 +264,7 @@ impl PreparedInt4SummarySynthesis<'_> {
             let plan = planner.plan_int4_with_control(&final_request, &context, planning, expected.group_width(), control)?;
             let planned = plan.planned_work();
             if !fits(planned, expected.synthesis_reserve) { return Err(Int4SourceMapError::WorkLimit); }
-            let mut driver = NativeDriver { engine, vocabulary, control, limits: mapping };
-            // The dynamic evidence prompt, group partition and entire resident
-            // KV are admitted against the same actual model before synthesis.
-            preflight(std::slice::from_ref(&plan), std::slice::from_ref(plan.execution_identity()), &driver)?;
-            let native = driver.run(&plan, plan.execution_identity())?;
+            let native = run(&plan, control)?;
             check_run(&plan, &native, mapping.mask_visits_per_chunk)?;
             let SourceTaskResult::Summarize(raw) = &native.result else { return Err(invalid()); };
             let bullets = evidence::lift_summary(source, raw, &collection, request.synthesis_options, &mut remaining, control)?;
@@ -246,6 +274,15 @@ impl PreparedInt4SummarySynthesis<'_> {
         finish(discovery, native, prompt_tokens, planned, bullets, segments, bytes, remaining, expected,
             mapping.reduction.max_result_bytes as u64, control)
     }
+}
+fn run_final<C: DecodeStepControl>(plan: &PreparedInt4SourceTask, engine: &mut StrictInt4Engine<'_>,
+    vocabulary: &ExtractionVocabulary, mapping: Int4SourceMapLimits, control: &mut C)
+    -> Result<Int4SourceTaskRun, Int4SourceMapError> {
+    let mut driver = NativeDriver { engine, vocabulary, control, limits: mapping };
+    // The dynamic evidence prompt, group partition and entire resident KV
+    // must fit this exact model before any synthesis forward begins.
+    preflight(std::slice::from_ref(plan), std::slice::from_ref(plan.execution_identity()), &driver)?;
+    driver.run(plan, plan.execution_identity()).map_err(Into::into)
 }
 fn remaining_verification(total: GroundingBudget, used: SourceMapVerification) -> Result<GroundingBudget, Int4SourceMapError> {
     Ok(GroundingBudget { max_fields: total.max_fields.checked_sub(used.fields).ok_or(Int4SourceMapError::WorkLimit)?,

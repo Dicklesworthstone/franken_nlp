@@ -14,8 +14,8 @@ fn request() -> SourceSummarySynthesis {
     SourceSummarySynthesis { map_options: SummaryOptions::default(), synthesis_options: SummaryOptions::default(),
         limits: SummarySynthesisLimits { max_evidence_segments: 64, max_evidence_bytes: 4096, verification: GroundingBudget::default() } }
 }
-fn limits() -> SummaryHierarchyLimits { SummaryHierarchyLimits { max_passes: 4, ..SummaryHierarchyLimits::default() } }
-fn prepare<'s>(p: &SourceTaskPlanner, text: &'s str, mapping: Int4SourceMapLimits,
+pub(super) fn limits() -> SummaryHierarchyLimits { SummaryHierarchyLimits { max_passes: 4, ..SummaryHierarchyLimits::default() } }
+pub(super) fn prepare<'s>(p: &SourceTaskPlanner, text: &'s str, mapping: Int4SourceMapLimits,
     hierarchy: SummaryHierarchyLimits, width: usize) -> Result<PreparedInt4SummaryHierarchy<'s>, Int4SourceMapError> {
     let id = maps::identity(p, &SourceMapTask::Summarize(request().map_options), width); let budget = maps::budget();
     p.plan_int4_summary_hierarchy_with_control(text, request(), hierarchy, budget, &PlanContext::new(&id, budget).unwrap(),
@@ -28,9 +28,9 @@ fn capacity(expected: &mut Int4SummaryHierarchyPreflight, available: usize) {
         &PlanContext::new(&id, budget).unwrap(), SourcePlanningLimits::default(), expected.group_width(), &mut go()).unwrap();
 }
 const SOURCE: &str = "éabc----βdef";
-fn setup(empty: bool) -> (Int4SummaryHierarchyPreflight, Int4SourceMapRun, evidence::Collection, GroundingBudget) {
-    let p = maps::planner(); let prepared = prepare(&p, SOURCE, maps::limits(), limits(), 32).unwrap();
-    let mut expected = prepared.expected; capacity(&mut expected, 6);
+pub(super) fn discovered(empty: bool) -> (SummaryHierarchyTail<'static>, Int4SourceMapRun) {
+    let p = maps::planner(); let mut prepared = prepare(&p, SOURCE, maps::limits(), limits(), 32).unwrap();
+    capacity(&mut prepared.expected, 6);
     let admitted = maps::admitted(&prepared.base.map); let mut driver = maps::script(&prepared.base.map);
     assert_eq!(driver.outputs.len(), 2);
     for ((output, chunk), quote) in driver.outputs.iter_mut().zip(prepared.base.map.chunks.chunks()).zip(["éabc", "βdef"]) {
@@ -39,7 +39,12 @@ fn setup(empty: bool) -> (Int4SummaryHierarchyPreflight, Int4SourceMapRun, evide
         raw.bullets = if empty { vec![] } else { vec![CitedBullet { text: "MAP_ASSERTION_MUST_NOT_ENTER_NEXT_PASS".to_owned(),
             citations: vec![SourceCitation { quote: quote.to_owned(), occurrence: SourceOccurrence::Anchored, spans }] }] };
     }
-    let discovery = prepared.base.map.execute_with_driver(&admitted, driver).unwrap();
+    let (map, tail) = prepared.into_parts();
+    let discovery = map.execute_with_driver(&admitted, driver).unwrap();
+    (tail, discovery)
+}
+fn setup(empty: bool) -> (Int4SummaryHierarchyPreflight, Int4SourceMapRun, evidence::Collection, GroundingBudget) {
+    let (tail, discovery) = discovered(empty); let expected = tail.expected;
     let mut remaining = remaining_verification(request().limits.verification, discovery.verification_used).unwrap();
     let evidence = evidence::collect(SOURCE, discovery.mapped.root().value(), request().map_options,
         request().limits, &mut remaining, &mut go()).unwrap();
@@ -85,10 +90,10 @@ fn script(expected: Int4SummaryHierarchyPreflight) -> Script {
         fail_prepare: None, fail_run: None, zero_tokens: false }
 }
 fn complete(empty: bool) -> (Int4SummaryHierarchyPreflight, Int4SummaryHierarchyRun) {
-    let (expected, discovery, collection, mut remaining) = setup(empty); let initial = EvidenceSize::of(&collection);
-    let reduced = execution::reduce(SOURCE, collection, request(), expected, 4 << 20, &mut remaining,
-        &mut script(expected), &mut go()).unwrap();
-    let run = finish(discovery, initial, reduced, remaining, expected, 4 << 20, &mut go()).unwrap();
+    let (tail, discovery) = discovered(empty); let expected = tail.expected;
+    let run = tail.execute(discovery, |tail, collection, remaining, control|
+        execution::reduce(SOURCE, collection, tail.base.request, tail.expected, 4 << 20, remaining,
+            &mut script(expected), control), &mut go()).unwrap();
     (expected, run)
 }
 fn decrement(work: &mut Int4Work, axis: usize) {

@@ -91,13 +91,18 @@ pub(super) struct Reduced {
     pub planned: Int4Work, pub actual: Int4Work, pub masks: u64,
     pub tokenizer: HierarchyTokenizerWork, pub levels: Vec<SummaryHierarchyLevel>, pub passes: Vec<SummaryHierarchyPass>,
 }
+impl Reduced {
+    pub(super) fn empty(expected: Int4SummaryHierarchyPreflight) -> Result<Self, Int4SourceMapError> {
+        Ok(Self { status: SummarySynthesisStatus::NoEvidenceCollected, final_pass: None,
+            planned: Int4Work::default(), actual: Int4Work::default(), masks: 0,
+            tokenizer: HierarchyTokenizerWork::default(), levels: vector(expected.limits.max_levels)?, passes: vector(expected.limits.max_passes)? })
+    }
+}
 #[allow(clippy::too_many_arguments)]
 pub(super) fn reduce<C: DecodeStepControl, D: Driver>(source: &str, mut frontier: evidence::Collection,
     request: SourceSummarySynthesis, expected: Int4SummaryHierarchyPreflight, max_result_bytes: u64,
     remaining: &mut GroundingBudget, driver: &mut D, control: &mut C) -> Result<Reduced, Int4SourceMapError> {
-    let mut out = Reduced { status: SummarySynthesisStatus::NoEvidenceCollected, final_pass: None,
-        planned: Int4Work::default(), actual: Int4Work::default(), masks: 0,
-        tokenizer: HierarchyTokenizerWork::default(), levels: vector(expected.limits.max_levels)?, passes: vector(expected.limits.max_passes)? };
+    let mut out = Reduced::empty(expected)?;
     checkpoint(control)?;
     if frontier.segment_count() == 0 { return Ok(out); }
     for level in 0..expected.limits.max_levels {

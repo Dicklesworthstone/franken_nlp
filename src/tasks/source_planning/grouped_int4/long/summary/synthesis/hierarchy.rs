@@ -6,6 +6,8 @@ use std::ops::Range;
 mod execution;
 mod receipt;
 mod transport;
+/// Native discovery cohorts followed by bounded scalar quote-reduction levels.
+pub mod cohort;
 
 pub const INT4_SUMMARY_HIERARCHY_EXECUTION: &str = "grouped-int4-hierarchical-quote-summary-v1";
 const SEMANTICS: &str = "lossy-quote-selection-every-level-not-full-document-equivalence-v1";
@@ -85,33 +87,64 @@ impl SourceTaskPlanner {
         Ok(PreparedInt4SummaryHierarchy { base, expected, mapping })
     }
 }
-impl PreparedInt4SummaryHierarchy<'_> {
+impl<'s> PreparedInt4SummaryHierarchy<'s> {
     pub fn preflight_metadata(&self) -> Int4SummaryHierarchyPreflight { self.expected }
     pub fn execution_identities(&self) -> impl ExactSizeIterator<Item = &ExecutionIdentity> { self.base.execution_identities() }
     pub fn max_result_bytes(&self) -> u64 { self.base.max_result_bytes() }
     pub fn max_kv_bytes(&self) -> u64 { self.base.max_kv_bytes() }
     pub fn group_width(&self) -> usize { self.expected.group_width() }
+    fn into_parts(self) -> (PreparedInt4SourceMap<'s>, SummaryHierarchyTail<'s>) {
+        let Self { base, expected, mapping } = self;
+        let (map, base) = base.into_parts();
+        (map, SummaryHierarchyTail { base, expected, mapping })
+    }
     pub fn execute_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
         planner: &SourceTaskPlanner, engine: &mut StrictInt4Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
         -> Result<Int4SummaryHierarchyRun, Int4SourceMapError> {
         checkpoint(control)?;
-        let Self { base, expected, mapping } = self;
-        if planner.tokenizer_digest() != base.identity.tokenizer_digest || *planner.template_digest() != base.identity.template_digest {
-            return Err(Int4SourceMapError::Admission);
-        }
-        base.map.preflight(admitted, engine)?;
-        let PreparedInt4SummarySynthesis { source, map, identity, budget, planning, request, .. } = base;
+        self.base.check_planner(planner)?;
+        self.base.map.preflight(admitted, engine)?;
+        let (map, tail) = self.into_parts();
         let discovery = map.execute_with_control(admitted, engine, vocabulary, control)?;
-        expected.discovery.discovery.verify_completed(&discovery)?;
+        tail.execute(discovery, |tail, collection, remaining, control|
+            tail.reduce(collection, remaining, planner, engine, vocabulary, control), control)
+    }
+}
+/// One semantic continuation for serial and cohort discovery. Scheduling never
+/// changes evidence reachability, hierarchy budgets or complete-level admission.
+struct SummaryHierarchyTail<'s> {
+    base: SummarySynthesisTail<'s>,
+    expected: Int4SummaryHierarchyPreflight,
+    mapping: Int4SourceMapLimits,
+}
+impl SummaryHierarchyTail<'_> {
+    fn execute<C: DecodeStepControl, F>(self, discovery: Int4SourceMapRun, run: F, control: &mut C)
+        -> Result<Int4SummaryHierarchyRun, Int4SourceMapError>
+        where F: FnOnce(&Self, evidence::Collection, &mut GroundingBudget, &mut C)
+            -> Result<execution::Reduced, Int4SourceMapError> {
+        self.expected.discovery.discovery.verify_completed(&discovery)?;
+        let request = self.base.request;
         let mut remaining = remaining_verification(request.limits.verification, discovery.verification_used)?;
-        let collection = evidence::collect(source, discovery.mapped.root().value(), request.map_options,
+        let collection = evidence::collect(self.base.source, discovery.mapped.root().value(), request.map_options,
             request.limits, &mut remaining, control)?;
         let initial = EvidenceSize::of(&collection);
-        let mut driver = execution::Native { planner, identity: &identity, budget, planning,
-            options: request.synthesis_options, mapping, engine, vocabulary, group_width: expected.group_width() };
-        let reduced = execution::reduce(source, collection, request, expected, mapping.reduction.max_result_bytes as u64,
-            &mut remaining, &mut driver, control)?;
-        finish(discovery, initial, reduced, remaining, expected, mapping.reduction.max_result_bytes as u64, control)
+        let reduced = if initial.segments == 0 {
+            drop(collection);
+            let empty = execution::Reduced::empty(self.expected)?;
+            checkpoint(control)?;
+            empty
+        } else { run(&self, collection, &mut remaining, control)? };
+        finish(discovery, initial, reduced, remaining, self.expected, self.mapping.reduction.max_result_bytes as u64, control)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn reduce<C: DecodeStepControl>(&self, collection: evidence::Collection, remaining: &mut GroundingBudget,
+        planner: &SourceTaskPlanner, engine: &mut StrictInt4Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
+        -> Result<execution::Reduced, Int4SourceMapError> {
+        let base = &self.base;
+        let mut driver = execution::Native { planner, identity: &base.identity, budget: base.budget, planning: base.planning,
+            options: base.request.synthesis_options, mapping: self.mapping, engine, vocabulary, group_width: self.expected.group_width() };
+        execution::reduce(base.source, collection, base.request, self.expected, self.mapping.reduction.max_result_bytes as u64,
+            remaining, &mut driver, control)
     }
 }
 fn finish<C: DecodeStepControl>(discovery: Int4SourceMapRun, initial: EvidenceSize, reduced: execution::Reduced,

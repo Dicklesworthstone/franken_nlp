@@ -5,33 +5,33 @@ use crate::{native_engine::lmhead::NANBEIGE_VOCAB_SIZE, tasks::answer::PassageOc
     tasks::source_planning::grouped_int4::long::tests as maps};
 use std::collections::VecDeque;
 
-struct Control { calls: usize, stop: usize }
+pub(super) struct Control { calls: usize, stop: usize }
 impl DecodeStepControl for Control {
     fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
         self.calls += 1; (self.calls >= self.stop).then_some(DecodeCancellationKind::PollQuota)
     }
 }
-fn continuing() -> Control { Control { calls: 0, stop: usize::MAX } }
-fn request() -> SourceQuestionSynthesis {
+pub(super) fn continuing() -> Control { Control { calls: 0, stop: usize::MAX } }
+pub(super) fn request() -> SourceQuestionSynthesis {
     SourceQuestionSynthesis { question: SourceQuestion { question: "Who is mentioned?".to_owned(),
         options: AnswerOptions::default(), verification: GroundingBudget::default() },
         limits: QuestionSynthesisLimits { max_evidence_passages: 32, max_evidence_bytes: 4096 } }
 }
-fn mapping() -> Int4SourceMapLimits {
+pub(super) fn mapping() -> Int4SourceMapLimits {
     let mut m = maps::limits(); m.chunks.max_chunk_bytes = 6; m.chunks.max_chunk_tokens = 6; m
 }
 fn identity(p: &SourceTaskPlanner, width: usize) -> ExecutionIdentity {
     let mut id = maps::identity(p, &SourceMapTask::Ner(NerOptions::default()), width);
     id.task_spec = ANSWER_TASK_VERSION.to_owned(); id
 }
-fn prepare<'s>(p: &SourceTaskPlanner, text: &'s str, request: &SourceQuestionSynthesis,
+pub(super) fn prepare<'s>(p: &SourceTaskPlanner, text: &'s str, request: &SourceQuestionSynthesis,
     mapping: Int4SourceMapLimits, width: usize, control: &mut Control)
     -> Result<PreparedInt4QuestionSynthesis<'s>, Int4SourceMapError> {
     let id = identity(p, width); let budget = maps::budget();
     p.plan_int4_question_synthesis_with_control(text, request, budget, &PlanContext::new(&id, budget).unwrap(),
         SourcePlanningLimits::default(), mapping, width, control)
 }
-fn raw(plan: &PreparedInt4SourceTask, passages: &[(&str, &str)], quote: Option<&str>, text: &str) -> AnswerResult {
+pub(super) fn raw(plan: &PreparedInt4SourceTask, passages: &[(&str, &str)], quote: Option<&str>, text: &str) -> AnswerResult {
     let options = plan.extraction.options();
     let ordinary = (0..NANBEIGE_VOCAB_SIZE as u32)
         .find(|id| *id != options.eos_token_id && !options.excluded_token_ids.contains(id)).unwrap();
@@ -70,7 +70,7 @@ impl SourceDriver for Script {
     }
 }
 // mode0=answered, mode1=all maps abstain, mode2=final pass abstains.
-fn synthetic(mode: usize) -> (Int4QuestionSynthesisPreflight, Int4QuestionSynthesisRun) {
+pub(super) fn synthetic(mode: usize) -> (Int4QuestionSynthesisPreflight, Int4QuestionSynthesisRun) {
     let p = maps::planner(); let source = "ééé                        ééé"; let request = request();
     let prepared = prepare(&p, source, &request, mapping(), 32, &mut continuing()).unwrap();
     let expected = prepared.expected;

@@ -18,6 +18,10 @@ use crate::{
 pub const INT4_SOURCE_MAP_COHORT_EXECUTION: &str = "grouped-int4-source-document-cohorts-v1";
 pub const COHORT_ENVELOPE_BYTES: u64 = 4096;
 
+/// Shared admission and result envelope for discovery cohorts followed by
+/// the existing scalar evidence-synthesis phases.
+pub mod synthesis;
+
 /// Maximum simultaneous chunk payload, quotable before source or model IO.
 /// Complete preparation, reduction, output and allocator reserves remain
 /// separately owned by the host for the entire invocation.

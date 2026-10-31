@@ -149,6 +149,37 @@ success; a drained stream can still contain rejected documents.
   finalizers inside the native session. Each row must complete and validate;
   there is no unrestricted successful prefix or unconstrained fallback.
 
+### Neural synthesis after discovery cohorts
+
+The prepared summary-synthesis, summary-hierarchy, answer-synthesis and
+answer-hierarchy plans expose `cohort_requirements(context_limit)` and
+`execute_cohorts_with_control`. Their native discovery chunks run in bounded
+shared-layer windows, then enter the same evidence collection, final synthesis
+and hierarchy reducers as serial discovery. Hierarchy passes remain scalar;
+every level still admits its complete frontier before its first forward.
+
+Each result keeps the complete existing synthesis result under `.document` and
+reports only discovery's physical grouping under `.discovery_cohorts`. The
+generic envelope is `Int4SynthesisCohortRun<T>`; the four task-specific aliases
+are `Int4SummarySynthesisCohortRun`, `Int4SummaryHierarchyCohortRun`,
+`Int4QuestionSynthesisCohortRun` and `Int4QuestionHierarchyCohortRun` in their
+respective `cohort` modules. Discovery statistics never include synthesis work
+or charge question-map whitespace as a native row.
+
+The complete native reservation is the componentwise maximum of all discovery
+windows and one full-context scalar engine. Discovery engines physically drain
+before synthesis allocates that engine. The scalar capacity must fit the
+original task KV ceiling before discovery begins, even when a short map would
+fit much less memory. Empty evidence skips scalar allocation and the final
+model pass. The embedding host must also retain complete preparation, evidence,
+verification, native transcript and final-output reservations through completion.
+
+Final-pass and hierarchy work reserves are subtracted before discovery; early
+completion or a smaller frontier never replenishes them. Shared verification
+allowances, original-source occurrence checks, explicit no-evidence status and
+whole-document failure behavior remain unchanged. This schedule does not widen
+the evidence caps or make lossy hierarchy equivalent to full-context inference.
+
 ## Chunks of one long document
 
 `candidate source-int4 extract-map`, `ner-map`, `keyphrases-map` (including

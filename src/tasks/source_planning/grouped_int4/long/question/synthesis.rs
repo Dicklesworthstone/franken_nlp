@@ -5,6 +5,8 @@ use super::*;
 use super::super::execution::{NativeDriver, SourceDriver, check_run, preflight};
 use crate::native_engine::portable_int8::ProjectionWork;
 mod evidence;
+/// Native discovery cohorts followed by the same verified-evidence synthesis.
+pub mod cohort;
 /// Explicit bounded, lossy quotation selection for over-context QA evidence.
 pub mod hierarchy;
 
@@ -122,6 +124,19 @@ pub struct PreparedInt4QuestionSynthesis<'s> {
     options: AnswerOptions,
     expected: Int4QuestionSynthesisPreflight,
 }
+// Private continuation owns the sealed question and evidence authority after
+// discovery. Both schedules enter this exact semantic path; callers cannot
+// supply discovered quotations or replace the remaining verification budget.
+struct Continuation<'s> {
+    source: &'s str,
+    question: String,
+    identity: ExecutionIdentity,
+    budget: TaskBudget,
+    planning: SourcePlanningLimits,
+    mapping: Int4SourceMapLimits,
+    options: AnswerOptions,
+    expected: Int4QuestionSynthesisPreflight,
+}
 impl SourceTaskPlanner {
     #[allow(clippy::too_many_arguments)]
     pub fn preflight_int4_question_synthesis_with_control<C: DecodeStepControl>(&self, source: &str,
@@ -172,22 +187,42 @@ fn reserve(limits: QuestionSynthesisLimits, budget: TaskBudget, planning: Source
         .ok_or(Int4SourceMapError::WorkLimit)?;
     Ok((mapping, reserved))
 }
-impl PreparedInt4QuestionSynthesis<'_> {
+impl<'s> PreparedInt4QuestionSynthesis<'s> {
     pub fn preflight_metadata(&self) -> Int4QuestionSynthesisPreflight { self.expected }
     pub fn execution_identities(&self) -> impl ExactSizeIterator<Item = &ExecutionIdentity> { self.map.execution_identities() }
     pub fn max_result_bytes(&self) -> u64 { self.mapping.reduction.max_result_bytes as u64 }
     pub fn max_kv_bytes(&self) -> u64 { self.budget.max_kv_bytes }
     pub fn group_width(&self) -> usize { self.expected.discovery.group_width() }
+    fn check_planner(&self, planner: &SourceTaskPlanner) -> Result<(), Int4SourceMapError> {
+        if planner.tokenizer_digest() != self.identity.tokenizer_digest || *planner.template_digest() != self.identity.template_digest {
+            return Err(Int4SourceMapError::Admission);
+        }
+        Ok(())
+    }
+    fn into_phases(self) -> (PreparedInt4Question<'s>, Continuation<'s>) {
+        let Self { source, question, map, identity, budget, planning, mapping, options, expected } = self;
+        (map, Continuation { source, question, identity, budget, planning, mapping, options, expected })
+    }
     pub fn execute_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
         planner: &SourceTaskPlanner, engine: &mut StrictInt4Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
         -> Result<Int4QuestionSynthesisRun, Int4SourceMapError> {
         checkpoint(control)?;
-        if planner.tokenizer_digest() != self.identity.tokenizer_digest || *planner.template_digest() != self.identity.template_digest {
-            return Err(Int4SourceMapError::Admission);
-        }
+        self.check_planner(planner)?;
         self.map.preflight(admitted, engine)?;
-        let Self { source, question, map, identity, budget, planning, mapping, options, expected } = self;
+        let mapping = self.mapping;
+        let (map, continuation) = self.into_phases();
         let discovery = map.execute_with_control(admitted, engine, vocabulary, control)?;
+        continuation.execute(discovery, planner, control, |plan, control| {
+            synthesis_pass(plan, engine, vocabulary, mapping, control)
+        })
+    }
+}
+impl Continuation<'_> {
+    fn execute<C: DecodeStepControl, F>(self, discovery: Int4QuestionRun,
+        planner: &SourceTaskPlanner, control: &mut C, run: F)
+        -> Result<Int4QuestionSynthesisRun, Int4SourceMapError>
+        where F: FnOnce(&PreparedInt4SourceTask, &mut C) -> Result<Int4SourceTaskRun, Int4SourceMapError> {
+        let Self { source, question, identity, budget, planning, mapping, options, expected } = self;
         expected.discovery.verify_completed(&discovery)?;
         let mut remaining = remaining_verification(expected.discovery.verification, discovery.verification_used)?;
         let collection = evidence::collect(source, discovery.mapped.root().value(), expected.limits, &mut remaining, control)?;
@@ -201,9 +236,7 @@ impl PreparedInt4QuestionSynthesis<'_> {
             let plan = planner.plan_int4_with_control(&request, &context, planning, expected.discovery.group_width(), control)?;
             let planned = plan.planned_work();
             if !fits(planned, expected.synthesis_reserve) { return Err(Int4SourceMapError::WorkLimit); }
-            let mut driver = NativeDriver { engine, vocabulary, control, limits: mapping };
-            preflight(std::slice::from_ref(&plan), std::slice::from_ref(plan.execution_identity()), &driver)?;
-            let native = driver.run(&plan, plan.execution_identity())?;
+            let native = run(&plan, control)?;
             check_run(&plan, &native, mapping.mask_visits_per_chunk)?;
             let work = native.model_work;
             let SourceTaskResult::Answer(raw) = native.result else { return Err(invalid()); };
@@ -215,6 +248,13 @@ impl PreparedInt4QuestionSynthesis<'_> {
         finish(discovery, answer, passages, bytes, prompt, tokens, planned, work, masks, remaining, expected,
             mapping.reduction.max_result_bytes as u64, control)
     }
+}
+fn synthesis_pass<C: DecodeStepControl>(plan: &PreparedInt4SourceTask, engine: &mut StrictInt4Engine<'_>,
+    vocabulary: &ExtractionVocabulary, mapping: Int4SourceMapLimits, control: &mut C)
+    -> Result<Int4SourceTaskRun, Int4SourceMapError> {
+    let mut driver = NativeDriver { engine, vocabulary, control, limits: mapping };
+    preflight(std::slice::from_ref(plan), std::slice::from_ref(plan.execution_identity()), &driver)?;
+    Ok(driver.run(plan, plan.execution_identity())?)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]

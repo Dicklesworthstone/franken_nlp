@@ -5,6 +5,8 @@ use std::ops::Range;
 mod execution;
 mod receipt;
 mod transport;
+/// Native discovery cohorts with the existing bounded quotation hierarchy.
+pub mod cohort;
 
 pub const INT4_QUESTION_HIERARCHY_EXECUTION: &str = "grouped-int4-hierarchical-quote-answer-v1";
 const SEMANTICS: &str = "lossy-question-quote-selection-not-full-document-equivalence-v1";
@@ -54,6 +56,13 @@ impl Int4QuestionHierarchyPreflight {
 pub struct PreparedInt4QuestionHierarchy<'s> {
     base: PreparedInt4QuestionSynthesis<'s>,
     expected: Int4QuestionHierarchyPreflight,
+    mapping: Int4SourceMapLimits,
+}
+struct HierarchyContinuation<'s> {
+    base: Continuation<'s>,
+    expected: Int4QuestionHierarchyPreflight,
+    // This is the original whole-hierarchy envelope, before every additional
+    // pass was reserved out of the sealed discovery mapping limits.
     mapping: Int4SourceMapLimits,
 }
 impl SourceTaskPlanner {
@@ -121,32 +130,57 @@ fn hierarchy_expectation<C: DecodeStepControl>(planner: &SourceTaskPlanner, requ
     checkpoint(control)?;
     Ok(Int4QuestionHierarchyPreflight { base, limits, capacity, reserved_work, reserved_masks })
 }
-impl PreparedInt4QuestionHierarchy<'_> {
+impl<'s> PreparedInt4QuestionHierarchy<'s> {
     pub fn preflight_metadata(&self) -> Int4QuestionHierarchyPreflight { self.expected }
     pub fn execution_identities(&self) -> impl ExactSizeIterator<Item = &ExecutionIdentity> { self.base.execution_identities() }
     pub fn max_result_bytes(&self) -> u64 { self.base.max_result_bytes() }
     pub fn max_kv_bytes(&self) -> u64 { self.base.max_kv_bytes() }
     pub fn group_width(&self) -> usize { self.expected.group_width() }
+    fn into_phases(self) -> (PreparedInt4Question<'s>, HierarchyContinuation<'s>) {
+        let Self { base, expected, mapping } = self;
+        let (map, base) = base.into_phases();
+        (map, HierarchyContinuation { base, expected, mapping })
+    }
     pub fn execute_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
         planner: &SourceTaskPlanner, engine: &mut StrictInt4Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
         -> Result<Int4QuestionHierarchyRun, Int4SourceMapError> {
         checkpoint(control)?;
-        let Self { base, expected, mapping } = self;
-        if planner.tokenizer_digest() != base.identity.tokenizer_digest || *planner.template_digest() != base.identity.template_digest {
-            return Err(Int4SourceMapError::Admission);
-        }
-        base.map.preflight(admitted, engine)?;
-        let PreparedInt4QuestionSynthesis { source, question, map, identity, budget, planning, options, .. } = base;
+        self.base.check_planner(planner)?;
+        self.base.map.preflight(admitted, engine)?;
+        let (map, continuation) = self.into_phases();
         let discovery = map.execute_with_control(admitted, engine, vocabulary, control)?;
+        continuation.execute(discovery, control, |continuation, collection, remaining, control| {
+            continuation.reduce(collection, remaining, planner, engine, vocabulary, control)
+        })
+    }
+}
+impl HierarchyContinuation<'_> {
+    fn execute<C: DecodeStepControl, F>(self, discovery: Int4QuestionRun, control: &mut C, reduce: F)
+        -> Result<Int4QuestionHierarchyRun, Int4SourceMapError>
+        where F: FnOnce(&Self, evidence::Collection, &mut GroundingBudget, &mut C)
+            -> Result<execution::Reduced, Int4SourceMapError> {
+        let expected = self.expected;
         expected.discovery().verify_completed(&discovery)?;
         let mut remaining = remaining_verification(expected.base.discovery.verification, discovery.verification_used)?;
-        let collection = evidence::collect(source, discovery.mapped.root().value(), expected.base.limits, &mut remaining, control)?;
+        let collection = evidence::collect(self.base.source, discovery.mapped.root().value(), expected.base.limits, &mut remaining, control)?;
         let initial = EvidenceSize::of(&collection);
-        let mut driver = execution::Native { planner, identity: &identity, question: &question, budget, planning,
-            options, mapping, engine, vocabulary, expected };
-        let reduced = execution::reduce(source, collection, expected, mapping.reduction.max_result_bytes as u64,
-            &mut remaining, &mut driver, control)?;
-        finish(discovery, initial, reduced, remaining, expected, mapping.reduction.max_result_bytes as u64, control)
+        let reduced = if collection.passages.is_empty() {
+            execution::empty(expected, control)?
+        } else {
+            reduce(&self, collection, &mut remaining, control)?
+        };
+        finish(discovery, initial, reduced, remaining, expected, self.mapping.reduction.max_result_bytes as u64, control)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn reduce<C: DecodeStepControl>(&self, collection: evidence::Collection, remaining: &mut GroundingBudget,
+        planner: &SourceTaskPlanner, engine: &mut StrictInt4Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
+        -> Result<execution::Reduced, Int4SourceMapError> {
+        let base = &self.base;
+        let mut driver = execution::Native { planner, identity: &base.identity, question: &base.question,
+            budget: base.budget, planning: base.planning, options: base.options, mapping: self.mapping,
+            engine, vocabulary, expected: self.expected };
+        execution::reduce(base.source, collection, self.expected, self.mapping.reduction.max_result_bytes as u64,
+            remaining, &mut driver, control)
     }
 }
 fn finish<C: DecodeStepControl>(discovery: Int4QuestionRun, initial_evidence: EvidenceSize, reduced: execution::Reduced,
