@@ -28,7 +28,7 @@ pub use grouped_int4::{Int4HostError, Int4LoadLimits, Int4LoadRequirements, Int4
     Int4SourceCorpusConfig, Int4SourceMapConfig, Int4SentimentHostLimits, Int4JudgeHostLimits,
     Int4SemanticHostLimits, Int4SemanticHostRequirements,
     Int4ScoredCohortHostLimits, Int4ScoredCohortBatchResult,
-    Int4AssayHostLimits, Int4AssayHostRequirements,
+    Int4AssayHostLimits, Int4AssayHostRequirements, Int4AssayOperation,
     Int4ExtractionCohortBatchResult, Int4SourceCohortBatchResult,
     Int4ResolveConfig, HostedInt4ChatStream, ResidentInt4, HostedInt4EntityCorpus,
     Int4EntityCorpusError, Int4EntityCorpusHostConfig, Int4EntityCorpusHostRequirements,
@@ -178,7 +178,7 @@ impl From<crate::assay::AssayError> for HostedError {
     fn from(error: crate::assay::AssayError) -> Self { Self::Assay(error) }
 }
 impl From<crate::calibration::CalibrationError> for HostedError {
-    fn from(_: crate::calibration::CalibrationError) -> Self { Self::Assay(crate::assay::AssayError::Calibration) }
+    fn from(error: crate::calibration::CalibrationError) -> Self { Self::Assay(error.into()) }
 }
 
 /// A reservation that is explicitly aborted on every non-commit path. Drop

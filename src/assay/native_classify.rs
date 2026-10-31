@@ -10,6 +10,7 @@ use super::{AssayError, EvalOptions, Limits, Split, SplitBindings, SplitIds, ASS
 mod dataset;
 mod replay;
 mod report;
+pub mod calibrate;
 pub use dataset::{Dataset, Row, SuiteManifest};
 pub use report::{Bindings, ClassMetrics, ClassificationMetrics, Evaluation, EvaluationBody,
     Gates, QualificationBody, QualificationReport, parse_gates};

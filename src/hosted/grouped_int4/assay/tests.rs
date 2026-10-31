@@ -2,7 +2,7 @@
 use super::*;
 use crate::native_engine::portable_int8::ProjectionWork;
 
-fn host() -> Int4AssayHostLimits {
+pub(super) fn host() -> Int4AssayHostLimits {
     Int4AssayHostLimits {
         native: NativeLimits { context_tokens: 128, allocator_reserve_bytes: 65536,
             run: RunLimits { max_elapsed: Duration::from_secs(1), max_checkpoints: 1000,

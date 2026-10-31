@@ -13,6 +13,9 @@ use crate::{
     tasks::{classify::{ClassificationLimits, grouped_int4::Int4ClassificationPlanner}, ir::TaskBudget},
 };
 
+mod calibrate;
+pub use calibrate::Int4AssayOperation;
+
 /// Complete operation limits. Both qualification arms spend the same native
 /// work and run allowance. Each row retains this exact original task budget.
 #[derive(Clone, Copy, Debug)]

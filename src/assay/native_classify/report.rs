@@ -34,7 +34,8 @@ pub fn parse_gates(bytes: &[u8], limits: Limits) -> Result<Gates, AssayError> {
 }
 fn bounded(value: f64) -> bool { value.is_finite() && (-1.0..=1.0).contains(&value) }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClassMetrics {
     pub support: usize,
     pub predicted: usize,
@@ -43,7 +44,8 @@ pub struct ClassMetrics {
     /// None when neither truth nor predictions contain this class.
     pub f1: Option<f64>,
 }
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClassificationMetrics {
     pub rows: usize,
     pub decided: usize,
@@ -63,7 +65,8 @@ pub struct ClassificationMetrics {
     pub macro_f1: Option<f64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Bindings {
     pub metadata: DatasetMetadata,
     pub suite: ContentCommitment,
@@ -138,11 +141,20 @@ pub(crate) fn evaluate(replay: &NativeReplay, key: &CommitmentKey, namespace: &s
 pub(crate) fn evaluate_with_checkpoint<E>(replay: &NativeReplay, key: &CommitmentKey, namespace: &str,
     options: EvalOptions, limits: Limits, checkpoint: &mut impl FnMut() -> Result<(), E>) -> Result<Evaluation, E>
 where E: From<AssayError> + From<CalibrationError> {
+    evaluate_transformed_with_checkpoint(replay, key, namespace, options, limits, &Ok,
+        "uncalibrated_positive_candidate_weight_over_two_completed_labels; full_vocabulary_scored_eos", checkpoint)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn evaluate_transformed_with_checkpoint<E>(replay: &NativeReplay, key: &CommitmentKey, namespace: &str,
+    options: EvalOptions, limits: Limits, transform: &impl Fn(f64) -> Result<f64, CalibrationError>,
+    score_semantics: &str, checkpoint: &mut impl FnMut() -> Result<(), E>) -> Result<Evaluation, E>
+where E: From<AssayError> + From<CalibrationError> {
     validate_scope(namespace, None)?; options.validate(limits)?; replay.sizes.validate(limits)?;
     checkpoint()?;
     let bindings = bindings(replay, key, namespace, checkpoint)?;
     let partition = replay.partition(checkpoint)?;
-    let measurement = super::super::measure_partition_with_checkpoint(&partition, options, limits, Ok, checkpoint)?;
+    let measurement = super::super::measure_partition_with_checkpoint(&partition, options, limits, transform, checkpoint)?;
     let classification = match &measurement {
         Measurement::Measured { .. } => Some(classification(replay, checkpoint)?),
         Measurement::InsufficientData { .. } => None,
@@ -151,7 +163,7 @@ where E: From<AssayError> + From<CalibrationError> {
     checkpoint()?;
     let body = EvaluationBody { schema_version: ASSAY_SCHEMA_VERSION, task: NATIVE_TASK.to_owned(),
         evidence: NATIVE_EVIDENCE.to_owned(), activation_authority: false, receipt_grade: ReceiptGrade::AuditOnly,
-        score_semantics: "uncalibrated_positive_candidate_weight_over_two_completed_labels; full_vocabulary_scored_eos".to_owned(),
+        score_semantics: score_semantics.to_owned(),
         classification_semantics: "native_sequence_score_argmax_then_lexical_label_id; task_policy_abstention; accuracy_correct_over_all_rows".to_owned(),
         bindings, options, measurement, classification, executed_rows: replay.rows.len(), group_width: replay.group_width,
         model_work: replay.model_work, rewound_positions: replay.rewound_positions };
@@ -173,6 +185,18 @@ pub(crate) fn compare_with_checkpoint<E>(candidate: &NativeReplay, baseline: &Na
     key: &CommitmentKey, namespace: &str, host_scope: &str, gates: Gates, options: EvalOptions,
     limits: Limits, checkpoint: &mut impl FnMut() -> Result<(), E>) -> Result<QualificationReport, E>
 where E: From<AssayError> + From<CalibrationError> {
+    let raw = "uncalibrated_positive_candidate_weight_over_two_completed_labels; full_vocabulary_scored_eos";
+    compare_transformed_with_checkpoint(candidate, baseline, key, namespace, host_scope, gates, options, limits,
+        &Ok, &Ok, raw, raw, checkpoint)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn compare_transformed_with_checkpoint<E>(candidate: &NativeReplay, baseline: &NativeReplay,
+    key: &CommitmentKey, namespace: &str, host_scope: &str, gates: Gates, options: EvalOptions,
+    limits: Limits, candidate_transform: &impl Fn(f64) -> Result<f64, CalibrationError>,
+    baseline_transform: &impl Fn(f64) -> Result<f64, CalibrationError>, candidate_semantics: &str,
+    baseline_semantics: &str, checkpoint: &mut impl FnMut() -> Result<(), E>) -> Result<QualificationReport, E>
+where E: From<AssayError> + From<CalibrationError> {
     validate_scope(namespace, Some(host_scope))?; gates.validate(limits)?; options.validate(limits)?;
     candidate.sizes.validate(limits)?; baseline.sizes.validate(limits)?;
     validate_pair(candidate, baseline, checkpoint)?;
@@ -187,13 +211,15 @@ where E: From<AssayError> + From<CalibrationError> {
         declared_host_scope: host_scope, gates: &gates, options };
     let policy_commitment = commit(key, namespace, "native_binary_qualification_policy_v1", &policy, limits)?;
     checkpoint()?;
-    let current = evaluate_with_checkpoint(candidate, key, namespace, options, limits, checkpoint)?;
-    let prior = evaluate_with_checkpoint(baseline, key, namespace, options, limits, checkpoint)?;
+    let current = evaluate_transformed_with_checkpoint(candidate, key, namespace, options, limits,
+        candidate_transform, candidate_semantics, checkpoint)?;
+    let prior = evaluate_transformed_with_checkpoint(baseline, key, namespace, options, limits,
+        baseline_transform, baseline_semantics, checkpoint)?;
     let decision = match (&current.body.measurement, &prior.body.measurement) {
         (Measurement::Measured { metrics: a }, Measurement::Measured { metrics: b }) => {
             let a_class = current.body.classification.as_ref().ok_or(AssayError::Qualification)?;
             let b_class = prior.body.classification.as_ref().ok_or(AssayError::Qualification)?;
-            let paired = paired_summary(candidate, baseline, count, checkpoint)?;
+            let paired = paired_summary(candidate, baseline, count, candidate_transform, baseline_transform, checkpoint)?;
             let reliability = &gates.reliability;
             let comparisons = vec![
                 upper("brier_increase", Some(paired.mean_brier_change), reliability.max_brier_increase),
@@ -224,23 +250,10 @@ where E: From<AssayError> + From<CalibrationError> {
     super::super::render(&result, limits)?; checkpoint()?; Ok(result)
 }
 
-fn bindings<E>(replay: &NativeReplay, key: &CommitmentKey, namespace: &str,
+pub(super) fn bindings<E>(replay: &NativeReplay, key: &CommitmentKey, namespace: &str,
     checkpoint: &mut impl FnMut() -> Result<(), E>) -> Result<Bindings, E>
 where E: From<AssayError> {
-    checkpoint()?;
-    let suite = crate::canonjson::canonical_bytes(&replay.manifest).map_err(|_| AssayError::Commitment)?;
-    let suite = key.commit(CommitmentDomain::Configuration, namespace, "native_binary_suite_v1", &suite)
-        .map_err(|_| AssayError::Commitment)?;
-    let mut split = |name: &str, ids: &[String]| -> Result<ContentCommitment, E> {
-        checkpoint()?;
-        let bytes = crate::canonjson::canonical_bytes(ids).map_err(|_| AssayError::Commitment)?;
-        Ok(key.commit(CommitmentDomain::Configuration, namespace, name, &bytes).map_err(|_| AssayError::Commitment)?)
-    };
-    let splits = SplitBindings {
-        development: split("native_development_ids_v1", &replay.manifest.splits.development)?,
-        calibration: split("native_calibration_ids_v1", &replay.manifest.splits.calibration)?,
-        locked_test: split("native_locked_test_ids_v1", &replay.manifest.splits.locked_test)?,
-    };
+    let (suite, input, splits) = source_bindings(&replay.manifest, replay.input_digest, key, namespace, checkpoint)?;
     let id = &replay.first_identity;
     let metadata = DatasetMetadata { dataset_id: replay.manifest.dataset_id.clone(),
         dataset_version: replay.manifest.dataset_version.clone(), named_population: replay.manifest.named_population.clone(),
@@ -248,8 +261,6 @@ where E: From<AssayError> {
         task_spec: id.task_spec.clone(), model_recipe_id: id.quant_recipe.clone(),
         prompt_template_sha256: id.template_digest, numerics_profile: id.numerics_profile.label(),
         thinking_mode: "disabled".to_owned() };
-    let input = key.commit(CommitmentDomain::Input, namespace, "native_source_ndjson_sha256_hex_v1",
-        replay.input_digest.to_hex().as_bytes()).map_err(|_| AssayError::Commitment)?;
     // Commit the binary digest of the specified framed full-identity sequence.
     // Never publish that raw digest or call it one synthetic ExecutionIdentity.
     let execution_collection = key.commit(CommitmentDomain::ExecutionIdentity, namespace,
@@ -261,6 +272,29 @@ where E: From<AssayError> {
         execution_collection_format: EXECUTION_COLLECTION_FORMAT.to_owned(), execution_collection_rows: replay.rows.len(),
         observation_collection, observation_collection_format: OBSERVATION_COLLECTION_FORMAT.to_owned(),
         observation_collection_rows: replay.rows.len() })
+}
+
+pub(super) fn source_bindings<E>(manifest: &SuiteManifest, input_digest: crate::execution_identity::Sha256Digest,
+    key: &CommitmentKey, namespace: &str, checkpoint: &mut impl FnMut() -> Result<(), E>)
+    -> Result<(ContentCommitment, ContentCommitment, SplitBindings), E>
+where E: From<AssayError> {
+    checkpoint()?;
+    let suite = crate::canonjson::canonical_bytes(manifest).map_err(|_| AssayError::Commitment)?;
+    let suite = key.commit(CommitmentDomain::Configuration, namespace, "native_binary_suite_v1", &suite)
+        .map_err(|_| AssayError::Commitment)?;
+    let mut split = |name: &str, ids: &[String]| -> Result<ContentCommitment, E> {
+        checkpoint()?;
+        let bytes = crate::canonjson::canonical_bytes(ids).map_err(|_| AssayError::Commitment)?;
+        Ok(key.commit(CommitmentDomain::Configuration, namespace, name, &bytes).map_err(|_| AssayError::Commitment)?)
+    };
+    let splits = SplitBindings {
+        development: split("native_development_ids_v1", &manifest.splits.development)?,
+        calibration: split("native_calibration_ids_v1", &manifest.splits.calibration)?,
+        locked_test: split("native_locked_test_ids_v1", &manifest.splits.locked_test)?,
+    };
+    let input = key.commit(CommitmentDomain::Input, namespace, "native_source_ndjson_sha256_hex_v1",
+        input_digest.to_hex().as_bytes()).map_err(|_| AssayError::Commitment)?;
+    checkpoint()?; Ok((suite, input, splits))
 }
 
 fn classification<E>(replay: &NativeReplay, checkpoint: &mut impl FnMut() -> Result<(), E>)
@@ -290,7 +324,7 @@ fn class_metrics(tp: usize, fp: usize, missed: usize) -> ClassMetrics {
 }
 fn ratio(a: usize, b: usize) -> Option<f64> { (b != 0).then(|| a as f64 / b as f64) }
 
-fn validate_pair<E>(a: &NativeReplay, b: &NativeReplay, checkpoint: &mut impl FnMut() -> Result<(), E>)
+pub(super) fn validate_pair<E>(a: &NativeReplay, b: &NativeReplay, checkpoint: &mut impl FnMut() -> Result<(), E>)
     -> Result<(), E> where E: From<AssayError> {
     if a.manifest_digest != b.manifest_digest || a.input_digest != b.input_digest
         || a.compatible_executions != b.compatible_executions || a.rows.len() != b.rows.len() {
@@ -305,14 +339,18 @@ fn validate_pair<E>(a: &NativeReplay, b: &NativeReplay, checkpoint: &mut impl Fn
     checkpoint()?; Ok(())
 }
 fn paired_summary<E>(a: &NativeReplay, b: &NativeReplay, count: usize,
-    checkpoint: &mut impl FnMut() -> Result<(), E>) -> Result<PairedSummary, E> {
+    candidate_transform: &impl Fn(f64) -> Result<f64, CalibrationError>,
+    baseline_transform: &impl Fn(f64) -> Result<f64, CalibrationError>,
+    checkpoint: &mut impl FnMut() -> Result<(), E>) -> Result<PairedSummary, E>
+where E: From<CalibrationError> {
     let mut summary = PairedSummary { rows: count, mean_brier_change: 0.0,
         candidate_better: 0, candidate_worse: 0, equal: 0 };
     for (index, (a, b)) in a.rows.iter().zip(&b.rows).enumerate() {
         if index % 64 == 0 { checkpoint()?; }
         if a.split != Split::LockedTest { continue; }
         let truth = if a.positive { 1.0 } else { 0.0 };
-        let candidate_error = a.probability - truth; let baseline_error = b.probability - truth;
+        let candidate_error = candidate_transform(a.probability)? - truth;
+        let baseline_error = baseline_transform(b.probability)? - truth;
         let change = candidate_error * candidate_error - baseline_error * baseline_error;
         summary.mean_brier_change += change;
         if change < 0.0 { summary.candidate_better += 1; }

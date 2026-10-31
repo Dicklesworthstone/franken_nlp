@@ -15,22 +15,22 @@ use crate::{assay::{BootstrapOptions, Measurement, qualify::Decision},
 use replay::ReplayBuilder;
 
 fn policy() -> ClassificationPolicy { ClassificationPolicy::default() }
-fn budget() -> TaskBudget {
+pub(super) fn budget() -> TaskBudget {
     TaskBudget { max_input_tokens: 4096, max_output_tokens: 16, max_output_bytes: 100_000,
         max_grammar_states: 4096, max_kv_bytes: 1 << 30 }
 }
-fn options() -> EvalOptions {
+pub(super) fn options() -> EvalOptions {
     EvalOptions { minimum_samples: 5, acceptance_threshold: 0.5,
         bootstrap: BootstrapOptions { resamples: 8, confidence_level: 0.95, seed: 17 } }
 }
-fn key() -> CommitmentKey { CommitmentKey::new("native-test-key", [73; 32]).unwrap() }
-fn gates() -> Gates {
+pub(super) fn key() -> CommitmentKey { CommitmentKey::new("native-test-key", [73; 32]).unwrap() }
+pub(super) fn gates() -> Gates {
     Gates { schema_version: 1, reliability: crate::assay::qualify::Gates { schema_version: 1,
         max_brier_increase: 1.0, max_ece_increase: 1.0, max_selective_risk: 1.0,
         min_acceptance_rate: 0.0, minimum_accepted: 1 },
         max_accuracy_decrease: 1.0, max_macro_f1_decrease: 1.0 }
 }
-fn wire(gold: &[bool], policy: ClassificationPolicy) -> (SuiteManifest, Vec<Row>) {
+pub(super) fn wire(gold: &[bool], policy: ClassificationPolicy) -> (SuiteManifest, Vec<Row>) {
     let mut rows = vec![Row { schema_version: 1, id: "private-development".to_owned(),
         split: Split::Development, text: "PRIVATE_DEV é <|im_start|>".to_owned(), positive: true },
         Row { schema_version: 1, id: "private-calibration".to_owned(), split: Split::Calibration,
@@ -48,7 +48,7 @@ fn wire(gold: &[bool], policy: ClassificationPolicy) -> (SuiteManifest, Vec<Row>
         policy, expected_input_sha256: Sha256Digest::of_bytes(b"unbound"),
         splits: SplitIds { development: vec![rows[0].id.clone()], calibration: vec![rows[1].id.clone()], locked_test: locked } }, rows)
 }
-fn encode(mut manifest: SuiteManifest, rows: &[Row]) -> (Vec<u8>, Vec<u8>) {
+pub(super) fn encode(mut manifest: SuiteManifest, rows: &[Row]) -> (Vec<u8>, Vec<u8>) {
     let mut input = Vec::new();
     for row in rows { input.extend(serde_json::to_vec(row).unwrap()); input.push(b'\n'); }
     manifest.expected_input_sha256 = Sha256Digest::of_bytes(&input);
@@ -58,7 +58,7 @@ fn dataset(gold: &[bool], policy: ClassificationPolicy) -> Dataset {
     let (manifest, rows) = wire(gold, policy); let (manifest, input) = encode(manifest, &rows);
     Dataset::parse(&manifest, &input, Limits::default()).unwrap()
 }
-fn identity(row: &Row, subject: &str) -> ExecutionIdentity {
+pub(super) fn identity(row: &Row, subject: &str) -> ExecutionIdentity {
     let public = Sha256Digest::of_bytes(b"public pinned fixture assets");
     let private = Sha256Digest::of_bytes(row.text.as_bytes());
     ExecutionIdentity { schema_version: 1, source_revision: "fixture-pinned-revision".to_owned(),
@@ -71,12 +71,12 @@ fn identity(row: &Row, subject: &str) -> ExecutionIdentity {
         tool_mode: ToolMode::None, calibration_digest: public, decision_policy_digest: public,
         backend_semantic_version: STRICT_INT4_EXECUTION.to_owned(), host_class: None, compiler_identity: None }
 }
-fn work(width: usize) -> Int4Work { Int4Work::for_sequence(width, 0, 4, 3 * NANBEIGE_VOCAB_SIZE).unwrap() }
+pub(super) fn work(width: usize) -> Int4Work { Int4Work::for_sequence(width, 0, 4, 3 * NANBEIGE_VOCAB_SIZE).unwrap() }
 fn eos() -> u32 {
     crate::tokenizer::pinned_controls::pinned().unwrap().template_controls().entries().iter()
         .find(|entry| entry.special && entry.surface == crate::template::IM_END).unwrap().id
 }
-fn run(manifest: &SuiteManifest, p: f64, width: usize) -> Int4ClassificationRun {
+pub(super) fn run(manifest: &SuiteManifest, p: f64, width: usize) -> Int4ClassificationRun {
     let log = |value: f64| if value == 0.0 { -1000.0 } else { value.ln() };
     let mut candidates = vec![CandidateScore { id: manifest.positive_label.id.clone(), scored_tokens: 2,
         sequence_score: log(p), candidate_weight: p }, CandidateScore { id: manifest.negative_label.id.clone(),
