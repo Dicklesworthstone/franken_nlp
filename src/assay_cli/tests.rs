@@ -1,9 +1,12 @@
 use super::*;
 
-fn command(args: &[&str]) -> AssayCommand {
+fn command(args: &[&str]) -> ScoredCommand {
     let definition = definitions().into_iter().find(|c| c.get_name() == args[0]).unwrap();
     let matches = definition.try_get_matches_from(args).unwrap();
-    AssayCommand::from_matches(args[0], &matches).unwrap()
+    match AssayCommand::from_matches(args[0], &matches).unwrap() {
+        AssayCommand::Scored(command) => command,
+        AssayCommand::Native(_) => panic!("supplied-observation fixture selected a native backend"),
+    }
 }
 struct NoRead;
 impl Read for NoRead {
@@ -50,7 +53,7 @@ fn a_backend_and_protected_key_are_mandatory_and_no_secret_value_option_exists()
     }
 }
 
-fn minimal_eval(flags: &[&str]) -> AssayCommand {
+fn minimal_eval(flags: &[&str]) -> ScoredCommand {
     let mut args = vec!["eval", "scored", "--suite", "absent-suite", "--key-file", "absent-key",
         "--key-id", "fixture-key", "--namespace", "fixture-suite"];
     args.extend_from_slice(flags); command(&args)
@@ -67,7 +70,7 @@ fn invalid_limits_statistics_and_apply_context_refuse_before_input_or_key_reads(
         assert!(!String::from_utf8(errors).unwrap().contains("absent-"));
     }
     let mut options = minimal_eval(&[]);
-    let AssayCommand::Eval(ref mut eval) = options else { unreachable!() };
+    let ScoredCommand::Eval(ref mut eval) = options else { unreachable!() };
     eval.as_of = Some("2026-01-01".to_owned());
     assert_eq!(options.run(&mut NoRead, &mut NoWrite, &mut Vec::new()), ErrorCode::Usage.as_process_exit());
 }
@@ -79,7 +82,7 @@ fn paired_comparison_requires_baseline_files_and_an_explicit_safe_host_scope() {
             "--key-file", "absent-key", "--key-id", "fixture-key", "--namespace", "fixture-suite",
             "--baseline-suite", "absent-baseline-suite", "--baseline-observations", "absent-baseline",
             "--gates", "absent-gates", "--host-scope", "declared-workstation"]);
-        let AssayCommand::Qualify(ref mut comparison) = options else { unreachable!() };
+        let ScoredCommand::Qualify(ref mut comparison) = options else { unreachable!() };
         match invalid {
             0 => comparison.baseline_suite = None,
             1 => comparison.baseline_observations = Some(PathBuf::from("-")),

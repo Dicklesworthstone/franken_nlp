@@ -1,4 +1,4 @@
-//! Explicit supplied-observation Assay commands. No model is loaded or activated.
+//! Explicit supplied-observation and native-model Assay commands.
 //! Complete bounded reports use a separate protocol from the frozen robot schema.
 use std::{io::{Read, Write}, path::{Path, PathBuf}, process::ExitCode};
 use clap::{Args, ArgMatches, FromArgMatches};
@@ -8,6 +8,7 @@ use crate::{assay::{self, AssayError, BootstrapOptions, Dataset, EvalOptions, Li
     execution_identity::Sha256Digest, local_io::{self, Destination}, receipt::CommitmentKey};
 
 mod schema;
+mod native;
 #[cfg(test)] mod tests;
 
 const PROTOCOL: &str = "fnlp.assay.scored";
@@ -127,7 +128,8 @@ pub(crate) struct Qualify {
     host_scope: Option<String>,
 }
 
-pub(crate) enum AssayCommand { Eval(Eval), Calibrate(Calibrate), Qualify(Qualify) }
+pub(crate) enum AssayCommand { Scored(ScoredCommand), Native(native::Command) }
+pub(crate) enum ScoredCommand { Eval(Eval), Calibrate(Calibrate), Qualify(Qualify) }
 
 pub(crate) fn definitions() -> Vec<clap::Command> {
     [("eval", "Evaluate explicitly supplied binary-event observations; no model replay or activation",
@@ -136,13 +138,40 @@ pub(crate) fn definitions() -> Vec<clap::Command> {
         Calibrate::augment_args(clap::Command::new("scored"))),
      ("qualify", "Compare paired supplied observations under explicit local gates; no activation authority",
         Qualify::augment_args(clap::Command::new("scored")))]
-        .into_iter().map(|(name, about, scored)| clap::Command::new(name).about(about)
-            .subcommand_required(true).subcommand(scored.about(about).after_help(
-                "All output is one complete canonical JSON report under fnlp.assay.scored v1. Scores and human labels are supplied by the caller; this command does not run a model or grant activation authority. Use --schema for the strict wire contract."))).collect()
+        .into_iter().map(|(name, about, scored)| {
+            let command = clap::Command::new(name).about(about).subcommand_required(true)
+                .subcommand(scored.about(about).after_help(
+                    "All output is one complete canonical JSON report under fnlp.assay.scored v1. Scores and human labels are supplied by the caller; this command does not run a model or grant activation authority. Use --schema for the strict wire contract."));
+            match name {
+                "eval" => command.about("Evaluate supplied observations or replay pinned native INT4 classification")
+                    .subcommand(native::definition(false)),
+                "qualify" => command.about("Compare paired supplied observations or native INT4 models under explicit local gates")
+                    .subcommand(native::definition(true)),
+                _ => command,
+            }
+        }).collect()
 }
 
 impl AssayCommand {
     pub(crate) fn recognizes(name: &str) -> bool { matches!(name, "eval" | "calibrate" | "qualify") }
+    pub(crate) fn from_matches(name: &str, matches: &ArgMatches) -> Result<Self, clap::Error> {
+        match matches.subcommand() {
+            Some(("native-int4", matches)) if matches!(name, "eval" | "qualify") =>
+                native::Command::from_matches(name == "qualify", matches).map(Self::Native),
+            Some(("scored", _)) => ScoredCommand::from_matches(name, matches).map(Self::Scored),
+            _ => Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand,
+                "an explicit supported Assay backend is required")),
+        }
+    }
+    pub(crate) fn run(self, input: &mut impl Read, output: &mut impl Write, errors: &mut impl Write) -> ExitCode {
+        match self {
+            Self::Scored(command) => command.run(input, output, errors),
+            Self::Native(command) => command.run(input, output, errors),
+        }
+    }
+}
+
+impl ScoredCommand {
     pub(crate) fn from_matches(name: &str, matches: &ArgMatches) -> Result<Self, clap::Error> {
         let Some(("scored", matches)) = matches.subcommand() else {
             return Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "explicit scored backend required"));
