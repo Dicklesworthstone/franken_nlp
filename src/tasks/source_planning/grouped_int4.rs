@@ -11,7 +11,7 @@ use crate::{
     native_engine::{
         constrained_int4::{self, Int4JsonBudget, Int4JsonError},
         decode::DecodeCancellationKind,
-        strict_int4::{Int4Work, StrictInt4Engine, STRICT_INT4_PROFILE},
+        strict_int4::{Int4Work, StrictInt4Engine, STRICT_INT4_PROFILE, prefill::Int4PrefillLimits},
     },
     tasks::{
         answer::{Int4AnswerFinalizer, ANSWER_TASK_VERSION},
@@ -190,6 +190,19 @@ impl PreparedInt4SourceTask {
         control: &mut C) -> Result<Int4SourceTaskRun, Int4SourceError> {
         checkpoint(control)?;
         self.extraction.execute_with(engine, admitted, vocabulary, work, control, |raw| self.finish(raw))
+    }
+
+    /// Layer-major prompt execution preserves the sealed task and independent
+    /// source finalizer inside the same exclusive native session. The caller
+    /// owns the full declared extra scratch before invoking this opt-in path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_layer_major_with_control<C: DecodeStepControl>(&self, admitted: &ExecutionIdentity,
+        engine: &mut StrictInt4Engine<'_>, vocabulary: &ExtractionVocabulary, work: Int4JsonBudget,
+        prefill: Int4PrefillLimits, control: &mut C) -> Result<Int4SourceTaskRun, Int4SourceError> {
+        prefill.validate().map_err(Int4JsonError::from)?;
+        checkpoint(control)?;
+        self.extraction.execute_layer_major_with(engine, admitted, vocabulary, work, prefill,
+            control, |raw| self.finish(raw))
     }
 
     fn finish(&self, raw: Int4ExtractRun) -> Result<Int4SourceTaskRun, Int4SourceError> {

@@ -21,11 +21,12 @@ use super::{
     portable_int8::LinearRows,
     rope::DEFAULT_ADMITTED_CONTEXT_CAP,
     strict_int4::{Int4ModelIdentity, Int4RunBudget, Int4Session, Int4Work,
-        StrictInt4Engine, StrictInt4Error, STRICT_INT4_PROFILE},
+        StrictInt4Engine, StrictInt4Error, STRICT_INT4_PROFILE, prefill::Int4PrefillLimits},
 };
 
 pub const INT4_JSON_EXECUTION: &str = "grouped-int4-constrained-json-final-prefill-head-v1";
 pub mod cohort;
+mod prefill;
 
 /// Group dots, MACs and attention pairs are additional to JSON/mask work.
 /// The KV ceiling prices the engine's complete resident capacity.
@@ -101,6 +102,19 @@ pub fn decode_json_int4<C: DecodeStepControl>(
     decode_json_int4_with(engine, identity, prompt, program, vocabulary, options, budget, control, Ok)
 }
 
+/// Execute the prompt in bounded causal layer-major morsels, then use the
+/// original constrained decoder and final-prefill head. The caller separately
+/// admits the declared additional scratch; task work and KV are unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_json_int4_layer_major<C: DecodeStepControl>(
+    engine: &mut StrictInt4Engine<'_>, identity: &ExecutionIdentity, prompt: &[u32],
+    program: &JsonProgram, vocabulary: &VocabMaskOracle, options: &JsonDecodeOptions,
+    budget: Int4JsonBudget, prefill: Int4PrefillLimits, control: &mut C,
+) -> Result<Int4JsonRun, Int4JsonError> {
+    decode_json_int4_layer_major_with(engine, identity, prompt, program, vocabulary, options,
+        budget, prefill, control, Ok)
+}
+
 /// Task-specific evidence and envelope validation execute while the same
 /// exclusive session owns KV. Any failure aborts it; Drop clears every slot
 /// on success, error and unwind before the host can release its reservations.
@@ -111,10 +125,37 @@ pub(crate) fn decode_json_int4_with<C, T, E, F>(
     budget: Int4JsonBudget, control: &mut C, finalize: F,
 ) -> Result<T, E>
 where C: DecodeStepControl, E: From<Int4JsonError>, F: FnOnce(Int4JsonRun) -> Result<T, E> {
+    decode_json_int4_scheduled(engine, identity, prompt, program, vocabulary, options,
+        budget, None, control, finalize)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_json_int4_layer_major_with<C, T, E, F>(
+    engine: &mut StrictInt4Engine<'_>, identity: &ExecutionIdentity, prompt: &[u32],
+    program: &JsonProgram, vocabulary: &VocabMaskOracle, options: &JsonDecodeOptions,
+    budget: Int4JsonBudget, prefill: Int4PrefillLimits, control: &mut C, finalize: F,
+) -> Result<T, E>
+where C: DecodeStepControl, E: From<Int4JsonError>, F: FnOnce(Int4JsonRun) -> Result<T, E> {
+    decode_json_int4_scheduled(engine, identity, prompt, program, vocabulary, options,
+        budget, Some(prefill), control, finalize)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_json_int4_scheduled<C, T, E, F>(
+    engine: &mut StrictInt4Engine<'_>, identity: &ExecutionIdentity, prompt: &[u32],
+    program: &JsonProgram, vocabulary: &VocabMaskOracle, options: &JsonDecodeOptions,
+    budget: Int4JsonBudget, prefill: Option<Int4PrefillLimits>, control: &mut C, finalize: F,
+) -> Result<T, E>
+where C: DecodeStepControl, E: From<Int4JsonError>, F: FnOnce(Int4JsonRun) -> Result<T, E> {
+    if let Some(limits) = prefill { limits.validate().map_err(Int4JsonError::from).map_err(E::from)?; }
     check_request(engine, identity, prompt, vocabulary, options, budget).map_err(E::from)?;
     let group_width = engine.model_identity().group_width();
     let mut session = engine.session(budget.native, control).map_err(Int4JsonError::from).map_err(E::from)?;
-    drive(group_width, prompt, program, vocabulary, options, budget, &mut session, finalize)
+    match prefill {
+        Some(limits) => prefill::drive_layer_major(group_width, prompt, program, vocabulary,
+            options, budget, &mut session, limits, finalize),
+        None => drive(group_width, prompt, program, vocabulary, options, budget, &mut session, finalize),
+    }
 }
 
 fn check_request(engine: &StrictInt4Engine<'_>, identity: &ExecutionIdentity, prompt: &[u32],
@@ -181,6 +222,15 @@ trait Driver {
     type Control: DecodeStepControl;
     fn control(&mut self) -> &mut Self::Control;
     fn append(&mut self, token: u32) -> Result<(), Int4JsonError>;
+    fn append_prompt(&mut self, prompt: &[u32]) -> Result<(), Int4JsonError> {
+        for (index, &token) in prompt.iter().enumerate() {
+            if let Some(cause) = self.control().prefill_checkpoint(index) {
+                return Err(JsonDecodeError::Cancelled(cause).into());
+            }
+            self.append(token)?;
+        }
+        Ok(())
+    }
     fn logits(&mut self) -> Result<Vec<f32>, Int4JsonError>;
     fn work(&self) -> Int4Work;
     fn abort(&mut self);
@@ -256,12 +306,7 @@ fn run<V: Vocabulary, D: Driver>(group_width: usize, prompt: &[u32], program: &J
     tokens.try_reserve_exact(options.max_new_tokens).map_err(|_| JsonDecodeError::AllocationRefused)?;
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(program.max_output_bytes()).map_err(|_| JsonDecodeError::AllocationRefused)?;
-    for (index, &token) in prompt.iter().enumerate() {
-        if let Some(cause) = driver.control().prefill_checkpoint(index) {
-            return Err(JsonDecodeError::Cancelled(cause).into());
-        }
-        driver.append(token)?;
-    }
+    driver.append_prompt(prompt)?;
     let mut logits = driver.logits()?;
     checked_logits(&logits, vocabulary.width())?;
     let mut positions = prompt.len() as u64;

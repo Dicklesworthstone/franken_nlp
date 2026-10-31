@@ -8,7 +8,7 @@
 use super::*;
 use crate::native_engine::{
     constrained_int4::{self, INT4_JSON_EXECUTION, Int4JsonBudget, Int4JsonError, Int4JsonRun},
-    strict_int4::{Int4Work, StrictInt4Engine, STRICT_INT4_PROFILE},
+    strict_int4::{Int4Work, StrictInt4Engine, STRICT_INT4_PROFILE, prefill::Int4PrefillLimits},
 };
 
 pub const INT4_EXTRACT_VERSION: &str = "grouped-int4-schema-source-extraction-v1";
@@ -188,15 +188,44 @@ impl Int4ExtractPlan {
         self.execute_with(engine, admitted, vocabulary, budget, control, Ok)
     }
 
+    /// Opt into bounded causal layer-major prompt execution with the original
+    /// exact schema/source finalizer and unchanged result/identity contract.
+    /// Additional prefill scratch must be separately admitted by the caller.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_layer_major<C: DecodeStepControl>(&self, engine: &mut StrictInt4Engine<'_>,
+        admitted: &ExecutionIdentity, vocabulary: &ExtractionVocabulary, budget: Int4JsonBudget,
+        prefill: Int4PrefillLimits, control: &mut C) -> Result<Int4ExtractRun, Int4ExtractError> {
+        self.execute_layer_major_with(engine, admitted, vocabulary, budget, prefill, control, Ok)
+    }
+
     /// Compose only shipped task finalizers inside the exclusive native
     /// session. A semantic/output refusal and late cancellation still abort
     /// and drain every KV slot before host reservations can be released.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn execute_with<C, T, E, F>(&self, engine: &mut StrictInt4Engine<'_>,
-        admitted: &ExecutionIdentity, vocabulary: &ExtractionVocabulary, mut budget: Int4JsonBudget,
+        admitted: &ExecutionIdentity, vocabulary: &ExtractionVocabulary, budget: Int4JsonBudget,
         control: &mut C, finalize: F) -> Result<T, E>
     where C: DecodeStepControl, E: From<Int4ExtractError> + From<Int4JsonError>,
         F: FnOnce(Int4ExtractRun) -> Result<T, E> {
+        self.execute_scheduled(engine, admitted, vocabulary, budget, None, control, finalize)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_layer_major_with<C, T, E, F>(&self, engine: &mut StrictInt4Engine<'_>,
+        admitted: &ExecutionIdentity, vocabulary: &ExtractionVocabulary, budget: Int4JsonBudget,
+        prefill: Int4PrefillLimits, control: &mut C, finalize: F) -> Result<T, E>
+    where C: DecodeStepControl, E: From<Int4ExtractError> + From<Int4JsonError>,
+        F: FnOnce(Int4ExtractRun) -> Result<T, E> {
+        self.execute_scheduled(engine, admitted, vocabulary, budget, Some(prefill), control, finalize)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_scheduled<C, T, E, F>(&self, engine: &mut StrictInt4Engine<'_>,
+        admitted: &ExecutionIdentity, vocabulary: &ExtractionVocabulary, mut budget: Int4JsonBudget,
+        prefill: Option<Int4PrefillLimits>, control: &mut C, finalize: F) -> Result<T, E>
+    where C: DecodeStepControl, E: From<Int4ExtractError> + From<Int4JsonError>,
+        F: FnOnce(Int4ExtractRun) -> Result<T, E> {
+        if let Some(limits) = prefill { limits.validate().map_err(Int4JsonError::from).map_err(E::from)?; }
         self.verify_identity(admitted).map_err(E::from)?;
         if vocabulary.controls != self.extraction.controls {
             return Err(E::from(Int4ExtractError::from(ExtractError::Contract(
@@ -205,9 +234,13 @@ impl Int4ExtractPlan {
         budget.json.max_kv_bytes = budget.json.max_kv_bytes.min(self.extraction.max_kv_bytes);
         // The native session owns cleanup and remains live throughout source
         // validation, complete-result accounting and the final checkpoint.
-        constrained_int4::decode_json_int4_with(engine, admitted, &self.extraction.prompt,
-            &self.extraction.program, &vocabulary.oracle, &self.extraction.options, budget,
-            control, |run| finalize(self.finalize(run).map_err(E::from)?))
+        let finish = |run| finalize(self.finalize(run).map_err(E::from)?);
+        match prefill {
+            Some(limits) => constrained_int4::decode_json_int4_layer_major_with(engine, admitted, &self.extraction.prompt,
+                &self.extraction.program, &vocabulary.oracle, &self.extraction.options, budget, limits, control, finish),
+            None => constrained_int4::decode_json_int4_with(engine, admitted, &self.extraction.prompt,
+                &self.extraction.program, &vocabulary.oracle, &self.extraction.options, budget, control, finish),
+        }
     }
 
     fn finalize(&self, run: Int4JsonRun) -> Result<Int4ExtractRun, Int4ExtractError> {

@@ -8,6 +8,7 @@ use crate::{
     native_engine::{portable_int8::int4::convert::GROUPED_INT4_RECIPE,
         quant_algebra::MAX_MODEL_K, strict_int4::STRICT_INT4_EXECUTION},
 };
+mod prefill;
 
 const GROUP: usize = 127;
 struct Table(Vec<Vec<u8>>);
@@ -37,11 +38,13 @@ impl DecodeStepControl for Control {
 struct Script {
     control: Control, row: Vec<f32>, seen: Vec<u32>, heads: usize,
     group: usize, aborted: bool, fail_append: bool, corrupt_work: bool,
+    prompt_calls: usize, prompt_morsels: Vec<usize>,
 }
 impl Script {
     fn new(row: Vec<f32>) -> Self {
         Self { row, control: Control::default(), seen: Vec::new(), heads: 0,
-            group: GROUP, aborted: false, fail_append: false, corrupt_work: false }
+            group: GROUP, aborted: false, fail_append: false, corrupt_work: false,
+            prompt_calls: 0, prompt_morsels: Vec::new() }
     }
 }
 impl Driver for Script {
