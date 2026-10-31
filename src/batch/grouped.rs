@@ -57,7 +57,18 @@ pub trait GroupedBatchProcessor {
     type Output: Serialize;
     type Guard;
     fn max_group_size(&self) -> usize;
+    /// A document can own several native sequences. The transport drains the
+    /// current window before a new plan would exceed this independent ceiling.
+    /// The host reserves one bounded lookahead plan as well as the live window.
+    fn max_group_weight(&self) -> usize { self.max_group_size() }
+    fn group_weight(&self, _prepared: &Self::Prepared) -> Result<usize, BatchItemFailure> { Ok(1) }
     fn prepare(&mut self, document: BatchDocument<Self::Args>) -> Result<Self::Prepared, BatchItemFailure>;
+    /// Planning borrows the invocation's existing controller; no document or
+    /// flush renews its deadline, poll quota or cancellation authority.
+    fn prepare_with_control<C: DecodeStepControl>(&mut self, document: BatchDocument<Self::Args>,
+        _control: &mut C) -> Result<Self::Prepared, BatchItemFailure> {
+        self.prepare(document)
+    }
     fn planned_work(&self, prepared: &Self::Prepared) -> Result<BatchWork, BatchItemFailure>;
     fn execute_group<C: DecodeStepControl>(&mut self, requests: Vec<GroupedRequest<Self::Prepared>>, control: &mut C)
         -> Result<GroupedOutput<Self::Output, Self::Guard>, BatchFault>;
@@ -72,7 +83,8 @@ pub trait GroupedBatchProcessor {
 /// or cancellation aborts a not-yet-executed cohort. Fatal read/prepare/control
 /// failures discard pending work and emit run_error, not fake document results.
 /// Output failure poisons the stream: no further input, inference or writes.
-/// Up to one bounded window may already have been read when delivery fails.
+/// Up to one bounded window and one prepared lookahead document may already
+/// have been read when delivery fails. A lookahead is never executed afterward.
 /// Panics unwind owned plans/results/guards; they are not caught as doc errors.
 pub fn run_ndjson<R: BufRead, W: Write, P: GroupedBatchProcessor, C: DecodeStepControl>(
     reader: &mut R, writer: &mut W, processor: &mut P, limits: BatchLimits,
@@ -81,7 +93,7 @@ pub fn run_ndjson<R: BufRead, W: Write, P: GroupedBatchProcessor, C: DecodeStepC
     let mut summary = BatchSummary::default();
     limits.validate().map_err(|fault| BatchRunError { fault, summary })?;
     if groups.max_records == 0 || groups.max_records > MAX_GROUP_RECORDS
-        || groups.max_records > processor.max_group_size() {
+        || groups.max_records > processor.max_group_size() || processor.max_group_weight() == 0 {
         return Err(BatchRunError { fault: BatchCode::InvalidLimits.into(), summary });
     }
     let mut sink = Sink::new(writer, limits);
@@ -111,10 +123,11 @@ struct Pending<P> {
     prepared: Option<P>,
     fault: Option<BatchFault>,
     charge: Option<BatchWork>,
+    weight: usize,
 }
 impl<P> Pending<P> {
     fn rejected(context: BatchRequestContext, id: Option<String>, fault: BatchFault) -> Self {
-        Self { context, id, prepared: None, fault: Some(fault), charge: None }
+        Self { context, id, prepared: None, fault: Some(fault), charge: None, weight: 0 }
     }
 }
 
@@ -124,6 +137,7 @@ fn run<R: BufRead, W: Write, P: GroupedBatchProcessor, C: DecodeStepControl>(rea
     checkpoint(control)?;
     sink.emit(&event::<()>("run_start", *epoch, 0), false)?;
     let mut pending = reserve(groups.max_records)?;
+    let mut pending_weight = 0_usize;
     let mut seen = BTreeSet::new(); let mut id_bytes = 0;
     loop {
         let Some(frame) = read_frame(reader, limits, summary, control)? else {
@@ -136,15 +150,25 @@ fn run<R: BufRead, W: Write, P: GroupedBatchProcessor, C: DecodeStepControl>(rea
             Ok(Command::Flush) => {
                 drain(&mut pending, processor, sink, summary, control)?;
                 barrier(sink, summary, epoch, false)?;
-                seen.clear(); id_bytes = 0; continue;
+                seen.clear(); id_bytes = 0; pending_weight = 0; continue;
             }
             Ok(Command::Document(document)) => Ok(document),
             Err(fault) => Err(fault),
         };
         let context = BatchRequestContext { request_seq: summary.requests, epoch: *epoch,
             input_line: frame.line, byte_offset: frame.offset };
-        pending.push(prepare(document, context, processor, limits, control, summary, &mut seen, &mut id_bytes)?);
-        if pending.len() == groups.max_records { drain(&mut pending, processor, sink, summary, control)?; }
+        let row = prepare(document, context, processor, limits, control, summary, &mut seen, &mut id_bytes)?;
+        let next_weight = pending_weight.checked_add(row.weight).ok_or(BatchCode::Admission)?;
+        if next_weight > processor.max_group_weight() {
+            drain(&mut pending, processor, sink, summary, control)?;
+            pending_weight = 0;
+        }
+        pending_weight = pending_weight.checked_add(row.weight).ok_or(BatchCode::Admission)?;
+        pending.push(row);
+        if pending.len() == groups.max_records || pending_weight == processor.max_group_weight() {
+            drain(&mut pending, processor, sink, summary, control)?;
+            pending_weight = 0;
+        }
     }
 }
 
@@ -171,8 +195,14 @@ fn prepare<P: GroupedBatchProcessor, C: DecodeStepControl>(document: Result<Batc
         return Ok(Pending::rejected(context, Some(id), BatchCode::DocumentLimit.into()));
     }
     checkpoint(control)?;
-    let prepared = match processor.prepare(document) {
+    let prepared = match processor.prepare_with_control(document, control) {
         Ok(prepared) => prepared,
+        Err(failure) if fatal(failure) => return Err(failure.fault),
+        Err(failure) => return Ok(Pending::rejected(context, Some(id), failure.fault)),
+    };
+    let weight = match processor.group_weight(&prepared) {
+        Ok(weight) if weight > 0 && weight <= processor.max_group_weight() => weight,
+        Ok(_) => return Ok(Pending::rejected(context, Some(id), BatchCode::Admission.into())),
         Err(failure) if fatal(failure) => return Err(failure.fault),
         Err(failure) => return Ok(Pending::rejected(context, Some(id), failure.fault)),
     };
@@ -187,7 +217,7 @@ fn prepare<P: GroupedBatchProcessor, C: DecodeStepControl>(document: Result<Batc
     };
     checkpoint(control)?;
     summary.reserved_work = total;
-    Ok(Pending { context, id: Some(id), prepared: Some(prepared), fault: None, charge: Some(charge) })
+    Ok(Pending { context, id: Some(id), prepared: Some(prepared), fault: None, charge: Some(charge), weight })
 }
 
 fn drain<W: Write, P: GroupedBatchProcessor, C: DecodeStepControl>(pending: &mut Vec<Pending<P::Prepared>>,

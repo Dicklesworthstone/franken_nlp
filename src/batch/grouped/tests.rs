@@ -25,15 +25,20 @@ impl Drop for Payload {
 struct Processor {
     state: Rc<State>, fail_row: Option<u64>, fatal_row: Option<u64>, wrong_route: bool,
     huge_first: bool, cancel_after_execute: bool,
+    weight_by_length: bool, cancel_in_planning: bool,
 }
 impl Processor {
     fn new(state: Rc<State>) -> Self {
-        Self { state, fail_row: None, fatal_row: None, wrong_route: false, huge_first: false, cancel_after_execute: false }
+        Self { state, fail_row: None, fatal_row: None, wrong_route: false, huge_first: false,
+            cancel_after_execute: false, weight_by_length: false, cancel_in_planning: false }
     }
 }
 impl GroupedBatchProcessor for Processor {
     type Args = (); type Prepared = String; type Output = Payload; type Guard = Lease;
     fn max_group_size(&self) -> usize { 4 }
+    fn group_weight(&self, prepared: &String) -> Result<usize, BatchItemFailure> {
+        Ok(if self.weight_by_length { prepared.len() } else { 1 })
+    }
     fn prepare(&mut self, document: BatchDocument<()>) -> Result<String, BatchItemFailure> {
         match document.text.as_str() {
             "reject" => Err(BatchItemFailure::reject(BatchCode::Planning)),
@@ -43,6 +48,14 @@ impl GroupedBatchProcessor for Processor {
     }
     fn planned_work(&self, _: &String) -> Result<BatchWork, BatchItemFailure> {
         Ok(BatchWork { forward_positions: 1, projected_logits: 10 })
+    }
+    fn prepare_with_control<C: DecodeStepControl>(&mut self, document: BatchDocument<()>, control: &mut C)
+        -> Result<String, BatchItemFailure> {
+        if self.cancel_in_planning && document.text == "cancel-planning" {
+            self.state.cancel.set(true);
+            checkpoint(control).map_err(BatchItemFailure::fatal)?;
+        }
+        self.prepare(document)
     }
     fn execute_group<C: DecodeStepControl>(&mut self, input: Vec<GroupedRequest<String>>, _: &mut C)
         -> Result<GroupedOutput<Payload, Lease>, BatchFault> {
@@ -126,6 +139,61 @@ fn one_group_call_per_window_and_original_order_across_short_final_window() {
         assert_eq!(document_events(&output).iter().map(|e| e["request_seq"].as_u64().unwrap()).collect::<Vec<_>>(), (1..=7).collect::<Vec<_>>());
         assert_eq!(state.leases.get(), 0); assert_eq!(state.payloads.get(), 0);
     }
+}
+#[test]
+fn weighted_documents_drain_before_overflow_and_keep_each_complete_bundle_together() {
+    let state = Rc::new(State::default()); let mut processor = Processor::new(Rc::clone(&state));
+    processor.weight_by_length = true;
+    let input = format!("{}{}{}{}", record("a", "abc"), record("b", "de"), record("c", "f"), record("d", "ghij"));
+    let (summary, output) = execute(&input, &mut processor, 4, BatchLimits::default());
+    assert_eq!(*state.groups.borrow(), vec![vec![1], vec![2, 3], vec![4]]);
+    assert_eq!(summary.succeeded, 4); assert_eq!(summary.failed, 0);
+    assert_eq!(document_events(&output).iter().map(|e| e["request_seq"].as_u64().unwrap()).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+    assert_eq!(state.leases.get(), 0); assert_eq!(state.payloads.get(), 0);
+}
+#[test]
+fn impossible_document_weights_are_isolated_and_keep_duplicate_epoch_rules() {
+    let state = Rc::new(State::default()); let mut processor = Processor::new(Rc::clone(&state));
+    processor.weight_by_length = true;
+    let input = format!("{}{}{}{{\"flush\":true}}\n{}", record("a", "abcde"), record("z", ""),
+        record("a", "x"), record("a", "y"));
+    let (summary, output) = execute(&input, &mut processor, 4, BatchLimits::default());
+    assert_eq!(*state.groups.borrow(), vec![vec![5]]);
+    let docs = document_events(&output);
+    assert_eq!(docs[0]["error"]["code"], "admission");
+    assert_eq!(docs[1]["error"]["code"], "admission");
+    assert_eq!(docs[2]["error"]["code"], "duplicate_id");
+    assert_eq!(docs[3]["epoch"], 2); assert_eq!(summary.failed, 3); assert_eq!(summary.succeeded, 1);
+    assert_eq!(summary.reserved_work.forward_positions, 1);
+}
+#[test]
+fn weighted_lookahead_is_bounded_and_does_not_execute_after_a_failed_delivery() {
+    let state = Rc::new(State::default()); let mut processor = Processor::new(Rc::clone(&state));
+    processor.weight_by_length = true;
+    let prefix = format!("{}{}", record("a", "abc"), record("b", "de"));
+    let input = format!("{prefix}{}", record("c", "f"));
+    let mut reader = Cursor::new(input.as_bytes()); let mut writer = Writer::new(Rc::clone(&state));
+    writer.fail_doc_flush = true;
+    let error = run_ndjson(&mut reader, &mut writer, &mut processor, BatchLimits::default(),
+        GroupLimits { max_records: 4 }, &mut Continue).unwrap_err();
+    assert_eq!(error.fault.code, BatchCode::OutputIo); assert_eq!(reader.position(), prefix.len() as u64);
+    assert_eq!(*state.groups.borrow(), vec![vec![1]]);
+    assert_eq!(error.summary.reserved_work.forward_positions, 2);
+    assert_eq!(state.leases.get(), 0); assert_eq!(state.payloads.get(), 0);
+    assert!(!events(&writer.bytes).iter().any(|e| e["event"] == "run_error" || e["event"] == "run_complete"));
+}
+#[test]
+fn planning_uses_the_same_controller_and_cannot_execute_pending_work_after_cancellation() {
+    let state = Rc::new(State::default()); let mut processor = Processor::new(Rc::clone(&state));
+    processor.cancel_in_planning = true;
+    let input = format!("{}{}", record("a", "pending"), record("b", "cancel-planning"));
+    let mut writer = Writer::new(Rc::clone(&state));
+    let error = run_ndjson(&mut Cursor::new(input), &mut writer, &mut processor, BatchLimits::default(),
+        GroupLimits { max_records: 4 }, &mut Control(Rc::clone(&state))).unwrap_err();
+    assert_eq!(error.fault, BatchFault::cancelled(DecodeCancellationKind::Deadline));
+    assert_eq!(error.summary.reserved_work.forward_positions, 1);
+    assert!(state.groups.borrow().is_empty());
+    assert!(!events(&writer.bytes).iter().any(|e| e["event"] == "doc"));
 }
 #[test]
 fn parse_errors_keep_their_position_and_do_not_enter_the_native_group() {
