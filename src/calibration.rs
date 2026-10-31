@@ -515,18 +515,23 @@ impl IsotonicModel {
     }
 
     /// Apply the monotonic piecewise-constant fit.
+    ///
+    /// A PAV block owns its inclusive upper score: scores above the preceding
+    /// block's upper score and through this boundary use this block's mean.
+    /// Scores outside the fitted range clamp to the first or last block. This
+    /// extension preserves the fitted value at every calibration observation,
+    /// including the lower observations of a block merged by PAV.
     pub fn calibrate(&self, probability: f64) -> Result<f64, CalibrationError> {
         validate_probability("score", probability)?;
-        let mut chosen = self
+        let chosen = self
             .blocks
-            .first()
-            .expect("validated calibration split is non-empty");
-        for block in &self.blocks {
-            if probability < block.upper_score {
-                break;
-            }
-            chosen = block;
-        }
+            .iter()
+            .find(|block| probability <= block.upper_score)
+            .unwrap_or_else(|| {
+                self.blocks
+                    .last()
+                    .expect("validated calibration split is non-empty")
+            });
         Ok(chosen.calibrated_probability)
     }
 

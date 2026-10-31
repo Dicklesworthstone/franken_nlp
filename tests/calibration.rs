@@ -143,10 +143,82 @@ fn temperature_is_explicit_and_isotonic_pav_is_monotonic() {
     assert!((calibrated[1].calibrated_probability - 0.5).abs() < 1e-12);
     assert!((calibrated[2].calibrated_probability - 1.0).abs() < 1e-12);
     assert!(isotonic.calibrate(0.2).unwrap() <= isotonic.calibrate(0.8).unwrap());
+    // Both observations in the pooled [0.4, 0.6] block must receive its
+    // fitted mean, not the preceding block's value. Intermediate scores use
+    // the block with the next inclusive upper boundary; tails clamp.
+    for (input, expected) in [
+        (0.0, 0.0),
+        (0.1, 0.0),
+        (0.2, 0.5),
+        (0.4, 0.5),
+        (0.6, 0.5),
+        (0.8, 1.0),
+        (0.9, 1.0),
+        (1.0, 1.0),
+    ] {
+        assert_eq!(isotonic.calibrate(input).unwrap(), expected);
+    }
 
     let temperature = TemperatureModel::fit(partition.calibration()).unwrap();
     assert!(temperature.temperature().is_finite());
     assert!((0.0..=1.0).contains(&temperature.calibrate(0.7).unwrap()));
+}
+
+#[test]
+fn isotonic_prediction_preserves_weighted_ties_and_complete_pooled_blocks() {
+    fn fit(rows: Vec<LabeledScore>) -> IsotonicModel {
+        let membership = SplitMembership::new(
+            ["dev".to_owned()],
+            rows.iter().map(|row| row.id().to_owned()),
+            ["test".to_owned()],
+        )
+        .unwrap();
+        let partition = membership
+            .partition(
+                vec![score("dev", 0.5, true)],
+                rows,
+                vec![score("test", 0.5, false)],
+            )
+            .unwrap();
+        IsotonicModel::fit(partition.calibration())
+    }
+
+    // The three equal-score rows at 0.2 contribute weight three. Pooling
+    // their two positives with the false 0.4 row gives 2/4, not an unweighted
+    // average of the two distinct input scores. The next block has the same
+    // mean, so every member of this plateau must predict 0.5.
+    let rows = vec![
+        score("cal-1", 0.2, true),
+        score("cal-2", 0.2, true),
+        score("cal-3", 0.2, false),
+        score("cal-4", 0.4, false),
+        score("cal-5", 0.6, true),
+        score("cal-6", 0.6, false),
+        score("cal-7", 0.8, true),
+    ];
+    let model = fit(rows.clone());
+    assert_eq!(model.blocks().len(), 3);
+    for row in &rows {
+        let expected = if row.probability() == 0.8 { 1.0 } else { 0.5 };
+        assert_eq!(model.calibrate(row.probability()).unwrap(), expected);
+    }
+    let mut reversed = rows;
+    reversed.reverse();
+    assert_eq!(model, fit(reversed));
+    let mut previous = model.calibrate(0.0).unwrap();
+    for step in 1..=100 {
+        let current = model.calibrate(f64::from(step) / 100.0).unwrap();
+        assert!(current >= previous);
+        previous = current;
+    }
+    assert_eq!(model.calibrate(0.0).unwrap(), 0.5);
+    assert_eq!(model.calibrate(1.0).unwrap(), 1.0);
+
+    let single = fit(vec![score("cal-1", 0.2, true), score("cal-2", 0.8, false)]);
+    assert_eq!(single.blocks().len(), 1);
+    for input in [0.0, 0.2, 0.5, 0.8, 1.0] {
+        assert_eq!(single.calibrate(input).unwrap(), 0.5);
+    }
 }
 
 #[test]
