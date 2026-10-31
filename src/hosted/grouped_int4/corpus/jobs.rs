@@ -4,6 +4,7 @@ use super::*;
 mod source;
 mod document;
 mod extract_document;
+mod document_native;
 mod generation;
 use crate::{
     hosted::corpus::jobs::{HostedJobError, JobHostLimits, SourceJobRequest, run_population},

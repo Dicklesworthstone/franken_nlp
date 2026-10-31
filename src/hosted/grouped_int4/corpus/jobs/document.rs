@@ -1,6 +1,7 @@
 //! Complete-document INT4 pipelines inside the existing owned-job lifecycle.
 //! One original document is one durable item, including all permitted passes.
 use super::*;
+use super::document_native::DocumentNative;
 use crate::{
     grammar::mask::MaskWorkLimits,
     hosted::grouped_int4::source_map::Int4SourceMapConfig,
@@ -8,7 +9,8 @@ use crate::{
         Int4SourceDocumentAdmission, Int4SourceDocumentBatchAdmission,
         Int4SourceDocumentJobPlanner, Int4SourceDocumentJobProcessor, Int4SourceDocumentTask,
     },
-    tasks::source_planning::{SourcePlanningLimits, grouped_int4::long::Int4SourceMapLimits},
+    tasks::source_planning::{SourcePlanningLimits, grouped_int4::long::{Int4SourceMapLimits,
+        cohort::{Int4SourceMapCohortBudget, Int4SourceMapCohortRequirement}}},
 };
 
 struct DocumentJobInput<R> {
@@ -79,6 +81,9 @@ impl NlpEngine {
     /// nonrenewable across failures and resumes. The output guard survives
     /// spool sync and journal acknowledgement. Private questions, inputs and
     /// results are not emitted to stdout by this method.
+    /// A factory explicitly configured with `with_chunk_cohorts` executes
+    /// native discovery windows inside the same complete-document transaction;
+    /// its authenticated schedule cannot be changed by resume.
     #[allow(clippy::too_many_arguments)]
     pub fn job_int4_source_document<R>(&self, model: &ResidentInt4,
         planner: Int4SourceDocumentJobPlanner, vocabulary: Arc<ExtractionVocabulary>,
@@ -97,9 +102,13 @@ impl NlpEngine {
         let result_bytes = planner.max_result_bytes();
         let output_tokens = planner.output_token_ceiling().map_err(HostedError::BatchSetup)?;
         let document_workspace = planner.workspace_bytes(limits.native, reduction_reserve_bytes)?;
-        let required = document_requirements(model.model_identity().group_width(),
+        let mut required = document_requirements(model.model_identity().group_width(),
             planner.task_budget(), planner.planning_limits(), mapping, result_bytes,
             request.limits, limits, document_workspace, private_question_bytes(planner.task()))?;
+        let cohort = if planner.uses_chunk_cohorts() {
+            Some(planner.cohort_requirements().map_err(HostedError::BatchSetup)?)
+        } else { None };
+        if let Some(quote) = cohort { required.use_cohorts(quote, limits.native.allocator_reserve_bytes)?; }
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(DocumentJobInput { preparation: Some((planner, vocabulary, request)), reader }))?;
@@ -109,6 +118,8 @@ impl NlpEngine {
         let frontier = Pending::reserve(&lease, MemoryClass::JobBuffers, required.document_workspace_bytes)?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.native_workspace_bytes)?;
+        let decoder = cohort.map(|quote| Pending::reserve(&lease, MemoryClass::JobBuffers,
+            quote.workspace_bytes)).transpose()?;
         let model = model.clone();
         let completed = dispatch::run(self, limits.native.run, cancellation, move |control| {
             let mut input = input;
@@ -122,25 +133,30 @@ impl NlpEngine {
                 Err(error) => return Ok(Err(JobRunError::Storage(error))),
             };
             checkpoint(control)?;
-            let mut engine = allocate_native(kv, scratch, || {
-                StrictInt4Engine::new(&model.inner.loaded.value, limits.native.context_tokens,
-                    Int4MemoryBudget { max_kv_bytes: required.native.kv_bytes,
-                        max_rope_bytes: required.native.rope_bytes,
-                        max_scratch_payload_bytes: required.native.scratch_payload_bound })
-                    .map(|engine| engine.with_kernel(kernel)).map_err(native_error)
-            })?;
+            let cohort = cohort.zip(decoder).map(|(quote, decoder)| (Int4SourceMapCohortBudget {
+                context_limit: limits.native.context_tokens,
+                native_memory: Int4MemoryBudget { max_kv_bytes: quote.native.kv_bytes,
+                    max_rope_bytes: quote.native.rope_bytes,
+                    max_scratch_payload_bytes: quote.native.scratch_payload_bound },
+                max_workspace_bytes: quote.workspace_bytes, max_result_bytes: quote.max_result_bytes,
+            }, decoder));
+            let mut native = DocumentNative::new(&model.inner.loaded.value, limits.native.context_tokens,
+                required.native, kernel, kv, scratch, cohort)?;
             let admission = DocumentAdmission {
                 lease: &lease, model: model.model_identity(),
                 task_spec: &planner.execution_identity().task_spec,
                 kv_bytes: required.native.kv_bytes, mapping, result_bytes, output_tokens,
             };
             let result = (|| {
-                let processor = Int4SourceDocumentJobProcessor::new(
-                    &planner, &mut engine.value, &vocabulary, admission)
-                    .map_err(JobRunError::Processor)?;
+                let processor = match &mut native {
+                    DocumentNative::Serial(engine) => Int4SourceDocumentJobProcessor::new(
+                        &planner, &mut engine.value, &vocabulary, admission),
+                    DocumentNative::Cohorts { budget, .. } => Int4SourceDocumentJobProcessor::new_cohorts(
+                        &planner, &model.inner.loaded.value, &vocabulary, *budget, kernel, admission),
+                }.map_err(JobRunError::Processor)?;
                 run_population(request, &population, processor, control)
             })();
-            drop(engine);
+            drop(native);
             drop(population);
             drop(vocabulary);
             drop(planner);
@@ -152,6 +168,20 @@ impl NlpEngine {
         // A physical cancellation/drain failure takes precedence over the job
         // result. Authenticated resume reconciles a lost acknowledgement.
         completed.map_err(HostedJobError::Job)
+    }
+}
+
+impl DocumentRequirements {
+    fn use_cohorts(&mut self, quote: Int4SourceMapCohortRequirement, allocator: u64)
+        -> Result<(), HostedError> {
+        if quote.native.kv_bytes < self.native.kv_bytes || quote.native.rope_bytes < self.native.rope_bytes
+            || quote.native.scratch_payload_bound < self.native.scratch_payload_bound
+            || quote.workspace_bytes == 0 || quote.max_result_bytes == 0 {
+            return Err(HostedError::Limits("INT4 document job incomplete cohort declaration"));
+        }
+        self.native = quote.native;
+        self.native_workspace_bytes = sum(&[quote.native.rope_bytes, quote.native.scratch_payload_bound, allocator])?;
+        Ok(())
     }
 }
 

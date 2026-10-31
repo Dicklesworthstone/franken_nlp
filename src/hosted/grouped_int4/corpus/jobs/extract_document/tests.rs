@@ -105,6 +105,60 @@ fn exact_resident_context_kv_and_nonzero_schema_are_required_before_input() {
 }
 
 #[test]
+fn cohort_reservation_keeps_both_schema_owners_and_the_complete_document_frontier() {
+    use crate::batch::extract::grouped_int4::long::cohort::Int4ExtractionMapCohortMemoryLimits;
+    let (budget, document, job, host) = fixture();
+    let frontier = document_workspace_bytes(budget, document, 4, 65536).unwrap();
+    let serial = requirements(WIDTH, budget, document, 65536, job, host, frontier, 8192).unwrap();
+    for chunks in [1, 2, 4] {
+        let quote = Int4ExtractionMapCohortMemoryLimits { max_chunks: chunks, context_tokens: 64,
+            max_output_tokens_per_chunk: 16, max_result_bytes_per_chunk: 4096 }.requirements(WIDTH).unwrap();
+        let mut grouped = serial;
+        grouped.use_cohorts(quote, host.native.allocator_reserve_bytes).unwrap();
+        assert_eq!(grouped.native, quote.native);
+        assert_eq!(grouped.native.kv_bytes, chunks as u64 * budget.max_kv_bytes);
+        assert_eq!(grouped.input_bytes, serial.input_bytes);
+        assert_eq!(grouped.document_workspace_bytes, frontier);
+        assert_eq!(grouped.native_workspace_bytes, quote.native.rope_bytes
+            + quote.native.scratch_payload_bound + host.native.allocator_reserve_bytes);
+        assert!(quote.workspace_bytes > 0);
+        assert_eq!(budget.max_kv_bytes, serial.native.kv_bytes);
+    }
+}
+
+#[test]
+fn incomplete_native_or_decoder_declarations_refuse_before_job_execution() {
+    use crate::batch::extract::grouped_int4::long::cohort::Int4ExtractionMapCohortMemoryLimits;
+    let (budget, document, job, host) = fixture();
+    let serial = requirements(WIDTH, budget, document, 65536, job, host, 65536, 8192).unwrap();
+    let quote = Int4ExtractionMapCohortMemoryLimits { max_chunks: 4, context_tokens: 64,
+        max_output_tokens_per_chunk: 16, max_result_bytes_per_chunk: 4096 }.requirements(WIDTH).unwrap();
+    for axis in 0..5 {
+        let mut short = quote;
+        match axis { 0 => short.native.kv_bytes = serial.native.kv_bytes - 1,
+            1 => short.native.rope_bytes = serial.native.rope_bytes - 1,
+            2 => short.native.scratch_payload_bound = serial.native.scratch_payload_bound - 1,
+            3 => short.workspace_bytes = 0, _ => short.max_result_bytes = 0 }
+        let mut required = serial;
+        assert!(required.use_cohorts(short, host.native.allocator_reserve_bytes).is_err());
+    }
+    let mut required = serial;
+    assert!(required.use_cohorts(quote, u64::MAX).is_err());
+}
+
+#[test]
+fn cohort_admission_retains_whole_window_kv_with_exact_semantic_result_tokens() {
+    let (budget, document, _, _) = fixture(); let base = identity(); let ids = [identity(), identity()];
+    let peak = 4 * budget.max_kv_bytes;
+    let mut claim = request(&ids, document, peak);
+    check_request(WIDTH, &base, peak, document, 65536, 16, &claim).unwrap();
+    claim.kv_reservation_bytes = budget.max_kv_bytes;
+    assert!(check_request(WIDTH, &base, peak, document, 65536, 16, &claim).is_err());
+    claim.kv_reservation_bytes = peak; claim.max_output_tokens += 1;
+    assert!(check_request(WIDTH, &base, peak, document, 65536, 16, &claim).is_err());
+}
+
+#[test]
 fn every_document_work_axis_and_masks_fit_the_persisted_lifetime_budget() {
     for axis in 0..6 {
         let (budget, document, mut job, host) = fixture();

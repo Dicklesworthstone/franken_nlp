@@ -1,8 +1,10 @@
 //! Durable exact-schema extraction for complete original INT4 documents.
 //! The existing native map and owned-job runner retain their original contracts.
 use super::*;
+use super::document_native::DocumentNative;
 use crate::{
-    batch::extract::grouped_int4::long::Int4ExtractionMapLimits,
+    batch::extract::grouped_int4::long::{Int4ExtractionMapLimits,
+        cohort::{Int4ExtractionMapCohortBudget, Int4ExtractionMapCohortRequirement}},
     grammar::mask::MaskWorkLimits,
     hosted::grouped_int4::extraction_map::document_workspace_bytes,
     jobs::runner::extract::grouped_int4::document::{Int4DocumentExtractionJobPlanner,
@@ -50,6 +52,8 @@ impl NlpEngine {
     /// model or verification authority. Output guards survive spool sync and
     /// journal acknowledgement. This API does not publish private results to
     /// stdout or retain an input spool for future resume.
+    /// `planner.with_chunk_cohorts()` selects authenticated native chunk
+    /// windows while retaining one whole-document result and commit boundary.
     #[allow(clippy::too_many_arguments)]
     pub fn job_int4_extract_document<R>(&self, model: &ResidentInt4,
         planner: Int4DocumentExtractionJobPlanner, vocabulary: Arc<ExtractionVocabulary>,
@@ -72,8 +76,12 @@ impl NlpEngine {
         let budget = planner.document_budget();
         let result_bytes = planner.max_result_bytes();
         let frontier_bytes = planner.workspace_bytes(limits.native, reduction_reserve_bytes)?;
-        let required = requirements(planner.group_width(), budget, document, result_bytes,
+        let mut required = requirements(planner.group_width(), budget, document, result_bytes,
             request.limits, limits, frontier_bytes, planner.request().schema.capacity())?;
+        let cohort = if planner.uses_chunk_cohorts() {
+            Some(planner.cohort_requirements().map_err(HostedError::BatchSetup)?)
+        } else { None };
+        if let Some(quote) = cohort { required.use_cohorts(quote, limits.native.allocator_reserve_bytes)?; }
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(ExtractionDocumentInput { preparation: Some((planner, vocabulary, request)), reader }))?;
@@ -82,6 +90,8 @@ impl NlpEngine {
         let frontier = Pending::reserve(&lease, MemoryClass::JobBuffers, required.document_workspace_bytes)?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.native_workspace_bytes)?;
+        let decoder = cohort.map(|quote| Pending::reserve(&lease, MemoryClass::JobBuffers,
+            quote.workspace_bytes)).transpose()?;
         let model = model.clone();
         let completed = dispatch::run(self, limits.native.run, cancellation, move |control| {
             let mut input = input;
@@ -95,22 +105,28 @@ impl NlpEngine {
                 Err(error) => return Ok(Err(JobRunError::Storage(error))),
             };
             checkpoint(control)?;
-            let mut engine = allocate_native(kv, scratch, || {
-                StrictInt4Engine::new(&model.inner.loaded.value, limits.native.context_tokens,
-                    Int4MemoryBudget { max_kv_bytes: required.native.kv_bytes,
-                        max_rope_bytes: required.native.rope_bytes,
-                        max_scratch_payload_bytes: required.native.scratch_payload_bound })
-                    .map(|engine| engine.with_kernel(kernel)).map_err(native_error)
-            })?;
+            let cohort = cohort.zip(decoder).map(|(quote, decoder)| (Int4ExtractionMapCohortBudget {
+                context_limit: limits.native.context_tokens,
+                native_memory: Int4MemoryBudget { max_kv_bytes: quote.native.kv_bytes,
+                    max_rope_bytes: quote.native.rope_bytes,
+                    max_scratch_payload_bytes: quote.native.scratch_payload_bound },
+                max_workspace_bytes: quote.workspace_bytes, max_result_bytes: quote.max_result_bytes,
+            }, decoder));
+            let mut native = DocumentNative::new(&model.inner.loaded.value, limits.native.context_tokens,
+                required.native, kernel, kv, scratch, cohort)?;
             let admission = DocumentAdmission { lease: &lease, model: model.model_identity(),
                 base: planner.execution_identity(), kv_bytes: required.native.kv_bytes,
                 document, result_bytes, output_tokens_per_chunk: u64::from(budget.max_output_tokens) };
             let result = (|| {
-                let processor = Int4DocumentExtractionJobProcessor::new(
-                    &planner, &mut engine.value, &vocabulary, admission).map_err(JobRunError::Processor)?;
+                let processor = match &mut native {
+                    DocumentNative::Serial(engine) => Int4DocumentExtractionJobProcessor::new(
+                        &planner, &mut engine.value, &vocabulary, admission),
+                    DocumentNative::Cohorts { budget, .. } => Int4DocumentExtractionJobProcessor::new_cohorts(
+                        &planner, &model.inner.loaded.value, &vocabulary, *budget, kernel, admission),
+                }.map_err(JobRunError::Processor)?;
                 run_population(request, &population, processor, control)
             })();
-            drop(engine);
+            drop(native);
             drop(population);
             drop(vocabulary);
             drop(planner);
@@ -122,6 +138,20 @@ impl NlpEngine {
         // Cancellation/drain failure takes precedence. Authenticated resume
         // reconciles durable progress if a commit acknowledgement was lost.
         completed.map_err(HostedJobError::Job)
+    }
+}
+
+impl DocumentRequirements {
+    fn use_cohorts(&mut self, quote: Int4ExtractionMapCohortRequirement, allocator: u64)
+        -> Result<(), HostedError> {
+        if quote.native.kv_bytes < self.native.kv_bytes || quote.native.rope_bytes < self.native.rope_bytes
+            || quote.native.scratch_payload_bound < self.native.scratch_payload_bound
+            || quote.workspace_bytes == 0 || quote.max_result_bytes == 0 {
+            return Err(HostedError::Limits("INT4 extraction document job incomplete cohort declaration"));
+        }
+        self.native = quote.native;
+        self.native_workspace_bytes = sum(&[quote.native.rope_bytes, quote.native.scratch_payload_bound, allocator])?;
+        Ok(())
     }
 }
 
