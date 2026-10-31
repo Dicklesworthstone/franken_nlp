@@ -52,6 +52,9 @@ pub enum CalibrationError {
     MissingExchangeabilityMemo,
     InvalidValidityWindow,
     InvalidDate,
+    InvalidFittedParameters {
+        method: &'static str,
+    },
     DuplicateLabel(String),
     IdentityMismatch {
         expected: Sha256Digest,
@@ -121,6 +124,9 @@ impl fmt::Display for CalibrationError {
                 write!(formatter, "validity end must not precede validity start")
             }
             Self::InvalidDate => write!(formatter, "invalid Gregorian validity date"),
+            Self::InvalidFittedParameters { method } => {
+                write!(formatter, "invalid fitted calibration parameters: {method}")
+            }
             Self::DuplicateLabel(label) => {
                 write!(formatter, "duplicate calibration label: {label}")
             }
@@ -388,6 +394,17 @@ pub struct TemperatureModel {
 }
 
 impl TemperatureModel {
+    /// Restore a transported transform after validating its numerical domain.
+    ///
+    /// This validates parameters only. The caller must separately authenticate
+    /// the fitted rows, execution identity and calibration provenance.
+    pub fn from_parameters(temperature: f64, fitted_rows: usize) -> Result<Self, CalibrationError> {
+        if !temperature.is_finite() || temperature <= 0.0 || fitted_rows == 0 {
+            return Err(CalibrationError::InvalidFittedParameters { method: "temperature" });
+        }
+        Ok(Self { temperature, fitted_rows })
+    }
+
     /// Fit temperature only on the sealed calibration split with deterministic golden-section search.
     pub fn fit(calibration: &CalibrationSet) -> Result<Self, CalibrationError> {
         for row in &calibration.rows {
@@ -465,6 +482,29 @@ pub struct IsotonicModel {
 }
 
 impl IsotonicModel {
+    /// Restore the monotonic PAV representation after checking every knot.
+    ///
+    /// Bounds are finite probabilities, upper scores strictly increase and
+    /// calibrated probabilities never decrease. The caller remains responsible
+    /// for authenticating the fit's data, identity and provenance.
+    pub fn from_blocks(blocks: Vec<IsotonicBlock>) -> Result<Self, CalibrationError> {
+        if blocks.is_empty()
+            || blocks.iter().any(|block| {
+                !block.upper_score.is_finite()
+                    || !(0.0..=1.0).contains(&block.upper_score)
+                    || !block.calibrated_probability.is_finite()
+                    || !(0.0..=1.0).contains(&block.calibrated_probability)
+            })
+            || blocks.windows(2).any(|pair| {
+                pair[0].upper_score >= pair[1].upper_score
+                    || pair[0].calibrated_probability > pair[1].calibrated_probability
+            })
+        {
+            return Err(CalibrationError::InvalidFittedParameters { method: "isotonic" });
+        }
+        Ok(Self { blocks })
+    }
+
     /// Fit a pool-adjacent-violators model only on the calibration split.
     pub fn fit(calibration: &CalibrationSet) -> Self {
         let mut rows = calibration.rows.clone();

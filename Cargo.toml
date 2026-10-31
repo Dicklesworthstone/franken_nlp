@@ -35,7 +35,7 @@ metadata-store = ["dep:fsqlite", "dep:fsqlite-types"]
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.10"
 
 # The release default does not select the currently Rayon-backed kernel surface.

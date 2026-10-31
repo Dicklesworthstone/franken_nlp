@@ -2,6 +2,7 @@
 #![cfg_attr(all(target_arch = "aarch64", target_endian = "little"), feature(stdarch_neon_i8mm))]
 
 pub mod artifact;
+pub mod assay;
 pub mod batch;
 pub mod calibration;
 mod candidate_cli;
