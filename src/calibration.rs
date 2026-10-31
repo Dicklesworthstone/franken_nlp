@@ -55,6 +55,7 @@ pub enum CalibrationError {
     InvalidFittedParameters {
         method: &'static str,
     },
+    AllocationRefused,
     DuplicateLabel(String),
     IdentityMismatch {
         expected: Sha256Digest,
@@ -127,6 +128,7 @@ impl fmt::Display for CalibrationError {
             Self::InvalidFittedParameters { method } => {
                 write!(formatter, "invalid fitted calibration parameters: {method}")
             }
+            Self::AllocationRefused => write!(formatter, "calibration allocation refused"),
             Self::DuplicateLabel(label) => {
                 write!(formatter, "duplicate calibration label: {label}")
             }
@@ -393,6 +395,8 @@ pub struct TemperatureModel {
     fitted_rows: usize,
 }
 
+const FIT_ROWS_PER_CHECKPOINT: usize = 1024;
+
 impl TemperatureModel {
     /// Restore a transported transform after validating its numerical domain.
     ///
@@ -407,11 +411,25 @@ impl TemperatureModel {
 
     /// Fit temperature only on the sealed calibration split with deterministic golden-section search.
     pub fn fit(calibration: &CalibrationSet) -> Result<Self, CalibrationError> {
-        for row in &calibration.rows {
+        Self::fit_with_checkpoint(calibration, &mut || Ok(()))
+    }
+
+    /// Keep every validation and loss pass inside the caller's owned run.
+    /// Checkpoints preserve the original row order and search arithmetic.
+    pub(crate) fn fit_with_checkpoint<E: From<CalibrationError>>(
+        calibration: &CalibrationSet,
+        checkpoint: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<Self, E> {
+        checkpoint()?;
+        if calibration.is_empty() {
+            return Err(CalibrationError::EmptySplit(SplitName::Calibration).into());
+        }
+        for (index, row) in calibration.rows.iter().enumerate() {
+            if index.is_multiple_of(FIT_ROWS_PER_CHECKPOINT) { checkpoint()?; }
             if row.probability <= 0.0 || row.probability >= 1.0 {
                 return Err(CalibrationError::TemperatureNeedsOpenProbability {
                     id: row.id.clone(),
-                });
+                }.into());
             }
         }
 
@@ -420,23 +438,25 @@ impl TemperatureModel {
         let golden_ratio = 0.618_033_988_749_894_9_f64;
         let mut left = upper_beta - (upper_beta - lower_beta) * golden_ratio;
         let mut right = lower_beta + (upper_beta - lower_beta) * golden_ratio;
-        let mut left_loss = temperature_loss(calibration, left);
-        let mut right_loss = temperature_loss(calibration, right);
+        let mut left_loss = temperature_loss(calibration, left, checkpoint)?;
+        let mut right_loss = temperature_loss(calibration, right, checkpoint)?;
         for _ in 0..128 {
+            checkpoint()?;
             if left_loss <= right_loss {
                 upper_beta = right;
                 right = left;
                 right_loss = left_loss;
                 left = upper_beta - (upper_beta - lower_beta) * golden_ratio;
-                left_loss = temperature_loss(calibration, left);
+                left_loss = temperature_loss(calibration, left, checkpoint)?;
             } else {
                 lower_beta = left;
                 left = right;
                 left_loss = right_loss;
                 right = lower_beta + (upper_beta - lower_beta) * golden_ratio;
-                right_loss = temperature_loss(calibration, right);
+                right_loss = temperature_loss(calibration, right, checkpoint)?;
             }
         }
+        checkpoint()?;
         let beta = (lower_beta + upper_beta) / 2.0;
         Ok(Self {
             temperature: 1.0 / beta,
@@ -506,21 +526,31 @@ impl IsotonicModel {
     }
 
     /// Fit a pool-adjacent-violators model only on the calibration split.
-    pub fn fit(calibration: &CalibrationSet) -> Self {
-        let mut rows = calibration.rows.clone();
-        rows.sort_by(|left, right| {
-            left.probability
-                .total_cmp(&right.probability)
-                .then_with(|| left.id.cmp(&right.id))
-        });
+    pub fn fit(calibration: &CalibrationSet) -> Result<Self, CalibrationError> {
+        Self::fit_with_checkpoint(calibration, &mut || Ok(()))
+    }
 
-        let mut blocks = Vec::<PavBlock>::new();
+    /// Cooperatively fit with checked storage and no copies of private row IDs.
+    /// At most two borrowed-row buffers, PAV state and the returned knots are
+    /// retained; the host prices their complete peak before native replay.
+    pub(crate) fn fit_with_checkpoint<E: From<CalibrationError>>(
+        calibration: &CalibrationSet,
+        checkpoint: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<Self, E> {
+        checkpoint()?;
+        if calibration.is_empty() {
+            return Err(CalibrationError::EmptySplit(SplitName::Calibration).into());
+        }
+        let rows = sorted_calibration_rows(calibration, checkpoint)?;
+        let mut blocks = fit_storage::<PavBlock>(rows.len())?;
         let mut index = 0;
+        let mut merged = 0_usize;
         while index < rows.len() {
             let score = rows[index].probability;
             let mut positive = 0_usize;
             let mut count = 0_usize;
             while index < rows.len() && rows[index].probability == score {
+                if index.is_multiple_of(FIT_ROWS_PER_CHECKPOINT) { checkpoint()?; }
                 positive += if rows[index].positive { 1 } else { 0 };
                 count += 1;
                 index += 1;
@@ -540,18 +570,19 @@ impl IsotonicModel {
                 left.upper_score = right.upper_score;
                 left.positive += right.positive;
                 left.count += right.count;
+                merged += 1;
+                if merged.is_multiple_of(FIT_ROWS_PER_CHECKPOINT) { checkpoint()?; }
             }
         }
-
-        Self {
-            blocks: blocks
-                .into_iter()
-                .map(|block| IsotonicBlock {
-                    upper_score: block.upper_score,
-                    calibrated_probability: block.mean(),
-                })
-                .collect(),
+        checkpoint()?;
+        let mut fitted = fit_storage(blocks.len())?;
+        for (index, block) in blocks.into_iter().enumerate() {
+            if index.is_multiple_of(FIT_ROWS_PER_CHECKPOINT) { checkpoint()?; }
+            fitted.push(IsotonicBlock { upper_score: block.upper_score,
+                calibrated_probability: block.mean() });
         }
+        checkpoint()?;
+        Ok(Self { blocks: fitted })
     }
 
     /// Apply the monotonic piecewise-constant fit.
@@ -563,15 +594,10 @@ impl IsotonicModel {
     /// including the lower observations of a block merged by PAV.
     pub fn calibrate(&self, probability: f64) -> Result<f64, CalibrationError> {
         validate_probability("score", probability)?;
-        let chosen = self
-            .blocks
-            .iter()
-            .find(|block| probability <= block.upper_score)
-            .unwrap_or_else(|| {
-                self.blocks
-                    .last()
-                    .expect("validated calibration split is non-empty")
-            });
+        let index = self.blocks.partition_point(|block| block.upper_score < probability);
+        let chosen = self.blocks.get(index).unwrap_or_else(|| {
+            self.blocks.last().expect("validated calibration split is non-empty")
+        });
         Ok(chosen.calibrated_probability)
     }
 
@@ -600,6 +626,61 @@ impl PavBlock {
     fn mean(self) -> f64 {
         self.positive as f64 / self.count as f64
     }
+}
+
+fn fit_storage<T>(count: usize) -> Result<Vec<T>, CalibrationError> {
+    let mut storage = Vec::new();
+    storage.try_reserve_exact(count).map_err(|_| CalibrationError::AllocationRefused)?;
+    Ok(storage)
+}
+
+/// Bounded leaf sorts followed by checkpointed stable merges. The total order
+/// remains probability then ID, exactly as in the original whole-split sort.
+fn sorted_calibration_rows<'a, E: From<CalibrationError>>(
+    calibration: &'a CalibrationSet,
+    checkpoint: &mut impl FnMut() -> Result<(), E>,
+) -> Result<Vec<&'a LabeledScore>, E> {
+    checkpoint()?;
+    let mut rows = fit_storage(calibration.len())?;
+    for (index, row) in calibration.rows.iter().enumerate() {
+        if index.is_multiple_of(FIT_ROWS_PER_CHECKPOINT) { checkpoint()?; }
+        rows.push(row);
+    }
+    let compare = |left: &LabeledScore, right: &LabeledScore| left.probability
+        .total_cmp(&right.probability).then_with(|| left.id.cmp(&right.id));
+    for chunk in rows.chunks_mut(FIT_ROWS_PER_CHECKPOINT) {
+        checkpoint()?;
+        chunk.sort_unstable_by(|left, right| compare(left, right));
+    }
+    if rows.len() > FIT_ROWS_PER_CHECKPOINT {
+        let mut scratch = fit_storage(rows.len())?;
+        let mut width = FIT_ROWS_PER_CHECKPOINT;
+        while width < rows.len() {
+            checkpoint()?;
+            scratch.clear();
+            let stride = width.saturating_mul(2);
+            for start in (0..rows.len()).step_by(stride) {
+                let middle = start.saturating_add(width).min(rows.len());
+                let end = start.saturating_add(stride).min(rows.len());
+                let mut left = start;
+                let mut right = middle;
+                while left < middle || right < end {
+                    if scratch.len().is_multiple_of(FIT_ROWS_PER_CHECKPOINT) { checkpoint()?; }
+                    if right == end || (left < middle && compare(rows[left], rows[right]).is_le()) {
+                        scratch.push(rows[left]);
+                        left += 1;
+                    } else {
+                        scratch.push(rows[right]);
+                        right += 1;
+                    }
+                }
+            }
+            std::mem::swap(&mut rows, &mut scratch);
+            width = stride;
+        }
+    }
+    checkpoint()?;
+    Ok(rows)
 }
 
 /// Locked-test reliability metrics. They cannot be produced from a calibration set.
@@ -719,6 +800,8 @@ impl SelectiveRisk {
 
 #[cfg(test)]
 mod checkpoint_tests;
+#[cfg(test)]
+mod fitting_tests;
 
 /// Maximum row operations between cooperative metric checkpoints. The caller
 /// owns the controller; these numerical routines never create a runtime.
@@ -1538,15 +1621,23 @@ fn validate_rows(
     Ok(())
 }
 
-fn temperature_loss(calibration: &CalibrationSet, beta: f64) -> f64 {
-    calibration.rows.iter().fold(0.0_f64, |loss, row| {
+fn temperature_loss<E: From<CalibrationError>>(
+    calibration: &CalibrationSet,
+    beta: f64,
+    checkpoint: &mut impl FnMut() -> Result<(), E>,
+) -> Result<f64, E> {
+    let mut loss = 0.0_f64;
+    for (index, row) in calibration.rows.iter().enumerate() {
+        if index.is_multiple_of(FIT_ROWS_PER_CHECKPOINT) { checkpoint()?; }
         let probability = sigmoid(logit(row.probability) * beta).clamp(1e-15, 1.0 - 1e-15);
-        if row.positive {
+        loss = if row.positive {
             loss - probability.ln()
         } else {
             loss - (1.0 - probability).ln()
-        }
-    })
+        };
+    }
+    checkpoint()?;
+    Ok(loss)
 }
 
 fn sigmoid(value: f64) -> f64 {

@@ -360,7 +360,7 @@ pub fn fit(
             }
         }
         FitMethod::Isotonic => {
-            let model = IsotonicModel::fit(calibration);
+            let model = IsotonicModel::fit(calibration).map_err(AssayError::from)?;
             Parameters::Isotonic {
                 fitted_rows: calibration.len(),
                 knots: model.blocks().iter().map(|block| Knot {

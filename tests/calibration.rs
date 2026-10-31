@@ -136,7 +136,7 @@ fn temperature_is_explicit_and_isotonic_pav_is_monotonic() {
             vec![score("test-1", 0.7, true)],
         )
         .unwrap();
-    let isotonic = IsotonicModel::fit(partition.calibration());
+    let isotonic = IsotonicModel::fit(partition.calibration()).unwrap();
     let calibrated = isotonic.blocks();
     assert_eq!(calibrated.len(), 3);
     assert!((calibrated[0].calibrated_probability - 0.0).abs() < 1e-12);
@@ -180,7 +180,7 @@ fn isotonic_prediction_preserves_weighted_ties_and_complete_pooled_blocks() {
                 vec![score("test", 0.5, false)],
             )
             .unwrap();
-        IsotonicModel::fit(partition.calibration())
+        IsotonicModel::fit(partition.calibration()).unwrap()
     }
 
     // The three equal-score rows at 0.2 contribute weight three. Pooling

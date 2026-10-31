@@ -107,7 +107,7 @@ fn validated_restoration_preserves_fitted_transforms_and_refuses_invalid_knots()
     let temperature = TemperatureModel::fit(calibration).unwrap();
     let restored_temperature = TemperatureModel::from_parameters(
         temperature.temperature(), temperature.fitted_rows()).unwrap();
-    let isotonic = IsotonicModel::fit(calibration);
+    let isotonic = IsotonicModel::fit(calibration).unwrap();
     let restored_isotonic = IsotonicModel::from_blocks(isotonic.blocks().to_vec()).unwrap();
     for point in 0..=100 {
         let probability = f64::from(point) / 100.0;

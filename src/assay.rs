@@ -108,7 +108,9 @@ impl fmt::Display for AssayError {
 }
 impl Error for AssayError {}
 impl From<CalibrationError> for AssayError {
-    fn from(_: CalibrationError) -> Self { Self::Calibration }
+    fn from(error: CalibrationError) -> Self {
+        match error { CalibrationError::AllocationRefused => Self::Allocation, _ => Self::Calibration }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
