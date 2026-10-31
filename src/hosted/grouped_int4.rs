@@ -9,6 +9,8 @@ mod assay;
 pub use assay::{Int4AssayHostLimits, Int4AssayHostRequirements, Int4AssayOperation};
 mod assay_ner;
 pub use assay_ner::{Int4NerAssayHostLimits, Int4NerAssayHostRequirements};
+mod assay_extract;
+pub use assay_extract::{Int4ExtractAssayHostLimits, Int4ExtractAssayHostRequirements};
 mod sentiment;
 pub use sentiment::Int4SentimentHostLimits;
 mod judge;

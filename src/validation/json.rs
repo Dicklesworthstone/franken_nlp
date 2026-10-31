@@ -1068,7 +1068,7 @@ mod tests {
         assert!(located.locations.contains_key("/é/2"));
         for malformed in [r#"{"é":[0,]}"#, r#"{"x":1,"x":2}"#, "1e309", "[null] trailing"] {
             let value_error = parse_json_with_limits(malformed, JsonLimits::default()).unwrap_err();
-            let located_error = parse_json_with_locations(malformed).unwrap_err();
+            let located_error = parse_json_with_locations(malformed).err().unwrap();
             assert_eq!(value_error.kind(), located_error.kind());
             assert_eq!(value_error.pointer(), located_error.pointer());
             assert_eq!(value_error.byte_offset(), located_error.byte_offset());

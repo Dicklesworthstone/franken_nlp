@@ -285,6 +285,7 @@ pub(in crate::assay_cli) fn cancelled(kind: DecodeCancellationKind) -> Failure {
 pub(in crate::assay_cli) fn host_failure(error: HostedError) -> Failure {
     match error {
         HostedError::Assay(error) => error.into(),
+        HostedError::BatchSetup(error) => batch_setup_failure(error),
         HostedError::Stopped { stop, task_error } => {
             if matches!(stop.kind, DecodeCancellationKind::FailFast | DecodeCancellationKind::LinkedExit) {
                 if let Some(error) = task_error { return host_failure(*error); }
@@ -320,6 +321,7 @@ pub(in crate::assay_cli) fn host_failure(error: HostedError) -> Failure {
                 Failure::new(ErrorCode::StructuredTaskNoResult, "native_classification_failed")),
         },
         HostedError::Int4(Int4HostError::SourceTask(error)) => source_failure(error),
+        HostedError::Int4(Int4HostError::Extraction(error)) => int4_extraction_failure(error),
         HostedError::Int4(Int4HostError::Native(StrictInt4Error::Cancelled(kind))) => cancelled(kind),
         HostedError::Int4(Int4HostError::Native(StrictInt4Error::Work)) =>
             Failure::new(ErrorCode::BudgetOrTimeout, "native_work_budget"),
@@ -332,12 +334,28 @@ pub(in crate::assay_cli) fn host_failure(error: HostedError) -> Failure {
     }
 }
 
+fn batch_setup_failure(error: crate::batch::BatchFault) -> Failure {
+    use crate::batch::BatchCode;
+    if let Some(kind) = error.cancellation { return cancelled(kind); }
+    match error.code {
+        BatchCode::WorkLimit => Failure::new(ErrorCode::BudgetOrTimeout, "native_planning_work_budget"),
+        BatchCode::InvalidLimits | BatchCode::LineLimit | BatchCode::DocumentLimit | BatchCode::EpochIdLimit
+            | BatchCode::InputLimit | BatchCode::RequestLimit | BatchCode::OutputLineLimit
+            | BatchCode::OutputLimit | BatchCode::Admission | BatchCode::Allocation =>
+            Failure::new(ErrorCode::AdmissionOrResourceLimit, "native_planning_admission_refused"),
+        BatchCode::InvalidExecution => Failure::new(ErrorCode::ArtifactIntegrityOrFormatOrVersion, "native_planning_identity"),
+        BatchCode::InvalidUtf8 | BatchCode::InvalidJson | BatchCode::InvalidEnvelope
+            | BatchCode::InvalidId | BatchCode::DuplicateId => Failure::new(ErrorCode::InputDecodeOrParse, "native_planning_input"),
+        BatchCode::Planning | BatchCode::Execution => Failure::new(ErrorCode::StructuredTaskNoResult, "native_planning_no_result"),
+        _ => Failure::new(ErrorCode::Generic, "native_planning_failed"),
+    }
+}
+
 /// Preserve typed source-planning and constrained-decoding causes without
 /// copying source-derived schema pointers or private diagnostic text.
 fn source_failure(error: crate::tasks::source_planning::grouped_int4::Int4SourceError) -> Failure {
-    use crate::{native_engine::constrained_int4::Int4JsonError,
-        tasks::{extract::grouped_int4::Int4ExtractError, ner::NerError,
-            source_planning::{SourcePlanningError, grouped_int4::Int4SourceError}}};
+    use crate::tasks::{ner::NerError,
+        source_planning::{SourcePlanningError, grouped_int4::Int4SourceError}};
     match error {
         Int4SourceError::Cancelled(kind) => cancelled(kind),
         Int4SourceError::Planning(SourcePlanningError::AllocationRefused
@@ -348,15 +366,21 @@ fn source_failure(error: crate::tasks::source_planning::grouped_int4::Int4Source
             | SourcePlanningError::Ner(NerError::OutputBudgetExceeded)) =>
             Failure::new(ErrorCode::BudgetOrTimeout, "native_source_output_budget"),
         Int4SourceError::Planning(SourcePlanningError::Extraction(error)
-            | SourcePlanningError::Ner(NerError::Extraction(error)))
-            | Int4SourceError::Extraction(Int4ExtractError::Extraction(error)) => extraction_failure(error),
-        Int4SourceError::Extraction(Int4ExtractError::Native(Int4JsonError::Native(error))) =>
-            host_failure(HostedError::Int4(Int4HostError::Native(error))),
-        Int4SourceError::Extraction(Int4ExtractError::Native(Int4JsonError::Decode(error))) => decode_failure(error),
-        Int4SourceError::Extraction(Int4ExtractError::Identity
-            | Int4ExtractError::Native(Int4JsonError::ModelIdentity | Int4JsonError::WorkMismatch)) =>
-            Failure::new(ErrorCode::ArtifactIntegrityOrFormatOrVersion, "native_source_execution_identity"),
+            | SourcePlanningError::Ner(NerError::Extraction(error))) => extraction_failure(error),
+        Int4SourceError::Extraction(error) => int4_extraction_failure(error),
         _ => Failure::new(ErrorCode::StructuredTaskNoResult, "native_source_no_result"),
+    }
+}
+fn int4_extraction_failure(error: crate::tasks::extract::grouped_int4::Int4ExtractError) -> Failure {
+    use crate::{native_engine::constrained_int4::Int4JsonError,
+        tasks::extract::grouped_int4::Int4ExtractError};
+    match error {
+        Int4ExtractError::Extraction(error) => extraction_failure(error),
+        Int4ExtractError::Native(Int4JsonError::Native(error)) =>
+            host_failure(HostedError::Int4(Int4HostError::Native(error))),
+        Int4ExtractError::Native(Int4JsonError::Decode(error)) => decode_failure(error),
+        Int4ExtractError::Identity | Int4ExtractError::Native(Int4JsonError::ModelIdentity | Int4JsonError::WorkMismatch) =>
+            Failure::new(ErrorCode::ArtifactIntegrityOrFormatOrVersion, "native_source_execution_identity"),
     }
 }
 fn extraction_failure(error: crate::tasks::extract::ExtractError) -> Failure {

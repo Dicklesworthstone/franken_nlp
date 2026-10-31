@@ -30,6 +30,7 @@ pub use grouped_int4::{Int4HostError, Int4LoadLimits, Int4LoadRequirements, Int4
     Int4ScoredCohortHostLimits, Int4ScoredCohortBatchResult,
     Int4AssayHostLimits, Int4AssayHostRequirements, Int4AssayOperation,
     Int4NerAssayHostLimits, Int4NerAssayHostRequirements,
+    Int4ExtractAssayHostLimits, Int4ExtractAssayHostRequirements,
     Int4ExtractionCohortBatchResult, Int4SourceCohortBatchResult,
     Int4ResolveConfig, HostedInt4ChatStream, ResidentInt4, HostedInt4EntityCorpus,
     Int4EntityCorpusError, Int4EntityCorpusHostConfig, Int4EntityCorpusHostRequirements,

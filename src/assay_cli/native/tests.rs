@@ -9,6 +9,7 @@ pub(super) fn parse(arguments: &[&str]) -> Command {
         AssayCommand::Native(command) => command,
         AssayCommand::Scored(_) => panic!("native fixture selected supplied observations"),
         AssayCommand::NativeNer(_) => panic!("classification fixture selected NER"),
+        AssayCommand::NativeExtract(_) => panic!("classification fixture selected extraction"),
     }
 }
 pub(super) fn command(paired: bool, flags: &[&str]) -> Command {
