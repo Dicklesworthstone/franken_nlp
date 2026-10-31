@@ -40,10 +40,11 @@ pub struct ExtractionBatchArgs {
     pub budget: TaskBudget,
 }
 
+#[derive(Clone)]
 pub struct ExtractionBatchPlanner {
-    encoder: SourceDocumentEncoder,
+    encoder: std::sync::Arc<SourceDocumentEncoder>,
     controls: TemplateControlIds,
-    fragments: Vec<Vec<u32>>,
+    fragments: std::sync::Arc<Vec<Vec<u32>>>,
     identity: ExecutionIdentity,
     ceiling: TaskBudget,
     compiler_limits: CompileLimits,
@@ -155,7 +156,9 @@ impl ExtractionBatchPlanner {
         identity.tokenizer_digest = Sha256Digest::of_bytes(PINNED_TOKENIZER_MODEL_BYTES);
         identity.validate().map_err(|_| BatchCode::Admission)?;
         let encoder = SourceDocumentEncoder::pinned(controls).map_err(|_| BatchCode::Planning)?;
-        Ok(Self { encoder, controls: controls.clone(), fragments, identity, ceiling, compiler_limits, source_limits, defaults, eos })
+        Ok(Self { encoder: std::sync::Arc::new(encoder), controls: controls.clone(),
+            fragments: std::sync::Arc::new(fragments), identity, ceiling,
+            compiler_limits, source_limits, defaults, eos })
     }
     pub fn prepare(&self, document: BatchDocument<ExtractionBatchArgs>) -> Result<PreparedBatchExtraction, BatchItemFailure> {
         self.prepare_inner(document).map_err(|fault| if matches!(fault.code, BatchCode::Allocation | BatchCode::InvalidExecution) {

@@ -30,7 +30,21 @@ pub struct PreparedInt4BatchExtraction {
     plan: Int4ExtractPlan,
     task: TaskPlan,
     source: SourceDocument,
+    request_digest: Sha256Digest,
 }
+
+/// One private request-identity protocol shared by preparation and native
+/// consumers. Exact schema/source bytes and task policy are bound together;
+/// corpus IDs never enter model planning or this model-request commitment.
+pub(crate) fn extraction_request_digest(text: &str, schema: &str,
+    grounding: ExtractionBatchGrounding, budget: TaskBudget) -> Result<Sha256Digest, BatchFault> {
+    #[derive(Serialize)]
+    struct Request<'a> { text: &'a str, schema: &'a str, grounding: ExtractionBatchGrounding, budget: TaskBudget }
+    let bytes = canonjson::canonical_bytes(&Request { text, schema, grounding, budget })
+        .map_err(|_| BatchFault::from(BatchCode::Serialization))?;
+    Ok(Sha256Digest::of_bytes(&bytes))
+}
+
 impl Int4ExtractionBatchPlanner {
     /// Construct only from the actual identity of source/snapshot-loaded
     /// weights. The caller admits tokenizer/planner storage separately.
@@ -71,6 +85,16 @@ impl Int4ExtractionBatchPlanner {
     pub fn base_execution_identity(&self) -> &ExecutionIdentity { &self.compiler.identity }
     pub fn group_width(&self) -> usize { self.group_width }
 
+    /// Select another explicitly loaded model while sharing only immutable
+    /// pinned tokenizer/scaffold assets. Source, grammar and executable state
+    /// remain request-owned; all task/default/resource limits are preserved.
+    pub fn with_model(&self, model: &Int4ModelIdentity) -> Result<Self, BatchFault> {
+        let mut compiler = self.compiler.clone();
+        compiler.identity = bind_candidate_model(compiler.identity.clone(), model)
+            .map_err(|_| BatchCode::Admission)?;
+        Ok(Self { compiler, group_width: model.group_width(), shared_defaults_only: self.shared_defaults_only })
+    }
+
     /// Seal a shared schema/grounding/budget policy for the whole input stream.
     /// Every explicit task_args override is rejected before document encoding
     /// or schema/source compilation; ordinary planners retain override support.
@@ -95,6 +119,9 @@ impl Int4ExtractionBatchPlanner {
         }
         let input = self.compiler.prepare_input(document).map_err(planning_fault)?;
         let ExtractionInput { task, source, schema, options, grounded, .. } = input;
+        let request_digest = extraction_request_digest(source.text(), &schema,
+            if grounded { ExtractionBatchGrounding::SourceMembership } else { ExtractionBatchGrounding::Structural },
+            *task.ir().budget()).map_err(BatchItemFailure::fatal)?;
         let c = &self.compiler;
         let plan = if grounded {
             Int4ExtractPlan::from_task_plan_with_source(&task, &schema, options, c.compiler_limits,
@@ -103,7 +130,7 @@ impl Int4ExtractionBatchPlanner {
             Int4ExtractPlan::from_task_plan(&task, &schema, options, c.compiler_limits,
                 &c.controls, c.identity.clone(), self.group_width)
         }.map_err(planning_failure)?;
-        Ok(PreparedInt4BatchExtraction { plan, task, source })
+        Ok(PreparedInt4BatchExtraction { plan, task, source, request_digest })
     }
 }
 impl PreparedInt4BatchExtraction {
@@ -113,6 +140,10 @@ impl PreparedInt4BatchExtraction {
     pub fn task_plan(&self) -> &TaskPlan { &self.task }
     pub fn source(&self) -> &SourceDocument { &self.source }
     pub fn planned_work(&self) -> Int4Work { self.plan.planned_work() }
+    /// Private source/schema association for native composition, never a
+    /// public content fingerprint or a replacement for full model admission.
+    pub(crate) fn request_digest(&self) -> Sha256Digest { self.request_digest }
+    pub(crate) fn comparison_policy_digest(&self) -> Sha256Digest { self.plan.comparison_policy_digest() }
     pub fn verify_identity(&self, admitted: &ExecutionIdentity) -> Result<(), Int4ExtractError> {
         self.plan.verify_identity(admitted)
     }
@@ -284,6 +315,67 @@ mod tests {
         assert!(first.verify_identity(changed.execution_identity()).is_err());
         let mut input = boolean(); input.task_args = None;
         first.verify_identity(planner.prepare(input).unwrap().execution_identity()).unwrap();
+    }
+
+    #[test]
+    fn private_request_seal_binds_exact_source_schema_grounding_and_budget_not_row_id() {
+        let planner = planner(127, None);
+        let original = boolean();
+        let expected = Sha256Digest::of_bytes(&canonjson::canonical_bytes(&serde_json::json!({
+            "text": original.text, "schema": r#"{"type":"boolean"}"#,
+            "grounding": "structural", "budget": budget(),
+        })).unwrap());
+        let prepared = planner.prepare(boolean()).unwrap();
+        assert_eq!(prepared.request_digest(), expected);
+        let mut renamed = boolean(); renamed.id = "another-private-row".to_owned();
+        assert_eq!(planner.prepare(renamed).unwrap().request_digest(), expected);
+        for axis in 0..4 {
+            let mut changed = boolean();
+            match axis {
+                0 => changed.text.push_str(" changed"),
+                1 => changed.task_args.as_mut().unwrap().schema = r#"{ "type": "boolean" }"#.to_owned(),
+                2 => changed.task_args.as_mut().unwrap().grounding = ExtractionBatchGrounding::SourceMembership,
+                _ => changed.task_args.as_mut().unwrap().budget.max_output_tokens -= 1,
+            }
+            // Source membership has no valid boolean-only schema: the
+            // compiler must refuse, never mint a differently grounded seal.
+            if axis == 2 { assert!(planner.prepare(changed).is_err()); continue; }
+            assert_ne!(planner.prepare(changed).unwrap().request_digest(), expected, "axis {axis}");
+        }
+        let source_schema = r#"{"type":"string","x-fnlp-source":"verbatim"}"#;
+        let source = planner.prepare(document(source_schema, "Alice", ExtractionBatchGrounding::SourceMembership)).unwrap();
+        let expected = Sha256Digest::of_bytes(&canonjson::canonical_bytes(&serde_json::json!({
+            "text": "Alice", "schema": source_schema, "grounding": "source_membership", "budget": budget(),
+        })).unwrap());
+        assert_eq!(source.request_digest(), expected);
+    }
+
+    #[test]
+    fn cloned_model_preparation_shares_only_immutable_pinned_assets() {
+        let planner = planner(127, Some(args(r#"{"type":"boolean"}"#, ExtractionBatchGrounding::Structural)));
+        let mut rebound = planner.compiler.clone();
+        assert!(std::sync::Arc::ptr_eq(&planner.compiler.encoder, &rebound.encoder));
+        assert!(std::sync::Arc::ptr_eq(&planner.compiler.fragments, &rebound.fragments));
+        assert_eq!(planner.compiler.identity, rebound.identity);
+        assert_eq!(planner.compiler.ceiling, rebound.ceiling);
+        assert_eq!(planner.compiler.compiler_limits, rebound.compiler_limits);
+        assert_eq!(planner.compiler.source_limits, rebound.source_limits);
+        rebound.defaults.as_mut().unwrap().schema = r#"{"type":"null"}"#.to_owned();
+        rebound.identity.task_spec = "changed-local-copy".to_owned();
+        assert_eq!(planner.compiler.defaults.as_ref().unwrap().schema, r#"{"type":"boolean"}"#);
+        assert_eq!(planner.compiler.identity.task_spec, "extract-v1");
+    }
+
+    #[test]
+    fn extraction_comparison_policy_ignores_only_model_group_partition() {
+        let narrow = planner(16, None).prepare(boolean()).unwrap();
+        let wide = planner(128, None).prepare(boolean()).unwrap();
+        assert_eq!(narrow.request_digest(), wide.request_digest());
+        assert_eq!(narrow.comparison_policy_digest(), wide.comparison_policy_digest());
+        assert_ne!(narrow.execution_identity().decision_policy_digest, wide.execution_identity().decision_policy_digest);
+        let mut changed = planner(16, None); changed.compiler.compiler_limits.max_string_bytes += 1;
+        let changed = changed.prepare(boolean()).unwrap();
+        assert_ne!(narrow.comparison_policy_digest(), changed.comparison_policy_digest());
     }
 
     struct Stop { calls: usize, at: usize, cause: DecodeCancellationKind }

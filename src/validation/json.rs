@@ -397,7 +397,18 @@ pub fn parse_json_with_limits(
     input: &str,
     limits: JsonLimits,
 ) -> Result<JsonValue, JsonParseError> {
-    parse_json_with_locations_and_limits(input, limits).map(|document| document.value)
+    parse_json_bounded(input, limits, None, false).map(|document| document.value)
+}
+
+/// Exact value-only parsing for admitted consumers that retain a tree. The
+/// aggregate node cap is checked before each value allocation; diagnostic
+/// location maps are unnecessary here and must not duplicate long paths.
+pub(crate) fn parse_json_with_node_limit(
+    input: &str,
+    limits: JsonLimits,
+    max_nodes: usize,
+) -> Result<JsonValue, JsonParseError> {
+    parse_json_bounded(input, limits, Some(max_nodes), false).map(|document| document.value)
 }
 
 pub(crate) fn parse_json_with_locations(input: &str) -> Result<ParsedJson, JsonParseError> {
@@ -407,6 +418,15 @@ pub(crate) fn parse_json_with_locations(input: &str) -> Result<ParsedJson, JsonP
 fn parse_json_with_locations_and_limits(
     input: &str,
     limits: JsonLimits,
+) -> Result<ParsedJson, JsonParseError> {
+    parse_json_bounded(input, limits, None, true)
+}
+
+fn parse_json_bounded(
+    input: &str,
+    limits: JsonLimits,
+    remaining_nodes: Option<usize>,
+    record_locations: bool,
 ) -> Result<ParsedJson, JsonParseError> {
     if input.len() > limits.max_input_bytes {
         return Err(JsonParseError {
@@ -424,6 +444,8 @@ fn parse_json_with_locations_and_limits(
         input,
         offset: 0,
         limits,
+        remaining_nodes,
+        record_locations,
         locations: BTreeMap::new(),
         location_cursor: JsonLocation { byte_offset: 0, scalar_offset: 0 },
         #[cfg(test)]
@@ -436,6 +458,8 @@ struct Parser<'a> {
     input: &'a str,
     offset: usize,
     limits: JsonLimits,
+    remaining_nodes: Option<usize>,
+    record_locations: bool,
     locations: BTreeMap<String, JsonLocation>,
     // Parsing never backtracks. Count source scalars only between successive
     // value starts, rather than rescanning the whole prefix for every node.
@@ -472,6 +496,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_value(&mut self, depth: usize, pointer: &str) -> Result<JsonValue, JsonParseError> {
+        if self.remaining_nodes == Some(0) {
+            return Err(self.error(JsonParseErrorKind::Resource, pointer, "JSON node limit exceeded"));
+        }
+        if let Some(remaining) = &mut self.remaining_nodes { *remaining -= 1; }
         if depth > self.limits.max_depth {
             return Err(self.error(
                 JsonParseErrorKind::Resource,
@@ -480,10 +508,10 @@ impl<'a> Parser<'a> {
             ));
         }
         self.skip_whitespace();
-        let location = self.current_location();
-        self.locations
-            .entry(pointer.to_owned())
-            .or_insert(location);
+        if self.record_locations {
+            let location = self.current_location();
+            self.locations.entry(pointer.to_owned()).or_insert(location);
+        }
         match self.peek() {
             Some(b'{') => self.parse_object(depth + 1, pointer),
             Some(b'[') => self.parse_array(depth + 1, pointer),
@@ -933,6 +961,8 @@ mod tests {
             input: &input,
             offset: 0,
             limits: JsonLimits::default(),
+            remaining_nodes: None,
+            record_locations: true,
             locations: BTreeMap::new(),
             location_cursor: JsonLocation { byte_offset: 0, scalar_offset: 0 },
             location_scan_bytes: 0,
@@ -1002,5 +1032,47 @@ mod tests {
         assert_eq!(error.pointer(), "/PRIVATE\n\u{001b}[31m");
         assert!(!format!("{error} {error:?}").contains("PRIVATE"));
         assert!(!format!("{error} {error:?}").chars().any(char::is_control));
+    }
+
+    #[test]
+    fn bounded_value_parser_counts_aggregate_nodes_without_location_maps() {
+        let input = r#"{"long/private~key":[{"n":12345678901234567890123456789012345678},null]}"#;
+        let limits = JsonLimits::default();
+        let parsed = parse_json_bounded(input, limits, Some(5), false).unwrap();
+        assert!(parsed.locations.is_empty());
+        assert_eq!(parsed.value, parse_json(input).unwrap());
+        assert_eq!(parse_json_with_node_limit(input, limits, 4).unwrap_err().kind(), JsonParseErrorKind::Resource);
+        assert_eq!(parse_json_with_node_limit("null", limits, 0).unwrap_err().kind(), JsonParseErrorKind::Resource);
+        // Object keys are not values; the whole tree has five nodes.
+        assert!(parse_json_with_node_limit(input, limits, 5).is_ok());
+    }
+
+    #[test]
+    fn bounded_value_parser_keeps_duplicate_depth_and_exact_decimal_rules() {
+        let limits = JsonLimits { max_depth: 1, ..JsonLimits::default() };
+        assert_eq!(parse_json_with_node_limit(r#"{"x":null,"x":0}"#, limits, 4).unwrap_err().kind(),
+            JsonParseErrorKind::DuplicateKey);
+        assert_eq!(parse_json_with_node_limit("[[0]]", limits, 3).unwrap_err().kind(), JsonParseErrorKind::Resource);
+        assert_eq!(parse_json_with_node_limit("1.00", limits, 1).unwrap(),
+            parse_json_with_node_limit("1e0", limits, 1).unwrap());
+        assert_ne!(parse_json_with_node_limit("9007199254740993", limits, 1).unwrap(),
+            parse_json_with_node_limit("9007199254740992", limits, 1).unwrap());
+    }
+
+    #[test]
+    fn value_only_and_location_parsers_keep_identical_values_and_errors() {
+        let input = r#"{"é":[1.00,12345678901234567890123456789012345678,"上海"]}"#;
+        let located = parse_json_with_locations(input).unwrap();
+        assert_eq!(parse_json_with_limits(input, JsonLimits::default()).unwrap(), located.value);
+        assert_eq!(located.locations.len(), 5);
+        assert!(located.locations.contains_key("/é/2"));
+        for malformed in [r#"{"é":[0,]}"#, r#"{"x":1,"x":2}"#, "1e309", "[null] trailing"] {
+            let value_error = parse_json_with_limits(malformed, JsonLimits::default()).unwrap_err();
+            let located_error = parse_json_with_locations(malformed).unwrap_err();
+            assert_eq!(value_error.kind(), located_error.kind());
+            assert_eq!(value_error.pointer(), located_error.pointer());
+            assert_eq!(value_error.byte_offset(), located_error.byte_offset());
+            assert_eq!(value_error.reason(), located_error.reason());
+        }
     }
 }

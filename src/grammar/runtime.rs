@@ -48,6 +48,15 @@ struct Node {
     minimum: usize,
 }
 
+/// Scalar-length rules follow schema edges. A long ancestor property name is
+/// stored once instead of being copied into every descendant's lookup key.
+#[derive(Clone, Debug, Default)]
+struct LengthRules {
+    max_chars: Option<usize>,
+    properties: BTreeMap<String, LengthRules>,
+    items: Option<Box<LengthRules>>,
+}
+
 /// Compile once, then borrow for any number of independent request states.
 #[derive(Clone, Debug)]
 pub struct JsonProgram {
@@ -55,9 +64,35 @@ pub struct JsonProgram {
     nodes: Vec<Node>,
     root: usize,
     max_output_bytes: usize,
-    lengths: BTreeMap<String, usize>,
+    lengths: LengthRules,
     exponents: Vec<(i32, Vec<u8>)>,
     source: Option<source::SourceBinding>,
+}
+
+/// Model-free declaration checks for private, already parsed gold values.
+/// This owns no executable states, source binding or acceptance authority.
+/// Actual source-bound enum feasibility remains the native planner's check.
+pub(crate) struct JsonValidationSchema {
+    root: SchemaNode,
+    lengths: LengthRules,
+    requires_source: bool,
+}
+impl JsonValidationSchema {
+    pub(crate) fn compile(source: &str, limits: CompileLimits) -> Result<Self, SchemaError> {
+        let (schema, lengths) = compile_declaration(source, limits)?;
+        let mut nodes = Vec::new();
+        // The declaration may contain verbatim enums without an invented
+        // document. Only this non-executable validator permits that state.
+        let root = build(schema.root(), "$", &lengths, &mut nodes, limits.max_states, 0, None, true)?;
+        if nodes[root].minimum > limits.max_output_bytes { return Err(resource("no JSON value fits output byte limit")); }
+        Ok(Self { root: schema.root().clone(), lengths, requires_source: schema.requires_verbatim_source() })
+    }
+    pub(crate) fn root(&self) -> &SchemaNode { &self.root }
+    pub(crate) fn requires_verbatim_source(&self) -> bool { self.requires_source }
+    pub(crate) fn validate_value(&self, value: &ValidationValue) -> Result<(), SchemaError> {
+        validate_value(&self.root, value).map_err(|_| invalid("independent JSON validation failed"))?;
+        validate_lengths(&self.root, value, "$", &self.lengths)
+    }
 }
 
 impl JsonProgram {
@@ -73,25 +108,15 @@ impl JsonProgram {
     }
 
     fn compile_bound(source: &str, limits: CompileLimits, binding: Option<source::SourceBinding>) -> Result<Self, SchemaError> {
-        if source.len() > limits.max_schema_bytes {
-            return Err(resource("schema byte limit exceeded"));
-        }
-        let mut raw = parse_json(source)?;
-        let mut lengths = BTreeMap::new();
-        take_lengths(&mut raw, "$", &mut lengths, 0)?;
-        let normalized = render(&raw);
-        // Canonical spelling can expand exact decimals. This internal copy is
-        // bounded by the already checked source plus the exact parser domain.
-        let mut compiler_limits = limits;
-        compiler_limits.max_schema_bytes = normalized.len();
-        let schema = compile_json_schema(&normalized, compiler_limits)?;
+        let (schema, lengths) = compile_declaration(source, limits)?;
         if schema.requires_verbatim_source() && binding.is_none() {
             return Err(SchemaError::UnsupportedKeyword {
                 pointer: "$".to_owned(), keyword: "runtime source-product gate".to_owned(),
             });
         }
         let mut nodes = Vec::new();
-        let root = build(schema.root(), "$", &lengths, &mut nodes, limits.max_states, 0, binding.as_ref().map(|b| &b.language))?;
+        let root = build(schema.root(), "$", &lengths, &mut nodes, limits.max_states, 0,
+            binding.as_ref().map(|b| &b.language), false)?;
         if nodes[root].minimum > limits.max_output_bytes {
             return Err(resource("no JSON value fits output byte limit"));
         }
@@ -134,6 +159,19 @@ impl JsonProgram {
     }
 }
 
+fn compile_declaration(source: &str, limits: CompileLimits)
+    -> Result<(CompiledSchema, LengthRules), SchemaError> {
+    if source.len() > limits.max_schema_bytes { return Err(resource("schema byte limit exceeded")); }
+    let mut raw = parse_json(source)?;
+    let lengths = take_lengths(&mut raw, "$", 0)?;
+    let normalized = render(&raw);
+    // Canonical spelling can expand exact decimals. This internal copy is
+    // bounded by the already checked source plus the exact parser domain.
+    let mut compiler_limits = limits;
+    compiler_limits.max_schema_bytes = normalized.len();
+    Ok((compile_json_schema(&normalized, compiler_limits)?, lengths))
+}
+
 fn resource(reason: &str) -> SchemaError {
     SchemaError::Resource { pointer: "$".to_owned(), reason: reason.to_owned() }
 }
@@ -144,9 +182,10 @@ fn child_path(path: &str, key: &str) -> String {
     format!("{path}/properties/{}", key.replace('~', "~0").replace('/', "~1"))
 }
 
-fn take_lengths(value: &mut JsonValue, path: &str, lengths: &mut BTreeMap<String, usize>, depth: usize) -> Result<(), SchemaError> {
+fn take_lengths(value: &mut JsonValue, path: &str, depth: usize) -> Result<LengthRules, SchemaError> {
     if depth > MAX_DEPTH { return Err(resource("schema nesting limit exceeded")); }
-    let JsonValue::Object(object) = value else { return Ok(()); };
+    let mut lengths = LengthRules::default();
+    let JsonValue::Object(object) = value else { return Ok(lengths); };
     if object.get("type").and_then(JsonValue::as_string) == Some("string") {
         if let Some(bound) = object.remove("maxLength") {
             let count = match bound.as_number().and_then(|n| n.integer_value()) {
@@ -154,16 +193,18 @@ fn take_lengths(value: &mut JsonValue, path: &str, lengths: &mut BTreeMap<String
                 Some(IntegerValue::Unsigned(n)) => n,
                 _ => return Err(invalid("maxLength must be a nonnegative integer")),
             };
-            lengths.insert(path.to_owned(), usize::try_from(count).unwrap_or(usize::MAX));
+            lengths.max_chars = Some(usize::try_from(count).unwrap_or(usize::MAX));
         }
     }
     if let Some(JsonValue::Object(properties)) = object.get_mut("properties") {
-        for (name, child) in properties { take_lengths(child, &child_path(path, name), lengths, depth + 1)?; }
+        for (name, child) in properties {
+            lengths.properties.insert(name.clone(), take_lengths(child, &child_path(path, name), depth + 1)?);
+        }
     }
     if let Some(items) = object.get_mut("items") {
-        take_lengths(items, &format!("{path}/items"), lengths, depth + 1)?;
+        lengths.items = Some(Box::new(take_lengths(items, &format!("{path}/items"), depth + 1)?));
     }
-    Ok(())
+    Ok(lengths)
 }
 
 fn render(value: &JsonValue) -> String {
@@ -177,7 +218,9 @@ fn render(value: &JsonValue) -> String {
     }
 }
 
-fn build(schema: &SchemaNode, path: &str, lengths: &BTreeMap<String, usize>, nodes: &mut Vec<Node>, cap: usize, depth: usize, source: Option<&SourceLanguage>) -> Result<usize, SchemaError> {
+#[allow(clippy::too_many_arguments)]
+fn build(schema: &SchemaNode, path: &str, lengths: &LengthRules, nodes: &mut Vec<Node>,
+    cap: usize, depth: usize, source: Option<&SourceLanguage>, declaration_only: bool) -> Result<usize, SchemaError> {
     if depth > MAX_DEPTH || nodes.len() >= cap { return Err(resource("runtime schema state limit exceeded")); }
     let literals = |values: &[ScalarValue]| {
         let mut bytes: Vec<_> = values.iter().map(|v| v.canonical_json().into_bytes()).collect();
@@ -188,25 +231,28 @@ fn build(schema: &SchemaNode, path: &str, lengths: &BTreeMap<String, usize>, nod
         SchemaNode::Object { properties, required } => {
             let mut fields = Vec::new();
             for (name, child) in properties {
+                let child_lengths = lengths.properties.get(name).ok_or_else(|| invalid("schema length-rule shape differs"))?;
                 fields.push(Property {
                     key: format!("{}:", escape_json_string(name)).into_bytes(),
-                    child: build(child, &child_path(path, name), lengths, nodes, cap, depth + 1, source)?,
+                    child: build(child, &child_path(path, name), child_lengths, nodes, cap, depth + 1, source, declaration_only)?,
                     required: required.contains(name),
                 });
             }
             Kind::Object(fields)
         }
         SchemaNode::Array { items, max_items } => Kind::Array {
-            child: build(items, &format!("{path}/items"), lengths, nodes, cap, depth + 1, source)?, maximum: *max_items,
+            child: build(items, &format!("{path}/items"),
+                lengths.items.as_deref().ok_or_else(|| invalid("schema length-rule shape differs"))?,
+                nodes, cap, depth + 1, source, declaration_only)?, maximum: *max_items,
         },
         SchemaNode::String { max_bytes, allowed, source: annotation } => {
             let verbatim = *annotation == SourceAnnotation::Verbatim;
-            let max_chars = lengths.get(path).copied().unwrap_or(usize::MAX);
+            let max_chars = lengths.max_chars.unwrap_or(usize::MAX);
             if let Some(values) = allowed {
                 if values.iter().any(|v| matches!(v, ScalarValue::String(s) if s.chars().count() > max_chars)) {
                     return Err(invalid("enum/const exceeds maxLength"));
                 }
-                if verbatim {
+                if verbatim && !declaration_only {
                     let index = source.ok_or_else(|| invalid("source annotation has no binding"))?;
                     let filtered: Vec<_> = values.iter().filter(|v| {
                         let ScalarValue::String(text) = v else { return false; };
@@ -248,20 +294,24 @@ fn build(schema: &SchemaNode, path: &str, lengths: &BTreeMap<String, usize>, nod
     Ok(id)
 }
 
-fn validate_lengths(schema: &SchemaNode, value: &ValidationValue, path: &str, lengths: &BTreeMap<String, usize>) -> Result<(), SchemaError> {
+fn validate_lengths(schema: &SchemaNode, value: &ValidationValue, path: &str, lengths: &LengthRules) -> Result<(), SchemaError> {
     match (schema, value) {
         (SchemaNode::String { .. }, ValidationValue::String(s)) => {
-            if lengths.get(path).is_some_and(|&cap| s.chars().count() > cap) {
+            if lengths.max_chars.is_some_and(|cap| s.chars().count() > cap) {
                 return Err(SchemaError::Validation { pointer: path.to_owned(), reason: "maxLength exceeded".to_owned() });
             }
         }
         (SchemaNode::Object { properties, .. }, ValidationValue::Object(values)) => {
             for (key, child) in properties {
-                if let Some(value) = values.get(key) { validate_lengths(child, value, &child_path(path, key), lengths)?; }
+                if let Some(value) = values.get(key) {
+                    let rules = lengths.properties.get(key).ok_or_else(|| invalid("schema length-rule shape differs"))?;
+                    validate_lengths(child, value, &child_path(path, key), rules)?;
+                }
             }
         }
         (SchemaNode::Array { items, .. }, ValidationValue::Array(values)) => {
-            for value in values { validate_lengths(items, value, &format!("{path}/items"), lengths)?; }
+            let rules = lengths.items.as_deref().ok_or_else(|| invalid("schema length-rule shape differs"))?;
+            for value in values { validate_lengths(items, value, &format!("{path}/items"), rules)?; }
         }
         _ => {}
     }
@@ -647,5 +697,72 @@ mod tests {
         let mut s = p.initial_state();
         for &b in text.as_bytes() { assert!(s.consume(b)); }
         assert!(s.is_accepting()); assert_eq!(s.consumed_bytes(), text.len()); p.validate_json(text).unwrap();
+    }
+
+    #[test]
+    fn declaration_validation_shares_native_scalar_length_and_enum_semantics() {
+        for schema in [r#"{"type":"string","maxLength":2}"#,
+            r#"{"type":"string","maxLength":2,"enum":["é","上海"]}"#] {
+            let declaration = JsonValidationSchema::compile(schema, CompileLimits::default()).unwrap();
+            let native = JsonProgram::compile(schema, CompileLimits::default()).unwrap();
+            for text in [r#""é""#, r#""上海""#, r#""é上海""#, "null"] {
+                let value = crate::validation::parse_json(text).unwrap();
+                assert_eq!(declaration.validate_value(&value).is_ok(), native.validate_json(text).is_ok());
+            }
+        }
+        let invalid = r#"{"type":"string","maxLength":1,"enum":["上海"]}"#;
+        assert!(JsonValidationSchema::compile(invalid, CompileLimits::default()).is_err());
+        assert!(JsonProgram::compile(invalid, CompileLimits::default()).is_err());
+    }
+
+    #[test]
+    fn declaration_validation_never_grants_unbound_source_execution() {
+        let schema = r#"{"type":"string","maxLength":1,"enum":["é"],"x-fnlp-source":"verbatim"}"#;
+        let declaration = JsonValidationSchema::compile(schema, CompileLimits::default()).unwrap();
+        assert!(declaration.requires_verbatim_source());
+        declaration.validate_value(&crate::validation::parse_json(r#""é""#).unwrap()).unwrap();
+        assert!(JsonProgram::compile(schema, CompileLimits::default()).is_err());
+        let actual = JsonProgram::compile_with_source(schema, "é", CompileLimits::default(), SourceRuntimeLimits::default()).unwrap();
+        actual.validate_json(r#""é""#).unwrap();
+        assert!(JsonProgram::compile_with_source(schema, "absent", CompileLimits::default(), SourceRuntimeLimits::default()).is_err());
+    }
+
+    #[test]
+    fn declaration_validation_keeps_native_depth_and_minimum_output_caps() {
+        let too_small = CompileLimits { max_output_bytes: 1, ..CompileLimits::default() };
+        let schema = r#"{"type":"string"}"#;
+        assert!(JsonValidationSchema::compile(schema, too_small).is_err());
+        assert!(JsonProgram::compile(schema, too_small).is_err());
+        let mut nested = "{\"type\":\"null\"}".to_owned();
+        for _ in 0..65 { nested = format!("{{\"type\":\"array\",\"items\":{nested},\"maxItems\":1}}"); }
+        assert!(JsonValidationSchema::compile(&nested, CompileLimits::default()).is_err());
+        assert!(JsonProgram::compile(&nested, CompileLimits::default()).is_err());
+    }
+
+    #[test]
+    fn length_rule_storage_never_repeats_long_ancestor_property_names() {
+        fn stored_key_bytes(rules: &LengthRules) -> usize {
+            rules.properties.iter().map(|(key, child)| key.len() + stored_key_bytes(child)).sum::<usize>()
+                + rules.items.as_deref().map_or(0, stored_key_bytes)
+        }
+        let long = "private/~".repeat(256);
+        let mut properties = serde_json::Map::new(); let mut values = serde_json::Map::new();
+        for index in 0..64 {
+            let key = format!("k{index:02}");
+            properties.insert(key.clone(), serde_json::json!({"type":"string","maxLength":1}));
+            values.insert(key, serde_json::json!("é"));
+        }
+        let mut outer = serde_json::Map::new();
+        outer.insert(long.clone(), serde_json::json!({"type":"object","properties":properties,"additionalProperties":false}));
+        let schema = serde_json::to_string(&serde_json::json!({"type":"object","properties":outer,"additionalProperties":false})).unwrap();
+        let native = JsonProgram::compile(&schema, CompileLimits::default()).unwrap();
+        let declaration = JsonValidationSchema::compile(&schema, CompileLimits::default()).unwrap();
+        assert_eq!(stored_key_bytes(&native.lengths), long.len() + 64 * 3);
+        assert_eq!(stored_key_bytes(&declaration.lengths), long.len() + 64 * 3);
+        assert!(stored_key_bytes(&native.lengths) < schema.len());
+        let mut document = serde_json::Map::new(); document.insert(long, serde_json::Value::Object(values));
+        let text = serde_json::to_string(&document).unwrap();
+        let value = crate::validation::parse_json(&text).unwrap();
+        native.validate_json(&text).unwrap(); declaration.validate_value(&value).unwrap();
     }
 }
