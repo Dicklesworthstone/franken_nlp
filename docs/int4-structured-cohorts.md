@@ -122,6 +122,14 @@ success; a drained stream can still contain rejected documents.
   collection of schema/source plans.
 - `NlpEngine::execute_int4_source_cohort` executes prepared NER, keyphrase,
   summary, and passage-QA plans, including mixed source-task kinds.
+- `NlpEngine::answer_int4_document_cohorts` executes one immutable question
+  over the complete source partition with `Int4SourceMapConfig<SourceQuestion>`.
+  Its `.document` retains every independent answer, abstention and whitespace
+  range in original order. `mapping.reduction.map_batch_chunks` counts source
+  chunks per window; `.cohorts.chunks` counts only nonblank native passages and
+  `.cohorts.cohorts` excludes all-whitespace windows. All original-coordinate
+  citation checks and nonrenewable question verification budgets still apply.
+  It does not select or synthesize a global answer.
 - `NlpEngine::summarize_int4_source_cohorts` and
   `NlpEngine::reduce_int4_keyphrases_document_cohorts` execute native chunk
   windows directly into the existing complete-document summary/keyphrase

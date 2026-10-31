@@ -6,8 +6,8 @@ use crate::tasks::source_planning::grouped_int4::long::cohort::{
 };
 mod aggregate;
 
-impl Int4SourceMapConfig {
-    /// Pre-IO peak for a simultaneous raw source-map window. Full document
+impl<T> Int4SourceMapConfig<T> {
+    /// Pre-IO peak for a simultaneous native source-map window. Full document
     /// preparation, frontier, evidence and output remain separately funded.
     pub fn cohort_requirements(&self, group_width: usize)
         -> Result<Int4SourceMapCohortRequirement, HostedError> {
@@ -119,7 +119,7 @@ impl NlpEngine {
     }
 }
 
-fn check_peak(required: Int4SourceMapCohortRequirement, ceiling: Int4SourceMapCohortRequirement)
+pub(super) fn check_peak(required: Int4SourceMapCohortRequirement, ceiling: Int4SourceMapCohortRequirement)
     -> Result<(), HostedError> {
     if required.native.kv_bytes > ceiling.native.kv_bytes || required.native.rope_bytes > ceiling.native.rope_bytes
         || required.native.scratch_payload_bound > ceiling.native.scratch_payload_bound

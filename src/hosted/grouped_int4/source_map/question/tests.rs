@@ -4,7 +4,7 @@ use crate::{execution_identity::NumericsProfile, native_engine::decode::DecodeCa
     tasks::{answer::AnswerOptions, source_planning::grouped_int4::Int4SourceError},
     validation::grounded_fields::GroundingBudget};
 
-fn fixture(width: usize) -> (SourceTaskPlanner, Int4SourceMapConfig<SourceQuestion>) {
+pub(super) fn fixture(width: usize) -> (SourceTaskPlanner, Int4SourceMapConfig<SourceQuestion>) {
     let (planner, base) = super::super::tests::fixture(SourceMapTask::Summarize(Default::default()), width);
     let mut identity = base.identity; identity.task_spec = ANSWER_TASK_VERSION.to_owned();
     let task = SourceQuestion { question: "Who founded the company?".to_owned(), options: AnswerOptions::default(),

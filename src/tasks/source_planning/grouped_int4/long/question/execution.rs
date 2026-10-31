@@ -3,7 +3,7 @@ use super::*;
 use super::super::execution::{SourceDriver, NativeDriver, check_run};
 
 impl PreparedInt4Question<'_> {
-    fn check_plans(&self, admitted: &[ExecutionIdentity]) -> Result<(), Int4SourceMapError> {
+    pub(super) fn check_plans(&self, admitted: &[ExecutionIdentity]) -> Result<(), Int4SourceMapError> {
         if self.plans.is_empty() || self.plans.len() != admitted.len()
             || self.plan_indices.len() != self.chunks.chunks().len()
             || self.expected.native_chunks != self.plans.len()
@@ -101,6 +101,31 @@ impl<D: SourceDriver> MapReduceTask for Executor<'_, D> {
         ReductionPolicy { id: "all-passage-answers-source-order-no-voting-v1", may_discard_information: false }
     }
     fn map_batch(&mut self, chunks: &[SourceChunk<'_>]) -> Result<Vec<MapOutput<QuestionValue>>, Int4SourceError> {
+        // Map windows follow ALL source chunks. Their nonblank plans form a
+        // dense slice, but whitespace must not create a native row or allow
+        // unrelated plans from the next source window into this one.
+        let end = self.next.checked_add(chunks.len()).ok_or(Int4SourceError::InvalidResult)?;
+        let indices = self.indices.get(self.next..end).ok_or(Int4SourceError::InvalidResult)?;
+        if chunks.is_empty() || chunks.iter().zip(indices).enumerate().any(|(offset, (chunk, index))|
+            chunk.id() != self.next + offset || has_text(chunk.text()) != index.is_some()) {
+            return Err(Int4SourceError::InvalidResult);
+        }
+        let mut native_rows = if let Some(first) = indices.iter().flatten().next().copied() {
+            let count = indices.iter().flatten().count();
+            let last = first.checked_add(count).ok_or(Int4SourceError::InvalidResult)?;
+            if !indices.iter().filter_map(|index| *index).eq(first..last) {
+                return Err(Int4SourceError::InvalidResult);
+            }
+            let plans = self.plans.get(first..last).ok_or(Int4SourceError::InvalidResult)?;
+            let admitted = self.admitted.get(first..last).ok_or(Int4SourceError::InvalidResult)?;
+            let mut driver = self.driver.borrow_mut();
+            if !driver.clean() { return Err(Int4SourceError::InvalidResult); }
+            let rows = driver.run_batch(plans, admitted)?;
+            if rows.as_ref().is_some_and(|rows| rows.len() != plans.len()) || !driver.clean() {
+                return Err(Int4SourceError::InvalidResult);
+            }
+            rows.map(Vec::into_iter)
+        } else { None };
         let mut values = Vec::new();
         values.try_reserve_exact(chunks.len()).map_err(|_| SourcePlanningError::AllocationRefused)?;
         for chunk in chunks {
@@ -112,7 +137,12 @@ impl<D: SourceDriver> MapReduceTask for Executor<'_, D> {
                 if !has_text(chunk.text()) { return Err(Int4SourceError::InvalidResult); }
                 let plan = self.plans.get(index).ok_or(Int4SourceError::InvalidResult)?;
                 let admitted = self.admitted.get(index).ok_or(Int4SourceError::InvalidResult)?;
-                let native = driver.run(plan, admitted)?;
+                let native = match &mut native_rows {
+                    Some(rows) => rows.next().ok_or(Int4SourceError::InvalidResult)?,
+                    // The default hook performs no work: serial execution
+                    // retains native row -> verification -> next native row.
+                    None => driver.run(plan, admitted)?,
+                };
                 check_run(plan, &native, self.mask_cap)?;
                 if !driver.clean() { return Err(Int4SourceError::InvalidResult); }
                 let work = native.model_work;

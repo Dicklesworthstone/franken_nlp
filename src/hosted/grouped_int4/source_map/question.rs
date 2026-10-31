@@ -7,6 +7,7 @@ use crate::tasks::{
     summarize::SourceCitation,
 };
 mod synthesis;
+mod cohort;
 
 impl<T: std::borrow::Borrow<SourceQuestion>> Int4SourceMapConfig<T> {
     /// Complete frontier plus native local, independent scan and lifted

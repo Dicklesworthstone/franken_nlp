@@ -1777,6 +1777,14 @@ end-to-end deadline cooperatively.
 Library callers use `SourceTaskPlanner::preflight_int4_question_with_control`,
 `SourceTaskPlanner::plan_int4_question_with_control`, and
 `NlpEngine::answer_int4_document` with `Int4SourceMapConfig<SourceQuestion>`.
+`NlpEngine::answer_int4_document_cohorts` additionally executes each nonblank
+source window through shared native decoder layers. Set
+`mapping.reduction.map_batch_chunks` to select the maximum source chunks per
+window; whitespace-only chunks remain in the result and occupy no native row.
+The returned `.document` preserves all passage answers and citations, while
+`.cohorts` reports actual nonblank rows and nonempty native windows. Complete
+question/source preparation, every source chunk's frontier, independent
+citation storage and the native/decoder peak remain admitted together.
 This is a candidate feature; compilation, model-present correctness and
 quality qualification remain pending controller-selected gates.
 

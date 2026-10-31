@@ -5,7 +5,7 @@ use super::super::{execution::SourceDriver, tests as fixtures};
 use crate::tasks::answer::PassageOccurrence;
 use std::{cell::Cell, collections::VecDeque, rc::Rc};
 
-fn question() -> SourceQuestion {
+pub(super) fn question() -> SourceQuestion {
     SourceQuestion { question: "Who is named? private-question-token".to_owned(),
         options: AnswerOptions::default(), verification: GroundingBudget::default() }
 }
@@ -13,12 +13,12 @@ fn identity(planner: &SourceTaskPlanner, width: usize) -> ExecutionIdentity {
     let mut identity = fixtures::identity(planner, &SourceMapTask::Ner(NerOptions::default()), width);
     identity.task_spec = ANSWER_TASK_VERSION.to_owned(); identity
 }
-fn limits() -> Int4SourceMapLimits {
+pub(super) fn limits() -> Int4SourceMapLimits {
     let mut limits = fixtures::limits();
     limits.chunks.max_chunk_bytes = 6; limits.chunks.max_chunk_tokens = 6;
     limits.reduction.map_batch_chunks = 2; limits
 }
-fn prepare<'s>(planner: &SourceTaskPlanner, source: &'s str, question: &SourceQuestion,
+pub(super) fn prepare<'s>(planner: &SourceTaskPlanner, source: &'s str, question: &SourceQuestion,
     limits: Int4SourceMapLimits, width: usize) -> PreparedInt4Question<'s> {
     let id = identity(planner, width); let budget = fixtures::budget();
     planner.plan_int4_question_with_control(source, question, budget, &PlanContext::new(&id, budget).unwrap(),
@@ -41,13 +41,21 @@ fn raw(plan: &PreparedInt4SourceTask, chunk: &SourceChunk<'_>) -> AnswerResult {
         generated_token_ids: vec![ordinary, options.eos_token_id], forward_positions: 0,
         projected_logits: 0, mask_node_visit_charge: 20 }
 }
-struct Script {
-    outputs: VecDeque<AnswerResult>, calls: Rc<Cell<usize>>, checkpoints: Rc<Cell<usize>>,
-    model_checks: Rc<Cell<usize>>, width: usize, capacity: usize,
-    fail_model_at: Option<usize>, fail_run_at: Option<usize>, cancel_at: Option<usize>,
-    dirty_after: Option<usize>, corrupt_axis: Option<usize>, receipt_width: Option<usize>,
+pub(super) struct Script {
+    pub(super) outputs: VecDeque<AnswerResult>,
+    pub(super) calls: Rc<Cell<usize>>,
+    pub(super) checkpoints: Rc<Cell<usize>>,
+    model_checks: Rc<Cell<usize>>,
+    pub(super) width: usize,
+    pub(super) capacity: usize,
+    pub(super) fail_model_at: Option<usize>,
+    pub(super) fail_run_at: Option<usize>,
+    pub(super) cancel_at: Option<usize>,
+    pub(super) dirty_after: Option<usize>,
+    pub(super) corrupt_axis: Option<usize>,
+    pub(super) receipt_width: Option<usize>,
 }
-fn script(prepared: &PreparedInt4Question<'_>) -> Script {
+pub(super) fn script(prepared: &PreparedInt4Question<'_>) -> Script {
     let outputs = prepared.chunks.chunks().iter().zip(&prepared.plan_indices)
         .filter_map(|(chunk, index)| index.map(|index| raw(&prepared.plans[index], chunk))).collect();
     Script { outputs, calls: Rc::new(Cell::new(0)), checkpoints: Rc::new(Cell::new(0)),
@@ -79,13 +87,13 @@ impl SourceDriver for Script {
             group_width: self.receipt_width.unwrap_or(plan.group_width()), result: SourceTaskResult::Answer(raw), model_work })
     }
 }
-fn change_axis(work: &mut Int4Work, axis: usize, delta: i64) {
+pub(super) fn change_axis(work: &mut Int4Work, axis: usize, delta: i64) {
     let value = match axis { 0 => &mut work.forward_positions, 1 => &mut work.projected_logits,
         2 => &mut work.attention_pairs, 3 => &mut work.projections.dot_products,
         _ => &mut work.projections.multiply_accumulates };
     if delta > 0 { *value += delta as u64; } else { *value -= (-delta) as u64; }
 }
-fn execute(prepared: PreparedInt4Question<'_>, driver: Script) -> Result<Int4QuestionRun, Int4SourceMapError> {
+pub(super) fn execute(prepared: PreparedInt4Question<'_>, driver: Script) -> Result<Int4QuestionRun, Int4SourceMapError> {
     let admitted = prepared.execution_identities().cloned().collect::<Vec<_>>();
     prepared.execute_with_driver(&admitted, driver)
 }

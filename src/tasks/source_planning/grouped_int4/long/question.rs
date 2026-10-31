@@ -12,6 +12,8 @@ use crate::tasks::{
 
 mod planning;
 mod execution;
+/// Native cohorts for independent passage answers with lossless source order.
+pub mod cohort;
 /// Opt-in native answer synthesis using verified verbatim passage evidence.
 pub mod synthesis;
 

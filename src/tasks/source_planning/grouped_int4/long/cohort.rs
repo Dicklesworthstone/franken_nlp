@@ -57,6 +57,8 @@ pub struct Int4SourceMapCohortBudget {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct Int4SourceMapCohortStats {
     pub cohorts: u64,
+    /// Native rows only. Question maps retain whitespace chunks separately
+    /// without executing a fabricated native row for those source ranges.
     pub chunks: u64,
     pub group_steps: u64,
     pub projection_groups: u64,
@@ -72,11 +74,11 @@ pub struct Int4SourceMapCohortRun {
     pub cohorts: Int4SourceMapCohortStats,
 }
 
-struct Window {
+pub(super) struct Window {
     contexts: [usize; MAX_INT4_SEQUENCES],
     count: usize,
-    requirement: Int4SourceMapCohortRequirement,
-    work: Int4Work,
+    pub(super) requirement: Int4SourceMapCohortRequirement,
+    pub(super) work: Int4Work,
 }
 impl PreparedInt4SourceMap<'_> {
     /// Exact componentwise peak over all actual windows, including the short
@@ -206,6 +208,16 @@ pub(super) struct AggregateDriver<'w, 'v, 'c, 's, C> {
     stats: &'s mut Int4SourceMapCohortStats,
     limits: Int4SourceMapLimits,
 }
+impl<'w, 'v, 'c, 's, C> AggregateDriver<'w, 'v, 'c, 's, C> {
+    /// Construction allocates no native state. The sealed caller completes
+    /// every row's admission before the first optional batch hook is invoked.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(weights: &'w Int4ModelWeights, vocabulary: &'v ExtractionVocabulary,
+        budget: Int4SourceMapCohortBudget, kernel: PackedInt4Kernel, limits: Int4SourceMapLimits,
+        stats: &'s mut Int4SourceMapCohortStats, control: &'c mut C) -> Self {
+        Self { native: Native { weights, vocabulary, budget, kernel }, control, stats, limits }
+    }
+}
 impl PreparedInt4SourceMap<'_> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn aggregate_driver<'w, 'v, 'c, 's, C: DecodeStepControl>(&self,
@@ -215,8 +227,7 @@ impl PreparedInt4SourceMap<'_> {
         -> Result<AggregateDriver<'w, 'v, 'c, 's, C>, Int4SourceMapError> {
         self.check_cohort_model(admitted, weights, control)?;
         self.preflight_cohorts(admitted, vocabulary, budget, control)?;
-        Ok(AggregateDriver { native: Native { weights, vocabulary, budget, kernel },
-            control, stats, limits: self.limits })
+        Ok(AggregateDriver::new(weights, vocabulary, budget, kernel, self.limits, stats, control))
     }
 }
 impl<C: DecodeStepControl> execution::SourceDriver for AggregateDriver<'_, '_, '_, '_, C> {
@@ -262,7 +273,7 @@ fn requirement(native: Int4MemoryRequirement, count: usize, tokens: u64, bytes: 
     let workspace_bytes = required_workspace_bytes(count, tokens, max_result_bytes).map_err(Int4SourceError::from)?;
     Ok(Int4SourceMapCohortRequirement { native, workspace_bytes, max_result_bytes })
 }
-fn window(plans: &[PreparedInt4SourceTask], width: usize, context_limit: usize)
+pub(super) fn window(plans: &[PreparedInt4SourceTask], width: usize, context_limit: usize)
     -> Result<Window, Int4SourceMapError> {
     if plans.is_empty() || plans.len() > MAX_INT4_SEQUENCES { return Err(Int4SourceMapError::InvalidLimits); }
     let mut contexts = [0; MAX_INT4_SEQUENCES]; let mut work = Int4Work::default();
@@ -284,20 +295,20 @@ fn window(plans: &[PreparedInt4SourceTask], width: usize, context_limit: usize)
     let native = Int4MemoryRequirement::for_cohort(&contexts[..plans.len()], width).map_err(native_error)?;
     Ok(Window { contexts, count: plans.len(), requirement: requirement(native, plans.len(), tokens, bytes)?, work })
 }
-fn maximum(a: Int4SourceMapCohortRequirement, b: Int4SourceMapCohortRequirement) -> Int4SourceMapCohortRequirement {
+pub(super) fn maximum(a: Int4SourceMapCohortRequirement, b: Int4SourceMapCohortRequirement) -> Int4SourceMapCohortRequirement {
     Int4SourceMapCohortRequirement { native: Int4MemoryRequirement {
         kv_bytes: a.native.kv_bytes.max(b.native.kv_bytes), rope_bytes: a.native.rope_bytes.max(b.native.rope_bytes),
         scratch_payload_bound: a.native.scratch_payload_bound.max(b.native.scratch_payload_bound) },
         workspace_bytes: a.workspace_bytes.max(b.workspace_bytes), max_result_bytes: a.max_result_bytes.max(b.max_result_bytes) }
 }
-fn check_budget(need: Int4SourceMapCohortRequirement, budget: Int4SourceMapCohortBudget) -> Result<(), Int4SourceMapError> {
+pub(super) fn check_budget(need: Int4SourceMapCohortRequirement, budget: Int4SourceMapCohortBudget) -> Result<(), Int4SourceMapError> {
     if need.native.kv_bytes > budget.native_memory.max_kv_bytes || need.native.rope_bytes > budget.native_memory.max_rope_bytes
         || need.native.scratch_payload_bound > budget.native_memory.max_scratch_payload_bytes
         || need.workspace_bytes > budget.max_workspace_bytes || need.max_result_bytes > budget.max_result_bytes
         || budget.max_result_bytes > MAX_COHORT_RESULT_BYTES { return Err(Int4SourceMapError::Admission); }
     Ok(())
 }
-fn row_budget(plan: &PreparedInt4SourceTask, context: usize, limits: Int4SourceMapLimits)
+pub(super) fn row_budget(plan: &PreparedInt4SourceTask, context: usize, limits: Int4SourceMapLimits)
     -> Result<Int4JsonBudget, Int4SourceError> {
     let work = plan.planned_work();
     let native = Int4MemoryRequirement::for_context(context, plan.group_width()).map_err(Int4JsonError::from)?;
@@ -386,7 +397,7 @@ impl<D: CohortDriver, C: DecodeStepControl> MapReduceTask for Executor<'_, '_, D
         execution::reduce(input, &mut || checkpoint(&mut **self.control.borrow_mut()))
     }
 }
-fn validate_group(plans: &[PreparedInt4SourceTask], run: &Int4SourceCohortRun) -> Result<(), Int4SourceError> {
+pub(super) fn validate_group(plans: &[PreparedInt4SourceTask], run: &Int4SourceCohortRun) -> Result<(), Int4SourceError> {
     if plans.is_empty() || run.schema_version != 1 || run.execution != INT4_SOURCE_COHORT_EXECUTION
         || run.sequences.len() != plans.len() { return Err(Int4SourceError::InvalidResult); }
     let mut planned = Int4Work::default(); let mut actual = Int4Work::default();
@@ -399,7 +410,7 @@ fn validate_group(plans: &[PreparedInt4SourceTask], run: &Int4SourceCohortRun) -
             SourceTaskResult::Ner(r) => r.generated_token_ids.len(),
             SourceTaskResult::Keyphrases(r) => r.generated_token_ids.len(),
             SourceTaskResult::Summarize(r) => r.generated_token_ids.len(),
-            SourceTaskResult::Answer(_) => return Err(Int4SourceError::InvalidResult),
+            SourceTaskResult::Answer(r) => r.generated_token_ids.len(),
         } as u64;
         longest_head = longest_head.max(tokens); heads = heads.checked_add(tokens).ok_or(Int4SourceError::InvalidResult)?;
     }
@@ -410,7 +421,7 @@ fn validate_group(plans: &[PreparedInt4SourceTask], run: &Int4SourceCohortRun) -
     }
     Ok(())
 }
-fn accumulate(previous: Int4SourceMapCohortStats, run: &Int4SourceCohortRun)
+pub(super) fn accumulate(previous: Int4SourceMapCohortStats, run: &Int4SourceCohortRun)
     -> Result<Int4SourceMapCohortStats, Int4SourceError> {
     let add = |a: u64, b: u64| a.checked_add(b).ok_or(Int4SourceError::InvalidResult);
     Ok(Int4SourceMapCohortStats { cohorts: add(previous.cohorts, 1)?, chunks: add(previous.chunks, run.sequences.len() as u64)?,
