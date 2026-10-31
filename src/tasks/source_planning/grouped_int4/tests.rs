@@ -21,7 +21,7 @@ impl DecodeStepControl for StopAfter {
         (self.calls >= self.at).then_some(DecodeCancellationKind::Deadline)
     }
 }
-fn planner() -> SourceTaskPlanner {
+pub(super) fn planner() -> SourceTaskPlanner {
     let t = EmbeddedTokenizer::pinned().unwrap();
     let entries: Vec<_> = [IM_START, IM_END, THINK_START, THINK_END].iter().map(|&surface| {
         let ids = t.tokenizer().encode_ids_with_options(surface, EncodeOptions { add_bos: false, add_eos: false }).unwrap();
@@ -57,20 +57,20 @@ fn identity_with_width(p: &SourceTaskPlanner, request: &SourceTaskRequest, width
         calibration_digest: d, decision_policy_digest: d, backend_semantic_version: STRICT_INT4_EXECUTION.to_owned(),
         host_class: None, compiler_identity: None }
 }
-fn prepare(p: &SourceTaskPlanner, r: &SourceTaskRequest) -> PreparedInt4SourceTask {
+pub(super) fn prepare(p: &SourceTaskPlanner, r: &SourceTaskRequest) -> PreparedInt4SourceTask {
     p.plan_int4_with_control(r, &PlanContext::new(&identity(p, r), budget()).unwrap(),
         SourcePlanningLimits::default(), 32, &mut Continue).unwrap()
 }
-fn ner(source: &str) -> SourceTaskRequest {
+pub(super) fn ner(source: &str) -> SourceTaskRequest {
     SourceTaskRequest::Ner { document: source.to_owned(), options: NerOptions::default(), budget: budget() }
 }
-fn keyphrases(source: &str) -> SourceTaskRequest {
+pub(super) fn keyphrases(source: &str) -> SourceTaskRequest {
     SourceTaskRequest::Keyphrases { document: source.to_owned(), options: KeyphraseOptions::default(), budget: budget() }
 }
-fn summary(source: &str) -> SourceTaskRequest {
+pub(super) fn summary(source: &str) -> SourceTaskRequest {
     SourceTaskRequest::Summarize { document: source.to_owned(), options: SummaryOptions::default(), budget: budget() }
 }
-fn answer(values: &[(&str, &str)]) -> SourceTaskRequest {
+pub(super) fn answer(values: &[(&str, &str)]) -> SourceTaskRequest {
     SourceTaskRequest::Answer { question: "Who is named?".to_owned(),
         passages: values.iter().map(|&(id, text)| AnswerPassage { id: id.to_owned(), text: text.to_owned() }).collect(),
         options: AnswerOptions::default(), budget: budget() }
@@ -83,7 +83,7 @@ fn schema(r: &SourceTaskRequest) -> String {
 }
 // Independent source membership is real; numbers and token IDs below are
 // deliberately synthetic. Only the private semantic-finalization seam sees them.
-fn synthetic(p: &PreparedInt4SourceTask, r: &SourceTaskRequest, source: &str, json: &str) -> Int4ExtractRun {
+pub(super) fn synthetic(p: &PreparedInt4SourceTask, r: &SourceTaskRequest, source: &str, json: &str) -> Int4ExtractRun {
     let grammar = JsonProgram::compile_with_source(&schema(r), source, CompileLimits::default(),
         SourceRuntimeLimits::default()).unwrap();
     let work = constrained_int4::planned_work(p.group_width(), p.prompt_tokens(), 2).unwrap();

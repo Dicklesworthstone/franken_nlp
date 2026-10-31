@@ -12,6 +12,7 @@ use crate::native_engine::{
 };
 
 pub const INT4_EXTRACT_VERSION: &str = "grouped-int4-schema-source-extraction-v1";
+pub mod cohort;
 
 #[derive(Debug)]
 pub enum Int4ExtractError { Extraction(ExtractError), Native(Int4JsonError), Identity }

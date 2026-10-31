@@ -40,18 +40,18 @@ fn task(schema: &str, documents: Vec<Vec<u32>>, source: bool, output_bytes: u64)
         None, post, budget, DependencyScope::ItemLocal).unwrap();
     TaskPlan::new(BuiltInTask::Extract.spec(), &PlanContext::new(&id, budget).unwrap(), ir).unwrap()
 }
-fn plan(schema: &str, width: usize) -> Int4ExtractPlan {
+pub(super) fn plan(schema: &str, width: usize) -> Int4ExtractPlan {
     Int4ExtractPlan::from_task_plan(&task(schema, vec![vec![7]], false, 16384), schema, options(),
         CompileLimits::default(), registry().template_controls(), identity(width), width).unwrap()
 }
-fn raw(plan: &Int4ExtractPlan, json: &str) -> Int4JsonRun {
+pub(super) fn raw(plan: &Int4ExtractPlan, json: &str) -> Int4JsonRun {
     let work = constrained_int4::planned_work(plan.group_width(), plan.prompt_tokens(), 2).unwrap();
     Int4JsonRun { schema_version: 1, execution: INT4_JSON_EXECUTION.to_owned(), group_width: plan.group_width(),
         model_work: work, output: JsonDecodeOutput { schema_version: 1, numerics_profile: STRICT_INT4_PROFILE.to_owned(),
             token_ids: vec![1, 0], json: json.to_owned(), forward_positions: work.forward_positions,
             projected_logits: work.projected_logits, mask_node_visit_charge: 20 } }
 }
-fn source_plan(text: &str, contexts: &[&str]) -> Int4ExtractPlan {
+pub(super) fn source_plan(text: &str, contexts: &[&str]) -> Int4ExtractPlan {
     let registry = registry(); let encoder = SourceDocumentEncoder::pinned(registry.template_controls()).unwrap();
     let source = encoder.encode_with_context(text, contexts, 1024, 1024).unwrap();
     let documents = source.context_token_ids().chain(std::iter::once(source.token_ids())).map(|ids| ids.to_vec()).collect();

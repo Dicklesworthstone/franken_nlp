@@ -24,6 +24,7 @@ use crate::{
 };
 
 pub mod capacity;
+pub mod cohort;
 pub mod long;
 
 pub const INT4_SOURCE_EXECUTION: &str = "grouped-int4-source-portfolio-v1";
