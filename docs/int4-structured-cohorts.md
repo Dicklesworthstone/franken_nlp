@@ -130,10 +130,44 @@ success; a drained stream can still contain rejected documents.
   finalizers inside the native session. Each row must complete and validate;
   there is no unrestricted successful prefix or unconstrained fallback.
 
+## Chunks of one long document
+
+`candidate source-int4 extract-map --cohort-chunks N` applies the same native
+grouping to independently planned chunks of one complete document. `N` must be
+1 through 64 and cannot exceed `--max-chunks`. The default remains serial.
+
+The planner compiles every actual schema/source chunk before inference. Each
+row retains its exact task identity, output limits, source grammar and causal
+context. The final short window allocates its actual row count; it does not pad
+or duplicate source chunks. Every value and source occurrence then passes the
+existing independent validation and original-coordinate lifting. Reduction
+retains the ordered independent JSON values without constructing a merged
+global object. A later chunk or reduction failure publishes no document result.
+
+The pre-IO quote covers the entire declared simultaneous window. The host
+checks all actual windows and retains componentwise peak native and decoder
+workspace reservations across their physical completion. These are additional
+to **all** prepared document plans, the full reduction frontier, verification
+storage and the guarded final result. The 64 MiB transient cohort envelope cap
+includes all per-chunk result ceilings plus metadata: a width of 64 with a
+1 MiB per-chunk ceiling requires lowering `--max-result-bytes` or the width.
+Whole-document work, mask and verification limits are never renewed by a new
+window. The output guard survives final serialization and flush.
+
+`NlpEngine::extract_int4_document_cohorts` uses
+`Int4ExtractionMapConfig.limits.mapping.reduction.map_batch_chunks` as its
+window width. Its result separates the original `.document` from `.cohorts`
+statistics. The lower-level prepared document exposes
+`cohort_requirements(context_limit)` and `execute_cohorts_with_control` for
+embedding hosts that supply the complete ownership and memory reservations.
+The CLI keeps the document under `output` and reports the declared width and
+actual physical counts under `cohort_schedule`. `output.mapped.map_batches`
+also reflects the chosen schedule; per-chunk identities and source semantics
+are unchanged. Width 1 explicitly selects the cohort path for comparison.
+
 All source-derived masks and occurrence state stay document-owned. Structural
 validity and exact source membership do not certify semantic accuracy or factual
-support. Durable jobs and complete-document chunk maps retain their existing
-execution paths.
+support. Durable jobs retain their existing execution paths.
 
 Focused regression source covers exact memory/KV admission, per-document budget
 stability, unchanged whole-run work, complete result bounds, source separation,

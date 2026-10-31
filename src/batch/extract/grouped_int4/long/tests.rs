@@ -9,12 +9,12 @@ use crate::{artifact::converter::PINNED_REVISION,
 const SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["quote"],"properties":{"quote":{"type":"string","maxLength":64,"x-fnlp-source":"verbatim"}}}"#;
 struct Continue;
 impl DecodeStepControl for Continue { fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None } }
-fn args(schema: &str, grounding: ExtractionBatchGrounding) -> ExtractionBatchArgs {
+pub(super) fn args(schema: &str, grounding: ExtractionBatchGrounding) -> ExtractionBatchArgs {
     ExtractionBatchArgs { schema: schema.to_owned(), grounding, budget: TaskBudget { max_input_tokens: 8192,
         max_output_tokens: 64, max_output_bytes: 1 << 20, max_grammar_states: 4096, max_kv_bytes: 1 << 31 } }
 }
-fn source_args() -> ExtractionBatchArgs { args(SCHEMA, ExtractionBatchGrounding::SourceMembership) }
-fn planner() -> Int4ExtractionBatchPlanner {
+pub(super) fn source_args() -> ExtractionBatchArgs { args(SCHEMA, ExtractionBatchGrounding::SourceMembership) }
+pub(super) fn planner() -> Int4ExtractionBatchPlanner {
     planner_with_width(32)
 }
 fn planner_with_width(width: usize) -> Int4ExtractionBatchPlanner {
@@ -34,7 +34,7 @@ fn planner_with_width(width: usize) -> Int4ExtractionBatchPlanner {
     Int4ExtractionBatchPlanner::pinned(controls.template_controls(), eos, identity, width, source_args().budget,
         CompileLimits::default(), SourceRuntimeLimits::default(), None).unwrap()
 }
-fn limits() -> Int4ExtractionMapLimits {
+pub(super) fn limits() -> Int4ExtractionMapLimits {
     Int4ExtractionMapLimits { mapping: Int4ExtractionMappingLimits {
         chunks: ChunkLimits { max_input_bytes: 8192, max_chunk_bytes: 6, max_chunk_tokens: 8192,
             context_tokens: 8192, reserved_tokens: 64, max_chunks: 256, max_tokenizer_calls: 1024 },
@@ -44,16 +44,16 @@ fn limits() -> Int4ExtractionMapLimits {
         mask_limits: MaskWorkLimits::default(), mask_visits_per_chunk: 1000, max_mask_visits: 256_000 },
         verification: GroundingBudget::default() }
 }
-fn prepare<'s>(planner: &Int4ExtractionBatchPlanner, source: &'s str, args: &ExtractionBatchArgs,
+pub(super) fn prepare<'s>(planner: &Int4ExtractionBatchPlanner, source: &'s str, args: &ExtractionBatchArgs,
     limits: Int4ExtractionMapLimits) -> PreparedInt4ExtractionMap<'s> {
     planner.plan_document_with_control(source, args, limits, &mut Continue).unwrap()
 }
-struct Script {
-    args: ExtractionBatchArgs, quote: Option<String>, json: Option<String>, calls: Rc<Cell<usize>>,
-    corrupt: Option<usize>, fail_at: Option<usize>, capacity: usize, group_width: usize, dirty_at: Option<usize>,
+pub(super) struct Script {
+    args: ExtractionBatchArgs, pub(super) quote: Option<String>, pub(super) json: Option<String>, pub(super) calls: Rc<Cell<usize>>,
+    pub(super) corrupt: Option<usize>, pub(super) fail_at: Option<usize>, capacity: usize, group_width: usize, dirty_at: Option<usize>,
 }
 impl Script {
-    fn new(args: &ExtractionBatchArgs) -> Self {
+    pub(super) fn new(args: &ExtractionBatchArgs) -> Self {
         Self { args: args.clone(), quote: None, json: None, calls: Rc::new(Cell::new(0)), corrupt: None,
             fail_at: None, capacity: 8192, group_width: 32, dirty_at: None }
     }

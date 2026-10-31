@@ -26,7 +26,7 @@ fn identity_with_width(width: usize) -> ExecutionIdentity {
         host_class: None, compiler_identity: None }
 }
 fn kv_bytes() -> u64 { Int4MemoryRequirement::for_context(128, 32).unwrap().kv_bytes }
-fn config() -> Int4ExtractionMapConfig {
+pub(super) fn config() -> Int4ExtractionMapConfig {
     Int4ExtractionMapConfig {
         request: ExtractionBatchArgs { schema: r#"{"type":"string","maxLength":16}"#.to_owned(),
             grounding: ExtractionBatchGrounding::SourceMembership,

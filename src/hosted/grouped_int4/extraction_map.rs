@@ -11,6 +11,7 @@ use crate::{
     tasks::{extract::{ExtractError, grouped_int4::Int4ExtractError}, ir::TaskBudget},
     validation::grounded_fields::{SourceFieldEvidence, VerifiedSourceSpan},
 };
+mod cohort;
 
 /// Admission for a complete original document. The immutable compiler owns
 /// the base identity; this config cannot substitute another model or task.

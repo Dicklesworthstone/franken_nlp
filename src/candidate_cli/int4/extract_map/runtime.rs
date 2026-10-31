@@ -4,7 +4,8 @@ use std::{fs::File, sync::Arc, time::{Duration, Instant}};
 use crate::{
     NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
     batch::extract::grouped_int4::{Int4ExtractionBatchPlanner,
-        long::{Int4ExtractionMapPreflight, Int4ExtractionMapError}},
+        long::{Int4ExtractionMapPreflight, Int4ExtractionMapError, Int4ExtractionMapRun,
+            cohort::Int4ExtractionMapCohortStats}},
     hosted::{CancellationToken, Int4ExtractionMapConfig, NativeLimits, RunLimits},
     native_engine::{decode::{DecodeCancellationKind, DecodeStepControl},
         strict_int4::weights::snapshot::INT4_SNAPSHOT_VERSION},
@@ -90,20 +91,35 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     // quantities. A mismatch must not quietly weaken the memory declaration.
     if config.workspace_bytes(limits.mapping.mapping.chunks.max_chunks).map_err(|_| CandidateError::Memory)?
         != limits.workspace_bytes { return Err(CandidateError::Memory); }
-    let result = engine.extract_int4_document(&model, text, Arc::new(planner), vocabulary,
-        config, common.kernel, cancellation).map_err(|_| CandidateError::Execution)?;
-    expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
-    remaining()?;
+    if let Some(quote) = limits.cohort {
+        if config.cohort_requirements(args.group_width).map_err(|_| CandidateError::Memory)? != quote {
+            return Err(CandidateError::Memory);
+        }
+    }
     let content = identity.logical_model_digest.to_hex();
-    let response = SourceResponse { schema_version: 1, scope: "real-source-current-candidate-int4",
-        evidence: "non_authoritative", model_id: "Nanbeige4.2-3B", source_revision: &identity.source_revision,
-        source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
-        candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
-        group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(),
-        output: result.result(), snapshot };
-    // No parsing/re-serialization of each exact JSON string, object merge or
-    // successful-prefix publication. The result guard survives write AND flush.
-    publish(&response, limits.max_result_bytes + 4096, output)
+    let finish = |document: &Int4ExtractionMapRun, cohort_schedule: Option<CohortSchedule<'_>>| {
+        expected.verify_completed(document).map_err(|_| CandidateError::Execution)?;
+        remaining()?;
+        let response = SourceResponse { schema_version: 1, scope: "real-source-current-candidate-int4",
+            evidence: "non_authoritative", model_id: "Nanbeige4.2-3B", source_revision: &identity.source_revision,
+            source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
+            candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
+            group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(),
+            output: document, snapshot, cohort_schedule };
+        // No parsing/re-serialization of each exact JSON string, object merge
+        // or successful-prefix publication. The result guard survives both
+        // write and flush, including the complete cohort wrapper's statistics.
+        publish(&response, limits.max_result_bytes + 4096, output)
+    };
+    if let Some(max_chunks) = limits.cohort_chunks {
+        let result = engine.extract_int4_document_cohorts(&model, text, Arc::new(planner), vocabulary,
+            config, common.kernel, cancellation).map_err(|_| CandidateError::Execution)?;
+        finish(&result.result().document, Some(CohortSchedule::new(max_chunks, &result.result().cohorts)))
+    } else {
+        let result = engine.extract_int4_document(&model, text, Arc::new(planner), vocabulary,
+            config, common.kernel, cancellation).map_err(|_| CandidateError::Execution)?;
+        finish(result.result(), None)
+    }
 }
 #[derive(Serialize)]
 struct SnapshotRecord { operation: &'static str, format: &'static str, file_bytes: u64 }
@@ -120,6 +136,19 @@ struct SourceResponse<'a, T: Serialize> {
     output: &'a T,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<SnapshotRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cohort_schedule: Option<CohortSchedule<'a>>,
+}
+#[derive(Serialize)]
+struct CohortSchedule<'a> {
+    execution: &'static str,
+    declared_max_chunks: usize,
+    physical: &'a Int4ExtractionMapCohortStats,
+}
+impl<'a> CohortSchedule<'a> {
+    fn new(declared_max_chunks: usize, physical: &'a Int4ExtractionMapCohortStats) -> Self {
+        Self { execution: "cross_chunk_constrained_cohorts", declared_max_chunks, physical }
+    }
 }
 
 #[cfg(test)]

@@ -32,6 +32,9 @@ fn source_and_pinned_snapshot_routes_keep_complete_document_limits() {
     assert_eq!(source.common.preparation_bytes, 1024 * MIB);
     assert_eq!(source.mapping.mapping.mask_visits_per_chunk, map.extraction.mask_visits());
     assert_eq!(source.mapping.mapping.max_mask_visits, 128_000_000_000);
+    assert_eq!(source.mapping.mapping.reduction.map_batch_chunks, 1);
+    assert_eq!(source.cohort_chunks, None);
+    assert!(source.cohort.is_none());
     assert!(source.common.prefill.is_none());
     let digest = "ab".repeat(32);
     let matches = definition().try_get_matches_from(["extract-map", "--schema", "schema.json",
@@ -42,6 +45,83 @@ fn source_and_pinned_snapshot_routes_keep_complete_document_limits() {
     assert!(snapshot.common.snapshot_pin.is_some());
     assert_eq!(source.mapping.mapping.max_model_work, snapshot.mapping.mapping.max_model_work);
     assert_eq!(source.workspace_bytes, snapshot.workspace_bytes);
+}
+
+#[test]
+fn chunk_cohorts_preserve_original_task_budget_geometry_and_whole_document_limits() {
+    let (serial, mut args) = arguments(&["--max-result-bytes", "65536"]);
+    args.memory_mib = 262_144;
+    let original = serial.validate(&args).unwrap();
+    let budget = serial.extraction.budget(&args, original.common);
+    for chunks in [1, 2, 8, 64] {
+        let mut grouped = serial.clone(); grouped.mapping.cohort_chunks = Some(chunks);
+        let limits = grouped.validate(&args).unwrap();
+        assert_eq!(limits.cohort_chunks, Some(chunks));
+        assert_eq!(limits.common.native, original.common.native);
+        assert_eq!(grouped.extraction.budget(&args, limits.common), budget);
+        assert_eq!(limits.mapping.mapping.chunks, original.mapping.mapping.chunks);
+        assert_eq!(limits.mapping.mapping.max_model_work, original.mapping.mapping.max_model_work);
+        assert_eq!(limits.mapping.mapping.max_mask_visits, original.mapping.mapping.max_mask_visits);
+        assert_eq!(limits.mapping.mapping.mask_visits_per_chunk, original.mapping.mapping.mask_visits_per_chunk);
+        assert_eq!(limits.mapping.mapping.mask_limits.max_trie_node_visits,
+            original.mapping.mapping.mask_limits.max_trie_node_visits);
+        assert_eq!(limits.mapping.verification, original.mapping.verification);
+        assert_eq!(limits.workspace_bytes, original.workspace_bytes);
+        let mut reduction = limits.mapping.mapping.reduction;
+        assert_eq!(reduction.map_batch_chunks, chunks);
+        reduction.map_batch_chunks = 1;
+        assert_eq!(reduction, original.mapping.mapping.reduction);
+        let quote = limits.cohort.unwrap();
+        assert_eq!(quote.native.kv_bytes, chunks as u64 * original.common.native.kv_bytes);
+        assert_eq!(quote.max_result_bytes, chunks as u64 * budget.max_output_bytes + 4096 + chunks as u64);
+    }
+}
+
+#[test]
+fn cohort_admission_covers_the_full_document_and_native_window_at_one_peak() {
+    for snapshot in [false, true] {
+        let (map, mut args) = arguments(&["--cohort-chunks", "4"]);
+        args.memory_mib = 262_144;
+        if snapshot {
+            args.source_dir = None; args.source_manifest = None;
+            args.snapshot = Some("local.snapshot".into()); args.expected_model_sha256 = Some("ab".repeat(32));
+        }
+        let limits = map.validate(&args).unwrap();
+        let budget = map.extraction.budget(&args, limits.common);
+        let quote = Int4ExtractionMapCohortMemoryLimits { max_chunks: 4, context_tokens: args.context_tokens,
+            max_output_tokens_per_chunk: u64::from(budget.max_output_tokens),
+            max_result_bytes_per_chunk: budget.max_output_bytes,
+        }.requirements(args.group_width).unwrap();
+        assert_eq!(limits.cohort, Some(quote));
+        let tokens = map.mapping.max_chunks as u64 * u64::from(budget.max_output_tokens);
+        let output = (map.mapping.max_map_result_bytes as u64 + 4096) * 4 + tokens * 8 + 4096;
+        let input = args.max_input_bytes as u64 + 1 + crate::candidate_cli::extract::SCHEMA_BYTES as u64 + 1
+            + limits.common.preparation_bytes;
+        let execution = quote.native.kv_bytes + quote.native.rope_bytes + quote.native.scratch_payload_bound
+            + ALLOCATOR_BYTES + quote.workspace_bytes + input + limits.workspace_bytes + output;
+        assert_eq!(limits.common.minimum_memory_bytes,
+            grouped_memory_floor(&args, limits.common, execution).unwrap());
+        args.memory_mib = limits.common.minimum_memory_bytes.div_ceil(MIB);
+        map.validate(&args).unwrap();
+        args.memory_mib -= 1;
+        assert_eq!(map.execute(args, &mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
+fn invalid_cohort_width_and_complete_cohort_result_refuse_before_input_or_schema_io() {
+    for flags in [vec!["--cohort-chunks", "0"], vec!["--cohort-chunks", "65"],
+        vec!["--cohort-chunks", "2", "--max-chunks", "1"],
+        vec!["--cohort-chunks", "64"]] {
+        // Default one-MiB native results plus the full cohort envelope exceed
+        // 64 MiB at width 64; the requested width is never silently reduced.
+        let mut command = command(&flags); command.args.memory_mib = 262_144;
+        let mut output = Vec::new();
+        assert_eq!(command.execute(&mut NoRead, &mut output), Err(CandidateError::Arguments));
+        assert!(output.is_empty());
+    }
+    let (mut map, args) = arguments(&[]); map.mapping.cohort_chunks = Some(usize::MAX);
+    assert_eq!(map.execute(args, &mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
 }
 
 #[test]
@@ -127,7 +207,10 @@ fn native_group_partition_is_explicit_and_free_text_controls_cannot_leak() {
 #[cfg(not(feature = "asupersync-runtime"))]
 #[test]
 fn unavailable_runtime_never_opens_source_schema_or_model() {
-    let mut output = Vec::new();
-    assert_eq!(command(&[]).execute(&mut NoRead, &mut output), Err(CandidateError::Unavailable));
-    assert!(output.is_empty());
+    for flags in [&[][..], &["--cohort-chunks", "1"][..], &["--cohort-chunks", "4"][..]] {
+        let mut command = command(flags); command.args.memory_mib = 262_144;
+        let mut output = Vec::new();
+        assert_eq!(command.execute(&mut NoRead, &mut output), Err(CandidateError::Unavailable));
+        assert!(output.is_empty());
+    }
 }

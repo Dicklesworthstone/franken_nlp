@@ -55,18 +55,8 @@ impl PreparedInt4ExtractionMap<'_> {
         let mapped = mapped.map_err(Int4ExtractionMapError::Reduction)?;
         step(&mut **control.borrow_mut())?;
         if task.next != self.expected.chunks || !task.driver.clean() { return Err(ExtractError::InvalidResult.into()); }
-        let remaining = task.remaining; let total = self.limits.verification;
-        let run = Int4ExtractionMapRun { schema_version: 1, execution: INT4_EXTRACTION_MAP_EXECUTION,
-            numerics_profile: STRICT_INT4_PROFILE, group_width: self.expected.group_width,
-            semantics: SEMANTICS, grounding: self.expected.grounding,
-            planned_model_work: self.expected.work, model_work: task.work, reserved_mask_node_visits: self.expected.masks,
-            mask_node_visit_charge: task.masks, verification_used: ExtractionMapVerification {
-                fields: total.max_fields.checked_sub(remaining.max_fields).ok_or(Int4ExtractionMapError::WorkLimit)?,
-                matches: total.max_matches.checked_sub(remaining.max_matches).ok_or(Int4ExtractionMapError::WorkLimit)?,
-                scan_steps: total.max_scan_steps.checked_sub(remaining.max_scan_steps).ok_or(Int4ExtractionMapError::WorkLimit)? },
-            untrusted_fields: ["mapped.root.value"], mapped };
-        self.expected.verify_completed(&run)?;
-        check_size(&run, self.max_result_bytes())?;
+        let run = complete(self.expected, self.limits.verification, task.remaining,
+            task.work, task.masks, mapped, self.max_result_bytes())?;
         step(&mut **control.borrow_mut())?;
         Ok(run)
     }
@@ -80,9 +70,7 @@ struct Executor<'a, 'c, D, C> {
 impl<D: Driver, C: DecodeStepControl> MapReduceTask for Executor<'_, '_, D, C> {
     type Value = ExtractionMapValue;
     type Error = Int4ExtractError;
-    fn policy(&self) -> ReductionPolicy {
-        ReductionPolicy { id: "lossless-independent-schema-values-source-order-v1", may_discard_information: false }
-    }
+    fn policy(&self) -> ReductionPolicy { policy() }
     fn map_batch(&mut self, chunks: &[SourceChunk<'_>]) -> Result<Vec<MapOutput<Self::Value>>, Int4ExtractError> {
         let mut output = Vec::new();
         output.try_reserve_exact(chunks.len()).map_err(|_| ExtractError::AllocationRefused)?;
@@ -93,40 +81,76 @@ impl<D: Driver, C: DecodeStepControl> MapReduceTask for Executor<'_, '_, D, C> {
             let plan = self.plans.get(chunk.id()).ok_or(ExtractError::InvalidResult)?;
             let identity = self.admitted.get(chunk.id()).ok_or(ExtractError::InvalidResult)?;
             let native = self.driver.execute(plan, identity, native_budget(plan, self.mask_budget), &mut **control)?;
-            if !self.driver.clean() || !valid_result(plan, &native, self.mask_budget.max_visits_per_item) {
-                return Err(ExtractError::InvalidResult.into());
-            }
-            // Recompute schema/JSON/field/EOS invariants from the sealed plan,
-            // not just plausible counters supplied alongside the native output.
-            plan.plan.verify_completed(&native)?;
-            let fields = original_fields(chunk, &native.result.source_fields, &mut self.remaining, &mut **control)?;
-            self.work = add_work(self.work, native.model_work).ok_or(ExtractError::InvalidResult)?;
-            self.masks = self.masks.checked_add(native.result.output.mask_node_visit_charge).ok_or(ExtractError::InvalidResult)?;
-            output.push(MapOutput { chunk_id: chunk.id(), value: ExtractionMapValue { chunks: vec![Arc::new(MappedExtractionChunk {
-                chunk_id: chunk.id(), source_span: chunk.span(), native, original_fields: fields })] } });
+            if !self.driver.clean() { return Err(ExtractError::InvalidResult.into()); }
+            let work = native.model_work; let masks = native.result.output.mask_node_visit_charge;
+            output.push(map_output(chunk, plan, native, self.mask_budget.max_visits_per_item,
+                &mut self.remaining, &mut **control)?);
+            self.work = add_work(self.work, work).ok_or(ExtractError::InvalidResult)?;
+            self.masks = self.masks.checked_add(masks).ok_or(ExtractError::InvalidResult)?;
             self.next += 1;
             step(&mut **control)?;
         }
         Ok(output)
     }
     fn reduce(&mut self, input: ReduceInput<'_, Self::Value>) -> Result<Self::Value, Int4ExtractError> {
-        let mut control = self.control.borrow_mut(); step(&mut **control)?;
-        let count = input.children.iter().try_fold(0_usize, |n, child| n.checked_add(child.value().chunks.len()))
-            .ok_or(ExtractError::InvalidResult)?;
-        let mut chunks = Vec::new(); chunks.try_reserve_exact(count).map_err(|_| ExtractError::AllocationRefused)?;
-        let mut next = input.children.first().ok_or(ExtractError::InvalidResult)?.chunk_range().start;
-        for child in input.children {
-            if child.chunk_range().start != next { return Err(ExtractError::InvalidResult.into()); }
-            for chunk in &child.value().chunks {
-                step(&mut **control)?;
-                if chunk.chunk_id != next { return Err(ExtractError::InvalidResult.into()); }
-                chunks.push(Arc::clone(chunk)); next += 1;
-            }
-            if child.chunk_range().end != next { return Err(ExtractError::InvalidResult.into()); }
-        }
-        step(&mut **control)?;
-        Ok(ExtractionMapValue { chunks })
+        reduce(input, &mut **self.control.borrow_mut())
     }
+}
+
+pub(super) fn policy() -> ReductionPolicy {
+    ReductionPolicy { id: "lossless-independent-schema-values-source-order-v1", may_discard_information: false }
+}
+
+/// Both schedules use this exact original-coordinate and sealed-plan check.
+/// Native batching changes neither a chunk's evidence nor its JSON bytes.
+pub(super) fn map_output<C: DecodeStepControl>(chunk: &SourceChunk<'_>, plan: &PreparedInt4BatchExtraction,
+    native: Int4ExtractRun, mask_cap: u64, remaining: &mut GroundingBudget, control: &mut C)
+    -> Result<MapOutput<ExtractionMapValue>, Int4ExtractError> {
+    if !valid_result(plan, &native, mask_cap) { return Err(ExtractError::InvalidResult.into()); }
+    // Recompute schema/JSON/field/EOS invariants from the sealed plan,
+    // not just plausible counters supplied alongside the native output.
+    plan.plan.verify_completed(&native)?;
+    let fields = original_fields(chunk, &native.result.source_fields, remaining, control)?;
+    Ok(MapOutput { chunk_id: chunk.id(), value: ExtractionMapValue { chunks: vec![Arc::new(MappedExtractionChunk {
+        chunk_id: chunk.id(), source_span: chunk.span(), native, original_fields: fields })] } })
+}
+
+pub(super) fn reduce<C: DecodeStepControl>(input: ReduceInput<'_, ExtractionMapValue>, control: &mut C)
+    -> Result<ExtractionMapValue, Int4ExtractError> {
+    step(control)?;
+    let count = input.children.iter().try_fold(0_usize, |n, child| n.checked_add(child.value().chunks.len()))
+        .ok_or(ExtractError::InvalidResult)?;
+    let mut chunks = Vec::new(); chunks.try_reserve_exact(count).map_err(|_| ExtractError::AllocationRefused)?;
+    let mut next = input.children.first().ok_or(ExtractError::InvalidResult)?.chunk_range().start;
+    for child in input.children {
+        if child.chunk_range().start != next { return Err(ExtractError::InvalidResult.into()); }
+        for chunk in &child.value().chunks {
+            step(control)?;
+            if chunk.chunk_id != next { return Err(ExtractError::InvalidResult.into()); }
+            chunks.push(Arc::clone(chunk)); next += 1;
+        }
+        if child.chunk_range().end != next { return Err(ExtractError::InvalidResult.into()); }
+    }
+    step(control)?;
+    Ok(ExtractionMapValue { chunks })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn complete(expected: Int4ExtractionMapPreflight, total: GroundingBudget, remaining: GroundingBudget,
+    work: Int4Work, masks: u64, mapped: MapReduceResult<ExtractionMapValue>, cap: u64)
+    -> Result<Int4ExtractionMapRun, Int4ExtractionMapError> {
+    let run = Int4ExtractionMapRun { schema_version: 1, execution: INT4_EXTRACTION_MAP_EXECUTION,
+        numerics_profile: STRICT_INT4_PROFILE, group_width: expected.group_width,
+        semantics: SEMANTICS, grounding: expected.grounding,
+        planned_model_work: expected.work, model_work: work, reserved_mask_node_visits: expected.masks,
+        mask_node_visit_charge: masks, verification_used: ExtractionMapVerification {
+            fields: total.max_fields.checked_sub(remaining.max_fields).ok_or(Int4ExtractionMapError::WorkLimit)?,
+            matches: total.max_matches.checked_sub(remaining.max_matches).ok_or(Int4ExtractionMapError::WorkLimit)?,
+            scan_steps: total.max_scan_steps.checked_sub(remaining.max_scan_steps).ok_or(Int4ExtractionMapError::WorkLimit)? },
+        untrusted_fields: ["mapped.root.value"], mapped };
+    expected.verify_completed(&run)?;
+    check_size(&run, cap)?;
+    Ok(run)
 }
 
 fn original_fields<C: DecodeStepControl>(chunk: &SourceChunk<'_>, fields: &[SourceFieldEvidence],

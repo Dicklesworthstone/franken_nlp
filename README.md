@@ -2545,8 +2545,9 @@ quality still require their named validation gates.
 chunk of a complete UTF-8 document. The pinned source encoder derives a
 lossless partition, and the planner checks each chunk against the actual
 schema and prompt capacity. All chunks and cumulative work are admitted
-before the first native forward. One resident model and engine serve the
-whole document, and only a fully verified completed result is published.
+before the first native forward. One resident model serves the whole document,
+and only a fully verified completed result is published. Execution is serial
+unless an explicit chunk cohort is requested.
 
 For example, this bounded schema permits a list of exact source strings in
 each chunk:
@@ -2570,6 +2571,18 @@ Optional `--save-snapshot NEW_FILE` occurs after the complete document
 preflights; a later task failure preserves the completed snapshot. All model
 inputs remain explicit candidate inputs with the actual model digest, group
 width and kernel carried in output provenance.
+
+Add `--cohort-chunks N` (1 through 64, at most `--max-chunks`) to execute
+independent chunks through shared native INT4 decoder layers. Each window,
+including a short final window, uses exactly its actual sequence contexts.
+The CLI admits the complete declared window's KV, shared native buffers and
+decoder workspace before input/model IO; a window that does not fit is refused.
+Each chunk keeps its original schema, source language, task budget and causal
+context. The complete document's work, verification and output allowances do
+not renew at a window boundary. Outer `cohort_schedule.physical` reports actual
+cohort, chunk, decoder-step and head-projection counts. The map result's
+`map_batches` counter also reflects the chosen window width. These counters
+describe execution structure; they do not establish measured speedup or parity.
 
 The result retains an ordered sequence of **independent exact-schema JSON
 strings**, chunk byte/scalar ranges, cumulative native work and source
@@ -2602,7 +2615,12 @@ resident model and full context. Its default preparation reserve is 1024 MiB;
 larger chunk counts or evidence/output limits may require an explicit larger
 reserve and process memory ceiling. The library equivalents are
 `Int4ExtractionBatchPlanner::plan_document_with_control` and
-`NlpEngine::extract_int4_document` with `Int4ExtractionMapConfig`. This is
+`NlpEngine::extract_int4_document` with `Int4ExtractionMapConfig`.
+`NlpEngine::extract_int4_document_cohorts` uses the same config's
+`limits.mapping.reduction.map_batch_chunks` and returns the complete `.document`
+alongside `.cohorts` statistics under one result guard. See
+[structured INT4 cohorts](docs/int4-structured-cohorts.md) for the additional
+window memory requirements. This is
 source-inventoried candidate functionality; build, model-present correctness
 and quality qualification remain pending.
 
