@@ -52,6 +52,12 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
     let (compiler, vocabulary) = source::planner()?;
     let planner = Int4SourceDocumentJobPlanner::for_model(model.model_identity(), Arc::new(compiler), task,
         budget, planning, map.mapping, lifetime, non_model_lifetime).map_err(|_| CandidateError::Planning)?;
+    let planner = if map.cohort_chunks.is_some() {
+        planner.with_chunk_cohorts().map_err(|_| CandidateError::Planning)?
+    } else { planner };
+    let cohort = planner.uses_chunk_cohorts().then(|| planner.cohort_requirements())
+        .transpose().map_err(|_| CandidateError::Memory)?;
+    if cohort != map.cohort { return Err(Failure::usage("document_job_cohort_quote")); }
     planner.check_job_limits(lifetime).map_err(|_| CandidateError::Planning)?;
     let identity = planner.execution_identity().clone();
     let host = host_limits(&args, limits, remaining()?);
@@ -94,7 +100,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(),
-        snapshot, output: &report,
+        snapshot, chunk_schedule: ChunkSchedule::new(map), output: &report,
     };
     // A metadata write failure can follow durable commits. No private source,
     // question, quote, task options, filesystem path or key is published here.
@@ -133,6 +139,21 @@ impl SnapshotRecord {
     }
 }
 #[derive(Serialize)]
+struct ChunkSchedule {
+    execution: &'static str,
+    phase: &'static str,
+    declared_max_chunks: usize,
+}
+impl ChunkSchedule {
+    fn new(map: MapLimits) -> Option<Self> {
+        map.cohort_chunks.map(|declared_max_chunks| Self {
+            execution: "native_chunk_cohorts",
+            phase: if map.synthesis.is_some() || map.question_synthesis.is_some() { "discovery" } else { "map" },
+            declared_max_chunks,
+        })
+    }
+}
+#[derive(Serialize)]
 struct Response<'a, T: Serialize> {
     protocol: &'static str, schema_version: u32, scope: &'static str, evidence: &'static str,
     task: &'static str, document_mode: &'static str, durable_unit: &'static str,
@@ -140,6 +161,8 @@ struct Response<'a, T: Serialize> {
     candidate_format: &'a str, quant_recipe: &'a str, group_width: usize, integer_kernel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<SnapshotRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chunk_schedule: Option<ChunkSchedule>,
     output: &'a T,
 }
 

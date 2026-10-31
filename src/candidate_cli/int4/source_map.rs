@@ -97,7 +97,7 @@ pub(super) fn definitions() -> Vec<clap::Command> {
     definitions_with_cohorts(true)
 }
 pub(super) fn document_job_definitions() -> Vec<clap::Command> {
-    definitions_with_cohorts(false)
+    definitions_with_cohorts(true)
 }
 fn definitions_with_cohorts(cohorts: bool) -> Vec<clap::Command> {
     [(Kind::Ner, "ner-map"), (Kind::Keyphrases, "keyphrases-map"),
@@ -126,7 +126,7 @@ fn definitions_with_cohorts(cohorts: bool) -> Vec<clap::Command> {
                 command.arg(clap::Arg::new("cohort_chunks").long("cohort-chunks")
                     .value_name("N").value_parser(clap::value_parser!(usize))
                     .help("Share native decoder layers across up to N independent chunks (1..=64); serial if omitted")
-                    .long_help("Explicitly execute up to N independent source chunks through shared native INT4 decoder layers. N must be 1..64 and cannot exceed --max-chunks. All original chunk plans and the complete simultaneous native/decoder/output memory are admitted before inference; each actual window, including the final short one, has exact independent causal contexts. The original per-chunk task budgets, source evidence and complete-document work/reduction limits remain unchanged. Raw NER/keyphrase maps retain their independent native results. Default summarize-map and --reduce-keyphrases preserve the complete exact candidate/evidence union, apply final top-k only once and retain their existing aggregate output. Default answer-map preserves every independent answer, abstention and whitespace range; whitespace-only chunks use no native work, so physical cohort statistics count only nonblank chunks and windows. With neural summary or answer synthesis, including explicit hierarchy, only discovery maps share native layers; dependent evidence passes remain serial under the same complete invocation allowance. The full synthesis context is reserved before discovery even when actual discovery contexts are smaller. Scheduling metadata identifies discovery-only physical statistics. Durable document jobs do not accept this option."))
+                    .long_help("Explicitly execute up to N independent source chunks through shared native INT4 decoder layers. N must be 1..64 and cannot exceed --max-chunks. All original chunk plans and the complete simultaneous native/decoder/output memory are admitted before inference; each actual window, including the final short one, has exact independent causal contexts. The original per-chunk task budgets, source evidence and complete-document work/reduction limits remain unchanged. Raw NER/keyphrase maps retain their independent native results. Default summarize-map and --reduce-keyphrases preserve the complete exact candidate/evidence union, apply final top-k only once and retain their existing aggregate output. Default answer-map preserves every independent answer, abstention and whitespace range; whitespace-only chunks use no native work, so physical cohort statistics count only nonblank chunks and windows. With neural summary or answer synthesis, including explicit hierarchy, only discovery maps share native layers; dependent evidence passes remain serial under the same complete invocation allowance. The full synthesis context is reserved before discovery even when actual discovery contexts are smaller. Single-document map output identifies discovery-only physical statistics. Retained document jobs authenticate the declared schedule and width for resume and commit only complete original documents; their stored semantic results contain no physical-statistics wrapper."))
             } else { command }
         }).collect()
 }
@@ -160,17 +160,17 @@ impl MapArgs {
             question: if kind == Kind::Answer { Some(question::QuestionArgs::from_arg_matches(matches)?) } else { None } })
     }
     pub(super) fn validate(&self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
-        self.validate_mode(args, false)
+        self.validate_mode(args, false, false)
     }
     pub(super) fn validate_document_job(&self, args: &Int4Args, map_only: bool)
         -> Result<MapLimits, CandidateError> {
-        if self.cohort_chunks.is_some() || (map_only && (self.kind != Kind::Summarize
-            || self.summary.is_none_or(|summary| summary.synthesis.synthesize_summary))) {
+        if map_only && (self.kind != Kind::Summarize
+            || self.summary.is_none_or(|summary| summary.synthesis.synthesize_summary)) {
             return Err(CandidateError::Arguments);
         }
-        self.validate_mode(args, map_only)
+        self.validate_mode(args, map_only, true)
     }
-    fn validate_mode(&self, args: &Int4Args, map_only: bool) -> Result<MapLimits, CandidateError> {
+    fn validate_mode(&self, args: &Int4Args, map_only: bool, document_job: bool) -> Result<MapLimits, CandidateError> {
         let m = self.mapping;
         let mut common = self.source.validate(args)?;
         if (self.kind == Kind::Answer) != self.question.is_some()
@@ -298,9 +298,9 @@ impl MapArgs {
             } else { Ok(quote) }
         }).transpose()?;
         if let Some(quote) = cohort {
-            // The full document and decoder window coexist. The bounded host
-            // wrapper adds 4096 bytes under the same four-payload output claim.
-            let output = sum(&[output, 4096 * 4])?;
+            // Durable jobs retain the original semantic document only. One-off
+            // maps also publish a bounded physical-statistics wrapper.
+            let output = if document_job { output } else { sum(&[output, 4096 * 4])? };
             let execution = sum(&[quote.native.kv_bytes, quote.native.rope_bytes,
                 quote.native.scratch_payload_bound, ALLOCATOR_BYTES, quote.workspace_bytes,
                 input, workspace_bytes, output])?;

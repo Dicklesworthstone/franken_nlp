@@ -46,6 +46,12 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
     let planner = Int4DocumentExtractionJobPlanner::for_model(model.model_identity(), budget,
         job.map.extraction.compiler(), job.map.extraction.source_limits(), extraction,
         map.mapping, lifetime, job.lifetime.verification()).map_err(|_| CandidateError::Planning)?;
+    let planner = if map.cohort_chunks.is_some() {
+        planner.with_chunk_cohorts().map_err(|_| CandidateError::Planning)?
+    } else { planner };
+    let cohort = planner.uses_chunk_cohorts().then(|| planner.cohort_requirements())
+        .transpose().map_err(|_| CandidateError::Memory)?;
+    if cohort != map.cohort { return Err(Failure::usage("extraction_document_job_cohort_quote")); }
     planner.check_job_limits(lifetime).map_err(|_| CandidateError::Planning)?;
     let controls = crate::tokenizer::pinned_controls::pinned().map_err(|_| CandidateError::Identity)?;
     let vocabulary = ExtractionVocabulary::pinned(controls.template_controls())
@@ -91,7 +97,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(),
-        snapshot, output: &report,
+        snapshot, chunk_schedule: map.cohort_chunks.map(ChunkSchedule::new), output: &report,
     };
     // A failed metadata write can follow durable commits. No original text,
     // schema, extracted values, coordinates, private paths or key is emitted.
@@ -130,6 +136,17 @@ impl SnapshotRecord {
     }
 }
 #[derive(Serialize)]
+struct ChunkSchedule {
+    execution: &'static str,
+    phase: &'static str,
+    declared_max_chunks: usize,
+}
+impl ChunkSchedule {
+    fn new(declared_max_chunks: usize) -> Self {
+        Self { execution: "native_chunk_cohorts", phase: "map", declared_max_chunks }
+    }
+}
+#[derive(Serialize)]
 struct Response<'a, T: Serialize> {
     protocol: &'static str, schema_version: u32, scope: &'static str, evidence: &'static str,
     task: &'static str, durable_unit: &'static str, extraction_mode: &'static str,
@@ -137,6 +154,8 @@ struct Response<'a, T: Serialize> {
     candidate_format: &'a str, quant_recipe: &'a str, group_width: usize, integer_kernel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<SnapshotRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chunk_schedule: Option<ChunkSchedule>,
     output: &'a T,
 }
 

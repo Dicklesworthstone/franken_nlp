@@ -79,6 +79,110 @@ fn independently_pinned_snapshots_preserve_complete_document_admission() {
     }
 }
 #[test]
+fn chunk_schedule_is_explicit_on_start_resume_and_does_not_change_document_authority() {
+    for &(task, flags, mode) in MODES {
+        let (serial, args) = command("start", task, flags);
+        let original = serial.args.validate(&args).unwrap();
+        assert!(original.cohort_chunks.is_none()); assert!(original.cohort.is_none());
+        for operation in ["start", "resume"] {
+            for width in ["1", "4"] {
+                let mut flags = flags.to_vec(); flags.extend(["--cohort-chunks", width]);
+                let (c, args) = command(operation, task, &flags); let map = c.args.validate(&args).unwrap();
+                assert_eq!(c.mode.name(), operation); assert_eq!(c.args.mode_name(map), mode);
+                assert_eq!(map.cohort_chunks, Some(width.parse().unwrap()));
+                assert_eq!(map.mapping.reduction.map_batch_chunks, width.parse::<usize>().unwrap());
+                assert_eq!(map.mapping.chunks, original.mapping.chunks);
+                assert_eq!(map.mapping.max_model_work, original.mapping.max_model_work);
+                assert_eq!(map.mapping.max_mask_visits, original.mapping.max_mask_visits);
+                assert_eq!(map.mapping.verification, original.mapping.verification);
+                assert_eq!(map.max_result_bytes, original.max_result_bytes);
+                assert_eq!(map.workspace_bytes, original.workspace_bytes);
+                assert_eq!(c.args.map.source.budget(&args, map.common), serial.args.map.source.budget(&args, original.common));
+                let fixed = lifetime(&args, original);
+                let admitted = c.args.lifetime_limits(&args, map, fixed).unwrap();
+                assert_eq!(admitted.map.cohort, map.cohort);
+                assert_eq!(admitted.buffer_bytes, serial.args.lifetime_limits(&args, original, fixed).unwrap().buffer_bytes);
+            }
+        }
+    }
+}
+#[test]
+fn durable_cohorts_price_native_phases_semantic_transcripts_private_inputs_and_population() {
+    for &(task, flags, mode) in MODES {
+        let mut flags = flags.to_vec(); flags.extend(["--cohort-chunks", "4"]);
+        for snapshot in [false, true] {
+            let (c, mut args) = command("resume", task, &flags);
+            if snapshot {
+                args.source_dir = None; args.source_manifest = None;
+                args.snapshot = Some("candidate.int4".into()); args.expected_model_sha256 = Some("ab".repeat(32));
+            }
+            let map = c.args.validate(&args).unwrap(); let common = map.common;
+            let quote = map.cohort.unwrap();
+            let budget = c.args.map.source.budget(&args, common);
+            let transcript_passes = match mode {
+                "source_map" => map.mapping.chunks.max_chunks as u64,
+                "summary_synthesis" => map.mapping.chunks.max_chunks as u64 + 1,
+                "summary_hierarchy" => map.mapping.chunks.max_chunks as u64 + map.hierarchy.unwrap().max_passes as u64,
+                "question_hierarchy" => map.question_hierarchy.unwrap().max_passes as u64,
+                "summary_selection" | "keyphrase_ranking" | "question_discovery" | "question_synthesis" => 0,
+                _ => panic!("unknown complete-document result"),
+            };
+            // No physical-cohort wrapper is persisted. Only native transcripts
+            // owned by the selected semantic result contribute token storage.
+            let output = map.max_result_bytes as u64 * 4
+                + transcript_passes * u64::from(budget.max_output_tokens) * 8 + 4096;
+            let question = if task == "answer" { crate::candidate_cli::source::OPTIONS_BYTES as u64 + 1 } else { 0 };
+            let input = args.max_input_bytes as u64 + 1 + question + common.preparation_bytes;
+            let execution = quote.native.kv_bytes + quote.native.rope_bytes + quote.native.scratch_payload_bound
+                + ALLOCATOR_BYTES + quote.workspace_bytes + input + map.workspace_bytes + output;
+            let loading = if snapshot { common.snapshot_need.scratch_bytes }
+                else { common.source_preparation_bytes + common.load.scratch_payload_bytes };
+            let expected = common.preparation_bytes + common.load.weight_payload_bytes + ALLOCATOR_BYTES
+                + loading.max(execution) + CLEANUP_BYTES;
+            assert_eq!(common.minimum_memory_bytes, expected);
+            assert_eq!(quote.native.kv_bytes, common.native.kv_bytes * 4);
+            let fixed = lifetime(&args, map); let all = c.args.lifetime_limits(&args, map, fixed).unwrap();
+            assert_eq!(all.map.common.minimum_memory_bytes, expected + all.buffer_bytes);
+            let mut tight = map; tight.common.memory_bytes = all.map.common.minimum_memory_bytes - 1;
+            assert_eq!(c.args.lifetime_limits(&args, tight, fixed).unwrap_err().code, "job_population_memory");
+            tight.common.memory_bytes += 1; assert!(c.args.lifetime_limits(&args, tight, fixed).is_ok());
+            args.memory_mib = expected.div_ceil(MIB); c.args.validate(&args).unwrap();
+            args.memory_mib -= 1;
+            assert_eq!(c.execute_owned(args, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+        }
+    }
+}
+#[test]
+fn invalid_cohort_admission_refuses_all_document_modes_before_private_io() {
+    for &(task, mode, _) in MODES {
+        for flags in [vec!["--cohort-chunks", "0"], vec!["--cohort-chunks", "65"],
+            vec!["--cohort-chunks", "9"], vec!["--cohort-chunks", "4", "--max-map-result-bytes", "1048575"]] {
+            let mut mode = mode.to_vec(); mode.extend(flags);
+            let (c, args) = command("resume", task, &mode);
+            assert_eq!(c.execute_owned(args, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+        }
+    }
+    let mut words = argv("start", "ner");
+    let at = words.iter().position(|word| word == "--max-chunks").unwrap() + 1;
+    words[at] = "64".to_owned(); words.extend(["--cohort-chunks", "64"].into_iter().map(str::to_owned));
+    let (c, mut args) = parse(words).unwrap(); args.memory_mib = 262_144;
+    assert_eq!(c.execute_owned(args, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+}
+#[test]
+fn item_local_source_jobs_do_not_accept_document_chunk_schedules() {
+    for definition in source_job::definitions() {
+        for operation in ["start", "resume"] {
+            let mut words = vec![definition.get_name().to_owned(), operation.to_owned()];
+            words.extend(["--source-dir", "sources", "--source-manifest", "manifest.json", "--memory-mib", "65536",
+                "--job-dir", "private/job", "--key-file", "private/key", "--limits", "limits.json",
+                "--job-id", "0123456789abcdef0123456789abcdef", "--store-results"].into_iter().map(str::to_owned));
+            assert!(definition.clone().try_get_matches_from(words.clone()).is_ok());
+            words.extend(["--cohort-chunks", "2"].into_iter().map(str::to_owned));
+            assert!(definition.clone().try_get_matches_from(words).is_err());
+        }
+    }
+}
+#[test]
 fn task_selection_hierarchy_and_repair_controls_are_explicit_and_family_scoped() {
     assert!(definition().try_get_matches_from(["document-job"]).is_err());
     assert!(definition().try_get_matches_from(["document-job", "start"]).is_err());

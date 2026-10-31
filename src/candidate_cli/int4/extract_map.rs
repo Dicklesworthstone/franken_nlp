@@ -66,7 +66,7 @@ pub(super) fn definition() -> clap::Command {
     definition_with_cohorts(true)
 }
 pub(super) fn document_job_definition() -> clap::Command {
-    definition_with_cohorts(false)
+    definition_with_cohorts(true)
 }
 fn definition_with_cohorts(cohorts: bool) -> clap::Command {
     let command = MappingArgs::augment_args(extract::definition().name("extract-map")
@@ -99,12 +99,12 @@ impl MapArgs {
             cohort_chunks: matches.try_get_one::<usize>("cohort_chunks").ok().flatten().copied() })
     }
     pub(super) fn validate_document_job(&self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
-        // Durable chunk scheduling and its authenticated job configuration
-        // have not opted into native cohorts. Never silently execute serially.
-        if self.cohort_chunks.is_some() { return Err(CandidateError::Arguments); }
-        self.validate(args)
+        self.validate_mode(args, true)
     }
     pub(super) fn validate(&self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
+        self.validate_mode(args, false)
+    }
+    fn validate_mode(&self, args: &Int4Args, document_job: bool) -> Result<MapLimits, CandidateError> {
         let m = self.mapping;
         let mut common = self.extraction.validate(args)?;
         if args.max_input_bytes < 4 || !(1..=256).contains(&m.max_chunks)
@@ -150,10 +150,9 @@ impl MapArgs {
             max_result_bytes_per_chunk: budget.max_output_bytes,
         }.requirements(args.group_width).map_err(|_| CandidateError::Arguments)).transpose()?;
         if let Some(quote) = cohort {
-            // The hosted cohort wrapper carries bounded physical statistics
-            // beside the unchanged complete document. Its output_claim prices
-            // the additional 4096 bytes with the same four-payload multiplier.
-            let output = sum(&[output, 4096 * 4])?;
+            // Retained jobs commit only the original semantic document. The
+            // one-off map additionally publishes bounded physical statistics.
+            let output = if document_job { output } else { sum(&[output, 4096 * 4])? };
             let execution = sum(&[quote.native.kv_bytes, quote.native.rope_bytes,
                 quote.native.scratch_payload_bound, ALLOCATOR_BYTES, quote.workspace_bytes,
                 input, workspace_bytes, output])?;

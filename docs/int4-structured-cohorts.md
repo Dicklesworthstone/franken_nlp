@@ -328,12 +328,68 @@ native rows/windows and discovery work. They exclude scalar hierarchy passes
 and question-map whitespace; all dependent work remains in the original
 semantic receipt. Private question/source content is absent from provenance.
 
-Durable document jobs retain their existing execution. Their argument parsing
-and owned job admission continue to reject cohort requests.
+### Durable complete-document cohorts
+
+Native chunk cohorts also run inside authenticated complete-document jobs:
+
+| Command | Supported cohort phase |
+|---|---|
+| `document-job start\|resume ner` | Independent entity maps |
+| `document-job start\|resume keyphrases` | Independent maps or complete global ranking with `--reduce-keyphrases` |
+| `document-job start\|resume summarize` | Raw maps with `--map-only`, deterministic selection, or discovery for flat/hierarchical synthesis |
+| `document-job start\|resume answer` | Independent QA or discovery for flat/hierarchical synthesis |
+| `extract-document-job start\|resume` | Independent exact-schema extraction maps |
+
+Each command above lives under `fnlp candidate source-int4`. Add
+`--cohort-chunks N` to its existing complete job invocation, retaining the
+protected job directory, secret, limits and explicit result-storage options
+described in the README. N must be 1 through 64 and no greater than
+`--max-chunks`. The selected schedule and width are authenticated private recipe
+inputs: use the same option on resume. Omit it when resuming an existing serial
+job. Changing execution schedule requires a separately started job.
+
+Every original document remains one durable attempt. Its complete model/mask
+debit is persisted before inference, every required chunk and dependent pass
+must complete, and the original semantic result is committed once. Cohort
+windows do not become checkpoints, and failure never publishes a partial
+document. All original task, evidence, verification and lifetime work bounds
+remain in force. The complete original population is still required on resume.
+
+Admission retains the full declared native/decoder peak for the invocation,
+including short documents and ragged windows. Synthesis modes reserve the
+componentwise discovery/scalar phase maximum. Population input, private question
+or raw schema ownership, complete evidence frontiers, retained transcript arrays,
+output serialization and journal storage keep their separate charges. No spare
+scalar engine is allocated beside the cohort engines. Native owners survive
+physical drain, spool acknowledgement and optional materialization.
+
+The stored result remains the existing semantic document, without the standalone
+map command's physical-statistics wrapper. Consequently, its original result
+cap and spool/materialization format remain valid. Public stdout adds only
+`chunk_schedule`, containing `execution: "native_chunk_cohorts"`,
+`phase: "map"` or `"discovery"`, and `declared_max_chunks`. It does not claim
+observed cohort counts or expose source, schema, question or result content.
+Serial recipes and stdout omit the new optional fields.
+
+Library callers opt in with
+`Int4SourceDocumentJobPlanner::with_chunk_cohorts()` or
+`Int4DocumentExtractionJobPlanner::with_chunk_cohorts()`. Configure the immutable
+map width before constructing the planner. Both expose `uses_chunk_cohorts()`
+and `cohort_requirements()`, and their existing hosted job entrypoints select
+the requested schedule. Low-level integrations use the corresponding
+`Int4SourceDocumentJobProcessor::new_cohorts` or
+`Int4DocumentExtractionJobProcessor::new_cohorts` constructor while owning the
+quoted capacity through complete processor teardown and durable acknowledgement.
+
+Item-local source/extraction jobs retain their existing single-item execution
+and do not accept document chunk options. New regression source covers every
+document mode, authenticated schedule/width changes, prepared-owner isolation,
+static and actual memory ceilings, unchanged task/work authority, private
+metadata, both loading routes and early refusal. These fixtures remain unrun.
 
 All source-derived masks and occurrence state stay document-owned. Structural
 validity and exact source membership do not certify semantic accuracy or factual
-support. Durable jobs retain their existing execution paths.
+support.
 
 Focused regression source covers exact memory/KV admission, per-document budget
 stability, unchanged whole-run work, complete result bounds, source separation,

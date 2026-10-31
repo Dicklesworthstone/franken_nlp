@@ -173,15 +173,15 @@ fn complete_chunk_cohort_memory_is_admitted_before_source_snapshot_or_output_io(
 }
 
 #[test]
-fn synthesis_routes_accept_discovery_cohorts_while_owned_jobs_refuse_them() {
+fn map_and_document_job_routes_preserve_modes_with_explicit_chunk_cohorts() {
     for command in definitions() {
         assert!(command.get_arguments().any(|arg| arg.get_id() == "cohort_chunks"));
     }
     let jobs = super::super::document_job::definition();
     for operation in jobs.get_subcommands() {
         for task in operation.get_subcommands() {
-            assert!(!task.get_arguments().any(|arg| arg.get_id() == "cohort_chunks"),
-                "{} {} must not advertise unimplemented cohort jobs", operation.get_name(), task.get_name());
+            assert!(task.get_arguments().any(|arg| arg.get_id() == "cohort_chunks"),
+                "{} {} must advertise the immutable document schedule", operation.get_name(), task.get_name());
         }
     }
     for (kind, mode) in SYNTHESIS_MODES {
@@ -201,10 +201,39 @@ fn synthesis_routes_accept_discovery_cohorts_while_owned_jobs_refuse_them() {
         (Kind::Answer, &["--question", "private-question.txt"][..])].into_iter().chain(SYNTHESIS_MODES) {
         let (mut map, mut args) = arguments(kind, mode);
         args.memory_mib = 262_144;
-        map.validate_document_job(&args, false).unwrap();
-        map.cohort_chunks = Some(1);
-        assert!(map.validate_document_job(&args, false).is_err());
-        assert!(map.validate_document_job(&args, true).is_err());
+        let serial = map.validate_document_job(&args, false).unwrap();
+        for width in [1, 2, 4] {
+            map.cohort_chunks = Some(width);
+            let grouped = map.validate_document_job(&args, false).unwrap();
+            assert_eq!(grouped.cohort_chunks, Some(width));
+            assert_eq!(grouped.mapping.reduction.map_batch_chunks, width);
+            assert_eq!(grouped.mapping.chunks, serial.mapping.chunks);
+            assert_eq!(grouped.mapping.max_model_work, serial.mapping.max_model_work);
+            assert_eq!(grouped.mapping.max_mask_visits, serial.mapping.max_mask_visits);
+            assert_eq!(grouped.summary.is_some(), serial.summary.is_some());
+            assert_eq!(grouped.keyphrases.is_some(), serial.keyphrases.is_some());
+            if let Some(summary) = grouped.summary {
+                let expected = serial.summary.unwrap();
+                assert_eq!(summary.aggregation, expected.aggregation);
+                assert_eq!(summary.max_bullets, expected.max_bullets);
+                assert_eq!(summary.max_result_bytes, expected.max_result_bytes);
+            }
+            if let Some(keyphrases) = grouped.keyphrases {
+                let expected = serial.keyphrases.unwrap();
+                assert_eq!(keyphrases.max_phrases, expected.max_phrases);
+                assert_eq!(keyphrases.max_result_bytes, expected.max_result_bytes);
+            }
+            assert_eq!(grouped.synthesis, serial.synthesis); assert_eq!(grouped.hierarchy, serial.hierarchy);
+            assert_eq!(grouped.question_synthesis, serial.question_synthesis);
+            assert_eq!(grouped.question_hierarchy, serial.question_hierarchy);
+            assert_eq!(grouped.max_result_bytes, serial.max_result_bytes);
+            assert_eq!(grouped.workspace_bytes, serial.workspace_bytes);
+            assert_eq!(map.source.budget(&args, grouped.common), map.source.budget(&args, serial.common));
+            if kind == Kind::Summarize && !mode.contains(&"--synthesize-summary") {
+                let raw = map.validate_document_job(&args, true).unwrap();
+                assert!(raw.summary.is_none()); assert_eq!(raw.cohort_chunks, Some(width));
+            } else { assert!(map.validate_document_job(&args, true).is_err()); }
+        }
     }
 }
 

@@ -1773,7 +1773,8 @@ passages. `output.mapped.map_batches` includes all logical source windows,
 including whitespace-only windows. With `--synthesize-answer` or
 `--hierarchical-answer`, the same option batches discovery before the dependent
 scalar evidence passes; those results retain discovery under `output.discovery`.
-Durable jobs retain their existing execution. See
+Complete-document jobs accept the same opt-in while retaining whole-document
+durable commits and authenticated resume settings. See
 [structured INT4 cohorts](docs/int4-structured-cohorts.md).
 
 `--options FILE` supplies the complete per-chunk `AnswerOptions` object:
@@ -2022,7 +2023,9 @@ Only discovery runs in cohorts; dependent evidence passes retain their scalar
 execution and complete work/verification limits. Their `cohort_schedule.execution`
 is `cross_chunk_constrained_discovery_cohorts`, and physical counters cover
 `output.discovery` only. Native admission reserves the larger discovery/scalar
-phase peak before execution. Durable document jobs retain their existing paths.
+phase peak before execution. Complete-document jobs use the same discovery
+schedule inside each atomic document attempt, with declared schedule metadata
+and the original semantic result in the durable spool.
 The library's `NlpEngine::map_int4_source_cohorts` additionally supports raw
 independent summary chunks through `SourceMapTask::Summarize`. It returns the
 complete `.document` and `.cohorts` statistics under one output guard, with
@@ -2467,8 +2470,8 @@ remain pending.
 `fnlp candidate source-int4 document-job start|resume ner|keyphrases|summarize|answer`
 connects the complete-document INT4 pipelines to authenticated durable jobs.
 Each original document is one atomic job item, including every chunk and
-selected reduction pass. One resident model and native engine serve the
-complete original population. This route requires `metadata-store` and
+selected reduction pass. One resident model serves the complete original
+population. This route requires `metadata-store` and
 `asupersync-runtime` on Linux x86-64 or AArch64, and supports pinned source
 conversion or an independently digest-pinned candidate snapshot.
 
@@ -2487,6 +2490,16 @@ remain available without accepting another task family's flags:
 | `answer --question FILE` | Independent question-aware answers from every nonblank source chunk |
 | `answer --question FILE --synthesize-answer` | One answer pass over all collected verified quotes |
 | `answer --question FILE --synthesize-answer --hierarchical-answer` | Bounded quote-selection levels preserving the original question, followed by a final answer |
+
+Every mode also accepts `--cohort-chunks N`, where N is 1 through 64 and no
+greater than `--max-chunks`. This runs independent discovery/map chunks through
+shared native decoder layers; dependent synthesis and hierarchy passes retain
+their scalar execution. The complete declared native peak and decoder workspace
+are reserved together with the population, evidence and result storage. Each
+original document still commits only after all its required work completes.
+Choose the flag and width at `start`, then repeat them exactly at `resume`:
+both are bound into the private authenticated recipe. Existing serial jobs
+resume with the flag omitted. See [durable chunk cohorts](docs/int4-structured-cohorts.md#durable-complete-document-cohorts).
 
 The input is the **complete original NDJSON population on every invocation**,
 including committed records when resuming:
@@ -2628,7 +2641,10 @@ if later authentication or document execution fails.
 
 Stdout uses `fnlp-candidate-int4-document-job-v1` with task, document mode,
 `durable_unit: "complete_original_document"`, public model provenance and
-authenticated progress only. Private source text, questions and results stay
+authenticated progress only. Cohort invocations additionally report
+`chunk_schedule` with `execution: "native_chunk_cohorts"`, the `map` or
+`discovery` phase and `declared_max_chunks`; it contains no actual physical
+counters. Private source text, questions and results stay
 out of that report. Result guards survive spool synchronization and journal
 acknowledgement. `--materialize` publishes verified `materialized.ndjson` after
 all original documents commit, and existing stored-job verification and
@@ -2638,8 +2654,11 @@ failure does not imply rollback.
 Library callers construct `Int4SourceDocumentJobPlanner::for_model` with the
 actual model identity, `Int4SourceDocumentTask`, compiler, exact budgets and
 `Int4SourceDocumentLifetime`, then call `NlpEngine::job_int4_source_document`
-with `SourceJobRequest` and `JobHostLimits`. This reuses the existing native
-document executors and durable runner. Hierarchy remains explicitly lossy;
+with `SourceJobRequest` and `JobHostLimits`. Call the planner's consuming
+`with_chunk_cohorts()` builder to opt in; `mapping.reduction.map_batch_chunks`
+sets the immutable maximum width, and `cohort_requirements()` quotes the full
+invocation peak. This reuses the existing native document executors and durable
+runner. Hierarchy remains explicitly lossy;
 source membership does not establish semantic entailment or full-context
 equivalence. Compilation, native execution, crash recovery, parity and task
 quality still require their named validation gates.
@@ -2738,6 +2757,13 @@ population shares one resident model, one exact raw schema and one fixed set
 of chunking, work and verification limits. This route requires `metadata-store`
 and `asupersync-runtime` on Linux x86-64 or AArch64.
 
+`--cohort-chunks N` also enables native chunk cohorts for this job, with N from
+1 through 64 and no greater than `--max-chunks`. Every row keeps the exact raw
+schema, grounding policy, task budget and independent causal context. Add the
+flag to `start` and repeat the same width on `resume`; serial jobs retain their
+existing recipe when it is omitted. Chunk windows are internal execution units:
+the original document remains the only result and durable commit unit.
+
 Supply the **complete original NDJSON population on every invocation**, even
 when resuming after some documents have already committed:
 
@@ -2810,7 +2836,8 @@ documents are skipped; an interrupted document starts again in full, retaining
 the previous attempt's debit. Uncommitted spool tails require the explicit
 resume-only `--discard-uncommitted-tail` policy after authentication.
 
-Memory admission includes the complete population, resident native engine,
+Memory admission includes the complete population, declared native peak and
+cohort decoder workspace when selected,
 all prepared chunk programs, extraction/evidence frontier, complete original
 document result, journal and protected spool serialization. The complete
 NDJSON record, including JSON escaping, must fit the stored input byte limit.
@@ -2819,7 +2846,9 @@ the whole-document cap and must fit `JobLimits.max_result_bytes`.
 
 Stdout uses `fnlp-candidate-int4-extract-document-job-v1`, identifies the durable
 unit as `complete_original_document` and reports public model provenance and
-authenticated progress. Schema bytes, original source and extracted values
+authenticated progress. An opted cohort schedule adds only declared execution,
+phase and width under `chunk_schedule`; stored results keep the original
+semantic document format. Schema bytes, original source and extracted values
 stay out of that report. Result guards remain alive through spool
 synchronization and journal acknowledgement. `--materialize` publishes verified
 `materialized.ndjson` after all documents commit. Stored-job status, verification
@@ -2830,7 +2859,10 @@ Library callers construct `Int4DocumentExtractionJobPlanner::for_model` with
 the actual model identity, fixed `ExtractionBatchArgs`, compiler/source limits,
 document limits, `JobLimits` and lifetime `GroundingBudget`, then call
 `NlpEngine::job_int4_extract_document` with `SourceJobRequest` and
-`JobHostLimits`. This is source-inventoried candidate functionality. Compilation,
+`JobHostLimits`. The planner's `with_chunk_cohorts()` builder enables native
+windows using the immutable `document.mapping.reduction.map_batch_chunks`
+width; `cohort_requirements()` quotes the full declared reservation. This is
+source-inventoried candidate functionality. Compilation,
 native correctness, crash recovery, parity and task quality remain unqualified
 until their named validation gates run.
 
