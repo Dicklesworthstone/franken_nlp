@@ -132,7 +132,9 @@ where T: Send + 'static,
     check_domain(engine, candidate)?;
     if let Some(baseline) = baseline { check_domain(engine, baseline)?; }
     let arms = 1 + usize::from(baseline.is_some());
-    validate_inputs(&input.base.dataset, &input.base.key, &input.base.namespace, options, limits, arms)?;
+    validate_inputs(&input.base.dataset, &input.base.key, &input.base.namespace, options, limits,
+        arms, host.max_labels)?;
+    validate_calibration_scope(&input.base.dataset)?;
     let operation = owned_operation(fit, arms, input.applications.each_ref().map(Option::is_some))?;
     for application in input.applications.iter().flatten() { application.validate_limits(limits)?; }
     let widths = [candidate.model_identity().group_width(),
@@ -169,6 +171,14 @@ where T: Send + 'static,
         drop(input); drop(native_claims); drop(lease);
         Ok(GuardedOutput::new(result.value, result._memory))
     })
+}
+
+fn validate_calibration_scope(dataset: &Dataset) -> Result<(), HostedError> {
+    // These persisted parameters model one binary event. Even raw/raw use of
+    // the calibrated qualification API cannot silently broaden that report or
+    // artifact contract to a multiclass vector or independent label heads.
+    if dataset.is_binary() { Ok(()) }
+    else { Err(HostedError::Assay(AssayError::Scope)) }
 }
 
 #[cfg(test)] mod tests;

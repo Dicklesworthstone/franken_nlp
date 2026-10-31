@@ -10,6 +10,7 @@ pub(super) fn host() -> Int4AssayHostLimits {
         task: TaskBudget { max_input_tokens: 128, max_output_tokens: 8, max_output_bytes: 100_000,
             max_grammar_states: 128,
             max_kv_bytes: Int4MemoryRequirement::for_context(128, 32).unwrap().kv_bytes },
+        max_labels: 2,
         preparation_reserve_bytes: 128 * 1024 * 1024,
         max_model_work: Int4Work { forward_positions: u64::MAX, projected_logits: u64::MAX,
             attention_pairs: u64::MAX, projections: ProjectionWork {
@@ -27,6 +28,33 @@ fn axis(work: &mut Int4Work, index: usize) -> &mut u64 {
 }
 fn is_work_budget(error: HostedError) -> bool {
     matches!(error, HostedError::Int4(Int4HostError::Classification(Int4ClassificationError::WorkBudget)))
+}
+
+pub(super) fn dataset(task: &str, labels: &[&str]) -> Dataset {
+    let mut input = Vec::new();
+    for (id, split) in [("dev", "development"), ("cal", "calibration"), ("test", "locked_test")] {
+        let mut row = serde_json::json!({"schema_version":1,"id":id,"split":split,
+            "text":format!("owned source {id}")});
+        match task {
+            "binary_classification" => row["positive"] = serde_json::json!(true),
+            "multiclass_classification" => row["label"] = serde_json::json!(labels[0]),
+            "multilabel_classification" => row["labels"] = serde_json::json!([]),
+            _ => panic!("unknown fixture task"),
+        }
+        input.extend(serde_json::to_vec(&row).unwrap()); input.push(b'\n');
+    }
+    let mut manifest = serde_json::json!({"schema_version":1,"task":task,"dataset_id":"owned",
+        "dataset_version":"v1","named_population":"owned fixture",
+        "expected_input_sha256":crate::execution_identity::Sha256Digest::of_bytes(&input),
+        "splits":{"development":["dev"],"calibration":["cal"],"locked_test":["test"]}});
+    if task == "binary_classification" {
+        manifest["positive_label"] = serde_json::json!({"id":labels[0],"description":""});
+        manifest["negative_label"] = serde_json::json!({"id":labels[1],"description":""});
+    } else {
+        manifest["labels"] = serde_json::json!(labels.iter().map(|id|
+            serde_json::json!({"id":id,"description":""})).collect::<Vec<_>>());
+    }
+    Dataset::parse(&serde_json::to_vec(&manifest).unwrap(), &input, metrics::Limits::default()).unwrap()
 }
 
 #[test]
@@ -59,6 +87,7 @@ fn complete_source_score_row_and_report_storage_are_priced_before_execution() {
     assert_eq!(quote.input_bytes,
         8 * limits.max_input_bytes as u64 + 8 * limits.max_manifest_bytes as u64
         + host.preparation_reserve_bytes + native_classify::required_replay_bytes(limits, 1).unwrap()
+        + 2 * 128 * 256 + 2 * 65_536
         + 4 * host.task.max_output_bytes);
     assert_eq!(quote.output_reservation_bytes, 4 * limits.max_output_bytes as u64 + 4096);
     let mut more = host; more.task.max_output_bytes += 1;
@@ -123,7 +152,7 @@ fn paired_bootstrap_prices_both_arms_before_any_model_call() {
 #[test]
 fn complete_context_capacity_and_every_resource_input_are_admitted() {
     let limits = metrics::Limits::default();
-    for field in 0..10 {
+    for field in 0..12 {
         let mut host = host();
         match field {
             0 => host.task.max_kv_bytes -= 1,
@@ -131,6 +160,8 @@ fn complete_context_capacity_and_every_resource_input_are_admitted() {
             2 => host.preparation_reserve_bytes = 0,
             3 => host.native.allocator_reserve_bytes = 0,
             4 => host.native.run.max_checkpoints = 1,
+            10 => host.max_labels = 0,
+            11 => host.max_labels = native_classify::MAX_LABELS + 1,
             _ => *axis(&mut host.max_model_work, field - 5) = 0,
         }
         assert!(host.requirements(&[127], limits).is_err(), "axis {field}");
@@ -171,4 +202,90 @@ fn sealed_input_and_public_reports_cross_the_existing_physical_host_boundary() {
     send::<Input>(); send::<NativeReplay>(); send::<Evaluation>(); send::<QualificationReport>();
     let _evaluate = NlpEngine::evaluate_int4_classification;
     let _qualify = NlpEngine::qualify_int4_classification;
+}
+
+#[test]
+fn exclusive_candidates_and_independent_heads_receive_their_complete_planning_geometry() {
+    let mut host = host(); host.max_labels = 7;
+    let limits = metrics::Limits::default();
+    let exclusive = planning_limits(host, limits, 7, 1).unwrap();
+    let multilabel = planning_limits(host, limits, 7, 7).unwrap();
+    assert_eq!(exclusive.max_labels, 7);
+    assert_eq!(exclusive.scoring.max_candidates, 7);
+    assert_eq!(exclusive.max_total_prompt_tokens, 128);
+    assert_eq!(multilabel.max_labels, 7);
+    assert_eq!(multilabel.scoring.max_candidates, 2);
+    assert_eq!(multilabel.max_total_prompt_tokens, 896);
+    assert_eq!(multilabel.max_context_tokens, exclusive.max_context_tokens);
+    assert_eq!(multilabel.max_total_label_bytes, 7 * (256 + 4096));
+    assert_eq!(multilabel.max_work, exclusive.max_work);
+    assert_eq!(multilabel.scoring.max_projected_logits, exclusive.scoring.max_projected_logits);
+    let single_label = planning_limits(host, limits, 1, 1).unwrap();
+    assert_eq!(single_label.scoring.max_candidates, 2);
+    for (labels, heads) in [(0, 1), (8, 1), (7, 0), (7, 2), (7, 8)] {
+        assert!(planning_limits(host, limits, labels, heads).is_err(), "{labels}/{heads}");
+    }
+}
+
+#[test]
+fn every_retained_label_and_prepared_head_is_charged_without_replicating_native_kv() {
+    let limits = metrics::Limits::default();
+    let mut host = host(); host.max_labels = 1;
+    for widths in [&[127][..], &[127, 128][..]] {
+        let first = host.requirements(widths, limits).unwrap();
+        for labels in [2, 3, 7, native_classify::MAX_LABELS] {
+            let mut larger = host; larger.max_labels = labels;
+            let quote = larger.requirements(widths, limits).unwrap();
+            let per_label = 128 * 256 + 65_536 + 32 * limits.max_rows as u64 * widths.len() as u64;
+            assert_eq!(quote.input_bytes - first.input_bytes, (labels as u64 - 1) * per_label);
+            assert_eq!(quote.native, first.native);
+            assert_eq!(quote.workspace_bytes, first.workspace_bytes);
+            assert_eq!(quote.output_reservation_bytes, first.output_reservation_bytes);
+        }
+    }
+}
+
+#[test]
+fn aggregate_prompt_geometry_is_checked_and_obeys_the_compiler_ceiling() {
+    assert_eq!(aggregate_prompt_tokens(8192, 128).unwrap(), 1_048_576);
+    assert_eq!(aggregate_prompt_tokens(262_144, 128).unwrap(), 16 * 1024 * 1024);
+    assert_eq!(preparation_bytes(128, 2).unwrap(), 196_608);
+    for (context, heads) in [(0, 1), (128, 0), (128, 129), (usize::MAX, 2)] {
+        assert!(aggregate_prompt_tokens(context, heads).is_err(), "{context}/{heads}");
+        assert!(preparation_bytes(context, heads).is_err(), "{context}/{heads}");
+    }
+}
+
+#[test]
+fn a_multilabel_bundle_spends_all_heads_on_the_shared_paired_allowance() {
+    let head = row();
+    let bundle = head.checked_add(head).unwrap().checked_add(head).unwrap();
+    let complete = bundle.checked_add(bundle).unwrap();
+    for field in 0..5 {
+        let mut ceiling = complete; *axis(&mut ceiling, field) -= 1;
+        let mut spent = Int4Work::default();
+        charge_work(&mut spent, bundle, ceiling).unwrap();
+        assert!(is_work_budget(charge_work(&mut spent, bundle, ceiling).unwrap_err()));
+        assert_eq!(spent, bundle);
+    }
+    let mut spent = Int4Work::default();
+    charge_work(&mut spent, bundle, complete).unwrap();
+    charge_work(&mut spent, bundle, complete).unwrap();
+    assert_eq!(spent, complete);
+}
+
+#[test]
+fn declared_label_capacity_rejects_underpriced_source_before_native_preparation() {
+    let binary = dataset("binary_classification", &["yes", "no"]);
+    let multiclass = dataset("multiclass_classification", &["news", "support", "other"]);
+    let multilabel = dataset("multilabel_classification", &["news", "support", "other"]);
+    let single = dataset("multilabel_classification", &["review"]);
+    assert_eq!(binary.head_count(), 1); assert_eq!(multiclass.head_count(), 1);
+    assert_eq!(multilabel.head_count(), 3); assert_eq!(single.head_count(), 1);
+    for suite in [&binary, &multiclass, &multilabel, &single] {
+        validate_shape(suite, suite.label_count()).unwrap();
+        validate_shape(suite, native_classify::MAX_LABELS).unwrap();
+        assert!(validate_shape(suite, suite.label_count() - 1).is_err());
+        assert!(validate_shape(suite, native_classify::MAX_LABELS + 1).is_err());
+    }
 }

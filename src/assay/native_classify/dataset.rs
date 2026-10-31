@@ -92,7 +92,16 @@ impl InputSizes {
 
 impl Dataset {
     pub fn parse(manifest_bytes: &[u8], input: &[u8], limits: Limits) -> Result<Self, AssayError> {
+        Self::parse_with_label_limit(manifest_bytes, input, limits, MAX_LABELS)
+    }
+
+    /// Enforce the caller's admitted label geometry before any case is
+    /// materialized into owned gold strings/vectors. The raw byte and manifest
+    /// envelopes remain separately bounded by `limits`.
+    pub fn parse_with_label_limit(manifest_bytes: &[u8], input: &[u8], limits: Limits,
+        max_labels: usize) -> Result<Self, AssayError> {
         limits.validate()?;
+        if !(1..=MAX_LABELS).contains(&max_labels) { return Err(AssayError::Limits); }
         if manifest_bytes.is_empty() || manifest_bytes.len() > limits.max_manifest_bytes
             || input.is_empty() || input.len() > limits.max_input_bytes {
             return Err(AssayError::InputLimit);
@@ -104,6 +113,7 @@ impl Dataset {
             && value.get("labels").is_some() { return Err(AssayError::Manifest); }
         let mut manifest: SuiteManifest = serde_json::from_value(value).map_err(|_| AssayError::Json)?;
         let total = validate_manifest(&manifest, limits)?;
+        if manifest.label_count() > max_labels { return Err(AssayError::InputLimit); }
         let kind = manifest.task_kind()?;
         let input_digest = Sha256Digest::of_bytes(input);
         if input_digest != manifest.expected_input_sha256 { return Err(AssayError::InputDigest); }

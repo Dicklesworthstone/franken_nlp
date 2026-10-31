@@ -38,6 +38,9 @@ struct Arguments {
     /// Complete candidate continuation depth, including its scored EOS.
     #[arg(long, default_value_t = 16)]
     max_candidate_tokens: usize,
+    /// Admission cap for the complete label set; multilabel uses one independent head per label.
+    #[arg(long, default_value_t = 2)]
+    max_labels: usize,
     /// Complete native task result for one document, separate from the report.
     #[arg(long, default_value_t = 1_048_576)]
     max_result_bytes: usize,
@@ -134,7 +137,7 @@ pub(super) fn definition(operation: &str) -> clap::Command {
             "calibrate" => "Fit authenticated reliability calibration from actual native replay",
             _ => "Run a pinned native INT4 classifier on a frozen labeled text suite",
         }))
-        .mut_arg("suite", |arg| arg.help("Strict binary-classification suite with exact case-file pin, labels and split membership"))
+        .mut_arg("suite", |arg| arg.help("Strict binary, multiclass or multilabel suite with exact case-file pin, labels and split membership"))
         .mut_arg("observations", |arg| arg.long("cases")
             .help("Frozen labeled-text NDJSON; '-' reads stdin; caller probabilities are rejected"))
         .mut_arg("max_output_bytes", |arg| arg.help("Complete output report cap, also applied independently to each imported calibration report"))
@@ -171,6 +174,7 @@ impl Command {
         model_input(args.snapshot.as_deref(), args.expected_model_sha256.as_deref(), args.group_width)?;
         mib(args.memory_mib.ok_or_else(invalid_options)?)?; mib(args.preparation_mib)?;
         if !(2..=64).contains(&args.max_candidate_tokens) || args.max_candidate_tokens >= args.context_tokens
+            || !(1..=assay::native_classify::MAX_LABELS).contains(&args.max_labels)
             || !(1..=64 * 1024 * 1024).contains(&args.max_result_bytes)
             || !(1..=86_400).contains(&args.timeout_seconds)
             || !(2..=1_000_000_000_000).contains(&args.snapshot_checkpoints)

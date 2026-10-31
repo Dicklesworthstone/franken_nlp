@@ -1,8 +1,8 @@
 # Native INT4 classification Assay
 
-`fnlp eval native-int4` executes the native binary, exclusive classifier over a
-frozen labeled text population. `fnlp calibrate native-int4` fits a persistable,
-authenticated reliability transform using only its calibration split.
+`fnlp eval native-int4` executes binary, multiclass or independent multilabel
+classification over a frozen labeled text population. `fnlp calibrate native-int4`
+fits a persistable, authenticated binary reliability transform using only its calibration split.
 `fnlp qualify native-int4` executes an explicitly pinned candidate and baseline
 over the same population, optionally applies independent calibration artifacts,
 then applies declared classification-quality and reliability gates. All commands require an existing
@@ -15,7 +15,7 @@ to describe its data contracts without a model, key, file read, or runtime. The
 original `eval/calibrate/qualify scored` commands keep their supplied-observation
 contracts and cannot supply artifacts to the native calibration route.
 
-## Freeze a labeled population
+## Freeze a binary labeled population
 
 The UTF-8 cases file contains one strict JSON object per line. Its only fields
 are `schema_version`, `id`, `split`, nonempty `text`, and Boolean `positive`:
@@ -57,7 +57,7 @@ source-unit hashes itself, rejects duplicate JSON keys and unknown fields, and
 checks the complete byte pin before loading a model. Rows never accept supplied
 probabilities or execution identities. File order can differ from the split
 lists; replay uses canonical ID order, and the byte pin still binds the original
-file exactly. Keep dataset IDs, population descriptions, key IDs and namespaces
+file exactly. Keep dataset IDs, population descriptions, declared label IDs, key IDs and namespaces
 nonsecret: reports intentionally disclose that metadata.
 
 The suite can optionally declare `policy` with
@@ -65,6 +65,81 @@ The suite can optionally declare `policy` with
 Omission uses zero for both. This is the native classifier's abstention policy.
 The separate `--acceptance-threshold` controls positive-event reliability
 statistics; it does not replace the classifier's selected label or task policy.
+
+## Multiclass and multilabel populations
+
+Both broader task modes use the same `eval native-int4` and `qualify native-int4`
+commands, with an explicit `--max-labels N` admission cap. Its default is two;
+raise it for a larger declared label set. The supported range is `1..=128`.
+Each suite selects exactly one task and gold shape:
+
+| `task` | Suite labels | Gold field on every case | Native execution |
+|---|---|---|---|
+| `binary_classification` | `positive_label` and `negative_label` | Boolean `positive` | One exclusive two-label head |
+| `multiclass_classification` | `labels` array with 2–128 unique IDs | String `label` naming exactly one declared ID | One exclusive head over all declared labels |
+| `multilabel_classification` | `labels` array with 1–128 unique IDs | Array `labels` containing unique declared IDs; `[]` is valid | Independent present/absent head for each declared label |
+
+The three gold forms cannot be mixed, and explicit `null` is not an omitted gold
+field. Unknown or duplicate label IDs refuse. The suite's label order and each
+multilabel gold set are canonicalized by exact ID; description bytes are retained.
+The frozen input pin still binds the caller's original byte order. Gold, case IDs
+and split membership never enter the classifier's prompt.
+
+For example, this complete seven-row multiclass case file names three topics:
+
+```jsonl
+{"schema_version":1,"id":"dev-1","split":"development","text":"Please correct the fee on my invoice.","label":"billing"}
+{"schema_version":1,"id":"cal-1","split":"calibration","text":"I need to change the date of my flight.","label":"travel"}
+{"schema_version":1,"id":"test-1","split":"locked_test","text":"My password reset link has expired.","label":"account"}
+{"schema_version":1,"id":"test-2","split":"locked_test","text":"I was charged twice for the same item.","label":"billing"}
+{"schema_version":1,"id":"test-3","split":"locked_test","text":"Where can I find my boarding pass?","label":"travel"}
+{"schema_version":1,"id":"test-4","split":"locked_test","text":"Please update my account email address.","label":"account"}
+{"schema_version":1,"id":"test-5","split":"locked_test","text":"The refund is missing from my statement.","label":"billing"}
+```
+
+Its manifest uses the same pin and split contract as binary input:
+
+```json
+{
+  "schema_version": 1,
+  "task": "multiclass_classification",
+  "dataset_id": "owned-support-topics",
+  "dataset_version": "1",
+  "named_population": "Illustrative user-owned support requests",
+  "labels": [
+    {"id": "account", "description": "Account access or profile settings."},
+    {"id": "billing", "description": "Payments, charges or refunds."},
+    {"id": "travel", "description": "Flights, bookings or travel documents."}
+  ],
+  "expected_input_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_CHARACTERS",
+  "splits": {
+    "development": ["dev-1"],
+    "calibration": ["cal-1"],
+    "locked_test": ["test-1", "test-2", "test-3", "test-4", "test-5"]
+  }
+}
+```
+
+For multilabel input, select `"task":"multilabel_classification"` and use only
+the `labels` gold array on every row, for example:
+
+```jsonl
+{"schema_version":1,"id":"test-1","split":"locked_test","text":"I cannot access my account to dispute the flight charge.","labels":["account","billing","travel"]}
+{"schema_version":1,"id":"test-2","split":"locked_test","text":"Thank you for your help.","labels":[]}
+```
+
+Freeze the **complete** new case file, its exact SHA-256 and complete nonempty
+split membership together. Changing the task or any case requires a new input
+pin. Multilabel scores normalize present/absent separately for each label;
+labels never compete in a softmax. Multiple positive labels and the empty set
+are ordinary outcomes. The declared policy applies independently to each head;
+an uncertain head is an abstention, not a manufactured negative label.
+
+Run the evaluation example below with this suite/case file and `--max-labels 3`.
+Use that same explicit cap for paired qualification. Native calibration fitting
+and artifact application currently require `binary_classification`; using any
+calibration option with the broader tasks refuses before either model snapshot
+or calibration artifact is opened.
 
 ## Evaluate a pinned model
 
@@ -91,13 +166,45 @@ intended evaluation. A parsed population below `minimum_samples` returns
 `measurement.status = "insufficient_data"` and `classification = null`, with no
 invented metric estimates. The command still records the actual completed replay.
 
-The report contains native held-out confusion counts, abstentions, accuracy over
+The binary report contains native held-out confusion counts, abstentions, accuracy over
 all held-out rows, decided accuracy, and per-class/macro F1. An abstention earns
 no accuracy credit. A missing class with no predictions has undefined F1 rather
 than an invented perfect score. Reliability metrics use the **uncalibrated
 positive candidate weight** normalized over the two complete label sequences;
 this is not a calibrated real-world probability. Brier score, ECE, selective risk
 and bootstrap intervals use the existing Assay measurement rules.
+
+Multiclass and multilabel reports set `classification` to null and provide their
+native quality metrics in `label_set`. The report's `task`, `score_semantics`
+and `classification_semantics` identify the exact interpretation. Multiclass
+accuracy counts correct selected labels over every held-out document;
+multilabel accuracy requires the exact gold set with every head decided.
+Abstentions earn no accuracy credit. Per-label counts and macro/micro F1 make
+individual classes visible; absent required F1 remains undefined rather than
+silently dropping that class from the macro score.
+
+`label_set` also reports `label_decision_coverage`, `hamming_loss`, and
+`partially_decided_rows`. A partially decided document counts in
+`abstained_rows`; an abstained label counts as a Hamming error, and an abstained
+positive counts as a missed positive for recall and F1. The accuracy gate uses
+`label_set.exact_match_accuracy` for both broader tasks. These definitions keep
+abstention visible instead of rewarding a classifier for suppressing difficult
+decisions.
+
+Reliability and acceptance have task-specific definitions:
+
+| Task | Brier score | ECE and selective risk |
+|---|---|---|
+| Binary | Existing positive-event squared error | Existing positive-event acceptance and risk |
+| Multiclass | Half the sum of one-vs-rest squared errors per document, in `0..1` | Top-label weight versus correctness; acceptance requires a native decision and top weight at least `--acceptance-threshold`; risk is incorrect selected label |
+| Multilabel | Mean of independent per-label squared errors per document, in `0..1` | Pooled label-event ECE; acceptance requires all heads decided and every chosen-side score at least the threshold (`p` for present, `1-p` for absent); risk is exact-set mismatch |
+
+All confidence intervals resample **complete documents**. Multilabel label
+events remain correlated within each bootstrap draw; they never inflate the
+sample count or the minimum number of held-out documents. Cached per-document
+losses and calibration-bin contributions keep bootstrap work independent of
+the number of label heads after the initial bounded scan. Paired Brier changes
+use these same per-document losses for both arms.
 
 The native task scores full-vocabulary continuations including scored EOS. The
 actual native selected label, including lexical label-ID ties and policy
@@ -108,7 +215,10 @@ HMAC in `bindings.execution_collection`. A separate
 `bindings.observation_collection` commits to each canonical row association,
 gold label, actual positive candidate weight, selected label and abstention
 decision. Its framing version is
-`ordered_native_binary_observations_sha256_framed_v1`; both collections expose
+`ordered_native_binary_observations_sha256_framed_v1` for binary input. Broader
+tasks use `ordered_native_label_vector_observations_sha256_framed_v1`, binding
+the complete gold/score/decision/abstention vectors and their label association.
+Both collections expose
 their format and row count alongside the HMAC. The suite, input, split membership
 and result seal are also bound. Documents, private row IDs, individual scores,
 and bare private input digests are omitted from ordinary evaluation reports.
@@ -117,6 +227,9 @@ knots include observed calibration score boundaries. Treat those artifacts as
 sensitive and retain protected file output.
 
 ## Fit, save and explicitly apply native calibration
+
+Fitting and artifact reuse support binary suites only. A binary scalar transform
+cannot be silently reused as multiclass or per-label calibration.
 
 Fitting requires at least `--minimum-samples` rows in **both** the calibration
 and locked-test splits. The seven-row illustrative suite above has only one
@@ -259,7 +372,13 @@ output publication and cleanup claims are additional. The explicit
 `--memory-mib` is a process memory-ledger ceiling, not a measured RSS result; an
 insufficient declaration refuses. Tight input/report bounds reduce the required
 reservation. `--preparation-mib` defaults to 128 and prices compiler/request
-headroom separately. `--max-result-bytes` bounds each task result, while
+headroom separately. `--max-labels` bounds parsed gold vectors, retained native
+score vectors and the complete possible prompt/head preparation before any IO;
+the host additionally prices its modeled complete preparation requirement.
+The suite is checked against this cap before typed gold rows are parsed, and
+an oversized label set refuses before malformed case JSON can be decoded. A
+multilabel document spends all of its independent heads from the same shared
+work allowance; no head or label renews it. `--max-result-bytes` bounds each task result, while
 `--max-output-bytes` bounds the complete final report including its envelope/LF.
 After parsing, the CLI checks the complete held-out bootstrap workload across
 both arms and the actual receipt namespace contract before either snapshot load.
@@ -307,3 +426,12 @@ decisions and exact paired work, refuses conservative expired qualification,
 and checks key/namespace/tamper/byte-pin/source-binding failures before opening
 a model. Its source adds regression coverage without asserting model quality or
 claiming that the fixture has been executed.
+
+The ignored fixture
+`model_present_label_sets_replay_native_heads_with_exact_paired_work_and_early_refusals`
+uses the same explicit model environment. It exercises both a three-class suite
+and a three-label suite, compares identical models with zero paired changes and
+exact doubled work, preserves private output, and verifies label-cap and
+binary-calibration refusals before absent model/artifact paths can be opened.
+It is unexecuted regression source pending the controller's DSR checkpoint and
+separate model-present qualification.

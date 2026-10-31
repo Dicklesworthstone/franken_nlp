@@ -1,6 +1,6 @@
 //! Operation admission and ownership regressions without model execution.
 use super::*;
-use super::super::tests::host;
+use super::super::tests::{dataset, host};
 
 #[test]
 fn explicit_raw_mode_keeps_the_existing_complete_evaluation_and_paired_quotes() {
@@ -106,4 +106,15 @@ fn sealed_applications_and_all_calibration_outcomes_cross_the_existing_physical_
     let _fit = NlpEngine::calibrate_int4_classification;
     let _apply = NlpEngine::evaluate_int4_classification_calibrated;
     let _pair = NlpEngine::qualify_int4_classification_calibrated;
+}
+
+#[test]
+fn binary_artifact_operations_refuse_nonbinary_scope_even_when_neither_arm_has_an_artifact() {
+    validate_calibration_scope(&dataset("binary_classification", &["yes", "no"])).unwrap();
+    assert_eq!(owned_operation(false, 2, [false, false]).unwrap(), Int4AssayOperation::Raw);
+    for suite in [dataset("multiclass_classification", &["news", "support", "other"]),
+        dataset("multilabel_classification", &["news", "support"]),
+        dataset("multilabel_classification", &["review"])] {
+        assert!(matches!(validate_calibration_scope(&suite), Err(HostedError::Assay(AssayError::Scope))));
+    }
 }

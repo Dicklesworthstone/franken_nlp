@@ -29,6 +29,9 @@ struct Fixture {
 impl Fixture {
     fn new(locked: usize) -> Self { Self::with_calibration(locked, 1) }
     fn with_calibration(locked: usize, calibration: usize) -> Self {
+        Self::with_task(locked, calibration, "binary_classification")
+    }
+    fn with_task(locked: usize, calibration: usize, task: &str) -> Self {
         let root = std::env::temp_dir().join(format!("fnlp-native-assay-{}-{}",
             std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
         fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
@@ -45,16 +48,31 @@ impl Fixture {
                     if positive { "The product works well and I am satisfied." }
                     else { "The product broke immediately and I am disappointed." });
                 private.push(text.clone()); private.push(Sha256Digest::of_bytes(text.as_bytes()).to_hex());
-                let row = serde_json::json!({"schema_version":1,"id":id,"split":split,"text":text,"positive":positive});
+                let mut row = serde_json::json!({"schema_version":1,"id":id,"split":split,"text":text});
+                match task {
+                    "binary_classification" => row["positive"] = serde_json::json!(positive),
+                    "multiclass_classification" => row["label"] = serde_json::json!(["negative", "neutral", "positive"][ordinal % 3]),
+                    "multilabel_classification" => row["labels"] = serde_json::json!(match ordinal % 3 {
+                        0 => vec!["negative", "positive"], 1 => vec!["neutral"], _ => vec![],
+                    }),
+                    _ => panic!("fixture task must be explicit"),
+                }
                 rows.extend(canonjson::canonical_bytes(&row).unwrap()); rows.push(b'\n');
             }
             splits.insert(split.to_owned(), serde_json::json!(ids));
         }
-        let manifest = serde_json::json!({"schema_version":1,"task":"binary_classification",
+        let mut manifest = serde_json::json!({"schema_version":1,"task":task,
             "dataset_id":"owned-native-fixture","dataset_version":"1","named_population":"synthetic-integration-only",
-            "positive_label":{"id":"positive","description":"An approving product review."},
-            "negative_label":{"id":"negative","description":"A disapproving product review."},
             "expected_input_sha256":Sha256Digest::of_bytes(&rows),"splits":splits});
+        if task == "binary_classification" {
+            manifest["positive_label"] = serde_json::json!({"id":"positive","description":"An approving product review."});
+            manifest["negative_label"] = serde_json::json!({"id":"negative","description":"A disapproving product review."});
+        } else {
+            manifest["labels"] = serde_json::json!([
+                {"id":"positive","description":"The document includes approval."},
+                {"id":"negative","description":"The document includes disapproval."},
+                {"id":"neutral","description":"The document includes a neutral factual statement."}]);
+        }
         private.push(Sha256Digest::of_bytes(&rows).to_hex());
         write(&suite, &canonjson::canonical_bytes(&manifest).unwrap()); write(&cases, &rows);
         // These neutral equality gates test replay wiring, not model usefulness.
@@ -73,6 +91,7 @@ impl Fixture {
         options.args.common.key_file = Some(self.key.clone()); options.args.snapshot = Some(source.snapshot.clone());
         options.args.expected_model_sha256 = Some(source.pin.clone()); options.args.group_width = source.width;
         options.args.memory_mib = Some(source.memory); options.args.kernel = source.kernel;
+        options.args.max_labels = if self.manifest["task"] == "binary_classification" { 2 } else { 3 };
         options.args.timeout_seconds = 86_400;
         // The calibration fixture can replay eleven complete labels twice.
         options.args.max_projected_logits = 1_000_000_000;
@@ -303,5 +322,85 @@ fn model_present_native_calibration_round_trip_and_independent_arms_preserve_aut
         assert!(!errors.is_empty());
     }
     assert_eq!(fs::read(&artifact_path).unwrap(), artifact_bytes);
+    println!("{COMPLETE}");
+}
+
+#[test]
+#[ignore = "requires controller-admitted independently pinned INT4 snapshot for multiclass/multilabel actual replay and paired document metrics"]
+fn model_present_label_sets_replay_native_heads_with_exact_paired_work_and_early_refusals() {
+    const CHILD: &str = "FNLP_INT4_ASSAY_LABEL_SET_CHILD";
+    const COMPLETE: &str = "FNLP_INT4_ASSAY_LABEL_SET_COMPLETE";
+    let full_name = concat!(module_path!(), "::model_present_label_sets_replay_native_heads_with_exact_paired_work_and_early_refusals");
+    let name = full_name.split_once("::").expect("crate-qualified fixture name").1;
+    if std::env::var(CHILD).ok().as_deref() != Some(name) {
+        let result = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", name, "--ignored", "--nocapture"]).env(CHILD, name)
+            .output().expect("isolated label-set fixture must start");
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(result.status.success(), "isolated label-set fixture failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&result.stderr));
+        assert!(stdout.contains(COMPLETE), "exact fixture filter ran no completed fixture");
+        return;
+    }
+    assert!(crate::installed_process_resources().is_none());
+    let source = Source::explicit();
+    for task in ["multiclass_classification", "multilabel_classification"] {
+        let fixture = Fixture::with_task(5, 1, task);
+        let (code, evaluated, errors) = fixture.run(fixture.options(&source, false), "evaluation.json");
+        assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&errors)); assert!(errors.is_empty());
+        let evaluated = evaluated.unwrap(); let eval = &evaluated["report"];
+        assert_eq!(eval["task"], task); assert_eq!(eval["executed_rows"], 7);
+        assert_eq!(eval["measurement"]["status"], "measured");
+        assert!(eval["classification"].is_null()); assert!(eval["label_set"].is_object());
+        assert_eq!(eval["label_set"]["mode"], if task == "multiclass_classification" { "multiclass" } else { "multilabel" });
+        assert_eq!(eval["label_set"]["rows"], 5); assert_eq!(eval["label_set"]["label_count"], 3);
+        assert_eq!(eval["label_set"]["decided_rows"], 5);
+        assert_eq!(eval["label_set"]["labels"].as_array().unwrap().iter()
+            .map(|label| label["label"].as_str().unwrap()).collect::<Vec<_>>(), ["negative", "neutral", "positive"]);
+        assert_eq!(eval["bindings"]["observation_collection_format"], native_classify::VECTOR_OBSERVATION_COLLECTION_FORMAT);
+        let single_work = work(&eval["model_work"]); assert!(single_work.into_iter().all(|n| n > 0));
+        let (code, paired, errors) = fixture.run(fixture.options(&source, true), "qualification.json");
+        assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&errors)); assert!(errors.is_empty());
+        let paired = paired.unwrap(); let report = &paired["report"];
+        assert_eq!(report["task"], task); assert_eq!(report["decision"]["status"], "passed");
+        for arm in ["candidate", "baseline"] {
+            assert_eq!(report[arm]["measurement"], eval["measurement"]);
+            assert_eq!(report[arm]["label_set"], eval["label_set"]);
+            assert_eq!(report[arm]["bindings"]["observation_collection"], eval["bindings"]["observation_collection"]);
+            assert_eq!(work(&report[arm]["model_work"]), single_work);
+        }
+        assert_eq!(report["decision"]["paired"]["equal"], 5);
+        assert_eq!(report["decision"]["paired"]["mean_brier_change"].as_f64(), Some(0.0));
+        assert_eq!(work(&report["total_model_work"]), single_work.map(|n| n.checked_mul(2).unwrap()));
+
+        // All these refusals are decidable without reading either the absent
+        // model or an absent calibration artifact, including a baseline-only one.
+        for refusal in 0..4 {
+            let mut options = fixture.options(&source, refusal == 3);
+            options.args.snapshot = Some(fixture.root.join("must-not-open-model"));
+            let expected = match refusal {
+                0 => { options.args.max_labels = 2; ErrorCode::AdmissionOrResourceLimit }
+                1 => { options.fit = calibration_command(&[]).fit; options.application = None; ErrorCode::Usage }
+                2 => { options.application = Some(application()); ErrorCode::Usage }
+                _ => {
+                    let comparison = options.comparison.as_mut().unwrap();
+                    comparison.baseline_snapshot = Some(fixture.root.join("must-not-open-baseline"));
+                    comparison.baseline_calibration = Some(fixture.root.join("must-not-open-calibration"));
+                    comparison.expected_baseline_calibration_sha256 = Some(super::super::super::tests::BASELINE_PIN.to_owned());
+                    comparison.baseline_as_of = Some("2026-06-01".to_owned());
+                    comparison.baseline_shift_assessment = Some("in-distribution".to_owned());
+                    ErrorCode::Usage
+                }
+            };
+            let (code, report, errors) = fixture.run(options, &format!("refused-label-task-{refusal}.json"));
+            assert_eq!(code, expected.as_process_exit()); assert!(report.is_none());
+            assert!(!errors.is_empty());
+            if refusal != 0 {
+                let failure: serde_json::Value = serde_json::from_slice(&errors).unwrap();
+                assert_eq!(failure["reason"], "native_calibration_requires_binary_task");
+            }
+        }
+        assert_eq!(fs::read(&fixture.cases).unwrap(), fixture.rows);
+    }
     println!("{COMPLETE}");
 }

@@ -49,14 +49,33 @@ fn native_schema_discovery_needs_no_files_models_keys_or_runtime() {
             crate::assay::native_classify::EXECUTION_COLLECTION_FORMAT);
         assert_eq!(value["private_bindings"]["observation_collection"]["format"],
             crate::assay::native_classify::OBSERVATION_COLLECTION_FORMAT);
+        assert_eq!(value["private_bindings"]["observation_collection"]["label_vector_format"],
+            crate::assay::native_classify::VECTOR_OBSERVATION_COLLECTION_FORMAT);
         assert_eq!(value["calibration"]["default_method"], "isotonic");
         assert_eq!(value["calibration"]["scope"], crate::assay::native_classify::calibrate::SCOPE);
         let definitions = &value["json_schema"]["$defs"];
-        assert_eq!(definitions["suite"]["properties"]["task"]["const"], "binary_classification");
-        assert!(definitions["suite"]["properties"].get("execution_identity").is_none());
-        assert!(definitions["case"]["properties"].get("probability").is_none());
-        assert_eq!(definitions["case"]["additionalProperties"], false);
-        assert_eq!(definitions["case"]["required"].as_array().unwrap().len(), 5);
+        assert_eq!(definitions["binary_suite"]["properties"]["task"]["const"], "binary_classification");
+        assert_eq!(value["supported_tasks"].as_array().unwrap().len(), if operation == "calibrate" { 1 } else { 3 });
+        if operation == "calibrate" {
+            assert_eq!(definitions["suite"]["$ref"], "#/$defs/binary_suite");
+            assert_eq!(definitions["case"]["$ref"], "#/$defs/binary_case");
+        } else {
+            assert_eq!(definitions["suite"]["oneOf"].as_array().unwrap().len(), 3);
+            assert_eq!(definitions["case"]["oneOf"].as_array().unwrap().len(), 3);
+        }
+        for (suite, case, gold) in [("binary_suite", "binary_case", "positive"),
+            ("multiclass_suite", "multiclass_case", "label"), ("multilabel_suite", "multilabel_case", "labels")] {
+            assert!(definitions[suite]["properties"].get("execution_identity").is_none());
+            assert!(definitions[case]["properties"].get("probability").is_none());
+            assert_eq!(definitions[case]["additionalProperties"], false);
+            let required = definitions[case]["required"].as_array().unwrap();
+            assert_eq!(required.len(), 5); assert!(required.iter().any(|field| field == gold));
+        }
+        assert_eq!(definitions["multiclass_suite"]["properties"]["labels"]["minItems"], 2);
+        assert_eq!(definitions["multilabel_suite"]["properties"]["labels"]["minItems"], 1);
+        assert_eq!(definitions["multilabel_case"]["properties"]["labels"]["uniqueItems"], true);
+        assert_eq!(value["label_admission"]["default"], 2);
+        assert_eq!(value["calibration"]["supported_task"], "binary_classification");
         let gates = &definitions["qualification_gates"];
         assert_eq!(gates["additionalProperties"], false);
         assert!(gates["required"].as_array().unwrap().iter().any(|field| field == "max_macro_f1_decrease"));
@@ -87,7 +106,7 @@ fn native_routes_require_explicit_pins_and_do_not_accept_scores_sampling_or_acti
 
 #[test]
 fn invalid_native_bounds_are_rejected_before_input_with_private_values_redacted() {
-    for field in 0..14 {
+    for field in 0..15 {
         let mut options = command(false, &[]);
         match field {
             0 => options.args.expected_model_sha256 = Some("PRIVATE-invalid-pin".to_owned()),
@@ -103,7 +122,8 @@ fn invalid_native_bounds_are_rejected_before_input_with_private_values_redacted(
             10 => options.args.max_projected_logits = 0,
             11 => options.args.max_attention_pairs = 0,
             12 => options.args.max_dot_products = 0,
-            _ => options.args.max_multiply_accumulates = 0,
+            13 => options.args.max_multiply_accumulates = 0,
+            _ => options.args.max_labels = 129,
         }
         let mut errors = Vec::new();
         assert_eq!(options.run(&mut NoRead, &mut NoWrite, &mut errors), ErrorCode::Usage.as_process_exit(), "field {field}");

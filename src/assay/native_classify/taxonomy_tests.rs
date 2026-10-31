@@ -242,3 +242,37 @@ fn exclusive_abstention_retains_raw_argmax_and_vector_bindings_cover_every_label
         assert_eq!(required_replay_bytes_for_labels(Limits::default(), 1, labels), Err(AssayError::Limits));
     }
 }
+
+#[test]
+fn admitted_label_cap_is_enforced_before_any_case_gold_is_materialized() {
+    for kind in [TaskKind::Multiclass, TaskKind::Multilabel] {
+        let (manifest, rows) = vector_wire(kind, &[vec![0]]);
+        let (bytes, input) = encode(manifest.clone(), &rows);
+        for cap in [3, MAX_LABELS] {
+            assert!(Dataset::parse_with_label_limit(&bytes, &input, Limits::default(), cap).is_ok());
+        }
+        for cap in [1, 2] {
+            assert_eq!(Dataset::parse_with_label_limit(&bytes, &input, Limits::default(), cap).err(),
+                Some(AssayError::InputLimit));
+        }
+        for cap in [0, MAX_LABELS + 1, usize::MAX] {
+            assert_eq!(Dataset::parse_with_label_limit(&bytes, &input, Limits::default(), cap).err(),
+                Some(AssayError::Limits));
+        }
+        // This pin and line count are valid, but every case would fail typed
+        // JSON/gold parsing. An underpriced label set must refuse first.
+        let malformed = b"not-json\nnot-json\nnot-json\n";
+        let mut manifest = manifest;
+        manifest.expected_input_sha256 = Sha256Digest::of_bytes(malformed);
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        assert_eq!(Dataset::parse_with_label_limit(&bytes, malformed, Limits::default(), 2).err(),
+            Some(AssayError::InputLimit));
+        assert_eq!(Dataset::parse_with_label_limit(&bytes, malformed, Limits::default(), 3).err(),
+            Some(AssayError::Json));
+    }
+    let (manifest, rows) = tests::wire(&[true], ClassificationPolicy::default());
+    let (bytes, input) = encode(manifest, &rows);
+    assert_eq!(Dataset::parse_with_label_limit(&bytes, &input, Limits::default(), 1).err(),
+        Some(AssayError::InputLimit));
+    assert!(Dataset::parse_with_label_limit(&bytes, &input, Limits::default(), 2).is_ok());
+}

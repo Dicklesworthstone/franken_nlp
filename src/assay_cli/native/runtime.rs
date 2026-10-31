@@ -53,7 +53,7 @@ impl Plan {
         let host = Int4AssayHostLimits { native: NativeLimits { context_tokens: args.context_tokens,
             allocator_reserve_bytes: ALLOCATOR_BYTES, run: RunLimits { max_elapsed: elapsed,
                 max_checkpoints: args.max_checkpoints, cleanup_reserve_bytes: CLEANUP_BYTES } },
-            task: args.task()?, preparation_reserve_bytes: mib(args.preparation_mib)?,
+            task: args.task()?, max_labels: args.max_labels, preparation_reserve_bytes: mib(args.preparation_mib)?,
             max_model_work: args.work() };
         let widths = [candidate.pin.group_width, baseline.as_ref().map(|model| model.pin.group_width).unwrap_or(args.group_width)];
         let widths = &widths[..1 + usize::from(baseline.is_some())];
@@ -76,6 +76,10 @@ impl Plan {
         // This guard stays live through the final physical output flush.
         let raw_staging_bytes = sum(&[multiply(limits.max_input_bytes, 8)?,
             multiply(limits.max_manifest_bytes, 8)?, multiply(limits.max_rows, 1024)?,
+            // Short label IDs still allocate String/Vec owners while strict
+            // JSON, typed gold sets and their indices coexist before transfer.
+            multiply(limits.max_rows, multiply(args.max_labels, 64)?)?,
+            multiply(args.max_labels, 512)?,
             multiply(limits.max_output_bytes, 4)?, calibration_staging, CLEANUP_BYTES])?;
         let residents = sum(&[candidate.memory.resident_bytes,
             baseline.as_ref().map_or(0, |model| model.memory.resident_bytes)])?;
@@ -122,7 +126,8 @@ pub(super) fn execute(command: &Command, limits: Limits, input: &mut impl Read,
     let cases = if common.observations.as_os_str() == "-" { read_bytes(input, limits.max_input_bytes)? }
         else { read_file(&common.observations, limits.max_input_bytes)? };
     remaining()?;
-    let dataset = native_classify::Dataset::parse(&manifest, &cases, limits)?;
+    let dataset = native_classify::Dataset::parse_with_label_limit(&manifest, &cases, limits, command.args.max_labels)?;
+    preflight_task(&dataset, command)?;
     let gates = command.comparison.as_ref().map(|comparison| {
         let bytes = read_file(comparison.gates.as_deref().ok_or_else(invalid_options)?, limits.max_manifest_bytes)?;
         native_classify::parse_gates(&bytes, limits).map_err(Failure::from)
@@ -221,6 +226,16 @@ fn decode_application(bytes: &[u8], pin: Sha256Digest, key: &CommitmentKey, name
         // parsing retains its distinct input-decode category elsewhere.
         if error == AssayError::Json { AssayError::InvalidCalibration.into() } else { error.into() }
     })
+}
+
+/// Labels are charged under the caller's pre-IO cap. Scalar binary calibration
+/// cannot be reinterpreted as a multiclass or independent-label transform.
+fn preflight_task(dataset: &native_classify::Dataset, command: &Command) -> Result<(), Failure> {
+    if dataset.label_count() > command.args.max_labels { return Err(AssayError::InputLimit.into()); }
+    if !dataset.is_binary() && (command.fit.is_some() || command.artifact_count() != 0) {
+        return Err(Failure::new(ErrorCode::Usage, "native_calibration_requires_binary_task"));
+    }
+    Ok(())
 }
 
 /// Reject population-dependent work and receipt namespace failures before

@@ -52,6 +52,25 @@ fn native_input_and_complete_report_bounds_increase_both_outer_and_host_reservat
 }
 
 #[test]
+fn label_cap_prices_gold_vectors_and_complete_native_heads_before_input_io() {
+    let binary = command(false, &[]); let limits = binary.validate().unwrap();
+    assert_eq!(binary.args.max_labels, 2);
+    let initial = Plan::new(&binary, limits).unwrap();
+    let expanded = command(false, &["--max-labels", "3"]);
+    let expanded = Plan::new(&expanded, expanded.validate().unwrap()).unwrap();
+    assert_eq!(expanded.host.max_labels, 3);
+    assert_eq!(expanded.raw_staging_bytes - initial.raw_staging_bytes,
+        limits.max_rows as u64 * 64 + 512);
+    assert!(expanded.minimum_memory_bytes > initial.minimum_memory_bytes);
+    assert_eq!(expanded.candidate.memory, initial.candidate.memory);
+    assert_eq!(expanded.host.task, initial.host.task);
+    assert_eq!(expanded.host.max_model_work, initial.host.max_model_work);
+    for cap in ["0", "129"] {
+        assert_eq!(command(false, &["--max-labels", cap]).validate().unwrap_err().code, ErrorCode::Usage);
+    }
+}
+
+#[test]
 fn native_fit_and_each_authenticated_artifact_are_in_the_complete_pre_io_peak() {
     let raw = command(false, &[]); let limits = raw.validate().unwrap();
     let raw_plan = Plan::new(&raw, limits).unwrap();
@@ -180,6 +199,65 @@ fn preflight_population() -> native_classify::Dataset {
         "dataset_version":"1","named_population":"owned fixture","positive_label":{"id":"yes","description":""},
         "negative_label":{"id":"no","description":""},"expected_input_sha256":Sha256Digest::of_bytes(&input),"splits":splits});
     native_classify::Dataset::parse(&canonjson::canonical_bytes(&suite).unwrap(), &input, Limits::default()).unwrap()
+}
+
+fn preflight_label_population(task: &str) -> native_classify::Dataset {
+    let mut input = Vec::new(); let mut splits = serde_json::Map::new();
+    for (split, count) in [("development", 1), ("calibration", 1), ("locked_test", 5)] {
+        let mut ids = Vec::new();
+        for index in 0..count {
+            let id = format!("{split}-{index}"); ids.push(id.clone());
+            let mut row = serde_json::json!({"schema_version":1,"id":id,"split":split,
+                "text":format!("Owned label-set preflight document {split} {index}")});
+            if task == "multiclass_classification" { row["label"] = serde_json::json!("alpha"); }
+            else { row["labels"] = serde_json::json!(if index % 2 == 0 { vec!["alpha", "gamma"] } else { vec![] }); }
+            input.extend(canonjson::canonical_bytes(&row).unwrap()); input.push(b'\n');
+        }
+        splits.insert(split.to_owned(), serde_json::json!(ids));
+    }
+    let suite = serde_json::json!({"schema_version":1,"task":task,"dataset_id":"preflight-labels",
+        "dataset_version":"1","named_population":"owned label-set fixture",
+        "labels":[{"id":"gamma","description":""},{"id":"alpha","description":""},{"id":"beta","description":""}],
+        "expected_input_sha256":Sha256Digest::of_bytes(&input),"splits":splits});
+    native_classify::Dataset::parse(&canonjson::canonical_bytes(&suite).unwrap(), &input, Limits::default()).unwrap()
+}
+
+#[test]
+fn task_preflight_admits_explicit_label_caps_and_refuses_binary_calibration_reuse() {
+    for task in ["multiclass_classification", "multilabel_classification"] {
+        let dataset = preflight_label_population(task);
+        assert_eq!(preflight_task(&dataset, &command(false, &[])).unwrap_err().code,
+            ErrorCode::AdmissionOrResourceLimit);
+        for paired in [false, true] {
+            assert!(preflight_task(&dataset, &command(paired, &["--max-labels", "3"])).is_ok());
+        }
+        let fit = calibration_command(&["--max-labels", "3"]);
+        let mut apply = command(false, &["--max-labels", "3"]); apply.application = Some(application());
+        let baseline = command(true, &["--max-labels", "3", "--baseline-calibration", "must-not-open-artifact",
+            "--expected-baseline-calibration-sha256", super::super::tests::BASELINE_PIN,
+            "--baseline-as-of", "2026-06-01", "--baseline-shift-assessment", "in-distribution"]);
+        for invalid in [fit, apply, baseline] {
+            invalid.validate().unwrap();
+            let error = preflight_task(&dataset, &invalid).unwrap_err();
+            assert_eq!(error.code, ErrorCode::Usage);
+            assert_eq!(error.reason, "native_calibration_requires_binary_task");
+        }
+    }
+    assert!(preflight_task(&preflight_population(), &calibration_command(&[])).is_ok());
+}
+
+#[test]
+fn label_reliability_bootstrap_admission_counts_documents_without_label_pseudoreplication() {
+    let key = CommitmentKey::new("fixture", [0x42; 32]).unwrap();
+    let mut options = EvalOptions::default(); options.minimum_samples = 5; options.bootstrap.resamples = 16;
+    for task in ["multiclass_classification", "multilabel_classification"] {
+        let dataset = preflight_label_population(task);
+        let mut limits = Limits::default(); limits.max_bootstrap_draws = 160;
+        assert!(preflight_replay(&dataset, &key, "fixture", options, limits, true).is_ok());
+        limits.max_bootstrap_draws = 159;
+        assert_eq!(preflight_replay(&dataset, &key, "fixture", options, limits, true).unwrap_err().code,
+            ErrorCode::AdmissionOrResourceLimit);
+    }
 }
 
 #[test]

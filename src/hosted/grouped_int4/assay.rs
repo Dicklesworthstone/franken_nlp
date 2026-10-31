@@ -22,8 +22,12 @@ pub use calibrate::Int4AssayOperation;
 pub struct Int4AssayHostLimits {
     pub native: NativeLimits,
     pub task: TaskBudget,
-    /// Caller-priced tokenizer, compiler, request and allocator overhead.
-    /// Dataset, retained scores, row results and native storage are separate.
+    /// Pre-IO bound on the complete declared label set. Multilabel tasks may
+    /// retain this many independent prepared heads while reusing one native KV.
+    pub max_labels: usize,
+    /// Caller-priced fixed tokenizer, compiler and allocator overhead.
+    /// Complete prompt/head staging, Dataset, retained scores, row results and
+    /// native storage are priced separately from this fixed reserve.
     pub preparation_reserve_bytes: u64,
     pub max_model_work: Int4Work,
 }
@@ -48,6 +52,7 @@ impl Int4AssayHostLimits {
         self.native.run.validate()?;
         self.task.validate().map_err(|_| HostedError::Limits("INT4 Assay task budget"))?;
         if !(1..=2).contains(&group_widths.len()) || self.preparation_reserve_bytes == 0
+            || !(1..=native_classify::MAX_LABELS).contains(&self.max_labels)
             || self.native.allocator_reserve_bytes == 0 || !nonzero(self.max_model_work) {
             return Err(HostedError::Limits("INT4 Assay complete resource envelope"));
         }
@@ -64,10 +69,12 @@ impl Int4AssayHostLimits {
         }
         let workspace_bytes = sum(&[native.rope_bytes, native.scratch_payload_bound,
             self.native.allocator_reserve_bytes])?;
-        let replay = native_classify::required_replay_bytes(limits, group_widths.len()).map_err(HostedError::Assay)?;
+        let replay = native_classify::required_replay_bytes_for_labels(limits, group_widths.len(),
+            self.max_labels).map_err(HostedError::Assay)?;
+        let preparation = preparation_bytes(self.native.context_tokens, self.max_labels)?;
         let input_bytes = sum(&[multiply(limits.max_input_bytes as u64, 8)?,
             multiply(limits.max_manifest_bytes as u64, 8)?, self.preparation_reserve_bytes,
-            replay, multiply(self.task.max_output_bytes, 4)?])?;
+            preparation, replay, multiply(self.task.max_output_bytes, 4)?])?;
         let output_reservation_bytes = sum(&[multiply(limits.max_output_bytes as u64, 4)?, 4096])?;
         Ok(Int4AssayHostRequirements { native, workspace_bytes, input_bytes, output_reservation_bytes })
     }
@@ -86,7 +93,7 @@ impl NlpEngine {
         -> Result<HostedOutput<Evaluation>, HostedError> {
         dispatch::preflight(self, host.native.run)?;
         check_domain(self, model)?;
-        validate_inputs(&dataset, &key, &namespace, options, limits, 1)?;
+        validate_inputs(&dataset, &key, &namespace, options, limits, 1, host.max_labels)?;
         let required = host.requirements(&[model.model_identity().group_width()], limits)?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
@@ -126,7 +133,7 @@ impl NlpEngine {
         -> Result<HostedOutput<QualificationReport>, HostedError> {
         dispatch::preflight(self, host.native.run)?;
         check_domain(self, candidate)?; check_domain(self, baseline)?;
-        validate_inputs(&dataset, &key, &namespace, options, limits, 2)?;
+        validate_inputs(&dataset, &key, &namespace, options, limits, 2, host.max_labels)?;
         gates.validate(limits).map_err(HostedError::Assay)?;
         native_classify::validate_scope(&namespace, Some(&host_scope)).map_err(HostedError::Assay)?;
         let required = host.requirements(&[candidate.model_identity().group_width(),
@@ -167,8 +174,10 @@ fn replay_arm(model: &ResidentInt4, dataset: &Dataset, host: Int4AssayHostLimits
     limits: metrics::Limits, memory: Int4MemoryRequirement, kernel: PackedInt4Kernel,
     work: &mut Int4Work, control: &mut RunControl) -> Result<NativeReplay, HostedError> {
     checkpoint(control)?;
+    validate_shape(dataset, host.max_labels)?;
+    let heads = dataset.head_count();
     let planner = Int4ClassificationPlanner::for_model(model.model_identity(), host.task,
-        planning_limits(host, limits)).map_err(classification_error)?;
+        planning_limits(host, limits, dataset.label_count(), heads)?).map_err(classification_error)?;
     let mut collector = Collector::new(dataset, model.model_identity(), limits).map_err(HostedError::Assay)?;
     checkpoint(control)?;
     let mut engine = StrictInt4Engine::new(&model.inner.loaded.value, host.native.context_tokens,
@@ -179,7 +188,7 @@ fn replay_arm(model: &ResidentInt4, dataset: &Dataset, host: Int4AssayHostLimits
         let request = dataset.classification_request(index, host.task).map_err(HostedError::Assay)?;
         let prepared = planner.plan_with_control(&request, control).map_err(classification_error)?;
         drop(request);
-        if prepared.head_count() != 1 || prepared.required_context() == 0
+        if prepared.head_count() != heads || prepared.required_context() == 0
             || prepared.required_context() > host.native.context_tokens || prepared.task_budget() != host.task {
             return Err(classification_error(Int4ClassificationError::Accounting));
         }
@@ -188,7 +197,7 @@ fn replay_arm(model: &ResidentInt4, dataset: &Dataset, host: Int4AssayHostLimits
         let run = prepared.execute_with_control(prepared.execution_identity(), &mut engine,
             Int4ScoringBudget { native: Int4RunBudget::exact(row_work), max_kv_bytes: memory.kv_bytes }, control)
             .map_err(classification_error)?;
-        if run.model_work != row_work || run.head_count != 1 || run.group_width != planner.group_width()
+        if run.model_work != row_work || run.head_count != heads || run.group_width != planner.group_width()
             || engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) {
             return Err(classification_error(Int4ClassificationError::Accounting));
         }
@@ -199,18 +208,28 @@ fn replay_arm(model: &ResidentInt4, dataset: &Dataset, host: Int4AssayHostLimits
     collector.finish().map_err(HostedError::Assay)
 }
 
-fn planning_limits(host: Int4AssayHostLimits, limits: metrics::Limits) -> ClassificationLimits {
-    ClassificationLimits { max_labels: 2, max_input_bytes: limits.max_line_bytes,
-        max_context_tokens: host.native.context_tokens, max_total_prompt_tokens: host.native.context_tokens,
+fn planning_limits(host: Int4AssayHostLimits, limits: metrics::Limits, labels: usize, heads: usize)
+    -> Result<ClassificationLimits, HostedError> {
+    if labels == 0 || labels > host.max_labels || host.max_labels > native_classify::MAX_LABELS
+        || !(heads == 1 || heads == labels) {
+        return Err(HostedError::Limits("INT4 Assay complete label/head geometry"));
+    }
+    let prompt_tokens = aggregate_prompt_tokens(host.native.context_tokens, heads)?;
+    let label_bytes = labels.checked_mul(256 + 4096)
+        .ok_or(HostedError::Limits("INT4 Assay label storage overflow"))?;
+    Ok(ClassificationLimits { max_labels: labels, max_input_bytes: limits.max_line_bytes,
+        max_total_label_bytes: label_bytes,
+        max_context_tokens: host.native.context_tokens, max_total_prompt_tokens: prompt_tokens,
         max_work: BatchWork { forward_positions: host.max_model_work.forward_positions,
             projected_logits: host.max_model_work.projected_logits },
-        scoring: ScoringLimits { max_candidates: 2,
+        scoring: ScoringLimits { max_candidates: if heads == labels { 2 } else { labels },
             max_projected_logits: host.max_model_work.projected_logits, ..ScoringLimits::default() },
-        ..ClassificationLimits::default() }
+        ..ClassificationLimits::default() })
 }
 fn validate_inputs(dataset: &Dataset, key: &CommitmentKey, namespace: &str,
-    options: EvalOptions, limits: metrics::Limits, arms: usize) -> Result<(), HostedError> {
+    options: EvalOptions, limits: metrics::Limits, arms: usize, max_labels: usize) -> Result<(), HostedError> {
     native_classify::validate_scope(namespace, None).map_err(HostedError::Assay)?;
+    validate_shape(dataset, max_labels)?;
     dataset.validate_limits(limits).map_err(HostedError::Assay)?;
     options.validate_rows(dataset.locked_test_len(), limits).map_err(HostedError::Assay)?;
     validate_bootstrap(dataset.locked_test_len(), arms, options, limits)?;
@@ -219,6 +238,36 @@ fn validate_inputs(dataset: &Dataset, key: &CommitmentKey, namespace: &str,
     key.commit(CommitmentDomain::Configuration, namespace, "native_assay_preflight_v1", &[])
         .map_err(|_| HostedError::Assay(AssayError::Commitment))?;
     Ok(())
+}
+
+fn validate_shape(dataset: &Dataset, max_labels: usize) -> Result<(), HostedError> {
+    if !(1..=native_classify::MAX_LABELS).contains(&max_labels)
+        || dataset.label_count() == 0 || dataset.label_count() > max_labels
+        || !(dataset.head_count() == 1 || dataset.head_count() == dataset.label_count()) {
+        return Err(HostedError::Limits("INT4 Assay complete label/head geometry"));
+    }
+    Ok(())
+}
+
+fn aggregate_prompt_tokens(context_tokens: usize, heads: usize) -> Result<usize, HostedError> {
+    if context_tokens == 0 || heads == 0 || heads > native_classify::MAX_LABELS {
+        return Err(HostedError::Limits("INT4 Assay aggregate prompt geometry"));
+    }
+    // This is the task compiler's existing complete-head token ceiling. An
+    // oversized bundle is refused by planning, never silently truncated.
+    context_tokens.checked_mul(heads).map(|tokens| tokens.min(16 * 1024 * 1024))
+        .ok_or(HostedError::Limits("INT4 Assay aggregate prompt overflow"))
+}
+
+fn preparation_bytes(context_tokens: usize, max_labels: usize) -> Result<u64, HostedError> {
+    let tokens = aggregate_prompt_tokens(context_tokens, max_labels)?;
+    // The prepared task retains every independent head before execution. This
+    // bounds simultaneously live token segments, copied trusted fragments,
+    // metadata, TaskIR/canonical JSON staging and task/scorer descriptors. The
+    // label term covers bounded 256-byte IDs, 4096-byte descriptions, opaque
+    // code/trie schedules and container overhead. Tokenizer tables and other
+    // fixed compiler/allocator ownership remain the caller's separate reserve.
+    sum(&[multiply(tokens as u64, 256)?, multiply(max_labels as u64, 65_536)?])
 }
 fn validate_bootstrap(rows: usize, arms: usize, options: EvalOptions, limits: metrics::Limits)
     -> Result<(), HostedError> {
