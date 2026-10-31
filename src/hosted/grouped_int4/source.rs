@@ -5,7 +5,8 @@
 use super::*;
 use crate::{
     grammar::mask::MaskWorkLimits,
-    native_engine::{constrained::JsonWorkBudget, constrained_int4::{self, Int4JsonBudget}},
+    native_engine::{constrained::JsonWorkBudget, constrained_int4::{self, Int4JsonBudget},
+        strict_int4::prefill::Int4PrefillLimits},
     tasks::{extract::ExtractionVocabulary,
         source_planning::grouped_int4::{Int4SourceError, Int4SourceTaskRun, PreparedInt4SourceTask}},
 };
@@ -20,6 +21,27 @@ impl NlpEngine {
         vocabulary: Arc<ExtractionVocabulary>, native: NativeLimits,
         mask_limits: MaskWorkLimits, max_mask_node_visits: u64, kernel: PackedInt4Kernel,
         cancellation: CancellationToken) -> Result<HostedOutput<Int4SourceTaskRun>, HostedError> {
+        self.execute_int4_source_task_scheduled(model, prepared, vocabulary, native, mask_limits,
+            max_mask_node_visits, kernel, None, cancellation)
+    }
+    /// Opt in to bounded layer-major prompts for NER, keyphrases, summary or
+    /// passage QA. The original constrained decode and semantic finalizer run
+    /// within the same native session, with one additional prompt memory charge.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_int4_source_task_layer_major(&self, model: &ResidentInt4, prepared: PreparedInt4SourceTask,
+        vocabulary: Arc<ExtractionVocabulary>, native: NativeLimits,
+        mask_limits: MaskWorkLimits, max_mask_node_visits: u64, kernel: PackedInt4Kernel,
+        prefill: Int4PrefillLimits, cancellation: CancellationToken)
+        -> Result<HostedOutput<Int4SourceTaskRun>, HostedError> {
+        self.execute_int4_source_task_scheduled(model, prepared, vocabulary, native, mask_limits,
+            max_mask_node_visits, kernel, Some(prefill), cancellation)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn execute_int4_source_task_scheduled(&self, model: &ResidentInt4, prepared: PreparedInt4SourceTask,
+        vocabulary: Arc<ExtractionVocabulary>, native: NativeLimits,
+        mask_limits: MaskWorkLimits, max_mask_node_visits: u64, kernel: PackedInt4Kernel,
+        prefill: Option<Int4PrefillLimits>, cancellation: CancellationToken)
+        -> Result<HostedOutput<Int4SourceTaskRun>, HostedError> {
         dispatch::preflight(self, native.run)?;
         if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
         constrained_int4::check_model(prepared.execution_identity(), model.model_identity())
@@ -28,12 +50,11 @@ impl NlpEngine {
             return Err(HostedError::ModelIdentity);
         }
         let work = prepared.planned_work();
-        let required = extract::requirements(work, prepared.group_width(), prepared.max_kv_bytes(),
-            native, mask_limits, max_mask_node_visits)?;
+        let (required, scratch_bytes) = extract::scheduled_requirements(work, prepared.group_width(),
+            prepared.max_kv_bytes(), native, mask_limits, max_mask_node_visits, prefill)?;
         let lease = self.resources().acquire_lease();
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-        let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-            sum(&[required.rope_bytes, required.scratch_payload_bound, native.allocator_reserve_bytes])?)?;
+        let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch, scratch_bytes)?;
         let output = output_claim(&lease, prepared.max_result_bytes(),
             prepared.task_budget().max_output_tokens as u64)?;
         let model = model.clone();
@@ -49,8 +70,12 @@ impl NlpEngine {
                 max_kv_bytes: required.kv_bytes, max_total_mask_node_visits: max_mask_node_visits, mask_limits,
             } };
             let result = allocate(output, || {
-                let run = prepared.execute_with_control(prepared.execution_identity(), &mut engine.value,
-                    &vocabulary, budget, control).map_err(task_error)?;
+                let run = match prefill {
+                    None => prepared.execute_with_control(prepared.execution_identity(), &mut engine.value,
+                        &vocabulary, budget, control),
+                    Some(limits) => prepared.execute_layer_major_with_control(prepared.execution_identity(),
+                        &mut engine.value, &vocabulary, budget, limits, control),
+                }.map_err(task_error)?;
                 if run.group_width != prepared.group_width() || engine.value.is_poisoned()
                     || !engine.value.kv_cache().all_slots_have_len(0) {
                     return Err(task_error(Int4SourceError::InvalidResult));
@@ -77,6 +102,8 @@ mod tests {
         send::<PreparedInt4SourceTask>();
         send::<Int4SourceTaskRun>();
         send::<Arc<ExtractionVocabulary>>();
+        send::<Int4PrefillLimits>();
+        let _grouped = NlpEngine::execute_int4_source_task_layer_major;
     }
 
     #[test]
