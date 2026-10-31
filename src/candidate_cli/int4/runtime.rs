@@ -88,10 +88,15 @@ impl Prepared {
             (Self::Extract { plan, vocabulary, masks, max_mask_node_visits }, None) =>
                 engine.execute_int4_extract(model, plan, vocabulary, native, masks,
                     max_mask_node_visits, kernel, cancellation).map(Completed::Extract),
+            (Self::Extract { plan, vocabulary, masks, max_mask_node_visits }, Some(prefill)) =>
+                engine.execute_int4_extract_layer_major(model, plan, vocabulary, native, masks,
+                    max_mask_node_visits, kernel, prefill, cancellation).map(Completed::Extract),
             (Self::Source { plan, vocabulary, masks, max_mask_node_visits }, None) =>
                 engine.execute_int4_source_task(model, plan, vocabulary, native, masks,
                     max_mask_node_visits, kernel, cancellation).map(Completed::Source),
-            (Self::Extract { .. } | Self::Source { .. }, Some(_)) => return Err(CandidateError::Arguments),
+            (Self::Source { plan, vocabulary, masks, max_mask_node_visits }, Some(prefill)) =>
+                engine.execute_int4_source_task_layer_major(model, plan, vocabulary, native, masks,
+                    max_mask_node_visits, kernel, prefill, cancellation).map(Completed::Source),
         }.map_err(|_| CandidateError::Execution)
     }
 }
@@ -108,7 +113,8 @@ pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
         || limits.minimum_memory_bytes > limits.memory_bytes || limits.kernel.kind() != args.kernel
         || !prefill::matches(&args, limits)?
         || !cohort::matches(&task, &args, limits)?
-        || (!matches!(&task, Int4Task::Text(_) | Int4Task::Classify(_)) && limits.prefill.is_some()) {
+        || (!matches!(&task, Int4Task::Text(_) | Int4Task::Classify(_) | Int4Task::Extract(_) | Int4Task::Source(..))
+            && limits.prefill.is_some()) {
         return Err(CandidateError::Arguments);
     }
     let started = Instant::now();

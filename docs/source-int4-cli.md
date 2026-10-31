@@ -45,12 +45,14 @@ addressed seeded sampler. `--temperature-milli`, `--top-k`, `--top-p-ppm`,
 `--logprobs`, `--min-new-tokens`, repeated `--stop`, `--ban-token`, repetition,
 presence and frequency penalties, and repeated `--logit-bias` are supported.
 Stops retain matching bytes. The pinned EOS cannot be banned or replaced.
-Text tasks can opt in to grouped-INT4 layer-major prompt execution with
-`--prefill-rows 1..=64`, with separately admitted extra workspace; see
-[INT4 prefill](int4-prefill.md). This changes prompt scheduling only, not
-sampling, stops, model identity or the completed response. Classification
-still rejects the flag. This route has no streaming, multi-request batch,
-durable-job or tool-execution mode.
+Text tasks and one-off `classify`, `sentiment`, `judge`, `extract`, `ner`,
+`keyphrases`, `summarize` and `answer` can opt in to grouped-INT4 layer-major
+prompt execution with `--prefill-rows 1..=64`, with separately admitted extra
+workspace; see [INT4 prefill](int4-prefill.md). This changes prompt scheduling
+while preserving each task's original model identity, work allowance, decoding
+policy and completed response. Structured tasks retain their greedy grammar
+decoder and independent source finalizers. Composed batch, map, retained-job,
+redaction and semantic workflows keep their existing prompt schedules.
 
 ## Admission and delivery
 

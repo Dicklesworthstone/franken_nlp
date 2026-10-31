@@ -50,13 +50,32 @@ fn all_four_tasks_accept_sources_or_independently_pinned_snapshots() {
 #[test]
 fn structured_routes_reject_generation_controls_even_when_explicit_defaults() {
     for name in ["ner", "keyphrases", "summarize", "answer"] {
-        for flags in [vec!["--max-output-bytes", "65536"], vec!["--prefill-rows", "1"],
+        for flags in [vec!["--max-output-bytes", "65536"],
             vec!["--min-new-tokens", "0"], vec!["--logprobs"], vec!["--stop", "END"],
             vec!["--ban-token", "7"], vec!["--logit-bias", "42=0"],
             vec!["--repetition-penalty-milli", "1000"], vec!["--presence-penalty-milli", "0"],
             vec!["--frequency-penalty-milli", "0"]] {
             assert!(CandidateCommand::from_matches(&matches(name, &flags)).is_err());
         }
+    }
+}
+
+#[test]
+fn one_off_prefill_preserves_task_and_mask_authority_while_shared_validation_stays_strict() {
+    for name in ["ner", "keyphrases", "summarize", "answer"] {
+        let (_, serial, args) = arguments(name, &["--options", "private-options.json"]);
+        let original = serial.validate(&args).unwrap();
+        let (kind, grouped, args) = arguments(name, &["--options", "private-options.json", "--prefill-rows", "4"]);
+        let limits = grouped.validate_with_prefill(&args).unwrap();
+        assert_eq!(serial, grouped); assert_eq!(kind.name(), name);
+        assert_eq!(grouped.budget(&args, limits), serial.budget(&args, original));
+        assert_eq!(grouped.mask_visits(), serial.mask_visits());
+        assert_eq!(grouped.planning(&args).max_context_tokens, args.context_tokens);
+        assert_eq!(limits.prefill.unwrap().max_batch_rows, 4);
+        assert_eq!(grouped.validate(&args).unwrap_err(), CandidateError::Arguments);
+        let root = matches(name, &["--prefill-rows", "4"]);
+        let task = root.subcommand_matches("source-int4").unwrap().subcommand_matches(name).unwrap();
+        assert!(SourceArgs::from_matches(task).is_err());
     }
 }
 

@@ -1,6 +1,13 @@
 //! Physical prompt scheduling for explicitly supported tasks. No semantic-policy change.
 use super::*;
 
+/// Reveal scheduling only at a root command wired to a hosted single task.
+/// Shared source/extraction definitions stay strict for their composed routes.
+pub(super) fn definition(command: clap::Command) -> clap::Command {
+    command.mut_arg("prefill_rows", |arg| arg.hide(false)
+        .help("Explicit INT4 layer-major prompt execution, 1..=64 rows; extra workspace is process-admitted"))
+}
+
 impl Int4Args {
     pub(super) fn prefill(&self) -> Result<Option<Int4PrefillLimits>, CandidateError> {
         // Reuse only the shared parser's row count, never its INT8 workspace

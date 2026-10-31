@@ -41,7 +41,7 @@ impl std::fmt::Debug for ExtractionArgs {
 pub(super) fn definition() -> clap::Command {
     let mut command = Int4Args::augment_args(clap::Command::new("extract")
         .about("Extract schema-valid JSON and optional exact source fields using grouped INT4")
-        .long_about("Compile a bounded local schema against the exact UTF-8 document before model access. Execute full-vocabulary greedy grammar decoding on the explicitly selected source-converted or snapshot-loaded INT4 model, then independently validate the complete result. --source-membership binds every annotated verbatim field to the original document and retains all matching offsets. JSON is returned as exact text inside the result envelope. Schema validity and source membership do not certify semantic accuracy. No sampling, repair retry, sparse projection or layer-major prefill is selected."))
+        .long_about("Compile a bounded local schema against the exact UTF-8 document before model access. Execute full-vocabulary greedy grammar decoding on the explicitly selected source-converted or snapshot-loaded INT4 model, then independently validate the complete result. --source-membership binds every annotated verbatim field to the original document and retains all matching offsets. JSON is returned as exact text inside the result envelope. Schema validity and source membership do not certify semantic accuracy. Greedy constrained decoding has no sampling, repair retry or sparse projection. Prompt execution is sequential by default; only the one-off extract command exposes --prefill-rows."))
         .mut_arg("input", |arg| arg.help("Exact UTF-8 source document; '-' reads stdin"))
         .mut_arg("max_new_tokens", |arg| arg.default_value("512").help("Constrained output tokens INCLUDING terminal EOS"))
         .mut_arg("preparation_mib", |arg| arg.default_value("512"));
@@ -50,13 +50,25 @@ pub(super) fn definition() -> clap::Command {
 }
 impl ExtractionArgs {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-        if TEXT_ONLY.iter().any(|id| matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine)) {
+        if matches.value_source("prefill_rows") == Some(clap::parser::ValueSource::CommandLine) {
             return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
-                "INT4 extraction accepts constrained tokens and result limits, not generation or prefill controls"));
+                "this INT4 extraction workflow requires sequential prompt execution"));
+        }
+        Self::from_matches_with_prefill(matches)
+    }
+    pub(super) fn from_matches_with_prefill(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        if TEXT_ONLY.iter().filter(|&&id| id != "prefill_rows")
+            .any(|id| matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine)) {
+            return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
+                "INT4 extraction accepts constrained tokens and result limits, not generation controls"));
         }
         Self::from_arg_matches(matches)
     }
     pub(super) fn validate(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
+        if args.prefill()?.is_some() { return Err(CandidateError::Arguments); }
+        self.validate_with_prefill(args)
+    }
+    pub(super) fn validate_with_prefill(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
         crate::candidate_cli::extract::check_schema_path(&self.schema)?;
         if !(1..=MAX_CONTENT_BYTES).contains(&self.max_result_bytes)
             || !(1..=65_536).contains(&self.max_grammar_states)
@@ -75,7 +87,7 @@ impl ExtractionArgs {
         // are declared reserves, not an operating-system RSS guarantee.
         let extra = sum(&[128 * MIB, crate::candidate_cli::extract::SCHEMA_BYTES as u64 * 16,
             self.max_result_bytes as u64 * 16, u64::from(self.max_grammar_states) * 32])?;
-        args.validate_storage(self.max_result_bytes, args.max_new_tokens,
+        args.validate_storage_with_prefill(self.max_result_bytes, args.max_new_tokens,
             args.context_tokens - args.max_new_tokens + 1, 0, extra)
     }
     pub(super) fn budget(&self, args: &Int4Args, limits: Int4Limits) -> TaskBudget {
@@ -172,10 +184,10 @@ mod tests {
         assert!(extract.validate(&command.args).unwrap().snapshot_pin.is_some());
     }
     #[test]
-    fn generation_and_schedule_controls_are_rejected_even_when_explicit_defaults() {
+    fn generation_controls_are_rejected_even_when_explicit_defaults() {
         let seed = "ab".repeat(32);
         for flags in [vec!["--seed", seed.as_str()], vec!["--max-output-bytes", "65536"],
-            vec!["--logprobs"], vec!["--prefill-rows", "1"], vec!["--min-new-tokens", "0"],
+            vec!["--logprobs"], vec!["--min-new-tokens", "0"],
             vec!["--stop", "END"], vec!["--ban-token", "7"], vec!["--repetition-penalty-milli", "1000"],
             vec!["--presence-penalty-milli", "0"], vec!["--frequency-penalty-milli", "0"],
             vec!["--logit-bias", "42=0"]] {
@@ -185,6 +197,24 @@ mod tests {
             let matches = crate::candidate_cli::definition().try_get_matches_from(argv).unwrap();
             assert!(CandidateCommand::from_matches(&matches).is_err());
         }
+    }
+    #[test]
+    fn one_off_prefill_preserves_schema_grounding_and_task_budget_but_shared_validation_stays_strict() {
+        let (serial, args) = arguments(&["--source-membership"]);
+        let original = serial.validate(&args).unwrap();
+        let (grouped, args) = arguments(&["--source-membership", "--prefill-rows", "4"]);
+        let limits = grouped.validate_with_prefill(&args).unwrap();
+        assert_eq!(serial, grouped);
+        let budget = grouped.budget(&args, limits);
+        assert_eq!(budget, serial.budget(&args, original));
+        assert_eq!(grouped.mask_visits(), serial.mask_visits());
+        assert_eq!(limits.prefill.unwrap().max_batch_rows, 4);
+        assert_eq!(grouped.validate(&args).unwrap_err(), CandidateError::Arguments);
+        let schema = " {\"type\":\"string\",\"const\":\"上海\",\"x-fnlp-source\":\"verbatim\"}\n";
+        let request = grouped.check_schema(schema.to_owned(), "上海 上海", budget).unwrap();
+        assert_eq!(request.schema, schema);
+        assert_eq!(request.grounding, ExtractionBatchGrounding::SourceMembership);
+        assert!(grouped.check_schema(schema.to_owned(), "Beijing", budget).is_err());
     }
     #[test]
     fn bad_budgets_or_programmatic_sampler_policy_refuse_before_io() {

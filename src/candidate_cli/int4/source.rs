@@ -56,13 +56,25 @@ pub(super) fn task(kind: Kind) -> BuiltInTask {
 }
 impl SourceArgs {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-        if TEXT_ONLY.iter().any(|id| matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine)) {
+        if matches.value_source("prefill_rows") == Some(clap::parser::ValueSource::CommandLine) {
             return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
-                "INT4 source tasks accept constrained tokens and result limits, not generation or prefill controls"));
+                "this INT4 source workflow requires sequential prompt execution"));
+        }
+        Self::from_matches_with_prefill(matches)
+    }
+    pub(super) fn from_matches_with_prefill(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        if TEXT_ONLY.iter().filter(|&&id| id != "prefill_rows")
+            .any(|id| matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine)) {
+            return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
+                "INT4 source tasks accept constrained tokens and result limits, not generation controls"));
         }
         Self::from_arg_matches(matches)
     }
     pub(super) fn validate(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
+        if args.prefill()?.is_some() { return Err(CandidateError::Arguments); }
+        self.validate_with_prefill(args)
+    }
+    pub(super) fn validate_with_prefill(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
         if self.options.as_ref().is_some_and(|path| path.as_os_str().is_empty() || path.as_os_str() == "-")
             || !(1..=MAX_CONTENT_BYTES).contains(&self.max_result_bytes)
             || !(1..=65_536).contains(&self.max_grammar_states)
@@ -82,7 +94,7 @@ impl SourceArgs {
             self.max_result_bytes as u64 * 16, u64::from(self.max_grammar_states) * 32])?;
         // The source prompt compiler reserves prompt + full output, including
         // EOS, against context. Keep its stricter bound in admission as well.
-        args.validate_storage(self.max_result_bytes, args.max_new_tokens,
+        args.validate_storage_with_prefill(self.max_result_bytes, args.max_new_tokens,
             args.context_tokens - args.max_new_tokens, 0, extra)
     }
     pub(super) fn budget(&self, args: &Int4Args, limits: Int4Limits) -> TaskBudget {

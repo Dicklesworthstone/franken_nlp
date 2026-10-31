@@ -1,8 +1,10 @@
 # Explicit grouped-INT4 prompt prefill
 
-`fnlp candidate source-int4 generate`, `chat`, `classify`, `sentiment` and
-`judge` accept `--prefill-rows N` for bounded layer-major prompt execution.
-Scored tasks group each independent head's prompt. The value is 1 through
+`fnlp candidate source-int4 generate`, `chat`, `classify`, `sentiment`,
+`judge`, `extract`, `ner`, `keyphrases`, `summarize` and `answer` accept
+`--prefill-rows N` for bounded layer-major prompt execution. Each row is one
+prompt position within a single task; scored tasks group each independent
+head's prompt. The value is 1 through
 64. Without this flag the existing sequential path is unchanged. This is an
 explicit non-certified candidate, not automatic dispatch, a benchmark result,
 a numerical qualification, or an INT8 fallback.
@@ -32,10 +34,11 @@ Source verification, independent snapshot pins, optional create-new snapshot
 saving, tokenizer/template binding, input validation and the completed JSON
 envelope remain unchanged. A snapshot failure never starts source conversion.
 Prefill does not add a stream, a multi-request batch command or a new runtime.
-One-off classification, sentiment and judgment use the same explicit scheduling
-option with complete task and native work admission. Scored corpus/job commands,
-resolution, extraction and source tasks still reject it, including
-programmatically constructed requests. There is no silently ignored option.
+One-off scored and structured tasks use the same explicit scheduling option
+with complete task and native work admission. Batch, map and retained-job
+commands, resolution, redaction and semantic extraction keep their existing
+prompt schedules and reject this option, including programmatically constructed
+requests. Their independent document/head/chunk cohort options remain separate.
 
 The separate [scoring-cohort mode](int4-scoring-cohorts.md) groups independent
 heads with `--cohort-heads N`. It cannot be combined with `--prefill-rows` and
@@ -92,6 +95,36 @@ axes, both pairwise judgment orders, rubric criteria and faithfulness evidence
 retain their original finalizers and exact whole-bundle work allowances. The
 same completed result contract applies to serial and grouped execution.
 
+Structured tasks replace only prompt appending. The shared constrained decoder
+continues to own full-vocabulary greedy selection, source-language and grammar
+masks, scored terminal EOS and exact native/mask work. Extraction independently
+validates the same raw schema and source fields. NER, keyphrases, summary and QA
+run their original semantic/source finalizers while the exclusive session still
+owns KV; a failed finalizer or late cancellation aborts that same session.
+Prompt grouping grants no additional output, verification or model-work budget.
+
+For example, opt into the same schedule for a single extraction or source task:
+
+```sh
+fnlp candidate source-int4 extract document.txt \
+  --schema extraction.schema.json --source-membership \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256_FROM_TRUSTED_CONVERSION" \
+  --memory-mib 8192 --group-width 128 --prefill-rows 4
+
+fnlp candidate source-int4 ner document.txt \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256_FROM_TRUSTED_CONVERSION" \
+  --memory-mib 8192 --group-width 128 --prefill-rows 4
+```
+
+`keyphrases` and `summarize` accept the same document input and schedule.
+`answer` retains its existing JSON request containing the exact question and
+passages. Typed options, original schema bytes, source evidence, complete result
+envelopes and private-input handling retain their existing contracts. One-off
+structured commands remain greedy; prompt grouping does not enable text
+sampling or repair controls.
+
 ## Memory and cancellation
 
 `Int4PrefillLimits::required_extra_scratch_bytes(rows)` is the authoritative
@@ -132,6 +165,14 @@ The explicit alternatives are:
 - `NlpEngine::execute_int4_classify_layer_major`,
   `execute_int4_sentiment_layer_major` and `execute_int4_judge_layer_major`
   reserve the extra scratch before entering the existing blocking invocation.
+- `constrained_int4::decode_json_int4_layer_major` and
+  `Int4ExtractPlan::execute_layer_major` share the constrained decoder and
+  independent extraction finalizer.
+- `PreparedInt4SourceTask::execute_layer_major_with_control` retains the sealed
+  NER, keyphrase, summary or answer finalizer inside the native session.
+- `NlpEngine::execute_int4_extract_layer_major` and
+  `execute_int4_source_task_layer_major` admit the full declared extra prompt
+  scratch with the original native allocation and guarded semantic output.
 
 Lower-level limits describe payload ceilings; they are not a substitute for a
 resource-domain reservation. The hosted method shares one implementation with
@@ -158,8 +199,19 @@ log-probabilities. It requires controller admission and these explicit inputs:
 `FNLP_INT4_TEST_MEMORY_MIB`, and `FNLP_INT4_TEST_KERNEL`. It only reads that
 snapshot; it never saves, replaces, deletes or downloads model files.
 
-Rust compilation/tests and this full-model test have not been run during this
-implementation: the repository-required RCH runner is unavailable in the working
-environment. Independent Python packed-group and memory/work arithmetic checks
-and exact source-blob verification do not establish Rust correctness, numerical
-qualification or measured performance. Keep the path opt-in pending those gates.
+The ignored
+`model_present_structured_prefill_matches_every_complete_serial_cli_result`
+uses those same explicit model, kernel and memory inputs and additionally
+requires `FNLP_INT4_PREFILL_SCHEMA`, an existing local file containing
+`{"type":"boolean"}`. It compares the complete canonical CLI response for
+extraction and all four source tasks at serial execution and rows 1, 4 and 64,
+including exact JSON/token transcripts, original-source evidence and work.
+Model-free regression source additionally covers ragged prompts, numeric
+continuation, UTF-8 fragments, source masks, semantic refusal and cancellation,
+static scratch admission, all model-loading routes and unsupported workflow
+boundaries. These are source fixtures, not executed proof.
+
+Compilation, Rust tests, full-model parity and performance remain unrun pending
+the repository's controller-selected immutable-SHA DSR checkpoint. Source review,
+whitespace checks and exact Git tree verification do not establish numerical
+qualification or measured performance. The path remains explicit and opt-in.

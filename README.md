@@ -1613,6 +1613,16 @@ model route is `--source-dir DIR --source-manifest FILE`; it also accepts
 conversion. The expected snapshot digest comes from an independently trusted
 conversion record.
 
+Single-request `ner`, `keyphrases`, `summarize` and `answer` also accept
+`--prefill-rows N` (1 through 64) for bounded layer-major prompt processing.
+The single-request `extract` command accepts the same option. The full declared
+additional scratch is admitted before native allocation, while task budgets,
+grammar/source masks, greedy decoding, scored EOS, evidence finalization and
+result envelopes retain their original contracts. Omitting the flag keeps
+sequential prompts. This option applies to these one-off commands; document
+cohorts keep their separate `--cohort-chunks` schedule. See
+[INT4 prefill](docs/int4-prefill.md) for examples, APIs and pending parity gates.
+
 NER returns typed mentions with all exact matching byte and Unicode-scalar
 intervals; repeated mentions remain explicitly ambiguous. Keyphrases retain
 exact source text and occurrence evidence. Summary bullets carry byte-verified
