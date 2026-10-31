@@ -16,6 +16,8 @@ use crate::{
 mod dataset;
 pub(crate) mod label_metrics;
 pub(crate) mod span_metrics;
+pub(crate) mod document_bootstrap;
+pub(crate) mod field_metrics;
 pub mod calibrate;
 pub mod qualify;
 pub mod native_classify;

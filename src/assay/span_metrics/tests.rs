@@ -1,4 +1,5 @@
 use super::*;
+use crate::assay::BootstrapOptions;
 
 fn span(kind: usize, start: usize, end: usize) -> Span { Span { kind, byte_start: start, byte_end: end } }
 fn anchored(kind: usize, start: usize, end: usize) -> Prediction {
@@ -118,9 +119,6 @@ fn empty_span_corpus_has_perfect_document_accuracy_but_undefined_span_scores() {
 
 #[test]
 fn undefined_bootstrap_replicates_are_not_silently_discarded() {
-    let mut series = Series::new(3).unwrap();
-    series.push(Some(0.2)); series.push(None); series.push(Some(0.8));
-    assert_eq!(series.finish::<AssayError>(options(), &mut || Ok(())).unwrap(), None);
     let rows = [counts(&[span(0, 0, 1)], &[]); 5];
     let metrics = measure(&rows);
     assert_eq!(metrics.exact.precision, None); assert_eq!(metrics.exact_interval.precision, None);

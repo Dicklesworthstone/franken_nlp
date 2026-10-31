@@ -6,54 +6,13 @@
 
 use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
-use super::{AssayError, BootstrapOptions, ConfidenceInterval, Limits, Split};
+use super::{AssayError, ConfidenceInterval, Limits, Split};
+pub use super::document_bootstrap::EvalOptions;
 
 const MAX_TYPES: usize = 8;
 const MAX_SPANS: usize = 4096;
 const MAX_OCCURRENCES: usize = 65_536;
 const MAX_LANGUAGES: usize = 128;
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct EvalOptions {
-    pub minimum_samples: usize,
-    pub bootstrap: BootstrapOptions,
-}
-impl Default for EvalOptions {
-    fn default() -> Self {
-        Self { minimum_samples: 20,
-            bootstrap: BootstrapOptions { resamples: 200, confidence_level: 0.95, seed: 0 } }
-    }
-}
-impl EvalOptions {
-    pub fn validate(self, limits: Limits) -> Result<(), AssayError> {
-        limits.validate()?;
-        if !(5..=100_000).contains(&self.minimum_samples)
-            || !(2..=limits.max_bootstrap_resamples).contains(&self.bootstrap.resamples)
-            || !self.bootstrap.confidence_level.is_finite()
-            || !(0.0..1.0).contains(&self.bootstrap.confidence_level)
-            || self.bootstrap.confidence_level == 0.0 {
-            return Err(AssayError::Options);
-        }
-        Ok(())
-    }
-    pub fn validate_rows(self, rows: usize, limits: Limits) -> Result<(), AssayError> {
-        self.validate_arms(rows, 1, limits)
-    }
-    pub fn validate_paired_rows(self, rows: usize, limits: Limits) -> Result<(), AssayError> {
-        self.validate_arms(rows, 2, limits)
-    }
-    fn validate_arms(self, rows: usize, arms: u64, limits: Limits) -> Result<(), AssayError> {
-        self.validate(limits)?;
-        if rows == 0 || rows > limits.max_rows
-            || (rows as u64).checked_mul(self.bootstrap.resamples as u64)
-                .and_then(|draws| draws.checked_mul(arms))
-                .is_none_or(|draws| draws > limits.max_bootstrap_draws) {
-            return Err(AssayError::InputLimit);
-        }
-        Ok(())
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct Span {
@@ -293,7 +252,7 @@ pub(crate) fn measure_with_checkpoint<E: From<AssayError>>(types: &[&str], rows:
     options.validate_rows(rows.len(), limits)?;
     validate_rows(types, rows, checkpoint)?;
     if rows.len() < options.minimum_samples { return Ok(insufficient(rows.len(), options)); }
-    let (current, _, _) = bootstrap(rows, None, options, checkpoint)?;
+    let (current, _, _) = bootstrap(rows, None, options, limits, checkpoint)?;
     Ok(Measurement::Measured { metrics: aggregate(types, rows, current, checkpoint)? })
 }
 
@@ -315,7 +274,7 @@ pub(crate) fn paired_with_checkpoint<E: From<AssayError>>(types: &[&str], candid
     if candidate.len() < options.minimum_samples {
         return Ok((insufficient(candidate.len(), options), insufficient(candidate.len(), options), None));
     }
-    let (current, prior, changes) = bootstrap(candidate, Some(baseline), options, checkpoint)?;
+    let (current, prior, changes) = bootstrap(candidate, Some(baseline), options, limits, checkpoint)?;
     let current = aggregate(types, candidate, current, checkpoint)?;
     let prior = aggregate(types, baseline, prior.ok_or(AssayError::Scope)?, checkpoint)?;
     let changes = changes.ok_or(AssayError::Scope)?;
@@ -391,112 +350,35 @@ fn aggregate<E: From<AssayError>>(types: &[&str], rows: &[Observation<'_>], inte
         document_accuracy_interval: intervals.accuracy.ok_or(AssayError::Observation)?, by_type, by_language })
 }
 
-struct Series { values: Vec<f64>, defined: bool }
-impl Series {
-    fn new(count: usize) -> Result<Self, AssayError> { Ok(Self { values: reserved(count)?, defined: true }) }
-    fn push(&mut self, value: Option<f64>) {
-        if let Some(value) = value { self.values.push(value); } else { self.defined = false; }
-    }
-    fn finish<E>(&mut self, options: EvalOptions, checkpoint: &mut impl FnMut() -> Result<(), E>)
-        -> Result<Option<ConfidenceInterval>, E> {
-        checkpoint()?;
-        if !self.defined || self.values.is_empty() { return Ok(None); }
-        self.values.sort_unstable_by(f64::total_cmp);
-        let tail = (1.0 - options.bootstrap.confidence_level) / 2.0;
-        let last = self.values.len() - 1;
-        let result = ConfidenceInterval { lower: self.values[(tail * last as f64).floor() as usize],
-            upper: self.values[((1.0 - tail) * last as f64).ceil() as usize],
-            confidence_level: options.bootstrap.confidence_level, resamples: options.bootstrap.resamples };
-        checkpoint()?; Ok(Some(result))
-    }
-}
-struct ScoreSamples { precision: Series, recall: Series, f1: Series }
-impl ScoreSamples {
-    fn new(count: usize) -> Result<Self, AssayError> {
-        Ok(Self { precision: Series::new(count)?, recall: Series::new(count)?, f1: Series::new(count)? })
-    }
-    fn push(&mut self, counts: Counts) {
-        let scores = counts.scores();
-        self.precision.push(scores.precision); self.recall.push(scores.recall); self.f1.push(scores.f1);
-    }
-    fn finish<E>(&mut self, options: EvalOptions, checkpoint: &mut impl FnMut() -> Result<(), E>) -> Result<SpanIntervals, E> {
-        Ok(SpanIntervals { precision: self.precision.finish(options, checkpoint)?,
-            recall: self.recall.finish(options, checkpoint)?, f1: self.f1.finish(options, checkpoint)? })
-    }
-}
-struct Samples { exact: ScoreSamples, relaxed: ScoreSamples, accuracy: Series }
 struct Intervals { exact: SpanIntervals, relaxed: SpanIntervals, accuracy: Option<ConfidenceInterval> }
-impl Samples {
-    fn new(count: usize) -> Result<Self, AssayError> {
-        Ok(Self { exact: ScoreSamples::new(count)?, relaxed: ScoreSamples::new(count)?, accuracy: Series::new(count)? })
-    }
-    fn push(&mut self, totals: Totals) {
-        self.exact.push(totals.exact); self.relaxed.push(totals.relaxed); self.accuracy.push(Some(totals.accuracy()));
-    }
-    fn finish<E>(&mut self, options: EvalOptions, checkpoint: &mut impl FnMut() -> Result<(), E>) -> Result<Intervals, E> {
-        Ok(Intervals { exact: self.exact.finish(options, checkpoint)?, relaxed: self.relaxed.finish(options, checkpoint)?,
-            accuracy: self.accuracy.finish(options, checkpoint)? })
-    }
-}
-struct ChangeSamples { exact_f1: Series, relaxed_f1: Series, exact_recall: Series, accuracy: Series }
 struct ChangeIntervals { exact_f1: Option<ConfidenceInterval>, relaxed_f1: Option<ConfidenceInterval>,
     exact_recall: Option<ConfidenceInterval>, accuracy: Option<ConfidenceInterval> }
-impl ChangeSamples {
-    fn new(count: usize) -> Result<Self, AssayError> {
-        Ok(Self { exact_f1: Series::new(count)?, relaxed_f1: Series::new(count)?,
-            exact_recall: Series::new(count)?, accuracy: Series::new(count)? })
-    }
-    fn push(&mut self, a: Totals, b: Totals) {
-        let current = a.exact.scores(); let prior = b.exact.scores();
-        self.exact_f1.push(difference(current.f1, prior.f1));
-        self.relaxed_f1.push(difference(a.relaxed.scores().f1, b.relaxed.scores().f1));
-        self.exact_recall.push(difference(current.recall, prior.recall));
-        self.accuracy.push(Some(a.accuracy() - b.accuracy()));
-    }
-    fn finish<E>(&mut self, options: EvalOptions, checkpoint: &mut impl FnMut() -> Result<(), E>) -> Result<ChangeIntervals, E> {
-        Ok(ChangeIntervals { exact_f1: self.exact_f1.finish(options, checkpoint)?,
-            relaxed_f1: self.relaxed_f1.finish(options, checkpoint)?, exact_recall: self.exact_recall.finish(options, checkpoint)?,
-            accuracy: self.accuracy.finish(options, checkpoint)? })
-    }
-}
 fn bootstrap<E: From<AssayError>>(candidate: &[Observation<'_>], baseline: Option<&[Observation<'_>]>,
-    options: EvalOptions, checkpoint: &mut impl FnMut() -> Result<(), E>)
+    options: EvalOptions, limits: Limits, checkpoint: &mut impl FnMut() -> Result<(), E>)
     -> Result<(Intervals, Option<Intervals>, Option<ChangeIntervals>), E> {
-    let mut current = Samples::new(options.bootstrap.resamples)?;
-    let mut prior = baseline.map(|_| Samples::new(options.bootstrap.resamples)).transpose()?;
-    let mut changes = baseline.map(|_| ChangeSamples::new(options.bootstrap.resamples)).transpose()?;
-    let mut state = options.bootstrap.seed;
-    for _ in 0..options.bootstrap.resamples {
-        checkpoint()?;
-        let (mut a, mut b) = (Totals::default(), Totals::default());
-        for draw in 0..candidate.len() {
-            if draw % 64 == 0 { checkpoint()?; }
-            let index = sampled_index(&mut state, candidate.len(), checkpoint)?;
-            a.add(candidate[index].counts.totals)?;
-            if let Some(rows) = baseline { b.add(rows[index].counts.totals)?; }
+    let mut summaries = |rows: &[Observation<'_>]| -> Result<Vec<Totals>, E> {
+        let mut totals = reserved(rows.len())?;
+        for (index, row) in rows.iter().enumerate() {
+            if index % 64 == 0 { checkpoint()?; }
+            totals.push(row.counts.totals);
         }
-        current.push(a);
-        if let Some(prior) = prior.as_mut() { prior.push(b); }
-        if let Some(changes) = changes.as_mut() { changes.push(a, b); }
-    }
-    let current = current.finish(options, checkpoint)?;
-    let prior = prior.as_mut().map(|values| values.finish(options, checkpoint)).transpose()?;
-    let changes = changes.as_mut().map(|values| values.finish(options, checkpoint)).transpose()?;
-    checkpoint()?; Ok((current, prior, changes))
-}
-
-fn sampled_index<E>(state: &mut u64, upper: usize, checkpoint: &mut impl FnMut() -> Result<(), E>) -> Result<usize, E> {
-    let upper = upper as u64;
-    let limit = (u64::MAX / upper) * upper;
-    loop {
-        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut value = *state;
-        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        value ^= value >> 31;
-        if value < limit { return Ok((value % upper) as usize); }
-        checkpoint()?;
-    }
+        Ok(totals)
+    };
+    let current = summaries(candidate)?;
+    let prior = baseline.map(&mut summaries).transpose()?;
+    let metrics = |value: Totals| {
+        let exact = value.exact.scores(); let relaxed = value.relaxed.scores();
+        [exact.precision, exact.recall, exact.f1, relaxed.precision, relaxed.recall, relaxed.f1, Some(value.accuracy())]
+    };
+    let result = super::document_bootstrap::measure_with_checkpoint::<7, Totals, E>(
+        &current, prior.as_deref(), options, limits, Totals::add, metrics, checkpoint)?;
+    let marginal = |value: [Option<ConfidenceInterval>; 7]| Intervals {
+        exact: SpanIntervals { precision: value[0], recall: value[1], f1: value[2] },
+        relaxed: SpanIntervals { precision: value[3], recall: value[4], f1: value[5] }, accuracy: value[6],
+    };
+    Ok((marginal(result.candidate), result.baseline.map(marginal), result.changes.map(|value| ChangeIntervals {
+        exact_f1: value[2], relaxed_f1: value[5], exact_recall: value[1], accuracy: value[6],
+    })))
 }
 fn sum(a: usize, b: usize) -> Result<usize, AssayError> { a.checked_add(b).ok_or(AssayError::InputLimit) }
 fn ratio(a: usize, b: usize) -> Option<f64> { (b != 0).then(|| a as f64 / b as f64) }
