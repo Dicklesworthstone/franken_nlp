@@ -49,7 +49,8 @@ pub(super) fn definition() -> clap::Command {
     ScoringArgs::augment_args(command)
 }
 /// Reveal scheduling only on tasks wired to grouped native scoring.
-/// Shared corpus/job/resolution definitions retain their serial policy.
+/// Ordered scored streams expose their own bounded cross-document policy;
+/// retained jobs and resolution keep serial execution.
 pub(super) fn prefill_definition(command: clap::Command) -> clap::Command {
     command.mut_arg("prefill_rows", |arg| arg.hide(false)
         .help("Explicit INT4 layer-major prompt execution, 1..=64 rows; extra workspace is admitted once and reused between scoring heads"))
@@ -73,8 +74,20 @@ impl ScoringArgs {
         }
         Self::from_arg_matches(matches)
     }
+    pub(super) fn from_batch_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        if matches.value_source("prefill_rows") == Some(clap::parser::ValueSource::CommandLine) {
+            return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
+                "INT4 scored streams do not accept prompt-prefill scheduling"));
+        }
+        Self::from_matches_with_prefill(matches)
+    }
+    pub(super) fn cohort_head_limit(self) -> Option<usize> { self.cohort_heads }
     pub(super) fn validate(self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
         if args.prefill()?.is_some() || self.cohort_heads.is_some() { return Err(CandidateError::Arguments); }
+        self.validate_with_prefill(args)
+    }
+    pub(super) fn validate_batch(self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
+        if args.prefill()?.is_some() { return Err(CandidateError::Arguments); }
         self.validate_with_prefill(args)
     }
     pub(super) fn validate_with_prefill(self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {

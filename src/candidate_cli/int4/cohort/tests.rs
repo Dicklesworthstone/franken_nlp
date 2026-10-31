@@ -100,10 +100,10 @@ fn parsed_job(operation: &str, task: &str, flags: &[&str]) -> Result<Int4Command
     Ok(command)
 }
 #[test]
-fn unsupported_streams_jobs_text_and_source_workflows_never_silently_ignore_the_option() {
+fn supported_scored_streams_and_serial_only_workflows_are_distinguished() {
     for task in ["classify", "sentiment", "judge"] {
         parsed("score-batch", &["--task", task]).unwrap();
-        assert!(parsed("score-batch", &["--task", task, "--cohort-heads", "4"]).is_err());
+        parsed("score-batch", &["--task", task, "--cohort-heads", "4"]).unwrap();
         for operation in ["start", "resume"] {
             parsed_job(operation, task, &[]).unwrap();
             assert!(parsed_job(operation, task, &["--cohort-heads", "4"]).is_err());
@@ -117,7 +117,7 @@ fn unsupported_streams_jobs_text_and_source_workflows_never_silently_ignore_the_
     assert!(parsed("extract", &["--schema", "schema.json", "--cohort-heads", "4"]).is_err());
     let command = parsed("classify", &["--cohort-heads", "4"]).unwrap();
     // This shared validator is the programmatic boundary used by serial-only
-    // scored stream, retained-job and resolution configurations.
+    // retained-job and resolution configurations.
     assert!(scoring(&command).validate(&command.args).is_err());
 }
 fn set_mode(args: &mut Int4Args, mode: usize) {

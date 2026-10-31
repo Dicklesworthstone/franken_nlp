@@ -5,7 +5,8 @@ use crate::{
     NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
     batch::scored_int4::{Int4ScoredBatchPlanner, Int4ScoredTask},
     candidate_cli::batch::{CandidateWriter, completed},
-    hosted::{CancellationToken, HostedError, NativeLimits, ResidentInt4, RunLimits, corpus::CorpusLimits},
+    hosted::{CancellationToken, HostedError, Int4ScoredCohortHostLimits,
+        NativeLimits, ResidentInt4, RunLimits, corpus::CorpusLimits},
     native_engine::{decode::DecodeCancellationKind, lmhead::scoring::ScoringMode,
         strict_int4::weights::snapshot::INT4_SNAPSHOT_VERSION},
     tasks::{classify::grouped_int4::Int4ClassificationPlanner,
@@ -127,6 +128,7 @@ fn stream<P: Int4ScoredTask + Send + 'static, W: Write + Send + 'static>(engine:
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(), snapshot,
+        cohort_schedule: limits.cohort.map(CohortSchedule::from),
     };
     let writer = CandidateWriter::new(output, &provenance, limits.transport.max_output_line_bytes, limits.output_bytes)?;
     let corpus = CorpusLimits {
@@ -136,8 +138,14 @@ fn stream<P: Int4ScoredTask + Send + 'static, W: Write + Send + 'static>(engine:
         transport: limits.transport, preparation_reserve_bytes: limits.preparation_reserve_bytes,
         io_reserve_bytes: limits.io_bytes,
     };
-    let summary = engine.batch_int4_scored(model, planner, corpus, common.kernel, reader, writer, cancellation)
-        .map_err(execution_error)?;
+    let summary = if let Some(cohort) = limits.cohort {
+        engine.batch_int4_scored_cohorts(model, planner, corpus,
+            Int4ScoredCohortHostLimits { max_documents: cohort.max_documents, max_heads: cohort.max_heads },
+            common.kernel, reader, writer, cancellation).map_err(execution_error)?.summary
+    } else {
+        engine.batch_int4_scored(model, planner, corpus, common.kernel, reader, writer, cancellation)
+            .map_err(execution_error)?
+    };
     // The host emitted the sole terminal record. A drained stream containing
     // rejected items still has nonzero process status, with no extra stdout.
     completed(summary)
@@ -157,6 +165,21 @@ struct Provenance<'a> {
     candidate_format: &'a str, quant_recipe: &'a str, group_width: usize, integer_kernel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<SnapshotRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cohort_schedule: Option<CohortSchedule>,
+}
+
+#[derive(Serialize)]
+struct CohortSchedule {
+    execution: &'static str,
+    declared_max_heads: usize,
+    declared_max_documents: usize,
+}
+impl From<CohortWindow> for CohortSchedule {
+    fn from(window: CohortWindow) -> Self {
+        Self { execution: "cross_document_scoring_cohorts",
+            declared_max_heads: window.max_heads, declared_max_documents: window.max_documents }
+    }
 }
 
 #[cfg(test)]
