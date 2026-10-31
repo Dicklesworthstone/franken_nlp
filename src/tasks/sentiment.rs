@@ -7,6 +7,11 @@
 mod distribution;
 mod native;
 mod planning;
+pub(crate) mod aggregation;
+pub use aggregation::{
+    SENTIMENT_AGGREGATION_PROFILE, SentimentAggregate, SentimentAggregateDimension,
+    SentimentAggregationError, SentimentAggregationPolicy, SentimentMixtureWeight,
+};
 pub use distribution::{
     SentimentAnchor, SentimentAxis, SentimentAxisInput, SentimentDecision,
     SentimentDimension, SentimentError, SentimentLimits, SentimentLogits,
