@@ -16,7 +16,7 @@ fn work(units: u64) -> Int4Work {
 fn limits(item: u64, total: u64) -> Int4ScoredBatchLimits {
     Int4ScoredBatchLimits { max_item_work: work(item), max_model_work: work(total) }
 }
-fn identity() -> ExecutionIdentity {
+pub(super) fn identity() -> ExecutionIdentity {
     let d = Sha256Digest::of_bytes(b"private-scored-stream-lifecycle-fixture");
     ExecutionIdentity { schema_version: 1, source_revision: PINNED_REVISION.to_owned(), logical_model_digest: d,
         artifact_format: INT4_SOURCE_FORMAT.to_owned(), quant_recipe: format!("{GROUPED_INT4_RECIPE}:group=32"),
@@ -54,7 +54,8 @@ impl Int4ScoredTask for Planner {
         let mut identity = self.identity.clone();
         identity.prompt_digest = Sha256Digest::of_bytes(text.as_bytes());
         identity.decision_policy_digest = Sha256Digest::of_bytes(&args.units.to_le_bytes());
-        Ok(Plan { identity, units: args.units, work: work(args.units), heads: 4,
+        let heads = match text.as_str() { "65-heads" => 65, "128-heads" => 128, _ => 4 };
+        Ok(Plan { identity, units: args.units, work: work(args.units), heads,
             context: 8, budget: task_budget(), result_bytes: 1024 })
     }
     fn facts(plan: &Plan) -> Int4ScoredPlanFacts<'_> {
@@ -69,6 +70,16 @@ impl Int4ScoredTask for Planner {
         _: Int4ScoringBudget, _: &mut C) -> Result<Output, BatchItemFailure> { unreachable!() }
     fn completed(plan: &Plan, output: &Output) -> bool {
         plan.units == output.units && plan.heads == output.heads && plan.work == output.work
+    }
+    fn cohort_contexts(plan: &Plan) -> Result<Vec<usize>, BatchItemFailure> {
+        assert!(plan.heads <= 64, "overwide documents must be rejected before native context extraction");
+        Ok(vec![plan.context; plan.heads])
+    }
+    fn execute_document_cohort<C: DecodeStepControl>(_: &[(&Plan, &ExecutionIdentity)],
+        _: &mut crate::native_engine::strict_int4::cohort::Int4CohortEngine<'_>,
+        _: crate::native_engine::strict_int4::scoring::cohort::Int4ScoringCohortBudget, _: &mut C)
+        -> Result<crate::native_engine::strict_int4::scoring::cohort::Int4ScoredCohort<Vec<Output>>, BatchItemFailure> {
+        unreachable!("serial lifecycle fixtures never replace native cohort execution")
     }
 }
 fn compiler(limits: Int4ScoredBatchLimits) -> Int4ScoredBatchPlanner<Planner> {
@@ -147,6 +158,47 @@ fn host(probe: &Rc<Probe>, mode: Mode, total: u64) -> (Engine, Admission, RunSta
 fn decrement(work: &mut Int4Work, axis: usize) {
     match axis { 0 => work.forward_positions -= 1, 1 => work.projected_logits -= 1, 2 => work.attention_pairs -= 1,
         3 => work.projections.dot_products -= 1, _ => work.projections.multiply_accumulates -= 1 }
+}
+
+fn cohort_limits() -> Int4ScoredCohortBatchLimits {
+    let memory = Int4MemoryRequirement::for_cohort(&[32; 64], 32).unwrap();
+    Int4ScoredCohortBatchLimits { max_documents: 4, max_heads: 64, context_limit: 32,
+        native_memory: crate::native_engine::strict_int4::Int4MemoryBudget {
+            max_kv_bytes: memory.kv_bytes, max_rope_bytes: memory.rope_bytes,
+            max_scratch_payload_bytes: memory.scratch_payload_bound },
+        max_workspace_bytes: 1 << 24, max_item_output_bytes: 1024, max_output_bytes: 4096 }
+}
+
+#[test]
+fn overwide_cohort_plans_never_reach_native_contexts_and_do_not_poison_following_plans() {
+    let compiler = compiler(limits(1, 2)); let mut remaining = work(2);
+    for text in ["65-heads", "128-heads"] {
+        let mut oversized = document(); oversized.text = text.to_owned();
+        let error = cohort::prepare_document(&compiler, oversized, cohort_limits(), &mut remaining, &mut Continue)
+            .err().expect("overwide document rejected before context extraction");
+        assert_eq!(error.fault.code, BatchCode::Admission); assert!(!error.stop);
+        assert_eq!(remaining, work(2));
+    }
+    for after in [work(1), work(0)] {
+        let plan = cohort::prepare_document(&compiler, document(), cohort_limits(), &mut remaining, &mut Continue).unwrap();
+        assert_eq!(plan.head_count(), 4); assert_eq!(remaining, after);
+    }
+    let exhausted = cohort::prepare_document(&compiler, document(), cohort_limits(), &mut remaining, &mut Continue)
+        .err().expect("queued documents already spent the invocation allowance");
+    assert_eq!(exhausted.fault.code, BatchCode::WorkLimit); assert!(!exhausted.stop);
+    assert_eq!(remaining, work(0));
+}
+
+#[test]
+fn cohort_preparation_checks_all_five_work_axes_before_queueing_without_partial_debits() {
+    let compiler = compiler(limits(1, 1));
+    for axis in 0..5 {
+        let mut remaining = work(1); decrement(&mut remaining, axis); let before = remaining;
+        let error = cohort::prepare_document(&compiler, document(), cohort_limits(), &mut remaining, &mut Continue)
+            .err().expect("whole document cannot fit the remaining work");
+        assert_eq!(error.fault.code, BatchCode::WorkLimit); assert!(!error.stop);
+        assert_eq!(remaining, before, "axis {axis} must not partially debit other axes");
+    }
 }
 
 #[test]

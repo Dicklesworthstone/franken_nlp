@@ -222,7 +222,8 @@ fn prehead_and_finalization_cancellation_preserve_original_cause() {
 fn source_model_factory_classifies_both_modes_reuses_kv_and_rejects_foreign_identity() {
     use crate::{artifact::converter::{ConversionSourceManifest, prepare_nanbeige42_input},
         native_engine::strict_int4::{Int4ModelWeights, Int4ModelLoadBudget, Int4ModelLoadRequirement,
-            Int4MemoryRequirement, Int4MemoryBudget}};
+            Int4MemoryRequirement, Int4MemoryBudget, cohort::Int4CohortEngine,
+            scoring::cohort::Int4ScoringCohortBudget}};
     let directory = std::env::var("FNLP_INT4_TEST_SOURCE_DIR").expect("explicit source directory required");
     let manifest = std::env::var("FNLP_INT4_TEST_SOURCE_MANIFEST").expect("explicit pinned manifest required");
     let source = prepare_nanbeige42_input(directory, ConversionSourceManifest::load_pinned(manifest).unwrap(), false, 65536).unwrap();
@@ -234,8 +235,12 @@ fn source_model_factory_classifies_both_modes_reuses_kv_and_rejects_foreign_iden
     let memory = Int4MemoryRequirement::for_context(4096, 32).unwrap();
     let mut engine = StrictInt4Engine::new(&weights, 4096, Int4MemoryBudget { max_kv_bytes: memory.kv_bytes,
         max_rope_bytes: memory.rope_bytes, max_scratch_payload_bytes: memory.scratch_payload_bound }).unwrap();
+    let mut plans = Vec::new(); let mut serial = Vec::new();
     for mode in [ClassificationMode::Exclusive, ClassificationMode::MultiLabel] {
         let mut request = request(mode); request.budget.max_kv_bytes = memory.kv_bytes;
+        if mode == ClassificationMode::MultiLabel {
+            request.document.push_str(" A separate longer document asks for a refund after a duplicate billing charge.");
+        }
         let planner = Int4ClassificationPlanner::for_model(weights.identity(), request.budget, ClassificationLimits::default()).unwrap();
         let prepared = planner.plan(&request).unwrap();
         check_model(prepared.execution_identity(), weights.identity()).unwrap();
@@ -247,5 +252,33 @@ fn source_model_factory_classifies_both_modes_reuses_kv_and_rejects_foreign_iden
         let second = prepared.execute_with_control(prepared.execution_identity(), &mut engine, budget, &mut Continue).unwrap();
         assert_eq!(first, second); assert_eq!(first.model_work, prepared.planned_work());
         assert!(engine.kv_cache().all_slots_have_len(0));
+        serial.push(first); plans.push(prepared);
     }
+    drop(engine);
+    let contexts: Vec<_> = plans.iter().flat_map(|plan| plan.cohort_contexts().unwrap()).collect();
+    assert_eq!(contexts.len(), 4);
+    let memory = Int4MemoryRequirement::for_cohort(&contexts, 32).unwrap();
+    let mut engine = Int4CohortEngine::new(&weights, &contexts, Int4MemoryBudget {
+        max_kv_bytes: memory.kv_bytes, max_rope_bytes: memory.rope_bytes,
+        max_scratch_payload_bytes: memory.scratch_payload_bound }).unwrap();
+    let work = plans.iter().fold(Int4Work::default(), |sum, plan| sum.checked_add(plan.planned_work()).unwrap());
+    let budget = Int4ScoringCohortBudget { native: Int4RunBudget::exact(work),
+        max_kv_bytes: memory.kv_bytes, max_output_bytes: 4_000_000 };
+    let documents: Vec<_> = plans.iter().map(|plan| (plan, plan.execution_identity())).collect();
+    let grouped = PreparedInt4Classification::execute_document_cohort_with_control(
+        &documents, &mut engine, budget, &mut Continue).unwrap();
+    assert_eq!(grouped.output, serial);
+    assert!(grouped.group_steps < work.forward_positions);
+    engine.check_idle().unwrap();
+    let replay = PreparedInt4Classification::execute_document_cohort_with_control(
+        &documents, &mut engine, budget, &mut Continue).unwrap();
+    assert_eq!(grouped, replay);
+    engine.check_idle().unwrap();
+    let mut foreign = plans[1].execution_identity().clone();
+    foreign.prompt_digest = Sha256Digest::of_bytes(b"other document");
+    let mismatched = [(documents[0].0, documents[0].1), (&plans[1], &foreign)];
+    assert!(matches!(PreparedInt4Classification::execute_document_cohort_with_control(
+        &mismatched, &mut engine, budget, &mut Continue), Err(Int4ClassificationError::Identity)
+            | Err(Int4ClassificationError::Planning(ClassificationPlanningError::Identity))));
+    engine.check_idle().unwrap();
 }

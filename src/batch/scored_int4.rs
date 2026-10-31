@@ -1,6 +1,7 @@
-//! Fixed-task, ordered scoring streams on one admitted native INT4 engine.
+//! Fixed-task, ordered scoring streams on an admitted native INT4 model.
 //! Every document is one complete classification, sentiment or judgment bundle.
-//! Heads and documents execute serially; no shared-layer batching is claimed.
+//! The baseline reuses one serial context. The explicit cohort adapter groups
+//! independent documents' heads through actual shared-layer native execution.
 use std::sync::Arc;
 use crate::{
     execution_identity::ExecutionIdentity,
@@ -14,6 +15,9 @@ use super::{BatchCode, BatchDocument, BatchFault, BatchItemFailure, BatchProcess
     BatchRequestContext, BatchWork, output::GuardedOutput};
 mod tasks;
 pub use tasks::Int4ScoredTask;
+mod cohort;
+pub mod memory;
+pub use cohort::{Int4ScoredCohortBatchLimits, Int4ScoredCohortBatchStats, NativeInt4ScoredCohortBatch};
 
 /// All five counters are finite, invocation-wide and nonrenewable at flush.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

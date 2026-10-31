@@ -8,6 +8,8 @@ use crate::{
     hosted::corpus::CorpusLimits,
     native_engine::{constrained_int4, strict_int4::Int4Work},
 };
+mod cohort;
+pub use cohort::{Int4ScoredCohortHostLimits, Int4ScoredCohortBatchResult};
 
 struct StreamInput<P: Int4ScoredTask, R, W> {
     planner: Option<Int4ScoredBatchPlanner<P>>, reader: R, writer: W,

@@ -3,7 +3,9 @@ use super::*;
 use serde::{Serialize, de::DeserializeOwned};
 use crate::{
     batch::{classify::ClassificationBatchArgs, judge::JudgeBatchArgs},
-    native_engine::strict_int4::{StrictInt4Error, STRICT_INT4_PROFILE, scoring::Int4ScoringError},
+    native_engine::strict_int4::{StrictInt4Error, STRICT_INT4_PROFILE,
+        cohort::Int4CohortEngine, scoring::{Int4ScoringError,
+            cohort::{Int4ScoredCohort, Int4ScoringCohortBudget}}},
     tasks::{
         classify::{ClassificationRequest, ClassificationPlanningError,
             grouped_int4::{Int4ClassificationPlanner, PreparedInt4Classification,
@@ -38,13 +40,17 @@ pub trait Int4ScoredTask: sealed::Sealed + Send + 'static {
         engine: &mut StrictInt4Engine<'_>, budget: Int4ScoringBudget, control: &mut C)
         -> Result<Self::Output, BatchItemFailure>;
     fn completed(plan: &Self::Plan, output: &Self::Output) -> bool;
+    fn cohort_contexts(plan: &Self::Plan) -> Result<Vec<usize>, BatchItemFailure>;
+    fn execute_document_cohort<C: DecodeStepControl>(documents: &[(&Self::Plan, &ExecutionIdentity)],
+        engine: &mut Int4CohortEngine<'_>, budget: Int4ScoringCohortBudget, control: &mut C)
+        -> Result<Int4ScoredCohort<Vec<Self::Output>>, BatchItemFailure>;
 }
 
 // The three sealed native plan APIs have the same ownership/accounting shape.
 // Only request construction, task-specific result cap and typed error mapping
 // differ; semantic finalization stays in the existing task implementation.
 macro_rules! native_plan_methods {
-    ($cap:expr, $error:ident, $execution:ident) => {
+    ($cap:expr, $error:ident, $execution:ident, $plan:ty) => {
         fn base_identity(&self) -> &ExecutionIdentity { self.execution_identity() }
         fn group_width(&self) -> usize { self.group_width() }
         fn facts(plan: &Self::Plan) -> Int4ScoredPlanFacts<'_> {
@@ -70,6 +76,15 @@ macro_rules! native_plan_methods {
                 && output.numerics_profile == STRICT_INT4_PROFILE && output.group_width == plan.group_width()
                 && output.head_count == plan.head_count() && output.model_work == plan.planned_work()
         }
+        fn cohort_contexts(plan: &Self::Plan) -> Result<Vec<usize>, BatchItemFailure> {
+            plan.cohort_contexts().map_err(|error| $error(error.into(), false))
+        }
+        fn execute_document_cohort<C: DecodeStepControl>(documents: &[(&Self::Plan, &ExecutionIdentity)],
+            engine: &mut Int4CohortEngine<'_>, budget: Int4ScoringCohortBudget, control: &mut C)
+            -> Result<Int4ScoredCohort<Vec<Self::Output>>, BatchItemFailure> {
+            <$plan>::execute_document_cohort_with_control(documents, engine, budget, control)
+                .map_err(|error| $error(error, true))
+        }
     };
 }
 impl sealed::Sealed for Int4ClassificationPlanner {}
@@ -85,7 +100,7 @@ impl Int4ScoredTask for Int4ClassificationPlanner {
         self.plan_with_control(&request, control).map_err(|e| classification_error(e, false))
     }
     native_plan_methods!(|p: &PreparedInt4Classification| p.task_budget().max_output_bytes,
-        classification_error, INT4_CLASSIFICATION_EXECUTION);
+        classification_error, INT4_CLASSIFICATION_EXECUTION, PreparedInt4Classification);
 }
 impl sealed::Sealed for Int4SentimentPlanner {}
 impl Int4ScoredTask for Int4SentimentPlanner {
@@ -98,7 +113,8 @@ impl Int4ScoredTask for Int4SentimentPlanner {
         let request = SentimentRequest { document: text, axes: args.axes, budget: args.budget };
         self.plan_with_control(&request, control).map_err(|e| sentiment_error(e, false))
     }
-    native_plan_methods!(|p: &PreparedInt4Sentiment| p.max_result_bytes(), sentiment_error, INT4_SENTIMENT_EXECUTION);
+    native_plan_methods!(|p: &PreparedInt4Sentiment| p.max_result_bytes(), sentiment_error,
+        INT4_SENTIMENT_EXECUTION, PreparedInt4Sentiment);
 }
 impl sealed::Sealed for Int4JudgePlanner {}
 impl Int4ScoredTask for Int4JudgePlanner {
@@ -110,7 +126,7 @@ impl Int4ScoredTask for Int4JudgePlanner {
         -> Result<Self::Plan, BatchItemFailure> {
         self.plan_with_control(&args.into_request(text), control).map_err(|e| judge_error(e, false))
     }
-    native_plan_methods!(|p: &PreparedInt4Judge| p.max_result_bytes(), judge_error, INT4_JUDGE_EXECUTION);
+    native_plan_methods!(|p: &PreparedInt4Judge| p.max_result_bytes(), judge_error, INT4_JUDGE_EXECUTION, PreparedInt4Judge);
 }
 
 fn phase(mut failure: BatchItemFailure, executing: bool) -> BatchItemFailure {

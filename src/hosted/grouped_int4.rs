@@ -24,6 +24,7 @@ pub use source_map::Int4SourceMapConfig;
 mod corpus;
 pub use corpus::Int4SourceCorpusConfig;
 mod scored_batch;
+pub use scored_batch::{Int4ScoredCohortHostLimits, Int4ScoredCohortBatchResult};
 mod scored_cohort;
 #[cfg(all(feature = "metadata-store", target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")))]
