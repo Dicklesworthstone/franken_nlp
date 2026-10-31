@@ -199,7 +199,7 @@ the evidence caps or make lossy hierarchy equivalent to full-context inference.
 ## Chunks of one long document
 
 `candidate source-int4 extract-map`, `ner-map`, `keyphrases-map` (including
-`--reduce-keyphrases`), default `summarize-map` and default `answer-map` accept `--cohort-chunks N` to
+`--reduce-keyphrases`), `summarize-map` and `answer-map` accept `--cohort-chunks N` to
 apply native grouping to independently planned chunks of one complete document.
 `N` must be 1 through 64 and cannot exceed `--max-chunks`. The default remains
 serial.
@@ -291,13 +291,45 @@ authority. The final QA output contains answers and citations without native
 token transcripts. Those transient native results remain funded until execution
 and reduction complete. Question text and paths stay out of public provenance.
 
-Neural summary/answer synthesis and durable document jobs retain their existing
-execution. Both direct argument parsing and owned job
-admission refuse unsupported cohort requests. `summarize-map --cohort-chunks`
-conflicts with `--synthesize-summary` and `--hierarchical-summary`; those modes
-have separate reduction and synthesis budget contracts. Likewise,
-`answer-map --cohort-chunks` conflicts with `--synthesize-answer` and
-`--hierarchical-answer`.
+### Synthesis command combinations
+
+All four neural synthesis modes accept discovery cohorts:
+
+| Command | Synthesis options with `--cohort-chunks N` | Later phases |
+|---|---|---|
+| `summarize-map` | `--synthesize-summary` | One scalar pass over all verified quotations |
+| `summarize-map` | `--synthesize-summary --hierarchical-summary` | Bounded scalar quotation-selection levels |
+| `answer-map` | `--synthesize-answer` | One scalar answer over all verified passages |
+| `answer-map` | `--synthesize-answer --hierarchical-answer` | Bounded scalar question-aware levels |
+
+For example, use discovery cohorts with an explicit summary hierarchy:
+
+```sh
+fnlp candidate source-int4 summarize-map report.txt \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256_FROM_TRUSTED_CONVERSION" \
+  --memory-mib 32768 --group-width 128 --cohort-chunks 4 \
+  --synthesize-summary --hierarchical-summary \
+  --summary-max-levels 8 --summary-max-passes 16 \
+  --max-total-mask-node-visits 160000000000
+```
+
+`--memory-mib` must cover the complete declaration, including all discovery
+plans and every permitted dependent pass. Work, mask, evidence and verification
+ceilings retain their original scope; requesting cohorts never raises them.
+Source conversion and independently pinned snapshots use the same route.
+Omitting `--cohort-chunks` keeps the existing serial execution.
+
+Synthesis output keeps its existing protocol and complete semantic result under
+`output`, with discovery under `output.discovery`. The separate schedule reports
+`execution: "cross_chunk_constrained_discovery_cohorts"`,
+`declared_max_chunks`, and `physical`. Those counters include only discovery
+native rows/windows and discovery work. They exclude scalar hierarchy passes
+and question-map whitespace; all dependent work remains in the original
+semantic receipt. Private question/source content is absent from provenance.
+
+Durable document jobs retain their existing execution. Their argument parsing
+and owned job admission continue to reject cohort requests.
 
 All source-derived masks and occurrence state stay document-owned. Structural
 validity and exact source membership do not certify semantic accuracy or factual
@@ -328,3 +360,12 @@ physical row/window counts against the original source partition while comparing
 the complete QA document apart from physical schedule fields. That fixture
 requires an explicit private question file in `FNLP_INT4_TEST_QUESTION` alongside
 the pinned snapshot, model digest, kernel and memory settings, and remains unrun.
+
+Synthesis regression sources cover full-context phase peaks before discovery,
+all reserved work and mask allowances, shared quote-only continuations,
+original-coordinate citation lifting, no-evidence scalar-allocation avoidance,
+hierarchy transcript retention and discovery-only ledgers. Hosted and CLI
+fixtures check complete private-input/workspace/output admission for all four
+modes and unchanged semantic publication. These sources have been reviewed;
+compilation, test execution, model parity and performance remain unrun pending
+the controller-selected checkpoint.

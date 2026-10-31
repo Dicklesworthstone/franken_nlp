@@ -21,6 +21,12 @@ impl Read for NoRead {
     fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("refused source map reached input"); }
 }
 const KINDS: [Kind; 3] = [Kind::Ner, Kind::Keyphrases, Kind::Summarize];
+pub(super) const SYNTHESIS_MODES: [(Kind, &[&str]); 4] = [
+    (Kind::Summarize, &["--synthesize-summary"]),
+    (Kind::Summarize, &["--synthesize-summary", "--hierarchical-summary"]),
+    (Kind::Answer, &["--question", "private-question.txt", "--synthesize-answer"]),
+    (Kind::Answer, &["--question", "private-question.txt", "--synthesize-answer", "--hierarchical-answer"]),
+];
 
 #[test]
 fn every_map_uses_whole_document_limits_on_source_and_pinned_snapshot_routes() {
@@ -60,7 +66,7 @@ fn chunk_cohorts_preserve_task_budgets_and_all_document_authority() {
     for (kind, mode) in [(Kind::Ner, &[][..]), (Kind::Keyphrases, &[][..]),
         (Kind::Summarize, &["--max-summary-bullets", "3"][..]),
         (Kind::Keyphrases, &["--reduce-keyphrases", "--document-keyphrases", "3"][..]),
-        (Kind::Answer, &["--question", "private-question.txt"][..])] {
+        (Kind::Answer, &["--question", "private-question.txt"][..])].into_iter().chain(SYNTHESIS_MODES) {
         let mut flags = mode.to_vec(); flags.extend_from_slice(&["--max-result-bytes", "65536"]);
         let (serial, mut args) = arguments(kind, &flags);
         args.memory_mib = 262_144;
@@ -80,6 +86,11 @@ fn chunk_cohorts_preserve_task_budgets_and_all_document_authority() {
                 original.mapping.mask_limits.max_trie_node_visits);
             assert_eq!(limits.mapping.verification, original.mapping.verification);
             assert_eq!(limits.workspace_bytes, original.workspace_bytes);
+            assert_eq!(limits.synthesis, original.synthesis);
+            assert_eq!(limits.question_synthesis, original.question_synthesis);
+            assert_eq!(limits.hierarchy, original.hierarchy);
+            assert_eq!(limits.question_hierarchy, original.question_hierarchy);
+            assert_eq!(limits.common.preparation_bytes, original.common.preparation_bytes);
             assert_eq!(grouped.question, serial.question);
             let (got, want) = (grouped.planning(&args), serial.planning(&args));
             assert_eq!((got.max_input_bytes, got.max_context_tokens, got.max_passages),
@@ -114,7 +125,7 @@ fn chunk_cohorts_preserve_task_budgets_and_all_document_authority() {
 fn complete_chunk_cohort_memory_is_admitted_before_source_snapshot_or_output_io() {
     for (kind, mode) in [(Kind::Ner, &[][..]), (Kind::Keyphrases, &[][..]),
         (Kind::Summarize, &[][..]), (Kind::Keyphrases, &["--reduce-keyphrases"][..]),
-        (Kind::Answer, &["--question", "private-question.txt"][..])] {
+        (Kind::Answer, &["--question", "private-question.txt"][..])].into_iter().chain(SYNTHESIS_MODES) {
         for snapshot in [false, true] {
             let mut flags = mode.to_vec(); flags.extend_from_slice(&["--cohort-chunks", "4"]);
             let (map, mut args) = arguments(kind, &flags);
@@ -126,15 +137,23 @@ fn complete_chunk_cohort_memory_is_admitted_before_source_snapshot_or_output_io(
             let limits = map.validate(&args).unwrap();
             let common = limits.common;
             let budget = map.source.budget(&args, common);
-            let quote = Int4SourceMapCohortMemoryLimits { max_chunks: 4, context_tokens: args.context_tokens,
+            let mut quote = Int4SourceMapCohortMemoryLimits { max_chunks: 4, context_tokens: args.context_tokens,
                 max_output_tokens_per_chunk: u64::from(budget.max_output_tokens),
                 max_result_bytes_per_chunk: budget.max_output_bytes,
             }.requirements(args.group_width).unwrap();
+            if limits.synthesis.is_some() || limits.question_synthesis.is_some() {
+                quote = quote.with_synthesis_context(args.context_tokens, args.group_width, budget.max_kv_bytes).unwrap();
+            }
             assert_eq!(limits.cohort, Some(quote));
-            let tokens = if limits.summary.is_some() || limits.keyphrases.is_some() || map.question.is_some() { 0 }
-                else { map.mapping.max_chunks as u64 * u64::from(budget.max_output_tokens) };
-            // Aggregates and QA omit native transcripts from final output;
-            // complete map tokens and all candidates remain in workspace.
+            let synthesis_passes = limits.hierarchy.map(|h| h.max_passes)
+                .or(limits.question_hierarchy.map(|h| h.max_passes))
+                .unwrap_or(usize::from(limits.synthesis.is_some() || limits.question_synthesis.is_some())) as u64;
+            let transcript_passes = if limits.summary.is_some() || limits.keyphrases.is_some() { 0 }
+                else if map.question.is_some() { limits.question_hierarchy.map_or(0, |h| h.max_passes as u64) }
+                else { map.mapping.max_chunks as u64 + synthesis_passes };
+            let tokens = transcript_passes * u64::from(budget.max_output_tokens);
+            // Summary synthesis retains every map and dependent transcript;
+            // QA hierarchy retains dependent passes, while flat QA has none.
             let output = (limits.max_result_bytes as u64 + 4096) * 4 + tokens * 8 + 4096;
             let question_input = if map.question.is_some() { question::QUESTION_BYTES as u64 + 1 } else { 0 };
             let input = args.max_input_bytes as u64 + 1 + question_input + common.preparation_bytes;
@@ -154,7 +173,7 @@ fn complete_chunk_cohort_memory_is_admitted_before_source_snapshot_or_output_io(
 }
 
 #[test]
-fn unsupported_synthesis_and_owned_job_routes_cannot_ignore_chunk_cohorts() {
+fn synthesis_routes_accept_discovery_cohorts_while_owned_jobs_refuse_them() {
     for command in definitions() {
         assert!(command.get_arguments().any(|arg| arg.get_id() == "cohort_chunks"));
     }
@@ -165,50 +184,46 @@ fn unsupported_synthesis_and_owned_job_routes_cannot_ignore_chunk_cohorts() {
                 "{} {} must not advertise unimplemented cohort jobs", operation.get_name(), task.get_name());
         }
     }
-    for flags in [&["--synthesize-summary"][..], &["--synthesize-summary", "--hierarchical-summary"][..]] {
-        let summary = definitions().into_iter().find(|c| c.get_name() == "summarize-map").unwrap();
-        let mut argv = vec!["summarize-map", "--source-dir", "source", "--source-manifest", "manifest",
-            "--memory-mib", "8192", "--cohort-chunks", "2"];
-        argv.extend_from_slice(flags);
-        assert!(summary.try_get_matches_from(argv).is_err());
-    }
-    for flags in [&["--synthesize-answer"][..], &["--synthesize-answer", "--hierarchical-answer"][..]] {
-        let answer = definitions().into_iter().find(|c| c.get_name() == "answer-map").unwrap();
-        let mut argv = vec!["answer-map", "--source-dir", "source", "--source-manifest", "manifest",
-            "--memory-mib", "8192", "--question", "private-question.txt", "--cohort-chunks", "2"];
-        argv.extend_from_slice(flags);
-        assert!(answer.try_get_matches_from(argv).is_err());
-    }
-    for (kind, flags) in [(Kind::Summarize, &["--synthesize-summary"][..]),
-        (Kind::Summarize, &["--synthesize-summary", "--hierarchical-summary"][..]),
-        (Kind::Answer, &["--question", "private-question.txt", "--synthesize-answer"][..]),
-        (Kind::Answer, &["--question", "private-question.txt", "--synthesize-answer", "--hierarchical-answer"][..])] {
-        let (mut map, args) = arguments(kind, flags); map.cohort_chunks = Some(2);
-        assert_eq!(map.execute(args, &mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+    for (kind, mode) in SYNTHESIS_MODES {
+        let mut flags = mode.to_vec(); flags.extend_from_slice(&["--cohort-chunks", "2"]);
+        let (map, mut args) = arguments(kind, &flags);
+        args.memory_mib = 262_144;
+        let limits = map.validate(&args).unwrap();
+        assert_eq!(limits.cohort_chunks, Some(2));
+        assert_eq!(limits.mapping.reduction.map_batch_chunks, 2);
+        assert_eq!(limits.synthesis.is_some(), kind == Kind::Summarize);
+        assert_eq!(limits.question_synthesis.is_some(), kind == Kind::Answer);
+        assert_eq!(limits.hierarchy.is_some(), mode.contains(&"--hierarchical-summary"));
+        assert_eq!(limits.question_hierarchy.is_some(), mode.contains(&"--hierarchical-answer"));
     }
     for (kind, mode) in [(Kind::Ner, &[][..]), (Kind::Keyphrases, &[][..]),
         (Kind::Summarize, &[][..]), (Kind::Keyphrases, &["--reduce-keyphrases"][..]),
-        (Kind::Answer, &["--question", "private-question.txt"][..])] {
-        let (mut map, args) = arguments(kind, mode);
+        (Kind::Answer, &["--question", "private-question.txt"][..])].into_iter().chain(SYNTHESIS_MODES) {
+        let (mut map, mut args) = arguments(kind, mode);
+        args.memory_mib = 262_144;
         map.validate_document_job(&args, false).unwrap();
         map.cohort_chunks = Some(1);
         assert!(map.validate_document_job(&args, false).is_err());
+        assert!(map.validate_document_job(&args, true).is_err());
     }
 }
 
 #[test]
 fn invalid_chunk_width_and_complete_window_output_fail_before_io() {
-    for kind in KINDS {
+    for (kind, mode) in [(Kind::Ner, &[][..]), (Kind::Keyphrases, &[][..]),
+        (Kind::Summarize, &[][..]), (Kind::Answer, &["--question", "private-question.txt"][..])]
+        .into_iter().chain(SYNTHESIS_MODES) {
         for flags in [vec!["--cohort-chunks", "0"], vec!["--cohort-chunks", "65"],
             vec!["--cohort-chunks", "2", "--max-chunks", "1"], vec!["--cohort-chunks", "64"]] {
             // Sixty-four one-MiB rows cannot fit their complete 64-MiB envelope.
             // The requested execution width must not be silently reduced.
-            let mut command = command(kind, &flags); command.args.memory_mib = 262_144;
+            let mut mode_flags = mode.to_vec(); mode_flags.extend_from_slice(&flags);
+            let mut command = command(kind, &mode_flags); command.args.memory_mib = 262_144;
             let mut output = Vec::new();
             assert_eq!(command.execute(&mut NoRead, &mut output), Err(CandidateError::Arguments));
             assert!(output.is_empty());
         }
-        let (mut map, args) = arguments(kind, &[]); map.cohort_chunks = Some(usize::MAX);
+        let (mut map, args) = arguments(kind, mode); map.cohort_chunks = Some(usize::MAX);
         assert_eq!(map.execute(args, &mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
     }
 }

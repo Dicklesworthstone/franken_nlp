@@ -238,6 +238,11 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         }
         Request::SummarySynthesis(task) => {
             let config = configuration(identity.clone(), task, &args, &options, limits, remaining()?);
+            if let Some(quote) = limits.cohort {
+                if config.synthesis_cohort_requirements(args.group_width).map_err(|_| CandidateError::Memory)? != quote {
+                    return Err(CandidateError::Memory);
+                }
+            }
             if let Some(hierarchy) = limits.hierarchy {
                 if config.summary_hierarchy_workspace_bytes(limits.mapping.chunks.max_chunks, hierarchy)
                     .map_err(|_| CandidateError::Memory)? != limits.workspace_bytes {
@@ -258,6 +263,11 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         }
         Request::QuestionSynthesis(task) => {
             let config = configuration(identity.clone(), task, &args, &options, limits, remaining()?);
+            if let Some(quote) = limits.cohort {
+                if config.synthesis_cohort_requirements(args.group_width).map_err(|_| CandidateError::Memory)? != quote {
+                    return Err(CandidateError::Memory);
+                }
+            }
             if let Some(hierarchy) = limits.question_hierarchy {
                 if config.question_hierarchy_workspace_bytes(limits.mapping.chunks.max_chunks, hierarchy)
                     .map_err(|_| CandidateError::Memory)? != limits.workspace_bytes {
@@ -383,41 +393,81 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         }
         Prepared::SummarySynthesis(mut config, expected) => {
             config.native.run.max_elapsed = remaining()?;
-            let result = engine.synthesize_int4_source_summary(&model, text, Arc::new(planner), Arc::new(vocabulary),
-                config, common.kernel, cancellation).map_err(execution_error)?;
-            expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
-            remaining()?;
-            publish(&Response { provenance: &provenance, output: result.result() },
-                limits.max_result_bytes + 4096, output)
+            if let Some(chunks) = limits.cohort_chunks {
+                let result = engine.synthesize_int4_source_summary_cohorts(&model, text,
+                    Arc::new(planner), Arc::new(vocabulary), config, common.kernel, cancellation)
+                    .map_err(execution_error)?;
+                expected.verify_completed(&result.result().document).map_err(|_| CandidateError::Execution)?;
+                remaining()?;
+                publish_discovery_cohort(&provenance, &result.result().document,
+                    &result.result().discovery_cohorts, chunks, limits.max_result_bytes + 4096, output)
+            } else {
+                let result = engine.synthesize_int4_source_summary(&model, text, Arc::new(planner), Arc::new(vocabulary),
+                    config, common.kernel, cancellation).map_err(execution_error)?;
+                expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+                remaining()?;
+                publish(&Response { provenance: &provenance, output: result.result() },
+                    limits.max_result_bytes + 4096, output)
+            }
         }
         Prepared::QuestionSynthesis(mut config, expected) => {
             config.native.run.max_elapsed = remaining()?;
-            let result = engine.synthesize_int4_document_answer(&model, text, Arc::new(planner), Arc::new(vocabulary),
-                config, common.kernel, cancellation).map_err(execution_error)?;
-            expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
-            remaining()?;
-            publish(&Response { provenance: &provenance, output: result.result() },
-                limits.max_result_bytes + 4096, output)
+            if let Some(chunks) = limits.cohort_chunks {
+                let result = engine.synthesize_int4_document_answer_cohorts(&model, text,
+                    Arc::new(planner), Arc::new(vocabulary), config, common.kernel, cancellation)
+                    .map_err(execution_error)?;
+                expected.verify_completed(&result.result().document).map_err(|_| CandidateError::Execution)?;
+                remaining()?;
+                publish_discovery_cohort(&provenance, &result.result().document,
+                    &result.result().discovery_cohorts, chunks, limits.max_result_bytes + 4096, output)
+            } else {
+                let result = engine.synthesize_int4_document_answer(&model, text, Arc::new(planner), Arc::new(vocabulary),
+                    config, common.kernel, cancellation).map_err(execution_error)?;
+                expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+                remaining()?;
+                publish(&Response { provenance: &provenance, output: result.result() },
+                    limits.max_result_bytes + 4096, output)
+            }
         }
         Prepared::QuestionHierarchy(mut config, expected) => {
             config.native.run.max_elapsed = remaining()?;
-            let result = engine.synthesize_int4_document_answer_hierarchy(&model, text,
-                Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), common.kernel, cancellation)
-                .map_err(execution_error)?;
-            expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
-            remaining()?;
-            publish(&Response { provenance: &provenance, output: result.result() },
-                limits.max_result_bytes + 4096, output)
+            if let Some(chunks) = limits.cohort_chunks {
+                let result = engine.synthesize_int4_document_answer_hierarchy_cohorts(&model, text,
+                    Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), common.kernel, cancellation)
+                    .map_err(execution_error)?;
+                expected.verify_completed(&result.result().document).map_err(|_| CandidateError::Execution)?;
+                remaining()?;
+                publish_discovery_cohort(&provenance, &result.result().document,
+                    &result.result().discovery_cohorts, chunks, limits.max_result_bytes + 4096, output)
+            } else {
+                let result = engine.synthesize_int4_document_answer_hierarchy(&model, text,
+                    Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), common.kernel, cancellation)
+                    .map_err(execution_error)?;
+                expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+                remaining()?;
+                publish(&Response { provenance: &provenance, output: result.result() },
+                    limits.max_result_bytes + 4096, output)
+            }
         }
         Prepared::SummaryHierarchy(mut config, expected) => {
             config.native.run.max_elapsed = remaining()?;
-            let result = engine.synthesize_int4_source_summary_hierarchy(&model, text,
-                Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), common.kernel, cancellation)
-                .map_err(execution_error)?;
-            expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
-            remaining()?;
-            publish(&Response { provenance: &provenance, output: result.result() },
-                limits.max_result_bytes + 4096, output)
+            if let Some(chunks) = limits.cohort_chunks {
+                let result = engine.synthesize_int4_source_summary_hierarchy_cohorts(&model, text,
+                    Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), common.kernel, cancellation)
+                    .map_err(execution_error)?;
+                expected.verify_completed(&result.result().document).map_err(|_| CandidateError::Execution)?;
+                remaining()?;
+                publish_discovery_cohort(&provenance, &result.result().document,
+                    &result.result().discovery_cohorts, chunks, limits.max_result_bytes + 4096, output)
+            } else {
+                let result = engine.synthesize_int4_source_summary_hierarchy(&model, text,
+                    Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), common.kernel, cancellation)
+                    .map_err(execution_error)?;
+                expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+                remaining()?;
+                publish(&Response { provenance: &provenance, output: result.result() },
+                    limits.max_result_bytes + 4096, output)
+            }
         }
     }
 }
@@ -458,6 +508,15 @@ fn publish_cohort<T: Serialize>(provenance: &Provenance<'_>, document: &T, physi
     chunks: usize, max_bytes: usize, output: &mut impl Write) -> Result<(), CandidateError> {
     publish(&CohortResponse { response: Response { provenance, output: document },
         cohort_schedule: CohortSchedule { execution: "cross_chunk_constrained_cohorts",
+            declared_max_chunks: chunks, physical } }, max_bytes, output)
+}
+fn publish_discovery_cohort<T: Serialize>(provenance: &Provenance<'_>, document: &T,
+    physical: &Int4SourceMapCohortStats, chunks: usize, max_bytes: usize, output: &mut impl Write)
+    -> Result<(), CandidateError> {
+    // The semantic receipt retains every dependent pass. This separate ledger
+    // covers discovery only; it cannot claim hierarchy groups ran in parallel.
+    publish(&CohortResponse { response: Response { provenance, output: document },
+        cohort_schedule: CohortSchedule { execution: "cross_chunk_constrained_discovery_cohorts",
             declared_max_chunks: chunks, physical } }, max_bytes, output)
 }
 

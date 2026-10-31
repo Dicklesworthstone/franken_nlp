@@ -1766,13 +1766,15 @@ entailment. A decoding failure, cancellation or exhausted budget returns no
 document result and never becomes an abstention. Empty or wholly whitespace
 documents are refused.
 
-The original document stays under `output`. With cohorts enabled,
+The independent-QA document stays under `output`. With cohorts enabled,
 `cohort_schedule.physical.chunks` equals `output.native_chunks`, and
 `cohort_schedule.physical.cohorts` counts source windows containing native
 passages. `output.mapped.map_batches` includes all logical source windows,
-including whitespace-only windows. The cohort option cannot be combined with
-`--synthesize-answer` or `--hierarchical-answer`, and durable jobs retain their
-existing execution. See [structured INT4 cohorts](docs/int4-structured-cohorts.md).
+including whitespace-only windows. With `--synthesize-answer` or
+`--hierarchical-answer`, the same option batches discovery before the dependent
+scalar evidence passes; those results retain discovery under `output.discovery`.
+Durable jobs retain their existing execution. See
+[structured INT4 cohorts](docs/int4-structured-cohorts.md).
 
 `--options FILE` supplies the complete per-chunk `AnswerOptions` object:
 
@@ -1838,7 +1840,14 @@ same total mask allowance. The `--max-qa-*` citation-verification counters
 span discovery, quote collection and original-coordinate citation lifting;
 they do not renew for synthesis. Memory admission includes all map results,
 quote passages, verifier owners, temporary final decoding and guarded output.
-One hosted invocation retains the same resident model and native allocation.
+One hosted invocation retains the same resident model through every phase.
+
+Add `--cohort-chunks N` to share native layers across discovery chunks before
+this final scalar answer pass. The complete scalar context is admitted before
+discovery, and its engine allocates only after discovery engines drain and
+verified evidence exists. The hosted entrypoint is
+`NlpEngine::synthesize_int4_document_answer_cohorts`. Its `.document` keeps the
+complete answer result, while `.discovery_cohorts` reports discovery only.
 
 The completed `fnlp-candidate-int4-answer-synthesis-v1` response keeps every
 chunk answer and adds the final answer, abstention or explicit
@@ -1931,6 +1940,12 @@ abstention. The result distinguishes four outcomes: `answered`, `abstained`,
 passes left no quotations for another level; it does not assert calibrated
 unanswerability. Both empty-evidence outcomes have no final pass.
 
+`--cohort-chunks N` also applies here: discovery chunks share native layers,
+then the original scalar hierarchy processes each complete evidence level.
+Every permitted pass's native transcript remains included in output admission.
+`NlpEngine::synthesize_int4_document_answer_hierarchy_cohorts` exposes this
+schedule through the library with separate `.discovery_cohorts` statistics.
+
 Library callers use
 `SourceTaskPlanner::preflight_int4_question_hierarchy_with_control`,
 `SourceTaskPlanner::plan_int4_question_hierarchy_with_control`, and
@@ -1987,9 +2002,9 @@ keyphrases. Unknown keys, duplicate keys, partial options and task switching
 are refused. Free-text generation controls and prefill overrides are not
 accepted.
 
-For `ner-map`, `keyphrases-map` (including `--reduce-keyphrases`), default
-`summarize-map` and default `answer-map`, `--cohort-chunks N` explicitly groups 1 through 64 independent
-chunks through the native INT4 decoder. The width
+For `ner-map`, `keyphrases-map` (including `--reduce-keyphrases`),
+`summarize-map` and `answer-map`, `--cohort-chunks N` explicitly groups 1 through
+64 independent discovery chunks through the native INT4 decoder. The width
 cannot exceed `--max-chunks`; the complete declared native/decoder window,
 all prepared chunks, reduction frontier and final output must fit admission.
 The final partial window uses its exact row count. Each chunk keeps its
@@ -2002,9 +2017,13 @@ in `output.mapped.map_batches`; aggregate summaries and ranked keyphrases use
 `output.map_batches`. All aggregate candidates and evidence survive until the
 complete document's final selection. Omitting the flag retains serial execution.
 
-`--cohort-chunks` cannot be combined with neural summary/answer synthesis or
-hierarchy; durable document jobs retain their existing execution paths. The
-library's `NlpEngine::map_int4_source_cohorts` additionally supports raw
+Neural summary/answer synthesis and explicit hierarchy accept the same option.
+Only discovery runs in cohorts; dependent evidence passes retain their scalar
+execution and complete work/verification limits. Their `cohort_schedule.execution`
+is `cross_chunk_constrained_discovery_cohorts`, and physical counters cover
+`output.discovery` only. Native admission reserves the larger discovery/scalar
+phase peak before execution. Durable document jobs retain their existing paths.
+The library's `NlpEngine::map_int4_source_cohorts` additionally supports raw
 independent summary chunks through `SourceMapTask::Summarize`. It returns the
 complete `.document` and `.cohorts` statistics under one output guard, with
 `Int4SourceMapConfig.mapping.reduction.map_batch_chunks` selecting the window.
@@ -2096,8 +2115,9 @@ Add `--cohort-chunks N` to run the native maps in shared-layer windows before
 this same complete-document union. Every bullet and citation still reaches
 the reducer; `--max-summary-bullets` does not reduce the admitted map/frontier
 storage. Size `--memory-mib` for the complete simultaneous native window and
-retained evidence. This option is available for the default union, without
-`--synthesize-summary` or `--hierarchical-summary`.
+retained evidence. With `--synthesize-summary` or `--hierarchical-summary`, the
+same option batches discovery before the separately bounded neural passes
+described below.
 
 For a `summary-options.json` file:
 
@@ -2188,6 +2208,12 @@ may omit relevant source context, and this mode does not claim full-document
 equivalence, factual correctness, recall or contradiction resolution.
 Hierarchical quote compression is not enabled by this flag.
 
+Add `--cohort-chunks N` to batch the independent discovery maps. The final
+evidence-only pass stays scalar and retains its full pre-reserved context and
+work allowance. Discovery engines drain before scalar allocation; empty evidence
+allocates no final engine. `NlpEngine::synthesize_int4_source_summary_cohorts`
+returns the complete `.document` plus discovery-only `.discovery_cohorts`.
+
 Library callers use
 `SourceTaskPlanner::plan_int4_summary_synthesis_with_control` and
 `NlpEngine::synthesize_int4_source_summary` with
@@ -2260,7 +2286,12 @@ plan witnesses used to check complete levels.
 Library callers use `SourceTaskPlanner::plan_int4_summary_hierarchy_with_control`
 and `NlpEngine::synthesize_int4_source_summary_hierarchy`, supplying
 `SummaryHierarchyLimits` alongside `Int4SourceMapConfig<SourceSummarySynthesis>`.
-One hosted invocation and native allocation cover the complete hierarchy.
+One hosted invocation covers the complete hierarchy. Add `--cohort-chunks N`
+to batch discovery before the existing scalar hierarchy, or call
+`NlpEngine::synthesize_int4_source_summary_hierarchy_cohorts`. Every original
+map and permitted hierarchy transcript remains funded. Native phase peaks are
+admitted together, with discovery engines drained before the scalar engine is
+allocated; `.discovery_cohorts` reports only discovery execution.
 Original-source membership remains structural; this mode does not establish
 semantic entailment, recall, factual correctness or full-document equivalence.
 Compilation, model-present execution, parity and task quality remain pending

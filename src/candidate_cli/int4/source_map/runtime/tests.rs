@@ -140,7 +140,8 @@ fn owned_runtime_boundary_rechecks_chunk_cohort_configuration_before_io() {
     }
     for (kind, mode) in [(Kind::Ner, &[][..]), (Kind::Keyphrases, &[][..]),
         (Kind::Summarize, &[][..]), (Kind::Keyphrases, &["--reduce-keyphrases"][..]),
-        (Kind::Answer, &["--question", "private-question.txt"][..])] {
+        (Kind::Answer, &["--question", "private-question.txt"][..])]
+        .into_iter().chain(super::super::tests::SYNTHESIS_MODES) {
         let mut flags = mode.to_vec(); flags.extend_from_slice(&["--cohort-chunks", "2"]);
         let mut command = super::super::tests::command(kind, &flags);
         command.args.memory_mib = 262_144;
@@ -153,7 +154,10 @@ fn owned_runtime_boundary_rechecks_chunk_cohort_configuration_before_io() {
     command.args.memory_mib = 262_144;
     let Int4Task::SourceMap(mut options) = command.task else { panic!("wrong summary task"); };
     let admitted = options.validate(&command.args).unwrap();
-    options.summary.as_mut().unwrap().synthesis.synthesize_summary = true;
+    let replacement = super::super::tests::command(Kind::Summarize,
+        &["--synthesize-summary", "--max-synthesis-evidence-bytes", "0"]);
+    let Int4Task::SourceMap(replacement) = replacement.task else { panic!("wrong synthesized summary task"); };
+    options.summary = replacement.summary;
     assert_eq!(execute(command.args, options, admitted, &mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
     let mut command = super::super::tests::command(Kind::Answer,
         &["--question", "private-question.txt", "--cohort-chunks", "2"]);
@@ -161,7 +165,7 @@ fn owned_runtime_boundary_rechecks_chunk_cohort_configuration_before_io() {
     let Int4Task::SourceMap(mut options) = command.task else { panic!("wrong question task"); };
     let admitted = options.validate(&command.args).unwrap();
     let replacement = super::super::tests::command(Kind::Answer,
-        &["--question", "private-question.txt", "--synthesize-answer"]);
+        &["--question", "private-question.txt", "--synthesize-answer", "--max-synthesis-passages", "0"]);
     let Int4Task::SourceMap(replacement) = replacement.task else { panic!("wrong synthesized question task"); };
     options.question = replacement.question;
     assert_eq!(execute(command.args, options, admitted, &mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
@@ -671,6 +675,117 @@ fn question_synthesis_fixture(width: usize) -> (SourceTaskPlanner, Int4SourceMap
         planning: config.planning, mapping: config.mapping, native: config.native,
         preparation_reserve_bytes: config.preparation_reserve_bytes,
         reduction_reserve_bytes: config.reduction_reserve_bytes })
+}
+
+#[test]
+fn synthesis_cohort_cli_and_host_keep_the_same_complete_phase_reservation() {
+    for width in [32, 128] {
+        for chunks in [1, 4] {
+            for (kind, mode) in super::super::tests::SYNTHESIS_MODES {
+                let width_arg = width.to_string(); let chunks_arg = chunks.to_string();
+                let mut flags = mode.to_vec();
+                flags.extend_from_slice(&["--group-width", &width_arg, "--cohort-chunks", &chunks_arg,
+                    "--max-chunk-bytes", "16", "--max-new-tokens", "16"]);
+                let mut command = super::super::tests::command(kind, &flags);
+                command.args.memory_mib = 262_144;
+                let Int4Task::SourceMap(options) = command.task else { panic!("wrong synthesis task"); };
+                let limits = options.validate(&command.args).unwrap();
+                let quote = limits.cohort.unwrap();
+                assert_eq!(quote.native.kv_bytes, chunks as u64 * limits.common.native.kv_bytes);
+                if kind == Kind::Summarize {
+                    let (planner, base) = synthesis_fixture(width);
+                    let task = options.summary.unwrap().synthesis.request(base.task.map_options,
+                        options.planning(&command.args)).unwrap();
+                    let mut config = configuration(base.identity, task, &command.args, &options, limits,
+                        Duration::from_secs(1));
+                    assert_eq!(config.synthesis_cohort_requirements(width).unwrap(), quote);
+                    assert_eq!(config.budget.max_kv_bytes, limits.common.native.kv_bytes);
+                    assert_eq!(Some(config.task.limits), limits.synthesis);
+                    if let Some(hierarchy) = limits.hierarchy {
+                        assert_eq!(config.summary_hierarchy_workspace_bytes(limits.mapping.chunks.max_chunks,
+                            hierarchy).unwrap(), limits.workspace_bytes);
+                        let grouped = summary_hierarchy_preflight(SOURCE, &planner, &config, hierarchy,
+                            width, &mut continuing()).unwrap();
+                        config.mapping.reduction.map_batch_chunks = 1;
+                        assert_eq!(summary_hierarchy_preflight(SOURCE, &planner, &config, hierarchy,
+                            width, &mut continuing()).unwrap(), grouped);
+                    } else {
+                        assert_eq!(config.summary_synthesis_workspace_bytes(limits.mapping.chunks.max_chunks)
+                            .unwrap(), limits.workspace_bytes);
+                        let grouped = summary_synthesis_preflight(SOURCE, &planner, &config,
+                            width, &mut continuing()).unwrap();
+                        config.mapping.reduction.map_batch_chunks = 1;
+                        assert_eq!(summary_synthesis_preflight(SOURCE, &planner, &config,
+                            width, &mut continuing()).unwrap(), grouped);
+                    }
+                } else {
+                    let (planner, base) = question_synthesis_fixture(width);
+                    let question = options.question.as_ref().unwrap();
+                    let task = question.synthesis_request(question.task("What happened?".to_owned(), None).unwrap(),
+                        options.planning(&command.args)).unwrap();
+                    let mut config = configuration(base.identity, task, &command.args, &options, limits,
+                        Duration::from_secs(1));
+                    assert_eq!(config.synthesis_cohort_requirements(width).unwrap(), quote);
+                    assert_eq!(config.budget.max_kv_bytes, limits.common.native.kv_bytes);
+                    assert_eq!(Some(config.task.limits), limits.question_synthesis);
+                    assert_eq!(config.task.question.verification, question.verification().unwrap());
+                    if let Some(hierarchy) = limits.question_hierarchy {
+                        assert_eq!(config.question_hierarchy_workspace_bytes(limits.mapping.chunks.max_chunks,
+                            hierarchy).unwrap(), limits.workspace_bytes);
+                        let grouped = question_hierarchy_preflight(SOURCE, &planner, &config, hierarchy,
+                            width, &mut continuing()).unwrap();
+                        config.mapping.reduction.map_batch_chunks = 1;
+                        assert_eq!(question_hierarchy_preflight(SOURCE, &planner, &config, hierarchy,
+                            width, &mut continuing()).unwrap(), grouped);
+                    } else {
+                        assert_eq!(config.question_synthesis_workspace_bytes(limits.mapping.chunks.max_chunks)
+                            .unwrap(), limits.workspace_bytes);
+                        let grouped = question_synthesis_preflight(SOURCE, &planner, &config,
+                            width, &mut continuing()).unwrap();
+                        config.mapping.reduction.map_batch_chunks = 1;
+                        assert_eq!(question_synthesis_preflight(SOURCE, &planner, &config,
+                            width, &mut continuing()).unwrap(), grouped);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn discovery_cohort_publication_preserves_all_synthesis_protocols_and_semantic_receipts() {
+    let output = serde_json::json!({"fixture_only":true,"discovery":{"chunks":3},
+        "passes":[{"generated_token_ids":[1,2,3]}],"final_pass":0,
+        "semantic_support":"not_assessed"});
+    let physical = Int4SourceMapCohortStats { cohorts: 1, chunks: 2, ..Default::default() };
+    for (task, protocol) in [
+        ("summarize", "fnlp-candidate-int4-summary-synthesis-v1"),
+        ("summarize", "fnlp-candidate-int4-summary-hierarchy-v1"),
+        ("answer", "fnlp-candidate-int4-answer-synthesis-v1"),
+        ("answer", "fnlp-candidate-int4-answer-hierarchy-v1"),
+    ] {
+        let provenance = Provenance { protocol, schema_version: 1,
+            scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task,
+            model_id: "Nanbeige4.2-3B", source_revision: "fixture", source_root_sha256: "fixture-source",
+            model_content_sha256: "fixture-model", candidate_format: INT4_SOURCE_FORMAT,
+            quant_recipe: "fixture:group=32", group_width: 32, integer_kernel: "s_scalar_i32", snapshot: None };
+        let mut serial_bytes = Vec::new();
+        publish(&Response { provenance: &provenance, output: &output }, 4096, &mut serial_bytes).unwrap();
+        let serial: serde_json::Value = serde_json::from_slice(&serial_bytes).unwrap();
+        let mut bytes = Vec::new();
+        publish_discovery_cohort(&provenance, &output, &physical, 4, 4096, &mut bytes).unwrap();
+        let mut grouped: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let schedule = grouped.as_object_mut().unwrap().remove("cohort_schedule").unwrap();
+        assert_eq!(schedule["execution"], "cross_chunk_constrained_discovery_cohorts");
+        assert_eq!(schedule["declared_max_chunks"], 4);
+        assert_eq!(schedule["physical"]["chunks"], 2);
+        assert_eq!(schedule["physical"]["cohorts"], 1);
+        assert_eq!(grouped, serial, "discovery scheduling cannot rewrite the semantic receipt or private inputs");
+        let mut refused = Vec::new();
+        assert_eq!(publish_discovery_cohort(&provenance, &output, &physical, 4, 1, &mut refused),
+            Err(CandidateError::Output));
+        assert!(refused.is_empty());
+    }
 }
 
 #[test]

@@ -123,17 +123,10 @@ fn definitions_with_cohorts(cohorts: bool) -> Vec<clap::Command> {
                 _ => command,
             };
             if cohorts {
-                let command = command.arg(clap::Arg::new("cohort_chunks").long("cohort-chunks")
+                command.arg(clap::Arg::new("cohort_chunks").long("cohort-chunks")
                     .value_name("N").value_parser(clap::value_parser!(usize))
                     .help("Share native decoder layers across up to N independent chunks (1..=64); serial if omitted")
-                    .long_help("Explicitly execute up to N independent source chunks through shared native INT4 decoder layers. N must be 1..64 and cannot exceed --max-chunks. All original chunk plans and the complete simultaneous native/decoder/output memory are admitted before inference; each actual window, including the final short one, has exact independent causal contexts. The original per-chunk task budgets, source evidence and complete-document work/reduction limits remain unchanged. Raw NER/keyphrase maps retain their independent native results. Default summarize-map and --reduce-keyphrases preserve the complete exact candidate/evidence union, apply final top-k only once and retain their existing aggregate output. Default answer-map preserves every independent answer, abstention and whitespace range; whitespace-only chunks use no native work, so physical cohort statistics count only nonblank chunks and windows. Neural synthesis, hierarchy and durable document jobs do not accept this option."));
-                match kind {
-                    Kind::Summarize => command.mut_arg("cohort_chunks", |arg|
-                        arg.conflicts_with_all(["synthesize_summary", "hierarchical_summary"])),
-                    Kind::Answer => command.mut_arg("cohort_chunks", |arg|
-                        arg.conflicts_with_all(["synthesize_answer", "hierarchical_answer"])),
-                    _ => command,
-                }
+                    .long_help("Explicitly execute up to N independent source chunks through shared native INT4 decoder layers. N must be 1..64 and cannot exceed --max-chunks. All original chunk plans and the complete simultaneous native/decoder/output memory are admitted before inference; each actual window, including the final short one, has exact independent causal contexts. The original per-chunk task budgets, source evidence and complete-document work/reduction limits remain unchanged. Raw NER/keyphrase maps retain their independent native results. Default summarize-map and --reduce-keyphrases preserve the complete exact candidate/evidence union, apply final top-k only once and retain their existing aggregate output. Default answer-map preserves every independent answer, abstention and whitespace range; whitespace-only chunks use no native work, so physical cohort statistics count only nonblank chunks and windows. With neural summary or answer synthesis, including explicit hierarchy, only discovery maps share native layers; dependent evidence passes remain serial under the same complete invocation allowance. The full synthesis context is reserved before discovery even when actual discovery contexts are smaller. Scheduling metadata identifies discovery-only physical statistics. Durable document jobs do not accept this option."))
             } else { command }
         }).collect()
 }
@@ -221,10 +214,6 @@ impl MapArgs {
             Some(question) => question.hierarchy()?,
             None => None,
         };
-        if self.cohort_chunks.is_some() && (synthesis.is_some() || hierarchy.is_some()
-            || question_synthesis.is_some() || question_hierarchy.is_some()) {
-            return Err(CandidateError::Arguments);
-        }
         let summary = self.summary.filter(|s| !s.synthesis.synthesize_summary && !map_only)
             .map(|s| s.limits(mapping)).transpose()?;
         if let Some(summary) = summary {
@@ -283,22 +272,31 @@ impl MapArgs {
                 },
             },
         };
-        // QA keeps answers and citations, not native token transcripts. The
-        // cohort quote prices that exact output; the serial quote is retained.
-        let tokens = if summary.is_some() || keyphrases.is_some()
-            || (self.cohort_chunks.is_some() && self.question.is_some()) { 0 }
-            else { times(preparation_passes, u64::from(budget.max_output_tokens))? };
+        // QA discovery and flat synthesis retain text/citations. Explicit QA
+        // hierarchy also retains every dependent pass's native transcript.
+        // Keep the existing serial quote and all summary transcript reserves.
+        let tokens = if summary.is_some() || keyphrases.is_some() { 0 }
+            else if self.cohort_chunks.is_some() && self.question.is_some() {
+                times(question_hierarchy.map_or(0, |limits| limits.max_passes as u64),
+                    u64::from(budget.max_output_tokens))?
+            } else { times(preparation_passes, u64::from(budget.max_output_tokens))? };
         let max_result_bytes = keyphrases.map_or(m.max_map_result_bytes, |limits| limits.max_result_bytes);
         let output = sum(&[max_result_bytes as u64 * 4, times(tokens, 8)?, 4096])?;
         let question_input = if self.question.is_some() { question::QUESTION_BYTES as u64 + 1 } else { 0 };
         let input = sum(&[args.max_input_bytes as u64 + 1, question_input, common.preparation_bytes])?;
         // CLI preparation stays alive through publication while the host owns
         // a separately charged source/preparation capture and complete output.
-        let cohort = self.cohort_chunks.map(|max_chunks| Int4SourceMapCohortMemoryLimits {
-            max_chunks, context_tokens: args.context_tokens,
-            max_output_tokens_per_chunk: u64::from(budget.max_output_tokens),
-            max_result_bytes_per_chunk: budget.max_output_bytes,
-        }.requirements(args.group_width).map_err(|_| CandidateError::Arguments)).transpose()?;
+        let cohort = self.cohort_chunks.map(|max_chunks| {
+            let quote = Int4SourceMapCohortMemoryLimits {
+                max_chunks, context_tokens: args.context_tokens,
+                max_output_tokens_per_chunk: u64::from(budget.max_output_tokens),
+                max_result_bytes_per_chunk: budget.max_output_bytes,
+            }.requirements(args.group_width).map_err(|_| CandidateError::Arguments)?;
+            if synthesis.is_some() || question_synthesis.is_some() {
+                quote.with_synthesis_context(args.context_tokens, args.group_width, budget.max_kv_bytes)
+                    .map_err(|_| CandidateError::Arguments)
+            } else { Ok(quote) }
+        }).transpose()?;
         if let Some(quote) = cohort {
             // The full document and decoder window coexist. The bounded host
             // wrapper adds 4096 bytes under the same four-payload output claim.
