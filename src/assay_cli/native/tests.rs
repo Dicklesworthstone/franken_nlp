@@ -8,6 +8,7 @@ pub(super) fn parse(arguments: &[&str]) -> Command {
     match AssayCommand::from_matches(arguments[0], &matches).unwrap() {
         AssayCommand::Native(command) => command,
         AssayCommand::Scored(_) => panic!("native fixture selected supplied observations"),
+        AssayCommand::NativeNer(_) => panic!("classification fixture selected NER"),
     }
 }
 pub(super) fn command(paired: bool, flags: &[&str]) -> Command {

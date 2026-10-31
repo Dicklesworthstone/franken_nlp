@@ -11,11 +11,11 @@ use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, Me
     receipt::CommitmentDomain,
     tasks::classify::{ClassificationError, ClassificationPlanningError, grouped_int4::Int4ClassificationError}};
 
-struct Model {
-    path: PathBuf,
-    pin: Int4SnapshotPin,
-    budget: Int4SnapshotBudget,
-    memory: Int4LoadRequirements,
+pub(in crate::assay_cli) struct Model {
+    pub(in crate::assay_cli) path: PathBuf,
+    pub(in crate::assay_cli) pin: Int4SnapshotPin,
+    pub(in crate::assay_cli) budget: Int4SnapshotBudget,
+    pub(in crate::assay_cli) memory: Int4LoadRequirements,
 }
 struct Plan {
     candidate: Model,
@@ -28,7 +28,7 @@ struct Plan {
     elapsed: Duration,
 }
 impl Model {
-    fn new(path: Option<&Path>, digest: Option<&str>, width: usize, run: RunLimits) -> Result<Self, Failure> {
+    pub(in crate::assay_cli) fn new(path: Option<&Path>, digest: Option<&str>, width: usize, run: RunLimits) -> Result<Self, Failure> {
         let (pin, need) = model_input(path, digest, width)?;
         let budget = Int4SnapshotBudget { max_weight_bytes: need.weight_payload_bytes,
             max_scratch_bytes: need.scratch_bytes,
@@ -153,40 +153,41 @@ pub(super) fn execute(command: &Command, limits: Limits, input: &mut impl Read,
         (Some(fit), None, None, None, None, None) => {
             let report = engine.calibrate_int4_classification(&candidate, dataset, key, namespace,
                 fit.options()?, options, limits, plan.host, plan.kernel, cancellation).map_err(host_failure)?;
-            publish_hosted(report, command.operation(), limits, destination, output, &remaining)
+            publish_hosted(report, NATIVE_PROTOCOL, command.operation(), limits, destination, output, &remaining)
         }
         (None, None, None, None, None, None) => {
             let report = engine.evaluate_int4_classification(&candidate, dataset, key, namespace,
                 options, limits, plan.host, plan.kernel, cancellation).map_err(host_failure)?;
-            publish_hosted(report, command.operation(), limits, destination, output, &remaining)
+            publish_hosted(report, NATIVE_PROTOCOL, command.operation(), limits, destination, output, &remaining)
         }
         (None, None, None, None, Some(application), None) => {
             let report = engine.evaluate_int4_classification_calibrated(&candidate, dataset, application, key, namespace,
                 options, limits, plan.host, plan.kernel, cancellation).map_err(host_failure)?;
-            publish_hosted(report, command.operation(), limits, destination, output, &remaining)
+            publish_hosted(report, NATIVE_PROTOCOL, command.operation(), limits, destination, output, &remaining)
         }
         (None, Some(comparison), Some(baseline), Some(gates), candidate_application, baseline_application) => {
             let host_scope = comparison.host_scope.as_deref().ok_or_else(invalid_options)?.to_owned();
             if candidate_application.is_none() && baseline_application.is_none() {
                 let report = engine.qualify_int4_classification(&candidate, baseline, dataset, key, namespace,
                     host_scope, gates, options, limits, plan.host, plan.kernel, cancellation).map_err(host_failure)?;
-                publish_hosted(report, command.operation(), limits, destination, output, &remaining)
+                publish_hosted(report, NATIVE_PROTOCOL, command.operation(), limits, destination, output, &remaining)
             } else {
                 let report = engine.qualify_int4_classification_calibrated(&candidate, baseline, dataset,
                     candidate_application, baseline_application, key, namespace, host_scope, gates,
                     options, limits, plan.host, plan.kernel, cancellation).map_err(host_failure)?;
-                publish_hosted(report, command.operation(), limits, destination, output, &remaining)
+                publish_hosted(report, NATIVE_PROTOCOL, command.operation(), limits, destination, output, &remaining)
             }
         }
         _ => Err(invalid_options()),
     }
 }
 
-fn publish_hosted<T: Serialize>(report: HostedOutput<T>, operation: &'static str, limits: Limits,
+pub(in crate::assay_cli) fn publish_hosted<T: Serialize>(report: HostedOutput<T>, protocol: &'static str,
+    operation: &'static str, limits: Limits,
     destination: Option<Destination>, output: &mut impl Write,
     remaining: &impl Fn() -> Result<Duration, Failure>) -> Result<(), Failure> {
     remaining()?;
-    let bytes = encode(operation, report.result(), limits)?;
+    let bytes = encode(protocol, operation, report.result(), limits)?;
     remaining()?;
     let result = publish(destination, &bytes, output);
     // The output claim and outer staging both survive the physical flush.
@@ -259,8 +260,9 @@ struct Envelope<'a, T: Serialize> {
     schema_version: u32, protocol: &'static str, operation: &'static str,
     evidence: &'static str, activation_authority: bool, report: &'a T,
 }
-fn encode(operation: &'static str, report: &impl Serialize, limits: Limits) -> Result<Vec<u8>, Failure> {
-    assay::render(&Envelope { schema_version: 1, protocol: NATIVE_PROTOCOL, operation,
+pub(in crate::assay_cli) fn encode(protocol: &'static str, operation: &'static str, report: &impl Serialize,
+    limits: Limits) -> Result<Vec<u8>, Failure> {
+    assay::render(&Envelope { schema_version: 1, protocol, operation,
         evidence: "native_model_replay", activation_authority: false, report }, limits).map_err(Into::into)
 }
 fn publish(destination: Option<Destination>, bytes: &[u8], output: &mut impl Write) -> Result<(), Failure> {
@@ -270,7 +272,7 @@ fn publish(destination: Option<Destination>, bytes: &[u8], output: &mut impl Wri
     }
 }
 
-fn cancelled(kind: DecodeCancellationKind) -> Failure {
+pub(in crate::assay_cli) fn cancelled(kind: DecodeCancellationKind) -> Failure {
     use DecodeCancellationKind::*;
     let code = match kind {
         Timeout | Deadline | PollQuota | CostBudget => ErrorCode::BudgetOrTimeout,
@@ -280,7 +282,7 @@ fn cancelled(kind: DecodeCancellationKind) -> Failure {
     };
     Failure::new(code, "native_assay_stopped")
 }
-fn host_failure(error: HostedError) -> Failure {
+pub(in crate::assay_cli) fn host_failure(error: HostedError) -> Failure {
     match error {
         HostedError::Assay(error) => error.into(),
         HostedError::Stopped { stop, task_error } => {
@@ -317,6 +319,7 @@ fn host_failure(error: HostedError) -> Failure {
             error => error.cancellation().map(cancelled).unwrap_or_else(||
                 Failure::new(ErrorCode::StructuredTaskNoResult, "native_classification_failed")),
         },
+        HostedError::Int4(Int4HostError::SourceTask(error)) => source_failure(error),
         HostedError::Int4(Int4HostError::Native(StrictInt4Error::Cancelled(kind))) => cancelled(kind),
         HostedError::Int4(Int4HostError::Native(StrictInt4Error::Work)) =>
             Failure::new(ErrorCode::BudgetOrTimeout, "native_work_budget"),
@@ -326,6 +329,57 @@ fn host_failure(error: HostedError) -> Failure {
         HostedError::ModelIdentity | HostedError::ResourceDomain =>
             Failure::new(ErrorCode::ArtifactIntegrityOrFormatOrVersion, "native_model_identity"),
         _ => Failure::new(ErrorCode::Generic, "native_execution_failed"),
+    }
+}
+
+/// Preserve typed source-planning and constrained-decoding causes without
+/// copying source-derived schema pointers or private diagnostic text.
+fn source_failure(error: crate::tasks::source_planning::grouped_int4::Int4SourceError) -> Failure {
+    use crate::{native_engine::constrained_int4::Int4JsonError,
+        tasks::{extract::grouped_int4::Int4ExtractError, ner::NerError,
+            source_planning::{SourcePlanningError, grouped_int4::Int4SourceError}}};
+    match error {
+        Int4SourceError::Cancelled(kind) => cancelled(kind),
+        Int4SourceError::Planning(SourcePlanningError::AllocationRefused
+            | SourcePlanningError::InputBudget | SourcePlanningError::ContextBudget
+            | SourcePlanningError::Ner(NerError::AllocationRefused)) =>
+            Failure::new(ErrorCode::AdmissionOrResourceLimit, "native_source_admission_refused"),
+        Int4SourceError::Planning(SourcePlanningError::OutputBudget
+            | SourcePlanningError::Ner(NerError::OutputBudgetExceeded)) =>
+            Failure::new(ErrorCode::BudgetOrTimeout, "native_source_output_budget"),
+        Int4SourceError::Planning(SourcePlanningError::Extraction(error)
+            | SourcePlanningError::Ner(NerError::Extraction(error)))
+            | Int4SourceError::Extraction(Int4ExtractError::Extraction(error)) => extraction_failure(error),
+        Int4SourceError::Extraction(Int4ExtractError::Native(Int4JsonError::Native(error))) =>
+            host_failure(HostedError::Int4(Int4HostError::Native(error))),
+        Int4SourceError::Extraction(Int4ExtractError::Native(Int4JsonError::Decode(error))) => decode_failure(error),
+        Int4SourceError::Extraction(Int4ExtractError::Identity
+            | Int4ExtractError::Native(Int4JsonError::ModelIdentity | Int4JsonError::WorkMismatch)) =>
+            Failure::new(ErrorCode::ArtifactIntegrityOrFormatOrVersion, "native_source_execution_identity"),
+        _ => Failure::new(ErrorCode::StructuredTaskNoResult, "native_source_no_result"),
+    }
+}
+fn extraction_failure(error: crate::tasks::extract::ExtractError) -> Failure {
+    use crate::{grammar::schema::SchemaError, tasks::extract::ExtractError};
+    match error {
+        ExtractError::Decode(error) => decode_failure(error),
+        ExtractError::AllocationRefused | ExtractError::Schema(SchemaError::Resource { .. }) =>
+            Failure::new(ErrorCode::AdmissionOrResourceLimit, "native_source_admission_refused"),
+        ExtractError::OutputBudgetExceeded => Failure::new(ErrorCode::BudgetOrTimeout, "native_source_output_budget"),
+        _ => Failure::new(ErrorCode::StructuredTaskNoResult, "native_source_no_result"),
+    }
+}
+fn decode_failure(error: crate::native_engine::constrained::JsonDecodeError) -> Failure {
+    use crate::{grammar::mask::MaskOracleError, native_engine::constrained::JsonDecodeError};
+    match error {
+        JsonDecodeError::Cancelled(kind) => cancelled(kind),
+        JsonDecodeError::BudgetExceeded(_)
+            | JsonDecodeError::Mask(MaskOracleError::WorkBudgetExceeded { .. } | MaskOracleError::WorkCounterOverflow) =>
+            Failure::new(ErrorCode::BudgetOrTimeout, "native_source_decode_budget"),
+        JsonDecodeError::AllocationRefused => Failure::new(ErrorCode::AdmissionOrResourceLimit, "native_source_admission_refused"),
+        // A stopped physical host carries the authoritative cancellation kind;
+        // a bare mask checkpoint has no evidence that it was a user request.
+        _ => Failure::new(ErrorCode::StructuredTaskNoResult, "native_source_no_result"),
     }
 }
 

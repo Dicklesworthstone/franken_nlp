@@ -7,6 +7,8 @@ mod snapshot;
 mod classify;
 mod assay;
 pub use assay::{Int4AssayHostLimits, Int4AssayHostRequirements, Int4AssayOperation};
+mod assay_ner;
+pub use assay_ner::{Int4NerAssayHostLimits, Int4NerAssayHostRequirements};
 mod sentiment;
 pub use sentiment::Int4SentimentHostLimits;
 mod judge;

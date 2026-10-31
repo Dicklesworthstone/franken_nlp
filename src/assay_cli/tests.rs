@@ -6,6 +6,7 @@ fn command(args: &[&str]) -> ScoredCommand {
     match AssayCommand::from_matches(args[0], &matches).unwrap() {
         AssayCommand::Scored(command) => command,
         AssayCommand::Native(_) => panic!("supplied-observation fixture selected a native backend"),
+        AssayCommand::NativeNer(_) => panic!("supplied-observation fixture selected native NER"),
     }
 }
 struct NoRead;

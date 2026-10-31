@@ -102,7 +102,7 @@ fn calibration_transport_requires_exact_pin_native_fit_envelope_and_authenticate
         observed_date: assay::calibrate::parse_date("2026-06-01").unwrap(),
         shift: crate::calibration::ShiftAssessment::InDistribution,
     };
-    let valid_transport = encode("calibrate", &serde_json::json!({"body":{},"seal":{}}), limits).unwrap();
+    let valid_transport = encode(NATIVE_PROTOCOL, "calibrate", &serde_json::json!({"body":{},"seal":{}}), limits).unwrap();
     let envelope: serde_json::Value = serde_json::from_slice(&valid_transport).unwrap();
     for field in 0..8 {
         let mut value = envelope.clone();
@@ -293,15 +293,15 @@ fn receipt_namespace_preflight_uses_the_actual_commitment_contract_without_a_mod
 #[test]
 fn native_report_framing_is_complete_bounded_and_not_supplied_observation_evidence() {
     let report = serde_json::json!({"classification":{"examples":20},"activation_authority":false});
-    let limits = Limits::default(); let bytes = encode("eval", &report, limits).unwrap();
+    let limits = Limits::default(); let bytes = encode(NATIVE_PROTOCOL, "eval", &report, limits).unwrap();
     assert_eq!(bytes.last(), Some(&b'\n'));
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["protocol"], NATIVE_PROTOCOL); assert_eq!(value["evidence"], "native_model_replay");
     assert_eq!(value["activation_authority"], false);
     let mut exact = limits; exact.max_output_bytes = bytes.len();
-    assert_eq!(encode("eval", &report, exact).unwrap(), bytes);
+    assert_eq!(encode(NATIVE_PROTOCOL, "eval", &report, exact).unwrap(), bytes);
     exact.max_output_bytes -= 1;
-    assert!(encode("eval", &report, exact).is_err());
+    assert!(encode(NATIVE_PROTOCOL, "eval", &report, exact).is_err());
 }
 
 #[test]

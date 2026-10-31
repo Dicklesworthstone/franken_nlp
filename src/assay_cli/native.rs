@@ -7,13 +7,13 @@ use crate::{native_engine::{int4::PackedInt4Kernel, simd::Int8KernelKind,
 
 mod schema;
 #[cfg(feature = "asupersync-runtime")]
-mod runtime;
+pub(super) mod runtime;
 #[cfg(test)] mod tests;
 
 const NATIVE_PROTOCOL: &str = "fnlp.assay.native-int4";
-const MIB: u64 = 1024 * 1024;
-const ALLOCATOR_BYTES: u64 = 64 * MIB;
-const CLEANUP_BYTES: u64 = 65_536;
+pub(super) const MIB: u64 = 1024 * 1024;
+pub(super) const ALLOCATOR_BYTES: u64 = 64 * MIB;
+pub(super) const CLEANUP_BYTES: u64 = 65_536;
 
 #[derive(Args)]
 struct Arguments {
@@ -296,8 +296,8 @@ fn application_input(path: Option<&Path>, digest: Option<&str>, date: Option<&st
     Ok(Some(ApplicationInput { path: path.to_owned(), pin,
         options: assay::calibrate::ApplyOptions { observed_date, shift } }))
 }
-fn file_path(path: &Path) -> bool { !path.as_os_str().is_empty() && path.as_os_str() != "-" }
-fn model_input(path: Option<&Path>, digest: Option<&str>, width: usize)
+pub(super) fn file_path(path: &Path) -> bool { !path.as_os_str().is_empty() && path.as_os_str() != "-" }
+pub(super) fn model_input(path: Option<&Path>, digest: Option<&str>, width: usize)
     -> Result<(Int4SnapshotPin, Int4SnapshotRequirements), Failure> {
     if path.is_none_or(|path| !file_path(path)) { return Err(invalid_options()); }
     let digest = digest.ok_or_else(invalid_options)?;
@@ -309,9 +309,9 @@ fn model_input(path: Option<&Path>, digest: Option<&str>, width: usize)
     let need = Int4SnapshotRequirements::for_group_width(width).map_err(|_| invalid_options())?;
     Ok((Int4SnapshotPin { group_width: width, model_content_sha256 }, need))
 }
-fn mib(value: u64) -> Result<u64, Failure> {
+pub(super) fn mib(value: u64) -> Result<u64, Failure> {
     value.checked_mul(MIB).filter(|&bytes| bytes != 0).ok_or_else(invalid_options)
 }
-fn sum(values: &[u64]) -> Result<u64, Failure> {
+pub(super) fn sum(values: &[u64]) -> Result<u64, Failure> {
     values.iter().try_fold(0_u64, |total, &value| total.checked_add(value).ok_or_else(invalid_options))
 }
