@@ -25,6 +25,7 @@ use super::{
 };
 
 pub const INT4_JSON_EXECUTION: &str = "grouped-int4-constrained-json-final-prefill-head-v1";
+pub mod cohort;
 
 /// Group dots, MACs and attention pairs are additional to JSON/mask work.
 /// The KV ceiling prices the engine's complete resident capacity.
