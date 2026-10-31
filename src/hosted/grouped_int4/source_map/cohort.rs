@@ -4,6 +4,7 @@ use crate::tasks::source_planning::grouped_int4::long::cohort::{
     Int4SourceMapCohortBudget, Int4SourceMapCohortMemoryLimits,
     Int4SourceMapCohortRequirement, Int4SourceMapCohortRun,
 };
+mod aggregate;
 
 impl Int4SourceMapConfig {
     /// Pre-IO peak for a simultaneous raw source-map window. Full document

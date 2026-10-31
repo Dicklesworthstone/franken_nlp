@@ -2039,6 +2039,12 @@ save follows complete-document preflight.
 
 Library callers use `Int4KeyphraseLimits` and
 `NlpEngine::reduce_int4_keyphrases_document` with `Int4SourceMapConfig`.
+`NlpEngine::reduce_int4_keyphrases_document_cohorts` additionally runs each
+map window through shared native decoder layers before the same complete
+exact-text ranking. Its result contains the original `.document` plus physical
+`.cohorts` statistics. The configured `mapping.reduction.map_batch_chunks`
+selects the width; all chunk plans, native/decoder peak memory, complete
+candidate/evidence frontier and final output must be admitted together.
 The complete native candidate union is deterministic for fixed native
 outputs; model selection is not a recall guarantee, chunk boundaries may
 split phrases, and single-context equivalence remains unestablished.
@@ -2262,7 +2268,14 @@ completed snapshot survives a later task error.
 
 The library surfaces are `SourceTaskPlanner::plan_int4_map_with_control`,
 `NlpEngine::map_int4_source`, and `NlpEngine::summarize_int4_source`, with
-`Int4SourceMapConfig` and `Int4SummaryLimits`. This remains the explicit
+`Int4SourceMapConfig` and `Int4SummaryLimits`.
+`NlpEngine::summarize_int4_source_cohorts` uses the same summary limits and
+complete bullet/evidence union with native chunk cohorts selected by
+`mapping.reduction.map_batch_chunks`. Its `.document` retains the original
+aggregate semantics and `.cohorts` reports physical execution statistics;
+every candidate is retained until the complete final selection. Native
+cohorts do not add neural synthesis or hierarchical reduction.
+This remains the explicit
 source-inventoried candidate rail. Model-present execution, quality,
 performance and release qualification have not been established by these
 implementation fixtures.

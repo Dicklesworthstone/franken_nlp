@@ -6,12 +6,19 @@ use crate::{native_engine::lmhead::NANBEIGE_VOCAB_SIZE,
 
 pub(super) trait SourceDriver {
     fn capacity(&self) -> usize;
+    /// Resident row capacity. Serial engines reserve their full fixed context;
+    /// exact-sized cohort rows may retain only the sealed row's own context.
+    fn context_for(&self, _: &PreparedInt4SourceTask) -> Result<usize, Int4SourceError> { Ok(self.capacity()) }
     fn group_width(&self) -> usize;
     fn clean(&self) -> bool;
     fn check_model(&self, identity: &ExecutionIdentity) -> Result<(), Int4SourceError>;
     fn checkpoint(&mut self) -> Result<(), Int4SourceError>;
     fn run(&mut self, plan: &PreparedInt4SourceTask, identity: &ExecutionIdentity)
         -> Result<Int4SourceTaskRun, Int4SourceError>;
+    /// None performs no work. Existing serial passes preserve their original
+    /// native-row -> independent-verification -> next-row failure ordering.
+    fn run_batch(&mut self, _: &[PreparedInt4SourceTask], _: &[ExecutionIdentity])
+        -> Result<Option<Vec<Int4SourceTaskRun>>, Int4SourceError> { Ok(None) }
 }
 pub(super) struct NativeDriver<'e, 'w, 'v, 'c, C> {
     pub(super) engine: &'e mut StrictInt4Engine<'w>,
@@ -49,12 +56,13 @@ pub(super) fn preflight(plans: &[PreparedInt4SourceTask], admitted: &[ExecutionI
         return Err(Int4SourceMapError::Admission);
     }
     let width = driver.group_width();
-    let required = Int4MemoryRequirement::for_context(driver.capacity(), width)
-        .map_err(|_| Int4SourceMapError::Admission)?;
     for (plan, identity) in plans.iter().zip(admitted) {
         plan.verify_identity(identity)?;
         driver.check_model(identity)?;
-        if plan.group_width() != width || plan.planned_work().forward_positions > driver.capacity() as u64
+        let context = driver.context_for(plan)?;
+        let required = Int4MemoryRequirement::for_context(context, width)
+            .map_err(|_| Int4SourceMapError::Admission)?;
+        if context > driver.capacity() || plan.group_width() != width || plan.planned_work().forward_positions > context as u64
             || required.kv_bytes > plan.max_kv_bytes() || required.kv_bytes > plan.task_budget().max_kv_bytes {
             return Err(Int4SourceMapError::Admission);
         }

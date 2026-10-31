@@ -3,8 +3,10 @@
 //! top-k runs only once at the complete root. This is not neural synthesis.
 use super::*;
 use super::execution::{SourceDriver, NativeDriver, check_run, mask_charge, original_spans, preflight};
+use super::cohort::{Int4SourceMapCohortBudget, Int4SourceMapCohortStats, COHORT_ENVELOPE_BYTES};
 use crate::{
     corpus::summarize::{CorpusSummaryError, CorpusSummaryLimits, CorpusSummaryResult, CorpusSummaryTask, SummaryPass, check_bytes},
+    native_engine::{int4::PackedInt4Kernel, strict_int4::Int4ModelWeights},
     tasks::{mapreduce::CHUNK_PROFILE, summarize::{SummaryResult, CitationGuarantee, SummarySemanticSupport}},
 };
 
@@ -12,6 +14,7 @@ use crate::{
 pub mod synthesis;
 
 pub const INT4_CORPUS_SUMMARY_EXECUTION: &str = "grouped-int4-cited-summary-map-exact-reduce-v1";
+pub const INT4_CORPUS_SUMMARY_COHORT_EXECUTION: &str = "grouped-int4-cited-summary-cohorts-exact-reduce-v1";
 const SUMMARY_SEMANTICS: &str = "exact-bullet-evidence-union-no-neural-synthesis-v1";
 
 #[derive(Clone, Copy, Debug)]
@@ -98,6 +101,14 @@ pub struct Int4CorpusSummaryRun {
     pub verification_scan_steps: u64,
     pub summary: CorpusSummaryResult,
 }
+#[derive(Serialize)]
+pub struct Int4CorpusSummaryCohortRun {
+    pub schema_version: u32,
+    pub execution: &'static str,
+    /// Identical exact union and final ranking, with physical map_batches.
+    pub document: Int4CorpusSummaryRun,
+    pub cohorts: Int4SourceMapCohortStats,
+}
 impl Int4SourceMapPreflight {
     pub fn verify_summary_completed(&self, run: &Int4CorpusSummaryRun) -> Result<(), Int4CorpusSummaryError> {
         let s = &run.summary;
@@ -142,7 +153,21 @@ impl PreparedInt4SourceMap<'_> {
         let limits = self.limits;
         self.execute_summary_with_driver(admitted, summary, NativeDriver { engine, vocabulary, control, limits })
     }
-    fn execute_summary_with_driver<D: SourceDriver>(self, admitted: &[ExecutionIdentity],
+    /// Run real native chunk cohorts directly into the existing exact cited
+    /// union. Every candidate survives until the one final complete-root top-k.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_summary_cohorts_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
+        weights: &Int4ModelWeights, vocabulary: &ExtractionVocabulary, summary: Int4SummaryLimits,
+        budget: Int4SourceMapCohortBudget, kernel: PackedInt4Kernel, control: &mut C)
+        -> Result<Int4CorpusSummaryCohortRun, Int4CorpusSummaryError> {
+        checkpoint(control)?;
+        self.check_summary(summary)?;
+        let mut cohorts = Int4SourceMapCohortStats::default();
+        let driver = self.aggregate_driver(admitted, weights, vocabulary, budget, kernel, &mut cohorts, control)?;
+        let document = self.execute_summary_with_driver(admitted, summary, driver)?;
+        finish_cohorts(document, cohorts, summary.max_result_bytes, control)
+    }
+    pub(super) fn execute_summary_with_driver<D: SourceDriver>(self, admitted: &[ExecutionIdentity],
         limits: Int4SummaryLimits, mut driver: D) -> Result<Int4CorpusSummaryRun, Int4CorpusSummaryError> {
         driver.checkpoint()?;
         let options = self.summary_options(limits)?;
@@ -184,6 +209,21 @@ impl PreparedInt4SourceMap<'_> {
         Ok(run)
     }
 }
+
+// Closed composition only; callers cannot authenticate serialized summaries
+// through this internal finalizer instead of executing the admitted model.
+pub(super) fn finish_cohorts<C: DecodeStepControl>(document: Int4CorpusSummaryRun,
+    cohorts: Int4SourceMapCohortStats, max_result_bytes: usize, control: &mut C)
+    -> Result<Int4CorpusSummaryCohortRun, Int4CorpusSummaryError> {
+    cohort::check_aggregate_stats(cohorts, document.summary.mapped_chunks, document.map_batches,
+        document.planned_model_work, document.model_work)?;
+    let run = Int4CorpusSummaryCohortRun { schema_version: 1, execution: INT4_CORPUS_SUMMARY_COHORT_EXECUTION,
+        document, cohorts };
+    let cap = max_result_bytes.checked_add(COHORT_ENVELOPE_BYTES as usize).ok_or(Int4CorpusSummaryError::Accounting)?;
+    check_bytes(&run, cap)?;
+    checkpoint(control)?;
+    Ok(run)
+}
 struct Pass<'a, D> {
     plans: &'a [PreparedInt4SourceTask],
     admitted: &'a [ExecutionIdentity],
@@ -195,16 +235,11 @@ struct Pass<'a, D> {
     mask_cap: u64,
     remaining: GroundingBudget,
 }
-impl<D: SourceDriver> SummaryPass for Pass<'_, D> {
-    type Error = Int4SourceError;
-    fn options(&self) -> SummaryOptions { self.options }
-    fn run(&mut self, chunk: &SourceChunk<'_>) -> Result<SummaryResult, Self::Error> {
-        let mut driver = self.driver.borrow_mut();
-        driver.checkpoint()?;
-        if !driver.clean() || chunk.id() != self.next_chunk { return Err(Int4SourceError::InvalidResult); }
+impl<D: SourceDriver> Pass<'_, D> {
+    fn finish(&mut self, chunk: &SourceChunk<'_>, native: Int4SourceTaskRun, driver: &mut D)
+        -> Result<SummaryResult, Int4SourceError> {
+        if chunk.id() != self.next_chunk { return Err(Int4SourceError::InvalidResult); }
         let plan = self.plans.get(chunk.id()).ok_or(Int4SourceError::InvalidResult)?;
-        let identity = self.admitted.get(chunk.id()).ok_or(Int4SourceError::InvalidResult)?;
-        let native = driver.run(plan, identity)?;
         check_run(plan, &native, self.mask_cap)?;
         if !driver.clean() { return Err(Int4SourceError::InvalidResult); }
         // Independently verify every local occurrence under the map's one
@@ -217,6 +252,39 @@ impl<D: SourceDriver> SummaryPass for Pass<'_, D> {
         self.next_chunk += 1;
         driver.checkpoint()?;
         Ok(summary)
+    }
+}
+impl<D: SourceDriver> SummaryPass for Pass<'_, D> {
+    type Error = Int4SourceError;
+    fn options(&self) -> SummaryOptions { self.options }
+    fn run(&mut self, chunk: &SourceChunk<'_>) -> Result<SummaryResult, Self::Error> {
+        let driver = self.driver;
+        let mut driver = driver.borrow_mut();
+        driver.checkpoint()?;
+        if !driver.clean() || chunk.id() != self.next_chunk { return Err(Int4SourceError::InvalidResult); }
+        let plan = self.plans.get(chunk.id()).ok_or(Int4SourceError::InvalidResult)?;
+        let identity = self.admitted.get(chunk.id()).ok_or(Int4SourceError::InvalidResult)?;
+        let native = driver.run(plan, identity)?;
+        self.finish(chunk, native, &mut *driver)
+    }
+    fn run_batch(&mut self, chunks: &[SourceChunk<'_>]) -> Result<Option<Vec<MapOutput<SummaryResult>>>, Self::Error> {
+        let end = self.next_chunk.checked_add(chunks.len()).ok_or(Int4SourceError::InvalidResult)?;
+        if chunks.is_empty() || chunks.iter().enumerate().any(|(index, chunk)| chunk.id() != self.next_chunk + index) {
+            return Err(Int4SourceError::InvalidResult);
+        }
+        let driver = self.driver;
+        let mut driver = driver.borrow_mut();
+        if !driver.clean() { return Err(Int4SourceError::InvalidResult); }
+        let plans = self.plans.get(self.next_chunk..end).ok_or(Int4SourceError::InvalidResult)?;
+        let admitted = self.admitted.get(self.next_chunk..end).ok_or(Int4SourceError::InvalidResult)?;
+        let Some(rows) = driver.run_batch(plans, admitted)? else { return Ok(None); };
+        if rows.len() != chunks.len() { return Err(Int4SourceError::InvalidResult); }
+        let mut output = Vec::new(); output.try_reserve_exact(chunks.len()).map_err(|_| SourcePlanningError::AllocationRefused)?;
+        for (chunk, native) in chunks.iter().zip(rows) {
+            driver.checkpoint()?;
+            output.push(MapOutput { chunk_id: chunk.id(), value: self.finish(chunk, native, &mut *driver)? });
+        }
+        Ok(Some(output))
     }
 }
 #[cfg(test)] mod tests;

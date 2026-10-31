@@ -110,6 +110,13 @@ impl PreparedInt4SourceMap<'_> {
         weights: &Int4ModelWeights, vocabulary: &ExtractionVocabulary,
         budget: Int4SourceMapCohortBudget, kernel: PackedInt4Kernel, control: &mut C)
         -> Result<Int4SourceMapCohortRun, Int4SourceMapError> {
+        self.check_cohort_model(admitted, weights, control)?;
+        self.execute_cohorts_with_driver(admitted, vocabulary, budget,
+            Native { weights, vocabulary, budget, kernel }, control)
+    }
+
+    fn check_cohort_model<C: DecodeStepControl>(&self, admitted: &[ExecutionIdentity],
+        weights: &Int4ModelWeights, control: &mut C) -> Result<(), Int4SourceMapError> {
         checkpoint(control)?;
         self.check_cohort_shape()?;
         if admitted.len() != self.plans.len() || weights.group_width() != self.group_width() {
@@ -119,8 +126,7 @@ impl PreparedInt4SourceMap<'_> {
             checkpoint(control)?;
             constrained_int4::check_model(identity, weights.identity()).map_err(Int4SourceError::from)?;
         }
-        self.execute_cohorts_with_driver(admitted, vocabulary, budget,
-            Native { weights, vocabulary, budget, kernel }, control)
+        Ok(())
     }
 
     fn check_cohort_shape(&self) -> Result<(), Int4SourceMapError> {
@@ -132,12 +138,12 @@ impl PreparedInt4SourceMap<'_> {
         Ok(())
     }
 
-    // Private scripted seam only. Public execution requires real immutable
-    // model weights and never authenticates caller-supplied result records.
-    fn execute_cohorts_with_driver<D: CohortDriver, C: DecodeStepControl>(self,
+    /// Shared raw-map and aggregate admission. Inspect even the final chunk's
+    /// exact controls, vocabulary, masks, identity and capacity before ANY
+    /// native cohort is allocated; later windows never renew these allowances.
+    pub(super) fn preflight_cohorts<C: DecodeStepControl>(&self,
         admitted: &[ExecutionIdentity], vocabulary: &ExtractionVocabulary,
-        budget: Int4SourceMapCohortBudget, driver: D, control: &mut C)
-        -> Result<Int4SourceMapCohortRun, Int4SourceMapError> {
+        budget: Int4SourceMapCohortBudget, control: &mut C) -> Result<(), Int4SourceMapError> {
         checkpoint(control)?;
         check_budget(self.cohort_requirements(budget.context_limit)?, budget)?;
         if admitted.len() != self.plans.len() { return Err(Int4SourceMapError::Admission); }
@@ -152,6 +158,16 @@ impl PreparedInt4SourceMap<'_> {
                 budget: row_budget(plan, context, self.limits)? }, vocabulary)?;
         }
         checkpoint(control)?;
+        Ok(())
+    }
+
+    // Private scripted seam only. Public execution requires real immutable
+    // model weights and never authenticates caller-supplied result records.
+    fn execute_cohorts_with_driver<D: CohortDriver, C: DecodeStepControl>(self,
+        admitted: &[ExecutionIdentity], vocabulary: &ExtractionVocabulary,
+        budget: Int4SourceMapCohortBudget, driver: D, control: &mut C)
+        -> Result<Int4SourceMapCohortRun, Int4SourceMapError> {
+        self.preflight_cohorts(admitted, vocabulary, budget, control)?;
         let control = RefCell::new(control);
         let mut task = Executor { plans: &self.plans, admitted, driver, control: &control,
             next: 0, masks: 0, remaining: self.limits.verification, limits: self.limits,
@@ -178,6 +194,65 @@ impl PreparedInt4SourceMap<'_> {
         checkpoint(&mut **control.borrow_mut())?;
         Ok(result)
     }
+}
+
+/// Private native adapter for the existing exact summary/keyphrase reducers.
+/// It borrows the invocation's one control and physical ledger. A completed
+/// cohort travels directly into the original semantic pass, never through a
+/// public replay interface or a retained raw document intermediate.
+pub(super) struct AggregateDriver<'w, 'v, 'c, 's, C> {
+    native: Native<'w, 'v>,
+    control: &'c mut C,
+    stats: &'s mut Int4SourceMapCohortStats,
+    limits: Int4SourceMapLimits,
+}
+impl PreparedInt4SourceMap<'_> {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn aggregate_driver<'w, 'v, 'c, 's, C: DecodeStepControl>(&self,
+        admitted: &[ExecutionIdentity], weights: &'w Int4ModelWeights, vocabulary: &'v ExtractionVocabulary,
+        budget: Int4SourceMapCohortBudget, kernel: PackedInt4Kernel,
+        stats: &'s mut Int4SourceMapCohortStats, control: &'c mut C)
+        -> Result<AggregateDriver<'w, 'v, 'c, 's, C>, Int4SourceMapError> {
+        self.check_cohort_model(admitted, weights, control)?;
+        self.preflight_cohorts(admitted, vocabulary, budget, control)?;
+        Ok(AggregateDriver { native: Native { weights, vocabulary, budget, kernel },
+            control, stats, limits: self.limits })
+    }
+}
+impl<C: DecodeStepControl> execution::SourceDriver for AggregateDriver<'_, '_, '_, '_, C> {
+    fn capacity(&self) -> usize { self.native.budget.context_limit }
+    fn context_for(&self, plan: &PreparedInt4SourceTask) -> Result<usize, Int4SourceError> {
+        usize::try_from(plan.planned_work().forward_positions).map_err(|_| Int4SourceError::InvalidResult)
+    }
+    fn group_width(&self) -> usize { self.native.weights.group_width() }
+    // Engines are constructed and physically dropped inside each run_batch.
+    fn clean(&self) -> bool { true }
+    fn check_model(&self, identity: &ExecutionIdentity) -> Result<(), Int4SourceError> {
+        constrained_int4::check_model(identity, self.native.weights.identity()).map_err(Into::into)
+    }
+    fn checkpoint(&mut self) -> Result<(), Int4SourceError> { checkpoint(self.control) }
+    fn run(&mut self, _: &PreparedInt4SourceTask, _: &ExecutionIdentity)
+        -> Result<Int4SourceTaskRun, Int4SourceError> {
+        // The grouped reducer hook is mandatory for this private adapter.
+        Err(Int4SourceError::InvalidResult)
+    }
+    fn run_batch(&mut self, plans: &[PreparedInt4SourceTask], admitted: &[ExecutionIdentity])
+        -> Result<Option<Vec<Int4SourceTaskRun>>, Int4SourceError> {
+        let run = self.native.execute(plans, admitted, self.limits, self.control)?;
+        validate_group(plans, &run)?;
+        *self.stats = accumulate(*self.stats, &run)?;
+        Ok(Some(run.sequences))
+    }
+}
+
+/// Scalar aggregate envelopes must reconcile with the physical native ledger.
+pub(super) fn check_aggregate_stats(stats: Int4SourceMapCohortStats, chunks: usize, batches: usize,
+    planned: Int4Work, actual: Int4Work) -> Result<(), Int4SourceError> {
+    if stats.chunks != chunks as u64 || stats.cohorts != batches as u64 || batches == 0
+        || stats.planned_work != planned || stats.model_work != actual {
+        return Err(Int4SourceError::InvalidResult);
+    }
+    Ok(())
 }
 
 fn requirement(native: Int4MemoryRequirement, count: usize, tokens: u64, bytes: u64)
@@ -345,3 +420,4 @@ fn accumulate(previous: Int4SourceMapCohortStats, run: &Int4SourceCohortRun)
 }
 
 #[cfg(test)] mod tests;
+#[cfg(test)] mod aggregate_tests;

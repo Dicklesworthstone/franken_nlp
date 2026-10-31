@@ -122,6 +122,17 @@ success; a drained stream can still contain rejected documents.
   collection of schema/source plans.
 - `NlpEngine::execute_int4_source_cohort` executes prepared NER, keyphrase,
   summary, and passage-QA plans, including mixed source-task kinds.
+- `NlpEngine::summarize_int4_source_cohorts` and
+  `NlpEngine::reduce_int4_keyphrases_document_cohorts` execute native chunk
+  windows directly into the existing complete-document summary/keyphrase
+  reducers. Their `.document` retains the existing exact bullet/evidence union
+  or global phrase ranking; `.cohorts` reports physical execution counts.
+  They use `Int4SourceMapConfig` plus `Int4SummaryLimits` or
+  `Int4KeyphraseLimits`. All candidates survive intermediate reduction and
+  top-k applies only at the complete final root. The map's occurrence budget
+  and the reducer's independent verification allowance remain separate and
+  nonrenewable. Final output omits native token transcripts, while memory
+  admission still covers every transient row and the complete evidence frontier.
 - The finite-plan methods use `SourceLimits`: context and mask limits are per
   row, preparation covers **all** transferred plans and vocabulary/runtime
   state, and one invocation deadline/checkpoint budget covers the collection.

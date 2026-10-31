@@ -135,3 +135,112 @@ fn duplicate_chunk_admission_is_rejected_even_when_it_has_no_bullets() {
     let p = plan("aaaa"); let mut task = CorpusSummaryTask::new(Fixture, CorpusSummaryLimits::default()).unwrap();
     assert!(task.map_batch(p.chunks()).is_ok()); assert!(task.map_batch(p.chunks()).is_err());
 }
+
+struct Batched { calls: usize, widths: Vec<usize>, fault: Option<usize> }
+impl SummaryPass for Batched {
+    type Error = SummaryError;
+    fn options(&self) -> SummaryOptions { SummaryOptions::default() }
+    fn run(&mut self, _: &SourceChunk<'_>) -> Result<SummaryResult, Self::Error> {
+        panic!("an available summary batch must not fall back to serial inference")
+    }
+    fn run_batch(&mut self, chunks: &[SourceChunk<'_>])
+        -> Result<Option<Vec<MapOutput<SummaryResult>>>, Self::Error> {
+        self.calls += 1; self.widths.push(chunks.len());
+        if self.fault == Some(6) { return Err(SummaryError::OutputBudgetExceeded); }
+        assert_ne!(self.fault, Some(7), "scripted summary batch unwind");
+        let mut rows: Vec<_> = chunks.iter().map(|chunk| MapOutput {
+            chunk_id: chunk.id(), value: Fixture.run(chunk).unwrap(),
+        }).collect();
+        match self.fault {
+            Some(0) => { rows.pop(); },
+            Some(1) => rows.push(MapOutput { chunk_id: chunks[0].id(), value: Fixture.run(&chunks[0]).unwrap() }),
+            Some(2) => { let first = rows[0].chunk_id; rows[1].chunk_id = first; },
+            Some(3) => rows.reverse(),
+            Some(4) => rows.last_mut().unwrap().chunk_id += 1,
+            Some(5) => { rows.last_mut().unwrap().value.bullets[0].citations[0].spans.pop(); },
+            Some(8) => rows.last_mut().unwrap().value.numerics_profile = "wrong-profile".to_owned(),
+            _ => {},
+        }
+        Ok(Some(rows))
+    }
+}
+fn batched(fault: Option<usize>) -> Batched { Batched { calls: 0, widths: Vec::new(), fault } }
+
+#[test]
+fn native_batch_hook_preserves_every_candidate_until_complete_global_ranking() {
+    let p = plan("aaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let mut serial = CorpusSummaryTask::new(Fixture, CorpusSummaryLimits::default()).unwrap();
+    let expected = mapreduce::execute(&p, &mut serial, ExecutionLimits::default(), || Ok(())).unwrap()
+        .into_value().into_ranked(1, 100000).unwrap();
+    let expected = canonjson::canonical_bytes(&expected).unwrap();
+    for fan in [2, 3, 7] { for width in [1, 2, 4] {
+        let mut task = CorpusSummaryTask::new(batched(None), CorpusSummaryLimits::default()).unwrap();
+        let aggregate = mapreduce::execute(&p, &mut task, ExecutionLimits {
+            reduce_fan_in: fan, map_batch_chunks: width, ..ExecutionLimits::default()
+        }, || Ok(())).unwrap().into_value();
+        assert_eq!(aggregate.bullets().len(), 3);
+        let result = aggregate.into_ranked(1, 100000).unwrap();
+        assert_eq!(result.bullets[0].text, "global");
+        assert_eq!(result.bullets[0].evidence.len(), p.chunks().len());
+        assert_eq!(result.omitted_bullets, 2);
+        assert_eq!(canonjson::canonical_bytes(&result).unwrap(), expected);
+        assert_eq!(task.pass().calls, p.chunks().len().div_ceil(width));
+        assert_eq!(task.pass().widths, p.chunks().chunks(width).map(|c| c.len()).collect::<Vec<_>>());
+    } }
+}
+
+#[test]
+fn malformed_summary_batch_ids_or_cardinality_fail_before_any_evidence_scan() {
+    let p = plan("aaaaaaaa"); let limits = CorpusSummaryLimits::default();
+    for fault in 0..5 {
+        let mut task = CorpusSummaryTask::new(batched(Some(fault)), limits).unwrap();
+        assert!(task.map_batch(p.chunks()).is_err());
+        assert_eq!(task.scan_steps_remaining(), limits.max_scan_steps);
+        task.pass.fault = None;
+        assert!(matches!(task.map_batch(p.chunks()), Err(CorpusSummaryError::Poisoned)));
+        assert_eq!(task.pass().calls, 1);
+    }
+    let mut task = CorpusSummaryTask::new(batched(None), limits).unwrap();
+    assert!(task.map_batch(&p.chunks()[1..]).is_err());
+    assert_eq!(task.pass().calls, 0);
+}
+
+#[test]
+fn summary_batch_evidence_profile_errors_and_unwinds_permanently_poison_the_task() {
+    let p = plan("aaaaaaaa");
+    for fault in 5..=8 {
+        let mut task = CorpusSummaryTask::new(batched(Some(fault)), CorpusSummaryLimits::default()).unwrap();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task.map_batch(p.chunks())));
+        if fault == 7 { assert!(outcome.is_err()); }
+        else { assert!(outcome.unwrap().is_err()); }
+        task.pass.fault = None;
+        assert!(matches!(task.map_batch(p.chunks()), Err(CorpusSummaryError::Poisoned)));
+        assert_eq!(task.pass().calls, 1);
+    }
+}
+
+#[test]
+fn summary_batch_shares_one_scan_budget_and_default_serial_stops_at_first_invalid_row() {
+    let p = plan("aaaaaaaa");
+    let mut task = CorpusSummaryTask::new(batched(None), CorpusSummaryLimits { max_scan_steps: 96,
+        ..CorpusSummaryLimits::default() }).unwrap();
+    assert!(task.map_batch(p.chunks()).is_err());
+    assert_eq!(task.scan_steps_remaining(), 0);
+    assert!(matches!(task.map_batch(p.chunks()), Err(CorpusSummaryError::Poisoned)));
+    assert_eq!(task.pass().calls, 1);
+
+    struct Serial { calls: usize }
+    impl SummaryPass for Serial {
+        type Error = SummaryError;
+        fn options(&self) -> SummaryOptions { SummaryOptions::default() }
+        fn run(&mut self, chunk: &SourceChunk<'_>) -> Result<SummaryResult, Self::Error> {
+            self.calls += 1;
+            let mut result = Fixture.run(chunk)?;
+            result.bullets[0].citations[0].spans.clear();
+            Ok(result)
+        }
+    }
+    let mut task = CorpusSummaryTask::new(Serial { calls: 0 }, CorpusSummaryLimits::default()).unwrap();
+    assert!(task.map_batch(p.chunks()).is_err());
+    assert_eq!(task.pass().calls, 1);
+}

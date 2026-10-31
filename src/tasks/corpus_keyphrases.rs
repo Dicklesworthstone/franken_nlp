@@ -32,6 +32,12 @@ pub const CORPUS_KEYPHRASE_POLICY: &str = "exact-union-support-rank-sum-source-v
 pub trait KeyphrasePass {
     fn options(&self) -> KeyphraseOptions;
     fn run(&mut self, chunk: &SourceChunk<'_>) -> Result<KeyphraseResult, KeyphraseError>;
+    /// Optional admitted native batch. Successful rows must name exactly the
+    /// requested chunk ids in source order; errors expose no partial batch.
+    /// None performs no work or state changes and preserves serial run/verify
+    /// ordering. Memory and nonrenewable work admission remain pass-owned.
+    fn run_batch(&mut self, _chunks: &[SourceChunk<'_>])
+        -> Result<Option<Vec<MapOutput<KeyphraseResult>>>, KeyphraseError> { Ok(None) }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -149,6 +155,7 @@ pub struct CorpusKeyphraseTask<P> {
     scan_remaining: u64,
     // Chosen by the concrete adapter, never inferred from a returned receipt.
     profile: &'static str,
+    next_chunk: usize,
     failed: bool,
 }
 impl<P: KeyphrasePass> CorpusKeyphraseTask<P> {
@@ -168,7 +175,7 @@ impl<P: KeyphrasePass> CorpusKeyphraseTask<P> {
     fn with_profile(pass: P, limits: CorpusKeyphraseLimits, profile: &'static str) -> Result<Self, KeyphraseError> {
         limits.validate()?;
         let options = pass.options(); options.validate()?;
-        Ok(Self { pass, options, limits, scan_remaining: limits.max_scan_work, profile, failed: false })
+        Ok(Self { pass, options, limits, scan_remaining: limits.max_scan_work, profile, next_chunk: 0, failed: false })
     }
     pub fn scan_work_remaining(&self) -> u64 { self.scan_remaining }
     pub fn pass(&self) -> &P { &self.pass }
@@ -181,15 +188,27 @@ impl<P: KeyphrasePass> MapReduceTask for CorpusKeyphraseTask<P> {
         ReductionPolicy { id: CORPUS_KEYPHRASE_POLICY, may_discard_information: true }
     }
     fn map_batch(&mut self, chunks: &[SourceChunk<'_>]) -> Result<Vec<MapOutput<Self::Value>>, Self::Error> {
-        if self.failed || self.pass.options() != self.options { return Err(KeyphraseError::InvalidOptions); }
+        if self.failed { return Err(KeyphraseError::InvalidOptions); }
         self.failed = true;
+        if chunks.is_empty() || self.pass.options() != self.options { return Err(KeyphraseError::InvalidOptions); }
+        if chunks.iter().enumerate().any(|(offset, chunk)| self.next_chunk.checked_add(offset) != Some(chunk.id())) {
+            return Err(KeyphraseError::InvalidResult);
+        }
         let mut outputs = Vec::new();
         outputs.try_reserve_exact(chunks.len()).map_err(|_| KeyphraseError::AllocationRefused)?;
-        // Sequential native maps reuse one admitted engine. This adapter makes
-        // no batched-GEMM claim; the outer map batch is an orchestration batch.
+        let batch = self.pass.run_batch(chunks)?;
+        if batch.as_ref().is_some_and(|rows| rows.len() != chunks.len()
+            || rows.iter().zip(chunks).any(|(row, chunk)| row.chunk_id != chunk.id())) {
+            return Err(KeyphraseError::InvalidResult);
+        }
+        let mut batch = batch.map(Vec::into_iter);
         for chunk in chunks {
-            let raw = self.pass.run(chunk)?;
+            let raw = match &mut batch {
+                Some(rows) => rows.next().ok_or(KeyphraseError::InvalidResult)?.value,
+                None => self.pass.run(chunk)?,
+            };
             let value = map_value(chunk, raw, self.options, self.limits, &mut self.scan_remaining, self.profile)?;
+            self.next_chunk = self.next_chunk.checked_add(1).ok_or(KeyphraseError::InvalidResult)?;
             outputs.push(MapOutput { chunk_id: chunk.id(), value });
         }
         self.failed = false;
@@ -574,5 +593,114 @@ mod tests {
                 _ => bad.max_total_mask_node_visits = 199 }
             assert!(charge(bad, &result).is_err());
         }
+    }
+
+    struct Batched { calls: usize, widths: Vec<usize>, fault: Option<usize> }
+    impl KeyphrasePass for Batched {
+        fn options(&self) -> KeyphraseOptions { KeyphraseOptions::default() }
+        fn run(&mut self, _: &SourceChunk<'_>) -> Result<KeyphraseResult, KeyphraseError> {
+            panic!("an available keyphrase batch must not fall back to serial inference")
+        }
+        fn run_batch(&mut self, chunks: &[SourceChunk<'_>])
+            -> Result<Option<Vec<MapOutput<KeyphraseResult>>>, KeyphraseError> {
+            self.calls += 1; self.widths.push(chunks.len());
+            if self.fault == Some(6) { return Err(KeyphraseError::OutputBudgetExceeded); }
+            assert_ne!(self.fault, Some(7), "scripted keyphrase batch unwind");
+            let mut fixture = Fixture { corrupt: false };
+            let mut rows: Vec<_> = chunks.iter().map(|chunk| MapOutput {
+                chunk_id: chunk.id(), value: fixture.run(chunk).unwrap(),
+            }).collect();
+            match self.fault {
+                Some(0) => { rows.pop(); },
+                Some(1) => rows.push(MapOutput { chunk_id: chunks[0].id(), value: fixture.run(&chunks[0]).unwrap() }),
+                Some(2) => { let first = rows[0].chunk_id; rows[1].chunk_id = first; },
+                Some(3) => rows.reverse(),
+                Some(4) => rows.last_mut().unwrap().chunk_id += 1,
+                Some(5) => { rows.last_mut().unwrap().value.phrases[0].spans.pop(); },
+                Some(8) => rows.last_mut().unwrap().value.numerics_profile = "wrong-profile".to_owned(),
+                _ => {},
+            }
+            Ok(Some(rows))
+        }
+    }
+    fn batched(fault: Option<usize>) -> Batched { Batched { calls: 0, widths: Vec::new(), fault } }
+
+    #[test]
+    fn batch_hook_preserves_all_candidates_evidence_and_final_global_keyphrase_ranking() {
+        let plan = chunks("Rust abc Rust def Rust abc Rust def Rust", 9);
+        let mut serial = CorpusKeyphraseTask::new(Fixture { corrupt: false }, CorpusKeyphraseLimits::default()).unwrap();
+        let expected = mapreduce::execute(&plan, &mut serial, ExecutionLimits::default(), || Ok(())).unwrap()
+            .into_value().into_ranked(1, 65536).unwrap();
+        let expected = canonjson::canonical_bytes(&expected).unwrap();
+        for fan in [2, 3, 7] { for width in [1, 2, 4] {
+            let mut task = CorpusKeyphraseTask::new(batched(None), CorpusKeyphraseLimits::default()).unwrap();
+            let aggregate = mapreduce::execute(&plan, &mut task, ExecutionLimits {
+                reduce_fan_in: fan, map_batch_chunks: width, ..ExecutionLimits::default()
+            }, || Ok(())).unwrap().into_value();
+            assert_eq!(aggregate.phrases().len(), 3);
+            let result = aggregate.into_ranked(1, 65536).unwrap();
+            assert_eq!(result.phrases[0].text, "Rust");
+            assert_eq!(result.omitted_candidates, 2);
+            assert_eq!(canonjson::canonical_bytes(&result).unwrap(), expected);
+            assert_eq!(task.pass().calls, plan.chunks().len().div_ceil(width));
+            assert_eq!(task.pass().widths, plan.chunks().chunks(width).map(|c| c.len()).collect::<Vec<_>>());
+        } }
+    }
+
+    #[test]
+    fn malformed_keyphrase_batch_ids_cardinality_and_replayed_chunks_fail_before_scanning() {
+        let plan = chunks("RustRust", 4); let limits = CorpusKeyphraseLimits::default();
+        for fault in 0..5 {
+            let mut task = CorpusKeyphraseTask::new(batched(Some(fault)), limits).unwrap();
+            assert!(task.map_batch(plan.chunks()).is_err());
+            assert_eq!(task.scan_work_remaining(), limits.max_scan_work);
+            task.pass.fault = None;
+            assert!(task.map_batch(plan.chunks()).is_err());
+            assert_eq!(task.pass().calls, 1);
+        }
+        let mut task = CorpusKeyphraseTask::new(batched(None), limits).unwrap();
+        assert!(task.map_batch(&plan.chunks()[1..]).is_err());
+        assert_eq!(task.pass().calls, 0);
+        let mut task = CorpusKeyphraseTask::new(batched(None), limits).unwrap();
+        assert!(task.map_batch(&plan.chunks()[..1]).is_ok());
+        assert!(task.map_batch(&plan.chunks()[..1]).is_err());
+        assert_eq!(task.pass().calls, 1);
+    }
+
+    #[test]
+    fn keyphrase_batch_errors_unwinds_and_late_invalid_evidence_permanently_poison() {
+        let plan = chunks("RustRust", 4);
+        for fault in 5..=8 {
+            let mut task = CorpusKeyphraseTask::new(batched(Some(fault)), CorpusKeyphraseLimits::default()).unwrap();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task.map_batch(plan.chunks())));
+            if fault == 7 { assert!(outcome.is_err()); }
+            else { assert!(outcome.unwrap().is_err()); }
+            task.pass.fault = None;
+            assert!(task.map_batch(plan.chunks()).is_err());
+            assert_eq!(task.pass().calls, 1);
+        }
+    }
+
+    #[test]
+    fn keyphrase_batch_scan_budget_never_renews_and_serial_validation_stays_interleaved() {
+        let plan = chunks("RustRust", 4);
+        let mut task = CorpusKeyphraseTask::new(batched(None), CorpusKeyphraseLimits { max_scan_work: 32,
+            ..CorpusKeyphraseLimits::default() }).unwrap();
+        assert!(task.map_batch(plan.chunks()).is_err());
+        assert_eq!(task.scan_work_remaining(), 0);
+        assert!(task.map_batch(plan.chunks()).is_err());
+        assert_eq!(task.pass().calls, 1);
+
+        struct Serial { calls: usize }
+        impl KeyphrasePass for Serial {
+            fn options(&self) -> KeyphraseOptions { KeyphraseOptions::default() }
+            fn run(&mut self, chunk: &SourceChunk<'_>) -> Result<KeyphraseResult, KeyphraseError> {
+                self.calls += 1;
+                Fixture { corrupt: true }.run(chunk)
+            }
+        }
+        let mut task = CorpusKeyphraseTask::new(Serial { calls: 0 }, CorpusKeyphraseLimits::default()).unwrap();
+        assert!(task.map_batch(plan.chunks()).is_err());
+        assert_eq!(task.pass().calls, 1);
     }
 }

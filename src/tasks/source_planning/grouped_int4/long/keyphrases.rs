@@ -3,6 +3,8 @@
 //! request fails its bounds. Ranking and top-k occur only at the complete root.
 use super::*;
 use super::execution::{SourceDriver, NativeDriver, check_run, mask_charge, original_spans, preflight};
+use super::cohort::{Int4SourceMapCohortBudget, Int4SourceMapCohortStats, COHORT_ENVELOPE_BYTES};
+use crate::native_engine::{int4::PackedInt4Kernel, strict_int4::Int4ModelWeights};
 use crate::tasks::{
     corpus_keyphrases::{CorpusKeyphraseLimits, CorpusKeyphraseResult, CorpusKeyphraseTask,
         CorpusKeyphraseWarning, KeyphrasePass, CORPUS_KEYPHRASE_POLICY, check_bytes},
@@ -11,6 +13,7 @@ use crate::tasks::{
 };
 
 pub const INT4_CORPUS_KEYPHRASE_EXECUTION: &str = "grouped-int4-keyphrase-map-exact-reduce-v1";
+pub const INT4_CORPUS_KEYPHRASE_COHORT_EXECUTION: &str = "grouped-int4-keyphrase-cohorts-exact-reduce-v1";
 pub const INT4_CORPUS_KEYPHRASE_SEMANTICS: &str = "exact-text-chunk-support-rank-no-neural-reranking-v1";
 
 /// Complete-document union and final-output limits, independent of each map's
@@ -99,6 +102,14 @@ pub struct Int4CorpusKeyphraseRun {
     pub verification_scan_work: u64,
     pub keyphrases: CorpusKeyphraseResult,
 }
+#[derive(Serialize)]
+pub struct Int4CorpusKeyphraseCohortRun {
+    pub schema_version: u32,
+    pub execution: &'static str,
+    /// Original complete union and ranking, with physical map_batches.
+    pub document: Int4CorpusKeyphraseRun,
+    pub cohorts: Int4SourceMapCohortStats,
+}
 impl Int4SourceMapPreflight {
     pub fn verify_keyphrases_completed(&self, run: &Int4CorpusKeyphraseRun) -> Result<(), Int4CorpusKeyphraseError> {
         let result = &run.keyphrases;
@@ -154,9 +165,24 @@ impl PreparedInt4SourceMap<'_> {
         let mapping = self.limits;
         self.execute_keyphrases_with_driver(admitted, limits, NativeDriver { engine, vocabulary, control, limits: mapping })
     }
+    /// Execute complete native chunk cohorts into the same exact phrase union.
+    /// Original per-chunk ranks and every occurrence are verified before one
+    /// final document-wide ranking; no intermediate candidate is discarded.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_keyphrases_cohorts_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
+        weights: &Int4ModelWeights, vocabulary: &ExtractionVocabulary, limits: Int4KeyphraseLimits,
+        budget: Int4SourceMapCohortBudget, kernel: PackedInt4Kernel, control: &mut C)
+        -> Result<Int4CorpusKeyphraseCohortRun, Int4CorpusKeyphraseError> {
+        checkpoint(control)?;
+        self.check_keyphrases(limits)?;
+        let mut cohorts = Int4SourceMapCohortStats::default();
+        let driver = self.aggregate_driver(admitted, weights, vocabulary, budget, kernel, &mut cohorts, control)?;
+        let document = self.execute_keyphrases_with_driver(admitted, limits, driver)?;
+        finish_cohorts(document, cohorts, limits.max_result_bytes, control)
+    }
     // Private scripted seam, sharing the actual native receipt and occurrence
     // validators. It is not an alternate public execution backend.
-    fn execute_keyphrases_with_driver<D: SourceDriver>(self, admitted: &[ExecutionIdentity],
+    pub(super) fn execute_keyphrases_with_driver<D: SourceDriver>(self, admitted: &[ExecutionIdentity],
         limits: Int4KeyphraseLimits, mut driver: D) -> Result<Int4CorpusKeyphraseRun, Int4CorpusKeyphraseError> {
         driver.checkpoint()?;
         let options = self.keyphrase_options(limits)?;
@@ -205,6 +231,19 @@ impl PreparedInt4SourceMap<'_> {
     }
 }
 
+pub(super) fn finish_cohorts<C: DecodeStepControl>(document: Int4CorpusKeyphraseRun,
+    cohorts: Int4SourceMapCohortStats, max_result_bytes: usize, control: &mut C)
+    -> Result<Int4CorpusKeyphraseCohortRun, Int4CorpusKeyphraseError> {
+    cohort::check_aggregate_stats(cohorts, document.keyphrases.mapped_chunks, document.map_batches,
+        document.planned_model_work, document.model_work)?;
+    let run = Int4CorpusKeyphraseCohortRun { schema_version: 1, execution: INT4_CORPUS_KEYPHRASE_COHORT_EXECUTION,
+        document, cohorts };
+    let cap = max_result_bytes.checked_add(COHORT_ENVELOPE_BYTES as usize).ok_or(Int4CorpusKeyphraseError::Accounting)?;
+    check_bytes(&run, cap)?;
+    checkpoint(control)?;
+    Ok(run)
+}
+
 struct Pass<'a, D> {
     plans: &'a [PreparedInt4SourceTask],
     admitted: &'a [ExecutionIdentity],
@@ -218,13 +257,10 @@ struct Pass<'a, D> {
     native_error: Option<Int4SourceError>,
 }
 impl<D: SourceDriver> Pass<'_, D> {
-    fn run_native(&mut self, chunk: &SourceChunk<'_>) -> Result<KeyphraseResult, Int4SourceError> {
-        let mut driver = self.driver.borrow_mut();
-        driver.checkpoint()?;
-        if !driver.clean() || chunk.id() != self.next_chunk { return Err(Int4SourceError::InvalidResult); }
+    fn finish(&mut self, chunk: &SourceChunk<'_>, native: Int4SourceTaskRun, driver: &mut D)
+        -> Result<KeyphraseResult, Int4SourceError> {
+        if chunk.id() != self.next_chunk { return Err(Int4SourceError::InvalidResult); }
         let plan = self.plans.get(chunk.id()).ok_or(Int4SourceError::InvalidResult)?;
-        let identity = self.admitted.get(chunk.id()).ok_or(Int4SourceError::InvalidResult)?;
-        let native = driver.run(plan, identity)?;
         check_run(plan, &native, self.mask_cap)?;
         if !driver.clean() { return Err(Int4SourceError::InvalidResult); }
         // Verify every local occurrence independently using the original map's
@@ -238,12 +274,50 @@ impl<D: SourceDriver> Pass<'_, D> {
         driver.checkpoint()?;
         Ok(keyphrases)
     }
+    fn run_native(&mut self, chunk: &SourceChunk<'_>) -> Result<KeyphraseResult, Int4SourceError> {
+        let driver = self.driver;
+        let mut driver = driver.borrow_mut();
+        driver.checkpoint()?;
+        if !driver.clean() || chunk.id() != self.next_chunk { return Err(Int4SourceError::InvalidResult); }
+        let plan = self.plans.get(chunk.id()).ok_or(Int4SourceError::InvalidResult)?;
+        let identity = self.admitted.get(chunk.id()).ok_or(Int4SourceError::InvalidResult)?;
+        let native = driver.run(plan, identity)?;
+        self.finish(chunk, native, &mut *driver)
+    }
+    fn run_native_batch(&mut self, chunks: &[SourceChunk<'_>])
+        -> Result<Option<Vec<MapOutput<KeyphraseResult>>>, Int4SourceError> {
+        let end = self.next_chunk.checked_add(chunks.len()).ok_or(Int4SourceError::InvalidResult)?;
+        if chunks.is_empty() || chunks.iter().enumerate().any(|(index, chunk)| chunk.id() != self.next_chunk + index) {
+            return Err(Int4SourceError::InvalidResult);
+        }
+        let driver = self.driver;
+        let mut driver = driver.borrow_mut();
+        if !driver.clean() { return Err(Int4SourceError::InvalidResult); }
+        let plans = self.plans.get(self.next_chunk..end).ok_or(Int4SourceError::InvalidResult)?;
+        let admitted = self.admitted.get(self.next_chunk..end).ok_or(Int4SourceError::InvalidResult)?;
+        let Some(rows) = driver.run_batch(plans, admitted)? else { return Ok(None); };
+        if rows.len() != chunks.len() { return Err(Int4SourceError::InvalidResult); }
+        let mut output = Vec::new(); output.try_reserve_exact(chunks.len()).map_err(|_| SourcePlanningError::AllocationRefused)?;
+        for (chunk, native) in chunks.iter().zip(rows) {
+            driver.checkpoint()?;
+            output.push(MapOutput { chunk_id: chunk.id(), value: self.finish(chunk, native, &mut *driver)? });
+        }
+        Ok(Some(output))
+    }
 }
 impl<D: SourceDriver> KeyphrasePass for Pass<'_, D> {
     fn options(&self) -> KeyphraseOptions { self.options }
     fn run(&mut self, chunk: &SourceChunk<'_>) -> Result<KeyphraseResult, KeyphraseError> {
         if self.native_error.is_some() { return Err(KeyphraseError::InvalidResult); }
         match self.run_native(chunk) {
+            Ok(result) => Ok(result),
+            Err(error) => { self.native_error = Some(error); Err(KeyphraseError::InvalidResult) }
+        }
+    }
+    fn run_batch(&mut self, chunks: &[SourceChunk<'_>])
+        -> Result<Option<Vec<MapOutput<KeyphraseResult>>>, KeyphraseError> {
+        if self.native_error.is_some() { return Err(KeyphraseError::InvalidResult); }
+        match self.run_native_batch(chunks) {
             Ok(result) => Ok(result),
             Err(error) => { self.native_error = Some(error); Err(KeyphraseError::InvalidResult) }
         }

@@ -22,6 +22,14 @@ pub trait SummaryPass {
     type Error;
     fn options(&self) -> SummaryOptions;
     fn run(&mut self, chunk: &SourceChunk<'_>) -> Result<SummaryResult, Self::Error>;
+    /// Optional admitted native batch, with one labeled result per requested
+    /// chunk in the same order. A batch error yields no partial collection.
+    /// Returning None must perform no work or change pass state: the caller
+    /// then retains serial run/verify ordering and its existing failure point.
+    /// The pass still owns native/output admission through result delivery;
+    /// this hook neither grants memory nor replenishes model work allowances.
+    fn run_batch(&mut self, _chunks: &[SourceChunk<'_>])
+        -> Result<Option<Vec<MapOutput<SummaryResult>>>, Self::Error> { Ok(None) }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -208,11 +216,22 @@ impl<P: SummaryPass> MapReduceTask for CorpusSummaryTask<P> {
         if chunks.is_empty() || self.pass.options() != self.options {
             return Err(CorpusSummaryError::Summary(SummaryError::InvalidOptions));
         }
+        if chunks.iter().enumerate().any(|(offset, chunk)| self.next_chunk.checked_add(offset) != Some(chunk.id())) {
+            return Err(CorpusSummaryError::Summary(SummaryError::InvalidResult));
+        }
         let mut outputs = Vec::new();
         outputs.try_reserve_exact(chunks.len()).map_err(|_| CorpusSummaryError::Summary(SummaryError::AllocationRefused))?;
+        let batch = self.pass.run_batch(chunks).map_err(CorpusSummaryError::Pass)?;
+        if batch.as_ref().is_some_and(|rows| rows.len() != chunks.len()
+            || rows.iter().zip(chunks).any(|(row, chunk)| row.chunk_id != chunk.id())) {
+            return Err(CorpusSummaryError::Summary(SummaryError::InvalidResult));
+        }
+        let mut batch = batch.map(Vec::into_iter);
         for chunk in chunks {
-            if chunk.id() != self.next_chunk { return Err(CorpusSummaryError::Summary(SummaryError::InvalidResult)); }
-            let raw = self.pass.run(chunk).map_err(CorpusSummaryError::Pass)?;
+            let raw = match &mut batch {
+                Some(rows) => rows.next().ok_or(CorpusSummaryError::Summary(SummaryError::InvalidResult))?.value,
+                None => self.pass.run(chunk).map_err(CorpusSummaryError::Pass)?,
+            };
             let value = match self.profile {
                 NativeSummaryProfile::Eager => map_value(chunk, raw, self.options, self.limits, &mut self.scan_remaining),
                 NativeSummaryProfile::Int8 => map_value_for_profile(chunk, raw, self.options, self.limits,
