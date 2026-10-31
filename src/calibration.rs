@@ -717,14 +717,33 @@ impl SelectiveRisk {
     }
 }
 
+#[cfg(test)]
+mod checkpoint_tests;
+
+/// Maximum row operations between cooperative metric checkpoints. The caller
+/// owns the controller; these numerical routines never create a runtime.
+const METRIC_ROWS_PER_CHECKPOINT: usize = 1024;
+
 /// Report calibration reliability on locked-test rows only.
 pub fn report_locked_test(
     locked_test: &LockedTestSet,
     calibrate: impl Fn(f64) -> Result<f64, CalibrationError>,
     acceptance_threshold: f64,
 ) -> Result<(ReliabilityMetrics, SelectiveRisk), CalibrationError> {
-    let rows = calibrated_locked_rows(locked_test, calibrate)?;
-    evaluate_locked_rows(&rows, acceptance_threshold)
+    report_locked_test_with_checkpoint::<CalibrationError>(
+        locked_test, calibrate, acceptance_threshold, &mut || Ok(()))
+}
+
+/// The hosted variant retains the caller's exact cancellation/error type.
+/// Checkpoints do not change row order, floating arithmetic, or fit authority.
+pub(crate) fn report_locked_test_with_checkpoint<E: From<CalibrationError>>(
+    locked_test: &LockedTestSet,
+    calibrate: impl Fn(f64) -> Result<f64, CalibrationError>,
+    acceptance_threshold: f64,
+    checkpoint: &mut impl FnMut() -> Result<(), E>,
+) -> Result<(ReliabilityMetrics, SelectiveRisk), E> {
+    let rows = calibrated_locked_rows(locked_test, calibrate, checkpoint)?;
+    evaluate_locked_rows(&rows, acceptance_threshold, checkpoint)
 }
 
 /// Measure percentile-bootstrap uncertainty for a locked-test-only reliability report.
@@ -738,36 +757,51 @@ pub fn bootstrap_locked_test_confidence_intervals(
     acceptance_threshold: f64,
     bootstrap: BootstrapConfig,
 ) -> Result<ReliabilityConfidenceIntervals, CalibrationError> {
-    let rows = calibrated_locked_rows(locked_test, calibrate)?;
+    bootstrap_locked_test_confidence_intervals_with_checkpoint::<CalibrationError>(
+        locked_test, calibrate, acceptance_threshold, bootstrap, &mut || Ok(()))
+}
+
+/// Cooperatively bounded uncertainty calculation for one owned invocation.
+/// Every draw still uses the original deterministic stream and reduction order.
+pub(crate) fn bootstrap_locked_test_confidence_intervals_with_checkpoint<E: From<CalibrationError>>(
+    locked_test: &LockedTestSet,
+    calibrate: impl Fn(f64) -> Result<f64, CalibrationError>,
+    acceptance_threshold: f64,
+    bootstrap: BootstrapConfig,
+    checkpoint: &mut impl FnMut() -> Result<(), E>,
+) -> Result<ReliabilityConfidenceIntervals, E> {
+    let rows = calibrated_locked_rows(locked_test, calibrate, checkpoint)?;
     // Validate threshold even before sampling so an empty replica cannot hide
     // a malformed task policy.
-    let _ = evaluate_locked_rows(&rows, acceptance_threshold)?;
+    let _ = evaluate_locked_rows(&rows, acceptance_threshold, checkpoint)?;
     let mut state = bootstrap.seed;
     let mut ece = Vec::with_capacity(bootstrap.resamples);
     let mut brier = Vec::with_capacity(bootstrap.resamples);
     let mut selective_risk = Vec::with_capacity(bootstrap.resamples);
     let mut replica = Vec::with_capacity(rows.len());
     for _ in 0..bootstrap.resamples {
+        checkpoint()?;
         replica.clear();
-        for _ in 0..rows.len() {
+        for index in 0..rows.len() {
+            if index.is_multiple_of(METRIC_ROWS_PER_CHECKPOINT) { checkpoint()?; }
             replica.push(rows[sampled_index(&mut state, rows.len())]);
         }
-        let (metrics, selective) = evaluate_locked_rows(&replica, acceptance_threshold)?;
+        let (metrics, selective) = evaluate_locked_rows(&replica, acceptance_threshold, checkpoint)?;
         ece.push(metrics.ece);
         brier.push(metrics.brier);
         selective_risk.push(selective.risk);
     }
 
-    Ok(ReliabilityConfidenceIntervals {
-        locked_test_rows: rows.len(),
-        ece: percentile_interval(&mut ece, bootstrap),
-        brier: percentile_interval(&mut brier, bootstrap),
-        selective_risk: selective_risk
-            .into_iter()
-            .collect::<Option<Vec<_>>>()
-            .map(|mut risks| percentile_interval(&mut risks, bootstrap)),
-        bootstrap,
-    })
+    checkpoint()?;
+    let ece = percentile_interval(&mut ece, bootstrap);
+    checkpoint()?;
+    let brier = percentile_interval(&mut brier, bootstrap);
+    checkpoint()?;
+    let risks = selective_risk.into_iter().collect::<Option<Vec<_>>>();
+    checkpoint()?;
+    let selective_risk = risks.map(|mut values| percentile_interval(&mut values, bootstrap));
+    checkpoint()?;
+    Ok(ReliabilityConfidenceIntervals { locked_test_rows: rows.len(), ece, brier, selective_risk, bootstrap })
 }
 
 impl ReliabilityConfidenceIntervals {
@@ -798,36 +832,37 @@ struct CalibratedLockedRow {
     positive: bool,
 }
 
-fn calibrated_locked_rows(
+fn calibrated_locked_rows<E: From<CalibrationError>>(
     locked_test: &LockedTestSet,
     calibrate: impl Fn(f64) -> Result<f64, CalibrationError>,
-) -> Result<Vec<CalibratedLockedRow>, CalibrationError> {
-    locked_test
-        .rows
-        .iter()
-        .map(|row| {
-            let probability = calibrate(row.probability)?;
-            validate_probability(&row.id, probability)?;
-            Ok(CalibratedLockedRow {
-                probability,
-                positive: row.positive,
-            })
-        })
-        .collect()
+    checkpoint: &mut impl FnMut() -> Result<(), E>,
+) -> Result<Vec<CalibratedLockedRow>, E> {
+    checkpoint()?;
+    let mut values = Vec::with_capacity(locked_test.rows.len());
+    for (index, row) in locked_test.rows.iter().enumerate() {
+        if index.is_multiple_of(METRIC_ROWS_PER_CHECKPOINT) { checkpoint()?; }
+        let probability = calibrate(row.probability)?;
+        validate_probability(&row.id, probability)?;
+        values.push(CalibratedLockedRow { probability, positive: row.positive });
+    }
+    checkpoint()?;
+    Ok(values)
 }
 
-fn evaluate_locked_rows(
+fn evaluate_locked_rows<E: From<CalibrationError>>(
     rows: &[CalibratedLockedRow],
     acceptance_threshold: f64,
-) -> Result<(ReliabilityMetrics, SelectiveRisk), CalibrationError> {
+    checkpoint: &mut impl FnMut() -> Result<(), E>,
+) -> Result<(ReliabilityMetrics, SelectiveRisk), E> {
     if !acceptance_threshold.is_finite() || !(0.0..=1.0).contains(&acceptance_threshold) {
-        return Err(CalibrationError::InvalidThreshold);
+        return Err(CalibrationError::InvalidThreshold.into());
     }
     let mut bins = [ReliabilityBin::default(); DEFAULT_ECE_BINS];
     let mut brier_sum = 0.0_f64;
     let mut accepted = 0_usize;
     let mut accepted_errors = 0_usize;
-    for row in rows {
+    for (index, row) in rows.iter().enumerate() {
+        if index.is_multiple_of(METRIC_ROWS_PER_CHECKPOINT) { checkpoint()?; }
         let probability = row.probability;
         let label = if row.positive { 1.0 } else { 0.0 };
         brier_sum += (probability - label).powi(2);
@@ -840,6 +875,7 @@ fn evaluate_locked_rows(
             accepted_errors += if row.positive { 0 } else { 1 };
         }
     }
+    checkpoint()?;
     let rows = rows.len();
     let ece = bins.into_iter().fold(0.0_f64, |total, bin| {
         if bin.count == 0 {
