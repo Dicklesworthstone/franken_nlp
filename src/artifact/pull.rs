@@ -17,6 +17,9 @@
 //! or a model activation capability; same-user concurrent mutation is outside
 //! this local candidate operation's authority.
 
+#[cfg(feature = "asupersync-runtime")]
+pub mod http;
+
 use std::{
     error::Error,
     fmt,
