@@ -84,3 +84,60 @@ fn native_width_and_complete_consumption_cannot_silently_drop_heads() {
         |heads| { heads.next(); Ok::<_, Int4ScoringError>(()) }).unwrap_err();
     assert_eq!(error, Int4ScoringError::Accounting);
 }
+
+#[test]
+fn independent_documents_keep_ragged_head_boundaries_and_complete_semantic_results() {
+    let plans = [prepare(ClassificationMode::Exclusive, 32), prepare(ClassificationMode::MultiLabel, 32)];
+    let documents: Vec<_> = plans.iter().map(|plan| (plan, plan.execution_identity())).collect();
+    let capacities: Vec<_> = plans.iter().flat_map(|plan| plan.cohort_contexts().unwrap()).collect();
+    let budget = fixtures::document_budget(&documents);
+    let (schedules, work) = native::task::document_layout(&documents, &capacities, budget).unwrap();
+    let run = fixtures::run(plans.iter().flat_map(|plan| plan.inner.heads.iter().zip(&plan.schedules)
+        .map(|(head, &schedule)| (head.classifier.scorer.score(&mut Constant, ScoringMode::FullVocabulary).unwrap(), schedule))));
+    let expected: Vec<_> = plans.iter().map(|plan|
+        plan.finish_cohort(fixture(plan), plan.task_budget().max_output_bytes, &mut Continue).unwrap().output).collect();
+    let actual = native::task::finish_documents(&documents, run.clone(), &schedules, work,
+        budget.max_output_bytes, &mut Continue).unwrap();
+    assert_eq!(actual.output, expected);
+    assert_eq!(actual.output.iter().map(|output| output.head_count).collect::<Vec<_>>(), [1, 3]);
+    assert_eq!(actual.group_steps, run.group_steps); assert_eq!(actual.projection_groups, run.projection_groups);
+    let bytes = canonjson::canonical_bytes(&actual).unwrap().len() as u64;
+    assert!(native::task::finish_documents(&documents, run.clone(), &schedules, work, bytes, &mut Continue).is_ok());
+    assert!(matches!(native::task::finish_documents(&documents, run.clone(), &schedules, work, bytes - 1, &mut Continue),
+        Err(Int4ClassificationError::Scoring(Int4ScoringError::OutputBudget))));
+    let mut broken_last_document = run;
+    broken_last_document.heads.last_mut().unwrap().scores.candidates[0].id = "foreign".into();
+    assert!(native::task::finish_documents(&documents, broken_last_document, &schedules, work,
+        budget.max_output_bytes, &mut Continue).is_err());
+}
+
+#[test]
+fn document_admission_charges_actual_simultaneous_kv_and_aggregate_work() {
+    let mut plans = [prepare(ClassificationMode::Exclusive, 32), prepare(ClassificationMode::MultiLabel, 32)];
+    let capacities: Vec<_> = plans.iter().flat_map(|plan| plan.cohort_contexts().unwrap()).collect();
+    let required = capacities[1..].iter().sum::<usize>() as u64 * crate::native_engine::kv::KV_BYTES_PER_TOKEN as u64;
+    plans[1].inner.budget.max_kv_bytes = required;
+    let budget = {
+        let documents: Vec<_> = plans.iter().map(|plan| (plan, plan.execution_identity())).collect();
+        let budget = fixtures::document_budget(&documents);
+        assert!(native::task::document_layout(&documents, &capacities, budget).is_ok());
+        let mut larger = capacities.clone(); larger[1] += 1;
+        assert!(matches!(native::task::document_layout(&documents, &larger,
+            Int4ScoringCohortBudget { max_kv_bytes: u64::MAX, ..budget }),
+            Err(Int4ScoringError::Native(StrictInt4Error::Memory))));
+        let mut short_work = budget; short_work.native.max_forward_positions -= 1;
+        assert!(matches!(native::task::document_layout(&documents, &capacities, short_work),
+            Err(Int4ScoringError::Native(StrictInt4Error::Work))));
+        assert!(native::task::document_layout(&documents, &capacities[..3], budget).is_err());
+        assert!(native::task::document_layout(&documents, &[capacities[0]; 65], budget).is_err());
+        let mut foreign_model = plans[1].execution_identity().clone();
+        foreign_model.logical_model_digest = Sha256Digest::of_bytes(b"different model");
+        let foreign = [(documents[0].0, documents[0].1), (&plans[1], &foreign_model)];
+        assert!(matches!(native::task::document_layout(&foreign, &capacities, budget), Err(Int4ScoringError::Identity)));
+        budget
+    };
+    plans[1].inner.budget.max_kv_bytes = required - 1;
+    let documents: Vec<_> = plans.iter().map(|plan| (plan, plan.execution_identity())).collect();
+    assert!(matches!(native::task::document_layout(&documents, &capacities, budget),
+        Err(Int4ScoringError::Native(StrictInt4Error::Memory))));
+}

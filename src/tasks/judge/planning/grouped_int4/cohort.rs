@@ -4,6 +4,15 @@ use crate::native_engine::strict_int4::{cohort::Int4CohortEngine,
     scoring::cohort::{self as native, CompiledRequest, Int4CandidateCohortRun, Int4ScoredCohort, Int4ScoringCohortBudget}};
 
 impl PreparedInt4Judge {
+    /// Batch complete judgments from independent documents into one physical
+    /// scoring cohort, preserving each judgment's original head order and
+    /// finalizer. A failed document discards the complete cohort result.
+    pub fn execute_document_cohort_with_control<C: DecodeStepControl>(
+        documents: &[(&Self, &ExecutionIdentity)], engine: &mut Int4CohortEngine<'_>,
+        budget: Int4ScoringCohortBudget, control: &mut C,
+    ) -> Result<Int4ScoredCohort<Vec<Int4JudgeRun>>, Int4JudgeError> {
+        native::task::execute_documents(documents, engine, budget, control)
+    }
     pub fn cohort_contexts(&self) -> Result<Vec<usize>, Int4ScoringError> {
         if self.inner.executable.bundle().heads.len() != self.schedules.len() { return Err(Int4ScoringError::Accounting); }
         native::task::contexts(&self.schedules)
@@ -46,6 +55,38 @@ impl PreparedInt4Judge {
         -> Result<Int4ScoredCohort<Int4JudgeRun>, Int4JudgeError> {
         native::task::finish(run, &self.schedules, self.work, cap, |heads|
             self.evaluate_heads(control, |_, _, _, _| heads.next().ok_or(Int4JudgeError::Accounting)))
+    }
+}
+impl native::task::DocumentPlan for PreparedInt4Judge {
+    type Output = Int4JudgeRun;
+    type Error = Int4JudgeError;
+    fn schedules(&self) -> &[CandidateSchedule] { &self.schedules }
+    fn work(&self) -> Int4Work { self.work }
+    fn kv_cap(&self) -> u64 { self.budget.max_kv_bytes }
+    fn output_cap(&self) -> u64 { self.max_result_bytes() }
+    fn verify_document(&self, admitted: &ExecutionIdentity, model: &Int4ModelIdentity) -> Result<(), Self::Error> {
+        self.verify_identity(admitted)?; check_model(admitted, model)?;
+        if self.group_width != model.group_width() { return Err(Int4JudgeError::Identity); }
+        if self.inner.executable.bundle().heads.len() != self.schedules.len() { return Err(Int4JudgeError::Accounting); }
+        Ok(())
+    }
+    fn prompts<C: DecodeStepControl>(&self, control: &mut C) -> Result<Vec<Vec<u32>>, Self::Error> {
+        self.cohort_prompts(control)
+    }
+    fn append_requests<'a>(&'a self, admitted: &'a ExecutionIdentity, prompts: &'a [Vec<u32>],
+        budget: Int4ScoringCohortBudget, requests: &mut Vec<CompiledRequest<'a>>) -> Result<(), Self::Error> {
+        if prompts.len() != self.head_count() { return Err(Int4JudgeError::Accounting); }
+        for ((head, prompt), &schedule) in self.inner.executable.bundle().heads.iter().zip(prompts).zip(&self.schedules) {
+            requests.push(CompiledRequest { identity: admitted, prompt, scorer: &head.scorer,
+                mode: ScoringMode::FullVocabulary, schedule, max_output_bytes: budget.max_output_bytes.min(self.max_result_bytes()),
+                budget: Int4ScoringBudget { native: Int4RunBudget::exact(schedule.model),
+                    max_kv_bytes: budget.max_kv_bytes.min(self.budget.max_kv_bytes).min(head.ir.budget().max_kv_bytes) } });
+        }
+        Ok(())
+    }
+    fn finish_document<C: DecodeStepControl>(&self, heads: &mut std::vec::IntoIter<Int4CandidateRun>,
+        control: &mut C) -> Result<Self::Output, Self::Error> {
+        self.evaluate_heads(control, |_, _, _, _| heads.next().ok_or(Int4JudgeError::Accounting))
     }
 }
 #[cfg(test)] mod tests;

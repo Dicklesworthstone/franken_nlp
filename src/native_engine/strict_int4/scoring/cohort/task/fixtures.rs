@@ -46,3 +46,13 @@ pub(crate) fn budget() -> crate::tasks::ir::TaskBudget {
     crate::tasks::ir::TaskBudget { max_input_tokens: 4096, max_output_tokens: 16, max_output_bytes: 1_000_000,
         max_grammar_states: 4096, max_kv_bytes: 1 << 30 }
 }
+
+pub(crate) fn document_budget<P: DocumentPlan>(documents: &[(&P, &ExecutionIdentity)]) -> Int4ScoringCohortBudget {
+    Int4ScoringCohortBudget {
+        native: Int4RunBudget::exact(documents.iter().fold(Int4Work::default(),
+            |work, (plan, _)| work.checked_add(plan.work()).unwrap())),
+        max_kv_bytes: documents.iter().flat_map(|(plan, _)| plan.schedules())
+            .map(|schedule| schedule.context as u64 * KV_BYTES_PER_TOKEN as u64).sum(),
+        max_output_bytes: documents.iter().map(|(plan, _)| plan.output_cap()).sum(),
+    }
+}

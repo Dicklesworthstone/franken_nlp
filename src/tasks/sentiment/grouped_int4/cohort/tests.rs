@@ -71,3 +71,36 @@ fn complete_outer_envelope_retains_exact_output_budget_and_cancellation() {
     }
     assert_eq!(plan.finish_cohort(run, bytes, &mut Stop).unwrap_err().cancellation(), Some(DecodeCancellationKind::User));
 }
+
+#[test]
+fn cross_document_axes_retain_each_documents_score_space_and_identity() {
+    let plans = [prepare(ScoringMode::FullVocabulary, 32), prepare(ScoringMode::TrieConditional, 32)];
+    let documents: Vec<_> = plans.iter().map(|plan| (plan, plan.execution_identity())).collect();
+    let capacities: Vec<_> = plans.iter().flat_map(|plan| plan.cohort_contexts().unwrap()).collect();
+    let budget = fixtures::document_budget(&documents);
+    let (schedules, work) = native::task::document_layout(&documents, &capacities, budget).unwrap();
+    let prompts: Vec<_> = plans.iter().map(|plan| plan.cohort_prompts(&mut Continue).unwrap()).collect();
+    let mut compiled = Vec::with_capacity(schedules.len());
+    for ((plan, identity), prompts) in documents.iter().zip(&prompts) {
+        native::task::DocumentPlan::append_requests(*plan, identity, prompts, budget, &mut compiled).unwrap();
+    }
+    assert_eq!(compiled.len(), 8);
+    for (slot, request) in compiled.iter().enumerate() {
+        assert_eq!(request.identity, plans[slot / 4].execution_identity());
+        assert_eq!(request.prompt, prompts[slot / 4][slot % 4].as_slice());
+        assert_eq!(request.mode, plans[slot / 4].inner.options.mode);
+    }
+    let run = fixtures::run(plans.iter().flat_map(|plan| plan.inner.heads.iter().zip(&plan.schedules)
+        .map(move |(head, &schedule)| (head.scorer.score(&mut Constant, plan.inner.options.mode).unwrap(), schedule))));
+    let expected: Vec<_> = plans.iter().map(|plan|
+        plan.finish_cohort(fixture(plan), plan.max_result_bytes(), &mut Continue).unwrap().output).collect();
+    let actual = native::task::finish_documents(&documents, run.clone(), &schedules, work,
+        budget.max_output_bytes, &mut Continue).unwrap();
+    assert_eq!(actual.output, expected);
+    assert!(actual.output[0].result.dimensions.iter().all(|axis| axis.scores.full_vocab_denominators_computed));
+    assert!(actual.output[1].result.dimensions.iter().all(|axis| !axis.scores.full_vocab_denominators_computed));
+    let mut broken = run;
+    broken.heads.last_mut().unwrap().scores.candidates[0].id = "wrong axis".into();
+    assert!(native::task::finish_documents(&documents, broken, &schedules, work,
+        budget.max_output_bytes, &mut Continue).is_err());
+}

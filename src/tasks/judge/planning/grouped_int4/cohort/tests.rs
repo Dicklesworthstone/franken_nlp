@@ -80,3 +80,24 @@ fn complete_judgment_outer_bytes_and_finalizer_cancellation_stay_enforced() {
     }
     assert_eq!(plan.finish_cohort(run, bytes, &mut Stop).unwrap_err().cancellation(), Some(DecodeCancellationKind::Deadline));
 }
+
+#[test]
+fn cross_document_judgments_keep_both_orders_rubrics_and_evidence_windows_complete() {
+    let plans: Vec<_> = requests().iter().map(|request| prepare(request, 32)).collect();
+    let documents: Vec<_> = plans.iter().map(|plan| (plan, plan.execution_identity())).collect();
+    let capacities: Vec<_> = plans.iter().flat_map(|plan| plan.cohort_contexts().unwrap()).collect();
+    let budget = fixtures::document_budget(&documents);
+    let (schedules, work) = native::task::document_layout(&documents, &capacities, budget).unwrap();
+    let run = fixtures::run(plans.iter().flat_map(|plan| plan.inner.executable.bundle().heads.iter().zip(&plan.schedules)
+        .map(|(head, &schedule)| (head.scorer.score(&mut Constant, ScoringMode::FullVocabulary).unwrap(), schedule))));
+    let expected: Vec<_> = plans.iter().map(|plan| plan.finish_cohort(fixture(plan),
+        plan.max_result_bytes(), &mut fixtures::Continue).unwrap().output).collect();
+    let actual = native::task::finish_documents(&documents, run.clone(), &schedules, work,
+        budget.max_output_bytes, &mut fixtures::Continue).unwrap();
+    assert_eq!(actual.output, expected); assert_eq!(actual.output.len(), 3);
+    assert_eq!(actual.output.iter().map(|output| output.head_count).sum::<usize>(), schedules.len());
+    let mut broken_last_judgment = run;
+    broken_last_judgment.heads.last_mut().unwrap().scores.candidates[0].candidate_weight = f64::NAN;
+    assert!(native::task::finish_documents(&documents, broken_last_judgment, &schedules, work,
+        budget.max_output_bytes, &mut fixtures::Continue).is_err());
+}

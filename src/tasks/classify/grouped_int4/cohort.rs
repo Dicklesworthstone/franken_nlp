@@ -4,6 +4,15 @@ use crate::native_engine::strict_int4::{cohort::Int4CohortEngine,
     scoring::cohort::{self as native, CompiledRequest, Int4CandidateCohortRun, Int4ScoredCohort, Int4ScoringCohortBudget}};
 
 impl PreparedInt4Classification {
+    /// One real native cohort across independently admitted documents, in
+    /// document order then head order. Every document retains its own complete
+    /// semantic result and budget. Failure returns no partial collection.
+    pub fn execute_document_cohort_with_control<C: DecodeStepControl>(
+        documents: &[(&Self, &ExecutionIdentity)], engine: &mut Int4CohortEngine<'_>,
+        budget: Int4ScoringCohortBudget, control: &mut C,
+    ) -> Result<Int4ScoredCohort<Vec<Int4ClassificationRun>>, Int4ClassificationError> {
+        native::task::execute_documents(documents, engine, budget, control)
+    }
     /// Exact simultaneous contexts in stable head order. This explicit route
     /// refuses more than 64 heads; it never silently selects serial execution.
     pub fn cohort_contexts(&self) -> Result<Vec<usize>, Int4ScoringError> {
@@ -48,6 +57,39 @@ impl PreparedInt4Classification {
         -> Result<Int4ScoredCohort<Int4ClassificationRun>, Int4ClassificationError> {
         native::task::finish(run, &self.schedules, self.work, cap, |heads|
             self.execute_heads(control, |_, _, _, _| heads.next().ok_or(Int4ClassificationError::Accounting)))
+    }
+}
+impl native::task::DocumentPlan for PreparedInt4Classification {
+    type Output = Int4ClassificationRun;
+    type Error = Int4ClassificationError;
+    fn schedules(&self) -> &[CandidateSchedule] { &self.schedules }
+    fn work(&self) -> Int4Work { self.work }
+    fn kv_cap(&self) -> u64 { self.inner.budget.max_kv_bytes }
+    fn output_cap(&self) -> u64 { self.inner.budget.max_output_bytes }
+    fn verify_document(&self, admitted: &ExecutionIdentity, model: &Int4ModelIdentity) -> Result<(), Self::Error> {
+        self.verify_identity(admitted)?; check_model(admitted, model)?;
+        if self.group_width != model.group_width() { return Err(Int4ClassificationError::Identity); }
+        if self.inner.heads.len() != self.schedules.len() { return Err(Int4ClassificationError::Accounting); }
+        Ok(())
+    }
+    fn prompts<C: DecodeStepControl>(&self, control: &mut C) -> Result<Vec<Vec<u32>>, Self::Error> {
+        self.cohort_prompts(control)
+    }
+    fn append_requests<'a>(&'a self, admitted: &'a ExecutionIdentity, prompts: &'a [Vec<u32>],
+        budget: Int4ScoringCohortBudget, requests: &mut Vec<CompiledRequest<'a>>) -> Result<(), Self::Error> {
+        if prompts.len() != self.head_count() { return Err(Int4ClassificationError::Accounting); }
+        for ((head, prompt), &schedule) in self.inner.heads.iter().zip(prompts).zip(&self.schedules) {
+            requests.push(CompiledRequest { identity: admitted, prompt, scorer: &head.classifier.scorer,
+                mode: ScoringMode::FullVocabulary, schedule,
+                max_output_bytes: budget.max_output_bytes.min(self.inner.budget.max_output_bytes),
+                budget: Int4ScoringBudget { native: Int4RunBudget::exact(schedule.model),
+                    max_kv_bytes: budget.max_kv_bytes.min(self.inner.budget.max_kv_bytes) } });
+        }
+        Ok(())
+    }
+    fn finish_document<C: DecodeStepControl>(&self, heads: &mut std::vec::IntoIter<Int4CandidateRun>,
+        control: &mut C) -> Result<Self::Output, Self::Error> {
+        self.execute_heads(control, |_, _, _, _| heads.next().ok_or(Int4ClassificationError::Accounting))
     }
 }
 #[cfg(test)] mod tests;
