@@ -16,6 +16,10 @@ pub struct Int4SourceDocumentJobRecipe {
     pub(super) task: Int4SourceDocumentTask,
     pub(super) lifetime: Int4SourceDocumentLifetime,
     max_attempts: u64,
+    // Omitted entirely for the original serial profile: existing private
+    // recipe bytes and authenticated resume commitments stay unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chunk_cohorts: Option<&'static str>,
 }
 impl Int4SourceDocumentJobRecipe {
     pub(super) fn new(source: Int4SourceJobRecipe, task: Int4SourceDocumentTask,
@@ -29,12 +33,18 @@ impl Int4SourceDocumentJobRecipe {
             reservation_policy: "exact-discovery-and-complete-synthesis-reserve-per-durable-attempt-v1",
             source, mapping: MappingRecipe { chunks, reduction, max_model_work,
                 max_trie_node_visits, checkpoint_interval_nodes, mask_visits_per_chunk,
-                max_mask_visits, verification }, task, lifetime, max_attempts };
+                max_mask_visits, verification }, task, lifetime, max_attempts, chunk_cohorts: None };
         // Question bytes, options and every nested limit stay in this private
         // projection. Only JobRunner's per-job keyed commitment is persisted.
         bounded_json(&recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
         Ok(recipe)
     }
+    pub(super) fn enable_chunk_cohorts(&mut self) -> Result<(), BatchFault> {
+        self.chunk_cohorts = Some("native-document-chunk-cohorts-v1");
+        bounded_json(self, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
+        Ok(())
+    }
+    pub(super) fn uses_chunk_cohorts(&self) -> bool { self.chunk_cohorts.is_some() }
 }
 #[derive(Serialize)]
 struct MappingRecipe {

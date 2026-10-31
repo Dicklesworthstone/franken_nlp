@@ -10,6 +10,7 @@ use crate::{
     tokenizer::{embedded::EmbeddedTokenizer, pinned_controls},
 };
 mod keyphrases;
+mod cohorts;
 
 const WIDTH: usize = 32;
 const SOURCE: &str = "éabc----βdef";

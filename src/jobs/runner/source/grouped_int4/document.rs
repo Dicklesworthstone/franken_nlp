@@ -3,13 +3,15 @@
 //! pass. No partial document, failed citation or incomplete hierarchy is a result.
 use super::*;
 use crate::{
-    native_engine::constrained_int4,
+    native_engine::{constrained_int4, int4::PackedInt4Kernel, strict_int4::Int4ModelWeights},
     tasks::{answer::AnswerOptions, ir::PlanContext, keyphrases::KeyphraseOptions,
         mapreduce::{ChunkLimits, ExecutionLimits, CHUNK_PROFILE},
         summarize::SummaryOptions,
         source_planning::grouped_int4::long::{Int4SourceMapError, Int4SourceMapLimits,
             Int4SourceMapPreflight, Int4SourceMapRun, PreparedInt4SourceMap, SourceMapTask,
             INT4_SOURCE_MAP_EXECUTION,
+            cohort::{Int4SourceMapCohortBudget, Int4SourceMapCohortMemoryLimits,
+                Int4SourceMapCohortRequirement},
             keyphrases::{Int4CorpusKeyphraseError, Int4CorpusKeyphraseRun, Int4KeyphraseLimits,
                 INT4_CORPUS_KEYPHRASE_EXECUTION},
             summary::{Int4CorpusSummaryError, Int4CorpusSummaryRun, Int4SummaryLimits,
@@ -205,6 +207,42 @@ impl Int4SourceDocumentJobPlanner {
     pub fn job_limits(&self) -> JobLimits { self.limits }
     pub fn task(&self) -> &Int4SourceDocumentTask { &self.recipe.task }
     pub fn job_recipe(&self) -> &Int4SourceDocumentJobRecipe { &self.recipe }
+    /// Opt into native cohorts inside each complete durable document attempt.
+    /// The existing immutable map width is also the native cohort ceiling;
+    /// no document, work debit or spool commit is split into chunk attempts.
+    pub fn with_chunk_cohorts(mut self) -> Result<Self, BatchFault> {
+        self.cohort_requirements()?;
+        if !self.uses_chunk_cohorts() {
+            self.recipe.enable_chunk_cohorts()?;
+            // Previously prepared receipts belong to the old scheduling policy,
+            // even when their semantic task and native work happen to be identical.
+            self.owner = Arc::new(());
+        }
+        Ok(self)
+    }
+    pub fn uses_chunk_cohorts(&self) -> bool { self.recipe.uses_chunk_cohorts() }
+    /// Static declared native/decoder peak for the whole job invocation.
+    /// Actual document windows are checked against this ceiling before native
+    /// execution. Per-row task KV and all lifetime work remain unchanged.
+    pub fn cohort_requirements(&self) -> Result<Int4SourceMapCohortRequirement, BatchFault> {
+        let max_chunks = self.mapping.reduction.map_batch_chunks;
+        if max_chunks > self.mapping.chunks.max_chunks { return Err(BatchCode::InvalidLimits.into()); }
+        let context = self.planning.max_context_tokens;
+        let scalar = Int4MemoryRequirement::for_context(context, self.group_width)
+            .map_err(|_| BatchCode::InvalidLimits)?;
+        if scalar.kv_bytes != self.budget.max_kv_bytes { return Err(BatchCode::Admission.into()); }
+        let quote = Int4SourceMapCohortMemoryLimits { max_chunks, context_tokens: context,
+            max_output_tokens_per_chunk: u64::from(self.budget.max_output_tokens),
+            max_result_bytes_per_chunk: self.budget.max_output_bytes,
+        }.requirements(self.group_width).map_err(|_| BatchCode::InvalidLimits)?;
+        if matches!(self.task(), Int4SourceDocumentTask::SummarySynthesis(_)
+            | Int4SourceDocumentTask::SummaryHierarchy { .. }
+            | Int4SourceDocumentTask::QuestionSynthesis(_)
+            | Int4SourceDocumentTask::QuestionHierarchy { .. }) {
+            quote.with_synthesis_context(context, self.group_width, self.budget.max_kv_bytes)
+                .map_err(|_| BatchCode::Admission.into())
+        } else { Ok(quote) }
+    }
     pub fn max_result_bytes(&self) -> u64 {
         match self.task() {
             Int4SourceDocumentTask::Keyphrases { limits, .. } => limits.max_result_bytes as u64,

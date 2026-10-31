@@ -181,6 +181,31 @@ impl NativePlan<'_> {
             _ => Ok(()),
         }
     }
+    pub(super) fn cohort_requirements(&self, context: usize)
+        -> Result<Int4SourceMapCohortRequirement, BatchItemFailure> {
+        match self {
+            Self::Map(p) | Self::Keyphrases(p, _) | Self::Summary(p, _) => p.cohort_requirements(context),
+            Self::Question(p) => p.cohort_requirements(context),
+            Self::SummarySynthesis(p) => p.cohort_requirements(context),
+            Self::SummaryHierarchy(p) => p.cohort_requirements(context),
+            Self::QuestionSynthesis(p) => p.cohort_requirements(context),
+            Self::QuestionHierarchy(p) => p.cohort_requirements(context),
+        }.map_err(map_failure)
+    }
+    pub(super) fn preflight_cohorts<C: DecodeStepControl>(&self, identities: &[ExecutionIdentity],
+        weights: &Int4ModelWeights, control: &mut C) -> Result<(), BatchItemFailure> {
+        let expected = self.expected();
+        if identities.is_empty() || identities.len() != expected.native_chunks()
+            || weights.group_width() != expected.group_width() || self.identities(control)? != identities {
+            return Err(BatchItemFailure::fatal(BatchCode::Admission));
+        }
+        for identity in identities {
+            poll(control)?;
+            constrained_int4::check_model(identity, weights.identity())
+                .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
+        }
+        poll(control)
+    }
     pub(super) fn execute<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
         planner: &SourceTaskPlanner, engine: &mut StrictInt4Engine<'_>, vocabulary: &ExtractionVocabulary,
         control: &mut C) -> Result<Int4SourceDocumentRun, BatchItemFailure> {
@@ -201,6 +226,39 @@ impl NativePlan<'_> {
                 .map(Int4SourceDocumentRun::QuestionSynthesis).map_err(map_failure),
             Self::QuestionHierarchy(p) => p.execute_with_control(admitted, planner, engine, vocabulary, control)
                 .map(Int4SourceDocumentRun::QuestionHierarchy).map_err(map_failure),
+        }
+    }
+    /// The selected native path already verifies every physical cohort. Only
+    /// its complete semantic document enters the existing durable spool schema;
+    /// scheduling is authenticated by the recipe, not a new result envelope.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn execute_cohorts<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
+        planner: &SourceTaskPlanner, weights: &Int4ModelWeights, vocabulary: &ExtractionVocabulary,
+        budget: Int4SourceMapCohortBudget, kernel: PackedInt4Kernel, control: &mut C)
+        -> Result<Int4SourceDocumentRun, BatchItemFailure> {
+        match self {
+            Self::Map(p) => p.execute_cohorts_with_control(admitted, weights, vocabulary, budget, kernel, control)
+                .map(|run| Int4SourceDocumentRun::Map(run.document)).map_err(map_failure),
+            Self::Keyphrases(p, limits) => p.execute_keyphrases_cohorts_with_control(
+                admitted, weights, vocabulary, limits, budget, kernel, control)
+                .map(|run| Int4SourceDocumentRun::Keyphrases(run.document)).map_err(keyphrase_failure),
+            Self::Summary(p, limits) => p.execute_summary_cohorts_with_control(
+                admitted, weights, vocabulary, limits, budget, kernel, control)
+                .map(|run| Int4SourceDocumentRun::Summary(run.document)).map_err(summary_failure),
+            Self::Question(p) => p.execute_cohorts_with_control(admitted, weights, vocabulary, budget, kernel, control)
+                .map(|run| Int4SourceDocumentRun::Question(run.document)).map_err(map_failure),
+            Self::SummarySynthesis(p) => p.execute_cohorts_with_control(
+                admitted, planner, weights, vocabulary, budget, kernel, control)
+                .map(|run| Int4SourceDocumentRun::SummarySynthesis(run.document)).map_err(map_failure),
+            Self::SummaryHierarchy(p) => p.execute_cohorts_with_control(
+                admitted, planner, weights, vocabulary, budget, kernel, control)
+                .map(|run| Int4SourceDocumentRun::SummaryHierarchy(run.document)).map_err(map_failure),
+            Self::QuestionSynthesis(p) => p.execute_cohorts_with_control(
+                admitted, planner, weights, vocabulary, budget, kernel, control)
+                .map(|run| Int4SourceDocumentRun::QuestionSynthesis(run.document)).map_err(map_failure),
+            Self::QuestionHierarchy(p) => p.execute_cohorts_with_control(
+                admitted, planner, weights, vocabulary, budget, kernel, control)
+                .map(|run| Int4SourceDocumentRun::QuestionHierarchy(run.document)).map_err(map_failure),
         }
     }
 }
