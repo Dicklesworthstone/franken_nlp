@@ -144,7 +144,14 @@ pub fn scan_occurrences(source: &str, text: &str, budget: &mut GroundingBudget) 
             if byte == needle[matched] { matched += 1; }
             if matched == needle.len() {
                 let end = i + 1; let start = end - needle.len();
-                if source.get(start..end) != Some(text) { return Err(FieldGroundingError::Shape); }
+                // KMP's matched prefix already proves byte equality for this
+                // entire interval. Re-comparing the substring here would cost
+                // O(matches * needle.len()) on overlapping repetitions, outside
+                // the linear scan allowance charged above. Only constant-time
+                // UTF-8 boundary checks remain before publishing coordinates.
+                if !source.is_char_boundary(start) || !source.is_char_boundary(end) {
+                    return Err(FieldGroundingError::Shape);
+                }
                 push(VerifiedSourceSpan { byte_start: start, byte_end: end,
                     scalar_start: scalars.checked_sub(text_scalars).ok_or(FieldGroundingError::Shape)?, scalar_end: scalars })?;
                 matched = prefix[matched - 1]; // retain overlapping matches
@@ -173,6 +180,90 @@ mod tests {
                 .filter(|&i| source[i..].starts_with(text)).count();
             assert_eq!(spans.len(), expected);
         }
+    }
+    #[test]
+    fn exact_spans_match_an_independent_oracle_over_short_unicode_strings() {
+        fn words(depth: usize) -> Vec<String> {
+            let alphabet = ["a", "b", "é", "e\u{301}", "😀", "\r\n", "\0"];
+            let mut all = vec![String::new()];
+            let mut frontier = vec![String::new()];
+            for _ in 0..depth {
+                let mut next = Vec::new();
+                for prefix in &frontier {
+                    for suffix in alphabet { next.push(format!("{prefix}{suffix}")); }
+                }
+                all.extend(next.iter().cloned());
+                frontier = next;
+            }
+            all
+        }
+        let needles = words(2);
+        for source in words(3) {
+            for text in &needles {
+                // Deliberately simple independent reference: test each scalar
+                // boundary with ordinary substring comparison, without KMP.
+                let expected: Vec<_> = source.char_indices().map(|(byte, _)| byte)
+                    .chain(std::iter::once(source.len())).filter_map(|start| {
+                        if !source[start..].starts_with(text.as_str()) { return None; }
+                        let end = start + text.len();
+                        Some(VerifiedSourceSpan { byte_start: start, byte_end: end,
+                            scalar_start: source[..start].chars().count(),
+                            scalar_end: source[..end].chars().count() })
+                    }).collect();
+                let mut budget = GroundingBudget::default();
+                let before = budget;
+                let actual = scan_occurrences(&source, text, &mut budget);
+                let matched = expected.len();
+                if expected.is_empty() {
+                    assert_eq!(actual, Err(FieldGroundingError::Absent), "source={source:?} text={text:?}");
+                } else {
+                    assert_eq!(actual.unwrap(), expected, "source={source:?} text={text:?}");
+                }
+                assert_eq!(budget.max_matches, before.max_matches - matched);
+                assert_eq!(budget.max_fields, before.max_fields);
+                assert_eq!(before.max_scan_steps - budget.max_scan_steps,
+                    (source.len() as u64 + text.len() as u64 + 1) * 8);
+            }
+        }
+    }
+    #[test]
+    fn repetitive_long_matches_keep_every_overlap_under_one_linear_work_charge() {
+        let source_scalars = 65_536;
+        let needle_scalars = 32_768;
+        let source = "é".repeat(source_scalars);
+        let text = "é".repeat(needle_scalars);
+        let matches = source_scalars - needle_scalars + 1;
+        let work = (source.len() as u64 + text.len() as u64 + 1) * 8;
+        let mut budget = GroundingBudget { max_fields: 1, max_matches: matches, max_scan_steps: work };
+        let spans = scan_occurrences(&source, &text, &mut budget).unwrap();
+        assert_eq!(spans.len(), matches);
+        for (start, span) in spans.iter().enumerate() {
+            assert_eq!(*span, VerifiedSourceSpan { byte_start: start * 2,
+                byte_end: (start + needle_scalars) * 2,
+                scalar_start: start, scalar_end: start + needle_scalars });
+        }
+        assert_eq!(budget.max_scan_steps, 0);
+        assert_eq!(budget.max_matches, 0);
+        assert_eq!(scan_occurrences(&source, &text, &mut budget), Err(FieldGroundingError::WorkBudget));
+
+        // An insufficient occurrence budget rejects the complete result and
+        // retains the charged work; it cannot publish a truncated prefix.
+        let mut limited = GroundingBudget { max_fields: 1, max_matches: matches - 1, max_scan_steps: work };
+        assert_eq!(scan_occurrences(&source, &text, &mut limited), Err(FieldGroundingError::MatchBudget));
+        assert_eq!(limited.max_scan_steps, 0);
+        assert_eq!(limited.max_matches, matches - 1);
+    }
+    #[test]
+    fn repeated_long_prefix_mismatches_are_absent_without_renewing_work() {
+        let source = "abé".repeat(16_384);
+        let text = format!("{}z", "abé".repeat(8_192));
+        let work = (source.len() as u64 + text.len() as u64 + 1) * 8;
+        let mut budget = GroundingBudget { max_scan_steps: work, ..GroundingBudget::default() };
+        let matches = budget.max_matches;
+        assert_eq!(scan_occurrences(&source, &text, &mut budget), Err(FieldGroundingError::Absent));
+        assert_eq!(budget.max_scan_steps, 0);
+        assert_eq!(budget.max_matches, matches);
+        assert_eq!(scan_occurrences(&source, &text, &mut budget), Err(FieldGroundingError::WorkBudget));
     }
     #[test]
     fn nested_arrays_and_escaped_property_names_have_value_pointers() {
