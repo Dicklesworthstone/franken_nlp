@@ -22,12 +22,22 @@ fn definition() -> clap::Command {
     let command = existing::definition()
         .mut_subcommand("robot", |robot| robot.subcommand(selftest::definition()))
         .subcommand(crate::redaction_cli::definition())
+        .subcommands(crate::assay_cli::definitions())
         .subcommands(crate::text_cli::definitions()).subcommand(crate::text_batch::definition())
         .subcommand(candidate);
     #[cfg(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")))]
     let command = command.subcommand(crate::job_cli::definition());
     command
+}
+
+fn suppress_argument_values(args: &[OsString]) -> bool {
+    // Assay inputs and paths remain private even when an option precedes the
+    // subcommand or the root parser refuses before it resolves that command.
+    args.iter().skip(1).filter_map(|arg| arg.to_str())
+        .any(crate::assay_cli::AssayCommand::recognizes)
+        || args.get(1).and_then(|s| s.to_str()).is_some_and(|s| s == "redact" || s == "batch"
+            || s == "job" || s == "candidate" || crate::text_cli::TextCommand::recognizes(s))
 }
 
 pub fn cli_main() -> ExitCode {
@@ -39,7 +49,7 @@ pub fn cli_main() -> ExitCode {
             if !error.use_stderr() { return if error.print().is_ok() { ExitCode::SUCCESS } else { ErrorCode::Generic.as_process_exit() }; }
             // Never echo arbitrary argv values into redaction diagnostics. Key
             // bytes have no argv option, even on an invalid invocation.
-            if args.get(1).and_then(|s| s.to_str()).is_some_and(|s| s == "redact" || s == "batch" || s == "job" || s == "candidate" || crate::text_cli::TextCommand::recognizes(s)) {
+            if suppress_argument_values(&args) {
                 eprintln!("fnlp: invalid task arguments; run the task command with --help");
             } else { let _ = error.print(); }
             return ErrorCode::Usage.as_process_exit();
@@ -92,6 +102,15 @@ pub fn cli_main() -> ExitCode {
     let stdin = io::stdin();
     let terminal = stdin.is_terminal();
     let mut input = stdin.lock();
+    if let Some((name, matches)) = matches.subcommand() {
+        if crate::assay_cli::AssayCommand::recognizes(name) {
+            let options = match crate::assay_cli::AssayCommand::from_matches(name, matches) {
+                Ok(options) => options,
+                Err(_) => return ErrorCode::Usage.as_process_exit(),
+            };
+            return options.run(&mut input, &mut io::stdout().lock(), &mut io::stderr().lock());
+        }
+    }
     if let Some(("batch", matches)) = matches.subcommand() {
         let options = match crate::text_batch::BatchCommand::from_arg_matches(matches) {
             Ok(options) => options,
@@ -121,10 +140,23 @@ pub fn cli_main() -> ExitCode {
 mod task_dispatch_tests {
     use super::*;
     #[test]
+    fn assay_parse_failures_do_not_expose_arguments_when_root_options_precede_the_command() {
+        for name in ["eval", "calibrate", "qualify"] {
+            for prefix in [vec![], vec!["--unrecognized-root-option"], vec!["--color", "never"]] {
+                let mut args = vec![OsString::from("fnlp")];
+                args.extend(prefix.into_iter().map(OsString::from));
+                args.extend([name, "scored", "--unknown", "private-value-never-echo"].map(OsString::from));
+                assert!(definition().try_get_matches_from(&args).is_err());
+                assert!(suppress_argument_values(&args));
+            }
+        }
+        assert!(!suppress_argument_values(&["fnlp", "licenses"].map(OsString::from)));
+    }
+    #[test]
     fn new_task_and_existing_commands_share_root_help() {
         let mut root = definition();
         let help = root.render_long_help().to_string();
-        for name in ["redact", "tokens", "split", "normalize", "batch", "schema", "robot", "convert", "release", "models", "candidate"] { assert!(help.contains(name)); }
+        for name in ["redact", "tokens", "split", "normalize", "batch", "schema", "robot", "convert", "release", "models", "candidate", "eval", "calibrate"] { assert!(help.contains(name)); }
         assert!(root.try_get_matches_from(["fnlp", "redact", "--rules-only"]).is_ok());
     }
     #[test]
@@ -210,5 +242,17 @@ mod task_dispatch_tests {
             vec!["fnlp", "tokens", "--tier", "s_scalar_i32"]] {
             assert!(definition().try_get_matches_from(args).is_err());
         }
+    }
+    #[test]
+    fn assay_requires_the_explicit_scored_backend_and_keeps_robot_schema_separate() {
+        for name in ["eval", "calibrate", "qualify"] {
+            let matches = definition().try_get_matches_from(["fnlp", name, "scored", "--schema"]).unwrap();
+            let (actual, options) = matches.subcommand().unwrap();
+            assert_eq!(actual, name);
+            assert!(crate::assay_cli::AssayCommand::from_matches(actual, options).is_ok());
+            assert!(definition().try_get_matches_from(["fnlp", name, "--model", "local.fnlpq"]).is_err());
+        }
+        assert!(definition().try_get_matches_from(["fnlp", "robot", "schema"]).is_ok());
+        assert!(definition().try_get_matches_from(["fnlp", "robot", "eval"]).is_err());
     }
 }

@@ -3,6 +3,7 @@
 
 pub mod artifact;
 pub mod assay;
+mod assay_cli;
 pub mod batch;
 pub mod calibration;
 mod candidate_cli;
