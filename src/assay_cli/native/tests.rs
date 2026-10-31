@@ -19,6 +19,13 @@ pub(super) fn command(paired: bool, flags: &[&str]) -> Command {
         "--baseline-model-sha256", BASELINE_PIN, "--gates", "absent-private-gates", "--host-scope", "declared-fixture"]); }
     arguments.extend_from_slice(flags); parse(&arguments)
 }
+pub(super) fn calibration_command(flags: &[&str]) -> Command {
+    let mut arguments = vec!["calibrate", "native-int4", "--suite", "absent-private-suite", "--cases", "-",
+        "--key-file", "absent-private-key", "--key-id", "fixture-key", "--namespace", "fixture-suite",
+        "--snapshot", "absent-private-candidate", "--expected-model-sha256", PIN, "--memory-mib", "32768",
+        "--valid-from", "2026-01-01", "--valid-through", "2026-12-31", "--shift-policy", "conservative-abstain"];
+    arguments.extend_from_slice(flags); parse(&arguments)
+}
 struct NoRead;
 impl Read for NoRead {
     fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> { panic!("preflight reached input"); }
@@ -31,7 +38,7 @@ impl Write for NoWrite {
 
 #[test]
 fn native_schema_discovery_needs_no_files_models_keys_or_runtime() {
-    for operation in ["eval", "qualify"] {
+    for operation in ["eval", "calibrate", "qualify"] {
         let mut output = Vec::new(); let mut errors = Vec::new();
         assert_eq!(parse(&[operation, "native-int4", "--schema"]).run(&mut NoRead, &mut output, &mut errors), ExitCode::SUCCESS);
         assert!(errors.is_empty()); assert_eq!(output.last(), Some(&b'\n'));
@@ -42,6 +49,8 @@ fn native_schema_discovery_needs_no_files_models_keys_or_runtime() {
             crate::assay::native_classify::EXECUTION_COLLECTION_FORMAT);
         assert_eq!(value["private_bindings"]["observation_collection"]["format"],
             crate::assay::native_classify::OBSERVATION_COLLECTION_FORMAT);
+        assert_eq!(value["calibration"]["default_method"], "isotonic");
+        assert_eq!(value["calibration"]["scope"], crate::assay::native_classify::calibrate::SCOPE);
         let definitions = &value["json_schema"]["$defs"];
         assert_eq!(definitions["suite"]["properties"]["task"]["const"], "binary_classification");
         assert!(definitions["suite"]["properties"].get("execution_identity").is_none());
@@ -51,13 +60,14 @@ fn native_schema_discovery_needs_no_files_models_keys_or_runtime() {
         let gates = &definitions["qualification_gates"];
         assert_eq!(gates["additionalProperties"], false);
         assert!(gates["required"].as_array().unwrap().iter().any(|field| field == "max_macro_f1_decrease"));
+        assert_eq!(definitions["calibration_envelope"]["properties"]["operation"]["const"], "calibrate");
     }
 }
 
 #[test]
 fn native_routes_require_explicit_pins_and_do_not_accept_scores_sampling_or_activation_controls() {
     for arguments in [vec!["eval", "native-int4"], vec!["qualify", "native-int4"],
-        vec!["calibrate", "native-int4", "--schema"],
+        vec!["calibrate", "native-int4", "--schema", "--calibration", "foreign-report.json"],
         vec!["eval", "native-int4", "--schema", "--memory-mib", "100"],
         vec!["eval", "native-int4", "--observations", "scores.ndjson"],
         vec!["eval", "native-int4", "--schema", "--seed", "1"],
@@ -135,4 +145,63 @@ fn common_statistical_and_input_limits_are_also_native_preflight_requirements() 
         let mut errors = Vec::new();
         assert_eq!(command(false, &flags).run(&mut NoRead, &mut NoWrite, &mut errors), ErrorCode::Usage.as_process_exit());
     }
+}
+
+#[test]
+fn native_fit_defaults_to_isotonic_and_requires_explicit_validity_and_fallback() {
+    let options = calibration_command(&[]);
+    assert_eq!(options.operation(), "calibrate"); assert!(options.application.is_none());
+    assert_eq!(options.artifact_count(), 0); options.validate().unwrap();
+    assert!(matches!(options.fit.as_ref().unwrap().options().unwrap().method, assay::calibrate::FitMethod::Isotonic));
+    for field in 0..5 {
+        let mut options = calibration_command(&[]); let fit = options.fit.as_mut().unwrap();
+        match field {
+            0 => fit.valid_from = None, 1 => fit.valid_through = Some("2025-12-31".to_owned()),
+            2 => fit.valid_from = Some("2026-02-30".to_owned()), 3 => fit.shift_policy = None,
+            _ => fit.method = "silently-clipped-temperature".to_owned(),
+        }
+        assert_eq!(options.run(&mut NoRead, &mut NoWrite, &mut Vec::new()), ErrorCode::Usage.as_process_exit());
+    }
+}
+
+pub(super) fn application() -> Application {
+    Application { calibration: Some(PathBuf::from("absent-private-calibration")),
+        expected_calibration_sha256: Some(PIN.to_owned()), as_of: Some("2026-06-01".to_owned()),
+        shift_assessment: Some("in-distribution".to_owned()), shift_indicator: None }
+}
+
+#[test]
+fn native_application_requires_complete_pinned_context_and_sanitizes_shift_indicators_before_io() {
+    for field in 0..9 {
+        let mut options = command(false, &[]); let mut apply = application();
+        match field {
+            0 => apply.calibration = None, 1 => apply.calibration = Some(PathBuf::from("-")),
+            2 => apply.expected_calibration_sha256 = None, 3 => apply.as_of = None,
+            4 => apply.as_of = Some("2026-13-01".to_owned()), 5 => apply.shift_assessment = None,
+            6 => { apply.shift_assessment = Some("detected".to_owned()); apply.shift_indicator = Some("PRIVATE\nforged".to_owned()); }
+            7 => { apply.shift_assessment = Some("detected".to_owned()); apply.shift_indicator = Some("PRIVATE\u{2028}forged".to_owned()); }
+            _ => apply.shift_indicator = Some("unexpected-private-indicator".to_owned()),
+        }
+        options.application = Some(apply); let mut errors = Vec::new();
+        assert_eq!(options.run(&mut NoRead, &mut NoWrite, &mut errors), ErrorCode::Usage.as_process_exit());
+        assert!(!String::from_utf8(errors).unwrap().contains("PRIVATE"));
+    }
+}
+
+#[test]
+fn paired_artifacts_and_dates_are_explicit_and_independent_for_each_arm() {
+    let options = command(true, &["--calibration", "candidate-calibration", "--expected-calibration-sha256", PIN,
+        "--as-of", "2026-06-01", "--shift-assessment", "in-distribution",
+        "--baseline-calibration", "baseline-calibration", "--expected-baseline-calibration-sha256", BASELINE_PIN,
+        "--baseline-as-of", "2026-06-02", "--baseline-shift-assessment", "detected", "--baseline-shift-indicator", "population-change"]);
+    options.validate().unwrap(); assert_eq!(options.artifact_count(), 2);
+    let candidate = options.application.as_ref().unwrap().input().unwrap().unwrap();
+    let baseline = options.comparison.as_ref().unwrap().application_input().unwrap().unwrap();
+    assert_ne!(candidate.pin, baseline.pin); assert_ne!(candidate.options.observed_date, baseline.options.observed_date);
+    assert!(matches!(candidate.options.shift, crate::calibration::ShiftAssessment::InDistribution));
+    assert!(matches!(baseline.options.shift, crate::calibration::ShiftAssessment::Detected { .. }));
+    let baseline_only = command(true, &["--baseline-calibration", "baseline-calibration", "--expected-baseline-calibration-sha256", BASELINE_PIN,
+        "--baseline-as-of", "2026-06-02", "--baseline-shift-assessment", "in-distribution"]);
+    baseline_only.validate().unwrap(); assert_eq!(baseline_only.artifact_count(), 1);
+    assert!(baseline_only.application.as_ref().unwrap().input().unwrap().is_none());
 }

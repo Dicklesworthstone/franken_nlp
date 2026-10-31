@@ -27,7 +27,8 @@ struct Fixture {
     rows: Vec<u8>, manifest: serde_json::Value, private: Vec<String>,
 }
 impl Fixture {
-    fn new(locked: usize) -> Self {
+    fn new(locked: usize) -> Self { Self::with_calibration(locked, 1) }
+    fn with_calibration(locked: usize, calibration: usize) -> Self {
         let root = std::env::temp_dir().join(format!("fnlp-native-assay-{}-{}",
             std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
         fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
@@ -35,7 +36,7 @@ impl Fixture {
             root.join("key"), root.join("gates.json"));
         write(&key, &[0x42; 32]);
         let mut rows = Vec::new(); let mut private = Vec::new(); let mut splits = serde_json::Map::new();
-        for (split, count) in [("development", 1), ("calibration", 1), ("locked_test", locked)] {
+        for (split, count) in [("development", 1), ("calibration", calibration), ("locked_test", locked)] {
             let mut ids = Vec::new();
             for ordinal in 0..count {
                 let id = format!("private-native-{split}-{ordinal}"); ids.push(id.clone()); private.push(id.clone());
@@ -73,6 +74,8 @@ impl Fixture {
         options.args.expected_model_sha256 = Some(source.pin.clone()); options.args.group_width = source.width;
         options.args.memory_mib = Some(source.memory); options.args.kernel = source.kernel;
         options.args.timeout_seconds = 86_400;
+        // The calibration fixture can replay eleven complete labels twice.
+        options.args.max_projected_logits = 1_000_000_000;
         if let Some(comparison) = &mut options.comparison {
             comparison.baseline_snapshot = Some(source.snapshot.clone());
             comparison.baseline_model_sha256 = Some(source.pin.clone()); comparison.baseline_group_width = source.width;
@@ -199,5 +202,106 @@ fn model_present_native_assay_replays_and_paired_work_are_exact_and_private() {
     assert_eq!(code, ErrorCode::ArtifactIntegrityOrFormatOrVersion.as_process_exit()); assert!(report.is_none());
     assert!(!errors.is_empty());
     assert_eq!(fs::read(&fixture.cases).unwrap(), fixture.rows);
+    println!("{COMPLETE}");
+}
+
+fn apply_file(options: &mut Command, path: &Path, pin: &str, date: &str) {
+    options.application = Some(Application { calibration: Some(path.to_owned()),
+        expected_calibration_sha256: Some(pin.to_owned()), as_of: Some(date.to_owned()),
+        shift_assessment: Some("in-distribution".to_owned()), shift_indicator: None });
+}
+
+#[test]
+#[ignore = "requires controller-admitted independently pinned INT4 snapshot for native calibration fit/save/reload/apply and paired authority"]
+fn model_present_native_calibration_round_trip_and_independent_arms_preserve_authority() {
+    const CHILD: &str = "FNLP_INT4_ASSAY_CALIBRATION_CHILD";
+    const COMPLETE: &str = "FNLP_INT4_ASSAY_CALIBRATION_COMPLETE";
+    let full_name = concat!(module_path!(), "::model_present_native_calibration_round_trip_and_independent_arms_preserve_authority");
+    let name = full_name.split_once("::").expect("crate-qualified fixture name").1;
+    if std::env::var(CHILD).ok().as_deref() != Some(name) {
+        let result = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", name, "--ignored", "--nocapture"]).env(CHILD, name)
+            .output().expect("isolated native calibration fixture must start");
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(result.status.success(), "isolated calibration fixture failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&result.stderr));
+        assert!(stdout.contains(COMPLETE), "exact fixture filter ran no completed fixture");
+        return;
+    }
+    assert!(crate::installed_process_resources().is_none());
+    let source = Source::explicit(); let fixture = Fixture::with_calibration(5, 5);
+    let artifact_path = fixture.root.join("native-calibration.json");
+    let mut fit = fixture.options(&source, false);
+    fit.fit = calibration_command(&[]).fit; fit.application = None;
+    let (code, fitted, errors) = fixture.run(fit, "native-calibration.json");
+    assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&errors)); assert!(errors.is_empty());
+    let fitted = fitted.unwrap(); let body = &fitted["report"]["body"];
+    assert_eq!(fitted["operation"], "calibrate"); assert_eq!(body["scope"], native_calibration::SCOPE);
+    assert_eq!(body["outcome"]["status"], "fitted"); assert_eq!(body["native"]["executed_rows"], 11);
+    assert_eq!(body["outcome"]["measurement"]["status"], "measured");
+    let artifact_bytes = fs::read(&artifact_path).unwrap();
+    let pin = Sha256Digest::of_bytes(&artifact_bytes).to_hex();
+
+    let mut options = fixture.options(&source, false); apply_file(&mut options, &artifact_path, &pin, "2026-06-01");
+    let (code, applied, errors) = fixture.run(options, "applied-evaluation.json");
+    assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&errors)); assert!(errors.is_empty());
+    let applied = applied.unwrap(); let applied_body = &applied["report"]["body"];
+    assert_eq!(applied_body["application"]["status"], "calibrated");
+    assert_eq!(applied_body["outcome"]["status"], "evaluated");
+    let evaluation = &applied_body["outcome"]["evaluation"];
+    assert_eq!(evaluation["measurement"], body["outcome"]["measurement"]);
+    assert_eq!(evaluation["classification"], body["outcome"]["classification"]);
+    assert_eq!(work(&evaluation["model_work"]), work(&body["native"]["model_work"]));
+
+    let mut options = fixture.options(&source, true); apply_file(&mut options, &artifact_path, &pin, "2026-06-01");
+    let baseline = options.comparison.as_mut().unwrap(); baseline.baseline_calibration = Some(artifact_path.clone());
+    baseline.expected_baseline_calibration_sha256 = Some(pin.clone()); baseline.baseline_as_of = Some("2026-06-02".to_owned());
+    baseline.baseline_shift_assessment = Some("in-distribution".to_owned());
+    Plan::new(&options, options.validate().unwrap()).expect("explicit memory must admit both authenticated artifacts and models");
+    let (code, compared, errors) = fixture.run(options, "applied-qualification.json");
+    assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&errors)); assert!(errors.is_empty());
+    let compared = compared.unwrap(); let compared_body = &compared["report"]["body"];
+    assert_eq!(compared_body["candidate_application"]["status"], "calibrated");
+    assert_eq!(compared_body["baseline_application"]["status"], "calibrated");
+    assert_eq!(compared_body["outcome"]["status"], "compared");
+    let qualification = &compared_body["outcome"]["qualification"];
+    assert_eq!(qualification["decision"]["status"], "passed");
+    assert_eq!(qualification["decision"]["paired"]["mean_brier_change"].as_f64(), Some(0.0));
+    assert_eq!(qualification["candidate"]["measurement"], evaluation["measurement"]);
+    assert_eq!(qualification["baseline"]["measurement"], evaluation["measurement"]);
+    assert_eq!(work(&compared_body["total_model_work"]), work(&evaluation["model_work"]).map(|n| n.checked_mul(2).unwrap()));
+
+    let mut options = fixture.options(&source, true); apply_file(&mut options, &artifact_path, &pin, "2027-01-01");
+    let (code, refused, errors) = fixture.run(options, "expired-qualification.json");
+    assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&errors)); assert!(errors.is_empty());
+    let refused = refused.unwrap(); let refused_body = &refused["report"]["body"];
+    assert_eq!(refused_body["candidate_application"]["status"], "abstained");
+    assert_eq!(refused_body["baseline_application"]["status"], "raw");
+    assert_eq!(refused_body["outcome"]["status"], "abstained");
+    assert!(refused_body["outcome"].get("qualification").is_none());
+
+    let wrong_key = fixture.root.join("wrong-key"); write(&wrong_key, &[0x43; 32]);
+    let mut changed = fitted.clone(); changed["report"]["body"]["options"]["bootstrap"]["seed"] = serde_json::json!(1);
+    let tampered = fixture.root.join("tampered-calibration.json");
+    let tampered_bytes = canonjson::canonical_bytes(&changed).unwrap(); write(&tampered, &tampered_bytes);
+    let mut changed_suite = fixture.manifest.clone(); changed_suite["dataset_version"] = serde_json::json!("2");
+    let changed_suite_path = fixture.root.join("different-suite.json");
+    write(&changed_suite_path, &canonjson::canonical_bytes(&changed_suite).unwrap());
+    for refusal in 0..5 {
+        let mut options = fixture.options(&source, false); apply_file(&mut options, &artifact_path, &pin, "2026-06-01");
+        // These are all decidable before opening an actual model snapshot.
+        options.args.snapshot = Some(fixture.root.join("must-not-open-missing-model"));
+        match refusal {
+            0 => options.args.common.key_file = Some(wrong_key.clone()),
+            1 => options.args.common.namespace = Some("different-namespace".to_owned()),
+            2 => options.application.as_mut().unwrap().expected_calibration_sha256 = Some(Sha256Digest::of_bytes(b"wrong report pin").to_hex()),
+            3 => apply_file(&mut options, &tampered, &Sha256Digest::of_bytes(&tampered_bytes).to_hex(), "2026-06-01"),
+            _ => options.args.common.suite = Some(changed_suite_path.clone()),
+        }
+        let (code, report, errors) = fixture.run(options, &format!("refused-calibration-{refusal}.json"));
+        assert_eq!(code, ErrorCode::ArtifactIntegrityOrFormatOrVersion.as_process_exit()); assert!(report.is_none());
+        assert!(!errors.is_empty());
+    }
+    assert_eq!(fs::read(&artifact_path).unwrap(), artifact_bytes);
     println!("{COMPLETE}");
 }

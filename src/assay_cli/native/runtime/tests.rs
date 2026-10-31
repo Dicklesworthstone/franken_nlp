@@ -1,5 +1,5 @@
 use super::*;
-use super::super::tests::command;
+use super::super::tests::{application, calibration_command, command};
 
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod model;
@@ -49,6 +49,69 @@ fn native_input_and_complete_report_bounds_increase_both_outer_and_host_reservat
         assert!(quote.minimum_memory_bytes < initial.minimum_memory_bytes);
         assert_eq!(quote.candidate.memory, initial.candidate.memory);
     }
+}
+
+#[test]
+fn native_fit_and_each_authenticated_artifact_are_in_the_complete_pre_io_peak() {
+    let raw = command(false, &[]); let limits = raw.validate().unwrap();
+    let raw_plan = Plan::new(&raw, limits).unwrap();
+    let fit = calibration_command(&[]); let fit_plan = Plan::new(&fit, fit.validate().unwrap()).unwrap();
+    assert!(fit_plan.minimum_memory_bytes > raw_plan.minimum_memory_bytes);
+    assert_eq!(fit_plan.raw_staging_bytes, raw_plan.raw_staging_bytes);
+    assert_eq!(fit_plan.candidate.memory, raw_plan.candidate.memory);
+    let mut applied = command(false, &[]); applied.application = Some(application());
+    let applied_plan = Plan::new(&applied, applied.validate().unwrap()).unwrap();
+    assert!(applied_plan.raw_staging_bytes > raw_plan.raw_staging_bytes);
+    assert!(applied_plan.minimum_memory_bytes > raw_plan.minimum_memory_bytes);
+    let mut paired = command(true, &[]); paired.application = Some(application());
+    let one = Plan::new(&paired, paired.validate().unwrap()).unwrap();
+    let comparison = paired.comparison.as_mut().unwrap();
+    comparison.baseline_calibration = Some(PathBuf::from("absent-baseline-calibration"));
+    comparison.expected_baseline_calibration_sha256 = Some(super::super::tests::BASELINE_PIN.to_owned());
+    comparison.baseline_as_of = Some("2026-06-01".to_owned());
+    comparison.baseline_shift_assessment = Some("in-distribution".to_owned());
+    let both = Plan::new(&paired, paired.validate().unwrap()).unwrap();
+    assert!(both.minimum_memory_bytes > one.minimum_memory_bytes); assert!(both.raw_staging_bytes > one.raw_staging_bytes);
+    paired.args.memory_mib = Some(both.minimum_memory_bytes.div_ceil(MIB) - 1);
+    assert!(matches!(Plan::new(&paired, limits), Err(Failure { code: ErrorCode::AdmissionOrResourceLimit, .. })));
+}
+
+#[test]
+fn calibration_transport_requires_exact_pin_native_fit_envelope_and_authenticated_inner_report() {
+    let key = CommitmentKey::new("fixture", [0x42; 32]).unwrap(); let limits = Limits::default();
+    let context = || assay::calibrate::ApplyOptions {
+        observed_date: assay::calibrate::parse_date("2026-06-01").unwrap(),
+        shift: crate::calibration::ShiftAssessment::InDistribution,
+    };
+    let valid_transport = encode("calibrate", &serde_json::json!({"body":{},"seal":{}}), limits).unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&valid_transport).unwrap();
+    for field in 0..8 {
+        let mut value = envelope.clone();
+        match field {
+            0 => value["protocol"] = serde_json::json!("fnlp.assay.scored"),
+            1 => value["operation"] = serde_json::json!("eval"),
+            2 => value["evidence"] = serde_json::json!("provided_observations"),
+            3 => value["activation_authority"] = serde_json::json!(true),
+            4 => value["schema_version"] = serde_json::json!(2),
+            5 => { value.as_object_mut().unwrap().remove("activation_authority"); }
+            6 => value["unknown"] = serde_json::json!("PRIVATE-untrusted"),
+            _ => {} // A correctly framed but unauthenticated inner report also refuses.
+        }
+        let bytes = canonjson::canonical_bytes(&value).unwrap();
+        let Err(error) = decode_application(&bytes, Sha256Digest::of_bytes(&bytes), &key, "fixture", context(), limits)
+            else { panic!("untrusted calibration transport became a prepared application"); };
+        assert_eq!(error.code, ErrorCode::ArtifactIntegrityOrFormatOrVersion);
+        assert!(!error.reason.contains("PRIVATE"));
+    }
+    let duplicate = b"{\"schema_version\":1,\"schema_version\":1}";
+    assert!(decode_application(duplicate, Sha256Digest::of_bytes(duplicate), &key, "fixture", context(), limits).is_err());
+    let Err(error) = decode_application(b"not-json", Sha256Digest::of_bytes(b"independent-pin"), &key, "fixture", context(), limits)
+        else { panic!("mismatched pin accepted"); };
+    assert_eq!(error.reason, AssayError::InputDigest.code());
+    let mut cap = limits; cap.max_output_bytes = valid_transport.len() - 1;
+    let Err(error) = decode_application(&valid_transport, Sha256Digest::of_bytes(&valid_transport), &key, "fixture", context(), cap)
+        else { panic!("oversized calibration accepted"); };
+    assert_eq!(error.code, ErrorCode::AdmissionOrResourceLimit);
 }
 
 #[test]

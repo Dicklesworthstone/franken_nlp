@@ -81,29 +81,92 @@ struct Comparison {
     /// Caller-declared nonsecret scope, distinct from observed model execution.
     #[arg(long, required_unless_present = "schema")]
     host_scope: Option<String>,
+    /// Complete independently pinned native calibration report for the baseline.
+    #[arg(long, requires_all = ["expected_baseline_calibration_sha256", "baseline_as_of", "baseline_shift_assessment"])]
+    baseline_calibration: Option<PathBuf>,
+    #[arg(long, requires = "baseline_calibration")]
+    expected_baseline_calibration_sha256: Option<String>,
+    #[arg(long, requires = "baseline_calibration", value_name = "YYYY-MM-DD")]
+    baseline_as_of: Option<String>,
+    #[arg(long, requires = "baseline_calibration", value_parser = ["in-distribution", "detected"])]
+    baseline_shift_assessment: Option<String>,
+    #[arg(long, requires = "baseline_calibration")]
+    baseline_shift_indicator: Option<String>,
 }
 
-pub(crate) struct Command { args: Arguments, comparison: Option<Comparison> }
+#[derive(Args, Default)]
+struct Application {
+    /// Complete authenticated report from `calibrate native-int4`, over this exact frozen suite.
+    #[arg(long, requires_all = ["expected_calibration_sha256", "as_of", "shift_assessment"])]
+    calibration: Option<PathBuf>,
+    #[arg(long, requires = "calibration")]
+    expected_calibration_sha256: Option<String>,
+    #[arg(long, requires = "calibration", value_name = "YYYY-MM-DD")]
+    as_of: Option<String>,
+    #[arg(long, requires = "calibration", value_parser = ["in-distribution", "detected"])]
+    shift_assessment: Option<String>,
+    #[arg(long, requires = "calibration")]
+    shift_indicator: Option<String>,
+}
 
-pub(super) fn definition(paired: bool) -> clap::Command {
+#[derive(Args)]
+struct Fit {
+    /// Isotonic supports endpoint weights; temperature refuses 0/1 without clipping.
+    #[arg(long, default_value = "isotonic", value_parser = ["temperature", "isotonic"])]
+    method: String,
+    #[arg(long, required_unless_present = "schema", value_name = "YYYY-MM-DD")]
+    valid_from: Option<String>,
+    #[arg(long, required_unless_present = "schema", value_name = "YYYY-MM-DD")]
+    valid_through: Option<String>,
+    #[arg(long, required_unless_present = "schema", value_parser = ["raw-scores-uncalibrated", "conservative-abstain"])]
+    shift_policy: Option<String>,
+}
+struct ApplicationInput { path: PathBuf, pin: Sha256Digest, options: assay::calibrate::ApplyOptions }
+
+pub(crate) struct Command {
+    args: Arguments, comparison: Option<Comparison>, fit: Option<Fit>, application: Option<Application>,
+}
+
+pub(super) fn definition(operation: &str) -> clap::Command {
     let command = Arguments::augment_args(clap::Command::new("native-int4")
-        .about(if paired { "Replay pinned candidate and baseline classifiers on identical labeled text" }
-            else { "Run a pinned native INT4 classifier on a frozen labeled text suite" }))
+        .about(match operation {
+            "qualify" => "Replay pinned candidate and baseline classifiers on identical labeled text",
+            "calibrate" => "Fit authenticated reliability calibration from actual native replay",
+            _ => "Run a pinned native INT4 classifier on a frozen labeled text suite",
+        }))
         .mut_arg("suite", |arg| arg.help("Strict binary-classification suite with exact case-file pin, labels and split membership"))
         .mut_arg("observations", |arg| arg.long("cases")
             .help("Frozen labeled-text NDJSON; '-' reads stdin; caller probabilities are rejected"))
+        .mut_arg("max_output_bytes", |arg| arg.help("Complete output report cap, also applied independently to each imported calibration report"))
         .after_help("Output is one complete canonical JSON report under fnlp.assay.native-int4 v1. Native execution is observed; human gold labels and host scope remain caller declarations. Reports grant no model activation authority. Use --schema for exact data contracts.");
-    if paired { Comparison::augment_args(command) } else { command }
+    match operation {
+        "calibrate" => Fit::augment_args(command),
+        "qualify" => Comparison::augment_args(Application::augment_args(command)),
+        _ => Application::augment_args(command),
+    }
 }
 impl Command {
-    pub(super) fn from_matches(paired: bool, matches: &ArgMatches) -> Result<Self, clap::Error> {
+    pub(super) fn from_matches(operation: &str, matches: &ArgMatches) -> Result<Self, clap::Error> {
         Ok(Self { args: Arguments::from_arg_matches(matches)?,
-            comparison: if paired { Some(Comparison::from_arg_matches(matches)?) } else { None } })
+            comparison: if operation == "qualify" { Some(Comparison::from_arg_matches(matches)?) } else { None },
+            fit: if operation == "calibrate" { Some(Fit::from_arg_matches(matches)?) } else { None },
+            application: if operation == "calibrate" { None } else { Some(Application::from_arg_matches(matches)?) } })
     }
-    fn operation(&self) -> &'static str { if self.comparison.is_some() { "qualify" } else { "eval" } }
+    fn operation(&self) -> &'static str {
+        if self.fit.is_some() { "calibrate" } else if self.comparison.is_some() { "qualify" } else { "eval" }
+    }
+    fn artifact_count(&self) -> usize {
+        usize::from(self.application.as_ref().is_some_and(|options| options.calibration.is_some()))
+            + usize::from(self.comparison.as_ref().is_some_and(|options| options.baseline_calibration.is_some()))
+    }
     fn validate(&self) -> Result<Limits, Failure> {
         let limits = self.args.common.limits()?;
         self.args.metrics.options().validate(limits)?;
+        if let Some(fit) = &self.fit {
+            if self.application.is_some() || self.comparison.is_some() { return Err(invalid_options()); }
+            assay::native_classify::calibrate::validate_fit_options(fit.options()?, limits)?;
+        }
+        if let Some(application) = &self.application { let _ = application.input()?; }
         let args = &self.args;
         model_input(args.snapshot.as_deref(), args.expected_model_sha256.as_deref(), args.group_width)?;
         mib(args.memory_mib.ok_or_else(invalid_options)?)?; mib(args.preparation_mib)?;
@@ -120,6 +183,7 @@ impl Command {
         Int4MemoryRequirement::for_context(args.context_tokens, args.group_width).map_err(|_| invalid_options())?;
         PackedInt4Kernel::detect(args.kernel).map_err(|_| invalid_options())?;
         if let Some(comparison) = &self.comparison {
+            let _ = comparison.application_input()?;
             model_input(comparison.baseline_snapshot.as_deref(), comparison.baseline_model_sha256.as_deref(),
                 comparison.baseline_group_width)?;
             Int4MemoryRequirement::for_context(args.context_tokens, comparison.baseline_group_width)
@@ -173,6 +237,60 @@ impl Arguments {
             max_output_bytes: self.max_result_bytes as u64, max_grammar_states: 4096,
             max_kv_bytes: native.kv_bytes })
     }
+}
+impl Fit {
+    fn options(&self) -> Result<assay::calibrate::FitOptions, Failure> {
+        use assay::calibrate::{FitMethod, FitOptions, parse_date};
+        let method = match self.method.as_str() {
+            "temperature" => FitMethod::Temperature, "isotonic" => FitMethod::Isotonic,
+            _ => return Err(invalid_options()),
+        };
+        let valid_from = parse_date(self.valid_from.as_deref().ok_or_else(invalid_options)?)?;
+        let valid_through = parse_date(self.valid_through.as_deref().ok_or_else(invalid_options)?)?;
+        let validity = crate::calibration::ValidityWindow::new(valid_from, valid_through).map_err(|_| invalid_options())?;
+        let shift_policy = match self.shift_policy.as_deref() {
+            Some("raw-scores-uncalibrated") => crate::calibration::ShiftPolicy::RawScoresUncalibrated,
+            Some("conservative-abstain") => crate::calibration::ShiftPolicy::ConservativeAbstain,
+            _ => return Err(invalid_options()),
+        };
+        Ok(FitOptions { method, validity, shift_policy })
+    }
+}
+impl Application {
+    fn input(&self) -> Result<Option<ApplicationInput>, Failure> {
+        application_input(self.calibration.as_deref(), self.expected_calibration_sha256.as_deref(),
+            self.as_of.as_deref(), self.shift_assessment.as_deref(), self.shift_indicator.as_deref())
+    }
+}
+impl Comparison {
+    fn application_input(&self) -> Result<Option<ApplicationInput>, Failure> {
+        application_input(self.baseline_calibration.as_deref(), self.expected_baseline_calibration_sha256.as_deref(),
+            self.baseline_as_of.as_deref(), self.baseline_shift_assessment.as_deref(), self.baseline_shift_indicator.as_deref())
+    }
+}
+fn application_input(path: Option<&Path>, digest: Option<&str>, date: Option<&str>,
+    assessment: Option<&str>, indicator: Option<&str>) -> Result<Option<ApplicationInput>, Failure> {
+    let Some(path) = path else {
+        if [digest, date, assessment, indicator].iter().any(Option::is_some) { return Err(invalid_options()); }
+        return Ok(None);
+    };
+    if !file_path(path) { return Err(invalid_options()); }
+    let pin = Sha256Digest::from_hex(digest.ok_or_else(invalid_options)?).map_err(|_| invalid_options())?;
+    let observed_date = assay::calibrate::parse_date(date.ok_or_else(invalid_options)?)?;
+    let shift = match assessment {
+        Some("in-distribution") if indicator.is_none() => crate::calibration::ShiftAssessment::InDistribution,
+        Some("detected") => {
+            let indicator = indicator.ok_or_else(invalid_options)?;
+            if indicator.trim().is_empty() || indicator.len() > 1024
+                || indicator.chars().any(|ch| ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}')) {
+                return Err(invalid_options());
+            }
+            crate::calibration::ShiftAssessment::Detected { indicator: indicator.to_owned() }
+        }
+        _ => return Err(invalid_options()),
+    };
+    Ok(Some(ApplicationInput { path: path.to_owned(), pin,
+        options: assay::calibrate::ApplyOptions { observed_date, shift } }))
 }
 fn file_path(path: &Path) -> bool { !path.as_os_str().is_empty() && path.as_os_str() != "-" }
 fn model_input(path: Option<&Path>, digest: Option<&str>, width: usize)

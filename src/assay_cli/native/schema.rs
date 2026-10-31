@@ -62,6 +62,31 @@ pub(super) fn document(operation: &str) -> Value {
             "decrease_bounds":"Negative accuracy/F1 decrease bounds require improvement; an undefined required F1 fails its gate.",
             "activation_authority":false
         },
+        "calibration":{
+            "scope":crate::assay::native_classify::calibrate::SCOPE,
+            "fit_command":"calibrate native-int4",
+            "default_method":"isotonic",
+            "methods":["isotonic","temperature"],
+            "fit_population":"Only calibration rows fit parameters; only locked-test rows determine reported reliability metrics.",
+            "temperature":"Exact 0/1 calibration weights refuse; no implicit epsilon clipping.",
+            "fit_context":["--valid-from","--valid-through","--shift-policy"],
+            "shift_policies":["raw-scores-uncalibrated","conservative-abstain"],
+            "application_context":["--calibration","--expected-calibration-sha256","--as-of","--shift-assessment"],
+            "baseline_context":["--baseline-calibration","--expected-baseline-calibration-sha256","--baseline-as-of","--baseline-shift-assessment"],
+            "shift_indicator":"Detected shift requires its arm's bounded nonsecret indicator; in-distribution rejects one.",
+            "authentication":"Pin the exact complete native calibrate envelope before parsing; authenticate report, artifact and parameter seals with the same key and namespace before model loads.",
+            "binding":"Exact frozen dataset plus complete actual native execution and observation collections; a different model, source population, task budget or label/policy binding refuses.",
+            "score_semantics":"Transforms reliability scores only; observed native selected labels and policy abstentions remain unchanged.",
+            "independent_arms":"Either, both or neither qualification arm may supply a calibration artifact. Paired reliability gates compare each arm's effective transformed or raw score.",
+            "conservative_fallback":"A conservative calibration abstention produces a typed successful abstained outcome and cannot pass qualification gates.",
+            "fit_status_path":"report.body.outcome.status",
+            "fit_statuses":["fitted","insufficient_data"],
+            "application_statuses":["evaluated","abstained"],
+            "qualification_statuses":["compared","abstained"],
+            "disclosure_statuses":["raw","calibrated","uncalibrated","abstained"],
+            "file_bound":"--max-output-bytes caps each complete imported calibration report as well as the final output.",
+            "private_parameters":"Fitted artifacts intentionally contain sensitive numeric parameters, including isotonic score knots; retain protected file output."
+        },
         "json_schema":{
             "$schema":"https://json-schema.org/draft/2020-12/schema",
             "$defs":{
@@ -102,7 +127,13 @@ pub(super) fn document(operation: &str) -> Value {
                     "required":["schema_version","protocol","operation","evidence","activation_authority","report"],
                     "properties":{"schema_version":{"const":1},"protocol":{"const":NATIVE_PROTOCOL},
                         "operation":{"const":operation},"evidence":{"const":"native_model_replay"},
-                        "activation_authority":{"const":false},"report":{"type":"object"}}}
+                        "activation_authority":{"const":false},"report":{"type":"object"}}},
+                "calibration_envelope":{"type":"object","additionalProperties":false,
+                    "required":["schema_version","protocol","operation","evidence","activation_authority","report"],
+                    "properties":{"schema_version":{"const":1},"protocol":{"const":NATIVE_PROTOCOL},
+                        "operation":{"const":"calibrate"},"evidence":{"const":"native_model_replay"},
+                        "activation_authority":{"const":false},"report":{"type":"object","additionalProperties":false,
+                            "required":["body","seal"],"properties":{"body":{"type":"object"},"seal":{"type":"object"}}}}}
             }
         }
     })

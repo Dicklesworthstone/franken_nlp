@@ -2,8 +2,8 @@
 use super::*;
 use std::time::{Duration, Instant};
 use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
-    assay::native_classify,
-    hosted::{CancellationToken, HostedError, Int4AssayHostLimits, Int4LoadRequirements,
+    assay::native_classify::{self, calibrate as native_calibration},
+    hosted::{CancellationToken, HostedError, HostedOutput, Int4AssayHostLimits, Int4AssayOperation, Int4LoadRequirements,
         Int4HostError, NativeLimits, RunLimits},
     native_engine::{decode::DecodeCancellationKind, lmhead::scoring::ScoringError,
         strict_int4::{StrictInt4Error, scoring::Int4ScoringError,
@@ -56,14 +56,27 @@ impl Plan {
             task: args.task()?, preparation_reserve_bytes: mib(args.preparation_mib)?,
             max_model_work: args.work() };
         let widths = [candidate.pin.group_width, baseline.as_ref().map(|model| model.pin.group_width).unwrap_or(args.group_width)];
-        let need = host.requirements(&widths[..1 + usize::from(baseline.is_some())], limits).map_err(host_failure)?;
+        let widths = &widths[..1 + usize::from(baseline.is_some())];
+        let artifacts = command.artifact_count();
+        let operation = if command.fit.is_some() { Int4AssayOperation::Fit }
+            else if artifacts != 0 { Int4AssayOperation::Apply { artifacts } }
+            else { Int4AssayOperation::Raw };
+        let need = host.requirements_for_operation(widths, limits, operation).map_err(host_failure)?;
         let multiply = |count: usize, bytes: u64| (count as u64).checked_mul(bytes).ok_or_else(invalid_options);
+        // Prepared applications are authenticated before either model load.
+        // Keep their complete quoted storage outside the host until transfer,
+        // plus independent raw/envelope parsing storage for each bounded file.
+        let calibration_staging = if artifacts == 0 { 0 } else {
+            let raw = host.requirements(widths, limits).map_err(host_failure)?;
+            sum(&[need.input_bytes.checked_sub(raw.input_bytes).ok_or_else(invalid_options)?,
+                multiply(limits.max_output_bytes, 8 * artifacts as u64)?])?
+        };
         // Input bytes, strict parsing, text/ID indices and complete encoded
         // report staging exist before/after the hosted ownership transfer.
         // This guard stays live through the final physical output flush.
         let raw_staging_bytes = sum(&[multiply(limits.max_input_bytes, 8)?,
             multiply(limits.max_manifest_bytes, 8)?, multiply(limits.max_rows, 1024)?,
-            multiply(limits.max_output_bytes, 4)?, CLEANUP_BYTES])?;
+            multiply(limits.max_output_bytes, 4)?, calibration_staging, CLEANUP_BYTES])?;
         let residents = sum(&[candidate.memory.resident_bytes,
             baseline.as_ref().map_or(0, |model| model.memory.resident_bytes)])?;
         let codec = candidate.memory.staging_bytes.max(baseline.as_ref().map_or(0, |model| model.memory.staging_bytes));
@@ -118,6 +131,10 @@ pub(super) fn execute(command: &Command, limits: Limits, input: &mut impl Read,
     let namespace = common.namespace.as_deref().ok_or_else(invalid_options)?.to_owned();
     let options = command.args.metrics.options();
     preflight_replay(&dataset, &key, &namespace, options, limits, command.comparison.is_some())?;
+    let candidate_application = command.application.as_ref().map(Application::input).transpose()?.flatten()
+        .map(|input| load_application(input, &dataset, &key, &namespace, limits)).transpose()?;
+    let baseline_application = command.comparison.as_ref().map(Comparison::application_input).transpose()?.flatten()
+        .map(|input| load_application(input, &dataset, &key, &namespace, limits)).transpose()?;
     remaining()?;
     let cancellation = CancellationToken::default();
     let load_run = |duration| RunLimits { max_elapsed: duration,
@@ -127,30 +144,83 @@ pub(super) fn execute(command: &Command, limits: Limits, input: &mut impl Read,
     let baseline = plan.baseline.as_ref().map(|model| engine.load_int4_snapshot(model.path.clone(), model.pin,
         model.budget, ALLOCATOR_BYTES, load_run(remaining()?), cancellation.clone()).map_err(host_failure)).transpose()?;
     plan.host.native.run.max_elapsed = remaining()?;
-    match (&command.comparison, baseline.as_ref(), gates) {
-        (None, None, None) => {
+    match (&command.fit, &command.comparison, baseline.as_ref(), gates, candidate_application, baseline_application) {
+        (Some(fit), None, None, None, None, None) => {
+            let report = engine.calibrate_int4_classification(&candidate, dataset, key, namespace,
+                fit.options()?, options, limits, plan.host, plan.kernel, cancellation).map_err(host_failure)?;
+            publish_hosted(report, command.operation(), limits, destination, output, &remaining)
+        }
+        (None, None, None, None, None, None) => {
             let report = engine.evaluate_int4_classification(&candidate, dataset, key, namespace,
                 options, limits, plan.host, plan.kernel, cancellation).map_err(host_failure)?;
-            remaining()?;
-            let bytes = encode(command.operation(), report.result(), limits)?;
-            remaining()?;
-            publish(destination, &bytes, output)?;
-            // The report's output claim and outer staging both cover flush.
-            drop(report);
+            publish_hosted(report, command.operation(), limits, destination, output, &remaining)
         }
-        (Some(comparison), Some(baseline), Some(gates)) => {
+        (None, None, None, None, Some(application), None) => {
+            let report = engine.evaluate_int4_classification_calibrated(&candidate, dataset, application, key, namespace,
+                options, limits, plan.host, plan.kernel, cancellation).map_err(host_failure)?;
+            publish_hosted(report, command.operation(), limits, destination, output, &remaining)
+        }
+        (None, Some(comparison), Some(baseline), Some(gates), candidate_application, baseline_application) => {
             let host_scope = comparison.host_scope.as_deref().ok_or_else(invalid_options)?.to_owned();
-            let report = engine.qualify_int4_classification(&candidate, baseline, dataset, key, namespace,
-                host_scope, gates, options, limits, plan.host, plan.kernel, cancellation).map_err(host_failure)?;
-            remaining()?;
-            let bytes = encode(command.operation(), report.result(), limits)?;
-            remaining()?;
-            publish(destination, &bytes, output)?;
-            drop(report);
+            if candidate_application.is_none() && baseline_application.is_none() {
+                let report = engine.qualify_int4_classification(&candidate, baseline, dataset, key, namespace,
+                    host_scope, gates, options, limits, plan.host, plan.kernel, cancellation).map_err(host_failure)?;
+                publish_hosted(report, command.operation(), limits, destination, output, &remaining)
+            } else {
+                let report = engine.qualify_int4_classification_calibrated(&candidate, baseline, dataset,
+                    candidate_application, baseline_application, key, namespace, host_scope, gates,
+                    options, limits, plan.host, plan.kernel, cancellation).map_err(host_failure)?;
+                publish_hosted(report, command.operation(), limits, destination, output, &remaining)
+            }
         }
-        _ => return Err(invalid_options()),
+        _ => Err(invalid_options()),
     }
-    Ok(())
+}
+
+fn publish_hosted<T: Serialize>(report: HostedOutput<T>, operation: &'static str, limits: Limits,
+    destination: Option<Destination>, output: &mut impl Write,
+    remaining: &impl Fn() -> Result<Duration, Failure>) -> Result<(), Failure> {
+    remaining()?;
+    let bytes = encode(operation, report.result(), limits)?;
+    remaining()?;
+    let result = publish(destination, &bytes, output);
+    // The output claim and outer staging both survive the physical flush.
+    drop(report);
+    result
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredNativeCalibration {
+    schema_version: u32, protocol: String, operation: String, evidence: String,
+    activation_authority: bool, report: serde_json::Value,
+}
+fn load_application(input: ApplicationInput, dataset: &native_classify::Dataset, key: &CommitmentKey,
+    namespace: &str, limits: Limits) -> Result<native_calibration::PreparedApplication, Failure> {
+    let bytes = read_file(&input.path, limits.max_output_bytes)?;
+    let prepared = decode_application(&bytes, input.pin, key, namespace, input.options, limits)?;
+    prepared.validate_dataset(dataset, key, namespace, limits)?;
+    Ok(prepared)
+}
+fn decode_application(bytes: &[u8], pin: Sha256Digest, key: &CommitmentKey, namespace: &str,
+    options: assay::calibrate::ApplyOptions, limits: Limits) -> Result<native_calibration::PreparedApplication, Failure> {
+    if bytes.is_empty() || bytes.len() > limits.max_output_bytes { return Err(AssayError::InputLimit.into()); }
+    if Sha256Digest::of_bytes(bytes) != pin { return Err(AssayError::InputDigest.into()); }
+    let text = std::str::from_utf8(bytes).map_err(|_| AssayError::InvalidCalibration)?;
+    let value = canonjson::parse_str_with_limits(text,
+        canonjson::ParseLimits { max_depth: 32, max_string_bytes: limits.max_line_bytes })
+        .map_err(|_| AssayError::InvalidCalibration)?;
+    let stored: StoredNativeCalibration = serde_json::from_value(value).map_err(|_| AssayError::InvalidCalibration)?;
+    if stored.schema_version != 1 || stored.protocol != NATIVE_PROTOCOL || stored.operation != "calibrate"
+        || stored.evidence != "native_model_replay" || stored.activation_authority {
+        return Err(AssayError::InvalidCalibration.into());
+    }
+    let inner = assay::render(&stored.report, limits)?;
+    native_calibration::prepare_application(&inner, key, namespace, options, limits).map_err(|error| {
+        // The artifact transport owns malformed persisted JSON; source-case
+        // parsing retains its distinct input-decode category elsewhere.
+        if error == AssayError::Json { AssayError::InvalidCalibration.into() } else { error.into() }
+    })
 }
 
 /// Reject population-dependent work and receipt namespace failures before

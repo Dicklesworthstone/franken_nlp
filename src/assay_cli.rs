@@ -144,9 +144,11 @@ pub(crate) fn definitions() -> Vec<clap::Command> {
                     "All output is one complete canonical JSON report under fnlp.assay.scored v1. Scores and human labels are supplied by the caller; this command does not run a model or grant activation authority. Use --schema for the strict wire contract."));
             match name {
                 "eval" => command.about("Evaluate supplied observations or replay pinned native INT4 classification")
-                    .subcommand(native::definition(false)),
+                    .subcommand(native::definition("eval")),
+                "calibrate" => command.about("Fit supplied observations or actual native INT4 reliability on calibration rows")
+                    .subcommand(native::definition("calibrate")),
                 "qualify" => command.about("Compare paired supplied observations or native INT4 models under explicit local gates")
-                    .subcommand(native::definition(true)),
+                    .subcommand(native::definition("qualify")),
                 _ => command,
             }
         }).collect()
@@ -156,8 +158,8 @@ impl AssayCommand {
     pub(crate) fn recognizes(name: &str) -> bool { matches!(name, "eval" | "calibrate" | "qualify") }
     pub(crate) fn from_matches(name: &str, matches: &ArgMatches) -> Result<Self, clap::Error> {
         match matches.subcommand() {
-            Some(("native-int4", matches)) if matches!(name, "eval" | "qualify") =>
-                native::Command::from_matches(name == "qualify", matches).map(Self::Native),
+            Some(("native-int4", matches)) if Self::recognizes(name) =>
+                native::Command::from_matches(name, matches).map(Self::Native),
             Some(("scored", _)) => ScoredCommand::from_matches(name, matches).map(Self::Scored),
             _ => Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand,
                 "an explicit supported Assay backend is required")),

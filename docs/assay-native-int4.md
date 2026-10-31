@@ -1,17 +1,19 @@
 # Native INT4 classification Assay
 
 `fnlp eval native-int4` executes the native binary, exclusive classifier over a
-frozen labeled text population. `fnlp qualify native-int4` executes an explicitly
-pinned candidate and baseline over that same population, then applies declared
-classification-quality and reliability gates. Both commands require an existing
+frozen labeled text population. `fnlp calibrate native-int4` fits a persistable,
+authenticated reliability transform using only its calibration split.
+`fnlp qualify native-int4` executes an explicitly pinned candidate and baseline
+over the same population, optionally applies independent calibration artifacts,
+then applies declared classification-quality and reliability gates. All commands require an existing
 INT4 snapshot and an independently retained model-content SHA-256. They do not
 select an active model, convert weights, download a model, or activate artifacts.
 
 These commands need the `asupersync-runtime` feature and the protected local file
-profile on Linux x86_64/aarch64. `eval native-int4 --schema` and
-`qualify native-int4 --schema` describe the data contracts without a model, key,
-file read, or runtime. The original `eval/calibrate/qualify scored` commands keep
-their supplied-observation contracts; native calibration is not exposed here.
+profile on Linux x86_64/aarch64. Each operation supports `native-int4 --schema`
+to describe its data contracts without a model, key, file read, or runtime. The
+original `eval/calibrate/qualify scored` commands keep their supplied-observation
+contracts and cannot supply artifacts to the native calibration route.
 
 ## Freeze a labeled population
 
@@ -109,7 +111,80 @@ decision. Its framing version is
 `ordered_native_binary_observations_sha256_framed_v1`; both collections expose
 their format and row count alongside the HMAC. The suite, input, split membership
 and result seal are also bound. Documents, private row IDs, individual scores,
-and bare private input digests are omitted.
+and bare private input digests are omitted from ordinary evaluation reports.
+Calibration artifacts intentionally contain fitted numeric parameters; isotonic
+knots include observed calibration score boundaries. Treat those artifacts as
+sensitive and retain protected file output.
+
+## Fit, save and explicitly apply native calibration
+
+Fitting requires at least `--minimum-samples` rows in **both** the calibration
+and locked-test splits. The seven-row illustrative suite above has only one
+calibration row and therefore produces a typed `insufficient_data` fit with no
+usable artifact. The following commands assume a larger, independently labeled
+`calibration-suite.json` and `calibration-cases.ndjson`, with their exact complete
+byte pin and disjoint memberships already frozen.
+
+```sh
+fnlp calibrate native-int4 \
+  --snapshot /models/candidate.int4 --expected-model-sha256 "$CANDIDATE_PIN" \
+  --group-width 128 --memory-mib 16384 --kernel scalar \
+  --suite /private/calibration-suite.json --cases /private/calibration-cases.ndjson \
+  --key-file /private/assay.key --key-id owned-key --namespace owned-reviews-v1 \
+  --method isotonic --valid-from 2026-01-01 --valid-through 2026-12-31 \
+  --shift-policy conservative-abstain \
+  --max-rows 1000 --max-input-bytes 1048576 --max-suite-bytes 262144 \
+  --max-output-bytes 1048576 --output /private/native-calibration.json
+```
+
+Isotonic is the default and accepts native weights at zero or one. Explicit
+`--method temperature` performs deterministic temperature fitting and refuses
+endpoint calibration weights; it never introduces an implicit epsilon clamp.
+Both methods fit only calibration rows. The held-out reliability measurement is
+computed after fitting without feeding locked-test scores or labels into the
+fit. The original native label decisions, abstentions and classification metrics
+remain unchanged.
+
+Retain the SHA-256 of the **complete output file bytes**, including the outer
+native envelope and trailing LF, as `CALIBRATION_PIN`. Application authenticates
+the full report, artifact and parameter seals using the same key and namespace:
+
+```sh
+fnlp eval native-int4 \
+  --snapshot /models/candidate.int4 --expected-model-sha256 "$CANDIDATE_PIN" \
+  --group-width 128 --memory-mib 16384 --kernel scalar \
+  --suite /private/calibration-suite.json --cases /private/calibration-cases.ndjson \
+  --key-file /private/assay.key --key-id owned-key --namespace owned-reviews-v1 \
+  --calibration /private/native-calibration.json --expected-calibration-sha256 "$CALIBRATION_PIN" \
+  --as-of 2026-10-31 --shift-assessment in-distribution \
+  --max-rows 1000 --max-input-bytes 1048576 --max-suite-bytes 262144 \
+  --max-output-bytes 1048576 --output /private/calibrated-evaluation.json
+```
+
+The artifact scope is `exact_frozen_native_classification_replay`. Reapplication
+reruns the same frozen source population and verifies both complete actual
+execution and observation collections. Changing the input, split membership,
+labels, policy, task budget, model or native execution binding refuses. This
+artifact does not authorize calibrated claims on a new production population.
+It also never converts a supplied-observation artifact into native evidence.
+
+Date and shift are explicit caller declarations. Detected shift requires
+`--shift-assessment detected --shift-indicator population-change`; an
+in-distribution declaration rejects a shift indicator. Indicators are bounded,
+reject control characters/line separators, and appear in the sealed disclosure,
+so use nonsecret values. An expired, not-yet-valid or shifted artifact follows
+its declared `raw-scores-uncalibrated` or `conservative-abstain` policy. Tampering,
+a wrong key/namespace, or a changed replay binding is always a hard error and
+cannot use that fallback.
+
+Native fit/apply reports have a separately sealed `report.body` and
+`report.seal`. A fit exposes `report.body.outcome.status = fitted` or
+`insufficient_data`. An application exposes `evaluated` with an `evaluation`
+scorecard, or `abstained` with no invented measurement. Its
+`report.body.application.status` records `calibrated`, `uncalibrated`, or
+`abstained` and the reason. A calibrated scorecard transforms reliability
+probabilities only; it does not claim that its transformed score selected the
+observed native label.
 
 ## Compare candidate and baseline
 
@@ -155,6 +230,25 @@ successful report outcomes with exit status zero. The supplied `host_scope` is
 explicitly `caller_declared`; execution does not authenticate that declaration.
 Every report has `activation_authority = false` and audit-only receipt grade.
 
+To apply calibration during qualification, add the candidate's `--calibration`,
+`--expected-calibration-sha256`, `--as-of` and `--shift-assessment` arguments.
+The baseline has independent `--baseline-calibration`,
+`--expected-baseline-calibration-sha256`, `--baseline-as-of` and
+`--baseline-shift-assessment` arguments, plus `--baseline-shift-indicator` for
+detected shift. Each artifact must come from fitting its own model on this exact
+frozen suite. Either, both or neither arm may be calibrated; omission selects
+raw reliability for that arm without fitting anything implicitly.
+
+With at least one artifact, the outer qualified report has
+`report.body.candidate_application` and `baseline_application` disclosures.
+`report.body.outcome.status = compared` contains the ordinary `qualification`
+report, whose paired Brier differences and reliability gates use each arm's
+effective calibrated or declared raw-fallback scores. Actual native label/F1
+gates remain based on observed native decisions. If either artifact requires
+conservative abstention, the outcome is `abstained` and contains no numeric
+qualification decision that could pass. These explicit refusal reports still
+exit zero; authentication, binding, IO and resource failures exit nonzero.
+
 ## Admission, work and output
 
 Before key, suite, case or model IO, the CLI computes a checked complete memory
@@ -169,6 +263,12 @@ headroom separately. `--max-result-bytes` bounds each task result, while
 `--max-output-bytes` bounds the complete final report including its envelope/LF.
 After parsing, the CLI checks the complete held-out bootstrap workload across
 both arms and the actual receipt namespace contract before either snapshot load.
+Fit admission additionally includes calibration scans/sort/PAV storage,
+parameters and signed report staging. Apply admission includes each independent
+artifact file, strict envelope parsing, authenticated prepared owner and restored
+parameters before model loads and through hosted finalization. Each imported
+complete artifact file is also bounded by `--max-output-bytes`. Fitting and
+application run within the hosted cooperative cancellation/deadline envelope.
 
 The five work ceilings (`--max-forward-positions`, `--max-projected-logits`,
 `--max-attention-pairs`, `--max-dot-products`, `--max-multiply-accumulates`) cover
@@ -197,3 +297,13 @@ exact zero paired changes and doubled work, refuses a paired run priced for only
 one arm, and exercises private output, insufficient samples and mismatched pins.
 This is regression source, not a claimed model-quality measurement or recorded
 execution result.
+
+The separate ignored fixture
+`model_present_native_calibration_round_trip_and_independent_arms_preserve_authority`
+uses the same explicit model environment and child-process isolation. It fits
+isotonic on five calibration rows, saves and reloads the complete protected
+report, evaluates and compares both calibrated arms, verifies unchanged native
+decisions and exact paired work, refuses conservative expired qualification,
+and checks key/namespace/tamper/byte-pin/source-binding failures before opening
+a model. Its source adds regression coverage without asserting model quality or
+claiming that the fixture has been executed.
