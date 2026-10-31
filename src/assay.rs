@@ -15,9 +15,11 @@ use crate::{
 
 mod dataset;
 pub(crate) mod label_metrics;
+pub(crate) mod span_metrics;
 pub mod calibrate;
 pub mod qualify;
 pub mod native_classify;
+pub mod native_ner;
 pub use dataset::{Dataset, DatasetBindings, DatasetMetadata, Observation, Split, SplitBindings, SplitIds, SuiteManifest};
 
 pub const ASSAY_SCHEMA_VERSION: u32 = 1;

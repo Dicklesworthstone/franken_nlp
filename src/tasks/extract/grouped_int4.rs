@@ -60,6 +60,7 @@ pub struct Int4ExtractRun {
 pub struct Int4ExtractPlan {
     extraction: ExtractPlan,
     identity: ExecutionIdentity,
+    comparison_policy_digest: Sha256Digest,
     group_width: usize,
     work: Int4Work,
 }
@@ -99,8 +100,11 @@ impl Int4ExtractPlan {
         identity.decision_policy_digest = Sha256Digest::of_bytes(&canonjson::canonical_bytes(&(
             INT4_EXTRACT_VERSION, INT4_JSON_EXECUTION, group_width, extraction.policy_digest,
         )).map_err(|_| ExtractError::Serialization)?);
+        let comparison_policy_digest = Sha256Digest::of_bytes(&canonjson::canonical_bytes(&(
+            INT4_EXTRACT_VERSION, INT4_JSON_EXECUTION, "comparison-subject-group-width-v1", extraction.policy_digest,
+        )).map_err(|_| ExtractError::Serialization)?);
         identity.validate().map_err(|_| Int4ExtractError::Identity)?;
-        Ok(Self { extraction, identity, group_width, work })
+        Ok(Self { extraction, identity, comparison_policy_digest, group_width, work })
     }
 
     // Built-in task finalization is part of the admitted policy, not a
@@ -108,6 +112,9 @@ impl Int4ExtractPlan {
     pub(crate) fn with_finalizer_version(mut self, version: &'static str) -> Result<Self, Int4ExtractError> {
         self.identity.decision_policy_digest = Sha256Digest::of_bytes(&canonjson::canonical_bytes(&(
             "int4-built-in-finalizer-v1", version, self.identity.decision_policy_digest,
+        )).map_err(|_| ExtractError::Serialization)?);
+        self.comparison_policy_digest = Sha256Digest::of_bytes(&canonjson::canonical_bytes(&(
+            "int4-built-in-finalizer-v1", version, self.comparison_policy_digest,
         )).map_err(|_| ExtractError::Serialization)?);
         self.identity.validate().map_err(|_| Int4ExtractError::Identity)?;
         Ok(self)
@@ -120,6 +127,9 @@ impl Int4ExtractPlan {
     pub fn planned_work(&self) -> Int4Work { self.work }
     pub fn max_result_bytes(&self) -> u64 { self.extraction.max_result_bytes }
     pub fn max_kv_bytes(&self) -> u64 { self.extraction.max_kv_bytes }
+    // Paired audit compatibility may ignore only the comparison subject's
+    // group width. Complete execution admission still uses the full identity.
+    pub(crate) fn comparison_policy_digest(&self) -> Sha256Digest { self.comparison_policy_digest }
 
     /// All artifact, layout, task, policy and calibration fields are checked.
     /// Execution never repairs a caller's partially matching admission key.

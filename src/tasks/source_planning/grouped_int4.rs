@@ -26,6 +26,8 @@ use crate::{
 pub mod capacity;
 pub mod cohort;
 pub mod long;
+mod model;
+pub use model::Int4SourcePlanner;
 
 pub const INT4_SOURCE_EXECUTION: &str = "grouped-int4-source-portfolio-v1";
 
@@ -108,6 +110,7 @@ pub struct PreparedInt4SourceTask {
     extraction: Int4ExtractPlan,
     finalizer: Finalizer,
     budget: TaskBudget,
+    request_digest: Sha256Digest,
 }
 impl SourceTaskPlanner {
     /// The context must already identify the strict-v2 candidate and exact
@@ -161,7 +164,9 @@ impl SourceTaskPlanner {
             }
         };
         checkpoint(control)?;
-        Ok(PreparedInt4SourceTask { extraction, finalizer, budget })
+        let request_digest = Sha256Digest::of_bytes(&canonjson::canonical_bytes(request)
+            .map_err(|_| SourcePlanningError::Serialization)?);
+        Ok(PreparedInt4SourceTask { extraction, finalizer, budget, request_digest })
     }
 }
 impl PreparedInt4SourceTask {
@@ -172,6 +177,10 @@ impl PreparedInt4SourceTask {
     pub fn max_result_bytes(&self) -> u64 { self.extraction.max_result_bytes() }
     pub fn max_kv_bytes(&self) -> u64 { self.extraction.max_kv_bytes() }
     pub fn task_budget(&self) -> TaskBudget { self.budget }
+    /// Internal row association only. The public native result never exposes
+    /// this fingerprint of private source text or caller task configuration.
+    pub(crate) fn request_digest(&self) -> Sha256Digest { self.request_digest }
+    pub(crate) fn comparison_policy_digest(&self) -> Sha256Digest { self.extraction.comparison_policy_digest() }
     pub fn verify_identity(&self, admitted: &ExecutionIdentity) -> Result<(), Int4SourceError> {
         Ok(self.extraction.verify_identity(admitted)?)
     }

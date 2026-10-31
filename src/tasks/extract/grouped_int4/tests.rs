@@ -79,6 +79,24 @@ fn group_partition_controls_full_model_work_and_cannot_relabel_eager_or_int8() {
 }
 
 #[test]
+fn paired_policy_ignores_only_group_width_and_preserves_finalizer_and_decode_bounds() {
+    let a = plan(BOOLEAN, 16); let b = plan(BOOLEAN, 128);
+    assert_eq!(a.comparison_policy_digest(), b.comparison_policy_digest());
+    assert_ne!(a.execution_identity().decision_policy_digest, b.execution_identity().decision_policy_digest);
+    let original = a.comparison_policy_digest();
+    let wrapped = a.with_finalizer_version("ner-finalizer-fixture-v1").unwrap();
+    assert_ne!(original, wrapped.comparison_policy_digest());
+    assert_eq!(wrapped.comparison_policy_digest(),
+        b.with_finalizer_version("ner-finalizer-fixture-v1").unwrap().comparison_policy_digest());
+    assert_ne!(wrapped.comparison_policy_digest(),
+        plan(BOOLEAN, 16).with_finalizer_version("ner-finalizer-fixture-v2").unwrap().comparison_policy_digest());
+    let mut changed = options(); changed.max_new_tokens -= 1;
+    let changed = Int4ExtractPlan::from_task_plan(&task(BOOLEAN, vec![vec![7]], false, 16384),
+        BOOLEAN, changed, CompileLimits::default(), registry().template_controls(), identity(16), 16).unwrap();
+    assert_ne!(original, changed.comparison_policy_digest());
+}
+
+#[test]
 fn candidate_namespace_packing_group_controls_and_task_are_checked_before_compilation() {
     let task = task(BOOLEAN, vec![vec![7]], false, 16384);
     for axis in 0..9 {

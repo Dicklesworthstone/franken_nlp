@@ -128,6 +128,8 @@ fn exact_group_partition_changes_work_and_cannot_reuse_another_admission() {
         plans.push(plan);
     }
     for pair in plans.windows(2) {
+        assert_eq!(pair[0].request_digest(), pair[1].request_digest());
+        assert_eq!(pair[0].comparison_policy_digest(), pair[1].comparison_policy_digest());
         assert_eq!(pair[0].planned_work().projections.multiply_accumulates,
             pair[1].planned_work().projections.multiply_accumulates);
         assert!(pair[0].planned_work().projections.dot_products > pair[1].planned_work().projections.dot_products);
@@ -137,6 +139,26 @@ fn exact_group_partition_changes_work_and_cannot_reuse_another_admission() {
     for width in [0, 16, 127, usize::MAX] {
         assert!(p.plan_int4_with_control(&r, &context, SourcePlanningLimits::default(), width, &mut Continue).is_err());
     }
+}
+
+#[test]
+fn sealed_request_digest_binds_exact_source_options_and_task_budget() {
+    let p = planner(); let request = ner("Alice"); let original = prepare(&p, &request);
+    assert_eq!(original.request_digest(), Sha256Digest::of_bytes(&canonjson::canonical_bytes(&request).unwrap()));
+    let mut variants = vec![ner("Bob")];
+    let mut options = request.clone();
+    if let SourceTaskRequest::Ner { options, .. } = &mut options { options.max_entities -= 1; }
+    variants.push(options);
+    let mut budget_variant = request.clone();
+    if let SourceTaskRequest::Ner { budget, .. } = &mut budget_variant { budget.max_output_tokens -= 1; }
+    variants.push(budget_variant);
+    for changed in variants { assert_ne!(original.request_digest(), prepare(&p, &changed).request_digest()); }
+    let id = identity(&p, &request);
+    let mut limits = SourcePlanningLimits::default(); limits.source.verification.max_scan_steps -= 1;
+    let changed = p.plan_int4_with_control(&request, &PlanContext::new(&id, budget()).unwrap(),
+        limits, 32, &mut Continue).unwrap();
+    assert_eq!(original.request_digest(), changed.request_digest());
+    assert_ne!(original.comparison_policy_digest(), changed.comparison_policy_digest());
 }
 
 #[test]
