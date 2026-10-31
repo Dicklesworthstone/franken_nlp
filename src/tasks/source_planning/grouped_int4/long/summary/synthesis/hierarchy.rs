@@ -8,6 +8,9 @@ mod receipt;
 mod transport;
 /// Native discovery cohorts followed by bounded scalar quote-reduction levels.
 pub mod cohort;
+/// Native windows of independent groups within each fully admitted level.
+pub mod grouped;
+pub use grouped::Int4SummaryHierarchyGroupedRun;
 
 pub const INT4_SUMMARY_HIERARCHY_EXECUTION: &str = "grouped-int4-hierarchical-quote-summary-v1";
 const SEMANTICS: &str = "lossy-quote-selection-every-level-not-full-document-equivalence-v1";
@@ -140,9 +143,18 @@ impl SummaryHierarchyTail<'_> {
     fn reduce<C: DecodeStepControl>(&self, collection: evidence::Collection, remaining: &mut GroundingBudget,
         planner: &SourceTaskPlanner, engine: &mut StrictInt4Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
         -> Result<execution::Reduced, Int4SourceMapError> {
+        self.reduce_with_execution(collection, remaining, planner, vocabulary,
+            execution::Execution::Scalar(engine), control)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn reduce_with_execution<'a, 'w, C: DecodeStepControl>(&'a self, collection: evidence::Collection,
+        remaining: &mut GroundingBudget, planner: &'a SourceTaskPlanner, vocabulary: &'a ExtractionVocabulary,
+        execution: execution::Execution<'a, 'w>, control: &mut C)
+        -> Result<execution::Reduced, Int4SourceMapError> {
         let base = &self.base;
         let mut driver = execution::Native { planner, identity: &base.identity, budget: base.budget, planning: base.planning,
-            options: base.request.synthesis_options, mapping: self.mapping, engine, vocabulary, group_width: self.expected.group_width() };
+            options: base.request.synthesis_options, mapping: self.mapping, execution, vocabulary,
+            group_width: self.expected.group_width() };
         execution::reduce(base.source, collection, base.request, self.expected, self.mapping.reduction.max_result_bytes as u64,
             remaining, &mut driver, control)
     }

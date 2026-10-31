@@ -7,6 +7,8 @@ mod receipt;
 mod transport;
 /// Native discovery cohorts with the existing bounded quotation hierarchy.
 pub mod cohort;
+/// Native group windows inside each completely admitted hierarchy level.
+pub mod grouped;
 
 pub const INT4_QUESTION_HIERARCHY_EXECUTION: &str = "grouped-int4-hierarchical-quote-answer-v1";
 const SEMANTICS: &str = "lossy-question-quote-selection-not-full-document-equivalence-v1";
@@ -178,7 +180,7 @@ impl HierarchyContinuation<'_> {
         let base = &self.base;
         let mut driver = execution::Native { planner, identity: &base.identity, question: &base.question,
             budget: base.budget, planning: base.planning, options: base.options, mapping: self.mapping,
-            engine, vocabulary, expected: self.expected };
+            engine: execution::Engine::Scalar(engine), vocabulary, expected: self.expected };
         execution::reduce(base.source, collection, self.expected, self.mapping.reduction.max_result_bytes as u64,
             remaining, &mut driver, control)
     }

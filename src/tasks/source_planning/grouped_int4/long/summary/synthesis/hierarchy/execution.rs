@@ -1,10 +1,21 @@
 //! Exact whole-segment grouping and complete-level native admission.
 use super::*;
+use crate::{
+    native_engine::{int4::PackedInt4Kernel, strict_int4::Int4ModelWeights},
+    tasks::source_planning::grouped_int4::long::cohort::{Int4SourceMapCohortBudget,
+        hierarchy::{self as grouped, Int4HierarchyCohortStats}},
+};
+
+pub(super) enum Execution<'a, 'w> {
+    Scalar(&'a mut StrictInt4Engine<'w>),
+    Cohorts { weights: &'w Int4ModelWeights, budget: Int4SourceMapCohortBudget,
+        kernel: PackedInt4Kernel, max_groups: usize, stats: &'a mut Int4HierarchyCohortStats },
+}
 
 pub(super) struct Native<'a, 'w> {
     pub planner: &'a SourceTaskPlanner, pub identity: &'a ExecutionIdentity,
     pub budget: TaskBudget, pub planning: SourcePlanningLimits, pub options: SummaryOptions,
-    pub mapping: Int4SourceMapLimits, pub engine: &'a mut StrictInt4Engine<'w>, pub vocabulary: &'a ExtractionVocabulary,
+    pub mapping: Int4SourceMapLimits, pub execution: Execution<'a, 'w>, pub vocabulary: &'a ExtractionVocabulary,
     pub group_width: usize,
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -15,13 +26,21 @@ impl Witness {
         Ok(Self { identity: Sha256Digest::of_bytes(&bytes), prompt: plan.prompt_tokens(), work: plan.planned_work() })
     }
 }
-// Private fixture seam; public execution always uses Native.
+// Private fixture seam; public execution always uses the closed Native backend.
 pub(super) trait Driver {
     type Witness;
+    fn batch_width(&self) -> usize { 1 }
     fn count<C: DecodeStepControl>(&mut self, text: &str, control: &mut C) -> Result<usize, Int4SourceMapError>;
     fn prepare<C: DecodeStepControl>(&mut self, text: &str, control: &mut C) -> Result<Self::Witness, Int4SourceMapError>;
     fn run<C: DecodeStepControl>(&mut self, text: &str, witness: &Self::Witness, control: &mut C)
         -> Result<(Int4SourceTaskRun, Int4Work), Int4SourceMapError>;
+    fn run_batch<C: DecodeStepControl>(&mut self, texts: &[&str], witnesses: &[Self::Witness], control: &mut C)
+        -> Result<Vec<(Int4SourceTaskRun, Int4Work)>, Int4SourceMapError> {
+        if texts.len() != 1 || witnesses.len() != 1 { return Err(invalid()); }
+        let mut rows = vector(1)?;
+        rows.push(self.run(texts[0], &witnesses[0], control)?);
+        Ok(rows)
+    }
 }
 impl Native<'_, '_> {
     fn plan<C: DecodeStepControl>(&mut self, text: &str, control: &mut C) -> Result<PreparedInt4SourceTask, Int4SourceMapError> {
@@ -31,13 +50,22 @@ impl Native<'_, '_> {
         let plan = self.planner.plan_int4_with_control(&request, &context, self.planning, self.group_width, control)?;
         let (_, ceiling) = reserve(self.budget, self.planning, self.mapping, self.group_width)?;
         if !fits(plan.planned_work(), ceiling) { return Err(Int4SourceMapError::WorkLimit); }
-        let driver = NativeDriver { engine: self.engine, vocabulary: self.vocabulary, control, limits: self.mapping };
-        preflight(std::slice::from_ref(&plan), std::slice::from_ref(plan.execution_identity()), &driver)?;
+        match &mut self.execution {
+            Execution::Scalar(engine) => {
+                let driver = NativeDriver { engine: &mut **engine, vocabulary: self.vocabulary, control, limits: self.mapping };
+                preflight(std::slice::from_ref(&plan), std::slice::from_ref(plan.execution_identity()), &driver)?;
+            }
+            Execution::Cohorts { weights, budget, .. } =>
+                grouped::preflight_plan(&plan, weights, self.vocabulary, *budget, self.mapping, control)?,
+        }
         Ok(plan)
     }
 }
 impl Driver for Native<'_, '_> {
     type Witness = Witness;
+    fn batch_width(&self) -> usize {
+        match self.execution { Execution::Scalar(_) => 1, Execution::Cohorts { max_groups, .. } => max_groups }
+    }
     fn count<C: DecodeStepControl>(&mut self, text: &str, control: &mut C) -> Result<usize, Int4SourceMapError> {
         checkpoint(control)?;
         let count = self.planner.source_encoder().encode(text, self.planning.max_input_bytes, self.planning.max_input_bytes)
@@ -52,10 +80,42 @@ impl Driver for Native<'_, '_> {
         -> Result<(Int4SourceTaskRun, Int4Work), Int4SourceMapError> {
         let plan = self.plan(text, control)?;
         if Witness::of(&plan)? != *witness { return Err(Int4SourceMapError::Admission); }
-        let mut driver = NativeDriver { engine: self.engine, vocabulary: self.vocabulary, control, limits: self.mapping };
+        let Execution::Scalar(engine) = &mut self.execution else { return Err(invalid()); };
+        let mut driver = NativeDriver { engine: &mut **engine, vocabulary: self.vocabulary, control, limits: self.mapping };
         let run = driver.run(&plan, plan.execution_identity())?;
         check_run(&plan, &run, self.mapping.mask_visits_per_chunk)?;
         Ok((run, plan.planned_work()))
+    }
+    fn run_batch<C: DecodeStepControl>(&mut self, texts: &[&str], witnesses: &[Witness], control: &mut C)
+        -> Result<Vec<(Int4SourceTaskRun, Int4Work)>, Int4SourceMapError> {
+        if texts.is_empty() || texts.len() != witnesses.len() || texts.len() > self.batch_width() {
+            return Err(Int4SourceMapError::Admission);
+        }
+        if matches!(self.execution, Execution::Scalar(_)) {
+            let mut rows = vector(1)?;
+            rows.push(self.run(texts[0], &witnesses[0], control)?);
+            return Ok(rows);
+        }
+        // Rebuild at most one physical window after the entire level has its
+        // compact commitments. Every rebuilt plan must match before allocation.
+        let mut plans = vector(texts.len())?;
+        for (text, witness) in texts.iter().zip(witnesses) {
+            let plan = self.plan(text, control)?;
+            if Witness::of(&plan)? != *witness { return Err(Int4SourceMapError::Admission); }
+            plans.push(plan);
+        }
+        let Execution::Cohorts { weights, budget, kernel, stats, .. } = &mut self.execution
+            else { return Err(invalid()); };
+        let native = grouped::execute_window(&plans, weights, self.vocabulary, *budget, *kernel, self.mapping, control)?;
+        let completed = grouped::accumulate(**stats, &native)?;
+        if native.sequences.len() != plans.len() { return Err(invalid()); }
+        let mut rows = vector(plans.len())?;
+        for (plan, run) in plans.iter().zip(native.sequences) {
+            check_run(plan, &run, self.mapping.mask_visits_per_chunk)?;
+            rows.push((run, plan.planned_work()));
+        }
+        **stats = completed;
+        Ok(rows)
     }
 }
 struct Group { segments: Range<usize>, bytes: usize, tokens: usize }
@@ -104,6 +164,8 @@ pub(super) fn reduce<C: DecodeStepControl, D: Driver>(source: &str, mut frontier
     remaining: &mut GroundingBudget, driver: &mut D, control: &mut C) -> Result<Reduced, Int4SourceMapError> {
     let mut out = Reduced::empty(expected)?;
     checkpoint(control)?;
+    let batch_width = driver.batch_width();
+    if !(1..=64).contains(&batch_width) { return Err(Int4SourceMapError::InvalidLimits); }
     if frontier.segment_count() == 0 { return Ok(out); }
     for level in 0..expected.limits.max_levels {
         checkpoint(control)?;
@@ -117,7 +179,7 @@ pub(super) fn reduce<C: DecodeStepControl, D: Driver>(source: &str, mut frontier
         }
         // Compile and authenticate EVERY actual group before this level's first
         // native call. Compact witnesses retain no source text or identity strings.
-        // Rebuilding one plan at a time keeps only one grammar/source owner live.
+        // Rebuilding only the current native window bounds live grammar owners.
         let mut witnesses = vector(groups.len())?;
         for group in &groups {
             checkpoint(control)?;
@@ -125,27 +187,44 @@ pub(super) fn reduce<C: DecodeStepControl, D: Driver>(source: &str, mut frontier
         }
         let first = out.passes.len();
         let mut next = evidence::Collection::empty();
-        for (group_index, (group, witness)) in groups.into_iter().zip(witnesses).enumerate() {
+        for (window_index, (groups, witnesses)) in groups.chunks(batch_width).zip(witnesses.chunks(batch_width)).enumerate() {
             checkpoint(control)?;
-            let window = frontier.window(group.segments.clone(), control)?;
-            let (native, planned) = driver.run(&window.text, &witness, control)?;
-            if !fits(planned, expected.discovery.synthesis_reserve) || !fits(native.model_work, planned) {
-                return Err(Int4SourceMapError::WorkLimit);
+            // Preserve the original scalar allocation/cancellation boundary.
+            // Wider windows never retain one transport copy per native row.
+            let mut single_window = if batch_width == 1 {
+                Some(frontier.window(groups[0].segments.clone(), control)?)
+            } else { None };
+            let mut texts = vector(groups.len())?;
+            for group in groups { texts.push(frontier.range_text(group.segments.clone())?); }
+            let rows = driver.run_batch(&texts, witnesses, control)?;
+            if rows.len() != groups.len() { return Err(invalid()); }
+            // The complete native window has drained. Reconstruct one evidence
+            // owner at a time and preserve the original ordered verification.
+            for (offset, (group, (native, planned))) in groups.iter().zip(rows).enumerate() {
+                let group_index = window_index * batch_width + offset;
+                checkpoint(control)?;
+                let window = match single_window.take() {
+                    Some(window) => window,
+                    None => frontier.window(group.segments.clone(), control)?,
+                };
+                if !fits(planned, expected.discovery.synthesis_reserve) || !fits(native.model_work, planned) {
+                    return Err(Int4SourceMapError::WorkLimit);
+                }
+                let SourceTaskResult::Summarize(raw) = &native.result else { return Err(invalid()); };
+                let bullets = evidence::lift_summary(source, raw, &window, request.synthesis_options, remaining, control)?;
+                let masks = mask_charge(&native.result);
+                if masks > expected.discovery.synthesis_masks { return Err(Int4SourceMapError::WorkLimit); }
+                let pass = SummaryHierarchyPass { level, group: group_index, input_segments: group.segments.clone(),
+                    input_bytes: group.bytes, input_tokens: group.tokens, planned_model_work: planned, native, bullets };
+                receipt::verify_pass(&expected, &pass)?;
+                out.planned = add_work(out.planned, planned).ok_or(Int4SourceMapError::WorkLimit)?;
+                out.actual = add_work(out.actual, pass.native.model_work).ok_or(Int4SourceMapError::WorkLimit)?;
+                out.masks = out.masks.checked_add(masks).ok_or(Int4SourceMapError::WorkLimit)?;
+                if !terminal { next.append_verified(source, &pass.bullets, request.synthesis_options, request.limits, remaining, control)?; }
+                out.passes.push(pass);
+                check_size(&out.passes, max_result_bytes).map_err(Int4SourceError::from)?;
+                checkpoint(control)?;
             }
-            let SourceTaskResult::Summarize(raw) = &native.result else { return Err(invalid()); };
-            let bullets = evidence::lift_summary(source, raw, &window, request.synthesis_options, remaining, control)?;
-            let masks = mask_charge(&native.result);
-            if masks > expected.discovery.synthesis_masks { return Err(Int4SourceMapError::WorkLimit); }
-            let pass = SummaryHierarchyPass { level, group: group_index, input_segments: group.segments,
-                input_bytes: group.bytes, input_tokens: group.tokens, planned_model_work: planned, native, bullets };
-            receipt::verify_pass(&expected, &pass)?;
-            out.planned = add_work(out.planned, planned).ok_or(Int4SourceMapError::WorkLimit)?;
-            out.actual = add_work(out.actual, pass.native.model_work).ok_or(Int4SourceMapError::WorkLimit)?;
-            out.masks = out.masks.checked_add(masks).ok_or(Int4SourceMapError::WorkLimit)?;
-            if !terminal { next.append_verified(source, &pass.bullets, request.synthesis_options, request.limits, remaining, control)?; }
-            out.passes.push(pass);
-            check_size(&out.passes, max_result_bytes).map_err(Int4SourceError::from)?;
-            checkpoint(control)?;
         }
         let next_size = EvidenceSize::of(&next);
         out.levels.push(SummaryHierarchyLevel { input, passes: first..end, next_evidence: if terminal { None } else { Some(next_size) } });

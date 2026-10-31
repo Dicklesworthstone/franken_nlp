@@ -55,7 +55,18 @@ fn finish<T: Serialize, C: DecodeStepControl>(document: T, discovery_cohorts: In
     native_chunks: usize, source_windows: usize, planned: Int4Work, actual: Int4Work,
     max_result_bytes: u64, control: &mut C) -> Result<Int4SynthesisCohortRun<T>, Int4SourceMapError> {
     checkpoint(control)?;
-    let stats = discovery_cohorts;
+    check_discovery_stats(discovery_cohorts, native_chunks, source_windows, planned, actual)?;
+    let run = Int4SynthesisCohortRun { schema_version: 1, execution: INT4_SYNTHESIS_COHORT_EXECUTION,
+        document, discovery_cohorts };
+    let cap = max_result_bytes.checked_add(COHORT_ENVELOPE_BYTES).ok_or(Int4SourceMapError::WorkLimit)?;
+    check_size(&run, cap).map_err(Int4SourceError::from)?;
+    checkpoint(control)?;
+    Ok(run)
+}
+
+pub(in crate::tasks::source_planning::grouped_int4::long)
+fn check_discovery_stats(stats: Int4SourceMapCohortStats, native_chunks: usize,
+    source_windows: usize, planned: Int4Work, actual: Int4Work) -> Result<(), Int4SourceMapError> {
     if native_chunks == 0 || source_windows == 0 || stats.chunks != native_chunks as u64
         || stats.cohorts == 0 || stats.cohorts > source_windows as u64 || stats.cohorts > stats.chunks
         || stats.planned_work != planned || stats.model_work != actual || !fits(actual, planned)
@@ -64,12 +75,7 @@ fn finish<T: Serialize, C: DecodeStepControl>(document: T, discovery_cohorts: In
         || stats.projection_groups > actual.projected_logits / NANBEIGE_VOCAB_SIZE as u64 {
         return Err(Int4SourceError::InvalidResult.into());
     }
-    let run = Int4SynthesisCohortRun { schema_version: 1, execution: INT4_SYNTHESIS_COHORT_EXECUTION,
-        document, discovery_cohorts };
-    let cap = max_result_bytes.checked_add(COHORT_ENVELOPE_BYTES).ok_or(Int4SourceMapError::WorkLimit)?;
-    check_size(&run, cap).map_err(Int4SourceError::from)?;
-    checkpoint(control)?;
-    Ok(run)
+    Ok(())
 }
 
 #[cfg(test)] mod tests;

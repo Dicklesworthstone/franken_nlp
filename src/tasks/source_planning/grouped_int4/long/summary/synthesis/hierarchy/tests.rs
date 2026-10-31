@@ -89,7 +89,7 @@ fn script(expected: Int4SummaryHierarchyPreflight) -> Script {
     Script { expected, inputs: vec![], preparations: vec![], events: vec![], full: false, empty: false,
         fail_prepare: None, fail_run: None, zero_tokens: false }
 }
-fn complete(empty: bool) -> (Int4SummaryHierarchyPreflight, Int4SummaryHierarchyRun) {
+pub(super) fn complete(empty: bool) -> (Int4SummaryHierarchyPreflight, Int4SummaryHierarchyRun) {
     let (tail, discovery) = discovered(empty); let expected = tail.expected;
     let run = tail.execute(discovery, |tail, collection, remaining, control|
         execution::reduce(SOURCE, collection, tail.base.request, tail.expected, 4 << 20, remaining,
@@ -306,3 +306,5 @@ fn hierarchy_limits_and_first_preparation_cancellation_fail_closed() {
         &mut Control { calls: 0, stop: 1 }).err().unwrap();
     assert_eq!(error.cancellation(), Some(DecodeCancellationKind::Deadline));
 }
+
+mod grouped;

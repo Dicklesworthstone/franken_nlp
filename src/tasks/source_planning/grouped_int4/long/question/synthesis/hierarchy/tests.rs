@@ -4,6 +4,7 @@ use super::*;
 use crate::{tasks::answer::PassageOccurrence,
     tasks::source_planning::grouped_int4::long::tests as maps};
 use std::collections::VecDeque;
+mod grouped;
 
 pub(super) struct Control { calls: usize, stop: usize }
 impl DecodeStepControl for Control {

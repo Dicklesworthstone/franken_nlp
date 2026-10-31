@@ -21,6 +21,8 @@ pub const COHORT_ENVELOPE_BYTES: u64 = 4096;
 /// Shared admission and result envelope for discovery cohorts followed by
 /// the existing scalar evidence-synthesis phases.
 pub mod synthesis;
+/// Independent evidence groups within one completely admitted hierarchy level.
+pub mod hierarchy;
 
 /// Maximum simultaneous chunk payload, quotable before source or model IO.
 /// Complete preparation, reduction, output and allocator reserves remain
