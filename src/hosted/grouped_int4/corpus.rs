@@ -5,6 +5,8 @@
 use super::*;
 mod source;
 pub use source::Int4SourceCorpusConfig;
+mod cohort;
+pub use cohort::Int4ExtractionCohortBatchResult;
 use std::io::{BufRead, Write};
 use crate::{
     batch::{self as stream, BatchCode, BatchItemFailure, BatchSummary,

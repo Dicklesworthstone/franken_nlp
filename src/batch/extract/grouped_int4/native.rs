@@ -260,7 +260,7 @@ fn preparation_failure(mut failure: BatchItemFailure) -> BatchItemFailure {
     }
     failure
 }
-fn execution_failure(error: Int4ExtractError) -> BatchItemFailure {
+pub(super) fn execution_failure(error: Int4ExtractError) -> BatchItemFailure {
     if let Some(cause) = error.cancellation() { return BatchItemFailure::fatal(BatchFault::cancelled(cause)); }
     match error {
         Int4ExtractError::Extraction(error) => super::super::execution_failure(error),

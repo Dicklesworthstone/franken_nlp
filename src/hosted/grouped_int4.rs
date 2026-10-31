@@ -14,6 +14,7 @@ pub use resolve::{Int4ResolveConfig, HostedInt4EntityCorpus, Int4EntityCorpusErr
     Int4EntityCorpusHostConfig, Int4EntityCorpusHostRequirements, Int4EntityCorpusSummary};
 mod redact;
 mod extract;
+mod structured_cohort;
 mod semantic;
 pub use semantic::{Int4SemanticHostLimits, Int4SemanticHostRequirements};
 mod extraction_map;
@@ -22,7 +23,7 @@ mod source;
 mod source_map;
 pub use source_map::Int4SourceMapConfig;
 mod corpus;
-pub use corpus::Int4SourceCorpusConfig;
+pub use corpus::{Int4SourceCorpusConfig, Int4ExtractionCohortBatchResult};
 mod scored_batch;
 pub use scored_batch::{Int4ScoredCohortHostLimits, Int4ScoredCohortBatchResult};
 mod scored_cohort;

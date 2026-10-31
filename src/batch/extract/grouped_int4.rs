@@ -14,10 +14,14 @@ use crate::{
 };
 
 mod native;
+mod cohort;
+pub mod memory;
 /// Whole-document exact-schema extraction with original source coordinates.
 pub mod long;
 pub use native::{Int4ExtractionAdmission, Int4ExtractionBatchAdmission, Int4ExtractionBatchLimits,
     NativeInt4ExtractionBatch};
+pub use cohort::{Int4ExtractionCohortBatchLimits, Int4ExtractionCohortBatchStats,
+    NativeInt4ExtractionCohortBatch, PreparedInt4CohortExtraction};
 
 pub struct Int4ExtractionBatchPlanner {
     compiler: ExtractionBatchPlanner, group_width: usize, shared_defaults_only: bool,
@@ -168,15 +172,15 @@ mod tests {
     fn args(schema: &str, grounding: ExtractionBatchGrounding) -> ExtractionBatchArgs {
         ExtractionBatchArgs { schema: schema.to_owned(), grounding, budget: budget() }
     }
-    fn planner(width: usize, defaults: Option<ExtractionBatchArgs>) -> Int4ExtractionBatchPlanner {
+    pub(super) fn planner(width: usize, defaults: Option<ExtractionBatchArgs>) -> Int4ExtractionBatchPlanner {
         let (controls, eos, identity) = assets(width);
         Int4ExtractionBatchPlanner::pinned(controls.template_controls(), eos, identity, width, budget(),
             CompileLimits::default(), SourceRuntimeLimits::default(), defaults).unwrap()
     }
-    fn document(schema: &str, text: &str, grounding: ExtractionBatchGrounding) -> BatchDocument<ExtractionBatchArgs> {
+    pub(super) fn document(schema: &str, text: &str, grounding: ExtractionBatchGrounding) -> BatchDocument<ExtractionBatchArgs> {
         BatchDocument { id: "private-id".to_owned(), text: text.to_owned(), task_args: Some(args(schema, grounding)) }
     }
-    fn boolean() -> BatchDocument<ExtractionBatchArgs> {
+    pub(super) fn boolean() -> BatchDocument<ExtractionBatchArgs> {
         document(r#"{"type":"boolean"}"#, "PRIVATE_SOURCE <think>", ExtractionBatchGrounding::Structural)
     }
 
