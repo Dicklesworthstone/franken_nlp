@@ -25,12 +25,12 @@ impl Drop for Payload {
 struct Processor {
     state: Rc<State>, fail_row: Option<u64>, fatal_row: Option<u64>, wrong_route: bool,
     huge_first: bool, cancel_after_execute: bool,
-    weight_by_length: bool, cancel_in_planning: bool,
+    weight_by_length: bool, cancel_in_planning: bool, intrinsic_fault: Option<BatchFault>,
 }
 impl Processor {
     fn new(state: Rc<State>) -> Self {
         Self { state, fail_row: None, fatal_row: None, wrong_route: false, huge_first: false,
-            cancel_after_execute: false, weight_by_length: false, cancel_in_planning: false }
+            cancel_after_execute: false, weight_by_length: false, cancel_in_planning: false, intrinsic_fault: None }
     }
 }
 impl GroupedBatchProcessor for Processor {
@@ -65,7 +65,8 @@ impl GroupedBatchProcessor for Processor {
         let mut rows = Vec::new();
         for request in input {
             let seq = request.context.request_seq;
-            let result = if self.fail_row == Some(seq) { Err(BatchItemFailure::reject(BatchCode::Execution)) }
+            let result = if let Some(fault) = self.intrinsic_fault.filter(|_| seq == 1) { Err(BatchItemFailure::reject(fault)) }
+                else if self.fail_row == Some(seq) { Err(BatchItemFailure::reject(BatchCode::Execution)) }
                 else if self.fatal_row == Some(seq) { Err(BatchItemFailure::fatal(BatchCode::Execution)) }
                 else {
                     self.state.payloads.set(self.state.payloads.get() + 1);
@@ -269,6 +270,29 @@ fn fatal_row_failure_prevents_later_delivery_and_next_cohort() {
     assert_eq!(error.fault.code, BatchCode::Execution); assert_eq!(reader.position(), records(2).len() as u64);
     let output = events(&writer.bytes); assert_eq!(document_events(&output).len(), 1);
     assert_eq!(output.last().unwrap()["event"], "run_error"); assert_eq!(state.leases.get(), 0);
+}
+#[test]
+fn intrinsic_row_failures_remain_fatal_when_the_processor_marks_them_recoverable() {
+    for fault in [BatchFault::cancelled(DecodeCancellationKind::Deadline),
+        BatchCode::Cancelled.into(), BatchCode::InputIo.into(), BatchCode::OutputIo.into(),
+        BatchCode::InvalidExecution.into(),
+        BatchFault { code: BatchCode::Planning, cancellation: Some(DecodeCancellationKind::Shutdown) }] {
+        let state = Rc::new(State::default()); let mut processor = Processor::new(Rc::clone(&state));
+        processor.intrinsic_fault = Some(fault);
+        let input = records(4); let mut reader = Cursor::new(input.as_bytes()); let mut writer = Writer::new(Rc::clone(&state));
+        let error = run_ndjson(&mut reader, &mut writer, &mut processor, BatchLimits::default(),
+            GroupLimits { max_records: 2 }, &mut Continue).unwrap_err();
+        assert_eq!(error.fault, fault); assert_eq!(reader.position(), records(2).len() as u64);
+        assert_eq!(*state.groups.borrow(), vec![vec![1, 2]]);
+        assert_eq!(error.summary.reserved_work, BatchWork { forward_positions: 2, projected_logits: 20 });
+        assert_eq!(error.summary.succeeded, 0); assert_eq!(error.summary.failed, 1);
+        let output = events(&writer.bytes); let docs = document_events(&output);
+        assert_eq!(docs.len(), 1); assert_eq!(docs[0]["event"], "doc_error");
+        assert_eq!(docs[0]["error"], serde_json::to_value(fault).unwrap());
+        assert_eq!(output.last().unwrap()["event"], "run_error");
+        assert_eq!(output.last().unwrap()["error"], serde_json::to_value(fault).unwrap());
+        assert_eq!(state.leases.get(), 0); assert_eq!(state.payloads.get(), 0);
+    }
 }
 #[test]
 fn cancellation_after_native_return_preserves_cause_without_publishing_more_results() {

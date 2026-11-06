@@ -140,6 +140,15 @@ pub struct BatchItemFailure { pub fault: BatchFault, pub stop: bool }
 impl BatchItemFailure {
     pub fn reject(fault: impl Into<BatchFault>) -> Self { Self { fault: fault.into(), stop: false } }
     pub fn fatal(fault: impl Into<BatchFault>) -> Self { Self { fault: fault.into(), stop: true } }
+
+    /// A processor can make an item failure fatal, but cannot make cancellation,
+    /// broken transport or invalid engine state recoverable by clearing `stop`.
+    /// Per-document admission/work refusals still follow the processor's policy.
+    fn must_stop(&self) -> bool {
+        self.stop || self.fault.cancellation.is_some()
+            || matches!(self.fault.code, BatchCode::Cancelled | BatchCode::InputIo
+                | BatchCode::OutputIo | BatchCode::InvalidExecution)
+    }
 }
 
 /// Engine-assigned delivery coordinates. Not deserializable from task_args,
@@ -212,6 +221,8 @@ impl Error for BatchRunError {}
 /// that every item succeeded: inspect `failed`. A failed/partial output write
 /// poisons the stream; no further input or output is attempted. A normal I/O
 /// flush acknowledges the local writer, not remote processing or durability.
+/// Cancellation is checked after execution while the completed result and its
+/// admission guard are still owned, before any successful document is emitted.
 /// Blocking I/O itself cannot be preempted by these cooperative checkpoints.
 pub fn run_ndjson<R: BufRead, W: Write, P: BatchProcessor, C: DecodeStepControl>(
     reader: &mut R, writer: &mut W, processor: &mut P, limits: BatchLimits, control: &mut C,
@@ -284,7 +295,7 @@ fn run<R: BufRead, W: Write, P: BatchProcessor, C: DecodeStepControl>(reader: &m
             Ok(plan) => plan,
             Err(error) => {
                 reject(sink, summary, *epoch, &frame, Some(&id), error.fault)?;
-                if error.stop { return Err(error.fault); } else { continue; }
+                if error.must_stop() { return Err(error.fault); } else { continue; }
             }
         };
         let charge = processor.planned_work(&prepared);
@@ -299,6 +310,9 @@ fn run<R: BufRead, W: Write, P: BatchProcessor, C: DecodeStepControl>(reader: &m
             input_line: frame.line, byte_offset: frame.offset };
         match processor.execute_with_context(prepared, context, control) {
             Ok(result) => {
+                // Keep the result's reservation live through this check. A
+                // late cancellation cannot publish success or refund its work.
+                checkpoint(control)?;
                 let mut event = Event::new("doc", *epoch, summary.requests);
                 event.caller_id = Some(&id); event.input_line = Some(frame.line);
                 event.byte_offset = Some(frame.offset); event.result = Some(&result); event.reserved_work = Some(charge);
@@ -312,7 +326,7 @@ fn run<R: BufRead, W: Write, P: BatchProcessor, C: DecodeStepControl>(reader: &m
             }
             Err(error) => {
                 reject(sink, summary, *epoch, &frame, Some(&id), error.fault)?;
-                if error.stop { return Err(error.fault); }
+                if error.must_stop() { return Err(error.fault); }
             }
         }
     }

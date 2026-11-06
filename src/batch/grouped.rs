@@ -197,18 +197,18 @@ fn prepare<P: GroupedBatchProcessor, C: DecodeStepControl>(document: Result<Batc
     checkpoint(control)?;
     let prepared = match processor.prepare_with_control(document, control) {
         Ok(prepared) => prepared,
-        Err(failure) if fatal(failure) => return Err(failure.fault),
+        Err(failure) if failure.must_stop() => return Err(failure.fault),
         Err(failure) => return Ok(Pending::rejected(context, Some(id), failure.fault)),
     };
     let weight = match processor.group_weight(&prepared) {
         Ok(weight) if weight > 0 && weight <= processor.max_group_weight() => weight,
         Ok(_) => return Ok(Pending::rejected(context, Some(id), BatchCode::Admission.into())),
-        Err(failure) if fatal(failure) => return Err(failure.fault),
+        Err(failure) if failure.must_stop() => return Err(failure.fault),
         Err(failure) => return Ok(Pending::rejected(context, Some(id), failure.fault)),
     };
     let charge = match processor.planned_work(&prepared) {
         Ok(charge) => charge,
-        Err(failure) if fatal(failure) => return Err(failure.fault),
+        Err(failure) if failure.must_stop() => return Err(failure.fault),
         Err(failure) => return Ok(Pending::rejected(context, Some(id), failure.fault)),
     };
     let total = match summary.reserved_work.add(charge) {
@@ -262,7 +262,7 @@ fn drain<W: Write, P: GroupedBatchProcessor, C: DecodeStepControl>(pending: &mut
             }
             Err(failure) => {
                 emit_error(sink, summary, row, failure.fault)?;
-                if fatal(*failure) { return Err(failure.fault); }
+                if failure.must_stop() { return Err(failure.fault); }
             }
         }
     }
@@ -270,10 +270,6 @@ fn drain<W: Write, P: GroupedBatchProcessor, C: DecodeStepControl>(pending: &mut
     // above. Its guard is not released between first and last result flush.
     pending.clear();
     Ok(())
-}
-fn fatal(failure: BatchItemFailure) -> bool {
-    failure.stop || failure.fault.cancellation.is_some()
-        || matches!(failure.fault.code, BatchCode::Cancelled | BatchCode::InputIo | BatchCode::OutputIo | BatchCode::InvalidExecution)
 }
 fn emit_error<W: Write, P>(sink: &mut Sink<'_, W>, summary: &mut BatchSummary,
     row: &Pending<P>, fault: BatchFault) -> Result<(), BatchFault> {
