@@ -253,9 +253,12 @@ impl<'a> PreparedInt4ClassificationMap<'a> {
         let mut identities = planning::reserved(self.plans.len())?;
         identities.extend(self.plans.iter().map(|plan| plan.execution_identity().clone())); Ok(identities)
     }
-    pub fn execute_with_control<C: DecodeStepControl>(&self, admitted: &[ExecutionIdentity],
-        engine: &mut StrictInt4Engine<'_>, budget: Int4ScoringBudget, control: &mut C)
-        -> Result<Int4ClassificationMapRun, Int4ClassificationMapError> {
+    /// Check every future chunk and head against the actual resident engine
+    /// without executing a forward. A corpus can freeze the complete admission
+    /// before transferring its owned request to the execution phase.
+    pub fn preflight_with_control<C: DecodeStepControl>(&self, admitted: &[ExecutionIdentity],
+        engine: &StrictInt4Engine<'_>, budget: Int4ScoringBudget, control: &mut C)
+        -> Result<(), Int4ClassificationMapError> {
         planning::checkpoint(control)?;
         if admitted.len() != self.plans.len() || self.plans.is_empty() { return Err(Int4ClassificationMapError::Admission); }
         check_work_ceiling(self.planned_work(), budget.native)?;
@@ -267,6 +270,12 @@ impl<'a> PreparedInt4ClassificationMap<'a> {
             plan.preflight(identity, engine, Int4ScoringBudget {
                 native: Int4RunBudget::exact(plan.planned_work()), max_kv_bytes: budget.max_kv_bytes })?;
         }
+        planning::checkpoint(control)?; Ok(())
+    }
+    pub fn execute_with_control<C: DecodeStepControl>(&self, admitted: &[ExecutionIdentity],
+        engine: &mut StrictInt4Engine<'_>, budget: Int4ScoringBudget, control: &mut C)
+        -> Result<Int4ClassificationMapRun, Int4ClassificationMapError> {
+        self.preflight_with_control(admitted, engine, budget, control)?;
         self.collect_with_control(control, |index, plan, control| {
             let run = plan.execute_with_control(&admitted[index], engine, Int4ScoringBudget {
                 native: Int4RunBudget::exact(plan.planned_work()), max_kv_bytes: budget.max_kv_bytes }, control)?;

@@ -28,6 +28,10 @@ impl Int4ClassificationPlanner {
     /// task adds its complete prompt, label, score-space and policy bindings.
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     pub fn group_width(&self) -> usize { self.model.group_width() }
+    /// Immutable per-chunk task authority, also used to price a whole-document stream.
+    pub fn task_budget(&self) -> TaskBudget { self.ceiling }
+    /// Immutable raw-input and label ceilings of the pinned compiler.
+    pub fn planning_limits(&self) -> ClassificationLimits { self.limits }
     /// Exact source capacity for these labels, fixed prompt and task limits.
     pub fn max_document_bytes(&self, request: &ClassificationRequest, context_tokens: usize)
         -> Result<usize, Int4ClassificationError> {
