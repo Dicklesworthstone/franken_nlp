@@ -121,6 +121,7 @@ struct Int4Args {
 enum Int4Task {
     Text(Task), Classify(classify::ScoringArgs), Extract(extract::ExtractionArgs),
     ClassifyMap(classify_map::MapArgs),
+    ClassifyCorpus(classify_map::corpus::CorpusArgs),
     Stream(Task, stream::StreamArgs),
     Semantic(semantic::SemanticArgs),
     Sentiment(sentiment::SentimentArgs),
@@ -177,13 +178,14 @@ pub(super) fn definition() -> clap::Command {
     clap::Command::new("source-int4")
         .about("Run candidate INT4 tasks from pinned sources or a digest-pinned local snapshot")
         .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Sequential native execution defaults to scalar; --kernel explicitly selects an existing hardware-checked integer leaf. Text tasks and one-off classify, sentiment, judge, extract, ner, keyphrases, summarize and answer can opt in to bounded layer-major prompt execution with --prefill-rows. Structured batch, map, job, redaction and semantic workflows retain their existing prompt schedules. stream generate/chat emits bounded provisional token NDJSON and requires a final run_complete after native drain. text-batch runs one finite NDJSON cohort and emits one completed aggregate JSON object. text-corpus processes bounded windows with one resident model and cumulative budgets, emitting completed-window NDJSON with a required corpus_complete footer. extract-batch streams documents under one shared schema through one resident model and engine. ner, keyphrases, summarize and answer preserve their source-task semantics; their -batch commands run ordered typed source-task NDJSON. Every ordered batch requires run_complete plus exit 0 for whole-run success. ner-map and keyphrases-map process every chunk of a complete document with original-coordinate evidence; summarize-map produces a deterministic exact cited bullet union. sentiment-map scores every original source chunk with complete independent dimension distributions and explicit scalar-weighted aggregation, optionally using real chunk cohorts. classify-map retains every chunk's exact classification scores and reports a separate scalar-weighted exclusive or independent multi-label mixture. All map commands preflight the complete document and publish one completed result. extract-job start/resume retains ordered extraction results in an explicit protected spool. ner-job, keyphrases-job, summarize-job and answer-job provide the same opt-in durable start/resume contract for source tasks. redact-job start/resume retains complete-document edits under one authenticated detector, action and key scope, with metadata-only stdout. Resume authenticates the complete original population, exact task configuration, model/group identity and immutable lifetime limits. No automatic selection, fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Other routes publish completed task or corpus results.")
-        .after_long_help("Complete-document classification defaults to serial execution. classify-map --cohort-chunks N processes complete independent chunks together; requested chunks times actual heads must be at most 64 (one head for exclusive mode, one per label for multi_label). Physical cohort statistics remain separate from the semantic output.")
+        .after_long_help("Complete-document classification defaults to serial execution. classify-map --cohort-chunks N processes complete independent chunks together; requested chunks times actual heads must be at most 64 (one head for exclusive mode, one per label for multi_label). Physical cohort statistics remain separate from the semantic output. classify-corpus applies the complete-document map to ordered NDJSON with one resident model and native allocation. Its five work ceilings cover the entire run, never renew at flush, and its serial document/chunk schedule makes no cohort-speed claim. Require run_complete plus exit 0.")
         .subcommand_required(true)
         .subcommand(task("generate", "Generate from a bounded UTF-8 prompt using the pinned template"))
         .subcommand(task("chat", "Complete a bounded JSON system/user/assistant transcript"))
         .subcommand(stream::definition())
         .subcommand(classify::prefill_definition(classify::definition()))
         .subcommand(classify_map::definition())
+        .subcommand(classify_map::corpus::definition())
         .subcommand(sentiment::definition())
         .subcommand(sentiment_map::definition())
         .subcommand(judge::definition())
@@ -263,6 +265,7 @@ impl Int4Command {
             "chat" => Int4Task::Text(Task::Chat),
             "classify" => Int4Task::Classify(classify::ScoringArgs::from_matches_with_prefill(matches)?),
             "classify-map" => Int4Task::ClassifyMap(classify_map::MapArgs::from_matches(matches)?),
+            "classify-corpus" => Int4Task::ClassifyCorpus(classify_map::corpus::CorpusArgs::from_matches(matches)?),
             "sentiment" => Int4Task::Sentiment(sentiment::SentimentArgs::from_matches(matches)?),
             "sentiment-map" => Int4Task::SentimentMap(sentiment_map::MapArgs::from_matches(matches)?),
             "judge" => Int4Task::Judge(judge::JudgeArgs::from_matches(matches)?),
@@ -324,6 +327,8 @@ impl Int4Command {
                 options.execute_owned(args, input, output),
             Self { task: Int4Task::ScoredBatch(options), args, batch: None, job: None } =>
                 options.execute_owned(args, input, output),
+            Self { task: Int4Task::ClassifyCorpus(options), args, batch: None, job: None } =>
+                return options.run_owned(args, input, output, diagnostics),
             Self { task: Int4Task::RedactCorpus(options), args, batch: None, job: None } =>
                 options.execute_owned(args, input, output),
             command => command.execute(&mut input, &mut output),
@@ -383,7 +388,7 @@ impl Int4Command {
             Int4Task::Extract(extraction) => extraction.validate_with_prefill(&self.args)?,
             Int4Task::Source(_, source) => source.validate_with_prefill(&self.args)?,
             // The blocking stream must own its input and writer through cleanup.
-            Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::FaithfulnessMap(_) | Int4Task::Semantic(_) | Int4Task::Resolve(_) | Int4Task::Sentiment(_) | Int4Task::SentimentMap(_) | Int4Task::ClassifyMap(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ScoredBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
+            Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::FaithfulnessMap(_) | Int4Task::Semantic(_) | Int4Task::Resolve(_) | Int4Task::Sentiment(_) | Int4Task::SentimentMap(_) | Int4Task::ClassifyMap(_) | Int4Task::ClassifyCorpus(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ScoredBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
                 | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob => return Err(CandidateError::Arguments),
         };
         #[cfg(feature = "asupersync-runtime")]

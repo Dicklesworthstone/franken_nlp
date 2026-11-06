@@ -8,6 +8,7 @@ use crate::{native_engine::strict_int4::cohort::MAX_INT4_SEQUENCES,
 
 #[cfg(feature = "asupersync-runtime")]
 mod runtime;
+pub(super) mod corpus;
 #[cfg(test)]
 mod tests;
 

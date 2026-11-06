@@ -787,6 +787,77 @@ native planners. CLI, native ledger and host fixtures are authored; compilation,
 model-present execution and quality qualification remain pending the authorized
 controller gates.
 
+## Implemented candidate INT4 complete-document classification corpora
+
+`fnlp candidate source-int4 classify-corpus` applies complete-document
+classification to ordered `{id,text,task_args?}` NDJSON while retaining one
+grouped-INT4 model and native engine for the entire stream. Each document is
+losslessly partitioned according to its exact label prompts and context
+capacity. Every chunk is planned before that document's first native forward;
+the completed result retains the original byte/scalar spans, complete chunk
+scores and a separate scalar-weighted aggregate. Exclusive classification and
+independent multi-label classification preserve their existing finalizers and
+coverage/abstention policy. The aggregate remains uncalibrated and does not
+claim equivalence to scoring the source in one larger context.
+
+Use the same private `labels.json` and NDJSON envelope shown above:
+
+```bash
+fnlp candidate source-int4 classify-corpus documents.ndjson \
+  --defaults labels.json \
+  --snapshot /data/nanbeige.group128.snapshot \
+  --expected-model-sha256 "$TRUSTED_MODEL_CONTENT_SHA256" \
+  --group-width 128 --memory-mib 16384 --context-tokens 2048 \
+  --max-chunks 64 --max-chunk-bytes 4096 \
+  --max-requests 1000 --max-total-input-bytes 67108864 \
+  --max-total-output-bytes 67108864
+```
+
+These flags are admission ceilings, not a guarantee that an arbitrary corpus
+fits. `--max-input-bytes` bounds each complete decoded document;
+`--max-line-bytes` independently bounds encoded NDJSON, including escapes.
+`--max-result-bytes` bounds one native chunk, `--max-retained-result-bytes`
+bounds the retained chunk frontier, and `--max-map-result-bytes` bounds the
+complete document result. Transport and provenance framing are priced
+separately. Memory admission includes all retained plans and results, frozen
+chunk identities, complete native KV/scratch, defaults and transport staging.
+Documents and chunks execute serially; this route refuses `--cohort-chunks`,
+`--cohort-heads`, `--prefill-rows` and generation controls.
+
+The five work flags—`--max-forward-positions`, `--max-projected-logits`,
+`--max-attention-pairs`, `--max-dot-products` and
+`--max-multiply-accumulates`—bound the **entire invocation**. They are never
+multiplied by document count or renewed by a flush. Admitted failed attempts
+retain their charges. The checkpoint allowance and deadline also cover the
+whole stream. Blocking IO observes cancellation cooperatively.
+
+Shared defaults contain labels, optional mode and policy, with the task budget
+supplied by the CLI. A non-null `task_args` replaces the complete typed
+`ClassificationBatchArgs`, including a budget bounded by the host; it never
+merges individual settings. Missing or null arguments use the fixed defaults.
+Duplicate keys, unknown authority fields and incomplete overrides are refused.
+Source conversion is also supported through `--source-dir` and
+`--source-manifest`. An explicit `--save-snapshot` occurs after admission of
+the model, fixed defaults and host envelope; a later input failure can leave
+that requested snapshot in place.
+
+Events use `fnlp-candidate-int4-classify-corpus-v1`, with the standard ordered
+batch record under `record` and each completed map under `record.result`.
+An exact `{"flush":true}` drains the current ID epoch before IDs may be reused;
+it grants no new compute. No partial document is published after a failed
+chunk. Earlier completed documents remain usable if a later record fails, but
+whole-run success requires **both `run_complete` and exit status zero**. A
+drained stream with rejected records still exits unsuccessfully. This live
+corpus route provides no durable resume protocol.
+
+Library callers use `Int4ClassificationDocumentBatchPlanner` and
+`NlpEngine::batch_int4_classification_documents` with owned reader/writer and
+`CorpusLimits`. The pure `int4_classification_document_corpus_requirements`
+helper prices the complete hosted envelope before IO. Model-free regression
+sources and an explicitly ignored full-model corpus/standalone equivalence
+fixture are included; compilation, native parity and task quality remain
+subject to their separate controller validation gates.
+
 ## Implemented candidate INT4 scoring jobs
 
 `fnlp candidate source-int4 score-job start|resume --task classify|sentiment|judge`
