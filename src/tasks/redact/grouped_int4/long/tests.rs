@@ -1,6 +1,7 @@
 //! Pinned map preparation and shared destructive-offset/edit semantics.
 //! Native stage receipts are private scripted fixtures, not inference evidence.
 use super::*;
+mod cohort;
 use crate::{
     artifact::converter::PINNED_REVISION,
     execution_identity::{NumericsProfile, ThinkingMode, ToolMode},

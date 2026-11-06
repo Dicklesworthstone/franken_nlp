@@ -333,3 +333,40 @@ fn complete_owned_input_and_result_cross_one_physical_completion_boundary() {
     let _host = NlpEngine::redact_int4_document;
 }
 
+#[test]
+fn cohort_peak_prices_the_full_possible_verification_window_and_keeps_per_chunk_kv() {
+    for width in [3, 127, 128, 10752] {
+        let mut c = config(width); c.detector.mapping.reduction.map_batch_chunks = 3;
+        let row = check(&c, 16, width).unwrap();
+        let task = c.detector.per_chunk;
+        let peak = c.detector.cohort_requirements(c.native.context_tokens, width).unwrap();
+        assert_eq!(peak.native, Int4MemoryRequirement::for_cohort(&[128; 3], width).unwrap());
+        assert_eq!(peak.native.kv_bytes, 3 * row.kv_bytes);
+        assert_eq!(c.detector.per_chunk, task);
+        assert!(peak.workspace_bytes > peak.max_result_bytes);
+        let native_and_map = sum(&[peak.native.kv_bytes, peak.native.rope_bytes,
+            peak.native.scratch_payload_bound, c.native.allocator_reserve_bytes,
+            document_temporary_bytes(&c).unwrap(), peak.workspace_bytes]).unwrap();
+        assert!(native_and_map > row.kv_bytes + document_temporary_bytes(&c).unwrap());
+        c.request.verify = false;
+        assert_eq!(c.detector.cohort_requirements(c.native.context_tokens, width).unwrap(), peak,
+            "sequential stages reuse the same peak; verification never gets a new row allowance");
+        c.detector.per_chunk.max_kv_bytes -= 1;
+        assert!(c.detector.cohort_requirements(c.native.context_tokens, width).is_err());
+    }
+}
+
+#[test]
+fn cohort_output_keeps_semantic_redaction_and_schedule_receipts_under_one_owner() {
+    use crate::tasks::redact::grouped_int4::long::Int4LongRedactionCohortRun;
+    fn send<T: Send + 'static>() {}
+    send::<HostedOutput<Int4LongRedactionCohortRun>>();
+    let _host = NlpEngine::redact_int4_document_cohorts;
+    let mut c = config(127);
+    c.detector.mapping.reduction.map_batch_chunks = 4;
+    assert!(c.detector.cohort_requirements(c.native.context_tokens, 127).is_err(),
+        "declared width above the document chunk cap cannot silently shrink");
+    c.detector.mapping.reduction.map_batch_chunks = 3;
+    assert!(c.detector.cohort_requirements(c.native.context_tokens - 1, 127).is_err());
+}
+

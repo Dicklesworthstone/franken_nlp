@@ -10,7 +10,7 @@ use crate::{
     tasks::{extract::ExtractionVocabulary, ir::{PlanContext, TaskBudget}, ner::{NerOptions, NER_TASK_VERSION},
         mapreduce::CHUNK_PROFILE, source_planning::{SourcePlanningLimits, SourceTaskPlanner, SourceTaskResult,
             grouped_int4::{Int4SourceError, long::{Int4SourceMapError, Int4SourceMapLimits,
-                Int4SourceMapPreflight, PreparedInt4SourceMap, SourceMapTask, SourceMapVerification}}}},
+                Int4SourceMapPreflight, Int4SourceMapRun, PreparedInt4SourceMap, SourceMapTask, SourceMapVerification}}}},
     validation::grounded_fields::GroundingBudget,
 };
 use super::{Int4RedactionError, check_engine, check_model};
@@ -22,6 +22,10 @@ const DETECTOR_SCOPE: &str = "whole-source-rules-independent-ner-chunks-v1";
 const WARNINGS: [&str; 3] = ["ner_chunk_boundaries_may_split_entities", "detector_recall_not_established",
     "clean_scan_and_pseudonyms_are_not_anonymization"];
 const ZERO_VERIFICATION: SourceMapVerification = SourceMapVerification { fields: 0, matches: 0, scan_steps: 0 };
+
+mod cohort;
+pub use cohort::{Int4LongRedactionCohortRun, INT4_LONG_REDACTION_COHORT_EXECUTION,
+    INT4_LONG_REDACTION_COHORT_ENVELOPE_BYTES};
 
 /// mapping's native, mask and coordinate-verification ceilings span BOTH stages.
 /// Chunk/reduction/rule limits apply per stage. The request's grounding budget
@@ -209,6 +213,20 @@ impl<'p> Int4DocumentRedactor<'p> {
         engine: &mut StrictInt4Engine<'_>, vocabulary: &ExtractionVocabulary, accounting: &mut Accounting,
         grounding: &mut GroundingBudget, control: &mut C)
         -> Result<(DetectedDocument<'s>, Int4LongRedactionStage), Int4LongRedactionError> {
+        self.detect_with_map(source, request, accounting, grounding, control, |prepared, admitted, control| {
+            let mapped = prepared.execute_with_control(admitted, engine, vocabulary, control)?;
+            check_engine(&self.identity, self.group_width, engine, self.config.per_chunk.max_kv_bytes)?;
+            Ok(mapped)
+        })
+    }
+    /// Both native schedules enter the same whole-source detector, sealed map
+    /// proof, independent destructive-offset verification and stage ledger.
+    /// No public callback can substitute a native map or authorize an edit.
+    fn detect_with_map<'s, C: DecodeStepControl, F>(&self, source: &'s str, request: &RedactionRequest,
+        accounting: &mut Accounting, grounding: &mut GroundingBudget, control: &mut C, execute: F)
+        -> Result<(DetectedDocument<'s>, Int4LongRedactionStage), Int4LongRedactionError>
+    where F: FnOnce(PreparedInt4SourceMap<'s>, &[ExecutionIdentity], &mut C)
+        -> Result<Int4SourceMapRun, Int4LongRedactionError> {
         poll(control)?;
         let mapping = accounting.begin(self.config.mapping)?;
         // Rules inspect the WHOLE current source before neural chunking, so
@@ -222,11 +240,10 @@ impl<'p> Int4DocumentRedactor<'p> {
         let mut admitted = Vec::new();
         admitted.try_reserve_exact(prepared.chunk_count()).map_err(|_| RedactError::AllocationRefused)?;
         for identity in prepared.execution_identities() { poll(control)?; admitted.push(identity.clone()); }
-        let mapped = prepared.execute_with_control(&admitted, engine, vocabulary, control)?;
+        let mapped = execute(prepared, &admitted, control)?;
         // The sealed map proof checks complete source coverage, every actual
         // group/work receipt, native result counts and independent map evidence.
         proof.verify_completed(&mapped)?;
-        check_engine(&self.identity, self.group_width, engine, self.config.per_chunk.max_kv_bytes)?;
         for chunk in mapped.mapped.root().value().chunks() {
             poll(control)?;
             let SourceTaskResult::Ner(result) = &chunk.native.result else { return Err(RedactError::InvalidNerEvidence.into()); };
