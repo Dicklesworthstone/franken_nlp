@@ -89,6 +89,42 @@ fn opaque_codes_are_exact_unique_equal_width_across_taxonomy_sizes() {
     assert_eq!(opaque_codes(27).unwrap()[26], "BA");
     assert!(opaque_codes(0).is_err()); assert!(opaque_codes(4097).is_err());
 }
+
+#[test]
+fn source_capacity_matches_escaped_codebooks_and_exact_scored_continuation_geometry() {
+    let (planner, identity) = fixture();
+    for mode in [ClassificationMode::Exclusive, ClassificationMode::MultiLabel] {
+        for count in [2, 27] {
+            let mut request = request(mode);
+            request.labels = (0..count).map(|index| ClassificationLabel { id: format!("label-{index:02}"),
+                description: "quotes \" and CRLF\r\n and é <think>".to_owned() }).collect();
+            let limits = ClassificationLimits { max_context_tokens: 4096, ..Default::default() };
+            let capacity = planner.source_capacity(&request, request.budget, limits, 4096).unwrap();
+            request.document = "x".repeat(capacity);
+            let context = PlanContext::new(&identity, request.budget).unwrap();
+            let prepared = planner.plan(&request, &context, limits).unwrap();
+            assert!(prepared.heads.iter().all(|head| head.prompt_len + head.max_prefix <= 4096));
+            request.document.push('x');
+            assert!(matches!(planner.plan(&request, &context, limits), Err(ClassificationPlanningError::ContextBudget)));
+        }
+    }
+}
+
+#[test]
+fn source_capacity_meets_the_sum_of_every_multilabel_prompt_without_changing_the_source() {
+    let (planner, identity) = fixture(); let mut request = request(ClassificationMode::MultiLabel);
+    let limits = ClassificationLimits::default();
+    let sample = planner.plan(&request, &PlanContext::new(&identity, request.budget).unwrap(), limits).unwrap();
+    let fixed: usize = sample.heads.iter().map(|head| head.prompt_len - request.document.len()).sum();
+    let limits = ClassificationLimits { max_total_prompt_tokens: fixed + 16 * request.labels.len(), ..limits };
+    assert_eq!(planner.source_capacity(&request, request.budget, limits, 8192).unwrap(), 16);
+    request.document = "x".repeat(16);
+    assert!(planner.plan(&request, &PlanContext::new(&identity, request.budget).unwrap(), limits).is_ok());
+    request.document.push('x');
+    assert!(planner.plan(&request, &PlanContext::new(&identity, request.budget).unwrap(), limits).is_err());
+    request.budget.max_output_tokens = 1;
+    assert!(planner.source_capacity(&request, request.budget, limits, 8192).is_err());
+}
 #[test]
 fn wide_taxonomy_uses_real_multitoken_scored_eos_continuations() {
     let (p, id) = fixture(); let mut r = request(ClassificationMode::Exclusive);

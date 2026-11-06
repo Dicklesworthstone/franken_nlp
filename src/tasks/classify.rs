@@ -23,6 +23,11 @@ use super::ir::{DecodeStrategy, ScoreSpace, TaskIR, TaskPlan};
 
 const POLICY_SCALE: u32 = 1_000_000;
 
+pub(crate) mod aggregation;
+pub use aggregation::{CLASSIFICATION_AGGREGATION_PROFILE, ClassificationAggregate,
+    ClassificationAggregateResult, ClassificationAggregationError, ClassificationAggregationPolicy, ClassificationMixture,
+    ClassificationMixtureWeight, MultiLabelAggregate, MultiLabelAggregateLabel};
+
 /// An explicit, uncalibrated decision rule, in millionths of candidate weight.
 /// These thresholds are not accuracy or correctness-confidence guarantees.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

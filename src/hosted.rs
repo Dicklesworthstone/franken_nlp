@@ -29,6 +29,7 @@ mod pull;
 pub use pull::{HostedNetworkPullError, NetworkPullHostOptions};
 mod grouped_int4;
 pub use grouped_int4::{Int4HostError, Int4LoadLimits, Int4LoadRequirements, Int4ExtractionMapConfig,
+    Int4ClassificationMapHostConfig,
     Int4SourceCorpusConfig, Int4SourceMapConfig, Int4SentimentHostLimits, Int4SentimentMapHostConfig, Int4JudgeHostLimits,
     Int4SemanticHostLimits, Int4SemanticHostRequirements,
     Int4ScoredCohortHostLimits, Int4ScoredCohortBatchResult,

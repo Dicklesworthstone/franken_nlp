@@ -85,7 +85,7 @@ impl Default for ClassificationLimits {
     }
 }
 impl ClassificationLimits {
-    fn validate(self) -> Result<(), ClassificationPlanningError> {
+    pub(crate) fn validate(self) -> Result<(), ClassificationPlanningError> {
         if !(1..=4096).contains(&self.max_labels) || !(1..=64 * 1024 * 1024).contains(&self.max_input_bytes)
             || !(1..=1024).contains(&self.max_label_id_bytes) || self.max_label_description_bytes > 1024 * 1024
             || !(1..=8 * 1024 * 1024).contains(&self.max_total_label_bytes)
@@ -169,6 +169,47 @@ impl ClassificationPlanner {
     pub fn template_digest(&self) -> &Sha256Digest { &self.template_digest }
     pub fn tokenizer_digest(&self) -> Sha256Digest { Sha256Digest::of_bytes(PINNED_TOKENIZER_MODEL_BYTES) }
 
+    /// Exact byte capacity of the separately encoded source segment. The
+    /// pinned untrusted encoder emits one token per source/metadata byte;
+    /// escaped label codebooks and every independent head count in full.
+    pub(super) fn source_capacity(&self, request: &ClassificationRequest, ceiling: TaskBudget,
+        limits: ClassificationLimits, context_tokens: usize) -> Result<usize, ClassificationPlanningError> {
+        limits.validate()?;
+        request.budget.validate().map_err(|_| ClassificationPlanningError::InvalidLimits)?;
+        ceiling.validate().map_err(|_| ClassificationPlanningError::InvalidLimits)?;
+        request.policy.validate()?;
+        if !budget_fits(request.budget, ceiling) { return Err(ClassificationPlanningError::InvalidLimits); }
+        let labels = checked_labels(request, limits)?;
+        let codes = opaque_codes(labels.len())?;
+        let count = if request.mode == ClassificationMode::Exclusive { 1 } else { labels.len() };
+        let continuation = if request.mode == ClassificationMode::Exclusive { codes[0].len() } else { 1 };
+        if continuation + 1 > request.budget.max_output_tokens as usize
+            || continuation + 1 > limits.scoring.max_depth {
+            return Err(ClassificationPlanningError::ContextBudget);
+        }
+        let context = context_tokens.min(limits.max_context_tokens);
+        let prompt_cap = context.checked_sub(continuation)
+            .map(|n| n.min(request.budget.max_input_tokens as usize))
+            .ok_or(ClassificationPlanningError::ContextBudget)?;
+        let fragments = &self.fragments[usize::from(request.mode == ClassificationMode::MultiLabel)];
+        let overhead = fragments.iter().try_fold(0_usize, |n, ids| n.checked_add(ids.len()))
+            .ok_or(ClassificationPlanningError::ContextBudget)?;
+        let metadata_room = prompt_cap.checked_sub(overhead).ok_or(ClassificationPlanningError::ContextBudget)?;
+        let mut largest = 0; let mut total = 0_usize;
+        for index in 0..count {
+            let record = label_record(&labels, &codes, index, request.mode, metadata_room)?;
+            let fixed = overhead.checked_add(record.len()).ok_or(ClassificationPlanningError::ContextBudget)?;
+            largest = largest.max(fixed);
+            total = total.checked_add(fixed).ok_or(ClassificationPlanningError::ContextBudget)?;
+        }
+        let per_head = prompt_cap.checked_sub(largest).ok_or(ClassificationPlanningError::ContextBudget)?;
+        let aggregate = limits.max_total_prompt_tokens.checked_sub(total)
+            .ok_or(ClassificationPlanningError::ContextBudget)? / count;
+        let capacity = per_head.min(aggregate).min(limits.max_input_bytes);
+        if capacity == 0 { return Err(ClassificationPlanningError::ContextBudget); }
+        Ok(capacity)
+    }
+
     pub fn plan(&self, request: &ClassificationRequest, context: &PlanContext<'_>, limits: ClassificationLimits)
         -> Result<PreparedClassification, ClassificationPlanningError> {
         self.plan_with_control(request, context, limits, &mut Continue)
@@ -225,21 +266,15 @@ impl ClassificationPlanner {
         // document-token allocation. Escaped codebook bytes count in FULL.
         for index in 0..count {
             checkpoint(control)?;
-            let (record, candidates, label_index) = if request.mode == ClassificationMode::Exclusive {
-                #[derive(Serialize)]
-                struct Entry<'a> { code: &'a str, id: &'a str, description: &'a str }
-                let rows: Vec<_> = labels.iter().zip(&codes).map(|(l, code)| Entry { code, id: &l.id, description: &l.description }).collect();
-                check_metadata(&rows, metadata_room)?;
-                let record = canonjson::canonical_bytes(&rows).map_err(|_| ClassificationPlanningError::Serialization)?;
+            let record = label_record(&labels, &codes, index, request.mode, metadata_room)?;
+            let (candidates, label_index) = if request.mode == ClassificationMode::Exclusive {
                 // TaskIR identifiers have a deliberately narrower alphabet than
                 // user labels. Never weaken that ABI or normalize a user ID.
                 let candidates = codes.iter().enumerate().map(|(index, code)|
                     self.candidate(&internal_label_id(index), code)).collect::<Result<Vec<_>, _>>()?;
-                (record, candidates, None)
+                (candidates, None)
             } else {
-                check_metadata(labels[index], metadata_room)?;
-                let record = canonjson::canonical_bytes(labels[index]).map_err(|_| ClassificationPlanningError::Serialization)?;
-                (record, vec![self.candidate("no", "N")?, self.candidate("yes", "Y")?], Some(index))
+                (vec![self.candidate("no", "N")?, self.candidate("yes", "Y")?], Some(index))
             };
             let prompt_len = overhead.checked_add(record.len()).and_then(|n| n.checked_add(request.document.len()))
                 .ok_or(ClassificationPlanningError::ContextBudget)?;
@@ -453,6 +488,24 @@ fn checked_labels(r: &ClassificationRequest, limits: ClassificationLimits) -> Re
     let mut labels = reserved(r.labels.len())?; labels.extend(&r.labels); labels.sort_unstable_by(|a, b| a.id.cmp(&b.id));
     if labels.windows(2).any(|w| w[0].id == w[1].id) { return Err(ClassificationPlanningError::InvalidRequest); }
     Ok(labels)
+}
+/// Shared with capacity admission so JSON escaping and opaque code width
+/// cannot drift between the quote and the actual trusted prompt compiler.
+fn label_record(labels: &[&ClassificationLabel], codes: &[String], index: usize,
+    mode: ClassificationMode, cap: usize) -> Result<Vec<u8>, ClassificationPlanningError> {
+    if mode == ClassificationMode::Exclusive {
+        #[derive(Serialize)]
+        struct Entry<'a> { code: &'a str, id: &'a str, description: &'a str }
+        let mut rows = reserved(labels.len())?;
+        rows.extend(labels.iter().zip(codes).map(|(label, code)| Entry {
+            code, id: &label.id, description: &label.description }));
+        check_metadata(&rows, cap)?;
+        canonjson::canonical_bytes(&rows).map_err(|_| ClassificationPlanningError::Serialization)
+    } else {
+        let label = labels.get(index).ok_or(ClassificationPlanningError::Accounting)?;
+        check_metadata(label, cap)?;
+        canonjson::canonical_bytes(label).map_err(|_| ClassificationPlanningError::Serialization)
+    }
 }
 /// Equal-width opaque A..Z codes within a choice set. Wider taxonomies use
 /// exact multi-token continuations; EOS is scored and no length rule is hidden.

@@ -5,6 +5,9 @@ use crate::{native_engine::strict_int4::{prefill::Int4PrefillLimits, scoring::In
     tasks::{classify::grouped_int4::{self, Int4ClassificationError, Int4ClassificationRun, PreparedInt4Classification},
         ir::TaskBudget}};
 
+mod long;
+pub use long::Int4ClassificationMapHostConfig;
+
 impl NlpEngine {
     /// Execute all classification heads under one existing host call. A
     /// source-converted or independently pinned snapshot-loaded ResidentInt4

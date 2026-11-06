@@ -5,6 +5,7 @@ use super::*;
 use crate::native_engine::strict_int4::weights::snapshot::Int4SnapshotError;
 mod snapshot;
 mod classify;
+pub use classify::Int4ClassificationMapHostConfig;
 mod assay;
 pub use assay::{Int4AssayHostLimits, Int4AssayHostRequirements, Int4AssayOperation};
 mod assay_ner;
@@ -97,6 +98,7 @@ impl Int4LoadLimits {
 pub enum Int4HostError {
     Source(ConverterError), Model(Int4ModelError), Native(StrictInt4Error), Chat(Int4ChatError),
     Snapshot(Int4SnapshotError), Classification(Int4ClassificationError),
+    ClassificationMap(crate::tasks::classify::grouped_int4::long::Int4ClassificationMapError),
     Sentiment(crate::tasks::sentiment::grouped_int4::Int4SentimentError),
     SentimentMap(crate::tasks::sentiment::grouped_int4::long::Int4SentimentMapError),
     Judge(crate::tasks::judge::grouped_int4::Int4JudgeError),
@@ -120,6 +122,7 @@ impl fmt::Display for Int4HostError {
             Self::Chat(_) => "INT4 chat execution or finalization refused",
             Self::Snapshot(_) => "INT4 local snapshot loading or persistence refused",
             Self::Classification(_) => "INT4 classification execution or finalization refused",
+            Self::ClassificationMap(_) => "INT4 complete-document classification mapping or aggregation refused",
             Self::Sentiment(_) => "INT4 sentiment execution or finalization refused",
             Self::SentimentMap(_) => "INT4 complete-document sentiment mapping or aggregation refused",
             Self::Judge(_) => "INT4 complete judgment execution or finalization refused",
@@ -143,6 +146,7 @@ impl Error for Int4HostError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self { Self::Source(e) => Some(e), Self::Model(e) => Some(e), Self::Native(e) => Some(e),
             Self::Chat(e) => Some(e), Self::Snapshot(e) => Some(e), Self::Classification(e) => Some(e),
+            Self::ClassificationMap(e) => Some(e),
             Self::Sentiment(e) => Some(e), Self::SentimentMap(e) => Some(e),
             Self::Judge(e) => Some(e), Self::Resolution(e) => Some(e),
             Self::Entities(e) => Some(e), Self::Redaction(e) => Some(e),

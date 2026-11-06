@@ -28,6 +28,11 @@ impl Int4ClassificationPlanner {
     /// task adds its complete prompt, label, score-space and policy bindings.
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     pub fn group_width(&self) -> usize { self.model.group_width() }
+    /// Exact source capacity for these labels, fixed prompt and task limits.
+    pub fn max_document_bytes(&self, request: &ClassificationRequest, context_tokens: usize)
+        -> Result<usize, Int4ClassificationError> {
+        self.compiler.source_capacity(request, self.ceiling, self.limits, context_tokens).map_err(Into::into)
+    }
     #[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub(crate) fn durable_configuration(&self) -> (TaskBudget, ClassificationLimits) {
         (self.ceiling, self.limits)
