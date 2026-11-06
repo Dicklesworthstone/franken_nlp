@@ -1,4 +1,4 @@
-//! One complete hosted classification map and guarded publication.
+//! Whole-document preflight, one owned native map and complete publication.
 use super::*;
 use std::time::{Duration, Instant};
 use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
@@ -8,9 +8,8 @@ use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, Me
         generation::grouped_int4::INT4_SOURCE_FORMAT,
         strict_int4::{Int4ModelError, StrictInt4Error,
             weights::snapshot::{Int4SnapshotError, INT4_SNAPSHOT_VERSION}}},
-    tasks::classify::{ClassificationMode,
-        grouped_int4::{Int4ClassificationError, Int4ClassificationPlanner,
-            long::Int4ClassificationMapError}}};
+    tasks::classify::{ClassificationMode, grouped_int4::{Int4ClassificationError,
+        Int4ClassificationPlanner, long::Int4ClassificationMapError}}};
 
 struct DeadlineControl { started: Instant, deadline: Duration }
 impl DecodeStepControl for DeadlineControl {
@@ -74,6 +73,7 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     remaining()?;
     let budget = options.budget(common, limits.planning.max_labels)?;
     let request = classify::parse_request(&text, budget, args.max_input_bytes)?;
+    options.admit_request(&request)?;
     drop(text);
     remaining()?;
     let cancellation = CancellationToken::default();
@@ -87,15 +87,15 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         planning: limits.planning, mapping: limits.mapping,
         preparation_reserve_bytes: common.preparation_bytes,
     };
-    // Ordinary execution plans once inside the charged host. An explicit
-    // snapshot save first preflights the entire document so a known-invalid
-    // later chunk or whole-document work refusal creates no snapshot file.
+    // Ordinary execution compiles each chunk once inside the charged host.
+    // An explicit snapshot save requires complete preflight first, so an
+    // invalid document cannot create a requested snapshot as a side effect.
     let expected = if args.save_snapshot.is_some() {
         let preflight_bytes = sum(&[limits.memory.input_bytes, limits.memory.workspace_bytes])?;
         let _preflight = lease.reserve(MemoryClass::JobBuffers, preflight_bytes)
             .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
-        let planner = Int4ClassificationPlanner::for_model(model.model_identity(), budget, config.planning)
-            .map_err(classification_error)?;
+        let planner = Int4ClassificationPlanner::for_model(model.model_identity(), budget,
+            config.planning).map_err(classification_error)?;
         let prepared = planner.plan_document_with_control(&request, config.mapping,
             &mut DeadlineControl { started, deadline }).map_err(planning_error)?;
         let heads = if request.mode == ClassificationMode::Exclusive { 1 } else { request.labels.len() };
@@ -126,20 +126,31 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         source_root_sha256: model_identity.source_root_sha256(), model_content_sha256: &content,
         candidate_format: INT4_SOURCE_FORMAT, quant_recipe: &recipe,
         group_width: model_identity.group_width(), integer_kernel: common.kernel.kind().id(), snapshot };
-    let result = engine.map_int4_classify(&model, request, config, common.kernel, cancellation)
-        .map_err(|error| host_error(error, CandidateError::Execution))?;
-    if let Some(expected) = expected {
-        expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+    if let Some(chunks) = options.mapping.cohort_chunks {
+        let result = engine.map_int4_classify_cohorts(&model, request, config, chunks,
+            common.kernel, cancellation).map_err(|error| host_error(error, CandidateError::Execution))?;
+        if let Some(expected) = expected {
+            expected.verify_completed(&result.result().output).map_err(|_| CandidateError::Execution)?;
+        }
+        let cohort = Cohort { schema_version: result.result().schema_version,
+            execution: &result.result().execution, max_chunks: chunks, chunk_cohorts: result.result().chunk_cohorts,
+            group_steps: result.result().group_steps, projection_groups: result.result().projection_groups };
+        publish_complete(&Response { provenance: &provenance, output: &result.result().output, cohort: Some(cohort) },
+            limits.envelope_bytes, output, &remaining)
+    } else {
+        let result = engine.map_int4_classify(&model, request, config, common.kernel, cancellation)
+            .map_err(|error| host_error(error, CandidateError::Execution))?;
+        if let Some(expected) = expected {
+            expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+        }
+        publish_complete(&Response { provenance: &provenance, output: result.result(), cohort: None },
+            limits.envelope_bytes, output, &remaining)
     }
-    // The hosted guard and CLI publication reservation outlive serialization,
-    // deadline checks, the complete external write and its physical flush.
-    publish_complete(&Response { provenance: &provenance, output: result.result() },
-        limits.envelope_bytes, output, &remaining)
 }
 
-/// No bytes escape on an incomplete native result, serialization/cap refusal,
-/// or a deadline reached before publication. A writer can still fail after
-/// emitting transport bytes; that is an error, never successful completion.
+/// Stage the entire document before checking the final publication deadline.
+/// No output begins after a deadline spent during serialization. The hosted
+/// result and its resource guard stay live through the physical write/flush.
 fn publish_complete<T: Serialize>(value: &T, cap: usize, output: &mut impl Write,
     remaining: &impl Fn() -> Result<Duration, CandidateError>) -> Result<(), CandidateError> {
     remaining()?;
@@ -170,11 +181,17 @@ struct Provenance<'a> {
     snapshot: Option<SnapshotRecord>,
 }
 #[derive(Serialize)]
+struct Cohort<'a> {
+    schema_version: u32, execution: &'a str,
+    max_chunks: usize, chunk_cohorts: usize, group_steps: u64, projection_groups: u64,
+}
+#[derive(Serialize)]
 struct Response<'a, 'b, T: Serialize> {
     #[serde(flatten)]
     provenance: &'a Provenance<'b>,
     output: &'a T,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cohort: Option<Cohort<'a>>,
 }
 
-#[cfg(test)]
-mod tests;
+#[cfg(test)] mod tests;

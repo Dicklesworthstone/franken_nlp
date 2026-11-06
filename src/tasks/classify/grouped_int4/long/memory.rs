@@ -1,7 +1,8 @@
 //! Pure declared-memory quote shared by CLI and hosted classification maps.
 //! This accounts for simultaneous owners, not a measured process RSS cap.
-use super::{Int4ClassificationMapError, Int4ClassificationMapLimits};
-use crate::{native_engine::strict_int4::Int4MemoryRequirement,
+use super::{Int4ClassificationMapError, Int4ClassificationMapLimits, cohort::COHORT_WRAPPER_BYTES};
+use crate::{native_engine::strict_int4::{Int4MemoryRequirement,
+        cohort::MAX_INT4_SEQUENCES, scoring::cohort::required_task_workspace_bytes},
     tasks::{classify::ClassificationLimits, ir::TaskBudget}};
 
 pub const MIN_CLASSIFICATION_MAP_PREPARATION_BYTES: u64 = 128 * 1024 * 1024;
@@ -22,6 +23,15 @@ pub struct Int4ClassificationMapMemoryRequirement {
     /// Result remains charged through complete caller publication.
     pub output_reservation_bytes: u64,
     pub max_output_bytes: u64,
+}
+/// The `memory` fields are the complete simultaneous quote for the cohort
+/// schedule. `task_workspace_bytes` is already included in `memory.input_bytes`;
+/// neither it nor the serial quote should be added to the total again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Int4ClassificationMapCohortMemoryRequirement {
+    pub memory: Int4ClassificationMapMemoryRequirement,
+    pub task_workspace_bytes: u64,
+    pub max_cohort_output_bytes: u64,
 }
 impl Int4ClassificationMapMemoryLimits {
     pub fn requirements(self, width: usize, task: TaskBudget, planning: ClassificationLimits,
@@ -72,6 +82,44 @@ impl Int4ClassificationMapMemoryLimits {
         sum(&[native.kv_bytes, workspace_bytes, input_bytes, output_reservation_bytes])?;
         Ok(Int4ClassificationMapMemoryRequirement { native, workspace_bytes, input_bytes,
             output_reservation_bytes, max_output_bytes })
+    }
+
+    /// Quote a complete document with `cohort_chunks` simultaneous chunks and
+    /// at most `max_heads` independent classifier heads per chunk. Exclusive
+    /// classification uses one head; multilabel uses one per label. The host
+    /// checks actual geometry separately and never clamps an oversized input.
+    pub fn cohort_requirements(self, width: usize, task: TaskBudget, planning: ClassificationLimits,
+        mapping: Int4ClassificationMapLimits, max_heads: usize, cohort_chunks: usize)
+        -> Result<Int4ClassificationMapCohortMemoryRequirement, Int4ClassificationMapError> {
+        let mut memory = self.requirements(width, task, planning, mapping)?;
+        if max_heads == 0 || max_heads > planning.max_labels || cohort_chunks == 0
+            || cohort_chunks > mapping.chunks.max_chunks {
+            return Err(Int4ClassificationMapError::Limits);
+        }
+        let heads = max_heads.checked_mul(cohort_chunks)
+            .filter(|&heads| heads <= MAX_INT4_SEQUENCES).ok_or(Int4ClassificationMapError::Limits)?;
+        // The original per-chunk task cap must cover that chunk's entire
+        // simultaneous KV, independently of the global window reservation.
+        if mul(memory.native.kv_bytes, max_heads as u64)? > task.max_kv_bytes {
+            return Err(Int4ClassificationMapError::Admission);
+        }
+        let contexts = [self.context_tokens; MAX_INT4_SEQUENCES];
+        memory.native = Int4MemoryRequirement::for_cohort(&contexts[..heads], width)?;
+        memory.workspace_bytes = sum(&[memory.native.rope_bytes, memory.native.scratch_payload_bound,
+            self.allocator_reserve_bytes])?;
+        let max_cohort_output_bytes = sum(&[mul(task.max_output_bytes, cohort_chunks as u64)?, COHORT_WRAPPER_BYTES])?;
+        if max_cohort_output_bytes > super::MAX_BYTES { return Err(Int4ClassificationMapError::Limits); }
+        let task_workspace_bytes = required_task_workspace_bytes(mapping.max_model_work, heads, max_cohort_output_bytes)?;
+        // The base quote prices one complete pending chunk. A native window
+        // can finish several chunks before the retained-frontier cap rejects
+        // one, so charge that entire additional live result frontier too.
+        let additional_results = mul(max_cohort_output_bytes.checked_sub(task.max_output_bytes)
+            .ok_or(Int4ClassificationMapError::Limits)?, 8)?;
+        memory.input_bytes = sum(&[memory.input_bytes, task_workspace_bytes, additional_results])?;
+        memory.max_output_bytes = sum(&[mapping.max_result_bytes, COHORT_WRAPPER_BYTES])?;
+        memory.output_reservation_bytes = sum(&[mul(memory.max_output_bytes, 8)?, 4096])?;
+        sum(&[memory.native.kv_bytes, memory.workspace_bytes, memory.input_bytes, memory.output_reservation_bytes])?;
+        Ok(Int4ClassificationMapCohortMemoryRequirement { memory, task_workspace_bytes, max_cohort_output_bytes })
     }
 }
 fn mul(a: u64, b: u64) -> Result<u64, Int4ClassificationMapError> {

@@ -87,6 +87,27 @@ each scored position. Its candidate weights, ranking, original policy,
 classified/abstained decision and native work remain visible. A native failure
 is not converted into an abstention or omitted from the result.
 
+## Serial and native cohort execution
+
+Serial execution is the default and reuses one native cache. Add
+`--cohort-chunks 4`, for example, to execute windows of four complete chunks
+through the shared-projection native decoder. Each chunk keeps independent
+KV state and the same exact classification finalizer.
+
+The requested window must fit at most 64 simultaneous heads. Exclusive
+classification uses one head per chunk; multi-label classification uses one
+head per label per chunk. Every future window is checked before native
+execution. An oversized requested shape is refused, even for a short source,
+without silently reducing the window or choosing serial execution.
+
+Logical per-chunk task authority is the same across the serial and cohort
+schedules; their physical memory quotes account for the different simultaneous
+allocations. The complete semantic result remains under `output`. Cohort
+responses add a sibling `cohort` object with physical grouping counts, which
+are not a measured speedup or task-quality claim. See the
+[native chunk-cohort controls and exact result limits](int4-classification.md#native-chunk-cohorts)
+for memory admission, window geometry and examples.
+
 ## Document-level aggregation
 
 The aggregation profile is `classification-source-scalar-mixture-v1`. A

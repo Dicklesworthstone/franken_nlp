@@ -1,6 +1,7 @@
 //! Complete-document classification using the original exact native heads.
-//! One reusable serial cache visits every lossless source chunk. The entire
-//! plan and five-axis work sum are admitted before any native forward.
+//! One reusable serial cache or bounded native chunk cohorts visit every
+//! lossless source chunk. The entire plan and five-axis work sum are admitted
+//! before any native forward.
 use super::*;
 use crate::{tasks::{classify::{ClassificationMode, ClassificationPolicy, ClassificationAggregate,
         ClassificationAggregateResult, ClassificationAggregationPolicy, ClassificationAggregationError,
@@ -9,6 +10,9 @@ use crate::{tasks::{classify::{ClassificationMode, ClassificationPolicy, Classif
     validation::grounded_fields::VerifiedSourceSpan};
 
 pub mod memory;
+mod cohort;
+pub use cohort::{Int4ClassificationMapCohortBudget, Int4ClassificationMapCohortRun,
+    INT4_CLASSIFICATION_MAP_COHORT_EXECUTION};
 pub const INT4_CLASSIFICATION_MAP_EXECUTION: &str = "grouped-int4-complete-classification-map-v1";
 pub const MAX_CLASSIFICATION_MAP_CHUNKS: usize = 256;
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -77,6 +81,9 @@ impl From<ClassificationPlanningError> for Int4ClassificationMapError {
 }
 impl From<StrictInt4Error> for Int4ClassificationMapError {
     fn from(e: StrictInt4Error) -> Self { Self::Classification(e.into()) }
+}
+impl From<Int4ScoringError> for Int4ClassificationMapError {
+    fn from(e: Int4ScoringError) -> Self { Self::Classification(e.into()) }
 }
 impl From<ClassificationAggregationError> for Int4ClassificationMapError {
     fn from(e: ClassificationAggregationError) -> Self { Self::Aggregation(e) }

@@ -81,3 +81,42 @@ fn all_native_cancellation_causes_survive_the_host_error_boundary() {
         assert_eq!(error.to_string(), "native classification document task refused");
     }
 }
+
+#[test]
+fn exclusive_and_multilabel_windows_keep_their_actual_independent_head_counts() {
+    let (mut request, mut config) = fixture();
+    config.mapping.chunks.max_chunks = 64;
+    assert_eq!(head_count(&request), 1);
+    validate_cohort_request(&request, config, 64).unwrap();
+    assert!(validate_cohort_request(&request, config, 65).is_err());
+    request.mode = ClassificationMode::MultiLabel;
+    assert_eq!(head_count(&request), request.labels.len());
+    validate_cohort_request(&request, config, 32).unwrap();
+    assert!(validate_cohort_request(&request, config, 33).is_err());
+    for chunks in [0, usize::MAX] { assert!(validate_cohort_request(&request, config, chunks).is_err()); }
+    request.labels.clear();
+    assert!(validate_cohort_request(&request, config, 1).is_err());
+}
+
+#[test]
+fn hosted_cohorts_share_the_pure_quote_and_charge_excess_transferred_capacity() {
+    let (mut request, config) = fixture();
+    request.mode = ClassificationMode::MultiLabel;
+    request.budget.max_kv_bytes *= request.labels.len() as u64;
+    let required = config.cohort_requirements(32, request.budget, head_count(&request), 2).unwrap();
+    let expected = Int4ClassificationMapMemoryLimits { context_tokens: config.native.context_tokens,
+        preparation_reserve_bytes: config.preparation_reserve_bytes,
+        allocator_reserve_bytes: config.native.allocator_reserve_bytes }
+        .cohort_requirements(32, request.budget, config.planning, config.mapping, head_count(&request), 2).unwrap();
+    assert_eq!(required, expected);
+    let base = owned_input_bytes(&request, config, required.memory).unwrap();
+    let mut document = String::with_capacity(config.mapping.chunks.max_input_bytes + 1234);
+    document.push_str(&request.document); request.document = document;
+    assert_eq!(owned_input_bytes(&request, config, required.memory).unwrap() - base,
+        (request.document.capacity() - config.mapping.chunks.max_input_bytes) as u64);
+    let mut short = request.budget; short.max_kv_bytes -= 1;
+    assert!(config.cohort_requirements(32, short, head_count(&request), 2).is_err());
+    fn send<T: Send + 'static>() {}
+    send::<Int4ClassificationMapCohortRun>();
+    let _cohorts = NlpEngine::map_int4_classify_cohorts;
+}

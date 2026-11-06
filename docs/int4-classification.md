@@ -123,6 +123,7 @@ including JSON and label metadata. Generation controls and the single-request
 | `--max-retained-result-bytes` | 67108864 | Sum of retained chunk results |
 | `--max-map-result-bytes` | 16777216 | Complete semantic document result |
 | `--minimum-classified-coverage-ppm` | 1000000 | Original-scalar coverage needed for an aggregate decision |
+| `--cohort-chunks N` | Omitted: serial | Execute complete chunks together within the explicit native head ceiling |
 
 Every chunk retains its exact full-vocabulary sequence scores, candidate
 weights and classified/abstained decision. The `output.aggregate` is separately
@@ -146,6 +147,77 @@ large shapes before execution. These are ledger bounds, not measured RSS.
 Any failed chunk yields no document result. Serialization finishes under the
 same deadline before writing begins, and memory guards remain owned through
 the physical write and flush.
+
+### Native chunk cohorts
+
+Add `--cohort-chunks N` to run windows of complete chunks through the native
+shared-projection decoder. Each chunk keeps its own KV state and the original
+classifier finalizer. Exclusive classification has one head per chunk,
+regardless of its label count. Multi-label classification has one independent
+yes/no head per label per chunk. The requested window must satisfy:
+
+```text
+1 <= N <= 64
+N <= --max-chunks
+N * heads_per_chunk <= 64
+```
+
+For example, a four-chunk window permits up to sixteen independent labels;
+an exclusive classifier can use all 128 supported labels within its single
+codebook head. `--cohort-chunks 1` still executes a multi-label chunk's heads
+together, so it accepts at most 64 labels. Omit the option to retain serial
+execution and its existing support for 128 sequential label heads.
+
+```sh
+fnlp candidate source-int4 classify-map request.json \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256_FROM_TRUSTED_CONVERSION" \
+  --memory-mib "$MEMORY_MIB" --group-width 128 --context-tokens 2048 \
+  --cohort-chunks 4
+```
+
+The complete requested window's head count is checked after strict request
+parsing and before source conversion, snapshot loading or snapshot creation.
+An oversized request fails even if the document would fit in fewer chunks;
+the command never silently reduces the requested window or retries serially.
+The final window may contain fewer chunks because the complete partition has
+ended. All future windows, identities, work and context capacities are checked
+before native execution begins.
+
+The pre-input memory quote covers the largest valid label geometry for the
+requested window because the JSON mode and labels have not yet been read.
+It includes simultaneous KV, native scratch, all retained plans, the complete
+window result frontier and final publication. This can require a higher
+memory ceiling than the serial route. The five native work ceilings still
+cover the whole document; a new window does not renew them.
+
+The complete native window has a separate 64 MiB result ceiling, including
+4096 bytes of framing. Consequently, `N * --max-result-bytes + 4096` must not
+exceed 67108864. With the default 1 MiB per-chunk cap, a requested 64-chunk
+window refuses before input access. Set a smaller explicit cap, such as
+`--cohort-chunks 64 --max-result-bytes 524288`, when that shape is appropriate.
+Every chunk must still fit its complete result cap; no result is truncated.
+
+The response keeps the same complete semantic result under `output` and adds
+a sibling `cohort` object containing `schema_version`, `execution`,
+`max_chunks`, `chunk_cohorts`, `group_steps` and `projection_groups`. These
+fields describe physical grouping, not task quality or measured speed.
+Serial responses omit `cohort`. Chunk order, original source ranges,
+full-vocabulary scores, abstention policy and the named aggregate estimator
+use the same implementations in both schedules. Any failed window prevents
+publication of the entire document result.
+
+Embedders can call `NlpEngine::map_int4_classify_cohorts` with an explicit
+window size. `Int4ClassificationMapHostConfig::cohort_requirements` supplies
+the complete checked memory quote for the declared heads and chunks. Its task
+workspace is already included in `memory.input_bytes`. The per-chunk task KV
+budget must cover all of that chunk's simultaneous heads. Changing that task
+budget changes the compiled task identity; parity comparisons should use the
+same prepared task and budget in both schedules. The CLI fixes that logical
+authority at the declared maximum of 128 labels for serial execution and
+every cohort width, so selecting a schedule alone does not change TaskIR.
+The physical quote still reserves one serial cache or the complete admitted
+cohort window, according to the selected schedule.
 
 ## Explicit integer kernels
 

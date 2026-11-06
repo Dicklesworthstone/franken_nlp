@@ -62,3 +62,57 @@ fn undersized_kv_incoherent_source_limits_and_overflow_fail_pure_admission() {
         assert!(memory.requirements(32, task, planning, mapping).is_err(), "axis {axis}");
     }
 }
+
+#[test]
+fn cohort_quote_prices_all_chunk_heads_and_keeps_the_serial_quote_unchanged() {
+    let (memory, mut task, planning, mapping) = fixture();
+    for heads in [1, 3, 8] {
+        let row = Int4MemoryRequirement::for_context(memory.context_tokens, 32).unwrap();
+        task.max_kv_bytes = row.kv_bytes * heads as u64;
+        let serial = memory.requirements(32, task, planning, mapping).unwrap();
+        for chunks in [1, 2, 8] {
+            let quote = memory.cohort_requirements(32, task, planning, mapping, heads, chunks).unwrap();
+            let contexts = vec![memory.context_tokens; heads * chunks];
+            assert_eq!(quote.memory.native, Int4MemoryRequirement::for_cohort(&contexts, 32).unwrap());
+            assert_eq!(quote.memory.native.kv_bytes, row.kv_bytes * (heads * chunks) as u64);
+            assert_eq!(quote.memory.workspace_bytes, quote.memory.native.rope_bytes
+                + quote.memory.native.scratch_payload_bound + memory.allocator_reserve_bytes);
+            assert!(quote.memory.input_bytes >= serial.input_bytes + quote.task_workspace_bytes);
+            assert!(quote.max_cohort_output_bytes > chunks as u64 * task.max_output_bytes);
+            assert_eq!(quote.memory.max_output_bytes, mapping.max_result_bytes + COHORT_WRAPPER_BYTES);
+            assert_eq!(quote.memory.output_reservation_bytes, 8 * quote.memory.max_output_bytes + 4096);
+            assert_eq!(memory.requirements(32, task, planning, mapping).unwrap(), serial);
+        }
+    }
+}
+
+#[test]
+fn cohort_quote_refuses_per_document_kv_and_oversized_windows_without_clamping() {
+    let (memory, mut task, planning, mapping) = fixture();
+    let one = task.max_kv_bytes;
+    task.max_kv_bytes = one * 3;
+    assert!(memory.cohort_requirements(32, task, planning, mapping, 3, 2).is_ok());
+    task.max_kv_bytes -= 1;
+    assert!(matches!(memory.cohort_requirements(32, task, planning, mapping, 3, 2),
+        Err(Int4ClassificationMapError::Admission)));
+    task.max_kv_bytes = u64::MAX;
+    for (heads, chunks) in [(0, 1), (1, 0), (planning.max_labels + 1, 1), (16, 5),
+        (1, mapping.chunks.max_chunks + 1), (usize::MAX, 1), (1, usize::MAX)] {
+        assert!(matches!(memory.cohort_requirements(32, task, planning, mapping, heads, chunks),
+            Err(Int4ClassificationMapError::Limits)), "heads={heads} chunks={chunks}");
+    }
+}
+
+#[test]
+fn cohort_workspace_and_current_result_frontier_have_checked_finite_bounds() {
+    let (memory, task, planning, mut mapping) = fixture();
+    let one = memory.cohort_requirements(32, task, planning, mapping, 1, 1).unwrap();
+    let two = memory.cohort_requirements(32, task, planning, mapping, 1, 2).unwrap();
+    assert!(two.task_workspace_bytes > one.task_workspace_bytes);
+    assert!(two.memory.input_bytes > one.memory.input_bytes);
+    assert_eq!(two.memory.output_reservation_bytes, one.memory.output_reservation_bytes);
+    let mut excessive = task; excessive.max_output_bytes = 64 * 1024 * 1024;
+    assert!(memory.cohort_requirements(32, excessive, planning, mapping, 1, 1).is_err());
+    mapping.max_model_work.forward_positions = u64::MAX;
+    assert!(memory.cohort_requirements(32, task, planning, mapping, 1, 1).is_err());
+}
