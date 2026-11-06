@@ -1,5 +1,6 @@
 //! Real compiler/cursor/driver wiring with synthetic logits; no model parity.
 use super::*;
+use super::super::tests::{BoundaryCancellation, CANCELLATION_KINDS, CancellingDecoder, CancellingSink};
 
 fn identity() -> ExecutionIdentity {
     let d = Sha256Digest::of_bytes(b"synthetic-int8-fixture");
@@ -21,13 +22,15 @@ fn source(id: &ExecutionIdentity) -> ArtifactIdentity {
         logical_model_sha256: id.logical_model_digest.to_hex() }
 }
 #[derive(Default)]
-struct Control { stop_prompt: Option<usize>, stop_token: Option<usize> }
+struct Control { stop_prompt: Option<usize>, stop_token: Option<usize>, boundary: BoundaryCancellation }
 impl DecodeStepControl for Control {
     fn checkpoint(&mut self, index: usize) -> Option<DecodeCancellationKind> {
-        (self.stop_token == Some(index)).then_some(DecodeCancellationKind::Deadline)
+        self.boundary.checkpoint(index)
+            .or_else(|| (self.stop_token == Some(index)).then_some(DecodeCancellationKind::Deadline))
     }
     fn prefill_checkpoint(&mut self, index: usize) -> Option<DecodeCancellationKind> {
-        (self.stop_prompt == Some(index)).then_some(DecodeCancellationKind::CostBudget)
+        self.boundary.prefill_checkpoint(index)
+            .or_else(|| (self.stop_prompt == Some(index)).then_some(DecodeCancellationKind::CostBudget))
     }
 }
 struct Model {
@@ -213,6 +216,32 @@ fn cancellation_stops_prefill_preserves_cause_and_aborts_driver() {
     let error = p.drive(&Decoder, 1, &mut sink, &mut model).err().unwrap();
     assert_eq!(error.cancellation(), Some(DecodeCancellationKind::CostBudget));
     assert_eq!(model.tokens, [5]); assert_eq!(model.heads, 0); assert!(model.aborted); assert!(sink.0.is_empty());
+}
+#[test]
+fn terminal_decoder_and_delivery_cancellation_abort_native_generation() {
+    let p = plan(GenerationOptions::greedy(1, 1, 0));
+    for cause in CANCELLATION_KINDS {
+        for during_decode in [false, true] {
+            let mut model = Model::new(&[1]);
+            let signal = model.control.boundary.clone();
+            let error = if during_decode {
+                let decoder = CancellingDecoder { signal, cause, bytes: b"bb".to_vec() };
+                let mut sink = Sink::default();
+                let error = p.drive(&decoder, 1, &mut sink, &mut model).err().unwrap();
+                assert!(sink.0.is_empty());
+                error
+            } else {
+                let mut sink = CancellingSink { signal, cause, events: Vec::new() };
+                let error = p.drive(&Decoder, 1, &mut sink, &mut model).err().unwrap();
+                assert_eq!(sink.events.len(), 1, "delivered tokens are never retried");
+                error
+            };
+            assert_eq!(error.cancellation(), Some(cause));
+            assert!(model.aborted, "a terminal boundary must drain through the native abort path");
+            assert_eq!(model.tokens, [5, 6, 7]); assert_eq!(model.heads, 1);
+            assert_eq!(model.work(), Int8Work::for_sequence(0, 3, NANBEIGE_VOCAB_SIZE).unwrap());
+        }
+    }
 }
 #[test]
 fn native_failure_is_not_a_partial_success_or_retry() {

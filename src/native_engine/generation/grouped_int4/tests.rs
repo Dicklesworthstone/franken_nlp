@@ -1,5 +1,6 @@
 //! Compiler and real cursor wiring with synthetic logits, NOT model parity.
 use super::*;
+use super::super::tests::{BoundaryCancellation, CANCELLATION_KINDS, CancellingDecoder, CancellingSink};
 
 fn identity(width: usize) -> ExecutionIdentity {
     let d = Sha256Digest::of_bytes(b"synthetic-int4-fixture");
@@ -16,13 +17,15 @@ fn plan(options: GenerationOptions) -> Int4GenerationPlan {
     Int4GenerationPlan::compile(vec![5, 6, 7], options, identity(127), 127, "stable-item", 0, GenerationLimits::default()).unwrap()
 }
 #[derive(Default)]
-struct Control { stop_prompt: Option<usize>, stop_token: Option<usize> }
+struct Control { stop_prompt: Option<usize>, stop_token: Option<usize>, boundary: BoundaryCancellation }
 impl DecodeStepControl for Control {
     fn checkpoint(&mut self, index: usize) -> Option<DecodeCancellationKind> {
-        (self.stop_token == Some(index)).then_some(DecodeCancellationKind::Deadline)
+        self.boundary.checkpoint(index)
+            .or_else(|| (self.stop_token == Some(index)).then_some(DecodeCancellationKind::Deadline))
     }
     fn prefill_checkpoint(&mut self, index: usize) -> Option<DecodeCancellationKind> {
-        (self.stop_prompt == Some(index)).then_some(DecodeCancellationKind::CostBudget)
+        self.boundary.prefill_checkpoint(index)
+            .or_else(|| (self.stop_prompt == Some(index)).then_some(DecodeCancellationKind::CostBudget))
     }
 }
 struct Model {
@@ -200,6 +203,32 @@ fn cancellation_and_native_failure_abort_without_successful_partial_result() {
     assert!(model.aborted); assert_eq!(sink.0.len(), 1); assert_eq!(model.heads, 1);
 }
 #[test]
+fn terminal_decoder_and_delivery_cancellation_abort_native_generation() {
+    let p = plan(GenerationOptions::greedy(1, 1, 0));
+    for cause in CANCELLATION_KINDS {
+        for during_decode in [false, true] {
+            let mut model = Model::new(&[1]);
+            let signal = model.control.boundary.clone();
+            let error = if during_decode {
+                let decoder = CancellingDecoder { signal, cause, bytes: b"bb".to_vec() };
+                let mut sink = Sink::default();
+                let error = p.drive(&decoder, 1, &mut sink, &mut model).err().unwrap();
+                assert!(sink.0.is_empty());
+                error
+            } else {
+                let mut sink = CancellingSink { signal, cause, events: Vec::new() };
+                let error = p.drive(&Decoder, 1, &mut sink, &mut model).err().unwrap();
+                assert_eq!(sink.events.len(), 1, "delivered tokens are never retried");
+                error
+            };
+            assert_eq!(error.cancellation(), Some(cause));
+            assert!(model.aborted, "a terminal boundary must drain through the native abort path");
+            assert_eq!(model.tokens, [5, 6, 7]); assert_eq!(model.heads, 1);
+            assert_eq!(model.work(), Int4Work::for_sequence(127, 0, 3, NANBEIGE_VOCAB_SIZE).unwrap());
+        }
+    }
+}
+#[test]
 fn invalid_logits_and_forged_native_work_cannot_return_success() {
     let p = plan(GenerationOptions::greedy(1, 100, 0));
     let mut model = Model::new(&[1]); model.corrupt = true;
@@ -212,14 +241,14 @@ fn invalid_logits_and_forged_native_work_cannot_return_success() {
 fn uncertain_sink_delivery_and_decoder_failure_are_not_retried() {
     struct BadSink(usize);
     impl DecodeEventSink for BadSink {
-        type Permit = (); type Error = ();
-        fn reserve(&mut self, _: &DecodeTokenEvent) -> Result<(), ()> { Ok(()) }
-        fn permit(&mut self, _: (), _: DecodeTokenEvent) -> Result<(), ()> { self.0 += 1; Err(()) }
+        type Permit = (); type Error = &'static str;
+        fn reserve(&mut self, _: &DecodeTokenEvent) -> Result<(), Self::Error> { Ok(()) }
+        fn permit(&mut self, _: (), _: DecodeTokenEvent) -> Result<(), Self::Error> { self.0 += 1; Err("sink failed") }
     }
     struct BadDecoder;
     impl DecodeByteDecoder for BadDecoder {
-        type Error = ();
-        fn decode_token_ids(&self, _: &[u32]) -> Result<Vec<u8>, ()> { Err(()) }
+        type Error = &'static str;
+        fn decode_token_ids(&self, _: &[u32]) -> Result<Vec<u8>, Self::Error> { Err("decoder failed") }
     }
     let p = plan(GenerationOptions::greedy(4, 100, 0)); let mut model = Model::new(&[1]); let mut sink = BadSink(0);
     assert!(p.drive(&Decoder, 1, &mut sink, &mut model).is_err());

@@ -65,24 +65,37 @@ impl<'a, W: Write> Sink<'a, W> {
     pub fn new(writer: &'a mut W, limits: BatchLimits) -> Self { Self { writer, limits, emitted: 0, poisoned: false } }
     pub fn poisoned(&self) -> bool { self.poisoned }
     pub fn emit<T: Serialize>(&mut self, event: &Event<'_, T>, terminal: bool) -> Result<(), BatchFault> {
+        self.emit_with_checkpoint(event, terminal, || Ok(()))
+    }
+    /// Success publication checks the same invocation after both serialization
+    /// passes and immediately before external IO. Error records deliberately
+    /// use `emit` so cancellation can still be reported from terminal reserve.
+    pub fn emit_with_checkpoint<T: Serialize>(&mut self, event: &Event<'_, T>, terminal: bool,
+        mut checkpoint: impl FnMut() -> Result<(), BatchFault>) -> Result<(), BatchFault> {
         if self.poisoned { return Err(BatchCode::OutputIo.into()); }
+        checkpoint()?;
         let line_cap = if terminal { TERMINAL_RESERVE } else { self.limits.max_output_line_bytes };
         // A no-allocation size pass rejects large internal task results BEFORE
         // the canonical serializer builds its tree/byte vector. Output types
         // are trusted Rust Serialize implementations, never executable input.
         let mut count = Counter { remaining: line_cap - 1, overflow: false };
-        if serde_json::to_writer(&mut count, event).is_err() {
+        let sized = serde_json::to_writer(&mut count, event);
+        checkpoint()?;
+        if sized.is_err() {
             return Err(if count.overflow { BatchCode::OutputLineLimit } else { BatchCode::Serialization }.into());
         }
         // Serialize the ORIGINAL value, not the sizing pass's JSON: canonical
         // nonfinite-number rejection must not be bypassed by serde's nulls.
-        let mut bytes = canonjson::canonical_bytes(event).map_err(|_| BatchCode::Serialization)?;
+        let encoded = canonjson::canonical_bytes(event);
+        checkpoint()?;
+        let mut bytes = encoded.map_err(|_| BatchCode::Serialization)?;
         if bytes.len() >= line_cap { return Err(BatchCode::OutputLineLimit.into()); }
         bytes.try_reserve_exact(1).map_err(|_| BatchCode::Allocation)?; bytes.push(b'\n');
         let total = self.emitted.checked_add(bytes.len() as u64).ok_or(BatchCode::OutputLimit)?;
         let ceiling = if terminal { self.limits.max_output_bytes }
             else { self.limits.max_output_bytes - TERMINAL_RESERVE as u64 };
         if total > ceiling { return Err(BatchCode::OutputLimit.into()); }
+        checkpoint()?;
         // Treat even a flush-only error as possibly delivered. Never retry and
         // never append a terminal record to an unknown/truncated output prefix.
         if self.writer.write_all(&bytes).and_then(|_| self.writer.flush()).is_err() {

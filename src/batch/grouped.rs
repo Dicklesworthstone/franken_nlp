@@ -86,6 +86,8 @@ pub trait GroupedBatchProcessor {
 /// Up to one bounded window and one prepared lookahead document may already
 /// have been read when delivery fails. A lookahead is never executed afterward.
 /// Panics unwind owned plans/results/guards; they are not caught as doc errors.
+/// Successful records and the completion footer are checked for cancellation
+/// after serialization and before external IO, with cohort guards still held.
 pub fn run_ndjson<R: BufRead, W: Write, P: GroupedBatchProcessor, C: DecodeStepControl>(
     reader: &mut R, writer: &mut W, processor: &mut P, limits: BatchLimits,
     groups: GroupLimits, control: &mut C,
@@ -98,14 +100,14 @@ pub fn run_ndjson<R: BufRead, W: Write, P: GroupedBatchProcessor, C: DecodeStepC
     }
     let mut sink = Sink::new(writer, limits);
     let mut epoch = 1;
-    let result = run(reader, &mut sink, processor, limits, groups, control, &mut summary, &mut epoch);
-    match result {
-        Ok(()) => {
+    let result = run(reader, &mut sink, processor, limits, groups, control, &mut summary, &mut epoch)
+        .and_then(|()| {
             let mut event = event::<()>("run_complete", epoch, summary.requests);
             event.summary = Some(&summary);
-            sink.emit(&event, true).map_err(|fault| BatchRunError { fault, summary })?;
-            Ok(summary)
-        }
+            sink.emit_with_checkpoint(&event, true, || checkpoint(control))
+        });
+    match result {
+        Ok(()) => Ok(summary),
         Err(fault) => {
             if !sink.poisoned() {
                 let mut event = event::<()>("run_error", epoch, summary.requests);
@@ -252,7 +254,7 @@ fn drain<W: Write, P: GroupedBatchProcessor, C: DecodeStepControl>(pending: &mut
                 let mut event = event("doc", row.context.epoch, row.context.request_seq);
                 event.caller_id = row.id.as_deref(); event.input_line = Some(row.context.input_line);
                 event.byte_offset = Some(row.context.byte_offset); event.reserved_work = row.charge; event.result = Some(value);
-                match sink.emit(&event, false) {
+                match sink.emit_with_checkpoint(&event, false, || checkpoint(control)) {
                     Ok(()) => summary.succeeded += 1,
                     Err(fault) if matches!(fault.code, BatchCode::OutputLineLimit | BatchCode::Serialization) => {
                         emit_error(sink, summary, row, fault)?;

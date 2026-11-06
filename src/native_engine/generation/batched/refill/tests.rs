@@ -2,6 +2,7 @@
 //! Synthetic logits are mechanism evidence, not model parity or host speed.
 use super::*;
 use std::{cell::Cell, rc::Rc};
+use crate::native_engine::generation::tests::{BoundaryCancellation, CANCELLATION_KINDS, CancellingSink};
 
 fn identity() -> ExecutionIdentity {
     let d = Sha256Digest::of_bytes(b"refill test only");
@@ -155,6 +156,23 @@ fn cancellation_after_retirement_prevents_replacement_open() {
     let error = drive(&mut rows, &mut SlotQueue::new(&slots).unwrap(), &mut forward, &Decoder, &mut Discard, &mut Control(flag)).unwrap_err();
     assert!(matches!(error, GenerationError::Cancelled(DecodeCancellationKind::Deadline)));
     assert_eq!(forward.opened, [0]); assert_eq!(forward.groups.len(), 1); assert_eq!(forward.closed, [0]);
+}
+#[test]
+fn terminal_delivery_cancellation_never_retires_or_refills_a_slot() {
+    let plans = [plan("a", vec![5], GenerationOptions::greedy(1, 100, 0)),
+        plan("b", vec![6], GenerationOptions::greedy(1, 100, 0))];
+    for cause in CANCELLATION_KINDS {
+        let slots = [0, 0]; let mut rows = cursors(&plans); let mut forward = Fake::new(&slots);
+        let mut control = BoundaryCancellation::default();
+        let mut sink = CancellingSink { signal: control.clone(), cause, events: Vec::new() };
+        let error = drive(&mut rows, &mut SlotQueue::new(&slots).unwrap(), &mut forward,
+            &Decoder, &mut sink, &mut control).unwrap_err();
+        assert!(matches!(error, GenerationError::Cancelled(actual) if actual == cause));
+        assert_eq!(forward.opened, [0]); assert_eq!(forward.groups.len(), 1);
+        assert_eq!(forward.positions, [1, 0]); assert!(forward.closed.is_empty());
+        assert!(rows.iter().all(|row| !row.done && row.output.token_ids.is_empty()));
+        assert_eq!(sink.events.len(), 1); assert_eq!(sink.events[0].request_seq, 1);
+    }
 }
 #[test]
 fn corrupted_replacement_position_is_rejected_before_any_tick_token_delivery() {

@@ -221,8 +221,9 @@ impl Error for BatchRunError {}
 /// that every item succeeded: inspect `failed`. A failed/partial output write
 /// poisons the stream; no further input or output is attempted. A normal I/O
 /// flush acknowledges the local writer, not remote processing or durability.
-/// Cancellation is checked after execution while the completed result and its
-/// admission guard are still owned, before any successful document is emitted.
+/// Cancellation is checked after execution and after complete serialization
+/// while the result and its admission guard are still owned, before external
+/// document publication. The same boundary protects the completion footer.
 /// Blocking I/O itself cannot be preempted by these cooperative checkpoints.
 pub fn run_ndjson<R: BufRead, W: Write, P: BatchProcessor, C: DecodeStepControl>(
     reader: &mut R, writer: &mut W, processor: &mut P, limits: BatchLimits, control: &mut C,
@@ -231,14 +232,14 @@ pub fn run_ndjson<R: BufRead, W: Write, P: BatchProcessor, C: DecodeStepControl>
     limits.validate().map_err(|fault| BatchRunError { fault, summary })?;
     let mut sink = Sink::new(writer, limits);
     let mut epoch = 1_u64;
-    let result = run(reader, &mut sink, processor, limits, control, &mut summary, &mut epoch);
-    match result {
-        Ok(()) => {
+    let result = run(reader, &mut sink, processor, limits, control, &mut summary, &mut epoch)
+        .and_then(|()| {
             let mut event = Event::<()>::new("run_complete", epoch, summary.requests);
             event.summary = Some(&summary);
-            sink.emit(&event, true).map_err(|fault| BatchRunError { fault, summary })?;
-            Ok(summary)
-        }
+            sink.emit_with_checkpoint(&event, true, || checkpoint(control))
+        });
+    match result {
+        Ok(()) => Ok(summary),
         Err(fault) => {
             // Never append an error after a partial write or failed flush.
             if !sink.poisoned() {
@@ -316,7 +317,7 @@ fn run<R: BufRead, W: Write, P: BatchProcessor, C: DecodeStepControl>(reader: &m
                 let mut event = Event::new("doc", *epoch, summary.requests);
                 event.caller_id = Some(&id); event.input_line = Some(frame.line);
                 event.byte_offset = Some(frame.offset); event.result = Some(&result); event.reserved_work = Some(charge);
-                match sink.emit(&event, false) {
+                match sink.emit_with_checkpoint(&event, false, || checkpoint(control)) {
                     Ok(()) => summary.succeeded += 1,
                     Err(fault) if matches!(fault.code, BatchCode::OutputLineLimit | BatchCode::Serialization) => {
                         reject(sink, summary, *epoch, &frame, Some(&id), fault)?;

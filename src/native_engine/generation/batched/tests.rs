@@ -1,5 +1,6 @@
 //! Synthetic logits exercise the real shared Cursor/driver, not native quality.
 use super::*;
+use super::super::tests::{BoundaryCancellation, CANCELLATION_KINDS, CancellingSink};
 fn identity() -> ExecutionIdentity {
     let d = Sha256Digest::of_bytes(b"fixture");
     ExecutionIdentity { schema_version: 1, source_revision: "fixture".to_owned(), logical_model_digest: d,
@@ -131,6 +132,24 @@ fn cancellation_keeps_cause_and_stops_before_the_next_native_group() {
     assert!(matches!(drive(&mut cursors, &mut forward, &Decoder, &mut Discard, &mut Cancel),
         Err(GenerationError::Cancelled(DecodeCancellationKind::Deadline))));
     assert_eq!(forward.groups.len(), 1);
+}
+#[test]
+fn terminal_delivery_cancellation_stops_sibling_publication_in_the_same_group() {
+    let plans = [plan("a", vec![5], GenerationOptions::greedy(1, 100, 0)),
+        plan("b", vec![6], GenerationOptions::greedy(1, 100, 0))];
+    for cause in CANCELLATION_KINDS {
+        let mut control = BoundaryCancellation::default();
+        let mut sink = CancellingSink { signal: control.clone(), cause, events: Vec::new() };
+        let mut cursors = vec![Cursor::new(&plans[0], 1, BATCH_GENERATION_VERSION).unwrap(),
+            Cursor::new(&plans[1], 2, BATCH_GENERATION_VERSION).unwrap()];
+        let mut forward = Fake::new(2); forward.forced.fill(Some(1));
+        let error = drive(&mut cursors, &mut forward, &Decoder, &mut sink, &mut control).unwrap_err();
+        assert!(matches!(error, GenerationError::Cancelled(actual) if actual == cause));
+        assert_eq!(forward.groups.len(), 1); assert_eq!(forward.positions, [1, 1]);
+        assert_eq!(forward.closed, [false, false], "cancellation cannot retire a successful row");
+        assert!(cursors.iter().all(|cursor| !cursor.done && cursor.output.token_ids.is_empty()));
+        assert_eq!(sink.events.len(), 1); assert_eq!(sink.events[0].request_seq, 1);
+    }
 }
 #[test]
 fn cursor_does_not_accept_double_forward_or_an_unfinished_result() {

@@ -70,6 +70,10 @@ impl<'a> Cursor<'a> {
         let decoded = if eos {
             let mut bytes = reserved(self.output.content_bytes.len())?; bytes.extend_from_slice(&self.output.content_bytes); bytes
         } else { decoder.decode_token_ids(&ids).map_err(|_| GenerationError::Decoder)? };
+        // Decoding may consume the remaining budget or observe external
+        // cancellation. In particular, a byte-limit stop is still a successful
+        // result and must not conceal cancellation at this boundary.
+        checkpoint(control, index)?;
         if !decoded.starts_with(&self.output.content_bytes) { return Err(GenerationError::DecoderNotPrefixStable); }
         if decoded.len() > p.max_output_bytes {
             self.output.finish_reason = GenerationFinish::ByteLimit; self.done = true; self.awaiting_selection = false; return Ok(());
@@ -83,6 +87,10 @@ impl<'a> Cursor<'a> {
         // Cancellation while the sink waited releases the permit, not a token.
         checkpoint(control, index)?;
         sink.permit(permit, event).map_err(|_| GenerationError::Stream)?;
+        // Delivery itself may block or trigger cancellation. An already
+        // delivered event cannot be retracted, but it must not authorize a
+        // successful terminal result or retirement/refill of this row.
+        checkpoint(control, index)?;
         self.output.token_ids = ids; self.output.content_bytes = decoded;
         if let Some(scores) = &mut self.output.token_logprobs { scores.push(score.ok_or(GenerationError::InvalidLogits)?); }
         self.workspace.commit(selected)?;

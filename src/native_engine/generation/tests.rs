@@ -1,5 +1,49 @@
 //! Synthetic projection/transport tests, not native-model qualification.
 use super::*;
+
+pub(super) const CANCELLATION_KINDS: [DecodeCancellationKind; 11] = [
+    DecodeCancellationKind::User, DecodeCancellationKind::Timeout,
+    DecodeCancellationKind::Deadline, DecodeCancellationKind::PollQuota,
+    DecodeCancellationKind::CostBudget, DecodeCancellationKind::FailFast,
+    DecodeCancellationKind::RaceLost, DecodeCancellationKind::ParentCancelled,
+    DecodeCancellationKind::ResourceUnavailable, DecodeCancellationKind::Shutdown,
+    DecodeCancellationKind::LinkedExit,
+];
+
+/// Share a cancellation signal with an external decoder/sink. Tests trigger
+/// semantic boundaries rather than depending on a particular poll count.
+#[derive(Clone, Default)]
+pub(super) struct BoundaryCancellation(std::rc::Rc<std::cell::Cell<Option<DecodeCancellationKind>>>);
+impl DecodeStepControl for BoundaryCancellation {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { self.0.get() }
+}
+pub(super) struct CancellingDecoder {
+    pub(super) signal: BoundaryCancellation,
+    pub(super) cause: DecodeCancellationKind,
+    pub(super) bytes: Vec<u8>,
+}
+impl DecodeByteDecoder for CancellingDecoder {
+    type Error = &'static str;
+    fn decode_token_ids(&self, _: &[u32]) -> Result<Vec<u8>, Self::Error> {
+        self.signal.0.set(Some(self.cause));
+        Ok(self.bytes.clone())
+    }
+}
+pub(super) struct CancellingSink {
+    pub(super) signal: BoundaryCancellation,
+    pub(super) cause: DecodeCancellationKind,
+    pub(super) events: Vec<DecodeTokenEvent>,
+}
+impl DecodeEventSink for CancellingSink {
+    type Permit = (); type Error = &'static str;
+    fn reserve(&mut self, _: &DecodeTokenEvent) -> Result<(), Self::Error> { Ok(()) }
+    fn permit(&mut self, _: (), event: DecodeTokenEvent) -> Result<(), Self::Error> {
+        self.events.push(event);
+        self.signal.0.set(Some(self.cause));
+        Ok(())
+    }
+}
+
 fn identity() -> ExecutionIdentity {
     let d = Sha256Digest::of_bytes(b"fixture");
     ExecutionIdentity { schema_version: 1, source_revision: "fixture".to_owned(), logical_model_digest: d,
@@ -92,6 +136,42 @@ fn cancellation_keeps_original_cause_and_does_not_continue_prefill() {
     let p = plan(GenerationOptions::greedy(2, 100, 0)); let mut calls = 0;
     let error = p.run(&Decoder, 1, &mut Discard, &mut Stop, |_| { calls += 1; Ok(row(1)) }).err().unwrap();
     assert!(matches!(error, GenerationError::Cancelled(DecodeCancellationKind::Deadline))); assert_eq!(calls, 0);
+}
+#[test]
+fn decoding_cancellation_precedes_byte_limit_or_pending_token_delivery() {
+    for cause in CANCELLATION_KINDS {
+        for max_bytes in [1, 100] {
+            let mut control = BoundaryCancellation::default();
+            let decoder = CancellingDecoder { signal: control.clone(), cause, bytes: b"bb".to_vec() };
+            let p = plan(GenerationOptions::greedy(1, max_bytes, 0));
+            let mut sink = Sink::default(); let mut calls = 0;
+            let error = p.run(&decoder, 1, &mut sink, &mut control, |_| {
+                calls += 1; Ok(row(1))
+            }).err().unwrap();
+            assert!(matches!(error, GenerationError::Cancelled(actual) if actual == cause));
+            assert_eq!(calls, p.prompt_tokens());
+            assert!(sink.0.is_empty(), "cancelled decoding must not deliver a token");
+        }
+    }
+}
+#[test]
+fn terminal_delivery_cancellation_never_becomes_a_successful_sequence() {
+    for cause in CANCELLATION_KINDS {
+        for finish in [GenerationFinish::Eos, GenerationFinish::StopSuffix, GenerationFinish::TokenLimit] {
+            let mut options = GenerationOptions::greedy(if finish == GenerationFinish::TokenLimit { 1 } else { 4 }, 100, 0);
+            if finish == GenerationFinish::StopSuffix { options.stop_suffixes = vec![b"b".to_vec()]; }
+            let p = plan(options); let mut control = BoundaryCancellation::default();
+            let mut sink = CancellingSink { signal: control.clone(), cause, events: Vec::new() };
+            let mut calls = 0;
+            let error = p.run(&Decoder, 7, &mut sink, &mut control, |_| {
+                calls += 1; Ok(row(if finish == GenerationFinish::Eos { 0 } else { 1 }))
+            }).err().unwrap();
+            assert!(matches!(error, GenerationError::Cancelled(actual) if actual == cause));
+            assert_eq!(calls, p.prompt_tokens(), "terminal delivery must not feed a token back");
+            assert_eq!(sink.events.len(), 1, "a delivered event remains provisional and is never retried");
+            assert_eq!(sink.events[0].request_seq, 7);
+        }
+    }
 }
 #[test]
 fn context_and_sampler_work_are_declared_before_model_calls() {
