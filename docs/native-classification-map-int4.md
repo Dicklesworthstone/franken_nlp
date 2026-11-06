@@ -65,6 +65,60 @@ before creating the requested file. The existing create-new policy applies;
 this does not activate a model or authenticate a publisher. A saved snapshot
 can remain if later inference or publication fails.
 
+## Serial and native cohort execution
+
+Serial execution remains the default and reuses one native cache. Add
+`--cohort-chunks N` to score bounded windows of original chunks through the
+native classification cohort engine. For example, the snapshot invocation
+above can include `--cohort-chunks 4` to admit windows of up to four chunks.
+This is an explicit execution choice with its own simultaneous memory quote.
+
+The requested width must be between 1 and 64, must not exceed `--max-chunks`,
+and must satisfy `N × heads_per_chunk <= 64`. Exclusive classification has
+one head per chunk, irrespective of the number of candidate labels.
+Multi-label classification has one independent yes/no head for each label.
+Eight labels therefore admit at most eight chunks per window; nine labels
+admit at most seven. The command checks the actual request's label mode and
+head count before model loading. It refuses an invalid declared shape even
+if the document would happen to produce a shorter window. It never silently
+shrinks the requested width or switches execution modes.
+
+Even `--cohort-chunks 1` uses simultaneous heads within each multi-label
+chunk, so that schedule permits at most 64 labels. Omit the option to retain
+the serial route's support for 128 sequential independent label heads.
+
+Every chunk still has its own original source span, complete label codebook,
+prompt context and exact native work. All windows and identities are checked
+before the first native forward, including the final short window. The same
+whole-document work ceilings, retained-result limit and complete-result limit
+cover all windows. Optional snapshot saving first invokes the same exact
+all-window admission checks used by execution. Each chunk's task budget must
+cover its simultaneous heads; the whole window separately admits its combined native memory and
+scoring workspace. The CLI keeps logical task authority fixed across serial
+and cohort schedules while pricing their different physical allocations.
+
+The candidate JSON keeps the semantic map at `output` for either schedule.
+Cohort mode adds a separate top-level `cohort` object containing its schema,
+execution profile, requested `max_chunks`, completed `chunk_cohorts`,
+`group_steps` and `projection_groups`. These describe physical scheduling.
+They do not change the aggregate's meaning or establish a throughput result.
+The implementation uses the existing native chunk scorer and the same serial
+collector and aggregation code. A dedicated native fixture compares both
+modes' semantic maps; that fixture remains pending the required execution
+checkpoint.
+
+Each native window has an additional complete-output ceiling of 64 MiB,
+besides the per-chunk, retained and final document limits. The declaration
+`N * --max-result-bytes + 4096` must fit that ceiling; an oversized declared
+window refuses before input IO. At a width of 64, reduce the default 1 MiB
+per-chunk cap explicitly, for example with `--max-result-bytes 524288`.
+The CLI memory quote reserves the largest valid unknown chunk/head geometry
+before input IO, so cohort mode can require substantially more memory. Hosted
+callers can quote their declared head count directly. No window result is
+published independently: a later failure or cancellation yields no completed
+document result. See the [native chunk-cohort controls](int4-classification.md#native-chunk-cohorts)
+for exact limits and the embedding API.
+
 ## Complete source and scoring semantics
 
 The planner creates a disjoint, lossless partition of the original UTF-8
@@ -86,27 +140,6 @@ scores, including its scored terminal EOS and full-vocabulary denominator at
 each scored position. Its candidate weights, ranking, original policy,
 classified/abstained decision and native work remain visible. A native failure
 is not converted into an abstention or omitted from the result.
-
-## Serial and native cohort execution
-
-Serial execution is the default and reuses one native cache. Add
-`--cohort-chunks 4`, for example, to execute windows of four complete chunks
-through the shared-projection native decoder. Each chunk keeps independent
-KV state and the same exact classification finalizer.
-
-The requested window must fit at most 64 simultaneous heads. Exclusive
-classification uses one head per chunk; multi-label classification uses one
-head per label per chunk. Every future window is checked before native
-execution. An oversized requested shape is refused, even for a short source,
-without silently reducing the window or choosing serial execution.
-
-Logical per-chunk task authority is the same across the serial and cohort
-schedules; their physical memory quotes account for the different simultaneous
-allocations. The complete semantic result remains under `output`. Cohort
-responses add a sibling `cohort` object with physical grouping counts, which
-are not a measured speedup or task-quality claim. See the
-[native chunk-cohort controls and exact result limits](int4-classification.md#native-chunk-cohorts)
-for memory admission, window geometry and examples.
 
 ## Document-level aggregation
 
@@ -157,8 +190,9 @@ The main controls are `--max-input-bytes`, `--context-tokens`, `--max-chunks`,
 ceilings, `--max-result-bytes` for each complete chunk,
 `--max-retained-result-bytes` for retained chunk records, and
 `--max-map-result-bytes` for the complete semantic document result. Final
-candidate framing has its own fixed allowance. Tighten these bounds to the
-intended workload when choosing `--memory-mib`.
+candidate framing and optional cohort metadata have separate fixed
+allowances. Tighten these bounds to the intended workload when choosing
+`--memory-mib`.
 
 `--timeout-seconds` covers reading, model acquisition, optional snapshot
 preflight, execution and publication. `--max-checkpoints` bounds cooperative
@@ -180,6 +214,9 @@ qualification.
 
 Regression source covers strict dispatch and requests, rejection before IO,
 whole-document budget and memory admission, source/snapshot symmetry, typed
-deadline handling and complete publication. Compilation and Rust tests remain
+deadline handling and complete publication. Cohort regression source also
+covers ragged windows, per-chunk summed KV authority, every native work and
+memory axis, late identity failures, malformed results and unchanged
+aggregation of nonuniform chunk scores. Compilation and Rust tests remain
 pending the repository-required controller-selected DSR checkpoint. Model
 quality and performance require their separate retained evidence.

@@ -182,7 +182,9 @@ An oversized request fails even if the document would fit in fewer chunks;
 the command never silently reduces the requested window or retries serially.
 The final window may contain fewer chunks because the complete partition has
 ended. All future windows, identities, work and context capacities are checked
-before native execution begins.
+before native execution begins. An optional snapshot save first uses the same
+exact all-window admission path, including per-chunk summed KV and complete
+native/workspace bounds, before creating the requested file.
 
 The pre-input memory quote covers the largest valid label geometry for the
 requested window because the JSON mode and labels have not yet been read.
@@ -217,7 +219,9 @@ same prepared task and budget in both schedules. The CLI fixes that logical
 authority at the declared maximum of 128 labels for serial execution and
 every cohort width, so selecting a schedule alone does not change TaskIR.
 The physical quote still reserves one serial cache or the complete admitted
-cohort window, according to the selected schedule.
+cohort window, according to the selected schedule. The
+[complete-document guide](native-classification-map-int4.md) describes the
+scoring, aggregation and validation scope in detail.
 
 ## Explicit integer kernels
 

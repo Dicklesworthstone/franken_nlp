@@ -1,4 +1,4 @@
-//! Whole-document preflight, one owned native map and complete publication.
+//! One complete hosted classification map and guarded publication.
 use super::*;
 use std::time::{Duration, Instant};
 use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
@@ -6,10 +6,11 @@ use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, Me
         NativeLimits, RunLimits},
     native_engine::{decode::{DecodeCancellationKind, DecodeStepControl},
         generation::grouped_int4::INT4_SOURCE_FORMAT,
-        strict_int4::{Int4ModelError, StrictInt4Error,
+        strict_int4::{Int4MemoryBudget, Int4ModelError, Int4RunBudget, Int4Work, StrictInt4Error,
             weights::snapshot::{Int4SnapshotError, INT4_SNAPSHOT_VERSION}}},
-    tasks::classify::{ClassificationMode, grouped_int4::{Int4ClassificationError,
-        Int4ClassificationPlanner, long::Int4ClassificationMapError}}};
+    tasks::classify::grouped_int4::{Int4ClassificationError, Int4ClassificationPlanner,
+        long::{Int4ClassificationMapCohortBudget, Int4ClassificationMapError,
+            memory::Int4ClassificationMapCohortMemoryRequirement}}};
 
 struct DeadlineControl { started: Instant, deadline: Duration }
 impl DecodeStepControl for DeadlineControl {
@@ -45,6 +46,15 @@ fn host_error(error: HostedError, fallback: CandidateError) -> CandidateError {
         HostedError::ModelIdentity | HostedError::ResourceDomain => CandidateError::Identity,
         _ => fallback,
     }
+}
+fn cohort_budget(quote: Int4ClassificationMapCohortMemoryRequirement, work: Int4Work)
+    -> Int4ClassificationMapCohortBudget {
+    Int4ClassificationMapCohortBudget { native: Int4RunBudget::exact(work),
+        memory: Int4MemoryBudget { max_kv_bytes: quote.memory.native.kv_bytes,
+            max_rope_bytes: quote.memory.native.rope_bytes,
+            max_scratch_payload_bytes: quote.memory.native.scratch_payload_bound },
+        max_task_workspace_bytes: quote.task_workspace_bytes,
+        max_output_bytes: quote.max_cohort_output_bytes }
 }
 
 pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
@@ -87,15 +97,15 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         planning: limits.planning, mapping: limits.mapping,
         preparation_reserve_bytes: common.preparation_bytes,
     };
-    // Ordinary execution compiles each chunk once inside the charged host.
-    // An explicit snapshot save requires complete preflight first, so an
-    // invalid document cannot create a requested snapshot as a side effect.
+    // Ordinary execution plans once inside the charged host. An explicit
+    // snapshot save first preflights the entire document so a known-invalid
+    // later chunk or whole-document work refusal creates no snapshot file.
     let expected = if args.save_snapshot.is_some() {
         let preflight_bytes = sum(&[limits.memory.input_bytes, limits.memory.workspace_bytes])?;
         let _preflight = lease.reserve(MemoryClass::JobBuffers, preflight_bytes)
             .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
-        let planner = Int4ClassificationPlanner::for_model(model.model_identity(), budget,
-            config.planning).map_err(classification_error)?;
+        let planner = Int4ClassificationPlanner::for_model(model.model_identity(), budget, config.planning)
+            .map_err(classification_error)?;
         let prepared = planner.plan_document_with_control(&request, config.mapping,
             &mut DeadlineControl { started, deadline }).map_err(planning_error)?;
         let heads = if request.mode == ClassificationMode::Exclusive { 1 } else { request.labels.len() };
@@ -103,6 +113,16 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
             || prepared.group_width() != model.model_identity().group_width()
             || prepared.task_budget() != budget || prepared.max_result_bytes() != config.mapping.max_result_bytes {
             return Err(CandidateError::Identity);
+        }
+        if let Some(chunks) = options.mapping.cohort_chunks {
+            // Match the host's actual per-chunk head geometry, within the
+            // conservative unknown-input reservation already held above.
+            let quote = config.cohort_requirements(model.model_identity().group_width(), budget, heads, chunks)
+                .map_err(|_| CandidateError::Planning)?;
+            let admitted = prepared.identities().map_err(planning_error)?;
+            prepared.preflight_cohorts_with_control(&admitted, model.model_identity(), chunks,
+                cohort_budget(quote, prepared.planned_work()), &mut DeadlineControl { started, deadline })
+                .map_err(planning_error)?;
         }
         Some(prepared.preflight_metadata())
     } else { None };
@@ -126,16 +146,21 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         source_root_sha256: model_identity.source_root_sha256(), model_content_sha256: &content,
         candidate_format: INT4_SOURCE_FORMAT, quant_recipe: &recipe,
         group_width: model_identity.group_width(), integer_kernel: common.kernel.kind().id(), snapshot };
+    // Each hosted route verifies the complete native result using its sealed
+    // preflight metadata. An explicit pre-save plan is additionally checked
+    // here against the whole semantic/physical wrapper, never just its maps.
+    // Both branches retain their guard through serialization, write and flush.
     if let Some(chunks) = options.mapping.cohort_chunks {
-        let result = engine.map_int4_classify_cohorts(&model, request, config, chunks,
-            common.kernel, cancellation).map_err(|error| host_error(error, CandidateError::Execution))?;
+        let result = engine.map_int4_classify_cohorts(&model, request, config, chunks, common.kernel, cancellation)
+            .map_err(|error| host_error(error, CandidateError::Execution))?;
         if let Some(expected) = expected {
-            expected.verify_completed(&result.result().output).map_err(|_| CandidateError::Execution)?;
+            expected.verify_completed_cohorts(result.result(), chunks).map_err(|_| CandidateError::Execution)?;
         }
-        let cohort = Cohort { schema_version: result.result().schema_version,
-            execution: &result.result().execution, max_chunks: chunks, chunk_cohorts: result.result().chunk_cohorts,
-            group_steps: result.result().group_steps, projection_groups: result.result().projection_groups };
-        publish_complete(&Response { provenance: &provenance, output: &result.result().output, cohort: Some(cohort) },
+        let run = result.result();
+        let cohort = Cohort { schema_version: run.schema_version, execution: &run.execution,
+            max_chunks: chunks, chunk_cohorts: run.chunk_cohorts,
+            group_steps: run.group_steps, projection_groups: run.projection_groups };
+        publish_complete(&Response { provenance: &provenance, output: &run.output, cohort: Some(cohort) },
             limits.envelope_bytes, output, &remaining)
     } else {
         let result = engine.map_int4_classify(&model, request, config, common.kernel, cancellation)
@@ -148,9 +173,9 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     }
 }
 
-/// Stage the entire document before checking the final publication deadline.
-/// No output begins after a deadline spent during serialization. The hosted
-/// result and its resource guard stay live through the physical write/flush.
+/// No bytes escape on an incomplete native result, serialization/cap refusal,
+/// or a deadline reached before publication. A writer can still fail after
+/// emitting transport bytes; that is an error, never successful completion.
 fn publish_complete<T: Serialize>(value: &T, cap: usize, output: &mut impl Write,
     remaining: &impl Fn() -> Result<Duration, CandidateError>) -> Result<(), CandidateError> {
     remaining()?;
@@ -194,4 +219,5 @@ struct Response<'a, 'b, T: Serialize> {
     cohort: Option<Cohort<'a>>,
 }
 
-#[cfg(test)] mod tests;
+#[cfg(test)]
+mod tests;

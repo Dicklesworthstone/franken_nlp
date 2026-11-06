@@ -45,16 +45,8 @@ impl PreparedInt4ClassificationMap<'_> {
         weights: &Int4ModelWeights, kernel: PackedInt4Kernel, cohort_chunks: usize,
         budget: Int4ClassificationMapCohortBudget, control: &mut C)
         -> Result<Int4ClassificationMapCohortRun, Int4ClassificationMapError> {
-        planning::checkpoint(control)?;
-        if admitted.len() != self.plans.len() || weights.identity().group_width() != self.group_width() {
-            return Err(Int4ClassificationMapError::Admission);
-        }
-        for identity in admitted {
-            planning::checkpoint(control)?;
-            check_model(identity, weights.identity())?;
-        }
-        let windows = self.cohort_windows(admitted, cohort_chunks, budget, control)?;
-        self.collect_cohorts_with_control(&windows, control, |window, control| {
+        let windows = self.admitted_cohort_windows(admitted, weights.identity(), cohort_chunks, budget, control)?;
+        let run = self.collect_cohorts_with_control(&windows, control, |window, control| {
             planning::checkpoint(control)?;
             let mut documents = planning::reserved(window.end - window.start)?;
             for index in window.start..window.end { documents.push((&self.plans[index], &admitted[index])); }
@@ -66,7 +58,10 @@ impl PreparedInt4ClassificationMap<'_> {
             drop(engine);
             planning::checkpoint(control)?;
             Ok(run)
-        })
+        })?;
+        self.expected.verify_completed_cohorts(&run, cohort_chunks)?;
+        planning::checkpoint(control)?;
+        Ok(run)
     }
 
     pub(super) fn cohort_windows<C: DecodeStepControl>(&self, admitted: &[ExecutionIdentity], chunks: usize,
@@ -92,6 +87,7 @@ impl PreparedInt4ClassificationMap<'_> {
             let mut contexts = planning::reserved((end - start) * self.head_count())?;
             let mut documents = planning::reserved(end - start)?;
             let mut expected = Int4Work::default();
+            let mut projection_steps = 0_u64;
             for index in start..end {
                 planning::checkpoint(control)?;
                 let plan = &self.plans[index];
@@ -102,6 +98,10 @@ impl PreparedInt4ClassificationMap<'_> {
                 }
                 contexts.extend(plan.cohort_contexts()?);
                 expected = expected.checked_add(plan.planned_work())?;
+                for schedule in &plan.schedules {
+                    projection_steps = projection_steps.checked_add(schedule.scoring.prefix_evaluations as u64)
+                        .ok_or(Int4ClassificationMapError::Work)?;
+                }
                 documents.push((plan, &admitted[index]));
             }
             let required = Int4MemoryRequirement::for_cohort(&contexts, self.group_width())?;
@@ -117,7 +117,7 @@ impl PreparedInt4ClassificationMap<'_> {
                 return Err(Int4ClassificationMapError::Admission);
             }
             total = total.checked_add(work)?;
-            windows.push(Window { start, end, contexts, work });
+            windows.push(Window { start, end, contexts, work, projection_steps });
         }
         if total != self.planned_work() { return Err(Int4ClassificationMapError::Admission); }
         planning::checkpoint(control)?;
@@ -135,6 +135,7 @@ impl PreparedInt4ClassificationMap<'_> {
         let mut projection_groups = 0_u64;
         let output = self.collect_with_control(control, |index, _, control| {
             if results.len() == 0 {
+                planning::checkpoint(control)?;
                 let window = windows.get(next_window).ok_or(Int4ClassificationMapError::Admission)?;
                 if window.start != index || window.end <= index || window.end > self.plans.len() {
                     return Err(Int4ClassificationMapError::Admission);
@@ -144,7 +145,7 @@ impl PreparedInt4ClassificationMap<'_> {
                 if run.schema_version != 1 || run.execution != INT4_SCORING_COHORT_EXECUTION
                     || run.output.len() != window.end - window.start || run.group_steps == 0
                     || run.group_steps > window.work.forward_positions || run.projection_groups == 0
-                    || run.projection_groups > window.work.projected_logits {
+                    || run.projection_groups > window.projection_steps {
                     return Err(Int4ClassificationMapError::Admission);
                 }
                 group_steps = group_steps.checked_add(run.group_steps).ok_or(Int4ClassificationMapError::Work)?;
@@ -170,4 +171,5 @@ pub(super) struct Window {
     pub end: usize,
     pub contexts: Vec<usize>,
     pub work: Int4Work,
+    projection_steps: u64,
 }

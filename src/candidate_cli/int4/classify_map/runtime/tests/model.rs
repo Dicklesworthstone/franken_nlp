@@ -43,8 +43,9 @@ fn complete_classification_map_reaches_sources_and_snapshot_without_losing_any_s
         let mut output = Vec::new(); command.execute(&mut io::Cursor::new(wire), &mut output).unwrap();
         serde_json::from_slice::<serde_json::Value>(&output).unwrap()
     };
-    let original = run(make_source(&["--max-chunks", "16", "--save-snapshot", &snapshot]), &exclusive);
+    let original = run(make_source(&["--max-chunks", "16", "--cohort-chunks", "3", "--save-snapshot", &snapshot]), &exclusive);
     assert_eq!(original["snapshot"]["operation"], "saved");
+    assert_eq!(original["cohort"]["max_chunks"], 3);
     // This pin comes from successful independently checked source conversion,
     // never from the snapshot file's own unauthenticated header.
     let pin = original["model_content_sha256"].as_str().unwrap().to_owned();
@@ -57,14 +58,22 @@ fn complete_classification_map_reaches_sources_and_snapshot_without_losing_any_s
     };
     for (mode, heads) in [("exclusive", 1), ("multi_label", 2)] {
         let output = run(make_snapshot(&[]), &wire(mode));
+        let grouped = run(make_snapshot(&["--cohort-chunks", "3"]), &wire(mode));
         assert_eq!(output["protocol"], "fnlp-candidate-int4-classify-map-v1");
         assert_eq!(output["evidence"], "non_authoritative"); assert_eq!(output["snapshot"]["operation"], "loaded");
         assert_eq!(output["model_content_sha256"], pin);
         let semantic = &output["output"];
+        assert_eq!(semantic, &grouped["output"]);
+        assert_eq!(canonjson::canonical_bytes(semantic).unwrap(), canonjson::canonical_bytes(&grouped["output"]).unwrap());
+        assert!(output.get("cohort").is_none()); assert!(grouped["output"].get("output").is_none());
         assert_eq!(semantic["single_context_equivalence"], false);
         assert_eq!(semantic["planned_model_work"], semantic["model_work"]);
         assert_eq!(semantic["aggregate"]["result"]["mode"], mode);
         let chunks = semantic["chunks"].as_array().unwrap(); assert!(chunks.len() > 1);
+        assert_eq!(grouped["cohort"]["max_chunks"], 3);
+        assert_eq!(grouped["cohort"]["chunk_cohorts"], chunks.len().div_ceil(3));
+        assert!(grouped["cohort"]["group_steps"].as_u64().unwrap() > 0);
+        assert!(grouped["cohort"]["projection_groups"].as_u64().unwrap() > 0);
         let mut bytes = 0; let mut scalars = 0;
         for (index, chunk) in chunks.iter().enumerate() {
             let span = &chunk["source_span"];
@@ -77,13 +86,17 @@ fn complete_classification_map_reaches_sources_and_snapshot_without_losing_any_s
         assert_eq!(bytes, source.len()); assert_eq!(scalars, source.chars().count());
         assert_eq!(semantic["aggregate"]["source_bytes"], bytes); assert_eq!(semantic["aggregate"]["source_scalars"], scalars);
         if mode == "exclusive" { assert_eq!(semantic, &original["output"]); }
-        let serialized = serde_json::to_string(&output).unwrap(); assert!(!serialized.contains("private-map-fixture"));
+        let serialized = serde_json::to_string(&grouped).unwrap(); assert!(!serialized.contains("private-map-fixture"));
         for forbidden in ["prompt_digest", "taskir_digest", "source_dir", "snapshot_path"] { assert!(!serialized.contains(forbidden)); }
     }
     let actual = original["output"]["model_work"]["forward_positions"].as_u64().unwrap(); assert!(actual > 1);
-    let cap = (actual - 1).to_string(); let mut refused = Vec::new();
-    let result = make_snapshot(&["--max-forward-positions", &cap]).execute(&mut io::Cursor::new(&exclusive), &mut refused);
-    assert!(matches!(result, Err(CandidateError::Planning | CandidateError::Execution)));
-    assert!(refused.is_empty(), "whole-document failure must not publish a completed prefix");
+    let cap = (actual - 1).to_string();
+    for extra in [vec!["--max-forward-positions", cap.as_str()],
+        vec!["--max-forward-positions", cap.as_str(), "--cohort-chunks", "3"]] {
+        let mut refused = Vec::new();
+        let result = make_snapshot(&extra).execute(&mut io::Cursor::new(&exclusive), &mut refused);
+        assert!(matches!(result, Err(CandidateError::Planning | CandidateError::Execution)));
+        assert!(refused.is_empty(), "whole-document failure must not publish a completed prefix");
+    }
     // The explicitly requested snapshot remains intact after the fixture.
 }

@@ -1,11 +1,10 @@
-//! One charged invocation from complete document to complete mixture, using
-//! a serial cache or explicit bounded native chunk cohorts.
+//! One charged invocation from complete document to complete mixture.
 use super::*;
 use crate::tasks::classify::{ClassificationLabel, ClassificationLimits, ClassificationMode, ClassificationRequest,
     grouped_int4::{Int4ClassificationPlanner,
-        long::{Int4ClassificationMapError, Int4ClassificationMapLimits, Int4ClassificationMapRun,
-            Int4ClassificationMapCohortBudget, Int4ClassificationMapCohortRun, PreparedInt4ClassificationMap,
-            INT4_CLASSIFICATION_MAP_COHORT_EXECUTION,
+        long::{Int4ClassificationMapCohortBudget, Int4ClassificationMapCohortRun,
+            Int4ClassificationMapError, Int4ClassificationMapLimits, Int4ClassificationMapRun,
+            PreparedInt4ClassificationMap,
             memory::{Int4ClassificationMapMemoryLimits, Int4ClassificationMapMemoryRequirement,
                 Int4ClassificationMapCohortMemoryRequirement}}}};
 
@@ -90,16 +89,15 @@ impl NlpEngine {
         })
     }
 
-    /// Share decoder projections across explicit chunk × label windows.
-    /// All source plans and future window geometry are checked before the
-    /// first native call; success contains the complete document only.
+    /// Share native projections across complete independent chunk/head
+    /// contexts. One deadline, cancellation token and document work budget
+    /// cover every window, reduction and complete guarded publication.
     #[allow(clippy::too_many_arguments)]
     pub fn map_int4_classify_cohorts(&self, model: &ResidentInt4, request: ClassificationRequest,
         config: Int4ClassificationMapHostConfig, cohort_chunks: usize, kernel: PackedInt4Kernel,
         cancellation: CancellationToken) -> Result<HostedOutput<Int4ClassificationMapCohortRun>, HostedError> {
         dispatch::preflight(self, config.native.run)?;
         if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
-        validate_request(&request, config)?;
         validate_cohort_request(&request, config, cohort_chunks)?;
         let required = config.cohort_requirements(model.model_identity().group_width(), request.budget,
             head_count(&request), cohort_chunks)?;
@@ -119,9 +117,8 @@ impl NlpEngine {
                 input.value.config.planning).map_err(classification_error)?;
             let (prepared, admitted) = prepare(&planner, &model, &input.value, control)?;
             let expected = prepared.preflight_metadata();
-            // Commit peak ownership before allocating any window engine.
-            // Charges stay live until every window has physically drained,
-            // including cancellation and completion of the final aggregate.
+            // These charges remain owned until every exact-sized native
+            // window has physically dropped, including failure/cancellation.
             let kv = kv.commit()?;
             let scratch = scratch.commit()?;
             let result = allocate(output, || {
@@ -134,42 +131,29 @@ impl NlpEngine {
                         max_task_workspace_bytes: required.task_workspace_bytes,
                         max_output_bytes: required.max_cohort_output_bytes,
                     }, control).map_err(map_error)?;
-                if result.schema_version != 1 || result.execution != INT4_CLASSIFICATION_MAP_COHORT_EXECUTION
-                    || result.chunk_cohorts != prepared.chunk_count().div_ceil(cohort_chunks)
-                    || result.group_steps == 0 || result.group_steps > result.output.model_work.forward_positions
-                    || result.projection_groups == 0 || result.projection_groups > result.output.model_work.projected_logits {
-                    return Err(map_error(Int4ClassificationMapError::Admission));
-                }
-                expected.verify_completed(&result.output).map_err(map_error)?;
-                checkpoint(control)?;
-                Ok(result)
+                expected.verify_completed_cohorts(&result, cohort_chunks).map_err(map_error)?;
+                checkpoint(control)?; Ok(result)
             })?;
-            drop(admitted); drop(prepared); drop(planner); drop(input); drop(scratch); drop(kv); drop(lease);
+            drop(admitted); drop(prepared); drop(planner); drop(input);
+            drop(scratch); drop(kv); drop(lease);
             Ok(GuardedOutput::new(result.value, result._memory))
         })
     }
 }
+
 fn head_count(request: &ClassificationRequest) -> usize {
     if request.mode == ClassificationMode::Exclusive { 1 } else { request.labels.len() }
-}
-fn validate_cohort_request(request: &ClassificationRequest, config: Int4ClassificationMapHostConfig,
-    chunks: usize) -> Result<(), HostedError> {
-    if chunks == 0 || chunks > config.mapping.chunks.max_chunks
-        || chunks.checked_mul(head_count(request)).is_none_or(|heads| heads == 0
-            || heads > crate::native_engine::strict_int4::cohort::MAX_INT4_SEQUENCES) {
-        return Err(map_error(Int4ClassificationMapError::Limits));
-    }
-    Ok(())
 }
 fn prepare<'a>(planner: &Int4ClassificationPlanner, model: &ResidentInt4, input: &'a MapInput,
     control: &mut impl DecodeStepControl)
     -> Result<(PreparedInt4ClassificationMap<'a>, Vec<ExecutionIdentity>), HostedError> {
-    let config = input.config;
-    let prepared = planner.plan_document_with_control(&input.request, config.mapping, control).map_err(map_error)?;
-    if prepared.group_width() != model.model_identity().group_width() || prepared.head_count() != head_count(&input.request)
-        || prepared.chunk_count() == 0 || prepared.chunk_count() > config.mapping.chunks.max_chunks
-        || prepared.task_budget() != input.request.budget || prepared.required_context() > config.native.context_tokens
-        || prepared.max_result_bytes() != config.mapping.max_result_bytes {
+    let prepared = planner.plan_document_with_control(&input.request, input.config.mapping, control).map_err(map_error)?;
+    let expected_heads = head_count(&input.request);
+    if prepared.group_width() != model.model_identity().group_width() || prepared.head_count() != expected_heads
+        || prepared.chunk_count() == 0 || prepared.chunk_count() > input.config.mapping.chunks.max_chunks
+        || prepared.task_budget() != input.request.budget
+        || prepared.required_context() > input.config.native.context_tokens
+        || prepared.max_result_bytes() != input.config.mapping.max_result_bytes {
         return Err(map_error(Int4ClassificationMapError::Admission));
     }
     let admitted = prepared.identities().map_err(map_error)?;
@@ -185,6 +169,18 @@ fn prepare<'a>(planner: &Int4ClassificationPlanner, model: &ResidentInt4, input:
     }
     checkpoint(control)?;
     Ok((prepared, admitted))
+}
+
+fn validate_cohort_request(request: &ClassificationRequest, config: Int4ClassificationMapHostConfig,
+    cohort_chunks: usize) -> Result<(), HostedError> {
+    validate_request(request, config)?;
+    let heads = head_count(request);
+    if cohort_chunks == 0 || cohort_chunks > config.mapping.chunks.max_chunks
+        || cohort_chunks.checked_mul(heads).is_none_or(|rows|
+            rows > crate::native_engine::strict_int4::cohort::MAX_INT4_SEQUENCES) {
+        return Err(map_error(Int4ClassificationMapError::Limits));
+    }
+    Ok(())
 }
 fn validate_request(request: &ClassificationRequest, config: Int4ClassificationMapHostConfig) -> Result<(), HostedError> {
     let limits = config.planning;

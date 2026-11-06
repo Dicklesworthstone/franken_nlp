@@ -1,7 +1,7 @@
 //! Complete-document classification using the original exact native heads.
-//! One reusable serial cache or bounded native chunk cohorts visit every
-//! lossless source chunk. The entire plan and five-axis work sum are admitted
-//! before any native forward.
+//! Serial execution reuses one cache; explicit cohorts keep independent
+//! chunk/head contexts. Every plan and all five work axes are admitted before
+//! any native forward, and both schedules use the same complete finalizer.
 use super::*;
 use crate::{tasks::{classify::{ClassificationMode, ClassificationPolicy, ClassificationAggregate,
         ClassificationAggregateResult, ClassificationAggregationPolicy, ClassificationAggregationError,
@@ -9,6 +9,7 @@ use crate::{tasks::{classify::{ClassificationMode, ClassificationPolicy, Classif
     mapreduce::{CHUNK_PROFILE, ChunkLimits, ChunkPlan, MapReduceError}},
     validation::grounded_fields::VerifiedSourceSpan};
 
+mod execution;
 pub mod memory;
 mod cohort;
 pub use cohort::{Int4ClassificationMapCohortBudget, Int4ClassificationMapCohortRun,
@@ -126,6 +127,22 @@ impl Int4ClassificationMapPreflight {
     pub fn chunk_count(&self) -> usize { self.chunks }
     pub fn planned_work(&self) -> Int4Work { self.work }
     pub fn source_span(&self) -> VerifiedSourceSpan { self.source }
+    pub fn verify_completed_cohorts(&self, run: &Int4ClassificationMapCohortRun, cohort_chunks: usize)
+        -> Result<(), Int4ClassificationMapError> {
+        if cohort_chunks == 0 || cohort_chunks > self.chunk_limits.max_chunks
+            || self.heads == 0 || cohort_chunks.checked_mul(self.heads)
+                .is_none_or(|heads| heads > crate::native_engine::strict_int4::cohort::MAX_INT4_SEQUENCES)
+            || run.schema_version != 1 || run.execution != INT4_CLASSIFICATION_MAP_COHORT_EXECUTION
+            || run.chunk_cohorts != self.chunks.div_ceil(cohort_chunks)
+            || run.group_steps == 0 || run.group_steps > self.work.forward_positions
+            || run.projection_groups == 0 || run.projection_groups > self.work.projected_logits {
+            return Err(Int4ClassificationMapError::Admission);
+        }
+        self.verify_completed(&run.output)?;
+        value_bytes(run, self.result_bytes.checked_add(cohort::COHORT_WRAPPER_BYTES)
+            .ok_or(Int4ClassificationMapError::Limits)?)?;
+        Ok(())
+    }
     pub fn verify_completed(&self, run: &Int4ClassificationMapRun) -> Result<(), Int4ClassificationMapError> {
         if run.schema_version != 1 || run.execution != INT4_CLASSIFICATION_MAP_EXECUTION
             || run.numerics_profile != STRICT_INT4_PROFILE || run.group_width != self.group_width

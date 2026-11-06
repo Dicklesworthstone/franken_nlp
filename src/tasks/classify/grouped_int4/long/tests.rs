@@ -8,6 +8,9 @@ use crate::{native_engine::{portable_int8::ProjectionWork,
     tokenizer::{embedded::EmbeddedTokenizer, pinned_controls}};
 use fixtures::Continue;
 
+mod cohorts;
+mod model;
+
 fn fixture() -> (&'static ClassificationPlanner, &'static ExecutionIdentity) {
     static FIXTURE: OnceLock<(ClassificationPlanner, ExecutionIdentity)> = OnceLock::new();
     let (planner, identity) = FIXTURE.get_or_init(|| {

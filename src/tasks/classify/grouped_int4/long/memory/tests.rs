@@ -64,6 +64,76 @@ fn undersized_kv_incoherent_source_limits_and_overflow_fail_pure_admission() {
 }
 
 #[test]
+fn cohorts_charge_independent_kv_shared_rope_and_separate_live_window_storage() {
+    let (memory, mut task, mut planning, mapping) = fixture(); planning.max_labels = 4;
+    task.max_kv_bytes *= planning.max_labels as u64;
+    for width in [1, 3, 32, 128, 10752] {
+        let serial = memory.requirements(width, task, planning, mapping).unwrap();
+        let grouped = memory.cohort_requirements(width, task, planning, mapping, 4, 2).unwrap();
+        assert_eq!(grouped.memory.native.kv_bytes, serial.native.kv_bytes * 8);
+        assert_eq!(grouped.memory.native.rope_bytes, serial.native.rope_bytes);
+        assert!(grouped.memory.native.scratch_payload_bound > serial.native.scratch_payload_bound);
+        assert_eq!(grouped.memory.input_bytes, serial.input_bytes + grouped.task_workspace_bytes
+            + 8 * (grouped.max_cohort_output_bytes - task.max_output_bytes));
+        assert_eq!(grouped.memory.workspace_bytes, grouped.memory.native.rope_bytes + grouped.memory.native.scratch_payload_bound
+            + memory.allocator_reserve_bytes);
+        assert_eq!(grouped.max_cohort_output_bytes, task.max_output_bytes * 2 + COHORT_WRAPPER_BYTES);
+        assert_eq!(grouped.memory.max_output_bytes, mapping.max_result_bytes + COHORT_WRAPPER_BYTES);
+        assert_eq!(grouped.memory.output_reservation_bytes, serial.output_reservation_bytes + 8 * COHORT_WRAPPER_BYTES);
+    }
+}
+
+#[test]
+fn unknown_label_mode_prices_the_largest_valid_declared_chunk_head_product() {
+    let (memory, mut task, mut planning, mut mapping) = fixture();
+    planning.max_labels = 128; mapping.chunks.max_chunks = 128;
+    task.max_kv_bytes *= planning.max_labels as u64;
+    let row = Int4MemoryRequirement::for_context(memory.context_tokens, 32).unwrap();
+    let three = memory.cohort_requirements(32, task, planning, mapping, 21, 3).unwrap();
+    assert_eq!(three.memory.native.kv_bytes, row.kv_bytes * 63);
+    let sixty_four = memory.cohort_requirements(32, task, planning, mapping, 1, 64).unwrap();
+    assert_eq!(sixty_four.memory.native.kv_bytes, row.kv_bytes * 64);
+    // Callers quote the largest valid unknown shape explicitly. This never
+    // authorizes more actual heads or silently shrinks the requested window.
+    assert!(memory.cohort_requirements(32, task, planning, mapping, 22, 3).is_err());
+    for count in [0, 65, usize::MAX] {
+        assert!(memory.cohort_requirements(32, task, planning, mapping, 1, count).is_err());
+    }
+    mapping.chunks.max_chunks = 2;
+    assert!(memory.cohort_requirements(32, task, planning, mapping, 1, 3).is_err());
+}
+
+#[test]
+fn window_document_and_retained_result_caps_have_distinct_owners() {
+    let (memory, mut task, planning, mut mapping) = fixture();
+    let before = memory.cohort_requirements(32, task, planning, mapping, 1, 2).unwrap();
+    mapping.max_result_bytes *= 2;
+    let document = memory.cohort_requirements(32, task, planning, mapping, 1, 2).unwrap();
+    assert_eq!(document.memory.input_bytes, before.memory.input_bytes);
+    assert_eq!(document.task_workspace_bytes, before.task_workspace_bytes);
+    assert_eq!(document.max_cohort_output_bytes, before.max_cohort_output_bytes);
+    assert!(document.memory.output_reservation_bytes > before.memory.output_reservation_bytes);
+    mapping.max_retained_result_bytes = task.max_output_bytes;
+    let frontier = memory.cohort_requirements(32, task, planning, mapping, 1, 2).unwrap();
+    assert!(frontier.memory.input_bytes < document.memory.input_bytes);
+    assert_eq!(frontier.memory.output_reservation_bytes, document.memory.output_reservation_bytes);
+    task.max_output_bytes = super::super::MAX_BYTES;
+    assert!(memory.cohort_requirements(32, task, planning, mapping, 1, 2).is_err());
+}
+
+#[test]
+fn cohort_workspace_overflow_and_invalid_declarations_fail_without_allocation() {
+    for axis in 0..6 {
+        let (mut memory, mut task, mut planning, mut mapping) = fixture();
+        match axis { 0 => mapping.max_model_work.forward_positions = u64::MAX,
+            1 => task.max_output_bytes = u64::MAX, 2 => memory.preparation_reserve_bytes = u64::MAX,
+            3 => planning.max_labels = 0, 4 => mapping.chunks.max_chunks = 1,
+            _ => task.max_kv_bytes = 1 }
+        assert!(memory.cohort_requirements(32, task, planning, mapping, 1, 2).is_err(), "axis {axis}");
+    }
+}
+
+#[test]
 fn cohort_quote_prices_all_chunk_heads_and_keeps_the_serial_quote_unchanged() {
     let (memory, mut task, planning, mapping) = fixture();
     for heads in [1, 3, 8] {
