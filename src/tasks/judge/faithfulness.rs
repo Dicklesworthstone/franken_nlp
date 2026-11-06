@@ -195,7 +195,7 @@ fn validate_head(task: &TaskPlan, first: &TaskPlan, source: &[u32], claim: &[u32
         }) { return Err(JudgeError::Contract("faithfulness complete shared label vocabulary")); }
     Ok(())
 }
-fn assess(scores: &CandidateScores, policy: FaithfulnessPolicy) -> Result<FaithfulnessAssessment, JudgeError> {
+pub(super) fn assess(scores: &CandidateScores, policy: FaithfulnessPolicy) -> Result<FaithfulnessAssessment, JudgeError> {
     let mut ordered = Vec::with_capacity(3);
     for relation in [FaithfulnessRelation::Unsupported, FaithfulnessRelation::Contradicted, FaithfulnessRelation::Entailed] {
         let score = scores.candidates.iter().find(|c| c.id == relation.id()).ok_or(JudgeError::InvalidScores)?;
@@ -212,7 +212,7 @@ fn assess(scores: &CandidateScores, policy: FaithfulnessPolicy) -> Result<Faithf
             && margin >= f64::from(policy.minimum_margin_milli) / 1000.0
             && weight >= f64::from(policy.minimum_candidate_weight_ppm) / 1_000_000.0 })
 }
-fn decide(global: &FaithfulnessAssessment, windows: &[FaithfulnessWindow])
+pub(super) fn decide(global: &FaithfulnessAssessment, windows: &[FaithfulnessWindow])
     -> (Option<FaithfulnessRelation>, Option<FaithfulnessAbstention>) {
     use FaithfulnessRelation::*;
     use FaithfulnessAbstention::*;

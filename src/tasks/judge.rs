@@ -5,6 +5,7 @@
 //! Faithfulness separates full-source judgment from byte-verified evidence.
 
 mod common;
+mod aggregation;
 mod faithfulness;
 mod native;
 mod pairwise;
@@ -14,6 +15,9 @@ pub use planning::quantized;
 pub use planning::grouped_int4;
 
 pub use common::{JudgeError, JudgeLimits, JudgeLogits};
+pub use aggregation::{FaithfulnessAggregationPolicy, FaithfulnessAggregationError,
+    FaithfulnessAggregate, FaithfulnessAggregateAbstention, FaithfulnessAggregateEvidence,
+    FaithfulnessCoverage, FAITHFULNESS_AGGREGATION_PROFILE};
 pub use faithfulness::{FaithfulnessAbstention, FaithfulnessAssessment, FaithfulnessEvidence,
     FaithfulnessPlan, FaithfulnessPolicy, FaithfulnessRelation, FaithfulnessResult,
     FaithfulnessWindow, FAITHFULNESS_VERSION, partition_evidence};

@@ -18,6 +18,37 @@ impl FaithfulnessCompiler {
         let encoder = SourceDocumentEncoder::pinned(controls).map_err(|_| JudgeError::Contract("faithfulness pinned source encoder"))?;
         Ok(Self { fragments, candidates, encoder })
     }
+    /// Source bytes have an exact one-token-per-byte representation. The
+    /// claim and trusted scaffold stay fixed in every full-chunk/evidence
+    /// head; one continuation position is reserved for the scored E/C/U
+    /// verbalizer. The compiler still admits the exact evidence partition
+    /// and aggregate prompt/token work for every chunk before execution.
+    pub(super) fn source_capacity(&self, claim: &str, policy: FaithfulnessPolicy,
+        budget: TaskBudget, ceiling: TaskBudget, limits: JudgeLimits, context_tokens: usize)
+        -> Result<usize, JudgeError> {
+        policy.validate()?;
+        budget.validate().map_err(|_| JudgeError::Contract("judge task budget"))?;
+        ceiling.validate().map_err(|_| JudgeError::Contract("judge task ceiling"))?;
+        if claim.is_empty() || !fits(budget, ceiling) { return Err(JudgeError::Contract("faithfulness claim or task ceiling")); }
+        if budget.max_output_tokens < 2 || limits.per_head.max_depth < 2 {
+            return Err(JudgeError::Limit("candidate_tokens"));
+        }
+        let fixed = self.fragments.iter().try_fold(claim.len(), |n, ids| add(n, ids.len(), "prompt_tokens"))?;
+        let prompt_cap = context_tokens.checked_sub(1).ok_or(JudgeError::Limit("context_tokens"))?
+            .min(budget.max_input_tokens as usize).min(limits.max_total_prompt_tokens);
+        let capacity = prompt_cap.checked_sub(fixed).filter(|&n| n != 0)
+            .ok_or(JudgeError::Limit("faithfulness_source_tokens"))?;
+        let window = policy.evidence_window_bytes as usize;
+        // A nonfinal window may end up to three bytes early for UTF-8 and
+        // then prefer a delimiter in its latter half. Price that minimum
+        // progress, not window * count, which can omit a valid tail by
+        // exhausting the evidence-window limit on punctuation-rich input.
+        let progress = (window.saturating_sub(3) / 2).max(1);
+        let preceding = progress.checked_mul(policy.max_evidence_windows as usize - 1)
+            .ok_or(JudgeError::Limit("evidence_bytes"))?;
+        let evidence_bytes = window.checked_add(preceding).ok_or(JudgeError::Limit("evidence_bytes"))?;
+        Ok(capacity.min(evidence_bytes))
+    }
     pub(super) fn plan(&self, source: &str, claim: &str, policy: FaithfulnessPolicy,
         context: &PlanContext<'_>, budget: TaskBudget, controls: &TemplateControlIds, eos: u32, limits: JudgeLimits)
         -> Result<FaithfulnessPlan, JudgeError> {

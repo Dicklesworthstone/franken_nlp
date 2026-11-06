@@ -24,6 +24,16 @@ impl Int4JudgePlanner {
     /// Model/asset-bound base; each prepared plan binds its whole request.
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     pub fn group_width(&self) -> usize { self.model.group_width() }
+    /// Claim-aware source capacity of one complete faithfulness chunk. Exact
+    /// evidence-head and whole-document work admission follow compilation.
+    pub fn max_faithfulness_source_bytes(&self, request: &JudgeRequest, context_tokens: usize)
+        -> Result<usize, Int4JudgeError> {
+        let JudgeRequest::Faithfulness { claim, policy, budget, .. } = request else {
+            return Err(JudgeError::Contract("faithfulness map requires faithfulness mode").into());
+        };
+        self.compiler.faithfulness.source_capacity(claim, *policy, *budget, self.ceiling,
+            self.limits, context_tokens).map_err(Into::into)
+    }
     pub(crate) fn semantic_configuration(&self) -> (TaskBudget, JudgeLimits) {
         (self.ceiling, self.limits)
     }

@@ -16,6 +16,7 @@ use crate::native_engine::{
 };
 mod model;
 pub mod cohort;
+pub mod faithfulness_map;
 pub use model::Int4JudgePlanner;
 
 pub const INT4_JUDGE_EXECUTION: &str = "grouped-int4-complete-judge-prefix-heads-v1";
