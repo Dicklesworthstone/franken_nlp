@@ -5,8 +5,9 @@ pub(in crate::candidate_cli::int4) mod jobs;
 use crate::{
     native_engine::{lmhead::NANBEIGE_VOCAB_SIZE, portable_int8::ProjectionWork, strict_int4::Int4Work},
     tasks::{ir::TaskBudget, mapreduce::{ChunkLimits, ExecutionLimits}, ner::NerOptions,
-        redact::grouped_int4::long::Int4LongRedactionConfig,
-        source_planning::grouped_int4::long::Int4SourceMapLimits},
+        redact::grouped_int4::long::{Int4LongRedactionConfig, INT4_LONG_REDACTION_COHORT_ENVELOPE_BYTES},
+        source_planning::grouped_int4::long::{Int4SourceMapLimits,
+            cohort::{Int4SourceMapCohortMemoryLimits, Int4SourceMapCohortRequirement}}},
     validation::grounded_fields::{GroundingBudget, SourceFieldEvidence, VerifiedSourceSpan},
 };
 
@@ -51,7 +52,11 @@ struct MappingFlags {
     max_source_scan_steps: u64,
 }
 #[derive(Clone, Eq, PartialEq)]
-pub(in crate::candidate_cli::int4) struct DocumentArgs { redaction: RedactArgs, mapping: MappingFlags }
+pub(in crate::candidate_cli::int4) struct DocumentArgs {
+    redaction: RedactArgs,
+    mapping: MappingFlags,
+    cohort_chunks: Option<usize>,
+}
 impl std::fmt::Debug for DocumentArgs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("DocumentRedactArgs") }
 }
@@ -61,12 +66,20 @@ pub(in crate::candidate_cli::int4) struct DocumentLimits {
     mapping: Int4SourceMapLimits,
     edit_bytes: u64,
     workspace_bytes: u64,
+    cohort: Option<Int4SourceMapCohortRequirement>,
 }
 
 pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
+    serial_definition().arg(clap::Arg::new("cohort_chunks").long("cohort-chunks")
+        .value_parser(clap::value_parser!(usize)).value_name("N")
+        .help("Run up to N independent NER chunks together in BOTH stages (1..=64); admit the full window, never shrink or fall back"))
+}
+// Corpus and retained jobs continue to own serial document engines. Do not
+// inherit an accepted flag whose selected physical schedule they cannot run.
+fn serial_definition() -> clap::Command {
     MappingFlags::augment_args(super::definition().name("redact-document")
         .about("Redact a complete document with whole-source rules and native INT4 NER chunks")
-        .long_about("Losslessly partition one complete UTF-8 document for source-grounded native INT4 NER while deterministic rules scan the WHOLE text, including patterns crossing neural chunk boundaries. Preflight every original chunk before the first forward. Independently rescan and lift all NER coordinates before one transactional edit. By default re-tokenize and re-partition the actual transformed bytes, then rerun the same NER/rule union. Both stages share five native work counters, mask work and independent verification pools; no allowance renews per chunk. Any failed chunk or residual detection publishes no redacted result. NER chunk boundaries may split entities; a clean declared-union scan does not establish recall or anonymity. Same mask/placeholder/full256-HMAC key contract as redact, with commitment checked before document IO. Source conversion and independently pinned snapshots share the actual-model path. No corpus, retained job, automatic download or backend fallback. Blocking IO observes the deadline cooperatively.")
+        .long_about("Losslessly partition one complete UTF-8 document for source-grounded native INT4 NER while deterministic rules scan the WHOLE text, including patterns crossing neural chunk boundaries. Preflight every original chunk before the first forward. Independently rescan and lift all NER coordinates before one transactional edit. By default re-tokenize and re-partition the actual transformed bytes, then rerun the same NER/rule union. Both stages share five native work counters, mask work and independent verification pools; no allowance renews per chunk. Serial execution is the default. Explicit --cohort-chunks runs independent NER chunks in native cohorts in both stages, admitting the full declared window including the possible transformed-text peak; it never changes per-chunk KV authority or silently reduces the selected width. The result keeps separate physical cohort counters around the unchanged semantic redaction. Any failed chunk or residual detection publishes no redacted result. NER chunk boundaries may split entities; a clean declared-union scan does not establish recall or anonymity. Same mask/placeholder/full256-HMAC key contract as redact, with commitment checked before document IO. Source conversion and independently pinned snapshots share the actual-model path. No automatic download or backend fallback. Blocking IO observes the deadline cooperatively.")
         .mut_arg("input", |arg| arg.help("One complete UTF-8 document; '-' reads stdin unless stdin supplies the private key"))
         .mut_arg("max_input_bytes", |arg| arg.default_value("1048576").help("Maximum bytes of the COMPLETE original document"))
         .mut_arg("preparation_mib", |arg| arg.default_value("1024"))
@@ -75,7 +88,8 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
 }
 impl DocumentArgs {
     pub(in crate::candidate_cli::int4) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-        Ok(Self { redaction: RedactArgs::from_matches(matches)?, mapping: MappingFlags::from_arg_matches(matches)? })
+        Ok(Self { redaction: RedactArgs::from_matches(matches)?, mapping: MappingFlags::from_arg_matches(matches)?,
+            cohort_chunks: matches.try_get_one::<usize>("cohort_chunks").ok().flatten().copied() })
     }
     pub(in crate::candidate_cli::int4) fn validate(&self, args: &Int4Args) -> Result<DocumentLimits, CandidateError> {
         let short = self.redaction.validate(args)?;
@@ -93,7 +107,8 @@ impl DocumentArgs {
             || m.max_dot_products == 0 || m.max_multiply_accumulates == 0
             || !(1..=1_000_000).contains(&m.max_source_fields)
             || !(1..=1_000_000).contains(&m.max_source_evidence_spans)
-            || !(1..=1_000_000_000_000).contains(&m.max_source_scan_steps) {
+            || !(1..=1_000_000_000_000).contains(&m.max_source_scan_steps)
+            || self.cohort_chunks.is_some_and(|chunks| !(1..=64).contains(&chunks) || chunks > m.max_ner_chunks) {
             return Err(CandidateError::Arguments);
         }
         let budget = self.redaction.source.budget(args, common);
@@ -101,7 +116,8 @@ impl DocumentArgs {
             crate::candidate_cli::source::OPTIONS_BYTES as u64 * 2])?;
         let preparation_floor = sum(&[times(per_chunk, m.max_ner_chunks as u64)?, 256 * MIB,
             times(args.max_input_bytes.max(common.result_bytes) as u64, 64)?,
-            times(m.max_ner_map_bytes as u64 + 4096, 2)?])?;
+            times(m.max_ner_map_bytes as u64 + 4096, 2)?,
+            if self.cohort_chunks.is_some() { 2 * INT4_LONG_REDACTION_COHORT_ENVELOPE_BYTES } else { 0 }])?;
         if common.preparation_bytes < preparation_floor { return Err(CandidateError::Arguments); }
         let mapping = self.mapping_limits(args, common.result_bytes)?;
         let workspace_bytes = workspace_bytes(budget, mapping, short.edit_bytes)?;
@@ -111,8 +127,24 @@ impl DocumentArgs {
             u64::from(budget.max_output_tokens) * 8, short.edit_bytes])?;
         common.minimum_memory_bytes = common.minimum_memory_bytes.checked_sub(short_workspace)
             .and_then(|n| n.checked_add(workspace_bytes)).ok_or(CandidateError::Arguments)?;
+        let cohort = self.cohort_chunks.map(|chunks| {
+            Int4SourceMapCohortMemoryLimits { max_chunks: chunks, context_tokens: args.context_tokens,
+                max_output_tokens_per_chunk: u64::from(budget.max_output_tokens),
+                max_result_bytes_per_chunk: budget.max_output_bytes }.requirements(args.group_width)
+                .map_err(|_| CandidateError::Arguments)
+        }).transpose()?;
+        if let Some(required) = cohort {
+            let original = sum(&[common.native.kv_bytes, common.native.rope_bytes, common.native.scratch_payload_bound])?;
+            let grouped = sum(&[required.native.kv_bytes, required.native.rope_bytes, required.native.scratch_payload_bound])?;
+            let additional_native = grouped.checked_sub(original).ok_or(CandidateError::Arguments)?;
+            // Both document stages reuse this complete declared peak. The
+            // cohort workspace already owns its transient result; only the
+            // final wrapper adds to the hosted output's 4x payload charge.
+            common.minimum_memory_bytes = sum(&[common.minimum_memory_bytes, additional_native,
+                required.workspace_bytes, 4 * INT4_LONG_REDACTION_COHORT_ENVELOPE_BYTES])?;
+        }
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
-        Ok(DocumentLimits { common, mapping, edit_bytes: short.edit_bytes, workspace_bytes })
+        Ok(DocumentLimits { common, mapping, edit_bytes: short.edit_bytes, workspace_bytes, cohort })
     }
     fn verification(&self) -> GroundingBudget {
         GroundingBudget { max_fields: self.mapping.max_source_fields,
@@ -128,7 +160,7 @@ impl DocumentArgs {
             max_tokenizer_calls: m.max_ner_tokenizer_calls };
         chunks.effective_token_limit().map_err(|_| CandidateError::Arguments)?;
         Ok(Int4SourceMapLimits { chunks,
-            reduction: ExecutionLimits { map_batch_chunks: 1, reduce_fan_in: 8, max_reduction_levels: 8,
+            reduction: ExecutionLimits { map_batch_chunks: self.cohort_chunks.unwrap_or(1), reduce_fan_in: 8, max_reduction_levels: 8,
                 max_task_calls: 1024, max_value_bytes: m.max_ner_map_bytes,
                 max_live_value_bytes: m.max_ner_map_bytes * 2, max_total_value_bytes: m.max_ner_map_bytes * 4,
                 max_result_bytes: m.max_ner_map_bytes },

@@ -158,6 +158,113 @@ requires the embedding application to retain its resource/error-output guards.
 It is not a model activation receipt. Private prompt/source digests and generated
 NER token transcripts are not exported by the long-redaction envelope.
 
+## Grouped INT4 documents and explicit native chunk cohorts
+
+`fnlp candidate source-int4 redact-document` provides the same complete-document
+rule/NER/edit/verification composition using a selected grouped INT4 source
+conversion or independently pinned local snapshot. It defaults to serial NER
+chunks. Add `--cohort-chunks N` to execute up to `N` independent NER chunks
+together through the existing native cohort decoder, for both the original
+document and the freshly partitioned transformed document.
+
+```sh
+fnlp candidate source-int4 redact-document report.txt \
+  --source-dir ./pinned-source --source-manifest ./source-manifest.json \
+  --memory-mib 24576 --cohort-chunks 3
+```
+
+The memory ceiling is illustrative, not a measured requirement. The selected
+group width, context, conversion route and declared chunk/result limits determine
+admission. A snapshot uses `--snapshot ./model.int4` together with an independently
+trusted `--expected-model-sha256`; its cohort route is identical after loading.
+This command requires the `asupersync-runtime` feature and does not download a
+model or switch backends.
+
+The INT4 command defaults to a 1 MiB original input cap, 1 GiB preparation
+reserve, 64 NER chunks per stage, and 256,000,000,000 total mask visits across both
+stages. Its whole-operation dot-product ceiling is 10,000,000,000,000,000. The
+other complete-map, source-evidence, rule/action and nonrenewable-budget contracts
+above apply. `--max-source-fields`, `--max-source-evidence-spans` and
+`--max-source-scan-steps` explicitly bound each independent evidence pool.
+
+`--cohort-chunks` accepts 1 through 64 and cannot exceed `--max-ner-chunks`. An
+explicit width of 1 selects the cohort executor; omitting the option selects the
+existing serial executor. The last window may contain fewer rows because the
+document has ended. The implementation never silently lowers the selected
+window or retries serial execution after a refusal. `redact-corpus` and
+`redact-job start|resume` reject this option until those routes support it.
+
+The complete declared cohort window is priced before key, document or model I/O.
+Its native KV, RoPE, scratch and decoder workspace remain reserved through both
+stages. The second stage can grow after placeholders or pseudonyms expand the
+text, so admission does not use only the original document's observed peak.
+The stages reuse their cohort memory; they do not allocate two simultaneous
+native windows. Complete source plans, all retained chunk outputs, independent
+coordinate checks, edit storage and final result ownership remain separately
+charged. A task's per-chunk KV ceiling stays unchanged when a cohort is selected.
+
+The transient native cohort result has a 64 MiB ceiling, including framing. At
+width 64, the default 1 MiB per-chunk `--max-result-bytes` allowance exceeds that
+ceiling once framing is added and is refused. For example, explicitly choosing
+`--max-result-bytes 524288` admits that result-envelope geometry; it also tightens
+each chunk's output and the final semantic result. Other memory and work limits
+must still fit. No limit is silently resized to make a cohort run.
+
+All original chunk plans and actual cohort geometry are checked before a
+requested `--save-snapshot` is written. After editing, the entire new partition
+is checked before the first verification forward. Each chunk retains its own
+grammar, causal KV and execution identity. The complete native/evidence result
+passes through the same independent rescans, coordinate lifting, collision and
+overlap policy, full256 pseudonym scope, and final edit as serial execution.
+Original and verification stages consume the same whole-operation work, mask and
+evidence ledgers; neither a new cohort nor a stage boundary renews them.
+
+Successful serial INT4 output keeps protocol
+`fnlp-candidate-int4-redact-document-v1`. Explicit cohorts use
+`fnlp-candidate-int4-redact-document-cohorts-v1`. The cohort wrapper separates
+physical scheduling from the semantic result:
+
+| Field inside the outer `output` | Meaning |
+| --- | --- |
+| `execution` | `grouped-int4-document-redaction-chunk-cohorts-v1` |
+| `cohort_chunks` | Explicit maximum simultaneous chunk count |
+| `original_cohorts` | Original-stage chunk/window counts, grouped steps, projection groups and work |
+| `verification_cohorts` | Corresponding fresh verification counters, or `null` with `--no-verify` |
+| `output` | Existing complete-document semantic redaction, including both stage receipts and final edited result |
+
+The wrapper adds a bounded 4096-byte allowance around the existing semantic
+result cap. Both routes stage the entire JSON response, recheck the original
+deadline before publishing, and retain output ownership through writing and
+flush. Serialization failure, cancellation, an incomplete stage or a deadline
+reached before publication emits no successful result. Transport failure or a
+late flush can still leave external bytes and is reported as an error.
+
+Embedding applications use `NlpEngine::redact_int4_document_cohorts` with the same
+`RedactConfig<Int4LongRedactionConfig>` as the serial host, selecting the window
+through `detector.mapping.reduction.map_batch_chunks`. The pure
+`Int4LongRedactionConfig::cohort_requirements` quote covers either stage's maximum
+window. Lower-level callers can preflight actual original geometry with
+`Int4DocumentRedactor::preflight_cohorts` and run with `redact_cohorts`, while
+retaining the declared memory and error-output owners. The returned
+`Int4LongRedactionCohortRun` owns the unchanged semantic result and separate
+physical counters. Its `validate_schedule` checks internal consistency; it does
+not authenticate an externally supplied receipt.
+
+The source includes focused admission, all-axis budget, identity preservation,
+fresh-verification, schedule-corruption, mode-isolation and deadline-publication
+fixtures. An ignored model gate,
+`source_scalar_and_pinned_snapshot_cohorts_match_after_complete_repartitioned_verification`,
+compares complete semantic results from scalar source conversion against pinned
+snapshot serial and cohort widths 1 and 3 under scalar and an explicit available
+SIMD kernel. It checks original and transformed stage work independently and
+requires multiple cohort windows. It requires `FNLP_INT4_TEST_SOURCE_DIR`,
+`FNLP_INT4_TEST_SOURCE_MANIFEST`, `FNLP_INT4_TEST_MEMORY_MIB`,
+`FNLP_INT4_TEST_REDACT_DOCUMENT_SNAPSHOT` naming a new file, and
+`FNLP_INT4_TEST_KERNEL`; it never deletes an existing snapshot. This gate has not
+run in this session. Shared physical-step counts are structural data, not a
+latency or throughput measurement. DSR compilation/tests, actual-model parity,
+NER quality and target-host performance remain pending.
+
 ## Validation handoff
 
 The implementation adds 26 model-free regression definitions: 12 core, five host,

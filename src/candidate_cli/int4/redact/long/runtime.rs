@@ -6,12 +6,12 @@ use crate::{
     hosted::{CancellationToken, HostedError, Int4HostError, NativeLimits, RunLimits,
         RedactConfig, RedactionPseudonyms},
     native_engine::{decode::{DecodeCancellationKind, DecodeStepControl},
-        strict_int4::{STRICT_INT4_PROFILE, weights::snapshot::INT4_SNAPSHOT_VERSION}},
+        strict_int4::{Int4MemoryBudget, STRICT_INT4_PROFILE, weights::snapshot::INT4_SNAPSHOT_VERSION}},
     tasks::{BuiltInTask, redact::{actions::VerificationStatus, detectors, pseudonym::Pseudonyms,
         grouped_int4::{Int4RedactionError, long::{Int4DocumentRedactor, Int4LongRedactionError,
             Int4LongRedactionPreflight, Int4LongRedactionRun, Int4LongRedactionStage,
             INT4_LONG_REDACTION_EXECUTION}}},
-        source_planning::grouped_int4::long::SourceMapVerification},
+        source_planning::grouped_int4::long::{SourceMapVerification, cohort::Int4SourceMapCohortBudget}},
 };
 
 struct DeadlineControl { started: Instant, deadline: Duration }
@@ -173,8 +173,14 @@ pub(super) fn execute(args: Int4Args, command: DocumentArgs, _admitted: Document
     remaining()?;
     let identity = source::identity(model.model_identity(), &planner, BuiltInTask::Ner)?;
     let detector = command.detector(&args, limits, ner);
-    let expected = Int4DocumentRedactor::new(&planner, identity.clone(), detector.clone(), model.model_identity())
-        .map_err(planning_error)?.preflight(&text, &mut DeadlineControl { started, deadline }).map_err(planning_error)?;
+    let redactor = Int4DocumentRedactor::new(&planner, identity.clone(), detector.clone(), model.model_identity())
+        .map_err(planning_error)?;
+    let expected = match limits.cohort {
+        Some(required) => redactor.preflight_cohorts(&text, cohort_budget(required, args.context_tokens),
+            &mut DeadlineControl { started, deadline }),
+        None => redactor.preflight(&text, &mut DeadlineControl { started, deadline }),
+    }.map_err(planning_error)?;
+    drop(redactor);
     if expected.group_width != model.model_identity().group_width() || expected.source_bytes != text.len()
         || expected.source_scalars != text.chars().count() {
         return Err(CandidateError::Planning);
@@ -191,18 +197,17 @@ pub(super) fn execute(args: Int4Args, command: DocumentArgs, _admitted: Document
         if pin != model.model_identity().snapshot_pin() { return Err(CandidateError::Identity); }
         snapshot = Some(SnapshotRecord::new("saved", common.snapshot_need));
     }
-    let result = engine.redact_int4_document(&model, text, Arc::new(planner), Arc::new(vocabulary), RedactConfig {
+    let config = RedactConfig {
         ner_identity: identity.clone(), request: request.clone(), detector: detector.clone(),
         native: NativeLimits { context_tokens: args.context_tokens, allocator_reserve_bytes: ALLOCATOR_BYTES,
             run: RunLimits { max_elapsed: remaining()?, max_checkpoints: args.max_checkpoints,
                 cleanup_reserve_bytes: CLEANUP_BYTES } },
         preparation_reserve_bytes: common.preparation_bytes, edit_reserve_bytes: limits.edit_bytes,
-    }, secret, common.kernel, cancellation).map_err(execution_error)?;
-    check_completed(expected, result.result(), &request, &detector)?;
-    remaining()?;
+    };
     let content = identity.logical_model_digest.to_hex();
     let provenance = Provenance {
-        protocol: "fnlp-candidate-int4-redact-document-v1", schema_version: 1,
+        protocol: if limits.cohort.is_some() { "fnlp-candidate-int4-redact-document-cohorts-v1" }
+            else { "fnlp-candidate-int4-redact-document-v1" }, schema_version: 1,
         scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "redact",
         redaction_mode: "complete_document", model_id: "Nanbeige4.2-3B", source_revision: &identity.source_revision,
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
@@ -211,7 +216,47 @@ pub(super) fn execute(args: Int4Args, command: DocumentArgs, _admitted: Document
     };
     // Both output ownership and CLI preparation survive staging/write/flush.
     // No chunk NER transcript, provisional edit or failed verification escapes.
-    publish(&Response { provenance: &provenance, output: result.result() }, common.result_bytes + 4096, output)
+    if limits.cohort.is_some() {
+        let result = engine.redact_int4_document_cohorts(&model, text, Arc::new(planner), Arc::new(vocabulary),
+            config, secret, common.kernel, cancellation).map_err(execution_error)?;
+        check_completed(expected, &result.result().output, &request, &detector)?;
+        if Some(result.result().cohort_chunks) != command.cohort_chunks {
+            return Err(CandidateError::Execution);
+        }
+        result.result().validate_schedule().map_err(|_| CandidateError::Execution)?;
+        let cap = common.result_bytes.checked_add(INT4_LONG_REDACTION_COHORT_ENVELOPE_BYTES as usize)
+            .and_then(|bytes| bytes.checked_add(4096)).ok_or(CandidateError::Arguments)?;
+        publish_complete(&Response { provenance: &provenance, output: result.result() }, cap, output, &remaining)
+    } else {
+        let result = engine.redact_int4_document(&model, text, Arc::new(planner), Arc::new(vocabulary),
+            config, secret, common.kernel, cancellation).map_err(execution_error)?;
+        check_completed(expected, result.result(), &request, &detector)?;
+        publish_complete(&Response { provenance: &provenance, output: result.result() },
+            common.result_bytes + 4096, output, &remaining)
+    }
+}
+
+fn cohort_budget(required: Int4SourceMapCohortRequirement, context_limit: usize) -> Int4SourceMapCohortBudget {
+    Int4SourceMapCohortBudget { context_limit,
+        native_memory: Int4MemoryBudget { max_kv_bytes: required.native.kv_bytes,
+            max_rope_bytes: required.native.rope_bytes, max_scratch_payload_bytes: required.native.scratch_payload_bound },
+        max_workspace_bytes: required.workspace_bytes, max_result_bytes: required.max_result_bytes }
+}
+
+/// Complete bounded serialization precedes the publication deadline check.
+/// A failed/late writer remains an error even if it emitted transport bytes.
+fn publish_complete<T: Serialize>(value: &T, cap: usize, output: &mut impl Write,
+    remaining: &impl Fn() -> Result<Duration, CandidateError>) -> Result<(), CandidateError> {
+    remaining()?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(cap).map_err(|_| CandidateError::Memory)?;
+    let mut stage = BoundedOutput { bytes, cap };
+    serde_json::to_writer(&mut stage, value).map_err(|_| CandidateError::Output)?;
+    stage.write_all(b"\n").map_err(|_| CandidateError::Output)?;
+    remaining()?;
+    output.write_all(&stage.bytes).and_then(|()| output.flush()).map_err(|_| CandidateError::Output)?;
+    remaining()?;
+    Ok(())
 }
 
 #[derive(Serialize)]

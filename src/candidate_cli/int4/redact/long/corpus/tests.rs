@@ -150,6 +150,18 @@ fn invalid_stream_limits_and_private_key_scope_refuse_before_owned_io() {
     }
 }
 
+#[test]
+fn corpus_refuses_unsupported_chunk_cohorts_in_parser_and_programmatic_state() {
+    for width in ["1", "3"] {
+        assert!(parsed(&["--source-dir", "d", "--source-manifest", "m", "--cohort-chunks", width]).is_err());
+    }
+    for width in [1, 3] {
+        let (mut options, args) = arguments(&[]);
+        options.document.cohort_chunks = Some(width);
+        assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+}
+
 #[cfg(not(feature = "asupersync-runtime"))]
 #[test]
 fn disabled_runtime_does_not_consume_corpus_or_binary_key() {

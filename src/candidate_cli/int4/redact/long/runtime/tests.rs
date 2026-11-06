@@ -153,7 +153,8 @@ fn bounded_publication_keeps_final_maps_and_accounting_without_private_source_or
         candidate_format: "fixture-format", quant_recipe: "fixture:group=128", group_width: 128,
         integer_kernel: "s_scalar_i32", snapshot: None };
     let response = Response { provenance: &provenance, output: &output };
-    let mut bytes = Vec::new(); publish(&response, 16384, &mut bytes).unwrap();
+    let remaining = || Ok(Duration::from_secs(1));
+    let mut bytes = Vec::new(); publish_complete(&response, 16384, &mut bytes, &remaining).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["protocol"], "fnlp-candidate-int4-redact-document-v1");
     assert_eq!(value["output"]["run"]["result"]["text"], "é [redacted:email] 上海");
@@ -165,7 +166,7 @@ fn bounded_publication_keeps_final_maps_and_accounting_without_private_source_or
         "source_dir", "source_manifest", "snapshot_path"] { assert!(value.get(absent).is_none()); }
     assert!(!std::str::from_utf8(&bytes).unwrap().contains("a@example.org"));
     let mut refused = Vec::new();
-    assert_eq!(publish(&response, 1, &mut refused), Err(CandidateError::Output));
+    assert_eq!(publish_complete(&response, 1, &mut refused, &remaining), Err(CandidateError::Output));
     assert!(refused.is_empty());
 }
 
@@ -179,6 +180,34 @@ fn flush_failure_is_reported_after_complete_staging() {
     let (_, run, _, _) = fixture(true, false);
     let complete = serde_json::json!({"fixture_kind":"synthetic-receipts-real-rules", "run":run});
     let mut writer = FlushFailure(Vec::new());
-    assert_eq!(publish(&complete, 16384, &mut writer), Err(CandidateError::Output));
+    assert_eq!(publish_complete(&complete, 16384, &mut writer, &|| Ok(Duration::from_secs(1))), Err(CandidateError::Output));
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&writer.0).unwrap(), complete);
+}
+
+#[test]
+fn serialization_and_writer_flush_cannot_escape_the_original_deadline() {
+    use std::cell::Cell;
+    struct ExpiresWhileSerializing<'a>(&'a Cell<bool>);
+    impl Serialize for ExpiresWhileSerializing<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            self.0.set(true);
+            serializer.serialize_str("complete")
+        }
+    }
+    struct ExpiresWhileFlushing<'a> { expired: &'a Cell<bool>, bytes: Vec<u8> }
+    impl Write for ExpiresWhileFlushing<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> { self.bytes.extend_from_slice(bytes); Ok(bytes.len()) }
+        fn flush(&mut self) -> io::Result<()> { self.expired.set(true); Ok(()) }
+    }
+    let expired = Cell::new(false);
+    let remaining = || if expired.get() { Err(CandidateError::Timeout) } else { Ok(Duration::from_secs(1)) };
+    let mut bytes = Vec::new();
+    assert_eq!(publish_complete(&ExpiresWhileSerializing(&expired), 64, &mut bytes, &remaining), Err(CandidateError::Timeout));
+    assert!(bytes.is_empty(), "late serialization must not publish even a complete result");
+    assert_eq!(publish_complete(&"complete", 64, &mut bytes, &remaining), Err(CandidateError::Timeout));
+    assert!(bytes.is_empty(), "an already expired call must not write");
+    expired.set(false);
+    let mut writer = ExpiresWhileFlushing { expired: &expired, bytes: Vec::new() };
+    assert_eq!(publish_complete(&"complete", 64, &mut writer, &remaining), Err(CandidateError::Timeout));
+    assert_eq!(writer.bytes, b"\"complete\"\n", "transport bytes may exist but late flush cannot report success");
 }

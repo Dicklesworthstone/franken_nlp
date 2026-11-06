@@ -38,6 +38,8 @@ fn default_whole_document_route_preserves_shared_policy_and_both_model_inputs() 
     assert_eq!(limits.mapping.chunks.max_chunk_bytes, command.args.context_tokens);
     assert_eq!(limits.mapping.chunks.reserved_tokens, command.args.max_new_tokens);
     assert_eq!(limits.mapping.reduction.max_result_bytes, 16 * 1024 * 1024);
+    assert_eq!(limits.mapping.reduction.map_batch_chunks, 1);
+    assert!(selected.cohort_chunks.is_none() && limits.cohort.is_none());
     assert_eq!(request.actions.default_action, RedactionAction::Mask);
     assert!(request.verify); assert!(!request.actions.include_map);
     assert_eq!(request.grounding_budget, limits.mapping.verification);
@@ -90,7 +92,9 @@ fn invalid_document_bounds_and_generation_or_corpus_controls_refuse_before_io() 
         vec!["--max-attention-pairs", "0"], vec!["--max-dot-products", "0"], vec!["--max-multiply-accumulates", "0"],
         vec!["--max-source-fields", "0"], vec!["--max-source-evidence-spans", "1000001"],
         vec!["--max-source-scan-steps", "0"], vec!["--max-input-bytes", "3"],
-        vec!["--edit-reserve-mib", "1"], vec!["--context-tokens", "512"]] {
+        vec!["--edit-reserve-mib", "1"], vec!["--context-tokens", "512"],
+        vec!["--cohort-chunks", "0"], vec!["--cohort-chunks", "65"],
+        vec!["--cohort-chunks", "3", "--max-ner-chunks", "2"], vec!["--cohort-chunks", "64"]] {
         assert_eq!(command(&flags).execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
     }
     for flag in ["--ndjson", "--store-results", "--resume", "--job-dir", "--chunked",
@@ -171,6 +175,62 @@ fn a_single_plan_preparation_reserve_cannot_admit_the_complete_chunk_population(
     assert!(workspace_bytes(budget, mapping, 1).is_err());
 }
 
+#[test]
+fn declared_cohort_peak_is_additive_and_does_not_change_per_chunk_or_whole_operation_authority() {
+    for group in [3, 127, 128, 10752] {
+        let mut serial = command(&[]);
+        serial.args.group_width = group; serial.args.max_load_mib = 65536; serial.args.memory_mib = 65536;
+        let selected = options(&serial);
+        let baseline = selected.validate(&serial.args).unwrap();
+        let baseline_detector = selected.detector(&serial.args, baseline, NerOptions::default());
+        for chunks in [1, 3] {
+            let mut grouped = selected.clone(); grouped.cohort_chunks = Some(chunks);
+            let admitted = grouped.validate(&serial.args).unwrap();
+            let detector = grouped.detector(&serial.args, admitted, NerOptions::default());
+            let quote = admitted.cohort.unwrap();
+            assert_eq!(quote, detector.cohort_requirements(serial.args.context_tokens, group).unwrap());
+            assert_eq!(quote.native, Int4MemoryRequirement::for_cohort(&vec![serial.args.context_tokens; chunks], group).unwrap());
+            assert_eq!(admitted.common.native, baseline.common.native);
+            assert_eq!(detector.per_chunk, baseline_detector.per_chunk);
+            assert_eq!(detector.mapping.max_model_work, baseline_detector.mapping.max_model_work);
+            assert_eq!(detector.mapping.max_mask_visits, baseline_detector.mapping.max_mask_visits);
+            assert_eq!(detector.mapping.verification, baseline_detector.mapping.verification);
+            assert_eq!(detector.mapping.reduction.map_batch_chunks, chunks);
+            assert_eq!(admitted.workspace_bytes, baseline.workspace_bytes);
+            let original = baseline.common.native;
+            let native_delta = quote.native.kv_bytes + quote.native.rope_bytes + quote.native.scratch_payload_bound
+                - original.kv_bytes - original.rope_bytes - original.scratch_payload_bound;
+            assert_eq!(admitted.common.minimum_memory_bytes, baseline.common.minimum_memory_bytes
+                + native_delta + quote.workspace_bytes + 4 * INT4_LONG_REDACTION_COHORT_ENVELOPE_BYTES);
+            let mut narrow = command(&[]).args;
+            narrow.group_width = group; narrow.max_load_mib = 65536;
+            narrow.memory_mib = admitted.common.minimum_memory_bytes.saturating_sub(1) / MIB;
+            assert!(grouped.validate(&narrow).is_err());
+            narrow.memory_mib = admitted.common.minimum_memory_bytes.div_ceil(MIB);
+            assert!(grouped.validate(&narrow).is_ok());
+            // Verification reuses the same peak, even though its edited text
+            // may need more chunks than the original stage.
+            grouped.redaction.flags.no_verify = true;
+            assert_eq!(grouped.validate(&serial.args).unwrap().common.minimum_memory_bytes,
+                admitted.common.minimum_memory_bytes);
+        }
+    }
+}
+
+#[test]
+fn maximum_cohort_never_silently_shrinks_its_result_envelope() {
+    let mut too_wide = command(&["--cohort-chunks", "64"]);
+    too_wide.args.memory_mib = 65536;
+    assert!(options(&too_wide).validate(&too_wide.args).is_err(), "64 one-MiB rows exceed the native result cap with framing");
+    let mut selected = command(&["--cohort-chunks", "64", "--max-result-bytes", "524288"]);
+    selected.args.memory_mib = 65536;
+    let limits = options(&selected).validate(&selected.args).unwrap();
+    assert_eq!(limits.mapping.reduction.map_batch_chunks, 64);
+    assert_eq!(limits.cohort.unwrap().max_result_bytes, 64 * 524288 + 4096 + 64);
+    let mut invalid = options(&selected).clone(); invalid.cohort_chunks = Some(usize::MAX);
+    assert!(invalid.validate(&selected.args).is_err());
+}
+
 #[cfg(not(feature = "asupersync-runtime"))]
 #[test]
 fn unavailable_runtime_does_not_consume_the_document_or_binary_key() {
@@ -183,7 +243,7 @@ fn unavailable_runtime_does_not_consume_the_document_or_binary_key() {
 #[cfg(feature = "asupersync-runtime")]
 #[test]
 #[ignore = "requires controller-admitted pinned sources, a fresh snapshot and an available explicit SIMD kernel"]
-fn source_scalar_and_pinned_snapshot_simd_match_after_complete_repartitioned_verification() {
+fn source_scalar_and_pinned_snapshot_cohorts_match_after_complete_repartitioned_verification() {
     let source = std::env::var("FNLP_INT4_TEST_SOURCE_DIR").expect("explicit pinned source directory required");
     let manifest = std::env::var("FNLP_INT4_TEST_SOURCE_MANIFEST").expect("explicit source manifest required");
     let memory: u64 = std::env::var("FNLP_INT4_TEST_MEMORY_MIB").expect("explicit memory ceiling required")
@@ -195,7 +255,8 @@ fn source_scalar_and_pinned_snapshot_simd_match_after_complete_repartitioned_ver
     assert_ne!(kernel, Int8KernelKind::Scalar);
     PackedInt4Kernel::detect(kernel).expect("requested kernel must be available");
     let document = "é Contact a@example.org near 上海. Another a@example.org appears.";
-    let mut convert = command(&["--rules", "email", "--max-ner-chunk-bytes", "16", "--save-snapshot", &snapshot]);
+    let mut convert = command(&["--rules", "email", "--action", "placeholder", "--include-map",
+        "--max-ner-chunk-bytes", "16", "--save-snapshot", &snapshot]);
     convert.args.source_dir = Some(PathBuf::from(source)); convert.args.source_manifest = Some(PathBuf::from(manifest));
     convert.args.memory_mib = memory;
     let mut bytes = Vec::new(); convert.execute(&mut document.as_bytes(), &mut bytes).unwrap();
@@ -204,12 +265,41 @@ fn source_scalar_and_pinned_snapshot_simd_match_after_complete_repartitioned_ver
     assert_eq!(scalar["output"]["result"]["verification"], "clean_declared_union");
     assert!(!scalar["output"]["result"]["text"].as_str().unwrap().contains("a@example.org"));
     assert!(scalar["output"]["verification"].is_object());
+    assert_ne!(scalar["output"]["verification"]["preflight"]["source_bytes"],
+        scalar["output"]["original"]["preflight"]["source_bytes"], "fresh verification must observe placeholder expansion");
     let pin = scalar["model_content_sha256"].as_str().unwrap();
-    let mut reload = parsed(&["--rules", "email", "--max-ner-chunk-bytes", "16", "--snapshot", &snapshot,
+    let mut reload = parsed(&["--rules", "email", "--action", "placeholder", "--include-map",
+        "--max-ner-chunk-bytes", "16", "--snapshot", &snapshot,
         "--expected-model-sha256", pin, "--kernel", kernel.id()]).unwrap();
     reload.args.memory_mib = memory;
     let mut bytes = Vec::new(); reload.execute(&mut document.as_bytes(), &mut bytes).unwrap();
     let selected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(selected["output"], scalar["output"]);
     assert_eq!(selected["integer_kernel"], kernel.id()); assert_eq!(selected["snapshot"]["operation"], "loaded");
+    for width in [1_u64, 3] {
+        for selected_kernel in [Int8KernelKind::Scalar, kernel] {
+            let width_text = width.to_string();
+            let mut reload = parsed(&["--rules", "email", "--action", "placeholder", "--include-map",
+                "--max-ner-chunk-bytes", "16", "--cohort-chunks", &width_text, "--snapshot", &snapshot,
+                "--expected-model-sha256", pin, "--kernel", selected_kernel.id()]).unwrap();
+            reload.args.memory_mib = memory;
+            let mut bytes = Vec::new(); reload.execute(&mut document.as_bytes(), &mut bytes).unwrap();
+            let grouped: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(grouped["protocol"], "fnlp-candidate-int4-redact-document-cohorts-v1");
+            assert_eq!(grouped["output"]["output"], scalar["output"], "width {width}, kernel {}", selected_kernel.id());
+            assert_eq!(grouped["output"]["cohort_chunks"], width);
+            for (stats, stage) in [("original_cohorts", "original"), ("verification_cohorts", "verification")] {
+                let chunks = scalar["output"][stage]["preflight"]["chunks"].as_u64().unwrap();
+                let receipt = &grouped["output"][stats];
+                assert_eq!(receipt["chunks"], chunks);
+                assert_eq!(receipt["cohorts"], chunks.div_ceil(width));
+                assert_eq!(receipt["model_work"], scalar["output"][stage]["model_work"]);
+                if width > 1 {
+                    assert!(chunks > width, "fixture must cross native windows in both stages");
+                    assert!(receipt["group_steps"].as_u64().unwrap()
+                        < receipt["model_work"]["forward_positions"].as_u64().unwrap());
+                }
+            }
+        }
+    }
 }

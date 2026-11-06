@@ -106,6 +106,22 @@ fn storage_and_private_key_refusals_happen_before_any_owned_io() {
 }
 
 #[test]
+fn retained_jobs_refuse_unsupported_chunk_cohorts_before_private_io_or_lifetime_admission() {
+    for operation in ["start", "resume"] {
+        let mut words = argv(operation);
+        words.extend(["--cohort-chunks", "3"].into_iter().map(str::to_owned));
+        assert!(parse(words).is_err());
+        let (mut job, args) = command(operation, &[]);
+        let document = job.args.validate(&args).unwrap();
+        let stored = lifetime(&args, document);
+        job.args.document.cohort_chunks = Some(1);
+        assert!(matches!(job.args.lifetime_limits(&args, document, stored),
+            Err(Failure { code: "unsupported_redaction_cohorts", .. })));
+        assert_eq!(job.execute_owned(args, NoIo, &mut NoIo).unwrap_err().code, "unsupported_redaction_cohorts");
+    }
+}
+
+#[test]
 fn fixed_redaction_options_and_original_text_cap_remain_independent_of_encoded_envelopes() {
     let (job, args) = command("start", &["--max-input-bytes", "32", "--rules", "email,date",
         "--action", "placeholder", "--include-map", "--no-verify", "--ner-options", "typed-options.json"]);
