@@ -5,6 +5,11 @@ document and returns the original chunk results together with a named
 document-level aggregate. It supports exclusive classification and independent
 multi-label decisions through the existing native classifier.
 
+For a retained population with authenticated resume, use
+[`classify-document-job start|resume`](native-classification-document-jobs-int4.md).
+That route keeps each complete original document as one durable item and
+preserves these same chunk results and aggregate semantics.
+
 This is the complete-document classification route from
 [plan §§7.4 and 7.10](../COMPREHENSIVE_PLAN_FOR_FRANKEN_NLP.md). The aggregate
 is a source-scalar-weighted mixture of chunk candidate weights. It is distinct

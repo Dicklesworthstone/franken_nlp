@@ -35,6 +35,7 @@
 > `candidate source-int4` namespace includes generation/chat,
 > [live token streaming](#implemented-candidate-int4-token-streaming), classification,
 > [complete-document classification](./docs/native-classification-map-int4.md),
+> [durable complete-document classification jobs](./docs/native-classification-document-jobs-int4.md),
 > [independent dimensional sentiment](#implemented-candidate-int4-dimensional-sentiment),
 > [pairwise, rubric and faithfulness judgment](#implemented-candidate-int4-judgment),
 > [resident classification, sentiment and judgment streams](#implemented-candidate-int4-scoring-batches),
@@ -961,6 +962,38 @@ defaults and `Int4ScoredBatchLimits`, then call `NlpEngine::job_int4_scored` wit
 three native planners. This route uses the existing job format and serial
 native execution. Fixtures are authored; compilation, model-present execution,
 crash qualification, task quality and performance remain pending their gates.
+
+## Implemented candidate INT4 classification document jobs
+
+`fnlp candidate source-int4 classify-document-job start|resume` retains
+classification results for complete original documents, including documents
+requiring multiple native contexts. Each source is one durable item: every
+chunk must finish before its map and scalar-weighted aggregate can commit.
+It supports exclusive and independent multi-label decisions, with serial
+execution or explicit `--cohort-chunks N` windows.
+
+Provide fixed `--defaults labels.json`, the complete original
+`{id,text,task_args?}` NDJSON population on every invocation, and the existing
+protected job directory, secret, ID and immutable limits used by owned jobs.
+`--store-results` is required. Per-record arguments may only be absent, null
+or an empty object. Resume authenticates the population, labels and policies,
+model and group identity, chunk geometry, schedule and lifetime limits before
+replay or tail repair. Failed whole-document attempts retain all five native
+work charges; completed documents are skipped. No chunk receives a fresh
+work allowance or a partial successful commit.
+
+Memory admission includes the complete population and map, native state,
+retained results, journal and guarded serialization. Stdout reports public
+candidate provenance and progress under
+`fnlp-candidate-int4-classify-document-job-v1`; private results remain in the
+owned spool or explicitly requested `materialized.ndjson`. The original
+deadline remains active through final metadata write and flush. The route
+requires `metadata-store` and `asupersync-runtime` on Linux x86-64 or AArch64.
+
+See the [complete-document classification job guide](docs/native-classification-document-jobs-int4.md)
+for defaults, a complete limits example, start/resume commands, cohort bounds,
+library APIs and validation scope. Compilation, regression execution and
+actual-model evidence remain pending the prescribed controller gates.
 
 ## Implemented candidate INT4 entity resolution
 

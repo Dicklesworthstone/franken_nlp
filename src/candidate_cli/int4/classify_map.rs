@@ -63,10 +63,10 @@ pub(super) fn definition() -> clap::Command {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct MapLimits {
     pub common: Int4Limits,
-    mapping: Int4ClassificationMapLimits,
-    planning: ClassificationLimits,
-    memory: Int4ClassificationMapMemoryRequirement,
-    cli_preparation_bytes: u64,
+    pub(super) mapping: Int4ClassificationMapLimits,
+    pub(super) planning: ClassificationLimits,
+    pub(super) memory: Int4ClassificationMapMemoryRequirement,
+    pub(super) cli_preparation_bytes: u64,
     envelope_bytes: usize,
 }
 impl MapArgs {
@@ -137,7 +137,7 @@ impl MapArgs {
             _ => Err(CandidateError::Arguments),
         }
     }
-    fn budget(self, common: Int4Limits, max_heads: usize) -> Result<TaskBudget, CandidateError> {
+    pub(super) fn budget(self, common: Int4Limits, max_heads: usize) -> Result<TaskBudget, CandidateError> {
         let mut budget = self.scoring.budget(common);
         // Freeze logical task authority for all declared independent heads.
         // The physical serial memory quote still reserves just one cache;
@@ -147,9 +147,13 @@ impl MapArgs {
         Ok(budget)
     }
     fn admit_request(self, request: &ClassificationRequest) -> Result<(), CandidateError> {
-        let heads = if request.mode == ClassificationMode::Exclusive { 1 } else { request.labels.len() };
-        if request.labels.is_empty() || request.labels.len() > 128
-            || (request.mode == ClassificationMode::Exclusive && request.labels.len() < 2)
+        self.admit_labels(request.labels.len(), request.mode)
+    }
+    pub(super) fn cohort_chunks(self) -> Option<usize> { self.mapping.cohort_chunks }
+    pub(super) fn admit_labels(self, labels: usize, mode: ClassificationMode) -> Result<(), CandidateError> {
+        let heads = if mode == ClassificationMode::Exclusive { 1 } else { labels };
+        if labels == 0 || labels > 128
+            || (mode == ClassificationMode::Exclusive && labels < 2)
             || self.mapping.cohort_chunks.is_some_and(|chunks|
                 chunks.checked_mul(heads).is_none_or(|count| count == 0 || count > MAX_INT4_SEQUENCES)) {
             return Err(CandidateError::Planning);
