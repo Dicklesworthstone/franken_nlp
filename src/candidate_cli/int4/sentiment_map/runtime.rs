@@ -138,11 +138,19 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     }
 }
 
-/// A slow final writer/flush still consumes the end-to-end deadline. Callers
-/// retain their guarded native result and publication reservation until return.
+/// Stage the complete result under the invocation deadline before any
+/// external write. Callers retain their guarded native result and staging
+/// reservation through the physical write, flush and final deadline check.
 fn publish_complete<T: Serialize>(value: &T, cap: usize, output: &mut impl Write,
     remaining: &impl Fn() -> Result<Duration, CandidateError>) -> Result<(), CandidateError> {
-    publish(value, cap, output)?;
+    remaining()?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(cap).map_err(|_| CandidateError::Memory)?;
+    let mut stage = BoundedOutput { bytes, cap };
+    serde_json::to_writer(&mut stage, value).map_err(|_| CandidateError::Output)?;
+    stage.write_all(b"\n").map_err(|_| CandidateError::Output)?;
+    remaining()?;
+    output.write_all(&stage.bytes).and_then(|()| output.flush()).map_err(|_| CandidateError::Output)?;
     remaining()?;
     Ok(())
 }

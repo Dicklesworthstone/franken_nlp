@@ -60,24 +60,25 @@ fn map_publication_keeps_semantic_output_separate_from_cohorts_and_checks_comple
     let response = Response { provenance: &provenance, output: &semantic, cohort: Some(Cohort {
         schema_version: 1, execution: "fixture-native-cohorts".to_owned(),
         max_chunks: 3, chunk_cohorts: 2, group_steps: 7, projection_groups: 5 }) };
-    let mut encoded = Vec::new(); publish(&response, 4096, &mut encoded).unwrap();
+    let available = || Ok(Duration::from_secs(1));
+    let mut encoded = Vec::new(); publish_complete(&response, 4096, &mut encoded, &available).unwrap();
     assert_eq!(encoded.last(), Some(&b'\n'));
     let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
     assert_eq!(value["output"], semantic); assert_eq!(value["cohort"]["chunk_cohorts"], 2);
     assert_eq!(value["protocol"], "fnlp-candidate-int4-sentiment-map-v1");
     for absent in ["document", "prompt", "prompt_digest", "source_dir", "snapshot_path"] { assert!(value.get(absent).is_none()); }
-    let mut exact = Vec::new(); publish(&response, encoded.len(), &mut exact).unwrap(); assert_eq!(exact, encoded);
+    let mut exact = Vec::new(); publish_complete(&response, encoded.len(), &mut exact, &available).unwrap(); assert_eq!(exact, encoded);
     let mut refused = Vec::new();
-    assert_eq!(publish(&response, encoded.len() - 1, &mut refused), Err(CandidateError::Output));
+    assert_eq!(publish_complete(&response, encoded.len() - 1, &mut refused, &available), Err(CandidateError::Output));
     assert!(refused.is_empty());
     struct FlushFailure;
     impl Write for FlushFailure {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> { Ok(bytes.len()) }
         fn flush(&mut self) -> io::Result<()> { Err(io::Error::other("private fixture path")) }
     }
-    assert_eq!(publish(&response, encoded.len(), &mut FlushFailure), Err(CandidateError::Output));
+    assert_eq!(publish_complete(&response, encoded.len(), &mut FlushFailure, &available), Err(CandidateError::Output));
     let mut serial = Vec::new();
-    publish(&Response { provenance: &provenance, output: &semantic, cohort: None }, 4096, &mut serial).unwrap();
+    publish_complete(&Response { provenance: &provenance, output: &semantic, cohort: None }, 4096, &mut serial, &available).unwrap();
     assert!(serde_json::from_slice::<serde_json::Value>(&serial).unwrap().get("cohort").is_none());
 }
 
@@ -93,7 +94,7 @@ fn final_publication_checks_elapsed_deadline_after_physical_flush() {
     }
     let flushed = Cell::new(false);
     let mut writer = Writer { flushed: &flushed, bytes: Vec::new() };
-    let expired = || { assert!(flushed.get()); Err(CandidateError::Timeout) };
+    let expired = || if flushed.get() { Err(CandidateError::Timeout) } else { Ok(Duration::from_secs(1)) };
     assert_eq!(publish_complete(&serde_json::json!({"complete":true}), 128, &mut writer, &expired),
         Err(CandidateError::Timeout));
     assert_eq!(writer.bytes.last(), Some(&b'\n'));
@@ -102,7 +103,28 @@ fn final_publication_checks_elapsed_deadline_after_physical_flush() {
     let mut refused = Vec::new();
     assert_eq!(publish_complete(&serde_json::json!({"complete":true}), 1, &mut refused, &available),
         Err(CandidateError::Output));
-    assert!(refused.is_empty()); assert_eq!(calls.get(), 0);
+    assert!(refused.is_empty()); assert_eq!(calls.get(), 1);
+}
+
+#[test]
+fn deadline_before_or_during_serialization_never_starts_document_publication() {
+    use std::cell::Cell;
+    struct SlowResult<'a>(&'a Cell<bool>);
+    impl Serialize for SlowResult<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            self.0.set(true); serializer.serialize_str("completed document result")
+        }
+    }
+    let serialized = Cell::new(false);
+    let deadline = || if serialized.get() { Err(CandidateError::Timeout) } else { Ok(Duration::from_secs(1)) };
+    let mut output = Vec::new();
+    assert_eq!(publish_complete(&SlowResult(&serialized), 128, &mut output, &deadline), Err(CandidateError::Timeout));
+    assert!(serialized.get()); assert!(output.is_empty());
+    serialized.set(false);
+    assert_eq!(publish_complete(&SlowResult(&serialized), 128, &mut output,
+        &|| Err(CandidateError::Timeout)), Err(CandidateError::Timeout));
+    assert!(!serialized.get(), "expired invocations must refuse before serialization");
+    assert!(output.is_empty());
 }
 
 mod model;
