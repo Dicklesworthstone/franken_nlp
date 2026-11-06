@@ -90,6 +90,63 @@ label. Model content and group width derive from verified resident weights.
 No source paths, private prompt digests or arbitrary loader diagnostics are
 published. No label result is published before every head and finalizer succeeds.
 
+## Classification over complete documents
+
+`fnlp candidate source-int4 classify-map` accepts the same JSON request and
+classifies every chunk of a document that exceeds one native context. Chunks
+form a lossless partition of the original UTF-8 text, with byte and Unicode
+scalar ranges. The pinned prompt compiler calculates the source capacity for
+the supplied label codebook and every independent yes/no head. The complete
+partition and all native work are checked before the first forward pass.
+
+```sh
+fnlp candidate source-int4 classify-map request.json \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256_FROM_TRUSTED_CONVERSION" \
+  --memory-mib "$MEMORY_MIB" --group-width 128 --context-tokens 2048 \
+  --max-chunks 64 --minimum-classified-coverage-ppm 1000000
+```
+
+The explicit `--source-dir` plus `--source-manifest` route is also supported.
+An optional `--save-snapshot NEW_FILE` requires complete document planning
+before creating the snapshot. One JSON object represents one complete source;
+use `-` or omit its path for stdin. The default request ceiling is 1 MiB,
+including JSON and label metadata. Generation controls and the single-request
+`--prefill-rows` and `--cohort-heads` options are rejected.
+
+| Document option | Default | Meaning |
+| --- | ---: | --- |
+| `--max-chunks` | 64 | Refuse a larger partition; never truncate the source |
+| `--max-chunk-bytes` | Complete input cap | Optional additional bound below exact prompt capacity |
+| `--max-tokenizer-calls` | 8192 | Bound the complete partitioning work |
+| `--max-result-bytes` | 1048576 | Complete native result for each chunk |
+| `--max-retained-result-bytes` | 67108864 | Sum of retained chunk results |
+| `--max-map-result-bytes` | 16777216 | Complete semantic document result |
+| `--minimum-classified-coverage-ppm` | 1000000 | Original-scalar coverage needed for an aggregate decision |
+
+Every chunk retains its exact full-vocabulary sequence scores, candidate
+weights and classified/abstained decision. The `output.aggregate` is separately
+labeled `classification-source-scalar-mixture-v1`: it weights each chunk by
+its original Unicode scalar count, including abstained chunks. Exclusive
+classification mixes the same complete label set across chunks. Multi-label
+classification computes an independent yes/no mixture and coverage for each
+label; one label cannot authorize another label's decision.
+
+An aggregate decision requires both the requested coverage and the original
+candidate-weight/margin policy. These mixtures are uncalibrated descriptive
+scores. The output explicitly sets `single_context_equivalence:false`; it
+does not claim that chunk aggregation reproduces full-context inference.
+
+The serial path reuses one native KV cache. All five work ceilings cover the
+entire document and all heads; they are never replenished per chunk. The
+shared CLI/host memory quote includes all retained plans, native state, result
+frontiers and complete publication before input is read. Preparation defaults
+to 1024 MiB; its declared allowances and the chosen memory ceiling can refuse
+large shapes before execution. These are ledger bounds, not measured RSS.
+Any failed chunk yields no document result. Serialization finishes under the
+same deadline before writing begins, and memory guards remain owned through
+the physical write and flush.
+
 ## Explicit integer kernels
 
 `source-int4 classify`, `generate` and `chat` also accept `--kernel ID`. The

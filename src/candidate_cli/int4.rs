@@ -5,6 +5,7 @@ use crate::native_engine::{int4::PackedInt4Kernel, simd::Int8KernelKind,
         weights::snapshot::{Int4SnapshotBudget, Int4SnapshotPin, Int4SnapshotRequirements}}};
 
 mod classify;
+mod classify_map;
 mod sentiment;
 mod sentiment_map;
 mod judge;
@@ -118,6 +119,7 @@ struct Int4Args {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Int4Task {
     Text(Task), Classify(classify::ScoringArgs), Extract(extract::ExtractionArgs),
+    ClassifyMap(classify_map::MapArgs),
     Stream(Task, stream::StreamArgs),
     Semantic(semantic::SemanticArgs),
     Sentiment(sentiment::SentimentArgs),
@@ -178,6 +180,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(task("chat", "Complete a bounded JSON system/user/assistant transcript"))
         .subcommand(stream::definition())
         .subcommand(classify::prefill_definition(classify::definition()))
+        .subcommand(classify_map::definition())
         .subcommand(sentiment::definition())
         .subcommand(sentiment_map::definition())
         .subcommand(judge::definition())
@@ -255,6 +258,7 @@ impl Int4Command {
             "generate" => Int4Task::Text(Task::Generate),
             "chat" => Int4Task::Text(Task::Chat),
             "classify" => Int4Task::Classify(classify::ScoringArgs::from_matches_with_prefill(matches)?),
+            "classify-map" => Int4Task::ClassifyMap(classify_map::MapArgs::from_matches(matches)?),
             "sentiment" => Int4Task::Sentiment(sentiment::SentimentArgs::from_matches(matches)?),
             "sentiment-map" => Int4Task::SentimentMap(sentiment_map::MapArgs::from_matches(matches)?),
             "judge" => Int4Task::Judge(judge::JudgeArgs::from_matches(matches)?),
@@ -347,6 +351,9 @@ impl Int4Command {
         if let Int4Task::SentimentMap(options) = self.task {
             return options.execute(self.args, input, output);
         }
+        if let Int4Task::ClassifyMap(options) = self.task {
+            return options.execute(self.args, input, output);
+        }
         if let Int4Task::Judge(options) = self.task {
             return options.execute(self.args, input, output);
         }
@@ -363,6 +370,7 @@ impl Int4Command {
             return options.execute(self.args, input, output);
         }
         let limits = match &self.task {
+            Int4Task::ClassifyMap(_) => return Err(CandidateError::Arguments),
             Int4Task::Text(_) => self.args.validate()?,
             Int4Task::Classify(scoring) => scoring.validate_with_prefill(&self.args)?,
             Int4Task::Extract(extraction) => extraction.validate_with_prefill(&self.args)?,
