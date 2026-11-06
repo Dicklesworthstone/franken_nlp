@@ -51,6 +51,13 @@ of that attempt's timeout and the caller's `Cx` deadline. Neither a redirect nor
 a received body frame renews it. This explicit outer timer is necessary because
 the pinned client's streaming request timeout ends at the response head.
 
+While a transfer is pending, an owned runtime timer also checks the caller's
+`Cx` cancellation every 100 ms. The same transfer stays alive between checks;
+the timer neither restarts it nor extends its attempt deadline. Cancellation
+drops the transfer before rollback and preserves the original cancellation
+cause. The interval is subject to runtime scheduling; synchronous filesystem
+work remains cooperative between bounded operations.
+
 A data response must be exactly:
 
 - status `206`;

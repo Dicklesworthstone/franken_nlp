@@ -8,7 +8,9 @@
 //! rolls the staging file back to the exact pre-attempt length.
 //!
 //! Filesystem calls are synchronous and checkpointed between bounded network
-//! frames. This candidate therefore does not claim the final G0 HTTPS/platform
+//! frames. Pending transfers also check cancellation on a 100 ms runtime timer;
+//! synchronous filesystem work remains cooperative. This candidate therefore
+//! does not claim the final G0 HTTPS/platform
 //! qualification; it closes the missing executable acquisition path without
 //! weakening those gates.
 
@@ -20,6 +22,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     pin::Pin,
+    task::Poll,
     time::Duration,
 };
 
@@ -43,6 +46,7 @@ const USER_AGENT: &str = "franken_nlp-agent (+https://github.com/Dicklesworthsto
 const STAGING_SUFFIX: &str = ".partial";
 const COPY_BUFFER_BYTES: usize = 1024 * 1024;
 const DEFAULT_REDIRECTS: u32 = 5;
+const CANCELLATION_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug)]
 pub struct NetworkPartsRequest {
@@ -343,6 +347,11 @@ pub async fn download_release_parts(
 /// headers and then never yields a body frame must still release its file
 /// borrow and return through `finish_attempt` before another mirror starts.
 /// Redirects and body frames share this deadline; neither renews it.
+///
+/// This pin exposes no public Cx cancellation notification future or Waker
+/// registration. A separate runtime timer checkpoints pending work every
+/// 100 ms, subject to runtime scheduling and cooperative synchronous work.
+/// The timer does not cancel/recreate the transfer or renew its deadline.
 async fn drive_attempt<T>(
     cx: &Cx,
     part: usize,
@@ -361,7 +370,23 @@ async fn drive_attempt<T>(
         NetworkPullError::RequestTimeout { part, mirror }
     };
     if deadline <= cx.now() { return Err(expired()); }
-    let result = asupersync::time::timeout_at(deadline, std::pin::pin!(future)).await;
+    let result = {
+        let mut attempt = std::pin::pin!(future);
+        let mut cancellation = std::pin::pin!(async {
+            loop {
+                asupersync::time::sleep(cx.now(), CANCELLATION_CHECK_INTERVAL).await;
+                if let Err(error) = checkpoint(cx, Some(part)) { break error; }
+            }
+        });
+        let observed = poll_fn(|task_cx| {
+            if let Poll::Ready(error) = cancellation.as_mut().poll(task_cx) {
+                return Poll::Ready(Err(error));
+            }
+            attempt.as_mut().poll(task_cx)
+        });
+        asupersync::time::timeout_at(deadline, observed).await
+        // Both owned futures are dropped here, before rollback or retry.
+    };
     // Preserve any real parent cancellation, including its precise kind.
     // Synchronous file work is cooperative; detect a late ready result too.
     checkpoint(cx, Some(part))?;
@@ -694,9 +719,25 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{cell::Cell, sync::Arc, task::{Context, Waker}};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_ATTEMPT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    struct AttemptDrop<'a>(&'a Cell<bool>);
+    impl Drop for AttemptDrop<'_> {
+        fn drop(&mut self) { self.0.set(true); }
+    }
+
+    fn virtual_attempt_runtime() -> (asupersync::runtime::Runtime, Arc<asupersync::time::VirtualClock>) {
+        let clock = Arc::new(asupersync::time::VirtualClock::starting_at(
+            asupersync::types::Time::from_secs(17),
+        ));
+        let driver = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_timer_driver(driver).build().unwrap();
+        (runtime, clock)
+    }
 
     fn attempt_path() -> PathBuf {
         let sequence = NEXT_ATTEMPT_FIXTURE.fetch_add(1, Ordering::Relaxed);
@@ -746,6 +787,106 @@ mod tests {
         assert_eq!(file.stream_position().unwrap(), 2);
         assert_eq!(downloaded, 2, "timeout never refunds consumed network bytes");
         assert_eq!(next_range_end(0, 2, 6, 6, Some(4), downloaded).unwrap(), 3);
+    }
+
+    #[test]
+    fn silent_attempt_observes_each_cancellation_kind_at_the_next_timer_check() {
+        assert_eq!(CANCELLATION_CHECK_INTERVAL, Duration::from_millis(100));
+        for cause in [CancelKind::User, CancelKind::Timeout, CancelKind::Deadline,
+            CancelKind::PollQuota, CancelKind::CostBudget, CancelKind::FailFast,
+            CancelKind::RaceLost, CancelKind::ParentCancelled, CancelKind::ResourceUnavailable,
+            CancelKind::Shutdown, CancelKind::LinkedExit] {
+            let (runtime, clock) = virtual_attempt_runtime();
+            runtime.block_on(async {
+                let cx = Cx::current().unwrap();
+                assert_eq!(cx.now(), asupersync::types::Time::from_secs(17));
+                let dropped = Cell::new(false);
+                let mut task = Context::from_waker(Waker::noop());
+                let mut attempt = std::pin::pin!(drive_attempt(&cx, 2, 1, Duration::from_secs(60), async {
+                    let _guard = AttemptDrop(&dropped);
+                    std::future::pending::<Result<u64, NetworkPullError>>().await
+                }));
+                assert!(attempt.as_mut().poll(&mut task).is_pending());
+                cx.cancel_with(cause, None);
+                clock.advance(50_000_000);
+                assert!(attempt.as_mut().poll(&mut task).is_pending());
+                assert!(!dropped.get(), "pending timer checks must retain the transfer");
+                clock.advance(50_000_000);
+                let result = match attempt.as_mut().poll(&mut task) {
+                    Poll::Ready(result) => result,
+                    Poll::Pending => panic!("silent cancellation must not wait for the 60 second deadline"),
+                };
+                assert!(matches!(result, Err(NetworkPullError::Cancelled { cause: Some(observed), part: Some(2) })
+                    if observed == cause));
+                assert!(dropped.get(), "cancellation must release the owned transfer before returning");
+            });
+        }
+    }
+
+    #[test]
+    fn silent_cancellation_rolls_back_without_refunding_received_bytes() {
+        let (runtime, clock) = virtual_attempt_runtime();
+        let (mut file, part, mut hasher) = attempt_fixture(b"ab", b"abcdef");
+        let mut downloaded = 0;
+        let dropped = Cell::new(false);
+        let result = runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            assert_eq!(cx.now(), asupersync::types::Time::from_secs(17));
+            let mut task = Context::from_waker(Waker::noop());
+            let mut attempt = std::pin::pin!(drive_attempt(&cx, 0, 0, Duration::from_secs(60), async {
+                let _guard = AttemptDrop(&dropped);
+                file.write_all(b"cd").unwrap(); hasher.update(b"cd");
+                charge_body_bytes(&mut downloaded, 2).unwrap();
+                std::future::pending::<Result<u64, NetworkPullError>>().await
+            }));
+            assert!(attempt.as_mut().poll(&mut task).is_pending());
+            cx.cancel_with(CancelKind::User, None);
+            clock.advance(100_000_000);
+            match attempt.as_mut().poll(&mut task) {
+                Poll::Ready(result) => result,
+                Poll::Pending => panic!("cancelled transfer must finish on the cancellation timer"),
+            }
+        });
+        assert!(dropped.get());
+        assert!(matches!(finish_attempt(0, 0, &part, 2, 5, &mut file, &hasher, result),
+            Err(NetworkPullError::Cancelled { cause: Some(CancelKind::User), part: Some(0) })));
+        assert_eq!(file.metadata().unwrap().len(), 2);
+        assert_eq!(file.stream_position().unwrap(), 2);
+        assert_eq!(downloaded, 2, "cancellation never refunds consumed network bytes");
+        assert_eq!(next_range_end(0, 2, 6, 6, Some(4), downloaded).unwrap(), 3);
+    }
+
+    #[test]
+    fn cancellation_ticks_keep_one_transfer_and_never_renew_the_attempt_deadline() {
+        let (runtime, clock) = virtual_attempt_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            assert_eq!(cx.now(), asupersync::types::Time::from_secs(17));
+            let starts = Cell::new(0);
+            let polls = Cell::new(0);
+            let dropped = Cell::new(false);
+            let mut task = Context::from_waker(Waker::noop());
+            let mut attempt = std::pin::pin!(drive_attempt(&cx, 0, 0, Duration::from_millis(250), async {
+                starts.set(starts.get() + 1);
+                let _guard = AttemptDrop(&dropped);
+                poll_fn(|_| {
+                    polls.set(polls.get() + 1);
+                    if polls.get() == 4 { Poll::Ready(Ok(4_u64)) } else { Poll::Pending }
+                }).await
+            }));
+            assert!(attempt.as_mut().poll(&mut task).is_pending());
+            for _ in 0..2 {
+                clock.advance(100_000_000);
+                assert!(attempt.as_mut().poll(&mut task).is_pending());
+                assert_eq!(starts.get(), 1);
+                assert!(!dropped.get(), "a timer tick must not drop or restart the transfer");
+            }
+            clock.advance(50_000_001);
+            assert!(matches!(attempt.as_mut().poll(&mut task),
+                Poll::Ready(Err(NetworkPullError::RequestTimeout { part: 0, mirror: 0 }))));
+            assert_eq!(polls.get(), 3, "expired work must not receive a late completion poll");
+            assert!(dropped.get());
+        });
     }
 
     #[test]
