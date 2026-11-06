@@ -98,6 +98,17 @@ impl Int4ScoredJobRecipe {
         Self::finish("classify-v1", INT4_CLASSIFICATION_EXECUTION, CLASSIFICATION_PROMPT_VERSION,
             width, ceiling, native, Settings::Classification { planning: limits.into(), defaults })
     }
+    /// Keep the caller's actual allocation visible to the complete-document
+    /// host's capacity quote. The private recipe owns only a bounded logical
+    /// clone; large spare Vec/String capacities stay with the returned owner.
+    pub(super) fn classification_retaining_defaults(width: usize, ceiling: TaskBudget,
+        limits: ClassificationLimits, defaults: ClassificationBatchArgs, native: Int4ScoredBatchLimits)
+        -> Result<(Self, ClassificationBatchArgs), BatchFault> {
+        check_classification(limits, Some(&defaults), ceiling)?;
+        bounded_json(&defaults, RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
+        let recipe = Self::classification(width, ceiling, limits, Some(defaults.clone()), native)?;
+        Ok((recipe, defaults))
+    }
     pub(super) fn sentiment(width: usize, ceiling: TaskBudget, limits: SentimentLimits,
         defaults: Option<SentimentBatchArgs>, native: Int4ScoredBatchLimits) -> Result<Self, BatchFault> {
         check_scoring(limits.per_axis)?;

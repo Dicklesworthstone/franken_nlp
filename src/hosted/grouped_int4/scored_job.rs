@@ -13,6 +13,7 @@ use crate::{
     tasks::ir::TaskBudget,
 };
 use super::scored_batch::ScoredAdmission;
+mod document;
 
 struct JobInput<P: Int4ScoredJobTask, R> {
     preparation: Option<(Int4ScoredJobPlanner<P>, SourceJobRequest)>,
