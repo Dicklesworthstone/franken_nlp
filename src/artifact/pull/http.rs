@@ -34,10 +34,9 @@ use sha2::{Digest, Sha256};
 use super::{PullError, read_manifest, validate_sha256_text};
 use crate::artifact::{
     manifest::{
-        MAX_RELEASE_MANIFEST_PARTS, NANBEIGE42_INT8_V1_COMPATIBILITY, ReleaseManifest, ReleasePart,
+        NANBEIGE42_INT8_V1_COMPATIBILITY, ReleaseManifest, ReleasePart,
         release_manifest_sha256,
     },
-    reader::FnlpqRangeReader,
 };
 
 const USER_AGENT: &str = "franken_nlp-agent (+https://github.com/Dicklesworthstone/franken_nlp)";
@@ -58,8 +57,11 @@ pub struct NetworkPartsOptions {
     /// Reuse and extend existing `.partial` files. Final verified parts are
     /// always reused after a complete digest check, regardless of this flag.
     pub resume: bool,
-    /// Maximum newly downloaded bytes across this invocation. A successful
-    /// partial range is retained and returns DownloadBudgetExceeded.
+    /// Allowance for requested part-body bytes across ALL mirror attempts.
+    /// Received bytes remain charged when an attempt fails or rolls back. A
+    /// successful partial range is retained and returns DownloadBudgetExceeded.
+    /// This is not a wire-byte cap: HTTP/TLS overhead and unsolicited bytes
+    /// from a server that violates its requested range cannot be prevented.
     pub max_new_bytes: Option<u64>,
     /// Total timeout for each individual HTTP request, meet-composed with Cx.
     pub request_timeout: Duration,
@@ -93,6 +95,7 @@ pub struct NetworkPartReport {
     pub state: NetworkPartState,
     pub mirror_index: Option<usize>,
     pub resumed_bytes: u64,
+    /// Body bytes received for this part, including discarded mirror attempts.
     pub downloaded_bytes: u64,
     pub path: PathBuf,
 }
@@ -102,6 +105,7 @@ pub struct NetworkPartsReport {
     pub release_manifest_sha256: String,
     pub parts: Vec<NetworkPartReport>,
     pub reused_bytes: u64,
+    /// Body bytes received across all parts and attempts, including failures.
     pub downloaded_bytes: u64,
     pub complete_bytes: u64,
     pub parts_dir: PathBuf,
@@ -228,7 +232,7 @@ pub async fn download_release_parts(
             return Err(NetworkPullError::PartPath { part: index, detail: "manifest part must remain a portable basename" });
         }
         if final_path.exists() {
-            verify_final(index, part, &final_path)?;
+            verify_final(index, part, &final_path, || checkpoint(cx, Some(index)))?;
             reused_total = reused_total.checked_add(part.bytes)
                 .ok_or(NetworkPullError::InvalidOptions("reused byte arithmetic overflow"))?;
             reports.push(NetworkPartReport {
@@ -244,7 +248,7 @@ pub async fn download_release_parts(
         if start > part.bytes {
             return Err(NetworkPullError::Staging { part: index, operation: "length", detail: "partial exceeds declared part length".to_owned() });
         }
-        let mut prefix_hasher = hash_prefix(index, &mut staging, start, cx)?;
+        let prefix_hasher = hash_prefix(index, &mut staging, start, cx)?;
         let resumed = start;
         if start == part.bytes {
             let observed = hex_lower(&prefix_hasher.clone().finalize());
@@ -252,7 +256,7 @@ pub async fn download_release_parts(
                 return Err(NetworkPullError::Digest { part: index, expected: part.sha256.clone(), observed });
             }
             publish_part(index, &staging_path, &final_path)?;
-            verify_final(index, part, &final_path)?;
+            verify_final(index, part, &final_path, || checkpoint(cx, Some(index)))?;
             reused_total = reused_total.checked_add(part.bytes)
                 .ok_or(NetworkPullError::InvalidOptions("reused byte arithmetic overflow"))?;
             reports.push(NetworkPartReport {
@@ -263,46 +267,42 @@ pub async fn download_release_parts(
             continue;
         }
 
-        let allowance = options.max_new_bytes.map(|limit| limit.saturating_sub(downloaded_total));
-        if allowance == Some(0) {
-            return Err(NetworkPullError::DownloadBudgetExceeded {
-                limit: options.max_new_bytes.unwrap_or(0), downloaded_bytes: downloaded_total,
-                retained_bytes: start, total_bytes: manifest.artifact.bytes, part: index,
-            });
-        }
-        let request_end = match allowance {
-            Some(allowed) => part.bytes.saturating_sub(1).min(start.saturating_add(allowed).saturating_sub(1)),
-            None => part.bytes - 1,
-        };
-        let segment_len = request_end - start + 1;
         let base_len = start;
+        let downloaded_before_part = downloaded_total;
         let mut success = None;
         let mut last_error = String::from("no mirror attempted");
         if part.mirrors.is_empty() { return Err(NetworkPullError::NoMirrors { part: index }); }
 
         for (mirror_index, mirror) in part.mirrors.iter().enumerate() {
             checkpoint(cx, Some(index))?;
-            staging.set_len(base_len).map_err(|error| staging_error(index, "rollback-before-attempt", error))?;
-            staging.seek(SeekFrom::Start(base_len)).map_err(|error| staging_error(index, "seek-before-attempt", error))?;
+            // A failed attempt spends the enclosing budget even though its
+            // bytes are discarded. Recompute the next Range before contacting
+            // each mirror; never reuse the first mirror's larger allowance.
+            let request_end = next_range_end(index, start, part.bytes,
+                manifest.artifact.bytes, options.max_new_bytes, downloaded_total)?;
             let mut hasher = prefix_hasher.clone();
-            match fetch_range(cx, &client, index, mirror_index, mirror, start, request_end, part.bytes,
-                &mut staging, &mut hasher, options).await {
-                Ok(received) if received == segment_len => {
-                    success = Some((mirror_index, hasher));
+            let result = fetch_range(cx, &client, index, mirror_index, mirror, start, request_end, part.bytes,
+                &mut staging, &mut hasher, &mut downloaded_total, options).await;
+            // Digest validation belongs to the attempt, before short-circuiting
+            // mirror fallback. Failure restores both length and cursor to the
+            // pre-attempt prefix; a corrupt complete suffix cannot poison resume.
+            match finish_attempt(index, mirror_index, part, base_len, request_end,
+                &mut staging, &hasher, result) {
+                Ok(received) => {
+                    success = Some((mirror_index, received));
                     break;
                 }
-                Ok(received) => {
-                    last_error = format!("short body received={received} expected={segment_len}");
-                }
-                Err(NetworkPullError::Cancelled { cause, .. }) => {
-                    staging.set_len(base_len).map_err(|error| staging_error(index, "rollback-cancelled-attempt", error))?;
-                    return Err(NetworkPullError::Cancelled { cause, part: Some(index) });
-                }
+                // Retrying cannot repair cancellation or a local storage
+                // failure. In particular, rollback failure must stop here.
+                Err(error @ (NetworkPullError::Cancelled { .. } | NetworkPullError::Staging { .. })) => return Err(error),
                 Err(error) => last_error = error.to_string(),
             }
         }
-        let Some((mirror_index, hasher)) = success else {
-            staging.set_len(base_len).map_err(|error| staging_error(index, "rollback-exhausted-attempts", error))?;
+        let Some((mirror_index, segment_len)) = success else {
+            // Give exhausted enclosing work its typed budget outcome even if
+            // the last available mirror consumed the final allowance.
+            next_range_end(index, start, part.bytes, manifest.artifact.bytes,
+                options.max_new_bytes, downloaded_total)?;
             return Err(NetworkPullError::MirrorExhausted {
                 part: index, attempts: part.mirrors.len(), last: last_error,
             });
@@ -311,10 +311,6 @@ pub async fn download_release_parts(
         staging.sync_all().map_err(|error| staging_error(index, "sync", error))?;
         let new_len = base_len.checked_add(segment_len)
             .ok_or(NetworkPullError::InvalidOptions("part length arithmetic overflow"))?;
-        downloaded_total = downloaded_total.checked_add(segment_len)
-            .ok_or(NetworkPullError::InvalidOptions("downloaded byte arithmetic overflow"))?;
-        prefix_hasher = hasher;
-
         if new_len < part.bytes {
             return Err(NetworkPullError::DownloadBudgetExceeded {
                 limit: options.max_new_bytes.unwrap_or(downloaded_total),
@@ -322,16 +318,12 @@ pub async fn download_release_parts(
                 total_bytes: manifest.artifact.bytes, part: index,
             });
         }
-        let observed = hex_lower(&prefix_hasher.finalize());
-        if observed != part.sha256 {
-            return Err(NetworkPullError::Digest { part: index, expected: part.sha256.clone(), observed });
-        }
         publish_part(index, &staging_path, &final_path)?;
-        verify_final(index, part, &final_path)?;
+        verify_final(index, part, &final_path, || checkpoint(cx, Some(index)))?;
         reports.push(NetworkPartReport {
             part: index, name: part.name.clone(), bytes: part.bytes, sha256: part.sha256.clone(),
             state: NetworkPartState::Downloaded, mirror_index: Some(mirror_index), resumed_bytes: resumed,
-            downloaded_bytes: segment_len, path: final_path,
+            downloaded_bytes: downloaded_total - downloaded_before_part, path: final_path,
         });
     }
     checkpoint(cx, None)?;
@@ -341,6 +333,56 @@ pub async fn download_release_parts(
         complete_bytes: manifest.artifact.bytes, parts_dir: request.parts_dir.clone(),
         activation_authority: false,
     })
+}
+
+fn next_range_end(
+    part: usize, start: u64, part_bytes: u64, artifact_bytes: u64,
+    limit: Option<u64>, downloaded_bytes: u64,
+) -> Result<u64, NetworkPullError> {
+    let remaining = part_bytes.checked_sub(start).filter(|&bytes| bytes != 0)
+        .ok_or(NetworkPullError::InvalidOptions("invalid incomplete part range"))?;
+    let length = limit.map_or(remaining, |limit| remaining.min(limit.saturating_sub(downloaded_bytes)));
+    if length == 0 {
+        return Err(NetworkPullError::DownloadBudgetExceeded {
+            limit: limit.unwrap_or(0), downloaded_bytes, retained_bytes: start,
+            total_bytes: artifact_bytes, part,
+        });
+    }
+    // length <= part_bytes - start, so this addition cannot overflow.
+    Ok(start + length - 1)
+}
+
+/// Complete or roll back one real transfer, including its digest gate.
+fn finish_attempt(
+    index: usize, mirror: usize, part: &ReleasePart, start: u64, end: u64,
+    file: &mut File, hasher: &Sha256, result: Result<u64, NetworkPullError>,
+) -> Result<u64, NetworkPullError> {
+    let checked = result.and_then(|received| {
+        if end.checked_sub(start).and_then(|bytes| bytes.checked_add(1)) != Some(received) {
+            return Err(NetworkPullError::Response { part: index, mirror, detail: "body length differs from requested range" });
+        }
+        if end.checked_add(1) == Some(part.bytes) {
+            let observed = hex_lower(&hasher.clone().finalize());
+            if observed != part.sha256 {
+                return Err(NetworkPullError::Digest { part: index, expected: part.sha256.clone(), observed });
+            }
+        }
+        Ok(received)
+    });
+    if checked.is_err() {
+        file.set_len(start).map_err(|error| staging_error(index, "rollback-attempt", error))?;
+        file.seek(SeekFrom::Start(start)).map_err(|error| staging_error(index, "seek-after-rollback", error))?;
+        file.sync_all().map_err(|error| staging_error(index, "sync-rollback", error))?;
+    }
+    checked
+}
+
+fn charge_body_bytes(downloaded: &mut u64, bytes: usize) -> Result<(), NetworkPullError> {
+    let bytes = u64::try_from(bytes)
+        .map_err(|_| NetworkPullError::InvalidOptions("body byte length does not fit u64"))?;
+    *downloaded = downloaded.checked_add(bytes)
+        .ok_or(NetworkPullError::InvalidOptions("downloaded byte arithmetic overflow"))?;
+    Ok(())
 }
 
 async fn fetch_range(
@@ -354,6 +396,7 @@ async fn fetch_range(
     total: u64,
     file: &mut File,
     hasher: &mut Sha256,
+    downloaded_total: &mut u64,
     options: NetworkPartsOptions,
 ) -> Result<u64, NetworkPullError> {
     let mut url = initial_url.to_owned();
@@ -371,7 +414,10 @@ async fn fetch_range(
                 ("Accept-Encoding".to_owned(), "identity".to_owned()),
             ],
             Vec::new(),
-        ).await.map_err(|error| NetworkPullError::Body { part, mirror, detail: error.to_string() })?;
+        ).await;
+        // A cancelled request must not become a retryable transport error.
+        checkpoint(cx, Some(part))?;
+        let response = response.map_err(|error| NetworkPullError::Body { part, mirror, detail: error.to_string() })?;
         if matches!(response.head.status, 301 | 302 | 303 | 307 | 308) {
             if redirects == options.max_redirects {
                 return Err(NetworkPullError::Redirect { part, mirror, detail: "redirect limit exceeded" });
@@ -393,6 +439,9 @@ async fn fetch_range(
             let frame = frame.map_err(|error| NetworkPullError::Body { part, mirror, detail: error.to_string() })?;
             match frame {
                 Frame::Data(mut data) => {
+                    // Charge the entire delivered frame before inspecting or
+                    // writing it, including overlong bytes and failed writes.
+                    charge_body_bytes(downloaded_total, data.remaining())?;
                     while data.remaining() != 0 {
                         let bytes = data.chunk();
                         if bytes.is_empty() {
@@ -415,6 +464,7 @@ async fn fetch_range(
                 }
             }
         }
+        checkpoint(cx, Some(part))?;
         if received != end - start + 1 {
             return Err(NetworkPullError::Response { part, mirror, detail: "body length differs from requested range" });
         }
@@ -541,7 +591,9 @@ fn hash_prefix(part: usize, file: &mut File, length: u64, cx: &Cx) -> Result<Sha
     Ok(hasher)
 }
 
-fn verify_final(part: usize, expected: &ReleasePart, path: &Path) -> Result<(), NetworkPullError> {
+fn verify_final(part: usize, expected: &ReleasePart, path: &Path,
+    mut check: impl FnMut() -> Result<(), NetworkPullError>) -> Result<(), NetworkPullError> {
+    check()?;
     let metadata = fs::symlink_metadata(path).map_err(|error| NetworkPullError::ExistingPart {
         part, detail: if error.kind() == std::io::ErrorKind::NotFound { "final disappeared" } else { "cannot inspect final" },
     })?;
@@ -552,10 +604,12 @@ fn verify_final(part: usize, expected: &ReleasePart, path: &Path) -> Result<(), 
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
     let mut hasher = Sha256::new();
     loop {
+        check()?;
         let read = file.read(&mut buffer).map_err(|_| NetworkPullError::ExistingPart { part, detail: "cannot hash final" })?;
         if read == 0 { break; }
         hasher.update(&buffer[..read]);
     }
+    check()?;
     let observed = hex_lower(&hasher.finalize());
     if observed != expected.sha256 {
         return Err(NetworkPullError::Digest { part, expected: expected.sha256.clone(), observed });
@@ -594,6 +648,160 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_ATTEMPT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    fn attempt_path() -> PathBuf {
+        let sequence = NEXT_ATTEMPT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "fnlp-network-attempt-{}-{sequence}", std::process::id(),
+        ))
+    }
+
+    fn attempt_fixture(prefix: &[u8], complete: &[u8]) -> (File, ReleasePart, Sha256) {
+        let mut file = OpenOptions::new().read(true).write(true).create_new(true)
+            .open(attempt_path()).expect("create unique attempt fixture");
+        file.write_all(prefix).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(prefix);
+        let part = ReleasePart { id: 0, name: "fixture.part00".to_owned(),
+            bytes: complete.len() as u64, sha256: hex_lower(&Sha256::digest(complete)),
+            mirrors: vec!["https://first.invalid/part".to_owned(), "https://second.invalid/part".to_owned()] };
+        (file, part, hasher)
+    }
+
+    #[test]
+    fn corrupt_complete_mirror_rolls_back_before_a_valid_mirror_succeeds() {
+        let (mut file, part, prefix) = attempt_fixture(b"ab", b"abcdef");
+        let mut downloaded = 0;
+        let mut attempted = Vec::new();
+        for (mirror, bytes) in [b"XXXX".as_slice(), b"cdef"].into_iter().enumerate() {
+            attempted.push(mirror);
+            let end = next_range_end(0, 2, part.bytes, part.bytes, Some(8), downloaded).unwrap();
+            let mut hasher = prefix.clone();
+            charge_body_bytes(&mut downloaded, bytes.len()).unwrap();
+            file.write_all(bytes).unwrap(); hasher.update(bytes);
+            match finish_attempt(0, mirror, &part, 2, end, &mut file, &hasher, Ok(bytes.len() as u64)) {
+                Ok(received) => { assert_eq!(received, 4); break; }
+                Err(NetworkPullError::Digest { .. }) => {
+                    assert_eq!(mirror, 0);
+                    assert_eq!(file.metadata().unwrap().len(), 2);
+                    assert_eq!(file.stream_position().unwrap(), 2);
+                    assert_eq!(downloaded, 4, "rollback never refunds transferred bytes");
+                }
+                Err(error) => panic!("unexpected failure: {error}"),
+            }
+        }
+        assert_eq!(attempted, [0, 1]);
+        assert_eq!(downloaded, 8);
+        file.rewind().unwrap();
+        let mut bytes = Vec::new(); file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"abcdef");
+    }
+
+    #[test]
+    fn a_failed_attempt_shrinks_the_next_range_without_refunding_its_bytes() {
+        let (mut file, part, prefix) = attempt_fixture(b"ab", b"abcdef");
+        let mut downloaded = 0;
+        let end = next_range_end(0, 2, part.bytes, 12, Some(5), downloaded).unwrap();
+        assert_eq!(end, 5);
+        let mut hasher = prefix.clone();
+        charge_body_bytes(&mut downloaded, 3).unwrap();
+        file.write_all(b"bad").unwrap(); hasher.update(b"bad");
+        let failure = NetworkPullError::Body { part: 0, mirror: 0, detail: "interrupted".to_owned() };
+        assert!(matches!(finish_attempt(0, 0, &part, 2, end, &mut file, &hasher, Err(failure)),
+            Err(NetworkPullError::Body { .. })));
+        assert_eq!(file.metadata().unwrap().len(), 2);
+        let end = next_range_end(0, 2, part.bytes, 12, Some(5), downloaded).unwrap();
+        assert_eq!(end, 3, "only two body bytes remain for the next mirror");
+        let mut hasher = prefix;
+        charge_body_bytes(&mut downloaded, 2).unwrap();
+        file.write_all(b"cd").unwrap(); hasher.update(b"cd");
+        assert_eq!(finish_attempt(0, 1, &part, 2, end, &mut file, &hasher, Ok(2)).unwrap(), 2);
+        assert_eq!(file.metadata().unwrap().len(), 4, "a valid partial is retained for explicit resume");
+        assert!(matches!(next_range_end(0, 4, part.bytes, 12, Some(5), downloaded),
+            Err(NetworkPullError::DownloadBudgetExceeded {
+                limit: 5, downloaded_bytes: 5, retained_bytes: 4, total_bytes: 12, part: 0,
+            })));
+    }
+
+    #[test]
+    fn corrupt_body_cannot_buy_another_attempt_with_an_exhausted_budget() {
+        let (mut file, part, mut hasher) = attempt_fixture(b"ab", b"abcdef");
+        let mut downloaded = 0;
+        charge_body_bytes(&mut downloaded, 4).unwrap();
+        file.write_all(b"bad!").unwrap(); hasher.update(b"bad!");
+        assert!(matches!(finish_attempt(0, 0, &part, 2, 5, &mut file, &hasher, Ok(4)),
+            Err(NetworkPullError::Digest { .. })));
+        assert!(matches!(next_range_end(0, 2, part.bytes, part.bytes, Some(4), downloaded),
+            Err(NetworkPullError::DownloadBudgetExceeded { downloaded_bytes: 4, retained_bytes: 2, .. })));
+        assert_eq!(file.metadata().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn short_overlong_cancelled_and_storage_failed_attempts_restore_the_prefix() {
+        for kind in 0..4 {
+            let (mut file, part, mut hasher) = attempt_fixture(b"ab", b"abcdef");
+            let bytes = if kind == 1 { b"cdefEXTRA".as_slice() } else { b"cd".as_slice() };
+            let mut downloaded = 0;
+            charge_body_bytes(&mut downloaded, bytes.len()).unwrap();
+            file.write_all(bytes).unwrap(); hasher.update(bytes);
+            let result = match kind {
+                0 | 1 => Ok(bytes.len() as u64),
+                2 => Err(NetworkPullError::Cancelled { cause: Some(CancelKind::Deadline), part: Some(0) }),
+                _ => Err(NetworkPullError::Staging { part: 0, operation: "write-range", detail: "full".to_owned() }),
+            };
+            let error = finish_attempt(0, 0, &part, 2, 5, &mut file, &hasher, result).unwrap_err();
+            match kind {
+                0 | 1 => assert!(matches!(error, NetworkPullError::Response { .. })),
+                2 => assert!(matches!(error, NetworkPullError::Cancelled { cause: Some(CancelKind::Deadline), .. })),
+                _ => assert!(matches!(error, NetworkPullError::Staging { operation: "write-range", .. })),
+            }
+            assert_eq!(file.metadata().unwrap().len(), 2);
+            assert_eq!(file.stream_position().unwrap(), 2);
+            assert_eq!(downloaded, bytes.len() as u64);
+            file.rewind().unwrap();
+            let mut prefix = Vec::new(); file.read_to_end(&mut prefix).unwrap();
+            assert_eq!(prefix, b"ab");
+        }
+    }
+
+    #[test]
+    fn transfer_budget_and_range_arithmetic_refuse_overflow_and_empty_ranges() {
+        assert_eq!(next_range_end(0, u64::MAX - 2, u64::MAX, u64::MAX, None, 0).unwrap(), u64::MAX - 1);
+        assert_eq!(next_range_end(0, 5, 10, 10, Some(1), 0).unwrap(), 5);
+        for (start, total) in [(0, 0), (10, 10), (11, 10)] {
+            assert!(matches!(next_range_end(0, start, total, total, None, 0), Err(NetworkPullError::InvalidOptions(_))));
+        }
+        for downloaded in [4, 5, u64::MAX] {
+            assert!(matches!(next_range_end(0, 2, 6, 6, Some(4), downloaded),
+                Err(NetworkPullError::DownloadBudgetExceeded { .. })));
+        }
+        let mut downloaded = u64::MAX;
+        assert!(charge_body_bytes(&mut downloaded, 1).is_err());
+        assert_eq!(downloaded, u64::MAX);
+    }
+
+    #[test]
+    fn cached_part_verification_checks_cancellation_before_open_and_between_reads() {
+        let path = attempt_path();
+        let bytes = vec![b'x'; COPY_BUFFER_BYTES + 1];
+        let part = ReleasePart { id: 0, name: "fixture.part00".to_owned(), bytes: bytes.len() as u64,
+            sha256: hex_lower(&Sha256::digest(&bytes)), mirrors: Vec::new() };
+        let cancelled = || NetworkPullError::Cancelled { cause: Some(CancelKind::Deadline), part: Some(0) };
+        assert!(matches!(verify_final(0, &part, &path, || Err(cancelled())),
+            Err(NetworkPullError::Cancelled { cause: Some(CancelKind::Deadline), .. })));
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        file.write_all(&bytes).unwrap(); file.sync_all().unwrap(); drop(file);
+        let mut checks = 0;
+        assert!(matches!(verify_final(0, &part, &path, || {
+            checks += 1;
+            if checks == 3 { Err(cancelled()) } else { Ok(()) }
+        }), Err(NetworkPullError::Cancelled { .. })));
+        assert_eq!(checks, 3, "cancellation is observed before hashing the second block");
+        assert!(verify_final(0, &part, &path, || Ok(())).is_ok());
+    }
 
     #[test]
     fn range_response_requires_exact_206_identity_length_and_total() {
