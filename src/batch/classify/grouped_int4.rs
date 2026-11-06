@@ -6,17 +6,25 @@ use crate::{
     batch::{BatchCode, BatchDocument, BatchFault, BatchItemFailure, BatchProcessor,
         BatchRequestContext, BatchWork, output::GuardedOutput},
     execution_identity::ExecutionIdentity,
-    native_engine::{constrained_int4, decode::DecodeStepControl, portable_int8::ProjectionWork,
-        strict_int4::{Int4MemoryRequirement, Int4RunBudget, Int4Work, StrictInt4Engine,
+    native_engine::{constrained_int4, decode::DecodeStepControl, int4::PackedInt4Kernel,
+        strict_int4::{Int4MemoryRequirement, Int4ModelWeights, Int4RunBudget, Int4Work, StrictInt4Engine,
             StrictInt4Error, scoring::{Int4ScoringBudget, Int4ScoringError}}},
     tasks::{classify::{ClassificationLabel, ClassificationLimits, ClassificationMode,
         ClassificationRequest,
         grouped_int4::{Int4ClassificationError, Int4ClassificationPlanner,
-            long::{Int4ClassificationMapError, Int4ClassificationMapLimits,
-                Int4ClassificationMapPreflight, Int4ClassificationMapRun}}},
+            long::{Int4ClassificationMapCohortBudget, Int4ClassificationMapError, Int4ClassificationMapLimits,
+                Int4ClassificationMapPreflight, Int4ClassificationMapRun,
+                memory::{Int4ClassificationMapCohortMemoryRequirement, Int4ClassificationMapMemoryLimits}}}},
         ir::TaskBudget},
 };
 use super::ClassificationBatchArgs;
+use crate::batch::int4_document::{RunState, subtract};
+pub(crate) use crate::batch::int4_document::{fits, nonzero};
+
+mod cohort;
+pub use cohort::Int4ClassificationDocumentRun;
+pub(crate) use cohort::cohort_head_limit;
+use cohort::{Backend, CohortSchedule};
 
 /// Frozen identities, admission copies and document metadata retained while
 /// the original request is recompiled. This is additional to the map quote.
@@ -30,6 +38,7 @@ pub struct Int4ClassificationDocumentBatchPlanner {
     defaults: Option<ClassificationBatchArgs>,
     mapping: Int4ClassificationMapLimits,
     max_run_work: Int4Work,
+    cohorts: Option<CohortSchedule>,
     seal: Arc<()>,
 }
 impl Int4ClassificationDocumentBatchPlanner {
@@ -47,7 +56,7 @@ impl Int4ClassificationDocumentBatchPlanner {
             planner.max_document_bytes(&request, mapping.chunks.context_tokens)
                 .map_err(|e| map_failure(e.into(), false).fault)?;
         }
-        Ok(Self { planner, defaults, mapping, max_run_work, seal: Arc::new(()) })
+        Ok(Self { planner, defaults, mapping, max_run_work, cohorts: None, seal: Arc::new(()) })
     }
     pub fn base_execution_identity(&self) -> &ExecutionIdentity { self.planner.execution_identity() }
     pub fn group_width(&self) -> usize { self.planner.group_width() }
@@ -55,6 +64,29 @@ impl Int4ClassificationDocumentBatchPlanner {
     pub fn planning_limits(&self) -> ClassificationLimits { self.planner.planning_limits() }
     pub fn mapping_limits(&self) -> Int4ClassificationMapLimits { self.mapping }
     pub fn max_run_work(&self) -> Int4Work { self.max_run_work }
+    pub fn cohort_chunks(&self) -> Option<usize> { self.cohorts.map(|schedule| schedule.chunks) }
+    /// Opt into actual chunk-by-head native windows. Unknown records reserve
+    /// the largest valid head count; an oversized actual record is refused,
+    /// never split into a different schedule or silently executed serially.
+    pub fn with_chunk_cohorts(mut self, chunks: usize, memory: Int4ClassificationMapMemoryLimits)
+        -> Result<Self, BatchFault> {
+        let schedule = CohortSchedule::new(self.group_width(), self.task_budget(), self.planning_limits(),
+            self.mapping, chunks, memory)?;
+        if let Some(defaults) = &self.defaults {
+            schedule.check_request(defaults.mode, defaults.labels.len(), defaults.budget).map_err(|e| e.fault)?;
+        }
+        self.cohorts = Some(schedule);
+        // Prepared serial or differently grouped items cannot transfer into
+        // this schedule even though the logical classifier identity is fixed.
+        self.seal = Arc::new(());
+        Ok(self)
+    }
+    pub fn cohort_requirements(&self) -> Result<Int4ClassificationMapCohortMemoryRequirement, BatchFault> {
+        self.cohorts.map(|schedule| schedule.required).ok_or_else(|| BatchCode::InvalidLimits.into())
+    }
+    pub fn max_result_bytes(&self) -> u64 {
+        self.cohorts.map_or(self.mapping.max_result_bytes, |schedule| schedule.required.memory.max_output_bytes)
+    }
     /// Actual transferred capacities, so an embedding caller cannot hide a
     /// greatly overallocated defaults owner inside a small logical label set.
     pub fn retained_defaults_bytes(&self) -> Result<u64, BatchFault> {
@@ -65,7 +97,11 @@ impl Int4ClassificationDocumentBatchPlanner {
             .and_then(|n| n.checked_add(label.description.capacity() as u64)).ok_or_else(|| BatchCode::InvalidLimits.into()))
     }
     fn request(&self, document: BatchDocument<ClassificationBatchArgs>) -> Result<ClassificationRequest, BatchItemFailure> {
-        build_request(document, &self.defaults, self.mapping, self.task_budget(), self.planning_limits())
+        let request = build_request(document, &self.defaults, self.mapping, self.task_budget(), self.planning_limits())?;
+        if let Some(schedule) = self.cohorts {
+            schedule.check_request(request.mode, request.labels.len(), request.budget)?;
+        }
+        Ok(request)
     }
 }
 
@@ -92,6 +128,9 @@ pub struct Int4ClassificationDocumentAdmission<'a> {
     pub group_width: usize,
     pub required_context: usize,
     pub task_budget: TaskBudget,
+    /// Physical windows are independent of each chunk's logical task budget.
+    pub cohort_chunks: Option<usize>,
+    pub head_count: usize,
     pub kv_reservation_bytes: u64,
     pub max_result_bytes: u64,
 }
@@ -103,28 +142,34 @@ pub trait Int4ClassificationDocumentBatchAdmission {
 
 pub struct NativeInt4ClassificationDocumentBatch<'e, 'w, A: Int4ClassificationDocumentBatchAdmission> {
     compiler: Int4ClassificationDocumentBatchPlanner,
-    engine: &'e mut StrictInt4Engine<'w>,
+    backend: Backend<'e, 'w>,
     admission: A,
     run: RunState,
 }
 impl<'e, 'w, A: Int4ClassificationDocumentBatchAdmission> NativeInt4ClassificationDocumentBatch<'e, 'w, A> {
     pub fn new(compiler: Int4ClassificationDocumentBatchPlanner, engine: &'e mut StrictInt4Engine<'w>,
         admission: A) -> Result<Self, BatchFault> {
-        constrained_int4::check_model(compiler.base_execution_identity(), engine.model_identity())
-            .map_err(|_| BatchCode::Admission)?;
-        capacity(&compiler, compiler.task_budget(), engine).map_err(|e| e.fault)?;
-        let run = RunState::new(compiler.max_run_work);
-        Ok(Self { compiler, engine, admission, run })
+        Self::configured(compiler, Backend::Serial(engine), admission)
     }
-    pub fn remaining_work(&self) -> Int4Work { self.run.remaining }
-    pub fn is_poisoned(&self) -> bool { self.run.state != State::Ready || !clean(self.engine) }
+    pub fn new_cohorts(compiler: Int4ClassificationDocumentBatchPlanner, weights: &'w Int4ModelWeights,
+        budget: Int4ClassificationMapCohortBudget, kernel: PackedInt4Kernel, admission: A) -> Result<Self, BatchFault> {
+        Self::configured(compiler, Backend::Cohorts { weights, budget, kernel }, admission)
+    }
+    fn configured(compiler: Int4ClassificationDocumentBatchPlanner, backend: Backend<'e, 'w>, admission: A)
+        -> Result<Self, BatchFault> {
+        backend.check_capacity(&compiler, compiler.task_budget()).map_err(|e| e.fault)?;
+        let run = RunState::new(compiler.max_run_work);
+        Ok(Self { compiler, backend, admission, run })
+    }
+    pub fn remaining_work(&self) -> Int4Work { self.run.remaining() }
+    pub fn is_poisoned(&self) -> bool { self.run.is_unavailable() || !self.backend.is_clean() }
 }
 impl<A: Int4ClassificationDocumentBatchAdmission> BatchProcessor for NativeInt4ClassificationDocumentBatch<'_, '_, A> {
     type Args = ClassificationBatchArgs;
     type Prepared = PreparedInt4ClassificationDocument;
-    type Output = GuardedOutput<Int4ClassificationMapRun, A::Guard>;
+    type Output = GuardedOutput<Int4ClassificationDocumentRun, A::Guard>;
     fn prepare(&mut self, _: BatchDocument<Self::Args>) -> Result<Self::Prepared, BatchItemFailure> {
-        self.run.state = State::Failed;
+        self.run.fail();
         Err(BatchItemFailure::fatal(BatchCode::InvalidExecution))
     }
     fn prepare_with_control<C: DecodeStepControl>(&mut self, document: BatchDocument<Self::Args>, control: &mut C)
@@ -133,12 +178,12 @@ impl<A: Int4ClassificationDocumentBatchAdmission> BatchProcessor for NativeInt4C
         let result = (|| {
             checkpoint(control)?;
             let request = self.compiler.request(document)?;
-            let kv = capacity(&self.compiler, request.budget, self.engine)?;
+            let kv = self.backend.check_capacity(&self.compiler, request.budget)?;
             let plan = self.compiler.planner.plan_document_with_control(&request, self.compiler.mapping, control)
                 .map_err(|e| map_failure(e, false))?;
-            subtract(self.run.remaining, plan.planned_work())?;
+            subtract(self.run.remaining(), plan.planned_work())?;
             let identities = plan.identities().map_err(|e| map_failure(e, false))?;
-            plan.preflight_with_control(&identities, self.engine, budget(plan.planned_work(), kv), control)
+            self.backend.preflight(&self.compiler, &plan, &identities, kv, control)
                 .map_err(|e| map_failure(e, false))?;
             let expected = plan.preflight_metadata(); let required_context = plan.required_context();
             drop(plan);
@@ -146,14 +191,14 @@ impl<A: Int4ClassificationDocumentBatchAdmission> BatchProcessor for NativeInt4C
             Ok(PreparedInt4ClassificationDocument { request, expected, identities, required_context,
                 seal: Arc::clone(&self.compiler.seal) })
         })();
-        self.run.finish_preparation(result, clean(self.engine))
+        self.run.finish_preparation(result, self.backend.is_clean())
     }
     fn planned_work(&self, prepared: &Self::Prepared) -> BatchWork {
         let work = prepared.planned_work();
         BatchWork { forward_positions: work.forward_positions, projected_logits: work.projected_logits }
     }
     fn execute<C: DecodeStepControl>(&mut self, _: Self::Prepared, _: &mut C) -> Result<Self::Output, BatchItemFailure> {
-        self.run.state = State::Failed;
+        self.run.fail();
         Err(BatchItemFailure::fatal(BatchCode::InvalidExecution))
     }
     fn execute_with_context<C: DecodeStepControl>(&mut self, prepared: Self::Prepared,
@@ -167,7 +212,7 @@ impl<A: Int4ClassificationDocumentBatchAdmission> BatchProcessor for NativeInt4C
             // All later failures keep this debit and close the processor.
             self.run.charge(prepared.planned_work(), context)?;
             checkpoint(control)?;
-            let kv = capacity(&self.compiler, prepared.request.budget, self.engine)?;
+            let kv = self.backend.check_capacity(&self.compiler, prepared.request.budget)?;
             let plan = self.compiler.planner.plan_document_with_control(&prepared.request, self.compiler.mapping, control)
                 .map_err(|e| map_failure(e, true))?;
             let actual_ids = plan.identities().map_err(|e| map_failure(e, true))?;
@@ -176,27 +221,35 @@ impl<A: Int4ClassificationDocumentBatchAdmission> BatchProcessor for NativeInt4C
                 return Err(BatchItemFailure::fatal(BatchCode::Admission));
             }
             drop(actual_ids);
-            let native_budget = budget(prepared.planned_work(), kv);
-            plan.preflight_with_control(&prepared.identities, self.engine, native_budget, control)
+            self.backend.preflight(&self.compiler, &plan, &prepared.identities, kv, control)
                 .map_err(|e| map_failure(e, true))?;
             let (admitted, guard) = self.admission.admit(Int4ClassificationDocumentAdmission {
                 identities: &prepared.identities, model_work: prepared.planned_work(),
                 group_width: plan.group_width(), required_context: prepared.required_context,
-                task_budget: prepared.request.budget, kv_reservation_bytes: kv,
-                max_result_bytes: plan.max_result_bytes(),
+                task_budget: prepared.request.budget, cohort_chunks: self.compiler.cohort_chunks(),
+                head_count: plan.head_count(), kv_reservation_bytes: kv,
+                max_result_bytes: self.compiler.max_result_bytes(),
             })?;
             // The embedding host must authorize exactly the complete frozen
             // request, not just its first chunk or another compiler identity.
             if admitted != prepared.identities { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
             checkpoint(control)?;
-            let output = plan.execute_with_control(&admitted, self.engine, native_budget, control)
+            let output = self.backend.execute(&self.compiler, &plan, &admitted, kv, control)
                 .map_err(|e| map_failure(e, true))?;
-            prepared.expected.verify_completed(&output).map_err(|e| map_failure(e, true))?;
-            if !clean(self.engine) { return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)); }
+            match &output {
+                Int4ClassificationDocumentRun::Serial(run) if self.compiler.cohort_chunks().is_none() =>
+                    prepared.expected.verify_completed(run).map_err(|e| map_failure(e, true))?,
+                Int4ClassificationDocumentRun::Cohorts(run) => {
+                    let chunks = self.compiler.cohort_chunks().ok_or_else(|| BatchItemFailure::fatal(BatchCode::Admission))?;
+                    prepared.expected.verify_completed_cohorts(run, chunks).map_err(|e| map_failure(e, true))?;
+                }
+                _ => return Err(BatchItemFailure::fatal(BatchCode::Admission)),
+            }
+            if !self.backend.is_clean() { return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)); }
             checkpoint(control)?;
             Ok(GuardedOutput::new(output, guard))
         })();
-        self.run.finish_execution(result, clean(self.engine))
+        self.run.finish_execution(result, self.backend.is_clean())
     }
 }
 
@@ -292,60 +345,6 @@ fn map_failure(error: Int4ClassificationMapError, executing: bool) -> BatchItemF
     };
     if executing { failure.stop = true; }
     failure
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum State { Ready, Running, Failed }
-struct RunState { remaining: Int4Work, last_sequence: u64, state: State }
-impl RunState {
-    fn new(remaining: Int4Work) -> Self { Self { remaining, last_sequence: 0, state: State::Ready } }
-    fn enter(&mut self) -> Result<(), BatchItemFailure> {
-        if self.state != State::Ready { return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)); }
-        self.state = State::Running; Ok(())
-    }
-    fn charge(&mut self, work: Int4Work, context: BatchRequestContext) -> Result<(), BatchItemFailure> {
-        if self.state != State::Running || context.request_seq <= self.last_sequence
-            || context.epoch == 0 || context.input_line == 0 {
-            return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
-        }
-        let remaining = subtract(self.remaining, work).map_err(|e| BatchItemFailure::fatal(e.fault))?;
-        self.remaining = remaining; self.last_sequence = context.request_seq; Ok(())
-    }
-    fn finish_preparation<T>(&mut self, result: Result<T, BatchItemFailure>, clean: bool) -> Result<T, BatchItemFailure> {
-        match result {
-            Ok(value) if clean && self.state == State::Running => { self.state = State::Ready; Ok(value) }
-            Ok(_) => { self.state = State::Failed; Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)) }
-            Err(mut error) => {
-                // An aborted native session is intentionally poisoned. Keep
-                // its original typed cancellation/failure while refusing reuse.
-                if !clean || self.state != State::Running || error.fault.cancellation.is_some() {
-                    error.stop = true;
-                }
-                self.state = if error.stop { State::Failed } else { State::Ready };
-                Err(error)
-            }
-        }
-    }
-    fn finish_execution<T>(&mut self, result: Result<T, BatchItemFailure>, clean: bool) -> Result<T, BatchItemFailure> {
-        // Even an admission refusal happens after the full attempt is charged.
-        // Continuing after any execution error would renew a failed attempt.
-        self.finish_preparation(result.map_err(|mut e| { e.stop = true; e }), clean)
-    }
-}
-pub(crate) fn nonzero(work: Int4Work) -> bool {
-    work.forward_positions != 0 && work.projected_logits != 0 && work.attention_pairs != 0
-        && work.projections.dot_products != 0 && work.projections.multiply_accumulates != 0
-}
-pub(crate) fn fits(work: Int4Work, ceiling: Int4Work) -> bool {
-    work.forward_positions <= ceiling.forward_positions && work.projected_logits <= ceiling.projected_logits
-        && work.attention_pairs <= ceiling.attention_pairs && work.projections.fits(ceiling.projections)
-}
-fn subtract(a: Int4Work, b: Int4Work) -> Result<Int4Work, BatchItemFailure> {
-    let sub = |a: u64, b: u64| a.checked_sub(b).ok_or_else(|| BatchItemFailure::reject(BatchCode::WorkLimit));
-    Ok(Int4Work { forward_positions: sub(a.forward_positions, b.forward_positions)?,
-        projected_logits: sub(a.projected_logits, b.projected_logits)?, attention_pairs: sub(a.attention_pairs, b.attention_pairs)?,
-        projections: ProjectionWork { dot_products: sub(a.projections.dot_products, b.projections.dot_products)?,
-            multiply_accumulates: sub(a.projections.multiply_accumulates, b.projections.multiply_accumulates)? } })
 }
 
 #[cfg(test)] mod tests;

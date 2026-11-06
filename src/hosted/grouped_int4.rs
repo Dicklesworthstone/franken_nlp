@@ -5,7 +5,8 @@ use super::*;
 use crate::native_engine::strict_int4::weights::snapshot::Int4SnapshotError;
 mod snapshot;
 mod classify;
-pub use classify::{Int4ClassificationMapHostConfig, int4_classification_document_corpus_requirements};
+pub use classify::{Int4ClassificationMapHostConfig, int4_classification_document_corpus_requirements,
+    int4_classification_document_corpus_cohort_requirements};
 mod assay;
 pub use assay::{Int4AssayHostLimits, Int4AssayHostRequirements, Int4AssayOperation};
 mod assay_ner;

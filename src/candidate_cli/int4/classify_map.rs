@@ -75,6 +75,13 @@ impl MapArgs {
             mapping: MappingArgs::from_arg_matches(matches)? })
     }
     pub(super) fn validate(self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
+        self.validate_with_max_labels(args, 128)
+    }
+    /// A live corpus may narrow label authority for every default and override.
+    /// Existing one-off and durable workflows keep their original ceiling.
+    pub(super) fn validate_with_max_labels(self, args: &Int4Args, max_labels: usize)
+        -> Result<MapLimits, CandidateError> {
+        if !(1..=128).contains(&max_labels) { return Err(CandidateError::Arguments); }
         let mut common = self.scoring.validate(args)?;
         let m = self.mapping;
         if args.max_input_bytes < 4 || !(1..=256).contains(&m.max_chunks)
@@ -91,7 +98,8 @@ impl MapArgs {
         let aggregation = ClassificationAggregationPolicy {
             minimum_classified_coverage_ppm: m.minimum_classified_coverage_ppm };
         aggregation.validate().map_err(|_| CandidateError::Arguments)?;
-        let planning = self.scoring.classification_limits(args);
+        let mut planning = self.scoring.classification_limits(args);
+        planning.max_labels = max_labels;
         let budget = self.budget(common, planning.max_labels)?;
         let chunks = ChunkLimits { max_input_bytes: args.max_input_bytes,
             max_chunk_bytes: m.max_chunk_bytes.unwrap_or(args.max_input_bytes),

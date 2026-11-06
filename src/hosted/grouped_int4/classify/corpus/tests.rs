@@ -8,6 +8,8 @@ use crate::{artifact::converter::PINNED_REVISION, batch::BatchLimits,
         strict_int4::{Int4Work, STRICT_INT4_EXECUTION}},
     tasks::{classify::ClassificationAggregationPolicy, mapreduce::ChunkLimits}};
 
+mod cohorts;
+
 fn fixture() -> (TaskBudget, ClassificationLimits, Int4ClassificationMapLimits, CorpusLimits) {
     let task = TaskBudget { max_input_tokens: 768, max_output_tokens: 16, max_output_bytes: 65536,
         max_grammar_states: 4096, max_kv_bytes: Int4MemoryRequirement::for_context(1024, 32).unwrap().kv_bytes };
@@ -40,11 +42,12 @@ fn request(identities: &[ExecutionIdentity]) -> Int4ClassificationDocumentAdmiss
     let (task, _, mapping, _) = fixture();
     Int4ClassificationDocumentAdmission { identities, model_work: mapping.max_model_work, group_width: 32,
         required_context: 768, task_budget: task, kv_reservation_bytes: task.max_kv_bytes,
-        max_result_bytes: mapping.max_result_bytes }
+        cohort_chunks: None, head_count: 1, max_result_bytes: mapping.max_result_bytes }
 }
 fn check(request: &Int4ClassificationDocumentAdmission<'_>) -> Result<(), BatchItemFailure> {
-    let (task, _, mapping, limits) = fixture();
-    check_request(32, limits.native.context_tokens, task.max_kv_bytes, mapping, request)
+    let (task, planning, mapping, limits) = fixture();
+    check_request(32, DocumentCapacity { context: limits.native.context_tokens, kv_bytes: task.max_kv_bytes,
+        mapping, max_heads: planning.max_labels, cohort_chunks: None, max_result_bytes: mapping.max_result_bytes }, request)
 }
 
 #[test]
@@ -145,4 +148,5 @@ fn actual_full_kv_and_all_document_work_axes_are_independently_authorized() {
 fn owned_stream_crosses_only_the_existing_blocking_host_surface() {
     let _host = NlpEngine::batch_int4_classification_documents::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
     let _quote = crate::hosted::int4_classification_document_corpus_requirements;
+    let _cohorts = int4_classification_document_corpus_cohort_requirements;
 }

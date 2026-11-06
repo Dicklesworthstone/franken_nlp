@@ -18,6 +18,10 @@ struct StreamArgs {
     /// Private shared labels, mode and policy; never a document or model identity.
     #[arg(long, value_name = "FILE")]
     defaults: Option<PathBuf>,
+    /// Hard label ceiling for shared defaults and every per-record replacement.
+    /// Lower values reduce admitted multi-label KV and planning memory.
+    #[arg(long, default_value_t = 128)]
+    max_labels: usize,
     /// All nonempty records, including malformed records and flush controls.
     #[arg(long, default_value_t = 1000)]
     max_requests: u64,
@@ -46,8 +50,8 @@ impl std::fmt::Debug for CorpusArgs {
 pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
     StreamArgs::augment_args(super::definition().name("classify-corpus")
         .about("Classify ordered complete documents with one resident INT4 model")
-        .long_about("Stream bounded ordered {id,text,task_args?} NDJSON and exact {\"flush\":true} controls through one resident grouped-INT4 model and native allocation. Every document uses the complete-document classification map: lossless source partitioning, all-chunk preflight, exact full-vocabulary label/EOS scores, and a separate scalar-weighted exclusive or independent multi-label aggregate. --defaults supplies labels, mode and policy without a document, budget or model identity; a non-null task_args replaces the complete ClassificationBatchArgs under the fixed host ceiling. No partial document result escapes when a chunk fails. Earlier complete documents remain valid after a later failure. Require run_complete AND exit 0 for whole-run success. All five work flags bound the ENTIRE RUN, including failed admitted attempts, and never renew per document or flush. IDs reset only after a drained flush. Documents and their chunks execute serially; no cross-document or chunk-cohort speed claim. Source conversion and independently pinned snapshots share this route. A requested snapshot is saved after model/default admission and may remain if a later input record fails. No retained job, automatic download, backend fallback, sampling, thinking, tools, --prefill-rows, --cohort-heads or --cohort-chunks. Candidate distributions and the chunk aggregate are uncalibrated and do not establish full-context equivalence or semantic accuracy. Blocking IO observes cancellation cooperatively.")
-        .mut_arg("cohort_chunks", |arg| arg.hide(true))
+        .long_about("Stream bounded ordered {id,text,task_args?} NDJSON and exact {\"flush\":true} controls through one resident grouped-INT4 model with bounded native allocations. Every document uses the complete-document classification map: lossless source partitioning, all-chunk preflight, exact full-vocabulary label/EOS scores, and a separate scalar-weighted exclusive or independent multi-label aggregate. --defaults supplies labels, mode and policy without a document, budget or model identity; a non-null task_args replaces the complete ClassificationBatchArgs under the fixed host ceiling. --max-labels is a hard ceiling for all defaults and per-record settings, reducing admitted multi-label KV and planning memory. No partial document result escapes when a chunk fails. Earlier complete documents remain valid after a later failure. Require run_complete AND exit 0 for whole-run success. All five work flags bound the ENTIRE RUN, including failed admitted attempts, and never renew per document, chunk cohort or flush. IDs reset only after a drained flush. Documents execute sequentially. Chunks are serial by default; --cohort-chunks shares native decoder layers across independent chunks within each document. The declared chunks times actual label heads must be at most 64; invalid geometry refuses without clamping or serial fallback. Every cohort window is preflighted before that document's first forward. Source conversion and independently pinned snapshots share this route. A requested snapshot is saved after model/default admission and may remain if a later input record fails. No retained job, automatic download, backend fallback, sampling, thinking, tools, --prefill-rows or --cohort-heads. Candidate distributions and the chunk aggregate are uncalibrated and do not establish full-context equivalence or semantic accuracy. Blocking IO observes cancellation cooperatively.")
+        .mut_arg("cohort_chunks", |arg| arg.help("Share native layers across at most N chunks within each document; N times actual label heads must be <=64"))
         .mut_arg("input", |arg| arg.help("NDJSON file or '-' for stdin; one bounded complete document per record"))
         .mut_arg("max_input_bytes", |arg| arg.help("Maximum decoded complete UTF-8 document bytes per record"))
         .mut_arg("max_map_result_bytes", |arg| arg.help("Maximum complete semantic document result; event/provenance framing is additional"))
@@ -71,16 +75,11 @@ pub(in crate::candidate_cli::int4) struct CorpusLimits {
 
 impl CorpusArgs {
     pub(in crate::candidate_cli::int4) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-        if matches.value_source("cohort_chunks") == Some(clap::parser::ValueSource::CommandLine) {
-            return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
-                "complete-document classification corpora require serial chunk execution"));
-        }
         Ok(Self { document: MapArgs::from_matches(matches)?, stream: StreamArgs::from_arg_matches(matches)? })
     }
 
     pub(in crate::candidate_cli::int4) fn validate(&self, args: &Int4Args) -> Result<CorpusLimits, CandidateError> {
-        if self.document.mapping.cohort_chunks.is_some() { return Err(CandidateError::Arguments); }
-        let document = self.document.validate(args)?;
+        let document = self.document.validate_with_max_labels(args, self.stream.max_labels)?;
         let mut common = document.common;
         let s = &self.stream;
         if !(1..=100_000).contains(&s.max_requests)
@@ -124,7 +123,12 @@ impl CorpusArgs {
         let budget = self.document.budget(limits.common, limits.document.planning.max_labels)?;
         match shared::parse_defaults_with_limits(ScoreTask::Classify, limits.document.planning,
             limits.transport.max_document_bytes, text, budget)? {
-            Defaults::Classify(defaults) => Ok(defaults),
+            Defaults::Classify(defaults) => {
+                if let Some(settings) = &defaults {
+                    self.document.admit_labels(settings.labels.len(), settings.mode)?;
+                }
+                Ok(defaults)
+            },
             Defaults::Sentiment { .. } | Defaults::Judge(_) => Err(CandidateError::Input),
         }
     }

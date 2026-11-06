@@ -80,11 +80,14 @@ fn every_resource_axis_and_unsupported_schedule_refuses_before_io() {
     for flags in [vec!["--max-forward-positions", "0"], vec!["--max-projected-logits", "0"],
         vec!["--max-attention-pairs", "0"], vec!["--max-dot-products", "0"],
         vec!["--max-multiply-accumulates", "0"], vec!["--max-requests", "0"],
+        vec!["--max-labels", "0"], vec!["--max-labels", "129"],
         vec!["--max-requests", "100001"], vec!["--max-total-input-bytes", "0"],
         vec!["--max-total-input-bytes", "17179869185"], vec!["--max-total-output-bytes", "1"],
         vec!["--max-total-output-bytes", "17179869185"], vec!["--max-line-bytes", "1048575"],
         vec!["--max-line-bytes", "4194305"], vec!["--defaults", "-"],
         vec!["--max-chunks", "0"], vec!["--max-chunks", "257"],
+        vec!["--cohort-chunks", "0"], vec!["--cohort-chunks", "65"],
+        vec!["--max-chunks", "2", "--cohort-chunks", "3"],
         vec!["--max-chunk-bytes", "3"], vec!["--max-tokenizer-calls", "0"],
         vec!["--max-map-result-bytes", "0"], vec!["--max-retained-result-bytes", "0"],
         vec!["--minimum-classified-coverage-ppm", "1000001"],
@@ -94,7 +97,7 @@ fn every_resource_axis_and_unsupported_schedule_refuses_before_io() {
         assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments), "{flags:?}");
     }
     let (mut options, args) = arguments(&[]);
-    options.document.mapping.cohort_chunks = Some(1);
+    options.document.mapping.cohort_chunks = Some(65);
     assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
     let (options, mut args) = arguments(&[]);
     args.seed = Some("ab".repeat(32));
@@ -102,8 +105,8 @@ fn every_resource_axis_and_unsupported_schedule_refuses_before_io() {
 }
 
 #[test]
-fn explicit_generation_chunk_or_cross_document_schedules_are_not_ignored() {
-    for flags in [vec!["--cohort-chunks", "1"], vec!["--cohort-heads", "1"],
+fn explicit_generation_head_or_cross_document_schedules_are_not_ignored() {
+    for flags in [vec!["--cohort-heads", "1"],
         vec!["--prefill-rows", "1"], vec!["--max-new-tokens", "128"],
         vec!["--max-output-bytes", "65536"], vec!["--min-new-tokens", "0"],
         vec!["--logprobs"], vec!["--seed", "abababababababababababababababababababababababababababababababab"],
@@ -112,6 +115,78 @@ fn explicit_generation_chunk_or_cross_document_schedules_are_not_ignored() {
         all.extend_from_slice(&flags);
         assert!(parsed(&all).is_err(), "{flags:?}");
     }
+}
+
+#[test]
+fn chunk_cohorts_preserve_task_and_work_authority_and_price_every_live_native_owner() {
+    let (serial_options, args) = arguments(&[]);
+    let serial = serial_options.validate(&args).unwrap();
+    let serial_budget = serial_options.document.budget(serial.common, serial.document.planning.max_labels).unwrap();
+    for chunks in [1, 2, 4, 8] {
+        let (options, mut args) = arguments(&["--cohort-chunks", &chunks.to_string()]);
+        let grouped = options.validate(&args).unwrap();
+        assert_eq!(options.document.cohort_chunks(), Some(chunks));
+        assert_eq!(grouped.document.mapping.max_model_work, serial.document.mapping.max_model_work);
+        assert_eq!(grouped.transport.max_work, serial.transport.max_work);
+        assert_eq!(grouped.document.mapping.chunks, serial.document.mapping.chunks);
+        assert_eq!(options.document.budget(grouped.common, grouped.document.planning.max_labels).unwrap(), serial_budget);
+        let heads = grouped.document.planning.max_labels.min(MAX_INT4_SEQUENCES / chunks);
+        assert_eq!(grouped.document.memory.native.kv_bytes,
+            serial.document.memory.native.kv_bytes * (heads * chunks) as u64);
+        assert!(grouped.document.memory.input_bytes > serial.document.memory.input_bytes);
+        assert!(grouped.document.memory.output_reservation_bytes > serial.document.memory.output_reservation_bytes);
+        assert_eq!(grouped.transport.max_output_line_bytes as u64,
+            grouped.document.memory.max_output_bytes + FRAME_ALLOWANCE);
+        assert!(grouped.common.minimum_memory_bytes > serial.common.minimum_memory_bytes);
+        assert_eq!(grouped.common.native, serial.common.native,
+            "the original one-context task authority must not become the physical cohort quote");
+        args.memory_mib = grouped.common.minimum_memory_bytes.div_ceil(MIB);
+        options.validate(&args).unwrap();
+        args.memory_mib -= 1;
+        assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
+fn cohort_snapshots_have_the_same_schedule_and_complete_memory_quote_as_sources() {
+    let (source_options, source_args) = arguments(&["--cohort-chunks", "4"]);
+    let source = source_options.validate(&source_args).unwrap();
+    let pin = "ab".repeat(32);
+    let snapshot = parsed(&["--snapshot", "private.snapshot", "--expected-model-sha256", &pin,
+        "--cohort-chunks", "4"]).unwrap();
+    let Int4Task::ClassifyCorpus(options) = snapshot.task else { panic!("snapshot corpus required"); };
+    let loaded = options.validate(&snapshot.args).unwrap();
+    assert_eq!(options.document.cohort_chunks(), source_options.document.cohort_chunks());
+    assert_eq!(loaded.document.memory, source.document.memory);
+    assert_eq!(loaded.document.mapping.max_model_work, source.document.mapping.max_model_work);
+    assert_eq!(loaded.transport, source.transport);
+}
+
+#[test]
+fn explicit_label_cap_admits_four_native_rows_without_granting_more_work_or_labels() {
+    let (unrestricted, args) = arguments(&["--cohort-chunks", "2"]);
+    let full = unrestricted.validate(&args).unwrap();
+    let (options, mut args) = arguments(&["--cohort-chunks", "2", "--max-labels", "2"]);
+    let limited = options.validate(&args).unwrap();
+    assert_eq!(limited.document.planning.max_labels, 2);
+    assert_eq!(limited.document.memory.native.kv_bytes, limited.common.native.kv_bytes * 4);
+    assert_eq!(limited.document.mapping.max_model_work, full.document.mapping.max_model_work);
+    assert_eq!(limited.transport.max_work, full.transport.max_work);
+    assert!(limited.document.memory.input_bytes < full.document.memory.input_bytes);
+    assert!(limited.common.minimum_memory_bytes < full.common.minimum_memory_bytes);
+    let task = options.document.budget(limited.common, limited.document.planning.max_labels).unwrap();
+    assert_eq!(task.max_kv_bytes, limited.common.native.kv_bytes * 2);
+    let valid = r#"{"labels":[{"id":"a"},{"id":"b"}],"mode":"multi_label"}"#;
+    assert_eq!(options.load_defaults(Some(valid), limited).unwrap().unwrap().budget, task);
+    for mode in ["exclusive", "multi_label"] {
+        let invalid = format!(r#"{{"labels":[{{"id":"a"}},{{"id":"b"}},{{"id":"c"}}],"mode":"{mode}"}}"#);
+        assert_eq!(options.load_defaults(Some(&invalid), limited).err(), Some(CandidateError::Input));
+    }
+    // Quote the declared narrower capability directly, without first requiring
+    // enough process memory for the unrelated 128-label envelope.
+    args.memory_mib = limited.common.minimum_memory_bytes.div_ceil(MIB);
+    options.validate(&args).unwrap();
+    assert_eq!(unrestricted.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
 }
 
 #[test]
@@ -175,6 +250,24 @@ fn defaults_reject_duplicate_keys_unknown_authority_and_incomplete_labels() {
     }
     let input = " ".repeat(shared::DEFAULTS_BYTES + 1);
     assert_eq!(options.load_defaults(Some(&input), limits).err(), Some(CandidateError::Input));
+}
+
+#[test]
+fn fixed_defaults_refuse_oversized_chunk_head_geometry_without_native_io_or_clamping() {
+    let (options, args) = arguments(&["--cohort-chunks", "32"]);
+    let limits = options.validate(&args).unwrap();
+    let oversized = r#"{"labels":[{"id":"a"},{"id":"b"},{"id":"c"}],"mode":"multi_label"}"#;
+    assert_eq!(options.load_defaults(Some(oversized), limits).err(), Some(CandidateError::Planning));
+    let exact = r#"{"labels":[{"id":"a"},{"id":"b"}],"mode":"multi_label"}"#;
+    let settings = options.load_defaults(Some(exact), limits).unwrap().unwrap();
+    assert_eq!(settings.labels.len() * options.document.cohort_chunks().unwrap(), MAX_INT4_SEQUENCES);
+    let exclusive = r#"{"labels":[{"id":"a"},{"id":"b"},{"id":"c"}],"mode":"exclusive"}"#;
+    let settings = options.load_defaults(Some(exclusive), limits).unwrap().unwrap();
+    assert_eq!(settings.labels.len(), 3);
+    assert_eq!(settings.mode, ClassificationMode::Exclusive);
+    assert_eq!(options.document.cohort_chunks(), Some(32));
+    assert!(options.load_defaults(None, limits).unwrap().is_none(),
+        "per-record settings remain eligible for native preflight under the fixed schedule");
 }
 
 #[cfg(not(feature = "asupersync-runtime"))]

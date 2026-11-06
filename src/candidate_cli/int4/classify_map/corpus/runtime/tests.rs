@@ -16,20 +16,26 @@ fn owned_runtime_revalidates_controls_before_defaults_model_or_document_io() {
 #[test]
 fn host_quote_keeps_the_full_map_and_exact_transport_metadata_envelope() {
     for width in [3, 128, 10752] {
-        for chunks in [1, 8, 64] {
-            let command = command(&["--max-chunks", &chunks.to_string()]);
+        for (chunks, cohort_chunks, max_labels) in [(1, None, 128), (1, Some(1), 128),
+            (8, None, 128), (8, Some(4), 128), (64, None, 128), (64, Some(4), 128), (8, Some(2), 2)] {
+            let chunks_text = chunks.to_string();
+            let cohort_text = cohort_chunks.map(|count| count.to_string());
+            let labels_text = max_labels.to_string();
+            let mut flags = vec!["--max-chunks", chunks_text.as_str(), "--max-labels", labels_text.as_str()];
+            if let Some(count) = &cohort_text { flags.extend(["--cohort-chunks", count.as_str()]); }
+            let command = command(&flags);
             let Int4Task::ClassifyCorpus(options) = command.task else { panic!("classification corpus required"); };
             let mut args = command.args;
             args.group_width = width; args.max_load_mib = 65536;
             let limits = options.validate(&args).unwrap();
             let task = options.document.budget(limits.common, limits.document.planning.max_labels).unwrap();
             let host = host_limits(&args, limits, Duration::from_secs(30));
-            let quote = crate::hosted::int4_classification_document_corpus_requirements(width,
-                task, limits.document.planning, limits.document.mapping, host).unwrap();
+            let quote = memory_quote(width, task, limits, host, cohort_chunks).unwrap();
             assert_eq!(quote.native, limits.document.memory.native);
             assert_eq!(quote.workspace_bytes, limits.document.memory.workspace_bytes);
             assert_eq!(quote.output_reservation_bytes, limits.document.memory.output_reservation_bytes);
-            assert_eq!(quote.max_output_bytes, limits.document.mapping.max_result_bytes);
+            assert_eq!(quote.max_output_bytes, limits.document.memory.max_output_bytes);
+            assert_eq!(quote.max_output_bytes + FRAME_ALLOWANCE, limits.transport.max_output_line_bytes as u64);
             assert_eq!(quote.input_bytes, limits.document.memory.input_bytes
                 + corpus_buffer_bytes(limits.transport, limits.common.preparation_bytes, limits.io_bytes).unwrap()
                 + retained_metadata_bytes(chunks).unwrap());
@@ -78,11 +84,12 @@ fn cancellation_and_partial_corpus_diagnostics_retain_their_actual_scope() {
 #[test]
 fn candidate_frames_preserve_complete_native_record_bytes_and_private_paths_stay_absent() {
     let need = Int4SnapshotRequirements::for_group_width(128).unwrap();
-    for operation in [None, Some("saved"), Some("loaded")] {
+    for (operation, cohort_chunks) in [(None, None), (Some("saved"), None), (Some("loaded"), None),
+        (None, Some(1)), (Some("saved"), Some(4)), (Some("loaded"), Some(4))] {
         let provenance = Provenance {
             protocol: "fnlp-candidate-int4-classify-corpus-v1", schema_version: 1,
             scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "classify",
-            classification_mode: "complete_document", chunk_schedule: "serial",
+            classification_mode: "complete_document", chunk_schedule: chunk_schedule(cohort_chunks), cohort_chunks,
             model_id: "Nanbeige4.2-3B", source_revision: "fixture-revision",
             source_root_sha256: "fixture-source", model_content_sha256: "fixture-content",
             candidate_format: "fixture-format", quant_recipe: "fixture-recipe:group=128",
@@ -101,7 +108,13 @@ fn candidate_frames_preserve_complete_native_record_bytes_and_private_paths_stay
         let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(value["protocol"], "fnlp-candidate-int4-classify-corpus-v1");
         assert_eq!(value["classification_mode"], "complete_document");
-        assert_eq!(value["chunk_schedule"], "serial");
+        if let Some(chunks) = cohort_chunks {
+            assert_eq!(value["chunk_schedule"], "native_chunk_cohorts");
+            assert_eq!(value["cohort_chunks"], chunks);
+        } else {
+            assert_eq!(value["chunk_schedule"], "serial");
+            assert!(value.get("cohort_chunks").is_none(), "serial provenance stays wire-compatible");
+        }
         assert_eq!(value["evidence"], "non_authoritative");
         assert_eq!(value["record"]["result"]["single_context_equivalence"], false);
         if let Some(operation) = operation {
@@ -166,7 +179,20 @@ fn model_present_resident_documents_match_maps_and_flush_does_not_renew_work() {
         args.memory_mib = memory; args.kernel = kernel; args.context_tokens = 2048;
         args.timeout_seconds = 86_400;
     };
-    let flags = ["--max-chunks", "8", "--max-chunk-bytes", "64"];
+    let mut serial_results = Vec::new();
+    for cohort_chunks in [None, Some(2)] {
+        assert_native_corpus_schedule(&configure, cohort_chunks, &pin, &mut serial_results);
+    }
+    println!("{COMPLETE}");
+}
+
+fn assert_native_corpus_schedule(configure: &impl Fn(&mut Int4Args), cohort_chunks: Option<usize>,
+    pin: &str, serial_results: &mut Vec<Vec<u8>>) {
+    let mut flags = vec!["--max-chunks", "8", "--max-chunk-bytes", "64"];
+    let cohort_text = cohort_chunks.map(|chunks| chunks.to_string());
+    if let Some(chunks) = &cohort_text { flags.extend(["--cohort-chunks", chunks.as_str()]); }
+    let standalone_flags = flags.clone();
+    flags.extend(["--max-labels", "2"]);
     let command = command(&flags);
     let Int4Task::ClassifyCorpus(options) = command.task else { panic!("classification corpus required"); };
     let mut args = command.args; configure(&mut args);
@@ -203,16 +229,34 @@ fn model_present_resident_documents_match_maps_and_flush_does_not_renew_work() {
         assert_eq!(value["record"]["caller_id"], "reused");
         assert_eq!(value["record"]["epoch"], index + 1);
         assert_eq!(value["record"]["request_seq"], 2 * index + 1);
-        let result = &value["record"]["result"];
+        assert_eq!(value["chunk_schedule"], chunk_schedule(cohort_chunks));
+        let wrapper = &value["record"]["result"];
+        let result = if cohort_chunks.is_some() { &wrapper["output"] } else { wrapper };
         assert!(result["chunks"].as_array().unwrap().len() > 1);
         assert_eq!(result["single_context_equivalence"], false);
-        let mut standalone = crate::candidate_cli::int4::classify_map::tests::command(&flags);
+        let mut standalone = crate::candidate_cli::int4::classify_map::tests::command(&standalone_flags);
         configure(&mut standalone.args);
         let mut bytes = Vec::new();
         standalone.execute(&mut io::Cursor::new(serde_json::to_vec(&requests[index]).unwrap()), &mut bytes).unwrap();
         let standalone: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(canonjson::canonical_bytes(result).unwrap(),
             canonjson::canonical_bytes(&standalone["output"]).unwrap());
+        if let Some(chunks) = cohort_chunks {
+            assert_eq!(value["cohort_chunks"], chunks);
+            assert_eq!(wrapper["execution"], "grouped-int4-classification-chunk-cohorts-v1");
+            assert_eq!(wrapper["chunk_cohorts"], result["chunks"].as_array().unwrap().len().div_ceil(chunks));
+            assert!(wrapper["group_steps"].as_u64().unwrap() > 0);
+            assert!(wrapper["projection_groups"].as_u64().unwrap() > 0);
+            for field in ["schema_version", "execution", "chunk_cohorts", "group_steps", "projection_groups"] {
+                assert_eq!(wrapper[field], standalone["cohort"][field]);
+            }
+            assert_eq!(canonjson::canonical_bytes(result).unwrap(), serial_results[index],
+                "shared layers must preserve every original chunk score and aggregate");
+        } else {
+            assert!(value.get("cohort_chunks").is_none());
+            assert!(wrapper.get("output").is_none());
+            serial_results.push(canonjson::canonical_bytes(result).unwrap());
+        }
     }
     let footer = &events.last().unwrap()["record"];
     assert_eq!(footer["event"], "run_complete");
@@ -223,7 +267,9 @@ fn model_present_resident_documents_match_maps_and_flush_does_not_renew_work() {
     // Set every native axis to the first document's exact work. The drained
     // flush can reuse the ID, but it cannot fund the second document. A later
     // malformed row remains a separate ordered error and never erases doc 1.
-    let first = &results[0]["record"]["result"]["planned_model_work"];
+    let first = &results[0]["record"]["result"];
+    let first = if cohort_chunks.is_some() { &first["output"] } else { first };
+    let first = &first["planned_model_work"];
     let work: crate::native_engine::strict_int4::Int4Work = serde_json::from_value(first.clone()).unwrap();
     let values = [work.forward_positions.to_string(), work.projected_logits.to_string(),
         work.attention_pairs.to_string(), work.projections.dot_products.to_string(),
@@ -257,5 +303,4 @@ fn model_present_resident_documents_match_maps_and_flush_does_not_renew_work() {
     assert_eq!(footer["summary"]["reserved_work"]["projected_logits"], work.projected_logits);
     let resources = crate::installed_process_resources().unwrap();
     assert_eq!(resources.outstanding_closure_snapshot().active_closures, 0);
-    println!("{COMPLETE}");
 }

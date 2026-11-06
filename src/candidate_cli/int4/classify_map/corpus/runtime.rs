@@ -76,13 +76,18 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let planner = Int4ClassificationDocumentBatchPlanner::new(planner, defaults,
         limits.document.mapping, limits.document.mapping.max_model_work)
         .map_err(|fault| fault.cancellation.map(stopped).unwrap_or(CandidateError::Planning))?;
+    let cohort_chunks = command.document.cohort_chunks();
+    let planner = if let Some(chunks) = cohort_chunks {
+        planner.with_chunk_cohorts(chunks, Int4ClassificationMapMemoryLimits {
+            context_tokens: args.context_tokens, preparation_reserve_bytes: common.preparation_bytes,
+            allocator_reserve_bytes: ALLOCATOR_BYTES,
+        }).map_err(|fault| fault.cancellation.map(stopped).unwrap_or(CandidateError::Planning))?
+    } else { planner };
     if planner.group_width() != model.model_identity().group_width() { return Err(CandidateError::Identity); }
     let mut host = host_limits(&args, limits, remaining()?);
     // Validate the complete fixed host envelope before an optional snapshot
     // save. Future NDJSON documents are still admitted incrementally.
-    let quote = crate::hosted::int4_classification_document_corpus_requirements(
-        args.group_width, budget, limits.document.planning, limits.document.mapping, host)
-        .map_err(|error| host_error(error, CandidateError::Planning))?;
+    let quote = memory_quote(args.group_width, budget, limits, host, cohort_chunks)?;
     if quote.native != limits.document.memory.native || quote.workspace_bytes != limits.document.memory.workspace_bytes
         || quote.output_reservation_bytes != limits.document.memory.output_reservation_bytes
         || quote.max_output_bytes != limits.document.memory.max_output_bytes
@@ -106,7 +111,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let provenance = Provenance {
         protocol: "fnlp-candidate-int4-classify-corpus-v1", schema_version: 1,
         scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "classify",
-        classification_mode: "complete_document", chunk_schedule: "serial",
+        classification_mode: "complete_document", chunk_schedule: chunk_schedule(cohort_chunks), cohort_chunks,
         model_id: "Nanbeige4.2-3B", source_revision: &identity.source_revision,
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
@@ -138,6 +143,23 @@ fn host_limits(args: &Int4Args, limits: CorpusLimits, remaining: Duration) -> Ho
     }
 }
 
+fn memory_quote(width: usize, task: TaskBudget, limits: CorpusLimits, host: HostCorpusLimits,
+    cohort_chunks: Option<usize>) -> Result<Int4ClassificationMapMemoryRequirement, CandidateError> {
+    if let Some(chunks) = cohort_chunks {
+        crate::hosted::int4_classification_document_corpus_cohort_requirements(width, task,
+            limits.document.planning, limits.document.mapping, host, chunks)
+            .map(|quote| quote.memory).map_err(|error| host_error(error, CandidateError::Planning))
+    } else {
+        crate::hosted::int4_classification_document_corpus_requirements(width, task,
+            limits.document.planning, limits.document.mapping, host)
+            .map_err(|error| host_error(error, CandidateError::Planning))
+    }
+}
+
+fn chunk_schedule(cohort_chunks: Option<usize>) -> &'static str {
+    if cohort_chunks.is_some() { "native_chunk_cohorts" } else { "serial" }
+}
+
 #[derive(Serialize)]
 struct SnapshotRecord { operation: &'static str, format: &'static str, file_bytes: u64 }
 impl SnapshotRecord {
@@ -149,6 +171,8 @@ impl SnapshotRecord {
 struct Provenance<'a> {
     protocol: &'static str, schema_version: u32, scope: &'static str, evidence: &'static str, task: &'static str,
     classification_mode: &'static str, chunk_schedule: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cohort_chunks: Option<usize>,
     model_id: &'static str, source_revision: &'a str, source_root_sha256: &'a str, model_content_sha256: &'a str,
     candidate_format: &'a str, quant_recipe: &'a str, group_width: usize, integer_kernel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]

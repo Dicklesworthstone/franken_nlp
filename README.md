@@ -792,7 +792,7 @@ controller gates.
 
 `fnlp candidate source-int4 classify-corpus` applies complete-document
 classification to ordered `{id,text,task_args?}` NDJSON while retaining one
-grouped-INT4 model and native engine for the entire stream. Each document is
+grouped-INT4 model for the entire stream. Each document is
 losslessly partitioned according to its exact label prompts and context
 capacity. Every chunk is planned before that document's first native forward;
 the completed result retains the original byte/scalar spans, complete chunk
@@ -822,14 +822,33 @@ bounds the retained chunk frontier, and `--max-map-result-bytes` bounds the
 complete document result. Transport and provenance framing are priced
 separately. Memory admission includes all retained plans and results, frozen
 chunk identities, complete native KV/scratch, defaults and transport staging.
-Documents and chunks execute serially; this route refuses `--cohort-chunks`,
-`--cohort-heads`, `--prefill-rows` and generation controls.
+Documents execute sequentially and chunks execute serially by default. Add
+`--cohort-chunks 4` to share native decoder layers across independent chunks
+within each document. The declared chunk width times the actual label heads
+must be at most 64: exclusive classification uses one head, while multi-label
+classification uses one head per label. Oversized geometry is refused without
+clamping the width or switching to serial execution. Each document preflights
+all its native windows before its first forward. Cohort execution reserves the
+full simultaneous KV, scratch, task workspace and result frontier; it can
+therefore require a larger `--memory-mib` ceiling. The model stays resident,
+while each native cohort window owns its bounded allocation. This route
+refuses `--cohort-heads`, `--prefill-rows` and generation controls. It makes no
+cross-document scheduling or measured speedup claim.
+
+Use `--max-labels N` to declare a smaller capability ceiling for **all** defaults
+and per-record replacements. The default is 128; accepted values are 1–128.
+For example, `--max-labels 2 --cohort-chunks 2` reserves four simultaneous
+native rows and refuses any three-label record, including exclusive mode.
+The unchanged 128-label ceiling can otherwise require reservation for 64
+native rows. A small defaults file alone does not reduce this ceiling, because
+later records can replace the complete settings. Narrowing label authority
+does not grant additional native work.
 
 The five work flags—`--max-forward-positions`, `--max-projected-logits`,
 `--max-attention-pairs`, `--max-dot-products` and
 `--max-multiply-accumulates`—bound the **entire invocation**. They are never
-multiplied by document count or renewed by a flush. Admitted failed attempts
-retain their charges. The checkpoint allowance and deadline also cover the
+multiplied by document count or renewed by a chunk cohort or flush. Admitted
+failed attempts retain their charges. The checkpoint allowance and deadline also cover the
 whole stream. Blocking IO observes cancellation cooperatively.
 
 Shared defaults contain labels, optional mode and policy, with the task budget
@@ -843,7 +862,11 @@ the model, fixed defaults and host envelope; a later input failure can leave
 that requested snapshot in place.
 
 Events use `fnlp-candidate-int4-classify-corpus-v1`, with the standard ordered
-batch record under `record` and each completed map under `record.result`.
+batch record under `record`. Serial execution preserves each completed map
+under `record.result`. An explicit cohort run adds `cohort_chunks` and
+`chunk_schedule: "native_chunk_cohorts"` to provenance; `record.result` then
+contains the native cohort execution identifier, window/projection statistics
+and the unchanged semantic map under `record.result.output`.
 An exact `{"flush":true}` drains the current ID epoch before IDs may be reused;
 it grants no new compute. No partial document is published after a failed
 chunk. Earlier completed documents remain usable if a later record fails, but
@@ -853,10 +876,13 @@ corpus route provides no durable resume protocol.
 
 Library callers use `Int4ClassificationDocumentBatchPlanner` and
 `NlpEngine::batch_int4_classification_documents` with owned reader/writer and
-`CorpusLimits`. The pure `int4_classification_document_corpus_requirements`
-helper prices the complete hosted envelope before IO. Model-free regression
-sources and an explicitly ignored full-model corpus/standalone equivalence
-fixture are included; compilation, native parity and task quality remain
+`CorpusLimits`. The planner's explicit `with_chunk_cohorts` selects the same
+bounded schedule. The pure `int4_classification_document_corpus_requirements`
+and `int4_classification_document_corpus_cohort_requirements` helpers price the
+complete hosted envelope before IO. Model-free regression sources and an
+explicitly ignored full-model fixture compare serial and cohort corpus results
+with standalone maps and check cumulative work across flush. Compilation,
+native parity and task quality remain
 subject to their separate controller validation gates.
 
 ## Implemented candidate INT4 scoring jobs

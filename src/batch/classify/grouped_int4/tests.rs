@@ -1,29 +1,29 @@
 //! Pure ownership/accounting regressions. Native corpus/map equivalence is
 //! exercised separately by the explicitly armed CLI model fixture.
 use super::*;
-use crate::{canonjson, native_engine::decode::DecodeCancellationKind,
+use crate::{canonjson, native_engine::{decode::DecodeCancellationKind, portable_int8::ProjectionWork},
     tasks::{classify::{ClassificationAggregationPolicy, ClassificationPolicy, ClassificationPlanningError},
         mapreduce::ChunkLimits}};
 
-fn work(units: u64) -> Int4Work {
+pub(super) fn work(units: u64) -> Int4Work {
     Int4Work { forward_positions: 40 * units, projected_logits: 50 * units, attention_pairs: 60 * units,
         projections: ProjectionWork { dot_products: 70 * units, multiply_accumulates: 80 * units } }
 }
-fn task() -> TaskBudget {
+pub(super) fn task() -> TaskBudget {
     TaskBudget { max_input_tokens: 768, max_output_tokens: 16, max_output_bytes: 65536,
         max_grammar_states: 4096, max_kv_bytes: Int4MemoryRequirement::for_context(1024, 32).unwrap().kv_bytes }
 }
-fn planning() -> ClassificationLimits {
+pub(super) fn planning() -> ClassificationLimits {
     ClassificationLimits { max_labels: 4, max_input_bytes: 4096, max_total_label_bytes: 1024,
         max_context_tokens: 1024, ..Default::default() }
 }
-fn mapping() -> Int4ClassificationMapLimits {
+pub(super) fn mapping() -> Int4ClassificationMapLimits {
     Int4ClassificationMapLimits { chunks: ChunkLimits { max_input_bytes: 4096, max_chunk_bytes: 8,
         max_chunk_tokens: 768, context_tokens: 1024, reserved_tokens: 16, max_chunks: 64, max_tokenizer_calls: 4096 },
         max_model_work: work(4), max_retained_result_bytes: 1024 * 1024, max_result_bytes: 1024 * 1024,
         aggregation: ClassificationAggregationPolicy::default() }
 }
-fn args() -> ClassificationBatchArgs {
+pub(super) fn args() -> ClassificationBatchArgs {
     ClassificationBatchArgs { labels: ["alpha", "beta"].map(|id| ClassificationLabel {
         id: id.to_owned(), description: format!("Private description of {id}") }).to_vec(),
         mode: ClassificationMode::Exclusive, policy: ClassificationPolicy::default(), budget: task() }
@@ -31,7 +31,7 @@ fn args() -> ClassificationBatchArgs {
 fn context(seq: u64, epoch: u64) -> BatchRequestContext {
     BatchRequestContext { request_seq: seq, epoch, input_line: seq, byte_offset: 0 }
 }
-fn document(task_args: Option<ClassificationBatchArgs>) -> BatchDocument<ClassificationBatchArgs> {
+pub(super) fn document(task_args: Option<ClassificationBatchArgs>) -> BatchDocument<ClassificationBatchArgs> {
     BatchDocument { id: "not-a-semantic-key".to_owned(), text: "é\r\n𐐀 <think> exact tail".to_owned(), task_args }
 }
 fn lower(work: &mut Int4Work, axis: usize) {
@@ -140,11 +140,11 @@ fn successful_documents_across_flush_epochs_never_renew_the_native_budget() {
         run.enter().unwrap(); run.charge(work(1), context(sequence, epoch)).unwrap();
         run.finish_execution(Ok(()), true).unwrap();
     }
-    assert_eq!(run.remaining, work(0));
+    assert_eq!(run.remaining(), work(0));
     run.enter().unwrap();
-    let error = subtract(run.remaining, work(1)).unwrap_err();
+    let error = subtract(run.remaining(), work(1)).unwrap_err();
     assert_eq!(run.finish_preparation::<()>(Err(error), true).unwrap_err().fault.code, BatchCode::WorkLimit);
-    assert_eq!(run.state, State::Ready); assert_eq!(run.remaining, work(0));
+    assert!(!run.is_unavailable()); assert_eq!(run.remaining(), work(0));
 }
 
 #[test]
@@ -154,14 +154,14 @@ fn execution_refusal_and_unwind_keep_the_entire_attempt_debited_and_stop_reuse()
         run.charge(work(1), context(1, 1)).unwrap();
         let failure = run.finish_execution::<()>(Err(BatchItemFailure::reject(BatchCode::Admission)), clean).unwrap_err();
         assert!(failure.stop); assert_eq!(failure.fault.code, BatchCode::Admission);
-        assert_eq!(run.remaining, work(1)); assert_eq!(run.state, State::Failed); assert!(run.enter().is_err());
+        assert_eq!(run.remaining(), work(1)); assert!(run.is_unavailable()); assert!(run.enter().is_err());
     }
     let mut run = RunState::new(work(2));
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run.enter().unwrap(); run.charge(work(1), context(1, 1)).unwrap();
         panic!("private lifecycle fixture");
     }));
-    assert!(panic.is_err()); assert_eq!(run.remaining, work(1)); assert!(run.enter().is_err());
+    assert!(panic.is_err()); assert_eq!(run.remaining(), work(1)); assert!(run.enter().is_err());
 }
 
 #[test]
@@ -174,7 +174,7 @@ fn every_cancellation_cause_survives_poisoned_native_settlement() {
         let mut run = RunState::new(work(2)); run.enter().unwrap(); run.charge(work(1), context(1, 1)).unwrap();
         let settled = run.finish_execution::<()>(Err(failure), false).unwrap_err();
         assert!(settled.stop); assert_eq!(settled.fault, BatchFault::cancelled(cause));
-        assert_eq!(run.remaining, work(1)); assert_eq!(run.state, State::Failed);
+        assert_eq!(run.remaining(), work(1)); assert!(run.is_unavailable());
     }
 }
 
@@ -185,11 +185,11 @@ fn stale_delivery_context_and_dirty_success_cannot_reenter_a_finished_native_att
     run.enter().unwrap();
     let error = run.charge(work(1), context(2, 2)).unwrap_err();
     assert_eq!(error.fault.code, BatchCode::InvalidExecution);
-    assert_eq!(run.remaining, work(2));
+    assert_eq!(run.remaining(), work(2));
     assert!(run.finish_execution::<()>(Err(error), true).unwrap_err().stop);
     let mut dirty = RunState::new(work(1)); dirty.enter().unwrap();
     assert_eq!(dirty.finish_execution(Ok(()), false).unwrap_err().fault.code, BatchCode::InvalidExecution);
-    assert_eq!(dirty.state, State::Failed);
+    assert!(dirty.is_unavailable());
 }
 
 #[test]
@@ -198,4 +198,5 @@ fn preparation_and_publication_owners_fit_the_existing_physical_host_boundary() 
     send::<Int4ClassificationDocumentBatchPlanner>();
     send::<PreparedInt4ClassificationDocument>();
     send::<Int4ClassificationMapRun>();
+    send::<Int4ClassificationDocumentRun>();
 }

@@ -8,7 +8,8 @@ use crate::{native_engine::strict_int4::{prefill::Int4PrefillLimits, scoring::In
 mod long;
 pub use long::Int4ClassificationMapHostConfig;
 mod corpus;
-pub use corpus::int4_classification_document_corpus_requirements;
+pub use corpus::{int4_classification_document_corpus_requirements,
+    int4_classification_document_corpus_cohort_requirements};
 
 impl NlpEngine {
     /// Execute all classification heads under one existing host call. A
