@@ -2530,6 +2530,8 @@ fn drain_reason_for_run_error(error: &SealedTeamRunError) -> TeamDrainReason {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SealedTeamLaunchError {
     InvalidTeamWidth,
+    ChildLimitExceeded { requested: usize, maximum: usize },
+    Reentrant(ReentrantCall),
     MissingRequestContext,
     SpawnBlocking { detail: String },
 }
@@ -2540,6 +2542,15 @@ impl fmt::Display for SealedTeamLaunchError {
         match self {
             Self::InvalidTeamWidth => {
                 formatter.write_str("sealed scoped-CPU team width must include its coordinator")
+            }
+            Self::ChildLimitExceeded { requested, maximum } => {
+                write!(
+                    formatter,
+                    "sealed scoped-CPU team requests {requested} children, exceeding the host limit of {maximum}"
+                )
+            }
+            Self::Reentrant(error) => {
+                write!(formatter, "sealed scoped-CPU team entry refused: {error}")
             }
             Self::MissingRequestContext => {
                 formatter.write_str("sealed scoped-CPU team requires an asupersync request context")
@@ -2555,7 +2566,14 @@ impl fmt::Display for SealedTeamLaunchError {
 }
 
 #[cfg(feature = "asupersync-runtime")]
-impl std::error::Error for SealedTeamLaunchError {}
+impl std::error::Error for SealedTeamLaunchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Reentrant(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 #[cfg(feature = "asupersync-runtime")]
 impl SealedCpuTeam {
@@ -3009,6 +3027,27 @@ impl EngineResources {
             .expect("feature-enabled test host must retain a real blocking pool")
     }
 
+    /// Share one re-entry boundary between the synchronous engine facade and
+    /// lease-owned runtime launchers. Refusal never changes the outer marker.
+    fn enter_sync_call(self: &Arc<Self>) -> Result<EngineCallGuard, ReentrantCall> {
+        if is_runtime_worker_thread() {
+            return Err(ReentrantCall::RuntimeWorker);
+        }
+        let resource_key = Arc::as_ptr(self) as usize;
+        ACTIVE_SYNC_RESOURCE.with(|active| {
+            if active.get().is_some() {
+                return Err(ReentrantCall::NestedSyncCall);
+            }
+            active.set(Some(resource_key));
+            Ok(EngineCallGuard {
+                resource_key,
+                // A guard restores a thread-local entry on Drop and therefore
+                // must never cross to a different thread.
+                _not_send_or_sync: PhantomData,
+            })
+        })
+    }
+
     /// Fixed configuration selected by the first successful installation.
     pub const fn config(&self) -> ResourceHostConfig {
         self.config
@@ -3260,11 +3299,13 @@ impl EngineLease {
     /// its physical closure retains the completion guard until `scoped_cpu`
     /// has joined every fixed child and the closure returns.
     ///
-    /// This is the foundation seam, not a scheduler shortcut: callers supply
-    /// the already-admitted effective team width. The coordinator keeps one
-    /// deterministic shard, while the scope creates at most `width - 1`
-    /// children. Later stage schedulers attach their capacity-one
-    /// command/reply loops without creating another team.
+    /// This is the foundation seam, not a scheduler shortcut: the requested
+    /// effective team width must fit the fixed host envelope before runtime
+    /// entry or completion registration. The coordinator keeps one shard,
+    /// while the scope creates at most `width - 1` children. Later stage
+    /// schedulers attach their capacity-one command/reply loops without
+    /// creating another team. Runtime-worker and synchronous re-entry fail
+    /// before a nested `block_on` can occur.
     #[cfg(feature = "asupersync-runtime")]
     pub fn spawn_sealed_cpu_checkpoint_team(
         &self,
@@ -3277,6 +3318,17 @@ impl EngineLease {
 
         let child_count = scoped_cpu_child_cap(effective_compute_team_width)
             .ok_or(SealedTeamLaunchError::InvalidTeamWidth)?;
+        let maximum = self.resources.config.scoped_cpu_children_per_coordinator;
+        if child_count > maximum {
+            return Err(SealedTeamLaunchError::ChildLimitExceeded {
+                requested: child_count,
+                maximum,
+            });
+        }
+        let _sync_call = self
+            .resources
+            .enter_sync_call()
+            .map_err(SealedTeamLaunchError::Reentrant)?;
         let completion_guard = self.register_blocking_closure();
         self.resources.runtime().block_on(async move {
             let request_cx = Cx::current().ok_or(SealedTeamLaunchError::MissingRequestContext)?;
@@ -3440,22 +3492,7 @@ impl NlpEngine {
     /// worker thread or recursively from a synchronous engine call returns a
     /// typed failure instead of attempting `block_on`.
     pub fn enter_sync_call(&self) -> Result<EngineCallGuard, ReentrantCall> {
-        if is_runtime_worker_thread() {
-            return Err(ReentrantCall::RuntimeWorker);
-        }
-        let resource_key = Arc::as_ptr(self.resources()) as usize;
-        ACTIVE_SYNC_RESOURCE.with(|active| {
-            if active.get().is_some() {
-                return Err(ReentrantCall::NestedSyncCall);
-            }
-            active.set(Some(resource_key));
-            Ok(EngineCallGuard {
-                resource_key,
-                // A guard restores a thread-local entry on Drop and therefore
-                // must never cross to a different thread.
-                _not_send_or_sync: PhantomData,
-            })
-        })
+        self.resources().enter_sync_call()
     }
 }
 
@@ -3705,6 +3742,55 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn sealed_team_width_refusals_leave_the_host_unchanged() {
+        for config in [coordinator_only_config(), config()] {
+            let broker = ResourceBroker::isolated_for_test();
+            let resources = broker.install(config).expect("bounded host installs");
+            let lease = resources.acquire_lease();
+            let maximum = config.scoped_cpu_children_per_coordinator;
+            let memory = resources.memory_snapshot();
+            let outstanding = resources.outstanding_closure_snapshot();
+            let next_closure_id = resources.next_closure_id.load(Ordering::Relaxed);
+            let leases = resources.active_lease_count();
+
+            for (width, expected) in [
+                (0, SealedTeamLaunchError::InvalidTeamWidth),
+                (
+                    maximum + 2,
+                    SealedTeamLaunchError::ChildLimitExceeded {
+                        requested: maximum + 1,
+                        maximum,
+                    },
+                ),
+                (
+                    usize::MAX,
+                    SealedTeamLaunchError::ChildLimitExceeded {
+                        requested: usize::MAX - 1,
+                        maximum,
+                    },
+                ),
+            ] {
+                assert_eq!(
+                    lease.spawn_sealed_cpu_checkpoint_team(width).expect_err(
+                        "invalid or over-envelope width must fail before native allocation"
+                    ),
+                    expected,
+                );
+                assert_eq!(resources.memory_snapshot(), memory);
+                assert_eq!(resources.outstanding_closure_snapshot(), outstanding);
+                assert_eq!(
+                    resources.next_closure_id.load(Ordering::Relaxed),
+                    next_closure_id,
+                    "even a transient closure registration would consume an id"
+                );
+                assert_eq!(resources.active_lease_count(), leases);
+                assert_eq!(ACTIVE_SYNC_RESOURCE.with(Cell::get), None);
+            }
+        }
+    }
+
     #[test]
     fn pinned_guardrails_are_finite_and_nonzero() {
         let guardrails = RuntimeGuardrails::PINNED_DEFAULTS;
@@ -3863,6 +3949,81 @@ mod tests {
         drop(recovered);
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn sealed_team_reentry_preserves_the_outer_engine_guard() {
+        let broker = ResourceBroker::isolated_for_test();
+        let resources = broker.install(coordinator_only_config()).unwrap();
+        let engine = NlpEngine {
+            lease: resources.acquire_lease(),
+        };
+        let outer = engine.enter_sync_call().expect("first entry is admitted");
+        let resource_key = Arc::as_ptr(&resources) as usize;
+        let memory = resources.memory_snapshot();
+        let next_closure_id = resources.next_closure_id.load(Ordering::Relaxed);
+
+        assert_eq!(
+            engine.lease.spawn_sealed_cpu_checkpoint_team(1).unwrap_err(),
+            SealedTeamLaunchError::Reentrant(ReentrantCall::NestedSyncCall)
+        );
+        assert_eq!(ACTIVE_SYNC_RESOURCE.with(Cell::get), Some(resource_key));
+        assert_eq!(
+            engine.enter_sync_call().unwrap_err(),
+            ReentrantCall::NestedSyncCall,
+            "the launch refusal cannot release the outer synchronous entry"
+        );
+        assert_eq!(resources.memory_snapshot(), memory);
+        assert_eq!(resources.outstanding_closure_snapshot().active_closures, 0);
+        assert_eq!(
+            resources.next_closure_id.load(Ordering::Relaxed),
+            next_closure_id
+        );
+
+        drop(outer);
+        assert_eq!(ACTIVE_SYNC_RESOURCE.with(Cell::get), None);
+        drop(engine.enter_sync_call().expect("outer drop restores admission"));
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn sealed_team_and_engine_refuse_real_runtime_worker_reentry() {
+        let broker = ResourceBroker::isolated_for_test();
+        let resources = broker.install(config()).unwrap();
+        let memory = resources.memory_snapshot();
+        let next_closure_id = resources.next_closure_id.load(Ordering::Relaxed);
+        let worker_resources = Arc::clone(&resources);
+        let worker = resources.runtime().handle().spawn(async move {
+            assert!(
+                is_runtime_worker_thread(),
+                "this regression must execute on a real configured worker"
+            );
+            assert_eq!(ACTIVE_SYNC_RESOURCE.with(Cell::get), None);
+            let engine = NlpEngine {
+                lease: worker_resources.acquire_lease(),
+            };
+            let team_error = engine.lease.spawn_sealed_cpu_checkpoint_team(1)
+                .expect_err("worker must refuse before nested block_on");
+            let engine_error = engine.enter_sync_call()
+                .expect_err("library entry must share the same worker refusal");
+            assert_eq!(ACTIVE_SYNC_RESOURCE.with(Cell::get), None);
+            (team_error, engine_error)
+        });
+        let (team_error, engine_error) = resources.runtime().block_on(worker);
+        assert_eq!(
+            team_error,
+            SealedTeamLaunchError::Reentrant(ReentrantCall::RuntimeWorker)
+        );
+        assert_eq!(engine_error, ReentrantCall::RuntimeWorker);
+        assert_eq!(resources.memory_snapshot(), memory);
+        assert_eq!(resources.outstanding_closure_snapshot().active_closures, 0);
+        assert_eq!(
+            resources.next_closure_id.load(Ordering::Relaxed),
+            next_closure_id
+        );
+        assert_eq!(resources.active_lease_count(), 0);
+        assert_eq!(ACTIVE_SYNC_RESOURCE.with(Cell::get), None);
+    }
+
     #[test]
     fn cancelled_wrapper_remains_outstanding_until_closure_drop() {
         let broker = ResourceBroker::isolated_for_test();
@@ -3916,27 +4077,30 @@ mod tests {
             "a pre-entry refusal must not retain a completion latch"
         );
 
-        let mut handle = lease
-            .spawn_sealed_cpu_checkpoint_team(4)
-            .expect("one coordinator and three sealed children launch");
-        let joined = resources.runtime().block_on(async {
-            let request_cx = asupersync::cx::Cx::current()
-                .expect("runtime block_on installs the ambient request context");
-            handle.join(&request_cx).await
-        });
-        let snapshot = joined
-            .expect("blocking wrapper joins without a task failure")
-            .expect("sealed scoped CPU region completes");
-        assert_eq!(snapshot.phase, SealedTeamPhase::Joined);
-        assert_eq!(snapshot.expected_children, 3);
-        assert_eq!(snapshot.formed_children, 3);
-        assert_eq!(snapshot.exited_children, 3);
-        assert_eq!(snapshot.drain_reason, Some(TeamDrainReason::Completed));
-        assert_eq!(
-            resources.outstanding_closure_snapshot().active_closures,
-            0,
-            "the physical closure drops its latch only after the scoped join"
-        );
+        for width in 1..=4 {
+            let mut handle = lease
+                .spawn_sealed_cpu_checkpoint_team(width)
+                .expect("every width within the configured envelope launches");
+            let joined = resources.runtime().block_on(async {
+                let request_cx = asupersync::cx::Cx::current()
+                    .expect("runtime block_on installs the ambient request context");
+                handle.join(&request_cx).await
+            });
+            let snapshot = joined
+                .expect("blocking wrapper joins without a task failure")
+                .expect("sealed scoped CPU region completes");
+            assert_eq!(snapshot.phase, SealedTeamPhase::Joined);
+            assert_eq!(snapshot.expected_children, width - 1);
+            assert_eq!(snapshot.formed_children, width - 1);
+            assert_eq!(snapshot.exited_children, width - 1);
+            assert_eq!(snapshot.drain_reason, Some(TeamDrainReason::Completed));
+            assert_eq!(
+                resources.outstanding_closure_snapshot().active_closures,
+                0,
+                "the physical closure drops its latch only after the scoped join"
+            );
+            assert_eq!(ACTIVE_SYNC_RESOURCE.with(Cell::get), None);
+        }
     }
 
     fn admission_config(memory_ceiling_bytes: u64) -> ResourceHostConfig {
