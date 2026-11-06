@@ -42,8 +42,35 @@ Every request is an explicit byte range and sends:
 The pinned asupersync client is configured with no automatic redirects, no
 automatic retries, no cookies, a finite request timeout and a body cap no larger
 than the largest declared release part. Redirects are followed explicitly so
-that every hop can be checked. Only absolute HTTPS redirect targets are
-accepted. Mirror URLs are attempted sequentially in manifest order.
+that every hop is checked **before** the next request is constructed. Every
+target must be an absolute HTTPS URL with a plain ASCII hostname, no userinfo,
+no explicit port (including `:443`), and no whitespace, controls, backslashes or
+fragment. The check uses the exact selected asupersync revision's
+[`ParsedUrl` parser](https://github.com/Dicklesworthstone/asupersync/blob/362dc5b174427f66cfa76ab2bdd68cce1a95c6cc/src/http/h1/http_client.rs)
+after the stricter product authority checks. Policy refusal messages omit the
+URL and its potentially sensitive signed query.
+
+Redirect authority remains bound to the original manifest mirror throughout
+the attempt:
+
+- A custom mirror may redirect to its own exact hostname, compared without
+  case sensitivity. Subdomains, sibling mirrors and suffix lookalikes do not
+  inherit permission.
+- A mirror originally on `github.com` may also redirect to the exact hosts
+  `release-assets.githubusercontent.com`, `objects.githubusercontent.com` and
+  `github-releases.githubusercontent.com`. These names come from GitHub's
+  [documented download-domain inventory](https://docs.github.com/en/actions/reference/runners/self-hosted-runners#accessible-domains-by-function):
+  the release-assets host and two existing GitHub download hosts. No wildcard
+  `githubusercontent.com`, Azure or S3 permission is granted.
+- An accepted asset-host hop cannot broaden the original policy. A custom
+  mirror that uses another CDN must keep the request on its declared hostname;
+  arbitrary cross-host private-CDN redirects are refused.
+
+Signed paths and queries are forwarded byte for byte, including percent
+escapes and query parameters. Redirect URLs have a separate 16 KiB limit, so
+they can exceed the immutable manifest URL's 2 KiB cap without becoming
+unbounded. Mirror URLs are attempted sequentially in manifest order; a refused
+redirect follows the existing rollback and fallback path.
 
 One timeout covers the **complete mirror attempt**: all redirect hops, the
 response headers, and the streaming body. The effective deadline is the earlier

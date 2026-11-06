@@ -30,7 +30,7 @@ use asupersync::{
     CancelKind,
     bytes::Buf,
     cx::Cx,
-    http::{Body, Frame, HttpClient, Method},
+    http::{Body, Frame, HttpClient, Method, ParsedUrl, Scheme},
 };
 use sha2::{Digest, Sha256};
 
@@ -47,6 +47,14 @@ const STAGING_SUFFIX: &str = ".partial";
 const COPY_BUFFER_BYTES: usize = 1024 * 1024;
 const DEFAULT_REDIRECTS: u32 = 5;
 const CANCELLATION_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+// Signed asset URLs can be longer than the manifest's immutable mirror URLs.
+// Bound them independently without altering their path or query bytes.
+const MAX_DOWNLOAD_URL_BYTES: usize = 16 * 1024;
+const GITHUB_RELEASE_REDIRECT_HOSTS: [&str; 3] = [
+    "release-assets.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "github-releases.githubusercontent.com",
+];
 
 #[derive(Clone, Debug)]
 pub struct NetworkPartsRequest {
@@ -470,22 +478,23 @@ async fn fetch_range(
     downloaded_total: &mut u64,
     options: NetworkPartsOptions,
 ) -> Result<u64, NetworkPullError> {
+    let redirect_policy = MirrorRedirectPolicy::new(initial_url)
+        .map_err(|detail| NetworkPullError::Redirect { part, mirror, detail })?;
     let mut url = initial_url.to_owned();
     for redirects in 0..=options.max_redirects {
         checkpoint(cx, Some(part))?;
-        if !url.starts_with("https://") {
-            return Err(NetworkPullError::Redirect { part, mirror, detail: "only HTTPS targets are permitted" });
-        }
-        let response = client.request_streaming(
-            cx,
-            Method::Get,
-            &url,
-            vec![
-                ("Range".to_owned(), format!("bytes={start}-{end}")),
-                ("Accept-Encoding".to_owned(), "identity".to_owned()),
-            ],
-            Vec::new(),
-        ).await;
+        let response = redirect_policy.with_authorized_target(&url, |target| {
+            client.request_streaming(
+                cx,
+                Method::Get,
+                target,
+                vec![
+                    ("Range".to_owned(), format!("bytes={start}-{end}")),
+                    ("Accept-Encoding".to_owned(), "identity".to_owned()),
+                ],
+                Vec::new(),
+            )
+        }).map_err(|detail| NetworkPullError::Redirect { part, mirror, detail })?.await;
         // A cancelled request must not become a retryable transport error.
         checkpoint(cx, Some(part))?;
         let response = response.map_err(|error| NetworkPullError::Body { part, mirror, detail: error.to_string() })?;
@@ -496,10 +505,10 @@ async fn fetch_range(
             let location = unique_header(&response.head.headers, "location")
                 .map_err(|_| NetworkPullError::Redirect { part, mirror, detail: "duplicate Location header" })?
                 .ok_or(NetworkPullError::Redirect { part, mirror, detail: "redirect missing Location" })?;
-            if !location.starts_with("https://") {
-                return Err(NetworkPullError::Redirect { part, mirror, detail: "redirect must be absolute HTTPS URL" });
-            }
-            url = location.to_owned();
+            // Validate before copying Location or constructing the next
+            // request. A redirect cannot grant authority for a later hop.
+            url = redirect_policy.with_authorized_target(location, str::to_owned)
+                .map_err(|detail| NetworkPullError::Redirect { part, mirror, detail })?;
             continue;
         }
         validate_response_head(part, mirror, response.head.status, &response.head.headers, start, end, total)?;
@@ -542,6 +551,68 @@ async fn fetch_range(
         return Ok(received);
     }
     Err(NetworkPullError::Redirect { part, mirror, detail: "redirect state exhausted" })
+}
+
+/// Every hop remains bound to the independently pinned mirror's original host.
+/// Public github.com release URLs may also use the exact documented GitHub
+/// asset hosts. Custom mirrors retain same-host redirects; neither a sibling
+/// mirror nor a CDN response can widen this policy.
+struct MirrorRedirectPolicy {
+    original_host: String,
+}
+
+impl MirrorRedirectPolicy {
+    fn new(mirror: &str) -> Result<Self, &'static str> {
+        Ok(Self { original_host: parse_download_target(mirror)?.host })
+    }
+
+    /// Construct transport work only after validating the exact URL that is
+    /// passed to it. The callback also lets model-free tests prove refusal
+    /// happens before any request is constructed; retaining a Location uses
+    /// the same guard after its bounded transport parse.
+    fn with_authorized_target<'url, T>(
+        &self,
+        url: &'url str,
+        send: impl FnOnce(&'url str) -> T,
+    ) -> Result<T, &'static str> {
+        let target = parse_download_target(url)?;
+        let same_host = target.host.eq_ignore_ascii_case(&self.original_host);
+        let github_asset = self.original_host.eq_ignore_ascii_case("github.com")
+            && GITHUB_RELEASE_REDIRECT_HOSTS.iter()
+                .any(|host| target.host.eq_ignore_ascii_case(host));
+        if !same_host && !github_asset {
+            return Err("target host is outside the original mirror's redirect allowlist");
+        }
+        Ok(send(url))
+    }
+}
+
+/// Use the transport's parser, with the product's stricter URL authority
+/// policy applied first. The selected asupersync pin permits explicit ports
+/// and retains fragments in ParsedUrl::path; neither is allowed here. Errors
+/// deliberately omit the URL, whose signed query may contain credentials.
+fn parse_download_target(url: &str) -> Result<ParsedUrl, &'static str> {
+    if url.len() > MAX_DOWNLOAD_URL_BYTES || !url.is_ascii()
+        || url.bytes().any(|byte| byte <= b' ' || byte == 0x7f || matches!(byte, b'\\' | b'#'))
+    {
+        return Err("target must be bounded ASCII without whitespace, controls, backslashes or fragments");
+    }
+    let rest = url.strip_prefix("https://")
+        .ok_or("target must be an absolute HTTPS URL")?;
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty() || authority.len() > 253
+        || authority.split('.').any(|label| label.is_empty() || label.len() > 63
+            || label.starts_with('-') || label.ends_with('-')
+            || !label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))
+    {
+        return Err("target authority must be a hostname without credentials, ports or escapes");
+    }
+    let parsed = ParsedUrl::parse(url).map_err(|_| "target URL is invalid for the selected transport")?;
+    if parsed.scheme != Scheme::Https || parsed.port != 443 || parsed.host != authority {
+        return Err("target authority disagrees with the selected HTTPS transport");
+    }
+    Ok(parsed)
 }
 
 fn validate_response_head(
@@ -1074,6 +1145,129 @@ mod tests {
         }), Err(NetworkPullError::Cancelled { .. })));
         assert_eq!(checks, 3, "cancellation is observed before hashing the second block");
         assert!(verify_final(0, &part, &path, || Ok(())).is_ok());
+    }
+
+    #[test]
+    fn custom_mirror_redirects_keep_the_original_host_without_granting_github_authority() {
+        let policy = MirrorRedirectPolicy::new("https://mirror.example/releases/download/v1/part00").unwrap();
+        for target in [
+            "https://mirror.example/download?sig=unchanged",
+            "https://MIRROR.EXAMPLE/signed/part00",
+            "https://mirror.example",
+        ] {
+            assert_eq!(policy.with_authorized_target(target, |url| url).unwrap(), target);
+        }
+        for target in [
+            "https://other-mirror.example/part00",
+            "https://child.mirror.example/part00",
+            "https://mirror.example.attacker.invalid/part00",
+            "https://github.com/owner/repo/releases/download/v1/part00",
+            "https://release-assets.githubusercontent.com/part00",
+        ] {
+            assert!(policy.with_authorized_target(target, |_| {
+                panic!("an unapproved redirect must not construct transport work");
+            }).is_err());
+        }
+    }
+
+    #[test]
+    fn github_release_redirects_match_exact_hosts_and_remain_bound_across_hops() {
+        let policy = MirrorRedirectPolicy::new("https://GitHub.com/owner/repo/releases/download/v1/part00").unwrap();
+        let mut contacted = Vec::new();
+        for target in [
+            "https://github.com/owner/renamed/releases/download/v1/part00",
+            "https://release-assets.githubusercontent.com/signed/part00?sig=one",
+            "https://OBJECTS.GITHUBUSERCONTENT.COM/signed/part00?sig=two",
+            "https://github-releases.githubusercontent.com/signed/part00?sig=three",
+        ] {
+            policy.with_authorized_target(target, |url| contacted.push(url.to_owned())).unwrap();
+        }
+        assert_eq!(contacted.len(), 4);
+        for target in [
+            "https://release-assets.githubusercontent.com.attacker.invalid/part00",
+            "https://child.release-assets.githubusercontent.com/part00",
+            "https://attacker-release-assets.githubusercontent.com/part00",
+            "https://github.com.attacker.invalid/part00",
+            "https://attacker.invalid/release-assets.githubusercontent.com/part00",
+            "https://attacker.invalid/part00?next=https://github.com",
+            "https://storage.blob.core.windows.net/part00",
+            "https://bucket.s3.amazonaws.com/part00",
+        ] {
+            assert!(policy.with_authorized_target(target, |url| contacted.push(url.to_owned())).is_err());
+        }
+        assert_eq!(contacted.len(), 4, "an allowed CDN hop cannot broaden the original policy");
+
+        // A custom mirror directly naming one asset host gains only that host,
+        // not the github.com mirror's explicit set of cross-host permissions.
+        let asset = MirrorRedirectPolicy::new("https://objects.githubusercontent.com/part00").unwrap();
+        assert!(asset.with_authorized_target("https://release-assets.githubusercontent.com/part00", |_| {
+            panic!("a redirected or independently named CDN cannot expand authority");
+        }).is_err());
+    }
+
+    #[test]
+    fn malformed_initial_and_redirect_targets_are_refused_before_transport() {
+        let policy = MirrorRedirectPolicy::new("https://github.com/owner/repo/releases/download/v1/part00").unwrap();
+        let attempts = Cell::new(0);
+        for target in [
+            "", "http://github.com/part00", "ftp://github.com/part00",
+            "HTTPS://github.com/part00", "//github.com/part00", "/part00",
+            "https://", "https:///part00",
+            "https://user@github.com/part00", "https://user:secret@github.com/part00",
+            "https://github.com@attacker.invalid/part00",
+            "https://github.com:443/part00", "https://github.com:0443/part00",
+            "https://github.com:0/part00", "https://github.com:65536/part00",
+            "https://[::1]/part00", "https://github.com%2Eattacker.invalid/part00",
+            "https://github.com%2f@attacker.invalid/part00",
+            "https://github.com\\@attacker.invalid/part00",
+            "https://github.com/part00\\next", "https://github.com/part00#fragment",
+            "https://github.com /part00", "https://github.com/part 00",
+            "https://github.com/part00?sig=one\r\nHost:attacker.invalid",
+            "https://github.com/part00?sig=one\t", "https://github.com/part00?sig=one\x7f",
+            "https://gıthub.com/part00", "https://github..com/part00",
+            "https://github.com./part00", "https://-github.com/part00",
+            "https://github-.com/part00",
+        ] {
+            assert!(MirrorRedirectPolicy::new(target).is_err(), "initial target: {target:?}");
+            assert!(policy.with_authorized_target(target, |_| attempts.set(attempts.get() + 1)).is_err(),
+                "redirect target: {target:?}");
+        }
+        assert_eq!(attempts.get(), 0, "invalid Location must be refused before invoking transport");
+    }
+
+    #[test]
+    fn signed_redirect_paths_and_queries_are_forwarded_without_normalization() {
+        let policy = MirrorRedirectPolicy::new("https://github.com/owner/repo/releases/download/v1/part00").unwrap();
+        let target = concat!(
+            "https://release-assets.githubusercontent.com/github-production-release-asset/123/part%2F00",
+            "?sp=r&sv=2018-11-09&sig=a%2Fb+%3D&jwt=header.payload.signature",
+            "&response-content-disposition=attachment%3B%20filename%3Dpart00",
+            "&redirect_uri=https%3A%2F%2Fgithub.com%2Fasset&literal=one@two:three%23four",
+        );
+        let mut observed = String::new();
+        policy.with_authorized_target(target, |url| observed.push_str(url)).unwrap();
+        assert_eq!(observed, target);
+        let parsed = ParsedUrl::parse(&observed).unwrap();
+        assert_eq!(parsed.scheme, Scheme::Https);
+        assert_eq!(parsed.port, 443);
+        assert_eq!(parsed.host, "release-assets.githubusercontent.com");
+        assert_eq!(parsed.path, target.strip_prefix("https://release-assets.githubusercontent.com").unwrap());
+    }
+
+    #[test]
+    fn oversized_redirects_and_hostnames_are_rejected_before_request_allocation() {
+        let policy = MirrorRedirectPolicy::new("https://github.com/owner/repo/releases/download/v1/part00").unwrap();
+        let prefix = "https://release-assets.githubusercontent.com/part00?sig=";
+        let exact = format!("{prefix}{}", "a".repeat(MAX_DOWNLOAD_URL_BYTES - prefix.len()));
+        assert_eq!(policy.with_authorized_target(&exact, str::len).unwrap(), MAX_DOWNLOAD_URL_BYTES);
+        let oversized = format!("{exact}a");
+        let attempts = Cell::new(0);
+        assert!(policy.with_authorized_target(&oversized, |_| attempts.set(1)).is_err());
+        let long_label = format!("https://{}.example/part00", "a".repeat(64));
+        assert!(MirrorRedirectPolicy::new(&long_label).is_err());
+        let long_host = format!("https://{0}.{0}.{0}.{0}/part00", "a".repeat(63));
+        assert!(MirrorRedirectPolicy::new(&long_host).is_err());
+        assert_eq!(attempts.get(), 0);
     }
 
     #[test]
