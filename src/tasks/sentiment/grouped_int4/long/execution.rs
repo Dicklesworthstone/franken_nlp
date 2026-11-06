@@ -5,17 +5,26 @@ use crate::native_engine::strict_int4::scoring::cohort::{task::document_layout,
     INT4_SCORING_COHORT_EXECUTION};
 
 impl PreparedInt4SentimentMap<'_> {
-    /// Every document and every counter is preflighted before any forward.
-    /// The serial engine reuses one physical cache across all chunk axes.
-    pub fn execute_with_control<C: DecodeStepControl>(&self, admitted: &[ExecutionIdentity],
-        engine: &mut StrictInt4Engine<'_>, budget: Int4ScoringBudget, control: &mut C)
-        -> Result<Int4SentimentMapRun, Int4SentimentMapError> {
+    /// Check every original chunk against the actual resident engine before
+    /// an outer corpus runner admits an attempt. This performs no forwards.
+    pub fn preflight_with_control<C: DecodeStepControl>(&self, admitted: &[ExecutionIdentity],
+        engine: &StrictInt4Engine<'_>, budget: Int4ScoringBudget, control: &mut C)
+        -> Result<(), Int4SentimentMapError> {
         checkpoint(control)?; self.check_identities(admitted, engine.model_identity(), budget.native, control)?;
         for (plan, identity) in self.plans.iter().zip(admitted) {
             checkpoint(control)?;
             plan.preflight(identity, engine, Int4ScoringBudget {
                 native: Int4RunBudget::exact(plan.planned_work()), max_kv_bytes: budget.max_kv_bytes })?;
         }
+        checkpoint(control)
+    }
+
+    /// Every document and every counter is preflighted before any forward.
+    /// The serial engine reuses one physical cache across all chunk axes.
+    pub fn execute_with_control<C: DecodeStepControl>(&self, admitted: &[ExecutionIdentity],
+        engine: &mut StrictInt4Engine<'_>, budget: Int4ScoringBudget, control: &mut C)
+        -> Result<Int4SentimentMapRun, Int4SentimentMapError> {
+        self.preflight_with_control(admitted, engine, budget, control)?;
         let mut collected = Collection::new(self)?;
         for (index, (plan, identity)) in self.plans.iter().zip(admitted).enumerate() {
             checkpoint(control)?;
@@ -27,6 +36,16 @@ impl PreparedInt4SentimentMap<'_> {
             collected.push(index, run, control)?;
         }
         collected.finish(control)
+    }
+
+    /// Validate every exact ragged window using the real model and complete
+    /// cohort allowance, without constructing an engine or running a layer.
+    pub fn preflight_cohorts_with_control<C: DecodeStepControl>(&self, admitted: &[ExecutionIdentity],
+        weights: &Int4ModelWeights, cohort_chunks: usize, budget: Int4SentimentMapCohortBudget,
+        control: &mut C) -> Result<(), Int4SentimentMapError> {
+        checkpoint(control)?; self.check_identities(admitted, weights.identity(), budget.native, control)?;
+        self.cohort_windows(admitted, cohort_chunks, budget, control)?;
+        checkpoint(control)
     }
 
     /// Real simultaneous chunk × axis heads, with separate KV and original

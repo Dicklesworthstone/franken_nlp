@@ -15,6 +15,7 @@ pub mod generation;
 pub mod grouped;
 pub mod judge;
 pub mod scored_int4;
+pub mod sentiment;
 pub mod source;
 pub(crate) mod int4_document;
 mod framing;

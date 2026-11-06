@@ -14,7 +14,8 @@ pub use assay_ner::{Int4NerAssayHostLimits, Int4NerAssayHostRequirements};
 mod assay_extract;
 pub use assay_extract::{Int4ExtractAssayHostLimits, Int4ExtractAssayHostRequirements};
 mod sentiment;
-pub use sentiment::{Int4SentimentHostLimits, Int4SentimentMapHostConfig};
+pub use sentiment::{Int4SentimentHostLimits, Int4SentimentMapHostConfig,
+    int4_sentiment_document_corpus_requirements};
 mod judge;
 pub use judge::{Int4JudgeHostLimits, Int4FaithfulnessMapHostConfig};
 mod resolve;

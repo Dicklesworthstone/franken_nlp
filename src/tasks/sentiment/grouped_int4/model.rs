@@ -24,6 +24,10 @@ impl Int4SentimentPlanner {
     }
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     pub fn group_width(&self) -> usize { self.model.group_width() }
+    /// Immutable request authority retained by this model-bound compiler.
+    pub fn task_budget(&self) -> TaskBudget { self.ceiling }
+    /// Immutable finite-candidate planning bounds, without exposing prompts.
+    pub fn planning_limits(&self) -> SentimentLimits { self.limits }
     /// Exact maximum source bytes across the selected axes, request/planner
     /// prompt ceilings and native continuation context. No reserve heuristic.
     pub fn max_document_bytes(&self, axes: &[crate::tasks::sentiment::SentimentAxis],

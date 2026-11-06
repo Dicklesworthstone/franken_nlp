@@ -7,6 +7,8 @@ use crate::{
 };
 mod long;
 pub use long::Int4SentimentMapHostConfig;
+mod corpus;
+pub use corpus::int4_sentiment_document_corpus_requirements;
 
 /// Complete-bundle work and input ownership. Before transfer, callers admit
 /// the compiled plan's storage. The host retains its own explicit preparation
