@@ -45,6 +45,12 @@ than the largest declared release part. Redirects are followed explicitly so
 that every hop can be checked. Only absolute HTTPS redirect targets are
 accepted. Mirror URLs are attempted sequentially in manifest order.
 
+One timeout covers the **complete mirror attempt**: all redirect hops, the
+response headers, and the streaming body. The effective deadline is the earlier
+of that attempt's timeout and the caller's `Cx` deadline. Neither a redirect nor
+a received body frame renews it. This explicit outer timer is necessary because
+the pinned client's streaming request timeout ends at the response head.
+
 A data response must be exactly:
 
 - status `206`;
@@ -66,6 +72,11 @@ after its length and complete SHA-256 pass again.
 Incomplete work is stored at `<part-name>.partial`. With resume enabled, the
 entire retained prefix is re-hashed before the next request. A failed mirror is
 rolled back to the exact pre-attempt length before the next mirror is tried.
+The same rollback applies to a stalled body's timeout, after the body future
+has been dropped. Received bytes from failed attempts remain charged against
+the invocation's download allowance. Exhausting mirrors on a timeout preserves
+the typed timeout and CLI exit category 5; a caller's cancellation retains its
+original cause.
 
 The release manifest contains whole-part digests rather than per-range digests,
 so an incomplete prefix is deliberately **not** described as verified release
@@ -107,15 +118,35 @@ fnlp models acquire \
   --memory-mib 256
 ```
 
-`models acquire` first completes the exact same verified part acquisition and
-only then invokes the existing local reconstruction routine against those final
-part files. Network failure never enters reconstruction. Reconstruction failure
-does not relabel the downloaded parts as an active model; its staging file
-keeps the same forensic/resume semantics as `models reconstruct`.
+`models acquire` first admits 128 MiB of modeled local verification and
+reconstruction workspace in the process memory ledger. It then authenticates
+the supplied manifest pin and checks the final `--output` path. An existing
+regular file is reused only after its complete length, SHA-256, checked
+container structure, and manifest-bound semantic identities all pass again.
+The held file descriptor is used throughout verification, and an observed
+pathname replacement is refused. Corruption, truncation, symlinks, unreadable
+files, or identity mismatches are errors; they never silently authorize a
+replacement or download.
+
+A verified final artifact succeeds without opening the parts directory or
+staging path and without contacting any mirror. The receipt includes
+`cache_hit=true`, zero network/copy work, and `local_workspace_bytes=134217728`.
+This works with `--max-download-bytes 0 --max-copy-bytes 0`, including when the
+original parts have been removed. Cache hits still require the
+`asupersync-runtime` feature for the real process ledger.
+
+When the final path is absent, acquisition completes the same verified part
+download and then invokes local reconstruction against those final part files.
+The receipt includes `cache_hit=false`. Network failure never enters
+reconstruction; reconstruction keeps the forensic/resume semantics of
+`models reconstruct`. Both paths retain the local workspace charge through
+receipt publication. That charge models bounded metadata representations and
+streaming scratch; it is neither a 128 MiB allocation nor an exhaustive RSS cap.
 
 `--no-resume` disables reuse of both network partials and a pre-existing
 reconstruction staging file. Otherwise, reconstruction resumes only when the
 named staging file already exists; a fresh invocation uses create-new semantics.
+This option does not disable reuse of a completely verified final artifact.
 The network and reconstruction byte ceilings remain independent:
 `--max-download-bytes` bounds newly received bytes and `--max-copy-bytes`
 bounds newly appended reconstruction bytes.
@@ -124,10 +155,14 @@ bounds newly appended reconstruction bytes.
 reservation for HTTP/TLS/DNS/body bookkeeping. `--max-download-bytes` bounds
 new network bytes for resumable invocations. `--no-resume` refuses an
 existing partial file instead of extending it. `--request-timeout-seconds`
-and `--max-redirects` are finite per-mirror controls.
+and `--max-redirects` are finite per-mirror controls. For `models acquire`, the
+network reservation is additional to the 128 MiB local workspace; a cache hit
+needs only the local reservation. An insufficient local memory ceiling is
+refused before opening the manifest or artifact, with exit category 9.
 
-A successful command prints metadata only to stderr and exits zero after every
-part has a complete manifest digest. It still has
+A successful command prints metadata only to stderr. `download-parts` exits
+zero after every part has a complete manifest digest; `acquire` exits zero only
+after the complete final artifact is verified or reconstructed. Both retain
 `activation_authority=false`.
 
 ## What this does not claim

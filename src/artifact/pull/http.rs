@@ -16,7 +16,7 @@ use std::{
     error::Error,
     fmt,
     fs::{self, File, OpenOptions},
-    future::poll_fn,
+    future::{Future, poll_fn},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     pin::Pin,
@@ -63,7 +63,8 @@ pub struct NetworkPartsOptions {
     /// This is not a wire-byte cap: HTTP/TLS overhead and unsolicited bytes
     /// from a server that violates its requested range cannot be prevented.
     pub max_new_bytes: Option<u64>,
-    /// Total timeout for each individual HTTP request, meet-composed with Cx.
+    /// Total timeout for one mirror attempt, including redirects, response
+    /// headers and the complete streaming body, meet-composed with Cx.
     pub request_timeout: Duration,
     /// Maximum explicit HTTPS redirect hops for one mirror.
     pub max_redirects: u32,
@@ -126,6 +127,7 @@ pub enum NetworkPullError {
     Redirect { part: usize, mirror: usize, detail: &'static str },
     Response { part: usize, mirror: usize, detail: &'static str },
     Body { part: usize, mirror: usize, detail: String },
+    RequestTimeout { part: usize, mirror: usize },
     Digest { part: usize, expected: String, observed: String },
     DownloadBudgetExceeded {
         limit: u64,
@@ -151,6 +153,7 @@ impl fmt::Display for NetworkPullError {
             Self::Redirect { part, mirror, detail } => write!(f, "network pull part {part} mirror {mirror} redirect refused: {detail}"),
             Self::Response { part, mirror, detail } => write!(f, "network pull part {part} mirror {mirror} response refused: {detail}"),
             Self::Body { part, mirror, detail } => write!(f, "network pull part {part} mirror {mirror} body failed: {detail}"),
+            Self::RequestTimeout { part, mirror } => write!(f, "network pull part {part} mirror {mirror} complete-response timeout"),
             Self::Digest { part, expected, observed } => write!(f, "network pull part {part} digest mismatch expected={expected} observed={observed}"),
             Self::DownloadBudgetExceeded { limit, downloaded_bytes, retained_bytes, total_bytes, part } =>
                 write!(f, "network pull byte budget exhausted part={part} limit={limit} downloaded={downloaded_bytes} retained={retained_bytes} total={total_bytes}; partial staging retained"),
@@ -270,7 +273,7 @@ pub async fn download_release_parts(
         let base_len = start;
         let downloaded_before_part = downloaded_total;
         let mut success = None;
-        let mut last_error = String::from("no mirror attempted");
+        let mut last_error = None;
         if part.mirrors.is_empty() { return Err(NetworkPullError::NoMirrors { part: index }); }
 
         for (mirror_index, mirror) in part.mirrors.iter().enumerate() {
@@ -281,8 +284,9 @@ pub async fn download_release_parts(
             let request_end = next_range_end(index, start, part.bytes,
                 manifest.artifact.bytes, options.max_new_bytes, downloaded_total)?;
             let mut hasher = prefix_hasher.clone();
-            let result = fetch_range(cx, &client, index, mirror_index, mirror, start, request_end, part.bytes,
-                &mut staging, &mut hasher, &mut downloaded_total, options).await;
+            let result = drive_attempt(cx, index, mirror_index, options.request_timeout,
+                fetch_range(cx, &client, index, mirror_index, mirror, start, request_end, part.bytes,
+                    &mut staging, &mut hasher, &mut downloaded_total, options)).await;
             // Digest validation belongs to the attempt, before short-circuiting
             // mirror fallback. Failure restores both length and cursor to the
             // pre-attempt prefix; a corrupt complete suffix cannot poison resume.
@@ -295,7 +299,7 @@ pub async fn download_release_parts(
                 // Retrying cannot repair cancellation or a local storage
                 // failure. In particular, rollback failure must stop here.
                 Err(error @ (NetworkPullError::Cancelled { .. } | NetworkPullError::Staging { .. })) => return Err(error),
-                Err(error) => last_error = error.to_string(),
+                Err(error) => last_error = Some(error),
             }
         }
         let Some((mirror_index, segment_len)) = success else {
@@ -303,9 +307,7 @@ pub async fn download_release_parts(
             // the last available mirror consumed the final allowance.
             next_range_end(index, start, part.bytes, manifest.artifact.bytes,
                 options.max_new_bytes, downloaded_total)?;
-            return Err(NetworkPullError::MirrorExhausted {
-                part: index, attempts: part.mirrors.len(), last: last_error,
-            });
+            return Err(exhausted_mirrors(index, part.mirrors.len(), last_error));
         };
         staging.flush().map_err(|error| staging_error(index, "flush", error))?;
         staging.sync_all().map_err(|error| staging_error(index, "sync", error))?;
@@ -333,6 +335,50 @@ pub async fn download_release_parts(
         complete_bytes: manifest.artifact.bytes, parts_dir: request.parts_dir.clone(),
         activation_authority: false,
     })
+}
+
+/// At selected asupersync revision 362dc5b174427f66cfa76ab2bdd68cce1a95c6cc,
+/// `HttpClient::request_streaming` ends its timeout at the response head.
+/// Own one timer around the entire attempt instead: a server that supplies
+/// headers and then never yields a body frame must still release its file
+/// borrow and return through `finish_attempt` before another mirror starts.
+/// Redirects and body frames share this deadline; neither renews it.
+async fn drive_attempt<T>(
+    cx: &Cx,
+    part: usize,
+    mirror: usize,
+    timeout: Duration,
+    future: impl Future<Output = Result<T, NetworkPullError>>,
+) -> Result<T, NetworkPullError> {
+    checkpoint(cx, Some(part))?;
+    let parent_deadline = cx.budget().deadline;
+    let deadline = cx.budget_for_timeout(timeout).deadline
+        .ok_or(NetworkPullError::InvalidOptions("mirror attempt requires a deadline"))?;
+    let parent_limited = parent_deadline.is_some_and(|parent| parent <= deadline);
+    let expired = || if parent_limited {
+        NetworkPullError::Cancelled { cause: Some(CancelKind::Deadline), part: Some(part) }
+    } else {
+        NetworkPullError::RequestTimeout { part, mirror }
+    };
+    if deadline <= cx.now() { return Err(expired()); }
+    let result = asupersync::time::timeout_at(deadline, std::pin::pin!(future)).await;
+    // Preserve any real parent cancellation, including its precise kind.
+    // Synchronous file work is cooperative; detect a late ready result too.
+    checkpoint(cx, Some(part))?;
+    match result {
+        Ok(result) if cx.now() <= deadline => result,
+        _ => Err(expired()),
+    }
+}
+
+fn exhausted_mirrors(part: usize, attempts: usize, last: Option<NetworkPullError>) -> NetworkPullError {
+    match last {
+        // Keep the typed terminal timeout for the CLI's budget exit code.
+        // An earlier timeout remains retryable when another mirror succeeds.
+        Some(error @ NetworkPullError::RequestTimeout { .. }) => error,
+        last => NetworkPullError::MirrorExhausted { part, attempts,
+            last: last.map_or_else(|| "no mirror attempted".to_owned(), |error| error.to_string()) },
+    }
 }
 
 fn next_range_end(
@@ -669,6 +715,92 @@ mod tests {
             bytes: complete.len() as u64, sha256: hex_lower(&Sha256::digest(complete)),
             mirrors: vec!["https://first.invalid/part".to_owned(), "https://second.invalid/part".to_owned()] };
         (file, part, hasher)
+    }
+
+    #[test]
+    fn stalled_body_times_out_drops_the_attempt_and_rolls_back_without_refunding_bytes() {
+        use std::sync::atomic::AtomicBool;
+        struct DropSignal<'a>(&'a AtomicBool);
+        impl Drop for DropSignal<'_> {
+            fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+        }
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let (mut file, part, mut hasher) = attempt_fixture(b"ab", b"abcdef");
+        let mut downloaded = 0;
+        file.write_all(b"cd").unwrap(); hasher.update(b"cd");
+        charge_body_bytes(&mut downloaded, 2).unwrap();
+        let dropped = AtomicBool::new(false);
+        let guard = DropSignal(&dropped);
+        let result = runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            drive_attempt(&cx, 0, 0, Duration::from_millis(100), async move {
+                let _guard = guard;
+                std::future::pending::<Result<u64, NetworkPullError>>().await
+            }).await
+        });
+        assert!(dropped.load(Ordering::SeqCst), "the timed-out attempt must be dropped before retry");
+        assert!(matches!(result, Err(NetworkPullError::RequestTimeout { part: 0, mirror: 0 })));
+        assert!(matches!(finish_attempt(0, 0, &part, 2, 5, &mut file, &hasher, result),
+            Err(NetworkPullError::RequestTimeout { .. })));
+        assert_eq!(file.metadata().unwrap().len(), 2);
+        assert_eq!(file.stream_position().unwrap(), 2);
+        assert_eq!(downloaded, 2, "timeout never refunds consumed network bytes");
+        assert_eq!(next_range_end(0, 2, 6, 6, Some(4), downloaded).unwrap(), 3);
+    }
+
+    #[test]
+    fn complete_attempt_preserves_the_result_and_transport_error() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            assert_eq!(drive_attempt(&cx, 2, 3, Duration::from_secs(60), async { Ok(17_u64) }).await.unwrap(), 17);
+            let result = drive_attempt(&cx, 2, 3, Duration::from_secs(60), async {
+                Err::<u64, _>(NetworkPullError::Response { part: 2, mirror: 3, detail: "invalid range" })
+            }).await;
+            assert!(matches!(result, Err(NetworkPullError::Response { part: 2, mirror: 3, .. })));
+        });
+    }
+
+    #[test]
+    fn an_expired_attempt_does_not_start_request_or_body_work() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let result = drive_attempt(&cx, 1, 2, Duration::ZERO, async {
+                panic!("expired work must never be polled");
+                #[allow(unreachable_code)] Ok::<u64, NetworkPullError>(0)
+            }).await;
+            assert!(matches!(result, Err(NetworkPullError::RequestTimeout { part: 1, mirror: 2 })));
+        });
+    }
+
+    #[test]
+    fn parent_cancellation_wins_over_a_ready_attempt_without_losing_its_kind() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        for cause in [CancelKind::User, CancelKind::Timeout, CancelKind::Deadline,
+            CancelKind::PollQuota, CancelKind::CostBudget, CancelKind::FailFast,
+            CancelKind::RaceLost, CancelKind::ParentCancelled, CancelKind::ResourceUnavailable,
+            CancelKind::Shutdown, CancelKind::LinkedExit] {
+            runtime.block_on(async {
+                let cx = Cx::current().unwrap();
+                let result = drive_attempt(&cx, 2, 1, Duration::from_secs(60), async {
+                    cx.cancel_with(cause, None);
+                    Ok(4_u64)
+                }).await;
+                assert!(matches!(result, Err(NetworkPullError::Cancelled { cause: Some(observed), part: Some(2) })
+                    if observed == cause));
+            });
+        }
+    }
+
+    #[test]
+    fn exhausted_mirror_timeout_retains_its_typed_budget_outcome() {
+        assert!(matches!(exhausted_mirrors(2, 4,
+            Some(NetworkPullError::RequestTimeout { part: 2, mirror: 3 })),
+            NetworkPullError::RequestTimeout { part: 2, mirror: 3 }));
+        assert!(matches!(exhausted_mirrors(2, 4,
+            Some(NetworkPullError::Response { part: 2, mirror: 3, detail: "invalid range" })),
+            NetworkPullError::MirrorExhausted { part: 2, attempts: 4, .. }));
     }
 
     #[test]

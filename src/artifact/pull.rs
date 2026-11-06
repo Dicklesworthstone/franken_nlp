@@ -41,6 +41,17 @@ use crate::native_engine::decode::DecodeCancellationKind;
 
 const COPY_CHUNK_BYTES: usize = 1024 * 1024;
 
+/// Conservative process-ledger workspace for local release verification and
+/// reconstruction. The 1-MiB header and 256-KiB manifest caps bound serialized
+/// metadata, not the temporary canonical JSON trees and parsed tables. This
+/// reserve covers those representations, the bounded directory/census, one
+/// 1-MiB copy/hash buffer and the range reader's fixed-chunk scratch.
+///
+/// Hosts charge this modeled workspace before reading input and retain it
+/// through result publication. It does not allocate 128 MiB, grow with artifact
+/// payload size, cover transport bookkeeping, or claim an exhaustive RSS cap.
+pub const LOCAL_RELEASE_WORKSPACE_RESERVE_BYTES: u64 = 128 * 1024 * 1024;
+
 /// Explicit offline reconstruction request.
 ///
 /// `expected_release_manifest_sha256` is the domain-separated manifest digest
@@ -111,6 +122,23 @@ pub struct LocalReconstructReport {
     pub directory_durability_confirmed: bool,
 }
 
+/// Read-only verification of an existing caller-owned artifact.
+///
+/// Every invocation authenticates the supplied manifest pin, rehashes the
+/// complete held file, and checks its envelope/census/semantic identities. No
+/// release parts, staging paths or network are accessed. This is a cache-hit
+/// receipt for the local candidate workflow, never model-root activation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalArtifactVerificationReport {
+    pub release_manifest_sha256: String,
+    pub artifact_sha256: String,
+    pub artifact_bytes: u64,
+    pub part_count: usize,
+    pub logical_model_sha256: String,
+    pub output: PathBuf,
+    pub activation_authority: bool,
+}
+
 /// Typed refusal for local reconstruction. Default formatting avoids embedding
 /// arbitrary file contents or network responses.
 #[derive(Debug)]
@@ -136,6 +164,7 @@ pub enum PullError {
     PartDigest { part: usize, expected: String, observed: String },
     ArtifactLength { expected: u64, observed: u64 },
     ArtifactDigest { expected: String, observed: String },
+    ExistingArtifact { operation: &'static str, detail: String },
     Container(FnlpqReadError),
     ContainerIdentity(&'static str),
     Publish { operation: &'static str, detail: String },
@@ -198,6 +227,9 @@ impl fmt::Display for PullError {
                 f,
                 "local pull artifact digest mismatch expected={expected} observed={observed}"
             ),
+            Self::ExistingArtifact { operation, detail } => {
+                write!(f, "local pull cached artifact {operation} failed: {detail}")
+            }
             Self::Container(error) => write!(f, "local pull fnlpq verification failed: {error}"),
             Self::ContainerIdentity(field) => {
                 write!(f, "local pull fnlpq identity disagrees with manifest field {field}")
@@ -229,6 +261,96 @@ impl From<FnlpqReadError> for PullError {
     fn from(error: FnlpqReadError) -> Self {
         Self::Container(error)
     }
+}
+
+/// Check an existing final artifact before considering any acquisition work.
+///
+/// `Ok(None)` means the final path was absent after authenticating an active,
+/// compatible manifest. An existing corrupt, symlinked, non-regular or unreadable
+/// file is an error, never a cache miss that authorizes replacement/download.
+/// The held descriptor is used for both the whole-file hash and checked reader.
+/// Paths and contents must remain stable in the caller-controlled workspace;
+/// observed Unix pathname replacement rejects, but this is not a hostile-root
+/// transaction or an immutability capability.
+///
+/// The embedding host owns memory admission. The CLI reserves
+/// [`LOCAL_RELEASE_WORKSPACE_RESERVE_BYTES`] from its process ledger before
+/// invoking this API and retains that charge through receipt publication.
+pub fn verify_local_release_cache(
+    manifest_path: &Path,
+    expected_release_manifest_sha256: &str,
+    artifact_path: &Path,
+    mut checkpoint: impl FnMut(LocalReconstructProgress) -> Option<DecodeCancellationKind>,
+) -> Result<Option<LocalArtifactVerificationReport>, PullError> {
+    let mut progress = LocalReconstructProgress {
+        phase: LocalReconstructPhase::VerifyArtifact,
+        part_index: None,
+        verified_prefix_bytes: 0,
+        copied_bytes: 0,
+        artifact_bytes: 0,
+    };
+    reconstruction_checkpoint(progress, &mut checkpoint)?;
+    if manifest_path.as_os_str().is_empty() || artifact_path.as_os_str().is_empty()
+        || artifact_path.file_name().is_none()
+    {
+        return Err(PullError::InvalidPath("manifest and artifact paths must be explicit files"));
+    }
+    let manifest = read_pinned_manifest(manifest_path, expected_release_manifest_sha256)?;
+    progress.artifact_bytes = manifest.artifact.bytes;
+    reconstruction_checkpoint(progress, &mut checkpoint)?;
+    let named = match fs::symlink_metadata(artifact_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(PullError::ExistingArtifact {
+            operation: "inspect path", detail: error.to_string(),
+        }),
+    };
+    if named.file_type().is_symlink() || !named.is_file() {
+        return Err(PullError::ExistingArtifact {
+            operation: "regular-file check",
+            detail: "existing artifact must be a non-symlink regular file".to_owned(),
+        });
+    }
+    if named.len() != manifest.artifact.bytes {
+        return Err(PullError::ArtifactLength {
+            expected: manifest.artifact.bytes, observed: named.len(),
+        });
+    }
+    let mut file = File::open(artifact_path).map_err(|error| PullError::ExistingArtifact {
+        operation: "open", detail: error.to_string(),
+    })?;
+    let opened = file.metadata().map_err(|error| PullError::ExistingArtifact {
+        operation: "inspect held file", detail: error.to_string(),
+    })?;
+    if !opened.is_file() || opened.len() != named.len() || !same_file_identity(&named, &opened) {
+        return Err(PullError::ExistingArtifact {
+            operation: "path stability", detail: "artifact changed while opening".to_owned(),
+        });
+    }
+    let mut buffer = vec![0_u8; COPY_CHUNK_BYTES];
+    verify_staged_artifact(&mut file, &manifest, &mut buffer, progress, &mut checkpoint)?;
+    let pinned_file = file.try_clone().map_err(|error| PullError::ExistingArtifact {
+        operation: "clone held descriptor", detail: error.to_string(),
+    })?;
+    let reader = match FnlpqRangeReader::from_file_with_checkpoint(
+        pinned_file, || checkpoint(progress),
+    ) {
+        Ok(reader) => reader,
+        Err(FnlpqReadError::Cancelled(cause)) => return Err(PullError::Cancelled { cause, progress }),
+        Err(error) => return Err(PullError::Container(error)),
+    };
+    verify_container_identity(&reader, &manifest)?;
+    reconstruction_checkpoint(progress, &mut checkpoint)?;
+    check_staging_path(&file, artifact_path, manifest.artifact.bytes)?;
+    Ok(Some(LocalArtifactVerificationReport {
+        release_manifest_sha256: expected_release_manifest_sha256.to_owned(),
+        artifact_sha256: manifest.artifact.sha256.clone(),
+        artifact_bytes: manifest.artifact.bytes,
+        part_count: manifest.parts.len(),
+        logical_model_sha256: manifest.digests.logical_model_sha256.clone(),
+        output: artifact_path.to_owned(),
+        activation_authority: false,
+    }))
 }
 
 /// Reconstruct one explicit local release package without network access.
@@ -269,25 +391,7 @@ pub fn reconstruct_local_release_with_options(
     mut checkpoint: impl FnMut(LocalReconstructProgress) -> Option<DecodeCancellationKind>,
 ) -> Result<LocalReconstructReport, PullError> {
     validate_request_paths(request)?;
-    validate_sha256_text(&request.expected_release_manifest_sha256)
-        .ok_or(PullError::InvalidExpectedManifestDigest)?;
-
-    let manifest_bytes = read_manifest(&request.manifest)?;
-    let observed_manifest_sha256 = release_manifest_sha256(&manifest_bytes);
-    if observed_manifest_sha256 != request.expected_release_manifest_sha256 {
-        return Err(PullError::ManifestDigestMismatch {
-            expected: request.expected_release_manifest_sha256.clone(),
-            observed: observed_manifest_sha256,
-        });
-    }
-
-    let manifest = ReleaseManifest::parse(&manifest_bytes)?;
-    manifest.validate_for(NANBEIGE42_INT8_V1_COMPATIBILITY)?;
-    if manifest.lifecycle.state != "active" {
-        return Err(PullError::InactiveManifest {
-            state: manifest.lifecycle.state.clone(),
-        });
-    }
+    let manifest = read_pinned_manifest(&request.manifest, &request.expected_release_manifest_sha256)?;
 
     let mut progress = LocalReconstructProgress {
         phase: if options.resume {
@@ -716,6 +820,23 @@ fn verify_staged_artifact(
         });
     }
     Ok(())
+}
+
+fn read_pinned_manifest(path: &Path, expected: &str) -> Result<ReleaseManifest, PullError> {
+    validate_sha256_text(expected).ok_or(PullError::InvalidExpectedManifestDigest)?;
+    let bytes = read_manifest(path)?;
+    let observed = release_manifest_sha256(&bytes);
+    if observed != expected {
+        return Err(PullError::ManifestDigestMismatch {
+            expected: expected.to_owned(), observed,
+        });
+    }
+    let manifest = ReleaseManifest::parse(&bytes)?;
+    manifest.validate_for(NANBEIGE42_INT8_V1_COMPATIBILITY)?;
+    if manifest.lifecycle.state != "active" {
+        return Err(PullError::InactiveManifest { state: manifest.lifecycle.state.clone() });
+    }
+    Ok(manifest)
 }
 
 fn read_manifest(path: &Path) -> Result<Vec<u8>, PullError> {

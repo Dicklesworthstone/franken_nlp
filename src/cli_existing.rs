@@ -38,6 +38,7 @@ use crate::{
 };
 #[cfg(feature = "asupersync-runtime")]
 use crate::{
+    artifact::pull::{LOCAL_RELEASE_WORKSPACE_RESERVE_BYTES, verify_local_release_cache},
     artifact::pull::http::{NetworkPartsOptions, NetworkPartsRequest, NetworkPullError},
     hosted::{HostedError, HostedNetworkPullError, NetworkPullHostOptions},
 };
@@ -139,7 +140,7 @@ struct ConvertCommand {
 
 #[derive(Subcommand)]
 enum ModelsSubcommand {
-    /// Acquire parts and reconstruct one verified local Generic artifact; does not activate.
+    /// Reuse a fully verified local artifact, or acquire and reconstruct it; does not activate.
     Acquire(ModelsAcquireCommand),
     /// Acquire verified immutable release parts over pinned HTTPS; does not activate.
     DownloadParts(ModelsDownloadPartsCommand),
@@ -172,7 +173,7 @@ struct ModelsDownloadPartsCommand {
     /// Modeled HTTP/TLS/DNS/body bookkeeping reserve in MiB.
     #[arg(long, default_value_t = 16)]
     network_reserve_mib: u64,
-    /// Per-request timeout; every mirror attempt is independently bounded.
+    /// Total seconds per mirror attempt, including redirects, headers and body.
     #[arg(long, default_value_t = 300)]
     request_timeout_seconds: u64,
     /// Maximum explicit absolute-HTTPS redirect hops per mirror.
@@ -194,7 +195,7 @@ struct ModelsAcquireCommand {
     /// Staging Generic .fnlpq path, in the same directory as --output.
     #[arg(long)]
     staging_output: PathBuf,
-    /// New final Generic .fnlpq pathname; existing files are never replaced.
+    /// Final Generic .fnlpq pathname; a fully verified existing file is reused.
     #[arg(long)]
     output: PathBuf,
     /// Disable reuse of both HTTP partials and an existing reconstruction staging file.
@@ -206,13 +207,14 @@ struct ModelsAcquireCommand {
     /// Maximum new bytes copied from verified parts into reconstruction staging.
     #[arg(long)]
     max_copy_bytes: Option<u64>,
-    /// Process memory-ledger ceiling in MiB.
+    /// Process memory-ledger ceiling in MiB; local verification reserves 128 MiB.
+    /// Network work also needs the separate --network-reserve-mib allowance.
     #[arg(long)]
     memory_mib: u64,
     /// Modeled HTTP/TLS/DNS/body bookkeeping reserve in MiB.
     #[arg(long, default_value_t = 16)]
     network_reserve_mib: u64,
-    /// Per-request timeout; every mirror attempt is independently bounded.
+    /// Total seconds per mirror attempt, including redirects, headers and body.
     #[arg(long, default_value_t = 300)]
     request_timeout_seconds: u64,
     /// Maximum explicit absolute-HTTPS redirect hops per mirror.
@@ -501,28 +503,28 @@ fn run_models_command(command: ModelsSubcommand) -> ExitCode {
 }
 
 fn run_models_acquire(command: ModelsAcquireCommand) -> ExitCode {
+    const MIB: u64 = 1024 * 1024;
+    let Some(memory_bytes) = command.memory_mib.checked_mul(MIB).filter(|&bytes| bytes != 0) else {
+        eprintln!("MODELS_ACQUIRE RESULT=REFUSED reason=invalid-memory-mib");
+        return ErrorCode::Usage.as_process_exit();
+    };
+    let Some(network_reserve_bytes) = command.network_reserve_mib.checked_mul(MIB).filter(|&bytes| bytes != 0) else {
+        eprintln!("MODELS_ACQUIRE RESULT=REFUSED reason=invalid-network-reserve-mib");
+        return ErrorCode::Usage.as_process_exit();
+    };
+    if command.request_timeout_seconds == 0 || command.max_redirects > 16 {
+        eprintln!("MODELS_ACQUIRE RESULT=REFUSED reason=invalid-network-limits");
+        return ErrorCode::Usage.as_process_exit();
+    }
     #[cfg(not(feature = "asupersync-runtime"))]
     {
-        let _ = command;
+        let _ = (command, memory_bytes, network_reserve_bytes);
         eprintln!("MODELS_ACQUIRE RESULT=REFUSED reason=asupersync-runtime-feature-disabled");
         return ErrorCode::Generic.as_process_exit();
     }
     #[cfg(feature = "asupersync-runtime")]
     {
         use std::time::Duration;
-        const MIB: u64 = 1024 * 1024;
-        let Some(memory_bytes) = command.memory_mib.checked_mul(MIB).filter(|&bytes| bytes != 0) else {
-            eprintln!("MODELS_ACQUIRE RESULT=REFUSED reason=invalid-memory-mib");
-            return ErrorCode::Usage.as_process_exit();
-        };
-        let Some(network_reserve_bytes) = command.network_reserve_mib.checked_mul(MIB).filter(|&bytes| bytes != 0) else {
-            eprintln!("MODELS_ACQUIRE RESULT=REFUSED reason=invalid-network-reserve-mib");
-            return ErrorCode::Usage.as_process_exit();
-        };
-        if command.request_timeout_seconds == 0 || command.max_redirects > 16 {
-            eprintln!("MODELS_ACQUIRE RESULT=REFUSED reason=invalid-network-limits");
-            return ErrorCode::Usage.as_process_exit();
-        }
         let engine = match NlpEngine::builder().resource_config(ResourceHostConfig {
             runtime_preset: RuntimePreset::CurrentThread,
             runtime_workers: 1,
@@ -539,6 +541,40 @@ fn run_models_acquire(command: ModelsAcquireCommand) -> ExitCode {
                 return ErrorCode::AdmissionOrResourceLimit.as_process_exit();
             }
         };
+        let lease = engine.resources().acquire_lease();
+        // Admit local metadata, canonical parsing and streaming scratch before
+        // any manifest/artifact IO. Keep the charge through receipt output and
+        // reconstruction; the transport reserves its separate network budget.
+        let _workspace = match lease.reserve(
+            crate::MemoryClass::Staging, LOCAL_RELEASE_WORKSPACE_RESERVE_BYTES,
+        ).and_then(|reservation| reservation.commit()) {
+            Ok(memory) => memory,
+            Err(error) => {
+                eprintln!("MODELS_ACQUIRE RESULT=REFUSED stage=local-memory required_bytes={LOCAL_RELEASE_WORKSPACE_RESERVE_BYTES} reason={error}");
+                return ErrorCode::AdmissionOrResourceLimit.as_process_exit();
+            }
+        };
+        // Runtime creation above installs the real process ledger; it does not
+        // contact any mirror. Authenticate the final artifact before inspecting
+        // parts/staging or starting transport. Bad existing files never
+        // silently authorize replacement.
+        match verify_local_release_cache(
+            &command.manifest, &command.manifest_sha256, &command.output, |_| None,
+        ) {
+            Ok(Some(report)) => {
+                eprintln!(
+                    "MODELS_ACQUIRE RESULT=PASS output={} artifact_bytes={} artifact_sha256={} manifest_sha256={} parts={} cache_hit=true network_reused_bytes=0 network_downloaded_bytes=0 reconstruct_resumed_bytes=0 reconstruct_copied_bytes=0 local_workspace_bytes={LOCAL_RELEASE_WORKSPACE_RESERVE_BYTES} directory_durability=unconfirmed activation_authority=false",
+                    report.output.display(), report.artifact_bytes, report.artifact_sha256,
+                    report.release_manifest_sha256, report.part_count,
+                );
+                return ExitCode::SUCCESS;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("MODELS_ACQUIRE RESULT=FAIL stage=cache-verify reason={error}");
+                return reconstruct_error_code(&error).as_process_exit();
+            }
+        }
         let transfer = NetworkPartsOptions {
             resume: !command.no_resume,
             max_new_bytes: command.max_download_bytes,
@@ -578,7 +614,7 @@ fn run_models_acquire(command: ModelsAcquireCommand) -> ExitCode {
         match reconstruction {
             Ok(report) => {
                 eprintln!(
-                    "MODELS_ACQUIRE RESULT=PASS output={} artifact_bytes={} artifact_sha256={} manifest_sha256={} parts={} network_reused_bytes={} network_downloaded_bytes={} reconstruct_resumed_bytes={} reconstruct_copied_bytes={} directory_durability=unconfirmed activation_authority=false",
+                    "MODELS_ACQUIRE RESULT=PASS output={} artifact_bytes={} artifact_sha256={} manifest_sha256={} parts={} cache_hit=false network_reused_bytes={} network_downloaded_bytes={} reconstruct_resumed_bytes={} reconstruct_copied_bytes={} local_workspace_bytes={LOCAL_RELEASE_WORKSPACE_RESERVE_BYTES} directory_durability=unconfirmed activation_authority=false",
                     report.output.display(),
                     report.artifact_bytes,
                     report.artifact_sha256,
@@ -675,14 +711,23 @@ fn run_models_download_parts(command: ModelsDownloadPartsCommand) -> ExitCode {
 
 #[cfg(feature = "asupersync-runtime")]
 fn network_download_error_code(error: &HostedNetworkPullError) -> ErrorCode {
+    use asupersync::CancelKind;
     match error {
         HostedNetworkPullError::Hosted(HostedError::Limits(_) | HostedError::Reservation(_)) =>
             ErrorCode::AdmissionOrResourceLimit,
         HostedNetworkPullError::Hosted(_) => ErrorCode::Generic,
-        HostedNetworkPullError::Transfer(NetworkPullError::DownloadBudgetExceeded { .. }) =>
+        HostedNetworkPullError::Transfer(NetworkPullError::DownloadBudgetExceeded { .. }
+            | NetworkPullError::RequestTimeout { .. }) =>
             ErrorCode::BudgetOrTimeout,
-        HostedNetworkPullError::Transfer(NetworkPullError::Cancelled { .. }) =>
-            ErrorCode::Cancelled,
+        HostedNetworkPullError::Transfer(NetworkPullError::Cancelled { cause, .. }) => match cause {
+            Some(CancelKind::Timeout | CancelKind::Deadline | CancelKind::PollQuota
+                | CancelKind::CostBudget) => ErrorCode::BudgetOrTimeout,
+            Some(CancelKind::ResourceUnavailable) => ErrorCode::AdmissionOrResourceLimit,
+            Some(CancelKind::FailFast | CancelKind::LinkedExit | CancelKind::RaceLost) =>
+                ErrorCode::Generic,
+            Some(CancelKind::User | CancelKind::ParentCancelled | CancelKind::Shutdown) | None =>
+                ErrorCode::Cancelled,
+        },
         HostedNetworkPullError::Transfer(NetworkPullError::InvalidOptions(_)) =>
             ErrorCode::Usage,
         HostedNetworkPullError::Transfer(NetworkPullError::PartsDirectory { .. }
@@ -2608,6 +2653,38 @@ mod tests {
         }
         assert_eq!(super::reconstruct_error_code(&PullError::ResumePrefixMismatch { part: 0, offset: 13 }),
             crate::error::ErrorCode::ArtifactIntegrityOrFormatOrVersion);
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn models_network_timeout_and_cancellation_keep_their_exit_categories() {
+        use asupersync::CancelKind as Cause;
+        use crate::{artifact::pull::http::NetworkPullError, error::ErrorCode,
+            hosted::HostedNetworkPullError};
+        let classify = |error| super::network_download_error_code(
+            &HostedNetworkPullError::Transfer(error),
+        );
+        assert_eq!(classify(NetworkPullError::RequestTimeout { part: 0, mirror: 1 }),
+            ErrorCode::BudgetOrTimeout);
+        assert_eq!(classify(NetworkPullError::DownloadBudgetExceeded {
+            limit: 137, downloaded_bytes: 137, retained_bytes: 137, total_bytes: 1000, part: 0,
+        }), ErrorCode::BudgetOrTimeout);
+        for (cause, expected) in [
+            (Some(Cause::Timeout), ErrorCode::BudgetOrTimeout),
+            (Some(Cause::Deadline), ErrorCode::BudgetOrTimeout),
+            (Some(Cause::PollQuota), ErrorCode::BudgetOrTimeout),
+            (Some(Cause::CostBudget), ErrorCode::BudgetOrTimeout),
+            (Some(Cause::ResourceUnavailable), ErrorCode::AdmissionOrResourceLimit),
+            (Some(Cause::FailFast), ErrorCode::Generic),
+            (Some(Cause::LinkedExit), ErrorCode::Generic),
+            (Some(Cause::RaceLost), ErrorCode::Generic),
+            (Some(Cause::User), ErrorCode::Cancelled),
+            (Some(Cause::ParentCancelled), ErrorCode::Cancelled),
+            (Some(Cause::Shutdown), ErrorCode::Cancelled),
+            (None, ErrorCode::Cancelled),
+        ] {
+            assert_eq!(classify(NetworkPullError::Cancelled { cause, part: Some(0) }), expected);
+        }
     }
 
     #[test]

@@ -31,6 +31,7 @@ use franken_nlp::{
         pull::{
             LocalReconstructOptions, LocalReconstructPhase, LocalReconstructRequest,
             PullError, reconstruct_local_release, reconstruct_local_release_with_options,
+            verify_local_release_cache,
         },
         reader::FnlpqRangeReader,
     },
@@ -123,6 +124,194 @@ fn fresh_package_reconstruction_publishes_exact_checked_bytes() {
     assert_eq!(checked.tensors().len(), 201);
     assert_eq!(checked.logical_model_sha256(), fixture.manifest.digests.logical_model_sha256);
     assert_eq!(fs::read(fixture.part()).unwrap(), fixture.artifact);
+}
+
+#[test]
+fn verified_final_cache_hit_needs_neither_release_parts_nor_retained_staging() {
+    let fixture = Fixture::new("final-cache-hit");
+    let request = fixture.request("installed");
+    let reconstructed = reconstruct_local_release(&request).unwrap();
+    fs::rename(&fixture.parts_dir, fixture.root.join("retained-parts")).unwrap();
+    fs::rename(&request.staging_output, fixture.root.join("retained-staging")).unwrap();
+    let report = verify_local_release_cache(
+        &request.manifest, &request.expected_release_manifest_sha256, &request.output, |_| None,
+    ).unwrap().expect("authenticated final artifact is reusable independently of its source parts");
+    assert_eq!(report.artifact_sha256, reconstructed.artifact_sha256);
+    assert_eq!(report.release_manifest_sha256, reconstructed.release_manifest_sha256);
+    assert_eq!(report.logical_model_sha256, reconstructed.logical_model_sha256);
+    assert_eq!(report.artifact_bytes, fixture.artifact.len() as u64);
+    assert_eq!(report.part_count, 1);
+    assert!(!report.activation_authority);
+    assert_eq!(fs::read(&request.output).unwrap(), fixture.artifact);
+    assert!(!fixture.parts_dir.exists());
+    assert!(!request.staging_output.exists());
+}
+
+#[test]
+fn absent_final_is_a_cache_miss_only_after_manifest_authentication() {
+    let fixture = Fixture::new("cache-miss");
+    let request = fixture.request("absent");
+    assert_eq!(verify_local_release_cache(
+        &request.manifest, &request.expected_release_manifest_sha256, &request.output, |_| None,
+    ).unwrap(), None);
+    let error = verify_local_release_cache(
+        &request.manifest, &"00".repeat(32), &request.output, |_| None,
+    ).expect_err("missing output must not bypass the independent authority pin");
+    assert!(matches!(error, PullError::ManifestDigestMismatch { .. }));
+    assert!(!request.output.exists());
+    assert!(!request.staging_output.exists());
+}
+
+#[test]
+fn existing_final_cache_rehashes_bytes_and_refuses_damage_without_mutation() {
+    let fixture = Fixture::new("cache-corruption");
+    let request = fixture.request("damaged");
+    let mut damaged = fixture.artifact.clone();
+    let last = damaged.len() - 1;
+    damaged[last] ^= 1;
+    fs::write(&request.output, &damaged).unwrap();
+    let error = verify_local_release_cache(
+        &request.manifest, &request.expected_release_manifest_sha256, &request.output, |_| None,
+    ).expect_err("matching file length is never cache evidence");
+    assert!(matches!(error, PullError::ArtifactDigest { .. }));
+    assert_eq!(fs::read(&request.output).unwrap(), damaged);
+    let truncated = fixture.root.join("truncated.fnlpq");
+    fs::write(&truncated, &fixture.artifact[..137]).unwrap();
+    let error = verify_local_release_cache(
+        &request.manifest, &request.expected_release_manifest_sha256, &truncated, |_| None,
+    ).expect_err("partial artifact is a refusal, never a miss that authorizes replacement");
+    assert!(matches!(error, PullError::ArtifactLength { observed: 137, .. }));
+    assert_eq!(fs::read(truncated).unwrap(), fixture.artifact[..137]);
+    assert!(!request.staging_output.exists());
+}
+
+#[test]
+fn final_cache_rechecks_manifest_bound_semantic_identity_after_whole_file_digest() {
+    let fixture = Fixture::new("cache-semantic-identity");
+    let mut manifest = fixture.manifest.clone();
+    manifest.digests.logical_model_sha256 = "00".repeat(32);
+    let manifest_path = fixture.root.join("different-identity.manifest.json");
+    fs::write(&manifest_path, manifest.canonical_bytes().unwrap()).unwrap();
+    let error = verify_local_release_cache(
+        &manifest_path, &manifest.release_manifest_sha256().unwrap(),
+        &fixture.root.join(LOGICAL_NAME), |_| None,
+    ).expect_err("whole-file bytes alone do not satisfy the authenticated semantic identity");
+    assert!(matches!(error, PullError::ContainerIdentity("digests.logical_model_sha256")));
+}
+
+#[test]
+fn final_cache_verification_preserves_typed_cancellation_before_io_and_during_rehash() {
+    let fixture = Fixture::new("cache-cancellation");
+    let request = fixture.request("cancelled");
+    let error = verify_local_release_cache(
+        &fixture.root.join("unopened-manifest.json"), &request.expected_release_manifest_sha256,
+        &request.output, |_| Some(DecodeCancellationKind::Deadline),
+    ).expect_err("initial cancellation wins without reading a manifest");
+    assert!(matches!(error, PullError::Cancelled { cause: DecodeCancellationKind::Deadline, .. }));
+    let mut checkpoints = 0;
+    let path = fixture.root.join(LOGICAL_NAME);
+    let error = verify_local_release_cache(
+        &request.manifest, &request.expected_release_manifest_sha256, &path,
+        |progress| {
+            assert_eq!(progress.phase, LocalReconstructPhase::VerifyArtifact);
+            assert_eq!(progress.copied_bytes, 0);
+            checkpoints += 1;
+            (checkpoints == 5).then_some(DecodeCancellationKind::Shutdown)
+        },
+    ).expect_err("whole-file hashing remains cooperatively cancellable");
+    assert!(matches!(error, PullError::Cancelled { cause: DecodeCancellationKind::Shutdown, .. }));
+    assert_eq!(fs::read(path).unwrap(), fixture.artifact);
+    assert!(!request.staging_output.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn final_cache_refuses_symlinks_and_observed_path_replacement() {
+    use std::os::unix::fs::symlink;
+    let fixture = Fixture::new("cache-path-identity");
+    let request = fixture.request("symlink");
+    let source = fixture.root.join(LOGICAL_NAME);
+    symlink(&source, &request.output).unwrap();
+    assert!(matches!(verify_local_release_cache(
+        &request.manifest, &request.expected_release_manifest_sha256, &request.output, |_| None,
+    ), Err(PullError::ExistingArtifact { .. })));
+    let dangling = fixture.root.join("dangling.fnlpq");
+    symlink(fixture.root.join("never-created"), &dangling).unwrap();
+    assert!(matches!(verify_local_release_cache(
+        &request.manifest, &request.expected_release_manifest_sha256, &dangling, |_| None,
+    ), Err(PullError::ExistingArtifact { .. })));
+    let retained = fixture.root.join("retained-original.fnlpq");
+    let mut checkpoints = 0;
+    let error = verify_local_release_cache(
+        &request.manifest, &request.expected_release_manifest_sha256, &source,
+        |_| {
+            checkpoints += 1;
+            if checkpoints == 5 {
+                fs::rename(&source, &retained).unwrap();
+                fs::write(&source, &fixture.artifact).unwrap();
+            }
+            None
+        },
+    ).expect_err("same-length, same-byte pathname replacement cannot receive the held-file receipt");
+    assert!(matches!(error, PullError::StagingChanged(_)));
+    assert_eq!(fs::read(retained).unwrap(), fixture.artifact);
+    assert_eq!(fs::read(source).unwrap(), fixture.artifact);
+}
+
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn models_acquire_reuses_verified_final_after_local_admission_without_parts_or_copy_work() {
+    let fixture = Fixture::new("acquire-cache-cli");
+    let parts = fixture.root.join("unopened-parts");
+    let staging = fixture.root.join("uncreated-stage");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fnlp"))
+        .args(["models", "acquire", "--manifest"])
+        .arg(&fixture.manifest_path)
+        .arg("--manifest-sha256").arg(fixture.manifest.release_manifest_sha256().unwrap())
+        .arg("--parts-dir").arg(&parts)
+        .arg("--staging-output").arg(&staging)
+        .arg("--output").arg(fixture.root.join(LOGICAL_NAME))
+        .args(["--memory-mib", "128", "--max-download-bytes", "0", "--max-copy-bytes", "0"])
+        .output().expect("invoke the real acquire route with no available parts or work budget");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("MODELS_ACQUIRE RESULT=PASS"), "{stderr}");
+    assert!(stderr.contains("cache_hit=true"), "{stderr}");
+    assert!(stderr.contains("network_downloaded_bytes=0"), "{stderr}");
+    assert!(stderr.contains("reconstruct_copied_bytes=0"), "{stderr}");
+    assert!(stderr.contains("local_workspace_bytes=134217728"), "{stderr}");
+    assert!(stderr.contains("activation_authority=false"), "{stderr}");
+    assert!(!parts.exists());
+    assert!(!staging.exists());
+}
+
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn models_acquire_refuses_insufficient_local_memory_before_manifest_or_artifact_io() {
+    let fixture = Fixture::new("acquire-local-memory-cli");
+    let manifest = fixture.root.join("must-not-be-opened.manifest.json");
+    let parts = fixture.root.join("unopened-parts");
+    let staging = fixture.root.join("uncreated-stage");
+    let artifact = fixture.root.join(LOGICAL_NAME);
+    for memory_mib in ["1", "127"] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_fnlp"))
+            .args(["models", "acquire", "--manifest"])
+            .arg(&manifest)
+            .arg("--manifest-sha256").arg(fixture.manifest.release_manifest_sha256().unwrap())
+            .arg("--parts-dir").arg(&parts)
+            .arg("--staging-output").arg(&staging)
+            .arg("--output").arg(&artifact)
+            .args(["--memory-mib", memory_mib])
+            .output().expect("invoke real acquire admission before the missing manifest is opened");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(9), "{stderr}");
+        assert!(stderr.contains("MODELS_ACQUIRE RESULT=REFUSED stage=local-memory"), "{stderr}");
+        assert!(!stderr.contains("stage=cache-verify"), "{stderr}");
+        assert!(!manifest.exists());
+        assert!(!parts.exists());
+        assert!(!staging.exists());
+        assert_eq!(fs::read(&artifact).unwrap(), fixture.artifact);
+    }
 }
 
 #[test]
