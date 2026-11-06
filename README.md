@@ -586,6 +586,110 @@ Library callers use `Int4SentimentPlanner::for_model`, its
 compilation, model-present correctness and quality qualification remain
 pending controller-selected gates.
 
+## Implemented candidate INT4 complete-document sentiment corpora
+
+`fnlp candidate source-int4 sentiment-corpus` scores ordered complete documents
+from `{id,text,task_args?}` NDJSON with one resident grouped-INT4 model. Each
+document is losslessly partitioned using every selected axis's exact prompt
+capacity. All chunks preflight before the document's first native forward,
+and every axis and chunk must complete before its success frame is published.
+The result retains original byte/scalar spans, independent per-chunk affect
+distributions and the existing named scalar-weighted document aggregate.
+Abstained chunks retain their descriptive distributions; the aggregate uses
+the explicit coverage and peak/entropy policy. These quantities remain
+uncalibrated and do not establish full-context equivalence or psychological
+measurement.
+
+For example, save fixed settings as `affect-axes.json`:
+
+```json
+{
+  "axes": ["valence", "arousal"],
+  "policy": {
+    "minimum_peak_weight_ppm": 600000,
+    "maximum_normalized_entropy_ppm": 800000
+  }
+}
+```
+
+Supply the original documents as NDJSON:
+
+```jsonl
+{"id":"review-1","text":"The result was useful, although the delay was frustrating."}
+{"id":"review-2","text":"The support team resolved the problem quickly."}
+{"flush":true}
+{"id":"review-1","text":"The next delivery arrived on time."}
+```
+
+```bash
+fnlp candidate source-int4 sentiment-corpus reviews.ndjson \
+  --defaults affect-axes.json --max-axes 2 --cohort-chunks 2 \
+  --snapshot /data/nanbeige.group128.snapshot \
+  --expected-model-sha256 "$TRUSTED_MODEL_CONTENT_SHA256" \
+  --group-width 128 --memory-mib 16384 --context-tokens 2048 \
+  --max-chunks 64 --max-chunk-bytes 4096 \
+  --max-requests 1000 --max-total-input-bytes 67108864 \
+  --max-total-output-bytes 67108864
+```
+
+Documents execute sequentially. Without `--cohort-chunks`, all chunks reuse
+one serial native cache. Explicit cohorts share native decoder layers across
+independent chunk/axis sessions within the current document. `--max-axes`
+defaults to four and bounds **every** defaults selection and per-record
+replacement. Its product with the declared cohort width must not exceed 64;
+invalid geometry is refused before IO without clamping or fallback. The
+example reserves four native rows. All native windows retain the resident
+model and fit the declared simultaneous KV, scratch and task workspace;
+there is no cross-document scheduling or measured speedup claim.
+
+Without a defaults file, all four axes and the existing descriptive policy
+are selected. When narrowing `--max-axes`, provide explicit compatible axes
+in the defaults file. Missing or null `task_args` uses those fixed defaults.
+A non-null override replaces complete `SentimentBatchArgs {axes,budget}`
+within the host ceiling. It cannot change the run's policy, full-vocabulary
+score space, EOS, model or prompts. Duplicate keys, duplicate/unknown axes,
+unknown authority fields and incomplete replacements are rejected.
+
+All five flags—`--max-forward-positions`, `--max-projected-logits`,
+`--max-attention-pairs`, `--max-dot-products` and
+`--max-multiply-accumulates`—bound the **entire invocation**. Document count,
+chunk cohorts and flush controls never renew those allowances, and admitted
+failed attempts retain their charges. `--max-checkpoints` and the deadline
+also span the complete stream; blocking IO remains cooperative.
+`--max-input-bytes` bounds each decoded original source, while
+`--max-line-bytes` separately bounds encoded NDJSON, including JSON escapes.
+`--max-result-bytes` bounds one complete native chunk;
+`--max-retained-result-bytes` and `--max-map-result-bytes` bound the retained
+frontier and full semantic document result. Output framing and every live
+transport, default, plan, identity and native allocation are additionally
+priced before input IO. These limits are admission ceilings, not a guarantee
+that an arbitrary corpus fits.
+
+Frames use `fnlp-candidate-int4-sentiment-corpus-v1`, with the ordered batch
+event under `record`. Serial maps appear under `record.result`. Cohort runs
+declare `chunk_schedule: "native_chunk_cohorts"` and `cohort_chunks`, and place
+native window/projection statistics alongside the semantic map at
+`record.result.output`. An exact `{"flush":true}` drains the current ID epoch
+before IDs may be reused. Earlier completed documents remain usable after a
+later error, but whole-run success requires **both `run_complete` and exit
+status zero**. This live route does not provide durable resume.
+
+Source conversion uses `--source-dir` and `--source-manifest`; an explicitly
+requested `--save-snapshot` follows fixed model/default/envelope admission and
+can remain after a later row is rejected. The route requires
+`asupersync-runtime` and rejects sampled sentiment, focus presets, generation
+controls, `--prefill-rows` and `--cohort-heads`.
+
+Library callers use `Int4SentimentDocumentBatchPlanner`, its explicit
+`with_max_axes` and `with_chunk_cohorts` controls, and
+`NlpEngine::batch_int4_sentiment_documents` with owned reader/writer and
+`CorpusLimits`. `int4_sentiment_document_corpus_requirements` quotes the
+complete hosted envelope before IO. Model-free regression sources and an
+explicitly ignored full-model fixture cover strict controls, declared memory,
+serial/cohort equivalence with standalone maps and work exhaustion across
+flush. Compilation, native parity and task quality remain subject to their
+separate controller validation gates.
+
 ## Implemented candidate INT4 judgment
 
 `fnlp candidate source-int4 judge` runs **pairwise, rubric and faithfulness**

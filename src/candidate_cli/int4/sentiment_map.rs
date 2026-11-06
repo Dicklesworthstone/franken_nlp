@@ -7,6 +7,7 @@ use crate::tasks::{ir::TaskBudget, mapreduce::ChunkLimits,
 
 #[cfg(feature = "asupersync-runtime")]
 mod runtime;
+pub(super) mod corpus;
 #[cfg(test)]
 mod tests;
 
@@ -72,6 +73,12 @@ impl MapArgs {
             mapping: MappingArgs::from_arg_matches(matches)? })
     }
     pub(super) fn validate(self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
+        self.validate_with_max_axes(args, 4)
+    }
+    /// Corpus callers can narrow every document's declared axis capability.
+    /// One-off maps continue to admit their original four-axis request space.
+    fn validate_with_max_axes(self, args: &Int4Args, max_axes: usize) -> Result<MapLimits, CandidateError> {
+        if !(1..=4).contains(&max_axes) { return Err(CandidateError::Arguments); }
         let mut common = self.scoring.validate(args)?;
         let m = self.mapping;
         if args.max_input_bytes < 4 || !(1..=256).contains(&m.max_chunks)
@@ -87,7 +94,7 @@ impl MapArgs {
         let aggregation = SentimentAggregationPolicy {
             minimum_estimated_coverage_ppm: m.minimum_estimated_coverage_ppm };
         aggregation.validate().map_err(|_| CandidateError::Arguments)?;
-        let budget = self.budget(common)?;
+        let budget = self.budget_with_max_axes(common, max_axes)?;
         let chunks = ChunkLimits { max_input_bytes: args.max_input_bytes,
             max_chunk_bytes: m.max_chunk_bytes.unwrap_or(args.max_input_bytes),
             max_chunk_tokens: common.max_prompt_tokens,
@@ -98,11 +105,11 @@ impl MapArgs {
             max_retained_result_bytes: m.max_retained_result_bytes,
             max_result_bytes: m.max_map_result_bytes, aggregation };
         let planning = self.scoring.sentiment_limits(args);
-        // Before request IO, price the largest valid geometry for the four
-        // available axes. Actual axes*cohort_chunks must still fit 64 later.
+        // Before request IO, price the largest valid declared axis geometry.
+        // Actual axes*cohort_chunks must still fit 64 later.
         let memory = Int4SentimentMapMemoryLimits { context_tokens: args.context_tokens,
             preparation_reserve_bytes: common.preparation_bytes, allocator_reserve_bytes: ALLOCATOR_BYTES,
-            max_axes: 4, cohort_chunks: m.cohort_chunks }
+            max_axes, cohort_chunks: m.cohort_chunks }
             .requirements(args.group_width, budget, planning, mapping).map_err(|_| CandidateError::Arguments)?;
         let envelope_bytes = memory.max_output_bytes.checked_add(4096)
             .and_then(|bytes| usize::try_from(bytes).ok()).ok_or(CandidateError::Arguments)?;
@@ -120,11 +127,15 @@ impl MapArgs {
         Ok(MapLimits { common, mapping, planning, memory, cli_preparation_bytes, envelope_bytes })
     }
     fn budget(self, common: Int4Limits) -> Result<TaskBudget, CandidateError> {
+        self.budget_with_max_axes(common, 4)
+    }
+    fn budget_with_max_axes(self, common: Int4Limits, max_axes: usize) -> Result<TaskBudget, CandidateError> {
+        if !(1..=4).contains(&max_axes) { return Err(CandidateError::Arguments); }
         let mut budget = self.scoring.budget(common);
-        // One complete chunk can contain four independent axes. Freeze this
+        // One complete chunk can contain every declared axis. Freeze this
         // task authority for both serial and cohort execution; the actual
         // resident engine geometry is priced separately by the pure quote.
-        budget.max_kv_bytes = common.native.kv_bytes.checked_mul(4).ok_or(CandidateError::Arguments)?;
+        budget.max_kv_bytes = common.native.kv_bytes.checked_mul(max_axes as u64).ok_or(CandidateError::Arguments)?;
         Ok(budget)
     }
     fn admit_request(self, request: &SentimentRequest) -> Result<(), CandidateError> {
