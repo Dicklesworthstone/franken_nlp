@@ -15,7 +15,7 @@ pub use assay_extract::{Int4ExtractAssayHostLimits, Int4ExtractAssayHostRequirem
 mod sentiment;
 pub use sentiment::{Int4SentimentHostLimits, Int4SentimentMapHostConfig};
 mod judge;
-pub use judge::Int4JudgeHostLimits;
+pub use judge::{Int4JudgeHostLimits, Int4FaithfulnessMapHostConfig};
 mod resolve;
 pub use resolve::{Int4ResolveConfig, HostedInt4EntityCorpus, Int4EntityCorpusError,
     Int4EntityCorpusHostConfig, Int4EntityCorpusHostRequirements, Int4EntityCorpusSummary};
@@ -102,6 +102,7 @@ pub enum Int4HostError {
     Sentiment(crate::tasks::sentiment::grouped_int4::Int4SentimentError),
     SentimentMap(crate::tasks::sentiment::grouped_int4::long::Int4SentimentMapError),
     Judge(crate::tasks::judge::grouped_int4::Int4JudgeError),
+    FaithfulnessMap(crate::tasks::judge::grouped_int4::faithfulness_map::Int4FaithfulnessMapError),
     Resolution(crate::corpus::native_resolve::grouped_int4::Int4ResolveError),
     Entities(crate::corpus::entities_int4::Int4EntityError),
     Redaction(crate::tasks::redact::grouped_int4::Int4RedactionError),
@@ -126,6 +127,7 @@ impl fmt::Display for Int4HostError {
             Self::Sentiment(_) => "INT4 sentiment execution or finalization refused",
             Self::SentimentMap(_) => "INT4 complete-document sentiment mapping or aggregation refused",
             Self::Judge(_) => "INT4 complete judgment execution or finalization refused",
+            Self::FaithfulnessMap(_) => "INT4 complete-source faithfulness mapping or evidence reduction refused",
             Self::Resolution(_) => "INT4 entity resolution scoring or clustering refused",
             Self::Entities(_) => "INT4 original-document entity discovery or resolution refused",
             Self::Redaction(_) => "INT4 redaction detection, editing or verification refused",
@@ -148,7 +150,7 @@ impl Error for Int4HostError {
             Self::Chat(e) => Some(e), Self::Snapshot(e) => Some(e), Self::Classification(e) => Some(e),
             Self::ClassificationMap(e) => Some(e),
             Self::Sentiment(e) => Some(e), Self::SentimentMap(e) => Some(e),
-            Self::Judge(e) => Some(e), Self::Resolution(e) => Some(e),
+            Self::Judge(e) => Some(e), Self::FaithfulnessMap(e) => Some(e), Self::Resolution(e) => Some(e),
             Self::Entities(e) => Some(e), Self::Redaction(e) => Some(e),
             Self::Extraction(e) => Some(e), Self::ExtractionMap(e) => Some(e), Self::SourceTask(e) => Some(e),
             Self::SemanticExtraction(e) => Some(e),

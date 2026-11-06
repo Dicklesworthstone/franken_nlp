@@ -6,6 +6,9 @@ use crate::{
         Int4JudgeRun, PreparedInt4Judge, INT4_JUDGE_EXECUTION}},
 };
 
+mod faithfulness_map;
+pub use faithfulness_map::Int4FaithfulnessMapHostConfig;
+
 /// Nonrenewable work for both comparison orders, every criterion or the
 /// complete full-source/evidence bundle. Callers admit compiled-plan storage
 /// before transfer; this host retains its own preparation charge through the

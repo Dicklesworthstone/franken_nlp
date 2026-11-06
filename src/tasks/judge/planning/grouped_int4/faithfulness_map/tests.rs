@@ -113,7 +113,7 @@ fn source_partition_and_every_claim_preserve_original_utf8_and_literal_controls(
     let JudgeRequest::Faithfulness { source, claim, .. } = &request else { unreachable!() };
     let (compiler, _) = fixture(); let mut rebuilt = String::new();
     assert!(plan.chunk_count() > 1); assert!(plan.max_head_count() > 1);
-    assert_eq!(plan.head_count(), plan.plans.iter().map(PreparedInt4Judge::head_count).sum());
+    assert_eq!(plan.head_count(), plan.plans.iter().map(PreparedInt4Judge::head_count).sum::<usize>());
     for (chunk, row) in plan.chunks.chunks().iter().zip(&plan.plans) {
         rebuilt.push_str(chunk.text()); assert_eq!(chunk.tokens(), chunk.text().len());
         assert!(!chunk.text().ends_with('\r'));

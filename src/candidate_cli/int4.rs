@@ -9,6 +9,7 @@ mod classify_map;
 mod sentiment;
 mod sentiment_map;
 mod judge;
+mod faithfulness_map;
 mod scored_batch;
 mod scored_job;
 mod resolve;
@@ -125,6 +126,7 @@ enum Int4Task {
     Sentiment(sentiment::SentimentArgs),
     SentimentMap(sentiment_map::MapArgs),
     Judge(judge::JudgeArgs),
+    FaithfulnessMap(faithfulness_map::MapArgs),
     ScoredBatch(scored_batch::BatchArgs),
     Resolve(resolve::ResolveArgs),
     ResolveCorpus(resolve::corpus::CorpusArgs),
@@ -185,6 +187,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(sentiment::definition())
         .subcommand(sentiment_map::definition())
         .subcommand(judge::definition())
+        .subcommand(faithfulness_map::definition())
         .subcommand(scored_batch::definition())
         .subcommand(scored_job::definition())
         .subcommand(document_job::definition())
@@ -263,6 +266,7 @@ impl Int4Command {
             "sentiment" => Int4Task::Sentiment(sentiment::SentimentArgs::from_matches(matches)?),
             "sentiment-map" => Int4Task::SentimentMap(sentiment_map::MapArgs::from_matches(matches)?),
             "judge" => Int4Task::Judge(judge::JudgeArgs::from_matches(matches)?),
+            "faithfulness-map" => Int4Task::FaithfulnessMap(faithfulness_map::MapArgs::from_matches(matches)?),
             "score-batch" => Int4Task::ScoredBatch(scored_batch::BatchArgs::from_matches(matches)?),
             "resolve" => Int4Task::Resolve(resolve::ResolveArgs::from_matches(matches)?),
             "resolve-corpus" => Int4Task::ResolveCorpus(resolve::corpus::CorpusArgs::from_matches(matches)?),
@@ -358,6 +362,9 @@ impl Int4Command {
         if let Int4Task::Judge(options) = self.task {
             return options.execute(self.args, input, output);
         }
+        if let Int4Task::FaithfulnessMap(options) = self.task {
+            return options.execute(self.args, input, output);
+        }
         if let Int4Task::Semantic(options) = self.task {
             return options.execute(self.args, input, output);
         }
@@ -376,7 +383,7 @@ impl Int4Command {
             Int4Task::Extract(extraction) => extraction.validate_with_prefill(&self.args)?,
             Int4Task::Source(_, source) => source.validate_with_prefill(&self.args)?,
             // The blocking stream must own its input and writer through cleanup.
-            Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::Semantic(_) | Int4Task::Resolve(_) | Int4Task::Sentiment(_) | Int4Task::SentimentMap(_) | Int4Task::ClassifyMap(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ScoredBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
+            Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::FaithfulnessMap(_) | Int4Task::Semantic(_) | Int4Task::Resolve(_) | Int4Task::Sentiment(_) | Int4Task::SentimentMap(_) | Int4Task::ClassifyMap(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ScoredBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
                 | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob => return Err(CandidateError::Arguments),
         };
         #[cfg(feature = "asupersync-runtime")]
