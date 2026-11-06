@@ -175,6 +175,7 @@ fn exact_host_detection_authorizes_a_kernel_or_refuses_before_any_input() {
             let admission = match &command.task {
                 Int4Task::Text(_) => command.args.validate(),
                 Int4Task::Classify(scoring) => scoring.validate(&command.args),
+                Int4Task::ClassifyMap(map) => map.validate(&command.args).map(|limits| limits.common),
                 Int4Task::Sentiment(sentiment) => sentiment.validate(&command.args),
                 Int4Task::SentimentMap(map) => map.validate(&command.args).map(|limits| limits.common),
                 Int4Task::Judge(judge) => judge.validate(&command.args),
@@ -216,6 +217,7 @@ fn physical_kernel_selection_does_not_change_layout_memory_or_generation_options
         let limits = |command: &Int4Command| match &command.task {
             Int4Task::Text(_) => command.args.validate().unwrap(),
             Int4Task::Classify(scoring) => scoring.validate(&command.args).unwrap(),
+            Int4Task::ClassifyMap(map) => map.validate(&command.args).unwrap().common,
             Int4Task::Sentiment(sentiment) => sentiment.validate(&command.args).unwrap(),
             Int4Task::SentimentMap(map) => map.validate(&command.args).unwrap().common,
             Int4Task::Judge(judge) => judge.validate(&command.args).unwrap(),

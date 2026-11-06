@@ -1,4 +1,4 @@
-//! Whole-document preflight, one owned native map and complete publication.
+//! One complete hosted classification map and guarded publication.
 use super::*;
 use std::time::{Duration, Instant};
 use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
@@ -6,9 +6,11 @@ use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, Me
         NativeLimits, RunLimits},
     native_engine::{decode::{DecodeCancellationKind, DecodeStepControl},
         generation::grouped_int4::INT4_SOURCE_FORMAT,
-        strict_int4::weights::snapshot::INT4_SNAPSHOT_VERSION},
-    tasks::classify::{ClassificationMode, grouped_int4::{Int4ClassificationError,
-        Int4ClassificationPlanner, long::Int4ClassificationMapError}}};
+        strict_int4::{Int4ModelError, StrictInt4Error,
+            weights::snapshot::{Int4SnapshotError, INT4_SNAPSHOT_VERSION}}},
+    tasks::classify::{ClassificationMode,
+        grouped_int4::{Int4ClassificationError, Int4ClassificationPlanner,
+            long::Int4ClassificationMapError}}};
 
 struct DeadlineControl { started: Instant, deadline: Duration }
 impl DecodeStepControl for DeadlineControl {
@@ -28,16 +30,21 @@ fn planning_error(error: Int4ClassificationMapError) -> CandidateError {
 fn classification_error(error: Int4ClassificationError) -> CandidateError {
     error.cancellation().map(stopped).unwrap_or(CandidateError::Planning)
 }
-fn execution_error(error: HostedError) -> CandidateError {
+fn host_error(error: HostedError, fallback: CandidateError) -> CandidateError {
     match error {
         HostedError::Stopped { stop, .. } => stopped(stop.kind),
         HostedError::Join { physical_error: Some(error), .. }
-            | HostedError::Scope { physical_error: Some(error), .. } => execution_error(*error),
+            | HostedError::Scope { physical_error: Some(error), .. } => host_error(*error, fallback),
         HostedError::Int4(Int4HostError::ClassificationMap(error)) =>
-            error.cancellation().map(stopped).unwrap_or(CandidateError::Execution),
+            error.cancellation().map(stopped).unwrap_or(fallback),
+        HostedError::Int4(Int4HostError::Classification(error)) =>
+            error.cancellation().map(stopped).unwrap_or(fallback),
+        HostedError::Int4(Int4HostError::Model(Int4ModelError::Cancelled(cause)))
+            | HostedError::Int4(Int4HostError::Snapshot(Int4SnapshotError::Cancelled(cause)))
+            | HostedError::Int4(Int4HostError::Native(StrictInt4Error::Cancelled(cause))) => stopped(cause),
         HostedError::Reservation(_) => CandidateError::Memory,
         HostedError::ModelIdentity | HostedError::ResourceDomain => CandidateError::Identity,
-        _ => CandidateError::Execution,
+        _ => fallback,
     }
 }
 
@@ -56,6 +63,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
     }).build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
+    // Retain source/parser and final JSON staging ownership from before input
+    // IO through physical write and flush, including every failure path.
     let _preparation = lease.reserve(MemoryClass::JobBuffers, limits.cli_preparation_bytes)
         .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
     remaining()?;
@@ -63,12 +72,13 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         else { read_input(&mut crate::local_io::open_document(&args.input)
             .map_err(|_| CandidateError::Input)?, args.max_input_bytes)? };
     remaining()?;
-    let budget = options.budget(common);
+    let budget = options.budget(common, limits.planning.max_labels)?;
     let request = classify::parse_request(&text, budget, args.max_input_bytes)?;
     drop(text);
     remaining()?;
     let cancellation = CancellationToken::default();
-    let model = super::super::runtime::load_model(&engine, &args, common, remaining()?, cancellation.clone())?;
+    let model = super::super::runtime::load_model_with_failure(&engine, &args, common,
+        remaining()?, cancellation.clone(), |error| host_error(error, CandidateError::Model))?;
     remaining()?;
     let mut config = Int4ClassificationMapHostConfig {
         native: NativeLimits { context_tokens: args.context_tokens, allocator_reserve_bytes: ALLOCATOR_BYTES,
@@ -77,19 +87,21 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         planning: limits.planning, mapping: limits.mapping,
         preparation_reserve_bytes: common.preparation_bytes,
     };
-    // Ordinary execution compiles each chunk once inside the charged host.
-    // An explicit snapshot save requires complete preflight first, so an
-    // invalid document cannot create a requested snapshot as a side effect.
+    // Ordinary execution plans once inside the charged host. An explicit
+    // snapshot save first preflights the entire document so a known-invalid
+    // later chunk or whole-document work refusal creates no snapshot file.
     let expected = if args.save_snapshot.is_some() {
         let preflight_bytes = sum(&[limits.memory.input_bytes, limits.memory.workspace_bytes])?;
         let _preflight = lease.reserve(MemoryClass::JobBuffers, preflight_bytes)
             .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
-        let planner = Int4ClassificationPlanner::for_model(model.model_identity(), budget,
-            config.planning).map_err(classification_error)?;
+        let planner = Int4ClassificationPlanner::for_model(model.model_identity(), budget, config.planning)
+            .map_err(classification_error)?;
         let prepared = planner.plan_document_with_control(&request, config.mapping,
             &mut DeadlineControl { started, deadline }).map_err(planning_error)?;
         let heads = if request.mode == ClassificationMode::Exclusive { 1 } else { request.labels.len() };
-        if prepared.head_count() != heads || prepared.required_context() > args.context_tokens {
+        if prepared.head_count() != heads || prepared.required_context() > args.context_tokens
+            || prepared.group_width() != model.model_identity().group_width()
+            || prepared.task_budget() != budget || prepared.max_result_bytes() != config.mapping.max_result_bytes {
             return Err(CandidateError::Identity);
         }
         Some(prepared.preflight_metadata())
@@ -99,7 +111,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     if let Some(path) = &args.save_snapshot {
         let pin = engine.save_int4_snapshot(&model, path.clone(), common.snapshot_budget(false)?,
             RunLimits { max_elapsed: remaining()?, max_checkpoints: args.snapshot_checkpoints,
-                cleanup_reserve_bytes: CLEANUP_BYTES }, cancellation.clone()).map_err(|_| CandidateError::Model)?;
+                cleanup_reserve_bytes: CLEANUP_BYTES }, cancellation.clone())
+            .map_err(|error| host_error(error, CandidateError::Model))?;
         if pin != model.model_identity().snapshot_pin() { return Err(CandidateError::Identity); }
         snapshot = Some(SnapshotRecord::new("saved", common.snapshot_need));
     }
@@ -114,17 +127,19 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         candidate_format: INT4_SOURCE_FORMAT, quant_recipe: &recipe,
         group_width: model_identity.group_width(), integer_kernel: common.kernel.kind().id(), snapshot };
     let result = engine.map_int4_classify(&model, request, config, common.kernel, cancellation)
-        .map_err(execution_error)?;
+        .map_err(|error| host_error(error, CandidateError::Execution))?;
     if let Some(expected) = expected {
         expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
     }
+    // The hosted guard and CLI publication reservation outlive serialization,
+    // deadline checks, the complete external write and its physical flush.
     publish_complete(&Response { provenance: &provenance, output: result.result() },
         limits.envelope_bytes, output, &remaining)
 }
 
-/// Stage the entire document before checking the final publication deadline.
-/// No output begins after a deadline spent during serialization. The hosted
-/// result and its resource guard stay live through the physical write/flush.
+/// No bytes escape on an incomplete native result, serialization/cap refusal,
+/// or a deadline reached before publication. A writer can still fail after
+/// emitting transport bytes; that is an error, never successful completion.
 fn publish_complete<T: Serialize>(value: &T, cap: usize, output: &mut impl Write,
     remaining: &impl Fn() -> Result<Duration, CandidateError>) -> Result<(), CandidateError> {
     remaining()?;
@@ -161,4 +176,5 @@ struct Response<'a, 'b, T: Serialize> {
     output: &'a T,
 }
 
-#[cfg(test)] mod tests;
+#[cfg(test)]
+mod tests;

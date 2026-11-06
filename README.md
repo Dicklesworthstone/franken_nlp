@@ -34,6 +34,7 @@
 > Candidate execution requires the `asupersync-runtime` feature. The
 > `candidate source-int4` namespace includes generation/chat,
 > [live token streaming](#implemented-candidate-int4-token-streaming), classification,
+> [complete-document classification](./docs/native-classification-map-int4.md),
 > [independent dimensional sentiment](#implemented-candidate-int4-dimensional-sentiment),
 > [pairwise, rubric and faithfulness judgment](#implemented-candidate-int4-judgment),
 > [resident classification, sentiment and judgment streams](#implemented-candidate-int4-scoring-batches),

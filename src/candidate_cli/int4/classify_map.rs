@@ -25,34 +25,33 @@ struct MappingArgs {
     max_chunk_bytes: Option<usize>,
     #[arg(long, default_value_t = 8192)]
     max_tokenizer_calls: usize,
-    /// Complete semantic document result; provenance has a separate fixed allowance.
+    /// Complete semantic document result; framing has a separate fixed allowance.
     #[arg(long, default_value_t = 16_777_216)]
     max_map_result_bytes: u64,
-    /// Complete retained chunk results; never renewed per chunk or label.
+    /// Complete retained native chunk results, never renewed per chunk.
     #[arg(long, default_value_t = 67_108_864)]
     max_retained_result_bytes: u64,
-    /// Required original-scalar coverage by classified chunks; 1000000 requires all.
-    /// Multi-label classification applies this threshold independently to every label.
+    /// Required original-scalar coverage by classified heads; 1000000 requires all.
     #[arg(long, default_value_t = 1_000_000)]
     minimum_classified_coverage_ppm: u32,
 }
 
 pub(super) fn definition() -> clap::Command {
     MappingArgs::augment_args(classify::definition().name("classify-map")
-        .about("Classify every chunk of a complete document and report an explicit label-weight mixture")
-        .long_about("Read the same strict {document, labels, mode?, policy?} JSON object as classify. Losslessly partition the complete original source using the pinned encoder and the exact label/codebook prompt capacity. Preflight every chunk and all five whole-document native work ceilings before the first forward. Preserve complete per-chunk classifications and original byte/scalar lineage. The named aggregation weights chunks by original Unicode scalar count, includes abstained chunks in descriptive mixtures, and publishes a decision only when both the classified-coverage threshold and the request's candidate-weight/margin policy pass. Multi-label yes/no mixtures and coverage are independent for each label; labels never compete in a softmax. Aggregate weights are uncalibrated descriptive chunk mixtures, not full-context model probabilities. All plans, one reusable native cache, retained results and complete publication are memory-admitted before input IO. Source conversion and independently digest-pinned snapshots use the same route. A failed chunk publishes no partial document. Execution is serial; no sampling, thinking, tools, prompt overrides, --prefill-rows or --cohort-heads. Blocking IO observes the complete invocation deadline cooperatively.")
+        .about("Classify every chunk of a complete document with explicit aggregate decisions")
+        .long_about("Read the same strict {document, labels, mode?, policy?} JSON request as classify, then losslessly partition the complete original source using the pinned encoder and every label head's exact prompt capacity. Preflight all chunks and all five whole-document native work ceilings before the first forward. Preserve complete per-chunk full-vocabulary sequence scores and byte/scalar lineage. A separately named, uncalibrated reduction weights candidate distributions by original Unicode scalar counts; it is not a full-context model probability. Exclusive mode mixes the finite label choices; multi_label mode retains independent yes/no decisions and coverage for each label. Abstained chunks remain in descriptive weights, and aggregate decisions require the explicit classified-coverage threshold plus the existing peak/margin policy. Native heads and chunks execute serially on one reusable cache. All-chunk plans, native workspaces, retained results and complete publication are memory-admitted before input IO. Source conversion and independently pinned snapshots share this route. A failed chunk publishes no partial document. No sampling, prompt overrides, thinking, tools, --prefill-rows, --cohort-heads or --cohort-chunks. Blocking IO observes the end-to-end deadline cooperatively.")
         .mut_arg("input", |arg| arg.help("One complete typed classification JSON object; '-' reads stdin; not NDJSON"))
         .mut_arg("max_input_bytes", |arg| arg.default_value("1048576")
-            .help("Maximum bytes of the complete JSON request, including original document and labels"))
+            .help("Maximum bytes of the complete JSON request, including source, labels and policy"))
         .mut_arg("preparation_mib", |arg| arg.default_value("1024"))
         .mut_arg("max_result_bytes", |arg| arg.help("Complete native result per chunk; --max-map-result-bytes bounds the document"))
         .mut_arg("max_forward_positions", |arg| arg.default_value("262144")
-            .help("Whole-document native forward ceiling across all chunks and label heads"))
+            .help("Whole-document native forward ceiling across every chunk and label head"))
         .mut_arg("max_projected_logits", |arg| arg.default_value("10000000000"))
         .mut_arg("max_attention_pairs", |arg| arg.default_value("1000000000000"))
         .mut_arg("max_dot_products", |arg| arg.default_value("10000000000000000"))
         .mut_arg("max_multiply_accumulates", |arg| arg.default_value("10000000000000000"))
-        .mut_arg("max_checkpoints", |arg| arg.help("Cooperative allowance for the complete hosted plan, all chunks and reduction")))
+        .mut_arg("max_checkpoints", |arg| arg.help("Cooperative allowance for the complete hosted plan, every chunk and reduction")))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -84,7 +83,8 @@ impl MapArgs {
         let aggregation = ClassificationAggregationPolicy {
             minimum_classified_coverage_ppm: m.minimum_classified_coverage_ppm };
         aggregation.validate().map_err(|_| CandidateError::Arguments)?;
-        let budget = self.budget(common);
+        let planning = self.scoring.classification_limits(args);
+        let budget = self.budget(common, planning.max_labels)?;
         let chunks = ChunkLimits { max_input_bytes: args.max_input_bytes,
             max_chunk_bytes: m.max_chunk_bytes.unwrap_or(args.max_input_bytes),
             max_chunk_tokens: common.max_prompt_tokens,
@@ -94,7 +94,8 @@ impl MapArgs {
         let mapping = Int4ClassificationMapLimits { chunks, max_model_work: self.scoring.work_ceiling(),
             max_retained_result_bytes: m.max_retained_result_bytes,
             max_result_bytes: m.max_map_result_bytes, aggregation };
-        let planning = self.scoring.classification_limits(args);
+        // Price the declared maximum label count in either mode before input
+        // IO. Heads execute sequentially, so one native KV context suffices.
         let memory = Int4ClassificationMapMemoryLimits { context_tokens: args.context_tokens,
             preparation_reserve_bytes: common.preparation_bytes, allocator_reserve_bytes: ALLOCATOR_BYTES }
             .requirements(args.group_width, budget, planning, mapping).map_err(|_| CandidateError::Arguments)?;
@@ -113,7 +114,15 @@ impl MapArgs {
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(MapLimits { common, mapping, planning, memory, cli_preparation_bytes, envelope_bytes })
     }
-    fn budget(self, common: Int4Limits) -> TaskBudget { self.scoring.budget(common) }
+    fn budget(self, common: Int4Limits, max_heads: usize) -> Result<TaskBudget, CandidateError> {
+        let mut budget = self.scoring.budget(common);
+        // Freeze logical task authority for all declared independent heads.
+        // The physical serial memory quote still reserves just one cache;
+        // changing an admitted schedule must not change the task identity.
+        budget.max_kv_bytes = common.native.kv_bytes.checked_mul(max_heads as u64)
+            .ok_or(CandidateError::Arguments)?;
+        Ok(budget)
+    }
     pub(super) fn execute(self, args: Int4Args, input: &mut impl Read, output: &mut impl Write)
         -> Result<(), CandidateError> {
         let limits = self.validate(&args)?;
