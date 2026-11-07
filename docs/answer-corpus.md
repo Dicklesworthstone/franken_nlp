@@ -247,3 +247,12 @@ owned reader/writer, `CorpusLimits`, reduction reserve, kernel and cancellation
 token. `hosted::int4_question_document_corpus_requirements` exposes the same pure
 quote used by the command. Neither API requires metadata-store or invents a
 durable population contract.
+
+## Authenticated durable populations
+
+For retained results and resumable complete source/question items, use
+[`answer-document-job start|resume`](answer-document-jobs.md). That command
+reuses this same question compiler, answer modes and physical schedules through
+the owned job runner. It adds explicit result retention, authenticated lifetime
+work, whole-population identity and optional retained-input replay. The live
+`answer-corpus` command keeps its ordered-stream contract.

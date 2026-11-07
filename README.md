@@ -374,11 +374,12 @@ scored explicitly, and native work reports the actual projected rows.
 
 The option composes with `--prefill-rows` and, for extraction, `--source-membership`.
 It binds a distinct execution identity before host admission and preserves
-the built-in source finalizers. Serial `extract-batch` also accepts a fixed
-`--max-selected-rows` for its entire resident stream, with exact output-token
-admission and cumulative native/mask limits. Its `--cohort-documents` mode,
-source-task batches, maps, durable jobs, redaction and semantic second-reader
-routes reject selected rows. Full-vocabulary execution remains the default.
+the built-in source finalizers. Serial `extract-batch`, `ner-batch`,
+`keyphrases-batch`, `summarize-batch` and `answer-batch` accept a fixed
+`--max-selected-rows` for the entire resident stream, with exact output-token
+admission and cumulative native/mask limits. Per-record options cannot change
+that policy. Native cohorts, complete-document maps/corpora, durable jobs,
+redaction and semantic second-reader routes reject selected rows. Full-vocabulary execution remains the default.
 Prose fields can require a large row cap and fail
 explicitly when it is too small. See [selected-row INT4 source tasks](docs/int4-selected-rows.md)
 for CLI/library examples, accounting and the pending native-parity and
@@ -1980,14 +1981,39 @@ and physical crash qualification remain pending controller DSR gates.
 complete original source. One resident model serves the stream. The default
 preserves independent chunk answers and original-coordinate citations;
 `--synthesize-answer` adds one native answer over all collected verified source
-quotes. Explicit `--cohort-chunks N` shares native discovery layers before the
-optional scalar evidence pass. All five native work ceilings, masks and both
-verification pools remain finite across the entire run and every flush.
+quotes. Add `--hierarchical-answer` for bounded, explicitly lossy quotation
+selection when the evidence frontier exceeds one context. Every pass retains
+the record's original question and lifts citations to original source offsets.
+`--cohort-chunks N` and `--cohort-hierarchy-groups N` independently select native
+discovery and within-level schedules. All five native work ceilings, masks and
+both verification pools remain finite across the entire run and every flush;
+all permitted hierarchy passes are reserved before discovery.
 
 See [complete-source question-answering corpora](docs/answer-corpus.md) for the
-strict input contract, source/snapshot examples, complete-evidence synthesis,
+strict input contract, source/snapshot examples, flat synthesis and hierarchy,
 memory and work admission, and completion semantics. This live route requires
 `asupersync-runtime`; it does not require retained-job storage.
+
+### Retained complete-source question jobs
+
+`fnlp candidate source-int4 answer-document-job start|resume` applies the same
+per-record question compiler to an authenticated owned population. Independent
+answers, flat synthesis, hierarchies and both cohort schedules share one native
+implementation with `answer-corpus`. One complete source/question pair is the
+durable item; chunks and intermediate evidence passes never become partial
+successful records. All five native work axes and masks remain debited after a
+failed attempt, and verification lifetimes are bounded by the immutable attempt
+cap. Exact options, hierarchy policy, question bytes, model and schedules bind
+resume authority.
+
+The command uses the existing protected job directory, key, lifetime limits,
+result spool and materializer. Shared explicit `--spool-input` and
+`--use-retained-input` options support authenticated input replay; ordinary
+resume requires the original population again. CLI and host share one complete
+memory quote covering the retained population, source/question frontiers,
+native phase peak and hierarchy transcripts. Stdout contains metadata only.
+See [durable per-record question jobs](docs/answer-document-jobs.md) for examples,
+privacy boundaries and the source-only validation status.
 
 ## Implemented candidate INT4 source tasks
 

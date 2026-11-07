@@ -15,6 +15,9 @@ mod keyphrases;
 mod cohort;
 mod corpus;
 pub use corpus::int4_question_document_corpus_requirements;
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub use corpus::job::int4_question_document_job_requirements;
 pub(super) mod workspace;
 pub(super) mod documents;
 pub use documents::{Int4SourceDocumentCorpusRequirement, int4_source_document_corpus_requirements};

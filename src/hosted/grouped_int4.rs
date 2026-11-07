@@ -33,6 +33,9 @@ mod source;
 mod source_map;
 pub use source_map::{Int4SourceMapConfig, Int4SourceDocumentCorpusRequirement,
     int4_source_document_corpus_requirements, int4_question_document_corpus_requirements};
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub use source_map::int4_question_document_job_requirements;
 mod corpus;
 pub use corpus::{Int4SourceCorpusConfig, Int4ExtractionCohortBatchResult, Int4SourceCohortBatchResult};
 mod scored_batch;

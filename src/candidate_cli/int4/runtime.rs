@@ -109,7 +109,7 @@ impl DecodeStepControl for DeadlineControl {
 
 pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
-    if matches!(&task, Int4Task::ExtractCorpus(_) | Int4Task::AnswerCorpus(_) | Int4Task::SourceCorpus(_)) { return Err(CandidateError::Arguments); }
+    if matches!(&task, Int4Task::ExtractCorpus(_) | Int4Task::AnswerCorpus(_) | Int4Task::SourceCorpus(_) | Int4Task::QuestionDocumentJob) { return Err(CandidateError::Arguments); }
     if matches!(&task, Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::FaithfulnessMap(_) | Int4Task::FaithfulnessCorpus(_) | Int4Task::Semantic(_) | Int4Task::Resolve(_) | Int4Task::Sentiment(_) | Int4Task::SentimentMap(_) | Int4Task::SentimentCorpus(_) | Int4Task::ClassifyMap(_) | Int4Task::ClassifyCorpus(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ScoredBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_) | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::ClassificationDocumentJob | Int4Task::SentimentDocumentJob | Int4Task::FaithfulnessDocumentJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob)
         || limits.minimum_memory_bytes > limits.memory_bytes || limits.kernel.kind() != args.kernel
         || !prefill::matches(&args, limits)?
@@ -168,7 +168,7 @@ pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
             Input::Source { request, options }
         }
         Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::FaithfulnessMap(_) | Int4Task::FaithfulnessCorpus(_) | Int4Task::Semantic(_) | Int4Task::Resolve(_) | Int4Task::Sentiment(_) | Int4Task::SentimentMap(_) | Int4Task::SentimentCorpus(_) | Int4Task::ClassifyMap(_) | Int4Task::ClassifyCorpus(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ScoredBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
-            | Int4Task::SourceCorpus(_) | Int4Task::AnswerCorpus(_) | Int4Task::ExtractCorpus(_) | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::ClassificationDocumentJob | Int4Task::SentimentDocumentJob | Int4Task::FaithfulnessDocumentJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob => return Err(CandidateError::Arguments),
+            | Int4Task::SourceCorpus(_) | Int4Task::AnswerCorpus(_) | Int4Task::ExtractCorpus(_) | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::ClassificationDocumentJob | Int4Task::SentimentDocumentJob | Int4Task::FaithfulnessDocumentJob | Int4Task::QuestionDocumentJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob => return Err(CandidateError::Arguments),
     };
     remaining()?;
     let cancellation = CancellationToken::default();

@@ -12,6 +12,8 @@ use crate::{
     tasks::{answer::ANSWER_TASK_VERSION,
         source_planning::grouped_int4::long::cohort::Int4SourceMapCohortBudget},
 };
+#[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub mod job;
 
 struct QuestionStreamInput<R, W> {
     preparation: Option<(Int4QuestionDocumentBatchPlanner, Arc<ExtractionVocabulary>)>,
