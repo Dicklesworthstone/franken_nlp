@@ -127,15 +127,7 @@ fn array_union_keeps_duplicate_verbatim_origins_and_every_original_span() {
     assert_eq!(result.verification_used.fields, 2); assert_eq!(result.verification_used.matches, 4);
 }
 
-#[test]
-fn selected_stream_planner_cannot_enter_document_maps_even_at_the_full_row_ceiling() {
-    for cap in [7, NANBEIGE_VOCAB_SIZE] {
-        let selected = planner().with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: cap }).unwrap();
-        let error = selected.plan_document_with_control("é上海 and 上海", &source_args(), limits(), &mut Continue)
-            .err().unwrap();
-        assert!(matches!(error, Int4ExtractionMapError::Admission));
-    }
-}
+mod selected;
 pub(super) struct Script {
     args: ExtractionBatchArgs, pub(super) quote: Option<String>, pub(super) json: Option<String>, pub(super) calls: Rc<Cell<usize>>,
     pub(super) corrupt: Option<usize>, pub(super) fail_at: Option<usize>, capacity: usize, group_width: usize, dirty_at: Option<usize>,
@@ -164,8 +156,9 @@ impl Driver for Script {
         let fields = program.source_fields(&json).unwrap();
         let options = prepared.plan.options();
         let token = (0..NANBEIGE_VOCAB_SIZE as u32).find(|id| !options.excluded_token_ids.contains(id) && *id != options.eos_token_id).unwrap();
-        let work = constrained_int4::planned_work(prepared.plan.group_width(), prepared.plan.prompt_tokens(), 2).unwrap();
-        let mut run = Int4ExtractRun { schema_version: 1, execution: INT4_EXTRACT_VERSION.to_owned(),
+        let rows = prepared.plan.selected_rows().map_or(NANBEIGE_VOCAB_SIZE, |limits| limits.max_rows_per_step);
+        let work = prepared.plan.completed_work(2, 2 * rows as u64).unwrap();
+        let mut run = Int4ExtractRun { schema_version: 1, execution: prepared.plan.execution_version().to_owned(),
             group_width: prepared.plan.group_width(), model_work: work,
             result: ExtractResult { schema_version: if grounded { 2 } else { 1 }, task_spec_version: "extract-v1".to_owned(),
                 score_space: ScoreSpace::NotComputed, grounding: if grounded { ExtractionGrounding::SourceMembership }
@@ -184,7 +177,14 @@ impl Driver for Script {
             7 => run.result.output.mask_node_visit_charge = 1001,
             8 => run.group_width = 16,
             9 => run.result.output.numerics_profile = "strict-quantized-v1".to_owned(),
-            _ => run.model_work.projections.dot_products += 1,
+            10 => run.model_work.projections.dot_products += 1,
+            11 => run.execution = INT4_EXTRACT_VERSION.to_owned(),
+            12 | 13 => {
+                run.result.output.projected_logits = if axis == 12 { 1 } else { 2 * rows as u64 + 1 };
+                run.model_work = Int4Work::for_sequence(prepared.plan.group_width(), 0,
+                    run.result.output.forward_positions as usize, run.result.output.projected_logits as usize).unwrap();
+            },
+            _ => unreachable!(),
         } } }
         Ok(run)
     }

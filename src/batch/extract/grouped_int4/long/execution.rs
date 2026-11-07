@@ -10,7 +10,9 @@ impl PreparedInt4ExtractionMap<'_> {
         for ((plan, identity), chunk) in self.plans.iter().zip(admitted).zip(self.chunks.chunks()) {
             step(control)?;
             plan.verify_identity(identity)?;
-            if plan.source().text() != chunk.text() { return Err(Int4ExtractionMapError::Admission); }
+            if plan.source().text() != chunk.text() || plan.plan.selected_rows() != self.expected.selected_rows {
+                return Err(Int4ExtractionMapError::Admission);
+            }
             // Check even the FINAL chunk's full resident KV reservation before
             // the first forward. Caller identities cannot waive native capacity.
             preflight(plan, driver).map_err(batch_error)?;
@@ -141,9 +143,10 @@ pub(super) fn complete(expected: Int4ExtractionMapPreflight, total: GroundingBud
     work: Int4Work, masks: u64, mapped: MapReduceResult<ExtractionMapValue>, cap: u64,
     root_array_union: Option<RootArrayUnionResult>)
     -> Result<Int4ExtractionMapRun, Int4ExtractionMapError> {
-    let run = Int4ExtractionMapRun { schema_version: 1, execution: INT4_EXTRACTION_MAP_EXECUTION,
+    let run = Int4ExtractionMapRun { schema_version: 1, execution: expected.execution_version(),
         numerics_profile: STRICT_INT4_PROFILE, group_width: expected.group_width,
         semantics: if root_array_union.is_some() { ROOT_ARRAY_UNION_POLICY } else { SEMANTICS }, grounding: expected.grounding,
+        max_selected_rows: expected.selected_rows.map(|limits| limits.max_rows_per_step),
         planned_model_work: expected.work, model_work: work, reserved_mask_node_visits: expected.masks,
         mask_node_visit_charge: masks, verification_used: ExtractionMapVerification {
             fields: total.max_fields.checked_sub(remaining.max_fields).ok_or(Int4ExtractionMapError::WorkLimit)?,
@@ -190,9 +193,30 @@ fn original_fields<C: DecodeStepControl>(chunk: &SourceChunk<'_>, fields: &[Sour
     step(control)?;
     Ok(output)
 }
-pub(super) fn statistics(value: &ExtractionMapValue) -> Result<(Int4Work, u64, usize, usize), Int4ExtractError> {
+pub(super) fn statistics(value: &ExtractionMapValue, group_width: usize, selected: Option<Int4JsonSparseLimits>)
+    -> Result<(Int4Work, u64, usize, usize), Int4ExtractError> {
     let (mut work, mut masks, mut fields, mut spans) = (Int4Work::default(), 0_u64, 0_usize, 0_usize);
+    let execution = if selected.is_some() { crate::tasks::extract::grouped_int4::INT4_SPARSE_EXTRACT_VERSION }
+        else { crate::tasks::extract::grouped_int4::INT4_EXTRACT_VERSION };
+    let ceiling = selected.map_or(NANBEIGE_VOCAB_SIZE, |limits| limits.max_rows_per_step);
     for chunk in value.chunks() {
+        let row = &chunk.native; let output = &row.result.output;
+        let count = u64::try_from(output.token_ids.len()).map_err(|_| ExtractError::InvalidResult)?;
+        let maximum = count.checked_mul(ceiling as u64).ok_or(ExtractError::InvalidResult)?;
+        let exact_work = Int4Work::for_sequence(group_width, 0,
+            usize::try_from(output.forward_positions).map_err(|_| ExtractError::InvalidResult)?,
+            usize::try_from(output.projected_logits).map_err(|_| ExtractError::InvalidResult)?)
+            .map_err(|_| ExtractError::InvalidResult)?;
+        // Reconcile physical rows, not selection count times vocabulary. A
+        // selected head can vary at every step, but even EOS projects a row.
+        // This sealed output check cannot authorize a serialized native result.
+        if row.schema_version != 1 || row.execution != execution || row.group_width != group_width
+            || output.schema_version != 1 || output.numerics_profile != STRICT_INT4_PROFILE
+            || count == 0 || count > output.forward_positions || row.model_work != exact_work
+            || output.projected_logits < count || output.projected_logits > maximum
+            || (selected.is_none() && output.projected_logits != maximum) {
+            return Err(ExtractError::InvalidResult.into());
+        }
         work = add_work(work, chunk.native.model_work).ok_or(ExtractError::InvalidResult)?;
         masks = masks.checked_add(chunk.native.result.output.mask_node_visit_charge).ok_or(ExtractError::InvalidResult)?;
         fields = fields.checked_add(chunk.original_fields.len()).ok_or(ExtractError::InvalidResult)?;

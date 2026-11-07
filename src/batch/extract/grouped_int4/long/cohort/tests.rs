@@ -4,6 +4,8 @@ use super::super::tests::{args, source_args, planner, prepare, Script};
 use std::rc::Rc;
 use crate::tokenizer::pinned_controls;
 
+mod selected;
+
 struct Continue;
 impl DecodeStepControl for Continue {
     fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }
@@ -52,10 +54,15 @@ impl CohortDriver for Scripted {
             planned_work = add_work(planned_work, plan.planned_work()).unwrap();
             model_work = add_work(model_work, row.model_work).unwrap();
             group_steps = group_steps.max(row.model_work.forward_positions);
-            projection_groups = projection_groups.max(row.result.output.token_ids.len() as u64);
+            let selections = row.result.output.token_ids.len() as u64;
+            projection_groups = if let Some(limits) = plan.plan.selected_rows() {
+                projection_groups + selections * limits.max_rows_per_step.div_ceil(32) as u64
+            } else { projection_groups.max(selections) };
             sequences.push(row);
         }
-        let mut run = Int4ExtractCohortRun { schema_version: 1, execution: INT4_EXTRACT_COHORT_EXECUTION.to_owned(),
+        let execution = if plans[0].plan.selected_rows().is_some() { INT4_EXTRACT_SELECTED_COHORT_EXECUTION }
+            else { INT4_EXTRACT_COHORT_EXECUTION };
+        let mut run = Int4ExtractCohortRun { schema_version: 1, execution: execution.to_owned(),
             sequences, group_steps, projection_groups, planned_work, model_work };
         if let Some(axis) = self.corrupt_group { match axis {
             0 => run.schema_version += 1,
@@ -65,7 +72,9 @@ impl CohortDriver for Scripted {
             4 => run.model_work.projections.dot_products += 1,
             5 => run.group_steps += 1,
             6 => run.projection_groups = 0,
-            _ => run.projection_groups = u64::MAX,
+            7 => run.projection_groups = u64::MAX,
+            8 => run.execution = INT4_EXTRACT_COHORT_EXECUTION.to_owned(),
+            _ => run.projection_groups = run.sequences.iter().map(|row| row.result.output.token_ids.len() as u64).sum(),
         } }
         Ok(run)
     }

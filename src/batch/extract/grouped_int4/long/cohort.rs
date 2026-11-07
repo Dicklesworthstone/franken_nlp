@@ -9,10 +9,12 @@ use crate::{batch::extract::grouped_int4::memory::MAX_COHORT_RESULT_BYTES,
         strict_int4::{Int4MemoryBudget, Int4MemoryRequirement, Int4ModelWeights,
             Int4RunBudget, StrictInt4Error, cohort::{Int4CohortEngine, MAX_INT4_SEQUENCES}}},
     tasks::extract::grouped_int4::cohort::{self as extraction, Int4ExtractCohortRequest,
-        Int4ExtractCohortBudget, Int4ExtractCohortRun, INT4_EXTRACT_COHORT_EXECUTION},
+        Int4ExtractCohortBudget, Int4ExtractCohortRun, INT4_EXTRACT_COHORT_EXECUTION,
+        INT4_EXTRACT_SELECTED_COHORT_EXECUTION},
     native_engine::constrained_int4::cohort::Int4JsonCohortBudget};
 
 pub const INT4_EXTRACTION_MAP_COHORT_EXECUTION: &str = "grouped-int4-exact-schema-document-cohorts-v1";
+pub const INT4_EXTRACTION_MAP_SELECTED_COHORT_EXECUTION: &str = "grouped-int4-selected-row-exact-schema-document-cohorts-v1";
 pub const COHORT_ENVELOPE_BYTES: u64 = 4096;
 
 /// Declared simultaneous chunk bounds, quotable before document or model IO.
@@ -134,6 +136,10 @@ impl PreparedInt4ExtractionMap<'_> {
             || self.plans.len() != self.chunks.chunks().len() {
             return Err(Int4ExtractionMapError::InvalidLimits);
         }
+        if self.plans.iter().any(|plan| plan.plan.group_width() != self.group_width()
+            || plan.plan.selected_rows() != self.expected.selected_rows) {
+            return Err(Int4ExtractionMapError::Admission);
+        }
         Ok(())
     }
 
@@ -178,7 +184,9 @@ impl PreparedInt4ExtractionMap<'_> {
         let root_array_union = self.reduce_root_array(&mapped, &mut **control.borrow_mut())?;
         let document = execution::complete(self.expected, self.limits.verification, task.remaining,
             task.stats.model_work, task.masks, mapped, self.max_result_bytes(), root_array_union)?;
-        let run = Int4ExtractionMapCohortRun { schema_version: 1, execution: INT4_EXTRACTION_MAP_COHORT_EXECUTION,
+        let execution = if self.expected.selected_rows.is_some() { INT4_EXTRACTION_MAP_SELECTED_COHORT_EXECUTION }
+            else { INT4_EXTRACTION_MAP_COHORT_EXECUTION };
+        let run = Int4ExtractionMapCohortRun { schema_version: 1, execution,
             document, cohorts: task.stats };
         let cap = self.max_result_bytes().checked_add(COHORT_ENVELOPE_BYTES).ok_or(Int4ExtractionMapError::WorkLimit)?;
         check_size(&run, cap)?;
@@ -323,8 +331,13 @@ impl<D: CohortDriver, C: DecodeStepControl> MapReduceTask for Executor<'_, '_, D
     }
 }
 fn validate_group(plans: &[PreparedInt4BatchExtraction], run: &Int4ExtractCohortRun) -> Result<(), Int4ExtractError> {
-    if plans.is_empty() || run.schema_version != 1 || run.execution != INT4_EXTRACT_COHORT_EXECUTION
-        || run.sequences.len() != plans.len() { return Err(ExtractError::InvalidResult.into()); }
+    let first = plans.first().ok_or(ExtractError::InvalidResult)?;
+    let selected = first.plan.selected_rows();
+    let execution = if selected.is_some() { INT4_EXTRACT_SELECTED_COHORT_EXECUTION } else { INT4_EXTRACT_COHORT_EXECUTION };
+    if run.schema_version != 1 || run.execution != execution || run.sequences.len() != plans.len()
+        || plans.iter().any(|plan| plan.plan.selected_rows() != selected || plan.plan.group_width() != first.plan.group_width()) {
+        return Err(ExtractError::InvalidResult.into());
+    }
     let mut planned = Int4Work::default(); let mut actual = Int4Work::default();
     let (mut longest, mut longest_head, mut heads) = (0, 0, 0_u64);
     for (plan, row) in plans.iter().zip(&run.sequences) {
@@ -334,10 +347,18 @@ fn validate_group(plans: &[PreparedInt4BatchExtraction], run: &Int4ExtractCohort
         let tokens = row.result.output.token_ids.len() as u64;
         longest_head = longest_head.max(tokens); heads = heads.checked_add(tokens).ok_or(ExtractError::InvalidResult)?;
     }
-    if planned != run.planned_work || actual != run.model_work || longest != run.group_steps
-        || run.projection_groups == 0 || run.projection_groups < longest_head
-        || run.projection_groups > heads || run.projection_groups > run.group_steps {
+    if planned != run.planned_work || actual != run.model_work {
         return Err(ExtractError::InvalidResult.into());
+    }
+    // A selected head issues one call for every <=32-row chunk of the complete
+    // legal set for EACH sequence. Calls can outnumber shared decoder steps;
+    // the full-head schedule's count is not a valid sparse-head bound.
+    if selected.is_some() {
+        constrained_int4::cohort::check_selected_group_counts(None, actual.forward_positions, longest,
+            heads, longest_head, actual.projected_logits, run.group_steps, run.projection_groups)?;
+    } else {
+        constrained_int4::cohort::check_group_counts(None, actual.forward_positions, longest,
+            heads, longest_head, run.group_steps, run.projection_groups)?;
     }
     Ok(())
 }

@@ -119,7 +119,16 @@ impl Int4ExtractionDocumentBatchPlanner {
     pub fn max_run_work(&self) -> Int4Work { self.config.max_model_work }
     pub fn max_mask_visits(&self) -> u64 { self.config.max_mask_visits }
     pub fn max_verification(&self) -> GroundingBudget { self.config.max_verification }
+    pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.compiler.selected_rows() }
     pub fn uses_chunk_cohorts(&self) -> bool { self.chunk_cohorts }
+    /// Bind the complete legal-row policy before any source is prepared. A
+    /// prior preparation cannot be transferred even at the full-row ceiling,
+    /// where conservative work allowances happen to coincide.
+    pub fn with_selected_rows(mut self, limits: Int4JsonSparseLimits) -> Result<Self, BatchFault> {
+        self.compiler = self.compiler.with_selected_rows(limits)?;
+        self.owner = Arc::new(());
+        Ok(self)
+    }
     pub fn with_chunk_cohorts(mut self) -> Result<Self, BatchFault> {
         self.cohort_requirements()?;
         if !self.chunk_cohorts { self.chunk_cohorts = true; self.owner = Arc::new(()); }
@@ -164,7 +173,8 @@ impl Int4ExtractionDocumentBatchPlanner {
         -> Result<(Int4ExtractionMapPreflight, Vec<ExecutionIdentity>), BatchItemFailure> {
         let expected = plan.preflight_metadata();
         if expected.chunk_count() == 0 || expected.chunk_count() > self.config.limits.mapping.chunks.max_chunks
-            || expected.group_width() != self.group_width() || plan.max_kv_bytes() != self.document_budget().max_kv_bytes
+            || expected.group_width() != self.group_width() || expected.selected_rows() != self.selected_rows()
+            || plan.max_kv_bytes() != self.document_budget().max_kv_bytes
             || plan.max_result_bytes() != self.max_result_bytes() || plan.execution_identities().len() != expected.chunk_count()
             || !fits(expected.planned_work(), self.config.max_model_work)
             || expected.reserved_mask_visits() > self.config.max_mask_visits {

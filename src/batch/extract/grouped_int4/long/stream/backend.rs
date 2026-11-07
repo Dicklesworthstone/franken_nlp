@@ -46,7 +46,8 @@ impl Backend<'_, '_> {
         plan: &PreparedInt4ExtractionMap<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
         -> Result<(), BatchItemFailure> {
         self.check_capacity(planner)?;
-        if plan.plans.len() != plan.chunks.chunks().len() || plan.plans.len() != plan.expected.chunk_count() {
+        if plan.plans.len() != plan.chunks.chunks().len() || plan.plans.len() != plan.expected.chunk_count()
+            || plan.expected.selected_rows() != planner.selected_rows() {
             return Err(BatchItemFailure::fatal(BatchCode::Admission));
         }
         let masks = ExtractionMaskBudget { per_mask: planner.document_limits().mapping.mask_limits,
@@ -56,7 +57,9 @@ impl Backend<'_, '_> {
             poll(control)?;
             constrained_int4::check_model(row.execution_identity(), self.model_identity())
                 .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
-            if row.source().text() != chunk.text() { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
+            if row.source().text() != chunk.text() || row.plan.selected_rows() != planner.selected_rows() {
+                return Err(BatchItemFailure::fatal(BatchCode::Admission));
+            }
             let mut budget = native_budget(row, masks);
             match self {
                 Self::Serial(engine) => {

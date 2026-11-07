@@ -26,6 +26,7 @@ pub mod cohort;
 pub mod stream;
 
 pub const INT4_EXTRACTION_MAP_EXECUTION: &str = "grouped-int4-exact-schema-document-map-v1";
+pub const INT4_EXTRACTION_MAP_SELECTED_EXECUTION: &str = "grouped-int4-selected-row-exact-schema-document-map-v1";
 const SEMANTICS: &str = "independent-chunk-json-no-global-object-merge-v1";
 
 /// Whole-document allowances. Native work depends on the actual group
@@ -116,6 +117,7 @@ pub struct Int4ExtractionMapPreflight {
     grounding: ExtractionGrounding,
     verification: GroundingBudget,
     root_array_binding: Option<Sha256Digest>,
+    selected_rows: Option<Int4JsonSparseLimits>,
 }
 impl fmt::Debug for Int4ExtractionMapPreflight {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -123,6 +125,7 @@ impl fmt::Debug for Int4ExtractionMapPreflight {
             .field("source_span", &self.source_span).field("chunks", &self.chunks)
             .field("work", &self.work).field("masks", &self.masks).field("group_width", &self.group_width)
             .field("grounding", &self.grounding).field("verification", &self.verification)
+            .field("selected_rows", &self.selected_rows)
             .field("root_array_union", &self.root_array_binding.is_some()).finish()
     }
 }
@@ -132,15 +135,20 @@ impl Int4ExtractionMapPreflight {
     pub fn planned_work(&self) -> Int4Work { self.work }
     pub fn reserved_mask_visits(&self) -> u64 { self.masks }
     pub fn group_width(&self) -> usize { self.group_width }
+    pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.selected_rows }
+    pub fn execution_version(&self) -> &'static str {
+        if self.selected_rows.is_some() { INT4_EXTRACTION_MAP_SELECTED_EXECUTION } else { INT4_EXTRACTION_MAP_EXECUTION }
+    }
     pub fn verify_completed(&self, run: &Int4ExtractionMapRun) -> Result<(), Int4ExtractionMapError> {
         let root = run.mapped.root();
-        let (work, masks, fields, spans) = execution::statistics(root.value())?;
+        let (work, masks, fields, spans) = execution::statistics(root.value(), self.group_width, self.selected_rows)?;
         let same_children = run.root_array_union.as_ref().is_none_or(|union| union.matches_chunks(
             root.value().chunks().map(|chunk| array_union::ArrayUnionChunk {
                 chunk_id: chunk.chunk_id, source_span: chunk.source_span,
                 json: &chunk.native.result.output.json, source_fields: &chunk.original_fields,
             })));
-        if run.schema_version != 1 || run.execution != INT4_EXTRACTION_MAP_EXECUTION
+        if run.schema_version != 1 || run.execution != self.execution_version()
+            || run.max_selected_rows != self.selected_rows.map(|limits| limits.max_rows_per_step)
             || run.numerics_profile != STRICT_INT4_PROFILE || run.group_width != self.group_width
             || run.semantics != if self.root_array_binding.is_some() { ROOT_ARRAY_UNION_POLICY } else { SEMANTICS }
             || run.root_array_union.as_ref().map(RootArrayUnionResult::binding) != self.root_array_binding
@@ -190,6 +198,10 @@ pub struct Int4ExtractionMapRun {
     pub group_width: usize,
     pub semantics: &'static str,
     pub grounding: ExtractionGrounding,
+    /// Complete legal-row ceiling per token selection, including terminal EOS.
+    /// Omitted for the unchanged full-vocabulary document contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_selected_rows: Option<usize>,
     pub planned_model_work: Int4Work,
     pub model_work: Int4Work,
     pub reserved_mask_node_visits: u64,
@@ -241,7 +253,6 @@ impl Int4ExtractionBatchPlanner {
         -> Result<PreparedInt4ExtractionMap<'s>, Int4ExtractionMapError> {
         step(control)?;
         limits.root_array_workspace_bytes()?;
-        self.require_full_projection().map_err(|_| Int4ExtractionMapError::Admission)?;
         if source.is_empty() { return Err(Int4ExtractionMapError::EmptySource); }
         let b = args.budget; let c = &self.compiler; let m = limits.mapping; let v = limits.verification;
         b.validate().map_err(|_| Int4ExtractionMapError::InvalidLimits)?;
@@ -293,6 +304,7 @@ impl Int4ExtractionBatchPlanner {
             source_span: VerifiedSourceSpan { byte_start: first.byte_start, byte_end: last.byte_end,
                 scalar_start: first.scalar_start, scalar_end: last.scalar_end }, chunks: chunks.chunks().len(),
             work: Int4Work::default(), masks: 0, group_width: self.group_width, verification: v, root_array_binding: None,
+            selected_rows: self.selected_rows(),
             grounding: match args.grounding { ExtractionBatchGrounding::Structural => ExtractionGrounding::NotRequested,
                 ExtractionBatchGrounding::SourceMembership => ExtractionGrounding::SourceMembership } };
         let mut plans = Vec::new();
@@ -307,7 +319,8 @@ impl Int4ExtractionBatchPlanner {
                 .map_err(batch_error)?;
             if non_source.checked_add(chunk.tokens()) != Some(plan.plan.prompt_tokens())
                 || plan.plan.prompt_tokens().checked_add(b.max_output_tokens as usize).is_none_or(|n| n > chunk_limits.context_tokens)
-                || plan.source().text() != chunk.text() || plan.plan.group_width() != self.group_width {
+                || plan.source().text() != chunk.text() || plan.plan.group_width() != self.group_width
+                || plan.plan.selected_rows() != expected.selected_rows {
                 return Err(Int4ExtractionMapError::Admission);
             }
             expected.work = add_work(expected.work, plan.planned_work()).filter(|w| fits(*w, m.max_model_work))

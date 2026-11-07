@@ -146,6 +146,35 @@ fn changed_tail_or_factory_cannot_reuse_frozen_preparation_and_schedule_rotates_
 }
 
 #[test]
+fn selecting_complete_legal_rows_rotates_the_factory_seal_and_preserves_peak_memory() {
+    for cap in [65, NANBEIGE_VOCAB_SIZE] {
+        let dense = factory(true).with_chunk_cohorts().unwrap();
+        let original = snapshot(&dense, SOURCE); let peak = dense.cohort_requirements().unwrap();
+        let selected = dense.with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: cap }).unwrap();
+        assert_eq!(selected.selected_rows(), Some(Int4JsonSparseLimits { max_rows_per_step: cap }));
+        assert!(selected.uses_chunk_cohorts()); assert_eq!(selected.cohort_requirements().unwrap(), peak);
+        assert_eq!(selected.owns(&original).err().unwrap().fault.code, BatchCode::Admission);
+        let next = snapshot(&selected, SOURCE); selected.owns(&next).unwrap();
+        assert_eq!(next.expected.selected_rows(), selected.selected_rows());
+        assert_eq!(next.expected.planned_work().forward_positions, original.expected.planned_work().forward_positions);
+        assert_eq!(next.expected.reserved_mask_visits(), original.expected.reserved_mask_visits());
+        if cap == NANBEIGE_VOCAB_SIZE { assert_eq!(next.planned_work(), original.planned_work()); }
+        assert_ne!(next.expected, original.expected);
+        for (before, after) in original.identities.iter().zip(&next.identities) {
+            assert_eq!(before.prompt_digest, after.prompt_digest);
+            assert_ne!(before.decision_policy_digest, after.decision_policy_digest);
+        }
+        let plan = selected.plan(SOURCE, &mut Continue, true).unwrap();
+        selected.compare(&plan, &next, &mut Continue).unwrap();
+        assert!(selected.compare(&plan, &original, &mut Continue).is_err());
+        assert!(selected.with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: cap }).is_err());
+    }
+    for cap in [0, NANBEIGE_VOCAB_SIZE + 1] {
+        assert!(factory(true).with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: cap }).is_err());
+    }
+}
+
+#[test]
 fn document_args_are_strict_map_only_and_cannot_replace_any_policy() {
     for text in [r#"{"id":"x","text":"source"}"#, r#"{"id":"x","text":"source","task_args":null}"#,
         r#"{"id":"x","text":"source","task_args":{}}"#] {
@@ -160,7 +189,8 @@ fn document_args_are_strict_map_only_and_cannot_replace_any_policy() {
 
 #[test]
 fn each_of_nine_whole_run_axes_exhausts_atomically_across_flush_epochs() {
-    let factory = factory(true); let prepared = snapshot(&factory, SOURCE); let expected = prepared.expected;
+    for factory in [factory(true), factory(true).with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: 65 }).unwrap()] {
+    let prepared = snapshot(&factory, SOURCE); let expected = prepared.expected;
     let twice_work = expected.planned_work().checked_add(expected.planned_work()).unwrap();
     let twice_verification = add_verification(factory.config.limits.verification, factory.config.limits.verification).unwrap();
     for dimension in 0..9 {
@@ -190,6 +220,7 @@ fn each_of_nine_whole_run_axes_exhausts_atomically_across_flush_epochs() {
         assert_eq!(failure.fault.code, BatchCode::WorkLimit, "dimension {dimension}");
         assert!(failure.stop && ledger.failed);
         assert_eq!((ledger.work, ledger.masks, ledger.verification, ledger.sequence), before);
+    }
     }
 }
 

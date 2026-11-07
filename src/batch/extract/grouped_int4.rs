@@ -89,7 +89,8 @@ impl Int4ExtractionBatchPlanner {
     /// Fix the complete legal-row projection strategy for this ordered stream.
     /// Each actual schema/source plan binds this exact cap before admission;
     /// item arguments cannot replace it. Serial and cohort streams share this
-    /// policy; document maps and durable jobs retain full-vocabulary contracts.
+    /// policy, including complete-document maps. Consumers bind the same
+    /// selection and ceiling before preparation or durable admission.
     pub fn with_selected_rows(mut self, limits: Int4JsonSparseLimits) -> Result<Self, BatchFault> {
         limits.validate().map_err(|_| BatchCode::InvalidLimits)?;
         if self.selected_rows.is_some() { return Err(BatchCode::InvalidLimits.into()); }
