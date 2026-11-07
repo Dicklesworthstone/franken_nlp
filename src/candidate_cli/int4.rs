@@ -148,6 +148,7 @@ enum Int4Task {
     ScoredJob,
     ClassificationDocumentJob,
     SentimentDocumentJob,
+    FaithfulnessDocumentJob,
     SourceJob,
     DocumentJob,
     RedactJob,
@@ -170,6 +171,7 @@ enum Int4JobCommand {
     Scored(scored_job::JobCommand),
     ClassificationDocument(classify_document_job::JobCommand),
     SentimentDocument(sentiment_map::job::JobCommand),
+    FaithfulnessDocument(faithfulness_map::job::JobCommand),
     Source(source_job::JobCommand),
     Document(document_job::JobCommand),
     Redaction(redact::long::jobs::JobCommand),
@@ -200,6 +202,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(judge::definition())
         .subcommand(faithfulness_map::definition())
         .subcommand(faithfulness_map::corpus::definition())
+        .subcommand(faithfulness_map::job::definition())
         .subcommand(scored_batch::definition())
         .subcommand(scored_job::definition())
         .subcommand(classify_document_job::definition())
@@ -262,6 +265,11 @@ impl Int4Command {
             let (job, args) = sentiment_map::job::JobCommand::from_matches(matches)?;
             return Ok(Self { task: Int4Task::SentimentDocumentJob, args, batch: None,
                 job: Some(Int4JobCommand::SentimentDocument(job)) });
+        }
+        if name == "faithfulness-document-job" {
+            let (job, args) = faithfulness_map::job::JobCommand::from_matches(matches)?;
+            return Ok(Self { task: Int4Task::FaithfulnessDocumentJob, args, batch: None,
+                job: Some(Int4JobCommand::FaithfulnessDocument(job)) });
         }
         if name == "document-job" {
             let (job, args) = document_job::JobCommand::from_matches(matches)?;
@@ -344,6 +352,9 @@ impl Int4Command {
             Self { task: Int4Task::SentimentDocumentJob, args, batch: None,
                 job: Some(Int4JobCommand::SentimentDocument(job)) } =>
                 return job.run_owned(args, input, &mut output, diagnostics),
+            Self { task: Int4Task::FaithfulnessDocumentJob, args, batch: None,
+                job: Some(Int4JobCommand::FaithfulnessDocument(job)) } =>
+                return job.run_owned(args, input, &mut output, diagnostics),
             Self { task: Int4Task::SourceJob, args, batch: None, job: Some(Int4JobCommand::Source(job)) } =>
                 return job.run_owned(args, input, &mut output, diagnostics),
             Self { task: Int4Task::DocumentJob, args, batch: None, job: Some(Int4JobCommand::Document(job)) } =>
@@ -375,7 +386,7 @@ impl Int4Command {
         }
     }
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
-        if self.job.is_some() || matches!(self.task, Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::ClassificationDocumentJob | Int4Task::SentimentDocumentJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob) {
+        if self.job.is_some() || matches!(self.task, Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::ClassificationDocumentJob | Int4Task::SentimentDocumentJob | Int4Task::FaithfulnessDocumentJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob) {
             return Err(CandidateError::Arguments);
         }
         if let Some(batch) = self.batch {
@@ -422,7 +433,7 @@ impl Int4Command {
             Int4Task::Source(_, source) => source.validate_with_prefill(&self.args)?,
             // The blocking stream must own its input and writer through cleanup.
             Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::FaithfulnessMap(_) | Int4Task::FaithfulnessCorpus(_) | Int4Task::Semantic(_) | Int4Task::Resolve(_) | Int4Task::Sentiment(_) | Int4Task::SentimentMap(_) | Int4Task::SentimentCorpus(_) | Int4Task::ClassifyMap(_) | Int4Task::ClassifyCorpus(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ScoredBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
-                | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::ClassificationDocumentJob | Int4Task::SentimentDocumentJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob => return Err(CandidateError::Arguments),
+                | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::ClassificationDocumentJob | Int4Task::SentimentDocumentJob | Int4Task::FaithfulnessDocumentJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob => return Err(CandidateError::Arguments),
         };
         #[cfg(feature = "asupersync-runtime")]
         { runtime::execute_task(self.task, self.args, limits, input, output) }

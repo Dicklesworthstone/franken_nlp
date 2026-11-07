@@ -725,11 +725,17 @@ ragged window against the 64-head limit. No evidence is dropped and no
 oversized cohort silently changes its schedule. Whole-run success requires
 `run_complete` plus exit zero.
 
-The library also exposes authenticated complete-source durable jobs through
-`Int4FaithfulnessDocumentJobPlanner` and
+`fnlp candidate source-int4 faithfulness-document-job start|resume` provides
+explicit retained results and authenticated resume for the same population.
+Every original source and claim, fixed policy, map schedule, model and exact
+work lifetime authenticate before pending records run. Committed records are
+skipped and failed attempts retain their work debits. Stdout contains only
+progress metadata; explicit materialization publishes private results after
+all documents commit.
+
+Library callers use `Int4FaithfulnessDocumentJobPlanner` and
 `NlpEngine::job_int4_faithfulness_document`, reusing the corpus processor.
-Every original source and claim, the fixed policy and exact work lifetime
-authenticate on resume. See the [faithfulness population guide](docs/native-faithfulness-populations-int4.md)
+See the [faithfulness population guide](docs/native-faithfulness-populations-int4.md)
 for CLI and library contracts, explicit policy examples, memory boundaries
 and pending executable/native qualification gates.
 

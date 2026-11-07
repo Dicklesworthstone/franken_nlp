@@ -115,6 +115,105 @@ sampling, prompt overrides, thinking, tools, selected-row projection,
 `--prefill-rows`, `--cohort-heads` and cross-document cohorts. Full-vocabulary
 scoring remains part of the NLI result contract.
 
+## Durable start and resume
+
+`faithfulness-document-job start|resume` retains one complete-source judgment
+per original record. It accepts the same `policy.json` and source/claim
+population shown above. Supply the **complete original population on every
+resume**, including committed records in their original order. Claims, source
+bytes and IDs authenticate along with the fixed policy, model and recipe.
+Durable populations require unique IDs and do not accept live flush controls.
+
+The command requires `metadata-store` and `asupersync-runtime` on Linux x86-64
+or AArch64. Prepare an existing owner-only job directory, a protected file
+containing exactly 32 random raw secret bytes, and a random 128-bit job ID
+encoded as 32 lowercase hexadecimal characters. The
+[owned-job guide](owned-jobs.md) describes these storage prerequisites. The
+command does not generate keys or create or adopt a job directory.
+
+An illustrative `faithfulness-job-limits.json` is:
+
+```json
+{
+  "max_items": 3,
+  "max_id_bytes": 128,
+  "max_input_bytes_per_item": 1048576,
+  "max_snapshot_bytes": 4194304,
+  "max_result_bytes": 16781312,
+  "max_spool_bytes": 268435456,
+  "max_materialized_bytes": 268435456,
+  "max_journal_bytes": 67108864,
+  "max_attempts": 6,
+  "max_work": {
+    "model": {
+      "forward_positions": 262144,
+      "projected_logits": 10000000000,
+      "attention_pairs": 1000000000000,
+      "projections": {
+        "dot_products": 10000000000000000,
+        "multiply_accumulates": 10000000000000000
+      }
+    },
+    "mask_node_visits": 0
+  }
+}
+```
+
+These are explicit allowances, not measured costs or a guarantee that a
+population fits. `mask_node_visits` must be zero because this route scores
+the complete fixed candidate language. The stored item byte limit must fit
+`--max-input-bytes`; it bounds both the entire serialized record and the
+planner's combined source-plus-claim capability. The complete population
+must also fit its snapshot and transport bounds.
+
+Start with explicit retention:
+
+```sh
+fnlp candidate source-int4 faithfulness-document-job start claims.ndjson \
+  --policy policy.json \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --group-width 128 --memory-mib "$MEMORY_MIB" \
+  --context-tokens 2048 --max-chunks 64 \
+  --store-results --job-dir /private/faithfulness-job \
+  --job-id "$JOB_ID" --key-file /private/faithfulness-job.key \
+  --limits faithfulness-job-limits.json --materialize
+```
+
+Use the same invocation with `resume` in place of `start` to continue pending
+records. Repeat the exact policy, model/group identity, task and planning
+limits, map settings, schedule and immutable job limits. Committed records
+are authenticated and skipped; an unfinished source is retried from its
+beginning if the original attempt and work ceilings permit it. No partial
+source result is committed.
+
+For this durable command, the five native flags bound **each complete
+document**, and every one must fit the corresponding **lifetime** counter in
+`JobLimits.max_work`. The immutable job ledger is the authority across
+documents, failures and resumes. Increasing attempts or restarting never
+replenishes work. The per-invocation timeout and cooperative checkpoint
+allowance govern the current call without changing those persisted debits.
+
+Optional `--cohort-chunks N` uses the same actual ragged-window checks as the
+live corpus. The exact schedule binds the authenticated recipe. Serial
+stored results require the `--max-map-result-bytes` cap; cohort stored results
+need an additional 4096 bytes for their wrapper. The illustrated stored cap
+covers either schedule at the default 16 MiB semantic result cap.
+
+Stdout uses `fnlp-candidate-int4-faithfulness-document-job-v1` and contains
+only public model and job progress metadata. It does not emit source, claim,
+policy, scores, private paths or secrets. `--materialize` publishes verified
+private `materialized.ndjson` after all items commit; it never overwrites an
+existing materialization. The [job management CLI](job-management-cli.md)
+can inspect and verify retained state.
+
+Ordinary resume refuses uncommitted spool bytes or stages. Explicit
+`resume --discard-uncommitted-tail` authorizes their removal **after** model,
+recipe and original-population authentication. Changed source or claim bytes
+refuse before this repair. Durable progress can already exist when a later
+timeout or metadata write/flush fails, so check the exit status and
+authenticate stored state rather than assuming rollback.
+
 ## Library surfaces
 
 Construct an `Int4JudgePlanner` from the actual resident model, then wrap it:
