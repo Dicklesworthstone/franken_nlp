@@ -708,6 +708,31 @@ serial/cohort equivalence with standalone maps and work exhaustion across
 flush. Compilation, native parity and task quality remain subject to their
 separate controller validation gates.
 
+## Implemented candidate complete-source faithfulness corpora
+
+`fnlp candidate source-int4 faithfulness-corpus` checks ordered
+`{id,text,task_args:{claim}}` NDJSON with one resident model and a required
+fixed `--policy FILE`. `text` is the complete original source, including any
+counterevidence. The command losslessly partitions each source, preserves its
+exact claim and retains every chunk's NLI scores and original-coordinate
+evidence before publishing one complete result.
+
+The existing `faithfulness-map` semantics now cover an entire retrieval or
+generation log. All five work ceilings apply across the whole live stream,
+including admitted failed attempts and flush boundaries. Explicit
+`--cohort-chunks N` shares layers within a document and preflights every actual
+ragged window against the 64-head limit. No evidence is dropped and no
+oversized cohort silently changes its schedule. Whole-run success requires
+`run_complete` plus exit zero.
+
+The library also exposes authenticated complete-source durable jobs through
+`Int4FaithfulnessDocumentJobPlanner` and
+`NlpEngine::job_int4_faithfulness_document`, reusing the corpus processor.
+Every original source and claim, the fixed policy and exact work lifetime
+authenticate on resume. See the [faithfulness population guide](docs/native-faithfulness-populations-int4.md)
+for CLI and library contracts, explicit policy examples, memory boundaries
+and pending executable/native qualification gates.
+
 ## Implemented candidate INT4 judgment
 
 `fnlp candidate source-int4 judge` runs **pairwise, rubric and faithfulness**

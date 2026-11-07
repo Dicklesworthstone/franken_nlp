@@ -192,7 +192,7 @@ fn exact_host_detection_authorizes_a_kernel_or_refuses_before_any_input() {
                 Int4Task::SourceMap(map) => map.validate(&command.args).map(|limits| limits.common),
                 Int4Task::SourceBatch(batch) => batch.validate(&command.args).map(|limits| limits.common),
                 Int4Task::ScoredBatch(batch) => batch.validate(&command.args).map(|limits| limits.common),
-                Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::ClassifyCorpus(_) | Int4Task::SentimentCorpus(_)
+                Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::ClassifyCorpus(_) | Int4Task::SentimentCorpus(_) | Int4Task::FaithfulnessCorpus(_)
                     | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::ClassificationDocumentJob | Int4Task::SentimentDocumentJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob => Err(CandidateError::Arguments),
             };
             match PackedInt4Kernel::detect(kind) {
@@ -235,7 +235,7 @@ fn physical_kernel_selection_does_not_change_layout_memory_or_generation_options
             Int4Task::SourceMap(map) => map.validate(&command.args).unwrap().common,
             Int4Task::SourceBatch(batch) => batch.validate(&command.args).unwrap().common,
             Int4Task::ScoredBatch(batch) => batch.validate(&command.args).unwrap().common,
-            Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::ClassifyCorpus(_) | Int4Task::SentimentCorpus(_)
+            Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::ClassifyCorpus(_) | Int4Task::SentimentCorpus(_) | Int4Task::FaithfulnessCorpus(_)
                 | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::ClassificationDocumentJob | Int4Task::SentimentDocumentJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob => panic!("owned workflow is not a single-task kernel fixture"),
         };
         let storage = |limits: Int4Limits| (limits.memory_bytes, limits.preparation_bytes,

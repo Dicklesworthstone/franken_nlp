@@ -1,5 +1,6 @@
 //! Complete-source faithfulness with an explicit bounded evidence reduction.
 use super::*;
+pub(super) mod corpus;
 use serde::Deserialize;
 use crate::{native_engine::strict_int4::cohort::MAX_INT4_SEQUENCES,
     tasks::{ir::TaskBudget, mapreduce::ChunkLimits,
