@@ -25,18 +25,19 @@ struct QuestionStreamInput<R, W> {
 /// explicit preparation and IO declarations. These are modeled reservations.
 pub fn int4_question_document_corpus_requirements(width: usize,
     config: Int4QuestionDocumentBatchConfig, limits: CorpusLimits,
-    reduction_reserve_bytes: u64, cohort_chunks: Option<usize>)
+    reduction_reserve_bytes: u64, cohort_chunks: Option<usize>, hierarchy_groups: Option<usize>)
     -> Result<Int4QuestionDocumentMemoryRequirement, HostedError> {
     limits.native.run.validate()?;
-    memory_limits(limits, reduction_reserve_bytes, cohort_chunks)
+    memory_limits(limits, reduction_reserve_bytes, cohort_chunks, hierarchy_groups)
         .requirements(width, config, limits.transport).map_err(map_error)
 }
-fn memory_limits(limits: CorpusLimits, reduction_reserve_bytes: u64, cohort_chunks: Option<usize>)
+fn memory_limits(limits: CorpusLimits, reduction_reserve_bytes: u64, cohort_chunks: Option<usize>,
+    hierarchy_groups: Option<usize>)
     -> Int4QuestionDocumentMemoryLimits {
     Int4QuestionDocumentMemoryLimits { context_tokens: limits.native.context_tokens,
         allocator_reserve_bytes: limits.native.allocator_reserve_bytes,
         preparation_reserve_bytes: limits.preparation_reserve_bytes,
-        io_reserve_bytes: limits.io_reserve_bytes, reduction_reserve_bytes, cohort_chunks }
+        io_reserve_bytes: limits.io_reserve_bytes, reduction_reserve_bytes, cohort_chunks, hierarchy_groups }
 }
 
 impl NlpEngine {
@@ -44,6 +45,8 @@ impl NlpEngine {
     /// All independent passage answers remain in the result. Explicit flat
     /// synthesis uses all collected, verified verbatim quotations and refuses
     /// evidence that cannot fit the declared continuation; it never truncates.
+    /// Explicit hierarchy instead selects original quotations across bounded
+    /// levels, retains every native pass and never claims lossless equivalence.
     ///
     /// One resident model, owned reader/writer, deadline and nonrenewable native,
     /// mask and verification ledgers span all records and flush epochs. Every
@@ -66,11 +69,11 @@ impl NlpEngine {
             return Err(HostedError::ModelIdentity);
         }
         let cohort_chunks = planner.uses_chunk_cohorts().then_some(config.mapping.reduction.map_batch_chunks);
+        let hierarchy_groups = planner.hierarchy_cohort_schedule().map(|schedule| schedule.max_groups);
         let required = int4_question_document_corpus_requirements(planner.group_width(), config,
-            limits, reduction_reserve_bytes, cohort_chunks)?;
-        let cohort = cohort_chunks.map(|_| planner.cohort_requirements().map_err(HostedError::BatchSetup)).transpose()?;
-        let capacity = QuestionCapacity { config, kv_bytes: required.native.kv_bytes,
-            max_result_bytes: required.max_output_bytes };
+            limits, reduction_reserve_bytes, cohort_chunks, hierarchy_groups)?;
+        let cohort = planner.uses_native_cohorts().then(|| planner.cohort_requirements()
+            .map_err(HostedError::BatchSetup)).transpose()?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(QuestionStreamInput { preparation: Some((planner, vocabulary)), reader, writer }))?;
@@ -82,8 +85,8 @@ impl NlpEngine {
             let mut input = input;
             checkpoint(control)?;
             let (planner, vocabulary) = input.value.preparation.take().ok_or(HostedError::CompletionMissing)?;
-            let admission = QuestionAdmission { lease: &lease, model: model.model_identity(),
-                base: planner.base_execution_identity(), capacity };
+            let admission = QuestionAdmission::new(&lease, model.model_identity(),
+                planner.base_execution_identity(), config, required);
             let result = if let Some(quote) = cohort {
                 let budget = Int4SourceMapCohortBudget { context_limit: limits.native.context_tokens,
                     native_memory: Int4MemoryBudget { max_kv_bytes: quote.native.kv_bytes,
@@ -97,8 +100,8 @@ impl NlpEngine {
                     stream::run_ndjson(&mut input.value.reader, &mut input.value.writer,
                         &mut processor, limits.transport, control).map_err(HostedError::Batch)
                 };
-                // Exact-sized discovery windows and a possible scalar evidence
-                // continuation drain sequentially under the same phase peak.
+                // Exact-sized discovery and hierarchy windows (or their scalar
+                // phases) drain sequentially under the same complete peak.
                 // No unused scalar engine is allocated beside those owners.
                 drop(scratch); drop(kv);
                 result
@@ -130,12 +133,20 @@ struct QuestionCapacity {
     config: Int4QuestionDocumentBatchConfig,
     kv_bytes: u64,
     max_result_bytes: u64,
+    max_output_tokens: u64,
 }
 struct QuestionAdmission<'a> {
     lease: &'a EngineLease,
     model: &'a Int4ModelIdentity,
     base: &'a ExecutionIdentity,
     capacity: QuestionCapacity,
+}
+impl<'a> QuestionAdmission<'a> {
+    fn new(lease: &'a EngineLease, model: &'a Int4ModelIdentity, base: &'a ExecutionIdentity,
+        config: Int4QuestionDocumentBatchConfig, required: Int4QuestionDocumentMemoryRequirement) -> Self {
+        Self { lease, model, base, capacity: QuestionCapacity { config, kv_bytes: required.native.kv_bytes,
+            max_result_bytes: required.max_output_bytes, max_output_tokens: required.max_output_tokens } }
+    }
 }
 impl Int4QuestionDocumentBatchAdmission for QuestionAdmission<'_> {
     type Guard = Pending;
@@ -150,10 +161,9 @@ impl Int4QuestionDocumentBatchAdmission for QuestionAdmission<'_> {
                 .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
             identities.push(identity.clone());
         }
-        // Semantic QA stores text and citations, not native token vectors.
-        // Decoder tokens and physical cohort wrappers are already priced in
-        // the complete document workspace retained through delivery.
-        let guard = output_claim(self.lease, request.max_result_bytes, 0)
+        // Hierarchies retain native transcripts after their engines drain;
+        // keep their exact declared token authority charged through delivery.
+        let guard = output_claim(self.lease, request.max_result_bytes, request.max_output_tokens)
             .map_err(|error| match error { HostedError::Reservation(_) => BatchItemFailure::fatal(BatchCode::Admission),
                 _ => BatchItemFailure::fatal(BatchCode::InvalidExecution) })?;
         Ok((identities, guard))
@@ -177,7 +187,7 @@ fn check_request(width: usize, base: &ExecutionIdentity, capacity: QuestionCapac
             return Err(BatchItemFailure::fatal(BatchCode::Admission));
         }
     }
-    let contexts = (request.native_chunks as u64).checked_add(u64::from(config.synthesis.is_some()));
+    let contexts = (request.native_chunks as u64).checked_add(config.continuation_passes() as u64);
     if contexts.and_then(|n| mapping.mask_visits_per_chunk.checked_mul(n)) != Some(request.mask_node_visits)
         || request.mask_node_visits == 0 || request.mask_node_visits > mapping.max_mask_visits
         || request.mask_limits.max_trie_node_visits != mapping.mask_limits.max_trie_node_visits
@@ -195,7 +205,9 @@ fn check_request(width: usize, base: &ExecutionIdentity, capacity: QuestionCapac
         return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
     }
     if capacity.max_result_bytes == 0 || capacity.max_result_bytes != mapping.reduction.max_result_bytes as u64
-        || request.max_result_bytes != capacity.max_result_bytes {
+        || request.max_result_bytes != capacity.max_result_bytes
+        || config.retained_output_tokens().map_err(BatchItemFailure::fatal)? != capacity.max_output_tokens
+        || request.max_output_tokens != capacity.max_output_tokens {
         return Err(BatchItemFailure::fatal(BatchCode::OutputLineLimit));
     }
     Ok(())

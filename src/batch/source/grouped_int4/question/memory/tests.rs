@@ -4,14 +4,14 @@ use crate::{
     native_engine::{lmhead::NANBEIGE_VOCAB_SIZE, strict_int4::Int4Work},
     tasks::{answer::AnswerOptions, ir::TaskBudget, mapreduce::{ChunkLimits, ExecutionLimits},
         source_planning::{SourcePlanningLimits, grouped_int4::long::{Int4SourceMapLimits,
-            question::synthesis::QuestionSynthesisLimits}}},
+            question::synthesis::{QuestionSynthesisLimits, hierarchy::QuestionHierarchyLimits}}}},
     validation::grounded_fields::GroundingBudget,
 };
 
 fn fixture() -> (Int4QuestionDocumentMemoryLimits, Int4QuestionDocumentBatchConfig, BatchLimits) {
     let memory = Int4QuestionDocumentMemoryLimits { context_tokens: 128,
         allocator_reserve_bytes: 65_536, preparation_reserve_bytes: 32 * 1024 * 1024,
-        io_reserve_bytes: 65_536, reduction_reserve_bytes: 65_536, cohort_chunks: None };
+        io_reserve_bytes: 65_536, reduction_reserve_bytes: 65_536, cohort_chunks: None, hierarchy_groups: None };
     let work = Int4Work::for_sequence(32, 0, 1024, 128 * NANBEIGE_VOCAB_SIZE).unwrap();
     let verification = GroundingBudget { max_fields: 32, max_matches: 128, max_scan_steps: 100_000 };
     let run_verification = GroundingBudget { max_fields: 64, max_matches: 256, max_scan_steps: 200_000 };
@@ -30,7 +30,7 @@ fn fixture() -> (Int4QuestionDocumentMemoryLimits, Int4QuestionDocumentBatchConf
                 max_total_value_bytes: 1_048_576, max_result_bytes: 131_072 },
             max_model_work: work, mask_limits: Default::default(), mask_visits_per_chunk: 1000,
             max_mask_visits: 8000, verification },
-        verification, synthesis: None, max_question_bytes: 32,
+        verification, synthesis: None, hierarchy: None, max_question_bytes: 32,
         max_model_work: work.checked_add(work).unwrap(), max_mask_visits: 16_000,
         max_map_verification: run_verification, max_verification: run_verification,
     };
@@ -212,6 +212,37 @@ fn input_document_and_native_reservations_must_coexist_without_overflow() {
             1 => memory.io_reserve_bytes = u64::MAX, 2 => memory.allocator_reserve_bytes = u64::MAX,
             3 => memory.reduction_reserve_bytes = u64::MAX,
             _ => config.budget.max_output_bytes = u64::MAX }
+#[test]
+fn hierarchy_prices_every_retained_pass_question_copy_and_native_window() {
+    let (mut memory, mut config, transport) = fixture(); synthesize(&mut config);
+    let flat = memory.requirements(32, config, transport).unwrap();
+    config.hierarchy = Some(QuestionHierarchyLimits { max_passes: 4, max_levels: 3,
+        ..QuestionHierarchyLimits::default() });
+    let serial = memory.requirements(32, config, transport).unwrap();
+    assert_eq!(serial.native, flat.native);
+    assert_eq!(serial.input_bytes - flat.input_bytes,
+        3 * (QUESTION_DOCUMENT_CHUNK_METADATA_BYTES + config.max_question_bytes as u64 * 64));
+    assert_eq!(serial.max_output_tokens, 4 * u64::from(config.budget.max_output_tokens));
+    assert_eq!(serial.output_reservation_bytes - flat.output_reservation_bytes, serial.max_output_tokens * 8);
+    assert_eq!(serial.document_workspace_bytes - flat.document_workspace_bytes,
+        3 * (config.budget.max_output_bytes * 4 + u64::from(config.budget.max_output_tokens) * 8)
+            + 4 * (8192 + 256) + 3 * 128);
+    memory.hierarchy_groups = Some(2);
+    let groups = memory.requirements(32, config, transport).unwrap();
+    assert_eq!(groups.native.kv_bytes, config.budget.max_kv_bytes * 2);
+    assert_eq!(groups.input_bytes - serial.input_bytes, memory.preparation_reserve_bytes);
+    memory.cohort_chunks = Some(3);
+    let both = memory.requirements(32, config, transport).unwrap();
+    assert_eq!(both.native.kv_bytes, config.budget.max_kv_bytes * 3);
+    assert_eq!(both.max_output_tokens, serial.max_output_tokens);
+    assert_eq!(both.output_reservation_bytes, serial.output_reservation_bytes);
+    for groups in [0, 5, 65, usize::MAX] {
+        memory.hierarchy_groups = Some(groups);
+        assert!(memory.requirements(32, config, transport).is_err());
+    }
+    memory.hierarchy_groups = Some(1); config.hierarchy = None;
+    assert!(memory.requirements(32, config, transport).is_err());
+}
         assert!(memory.requirements(32, config, transport).is_err(), "owner {owner}");
     }
     let (mut memory, config, transport) = fixture();

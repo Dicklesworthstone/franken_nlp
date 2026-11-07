@@ -1,10 +1,12 @@
 //! Only real resident scalar execution or owned native discovery cohorts can
-//! execute the sealed question plans. Synthesis keeps its scalar continuation.
+//! execute the sealed question plans. Hierarchy group windows are admitted
+//! independently of discovery and drain before ordered evidence lifting.
 use super::*;
 use crate::{batch::extract::grouped_int4::memory::MAX_COHORT_RESULT_BYTES,
     native_engine::strict_int4::STRICT_INT4_PROFILE,
     tasks::source_planning::grouped_int4::long::{
         cohort::synthesis::INT4_SYNTHESIS_COHORT_EXECUTION,
+        cohort::hierarchy::INT4_HIERARCHY_COHORT_EXECUTION,
         question::cohort::INT4_QUESTION_COHORT_EXECUTION}};
 
 pub(super) enum Backend<'e, 'w> {
@@ -26,7 +28,7 @@ impl Backend<'_, '_> {
             return Err(BatchItemFailure::fatal(BatchCode::Admission));
         }
         match self {
-            Self::Serial(engine) if !factory.uses_chunk_cohorts() => {
+            Self::Serial(engine) if !factory.uses_native_cohorts() => {
                 let c = &factory.config; let context = c.planning.max_context_tokens;
                 let required = Int4MemoryRequirement::for_context(context, factory.group_width)
                     .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
@@ -36,7 +38,7 @@ impl Backend<'_, '_> {
                 }
                 Ok(required.kv_bytes)
             }
-            Self::Cohorts { budget, .. } if factory.uses_chunk_cohorts() => Ok(cohort_budget(factory, *budget)?.native.kv_bytes),
+            Self::Cohorts { budget, .. } if factory.uses_native_cohorts() => Ok(cohort_budget(factory, *budget)?.native.kv_bytes),
             _ => Err(BatchItemFailure::fatal(BatchCode::Admission)),
         }
     }
@@ -51,19 +53,23 @@ impl Backend<'_, '_> {
                 // before any forward and its evidence continuation before use.
             }
             Self::Cohorts { budget, .. } => {
-                check_peak(plan.cohort_requirements(budget.context_limit)?, cohort_budget(factory, *budget)?)?;
+                check_peak(plan.phase_requirements(budget.context_limit, factory.hierarchy_cohort_schedule())?,
+                    cohort_budget(factory, *budget)?)?;
             }
         }
         poll(control)
     }
-    pub(super) fn execute<C: DecodeStepControl>(&mut self, plan: NativePlan<'_>, identities: &[ExecutionIdentity],
-        planner: &SourceTaskPlanner, vocabulary: &ExtractionVocabulary, control: &mut C)
+    pub(super) fn execute<C: DecodeStepControl>(&mut self, factory: &Int4QuestionDocumentBatchPlanner,
+        plan: NativePlan<'_>, identities: &[ExecutionIdentity], vocabulary: &ExtractionVocabulary, control: &mut C)
         -> Result<Int4QuestionDocumentRun, BatchItemFailure> {
+        let planner = &factory.planner;
         match (self, plan) {
             (Self::Serial(engine), NativePlan::Independent(plan)) => plan.execute_with_control(identities, engine, vocabulary, control)
                 .map(Int4QuestionDocumentRun::Independent).map_err(|e| map_failure(e, true)),
             (Self::Serial(engine), NativePlan::Synthesis(plan)) => plan.execute_with_control(identities, planner, engine, vocabulary, control)
                 .map(Int4QuestionDocumentRun::Synthesis).map_err(|e| map_failure(e, true)),
+            (Self::Serial(engine), NativePlan::Hierarchy(plan)) => plan.execute_with_control(identities, planner, engine, vocabulary, control)
+                .map(Int4QuestionDocumentRun::Hierarchy).map_err(|e| map_failure(e, true)),
             (Self::Cohorts { weights, budget, kernel }, NativePlan::Independent(plan)) => {
                 let expected = plan.preflight_metadata();
                 let run = plan.execute_cohorts_with_control(identities, weights, vocabulary, *budget, *kernel, control)
@@ -86,12 +92,37 @@ impl Backend<'_, '_> {
                 check_stats(run.discovery_cohorts, &run.document.discovery)?;
                 Ok(Int4QuestionDocumentRun::Synthesis(run.document))
             }
+            (Self::Cohorts { weights, budget, kernel }, NativePlan::Hierarchy(plan)) => {
+                let expected = plan.preflight_metadata();
+                if let Some(schedule) = factory.hierarchy_cohort_schedule() {
+                    let run = plan.execute_hierarchy_cohorts_with_control(identities, planner, weights,
+                        vocabulary, schedule, *budget, *kernel, control).map_err(|e| map_failure(e, true))?;
+                    if run.schema_version != 1 || run.execution != INT4_HIERARCHY_COHORT_EXECUTION
+                        || run.discovery_cohorts.is_some() != schedule.discovery_cohorts {
+                        return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
+                    }
+                    expected.verify_completed(&run.document).map_err(|e| map_failure(e, true))?;
+                    if let Some(stats) = run.discovery_cohorts { check_stats(stats, &run.document.discovery)?; }
+                    // The sealed grouped executor validates every level/window,
+                    // all pass receipts and exact aggregate hierarchy stats.
+                    Ok(Int4QuestionDocumentRun::Hierarchy(run.document))
+                } else {
+                    let run = plan.execute_cohorts_with_control(identities, planner, weights, vocabulary,
+                        *budget, *kernel, control).map_err(|e| map_failure(e, true))?;
+                    if run.schema_version != 1 || run.execution != INT4_SYNTHESIS_COHORT_EXECUTION {
+                        return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
+                    }
+                    expected.verify_completed(&run.document).map_err(|e| map_failure(e, true))?;
+                    check_stats(run.discovery_cohorts, &run.document.discovery)?;
+                    Ok(Int4QuestionDocumentRun::Hierarchy(run.document))
+                }
+            }
         }
     }
 }
 pub(super) fn cohort_budget(factory: &Int4QuestionDocumentBatchPlanner, budget: Int4SourceMapCohortBudget)
     -> Result<Int4SourceMapCohortRequirement, BatchItemFailure> {
-    if !factory.uses_chunk_cohorts() || budget.context_limit != factory.config.planning.max_context_tokens
+    if !factory.uses_native_cohorts() || budget.context_limit != factory.config.planning.max_context_tokens
         || budget.max_result_bytes > MAX_COHORT_RESULT_BYTES {
         return Err(BatchItemFailure::fatal(BatchCode::Admission));
     }

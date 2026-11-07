@@ -14,10 +14,13 @@ use crate::{
         ir::{PlanContext, TaskBudget}, mapreduce::MapReduceError,
         source_planning::{SourcePlanningError, SourcePlanningLimits, SourceTaskPlanner,
             grouped_int4::{Int4SourceError, long::{Int4SourceMapError, Int4SourceMapLimits,
-                cohort::{Int4SourceMapCohortBudget, Int4SourceMapCohortMemoryLimits, Int4SourceMapCohortRequirement},
+                cohort::{Int4SourceMapCohortBudget, Int4SourceMapCohortMemoryLimits, Int4SourceMapCohortRequirement,
+                    hierarchy::Int4HierarchyCohortSchedule},
                 question::{Int4QuestionPreflight, Int4QuestionRun, PreparedInt4Question, SourceQuestion,
                     synthesis::{Int4QuestionSynthesisPreflight, Int4QuestionSynthesisRun,
-                        PreparedInt4QuestionSynthesis, QuestionSynthesisLimits, SourceQuestionSynthesis}}}}}},
+                        PreparedInt4QuestionSynthesis, QuestionSynthesisLimits, SourceQuestionSynthesis,
+                        hierarchy::{Int4QuestionHierarchyPreflight, Int4QuestionHierarchyRun,
+                            PreparedInt4QuestionHierarchy, QuestionHierarchyLimits}}}}}}},
     validation::grounded_fields::GroundingBudget,
 };
 mod planning;
@@ -65,6 +68,9 @@ pub struct Int4QuestionDocumentBatchConfig {
     pub mapping: Int4SourceMapLimits,
     pub verification: GroundingBudget,
     pub synthesis: Option<QuestionSynthesisLimits>,
+    /// Explicit lossy quotation selection. Requires the fixed synthesis policy;
+    /// all permitted passes reserve work before the first discovery forward.
+    pub hierarchy: Option<QuestionHierarchyLimits>,
     pub max_question_bytes: usize,
     pub max_model_work: Int4Work,
     pub max_mask_visits: u64,
@@ -91,7 +97,20 @@ impl Int4QuestionDocumentBatchConfig {
             return Err(BatchCode::InvalidLimits.into());
         }
         if let Some(limits) = self.synthesis { limits.validate(self.planning).map_err(|_| BatchCode::InvalidLimits)?; }
+        if let Some(limits) = self.hierarchy {
+            if self.synthesis.is_none() { return Err(BatchCode::InvalidLimits.into()); }
+            limits.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        }
         Ok(())
+    }
+    pub fn continuation_passes(&self) -> usize {
+        self.hierarchy.map_or(usize::from(self.synthesis.is_some()), |limits| limits.max_passes)
+    }
+    /// Hierarchy receipts retain every native continuation transcript. Plain
+    /// discovery and flat synthesis retain only semantic text and citations.
+    pub(crate) fn retained_output_tokens(&self) -> Result<u64, BatchFault> {
+        (self.hierarchy.map_or(0, |limits| limits.max_passes) as u64)
+            .checked_mul(u64::from(self.budget.max_output_tokens)).ok_or_else(|| BatchCode::InvalidLimits.into())
     }
 }
 
@@ -99,13 +118,19 @@ impl Int4QuestionDocumentBatchConfig {
 /// default. Changing the native schedule invalidates prior prepared ownership.
 pub struct Int4QuestionDocumentBatchPlanner {
     planner: Arc<SourceTaskPlanner>, identity: ExecutionIdentity, group_width: usize,
-    config: Int4QuestionDocumentBatchConfig, chunk_cohorts: bool, owner: Arc<()>,
+    config: Int4QuestionDocumentBatchConfig, chunk_cohorts: bool,
+    hierarchy_groups: Option<usize>, owner: Arc<()>,
 }
 impl Int4QuestionDocumentBatchPlanner {
     pub fn for_model(model: &Int4ModelIdentity, planner: Arc<SourceTaskPlanner>, identity: ExecutionIdentity,
         config: Int4QuestionDocumentBatchConfig) -> Result<Self, BatchFault> {
         constrained_int4::check_model(&identity, model).map_err(|_| BatchCode::Admission)?;
         Self::configured(planner, identity, model.group_width(), config)
+    }
+    #[cfg(test)]
+    pub(crate) fn for_planning_fixture(planner: Arc<SourceTaskPlanner>, identity: ExecutionIdentity,
+        group_width: usize, config: Int4QuestionDocumentBatchConfig) -> Result<Self, BatchFault> {
+        Self::configured(planner, identity, group_width, config)
     }
     // Model-free planning fixtures stay private and cannot manufacture a
     // native model identity or replace a production execution driver.
@@ -120,34 +145,76 @@ impl Int4QuestionDocumentBatchPlanner {
             return Err(BatchCode::Admission.into());
         }
         check_synthesis_reserve(&config, group_width)?;
-        Ok(Self { planner, identity, group_width, config, chunk_cohorts: false, owner: Arc::new(()) })
+        Ok(Self { planner, identity, group_width, config, chunk_cohorts: false,
+            hierarchy_groups: None, owner: Arc::new(()) })
     }
     pub fn config(&self) -> &Int4QuestionDocumentBatchConfig { &self.config }
     pub fn base_execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     pub fn group_width(&self) -> usize { self.group_width }
     pub fn uses_chunk_cohorts(&self) -> bool { self.chunk_cohorts }
+    pub fn uses_native_cohorts(&self) -> bool { self.chunk_cohorts || self.hierarchy_groups.is_some() }
+    pub fn hierarchy_cohort_schedule(&self) -> Option<Int4HierarchyCohortSchedule> {
+        self.hierarchy_groups.map(|max_groups| Int4HierarchyCohortSchedule {
+            max_groups, discovery_cohorts: self.chunk_cohorts })
+    }
     pub fn max_result_bytes(&self) -> u64 { self.config.mapping.reduction.max_result_bytes as u64 }
+    pub fn max_output_tokens(&self) -> u64 {
+        // Immutable construction validated max_passes <= 256 and a u32 token
+        // allowance; their product therefore fits u64.
+        self.config.hierarchy.map_or(0, |limits| limits.max_passes as u64 * u64::from(self.config.budget.max_output_tokens))
+    }
     pub fn with_chunk_cohorts(mut self) -> Result<Self, BatchFault> {
+        let changed = !self.chunk_cohorts;
+        self.chunk_cohorts = true;
         self.cohort_requirements()?;
-        if !self.chunk_cohorts { self.chunk_cohorts = true; self.owner = Arc::new(()); }
+        if changed { self.owner = Arc::new(()); }
+        Ok(self)
+    }
+    pub fn with_hierarchy_cohorts(mut self, max_groups: usize) -> Result<Self, BatchFault> {
+        let limits = self.config.hierarchy.ok_or(BatchCode::InvalidLimits)?;
+        Int4HierarchyCohortSchedule { max_groups, discovery_cohorts: self.chunk_cohorts }
+            .validate(limits.max_passes).map_err(|_| BatchCode::InvalidLimits)?;
+        let changed = self.hierarchy_groups != Some(max_groups);
+        self.hierarchy_groups = Some(max_groups);
+        self.cohort_requirements()?;
+        if changed { self.owner = Arc::new(()); }
         Ok(self)
     }
     pub fn cohort_requirements(&self) -> Result<Int4SourceMapCohortRequirement, BatchFault> {
         let c = self.config; let chunks = c.mapping.reduction.map_batch_chunks;
-        if chunks > c.mapping.chunks.max_chunks { return Err(BatchCode::InvalidLimits.into()); }
-        let quote = Int4SourceMapCohortMemoryLimits { max_chunks: chunks,
+        let discovery = if self.chunk_cohorts || self.hierarchy_groups.is_none() {
+            if chunks > c.mapping.chunks.max_chunks { return Err(BatchCode::InvalidLimits.into()); }
+            Some(Int4SourceMapCohortMemoryLimits { max_chunks: chunks,
             context_tokens: c.planning.max_context_tokens,
             max_output_tokens_per_chunk: u64::from(c.budget.max_output_tokens),
             max_result_bytes_per_chunk: c.budget.max_output_bytes }.requirements(self.group_width)
-            .map_err(|_| BatchCode::InvalidLimits)?;
+            .map_err(|_| BatchCode::InvalidLimits)?)
+        } else { None };
+        if let Some(schedule) = self.hierarchy_cohort_schedule() {
+            return schedule.requirements(discovery, c.planning.max_context_tokens, self.group_width, c.budget)
+                .map_err(|_| BatchCode::Admission.into());
+        }
+        let quote = discovery.ok_or(BatchCode::InvalidLimits)?;
         if c.synthesis.is_some() {
             quote.with_synthesis_context(c.planning.max_context_tokens, self.group_width, c.budget.max_kv_bytes)
                 .map_err(|_| BatchCode::Admission.into())
         } else { Ok(quote) }
     }
-    fn owns(&self, prepared: &PreparedInt4QuestionDocument) -> Result<(), BatchItemFailure> {
+    pub(crate) fn owns(&self, prepared: &PreparedInt4QuestionDocument) -> Result<(), BatchItemFailure> {
         if !Arc::ptr_eq(&self.owner, &prepared.owner) { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
         Ok(())
+    }
+    /// Seal a complete source/question pair without allocating native state.
+    /// Executing processors still preflight the actual backend and reconstruct
+    /// every exact native identity against this factory's private owner.
+    pub fn prepare_with_control<C: DecodeStepControl>(&self, source: String,
+        args: QuestionDocumentArgs, control: &mut C) -> Result<PreparedInt4QuestionDocument, BatchItemFailure> {
+        let plan = self.plan(&source, &args.question, control, false)?;
+        let (expected, identities) = self.snapshot(&plan, control)?;
+        drop(plan);
+        poll(control)?;
+        Ok(PreparedInt4QuestionDocument { source, question: args.question,
+            expected, identities, owner: Arc::clone(&self.owner) })
     }
 }
 
@@ -163,10 +230,13 @@ impl PreparedInt4QuestionDocument {
 }
 #[derive(Serialize)]
 #[serde(untagged)]
-pub enum Int4QuestionDocumentRun { Independent(Int4QuestionRun), Synthesis(Int4QuestionSynthesisRun) }
+pub enum Int4QuestionDocumentRun {
+    Independent(Int4QuestionRun), Synthesis(Int4QuestionSynthesisRun), Hierarchy(Int4QuestionHierarchyRun),
+}
 pub struct Int4QuestionDocumentAdmission<'a> {
     pub identities: &'a [ExecutionIdentity], pub model_work: Int4Work, pub mask_node_visits: u64,
     pub mask_limits: MaskWorkLimits, pub kv_reservation_bytes: u64, pub max_result_bytes: u64,
+    pub max_output_tokens: u64,
     pub chunk_count: usize, pub native_chunks: usize,
 }
 pub trait Int4QuestionDocumentBatchAdmission {
@@ -241,11 +311,12 @@ impl<A: Int4QuestionDocumentBatchAdmission> BatchProcessor for NativeInt4Questio
                 identities: &prepared.identities, model_work: prepared.planned_work(),
                 mask_node_visits: prepared.reserved_mask_visits(), mask_limits: c.mapping.mask_limits,
                 kv_reservation_bytes: kv, max_result_bytes: self.planner.max_result_bytes(),
+                max_output_tokens: self.planner.max_output_tokens(),
                 chunk_count: prepared.chunk_count(), native_chunks: prepared.native_chunks(),
             })?;
             poll(control)?;
             if admitted != prepared.identities { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
-            let output = self.backend.execute(plan, &admitted, &self.planner.planner, self.vocabulary, control)?;
+            let output = self.backend.execute(self.planner, plan, &admitted, self.vocabulary, control)?;
             prepared.expected.verify(&output)?;
             self.backend.capacity(self.planner)?; poll(control)?;
             Ok(GuardedOutput::new(output, guard))
@@ -339,8 +410,14 @@ fn check_synthesis_reserve(c: &Int4QuestionDocumentBatchConfig, width: usize) ->
     let output = c.budget.max_output_tokens as usize;
     let prompt = c.planning.max_context_tokens.checked_sub(output)
         .map(|n| n.min(c.budget.max_input_tokens as usize)).filter(|&n| n > 0).ok_or(BatchCode::InvalidLimits)?;
-    let work = constrained_int4::planned_work(width, prompt, output).map_err(|_| BatchCode::InvalidLimits)?;
-    if !fits(work, c.mapping.max_model_work) || c.mapping.max_mask_visits <= c.mapping.mask_visits_per_chunk {
+    let pass = constrained_int4::planned_work(width, prompt, output).map_err(|_| BatchCode::InvalidLimits)?;
+    let mut work = Int4Work::default();
+    for _ in 0..c.continuation_passes() {
+        work = work.checked_add(pass).map_err(|_| BatchCode::InvalidLimits)?;
+    }
+    let masks = c.mapping.mask_visits_per_chunk.checked_mul(c.continuation_passes() as u64)
+        .ok_or(BatchCode::InvalidLimits)?;
+    if !fits(work, c.mapping.max_model_work) || c.mapping.max_mask_visits <= masks {
         return Err(BatchCode::InvalidLimits.into());
     }
     Ok(())

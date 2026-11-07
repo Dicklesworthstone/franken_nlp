@@ -78,9 +78,7 @@ evidence. Original-coordinate citations remain attached to the final answer.
 
 No collected evidence, a final model abstention and an answered result remain
 distinct outcomes. An inference, verification or resource failure is never
-converted into successful abstention. Hierarchical evidence selection is not
-part of this command; existing `answer-map` and `document-job answer` retain
-their explicit hierarchy workflows.
+converted into successful abstention.
 
 `--options FILE` selects one complete `AnswerOptions` JSON object for the entire
 stream. For example:
@@ -93,7 +91,42 @@ Omitting the file uses the shipped options. Unknown, duplicate or missing
 option fields are refused. Options are read and validated before model loading
 or population input; per-record questions do not replace them.
 
-## Native chunk cohorts
+## Bounded answer hierarchies
+
+Add `--hierarchical-answer` with `--synthesize-answer` to reduce an evidence
+frontier through bounded quote-selection levels before the final answer:
+
+```bash
+fnlp candidate source-int4 answer-corpus questions.ndjson \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$EXPECTED_MODEL_SHA256" \
+  --memory-mib 32768 \
+  --synthesize-answer --hierarchical-answer \
+  --answer-max-levels 8 --answer-max-passes 16 \
+  --cohort-chunks 4 --cohort-hierarchy-groups 2
+```
+
+Each level plans its complete evidence frontier into groups that fit the actual
+question, passage manifest and context. Each pass retains the record's exact
+question. Only independently verified original-source quotations selected by
+these passes enter the next level; generated answer prose remains output data.
+Every final citation lifts to its original source coordinates.
+
+This mode is explicitly lossy: intermediate selection may omit relevant
+quotations. It does not promise equivalence to full-context inference or to a
+single flat evidence pass. `--answer-max-levels` includes the final level, and
+`--answer-max-passes` includes every additional native pass across all levels.
+`--answer-max-tokenizer-calls` and `--answer-max-tokenizer-bytes` bound grouping
+work across the complete document. Exhausted bounds, an oversized individual
+quote, nonprogress, cancellation or verification failure yields no partial
+successful document.
+
+All permitted passes reserve their full work and masks **before discovery**.
+The shared quote prices their question copies, identities and retained native
+transcripts; the output guard keeps those transcripts charged through delivery.
+The independent and flat-synthesis modes retain their existing result shapes.
+
+## Native discovery and hierarchy cohorts
 
 Without `--cohort-chunks`, discovery uses a serial native engine. Explicit
 `--cohort-chunks N` shares decoder layers across independent discovery chunks.
@@ -102,15 +135,20 @@ decoder and result quote. The selected width is not silently reduced.
 
 Each row keeps the same original task KV, prompt, source evidence and finalizer.
 Whitespace chunks retain their original ranges without fabricated native
-answers or model work. All discovery windows drain before the optional scalar
-synthesis pass. The host admits the componentwise native peak for both phases,
-including the full synthesis context, rather than adding simultaneous KV for
-phases that do not coexist. Documents remain sequential and ordered.
+answers or model work. All discovery windows drain before the evidence phase.
+A flat synthesis uses one scalar pass. With hierarchy enabled,
+`--cohort-hierarchy-groups N` independently shares native layers within each
+level; its width must be 1 through 64 and no greater than the complete pass
+ceiling. Hierarchy cohorts can run with serial discovery, and discovery cohorts
+can run with serial hierarchy passes. Every complete level drains before the
+next begins. The host admits the componentwise native peak across phases,
+including the full continuation context, plus each simultaneous preparation
+owner. Documents remain sequential and ordered.
 
-The final semantic document keeps the existing independent-question or
-question-synthesis wire shape. Public candidate provenance records
-`chunk_schedule` and an optional `cohort_chunks`; physical scheduling does not
-replace the semantic result with a wrapper.
+The final semantic document keeps the existing independent-question,
+question-synthesis or question-hierarchy wire shape. Public candidate provenance
+records the answer mode, discovery schedule and optional hierarchy schedule;
+physical scheduling does not replace the semantic result with a wrapper.
 
 ## Bounds and whole-run accounting
 
@@ -140,7 +178,7 @@ The five native work flags bound the **entire stream**:
 - `--max-multiply-accumulates`
 
 Every admitted attempt reserves its complete planned discovery work and, when
-requested, the full future synthesis envelope before execution. Failed attempts
+requested, the full future synthesis or hierarchy envelope before execution. Failed attempts
 keep those debits. Increasing the permitted record count does not multiply the
 native work ceilings.
 
@@ -157,7 +195,8 @@ Masks and the two independent verification pools also have run ceilings:
 | `--max-qa-scan-steps` | `--max-run-qa-scan-steps` |
 
 The complete per-document verification allowances are reserved before an
-attempt. Discovery and synthesis share the same QA pool. Neither flush, a new
+attempt. Discovery, synthesis, hierarchy levels and citation lifting share the
+same QA pool. Neither flush, a new
 record, a shorter native window nor a failed attempt renews these counters.
 `--max-checkpoints` and the hosted deadline likewise span the invocation.
 
@@ -197,7 +236,11 @@ Library callers use
 `batch::source::grouped_int4::question::Int4QuestionDocumentBatchConfig`,
 `Int4QuestionDocumentBatchPlanner`, and `NativeInt4QuestionDocumentBatch`.
 The planner binds the actual model, source compiler, options, budgets and
-physical schedule. `QuestionDocumentArgs` contains the required exact question.
+physical schedules. `QuestionDocumentArgs` contains the required exact question.
+`config.hierarchy` selects the bounded hierarchy; call `with_chunk_cohorts()`
+and/or `with_hierarchy_cohorts(max_groups)` before preparing documents. A schedule
+change invalidates earlier prepared ownership. The public memory limits and
+hosted quote accept independent discovery and hierarchy group widths.
 
 `NlpEngine::batch_int4_question_documents` accepts the factory, pinned vocabulary,
 owned reader/writer, `CorpusLimits`, reduction reserve, kernel and cancellation

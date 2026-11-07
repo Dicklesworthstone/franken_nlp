@@ -3,23 +3,28 @@
 use super::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Proof { Independent(Int4QuestionPreflight), Synthesis(Int4QuestionSynthesisPreflight) }
+enum Proof {
+    Independent(Int4QuestionPreflight), Synthesis(Int4QuestionSynthesisPreflight), Hierarchy(Int4QuestionHierarchyPreflight),
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct Expected { proof: Proof, pub(super) work: Int4Work, pub(super) masks: u64 }
 impl Expected {
     pub(super) fn discovery(self) -> Int4QuestionPreflight {
-        match self.proof { Proof::Independent(p) => p, Proof::Synthesis(p) => p.discovery() }
+        match self.proof { Proof::Independent(p) => p, Proof::Synthesis(p) => p.discovery(),
+            Proof::Hierarchy(p) => p.discovery() }
     }
     pub(super) fn verify(self, output: &Int4QuestionDocumentRun) -> Result<(), BatchItemFailure> {
         match (self.proof, output) {
             (Proof::Independent(p), Int4QuestionDocumentRun::Independent(run)) => p.verify_completed(run),
             (Proof::Synthesis(p), Int4QuestionDocumentRun::Synthesis(run)) => p.verify_completed(run),
+            (Proof::Hierarchy(p), Int4QuestionDocumentRun::Hierarchy(run)) => p.verify_completed(run),
             _ => return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)),
         }.map_err(|e| map_failure(e, true))
     }
 }
 pub(super) enum NativePlan<'s> {
     Independent(PreparedInt4Question<'s>), Synthesis(PreparedInt4QuestionSynthesis<'s>),
+    Hierarchy(PreparedInt4QuestionHierarchy<'s>),
 }
 impl NativePlan<'_> {
     pub(super) fn expected(&self) -> Result<Expected, BatchItemFailure> {
@@ -32,18 +37,25 @@ impl NativePlan<'_> {
                 (Proof::Synthesis(p), p.reserved_model_work().map_err(|e| map_failure(e, true))?,
                     p.reserved_mask_visits().map_err(|e| map_failure(e, true))?)
             }
+            Self::Hierarchy(plan) => {
+                let p = plan.preflight_metadata();
+                (Proof::Hierarchy(p), p.reserved_model_work(), p.reserved_mask_visits())
+            }
         };
         Ok(Expected { proof, work, masks })
     }
     pub(super) fn max_kv_bytes(&self) -> u64 {
-        match self { Self::Independent(p) => p.max_kv_bytes(), Self::Synthesis(p) => p.max_kv_bytes() }
+        match self { Self::Independent(p) => p.max_kv_bytes(), Self::Synthesis(p) => p.max_kv_bytes(),
+            Self::Hierarchy(p) => p.max_kv_bytes() }
     }
     fn max_result_bytes(&self) -> u64 {
-        match self { Self::Independent(p) => p.max_result_bytes(), Self::Synthesis(p) => p.max_result_bytes() }
+        match self { Self::Independent(p) => p.max_result_bytes(), Self::Synthesis(p) => p.max_result_bytes(),
+            Self::Hierarchy(p) => p.max_result_bytes() }
     }
     fn identities<C: DecodeStepControl>(&self, control: &mut C) -> Result<Vec<ExecutionIdentity>, BatchItemFailure> {
         match self { Self::Independent(p) => copy_identities(p.execution_identities(), control),
-            Self::Synthesis(p) => copy_identities(p.execution_identities(), control) }
+            Self::Synthesis(p) => copy_identities(p.execution_identities(), control),
+            Self::Hierarchy(p) => copy_identities(p.execution_identities(), control) }
     }
     pub(super) fn preflight<C: DecodeStepControl>(&self, identities: &[ExecutionIdentity],
         model: &Int4ModelIdentity, control: &mut C) -> Result<(), BatchItemFailure> {
@@ -58,8 +70,19 @@ impl NativePlan<'_> {
         poll(control)
     }
     pub(super) fn cohort_requirements(&self, context: usize) -> Result<Int4SourceMapCohortRequirement, BatchItemFailure> {
-        match self { Self::Independent(p) => p.cohort_requirements(context), Self::Synthesis(p) => p.cohort_requirements(context) }
+        match self { Self::Independent(p) => p.cohort_requirements(context), Self::Synthesis(p) => p.cohort_requirements(context),
+            Self::Hierarchy(p) => p.cohort_requirements(context) }
             .map_err(|e| map_failure(e, true))
+    }
+    pub(super) fn phase_requirements(&self, context: usize, schedule: Option<Int4HierarchyCohortSchedule>)
+        -> Result<Int4SourceMapCohortRequirement, BatchItemFailure> {
+        match schedule {
+            None => self.cohort_requirements(context),
+            Some(schedule) => match self {
+                Self::Hierarchy(p) => p.hierarchy_cohort_requirements(context, schedule).map_err(|e| map_failure(e, true)),
+                _ => Err(BatchItemFailure::fatal(BatchCode::Admission)),
+            },
+        }
     }
 }
 impl Int4QuestionDocumentBatchPlanner {
@@ -79,12 +102,16 @@ impl Int4QuestionDocumentBatchPlanner {
         owned_question.try_reserve_exact(question.len()).map_err(|_| BatchItemFailure::fatal(BatchCode::Allocation))?;
         owned_question.push_str(question);
         let question = SourceQuestion { question: owned_question, options: c.options, verification: c.verification };
-        let plan = match c.synthesis {
-            None => NativePlan::Independent(self.planner.plan_int4_question_with_control(source, &question,
+        let plan = match (c.synthesis, c.hierarchy) {
+            (None, None) => NativePlan::Independent(self.planner.plan_int4_question_with_control(source, &question,
                 c.budget, &context, c.planning, c.mapping, self.group_width, control).map_err(|e| map_failure(e, fatal))?),
-            Some(limits) => NativePlan::Synthesis(self.planner.plan_int4_question_synthesis_with_control(source,
+            (Some(limits), None) => NativePlan::Synthesis(self.planner.plan_int4_question_synthesis_with_control(source,
                 &SourceQuestionSynthesis { question, limits }, c.budget, &context, c.planning, c.mapping,
                 self.group_width, control).map_err(|e| map_failure(e, fatal))?),
+            (Some(limits), Some(hierarchy)) => NativePlan::Hierarchy(self.planner.plan_int4_question_hierarchy_with_control(
+                source, &SourceQuestionSynthesis { question, limits }, hierarchy, c.budget, &context,
+                c.planning, c.mapping, self.group_width, control).map_err(|e| map_failure(e, fatal))?),
+            (None, Some(_)) => return Err(BatchItemFailure::fatal(BatchCode::InvalidLimits)),
         };
         let expected = plan.expected()?; let discovery = expected.discovery();
         if discovery.group_width() != self.group_width || discovery.chunk_count() == 0

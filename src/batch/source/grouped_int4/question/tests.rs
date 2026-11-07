@@ -50,6 +50,7 @@ fn config(synthesis: bool) -> Int4QuestionDocumentBatchConfig {
             max_model_work: item, mask_limits: MaskWorkLimits::default(),
             mask_visits_per_chunk: 1000, max_mask_visits: 256000, verification },
         verification, synthesis: synthesis.then_some(QuestionSynthesisLimits { max_evidence_passages: 32, max_evidence_bytes: 4096 }),
+        hierarchy: None,
         max_question_bytes: 1024, max_model_work: item.checked_add(item).unwrap(), max_mask_visits: 512000,
         max_map_verification: add_verification(verification, verification).unwrap(),
         max_verification: add_verification(verification, verification).unwrap() }
@@ -142,6 +143,79 @@ fn flat_synthesis_reserves_the_full_scalar_pass_before_any_discovery() {
     assert!(check_synthesis_reserve(&insufficient, WIDTH).is_err());
     let mut insufficient = config(true); insufficient.mapping.max_mask_visits = 1000;
     assert!(check_synthesis_reserve(&insufficient, WIDTH).is_err());
+}
+fn hierarchy_factory(passes: usize) -> Int4QuestionDocumentBatchPlanner {
+    let p = planner(); let mut config = config(true);
+    config.hierarchy = Some(QuestionHierarchyLimits { max_passes: passes, ..QuestionHierarchyLimits::default() });
+    Int4QuestionDocumentBatchPlanner::configured(Arc::clone(&p), identity(&p), WIDTH, config).unwrap()
+}
+#[test]
+fn each_private_question_hierarchy_reserves_all_passes_before_discovery() {
+    let plain = prepared(&factory(false), "Alice Bob Carol", "Who is named?");
+    let pass = constrained_int4::planned_work(WIDTH, 8128, 64).unwrap();
+    for passes in [1, 3, 16] {
+        let factory = hierarchy_factory(passes);
+        let sealed = factory.prepare_with_control("Alice Bob Carol".to_owned(),
+            QuestionDocumentArgs { question: "Who is named?".to_owned() }, &mut Continue).unwrap();
+        let mut expected = plain.planned_work();
+        for _ in 0..passes { expected = expected.checked_add(pass).unwrap(); }
+        assert_eq!(sealed.planned_work(), expected);
+        assert_eq!(sealed.reserved_mask_visits(), plain.reserved_mask_visits() + passes as u64 * 1000);
+        assert_eq!(sealed.execution_identities(), plain.execution_identities());
+        assert_eq!(factory.max_output_tokens(), passes as u64 * 64);
+        let same = factory.plan(&sealed.source, &sealed.question, &mut Continue, false).unwrap();
+        factory.compare(&same, &sealed, &mut Continue).unwrap();
+        let changed = factory.plan(&sealed.source, "Where is named?", &mut Continue, false).unwrap();
+        assert_eq!(factory.compare(&changed, &sealed, &mut Continue).unwrap_err().fault.code, BatchCode::Admission);
+        let stopped = factory.plan(&sealed.source, &sealed.question, &mut Stop(DecodeCancellationKind::Deadline), false)
+            .err().unwrap();
+        assert_eq!(stopped.fault.cancellation, Some(DecodeCancellationKind::Deadline));
+    }
+}
+#[test]
+fn hierarchy_and_discovery_schedules_are_independent_and_sealed_to_prepared_ownership() {
+    let f = hierarchy_factory(3); let old = prepared(&f, "Alice Bob", "Who is named?");
+    let grouped = f.with_hierarchy_cohorts(2).unwrap();
+    assert!(grouped.uses_native_cohorts()); assert!(!grouped.uses_chunk_cohorts());
+    assert!(grouped.owns(&old).is_err());
+    assert_eq!(grouped.hierarchy_cohort_schedule(), Some(Int4HierarchyCohortSchedule {
+        max_groups: 2, discovery_cohorts: false }));
+    assert_eq!(grouped.cohort_requirements().unwrap().native.kv_bytes, grouped.config.budget.max_kv_bytes * 2);
+    let current = prepared(&grouped, "Alice Bob", "Who is named?");
+    let grouped = grouped.with_hierarchy_cohorts(2).unwrap(); grouped.owns(&current).unwrap();
+    let both = grouped.with_chunk_cohorts().unwrap();
+    assert!(both.owns(&current).is_err());
+    assert_eq!(both.hierarchy_cohort_schedule().unwrap().discovery_cohorts, true);
+    assert_eq!(both.cohort_requirements().unwrap().native.kv_bytes, both.config.budget.max_kv_bytes * 3);
+    let exact = budget(&both); backend::cohort_budget(&both, exact).unwrap();
+    let plan = both.plan("Alice", "Who is named?", &mut Continue, false).unwrap();
+    let actual = plan.phase_requirements(exact.context_limit, both.hierarchy_cohort_schedule()).unwrap();
+    assert!(actual.native.kv_bytes <= exact.native_memory.max_kv_bytes);
+    for groups in [0, 4, 65, usize::MAX] { assert!(hierarchy_factory(3).with_hierarchy_cohorts(groups).is_err()); }
+    assert!(factory(true).with_hierarchy_cohorts(1).is_err());
+    assert!(factory(false).with_hierarchy_cohorts(1).is_err());
+}
+#[test]
+fn hierarchy_refuses_missing_policy_or_insufficient_whole_pass_authority() {
+    let mut missing = config(false); missing.hierarchy = Some(QuestionHierarchyLimits::default());
+    assert_eq!(missing.validate().unwrap_err().code, BatchCode::InvalidLimits);
+    let f = hierarchy_factory(3); let plan = prepared(&f, "Alice Bob", "Who is named?");
+    for axis in 0..6 {
+        let mut c = f.config;
+        let mut required = constrained_int4::planned_work(WIDTH, 8128, 64).unwrap();
+        required = required.checked_add(required).unwrap().checked_add(
+            constrained_int4::planned_work(WIDTH, 8128, 64).unwrap()).unwrap();
+        if axis < 5 { *native_axis(&mut c.mapping.max_model_work, axis) = *native_axis(&mut required, axis) - 1; }
+        else { c.mapping.max_mask_visits = 3000; }
+        assert_eq!(check_synthesis_reserve(&c, WIDTH).unwrap_err().code, BatchCode::InvalidLimits);
+    }
+    let mut ledger = Ledger::default(); ledger.begin(&f.config, plan.expected, context(1, 1)).unwrap();
+    assert_eq!(ledger.verification, f.config.verification, "one shared QA pool spans every level");
+    assert!(ledger.ready().is_err(), "failure cannot refund hierarchy reservations");
+    ledger.failed = false; ledger.begin(&f.config, plan.expected, context(4, 2)).unwrap();
+    assert_eq!(ledger.work, plan.planned_work().checked_add(plan.planned_work()).unwrap());
+    ledger.failed = false;
+    assert_eq!(ledger.begin(&f.config, plan.expected, context(8, 3)).unwrap_err().fault.code, BatchCode::WorkLimit);
 }
 #[test]
 fn all_native_mask_and_both_verification_axes_reserve_atomically() {

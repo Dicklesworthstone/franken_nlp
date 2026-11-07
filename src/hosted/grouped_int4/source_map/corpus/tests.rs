@@ -6,7 +6,8 @@ use crate::{
     native_engine::{generation::grouped_int4::INT4_SOURCE_FORMAT,
         portable_int8::int4::convert::GROUPED_INT4_RECIPE, strict_int4::STRICT_INT4_EXECUTION},
     tasks::{mapreduce::{ChunkLimits, ExecutionLimits},
-        source_planning::grouped_int4::long::question::synthesis::QuestionSynthesisLimits},
+        source_planning::grouped_int4::long::question::synthesis::{QuestionSynthesisLimits,
+            hierarchy::QuestionHierarchyLimits}},
     validation::grounded_fields::GroundingBudget,
 };
 use std::{io::Cursor, time::Duration};
@@ -51,6 +52,7 @@ fn config(width: usize, synthesis: bool) -> Int4QuestionDocumentBatchConfig {
         },
         verification: grounding,
         synthesis: synthesis.then_some(QuestionSynthesisLimits { max_evidence_passages: 4, max_evidence_bytes: 1024 }),
+        hierarchy: None,
         max_question_bytes: 32, max_model_work: run, max_mask_visits: 16_000,
         max_map_verification: run_grounding, max_verification: run_grounding,
     }
@@ -62,19 +64,21 @@ fn limits() -> CorpusLimits {
         preparation_reserve_bytes: 1 << 20, io_reserve_bytes: 1 << 20 }
 }
 fn capacity(config: Int4QuestionDocumentBatchConfig, cohort: Option<usize>, width: usize) -> QuestionCapacity {
-    let quote = int4_question_document_corpus_requirements(width, config, limits(), 1 << 20, cohort).unwrap();
-    QuestionCapacity { config, kv_bytes: quote.native.kv_bytes, max_result_bytes: quote.max_output_bytes }
+    let quote = int4_question_document_corpus_requirements(width, config, limits(), 1 << 20, cohort, None).unwrap();
+    QuestionCapacity { config, kv_bytes: quote.native.kv_bytes, max_result_bytes: quote.max_output_bytes,
+        max_output_tokens: quote.max_output_tokens }
 }
 fn request<'a>(identities: &'a [ExecutionIdentity], capacity: QuestionCapacity,
     logical_chunks: usize) -> Int4QuestionDocumentAdmission<'a> {
-    let contexts = identities.len() + usize::from(capacity.config.synthesis.is_some());
+    let contexts = identities.len() + capacity.config.continuation_passes();
     let row = constrained_int4::planned_work(127, 64, 64).unwrap();
     let mut work = Int4Work::default();
     for _ in 0..contexts { work = work.checked_add(row).unwrap(); }
     Int4QuestionDocumentAdmission { identities, model_work: work,
         mask_node_visits: capacity.config.mapping.mask_visits_per_chunk * contexts as u64,
         mask_limits: capacity.config.mapping.mask_limits, kv_reservation_bytes: capacity.kv_bytes,
-        max_result_bytes: capacity.max_result_bytes, chunk_count: logical_chunks, native_chunks: identities.len() }
+        max_result_bytes: capacity.max_result_bytes, max_output_tokens: capacity.max_output_tokens,
+        chunk_count: logical_chunks, native_chunks: identities.len() }
 }
 
 #[test]
@@ -161,13 +165,13 @@ fn host_quote_uses_the_shared_memory_contract_and_refuses_invalid_context_before
         for cohort in [None, Some(1), Some(3)] {
             let mut config = config(127, synthesis); config.mapping.reduction.map_batch_chunks = cohort.unwrap_or(1);
             let host = limits();
-            let expected = memory_limits(host, 1 << 20, cohort).requirements(127, config, host.transport).unwrap();
-            assert_eq!(int4_question_document_corpus_requirements(127, config, host, 1 << 20, cohort).unwrap(), expected);
+            let expected = memory_limits(host, 1 << 20, cohort, None).requirements(127, config, host.transport).unwrap();
+            assert_eq!(int4_question_document_corpus_requirements(127, config, host, 1 << 20, cohort, None).unwrap(), expected);
             assert_eq!(expected.max_output_bytes, config.mapping.reduction.max_result_bytes as u64);
             assert_eq!(expected.max_output_tokens, 0);
             let mut wrong = host; wrong.native.context_tokens -= 1;
-            assert!(int4_question_document_corpus_requirements(127, config, wrong, 1 << 20, cohort).is_err());
-            assert!(int4_question_document_corpus_requirements(127, config, host, 0, cohort).is_err());
+            assert!(int4_question_document_corpus_requirements(127, config, wrong, 1 << 20, cohort, None).is_err());
+            assert!(int4_question_document_corpus_requirements(127, config, host, 0, cohort, None).is_err());
         }
     }
 }
@@ -175,6 +179,28 @@ fn host_quote_uses_the_shared_memory_contract_and_refuses_invalid_context_before
 #[test]
 fn question_factory_vocabulary_and_both_stream_handles_cross_one_owned_boundary() {
     fn send<T: Send + 'static>() {}
+#[test]
+fn hierarchy_admission_keeps_all_pass_masks_and_transcript_tokens_through_delivery() {
+    let mut config = config(127, true);
+    config.hierarchy = Some(QuestionHierarchyLimits { max_passes: 3, ..QuestionHierarchyLimits::default() });
+    let base = identity(127); let identities = [base.clone()];
+    for discovery in [None, Some(1), Some(3)] {
+        config.mapping.reduction.map_batch_chunks = discovery.unwrap_or(1);
+        for groups in [None, Some(1), Some(2)] {
+            let quote = int4_question_document_corpus_requirements(127, config, limits(), 1 << 20, discovery, groups).unwrap();
+            let c = QuestionCapacity { config, kv_bytes: quote.native.kv_bytes,
+                max_result_bytes: quote.max_output_bytes, max_output_tokens: quote.max_output_tokens };
+            let exact = request(&identities, c, 3); check_request(127, &base, c, &exact).unwrap();
+            assert_eq!(exact.mask_node_visits, 4000);
+            assert_eq!(exact.max_output_tokens, 3 * 64);
+            assert_eq!(quote.output_reservation_bytes, 4 * quote.max_output_bytes + 8 * exact.max_output_tokens + 4096);
+            let mut short = request(&identities, c, 3); short.max_output_tokens -= 1;
+            assert_eq!(check_request(127, &base, c, &short).unwrap_err().fault.code, BatchCode::OutputLineLimit);
+            let mut short = request(&identities, c, 3); short.mask_node_visits -= 1000;
+            assert_eq!(check_request(127, &base, c, &short).unwrap_err().fault.code, BatchCode::InvalidExecution);
+        }
+    }
+}
     send::<Int4QuestionDocumentBatchPlanner>();
     send::<QuestionStreamInput<Cursor<Vec<u8>>, Vec<u8>>>();
     send::<Charged<QuestionStreamInput<Cursor<Vec<u8>>, Vec<u8>>>>();

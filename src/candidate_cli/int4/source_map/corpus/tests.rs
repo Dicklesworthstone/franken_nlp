@@ -108,7 +108,7 @@ fn independent_and_flat_synthesis_admit_the_same_chunk_task_under_explicit_physi
         let quote = Int4QuestionDocumentMemoryLimits { context_tokens: args.context_tokens,
             allocator_reserve_bytes: ALLOCATOR_BYTES, preparation_reserve_bytes: limits.common.preparation_bytes,
             io_reserve_bytes: limits.io_bytes, reduction_reserve_bytes: limits.reduction_reserve_bytes,
-            cohort_chunks: command.stream.cohort_chunks }
+            cohort_chunks: command.stream.cohort_chunks, hierarchy_groups: command.stream.cohort_hierarchy_groups }
             .requirements(args.group_width, limits.config, limits.transport).unwrap();
         assert_eq!(quote, limits.memory);
         let (_, mut narrow) = arguments(&[]);
@@ -157,6 +157,42 @@ fn invalid_population_and_native_windows_refuse_before_private_options_model_or_
         let (command, args) = arguments(&flags);
         assert_eq!(command.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments), "{flags:?}");
     }
+#[test]
+fn per_record_hierarchy_supports_independent_discovery_and_group_windows() {
+    let (flat, args) = arguments(&["--synthesize-answer"]);
+    let flat = flat.validate(&args).unwrap();
+    for schedules in [vec![], vec!["--cohort-chunks", "3"],
+        vec!["--cohort-hierarchy-groups", "2"],
+        vec!["--cohort-chunks", "3", "--cohort-hierarchy-groups", "2"]] {
+        let mut flags = vec!["--synthesize-answer", "--hierarchical-answer", "--answer-max-passes", "4",
+            "--answer-max-levels", "3", "--answer-max-tokenizer-calls", "1024",
+            "--answer-max-tokenizer-bytes", "1048576"];
+        flags.extend(schedules);
+        let (command, args) = arguments(&flags); let limits = command.validate(&args).unwrap();
+        let hierarchy = limits.config.hierarchy.unwrap();
+        assert_eq!(hierarchy.max_passes, 4); assert_eq!(hierarchy.max_levels, 3);
+        assert_eq!(hierarchy.max_tokenizer_calls, 1024); assert_eq!(hierarchy.max_tokenizer_bytes, 1048576);
+        assert_eq!(limits.config.budget, flat.config.budget);
+        assert_eq!(limits.config.max_model_work, flat.config.max_model_work);
+        assert_eq!(limits.config.max_mask_visits, flat.config.max_mask_visits);
+        assert_eq!(limits.config.max_verification, flat.config.max_verification);
+        assert_eq!(limits.memory.max_output_tokens, 4 * u64::from(limits.config.budget.max_output_tokens));
+        assert!(limits.memory.input_bytes > flat.memory.input_bytes);
+        assert!(limits.memory.output_reservation_bytes > flat.memory.output_reservation_bytes);
+        let row = limits.config.budget.max_kv_bytes;
+        assert_eq!(limits.memory.native.kv_bytes, row * command.stream.cohort_chunks.unwrap_or(1)
+            .max(command.stream.cohort_hierarchy_groups.unwrap_or(1)) as u64);
+    }
+    for flags in [vec!["--answer-max-levels", "0"], vec!["--answer-max-passes", "0"],
+        vec!["--answer-max-passes", "257"], vec!["--answer-max-tokenizer-calls", "0"],
+        vec!["--answer-max-tokenizer-bytes", "0"], vec!["--cohort-hierarchy-groups", "0"],
+        vec!["--cohort-hierarchy-groups", "65"],
+        vec!["--cohort-hierarchy-groups", "3", "--answer-max-passes", "2"]] {
+        let mut selection = vec!["--synthesize-answer", "--hierarchical-answer"];
+        selection.extend(flags); let (command, args) = arguments(&selection);
+        assert_eq!(command.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+}
 }
 
 #[cfg(not(feature = "asupersync-runtime"))]
@@ -229,13 +265,18 @@ fn actual_source_and_pinned_snapshot_cohorts_preserve_distinct_questions_and_ord
     assert_eq!(baseline.last().unwrap()["record"]["event"], "run_complete");
     let baseline_records = semantic_records(&baseline, false, 1);
     let pin = baseline[0]["model_content_sha256"].as_str().unwrap();
-    for synthesis in [false, true] {
+    for mode in 0..3 {
+        let synthesis = mode != 0; let hierarchy = mode == 2;
         let mut expected = None;
-        for width in [None, Some("1"), Some("3")] {
+        for (width, groups) in [(None, None), (Some("1"), None), (Some("3"), None),
+            (None, Some("2")), (Some("3"), Some("2"))] {
+            if groups.is_some() && !hierarchy { continue; }
             let mut flags = vec!["--snapshot", &snapshot, "--expected-model-sha256", pin,
                 "--kernel", kernel.id(), "--max-requests", "4", "--max-chunk-bytes", "16"];
             if synthesis { flags.push("--synthesize-answer"); }
+            if hierarchy { flags.extend(["--hierarchical-answer", "--answer-max-passes", "4"]); }
             if let Some(width) = width { flags.extend(["--cohort-chunks", width]); }
+            if let Some(groups) = groups { flags.extend(["--cohort-hierarchy-groups", groups]); }
             let parsed = parsed(&flags).unwrap();
             let Int4Task::AnswerCorpus(command) = parsed.task else { panic!("QA corpus required"); };
             let mut args = parsed.args; args.memory_mib = memory;
@@ -247,7 +288,8 @@ fn actual_source_and_pinned_snapshot_cohorts_preserve_distinct_questions_and_ord
             if let Some(expected) = &expected { assert_eq!(&records, expected); } else { expected = Some(records); }
             assert!(rows.iter().all(|row| row["integer_kernel"] == kernel.id()));
             assert!(rows.iter().all(|row| row["answer_mode"] ==
-                if synthesis { "verified_evidence_synthesis" } else { "independent_passage_answers" }));
+                if hierarchy { "hierarchical_quote_selection" }
+                else if synthesis { "verified_evidence_synthesis" } else { "independent_passage_answers" }));
             assert_eq!(rows.last().unwrap()["record"]["summary"]["failed"], 0);
         }
     }

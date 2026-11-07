@@ -8,7 +8,7 @@ use crate::{
     tasks::{answer::{PassageCitation, PassageOccurrence}, summarize::SourceCitation,
         source_planning::grouped_int4::long::{Int4SourceMapError,
             cohort::{Int4SourceMapCohortMemoryLimits, Int4SourceMapCohortRequirement,
-                COHORT_ENVELOPE_BYTES}}},
+                COHORT_ENVELOPE_BYTES, hierarchy::Int4HierarchyCohortSchedule}}},
     validation::grounded_fields::{SourceFieldEvidence, VerifiedSourceSpan},
 };
 
@@ -22,8 +22,9 @@ pub struct Int4QuestionDocumentMemoryLimits {
     pub preparation_reserve_bytes: u64,
     pub io_reserve_bytes: u64,
     pub reduction_reserve_bytes: u64,
-    /// Explicit discovery schedule; synthesis remains a later scalar phase.
+    /// Explicit discovery schedule, independent of hierarchy group windows.
     pub cohort_chunks: Option<usize>,
+    pub hierarchy_groups: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,8 +41,8 @@ pub struct Int4QuestionDocumentMemoryRequirement {
     /// Semantic output, canonical serialization and fixed output overhead.
     pub output_reservation_bytes: u64,
     pub max_output_bytes: u64,
-    /// Independent and synthesized QA keep text/citations, not token-id arrays.
-    /// Native transcripts are temporary and priced in document workspace.
+    /// Hierarchies retain every continuation's native token IDs. Independent
+    /// and flat synthesis results retain semantic text and citations only.
     pub max_output_tokens: u64,
 }
 
@@ -65,7 +66,7 @@ impl Int4QuestionDocumentMemoryLimits {
         let cohort = self.cohort_requirements(width, config)?;
         let native = cohort.map_or(row, |quote| quote.native);
         let chunks = config.mapping.chunks.max_chunks as u64;
-        let synthesis_passes = u64::from(config.synthesis.is_some());
+        let synthesis_passes = config.continuation_passes() as u64;
         let identities = sum(&[chunks, synthesis_passes])?;
         // The population record, all simultaneous chunk plans, and an optional
         // continuation retain their own question representations. The 64-byte
@@ -77,7 +78,10 @@ impl Int4QuestionDocumentMemoryLimits {
         let transport_bytes = sum(&[mul(transport.max_line_bytes as u64, 8)?,
             mul(transport.max_output_line_bytes as u64, 4)?, mul(transport.max_epoch_ids as u64, 128)?,
             transport.max_epoch_id_bytes as u64, self.preparation_reserve_bytes, self.io_reserve_bytes])?;
-        let input_bytes = sum(&[transport_bytes, source_payload, question_payload,
+        let hierarchy_preparation = self.hierarchy_groups.map(|max_groups|
+            Int4HierarchyCohortSchedule { max_groups, discovery_cohorts: self.cohort_chunks.is_some() }
+                .additional_preparation_bytes(self.preparation_reserve_bytes)).transpose()?.unwrap_or(0);
+        let input_bytes = sum(&[transport_bytes, source_payload, question_payload, hierarchy_preparation,
             mul(identities, QUESTION_DOCUMENT_CHUNK_METADATA_BYTES)?])?;
 
         let budget = config.budget; let mapping = config.mapping;
@@ -107,11 +111,12 @@ impl Int4QuestionDocumentMemoryLimits {
         let document_workspace_bytes = sum(&[staged, mul(tokens, 8)?, map_fields, map_spans,
             qa_fields, qa_spans, self.reduction_reserve_bytes, synthesis, cohort_workspace])?;
         let max_output_bytes = mapping.reduction.max_result_bytes as u64;
+        let max_output_tokens = config.retained_output_tokens().map_err(|_| Int4SourceMapError::InvalidLimits)?;
         let required = Int4QuestionDocumentMemoryRequirement {
             native, workspace_bytes: sum(&[native.rope_bytes, native.scratch_payload_bound,
                 self.allocator_reserve_bytes])?, input_bytes, document_workspace_bytes,
-            output_reservation_bytes: sum(&[mul(max_output_bytes, 4)?, 4096])?,
-            max_output_bytes, max_output_tokens: 0,
+            output_reservation_bytes: sum(&[mul(max_output_bytes, 4)?, mul(max_output_tokens, 8)?, 4096])?,
+            max_output_bytes, max_output_tokens,
         };
         // Each component may fit u64 while their simultaneous ownership does
         // not. Reject before callers can construct a wrapped total admission.
@@ -122,14 +127,22 @@ impl Int4QuestionDocumentMemoryLimits {
 
     pub(crate) fn cohort_requirements(self, width: usize, config: Int4QuestionDocumentBatchConfig)
         -> Result<Option<Int4SourceMapCohortRequirement>, Int4SourceMapError> {
-        self.cohort_chunks.map(|chunks| {
+        let discovery = self.cohort_chunks.map(|chunks| {
             if chunks != config.mapping.reduction.map_batch_chunks || chunks > config.mapping.chunks.max_chunks {
                 return Err(Int4SourceMapError::InvalidLimits);
             }
-            let quote = Int4SourceMapCohortMemoryLimits { max_chunks: chunks,
+            Int4SourceMapCohortMemoryLimits { max_chunks: chunks,
                 context_tokens: self.context_tokens,
                 max_output_tokens_per_chunk: u64::from(config.budget.max_output_tokens),
-                max_result_bytes_per_chunk: config.budget.max_output_bytes }.requirements(width)?;
+                max_result_bytes_per_chunk: config.budget.max_output_bytes }.requirements(width)
+        }).transpose()?;
+        if let Some(max_groups) = self.hierarchy_groups {
+            let hierarchy = config.hierarchy.ok_or(Int4SourceMapError::InvalidLimits)?;
+            let schedule = Int4HierarchyCohortSchedule { max_groups, discovery_cohorts: self.cohort_chunks.is_some() };
+            schedule.validate(hierarchy.max_passes)?;
+            return schedule.requirements(discovery, self.context_tokens, width, config.budget).map(Some);
+        }
+        discovery.map(|quote| {
             if config.synthesis.is_some() {
                 // Every discovery window drains before evidence synthesis.
                 // Use componentwise maxima, never sum two simultaneous engines.
@@ -144,12 +157,18 @@ fn synthesis_workspace(config: Int4QuestionDocumentBatchConfig) -> Result<u64, I
     // All verified quotes survive collection; no top-k truncation. Verbatim
     // copies, joined/encoded evidence, passage manifest/layout, origin fanout,
     // independent scans and the final native transcript coexist with discovery.
+    let per_pass = sum(&[mul(config.budget.max_output_bytes, 4)?,
+        mul(u64::from(config.budget.max_output_tokens), 8)?])?;
+    let hierarchy = match config.hierarchy {
+        None => 0,
+        Some(hierarchy) => sum(&[mul(per_pass, (hierarchy.max_passes - 1) as u64)?,
+            mul(hierarchy.max_passes as u64, 8192 + 256)?, mul(hierarchy.max_levels as u64, 128)?])?,
+    };
     sum(&[mul(limits.max_evidence_bytes as u64, 64)?,
         mul(limits.max_evidence_passages as u64, 1024)?,
         mul(config.verification.max_matches as u64, 128)?,
         mul(config.verification.max_fields as u64, 128)?,
-        mul(config.budget.max_output_bytes, 4)?,
-        mul(u64::from(config.budget.max_output_tokens), 8)?])
+        per_pass, hierarchy])
 }
 fn sum(values: &[u64]) -> Result<u64, Int4SourceMapError> {
     values.iter().try_fold(0_u64, |n, value| n.checked_add(*value).ok_or(Int4SourceMapError::InvalidLimits))

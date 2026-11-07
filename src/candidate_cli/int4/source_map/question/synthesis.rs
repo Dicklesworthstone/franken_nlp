@@ -6,7 +6,7 @@ use crate::tasks::source_planning::{SourcePlanningLimits,
 pub(in super::super) mod hierarchy;
 
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct SynthesisArgs {
+pub(in super::super) struct SynthesisArgs {
     #[command(flatten)]
     pub flat: FlatSynthesisArgs,
     #[command(flatten)]
@@ -29,19 +29,19 @@ pub(in super::super) struct FlatSynthesisArgs {
     max_synthesis_evidence_bytes: Option<usize>,
 }
 impl SynthesisArgs {
-    pub(super) fn validate(self) -> Result<(), CandidateError> {
+    pub(in super::super) fn validate(self) -> Result<(), CandidateError> {
         self.flat.validate()?;
         self.hierarchy()?;
         Ok(())
     }
-    pub(super) fn hierarchy(self)
+    pub(in super::super) fn hierarchy(self)
         -> Result<Option<crate::tasks::source_planning::grouped_int4::long::question::synthesis::hierarchy::QuestionHierarchyLimits>, CandidateError> {
         self.hierarchy.limits(self.flat.synthesize_answer)
     }
-    pub(super) fn planning(self, planning: SourcePlanningLimits) -> SourcePlanningLimits {
+    pub(in super::super) fn planning(self, planning: SourcePlanningLimits) -> SourcePlanningLimits {
         self.flat.planning(planning)
     }
-    pub(super) fn limits(self, planning: SourcePlanningLimits)
+    pub(in super::super) fn limits(self, planning: SourcePlanningLimits)
         -> Result<Option<QuestionSynthesisLimits>, CandidateError> {
         self.validate()?;
         self.flat.limits(planning)

@@ -78,13 +78,18 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         factory.with_chunk_cohorts()
             .map_err(|fault| fault.cancellation.map(stopped).unwrap_or(CandidateError::Planning))?
     } else { factory };
+    let factory = if let Some(groups) = command.stream.cohort_hierarchy_groups {
+        factory.with_hierarchy_cohorts(groups)
+            .map_err(|fault| fault.cancellation.map(stopped).unwrap_or(CandidateError::Planning))?
+    } else { factory };
     if factory.group_width() != model.model_identity().group_width()
-        || factory.max_result_bytes() != limits.memory.max_output_bytes {
+        || factory.max_result_bytes() != limits.memory.max_output_bytes
+        || factory.max_output_tokens() != limits.memory.max_output_tokens {
         return Err(CandidateError::Identity);
     }
     let mut host = host_limits(&args, limits, remaining()?);
     let quote = crate::hosted::int4_question_document_corpus_requirements(args.group_width, *factory.config(),
-        host, limits.reduction_reserve_bytes, command.stream.cohort_chunks)
+        host, limits.reduction_reserve_bytes, command.stream.cohort_chunks, command.stream.cohort_hierarchy_groups)
         .map_err(|error| host_error(error, CandidateError::Planning))?;
     if quote != limits.memory { return Err(CandidateError::Memory); }
     remaining()?;
@@ -106,8 +111,10 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         protocol: "fnlp-candidate-int4-answer-corpus-v1", schema_version: 1,
         scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "answer",
         source_mode: "complete_document", question_source: "per_record",
-        answer_mode: answer_mode(limits.config.synthesis.is_some()),
+        answer_mode: answer_mode(limits.config.synthesis.is_some(), limits.config.hierarchy.is_some()),
         chunk_schedule: chunk_schedule(command.stream.cohort_chunks), cohort_chunks: command.stream.cohort_chunks,
+        hierarchy_schedule: limits.config.hierarchy.map(|_| hierarchy_schedule(command.stream.cohort_hierarchy_groups)),
+        cohort_hierarchy_groups: command.stream.cohort_hierarchy_groups,
         model_id: "Nanbeige4.2-3B", source_revision: &identity.source_revision,
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
@@ -139,8 +146,12 @@ fn host_limits(args: &Int4Args, limits: CorpusLimits, remaining: Duration) -> Ho
 fn chunk_schedule(cohort_chunks: Option<usize>) -> &'static str {
     if cohort_chunks.is_some() { "native_chunk_cohorts" } else { "serial" }
 }
-fn answer_mode(synthesis: bool) -> &'static str {
-    if synthesis { "verified_evidence_synthesis" } else { "independent_passage_answers" }
+fn hierarchy_schedule(groups: Option<usize>) -> &'static str {
+    if groups.is_some() { "native_group_cohorts" } else { "serial" }
+}
+fn answer_mode(synthesis: bool, hierarchy: bool) -> &'static str {
+    if hierarchy { "hierarchical_quote_selection" }
+    else if synthesis { "verified_evidence_synthesis" } else { "independent_passage_answers" }
 }
 #[derive(Serialize)]
 struct SnapshotRecord { operation: &'static str, format: &'static str, file_bytes: u64 }
@@ -156,6 +167,10 @@ struct Provenance<'a> {
     chunk_schedule: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     cohort_chunks: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hierarchy_schedule: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cohort_hierarchy_groups: Option<usize>,
     model_id: &'static str, source_revision: &'a str, source_root_sha256: &'a str, model_content_sha256: &'a str,
     candidate_format: &'a str, quant_recipe: &'a str, group_width: usize, integer_kernel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
