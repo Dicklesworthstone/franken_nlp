@@ -115,7 +115,7 @@ where C: DecodeStepControl, E: From<Int4ScoringError>, F: FnOnce(Int4CandidateCo
 fn check_count(count: usize) -> Result<(), Int4ScoringError> {
     if count == 0 || count > MAX_INT4_SEQUENCES { return Err(Int4ScoringError::Input); } Ok(())
 }
-fn check_geometry(requests: &[CompiledRequest<'_>], capacities: &[usize], budget: Int4ScoringCohortBudget)
+pub(crate) fn check_geometry(requests: &[CompiledRequest<'_>], capacities: &[usize], budget: Int4ScoringCohortBudget)
     -> Result<Int4Work, Int4ScoringError> {
     check_count(requests.len())?; check_output_limit(budget.max_output_bytes)?;
     if requests.len() != capacities.len() { return Err(Int4ScoringError::Input); }

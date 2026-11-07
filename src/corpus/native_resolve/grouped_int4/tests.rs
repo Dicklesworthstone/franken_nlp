@@ -9,9 +9,9 @@ use crate::{
     validation::{SourceSpan, validate_source_span, grounded_fields::VerifiedSourceSpan},
 };
 
-struct Continue;
+pub(super) struct Continue;
 impl DecodeStepControl for Continue { fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None } }
-fn planner() -> &'static ResolutionPlanner {
+pub(super) fn planner() -> &'static ResolutionPlanner {
     static PINNED: OnceLock<ResolutionPlanner> = OnceLock::new();
     PINNED.get_or_init(|| {
         let controls = pinned_controls::pinned().unwrap();
@@ -20,7 +20,7 @@ fn planner() -> &'static ResolutionPlanner {
         ResolutionPlanner::pinned(controls.template_controls(), eos).unwrap()
     })
 }
-fn identity() -> ExecutionIdentity {
+pub(super) fn identity() -> ExecutionIdentity {
     let p = planner();
     let d = Sha256Digest::of_bytes(b"private-int4-resolution-fixture");
     ExecutionIdentity { schema_version: 1, source_revision: "fixture".to_owned(), logical_model_digest: d,
@@ -31,17 +31,17 @@ fn identity() -> ExecutionIdentity {
         thinking_mode: ThinkingMode::Disabled, tool_mode: ToolMode::None, calibration_digest: d, decision_policy_digest: d,
         backend_semantic_version: STRICT_INT4_EXECUTION.to_owned(), host_class: None, compiler_identity: None }
 }
-fn docs() -> Vec<ResolutionDocument> {
+pub(super) fn docs() -> Vec<ResolutionDocument> {
     ["a", "b", "c"].iter().map(|&id| ResolutionDocument {
         id: id.to_owned(), text: "Smith <think> instructions\r\n上海 😀".to_owned(),
         mentions: vec![MentionInput { entity_type: "PERSON".to_owned(), surface: "Smith".to_owned(),
             span: VerifiedSourceSpan { byte_start: 0, byte_end: 5, scalar_start: 0, scalar_end: 5 } }],
     }).collect()
 }
-fn graph(d: &[ResolutionDocument]) -> ResolutionPlan<'_> {
+pub(super) fn graph(d: &[ResolutionDocument]) -> ResolutionPlan<'_> {
     ResolutionPlan::prepare(d, ResolveOptions::default(), ResolveLimits::default(), &mut Continue).unwrap()
 }
-fn limits() -> Int4ResolveLimits {
+pub(super) fn limits() -> Int4ResolveLimits {
     let mut work = Int4Work::default();
     work.forward_positions = u64::MAX;
     work.projected_logits = u64::MAX;
@@ -50,13 +50,13 @@ fn limits() -> Int4ResolveLimits {
     work.projections.multiply_accumulates = u64::MAX;
     Int4ResolveLimits { planning: NativeResolveLimits::default(), max_model_work: work }
 }
-fn prepared<'p, 's>(plan: &'p ResolutionPlan<'s>, width: usize) -> PreparedInt4Resolution<'static, 'p, 's> {
+pub(super) fn prepared<'p, 's>(plan: &'p ResolutionPlan<'s>, width: usize) -> PreparedInt4Resolution<'static, 'p, 's> {
     planner().compile_int4(plan, &identity(), limits(), width, &mut Continue).unwrap()
 }
-fn admitted(prepared: &PreparedInt4Resolution<'_, '_, '_>) -> Vec<ExecutionIdentity> {
+pub(super) fn admitted(prepared: &PreparedInt4Resolution<'_, '_, '_>) -> Vec<ExecutionIdentity> {
     prepared.execution_identities().cloned().collect()
 }
-fn synthetic(schedule: CandidateSchedule, width: usize, decision: PairDecision) -> Int4CandidateRun {
+pub(super) fn synthetic(schedule: CandidateSchedule, width: usize, decision: PairDecision) -> Int4CandidateRun {
     let values: [f64; 3] = match decision {
         PairDecision::Same => [-4.0, -1.0, -4.0],
         PairDecision::Different => [-1.0, -4.0, -4.0],
@@ -73,7 +73,7 @@ fn synthetic(schedule: CandidateSchedule, width: usize, decision: PairDecision) 
         numerics_profile: STRICT_INT4_PROFILE.to_owned(), group_width: width,
         scores, model_work: schedule.model, rewound_positions: 2 }
 }
-fn all_same(prepared: PreparedInt4Resolution<'_, '_, '_>) -> Int4ResolutionRun {
+pub(super) fn all_same(prepared: PreparedInt4Resolution<'_, '_, '_>) -> Int4ResolutionRun {
     let ids = admitted(&prepared);
     let width = prepared.group_width();
     prepared.execute_heads(&ids, &mut Continue, |_, _, _, schedule, _| {

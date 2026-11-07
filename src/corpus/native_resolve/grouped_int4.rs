@@ -6,6 +6,7 @@
 //! snapshot results. It adds no runtime, loader, alternate kernel or retry.
 
 use super::*;
+use crate::corpus::resolve::FrozenPairScore;
 use crate::native_engine::{
     decode::DecodeCancellationKind,
     generation::grouped_int4::bind_candidate_model,
@@ -14,6 +15,10 @@ use crate::native_engine::{
         scoring::{self, CandidateSchedule, Int4CandidateRun, Int4ScoringBudget,
             Int4ScoringError, INT4_SCORING_EXECUTION}},
 };
+
+pub mod cohort;
+pub use cohort::{Int4ResolutionCohortBudget, Int4ResolutionCohortMemoryLimits,
+    Int4ResolutionCohortRequirements, Int4ResolutionCohortRun, INT4_RESOLUTION_COHORT_EXECUTION};
 
 pub const INT4_RESOLUTION_EXECUTION: &str = "grouped-int4-resolution-two-order-complete-link-v1";
 
@@ -255,37 +260,64 @@ impl PreparedInt4Resolution<'_, '_, '_> {
         self.verify_admitted(admitted, control)?;
         let max_result_bytes = self.max_result_bytes() as usize;
         let expected_heads = self.head_count();
-        let mut scores = resolve::reserved(self.pair_count())?;
-        let mut work = Int4Work::default();
-        let mut rewound = 0_u64;
-        let mut head_count = 0_usize;
+        let mut progress = ResolutionProgress::new(self.pair_count())?;
         for (index, (pair, schedules)) in self.inner.pairs.into_iter().zip(self.schedules).enumerate() {
             let mut results = [PairLogProbabilities { same: 0.0, different: 0.0, uncertain: 0.0 }; 2];
             for (order, schedule) in schedules.into_iter().enumerate() {
                 resolve::checkpoint(control)?;
                 let run = evaluate(index, order, &pair.prompts[order], schedule, control)?;
                 resolve::checkpoint(control)?;
-                if run.schema_version != 1 || run.execution != INT4_SCORING_EXECUTION
-                    || run.numerics_profile != STRICT_INT4_PROFILE || run.group_width != self.group_width
-                    || run.model_work != schedule.model || run.scores.work != schedule.scoring
-                    || run.rewound_positions != 2 {
-                    return Err(Int4ResolveError::Accounting);
-                }
-                results[order] = validate_scores(&run.scores, self.inner.planner.eos)?;
-                work = work.checked_add(run.model_work)?;
-                rewound = rewound.checked_add(run.rewound_positions).ok_or(Int4ResolveError::Accounting)?;
-                if !within(work, self.work) { return Err(Int4ResolveError::Accounting); }
-                head_count = head_count.checked_add(1).ok_or(Int4ResolveError::Accounting)?;
+                results[order] = progress.accept_head(&run, schedule, self.group_width,
+                    self.inner.planner.eos, self.work)?;
             }
-            scores.push(pair.ticket.finish(BidirectionalScores { forward: results[0], reverse: results[1] }));
+            progress.scores.push(pair.ticket.finish(BidirectionalScores { forward: results[0], reverse: results[1] }));
         }
-        if head_count != expected_heads || work != self.work { return Err(Int4ResolveError::Accounting); }
+        progress.finish(self.inner.plan, self.group_width, self.work, expected_heads, max_result_bytes, control)
+    }
+}
+
+/// Both physical schedules enter the same complete-head validator and graph
+/// finalizer. The only retained per-pair result is its private frozen ticket.
+struct ResolutionProgress {
+    scores: Vec<FrozenPairScore>,
+    work: Int4Work,
+    rewound: u64,
+    heads: usize,
+}
+impl ResolutionProgress {
+    fn new(pairs: usize) -> Result<Self, Int4ResolveError> {
+        Ok(Self { scores: resolve::reserved(pairs)?, work: Int4Work::default(), rewound: 0, heads: 0 })
+    }
+    fn accept_head(&mut self, run: &Int4CandidateRun, schedule: CandidateSchedule,
+        width: usize, eos: u32, ceiling: Int4Work) -> Result<PairLogProbabilities, Int4ResolveError> {
+        if run.schema_version != 1 || run.execution != INT4_SCORING_EXECUTION
+            || run.numerics_profile != STRICT_INT4_PROFILE || run.group_width != width
+            || run.model_work != schedule.model || run.scores.work != schedule.scoring
+            || run.rewound_positions != 2 || schedule.rewound != 2 {
+            return Err(Int4ResolveError::Accounting);
+        }
+        let result = validate_scores(&run.scores, eos)?;
+        let work = self.work.checked_add(run.model_work)?;
+        let rewound = self.rewound.checked_add(run.rewound_positions).ok_or(Int4ResolveError::Accounting)?;
+        let heads = self.heads.checked_add(1).ok_or(Int4ResolveError::Accounting)?;
+        if !within(work, ceiling) { return Err(Int4ResolveError::Accounting); }
+        self.work = work; self.rewound = rewound; self.heads = heads;
+        Ok(result)
+    }
+    fn finish<C: DecodeStepControl>(self, plan: &ResolutionPlan<'_>, width: usize,
+        expected_work: Int4Work, expected_heads: usize, max_result_bytes: usize, control: &mut C)
+        -> Result<Int4ResolutionRun, Int4ResolveError> {
+        if self.heads != expected_heads || self.work != expected_work
+            || self.scores.len().checked_mul(2) != Some(expected_heads)
+            || (expected_heads as u64).checked_mul(2) != Some(self.rewound) {
+            return Err(Int4ResolveError::Accounting);
+        }
         resolve::checkpoint(control)?;
-        let result = self.inner.plan.finalize(scores, control)?;
+        let result = plan.finalize(self.scores, control)?;
         let output = Int4ResolutionRun { schema_version: 1, execution: INT4_RESOLUTION_EXECUTION,
             numerics_profile: STRICT_INT4_PROFILE, scoring_execution: INT4_SCORING_EXECUTION,
-            group_width: self.group_width, model_evaluated: head_count != 0, head_count,
-            planned_model_work: self.work, model_work: work, rewound_positions: rewound, result };
+            group_width: width, model_evaluated: self.heads != 0, head_count: self.heads,
+            planned_model_work: expected_work, model_work: self.work, rewound_positions: self.rewound, result };
         resolve::check_output(&output, max_result_bytes)?;
         resolve::checkpoint(control)?;
         Ok(output)
