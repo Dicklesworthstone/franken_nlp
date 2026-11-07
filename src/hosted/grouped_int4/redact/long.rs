@@ -72,7 +72,7 @@ impl NlpEngine {
     }
 }
 
-fn document_error(error: Int4LongRedactionError) -> HostedError {
+pub(super) fn document_error(error: Int4LongRedactionError) -> HostedError {
     match error {
         Int4LongRedactionError::Map(error) => HostedError::Int4(Int4HostError::SourceMap(error)),
         // Drop residual coordinate vectors inside the failing output allocation.

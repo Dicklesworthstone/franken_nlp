@@ -74,8 +74,6 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
         .value_parser(clap::value_parser!(usize)).value_name("N")
         .help("Run up to N independent NER chunks together in BOTH stages (1..=64); admit the full window, never shrink or fall back"))
 }
-// Corpus and retained jobs continue to own serial document engines. Do not
-// inherit an accepted flag whose selected physical schedule they cannot run.
 fn serial_definition() -> clap::Command {
     MappingFlags::augment_args(super::definition().name("redact-document")
         .about("Redact a complete document with whole-source rules and native INT4 NER chunks")
@@ -92,6 +90,14 @@ impl DocumentArgs {
             cohort_chunks: matches.try_get_one::<usize>("cohort_chunks").ok().flatten().copied() })
     }
     pub(in crate::candidate_cli::int4) fn validate(&self, args: &Int4Args) -> Result<DocumentLimits, CandidateError> {
+        self.validate_output(args, true)
+    }
+    // Live and retained populations preserve the serial semantic result wire.
+    // Only the standalone command publishes the physical cohort wrapper.
+    fn validate_population(&self, args: &Int4Args) -> Result<DocumentLimits, CandidateError> {
+        self.validate_output(args, false)
+    }
+    fn validate_output(&self, args: &Int4Args, cohort_envelope: bool) -> Result<DocumentLimits, CandidateError> {
         let short = self.redaction.validate(args)?;
         let mut common = short.common;
         let m = self.mapping;
@@ -117,7 +123,7 @@ impl DocumentArgs {
         let preparation_floor = sum(&[times(per_chunk, m.max_ner_chunks as u64)?, 256 * MIB,
             times(args.max_input_bytes.max(common.result_bytes) as u64, 64)?,
             times(m.max_ner_map_bytes as u64 + 4096, 2)?,
-            if self.cohort_chunks.is_some() { 2 * INT4_LONG_REDACTION_COHORT_ENVELOPE_BYTES } else { 0 }])?;
+            if cohort_envelope && self.cohort_chunks.is_some() { 2 * INT4_LONG_REDACTION_COHORT_ENVELOPE_BYTES } else { 0 }])?;
         if common.preparation_bytes < preparation_floor { return Err(CandidateError::Arguments); }
         let mapping = self.mapping_limits(args, common.result_bytes)?;
         let workspace_bytes = workspace_bytes(budget, mapping, short.edit_bytes)?;
@@ -137,9 +143,10 @@ impl DocumentArgs {
             let original = sum(&[common.native.kv_bytes, common.native.rope_bytes, common.native.scratch_payload_bound])?;
             let grouped = sum(&[required.native.kv_bytes, required.native.rope_bytes, required.native.scratch_payload_bound])?;
             let additional_native = grouped.checked_sub(original).ok_or(CandidateError::Arguments)?;
-            // Both document stages reuse this complete declared peak. The
-            // cohort workspace already owns its transient result; only the
-            // final wrapper adds to the hosted output's 4x payload charge.
+            // Both document stages reuse this complete declared peak. Native
+            // cohort workspace owns per-window results. The complete wrapper
+            // is separately staged even when a population emits only its
+            // semantic result; populations charge it as transient workspace.
             common.minimum_memory_bytes = sum(&[common.minimum_memory_bytes, additional_native,
                 required.workspace_bytes, 4 * INT4_LONG_REDACTION_COHORT_ENVELOPE_BYTES])?;
         }
@@ -189,6 +196,19 @@ impl DocumentArgs {
         { runtime::execute(args, self, limits, input, output) }
         #[cfg(not(feature = "asupersync-runtime"))]
         { let _ = (self, args, limits, input, output); Err(CandidateError::Unavailable) }
+    }
+}
+#[cfg(feature = "asupersync-runtime")]
+#[derive(Serialize)]
+struct ChunkSchedule {
+    execution: &'static str,
+    phase: &'static str,
+    declared_max_chunks: usize,
+}
+#[cfg(feature = "asupersync-runtime")]
+impl ChunkSchedule {
+    fn new(declared_max_chunks: usize) -> Self {
+        Self { execution: "native_chunk_cohorts", phase: "redaction_ner_maps", declared_max_chunks }
     }
 }
 fn times(value: u64, count: u64) -> Result<u64, CandidateError> {

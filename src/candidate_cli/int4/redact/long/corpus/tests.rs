@@ -151,13 +151,46 @@ fn invalid_stream_limits_and_private_key_scope_refuse_before_owned_io() {
 }
 
 #[test]
-fn corpus_refuses_unsupported_chunk_cohorts_in_parser_and_programmatic_state() {
+fn corpus_chunk_cohorts_preserve_task_authority_and_admit_one_reusable_peak_without_a_wire_wrapper() {
+    let (serial, mut args) = arguments(&[]);
+    args.memory_mib = 65536;
+    let baseline = serial.validate(&args).unwrap();
     for width in ["1", "3"] {
-        assert!(parsed(&["--source-dir", "d", "--source-manifest", "m", "--cohort-chunks", width]).is_err());
+        let (cohorts, _) = arguments(&["--cohort-chunks", width]);
+        let selected = cohorts.validate(&args).unwrap();
+        let quote = selected.document.cohort.unwrap();
+        let original = baseline.common.native;
+        let native_delta = quote.native.kv_bytes + quote.native.rope_bytes + quote.native.scratch_payload_bound
+            - original.kv_bytes - original.rope_bytes - original.scratch_payload_bound;
+        assert_eq!(selected.document.mapping.reduction.map_batch_chunks, width.parse::<usize>().unwrap());
+        assert_eq!(selected.common.minimum_memory_bytes,
+            baseline.common.minimum_memory_bytes + native_delta + quote.workspace_bytes
+                + 4 * INT4_LONG_REDACTION_COHORT_ENVELOPE_BYTES);
+        assert_eq!(selected.common.native, baseline.common.native, "physical width must not widen per-chunk KV");
+        assert_eq!(selected.transport, baseline.transport);
+        assert_eq!(selected.model_work, baseline.model_work);
+        assert_eq!(selected.masks, baseline.masks);
+        assert_eq!(selected.document.workspace_bytes, baseline.document.workspace_bytes);
+        let standalone = cohorts.document.validate(&args).unwrap();
+        let population = cohorts.document.validate_population(&args).unwrap();
+        assert_eq!(standalone.common.minimum_memory_bytes, population.common.minimum_memory_bytes,
+            "the complete wrapper is staged even when only its semantic result is emitted");
+        let mut no_verification = cohorts.clone(); no_verification.document.redaction.flags.no_verify = true;
+        assert_eq!(no_verification.validate(&args).unwrap().common.minimum_memory_bytes,
+            selected.common.minimum_memory_bytes, "original and edited maps reuse one peak");
+        let (_, mut short) = arguments(&[]);
+        short.memory_mib = selected.common.minimum_memory_bytes.saturating_sub(1) / MIB;
+        assert!(cohorts.validate(&short).is_err());
+        short.memory_mib = selected.common.minimum_memory_bytes.div_ceil(MIB);
+        assert!(cohorts.validate(&short).is_ok());
     }
-    for width in [1, 3] {
-        let (mut options, args) = arguments(&[]);
-        options.document.cohort_chunks = Some(width);
+}
+
+#[test]
+fn invalid_corpus_cohort_windows_refuse_before_private_io_without_shrinking() {
+    for flags in [vec!["--cohort-chunks", "0"], vec!["--cohort-chunks", "65"],
+        vec!["--cohort-chunks", "3", "--max-ner-chunks", "2"], vec!["--cohort-chunks", "64"]] {
+        let (options, mut args) = arguments(&flags); args.memory_mib = 65536;
         assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
     }
 }
@@ -214,8 +247,20 @@ fn source_scalar_and_pinned_snapshot_simd_match_across_document_and_flush_bounda
         "--snapshot", &snapshot, "--expected-model-sha256", pin, "--kernel", kernel.id()]).unwrap();
     let Int4Task::RedactCorpus(options) = reload.task else { panic!("corpus task required"); };
     let mut args = reload.args; args.memory_mib = memory;
-    let selected = collect(options, args, input);
+    let selected = collect(options, args, input.clone());
     assert_eq!(selected.iter().map(|row| &row["record"]).collect::<Vec<_>>(),
         scalar.iter().map(|row| &row["record"]).collect::<Vec<_>>());
     assert!(selected.iter().all(|row| row["integer_kernel"] == kernel.id()));
+    assert!(selected.iter().all(|row| row.get("chunk_schedule").is_none()));
+    for width in ["1", "3"] {
+        let reload = parsed(&["--rules", "email", "--max-requests", "4", "--max-ner-chunk-bytes", "16",
+            "--snapshot", &snapshot, "--expected-model-sha256", pin, "--kernel", kernel.id(),
+            "--cohort-chunks", width]).unwrap();
+        let Int4Task::RedactCorpus(options) = reload.task else { panic!("corpus task required"); };
+        let mut args = reload.args; args.memory_mib = memory;
+        let grouped = collect(options, args, input.clone());
+        assert_eq!(grouped.iter().map(|row| &row["record"]).collect::<Vec<_>>(),
+            scalar.iter().map(|row| &row["record"]).collect::<Vec<_>>(), "cohort width {width}");
+        assert!(grouped.iter().all(|row| row["chunk_schedule"]["declared_max_chunks"] == width.parse::<u64>().unwrap()));
+    }
 }

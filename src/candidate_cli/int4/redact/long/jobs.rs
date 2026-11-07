@@ -38,8 +38,8 @@ struct JobExecutionLimits {
 
 pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
     let operation = |name: &'static str, about: &'static str| {
-        StorageArgs::augment_args(super::serial_definition().name(name).about(about)
-            .long_about("Create or explicitly resume one retained complete-document INT4 redaction job. Requires --store-results, an existing owner-only --job-dir, original --job-id, an independent protected --key-file and exact immutable --limits. Supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation, including resume; inputs remain in memory and are not persisted. IDs are unique across the complete population, flush controls are refused, and task_args cannot override the fixed detector, action, verification or key policy. --max-input-bytes caps decoded ORIGINAL text; JobLimits.max_input_bytes_per_item separately caps the encoded JSON envelope. Whole-document rules and every native NER chunk feed one edited result; fresh transformed detection remains the default. Pseudonymization uses one full256 scope: its separate binary --key-stdin requires a population FILE and its commitment is checked before population IO. The job key file is never used as the pseudonym key. Exact model/group, original envelope bytes/order, detector limits, policy and actual key commitment authenticate before job repair or inference. Lifetime native and mask work comes solely from --limits and is never multiplied or renewed by attempts or resume. Stdout contains completion metadata only; private text and maps remain in the explicitly retained spool. --materialize publishes verified materialized.ndjson only after all items commit. Optional model snapshot creation occurs during setup and remains if later job authentication or execution fails. Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64.")
+        StorageArgs::augment_args(super::definition().name(name).about(about)
+            .long_about("Create or explicitly resume one retained complete-document INT4 redaction job. Requires --store-results, an existing owner-only --job-dir, original --job-id, an independent protected --key-file and exact immutable --limits. Supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation, including resume; inputs remain in memory and are not persisted. IDs are unique across the complete population, flush controls are refused, and task_args cannot override the fixed detector, action, verification or key policy. --max-input-bytes caps decoded ORIGINAL text; JobLimits.max_input_bytes_per_item separately caps the encoded JSON envelope. Whole-document rules and every native NER chunk feed one edited result; fresh transformed detection remains the default. Serial execution preserves existing recipes. Explicit --cohort-chunks N shares native layers across independent NER chunks in both stages using one admitted peak; the schedule, width and native context are authenticated, so repeat the same selection on resume. Stored semantic results and complete-document commit boundaries are unchanged. Pseudonymization uses one full256 scope: its separate binary --key-stdin requires a population FILE and its commitment is checked before population IO. The job key file is never used as the pseudonym key. Exact model/group, original envelope bytes/order, detector limits, policy and actual key commitment authenticate before job repair or inference. Lifetime native and mask work comes solely from --limits and is never multiplied or renewed by attempts or resume. Stdout contains completion metadata only; private text and maps remain in the explicitly retained spool. --materialize publishes verified materialized.ndjson only after all items commit. Optional model snapshot creation occurs during setup and remains if later job authentication or execution fails. Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64.")
             .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population, also on resume; '-' reads stdin unless stdin supplies the pseudonym key"))
             .mut_arg("max_input_bytes", |arg| arg.help("Maximum decoded ORIGINAL document bytes per item; the immutable JobLimits cap separately bounds encoded JSON"))
             .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoints for this invocation; persisted work and attempts never renew")))
@@ -58,7 +58,6 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
 impl JobArgs {
     /// Pure option admission. This reads no source, secret, limits or population.
     fn validate(&self, args: &Int4Args) -> Result<DocumentLimits, Failure> {
-        if self.document.cohort_chunks.is_some() { return Err(Failure::usage("unsupported_redaction_cohorts")); }
         let s = &self.storage;
         let local = |path: &std::path::Path| !path.as_os_str().is_empty() && path.as_os_str() != "-";
         if !s.store_results || !local(&s.job_dir) || !local(&s.key_file) || !local(&s.limits_file)
@@ -67,7 +66,7 @@ impl JobArgs {
             || s.journal_memory_mib == 0 || s.serialization_memory_mib == 0 {
             return Err(Failure::usage("explicit_storage_or_job_options"));
         }
-        let limits = self.document.validate(args).map_err(Failure::from)?;
+        let limits = self.document.validate_population(args).map_err(Failure::from)?;
         for mib in [s.journal_memory_mib, s.serialization_memory_mib] {
             if mib.checked_mul(MIB).is_none_or(|bytes| bytes > limits.common.memory_bytes) {
                 return Err(Failure::usage("job_memory_options"));
@@ -77,8 +76,9 @@ impl JobArgs {
     }
     fn lifetime_limits(&self, args: &Int4Args, document: DocumentLimits,
         job: JobLimits) -> Result<JobExecutionLimits, Failure> {
-        if self.document.cohort_chunks.is_some() || document.cohort.is_some() {
-            return Err(Failure::usage("unsupported_redaction_cohorts"));
+        if self.document.cohort_chunks.is_some() != document.cohort.is_some()
+            || self.document.cohort_chunks.unwrap_or(1) != document.mapping.reduction.map_batch_chunks {
+            return Err(Failure::usage("redaction_chunk_schedule"));
         }
         job.validate().map_err(|_| Failure::usage("job_limits"))?;
         let mut common = document.common;

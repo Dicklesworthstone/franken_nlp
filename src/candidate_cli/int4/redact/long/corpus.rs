@@ -55,9 +55,9 @@ pub(in crate::candidate_cli::int4) struct CorpusLimits {
     io_bytes: u64,
 }
 pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
-    StreamFlags::augment_args(super::serial_definition().name("redact-corpus")
+    StreamFlags::augment_args(super::definition().name("redact-corpus")
         .about("Redact ordered complete-document NDJSON with one resident INT4 model and key scope")
-        .long_about("Stream bounded {id,text,task_args?} NDJSON and exact {\"flush\":true} controls through one resident grouped-INT4 model and native allocation. Each document uses the complete-document redactor: whole-source rules, source-aligned NER chunks, one edit, and fresh transformed-text verification by default. The policy, NER types, binary key and namespace are fixed for the entire stream; task_args must be absent, null or an empty object. Completed document events remain valid if a later record fails. Require run_complete AND exit 0 for whole-run success. Per-document work/mask envelopes are charged to independent whole-corpus ceilings, including failed documents, and never renew at flush. IO/key ownership lasts through physical cleanup and writer flush. No retained job, per-item host invocation, rules-only fallback, automatic download or backend switch. NER chunk boundaries and model omissions can miss PII; clean scans and pseudonyms do not establish anonymity. Blocking IO observes cancellation cooperatively.")
+        .long_about("Stream bounded {id,text,task_args?} NDJSON and exact {\"flush\":true} controls through one resident grouped-INT4 model. Each document uses the complete-document redactor: whole-source rules, source-aligned NER chunks, one edit, and fresh transformed-text verification by default. Serial execution is the default. Explicit --cohort-chunks N shares native layers across independent NER chunks in both stages, with one admitted peak reused after the original stage drains; it never changes per-chunk KV or silently reduces the selected width. Documents remain ordered and the semantic result envelope is unchanged. The policy, NER types, binary key and namespace are fixed for the entire stream; task_args must be absent, null or an empty object. Completed document events remain valid if a later record fails. Require run_complete AND exit 0 for whole-run success. Per-document work/mask envelopes are charged to independent whole-corpus ceilings, including failed documents, and never renew at flush. IO/key ownership lasts through physical cleanup and writer flush. No retained job, per-item host invocation, rules-only fallback, automatic download or backend switch. NER chunk boundaries and model omissions can miss PII; clean scans and pseudonyms do not establish anonymity. Blocking IO observes cancellation cooperatively.")
         .mut_arg("input", |arg| arg.help("NDJSON file or '-' for stdin; binary key stdin requires a separate corpus file"))
         .mut_arg("max_input_bytes", |arg| arg.help("Maximum decoded COMPLETE original document bytes per record"))
         .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoint allowance for the ENTIRE corpus execution")))
@@ -67,8 +67,7 @@ impl CorpusArgs {
         Ok(Self { document: DocumentArgs::from_matches(matches)?, stream: StreamFlags::from_arg_matches(matches)? })
     }
     pub(in crate::candidate_cli::int4) fn validate(&self, args: &Int4Args) -> Result<CorpusLimits, CandidateError> {
-        if self.document.cohort_chunks.is_some() { return Err(CandidateError::Arguments); }
-        let document = self.document.validate(args)?;
+        let document = self.document.validate_population(args)?;
         let mut common = document.common;
         let s = self.stream;
         if !(1..=100_000).contains(&s.max_requests)

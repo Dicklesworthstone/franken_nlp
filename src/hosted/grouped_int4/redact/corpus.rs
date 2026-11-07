@@ -1,4 +1,4 @@
-//! Complete-document redaction streams on one charged resident INT4 engine.
+//! Complete-document redaction streams on one charged resident INT4 model.
 use super::*;
 #[cfg(all(feature = "metadata-store", target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -12,6 +12,9 @@ use crate::{
     tasks::redact::grouped_int4::corpus::{self as document_batch,
         Int4DocumentRedactionBatchConfig, Int4RedactionAdmission, Int4RedactionBatchAdmission,
         NativeInt4DocumentRedactionBatch},
+    tasks::{redact::grouped_int4::long::INT4_LONG_REDACTION_COHORT_ENVELOPE_BYTES,
+        source_planning::grouped_int4::long::cohort::{Int4SourceMapCohortBudget,
+            Int4SourceMapCohortRequirement}},
 };
 
 struct Preparation {
@@ -38,24 +41,52 @@ impl NlpEngine {
         pseudonyms: Option<RedactionPseudonyms>, limits: CorpusLimits, kernel: PackedInt4Kernel,
         reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        self.batch_int4_redact_documents_for_schedule(model, planner, vocabulary, config,
+            pseudonyms, limits, kernel, reader, writer, cancellation, false)
+    }
+
+    /// Stream ordered documents with native chunk cohorts in both detection
+    /// stages. The full declared window is admitted once and reused after each
+    /// stage drains; the edited document is freshly partitioned and verified.
+    /// Per-chunk KV, semantic output and whole-attempt work remain unchanged.
+    /// An oversized window is refused, never reduced or switched to serial.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int4_redact_documents_cohorts<R, W>(&self, model: &ResidentInt4,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: RedactionCorpusConfig<Int4DocumentRedactionBatchConfig>,
+        pseudonyms: Option<RedactionPseudonyms>, limits: CorpusLimits, kernel: PackedInt4Kernel,
+        reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        self.batch_int4_redact_documents_for_schedule(model, planner, vocabulary, config,
+            pseudonyms, limits, kernel, reader, writer, cancellation, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn batch_int4_redact_documents_for_schedule<R, W>(&self, model: &ResidentInt4,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: RedactionCorpusConfig<Int4DocumentRedactionBatchConfig>,
+        pseudonyms: Option<RedactionPseudonyms>, limits: CorpusLimits, kernel: PackedInt4Kernel,
+        reader: R, writer: W, cancellation: CancellationToken, cohorts: bool) -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
         dispatch::preflight(self, limits.native.run)?;
         if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
         redact_task::check_model(&config.batch.ner_identity, model.model_identity()).map_err(redaction_error)?;
-        document_batch::check_configuration(&planner, &config.batch, model.model_identity())
-            .map_err(HostedError::BatchSetup)?;
+        if cohorts {
+            document_batch::check_cohort_configuration(&planner, &config.batch, model.model_identity(),
+                limits.native.context_tokens).map_err(HostedError::BatchSetup)?;
+        } else {
+            document_batch::check_configuration(&planner, &config.batch, model.model_identity())
+                .map_err(HostedError::BatchSetup)?;
+        }
         let width = model.model_identity().group_width();
-        let required = Int4MemoryRequirement::for_context(limits.native.context_tokens, width).map_err(native_error)?;
-        validate_limits(&config, limits, required.kv_bytes)?;
-        let buffers = sum(&[limits.reservation_bytes()?,
-            long::document_workspace_bytes(&config.batch.detector, config.edit_reserve_bytes)?,
-            secret_bytes(pseudonyms.as_ref())?])?;
+        let required = corpus_requirements(&config, limits, width, pseudonyms.as_ref(), cohorts)?;
         let lease = self.resources().acquire_lease();
-        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, buffers)?,
+        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(CorpusInput { preparation: Some(Preparation { planner, vocabulary, config, secret: pseudonyms }),
                 reader, writer }))?;
-        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
+        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
         let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-            sum(&[required.rope_bytes, required.scratch_payload_bound, limits.native.allocator_reserve_bytes])?)?;
+            required.workspace_bytes)?;
         let model = model.clone();
         dispatch::run(self, limits.native.run, cancellation, move |control| {
             let mut input = input;
@@ -65,24 +96,41 @@ impl NlpEngine {
             // One scope, checked before native allocation or the first IO.
             // No secret reread, key generation or policy change at a flush.
             let context = pseudonym_context(secret.as_ref(), &config.batch.request)?;
-            let mut engine = allocate_native(kv, workspace, || {
-                StrictInt4Engine::new(&model.inner.loaded.value, limits.native.context_tokens, Int4MemoryBudget {
-                    max_kv_bytes: required.kv_bytes, max_rope_bytes: required.rope_bytes,
-                    max_scratch_payload_bytes: required.scratch_payload_bound,
-                }).map(|engine| engine.with_kernel(kernel)).map_err(native_error)
-            })?;
-            let result = {
-                let admission = DocumentAdmission {
-                    lease: &lease, model: model.model_identity(),
-                    fixed: FixedItem::new(&config.batch, width, required.kv_bytes,
-                        limits.transport.max_output_line_bytes as u64),
-                };
-                let mut processor = NativeInt4DocumentRedactionBatch::new(&planner, config.batch,
-                    &mut engine.value, &vocabulary, context.as_ref(), admission).map_err(HostedError::BatchSetup)?;
-                stream::run_ndjson(&mut input.value.reader, &mut input.value.writer,
-                    &mut processor, limits.transport, control).map_err(HostedError::Batch)
+            let admission = DocumentAdmission {
+                lease: &lease, model: model.model_identity(),
+                fixed: FixedItem::new(&config.batch, width, required.native.kv_bytes,
+                    limits.transport.max_output_line_bytes as u64),
             };
-            drop(engine);
+            let result = if let Some(quote) = required.cohort {
+                let result = {
+                    let mut processor = NativeInt4DocumentRedactionBatch::new_cohorts(&planner, config.batch,
+                        &model.inner.loaded.value, &vocabulary, context.as_ref(),
+                        native_cohort_budget(quote, limits.native.context_tokens), kernel, admission)
+                        .map_err(HostedError::BatchSetup)?;
+                    stream::run_ndjson(&mut input.value.reader, &mut input.value.writer,
+                        &mut processor, limits.transport, control).map_err(HostedError::Batch)
+                };
+                // The concrete backend owns and drains its exact-sized native
+                // windows. Keep the full peak charged through stream delivery;
+                // no unused scalar engine coexists with those windows.
+                drop(workspace); drop(kv);
+                result
+            } else {
+                let mut engine = allocate_native(kv, workspace, || {
+                    StrictInt4Engine::new(&model.inner.loaded.value, limits.native.context_tokens, Int4MemoryBudget {
+                        max_kv_bytes: required.native.kv_bytes, max_rope_bytes: required.native.rope_bytes,
+                        max_scratch_payload_bytes: required.native.scratch_payload_bound,
+                    }).map(|engine| engine.with_kernel(kernel)).map_err(native_error)
+                })?;
+                let result = {
+                    let mut processor = NativeInt4DocumentRedactionBatch::new(&planner, config.batch,
+                        &mut engine.value, &vocabulary, context.as_ref(), admission).map_err(HostedError::BatchSetup)?;
+                    stream::run_ndjson(&mut input.value.reader, &mut input.value.writer,
+                        &mut processor, limits.transport, control).map_err(HostedError::Batch)
+                };
+                drop(engine);
+                result
+            };
             drop(context);
             drop(secret);
             drop(vocabulary);
@@ -92,6 +140,49 @@ impl NlpEngine {
             result
         })
     }
+}
+
+struct CorpusRequirements {
+    native: Int4MemoryRequirement,
+    workspace_bytes: u64,
+    input_bytes: u64,
+    cohort: Option<Int4SourceMapCohortRequirement>,
+}
+fn corpus_requirements(config: &RedactionCorpusConfig<Int4DocumentRedactionBatchConfig>,
+    limits: CorpusLimits, width: usize, secret: Option<&RedactionPseudonyms>, cohorts: bool)
+    -> Result<CorpusRequirements, HostedError> {
+    limits.native.run.validate()?;
+    // Each task still owns only one row. A full cohort reservation must never
+    // be mistaken for permission to enlarge a single chunk's context.
+    let row = Int4MemoryRequirement::for_context(limits.native.context_tokens, width).map_err(native_error)?;
+    validate_limits(config, limits, row.kv_bytes)?;
+    let cohort = cohorts.then(|| config.batch.detector.cohort_requirements(limits.native.context_tokens, width))
+        .transpose().map_err(long::document_error)?;
+    let native = cohort.map_or(row, |quote| quote.native);
+    let input_bytes = sum(&[limits.reservation_bytes()?,
+        long::document_workspace_bytes(&config.batch.detector, config.edit_reserve_bytes)?,
+        secret_bytes(secret)?, cohort_temporary_bytes(cohort)?])?;
+    let workspace_bytes = sum(&[native.rope_bytes, native.scratch_payload_bound,
+        limits.native.allocator_reserve_bytes])?;
+    sum(&[input_bytes, native.kv_bytes, workspace_bytes])?;
+    Ok(CorpusRequirements { native, workspace_bytes, input_bytes, cohort })
+}
+
+fn cohort_temporary_bytes(cohort: Option<Int4SourceMapCohortRequirement>) -> Result<u64, HostedError> {
+    // A cohort's decoder storage and the temporary redaction wrapper are
+    // independent. check_size canonicalizes the wrapper before it is removed;
+    // the final output guard continues to price only the semantic envelope.
+    match cohort {
+        Some(quote) => sum(&[quote.workspace_bytes, 4 * INT4_LONG_REDACTION_COHORT_ENVELOPE_BYTES]),
+        None => Ok(0),
+    }
+}
+fn native_cohort_budget(quote: Int4SourceMapCohortRequirement, context_limit: usize) -> Int4SourceMapCohortBudget {
+    Int4SourceMapCohortBudget { context_limit,
+        native_memory: Int4MemoryBudget { max_kv_bytes: quote.native.kv_bytes,
+            max_rope_bytes: quote.native.rope_bytes,
+            max_scratch_payload_bytes: quote.native.scratch_payload_bound },
+        max_workspace_bytes: quote.workspace_bytes, max_result_bytes: quote.max_result_bytes }
 }
 
 fn validate_limits(config: &RedactionCorpusConfig<Int4DocumentRedactionBatchConfig>,

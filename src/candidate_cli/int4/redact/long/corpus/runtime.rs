@@ -7,7 +7,8 @@ use crate::{
     hosted::{CancellationToken, HostedError, Int4HostError, NativeLimits, RunLimits, RedactionPseudonyms,
         corpus::{CorpusLimits as HostCorpusLimits, RedactionCorpusConfig}},
     native_engine::{decode::DecodeCancellationKind, strict_int4::weights::snapshot::INT4_SNAPSHOT_VERSION},
-    tasks::{BuiltInTask, redact::{detectors, pseudonym::Pseudonyms, grouped_int4::corpus::check_configuration}},
+    tasks::{BuiltInTask, redact::{detectors, pseudonym::Pseudonyms,
+        grouped_int4::corpus::{check_configuration, check_cohort_configuration}}},
 };
 
 fn cancelled(cause: DecodeCancellationKind) -> CandidateError {
@@ -84,7 +85,13 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let batch = command.configuration(&args, limits, identity.clone(), ner);
     // Check the fixed complete-document recipe, actual model/group and whole
     // stream envelope before optional model snapshot publication or corpus IO.
-    check_configuration(&planner, &batch, model.model_identity()).map_err(|_| CandidateError::Planning)?;
+    if let Some(expected) = limits.document.cohort {
+        let required = check_cohort_configuration(&planner, &batch, model.model_identity(), args.context_tokens)
+            .map_err(|_| CandidateError::Planning)?;
+        if required != expected { return Err(CandidateError::Memory); }
+    } else {
+        check_configuration(&planner, &batch, model.model_identity()).map_err(|_| CandidateError::Planning)?;
+    }
     let mut snapshot = common.snapshot_pin.map(|_| SnapshotRecord::new("loaded", common.snapshot_need));
     if let Some(path) = &args.save_snapshot {
         let pin = engine.save_int4_snapshot(&model, path.clone(), common.snapshot_budget(false)?,
@@ -102,6 +109,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(), snapshot,
+        chunk_schedule: command.document.cohort_chunks.map(ChunkSchedule::new),
     };
     let writer = CandidateWriter::new(output, &provenance, limits.transport.max_output_line_bytes, limits.output_bytes)?;
     let reader: Box<dyn BufRead + Send> = if args.input.as_os_str() == "-" {
@@ -116,9 +124,14 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
                 cleanup_reserve_bytes: CLEANUP_BYTES } },
         transport: limits.transport, preparation_reserve_bytes: common.preparation_bytes, io_reserve_bytes: limits.io_bytes,
     };
-    let summary = engine.batch_int4_redact_documents(&model, Arc::new(planner), Arc::new(vocabulary),
-        RedactionCorpusConfig { batch, edit_reserve_bytes: limits.document.edit_bytes }, secret,
-        host, common.kernel, reader, writer, cancellation).map_err(execution_error)?;
+    let config = RedactionCorpusConfig { batch, edit_reserve_bytes: limits.document.edit_bytes };
+    let summary = if limits.document.cohort.is_some() {
+        engine.batch_int4_redact_documents_cohorts(&model, Arc::new(planner), Arc::new(vocabulary),
+            config, secret, host, common.kernel, reader, writer, cancellation)
+    } else {
+        engine.batch_int4_redact_documents(&model, Arc::new(planner), Arc::new(vocabulary),
+            config, secret, host, common.kernel, reader, writer, cancellation)
+    }.map_err(execution_error)?;
     // The host emitted the sole terminal frame. Earlier completed rows remain
     // valid, but any failed record still makes the process unsuccessful.
     completed(summary)
@@ -138,6 +151,8 @@ struct Provenance<'a> {
     group_width: usize, integer_kernel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<SnapshotRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chunk_schedule: Option<ChunkSchedule>,
 }
 
 #[cfg(test)]

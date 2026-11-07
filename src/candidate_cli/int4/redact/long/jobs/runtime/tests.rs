@@ -172,7 +172,7 @@ fn metadata_only_report_has_public_provenance_and_keeps_sensitive_results_in_the
     let stored = lifetime(&args, document); let id = JobId([0x12; 16]);
     let report = progress_report(completed(id, stored), id, stored, true,
         RunMode::Resume { discard_uncommitted: false }, "redact").unwrap();
-    let response = Response {
+    let mut response = Response {
         protocol: "fnlp-candidate-int4-redact-job-v1", schema_version: 1,
         scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "redact",
         redaction_mode: "complete_document", retained_output_is_sensitive: true,
@@ -180,7 +180,7 @@ fn metadata_only_report_has_public_provenance_and_keeps_sensitive_results_in_the
         source_root_sha256: "fixture-public-source", model_content_sha256: "fixture-public-model",
         candidate_format: "fixture-format", quant_recipe: "fixture-grouped-int4", group_width: 128,
         integer_kernel: "s_scalar_i32", snapshot: Some(SnapshotRecord::new("loaded", document.common.snapshot_need)),
-        output: &report,
+        chunk_schedule: None, output: &report,
     };
     let mut bytes = Vec::new(); publish(&response, job_cli::REPORT_BYTES, &mut bytes).unwrap();
     let event: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -195,6 +195,12 @@ fn metadata_only_report_has_public_provenance_and_keeps_sensitive_results_in_the
     }
     assert!(bytes.ends_with(b"\n"));
     assert_eq!(publish(&response, 1, &mut NoIo), Err(CandidateError::Output));
+    assert!(event.get("chunk_schedule").is_none());
+    response.chunk_schedule = Some(ChunkSchedule::new(3));
+    let grouped = serde_json::to_value(&response).unwrap();
+    assert_eq!(grouped["output"], event["output"]);
+    assert_eq!(grouped["chunk_schedule"]["declared_max_chunks"], 3);
+    assert_eq!(grouped["chunk_schedule"]["phase"], "redaction_ner_maps");
 }
 
 #[test]

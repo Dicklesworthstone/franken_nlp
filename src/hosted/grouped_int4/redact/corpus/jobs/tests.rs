@@ -253,4 +253,83 @@ fn owned_population_preparation_secrets_and_reader_cross_one_physical_boundary()
     send::<SourceJobRequest>();
     send::<RedactionCorpusConfig<Int4RedactionJobConfig>>();
     let _host = NlpEngine::job_int4_redact_document::<Cursor<Vec<u8>>>;
+    let _cohorts = NlpEngine::job_int4_redact_document_cohorts::<Cursor<Vec<u8>>>;
+}
+
+#[test]
+fn retained_cohorts_keep_one_peak_across_stages_and_charge_the_whole_native_window() {
+    let mut c = config(); c.batch.batch.detector.mapping.reduction.map_batch_chunks = 3;
+    let (job, host) = limits(&c);
+    let serial = job_requirements(&c, job, host, 127, None).unwrap();
+    assert!(serial.cohort.is_none());
+    let grouped = job_requirements_for_schedule(&c, job, host, 127, None, true).unwrap();
+    assert_eq!(grouped.native, Int4MemoryRequirement::for_cohort(&[128; 3], 127).unwrap());
+    assert!(grouped.native.kv_bytes > c.batch.batch.detector.per_chunk.max_kv_bytes);
+    let quote = grouped.cohort.unwrap();
+    assert_eq!(grouped.input_bytes - serial.input_bytes, quote.workspace_bytes
+        + 4 * crate::tasks::redact::grouped_int4::long::INT4_LONG_REDACTION_COHORT_ENVELOPE_BYTES);
+    let fixed = FixedItem::new(&c.batch.batch, 127, grouped.native.kv_bytes, job.max_result_bytes as u64);
+    assert_eq!(fixed.model_work, c.batch.batch.item_model_work());
+    assert_eq!(fixed.mask_visits, c.batch.batch.detector.mapping.max_mask_visits);
+    assert_eq!(fixed.result_bytes, c.batch.batch.detector.max_result_bytes);
+    check_admission(&fixed, &admission_request(&fixed)).unwrap();
+    let mut row_only = admission_request(&fixed);
+    row_only.kv_reservation_bytes = c.batch.batch.detector.per_chunk.max_kv_bytes;
+    assert_eq!(check_admission(&fixed, &row_only).unwrap_err().fault.code, BatchCode::Admission);
+    c.batch.batch.request.verify = !c.batch.batch.request.verify;
+    let other_stage_count = job_requirements_for_schedule(&c, job, host, 127, None, true).unwrap();
+    assert_eq!(other_stage_count.native, grouped.native);
+    assert_eq!(other_stage_count.workspace_bytes, grouped.workspace_bytes);
+    assert_eq!(other_stage_count.input_bytes, grouped.input_bytes);
+}
+
+#[test]
+fn changing_cohort_width_never_renews_persisted_work_masks_or_result_authority() {
+    for chunks in [1, 2, 3] {
+        let mut c = config(); c.batch.batch.detector.mapping.reduction.map_batch_chunks = chunks;
+        let (job, host) = limits(&c);
+        job_requirements_for_schedule(&c, job, host, 127, None, true).unwrap();
+        for axis in 0..6 {
+            for increase in [false, true] {
+                let mut changed = job;
+                let counter = match axis {
+                    0 => &mut changed.max_work.model.forward_positions,
+                    1 => &mut changed.max_work.model.projected_logits,
+                    2 => &mut changed.max_work.model.attention_pairs,
+                    3 => &mut changed.max_work.model.projections.dot_products,
+                    4 => &mut changed.max_work.model.projections.multiply_accumulates,
+                    _ => &mut changed.max_work.mask_node_visits,
+                };
+                if increase { *counter += 1; } else { *counter -= 1; }
+                assert!(job_requirements_for_schedule(&c, changed, host, 127, None, true).is_err(),
+                    "chunks {chunks} axis {axis} increase {increase}");
+            }
+        }
+        let mut short = job; short.max_result_bytes = c.batch.batch.detector.max_result_bytes as usize - 1;
+        assert!(job_requirements_for_schedule(&c, short, host, 127, None, true).is_err());
+    }
+}
+
+#[test]
+fn retained_cohort_quotes_refuse_bad_windows_per_row_authority_and_unadmitted_memory() {
+    for chunks in [0, 4, 65, usize::MAX] {
+        let mut c = config(); c.batch.batch.detector.mapping.reduction.map_batch_chunks = chunks;
+        let (job, host) = limits(&c);
+        assert!(job_requirements_for_schedule(&c, job, host, 127, None, true).is_err(), "chunks {chunks}");
+    }
+    for axis in 0..8 {
+        let mut c = config(); c.batch.batch.detector.mapping.reduction.map_batch_chunks = 3;
+        let (job, mut host) = limits(&c);
+        match axis {
+            0 => c.batch.batch.detector.per_chunk.max_kv_bytes -= 1,
+            1 => host.native.context_tokens -= 1,
+            2 => c.batch.batch.detector.planning.max_context_tokens += 1,
+            3 => c.batch.batch.detector.mapping.chunks.context_tokens += 1,
+            4 => c.edit_reserve_bytes = 0,
+            5 => host.native.allocator_reserve_bytes = 0,
+            6 => host.serialization_reserve_bytes = u64::MAX,
+            _ => c.batch.batch.detector.per_chunk.max_output_bytes = u64::MAX,
+        }
+        assert!(job_requirements_for_schedule(&c, job, host, 127, None, true).is_err(), "axis {axis}");
+    }
 }

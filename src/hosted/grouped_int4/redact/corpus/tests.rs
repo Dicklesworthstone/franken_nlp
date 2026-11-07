@@ -231,4 +231,82 @@ fn owned_stream_capture_keeps_reader_writer_key_and_configuration_in_one_send_pa
     send::<RedactionPseudonyms>();
     send::<RedactionCorpusConfig<Int4DocumentRedactionBatchConfig>>();
     let _host = NlpEngine::batch_int4_redact_documents::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
+    let _cohorts = NlpEngine::batch_int4_redact_documents_cohorts::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
+}
+
+#[test]
+fn chunk_schedule_admits_the_whole_window_without_expanding_any_single_row_or_work_allowance() {
+    for group in [3, 127, 128, 10752] {
+        for chunks in [1, 2, 3] {
+            let mut c = config(group); c.batch.detector.mapping.reduction.map_batch_chunks = chunks;
+            let row = c.batch.detector.per_chunk;
+            let serial = corpus_requirements(&c, limits(), group, None, false).unwrap();
+            let grouped = corpus_requirements(&c, limits(), group, None, true).unwrap();
+            assert!(serial.cohort.is_none());
+            assert_eq!(grouped.native, Int4MemoryRequirement::for_cohort(&vec![128; chunks], group).unwrap());
+            assert_eq!(grouped.cohort.unwrap().native, grouped.native);
+            assert_eq!(c.batch.detector.per_chunk, row);
+            assert_eq!(serial.native.kv_bytes, row.max_kv_bytes);
+            let serial_item = FixedItem::new(&c.batch, group, serial.native.kv_bytes, 131_072);
+            let grouped_item = FixedItem::new(&c.batch, group, grouped.native.kv_bytes, 131_072);
+            assert_eq!(grouped_item.model_work, serial_item.model_work);
+            assert_eq!(grouped_item.mask_visits, serial_item.mask_visits);
+            assert_eq!(grouped_item.result_bytes, serial_item.result_bytes);
+            check_admission(&grouped_item, &request(&grouped_item)).unwrap();
+            if chunks > 1 {
+                assert!(grouped.native.kv_bytes > row.max_kv_bytes);
+                let mut undercharged = request(&grouped_item);
+                undercharged.kv_reservation_bytes = row.max_kv_bytes;
+                assert_eq!(check_admission(&grouped_item, &undercharged).unwrap_err().fault.code,
+                    BatchCode::Admission);
+            }
+        }
+    }
+}
+
+#[test]
+fn original_and_fresh_verification_maps_reuse_one_admitted_peak_and_keep_semantic_output_caps() {
+    let mut c = config(127); c.batch.detector.mapping.reduction.map_batch_chunks = 3;
+    c.batch.request.verify = false;
+    let original = corpus_requirements(&c, limits(), 127, None, true).unwrap();
+    c.batch.request.verify = true;
+    let verified = corpus_requirements(&c, limits(), 127, None, true).unwrap();
+    let serial = corpus_requirements(&c, limits(), 127, None, false).unwrap();
+    assert_eq!(original.native, verified.native);
+    assert_eq!(original.workspace_bytes, verified.workspace_bytes);
+    assert_eq!(original.input_bytes, verified.input_bytes);
+    assert_eq!(original.cohort, verified.cohort);
+    let quote = verified.cohort.unwrap();
+    assert_eq!(verified.input_bytes - serial.input_bytes, quote.workspace_bytes
+        + 4 * crate::tasks::redact::grouped_int4::long::INT4_LONG_REDACTION_COHORT_ENVELOPE_BYTES);
+    let fixed = FixedItem::new(&c.batch, 127, verified.native.kv_bytes, 131_072);
+    assert_eq!(fixed.result_bytes, c.batch.detector.max_result_bytes);
+    let mut expanded_output = request(&fixed);
+    expanded_output.max_result_bytes += crate::tasks::redact::grouped_int4::long::INT4_LONG_REDACTION_COHORT_ENVELOPE_BYTES;
+    assert_eq!(check_admission(&fixed, &expanded_output).unwrap_err().fault.code,
+        BatchCode::InvalidExecution);
+}
+
+#[test]
+fn impossible_cohort_windows_contexts_and_reservations_fail_without_clamping() {
+    for chunks in [0, 4, 65, usize::MAX] {
+        let mut c = config(127); c.batch.detector.mapping.reduction.map_batch_chunks = chunks;
+        assert!(corpus_requirements(&c, limits(), 127, None, true).is_err(), "chunks {chunks}");
+    }
+    for axis in 0..9 {
+        let mut c = config(127); c.batch.detector.mapping.reduction.map_batch_chunks = 3;
+        let mut l = limits();
+        match axis {
+            0 => c.batch.detector.per_chunk.max_kv_bytes -= 1,
+            1 => l.native.context_tokens -= 1,
+            2 => c.batch.detector.planning.max_context_tokens += 1,
+            3 => c.batch.detector.mapping.chunks.context_tokens += 1,
+            4 => c.edit_reserve_bytes = 0,
+            5 => l.native.allocator_reserve_bytes = 0,
+            6 => l.transport.max_output_line_bytes = 65_535,
+            7 => l.preparation_reserve_bytes = u64::MAX,
+            _ => c.batch.detector.per_chunk.max_output_bytes = u64::MAX,
+        }
+        assert!(corpus_requirements(&c, l, 127, None, true).is_err(), "axis {axis}");
+    }
 }

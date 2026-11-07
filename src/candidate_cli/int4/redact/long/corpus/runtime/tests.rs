@@ -19,8 +19,20 @@ fn provenance() -> Provenance<'static> {
         redaction_mode: "complete_document", model_id: "Nanbeige4.2-3B", source_revision: "fixture",
         source_root_sha256: "fixture-source", model_content_sha256: "fixture-model",
         candidate_format: "fixture-format", quant_recipe: "fixture:group=128", group_width: 128,
-        integer_kernel: "s_scalar_i32", snapshot: Some(SnapshotRecord::new("loaded",
+        integer_kernel: "s_scalar_i32", chunk_schedule: None, snapshot: Some(SnapshotRecord::new("loaded",
             Int4SnapshotRequirements::for_group_width(128).unwrap())) }
+}
+
+#[test]
+fn corpus_schedule_metadata_is_explicit_and_omitted_for_existing_serial_output() {
+    let mut metadata = provenance();
+    let serial = serde_json::to_value(&metadata).unwrap();
+    assert!(serial.get("chunk_schedule").is_none());
+    metadata.chunk_schedule = Some(ChunkSchedule::new(3));
+    let grouped = serde_json::to_value(&metadata).unwrap();
+    assert_eq!(grouped["protocol"], serial["protocol"]);
+    assert_eq!(grouped["chunk_schedule"], serde_json::json!({"execution":"native_chunk_cohorts",
+        "phase":"redaction_ner_maps","declared_max_chunks":3}));
 }
 
 #[test]

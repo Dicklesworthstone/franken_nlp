@@ -7,7 +7,8 @@ use crate::{
     hosted::{CancellationToken, HostedError, Int4HostError, NativeLimits, RunLimits, RedactionPseudonyms,
         corpus::{RedactionCorpusConfig, jobs::{HostedJobError, JobHostLimits, SourceJobRequest}}},
     jobs::{JobError, JobSecret, MismatchField, runner::{JobRunError,
-        redact::grouped_int4::{check_configuration, check_job_limits, INT4_REDACTION_JOB_RECIPE_BYTES}}},
+        redact::grouped_int4::{check_configuration, check_cohort_configuration, check_job_limits,
+            INT4_REDACTION_JOB_RECIPE_BYTES}}},
     native_engine::{decode::DecodeCancellationKind, strict_int4::weights::snapshot::INT4_SNAPSHOT_VERSION},
     tasks::{BuiltInTask, redact::{detectors, pseudonym::Pseudonyms}},
 };
@@ -54,8 +55,14 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     let identity = source::identity(model.model_identity(), &planner, BuiltInTask::Ner)?;
     let config = job.configuration(&args, limits, identity.clone(), ner);
     check_job_limits(&config, lifetime).map_err(|_| Failure::usage("redaction_job_lifetime_contract"))?;
-    check_configuration(&planner, &config, model.model_identity(), lifetime)
-        .map_err(|_| Failure::usage("redaction_job_configuration"))?;
+    if let Some(expected) = limits.document.cohort {
+        let required = check_cohort_configuration(&planner, &config, model.model_identity(), lifetime, args.context_tokens)
+            .map_err(|_| Failure::usage("redaction_job_configuration"))?;
+        if required != expected { return Err(Failure::usage("redaction_job_cohort_quote")); }
+    } else {
+        check_configuration(&planner, &config, model.model_identity(), lifetime)
+            .map_err(|_| Failure::usage("redaction_job_configuration"))?;
+    }
     // This separately requested model snapshot is setup output, not a job
     // commit. Population/recipe authentication happens inside the host below.
     let mut snapshot = common.snapshot_pin.map(|_| SnapshotRecord::new("loaded", common.snapshot_need));
@@ -80,9 +87,14 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     let materialize = job.storage.materialize;
     let request = SourceJobRequest { root: job.storage.job_dir, key, job_id, limits: lifetime,
         mode: open_mode(mode), materialize };
-    let progress = engine.job_int4_redact_document(&model, Arc::new(planner), Arc::new(vocabulary),
-        RedactionCorpusConfig { batch: config, edit_reserve_bytes: limits.document.edit_bytes },
-        secret, request, host, common.kernel, reader, cancellation).map_err(execution_failure)?;
+    let config = RedactionCorpusConfig { batch: config, edit_reserve_bytes: limits.document.edit_bytes };
+    let progress = if limits.document.cohort.is_some() {
+        engine.job_int4_redact_document_cohorts(&model, Arc::new(planner), Arc::new(vocabulary),
+            config, secret, request, host, common.kernel, reader, cancellation)
+    } else {
+        engine.job_int4_redact_document(&model, Arc::new(planner), Arc::new(vocabulary),
+            config, secret, request, host, common.kernel, reader, cancellation)
+    }.map_err(execution_failure)?;
     remaining()?;
     let report = progress_report(progress, job_id, lifetime, materialize, mode, "redact")?;
     let content = identity.logical_model_digest.to_hex();
@@ -94,7 +106,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(),
-        snapshot, output: &report,
+        snapshot, chunk_schedule: job.document.cohort_chunks.map(ChunkSchedule::new), output: &report,
     };
     // Metadata only. Delivery failure may follow durable progress and never
     // authorizes automatic replay, tail repair or an unrequested rollback.
@@ -197,6 +209,8 @@ struct Response<'a, T: Serialize> {
     group_width: usize, integer_kernel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<SnapshotRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chunk_schedule: Option<ChunkSchedule>,
     output: &'a T,
 }
 #[cfg(test)]

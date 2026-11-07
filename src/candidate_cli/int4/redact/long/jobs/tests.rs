@@ -106,18 +106,37 @@ fn storage_and_private_key_refusals_happen_before_any_owned_io() {
 }
 
 #[test]
-fn retained_jobs_refuse_unsupported_chunk_cohorts_before_private_io_or_lifetime_admission() {
+fn retained_job_cohorts_keep_exact_lifetime_authority_and_one_admitted_peak_in_both_modes() {
     for operation in ["start", "resume"] {
-        let mut words = argv(operation);
-        words.extend(["--cohort-chunks", "3"].into_iter().map(str::to_owned));
-        assert!(parse(words).is_err());
-        let (mut job, args) = command(operation, &[]);
-        let document = job.args.validate(&args).unwrap();
+        let (serial, args) = command(operation, &[]);
+        let document = serial.args.validate(&args).unwrap();
         let stored = lifetime(&args, document);
-        job.args.document.cohort_chunks = Some(1);
-        assert!(matches!(job.args.lifetime_limits(&args, document, stored),
-            Err(Failure { code: "unsupported_redaction_cohorts", .. })));
-        assert_eq!(job.execute_owned(args, NoIo, &mut NoIo).unwrap_err().code, "unsupported_redaction_cohorts");
+        let baseline = serial.args.lifetime_limits(&args, document, stored).unwrap();
+        for width in ["1", "3"] {
+            let (cohorts, args) = command(operation, &["--cohort-chunks", width]);
+            let document = cohorts.args.validate(&args).unwrap();
+            let selected = cohorts.args.lifetime_limits(&args, document, stored).unwrap();
+            let quote = document.cohort.unwrap();
+            let original = baseline.common.native;
+            let native_delta = quote.native.kv_bytes + quote.native.rope_bytes + quote.native.scratch_payload_bound
+                - original.kv_bytes - original.rope_bytes - original.scratch_payload_bound;
+            assert_eq!(document.mapping.reduction.map_batch_chunks, width.parse::<usize>().unwrap());
+            assert_eq!(selected.common.minimum_memory_bytes,
+                baseline.common.minimum_memory_bytes + native_delta + quote.workspace_bytes
+                    + 4 * INT4_LONG_REDACTION_COHORT_ENVELOPE_BYTES);
+            assert_eq!(selected.model_work, stored.max_work.int4_model_work());
+            assert_eq!(selected.masks, stored.max_work.mask_node_visits);
+            assert_eq!(selected.common.native, baseline.common.native);
+            assert_eq!(selected.common.result_bytes, baseline.common.result_bytes);
+            assert_eq!(selected.buffer_bytes, baseline.buffer_bytes);
+            assert!(matches!(cohorts.args.lifetime_limits(&args, baseline.document, stored),
+                Err(Failure { code: "redaction_chunk_schedule", .. })));
+        }
+        for flags in [vec!["--cohort-chunks", "0"], vec!["--cohort-chunks", "65"],
+            vec!["--cohort-chunks", "3", "--max-ner-chunks", "2"], vec!["--cohort-chunks", "64"]] {
+            let (job, args) = command(operation, &flags);
+            assert_eq!(job.execute_owned(args, NoIo, &mut NoIo).unwrap_err().code, "invalid_job_options");
+        }
     }
 }
 

@@ -1685,7 +1685,7 @@ controller-selected gates.
 ## Implemented candidate INT4 redaction corpora
 
 `fnlp candidate source-int4 redact-corpus` streams ordered documents through
-one resident grouped-INT4 model, native allocation, fixed detector policy and
+one resident grouped-INT4 model, fixed detector policy and
 pseudonym scope. Each record uses the complete-document redactor, so both
 single-context and longer documents follow the same checked path. This route
 requires `asupersync-runtime`.
@@ -1717,6 +1717,16 @@ default. Full256 pseudonymization reads one binary key from inherited stdin
 with a separate corpus file, and checks its expected commitment before
 opening or reading the corpus. Flush controls never replace that key scope.
 
+Add `--cohort-chunks N` to share native decoder layers across independent NER
+chunks within each document. N must be 1 through 64 and no greater than
+`--max-ner-chunks`; the full declared window and its result workspace must fit
+the selected memory and native result ceilings. The original map drains before
+the edited text is freshly partitioned and checked with the same cohort
+schedule. Both stages reuse one admitted native peak, including capacity for a
+larger edited-text partition. Per-chunk task KV, all work limits and document
+ordering remain unchanged. There is no automatic width reduction or serial
+fallback. Omit the flag for the existing serial schedule.
+
 `--max-input-bytes` bounds each decoded original document, while
 `--max-line-bytes` bounds the complete JSON envelope before LF, including
 escaping and a trailing CR. The default line ceiling is 4 MiB. Total input
@@ -1734,17 +1744,22 @@ Those whole-stream counters and the hosted deadline/checkpoint allowance
 never renew per document or flush. Each document also keeps its complete
 original/transformed work and two verification-pool bounds.
 
-The host owns the incremental reader, writer, planner, key and native engine
-through physical cleanup. It retains full KV and map/edit workspace, with
+The host owns the incremental reader, writer, planner, key and native execution
+through physical cleanup. It retains the declared native peak and map/edit workspace, with
 explicit transport buffers, duplicate-ID storage, both preparation lifetimes
-and guarded per-document results. It does not collect the corpus or create a
+and guarded per-document results. Cohort admission also covers native decoder
+workspace and transient physical-receipt serialization; it does not enlarge
+the semantic document result ceiling. It does not collect the corpus or create a
 new runtime/model for every record.
 
 Every completed event is wrapped with
 `protocol: "fnlp-candidate-int4-redact-corpus-v1"` and actual model/group/kernel
 provenance; the native event remains under `record`. Completed results contain
 only final edited text, public policy, optional coordinate maps and bounded
-receipts. Original text, private prompts, raw keys, namespace and local paths
+receipts. Explicit cohorts add public `chunk_schedule` metadata with
+`execution: "native_chunk_cohorts"`, `phase: "redaction_ner_maps"` and
+`declared_max_chunks`; the nested semantic result keeps the existing wire
+shape. Serial provenance omits this field. Original text, private prompts, raw keys, namespace and local paths
 do not enter provenance. Failed rows export fixed errors without rejected
 transformed text.
 
@@ -1761,6 +1776,9 @@ each streamed original document is then fully preflighted before its native
 work, and its transformed partition is planned freshly. Library callers use
 `NativeInt4DocumentRedactionBatch`, `Int4DocumentRedactionBatchConfig` and
 `NlpEngine::batch_int4_redact_documents` with owned reader/writer handles.
+Explicit cohorts use `NativeInt4DocumentRedactionBatch::new_cohorts` or
+`NlpEngine::batch_int4_redact_documents_cohorts` with the same fixed policy and
+semantic output contract.
 Source and resource fixtures are authored; compilation, model-present
 execution and quality qualification remain pending controller-selected gates.
 
@@ -1872,6 +1890,17 @@ including a verification prompt that can only be planned from the actual
 edited text. Failed or interrupted attempts retain that debit. No failed or
 partial redaction becomes a committed successful result.
 
+`--cohort-chunks N` enables the same native NER chunk cohorts for retained jobs,
+with N from 1 through 64 and no greater than `--max-ner-chunks`. The original
+and freshly edited maps run in consecutive stages and share one admitted
+native peak. Cohort schedule, width and context are authenticated in the private
+job recipe. Repeat the same selection on resume; adding, removing or changing
+it refuses authentication before repair or inference. Existing serial jobs
+retain their original recipe bytes when the flag is omitted. Each complete
+document is still one durable attempt and one result commit; chunks and
+verification stages do not become checkpoints. No work allowance increases
+with cohort width, population size or resume.
+
 Memory admission includes the complete frozen population and ID index,
 journal and serialization staging, private recipe, both preparation owners,
 full resident KV, complete-map/edit workspace, secret metadata and guarded
@@ -1882,6 +1911,8 @@ Each complete result stays charged through spool sync and journal acknowledgemen
 Stdout contains only a bounded completion report with
 `protocol: "fnlp-candidate-int4-redact-job-v1"`, public model provenance,
 `redaction_mode: "complete_document"` and authenticated progress.
+Explicit cohorts add the public `chunk_schedule` metadata described above;
+stored semantic results keep the original redaction envelope and byte ceiling.
 Private results remain in the explicit owner-only spool. `--materialize`
 publishes ordered `materialized.ndjson` only after all items commit;
 existing stored-job status, verification and materialization remain available
@@ -1899,7 +1930,9 @@ job fails. It is separate from durable job commits.
 Library callers use `Int4RedactionJobConfig` and
 `NlpEngine::job_int4_redact_document` with the existing
 `SourceJobRequest`, `JobHostLimits` and
-`RedactionCorpusConfig` wrappers. No parallel job storage format or implicit
+`RedactionCorpusConfig` wrappers. Select
+`NlpEngine::job_int4_redact_document_cohorts` for authenticated native chunk
+cohorts through the same runner and storage contract. No parallel job storage format or implicit
 input spool is introduced. Fixtures cover authority, resource, privacy and
 resume contracts; compilation, model-present execution, crash recovery and
 quality qualification remain pending controller-selected gates.
