@@ -132,7 +132,8 @@ pub(super) fn execute(args: Int4Args, command: JudgeArgs, _admitted: Int4Limits,
     // Both guards survive bounded staging, writing and flushing. Inference
     // failure never emits a prefix; a writer error remains an output failure.
     let response = Response { provenance: &provenance, output: result.result() };
-    publish(&cohort::Response { response: &response, cohort: result.summary() }, limits.result_bytes + 4096, output)
+    publish_checked(&cohort::Response { response: &response, cohort: result.summary() },
+        limits.result_bytes + 4096, output, &|| remaining().map(|_| ()))
 }
 
 #[derive(Serialize)]

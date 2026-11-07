@@ -78,7 +78,7 @@ fn independent_phase_metadata_preserves_the_original_hierarchy_receipt() {
             let physical_discovery = chunks.map(|_| &discovery);
             let mut bytes = Vec::new();
             publish_hierarchy_cohorts(&provenance, &document, physical_discovery, &hierarchy,
-                chunks, schedule, 4096, &mut bytes).unwrap();
+                chunks, schedule, 4096, &mut bytes, &|| Ok(())).unwrap();
             let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             let ledger = value.as_object_mut().unwrap().remove("hierarchy_cohort_schedule").unwrap();
             assert_eq!(ledger["execution"], "within_level_constrained_hierarchy_cohorts");
@@ -94,11 +94,14 @@ fn independent_phase_metadata_preserves_the_original_hierarchy_receipt() {
             assert_eq!(value, serial);
             let mut refused = Vec::new();
             assert_eq!(publish_hierarchy_cohorts(&provenance, &document, physical_discovery, &hierarchy,
-                chunks, schedule, 1, &mut refused), Err(CandidateError::Output));
+                chunks, schedule, 1, &mut refused, &|| Ok(())), Err(CandidateError::Output));
             assert!(refused.is_empty());
             assert_eq!(publish_hierarchy_cohorts(&provenance, &document, physical_discovery, &hierarchy,
                 chunks, Int4HierarchyCohortSchedule { discovery_cohorts: !schedule.discovery_cohorts, ..schedule },
-                4096, &mut refused), Err(CandidateError::Execution));
+                4096, &mut refused, &|| Ok(())), Err(CandidateError::Execution));
+            assert!(refused.is_empty());
+            assert_eq!(publish_hierarchy_cohorts(&provenance, &document, physical_discovery, &hierarchy,
+                chunks, schedule, 4096, &mut refused, &|| Err(CandidateError::Timeout)), Err(CandidateError::Timeout));
             assert!(refused.is_empty());
         }
     }

@@ -39,7 +39,8 @@ pub(super) fn execute(command: &RedactCommand, common: &CandidateArgs, limits: L
         quant_recipe: &facts.recipe_id, output: &result };
     // Only complete edited text and opt-in coordinates escape. The existing
     // result guard and caller Session survive canonical staging, write and flush.
-    publish(&response, command.host.max_result_bytes + 4096, output)
+    publish_checked(&response, command.host.max_result_bytes + 4096, output,
+        &|| session.remaining().map(|_| ()))
 }
 fn fits(work: Int8Work, ceiling: Int8Work) -> bool {
     work.forward_positions <= ceiling.forward_positions && work.projected_logits <= ceiling.projected_logits

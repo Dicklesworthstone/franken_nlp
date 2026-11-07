@@ -156,6 +156,93 @@ fn delivery_and_flush_failures_are_both_failures() {
     assert_eq!(output.0, b"1\n");
 }
 
+#[test]
+fn checked_publication_preserves_refusals_before_serialization_or_io() {
+    struct NoSerialization;
+    impl Serialize for NoSerialization {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            panic!("expired publication serialized a result")
+        }
+    }
+    struct NoIo;
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("refused publication wrote output") }
+        fn flush(&mut self) -> io::Result<()> { panic!("refused publication flushed output") }
+    }
+    for refusal in [CandidateError::Timeout, CandidateError::Execution] {
+        assert_eq!(publish_checked(&NoSerialization, 128, &mut NoIo, &|| Err(refusal)), Err(refusal));
+    }
+}
+
+#[test]
+fn serialization_that_exhausts_the_deadline_publishes_no_bytes() {
+    use std::cell::Cell;
+    struct Expires<'a>(&'a Cell<bool>);
+    impl Serialize for Expires<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            self.0.set(true);
+            serializer.serialize_str("complete private output")
+        }
+    }
+    let expired = Cell::new(false);
+    let check = || if expired.get() { Err(CandidateError::Timeout) } else { Ok(()) };
+    let mut output = Vec::new();
+    assert_eq!(publish_checked(&Expires(&expired), 128, &mut output, &check), Err(CandidateError::Timeout));
+    assert!(expired.get());
+    assert!(output.is_empty());
+}
+
+#[test]
+fn deadline_exhausted_during_write_or_flush_cannot_return_success() {
+    use std::cell::Cell;
+    struct ExpiringOutput<'a> {
+        expired: &'a Cell<bool>,
+        expire_on_write: bool,
+        bytes: Vec<u8>,
+        flushed: bool,
+    }
+    impl Write for ExpiringOutput<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            if self.expire_on_write { self.expired.set(true); }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushed = true;
+            if !self.expire_on_write { self.expired.set(true); }
+            Ok(())
+        }
+    }
+    for expire_on_write in [true, false] {
+        let expired = Cell::new(false);
+        let check = || if expired.get() { Err(CandidateError::Timeout) } else { Ok(()) };
+        let mut output = ExpiringOutput { expired: &expired, expire_on_write,
+            bytes: Vec::new(), flushed: false };
+        assert_eq!(publish_checked(&"complete", 128, &mut output, &check), Err(CandidateError::Timeout));
+        // Cooperative IO cannot retract already delivered bytes. Only the
+        // command's non-success completion tells the caller not to accept them.
+        assert_eq!(output.bytes, b"\"complete\"\n");
+        assert!(output.flushed);
+        assert!(!CandidateError::Timeout.message().contains("no result published"));
+    }
+}
+
+#[test]
+fn checked_publication_preserves_exact_encoding_caps_and_transport_failures() {
+    let value = serde_json::json!({"content":"A\n\u{1b}[31mB"});
+    let mut expected = Vec::new(); publish(&value, 128, &mut expected).unwrap();
+    let mut actual = Vec::new();
+    publish_checked(&value, expected.len(), &mut actual, &|| Ok(())).unwrap();
+    assert_eq!(actual, expected);
+    let mut refused = Vec::new();
+    assert_eq!(publish_checked(&value, expected.len() - 1, &mut refused, &|| Ok(())), Err(CandidateError::Output));
+    assert!(refused.is_empty());
+    assert_eq!(publish_checked(&value, expected.len(), &mut RefuseWrite, &|| Ok(())), Err(CandidateError::Output));
+    let mut failed_flush = RefuseFlush(Vec::new());
+    assert_eq!(publish_checked(&value, expected.len(), &mut failed_flush, &|| Ok(())), Err(CandidateError::Output));
+    assert_eq!(failed_flush.0, expected);
+}
+
 #[cfg(not(feature = "asupersync-runtime"))]
 #[test]
 fn unavailable_build_never_reads_input_or_produces_output() {

@@ -346,7 +346,7 @@ fn complete_publication_keeps_provenance_and_original_coordinates_and_refuses_ov
     }
     let physical = Int4SourceMapCohortStats { cohorts: 1, chunks: 2, ..Default::default() };
     let mut grouped_bytes = Vec::new();
-    publish_cohort(&provenance, &output, &physical, 4, 4096, &mut grouped_bytes).unwrap();
+    publish_cohort(&provenance, &output, &physical, 4, 4096, &mut grouped_bytes, &|| Ok(())).unwrap();
     let mut grouped_value: serde_json::Value = serde_json::from_slice(&grouped_bytes).unwrap();
     assert_eq!(grouped_value["cohort_schedule"]["physical"]["chunks"], 2);
     assert_eq!(grouped_value["cohort_schedule"]["declared_max_chunks"], 4);
@@ -355,7 +355,7 @@ fn complete_publication_keeps_provenance_and_original_coordinates_and_refuses_ov
     let mut refused = Vec::new();
     assert_eq!(publish(&response, 1, &mut refused), Err(CandidateError::Output));
     assert!(refused.is_empty());
-    assert_eq!(publish_cohort(&provenance, &output, &physical, 4, 1, &mut refused), Err(CandidateError::Output));
+    assert_eq!(publish_cohort(&provenance, &output, &physical, 4, 1, &mut refused, &|| Ok(())), Err(CandidateError::Output));
     assert!(refused.is_empty());
     struct FlushFailure(Vec<u8>);
     impl Write for FlushFailure {
@@ -366,8 +366,26 @@ fn complete_publication_keeps_provenance_and_original_coordinates_and_refuses_ov
     assert_eq!(publish(&response, 4096, &mut failed), Err(CandidateError::Output));
     assert!(!failed.0.is_empty(), "transport failure is not a successful task response");
     let mut failed = FlushFailure(Vec::new());
-    assert_eq!(publish_cohort(&provenance, &output, &physical, 4, 4096, &mut failed), Err(CandidateError::Output));
+    assert_eq!(publish_cohort(&provenance, &output, &physical, 4, 4096, &mut failed, &|| Ok(())), Err(CandidateError::Output));
     assert!(!failed.0.is_empty());
+
+    struct Expires<'a>(&'a std::cell::Cell<bool>);
+    impl Serialize for Expires<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            self.0.set(true);
+            serializer.serialize_str("complete private source result")
+        }
+    }
+    let expired = std::cell::Cell::new(false);
+    let check = || if expired.get() { Err(CandidateError::Timeout) } else { Ok(()) };
+    let mut refused = Vec::new();
+    assert_eq!(publish_cohort(&provenance, &Expires(&expired), &physical, 4, 4096,
+        &mut refused, &check), Err(CandidateError::Timeout));
+    assert!(refused.is_empty());
+    expired.set(false);
+    assert_eq!(publish_discovery_cohort(&provenance, &Expires(&expired), &physical, 4, 4096,
+        &mut refused, &check), Err(CandidateError::Timeout));
+    assert!(refused.is_empty());
 }
 
 fn question_fixture(width: usize) -> (SourceTaskPlanner, Int4SourceMapConfig<SourceQuestion>, MapLimits) {
@@ -531,7 +549,7 @@ fn document_qa_publication_exports_neither_private_question_nor_question_path() 
     }
     let physical = Int4SourceMapCohortStats { cohorts: 1, chunks: 2, ..Default::default() };
     let mut cohort_bytes = Vec::new();
-    publish_cohort(&provenance, &output, &physical, 4, 4096, &mut cohort_bytes).unwrap();
+    publish_cohort(&provenance, &output, &physical, 4, 4096, &mut cohort_bytes, &|| Ok(())).unwrap();
     let mut cohort: serde_json::Value = serde_json::from_slice(&cohort_bytes).unwrap();
     assert_eq!(cohort["cohort_schedule"]["physical"]["chunks"], 2);
     assert_eq!(cohort["cohort_schedule"]["declared_max_chunks"], 4);
@@ -774,7 +792,7 @@ fn discovery_cohort_publication_preserves_all_synthesis_protocols_and_semantic_r
         publish(&Response { provenance: &provenance, output: &output }, 4096, &mut serial_bytes).unwrap();
         let serial: serde_json::Value = serde_json::from_slice(&serial_bytes).unwrap();
         let mut bytes = Vec::new();
-        publish_discovery_cohort(&provenance, &output, &physical, 4, 4096, &mut bytes).unwrap();
+        publish_discovery_cohort(&provenance, &output, &physical, 4, 4096, &mut bytes, &|| Ok(())).unwrap();
         let mut grouped: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let schedule = grouped.as_object_mut().unwrap().remove("cohort_schedule").unwrap();
         assert_eq!(schedule["execution"], "cross_chunk_constrained_discovery_cohorts");
@@ -783,7 +801,7 @@ fn discovery_cohort_publication_preserves_all_synthesis_protocols_and_semantic_r
         assert_eq!(schedule["physical"]["cohorts"], 1);
         assert_eq!(grouped, serial, "discovery scheduling cannot rewrite the semantic receipt or private inputs");
         let mut refused = Vec::new();
-        assert_eq!(publish_discovery_cohort(&provenance, &output, &physical, 4, 1, &mut refused),
+        assert_eq!(publish_discovery_cohort(&provenance, &output, &physical, 4, 1, &mut refused, &|| Ok(())),
             Err(CandidateError::Output));
         assert!(refused.is_empty());
     }

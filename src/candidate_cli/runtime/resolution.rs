@@ -95,7 +95,7 @@ fn deliver<T: Serialize>(session: &Session, facts: &ArtifactIdentity, result: &T
         evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,
         source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
         quant_recipe: &facts.recipe_id, output: result };
-    publish(&response, cap, output)
+    publish_checked(&response, cap, output, &|| session.remaining().map(|_| ()))
 }
 
 #[cfg(test)] mod tests;

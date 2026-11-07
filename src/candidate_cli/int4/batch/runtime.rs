@@ -82,7 +82,7 @@ pub(super) fn execute(args: Int4Args, batch: BatchArgs, limits: BatchLimits,
         group_width: args.group_width, integer_kernel: limits.common.kernel.kind().id(),
         items: &items, output: result.result(), snapshot,
     };
-    publish(&response, limits.publication_bytes, output)
+    publish_checked(&response, limits.publication_bytes, output, &|| remaining().map(|_| ()))
 }
 
 pub(super) fn stage_run(remaining: Duration, checkpoints: u64) -> RunLimits {

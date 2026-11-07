@@ -89,7 +89,8 @@ pub(in crate::candidate_cli) fn execute(command: RedactCommand, common: Candidat
         quant_recipe: &facts.recipe_id, output: &result };
     // Native result contains only final edited text and opted-in coordinates.
     // Keep both guards alive through the complete write AND flush.
-    publish(&response, command.host.max_result_bytes + 4096, output)
+    publish_checked(&response, command.host.max_result_bytes + 4096, output,
+        &|| session.remaining().map(|_| ()))
 }
 
 #[cfg(test)] mod tests;

@@ -47,7 +47,7 @@ pub(super) fn execute(task: Task, args: CandidateArgs, limits: Limits,
         output: &result };
     // Keep both the hosted output charge and preparation/staging charge alive
     // until serialization, external delivery and flush have actually finished.
-    publish(&response, limits.result_bytes + 4096, output)
+    publish_checked(&response, limits.result_bytes + 4096, output, &|| session.remaining().map(|_| ()))
 }
 
 /// Buffered and corpus requests use one explicit strategy choice. No retry or

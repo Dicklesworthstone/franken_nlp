@@ -145,7 +145,8 @@ pub(super) fn execute(args: Int4Args, command: SemanticArgs, _admitted: Int4Limi
     };
     // The guarded combined result stays borrowed through serialization and
     // delivery. No per-field prefix or error-shaped success is published.
-    publish(&response, common.result_bytes.checked_add(4096).ok_or(CandidateError::Memory)?, output)
+    publish_checked(&response, common.result_bytes.checked_add(4096).ok_or(CandidateError::Memory)?,
+        output, &|| remaining().map(|_| ()))
 }
 
 fn read_local(path: &std::path::Path, cap: usize) -> Result<String, CandidateError> {

@@ -98,7 +98,7 @@ fn deliver<T: Serialize>(session: &Session, facts: &ArtifactIdentity, guarded: &
         quant_recipe: &facts.recipe_id, output: guarded };
     // guarded is the caller's HostedOutput; it and Session are still alive
     // through serialization, external write and flush. No partial head output.
-    publish(&response, cap, output)
+    publish_checked(&response, cap, output, &|| session.remaining().map(|_| ()))
 }
 
 #[cfg(test)] mod tests;

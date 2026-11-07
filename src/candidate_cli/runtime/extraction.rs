@@ -80,7 +80,8 @@ pub(in crate::candidate_cli) fn execute(command: ExtractCommand, args: Candidate
     // The raw extracted JSON remains a STRING in the typed result. Converting
     // it through Value here would destroy the exact decimal/scalar contract.
     // Output and preparation guards remain live until external flush completes.
-    publish(&response, command.host.max_result_bytes + 4096, output)
+    publish_checked(&response, command.host.max_result_bytes + 4096, output,
+        &|| session.remaining().map(|_| ()))
 }
 
 #[cfg(test)] mod tests;

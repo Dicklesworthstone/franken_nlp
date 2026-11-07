@@ -117,7 +117,7 @@ fn deliver<T: Serialize>(session: &Session, facts: &ArtifactIdentity, result: &T
         quant_recipe: &facts.recipe_id, output: result };
     // Both host output ownership and the CLI's aggregate staging reservation
     // remain live through complete serialization, external write and flush.
-    publish(&response, cap, output)
+    publish_checked(&response, cap, output, &|| session.remaining().map(|_| ()))
 }
 
 fn check_completed(expected: &Preflight, result: &Int8SourceMapRun) -> Result<(), CandidateError> {

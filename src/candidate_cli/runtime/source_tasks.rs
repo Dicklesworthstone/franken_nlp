@@ -200,7 +200,8 @@ pub(in crate::candidate_cli) fn execute(command: SourceCommand, args: CandidateA
         quant_recipe: &facts.recipe_id, output: &result };
     // No result prefix is written until native/source finalization completes.
     // Both the output guard and preparation owner survive write AND flush.
-    publish(&response, command.args.host.max_result_bytes + 4096, output)
+    publish_checked(&response, command.args.host.max_result_bytes + 4096, output,
+        &|| session.remaining().map(|_| ()))
 }
 
 #[cfg(test)]

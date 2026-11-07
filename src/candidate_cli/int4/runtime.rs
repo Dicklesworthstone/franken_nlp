@@ -212,9 +212,9 @@ pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
         crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback => None,
         _ => Some(&encoding),
     };
-    publish(&input_encoding::Response {
+    publish_checked(&input_encoding::Response {
         response: &cohort::Response { response: &response, cohort: result.cohort() }, input_encoding,
-    }, limits.result_bytes + 4096, output)
+    }, limits.result_bytes + 4096, output, &|| remaining().map(|_| ()))
 }
 
 fn prepare(request: Input, model: &ResidentInt4, args: &Int4Args, limits: Int4Limits,

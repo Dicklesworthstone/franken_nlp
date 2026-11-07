@@ -362,12 +362,25 @@ fn parse_messages(input: &str, cap: usize) -> Result<Vec<ChatMessage>, Candidate
 /// retains the hosted output guard through write AND flush. A broken pipe can
 /// still truncate transport bytes; it is always an error, never task success.
 fn publish<T: Serialize>(value: &T, cap: usize, output: &mut impl Write) -> Result<(), CandidateError> {
+    publish_checked(value, cap, output, &|| Ok(()))
+}
+
+/// Publish a complete response only while the caller's original run control
+/// remains valid. Check before staging, after serialization but before the
+/// first external byte, and after write/flush before reporting success.
+/// Blocking IO is cooperative: an expired write cannot retract bytes already
+/// delivered, but it must never return successful command completion.
+fn publish_checked<T: Serialize>(value: &T, cap: usize, output: &mut impl Write,
+    check: &impl Fn() -> Result<(), CandidateError>) -> Result<(), CandidateError> {
+    check()?;
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(cap).map_err(|_| CandidateError::Memory)?;
     let mut stage = BoundedOutput { bytes, cap };
     serde_json::to_writer(&mut stage, value).map_err(|_| CandidateError::Output)?;
     stage.write_all(b"\n").map_err(|_| CandidateError::Output)?;
-    output.write_all(&stage.bytes).and_then(|()| output.flush()).map_err(|_| CandidateError::Output)
+    check()?;
+    output.write_all(&stage.bytes).and_then(|()| output.flush()).map_err(|_| CandidateError::Output)?;
+    check()
 }
 struct BoundedOutput { bytes: Vec<u8>, cap: usize }
 impl Write for BoundedOutput {
@@ -402,7 +415,7 @@ impl CandidateError {
             Self::Model => "explicit local current-candidate model loading refused",
             Self::Identity => "candidate model identity changed or is incompatible",
             Self::Planning => "prompt, schema or task contract refused; no result published",
-            Self::Timeout => "cooperative request deadline expired; no result published",
+            Self::Timeout => "cooperative request deadline expired; successful completion not confirmed",
             Self::Execution => "native execution failed or was cancelled; no result published",
             Self::Output => "completed result could not be delivered",
             Self::Batch => "corpus stopped or contains failed records; earlier completed frames may exist",

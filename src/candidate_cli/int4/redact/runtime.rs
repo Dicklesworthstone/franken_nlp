@@ -179,7 +179,8 @@ pub(super) fn execute(args: Int4Args, command: RedactArgs, _admitted: RedactLimi
     };
     // Both guards survive staging, writing AND flushing. A rejected native,
     // editing or verification result never reaches the writer.
-    publish(&Response { provenance: &provenance, output: run }, common.result_bytes + 4096, output)
+    publish_checked(&Response { provenance: &provenance, output: run }, common.result_bytes + 4096,
+        output, &|| remaining().map(|_| ()))
 }
 
 #[derive(Serialize)]

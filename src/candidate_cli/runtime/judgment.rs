@@ -57,7 +57,8 @@ pub(in crate::candidate_cli) fn execute(command: JudgeCommand, args: CandidateAr
         quant_recipe: &facts.recipe_id, output: &result };
     // A failure in either order, any criterion or any evidence head has no
     // output. Hosted result ownership remains attached through write AND flush.
-    publish(&response, command.args.max_result_bytes + 4096, output)
+    publish_checked(&response, command.args.max_result_bytes + 4096, output,
+        &|| session.remaining().map(|_| ()))
 }
 
 #[cfg(test)] mod tests;

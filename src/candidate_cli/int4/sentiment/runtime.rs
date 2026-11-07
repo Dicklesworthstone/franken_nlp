@@ -131,7 +131,8 @@ pub(super) fn execute(args: Int4Args, command: SentimentArgs, _admitted: Int4Lim
     // Retain the host's complete output and the CLI preparation guards through
     // bounded staging, writing and flushing. Failed heads emit no prefix.
     let response = Response { provenance: &provenance, output: result.result() };
-    publish(&cohort::Response { response: &response, cohort: result.summary() }, limits.result_bytes + 4096, output)
+    publish_checked(&cohort::Response { response: &response, cohort: result.summary() },
+        limits.result_bytes + 4096, output, &|| remaining().map(|_| ()))
 }
 
 #[derive(Serialize)]
