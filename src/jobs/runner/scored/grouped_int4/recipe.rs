@@ -126,6 +126,20 @@ impl Int4ScoredJobRecipe {
         Self::finish("sentiment-v1", INT4_SENTIMENT_EXECUTION, SENTIMENT_PROMPT_VERSION,
             width, ceiling, native, Settings::Sentiment { planning: limits.into(), defaults })
     }
+    /// Preserve the transferred allocation for the durable host's memory
+    /// quote while committing only the bounded logical settings to the recipe.
+    pub(super) fn sentiment_retaining_defaults(width: usize, ceiling: TaskBudget,
+        limits: SentimentLimits, defaults: SentimentBatchArgs, native: Int4ScoredBatchLimits)
+        -> Result<(Self, SentimentBatchArgs), BatchFault> {
+        check_budget(defaults.budget, ceiling)?;
+        if defaults.axes.is_empty() || defaults.axes.len() > SentimentAxis::ALL.len()
+            || defaults.axes.iter().enumerate().any(|(i, axis)| defaults.axes[..i].contains(axis)) {
+            return Err(BatchCode::InvalidLimits.into());
+        }
+        bounded_json(&defaults, RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
+        let recipe = Self::sentiment(width, ceiling, limits, Some(defaults.clone()), native)?;
+        Ok((recipe, defaults))
+    }
     pub(super) fn judge(width: usize, ceiling: TaskBudget, limits: JudgeLimits,
         defaults: Option<JudgeBatchArgs>, native: Int4ScoredBatchLimits) -> Result<Self, BatchFault> {
         check_scoring(limits.per_head)?;

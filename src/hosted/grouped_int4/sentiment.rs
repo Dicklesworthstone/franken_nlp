@@ -9,6 +9,9 @@ mod long;
 pub use long::Int4SentimentMapHostConfig;
 mod corpus;
 pub use corpus::int4_sentiment_document_corpus_requirements;
+#[cfg(all(feature = "metadata-store", target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod job;
 
 /// Complete-bundle work and input ownership. Before transfer, callers admit
 /// the compiled plan's storage. The host retains its own explicit preparation

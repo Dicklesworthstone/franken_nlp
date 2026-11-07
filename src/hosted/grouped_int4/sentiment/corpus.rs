@@ -45,7 +45,7 @@ fn map_memory(limits: CorpusLimits, max_axes: usize, cohort_chunks: Option<usize
         preparation_reserve_bytes: limits.preparation_reserve_bytes,
         allocator_reserve_bytes: limits.native.allocator_reserve_bytes, max_axes, cohort_chunks }
 }
-fn document_output_bytes(mapping: Int4SentimentMapLimits, cohort_chunks: Option<usize>) -> Result<u64, HostedError> {
+pub(super) fn document_output_bytes(mapping: Int4SentimentMapLimits, cohort_chunks: Option<usize>) -> Result<u64, HostedError> {
     mapping.max_result_bytes.checked_add(if cohort_chunks.is_some() { 4096 } else { 0 })
         .ok_or(HostedError::Limits("sentiment document output arithmetic"))
 }
@@ -134,12 +134,19 @@ impl NlpEngine {
 }
 
 #[derive(Clone, Copy)]
-struct DocumentCapacity {
-    context: usize, kv_bytes: u64, mapping: Int4SentimentMapLimits,
-    max_axes: usize, cohort_chunks: Option<usize>, max_result_bytes: u64,
+pub(super) struct DocumentCapacity {
+    pub(super) context: usize,
+    pub(super) kv_bytes: u64,
+    pub(super) mapping: Int4SentimentMapLimits,
+    pub(super) max_axes: usize,
+    pub(super) cohort_chunks: Option<usize>,
+    pub(super) max_result_bytes: u64,
 }
-struct DocumentAdmission<'a> {
-    lease: &'a EngineLease, model: &'a Int4ModelIdentity, capacity: DocumentCapacity, output_bytes: u64,
+pub(super) struct DocumentAdmission<'a> {
+    pub(super) lease: &'a EngineLease,
+    pub(super) model: &'a Int4ModelIdentity,
+    pub(super) capacity: DocumentCapacity,
+    pub(super) output_bytes: u64,
 }
 impl Int4SentimentDocumentBatchAdmission for DocumentAdmission<'_> {
     type Guard = Pending;

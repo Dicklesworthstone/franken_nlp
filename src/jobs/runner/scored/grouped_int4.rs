@@ -18,6 +18,8 @@ mod recipe;
 pub use recipe::Int4ScoredJobRecipe;
 /// Complete-document classification with one durable debit and result per source.
 pub mod document;
+/// Complete-document sentiment with fixed dimensions and durable whole-source results.
+pub mod sentiment_document;
 
 /// Closed to the existing model-bound classification, sentiment and judge
 /// compilers. Neither a caller-supplied recipe nor an alternate scorer can
