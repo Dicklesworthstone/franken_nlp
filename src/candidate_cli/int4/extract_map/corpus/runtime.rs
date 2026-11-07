@@ -110,6 +110,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "extract",
         source_mode: "complete_document", chunk_schedule: chunk_schedule(limits.document.cohort_chunks),
         cohort_chunks: limits.document.cohort_chunks,
+        root_array_union: limits.document.mapping.root_array_union.map(array_union::ArrayUnionSelection::new),
         model_id: "Nanbeige4.2-3B", source_revision: &identity.source_revision,
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
@@ -158,6 +159,8 @@ struct Provenance<'a> {
     task: &'static str, source_mode: &'static str, chunk_schedule: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     cohort_chunks: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_array_union: Option<array_union::ArrayUnionSelection>,
     model_id: &'static str, source_revision: &'a str, source_root_sha256: &'a str, model_content_sha256: &'a str,
     candidate_format: &'a str, quant_recipe: &'a str, group_width: usize, integer_kernel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]

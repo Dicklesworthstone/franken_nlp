@@ -42,8 +42,8 @@ impl Int4DocumentExtractionJobPlanner {
 impl NlpEngine {
     /// Start or resume fixed-schema extraction over the complete original
     /// population. Every document commits all independently validated chunk
-    /// values and source locations as one result, with no partial chunk commit
-    /// or invented global JSON merge. A required field that cannot be produced
+    /// values and source locations as one result, including an optional exact
+    /// root-array union authenticated by the job recipe. A required field that cannot be produced
     /// under its schema/source constraint remains a typed no-result failure.
     ///
     /// The immutable factory and complete input population authenticate before

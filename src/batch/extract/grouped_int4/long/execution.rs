@@ -55,8 +55,9 @@ impl PreparedInt4ExtractionMap<'_> {
         let mapped = mapped.map_err(Int4ExtractionMapError::Reduction)?;
         step(&mut **control.borrow_mut())?;
         if task.next != self.expected.chunks || !task.driver.clean() { return Err(ExtractError::InvalidResult.into()); }
+        let root_array_union = self.reduce_root_array(&mapped, &mut **control.borrow_mut())?;
         let run = complete(self.expected, self.limits.verification, task.remaining,
-            task.work, task.masks, mapped, self.max_result_bytes())?;
+            task.work, task.masks, mapped, self.max_result_bytes(), root_array_union)?;
         step(&mut **control.borrow_mut())?;
         Ok(run)
     }
@@ -137,17 +138,19 @@ pub(super) fn reduce<C: DecodeStepControl>(input: ReduceInput<'_, ExtractionMapV
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn complete(expected: Int4ExtractionMapPreflight, total: GroundingBudget, remaining: GroundingBudget,
-    work: Int4Work, masks: u64, mapped: MapReduceResult<ExtractionMapValue>, cap: u64)
+    work: Int4Work, masks: u64, mapped: MapReduceResult<ExtractionMapValue>, cap: u64,
+    root_array_union: Option<RootArrayUnionResult>)
     -> Result<Int4ExtractionMapRun, Int4ExtractionMapError> {
     let run = Int4ExtractionMapRun { schema_version: 1, execution: INT4_EXTRACTION_MAP_EXECUTION,
         numerics_profile: STRICT_INT4_PROFILE, group_width: expected.group_width,
-        semantics: SEMANTICS, grounding: expected.grounding,
+        semantics: if root_array_union.is_some() { ROOT_ARRAY_UNION_POLICY } else { SEMANTICS }, grounding: expected.grounding,
         planned_model_work: expected.work, model_work: work, reserved_mask_node_visits: expected.masks,
         mask_node_visit_charge: masks, verification_used: ExtractionMapVerification {
             fields: total.max_fields.checked_sub(remaining.max_fields).ok_or(Int4ExtractionMapError::WorkLimit)?,
             matches: total.max_matches.checked_sub(remaining.max_matches).ok_or(Int4ExtractionMapError::WorkLimit)?,
             scan_steps: total.max_scan_steps.checked_sub(remaining.max_scan_steps).ok_or(Int4ExtractionMapError::WorkLimit)? },
-        untrusted_fields: ["mapped.root.value"], mapped };
+        untrusted_fields: if root_array_union.is_some() { vec!["mapped.root.value", "root_array_union"] }
+            else { vec!["mapped.root.value"] }, mapped, root_array_union };
     expected.verify_completed(&run)?;
     check_size(&run, cap)?;
     Ok(run)

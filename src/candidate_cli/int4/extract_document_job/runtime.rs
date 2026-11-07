@@ -5,6 +5,7 @@ use std::{sync::Arc, time::{Duration, Instant}};
 use crate::{
     NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
     candidate_cli::{extract::SCHEMA_BYTES,
+        int4::extract_map::array_union::ArrayUnionSelection,
         runtime::owned_jobs::{host_failure, job_failure, open_mode, progress_report}},
     hosted::{CancellationToken, NativeLimits, RunLimits, corpus::jobs::{JobHostLimits, SourceJobRequest}},
     jobs::{JobSecret, runner::extract::grouped_int4::document::Int4DocumentExtractionJobPlanner},
@@ -90,12 +91,14 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
     let response = Response {
         protocol: "fnlp-candidate-int4-extract-document-job-v1", schema_version: 1,
         scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "extract",
-        durable_unit: "complete_original_document", extraction_mode: "independent_schema_chunk_values",
+        durable_unit: "complete_original_document", extraction_mode: if map.mapping.root_array_union.is_some() {
+            "root_array_exact_union" } else { "independent_schema_chunk_values" },
         model_id: "Nanbeige4.2-3B", source_revision: &identity.source_revision,
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(),
         snapshot, chunk_schedule: map.cohort_chunks.map(ChunkSchedule::new), output: &report,
+        root_array_union: map.mapping.root_array_union.map(ArrayUnionSelection::new),
     };
     // A failed metadata write can follow durable commits. No original text,
     // schema, extracted values, coordinates, private paths or key is emitted.
@@ -154,6 +157,8 @@ struct Response<'a, T: Serialize> {
     snapshot: Option<SnapshotRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     chunk_schedule: Option<ChunkSchedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_array_union: Option<ArrayUnionSelection>,
     output: &'a T,
 }
 

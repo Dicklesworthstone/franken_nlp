@@ -10,7 +10,8 @@ use crate::{
             Int4ExtractionMapCohortRequirement}},
     native_engine::{constrained_int4, int4::PackedInt4Kernel,
         strict_int4::{Int4MemoryRequirement, Int4ModelWeights}},
-    tasks::mapreduce::{ChunkLimits, ExecutionLimits, CHUNK_PROFILE},
+    tasks::{mapreduce::{ChunkLimits, ExecutionLimits, CHUNK_PROFILE},
+        extract::array_union::{RootArrayUnionLimits, ROOT_ARRAY_UNION_POLICY}},
     validation::grounded_fields::GroundingBudget,
 };
 use std::sync::Arc;
@@ -22,6 +23,14 @@ pub use execution::{Int4ExtractionDocumentAdmission, Int4ExtractionDocumentBatch
     Int4DocumentExtractionJobProcessor};
 
 const CHUNK_COHORT_SCHEDULE: &str = "native-document-chunk-cohorts-v1";
+
+/// The reducer changes result semantics, so both its fixed version and every
+/// bounded allowance belong in the authenticated private recipe.
+#[derive(Serialize)]
+struct RootArrayUnionRecipe {
+    policy: &'static str,
+    limits: RootArrayUnionLimits,
+}
 
 /// Private immutable settings projected into JobRunner's keyed commitment.
 /// Exact schema bytes stay in the sealed extraction defaults, including number
@@ -47,13 +56,15 @@ pub struct Int4DocumentExtractionJobRecipe {
     /// Absent preserves the exact original serial recipe commitment.
     #[serde(skip_serializing_if = "Option::is_none")]
     chunk_cohorts: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_array_union: Option<RootArrayUnionRecipe>,
 }
 impl Int4DocumentExtractionJobRecipe {
     fn new(extraction: Int4ExtractionJobRecipe, document: Int4ExtractionMapLimits,
         max_lifetime_verification: GroundingBudget, max_attempts: u64) -> Result<Self, BatchFault> {
         // Exhaustive projections prevent newly introduced map/mask settings
         // from silently escaping the private resume commitment.
-        let Int4ExtractionMapLimits { mapping, verification } = document;
+        let Int4ExtractionMapLimits { mapping, verification, root_array_union } = document;
         let Int4ExtractionMappingLimits { chunks, reduction, max_model_work, mask_limits,
             mask_visits_per_chunk, max_mask_visits } = mapping;
         let MaskWorkLimits { max_trie_node_visits, checkpoint_interval_nodes } = mask_limits;
@@ -63,7 +74,9 @@ impl Int4DocumentExtractionJobRecipe {
             extraction, chunks, reduction, per_document_model_work: max_model_work,
             max_trie_node_visits, checkpoint_interval_nodes, mask_visits_per_chunk,
             max_mask_visits_per_document: max_mask_visits, verification,
-            max_lifetime_verification, max_attempts, chunk_cohorts: None };
+            max_lifetime_verification, max_attempts, chunk_cohorts: None,
+            root_array_union: root_array_union.map(|limits| RootArrayUnionRecipe {
+                policy: ROOT_ARRAY_UNION_POLICY, limits }) };
         bounded_json(&recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
         Ok(recipe)
     }
@@ -96,6 +109,17 @@ impl Int4DocumentExtractionJobPlanner {
         let width = extraction.recipe.group_width;
         validate_limits(width, extraction.task_ceiling(), extraction.recipe.defaults.budget, document, limits)?;
         verify_lifetime(document.verification, max_lifetime_verification, limits.max_attempts)?;
+        if let Some(union) = document.root_array_union {
+            let CompilerRecipe { max_schema_bytes, max_string_bytes, max_array_items, max_output_bytes,
+                max_states, max_transitions, max_mask_bytes } = &extraction.recipe.compiler;
+            let declaration = crate::grammar::runtime::JsonValidationSchema::compile(
+                &extraction.recipe.defaults.schema, CompileLimits {
+                    max_schema_bytes: *max_schema_bytes, max_string_bytes: *max_string_bytes,
+                    max_array_items: *max_array_items, max_output_bytes: *max_output_bytes,
+                    max_states: *max_states, max_transitions: *max_transitions, max_mask_bytes: *max_mask_bytes,
+                }).map_err(|_| BatchCode::Planning)?;
+            union.validate_schema(declaration.root()).map_err(|_| BatchCode::Planning)?;
+        }
         // The compiler's immutable extraction policy and the document recipe
         // must agree even for internal planning fixtures.
         let expected = native_limits(document, limits);
@@ -252,6 +276,7 @@ fn validate_limits(width: usize, ceiling: TaskBudget, request: TaskBudget,
     ceiling.validate().map_err(|_| BatchCode::InvalidLimits)?;
     request.validate().map_err(|_| BatchCode::InvalidLimits)?;
     let m = document.mapping; let e = m.reduction; let v = document.verification;
+    document.root_array_workspace_bytes().map_err(|_| BatchCode::InvalidLimits)?;
     m.chunks.effective_token_limit().map_err(|_| BatchCode::InvalidLimits)?;
     let kv = Int4MemoryRequirement::for_context(m.chunks.context_tokens, width)
         .map_err(|_| BatchCode::InvalidLimits)?.kv_bytes;
@@ -285,7 +310,8 @@ fn map_failure(error: Int4ExtractionMapError) -> BatchItemFailure {
         Int4ExtractionMapError::Admission => BatchCode::Admission,
         Int4ExtractionMapError::Allocation => BatchCode::Allocation,
         Int4ExtractionMapError::Chunk(_) => BatchCode::Planning,
-        Int4ExtractionMapError::Extraction(_) | Int4ExtractionMapError::Reduction(_) => BatchCode::InvalidExecution,
+        Int4ExtractionMapError::Extraction(_) | Int4ExtractionMapError::Reduction(_)
+            | Int4ExtractionMapError::ArrayUnion(_) => BatchCode::InvalidExecution,
     })
 }
 

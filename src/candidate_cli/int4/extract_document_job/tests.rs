@@ -48,6 +48,33 @@ fn start_and_resume_use_complete_document_limits_and_an_explicit_fixed_schema() 
         assert!(admitted.map.common.minimum_memory_bytes > map.common.minimum_memory_bytes);
     }
 }
+
+#[test]
+fn start_resume_and_retained_replay_keep_exact_array_policy_and_one_extra_workspace() {
+    for (operation, retained) in [("start", false), ("resume", false), ("resume", true)] {
+        let mut flags = vec!["--cohort-chunks", "3"];
+        if retained { flags.push("--use-retained-input"); }
+        let (plain, args) = command(operation, &flags);
+        let before = plain.args.validate(&args).unwrap();
+        flags.extend(["--root-array-union", "--max-union-records", "32", "--max-union-origins", "128",
+            "--max-union-input-bytes", "1048576", "--max-union-json-bytes", "65536",
+            "--max-union-nodes", "4096", "--max-union-result-bytes", "262144"]);
+        let (union, args) = command(operation, &flags);
+        let after = union.args.validate(&args).unwrap();
+        let policy = after.mapping.root_array_union.unwrap();
+        let fixed = lifetime(&args, before);
+        let before = plain.args.lifetime_limits(&args, before, fixed).unwrap();
+        let after = union.args.lifetime_limits(&args, after, fixed).unwrap();
+        assert_eq!(after.map.mapping.root_array_union, Some(policy));
+        assert_eq!(after.map.workspace_bytes - before.map.workspace_bytes,
+            policy.requirements().unwrap().workspace_bytes);
+        assert_eq!(after.buffer_bytes, before.buffer_bytes);
+        assert_eq!(after.map.cohort, before.map.cohort);
+        assert_eq!(after.map.mapping.mapping.max_model_work, before.map.mapping.mapping.max_model_work);
+        assert_eq!(after.map.mapping.mapping.max_mask_visits, before.map.mapping.mapping.max_mask_visits);
+        assert_eq!(after.map.max_result_bytes, before.map.max_result_bytes);
+    }
+}
 #[test]
 fn pinned_snapshot_and_source_conversion_preserve_schema_and_document_work() {
     let (source, source_args) = command("resume", &["--source-membership"]);

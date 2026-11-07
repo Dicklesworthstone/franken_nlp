@@ -46,7 +46,8 @@ impl NlpEngine {
     /// Produce independently validated schema values for every source chunk.
     /// One model, native engine and control own the entire map/reduce pass.
     /// The final guarded result preserves original coordinates and independent
-    /// chunk values; it does not fabricate a merged whole-document object.
+    /// chunk values. An explicit root-array policy additionally returns exact
+    /// deduplicated records and every contributing origin after final validation.
     #[allow(clippy::too_many_arguments)]
     pub fn extract_int4_document(&self, model: &ResidentInt4, source: String,
         planner: Arc<Int4ExtractionBatchPlanner>, vocabulary: Arc<ExtractionVocabulary>,
@@ -154,6 +155,7 @@ fn validate(config: &Int4ExtractionMapConfig, identity: &ExecutionIdentity, widt
         return Err(HostedError::Limits("INT4 extraction map source, capacity or whole-document limits"));
     }
     m.chunks.effective_token_limit().map_err(|_| HostedError::Limits("INT4 extraction map chunk geometry"))?;
+    config.limits.root_array_workspace_bytes().map_err(map_error)?;
     Ok(())
 }
 fn input_bytes(source_capacity: usize, config: &Int4ExtractionMapConfig) -> Result<u64, HostedError> {
@@ -177,7 +179,8 @@ pub(super) fn document_workspace_bytes(budget: TaskBudget, limits: Int4Extractio
         .ok_or(HostedError::Limits("INT4 extraction map field arithmetic"))?;
     let spans = (v.max_matches as u64).checked_mul(std::mem::size_of::<VerifiedSourceSpan>() as u64)
         .and_then(|n| n.checked_mul(2)).ok_or(HostedError::Limits("INT4 extraction map occurrence arithmetic"))?;
-    sum(&[staged, tokens, fields, spans, reserve])
+    let union = limits.root_array_workspace_bytes().map_err(map_error)?;
+    sum(&[staged, tokens, fields, spans, reserve, union])
 }
 fn poll(control: &mut impl DecodeStepControl) -> Result<(), HostedError> {
     match control.prefill_checkpoint(0) {

@@ -78,6 +78,7 @@ fn corpus_frame_keeps_exact_chunk_json_and_reveals_only_public_outer_metadata() 
             protocol: "fnlp-candidate-int4-extract-corpus-v1", schema_version: 1,
             scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "extract",
             source_mode: "complete_document", chunk_schedule: chunk_schedule(cohort_chunks), cohort_chunks,
+            root_array_union: None,
             model_id: "Nanbeige4.2-3B", source_revision: "public-revision", source_root_sha256: "public-source",
             model_content_sha256: "public-model", candidate_format: "candidate-int4", quant_recipe: "recipe",
             group_width: 128, integer_kernel: "s_scalar_i32",

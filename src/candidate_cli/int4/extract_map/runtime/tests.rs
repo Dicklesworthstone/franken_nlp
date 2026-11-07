@@ -228,14 +228,15 @@ fn publication_preserves_independent_json_strings_and_original_coordinates() {
         evidence: "non_authoritative", model_id: "Nanbeige4.2-3B", source_revision: "fixture",
         source_root_sha256: "fixture-source", model_content_sha256: "fixture-model",
         candidate_format: INT4_SOURCE_FORMAT, quant_recipe: "fixture:group=32", group_width: 32,
-        integer_kernel: "s_scalar_i32", output: &output, snapshot: None, cohort_schedule: None };
+        integer_kernel: "s_scalar_i32", output: &output, snapshot: None, cohort_schedule: None,
+        root_array_union: None };
     let mut bytes = Vec::new(); publish(&response, 4096, &mut bytes).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["output"]["chunks"][0]["json"], exact);
     assert_eq!(value["output"]["chunks"][1]["byte_start"], 10);
     assert_eq!(value["output"]["chunks"].as_array().unwrap().len(), 2);
     assert_eq!(value["evidence"], "non_authoritative");
-    for absent in ["source_dir", "source_manifest", "schema", "snapshot_path", "prompt_digest", "cohort_schedule"] {
+    for absent in ["source_dir", "source_manifest", "schema", "snapshot_path", "prompt_digest", "cohort_schedule", "root_array_union"] {
         assert!(value.get(absent).is_none());
     }
     let mut refused = Vec::new(); assert!(publish(&response, 1, &mut refused).is_err());

@@ -35,7 +35,7 @@ fn config(grounded: bool) -> Int4ExtractionDocumentBatchConfig {
             reduction: ExecutionLimits { map_batch_chunks: 3, reduce_fan_in: 2,
                 max_value_bytes: 4 << 20, ..ExecutionLimits::default() },
             max_model_work: maximum_work(), mask_limits: MaskWorkLimits::default(),
-            mask_visits_per_chunk: 1000, max_mask_visits: 8000 }, verification },
+            mask_visits_per_chunk: 1000, max_mask_visits: 8000 }, verification, root_array_union: None },
         max_model_work: maximum_work(), max_mask_visits: 32_000,
         max_verification: GroundingBudget { max_fields: verification.max_fields * 4,
             max_matches: verification.max_matches * 4, max_scan_steps: verification.max_scan_steps * 4 },
@@ -99,6 +99,31 @@ fn all_real_unicode_chunks_keep_exact_source_schema_and_independent_identities()
         assert_eq!(one.chunk_count(), 1);
         assert!(one.planned_work().forward_positions < prepared.planned_work().forward_positions);
     }
+}
+
+#[test]
+fn union_factory_refuses_non_array_defaults_and_freezes_policy_before_document_execution() {
+    let mut selected = config(false);
+    selected.limits.root_array_union = Some(super::super::tests::union_limits());
+    assert!(build(selected).is_err());
+    let mut selected = config(false);
+    selected.request.schema = r#"{"type":"array","items":{"type":"integer"},"maxItems":8}"#.to_owned();
+    selected.limits.root_array_union = Some(super::super::tests::union_limits());
+    let factory = build(selected).unwrap();
+    let prepared = snapshot(&factory, SOURCE);
+    assert!(prepared.expected.root_array_binding.is_some());
+    let private = prepared.expected.root_array_binding.unwrap().to_hex();
+    assert!(!format!("{:?}", prepared.expected).contains(&private));
+    let plan = factory.plan(SOURCE, &mut Continue, true).unwrap();
+    factory.compare(&plan, &prepared, &mut Continue).unwrap();
+    let mut changed = config(false);
+    changed.request.schema = factory.request().schema.clone();
+    changed.limits.root_array_union = factory.document_limits().root_array_union;
+    changed.limits.root_array_union.as_mut().unwrap().max_origins += 1;
+    let other = build(changed).unwrap();
+    let other_plan = other.plan(SOURCE, &mut Continue, true).unwrap();
+    assert_ne!(other_plan.preflight_metadata(), prepared.expected);
+    assert!(other.compare(&other_plan, &prepared, &mut Continue).is_err());
 }
 
 #[test]

@@ -77,7 +77,8 @@ impl Int4ExtractionDocumentMemoryLimits {
         let fields = mul(v.max_fields as u64, std::mem::size_of::<SourceFieldEvidence>() as u64)?;
         let spans = mul(mul(v.max_matches as u64, std::mem::size_of::<VerifiedSourceSpan>() as u64)?, 2)?;
         let document_workspace_bytes = sum(&[staged, mul(tokens, 8)?, fields, spans,
-            self.reduction_reserve_bytes, cohort.map_or(0, |quote| quote.workspace_bytes)])?;
+            self.reduction_reserve_bytes, cohort.map_or(0, |quote| quote.workspace_bytes),
+            document.root_array_workspace_bytes()?])?;
         let max_output_bytes = r.max_result_bytes as u64;
         let required = Int4ExtractionDocumentMemoryRequirement { native,
             workspace_bytes: sum(&[native.rope_bytes, native.scratch_payload_bound, self.allocator_reserve_bytes])?,

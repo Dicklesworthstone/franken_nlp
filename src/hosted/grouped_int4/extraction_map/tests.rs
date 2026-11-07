@@ -33,6 +33,7 @@ pub(super) fn config() -> Int4ExtractionMapConfig {
             budget: TaskBudget { max_input_tokens: 64, max_output_tokens: 16, max_output_bytes: 4096,
                 max_grammar_states: 4096, max_kv_bytes: kv_bytes() } },
         limits: Int4ExtractionMapLimits {
+            root_array_union: None,
             mapping: Int4ExtractionMappingLimits {
                 chunks: ChunkLimits { max_input_bytes: 1024, max_chunk_bytes: 16, max_chunk_tokens: 16,
                     context_tokens: 128, reserved_tokens: 32, max_chunks: 16, ..ChunkLimits::default() },
@@ -58,6 +59,27 @@ fn task_profile_and_full_resident_capacity_are_required() {
     assert!(validate(&config(), &id, 32, 10, kv_bytes()).is_err());
     let mut id = identity(); id.backend_semantic_version = "other".to_owned();
     assert!(validate(&config(), &id, 32, 10, kv_bytes()).is_err());
+}
+
+#[test]
+fn optional_root_array_reducer_has_one_shared_additional_workspace_quote() {
+    let mut config = config();
+    let before = config.workspace_bytes(2).unwrap();
+    let policy = crate::tasks::extract::array_union::RootArrayUnionLimits {
+        max_records: 16, max_origins: 64, max_input_bytes: 65_536,
+        max_json_bytes: 1024, max_nodes: 4096, max_result_bytes: 4096,
+    };
+    config.limits.root_array_union = Some(policy);
+    let extra = policy.requirements().unwrap().workspace_bytes;
+    assert_eq!(config.workspace_bytes(2).unwrap(), before + extra);
+    let mut per_chunk = config.limits; per_chunk.root_array_union = None;
+    for chunks in [1, 16] {
+        assert_eq!(config.workspace_bytes(chunks).unwrap()
+            - document_workspace_bytes(config.request.budget, per_chunk, chunks, config.reduction_reserve_bytes).unwrap(), extra);
+    }
+    config.limits.root_array_union.as_mut().unwrap().max_result_bytes += 1;
+    assert!(config.workspace_bytes(2).is_err());
+    assert!(validate(&config, &identity(), 32, 10, kv_bytes()).is_err());
 }
 #[test]
 fn grouped_candidate_identity_cannot_be_replaced_by_a_compatible_shape() {

@@ -34,6 +34,8 @@ pub mod grounded;
 pub mod grouped_int4;
 pub mod quantized;
 pub mod semantic;
+/// Explicit exact-record union of complete root-array extraction maps.
+pub mod array_union;
 pub use grounded::{SourceDocument, SourceDocumentEncoder};
 
 /// Explicit sampler policy; this path does not accept seeded or thinking modes.

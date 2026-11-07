@@ -105,9 +105,10 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
             source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
             candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
             group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(),
-            output: document, snapshot, cohort_schedule };
-        // No parsing/re-serialization of each exact JSON string, object merge
-        // or successful-prefix publication. The result guard survives both
+            output: document, snapshot, cohort_schedule,
+            root_array_union: limits.mapping.root_array_union.map(array_union::ArrayUnionSelection::new) };
+        // Preserve every exact chunk JSON string and the optional independently
+        // validated record union. The result guard survives both
         // write and flush, including the complete cohort wrapper's statistics.
         publish(&response, limits.max_result_bytes + 4096, output)
     };
@@ -138,6 +139,8 @@ struct SourceResponse<'a, T: Serialize> {
     snapshot: Option<SnapshotRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cohort_schedule: Option<CohortSchedule<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_array_union: Option<array_union::ArrayUnionSelection>,
 }
 #[derive(Serialize)]
 struct CohortSchedule<'a> {

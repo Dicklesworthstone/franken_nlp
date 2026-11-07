@@ -21,6 +21,75 @@ impl Read for NoRead {
 }
 
 #[test]
+fn exact_array_union_is_explicit_and_prices_one_complete_reducer_for_each_schedule() {
+    let (plain, mut args) = arguments(&[]);
+    args.memory_mib = 262_144;
+    let original = plain.validate(&args).unwrap();
+    assert!(original.mapping.root_array_union.is_none());
+    for chunks in [None, Some(1), Some(3)] {
+        let (mut union, _) = arguments(&["--root-array-union"]);
+        let mut baseline = plain.clone(); baseline.cohort_chunks = chunks;
+        union.cohort_chunks = chunks;
+        let before = baseline.validate(&args).unwrap();
+        let after = union.validate(&args).unwrap();
+        let policy = after.mapping.root_array_union.unwrap();
+        assert_eq!((policy.max_records, policy.max_origins, policy.max_nodes), (4096, 16_384, 262_144));
+        assert_eq!(policy.max_input_bytes, union.mapping.max_total_value_bytes);
+        assert_eq!(policy.max_json_bytes, after.max_result_bytes);
+        assert_eq!(after.workspace_bytes - before.workspace_bytes, policy.requirements().unwrap().workspace_bytes);
+        assert!(after.common.minimum_memory_bytes > before.common.minimum_memory_bytes);
+        assert_eq!(after.common.native, before.common.native);
+        assert_eq!(after.cohort, before.cohort);
+        assert_eq!(after.mapping.mapping.max_model_work, before.mapping.mapping.max_model_work);
+        assert_eq!(after.mapping.mapping.max_mask_visits, before.mapping.mapping.max_mask_visits);
+        assert_eq!(after.mapping.verification, before.mapping.verification);
+        assert_eq!(after.max_result_bytes, before.max_result_bytes);
+        assert_eq!(union.extraction.budget(&args, after.common), baseline.extraction.budget(&args, before.common));
+    }
+}
+
+#[test]
+fn array_union_caps_and_unfunded_workspace_refuse_before_input() {
+    for name in ["--max-union-records", "--max-union-origins", "--max-union-input-bytes",
+        "--max-union-json-bytes", "--max-union-nodes", "--max-union-result-bytes"] {
+        assert!(definition().try_get_matches_from(["extract-map", "--schema", "schema.json",
+            "--source-dir", "source", "--source-manifest", "manifest", name, "10"]).is_err());
+        let mut command = command(&["--root-array-union", name, "0"]);
+        command.args.memory_mib = 262_144;
+        assert_eq!(command.execute(&mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+    }
+    for flags in [vec!["--max-union-records", "1000001"],
+        vec!["--max-union-records", "3", "--max-union-origins", "2"],
+        vec!["--max-union-json-bytes", "16777217"],
+        vec!["--max-union-result-bytes", "16777217"],
+        vec!["--max-union-input-bytes", "67108865"], vec!["--max-union-nodes", "1000001"]] {
+        let mut all = vec!["--root-array-union"]; all.extend(flags);
+        let mut command = command(&all); command.args.memory_mib = 262_144;
+        assert_eq!(command.execute(&mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+    }
+    let (union, mut args) = arguments(&["--root-array-union"]); args.memory_mib = 262_144;
+    let quote = union.validate(&args).unwrap();
+    args.memory_mib = quote.common.minimum_memory_bytes.div_ceil(MIB) - 1;
+    assert_eq!(union.execute(args, &mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+}
+
+#[test]
+fn root_array_declaration_is_checked_before_model_access_without_rounding_schema_numbers() {
+    let (map, mut args) = arguments(&["--root-array-union"]); args.memory_mib = 262_144;
+    let budget = map.extraction.budget(&args, map.validate(&args).unwrap().common);
+    let schema = r#"{"type":"array","maxItems":8,"items":{"type":"number","const":12345678901234567890123456789012345678}}"#;
+    assert_eq!(map.request(schema.to_owned(), budget).unwrap().schema, schema);
+    for schema in [r#"{"type":"boolean"}"#, r#"{"type":"object","properties":{},"additionalProperties":false}"#] {
+        assert_eq!(map.request(schema.to_owned(), budget).err(), Some(CandidateError::Planning));
+    }
+    let (source, _) = arguments(&["--root-array-union", "--source-membership"]);
+    let schema = r#"{"type":"array","maxItems":8,"items":{"type":"string","maxLength":8,"x-fnlp-source":"verbatim","enum":["café"]}}"#;
+    let request = source.request(schema.to_owned(), budget).unwrap();
+    assert_eq!(request.schema, schema);
+    assert_eq!(request.grounding, crate::batch::extract::ExtractionBatchGrounding::SourceMembership);
+}
+
+#[test]
 fn source_and_pinned_snapshot_routes_keep_complete_document_limits() {
     let (map, args) = arguments(&[]);
     let source = map.validate(&args).unwrap();

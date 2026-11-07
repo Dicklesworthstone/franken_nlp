@@ -22,7 +22,7 @@ fn fixture() -> (Int4ExtractionDocumentMemoryLimits, TaskBudget, Int4ExtractionM
             max_total_value_bytes: 1_048_576, max_result_bytes: 131_072 },
         max_model_work: Int4Work::for_sequence(32, 0, 1024, 128 * NANBEIGE_VOCAB_SIZE).unwrap(),
         mask_limits: Default::default(), mask_visits_per_chunk: 1000, max_mask_visits: 8000 },
-        verification: GroundingBudget { max_fields: 32, max_matches: 128, max_scan_steps: 100_000 } };
+        verification: GroundingBudget { max_fields: 32, max_matches: 128, max_scan_steps: 100_000 }, root_array_union: None };
     (memory, budget, document, BatchLimits::default())
 }
 
@@ -49,6 +49,22 @@ fn serial_quote_owns_complete_document_results_and_all_frozen_chunk_descriptors(
         (budget.max_output_bytes * chunks + document.mapping.reduction.max_live_value_bytes as u64) * 4
         + tokens * 8 + document.verification.max_fields as u64 * std::mem::size_of::<SourceFieldEvidence>() as u64
         + document.verification.max_matches as u64 * coordinates * 2 + memory.reduction_reserve_bytes);
+}
+
+#[test]
+fn union_workspace_is_added_once_without_changing_native_output_or_work_authority() {
+    let (memory, budget, mut document, transport) = fixture();
+    let plain = memory.requirements(32, budget, document, transport).unwrap();
+    let policy = crate::tasks::extract::array_union::RootArrayUnionLimits {
+        max_records: 8, max_origins: 32, max_input_bytes: 4096, max_json_bytes: 4096,
+        max_nodes: 512, max_result_bytes: 65536 };
+    document.root_array_union = Some(policy);
+    let selected = memory.requirements(32, budget, document, transport).unwrap();
+    assert_eq!(selected.document_workspace_bytes - plain.document_workspace_bytes, policy.requirements().unwrap().workspace_bytes);
+    assert_eq!(selected.native, plain.native); assert_eq!(selected.workspace_bytes, plain.workspace_bytes);
+    assert_eq!(selected.input_bytes, plain.input_bytes); assert_eq!(selected.output_reservation_bytes, plain.output_reservation_bytes);
+    document.root_array_union.as_mut().unwrap().max_result_bytes = document.mapping.reduction.max_result_bytes + 1;
+    assert!(memory.requirements(32, budget, document, transport).is_err());
 }
 
 #[test]

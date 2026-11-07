@@ -35,7 +35,7 @@ fn maximum_work() -> Int4Work {
         projections: ProjectionWork { dot_products: n, multiply_accumulates: n } }
 }
 fn mapping() -> Int4ExtractionMapLimits {
-    Int4ExtractionMapLimits { mapping: Int4ExtractionMappingLimits {
+    Int4ExtractionMapLimits { root_array_union: None, mapping: Int4ExtractionMappingLimits {
         chunks: ChunkLimits { max_input_bytes: 4096, max_chunk_bytes: 8, max_chunk_tokens: 8,
             context_tokens: 8192, reserved_tokens: 64, max_chunks: 8, max_tokenizer_calls: 1024 },
         reduction: ExecutionLimits { map_batch_chunks: 1, reduce_fan_in: 2,
@@ -220,6 +220,61 @@ fn compiler_source_and_document_policies_change_the_keyed_recipe() {
         assert_eq!(baseline.binding.compare(&freeze(&changed).binding), Err(JobError::Mismatch(MismatchField::Recipe)),
             "field {field}");
     }
+}
+
+#[test]
+fn exact_array_union_version_and_every_limit_are_authenticated_for_resume() {
+    use crate::tasks::extract::array_union::{RootArrayUnionLimits, ROOT_ARRAY_UNION_POLICY};
+    let policy = RootArrayUnionLimits { max_records: 32, max_origins: 128,
+        max_input_bytes: 1 << 20, max_json_bytes: 65_536, max_nodes: 4096, max_result_bytes: 262_144 };
+    let make = |policy: Option<RootArrayUnionLimits>| {
+        let mut map = mapping(); map.root_array_union = policy;
+        let mut request = request(false);
+        request.schema = r#"{"type":"array","maxItems":32,"items":{"type":"number"}}"#.to_owned();
+        build(WIDTH, budget(), CompileLimits::default(), SourceRuntimeLimits::default(),
+            request, map, limits(), lifetime()).unwrap()
+    };
+    let plain = make(None);
+    assert!(serde_json::to_value(plain.job_recipe()).unwrap().get("root_array_union").is_none());
+    let union = make(Some(policy));
+    let encoded = serde_json::to_value(union.job_recipe()).unwrap();
+    assert_eq!(encoded["root_array_union"]["policy"], ROOT_ARRAY_UNION_POLICY);
+    assert_eq!(encoded["root_array_union"]["limits"], serde_json::to_value(policy).unwrap());
+    let baseline = freeze(&union);
+    assert_eq!(baseline.binding.compare(&freeze(&plain).binding), Err(JobError::Mismatch(MismatchField::Recipe)));
+    for field in 0..7 {
+        let mut changed = policy;
+        match field {
+            0 => changed.max_records += 1, 1 => changed.max_origins += 1,
+            2 => changed.max_input_bytes += 1, 3 => changed.max_json_bytes += 1,
+            4 => changed.max_nodes += 1, 5 => changed.max_result_bytes += 1, _ => {},
+        }
+        let mut factory = make(Some(changed));
+        if field == 6 { factory.recipe.root_array_union.as_mut().unwrap().policy = "different-union-policy"; }
+        assert_eq!(baseline.binding.compare(&freeze(&factory).binding),
+            Err(JobError::Mismatch(MismatchField::Recipe)), "field {field}");
+    }
+    let before = prepare(&plain, SOURCE);
+    let after = prepare(&union, SOURCE);
+    assert_eq!(before.planned_work(), after.planned_work());
+    assert_eq!(before.execution_identities(), after.execution_identities());
+    assert_ne!(before.expected, after.expected);
+    assert_eq!(plain.max_result_bytes(), union.max_result_bytes());
+}
+
+#[test]
+fn array_union_job_factory_refuses_a_non_array_schema_before_population_work() {
+    let mut map = mapping();
+    map.root_array_union = Some(crate::tasks::extract::array_union::RootArrayUnionLimits {
+        max_records: 32, max_origins: 128, max_input_bytes: 1 << 20,
+        max_json_bytes: 65_536, max_nodes: 4096, max_result_bytes: 262_144,
+    });
+    let error = build(WIDTH, budget(), CompileLimits::default(), SourceRuntimeLimits::default(),
+        request(false), map, limits(), lifetime()).err().unwrap();
+    assert_eq!(error.code, BatchCode::Planning);
+    map.root_array_union = None;
+    build(WIDTH, budget(), CompileLimits::default(), SourceRuntimeLimits::default(),
+        request(false), map, limits(), lifetime()).unwrap();
 }
 
 #[test]

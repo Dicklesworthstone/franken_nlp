@@ -175,8 +175,9 @@ impl PreparedInt4ExtractionMap<'_> {
             || task.stats.cohorts != mapped.map_batches() as u64 || task.stats.planned_work != self.expected.work {
             return Err(ExtractError::InvalidResult.into());
         }
+        let root_array_union = self.reduce_root_array(&mapped, &mut **control.borrow_mut())?;
         let document = execution::complete(self.expected, self.limits.verification, task.remaining,
-            task.stats.model_work, task.masks, mapped, self.max_result_bytes())?;
+            task.stats.model_work, task.masks, mapped, self.max_result_bytes(), root_array_union)?;
         let run = Int4ExtractionMapCohortRun { schema_version: 1, execution: INT4_EXTRACTION_MAP_COHORT_EXECUTION,
             document, cohorts: task.stats };
         let cap = self.max_result_bytes().checked_add(COHORT_ENVELOPE_BYTES).ok_or(Int4ExtractionMapError::WorkLimit)?;

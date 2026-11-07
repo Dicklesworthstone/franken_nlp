@@ -186,6 +186,16 @@ impl Int4ExtractPlan {
         Ok(self.extraction.program.declarative_schema())
     }
 
+    /// Validate a document reduction against this exact task's full immutable
+    /// declaration. Original chunk evidence, not this structural check, owns
+    /// source membership for values discovered outside this plan's source.
+    pub(crate) fn validate_reduced_value(&self, task: &TaskPlan, source: &SourceDocument,
+        value: &crate::validation::JsonValue) -> Result<(), Int4ExtractError> {
+        self.semantic_schema(task, source)?;
+        self.extraction.program.validate_declarative_value(value)
+            .map_err(|_| ExtractError::InvalidResult.into())
+    }
+
     pub fn execute<C: DecodeStepControl>(&self, engine: &mut StrictInt4Engine<'_>,
         admitted: &ExecutionIdentity, vocabulary: &ExtractionVocabulary, budget: Int4JsonBudget,
         control: &mut C) -> Result<Int4ExtractRun, Int4ExtractError> {

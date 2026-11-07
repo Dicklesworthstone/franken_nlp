@@ -70,6 +70,7 @@ fn whole_document_progress_report_does_not_emit_schema_source_values_or_private_
         model_content_sha256: &content, candidate_format: "fixture-candidate-format", quant_recipe: "fixture-grouped-int4",
         group_width: args.group_width, integer_kernel: map.common.kernel.kind().id(),
         snapshot: Some(SnapshotRecord::new("loaded", map.common.snapshot_need)), chunk_schedule: None, output: &report,
+        root_array_union: None,
     };
     let mut bytes = Vec::new(); publish(&response, job_cli::REPORT_BYTES, &mut bytes).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -80,6 +81,7 @@ fn whole_document_progress_report_does_not_emit_schema_source_values_or_private_
     assert_eq!(value["output"]["attempts"], 3); assert_eq!(value["output"]["committed"], 2);
     assert_eq!(value["output"]["reserved_work"], serde_json::to_value(fixed.max_work).unwrap());
     assert!(value.get("chunk_schedule").is_none());
+    assert!(value.get("root_array_union").is_none());
     for forbidden in ["text", "schema", "values", "spans", "recipe", "key", "job_dir", "results", "documents"] {
         assert!(value.get(forbidden).is_none()); assert!(value["output"].get(forbidden).is_none());
     }

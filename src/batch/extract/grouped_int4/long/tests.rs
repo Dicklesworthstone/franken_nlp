@@ -42,11 +42,89 @@ pub(super) fn limits() -> Int4ExtractionMapLimits {
         max_model_work: Int4Work { forward_positions: u64::MAX, projected_logits: u64::MAX, attention_pairs: u64::MAX,
             projections: ProjectionWork { dot_products: u64::MAX, multiply_accumulates: u64::MAX } },
         mask_limits: MaskWorkLimits::default(), mask_visits_per_chunk: 1000, max_mask_visits: 256_000 },
-        verification: GroundingBudget::default() }
+        verification: GroundingBudget::default(), root_array_union: None }
 }
 pub(super) fn prepare<'s>(planner: &Int4ExtractionBatchPlanner, source: &'s str, args: &ExtractionBatchArgs,
     limits: Int4ExtractionMapLimits) -> PreparedInt4ExtractionMap<'s> {
     planner.plan_document_with_control(source, args, limits, &mut Continue).unwrap()
+}
+
+pub(super) fn union_limits() -> RootArrayUnionLimits {
+    RootArrayUnionLimits { max_records: 64, max_origins: 1024, max_input_bytes: 1 << 20,
+        max_json_bytes: 1 << 20, max_nodes: 65536, max_result_bytes: 1 << 20 }
+}
+#[test]
+fn exact_array_union_retains_all_chunk_results_and_binds_policy_source_and_partition() {
+    let p = planner(); let a = args(r#"{"type":"array","items":{"type":"integer"},"maxItems":8}"#,
+        ExtractionBatchGrounding::Structural);
+    let source = "Alice Bob Carol";
+    let mut selected = limits(); selected.root_array_union = Some(union_limits());
+    let prepared = prepare(&p, source, &a, selected); let expected = prepared.preflight_metadata();
+    let plain = prepare(&p, source, &a, limits()).preflight_metadata();
+    assert_eq!(plain.planned_work(), expected.planned_work());
+    assert_eq!(plain.reserved_mask_visits(), expected.reserved_mask_visits());
+    assert_ne!(plain, expected);
+    let mut script = Script::new(&a); script.json = Some("[1,2]".to_owned());
+    let result = run(prepared, script).unwrap(); expected.verify_completed(&result).unwrap();
+    let union = result.root_array_union.as_ref().unwrap();
+    assert_eq!(union.json(), "[1,2]");
+    assert_eq!(union.records()[0].origins.len(), expected.chunk_count());
+    assert!(result.mapped.root().value().chunks().all(|chunk| chunk.native.result.output.json == "[1,2]"));
+    assert_eq!(result.semantics, ROOT_ARRAY_UNION_POLICY);
+    assert!(plain.verify_completed(&result).is_err());
+    let mut changed = selected; changed.root_array_union.as_mut().unwrap().max_origins += 1;
+    assert!(prepare(&p, source, &a, changed).preflight_metadata().verify_completed(&result).is_err());
+    assert_ne!(prepare(&p, "Carol Bob Alice", &a, selected).preflight_metadata().root_array_binding, expected.root_array_binding);
+    changed = selected; changed.mapping.chunks.max_chunk_bytes = 5;
+    assert_ne!(prepare(&p, source, &a, changed).preflight_metadata().root_array_binding, expected.root_array_binding);
+    let mut script = Script::new(&a); script.json = Some("[1,2]".to_owned());
+    let plain = run(prepare(&p, source, &a, limits()), script).unwrap();
+    assert!(plain.root_array_union.is_none());
+    assert!(serde_json::to_value(&plain).unwrap().get("root_array_union").is_none());
+    assert_eq!(plain.untrusted_fields, ["mapped.root.value"]);
+}
+#[test]
+fn array_union_schema_and_complete_output_caps_refuse_before_native_work() {
+    let p = planner(); let mut selected = limits(); selected.root_array_union = Some(union_limits());
+    assert!(matches!(p.plan_document_with_control("Alice Bob", &source_args(), selected, &mut Continue),
+        Err(Int4ExtractionMapError::ArrayUnion(RootArrayUnionError::Schema))));
+    selected.mapping.reduction.max_result_bytes = union_limits().max_result_bytes - 1;
+    assert!(selected.root_array_workspace_bytes().is_err());
+}
+#[test]
+fn aggregate_cannot_be_transplanted_between_different_outputs_of_the_same_preparation() {
+    let p = planner(); let a = args(r#"{"type":"array","items":{"type":"integer"},"maxItems":8}"#,
+        ExtractionBatchGrounding::Structural);
+    let mut selected = limits(); selected.root_array_union = Some(union_limits());
+    let source = "Alice Bob";
+    let prepared = prepare(&p, source, &a, selected); let expected = prepared.preflight_metadata();
+    let mut first = Script::new(&a); first.json = Some("[1]".to_owned());
+    let mut second = Script::new(&a); second.json = Some("[2]".to_owned());
+    let mut left = run(prepared, first).unwrap();
+    let mut right = run(prepare(&p, source, &a, selected), second).unwrap();
+    expected.verify_completed(&left).unwrap(); expected.verify_completed(&right).unwrap();
+    left.root_array_union = right.root_array_union.take();
+    assert!(expected.verify_completed(&left).is_err());
+}
+#[test]
+fn array_union_keeps_duplicate_verbatim_origins_and_every_original_span() {
+    let p = planner(); let a = args(r#"{"type":"array","items":{"type":"string","x-fnlp-source":"verbatim"},"maxItems":8}"#,
+        ExtractionBatchGrounding::SourceMembership);
+    let mut selected = limits(); selected.root_array_union = Some(union_limits());
+    let prepared = prepare(&p, "éAéAéAéA", &a, selected);
+    let mut script = Script::new(&a); script.json = Some(r#"["é"]"#.to_owned());
+    let result = run(prepared, script).unwrap();
+    let union = result.root_array_union.as_ref().unwrap();
+    assert_eq!(union.json(), r#"["é"]"#);
+    assert_eq!(union.records()[0].origins.len(), 2);
+    let chunks: Vec<_> = result.mapped.root().value().chunks().collect();
+    for origin in &union.records()[0].origins {
+        assert_eq!(origin.source_field_indices, [0]);
+        let field = &chunks[origin.chunk_id].original_fields[origin.source_field_indices[0]];
+        assert_eq!(field.json_pointer, "/0"); assert_eq!(field.spans.len(), 2);
+        assert_eq!(field.occurrence, SourceOccurrence::Ambiguous);
+    }
+    assert_eq!(result.verification_used.fields, 2); assert_eq!(result.verification_used.matches, 4);
 }
 
 #[test]

@@ -1,6 +1,8 @@
 //! Complete-document INT4 extraction with explicit chunk and reduction budgets.
 use super::*;
 pub(super) mod corpus;
+pub(super) mod array_union;
+use array_union::ArrayUnionArgs;
 use crate::{
     batch::extract::{ExtractionBatchArgs, grouped_int4::long::{Int4ExtractionMappingLimits, Int4ExtractionMapLimits,
         cohort::{Int4ExtractionMapCohortMemoryLimits, Int4ExtractionMapCohortRequirement}}},
@@ -19,6 +21,7 @@ pub(super) struct MapArgs {
     pub extraction: extract::ExtractionArgs,
     mapping: MappingArgs,
     cohort_chunks: Option<usize>,
+    array_union: ArrayUnionArgs,
 }
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
 struct MappingArgs {
@@ -70,13 +73,14 @@ pub(super) fn document_job_definition() -> clap::Command {
     definition_with_cohorts(true)
 }
 fn definition_with_cohorts(cohorts: bool) -> clap::Command {
-    let command = MappingArgs::augment_args(extract::definition().name("extract-map")
+    let command = ArrayUnionArgs::augment_args(MappingArgs::augment_args(extract::definition().name("extract-map")
         .about("Extract one exact schema over every chunk of a complete document using grouped INT4")
         .long_about("Losslessly partition one complete UTF-8 document with the pinned source encoder and actual schema/template prompt capacity. Compile and admit ALL chunks before the first native forward. Execution is serial unless --cohort-chunks N explicitly groups up to N independent chunks through shared native INT4 decoder layers; N must be 1..64 and cannot exceed --max-chunks. The complete window's native, decoder, output and reduction storage is admitted before IO, with exact native contexts for each actual window and the final partial window. Every chunk keeps its original task budget, grammar, source language and causal KV. Output retains each independent exact-schema JSON string and chunk byte/scalar lineage; --source-membership independently verifies all compatible verbatim occurrences within each chunk and lifts them to original-document coordinates. It does not find occurrences in other chunks from which the value was not extracted. Required fields must be satisfiable in each chunk. There is no merged global object, unconstrained repair, overlapping-window analysis or single-context equivalence claim. Work, mask, field/span verification, tokenization and reduction budgets are for the whole document and never renew per chunk or cohort. No partial document success is published. Source-conversion and digest-pinned snapshot routes share the same checked path. Blocking IO observes the end-to-end deadline cooperatively.")
         .mut_arg("input", |arg| arg.help("One complete UTF-8 document; '-' reads stdin; not NDJSON"))
         .mut_arg("max_input_bytes", |arg| arg.default_value("1048576").help("Maximum bytes of the COMPLETE original document"))
         .mut_arg("preparation_mib", |arg| arg.default_value("1024"))
-        .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoint allowance for hosted document preparation, chunks and reduction")));
+        .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoint allowance for hosted document preparation, chunks and reduction"))
+        .after_long_help(array_union::HELP)));
     if cohorts {
         command.arg(clap::Arg::new("cohort_chunks").long("cohort-chunks")
             .value_name("N").value_parser(clap::value_parser!(usize))
@@ -97,6 +101,7 @@ impl MapArgs {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         Ok(Self { extraction: extract::ExtractionArgs::from_matches(matches)?,
             mapping: MappingArgs::from_arg_matches(matches)?,
+            array_union: ArrayUnionArgs::from_arg_matches(matches)?,
             cohort_chunks: matches.try_get_one::<usize>("cohort_chunks").ok().flatten().copied() })
     }
     pub(super) fn validate_document_job(&self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
@@ -190,13 +195,16 @@ impl MapArgs {
                     multiply_accumulates: m.max_multiply_accumulates } },
             mask_limits: self.extraction.masks(), mask_visits_per_chunk: self.extraction.mask_visits(),
             max_mask_visits: m.max_total_mask_node_visits,
-        }, verification: GroundingBudget { max_fields: m.max_extraction_fields,
+        }, root_array_union: self.array_union.limits(m)?,
+        verification: GroundingBudget { max_fields: m.max_extraction_fields,
             max_matches: m.max_extraction_evidence_spans, max_scan_steps: m.max_extraction_scan_steps } })
     }
     pub(super) fn request(&self, schema: String, budget: TaskBudget) -> Result<ExtractionBatchArgs, CandidateError> {
         // The source language is compiled independently for each REAL chunk.
         // A whole-document source automaton or placeholder would prove less.
-        self.extraction.shared_defaults(schema, budget)
+        let request = self.extraction.shared_defaults(schema, budget)?;
+        self.array_union.check_schema(&request.schema, self.extraction.compiler(), self.mapping)?;
+        Ok(request)
     }
     pub(super) fn execute(self, args: Int4Args, input: &mut impl Read, output: &mut impl Write)
         -> Result<(), CandidateError> {
@@ -228,5 +236,6 @@ fn workspace_bytes(budget: TaskBudget, limits: Int4ExtractionMapLimits, chunks: 
     let fields = times(limits.verification.max_fields as u64, std::mem::size_of::<SourceFieldEvidence>() as u64)?;
     let spans = times(times(limits.verification.max_matches as u64,
         std::mem::size_of::<VerifiedSourceSpan>() as u64)?, 2)?;
-    sum(&[staged, tokens, fields, spans, reserve])
+    let union = limits.root_array_workspace_bytes().map_err(|_| CandidateError::Arguments)?;
+    sum(&[staged, tokens, fields, spans, reserve, union])
 }

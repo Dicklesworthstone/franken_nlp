@@ -54,6 +54,7 @@ pub struct Int4ExtractionDocumentBatchConfig {
 }
 impl Int4ExtractionDocumentBatchConfig {
     pub(crate) fn validate(&self) -> Result<(), BatchFault> {
+        self.limits.root_array_workspace_bytes().map_err(|_| BatchCode::InvalidLimits)?;
         self.request.budget.validate().map_err(|_| BatchCode::InvalidLimits)?;
         let m = self.limits.mapping; let v = self.limits.verification;
         m.chunks.effective_token_limit().map_err(|_| BatchCode::InvalidLimits)?;
@@ -101,6 +102,11 @@ impl Int4ExtractionDocumentBatchPlanner {
             || request.max_output_bytes > ceiling.max_output_bytes || request.max_grammar_states > ceiling.max_grammar_states
             || request.max_kv_bytes != kv || ceiling.max_kv_bytes != kv {
             return Err(BatchCode::InvalidLimits.into());
+        }
+        if let Some(union) = config.limits.root_array_union {
+            let declaration = crate::grammar::runtime::JsonValidationSchema::compile(
+                &config.request.schema, compiler.compiler.compiler_limits).map_err(|_| BatchCode::Planning)?;
+            union.validate_schema(declaration.root()).map_err(|_| BatchCode::Planning)?;
         }
         Ok(Self { compiler, config, chunk_cohorts: false, owner: Arc::new(()) })
     }
@@ -375,7 +381,8 @@ fn map_failure(error: Int4ExtractionMapError, fatal: bool) -> BatchItemFailure {
         Int4ExtractionMapError::Chunk(MapReduceError::Cancelled | MapReduceError::InvalidSpan
             | MapReduceError::InvalidTokenCount | MapReduceError::Tokenizer) => (BatchCode::Planning, true),
         Int4ExtractionMapError::Chunk(_) => (BatchCode::Planning, fatal),
-        Int4ExtractionMapError::Extraction(_) | Int4ExtractionMapError::Reduction(_) => (BatchCode::InvalidExecution, true),
+        Int4ExtractionMapError::Extraction(_) | Int4ExtractionMapError::Reduction(_)
+            | Int4ExtractionMapError::ArrayUnion(_) => (BatchCode::InvalidExecution, true),
     };
     if stop { BatchItemFailure::fatal(code) } else { BatchItemFailure::reject(code) }
 }

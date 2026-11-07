@@ -144,6 +144,15 @@ impl JsonProgram {
         self.source_fields_for_value(&value).map(|_| ())
     }
 
+    /// Complete declarative validation for a composed value whose original
+    /// chunk evidence is retained separately. No source-membership authority
+    /// is minted here and the originating chunk's output byte cap is not a
+    /// whole-document cap. Includes runtime-owned Unicode maxLength rules.
+    pub(crate) fn validate_declarative_value(&self, value: &ValidationValue) -> Result<(), SchemaError> {
+        validate_value(self.schema.root(), value).map_err(|_| invalid("independent JSON validation failed"))?;
+        validate_lengths(self.schema.root(), value, "$", &self.lengths)
+    }
+
     fn validated_value(&self, text: &str) -> Result<ValidationValue, SchemaError> {
         if text.len() > self.max_output_bytes { return Err(resource("output byte limit exceeded")); }
         let value = parse_json_with_limits(text, JsonLimits {

@@ -45,6 +45,7 @@ fn fixture() -> (TaskBudget, Int4ExtractionMapLimits, JobLimits, JobHostLimits) 
     let budget = TaskBudget { max_input_tokens: 48, max_output_tokens: 16,
         max_output_bytes: 4096, max_grammar_states: 4096, max_kv_bytes: native.kv_bytes };
     let document = Int4ExtractionMapLimits {
+        root_array_union: None,
         mapping: Int4ExtractionMappingLimits {
             chunks: ChunkLimits { max_input_bytes: 8192, max_chunk_bytes: 1024,
                 max_chunk_tokens: 48, context_tokens: 64, reserved_tokens: 16,

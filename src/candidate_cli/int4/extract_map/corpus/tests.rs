@@ -31,6 +31,34 @@ impl Write for NoIo {
 }
 
 #[test]
+fn document_corpus_prices_the_same_exact_array_policy_once_without_renewing_native_work() {
+    for cohorts in [None, Some(3)] {
+        let (mut plain, args) = arguments(&[]);
+        let (mut union, _) = arguments(&["--root-array-union", "--max-union-records", "32",
+            "--max-union-origins", "128", "--max-union-input-bytes", "1048576",
+            "--max-union-json-bytes", "65536", "--max-union-nodes", "4096",
+            "--max-union-result-bytes", "262144"]);
+        plain.document.cohort_chunks = cohorts; union.document.cohort_chunks = cohorts;
+        let before = plain.validate(&args).unwrap();
+        let after = union.validate(&args).unwrap();
+        let policy = after.document.mapping.root_array_union.unwrap();
+        assert_eq!(after.memory.document_workspace_bytes - before.memory.document_workspace_bytes,
+            policy.requirements().unwrap().workspace_bytes);
+        assert_eq!(after.memory.native, before.memory.native);
+        assert_eq!(after.memory.input_bytes, before.memory.input_bytes);
+        assert_eq!(after.memory.output_reservation_bytes, before.memory.output_reservation_bytes);
+        assert_eq!(after.transport.max_work, before.transport.max_work);
+        assert_eq!(after.max_run_mask_visits, before.max_run_mask_visits);
+        assert_eq!(after.max_run_verification, before.max_run_verification);
+        assert_eq!(after.document.mapping.mapping.chunks, before.document.mapping.mapping.chunks);
+        let budget = union.document.extraction.budget(&args, after.common);
+        let raw = r#"{"type":"array","maxItems":32,"items":{"type":"number"}}"#;
+        assert_eq!(union.load_defaults(raw.to_owned(), budget).unwrap().schema, raw);
+        assert!(union.load_defaults(r#"{"type":"number"}"#.to_owned(), budget).is_err());
+    }
+}
+
+#[test]
 fn whole_document_route_requires_owned_dispatch_and_an_explicit_schema() {
     assert_eq!(command(&[]).execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
     assert!(parsed(&["--source-dir", "source", "--source-manifest", "manifest"]).is_err());

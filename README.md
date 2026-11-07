@@ -452,9 +452,17 @@ record. `--max-requests` counts all nonempty records, including flush controls
 and malformed input. Native work, mask visits, checkpoints and total input/
 output budgets span the entire run and do not renew at flush boundaries.
 Memory admission includes the resident model, full context, preparation,
-transport staging and guarded results. Execution is sequential and blocking
-IO observes cancellation cooperatively. For retained results and explicit
-resume, use the separate extraction-job surface below.
+transport staging and guarded results. Execution is serial by default.
+`--cohort-documents N` shares native decoder layers across independent
+documents, and `--prefill-rows P` additionally packs known prompt positions.
+Both schedules support `--max-selected-rows R`, which projects every legal
+grammar row within the declared cap, including EOS. A complete legal set that
+exceeds the cap fails without pruning or a dense retry. These options also
+compose on `ner-batch`, `keyphrases-batch`, `summarize-batch`, and `answer-batch`.
+See [selected INT4 rows](docs/int4-selected-rows.md) and
+[structured cohorts](docs/int4-structured-cohorts.md) for limits and unrun
+qualification gates. Blocking IO observes cancellation cooperatively. For
+retained results and explicit resume, use the extraction-job surface below.
 
 ## Implemented candidate INT4 extraction jobs
 
@@ -3315,6 +3323,21 @@ occurrence **within the chunk that produced it**, and those intervals are
 lifted to original-document coordinates. It does not discover occurrences in
 other chunks from which that value was not extracted. Repeated occurrences
 stay explicit; Unicode-scalar coordinates are distinct from byte coordinates.
+
+Add **`--root-array-union`** when the schema's root is an array and the desired
+document result is one combined record list. It combines exact canonical
+records in first-occurrence source order, retains every duplicate origin and
+reference to source evidence, and independently validates the completed array
+against the original schema. Exact decimal comparison preserves large numbers.
+Original chunk results stay available. Exceeding final `maxItems` or any
+declared reducer/output bound fails the complete document without truncation.
+
+The same option works on `extract-corpus` and
+`extract-document-job start|resume`, with serial or cohort chunk execution.
+Retained jobs authenticate its fixed policy and all limits. Its separate
+memory reservation is charged once per active document; it adds no model pass.
+See [exact root-array reduction](docs/int4-extraction-array-union.md) for
+examples, bounds, provenance and the unrun qualification gates.
 
 Each chunk must independently satisfy the schema. For example, a required
 verbatim constant present in only one chunk makes the complete request fail;

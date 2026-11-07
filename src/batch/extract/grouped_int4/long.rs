@@ -10,7 +10,8 @@ use std::sync::Arc;
 use crate::{
     native_engine::{constrained_int4, decode::DecodeCancellationKind,
         strict_int4::{StrictInt4Engine, STRICT_INT4_PROFILE}},
-    tasks::{extract::{ExtractionGrounding, quantized::check_size},
+    tasks::{extract::{ExtractionGrounding, quantized::check_size,
+            array_union::{self, RootArrayUnionLimits, RootArrayUnionResult, RootArrayUnionError, ROOT_ARRAY_UNION_POLICY}},
         extract::grouped_int4::Int4ExtractRun,
         mapreduce::{self, ChunkLimits, ChunkPlan, ExecutionError, ExecutionLimits, MapReduceError,
             MapReduceResult, MapReduceTask, MapOutput, ReduceInput, ReductionPolicy, SourceChunk}},
@@ -45,12 +46,28 @@ pub struct Int4ExtractionMapLimits {
     /// Additional nonrenewable original-coordinate verification across ALL
     /// chunks. Native schema/source validation retains its own per-pass caps.
     pub verification: GroundingBudget,
+    /// Explicit exact union of root-array records; None preserves independent
+    /// chunk output and its original serialized identity.
+    pub root_array_union: Option<RootArrayUnionLimits>,
+}
+impl Int4ExtractionMapLimits {
+    /// Additional simultaneous reducer payload beyond the ordinary map quote.
+    /// The complete document cap still covers BOTH chunks and optional union.
+    pub fn root_array_workspace_bytes(self) -> Result<u64, Int4ExtractionMapError> {
+        let Some(limits) = self.root_array_union else { return Ok(0); };
+        if limits.max_result_bytes > self.mapping.reduction.max_result_bytes
+            || limits.max_json_bytes > self.mapping.reduction.max_result_bytes {
+            return Err(Int4ExtractionMapError::InvalidLimits);
+        }
+        Ok(limits.requirements()?.workspace_bytes)
+    }
 }
 
 /// Default diagnostics reveal neither source text nor schema/compiler details.
 pub enum Int4ExtractionMapError {
     InvalidLimits, EmptySource, WorkLimit, Admission, Allocation,
     Chunk(MapReduceError), Extraction(Int4ExtractError), Reduction(ExecutionError<Int4ExtractError>),
+    ArrayUnion(RootArrayUnionError),
 }
 impl fmt::Display for Int4ExtractionMapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -63,6 +80,7 @@ impl fmt::Display for Int4ExtractionMapError {
             Self::Chunk(_) => "INT4 extraction document partition refused",
             Self::Extraction(_) => "INT4 extraction document native task refused",
             Self::Reduction(_) => "INT4 extraction document reduction refused",
+            Self::ArrayUnion(_) => "INT4 extraction root-array union refused",
         })
     }
 }
@@ -71,21 +89,24 @@ impl fmt::Debug for Int4ExtractionMapError {
 }
 impl Error for Int4ExtractionMapError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self { Self::Chunk(e) => Some(e), Self::Extraction(e) => Some(e), Self::Reduction(e) => Some(e), _ => None }
+        match self { Self::Chunk(e) => Some(e), Self::Extraction(e) => Some(e), Self::Reduction(e) => Some(e),
+            Self::ArrayUnion(e) => Some(e), _ => None }
     }
 }
 impl From<Int4ExtractError> for Int4ExtractionMapError { fn from(e: Int4ExtractError) -> Self { Self::Extraction(e) } }
 impl From<ExtractError> for Int4ExtractionMapError { fn from(e: ExtractError) -> Self { Self::Extraction(e.into()) } }
+impl From<RootArrayUnionError> for Int4ExtractionMapError { fn from(e: RootArrayUnionError) -> Self { Self::ArrayUnion(e) } }
 impl Int4ExtractionMapError {
     pub fn cancellation(&self) -> Option<DecodeCancellationKind> {
         match self {
             Self::Extraction(e) | Self::Reduction(ExecutionError::Task { source: e, .. }) => e.cancellation(),
+            Self::ArrayUnion(RootArrayUnionError::Cancelled(cause)) => Some(*cause),
             _ => None,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Int4ExtractionMapPreflight {
     source_span: VerifiedSourceSpan,
     chunks: usize,
@@ -94,6 +115,16 @@ pub struct Int4ExtractionMapPreflight {
     group_width: usize,
     grounding: ExtractionGrounding,
     verification: GroundingBudget,
+    root_array_binding: Option<Sha256Digest>,
+}
+impl fmt::Debug for Int4ExtractionMapPreflight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Int4ExtractionMapPreflight")
+            .field("source_span", &self.source_span).field("chunks", &self.chunks)
+            .field("work", &self.work).field("masks", &self.masks).field("group_width", &self.group_width)
+            .field("grounding", &self.grounding).field("verification", &self.verification)
+            .field("root_array_union", &self.root_array_binding.is_some()).finish()
+    }
 }
 impl Int4ExtractionMapPreflight {
     pub fn source_span(&self) -> VerifiedSourceSpan { self.source_span }
@@ -104,9 +135,18 @@ impl Int4ExtractionMapPreflight {
     pub fn verify_completed(&self, run: &Int4ExtractionMapRun) -> Result<(), Int4ExtractionMapError> {
         let root = run.mapped.root();
         let (work, masks, fields, spans) = execution::statistics(root.value())?;
+        let same_children = run.root_array_union.as_ref().is_none_or(|union| union.matches_chunks(
+            root.value().chunks().map(|chunk| array_union::ArrayUnionChunk {
+                chunk_id: chunk.chunk_id, source_span: chunk.source_span,
+                json: &chunk.native.result.output.json, source_fields: &chunk.original_fields,
+            })));
         if run.schema_version != 1 || run.execution != INT4_EXTRACTION_MAP_EXECUTION
-            || run.numerics_profile != STRICT_INT4_PROFILE || run.semantics != SEMANTICS || run.group_width != self.group_width
-            || run.grounding != self.grounding || run.untrusted_fields != ["mapped.root.value"]
+            || run.numerics_profile != STRICT_INT4_PROFILE || run.group_width != self.group_width
+            || run.semantics != if self.root_array_binding.is_some() { ROOT_ARRAY_UNION_POLICY } else { SEMANTICS }
+            || run.root_array_union.as_ref().map(RootArrayUnionResult::binding) != self.root_array_binding
+            || !same_children
+            || run.grounding != self.grounding || run.untrusted_fields.as_slice() != if self.root_array_binding.is_some() {
+                &["mapped.root.value", "root_array_union"][..] } else { &["mapped.root.value"][..] }
             || root.source_span() != self.source_span || root.chunk_range() != (0..self.chunks)
             || root.value().chunks.len() != self.chunks || run.planned_model_work != self.work
             || run.reserved_mask_node_visits != self.masks || run.model_work != work
@@ -155,8 +195,10 @@ pub struct Int4ExtractionMapRun {
     pub reserved_mask_node_visits: u64,
     pub mask_node_visit_charge: u64,
     pub verification_used: ExtractionMapVerification,
-    pub untrusted_fields: [&'static str; 1],
+    pub untrusted_fields: Vec<&'static str>,
     pub mapped: MapReduceResult<ExtractionMapValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_array_union: Option<RootArrayUnionResult>,
 }
 
 /// Source-borrowing, consumed commitment. No wire constructor or external
@@ -176,6 +218,19 @@ impl PreparedInt4ExtractionMap<'_> {
     pub fn max_result_bytes(&self) -> u64 { self.limits.mapping.reduction.max_result_bytes as u64 }
     pub fn group_width(&self) -> usize { self.expected.group_width }
     pub fn max_kv_bytes(&self) -> u64 { self.kv_ceiling }
+    fn reduce_root_array<C: DecodeStepControl>(&self, mapped: &MapReduceResult<ExtractionMapValue>, control: &mut C)
+        -> Result<Option<RootArrayUnionResult>, Int4ExtractionMapError> {
+        let Some(limits) = self.limits.root_array_union else { return Ok(None); };
+        let first = self.plans.first().ok_or(Int4ExtractionMapError::Admission)?;
+        let schema = first.plan.semantic_schema(&first.task, &first.source)?;
+        let binding = self.expected.root_array_binding.ok_or(Int4ExtractionMapError::Admission)?;
+        Ok(Some(array_union::reduce(schema, binding, limits,
+            mapped.root().value().chunks().map(|chunk| array_union::ArrayUnionChunk {
+                chunk_id: chunk.chunk_id, source_span: chunk.source_span,
+                json: &chunk.native.result.output.json, source_fields: &chunk.original_fields,
+            }), |value| first.plan.validate_reduced_value(&first.task, &first.source, value)
+                .map_err(|_| RootArrayUnionError::Input), control)?))
+    }
 }
 impl Int4ExtractionBatchPlanner {
     /// Compile every actual chunk, not a placeholder document. The caller must
@@ -185,6 +240,7 @@ impl Int4ExtractionBatchPlanner {
         args: &ExtractionBatchArgs, limits: Int4ExtractionMapLimits, control: &mut C)
         -> Result<PreparedInt4ExtractionMap<'s>, Int4ExtractionMapError> {
         step(control)?;
+        limits.root_array_workspace_bytes()?;
         self.require_full_projection().map_err(|_| Int4ExtractionMapError::Admission)?;
         if source.is_empty() { return Err(Int4ExtractionMapError::EmptySource); }
         let b = args.budget; let c = &self.compiler; let m = limits.mapping; let v = limits.verification;
@@ -236,7 +292,7 @@ impl Int4ExtractionBatchPlanner {
         let mut expected = Int4ExtractionMapPreflight {
             source_span: VerifiedSourceSpan { byte_start: first.byte_start, byte_end: last.byte_end,
                 scalar_start: first.scalar_start, scalar_end: last.scalar_end }, chunks: chunks.chunks().len(),
-            work: Int4Work::default(), masks: 0, group_width: self.group_width, verification: v,
+            work: Int4Work::default(), masks: 0, group_width: self.group_width, verification: v, root_array_binding: None,
             grounding: match args.grounding { ExtractionBatchGrounding::Structural => ExtractionGrounding::NotRequested,
                 ExtractionBatchGrounding::SourceMembership => ExtractionGrounding::SourceMembership } };
         let mut plans = Vec::new();
@@ -259,6 +315,21 @@ impl Int4ExtractionBatchPlanner {
             expected.masks = expected.masks.checked_add(m.mask_visits_per_chunk).filter(|&n| n <= m.max_mask_visits)
                 .ok_or(Int4ExtractionMapError::WorkLimit)?;
             plans.push(plan);
+        }
+        if let Some(union) = limits.root_array_union {
+            let first = plans.first().ok_or(Int4ExtractionMapError::Admission)?;
+            union.validate_schema(first.plan.semantic_schema(&first.task, &first.source)?)?;
+            let mut identities = Vec::new();
+            identities.try_reserve_exact(plans.len()).map_err(|_| Int4ExtractionMapError::Allocation)?;
+            for plan in &plans {
+                step(control)?;
+                identities.push(plan.execution_identity().receipt_digest().map_err(|_| Int4ExtractionMapError::Admission)?);
+            }
+            // A sealed aggregate from another source, model, chunk partition,
+            // schema or policy cannot be transplanted into this map result.
+            let bytes = canonjson::canonical_bytes(&(union.binding(first.execution_identity().schema_digest)?,
+                Sha256Digest::of_bytes(source.as_bytes()), identities)).map_err(|_| Int4ExtractionMapError::Admission)?;
+            expected.root_array_binding = Some(Sha256Digest::of_bytes(&bytes));
         }
         step(control)?;
         Ok(PreparedInt4ExtractionMap { chunks, plans, limits, expected, kv_ceiling: b.max_kv_bytes })

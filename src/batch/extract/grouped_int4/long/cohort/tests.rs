@@ -108,6 +108,27 @@ fn actual_windows_include_a_ragged_tail_and_preserve_every_serial_semantic_field
 }
 
 #[test]
+fn optional_array_union_is_identical_for_serial_and_ragged_native_cohort_maps() {
+    let p = planner(); let a = args(r#"{"type":"array","items":{"type":"integer"},"maxItems":8}"#,
+        ExtractionBatchGrounding::Structural);
+    let source = "Alice Bob Carol Dora Eve"; let vocabulary = vocabulary();
+    let mut selected = limits(1); selected.root_array_union = Some(super::super::tests::union_limits());
+    let serial_plan = prepare(&p, source, &a, selected);
+    let ids: Vec<_> = serial_plan.execution_identities().cloned().collect();
+    let mut script = Script::new(&a); script.json = Some("[1,2]".to_owned());
+    let serial = serial_plan.execute_with_driver(&ids, script, &mut Continue).unwrap();
+    for width in [1, 2, 4, 64] {
+        selected = limits(width); selected.root_array_union = Some(super::super::tests::union_limits());
+        let prepared = prepare(&p, source, &a, selected); let expected = prepared.preflight_metadata();
+        let mut script = Scripted::new(&a); script.scalar.json = Some("[1,2]".to_owned());
+        let result = run(prepared, script, &vocabulary).unwrap();
+        expected.verify_completed(&result.document).unwrap();
+        assert_eq!(without_schedule(&result.document), without_schedule(&serial));
+        assert_eq!(result.document.root_array_union.as_ref().unwrap().json(), "[1,2]");
+    }
+}
+
+#[test]
 fn actual_component_peaks_fit_the_shared_declared_window_quote_without_padded_tail_work() {
     let planner = planner(); let args = source_args(); let source = "Alice Bob Carol";
     let prepared = prepare(&planner, source, &args, limits(2));
