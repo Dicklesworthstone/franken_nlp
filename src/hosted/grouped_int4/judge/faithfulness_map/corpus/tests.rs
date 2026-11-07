@@ -40,7 +40,8 @@ fn capacity(cohort_chunks: Option<usize>) -> DocumentCapacity {
     let (task, planning, mapping, limits) = fixture();
     let quote = int4_faithfulness_document_corpus_requirements(32, task, planning, mapping, limits, cohort_chunks).unwrap();
     DocumentCapacity { context: limits.native.context_tokens, kv_bytes: quote.native.kv_bytes, mapping,
-        cohort_chunks, max_result_bytes: document_output_bytes(mapping, cohort_chunks).unwrap(), task_budget: task }
+        cohort_chunks, max_heads: MAX_FAITHFULNESS_MAP_HEADS,
+        max_result_bytes: document_output_bytes(mapping, cohort_chunks).unwrap(), task_budget: task }
 }
 fn request(identities: &[ExecutionIdentity], capacity: DocumentCapacity) -> Int4FaithfulnessDocumentAdmission<'_> {
     Int4FaithfulnessDocumentAdmission { identities, model_work: capacity.mapping.max_model_work, group_width: 32,
@@ -110,6 +111,53 @@ fn serial_execution_only_prices_one_physical_cache_in_its_task_allowance() {
 }
 
 #[test]
+fn capped_corpus_quote_preserves_legacy_default_and_enables_small_evidence_sets() {
+    let (task, planning, mapping, limits) = fixture();
+    let row = Int4MemoryRequirement::for_context(limits.native.context_tokens, 32).unwrap().kv_bytes;
+    for chunks in [None, Some(1), Some(3), Some(64)] {
+        let legacy = int4_faithfulness_document_corpus_requirements(32, task, planning, mapping, limits, chunks).unwrap();
+        let unchanged = int4_faithfulness_document_corpus_requirements_with_max_heads(
+            32, task, planning, mapping, limits, 32, chunks).unwrap();
+        assert_eq!(unchanged, legacy);
+        let mut one_row = task; one_row.max_kv_bytes = row;
+        let capped = int4_faithfulness_document_corpus_requirements_with_max_heads(
+            32, one_row, planning, mapping, limits, 1, chunks).unwrap();
+        assert_eq!(capped.native.kv_bytes, row * chunks.unwrap_or(1) as u64);
+        assert!(capped.input_bytes < legacy.input_bytes);
+        assert_eq!(capped.output_reservation_bytes, legacy.output_reservation_bytes);
+        assert_eq!(capped.max_output_bytes, legacy.max_output_bytes);
+    }
+    for cap in [0, 33, usize::MAX] {
+        assert!(int4_faithfulness_document_corpus_requirements_with_max_heads(
+            32, task, planning, mapping, limits, cap, None).is_err());
+    }
+}
+
+#[test]
+fn admission_requires_actual_heads_and_physical_peak_to_fit_the_declared_cap() {
+    let (mut task, planning, mapping, limits) = fixture();
+    task.max_kv_bytes = Int4MemoryRequirement::for_context(limits.native.context_tokens, 32).unwrap().kv_bytes * 3;
+    let quote = int4_faithfulness_document_corpus_requirements_with_max_heads(
+        32, task, planning, mapping, limits, 3, Some(3)).unwrap();
+    let capacity = DocumentCapacity { task_budget: task, kv_bytes: quote.native.kv_bytes,
+        max_heads: 3, ..capacity(Some(3)) };
+    let identities = [identity(), identity(), identity(), identity()];
+    let mut request = request(&identities, capacity);
+    request.head_count = 11; request.max_head_count = 3;
+    check_request(32, capacity, &request).unwrap();
+    request.max_head_count = 4;
+    assert_eq!(check_request(32, capacity, &request).unwrap_err().fault.code, BatchCode::Admission);
+    request.max_head_count = 3;
+    request.kv_reservation_bytes += 1;
+    assert_eq!(check_request(32, capacity, &request).unwrap_err().fault.code, BatchCode::Admission);
+    request.kv_reservation_bytes -= 1;
+    for cap in [0, 33, usize::MAX] {
+        assert_eq!(check_request(32, DocumentCapacity { max_heads: cap, ..capacity }, &request)
+            .unwrap_err().fault.code, BatchCode::Admission);
+    }
+}
+
+#[test]
 fn every_native_axis_and_fixed_execution_cap_is_checked_at_admission() {
     let identities = [identity(), identity()];
     let capacity = capacity(Some(3));
@@ -158,6 +206,7 @@ fn missing_reservations_output_capacity_and_arithmetic_fail_before_io() {
 fn owned_stream_and_quote_are_available_on_the_existing_host_surface() {
     let _host = NlpEngine::batch_int4_faithfulness_documents::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
     let _quote = crate::hosted::int4_faithfulness_document_corpus_requirements;
+    let _capped_quote = crate::hosted::int4_faithfulness_document_corpus_requirements_with_max_heads;
     fn send<T: Send + 'static>() {}
     send::<StreamInput<std::io::Cursor<Vec<u8>>, Vec<u8>>>();
 }

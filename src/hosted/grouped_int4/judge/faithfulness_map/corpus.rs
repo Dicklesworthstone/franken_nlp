@@ -24,6 +24,17 @@ use crate::{
 pub fn int4_faithfulness_document_corpus_requirements(width: usize, task: TaskBudget,
     planning: JudgeLimits, mapping: Int4FaithfulnessMapLimits, limits: CorpusLimits,
     cohort_chunks: Option<usize>) -> Result<Int4FaithfulnessMapMemoryRequirement, HostedError> {
+    int4_faithfulness_document_corpus_requirements_with_max_heads(width, task, planning,
+        mapping, limits, MAX_FAITHFULNESS_MAP_HEADS, cohort_chunks)
+}
+
+/// Quote a corpus whose sealed planner explicitly bounds complete evidence
+/// heads per source chunk. The planner checks that its fixed policy fits this
+/// declaration before execution; the quote cannot grant a wider policy or
+/// omit any evidence. The legacy helper retains its original 32-head bound.
+pub fn int4_faithfulness_document_corpus_requirements_with_max_heads(width: usize, task: TaskBudget,
+    planning: JudgeLimits, mapping: Int4FaithfulnessMapLimits, limits: CorpusLimits,
+    max_heads: usize, cohort_chunks: Option<usize>) -> Result<Int4FaithfulnessMapMemoryRequirement, HostedError> {
     let transport = limits.reservation_bytes()?;
     let max_result_bytes = document_output_bytes(mapping, cohort_chunks)?;
     if max_result_bytes > limits.transport.max_output_line_bytes as u64 {
@@ -31,9 +42,9 @@ pub fn int4_faithfulness_document_corpus_requirements(width: usize, task: TaskBu
     }
     let memory = map_memory(limits);
     let mut required = match cohort_chunks {
-        None => memory.requirements(width, task, planning, mapping),
+        None => memory.requirements_with_max_heads(width, task, planning, mapping, max_heads),
         Some(chunks) => memory.cohort_requirements(width, task, planning, mapping,
-            MAX_FAITHFULNESS_MAP_HEADS, chunks).map(|required| required.memory),
+            max_heads, chunks).map(|required| required.memory),
     }.map_err(map_error)?;
     let metadata = (mapping.chunks.max_chunks as u64).checked_mul(FAITHFULNESS_DOCUMENT_CHUNK_METADATA_BYTES)
         .ok_or(HostedError::Limits("faithfulness document metadata arithmetic"))?;
@@ -79,10 +90,12 @@ impl NlpEngine {
         crate::batch::judge::grouped_int4::validate_limits(planner.task_budget(), planner.planning_limits(),
             mapping, planner.max_run_work()).map_err(HostedError::BatchSetup)?;
         let cohort_chunks = planner.cohort_chunks();
-        let required = int4_faithfulness_document_corpus_requirements(planner.group_width(), planner.task_budget(),
-            planner.planning_limits(), mapping, limits, cohort_chunks)?;
+        let required = int4_faithfulness_document_corpus_requirements_with_max_heads(
+            planner.group_width(), planner.task_budget(), planner.planning_limits(), mapping,
+            limits, planner.max_heads(), cohort_chunks)?;
         let capacity = DocumentCapacity { context: limits.native.context_tokens, kv_bytes: required.native.kv_bytes,
-            mapping, cohort_chunks, max_result_bytes: planner.max_result_bytes(), task_budget: planner.task_budget() };
+            mapping, cohort_chunks, max_heads: planner.max_heads(),
+            max_result_bytes: planner.max_result_bytes(), task_budget: planner.task_budget() };
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(StreamInput { planner: Some(planner), reader, writer }))?;
@@ -135,6 +148,7 @@ pub(super) struct DocumentCapacity {
     pub(super) kv_bytes: u64,
     pub(super) mapping: Int4FaithfulnessMapLimits,
     pub(super) cohort_chunks: Option<usize>,
+    pub(super) max_heads: usize,
     pub(super) max_result_bytes: u64,
     pub(super) task_budget: TaskBudget,
 }
@@ -170,7 +184,8 @@ fn check_request(width: usize, capacity: DocumentCapacity, request: &Int4Faithfu
         || request.task_budget != c.task_budget || request.task_budget.validate().is_err()
         || chunks == 0 || chunks > c.mapping.chunks.max_chunks
         || request.required_context == 0 || request.required_context > c.context
-        || !(1..=MAX_FAITHFULNESS_MAP_HEADS).contains(&request.max_head_count)
+        || !(1..=MAX_FAITHFULNESS_MAP_HEADS).contains(&c.max_heads)
+        || !(1..=c.max_heads).contains(&request.max_head_count)
         || request.head_count < chunks || request.head_count < request.max_head_count
         || chunks.checked_mul(request.max_head_count).is_none_or(|heads| request.head_count > heads)
         || request.cohort_chunks != c.cohort_chunks {
@@ -182,7 +197,7 @@ fn check_request(width: usize, capacity: DocumentCapacity, request: &Int4Faithfu
         if chunks == 0 || chunks > c.mapping.chunks.max_chunks || chunks > MAX_INT4_SEQUENCES {
             return Err(BatchItemFailure::fatal(BatchCode::Admission));
         }
-        let heads = chunks.checked_mul(MAX_FAITHFULNESS_MAP_HEADS)
+        let heads = chunks.checked_mul(c.max_heads)
             .ok_or_else(|| BatchItemFailure::fatal(BatchCode::Admission))?.min(MAX_INT4_SEQUENCES);
         let contexts = [c.context; MAX_INT4_SEQUENCES];
         if row.kv_bytes.checked_mul(request.max_head_count as u64)

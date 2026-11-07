@@ -112,6 +112,26 @@ fn ragged_cohort_width_is_not_falsely_limited_to_two_source_chunks() {
 }
 
 #[test]
+fn explicit_head_cap_must_hold_the_entire_fixed_policy_without_pruning() {
+    for windows in 1..=31 {
+        let mut policy = policy();
+        policy.max_evidence_windows = windows; policy.max_evidence_spans = windows;
+        let required = if windows == 1 { 1 } else { windows as usize + 1 };
+        for cap in 1..=MAX_FAITHFULNESS_MAP_HEADS {
+            assert_eq!(validate_head_cap(policy, cap).is_ok(), cap >= required,
+                "{windows} evidence windows under a {cap}-head declaration");
+        }
+        for invalid in [0, 33, usize::MAX] { assert!(validate_head_cap(policy, invalid).is_err()); }
+    }
+    let mut invalid = policy(); invalid.max_evidence_spans = 0;
+    assert!(validate_head_cap(invalid, 32).is_err());
+    // Resource declarations and the selected window remain independent:
+    // 64 chunks can be valid with one head each, while native preflight must
+    // still refuse an actual later window containing more than 64 heads.
+    validate_cohort_chunks(64, mapping()).unwrap();
+}
+
+#[test]
 fn physical_summary_counts_full_vocabulary_projections_and_all_ragged_windows() {
     backend::verify_schedule(7, 3, 3, 9, 8, work(1)).unwrap();
     for (chunks, width, windows, steps, projections) in [(0, 3, 0, 1, 1), (7, 0, 3, 9, 8),

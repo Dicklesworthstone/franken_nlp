@@ -8,7 +8,7 @@ use crate::{native_engine::{lmhead::NANBEIGE_VOCAB_SIZE, strict_int4::Int4Memory
 pub(super) enum Backend<'e, 'w> {
     Serial(&'e mut StrictInt4Engine<'w>),
     Cohorts { weights: &'w Int4ModelWeights, kernel: PackedInt4Kernel,
-        chunks: usize, context: usize, required: Int4FaithfulnessMapCohortMemoryRequirement },
+        chunks: usize, context: usize, max_heads: usize, required: Int4FaithfulnessMapCohortMemoryRequirement },
 }
 impl<'e, 'w> Backend<'e, 'w> {
     pub(super) fn cohorts(compiler: &Int4FaithfulnessDocumentBatchPlanner, weights: &'w Int4ModelWeights,
@@ -17,9 +17,10 @@ impl<'e, 'w> Backend<'e, 'w> {
         validate_cohort_chunks(chunks, compiler.mapping)?;
         constrained_int4::check_model(compiler.execution_identity(), weights.identity()).map_err(|_| BatchCode::Admission)?;
         let required = memory.cohort_requirements(compiler.group_width(), compiler.task_budget(),
-            compiler.planning_limits(), compiler.mapping, MAX_FAITHFULNESS_MAP_HEADS, chunks)
+            compiler.planning_limits(), compiler.mapping, compiler.max_heads, chunks)
             .map_err(|error| map_failure(error, false).fault)?;
-        Ok(Self::Cohorts { weights, kernel, chunks, context: memory.context_tokens, required })
+        Ok(Self::Cohorts { weights, kernel, chunks, context: memory.context_tokens,
+            max_heads: compiler.max_heads, required })
     }
     pub(super) fn clean(&self) -> bool {
         match self { Self::Serial(engine) => !engine.is_poisoned() && engine.kv_cache().all_slots_have_len(0),
@@ -40,8 +41,9 @@ impl<'e, 'w> Backend<'e, 'w> {
                 }
                 (engine.model_identity(), context, row.kv_bytes)
             }
-            Self::Cohorts { weights, chunks, context, required, .. } => {
-                if compiler.cohort_chunks != Some(*chunks) || required.memory.max_output_bytes != compiler.max_result_bytes() {
+            Self::Cohorts { weights, chunks, context, max_heads, required, .. } => {
+                if compiler.cohort_chunks != Some(*chunks) || compiler.max_heads != *max_heads
+                    || required.memory.max_output_bytes != compiler.max_result_bytes() {
                     return Err(BatchItemFailure::fatal(BatchCode::Admission));
                 }
                 (weights.identity(), *context, required.memory.native.kv_bytes)

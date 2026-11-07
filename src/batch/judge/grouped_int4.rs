@@ -40,6 +40,7 @@ pub struct Int4FaithfulnessDocumentBatchPlanner {
     policy: FaithfulnessPolicy,
     mapping: Int4FaithfulnessMapLimits,
     max_run_work: Int4Work,
+    max_heads: usize,
     cohort_chunks: Option<usize>,
     seal: Arc<()>,
 }
@@ -54,7 +55,18 @@ impl Int4FaithfulnessDocumentBatchPlanner {
         constrained_int4::check_profile(compiler.execution_identity(), compiler.group_width())
             .map_err(|_| BatchCode::Admission)?;
         if compiler.execution_identity().task_spec != "judge-v1" { return Err(BatchCode::Admission.into()); }
-        Ok(Self { compiler, policy, mapping, max_run_work, cohort_chunks: None, seal: Arc::new(()) })
+        Ok(Self { compiler, policy, mapping, max_run_work, max_heads: MAX_FAITHFULNESS_MAP_HEADS,
+            cohort_chunks: None, seal: Arc::new(()) })
+    }
+    /// Explicitly bound every source chunk's complete evidence-head set.
+    /// The fixed policy must fit in full: this never truncates evidence,
+    /// changes its partition or widens the factory's task budget. Omitting
+    /// this opt-in preserves the original 32-head resource declaration.
+    pub fn with_max_heads(mut self, max_heads: usize) -> Result<Self, BatchFault> {
+        validate_head_cap(self.policy, max_heads)?;
+        self.max_heads = max_heads;
+        self.seal = Arc::new(());
+        Ok(self)
     }
     /// Fixed chunk windows retain every original evidence head. Head counts
     /// vary by source; every actual ragged window is checked after planning,
@@ -74,6 +86,7 @@ impl Int4FaithfulnessDocumentBatchPlanner {
     pub fn group_width(&self) -> usize { self.compiler.group_width() }
     pub fn policy(&self) -> FaithfulnessPolicy { self.policy }
     pub fn max_run_work(&self) -> Int4Work { self.max_run_work }
+    pub fn max_heads(&self) -> usize { self.max_heads }
     pub fn cohort_chunks(&self) -> Option<usize> { self.cohort_chunks }
     pub fn max_result_bytes(&self) -> u64 {
         self.mapping.max_result_bytes + if self.cohort_chunks.is_some() { COHORT_WRAPPER_BYTES } else { 0 }
@@ -248,6 +261,17 @@ fn validate_cohort_chunks(chunks: usize, mapping: Int4FaithfulnessMapLimits) -> 
     }
     Ok(())
 }
+fn validate_head_cap(policy: FaithfulnessPolicy, max_heads: usize) -> Result<(), BatchFault> {
+    policy.validate().map_err(|_| BatchCode::InvalidLimits)?;
+    // A single complete evidence window reuses the full-source head. Any
+    // larger partition retains its own full-source head plus every window.
+    let policy_heads = if policy.max_evidence_windows == 1 { 1 }
+        else { policy.max_evidence_windows as usize + 1 };
+    if !(1..=MAX_FAITHFULNESS_MAP_HEADS).contains(&max_heads) || policy_heads > max_heads {
+        return Err(BatchCode::InvalidLimits.into());
+    }
+    Ok(())
+}
 fn build_request(document: BatchDocument<Int4FaithfulnessDocumentArgs>, policy: FaithfulnessPolicy,
     task: TaskBudget, mapping: Int4FaithfulnessMapLimits) -> Result<JudgeRequest, BatchItemFailure> {
     let args = document.task_args.ok_or_else(|| BatchItemFailure::reject(BatchCode::Planning))?;
@@ -261,8 +285,8 @@ fn validate_plan(plan: &PreparedInt4FaithfulnessMap<'_>, compiler: &Int4Faithful
     -> Result<(), BatchItemFailure> {
     if plan.chunk_count() == 0 || plan.chunk_count() > compiler.mapping.chunks.max_chunks
         || plan.head_count() < plan.chunk_count()
-        || !(1..=MAX_FAITHFULNESS_MAP_HEADS).contains(&plan.max_head_count())
-        || plan.head_count() > plan.chunk_count().checked_mul(MAX_FAITHFULNESS_MAP_HEADS)
+        || !(1..=compiler.max_heads).contains(&plan.max_head_count())
+        || plan.head_count() > plan.chunk_count().checked_mul(compiler.max_heads)
             .ok_or_else(|| BatchItemFailure::fatal(BatchCode::Admission))?
         || plan.group_width() != compiler.group_width() || plan.task_budget() != compiler.task_budget()
         || plan.required_context() == 0 || plan.required_context() > compiler.mapping.chunks.context_tokens

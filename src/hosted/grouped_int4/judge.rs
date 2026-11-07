@@ -7,7 +7,8 @@ use crate::{
 };
 
 mod faithfulness_map;
-pub use faithfulness_map::{Int4FaithfulnessMapHostConfig, int4_faithfulness_document_corpus_requirements};
+pub use faithfulness_map::{Int4FaithfulnessMapHostConfig, int4_faithfulness_document_corpus_requirements,
+    int4_faithfulness_document_corpus_requirements_with_max_heads};
 
 /// Nonrenewable work for both comparison orders, every criterion or the
 /// complete full-source/evidence bundle. Callers admit compiled-plan storage

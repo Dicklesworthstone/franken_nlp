@@ -34,9 +34,21 @@ pub struct Int4FaithfulnessMapCohortMemoryRequirement {
 impl Int4FaithfulnessMapMemoryLimits {
     pub fn requirements(self, width: usize, task: TaskBudget, planning: JudgeLimits,
         mapping: Int4FaithfulnessMapLimits) -> Result<Int4FaithfulnessMapMemoryRequirement, Int4FaithfulnessMapError> {
+        self.requirements_with_max_heads(width, task, planning, mapping, MAX_FAITHFULNESS_MAP_HEADS)
+    }
+
+    /// Quote complete plan ownership under a declared per-chunk head cap.
+    /// Callers must bind that cap to the fixed evidence policy and reject
+    /// any prepared chunk that exceeds it before using this reservation.
+    /// Serial execution still owns only one physical KV row. Result and
+    /// evidence limits are unchanged; no source window may be omitted.
+    pub fn requirements_with_max_heads(self, width: usize, task: TaskBudget, planning: JudgeLimits,
+        mapping: Int4FaithfulnessMapLimits, max_heads: usize)
+        -> Result<Int4FaithfulnessMapMemoryRequirement, Int4FaithfulnessMapError> {
         mapping.validate(task)?;
         let scoring = planning.per_head;
-        if self.preparation_reserve_bytes < MIN_FAITHFULNESS_MAP_PREPARATION_BYTES
+        if !(1..=MAX_FAITHFULNESS_MAP_HEADS).contains(&max_heads)
+            || self.preparation_reserve_bytes < MIN_FAITHFULNESS_MAP_PREPARATION_BYTES
             || self.allocator_reserve_bytes == 0 || mapping.chunks.context_tokens > self.context_tokens
             || planning.max_total_prompt_tokens == 0 || planning.max_total_candidate_tokens == 0
             || planning.max_total_projected_logits == 0 || planning.max_output_bytes == 0
@@ -47,7 +59,7 @@ impl Int4FaithfulnessMapMemoryLimits {
         let native = Int4MemoryRequirement::for_context(self.context_tokens, width)?;
         if native.kv_bytes > task.max_kv_bytes { return Err(Int4FaithfulnessMapError::Admission); }
         let chunks = mapping.chunks.max_chunks as u64;
-        let max_heads = MAX_FAITHFULNESS_MAP_HEADS as u64;
+        let max_heads = max_heads as u64;
         let per_chunk_prompt = mul(u64::from(task.max_input_tokens), max_heads)?
             .min(planning.max_total_prompt_tokens as u64);
         let declared_tokens = mul(per_chunk_prompt, chunks)?;
@@ -82,7 +94,7 @@ impl Int4FaithfulnessMapMemoryLimits {
     pub fn cohort_requirements(self, width: usize, task: TaskBudget, planning: JudgeLimits,
         mapping: Int4FaithfulnessMapLimits, max_heads: usize, cohort_chunks: usize)
         -> Result<Int4FaithfulnessMapCohortMemoryRequirement, Int4FaithfulnessMapError> {
-        let mut memory = self.requirements(width, task, planning, mapping)?;
+        let mut memory = self.requirements_with_max_heads(width, task, planning, mapping, max_heads)?;
         if max_heads == 0 || max_heads > MAX_FAITHFULNESS_MAP_HEADS || cohort_chunks == 0
             || cohort_chunks > mapping.chunks.max_chunks || cohort_chunks > MAX_INT4_SEQUENCES {
             return Err(Int4FaithfulnessMapError::Limits);

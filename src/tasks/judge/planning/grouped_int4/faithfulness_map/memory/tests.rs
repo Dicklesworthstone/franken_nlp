@@ -82,3 +82,49 @@ fn per_chunk_task_kv_and_complete_window_output_are_independent_hard_caps() {
     task.max_output_bytes = 1_048_576;
     assert!(memory.cohort_requirements(32, task, planning, mapping, 32, 64).is_err());
 }
+
+#[test]
+fn explicit_head_cap_reduces_plan_ownership_without_shrinking_complete_results() {
+    let (memory, task, planning, mapping) = fixture();
+    let legacy = memory.requirements(32, task, planning, mapping).unwrap();
+    assert_eq!(legacy, memory.requirements_with_max_heads(32, task, planning, mapping, 32).unwrap());
+    let mut previous = None;
+    for heads in [1, 3, 8, 16, 32] {
+        let current = memory.requirements_with_max_heads(32, task, planning, mapping, heads).unwrap();
+        assert_eq!(current.native, legacy.native, "serial execution keeps one physical row");
+        assert_eq!(current.workspace_bytes, legacy.workspace_bytes);
+        assert_eq!(current.max_output_bytes, legacy.max_output_bytes);
+        assert_eq!(current.output_reservation_bytes, legacy.output_reservation_bytes);
+        assert!(current.input_bytes > memory.preparation_reserve_bytes);
+        if let Some(previous) = previous { assert!(current.input_bytes > previous); }
+        previous = Some(current.input_bytes);
+    }
+    for heads in [0, 33, usize::MAX] {
+        assert!(memory.requirements_with_max_heads(32, task, planning, mapping, heads).is_err());
+    }
+}
+
+#[test]
+fn small_declared_evidence_sets_enable_cohorts_with_their_own_task_kv_ceiling() {
+    let (memory, mut task, planning, mapping) = fixture();
+    let row = Int4MemoryRequirement::for_context(memory.context_tokens, 32).unwrap().kv_bytes;
+    task.max_kv_bytes = row;
+    assert!(memory.cohort_requirements(32, task, planning, mapping, 32, 3).is_err());
+    let one = memory.cohort_requirements(32, task, planning, mapping, 1, 3).unwrap();
+    assert_eq!(one.memory.native.kv_bytes, 3 * row);
+    let serial = memory.requirements_with_max_heads(32, task, planning, mapping, 1).unwrap();
+    assert!(one.memory.input_bytes >= serial.input_bytes + one.task_workspace_bytes);
+    task.max_kv_bytes = 3 * row;
+    let three = memory.cohort_requirements(32, task, planning, mapping, 3, 3).unwrap();
+    assert_eq!(three.memory.native.kv_bytes, 9 * row);
+    assert!(three.memory.input_bytes > one.memory.input_bytes);
+    assert_eq!(three.memory.max_output_bytes, one.memory.max_output_bytes);
+    assert_eq!(three.memory.output_reservation_bytes, one.memory.output_reservation_bytes);
+    task.max_kv_bytes -= 1;
+    assert!(memory.cohort_requirements(32, task, planning, mapping, 3, 3).is_err());
+    // The maximum admissible physical window remains64, not a silently
+    // shortened chunk schedule. Actual execution still checks every window.
+    task.max_kv_bytes += 1;
+    let many = memory.cohort_requirements(32, task, planning, mapping, 3, 64).unwrap();
+    assert_eq!(many.memory.native.kv_bytes, 64 * row);
+}

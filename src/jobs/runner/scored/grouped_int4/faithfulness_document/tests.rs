@@ -149,6 +149,53 @@ fn schedule_output_envelope_and_all_lifetime_axes_are_immutable() {
 }
 
 #[test]
+fn omitted_head_cap_preserves_the_exact_legacy_private_recipe() {
+    let actual = recipe(mapping(), policy(), budget(), JudgeLimits::default(), limits());
+    // This is the complete wire projection before bounded head declarations
+    // existed. No null field, new version, changed input policy or default
+    // cap may invalidate a previously committed source/claim population.
+    let legacy = serde_json::json!({
+        "version": 1,
+        "dependency_scope": "item-local-complete-source-claim",
+        "input_policy": "fixed-faithfulness-policy-required-claim-item-args-v1",
+        "execution": INT4_FAITHFULNESS_MAP_EXECUTION,
+        "chunk_profile": CHUNK_PROFILE,
+        "aggregation_profile": FAITHFULNESS_AGGREGATION_PROFILE,
+        "reservation_policy": "exact-all-chunk-five-axis-work-before-durable-attempt-v1",
+        "judge": &actual.judge,
+        "policy": policy(),
+        "chunks": mapping().chunks,
+        "per_document_model_work": mapping().max_model_work,
+        "max_retained_result_bytes": mapping().max_retained_result_bytes,
+        "max_result_bytes": mapping().max_result_bytes,
+        "max_stored_result_bytes": mapping().max_result_bytes,
+        "aggregation": mapping().aggregation,
+        "cohort_chunks": null,
+    });
+    assert!(actual.max_heads.is_none());
+    assert_eq!(canonjson::canonical_bytes(&actual).unwrap(), canonjson::canonical_bytes(&legacy).unwrap());
+}
+
+#[test]
+fn opted_in_head_cap_is_resume_authority_even_when_task_budget_stays_the_same() {
+    let mut policy = policy(); policy.max_evidence_windows = 1; policy.max_evidence_spans = 1;
+    let make = || recipe(mapping(), policy, budget(), JudgeLimits::default(), limits());
+    let original = make(); let original_binding = freeze(&original).binding;
+    for cap in [1, 3, 32] {
+        let mut explicit = make(); explicit.max_heads = Some(cap);
+        assert_eq!(original_binding.compare(&freeze(&explicit).binding),
+            Err(JobError::Mismatch(MismatchField::Recipe)), "explicit cap {cap}");
+        let serialized = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(serialized["max_heads"], cap);
+        assert_eq!(canonjson::canonical_bytes(&explicit.judge).unwrap(),
+            canonjson::canonical_bytes(&original.judge).unwrap());
+        let mut changed = make(); changed.max_heads = Some(if cap == 1 { 3 } else { 1 });
+        assert_eq!(freeze(&explicit).binding.compare(&freeze(&changed).binding),
+            Err(JobError::Mismatch(MismatchField::Recipe)));
+    }
+}
+
+#[test]
 fn both_exact_claim_and_final_source_tail_authenticate_without_metadata_disclosure() {
     let recipe = recipe(mapping(), policy(), budget(), JudgeLimits::default(), limits());
     let original = freeze(&recipe);

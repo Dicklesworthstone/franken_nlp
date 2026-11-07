@@ -39,6 +39,9 @@ pub struct Int4FaithfulnessDocumentJobRecipe {
     max_stored_result_bytes: u64,
     aggregation: FaithfulnessAggregationPolicy,
     cohort_chunks: Option<usize>,
+    /// Absence preserves the original recipe bytes and 32-head declaration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_heads: Option<usize>,
 }
 impl Int4FaithfulnessDocumentJobRecipe {
     fn new(judge: Int4ScoredJobRecipe, policy: FaithfulnessPolicy, mapping: Int4FaithfulnessMapLimits)
@@ -54,7 +57,7 @@ impl Int4FaithfulnessDocumentJobRecipe {
             reservation_policy: "exact-all-chunk-five-axis-work-before-durable-attempt-v1",
             judge, policy, chunks, per_document_model_work: max_model_work,
             max_retained_result_bytes, max_result_bytes, max_stored_result_bytes: max_result_bytes,
-            aggregation, cohort_chunks: None };
+            aggregation, cohort_chunks: None, max_heads: None };
         bounded_json(&recipe, RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
         Ok(recipe)
     }
@@ -79,6 +82,15 @@ impl Int4FaithfulnessDocumentJobPlanner {
         let compiler = Int4FaithfulnessDocumentBatchPlanner::new(planner, policy, mapping, native.max_model_work)?;
         Ok(Self { compiler, identity, recipe, limits })
     }
+    /// Narrow the physical declaration without changing the fixed policy or
+    /// task ceiling. An explicit cap becomes immutable resume authority;
+    /// existing jobs created without this opt-in keep their original recipe.
+    pub fn with_max_heads(mut self, max_heads: usize) -> Result<Self, BatchFault> {
+        self.compiler = self.compiler.with_max_heads(max_heads)?;
+        self.recipe.max_heads = Some(max_heads);
+        bounded_json(&self.recipe, RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
+        Ok(self)
+    }
     pub fn with_chunk_cohorts(mut self, chunks: usize) -> Result<Self, BatchFault> {
         self.compiler = self.compiler.with_chunk_cohorts(chunks)?;
         if self.compiler.max_result_bytes() > self.limits.max_result_bytes as u64 {
@@ -97,6 +109,7 @@ impl Int4FaithfulnessDocumentJobPlanner {
     pub fn job_limits(&self) -> JobLimits { self.limits }
     pub fn group_width(&self) -> usize { self.compiler.group_width() }
     pub fn policy(&self) -> FaithfulnessPolicy { self.compiler.policy() }
+    pub fn max_heads(&self) -> usize { self.compiler.max_heads() }
     pub fn cohort_chunks(&self) -> Option<usize> { self.compiler.cohort_chunks() }
     pub fn max_result_bytes(&self) -> u64 { self.compiler.max_result_bytes() }
     pub fn job_recipe(&self) -> &Int4FaithfulnessDocumentJobRecipe { &self.recipe }

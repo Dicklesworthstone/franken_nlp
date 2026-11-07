@@ -8,7 +8,6 @@ use crate::{
     jobs::{JobLimits, JobProgress, JobWork, population::JobPopulation,
         runner::{JobRunError, scored::grouped_int4::faithfulness_document::{
             Int4FaithfulnessDocumentJobPlanner, Int4FaithfulnessDocumentJobProcessor}}},
-    tasks::judge::grouped_int4::faithfulness_map::MAX_FAITHFULNESS_MAP_HEADS,
 };
 
 struct JobInput<R> {
@@ -44,12 +43,12 @@ impl NlpEngine {
         let mapping = planner.document_limits();
         let cohort_chunks = planner.cohort_chunks();
         let required = requirements(planner.group_width(), planner.task_budget(), planner.planning_limits(),
-            mapping, request.limits, limits, cohort_chunks)?;
+            mapping, request.limits, limits, planner.max_heads(), cohort_chunks)?;
         if planner.max_result_bytes() != document_output_bytes(mapping, cohort_chunks)? {
             return Err(HostedError::Limits("faithfulness document job result envelope").into());
         }
         let capacity = DocumentCapacity { context: limits.native.context_tokens,
-            kv_bytes: required.native.kv_bytes, mapping, cohort_chunks,
+            kv_bytes: required.native.kv_bytes, mapping, cohort_chunks, max_heads: planner.max_heads(),
             max_result_bytes: planner.max_result_bytes(), task_budget: planner.task_budget() };
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
@@ -111,9 +110,10 @@ fn map_memory(limits: JobHostLimits) -> Int4FaithfulnessMapMemoryLimits {
 
 /// The authenticated original population coexists with one complete map
 /// frontier and the frozen identities retained during exact recompilation.
+#[allow(clippy::too_many_arguments)]
 fn requirements(width: usize, task: TaskBudget, planning: JudgeLimits,
     mapping: Int4FaithfulnessMapLimits, job: JobLimits, host: JobHostLimits,
-    cohort_chunks: Option<usize>) -> Result<Int4FaithfulnessMapMemoryRequirement, HostedJobError> {
+    max_heads: usize, cohort_chunks: Option<usize>) -> Result<Int4FaithfulnessMapMemoryRequirement, HostedJobError> {
     let population = host.required_buffer_bytes(job)?;
     crate::batch::judge::grouped_int4::validate_limits(task, planning, mapping,
         job.max_work.int4_model_work()).map_err(HostedError::BatchSetup)?;
@@ -126,9 +126,9 @@ fn requirements(width: usize, task: TaskBudget, planning: JudgeLimits,
     }
     let memory = map_memory(host);
     let mut required = match cohort_chunks {
-        None => memory.requirements(width, task, planning, mapping),
+        None => memory.requirements_with_max_heads(width, task, planning, mapping, max_heads),
         Some(chunks) => memory.cohort_requirements(width, task, planning, mapping,
-            MAX_FAITHFULNESS_MAP_HEADS, chunks).map(|required| required.memory),
+            max_heads, chunks).map(|required| required.memory),
     }.map_err(map_error)?;
     let frontier = required.input_bytes.checked_sub(host.preparation_reserve_bytes)
         .ok_or(HostedError::Limits("faithfulness document preparation arithmetic"))?;
