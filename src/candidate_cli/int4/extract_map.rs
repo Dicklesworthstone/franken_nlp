@@ -1,5 +1,6 @@
 //! Complete-document INT4 extraction with explicit chunk and reduction budgets.
 use super::*;
+pub(super) mod corpus;
 use crate::{
     batch::extract::{ExtractionBatchArgs, grouped_int4::long::{Int4ExtractionMappingLimits, Int4ExtractionMapLimits,
         cohort::{Int4ExtractionMapCohortMemoryLimits, Int4ExtractionMapCohortRequirement}}},
@@ -99,12 +100,17 @@ impl MapArgs {
             cohort_chunks: matches.try_get_one::<usize>("cohort_chunks").ok().flatten().copied() })
     }
     pub(super) fn validate_document_job(&self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
-        self.validate_mode(args, true)
+        self.validate_mode(args, true, true)
+    }
+    fn validate_corpus(&self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
+        // The corpus uses a shared complete quote for all simultaneous owners.
+        // Do not reject on the one-shot map's more conservative phase sum first.
+        self.validate_mode(args, true, false)
     }
     pub(super) fn validate(&self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
-        self.validate_mode(args, false)
+        self.validate_mode(args, false, true)
     }
-    fn validate_mode(&self, args: &Int4Args, document_job: bool) -> Result<MapLimits, CandidateError> {
+    fn validate_mode(&self, args: &Int4Args, document_job: bool, admit_memory: bool) -> Result<MapLimits, CandidateError> {
         let m = self.mapping;
         let mut common = self.extraction.validate(args)?;
         if args.max_input_bytes < 4 || !(1..=256).contains(&m.max_chunks)
@@ -150,7 +156,7 @@ impl MapArgs {
             max_result_bytes_per_chunk: budget.max_output_bytes,
         }.requirements(args.group_width).map_err(|_| CandidateError::Arguments)).transpose()?;
         if let Some(quote) = cohort {
-            // Retained jobs commit only the original semantic document. The
+            // Population routes return only the original semantic document. The
             // one-off map additionally publishes bounded physical statistics.
             let output = if document_job { output } else { sum(&[output, 4096 * 4])? };
             let execution = sum(&[quote.native.kv_bytes, quote.native.rope_bytes,
@@ -162,7 +168,7 @@ impl MapArgs {
         } else {
             common.minimum_memory_bytes = sum(&[common.minimum_memory_bytes, input, workspace_bytes, output])?;
         }
-        if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
+        if admit_memory && common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(MapLimits { common, mapping, reduction_reserve_bytes, max_result_bytes: m.max_map_result_bytes,
             workspace_bytes, cohort_chunks: self.cohort_chunks, cohort })
     }

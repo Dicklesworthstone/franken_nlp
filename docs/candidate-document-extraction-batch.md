@@ -1,5 +1,10 @@
 # Candidate complete-document extraction batches
 
+For source-converted or independently pinned snapshot INT4 models, see
+[complete-document INT4 extraction corpora](native-extraction-corpus-int4.md).
+That route provides explicit fixed run work/verification ceilings and optional
+native chunk cohorts. The portable INT8 route is documented below.
+
 `fnlp candidate batch --task extract --chunked --schema FILE` reads bounded NDJSON
 records whose original text can exceed one native context. It uses one resident
 candidate model, one native engine, one process-owned invocation and the existing

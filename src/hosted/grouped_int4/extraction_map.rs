@@ -12,6 +12,8 @@ use crate::{
     validation::grounded_fields::{SourceFieldEvidence, VerifiedSourceSpan},
 };
 mod cohort;
+mod corpus;
+pub use corpus::int4_extraction_document_corpus_requirements;
 
 /// Admission for a complete original document. The immutable compiler owns
 /// the base identity; this config cannot substitute another model or task.

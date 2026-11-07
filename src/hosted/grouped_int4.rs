@@ -28,7 +28,7 @@ mod structured_cohort;
 mod semantic;
 pub use semantic::{Int4SemanticHostLimits, Int4SemanticHostRequirements};
 mod extraction_map;
-pub use extraction_map::Int4ExtractionMapConfig;
+pub use extraction_map::{Int4ExtractionMapConfig, int4_extraction_document_corpus_requirements};
 mod source;
 mod source_map;
 pub use source_map::Int4SourceMapConfig;
