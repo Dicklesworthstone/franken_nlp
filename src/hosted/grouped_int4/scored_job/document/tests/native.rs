@@ -80,8 +80,9 @@ fn complete_native_classification_jobs_match_serial_and_cohorts_and_resume_witho
             let root = parent.join(format!("{index}-{cohorts}"));
             fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
             let factory = || planner(&model, settings.clone(), planning, document, job, host, cohorts);
+            let retention = crate::jobs::InputRetentionLimits { max_spool_bytes: 1 << 20 };
             let progress = engine.job_int4_classification_document(&model, factory(),
-                request(root.clone(), job, JobOpenMode::Create), host, PackedInt4Kernel::scalar(),
+                request(root.clone(), job, JobOpenMode::CreateRetainingInputs(retention)), host, PackedInt4Kernel::scalar(),
                 Cursor::new(source.as_bytes().to_vec()), CancellationToken::default()).unwrap();
             assert_eq!(progress.committed, 2); assert_eq!(progress.attempts, 2); assert!(progress.materialized);
             drained(&engine, baseline);
@@ -103,12 +104,23 @@ fn complete_native_classification_jobs_match_serial_and_cohorts_and_resume_witho
             assert_eq!(replay, progress, "committed documents must consume no additional attempts or native work");
             assert_eq!(fs::read_to_string(root.join("materialized.ndjson")).unwrap(), output);
             drained(&engine, baseline);
+            let dropped = Arc::new(AtomicBool::new(false));
+            let retained = engine.job_int4_classification_document(&model, factory(),
+                request(root.clone(), job,
+                    JobOpenMode::ResumeRetained { tail: TailPolicy::Refuse, retention }),
+                host, PackedInt4Kernel::scalar(), NeverRead(Arc::clone(&dropped)),
+                CancellationToken::default()).unwrap();
+            assert_eq!(retained, progress, "retained input must not authorize a second native attempt");
+            assert!(dropped.load(Ordering::SeqCst));
+            assert_eq!(fs::read_to_string(root.join("materialized.ndjson")).unwrap(), output);
+            drained(&engine, baseline);
             let mut changed = settings.clone(); changed.labels[0].description = "changed private policy".to_owned();
             let changed = planner(&model, changed, planning, document, job, host, cohorts);
             let before = fs::read(root.join("results.spool")).unwrap();
             assert!(engine.job_int4_classification_document(&model, changed,
-                request(root.clone(), job, JobOpenMode::Resume(TailPolicy::DiscardUncommitted)),
-                host, PackedInt4Kernel::scalar(), Cursor::new(source.as_bytes().to_vec()),
+                request(root.clone(), job,
+                    JobOpenMode::ResumeRetained { tail: TailPolicy::DiscardUncommitted, retention }),
+                host, PackedInt4Kernel::scalar(), NeverRead(Arc::new(AtomicBool::new(false))),
                 CancellationToken::default()).is_err());
             assert_eq!(fs::read(root.join("results.spool")).unwrap(), before);
             drained(&engine, baseline);

@@ -77,11 +77,11 @@ impl Drop for Root { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
 fn request(root: &Root, mode: JobOpenMode, materialize: bool) -> SourceJobRequest {
     SourceJobRequest { root: root.0.clone(), key: key(), job_id: JobId([7;16]), limits: job_limits(), mode, materialize }
 }
-fn population(changed: bool) -> JobPopulation {
+fn population(changed: bool) -> Option<JobPopulation> {
     let text = if changed { "changed" } else { "original" };
     let source = format!("{{\"id\":\"alpha\",\"text\":\"{text}\"}}\n{{\"id\":\"beta\",\"text\":\"original\"}}\n");
-    JobPopulation::read_ndjson(&mut Cursor::new(source), &key(), JobId([7;16]), job_limits(),
-        host_limits().transport, &mut Control::default()).unwrap()
+    Some(JobPopulation::read_ndjson(&mut Cursor::new(source), &key(), JobId([7;16]), job_limits(),
+        host_limits().transport, &mut Control::default()).unwrap())
 }
 struct Fixture { identity: ExecutionIdentity, calls: Arc<Mutex<Vec<u64>>>, fail_second: bool }
 impl Fixture {
@@ -152,4 +152,80 @@ fn default_host_error_formatting_does_not_include_private_nested_messages() {
     assert!(!format!("{error:?} {error}").contains("private path"));
     let job = HostedJobError::from(JobError::DuplicateId);
     assert!(format!("{job}").contains("DuplicateId"));
+}
+
+#[test]
+fn retained_resume_owns_the_population_and_keeps_failed_attempt_debits() {
+    let root = Root::new(); let calls = Arc::new(Mutex::new(Vec::new()));
+    let retention = InputRetentionLimits { max_spool_bytes: 1 << 20 };
+    let mut control = Control::default();
+    let original = population(false);
+    let failure = run_population(request(&root, JobOpenMode::CreateRetainingInputs(retention), true),
+        &original, Fixture::new(&calls, true), &mut control).unwrap_err();
+    assert_eq!(failure, JobRunError::Processor(BatchCode::Execution.into()));
+    assert!(root.0.join("inputs.spool").exists());
+    assert!(!root.0.join("materialized.ndjson").exists());
+    drop(original);
+    let progress = run_population(request(&root,
+        JobOpenMode::ResumeRetained { tail: TailPolicy::Refuse, retention }, true),
+        &None, Fixture::new(&calls, false), &mut control).unwrap();
+    assert_eq!(progress.committed, 2); assert_eq!(progress.attempts, 3);
+    assert!(progress.materialized);
+    assert_eq!(*calls.lock().unwrap(), vec![1, 2, 2]);
+    assert_eq!(fs::read(root.0.join("materialized.ndjson")).unwrap(), b"1\n2\n");
+}
+
+#[test]
+fn retained_mode_does_not_touch_the_supplied_reader() {
+    struct Unreadable;
+    impl std::io::Read for Unreadable {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> { panic!("original input read") }
+    }
+    impl std::io::BufRead for Unreadable {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> { panic!("original input buffered") }
+        fn consume(&mut self, _: usize) { panic!("original input consumed") }
+    }
+    let root = Root::new();
+    let mode = JobOpenMode::ResumeRetained { tail: TailPolicy::Refuse,
+        retention: InputRetentionLimits { max_spool_bytes: 1 << 20 } };
+    assert!(read_population(&mut Unreadable, &request(&root, mode, false),
+        host_limits().transport, &mut Control::default()).unwrap().is_none());
+    let invalid = JobOpenMode::ResumeRetained { tail: TailPolicy::Refuse,
+        retention: InputRetentionLimits { max_spool_bytes: 0 } };
+    assert!(read_population(&mut Unreadable, &request(&root, invalid, false),
+        host_limits().transport, &mut Control::default()).is_err());
+    assert!(fs::read_dir(&root.0).unwrap().next().is_none());
+}
+
+#[test]
+fn input_selection_cannot_silently_change_authority() {
+    let root = Root::new(); let calls = Arc::new(Mutex::new(Vec::new()));
+    let retention = InputRetentionLimits { max_spool_bytes: 1 << 20 };
+    let mut control = Control::default();
+    for mode in [JobOpenMode::Create, JobOpenMode::Resume(TailPolicy::Refuse),
+        JobOpenMode::CreateRetainingInputs(retention)] {
+        let error = run_population(request(&root, mode, false), &None,
+            Fixture::new(&calls, false), &mut control).unwrap_err();
+        assert_eq!(error, JobRunError::Storage(JobError::InvalidLimits));
+    }
+    let error = run_population(request(&root,
+        JobOpenMode::ResumeRetained { tail: TailPolicy::Refuse, retention }, false),
+        &population(false), Fixture::new(&calls, false), &mut control).unwrap_err();
+    assert_eq!(error, JobRunError::Storage(JobError::InvalidLimits));
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn ordinary_creation_never_authorizes_retained_replay() {
+    let root = Root::new(); let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut control = Control::default();
+    run_population(request(&root, JobOpenMode::Create, false), &population(false),
+        Fixture::new(&calls, false), &mut control).unwrap();
+    assert!(!root.0.join("inputs.spool").exists());
+    let mode = JobOpenMode::ResumeRetained { tail: TailPolicy::DiscardUncommitted,
+        retention: InputRetentionLimits { max_spool_bytes: 1 << 20 } };
+    assert!(run_population(request(&root, mode, true), &None,
+        Fixture::new(&calls, false), &mut control).is_err());
+    assert_eq!(*calls.lock().unwrap(), vec![1, 2]);
+    assert!(!root.0.join("materialized.ndjson").exists());
 }

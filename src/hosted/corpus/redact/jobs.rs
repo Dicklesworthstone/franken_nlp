@@ -3,9 +3,9 @@
 use super::*;
 use crate::{
     batch::{BatchDocument, BatchProcessor, BatchRequestContext, BatchWork},
-    jobs::{JobProgress, JobWork, population::JobPopulation, runner::{DurableBatchProcessor, JobRunError}},
+    jobs::{JobProgress, JobWork, runner::{DurableBatchProcessor, JobRunError}},
     native_engine::decode::DecodeStepControl,
-    hosted::corpus::jobs::{run_population, HostedJobError, JobHostLimits, SourceJobRequest},
+    hosted::corpus::jobs::{read_population, run_population, HostedJobError, JobHostLimits, SourceJobRequest},
     tasks::redact::batch::{RedactionBatchArgs, Int8RedactionBatchAdmission},
 };
 mod recipe;
@@ -51,8 +51,8 @@ impl NlpEngine {
             let context = pseudonym_context(secret.as_ref(), &config.batch.request)?;
             let identity = config.batch.ner_identity.clone();
             let recipe = RedactionJobRecipe::short(&config.batch, context.as_ref())?;
-            let population = match JobPopulation::read_ndjson(&mut input.value.reader, &request.key,
-                request.job_id, request.limits, limits.transport, control) {
+            let population = match read_population(&mut input.value.reader, &request,
+                limits.transport, control) {
                 Ok(p) => p, Err(e) => return Ok(Err(JobRunError::Storage(e))),
             };
             let mut engine = allocate_native(kv, scratch, || model.inner.loaded.value

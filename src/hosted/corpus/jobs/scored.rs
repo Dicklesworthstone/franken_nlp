@@ -37,8 +37,8 @@ impl NlpEngine {
             let factory = Int8ClassificationJobPlanner::new(&planner, config.identity,
                 config.task_ceiling, config.planning, config.defaults, config.max_model_work)
                 .map_err(HostedError::BatchSetup)?;
-            let population = match JobPopulation::read_ndjson(&mut input.value.reader, &request.key,
-                request.job_id, request.limits, limits.transport, control) {
+            let population = match read_population(&mut input.value.reader, &request,
+                limits.transport, control) {
                 Ok(p) => p, Err(e) => return Ok(Err(JobRunError::Storage(e))),
             };
             let mut engine = allocate_native(kv, scratch, || model.inner.loaded.value
@@ -85,8 +85,8 @@ impl NlpEngine {
             let mut input = input;
             let (planner, config, request) = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
             let factory = Int8SentimentJobPlanner::new(&planner, config).map_err(HostedError::BatchSetup)?;
-            let population = match JobPopulation::read_ndjson(&mut input.value.reader, &request.key,
-                request.job_id, request.limits, limits.transport, control) {
+            let population = match read_population(&mut input.value.reader, &request,
+                limits.transport, control) {
                 Ok(p) => p, Err(e) => return Ok(Err(JobRunError::Storage(e))),
             };
             let mut engine = allocate_native(kv, scratch, || model.inner.loaded.value

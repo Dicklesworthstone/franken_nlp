@@ -5,8 +5,8 @@ use super::*;
 use std::io::BufRead;
 use crate::{
     batch::scored_int4::Int4ScoredBatchLimits,
-    hosted::corpus::jobs::{HostedJobError, JobHostLimits, SourceJobRequest, run_population},
-    jobs::{JobLimits, JobProgress, population::JobPopulation,
+    hosted::corpus::jobs::{HostedJobError, JobHostLimits, SourceJobRequest, read_population, run_population},
+    jobs::{JobLimits, JobProgress,
         runner::{JobRunError, scored::grouped_int4::{Int4ScoredJobPlanner,
             Int4ScoredJobProcessor, Int4ScoredJobTask}}},
     native_engine::constrained_int4,
@@ -68,8 +68,8 @@ impl NlpEngine {
             checkpoint(control)?;
             let (planner, request) = input.value.preparation.take()
                 .ok_or(HostedError::CompletionMissing)?;
-            let population = match JobPopulation::read_ndjson(&mut input.value.reader,
-                &request.key, request.job_id, request.limits, limits.transport, control) {
+            let population = match read_population(&mut input.value.reader,
+                &request, limits.transport, control) {
                 Ok(population) => population,
                 Err(error) => return Ok(Err(JobRunError::Storage(error))),
             };

@@ -1,9 +1,9 @@
 //! Retained complete judgments using the SAME processor as the live corpus.
 //! No public injected scorer, renewed task budget, or generated-label fallback.
 use super::*;
-use super::super::jobs::{run_population, HostedJobError, JobHostLimits, SourceJobRequest};
+use super::super::jobs::{read_population, run_population, HostedJobError, JobHostLimits, SourceJobRequest};
 use crate::{
-    jobs::{JobProgress, JobWork, population::JobPopulation,
+    jobs::{JobProgress, JobWork,
         runner::{DurableBatchProcessor, JobRunError}},
     native_engine::lmhead::scoring::ScoringLimits,
     tasks::judge::{JUDGE_PROMPT_VERSION, quantized::INT8_JUDGE_EXECUTION},
@@ -57,8 +57,8 @@ impl NlpEngine {
             let mut input = input;
             let (planner, config, request) = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
             let recipe = JudgeJobRecipe::new(&config, prefill)?;
-            let population = match JobPopulation::read_ndjson(&mut input.value.reader, &request.key,
-                request.job_id, request.limits, limits.transport, control) {
+            let population = match read_population(&mut input.value.reader, &request,
+                limits.transport, control) {
                 Ok(population) => population,
                 Err(error) => return Ok(Err(JobRunError::Storage(error))),
             };

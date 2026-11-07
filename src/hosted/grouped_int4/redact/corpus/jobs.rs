@@ -2,8 +2,8 @@
 //! protocol. One item commits one final edit, never intermediate NER chunks.
 use super::*;
 use crate::{
-    hosted::corpus::jobs::{run_population, HostedJobError, JobHostLimits, SourceJobRequest},
-    jobs::{JobLimits, JobProgress, population::JobPopulation, runner::{JobRunError,
+    hosted::corpus::jobs::{read_population, run_population, HostedJobError, JobHostLimits, SourceJobRequest},
+    jobs::{JobLimits, JobProgress, runner::{JobRunError,
         redact::grouped_int4::{self as redact_job, Int4RedactionJobConfig,
             Int4RedactionJobProcessor, INT4_REDACTION_JOB_RECIPE_BYTES}}},
 };
@@ -93,8 +93,8 @@ impl NlpEngine {
             // The actual pseudonym key commitment is checked before any
             // population IO; the independent job secret authenticates storage.
             let context = pseudonym_context(secret.as_ref(), &config.batch.batch.request)?;
-            let population = match JobPopulation::read_ndjson(&mut input.value.reader, &request.key,
-                request.job_id, request.limits, limits.transport, control) {
+            let population = match read_population(&mut input.value.reader, &request,
+                limits.transport, control) {
                 Ok(population) => population,
                 Err(error) => return Ok(Err(JobRunError::Storage(error))),
             };

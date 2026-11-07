@@ -44,8 +44,8 @@ impl NlpEngine {
             let context = pseudonym_context(secret.as_ref(), &config.batch.request)?;
             let identity = config.batch.ner_identity.clone();
             let recipe = RedactionJobRecipe::long(&config.batch, context.as_ref())?;
-            let population = match JobPopulation::read_ndjson(&mut input.value.reader, &request.key,
-                request.job_id, request.limits, limits.transport, control) {
+            let population = match read_population(&mut input.value.reader, &request,
+                limits.transport, control) {
                 Ok(p) => p, Err(e) => return Ok(Err(JobRunError::Storage(e))),
             };
             let mut engine = allocate_native(kv, scratch, || model.inner.loaded.value

@@ -30,8 +30,8 @@ impl NlpEngine {
         let completed = dispatch::run(self, limits.native.run, cancellation, move |control| {
             let mut input = input; // Capture the complete storage-before-charge package.
             let (planner, vocabulary, request) = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
-            let population = match JobPopulation::read_ndjson(&mut input.value.reader, &request.key,
-                request.job_id, request.limits, limits.transport, control) {
+            let population = match read_population(&mut input.value.reader, &request,
+                limits.transport, control) {
                 Ok(population) => population,
                 Err(error) => return Ok(Err(JobRunError::Storage(error))),
             };

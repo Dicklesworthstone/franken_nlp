@@ -7,8 +7,8 @@ mod extract_document;
 mod document_native;
 mod generation;
 use crate::{
-    hosted::corpus::jobs::{HostedJobError, JobHostLimits, SourceJobRequest, run_population},
-    jobs::{JobLimits, JobProgress, population::JobPopulation,
+    hosted::corpus::jobs::{HostedJobError, JobHostLimits, SourceJobRequest, read_population, run_population},
+    jobs::{JobLimits, JobProgress,
         runner::{JobRunError, extract::grouped_int4::{Int4ExtractionJobPlanner, Int4ExtractionJobProcessor}}},
     tasks::ir::TaskBudget,
 };
@@ -54,8 +54,8 @@ impl NlpEngine {
             checkpoint(control)?;
             let (planner, vocabulary, request) = input.value.preparation.take()
                 .ok_or(HostedError::CompletionMissing)?;
-            let population = match JobPopulation::read_ndjson(&mut input.value.reader, &request.key,
-                request.job_id, request.limits, limits.transport, control) {
+            let population = match read_population(&mut input.value.reader, &request,
+                limits.transport, control) {
                 Ok(population) => population,
                 Err(error) => return Ok(Err(JobRunError::Storage(error))),
             };

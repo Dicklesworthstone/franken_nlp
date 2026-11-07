@@ -4,8 +4,8 @@ use std::io::BufRead;
 use super::corpus::{DocumentAdmission, DocumentCapacity, document_output_bytes};
 use crate::{
     batch::judge::grouped_int4::FAITHFULNESS_DOCUMENT_CHUNK_METADATA_BYTES,
-    hosted::corpus::jobs::{HostedJobError, JobHostLimits, SourceJobRequest, run_population},
-    jobs::{JobLimits, JobProgress, JobWork, population::JobPopulation,
+    hosted::corpus::jobs::{HostedJobError, JobHostLimits, SourceJobRequest, read_population, run_population},
+    jobs::{JobLimits, JobProgress, JobWork,
         runner::{JobRunError, scored::grouped_int4::faithfulness_document::{
             Int4FaithfulnessDocumentJobPlanner, Int4FaithfulnessDocumentJobProcessor}}},
 };
@@ -62,8 +62,8 @@ impl NlpEngine {
             let mut input = input;
             checkpoint(control)?;
             let (planner, request) = input.value.preparation.take().ok_or(HostedError::CompletionMissing)?;
-            let population = match JobPopulation::read_ndjson(&mut input.value.reader,
-                &request.key, request.job_id, request.limits, limits.transport, control) {
+            let population = match read_population(&mut input.value.reader,
+                &request, limits.transport, control) {
                 Ok(population) => population,
                 Err(error) => return Ok(Err(JobRunError::Storage(error))),
             };
