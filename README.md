@@ -2785,6 +2785,58 @@ source-inventoried candidate rail. Model-present execution, quality,
 performance and release qualification have not been established by these
 implementation fixtures.
 
+## Implemented candidate INT4 resident complete-source task corpora
+
+`fnlp candidate source-int4 source-corpus` now streams complete original
+documents through the existing NER, keyphrase, summary and fixed-question
+pipelines with one resident model. The live route requires
+`asupersync-runtime` and has no metadata-store or retained-job requirement.
+
+| Command | Complete-document modes |
+|---|---|
+| `source-corpus ner` or `ner-corpus` | Independent source-grounded entity maps |
+| `source-corpus keyphrases` or `keyphrases-corpus` | Independent maps; explicit `--reduce-keyphrases` for global exact candidate ranking |
+| `source-corpus summarize` or `summarize-corpus` | Exact cited-bullet union; explicit flat or hierarchical neural synthesis |
+| `source-corpus answer --question FILE` | Fixed-question maps; explicit flat or hierarchical evidence-based answer synthesis |
+
+The separate `answer-corpus` route continues to accept a private question per
+record. The fixed-task route accepts `{id,text,task_args?}` records with
+`task_args` absent, null or empty; `text` is the complete original source.
+One fixed `--options` file controls the selected per-chunk task.
+
+```sh
+fnlp candidate source-int4 summarize-corpus documents.ndjson \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --memory-mib "$MEMORY_MIB" --group-width 128 \
+  --synthesize-summary --hierarchical-summary \
+  --cohort-chunks 4 --cohort-hierarchy-groups 2
+```
+
+Every original discovery frontier is preflighted before its first native
+forward, then sealed identities and work are compared during execution
+reconstruction. All selected reduction and synthesis passes belong to one
+atomic complete-document result. Explicit discovery and hierarchy group
+cohorts reuse the existing native kernels and admit the complete phase peak,
+without changing per-row task authority or semantic output.
+
+All five native work flags bound the entire stream. Independent run-wide mask,
+source-verification and deterministic-reducer ceilings also remain cumulative
+across records, failures and flushes. The host owns source, fixed private
+settings, compiled frontiers, native state, reader/writer and guarded results
+through physical completion. Whole-run success requires `run_complete` and
+exit zero. Original-coordinate citations establish source membership;
+hierarchies remain explicitly lossy and do not establish semantic entailment.
+
+The library API is `Int4SourceDocumentBatchPlanner` with
+`NlpEngine::batch_int4_source_documents`, backed by a shared pure memory quote.
+Durable document jobs reuse the same storage-neutral task/planning/backend
+code and preserve their original authenticated recipe bytes. See
+[resident complete-source task corpora](docs/source-corpus.md) for input,
+limits, mode selection, source/snapshot acquisition and library details.
+Compilation, tests and native qualification remain pending the required DSR
+production gate.
+
 ## Implemented candidate INT4 source-task jobs
 
 `fnlp candidate source-int4 ner-job|keyphrases-job|summarize-job|answer-job`

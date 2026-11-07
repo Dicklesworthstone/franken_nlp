@@ -140,6 +140,7 @@ enum Int4Task {
     Source(crate::candidate_cli::source::Kind, source::SourceArgs),
     SourceBatch(source_batch::BatchArgs),
     SourceMap(source_map::MapArgs),
+    SourceCorpus(source_map::documents::CorpusArgs),
     AnswerCorpus(source_map::corpus::CorpusArgs),
     ExtractBatch(extract_batch::BatchArgs),
     ExtractMap(extract_map::MapArgs),
@@ -189,7 +190,7 @@ pub(super) fn definition() -> clap::Command {
     clap::Command::new("source-int4")
         .about("Run candidate INT4 tasks from pinned sources or a digest-pinned local snapshot")
         .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Sequential native execution defaults to scalar; --kernel explicitly selects an existing hardware-checked integer leaf. Text tasks and one-off classify, sentiment, judge, extract, ner, keyphrases, summarize and answer can opt in to bounded layer-major prompt execution with --prefill-rows. Structured batch, map, job, redaction and semantic workflows retain their existing prompt schedules. stream generate/chat emits bounded provisional token NDJSON and requires a final run_complete after native drain. text-batch runs one finite NDJSON cohort and emits one completed aggregate JSON object. text-corpus processes bounded windows with one resident model and cumulative budgets, emitting completed-window NDJSON with a required corpus_complete footer. extract-batch streams documents under one shared schema through one resident model and engine. ner, keyphrases, summarize and answer preserve their source-task semantics; their -batch commands run ordered typed source-task NDJSON. Every ordered batch requires run_complete plus exit 0 for whole-run success. ner-map and keyphrases-map process every chunk of a complete document with original-coordinate evidence; summarize-map produces a deterministic exact cited bullet union. sentiment-map scores every original source chunk with complete independent dimension distributions and explicit scalar-weighted aggregation, optionally using real chunk cohorts. classify-map retains every chunk's exact classification scores and reports a separate scalar-weighted exclusive or independent multi-label mixture. All map commands preflight the complete document and publish one completed result. extract-job start/resume retains ordered extraction results in an explicit protected spool. ner-job, keyphrases-job, summarize-job and answer-job provide the same opt-in durable start/resume contract for source tasks. redact-job start/resume retains complete-document edits under one authenticated detector, action and key scope, with metadata-only stdout. Resume authenticates the complete original population, exact task configuration, model/group identity and immutable lifetime limits. No automatic selection, fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Other routes publish completed task or corpus results.")
-        .after_long_help("Complete-document classification defaults to serial execution. classify-map --cohort-chunks N processes complete independent chunks together; requested chunks times actual heads must be at most 64 (one head for exclusive mode, one per label for multi_label). Physical cohort statistics remain separate from the semantic output. classify-corpus applies the complete-document map to ordered NDJSON with one resident model. Its explicit --cohort-chunks schedule shares native layers within each document; --max-labels bounds every default and replacement and can reduce admitted cohort memory. sentiment-corpus provides complete-document affect distributions and their scalar-weighted aggregate on the same ordered resident stream pattern; --max-axes bounds defaults and replacements, and --cohort-chunks shares layers within each document. Both corpus routes keep all five work ceilings across the entire run without renewal at chunk cohorts or flushes. Require run_complete plus exit 0.")
+        .after_long_help("Complete-document classification defaults to serial execution. classify-map --cohort-chunks N processes complete independent chunks together; requested chunks times actual heads must be at most 64 (one head for exclusive mode, one per label for multi_label). Physical cohort statistics remain separate from the semantic output. classify-corpus applies the complete-document map to ordered NDJSON with one resident model. Its explicit --cohort-chunks schedule shares native layers within each document; --max-labels bounds every default and replacement and can reduce admitted cohort memory. sentiment-corpus provides complete-document affect distributions and their scalar-weighted aggregate on the same ordered resident stream pattern; --max-axes bounds defaults and replacements, and --cohort-chunks shares layers within each document. Both corpus routes keep all five work ceilings across the entire run without renewal at chunk cohorts or flushes. source-corpus ner/keyphrases/summarize/answer applies the existing complete-document source pipelines to a live resident stream with fixed options and, for answer, one fixed question file. It includes exact reducers, explicit neural synthesis and hierarchies, and independent discovery/hierarchy cohort schedules. ner-corpus, keyphrases-corpus and summarize-corpus are short forms. Require run_complete plus exit 0.")
         .subcommand_required(true)
         .subcommand(task("generate", "Generate from a bounded UTF-8 prompt using the pinned template"))
         .subcommand(task("chat", "Complete a bounded JSON system/user/assistant transcript"))
@@ -226,6 +227,8 @@ pub(super) fn definition() -> clap::Command {
         .subcommands(source_batch::definitions())
         .subcommands(source_job::definitions())
         .subcommands(source_map::definitions())
+        .subcommand(source_map::documents::definition())
+        .subcommands(source_map::documents::definitions())
         .subcommand(source_map::corpus::definition())
         .subcommand(batch::definition())
         .subcommand(batch::corpus::definition())
@@ -238,6 +241,14 @@ impl Int4Command {
         if name == "stream" {
             let (task, options, args) = stream::from_matches(matches)?;
             return Ok(Self { task: Int4Task::Stream(task, options), args, batch: None, job: None });
+        }
+        if name == "source-corpus" {
+            let (name, matches) = matches.subcommand().ok_or_else(||
+                clap::Error::raw(clap::error::ErrorKind::MissingSubcommand, "source corpus task required"))?;
+            let kind = crate::candidate_cli::source::Kind::named(name).ok_or_else(||
+                clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source corpus task refused"))?;
+            return Ok(Self { task: Int4Task::SourceCorpus(source_map::documents::CorpusArgs::from_matches(kind, matches)?),
+                args: Int4Args::from_arg_matches(matches)?, batch: None, job: None });
         }
         if name == "text-job" {
             let (job, args) = text_job::JobCommand::from_matches(matches)?;
@@ -326,6 +337,11 @@ impl Int4Command {
                     .ok_or_else(|| clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source map task refused"))?;
                 Int4Task::SourceMap(source_map::MapArgs::from_matches(kind, matches)?)
             }
+            "ner-corpus" | "keyphrases-corpus" | "summarize-corpus" => {
+                let kind = crate::candidate_cli::source::Kind::named(name.trim_end_matches("-corpus"))
+                    .ok_or_else(|| clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source corpus task refused"))?;
+                Int4Task::SourceCorpus(source_map::documents::CorpusArgs::from_matches(kind, matches)?)
+            }
             "ner-batch" | "keyphrases-batch" | "summarize-batch" | "answer-batch" => {
                 let kind = crate::candidate_cli::source::Kind::named(name.trim_end_matches("-batch"))
                     .ok_or_else(|| clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source batch task refused"))?;
@@ -375,6 +391,8 @@ impl Int4Command {
                 return options.run_owned(args, input, output, diagnostics),
             Self { task: Int4Task::SourceBatch(options), args, batch: None, job: None } =>
                 options.execute_owned(args, input, output),
+            Self { task: Int4Task::SourceCorpus(options), args, batch: None, job: None } =>
+                return options.run_owned(args, input, output, diagnostics),
             Self { task: Int4Task::ScoredBatch(options), args, batch: None, job: None } =>
                 options.execute_owned(args, input, output),
             Self { task: Int4Task::ClassifyCorpus(options), args, batch: None, job: None } =>
@@ -443,7 +461,7 @@ impl Int4Command {
             Int4Task::Source(_, source) => source.validate_with_prefill(&self.args)?,
             // The blocking stream must own its input and writer through cleanup.
             Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::FaithfulnessMap(_) | Int4Task::FaithfulnessCorpus(_) | Int4Task::Semantic(_) | Int4Task::Resolve(_) | Int4Task::Sentiment(_) | Int4Task::SentimentMap(_) | Int4Task::SentimentCorpus(_) | Int4Task::ClassifyMap(_) | Int4Task::ClassifyCorpus(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ScoredBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
-                | Int4Task::AnswerCorpus(_) | Int4Task::ExtractCorpus(_) | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::ClassificationDocumentJob | Int4Task::SentimentDocumentJob | Int4Task::FaithfulnessDocumentJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob => return Err(CandidateError::Arguments),
+                | Int4Task::SourceCorpus(_) | Int4Task::AnswerCorpus(_) | Int4Task::ExtractCorpus(_) | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::ClassificationDocumentJob | Int4Task::SentimentDocumentJob | Int4Task::FaithfulnessDocumentJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob => return Err(CandidateError::Arguments),
         };
         #[cfg(feature = "asupersync-runtime")]
         { runtime::execute_task(self.task, self.args, limits, input, output) }

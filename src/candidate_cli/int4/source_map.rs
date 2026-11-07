@@ -16,6 +16,7 @@ mod question;
 pub(in crate::candidate_cli::int4) mod corpus;
 mod synthesis;
 mod keyphrases;
+pub(super) mod documents;
 #[cfg(feature = "asupersync-runtime")]
 mod runtime;
 #[cfg(test)]
@@ -184,6 +185,11 @@ impl MapArgs {
         }
         self.validate_mode(args, map_only, true)
     }
+    pub(super) fn validate_corpus(&self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
+        // Ordered streams publish the same semantic document as retained jobs;
+        // the declared schedule lives in public stream provenance.
+        self.validate_mode(args, false, true)
+    }
     fn validate_mode(&self, args: &Int4Args, map_only: bool, document_job: bool) -> Result<MapLimits, CandidateError> {
         let m = self.mapping;
         let mut common = self.source.validate(args)?;
@@ -338,12 +344,11 @@ impl MapArgs {
     }
     /// Build the immutable task from real typed settings. No placeholder
     /// document or caller-supplied execution identity participates here.
-    #[cfg(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(feature = "asupersync-runtime")]
     pub(super) fn document_task(&self, args: &Int4Args, limits: MapLimits,
         raw: Option<&str>, question_text: Option<String>, max_lifetime_keyphrase_scan_work: u64)
-        -> Result<crate::jobs::runner::source::grouped_int4::document::Int4SourceDocumentTask, CandidateError> {
-        use crate::{jobs::runner::source::grouped_int4::document::Int4SourceDocumentTask as Task,
+        -> Result<crate::batch::source::grouped_int4::document::Int4SourceDocumentTask, CandidateError> {
+        use crate::{batch::source::grouped_int4::document::Int4SourceDocumentTask as Task,
             tasks::{ner::NerOptions, keyphrases::KeyphraseOptions, summarize::SummaryOptions}};
         let planning = self.planning(args);
         if let Some(question) = &self.question {

@@ -82,7 +82,7 @@ still undergo independent schema, source, EOS, control and exact-work checks.
 
 Library callers select the policy on the immutable
 `Int4ExtractionBatchPlanner::with_selected_rows` factory before passing it to
-`NlpEngine::batch_int4_extract`. `for_model` carries the declared policy to
+`NlpEngine::batch_int4_extract`. `with_model` carries the declared policy to
 another explicitly loaded model. Durable extraction, native cohorts and
 complete-document extraction maps reject this factory before native work or
 journaling; they retain their existing full-vocabulary contracts.
