@@ -363,6 +363,21 @@ separate model-present fixture compares buffered and streamed execution.
 Compilation, test execution and model qualification remain pending the
 controller's required DSR and model gates.
 
+### Implemented candidate INT4 selected-row extraction
+
+One-off `fnlp candidate source-int4 extract` accepts explicit
+`--max-selected-rows N` to project every grammar-legal output row through the
+existing INT4 kernels. A step whose complete legal set exceeds the cap refuses;
+the strategy never truncates the grammar or substitutes top-k pruning. EOS is
+scored explicitly, and native work reports the actual projected rows.
+
+The option composes with `--prefill-rows` and `--source-membership`. It binds a
+distinct execution identity before host admission. Full-vocabulary extraction
+remains the default; shared batch, map, durable-job and semantic second-reader
+routes reject this one-off option. See [selected-row INT4 extraction](docs/int4-selected-rows.md)
+for CLI/library examples, accounting and the pending native-parity and
+performance gates.
+
 ### Implemented candidate INT4 extraction batches
 
 `fnlp candidate source-int4 extract-batch` connects the native constrained
@@ -1124,6 +1139,34 @@ See the [complete-document classification job guide](docs/native-classification-
 for defaults, a complete limits example, start/resume commands, cohort bounds,
 library APIs and validation scope. Compilation, regression execution and
 actual-model evidence remain pending the prescribed controller gates.
+
+## Implemented candidate INT4 sentiment document jobs
+
+`fnlp candidate source-int4 sentiment-document-job start|resume` retains and
+resumes dimensional sentiment for complete original documents. Fixed private
+`--defaults` select axes and decision policy; each original source is one
+durable result containing all chunk distributions, source spans and the
+Unicode-scalar-weighted aggregate. Serial execution and explicit
+`--cohort-chunks N` use the existing native sentiment processor.
+
+Provide the complete original NDJSON population on every invocation, a
+protected job directory and key, exact job ID, immutable limits and explicit
+`--store-results`. Per-record arguments may only be absent, null or an empty
+object. Committed documents are skipped; failed attempts retain all five
+native work charges. Resume authenticates the original population, fixed
+settings, model, limits and schedule before inference or optional tail repair.
+
+`--max-axes` bounds pre-input admission and must fit the cohort geometry.
+Memory includes the complete population, frozen identities, native windows,
+retained chunks and guarded storage publication. Stdout reports metadata under
+`fnlp-candidate-int4-sentiment-document-job-v1`; private results remain in the
+spool or explicitly requested `materialized.ndjson`. The command requires
+`metadata-store` and `asupersync-runtime` on Linux x86-64 or AArch64.
+
+See the [complete-document sentiment job guide](docs/native-sentiment-document-jobs-int4.md)
+for defaults, limits, start/resume commands, cohort bounds and embedding APIs.
+Compilation, regression execution and actual-model evidence remain pending
+the prescribed controller gates.
 
 ## Implemented candidate INT4 entity resolution
 

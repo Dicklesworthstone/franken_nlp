@@ -5,7 +5,7 @@ use crate::{jobs::{JobId, JobProgress}, native_engine::decode::DecodeCancellatio
 
 #[test]
 fn host_population_quote_and_frozen_chunk_identity_storage_match_admission() {
-    for flags in [vec![], vec!["--cohort-chunks", "3"]] {
+    for flags in [vec![], vec!["--cohort-chunks", "3"], vec!["--cohort-chunks", "4", "--max-axes", "1"]] {
         let (c, args) = command("resume", &flags); let map = c.args.validate(&args).unwrap();
         let fixed = lifetime(&args, map); let limits = c.args.lifetime_limits(&args, map, fixed).unwrap();
         let host = host_limits(&args, limits, Duration::from_secs(7));
@@ -96,4 +96,19 @@ fn flush_failure_or_a_deadline_during_delivery_never_reports_success() {
     let mut bytes = Vec::new();
     assert_eq!(publish_report(&true, &mut bytes, &deadline).unwrap_err().exit, ErrorCode::BudgetOrTimeout);
     assert_eq!(bytes, b"true\n"); assert_eq!(checks.get(), 3);
+}
+
+#[test]
+fn runtime_rechecks_explicit_axis_capability_before_private_io() {
+    for axes in [0, 5] {
+        let (mut c, args) = command("resume", &[]); let map = c.args.validate(&args).unwrap();
+        c.args.sentiment.max_axes = Some(axes);
+        assert_eq!(execute(c.mode, args, c.args, map, NoIo, &mut NoIo).unwrap_err().code,
+            "sentiment_document_job_geometry");
+    }
+    let (mut c, args) = command("start", &[]); let map = c.args.validate(&args).unwrap();
+    c.args.sentiment.max_axes = Some(4);
+    c.args.map.mapping.max_chunks = 64; c.args.map.mapping.cohort_chunks = Some(22);
+    assert_eq!(execute(c.mode, args, c.args, map, NoIo, &mut NoIo).unwrap_err().code,
+        "sentiment_document_job_geometry");
 }

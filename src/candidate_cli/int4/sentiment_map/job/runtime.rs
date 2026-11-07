@@ -38,7 +38,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
     if host.required_buffer_bytes(lifetime).map_err(host_failure)? != limits.buffer_bytes {
         return Err(Failure::usage("sentiment_document_job_host_quote"));
     }
-    let budget = job.map.budget(common)?;
+    let budget = job.map.budget_with_max_axes(common, job.sentiment.max_axes.unwrap_or(4))?;
     let defaults = job.sentiment.defaults.as_ref()
         .map(|path| read_config(path, shared::DEFAULTS_BYTES, &remaining)).transpose()?;
     let (settings, policy) = job.load_settings(defaults.as_deref(), budget, &args)?;

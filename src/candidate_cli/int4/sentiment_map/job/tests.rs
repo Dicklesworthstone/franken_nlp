@@ -187,3 +187,60 @@ fn owned_root_dispatch_cannot_fall_through_to_single_document_execution() {
         assert!(parse(words).is_err());
     }
 }
+
+#[test]
+fn explicit_axis_capability_refuses_invalid_declared_geometry_before_private_io() {
+    for operation in ["start", "resume"] {
+        for axes in ["0", "5"] {
+            let (c, args) = command(operation, &["--max-axes", axes]);
+            assert_eq!(c.execute_owned(args, NoIo, &mut NoIo).unwrap_err().code,
+                "sentiment_document_job_geometry");
+        }
+        let (mut c, args) = command(operation, &["--max-axes", "4"]);
+        c.args.map.mapping.max_chunks = 64; c.args.map.mapping.cohort_chunks = Some(22);
+        assert_eq!(c.execute_owned(args, NoIo, &mut NoIo).unwrap_err().code,
+            "sentiment_document_job_geometry");
+        let (mut c, args) = command(operation, &["--max-axes", "2"]);
+        c.args.map.mapping.max_chunks = 64; c.args.map.mapping.cohort_chunks = Some(22);
+        let map = c.args.validate(&args).unwrap();
+        let budget = c.args.map.budget_with_max_axes(map.common, c.args.sentiment.max_axes.unwrap_or(4)).unwrap();
+        let (settings, _) = c.args.load_settings(Some(r#"{"axes":["valence","arousal"]}"#), budget, &args).unwrap();
+        assert_eq!(settings.budget, budget);
+        assert_eq!(budget.max_kv_bytes * 2, c.args.map.budget(map.common).unwrap().max_kv_bytes);
+    }
+}
+
+#[test]
+fn explicit_axis_cap_reduces_memory_while_omission_preserves_existing_task_authority() {
+    let (wide, wide_args) = command("start", &["--cohort-chunks", "4"]);
+    let (narrow, narrow_args) = command("start", &["--cohort-chunks", "4", "--max-axes", "1"]);
+    let full = wide.args.validate(&wide_args).unwrap(); let one = narrow.args.validate(&narrow_args).unwrap();
+    assert!(wide.args.sentiment.max_axes.is_none());
+    let full_budget = wide.args.map.budget_with_max_axes(full.common, wide.args.sentiment.max_axes.unwrap_or(4)).unwrap();
+    let one_budget = narrow.args.map.budget_with_max_axes(one.common, narrow.args.sentiment.max_axes.unwrap_or(4)).unwrap();
+    assert_eq!(full_budget, wide.args.map.budget(full.common).unwrap(), "omission preserves old resume recipes");
+    assert_eq!(one.mapping.max_model_work, full.mapping.max_model_work);
+    assert_eq!(one.mapping.chunks, full.mapping.chunks);
+    assert_eq!(one_budget.max_kv_bytes * 4, full_budget.max_kv_bytes);
+    assert_eq!(one.memory.native.kv_bytes * 4, full.memory.native.kv_bytes);
+    assert!(one.memory.input_bytes < full.memory.input_bytes);
+    assert!(one.common.minimum_memory_bytes < full.common.minimum_memory_bytes);
+    assert_eq!(one_budget.max_input_tokens, full_budget.max_input_tokens);
+    assert_eq!(one_budget.max_output_bytes, full_budget.max_output_bytes);
+}
+
+#[test]
+fn optional_defaults_keep_four_axes_unless_an_explicit_fixed_selection_fits_the_cap() {
+    let (c, args) = command("resume", &["--max-axes", "2"]); let map = c.args.validate(&args).unwrap();
+    assert!(c.args.sentiment.defaults.is_none());
+    let budget = c.args.map.budget_with_max_axes(map.common, c.args.sentiment.max_axes.unwrap_or(4)).unwrap();
+    for defaults in [None, Some("{}"), Some(r#"{"axes":["valence","arousal","dominance"]}"#)] {
+        assert_eq!(c.args.load_settings(defaults, budget, &args).err(), Some(CandidateError::Planning));
+    }
+    let (settings, _) = c.args.load_settings(Some(r#"{"axes":["approach","valence"]}"#), budget, &args).unwrap();
+    assert_eq!(settings.axes, [SentimentAxis::Approach, SentimentAxis::Valence]);
+    assert_eq!(settings.budget, budget);
+    let (settings, _) = c.args.load_settings(Some(r#"{"axes":["valence"]}"#), budget, &args).unwrap();
+    assert_eq!(settings.axes, [SentimentAxis::Valence]);
+    assert_eq!(settings.budget, budget, "a smaller fixed selection cannot change the declared task authority");
+}

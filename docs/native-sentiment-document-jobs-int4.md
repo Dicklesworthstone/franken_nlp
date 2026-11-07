@@ -122,10 +122,27 @@ accumulates. Each ceiling must fit the corresponding immutable lifetime
 resume multiply or renew those counters. Failed attempts remain debited.
 
 Add `--cohort-chunks N` to share native decoder layers across complete independent
-chunks of one document. `N` must fit `--max-chunks`, and `N * requested_axes`
-must not exceed 64. Actual fixed-axis geometry is checked before model or
-population loading. The schedule and exact width are part of the authenticated
-job recipe; serial and cohort schedules cannot be swapped during resume.
+chunks of one document. `N` must fit `--max-chunks`, and the fixed selected axes
+must satisfy `N * requested_axes <= 64` before model or population loading.
+
+Optional `--max-axes 1..4` narrows the initial memory quote and task KV ceiling.
+An explicit cap must satisfy `N * max_axes <= 64` before any configuration or
+population is read, and fixed defaults may not select more axes than that cap.
+Omitting the option preserves the original four-axis task ceiling and its
+conservative memory quote; actual fixed-axis geometry is still checked after
+defaults are parsed. Existing jobs created without the option remain resumable
+without it.
+
+For a new two-axis job, use defaults such as `{"axes":["valence","arousal"]}`
+with `--max-axes 2 --cohort-chunks 3`. This admits six simultaneous native heads
+instead of the twelve in the omitted-option quote. It does not increase any
+work allowance. A cap below four requires compatible explicit defaults, since
+omitting `--defaults` still selects all four axes.
+
+The schedule, exact width, fixed axes and task budget are part of the
+authenticated job recipe. Repeat them on resume, including `--max-axes` when
+it was used at creation. Adding a narrower cap to an existing job would change
+its authenticated task budget; it is not a way to rewrite stored authority.
 
 Admission includes the full population, mapping plans, native execution,
 retained results, complete publication, durable storage buffers and frozen
@@ -159,3 +176,21 @@ plus scalar-weighted descriptive aggregates. Policy and estimated-coverage
 thresholds govern whether a dimension publishes an estimate or abstains. This
 does not establish full-context equivalence, calibrated psychological measures,
 semantic accuracy or release certification.
+
+## Embedding and validation scope
+
+Construct `Int4SentimentDocumentJobPlanner` from an actual
+`Int4SentimentPlanner`, fixed `SentimentBatchArgs`, `Int4SentimentMapLimits` and
+immutable `JobLimits`. Optionally select `with_chunk_cohorts(chunks)`, then use
+`NlpEngine::job_int4_sentiment_document` with the resident model,
+`SourceJobRequest`, `JobHostLimits`, packed kernel, owned reader and cancellation
+token. The implementation shares the native sentiment corpus processor and
+existing authenticated `JobRunner`.
+
+An explicitly ignored actual-model fixture covers one-axis and four-axis
+multichunk UTF-8 populations, serial/cohort output and persisted-work equality,
+completed resume without new work, changed-input/policy refusal, cancellation
+ownership and resource drainage. It requires the controller's pinned source,
+explicit memory and isolated private test directory. It has not been executed.
+Compilation, Rust tests, native parity, crash qualification and performance
+remain pending the prescribed DSR production checkpoint and separate model gates.

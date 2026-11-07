@@ -136,3 +136,6 @@ fn owned_reader_and_private_recipe_travel_through_the_hosted_job_boundary() {
     fn send<T: Send + 'static>() {}
     send::<JobInput<std::io::Cursor<Vec<u8>>>>();
 }
+
+#[cfg(feature = "asupersync-runtime")]
+mod native;

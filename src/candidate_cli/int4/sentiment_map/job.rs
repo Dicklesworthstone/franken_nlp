@@ -28,16 +28,20 @@ struct SentimentArgs {
     /// Fixed private {axes?,policy?} JSON; absent uses all four default axes.
     #[arg(long, value_name = "FILE")]
     defaults: Option<PathBuf>,
+    /// Optional hard axis cap; omission preserves existing four-axis budgeting.
+    #[arg(long)]
+    max_axes: Option<usize>,
 }
 
 pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
     let operation = |name: &'static str, about: &'static str| {
         let command = SentimentArgs::augment_args(StorageArgs::augment_args(super::definition()
             .name(name).about(about)
-            .long_about("Retain and resume dimensional sentiment of COMPLETE original documents with fixed optional --defaults {axes?,policy?}; omission selects all four axes and the standard policy. Supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation. Text is never a pre-split chunk and task_args may only be absent, null or an empty object. Every chunk and requested axis must finish before the original document commits. Retained results include complete per-chunk distributions, original byte/scalar coordinates and named scalar-weighted descriptive aggregates. --cohort-chunks shares native layers within one document; repeat the exact schedule and width on resume. Requires --store-results, protected existing --job-dir and --key-file, exact --job-id, immutable --limits and unchanged axes/policy. All five per-document work flags cover every chunk and axis; JobLimits.max_work is the sole lifetime allowance, including failed attempts, and mask_node_visits must be zero. Chunks, attempts and resume never renew that allowance. Complete input, planning, native, retained-result and durable-job memory are admitted before population IO. Stdout is metadata only; --materialize publishes private results after every document commits. No partial-document success, automatic retry, input spooling, calibrated confidence or full-context equivalence. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
+            .long_about("Retain and resume dimensional sentiment of COMPLETE original documents with fixed optional --defaults {axes?,policy?}; omission selects all four axes and the standard policy. Supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation. Text is never a pre-split chunk and task_args may only be absent, null or an empty object. Every chunk and requested axis must finish before the original document commits. Retained results include complete per-chunk distributions, original byte/scalar coordinates and named scalar-weighted descriptive aggregates. Optional --max-axes bounds the fixed dimension selection and can reduce admitted memory; a bound below four requires --defaults selecting no more than that many axes. An explicit axis bound times --cohort-chunks must fit 64 heads. Omitting --max-axes preserves existing four-axis task budgeting and checks the actual fixed selection. --cohort-chunks shares native layers within one document; repeat the exact task budget, schedule and width on resume. Requires --store-results, protected existing --job-dir and --key-file, exact --job-id, immutable --limits and unchanged axes/policy. All five per-document work flags cover every chunk and axis; JobLimits.max_work is the sole lifetime allowance, including failed attempts, and mask_node_visits must be zero. Chunks, attempts and resume never renew that allowance. Complete input, planning, native, retained-result and durable-job memory are admitted before population IO. Stdout is metadata only; --materialize publishes private results after every document commits. No partial-document success, automatic retry, input spooling, calibrated confidence or full-context equivalence. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
             .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population, also on resume; '-' reads stdin"))
             .mut_arg("max_input_bytes", |arg| arg.help("Outer ceiling for each complete NDJSON record and original document; immutable stored input ceiling must fit"))
             .mut_arg("max_map_result_bytes", |arg| arg.help("Complete semantic document cap; stored result ceiling also covers cohort framing when enabled"))
+            .mut_arg("cohort_chunks", |arg| arg.help("Share native layers across N chunks; actual axes and any explicit --max-axes times N must be <=64"))
             .mut_arg("max_checkpoints", |arg| arg.help("Cooperative allowance for this invocation; durable work and attempts never renew"))))
             .mut_arg("store_results", |arg| arg.help("Required consent to retain private complete-document sentiment results"));
         if name == "resume" {
@@ -75,7 +79,14 @@ impl JobArgs {
             || s.journal_memory_mib == 0 || s.serialization_memory_mib == 0 {
             return Err(Failure::usage("explicit_sentiment_document_job_storage"));
         }
-        let map = self.map.validate(args)?;
+        if self.sentiment.max_axes.is_some_and(|axes| !(1..=4).contains(&axes)
+            || self.map.mapping.cohort_chunks.is_some_and(|chunks|
+                chunks.checked_mul(axes).is_none_or(|heads| heads == 0 || heads > 64))) {
+            return Err(Failure::usage("sentiment_document_job_geometry"));
+        }
+        // Omission retains the existing four-axis task and memory authority;
+        // only an explicit cap imposes a declared window before defaults IO.
+        let map = self.map.validate_with_max_axes(args, self.sentiment.max_axes.unwrap_or(4))?;
         for mib in [s.journal_memory_mib, s.serialization_memory_mib] {
             if mib.checked_mul(MIB).is_none_or(|bytes| bytes > map.common.memory_bytes) {
                 return Err(Failure::usage("job_memory_options"));
@@ -88,10 +99,11 @@ impl JobArgs {
         let Defaults::Sentiment { args: settings, policy } = shared::parse_defaults_with_limits(
             ScoreTask::Sentiment, self.map.scoring.classification_limits(args),
             args.max_input_bytes, text, budget)? else { return Err(CandidateError::Input); };
-        // Price all four possible axes before defaults IO, then refuse invalid
-        // actual geometry before source/model/population IO. Never clamp it.
-        if self.map.mapping.cohort_chunks.is_some_and(|chunks|
-            chunks.checked_mul(settings.axes.len()).is_none_or(|heads| heads > 64)) {
+        // Fixed settings cannot expand an explicit capability. With no cap,
+        // preserve the existing actual-axis check and four-axis task budget.
+        if self.sentiment.max_axes.is_some_and(|axes| settings.axes.len() > axes)
+            || self.map.mapping.cohort_chunks.is_some_and(|chunks|
+                chunks.checked_mul(settings.axes.len()).is_none_or(|heads| heads > 64)) {
             return Err(CandidateError::Planning);
         }
         Ok((settings, policy))
