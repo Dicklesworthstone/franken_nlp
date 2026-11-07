@@ -197,3 +197,42 @@ fn reservation_arithmetic_overflow_is_an_explicit_invalid_limits_failure() {
         rejected(limits().requirements(WIDTH, work(70), transport));
     }
 }
+
+#[test]
+fn packed_workspace_is_charged_once_without_changing_document_or_output_authority() {
+    for documents in [1, 3, 64] {
+        let mut limits = limits(); limits.max_documents = documents;
+        let base = limits.requirements(WIDTH, work(70), transport()).unwrap();
+        for rows in [1, 2, 64] {
+            let extra = Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
+            // An oversized caller ceiling is not an allocation or permission
+            // to multiply this workspace by every independent document.
+            for cap in [extra, u64::MAX] {
+                let mut packed = limits.requirements_packed(WIDTH, work(70), transport(),
+                    Int4PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: cap }).unwrap();
+                assert_eq!(packed.workspace_bytes, base.workspace_bytes + extra);
+                packed.workspace_bytes = base.workspace_bytes;
+                assert_eq!(packed, base);
+            }
+        }
+    }
+}
+
+#[test]
+fn packed_cap_and_extra_scratch_refuse_before_any_native_allocation() {
+    for rows in [0, 65, usize::MAX] {
+        rejected(limits().requirements_packed(WIDTH, work(70), transport(),
+            Int4PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX }));
+    }
+    for rows in [1, 2, 64] {
+        let extra = Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
+        rejected(limits().requirements_packed(WIDTH, work(70), transport(),
+            Int4PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: extra - 1 }));
+    }
+    let mut limits = limits();
+    let native = Int4MemoryRequirement::for_cohort(&[32, 32, 32], WIDTH).unwrap();
+    limits.allocator_reserve_bytes = u64::MAX - native.rope_bytes - native.scratch_payload_bound;
+    assert_eq!(limits.requirements(WIDTH, work(70), transport()).unwrap().workspace_bytes, u64::MAX);
+    rejected(limits.requirements_packed(WIDTH, work(70), transport(),
+        Int4PrefillLimits { max_batch_rows: 1, max_extra_scratch_bytes: u64::MAX }));
+}

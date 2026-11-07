@@ -85,7 +85,14 @@ impl ExtractionArgs {
         Ok(args)
     }
     pub(super) fn validate(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
-        if self.max_selected_rows.is_some() || args.prefill()?.is_some() { return Err(CandidateError::Arguments); }
+        if args.prefill()?.is_some() { return Err(CandidateError::Arguments); }
+        self.validate_full_projection_with_prefill(args)
+    }
+    /// Composed streams own their projection policy separately from one-off
+    /// extraction arguments, even when they expose prompt scheduling.
+    pub(super) fn validate_full_projection_with_prefill(&self, args: &Int4Args)
+        -> Result<Int4Limits, CandidateError> {
+        if self.max_selected_rows.is_some() { return Err(CandidateError::Arguments); }
         self.validate_with_prefill(args)
     }
     pub(super) fn validate_with_prefill(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {

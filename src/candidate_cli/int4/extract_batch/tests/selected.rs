@@ -51,8 +51,10 @@ fn invalid_rows_and_serial_incompatible_options_refuse_before_private_io() {
     let (mut batch, args) = arguments(&["--max-selected-rows", "7"]);
     batch.stream.cohort_documents = Some(1);
     assert_eq!(batch.execute_owned(args, NoRead, NoWrite), Err(CandidateError::Arguments));
-    let matched = matches(&["--max-selected-rows", "7", "--prefill-rows", "1"]);
-    assert!(BatchArgs::from_matches(&matched).is_err());
+    let command = definition().try_get_matches_from(["extract-batch", "--source-dir", "source",
+        "--source-manifest", "manifest", "--memory-mib", "8192", "--schema", "schema.json",
+        "--max-selected-rows", "7", "--prefill-rows", "1"]);
+    assert!(command.is_err());
 }
 
 #[test]

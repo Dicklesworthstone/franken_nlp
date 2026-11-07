@@ -71,7 +71,8 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(),
         task: batch.kind.name(), snapshot,
-        cohort_schedule: limits.cohort_documents.map(CohortSchedule::new),
+        cohort_schedule: limits.cohort_documents.map(|documents|
+            CohortSchedule::new(documents, common.prefill.map(|prefill| prefill.max_batch_rows))),
         max_selected_rows: limits.selected_rows.map(|limits| limits.max_rows_per_step),
     };
     let writer = CandidateWriter::new(output, &provenance, limits.transport.max_output_line_bytes, limits.output_bytes)?;
@@ -83,9 +84,14 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         io_reserve_bytes: limits.io_bytes,
     };
     let summary = if let Some(max_documents) = limits.cohort_documents {
-        engine.batch_int4_source_cohorts(&model, Arc::new(planner), Arc::new(vocabulary), config,
-            corpus, max_documents, common.kernel, reader, writer, cancellation)
-            .map_err(|_| CandidateError::Batch)?.summary
+        let planner = Arc::new(planner); let vocabulary = Arc::new(vocabulary);
+        let result = match common.prefill {
+            Some(prefill) => engine.batch_int4_source_cohorts_packed(&model, planner, vocabulary, config,
+                corpus, max_documents, common.kernel, prefill, reader, writer, cancellation),
+            None => engine.batch_int4_source_cohorts(&model, planner, vocabulary, config,
+                corpus, max_documents, common.kernel, reader, writer, cancellation),
+        };
+        result.map_err(|_| CandidateError::Batch)?.summary
     } else {
         engine.batch_int4_source(&model, Arc::new(planner), Arc::new(vocabulary), config,
             corpus, common.kernel, reader, writer, cancellation).map_err(|_| CandidateError::Batch)?
@@ -115,10 +121,17 @@ struct Provenance<'a> {
     max_selected_rows: Option<usize>,
 }
 #[derive(Serialize)]
-struct CohortSchedule { execution: &'static str, declared_max_documents: usize }
+struct CohortSchedule {
+    execution: &'static str,
+    declared_max_documents: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    declared_max_packed_rows: Option<usize>,
+}
 impl CohortSchedule {
-    fn new(declared_max_documents: usize) -> Self {
-        Self { execution: "cross_document_constrained_cohorts", declared_max_documents }
+    fn new(declared_max_documents: usize, declared_max_packed_rows: Option<usize>) -> Self {
+        let execution = if declared_max_packed_rows.is_some() { "cross_document_packed_constrained_cohorts" }
+            else { "cross_document_constrained_cohorts" };
+        Self { execution, declared_max_documents, declared_max_packed_rows }
     }
 }
 

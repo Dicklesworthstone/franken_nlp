@@ -66,7 +66,84 @@ Each document retains an independent prompt, grammar/source language, EOS,
 causal KV, and original task budget. Grouping does not widen a document's
 `TaskBudget` or change its TaskIR identity. Full-vocabulary greedy token
 selection remains the same: this option introduces no sparse projection,
-sampling, repair retry, or prompt-prefill selector.
+sampling or repair retry.
+
+## Packed prompt and feedback passes
+
+The same five batch commands additionally accept `--prefill-rows P` with
+`--cohort-documents N`. `P` is a ceiling of 1 through 64 **total token positions
+per native pass**, independent of the number of documents. For example:
+
+```sh
+fnlp candidate source-int4 extract-batch documents.ndjson \
+  --schema extraction.schema.json \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256_FROM_TRUSTED_CONVERSION" \
+  --memory-mib 32768 --group-width 128 --context-tokens 1024 \
+  --max-new-tokens 128 --cohort-documents 4 --prefill-rows 16
+```
+
+Each pass may combine bounded contiguous prompt runs from different documents
+and one already sampled feedback token from each selected ready document.
+Prompt positions remain causal: an earlier position never sees later positions
+from its own run, and no position sees another document's KV. Intermediate
+prompt positions do not run the vocabulary head. A document must finish its
+current selection before its next feedback token can enter another pass;
+unsampled future tokens are never forwarded. The scheduler rotates when `P`
+is smaller than the number of active documents, so even `P = 1` is supported.
+
+The CLI and hosted packed methods add exactly
+`Int4PrefillLimits::validate()` bytes to the ordinary activation workspace.
+This scratch is shared by the live window and is charged once, independently
+of `N`. It does not replace decoder workspace, per-document causal KV, source
+preparation, output claims or the lookahead. All quotation arithmetic is
+checked before the CLI opens inputs or allocates its runtime and model; the
+host recomputes the quote before stream IO. A low process memory ceiling, an
+invalid pack cap, or insufficient explicit scratch allowance refuses the
+request. Hosted guards retain the extra scratch reservation through physical
+completion, cancellation cleanup and output delivery.
+
+Omitting `--prefill-rows` keeps the existing cohort execution. Omitting both
+flags keeps serial execution. Serial streams and selected-row streams cannot
+combine with this option. Chunk maps, hierarchical synthesis, durable jobs and
+scoring cohorts keep their separate scheduling capabilities. This extension
+does not enable packed prefill on those routes.
+
+Packed outer provenance contains:
+
+```json
+{
+  "cohort_schedule": {
+    "execution": "cross_document_packed_constrained_cohorts",
+    "declared_max_documents": 4,
+    "declared_max_packed_rows": 16
+  }
+}
+```
+
+These are declared capacities. Actual physical group and projection counts
+remain in the hosted result's `.cohorts` statistics; they are verified against
+executed per-document work. The five native work axes, mask budgets, task
+identities, exact source bytes, independently finalized results and ordered
+NDJSON protocol remain unchanged. A packed pass can reduce physical group
+calls; its count is not a throughput measurement or a numerical parity claim.
+
+Embedders use `NlpEngine::batch_int4_extract_cohorts_packed` or
+`NlpEngine::batch_int4_source_cohorts_packed`, passing `Int4PrefillLimits` after
+the kernel argument. The existing methods continue to select their original
+schedule. Lower-level users have `NativeInt4ExtractionCohortBatch::new_packed`
+and `NativeInt4SourceCohortBatch::new_packed`; their memory ownership must cover
+the shared `Int4ExtractionCohortMemoryLimits::requirements_packed` quote
+(also exported as `Int4SourceCohortMemoryLimits`).
+
+Pure quotation and CLI fixtures cover caps 1, 2 and 64, cap/window independence,
+invalid caps, underfunded scratch and process memory, arithmetic overflow,
+selected-row refusal and programmatic policy drift. The controller-only
+complete-stream model fixtures also compare ordinary and packed schedules at
+caps 1, 2 and 64 over unequal prompts, malformed input, explicit flush, reused
+IDs and a partial EOF window. They compare complete task results and work,
+removing only declared scheduling metadata. These fixtures are provided for
+the admitted validation lane; they have not been executed in this session.
 
 ## Memory, work, and delivery
 

@@ -2068,8 +2068,9 @@ The single-request `extract` command accepts the same option. The full declared
 additional scratch is admitted before native allocation, while task budgets,
 grammar/source masks, greedy decoding, scored EOS, evidence finalization and
 result envelopes retain their original contracts. Omitting the flag keeps
-sequential prompts. This option applies to these one-off commands; document
-cohorts use separate `--cohort-chunks` and `--cohort-hierarchy-groups` schedules. See
+sequential prompts. The five structured batch commands also accept this option
+with explicit `--cohort-documents`; complete-document chunk and hierarchy
+cohorts keep their separate `--cohort-chunks` and `--cohort-hierarchy-groups` schedules. See
 [INT4 prefill](docs/int4-prefill.md) for examples, APIs and pending parity gates.
 
 NER returns typed mentions with all exact matching byte and Unicode-scalar
@@ -2141,6 +2142,14 @@ Interactive producers must fill a window or send `{"flush":true}` before
 waiting for output; EOF also drains the final partial window. See
 [structured INT4 cohorts](docs/int4-structured-cohorts.md) for memory,
 delivery and qualification details.
+
+Add `--prefill-rows P` (1 through 64) to pack at most P total prompt and already
+sampled feedback positions per native pass. The cap is independent of document
+count, so a pack can be smaller than the live window. The CLI and host reserve
+the extra scratch once while keeping each document's task, KV, grammar and
+logical work bounds. The default cohort schedule is unchanged. This explicit
+candidate route adds no measured parity or throughput claim; see
+[packed structured passes](docs/int4-structured-cohorts.md#packed-prompt-and-feedback-passes).
 
 For NER, keyphrases and summary, the ordinary record is `{"id":"d1","text":"..."}`.
 Shipped options apply unless a complete typed `task_args` or `--defaults FILE`

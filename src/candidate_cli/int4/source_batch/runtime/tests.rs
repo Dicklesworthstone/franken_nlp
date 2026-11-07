@@ -87,7 +87,7 @@ fn every_source_task_stream_preserves_inner_spans_and_explicit_snapshot_provenan
 
 #[test]
 fn source_schedule_provenance_declares_policy_without_private_bindings_or_work_claims() {
-    let schedule = serde_json::to_value(CohortSchedule::new(4)).unwrap();
+    let schedule = serde_json::to_value(CohortSchedule::new(4, None)).unwrap();
     assert_eq!(schedule, serde_json::json!({"execution":"cross_document_constrained_cohorts",
         "declared_max_documents":4}));
     for task in ["ner", "keyphrases", "summarize", "answer"] {
@@ -109,10 +109,32 @@ fn source_schedule_provenance_declares_policy_without_private_bindings_or_work_c
             assert!(selected.get(absent).is_none());
         }
         provenance.max_selected_rows = None;
-        provenance.cohort_schedule = Some(CohortSchedule::new(4));
+        provenance.cohort_schedule = Some(CohortSchedule::new(4, None));
         let mut grouped = serde_json::to_value(&provenance).unwrap();
         assert_eq!(grouped.as_object_mut().unwrap().remove("cohort_schedule"), Some(schedule.clone()));
         assert_eq!(grouped, serial);
+    }
+}
+
+#[test]
+fn packed_source_provenance_declares_total_token_capacity_without_work_claims() {
+    for rows in [1, 2, 64] {
+        let schedule = serde_json::to_value(CohortSchedule::new(4, Some(rows))).unwrap();
+        assert_eq!(schedule, serde_json::json!({"execution":"cross_document_packed_constrained_cohorts",
+            "declared_max_documents":4,"declared_max_packed_rows":rows}));
+    }
+}
+
+#[test]
+fn owned_source_stream_rechecks_packed_schedule_before_defaults_model_or_io() {
+    for name in ["ner-batch", "keyphrases-batch", "summarize-batch", "answer-batch"] {
+        let command = super::super::tests::command(name, &["--cohort-documents", "3", "--prefill-rows", "2"]);
+        let Int4Command { task: Int4Task::SourceBatch(mut batch), mut args, batch: None, job: None } = command
+            else { panic!("wrong task"); };
+        args.memory_mib = 262_144;
+        let quoted = batch.validate(&args).unwrap();
+        batch.stream.cohort_documents = None;
+        assert_eq!(execute(args, batch, quoted, NoIo, NoIo), Err(CandidateError::Arguments));
     }
 }
 
@@ -198,7 +220,10 @@ fn model_present_source_cohorts_preserve_complete_serial_streams() {
         let mut expected = None;
         let mut task_budget = None;
         for flags in [&[][..], &["--cohort-documents", "1"][..],
-            &["--cohort-documents", "2"][..], &["--cohort-documents", "4"][..]] {
+            &["--cohort-documents", "2"][..], &["--cohort-documents", "4"][..],
+            &["--cohort-documents", "4", "--prefill-rows", "1"][..],
+            &["--cohort-documents", "4", "--prefill-rows", "2"][..],
+            &["--cohort-documents", "4", "--prefill-rows", "64"][..]] {
             let mut argv = vec!["candidate", "source-int4", task, "--snapshot", &snapshot,
                 "--expected-model-sha256", &pin, "--memory-mib", &memory, "--kernel", &kernel,
                 "--context-tokens", "2048", "--max-new-tokens", "512",
@@ -229,7 +254,8 @@ fn model_present_source_cohorts_preserve_complete_serial_streams() {
                 assert_eq!(value["model_content_sha256"], pin);
                 let schedule = value.as_object_mut().unwrap().remove("cohort_schedule");
                 if let Some(documents) = limits.cohort_documents {
-                    assert_eq!(schedule, Some(serde_json::to_value(CohortSchedule::new(documents)).unwrap()));
+                    assert_eq!(schedule, Some(serde_json::to_value(CohortSchedule::new(documents,
+                        limits.common.prefill.map(|prefill| prefill.max_batch_rows))).unwrap()));
                     assert_eq!(value["record"]["execution"], crate::batch::grouped::GROUPED_EXECUTION);
                 } else {
                     assert!(schedule.is_none());

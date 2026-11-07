@@ -2,6 +2,7 @@ use super::*;
 use crate::tasks::answer::{AnswerOptions, AnswerPassage};
 
 mod selected;
+mod prefill;
 
 pub(super) fn command(name: &str, extra: &[&str]) -> Int4Command {
     let mut argv = vec!["candidate", "source-int4", name, "--source-dir", "explicit-source",
@@ -246,7 +247,7 @@ fn invalid_limits_and_programmatic_policy_drift_refuse_before_all_io() {
 
 #[test]
 fn source_options_and_text_controls_cannot_be_silently_ignored_by_corpus_routes() {
-    for flags in [vec!["--options", "options.json"], vec!["--prefill-rows", "1"],
+    for flags in [vec!["--options", "options.json"],
         vec!["--max-output-bytes", "65536"], vec!["--min-new-tokens", "0"], vec!["--logprobs"]] {
         let mut argv = vec!["candidate", "source-int4", "ner-batch", "--source-dir", "source",
             "--source-manifest", "manifest", "--memory-mib", "8192"];

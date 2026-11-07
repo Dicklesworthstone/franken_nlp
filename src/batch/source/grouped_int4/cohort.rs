@@ -5,10 +5,10 @@ use std::sync::Arc;
 use crate::{batch::grouped::{GroupedBatchProcessor, GroupedOutput, GroupedRequest, GroupedRow},
     native_engine::{int4::PackedInt4Kernel,
         constrained_int4::cohort::{Int4JsonCohortBudget, required_workspace_bytes},
-        strict_int4::{Int4MemoryBudget, Int4ModelWeights, cohort::Int4CohortEngine}},
+        strict_int4::{Int4MemoryBudget, Int4ModelWeights, cohort::Int4CohortEngine, prefill::Int4PrefillLimits}},
     tasks::{extract::grouped_int4::cohort::Int4ExtractCohortBudget,
         source_planning::grouped_int4::cohort::{self as source_group,
-            Int4SourceCohortRequest, INT4_SOURCE_COHORT_EXECUTION}}};
+            Int4SourceCohortRequest, INT4_SOURCE_COHORT_EXECUTION, INT4_SOURCE_PACKED_COHORT_EXECUTION}}};
 
 /// A prepared source task sealed to the actual processor that admitted it.
 /// Wire records cannot replace its prompt, source, finalizer or model identity.
@@ -26,6 +26,7 @@ pub struct NativeInt4SourceCohortBatch<'p, 'w, 'v, A: Int4SourceBatchAdmission> 
     work: Int4SourceBatchLimits,
     limits: Int4SourceCohortBatchLimits,
     kernel: PackedInt4Kernel,
+    prefill: Option<Int4PrefillLimits>,
     seal: Arc<()>,
     account: Account,
     last_context: Option<BatchRequestContext>,
@@ -42,9 +43,22 @@ impl<'p, 'w, 'v, A: Int4SourceBatchAdmission> NativeInt4SourceCohortBatch<'p, 'w
         constrained_int4::check_model(compiler.base_execution_identity(), weights.identity())
             .map_err(|_| BatchCode::Admission)?;
         if compiler.group_width() != weights.group_width() { return Err(BatchCode::Admission.into()); }
-        Ok(Self { compiler, weights, vocabulary, admission, work, limits, kernel, seal: Arc::new(()),
+        Ok(Self { compiler, weights, vocabulary, admission, work, limits, kernel, prefill: None, seal: Arc::new(()),
             account: Account::default(), last_context: None, failed: false,
             statistics: Int4SourceCohortBatchStats::default() })
+    }
+    /// Pack only prompt positions and already sampled feedback under one
+    /// explicit total-token cap. The validated extra scratch must be reserved
+    /// separately from the ordinary cohort and decoder memory requirements.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_packed(compiler: Int4SourceBatchPlanner<'p>, weights: &'w Int4ModelWeights,
+        vocabulary: &'v ExtractionVocabulary, admission: A, work: Int4SourceBatchLimits,
+        limits: Int4SourceCohortBatchLimits, kernel: PackedInt4Kernel, prefill: Int4PrefillLimits)
+        -> Result<Self, BatchFault> {
+        prefill.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        let mut processor = Self::new(compiler, weights, vocabulary, admission, work, limits, kernel)?;
+        processor.prefill = Some(prefill);
+        Ok(processor)
     }
     pub fn reserved_model_work(&self) -> Int4Work { self.account.work }
     pub fn reserved_mask_visits(&self) -> u64 { self.account.masks }
@@ -96,13 +110,20 @@ impl<'p, 'w, 'v, A: Int4SourceBatchAdmission> NativeInt4SourceCohortBatch<'p, 'w
         checkpoint(control).map_err(|error| error.fault)?;
         let mut engine = Int4CohortEngine::new(self.weights, &contexts, self.limits.native_memory)
             .map_err(native_error)?.with_kernel(self.kernel);
-        let raw = source_group::execute(&mut engine, &rows, self.vocabulary, Int4ExtractCohortBudget {
+        let budget = Int4ExtractCohortBudget {
             decode: Int4JsonCohortBudget { native: Int4RunBudget::exact(work), max_kv_bytes: required.kv_bytes,
                 max_mask_node_visits: mask_visits, max_result_bytes: self.limits.max_result_bytes },
             max_result_bytes: self.limits.max_result_bytes,
-        }, control).map_err(|error| execution_failure(error).fault)?;
+        };
+        let (raw, execution) = match self.prefill {
+            Some(prefill) => (source_group::execute_packed(&mut engine, &rows, self.vocabulary, budget,
+                prefill, control), INT4_SOURCE_PACKED_COHORT_EXECUTION),
+            None => (source_group::execute(&mut engine, &rows, self.vocabulary, budget, control),
+                INT4_SOURCE_COHORT_EXECUTION),
+        };
+        let raw = raw.map_err(|error| execution_failure(error).fault)?;
         engine.check_idle().map_err(native_error)?; drop(engine);
-        if raw.schema_version != 1 || raw.execution != INT4_SOURCE_COHORT_EXECUTION
+        if raw.schema_version != 1 || raw.execution != execution
             || raw.sequences.len() != requests.len() || raw.planned_work != work {
             return Err(BatchCode::InvalidExecution.into());
         }

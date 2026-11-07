@@ -3,7 +3,7 @@ use super::Int4ExtractionBatchLimits;
 use crate::{batch::{BatchCode, BatchFault, BatchLimits},
     native_engine::{constrained_int4::cohort::required_workspace_bytes,
         lmhead::NANBEIGE_VOCAB_SIZE,
-        strict_int4::{Int4MemoryRequirement, cohort::MAX_INT4_SEQUENCES}}};
+        strict_int4::{Int4MemoryRequirement, cohort::MAX_INT4_SEQUENCES, prefill::Int4PrefillLimits}}};
 
 pub const MAX_COHORT_RESULT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -33,6 +33,18 @@ pub struct Int4ExtractionCohortMemoryRequirement {
     pub max_result_bytes: u64,
 }
 impl Int4ExtractionCohortMemoryLimits {
+    /// Quote one bounded packed prompt/feedback workspace for the whole
+    /// window. Its row cap counts total token positions, not documents.
+    /// Per-document KV, task output and decoder workspace remain unchanged.
+    pub fn requirements_packed(self, width: usize, work: Int4ExtractionBatchLimits,
+        transport: BatchLimits, prefill: Int4PrefillLimits)
+        -> Result<Int4ExtractionCohortMemoryRequirement, BatchFault> {
+        let extra = prefill.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        let mut required = self.requirements(width, work, transport)?;
+        required.workspace_bytes = add(&[required.workspace_bytes, extra])?;
+        Ok(required)
+    }
+
     pub fn requirements(self, width: usize, work: Int4ExtractionBatchLimits, transport: BatchLimits)
         -> Result<Int4ExtractionCohortMemoryRequirement, BatchFault> {
         work.validate()?; transport.validate()?;

@@ -1,6 +1,7 @@
 use super::*;
 use crate::native_engine::lmhead::NANBEIGE_VOCAB_SIZE;
 mod selected;
+mod prefill;
 
 fn matches(extra: &[&str]) -> clap::ArgMatches {
     let mut argv = vec!["extract-batch", "--source-dir", "explicit-source",
@@ -110,8 +111,8 @@ fn cli_and_host_share_the_complete_window_plus_lookahead_memory_quote() {
 }
 
 #[test]
-fn explicit_generation_and_prefill_controls_do_not_leak_into_extraction_batch() {
-    for flags in [vec!["--max-output-bytes", "65536"], vec!["--prefill-rows", "1"],
+fn explicit_generation_controls_do_not_leak_into_extraction_batch() {
+    for flags in [vec!["--max-output-bytes", "65536"],
         vec!["--min-new-tokens", "0"], vec!["--logprobs"], vec!["--logit-bias", "42=0"]] {
         assert!(BatchArgs::from_matches(&matches(&flags)).is_err());
     }

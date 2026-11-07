@@ -33,12 +33,20 @@ ceiling is a ledger allowance, not measured RSS.
 Source verification, independent snapshot pins, optional create-new snapshot
 saving, tokenizer/template binding, input validation and the completed JSON
 envelope remain unchanged. A snapshot failure never starts source conversion.
-Prefill does not add a stream, a multi-request batch command or a new runtime.
 One-off scored and structured tasks use the same explicit scheduling option
-with complete task and native work admission. Batch, map and retained-job
-commands, resolution, redaction and semantic extraction keep their existing
-prompt schedules and reject this option, including programmatically constructed
-requests. Their independent document/head/chunk cohort options remain separate.
+with complete task and native work admission. The five structured batch commands
+`extract-batch`, `ner-batch`, `keyphrases-batch`, `summarize-batch` and
+`answer-batch` also accept it when `--cohort-documents N` is explicit. In those
+streams `P` bounds total prompt/feedback token positions across the live window,
+and the CLI and host reserve the extra scratch once. See
+[structured cohort packing](int4-structured-cohorts.md#packed-prompt-and-feedback-passes)
+for the schedule, memory quote and ordered delivery contract.
+
+Serial structured batches, maps, retained jobs, resolution, redaction and
+semantic extraction keep their existing prompt schedules and reject this option,
+including programmatically constructed requests. Their independent
+document/head/chunk cohort options remain separate. Generation/chat retain
+their existing packed batch and corpus interfaces.
 
 The separate [scoring-cohort mode](int4-scoring-cohorts.md) groups independent
 heads with `--cohort-heads N`. It cannot be combined with `--prefill-rows` and

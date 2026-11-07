@@ -51,8 +51,11 @@ pub(super) fn definitions() -> Vec<clap::Command> {
         (Kind::Summarize, "summarize-batch"), (Kind::Answer, "answer-batch")]
         .into_iter().map(|(kind, name)| StreamArgs::augment_args(source::definition(kind).name(name)
             .about("Run an ordered source-task NDJSON stream with one resident grouped-INT4 model")
-            .long_about("Run one fixed source task over ordered {id,text,task_args?} NDJSON and exact {\"flush\":true} controls. NER, keyphrases and summarize use shipped options unless --defaults or per-record typed task_args supplies explicit bounded options. For answer, text is the question and task_args supplies separately typed passages, options and budget; no passage set is invented or reused implicitly. Defaults files use complete SourceBatchArgs JSON, including its task selector and budget. A record cannot switch tasks or raise the CLI ceilings. Execution is serial unless --cohort-documents N explicitly groups up to N complete documents through shared native decoder layers, preserving each original task budget, grammar, source/passages and causal KV. The entire window plus one lookahead is memory-admitted before IO. Partial windows execute at flush or EOF; interactive producers must fill a window or send a flush before waiting. Results and rejected records remain ordered, and IDs reset only after a drained flush. Every completed event carries candidate provenance. Require run_complete AND exit 0 for whole-run success; earlier completed groups remain valid if a later record fails. Native work, masks, checkpoints and transport ceilings span all documents, cohorts and epochs. Full-vocabulary projection remains the default. Explicit --max-selected-rows N fixes all-legal-row projection for the SERIAL stream; N must be 1..=166144 and cannot combine with --cohort-documents. Every item binds the cap and original built-in finalizer before admission. Per-record arguments cannot override the projection policy. A legal set exceeding the cap returns no result, never a pruned language or an automatic retry. Summary prose and answer text may need a wide ceiling. This path checks only selected logits; native parity and performance require separate evidence. No sampling, repair retry or prompt-prefill selector. Structural citations do not certify semantic support; failed inference is never abstention. Input/writer ownership survives cancellation until hosted cleanup. Blocking IO is cooperative, not preemptible.")
+            .long_about("Run one fixed source task over ordered {id,text,task_args?} NDJSON and exact {\"flush\":true} controls. NER, keyphrases and summarize use shipped options unless --defaults or per-record typed task_args supplies explicit bounded options. For answer, text is the question and task_args supplies separately typed passages, options and budget; no passage set is invented or reused implicitly. Defaults files use complete SourceBatchArgs JSON, including its task selector and budget. A record cannot switch tasks or raise the CLI ceilings. Execution is serial unless --cohort-documents N explicitly groups up to N complete documents through shared native decoder layers, preserving each original task budget, grammar, source/passages and causal KV. The entire window plus one lookahead is memory-admitted before IO. Partial windows execute at flush or EOF; interactive producers must fill a window or send a flush before waiting. Results and rejected records remain ordered, and IDs reset only after a drained flush. Every completed event carries candidate provenance. Require run_complete AND exit 0 for whole-run success; earlier completed groups remain valid if a later record fails. Native work, masks, checkpoints and transport ceilings span all documents, cohorts and epochs. Full-vocabulary projection remains the default. Explicit --max-selected-rows N fixes all-legal-row projection for the SERIAL stream; N must be 1..=166144 and cannot combine with --cohort-documents. Every item binds the cap and original built-in finalizer before admission. Per-record arguments cannot override the projection policy. A legal set exceeding the cap returns no result, never a pruned language or an automatic retry. Summary prose and answer text may need a wide ceiling. This path checks only selected logits; native parity and performance require separate evidence. With --cohort-documents, explicit --prefill-rows P packs at most P TOTAL prompt and already sampled feedback positions per native pass, 1..=64, with independent extra scratch admission. P may be smaller than the document window. Omitting it retains the existing cohort schedule. No sampling or repair retry. Structural citations do not certify semantic support; failed inference is never abstention. Input/writer ownership survives cancellation until hosted cleanup. Blocking IO is cooperative, not preemptible.")
             .mut_arg("options", |arg| arg.hide(true))
+            .mut_arg("prefill_rows", |arg| arg.hide(false).requires("cohort_documents")
+                .conflicts_with("source_batch_max_selected_rows")
+                .help("With --cohort-documents: maximum TOTAL prompt/feedback token rows per packed pass, 1..=64; extra scratch is admitted"))
             .mut_arg("input", |arg| arg.help("NDJSON file or '-' for stdin; each source record is bounded and read incrementally"))
             .mut_arg("max_input_bytes", |arg| arg.help("Maximum decoded document/question and passage input bytes per record"))
             .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoint allowance for the ENTIRE corpus execution"))))
@@ -75,21 +78,24 @@ impl BatchArgs {
             return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
                 "source-task batches use complete --defaults or per-record task_args, not --options"));
         }
-        Ok(Self { kind, source: source::SourceArgs::from_matches(matches)?, stream: StreamArgs::from_arg_matches(matches)? })
+        Ok(Self { kind, source: source::SourceArgs::from_matches_with_prefill(matches)?,
+            stream: StreamArgs::from_arg_matches(matches)? })
     }
     pub(super) fn validate(&self, args: &Int4Args) -> Result<BatchLimits, CandidateError> {
         let stream = &self.stream;
         let selected_rows = self.selected_rows()?;
+        let prefill = args.prefill()?;
         if !(1..=100_000).contains(&stream.max_requests)
             || stream.max_line_bytes < args.max_input_bytes || !(1..=4 * 1024 * 1024).contains(&stream.max_line_bytes)
             || !(1..=16 * 1024 * MIB).contains(&stream.max_total_input_bytes)
             || !(1..=16 * 1024 * MIB).contains(&stream.max_total_output_bytes)
             || self.source.options_path().is_some()
             || (selected_rows.is_some() && stream.cohort_documents.is_some())
+            || (prefill.is_some() && (stream.cohort_documents.is_none() || selected_rows.is_some()))
             || stream.defaults.as_ref().is_some_and(|path| path.as_os_str().is_empty() || path.as_os_str() == "-") {
             return Err(CandidateError::Arguments);
         }
-        let mut common = self.source.validate(args)?;
+        let mut common = self.source.validate_full_projection_with_prefill(args)?;
         let one = match selected_rows {
             Some(rows) => constrained_int4::sparse::planned_work(args.group_width, common.max_prompt_tokens,
                 args.max_new_tokens, rows),
@@ -117,9 +123,13 @@ impl BatchArgs {
         let preparation_reserve_bytes = common.preparation_bytes;
         let io_bytes = sum(&[transport.max_output_line_bytes as u64, FRAME_ALLOWANCE, IO_BUFFER_BYTES as u64])?;
         if let Some(max_documents) = stream.cohort_documents {
-            let quote = Int4SourceCohortMemoryLimits { max_documents, context_tokens: args.context_tokens,
+            let memory = Int4SourceCohortMemoryLimits { max_documents, context_tokens: args.context_tokens,
                 preparation_reserve_bytes, io_reserve_bytes: io_bytes, allocator_reserve_bytes: ALLOCATOR_BYTES,
-            }.requirements(args.group_width, native, transport).map_err(|_| CandidateError::Arguments)?;
+            };
+            let quote = match prefill {
+                Some(prefill) => memory.requirements_packed(args.group_width, native, transport, prefill),
+                None => memory.requirements(args.group_width, native, transport),
+            }.map_err(|_| CandidateError::Arguments)?;
             let execution = sum(&[quote.native.kv_bytes, quote.workspace_bytes,
                 quote.input_bytes, quote.output_reservation_bytes])?;
             common.minimum_memory_bytes = grouped_memory_floor(args, common, execution)?;

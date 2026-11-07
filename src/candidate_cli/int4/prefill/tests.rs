@@ -305,6 +305,24 @@ fn structured_batch_map_redaction_and_semantic_workflows_keep_strict_prefill_bou
             if cohort { flags.extend([if task.ends_with("-batch") { "--cohort-documents" } else { "--cohort-chunks" }, "2"]); }
             for width in ["1", "4", "64"] {
                 let mut rejected = flags.clone(); rejected.extend(["--prefill-rows", width]);
+                if cohort && task.ends_with("-batch") {
+                    let explicit = parsed_workflow(&[task], &rejected).unwrap();
+                    let limits = match &explicit.task {
+                        Int4Task::ExtractBatch(options) => options.validate(&explicit.args).unwrap().common,
+                        Int4Task::SourceBatch(options) => options.validate(&explicit.args).unwrap().common,
+                        _ => panic!("structured cohort batch required"),
+                    };
+                    assert_eq!(limits.prefill.unwrap().max_batch_rows.to_string(), width);
+                    let mut programmatic = parsed_workflow(&[task], &flags).unwrap();
+                    programmatic.args.policy = explicit.args.policy;
+                    let limits = match &programmatic.task {
+                        Int4Task::ExtractBatch(options) => options.validate(&programmatic.args).unwrap().common,
+                        Int4Task::SourceBatch(options) => options.validate(&programmatic.args).unwrap().common,
+                        _ => panic!("structured cohort batch required"),
+                    };
+                    assert_eq!(limits.prefill.unwrap().max_batch_rows.to_string(), width);
+                    continue;
+                }
                 assert!(parsed_workflow(&[task], &rejected).is_err());
                 let mut command = parsed_workflow(&[task], &flags).unwrap();
                 match &command.task {
@@ -328,6 +346,27 @@ fn structured_batch_map_redaction_and_semantic_workflows_keep_strict_prefill_bou
                     }
                 }
             }
+        }
+    }
+}
+#[test]
+fn packed_streams_refuse_one_off_selected_policy_even_for_programmatic_composition() {
+    for task in STRUCTURED_TASKS {
+        let name = format!("{task}-batch");
+        let mut flags = vec!["--cohort-documents", "2", "--prefill-rows", "1"];
+        if task == "extract" { flags.extend(["--schema", "schema.json"]); }
+        let mut stream = parsed_workflow(&[&name], &flags).unwrap();
+        let selected = parsed(task, &["--max-selected-rows", "7"]).unwrap();
+        match (&mut stream.task, selected.task) {
+            (Int4Task::ExtractBatch(batch), Int4Task::Extract(options)) => {
+                batch.extraction = options;
+                assert!(matches!(batch.validate(&stream.args), Err(CandidateError::Arguments)));
+            }
+            (Int4Task::SourceBatch(batch), Int4Task::Source(_, options)) => {
+                batch.source = options;
+                assert!(matches!(batch.validate(&stream.args), Err(CandidateError::Arguments)));
+            }
+            _ => panic!("matching structured tasks required"),
         }
     }
 }

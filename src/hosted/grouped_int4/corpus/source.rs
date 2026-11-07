@@ -7,6 +7,7 @@ use crate::{
         Int4SourceBatchPlanner, NativeInt4SourceBatch, Int4SourceCohortBatchLimits,
         Int4SourceCohortBatchStats, NativeInt4SourceCohortBatch,
         memory::Int4SourceCohortMemoryLimits}},
+    native_engine::strict_int4::prefill::Int4PrefillLimits,
     tasks::{ir::TaskBudget, source_planning::{SourcePlanningLimits, SourceTaskPlanner}},
 };
 
@@ -142,16 +143,47 @@ impl NlpEngine {
         kernel: PackedInt4Kernel, reader: R, writer: W, cancellation: CancellationToken)
         -> Result<Int4SourceCohortBatchResult, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        self.batch_int4_source_cohorts_for_schedule(model, planner, vocabulary, config, limits,
+            max_documents, kernel, None, reader, writer, cancellation)
+    }
+
+    /// Explicit packed prompt/feedback execution for the same source-task
+    /// corpus. Per-document grammars, evidence, finalizers and work are fixed;
+    /// the extra packed workspace is charged once for the entire live window.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int4_source_cohorts_packed<R, W>(&self, model: &ResidentInt4,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: Int4SourceCorpusConfig, limits: CorpusLimits, max_documents: usize,
+        kernel: PackedInt4Kernel, prefill: Int4PrefillLimits,
+        reader: R, writer: W, cancellation: CancellationToken)
+        -> Result<Int4SourceCohortBatchResult, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        self.batch_int4_source_cohorts_for_schedule(model, planner, vocabulary, config, limits,
+            max_documents, kernel, Some(prefill), reader, writer, cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn batch_int4_source_cohorts_for_schedule<R, W>(&self, model: &ResidentInt4,
+        planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: Int4SourceCorpusConfig, limits: CorpusLimits, max_documents: usize,
+        kernel: PackedInt4Kernel, prefill: Option<Int4PrefillLimits>,
+        reader: R, writer: W, cancellation: CancellationToken)
+        -> Result<Int4SourceCohortBatchResult, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
         config.require_full_projection()?;
         dispatch::preflight(self, limits.native.run)?;
         if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
         let width = model.model_identity().group_width();
-        let required = Int4SourceCohortMemoryLimits {
+        let memory = Int4SourceCohortMemoryLimits {
             max_documents, context_tokens: limits.native.context_tokens,
             preparation_reserve_bytes: limits.preparation_reserve_bytes,
             io_reserve_bytes: limits.io_reserve_bytes,
             allocator_reserve_bytes: limits.native.allocator_reserve_bytes,
-        }.requirements(width, config.native_work, limits.transport).map_err(HostedError::BatchSetup)?;
+        };
+        let required = match prefill {
+            Some(prefill) => memory.requirements_packed(width, config.native_work, limits.transport, prefill),
+            None => memory.requirements(width, config.native_work, limits.transport),
+        }.map_err(HostedError::BatchSetup)?;
         // TaskBudget belongs to one document. The aggregate native allocation
         // must never be mistaken for authority to widen that document's KV.
         let row_kv = Int4MemoryRequirement::for_context(limits.native.context_tokens, width)
@@ -183,8 +215,12 @@ impl NlpEngine {
             let admission = SourceCohortAdmission { lease: &lease, model: model.model_identity(),
                 context_limit: limits.native.context_tokens, masks: config.native_work.masks,
                 output_bytes: limits.transport.max_output_line_bytes as u64, task_spec: &task_spec };
-            let mut processor = NativeInt4SourceCohortBatch::new(compiler, &model.inner.loaded.value,
-                &vocabulary, admission, config.native_work, native, kernel).map_err(HostedError::BatchSetup)?;
+            let mut processor = match prefill {
+                Some(prefill) => NativeInt4SourceCohortBatch::new_packed(compiler, &model.inner.loaded.value,
+                    &vocabulary, admission, config.native_work, native, kernel, prefill),
+                None => NativeInt4SourceCohortBatch::new(compiler, &model.inner.loaded.value,
+                    &vocabulary, admission, config.native_work, native, kernel),
+            }.map_err(HostedError::BatchSetup)?;
             let result = stream::grouped::run_ndjson(&mut input.value.reader, &mut input.value.writer,
                 &mut processor, limits.transport, stream::grouped::GroupLimits { max_records: max_documents }, control)
                 .map_err(HostedError::Batch);

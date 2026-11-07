@@ -5,9 +5,10 @@ use crate::{batch::grouped::{GroupedBatchProcessor, GroupedOutput, GroupedReques
     native_engine::{int4::PackedInt4Kernel,
         constrained_int4::cohort::{Int4JsonCohortBudget, required_workspace_bytes},
         strict_int4::{Int4MemoryBudget, Int4MemoryRequirement, Int4ModelWeights, Int4RunBudget, StrictInt4Error,
-            cohort::{Int4CohortEngine, MAX_INT4_SEQUENCES}}},
+            cohort::{Int4CohortEngine, MAX_INT4_SEQUENCES}, prefill::Int4PrefillLimits}},
     tasks::extract::grouped_int4::{Int4ExtractRun, cohort::{self as extraction,
-        Int4ExtractCohortRequest, Int4ExtractCohortBudget, INT4_EXTRACT_COHORT_EXECUTION}}};
+        Int4ExtractCohortRequest, Int4ExtractCohortBudget, INT4_EXTRACT_COHORT_EXECUTION,
+        INT4_EXTRACT_PACKED_COHORT_EXECUTION}}};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Int4ExtractionCohortBatchLimits {
@@ -62,6 +63,7 @@ pub struct NativeInt4ExtractionCohortBatch<'w, 'v, A: Int4ExtractionBatchAdmissi
     work: Int4ExtractionBatchLimits,
     limits: Int4ExtractionCohortBatchLimits,
     kernel: PackedInt4Kernel,
+    prefill: Option<Int4PrefillLimits>,
     seal: Arc<()>,
     account: Account,
     last_context: Option<BatchRequestContext>,
@@ -78,9 +80,22 @@ impl<'w, 'v, A: Int4ExtractionBatchAdmission> NativeInt4ExtractionCohortBatch<'w
         crate::native_engine::constrained_int4::check_model(compiler.base_execution_identity(), weights.identity())
             .map_err(|_| BatchCode::Admission)?;
         if compiler.group_width() != weights.group_width() { return Err(BatchCode::Admission.into()); }
-        Ok(Self { compiler, weights, vocabulary, admission, work, limits, kernel, seal: Arc::new(()),
+        Ok(Self { compiler, weights, vocabulary, admission, work, limits, kernel, prefill: None, seal: Arc::new(()),
             account: Account::default(), last_context: None, failed: false,
             statistics: Int4ExtractionCohortBatchStats::default() })
+    }
+    /// Explicitly pack bounded prompt runs and already sampled feedback.
+    /// Callers must reserve the extra payload returned by `prefill.validate()`
+    /// in addition to the ordinary cohort and decoder memory requirements.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_packed(compiler: Int4ExtractionBatchPlanner, weights: &'w Int4ModelWeights,
+        vocabulary: &'v ExtractionVocabulary, admission: A, work: Int4ExtractionBatchLimits,
+        limits: Int4ExtractionCohortBatchLimits, kernel: PackedInt4Kernel, prefill: Int4PrefillLimits)
+        -> Result<Self, BatchFault> {
+        prefill.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        let mut processor = Self::new(compiler, weights, vocabulary, admission, work, limits, kernel)?;
+        processor.prefill = Some(prefill);
+        Ok(processor)
     }
     pub fn reserved_model_work(&self) -> Int4Work { self.account.work }
     pub fn reserved_mask_visits(&self) -> u64 { self.account.masks }
@@ -132,13 +147,20 @@ impl<'w, 'v, A: Int4ExtractionBatchAdmission> NativeInt4ExtractionCohortBatch<'w
         checkpoint(control).map_err(|error| error.fault)?;
         let mut engine = Int4CohortEngine::new(self.weights, &contexts, self.limits.native_memory)
             .map_err(native_error)?.with_kernel(self.kernel);
-        let raw = extraction::execute(&mut engine, &rows, self.vocabulary, Int4ExtractCohortBudget {
+        let budget = Int4ExtractCohortBudget {
             decode: Int4JsonCohortBudget { native: Int4RunBudget::exact(work), max_kv_bytes: required.kv_bytes,
                 max_mask_node_visits: mask_visits, max_result_bytes: self.limits.max_result_bytes },
             max_result_bytes: self.limits.max_result_bytes,
-        }, control).map_err(|error| native::execution_failure(error).fault)?;
+        };
+        let (raw, execution) = match self.prefill {
+            Some(prefill) => (extraction::execute_packed(&mut engine, &rows, self.vocabulary, budget,
+                prefill, control), INT4_EXTRACT_PACKED_COHORT_EXECUTION),
+            None => (extraction::execute(&mut engine, &rows, self.vocabulary, budget, control),
+                INT4_EXTRACT_COHORT_EXECUTION),
+        };
+        let raw = raw.map_err(|error| native::execution_failure(error).fault)?;
         engine.check_idle().map_err(native_error)?; drop(engine);
-        if raw.schema_version != 1 || raw.execution != INT4_EXTRACT_COHORT_EXECUTION
+        if raw.schema_version != 1 || raw.execution != execution
             || raw.sequences.len() != requests.len() || raw.planned_work != work {
             return Err(BatchCode::InvalidExecution.into());
         }
