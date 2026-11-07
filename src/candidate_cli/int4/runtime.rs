@@ -266,7 +266,7 @@ fn prepare(request: Input, model: &ResidentInt4, args: &Int4Args, limits: Int4Li
                     CandidateError::Timeout
                 } else { CandidateError::Execution });
             }
-            Ok(Prepared::Extract { plan: prepared.into_extraction_plan(), vocabulary,
+            Ok(Prepared::Extract { plan: options.configure_plan(prepared.into_extraction_plan())?, vocabulary,
                 masks: options.masks(), max_mask_node_visits: options.mask_visits() })
         }
         Input::Source { request, options } => {

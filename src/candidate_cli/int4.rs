@@ -208,7 +208,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(redact::long::definition())
         .subcommand(redact::long::corpus::definition())
         .subcommand(redact::long::jobs::definition())
-        .subcommand(prefill::definition(extract::definition()))
+        .subcommand(prefill::definition(extract::one_off_definition()))
         .subcommand(semantic::definition())
         .subcommand(extract_batch::definition())
         .subcommand(extract_job::definition())

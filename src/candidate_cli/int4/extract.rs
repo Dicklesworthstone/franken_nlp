@@ -5,6 +5,7 @@ use super::*;
 use crate::{
     batch::extract::{ExtractionBatchArgs, ExtractionBatchGrounding},
     grammar::{CompileLimits, mask::MaskWorkLimits, runtime::{JsonProgram, SourceRuntimeLimits}},
+    native_engine::constrained_int4::sparse::Int4JsonSparseLimits,
     tasks::ir::TaskBudget,
 };
 
@@ -33,6 +34,10 @@ pub(super) struct ExtractionArgs {
     max_mask_node_visits: u64,
     #[arg(long, default_value_t = 2_000_000)]
     mask_step_node_visits: u64,
+    // Only the one-off command installs this argument. Shared definitions
+    // cannot accidentally expose an execution strategy they do not implement.
+    #[arg(skip)]
+    max_selected_rows: Option<usize>,
 }
 impl std::fmt::Debug for ExtractionArgs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ExtractionArgs") }
@@ -48,13 +53,26 @@ pub(super) fn definition() -> clap::Command {
     for &id in TEXT_ONLY { command = command.mut_arg(id, |arg| arg.hide(true)); }
     ExtractionArgs::augment_args(command)
 }
+
+pub(super) fn one_off_definition() -> clap::Command {
+    definition()
+        .long_about("Compile a bounded local schema against the exact UTF-8 document before model access. Full-vocabulary greedy grammar decoding is the default. Explicit --max-selected-rows N selects every legal grammar row and refuses a step whose complete legal set exceeds N, including EOS when accepting. This is a bounded head projection strategy, never top-k pruning; it checks requested logits and does not certify parity with unrequested full-head rows. The strategy and exact row ceiling enter execution identity before hosted admission. --source-membership preserves all original occurrences of annotated verbatim fields. JSON remains exact text and the complete result is independently validated. Schema validity and source membership do not certify semantic accuracy. No sampling or repair retry. --prefill-rows independently selects bounded layer-major prompt execution. Shared batch, map, job and semantic workflows keep their existing head strategy.")
+        .arg(clap::Arg::new("max_selected_rows").long("max-selected-rows")
+            .value_name("N").value_parser(clap::value_parser!(usize))
+            .help("Opt into all legal grammar-row projections; 1..=166144 rows per step including accepted EOS; excess refuses"))
+}
 impl ExtractionArgs {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         if matches.value_source("prefill_rows") == Some(clap::parser::ValueSource::CommandLine) {
             return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
                 "this INT4 extraction workflow requires sequential prompt execution"));
         }
-        Self::from_matches_with_prefill(matches)
+        let args = Self::from_matches_with_prefill(matches)?;
+        if args.max_selected_rows.is_some() {
+            return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
+                "this INT4 extraction workflow requires full-vocabulary head projection"));
+        }
+        Ok(args)
     }
     pub(super) fn from_matches_with_prefill(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         if TEXT_ONLY.iter().filter(|&&id| id != "prefill_rows")
@@ -62,13 +80,16 @@ impl ExtractionArgs {
             return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
                 "INT4 extraction accepts constrained tokens and result limits, not generation controls"));
         }
-        Self::from_arg_matches(matches)
+        let mut args = Self::from_arg_matches(matches)?;
+        args.max_selected_rows = matches.try_get_one::<usize>("max_selected_rows").ok().flatten().copied();
+        Ok(args)
     }
     pub(super) fn validate(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
-        if args.prefill()?.is_some() { return Err(CandidateError::Arguments); }
+        if self.max_selected_rows.is_some() || args.prefill()?.is_some() { return Err(CandidateError::Arguments); }
         self.validate_with_prefill(args)
     }
     pub(super) fn validate_with_prefill(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
+        let _ = self.selected_rows()?;
         crate::candidate_cli::extract::check_schema_path(&self.schema)?;
         if !(1..=MAX_CONTENT_BYTES).contains(&self.max_result_bytes)
             || !(1..=65_536).contains(&self.max_grammar_states)
@@ -106,6 +127,23 @@ impl ExtractionArgs {
     }
     pub(super) fn mask_visits(&self) -> u64 { self.max_mask_node_visits }
     pub(super) fn schema_path(&self) -> &std::path::Path { &self.schema }
+    fn selected_rows(&self) -> Result<Option<Int4JsonSparseLimits>, CandidateError> {
+        self.max_selected_rows.map(|max_rows_per_step| {
+            let limits = Int4JsonSparseLimits { max_rows_per_step };
+            limits.validate().map_err(|_| CandidateError::Arguments)?;
+            Ok(limits)
+        }).transpose()
+    }
+    /// Bind the explicit head strategy before the host sees an admitted plan.
+    #[cfg(any(feature = "asupersync-runtime", test))]
+    pub(super) fn configure_plan(&self, plan: crate::tasks::extract::grouped_int4::Int4ExtractPlan)
+        -> Result<crate::tasks::extract::grouped_int4::Int4ExtractPlan, CandidateError> {
+        if plan.selected_rows().is_some() { return Err(CandidateError::Planning); }
+        match self.selected_rows()? {
+            Some(limits) => plan.with_selected_rows(limits).map_err(|_| CandidateError::Planning),
+            None => Ok(plan),
+        }
+    }
     #[cfg(test)]
     pub(super) fn source_membership(&self) -> bool { self.source_membership }
 
@@ -113,6 +151,7 @@ impl ExtractionArgs {
     /// Source membership compiles against EACH original job/corpus document.
     pub(super) fn shared_defaults(&self, schema: String, ceiling: TaskBudget)
         -> Result<ExtractionBatchArgs, CandidateError> {
+        if self.max_selected_rows.is_some() { return Err(CandidateError::Arguments); }
         ceiling.validate().map_err(|_| CandidateError::Planning)?;
         let request = crate::candidate_cli::extract::arguments(schema, self.source_membership, ceiling)?;
         let declaration = crate::validation::parse_json_with_limits(&request.schema, crate::validation::JsonLimits {
@@ -147,6 +186,7 @@ impl ExtractionArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod selected;
     fn command(extra: &[&str]) -> Int4Command {
         let mut argv = vec!["candidate", "source-int4", "extract", "--source-dir", "explicit-source",
             "--source-manifest", "explicit-manifest.json", "--memory-mib", "8192", "--schema", "schema.json"];

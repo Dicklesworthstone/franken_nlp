@@ -5,6 +5,33 @@ that the current JSON grammar permits. This uses the existing quantized model,
 native session, selected-row kernels and source validator. Full-vocabulary
 execution remains the default and the reference for qualification.
 
+## Candidate CLI
+
+One-off schema extraction exposes the strategy explicitly:
+
+```sh
+fnlp candidate source-int4 extract document.txt \
+  --schema schema.json \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --group-width 128 --memory-mib "$MEMORY_MIB" \
+  --max-new-tokens 128 --max-selected-rows 256 \
+  --prefill-rows 4
+```
+
+The source-directory/manifest acquisition route also works. The optional
+`--prefill-rows` changes prompt scheduling and composes with selected rows;
+omitting it preserves sequential prefill. Add `--source-membership` for a
+schema with annotated verbatim fields. The row cap must cover the complete
+legal token set at every visited grammar state; this example cap is not a
+promise that an arbitrary schema fits.
+
+`--max-selected-rows` is available only on one-off `extract`. Shared extraction
+batches, maps, durable jobs and the semantic second-reader route reject it.
+Without the option, extraction retains full-vocabulary execution and its
+existing identity. Native work in the result reports actual projected rows;
+grammar-mask, task, source and complete-result limits are unchanged.
+
 ## Library use
 
 Seal the strategy before asking the host to admit the prepared extraction:
