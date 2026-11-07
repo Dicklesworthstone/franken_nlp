@@ -125,7 +125,8 @@ fn discovery_publication_keeps_original_offsets_without_document_or_witness_prov
         scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "resolve",
         model_id: "Nanbeige4.2-3B", source_revision: "fixture", source_root_sha256: "model-source-root",
         model_content_sha256: "model-content", candidate_format: "candidate-format", quant_recipe: "candidate:group=128",
-        group_width: 128, integer_kernel: "s_scalar_i32", snapshot: None };
+        group_width: 128, integer_kernel: "s_scalar_i32", snapshot: None,
+        cohort_pairs: None, cohort_chunks: None };
     let response = Response { provenance: &provenance, output: &result };
     let mut output = Vec::new(); publish(&response, 16384, &mut output).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
@@ -188,6 +189,27 @@ fn raw_and_chunked_discovery_match_between_source_scalar_and_pinned_snapshot_sim
         let selected: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(selected["snapshot"]["operation"], "loaded");
         assert_eq!(selected["output"], baseline["output"]);
+        for schedule in [vec!["--cohort-chunks", "3"], vec!["--cohort-pairs", "2"],
+            vec!["--cohort-chunks", "3", "--cohort-pairs", "2"]] {
+            for selected_kernel in [Int8KernelKind::Scalar, kernel] {
+                let mut flags = vec!["--snapshot", snapshot.as_str(), "--expected-model-sha256", pin.as_str(),
+                    "--kernel", selected_kernel.id()];
+                if chunked { flags.extend(["--chunked", "--max-ner-chunk-bytes", "16"]); }
+                flags.extend(schedule.iter().copied());
+                let mut grouped = command(&flags); grouped.args.memory_mib = memory;
+                let mut output = Vec::new(); grouped.execute(&mut input.as_bytes(), &mut output).unwrap();
+                let actual: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(actual["output"]["output"], baseline["output"]);
+                if schedule.contains(&"--cohort-chunks") {
+                    let chunks = baseline["output"]["chunk_count"].as_u64().unwrap();
+                    assert_eq!(actual["output"]["ner_cohorts"], chunks.div_ceil(3));
+                } else { assert_eq!(actual["output"]["ner_cohorts"], 0); }
+                if schedule.contains(&"--cohort-pairs") {
+                    let pairs = baseline["output"]["resolution"]["result"]["judgments"].as_array().unwrap().len();
+                    assert_eq!(actual["output"]["pair_cohorts"], pairs.div_ceil(2));
+                } else { assert_eq!(actual["output"]["pair_cohorts"], 0); }
+            }
+        }
     }
     // The explicit snapshot remains available on success and failure.
 }

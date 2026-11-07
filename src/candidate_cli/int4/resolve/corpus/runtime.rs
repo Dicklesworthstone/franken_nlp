@@ -26,9 +26,10 @@ fn native(args: &Int4Args, elapsed: Duration) -> NativeLimits {
 
 pub(super) fn memory_floor(args: &Int4Args, command: &CorpusArgs, common: Int4Limits,
     transport: EntityStreamLimits, io_bytes: u64, task: &Int4EntityConfig) -> Result<u64, Failure> {
-    let requirement = Int4EntityCorpusHostRequirements::for_config(task, transport,
+    let requirement = Int4EntityCorpusHostRequirements::for_config_with_schedule(task, transport,
         native(args, Duration::from_secs(args.timeout_seconds)), common.preparation_bytes,
-        command.resolution.graph_bytes().map_err(candidate_failure)?, io_bytes, args.group_width)
+        command.resolution.graph_bytes().map_err(candidate_failure)?, io_bytes, args.group_width,
+        command.resolution.cohorts.enabled().then(|| command.resolution.cohorts.schedule()))
         .map_err(host_failure)?;
     // Resident model allocation and the caller's policy/planner preparation
     // coexist with every host-owned parser, graph, output and native claim.
@@ -105,6 +106,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         native: native(&args, remaining()?), preparation_reserve_bytes: common.preparation_bytes,
         graph_reserve_bytes: command.resolution.graph_bytes().map_err(candidate_failure)?,
         io_reserve_bytes: limits.io_bytes,
+        schedule: command.resolution.cohorts.enabled().then(|| command.resolution.cohorts.schedule()),
     };
     let completed = engine.execute_int4_entity_corpus(&model, source, resolver, vocabulary, config,
         common.kernel, reader, output, cancellation).map_err(corpus_failure)?;

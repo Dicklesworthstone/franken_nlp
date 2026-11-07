@@ -2,7 +2,60 @@
 //! The optional chunked path keeps original document identities and coordinates.
 use super::*;
 use crate::corpus::entities_int4::{Int4EntityConfig, Int4EntityError, Int4EntityRun,
-    PreparedInt4EntityCorpus, INT4_ENTITY_EXECUTION};
+    PreparedInt4EntityCorpus, INT4_ENTITY_EXECUTION,
+    cohort::{Int4EntitySchedule, Int4EntityCohortBudget, Int4EntityCohortRequirement,
+        Int4EntityCohortRun, INT4_ENTITY_COHORT_EXECUTION}};
+
+/// Componentwise phase peak for independently selected NER and pair windows.
+/// The result excludes original input payload and resident weights. Extra NER
+/// plans, shared graph storage, transient windows, output staging and cleanup
+/// remain charged throughout the same physical invocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Int4EntityCohortHostRequirements {
+    pub preparation_bytes: u64,
+    pub temporary_bytes: u64,
+    pub output_bytes: u64,
+    pub kv_bytes: u64,
+    pub scratch_bytes: u64,
+    pub cleanup_bytes: u64,
+    pub max_result_bytes: u64,
+    pub(super) cohort: Int4EntityCohortRequirement,
+}
+impl Int4EntityCohortHostRequirements {
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_config(task: &Int4EntityConfig, native: NativeLimits, preparation: u64,
+        graph: u64, schedule: Int4EntitySchedule, width: usize) -> Result<Self, HostedError> {
+        requirements(task, 0, native, preparation, graph, width)?;
+        if schedule.ner_cohort_chunks.is_none() && schedule.pair_cohort_pairs.is_none() {
+            return Err(HostedError::Limits("INT4 entity cohort phase required"));
+        }
+        let cohort = schedule.requirements(task, native.context_tokens, preparation, width).map_err(execution_error)?;
+        let result = Self {
+            preparation_bytes: sum(&[preparation, cohort.additional_preparation_bytes])?,
+            temporary_bytes: sum(&[temporary_bytes(task, graph)?, cohort.workspace_bytes])?,
+            output_bytes: super::cohort_output_bytes(cohort.max_result_bytes)?,
+            kv_bytes: cohort.native.kv_bytes,
+            scratch_bytes: sum(&[cohort.native.rope_bytes, cohort.native.scratch_payload_bound,
+                native.allocator_reserve_bytes])?,
+            cleanup_bytes: native.run.cleanup_reserve_bytes,
+            max_result_bytes: cohort.max_result_bytes, cohort,
+        };
+        result.total_bytes()?;
+        Ok(result)
+    }
+    pub fn total_bytes(self) -> Result<u64, HostedError> {
+        sum(&[self.preparation_bytes, self.temporary_bytes, self.output_bytes,
+            self.kv_bytes, self.scratch_bytes, self.cleanup_bytes])
+    }
+    pub(super) fn budget(self, context_tokens: usize, preparation_reserve_bytes: u64) -> Int4EntityCohortBudget {
+        Int4EntityCohortBudget { context_tokens, preparation_reserve_bytes,
+            native_memory: Int4MemoryBudget { max_kv_bytes: self.cohort.native.kv_bytes,
+                max_rope_bytes: self.cohort.native.rope_bytes,
+                max_scratch_payload_bytes: self.cohort.native.scratch_payload_bound },
+            max_preparation_bytes: self.cohort.additional_preparation_bytes,
+            max_workspace_bytes: self.cohort.workspace_bytes, max_result_bytes: self.max_result_bytes }
+    }
+}
 
 struct Input { prepared: Option<PreparedInt4EntityCorpus>, vocabulary: Arc<ExtractionVocabulary> }
 
@@ -81,6 +134,60 @@ impl NlpEngine {
             Ok(GuardedOutput::new(result.value, result._memory))
         })
     }
+    /// Run independently selected discovery and pair-scoring windows against
+    /// one consumed source corpus. The complete declared phase peak is reserved
+    /// before execution, and each core phase owns only the native engine it uses.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_int4_entities_cohorts(&self, model: &ResidentInt4, prepared: PreparedInt4EntityCorpus,
+        vocabulary: Arc<ExtractionVocabulary>, native: NativeLimits, preparation_reserve_bytes: u64,
+        graph_reserve_bytes: u64, schedule: Int4EntitySchedule, kernel: PackedInt4Kernel,
+        cancellation: CancellationToken) -> Result<HostedOutput<Int4EntityCohortRun>, HostedError> {
+        dispatch::preflight(self, native.run)?;
+        if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
+        constrained_int4::check_model(prepared.source_identity(), model.model_identity())
+            .map_err(|_| HostedError::ModelIdentity)?;
+        constrained_int4::check_model(prepared.resolution_identity(), model.model_identity())
+            .map_err(|_| HostedError::ModelIdentity)?;
+        let width = model.model_identity().group_width();
+        if prepared.group_width() != width { return Err(HostedError::ModelIdentity); }
+        requirements(prepared.config(), prepared.required_ner_context_tokens(), native,
+            preparation_reserve_bytes, graph_reserve_bytes, width)?;
+        let required = Int4EntityCohortHostRequirements::for_config(prepared.config(), native,
+            preparation_reserve_bytes, graph_reserve_bytes, schedule, width)?;
+        let input_bytes = sum(&[prepared.retained_input_bytes().map_err(execution_error)?, required.preparation_bytes])?;
+        let expected = Expected { width, documents: prepared.document_count(), chunks: prepared.chunk_count(),
+            ner_work: prepared.ner_reserved_work(), masks: prepared.reserved_mask_visits(),
+            max_model_work: prepared.config().max_model_work, chunked: prepared.config().chunks.is_some() };
+        let lease = self.resources().acquire_lease();
+        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, input_bytes)?,
+            || Ok(Input { prepared: Some(prepared), vocabulary }))?;
+        let model = model.clone();
+        dispatch::run(self, native.run, cancellation, move |control| {
+            let mut input = input;
+            let temporary = Pending::reserve(&lease, MemoryClass::JobBuffers, required.temporary_bytes)?;
+            let output = Pending::reserve(&lease, MemoryClass::JobBuffers, required.output_bytes)?;
+            let phase_peak = if expected.documents == 0 { None } else {
+                let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
+                let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.scratch_bytes)?;
+                Some((kv.commit()?, scratch.commit()?))
+            };
+            let prepared = input.value.prepared.take().ok_or(HostedError::CompletionMissing)?;
+            let result = allocate(output, || {
+                let result = prepared.execute_cohorts_with_control(&model.inner.loaded.value, &input.value.vocabulary,
+                    kernel, schedule, required.budget(native.context_tokens, preparation_reserve_bytes), control)
+                    .map_err(execution_error)?;
+                check_cohort_result(&result, expected, schedule)?;
+                checkpoint(control)?;
+                Ok(result)
+            })?;
+            drop(phase_peak);
+            drop(temporary);
+            drop(input);
+            drop(lease);
+            Ok(GuardedOutput::new(result.value, result._memory))
+        })
+    }
+
 }
 
 pub(super) fn requirements(config: &Int4EntityConfig, ner_context: usize, native: NativeLimits,
@@ -100,13 +207,16 @@ pub(super) fn requirements(config: &Int4EntityConfig, ner_context: usize, native
 }
 
 pub(super) fn temporary_bytes(config: &Int4EntityConfig, graph: u64) -> Result<u64, HostedError> {
-    // At most one source grammar/native result is resident at a time. Graph
-    // storage separately owns the expanded mentions and compact chunk receipts.
+    // Serial NER storage is the shared baseline. Cohort admission adds its
+    // simultaneous plans and native windows; graph storage owns mentions and
+    // compact receipts, and the collector retains bounded document metadata.
     let result = config.ner_budget.max_output_bytes.checked_mul(4)
         .ok_or(HostedError::Limits("INT4 entity NER intermediate arithmetic"))?;
     let tokens = u64::from(config.ner_budget.max_output_tokens).checked_mul(8)
         .ok_or(HostedError::Limits("INT4 entity token arithmetic"))?;
-    sum(&[result, tokens, graph])
+    let collection = crate::corpus::entities_int4::collection_workspace_bytes(config.graph.max_documents)
+        .map_err(execution_error)?;
+    sum(&[result, tokens, graph, collection])
 }
 
 #[derive(Clone, Copy)]
@@ -136,6 +246,35 @@ pub(super) fn check_result(result: &Int4EntityRun, expected: Expected) -> Result
     super::check_work(result.ner_model_work, expected.ner_work)?;
     super::check_work(actual, reserved)?;
     super::check_work(reserved, expected.max_model_work)?;
+    Ok(())
+}
+
+
+pub(super) fn check_cohort_result(result: &Int4EntityCohortRun, expected: Expected,
+    schedule: Int4EntitySchedule) -> Result<(), HostedError> {
+    check_result(&result.output, expected)?;
+    let windows = |count: usize, width: Option<usize>, max: usize| -> Result<usize, HostedError> {
+        match width {
+            None => Ok(0),
+            Some(width) if (1..=max).contains(&width) => Ok(count.div_ceil(width)),
+            Some(_) => Err(execution_error(Int4EntityError::Accounting)),
+        }
+    };
+    let ner = windows(expected.chunks, schedule.ner_cohort_chunks, 64)?;
+    let pairs = windows(result.output.resolution.result.judgments.len(), schedule.pair_cohort_pairs, 32)?;
+    let counters = |windows: usize, steps: u64, projections: u64, positions: u64| {
+        (windows == 0) == (steps == 0) && (windows == 0) == (projections == 0)
+            && projections <= steps && steps <= positions
+    };
+    if result.schema_version != 1 || result.execution != INT4_ENTITY_COHORT_EXECUTION
+        || result.schedule != schedule
+        || (schedule.ner_cohort_chunks.is_none() && schedule.pair_cohort_pairs.is_none())
+        || result.ner_cohorts != ner || result.pair_cohorts != pairs
+        || !counters(ner, result.ner_group_steps, result.ner_projection_groups, result.output.ner_model_work.forward_positions)
+        || !counters(pairs, result.pair_group_steps, result.pair_projection_groups,
+            result.output.resolution.model_work.forward_positions) {
+        return Err(execution_error(Int4EntityError::Accounting));
+    }
     Ok(())
 }
 

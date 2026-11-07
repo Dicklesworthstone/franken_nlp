@@ -42,7 +42,8 @@ fn discovery_is_explicit_and_preserves_exact_original_bytes_and_ner_options() {
 #[test]
 fn raw_wire_refuses_mentions_authority_overrides_duplicate_keys_and_invalid_ner_policy() {
     let command = parsed(&["--discover-entities"]).unwrap(); let options = options(&command);
-    for field in ["budget", "work", "model", "execution_identity", "seed", "thinking", "tools", "scores", "clusters"] {
+    for field in ["budget", "work", "model", "execution_identity", "seed", "thinking", "tools", "scores", "clusters",
+        "cohort_pairs", "cohort_chunks", "schedule"] {
         let mut wire = fixture(); wire[field] = json!({});
         assert!(matches!(options.discovery.input(options, &command.args, &wire.to_string()), Err(CandidateError::Input)));
     }
@@ -138,6 +139,47 @@ fn ner_depth_masks_grounding_and_chunk_counts_are_separate_from_pair_language_an
 }
 
 #[test]
+fn discovery_and_pair_cohorts_are_independent_and_do_not_rewrite_task_authority() {
+    for chunked in [false, true] {
+        for (chunks, pairs) in [(Some("2"), None), (None, Some("2")), (Some("3"), Some("2"))] {
+            let mut flags = vec!["--discover-entities"];
+            if chunked { flags.push("--chunked"); }
+            if let Some(chunks) = chunks { flags.extend(["--cohort-chunks", chunks]); }
+            if let Some(pairs) = pairs { flags.extend(["--cohort-pairs", pairs]); }
+            let mut command = parsed(&flags).unwrap();
+            command.args.memory_mib = 131072;
+            let selected = options(&command);
+            let limits = selected.validate(&command.args).unwrap();
+            let task = selected.discovery.configuration(selected, &command.args, limits,
+                NerOptions::default(), ResolveOptions::default()).unwrap();
+            let schedule = selected.cohorts.schedule();
+            assert_eq!(schedule.ner_cohort_chunks, chunks.map(|n| n.parse().unwrap()));
+            assert_eq!(schedule.pair_cohort_pairs, pairs.map(|n| n.parse().unwrap()));
+            assert_eq!(task.chunks.is_some(), chunked);
+            assert_eq!(task.max_model_work, selected.scoring.work_ceiling());
+            assert_eq!(task.masks.max_visits_per_run, selected.discovery.snapshot_masks());
+            assert_eq!(task.ner_budget.max_kv_bytes, limits.native.kv_bytes);
+            assert_eq!(task.scoring.planning.per_head.max_kv_bytes, limits.native.kv_bytes);
+        }
+    }
+}
+
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn complete_discovery_cohort_admission_is_checked_before_source_or_model_io() {
+    let mut command = parsed(&["--discover-entities", "--chunked", "--cohort-chunks", "3", "--cohort-pairs", "2"]).unwrap();
+    command.args.memory_mib = 131072;
+    let selected = options(&command);
+    let limits = selected.validate(&command.args).unwrap();
+    let floor = super::super::runtime::cohort_memory_floor(selected, &command.args, limits).unwrap();
+    assert!(limits.minimum_memory_bytes >= floor);
+    command.args.memory_mib = (limits.minimum_memory_bytes - 1) / MIB;
+    assert_eq!(command.execute(&mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+    command.args.memory_mib = limits.minimum_memory_bytes.div_ceil(MIB);
+    assert!(selected.validate(&command.args).is_ok());
+}
+
+#[test]
 fn discovery_and_chunk_witnesses_and_temporary_output_are_added_to_the_complete_memory_quote() {
     for flags in [vec!["--discover-entities"], vec!["--discover-entities", "--chunked"]] {
         let mut command = parsed(&flags).unwrap(); let options = options(&command);
@@ -145,8 +187,10 @@ fn discovery_and_chunk_witnesses_and_temporary_output_are_added_to_the_complete_
         let limits = options.validate(&command.args).unwrap();
         assert_eq!(limits.minimum_memory_bytes, base.minimum_memory_bytes + base.preparation_bytes
             + options.graph_bytes().unwrap() + options.host_input_bytes(&command.args).unwrap()
-            + options.discovery.temporary_bytes(base).unwrap());
-        assert_eq!(options.discovery.temporary_bytes(base).unwrap(), base.result_bytes as u64 * 4 + 256 * 8);
+            + options.discovery.temporary_bytes(base, options.graph.max_documents).unwrap());
+        assert_eq!(options.discovery.temporary_bytes(base, options.graph.max_documents).unwrap(),
+            base.result_bytes as u64 * 4 + 256 * 8
+                + crate::corpus::entities_int4::collection_workspace_bytes(options.graph.max_documents).unwrap());
         assert!(options.discovery.witness_bytes(options) > 0);
         command.args.memory_mib = (limits.minimum_memory_bytes - 1) / MIB;
         assert!(options.validate(&command.args).is_err());

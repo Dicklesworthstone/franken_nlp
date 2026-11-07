@@ -63,6 +63,15 @@ the matching synthesis and hierarchy flags and never enables prompt prefill.
 See [structured INT4 cohorts](int4-structured-cohorts.md#native-hierarchy-group-cohorts)
 for allowed widths, complete memory admission and examples.
 
+Entity `resolve` and resident `resolve-corpus` have independent native schedules:
+`--cohort-pairs 1..=32` keeps both orders of each candidate pair together, while
+`--cohort-chunks 1..=64` batches NER discovery with `--discover-entities`.
+Discovery windows can cross original document boundaries, with or without
+`--chunked`. These schedules preserve whole-snapshot and whole-invocation work
+ceilings and use shared host admission for the complete phase peak. See
+[native INT4 entity cohorts](native-entity-cohorts-int4.md) for examples and
+semantic versus physical output fields.
+
 ## Admission and delivery
 
 `--memory-mib` is a process ledger ceiling, not a promised OS RSS maximum.

@@ -70,7 +70,8 @@ fn fixed_policy_rejects_duplicate_keys_omissions_and_authority_overrides() {
     let parsed = Policy::parse(&policy().to_string()).unwrap();
     assert_eq!(parsed.ner.max_entities, 8);
     assert_eq!(parsed.options.blocking, crate::corpus::resolve::BlockingPolicy::ExactSurface);
-    for field in ["documents", "budget", "work", "model", "execution_identity", "seed", "thinking", "tools"] {
+    for field in ["documents", "budget", "work", "model", "execution_identity", "seed", "thinking", "tools",
+        "cohort_pairs", "cohort_chunks", "schedule"] {
         let mut value = policy(); value[field] = json!({});
         assert!(Policy::parse(&value.to_string()).is_err());
     }
@@ -125,6 +126,37 @@ fn epochs_reuse_one_work_mask_and_grounding_allowance_without_multiplication() {
         assert_eq!(config.verification.max_matches, changed.verification.max_matches);
         assert_eq!(config.graph.max_documents, second.transport.max_documents);
         assert_eq!(first.common.minimum_memory_bytes, second.common.minimum_memory_bytes);
+    }
+}
+
+#[test]
+fn corpus_schedules_keep_fixed_native_mask_and_verification_authority_across_epochs() {
+    for flags in [vec!["--cohort-pairs", "2"], vec!["--cohort-chunks", "3"],
+        vec!["--chunked", "--cohort-chunks", "3", "--cohort-pairs", "2"]] {
+        let (mut command, mut args) = args(&flags);
+        args.memory_mib = 131072;
+        let limits = command.validate(&args).unwrap();
+        let before = command.configuration(&args, limits.common, Policy::parse(&policy().to_string()).unwrap()).unwrap();
+        let schedule = command.resolution.cohorts.schedule();
+        command.stream.max_snapshots = 1;
+        let again = command.validate(&args).unwrap();
+        let after = command.configuration(&args, again.common, Policy::parse(&policy().to_string()).unwrap()).unwrap();
+        assert_eq!(before.max_model_work, after.max_model_work);
+        assert_eq!(before.masks.max_visits_per_run, after.masks.max_visits_per_run);
+        assert_eq!(before.verification, after.verification);
+        assert_eq!(schedule, command.resolution.cohorts.schedule());
+        assert_eq!(limits.common.minimum_memory_bytes, again.common.minimum_memory_bytes);
+        assert_eq!(before.ner_budget.max_kv_bytes, limits.common.native.kv_bytes);
+        assert_eq!(before.scoring.planning.per_head.max_kv_bytes, limits.common.native.kv_bytes);
+    }
+}
+
+#[test]
+fn malformed_corpus_cohorts_refuse_before_policy_population_model_or_output_io() {
+    for flags in [vec!["--cohort-pairs", "0"], vec!["--cohort-pairs", "33"],
+        vec!["--cohort-chunks", "0"], vec!["--cohort-chunks", "65"]] {
+        let (command, args) = args(&flags);
+        assert_eq!(command.execute_owned(args, NoIo, NoIo).err().unwrap().exit, ErrorCode::Usage);
     }
 }
 

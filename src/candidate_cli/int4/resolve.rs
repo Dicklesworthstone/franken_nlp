@@ -2,6 +2,7 @@
 use super::*;
 use serde::Deserialize;
 use crate::{batch::BatchWork,
+    corpus::entities_int4::cohort::Int4EntitySchedule,
     corpus::{resolve::{ResolutionDocument, ResolveOptions, ResolveLimits},
         native_resolve::{NativeResolveLimits, grouped_int4::Int4ResolveLimits}},
 };
@@ -12,6 +13,33 @@ pub(super) mod corpus;
 mod runtime;
 #[cfg(test)]
 mod tests;
+
+#[derive(Args, Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CohortArgs {
+    /// Complete pairs per native window, 1..=32; both orders share one window.
+    #[arg(long, value_name = "N")]
+    cohort_pairs: Option<usize>,
+    /// NER discovery chunks per native window, 1..=64; may cross document boundaries.
+    #[arg(long, value_name = "N", requires = "discover_entities")]
+    cohort_chunks: Option<usize>,
+}
+impl CohortArgs {
+    fn enabled(self) -> bool { self.cohort_pairs.is_some() || self.cohort_chunks.is_some() }
+    fn validate(self, discover: bool) -> Result<(), CandidateError> {
+        if self.cohort_pairs.is_some_and(|n| !(1..=32).contains(&n))
+            || self.cohort_chunks.is_some_and(|n| !discover || !(1..=64).contains(&n)) {
+            return Err(CandidateError::Arguments);
+        }
+        Ok(())
+    }
+    fn schedule(self) -> Int4EntitySchedule {
+        Int4EntitySchedule { ner_cohort_chunks: self.cohort_chunks, pair_cohort_pairs: self.cohort_pairs }
+    }
+    fn output_cap(self, semantic_bytes: usize) -> Result<usize, CandidateError> {
+        semantic_bytes.checked_add(if self.enabled() { 8192 } else { 4096 })
+            .ok_or(CandidateError::Arguments)
+    }
+}
 
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
 struct GraphArgs {
@@ -36,6 +64,7 @@ struct GraphArgs {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ResolveArgs {
     scoring: classify::ScoringArgs, graph: GraphArgs, discovery: discovery::DiscoveryArgs,
+    cohorts: CohortArgs,
 }
 
 // Deliberately no Debug: original documents and mention surfaces are private.
@@ -56,7 +85,8 @@ pub(super) fn definition() -> clap::Command {
         .mut_arg("max_dot_products", |arg| arg.default_value("100000000000000"))
         .mut_arg("max_result_bytes", |arg| arg.help("Complete native resolution result; candidate provenance is additional"))
         .mut_arg("max_forward_positions", |arg| arg.help("Whole-snapshot native forward ceiling, shared by all discovery chunks, pairs and both presentation orders")));
-    discovery::DiscoveryArgs::augment_args(command)
+    CohortArgs::augment_args(discovery::DiscoveryArgs::augment_args(command))
+        .after_long_help("Native cohorts are explicit and independently selected. --cohort-pairs N executes both presentation orders of up to N complete pairs together (1..=32 pairs, at most 64 heads). --cohort-chunks N executes up to N independent NER discovery chunks together (1..=64); it requires --discover-entities and also applies to unchunked documents. All original sources and the complete pair graph retain their existing semantics. Every window drains before a dependent phase starts. The requested schedule admits its complete native phase peak and simultaneous preparation without enlarging any task's context or replenishing native, mask or grounding budgets. Physical cohort counters are separate from the semantic result. No measured speedup or model parity is implied.")
 }
 impl ResolveArgs {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
@@ -65,9 +95,11 @@ impl ResolveArgs {
                 "INT4 resolution uses a fixed label-plus-EOS language"));
         }
         Ok(Self { scoring: classify::ScoringArgs::from_matches(matches)?, graph: GraphArgs::from_arg_matches(matches)?,
-            discovery: discovery::DiscoveryArgs::from_arg_matches(matches)? })
+            discovery: discovery::DiscoveryArgs::from_arg_matches(matches)?,
+            cohorts: CohortArgs::from_arg_matches(matches)? })
     }
     pub(super) fn validate(self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
+        self.cohorts.validate(self.discovery.discover_entities)?;
         let mut limits = self.scoring.validate(args)?;
         let g = self.graph;
         if self.scoring.budget(limits).max_output_tokens != 2
@@ -88,7 +120,11 @@ impl ResolveArgs {
         // and complete graph until physical completion. This is a conservative
         // declared reservation quote, not an OS RSS estimate.
         limits.minimum_memory_bytes = sum(&[limits.minimum_memory_bytes, limits.preparation_bytes,
-            graph_bytes, self.host_input_bytes(args)?, self.discovery.temporary_bytes(limits)?])?;
+            graph_bytes, self.host_input_bytes(args)?, self.discovery.temporary_bytes(limits, self.graph.max_documents)?])?;
+        #[cfg(feature = "asupersync-runtime")]
+        if self.cohorts.enabled() {
+            limits.minimum_memory_bytes = limits.minimum_memory_bytes.max(runtime::cohort_memory_floor(self, args, limits)?);
+        }
         if limits.minimum_memory_bytes > limits.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(limits)
     }

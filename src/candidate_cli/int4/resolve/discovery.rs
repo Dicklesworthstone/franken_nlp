@@ -96,8 +96,10 @@ impl DiscoveryArgs {
     pub(super) fn witness_bytes(self, command: ResolveArgs) -> u64 {
         if self.discover_entities { self.snapshot_chunks(command) as u64 * 1024 } else { 0 }
     }
-    pub(super) fn temporary_bytes(self, limits: Int4Limits) -> Result<u64, CandidateError> {
-        if self.discover_entities { sum(&[limits.result_bytes as u64 * 4, self.tokens() as u64 * 8]) }
+    pub(super) fn temporary_bytes(self, limits: Int4Limits, max_documents: usize) -> Result<u64, CandidateError> {
+        if self.discover_entities { sum(&[limits.result_bytes as u64 * 4, self.tokens() as u64 * 8,
+            crate::corpus::entities_int4::collection_workspace_bytes(max_documents)
+                .map_err(|_| CandidateError::Arguments)?]) }
             else { Ok(0) }
     }
     pub(super) fn check_preparation(self, command: ResolveArgs, args: &Int4Args, limits: Int4Limits)

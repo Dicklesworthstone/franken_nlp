@@ -241,7 +241,8 @@ fn real_cli_reuses_epochs_and_refuses_late_input_or_lifetime_mask_exhaustion() {
     let config = Int4EntityCorpusHostConfig { source_identity, resolution_identity, task,
         transport: limits.transport, native: native(&args, Duration::from_secs(args.timeout_seconds)),
         preparation_reserve_bytes: limits.common.preparation_bytes,
-        graph_reserve_bytes: options.resolution.graph_bytes().unwrap(), io_reserve_bytes: limits.io_bytes };
+        graph_reserve_bytes: options.resolution.graph_bytes().unwrap(), io_reserve_bytes: limits.io_bytes,
+        schedule: None };
     let loaded = engine.resources().memory_snapshot();
     let cancellation = CancellationToken::default(); cancellation.cancel(DecodeCancellationKind::User);
     let error = engine.execute_int4_entity_corpus(&model, Arc::new(source), Arc::new(resolver), Arc::new(vocabulary),

@@ -213,3 +213,59 @@ fn owned_source_graph_and_guarded_result_cross_the_physical_runtime_boundary() {
     send::<ResolveInput>(); send::<Int4ResolutionRun>(); send::<HostedOutput<Int4ResolutionRun>>();
     let _host = NlpEngine::resolve_int4;
 }
+
+
+#[test]
+fn pair_cohorts_reserve_both_orders_without_widening_each_tasks_context() {
+    for width in [16, 32, 128] {
+        let c = config(width);
+        let quote = |pairs| Int4ResolveCohortHostRequirements::for_config(c.scoring, c.native,
+            c.preparation_reserve_bytes, c.graph_reserve_bytes, pairs, width).unwrap();
+        let single = Int4MemoryRequirement::for_context(c.native.context_tokens, width).unwrap();
+        let two = quote(2);
+        assert_eq!(two.kv_bytes, 4 * single.kv_bytes);
+        assert_eq!(quote(3).kv_bytes, 6 * single.kv_bytes);
+        assert_eq!(two.preparation_bytes, c.preparation_reserve_bytes);
+        assert!(two.temporary_bytes > c.graph_reserve_bytes);
+        assert!(two.max_result_bytes > (c.scoring.planning.max_result_bytes as u64)
+            .min(c.scoring.planning.per_head.max_output_bytes));
+        assert_eq!(two.output_bytes, 4 * two.max_result_bytes + 4096);
+        assert_eq!(two.total_bytes().unwrap(), two.preparation_bytes + two.temporary_bytes
+            + two.output_bytes + two.kv_bytes + two.scratch_bytes + two.cleanup_bytes);
+        assert_eq!(c.scoring.planning.per_head.max_kv_bytes, single.kv_bytes);
+        let mut capped = c.scoring;
+        capped.planning.per_head.max_kv_bytes -= 1;
+        assert!(Int4ResolveCohortHostRequirements::for_config(capped, c.native,
+            c.preparation_reserve_bytes, c.graph_reserve_bytes, 2, width).is_err());
+    }
+}
+
+#[test]
+fn impossible_pair_windows_and_overflowing_complete_envelopes_refuse_pure_admission() {
+    let c = config(32);
+    for pairs in [0, 33, usize::MAX] {
+        assert!(Int4ResolveCohortHostRequirements::for_config(c.scoring, c.native,
+            c.preparation_reserve_bytes, c.graph_reserve_bytes, pairs, 32).is_err());
+    }
+    for (preparation, graph) in [(0, 4096), (4096, 0), (u64::MAX, 4096), (4096, u64::MAX)] {
+        assert!(Int4ResolveCohortHostRequirements::for_config(c.scoring, c.native,
+            preparation, graph, 1, 32).is_err());
+    }
+    let mut native = c.native; native.context_tokens -= 1;
+    assert!(Int4ResolveCohortHostRequirements::for_config(c.scoring, native,
+        c.preparation_reserve_bytes, c.graph_reserve_bytes, 1, 32).is_err());
+    assert!(cohort_output_bytes(u64::MAX / 4 + 1).is_err());
+    let mut q = Int4ResolveCohortHostRequirements::for_config(c.scoring, c.native,
+        c.preparation_reserve_bytes, c.graph_reserve_bytes, 1, 32).unwrap();
+    q.cleanup_bytes = u64::MAX;
+    assert!(q.total_bytes().is_err());
+}
+
+#[test]
+fn pair_cohort_results_and_owned_host_api_cross_the_physical_boundary() {
+    fn send<T: Send + 'static>() {}
+    send::<Int4ResolveCohortHostRequirements>();
+    send::<Int4ResolutionCohortRun>();
+    send::<HostedOutput<Int4ResolutionCohortRun>>();
+    let _method = NlpEngine::resolve_int4_cohorts;
+}

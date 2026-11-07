@@ -107,6 +107,10 @@ pub(super) fn execute(args: Int4Args, command: ResolveArgs,
     let raw = command.discovery.input(command, &args, &text)?;
     drop(text);
     let config = command.discovery.configuration(command, &args, limits, raw.ner, raw.options)?;
+    if command.cohorts.enabled()
+        && entity_cohort_memory_floor(command, &args, limits, &config)? > limits.memory_bytes {
+        return Err(CandidateError::Memory);
+    }
     remaining()?;
     let cancellation = CancellationToken::default();
     let model = crate::candidate_cli::int4::runtime::load_model(&engine, &args, limits,
@@ -136,21 +140,30 @@ pub(super) fn execute(args: Int4Args, command: ResolveArgs,
         if pin != model.model_identity().snapshot_pin() { return Err(CandidateError::Identity); }
         snapshot = Some(SnapshotRecord::new("saved", limits.snapshot_need));
     }
-    let result = engine.execute_int4_entities(&model, prepared, Arc::new(vocabulary),
-        NativeLimits { context_tokens: args.context_tokens, allocator_reserve_bytes: ALLOCATOR_BYTES,
-            run: RunLimits { max_elapsed: remaining()?, max_checkpoints: args.max_checkpoints,
-                cleanup_reserve_bytes: CLEANUP_BYTES } },
-        limits.preparation_bytes, command.graph_bytes()?, limits.kernel, cancellation).map_err(execution_error)?;
-    check_result(result.result(), expected)?;
-    remaining()?;
     let content = resolution_identity.logical_model_digest.to_hex();
     let provenance = Provenance { protocol: "fnlp-candidate-int4-entities-v1", schema_version: 1,
         scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "resolve",
         model_id: "Nanbeige4.2-3B", source_revision: &resolution_identity.source_revision,
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &resolution_identity.artifact_format, quant_recipe: &resolution_identity.quant_recipe,
-        group_width: model.model_identity().group_width(), integer_kernel: limits.kernel.kind().id(), snapshot };
-    publish(&Response { provenance: &provenance, output: result.result() }, limits.result_bytes + 4096, output)
+        group_width: model.model_identity().group_width(), integer_kernel: limits.kernel.kind().id(), snapshot,
+        cohort_pairs: command.cohorts.cohort_pairs, cohort_chunks: command.cohorts.cohort_chunks };
+    let native = native_limits(&args, remaining()?);
+    let cap = command.cohorts.output_cap(limits.result_bytes)?;
+    if command.cohorts.enabled() {
+        let result = engine.execute_int4_entities_cohorts(&model, prepared, Arc::new(vocabulary), native,
+            limits.preparation_bytes, command.graph_bytes()?, command.cohorts.schedule(),
+            limits.kernel, cancellation).map_err(execution_error)?;
+        check_result(&result.result().output, expected)?;
+        remaining()?;
+        publish_complete(&Response { provenance: &provenance, output: result.result() }, cap, output, &remaining)
+    } else {
+        let result = engine.execute_int4_entities(&model, prepared, Arc::new(vocabulary), native,
+            limits.preparation_bytes, command.graph_bytes()?, limits.kernel, cancellation).map_err(execution_error)?;
+        check_result(result.result(), expected)?;
+        remaining()?;
+        publish_complete(&Response { provenance: &provenance, output: result.result() }, cap, output, &remaining)
+    }
 }
 
 #[cfg(test)]

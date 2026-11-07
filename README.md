@@ -1383,8 +1383,10 @@ million fields, `--max-mentions` matches and `--max-scan-steps` scan work; graph
 anchor validation has its own bounded scan allowance.
 
 The pipeline preflights **every NER document/chunk before its first native
-forward**, retains compact private witnesses, and executes one source grammar
-at a time. It independently rechecks all recovered occurrences and translates
+forward** and retains compact private witnesses. The default schedule executes
+one source grammar at a time; explicit native cohorts can group independent
+chunks, including chunks from different documents. The shared collector
+independently rechecks all recovered occurrences and translates
 chunk offsets back to exact byte/scalar positions in the original documents.
 Only then is the complete lexical pair graph available. Every pair and both
 orders must fit the remainder after **all NER work was reserved**; early EOS
@@ -1415,11 +1417,35 @@ quality and controller-selected production checks still require their named
 validation gates. Local INT4 snapshots do not become canonical FNLPQ releases
 or active installed models through this command.
 
+### Independent native discovery and pair cohorts
+
+Both `resolve` and `resolve-corpus` accept explicit, independent native schedules:
+`--cohort-pairs N` groups 1 through 32 complete candidate pairs, keeping both
+presentation orders together; `--cohort-chunks N` groups 1 through 64 NER
+chunks and requires `--discover-entities`. Discovery cohorts also work without
+`--chunked`, where each complete document contributes one source task. Selecting
+only one schedule leaves the other phase serial.
+
+Every future source window or pair window is admitted before its phase starts.
+The host reserves the complete native phase peak, simultaneous source planning,
+retained graph and guarded output. Each task keeps its original context and KV
+ceiling. All native work, mask and grounding allowances remain fixed across
+windows and corpus flushes; early EOS does not refund NER reservations into pair
+scoring. Source coordinates, both-order full-vocabulary scores and complete-link
+clustering use the shared serial finalizers. Physical counters are published
+separately from the semantic result. Larger widths consume more reserved memory;
+no measured speedup or actual-model parity is claimed by this implementation.
+
+See [native INT4 entity cohorts](docs/native-entity-cohorts-int4.md) for commands,
+output shapes and the shared library admission APIs.
+
 ## Implemented candidate INT4 entity-resolution corpora
 
 `fnlp candidate source-int4 resolve-corpus` discovers and resolves entities from
-bounded raw-document NDJSON while keeping **one model and one native engine
-resident across document groups**. It requires `asupersync-runtime`, explicit
+bounded raw-document NDJSON while keeping **one model resident across document
+groups**. The default schedule also retains one serial engine; explicit native
+cohorts allocate only their required windows and drain them between phases.
+It requires `asupersync-runtime`, explicit
 source or snapshot selection, `--discover-entities`, and a fixed `--policy FILE`.
 Add `--chunked` to discover mentions across every admitted source chunk before
 resolving the complete group.

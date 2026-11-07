@@ -79,7 +79,7 @@ fn exact_original_utf8_and_explicit_policy_survive_wire_parsing() {
 fn duplicate_unknown_and_execution_authority_fields_are_rejected() {
     let command = command(&[]); let options = options(&command); let cap = command.args.max_input_bytes;
     for field in ["budget", "model", "work", "execution_identity", "group_width", "numerics_profile",
-        "seed", "prompt", "tools", "thinking", "scores", "clusters"] {
+        "seed", "prompt", "tools", "thinking", "scores", "clusters", "cohort_pairs", "cohort_chunks", "schedule"] {
         let mut value = fixture(); value[field] = json!({});
         assert!(matches!(options.parse(&value.to_string(), cap), Err(CandidateError::Input)));
     }
@@ -193,6 +193,61 @@ fn whole_snapshot_ceiling_is_never_multiplied_by_pairs_or_orders() {
     assert_eq!(options.scoring.admit_plan(9, 8, cap), Err(CandidateError::Planning));
 }
 
+#[test]
+fn pair_cohorts_are_explicit_and_preserve_single_head_and_whole_snapshot_limits() {
+    let serial = command(&[]);
+    let serial_options = options(&serial);
+    assert!(!serial_options.cohorts.enabled());
+    for pairs in ["1", "2", "32"] {
+        let mut grouped = command(&["--cohort-pairs", pairs]);
+        grouped.args.memory_mib = 131072;
+        let selected = options(&grouped);
+        let limits = selected.validate(&grouped.args).unwrap();
+        assert_eq!(selected.cohorts.cohort_pairs, Some(pairs.parse().unwrap()));
+        assert_eq!(selected.cohorts.cohort_chunks, None);
+        assert_eq!(selected.scoring.work_ceiling(), serial_options.scoring.work_ceiling());
+        assert_eq!(selected.scoring_limits(&grouped.args, limits).planning.per_head.max_kv_bytes,
+            Int4MemoryRequirement::for_context(grouped.args.context_tokens, grouped.args.group_width).unwrap().kv_bytes);
+        assert!(limits.cohort.is_none(), "pair windows are not one all-heads scoring bundle");
+    }
+}
+
+#[test]
+fn impossible_pair_or_discovery_schedules_refuse_before_any_private_io() {
+    for flags in [vec!["--cohort-pairs", "0"], vec!["--cohort-pairs", "33"],
+        vec!["--discover-entities", "--cohort-chunks", "0"],
+        vec!["--discover-entities", "--cohort-chunks", "65"]] {
+        let mut output = Vec::new();
+        assert_eq!(command(&flags).execute(&mut NoRead, &mut output), Err(CandidateError::Arguments));
+        assert!(output.is_empty());
+    }
+    for flags in [vec!["--cohort-chunks", "1"], vec!["--cohort-heads", "2"],
+        vec!["--cohort-pairs", "1", "--prefill-rows", "1"]] {
+        let mut all = vec!["--source-dir", "d", "--source-manifest", "m"];
+        all.extend(flags);
+        assert!(parsed(&all).is_err());
+    }
+    let mut injected = command(&[]);
+    let Int4Task::Resolve(ref mut selected) = injected.task else { panic!("resolve required"); };
+    selected.cohorts.cohort_chunks = Some(1);
+    assert_eq!(injected.execute(&mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+}
+
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn pair_cohort_cli_uses_shared_host_quote_and_enforces_the_complete_memory_floor() {
+    let mut grouped = command(&["--cohort-pairs", "3"]);
+    grouped.args.memory_mib = 131072;
+    let selected = options(&grouped);
+    let limits = selected.validate(&grouped.args).unwrap();
+    let required = runtime::cohort_memory_floor(selected, &grouped.args, limits).unwrap();
+    assert!(limits.minimum_memory_bytes >= required);
+    grouped.args.memory_mib = (limits.minimum_memory_bytes - 1) / MIB;
+    assert_eq!(grouped.execute(&mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+    grouped.args.memory_mib = limits.minimum_memory_bytes.div_ceil(MIB);
+    assert!(selected.validate(&grouped.args).is_ok());
+}
+
 #[cfg(not(feature = "asupersync-runtime"))]
 #[test]
 fn absent_runtime_fails_before_input_model_io_or_publication() {
@@ -231,5 +286,17 @@ fn source_scalar_and_independently_pinned_snapshot_simd_resolve_the_same_snapsho
     let selected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(selected["snapshot"]["operation"], "loaded");
     assert_eq!(selected["output"], scalar["output"]);
+    for pairs in ["1", "3", "32"] {
+        for selected_kernel in [Int8KernelKind::Scalar, kernel] {
+            let mut grouped = parsed(&["--snapshot", &snapshot, "--expected-model-sha256", pin,
+                "--kernel", selected_kernel.id(), "--cohort-pairs", pairs]).unwrap();
+            grouped.args.memory_mib = memory;
+            let mut bytes = Vec::new(); grouped.execute(&mut wire.as_bytes(), &mut bytes).unwrap();
+            let actual: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(actual["cohort_pairs"], pairs.parse::<usize>().unwrap());
+            assert_eq!(actual["output"]["output"], scalar["output"]);
+            assert_eq!(actual["output"]["pair_cohorts"], 1);
+        }
+    }
     // The caller-owned snapshot is deliberately preserved, including on failure.
 }

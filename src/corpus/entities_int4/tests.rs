@@ -520,3 +520,5 @@ fn mask_and_grounding_configuration_axes_are_bounded_even_without_input() {
         assert!(matches!(c.validate(), Err(Int4EntityError::InvalidLimits)), "axis {axis}");
     }
 }
+
+mod cohorts;

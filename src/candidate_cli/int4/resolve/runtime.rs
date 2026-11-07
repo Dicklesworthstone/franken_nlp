@@ -6,13 +6,55 @@ use crate::{
     execution_identity::{ExecutionIdentity, NumericsProfile, Sha256Digest, ThinkingMode, ToolMode},
     corpus::{resolve::{ResolutionPlan, ResolveError, RESOLVE_VERSION},
         native_resolve::{ResolutionPlanner, grouped_int4::{Int4ResolveError, Int4ResolutionRun, INT4_RESOLUTION_EXECUTION}}},
-    hosted::{CancellationToken, HostedError, Int4HostError, Int4ResolveConfig, NativeLimits, RunLimits},
+    hosted::{CancellationToken, HostedError, Int4HostError, Int4ResolveConfig, NativeLimits, RunLimits,
+        Int4ResolveCohortHostRequirements, Int4EntityCohortHostRequirements},
     native_engine::{decode::{DecodeCancellationKind, DecodeStepControl},
         generation::grouped_int4::bind_candidate_model,
         strict_int4::{Int4ModelIdentity, Int4Work, STRICT_INT4_EXECUTION, STRICT_INT4_PROFILE,
             scoring::INT4_SCORING_EXECUTION, weights::snapshot::INT4_SNAPSHOT_VERSION}},
 };
 mod discovery;
+
+fn native_limits(args: &Int4Args, elapsed: Duration) -> NativeLimits {
+    NativeLimits { context_tokens: args.context_tokens, allocator_reserve_bytes: ALLOCATOR_BYTES,
+        run: RunLimits { max_elapsed: elapsed, max_checkpoints: args.max_checkpoints,
+            cleanup_reserve_bytes: CLEANUP_BYTES } }
+}
+
+pub(super) fn cohort_memory_floor(command: ResolveArgs, args: &Int4Args, limits: Int4Limits)
+    -> Result<u64, CandidateError> {
+    if command.discovery.discover_entities {
+        let task = command.discovery.configuration(command, args, limits,
+            crate::tasks::ner::NerOptions::default(), ResolveOptions::default())?;
+        entity_cohort_memory_floor(command, args, limits, &task)
+    } else {
+        let pairs = command.cohorts.cohort_pairs.ok_or(CandidateError::Arguments)?;
+        let required = Int4ResolveCohortHostRequirements::for_config(command.scoring_limits(args, limits),
+            native_limits(args, Duration::from_secs(args.timeout_seconds)), limits.preparation_bytes,
+            command.graph_bytes()?, pairs, args.group_width).map_err(|_| CandidateError::Arguments)?;
+        complete_cohort_memory_floor(command, args, limits,
+            required.total_bytes().map_err(|_| CandidateError::Arguments)?)
+    }
+}
+
+fn entity_cohort_memory_floor(command: ResolveArgs, args: &Int4Args, limits: Int4Limits,
+    task: &crate::corpus::entities_int4::Int4EntityConfig) -> Result<u64, CandidateError> {
+    let required = Int4EntityCohortHostRequirements::for_config(task,
+        native_limits(args, Duration::from_secs(args.timeout_seconds)), limits.preparation_bytes,
+        command.graph_bytes()?, command.cohorts.schedule(), args.group_width)
+        .map_err(|_| CandidateError::Arguments)?;
+    complete_cohort_memory_floor(command, args, limits,
+        required.total_bytes().map_err(|_| CandidateError::Arguments)?)
+}
+
+fn complete_cohort_memory_floor(command: ResolveArgs, args: &Int4Args, limits: Int4Limits,
+    host_bytes: u64) -> Result<u64, CandidateError> {
+    // The host quote owns its planners, graph, simultaneous native preparation,
+    // complete phase peak and result. The CLI's source and serialization owner
+    // remains separate, as do the moved original document capacities.
+    sum(&[limits.load.weight_payload_bytes, ALLOCATOR_BYTES, limits.preparation_bytes,
+        command.host_input_bytes(args)?, host_bytes])
+}
 
 struct DeadlineControl { started: Instant, deadline: Duration }
 impl DecodeStepControl for DeadlineControl {
@@ -160,14 +202,8 @@ pub(super) fn execute(args: Int4Args, command: ResolveArgs, _admitted: Int4Limit
     }
     let config = Int4ResolveConfig { identity: identity.clone(), options: population.options,
         graph: command.graph_limits(&args, limits), scoring,
-        native: NativeLimits { context_tokens: args.context_tokens, allocator_reserve_bytes: ALLOCATOR_BYTES,
-            run: RunLimits { max_elapsed: remaining()?, max_checkpoints: args.max_checkpoints,
-                cleanup_reserve_bytes: CLEANUP_BYTES } },
+        native: native_limits(&args, remaining()?),
         preparation_reserve_bytes: limits.preparation_bytes, graph_reserve_bytes: command.graph_bytes()? };
-    let result = engine.resolve_int4(&model, population.documents, Arc::new(planner), config,
-        limits.kernel, cancellation).map_err(execution_error)?;
-    check_result(result.result(), expected)?;
-    remaining()?;
     let content = identity.logical_model_digest.to_hex();
     let provenance = Provenance {
         protocol: "fnlp-candidate-int4-resolve-v1", schema_version: 1,
@@ -176,10 +212,38 @@ pub(super) fn execute(args: Int4Args, command: ResolveArgs, _admitted: Int4Limit
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: limits.kernel.kind().id(), snapshot,
+        cohort_pairs: command.cohorts.cohort_pairs, cohort_chunks: command.cohorts.cohort_chunks,
     };
     // Keep both the host result guard and CLI staging owner through write AND
     // flush. The full result is staged before the first external byte.
-    publish(&Response { provenance: &provenance, output: result.result() }, limits.result_bytes + 4096, output)
+    let cap = command.cohorts.output_cap(limits.result_bytes)?;
+    if let Some(pairs) = command.cohorts.cohort_pairs {
+        let result = engine.resolve_int4_cohorts(&model, population.documents, Arc::new(planner), config,
+            pairs, limits.kernel, cancellation).map_err(execution_error)?;
+        check_result(&result.result().output, expected)?;
+        remaining()?;
+        publish_complete(&Response { provenance: &provenance, output: result.result() }, cap, output, &remaining)
+    } else {
+        let result = engine.resolve_int4(&model, population.documents, Arc::new(planner), config,
+            limits.kernel, cancellation).map_err(execution_error)?;
+        check_result(result.result(), expected)?;
+        remaining()?;
+        publish_complete(&Response { provenance: &provenance, output: result.result() }, cap, output, &remaining)
+    }
+}
+
+fn publish_complete<T: Serialize>(value: &T, cap: usize, output: &mut impl Write,
+    remaining: &impl Fn() -> Result<Duration, CandidateError>) -> Result<(), CandidateError> {
+    remaining()?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(cap).map_err(|_| CandidateError::Memory)?;
+    let mut stage = BoundedOutput { bytes, cap };
+    serde_json::to_writer(&mut stage, value).map_err(|_| CandidateError::Output)?;
+    stage.write_all(b"\n").map_err(|_| CandidateError::Output)?;
+    remaining()?;
+    output.write_all(&stage.bytes).and_then(|()| output.flush()).map_err(|_| CandidateError::Output)?;
+    remaining()?;
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -196,6 +260,10 @@ struct Provenance<'a> {
     candidate_format: &'a str, quant_recipe: &'a str, group_width: usize, integer_kernel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<SnapshotRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cohort_pairs: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cohort_chunks: Option<usize>,
 }
 #[derive(Serialize)]
 struct Response<'a, 'b, T: Serialize> {

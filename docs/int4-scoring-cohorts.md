@@ -37,8 +37,11 @@ evidence-window head construction.
 `--cohort-heads` cannot be combined with `--prefill-rows`. Prompt prefill groups
 successive positions within one head; a scoring cohort groups one next position
 from each active head. They have different simultaneous storage requirements.
-Scored jobs, resolution, extraction and source-task commands reject the cohort
-option. Generation/chat retain their separate text cohort interfaces.
+Scored jobs, resolution, extraction and source-task commands reject
+`--cohort-heads`. Resolution instead exposes independent `--cohort-pairs`
+and NER `--cohort-chunks` schedules, with complete pairs kept together; see
+[native INT4 entity cohorts](native-entity-cohorts-int4.md). Generation/chat
+retain their separate text cohort interfaces.
 
 ## Cross-document scored streams
 

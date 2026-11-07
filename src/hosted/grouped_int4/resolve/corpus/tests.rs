@@ -60,7 +60,8 @@ fn quote_includes_stream_storage_full_native_capacity_and_independent_terminal()
         + 256 * task.max_snapshot_chunks as u64);
     assert_eq!(q.retained_bytes, q.input_payload_bytes + 32 * t.max_line_bytes as u64 + 4096 + 4096);
     assert_eq!(q.temporary_bytes, 8192 + 4 * task.ner_budget.max_output_bytes
-        + 8 * u64::from(task.ner_budget.max_output_tokens));
+        + 8 * u64::from(task.ner_budget.max_output_tokens)
+        + crate::corpus::entities_int4::collection_workspace_bytes(task.graph.max_documents).unwrap());
     assert_eq!(q.output_bytes, 4 * t.max_output_line_bytes as u64 + 4096 + 4 * FOOTER_BYTES + 4096);
     assert_eq!(q.kv_bytes, actual.kv_bytes);
     assert_eq!(q.scratch_bytes, actual.rope_bytes + actual.scratch_payload_bound + 4096);
@@ -384,4 +385,128 @@ fn owned_completion_and_errors_cross_the_physical_handoff() {
     send::<HostedInt4EntityCorpus<Vec<u8>>>();
     send::<Int4EntityCorpusError>();
     send::<Input<Cursor<Vec<u8>>, Vec<u8>>>();
+}
+
+
+fn cohort_schedule() -> Int4EntitySchedule {
+    Int4EntitySchedule { ner_cohort_chunks: Some(3), pair_cohort_pairs: Some(2) }
+}
+fn physical_charge() -> Int4EntityCorpusCohortSummary {
+    Int4EntityCorpusCohortSummary { schedule: cohort_schedule(), ner_cohorts: 1,
+        ner_group_steps: 1, ner_projection_groups: 1, pair_cohorts: 1,
+        pair_group_steps: 1, pair_projection_groups: 1 }
+}
+
+#[test]
+fn corpus_cohorts_share_oneoff_phase_peak_and_keep_serial_quote_unchanged() {
+    let task = task(); let t = transport(); let schedule = cohort_schedule();
+    let serial = quote(&task, t).unwrap();
+    assert_eq!(serial, Int4EntityCorpusHostRequirements::for_config_with_schedule(
+        &task, t, native(), 4096, 8192, 4096, 32, None).unwrap());
+    let host = Int4EntityCohortHostRequirements::for_config(&task, native(), 4096, 8192, schedule, 32).unwrap();
+    let cohort = Int4EntityCorpusHostRequirements::for_config_with_schedule(
+        &task, t, native(), 4096, 8192, 4096, 32, Some(schedule)).unwrap();
+    assert_eq!(cohort.input_payload_bytes, serial.input_payload_bytes);
+    assert_eq!(cohort.retained_bytes, serial.retained_bytes + host.preparation_bytes - 4096);
+    assert_eq!(cohort.temporary_bytes, host.temporary_bytes);
+    assert_eq!(cohort.kv_bytes, host.kv_bytes);
+    assert_eq!(cohort.scratch_bytes, host.scratch_bytes);
+    assert_eq!(cohort.cleanup_bytes, host.cleanup_bytes);
+    assert_eq!(cohort.output_bytes, output_reserve((t.max_output_line_bytes as u64).max(host.max_result_bytes)).unwrap()
+        + output_reserve(FOOTER_BYTES).unwrap());
+    assert_eq!(cohort.total_bytes().unwrap(), cohort.retained_bytes + cohort.temporary_bytes
+        + cohort.output_bytes + cohort.kv_bytes + cohort.scratch_bytes + cohort.cleanup_bytes);
+    for stage in 0..2 {
+        let mut capped = task.clone();
+        if stage == 0 { capped.ner_budget.max_kv_bytes -= 1; }
+        else { capped.scoring.planning.per_head.max_kv_bytes -= 1; }
+        assert!(Int4EntityCorpusHostRequirements::for_config_with_schedule(
+            &capped, t, native(), 4096, 8192, 4096, 32, Some(schedule)).is_err());
+    }
+    assert!(Int4EntityCorpusHostRequirements::for_config_with_schedule(
+        &task, t, native(), 4096, 8192, 4096, 32, Some(Int4EntitySchedule::default())).is_err());
+}
+
+#[test]
+fn cohort_epochs_and_empty_flush_accumulate_physical_work_without_renewing_any_allowance() {
+    let schedule = cohort_schedule();
+    let mut ledger = Ledger::with_schedule(&task(), Some(schedule));
+    for count in 1..=2 {
+        ledger.begin().unwrap();
+        ledger.complete_with_cohort(charge(), Some(physical_charge())).unwrap();
+        let before_delivery = ledger.remaining;
+        ledger.acknowledge().unwrap();
+        assert_eq!(ledger.remaining, before_delivery);
+        assert_eq!(ledger.summary.cohort.unwrap().ner_cohorts, count);
+        assert_eq!(ledger.summary.cohort.unwrap().pair_cohorts, count);
+    }
+    assert_eq!(ledger.remaining.work, work(40));
+    assert_eq!(ledger.remaining.scoring, work(98));
+    assert_eq!(ledger.remaining.masks, 20);
+    assert_eq!(ledger.remaining.verification, GroundingBudget { max_fields: 96, max_matches: 94, max_scan_steps: 92 });
+    assert_eq!(ledger.summary.reserved_model_work, work(60));
+    assert_eq!(ledger.summary.model_work, work(4));
+    let remaining = ledger.remaining; let summary = ledger.summary;
+    ledger.begin().unwrap();
+    ledger.complete_with_cohort(zero_charge(), Some(Int4EntityCorpusCohortSummary::empty(schedule))).unwrap();
+    ledger.acknowledge().unwrap();
+    assert_eq!(ledger.remaining, remaining);
+    assert_eq!(ledger.summary, summary);
+    ledger.begin().unwrap();
+    assert!(ledger.complete_with_cohort(charge(), Some(physical_charge())).is_err());
+    assert_eq!(ledger.state, State::Failed);
+    assert_eq!(ledger.remaining, remaining);
+    assert_eq!(ledger.summary, summary);
+    assert!(ledger.begin().is_err());
+}
+
+#[test]
+fn missing_or_different_cohort_schedule_and_physical_counter_overflow_fail_atomically() {
+    let schedule = cohort_schedule();
+    for axis in 0..9 {
+        let mut ledger = Ledger::with_schedule(&task(), Some(schedule));
+        let mut next = Some(physical_charge());
+        match axis {
+            0 => next = None,
+            1 => next.as_mut().unwrap().schedule.ner_cohort_chunks = Some(1),
+            2 => next.as_mut().unwrap().schedule.pair_cohort_pairs = None,
+            3 => ledger.summary.cohort.as_mut().unwrap().ner_cohorts = u64::MAX,
+            4 => ledger.summary.cohort.as_mut().unwrap().ner_group_steps = u64::MAX,
+            5 => ledger.summary.cohort.as_mut().unwrap().ner_projection_groups = u64::MAX,
+            6 => ledger.summary.cohort.as_mut().unwrap().pair_cohorts = u64::MAX,
+            7 => ledger.summary.cohort.as_mut().unwrap().pair_group_steps = u64::MAX,
+            _ => ledger.summary.cohort.as_mut().unwrap().pair_projection_groups = u64::MAX,
+        }
+        let remaining = ledger.remaining; let summary = ledger.summary;
+        ledger.begin().unwrap();
+        assert!(ledger.complete_with_cohort(charge(), next).is_err(), "axis {axis}");
+        assert_eq!(ledger.state, State::Failed);
+        assert_eq!(ledger.remaining, remaining);
+        assert_eq!(ledger.summary, summary);
+    }
+    let mut serial = Ledger::new(&task());
+    serial.begin().unwrap();
+    assert!(serial.complete_with_cohort(zero_charge(), Some(physical_charge())).is_err());
+    assert_eq!(serial.summary, Int4EntityCorpusSummary::default());
+}
+
+#[test]
+fn serial_footer_omits_schedule_and_empty_cohort_footer_retains_the_selected_phases() {
+    let serial = Int4EntityCorpusSummary::default();
+    let serial_frame = events(&footer_bytes(&provenance(), &serial, FOOTER_BYTES).unwrap()).remove(0);
+    assert!(serial_frame["summary"].get("cohort").is_none());
+    let schedule = cohort_schedule();
+    let ledger = Ledger::with_schedule(&task(), Some(schedule));
+    let frame = events(&footer_bytes(&provenance(), &ledger.summary, FOOTER_BYTES).unwrap()).remove(0);
+    assert_eq!(frame["epoch"], 0);
+    assert_eq!(frame["summary"]["cohort"]["schedule"]["ner_cohort_chunks"], 3);
+    assert_eq!(frame["summary"]["cohort"]["schedule"]["pair_cohort_pairs"], 2);
+    for name in ["ner_cohorts", "ner_group_steps", "ner_projection_groups",
+        "pair_cohorts", "pair_group_steps", "pair_projection_groups"] {
+        assert_eq!(frame["summary"]["cohort"][name], 0);
+    }
+    assert_eq!(ledger.remaining.work, task().max_model_work);
+    fn send<T: Send + 'static>() {}
+    send::<Int4EntityCorpusCohortSummary>();
+    send::<Int4EntityCorpusHostRequirements>();
 }

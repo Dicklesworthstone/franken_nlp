@@ -49,7 +49,8 @@ pub use grouped_int4::{Int4HostError, Int4LoadLimits, Int4LoadRequirements, Int4
     Int4ExtractionCohortBatchResult, Int4SourceCohortBatchResult,
     Int4ResolveConfig, HostedInt4ChatStream, ResidentInt4, HostedInt4EntityCorpus,
     Int4EntityCorpusError, Int4EntityCorpusHostConfig, Int4EntityCorpusHostRequirements,
-    Int4EntityCorpusSummary};
+    Int4EntityCorpusSummary, Int4EntityCorpusCohortSummary,
+    Int4ResolveCohortHostRequirements, Int4EntityCohortHostRequirements};
 mod scored;
 mod sentiment;
 pub use sentiment::SentimentHostLimits;

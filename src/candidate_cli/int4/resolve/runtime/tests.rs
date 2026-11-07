@@ -109,7 +109,8 @@ fn completed_publication_keeps_cluster_data_and_hides_private_provenance() {
         scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "resolve",
         model_id: "Nanbeige4.2-3B", source_revision: "fixture", source_root_sha256: "model-source-root",
         model_content_sha256: "model-content", candidate_format: "candidate-format", quant_recipe: "candidate:group=128",
-        group_width: 128, integer_kernel: "s_scalar_i32", snapshot: None };
+        group_width: 128, integer_kernel: "s_scalar_i32", snapshot: None,
+        cohort_pairs: None, cohort_chunks: None };
     let response = Response { provenance: &provenance, output: &result };
     let mut bytes = Vec::new(); publish(&response, 4096, &mut bytes).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -120,6 +121,59 @@ fn completed_publication_keeps_cluster_data_and_hides_private_provenance() {
     let mut refused = Vec::new();
     assert_eq!(publish(&response, 1, &mut refused), Err(CandidateError::Output));
     assert!(refused.is_empty());
+}
+
+#[test]
+fn cohort_provenance_reports_only_explicit_physical_schedule() {
+    let provenance = Provenance { protocol: "fnlp-candidate-int4-resolve-v1", schema_version: 1,
+        scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "resolve",
+        model_id: "Nanbeige4.2-3B", source_revision: "fixture", source_root_sha256: "source-root",
+        model_content_sha256: "model-content", candidate_format: "candidate-format", quant_recipe: "group=128",
+        group_width: 128, integer_kernel: "s_scalar_i32", snapshot: None,
+        cohort_pairs: Some(3), cohort_chunks: None };
+    let value = serde_json::to_value(&provenance).unwrap();
+    assert_eq!(value["cohort_pairs"], 3);
+    assert!(value.get("cohort_chunks").is_none());
+    for field in ["source", "documents", "question", "surface", "identity", "prompt", "scores"] {
+        assert!(value.get(field).is_none());
+    }
+}
+
+#[test]
+fn complete_resolution_publication_refuses_deadline_expiry_during_serialization() {
+    use std::cell::Cell;
+    struct Expire<'a>(&'a Cell<bool>);
+    impl Serialize for Expire<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            self.0.set(true);
+            serializer.serialize_bool(true)
+        }
+    }
+    struct NoOutput;
+    impl Write for NoOutput {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("expired result reached stdout"); }
+        fn flush(&mut self) -> io::Result<()> { panic!("expired result flushed stdout"); }
+    }
+    let expired = Cell::new(false);
+    let remaining = || if expired.get() { Err(CandidateError::Timeout) } else { Ok(Duration::from_secs(1)) };
+    assert_eq!(publish_complete(&Expire(&expired), 64, &mut NoOutput, &remaining), Err(CandidateError::Timeout));
+}
+
+#[test]
+fn complete_resolution_publication_keeps_deadline_authority_through_flush() {
+    use std::cell::Cell;
+    struct ExpiringWriter<'a> { expired: &'a Cell<bool>, bytes: Vec<u8> }
+    impl Write for ExpiringWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes); Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> { self.expired.set(true); Ok(()) }
+    }
+    let expired = Cell::new(false);
+    let remaining = || if expired.get() { Err(CandidateError::Timeout) } else { Ok(Duration::from_secs(1)) };
+    let mut writer = ExpiringWriter { expired: &expired, bytes: Vec::new() };
+    assert_eq!(publish_complete(&true, 64, &mut writer, &remaining), Err(CandidateError::Timeout));
+    assert_eq!(writer.bytes, b"true\n");
 }
 
 #[test]

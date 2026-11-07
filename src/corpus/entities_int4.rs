@@ -1,7 +1,8 @@
 //! Raw original documents -> bounded native INT4 NER -> one complete graph.
 //!
 //! Every source chunk is compiled before inference; only compact private
-//! witnesses survive preparation. One grammar/result is rebuilt at a time.
+//! witnesses survive preparation. Only the selected bounded window of source
+//! grammars/results is rebuilt at a time; scalar execution uses one row.
 //! All NER reservations, including unused early-EOS capacity, are subtracted
 //! before pair scoring receives the remainder of the same corpus allowance.
 //! Intermediate mentions or partial clusters are never successful output.
@@ -32,6 +33,7 @@ use super::{
     resolve::{self, ResolutionDocument, ResolutionPlan, ResolveError, ResolveLimits, ResolveOptions},
 };
 mod grounding;
+pub mod cohort;
 
 pub const INT4_ENTITY_EXECUTION: &str = "grouped-int4-original-document-ner-to-complete-resolution-v1";
 
@@ -341,45 +343,119 @@ struct Extracted {
 fn collect<C: DecodeStepControl, F>(inputs: Vec<Input>, config: &Int4EntityConfig, width: usize,
     control: &mut C, mut execute: F) -> Result<Extracted, Int4EntityError>
 where F: FnMut(&str, &ChunkWitness, &mut C) -> Result<Int4SourceTaskRun, Int4EntityError> {
-    let mut documents = reserved(inputs.len())?; let mut receipts = reserved(inputs.len())?;
+    collect_windows(inputs, config, width, 1, control, |requests, control| {
+        if requests.len() != 1 { return Err(Int4EntityError::Accounting); }
+        let mut results = reserved(1)?;
+        results.push(execute(requests[0].text, requests[0].witness, control)?);
+        Ok(results)
+    })
+}
+
+struct ChunkRequest<'a> { text: &'a str, witness: &'a ChunkWitness }
+struct CollectionDocument {
+    document: ResolutionDocument,
+    chunks: Vec<ChunkWitness>,
+    receipts: Vec<Int4EntityChunkReceipt>,
+    cursor: usize,
+    scalar: usize,
+    proposed: usize,
+    work: Int4Work,
+    masks: u64,
+}
+
+/// Additional collector handles/cursors; original text and compact witnesses
+/// retain their existing input ownership. No flat all-chunk list is allocated.
+pub(crate) fn collection_workspace_bytes(max_documents: usize) -> Result<u64, Int4EntityError> {
+    use crate::native_engine::strict_int4::cohort::MAX_INT4_SEQUENCES;
+    if max_documents > 4096 { return Err(Int4EntityError::InvalidLimits); }
+    let documents = (max_documents as u64).checked_mul(size_of::<CollectionDocument>() as u64)
+        .ok_or(Int4EntityError::WorkBudget)?;
+    let window = (MAX_INT4_SEQUENCES as u64).checked_mul(
+        (size_of::<ChunkRequest<'_>>() + size_of::<(usize, usize)>()) as u64)
+        .ok_or(Int4EntityError::WorkBudget)?;
+    documents.checked_add(window).ok_or(Int4EntityError::WorkBudget)
+}
+
+/// One canonical occurrence/coordinate collector for scalar and native cohort
+/// execution. A window may cross document boundaries, but every result enters
+/// its original document in exact chunk order. Only a bounded window of native
+/// results is retained; a failed later row cannot publish a partial snapshot.
+fn collect_windows<C: DecodeStepControl, F>(inputs: Vec<Input>, config: &Int4EntityConfig,
+    width: usize, window: usize, control: &mut C, mut execute: F) -> Result<Extracted, Int4EntityError>
+where F: FnMut(&[ChunkRequest<'_>], &mut C) -> Result<Vec<Int4SourceTaskRun>, Int4EntityError> {
+    if !(1..=crate::native_engine::strict_int4::cohort::MAX_INT4_SEQUENCES).contains(&window) {
+        return Err(Int4EntityError::InvalidLimits);
+    }
+    let mut pending = reserved(inputs.len())?;
     let mut verification = config.verification;
     let (mut bytes, mut mentions, mut masks, mut chunks) = (0_usize, 0_usize, 0_u64, 0_usize);
     let mut work = Int4Work::default();
     for input in inputs {
         resolve::checkpoint(control)?;
         if input.chunks.is_empty() { return Err(Int4EntityError::Accounting); }
-        let mut document = ResolutionDocument { id: input.document.id, text: input.document.text, mentions: Vec::new() };
+        let document = ResolutionDocument { id: input.document.id, text: input.document.text, mentions: Vec::new() };
         bytes = bytes.checked_add(document.id.len()).and_then(|n| n.checked_add(document.text.len()))
             .filter(|&n| n <= config.graph.max_input_bytes).ok_or(Int4EntityError::WorkBudget)?;
-        let mut chunk_receipts = reserved(input.chunks.len())?;
-        let (mut cursor, mut scalar, mut proposed, mut document_masks) = (0_usize, 0_usize, 0_usize, 0_u64);
-        let mut document_work = Int4Work::default();
-        for (index, chunk) in input.chunks.iter().enumerate() {
+        pending.push(CollectionDocument { document, receipts: reserved(input.chunks.len())?, chunks: input.chunks,
+            cursor: 0, scalar: 0, proposed: 0, work: Int4Work::default(), masks: 0 });
+    }
+    let (mut document_index, mut chunk_index) = (0_usize, 0_usize);
+    let mut positions = reserved(window)?;
+    while document_index < pending.len() {
+        positions.clear();
+        while positions.len() < window && document_index < pending.len() {
+            positions.push((document_index, chunk_index));
+            chunk_index += 1;
+            if chunk_index == pending[document_index].chunks.len() {
+                document_index += 1; chunk_index = 0;
+            }
+        }
+        let mut requests = reserved(positions.len())?;
+        for &(document, index) in &positions {
             resolve::checkpoint(control)?;
-            let text = chunk_text(&document.text, chunk.span, cursor, scalar)?;
-            let run = execute(text, chunk, control)?;
+            let input = &pending[document];
+            let chunk = &input.chunks[index];
+            let (cursor, scalar) = if index == 0 { (0, 0) }
+                else { (input.chunks[index - 1].span.byte_end, input.chunks[index - 1].span.scalar_end) };
+            let text = chunk_text(&input.document.text, chunk.span, cursor, scalar)?;
+            requests.push(ChunkRequest { text, witness: chunk });
+        }
+        let results = execute(&requests, control)?;
+        drop(requests);
+        if results.len() != positions.len() { return Err(Int4EntityError::Accounting); }
+        for (&(document, index), run) in positions.iter().zip(results) {
             resolve::checkpoint(control)?;
+            let input = &mut pending[document];
+            if index != input.receipts.len() { return Err(Int4EntityError::Accounting); }
+            let chunk = &input.chunks[index];
+            let text = chunk_text(&input.document.text, chunk.span, input.cursor, input.scalar)?;
             let (ner, actual) = check_run(chunk, run, config, width)?;
             let proposed_entities = ner.entities.len(); let mask_node_visits = ner.mask_node_visit_charge;
             let local = grounding::expand(text, ner, config, &mut verification, control)?;
             let anchored_mentions = local.len();
-            grounding::append(&mut document, local, chunk.span, &mut bytes, &mut mentions, config.graph, control)?;
-            proposed = proposed.checked_add(proposed_entities).ok_or(Int4EntityError::WorkBudget)?;
-            document_work = plus(document_work, actual)?;
-            document_masks = document_masks.checked_add(mask_node_visits).ok_or(Int4EntityError::WorkBudget)?;
+            grounding::append(&mut input.document, local, chunk.span, &mut bytes, &mut mentions, config.graph, control)?;
+            input.proposed = input.proposed.checked_add(proposed_entities).ok_or(Int4EntityError::WorkBudget)?;
+            input.work = plus(input.work, actual)?;
+            input.masks = input.masks.checked_add(mask_node_visits).ok_or(Int4EntityError::WorkBudget)?;
             chunks = chunks.checked_add(1).filter(|&n| n <= config.max_snapshot_chunks).ok_or(Int4EntityError::WorkBudget)?;
-            chunk_receipts.push(Int4EntityChunkReceipt { chunk_id: index, source_span: chunk.span,
+            input.receipts.push(Int4EntityChunkReceipt { chunk_id: index, source_span: chunk.span,
                 proposed_entities, anchored_mentions, model_work: actual, mask_node_visits });
-            cursor = chunk.span.byte_end; scalar = chunk.span.scalar_end;
+            input.cursor = chunk.span.byte_end; input.scalar = chunk.span.scalar_end;
         }
-        if cursor != document.text.len() { return Err(Int4EntityError::Accounting); }
-        work = plus(work, document_work)?;
-        masks = masks.checked_add(document_masks).filter(|&n| n <= config.masks.max_visits_per_run)
+    }
+    let mut documents = reserved(pending.len())?; let mut receipts = reserved(pending.len())?;
+    for input in pending {
+        resolve::checkpoint(control)?;
+        if input.cursor != input.document.text.len() || input.receipts.len() != input.chunks.len() {
+            return Err(Int4EntityError::Accounting);
+        }
+        work = plus(work, input.work)?;
+        masks = masks.checked_add(input.masks).filter(|&n| n <= config.masks.max_visits_per_run)
             .ok_or(Int4EntityError::WorkBudget)?;
-        receipts.push(Int4EntityDocumentReceipt { document_id: copy(&document.id)?, proposed_entities: proposed,
-            anchored_mentions: document.mentions.len(), model_work: document_work,
-            mask_node_visits: document_masks, chunks: chunk_receipts });
-        documents.push(document);
+        receipts.push(Int4EntityDocumentReceipt { document_id: copy(&input.document.id)?, proposed_entities: input.proposed,
+            anchored_mentions: input.document.mentions.len(), model_work: input.work,
+            mask_node_visits: input.masks, chunks: input.receipts });
+        documents.push(input.document);
     }
     resolve::checkpoint(control)?;
     let verification_used = EntityVerificationWork {

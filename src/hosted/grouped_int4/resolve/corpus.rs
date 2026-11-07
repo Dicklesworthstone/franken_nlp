@@ -9,7 +9,8 @@ use crate::{
     canonjson,
     corpus::{
         entities::{EntityDocument, EntityVerificationWork},
-        entities_int4::{Int4EntityConfig, Int4EntityError, Int4EntityRun, prepare_int4_entities},
+        entities_int4::{Int4EntityConfig, Int4EntityError, Int4EntityRun, prepare_int4_entities,
+            cohort::{Int4EntitySchedule, Int4EntityCohortRun}},
         entity_stream::{self, EntitySnapshotProcessor, EntityStreamError, EntityStreamLimits,
             EntityStreamSummary, ENTITY_STREAM_PROTOCOL},
     },
@@ -35,11 +36,13 @@ pub struct Int4EntityCorpusHostConfig {
     pub preparation_reserve_bytes: u64,
     pub graph_reserve_bytes: u64,
     pub io_reserve_bytes: u64,
+    /// Optional independently selected discovery and pair-scoring windows.
+    pub schedule: Option<Int4EntitySchedule>,
 }
 impl Int4EntityCorpusHostConfig {
     pub fn requirements(&self, group_width: usize) -> Result<Int4EntityCorpusHostRequirements, HostedError> {
-        Int4EntityCorpusHostRequirements::for_config(&self.task, self.transport, self.native,
-            self.preparation_reserve_bytes, self.graph_reserve_bytes, self.io_reserve_bytes, group_width)
+        Int4EntityCorpusHostRequirements::for_config_with_schedule(&self.task, self.transport, self.native,
+            self.preparation_reserve_bytes, self.graph_reserve_bytes, self.io_reserve_bytes, group_width, self.schedule)
     }
 }
 
@@ -55,6 +58,7 @@ pub struct Int4EntityCorpusHostRequirements {
     pub cleanup_bytes: u64,
     native: Int4MemoryRequirement,
     input_payload_bytes: u64,
+    cohort: Option<Int4EntityCohortHostRequirements>,
 }
 impl Int4EntityCorpusHostRequirements {
     /// Identity-independent admission for use before opening source/model or
@@ -62,11 +66,26 @@ impl Int4EntityCorpusHostRequirements {
     #[allow(clippy::too_many_arguments)]
     pub fn for_config(task: &Int4EntityConfig, transport: EntityStreamLimits, native: NativeLimits,
         preparation: u64, graph: u64, io: u64, width: usize) -> Result<Self, HostedError> {
+        Self::for_config_with_schedule(task, transport, native, preparation, graph, io, width, None)
+    }
+    /// Complete static admission for the same schedule used by each epoch.
+    /// Per-task KV remains a single-context limit; physical reservations price
+    /// the maximum simultaneous phase and never reset the stream work ledger.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_config_with_schedule(task: &Int4EntityConfig, transport: EntityStreamLimits, native: NativeLimits,
+        preparation: u64, graph: u64, io: u64, width: usize, schedule: Option<Int4EntitySchedule>)
+        -> Result<Self, HostedError> {
         entity_stream::validate::<HostedError>(transport)
             .map_err(|_| HostedError::Limits("INT4 entity corpus transport"))?;
         task.graph.validate(task.resolution).map_err(|error| entities::execution_error(error.into()))?;
         task.source_planning.validate().map_err(|_| HostedError::Limits("INT4 entity source planning"))?;
         let (required, scratch_bytes) = entities::requirements(task, 0, native, preparation, graph, width)?;
+        let cohort = schedule.map(|schedule| Int4EntityCohortHostRequirements::for_config(
+            task, native, preparation, graph, schedule, width)).transpose()?;
+        let (required, scratch_bytes, preparation, temporary_bytes, max_result_bytes) = match cohort {
+            Some(q) => (q.cohort.native, q.scratch_bytes, q.preparation_bytes, q.temporary_bytes, q.max_result_bytes),
+            None => (required, scratch_bytes, preparation, entities::temporary_bytes(task, graph)?, task.max_result_bytes as u64),
+        };
         let document_cap = task.chunks.map_or(task.source_planning.max_input_bytes, |chunks| chunks.max_input_bytes);
         if io == 0 || transport.max_output_bytes <= FOOTER_BYTES
             || transport.max_documents > task.graph.max_documents
@@ -85,11 +104,11 @@ impl Int4EntityCorpusHostRequirements {
         ])?;
         let retained_bytes = sum(&[input_payload_bytes, product(transport.max_line_bytes as u64, 32)?,
             preparation, io])?;
-        let output_bytes = sum(&[output_reserve(transport.max_output_line_bytes.max(task.max_result_bytes) as u64)?,
+        let output_bytes = sum(&[output_reserve((transport.max_output_line_bytes as u64).max(max_result_bytes))?,
             output_reserve(FOOTER_BYTES)?])?;
-        let result = Self { retained_bytes, temporary_bytes: entities::temporary_bytes(task, graph)?,
+        let result = Self { retained_bytes, temporary_bytes,
             output_bytes, kv_bytes: required.kv_bytes, scratch_bytes,
-            cleanup_bytes: native.run.cleanup_reserve_bytes, native: required, input_payload_bytes };
+            cleanup_bytes: native.run.cleanup_reserve_bytes, native: required, input_payload_bytes, cohort };
         result.total_bytes()?;
         Ok(result)
     }
@@ -113,6 +132,47 @@ pub struct Int4EntityCorpusSummary {
     pub reserved_mask_node_visits: u64,
     pub mask_node_visits: u64,
     pub verification_used: EntityVerificationWork,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cohort: Option<Int4EntityCorpusCohortSummary>,
+}
+
+
+/// Physical cohort counters retain the selected schedule across the whole
+/// invocation. Zero-pair and empty epochs contribute zero rather than renewing
+/// any allowance; semantic work remains in the existing summary counters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct Int4EntityCorpusCohortSummary {
+    pub schedule: Int4EntitySchedule,
+    pub ner_cohorts: u64,
+    pub ner_group_steps: u64,
+    pub ner_projection_groups: u64,
+    pub pair_cohorts: u64,
+    pub pair_group_steps: u64,
+    pub pair_projection_groups: u64,
+}
+impl Int4EntityCorpusCohortSummary {
+    fn empty(schedule: Int4EntitySchedule) -> Self {
+        Self { schedule, ner_cohorts: 0, ner_group_steps: 0, ner_projection_groups: 0,
+            pair_cohorts: 0, pair_group_steps: 0, pair_projection_groups: 0 }
+    }
+    fn from_run(run: &Int4EntityCohortRun, schedule: Int4EntitySchedule) -> Result<Self, Int4EntityError> {
+        if run.schedule != schedule { return Err(Int4EntityError::Accounting); }
+        Ok(Self { schedule, ner_cohorts: u64::try_from(run.ner_cohorts).map_err(|_| Int4EntityError::Accounting)?,
+            ner_group_steps: run.ner_group_steps, ner_projection_groups: run.ner_projection_groups,
+            pair_cohorts: u64::try_from(run.pair_cohorts).map_err(|_| Int4EntityError::Accounting)?,
+            pair_group_steps: run.pair_group_steps, pair_projection_groups: run.pair_projection_groups })
+    }
+    fn checked_add(self, next: Self) -> Result<Self, Int4EntityError> {
+        if self.schedule != next.schedule { return Err(Int4EntityError::Accounting); }
+        let add = |a: u64, b: u64| a.checked_add(b).ok_or(Int4EntityError::Accounting);
+        Ok(Self { schedule: self.schedule,
+            ner_cohorts: add(self.ner_cohorts, next.ner_cohorts)?,
+            ner_group_steps: add(self.ner_group_steps, next.ner_group_steps)?,
+            ner_projection_groups: add(self.ner_projection_groups, next.ner_projection_groups)?,
+            pair_cohorts: add(self.pair_cohorts, next.pair_cohorts)?,
+            pair_group_steps: add(self.pair_group_steps, next.pair_group_steps)?,
+            pair_projection_groups: add(self.pair_projection_groups, next.pair_projection_groups)? })
+    }
 }
 
 /// No private source or writer diagnostic is included in Display/Debug.
@@ -191,6 +251,8 @@ struct EpochResult {
     #[serde(flatten)]
     provenance: Provenance,
     output: Int4EntityRun,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cohort: Option<Int4EntityCorpusCohortSummary>,
 }
 
 struct Input<R, W> {
@@ -276,7 +338,9 @@ impl Write for ByteCounter {
 impl NlpEngine {
     /// Execute exact {id,text} and {flush:true} NDJSON records on one loaded
     /// model. All parsing, NER, graph scoring and writes share one hosted run;
-    /// the native engine is allocated once, lazily for the first nonempty epoch.
+    /// the serial engine is allocated once, lazily for the first nonempty epoch.
+    /// A cohort schedule retains the full phase peak while its core creates
+    /// only the phase engines required by the selected execution.
     /// An empty flush is a real empty snapshot; EOF emits only pending docs.
     /// Every nonempty document executes NER even when it yields zero mentions.
     ///
@@ -321,11 +385,11 @@ impl NlpEngine {
             drop(empty);
             let output = Arc::new(output.commit()?);
             let provenance = Provenance::new(model.model_identity(), &config.resolution_identity, kernel);
-            let mut processor = Processor { model: &model.inner.loaded.value, engine: None,
+            let mut processor = Processor { model: &model.inner.loaded.value, engine: None, cohort_native: None,
                 source: input.value.source.clone(), resolver: input.value.resolver.clone(),
                 vocabulary: input.value.vocabulary.clone(), config, required, kernel,
                 kv: Some(kv), scratch: Some(scratch), output: Arc::clone(&output),
-                provenance: provenance.clone(), ledger: Ledger::new(&config.task) };
+                provenance: provenance.clone(), ledger: Ledger::with_schedule(&config.task, config.schedule) };
             let mut transport = config.transport;
             transport.max_output_bytes -= FOOTER_BYTES;
             let result = entity_stream::run_ndjson(
@@ -370,17 +434,25 @@ struct Charge {
 }
 struct Ledger { remaining: Allowance, state: State, summary: Int4EntityCorpusSummary }
 impl Ledger {
-    fn new(task: &Int4EntityConfig) -> Self {
+    #[cfg(test)]
+    fn new(task: &Int4EntityConfig) -> Self { Self::with_schedule(task, None) }
+    fn with_schedule(task: &Int4EntityConfig, schedule: Option<Int4EntitySchedule>) -> Self {
         Self { remaining: Allowance { work: task.max_model_work, scoring: task.scoring.max_model_work,
             masks: task.masks.max_visits_per_run, verification: task.verification },
-            state: State::Ready, summary: Int4EntityCorpusSummary::default() }
+            state: State::Ready, summary: Int4EntityCorpusSummary {
+                cohort: schedule.map(Int4EntityCorpusCohortSummary::empty), ..Default::default() } }
     }
     fn begin(&mut self) -> Result<Allowance, Int4EntityError> {
         if self.state != State::Ready { self.state = State::Failed; return Err(Int4EntityError::Accounting); }
         self.state = State::Running;
         Ok(self.remaining)
     }
+    #[cfg(test)]
     fn complete(&mut self, charge: Charge) -> Result<(), Int4EntityError> {
+        self.complete_with_cohort(charge, None)
+    }
+    fn complete_with_cohort(&mut self, charge: Charge, cohort: Option<Int4EntityCorpusCohortSummary>)
+        -> Result<(), Int4EntityError> {
         let previous = std::mem::replace(&mut self.state, State::Failed);
         if previous != State::Running { return Err(Int4EntityError::Accounting); }
         subtract_work(charge.reserved, charge.actual)?;
@@ -397,7 +469,12 @@ impl Ledger {
             } };
         let previous = self.summary;
         let add = |a: u64, b: u64| a.checked_add(b).ok_or(Int4EntityError::Accounting);
-        let summary = Int4EntityCorpusSummary { transport: previous.transport,
+        let cohort = match (previous.cohort, cohort) {
+            (None, None) => None,
+            (Some(total), Some(next)) => Some(total.checked_add(next)?),
+            _ => return Err(Int4EntityError::Accounting),
+        };
+        let summary = Int4EntityCorpusSummary { transport: previous.transport, cohort,
             reserved_model_work: previous.reserved_model_work.checked_add(charge.reserved)?,
             model_work: previous.model_work.checked_add(charge.actual)?,
             reserved_mask_node_visits: add(previous.reserved_mask_node_visits, charge.masks_reserved)?,
@@ -432,6 +509,9 @@ fn subtract_work(a: Int4Work, b: Int4Work) -> Result<Int4Work, Int4EntityError> 
 struct Processor<'p, 'm> {
     model: &'m Int4ModelWeights,
     engine: Option<ChargedNative<StrictInt4Engine<'m>>>,
+    // Drop the core phase engines before these committed peak reservations.
+    // Keeping them on the processor spans all epochs, writes and final drain.
+    cohort_native: Option<(CommittedMemory, CommittedMemory)>,
     source: Arc<SourceTaskPlanner>, resolver: Arc<ResolutionPlanner>, vocabulary: Arc<ExtractionVocabulary>,
     config: &'p Int4EntityCorpusHostConfig,
     required: Int4EntityCorpusHostRequirements,
@@ -457,8 +537,21 @@ impl EntitySnapshotProcessor for Processor<'_, '_> {
             || prepared.retained_input_bytes().map_err(entities::execution_error)? > self.required.input_payload_bytes {
             return Err(HostedError::Limits("INT4 entity corpus retained input or context"));
         }
-        let result = if empty {
-            prepared.finalize_without_model(control).map_err(entities::execution_error)?
+        let (result, cohort) = if let Some(schedule) = self.config.schedule {
+            let required = self.required.cohort.ok_or(HostedError::CompletionMissing)?;
+            if !empty && self.cohort_native.is_none() {
+                let kv = self.kv.take().ok_or(HostedError::CompletionMissing)?;
+                let scratch = self.scratch.take().ok_or(HostedError::CompletionMissing)?;
+                self.cohort_native = Some((kv.commit()?, scratch.commit()?));
+            }
+            let result = prepared.execute_cohorts_with_control(self.model, &self.vocabulary, self.kernel,
+                schedule, required.budget(self.config.native.context_tokens, self.config.preparation_reserve_bytes), control)
+                .map_err(entities::execution_error)?;
+            entities::check_cohort_result(&result, expected, schedule)?;
+            let physical = Int4EntityCorpusCohortSummary::from_run(&result, schedule).map_err(entities::execution_error)?;
+            (result.output, Some(physical))
+        } else if empty {
+            (prepared.finalize_without_model(control).map_err(entities::execution_error)?, None)
         } else {
             if self.engine.is_none() {
                 let kv = self.kv.take().ok_or(HostedError::CompletionMissing)?;
@@ -477,14 +570,14 @@ impl EntitySnapshotProcessor for Processor<'_, '_> {
             if engine.value.is_poisoned() || !engine.value.kv_cache().all_slots_have_len(0) {
                 return Err(entities::execution_error(Int4EntityError::Accounting));
             }
-            result
+            (result, None)
         };
         entities::check_result(&result, expected)?;
-        self.ledger.complete(Charge { reserved: result.reserved_model_work, actual: result.model_work,
+        self.ledger.complete_with_cohort(Charge { reserved: result.reserved_model_work, actual: result.model_work,
             scoring: result.resolution.planned_model_work, masks_reserved: result.reserved_mask_node_visits,
-            masks_actual: result.mask_node_visit_charge, verification: result.verification_used })
+            masks_actual: result.mask_node_visit_charge, verification: result.verification_used }, cohort)
             .map_err(entities::execution_error)?;
-        Ok(GuardedOutput::new(EpochResult { provenance: self.provenance.clone(), output: result }, Arc::clone(&self.output)))
+        Ok(GuardedOutput::new(EpochResult { provenance: self.provenance.clone(), output: result, cohort }, Arc::clone(&self.output)))
     }
     fn acknowledge_snapshot(&mut self) -> Result<(), Self::Error> {
         self.ledger.acknowledge().map_err(entities::execution_error)

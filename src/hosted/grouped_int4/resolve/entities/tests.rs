@@ -100,9 +100,11 @@ fn every_host_reserve_and_runtime_cleanup_bound_is_explicit() {
 #[test]
 fn intermediate_storage_prices_decoded_bytes_tokens_and_graph_with_checked_arithmetic() {
     let mut c = config(32);
-    assert_eq!(temporary_bytes(&c, 8192).unwrap(), 4 * 4096 + 8 * 16 + 8192);
+    assert_eq!(temporary_bytes(&c, 8192).unwrap(), 4 * 4096 + 8 * 16 + 8192
+        + crate::corpus::entities_int4::collection_workspace_bytes(c.graph.max_documents).unwrap());
     c.ner_budget.max_output_tokens = u32::MAX;
-    assert_eq!(temporary_bytes(&c, 8192).unwrap(), 4 * 4096 + 8 * u64::from(u32::MAX) + 8192);
+    assert_eq!(temporary_bytes(&c, 8192).unwrap(), 4 * 4096 + 8 * u64::from(u32::MAX) + 8192
+        + crate::corpus::entities_int4::collection_workspace_bytes(c.graph.max_documents).unwrap());
     c.ner_budget.max_output_bytes = u64::MAX / 4 + 1;
     assert!(temporary_bytes(&c, 8192).is_err());
     let c = config(32);
@@ -304,4 +306,93 @@ fn consumed_preparation_and_guarded_complete_results_own_the_physical_runtime_bo
     send::<Input>(); send::<PreparedInt4EntityCorpus>(); send::<Int4EntityRun>();
     send::<HostedOutput<Int4EntityRun>>();
     let _host = NlpEngine::execute_int4_entities;
+}
+
+
+#[test]
+fn independent_entity_schedules_price_the_larger_phase_and_extra_preparation() {
+    for width in [16, 32, 128] {
+        let c = config(width);
+        let quote = |schedule| Int4EntityCohortHostRequirements::for_config(&c, native(), 4096, 8192, schedule, width).unwrap();
+        let ner = quote(Int4EntitySchedule { ner_cohort_chunks: Some(3), pair_cohort_pairs: None });
+        let pair = quote(Int4EntitySchedule { ner_cohort_chunks: None, pair_cohort_pairs: Some(2) });
+        let both = quote(Int4EntitySchedule { ner_cohort_chunks: Some(3), pair_cohort_pairs: Some(2) });
+        let single = Int4MemoryRequirement::for_context(128, width).unwrap();
+        assert_eq!(ner.kv_bytes, 3 * single.kv_bytes);
+        assert_eq!(pair.kv_bytes, 4 * single.kv_bytes);
+        assert_eq!(both.kv_bytes, ner.kv_bytes.max(pair.kv_bytes));
+        assert_eq!(both.scratch_bytes, ner.scratch_bytes.max(pair.scratch_bytes));
+        assert_eq!(ner.preparation_bytes, 3 * 4096);
+        assert_eq!(pair.preparation_bytes, 4096);
+        assert_eq!(both.preparation_bytes, ner.preparation_bytes);
+        assert!(both.temporary_bytes > temporary_bytes(&c, 8192).unwrap());
+        assert_eq!(both.max_result_bytes, c.max_result_bytes as u64 + 4096);
+        assert_eq!(both.output_bytes, 4 * both.max_result_bytes + 4096);
+        assert_eq!(both.total_bytes().unwrap(), both.preparation_bytes + both.temporary_bytes
+            + both.output_bytes + both.kv_bytes + both.scratch_bytes + both.cleanup_bytes);
+        assert_eq!(c.ner_budget.max_kv_bytes, single.kv_bytes);
+        assert_eq!(c.scoring.planning.per_head.max_kv_bytes, single.kv_bytes);
+        let budget = both.budget(128, 4096);
+        assert_eq!(budget.preparation_reserve_bytes, 4096);
+        assert_eq!(budget.max_preparation_bytes, 2 * 4096);
+        assert_eq!(budget.native_memory.max_kv_bytes, both.kv_bytes);
+    }
+}
+
+#[test]
+fn entity_cohort_admission_refuses_empty_invalid_or_unfunded_stage_schedules() {
+    let c = config(32);
+    for (ner, pair) in [(None, None), (Some(0), None), (Some(65), None), (None, Some(0)), (None, Some(33))] {
+        let schedule = Int4EntitySchedule { ner_cohort_chunks: ner, pair_cohort_pairs: pair };
+        assert!(Int4EntityCohortHostRequirements::for_config(&c, native(), 4096, 8192, schedule, 32).is_err());
+    }
+    let schedule = Int4EntitySchedule { ner_cohort_chunks: Some(2), pair_cohort_pairs: Some(2) };
+    for stage in 0..2 {
+        let mut capped = c.clone();
+        if stage == 0 { capped.ner_budget.max_kv_bytes -= 1; }
+        else { capped.scoring.planning.per_head.max_kv_bytes -= 1; }
+        assert!(Int4EntityCohortHostRequirements::for_config(&capped, native(), 4096, 8192, schedule, 32).is_err());
+    }
+    for (prep, graph) in [(0, 8192), (4096, 0), (u64::MAX, 8192), (4096, u64::MAX)] {
+        assert!(Int4EntityCohortHostRequirements::for_config(&c, native(), prep, graph, schedule, 32).is_err());
+    }
+}
+
+#[test]
+fn entity_cohort_completion_binds_schedule_and_both_physical_phase_counters() {
+    let schedule = Int4EntitySchedule { ner_cohort_chunks: Some(2), pair_cohort_pairs: Some(2) };
+    for axis in 0..10 {
+        let (output, expected) = receipt(2, true);
+        let mut run = Int4EntityCohortRun { schema_version: 1, execution: INT4_ENTITY_COHORT_EXECUTION,
+            schedule, ner_cohorts: 1, ner_group_steps: 2, ner_projection_groups: 1,
+            pair_cohorts: 0, pair_group_steps: 0, pair_projection_groups: 0, output };
+        check_cohort_result(&run, expected, schedule).unwrap();
+        match axis {
+            0 => run.schema_version = 2,
+            1 => run.execution = "foreign-cohort",
+            2 => run.schedule.ner_cohort_chunks = Some(1),
+            3 => run.ner_cohorts += 1,
+            4 => run.ner_group_steps = 0,
+            5 => run.ner_projection_groups = 0,
+            6 => run.ner_group_steps = run.output.ner_model_work.forward_positions + 1,
+            7 => run.ner_projection_groups = run.ner_group_steps + 1,
+            8 => run.pair_cohorts = 1,
+            _ => run.pair_group_steps = 1,
+        }
+        assert!(check_cohort_result(&run, expected, schedule).is_err(), "axis {axis}");
+    }
+    let (output, expected) = receipt(0, false);
+    let run = Int4EntityCohortRun { schema_version: 1, execution: INT4_ENTITY_COHORT_EXECUTION,
+        schedule, ner_cohorts: 0, ner_group_steps: 0, ner_projection_groups: 0,
+        pair_cohorts: 0, pair_group_steps: 0, pair_projection_groups: 0, output };
+    check_cohort_result(&run, expected, schedule).unwrap();
+}
+
+#[test]
+fn entity_cohort_native_and_result_ownership_crosses_the_owned_host_boundary() {
+    fn send<T: Send + 'static>() {}
+    send::<Int4EntityCohortHostRequirements>();
+    send::<Int4EntityCohortRun>();
+    send::<HostedOutput<Int4EntityCohortRun>>();
+    let _method = NlpEngine::execute_int4_entities_cohorts;
 }
