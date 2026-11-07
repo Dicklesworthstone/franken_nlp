@@ -363,18 +363,21 @@ separate model-present fixture compares buffered and streamed execution.
 Compilation, test execution and model qualification remain pending the
 controller's required DSR and model gates.
 
-### Implemented candidate INT4 selected-row extraction
+### Implemented candidate INT4 selected-row source tasks
 
-One-off `fnlp candidate source-int4 extract` accepts explicit
+One-off `fnlp candidate source-int4 extract`, `ner`, `keyphrases`, `summarize`
+and `answer` accept explicit
 `--max-selected-rows N` to project every grammar-legal output row through the
 existing INT4 kernels. A step whose complete legal set exceeds the cap refuses;
 the strategy never truncates the grammar or substitutes top-k pruning. EOS is
 scored explicitly, and native work reports the actual projected rows.
 
-The option composes with `--prefill-rows` and `--source-membership`. It binds a
-distinct execution identity before host admission. Full-vocabulary extraction
-remains the default; shared batch, map, durable-job and semantic second-reader
-routes reject this one-off option. See [selected-row INT4 extraction](docs/int4-selected-rows.md)
+The option composes with `--prefill-rows` and, for extraction, `--source-membership`.
+It binds a distinct execution identity before host admission and preserves
+the built-in source finalizers. Full-vocabulary execution remains the default;
+shared batch, map, durable-job, redaction and semantic second-reader routes
+reject this one-off option. Prose fields can require a large row cap and fail
+explicitly when it is too small. See [selected-row INT4 source tasks](docs/int4-selected-rows.md)
 for CLI/library examples, accounting and the pending native-parity and
 performance gates.
 

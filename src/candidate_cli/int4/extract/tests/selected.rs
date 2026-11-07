@@ -11,7 +11,7 @@ use crate::{
 };
 
 #[test]
-fn only_the_one_off_extract_definition_exposes_selected_rows() {
+fn only_supported_one_off_definitions_expose_selected_rows() {
     fn collect(command: &clap::Command, prefix: &str, found: &mut Vec<String>) {
         let path = format!("{prefix}/{}", command.get_name());
         if command.get_arguments().any(|arg| arg.get_id().as_str() == "max_selected_rows") {
@@ -21,7 +21,8 @@ fn only_the_one_off_extract_definition_exposes_selected_rows() {
     }
     let mut found = Vec::new();
     collect(&crate::candidate_cli::definition(), "", &mut found);
-    assert_eq!(found, ["/candidate/source-int4/extract"]);
+    assert_eq!(found, ["/candidate/source-int4/extract", "/candidate/source-int4/ner",
+        "/candidate/source-int4/keyphrases", "/candidate/source-int4/summarize", "/candidate/source-int4/answer"]);
     for shared in [definition(), super::super::super::extract_batch::definition(),
         super::super::super::extract_map::definition(), super::super::super::extract_job::definition(),
         super::super::super::extract_document_job::definition(), super::super::super::semantic::definition()] {

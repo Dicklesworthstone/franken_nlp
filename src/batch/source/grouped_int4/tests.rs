@@ -278,6 +278,22 @@ fn host(state: &Rc<State>, mode: Mode) -> (Engine, Admission, RunState) {
         Admission { state: Rc::clone(state), reject: false, wrong: false }, RunState::new(limits()))
 }
 #[test]
+fn selected_source_injection_refuses_before_batch_admission_or_native_execution() {
+    use crate::native_engine::constrained_int4::sparse::Int4JsonSparseLimits;
+    let p = planner(); let c = compiler(&p, BuiltInTask::Keyphrases);
+    for cap in [7, NANBEIGE_VOCAB_SIZE] {
+        let plan = c.prepare_with_control(document(), &mut Continue).unwrap()
+            .with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: cap }).unwrap();
+        let state = Rc::new(State::default());
+        let (mut driver, mut admission, mut run) = host(&state, Mode::Success);
+        let error = execute_admitted(plan, &mut driver, &mut admission, &mut run,
+            context(1, 1), &mut Continue).err().unwrap();
+        assert!(error.stop && run.failed); assert_eq!(error.fault.code, BatchCode::Admission);
+        assert_eq!(state.admissions.get(), 0); assert_eq!(state.calls.get(), 0);
+        assert_eq!(state.drops.get(), 0); assert!(!state.live.get() && !state.running.get());
+    }
+}
+#[test]
 fn guard_survives_native_work_and_serialization_and_complete_work_is_retained() {
     let p = planner(); let plan = compiler(&p, BuiltInTask::Keyphrases).prepare_with_control(document(), &mut Continue).unwrap();
     let work = plan.planned_work(); let state = Rc::new(State::default());

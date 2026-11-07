@@ -202,6 +202,7 @@ impl Driver for NativeDriver<'_, '_, '_> {
     }
 }
 fn preflight(prepared: &PreparedInt4SourceTask, driver: &impl Driver) -> Result<u64, BatchItemFailure> {
+    prepared.require_full_projection().map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
     if !driver.clean() { return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)); }
     if prepared.group_width() != driver.group_width() {
         return Err(BatchItemFailure::fatal(BatchCode::Admission));

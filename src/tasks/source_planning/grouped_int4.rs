@@ -9,14 +9,14 @@
 use super::*;
 use crate::{
     native_engine::{
-        constrained_int4::{self, Int4JsonBudget, Int4JsonError},
+        constrained_int4::{self, Int4JsonBudget, Int4JsonError, sparse::Int4JsonSparseLimits},
         decode::DecodeCancellationKind,
         strict_int4::{Int4Work, StrictInt4Engine, STRICT_INT4_PROFILE, prefill::Int4PrefillLimits},
     },
     tasks::{
         answer::{Int4AnswerFinalizer, ANSWER_TASK_VERSION},
         extract::{ExtractResult, grouped_int4::{Int4ExtractError, Int4ExtractPlan,
-            Int4ExtractRun, INT4_EXTRACT_VERSION}, quantized::check_size},
+            Int4ExtractRun}, quantized::check_size},
         keyphrases::{self, KEYPHRASES_TASK_VERSION},
         ner::{self, NER_TASK_VERSION},
         summarize::{self, SUMMARIZE_TASK_VERSION},
@@ -30,6 +30,7 @@ mod model;
 pub use model::Int4SourcePlanner;
 
 pub const INT4_SOURCE_EXECUTION: &str = "grouped-int4-source-portfolio-v1";
+pub const INT4_SPARSE_SOURCE_EXECUTION: &str = "grouped-int4-selected-row-source-portfolio-v1";
 
 /// Default diagnostics redact source/compiler content. Explicit diagnostic
 /// handling can inspect typed causes without logging a private document.
@@ -170,6 +171,27 @@ impl SourceTaskPlanner {
     }
 }
 impl PreparedInt4SourceTask {
+    /// Explicitly project the complete legal token set under one row ceiling.
+    /// This consumes the unadmitted plan and binds both head strategy and the
+    /// original source-task finalizer. No schema, passage or source escapes.
+    /// A too-wide set refuses; prose fields may require a large row ceiling.
+    pub fn with_selected_rows(mut self, limits: Int4JsonSparseLimits) -> Result<Self, Int4SourceError> {
+        self.extraction = self.extraction.with_selected_rows(limits)?
+            .with_finalizer_version(INT4_SPARSE_SOURCE_EXECUTION)?;
+        Ok(self)
+    }
+    pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.extraction.selected_rows() }
+    pub fn execution_version(&self) -> &'static str {
+        if self.selected_rows().is_some() { INT4_SPARSE_SOURCE_EXECUTION } else { INT4_SOURCE_EXECUTION }
+    }
+    /// Composed full-head schedules and durable recipes cannot acquire a
+    /// selected-row plan, including one with a full-vocabulary ceiling.
+    pub(crate) fn require_full_projection(&self) -> Result<(), Int4SourceError> {
+        if self.selected_rows().is_some() {
+            return Err(SourcePlanningError::Contract("source workflow requires full-vocabulary projection").into());
+        }
+        Ok(())
+    }
     pub fn execution_identity(&self) -> &ExecutionIdentity { self.extraction.execution_identity() }
     pub fn group_width(&self) -> usize { self.extraction.group_width() }
     pub fn planned_work(&self) -> Int4Work { self.extraction.planned_work() }
@@ -206,11 +228,12 @@ impl PreparedInt4SourceTask {
     }
 
     fn finish(&self, raw: Int4ExtractRun) -> Result<Int4SourceTaskRun, Int4SourceError> {
-        if raw.schema_version != 1 || raw.execution != INT4_EXTRACT_VERSION || raw.group_width != self.group_width() {
+        if raw.schema_version != 1 || raw.execution != self.extraction.execution_version()
+            || raw.group_width != self.group_width() {
             return Err(Int4SourceError::InvalidResult);
         }
         let result = self.finalizer.finish(raw.result, self.max_result_bytes())?;
-        let run = Int4SourceTaskRun { schema_version: 1, execution: INT4_SOURCE_EXECUTION.to_owned(),
+        let run = Int4SourceTaskRun { schema_version: 1, execution: self.execution_version().to_owned(),
             group_width: self.group_width(), result, model_work: raw.model_work };
         check_size(&run, self.max_result_bytes())?;
         Ok(run)

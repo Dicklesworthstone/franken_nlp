@@ -214,7 +214,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(extract_job::definition())
         .subcommand(extract_map::definition())
         .subcommand(extract_document_job::definition())
-        .subcommands(source::definitions().into_iter().map(prefill::definition))
+        .subcommands(source::one_off_definitions().into_iter().map(prefill::definition))
         .subcommands(source_batch::definitions())
         .subcommands(source_job::definitions())
         .subcommands(source_map::definitions())

@@ -6,11 +6,12 @@ use crate::{
     grammar::runtime::JsonProgram,
     native_engine::{constrained::JsonDecodeOutput, generation::grouped_int4::INT4_SOURCE_FORMAT,
         portable_int8::int4::convert::GROUPED_INT4_RECIPE, strict_int4::STRICT_INT4_EXECUTION},
-    tasks::{answer::{AnswerCalibration, AnswerStatus}, extract::ExtractionGrounding,
+    tasks::{answer::{AnswerCalibration, AnswerStatus}, extract::{ExtractionGrounding, grouped_int4::INT4_EXTRACT_VERSION},
         ir::ScoreSpace, summarize::{CitationGuarantee, SummarySemanticSupport}},
     tokenizer::specials::ArchivedControlRegistries,
     validation::{SourceSpan, validate_source_span, grounded_fields::SourceOccurrence},
 };
+mod selected;
 
 struct Continue;
 impl DecodeStepControl for Continue { fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None } }

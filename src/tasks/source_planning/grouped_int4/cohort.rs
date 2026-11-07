@@ -28,6 +28,7 @@ pub struct Int4SourceCohortRun {
 /// The extraction layer retains the exact task/control and work contract.
 pub(crate) fn preflight(request: &Int4SourceCohortRequest<'_>, vocabulary: &ExtractionVocabulary)
     -> Result<(), Int4SourceError> {
+    request.prepared.require_full_projection()?;
     request.prepared.verify_identity(request.admitted_identity)?;
     extraction_group::preflight(&Int4ExtractCohortRequest { prepared: &request.prepared.extraction,
         admitted_identity: request.admitted_identity, budget: request.budget }, vocabulary)?;
@@ -58,6 +59,7 @@ pub(super) fn finish(requests: &[Int4SourceCohortRequest<'_>], raw: Int4ExtractC
         || raw.sequences.len() != requests.len() || requests.is_empty() || requests.len() > MAX_INT4_SEQUENCES {
         return Err(Int4SourceError::InvalidResult);
     }
+    for request in requests { request.prepared.require_full_projection()?; }
     let mut sequences = Vec::new(); sequences.try_reserve_exact(requests.len())
         .map_err(|_| Int4SourceError::from(ExtractError::AllocationRefused))?;
     let mut planned_work = Int4Work::default(); let mut model_work = Int4Work::default(); let mut longest = 0;

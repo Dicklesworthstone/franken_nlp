@@ -4,6 +4,7 @@ use super::*;
 use crate::{
     candidate_cli::source::{self as shared, Kind},
     grammar::{CompileLimits, mask::MaskWorkLimits, runtime::SourceRuntimeLimits},
+    native_engine::constrained_int4::sparse::Int4JsonSparseLimits,
     tasks::{BuiltInTask, ir::TaskBudget, source_planning::SourcePlanningLimits},
 };
 
@@ -28,12 +29,24 @@ pub(super) struct SourceArgs {
     max_mask_node_visits: u64,
     #[arg(long, default_value_t = 2_000_000)]
     mask_step_node_visits: u64,
+    #[arg(skip)]
+    max_selected_rows: Option<usize>,
 }
 impl std::fmt::Debug for SourceArgs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("SourceArgs") }
 }
 pub(super) fn definitions() -> Vec<clap::Command> {
     [Kind::Ner, Kind::Keyphrases, Kind::Summarize, Kind::Answer].into_iter().map(definition).collect()
+}
+/// Shared definitions retain full-head schedules; only these direct commands
+/// can bind selected rows into a complete source task before host admission.
+pub(super) fn one_off_definitions() -> Vec<clap::Command> {
+    definitions().into_iter().map(|command| command
+        .arg(clap::Arg::new("max_selected_rows").long("max-selected-rows")
+            .value_name("N").value_parser(clap::value_parser!(usize))
+            .help("Opt into all legal grammar-row projections; 1..=166144 rows per step including accepted EOS; excess refuses"))
+        .after_long_help("Full-vocabulary projection remains the default. --max-selected-rows projects every legal token, never prunes the grammar, and refuses before projecting a set larger than the cap. The exact strategy, cap and source-task finalizer bind execution identity. Source spans, passage boundaries, citation verification, complete result limits and mask work remain unchanged. Summary prose and answer text can have wide legal sets, so a small cap may refuse them; no automatic fallback or retry occurs. --prefill-rows independently enables bounded layer-major prompt execution. This option checks only selected logits; actual-model parity and performance require separate evidence. Shared batches, maps, jobs and redaction do not accept it."))
+        .collect()
 }
 pub(super) fn definition(kind: Kind) -> clap::Command {
     let about = match kind {
@@ -60,7 +73,12 @@ impl SourceArgs {
             return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
                 "this INT4 source workflow requires sequential prompt execution"));
         }
-        Self::from_matches_with_prefill(matches)
+        let args = Self::from_matches_with_prefill(matches)?;
+        if args.max_selected_rows.is_some() {
+            return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
+                "this INT4 source workflow requires full-vocabulary head projection"));
+        }
+        Ok(args)
     }
     pub(super) fn from_matches_with_prefill(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         if TEXT_ONLY.iter().filter(|&&id| id != "prefill_rows")
@@ -68,13 +86,16 @@ impl SourceArgs {
             return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
                 "INT4 source tasks accept constrained tokens and result limits, not generation controls"));
         }
-        Self::from_arg_matches(matches)
+        let mut args = Self::from_arg_matches(matches)?;
+        args.max_selected_rows = matches.try_get_one::<usize>("max_selected_rows").ok().flatten().copied();
+        Ok(args)
     }
     pub(super) fn validate(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
-        if args.prefill()?.is_some() { return Err(CandidateError::Arguments); }
+        if self.max_selected_rows.is_some() || args.prefill()?.is_some() { return Err(CandidateError::Arguments); }
         self.validate_with_prefill(args)
     }
     pub(super) fn validate_with_prefill(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
+        let _ = self.selected_rows()?;
         if self.options.as_ref().is_some_and(|path| path.as_os_str().is_empty() || path.as_os_str() == "-")
             || !(1..=MAX_CONTENT_BYTES).contains(&self.max_result_bytes)
             || !(1..=65_536).contains(&self.max_grammar_states)
@@ -114,6 +135,22 @@ impl SourceArgs {
     }
     pub(super) fn mask_visits(&self) -> u64 { self.max_mask_node_visits }
     pub(super) fn options_path(&self) -> Option<&std::path::Path> { self.options.as_deref() }
+    fn selected_rows(&self) -> Result<Option<Int4JsonSparseLimits>, CandidateError> {
+        self.max_selected_rows.map(|max_rows_per_step| {
+            let limits = Int4JsonSparseLimits { max_rows_per_step };
+            limits.validate().map_err(|_| CandidateError::Arguments)?;
+            Ok(limits)
+        }).transpose()
+    }
+    #[cfg(any(feature = "asupersync-runtime", test))]
+    pub(super) fn configure_plan(&self, plan: crate::tasks::source_planning::grouped_int4::PreparedInt4SourceTask)
+        -> Result<crate::tasks::source_planning::grouped_int4::PreparedInt4SourceTask, CandidateError> {
+        if plan.selected_rows().is_some() { return Err(CandidateError::Planning); }
+        match self.selected_rows()? {
+            Some(limits) => plan.with_selected_rows(limits).map_err(|_| CandidateError::Planning),
+            None => Ok(plan),
+        }
+    }
 }
 
 #[cfg(feature = "asupersync-runtime")]

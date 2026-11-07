@@ -291,7 +291,7 @@ fn prepare(request: Input, model: &ResidentInt4, args: &Int4Args, limits: Int4Li
                 return Err(CandidateError::Planning);
             }
             prepared.verify_identity(prepared.execution_identity()).map_err(|_| CandidateError::Identity)?;
-            Ok(Prepared::Source { plan: prepared, vocabulary: Arc::new(vocabulary),
+            Ok(Prepared::Source { plan: options.configure_plan(prepared)?, vocabulary: Arc::new(vocabulary),
                 masks: options.masks(), max_mask_node_visits: options.mask_visits() })
         }
     }

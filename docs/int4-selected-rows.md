@@ -1,4 +1,4 @@
-# Grammar-first selected-row INT4 extraction
+# Grammar-first selected-row INT4 source tasks
 
 The native grouped-INT4 decoder can explicitly project only the output rows
 that the current JSON grammar permits. This uses the existing quantized model,
@@ -26,11 +26,29 @@ schema with annotated verbatim fields. The row cap must cover the complete
 legal token set at every visited grammar state; this example cap is not a
 promise that an arbitrary schema fits.
 
-`--max-selected-rows` is available only on one-off `extract`. Shared extraction
-batches, maps, durable jobs and the semantic second-reader route reject it.
-Without the option, extraction retains full-vocabulary execution and its
+`--max-selected-rows` is available on one-off `extract`, `ner`, `keyphrases`,
+`summarize` and `answer`. Shared batches, maps, durable jobs, redaction and the
+semantic second-reader route reject it. Without the option, these tasks retain full-vocabulary execution and their
 existing identity. Native work in the result reports actual projected rows;
 grammar-mask, task, source and complete-result limits are unchanged.
+
+For example, the same source-bound NER task can opt into the strategy:
+
+```sh
+fnlp candidate source-int4 ner document.txt \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --group-width 128 --memory-mib "$MEMORY_MIB" \
+  --max-selected-rows 4096
+```
+
+The cap is a refusal boundary, not a prediction of how many rows a source
+task will need. Summary prose and answer strings can admit wide token sets;
+a small cap can refuse them. No task silently changes its schema or falls
+back to the full head. NER and keyphrases retain exact source occurrences;
+summaries and answers retain independently checked citations, passage
+boundaries and their existing abstention semantics. A decoding failure does
+not become an answer abstention.
 
 ## Library use
 
@@ -51,6 +69,12 @@ requires its existing separate prompt-scratch reservation. Direct native
 callers can use `constrained_int4::sparse::decode_json_int4_sparse` or
 `sparse::prefill::decode_json_int4_sparse_layer_major` with the matching planned
 work and native/KV budgets.
+
+`PreparedInt4SourceTask::with_selected_rows` provides the same consuming
+opt-in for built-in source tasks before hosted admission. The host's existing
+serial and layer-major source entrypoints use the selected plan's work.
+Its original typed finalizer stays sealed to the plan; callers cannot inject
+a schema, substitute an extraction result, or relabel a full-head receipt.
 
 `max_rows_per_step` must be in `1..=166144`. It is a complete legal-set ceiling:
 if one selection has more legal rows, execution fails before that selection's
@@ -79,9 +103,12 @@ their memory reservation.
 Both the execution identity and comparison policy bind the selected strategy
 and row ceiling. Native results use
 `grouped-int4-grammar-first-selected-rows-v1`; extraction results use
-`grouped-int4-selected-row-schema-source-extraction-v1`. A full-head result or
+`grouped-int4-selected-row-schema-source-extraction-v1`; built-in source
+results use `grouped-int4-selected-row-source-portfolio-v1`. A full-head result or
 admission cannot be relabeled as selected-row execution. The current
-multi-sequence extraction cohort API refuses selected-row plans explicitly.
+multi-sequence extraction and source cohort APIs refuse selected-row plans
+explicitly. Source batch and durable job admission also refuse injected
+selected plans before native work or durable work journaling.
 
 Independent JSON validation, exact-number preservation, source-membership
 evidence, complete result-size checks and the final cancellation check remain

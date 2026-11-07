@@ -217,6 +217,7 @@ impl<A: Int4SourceBatchAdmission> DurableBatchProcessor for Int4SourceJobProcess
     }
     fn durable_work(&self, prepared: &Self::Prepared) -> Result<JobWork, BatchItemFailure> {
         if self.native.is_poisoned() { return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)); }
+        prepared.require_full_projection().map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
         // These are actual group-aware planned counts. A fresh native ledger
         // on resume never refunds the journal's previous failed attempts.
         Ok(JobWork::from_int4(prepared.planned_work(), self.planner.native.masks.max_visits_per_item))

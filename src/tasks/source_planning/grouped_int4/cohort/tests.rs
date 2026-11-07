@@ -63,6 +63,22 @@ fn every_source_task_preflights_identity_and_work_without_allocating_an_engine()
 }
 
 #[test]
+fn selected_source_plans_cannot_enter_full_head_cohorts_even_at_full_row_cap() {
+    use crate::native_engine::{constrained_int4::sparse::Int4JsonSparseLimits, lmhead::NANBEIGE_VOCAB_SIZE};
+    let planner = planner(); let vocabulary = ExtractionVocabulary::pinned(&planner.controls).unwrap();
+    for cap in [7, NANBEIGE_VOCAB_SIZE] {
+        let fixtures = vec![(ner("Alice"), "Alice", "[]")];
+        let plans = vec![prepare(&planner, &fixtures[0].0)
+            .with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: cap }).unwrap()];
+        let requests = requests(&plans);
+        assert!(preflight(&requests[0], &vocabulary).is_err());
+        let mut output = raw(&plans, &fixtures);
+        output.sequences[0].execution = plans[0].extraction.execution_version().to_owned();
+        assert!(finish(&requests, output, 8 << 20).is_err());
+    }
+}
+
+#[test]
 fn all_four_original_semantic_finalizers_remain_independent_and_ordered() {
     let planner = planner(); let fixtures = fixtures();
     let plans: Vec<_> = fixtures.iter().map(|(request, _, _)| prepare(&planner, request)).collect();
