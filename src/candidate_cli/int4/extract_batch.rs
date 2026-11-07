@@ -32,11 +32,10 @@ struct StreamArgs {
     /// Interactive producers must fill a window or send a flush command.
     #[arg(long, value_name = "N")]
     cohort_documents: Option<usize>,
-    /// Serial only: project every grammar-legal row under this fixed ceiling.
+    /// Project every grammar-legal row under this fixed ceiling in each document.
     /// A set exceeding the cap refuses instead of pruning or falling back.
     // This capability belongs to the entire stream, not shared item arguments.
-    #[arg(long = "max-selected-rows", id = "batch_max_selected_rows", value_name = "N",
-        conflicts_with = "cohort_documents")]
+    #[arg(long = "max-selected-rows", id = "batch_max_selected_rows", value_name = "N")]
     max_selected_rows: Option<usize>,
     /// Whole-stream nonempty records, including malformed input and flush commands.
     #[arg(long, default_value_t = 1000)]
@@ -55,10 +54,9 @@ struct StreamArgs {
 pub(super) fn definition() -> clap::Command {
     StreamArgs::augment_args(extract::definition().name("extract-batch")
         .about("Extract one shared schema from bounded NDJSON using one resident INT4 model")
-        .long_about("Process ordered {id,text} NDJSON and exact {\"flush\":true} controls with one resident source-converted or digest-pinned snapshot INT4 model. --schema supplies one exact shared schema; --source-membership binds its annotated verbatim fields to EACH original document. Any non-null task_args is rejected before document tokenization, even if it repeats the shared schema or budgets. Execution is serial unless --cohort-documents N explicitly groups up to N complete documents through shared native decoder layers, with independent grammars, source masks and causal KV. The entire window and a lookahead plan are memory-admitted before IO. A partial window executes at flush or EOF; interactive producers must fill the window or send a flush before waiting. Results remain ordered. IDs are unique within each bounded epoch and reset only after a drained flush. Every event has candidate provenance. Require run_complete AND exit 0 for whole-run success; run_complete alone reports a drained protocol and can include failed documents. Earlier complete results remain valid after a later failure. Native work, mask visits, checkpoints, input and output ceilings never renew per document, cohort or epoch. Full-vocabulary greedy decoding remains the default. Explicit --max-selected-rows N opts the entire serial stream into every legal grammar-row projection, with a fixed ceiling of 1..=166144 rows per selection including accepted EOS. A complete legal set exceeding the cap refuses; no rows are pruned and no dense fallback is silently chosen. The strategy and ceiling bind each document's execution identity before admission. It cannot be combined with --cohort-documents and does not enable selected rows in maps or durable jobs. Output-token, result-byte, KV, mask and independent source/schema validation limits remain unchanged. With --cohort-documents, explicit --prefill-rows P packs at most P TOTAL prompt and already sampled feedback positions per native pass, 1..=64, with independent extra scratch admission. P may be smaller than the document window. Omitting it retains the existing cohort schedule. No sampler, repair retry, durable resume, native parity, speed or semantic-accuracy claim. Blocking IO is cooperative, not preemptible.")
+        .long_about("Process ordered {id,text} NDJSON and exact {\"flush\":true} controls with one resident source-converted or digest-pinned snapshot INT4 model. --schema supplies one exact shared schema; --source-membership binds its annotated verbatim fields to EACH original document. Any non-null task_args is rejected before document tokenization, even if it repeats the shared schema or budgets. Execution is serial unless --cohort-documents N explicitly groups up to N complete documents through shared native decoder layers, with independent grammars, source masks and causal KV. The entire window and a lookahead plan are memory-admitted before IO. A partial window executes at flush or EOF; interactive producers must fill the window or send a flush before waiting. Results remain ordered. IDs are unique within each bounded epoch and reset only after a drained flush. Every event has candidate provenance. Require run_complete AND exit 0 for whole-run success; run_complete alone reports a drained protocol and can include failed documents. Earlier complete results remain valid after a later failure. Native work, mask visits, checkpoints, input and output ceilings never renew per document, cohort or epoch. Full-vocabulary greedy decoding remains the default. Explicit --max-selected-rows N opts the entire stream into every legal grammar-row projection, with a fixed ceiling of 1..=166144 rows per selection including accepted EOS. It supports serial, cohort and packed-cohort execution. A complete legal set exceeding the cap refuses; no rows are pruned and no dense fallback is silently chosen. The strategy and ceiling bind each document's execution identity before admission. This option does not enable selected rows in maps or durable jobs. Output-token, result-byte, KV, mask and independent source/schema validation limits remain unchanged. With --cohort-documents, explicit --prefill-rows P packs at most P TOTAL prompt and already sampled feedback positions per native pass, 1..=64, with independent extra scratch admission. P may be smaller than the document window. Omitting it retains the existing cohort schedule. No sampler, repair retry, durable resume, native parity, speed or semantic-accuracy claim. Blocking IO is cooperative, not preemptible.")
         .mut_arg("input", |arg| arg.help("NDJSON file, or '-' for stdin; read one bounded record at a time"))
         .mut_arg("prefill_rows", |arg| arg.hide(false).requires("cohort_documents")
-            .conflicts_with("batch_max_selected_rows")
             .help("With --cohort-documents: maximum TOTAL prompt/feedback token rows per packed pass, 1..=64; extra scratch is admitted"))
         .mut_arg("max_input_bytes", |arg| arg.help("Maximum decoded UTF-8 document bytes per record"))
         .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoint allowance for the ENTIRE corpus execution")))
@@ -90,8 +88,7 @@ impl BatchArgs {
             || !(1..=MAX_LINE_BYTES).contains(&stream.max_line_bytes)
             || !(1..=MAX_TRANSPORT_BYTES).contains(&stream.max_total_input_bytes)
             || !(1..=MAX_TRANSPORT_BYTES).contains(&stream.max_total_output_bytes)
-            || (selected_rows.is_some() && stream.cohort_documents.is_some())
-            || (prefill.is_some() && (stream.cohort_documents.is_none() || selected_rows.is_some())) {
+            || (prefill.is_some() && stream.cohort_documents.is_none()) {
             return Err(CandidateError::Arguments);
         }
         // Retain source/snapshot exclusivity, real hardware detection, schema
@@ -136,10 +133,8 @@ impl BatchArgs {
             let memory = Int4ExtractionCohortMemoryLimits { max_documents, context_tokens: args.context_tokens,
                 preparation_reserve_bytes, io_reserve_bytes: io_bytes, allocator_reserve_bytes: ALLOCATOR_BYTES,
             };
-            let quote = match prefill {
-                Some(prefill) => memory.requirements_packed(args.group_width, native, transport, prefill),
-                None => memory.requirements(args.group_width, native, transport),
-            }.map_err(|_| CandidateError::Arguments)?;
+            let quote = memory.requirements_for_execution(args.group_width, native, transport,
+                selected_rows, prefill).map_err(|_| CandidateError::Arguments)?;
             let execution = sum(&[quote.native.kv_bytes, quote.workspace_bytes,
                 quote.input_bytes, quote.output_reservation_bytes])?;
             common.minimum_memory_bytes = grouped_memory_floor(args, common, execution)?;
@@ -170,8 +165,7 @@ impl BatchArgs {
     #[cfg(any(feature = "asupersync-runtime", test))]
     fn configure_planner(&self, planner: crate::batch::extract::grouped_int4::Int4ExtractionBatchPlanner)
         -> Result<crate::batch::extract::grouped_int4::Int4ExtractionBatchPlanner, CandidateError> {
-        if planner.selected_rows().is_some()
-            || (self.stream.max_selected_rows.is_some() && self.stream.cohort_documents.is_some()) {
+        if planner.selected_rows().is_some() {
             return Err(CandidateError::Arguments);
         }
         match self.selected_rows()? {

@@ -54,7 +54,7 @@ fn packed_source_finalizers_reject_work_drift_impossible_counts_and_late_semanti
 }
 
 #[test]
-fn packed_source_execution_does_not_accept_selected_rows_or_repair_identity_drift() {
+fn packed_source_execution_never_reinterprets_selected_rows_as_full_head_or_repairs_identity() {
     use crate::native_engine::{constrained_int4::sparse::Int4JsonSparseLimits, lmhead::NANBEIGE_VOCAB_SIZE};
     let planner = planner();
     let fixtures = vec![(ner("Alice"), "Alice", "[]")];
@@ -65,4 +65,38 @@ fn packed_source_execution_does_not_accept_selected_rows_or_repair_identity_drif
     let mut wrong = plans[0].execution_identity().clone(); wrong.prompt_digest = Sha256Digest::of_bytes(b"foreign source");
     requests[0].admitted_identity = &wrong;
     assert!(finish_scheduled(&requests, packed_raw(&plans, &fixtures), 8 << 20, Some(limits())).is_err());
+}
+
+#[test]
+fn packed_selected_source_cohorts_keep_caps_results_and_chunk_counts_independent() {
+    use crate::native_engine::{constrained_int4::sparse::Int4JsonSparseLimits, lmhead::NANBEIGE_VOCAB_SIZE};
+    let planner = planner(); let fixtures = fixtures();
+    let plans: Vec<_> = fixtures.iter().zip([7, 33, 65, NANBEIGE_VOCAB_SIZE])
+        .map(|((request, _, _), max_rows_per_step)| prepare(&planner, request)
+            .with_selected_rows(Int4JsonSparseLimits { max_rows_per_step }).unwrap()).collect();
+    let requests = requests(&plans);
+    let ordinary = finish(&requests, selected_raw(&plans, &fixtures), 8 << 20).unwrap();
+    let mut raw = selected_raw(&plans, &fixtures);
+    raw.execution = INT4_EXTRACT_SELECTED_PACKED_COHORT_EXECUTION.to_owned();
+    raw.group_steps = raw.model_work.forward_positions.div_ceil(limits().max_batch_rows as u64).max(2);
+    assert!(raw.projection_groups > raw.group_steps);
+    assert!(finish(&requests, raw.clone(), 8 << 20).is_err());
+    let packed = finish_scheduled(&requests, raw.clone(), 8 << 20, Some(limits())).unwrap();
+    assert_eq!(packed.execution, INT4_SOURCE_SELECTED_PACKED_COHORT_EXECUTION);
+    assert_eq!(packed.sequences, ordinary.sequences);
+    assert_eq!(packed.planned_work, ordinary.planned_work);
+    assert_eq!(packed.model_work, ordinary.model_work);
+    assert_eq!(packed.projection_groups, ordinary.projection_groups);
+    for axis in 0..4 {
+        let mut changed = raw.clone();
+        match axis { 0 => changed.group_steps = 1,
+            1 => changed.group_steps = changed.model_work.forward_positions + 1,
+            2 => changed.execution = INT4_EXTRACT_PACKED_COHORT_EXECUTION.to_owned(),
+            _ => changed.projection_groups = 0 }
+        assert!(finish_scheduled(&requests, changed, 8 << 20, Some(limits())).is_err(), "axis {axis}");
+    }
+    let mut wrong = plans[3].execution_identity().clone();
+    wrong.schema_digest = Sha256Digest::of_bytes(b"another independently sealed schema");
+    let mut requests = requests; requests[3].admitted_identity = &wrong;
+    assert!(finish_scheduled(&requests, raw, 8 << 20, Some(limits())).is_err());
 }

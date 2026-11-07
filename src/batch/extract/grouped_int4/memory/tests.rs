@@ -236,3 +236,35 @@ fn packed_cap_and_extra_scratch_refuse_before_any_native_allocation() {
     rejected(limits.requirements_packed(WIDTH, work(70), transport(),
         Int4PrefillLimits { max_batch_rows: 1, max_extra_scratch_bytes: u64::MAX }));
 }
+
+#[test]
+fn selected_projection_quotes_full_token_storage_and_packed_scratch_once_per_window() {
+    for documents in [1, 3, 64] {
+        let mut limits = limits(); limits.max_documents = documents;
+        let dense = limits.requirements(WIDTH, work(70), transport()).unwrap();
+        for max_rows_per_step in [1, 7, NANBEIGE_VOCAB_SIZE] {
+            let selected = Int4JsonSparseLimits { max_rows_per_step };
+            let mut work = work(70);
+            work.max_model_work = Int4Work::for_sequence(WIDTH, 0, 256, 70 * max_rows_per_step).unwrap();
+            let base = limits.requirements_for_execution(WIDTH, work, transport(), Some(selected), None).unwrap();
+            assert_eq!(base, dense); // A smaller projection never shrinks token, EOS or result storage.
+            for rows in [1, 2, 64] {
+                let extra = Int4PrefillLimits::required_extra_scratch_bytes(rows).unwrap();
+                let mut packed = limits.requirements_for_execution(WIDTH, work, transport(), Some(selected),
+                    Some(Int4PrefillLimits { max_batch_rows: rows, max_extra_scratch_bytes: u64::MAX })).unwrap();
+                assert_eq!(packed.workspace_bytes, base.workspace_bytes + extra);
+                packed.workspace_bytes = base.workspace_bytes;
+                assert_eq!(packed, base);
+            }
+            work.max_model_work.projected_logits += max_rows_per_step as u64 - 1;
+            assert_eq!(limits.requirements_for_execution(WIDTH, work, transport(), Some(selected), None).unwrap(), base);
+        }
+    }
+    for max_rows_per_step in [0, NANBEIGE_VOCAB_SIZE + 1, usize::MAX] {
+        rejected(limits().requirements_for_execution(WIDTH, work(70), transport(),
+            Some(Int4JsonSparseLimits { max_rows_per_step }), None));
+    }
+    let mut work = work(70); work.max_model_work.projected_logits = 6;
+    rejected(limits().requirements_for_execution(WIDTH, work, transport(),
+        Some(Int4JsonSparseLimits { max_rows_per_step: 7 }), None));
+}

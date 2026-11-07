@@ -65,8 +65,10 @@ The last input record need not end with a newline.
 Each document retains an independent prompt, grammar/source language, EOS,
 causal KV, and original task budget. Grouping does not widen a document's
 `TaskBudget` or change its TaskIR identity. Full-vocabulary greedy token
-selection remains the same: this option introduces no sparse projection,
-sampling or repair retry.
+selection remains the default. The separate `--max-selected-rows` option
+explicitly selects complete grammar-legal row projection for every document;
+grouping alone does not change projection policy. There is no sampling or
+repair retry.
 
 ## Packed prompt and feedback passes
 
@@ -104,8 +106,9 @@ request. Hosted guards retain the extra scratch reservation through physical
 completion, cancellation cleanup and output delivery.
 
 Omitting `--prefill-rows` keeps the existing cohort execution. Omitting both
-flags keeps serial execution. Serial streams and selected-row streams cannot
-combine with this option. Chunk maps, hierarchical synthesis, durable jobs and
+flags keeps serial execution. `--prefill-rows` requires a document cohort and
+composes with `--max-selected-rows` on all five routes. Chunk maps,
+hierarchical synthesis, durable jobs and
 scoring cohorts keep their separate scheduling capabilities. This extension
 does not enable packed prefill on those routes.
 
@@ -133,17 +136,66 @@ Embedders use `NlpEngine::batch_int4_extract_cohorts_packed` or
 the kernel argument. The existing methods continue to select their original
 schedule. Lower-level users have `NativeInt4ExtractionCohortBatch::new_packed`
 and `NativeInt4SourceCohortBatch::new_packed`; their memory ownership must cover
-the shared `Int4ExtractionCohortMemoryLimits::requirements_packed` quote
-(also exported as `Int4SourceCohortMemoryLimits`).
+the shared `Int4ExtractionCohortMemoryLimits::requirements_for_execution`
+quote with the fixed projection policy and packed limits (also exported as
+`Int4SourceCohortMemoryLimits`). The original `requirements` and
+`requirements_packed` helpers retain their full-vocabulary interpretation.
 
 Pure quotation and CLI fixtures cover caps 1, 2 and 64, cap/window independence,
 invalid caps, underfunded scratch and process memory, arithmetic overflow,
-selected-row refusal and programmatic policy drift. The controller-only
+selected-row composition and programmatic policy drift. The controller-only
 complete-stream model fixtures also compare ordinary and packed schedules at
 caps 1, 2 and 64 over unequal prompts, malformed input, explicit flush, reused
 IDs and a partial EOF window. They compare complete task results and work,
 removing only declared scheduling metadata. These fixtures are provided for
 the admitted validation lane; they have not been executed in this session.
+
+## Selected-row projection within document cohorts
+
+All five batch routes accept `--max-selected-rows R --cohort-documents N`,
+with optional `--prefill-rows P`. R is 1 through 166144 and bounds the complete
+legal token set for one selection of one document, including accepted EOS.
+N bounds independent documents and P bounds token positions per forward pass.
+For example, append `--max-selected-rows 4096` to either command above. This
+ceiling may refuse a wide schema or prose state; it never prunes legal tokens,
+widens task authority or falls back to a dense head.
+
+The scheduler shares decoder passes while retaining independent per-document
+masks, prompt state and greedy selections. Selected scoring holds one complete
+legal mask and projects each legal row in ascending-ID blocks of at most 32.
+A document's cap is checked before its first head chunk. EOS remains scored;
+single legal tokens still pass through ordinary causal feedback. Original
+schema, source, citation and task finalizers remain inside the owned session,
+and every row must finalize before successful window delivery.
+
+The stream's immutable compiler seals one projection cap before admission.
+Finite prepared-plan cohort callers may use different sealed caps for different
+rows, but cannot mix full-vocabulary and selected strategies in one window.
+The per-row identities and result markers match the existing selected serial
+route. Outer extraction markers distinguish
+`grouped-int4-schema-source-extraction-selected-cohort-v1` and
+`grouped-int4-schema-source-extraction-selected-packed-cohort-v1`; source-task
+markers distinguish `grouped-int4-source-portfolio-selected-cohort-v1` and
+`grouped-int4-source-portfolio-selected-packed-cohort-v1`.
+
+Selected `projection_groups` counts actual bounded head-chunk invocations,
+which can exceed `group_steps`. Forward scheduling, total selections, chunk
+counts and all five work axes are checked independently. The NDJSON provenance
+retains `cohort_schedule` and adds the existing `max_selected_rows` declaration;
+these fields do not expose per-document identities or claim observed speed.
+
+The shared quote derives maximum output-token storage from planned projected
+rows divided by the sealed cap, including EOS. Dividing by vocabulary size
+would underreserve selected results. Native head workspace remains funded;
+the implementation needs no cap-sized score array for each document. Packed
+scratch is charged once per window, and complete native KV, preparation,
+lookahead, transport, output and finalizer reservations remain in place. See
+[the selected-row guide](int4-selected-rows.md) for the complete contract.
+
+Regression definitions cover independent caps and identities, original source
+finalizers, selected chunk counts, mixed-strategy refusal, exact memory
+boundaries and all five CLI routes. Compilation, test execution, native model
+parity and performance qualification remain **UNRUN** for this extension.
 
 ## Memory, work, and delivery
 

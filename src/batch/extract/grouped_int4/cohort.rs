@@ -8,7 +8,8 @@ use crate::{batch::grouped::{GroupedBatchProcessor, GroupedOutput, GroupedReques
             cohort::{Int4CohortEngine, MAX_INT4_SEQUENCES}, prefill::Int4PrefillLimits}},
     tasks::extract::grouped_int4::{Int4ExtractRun, cohort::{self as extraction,
         Int4ExtractCohortRequest, Int4ExtractCohortBudget, INT4_EXTRACT_COHORT_EXECUTION,
-        INT4_EXTRACT_PACKED_COHORT_EXECUTION}}};
+        INT4_EXTRACT_PACKED_COHORT_EXECUTION, INT4_EXTRACT_SELECTED_COHORT_EXECUTION,
+        INT4_EXTRACT_SELECTED_PACKED_COHORT_EXECUTION}}};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Int4ExtractionCohortBatchLimits {
@@ -75,7 +76,6 @@ impl<'w, 'v, A: Int4ExtractionBatchAdmission> NativeInt4ExtractionCohortBatch<'w
     pub fn new(compiler: Int4ExtractionBatchPlanner, weights: &'w Int4ModelWeights,
         vocabulary: &'v ExtractionVocabulary, admission: A, work: Int4ExtractionBatchLimits,
         limits: Int4ExtractionCohortBatchLimits, kernel: PackedInt4Kernel) -> Result<Self, BatchFault> {
-        compiler.require_full_projection()?;
         work.validate()?; limits.validate(compiler.group_width())?;
         crate::native_engine::constrained_int4::check_model(compiler.base_execution_identity(), weights.identity())
             .map_err(|_| BatchCode::Admission)?;
@@ -152,11 +152,16 @@ impl<'w, 'v, A: Int4ExtractionBatchAdmission> NativeInt4ExtractionCohortBatch<'w
                 max_mask_node_visits: mask_visits, max_result_bytes: self.limits.max_result_bytes },
             max_result_bytes: self.limits.max_result_bytes,
         };
-        let (raw, execution) = match self.prefill {
-            Some(prefill) => (extraction::execute_packed(&mut engine, &rows, self.vocabulary, budget,
-                prefill, control), INT4_EXTRACT_PACKED_COHORT_EXECUTION),
-            None => (extraction::execute(&mut engine, &rows, self.vocabulary, budget, control),
-                INT4_EXTRACT_COHORT_EXECUTION),
+        let raw = match self.prefill {
+            Some(prefill) => extraction::execute_packed(&mut engine, &rows, self.vocabulary, budget,
+                prefill, control),
+            None => extraction::execute(&mut engine, &rows, self.vocabulary, budget, control),
+        };
+        let execution = match (self.compiler.selected_rows().is_some(), self.prefill.is_some()) {
+            (false, false) => INT4_EXTRACT_COHORT_EXECUTION,
+            (false, true) => INT4_EXTRACT_PACKED_COHORT_EXECUTION,
+            (true, false) => INT4_EXTRACT_SELECTED_COHORT_EXECUTION,
+            (true, true) => INT4_EXTRACT_SELECTED_PACKED_COHORT_EXECUTION,
         };
         let raw = raw.map_err(|error| native::execution_failure(error).fault)?;
         engine.check_idle().map_err(native_error)?; drop(engine);

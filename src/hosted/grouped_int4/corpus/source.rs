@@ -20,7 +20,7 @@ pub struct Int4SourceCorpusConfig {
     pub planning: SourcePlanningLimits,
     pub defaults: Option<SourceBatchArgs>,
     pub native_work: Int4SourceBatchLimits,
-    /// Fixed all-legal-row ceiling for the serial stream only. The compiler
+    /// Fixed all-legal-row ceiling for the serial or cohort stream. The compiler
     /// seals it into each actual source task before admission; rows cannot
     /// override it. None retains the full-vocabulary execution contract.
     pub selected_rows: Option<Int4JsonSparseLimits>,
@@ -49,12 +49,6 @@ impl Int4SourceCorpusConfig {
         }
         if allocated_kv == 0 || allocated_kv > self.task_ceiling.max_kv_bytes {
             return Err(HostedError::Limits("INT4 source corpus complete KV reservation"));
-        }
-        Ok(())
-    }
-    fn require_full_projection(&self) -> Result<(), HostedError> {
-        if self.selected_rows.is_some() {
-            return Err(HostedError::Limits("INT4 source cohorts require full-vocabulary projection"));
         }
         Ok(())
     }
@@ -170,7 +164,6 @@ impl NlpEngine {
         reader: R, writer: W, cancellation: CancellationToken)
         -> Result<Int4SourceCohortBatchResult, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
-        config.require_full_projection()?;
         dispatch::preflight(self, limits.native.run)?;
         if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
         let width = model.model_identity().group_width();
@@ -180,10 +173,8 @@ impl NlpEngine {
             io_reserve_bytes: limits.io_reserve_bytes,
             allocator_reserve_bytes: limits.native.allocator_reserve_bytes,
         };
-        let required = match prefill {
-            Some(prefill) => memory.requirements_packed(width, config.native_work, limits.transport, prefill),
-            None => memory.requirements(width, config.native_work, limits.transport),
-        }.map_err(HostedError::BatchSetup)?;
+        let required = memory.requirements_for_execution(width, config.native_work, limits.transport,
+            config.selected_rows, prefill).map_err(HostedError::BatchSetup)?;
         // TaskBudget belongs to one document. The aggregate native allocation
         // must never be mistaken for authority to widen that document's KV.
         let row_kv = Int4MemoryRequirement::for_context(limits.native.context_tokens, width)
@@ -212,9 +203,14 @@ impl NlpEngine {
             let task_spec = config.identity.task_spec.clone();
             let compiler = Int4SourceBatchPlanner::new(&planner, config.identity, config.task_ceiling,
                 config.planning, config.defaults, width).map_err(HostedError::BatchSetup)?;
+            let compiler = match config.selected_rows {
+                Some(limits) => compiler.with_selected_rows(limits).map_err(HostedError::BatchSetup)?,
+                None => compiler,
+            };
             let admission = SourceCohortAdmission { lease: &lease, model: model.model_identity(),
                 context_limit: limits.native.context_tokens, masks: config.native_work.masks,
-                output_bytes: limits.transport.max_output_line_bytes as u64, task_spec: &task_spec };
+                output_bytes: limits.transport.max_output_line_bytes as u64, task_spec: &task_spec,
+                selected_rows: config.selected_rows };
             let mut processor = match prefill {
                 Some(prefill) => NativeInt4SourceCohortBatch::new_packed(compiler, &model.inner.loaded.value,
                     &vocabulary, admission, config.native_work, native, kernel, prefill),
@@ -247,6 +243,7 @@ struct SourceCohortAdmission<'a> {
     masks: ExtractionMaskBudget,
     output_bytes: u64,
     task_spec: &'a str,
+    selected_rows: Option<Int4JsonSparseLimits>,
 }
 impl Int4SourceBatchAdmission for SourceCohortAdmission<'_> {
     type Guard = Pending;
@@ -254,23 +251,22 @@ impl Int4SourceBatchAdmission for SourceCohortAdmission<'_> {
         -> Result<(ExecutionIdentity, Self::Guard), BatchItemFailure> {
         constrained_int4::check_model(request.identity, self.model)
             .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
-        check_source_cohort_request(self.model.group_width(), self.context_limit,
-            self.output_bytes, self.masks, &request, self.task_spec)?;
-        let tokens = request.model_work.projected_logits / NANBEIGE_VOCAB_SIZE as u64;
+        let tokens = check_source_cohort_request(self.model.group_width(), self.context_limit,
+            self.output_bytes, self.masks, &request, self.task_spec, self.selected_rows)?;
         let guard = output_claim(self.lease, request.max_result_bytes, tokens).map_err(admission_failure)?;
         Ok((request.identity.clone(), guard))
     }
 }
 fn check_source_cohort_request(width: usize, context_limit: usize, output_bytes: u64,
-    masks: ExtractionMaskBudget, request: &Int4SourceAdmission<'_>, task_spec: &str)
-    -> Result<(), BatchItemFailure> {
+    masks: ExtractionMaskBudget, request: &Int4SourceAdmission<'_>, task_spec: &str,
+    selected_rows: Option<Int4JsonSparseLimits>) -> Result<u64, BatchItemFailure> {
     let exact_kv = request.model_work.forward_positions.checked_mul(KV_BYTES_PER_TOKEN as u64)
         .ok_or_else(|| BatchItemFailure::fatal(BatchCode::Admission))?;
     if !matches!(task_spec, "ner-v1" | "keyphrases-v1" | "summarize-v1" | "answer-v1")
         || request.model_work.forward_positions > context_limit as u64 || request.kv_reservation_bytes != exact_kv {
         return Err(BatchItemFailure::fatal(BatchCode::Admission));
     }
-    check_request_for_task(width, exact_kv, output_bytes, masks, request, task_spec)
+    check_request_for_projection(width, exact_kv, output_bytes, masks, request, task_spec, selected_rows)
 }
 
 #[cfg(test)] mod tests;

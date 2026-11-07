@@ -42,10 +42,6 @@ fn every_source_stream_refuses_unbounded_or_unsupported_packing_before_io() {
         assert!(crate::candidate_cli::definition().try_get_matches_from([
             "candidate", "source-int4", name, "--source-dir", "source", "--source-manifest", "manifest",
             "--memory-mib", "8192", "--prefill-rows", "1"]).is_err());
-        assert!(crate::candidate_cli::definition().try_get_matches_from([
-            "candidate", "source-int4", name, "--source-dir", "source", "--source-manifest", "manifest",
-            "--memory-mib", "8192", "--cohort-documents", "3", "--prefill-rows", "1",
-            "--max-selected-rows", "7"]).is_err());
         for rows in [0, 65, usize::MAX] {
             let (batch, args) = arguments(name, &["--cohort-documents", "3", "--prefill-rows", &rows.to_string()]);
             assert_eq!(batch.execute_owned(args, NoRead, NoWrite), Err(CandidateError::Arguments));
@@ -53,7 +49,7 @@ fn every_source_stream_refuses_unbounded_or_unsupported_packing_before_io() {
         for selected in [None, Some(7)] {
             let (mut batch, args) = arguments(name, &["--cohort-documents", "3", "--prefill-rows", "2"]);
             batch.stream.max_selected_rows = selected;
-            if selected.is_none() { batch.stream.cohort_documents = None; }
+            batch.stream.cohort_documents = None;
             assert_eq!(batch.execute_owned(args, NoRead, NoWrite), Err(CandidateError::Arguments));
         }
     }

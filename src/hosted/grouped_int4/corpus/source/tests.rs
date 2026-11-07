@@ -188,20 +188,20 @@ fn source_cohort_admission_preserves_one_task_and_exact_row_kv_for_every_task_ki
         let task_spec = config.identity.task_spec.as_str();
         let mut request = request(&config);
         request.kv_reservation_bytes = request.model_work.forward_positions * KV_BYTES_PER_TOKEN as u64;
-        check_source_cohort_request(32, 4096, 65_536, masks(), &request, task_spec).unwrap();
+        check_source_cohort_request(32, 4096, 65_536, masks(), &request, task_spec, None).unwrap();
         for bytes in [0, request.kv_reservation_bytes - 1, config.task_ceiling.max_kv_bytes,
             3 * request.kv_reservation_bytes, u64::MAX] {
             let bad = Int4SourceAdmission { kv_reservation_bytes: bytes, ..request };
-            let error = check_source_cohort_request(32, 4096, 65_536, masks(), &bad, task_spec).unwrap_err();
+            let error = check_source_cohort_request(32, 4096, 65_536, masks(), &bad, task_spec, None).unwrap_err();
             assert!(error.stop); assert_eq!(error.fault.code, BatchCode::Admission);
         }
         let error = check_source_cohort_request(32, request.model_work.forward_positions as usize - 1,
-            65_536, masks(), &request, task_spec).unwrap_err();
+            65_536, masks(), &request, task_spec, None).unwrap_err();
         assert!(error.stop); assert_eq!(error.fault.code, BatchCode::Admission);
         let mut substituted = config.identity.clone(); substituted.task_spec = "extract-v1".to_owned();
         let bad = Int4SourceAdmission { identity: &substituted, ..request };
-        assert!(check_source_cohort_request(32, 4096, 65_536, masks(), &bad, task_spec).unwrap_err().stop);
-        assert!(check_source_cohort_request(32, 4096, 65_536, masks(), &bad, "extract-v1").unwrap_err().stop);
+        assert!(check_source_cohort_request(32, 4096, 65_536, masks(), &bad, task_spec, None).unwrap_err().stop);
+        assert!(check_source_cohort_request(32, 4096, 65_536, masks(), &bad, "extract-v1", None).unwrap_err().stop);
     }
 }
 
@@ -247,11 +247,11 @@ fn cohort_source_admission_rechecks_work_masks_and_output_before_native_executio
             _ => request.mask_limits.checkpoint_interval_nodes += 1,
         }
         assert!(check_source_cohort_request(32, 4096, 65_536, masks(), &request,
-            &config.identity.task_spec).unwrap_err().stop, "axis {axis}");
+            &config.identity.task_spec, None).unwrap_err().stop, "axis {axis}");
     }
     let request = make();
     let error = check_source_cohort_request(32, 4096, 65_535, masks(), &request,
-        &config.identity.task_spec).unwrap_err();
+        &config.identity.task_spec, None).unwrap_err();
     assert!(!error.stop); assert_eq!(error.fault.code, BatchCode::OutputLineLimit);
 }
 
@@ -274,8 +274,11 @@ fn all_source_tasks_reserve_exact_output_tokens_from_the_fixed_selected_row_cap(
                     assert!(check_request_for_task(width, config.task_ceiling.max_kv_bytes, 65_536,
                         masks(), &request, &config.identity.task_spec).is_err());
                 }
-                // Cohorts refuse even an arithmetically dense selected policy.
-                assert!(config.require_full_projection().is_err());
+                let request = Int4SourceAdmission {
+                    kv_reservation_bytes: request.model_work.forward_positions * KV_BYTES_PER_TOKEN as u64,
+                    ..request };
+                assert_eq!(check_source_cohort_request(width, 4096, 65_536, masks(), &request,
+                    &config.identity.task_spec, config.selected_rows).unwrap(), 4);
             }
         }
     }

@@ -8,7 +8,8 @@ use crate::{batch::grouped::{GroupedBatchProcessor, GroupedOutput, GroupedReques
         strict_int4::{Int4MemoryBudget, Int4ModelWeights, cohort::Int4CohortEngine, prefill::Int4PrefillLimits}},
     tasks::{extract::grouped_int4::cohort::Int4ExtractCohortBudget,
         source_planning::grouped_int4::cohort::{self as source_group,
-            Int4SourceCohortRequest, INT4_SOURCE_COHORT_EXECUTION, INT4_SOURCE_PACKED_COHORT_EXECUTION}}};
+            Int4SourceCohortRequest, INT4_SOURCE_COHORT_EXECUTION, INT4_SOURCE_PACKED_COHORT_EXECUTION,
+            INT4_SOURCE_SELECTED_COHORT_EXECUTION, INT4_SOURCE_SELECTED_PACKED_COHORT_EXECUTION}}};
 
 /// A prepared source task sealed to the actual processor that admitted it.
 /// Wire records cannot replace its prompt, source, finalizer or model identity.
@@ -38,7 +39,6 @@ impl<'p, 'w, 'v, A: Int4SourceBatchAdmission> NativeInt4SourceCohortBatch<'p, 'w
     pub fn new(compiler: Int4SourceBatchPlanner<'p>, weights: &'w Int4ModelWeights,
         vocabulary: &'v ExtractionVocabulary, admission: A, work: Int4SourceBatchLimits,
         limits: Int4SourceCohortBatchLimits, kernel: PackedInt4Kernel) -> Result<Self, BatchFault> {
-        compiler.require_full_projection()?;
         work.validate()?; limits.validate(compiler.group_width())?;
         constrained_int4::check_model(compiler.base_execution_identity(), weights.identity())
             .map_err(|_| BatchCode::Admission)?;
@@ -115,11 +115,16 @@ impl<'p, 'w, 'v, A: Int4SourceBatchAdmission> NativeInt4SourceCohortBatch<'p, 'w
                 max_mask_node_visits: mask_visits, max_result_bytes: self.limits.max_result_bytes },
             max_result_bytes: self.limits.max_result_bytes,
         };
-        let (raw, execution) = match self.prefill {
-            Some(prefill) => (source_group::execute_packed(&mut engine, &rows, self.vocabulary, budget,
-                prefill, control), INT4_SOURCE_PACKED_COHORT_EXECUTION),
-            None => (source_group::execute(&mut engine, &rows, self.vocabulary, budget, control),
-                INT4_SOURCE_COHORT_EXECUTION),
+        let raw = match self.prefill {
+            Some(prefill) => source_group::execute_packed(&mut engine, &rows, self.vocabulary, budget,
+                prefill, control),
+            None => source_group::execute(&mut engine, &rows, self.vocabulary, budget, control),
+        };
+        let execution = match (self.compiler.selected_rows().is_some(), self.prefill.is_some()) {
+            (false, false) => INT4_SOURCE_COHORT_EXECUTION,
+            (false, true) => INT4_SOURCE_PACKED_COHORT_EXECUTION,
+            (true, false) => INT4_SOURCE_SELECTED_COHORT_EXECUTION,
+            (true, true) => INT4_SOURCE_SELECTED_PACKED_COHORT_EXECUTION,
         };
         let raw = raw.map_err(|error| execution_failure(error).fault)?;
         engine.check_idle().map_err(native_error)?; drop(engine);

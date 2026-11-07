@@ -64,7 +64,7 @@ fn every_source_task_preflights_identity_and_work_without_allocating_an_engine()
 }
 
 #[test]
-fn selected_source_plans_cannot_enter_full_head_cohorts_even_at_full_row_cap() {
+fn selected_source_plans_preflight_without_becoming_full_head_even_at_full_row_cap() {
     use crate::native_engine::{constrained_int4::sparse::Int4JsonSparseLimits, lmhead::NANBEIGE_VOCAB_SIZE};
     let planner = planner(); let vocabulary = ExtractionVocabulary::pinned(&planner.controls).unwrap();
     for cap in [7, NANBEIGE_VOCAB_SIZE] {
@@ -72,11 +72,78 @@ fn selected_source_plans_cannot_enter_full_head_cohorts_even_at_full_row_cap() {
         let plans = vec![prepare(&planner, &fixtures[0].0)
             .with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: cap }).unwrap()];
         let requests = requests(&plans);
-        assert!(preflight(&requests[0], &vocabulary).is_err());
+        preflight(&requests[0], &vocabulary).unwrap();
         let mut output = raw(&plans, &fixtures);
         output.sequences[0].execution = plans[0].extraction.execution_version().to_owned();
         assert!(finish(&requests, output, 8 << 20).is_err());
     }
+}
+
+fn selected_raw(plans: &[PreparedInt4SourceTask], fixtures: &[(SourceTaskRequest, &str, &str)]) -> Int4ExtractCohortRun {
+    let mut run = raw(plans, fixtures);
+    run.execution = INT4_EXTRACT_SELECTED_COHORT_EXECUTION.to_owned();
+    run.model_work = Int4Work::default();
+    run.projection_groups = 0;
+    for (plan, row) in plans.iter().zip(&mut run.sequences) {
+        let cap = plan.selected_rows().unwrap().max_rows_per_step;
+        // Synthetic completion: a full cap-sized selection, then scored EOS.
+        // These records exercise finalizers and accounting, not native parity.
+        let work = Int4Work::for_sequence(plan.group_width(), 0, plan.prompt_tokens() + 1, cap + 1).unwrap();
+        row.execution = plan.extraction.execution_version().to_owned();
+        row.model_work = work;
+        row.result.output.forward_positions = work.forward_positions;
+        row.result.output.projected_logits = work.projected_logits;
+        run.model_work = run.model_work.checked_add(work).unwrap();
+        run.projection_groups += cap.div_ceil(32) as u64 + 1;
+    }
+    run
+}
+
+#[test]
+fn selected_source_cohorts_preserve_independent_caps_and_every_semantic_finalizer() {
+    use crate::native_engine::{constrained_int4::sparse::Int4JsonSparseLimits, lmhead::NANBEIGE_VOCAB_SIZE};
+    let planner = planner(); let fixtures = fixtures();
+    let plans: Vec<_> = fixtures.iter().zip([7, 33, 65, NANBEIGE_VOCAB_SIZE])
+        .map(|((request, _, _), max_rows_per_step)| prepare(&planner, request)
+            .with_selected_rows(Int4JsonSparseLimits { max_rows_per_step }).unwrap()).collect();
+    let requests = requests(&plans);
+    let vocabulary = ExtractionVocabulary::pinned(&planner.controls).unwrap();
+    for request in &requests { preflight(request, &vocabulary).unwrap(); }
+    let raw = selected_raw(&plans, &fixtures);
+    let expected: Vec<_> = plans.iter().zip(&raw.sequences)
+        .map(|(plan, row)| plan.finish(row.clone()).unwrap()).collect();
+    let output = finish(&requests, raw, 8 << 20).unwrap();
+    assert_eq!(output.execution, INT4_SOURCE_SELECTED_COHORT_EXECUTION);
+    assert_eq!(output.sequences, expected);
+    assert!(output.projection_groups > output.group_steps);
+    for (plan, row) in plans.iter().zip(&output.sequences) {
+        assert_eq!(row.execution, plan.execution_version());
+        plan.verify_identity(plan.execution_identity()).unwrap();
+    }
+    let cap = canonjson::canonical_bytes(&output).unwrap().len() as u64;
+    assert!(finish(&requests, selected_raw(&plans, &fixtures), cap).is_ok());
+    assert!(finish(&requests, selected_raw(&plans, &fixtures), cap - 1).is_err());
+    for axis in 0..5 {
+        let mut raw = selected_raw(&plans, &fixtures);
+        match axis { 0 => raw.projection_groups = 0,
+            1 => raw.projection_groups = raw.model_work.projected_logits + 1,
+            2 => raw.model_work.projected_logits += 1,
+            3 => raw.execution = INT4_EXTRACT_COHORT_EXECUTION.to_owned(),
+            _ => raw.sequences.swap(0, 1) }
+        assert!(finish(&requests, raw, 8 << 20).is_err(), "axis {axis}");
+    }
+    let mut bad = fixtures.clone(); bad[2].2 = r#"[{"citations":[],"text":"A claim."}]"#;
+    assert!(finish(&requests, selected_raw(&plans, &bad), 8 << 20).is_err());
+}
+
+#[test]
+fn mixed_projection_strategies_cannot_share_a_source_cohort() {
+    use crate::native_engine::constrained_int4::sparse::Int4JsonSparseLimits;
+    let planner = planner(); let fixtures = fixtures();
+    let plans = vec![prepare(&planner, &fixtures[0].0), prepare(&planner, &fixtures[1].0)
+        .with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: 7 }).unwrap()];
+    assert!(selected_projection(&requests(&plans)).is_err());
+    assert!(finish(&requests(&plans), raw(&plans, &fixtures[..2]), 8 << 20).is_err());
 }
 
 #[test]

@@ -62,6 +62,37 @@ fn all_source_kinds_keep_serial_task_identity_and_exact_per_document_kv() {
 }
 
 #[test]
+fn all_selected_source_cohorts_keep_serial_identity_and_independent_nonrenewable_work() {
+    let planner = planner(); let vocabulary = vocabulary();
+    for kind in [BuiltInTask::Ner, BuiltInTask::Keyphrases, BuiltInTask::Summarize, BuiltInTask::Answer] {
+        for max_rows_per_step in [7, NANBEIGE_VOCAB_SIZE] {
+            let compiler = compiler(&planner, kind)
+                .with_selected_rows(Int4JsonSparseLimits { max_rows_per_step }).unwrap();
+            let serial = compiler.prepare_with_control(document(), &mut Continue).unwrap();
+            let mut account = Account::default();
+            let prepared = prepare_document(&compiler, document(), &vocabulary, limits(), work_limits(),
+                &mut account, &mut Continue).unwrap();
+            prepared.verify_identity(serial.execution_identity()).unwrap();
+            assert_eq!(prepared.selected_rows(), compiler.selected_rows());
+            assert_eq!(prepared.task_budget(), serial.task_budget());
+            assert_eq!(prepared.planned_work(), serial.planned_work());
+            assert_eq!(prepared.planned_work().projected_logits,
+                u64::from(prepared.task_budget().max_output_tokens) * max_rows_per_step as u64);
+            let (context, kv) = price_plan(&prepared, limits()).unwrap();
+            assert_eq!(kv, context as u64 * KV_BYTES_PER_TOKEN as u64);
+            assert_eq!(account.work, prepared.planned_work());
+            assert_eq!(account.masks, work_limits().masks.max_visits_per_item);
+            let mut exhausted = work_limits(); exhausted.max_model_work = account.work;
+            let before = account;
+            let error = prepare_document(&compiler, document(), &vocabulary, limits(), exhausted,
+                &mut account, &mut Continue).err().unwrap();
+            assert!(!error.stop); assert_eq!(error.fault.code, BatchCode::WorkLimit);
+            assert_eq!(account, before);
+        }
+    }
+}
+
+#[test]
 fn per_record_options_and_passages_stay_in_each_original_source_identity() {
     let planner = planner(); let vocabulary = vocabulary();
     for kind in [BuiltInTask::Keyphrases, BuiltInTask::Answer] {

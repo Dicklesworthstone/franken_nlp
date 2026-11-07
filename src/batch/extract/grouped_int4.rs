@@ -86,10 +86,10 @@ impl Int4ExtractionBatchPlanner {
     pub fn base_execution_identity(&self) -> &ExecutionIdentity { &self.compiler.identity }
     pub fn group_width(&self) -> usize { self.group_width }
 
-    /// Fix the complete legal-row projection strategy for this serial stream.
+    /// Fix the complete legal-row projection strategy for this ordered stream.
     /// Each actual schema/source plan binds this exact cap before admission;
-    /// item arguments cannot replace it. Native cohorts, document maps and
-    /// durable jobs retain their full-vocabulary contracts.
+    /// item arguments cannot replace it. Serial and cohort streams share this
+    /// policy; document maps and durable jobs retain full-vocabulary contracts.
     pub fn with_selected_rows(mut self, limits: Int4JsonSparseLimits) -> Result<Self, BatchFault> {
         limits.validate().map_err(|_| BatchCode::InvalidLimits)?;
         if self.selected_rows.is_some() { return Err(BatchCode::InvalidLimits.into()); }

@@ -38,7 +38,7 @@ fn different_document_contexts_keep_exact_independent_kv_and_dense_work() {
         let identity = identity(width);
         for prompt in [8, 21] {
             let request = request(&identity, width, prompt);
-            check_cohort_request(width, 32, 8192, masks(), &request).unwrap();
+            assert_eq!(check_cohort_request(width, 32, 8192, masks(), &request, None).unwrap(), 4);
             assert_eq!(request.kv_reservation_bytes, (prompt + 3) as u64 * KV_BYTES_PER_TOKEN as u64);
         }
     }
@@ -49,10 +49,10 @@ fn neither_neighbor_contexts_nor_a_serial_reusable_cache_can_replace_the_exact_r
     for bytes in [0, original.kv_reservation_bytes - 1, 32 * KV_BYTES_PER_TOKEN as u64,
         2 * original.kv_reservation_bytes, u64::MAX] {
         let mut request = request(&identity, 128, 8); request.kv_reservation_bytes = bytes;
-        let error = check_cohort_request(128, 32, 8192, masks(), &request).unwrap_err();
+        let error = check_cohort_request(128, 32, 8192, masks(), &request, None).unwrap_err();
         assert!(error.stop); assert_eq!(error.fault.code, BatchCode::Admission);
     }
-    assert!(check_cohort_request(128, 10, 8192, masks(), &original).is_err());
+    assert!(check_cohort_request(128, 10, 8192, masks(), &original, None).is_err());
 }
 #[test]
 fn changing_any_native_work_axis_or_mask_identity_is_a_fatal_admission_mismatch() {
@@ -69,12 +69,31 @@ fn changing_any_native_work_axis_or_mask_identity_is_a_fatal_admission_mismatch(
             6 => request.mask_limits.max_trie_node_visits += 1,
             _ => request.mask_limits.checkpoint_interval_nodes += 1,
         }
-        assert!(check_cohort_request(128, 32, 8192, masks(), &request).unwrap_err().stop, "axis {axis}");
+        assert!(check_cohort_request(128, 32, 8192, masks(), &request, None).unwrap_err().stop, "axis {axis}");
     }
 }
 #[test]
 fn complete_output_bounds_remain_typed_document_rejections() {
     let identity = identity(128); let request = request(&identity, 128, 8);
-    let error = check_cohort_request(128, 32, 8191, masks(), &request).unwrap_err();
+    let error = check_cohort_request(128, 32, 8191, masks(), &request, None).unwrap_err();
     assert!(!error.stop); assert_eq!(error.fault.code, BatchCode::OutputLineLimit);
+}
+
+#[test]
+fn selected_host_admission_prices_all_output_tokens_and_scored_eos_from_the_sealed_cap() {
+    for width in [1, 32, 127, MAX_MODEL_K] {
+        let identity = identity(width);
+        for cap in [1, 7, NANBEIGE_VOCAB_SIZE] {
+            let policy = Int4JsonSparseLimits { max_rows_per_step: cap };
+            let mut request = request(&identity, width, 8);
+            request.model_work = constrained_int4::sparse::planned_work(width, 8, 4, policy).unwrap();
+            assert_eq!(check_cohort_request(width, 32, 8192, masks(), &request, Some(policy)).unwrap(), 4);
+            if cap < NANBEIGE_VOCAB_SIZE {
+                assert!(check_cohort_request(width, 32, 8192, masks(), &request, None).is_err());
+            }
+            request.kv_reservation_bytes += KV_BYTES_PER_TOKEN as u64;
+            assert_eq!(check_cohort_request(width, 32, 8192, masks(), &request, Some(policy))
+                .unwrap_err().fault.code, BatchCode::Admission);
+        }
+    }
 }

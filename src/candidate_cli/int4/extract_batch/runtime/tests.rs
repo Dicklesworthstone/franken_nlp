@@ -75,11 +75,12 @@ fn extraction_stream_provenance_preserves_exact_inner_json_and_snapshot_identity
 }
 
 #[test]
-fn owned_stream_rechecks_the_serial_selected_policy_before_any_io() {
+fn owned_stream_rechecks_the_selected_cap_before_any_io() {
     let Int4Command { task: Int4Task::ExtractBatch(mut batch), args, batch: None, job: None } =
         command(&["--max-selected-rows", "7"]) else { panic!("wrong task"); };
     let quoted = batch.validate(&args).unwrap();
     batch.stream.cohort_documents = Some(1);
+    batch.stream.max_selected_rows = Some(0);
     assert_eq!(execute(args, batch, quoted, NoIo, NoIo), Err(CandidateError::Arguments));
 }
 

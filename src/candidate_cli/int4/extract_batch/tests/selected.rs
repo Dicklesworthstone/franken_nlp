@@ -39,22 +39,57 @@ fn explicit_stream_rows_price_all_outputs_without_weakening_task_memory_or_masks
 }
 
 #[test]
-fn invalid_rows_and_serial_incompatible_options_refuse_before_private_io() {
+fn invalid_rows_and_packing_without_a_cohort_refuse_before_private_io() {
     for cap in [0, NANBEIGE_VOCAB_SIZE + 1, usize::MAX] {
         let count = cap.to_string(); let (batch, args) = arguments(&["--max-selected-rows", &count]);
         assert_eq!(batch.execute_owned(args, NoRead, NoWrite), Err(CandidateError::Arguments));
     }
-    let command = definition().try_get_matches_from(["extract-batch", "--source-dir", "source",
-        "--source-manifest", "manifest", "--memory-mib", "8192", "--schema", "schema.json",
-        "--max-selected-rows", "7", "--cohort-documents", "1"]);
-    assert!(command.is_err());
     let (mut batch, args) = arguments(&["--max-selected-rows", "7"]);
-    batch.stream.cohort_documents = Some(1);
+    batch.stream.cohort_documents = Some(0);
     assert_eq!(batch.execute_owned(args, NoRead, NoWrite), Err(CandidateError::Arguments));
     let command = definition().try_get_matches_from(["extract-batch", "--source-dir", "source",
         "--source-manifest", "manifest", "--memory-mib", "8192", "--schema", "schema.json",
         "--max-selected-rows", "7", "--prefill-rows", "1"]);
     assert!(command.is_err());
+}
+
+#[test]
+fn selected_extraction_cohorts_and_packed_prefill_preserve_each_task_and_complete_memory_quote() {
+    for documents in [1, 3, 64] {
+        for rows in [None, Some(1), Some(64)] {
+            let documents = documents.to_string();
+            let packed = rows.map(|rows| rows.to_string());
+            let mut flags = vec!["--cohort-documents", documents.as_str(), "--max-requests", "8",
+                "--max-result-bytes", "65536"];
+            if let Some(rows) = &packed { flags.extend(["--prefill-rows", rows.as_str()]); }
+            let (dense, mut dense_args) = arguments(&flags); dense_args.memory_mib = 262_144;
+            let reference = dense.validate(&dense_args).unwrap();
+            for cap in [1, 7, NANBEIGE_VOCAB_SIZE] {
+                let cap_string = cap.to_string(); let mut flags = flags.clone();
+                flags.extend(["--max-selected-rows", &cap_string]);
+                let (selected, mut args) = arguments(&flags); args.memory_mib = 262_144;
+                let admitted = selected.validate(&args).unwrap();
+                assert_eq!(admitted.selected_rows.unwrap().max_rows_per_step, cap);
+                assert_eq!(admitted.common.native, reference.common.native);
+                assert_eq!(admitted.common.minimum_memory_bytes, reference.common.minimum_memory_bytes);
+                assert_eq!(selected.extraction.budget(&args, admitted.common),
+                    dense.extraction.budget(&dense_args, reference.common));
+                assert_eq!(admitted.native.max_model_work.projected_logits, 8 * args.max_new_tokens as u64 * cap as u64);
+                assert_eq!(admitted.native.max_model_work.attention_pairs, reference.native.max_model_work.attention_pairs);
+                assert_eq!(admitted.native.masks.max_visits_per_run, reference.native.masks.max_visits_per_run);
+                let memory = Int4ExtractionCohortMemoryLimits { max_documents: admitted.cohort_documents.unwrap(),
+                    context_tokens: args.context_tokens, preparation_reserve_bytes: admitted.preparation_reserve_bytes,
+                    io_reserve_bytes: admitted.io_bytes, allocator_reserve_bytes: ALLOCATOR_BYTES };
+                let quote = memory.requirements_for_execution(args.group_width, admitted.native, admitted.transport,
+                    admitted.selected_rows, admitted.common.prefill).unwrap();
+                let execution = quote.native.kv_bytes + quote.workspace_bytes + quote.input_bytes + quote.output_reservation_bytes;
+                assert_eq!(admitted.common.minimum_memory_bytes, grouped_memory_floor(&args, admitted.common, execution).unwrap());
+                args.memory_mib = admitted.common.minimum_memory_bytes.div_ceil(MIB);
+                selected.validate(&args).unwrap(); args.memory_mib -= 1;
+                assert_eq!(selected.execute_owned(args, NoRead, NoWrite), Err(CandidateError::Arguments));
+            }
+        }
+    }
 }
 
 #[test]
@@ -125,6 +160,12 @@ fn shared_cli_factory_seals_each_document_before_host_admission() {
         sparse.verify_identity(sparse.execution_identity()).unwrap();
         assert!(dense.configure_planner(changed).is_err());
         assert!(selected.configure_planner(selected.configure_planner(compiler(&selected, &args)).unwrap()).is_err());
+        let mut grouped = selected.clone(); grouped.stream.cohort_documents = Some(3);
+        let mut grouped_args = args.clone(); grouped_args.memory_mib = 262_144;
+        let cohort = grouped.configure_planner(compiler(&grouped, &grouped_args)).unwrap();
+        let cohort = prepare(&cohort);
+        cohort.verify_identity(sparse.execution_identity()).unwrap();
+        assert_eq!(cohort.planned_work(), sparse.planned_work());
     }
 }
 

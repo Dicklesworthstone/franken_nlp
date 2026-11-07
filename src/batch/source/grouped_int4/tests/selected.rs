@@ -28,7 +28,7 @@ fn all_four_serial_tasks_seal_the_same_selected_policy_as_direct_source_plans() 
         assert_eq!(plan.planned_work(), direct.planned_work());
         assert_eq!(plan.planned_work().projected_logits, 7 * u64::from(budget().max_output_tokens));
         assert!(plan.require_full_projection().is_err());
-        assert!(selected.require_full_projection().is_err());
+        assert_eq!(selected.selected_rows(), Some(rows(7)));
     }
 }
 
@@ -42,9 +42,9 @@ fn cap_validation_and_full_width_identity_cannot_disguise_the_stream_policy() {
     assert!(compiler(&p, BuiltInTask::Keyphrases).with_selected_rows(rows(7)).unwrap()
         .with_selected_rows(rows(7)).is_err());
     let dense = compiler(&p, BuiltInTask::Keyphrases);
-    dense.require_full_projection().unwrap();
+    assert!(dense.selected_rows().is_none());
     let full = compiler(&p, BuiltInTask::Keyphrases).with_selected_rows(rows(NANBEIGE_VOCAB_SIZE)).unwrap();
-    assert!(full.require_full_projection().is_err());
+    assert_eq!(full.selected_rows(), Some(rows(NANBEIGE_VOCAB_SIZE)));
     let dense = dense.prepare_with_control(document(), &mut Continue).unwrap();
     let full = full.prepare_with_control(document(), &mut Continue).unwrap();
     assert_eq!(dense.planned_work(), full.planned_work());

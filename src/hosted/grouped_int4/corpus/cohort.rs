@@ -16,7 +16,7 @@ pub struct Int4ExtractionCohortBatchResult {
 impl NlpEngine {
     /// Run independent schema/source documents through shared decoder layers.
     /// Each document retains its grammar, original bytes, independent KV and
-    /// full-vocabulary greedy semantics. No source mask crosses a document.
+    /// sealed greedy projection policy. No source mask crosses a document.
     ///
     /// Preparation is priced for the full window plus one lookahead. Native
     /// maximum payload reservations precede IO; each exact-size engine lives
@@ -60,17 +60,15 @@ impl NlpEngine {
         if planner.group_width() != model.model_identity().group_width() { return Err(HostedError::ModelIdentity); }
         constrained_int4::check_model(planner.base_execution_identity(), model.model_identity())
             .map_err(|_| HostedError::ModelIdentity)?;
-        planner.require_full_projection().map_err(HostedError::BatchSetup)?;
+        let selected_rows = planner.selected_rows();
         let memory = Int4ExtractionCohortMemoryLimits {
             max_documents, context_tokens: limits.native.context_tokens,
             preparation_reserve_bytes: limits.preparation_reserve_bytes,
             io_reserve_bytes: limits.io_reserve_bytes,
             allocator_reserve_bytes: limits.native.allocator_reserve_bytes,
         };
-        let required = match prefill {
-            Some(prefill) => memory.requirements_packed(planner.group_width(), native_work, limits.transport, prefill),
-            None => memory.requirements(planner.group_width(), native_work, limits.transport),
-        }.map_err(HostedError::BatchSetup)?;
+        let required = memory.requirements_for_execution(planner.group_width(), native_work,
+            limits.transport, selected_rows, prefill).map_err(HostedError::BatchSetup)?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(StreamInput { preparation: Some((planner, vocabulary)), reader, writer }))?;
@@ -95,7 +93,7 @@ impl NlpEngine {
             let (planner, vocabulary) = input.value.preparation.take().ok_or(HostedError::CompletionMissing)?;
             let admission = CohortAdmission { lease: &lease, model: model.model_identity(),
                 context_limit: limits.native.context_tokens, masks: native_work.masks,
-                output_bytes: limits.transport.max_output_line_bytes as u64 };
+                output_bytes: limits.transport.max_output_line_bytes as u64, selected_rows };
             let mut processor = match prefill {
                 Some(prefill) => NativeInt4ExtractionCohortBatch::new_packed(planner, &model.inner.loaded.value,
                     &vocabulary, admission, native_work, native, kernel, prefill),
@@ -118,6 +116,7 @@ struct CohortAdmission<'a> {
     context_limit: usize,
     masks: ExtractionMaskBudget,
     output_bytes: u64,
+    selected_rows: Option<Int4JsonSparseLimits>,
 }
 impl Int4ExtractionBatchAdmission for CohortAdmission<'_> {
     type Guard = Pending;
@@ -125,14 +124,15 @@ impl Int4ExtractionBatchAdmission for CohortAdmission<'_> {
         -> Result<(ExecutionIdentity, Self::Guard), BatchItemFailure> {
         constrained_int4::check_model(request.identity, self.model)
             .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
-        check_cohort_request(self.model.group_width(), self.context_limit, self.output_bytes, self.masks, &request)?;
-        let tokens = request.model_work.projected_logits / NANBEIGE_VOCAB_SIZE as u64;
+        let tokens = check_cohort_request(self.model.group_width(), self.context_limit,
+            self.output_bytes, self.masks, &request, self.selected_rows)?;
         let guard = output_claim(self.lease, request.max_result_bytes, tokens).map_err(admission_failure)?;
         Ok((request.identity.clone(), guard))
     }
 }
 fn check_cohort_request(width: usize, context_limit: usize, output_bytes: u64,
-    masks: ExtractionMaskBudget, request: &Int4ExtractionAdmission<'_>) -> Result<(), BatchItemFailure> {
+    masks: ExtractionMaskBudget, request: &Int4ExtractionAdmission<'_>,
+    selected_rows: Option<Int4JsonSparseLimits>) -> Result<u64, BatchItemFailure> {
     // This route creates the exact preflight context for each independent row;
     // never accept a serial reusable cache as the charge for the whole window.
     let exact_kv = request.model_work.forward_positions.checked_mul(KV_BYTES_PER_TOKEN as u64)
@@ -140,7 +140,7 @@ fn check_cohort_request(width: usize, context_limit: usize, output_bytes: u64,
     if request.model_work.forward_positions > context_limit as u64 || request.kv_reservation_bytes != exact_kv {
         return Err(BatchItemFailure::fatal(BatchCode::Admission));
     }
-    check_request_for_task(width, exact_kv, output_bytes, masks, request, "extract-v1")
+    check_request_for_projection(width, exact_kv, output_bytes, masks, request, "extract-v1", selected_rows)
 }
 
 #[cfg(test)] mod tests;

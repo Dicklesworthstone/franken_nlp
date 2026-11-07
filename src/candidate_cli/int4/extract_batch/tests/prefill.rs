@@ -47,7 +47,7 @@ fn packed_caps_and_unsupported_combinations_refuse_before_private_io() {
     for selected in [None, Some(7)] {
         let (mut batch, args) = arguments(&["--cohort-documents", "3", "--prefill-rows", "2"]);
         batch.stream.max_selected_rows = selected;
-        if selected.is_none() { batch.stream.cohort_documents = None; }
+        batch.stream.cohort_documents = None;
         assert_eq!(batch.execute_owned(args, NoRead, NoWrite), Err(CandidateError::Arguments));
     }
 }

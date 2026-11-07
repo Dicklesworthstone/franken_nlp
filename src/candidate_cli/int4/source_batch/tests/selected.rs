@@ -1,4 +1,4 @@
-//! Explicit serial capability and pure admission; no native execution.
+//! Explicit stream capability and pure admission; no native execution.
 use super::*;
 use crate::native_engine::{constrained_int4::sparse, lmhead::NANBEIGE_VOCAB_SIZE};
 
@@ -41,19 +41,51 @@ fn all_four_selected_batches_preserve_source_authority_and_exact_whole_run_work(
 }
 
 #[test]
-fn invalid_caps_and_cohort_composition_refuse_before_private_io() {
+fn invalid_caps_and_invalid_cohort_windows_refuse_before_private_io() {
     for name in COMMANDS {
         for cap in [0, NANBEIGE_VOCAB_SIZE + 1, usize::MAX] {
             let count = cap.to_string(); let (batch, args) = arguments(name, &["--max-selected-rows", &count]);
             assert_eq!(batch.execute_owned(args, NoRead, NoWrite), Err(CandidateError::Arguments));
         }
-        let definition = definitions().into_iter().find(|c| c.get_name() == name).unwrap();
-        assert!(definition.try_get_matches_from([name, "--source-dir", "explicit-source",
-            "--source-manifest", "explicit-manifest", "--max-selected-rows", "7",
-            "--cohort-documents", "1"]).is_err());
         let (mut batch, args) = arguments(name, &["--max-selected-rows", "7"]);
-        batch.stream.cohort_documents = Some(1);
+        batch.stream.cohort_documents = Some(0);
         assert_eq!(batch.execute_owned(args, NoRead, NoWrite), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
+fn all_selected_source_routes_compose_with_cohorts_and_packed_prefill_without_widening_tasks() {
+    for name in COMMANDS {
+        for rows in [None, Some(1), Some(64)] {
+            let packed = rows.map(|rows| rows.to_string());
+            let mut flags = vec!["--cohort-documents", "3", "--max-requests", "8", "--max-result-bytes", "65536"];
+            if let Some(rows) = &packed { flags.extend(["--prefill-rows", rows.as_str()]); }
+            let (dense, mut dense_args) = arguments(name, &flags); dense_args.memory_mib = 262_144;
+            let reference = dense.validate(&dense_args).unwrap();
+            for cap in [1, 7, NANBEIGE_VOCAB_SIZE] {
+                let cap_string = cap.to_string(); let mut flags = flags.clone();
+                flags.extend(["--max-selected-rows", &cap_string]);
+                let (selected, mut args) = arguments(name, &flags); args.memory_mib = 262_144;
+                let admitted = selected.validate(&args).unwrap();
+                assert_eq!(admitted.selected_rows.unwrap().max_rows_per_step, cap);
+                assert_eq!(admitted.common.native, reference.common.native);
+                assert_eq!(admitted.common.minimum_memory_bytes, reference.common.minimum_memory_bytes);
+                assert_eq!(selected.source.budget(&args, admitted.common), dense.source.budget(&dense_args, reference.common));
+                assert_eq!(admitted.native.max_model_work.projected_logits, 8 * args.max_new_tokens as u64 * cap as u64);
+                assert_eq!(admitted.native.max_model_work.attention_pairs, reference.native.max_model_work.attention_pairs);
+                assert_eq!(admitted.native.masks.max_visits_per_run, reference.native.masks.max_visits_per_run);
+                let memory = Int4SourceCohortMemoryLimits { max_documents: 3, context_tokens: args.context_tokens,
+                    preparation_reserve_bytes: admitted.preparation_reserve_bytes, io_reserve_bytes: admitted.io_bytes,
+                    allocator_reserve_bytes: ALLOCATOR_BYTES };
+                let quote = memory.requirements_for_execution(args.group_width, admitted.native, admitted.transport,
+                    admitted.selected_rows, admitted.common.prefill).unwrap();
+                let execution = quote.native.kv_bytes + quote.workspace_bytes + quote.input_bytes + quote.output_reservation_bytes;
+                assert_eq!(admitted.common.minimum_memory_bytes, grouped_memory_floor(&args, admitted.common, execution).unwrap());
+                args.memory_mib = admitted.common.minimum_memory_bytes.div_ceil(MIB);
+                selected.validate(&args).unwrap(); args.memory_mib -= 1;
+                assert_eq!(selected.execute_owned(args, NoRead, NoWrite), Err(CandidateError::Arguments));
+            }
+        }
     }
 }
 

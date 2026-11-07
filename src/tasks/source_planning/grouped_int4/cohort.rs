@@ -3,10 +3,13 @@ use super::*;
 use crate::{native_engine::strict_int4::cohort::{Int4CohortEngine, MAX_INT4_SEQUENCES},
     tasks::extract::grouped_int4::cohort::{self as extraction_group,
         Int4ExtractCohortRequest, Int4ExtractCohortBudget, Int4ExtractCohortRun,
-        INT4_EXTRACT_COHORT_EXECUTION, INT4_EXTRACT_PACKED_COHORT_EXECUTION}};
+        INT4_EXTRACT_COHORT_EXECUTION, INT4_EXTRACT_PACKED_COHORT_EXECUTION,
+        INT4_EXTRACT_SELECTED_COHORT_EXECUTION, INT4_EXTRACT_SELECTED_PACKED_COHORT_EXECUTION}};
 
 pub const INT4_SOURCE_COHORT_EXECUTION: &str = "grouped-int4-source-portfolio-cohort-v1";
 pub const INT4_SOURCE_PACKED_COHORT_EXECUTION: &str = "grouped-int4-source-portfolio-packed-cohort-v1";
+pub const INT4_SOURCE_SELECTED_COHORT_EXECUTION: &str = "grouped-int4-source-portfolio-selected-cohort-v1";
+pub const INT4_SOURCE_SELECTED_PACKED_COHORT_EXECUTION: &str = "grouped-int4-source-portfolio-selected-packed-cohort-v1";
 
 pub struct Int4SourceCohortRequest<'a> {
     pub prepared: &'a PreparedInt4SourceTask,
@@ -29,7 +32,6 @@ pub struct Int4SourceCohortRun {
 /// The extraction layer retains the exact task/control and work contract.
 pub(crate) fn preflight(request: &Int4SourceCohortRequest<'_>, vocabulary: &ExtractionVocabulary)
     -> Result<(), Int4SourceError> {
-    request.prepared.require_full_projection()?;
     request.prepared.verify_identity(request.admitted_identity)?;
     extraction_group::preflight(&Int4ExtractCohortRequest { prepared: &request.prepared.extraction,
         admitted_identity: request.admitted_identity, budget: request.budget }, vocabulary)?;
@@ -38,6 +40,7 @@ pub(crate) fn preflight(request: &Int4SourceCohortRequest<'_>, vocabulary: &Extr
 
 /// Sources, task kinds, schemas and passage partitions may differ. Each row
 /// retains its own grammar and attention state, full identity, and finalizer.
+/// A window uses one projection strategy; selected-row caps remain per row.
 /// Any failed semantic finalizer discards the entire still-owned native group.
 pub fn execute<C: DecodeStepControl>(engine: &mut Int4CohortEngine<'_>,
     requests: &[Int4SourceCohortRequest<'_>], vocabulary: &ExtractionVocabulary,
@@ -58,7 +61,7 @@ fn execute_scheduled<C: DecodeStepControl>(engine: &mut Int4CohortEngine<'_>,
     budget: Int4ExtractCohortBudget, prefill: Option<Int4PrefillLimits>, control: &mut C)
     -> Result<Int4SourceCohortRun, Int4SourceError> {
     if let Some(limits) = prefill { limits.validate().map_err(Int4JsonError::from)?; }
-    if requests.is_empty() || requests.len() > MAX_INT4_SEQUENCES { return Err(Int4SourceError::InvalidResult); }
+    selected_projection(requests)?;
     for request in requests { preflight(request, vocabulary)?; }
     let mut extraction = Vec::new(); extraction.try_reserve_exact(requests.len())
         .map_err(|_| Int4SourceError::from(ExtractError::AllocationRefused))?;
@@ -84,12 +87,17 @@ pub(super) fn finish(requests: &[Int4SourceCohortRequest<'_>], raw: Int4ExtractC
 fn finish_scheduled(requests: &[Int4SourceCohortRequest<'_>], raw: Int4ExtractCohortRun, cap: u64,
     prefill: Option<Int4PrefillLimits>) -> Result<Int4SourceCohortRun, Int4SourceError> {
     if let Some(limits) = prefill { limits.validate().map_err(Int4JsonError::from)?; }
-    let extraction_execution = if prefill.is_some() { INT4_EXTRACT_PACKED_COHORT_EXECUTION } else { INT4_EXTRACT_COHORT_EXECUTION };
+    let selected = selected_projection(requests)?;
+    let extraction_execution = match (selected, prefill.is_some()) {
+        (false, false) => INT4_EXTRACT_COHORT_EXECUTION,
+        (false, true) => INT4_EXTRACT_PACKED_COHORT_EXECUTION,
+        (true, false) => INT4_EXTRACT_SELECTED_COHORT_EXECUTION,
+        (true, true) => INT4_EXTRACT_SELECTED_PACKED_COHORT_EXECUTION,
+    };
     if raw.schema_version != 1 || raw.execution != extraction_execution
-        || raw.sequences.len() != requests.len() || requests.is_empty() || requests.len() > MAX_INT4_SEQUENCES {
+        || raw.sequences.len() != requests.len() {
         return Err(Int4SourceError::InvalidResult);
     }
-    for request in requests { request.prepared.require_full_projection()?; }
     let mut sequences = Vec::new(); sequences.try_reserve_exact(requests.len())
         .map_err(|_| Int4SourceError::from(ExtractError::AllocationRefused))?;
     let mut planned_work = Int4Work::default(); let mut model_work = Int4Work::default(); let mut longest = 0;
@@ -109,14 +117,33 @@ fn finish_scheduled(requests: &[Int4SourceCohortRequest<'_>], raw: Int4ExtractCo
     if planned_work != raw.planned_work || model_work != raw.model_work {
         return Err(Int4SourceError::InvalidResult);
     }
-    constrained_int4::cohort::check_group_counts(prefill, model_work.forward_positions, longest,
-        all_projections, longest_projection_sequence, raw.group_steps, raw.projection_groups)
-        .map_err(|_| Int4SourceError::InvalidResult)?;
-    let execution = if prefill.is_some() { INT4_SOURCE_PACKED_COHORT_EXECUTION } else { INT4_SOURCE_COHORT_EXECUTION };
+    if selected {
+        constrained_int4::cohort::check_selected_group_counts(prefill, model_work.forward_positions, longest,
+            all_projections, longest_projection_sequence, model_work.projected_logits,
+            raw.group_steps, raw.projection_groups)
+    } else {
+        constrained_int4::cohort::check_group_counts(prefill, model_work.forward_positions, longest,
+            all_projections, longest_projection_sequence, raw.group_steps, raw.projection_groups)
+    }.map_err(|_| Int4SourceError::InvalidResult)?;
+    let execution = match (selected, prefill.is_some()) {
+        (false, false) => INT4_SOURCE_COHORT_EXECUTION,
+        (false, true) => INT4_SOURCE_PACKED_COHORT_EXECUTION,
+        (true, false) => INT4_SOURCE_SELECTED_COHORT_EXECUTION,
+        (true, true) => INT4_SOURCE_SELECTED_PACKED_COHORT_EXECUTION,
+    };
     let output = Int4SourceCohortRun { schema_version: 1, execution: execution.to_owned(),
         sequences, group_steps: raw.group_steps, projection_groups: raw.projection_groups, planned_work, model_work };
     check_size(&output, cap)?;
     Ok(output)
+}
+
+fn selected_projection(requests: &[Int4SourceCohortRequest<'_>]) -> Result<bool, Int4SourceError> {
+    if requests.is_empty() || requests.len() > MAX_INT4_SEQUENCES { return Err(Int4SourceError::InvalidResult); }
+    let selected = requests[0].prepared.selected_rows().is_some();
+    if requests.iter().any(|request| request.prepared.selected_rows().is_some() != selected) {
+        return Err(Int4SourceError::InvalidResult);
+    }
+    Ok(selected)
 }
 
 #[cfg(test)] mod tests;

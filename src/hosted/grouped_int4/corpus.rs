@@ -142,6 +142,7 @@ fn check_request(width: usize, kv_bytes: u64, output_bytes: u64,
     check_request_for_task(width, kv_bytes, output_bytes, masks, request, "extract-v1")
 }
 
+#[cfg(test)]
 fn check_request_for_task(width: usize, kv_bytes: u64, output_bytes: u64,
     masks: ExtractionMaskBudget, request: &Int4ExtractionAdmission<'_>, task_spec: &str)
     -> Result<(), BatchItemFailure> {

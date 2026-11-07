@@ -41,6 +41,7 @@ fn owned_boundary_rechecks_selected_policy_before_private_defaults_or_io() {
             else { panic!("wrong source batch task") };
         let quote = batch.validate(&args).unwrap();
         batch.stream.cohort_documents = Some(1);
+        batch.stream.max_selected_rows = Some(0);
         assert_eq!(execute(args, batch, quote, NoIo, NoIo), Err(CandidateError::Arguments));
     }
 }

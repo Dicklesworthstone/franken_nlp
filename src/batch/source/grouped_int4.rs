@@ -53,7 +53,7 @@ impl<'p> Int4SourceBatchPlanner<'p> {
     }
     pub fn base_execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     pub fn group_width(&self) -> usize { self.group_width }
-    /// Fix the complete legal-row projection policy for this serial stream.
+    /// Fix the complete legal-row projection policy for this ordered stream.
     /// Every source plan binds the cap and its original built-in finalizer;
     /// per-record options cannot replace this policy or omit a legal token.
     pub fn with_selected_rows(mut self, limits: Int4JsonSparseLimits) -> Result<Self, BatchFault> {
@@ -63,10 +63,6 @@ impl<'p> Int4SourceBatchPlanner<'p> {
         Ok(self)
     }
     pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.selected_rows }
-    pub(crate) fn require_full_projection(&self) -> Result<(), BatchFault> {
-        if self.selected_rows.is_some() { return Err(BatchCode::Admission.into()); }
-        Ok(())
-    }
     pub fn prepare_with_control<C: DecodeStepControl>(&self, document: BatchDocument<SourceBatchArgs>,
         control: &mut C) -> Result<PreparedInt4SourceTask, BatchItemFailure> {
         checkpoint(control)?;
