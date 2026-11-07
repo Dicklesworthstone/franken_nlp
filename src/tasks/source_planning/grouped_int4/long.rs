@@ -57,7 +57,7 @@ pub struct Int4SourceMapLimits {
     pub verification: GroundingBudget,
 }
 impl Int4SourceMapLimits {
-    fn validate(self, budget: TaskBudget, planning: SourcePlanningLimits) -> Result<(), Int4SourceMapError> {
+    pub(crate) fn validate(self, budget: TaskBudget, planning: SourcePlanningLimits) -> Result<(), Int4SourceMapError> {
         self.chunks.effective_token_limit().map_err(Int4SourceMapError::Chunk)?;
         budget.validate().map_err(|_| Int4SourceMapError::InvalidLimits)?;
         let v = self.verification;

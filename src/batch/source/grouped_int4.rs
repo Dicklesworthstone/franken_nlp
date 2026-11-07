@@ -18,6 +18,8 @@ pub use crate::batch::extract::grouped_int4::{Int4ExtractionAdmission as Int4Sou
     Int4ExtractionBatchAdmission as Int4SourceBatchAdmission, Int4ExtractionBatchLimits as Int4SourceBatchLimits};
 
 mod cohort;
+/// Live complete-document QA with a separate private question for every row.
+pub mod question;
 pub use cohort::{NativeInt4SourceCohortBatch, PreparedInt4CohortSource};
 // Source and extraction rows share the same dense native decoder, transport
 // ownership and memory accounting. Keep one authoritative window quotation.
