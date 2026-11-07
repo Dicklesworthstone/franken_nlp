@@ -8,6 +8,7 @@ use crate::tasks::{ir::TaskBudget, mapreduce::ChunkLimits,
 #[cfg(feature = "asupersync-runtime")]
 mod runtime;
 pub(super) mod corpus;
+pub(super) mod job;
 #[cfg(test)]
 mod tests;
 
