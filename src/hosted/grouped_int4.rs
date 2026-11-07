@@ -31,7 +31,7 @@ mod extraction_map;
 pub use extraction_map::{Int4ExtractionMapConfig, int4_extraction_document_corpus_requirements};
 mod source;
 mod source_map;
-pub use source_map::Int4SourceMapConfig;
+pub use source_map::{Int4SourceMapConfig, int4_question_document_corpus_requirements};
 mod corpus;
 pub use corpus::{Int4SourceCorpusConfig, Int4ExtractionCohortBatchResult, Int4SourceCohortBatchResult};
 mod scored_batch;

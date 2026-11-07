@@ -13,6 +13,8 @@ mod summary;
 mod question;
 mod keyphrases;
 mod cohort;
+mod corpus;
+pub use corpus::int4_question_document_corpus_requirements;
 
 /// One original document, fixed task/model and nonrenewable work envelope.
 /// Preparation prices all retained prompts/grammars, tokenizer/vocabulary
