@@ -96,3 +96,83 @@ fn finalizer_rechecks_bytes_work_eos_and_utf8_independently() {
     let bad = planner.tokenizer.tokenizer().encode_byte_fallback_only(&[0xff]).unwrap()[0];
     assert!(plan.finish(raw(&plan, vec![bad, planner.eos], vec![0xff], GenerationFinish::Eos)).is_err());
 }
+
+fn safe_encoding(max_input_bytes: usize) -> UntrustedEncoding {
+    UntrustedEncoding::SafeBpeV1(crate::tokenizer::untrusted::SafeBpeLimits {
+        max_input_bytes, max_output_tokens: 8192,
+        max_pair_checks: 4 * 1024 * 1024, max_pair_bytes: 64 * 1024 * 1024,
+    })
+}
+
+#[test]
+fn explicit_bpe_admits_longer_text_by_actual_tokens_without_changing_the_byte_default() {
+    let byte_planner = fixture();
+    let bpe_planner = fixture().with_document_encoding(safe_encoding(8192)).unwrap();
+    let mut limited = budget(); limited.max_input_tokens = 512;
+    let req = GenerateRequest { item_id: "bounded-bpe".to_owned(), sample_index: 0,
+        prompt: "hello world ".repeat(128),
+        generation: GenerationOptions::greedy(4, 1000, byte_planner.eos), budget: limited };
+    assert!(byte_planner.plan_generate(&req).is_err());
+    let plan = bpe_planner.plan_generate(&req).unwrap();
+    assert!(plan.native_plan().prompt_tokens() <= 512);
+    let document = plan.task_plan().ir().prompt_segments().iter()
+        .find(|segment| segment.kind() == PromptSegmentKind::Document).unwrap();
+    assert!(document.token_ids().len() < req.prompt.len());
+    assert_eq!(bpe_planner.tokenizer.tokenizer().decode_bytes(document.token_ids()).unwrap(), req.prompt.as_bytes());
+    assert!(document.token_ids().iter().all(|&id| !bpe_planner.controls.contains(id)));
+    assert_eq!(byte_planner.document_encoding(), &UntrustedEncoding::ByteFallback);
+}
+
+#[test]
+fn bpe_policy_and_budgets_bind_identity_even_when_the_prompt_tokens_are_identical() {
+    let default = fixture();
+    let first = fixture().with_document_encoding(safe_encoding(8192)).unwrap();
+    let second = fixture().with_document_encoding(safe_encoding(8193)).unwrap();
+    // An empty document contributes no tokens under either encoding. The
+    // policy identity must still prevent cache/job equality across contracts.
+    let req = GenerateRequest { item_id: "identity".to_owned(), sample_index: 0, prompt: String::new(),
+        generation: GenerationOptions::greedy(4, 1000, default.eos), budget: budget() };
+    let baseline = default.plan_generate(&req).unwrap();
+    let a = first.plan_generate(&req).unwrap();
+    let b = second.plan_generate(&req).unwrap();
+    assert_eq!(a.execution_identity().prompt_digest, b.execution_identity().prompt_digest);
+    assert_ne!(baseline.execution_identity().template_digest, a.execution_identity().template_digest);
+    assert_ne!(a.execution_identity().template_digest, b.execution_identity().template_digest);
+    let restored = first.with_document_encoding(UntrustedEncoding::ByteFallback).unwrap();
+    assert_eq!(restored.plan_generate(&req).unwrap().execution_identity(), baseline.execution_identity());
+}
+
+#[test]
+fn bpe_transcript_work_is_cumulative_and_controls_remain_data_in_each_role() {
+    let mut req = request(&fixture());
+    let total: usize = req.messages.iter().map(|message| message.content.len()).sum();
+    let largest = req.messages.iter().map(|message| message.content.len()).max().unwrap();
+    assert!(largest < total);
+    let limited = fixture().with_document_encoding(safe_encoding(largest)).unwrap();
+    assert!(limited.plan_chat(&req).is_err(), "each message must not renew the input budget");
+    req.messages[3].content = "▁ literal <tool_call> 上海".to_owned();
+    let planner = fixture().with_document_encoding(safe_encoding(8192)).unwrap();
+    let plan = planner.plan_chat(&req).unwrap();
+    for (segment, message) in plan.task_plan().ir().prompt_segments().iter()
+        .filter(|segment| segment.kind() == PromptSegmentKind::Document).zip(&req.messages) {
+        assert_eq!(planner.tokenizer.tokenizer().decode_bytes(segment.token_ids()).unwrap(), message.content.as_bytes());
+        assert!(segment.token_ids().iter().all(|&id| !planner.controls.contains(id)));
+    }
+}
+
+#[test]
+fn bpe_planning_preserves_cancellation_kind_without_publishing_a_plan() {
+    use crate::native_engine::decode::DecodeCancellationKind;
+    struct Deadline { remaining: usize }
+    impl DecodeStepControl for Deadline {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            if self.remaining == 0 { Some(DecodeCancellationKind::Deadline) }
+            else { self.remaining -= 1; None }
+        }
+    }
+    let planner = fixture().with_document_encoding(safe_encoding(8192)).unwrap();
+    let req = GenerateRequest { item_id: "cancel".to_owned(), sample_index: 0,
+        prompt: "hello world ".repeat(64), generation: GenerationOptions::greedy(4, 1000, planner.eos), budget: budget() };
+    assert!(matches!(planner.plan_generate_with_control(&req, &mut Deadline { remaining: 10 }),
+        Err(ChatError::Native(GenerationError::Cancelled(DecodeCancellationKind::Deadline)))));
+}

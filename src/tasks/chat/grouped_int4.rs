@@ -65,25 +65,40 @@ impl Int4ChatPlanner {
         let compiler = ChatPlanner::pinned_for_backend(controls, eos, identity, ceiling, limits, ChatBackend::GroupedInt4)?;
         Ok(Self { compiler, group_width })
     }
+    /// Opt in to a distinct, bounded untrusted-message encoding identity.
+    pub fn with_document_encoding(mut self, policy: UntrustedEncoding) -> Result<Self, Int4ChatError> {
+        self.compiler = self.compiler.with_document_encoding(policy)?;
+        Ok(self)
+    }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { self.compiler.document_encoding() }
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.compiler.identity }
     pub fn group_width(&self) -> usize { self.group_width }
     pub fn plan_chat(&self, request: &ChatRequest) -> Result<PreparedInt4Chat, Int4ChatError> {
+        self.plan_chat_with_control(request, &mut PlanningContinue)
+    }
+    pub fn plan_chat_with_control<C: DecodeStepControl>(&self, request: &ChatRequest,
+        control: &mut C) -> Result<PreparedInt4Chat, Int4ChatError> {
         self.compile(BuiltInTask::Chat, &request.item_id, request.sample_index,
-            &request.messages, &request.generation, request.budget)
+            &request.messages, &request.generation, request.budget, control)
     }
     /// As in existing generate, a single untrusted user message passes through
     /// the pinned template. This is not a raw-control-token escape hatch.
     pub fn plan_generate(&self, request: &GenerateRequest) -> Result<PreparedInt4Chat, Int4ChatError> {
+        self.plan_generate_with_control(request, &mut PlanningContinue)
+    }
+    pub fn plan_generate_with_control<C: DecodeStepControl>(&self, request: &GenerateRequest,
+        control: &mut C) -> Result<PreparedInt4Chat, Int4ChatError> {
         if request.prompt.len() > self.compiler.limits.max_message_bytes
             || request.prompt.len() > self.compiler.limits.max_total_message_bytes {
             return Err(ChatError::Limit("prompt bytes").into());
         }
         self.compile(BuiltInTask::Generate, &request.item_id, request.sample_index,
-            &[ChatMessage { role: ChatRole::User, content: request.prompt.clone() }], &request.generation, request.budget)
+            &[ChatMessage { role: ChatRole::User, content: request.prompt.clone() }], &request.generation, request.budget, control)
     }
-    fn compile(&self, kind: BuiltInTask, item: &str, sample: u64, messages: &[ChatMessage],
-        options: &GenerationOptions, budget: TaskBudget) -> Result<PreparedInt4Chat, Int4ChatError> {
-        let input = self.compiler.compile_input(kind, messages, options, budget)?;
+    #[allow(clippy::too_many_arguments)]
+    fn compile<C: DecodeStepControl>(&self, kind: BuiltInTask, item: &str, sample: u64, messages: &[ChatMessage],
+        options: &GenerationOptions, budget: TaskBudget, control: &mut C) -> Result<PreparedInt4Chat, Int4ChatError> {
+        let input = self.compiler.compile_input_with_control(kind, messages, options, budget, control)?;
         let native = Int4GenerationPlan::compile(input.prompt, input.options, input.identity,
             self.group_width, item, sample, self.compiler.limits.generation)?;
         Ok(PreparedInt4Chat { task: input.task, native,

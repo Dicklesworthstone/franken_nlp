@@ -42,6 +42,31 @@ fn default_options_use_the_same_pinned_greedy_contract_and_group_aware_requireme
 }
 
 #[test]
+fn explicit_safe_bpe_is_text_only_and_admits_workspace_before_any_io() {
+    use crate::tokenizer::untrusted::UntrustedEncoding;
+    for task in ["generate", "chat"] {
+        let options = args(task, &["--input-encoding", "safe-bpe-v1"]);
+        let limits = options.validate().unwrap();
+        assert!(matches!(options.input_encoding.policy(options.max_input_bytes, limits.max_prompt_tokens).unwrap(),
+            UntrustedEncoding::SafeBpeV1(_)));
+        // One MiB of source requires >256 MiB of additional encoder payload;
+        // the default 256-MiB preparation grant must fail before opening files.
+        let oversized = command(task, &["--input-encoding", "safe-bpe-v1", "--max-input-bytes", "1048576"]);
+        assert_eq!(oversized.execute(&mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+        let invalid = command(task, &["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "0"]);
+        assert_eq!(invalid.execute(&mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+    }
+    // A task that still uses byte-counted chunk planning must never accept a
+    // tokenization switch which its planner would silently ignore.
+    for task in ["ner", "keyphrases", "summarize", "answer", "extract"] {
+        let argv = ["candidate", "source-int4", task, "--source-dir", "source",
+            "--source-manifest", "manifest.json", "--memory-mib", "8192",
+            "--input-encoding", "safe-bpe-v1"];
+        assert!(crate::candidate_cli::definition().try_get_matches_from(argv).is_err());
+    }
+}
+
+#[test]
 fn invalid_limits_eos_and_prefill_rows_refuse_before_input_or_model_io() {
     for extra in [vec!["--group-width", "0"], vec!["--group-width", "10753"],
         vec!["--context-tokens", "0"], vec!["--context-tokens", "1"],

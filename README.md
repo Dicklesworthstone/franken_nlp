@@ -300,6 +300,61 @@ fnlp doctor                          # idempotent self-check/repair
 #   fnlp audit plan/grade · fnlp job partition/merge · fnlp resident start
 ```
 
+## Explicit bounded BPE input for candidate INT4 generation
+
+One-request `fnlp candidate source-int4 generate` and `chat` accept
+`--input-encoding safe-bpe-v1`. The existing default is `byte-fallback`, which
+uses one token per input byte. The explicit BPE policy can use ordinary
+vocabulary pieces while preserving every original message byte and excluding
+all template-control and added-token IDs. Context admission counts the actual
+resulting tokens, so a message is no longer refused solely because its byte
+count exceeds the available input-token count.
+
+```bash
+# Reuse an independently digest-pinned candidate snapshot.
+fnlp candidate source-int4 generate prompt.txt \
+  --snapshot nanbeige.int4.snapshot \
+  --expected-model-sha256 "$MODEL_SHA256" \
+  --memory-mib 8192 --context-tokens 2048 \
+  --input-encoding safe-bpe-v1
+
+# A complete system/user/assistant transcript shares ONE tokenizer-work budget.
+fnlp candidate source-int4 chat messages.json \
+  --source-dir /models/nanbeige-pinned \
+  --source-manifest conversion-source-manifest.json \
+  --memory-mib 8192 --input-encoding safe-bpe-v1 \
+  --max-tokenizer-pair-checks 8388608 \
+  --max-tokenizer-pair-bytes 134217728
+```
+
+The first source scalar uses raw BYTE pieces to make decoding independent of
+the preceding trusted scaffold. Subsequent ordinary pieces use no injected
+token matching or dummy prefix. Literal `▁`, whitespace, Unicode and
+marker-looking text retain their exact bytes. Both standalone and embedded
+decoding are checked before a message becomes an admitted prompt segment.
+
+The merge search has explicit work bounds: the default complete-transcript
+limits are 4,194,304 pair checks and 67,108,864 examined pair bytes. Their hard
+ceilings are 67,108,864 checks and 536,870,912 bytes. A limit refusal produces
+no task result and never silently switches encoding. The existing input and
+context ceilings still apply, and the encoder's conservative workspace is
+included in preparation admission before document or model IO. Cancellation
+and deadline checks run inside bounded encoding intervals. Long inputs may
+need a larger explicit work cap even when their final tokens fit the context.
+
+The selected policy and all its limits enter the template execution identity
+and appear in `input_encoding` on the completed candidate response. Library
+callers can select the same contract with `with_document_encoding` on
+`ChatPlanner`, `Int8ChatPlanner` or `Int4ChatPlanner`, and use the
+`plan_chat_with_control` / `plan_generate_with_control` methods for cooperative
+planning cancellation. The host must admit `SafeBpeLimits::requirements()`.
+
+This is a distinct candidate tokenization contract, with its own regression
+fixtures; it does not assert ordinary slow-tokenizer token-ID parity or task
+quality gains. Other CLI tasks, streaming, corpora and retained jobs keep their
+existing byte-fallback contract. These encoding and planner tests still require
+the repository's authorized DSR checkpoint and model-present qualification.
+
 ## Implemented candidate INT4 token streaming
 
 `fnlp candidate source-int4 stream generate|chat` exposes live native token

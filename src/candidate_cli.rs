@@ -20,6 +20,7 @@ mod runtime;
 #[cfg(test)]
 mod tests;
 mod generation_policy;
+mod input_encoding;
 mod text_batch;
 mod source;
 mod batch;

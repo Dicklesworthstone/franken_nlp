@@ -207,7 +207,14 @@ pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
     };
     // Completed retains the exact hosted output guard while Serialize borrows
     // its result. No unguarded JSON value or partially completed head escapes.
-    publish(&cohort::Response { response: &response, cohort: result.cohort() }, limits.result_bytes + 4096, output)
+    let encoding = args.input_encoding.policy(args.max_input_bytes, limits.max_prompt_tokens)?;
+    let input_encoding = match &encoding {
+        crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback => None,
+        _ => Some(&encoding),
+    };
+    publish(&input_encoding::Response {
+        response: &cohort::Response { response: &response, cohort: result.cohort() }, input_encoding,
+    }, limits.result_bytes + 4096, output)
 }
 
 fn prepare(request: Input, model: &ResidentInt4, args: &Int4Args, limits: Int4Limits,
@@ -223,14 +230,20 @@ fn prepare(request: Input, model: &ResidentInt4, args: &Int4Args, limits: Int4Li
             let planner = Int4ChatPlanner::for_model(model.model_identity(), budget, ChatLimits {
                 max_messages: 128, max_message_bytes: args.max_input_bytes,
                 max_total_message_bytes: args.max_input_bytes, generation: args.generation_limits(limits),
-            }).map_err(|_| CandidateError::Planning)?;
+            }).map_err(|_| CandidateError::Planning)?
+                .with_document_encoding(args.input_encoding.policy(args.max_input_bytes, limits.max_prompt_tokens)?)
+                .map_err(|_| CandidateError::Planning)?;
             let options = args.options(planner.eos_token_id())?;
             let plan = match request {
-                TextInput::Generate(prompt) => planner.plan_generate(&GenerateRequest {
-                    item_id: "cli".to_owned(), sample_index: 0, prompt, generation: options, budget }),
-                TextInput::Chat(messages) => planner.plan_chat(&ChatRequest {
-                    item_id: "cli".to_owned(), sample_index: 0, messages, generation: options, budget }),
-            }.map_err(|_| CandidateError::Planning)?;
+                TextInput::Generate(prompt) => planner.plan_generate_with_control(&GenerateRequest {
+                    item_id: "cli".to_owned(), sample_index: 0, prompt, generation: options, budget }, control),
+                TextInput::Chat(messages) => planner.plan_chat_with_control(&ChatRequest {
+                    item_id: "cli".to_owned(), sample_index: 0, messages, generation: options, budget }, control),
+            }.map_err(|error| match error.cancellation() {
+                Some(DecodeCancellationKind::Deadline | DecodeCancellationKind::Timeout) => CandidateError::Timeout,
+                Some(_) => CandidateError::Execution,
+                None => CandidateError::Planning,
+            })?;
             Ok(Prepared::Text(plan))
         }
         Input::Classify(request, scoring) => {

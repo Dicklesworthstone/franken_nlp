@@ -116,6 +116,9 @@ struct Int4Args {
     logprobs: bool,
     #[command(flatten)]
     policy: generation_policy::GenerationPolicyArgs,
+    /// Populated only by the explicit one-request text command parser.
+    #[arg(skip)]
+    input_encoding: input_encoding::InputEncodingArgs,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -194,8 +197,8 @@ pub(super) fn definition() -> clap::Command {
         .long_about("Non-certified grouped INT4 candidate inference on the existing resource host. Select --source-dir plus --source-manifest, optionally with --save-snapshot NEW_FILE, or select --snapshot FILE plus an independent --expected-model-sha256. Always requires --memory-mib. Sequential native execution defaults to scalar; --kernel explicitly selects an existing hardware-checked integer leaf. Text tasks and one-off classify, sentiment, judge, extract, ner, keyphrases, summarize and answer can opt in to bounded layer-major prompt execution with --prefill-rows. Structured batch, map, job, redaction and semantic workflows retain their existing prompt schedules. stream generate/chat emits bounded provisional token NDJSON and requires a final run_complete after native drain. text-batch runs one finite NDJSON cohort and emits one completed aggregate JSON object. text-corpus processes bounded windows with one resident model and cumulative budgets, emitting completed-window NDJSON with a required corpus_complete footer. extract-batch streams documents under one shared schema through one resident model and engine. ner, keyphrases, summarize and answer preserve their source-task semantics; their -batch commands run ordered typed source-task NDJSON. Every ordered batch requires run_complete plus exit 0 for whole-run success. ner-map and keyphrases-map process every chunk of a complete document with original-coordinate evidence; summarize-map produces a deterministic exact cited bullet union. sentiment-map scores every original source chunk with complete independent dimension distributions and explicit scalar-weighted aggregation, optionally using real chunk cohorts. classify-map retains every chunk's exact classification scores and reports a separate scalar-weighted exclusive or independent multi-label mixture. All map commands preflight the complete document and publish one completed result. extract-job start/resume retains ordered extraction results in an explicit protected spool. ner-job, keyphrases-job, summarize-job and answer-job provide the same opt-in durable start/resume contract for source tasks. redact-job start/resume retains complete-document edits under one authenticated detector, action and key scope, with metadata-only stdout. Resume authenticates the complete original population, exact task configuration, model/group identity and immutable lifetime limits. No automatic selection, fallback, download, active catalog, thinking mode or tools. Snapshots are local candidate storage, not canonical FNLPQ or release activation. Other routes publish completed task or corpus results.")
         .after_long_help("Complete-document classification defaults to serial execution. classify-map --cohort-chunks N processes complete independent chunks together; requested chunks times actual heads must be at most 64 (one head for exclusive mode, one per label for multi_label). Physical cohort statistics remain separate from the semantic output. classify-corpus applies the complete-document map to ordered NDJSON with one resident model. Its explicit --cohort-chunks schedule shares native layers within each document; --max-labels bounds every default and replacement and can reduce admitted cohort memory. sentiment-corpus provides complete-document affect distributions and their scalar-weighted aggregate on the same ordered resident stream pattern; --max-axes bounds defaults and replacements, and --cohort-chunks shares layers within each document. Both corpus routes keep all five work ceilings across the entire run without renewal at chunk cohorts or flushes. source-corpus ner/keyphrases/summarize/answer applies the existing complete-document source pipelines to a live resident stream with fixed options and, for answer, one fixed question file. It includes exact reducers, explicit neural synthesis and hierarchies, and independent discovery/hierarchy cohort schedules. ner-corpus, keyphrases-corpus and summarize-corpus are short forms. Require run_complete plus exit 0.")
         .subcommand_required(true)
-        .subcommand(task("generate", "Generate from a bounded UTF-8 prompt using the pinned template"))
-        .subcommand(task("chat", "Complete a bounded JSON system/user/assistant transcript"))
+        .subcommand(input_encoding::definition(task("generate", "Generate from a bounded UTF-8 prompt using the pinned template")))
+        .subcommand(input_encoding::definition(task("chat", "Complete a bounded JSON system/user/assistant transcript")))
         .subcommand(stream::definition())
         .subcommand(classify::prefill_definition(classify::definition()))
         .subcommand(classify_map::definition())
@@ -357,7 +360,11 @@ impl Int4Command {
             }
             _ => return Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source-int4 task refused")),
         };
-        Ok(Self { task, args: Int4Args::from_arg_matches(matches)?, batch: None, job: None })
+        let mut args = Int4Args::from_arg_matches(matches)?;
+        if matches!(name, "generate" | "chat") {
+            args.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+        }
+        Ok(Self { task, args, batch: None, job: None })
     }
     /// Corpus/job execution owns input until the hosted invocation drains.
     pub(super) fn run_owned<R: Read + Send + 'static, W: Write + Send + 'static>(
@@ -572,8 +579,10 @@ impl Int4Args {
             || sum(&[load.weight_payload_bytes, peak_codec_scratch])? > max_load_bytes {
             return Err(CandidateError::Arguments);
         }
+        let encoding_workspace = self.input_encoding.workspace_bytes(self.max_input_bytes, max_prompt_tokens)?;
+        if sampler_bytes == 0 && encoding_workspace != 0 { return Err(CandidateError::Arguments); }
         let preparation_floor = sum(&[128 * MIB, self.max_input_bytes as u64 * 32,
-            (result_bytes as u64 + 4096) * 2, extra_preparation_bytes])?;
+            (result_bytes as u64 + 4096) * 2, extra_preparation_bytes, encoding_workspace])?;
         if preparation_bytes < preparation_floor { return Err(CandidateError::Arguments); }
         let resident = sum(&[load.weight_payload_bytes, ALLOCATOR_BYTES])?;
         let load_stage = if snapshot_pin.is_some() { snapshot_need.scratch_bytes }

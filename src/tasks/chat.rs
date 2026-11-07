@@ -17,7 +17,8 @@ use crate::{
         sampler::Seed256},
     template::{Conversation, Message, MessageRole, RenderOptions, TemplateBuilder, ToolFormat, IM_START, IM_END, THINK_START, THINK_END},
     tokenizer::{bpe::EncodeOptions, embedded::{EmbeddedTokenizer, PINNED_TOKENIZER_MODEL_BYTES,
-        PINNED_ADDED_TOKENS_BYTES, PINNED_TOKENIZER_CONFIG_BYTES, PINNED_SPECIAL_TOKENS_MAP_BYTES}, specials::TemplateControlIds},
+        PINNED_ADDED_TOKENS_BYTES, PINNED_TOKENIZER_CONFIG_BYTES, PINNED_SPECIAL_TOKENS_MAP_BYTES}, specials::TemplateControlIds,
+        untrusted::{SafeBpeWork, UntrustedDocumentEncoder, UntrustedEncoding}},
 };
 use super::{BuiltInTask, extract::SourceDocumentEncoder,
     ir::{DecodeBudget, DecodeStrategy, DependencyScope, FinitePostcondition, GrammarReference, PlanContext,
@@ -88,6 +89,7 @@ impl From<GenerationError> for ChatError { fn from(error: GenerationError) -> Se
 pub struct ChatPlanner {
     tokenizer: Arc<EmbeddedTokenizer>, encoder: SourceDocumentEncoder, controls: TemplateControlIds,
     eos: u32, identity: ExecutionIdentity, ceiling: TaskBudget, limits: ChatLimits,
+    byte_template_digest: Sha256Digest, document_encoding: UntrustedEncoding,
 }
 pub struct PreparedChat {
     task: TaskPlan, native: GenerationPlan, tokenizer: Arc<EmbeddedTokenizer>, sample_index: u64,
@@ -159,29 +161,57 @@ impl ChatPlanner {
         identity.template_digest = hash(&(CHAT_PROMPT_VERSION, exemplar, census, assets, eos))?;
         identity.tokenizer_digest = Sha256Digest::of_bytes(PINNED_TOKENIZER_MODEL_BYTES);
         let encoder = SourceDocumentEncoder::pinned(controls).map_err(|_| ChatError::Encoding)?;
-        Ok(Self { tokenizer, encoder, controls: controls.clone(), eos, identity, ceiling, limits })
+        let byte_template_digest = identity.template_digest;
+        Ok(Self { tokenizer, encoder, controls: controls.clone(), eos, identity, ceiling, limits,
+            byte_template_digest, document_encoding: UntrustedEncoding::ByteFallback })
     }
+    /// Explicitly select the untrusted-message tokenization contract. The
+    /// default byte-only identity is retained; BPE and its cumulative work
+    /// ceilings are separately bound before any prompt or native plan exists.
+    /// The embedding host must admit the policy's workspace requirements.
+    pub fn with_document_encoding(mut self, policy: UntrustedEncoding) -> Result<Self, ChatError> {
+        policy.validate().map_err(|_| ChatError::Limit("document encoding policy"))?;
+        self.identity.template_digest = match &policy {
+            UntrustedEncoding::ByteFallback => self.byte_template_digest,
+            UntrustedEncoding::SafeBpeV1(_) => hash(&(
+                "chat-untrusted-encoding-v1", self.byte_template_digest, &policy))?,
+        };
+        self.document_encoding = policy;
+        Ok(self)
+    }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { &self.document_encoding }
     pub fn plan_chat(&self, request: &ChatRequest) -> Result<PreparedChat, ChatError> {
-        self.compile(BuiltInTask::Chat, &request.item_id, request.sample_index, &request.messages, &request.generation, request.budget)
+        self.plan_chat_with_control(request, &mut PlanningContinue)
+    }
+    pub fn plan_chat_with_control<C: DecodeStepControl>(&self, request: &ChatRequest,
+        control: &mut C) -> Result<PreparedChat, ChatError> {
+        self.compile(BuiltInTask::Chat, &request.item_id, request.sample_index, &request.messages,
+            &request.generation, request.budget, control)
     }
     pub fn plan_generate(&self, request: &GenerateRequest) -> Result<PreparedChat, ChatError> {
+        self.plan_generate_with_control(request, &mut PlanningContinue)
+    }
+    pub fn plan_generate_with_control<C: DecodeStepControl>(&self, request: &GenerateRequest,
+        control: &mut C) -> Result<PreparedChat, ChatError> {
         // Check before the owned single-message conversion, not after cloning
         // an unbounded caller string into a second request representation.
         if request.prompt.len() > self.limits.max_message_bytes || request.prompt.len() > self.limits.max_total_message_bytes {
             return Err(ChatError::Limit("prompt bytes"));
         }
         self.compile(BuiltInTask::Generate, &request.item_id, request.sample_index,
-            &[ChatMessage { role: ChatRole::User, content: request.prompt.clone() }], &request.generation, request.budget)
+            &[ChatMessage { role: ChatRole::User, content: request.prompt.clone() }], &request.generation, request.budget, control)
     }
-    fn compile(&self, kind: BuiltInTask, item: &str, sample: u64, messages: &[ChatMessage],
-        options: &GenerationOptions, budget: TaskBudget) -> Result<PreparedChat, ChatError> {
-        let input = self.compile_input(kind, messages, options, budget)?;
+    #[allow(clippy::too_many_arguments)]
+    fn compile<C: DecodeStepControl>(&self, kind: BuiltInTask, item: &str, sample: u64, messages: &[ChatMessage],
+        options: &GenerationOptions, budget: TaskBudget, control: &mut C) -> Result<PreparedChat, ChatError> {
+        let input = self.compile_input_with_control(kind, messages, options, budget, control)?;
         let native = GenerationPlan::compile(input.prompt, input.options, input.identity,
             item, sample, self.limits.generation)?;
         Ok(PreparedChat { task: input.task, native, tokenizer: Arc::clone(&self.tokenizer), sample_index: sample })
     }
-    fn compile_input(&self, kind: BuiltInTask, messages: &[ChatMessage], options: &GenerationOptions,
-        budget: TaskBudget) -> Result<ChatInput, ChatError> {
+    fn compile_input_with_control<C: DecodeStepControl>(&self, kind: BuiltInTask, messages: &[ChatMessage],
+        options: &GenerationOptions, budget: TaskBudget, control: &mut C) -> Result<ChatInput, ChatError> {
+        planning_checkpoint(control)?;
         // Reject invalid/oversized caller-owned option collections before
         // rendering, tokenizing messages or cloning them into a sealed plan.
         options.validate(self.limits.generation)?;
@@ -207,22 +237,44 @@ impl ChatPlanner {
         // the leading <|im_start|>; never prepend configured BOS here.
         let mut tail = rendered.as_str(); let mut segments = Vec::new();
         let mut token_total = 0_usize;
+        // One work ledger for the complete transcript. A second message never
+        // renews BPE input, output, pair-comparison or examined-byte limits.
+        let mut encoding_work = SafeBpeWork::default();
         let cap = (budget.max_input_tokens as usize).min(self.limits.generation.max_prompt_tokens);
         for (message, slot) in messages.iter().zip(&placeholders) {
+            planning_checkpoint(control)?;
             let (before, rest) = tail.split_once(slot).ok_or(ChatError::Contract("template placeholder"))?;
             let scaffold = self.tokenizer.tokenizer().encode_ids_with_options(before, EncodeOptions { add_bos: false, add_eos: false })
                 .map_err(|_| ChatError::Encoding)?;
             token_total = add_tokens(token_total, scaffold.len(), cap)?;
-            let source = self.encoder.encode(&message.content, self.limits.max_message_bytes, cap.saturating_sub(token_total))
-                .map_err(|_| ChatError::Encoding)?;
-            token_total = add_tokens(token_total, source.token_ids().len(), cap)?;
+            let document_ids = match &self.document_encoding {
+                UntrustedEncoding::ByteFallback => {
+                    let source = self.encoder.encode(&message.content, self.limits.max_message_bytes,
+                        cap.saturating_sub(token_total)).map_err(|_| ChatError::Encoding)?;
+                    source.token_ids().to_vec()
+                }
+                policy @ UntrustedEncoding::SafeBpeV1(_) => {
+                    let encoder = UntrustedDocumentEncoder::new(self.tokenizer.tokenizer(), &self.controls);
+                    let mut cancelled = None;
+                    let encoded = encoder.encode_with_policy(message.content.as_bytes(), policy,
+                        &mut encoding_work, &mut || {
+                            if cancelled.is_none() { cancelled = control.checkpoint(0); }
+                            cancelled.is_none()
+                        });
+                    if let Some(cause) = cancelled { return Err(GenerationError::Cancelled(cause).into()); }
+                    let source = encoded.map_err(|_| ChatError::Encoding)?;
+                    source.ids().to_vec()
+                }
+            };
+            token_total = add_tokens(token_total, document_ids.len(), cap)?;
             segments.push(PromptSegment::new(PromptSegmentKind::TaskInstruction, scaffold));
-            segments.push(PromptSegment::new(PromptSegmentKind::Document, source.token_ids().to_vec()));
+            segments.push(PromptSegment::new(PromptSegmentKind::Document, document_ids));
             tail = rest;
         }
         let suffix = self.tokenizer.tokenizer().encode_ids_with_options(tail, EncodeOptions { add_bos: false, add_eos: false })
             .map_err(|_| ChatError::Encoding)?;
         token_total = add_tokens(token_total, suffix.len(), cap)?;
+        planning_checkpoint(control)?;
         segments.push(PromptSegment::new(PromptSegmentKind::AnswerScaffold, suffix));
         let ir = TaskIR::new(segments, DecodeStrategy::FreeText { stops: vec![TokenSequence::new(vec![self.eos])],
             budget: DecodeBudget { max_tokens: u32::try_from(options.max_new_tokens).map_err(|_| ChatError::Limit("decode tokens"))?,
@@ -274,6 +326,16 @@ impl PreparedChat {
 
 struct ChatInput {
     task: TaskPlan, prompt: Vec<u32>, options: GenerationOptions, identity: ExecutionIdentity,
+}
+struct PlanningContinue;
+impl DecodeStepControl for PlanningContinue {
+    fn checkpoint(&mut self, _: usize) -> Option<crate::native_engine::decode::DecodeCancellationKind> { None }
+}
+fn planning_checkpoint<C: DecodeStepControl>(control: &mut C) -> Result<(), ChatError> {
+    match control.checkpoint(0) {
+        Some(cause) => Err(GenerationError::Cancelled(cause).into()),
+        None => Ok(()),
+    }
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ChatBackend { Eager, Int8, GroupedInt4 }
