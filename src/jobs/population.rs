@@ -77,33 +77,6 @@ impl JobPopulation {
         Ok(result)
     }
     pub fn stats(&self) -> PopulationStats { self.stats }
-    pub(super) fn input(&self, ordinal: usize) -> Option<JobInput<'_>> {
-        self.items.get(ordinal).map(|item| JobInput { id: &item.id,
-            original: &item.bytes, normalized: &item.bytes })
-    }
-    pub(super) fn retained() -> Self {
-        Self { items: Vec::new(), stats: PopulationStats::default() }
-    }
-    /// Called only by the authenticated framed-input reader. It has already
-    /// checked envelope shape, uniqueness against the frozen index, and caps.
-    /// Statistics describe these exact restored records, not discarded blank
-    /// lines or delimiters from a historical transport stream.
-    pub(super) fn push_retained(&mut self, id: String, bytes: Vec<u8>, limits: JobLimits)
-        -> Result<(), JobError> {
-        if self.stats.items >= limits.max_items || id.is_empty() || id.len() > limits.max_id_bytes
-            || bytes.len() > limits.max_input_bytes_per_item { return Err(JobError::Limit); }
-        let snapshot = self.stats.snapshot_bytes.checked_add(id.len() as u64)
-            .and_then(|n| n.checked_add(bytes.len() as u64))
-            .and_then(|n| n.checked_add(bytes.len() as u64))
-            .filter(|&n| n <= limits.max_snapshot_bytes).ok_or(JobError::Limit)?;
-        self.stats.input_bytes = self.stats.input_bytes.checked_add(bytes.len() as u64).ok_or(JobError::Limit)?;
-        self.items.try_reserve(1).map_err(|_| JobError::Allocation)?;
-        self.items.push(Envelope { id, bytes });
-        self.stats.items += 1;
-        self.stats.input_lines = self.stats.items;
-        self.stats.snapshot_bytes = snapshot;
-        Ok(())
-    }
     pub fn inputs(&self) -> impl ExactSizeIterator<Item = JobInput<'_>> + '_ {
         self.items.iter().map(|item| JobInput { id: &item.id, original: &item.bytes, normalized: &item.bytes })
     }

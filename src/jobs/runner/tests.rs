@@ -182,6 +182,100 @@ fn retained_resume_refreezes_recipe_identity_and_limits_before_result_repair() {
 }
 
 #[test]
+fn retained_resume_validates_typed_arguments_in_committed_and_pending_records_before_repair() {
+    use std::io::Write;
+    for invalid_ordinal in 0..2 {
+        let root = Root::new(); let events = Rc::new(Events::default());
+        let processor = Processor::new(events.clone()); let mut control = Control::default();
+        let invalid = if invalid_ordinal == 0 {
+            br#"{"id":"alpha","text":"valid envelope","task_args":{"v":"wrong type"}}"#.as_slice()
+        } else {
+            br#"{"id":"beta","text":"valid envelope","task_args":{"v":"wrong type"}}"#.as_slice()
+        };
+        let mut population = inputs();
+        population[invalid_ordinal] = JobInput { id: population[invalid_ordinal].id,
+            original: invalid, normalized: invalid };
+        // The lower-level owner accepts opaque typed arguments. Produce an
+        // authentic fixture with the real runner recipe, so only P::Args can
+        // detect this incompatibility; stored population hashes all agree.
+        let mut fresh = manifest_builder(&key(), JobId([7;16]), limits(), &processor, &mut control).unwrap();
+        for input in &population { fresh.push(&key(), input, &mut control).unwrap(); }
+        let mut job = OwnedJob::create_with_retained_inputs(&root.0, key(), fresh.finish(&key()).unwrap(),
+            retention(), &population, &mut control).unwrap();
+        job.begin(&population[0], work(), &mut control).unwrap().commit(&1_u64, &mut control).unwrap();
+        drop(job);
+        let mut output = fs::OpenOptions::new().append(true).open(root.0.join("results.spool")).unwrap();
+        output.write_all(b"uncommitted result tail").unwrap(); output.sync_all().unwrap(); drop(output);
+        let before = fs::read(root.0.join("results.spool")).unwrap();
+        assert_eq!(err(JobRunner::resume_with_retained_inputs(&root.0, key(), JobId([7;16]), limits(),
+            retention(), processor, TailPolicy::DiscardUncommitted, &mut control)), JobRunError::InvalidEnvelope);
+        assert_eq!(fs::read(root.0.join("results.spool")).unwrap(), before);
+        assert!(events.prepared.borrow().is_empty()); assert!(events.executed.borrow().is_empty());
+        let stored = crate::jobs::StoredJob::open(&root.0, key(), JobId([7;16]), limits(), &mut control).unwrap();
+        assert_eq!(stored.status().unwrap().committed, 1);
+    }
+}
+
+#[test]
+fn retained_replay_read_failure_or_cancellation_stops_before_new_debit_and_releases_owners() {
+    use std::io::{Seek, SeekFrom, Write};
+    for corrupt in [true, false] {
+        let root = Root::new(); let population = inputs(); let mut control = Control::default();
+        drop(JobRunner::create_with_retained_inputs(&root.0, key(), JobId([7;16]), limits(), retention(),
+            &population, Processor::new(Rc::new(Events::default())), &mut control).unwrap());
+        let original = fs::read(root.0.join("inputs.spool")).unwrap();
+        let events = Rc::new(Events::default());
+        let mut run = JobRunner::resume_with_retained_inputs(&root.0, key(), JobId([7;16]), limits(),
+            retention(), Processor::new(events.clone()), TailPolicy::Refuse, &mut control).unwrap();
+        #[cfg(target_os = "linux")]
+        let retained_fd = fs::read_dir("/proc/self/fd").unwrap().filter_map(Result::ok)
+            .map(|entry| entry.path()).find(|path| fs::read_link(path).ok().as_deref()
+                == Some(root.0.join("inputs.spool").as_path())).expect("retained file stays open with its owner");
+        if corrupt {
+            let mut file = fs::OpenOptions::new().write(true).open(root.0.join("inputs.spool")).unwrap();
+            file.seek(SeekFrom::Start(crate::jobs::retained::HEADER_BYTES as u64)).unwrap();
+            file.write_all(b"X").unwrap(); file.sync_all().unwrap();
+        }
+        let mut cancel = Control { calls: 0, stop_at: if corrupt { None } else { Some(3) } };
+        let expected = if corrupt { JobError::Authentication }
+            else { JobError::Cancelled(DecodeCancellationKind::Deadline) };
+        assert_eq!(err(run.step(&mut cancel)), JobRunError::Storage(expected));
+        assert!(run.is_stopped()); assert!(run.job.is_poisoned());
+        assert_eq!(run.progress().attempts, 0); assert_eq!(run.progress().committed, 0);
+        assert_eq!(err(run.step(&mut control)), JobRunError::Stopped);
+        assert!(events.prepared.borrow().is_empty()); assert!(events.executed.borrow().is_empty());
+        assert_eq!(crate::jobs::tests::error(crate::jobs::StoredJob::open(&root.0, key(), JobId([7;16]),
+            limits(), &mut control)), JobError::Busy);
+        drop(run);
+        #[cfg(target_os = "linux")]
+        assert_ne!(fs::read_link(retained_fd).ok().as_deref(), Some(root.0.join("inputs.spool").as_path()));
+        // Restore the fixture's externally damaged bytes before checking that
+        // the exclusive owner can reopen; this grants no in-session retry.
+        if corrupt { fs::write(root.0.join("inputs.spool"), &original).unwrap(); }
+        let stored = crate::jobs::StoredJob::open(&root.0, key(), JobId([7;16]), limits(), &mut control).unwrap();
+        assert_eq!(stored.status().unwrap().attempts, 0);
+    }
+}
+
+#[test]
+fn complete_retained_resume_starts_at_eof_without_another_delivery() {
+    let root = Root::new(); let population = inputs(); let mut control = Control::default();
+    let mut created = JobRunner::create_with_retained_inputs(&root.0, key(), JobId([7;16]), limits(),
+        retention(), &population, Processor::new(Rc::new(Events::default())), &mut control).unwrap();
+    assert_eq!(created.run(&mut control).unwrap().committed, 2); drop(created);
+    let events = Rc::new(Events::default());
+    let mut resumed = JobRunner::resume_with_retained_inputs(&root.0, key(), JobId([7;16]), limits(),
+        retention(), Processor::new(events.clone()), TailPolicy::Refuse, &mut control).unwrap();
+    match &resumed.inputs { Inputs::Retained(cursor) => assert_eq!(cursor.ordinal(), 2),
+        Inputs::Borrowed(_) => panic!("retained replay must own its cursor") }
+    assert!(resumed.step(&mut control).unwrap().is_none());
+    assert_eq!(resumed.run(&mut control).unwrap().attempts, 2);
+    assert_eq!(resumed.read_committed(0, &mut control).unwrap(), b"1");
+    assert_eq!(resumed.read_committed(1, &mut control).unwrap(), b"2");
+    assert!(events.prepared.borrow().is_empty()); assert!(events.executed.borrow().is_empty());
+}
+
+#[test]
 fn damaged_retained_input_blocks_repair_even_when_original_inputs_are_supplied() {
     use std::io::{Seek, SeekFrom, Write};
     let root = Root::new(); let population = inputs(); let mut control = Control::default();

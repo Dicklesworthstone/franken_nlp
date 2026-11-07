@@ -4,11 +4,12 @@
 //! normalization only. It does not turn the live batch epoch into a snapshot.
 //! No task failures are cached as successful results and no retry is implicit.
 use super::{FrozenManifest, InputRetentionLimits, JobContract, JobError, JobId, JobInput, JobLimits, JobProgress,
-    JobSecret, JobWork, OwnedJob, TailPolicy, checkpoint, population::JobPopulation};
+    JobSecret, JobWork, OwnedJob, TailPolicy, checkpoint,
+    manifest::ManifestBuilder, retained::RetainedInputCursor};
 use crate::{batch::{BatchDocument, BatchFault, BatchItemFailure, BatchProcessor, BatchRequestContext},
     canonjson, execution_identity::ExecutionIdentity, native_engine::decode::DecodeStepControl};
 use serde::Serialize;
-use std::{error::Error, fmt, path::Path};
+use std::{error::Error, fmt, fs::File, path::Path};
 
 pub mod source;
 pub mod extract;
@@ -62,28 +63,31 @@ struct Recipe<'a, R: Serialize + ?Sized> {
     processor: &'a R,
 }
 
-/// The exact borrowed or retained population cannot change between freeze and execution.
+/// Every execution input is authenticated against the complete frozen population.
 /// No raw job/processor mutation or retry/reset handle is exposed. The host
 /// accounts for input, planning, journal, canonicalization and frame staging
 /// memory in addition to the native admission guard. Work debits are durable;
 /// memory admission is deliberately NOT inferred from JobLimits.
 pub struct JobRunner<'items, 'bytes, P: DurableBatchProcessor> {
+    // Declaration order is the cleanup contract: the input file and its one
+    // record buffer close BEFORE OwnedJob releases its exclusive storage lock.
+    inputs: Inputs<'items, 'bytes>,
     job: OwnedJob,
     processor: P,
-    inputs: Inputs<'items, 'bytes>,
     limits: JobLimits,
     stopped: bool,
 }
 enum Inputs<'items, 'bytes> {
     Borrowed(&'items [JobInput<'bytes>]),
-    Retained(JobPopulation),
+    Retained(RetainedInputCursor<File>),
 }
 impl Inputs<'_, '_> {
-    fn get(&self, ordinal: usize) -> Option<JobInput<'_>> {
+    fn get<'input, C: DecodeStepControl>(&'input mut self, ordinal: usize,
+        job: &mut OwnedJob, control: &mut C) -> Result<JobInput<'input>, JobError> {
         match self {
             Self::Borrowed(inputs) => inputs.get(ordinal).map(|input| JobInput {
-                id: input.id, original: input.original, normalized: input.normalized }),
-            Self::Retained(population) => population.input(ordinal),
+                id: input.id, original: input.original, normalized: input.normalized }).ok_or(JobError::Corrupt),
+            Self::Retained(cursor) => job.read_retained_input(cursor, control),
         }
     }
 }
@@ -122,22 +126,23 @@ impl<'items, 'bytes, P: DurableBatchProcessor> JobRunner<'items, 'bytes, P> {
         Ok(Self { job, processor, inputs: Inputs::Borrowed(inputs), limits, stopped: false })
     }
     /// Restore only an explicitly retained, authenticated complete snapshot.
-    /// No original reader is needed. This runner owns the restored buffers;
-    /// hosts must admit them before entering. The clean processor is refrozen
-    /// against the exact bytes before result-tail repair or any new debit.
+    /// No original reader is needed. The runner first authenticates and
+    /// refreezes EVERY input with the clean processor's typed arguments and
+    /// recipe, then replays pending inputs through one reusable record buffer.
+    /// Hosts admit that record plus the bounded keyed index before entering.
+    /// Result-tail repair and new debits follow the complete initial scan.
     pub fn resume_with_retained_inputs<C: DecodeStepControl>(root: &Path, key: JobSecret,
         job_id: JobId, limits: JobLimits, retention: InputRetentionLimits, processor: P,
         tail: TailPolicy, control: &mut C) -> Result<Self, JobRunError> {
         checkpoint(control)?;
-        limits.validate()?;
         retention.validate()?;
-        processor.validate_job_limits(limits).map_err(JobRunError::Processor)?;
-        let (job, population) = OwnedJob::resume_with_retained_inputs(root, key, job_id, limits,
-            retention, tail, control, |key, population, control| {
-                let inputs = population.borrowed_inputs()?;
-                freeze(key, job_id, limits, &inputs, &processor, control)
+        let fresh = manifest_builder(&key, job_id, limits, &processor, control)?;
+        let (job, cursor) = OwnedJob::resume_with_retained_inputs(root, key, job_id, limits,
+            retention, tail, fresh, control, |input, _| -> Result<(), JobRunError> {
+                drop(parse::<P>(input, limits)?);
+                Ok(())
             })?;
-        Ok(Self { job, processor, inputs: Inputs::Retained(population), limits, stopped: false })
+        Ok(Self { job, processor, inputs: Inputs::Retained(cursor), limits, stopped: false })
     }
     pub fn progress(&self) -> JobProgress { self.job.progress() }
     pub fn is_stopped(&self) -> bool { self.stopped || self.job.is_poisoned() }
@@ -159,7 +164,7 @@ impl<'items, 'bytes, P: DurableBatchProcessor> JobRunner<'items, 'bytes, P> {
         self.stopped = true;
         checkpoint(control)?;
         let ordinal = usize::try_from(progress.committed).map_err(|_| JobError::Limit)?;
-        let input = self.inputs.get(ordinal).ok_or(JobError::Corrupt)?;
+        let input = self.inputs.get(ordinal, &mut self.job, control)?;
         let document = parse::<P>(&input, self.limits)?;
         let prepared = self.processor.prepare_with_control(document, control)?;
         checkpoint(control)?;
@@ -215,20 +220,25 @@ impl<'items, 'bytes, P: DurableBatchProcessor> JobRunner<'items, 'bytes, P> {
 fn freeze<P: DurableBatchProcessor, C: DecodeStepControl>(key: &JobSecret, job_id: JobId,
     limits: JobLimits, inputs: &[JobInput<'_>], processor: &P, control: &mut C)
     -> Result<FrozenManifest, JobRunError> {
-    limits.validate()?;
-    processor.validate_job_limits(limits).map_err(JobRunError::Processor)?;
     // Freeze first bounds the TOTAL population before envelope parsing. It
     // retains only keyed metadata and performs no filesystem/native work.
-    let recipe = Recipe { protocol: OWNED_BATCH_PROTOCOL,
-        input_profile: "identity-json-envelope-v1", processor: processor.job_recipe() };
-    let manifest = FrozenManifest::freeze(key, JobContract { job_id,
-        execution: processor.execution_identity(), recipe: &recipe, limits },
-        inputs.iter().map(|input| JobInput { id: input.id, original: input.original, normalized: input.normalized }), control)?;
+    let mut fresh = manifest_builder(key, job_id, limits, processor, control)?;
+    for input in inputs { fresh.push(key, input, control)?; }
+    let manifest = fresh.finish(key)?;
     for input in inputs {
         checkpoint(control)?;
         drop(parse::<P>(input, limits)?);
     }
     Ok(manifest)
+}
+fn manifest_builder<P: DurableBatchProcessor, C: DecodeStepControl>(key: &JobSecret, job_id: JobId,
+    limits: JobLimits, processor: &P, control: &mut C) -> Result<ManifestBuilder, JobRunError> {
+    limits.validate()?;
+    processor.validate_job_limits(limits).map_err(JobRunError::Processor)?;
+    let recipe = Recipe { protocol: OWNED_BATCH_PROTOCOL,
+        input_profile: "identity-json-envelope-v1", processor: processor.job_recipe() };
+    Ok(ManifestBuilder::new(key, JobContract { job_id, execution: processor.execution_identity(),
+        recipe: &recipe, limits }, control)?)
 }
 fn parse<P: BatchProcessor>(input: &JobInput<'_>, limits: JobLimits)
     -> Result<BatchDocument<P::Args>, JobRunError> {

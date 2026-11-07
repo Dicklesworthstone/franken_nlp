@@ -136,57 +136,147 @@ pub(super) fn write<W: Write + Seek, C: DecodeStepControl>(writer: &mut W, key: 
         commitment: finish(key, chain, manifest.item_count(), offset) })
 }
 
-/// Validate framing, every envelope, every keyed item, and the final chain.
-/// Only one bounded frame and its strict JSON parser are transient. A visitor
-/// may retain that owned buffer; no additional population-sized copy exists.
-/// Visitors must discard all state if the final receipt check fails.
-pub(super) fn read<R: Read + Seek, C: DecodeStepControl>(reader: &mut R, key: &JobSecret,
-    manifest: &FrozenManifest, receipt: &InputReceipt, control: &mut C,
-    mut visit: impl FnMut(String, Vec<u8>) -> Result<(), JobError>) -> Result<(), JobError> {
-    receipt.validate(manifest.limits, manifest.item_count())?;
-    if reader.seek(SeekFrom::End(0)).map_err(|_| JobError::Io)? != receipt.spool_bytes {
-        return Err(JobError::Corrupt);
-    }
-    reader.seek(SeekFrom::Start(0)).map_err(|_| JobError::Io)?;
-    let mut chain = start(key, &manifest.binding, receipt.max_spool_bytes);
-    let mut offset = 0_u64;
-    let mut snapshot_bytes = 0_u64;
-    for ordinal in 0..receipt.items {
+/// Opaque position from this exact receipt. A bookmark is useful only after
+/// its owner has verified the WHOLE spool; it is never independent authority.
+#[derive(Clone, Copy)]
+pub(super) struct InputBookmark {
+    receipt: Commitment,
+    ordinal: u64,
+    offset: u64,
+    snapshot_bytes: u64,
+    chain: Commitment,
+}
+
+/// One reusable input buffer and one sequential file handle. Lending the
+/// current envelope prevents another read while planning/execution still uses
+/// its bytes. No input population, frame-offset index, or caller-controlled
+/// seek handle escapes. The enclosing runner drops this owner before its job
+/// lock. Hosts price the maximum record plus strict parser storage separately
+/// from the bounded keyed manifest/uniqueness index.
+pub(super) struct RetainedInputCursor<R> {
+    reader: R,
+    receipt: InputReceipt,
+    binding: Binding,
+    limits: JobLimits,
+    ordinal: u64,
+    offset: u64,
+    snapshot_bytes: u64,
+    chain: Commitment,
+    bytes: Vec<u8>,
+    id: String,
+    whole_spool_verified: bool,
+    poisoned: bool,
+}
+impl<R: Read + Seek> RetainedInputCursor<R> {
+    pub(super) fn new<C: DecodeStepControl>(mut reader: R, key: &JobSecret,
+        manifest: &FrozenManifest, receipt: &InputReceipt, control: &mut C) -> Result<Self, JobError> {
         checkpoint(control)?;
+        receipt.validate(manifest.limits, manifest.item_count())?;
+        if reader.seek(SeekFrom::End(0)).map_err(|_| JobError::Io)? != receipt.spool_bytes {
+            return Err(JobError::Corrupt);
+        }
+        reader.seek(SeekFrom::Start(0)).map_err(|_| JobError::Io)?;
+        Ok(Self { reader, receipt: receipt.clone(), binding: manifest.binding.clone(), limits: manifest.limits,
+            ordinal: 0, offset: 0, snapshot_bytes: 0,
+            chain: start(key, &manifest.binding, receipt.max_spool_bytes), bytes: Vec::new(), id: String::new(),
+            whole_spool_verified: false, poisoned: false })
+    }
+    pub(super) fn ordinal(&self) -> u64 { self.ordinal }
+    pub(super) fn bookmark(&self) -> Result<InputBookmark, JobError> {
+        if self.poisoned { return Err(JobError::Poisoned); }
+        Ok(InputBookmark { receipt: self.receipt.commitment, ordinal: self.ordinal,
+            offset: self.offset, snapshot_bytes: self.snapshot_bytes, chain: self.chain })
+    }
+    /// Resume the same sequential chain at the next pending ordinal, without
+    /// rereading committed inputs during execution. Full initial verification
+    /// and a freshly reconstructed native contract must precede this call.
+    pub(super) fn replay_from<C: DecodeStepControl>(&mut self, position: InputBookmark,
+        control: &mut C) -> Result<(), JobError> {
+        if self.poisoned { return Err(JobError::Poisoned); }
+        self.poisoned = true;
+        checkpoint(control)?;
+        if !self.whole_spool_verified || !position.receipt.matches(self.receipt.commitment)
+            || position.ordinal > self.receipt.items || position.offset > self.receipt.spool_bytes
+            || position.snapshot_bytes > self.limits.max_snapshot_bytes
+            || (position.ordinal == self.receipt.items) != (position.offset == self.receipt.spool_bytes) {
+            return Err(JobError::InvalidTransition);
+        }
+        self.reader.seek(SeekFrom::Start(position.offset)).map_err(|_| JobError::Io)?;
+        self.ordinal = position.ordinal;
+        self.offset = position.offset;
+        self.snapshot_bytes = position.snapshot_bytes;
+        self.chain = position.chain;
+        self.bytes.clear();
+        self.id.clear();
+        self.poisoned = false;
+        Ok(())
+    }
+    pub(super) fn read_next<C: DecodeStepControl>(&mut self, key: &JobSecret,
+        manifest: &FrozenManifest, control: &mut C) -> Result<Option<JobInput<'_>>, JobError> {
+        if self.poisoned { return Err(JobError::Poisoned); }
+        self.poisoned = true;
+        checkpoint(control)?;
+        manifest.binding.compare(&self.binding)?;
+        if manifest.limits != self.limits { return Err(JobError::Mismatch(super::MismatchField::Limits)); }
+        if self.ordinal == self.receipt.items {
+            self.check_end(key)?;
+            self.poisoned = false;
+            return Ok(None);
+        }
         let mut header = [0_u8; HEADER_BYTES];
-        reader.read_exact(&mut header).map_err(|_| JobError::Corrupt)?;
+        self.reader.read_exact(&mut header).map_err(|_| JobError::Corrupt)?;
         let length = u64::from_le_bytes(header[16..24].try_into().map_err(|_| JobError::Corrupt)?);
-        let end = offset.checked_add(HEADER_BYTES as u64).and_then(|n| n.checked_add(length))
-            .filter(|&n| n <= receipt.spool_bytes).ok_or(JobError::Corrupt)?;
-        let next_snapshot = length.checked_mul(2).and_then(|n| n.checked_add(snapshot_bytes))
-            .filter(|&n| n <= manifest.limits.max_snapshot_bytes).ok_or(JobError::Limit)?;
-        if &header[..8] != MAGIC || header[8..16] != ordinal.to_le_bytes()
-            || length == 0 || length > manifest.limits.max_input_bytes_per_item as u64 {
+        let end = self.offset.checked_add(HEADER_BYTES as u64).and_then(|n| n.checked_add(length))
+            .filter(|&n| n <= self.receipt.spool_bytes).ok_or(JobError::Corrupt)?;
+        let next_snapshot = length.checked_mul(2).and_then(|n| n.checked_add(self.snapshot_bytes))
+            .filter(|&n| n <= self.limits.max_snapshot_bytes).ok_or(JobError::Limit)?;
+        if &header[..8] != MAGIC || header[8..16] != self.ordinal.to_le_bytes()
+            || length == 0 || length > self.limits.max_input_bytes_per_item as u64 {
             return Err(JobError::Corrupt);
         }
         let n = usize::try_from(length).map_err(|_| JobError::Limit)?;
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(n).map_err(|_| JobError::Allocation)?;
-        bytes.resize(n, 0);
-        for chunk in bytes.chunks_mut(8192) {
+        self.id.clear();
+        self.bytes.try_reserve_exact(n.saturating_sub(self.bytes.len())).map_err(|_| JobError::Allocation)?;
+        self.bytes.resize(n, 0);
+        for chunk in self.bytes.chunks_mut(8192) {
             checkpoint(control)?;
-            reader.read_exact(chunk).map_err(|_| JobError::Corrupt)?;
+            self.reader.read_exact(chunk).map_err(|_| JobError::Corrupt)?;
         }
-        let actual = next(key, chain, ordinal, offset, &bytes);
+        let actual = next(key, self.chain, self.ordinal, self.offset, &self.bytes);
         let expected = Commitment(header[24..].try_into().map_err(|_| JobError::Corrupt)?);
         if !actual.matches(expected) { return Err(JobError::Authentication); }
-        let id = envelope_id(&bytes, manifest.limits)?;
-        snapshot_bytes = next_snapshot.checked_add(id.len() as u64)
-            .filter(|&n| n <= manifest.limits.max_snapshot_bytes).ok_or(JobError::Limit)?;
-        manifest.verify_input(key, ordinal, &JobInput { id: &id, original: &bytes, normalized: &bytes })?;
-        visit(id, bytes)?;
-        chain = actual;
-        offset = end;
+        self.id = envelope_id(&self.bytes, self.limits)?;
+        self.snapshot_bytes = next_snapshot.checked_add(self.id.len() as u64)
+            .filter(|&n| n <= self.limits.max_snapshot_bytes).ok_or(JobError::Limit)?;
+        manifest.verify_input(key, self.ordinal, &JobInput { id: &self.id,
+            original: &self.bytes, normalized: &self.bytes })?;
+        self.chain = actual;
+        self.offset = end;
+        self.ordinal += 1;
+        // Do not release the terminal record before the end commitment agrees.
+        if self.ordinal == self.receipt.items { self.check_end(key)?; }
+        checkpoint(control)?;
+        self.poisoned = false;
+        Ok(Some(JobInput { id: &self.id, original: &self.bytes, normalized: &self.bytes }))
     }
-    if offset != receipt.spool_bytes || !finish(key, chain, receipt.items, offset).matches(receipt.commitment) {
-        return Err(JobError::Authentication);
+    fn check_end(&mut self, key: &JobSecret) -> Result<(), JobError> {
+        if self.ordinal != self.receipt.items || self.offset != self.receipt.spool_bytes
+            || !finish(key, self.chain, self.receipt.items, self.offset).matches(self.receipt.commitment) {
+            return Err(JobError::Authentication);
+        }
+        self.whole_spool_verified = true;
+        Ok(())
     }
-    checkpoint(control)
+}
+
+/// Authenticate the complete spool with one reusable record buffer. Visitors
+/// borrow each exact envelope and must discard derived state on ANY failure.
+pub(super) fn read<R: Read + Seek, C: DecodeStepControl>(reader: &mut R, key: &JobSecret,
+    manifest: &FrozenManifest, receipt: &InputReceipt, control: &mut C,
+    mut visit: impl FnMut(&JobInput<'_>) -> Result<(), JobError>) -> Result<(), JobError> {
+    let mut cursor = RetainedInputCursor::new(reader, key, manifest, receipt, control)?;
+    while let Some(input) = cursor.read_next(key, manifest, control)? { visit(&input)?; }
+    Ok(())
 }
 
 #[cfg(test)] mod tests;

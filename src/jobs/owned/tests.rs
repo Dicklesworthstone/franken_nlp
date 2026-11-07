@@ -86,16 +86,21 @@ fn retained_restore_and_fresh_manifest_authorization_share_one_exclusive_lock() 
     let dir = root(); let population = retained_population();
     drop(OwnedJob::create_with_retained_inputs(&dir, key(), retained_manifest(), retained_cap(),
         &population, &mut Control::default()).unwrap());
-    let (job, restored) = OwnedJob::resume_with_retained_inputs(&dir, key(), JobId([7;16]), limits(),
-        retained_cap(), TailPolicy::Refuse, &mut Control::default(), |secret, population, control| {
+    let fresh = crate::jobs::manifest::ManifestBuilder::new(&key(), super::super::JobContract {
+        job_id: JobId([7;16]), execution: &crate::jobs::tests::identity(),
+        recipe: &"retained exact-envelope fixture", limits: limits() }, &mut Control::default()).unwrap();
+    let mut visited = 0;
+    let (job, cursor) = OwnedJob::resume_with_retained_inputs(&dir, key(), JobId([7;16]), limits(),
+        retained_cap(), TailPolicy::Refuse, fresh, &mut Control::default(), |input, _| -> Result<(), JobError> {
             assert_eq!(error(OwnedJob::resume(&dir, key(), retained_manifest(), TailPolicy::Refuse,
                 &mut Control::default())), JobError::Busy);
-            population.freeze(secret, super::super::JobContract { job_id: JobId([7;16]),
-                execution: &crate::jobs::tests::identity(), recipe: &"retained exact-envelope fixture",
-                limits: limits() }, control)
+            assert_eq!(input.id, if visited == 0 { "alpha" } else { "beta" });
+            visited += 1;
+            Ok(())
         }).unwrap();
-    assert_eq!(restored.stats().items, 2);
+    assert_eq!(visited, 2); assert_eq!(cursor.ordinal(), 0);
     assert_eq!(error(StoredJob::open(&dir, key(), JobId([7;16]), limits(), &mut Control::default())), JobError::Busy);
+    drop(cursor);
     drop(job); drop(StoredJob::open(&dir, key(), JobId([7;16]), limits(), &mut Control::default()).unwrap());
 }
 

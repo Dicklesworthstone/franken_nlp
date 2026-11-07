@@ -75,6 +75,50 @@ fn complete_population_uniqueness_precedes_any_execution_or_io() {
     assert_eq!(failure, JobError::DuplicateId);
 }
 #[test]
+fn incremental_manifest_keeps_the_original_population_wire_commitment() {
+    let mut builder = manifest::ManifestBuilder::new(&key(), JobContract { job_id: JobId([7;16]),
+        execution: &identity(), recipe: &"fixed item-local recipe; effective-seed=7", limits: limits() },
+        &mut Control::default()).unwrap();
+    for ordinal in 0..2 {
+        let source = input(ordinal);
+        // Each allocation is destroyed before the next record is bound. The
+        // builder must retain only keyed metadata, never an envelope borrow.
+        let id = source.id.to_owned(); let bytes = source.original.to_vec();
+        builder.push(&key(), &JobInput { id: &id, original: &bytes, normalized: &bytes },
+            &mut Control::default()).unwrap();
+    }
+    let manifest = builder.finish(&key()).unwrap();
+    assert_eq!(manifest.item_count(), 2);
+    // Fixed HMAC-SHA256 vector from the original population-v1 domains and
+    // canonical ItemBinding bytes, independently derived before this refactor.
+    assert_eq!(hex(&manifest.population_commitment().0),
+        "4c19c47b81de6155e723675c6097e8d476dccbcd3397380f68c9e8e9c18ac6c8");
+}
+#[test]
+fn failed_incremental_population_cannot_be_finished_as_a_valid_prefix() {
+    for failure in 0..4 {
+        let mut cap = limits();
+        if failure == 1 { cap.max_items = 1; }
+        let mut builder = manifest::ManifestBuilder::new(&key(), JobContract { job_id: JobId([7;16]),
+            execution: &identity(), recipe: &"fixture", limits: cap }, &mut Control::default()).unwrap();
+        builder.push(&key(), &input(0), &mut Control::default()).unwrap();
+        let result = match failure {
+            0 => builder.push(&key(), &input(0), &mut Control::default()),
+            1 => builder.push(&key(), &input(1), &mut Control::default()),
+            2 => builder.push(&JobSecret::from_bytes([18;32]), &input(1), &mut Control::default()),
+            _ => builder.push(&key(), &input(1), &mut Control { calls: 0, stop_at: Some(1) }),
+        };
+        let expected = match failure {
+            0 => JobError::DuplicateId, 1 => JobError::Limit,
+            2 => JobError::Mismatch(MismatchField::Secret),
+            _ => JobError::Cancelled(DecodeCancellationKind::Deadline),
+        };
+        assert_eq!(error(result), expected);
+        assert_eq!(error(builder.push(&key(), &input(1), &mut Control::default())), JobError::Poisoned);
+        assert_eq!(error(builder.finish(&key())), JobError::Poisoned);
+    }
+}
+#[test]
 fn population_order_original_and_normalized_content_are_bound() {
     let a = manifest();
     let b = FrozenManifest::freeze(&key(), JobContract { job_id: JobId([7; 16]), execution: &identity(),

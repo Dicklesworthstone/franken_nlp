@@ -131,35 +131,11 @@ impl FrozenManifest {
     pub fn freeze<'a, R: Serialize, C: crate::native_engine::decode::DecodeStepControl>(
         key: &JobSecret, contract: JobContract<'_, R>, inputs: impl IntoIterator<Item = JobInput<'a>>,
         control: &mut C) -> Result<Self, JobError> {
-        super::checkpoint(control)?;
-        contract.limits.validate()?;
-        contract.execution.validate().map_err(|_| JobError::InvalidIdentity)?;
-        let execution = bounded_json(contract.execution, 64 * 1024)?;
-        let recipe = bounded_json(contract.recipe, 1024 * 1024)?;
-        let limits = bounded_json(&contract.limits, 16 * 1024)?;
-        let job = &contract.job_id.0;
-        let mut population = key.commit(b"population-start", &[job]);
-        let mut items = Vec::new(); let mut seen = BTreeSet::new(); let mut bytes = 0_u64;
+        let mut builder = ManifestBuilder::new(key, contract, control)?;
         for input in inputs {
-            super::checkpoint(control)?;
-            if items.len() as u64 >= contract.limits.max_items { return Err(JobError::Limit); }
-            let ordinal = items.len() as u64;
-            let item = bind_input(key, contract.job_id, ordinal, &input, contract.limits)?;
-            // Keyed, fixed-size IDs keep private identifier strings out of the
-            // retained index. Hash collision fails closed as a duplicate.
-            if !seen.insert(item.id.0) { return Err(JobError::DuplicateId); }
-            bytes = bytes.checked_add(input.id.len() as u64).and_then(|n| n.checked_add(input.original.len() as u64))
-                .and_then(|n| n.checked_add(input.normalized.len() as u64)).filter(|&n| n <= contract.limits.max_snapshot_bytes)
-                .ok_or(JobError::Limit)?;
-            let encoded = bounded_json(&item, 4096)?;
-            population = key.commit(b"population-next", &[job, &population.0, &encoded]);
-            items.try_reserve(1).map_err(|_| JobError::Allocation)?; items.push(item);
+            builder.push(key, &input, control)?;
         }
-        if items.is_empty() || items.len() as u64 > contract.limits.max_attempts { return Err(JobError::InvalidLimits); }
-        population = key.commit(b"population-end", &[job, &population.0, &(items.len() as u64).to_le_bytes()]);
-        Ok(Self { binding: Binding { job: contract.job_id, secret: key.commit(b"key-check", &[job]),
-            execution: key.commit(b"execution", &[job, &execution]), recipe: key.commit(b"recipe", &[job, &recipe]),
-            population, limits: key.commit(b"limits", &[job, &limits]) }, items, limits: contract.limits })
+        builder.finish(key)
     }
     pub fn item_count(&self) -> u64 { self.items.len() as u64 }
     pub fn job_id(&self) -> JobId { self.binding.job }
@@ -170,6 +146,74 @@ impl FrozenManifest {
         let actual = bind_input(key, self.binding.job, ordinal, input, self.limits)?;
         if &actual != expected { return Err(JobError::Mismatch(MismatchField::Population)); }
         Ok(())
+    }
+}
+
+/// Reconstruct the complete population one borrowed envelope at a time. This
+/// builder retains keyed metadata only: every input must be freshly bound and
+/// the complete uniqueness index remains subject to the existing item ceiling.
+/// A stored population hash cannot substitute for reading the actual bytes.
+pub(super) struct ManifestBuilder {
+    binding: Binding,
+    items: Vec<ItemBinding>,
+    seen: BTreeSet<[u8; 32]>,
+    limits: JobLimits,
+    bytes: u64,
+    failed: bool,
+}
+impl ManifestBuilder {
+    pub(super) fn new<R: Serialize, C: crate::native_engine::decode::DecodeStepControl>(
+        key: &JobSecret, contract: JobContract<'_, R>, control: &mut C) -> Result<Self, JobError> {
+        super::checkpoint(control)?;
+        contract.limits.validate()?;
+        contract.execution.validate().map_err(|_| JobError::InvalidIdentity)?;
+        let execution = bounded_json(contract.execution, 64 * 1024)?;
+        let recipe = bounded_json(contract.recipe, 1024 * 1024)?;
+        let limits = bounded_json(&contract.limits, 16 * 1024)?;
+        let job = &contract.job_id.0;
+        Ok(Self { binding: Binding { job: contract.job_id, secret: key.commit(b"key-check", &[job]),
+            execution: key.commit(b"execution", &[job, &execution]), recipe: key.commit(b"recipe", &[job, &recipe]),
+            population: key.commit(b"population-start", &[job]), limits: key.commit(b"limits", &[job, &limits]) },
+            items: Vec::new(), seen: BTreeSet::new(), limits: contract.limits, bytes: 0, failed: false })
+    }
+    pub(super) fn push<C: crate::native_engine::decode::DecodeStepControl>(&mut self,
+        key: &JobSecret, input: &JobInput<'_>, control: &mut C) -> Result<(), JobError> {
+        if self.failed { return Err(JobError::Poisoned); }
+        self.failed = true;
+        super::checkpoint(control)?;
+        let job = &self.binding.job.0;
+        if !key.commit(b"key-check", &[job]).matches(self.binding.secret) {
+            return Err(JobError::Mismatch(MismatchField::Secret));
+        }
+        if self.items.len() as u64 >= self.limits.max_items { return Err(JobError::Limit); }
+        let item = bind_input(key, self.binding.job, self.items.len() as u64, input, self.limits)?;
+        // Keyed fixed-size IDs preserve whole-snapshot uniqueness without a
+        // second plaintext identifier copy. Hash collisions fail closed.
+        if !self.seen.insert(item.id.0) { return Err(JobError::DuplicateId); }
+        let bytes = self.bytes.checked_add(input.id.len() as u64)
+            .and_then(|n| n.checked_add(input.original.len() as u64))
+            .and_then(|n| n.checked_add(input.normalized.len() as u64))
+            .filter(|&n| n <= self.limits.max_snapshot_bytes).ok_or(JobError::Limit)?;
+        let encoded = bounded_json(&item, 4096)?;
+        self.binding.population = key.commit(b"population-next", &[job, &self.binding.population.0, &encoded]);
+        self.items.try_reserve(1).map_err(|_| JobError::Allocation)?;
+        self.items.push(item);
+        self.bytes = bytes;
+        self.failed = false;
+        Ok(())
+    }
+    pub(super) fn finish(mut self, key: &JobSecret) -> Result<FrozenManifest, JobError> {
+        if self.failed { return Err(JobError::Poisoned); }
+        let job = &self.binding.job.0;
+        if !key.commit(b"key-check", &[job]).matches(self.binding.secret) {
+            return Err(JobError::Mismatch(MismatchField::Secret));
+        }
+        if self.items.is_empty() || self.items.len() as u64 > self.limits.max_attempts {
+            return Err(JobError::InvalidLimits);
+        }
+        self.binding.population = key.commit(b"population-end", &[job, &self.binding.population.0,
+            &(self.items.len() as u64).to_le_bytes()]);
+        Ok(FrozenManifest { binding: self.binding, items: self.items, limits: self.limits })
     }
 }
 fn bind_input(key: &JobSecret, job: JobId, ordinal: u64, input: &JobInput<'_>, limits: JobLimits)
