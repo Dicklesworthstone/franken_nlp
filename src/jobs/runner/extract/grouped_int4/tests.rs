@@ -85,6 +85,21 @@ fn freeze(planner: &Int4ExtractionJobPlanner) -> FrozenManifest {
 }
 
 #[test]
+fn injected_selected_plans_refuse_before_durable_work_is_journalable() {
+    let p = planner();
+    let dense = p.compiler.prepare(shared_document(document("Alice")).unwrap()).unwrap();
+    let masks = p.recipe.native.max_visits_per_item;
+    assert_eq!(durable_plan_work(&dense, masks).unwrap(), JobWork::from_int4(dense.planned_work(), masks));
+    for max_rows_per_step in [7, NANBEIGE_VOCAB_SIZE] {
+        let selected = planner().compiler.with_selected_rows(
+            crate::native_engine::constrained_int4::sparse::Int4JsonSparseLimits { max_rows_per_step }).unwrap();
+        let prepared = selected.prepare(shared_document(document("Alice")).unwrap()).unwrap();
+        let failure = durable_plan_work(&prepared, masks).unwrap_err();
+        assert!(failure.stop); assert_eq!(failure.fault.code, BatchCode::Admission);
+    }
+}
+
+#[test]
 fn exact_schema_and_source_bytes_are_bound_without_privileged_marker_tokens() {
     let mut args = defaults();
     args.schema = format!(" {{\"type\":\"number\",\"const\":{NUMBER}}} \n");

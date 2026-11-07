@@ -1,5 +1,6 @@
 use super::*;
 use crate::native_engine::lmhead::NANBEIGE_VOCAB_SIZE;
+mod selected;
 
 fn matches(extra: &[&str]) -> clap::ArgMatches {
     let mut argv = vec!["extract-batch", "--source-dir", "explicit-source",

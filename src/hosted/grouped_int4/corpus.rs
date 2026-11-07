@@ -14,7 +14,7 @@ use crate::{
             Int4ExtractionBatchAdmission, Int4ExtractionBatchLimits,
             Int4ExtractionBatchPlanner, NativeInt4ExtractionBatch}}},
     hosted::corpus::CorpusLimits,
-    native_engine::{constrained_int4, kv::KV_BYTES_PER_TOKEN,
+    native_engine::{constrained_int4::{self, sparse::Int4JsonSparseLimits}, kv::KV_BYTES_PER_TOKEN,
         lmhead::NANBEIGE_VOCAB_SIZE, strict_int4::Int4Work},
 };
 
@@ -54,6 +54,7 @@ impl NlpEngine {
         }
         constrained_int4::check_model(planner.base_execution_identity(), model.model_identity())
             .map_err(|_| HostedError::ModelIdentity)?;
+        let selected_rows = planner.selected_rows();
         let required = requirements(model.model_identity().group_width(), native_work, limits)?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
@@ -73,7 +74,7 @@ impl NlpEngine {
             })?;
             let admission = CorpusAdmission { lease: &lease, model: model.model_identity(),
                 kv_bytes: required.native.kv_bytes, masks: native_work.masks,
-                output_bytes: limits.transport.max_output_line_bytes as u64 };
+                output_bytes: limits.transport.max_output_line_bytes as u64, selected_rows };
             let result = {
                 let mut processor = NativeInt4ExtractionBatch::new(
                     planner, &mut engine.value, &vocabulary, admission, native_work,
@@ -109,6 +110,7 @@ struct CorpusAdmission<'a> {
     kv_bytes: u64,
     masks: ExtractionMaskBudget,
     output_bytes: u64,
+    selected_rows: Option<Int4JsonSparseLimits>,
 }
 impl Int4ExtractionBatchAdmission for CorpusAdmission<'_> {
     type Guard = Pending;
@@ -123,9 +125,8 @@ impl CorpusAdmission<'_> {
         -> Result<(ExecutionIdentity, Pending), BatchItemFailure> {
         constrained_int4::check_model(request.identity, self.model)
             .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
-        check_request_for_task(self.model.group_width(), self.kv_bytes, self.output_bytes,
-            self.masks, &request, task_spec)?;
-        let tokens = request.model_work.projected_logits / NANBEIGE_VOCAB_SIZE as u64;
+        let tokens = check_request_for_projection(self.model.group_width(), self.kv_bytes, self.output_bytes,
+            self.masks, &request, task_spec, self.selected_rows)?;
         // Keep the reservation live through result allocation, serialization
         // and writer delivery. Allocation has not happened at admission, so
         // no committed-memory receipt is fabricated here. GuardedOutput drops
@@ -144,6 +145,16 @@ fn check_request(width: usize, kv_bytes: u64, output_bytes: u64,
 fn check_request_for_task(width: usize, kv_bytes: u64, output_bytes: u64,
     masks: ExtractionMaskBudget, request: &Int4ExtractionAdmission<'_>, task_spec: &str)
     -> Result<(), BatchItemFailure> {
+    check_request_for_projection(width, kv_bytes, output_bytes, masks, request, task_spec, None).map(|_| ())
+}
+
+/// The planner fixes this projection policy for the entire serial stream.
+/// Planned rows are exactly output-token ceiling times rows per selection;
+/// using the vocabulary width for sparse work would underreserve output.
+/// Actual sparse row counts never supply admission authority here.
+fn check_request_for_projection(width: usize, kv_bytes: u64, output_bytes: u64,
+    masks: ExtractionMaskBudget, request: &Int4ExtractionAdmission<'_>, task_spec: &str,
+    selected_rows: Option<Int4JsonSparseLimits>) -> Result<u64, BatchItemFailure> {
     constrained_int4::check_profile(request.identity, width)
         .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
     if !matches!(task_spec, "extract-v1" | "ner-v1" | "keyphrases-v1" | "summarize-v1" | "answer-v1")
@@ -155,10 +166,16 @@ fn check_request_for_task(width: usize, kv_bytes: u64, output_bytes: u64,
         || request.mask_limits.checkpoint_interval_nodes != masks.per_mask.checkpoint_interval_nodes {
         return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
     }
+    let rows_per_token = match selected_rows {
+        Some(limits) if task_spec == "extract-v1" => limits.validate()
+            .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))? as u64,
+        Some(_) => return Err(BatchItemFailure::fatal(BatchCode::Admission)),
+        None => NANBEIGE_VOCAB_SIZE as u64,
+    };
     let work = request.model_work;
     if work.forward_positions == 0 || work.projected_logits == 0
-        || work.projected_logits % NANBEIGE_VOCAB_SIZE as u64 != 0
-        || work.projected_logits / NANBEIGE_VOCAB_SIZE as u64 > work.forward_positions {
+        || work.projected_logits % rows_per_token != 0
+        || work.projected_logits / rows_per_token > work.forward_positions {
         return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
     }
     if work.forward_positions > kv_bytes / KV_BYTES_PER_TOKEN as u64 {
@@ -174,7 +191,7 @@ fn check_request_for_task(width: usize, kv_bytes: u64, output_bytes: u64,
     if request.max_result_bytes == 0 || request.max_result_bytes > output_bytes {
         return Err(BatchItemFailure::reject(BatchCode::OutputLineLimit));
     }
-    Ok(())
+    Ok(work.projected_logits / rows_per_token)
 }
 
 fn admission_failure(error: HostedError) -> BatchItemFailure {

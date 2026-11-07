@@ -8,7 +8,7 @@ use super::*;
 use crate::{
     native_engine::{generation::grouped_int4::bind_candidate_model,
         strict_int4::{Int4ModelIdentity, Int4Work, STRICT_INT4_EXECUTION},
-        constrained_int4::Int4JsonError},
+        constrained_int4::{Int4JsonError, sparse::Int4JsonSparseLimits}},
     tasks::extract::grouped_int4::{Int4ExtractError, Int4ExtractPlan},
     tokenizer::pinned_controls,
 };
@@ -25,6 +25,7 @@ pub use cohort::{Int4ExtractionCohortBatchLimits, Int4ExtractionCohortBatchStats
 
 pub struct Int4ExtractionBatchPlanner {
     compiler: ExtractionBatchPlanner, group_width: usize, shared_defaults_only: bool,
+    selected_rows: Option<Int4JsonSparseLimits>,
 }
 pub struct PreparedInt4BatchExtraction {
     plan: Int4ExtractPlan,
@@ -80,10 +81,30 @@ impl Int4ExtractionBatchPlanner {
         defaults: Option<ExtractionBatchArgs>) -> Result<Self, BatchFault> {
         Ok(Self { compiler: ExtractionBatchPlanner::pinned_for_backend(controls, eos, identity,
             ceiling, compiler_limits, source_limits, defaults, ExtractionBackend::Int4 { group_width })?,
-            group_width, shared_defaults_only: false })
+            group_width, shared_defaults_only: false, selected_rows: None })
     }
     pub fn base_execution_identity(&self) -> &ExecutionIdentity { &self.compiler.identity }
     pub fn group_width(&self) -> usize { self.group_width }
+
+    /// Fix the complete legal-row projection strategy for this serial stream.
+    /// Each actual schema/source plan binds this exact cap before admission;
+    /// item arguments cannot replace it. Native cohorts, document maps and
+    /// durable jobs retain their full-vocabulary contracts.
+    pub fn with_selected_rows(mut self, limits: Int4JsonSparseLimits) -> Result<Self, BatchFault> {
+        limits.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        if self.selected_rows.is_some() { return Err(BatchCode::InvalidLimits.into()); }
+        self.selected_rows = Some(limits);
+        Ok(self)
+    }
+    pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.selected_rows }
+    pub(crate) fn require_full_projection(&self) -> Result<(), BatchFault> {
+        if self.selected_rows.is_some() { return Err(BatchCode::Admission.into()); }
+        Ok(())
+    }
+    pub(crate) fn check_projection(&self, prepared: &PreparedInt4BatchExtraction) -> Result<(), BatchFault> {
+        if prepared.plan.selected_rows() != self.selected_rows { return Err(BatchCode::Admission.into()); }
+        Ok(())
+    }
 
     /// Select another explicitly loaded model while sharing only immutable
     /// pinned tokenizer/scaffold assets. Source, grammar and executable state
@@ -92,7 +113,8 @@ impl Int4ExtractionBatchPlanner {
         let mut compiler = self.compiler.clone();
         compiler.identity = bind_candidate_model(compiler.identity.clone(), model)
             .map_err(|_| BatchCode::Admission)?;
-        Ok(Self { compiler, group_width: model.group_width(), shared_defaults_only: self.shared_defaults_only })
+        Ok(Self { compiler, group_width: model.group_width(), shared_defaults_only: self.shared_defaults_only,
+            selected_rows: self.selected_rows })
     }
 
     /// Seal a shared schema/grounding/budget policy for the whole input stream.
@@ -130,6 +152,10 @@ impl Int4ExtractionBatchPlanner {
             Int4ExtractPlan::from_task_plan(&task, &schema, options, c.compiler_limits,
                 &c.controls, c.identity.clone(), self.group_width)
         }.map_err(planning_failure)?;
+        let plan = match self.selected_rows {
+            Some(limits) => plan.with_selected_rows(limits).map_err(planning_failure)?,
+            None => plan,
+        };
         Ok(PreparedInt4BatchExtraction { plan, task, source, request_digest })
     }
 }
@@ -173,6 +199,7 @@ fn planning_failure(error: Int4ExtractError) -> BatchItemFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod selected;
     use crate::{artifact::converter::PINNED_REVISION,
         native_engine::{decode::DecodeCancellationKind, generation::grouped_int4::INT4_SOURCE_FORMAT,
             portable_int8::int4::convert::GROUPED_INT4_RECIPE},

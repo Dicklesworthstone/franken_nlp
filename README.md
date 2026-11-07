@@ -374,9 +374,12 @@ scored explicitly, and native work reports the actual projected rows.
 
 The option composes with `--prefill-rows` and, for extraction, `--source-membership`.
 It binds a distinct execution identity before host admission and preserves
-the built-in source finalizers. Full-vocabulary execution remains the default;
-shared batch, map, durable-job, redaction and semantic second-reader routes
-reject this one-off option. Prose fields can require a large row cap and fail
+the built-in source finalizers. Serial `extract-batch` also accepts a fixed
+`--max-selected-rows` for its entire resident stream, with exact output-token
+admission and cumulative native/mask limits. Its `--cohort-documents` mode,
+source-task batches, maps, durable jobs, redaction and semantic second-reader
+routes reject selected rows. Full-vocabulary execution remains the default.
+Prose fields can require a large row cap and fail
 explicitly when it is too small. See [selected-row INT4 source tasks](docs/int4-selected-rows.md)
 for CLI/library examples, accounting and the pending native-parity and
 performance gates.

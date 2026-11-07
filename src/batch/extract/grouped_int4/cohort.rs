@@ -73,6 +73,7 @@ impl<'w, 'v, A: Int4ExtractionBatchAdmission> NativeInt4ExtractionCohortBatch<'w
     pub fn new(compiler: Int4ExtractionBatchPlanner, weights: &'w Int4ModelWeights,
         vocabulary: &'v ExtractionVocabulary, admission: A, work: Int4ExtractionBatchLimits,
         limits: Int4ExtractionCohortBatchLimits, kernel: PackedInt4Kernel) -> Result<Self, BatchFault> {
+        compiler.require_full_projection()?;
         work.validate()?; limits.validate(compiler.group_width())?;
         crate::native_engine::constrained_int4::check_model(compiler.base_execution_identity(), weights.identity())
             .map_err(|_| BatchCode::Admission)?;

@@ -32,6 +32,7 @@ impl NlpEngine {
         if planner.group_width() != model.model_identity().group_width() { return Err(HostedError::ModelIdentity); }
         constrained_int4::check_model(planner.base_execution_identity(), model.model_identity())
             .map_err(|_| HostedError::ModelIdentity)?;
+        planner.require_full_projection().map_err(HostedError::BatchSetup)?;
         let required = Int4ExtractionCohortMemoryLimits {
             max_documents, context_tokens: limits.native.context_tokens,
             preparation_reserve_bytes: limits.preparation_reserve_bytes,

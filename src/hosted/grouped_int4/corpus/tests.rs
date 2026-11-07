@@ -209,3 +209,89 @@ fn owned_corpus_inputs_can_cross_the_existing_blocking_boundary() {
     send::<Int4ExtractionBatchPlanner>();
     send::<Arc<ExtractionVocabulary>>();
 }
+
+#[test]
+fn fixed_sparse_ceiling_reserves_exact_output_tokens_and_full_physical_memory() {
+    for width in [1, 32, 127, 128] {
+        let id = identity(width);
+        for max_rows_per_step in [1, 7, NANBEIGE_VOCAB_SIZE] {
+            let selected = Int4JsonSparseLimits { max_rows_per_step };
+            let mut request = request(&id, width);
+            request.model_work = constrained_int4::sparse::planned_work(width, 8, 4, selected).unwrap();
+            let tokens = check_request_for_projection(width, request.kv_reservation_bytes, 8192,
+                masks(), &request, "extract-v1", Some(selected)).unwrap();
+            assert_eq!(tokens, 4);
+            assert_eq!(request.model_work.projected_logits, 4 * max_rows_per_step as u64);
+            assert_eq!(request.model_work.forward_positions, work(width).forward_positions);
+            assert_eq!(request.model_work.attention_pairs, work(width).attention_pairs);
+            let mut budget = native_work(width); budget.max_model_work = request.model_work;
+            let sparse_memory = requirements(width, budget, limits()).unwrap();
+            let dense_memory = requirements(width, native_work(width), limits()).unwrap();
+            assert_eq!(sparse_memory.native, dense_memory.native);
+            assert_eq!(sparse_memory.workspace_bytes, dense_memory.workspace_bytes);
+            assert_eq!(sparse_memory.input_bytes, dense_memory.input_bytes);
+            if max_rows_per_step < NANBEIGE_VOCAB_SIZE {
+                // Full-vocabulary division would reserve zero tokens here.
+                assert_eq!(request.model_work.projected_logits / NANBEIGE_VOCAB_SIZE as u64, 0);
+                assert!(check(width, &request).is_err());
+            } else { check(width, &request).unwrap(); }
+        }
+    }
+}
+
+#[test]
+fn selected_admission_rejects_nonintegral_caps_and_inconsistent_native_axes() {
+    let id = identity(127); let selected = Int4JsonSparseLimits { max_rows_per_step: 7 };
+    for axis in 0..8 {
+        let mut request = request(&id, 127);
+        request.model_work = constrained_int4::sparse::planned_work(127, 8, 4, selected).unwrap();
+        match axis {
+            0 => request.model_work.forward_positions = 0,
+            1 => request.model_work.projected_logits = 0,
+            2 => request.model_work.attention_pairs -= 1,
+            3 => request.model_work.projections.dot_products -= 1,
+            4 => request.model_work.projections.multiply_accumulates -= 1,
+            // Even an exact native quote must be the planned ceiling, not an
+            // actual sparse-row total or more outputs than forward positions.
+            5 => request.model_work = Int4Work::for_sequence(127, 0, 11, 27).unwrap(),
+            6 => request.model_work = Int4Work::for_sequence(127, 0, 11, 7 * 12).unwrap(),
+            _ => request.model_work = constrained_int4::sparse::planned_work(128, 8, 4, selected).unwrap(),
+        }
+        let failure = check_request_for_projection(127, request.kv_reservation_bytes, 8192,
+            masks(), &request, "extract-v1", Some(selected)).unwrap_err();
+        assert!(failure.stop); assert_eq!(failure.fault.code, BatchCode::InvalidExecution, "axis {axis}");
+    }
+    for max_rows_per_step in [0, NANBEIGE_VOCAB_SIZE + 1, usize::MAX] {
+        let request = request(&id, 127);
+        let failure = check_request_for_projection(127, request.kv_reservation_bytes, 8192,
+            masks(), &request, "extract-v1", Some(Int4JsonSparseLimits { max_rows_per_step })).unwrap_err();
+        assert!(failure.stop); assert_eq!(failure.fault.code, BatchCode::Admission);
+    }
+}
+
+#[test]
+fn selected_policy_does_not_spread_to_source_tasks_or_relax_masks_kv_and_output() {
+    let selected = Int4JsonSparseLimits { max_rows_per_step: 7 };
+    let mut id = identity(127);
+    for task in ["ner-v1", "keyphrases-v1", "summarize-v1", "answer-v1"] {
+        id.task_spec = task.to_owned();
+        let request = request(&id, 127);
+        check_request_for_task(127, request.kv_reservation_bytes, 8192, masks(), &request, task).unwrap();
+        let failure = check_request_for_projection(127, request.kv_reservation_bytes, 8192,
+            masks(), &request, task, Some(selected)).unwrap_err();
+        assert!(failure.stop); assert_eq!(failure.fault.code, BatchCode::Admission);
+    }
+    id.task_spec = "extract-v1".to_owned();
+    for axis in 0..4 {
+        let mut request = request(&id, 127);
+        request.model_work = constrained_int4::sparse::planned_work(127, 8, 4, selected).unwrap();
+        match axis { 0 => request.mask_node_visits -= 1,
+            1 => request.mask_limits.max_trie_node_visits -= 1,
+            2 => request.kv_reservation_bytes -= 1, _ => request.max_result_bytes += 1 }
+        let failure = check_request_for_projection(127, 32 * KV_BYTES_PER_TOKEN as u64, 8192,
+            masks(), &request, "extract-v1", Some(selected)).unwrap_err();
+        assert_eq!(failure.stop, axis != 3);
+        assert_eq!(failure.fault.code, match axis { 0 | 1 => BatchCode::InvalidExecution,
+            2 => BatchCode::Admission, _ => BatchCode::OutputLineLimit });
+    }
+}

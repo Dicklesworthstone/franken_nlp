@@ -66,6 +66,7 @@ impl NlpEngine {
             let admission = SourceJobAdmission { inner: CorpusAdmission {
                 lease: &lease, model: model.model_identity(), kv_bytes: required.native.kv_bytes,
                 masks: native_work.masks, output_bytes: request.limits.max_result_bytes as u64,
+                selected_rows: None,
             }, task_spec: &planner.execution_identity().task_spec };
             let result = (|| {
                 let processor = Int4SourceJobProcessor::new(&planner, &mut engine.value, &vocabulary, admission)

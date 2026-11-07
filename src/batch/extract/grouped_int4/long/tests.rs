@@ -48,6 +48,16 @@ pub(super) fn prepare<'s>(planner: &Int4ExtractionBatchPlanner, source: &'s str,
     limits: Int4ExtractionMapLimits) -> PreparedInt4ExtractionMap<'s> {
     planner.plan_document_with_control(source, args, limits, &mut Continue).unwrap()
 }
+
+#[test]
+fn selected_stream_planner_cannot_enter_document_maps_even_at_the_full_row_ceiling() {
+    for cap in [7, NANBEIGE_VOCAB_SIZE] {
+        let selected = planner().with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: cap }).unwrap();
+        let error = selected.plan_document_with_control("é上海 and 上海", &source_args(), limits(), &mut Continue)
+            .err().unwrap();
+        assert!(matches!(error, Int4ExtractionMapError::Admission));
+    }
+}
 pub(super) struct Script {
     args: ExtractionBatchArgs, pub(super) quote: Option<String>, pub(super) json: Option<String>, pub(super) calls: Rc<Cell<usize>>,
     pub(super) corrupt: Option<usize>, pub(super) fail_at: Option<usize>, capacity: usize, group_width: usize, dirty_at: Option<usize>,

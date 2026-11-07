@@ -32,7 +32,7 @@ fn owned_boundary_rechecks_options_before_paths_runtime_or_stream_io() {
 #[test]
 fn extraction_stream_provenance_preserves_exact_inner_json_and_snapshot_identity() {
     let need = Int4SnapshotRequirements::for_group_width(128).unwrap();
-    let provenance = Provenance {
+    let mut provenance = Provenance {
         protocol: "fnlp-candidate-int4-extract-batch-v1", schema_version: 1,
         scope: "real-source-current-candidate-int4", evidence: "non_authoritative",
         model_id: "Nanbeige4.2-3B", source_revision: "fixture-revision",
@@ -40,7 +40,7 @@ fn extraction_stream_provenance_preserves_exact_inner_json_and_snapshot_identity
         candidate_format: "fnlp-int4-source-candidate-v1", quant_recipe: "fixture:group=128",
         group_width: 128, integer_kernel: "s_scalar_i32", task: "extract",
         snapshot: Some(SnapshotRecord::new("loaded", need)),
-        cohort_schedule: None,
+        cohort_schedule: None, max_selected_rows: None,
     };
     // A transport fixture, not a fabricated inference result. The exact inner
     // bytes remain intact even if a consumer cannot represent this number.
@@ -64,9 +64,23 @@ fn extraction_stream_provenance_preserves_exact_inner_json_and_snapshot_identity
     assert_eq!(value["snapshot"]["format"], INT4_SNAPSHOT_VERSION);
     assert_eq!(value["snapshot"]["file_bytes"], need.file_bytes);
     for absent in ["logical_model_sha256", "prompt_digest", "schema_digest", "taskir_digest",
-        "source_dir", "source_manifest", "schema", "snapshot_path"] {
+        "source_dir", "source_manifest", "schema", "snapshot_path", "max_selected_rows"] {
         assert!(value.get(absent).is_none());
     }
+    provenance.max_selected_rows = Some(7);
+    let selected = serde_json::to_value(&provenance).unwrap();
+    assert_eq!(selected["max_selected_rows"], 7);
+    assert!(selected.get("decision_policy_digest").is_none());
+    assert!(selected.get("prompt_digest").is_none());
+}
+
+#[test]
+fn owned_stream_rechecks_the_serial_selected_policy_before_any_io() {
+    let Int4Command { task: Int4Task::ExtractBatch(mut batch), args, batch: None, job: None } =
+        command(&["--max-selected-rows", "7"]) else { panic!("wrong task"); };
+    let quoted = batch.validate(&args).unwrap();
+    batch.stream.cohort_documents = Some(1);
+    assert_eq!(execute(args, batch, quoted, NoIo, NoIo), Err(CandidateError::Arguments));
 }
 
 #[test]

@@ -100,6 +100,19 @@ fn row_admission_prices_its_exact_planned_kv_and_keeps_task_and_output_caps() {
 }
 
 #[test]
+fn selected_rows_cannot_enter_a_cohort_or_debit_its_pending_work() {
+    let vocabulary = vocabulary();
+    for max_rows_per_step in [7, NANBEIGE_VOCAB_SIZE] {
+        let compiler = planner(WIDTH, None).with_selected_rows(Int4JsonSparseLimits { max_rows_per_step }).unwrap();
+        let mut account = Account::default();
+        let error = prepare_document(&compiler, boolean(), &vocabulary, limits(), work_limits(),
+            &mut account, &mut Continue).err().unwrap();
+        assert!(error.stop); assert_eq!(error.fault.code, BatchCode::InvalidExecution);
+        assert_eq!(account, Account::default());
+    }
+}
+
+#[test]
 fn impossible_row_mask_budget_is_rejected_before_charging_or_disturbing_pending_work() {
     let planner = planner(WIDTH, None); let vocabulary = vocabulary();
     let row = planner.prepare(boolean()).unwrap().planned_work();

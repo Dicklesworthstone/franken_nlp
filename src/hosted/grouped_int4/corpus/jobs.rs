@@ -68,7 +68,7 @@ impl NlpEngine {
             })?;
             let admission = CorpusAdmission { lease: &lease, model: model.model_identity(),
                 kv_bytes: required.native.kv_bytes, masks: native_work.masks,
-                output_bytes: request.limits.max_result_bytes as u64 };
+                output_bytes: request.limits.max_result_bytes as u64, selected_rows: None };
             let result = (|| {
                 let processor = Int4ExtractionJobProcessor::new(planner, &mut engine.value, &vocabulary, admission)
                     .map_err(JobRunError::Processor)?;

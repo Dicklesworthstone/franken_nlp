@@ -27,8 +27,9 @@ legal token set at every visited grammar state; this example cap is not a
 promise that an arbitrary schema fits.
 
 `--max-selected-rows` is available on one-off `extract`, `ner`, `keyphrases`,
-`summarize` and `answer`. Shared batches, maps, durable jobs, redaction and the
-semantic second-reader route reject it. Without the option, these tasks retain full-vocabulary execution and their
+`summarize` and `answer`, and on serial `extract-batch`. Source-task batches,
+native cohorts, maps, durable jobs, redaction and the semantic second-reader
+route reject it. Without the option, these tasks retain full-vocabulary execution and their
 existing identity. Native work in the result reports actual projected rows;
 grammar-mask, task, source and complete-result limits are unchanged.
 
@@ -49,6 +50,42 @@ back to the full head. NER and keyphrases retain exact source occurrences;
 summaries and answers retain independently checked citations, passage
 boundaries and their existing abstention semantics. A decoding failure does
 not become an answer abstention.
+
+### Resident serial extraction streams
+
+The same fixed policy can process a bounded NDJSON corpus without reloading
+the model for each record:
+
+```sh
+fnlp candidate source-int4 extract-batch documents.ndjson \
+  --schema schema.json --source-membership \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --group-width 128 --memory-mib "$MEMORY_MIB" \
+  --max-new-tokens 128 --max-selected-rows 4096
+```
+
+Each record is `{"id":"document-1","text":"exact original source"}`.
+The shared schema, grounding policy and row cap apply to the entire stream;
+non-null `task_args` cannot replace them. Each document gets its own grammar,
+source mask and causal state, while the model, vocabulary and engine remain
+resident. All native work, masks, input/output limits and cooperative
+checkpoints remain cumulative across records and `{"flush":true}` controls.
+Whole-run success requires both `run_complete` and exit status zero.
+
+`--cohort-documents` and `--prefill-rows` do not combine with this serial
+route. Selected-row batches explicitly refuse a prepared item with a different
+head policy. Host admission uses the fixed row cap to recover the exact
+reserved output-token ceiling; dividing selected projections by the full
+vocabulary size would underreserve token storage. Complete native results
+still undergo independent schema, source, EOS, control and exact-work checks.
+
+Library callers select the policy on the immutable
+`Int4ExtractionBatchPlanner::with_selected_rows` factory before passing it to
+`NlpEngine::batch_int4_extract`. `for_model` carries the declared policy to
+another explicitly loaded model. Durable extraction, native cohorts and
+complete-document extraction maps reject this factory before native work or
+journaling; they retain their existing full-vocabulary contracts.
 
 ## Library use
 
@@ -122,6 +159,11 @@ bounded block tails, full-argmax comparison on small masks, ties, nonfinite
 selected logits, cancellation, work mismatches, group tails, identity
 separation, source spans, exact numeric boundaries, layer-major composition
 and cohort refusal. They have not been executed in this session.
+
+Additional serial-stream definitions cover fixed policy propagation, injection
+refusal, exact output-token reservation, failure poisoning and KV cleanup,
+selected completion verification, parser scope, and early cohort/map/durable
+refusal. These definitions are also **UNRUN**.
 
 Compilation and regression execution await the repository's controller-owned
 DSR checkpoint on the named production graph. Actual-model equality against

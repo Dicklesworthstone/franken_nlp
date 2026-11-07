@@ -187,11 +187,19 @@ impl<A: Int4ExtractionBatchAdmission> DurableBatchProcessor for Int4ExtractionJo
     }
     fn durable_work(&self, prepared: &Self::Prepared) -> Result<JobWork, BatchItemFailure> {
         if self.native.is_poisoned() { return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)); }
-        // Copy the already group-aware quote. Recomputing it with INT8
-        // formulas would undercharge group dots and corrupt durable authority.
-        Ok(JobWork::from_int4(prepared.planned_work(), self.recipe.native.max_visits_per_item))
+        durable_plan_work(prepared, self.recipe.native.max_visits_per_item)
     }
     fn max_result_bytes(&self, prepared: &Self::Prepared) -> u64 { prepared.extraction_plan().max_result_bytes() }
+}
+fn durable_plan_work(prepared: &PreparedInt4BatchExtraction, masks: u64) -> Result<JobWork, BatchItemFailure> {
+    // A prepared plan can be passed through the public processor trait. Its
+    // strategy must match the immutable full-head recipe before journaling.
+    if prepared.extraction_plan().selected_rows().is_some() {
+        return Err(BatchItemFailure::fatal(BatchCode::Admission));
+    }
+    // Copy the already group-aware quote. Recomputing it with INT8
+    // formulas would undercharge group dots and corrupt durable authority.
+    Ok(JobWork::from_int4(prepared.planned_work(), masks))
 }
 fn shared_document(document: BatchDocument<()>) -> Result<BatchDocument<ExtractionBatchArgs>, BatchItemFailure> {
     if document.task_args.is_some() { return Err(BatchItemFailure::fatal(BatchCode::InvalidEnvelope)); }

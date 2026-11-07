@@ -32,6 +32,12 @@ struct StreamArgs {
     /// Interactive producers must fill a window or send a flush command.
     #[arg(long, value_name = "N")]
     cohort_documents: Option<usize>,
+    /// Serial only: project every grammar-legal row under this fixed ceiling.
+    /// A set exceeding the cap refuses instead of pruning or falling back.
+    // This capability belongs to the entire stream, not shared item arguments.
+    #[arg(long = "max-selected-rows", id = "batch_max_selected_rows", value_name = "N",
+        conflicts_with = "cohort_documents")]
+    max_selected_rows: Option<usize>,
     /// Whole-stream nonempty records, including malformed input and flush commands.
     #[arg(long, default_value_t = 1000)]
     max_requests: u64,
@@ -49,7 +55,7 @@ struct StreamArgs {
 pub(super) fn definition() -> clap::Command {
     StreamArgs::augment_args(extract::definition().name("extract-batch")
         .about("Extract one shared schema from bounded NDJSON using one resident INT4 model")
-        .long_about("Process ordered {id,text} NDJSON and exact {\"flush\":true} controls with one resident source-converted or digest-pinned snapshot INT4 model. --schema supplies one exact shared schema; --source-membership binds its annotated verbatim fields to EACH original document. Any non-null task_args is rejected before document tokenization, even if it repeats the shared schema or budgets. Execution is serial unless --cohort-documents N explicitly groups up to N complete documents through shared native decoder layers, with independent grammars, source masks and causal KV. The entire window and a lookahead plan are memory-admitted before IO. A partial window executes at flush or EOF; interactive producers must fill the window or send a flush before waiting. Results remain ordered. IDs are unique within each bounded epoch and reset only after a drained flush. Every event has candidate provenance. Require run_complete AND exit 0 for whole-run success; run_complete alone reports a drained protocol and can include failed documents. Earlier complete results remain valid after a later failure. Native work, mask visits, checkpoints, input and output ceilings never renew per document, cohort or epoch. Full-vocabulary greedy semantics and original task budgets are unchanged. No sampler, repair retry, sparse projection, layer-major prompt prefill, durable resume or semantic-accuracy claim. Blocking IO is cooperative, not preemptible.")
+        .long_about("Process ordered {id,text} NDJSON and exact {\"flush\":true} controls with one resident source-converted or digest-pinned snapshot INT4 model. --schema supplies one exact shared schema; --source-membership binds its annotated verbatim fields to EACH original document. Any non-null task_args is rejected before document tokenization, even if it repeats the shared schema or budgets. Execution is serial unless --cohort-documents N explicitly groups up to N complete documents through shared native decoder layers, with independent grammars, source masks and causal KV. The entire window and a lookahead plan are memory-admitted before IO. A partial window executes at flush or EOF; interactive producers must fill the window or send a flush before waiting. Results remain ordered. IDs are unique within each bounded epoch and reset only after a drained flush. Every event has candidate provenance. Require run_complete AND exit 0 for whole-run success; run_complete alone reports a drained protocol and can include failed documents. Earlier complete results remain valid after a later failure. Native work, mask visits, checkpoints, input and output ceilings never renew per document, cohort or epoch. Full-vocabulary greedy decoding remains the default. Explicit --max-selected-rows N opts the entire serial stream into every legal grammar-row projection, with a fixed ceiling of 1..=166144 rows per selection including accepted EOS. A complete legal set exceeding the cap refuses; no rows are pruned and no dense fallback is silently chosen. The strategy and ceiling bind each document's execution identity before admission. It cannot be combined with --cohort-documents and does not enable selected rows in maps or durable jobs. Output-token, result-byte, KV, mask and independent source/schema validation limits remain unchanged. No sampler, repair retry, layer-major prompt prefill, durable resume, native parity, speed or semantic-accuracy claim. Blocking IO is cooperative, not preemptible.")
         .mut_arg("input", |arg| arg.help("NDJSON file, or '-' for stdin; read one bounded record at a time"))
         .mut_arg("max_input_bytes", |arg| arg.help("Maximum decoded UTF-8 document bytes per record"))
         .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoint allowance for the ENTIRE corpus execution")))
@@ -64,6 +70,7 @@ pub(super) struct BatchLimits {
     pub io_bytes: u64,
     pub preparation_reserve_bytes: u64,
     pub cohort_documents: Option<usize>,
+    pub selected_rows: Option<constrained_int4::sparse::Int4JsonSparseLimits>,
 }
 impl BatchArgs {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
@@ -73,18 +80,23 @@ impl BatchArgs {
 
     pub(super) fn validate(&self, args: &Int4Args) -> Result<BatchLimits, CandidateError> {
         let stream = self.stream;
+        let selected_rows = self.selected_rows()?;
         if !(1..=MAX_REQUESTS).contains(&stream.max_requests)
             || stream.max_line_bytes < args.max_input_bytes
             || !(1..=MAX_LINE_BYTES).contains(&stream.max_line_bytes)
             || !(1..=MAX_TRANSPORT_BYTES).contains(&stream.max_total_input_bytes)
-            || !(1..=MAX_TRANSPORT_BYTES).contains(&stream.max_total_output_bytes) {
+            || !(1..=MAX_TRANSPORT_BYTES).contains(&stream.max_total_output_bytes)
+            || (selected_rows.is_some() && stream.cohort_documents.is_some()) {
             return Err(CandidateError::Arguments);
         }
         // Retain source/snapshot exclusivity, real hardware detection, schema
         // path checks and the extraction-only decoder policy before any IO.
         let mut common = self.extraction.validate(args)?;
-        let one = constrained_int4::planned_work(args.group_width, common.max_prompt_tokens,
-            args.max_new_tokens).map_err(|_| CandidateError::Arguments)?;
+        let one = match selected_rows {
+            Some(rows) => constrained_int4::sparse::planned_work(args.group_width, common.max_prompt_tokens,
+                args.max_new_tokens, rows),
+            None => constrained_int4::planned_work(args.group_width, common.max_prompt_tokens, args.max_new_tokens),
+        }.map_err(|_| CandidateError::Arguments)?;
         // Each item has its OWN attention triangle. Scaling the already
         // computed work must not square a fictitious concatenated corpus.
         let work = scale_work(one, stream.max_requests)?;
@@ -135,7 +147,28 @@ impl BatchArgs {
         }
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(BatchLimits { common, transport, native, output_bytes: stream.max_total_output_bytes,
-            io_bytes, preparation_reserve_bytes, cohort_documents: stream.cohort_documents })
+            io_bytes, preparation_reserve_bytes, cohort_documents: stream.cohort_documents, selected_rows })
+    }
+
+    fn selected_rows(&self) -> Result<Option<constrained_int4::sparse::Int4JsonSparseLimits>, CandidateError> {
+        self.stream.max_selected_rows.map(|max_rows_per_step| {
+            let limits = constrained_int4::sparse::Int4JsonSparseLimits { max_rows_per_step };
+            limits.validate().map_err(|_| CandidateError::Arguments)?;
+            Ok(limits)
+        }).transpose()
+    }
+
+    #[cfg(any(feature = "asupersync-runtime", test))]
+    fn configure_planner(&self, planner: crate::batch::extract::grouped_int4::Int4ExtractionBatchPlanner)
+        -> Result<crate::batch::extract::grouped_int4::Int4ExtractionBatchPlanner, CandidateError> {
+        if planner.selected_rows().is_some()
+            || (self.stream.max_selected_rows.is_some() && self.stream.cohort_documents.is_some()) {
+            return Err(CandidateError::Arguments);
+        }
+        match self.selected_rows()? {
+            Some(limits) => planner.with_selected_rows(limits).map_err(|_| CandidateError::Planning),
+            None => Ok(planner),
+        }
     }
 
     /// Preserve exact schema bytes. Source membership is compiled against

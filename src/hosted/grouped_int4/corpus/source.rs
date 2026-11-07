@@ -93,6 +93,7 @@ impl NlpEngine {
             let admission = SourceAdmission { inner: CorpusAdmission {
                 lease: &lease, model: model.model_identity(), kv_bytes: required.native.kv_bytes,
                 masks: config.native_work.masks, output_bytes: limits.transport.max_output_line_bytes as u64,
+                selected_rows: None,
             }, task_spec: &task_spec };
             let result = {
                 let mut processor = NativeInt4SourceBatch::new(compiler, &mut engine.value,

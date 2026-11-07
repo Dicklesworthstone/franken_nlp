@@ -10,7 +10,7 @@ use crate::native_engine::{
     strict_int4::{Int4MemoryRequirement, Int4RunBudget, StrictInt4Engine, StrictInt4Error,
         STRICT_INT4_PROFILE},
 };
-use crate::tasks::extract::grouped_int4::{Int4ExtractRun, INT4_EXTRACT_VERSION};
+use crate::tasks::extract::grouped_int4::Int4ExtractRun;
 
 /// Host admission must additionally cover immutable weights/vocabulary,
 /// preparation, full native workspace, allocator slack and transport buffers.
@@ -117,6 +117,11 @@ impl<A: Int4ExtractionBatchAdmission> BatchProcessor for NativeInt4ExtractionBat
     }
     fn execute_with_context<C: DecodeStepControl>(&mut self, prepared: Self::Prepared,
         context: BatchRequestContext, control: &mut C) -> Result<Self::Output, BatchItemFailure> {
+        self.run.ready()?;
+        if let Err(fault) = self.compiler.check_projection(&prepared) {
+            self.run.failed = true;
+            return Err(BatchItemFailure::fatal(fault));
+        }
         execute_admitted(prepared, &mut self.driver, &mut self.admission, &mut self.run, context, control)
     }
 }
@@ -240,9 +245,16 @@ fn execute_admitted<D: Driver, A: Int4ExtractionBatchAdmission, C: DecodeStepCon
 pub(super) fn valid_result(prepared: &PreparedInt4BatchExtraction, result: &Int4ExtractRun, masks: u64) -> bool {
     let out = &result.result.output;
     let options = prepared.plan.options();
-    let expected = constrained_int4::planned_work(prepared.plan.group_width(),
-        prepared.plan.prompt_tokens(), out.token_ids.len()).ok();
-    result.schema_version == 1 && result.execution == INT4_EXTRACT_VERSION
+    // Sparse completion has a variable actual row count. Reuse the sealed
+    // validator for its exact work and independent schema/source/EOS checks;
+    // retain the unchanged dense accounting path for existing streams/maps.
+    let expected = if prepared.plan.selected_rows().is_some() {
+        prepared.plan.verify_completed(result).ok().map(|()| result.model_work)
+    } else {
+        constrained_int4::planned_work(prepared.plan.group_width(),
+            prepared.plan.prompt_tokens(), out.token_ids.len()).ok()
+    };
+    result.schema_version == 1 && result.execution == prepared.plan.execution_version()
         && result.group_width == prepared.plan.group_width()
         && out.schema_version == 1 && out.numerics_profile == STRICT_INT4_PROFILE
         && result.result.task_spec_version == prepared.task.task_spec_identity()

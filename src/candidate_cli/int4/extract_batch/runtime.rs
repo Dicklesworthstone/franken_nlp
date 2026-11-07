@@ -53,6 +53,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         batch.extraction.compiler(), batch.extraction.source_limits(), Some(defaults))
         .and_then(Int4ExtractionBatchPlanner::require_shared_defaults)
         .map_err(|_| CandidateError::Planning)?;
+    let planner = batch.configure_planner(planner)?;
     remaining()?;
     let controls = crate::tokenizer::pinned_controls::pinned().map_err(|_| CandidateError::Identity)?;
     let vocabulary = ExtractionVocabulary::pinned(controls.template_controls())
@@ -80,6 +81,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         quant_recipe: &identity.quant_recipe, group_width: model.model_identity().group_width(),
         integer_kernel: common.kernel.kind().id(), task: "extract", snapshot,
         cohort_schedule: limits.cohort_documents.map(CohortSchedule::new),
+        max_selected_rows: limits.selected_rows.map(|limits| limits.max_rows_per_step),
     };
     // This writer copies the canonical inner event without parsing its JSON
     // numbers. It stages one frame and permanently stops after partial IO.
@@ -134,6 +136,8 @@ struct Provenance<'a> {
     snapshot: Option<SnapshotRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cohort_schedule: Option<CohortSchedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_selected_rows: Option<usize>,
 }
 
 #[derive(Serialize)]

@@ -1,5 +1,6 @@
 //! Lifecycle tests use a private driver; they make no model-quality claim.
 use super::*;
+mod selected;
 use std::{cell::Cell, io::{self, Cursor, Write}, rc::Rc};
 use crate::{
     artifact::converter::PINNED_REVISION,
@@ -167,11 +168,14 @@ impl Driver for Engine {
         }
         let mut tokens = EmbeddedTokenizer::pinned().unwrap().tokenizer().encode_byte_fallback_only(b"true").unwrap();
         tokens.push(prepared.plan.options().eos_token_id);
-        let work = constrained_int4::planned_work(self.width, prepared.plan.prompt_tokens(), tokens.len()).unwrap();
+        let work = if prepared.plan.selected_rows().is_some() {
+            Int4Work::for_sequence(self.width, 0, prepared.plan.prompt_tokens() + tokens.len() - 1,
+                2 * tokens.len()).unwrap()
+        } else { constrained_int4::planned_work(self.width, prepared.plan.prompt_tokens(), tokens.len()).unwrap() };
         let output = JsonDecodeOutput { schema_version: 1, numerics_profile: STRICT_INT4_PROFILE.to_owned(),
             token_ids: tokens, json: "true".to_owned(), forward_positions: work.forward_positions,
             projected_logits: work.projected_logits, mask_node_visit_charge: 5 };
-        let mut result = Int4ExtractRun { schema_version: 1, execution: INT4_EXTRACT_VERSION.to_owned(),
+        let mut result = Int4ExtractRun { schema_version: 1, execution: prepared.plan.execution_version().to_owned(),
             group_width: self.width, model_work: work, result: ExtractResult { schema_version: 1,
                 task_spec_version: "extract-v1".to_owned(), score_space: ScoreSpace::NotComputed,
                 grounding: ExtractionGrounding::NotRequested, output, source_fields: Vec::new() } };
