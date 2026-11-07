@@ -37,7 +37,12 @@ impl JobManagementLimits {
         let index = job.max_items.checked_mul(1024).ok_or(HostedError::Limits("stored-job index arithmetic"))?;
         let frames = (job.max_result_bytes as u64).checked_mul(4)
             .ok_or(HostedError::Limits("stored-job frame arithmetic"))?;
-        Ok(sum(&[index, frames, 2 * 1024 * 1024, self.journal_reserve_bytes,
+        // Retained-input authentication streams one bounded envelope at a
+        // time. Price its bytes, decoded ID and parser/allocator scratch;
+        // management never reconstructs the entire in-memory population.
+        let input_frame = (job.max_input_bytes_per_item as u64).checked_mul(8)
+            .ok_or(HostedError::Limits("stored-job input frame arithmetic"))?;
+        Ok(sum(&[index, frames, input_frame, 2 * 1024 * 1024, self.journal_reserve_bytes,
             self.serialization_reserve_bytes, self.io_reserve_bytes])?)
     }
 }

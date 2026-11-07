@@ -13,6 +13,7 @@ impl OwnedJob {
         self.ready()?; checkpoint(control)?;
         if self.header.committed != self.header.items { return Err(JobError::Incomplete); }
         self.poisoned = true;
+        self.verify_retained_inputs(control)?;
         self.verify_prefix(control)?;
         if self.files.spool.metadata().map_err(|_| JobError::Io)?.len() != self.header.spool_end {
             return Err(JobError::UncommittedTail);

@@ -4,7 +4,7 @@
 //! corpus. They cannot authorize a new attempt: this type exposes no input,
 //! manifest, processor, connection, inner owner, or conversion to OwnedJob.
 use super::*;
-use crate::jobs::{manifest::bounded_json, MismatchField};
+use crate::jobs::{manifest::bounded_json, MismatchField, RetainedInputReport};
 use std::collections::BTreeSet;
 
 /// A bounded metadata report, never an inference or original-input receipt.
@@ -25,6 +25,13 @@ pub struct StoredJobReport {
     /// A destination exists without a publication acknowledgement. Status
     /// reports presence only; verify/materialize compare it with committed data.
     pub unacknowledged_output_present: bool,
+    /// Present only after the complete journal-authorized input spool has
+    /// authenticated. No input IDs, bytes, commitments or keys are exposed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retained_inputs: Option<RetainedInputReport>,
+    /// Includes a zero-length orphan. No management path adopts or removes it.
+    #[serde(skip_serializing_if = "is_false")]
+    pub uncommitted_input_spool_present: bool,
 }
 
 /// Exclusively locks an existing job without granting new execution authority.
@@ -38,49 +45,9 @@ pub struct StoredJob {
 impl StoredJob {
     pub fn open<C: DecodeStepControl>(root: &Path, key: JobSecret, expected_job: JobId,
         limits: super::super::JobLimits, control: &mut C) -> Result<Self, JobError> {
-        checkpoint(control)?;
-        limits.validate()?;
-        let files = JobFiles::open(root, false, limits.max_journal_bytes, limits.max_spool_bytes)?;
-        let journal = Journal::open(&files.database_path(), limits.max_journal_bytes)?;
-        let header: Header = journal.read(Table::Header, 0, &key)?;
-        if header.binding.job != expected_job { return Err(JobError::Mismatch(MismatchField::Job)); }
-        if !key.commit(b"key-check", &[&expected_job.0]).matches(header.binding.secret) {
-            return Err(JobError::Mismatch(MismatchField::Secret));
-        }
-        let encoded_limits = bounded_json(&limits, 16 * 1024)?;
-        if !key.commit(b"limits", &[&expected_job.0, &encoded_limits]).matches(header.binding.limits) {
-            return Err(JobError::Mismatch(MismatchField::Limits));
-        }
-        if header.schema_version != 1 || header.items == 0 || header.items > limits.max_items
-            || header.items > limits.max_attempts || header.committed > header.items {
-            return Err(JobError::Corrupt);
-        }
-        journal.check_count(header.items)?;
-        let count = usize::try_from(header.items).map_err(|_| JobError::Limit)?;
-        let mut items = Vec::new();
-        items.try_reserve_exact(count).map_err(|_| JobError::Allocation)?;
-        let mut seen = BTreeSet::new();
-        let mut population = key.commit(b"population-start", &[&expected_job.0]);
-        for ordinal in 0..header.items {
-            checkpoint(control)?;
-            let row: Item = journal.read(Table::Item, ordinal, &key)?;
-            if row.binding.ordinal != ordinal || !seen.insert(row.binding.id.0) {
-                return Err(JobError::Corrupt);
-            }
-            let encoded = bounded_json(&row.binding, 4096)?;
-            population = key.commit(b"population-next", &[&expected_job.0, &population.0, &encoded]);
-            items.push(row.binding);
-        }
-        population = key.commit(b"population-end", &[&expected_job.0, &population.0,
-            &header.items.to_le_bytes()]);
-        if !population.matches(header.binding.population) { return Err(JobError::Corrupt); }
-        drop(seen);
-        // Only this private management owner is reconstructed. No caller can
-        // retrieve its manifest to pretend stored hashes prove current inputs.
-        let manifest = FrozenManifest { binding: header.binding.clone(), items, limits };
-        let mut job = OwnedJob { journal, files, key, manifest, header, poisoned: true,
-            #[cfg(test)] fail_at: None };
+        let mut job = load_metadata(root, key, expected_job, limits, control)?;
         job.verify_prefix(control)?;
+        job.check_retained_inputs(control)?;
         let report = describe(&job, control)?;
         job.poisoned = false;
         Ok(Self { job, report })
@@ -101,6 +68,7 @@ impl StoredJob {
         self.job.ready()?;
         self.job.poisoned = true;
         self.job.verify_prefix(control)?;
+        self.job.check_retained_inputs(control)?;
         let report = describe(&self.job, control)?;
         reject_orphans(&report)?;
         if report.unacknowledged_output_present { self.job.verify_materialized(control)?; }
@@ -127,8 +95,56 @@ impl StoredJob {
         Ok(report)
     }
 }
+fn is_false(value: &bool) -> bool { !value }
+
+/// A private, poisoned owner used only while authenticating management or
+/// retained replay. Stored hashes do not authorize an attempt: the public
+/// StoredJob never exposes this owner, and replay must replace its manifest
+/// with a newly frozen exact-byte/native-recipe manifest before recovery can
+/// clear the poison. The files and exclusive lock move together throughout.
+pub(super) fn load_metadata<C: DecodeStepControl>(root: &Path, key: JobSecret, expected_job: JobId,
+    limits: super::super::JobLimits, control: &mut C) -> Result<OwnedJob, JobError> {
+    checkpoint(control)?;
+    limits.validate()?;
+    let files = JobFiles::open(root, false, limits.max_journal_bytes, limits.max_spool_bytes)?;
+    let journal = Journal::open(&files.database_path(), limits.max_journal_bytes)?;
+    let header: Header = journal.read(Table::Header, 0, &key)?;
+    if header.binding.job != expected_job { return Err(JobError::Mismatch(MismatchField::Job)); }
+    if !key.commit(b"key-check", &[&expected_job.0]).matches(header.binding.secret) {
+        return Err(JobError::Mismatch(MismatchField::Secret));
+    }
+    let encoded_limits = bounded_json(&limits, 16 * 1024)?;
+    if !key.commit(b"limits", &[&expected_job.0, &encoded_limits]).matches(header.binding.limits) {
+        return Err(JobError::Mismatch(MismatchField::Limits));
+    }
+    if header.schema_version != 1 || header.items == 0 || header.items > limits.max_items
+        || header.items > limits.max_attempts || header.committed > header.items {
+        return Err(JobError::Corrupt);
+    }
+    journal.check_count(header.items)?;
+    let count = usize::try_from(header.items).map_err(|_| JobError::Limit)?;
+    let mut items = Vec::new();
+    items.try_reserve_exact(count).map_err(|_| JobError::Allocation)?;
+    let mut seen = BTreeSet::new();
+    let mut population = key.commit(b"population-start", &[&expected_job.0]);
+    for ordinal in 0..header.items {
+        checkpoint(control)?;
+        let row: Item = journal.read(Table::Item, ordinal, &key)?;
+        if row.binding.ordinal != ordinal || !seen.insert(row.binding.id.0) { return Err(JobError::Corrupt); }
+        let encoded = bounded_json(&row.binding, 4096)?;
+        population = key.commit(b"population-next", &[&expected_job.0, &population.0, &encoded]);
+        items.push(row.binding);
+    }
+    population = key.commit(b"population-end", &[&expected_job.0, &population.0,
+        &header.items.to_le_bytes()]);
+    if !population.matches(header.binding.population) { return Err(JobError::Corrupt); }
+    drop(seen);
+    let manifest = FrozenManifest { binding: header.binding.clone(), items, limits };
+    Ok(OwnedJob { journal, files, key, manifest, header, poisoned: true,
+        #[cfg(test)] fail_at: None })
+}
 fn reject_orphans(report: &StoredJobReport) -> Result<(), JobError> {
-    if report.uncommitted_spool_bytes != 0 || report.staged_output_present {
+    if report.uncommitted_spool_bytes != 0 || report.staged_output_present || report.uncommitted_input_spool_present {
         return Err(JobError::UncommittedTail);
     }
     Ok(())
@@ -140,6 +156,8 @@ fn describe<C: DecodeStepControl>(job: &OwnedJob, control: &mut C) -> Result<Sto
     let tail = length.checked_sub(progress.spool_bytes).ok_or(JobError::Corrupt)?;
     let staged = job.files.has_stages()?;
     let published = job.files.materialized(job.manifest.limits.max_materialized_bytes)?.is_some();
+    let orphan_input = job.header.retained_inputs.is_none()
+        && job.files.retained_inputs(retained::storage_ceiling(job.manifest.limits)?)?.is_some();
     checkpoint(control)?;
     Ok(StoredJobReport { schema_version: 1,
         verification_scope: "authenticated-stored-state-not-input-replay-v1",
@@ -147,7 +165,9 @@ fn describe<C: DecodeStepControl>(job: &OwnedJob, control: &mut C) -> Result<Sto
         attempts: progress.attempts, reserved_work: progress.reserved_work,
         committed_spool_bytes: progress.spool_bytes, uncommitted_spool_bytes: tail,
         staged_output_present: staged, materialized: progress.materialized,
-        unacknowledged_output_present: published && !progress.materialized })
+        unacknowledged_output_present: published && !progress.materialized,
+        retained_inputs: job.header.retained_inputs.as_ref().map(InputReceipt::report),
+        uncommitted_input_spool_present: orphan_input })
 }
 
 #[cfg(test)] mod tests;

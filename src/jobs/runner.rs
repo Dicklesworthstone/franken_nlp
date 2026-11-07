@@ -3,8 +3,8 @@
 //! This profile freezes exact JSON request envelopes, with identity
 //! normalization only. It does not turn the live batch epoch into a snapshot.
 //! No task failures are cached as successful results and no retry is implicit.
-use super::{FrozenManifest, JobContract, JobError, JobId, JobInput, JobLimits, JobProgress,
-    JobSecret, JobWork, OwnedJob, TailPolicy, checkpoint};
+use super::{FrozenManifest, InputRetentionLimits, JobContract, JobError, JobId, JobInput, JobLimits, JobProgress,
+    JobSecret, JobWork, OwnedJob, TailPolicy, checkpoint, population::JobPopulation};
 use crate::{batch::{BatchDocument, BatchFault, BatchItemFailure, BatchProcessor, BatchRequestContext},
     canonjson, execution_identity::ExecutionIdentity, native_engine::decode::DecodeStepControl};
 use serde::Serialize;
@@ -62,7 +62,7 @@ struct Recipe<'a, R: Serialize + ?Sized> {
     processor: &'a R,
 }
 
-/// The exact borrowed population cannot change between freeze and execution.
+/// The exact borrowed or retained population cannot change between freeze and execution.
 /// No raw job/processor mutation or retry/reset handle is exposed. The host
 /// accounts for input, planning, journal, canonicalization and frame staging
 /// memory in addition to the native admission guard. Work debits are durable;
@@ -70,9 +70,22 @@ struct Recipe<'a, R: Serialize + ?Sized> {
 pub struct JobRunner<'items, 'bytes, P: DurableBatchProcessor> {
     job: OwnedJob,
     processor: P,
-    inputs: &'items [JobInput<'bytes>],
+    inputs: Inputs<'items, 'bytes>,
     limits: JobLimits,
     stopped: bool,
+}
+enum Inputs<'items, 'bytes> {
+    Borrowed(&'items [JobInput<'bytes>]),
+    Retained(JobPopulation),
+}
+impl Inputs<'_, '_> {
+    fn get(&self, ordinal: usize) -> Option<JobInput<'_>> {
+        match self {
+            Self::Borrowed(inputs) => inputs.get(ordinal).map(|input| JobInput {
+                id: input.id, original: input.original, normalized: input.normalized }),
+            Self::Retained(population) => population.input(ordinal),
+        }
+    }
 }
 impl<'items, 'bytes, P: DurableBatchProcessor> JobRunner<'items, 'bytes, P> {
     /// Creates only in an existing protected directory. The host generates and
@@ -83,7 +96,19 @@ impl<'items, 'bytes, P: DurableBatchProcessor> JobRunner<'items, 'bytes, P> {
         -> Result<Self, JobRunError> {
         let manifest = freeze(&key, job_id, limits, inputs, &processor, control)?;
         let job = OwnedJob::create(root, key, manifest, control)?;
-        Ok(Self { job, processor, inputs, limits, stopped: false })
+        Ok(Self { job, processor, inputs: Inputs::Borrowed(inputs), limits, stopped: false })
+    }
+
+    /// Explicitly retain the complete exact envelope population under its own
+    /// disk cap. The input file and directory are synced before the first
+    /// authenticated journal receipt can acknowledge the retained snapshot.
+    pub fn create_with_retained_inputs<C: DecodeStepControl>(root: &Path, key: JobSecret,
+        job_id: JobId, limits: JobLimits, retention: InputRetentionLimits,
+        inputs: &'items [JobInput<'bytes>], processor: P, control: &mut C) -> Result<Self, JobRunError> {
+        retention.validate()?;
+        let manifest = freeze(&key, job_id, limits, inputs, &processor, control)?;
+        let job = OwnedJob::create_with_retained_inputs(root, key, manifest, retention, inputs, control)?;
+        Ok(Self { job, processor, inputs: Inputs::Borrowed(inputs), limits, stopped: false })
     }
 
     /// Requires the entire original population and a newly constructed clean
@@ -94,7 +119,25 @@ impl<'items, 'bytes, P: DurableBatchProcessor> JobRunner<'items, 'bytes, P> {
         tail: TailPolicy, control: &mut C) -> Result<Self, JobRunError> {
         let manifest = freeze(&key, job_id, limits, inputs, &processor, control)?;
         let job = OwnedJob::resume(root, key, manifest, tail, control)?;
-        Ok(Self { job, processor, inputs, limits, stopped: false })
+        Ok(Self { job, processor, inputs: Inputs::Borrowed(inputs), limits, stopped: false })
+    }
+    /// Restore only an explicitly retained, authenticated complete snapshot.
+    /// No original reader is needed. This runner owns the restored buffers;
+    /// hosts must admit them before entering. The clean processor is refrozen
+    /// against the exact bytes before result-tail repair or any new debit.
+    pub fn resume_with_retained_inputs<C: DecodeStepControl>(root: &Path, key: JobSecret,
+        job_id: JobId, limits: JobLimits, retention: InputRetentionLimits, processor: P,
+        tail: TailPolicy, control: &mut C) -> Result<Self, JobRunError> {
+        checkpoint(control)?;
+        limits.validate()?;
+        retention.validate()?;
+        processor.validate_job_limits(limits).map_err(JobRunError::Processor)?;
+        let (job, population) = OwnedJob::resume_with_retained_inputs(root, key, job_id, limits,
+            retention, tail, control, |key, population, control| {
+                let inputs = population.borrowed_inputs()?;
+                freeze(key, job_id, limits, &inputs, &processor, control)
+            })?;
+        Ok(Self { job, processor, inputs: Inputs::Retained(population), limits, stopped: false })
     }
     pub fn progress(&self) -> JobProgress { self.job.progress() }
     pub fn is_stopped(&self) -> bool { self.stopped || self.job.is_poisoned() }
@@ -117,7 +160,7 @@ impl<'items, 'bytes, P: DurableBatchProcessor> JobRunner<'items, 'bytes, P> {
         checkpoint(control)?;
         let ordinal = usize::try_from(progress.committed).map_err(|_| JobError::Limit)?;
         let input = self.inputs.get(ordinal).ok_or(JobError::Corrupt)?;
-        let document = parse::<P>(input, self.limits)?;
+        let document = parse::<P>(&input, self.limits)?;
         let prepared = self.processor.prepare_with_control(document, control)?;
         checkpoint(control)?;
         let work = self.processor.durable_work(&prepared)?;
@@ -133,7 +176,7 @@ impl<'items, 'bytes, P: DurableBatchProcessor> JobRunner<'items, 'bytes, P> {
         // Stable delivery coordinates, never an attempt-derived sampling seed.
         let context = BatchRequestContext { request_seq: sequence, epoch: 1,
             input_line: sequence, byte_offset: 0 };
-        let attempt = self.job.begin(input, work, control)?;
+        let attempt = self.job.begin(&input, work, control)?;
         let output = self.processor.execute_with_context(prepared, context, control)?;
         let committed = attempt.commit(&output, control)?;
         drop(output);

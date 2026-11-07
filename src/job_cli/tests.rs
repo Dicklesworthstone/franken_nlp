@@ -11,7 +11,8 @@ fn report() -> StoredJobReport {
     StoredJobReport { schema_version: 1, verification_scope: "authenticated-stored-state-not-input-replay-v1",
         job_id: JobId([7; 16]), items: 2, committed: 1, attempts: 2, reserved_work: JobWork::default(),
         committed_spool_bytes: 512, uncommitted_spool_bytes: 0, staged_output_present: false,
-        materialized: false, unacknowledged_output_present: false }
+        materialized: false, unacknowledged_output_present: false,
+        retained_inputs: None, uncommitted_input_spool_present: false }
 }
 #[test]
 fn all_management_commands_parse_without_any_model_arguments() {
@@ -42,7 +43,8 @@ fn help_and_schema_require_no_paths_keys_or_runtime() {
     let schema = canonjson::parse_str(std::str::from_utf8(&out).unwrap()).unwrap();
     assert_eq!(schema["can_execute_or_resume"], false);
     assert_eq!(schema["model_required"], false); assert_eq!(schema["original_inputs_required"], false);
-    assert_eq!(schema["report_fields"].as_array().unwrap().len(), 12);
+    assert_eq!(schema["report_fields"].as_array().unwrap().len(), 14);
+    assert_eq!(schema["retained_input_fields"], serde_json::json!(["items", "spool_bytes", "max_spool_bytes"]));
 }
 #[test]
 fn job_id_has_one_explicit_canonical_representation() {
@@ -77,6 +79,25 @@ fn report_is_one_canonical_line_with_no_retained_result_contents() {
     assert_eq!(value["report"]["attempts"], 2);
     assert_eq!(value["report"]["materialized"], false);
     assert_eq!(value["report"]["verification_scope"], schema().report_scope);
+    assert!(value["report"].get("retained_inputs").is_none());
+    assert!(value["report"].get("uncommitted_input_spool_present").is_none());
+}
+
+#[test]
+fn input_retention_report_contains_only_counts_and_explicit_orphan_state() {
+    let mut r = report();
+    r.retained_inputs = Some(crate::jobs::RetainedInputReport { items: 2,
+        spool_bytes: 768, max_spool_bytes: 4096 });
+    let mut bytes = Vec::new();
+    emit(&mut bytes, &Success { schema_version: 1, operation: StoredJobOperation::Status,
+        status: "ok", report: &r }).unwrap();
+    let value = canonjson::parse_str(std::str::from_utf8(&bytes).unwrap()).unwrap();
+    assert_eq!(value["report"]["retained_inputs"],
+        serde_json::json!({"items":2,"spool_bytes":768,"max_spool_bytes":4096}));
+    r.retained_inputs = None; r.uncommitted_input_spool_present = true;
+    let value = serde_json::to_value(&r).unwrap();
+    assert!(value.get("retained_inputs").is_none());
+    assert_eq!(value["uncommitted_input_spool_present"], true);
 }
 #[test]
 fn all_cancellation_causes_keep_budget_versus_cancel_classification() {

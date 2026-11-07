@@ -204,7 +204,8 @@ struct ManagementSchema {
     schema_version: u32, commands: [&'static str; 4], report_scope: &'static str,
     original_inputs_required: bool, model_required: bool, can_execute_or_resume: bool,
     stdout: &'static str, stderr: &'static str, publication: &'static str,
-    tail_policy: &'static str, report_fields: [&'static str; 12],
+    tail_policy: &'static str, report_fields: [&'static str; 14],
+    retained_input_fields: [&'static str; 3],
 }
 fn schema() -> ManagementSchema {
     ManagementSchema { schema_version: 1, commands: ["status", "verify", "materialize", "schema"],
@@ -216,7 +217,9 @@ fn schema() -> ManagementSchema {
         tail_policy: "status reports orphans; verify/materialize refuse; no deletion or repair",
         report_fields: ["schema_version", "verification_scope", "job_id", "items", "committed", "attempts",
             "reserved_work", "committed_spool_bytes", "uncommitted_spool_bytes", "staged_output_present",
-            "materialized", "unacknowledged_output_present"] }
+            "materialized", "unacknowledged_output_present", "retained_inputs",
+            "uncommitted_input_spool_present"],
+        retained_input_fields: ["items", "spool_bytes", "max_spool_bytes"] }
 }
 
 #[cfg(test)] mod tests;

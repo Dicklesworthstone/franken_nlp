@@ -24,6 +24,123 @@ fn append_tail(root: &Path, bytes: &[u8]) {
     let mut spool = OpenOptions::new().append(true).open(root.join("results.spool")).unwrap();
     spool.write_all(bytes).unwrap(); spool.sync_all().unwrap();
 }
+fn retained_population() -> [JobInput<'static>; 2] {
+    let a = br#"{"id":"alpha","text":"Alice retained private source","task_args":{"v":1}}"#;
+    let b = br#"{"id":"beta","text":"Bob retained private source","task_args":{"v":2}}"#;
+    [JobInput { id: "alpha", original: a, normalized: a }, JobInput { id: "beta", original: b, normalized: b }]
+}
+fn retained_manifest() -> FrozenManifest {
+    FrozenManifest::freeze(&key(), super::super::JobContract { job_id: JobId([7;16]),
+        execution: &crate::jobs::tests::identity(), recipe: &"retained exact-envelope fixture", limits: limits() },
+        retained_population(), &mut Control::default()).unwrap()
+}
+fn retained_cap() -> InputRetentionLimits { InputRetentionLimits { max_spool_bytes: 1 << 20 } }
+
+#[test]
+fn absent_retention_header_matches_legacy_canonical_bytes_and_mac() {
+    let dir = root(); let job = create(&dir);
+    let legacy = serde_json::json!({"schema_version": 1, "binding": &job.header.binding,
+        "items": job.header.items, "committed": 0, "attempts": 0,
+        "used": JobWork::default(), "spool_end": 0, "materialized": false });
+    let legacy_bytes = crate::jobs::manifest::bounded_json(&legacy, 16 * 1024).unwrap();
+    assert_eq!(crate::jobs::manifest::bounded_json(&job.header, 16 * 1024).unwrap(), legacy_bytes);
+    job.journal.transaction(|journal| journal.write(Table::Header, 0, &job.key, &legacy, false)).unwrap();
+    job.files.sync_database().unwrap();
+    let restored: Header = job.journal.read(Table::Header, 0, &job.key).unwrap();
+    assert!(restored == job.header); assert!(restored.retained_inputs.is_none());
+    drop(job); drop(resume(&dir, TailPolicy::Refuse));
+}
+
+#[test]
+fn retained_creation_faults_never_promote_an_unjournaled_input_spool() {
+    for point in [CreateFault::InputSpoolWritten, CreateFault::InputSpoolSynced] {
+        let dir = root(); let population = retained_population();
+        let result = OwnedJob::create_inner(&dir, key(), retained_manifest(),
+            Some((retained_cap(), &population)), &mut Control::default(), Some(point));
+        assert_eq!(error(result), JobError::Io);
+        assert!(dir.join("inputs.spool").exists());
+        let before = fs::read(dir.join("inputs.spool")).unwrap();
+        assert!(StoredJob::open(&dir, key(), JobId([7;16]), limits(), &mut Control::default()).is_err());
+        assert!(OwnedJob::resume(&dir, key(), retained_manifest(), TailPolicy::DiscardUncommitted,
+            &mut Control::default()).is_err());
+        assert_eq!(fs::read(dir.join("inputs.spool")).unwrap(), before);
+        assert_eq!(fs::metadata(dir.join("results.spool")).unwrap().len(), 0);
+    }
+}
+
+#[test]
+fn retained_creation_lost_ack_recovers_only_after_authenticated_header_commit() {
+    let dir = root(); let population = retained_population();
+    assert_eq!(error(OwnedJob::create_inner(&dir, key(), retained_manifest(),
+        Some((retained_cap(), &population)), &mut Control::default(), Some(CreateFault::HeaderCommitted))), JobError::Io);
+    let mut stored = StoredJob::open(&dir, key(), JobId([7;16]), limits(), &mut Control::default()).unwrap();
+    let report = stored.verify(&mut Control::default()).unwrap();
+    assert_eq!((report.items, report.committed, report.attempts), (2, 0, 0));
+    assert_eq!(report.retained_inputs.unwrap().items, 2); drop(stored);
+    let job = OwnedJob::resume(&dir, key(), retained_manifest(), TailPolicy::Refuse, &mut Control::default()).unwrap();
+    assert!(!job.is_poisoned()); assert_eq!(job.progress().attempts, 0);
+}
+
+#[test]
+fn retained_restore_and_fresh_manifest_authorization_share_one_exclusive_lock() {
+    let dir = root(); let population = retained_population();
+    drop(OwnedJob::create_with_retained_inputs(&dir, key(), retained_manifest(), retained_cap(),
+        &population, &mut Control::default()).unwrap());
+    let (job, restored) = OwnedJob::resume_with_retained_inputs(&dir, key(), JobId([7;16]), limits(),
+        retained_cap(), TailPolicy::Refuse, &mut Control::default(), |secret, population, control| {
+            assert_eq!(error(OwnedJob::resume(&dir, key(), retained_manifest(), TailPolicy::Refuse,
+                &mut Control::default())), JobError::Busy);
+            population.freeze(secret, super::super::JobContract { job_id: JobId([7;16]),
+                execution: &crate::jobs::tests::identity(), recipe: &"retained exact-envelope fixture",
+                limits: limits() }, control)
+        }).unwrap();
+    assert_eq!(restored.stats().items, 2);
+    assert_eq!(error(StoredJob::open(&dir, key(), JobId([7;16]), limits(), &mut Control::default())), JobError::Busy);
+    drop(job); drop(StoredJob::open(&dir, key(), JobId([7;16]), limits(), &mut Control::default()).unwrap());
+}
+
+#[test]
+fn retained_status_is_content_free_and_input_corruption_blocks_management() {
+    let dir = root(); let population = retained_population();
+    drop(OwnedJob::create_with_retained_inputs(&dir, key(), retained_manifest(), retained_cap(),
+        &population, &mut Control::default()).unwrap());
+    let mut stored = StoredJob::open(&dir, key(), JobId([7;16]), limits(), &mut Control::default()).unwrap();
+    let report = stored.verify(&mut Control::default()).unwrap();
+    assert_eq!(report.retained_inputs.unwrap().spool_bytes, fs::metadata(dir.join("inputs.spool")).unwrap().len());
+    let encoded = serde_json::to_string(&report).unwrap();
+    for private in ["alpha", "beta", "Alice", "Bob", "commitment", "secret"] { assert!(!encoded.contains(private)); }
+    drop(stored);
+    let mut spool = OpenOptions::new().write(true).open(dir.join("inputs.spool")).unwrap();
+    spool.seek(SeekFrom::Start(retained::HEADER_BYTES as u64)).unwrap(); spool.write_all(b"X").unwrap();
+    spool.sync_all().unwrap(); drop(spool);
+    assert_eq!(error(StoredJob::open(&dir, key(), JobId([7;16]), limits(), &mut Control::default())), JobError::Authentication);
+}
+
+#[test]
+fn zero_length_orphan_input_is_reported_but_never_adopted_or_deleted() {
+    let dir = root(); drop(create(&dir));
+    let orphan = OpenOptions::new().write(true).create_new(true).open(dir.join("inputs.spool")).unwrap();
+    orphan.set_permissions(fs::Permissions::from_mode(0o600)).unwrap(); orphan.sync_all().unwrap(); drop(orphan);
+    let mut stored = StoredJob::open(&dir, key(), JobId([7;16]), limits(), &mut Control::default()).unwrap();
+    let report = stored.status().unwrap();
+    assert!(report.retained_inputs.is_none()); assert!(report.uncommitted_input_spool_present);
+    assert_eq!(error(stored.verify(&mut Control::default())), JobError::UncommittedTail); drop(stored);
+    assert_eq!(error(OwnedJob::resume(&dir, key(), manifest(), TailPolicy::DiscardUncommitted,
+        &mut Control::default())), JobError::UncommittedTail);
+    assert_eq!(fs::metadata(dir.join("inputs.spool")).unwrap().len(), 0);
+}
+
+#[test]
+fn missing_committed_input_spool_is_not_a_metadata_only_fallback() {
+    let dir = root(); let population = retained_population();
+    drop(OwnedJob::create_with_retained_inputs(&dir, key(), retained_manifest(), retained_cap(),
+        &population, &mut Control::default()).unwrap());
+    fs::rename(dir.join("inputs.spool"), dir.join("saved-inputs")).unwrap();
+    assert_eq!(error(StoredJob::open(&dir, key(), JobId([7;16]), limits(), &mut Control::default())), JobError::Corrupt);
+    assert_eq!(error(OwnedJob::resume(&dir, key(), retained_manifest(), TailPolicy::DiscardUncommitted,
+        &mut Control::default())), JobError::Corrupt);
+    assert!(dir.join("saved-inputs").exists());
+}
 #[test]
 fn exclusive_lock_and_private_files_hold_until_database_closes() {
     let dir = root(); let job = create(&dir);

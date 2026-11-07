@@ -20,6 +20,7 @@ fn inputs() -> [JobInput<'static>; 2] {
     let b = br#"{"id":"beta","text":"Bob private source","task_args":{"v":2}}"#;
     [JobInput { id: "alpha", original: a, normalized: a }, JobInput { id: "beta", original: b, normalized: b }]
 }
+fn retention() -> InputRetentionLimits { InputRetentionLimits { max_spool_bytes: 1 << 20 } }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Args { v: u64 }
@@ -95,6 +96,148 @@ impl DecodeStepControl for GuardControl {
 }
 fn err<T>(result: Result<T, JobRunError>) -> JobRunError {
     match result { Err(error) => error, Ok(_) => panic!("expected refusal") }
+}
+
+#[test]
+fn retained_resume_owns_exact_inputs_after_original_population_is_dropped() {
+    let root = Root::new(); let full = Root::new(); let mut control = Control::default();
+    let seen = Rc::new(Events::default());
+    {
+        // A heap-owned record with CR and noncanonical whitespace catches
+        // reconstruction through JSON serialization instead of exact bytes.
+        let a = b" {\"id\":\"alpha\", \"text\":\"Alice private source\", \"task_args\":{\"v\":1}}\r".to_vec();
+        let b = inputs()[1].original.to_vec();
+        let population = [JobInput { id: "alpha", original: &a, normalized: &a },
+            JobInput { id: "beta", original: &b, normalized: &b }];
+        let mut run = JobRunner::create_with_retained_inputs(&root.0, key(), JobId([7;16]), limits(),
+            retention(), &population, Processor::new(seen.clone()), &mut control).unwrap();
+        assert_eq!(run.step(&mut control).unwrap().unwrap().committed, 1);
+        let mut baseline = JobRunner::create(&full.0, key(), JobId([7;16]), limits(), &population,
+            Processor::new(Rc::new(Events::default())), &mut control).unwrap();
+        baseline.run(&mut control).unwrap(); baseline.materialize_ordered(&mut control).unwrap();
+    }
+    let mut resumed = JobRunner::resume_with_retained_inputs(&root.0, key(), JobId([7;16]), limits(),
+        retention(), Processor::new(seen.clone()), TailPolicy::Refuse, &mut control).unwrap();
+    resumed.run(&mut control).unwrap(); resumed.materialize_ordered(&mut control).unwrap();
+    assert_eq!(*seen.prepared.borrow(), vec!["alpha", "beta"]);
+    assert_eq!(*seen.executed.borrow(), vec![1, 2]);
+    assert_eq!(resumed.progress().attempts, 2);
+    assert_eq!(fs::read(root.0.join("materialized.ndjson")).unwrap(),
+        fs::read(full.0.join("materialized.ndjson")).unwrap());
+}
+
+#[test]
+fn retained_input_is_explicit_and_does_not_change_original_resume_authority() {
+    let root = Root::new(); let retained_root = Root::new(); let population = inputs();
+    let mut control = Control::default();
+    drop(JobRunner::create(&root.0, key(), JobId([7;16]), limits(), &population,
+        Processor::new(Rc::new(Events::default())), &mut control).unwrap());
+    assert!(!root.0.join("inputs.spool").exists());
+    assert_eq!(err(JobRunner::resume_with_retained_inputs(&root.0, key(), JobId([7;16]), limits(),
+        retention(), Processor::new(Rc::new(Events::default())), TailPolicy::DiscardUncommitted, &mut control)),
+        JobRunError::Storage(JobError::InputsNotRetained));
+    drop(JobRunner::create_with_retained_inputs(&retained_root.0, key(), JobId([7;16]), limits(), retention(),
+        &population, Processor::new(Rc::new(Events::default())), &mut control).unwrap());
+    let mut resumed = JobRunner::resume(&retained_root.0, key(), JobId([7;16]), limits(), &population,
+        Processor::new(Rc::new(Events::default())), TailPolicy::Refuse, &mut control).unwrap();
+    assert_eq!(resumed.run(&mut control).unwrap().committed, 2);
+}
+
+#[test]
+fn retention_limit_refuses_before_any_job_file_is_created() {
+    let root = Root::new(); let population = inputs(); let events = Rc::new(Events::default());
+    assert_eq!(err(JobRunner::create_with_retained_inputs(&root.0, key(), JobId([7;16]), limits(),
+        InputRetentionLimits { max_spool_bytes: 1 }, &population, Processor::new(events.clone()),
+        &mut Control::default())), JobRunError::Storage(JobError::Limit));
+    assert_eq!(fs::read_dir(&root.0).unwrap().count(), 0);
+    assert!(events.prepared.borrow().is_empty()); assert!(events.executed.borrow().is_empty());
+}
+
+#[test]
+fn retained_resume_refreezes_recipe_identity_and_limits_before_result_repair() {
+    use std::io::Write;
+    let root = Root::new(); let population = inputs(); let mut control = Control::default();
+    drop(JobRunner::create_with_retained_inputs(&root.0, key(), JobId([7;16]), limits(), retention(),
+        &population, Processor::new(Rc::new(Events::default())), &mut control).unwrap());
+    let mut spool = fs::OpenOptions::new().append(true).open(root.0.join("results.spool")).unwrap();
+    spool.write_all(b"uncommitted result tail").unwrap(); spool.sync_all().unwrap(); drop(spool);
+    let before = fs::read(root.0.join("results.spool")).unwrap();
+    let input_before = fs::read(root.0.join("inputs.spool")).unwrap();
+    for field in [MismatchField::Recipe, MismatchField::Execution, MismatchField::Limits] {
+        let events = Rc::new(Events::default()); let mut processor = Processor::new(events.clone());
+        let mut cap = limits();
+        match field {
+            MismatchField::Recipe => processor.recipe.seed += 1,
+            MismatchField::Execution => processor.identity.backend_semantic_version.push_str("-changed"),
+            MismatchField::Limits => cap.max_attempts += 1,
+            _ => unreachable!(),
+        }
+        assert_eq!(err(JobRunner::resume_with_retained_inputs(&root.0, key(), JobId([7;16]), cap,
+            retention(), processor, TailPolicy::DiscardUncommitted, &mut control)),
+            JobRunError::Storage(JobError::Mismatch(field)));
+        assert!(events.prepared.borrow().is_empty()); assert!(events.executed.borrow().is_empty());
+        assert_eq!(fs::read(root.0.join("results.spool")).unwrap(), before);
+        assert_eq!(fs::read(root.0.join("inputs.spool")).unwrap(), input_before);
+    }
+}
+
+#[test]
+fn damaged_retained_input_blocks_repair_even_when_original_inputs_are_supplied() {
+    use std::io::{Seek, SeekFrom, Write};
+    let root = Root::new(); let population = inputs(); let mut control = Control::default();
+    drop(JobRunner::create_with_retained_inputs(&root.0, key(), JobId([7;16]), limits(), retention(),
+        &population, Processor::new(Rc::new(Events::default())), &mut control).unwrap());
+    let mut input = fs::OpenOptions::new().write(true).open(root.0.join("inputs.spool")).unwrap();
+    input.seek(SeekFrom::Start(crate::jobs::retained::HEADER_BYTES as u64)).unwrap();
+    input.write_all(b"X").unwrap(); input.sync_all().unwrap(); drop(input);
+    let mut output = fs::OpenOptions::new().append(true).open(root.0.join("results.spool")).unwrap();
+    output.write_all(b"tail").unwrap(); output.sync_all().unwrap(); drop(output);
+    for use_retained in [true, false] {
+        let events = Rc::new(Events::default()); let processor = Processor::new(events.clone());
+        let result = if use_retained {
+            JobRunner::resume_with_retained_inputs(&root.0, key(), JobId([7;16]), limits(), retention(),
+                processor, TailPolicy::DiscardUncommitted, &mut control)
+        } else {
+            JobRunner::resume(&root.0, key(), JobId([7;16]), limits(), &population, processor,
+                TailPolicy::DiscardUncommitted, &mut control)
+        };
+        assert_eq!(err(result), JobRunError::Storage(JobError::Authentication));
+        assert!(events.executed.borrow().is_empty());
+        assert_eq!(fs::read(root.0.join("results.spool")).unwrap(), b"tail");
+    }
+}
+
+#[test]
+fn retained_replay_keeps_failed_attempt_work_and_stable_delivery_coordinates() {
+    let root = Root::new(); let population = inputs(); let events = Rc::new(Events::default());
+    let mut processor = Processor::new(events.clone()); processor.fail_sequence = Some(1);
+    let mut control = Control::default();
+    let mut run = JobRunner::create_with_retained_inputs(&root.0, key(), JobId([7;16]), limits(),
+        retention(), &population, processor, &mut control).unwrap();
+    assert!(run.step(&mut control).is_err()); assert_eq!(run.progress().attempts, 1); drop(run);
+    let mut resumed = JobRunner::resume_with_retained_inputs(&root.0, key(), JobId([7;16]), limits(),
+        retention(), Processor::new(events.clone()), TailPolicy::Refuse, &mut control).unwrap();
+    let progress = resumed.run(&mut control).unwrap();
+    assert_eq!(progress.attempts, 3);
+    assert_eq!(progress.reserved_work, work().checked_add(work()).unwrap().checked_add(work()).unwrap());
+    assert_eq!(*events.executed.borrow(), vec![1, 1, 2]);
+}
+
+#[test]
+fn current_input_read_cap_can_tighten_without_rewriting_creation_consent() {
+    let root = Root::new(); let population = inputs(); let mut control = Control::default();
+    drop(JobRunner::create_with_retained_inputs(&root.0, key(), JobId([7;16]), limits(), retention(),
+        &population, Processor::new(Rc::new(Events::default())), &mut control).unwrap());
+    let length = fs::metadata(root.0.join("inputs.spool")).unwrap().len();
+    assert_eq!(err(JobRunner::resume_with_retained_inputs(&root.0, key(), JobId([7;16]), limits(),
+        InputRetentionLimits { max_spool_bytes: length - 1 }, Processor::new(Rc::new(Events::default())),
+        TailPolicy::Refuse, &mut control)), JobRunError::Storage(JobError::Limit));
+    drop(JobRunner::resume_with_retained_inputs(&root.0, key(), JobId([7;16]), limits(),
+        InputRetentionLimits { max_spool_bytes: length }, Processor::new(Rc::new(Events::default())),
+        TailPolicy::Refuse, &mut control).unwrap());
+    let stored = crate::jobs::StoredJob::open(&root.0, key(), JobId([7;16]), limits(), &mut control).unwrap();
+    let report = stored.status().unwrap().retained_inputs.unwrap();
+    assert_eq!(report.spool_bytes, length); assert_eq!(report.max_spool_bytes, retention().max_spool_bytes);
 }
 
 #[test]

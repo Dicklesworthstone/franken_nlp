@@ -7,6 +7,7 @@ use std::fs::TryLockError;
 
 const DATABASE: &str = "journal.fsqlite";
 const SPOOL: &str = "results.spool";
+const INPUTS: &str = "inputs.spool";
 const LOCK: &str = "job.lock";
 const MATERIALIZED: &str = "materialized.ndjson";
 
@@ -57,6 +58,43 @@ impl JobFiles {
     pub fn sync_directory(&self) -> Result<(), JobError> {
         check_parent(&self.parent)?; self.parent.sync_all().map_err(|_| JobError::Io)
     }
+    /// Explicit input-retention opt-in, under this job's existing lock. The
+    /// caller must price and bound the complete framed snapshot BEFORE opening
+    /// this file. An orphan from failed initialization is never overwritten.
+    /// No receipt may be journaled until `sync_inputs` succeeds.
+    pub fn create_inputs(&self, max: u64) -> Result<File, JobError> {
+        input_limit(max)?;
+        open_owned(&self.parent, INPUTS, true, true, false, max)
+    }
+    /// Seal the written file before its journal receipt is published. Returns
+    /// its checked physical size for comparison with the planned frame total.
+    /// Content authentication belongs to the input-framing/journal layer.
+    pub fn sync_inputs(&self, file: &File, max: u64) -> Result<u64, JobError> {
+        input_limit(max)?;
+        let length = check_owned_name(&self.parent, INPUTS, file, max)?;
+        file.sync_all().map_err(|_| JobError::Io)?;
+        self.sync_directory()?;
+        if check_owned_name(&self.parent, INPUTS, file, max)? != length {
+            return Err(JobError::UnsafeStorage);
+        }
+        Ok(length)
+    }
+    /// Read-only access while this owner retains the exclusive job lock. File
+    /// presence alone never authorizes replay: the caller must authenticate a
+    /// journal receipt and the exact frames before using retained input bytes.
+    pub fn retained_inputs(&self, max: u64) -> Result<Option<File>, JobError> {
+        input_limit(max)?;
+        check_parent(&self.parent)?;
+        match fs::symlink_metadata(fd_path(&self.parent).join(INPUTS)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(JobError::Io),
+            Ok(_) => {
+                let file = open_owned(&self.parent, INPUTS, false, false, false, max)?;
+                check_owned_name(&self.parent, INPUTS, &file, max)?;
+                Ok(Some(file))
+            }
+        }
+    }
     pub fn destination(&self) -> Result<Destination, JobError> {
         check_parent(&self.parent)?;
         // Do not accumulate a new full-size stage on each crashed retry.
@@ -97,6 +135,21 @@ impl JobFiles {
             Ok(_) => open_owned(&self.parent, MATERIALIZED, false, false, true, max).map(Some),
         }
     }
+}
+fn input_limit(max: u64) -> Result<(), JobError> {
+    if max == 0 || max > i64::MAX as u64 { return Err(JobError::InvalidLimits); }
+    Ok(())
+}
+fn check_owned_name(parent: &File, name: &str, file: &File, max: u64) -> Result<u64, JobError> {
+    check_parent(parent)?;
+    let held = file.metadata().map_err(|_| JobError::Io)?;
+    let named = fs::symlink_metadata(fd_path(parent).join(name)).map_err(|_| JobError::UnsafeStorage)?;
+    check_file(&held, parent, false, max)?;
+    check_file(&named, parent, false, max)?;
+    if identity(&held) != identity(&named) || held.len() != named.len() {
+        return Err(JobError::UnsafeStorage);
+    }
+    Ok(held.len())
 }
 fn check_parent(parent: &File) -> Result<(), JobError> {
     let meta = parent.metadata().map_err(|_| JobError::Io)?;
@@ -177,4 +230,130 @@ fn scan_stages(parent: &File, mut visit: impl FnMut(&str) -> Result<(), JobError
         found = true; visit(name)?;
     }
     Ok(found)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{io::{Seek, SeekFrom}, os::unix::fs::{DirBuilderExt, symlink}};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    fn root() -> PathBuf {
+        let path = std::env::temp_dir().join(format!("fnlp-job-inputs-{}-{}",
+            std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        path
+    }
+    fn create(root: &Path) -> JobFiles {
+        JobFiles::open(root, true, 1024 * 1024, 4096).unwrap()
+    }
+    fn write_inputs(files: &JobFiles, bytes: &[u8]) -> File {
+        let mut input = files.create_inputs(4096).unwrap();
+        input.write_all(bytes).unwrap();
+        assert_eq!(files.sync_inputs(&input, 4096).unwrap(), bytes.len() as u64);
+        input
+    }
+
+    #[test]
+    fn inputs_are_explicit_private_and_reopened_read_only_under_the_same_lock() {
+        let dir = root();
+        let files = create(&dir);
+        assert!(!dir.join(INPUTS).exists());
+        assert!(files.retained_inputs(4096).unwrap().is_none());
+        drop(write_inputs(&files, b"exact private snapshot"));
+        assert_eq!(fs::metadata(dir.join(INPUTS)).unwrap().mode() & 0o7777, 0o600);
+        let mut retained = files.retained_inputs(4096).unwrap().unwrap();
+        let mut bytes = Vec::new();
+        retained.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"exact private snapshot");
+        assert!(retained.write_all(b"mutate").is_err());
+        assert!(matches!(JobFiles::open(&dir, false, 1024 * 1024, 4096), Err(JobError::Busy)));
+        drop(retained); drop(files);
+        let reopened = JobFiles::open(&dir, false, 1024 * 1024, 4096).unwrap();
+        assert_eq!(reopened.retained_inputs(4096).unwrap().unwrap().metadata().unwrap().len(), 22);
+    }
+
+    #[test]
+    fn a_prior_input_file_is_never_replaced_even_if_incomplete() {
+        let dir = root(); let files = create(&dir);
+        let mut unfinished = files.create_inputs(4096).unwrap();
+        unfinished.write_all(b"partial").unwrap();
+        drop(unfinished);
+        assert!(matches!(files.create_inputs(4096), Err(JobError::AlreadyExists)));
+        assert_eq!(fs::read(dir.join(INPUTS)).unwrap(), b"partial");
+    }
+
+    #[test]
+    fn input_caps_are_checked_before_reading_or_acknowledging_a_file() {
+        let dir = root(); let files = create(&dir);
+        assert!(matches!(files.create_inputs(0), Err(JobError::InvalidLimits)));
+        assert!(matches!(files.create_inputs(u64::MAX), Err(JobError::InvalidLimits)));
+        assert!(!dir.join(INPUTS).exists());
+        let mut input = files.create_inputs(4).unwrap();
+        input.write_all(b"oversize").unwrap();
+        assert_eq!(files.sync_inputs(&input, 4), Err(JobError::UnsafeStorage));
+        assert!(matches!(files.retained_inputs(4), Err(JobError::UnsafeStorage)));
+        assert_eq!(fs::read(dir.join(INPUTS)).unwrap(), b"oversize");
+    }
+
+    #[test]
+    fn unsafe_input_modes_links_and_types_are_refused() {
+        let dir = root(); let files = create(&dir);
+        let input = write_inputs(&files, b"private");
+        input.set_permissions(fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(matches!(files.retained_inputs(4096), Err(JobError::UnsafeStorage)));
+        assert_eq!(files.sync_inputs(&input, 4096), Err(JobError::UnsafeStorage));
+
+        let dir = root(); let files = create(&dir);
+        drop(write_inputs(&files, b"private"));
+        fs::hard_link(dir.join(INPUTS), dir.join("alias")).unwrap();
+        assert!(matches!(files.retained_inputs(4096), Err(JobError::UnsafeStorage)));
+
+        let dir = root(); let files = create(&dir);
+        symlink(SPOOL, dir.join(INPUTS)).unwrap();
+        assert!(matches!(files.retained_inputs(4096), Err(JobError::UnsafeStorage)));
+        assert!(matches!(files.create_inputs(4096), Err(JobError::AlreadyExists)));
+
+        let dir = root(); let files = create(&dir);
+        fs::DirBuilder::new().mode(0o700).create(dir.join(INPUTS)).unwrap();
+        assert!(matches!(files.retained_inputs(4096), Err(JobError::UnsafeStorage)));
+    }
+
+    #[test]
+    fn input_sync_refuses_a_replaced_name_or_a_different_held_inode() {
+        let dir = root(); let files = create(&dir);
+        let input = write_inputs(&files, b"original");
+        fs::rename(dir.join(INPUTS), dir.join("original")).unwrap();
+        let replacement = write_inputs(&files, b"replacement");
+        assert_eq!(files.sync_inputs(&input, 4096), Err(JobError::UnsafeStorage));
+        assert_eq!(files.sync_inputs(&files.spool, 4096), Err(JobError::UnsafeStorage));
+        assert_eq!(files.sync_inputs(&replacement, 4096).unwrap(), 11);
+        assert_eq!(fs::read(dir.join("original")).unwrap(), b"original");
+        assert_eq!(fs::read(dir.join(INPUTS)).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn renamed_job_parent_cannot_redirect_input_creation_or_readback() {
+        let base = root(); let path = base.join("job");
+        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        let files = create(&path);
+        fs::rename(&path, base.join("held-job")).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        drop(write_inputs(&files, b"held parent"));
+        assert!(!path.join(INPUTS).exists());
+        assert_eq!(fs::read(base.join("held-job").join(INPUTS)).unwrap(), b"held parent");
+        let mut retained = files.retained_inputs(4096).unwrap().unwrap();
+        retained.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new(); retained.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"held parent");
+    }
+
+    #[test]
+    fn relaxed_parent_blocks_input_read_and_sync() {
+        let dir = root(); let files = create(&dir);
+        let input = write_inputs(&files, b"private");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(matches!(files.retained_inputs(4096), Err(JobError::UnsafeStorage)));
+        assert_eq!(files.sync_inputs(&input, 4096), Err(JobError::UnsafeStorage));
+    }
 }

@@ -1,8 +1,9 @@
 //! Serial durable operations on one exclusively held owned job. Runtime,
 //! resource admission, model/vocabulary ownership and actual native cleanup
 //! remain the embedding host's responsibilities, not journal capabilities.
-use super::{FrozenManifest, JobError, JobId, JobInput, JobSecret, JobWork, checkpoint,
-    frame::{self, Pointer}, journal::{Journal, Table}, manifest::{Binding, ItemBinding}};
+use super::{FrozenManifest, InputRetentionLimits, JobError, JobId, JobInput, JobSecret, JobWork, checkpoint,
+    frame::{self, Pointer}, journal::{Journal, Table}, manifest::{Binding, ItemBinding},
+    retained::{self, InputReceipt}};
 use crate::{local_io::JobFiles, native_engine::decode::DecodeStepControl};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -32,6 +33,10 @@ enum Stage { Pending, Admitted, Running, ResultCommitted, Materialized }
 struct Header {
     schema_version: u32, binding: Binding, items: u64, committed: u64,
     attempts: u64, used: JobWork, spool_end: u64, materialized: bool,
+    // Absence serializes exactly like the original schema-v1 header. Existing
+    // canonical row MACs and all non-retaining job recipes remain unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retained_inputs: Option<InputReceipt>,
 }
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -59,13 +64,43 @@ impl OwnedJob {
     /// Failed initialization is never silently adopted or overwritten.
     pub fn create<C: DecodeStepControl>(root: &Path, key: JobSecret, manifest: FrozenManifest, control: &mut C)
         -> Result<Self, JobError> {
+        Self::create_inner(root, key, manifest, None, control, None)
+    }
+    /// Restricted to the exact-envelope runner; generic normalized populations
+    /// do not silently inherit this input format or retention consent.
+    pub(super) fn create_with_retained_inputs<C: DecodeStepControl>(root: &Path, key: JobSecret,
+        manifest: FrozenManifest, retention: InputRetentionLimits, inputs: &[JobInput<'_>], control: &mut C)
+        -> Result<Self, JobError> {
+        Self::create_inner(root, key, manifest, Some((retention, inputs)), control, None)
+    }
+    fn create_inner<C: DecodeStepControl>(root: &Path, key: JobSecret, manifest: FrozenManifest,
+        retained: Option<(InputRetentionLimits, &[JobInput<'_>])>, control: &mut C, fail_at: Option<CreateFault>)
+        -> Result<Self, JobError> {
         checkpoint(control)?;
         check_secret(&key, &manifest)?;
+        let expected_input_bytes = retained.map(|(cap, inputs)| retained::preflight(&key, &manifest, cap, inputs, control)).transpose()?;
         let limits = manifest.limits;
         let files = JobFiles::open(root, true, limits.max_journal_bytes, limits.max_spool_bytes)?;
+        if retained.is_none() && files.retained_inputs(retained::storage_ceiling(limits)?)?.is_some() {
+            return Err(JobError::UncommittedTail);
+        }
         let journal = Journal::open(&files.database_path(), limits.max_journal_bytes)?;
+        let retained_inputs = if let Some((cap, inputs)) = retained {
+            let mut spool = files.create_inputs(cap.max_spool_bytes)?;
+            let receipt = retained::write(&mut spool, &key, &manifest, cap, inputs, control)?;
+            create_fault(fail_at, CreateFault::InputSpoolWritten)?;
+            let durable_length = files.sync_inputs(&spool, cap.max_spool_bytes)?;
+            if Some(durable_length) != expected_input_bytes || durable_length != receipt.spool_bytes {
+                return Err(JobError::Corrupt);
+            }
+            create_fault(fail_at, CreateFault::InputSpoolSynced)?;
+            // Cancellation here leaves an orphan, never a committed input
+            // snapshot. The initial journal transaction is the authority.
+            checkpoint(control)?;
+            Some(receipt)
+        } else { None };
         let header = Header { schema_version: 1, binding: manifest.binding.clone(), items: manifest.item_count(),
-            committed: 0, attempts: 0, used: JobWork::default(), spool_end: 0, materialized: false };
+            committed: 0, attempts: 0, used: JobWork::default(), spool_end: 0, materialized: false, retained_inputs };
         journal.transaction(|journal| {
             journal.create_schema()?;
             for binding in &manifest.items {
@@ -77,6 +112,7 @@ impl OwnedJob {
             journal.write(Table::Header, 0, &key, &header, true)
         })?;
         files.check_database(limits.max_journal_bytes)?; files.sync_database()?;
+        create_fault(fail_at, CreateFault::HeaderCommitted)?;
         Ok(Self { journal, files, key, manifest, header, poisoned: false, #[cfg(test)] fail_at: None })
     }
 
@@ -93,21 +129,29 @@ impl OwnedJob {
         let header: Header = journal.read(Table::Header, 0, &key)?;
         manifest.binding.compare(&header.binding)?;
         let mut job = Self { journal, files, key, manifest, header, poisoned: true, #[cfg(test)] fail_at: None };
-        job.verify_prefix(control)?;
-        let length = job.files.spool.metadata().map_err(|_| JobError::Io)?.len();
-        if length != job.header.spool_end {
-            if tail == TailPolicy::Refuse { return Err(JobError::UncommittedTail); }
-            checkpoint(control)?;
-            job.files.spool.set_len(job.header.spool_end).map_err(|_| JobError::Io)?;
-            job.files.spool.sync_all().map_err(|_| JobError::Io)?;
-        }
-        if job.files.has_stages()? {
-            if tail == TailPolicy::Refuse { return Err(JobError::UncommittedTail); }
-            checkpoint(control)?;
-            job.files.discard_stages(job.manifest.limits.max_materialized_bytes)?;
-        }
-        job.poisoned = false;
+        job.verify_retained_inputs(control)?;
+        job.recover(tail, control)?;
         Ok(job)
+    }
+    /// Called only after exact fresh input/recipe authorization. Retention
+    /// verification precedes this method so corrupt/orphan input can never
+    /// grant permission to truncate a result tail or discard output stages.
+    fn recover<C: DecodeStepControl>(&mut self, tail: TailPolicy, control: &mut C) -> Result<(), JobError> {
+        self.verify_prefix(control)?;
+        let length = self.files.spool.metadata().map_err(|_| JobError::Io)?.len();
+        if length != self.header.spool_end {
+            if tail == TailPolicy::Refuse { return Err(JobError::UncommittedTail); }
+            checkpoint(control)?;
+            self.files.spool.set_len(self.header.spool_end).map_err(|_| JobError::Io)?;
+            self.files.spool.sync_all().map_err(|_| JobError::Io)?;
+        }
+        if self.files.has_stages()? {
+            if tail == TailPolicy::Refuse { return Err(JobError::UncommittedTail); }
+            checkpoint(control)?;
+            self.files.discard_stages(self.manifest.limits.max_materialized_bytes)?;
+        }
+        self.poisoned = false;
+        Ok(())
     }
     pub fn progress(&self) -> JobProgress {
         JobProgress { job_id: self.header.binding.job, items: self.header.items,
@@ -170,6 +214,7 @@ impl OwnedJob {
     /// looking tail remains an error here; only explicit resume policy repairs.
     pub fn verify<C: DecodeStepControl>(&mut self, control: &mut C) -> Result<JobProgress, JobError> {
         self.ready()?; self.poisoned = true;
+        self.verify_retained_inputs(control)?;
         self.verify_prefix(control)?;
         if self.files.spool.metadata().map_err(|_| JobError::Io)?.len() != self.header.spool_end {
             return Err(JobError::UncommittedTail);
@@ -279,8 +324,16 @@ fn check_secret(key: &JobSecret, manifest: &FrozenManifest) -> Result<(), JobErr
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Fault { Admitted, Running, SpoolWritten, SpoolSynced, ResultCommitted, Published, Materialized }
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CreateFault { InputSpoolWritten, InputSpoolSynced, HeaderCommitted }
+fn create_fault(fail_at: Option<CreateFault>, point: CreateFault) -> Result<(), JobError> {
+    #[cfg(test)] if fail_at == Some(point) { return Err(JobError::Io); }
+    #[cfg(not(test))] let _ = (fail_at, point);
+    Ok(())
+}
 
 // Kept beside the owner so publication and journal-state transitions share
 // the same exclusive session, poisoned-error policy, and cancellation control.
 mod materialize;
+mod retained_inputs;
 #[cfg(test)] mod tests;
