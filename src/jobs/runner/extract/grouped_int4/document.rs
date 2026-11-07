@@ -235,6 +235,7 @@ impl Int4DocumentExtractionJobPlanner {
         }
         if identities.len() != expected.chunk_count() || expected.chunk_count() == 0
             || expected.group_width() != self.group_width() || expected.selected_rows() != self.selected_rows()
+            || expected.execution_version() != self.recipe.execution
             || plan.max_kv_bytes() != self.document_budget().max_kv_bytes
             || plan.max_result_bytes() != self.max_result_bytes() {
             return Err(BatchItemFailure::fatal(BatchCode::Admission));

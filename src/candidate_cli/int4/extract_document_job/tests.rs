@@ -32,6 +32,40 @@ impl Write for NoIo {
 }
 
 #[test]
+fn start_resume_and_retained_replay_preserve_the_explicit_selected_row_policy() {
+    for (operation, retained) in [("start", false), ("resume", false), ("resume", true)] {
+        for grouped in [false, true] {
+            let mut flags = vec!["--source-membership", "--root-array-union"];
+            if retained { flags.push("--use-retained-input"); }
+            if grouped { flags.extend(["--cohort-chunks", "3"]); }
+            let (full, args) = command(operation, &flags);
+            let baseline = full.args.validate(&args).unwrap();
+            assert!(full.args.map.extraction.selected_rows().unwrap().is_none());
+            for cap in ["1", "7", "166144"] {
+                let mut selected_flags = flags.clone(); selected_flags.extend(["--max-selected-rows", cap]);
+                let (selected, _) = command(operation, &selected_flags);
+                let map = selected.args.validate(&args).unwrap();
+                assert_eq!(selected.args.map.extraction.selected_rows().unwrap().unwrap().max_rows_per_step.to_string(), cap);
+                assert_eq!(map.common.minimum_memory_bytes, baseline.common.minimum_memory_bytes);
+                assert_eq!(map.cohort, baseline.cohort);
+                assert_eq!(map.workspace_bytes, baseline.workspace_bytes);
+                let fixed = lifetime(&args, baseline);
+                let original = full.args.lifetime_limits(&args, baseline, fixed).unwrap();
+                let admitted = selected.args.lifetime_limits(&args, map, fixed).unwrap();
+                assert_eq!(admitted.buffer_bytes, original.buffer_bytes);
+                assert_eq!(admitted.map.mapping.mapping.max_model_work, original.map.mapping.mapping.max_model_work);
+                assert_eq!(admitted.map.mapping.mapping.max_mask_visits, original.map.mapping.mapping.max_mask_visits);
+                assert_eq!(admitted.map.mapping.verification, original.map.mapping.verification);
+                assert_eq!(admitted.map.mapping.root_array_union, original.map.mapping.root_array_union);
+                let schema = " {\"type\":\"array\",\"maxItems\":8,\"items\":{\"type\":\"string\",\"maxLength\":64,\"x-fnlp-source\":\"verbatim\"}}\n";
+                let budget = selected.args.map.extraction.budget(&args, map.common);
+                assert_eq!(selected.args.map.request(schema.to_owned(), budget).unwrap().schema, schema);
+            }
+        }
+    }
+}
+
+#[test]
 fn start_and_resume_use_complete_document_limits_and_an_explicit_fixed_schema() {
     for operation in ["start", "resume"] {
         let (c, args) = command(operation, &[]); let map = c.args.validate(&args).unwrap();

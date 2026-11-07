@@ -22,6 +22,37 @@ impl Read for NoRead {
 }
 
 #[test]
+fn selected_projection_is_explicit_and_preserves_complete_document_memory_and_safety_limits() {
+    for flags in [&[][..], &["--cohort-chunks", "4"][..],
+        &["--source-membership", "--root-array-union", "--cohort-chunks", "3"][..]] {
+        let (full, mut args) = arguments(flags); args.memory_mib = 262_144;
+        let baseline = full.validate(&args).unwrap();
+        assert!(full.extraction.selected_rows().unwrap().is_none());
+        for cap in ["1", "7", "166144"] {
+            let mut selected_flags = flags.to_vec(); selected_flags.extend(["--max-selected-rows", cap]);
+            let (selected, _) = arguments(&selected_flags);
+            let limits = selected.validate(&args).unwrap();
+            assert_eq!(selected.extraction.selected_rows().unwrap().unwrap().max_rows_per_step.to_string(), cap);
+            assert_eq!(limits.common.minimum_memory_bytes, baseline.common.minimum_memory_bytes);
+            assert_eq!(limits.common.native, baseline.common.native);
+            assert_eq!(limits.cohort, baseline.cohort);
+            assert_eq!(limits.workspace_bytes, baseline.workspace_bytes);
+            assert_eq!(limits.mapping.mapping.max_model_work, baseline.mapping.mapping.max_model_work);
+            assert_eq!(limits.mapping.mapping.max_mask_visits, baseline.mapping.mapping.max_mask_visits);
+            assert_eq!(limits.mapping.verification, baseline.mapping.verification);
+            assert_eq!(limits.mapping.root_array_union, baseline.mapping.root_array_union);
+            assert_eq!(selected.extraction.budget(&args, limits.common),
+                full.extraction.budget(&args, baseline.common));
+        }
+    }
+    for cap in ["0", "166145", "18446744073709551615"] {
+        let mut command = command(&["--max-selected-rows", cap]);
+        command.args.memory_mib = 262_144;
+        assert_eq!(command.execute(&mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
 fn exact_array_union_is_explicit_and_prices_one_complete_reducer_for_each_schedule() {
     let (plain, mut args) = arguments(&[]);
     args.memory_mib = 262_144;

@@ -144,17 +144,31 @@ fn selected_document_recipe_authenticates_strategy_cap_and_preserves_dense_recip
     assert!(dense_recipe.get("selected_rows").is_none());
     assert_eq!(dense_recipe["extraction"]["execution"], INT4_EXTRACT_VERSION);
     let dense_binding = freeze(&dense);
-    let a = factory(true).with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: 7 }).unwrap();
-    let b = factory(true).with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: 8 }).unwrap();
-    let encoded = serde_json::to_value(a.job_recipe()).unwrap();
-    assert_eq!(encoded["execution"], INT4_EXTRACTION_MAP_SELECTED_EXECUTION);
-    assert_eq!(encoded["selected_rows"]["max_rows_per_step"], 7);
-    assert_eq!(encoded["selected_rows"]["native_execution"], constrained_int4::sparse::INT4_SPARSE_JSON_EXECUTION);
-    assert_eq!(encoded["extraction"]["execution"], crate::tasks::extract::grouped_int4::INT4_SPARSE_EXTRACT_VERSION);
-    assert_eq!(dense_binding.binding.compare(&freeze(&a).binding), Err(JobError::Mismatch(MismatchField::Recipe)));
-    assert_eq!(freeze(&a).binding.compare(&freeze(&b).binding), Err(JobError::Mismatch(MismatchField::Recipe)));
-    let same = factory(true).with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: 7 }).unwrap();
-    freeze(&a).binding.compare(&freeze(&same).binding).unwrap();
+    for cap in [1, 7, 166_144] {
+        let rows = Int4JsonSparseLimits { max_rows_per_step: cap };
+        let selected = factory(true).with_selected_rows(rows).unwrap();
+        let mut encoded = serde_json::to_value(selected.job_recipe()).unwrap();
+        assert_eq!(encoded["execution"], INT4_EXTRACTION_MAP_SELECTED_EXECUTION);
+        assert_eq!(encoded["selected_rows"]["max_rows_per_step"], cap);
+        assert_eq!(encoded["selected_rows"]["native_execution"], constrained_int4::sparse::INT4_SPARSE_JSON_EXECUTION);
+        assert_eq!(encoded["selected_rows"]["execution"], crate::tasks::extract::grouped_int4::INT4_SPARSE_EXTRACT_VERSION);
+        assert_eq!(encoded["extraction"]["execution"], crate::tasks::extract::grouped_int4::INT4_SPARSE_EXTRACT_VERSION);
+        encoded.as_object_mut().unwrap().remove("selected_rows");
+        encoded["execution"] = dense_recipe["execution"].clone();
+        encoded["extraction"]["execution"] = dense_recipe["extraction"]["execution"].clone();
+        assert_eq!(encoded, dense_recipe);
+        assert_eq!(dense_binding.binding.compare(&freeze(&selected).binding), Err(JobError::Mismatch(MismatchField::Recipe)));
+        let changed = factory(true).with_selected_rows(Int4JsonSparseLimits {
+            max_rows_per_step: if cap == 1 { 2 } else { cap - 1 },
+        }).unwrap();
+        assert_eq!(freeze(&selected).binding.compare(&freeze(&changed).binding), Err(JobError::Mismatch(MismatchField::Recipe)));
+        let same = factory(true).with_selected_rows(rows).unwrap();
+        freeze(&selected).binding.compare(&freeze(&same).binding).unwrap();
+        // Even an internal recipe mismatch cannot authorize a prepared attempt.
+        let mut mislabeled = selected; mislabeled.recipe.execution = INT4_EXTRACTION_MAP_EXECUTION;
+        assert_eq!(mislabeled.prepare_with_control(document(SOURCE), &mut Continue).err().unwrap().fault.code,
+            BatchCode::Admission);
+    }
 }
 
 #[test]
@@ -187,21 +201,47 @@ fn selected_document_debit_admits_sparse_work_and_keeps_original_chunk_authority
 
 #[test]
 fn selected_document_policy_expires_prepared_attempts_and_composes_with_chunk_cohorts() {
-    let dense = factory(false);
-    let old = prepare(&dense, SOURCE);
-    let selected = dense.with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: 7 }).unwrap();
-    assert_eq!(selected.owns(&old).err().unwrap().fault.code, BatchCode::Admission);
-    let next = prepare(&selected, SOURCE);
-    let grouped = selected.with_chunk_cohorts().unwrap();
-    assert_eq!(grouped.owns(&next).err().unwrap().fault.code, BatchCode::Admission);
-    let final_plan = prepare(&grouped, SOURCE);
-    assert_eq!(next.work, final_plan.work);
-    assert_eq!(next.identities, final_plan.identities);
-    assert_eq!(grouped.selected_rows().unwrap().max_rows_per_step, 7);
+    for grounded in [false, true] {
+        for cap in [7, 166_144] {
+            let dense = factory(grounded); let old = prepare(&dense, SOURCE);
+            let rows = Int4JsonSparseLimits { max_rows_per_step: cap };
+            let selected = dense.with_selected_rows(rows).unwrap();
+            assert_eq!(selected.owns(&old).err().unwrap().fault.code, BatchCode::Admission);
+            let next = prepare(&selected, SOURCE);
+            assert_eq!(next.expected.selected_rows(), Some(rows));
+            assert_eq!(next.expected.execution_version(), INT4_EXTRACTION_MAP_SELECTED_EXECUTION);
+            let work = next.work.int4_model_work(); let full = old.work.int4_model_work();
+            assert_eq!(work.forward_positions, full.forward_positions);
+            assert_eq!(work.attention_pairs, full.attention_pairs);
+            assert_eq!(next.work.mask_node_visits, old.work.mask_node_visits);
+            assert_eq!(work.projected_logits,
+                next.chunk_count() as u64 * u64::from(budget().max_output_tokens) * cap as u64);
+            if cap == 166_144 { assert_eq!(work, full); }
+            else { assert!(work.projections.dot_products < full.projections.dot_products); }
+            for (before, after) in old.identities.iter().zip(&next.identities) {
+                assert_eq!(before.prompt_digest, after.prompt_digest);
+                assert_eq!(before.schema_digest, after.schema_digest);
+                assert_ne!(before.decision_policy_digest, after.decision_policy_digest);
+            }
+            let plan = selected.plan(SOURCE, &mut Continue).unwrap();
+            selected.compare(&plan, &next, &mut Continue).unwrap();
+            assert_eq!(next.work, receipt_work(plan.preflight_metadata()));
+            assert!(selected.compare(&plan, &old, &mut Continue).is_err());
+            drop(plan);
+            let grouped = selected.with_chunk_cohorts().unwrap();
+            assert_eq!(grouped.owns(&next).err().unwrap().fault.code, BatchCode::Admission);
+            let final_plan = prepare(&grouped, SOURCE);
+            assert_eq!(next.work, final_plan.work);
+            assert_eq!(next.identities, final_plan.identities);
+            assert_eq!(grouped.selected_rows(), Some(rows));
+            let inverse = factory(grounded).with_chunk_cohorts().unwrap().with_selected_rows(rows).unwrap();
+            assert_eq!(freeze(&grouped).binding.compare(&freeze(&inverse).binding), Ok(()));
+            assert!(grouped.with_selected_rows(rows).is_err());
+        }
+    }
     for cap in [0, 166_145, usize::MAX] {
         assert!(factory(false).with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: cap }).is_err());
     }
-    assert!(grouped.with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: 7 }).is_err());
 }
 
 #[test]

@@ -31,6 +31,35 @@ impl Write for NoIo {
 }
 
 #[test]
+fn selected_projection_composes_with_exact_array_reduction_without_renewing_stream_limits() {
+    for flags in [&["--root-array-union"][..],
+        &["--root-array-union", "--cohort-chunks", "3", "--source-membership"][..]] {
+        let (plain, args) = arguments(flags);
+        let baseline = plain.validate(&args).unwrap();
+        assert!(plain.document.extraction.selected_rows().unwrap().is_none());
+        for cap in ["1", "7", "166144"] {
+            let mut selected_flags = flags.to_vec(); selected_flags.extend(["--max-selected-rows", cap]);
+            let (selected, _) = arguments(&selected_flags);
+            let admitted = selected.validate(&args).unwrap();
+            assert_eq!(selected.document.extraction.selected_rows().unwrap().unwrap().max_rows_per_step.to_string(), cap);
+            assert_eq!(admitted.memory, baseline.memory);
+            assert_eq!(admitted.transport, baseline.transport);
+            assert_eq!(admitted.max_run_mask_visits, baseline.max_run_mask_visits);
+            assert_eq!(admitted.max_run_verification, baseline.max_run_verification);
+            assert_eq!(admitted.document.mapping.mapping.max_model_work, baseline.document.mapping.mapping.max_model_work);
+            assert_eq!(admitted.document.mapping.root_array_union, baseline.document.mapping.root_array_union);
+            let budget = selected.document.extraction.budget(&args, admitted.common);
+            let raw = if flags.contains(&"--source-membership") {
+                " {\"type\":\"array\",\"maxItems\":8,\"items\":{\"type\":\"string\",\"maxLength\":64,\"x-fnlp-source\":\"verbatim\"}}\n"
+            } else {
+                " {\"type\":\"array\",\"maxItems\":8,\"items\":{\"type\":\"number\",\"const\":12345678901234567890123456789012345678}}\n"
+            };
+            assert_eq!(selected.load_defaults(raw.to_owned(), budget).unwrap().schema, raw);
+        }
+    }
+}
+
+#[test]
 fn document_corpus_prices_the_same_exact_array_policy_once_without_renewing_native_work() {
     for cohorts in [None, Some(3)] {
         let (mut plain, args) = arguments(&[]);

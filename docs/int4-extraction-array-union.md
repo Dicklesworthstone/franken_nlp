@@ -95,6 +95,13 @@ available through `--source-dir DIR --source-manifest FILE`.
 NDJSON input. A document is published only after its complete reduction and
 validation. Earlier completed documents remain valid if a later document fails.
 
+All three extraction routes also accept `--max-selected-rows N` for an explicit
+bounded projection of every legal grammar row, with serial or chunk-cohort
+execution. The [selected-row contract](int4-selected-rows.md#complete-document-extraction)
+applies independently of exact union: the cap never prunes schema-valid rows,
+and neither a later projection refusal nor a union failure publishes a partial
+document. Durable resume authenticates both the row cap and the union policy.
+
 ## Independent bounds and memory ownership
 
 The optional reducer has six complete-document limits:

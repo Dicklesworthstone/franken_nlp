@@ -137,6 +137,26 @@ or changing it refuses the stored job instead of mixing policies. Failed
 attempts retain their durable work debit. Existing full-head jobs keep their
 original recipe when the option is omitted.
 
+For example, after preparing the protected job directory, key, ID and lifetime
+limits, start a retained selected-row job with:
+
+```sh
+fnlp candidate source-int4 extract-document-job start documents.ndjson \
+  --schema records.schema.json --source-membership \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --group-width 128 --memory-mib "$MEMORY_MIB" \
+  --max-chunks 8 --cohort-chunks 4 --max-selected-rows 4096 \
+  --store-results --job-dir /private/extraction-job --job-id "$JOB_ID" \
+  --key-file /private/extraction-job.key --limits extraction-job-limits.json \
+  --materialize
+```
+
+A selected cap of 166144 still creates a distinct execution policy, even when
+its conservative work equals the full head. It cannot reuse a full-head
+preparation or resume a full-head job. Selection and chunk-cohort scheduling
+compose in either builder order; changing either invalidates prior preparations.
+
 Library callers select `Int4ExtractionBatchPlanner::with_selected_rows`
 before `plan_document_with_control` or hosted one-document extraction.
 `Int4ExtractionDocumentBatchPlanner::with_selected_rows` applies it to an
@@ -310,6 +330,10 @@ finalizers, selected chunk counts, rejection of mixed strategies and wrong
 markers, complete output-token reservation, packed scratch charged once, and
 all five CLI combinations at exact process-memory boundaries. These
 definitions are also **UNRUN**.
+
+Complete-document definitions also cover authenticated resume, retained-input
+replay, fixed memory and lifetime limits, and full-vocabulary-cap identity
+separation despite equal planned work. These definitions remain **UNRUN**.
 
 Compilation and regression execution await the repository's controller-owned
 DSR checkpoint on the named production graph. Actual-model equality against
