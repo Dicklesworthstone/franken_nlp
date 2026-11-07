@@ -17,7 +17,7 @@ mod sentiment;
 pub use sentiment::{Int4SentimentHostLimits, Int4SentimentMapHostConfig,
     int4_sentiment_document_corpus_requirements};
 mod judge;
-pub use judge::{Int4JudgeHostLimits, Int4FaithfulnessMapHostConfig};
+pub use judge::{Int4JudgeHostLimits, Int4FaithfulnessMapHostConfig, int4_faithfulness_document_corpus_requirements};
 mod resolve;
 pub use resolve::{Int4ResolveConfig, HostedInt4EntityCorpus, Int4EntityCorpusError,
     Int4EntityCorpusHostConfig, Int4EntityCorpusHostRequirements, Int4EntityCorpusSummary};

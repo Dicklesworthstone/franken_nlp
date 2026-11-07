@@ -1,5 +1,9 @@
 //! Complete-source faithfulness under one owned native invocation.
 use super::*;
+mod corpus;
+pub use corpus::int4_faithfulness_document_corpus_requirements;
+#[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod job;
 use crate::{native_engine::lmhead::NANBEIGE_VOCAB_SIZE,
     tasks::judge::{JudgeLimits, JudgeRequest,
     grouped_int4::{Int4JudgePlanner,

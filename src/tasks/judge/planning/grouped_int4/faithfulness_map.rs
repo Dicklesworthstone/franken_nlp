@@ -250,9 +250,12 @@ impl<'a> PreparedInt4FaithfulnessMap<'a> {
         let mut identities = reserved(self.plans.len())?;
         identities.extend(self.plans.iter().map(|plan| plan.execution_identity().clone())); Ok(identities)
     }
-    pub fn execute_with_control<C: DecodeStepControl>(&self, admitted: &[ExecutionIdentity],
-        engine: &mut StrictInt4Engine<'_>, budget: Int4ScoringBudget, control: &mut C)
-        -> Result<Int4FaithfulnessMapRun, Int4FaithfulnessMapError> {
+    /// Admit every original chunk against the actual resident engine without
+    /// forwarding or changing native state. Corpus and durable callers use
+    /// this before charging an attempt; execution repeats the same checks.
+    pub fn preflight_with_control<C: DecodeStepControl>(&self, admitted: &[ExecutionIdentity],
+        engine: &StrictInt4Engine<'_>, budget: Int4ScoringBudget, control: &mut C)
+        -> Result<(), Int4FaithfulnessMapError> {
         checkpoint(control)?;
         if admitted.len() != self.plans.len() || self.plans.is_empty() { return Err(Int4FaithfulnessMapError::Admission); }
         check_work(self.planned_work(), budget.native)?;
@@ -264,6 +267,12 @@ impl<'a> PreparedInt4FaithfulnessMap<'a> {
             plan.preflight(identity, engine, Int4ScoringBudget {
                 native: Int4RunBudget::exact(plan.planned_work()), max_kv_bytes: budget.max_kv_bytes })?;
         }
+        checkpoint(control)
+    }
+    pub fn execute_with_control<C: DecodeStepControl>(&self, admitted: &[ExecutionIdentity],
+        engine: &mut StrictInt4Engine<'_>, budget: Int4ScoringBudget, control: &mut C)
+        -> Result<Int4FaithfulnessMapRun, Int4FaithfulnessMapError> {
+        self.preflight_with_control(admitted, engine, budget, control)?;
         self.collect_with_control(control, |index, plan, control| {
             let run = plan.execute_with_control(&admitted[index], engine, Int4ScoringBudget {
                 native: Int4RunBudget::exact(plan.planned_work()), max_kv_bytes: budget.max_kv_bytes }, control)?;

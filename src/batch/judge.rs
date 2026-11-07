@@ -3,6 +3,8 @@
 //! judge implementation. The host's actual admission guard remains live until
 //! native completion, result validation AND delivery by the batch writer.
 
+pub mod grouped_int4;
+
 use crate::{
     execution_identity::{ExecutionIdentity, NumericsProfile, ThinkingMode, ToolMode},
     native_engine::{decode::DecodeStepControl, hf_bf16_eager::{HfBf16EagerEngine,
