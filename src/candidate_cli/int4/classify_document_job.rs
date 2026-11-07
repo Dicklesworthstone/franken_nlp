@@ -33,8 +33,9 @@ pub(super) fn definition() -> clap::Command {
     let operation = |name: &'static str, about: &'static str| {
         let command = ClassificationArgs::augment_args(StorageArgs::augment_args(classify_map::definition()
             .name(name).about(about)
-            .long_about("Retain and resume classification of COMPLETE original documents with fixed --defaults {labels,mode?,policy?}. Supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation; text is never a pre-split chunk and task_args may only be absent, null or an empty object. Each document is losslessly partitioned and every native chunk must finish before that original document commits. Retained results preserve full-vocabulary chunk scores, original byte/scalar coordinates and the explicitly named scalar-weighted exclusive or independent multi-label aggregate. --cohort-chunks shares native layers within a document; repeat the exact declared schedule and width on resume. Requires --store-results, protected existing --job-dir and --key-file, exact --job-id, immutable --limits and unchanged private label settings. All five per-document work flags cover every chunk; JobLimits.max_work is the sole lifetime allowance, including failed attempts, and mask_node_visits must be zero. Neither new chunks, attempts nor resume renew that work. Complete input, planning, native, retained-result and durable-job memory are admitted before reading the population. Stdout is metadata only; --materialize publishes private retained results after every document commits. No partial-document success, automatic retry, input spooling, calibrated confidence or full-context equivalence. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
-            .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population, also on resume; '-' reads stdin"))
+            .long_about("Retain and resume classification of COMPLETE original documents with fixed --defaults {labels,mode?,policy?}. By default, supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation; explicit retained-input replay is available. text is never a pre-split chunk and task_args may only be absent, null or an empty object. Each document is losslessly partitioned and every native chunk must finish before that original document commits. Retained results preserve full-vocabulary chunk scores, original byte/scalar coordinates and the explicitly named scalar-weighted exclusive or independent multi-label aggregate. --cohort-chunks shares native layers within a document; repeat the exact declared schedule and width on resume. Requires --store-results, protected existing --job-dir and --key-file, exact --job-id, immutable --limits and unchanged private label settings. All five per-document work flags cover every chunk; JobLimits.max_work is the sole lifetime allowance, including failed attempts, and mask_node_visits must be zero. Neither new chunks, attempts nor resume renew that work. Complete input, planning, native, retained-result and durable-job memory are admitted before reading the population. Stdout is metadata only; --materialize publishes private retained results after every document commits. No partial-document success, automatic retry, calibrated confidence or full-context equivalence. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
+            .after_help(job_cli::INPUT_RETENTION_HELP)
+            .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population; omit with --use-retained-input; '-' reads stdin"))
             .mut_arg("max_input_bytes", |arg| arg.help("Outer ceiling for each complete NDJSON record and original document; immutable stored input ceiling must fit"))
             .mut_arg("max_map_result_bytes", |arg| arg.help("Complete original-document result cap; must fit immutable JobLimits.max_result_bytes"))
             .mut_arg("max_checkpoints", |arg| arg.help("Cooperative allowance for this invocation; durable work and attempts never renew"))))
@@ -65,6 +66,7 @@ struct JobExecutionLimits {
 impl JobArgs {
     fn validate(&self, args: &Int4Args) -> Result<MapLimits, Failure> {
         let s = &self.storage;
+        s.input_retention.limits()?;
         let local = |path: &std::path::Path| !path.as_os_str().is_empty() && path.as_os_str() != "-";
         if !s.store_results || !local(&s.job_dir) || !local(&s.key_file) || !local(&s.limits_file)
             || !local(&self.classification.defaults)
@@ -156,6 +158,7 @@ impl JobCommand {
     }
     fn execute_owned<R: Read + Send + 'static>(self, args: Int4Args, input: R, output: &mut impl Write)
         -> Result<(), Failure> {
+        self.args.storage.input_retention.validate(self.mode, &args.input)?;
         let map = self.args.validate(&args)?;
         #[cfg(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")))]

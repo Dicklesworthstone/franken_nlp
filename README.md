@@ -1099,9 +1099,10 @@ fnlp candidate source-int4 score-job start documents.ndjson \
 ```
 
 Use `resume` in place of `start`, with the same settings and the **complete
-original population**, including committed records. IDs are unique across the
+original population**, including committed records, or select
+[explicit retained-input replay](docs/retained-inputs.md). IDs are unique across the
 whole frozen population; live-stream flush controls are refused. Inputs are
-admitted in memory for the invocation and are not persisted for future recovery.
+admitted in memory for the invocation; saving them requires `--spool-input`.
 Per-record `task_args` keeps the existing typed contract and replaces complete
 shared defaults. Sentiment mode, terminal EOS and policy remain run-wide.
 
@@ -1858,8 +1859,9 @@ fnlp candidate source-int4 redact-job start documents.ndjson \
 ```
 
 Use the same arguments with `resume` in place of `start` and supply the
-**complete original population**, including committed items. Inputs remain in
-admitted memory during the invocation; they are not saved for future recovery.
+**complete original population**, including committed items, or select
+[explicit retained-input replay](docs/retained-inputs.md). Inputs remain in
+admitted memory during the invocation; saving them requires `--spool-input`.
 Resume authenticates original envelope bytes, IDs and order, the actual
 model/group/strict-v2 identity, decoded source cap, NER options, rules, actions,
 chunking, both verification policies and limits, and the actual pseudonym key
@@ -1939,6 +1941,37 @@ cohorts through the same runner and storage contract. No parallel job storage fo
 input spool is introduced. Fixtures cover authority, resource, privacy and
 resume contracts; compilation, model-present execution, crash recovery and
 quality qualification remain pending controller-selected gates.
+
+## Explicit retained inputs for native jobs
+
+Native durable jobs can resume without reopening their original population
+file when creation explicitly saved the input envelopes. Add `--spool-input
+--max-retained-input-mib N` to `start`; on `resume`, omit the input positional
+argument and use `--use-retained-input --max-retained-input-mib N`. Retention is
+separate from `--store-results`, and its byte ceiling must be explicit and
+positive. Existing jobs and starts without these flags save no input bytes.
+
+The shared path covers INT8 and INT4 extraction, source tasks, scoring,
+generation, redaction, and complete-document classification, sentiment and
+faithfulness jobs. The saved population includes exact encoded envelopes,
+per-record task arguments, IDs and order. It does not replace the model,
+schema/options files, shared question or independent secret keys needed to
+reconstruct the same execution recipe.
+
+Creation syncs a protected `inputs.spool` before publishing its authenticated
+journal receipt. Resume holds the same exclusive job lock while checking the
+receipt, every bounded frame, the original population and the fresh processor
+recipe before result recovery or native work. Committed items remain skipped;
+spent attempts and work budgets stay spent. A file without a receipt cannot
+authorize replay. The in-memory snapshot and item ceilings still apply.
+
+`fnlp job status` and `verify` also authenticate retained inputs without a
+model, one record at a time. Their optional retention report exposes only
+counts and byte ceilings. Retained sources are private plaintext in the
+owner-only job directory; no purge command or encryption at rest is implied.
+See [retained input replay](docs/retained-inputs.md) for examples and recovery
+semantics. Source fixtures cover the new paths; Rust execution, native parity
+and physical crash qualification remain pending controller DSR gates.
 
 ## Implemented candidate INT4 complete-source question corpora
 
@@ -2894,10 +2927,11 @@ fnlp candidate source-int4 ner-job start documents.ndjson \
   --materialize
 ```
 
-Use the same arguments and complete original population with `resume`.
+Use the same arguments and complete original population with `resume`, or
+select [explicit retained-input replay](docs/retained-inputs.md).
 Already committed items remain in that input and are skipped after
-authentication. The command admits the population in memory; it does not
-persist the input for future recovery. IDs must be unique across the whole
+authentication. The command admits the population in memory; saving it for
+future recovery requires `--spool-input`. IDs must be unique across the whole
 population, and live-stream `flush` controls are refused.
 
 Records use the same typed `{id,text,task_args?}` contract as
@@ -3006,8 +3040,8 @@ every document. `task_args` may be absent, null or an empty object; task choices
 options, questions and budgets are fixed for the entire job. `--options FILE`
 accepts the selected family's complete typed options. Duplicate IDs anywhere
 in the population, live-stream flush controls, unknown fields and per-record
-task overrides refuse. Inputs are admitted in memory and are not saved for
-future resume by this command.
+task overrides refuse. Inputs are admitted in memory; saving them for future
+resume requires [explicit input retention](docs/retained-inputs.md).
 
 Prepare the existing protected job directory, random job ID and protected
 32-byte raw secret described in [owned job storage](docs/owned-jobs.md).
@@ -3057,8 +3091,9 @@ fnlp candidate source-int4 document-job start summarize documents.ndjson \
   --materialize
 ```
 
-Replace `start` with `resume` and provide the same original population and
-settings. Resume authenticates original bytes, order and IDs; real model,
+Replace `start` with `resume` and provide the same original population or select
+explicit retained-input replay, preserving the same settings. Resume
+authenticates original bytes, order and IDs; real model,
 group width and compiler identity; exact private question/options; chunking,
 reduction and hierarchy configuration; and every immutable lifetime ceiling
 before replay or tail repair. `--discard-uncommitted-tail` is an explicit
@@ -3291,8 +3326,9 @@ fnlp candidate source-int4 extract-document-job start documents.ndjson \
   --materialize
 ```
 
-Replace `start` with `resume`, preserving the full original population, exact
-schema bytes and all immutable settings. Source conversion is also supported
+Replace `start` with `resume`, supplying or explicitly replaying the full
+retained population and preserving exact schema bytes and all immutable
+settings. Source conversion is also supported
 with `--source-dir DIR --source-manifest FILE`. Optional `--save-snapshot`
 follows immutable planner admission and precedes population execution; the
 completed independent model file survives later authentication or execution
@@ -3366,8 +3402,10 @@ It accepts the same pinned source conversion and independently digest-pinned
 snapshot inputs as the existing INT4 text commands. One resident model serves
 all pending items, through one owned physical invocation.
 
-Supply the **complete original population** on both start and resume, including
-already committed items. The wire format is `{id,text,task_args?}` NDJSON:
+Supply the **complete original population** on start and ordinary resume,
+including already committed items. Explicit input retention also permits
+resume without the original population file. The wire format is
+`{id,text,task_args?}` NDJSON:
 
 ```jsonl
 {"id":"message-1","text":"Write a short welcome message."}

@@ -74,6 +74,27 @@ fn repair_is_resume_only_and_requires_an_explicit_flag() {
 }
 
 #[test]
+fn retained_input_modes_keep_explicit_model_and_storage_admission() {
+    let (start, args) = command("start", &["population.ndjson", "--spool-input", "--max-retained-input-mib", "8"]);
+    start.args.storage.input_retention.validate(start.mode, &args.input).unwrap();
+    assert!(start.args.validate(&args).is_ok());
+    let (resume, args) = command("resume", &["--use-retained-input", "--max-retained-input-mib", "4"]);
+    resume.args.storage.input_retention.validate(resume.mode, &args.input).unwrap();
+    assert_eq!(args.input, PathBuf::from("-"));
+    assert!(resume.args.validate(&args).is_ok());
+    for (operation, flag) in [("start", "--use-retained-input"), ("resume", "--spool-input")] {
+        let (c, args) = command(operation, &[flag, "--max-retained-input-mib", "1"]);
+        assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().code, "job_input_retention_options");
+    }
+    for extra in [vec!["--use-retained-input"],
+        vec!["--use-retained-input", "--max-retained-input-mib", "4", "population.ndjson"],
+        vec!["--use-retained-input", "--max-retained-input-mib", "4", "-"]] {
+        let mut words = argv("resume"); words.extend(extra.into_iter().map(str::to_owned));
+        assert!(parse(words).is_err());
+    }
+}
+
+#[test]
 fn missing_storage_consent_and_nonlocal_storage_paths_refuse_before_io() {
     for case in 0..4 {
         let (mut c, args) = command("start", &[]);

@@ -40,6 +40,7 @@ fn host_limits(args: &TextJobArgs, limits: Limits, session: &Session) -> Result<
 }
 pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode, args: TextJobArgs,
     limits: Limits, input: R, output: &mut impl Write) -> Result<(), Failure> {
+    args.input_retention.validate(mode, &args.common.input)?;
     // First allocation owner survives all input, planner and report locals.
     let session = Session::new(&args.common, limits)?;
     let lifetime = command::parse_limits(&read_config(&session, &args.limits_file, command::LIMIT_BYTES)?)?;
@@ -50,18 +51,13 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     let facts = session.facts(&args.common)?;
     let planner = prepare(&args, limits, lifetime, &facts)?;
     session.remaining()?;
-    let reader: Box<dyn BufRead + Send> = if args.common.input.as_os_str() == "-" {
-        Box::new(BufReader::with_capacity(IO_BYTES, input))
-    } else {
-        Box::new(BufReader::with_capacity(IO_BYTES,
-            crate::local_io::open_document(&args.common.input).map_err(|_| CandidateError::Input)?))
-    };
+    let reader = command::population_reader(mode, args.input_retention, &args.common.input, input, IO_BYTES)?;
     let cancellation = CancellationToken::default();
     let model = session.load(&args.common, limits, &facts, cancellation.clone())?;
     let host = host_limits(&args, limits, &session)?;
     let task = args.task_name(); let job_id = args.job_id; let materialize = args.materialize;
     let request = SourceJobRequest { root: args.job_dir, key, job_id, limits: lifetime,
-        mode: open_mode(mode), materialize };
+        mode: open_mode(mode, args.input_retention)?, materialize };
     let progress = session.engine.job_int8_text(&model, planner, request, host, reader, cancellation)
         .map_err(host_failure)?;
     session.remaining()?;

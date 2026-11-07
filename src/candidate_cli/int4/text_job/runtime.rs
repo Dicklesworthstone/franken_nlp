@@ -1,6 +1,6 @@
 //! Actual resident model, pinned text compiler and one owned retained job.
 use super::*;
-use std::{io::{BufRead, BufReader}, time::{Duration, Instant}};
+use std::time::{Duration, Instant};
 use crate::{
     NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
     candidate_cli::runtime::owned_jobs::{host_failure, job_failure, open_mode, progress_report},
@@ -14,6 +14,7 @@ use crate::{
 pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     job: JobArgs, _admitted: Int4Limits, input: R, output: &mut impl Write) -> Result<(), Failure> {
     let started = Instant::now();
+    job.storage.input_retention.validate(mode, &args.input)?;
     let common = job.validate(&args)?;
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
@@ -36,12 +37,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     check_host_quote(host_limits(&args, limits, remaining()?), lifetime, limits.buffer_bytes)?;
     let key = JobSecret::read(&job.storage.key_file).map_err(job_failure)?;
     remaining()?;
-    let reader: Box<dyn BufRead + Send> = if args.input.as_os_str() == "-" {
-        Box::new(BufReader::with_capacity(IO_BUFFER_BYTES, input))
-    } else {
-        Box::new(BufReader::with_capacity(IO_BUFFER_BYTES,
-            crate::local_io::open_document(&args.input).map_err(|_| CandidateError::Input)?))
-    };
+    let reader = job_cli::population_reader(mode, job.storage.input_retention, &args.input, input, IO_BUFFER_BYTES)?;
     let cancellation = CancellationToken::default();
     let model = super::super::runtime::load_model(&engine, &args, common, remaining()?, cancellation.clone())?;
     remaining()?;
@@ -62,7 +58,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     let host = host_limits(&args, limits, remaining()?);
     let task = job.task_name(); let job_id = job.storage.job_id; let materialize = job.storage.materialize;
     let request = SourceJobRequest { root: job.storage.job_dir, key, job_id, limits: lifetime,
-        mode: open_mode(mode), materialize };
+        mode: open_mode(mode, job.storage.input_retention)?, materialize };
     // The host authenticates the complete population and exact recipe before
     // replay/repair, executes only pending whole items and drains physically.
     let progress = engine.job_int4_generation(&model, planner, request, host,

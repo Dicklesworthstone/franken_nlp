@@ -22,6 +22,7 @@ fn result_ceiling(args: &ScoreJobArgs, lifetime: JobLimits) -> Result<(), Failur
 
 pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode, args: ScoreJobArgs,
     common: CandidateArgs, limits: Limits, input: R, output: &mut impl Write) -> Result<(), Failure> {
+    args.input_retention.validate(mode, &args.host.input)?;
     // First local owner: settings, planners, reader and report drop before the
     // CLI preparation charge. The host separately owns the transferred state.
     let prefill = args.prefill_limits()?;
@@ -38,18 +39,13 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     // job adds retention, not a divergent scoring implementation or defaults.
     let corpus = scored_batch::configure_scored(args.kind()?, &args.host, &facts, limits, defaults)?;
     session.remaining()?;
-    let reader: Box<dyn BufRead + Send> = if args.host.input.as_os_str() == "-" {
-        Box::new(BufReader::with_capacity(IO_BYTES, input))
-    } else {
-        Box::new(BufReader::with_capacity(IO_BYTES,
-            crate::local_io::open_document(&args.host.input).map_err(|_| CandidateError::Input)?))
-    };
+    let reader = command::population_reader(mode, args.input_retention, &args.host.input, input, IO_BYTES)?;
     let cancellation = CancellationToken::default();
     let model = session.load(&common, limits, &facts, cancellation.clone())?;
     let host = host_limits(&args, &common, limits, &session)?;
     let job_id = args.job_id; let materialize = args.materialize;
     let request = SourceJobRequest { root: args.job_dir, key, job_id,
-        limits: lifetime, mode: open_mode(mode), materialize };
+        limits: lifetime, mode: open_mode(mode, args.input_retention)?, materialize };
     let progress = match corpus {
         Corpus::Classify(planner, config) => session.engine.job_int8_classify(&model, planner,
             config, request, host, reader, cancellation),

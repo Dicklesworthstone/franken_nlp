@@ -29,6 +29,8 @@ pub(super) struct StorageArgs {
     /// Required consent to retain private extraction results in the owner-only spool.
     #[arg(long)]
     pub store_results: bool,
+    #[command(flatten)]
+    pub input_retention: job_cli::InputRetentionArgs,
     /// Existing owner-only job directory; never created or silently adopted.
     #[arg(long, value_name = "DIR")]
     pub job_dir: PathBuf,
@@ -61,8 +63,9 @@ pub(super) struct StorageArgs {
 pub(super) fn definition() -> clap::Command {
     let operation = |name: &'static str, about: &'static str| {
         StorageArgs::augment_args(extract::definition().name(name).about(about)
-            .long_about("Retain and resume schema/source extraction with one resident source-converted or independently pinned snapshot INT4 model. Requires --store-results, an existing protected --job-dir, original --job-id and --key-file, immutable --limits, and one exact shared --schema. Supply the COMPLETE original NDJSON population on every invocation; inputs are admitted in memory and are not persisted for you. Non-null task_args and flush controls are refused. Resume authenticates exact input bytes, schema, model/group identity and recipe before replay or tail repair. Lifetime native work includes every INT4 group dot and does not renew on resume; failed attempts remain debited. Stdout is metadata only; retained private results are read through explicit job verification/materialization. --materialize publishes only after all items commit. Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. No automatic retry, key/directory creation, release activation or semantic-accuracy claim.")
-            .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population, also on resume; '-' reads stdin"))
+            .long_about("Retain and resume schema/source extraction with one resident source-converted or independently pinned snapshot INT4 model. Requires --store-results, an existing protected --job-dir, original --job-id and --key-file, immutable --limits, and one exact shared --schema. By default, supply the COMPLETE original NDJSON population on every invocation; explicit retained-input replay is available. Non-null task_args and flush controls are refused. Resume authenticates exact input bytes, schema, model/group identity and recipe before replay or tail repair. Lifetime native work includes every INT4 group dot and does not renew on resume; failed attempts remain debited. Stdout is metadata only; retained private results are read through explicit job verification/materialization. --materialize publishes only after all items commit. Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. No automatic retry, key/directory creation, release activation or semantic-accuracy claim.")
+            .after_help(job_cli::INPUT_RETENTION_HELP)
+            .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population; omit with --use-retained-input; '-' reads stdin"))
             .mut_arg("max_input_bytes", |arg| arg.help("Outer cap on each complete NDJSON record; immutable JobLimits.max_input_bytes_per_item must fit"))
             .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoints for this complete invocation; persisted work and attempt ceilings do not renew")))
     };
@@ -94,6 +97,7 @@ impl JobArgs {
     /// Pure option validation, before reading any key, limits, schema or input.
     pub(super) fn validate(&self, args: &Int4Args) -> Result<Int4Limits, Failure> {
         let s = &self.storage;
+        s.input_retention.limits()?;
         let local = |path: &std::path::Path| !path.as_os_str().is_empty() && path.as_os_str() != "-";
         if !s.store_results || !local(&s.job_dir) || !local(&s.key_file) || !local(&s.limits_file)
             || !(1..=1024 * 1024).contains(&s.max_stream_mib)
@@ -189,6 +193,7 @@ impl JobCommand {
 
     pub(super) fn execute_owned<R: Read + Send + 'static>(self, args: Int4Args,
         input: R, output: &mut impl Write) -> Result<(), Failure> {
+        self.args.storage.input_retention.validate(self.mode, &args.input)?;
         let common = self.args.validate(&args)?;
         #[cfg(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")))]

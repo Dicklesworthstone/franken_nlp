@@ -54,8 +54,20 @@ Uniqueness is checked over the whole snapshot, not per batch flush epoch. The
 initial implementation uses a bounded in-memory index with a hard ceiling of
 100,000 items and explicit aggregate input-byte limits. Larger populations fail
 closed; an external-sort/index implementation is not present. Resume requires
-reconstructing the full original manifest. Mismatches report closed field
+reconstructing the full original manifest from supplied inputs or explicitly
+retained authenticated envelopes. Mismatches report closed field
 categories rather than printing private old/new values.
+
+`JobRunner::create_with_retained_inputs` opts into a separate bounded
+`inputs.spool`. It validates and writes exact identity-normalized NDJSON
+envelopes, syncs the file and directory, and then publishes an optional receipt
+in the initial authenticated journal transaction. Ordinary creation omits both
+the file and receipt. `JobRunner::resume_with_retained_inputs` authenticates
+that receipt, every frame and the original population under the exclusive job
+lock, then checks the fresh processor's execution identity and recipe before
+any result-tail recovery. The complete population stays inside the existing
+snapshot memory ceiling. See [retained input replay](retained-inputs.md) for
+the native host and CLI entrypoints, explicit disk cap and privacy contract.
 
 ## Commit and recovery protocol
 
@@ -137,9 +149,11 @@ under `WIRING.md`. No build, test, physical-durability, phase-gate or release pa
 is claimed. Read-back PRAGMAs and sync calls are implementation checks, not a
 platform durability certificate.
 
-This does not implement public `fnlp job` commands, a hosted native job runner,
-input spooling, external-sort manifests, cross-item reductions, cache dependency
-invalidation, encryption-at-rest, key generation, or retention/purge commands.
+Native hosts and the candidate job commands use this storage contract;
+`fnlp job` also supplies stored-state management without a model. External-sort
+manifests, cross-item reductions, cache dependency invalidation,
+encryption-at-rest, key generation and retention-purge commands remain outside
+this implementation.
 Owned committed records and no-replace publication do not imply exactly-once
 delivery to arbitrary stdout consumers. Replaying bytes to an external consumer
 requires that consumer's own deduplication or acknowledgement protocol.

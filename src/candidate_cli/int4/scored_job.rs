@@ -38,8 +38,9 @@ struct ScoreArgs {
 pub(super) fn definition() -> clap::Command {
     let operation = |name: &'static str, about: &'static str| {
         StorageArgs::augment_args(ScoreArgs::augment_args(classify::definition().name(name).about(about)
-            .long_about("Retain and resume complete classification, sentiment or judgment results with one resident source-converted or independently pinned snapshot INT4 model. Requires --store-results, an existing protected --job-dir, original --job-id and --key-file, and immutable --limits. Supply the COMPLETE original NDJSON {id,text,task_args?} population on every invocation. --task is fixed; --defaults has the same typed settings as score-batch. Supplied task_args replaces the complete shared arguments. Sentiment scoring mode, EOS and policy stay fixed for the run. Every native head preflights before execution. Resume authenticates original input bytes, defaults, planner limits and model/group identity before any repair or native forward. Five scoring flags bound EACH ITEM; JobLimits.max_work is the sole lifetime authority, including failed attempts, and its mask_node_visits must be zero. Neither population size nor resume renews that work. Flush controls are refused. Stdout is metadata only; private scores remain in the explicitly retained spool. --materialize publishes only after all items commit. Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. No automatic retry, input spooling, key/directory creation, release activation or semantic-accuracy claim.")
-            .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population, also on resume; '-' reads stdin"))
+            .long_about("Retain and resume complete classification, sentiment or judgment results with one resident source-converted or independently pinned snapshot INT4 model. Requires --store-results, an existing protected --job-dir, original --job-id and --key-file, and immutable --limits. By default, supply the COMPLETE original NDJSON {id,text,task_args?} population on every invocation; explicit retained-input replay is available. --task is fixed; --defaults has the same typed settings as score-batch. Supplied task_args replaces the complete shared arguments. Sentiment scoring mode, EOS and policy stay fixed for the run. Every native head preflights before execution. Resume authenticates original input bytes, defaults, planner limits and model/group identity before any repair or native forward. Five scoring flags bound EACH ITEM; JobLimits.max_work is the sole lifetime authority, including failed attempts, and its mask_node_visits must be zero. Neither population size nor resume renews that work. Flush controls are refused. Stdout is metadata only; private scores remain in the explicitly retained spool. --materialize publishes only after all items commit. Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. No automatic retry, key/directory creation, release activation or semantic-accuracy claim.")
+            .after_help(job_cli::INPUT_RETENTION_HELP)
+            .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population; omit with --use-retained-input; '-' reads stdin"))
             .mut_arg("max_input_bytes", |arg| arg.help("Outer cap on each complete NDJSON record; immutable JobLimits.max_input_bytes_per_item must fit"))
             .mut_arg("max_result_bytes", |arg| arg.help("Complete per-item scored result ceiling; must fit immutable JobLimits.max_result_bytes"))
             .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoints for this invocation; persisted work and attempts do not renew"))
@@ -79,6 +80,7 @@ impl JobArgs {
     fn validate(&self, args: &Int4Args) -> Result<Int4Limits, Failure> {
         self.kind()?;
         let s = &self.storage;
+        s.input_retention.limits()?;
         let local = |path: &std::path::Path| !path.as_os_str().is_empty() && path.as_os_str() != "-";
         if !s.store_results || !local(&s.job_dir) || !local(&s.key_file) || !local(&s.limits_file)
             || self.score.defaults.as_ref().is_some_and(|path| !local(path))
@@ -168,6 +170,7 @@ impl JobCommand {
     }
     fn execute_owned<R: Read + Send + 'static>(self, args: Int4Args, input: R, output: &mut impl Write)
         -> Result<(), Failure> {
+        self.args.storage.input_retention.validate(self.mode, &args.input)?;
         let common = self.args.validate(&args)?;
         #[cfg(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")))]

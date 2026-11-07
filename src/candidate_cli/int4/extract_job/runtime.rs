@@ -1,6 +1,6 @@
 //! Owned population, real resident INT4 model and one authenticated job run.
 use super::*;
-use std::{io::{BufRead, BufReader}, sync::Arc, time::{Duration, Instant}};
+use std::{sync::Arc, time::{Duration, Instant}};
 use crate::{
     NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
     candidate_cli::{extract::SCHEMA_BYTES, runtime::owned_jobs::{
@@ -15,6 +15,7 @@ use crate::{
 pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     job: JobArgs, _admitted: Int4Limits, input: R, output: &mut impl Write) -> Result<(), Failure> {
     let started = Instant::now();
+    job.storage.input_retention.validate(mode, &args.input)?;
     // Recheck options at the owned boundary before private IO/runtime creation.
     let common = job.validate(&args)?;
     let deadline = Duration::from_secs(args.timeout_seconds);
@@ -44,12 +45,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     let budget = job.extraction.budget(&args, common);
     let defaults = job.extraction.shared_defaults(schema, budget)?;
     remaining()?;
-    let reader: Box<dyn BufRead + Send> = if args.input.as_os_str() == "-" {
-        Box::new(BufReader::with_capacity(IO_BUFFER_BYTES, input))
-    } else {
-        Box::new(BufReader::with_capacity(IO_BUFFER_BYTES,
-            crate::local_io::open_document(&args.input).map_err(|_| CandidateError::Input)?))
-    };
+    let reader = job_cli::population_reader(mode, job.storage.input_retention, &args.input, input, IO_BUFFER_BYTES)?;
     let cancellation = CancellationToken::default();
     let model = super::super::runtime::load_model(&engine, &args, common, remaining()?, cancellation.clone())?;
     remaining()?;
@@ -75,7 +71,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     let job_id = job.storage.job_id;
     let materialize = job.storage.materialize;
     let request = SourceJobRequest { root: job.storage.job_dir, key, job_id, limits: lifetime,
-        mode: open_mode(mode), materialize };
+        mode: open_mode(mode, job.storage.input_retention)?, materialize };
     // Only the real host opens the protected job, authenticates the exact
     // population/recipe, skips committed ordinals and admits pending forwards.
     let progress = engine.job_int4_extract(&model, planner, vocabulary, request, host,

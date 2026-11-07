@@ -1,6 +1,6 @@
 //! Authenticate one complete population before repair or durable native execution.
 use super::*;
-use std::{io::{BufRead, BufReader}, sync::Arc, time::{Duration, Instant}};
+use std::{sync::Arc, time::{Duration, Instant}};
 use crate::{
     NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
     candidate_cli::runtime::owned_jobs::{host_failure, job_failure, open_mode, progress_report},
@@ -16,6 +16,7 @@ use crate::{
 pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     job: JobArgs, _admitted: DocumentLimits, mut input: R, output: &mut impl Write) -> Result<(), Failure> {
     let started = Instant::now();
+    job.storage.input_retention.validate(mode, &args.input)?;
     let admitted = job.validate(&args)?;
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
@@ -76,17 +77,12 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     remaining()?;
     // No caller stdio lock crosses the physical boundary. All decoded original
     // text is also checked against config.max_source_bytes by the durable adapter.
-    let reader: Box<dyn BufRead + Send> = if args.input.as_os_str() == "-" {
-        Box::new(BufReader::with_capacity(IO_BUFFER_BYTES, input))
-    } else {
-        Box::new(BufReader::with_capacity(IO_BUFFER_BYTES,
-            crate::local_io::open_document(&args.input).map_err(|_| CandidateError::Input)?))
-    };
+    let reader = job_cli::population_reader(mode, job.storage.input_retention, &args.input, input, IO_BUFFER_BYTES)?;
     let host = host_limits(&args, limits, remaining()?);
     let job_id = job.storage.job_id;
     let materialize = job.storage.materialize;
     let request = SourceJobRequest { root: job.storage.job_dir, key, job_id, limits: lifetime,
-        mode: open_mode(mode), materialize };
+        mode: open_mode(mode, job.storage.input_retention)?, materialize };
     let config = RedactionCorpusConfig { batch: config, edit_reserve_bytes: limits.document.edit_bytes };
     let progress = if limits.document.cohort.is_some() {
         engine.job_int4_redact_document_cohorts(&model, Arc::new(planner), Arc::new(vocabulary),

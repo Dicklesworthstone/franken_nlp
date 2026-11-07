@@ -1,6 +1,6 @@
 //! One admitted model, authenticated population and complete-document job.
 use super::*;
-use std::{io::{BufRead, BufReader}, time::{Duration, Instant}};
+use std::time::{Duration, Instant};
 use crate::{
     NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
     candidate_cli::runtime::owned_jobs::{host_failure, job_failure, open_mode, progress_report},
@@ -16,6 +16,7 @@ use crate::{
 pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, job: JobArgs,
     _admitted: MapLimits, input: R, output: &mut impl Write) -> Result<(), Failure> {
     let started = Instant::now();
+    job.storage.input_retention.validate(mode, &args.input)?;
     let map = job.validate(&args)?;
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
@@ -77,15 +78,10 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
         snapshot = Some(SnapshotRecord::new("saved", common.snapshot_need));
     }
     remaining()?;
-    let reader: Box<dyn BufRead + Send> = if args.input.as_os_str() == "-" {
-        Box::new(BufReader::with_capacity(IO_BUFFER_BYTES, input))
-    } else {
-        Box::new(BufReader::with_capacity(IO_BUFFER_BYTES,
-            crate::local_io::open_document(&args.input).map_err(|_| CandidateError::Input)?))
-    };
+    let reader = job_cli::population_reader(mode, job.storage.input_retention, &args.input, input, IO_BUFFER_BYTES)?;
     let job_id = job.storage.job_id; let materialize = job.storage.materialize;
     let request = SourceJobRequest { root: job.storage.job_dir, key, job_id, limits: lifetime,
-        mode: open_mode(mode), materialize };
+        mode: open_mode(mode, job.storage.input_retention)?, materialize };
     let progress = engine.job_int4_classification_document(&model, planner, request,
         host_limits(&args, limits, remaining()?), common.kernel, reader, cancellation)
         .map_err(|error| match error { HostedJobError::Host(error) => model_failure(error),

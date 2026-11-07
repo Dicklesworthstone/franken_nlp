@@ -48,7 +48,7 @@ pub(crate) struct RedactCommand {
     /// Include sensitive original/output coordinate mappings in the result, not logs.
     #[arg(long)]
     include_map: bool,
-    /// Raw 32..4096-byte high-entropy key via inherited stdin; source must be a file.
+    /// Raw 32..4096-byte high-entropy key via inherited stdin; source is a file or explicit retained input.
     #[arg(long)]
     key_stdin: bool,
     #[arg(long)]
@@ -71,7 +71,7 @@ pub(crate) struct RedactCommand {
 pub(super) fn definition() -> clap::Command {
     RedactCommand::augment_args(clap::Command::new("redact")
         .about("Redact with native source-bound NER plus rules; verify the edited text afresh")
-        .after_help("Verification covers only the selected detector union, not all PII. Model omissions and Unicode obfuscations remain possible. Pseudonyms are not anonymization. By default this candidate command emits one completed JSON object, never intermediate NER text. Pseudonymization always uses full 256-bit HMAC; raw key bytes have no argv option. Add --chunked for long documents: rules scan whole text while NER uses source-aligned chunks, then verification re-chunks the actual edited text. NER chunk boundaries may split entities; per-document work ceilings never renew per chunk. Add --ndjson for an owned corpus stream with one resident engine, fixed policy/key scope and independent whole-corpus ceilings. Completed document events remain valid if later records fail; any failed record yields a nonzero exit. Records cannot override actions, keys, types, chunking or verification. Add --store-results with --job-dir, --job-id, --job-key-file and --job-limits for explicit private retention; --resume requires the complete original population and unchanged policy/key scope. Retained mode emits metadata only, and an error may follow durable progress. It requires metadata-store on supported Linux targets. The independent fnlp redact --rules-only command remains model-free."))
+        .after_help("Verification covers only the selected detector union, not all PII. Model omissions and Unicode obfuscations remain possible. Pseudonyms are not anonymization. By default this candidate command emits one completed JSON object, never intermediate NER text. Pseudonymization always uses full 256-bit HMAC; raw key bytes have no argv option. Add --chunked for long documents: rules scan whole text while NER uses source-aligned chunks, then verification re-chunks the actual edited text. NER chunk boundaries may split entities; per-document work ceilings never renew per chunk. Add --ndjson for an owned corpus stream with one resident engine, fixed policy/key scope and independent whole-corpus ceilings. Completed document events remain valid if later records fail; any failed record yields a nonzero exit. Records cannot override actions, keys, types, chunking or verification. Add --store-results with --job-dir, --job-id, --job-key-file and --job-limits for explicit private retention. Save original envelopes only with --spool-input --max-retained-input-mib N; --resume --use-retained-input --max-retained-input-mib N restores them without a population positional argument or population stdin read. Otherwise resume requires the complete original population. Policy and both key scopes remain unchanged. Retained mode emits metadata only, and an error may follow durable progress. It requires metadata-store on supported Linux targets. The independent fnlp redact --rules-only command remains model-free."))
 }
 impl RedactCommand {
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), CandidateError> {
@@ -87,10 +87,13 @@ impl RedactCommand {
             .and_then(|n| n.checked_add(self.host.max_result_bytes as u64 * 16))
             .and_then(|n| n.checked_add(MIB)).ok_or(CandidateError::Arguments)?;
         if edit < floor || edit > limits.memory_bytes { return Err(CandidateError::Arguments); }
-        validate_key_scope(self.action, &self.input, self.key_stdin, self.key_id.as_deref(),
+        self.retention.validate(self.corpus.ndjson, limits)?;
+        self.retention.input_retention.validate(self.retention.mode(), &self.input)
+            .map_err(|_| CandidateError::Arguments)?;
+        let population_stdin = self.input.as_os_str() == "-" && !self.retention.input_retention.use_retained_input;
+        validate_key_scope(self.action, population_stdin, self.key_stdin, self.key_id.as_deref(),
             self.namespace.as_deref(), self.expected_key_commitment.as_deref())?;
         self.corpus.validate(self, limits)?;
-        self.retention.validate(self.corpus.ndjson, limits)?;
         Ok((common, limits))
     }
     pub(super) fn request(&self) -> RedactionRequest {
@@ -129,10 +132,10 @@ impl RedactCommand {
 }
 /// One private-key contract for the INT8 and grouped-INT4 redaction commands.
 /// No backend may relax stdin separation or accept raw key bytes in argv.
-pub(super) fn validate_key_scope(action: Action, input: &std::path::Path, key_stdin: bool,
+pub(super) fn validate_key_scope(action: Action, population_stdin: bool, key_stdin: bool,
     key_id: Option<&str>, namespace: Option<&str>, expected: Option<&str>) -> Result<(), CandidateError> {
     if action == Action::Pseudonymize {
-        if !key_stdin || input.as_os_str() == "-"
+        if !key_stdin || population_stdin
             || key_id.is_none_or(|id| id.is_empty() || id.len() > 128
                 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)))
             || namespace.is_none_or(|s| s.is_empty() || s.len() > 256) {

@@ -1,10 +1,10 @@
-//! Explicit private result retention and authenticated native inference resume.
-//! No implicit key generation, input persistence, directory creation or retry.
+//! Explicit private content retention and authenticated native inference resume.
+//! No implicit key generation, directory creation, input retention or retry.
 #![cfg_attr(not(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64"))), allow(dead_code))]
 use super::*;
 use clap::Subcommand;
-use crate::jobs::{JobId, JobLimits};
+use crate::jobs::{InputRetentionLimits, JobId, JobLimits};
 use super::source::SourceHostArgs;
 mod config;
 pub(super) mod document;
@@ -17,6 +17,7 @@ pub(super) use config::{Defaults, load_defaults, native_limits, parse_limits};
 pub(super) const LIMIT_BYTES: usize = 16 * 1024;
 pub(super) const DEFAULT_BYTES: usize = 1024 * 1024;
 pub(super) const REPORT_BYTES: usize = 16 * 1024;
+pub(in crate::candidate_cli) const INPUT_RETENTION_HELP: &str = "Input retention is separate consent: start with --spool-input --max-retained-input-mib N to save exact private envelopes in the protected job. Resume with --use-retained-input --max-retained-input-mib N and omit the population positional argument; the original population file/stdin is not opened. The explicit disk cap includes framing and does not enlarge in-memory snapshot admission or lifetime work. Original model, task, limits and key are still required. Retained inputs authenticate under the same exclusive job lock before recipe binding, repair or inference; missing/corrupt/uncommitted input bytes never fall back to an external source. Omit both flags to keep supplying the complete original population on every invocation.";
 
 #[derive(Args)]
 pub(crate) struct JobCommand {
@@ -39,14 +40,15 @@ struct ResumeArgs {
 }
 #[derive(Args)]
 pub(super) struct JobArgs {
-    /// COMPLETE original NDJSON population, also on resume. '-' reads stdin.
-    /// Input is admitted in memory, not saved for you; preserve it separately.
+    /// COMPLETE original NDJSON population; omit only with --use-retained-input.
+    /// '-' reads stdin. Saving inputs requires --spool-input and a byte ceiling.
     #[arg(default_value = "-")] pub input: PathBuf,
     #[arg(long, value_parser = ["ner", "keyphrases", "summarize", "answer", "extract"])]
     pub task: String,
     #[command(flatten)] pub host: SourceHostArgs,
     /// Required consent: retain private native results in the owner-only spool.
     #[arg(long)] pub store_results: bool,
+    #[command(flatten)] pub input_retention: InputRetentionArgs,
     /// Existing owner-only directory; never created or silently adopted.
     #[arg(long)] pub job_dir: PathBuf,
     /// Expected random 128-bit job ID, as exactly 32 lowercase hex characters.
@@ -84,13 +86,77 @@ impl RunMode {
     pub(super) fn name(self) -> &'static str { match self { Self::Start => "start", Self::Resume { .. } => "resume" } }
 }
 
+/// Input retention is independent consent from result retention. The byte cap
+/// covers the framed on-disk population; the existing snapshot admission still
+/// bounds the reconstructed population and its exact-byte verification.
+#[derive(Args, Clone, Copy, Debug, Default)]
+pub(in crate::candidate_cli) struct InputRetentionArgs {
+    /// Start only: retain exact private input envelopes in the protected job.
+    #[arg(long, conflicts_with = "use_retained_input", requires = "max_retained_input_mib")]
+    pub spool_input: bool,
+    /// Resume only: restore authenticated retained inputs; do not read a population file or stdin.
+    #[arg(long, conflicts_with_all = ["spool_input", "input"], requires = "max_retained_input_mib")]
+    pub use_retained_input: bool,
+    /// Explicit byte ceiling in MiB for the retained input spool, including framing.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub max_retained_input_mib: Option<u64>,
+}
+impl InputRetentionArgs {
+    pub(in crate::candidate_cli) fn requested(self) -> bool {
+        self.spool_input || self.use_retained_input || self.max_retained_input_mib.is_some()
+    }
+
+    pub(in crate::candidate_cli) fn limits(self) -> Result<Option<InputRetentionLimits>, Failure> {
+        if self.spool_input && self.use_retained_input
+            || self.max_retained_input_mib.is_some() != (self.spool_input || self.use_retained_input) {
+            return Err(Failure::usage("job_input_retention_options"));
+        }
+        self.max_retained_input_mib.map(|mib| {
+            let max_spool_bytes = mib.checked_mul(MIB).filter(|&bytes| bytes > 0)
+                .ok_or_else(|| Failure::usage("job_input_retention_options"))?;
+            let limits = InputRetentionLimits { max_spool_bytes };
+            limits.validate().map_err(|_| Failure::usage("job_input_retention_options"))?;
+            Ok(limits)
+        }).transpose()
+    }
+
+    pub(in crate::candidate_cli) fn validate(self, mode: RunMode, input: &std::path::Path)
+        -> Result<(), Failure> {
+        self.limits()?;
+        if matches!(mode, RunMode::Start) && self.use_retained_input
+            || matches!(mode, RunMode::Resume { .. }) && self.spool_input
+            || self.use_retained_input && input.as_os_str() != "-" {
+            return Err(Failure::usage("job_input_retention_options"));
+        }
+        Ok(())
+    }
+}
+
+/// Selecting retained replay never opens the supplied population path or reads
+/// the inherited input stream. The host restores under its exclusive job lock;
+/// this empty reader cannot become a fallback source if authentication fails.
+pub(in crate::candidate_cli) fn population_reader<R: Read + Send + 'static>(mode: RunMode,
+    retention: InputRetentionArgs, path: &std::path::Path, input: R, buffer_bytes: usize)
+    -> Result<Box<dyn io::BufRead + Send>, Failure> {
+    retention.validate(mode, path)?;
+    if retention.use_retained_input { return Ok(Box::new(io::empty())); }
+    if path.as_os_str() == "-" {
+        Ok(Box::new(io::BufReader::with_capacity(buffer_bytes, input)))
+    } else {
+        Ok(Box::new(io::BufReader::with_capacity(buffer_bytes,
+            crate::local_io::open_document(path).map_err(|_| CandidateError::Input)?)))
+    }
+}
+
 pub(super) fn definition() -> clap::Command {
     JobCommand::augment_args(clap::Command::new("job")
         .about("Start or resume explicitly retained, non-certified native corpus jobs")
-        .long_about("Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. Store private results only with --store-results, a protected existing directory, original key, random job ID and immutable limits. Resume requires the complete original input and unchanged task/model recipe. Stdout contains metadata only; errors may follow durable progress. No automatic retry, input spooling, directory/key creation or release activation. Add --task extract --schema FILE --document-config FILE to retain and resume complete documents larger than one context. One journal result contains independent exact-schema chunk values, never a repaired global object or a partial document. Document settings and the shared schema must remain unchanged on resume. For --task ner, keyphrases or summarize, use --source-document-config FILE instead: fixed task options, complete source-aligned chunk maps and one durable result per original document, without global reranking or summary synthesis."))
+        .long_about("Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. Store private results only with --store-results, a protected existing directory, original key, random job ID and immutable limits. Resume authenticates the complete original input and unchanged task/model recipe, with an explicit retained-input source available. Stdout contains metadata only; errors may follow durable progress. No automatic retry, directory/key creation or release activation. Add --task extract --schema FILE --document-config FILE to retain and resume complete documents larger than one context. One journal result contains independent exact-schema chunk values, never a repaired global object or a partial document. Document settings and the shared schema must remain unchanged on resume. For --task ner, keyphrases or summarize, use --source-document-config FILE instead: fixed task options, complete source-aligned chunk maps and one durable result per original document, without global reranking or summary synthesis.")
+        .after_help(INPUT_RETENTION_HELP))
 }
 impl JobArgs {
     pub(super) fn validate(&self) -> Result<(CandidateArgs, Limits), Failure> {
+        self.input_retention.limits()?;
         let local = |p: &std::path::Path| !p.as_os_str().is_empty() && p.as_os_str() != "-";
         if !self.store_results || !local(&self.job_dir) || !local(&self.key_file) || !local(&self.limits_file)
             || self.defaults.as_ref().is_some_and(|p| !local(p)) || self.schema.as_ref().is_some_and(|p| !local(p))
@@ -147,6 +213,7 @@ impl JobCommand {
     }
     fn execute_owned<R: Read + Send + 'static>(self, input: R, output: &mut impl Write) -> Result<(), Failure> {
         let (mode, args) = self.into_parts();
+        args.input_retention.validate(mode, &args.input)?;
         let (common, limits) = args.validate()?;
         #[cfg(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")))]

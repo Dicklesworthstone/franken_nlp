@@ -4,7 +4,7 @@ pub(in crate::candidate_cli) mod scored;
 pub(in crate::candidate_cli) mod generation;
 mod document;
 mod source_document;
-use std::{io::{BufRead, BufReader}, sync::Arc};
+use std::sync::Arc;
 use super::source_tasks::{Session, source_identity};
 use crate::jobs::runner::extract::document::Int8DocumentExtractionJobPlanner;
 use crate::jobs::runner::source::document::Int8SourceDocumentJobPlanner;
@@ -90,16 +90,24 @@ fn preflight_memory(host: JobHostLimits, job: JobLimits, limits: Limits) -> Resu
     }
     Ok(())
 }
-pub(in crate::candidate_cli) fn open_mode(mode: RunMode) -> JobOpenMode {
-    match mode {
-        RunMode::Start => JobOpenMode::Create,
-        RunMode::Resume { discard_uncommitted: false } => JobOpenMode::Resume(TailPolicy::Refuse),
-        RunMode::Resume { discard_uncommitted: true } => JobOpenMode::Resume(TailPolicy::DiscardUncommitted),
-    }
+pub(in crate::candidate_cli) fn open_mode(mode: RunMode, retention: command::InputRetentionArgs)
+    -> Result<JobOpenMode, Failure> {
+    retention.validate(mode, std::path::Path::new("-"))?;
+    let retained = retention.limits()?;
+    Ok(match (mode, retained) {
+        (RunMode::Start, Some(retention)) => JobOpenMode::CreateRetainingInputs(retention),
+        (RunMode::Start, None) => JobOpenMode::Create,
+        (RunMode::Resume { discard_uncommitted }, retained) => {
+            let tail = if discard_uncommitted { TailPolicy::DiscardUncommitted } else { TailPolicy::Refuse };
+            match retained { Some(retention) => JobOpenMode::ResumeRetained { tail, retention },
+                None => JobOpenMode::Resume(tail) }
+        }
+    })
 }
 
 pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode, args: JobArgs,
     common: CandidateArgs, limits: Limits, input: R, output: &mut impl Write) -> Result<(), Failure> {
+    args.input_retention.validate(mode, &args.input)?;
     // Declared first: preparation/input/factory/result storage drops BEFORE its
     // charge. No key/config/model IO occurs before this preparation admission.
     let session = Session::new(&common, limits)?;
@@ -123,23 +131,18 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
         (None, None) => prepare(&args, &facts, ceiling, defaults, native, &mut session.control())?,
         (Some(_), Some(_)) => return Err(Failure::usage("source_document_job_options")),
     };
-    // Only owned IO crosses the worker boundary; root CLI must hold no stdio
-    // locks. This does NOT persist the original population for future resume.
-    let reader: Box<dyn BufRead + Send> = if args.input.as_os_str() == "-" {
-        Box::new(BufReader::with_capacity(IO_BYTES, input))
-    } else {
-        Box::new(BufReader::with_capacity(IO_BYTES,
-            crate::local_io::open_document(&args.input).map_err(|_| CandidateError::Input)?))
-    };
+    // Only owned IO crosses the worker boundary; retained replay supplies no
+    // external population reader and is restored by the locked job owner.
+    let reader = command::population_reader(mode, args.input_retention, &args.input, input, IO_BYTES)?;
     let cancellation = CancellationToken::default();
     let model = session.load(&common, limits, &facts, cancellation.clone())?;
     let host = host_limits(&args, &common, limits, &session)?;
     let job_id = args.job_id; let materialize = args.materialize;
     let request = SourceJobRequest { root: args.job_dir, key, job_id, limits: lifetime,
-        mode: open_mode(mode), materialize };
-    // Ingestion and complete typed-population authentication happen inside the
-    // existing host BEFORE job-file access/native forwards, but AFTER weights
-    // are resident. Committed results are skipped by the unchanged JobRunner.
+        mode: open_mode(mode, args.input_retention)?, materialize };
+    // The host either ingests the supplied population or authenticates retained
+    // inputs under one job lock. Exact typed-population/recipe binding precedes
+    // repair and native forwards. Committed results are skipped by JobRunner.
     let progress = match prepared {
         PreparedJob::Source { planner, config } => session.engine.job_int8_source(&model, planner,
             vocabulary, config, request, host, reader, cancellation),
@@ -198,6 +201,7 @@ pub(in crate::candidate_cli) fn job_failure(error: JobError) -> Failure {
         JobError::WorkLimit => (ErrorCode::BudgetOrTimeout, "job_lifetime_work_or_attempts"),
         JobError::Limit | JobError::Allocation | JobError::Platform => (ErrorCode::AdmissionOrResourceLimit, "job_resource_limit"),
         JobError::UncommittedTail => (ErrorCode::StructuredTaskNoResult, "job_uncommitted_tail_or_stage"),
+        JobError::InputsNotRetained => (ErrorCode::StructuredTaskNoResult, "inputs_not_retained"),
         JobError::PublicationUncertain => (ErrorCode::Generic, "job_publication_uncertain"),
         _ => (ErrorCode::Generic, "job_storage_or_state"),
     };

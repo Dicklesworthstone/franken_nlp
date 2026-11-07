@@ -90,15 +90,15 @@ impl DocumentArgs {
             cohort_chunks: matches.try_get_one::<usize>("cohort_chunks").ok().flatten().copied() })
     }
     pub(in crate::candidate_cli::int4) fn validate(&self, args: &Int4Args) -> Result<DocumentLimits, CandidateError> {
-        self.validate_output(args, true)
+        self.validate_output(args, true, args.input.as_os_str() == "-")
     }
     // Live and retained populations preserve the serial semantic result wire.
     // Only the standalone command publishes the physical cohort wrapper.
-    fn validate_population(&self, args: &Int4Args) -> Result<DocumentLimits, CandidateError> {
-        self.validate_output(args, false)
+    fn validate_population(&self, args: &Int4Args, retained_input: bool) -> Result<DocumentLimits, CandidateError> {
+        self.validate_output(args, false, args.input.as_os_str() == "-" && !retained_input)
     }
-    fn validate_output(&self, args: &Int4Args, cohort_envelope: bool) -> Result<DocumentLimits, CandidateError> {
-        let short = self.redaction.validate(args)?;
+    fn validate_output(&self, args: &Int4Args, cohort_envelope: bool, population_stdin: bool) -> Result<DocumentLimits, CandidateError> {
+        let short = self.redaction.validate_input(args, population_stdin)?;
         let mut common = short.common;
         let m = self.mapping;
         if args.max_input_bytes < 4 || !(1..=256).contains(&m.max_ner_chunks)

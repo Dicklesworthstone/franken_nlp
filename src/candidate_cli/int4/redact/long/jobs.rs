@@ -39,8 +39,9 @@ struct JobExecutionLimits {
 pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
     let operation = |name: &'static str, about: &'static str| {
         StorageArgs::augment_args(super::definition().name(name).about(about)
-            .long_about("Create or explicitly resume one retained complete-document INT4 redaction job. Requires --store-results, an existing owner-only --job-dir, original --job-id, an independent protected --key-file and exact immutable --limits. Supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation, including resume; inputs remain in memory and are not persisted. IDs are unique across the complete population, flush controls are refused, and task_args cannot override the fixed detector, action, verification or key policy. --max-input-bytes caps decoded ORIGINAL text; JobLimits.max_input_bytes_per_item separately caps the encoded JSON envelope. Whole-document rules and every native NER chunk feed one edited result; fresh transformed detection remains the default. Serial execution preserves existing recipes. Explicit --cohort-chunks N shares native layers across independent NER chunks in both stages using one admitted peak; the schedule, width and native context are authenticated, so repeat the same selection on resume. Stored semantic results and complete-document commit boundaries are unchanged. Pseudonymization uses one full256 scope: its separate binary --key-stdin requires a population FILE and its commitment is checked before population IO. The job key file is never used as the pseudonym key. Exact model/group, original envelope bytes/order, detector limits, policy and actual key commitment authenticate before job repair or inference. Lifetime native and mask work comes solely from --limits and is never multiplied or renewed by attempts or resume. Stdout contains completion metadata only; private text and maps remain in the explicitly retained spool. --materialize publishes verified materialized.ndjson only after all items commit. Optional model snapshot creation occurs during setup and remains if later job authentication or execution fails. Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64.")
-            .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population, also on resume; '-' reads stdin unless stdin supplies the pseudonym key"))
+            .long_about("Create or explicitly resume one retained complete-document INT4 redaction job. Requires --store-results, an existing owner-only --job-dir, original --job-id, an independent protected --key-file and exact immutable --limits. By default, supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation; explicit retained-input replay is available. IDs are unique across the complete population, flush controls are refused, and task_args cannot override the fixed detector, action, verification or key policy. --max-input-bytes caps decoded ORIGINAL text; JobLimits.max_input_bytes_per_item separately caps the encoded JSON envelope. Whole-document rules and every native NER chunk feed one edited result; fresh transformed detection remains the default. Serial execution preserves existing recipes. Explicit --cohort-chunks N shares native layers across independent NER chunks in both stages using one admitted peak; the schedule, width and native context are authenticated, so repeat the same selection on resume. Stored semantic results and complete-document commit boundaries are unchanged. Pseudonymization uses one full256 scope: its separate binary --key-stdin requires a population FILE unless --use-retained-input is selected, and its commitment is checked before population IO. The job key file is never used as the pseudonym key. Exact model/group, original envelope bytes/order, detector limits, policy and actual key commitment authenticate before job repair or inference. Lifetime native and mask work comes solely from --limits and is never multiplied or renewed by attempts or resume. Stdout contains completion metadata only; private text and maps remain in the explicitly retained spool. --materialize publishes verified materialized.ndjson only after all items commit. Optional model snapshot creation occurs during setup and remains if later job authentication or execution fails. Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64.")
+            .after_help(job_cli::INPUT_RETENTION_HELP)
+            .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population; omit with --use-retained-input; '-' reads stdin unless stdin supplies the pseudonym key"))
             .mut_arg("max_input_bytes", |arg| arg.help("Maximum decoded ORIGINAL document bytes per item; the immutable JobLimits cap separately bounds encoded JSON"))
             .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoints for this invocation; persisted work and attempts never renew")))
             .mut_arg("store_results", |arg| arg.help("Required consent to retain sensitive edited text and optional maps in the owner-only result spool"))
@@ -59,6 +60,7 @@ impl JobArgs {
     /// Pure option admission. This reads no source, secret, limits or population.
     fn validate(&self, args: &Int4Args) -> Result<DocumentLimits, Failure> {
         let s = &self.storage;
+        s.input_retention.limits()?;
         let local = |path: &std::path::Path| !path.as_os_str().is_empty() && path.as_os_str() != "-";
         if !s.store_results || !local(&s.job_dir) || !local(&s.key_file) || !local(&s.limits_file)
             || !(1..=1024 * 1024).contains(&s.max_stream_mib)
@@ -66,7 +68,7 @@ impl JobArgs {
             || s.journal_memory_mib == 0 || s.serialization_memory_mib == 0 {
             return Err(Failure::usage("explicit_storage_or_job_options"));
         }
-        let limits = self.document.validate_population(args).map_err(Failure::from)?;
+        let limits = self.document.validate_population(args, s.input_retention.use_retained_input).map_err(Failure::from)?;
         for mib in [s.journal_memory_mib, s.serialization_memory_mib] {
             if mib.checked_mul(MIB).is_none_or(|bytes| bytes > limits.common.memory_bytes) {
                 return Err(Failure::usage("job_memory_options"));
@@ -172,6 +174,7 @@ impl JobCommand {
     }
     fn execute_owned<R: Read + Send + 'static>(self, args: Int4Args,
         input: R, output: &mut impl Write) -> Result<(), Failure> {
+        self.args.storage.input_retention.validate(self.mode, &args.input)?;
         let admitted = self.args.validate(&args)?;
         #[cfg(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")))]

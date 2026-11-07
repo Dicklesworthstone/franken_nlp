@@ -60,6 +60,73 @@ fn repair_is_an_explicit_resume_only_flag_and_not_an_implicit_default() {
     assert!(matches!(c.mode(), RunMode::Resume { discard_uncommitted: true }));
     assert!(definition().try_get_matches_from(["job", "start", "--discard-uncommitted-tail"]).is_err());
 }
+fn input_options(extra: &[&str]) -> Result<InputRetentionArgs, clap::Error> {
+    let definition = InputRetentionArgs::augment_args(clap::Command::new("input-selection")
+        .arg(clap::Arg::new("input").default_value("-")));
+    let mut argv = vec!["input-selection"];
+    argv.extend_from_slice(extra);
+    InputRetentionArgs::from_arg_matches(&definition.try_get_matches_from(argv)?)
+}
+#[test]
+fn input_retention_requires_separate_consent_and_an_explicit_positive_disk_cap() {
+    let default = args("ner", &[]);
+    assert!(default.store_results);
+    assert!(!default.input_retention.requested());
+    assert!(default.input_retention.limits().unwrap().is_none());
+    for invalid in [
+        vec!["--spool-input"], vec!["--use-retained-input"],
+        vec!["--spool-input", "--max-retained-input-mib", "0"],
+        vec!["--use-retained-input", "--max-retained-input-mib", "0"],
+        vec!["--spool-input", "--use-retained-input", "--max-retained-input-mib", "1"],
+    ] { assert!(input_options(&invalid).is_err(), "{invalid:?}"); }
+    for invalid in [
+        vec!["--max-retained-input-mib", "1"],
+        vec!["--spool-input", "--max-retained-input-mib", "8796093022208"],
+        vec!["--spool-input", "--max-retained-input-mib", "18446744073709551615"],
+    ] { assert!(input_options(&invalid).unwrap().limits().is_err(), "{invalid:?}"); }
+    let retained = input_options(&["--spool-input", "--max-retained-input-mib", "7"]).unwrap();
+    assert_eq!(retained.limits().unwrap(), Some(InputRetentionLimits { max_spool_bytes: 7 * MIB }));
+}
+#[test]
+fn retained_replay_rejects_explicit_population_arguments_including_dash() {
+    for population in ["original.ndjson", "-"] {
+        assert!(input_options(&["--use-retained-input", "--max-retained-input-mib", "1", population]).is_err());
+    }
+    let retained = input_options(&["--use-retained-input", "--max-retained-input-mib", "1"]).unwrap();
+    assert!(retained.validate(RunMode::Resume { discard_uncommitted: false }, std::path::Path::new("-")).is_ok());
+    assert!(retained.validate(RunMode::Resume { discard_uncommitted: false }, std::path::Path::new("original.ndjson")).is_err());
+}
+#[test]
+fn input_retention_mode_mismatches_fail_before_configuration_or_input_io() {
+    struct NoRead;
+    impl Read for NoRead { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("unexpected population read") } }
+    for (mode, flag) in [("start", "--use-retained-input"), ("resume", "--spool-input")] {
+        let c = command(mode, "ner", &[flag, "--max-retained-input-mib", "1"]);
+        let mut stdout = Vec::new();
+        let error = c.execute_owned(NoRead, &mut stdout).unwrap_err();
+        assert_eq!(error.code, "job_input_retention_options");
+        assert!(stdout.is_empty());
+    }
+}
+#[test]
+fn retained_population_reader_never_touches_stdin_or_falls_back_to_an_external_file() {
+    struct NoRead;
+    impl Read for NoRead { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("retained resume read inherited input") } }
+    let retained = input_options(&["--use-retained-input", "--max-retained-input-mib", "1"]).unwrap();
+    let mode = RunMode::Resume { discard_uncommitted: false };
+    let mut reader = population_reader(mode, retained, std::path::Path::new("-"), NoRead, 8192).unwrap();
+    let mut bytes = Vec::new();
+    assert_eq!(reader.read_to_end(&mut bytes).unwrap(), 0);
+    assert!(bytes.is_empty());
+    let error = population_reader(mode, retained, std::path::Path::new("/nonexistent/private-population"), NoRead, 8192)
+        .err().unwrap();
+    assert_eq!(error.code, "job_input_retention_options");
+    let exact = b"{\"id\":\"x\",\"text\":\"private\"}\r\n";
+    let mut external = population_reader(RunMode::Start, InputRetentionArgs::default(), std::path::Path::new("-"),
+        io::Cursor::new(exact), 8192).unwrap();
+    external.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, exact);
+}
 #[test]
 fn schema_options_never_change_the_fixed_source_task() {
     assert!(args("ner", &["--schema", "s.json"]).validate().is_err());

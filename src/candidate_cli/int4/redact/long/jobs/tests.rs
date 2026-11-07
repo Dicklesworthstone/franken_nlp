@@ -141,6 +141,20 @@ fn retained_job_cohorts_keep_exact_lifetime_authority_and_one_admitted_peak_in_b
 }
 
 #[test]
+fn retained_resume_authenticates_pseudonym_scope_without_an_external_population() {
+    let (job, args) = command("resume", &["--use-retained-input", "--max-retained-input-mib", "16",
+        "--action", "pseudonymize", "--key-stdin", "--key-id", "rotation", "--namespace", "private-scope"]);
+    assert_eq!(args.input, PathBuf::from("-"));
+    assert!(job.args.validate(&args).is_ok());
+    let (external, args) = command("resume", &["--action", "pseudonymize", "--key-stdin",
+        "--key-id", "rotation", "--namespace", "private-scope"]);
+    assert!(external.args.validate(&args).is_err());
+    let (wrong_mode, args) = command("start", &["--use-retained-input", "--max-retained-input-mib", "16"]);
+    assert_eq!(wrong_mode.execute_owned(args, NoIo, &mut NoIo).unwrap_err().code,
+        "job_input_retention_options");
+}
+
+#[test]
 fn fixed_redaction_options_and_original_text_cap_remain_independent_of_encoded_envelopes() {
     let (job, args) = command("start", &["--max-input-bytes", "32", "--rules", "email,date",
         "--action", "placeholder", "--include-map", "--no-verify", "--ner-options", "typed-options.json"]);

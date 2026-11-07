@@ -39,9 +39,10 @@ pub(super) fn definition(kind: Kind) -> clap::Command {
         Kind::Summarize => "summarize-job", Kind::Answer => "answer-job" };
     let operation = |name: &'static str, about: &'static str| {
         DefaultsArgs::augment_args(StorageArgs::augment_args(source::definition(kind).name(name).about(about)
-            .long_about("Start or resume one fixed source-task job on a resident source-converted or independently pinned snapshot INT4 model. Requires --store-results, an existing protected --job-dir, original --job-id and --key-file, and immutable --limits. Supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation; inputs are admitted in memory and are not persisted. For answer, text is the question and typed task_args supplies passages, options and budget unless an explicit complete --defaults file does so. Other tasks use shipped options unless explicit bounded defaults or per-record arguments override them. A record cannot switch task families or change the complete resident KV allowance. Flush controls and duplicate IDs anywhere in the population reject. Resume authenticates exact population, model/group identity, options and recipe before replay or tail repair. Lifetime native work includes every group dot and does not renew on resume; failed attempts remain debited. Stdout contains only progress/provenance metadata. Results remain in the explicit owner-only spool; --materialize publishes verified materialized.ndjson only after all items commit. Structural citations do not certify semantic support, and failed inference is never successful QA abstention. Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64.")
+            .long_about("Start or resume one fixed source-task job on a resident source-converted or independently pinned snapshot INT4 model. Requires --store-results, an existing protected --job-dir, original --job-id and --key-file, and immutable --limits. By default, supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation; explicit retained-input replay is available. For answer, text is the question and typed task_args supplies passages, options and budget unless an explicit complete --defaults file does so. Other tasks use shipped options unless explicit bounded defaults or per-record arguments override them. A record cannot switch task families or change the complete resident KV allowance. Flush controls and duplicate IDs anywhere in the population reject. Resume authenticates exact population, model/group identity, options and recipe before replay or tail repair. Lifetime native work includes every group dot and does not renew on resume; failed attempts remain debited. Stdout contains only progress/provenance metadata. Results remain in the explicit owner-only spool; --materialize publishes verified materialized.ndjson only after all items commit. Structural citations do not certify semantic support, and failed inference is never successful QA abstention. Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64.")
+            .after_help(job_cli::INPUT_RETENTION_HELP)
             .mut_arg("options", |arg| arg.hide(true))
-            .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population, also on resume; '-' reads stdin"))
+            .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population; omit with --use-retained-input; '-' reads stdin"))
             .mut_arg("max_input_bytes", |arg| arg.help("Outer cap for each complete NDJSON record and decoded source input; immutable stored input ceiling must fit"))
             .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoints for this invocation; persisted work and attempts never renew"))))
             .mut_arg("store_results", |arg| arg.help("Required consent to retain private source-task results in the owner-only spool"))
@@ -70,6 +71,7 @@ impl JobArgs {
     /// Pure admission, before reading private files or constructing the host.
     pub(super) fn validate(&self, args: &Int4Args) -> Result<Int4Limits, Failure> {
         let s = &self.storage;
+        s.input_retention.limits()?;
         let local = |path: &std::path::Path| !path.as_os_str().is_empty() && path.as_os_str() != "-";
         if !s.store_results || !local(&s.job_dir) || !local(&s.key_file) || !local(&s.limits_file)
             || !(1..=1024 * 1024).contains(&s.max_stream_mib)
@@ -168,6 +170,7 @@ impl JobCommand {
     }
     pub(super) fn execute_owned<R: Read + Send + 'static>(self, args: Int4Args,
         input: R, output: &mut impl Write) -> Result<(), Failure> {
+        self.args.storage.input_retention.validate(self.mode, &args.input)?;
         let common = self.args.validate(&args)?;
         #[cfg(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")))]

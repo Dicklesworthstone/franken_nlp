@@ -67,7 +67,7 @@ impl CorpusArgs {
         Ok(Self { document: DocumentArgs::from_matches(matches)?, stream: StreamFlags::from_arg_matches(matches)? })
     }
     pub(in crate::candidate_cli::int4) fn validate(&self, args: &Int4Args) -> Result<CorpusLimits, CandidateError> {
-        let document = self.document.validate_population(args)?;
+        let document = self.document.validate_population(args, false)?;
         let mut common = document.common;
         let s = self.stream;
         if !(1..=100_000).contains(&s.max_requests)

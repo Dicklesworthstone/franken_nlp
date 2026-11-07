@@ -25,8 +25,9 @@ pub(super) fn definition() -> clap::Command {
         let tasks = ["generate", "chat"].into_iter().map(|task| {
             let command = StorageArgs::augment_args(Int4Args::augment_args(clap::Command::new(task)))
                 .about("Retain complete native results under one immutable generation recipe")
-                .long_about("Run or resume retained generate/chat items on one resident grouped-INT4 model. Supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation, including resume. text is the prompt or final user turn; optional task_args contains only sample_index and, for chat, history. Shared seed, stops, penalties, logprobs, context, task limits and model/group identity are authenticated and cannot change on resume. No seed means greedy; no implicit random seed is generated. Requires --store-results, existing protected --job-dir and --key-file, exact --job-id, and immutable --limits. All five native lifetime work axes are charged before each attempt and never refunded for EOS, failure or cancellation; mask_node_visits must be zero. Results commit only after whole native completion. Stdout is metadata only; --materialize publishes verified private results after every item commits. The retained adapter is serial; --prefill-rows and cohort scheduling are unsupported. No partial-token checkpoints, input persistence, flush controls, per-record policy changes, automatic retry, thinking mode, tools, model download or release activation. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
-                .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population, also on resume; '-' reads stdin"))
+                .long_about("Run or resume retained generate/chat items on one resident grouped-INT4 model. By default, supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation; explicit retained-input replay is available. text is the prompt or final user turn; optional task_args contains only sample_index and, for chat, history. Shared seed, stops, penalties, logprobs, context, task limits and model/group identity are authenticated and cannot change on resume. No seed means greedy; no implicit random seed is generated. Requires --store-results, existing protected --job-dir and --key-file, exact --job-id, and immutable --limits. All five native lifetime work axes are charged before each attempt and never refunded for EOS, failure or cancellation; mask_node_visits must be zero. Results commit only after whole native completion. Stdout is metadata only; --materialize publishes verified private results after every item commits. The retained adapter is serial; --prefill-rows and cohort scheduling are unsupported. No partial-token checkpoints, flush controls, per-record policy changes, automatic retry, thinking mode, tools, model download or release activation. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
+                .after_help(job_cli::INPUT_RETENTION_HELP)
+                .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population; omit with --use-retained-input; '-' reads stdin"))
                 .mut_arg("max_input_bytes", |arg| arg.help("Outer ceiling for each complete NDJSON record; immutable JobLimits.max_input_bytes_per_item must fit"))
                 .mut_arg("max_checkpoints", |arg| arg.help("Cooperative allowance for this invocation; durable work and attempts never renew"))
                 .mut_arg("prefill_rows", |arg| arg.help("Unsupported on retained text jobs; the native adapter executes whole items serially"))
@@ -66,6 +67,7 @@ impl JobArgs {
     /// Reject configuration mistakes before opening private storage or input.
     fn validate(&self, args: &Int4Args) -> Result<Int4Limits, Failure> {
         let s = &self.storage;
+        s.input_retention.limits()?;
         let local = |path: &std::path::Path| !path.as_os_str().is_empty() && path.as_os_str() != "-";
         if !s.store_results || !local(&s.job_dir) || !local(&s.key_file) || !local(&s.limits_file)
             || !(1..=1024 * 1024).contains(&s.max_stream_mib)
@@ -163,6 +165,7 @@ impl JobCommand {
     }
     fn execute_owned<R: Read + Send + 'static>(self, args: Int4Args, input: R,
         output: &mut impl Write) -> Result<(), Failure> {
+        self.args.storage.input_retention.validate(self.mode, &args.input)?;
         let common = self.args.validate(&args)?;
         #[cfg(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")))]

@@ -33,6 +33,19 @@ fn generation_and_chat_have_distinct_start_and_authenticated_resume_routes() {
     assert!(parse("start", "judge", &[]).is_err());
 }
 #[test]
+fn text_job_input_replay_never_implies_a_new_seed_or_lifetime_budget() {
+    for task in ["generate", "chat"] {
+        let (mode, a) = parse("start", task, &["--spool-input", "--max-retained-input-mib", "8"]).unwrap().into_parts();
+        a.input_retention.validate(mode, &a.common.input).unwrap();
+        let (mode, b) = parse("resume", task, &["--use-retained-input", "--max-retained-input-mib", "4"]).unwrap().into_parts();
+        b.input_retention.validate(mode, &b.common.input).unwrap();
+        assert!(a.common.options(166_101).unwrap() == b.common.options(166_101).unwrap());
+        a.check_lifetime(lifetime(), a.validate().unwrap()).unwrap();
+        b.check_lifetime(lifetime(), b.validate().unwrap()).unwrap();
+        assert!(parse("resume", task, &["--use-retained-input", "--max-retained-input-mib", "4", "population.ndjson"]).is_err());
+    }
+}
+#[test]
 fn all_generation_controls_survive_the_retained_parser_and_explicit_resume() {
     let seed = "07".repeat(32);
     let switches = ["--seed", seed.as_str(), "--temperature-milli", "850", "--top-k", "32", "--top-p-ppm", "900000",

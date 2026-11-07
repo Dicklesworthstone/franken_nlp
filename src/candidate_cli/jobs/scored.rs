@@ -27,6 +27,7 @@ pub(in crate::candidate_cli) struct ScoreJobArgs {
     #[command(flatten)] pub prefill: crate::candidate_cli::scored::prefill::ScoringPrefillArgs,
     /// Required consent to retain private native output in the protected spool.
     #[arg(long)] pub store_results: bool,
+    #[command(flatten)] pub input_retention: InputRetentionArgs,
     /// Existing owner-only directory. Never created or adopted automatically.
     #[arg(long)] pub job_dir: PathBuf,
     /// Expected random 128-bit job ID: exactly 32 lowercase hex characters.
@@ -54,6 +55,7 @@ impl ScoreJobArgs {
         scored_batch::corpus_prefill(self.kind()?, &self.prefill).map_err(Into::into)
     }
     pub(in crate::candidate_cli) fn validate(&self) -> Result<(CandidateArgs, Limits), Failure> {
+        self.input_retention.limits()?;
         self.prefill_limits()?;
         let local = |p: &std::path::Path| !p.as_os_str().is_empty() && p.as_os_str() != "-";
         if !self.store_results || !local(&self.job_dir) || !local(&self.key_file) || !local(&self.limits_file)
@@ -80,7 +82,8 @@ impl ScoreJobArgs {
 pub(in crate::candidate_cli) fn definition() -> clap::Command {
     ScoreJobCommand::augment_args(clap::Command::new("score-job")
         .about("Start or resume retained native classification/sentiment/judgment corpus jobs")
-        .long_about("Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64. The input is the COMPLETE original NDJSON {id,text,task_args?} population, including on resume. Uses the same full-vocabulary scorers and defaults as score-batch; no generated-label shortcut or calibrated-confidence claim. All scoring flags and defaults are frozen for resume. Judge jobs accept --prefill-rows for bounded grouped prompts; the effective schedule is also frozen and cannot change on resume. Other tasks refuse that option. Lifetime work and failed attempts remain debited. Explicit --store-results, protected directory, original secret and immutable JobLimits are mandatory. Stdout is metadata only, not private document scores. No automatic retry or input spooling."))
+        .long_about("Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64. The input is the COMPLETE original NDJSON {id,text,task_args?} population; resume can explicitly restore it from retained input storage. Uses the same full-vocabulary scorers and defaults as score-batch; no generated-label shortcut or calibrated-confidence claim. All scoring flags and defaults are frozen for resume. Judge jobs accept --prefill-rows for bounded grouped prompts; the effective schedule is also frozen and cannot change on resume. Other tasks refuse that option. Lifetime work and failed attempts remain debited. Explicit --store-results, protected directory, original secret and immutable JobLimits are mandatory. Stdout is metadata only, not private document scores. No automatic retry.")
+        .after_help(INPUT_RETENTION_HELP))
 }
 impl ScoreJobCommand {
     fn into_parts(self) -> (RunMode, ScoreJobArgs) {
@@ -104,6 +107,7 @@ impl ScoreJobCommand {
 }
 fn execute_owned<R: Read + Send + 'static>(mode: RunMode, args: ScoreJobArgs, input: R, output: &mut impl Write)
     -> Result<(), Failure> {
+    args.input_retention.validate(mode, &args.host.input)?;
     let (common, limits) = args.validate()?;
     #[cfg(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")))]

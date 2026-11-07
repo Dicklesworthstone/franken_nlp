@@ -172,7 +172,7 @@ fn corpus_chunk_cohorts_preserve_task_authority_and_admit_one_reusable_peak_with
         assert_eq!(selected.masks, baseline.masks);
         assert_eq!(selected.document.workspace_bytes, baseline.document.workspace_bytes);
         let standalone = cohorts.document.validate(&args).unwrap();
-        let population = cohorts.document.validate_population(&args).unwrap();
+        let population = cohorts.document.validate_population(&args, false).unwrap();
         assert_eq!(standalone.common.minimum_memory_bytes, population.common.minimum_memory_bytes,
             "the complete wrapper is staged even when only its semantic result is emitted");
         let mut no_verification = cohorts.clone(); no_verification.document.redaction.flags.no_verify = true;

@@ -99,6 +99,30 @@ fn job_authentication_never_substitutes_for_the_pseudonym_key_source() {
     assert_eq!(c.retention.job_key_file.as_ref().unwrap(), &PathBuf::from("protected.key"));
 }
 #[test]
+fn retained_population_frees_stdin_only_for_the_explicit_pseudonym_secret() {
+    let c = command(&["--resume", "--use-retained-input", "--max-retained-input-mib", "4",
+        "--action", "pseudonymize", "--key-stdin", "--key-id", "pii-v1", "--namespace", "corpus"]);
+    c.validate().unwrap();
+    assert_eq!(c.input, PathBuf::from("-"));
+    assert!(c.key(&mut &[7; 32][..]).unwrap().is_some());
+    let external = command(&["--resume", "--action", "pseudonymize", "--key-stdin",
+        "--key-id", "pii-v1", "--namespace", "corpus"]);
+    assert!(external.validate().is_err());
+    let without_secret = command(&["--resume", "--use-retained-input", "--max-retained-input-mib", "4",
+        "--action", "pseudonymize"]);
+    assert!(without_secret.validate().is_err());
+}
+#[test]
+fn input_spooling_cannot_enable_implicit_jobs_or_change_start_resume_roles() {
+    for flags in [vec!["--use-retained-input", "--max-retained-input-mib", "1"],
+        vec!["--resume", "--spool-input", "--max-retained-input-mib", "1"]] {
+        let c = command(&flags);
+        assert!(c.validate().is_err());
+    }
+    let c = crate::candidate_cli::redact::tests::command(&["--ndjson", "--spool-input", "--max-retained-input-mib", "1"]);
+    assert!(c.validate().is_err());
+}
+#[test]
 fn job_identifiers_are_exact_and_no_key_bytes_enter_arguments() {
     for text in ["", "ABCDABCDABCDABCDABCDABCDABCDABCD", "0123456789abcdef0123456789abcde", "-1", "０１２３"] {
         assert!(parse_job_id(text).is_err());

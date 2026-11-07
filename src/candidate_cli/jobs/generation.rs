@@ -24,6 +24,7 @@ pub(in crate::candidate_cli) struct TextJobArgs {
     #[command(flatten)] pub common: CandidateArgs,
     /// Consent to retain private generated content, tokens and optional scores.
     #[arg(long)] pub store_results: bool,
+    #[command(flatten)] pub input_retention: InputRetentionArgs,
     #[arg(long)] pub job_dir: PathBuf,
     #[arg(long, value_parser = parse_job_id)] pub job_id: JobId,
     /// Protected file containing exactly 32 raw job-authentication bytes; not a sampling seed.
@@ -41,6 +42,7 @@ impl TextJobArgs {
         match self.task { TextTask::Generate => "generate", TextTask::Chat => "chat" }
     }
     pub(in crate::candidate_cli) fn validate(&self) -> Result<Limits, Failure> {
+        self.input_retention.limits()?;
         let limits = self.common.validate()?;
         // The retained adapter is serial. Never accept a scheduling option and
         // quietly ignore it or let it change across resumed executions.
@@ -76,7 +78,8 @@ impl TextJobArgs {
 pub(in crate::candidate_cli) fn definition() -> clap::Command {
     TextJobCommand::augment_args(clap::Command::new("text-job")
         .about("Start or resume retained native generation/chat jobs")
-        .long_about("Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. Input is the COMPLETE original {id,text,task_args?} NDJSON population on both start and resume, not the text-batch prompt/messages protocol. Optional task_args contains sample_index and chat history only; text becomes the final user turn. Shared generation flags, explicit seed, stops and penalties are frozen in the authenticated recipe. No seed means greedy, never random seed generation. Results commit only after whole native completion; no partial token stream is retained. Failed attempts retain all native work charges. --store-results, protected existing storage, original job key and immutable limits are required. Stdout is completion metadata only. No automatic retry, input persistence, model download, tools or thinking mode. This retained route is serial; --prefill-rows/cohort-rows/active-rows are unsupported."))
+        .long_about("Requires metadata-store plus asupersync-runtime on Linux x86-64/AArch64. Input is the COMPLETE original {id,text,task_args?} NDJSON population, not the text-batch prompt/messages protocol; resume can explicitly restore retained inputs. Optional task_args contains sample_index and chat history only; text becomes the final user turn. Shared generation flags, explicit seed, stops and penalties are frozen in the authenticated recipe. No seed means greedy, never random seed generation. Results commit only after whole native completion; no partial token stream is retained. Failed attempts retain all native work charges. --store-results, protected existing storage, original job key and immutable limits are required. Stdout is completion metadata only. No automatic retry, model download, tools or thinking mode. This retained route is serial; --prefill-rows/cohort-rows/active-rows are unsupported.")
+        .after_help(INPUT_RETENTION_HELP))
 }
 impl TextJobCommand {
     fn into_parts(self) -> (RunMode, TextJobArgs) {
@@ -100,6 +103,7 @@ impl TextJobCommand {
 }
 fn execute_owned<R: Read + Send + 'static>(mode: RunMode, args: TextJobArgs, input: R, output: &mut impl Write)
     -> Result<(), Failure> {
+    args.input_retention.validate(mode, &args.common.input)?;
     let limits = args.validate()?;
     #[cfg(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")))]

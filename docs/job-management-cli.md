@@ -32,7 +32,8 @@ original corpus, model, task defaults or inference recipe is required.
 no file or runtime. It does not silently revise the frozen `robot schema` v3.
 
 `status` authenticates all stored metadata and the complete committed result
-prefix before reporting metadata. A successful status operation may report
+prefix, plus any journal-authorized retained inputs, before reporting metadata.
+A successful status operation may report
 orphan-tail bytes, an interrupted stage or an unacknowledged output file; zero
 exit means the inspection succeeded, not that those conditions are absent.
 `verify` rejects tails/stages and checks an unacknowledged output against the
@@ -45,7 +46,15 @@ its contents. Unrelated existing output is never overwritten.
 There are no `--key`/`--secret` bytes, model, arbitrary output, overwrite, purge,
 repair or tail-discard options. No startup/resume inference commands are
 registered by this checkpoint. Recovery that discards orphans and execution
-resume still require the original explicit authenticated replay path.
+resume use the explicit authenticated native job path, with either the original
+population or [explicitly retained input envelopes](retained-inputs.md).
+
+An input-retention receipt adds `retained_inputs` to the report, containing
+only item count, stored byte count and the original retention byte ceiling.
+An input file without a receipt is reported as
+`uncommitted_input_spool_present: true`; verify and materialize refuse it.
+Private envelopes, identifiers, questions and input commitments never enter
+the management response.
 
 ## Process host and diagnostics
 
@@ -62,6 +71,7 @@ The CLI requires `--memory-bytes` as explicit whole-process authority. Defaults
 for caller-modeled journal and serialization headroom are respectively
 67,108,864 and 16,777,216 bytes and can be set with `--journal-memory-bytes` and
 `--serialization-memory-bytes`. Metadata-index and bounded frame-buffer floors,
+including one maximum input envelope for streaming retention verification,
 IO/path storage and report/cleanup reservations are additional. These values
 are not measurements of fsqlite RAM or an allocator/RSS limiter. Inadequate
 admission fails before opening job storage, rather than proceeding uncharged.

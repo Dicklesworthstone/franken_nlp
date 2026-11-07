@@ -30,6 +30,19 @@ fn all_scored_tasks_have_distinct_start_and_authenticated_resume_routes() {
     }
 }
 #[test]
+fn scored_job_input_retention_is_explicit_for_each_fixed_task() {
+    for task in ["classify", "sentiment", "judge"] {
+        let (mode, a) = command("start", task, &["--spool-input", "--max-retained-input-mib", "8"]).into_parts();
+        a.input_retention.validate(mode, &a.host.input).unwrap();
+        a.validate().unwrap();
+        let (mode, a) = command("resume", task, &["--use-retained-input", "--max-retained-input-mib", "4"]).into_parts();
+        a.input_retention.validate(mode, &a.host.input).unwrap();
+        a.validate().unwrap();
+        assert!(parse("resume", task, &["--use-retained-input", "--max-retained-input-mib", "4", "population.ndjson"]).is_err());
+        assert!(parse("start", task, &["--spool-input"]).is_err());
+    }
+}
+#[test]
 fn scoring_jobs_cannot_accept_generation_schema_mask_or_start_repair_switches() {
     // Every negative fixture starts with ALL required options, so a missing
     // model, secret or directory cannot accidentally satisfy the assertion.

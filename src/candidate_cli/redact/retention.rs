@@ -7,9 +7,11 @@ use super::corpus::CorpusEnvelope;
 #[derive(Args, Default)]
 pub(in crate::candidate_cli) struct RetentionArgs {
     /// Retain private completed edits in an owner-only authenticated job spool.
-    /// Stdout becomes metadata only. Original inputs are NOT stored for resume.
+    /// Stdout becomes metadata only. Retaining inputs requires --spool-input.
     #[arg(long, requires_all = ["ndjson", "job_dir", "job_id", "job_key_file", "job_limits"])]
     pub store_results: bool,
+    #[command(flatten)]
+    pub input_retention: crate::candidate_cli::jobs::InputRetentionArgs,
     /// Existing protected job directory; never created or adopted automatically.
     #[arg(long, requires = "store_results")]
     pub job_dir: Option<PathBuf>,
@@ -42,6 +44,11 @@ pub(in crate::candidate_cli) struct RetentionArgs {
     serialization_memory_mib: Option<u64>,
 }
 impl RetentionArgs {
+    pub(in crate::candidate_cli) fn mode(&self) -> crate::candidate_cli::jobs::RunMode {
+        if self.resume { crate::candidate_cli::jobs::RunMode::Resume {
+            discard_uncommitted: self.discard_uncommitted_tail } }
+        else { crate::candidate_cli::jobs::RunMode::Start }
+    }
     pub(in crate::candidate_cli) fn max_lines(&self) -> u64 { self.max_job_input_lines.unwrap_or(100_000) }
     pub(in crate::candidate_cli) fn journal_bytes(&self) -> Result<u64, CandidateError> {
         self.journal_memory_mib.unwrap_or(64).checked_mul(MIB).filter(|&n| n > 0).ok_or(CandidateError::Arguments)
@@ -50,10 +57,12 @@ impl RetentionArgs {
         self.serialization_memory_mib.unwrap_or(16).checked_mul(MIB).filter(|&n| n > 0).ok_or(CandidateError::Arguments)
     }
     pub(super) fn validate(&self, ndjson: bool, limits: Limits) -> Result<(), CandidateError> {
+        self.input_retention.limits().map_err(|_| CandidateError::Arguments)?;
         if !self.store_results {
             if self.job_dir.is_some() || self.job_id.is_some() || self.job_key_file.is_some() || self.job_limits.is_some()
                 || self.resume || self.discard_uncommitted_tail || self.materialize || self.max_job_input_lines.is_some()
-                || self.journal_memory_mib.is_some() || self.serialization_memory_mib.is_some() {
+                || self.journal_memory_mib.is_some() || self.serialization_memory_mib.is_some()
+                || self.input_retention.requested() {
                 return Err(CandidateError::Arguments);
             }
             return Ok(());

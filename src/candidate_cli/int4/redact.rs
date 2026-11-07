@@ -23,7 +23,7 @@ struct RedactionFlags {
     /// Include sensitive original/output coordinate mappings in the final result.
     #[arg(long)]
     include_map: bool,
-    /// Raw 32..4096-byte high-entropy key via inherited stdin; source must be a file.
+    /// Raw 32..4096-byte high-entropy key via inherited stdin; source is a file or explicit retained input.
     #[arg(long)]
     key_stdin: bool,
     #[arg(long)]
@@ -65,12 +65,15 @@ impl RedactArgs {
             flags: RedactionFlags::from_arg_matches(matches)? })
     }
     pub(super) fn validate(&self, args: &Int4Args) -> Result<RedactLimits, CandidateError> {
+        self.validate_input(args, args.input.as_os_str() == "-")
+    }
+    fn validate_input(&self, args: &Int4Args, population_stdin: bool) -> Result<RedactLimits, CandidateError> {
         let mut common = self.source.validate(args)?;
         if self.flags.rules.is_empty() || !(1..=16_384).contains(&self.flags.max_detections)
             || !(1..=1_000_000_000_000).contains(&self.flags.max_rule_work) {
             return Err(CandidateError::Arguments);
         }
-        shared::validate_key_scope(self.flags.action, &args.input, self.flags.key_stdin,
+        shared::validate_key_scope(self.flags.action, population_stdin, self.flags.key_stdin,
             self.flags.key_id.as_deref(), self.flags.namespace.as_deref(),
             self.flags.expected_key_commitment.as_deref())?;
         let edit_bytes = mib(self.flags.edit_reserve_mib)?;

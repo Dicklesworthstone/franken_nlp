@@ -1,6 +1,6 @@
 //! One owned native invocation for an authenticated source-task population.
 use super::*;
-use std::{io::{BufRead, BufReader}, sync::Arc, time::{Duration, Instant}};
+use std::{sync::Arc, time::{Duration, Instant}};
 use crate::{
     NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
     batch::source::grouped_int4::MAX_SOURCE_ARGUMENT_BYTES,
@@ -14,6 +14,7 @@ use crate::{
 pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     job: JobArgs, _admitted: Int4Limits, input: R, output: &mut impl Write) -> Result<(), Failure> {
     let started = Instant::now();
+    job.storage.input_retention.validate(mode, &args.input)?;
     let common = job.validate(&args)?;
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
@@ -42,12 +43,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     let defaults = source_batch::load_defaults(job.kind, defaults_text.as_deref(), budget, args.max_input_bytes)?;
     drop(defaults_text);
     remaining()?;
-    let reader: Box<dyn BufRead + Send> = if args.input.as_os_str() == "-" {
-        Box::new(BufReader::with_capacity(IO_BUFFER_BYTES, input))
-    } else {
-        Box::new(BufReader::with_capacity(IO_BUFFER_BYTES,
-            crate::local_io::open_document(&args.input).map_err(|_| CandidateError::Input)?))
-    };
+    let reader = job_cli::population_reader(mode, job.storage.input_retention, &args.input, input, IO_BUFFER_BYTES)?;
     let cancellation = CancellationToken::default();
     let model = super::super::runtime::load_model(&engine, &args, common, remaining()?, cancellation.clone())?;
     remaining()?;
@@ -71,7 +67,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     let materialize = job.storage.materialize;
     let task = job.kind.name();
     let request = SourceJobRequest { root: job.storage.job_dir, key, job_id, limits: lifetime,
-        mode: open_mode(mode), materialize };
+        mode: open_mode(mode, job.storage.input_retention)?, materialize };
     // Host authenticates the exact complete population and private recipe,
     // skips committed items and retains each output guard through spool sync
     // and journal acknowledgement. No native result is fabricated here.

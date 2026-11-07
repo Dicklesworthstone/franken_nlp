@@ -52,9 +52,24 @@ fn cancelled_factory_preparation_never_constructs_a_usable_job() {
 }
 #[test]
 fn repair_policy_is_never_inferred_from_a_failed_invocation() {
-    assert_eq!(open_mode(RunMode::Start), JobOpenMode::Create);
-    assert_eq!(open_mode(RunMode::Resume { discard_uncommitted: false }), JobOpenMode::Resume(TailPolicy::Refuse));
-    assert_eq!(open_mode(RunMode::Resume { discard_uncommitted: true }), JobOpenMode::Resume(TailPolicy::DiscardUncommitted));
+    let external = command::InputRetentionArgs::default();
+    assert_eq!(open_mode(RunMode::Start, external).unwrap(), JobOpenMode::Create);
+    assert_eq!(open_mode(RunMode::Resume { discard_uncommitted: false }, external).unwrap(), JobOpenMode::Resume(TailPolicy::Refuse));
+    assert_eq!(open_mode(RunMode::Resume { discard_uncommitted: true }, external).unwrap(), JobOpenMode::Resume(TailPolicy::DiscardUncommitted));
+}
+#[test]
+fn retained_input_selection_preserves_explicit_tail_policy_and_byte_authority() {
+    let retention = command::InputRetentionArgs { spool_input: true, use_retained_input: false,
+        max_retained_input_mib: Some(7) };
+    let bounds = crate::jobs::InputRetentionLimits { max_spool_bytes: 7 * MIB };
+    assert_eq!(open_mode(RunMode::Start, retention).unwrap(), JobOpenMode::CreateRetainingInputs(bounds));
+    assert!(open_mode(RunMode::Resume { discard_uncommitted: false }, retention).is_err());
+    let retained = command::InputRetentionArgs { spool_input: false, use_retained_input: true, ..retention };
+    for (discard_uncommitted, tail) in [(false, TailPolicy::Refuse), (true, TailPolicy::DiscardUncommitted)] {
+        assert_eq!(open_mode(RunMode::Resume { discard_uncommitted }, retained).unwrap(),
+            JobOpenMode::ResumeRetained { tail, retention: bounds });
+    }
+    assert!(open_mode(RunMode::Start, retained).is_err());
 }
 fn progress() -> JobProgress {
     JobProgress { job_id: JobId([1; 16]), items: 2, committed: 2, attempts: 3,
@@ -87,8 +102,10 @@ fn authenticated_resume_failures_keep_closed_actionable_categories() {
     let cases = [(JobError::Mismatch(crate::jobs::MismatchField::Population), "job_contract_mismatch"),
         (JobError::UncommittedTail, "job_uncommitted_tail_or_stage"), (JobError::WorkLimit, "job_lifetime_work_or_attempts"),
         (JobError::UnsafeStorage, "unsafe_job_storage"), (JobError::AlreadyExists, "job_already_exists"),
-        (JobError::Busy, "job_busy"), (JobError::PublicationUncertain, "job_publication_uncertain")];
+        (JobError::Busy, "job_busy"), (JobError::PublicationUncertain, "job_publication_uncertain"),
+        (JobError::InputsNotRetained, "inputs_not_retained")];
     for (error, code) in cases { assert_eq!(job_failure(error).code, code); }
+    assert_eq!(job_failure(JobError::InputsNotRetained).exit, ErrorCode::StructuredTaskNoResult);
     assert!(matches!(cancelled(DecodeCancellationKind::User).exit, ErrorCode::Cancelled));
     let fault = crate::batch::BatchFault::cancelled(DecodeCancellationKind::PollQuota);
     assert!(matches!(host_failure(HostedJobError::Job(JobRunError::Processor(fault))).exit, ErrorCode::BudgetOrTimeout));

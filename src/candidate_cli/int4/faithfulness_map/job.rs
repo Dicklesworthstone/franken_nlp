@@ -35,8 +35,9 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
     let operation = |name: &'static str, about: &'static str| {
         let command = FaithfulnessArgs::augment_args(StorageArgs::augment_args(super::definition()
             .name(name).about(about)
-            .long_about("Retain and resume faithfulness judgments of COMPLETE original sources with a required fixed --policy FaithfulnessPolicy JSON file. Supply the COMPLETE original {id,text,task_args:{claim}} NDJSON population on every invocation. text is never a pre-split chunk; every row supplies its own nonempty claim and no policy or budget overrides. The combined exact source and claim bytes must fit the immutable stored per-item input ceiling. Every source chunk and evidence head must finish before the original document commits. Retain full-vocabulary NLI scores, contrary and uncertain evidence, original byte/scalar coordinates and the named complete-source reduction. --cohort-chunks shares native layers within a document; each actual ragged window must fit 64 heads without resizing or fallback. Repeat the exact policy, task budget, mapping and schedule on resume. Requires --store-results, protected existing --job-dir and --key-file, exact --job-id and immutable --limits. All five per-document work flags cover every chunk and evidence head. JobLimits.max_work is the sole lifetime allowance, including failed attempts; mask_node_visits must be zero. Chunks, attempts and resume never renew that allowance. Complete input, planning, native, retained-result and durable-job memory are admitted before population IO. Stdout is metadata only; --materialize publishes private results after every document commits. No partial-document success, automatic retry, input spooling, generation, selected-row heads, calibrated correctness probability or full-context equivalence. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
-            .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population with a claim per record, also on resume; '-' reads stdin"))
+            .long_about("Retain and resume faithfulness judgments of COMPLETE original sources with a required fixed --policy FaithfulnessPolicy JSON file. By default, supply the COMPLETE original {id,text,task_args:{claim}} NDJSON population on every invocation; explicit retained-input replay is available. text is never a pre-split chunk; every row supplies its own nonempty claim and no policy or budget overrides. The combined exact source and claim bytes must fit the immutable stored per-item input ceiling. Every source chunk and evidence head must finish before the original document commits. Retain full-vocabulary NLI scores, contrary and uncertain evidence, original byte/scalar coordinates and the named complete-source reduction. --cohort-chunks shares native layers within a document; each actual ragged window must fit 64 heads without resizing or fallback. Repeat the exact policy, task budget, mapping and schedule on resume. Requires --store-results, protected existing --job-dir and --key-file, exact --job-id and immutable --limits. All five per-document work flags cover every chunk and evidence head. JobLimits.max_work is the sole lifetime allowance, including failed attempts; mask_node_visits must be zero. Chunks, attempts and resume never renew that allowance. Complete input, planning, native, retained-result and durable-job memory are admitted before population IO. Stdout is metadata only; --materialize publishes private results after every document commits. No partial-document success, automatic retry, generation, selected-row heads, calibrated correctness probability or full-context equivalence. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
+            .after_help(job_cli::INPUT_RETENTION_HELP)
+            .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population with a claim per record; omit with --use-retained-input; '-' reads stdin"))
             .mut_arg("max_input_bytes", |arg| arg.help("Outer ceiling for combined source and claim bytes; immutable stored input ceiling must fit"))
             .mut_arg("max_map_result_bytes", |arg| arg.help("Complete semantic document cap; stored result ceiling also covers cohort framing when enabled"))
             .mut_arg("cohort_chunks", |arg| arg.help("Share native layers across N chunks; every actual ragged window must fit 64 heads"))
@@ -69,6 +70,7 @@ impl JobArgs {
     /// Pure admission precedes key, policy, lifetime limits and population IO.
     fn validate(&self, args: &Int4Args) -> Result<MapLimits, Failure> {
         let s = &self.storage;
+        s.input_retention.limits()?;
         let local = |path: &std::path::Path| !path.as_os_str().is_empty() && path.as_os_str() != "-";
         if !s.store_results || !local(&s.job_dir) || !local(&s.key_file) || !local(&s.limits_file)
             || !local(&self.faithfulness.policy)
@@ -160,6 +162,7 @@ impl JobCommand {
     }
     fn execute_owned<R: Read + Send + 'static>(self, args: Int4Args, input: R, output: &mut impl Write)
         -> Result<(), Failure> {
+        self.args.storage.input_retention.validate(self.mode, &args.input)?;
         let map = self.args.validate(&args)?;
         #[cfg(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")))]

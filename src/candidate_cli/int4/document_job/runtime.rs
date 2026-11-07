@@ -1,6 +1,6 @@
 //! One authenticated population, resident engine and whole-document job runner.
 use super::*;
-use std::{io::{BufRead, BufReader}, sync::Arc, time::{Duration, Instant}};
+use std::{sync::Arc, time::{Duration, Instant}};
 use crate::{
     NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
     candidate_cli::runtime::owned_jobs::{host_failure, job_failure, open_mode, progress_report},
@@ -12,6 +12,7 @@ use crate::{
 pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, job: JobArgs,
     _admitted: MapLimits, input: R, output: &mut impl Write) -> Result<(), Failure> {
     let started = Instant::now();
+    job.storage.input_retention.validate(mode, &args.input)?;
     let map = job.validate(&args)?;
     let common = map.common;
     let deadline = Duration::from_secs(args.timeout_seconds);
@@ -89,16 +90,11 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
         snapshot = Some(SnapshotRecord::new("saved", common.snapshot_need));
     }
     remaining()?;
-    let reader: Box<dyn BufRead + Send> = if args.input.as_os_str() == "-" {
-        Box::new(BufReader::with_capacity(IO_BUFFER_BYTES, input))
-    } else {
-        Box::new(BufReader::with_capacity(IO_BUFFER_BYTES,
-            crate::local_io::open_document(&args.input).map_err(|_| CandidateError::Input)?))
-    };
+    let reader = job_cli::population_reader(mode, job.storage.input_retention, &args.input, input, IO_BUFFER_BYTES)?;
     let task_name = job.map.kind.name();
     let job_id = job.storage.job_id; let materialize = job.storage.materialize;
     let request = SourceJobRequest { root: job.storage.job_dir, key, job_id, limits: lifetime,
-        mode: open_mode(mode), materialize };
+        mode: open_mode(mode, job.storage.input_retention)?, materialize };
     let progress = engine.job_int4_source_document(&model, planner, Arc::new(vocabulary), request,
         host_limits(&args, limits, remaining()?), map.reduction_reserve_bytes, common.kernel,
         reader, cancellation).map_err(host_failure)?;

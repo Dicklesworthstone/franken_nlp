@@ -2,9 +2,9 @@
 //! Only completion metadata reaches stdout; sensitive edits remain protected.
 use super::*;
 use crate::{
-    candidate_cli::jobs as job_cli,
-    hosted::corpus::jobs::{JobHostLimits, JobOpenMode, SourceJobRequest},
-    jobs::{JobId, JobLimits, JobProgress, JobSecret, JobWork, TailPolicy, population::PopulationReadLimits},
+    candidate_cli::{jobs as job_cli, runtime::owned_jobs::open_mode},
+    hosted::corpus::jobs::{JobHostLimits, SourceJobRequest},
+    jobs::{JobId, JobLimits, JobProgress, JobSecret, JobWork, population::PopulationReadLimits},
 };
 
 fn host_limits(command: &RedactCommand, common: &CandidateArgs, limits: Limits,
@@ -26,8 +26,10 @@ fn read_config(session: &Session, path: &std::path::Path, cap: usize) -> Result<
 pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     command: RedactCommand, common: CandidateArgs, limits: Limits, envelope: CorpusEnvelope,
     mut input: R, mut output: W) -> Result<(), CandidateError> {
-    let session = Session::new(&common, limits)?;
     let retention = &command.retention;
+    let mode = retention.mode();
+    retention.input_retention.validate(mode, &command.input).map_err(|_| CandidateError::Arguments)?;
+    let session = Session::new(&common, limits)?;
     let path = retention.job_limits.as_ref().ok_or(CandidateError::Arguments)?;
     let lifetime = job_cli::parse_limits(&read_config(&session, path, job_cli::LIMIT_BYTES)?)
         .map_err(|_| CandidateError::Input)?;
@@ -52,20 +54,14 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let identity = source_identity(&facts, &planner, BuiltInTask::Ner)?;
     let prepared = prepare(&command, limits, envelope, &planner, identity, ner, request)?;
     session.remaining()?;
-    let reader: Box<dyn BufRead + Send> = if command.input.as_os_str() == "-" {
-        Box::new(BufReader::with_capacity(IO_BUFFER_BYTES, input))
-    } else {
-        Box::new(BufReader::with_capacity(IO_BUFFER_BYTES,
-            crate::local_io::open_document(&command.input).map_err(|_| CandidateError::Input)?))
-    };
+    let reader = job_cli::population_reader(mode, retention.input_retention, &command.input, input, IO_BUFFER_BYTES)
+        .map_err(|_| CandidateError::Input)?;
     let cancellation = CancellationToken::default();
     let model = session.load(&common, limits, &facts, cancellation.clone())?;
     // Refresh remaining time after preparation/loading; do not renew it.
     let host = host_limits(&command, &common, limits, envelope, &session)?;
     let job_id = retention.job_id.ok_or(CandidateError::Arguments)?;
-    let mode = if retention.resume {
-        JobOpenMode::Resume(if retention.discard_uncommitted_tail { TailPolicy::DiscardUncommitted } else { TailPolicy::Refuse })
-    } else { JobOpenMode::Create };
+    let mode = open_mode(mode, retention.input_retention).map_err(|_| CandidateError::Arguments)?;
     let job = SourceJobRequest { root: retention.job_dir.clone().ok_or(CandidateError::Arguments)?,
         key, job_id, limits: lifetime, mode, materialize: retention.materialize };
     let edit_reserve_bytes = command.edit_reserve_mib.checked_mul(MIB).ok_or(CandidateError::Arguments)?;
