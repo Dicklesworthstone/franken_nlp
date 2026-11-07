@@ -44,6 +44,21 @@ fn every_document_binds_its_full_identity_and_vocabulary_control_registry() {
 }
 
 #[test]
+fn full_head_cohorts_refuse_selected_plans_even_with_a_full_vocabulary_ceiling() {
+    let registry = crate::tasks::extract::tests::registry();
+    let vocabulary = ExtractionVocabulary::pinned(registry.template_controls()).unwrap();
+    for max_rows_per_step in [1, NANBEIGE_VOCAB_SIZE] {
+        let plans = [plan(r#"{"type":"boolean"}"#, 127)
+            .with_selected_rows(selected_head::Int4JsonSparseLimits { max_rows_per_step }).unwrap()];
+        let requests = requests(&plans);
+        assert!(matches!(check_request(&requests[0], &vocabulary),
+            Err(Int4ExtractError::Extraction(ExtractError::Contract(_)))));
+        assert!(preflight(&requests[0], &vocabulary).is_err());
+        assert!(finish(&requests, raw(&requests, &["true"]), 1 << 20).is_err());
+    }
+}
+
+#[test]
 fn per_document_kv_authority_is_the_meet_of_task_and_invocation_limits() {
     let plans = [plan(r#"{"type":"boolean"}"#, 127)]; let mut requests = requests(&plans);
     requests[0].budget.json.max_kv_bytes = u64::MAX;

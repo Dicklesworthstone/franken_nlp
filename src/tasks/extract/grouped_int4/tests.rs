@@ -9,6 +9,7 @@ use crate::{
     validation::grounded_fields::SourceOccurrence,
 };
 use super::super::tests::{registry, options, identity as eager_identity};
+mod selected;
 
 const BOOLEAN: &str = r#"{"type":"boolean"}"#;
 const SOURCE: &str = r#"{"type":"string","maxLength":64,"x-fnlp-source":"verbatim"}"#;

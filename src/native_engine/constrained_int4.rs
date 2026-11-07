@@ -26,6 +26,7 @@ use super::{
 
 pub const INT4_JSON_EXECUTION: &str = "grouped-int4-constrained-json-final-prefill-head-v1";
 pub mod cohort;
+pub mod sparse;
 mod prefill;
 
 /// Group dots, MACs and attention pairs are additional to JSON/mask work.

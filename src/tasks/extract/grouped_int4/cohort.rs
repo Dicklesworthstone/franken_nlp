@@ -33,6 +33,9 @@ pub struct Int4ExtractCohortRun {
 
 fn check_request(request: &Int4ExtractCohortRequest<'_>, vocabulary: &ExtractionVocabulary)
     -> Result<(), Int4ExtractError> {
+    if request.prepared.selected_rows().is_some() {
+        return Err(ExtractError::Contract("selected-row INT4 extraction requires single-sequence execution").into());
+    }
     request.prepared.verify_identity(request.admitted_identity)?;
     if vocabulary.controls != request.prepared.extraction.controls {
         return Err(ExtractError::Contract("cohort vocabulary control registry differs from sealed INT4 plan").into());
@@ -92,6 +95,9 @@ pub(super) fn finish(requests: &[Int4ExtractCohortRequest<'_>], raw: Int4JsonCoh
     }
     let mut expected = Int4Work::default();
     for request in requests {
+        if request.prepared.selected_rows().is_some() {
+            return Err(ExtractError::Contract("selected-row INT4 extraction requires single-sequence execution").into());
+        }
         request.prepared.verify_identity(request.admitted_identity)?;
         if request.prepared.group_width() != requests[0].prepared.group_width() { return Err(Int4ExtractError::Identity); }
         expected = expected.checked_add(request.prepared.planned_work()).map_err(Int4JsonError::from)?;

@@ -7,12 +7,15 @@
 
 use super::*;
 use crate::native_engine::{
-    constrained_int4::{self, INT4_JSON_EXECUTION, Int4JsonBudget, Int4JsonError, Int4JsonRun},
+    constrained_int4::{self, INT4_JSON_EXECUTION, Int4JsonBudget, Int4JsonError, Int4JsonRun,
+        sparse as selected_head},
     strict_int4::{Int4Work, StrictInt4Engine, STRICT_INT4_PROFILE, prefill::Int4PrefillLimits},
 };
 
 pub const INT4_EXTRACT_VERSION: &str = "grouped-int4-schema-source-extraction-v1";
 pub mod cohort;
+mod projection;
+pub use projection::INT4_SPARSE_EXTRACT_VERSION;
 
 #[derive(Debug)]
 pub enum Int4ExtractError { Extraction(ExtractError), Native(Int4JsonError), Identity }
@@ -63,6 +66,7 @@ pub struct Int4ExtractPlan {
     comparison_policy_digest: Sha256Digest,
     group_width: usize,
     work: Int4Work,
+    selected_rows: Option<selected_head::Int4JsonSparseLimits>,
 }
 impl Int4ExtractPlan {
     #[allow(clippy::too_many_arguments)]
@@ -104,7 +108,7 @@ impl Int4ExtractPlan {
             INT4_EXTRACT_VERSION, INT4_JSON_EXECUTION, "comparison-subject-group-width-v1", extraction.policy_digest,
         )).map_err(|_| ExtractError::Serialization)?);
         identity.validate().map_err(|_| Int4ExtractError::Identity)?;
-        Ok(Self { extraction, identity, comparison_policy_digest, group_width, work })
+        Ok(Self { extraction, identity, comparison_policy_digest, group_width, work, selected_rows: None })
     }
 
     // Built-in task finalization is part of the admitted policy, not a
@@ -147,11 +151,11 @@ impl Int4ExtractPlan {
     pub(crate) fn verify_completed(&self, run: &Int4ExtractRun) -> Result<(), Int4ExtractError> {
         // Bound the original envelope before the temporary validation copy.
         super::quantized::check_size(run, self.max_result_bytes())?;
-        if run.schema_version != 1 || run.execution != INT4_EXTRACT_VERSION || run.group_width != self.group_width {
+        if run.schema_version != 1 || run.execution != self.execution_version() || run.group_width != self.group_width {
             return Err(ExtractError::InvalidResult.into());
         }
         let output = &run.result.output;
-        let expected = constrained_int4::planned_work(self.group_width, self.prompt_tokens(), output.token_ids.len())?;
+        let expected = self.completed_work(output.token_ids.len(), output.projected_logits)?;
         if run.model_work != expected || output.forward_positions != expected.forward_positions
             || output.projected_logits != expected.projected_logits {
             return Err(Int4JsonError::WorkMismatch.into());
@@ -235,25 +239,30 @@ impl Int4ExtractPlan {
         // The native session owns cleanup and remains live throughout source
         // validation, complete-result accounting and the final checkpoint.
         let finish = |run| finalize(self.finalize(run).map_err(E::from)?);
-        match prefill {
-            Some(limits) => constrained_int4::decode_json_int4_layer_major_with(engine, admitted, &self.extraction.prompt,
-                &self.extraction.program, &vocabulary.oracle, &self.extraction.options, budget, limits, control, finish),
-            None => constrained_int4::decode_json_int4_with(engine, admitted, &self.extraction.prompt,
+        match (self.selected_rows, prefill) {
+            (Some(rows), Some(prefill)) => selected_head::prefill::decode_json_int4_sparse_layer_major_with(
+                engine, admitted, &self.extraction.prompt, &self.extraction.program, &vocabulary.oracle,
+                &self.extraction.options, budget, rows, prefill, control, finish),
+            (None, Some(prefill)) => constrained_int4::decode_json_int4_layer_major_with(engine, admitted, &self.extraction.prompt,
+                &self.extraction.program, &vocabulary.oracle, &self.extraction.options, budget, prefill, control, finish),
+            (Some(rows), None) => selected_head::decode_json_int4_sparse_with(engine, admitted, &self.extraction.prompt,
+                &self.extraction.program, &vocabulary.oracle, &self.extraction.options, budget, rows, control, finish),
+            (None, None) => constrained_int4::decode_json_int4_with(engine, admitted, &self.extraction.prompt,
                 &self.extraction.program, &vocabulary.oracle, &self.extraction.options, budget, control, finish),
         }
     }
 
     fn finalize(&self, run: Int4JsonRun) -> Result<Int4ExtractRun, Int4ExtractError> {
-        if run.schema_version != 1 || run.execution != INT4_JSON_EXECUTION || run.group_width != self.group_width {
+        if run.schema_version != 1 || run.execution != self.native_execution_version() || run.group_width != self.group_width {
             return Err(ExtractError::InvalidResult.into());
         }
-        let expected = constrained_int4::planned_work(self.group_width, self.prompt_tokens(), run.output.token_ids.len())?;
+        let expected = self.completed_work(run.output.token_ids.len(), run.output.projected_logits)?;
         if run.model_work != expected || run.output.forward_positions != expected.forward_positions
             || run.output.projected_logits != expected.projected_logits {
             return Err(Int4JsonError::WorkMismatch.into());
         }
         let result = self.extraction.finalize_profile(run.output, STRICT_INT4_PROFILE)?;
-        let output = Int4ExtractRun { schema_version: 1, execution: INT4_EXTRACT_VERSION.to_owned(),
+        let output = Int4ExtractRun { schema_version: 1, execution: self.execution_version().to_owned(),
             group_width: self.group_width, result, model_work: run.model_work };
         // This existing bounded serializer accepts only trusted typed values;
         // it counts the OUTER envelope before allocating canonical JSON.
