@@ -56,23 +56,31 @@ pub(super) fn definition() -> clap::Command {
 
 pub(super) fn one_off_definition() -> clap::Command {
     definition()
-        .long_about("Compile a bounded local schema against the exact UTF-8 document before model access. Full-vocabulary greedy grammar decoding is the default. Explicit --max-selected-rows N selects every legal grammar row and refuses a step whose complete legal set exceeds N, including EOS when accepting. This is a bounded head projection strategy, never top-k pruning; it checks requested logits and does not certify parity with unrequested full-head rows. The strategy and exact row ceiling enter execution identity before hosted admission. --source-membership preserves all original occurrences of annotated verbatim fields. JSON remains exact text and the complete result is independently validated. Schema validity and source membership do not certify semantic accuracy. No sampling or repair retry. --prefill-rows independently selects bounded layer-major prompt execution. Batch streams expose their own fixed selected-row option, including document cohorts and packed prompt passes. Map, job and semantic workflows retain full-vocabulary execution.")
-        .arg(clap::Arg::new("max_selected_rows").long("max-selected-rows")
-            .value_name("N").value_parser(clap::value_parser!(usize))
-            .help("Opt into all legal grammar-row projections; 1..=166144 rows per step including accepted EOS; excess refuses"))
+        .long_about("Compile a bounded local schema against the exact UTF-8 document before model access. Full-vocabulary greedy grammar decoding is the default. Explicit --max-selected-rows N selects every legal grammar row and refuses a step whose complete legal set exceeds N, including EOS when accepting. This is a bounded head projection strategy, never top-k pruning; it checks requested logits and does not certify parity with unrequested full-head rows. The strategy and exact row ceiling enter execution identity before hosted admission. --source-membership preserves all original occurrences of annotated verbatim fields. JSON remains exact text and the complete result is independently validated. Schema validity and source membership do not certify semantic accuracy. No sampling or repair retry. --prefill-rows independently selects bounded layer-major prompt execution. Batch streams expose their own fixed selected-row option, including document cohorts and packed prompt passes. The one-off extract-map also accepts a fixed selected-row policy for all chunks; document corpora, jobs and semantic workflows retain full-vocabulary execution.")
+        .arg(selected_rows_argument())
+}
+pub(super) fn selected_rows_argument() -> clap::Arg {
+    clap::Arg::new("max_selected_rows").long("max-selected-rows")
+        .value_name("N").value_parser(clap::value_parser!(usize))
+        .help("Opt into all legal grammar-row projections; 1..=166144 rows per step including accepted EOS; excess refuses")
 }
 impl ExtractionArgs {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-        if matches.value_source("prefill_rows") == Some(clap::parser::ValueSource::CommandLine) {
-            return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
-                "this INT4 extraction workflow requires sequential prompt execution"));
-        }
-        let args = Self::from_matches_with_prefill(matches)?;
+        let args = Self::from_matches_with_projection(matches)?;
         if args.max_selected_rows.is_some() {
             return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
                 "this INT4 extraction workflow requires full-vocabulary head projection"));
         }
         Ok(args)
+    }
+    /// A composed map may select a fixed head policy while keeping ordinary
+    /// sequential prompt execution. Population routes validate their own scope.
+    pub(super) fn from_matches_with_projection(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        if matches.value_source("prefill_rows") == Some(clap::parser::ValueSource::CommandLine) {
+            return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
+                "this INT4 extraction workflow requires sequential prompt execution"));
+        }
+        Self::from_matches_with_prefill(matches)
     }
     pub(super) fn from_matches_with_prefill(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         if TEXT_ONLY.iter().filter(|&&id| id != "prefill_rows")
@@ -87,6 +95,10 @@ impl ExtractionArgs {
     pub(super) fn validate(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
         if args.prefill()?.is_some() { return Err(CandidateError::Arguments); }
         self.validate_full_projection_with_prefill(args)
+    }
+    pub(super) fn validate_with_projection(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
+        if args.prefill()?.is_some() { return Err(CandidateError::Arguments); }
+        self.validate_with_prefill(args)
     }
     /// Composed streams own their projection policy separately from one-off
     /// extraction arguments, even when they expose prompt scheduling.
@@ -134,12 +146,23 @@ impl ExtractionArgs {
     }
     pub(super) fn mask_visits(&self) -> u64 { self.max_mask_node_visits }
     pub(super) fn schema_path(&self) -> &std::path::Path { &self.schema }
-    fn selected_rows(&self) -> Result<Option<Int4JsonSparseLimits>, CandidateError> {
+    pub(super) fn selected_rows(&self) -> Result<Option<Int4JsonSparseLimits>, CandidateError> {
         self.max_selected_rows.map(|max_rows_per_step| {
             let limits = Int4JsonSparseLimits { max_rows_per_step };
             limits.validate().map_err(|_| CandidateError::Arguments)?;
             Ok(limits)
         }).transpose()
+    }
+    /// Seal a document-wide head policy before preparing any real chunk. The
+    /// same immutable planner is used for preflight and hosted re-preparation.
+    #[cfg(any(feature = "asupersync-runtime", test))]
+    pub(super) fn configure_planner(&self, planner: crate::batch::extract::grouped_int4::Int4ExtractionBatchPlanner)
+        -> Result<crate::batch::extract::grouped_int4::Int4ExtractionBatchPlanner, CandidateError> {
+        if planner.selected_rows().is_some() { return Err(CandidateError::Planning); }
+        match self.selected_rows()? {
+            Some(limits) => planner.with_selected_rows(limits).map_err(|_| CandidateError::Planning),
+            None => Ok(planner),
+        }
     }
     /// Bind the explicit head strategy before the host sees an admitted plan.
     #[cfg(any(feature = "asupersync-runtime", test))]
@@ -159,6 +182,13 @@ impl ExtractionArgs {
     pub(super) fn shared_defaults(&self, schema: String, ceiling: TaskBudget)
         -> Result<ExtractionBatchArgs, CandidateError> {
         if self.max_selected_rows.is_some() { return Err(CandidateError::Arguments); }
+        self.shared_defaults_with_projection(schema, ceiling)
+    }
+    /// Projection policy belongs to the planner, never the per-document schema
+    /// or budget. Only workflows that bind that planner may use this helper.
+    pub(super) fn shared_defaults_with_projection(&self, schema: String, ceiling: TaskBudget)
+        -> Result<ExtractionBatchArgs, CandidateError> {
+        let _ = self.selected_rows()?;
         ceiling.validate().map_err(|_| CandidateError::Planning)?;
         let request = crate::candidate_cli::extract::arguments(schema, self.source_membership, ceiling)?;
         let declaration = crate::validation::parse_json_with_limits(&request.schema, crate::validation::JsonLimits {

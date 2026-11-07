@@ -68,8 +68,13 @@ struct MappingArgs {
 }
 pub(super) fn definition() -> clap::Command {
     definition_with_cohorts(true)
+        .arg(extract::selected_rows_argument())
+        .after_long_help(format!("{}\n\nSelected-row projection: --max-selected-rows N fixes the same complete-legal-row ceiling for EVERY chunk, including native chunk cohorts. Full-vocabulary projection remains the default. Every legal token is evaluated; a set larger than N refuses the complete document without pruning or fallback. The exact strategy and ceiling bind every chunk identity before native admission. Whole-document work is priced from the selected ceiling; grammar masks, source evidence, task limits and physical memory reservations are unchanged. Per-chunk results name their execution strategy and the document includes max_selected_rows. Actual-model parity and performance remain separately unqualified. Document corpus and retained-job commands keep their full-vocabulary policy.", array_union::HELP))
 }
 pub(super) fn document_job_definition() -> clap::Command {
+    definition_with_cohorts(true)
+}
+pub(super) fn corpus_definition() -> clap::Command {
     definition_with_cohorts(true)
 }
 fn definition_with_cohorts(cohorts: bool) -> clap::Command {
@@ -99,7 +104,7 @@ pub(super) struct MapLimits {
 }
 impl MapArgs {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-        Ok(Self { extraction: extract::ExtractionArgs::from_matches(matches)?,
+        Ok(Self { extraction: extract::ExtractionArgs::from_matches_with_projection(matches)?,
             mapping: MappingArgs::from_arg_matches(matches)?,
             array_union: ArrayUnionArgs::from_arg_matches(matches)?,
             cohort_chunks: matches.try_get_one::<usize>("cohort_chunks").ok().flatten().copied() })
@@ -117,7 +122,8 @@ impl MapArgs {
     }
     fn validate_mode(&self, args: &Int4Args, document_job: bool, admit_memory: bool) -> Result<MapLimits, CandidateError> {
         let m = self.mapping;
-        let mut common = self.extraction.validate(args)?;
+        let mut common = if document_job { self.extraction.validate(args)? }
+            else { self.extraction.validate_with_projection(args)? };
         if args.max_input_bytes < 4 || !(1..=256).contains(&m.max_chunks)
             || self.cohort_chunks.is_some_and(|n| !(1..=64).contains(&n) || n > m.max_chunks)
             || !(1..=1_000_000).contains(&m.max_tokenizer_calls)
@@ -202,7 +208,7 @@ impl MapArgs {
     pub(super) fn request(&self, schema: String, budget: TaskBudget) -> Result<ExtractionBatchArgs, CandidateError> {
         // The source language is compiled independently for each REAL chunk.
         // A whole-document source automaton or placeholder would prove less.
-        let request = self.extraction.shared_defaults(schema, budget)?;
+        let request = self.extraction.shared_defaults_with_projection(schema, budget)?;
         self.array_union.check_schema(&request.schema, self.extraction.compiler(), self.mapping)?;
         Ok(request)
     }

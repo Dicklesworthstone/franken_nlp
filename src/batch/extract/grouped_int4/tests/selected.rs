@@ -45,7 +45,6 @@ fn repeated_invalid_and_full_vocabulary_caps_keep_an_explicit_distinct_policy() 
     let a = dense.prepare(boolean()).unwrap(); let b = full.prepare(boolean()).unwrap();
     assert_eq!(a.planned_work(), b.planned_work());
     assert_ne!(a.execution_identity(), b.execution_identity());
-    dense.require_full_projection().unwrap(); assert!(full.require_full_projection().is_err());
     assert!(dense.check_projection(&b).is_err()); assert!(full.check_projection(&a).is_err());
     let seven = planner(32, None).with_selected_rows(rows(7)).unwrap();
     let eight = planner(32, None).with_selected_rows(rows(8)).unwrap();

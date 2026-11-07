@@ -98,10 +98,6 @@ impl Int4ExtractionBatchPlanner {
         Ok(self)
     }
     pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.selected_rows }
-    pub(crate) fn require_full_projection(&self) -> Result<(), BatchFault> {
-        if self.selected_rows.is_some() { return Err(BatchCode::Admission.into()); }
-        Ok(())
-    }
     pub(crate) fn check_projection(&self, prepared: &PreparedInt4BatchExtraction) -> Result<(), BatchFault> {
         if prepared.plan.selected_rows() != self.selected_rows { return Err(BatchCode::Admission.into()); }
         Ok(())

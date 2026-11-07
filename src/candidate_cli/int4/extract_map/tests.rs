@@ -1,4 +1,5 @@
 use super::*;
+mod selected;
 
 pub(super) fn command(extra: &[&str]) -> Int4Command {
     let mut argv = vec!["candidate", "source-int4", "extract-map", "--source-dir", "explicit-source",

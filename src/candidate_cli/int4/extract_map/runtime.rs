@@ -66,6 +66,7 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     remaining()?;
     let planner = Int4ExtractionBatchPlanner::for_model(model.model_identity(), budget,
         options.extraction.compiler(), options.extraction.source_limits(), None).map_err(|_| CandidateError::Planning)?;
+    let planner = options.extraction.configure_planner(planner)?;
     let expected = preflight(&text, &request, &planner, limits.mapping, &mut DeadlineControl { started, deadline })?;
     let controls = crate::tokenizer::pinned_controls::pinned().map_err(|_| CandidateError::Identity)?;
     let vocabulary = ExtractionVocabulary::pinned(controls.template_controls())
@@ -110,7 +111,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         // Preserve every exact chunk JSON string and the optional independently
         // validated record union. The result guard survives both
         // write and flush, including the complete cohort wrapper's statistics.
-        publish(&response, limits.max_result_bytes + 4096, output)
+        publish_checked(&response, limits.max_result_bytes + 4096, output,
+            &|| remaining().map(|_| ()))
     };
     if let Some(max_chunks) = limits.cohort_chunks {
         let result = engine.extract_int4_document_cohorts(&model, text, Arc::new(planner), vocabulary,

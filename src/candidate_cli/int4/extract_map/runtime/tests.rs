@@ -1,5 +1,6 @@
 //! Real pinned schema/chunk preparation; no fixture claims model execution.
 use super::*;
+mod selected;
 use crate::{
     artifact::converter::PINNED_REVISION,
     execution_identity::{ExecutionIdentity, NumericsProfile, Sha256Digest, ThinkingMode, ToolMode},
