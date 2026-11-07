@@ -18,6 +18,9 @@ struct StreamArgs {
     /// Fixed private FaithfulnessPolicy JSON; no claim, source or budget overrides.
     #[arg(long, value_name = "FILE", required = true)]
     policy: PathBuf,
+    /// Explicit per-chunk head ceiling (1..=32), including the whole-source head; omitted preserves 32.
+    #[arg(long, value_name = "N")]
+    max_evidence_heads: Option<usize>,
     /// All nonempty records, including malformed records and flush controls.
     #[arg(long, default_value_t = 1000)]
     max_requests: u64,
@@ -75,7 +78,7 @@ impl CorpusArgs {
 
     pub(in crate::candidate_cli::int4) fn validate(&self, args: &Int4Args) -> Result<CorpusLimits, CandidateError> {
         let s = &self.stream;
-        let document = self.document.validate(args)?;
+        let document = self.document.validate_with_max_heads(args, s.max_evidence_heads.unwrap_or(32))?;
         let mut common = document.common;
         if !(1..=100_000).contains(&s.max_requests)
             || !(1..=16 * 1024 * MIB).contains(&s.max_total_input_bytes)
@@ -136,6 +139,21 @@ pub(super) fn parse_policy(text: &str) -> Result<FaithfulnessPolicy, CandidateEr
     }).map_err(|_| CandidateError::Input)?;
     let policy: FaithfulnessPolicy = serde_json::from_value(value).map_err(|_| CandidateError::Input)?;
     policy.validate().map_err(|_| CandidateError::Planning)?;
+    Ok(policy)
+}
+
+pub(super) fn parse_policy_with_max_heads(text: &str, max_heads: Option<usize>)
+    -> Result<FaithfulnessPolicy, CandidateError> {
+    let policy = parse_policy(text)?;
+    if let Some(max_heads) = max_heads {
+        // A single evidence window reuses the whole-source head. Otherwise
+        // score that head and every evidence window, even if fewer spans are retained.
+        let required = if policy.max_evidence_windows == 1 { 1 }
+            else { policy.max_evidence_windows as usize + 1 };
+        if !(1..=32).contains(&max_heads) || required > max_heads {
+            return Err(CandidateError::Planning);
+        }
+    }
     Ok(policy)
 }
 

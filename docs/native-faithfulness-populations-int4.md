@@ -102,13 +102,49 @@ heads**. Total heads across a long document may exceed 64. All future windows
 are checked before its first native forward; an oversized window refuses
 without resizing, dropping evidence or falling back to serial execution.
 
-The pure allocation quote prices `min(32 × N, 64)` heads. This conservative
+By default, the pure allocation quote prices `min(32 × N, 64)` heads. This
 peak does not itself reject widths above two: the actual number of evidence
 heads depends on each source chunk. Other limits still apply. In particular,
 the bounded cohort-output quote includes each chunk result plus its wrapper;
 64 chunks at the default 1 MiB per-chunk cap exceed that output ceiling.
 Narrow `--max-result-bytes` when appropriate for the intended result size;
 actual oversized results still fail explicitly.
+
+### Smaller fixed-policy head ceilings
+
+Both population commands accept optional `--max-evidence-heads H`, with
+`1 <= H <= 32`. This narrows the admitted **total NLI heads per source
+chunk**, including the whole-source head. Set it only when the fixed policy
+fits that ceiling:
+
+| Fixed `max_evidence_windows` | Required head ceiling |
+| --- | --- |
+| `1` | `1`, because the single window reuses the whole-source head |
+| `2` through `31` | `max_evidence_windows + 1` |
+
+`max_evidence_spans` limits retained witnesses and does not lower the number
+of scored heads. A conflicting policy is refused before model loading or
+population input. No source window is removed to satisfy the ceiling.
+
+The smaller ceiling is used during the initial memory admission, including
+retained plans and the per-chunk task KV budget. Cohorts then reserve
+`min(H × N, 64)` physical heads. Serial execution continues to reserve one
+physical KV row. The actual complete ragged schedule is still checked before
+native execution; a window above 64 heads refuses even when the allocation
+quote was capped at 64. All five work allowances, complete result limits and
+source/claim byte ceilings retain their original meaning.
+
+For a fixed policy with `max_evidence_windows: 1`, `max_evidence_spans: 1`
+and `evidence_window_bytes: 256`, the options
+`--max-evidence-heads 1 --cohort-chunks 8 --max-chunk-bytes 256` admit
+eight native heads per full cohort. The whole source must still fit the
+configured number of chunks and every exact claim-aware prompt must fit the
+context. Narrowing the ceiling can make this invocation fit a memory limit
+that the default 32-head allowance would refuse.
+
+Omitting the option preserves the previous 32-head task budget and memory
+quote. The one-shot `faithfulness-map` command retains its existing behavior
+and does not accept this population-only option.
 
 The live command requires `asupersync-runtime`. It rejects generation,
 sampling, prompt overrides, thinking, tools, selected-row projection,
@@ -200,6 +236,13 @@ stored results require the `--max-map-result-bytes` cap; cohort stored results
 need an additional 4096 bytes for their wrapper. The illustrated stored cap
 covers either schedule at the default 16 MiB semantic result cap.
 
+An explicit `--max-evidence-heads` also binds the authenticated job recipe.
+Repeat the exact option on every resume. Even explicit `32` is a distinct
+opt-in recipe from omission, although its task and memory allowances are
+equal. Resume jobs created without this option by continuing to omit it;
+their existing recipe bytes remain unchanged. A smaller ceiling never
+increases or resets the immutable lifetime work counters.
+
 Stdout uses `fnlp-candidate-int4-faithfulness-document-job-v1` and contains
 only public model and job progress metadata. It does not emit source, claim,
 policy, scores, private paths or secrets. `--materialize` publishes verified
@@ -236,6 +279,18 @@ model, `CorpusLimits`, explicit kernel, owned reader/writer and cancellation
 token. `int4_faithfulness_document_corpus_requirements` quotes its complete
 hosted reservation before IO. `Int4FaithfulnessDocumentArgs` contains only
 the required claim; `BatchDocument.text` is the original source.
+
+Both population planner types provide `.with_max_heads(H)?` and
+`.max_heads()`. The builder validates the fixed policy and the prepared
+descriptor remains bound to the admitted ceiling. Use
+`int4_faithfulness_document_corpus_requirements_with_max_heads` with that
+same ceiling for a smaller pre-IO corpus quote; the original quote function
+continues to use 32. For native map quotes,
+`Int4FaithfulnessMapMemoryLimits::requirements_with_max_heads` narrows serial
+plan ownership, and `cohort_requirements` uses its explicit head ceiling for
+both plans and native state. These pure quote functions require the caller
+to enforce the corresponding policy and prepared-head capability; the
+population planners and hosted routes perform those checks.
 
 Preparation is sealed to its planner. Execution recompiles the source/claim
 and compares the full identity list, geometry and planned work with the

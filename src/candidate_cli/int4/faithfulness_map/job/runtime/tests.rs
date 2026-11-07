@@ -52,22 +52,25 @@ fn completion_reports_only_public_model_and_durable_progress_metadata() {
     let progress = JobProgress { job_id: id, items: 2, committed: 2, attempts: 3,
         reserved_work: fixed.max_work, spool_bytes: 1024, materialized: true };
     let report = progress_report(progress, id, fixed, true, c.mode, "faithfulness").unwrap();
-    let response = Response { protocol: "fnlp-candidate-int4-faithfulness-document-job-v1", schema_version: 1,
+    let mut response = Response { protocol: "fnlp-candidate-int4-faithfulness-document-job-v1", schema_version: 1,
         scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "faithfulness",
         durable_unit: "complete_original_document", model_id: "Nanbeige4.2-3B",
         source_revision: "public-revision", source_root_sha256: "public-source", model_content_sha256: "public-model",
         candidate_format: "candidate-int4", quant_recipe: "strict-int4", group_width: args.group_width,
-        integer_kernel: map.common.kernel.kind().id(), snapshot: None, cohort_chunks: Some(3), output: &report };
+        integer_kernel: map.common.kernel.kind().id(), snapshot: None, cohort_chunks: Some(3),
+        max_evidence_heads: None, output: &report };
     let mut bytes = Vec::new(); publish_report(&response, &mut bytes, &available).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["durable_unit"], "complete_original_document"); assert_eq!(value["cohort_chunks"], 3);
     assert_eq!(value["task"], "faithfulness"); assert_eq!(value["output"]["committed"], 2);
     assert_eq!(value["output"]["attempts"], 3);
     assert_eq!(value["output"]["reserved_work"], serde_json::to_value(fixed.max_work).unwrap());
-    for forbidden in ["text", "source", "claim", "scores", "citations", "policy", "recipe", "key", "job_dir", "documents", "aggregate"] {
+    for forbidden in ["text", "source", "claim", "scores", "citations", "policy", "recipe", "key", "job_dir", "documents", "aggregate", "max_evidence_heads"] {
         assert!(value.get(forbidden).is_none()); assert!(value["output"].get(forbidden).is_none());
     }
     assert!(bytes.ends_with(b"\n"));
+    response.max_evidence_heads = Some(1);
+    assert_eq!(serde_json::to_value(&response).unwrap()["max_evidence_heads"], 1);
 }
 
 fn available() -> Result<Duration, CandidateError> { Ok(Duration::from_secs(1)) }

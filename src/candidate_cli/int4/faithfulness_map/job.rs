@@ -26,6 +26,9 @@ struct FaithfulnessArgs {
     /// Fixed strict FaithfulnessPolicy JSON; each population record supplies its own claim.
     #[arg(long, value_name = "FILE", required = true)]
     policy: PathBuf,
+    /// Explicit per-chunk head ceiling (1..=32); repeat on resume, and omit for legacy jobs.
+    #[arg(long, value_name = "N")]
+    max_evidence_heads: Option<usize>,
 }
 
 pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
@@ -74,7 +77,7 @@ impl JobArgs {
             || s.journal_memory_mib == 0 || s.serialization_memory_mib == 0 {
             return Err(Failure::usage("explicit_faithfulness_document_job_storage"));
         }
-        let map = self.map.validate(args)?;
+        let map = self.map.validate_with_max_heads(args, self.faithfulness.max_evidence_heads.unwrap_or(32))?;
         for mib in [s.journal_memory_mib, s.serialization_memory_mib] {
             if mib.checked_mul(MIB).is_none_or(|bytes| bytes > map.common.memory_bytes) {
                 return Err(Failure::usage("job_memory_options"));

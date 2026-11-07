@@ -38,9 +38,9 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
     if host.required_buffer_bytes(lifetime).map_err(host_failure)? != limits.buffer_bytes {
         return Err(Failure::usage("faithfulness_document_job_host_quote"));
     }
-    let budget = job.map.budget(common)?;
+    let budget = job.map.budget_with_max_heads(common, job.faithfulness.max_evidence_heads.unwrap_or(32))?;
     let policy_text = read_config(&job.faithfulness.policy, super::super::corpus::POLICY_BYTES, &remaining)?;
-    let policy = super::super::corpus::parse_policy(&policy_text)?;
+    let policy = super::super::corpus::parse_policy_with_max_heads(&policy_text, job.faithfulness.max_evidence_heads)?;
     drop(policy_text);
     remaining()?;
     let key = JobSecret::read(&job.storage.key_file).map_err(job_failure)?;
@@ -53,6 +53,9 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
         .map_err(|_| CandidateError::Planning)?;
     let planner = Int4FaithfulnessDocumentJobPlanner::new(compiler, policy, map.mapping, lifetime)
         .map_err(|_| CandidateError::Planning)?;
+    let planner = if let Some(max_heads) = job.faithfulness.max_evidence_heads {
+        planner.with_max_heads(max_heads).map_err(|_| CandidateError::Planning)?
+    } else { planner };
     let cohort_chunks = job.map.mapping.cohort_chunks;
     let planner = if let Some(chunks) = cohort_chunks {
         planner.with_chunk_cohorts(chunks).map_err(|_| CandidateError::Planning)?
@@ -94,7 +97,8 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
         source_revision: &identity.source_revision, source_root_sha256: model.model_identity().source_root_sha256(),
         model_content_sha256: &content, candidate_format: &identity.artifact_format,
         quant_recipe: &identity.quant_recipe, group_width: model.model_identity().group_width(),
-        integer_kernel: common.kernel.kind().id(), snapshot, cohort_chunks, output: &report };
+        integer_kernel: common.kernel.kind().id(), snapshot, cohort_chunks,
+        max_evidence_heads: job.faithfulness.max_evidence_heads, output: &report };
     // Failure can follow durable commits; stdout contains only metadata.
     publish_report(&response, output, &remaining)
 }
@@ -162,6 +166,8 @@ struct Response<'a, T: Serialize> {
     snapshot: Option<SnapshotRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cohort_chunks: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_evidence_heads: Option<usize>,
     output: &'a T,
 }
 

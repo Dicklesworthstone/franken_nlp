@@ -54,6 +54,41 @@ fn serial_and_ragged_cohorts_keep_one_lifetime_and_price_frozen_chunk_descriptor
 }
 
 #[test]
+fn explicit_head_cap_lowers_start_and_resume_admission_without_changing_the_lifetime() {
+    for operation in ["start", "resume"] {
+        let (legacy, mut args) = command(operation, &["--cohort-chunks", "3"]);
+        let old = legacy.args.validate(&args).unwrap();
+        assert_eq!(legacy.args.faithfulness.max_evidence_heads, None);
+        let (explicit, _) = command(operation, &["--cohort-chunks", "3", "--max-evidence-heads", "32"]);
+        let unchanged = explicit.args.validate(&args).unwrap();
+        assert_eq!(old.memory, unchanged.memory);
+        assert_eq!(old.common.minimum_memory_bytes, unchanged.common.minimum_memory_bytes);
+        assert_eq!(legacy.args.map.budget(old.common).unwrap(),
+            explicit.args.map.budget_with_max_heads(unchanged.common, 32).unwrap());
+
+        let (narrow, _) = command(operation, &["--cohort-chunks", "3", "--max-evidence-heads", "1"]);
+        let small = narrow.args.validate(&args).unwrap();
+        let fixed = lifetime(&args, small);
+        let admitted = narrow.args.lifetime_limits(&args, small, fixed).unwrap();
+        let legacy_admitted = legacy.args.lifetime_limits(&args, old, fixed).unwrap();
+        assert_eq!(small.memory.native.kv_bytes, small.common.native.kv_bytes * 3);
+        assert_eq!(narrow.args.map.budget_with_max_heads(small.common, 1).unwrap().max_kv_bytes,
+            small.common.native.kv_bytes);
+        assert!(admitted.map.common.minimum_memory_bytes < legacy_admitted.map.common.minimum_memory_bytes);
+        assert_eq!(admitted.map.mapping.max_model_work, legacy_admitted.map.mapping.max_model_work);
+        assert_eq!(admitted.map.mapping.max_model_work, fixed.max_work.int4_model_work());
+        assert_eq!(admitted.map.mapping.chunks, legacy_admitted.map.mapping.chunks);
+        assert_eq!(small.memory.max_output_bytes, old.memory.max_output_bytes);
+        args.memory_mib = admitted.map.common.minimum_memory_bytes.div_ceil(MIB);
+        let small = narrow.args.validate(&args).unwrap();
+        narrow.args.lifetime_limits(&args, small, fixed).unwrap();
+        if let Ok(old) = legacy.args.validate(&args) {
+            assert_eq!(legacy.args.lifetime_limits(&args, old, fixed).unwrap_err().code, "job_population_memory");
+        }
+    }
+}
+
+#[test]
 fn exact_complete_output_and_every_lifetime_work_axis_are_required() {
     for flags in [vec![], vec!["--cohort-chunks", "3"]] {
         let (c, args) = command("resume", &flags); let map = c.args.validate(&args).unwrap();
@@ -128,7 +163,8 @@ fn explicit_storage_policy_and_geometry_refuse_before_all_private_io() {
     }
     for flags in [vec!["--max-chunks", "0"], vec!["--cohort-chunks", "9"], vec!["--cohort-chunks", "0"],
         vec!["--max-tokenizer-calls", "0"], vec!["--minimum-classified-coverage-ppm", "1000001"],
-        vec!["--max-forward-positions", "0"]] {
+        vec!["--max-forward-positions", "0"], vec!["--max-evidence-heads", "0"],
+        vec!["--max-evidence-heads", "33"]] {
         let mut words = argv("start");
         if flags[0] == "--max-chunks" {
             let at = words.iter().position(|word| word == "--max-chunks").unwrap(); words[at + 1] = flags[1].to_owned();

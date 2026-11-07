@@ -61,19 +61,23 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     remaining()?;
     let text = read_input(&mut crate::local_io::open_document(&command.stream.policy)
         .map_err(|_| CandidateError::Input)?, POLICY_BYTES)?;
-    let policy = parse_policy(&text)?;
+    let policy = parse_policy_with_max_heads(&text, command.stream.max_evidence_heads)?;
     drop(text);
     remaining()?;
     let cancellation = CancellationToken::default();
     let model = crate::candidate_cli::int4::runtime::load_model_with_failure(&engine, &args, common,
         remaining()?, cancellation.clone(), |error| host_error(error, CandidateError::Model))?;
     remaining()?;
-    let budget = command.document.budget(common)?;
+    let budget = command.document.budget_with_max_heads(common, command.stream.max_evidence_heads.unwrap_or(32))?;
     let planner = Int4JudgePlanner::for_model(model.model_identity(), budget, limits.document.planning)
         .map_err(|error| error.cancellation().map(stopped).unwrap_or(CandidateError::Planning))?;
     let planner = Int4FaithfulnessDocumentBatchPlanner::new(planner, policy,
         limits.document.mapping, limits.document.mapping.max_model_work)
         .map_err(|fault| fault.cancellation.map(stopped).unwrap_or(CandidateError::Planning))?;
+    let planner = if let Some(max_heads) = command.stream.max_evidence_heads {
+        planner.with_max_heads(max_heads)
+            .map_err(|fault| fault.cancellation.map(stopped).unwrap_or(CandidateError::Planning))?
+    } else { planner };
     let cohort_chunks = command.document.mapping.cohort_chunks;
     let planner = if let Some(chunks) = cohort_chunks {
         planner.with_chunk_cohorts(chunks)
@@ -81,8 +85,8 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     } else { planner };
     if planner.group_width() != model.model_identity().group_width() { return Err(CandidateError::Identity); }
     let mut host = host_limits(&args, limits, remaining()?);
-    let quote = crate::hosted::int4_faithfulness_document_corpus_requirements(args.group_width, budget,
-        limits.document.planning, limits.document.mapping, host, cohort_chunks)
+    let quote = crate::hosted::int4_faithfulness_document_corpus_requirements_with_max_heads(args.group_width, budget,
+        limits.document.planning, limits.document.mapping, host, planner.max_heads(), cohort_chunks)
         .map_err(|error| host_error(error, CandidateError::Planning))?;
     let expected = limits.document.memory;
     if quote.native != expected.native || quote.workspace_bytes != expected.workspace_bytes
@@ -110,6 +114,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         protocol: "fnlp-candidate-int4-faithfulness-corpus-v1", schema_version: 1,
         scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "faithfulness",
         source_mode: "complete_source", chunk_schedule: chunk_schedule(cohort_chunks), cohort_chunks,
+        max_evidence_heads: command.stream.max_evidence_heads,
         model_id: "Nanbeige4.2-3B", source_revision: &identity.source_revision,
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
@@ -158,6 +163,8 @@ struct Provenance<'a> {
     source_mode: &'static str, chunk_schedule: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     cohort_chunks: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_evidence_heads: Option<usize>,
     model_id: &'static str, source_revision: &'a str, source_root_sha256: &'a str, model_content_sha256: &'a str,
     candidate_format: &'a str, quant_recipe: &'a str, group_width: usize, integer_kernel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]

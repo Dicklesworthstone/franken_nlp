@@ -120,7 +120,7 @@ fn unsupported_generation_and_single_request_schedules_refuse() {
     for flags in [vec!["--prefill-rows", "1"], vec!["--cohort-heads", "1"],
         vec!["--max-new-tokens", "128"], vec!["--max-output-bytes", "65536"],
         vec!["--temperature-milli", "1000"], vec!["--logprobs"], vec!["--stop", "END"],
-        vec!["--focus-area", "reviews"], vec!["--prompt", "private"]] {
+        vec!["--focus-area", "reviews"], vec!["--prompt", "private"], vec!["--max-evidence-heads", "1"]] {
         let mut all = vec!["--source-dir", "d", "--source-manifest", "m"];
         all.extend(flags); assert!(parsed(&all).is_err());
     }

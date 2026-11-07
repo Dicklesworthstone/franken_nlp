@@ -76,6 +76,10 @@ impl MapArgs {
             mapping: MappingArgs::from_arg_matches(matches)? })
     }
     pub(super) fn validate(self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
+        self.validate_with_max_heads(args, 32)
+    }
+    fn validate_with_max_heads(self, args: &Int4Args, max_heads: usize) -> Result<MapLimits, CandidateError> {
+        if !(1..=32).contains(&max_heads) { return Err(CandidateError::Arguments); }
         let mut common = self.scoring.validate(args)?;
         let m = self.mapping;
         if args.max_input_bytes < 4 || !(1..=256).contains(&m.max_chunks)
@@ -92,7 +96,7 @@ impl MapArgs {
         let aggregation = FaithfulnessAggregationPolicy {
             minimum_classified_coverage_ppm: m.minimum_classified_coverage_ppm };
         aggregation.validate().map_err(|_| CandidateError::Arguments)?;
-        let budget = self.budget(common)?;
+        let budget = self.budget_with_max_heads(common, max_heads)?;
         let planning = self.scoring.judge_limits(budget);
         let chunks = ChunkLimits { max_input_bytes: args.max_input_bytes,
             max_chunk_bytes: m.max_chunk_bytes.unwrap_or(args.max_input_bytes),
@@ -109,10 +113,10 @@ impl MapArgs {
             // Source partitions may have different evidence-head counts.
             // Price every admissible <=64-head window before input IO; the
             // complete actual geometry is checked without changing its width.
-            memory_limits.cohort_requirements(args.group_width, budget, planning, mapping, 32, chunks)
+            memory_limits.cohort_requirements(args.group_width, budget, planning, mapping, max_heads, chunks)
                 .map_err(|_| CandidateError::Arguments)?.memory
         } else {
-            memory_limits.requirements(args.group_width, budget, planning, mapping)
+            memory_limits.requirements_with_max_heads(args.group_width, budget, planning, mapping, max_heads)
                 .map_err(|_| CandidateError::Arguments)?
         };
         let envelope_bytes = memory.max_output_bytes.checked_add(4096)
@@ -131,10 +135,15 @@ impl MapArgs {
         Ok(MapLimits { common, mapping, planning, memory, cli_preparation_bytes, envelope_bytes })
     }
     fn budget(self, common: Int4Limits) -> Result<TaskBudget, CandidateError> {
+        self.budget_with_max_heads(common, 32)
+    }
+    fn budget_with_max_heads(self, common: Int4Limits, max_heads: usize) -> Result<TaskBudget, CandidateError> {
+        if !(1..=32).contains(&max_heads) { return Err(CandidateError::Arguments); }
         let mut budget = self.scoring.budget(common);
-        // Full-source plus at most 31 evidence heads in one chunk. Logical
-        // task authority stays identical for serial and cohort scheduling.
-        budget.max_kv_bytes = common.native.kv_bytes.checked_mul(32).ok_or(CandidateError::Arguments)?;
+        // Complete-source populations can explicitly narrow the per-chunk
+        // authority. Its meaning stays identical for serial and cohorts.
+        budget.max_kv_bytes = common.native.kv_bytes.checked_mul(max_heads as u64)
+            .ok_or(CandidateError::Arguments)?;
         Ok(budget)
     }
     pub(super) fn execute(self, args: Int4Args, input: &mut impl Read, output: &mut impl Write)

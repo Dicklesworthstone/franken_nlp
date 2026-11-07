@@ -56,6 +56,74 @@ fn policy_is_explicit_strict_and_cannot_smuggle_a_claim_or_execution_authority()
 }
 
 #[test]
+fn explicit_head_cap_accounts_for_every_policy_window_before_model_io() {
+    assert_eq!(parse_policy_with_max_heads(POLICY, None), parse_policy(POLICY));
+    assert_eq!(parse_policy_with_max_heads(POLICY, Some(32)), parse_policy(POLICY));
+    for windows in [1, 2, 3, 31] {
+        let mut value: serde_json::Value = serde_json::from_str(POLICY).unwrap();
+        value["max_evidence_windows"] = serde_json::json!(windows);
+        // Retaining one witness must not erase the other scored windows.
+        value["max_evidence_spans"] = serde_json::json!(1);
+        let text = value.to_string();
+        let needed = if windows == 1 { 1 } else { windows + 1 };
+        for cap in 0..=33 {
+            assert_eq!(parse_policy_with_max_heads(&text, Some(cap)).is_ok(),
+                (needed..=32).contains(&cap), "windows={windows}, cap={cap}");
+        }
+    }
+}
+
+#[test]
+fn explicit_head_cap_admits_smaller_cohorts_without_renewing_any_work_counter() {
+    let (legacy, mut args) = arguments(&["--cohort-chunks", "3"]);
+    let old = legacy.validate(&args).unwrap();
+    assert_eq!(legacy.stream.max_evidence_heads, None);
+    let (explicit, _) = arguments(&["--cohort-chunks", "3", "--max-evidence-heads", "32"]);
+    let unchanged = explicit.validate(&args).unwrap();
+    assert_eq!(old.document.memory, unchanged.document.memory);
+    assert_eq!(old.common.minimum_memory_bytes, unchanged.common.minimum_memory_bytes);
+    assert_eq!(legacy.document.budget(old.common).unwrap(),
+        explicit.document.budget_with_max_heads(unchanged.common, 32).unwrap());
+
+    let (narrow, _) = arguments(&["--cohort-chunks", "3", "--max-evidence-heads", "1"]);
+    let small = narrow.validate(&args).unwrap();
+    assert_eq!(small.document.memory.native.kv_bytes, small.common.native.kv_bytes * 3);
+    assert_eq!(narrow.document.budget_with_max_heads(small.common, 1).unwrap().max_kv_bytes,
+        small.common.native.kv_bytes);
+    assert!(small.document.memory.input_bytes < old.document.memory.input_bytes);
+    assert!(small.common.minimum_memory_bytes < old.common.minimum_memory_bytes);
+    assert_eq!(small.document.mapping.max_model_work, old.document.mapping.max_model_work);
+    assert_eq!(small.transport, old.transport);
+    assert_eq!(small.document.memory.max_output_bytes, old.document.memory.max_output_bytes);
+    args.memory_mib = small.common.minimum_memory_bytes.div_ceil(MIB);
+    narrow.validate(&args).unwrap();
+    assert_eq!(legacy.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+}
+
+#[test]
+fn source_and_snapshot_share_explicit_cap_and_keep_ragged_geometry_independent() {
+    let (options, args) = arguments(&["--cohort-chunks", "3", "--max-evidence-heads", "3"]);
+    let source = options.validate(&args).unwrap();
+    let pin = "ab".repeat(32);
+    let snapshot = parsed(&["--snapshot", "private.snapshot", "--expected-model-sha256", &pin,
+        "--policy", "private-policy.json", "--cohort-chunks", "3", "--max-evidence-heads", "3"]).unwrap();
+    let Int4Task::FaithfulnessCorpus(restored) = snapshot.task else { panic!("snapshot corpus required"); };
+    let loaded = restored.validate(&snapshot.args).unwrap();
+    assert_eq!(source.document.memory, loaded.document.memory);
+    assert_eq!(options.document.budget_with_max_heads(source.common, 3).unwrap(),
+        restored.document.budget_with_max_heads(loaded.common, 3).unwrap());
+    assert_eq!(source.document.memory.native.kv_bytes, source.common.native.kv_bytes * 9);
+
+    // A theoretical 3 * 32 peak above 64 only bounds the allocation. Each
+    // actual window is still prepared in full and checked by the core.
+    let (options, args) = arguments(&["--max-result-bytes", "65536", "--cohort-chunks", "32",
+        "--max-evidence-heads", "3"]);
+    let ragged = options.validate(&args).unwrap();
+    assert_eq!(ragged.document.memory.native.kv_bytes, ragged.common.native.kv_bytes * 64);
+    assert_eq!(options.document.mapping.cohort_chunks, Some(32));
+}
+
+#[test]
 fn source_and_snapshot_modes_share_the_owned_complete_source_contract() {
     assert_eq!(command(&[]).execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
     let (options, args) = arguments(&["--cohort-chunks", "3"]);
@@ -130,7 +198,8 @@ fn invalid_transport_native_work_and_geometry_refuse_before_io() {
         vec!["--max-chunks", "2", "--cohort-chunks", "3"], vec!["--max-chunk-bytes", "3"],
         vec!["--max-tokenizer-calls", "0"], vec!["--max-map-result-bytes", "0"],
         vec!["--max-retained-result-bytes", "0"], vec!["--minimum-classified-coverage-ppm", "1000001"],
-        vec!["--timeout-seconds", "0"], vec!["--max-checkpoints", "1"], vec!["--preparation-mib", "1"]] {
+        vec!["--timeout-seconds", "0"], vec!["--max-checkpoints", "1"], vec!["--preparation-mib", "1"],
+        vec!["--max-evidence-heads", "0"], vec!["--max-evidence-heads", "33"]] {
         let (options, args) = arguments(&flags);
         assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments), "{flags:?}");
     }
