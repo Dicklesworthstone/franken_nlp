@@ -6,15 +6,16 @@ use crate::{
         BatchRequestContext, BatchWork, generation::GuardedOutput},
     execution_identity::ExecutionIdentity,
     jobs::{JobLimits, JobWork, runner::DurableBatchProcessor},
-    native_engine::{decode::DecodeStepControl,
-        strict_int4::{Int4ModelIdentity, StrictInt4Engine}},
+    native_engine::{decode::DecodeStepControl, int4::PackedInt4Kernel,
+        strict_int4::{Int4ModelIdentity, Int4ModelWeights, StrictInt4Engine}},
     tasks::{extract::ExtractionVocabulary,
         redact::{pseudonym::Pseudonyms, grouped_int4::{
             corpus::{self as document_batch, Int4DocumentRedactionBatchConfig,
                 Int4RedactionBatchAdmission, NativeInt4DocumentRedactionBatch,
                 PreparedInt4DocumentRedaction, RedactionBatchArgs},
             long::Int4LongRedactionRun}},
-        source_planning::SourceTaskPlanner},
+        source_planning::{SourceTaskPlanner,
+            grouped_int4::long::cohort::{Int4SourceMapCohortBudget, Int4SourceMapCohortRequirement}}},
 };
 use serde::Serialize;
 
@@ -46,6 +47,14 @@ pub fn check_configuration(planner: &SourceTaskPlanner, config: &Int4RedactionJo
     model: &Int4ModelIdentity, limits: JobLimits) -> Result<(), BatchFault> {
     check_job_limits(config, limits)?;
     document_batch::check_configuration(planner, &config.batch, model)
+}
+/// Explicit native schedule admission before snapshot saving, population IO
+/// or durable mutation. The original/verification stages share this full peak.
+pub fn check_cohort_configuration(planner: &SourceTaskPlanner, config: &Int4RedactionJobConfig,
+    model: &Int4ModelIdentity, limits: JobLimits, context_tokens: usize)
+    -> Result<Int4SourceMapCohortRequirement, BatchFault> {
+    check_job_limits(config, limits)?;
+    document_batch::check_cohort_configuration(planner, &config.batch, model, context_tokens)
 }
 fn check_static_limits(config: &Int4RedactionJobConfig) -> Result<(), BatchFault> {
     let d = &config.batch.detector;
@@ -107,6 +116,24 @@ impl<'p, 'e, 'w, 'v, 's, 'k, A: Int4RedactionBatchAdmission>
             engine, vocabulary, pseudonyms, admission)?;
         Ok(Self { native, identity, recipe })
     }
+    /// Bind the exact native chunk window into the private replay recipe.
+    /// Every attempt still persists the complete two-stage work allowance;
+    /// locally drained cohorts neither renew it nor create partial results.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_cohorts(planner: &'p SourceTaskPlanner, config: Int4RedactionJobConfig,
+        weights: &'w Int4ModelWeights, vocabulary: &'v ExtractionVocabulary,
+        pseudonyms: Option<&'s Pseudonyms<'k>>, budget: Int4SourceMapCohortBudget,
+        kernel: PackedInt4Kernel, admission: A) -> Result<Self, BatchFault> {
+        check_static_limits(&config)?;
+        document_batch::check_cohort_configuration(planner, &config.batch,
+            weights.identity(), budget.context_limit)?;
+        let recipe = Int4RedactionJobRecipe::new_cohorts(&config,
+            weights.group_width(), budget.context_limit, pseudonyms)?;
+        let identity = config.batch.ner_identity.clone();
+        let native = NativeInt4DocumentRedactionBatch::new_cohorts(planner, config.batch,
+            weights, vocabulary, pseudonyms, budget, kernel, admission)?;
+        Ok(Self { native, identity, recipe })
+    }
     fn check_source(&self, bytes: usize) -> Result<(), BatchItemFailure> {
         check_source(bytes, self.recipe.max_source_bytes(), self.native.is_poisoned())
     }
@@ -149,6 +176,7 @@ impl<A: Int4RedactionBatchAdmission> DurableBatchProcessor
     fn validate_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> { self.recipe.check_job_limits(limits) }
     fn durable_work(&self, prepared: &Self::Prepared) -> Result<JobWork, BatchItemFailure> {
         self.check_source(prepared.source_bytes)?;
+        self.native.check_prepared(&prepared.native)?;
         // The unknown transformed source requires the complete item envelope.
         // A new native ledger after resume cannot refund the persisted debits.
         self.recipe.check_work(self.native.planned_work(&prepared.native), self.native.is_poisoned())

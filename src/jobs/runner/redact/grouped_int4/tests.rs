@@ -332,6 +332,47 @@ fn recipe_versions_bind_the_complete_document_and_both_grounding_pools() {
         serde_json::to_value(c.batch.request.grounding_budget).unwrap());
 }
 #[test]
+fn explicit_chunk_cohorts_preserve_serial_recipe_bytes_and_complete_attempt_debits() {
+    let mut c = config(); c.batch.detector.mapping.reduction.map_batch_chunks = 3;
+    let serial = recipe(&c);
+    let grouped = Int4RedactionJobRecipe::new_cohorts(&c, WIDTH, 8192, None).unwrap();
+    let baseline = canonjson::canonical_bytes(&serial).unwrap();
+    let mut encoded = serde_json::to_value(&grouped).unwrap();
+    let schedule = encoded.as_object_mut().unwrap().remove("chunk_cohorts").unwrap();
+    assert_eq!(schedule["execution"], crate::tasks::redact::grouped_int4::long::INT4_LONG_REDACTION_COHORT_EXECUTION);
+    assert_eq!(schedule["cohort_chunks"], 3); assert_eq!(schedule["context_tokens"], 8192);
+    assert_eq!(canonjson::canonical_bytes(&encoded).unwrap(), baseline);
+    assert!(serde_json::to_value(&serial).unwrap().get("chunk_cohorts").is_none());
+    assert_eq!(grouped.check_work(batch_work(item(&c)), false).unwrap(), item(&c));
+    assert_eq!(grouped.max_result_bytes(), serial.max_result_bytes());
+    grouped.check_job_limits(limits(&c)).unwrap();
+    assert_eq!(freeze(&c, &serial).binding.compare(&freeze(&c, &grouped).binding),
+        Err(JobError::Mismatch(MismatchField::Recipe)));
+}
+#[test]
+fn explicit_native_window_width_and_context_are_immutable_replay_authority() {
+    let mut c = config(); c.batch.detector.mapping.reduction.map_batch_chunks = 3;
+    c.batch.detector.planning.max_context_tokens = 4096;
+    c.batch.detector.mapping.chunks.context_tokens = 4096;
+    let grouped = Int4RedactionJobRecipe::new_cohorts(&c, WIDTH, 4096, None).unwrap();
+    let baseline = freeze(&c, &grouped);
+    let same = Int4RedactionJobRecipe::new_cohorts(&c, WIDTH, 4096, None).unwrap();
+    assert_eq!(baseline.binding.compare(&freeze(&c, &same).binding), Ok(()));
+    let more_context = Int4RedactionJobRecipe::new_cohorts(&c, WIDTH, 4097, None).unwrap();
+    assert_eq!(baseline.binding.compare(&freeze(&c, &more_context).binding),
+        Err(JobError::Mismatch(MismatchField::Recipe)));
+    c.batch.detector.mapping.reduction.map_batch_chunks = 1;
+    let width_one = Int4RedactionJobRecipe::new_cohorts(&c, WIDTH, 4096, None).unwrap();
+    assert_eq!(baseline.binding.compare(&freeze(&c, &width_one).binding),
+        Err(JobError::Mismatch(MismatchField::Recipe)));
+    for chunks in [0, 65] {
+        c.batch.detector.mapping.reduction.map_batch_chunks = chunks;
+        assert_eq!(fault(Int4RedactionJobRecipe::new_cohorts(&c, WIDTH, 4096, None)).code, BatchCode::Admission);
+    }
+    c.batch.detector.mapping.reduction.map_batch_chunks = 3;
+    assert_eq!(fault(Int4RedactionJobRecipe::new_cohorts(&c, WIDTH, 4095, None)).code, BatchCode::Admission);
+}
+#[test]
 fn source_profile_group_and_packing_are_separate_execution_authority() {
     let c = config(); let r = recipe(&c); let baseline = freeze(&c, &r);
     for n in 0..4 {
@@ -679,4 +720,28 @@ fn cancellation_before_planning_creates_no_attempt_or_admission_guard() {
     assert!(run.step(&mut Stop(DecodeCancellationKind::User)).is_err());
     assert_eq!(run.progress().attempts, 0); assert_eq!(run.progress().reserved_work, JobWork::default());
     assert_eq!(events.plans.get(), 0); assert_eq!(events.executions.get(), 0); assert_eq!(events.releases.get(), 0);
+}
+#[test]
+fn durable_resume_authenticates_the_native_chunk_schedule_before_planning() {
+    let root = Root::new(); let input = inputs(); let events = Rc::new(Events::default());
+    let make = |grouped: bool, chunks: usize| {
+        let mut c = config(); c.batch.detector.mapping.reduction.map_batch_chunks = chunks;
+        let mut processor = Processor::new(c, None, Rc::clone(&events));
+        if grouped {
+            processor.recipe = Int4RedactionJobRecipe::new_cohorts(&processor.config, WIDTH, 8192, None).unwrap();
+        }
+        processor
+    };
+    let lim = limits(&config());
+    let run = JobRunner::create(&root.0, key(), JobId([9; 16]), lim, &input, make(true, 3), &mut Continue).unwrap();
+    assert_eq!(run.progress().attempts, 0); drop(run);
+    for (grouped, chunks) in [(false, 3), (true, 1)] {
+        assert_eq!(error(JobRunner::resume(&root.0, key(), JobId([9; 16]), lim, &input,
+            make(grouped, chunks), TailPolicy::DiscardUncommitted, &mut Continue)),
+            JobRunError::Storage(JobError::Mismatch(MismatchField::Recipe)));
+    }
+    let resumed = JobRunner::resume(&root.0, key(), JobId([9; 16]), lim, &input,
+        make(true, 3), TailPolicy::Refuse, &mut Continue).unwrap();
+    assert_eq!(resumed.progress().attempts, 0); assert_eq!(resumed.progress().reserved_work, JobWork::default());
+    assert_eq!(events.plans.get(), 0); assert_eq!(events.executions.get(), 0);
 }

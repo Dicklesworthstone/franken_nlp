@@ -9,7 +9,8 @@ use crate::{
             grouped_int4::long::{Int4SourceMapLimits, INT4_SOURCE_MAP_EXECUTION}},
         redact::{RedactionRequest, actions::ACTION_POLICY_VERSION, detectors::RULE_PROFILE,
             union::OVERLAP_POLICY, pseudonym::{PseudonymEncoding, PseudonymIdentity},
-            grouped_int4::long::{Int4LongRedactionConfig, INT4_LONG_REDACTION_EXECUTION}}},
+            grouped_int4::long::{Int4LongRedactionConfig, INT4_LONG_REDACTION_EXECUTION,
+                INT4_LONG_REDACTION_COHORT_EXECUTION}}},
     validation::grounded_fields::GroundingBudget,
 };
 const INPUT_POLICY: &str = "fixed-redaction-policy-original-utf8-full256-v1";
@@ -37,6 +38,13 @@ pub struct Int4RedactionJobRecipe {
     pseudonyms: Option<PseudonymIdentity>,
     item_work: JobWork,
     max_result_bytes: u64,
+    /// Omission preserves the exact existing serial replay commitment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chunk_cohorts: Option<ChunkCohortRecipe>,
+}
+#[derive(Serialize)]
+struct ChunkCohortRecipe {
+    execution: &'static str, cohort_chunks: usize, context_tokens: usize,
 }
 #[derive(Serialize)]
 struct DetectorRecipe {
@@ -113,7 +121,19 @@ impl Int4RedactionJobRecipe {
             request: request.clone(), max_model_work: *max_model_work, max_mask_visits: *max_mask_visits,
             pseudonyms: context.map(|p| p.identity().clone()),
             item_work: JobWork::from_int4(batch.item_model_work(), mapping.max_mask_visits),
-            max_result_bytes: *max_result_bytes };
+            max_result_bytes: *max_result_bytes, chunk_cohorts: None };
+        bounded(&recipe)?;
+        Ok(recipe)
+    }
+    pub(super) fn new_cohorts(config: &Int4RedactionJobConfig, group_width: usize,
+        context_tokens: usize, context: Option<&Pseudonyms<'_>>) -> Result<Self, BatchFault> {
+        config.batch.detector.cohort_requirements(context_tokens, group_width)
+            .map_err(|_| BatchCode::Admission)?;
+        let mut recipe = Self::new(config, group_width, context)?;
+        recipe.chunk_cohorts = Some(ChunkCohortRecipe {
+            execution: INT4_LONG_REDACTION_COHORT_EXECUTION,
+            cohort_chunks: config.batch.detector.mapping.reduction.map_batch_chunks, context_tokens,
+        });
         bounded(&recipe)?;
         Ok(recipe)
     }

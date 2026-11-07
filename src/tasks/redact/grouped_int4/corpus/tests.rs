@@ -480,3 +480,111 @@ fn residual_reports_never_reach_corpus_error_output() {
     let text = String::from_utf8(canonjson::canonical_bytes(&error.fault).unwrap()).unwrap();
     for field in ["residuals", "rules", "model_types", "text", "pseudonym"] { assert!(!text.contains(field)); }
 }
+
+fn cohort_budget(c: &Int4DocumentRedactionBatchConfig) -> Int4SourceMapCohortBudget {
+    let context_limit = c.detector.planning.max_context_tokens;
+    let required = c.detector.cohort_requirements(context_limit, WIDTH).unwrap();
+    Int4SourceMapCohortBudget { context_limit,
+        native_memory: crate::native_engine::strict_int4::Int4MemoryBudget {
+            max_kv_bytes: required.native.kv_bytes, max_rope_bytes: required.native.rope_bytes,
+            max_scratch_payload_bytes: required.native.scratch_payload_bound },
+        max_workspace_bytes: required.workspace_bytes, max_result_bytes: required.max_result_bytes }
+}
+#[test]
+fn declared_cohort_peak_preserves_each_row_and_both_stage_work_allowances() {
+    let serial = config(); let item = serial.item_model_work();
+    for chunks in [1, 3, 8] {
+        let mut c = config(); c.detector.mapping.reduction.map_batch_chunks = chunks;
+        let budget = cohort_budget(&c);
+        let required = backend::cohort_budget(&c, WIDTH, budget).unwrap();
+        let row = crate::native_engine::strict_int4::Int4MemoryRequirement::for_context(budget.context_limit, WIDTH).unwrap();
+        assert_eq!(required.native.kv_bytes, row.kv_bytes * chunks as u64);
+        assert!(row.kv_bytes <= c.detector.per_chunk.max_kv_bytes);
+        assert_eq!(c.item_model_work(), item);
+        assert_eq!(c.detector.mapping.max_mask_visits, serial.detector.mapping.max_mask_visits);
+        // Original and transformed stages share one complete allowance. A
+        // short original document or a flush cannot renew any of its axes.
+        let mut ledger = Ledger::default();
+        ledger.begin(&c, context(1, 1)).unwrap(); ledger.finish(&Ok::<(), BatchItemFailure>(()));
+        ledger.begin(&c, context(4, 2)).unwrap();
+        assert_eq!(ledger.reserved, item.checked_add(item).unwrap());
+        assert_eq!(ledger.masks, 2 * c.detector.mapping.max_mask_visits);
+    }
+}
+#[test]
+fn cohort_admission_refuses_every_underpriced_axis_and_widened_row_authority() {
+    let mut c = config(); c.detector.mapping.reduction.map_batch_chunks = 3;
+    let exact = cohort_budget(&c);
+    for axis in 0..7 {
+        let mut short = exact;
+        match axis {
+            0 => short.native_memory.max_kv_bytes -= 1,
+            1 => short.native_memory.max_rope_bytes -= 1,
+            2 => short.native_memory.max_scratch_payload_bytes -= 1,
+            3 => short.max_workspace_bytes -= 1,
+            4 => short.max_result_bytes -= 1,
+            5 => short.context_limit -= 1,
+            _ => short.max_result_bytes = crate::batch::extract::grouped_int4::memory::MAX_COHORT_RESULT_BYTES + 1,
+        }
+        let refused = backend::cohort_budget(&c, WIDTH, short).unwrap_err();
+        assert!(refused.stop); assert_eq!(refused.fault.code, BatchCode::Admission);
+    }
+    c.detector.per_chunk.max_kv_bytes =
+        crate::native_engine::strict_int4::Int4MemoryRequirement::for_context(exact.context_limit, WIDTH).unwrap().kv_bytes - 1;
+    assert!(backend::cohort_budget(&c, WIDTH, exact).is_err());
+    for chunks in [0, 65] {
+        let mut c = config(); c.detector.mapping.reduction.map_batch_chunks = chunks;
+        assert!(backend::cohort_budget(&c, WIDTH, exact).is_err());
+    }
+    let mut c = config(); c.detector.mapping.chunks.max_chunks = 2;
+    c.detector.mapping.reduction.map_batch_chunks = 3;
+    assert!(backend::cohort_budget(&c, WIDTH, exact).is_err());
+}
+#[test]
+fn prepared_documents_are_sealed_to_the_exact_policy_key_and_schedule_owner() {
+    let owner = Arc::new(()); let other = Arc::new(());
+    let prepared = PreparedInt4DocumentRedaction { source: "alpha beta".to_owned(),
+        preflight: receipt(&config(), None).original.preflight, owner: Arc::clone(&owner) };
+    check_owner(&owner, &prepared).unwrap();
+    let refused = check_owner(&other, &prepared).unwrap_err();
+    assert_eq!(refused.fault.code, BatchCode::Admission); assert!(refused.stop);
+}
+fn cohort_receipt(c: &Int4DocumentRedactionBatchConfig)
+    -> crate::tasks::redact::grouped_int4::long::Int4LongRedactionCohortRun {
+    use crate::tasks::{redact::grouped_int4::long::{Int4LongRedactionCohortRun,
+        INT4_LONG_REDACTION_COHORT_EXECUTION}, source_planning::grouped_int4::long::cohort::Int4SourceMapCohortStats};
+    let output = receipt(c, None); let width = c.detector.mapping.reduction.map_batch_chunks;
+    let stats = |stage: &Int4LongRedactionStage| {
+        let rows = stage.preflight.chunks.min(width) as u64;
+        Int4SourceMapCohortStats { cohorts: (stage.preflight.chunks as u64).div_ceil(width as u64),
+            chunks: stage.preflight.chunks as u64, group_steps: stage.model_work.forward_positions.div_ceil(rows),
+            projection_groups: (stage.model_work.projected_logits / NANBEIGE_VOCAB_SIZE as u64).div_ceil(rows),
+            planned_work: stage.preflight.planned_model_work, model_work: stage.model_work }
+    };
+    Int4LongRedactionCohortRun { schema_version: 1, execution: INT4_LONG_REDACTION_COHORT_EXECUTION,
+        cohort_chunks: width, original_cohorts: stats(&output.original),
+        verification_cohorts: output.verification.as_ref().map(stats), output }
+}
+#[test]
+fn physical_receipts_are_validated_before_preserving_the_exact_semantic_wire() {
+    for verify in [false, true] {
+        for chunks in [1, 2, 3] {
+            let mut c = config(); c.request.verify = verify; c.detector.mapping.reduction.map_batch_chunks = chunks;
+            let run = cohort_receipt(&c); let original = run.output.original.preflight;
+            let expected = canonjson::canonical_bytes(&run.output).unwrap();
+            let semantic = backend::completed(run, chunks).unwrap();
+            validate_result(&semantic, original, &c, WIDTH, None).unwrap();
+            assert_eq!(canonjson::canonical_bytes(&semantic).unwrap(), expected);
+        }
+    }
+    let mut c = config(); c.detector.mapping.reduction.map_batch_chunks = 3;
+    for axis in 0..7 {
+        let mut run = cohort_receipt(&c);
+        match axis { 0 => run.cohort_chunks = 2, 1 => run.execution = "serial",
+            2 => run.original_cohorts.chunks += 1, 3 => run.original_cohorts.cohorts += 1,
+            4 => run.original_cohorts.model_work.forward_positions += 1,
+            5 => run.verification_cohorts = None,
+            _ => run.verification_cohorts.as_mut().unwrap().projection_groups = 0 }
+        assert!(backend::completed(run, 3).is_err());
+    }
+}
