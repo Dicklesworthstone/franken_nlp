@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     hosted::corpus::jobs::{HostedJobError, JobHostLimits, SourceJobRequest, read_population, run_population},
-    jobs::{JobLimits, JobProgress,
+    jobs::{JobInputMemory, JobLimits, JobProgress,
         runner::{JobRunError, source::grouped_int4::question_document::{
             Int4QuestionDocumentJobPlanner, Int4QuestionDocumentJobProcessor,
             memory::{Int4QuestionDocumentJobMemoryLimits, Int4QuestionDocumentJobMemoryRequirement}}}},
@@ -18,9 +18,10 @@ struct QuestionJobInput<R> {
 #[allow(clippy::too_many_arguments)]
 pub fn int4_question_document_job_requirements(width: usize,
     config: Int4QuestionDocumentBatchConfig, job: JobLimits, host: JobHostLimits,
-    reduction_reserve_bytes: u64, cohort_chunks: Option<usize>, hierarchy_groups: Option<usize>)
+    reduction_reserve_bytes: u64, cohort_chunks: Option<usize>, hierarchy_groups: Option<usize>,
+    input: JobInputMemory)
     -> Result<Int4QuestionDocumentJobMemoryRequirement, HostedJobError> {
-    let population = host.required_buffer_bytes(job)?;
+    let population = host.required_buffer_bytes_for_input(job, input)?;
     let required = Int4QuestionDocumentJobMemoryLimits {
         document: Int4QuestionDocumentMemoryLimits { context_tokens: host.native.context_tokens,
             allocator_reserve_bytes: host.native.allocator_reserve_bytes,
@@ -29,7 +30,7 @@ pub fn int4_question_document_job_requirements(width: usize,
             cohort_chunks, hierarchy_groups },
         transport: host.transport, journal_reserve_bytes: host.journal_reserve_bytes,
         serialization_reserve_bytes: host.serialization_reserve_bytes,
-    }.requirements(width, config, job).map_err(HostedError::BatchSetup)?;
+    }.requirements(width, config, job, input).map_err(HostedError::BatchSetup)?;
     if required.population_buffer_bytes != population {
         return Err(HostedError::Limits("question document job population quotation").into());
     }
@@ -70,7 +71,7 @@ impl NlpEngine {
         let chunks = planner.uses_chunk_cohorts().then_some(config.mapping.reduction.map_batch_chunks);
         let groups = planner.hierarchy_cohort_schedule().map(|schedule| schedule.max_groups);
         let quote = int4_question_document_job_requirements(planner.group_width(), config,
-            request.limits, host, reduction_reserve_bytes, chunks, groups)?;
+            request.limits, host, reduction_reserve_bytes, chunks, groups, request.mode.input_memory())?;
         let required = quote.document;
         if planner.max_result_bytes() != required.max_output_bytes
             || planner.max_output_tokens() != required.max_output_tokens {

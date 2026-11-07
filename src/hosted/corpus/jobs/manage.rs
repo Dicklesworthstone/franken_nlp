@@ -34,15 +34,10 @@ impl JobManagementLimits {
         if self.journal_reserve_bytes == 0 || self.serialization_reserve_bytes == 0 || self.io_reserve_bytes == 0 {
             return Err(HostedError::Limits("explicit stored-job memory reservations required").into());
         }
-        let index = job.max_items.checked_mul(1024).ok_or(HostedError::Limits("stored-job index arithmetic"))?;
-        let frames = (job.max_result_bytes as u64).checked_mul(4)
-            .ok_or(HostedError::Limits("stored-job frame arithmetic"))?;
         // Retained-input authentication streams one bounded envelope at a
-        // time. Price its bytes, decoded ID and parser/allocator scratch;
+        // time. Share the record, strict parser, keyed index and frame floor;
         // management never reconstructs the entire in-memory population.
-        let input_frame = (job.max_input_bytes_per_item as u64).checked_mul(8)
-            .ok_or(HostedError::Limits("stored-job input frame arithmetic"))?;
-        Ok(sum(&[index, frames, input_frame, 2 * 1024 * 1024, self.journal_reserve_bytes,
+        Ok(sum(&[JobInputMemory::RetainedRecord.buffer_bytes(job)?, self.journal_reserve_bytes,
             self.serialization_reserve_bytes, self.io_reserve_bytes])?)
     }
 }

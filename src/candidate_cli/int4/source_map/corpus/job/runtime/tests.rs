@@ -14,9 +14,11 @@ fn host_and_cli_quote_the_same_complete_population_before_any_model_io() {
     let host = host_limits(&args, limits, Duration::from_secs(60));
     let quote = crate::hosted::int4_question_document_job_requirements(args.group_width,
         limits.config, job, host, limits.reduction_reserve_bytes,
-        command.args.questions.cohort_chunks, command.args.questions.cohort_hierarchy_groups).unwrap();
+        command.args.questions.cohort_chunks, command.args.questions.cohort_hierarchy_groups,
+        command.args.storage.input_retention.input_memory().unwrap()).unwrap();
     assert_eq!(quote, limits.memory);
-    assert_eq!(host.required_buffer_bytes(job).unwrap(), quote.population_buffer_bytes);
+    assert_eq!(host.required_buffer_bytes_for_input(job,
+        command.args.storage.input_retention.input_memory().unwrap()).unwrap(), quote.population_buffer_bytes);
     assert_eq!(limits.cli_preparation_bytes,
         limits.common.preparation_bytes + 2 * IO_BUFFER_BYTES as u64 + job_cli::REPORT_BYTES as u64);
 }

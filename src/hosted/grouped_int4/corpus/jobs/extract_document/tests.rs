@@ -83,7 +83,7 @@ fn request(ids: &[ExecutionIdentity], document: Int4ExtractionMapLimits, kv: u64
 fn whole_population_two_schema_owners_and_maximum_frontier_are_admitted_together() {
     let (budget, document, job, host) = fixture();
     let frontier = document_workspace_bytes(budget, document, 4, 65536).unwrap();
-    let need = requirements(WIDTH, budget, document, 65536, job, host, frontier, 8192).unwrap();
+    let need = requirements(WIDTH, budget, document, 65536, job, host, frontier, 8192, JobInputMemory::CompletePopulation).unwrap();
     assert_eq!(need.input_bytes, host.required_buffer_bytes(job).unwrap() + 2 * 8192);
     assert_eq!(need.document_workspace_bytes, frontier);
     assert_eq!(need.native.kv_bytes, budget.max_kv_bytes);
@@ -98,10 +98,10 @@ fn exact_resident_context_kv_and_nonzero_schema_are_required_before_input() {
         match axis { 0 => budget.max_kv_bytes -= 1, 1 => budget.max_kv_bytes += 1,
             2 => document.mapping.chunks.context_tokens -= 1, 3 => host.native.context_tokens += 1,
             _ => host.native.allocator_reserve_bytes = 0 }
-        assert!(requirements(WIDTH, budget, document, 65536, job, host, 65536, 128).is_err(), "axis {axis}");
+        assert!(requirements(WIDTH, budget, document, 65536, job, host, 65536, 128, JobInputMemory::CompletePopulation).is_err(), "axis {axis}");
     }
     let (budget, document, job, host) = fixture();
-    assert!(requirements(WIDTH, budget, document, 65536, job, host, 65536, 0).is_err());
+    assert!(requirements(WIDTH, budget, document, 65536, job, host, 65536, 0, JobInputMemory::CompletePopulation).is_err());
 }
 
 #[test]
@@ -109,7 +109,7 @@ fn cohort_reservation_keeps_both_schema_owners_and_the_complete_document_frontie
     use crate::batch::extract::grouped_int4::long::cohort::Int4ExtractionMapCohortMemoryLimits;
     let (budget, document, job, host) = fixture();
     let frontier = document_workspace_bytes(budget, document, 4, 65536).unwrap();
-    let serial = requirements(WIDTH, budget, document, 65536, job, host, frontier, 8192).unwrap();
+    let serial = requirements(WIDTH, budget, document, 65536, job, host, frontier, 8192, JobInputMemory::CompletePopulation).unwrap();
     for chunks in [1, 2, 4] {
         let quote = Int4ExtractionMapCohortMemoryLimits { max_chunks: chunks, context_tokens: 64,
             max_output_tokens_per_chunk: 16, max_result_bytes_per_chunk: 4096 }.requirements(WIDTH).unwrap();
@@ -130,7 +130,7 @@ fn cohort_reservation_keeps_both_schema_owners_and_the_complete_document_frontie
 fn incomplete_native_or_decoder_declarations_refuse_before_job_execution() {
     use crate::batch::extract::grouped_int4::long::cohort::Int4ExtractionMapCohortMemoryLimits;
     let (budget, document, job, host) = fixture();
-    let serial = requirements(WIDTH, budget, document, 65536, job, host, 65536, 8192).unwrap();
+    let serial = requirements(WIDTH, budget, document, 65536, job, host, 65536, 8192, JobInputMemory::CompletePopulation).unwrap();
     let quote = Int4ExtractionMapCohortMemoryLimits { max_chunks: 4, context_tokens: 64,
         max_output_tokens_per_chunk: 16, max_result_bytes_per_chunk: 4096 }.requirements(WIDTH).unwrap();
     for axis in 0..5 {
@@ -167,7 +167,7 @@ fn every_document_work_axis_and_masks_fit_the_persisted_lifetime_budget() {
             3 => job.max_work.model.projections.dot_products -= 1,
             4 => job.max_work.model.projections.multiply_accumulates -= 1,
             _ => job.max_work.mask_node_visits -= 1 }
-        assert!(requirements(WIDTH, budget, document, 65536, job, host, 65536, 128).is_err(), "axis {axis}");
+        assert!(requirements(WIDTH, budget, document, 65536, job, host, 65536, 128, JobInputMemory::CompletePopulation).is_err(), "axis {axis}");
     }
 }
 
@@ -233,10 +233,10 @@ fn shared_workspace_quote_prices_all_native_values_and_both_evidence_coordinate_
 #[test]
 fn zero_reserves_overflow_and_small_stored_result_caps_refuse_before_execution() {
     let (budget, document, job, host) = fixture();
-    assert!(requirements(WIDTH, budget, document, 65536, job, host, 0, 128).is_err());
-    assert!(requirements(WIDTH, budget, document, 65536, job, host, 65536, usize::MAX).is_err());
+    assert!(requirements(WIDTH, budget, document, 65536, job, host, 0, 128, JobInputMemory::CompletePopulation).is_err());
+    assert!(requirements(WIDTH, budget, document, 65536, job, host, 65536, usize::MAX, JobInputMemory::CompletePopulation).is_err());
     assert!(requirements(WIDTH, budget, document, job.max_result_bytes as u64 + 1,
-        job, host, 65536, 128).is_err());
+        job, host, 65536, 128, JobInputMemory::CompletePopulation).is_err());
     for chunks in [0, 5, 257, usize::MAX] {
         assert!(document_workspace_bytes(budget, document, chunks, 65536).is_err());
     }
@@ -244,7 +244,7 @@ fn zero_reserves_overflow_and_small_stored_result_caps_refuse_before_execution()
         let mut host = host;
         match axis { 0 => host.preparation_reserve_bytes = 0, 1 => host.io_reserve_bytes = 0,
             2 => host.journal_reserve_bytes = 0, _ => host.serialization_reserve_bytes = 0 }
-        assert!(requirements(WIDTH, budget, document, 65536, job, host, 65536, 128).is_err(), "axis {axis}");
+        assert!(requirements(WIDTH, budget, document, 65536, job, host, 65536, 128, JobInputMemory::CompletePopulation).is_err(), "axis {axis}");
     }
 }
 

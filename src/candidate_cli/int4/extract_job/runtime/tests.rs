@@ -67,10 +67,13 @@ fn cli_memory_quote_agrees_with_the_host_and_cannot_replace_host_validation() {
     let job = lifetime(&command.args, &args, common);
     let limits = command.args.lifetime_limits(&args, common, job).unwrap();
     let host = host_limits(&args, limits, Duration::from_secs(30));
-    check_host_quote(host, job, limits.buffer_bytes).unwrap();
-    assert_eq!(check_host_quote(host, job, limits.buffer_bytes - 1).unwrap_err().code, "job_host_memory_quote");
+    check_host_quote(host, job, limits.buffer_bytes, JobInputMemory::CompletePopulation).unwrap();
+    check_host_quote(host, job, limits.buffer_bytes - 2 * job.max_snapshot_bytes, JobInputMemory::RetainedRecord).unwrap();
+    assert_eq!(check_host_quote(host, job, limits.buffer_bytes - 1, JobInputMemory::CompletePopulation)
+        .unwrap_err().code, "job_host_memory_quote");
     let mut invalid = host; invalid.journal_reserve_bytes = 0;
-    assert_eq!(check_host_quote(invalid, job, limits.buffer_bytes).unwrap_err().code, "job_host_admission");
+    assert_eq!(check_host_quote(invalid, job, limits.buffer_bytes, JobInputMemory::CompletePopulation)
+        .unwrap_err().code, "job_host_admission");
     assert_eq!(host.native.context_tokens, args.context_tokens);
     assert_eq!(host.native.run.max_checkpoints, args.max_checkpoints);
     assert_eq!(host.native.run.max_elapsed, Duration::from_secs(30));

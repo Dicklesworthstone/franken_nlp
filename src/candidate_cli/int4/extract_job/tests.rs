@@ -95,6 +95,26 @@ fn retained_input_modes_keep_explicit_model_and_storage_admission() {
 }
 
 #[test]
+fn retained_resume_quotes_one_envelope_without_widening_native_or_mask_work() {
+    let (start, args) = command("start", &["--spool-input", "--max-retained-input-mib", "8"]);
+    let common = start.args.validate(&args).unwrap();
+    let job = lifetime(&start.args, &args, common);
+    let full = start.args.lifetime_limits(&args, common, job).unwrap();
+    let (resume, resumed_args) = command("resume", &["--use-retained-input", "--max-retained-input-mib", "8"]);
+    let declared = resume.args.validate(&resumed_args).unwrap();
+    let replay = resume.args.lifetime_limits(&resumed_args, declared, job).unwrap();
+    assert_eq!(replay.buffer_bytes + 2 * job.max_snapshot_bytes, full.buffer_bytes);
+    assert_eq!(replay.common.minimum_memory_bytes + 2 * job.max_snapshot_bytes, full.common.minimum_memory_bytes);
+    assert_eq!(replay.native.max_model_work, full.native.max_model_work);
+    assert_eq!(replay.native.masks.max_visits_per_run, full.native.masks.max_visits_per_run);
+    assert_eq!(replay.common.native, full.common.native);
+    let mut large = job; large.max_snapshot_bytes = common.memory_bytes;
+    assert_eq!(start.args.lifetime_limits(&args, common, large).unwrap_err().code, "job_population_memory");
+    let bounded = resume.args.lifetime_limits(&resumed_args, declared, large).unwrap();
+    assert_eq!(bounded.buffer_bytes, replay.buffer_bytes);
+}
+
+#[test]
 fn missing_storage_consent_and_nonlocal_storage_paths_refuse_before_io() {
     for case in 0..4 {
         let (mut c, args) = command("start", &[]);

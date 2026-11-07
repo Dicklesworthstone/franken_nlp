@@ -10,7 +10,7 @@ mod generation;
 mod source_document;
 pub use manage::{JobManagementLimits, StoredJobOperation, StoredJobRequest};
 use crate::{
-    jobs::{InputRetentionLimits, JobError, JobId, JobLimits, JobProgress, JobSecret, TailPolicy,
+    jobs::{InputRetentionLimits, JobError, JobId, JobInputMemory, JobLimits, JobProgress, JobSecret, TailPolicy,
         population::{JobPopulation, PopulationReadLimits},
         runner::{DurableBatchProcessor, JobRunError, JobRunner, source::Int8SourceJobProcessor}},
     batch::source::quantized as source_batch,
@@ -29,6 +29,17 @@ pub enum JobOpenMode {
     /// Resume from an authenticated retained population without reading the
     /// supplied reader. The current read ceiling may tighten the original cap.
     ResumeRetained { tail: TailPolicy, retention: InputRetentionLimits },
+}
+impl JobOpenMode {
+    /// Payload ownership implied by the actual job source. This changes only
+    /// the memory quote, never the stored contract or lifetime work limits.
+    pub fn input_memory(self) -> JobInputMemory {
+        match self {
+            Self::ResumeRetained { .. } => JobInputMemory::RetainedRecord,
+            Self::Create | Self::Resume(_) | Self::CreateRetainingInputs(_) =>
+                JobInputMemory::CompletePopulation,
+        }
+    }
 }
 
 /// Explicit owner-only result-retention request. Input retention additionally
@@ -66,26 +77,27 @@ pub struct JobHostLimits {
     pub serialization_reserve_bytes: u64,
 }
 impl JobHostLimits {
-    /// Checked job-buffer commitment used by this host, excluding native KV,
+    /// Checked complete-population commitment, excluding native KV,
     /// workspace and per-result claims. Entrypoints may reject impossible
     /// admission before loading weights; this neither reserves nor grants RAM.
     pub fn required_buffer_bytes(self, job: JobLimits) -> Result<u64, HostedJobError> {
         self.reservation_bytes(job)
     }
     fn reservation_bytes(self, job: JobLimits) -> Result<u64, HostedJobError> {
+        self.required_buffer_bytes_for_input(job, JobInputMemory::CompletePopulation)
+    }
+    /// Price the actual input owner. Retained replay keeps the keyed manifest
+    /// index and one reusable record; original input ingestion keeps the full
+    /// population. Native entrypoints derive this from `request.mode`.
+    pub fn required_buffer_bytes_for_input(self, job: JobLimits, input: JobInputMemory)
+        -> Result<u64, HostedJobError> {
         self.native.run.validate()?; self.transport.validate()?; job.validate()?;
         if self.preparation_reserve_bytes == 0 || self.io_reserve_bytes == 0
             || self.journal_reserve_bytes == 0 || self.serialization_reserve_bytes == 0 {
             return Err(HostedError::Limits("explicit job preparation/IO/journal/serialization reservations required").into());
         }
-        let scaled = |n: u64, factor: u64| n.checked_mul(factor)
-            .ok_or(HostedError::Limits("job staging arithmetic"));
         Ok(sum(&[
-            // Input storage/capacity plus complete manifest, transient keyed
-            // ID trees and borrow-only runner index. Not an epoch-sized window.
-            scaled(job.max_snapshot_bytes, 2)?, scaled(job.max_items, 1024)?,
-            scaled(job.max_input_bytes_per_item as u64, 8)?,
-            scaled(job.max_result_bytes as u64, 4)?, 2 * 1024 * 1024,
+            input.buffer_bytes(job)?,
             self.preparation_reserve_bytes, self.io_reserve_bytes,
             self.journal_reserve_bytes, self.serialization_reserve_bytes,
         ])?)
@@ -133,7 +145,7 @@ impl NlpEngine {
     where R: BufRead + Send + 'static {
         dispatch::preflight(self, limits.native.run)?;
         self.check_resident_domain(model)?;
-        let bytes = limits.reservation_bytes(request.limits)?;
+        let bytes = limits.required_buffer_bytes_for_input(request.limits, request.mode.input_memory())?;
         let required = requirements(limits.native)?;
         check_model_identity(model.artifact_identity(), &config.identity)?;
         source_batch::check_configuration(&planner, &config.identity, config.task_ceiling,

@@ -36,7 +36,8 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
     let limits = job.lifetime_limits(&args, map, lifetime)?;
     let map = limits.map; let common = map.common;
     let host = host_limits(&args, limits, remaining()?);
-    if host.required_buffer_bytes(lifetime).map_err(host_failure)? != limits.buffer_bytes {
+    if host.required_buffer_bytes_for_input(lifetime, job.storage.input_retention.input_memory()?)
+        .map_err(host_failure)? != limits.buffer_bytes {
         return Err(Failure::usage("sentiment_document_job_host_quote"));
     }
     let budget = job.map.budget_with_max_axes(common, job.sentiment.max_axes.unwrap_or(4))?;

@@ -3,7 +3,7 @@
 use super::*;
 use crate::{
     hosted::corpus::jobs::{read_population, run_population, HostedJobError, JobHostLimits, SourceJobRequest},
-    jobs::{JobLimits, JobProgress, runner::{JobRunError,
+    jobs::{JobInputMemory, JobLimits, JobProgress, runner::{JobRunError,
         redact::grouped_int4::{self as redact_job, Int4RedactionJobConfig,
             Int4RedactionJobProcessor, INT4_REDACTION_JOB_RECIPE_BYTES}}},
 };
@@ -73,9 +73,11 @@ impl NlpEngine {
         }
         let width = model.model_identity().group_width();
         let required = if cohorts {
-            job_requirements_for_schedule(&config, request.limits, limits, width, pseudonyms.as_ref(), true)?
+            job_requirements_for_schedule(&config, request.limits, limits, width, pseudonyms.as_ref(),
+                true, request.mode.input_memory())?
         } else {
-            job_requirements(&config, request.limits, limits, width, pseudonyms.as_ref())?
+            job_requirements(&config, request.limits, limits, width, pseudonyms.as_ref(),
+                request.mode.input_memory())?
         };
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
@@ -157,12 +159,14 @@ struct JobRequirements {
     cohort: Option<Int4SourceMapCohortRequirement>,
 }
 fn job_requirements(config: &RedactionCorpusConfig<Int4RedactionJobConfig>,
-    job: JobLimits, limits: JobHostLimits, width: usize, secret: Option<&RedactionPseudonyms>)
+    job: JobLimits, limits: JobHostLimits, width: usize, secret: Option<&RedactionPseudonyms>,
+    input: JobInputMemory)
     -> Result<JobRequirements, HostedJobError> {
-    job_requirements_for_schedule(config, job, limits, width, secret, false)
+    job_requirements_for_schedule(config, job, limits, width, secret, false, input)
 }
 fn job_requirements_for_schedule(config: &RedactionCorpusConfig<Int4RedactionJobConfig>,
-    job: JobLimits, limits: JobHostLimits, width: usize, secret: Option<&RedactionPseudonyms>, cohorts: bool)
+    job: JobLimits, limits: JobHostLimits, width: usize, secret: Option<&RedactionPseudonyms>,
+    cohorts: bool, input: JobInputMemory)
     -> Result<JobRequirements, HostedJobError> {
     redact_job::check_job_limits(&config.batch, job).map_err(HostedError::BatchSetup)?;
     let detector = &config.batch.batch.detector;
@@ -180,7 +184,7 @@ fn job_requirements_for_schedule(config: &RedactionCorpusConfig<Int4RedactionJob
     // Population, journal and canonical serializer storage already include the
     // retained-result cap. The independent output guard prices the actual
     // detector envelope, which may be smaller than that stored-frame ceiling.
-    let input_bytes = sum(&[limits.required_buffer_bytes(job)?,
+    let input_bytes = sum(&[limits.required_buffer_bytes_for_input(job, input)?,
         long::document_workspace_bytes(detector, config.edit_reserve_bytes)?,
         secret_bytes(secret)?, 4 * INT4_REDACTION_JOB_RECIPE_BYTES as u64,
         cohort_temporary_bytes(cohort)?])?;

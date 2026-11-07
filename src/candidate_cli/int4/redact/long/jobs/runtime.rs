@@ -1,5 +1,6 @@
 //! Authenticate one complete population before repair or durable native execution.
 use super::*;
+use crate::jobs::JobInputMemory;
 use std::{sync::Arc, time::{Duration, Instant}};
 use crate::{
     NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
@@ -17,6 +18,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     job: JobArgs, _admitted: DocumentLimits, mut input: R, output: &mut impl Write) -> Result<(), Failure> {
     let started = Instant::now();
     job.storage.input_retention.validate(mode, &args.input)?;
+    let input_memory = job.storage.input_retention.input_memory()?;
     let admitted = job.validate(&args)?;
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
@@ -34,7 +36,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     let lifetime = job_cli::parse_limits(&read_config(&job.storage.limits_file, job_cli::LIMIT_BYTES, &remaining)?)?;
     let limits = job.lifetime_limits(&args, admitted, lifetime)?;
     let common = limits.common;
-    check_host_quote(host_limits(&args, limits, remaining()?), lifetime, limits.buffer_bytes)?;
+    check_host_quote(host_limits(&args, limits, remaining()?), lifetime, limits.buffer_bytes, input_memory)?;
     // Protected job-authentication key is separate from the caller's binary
     // pseudonym key. Neither is generated, reused as sampling entropy or printed.
     let key = JobSecret::read(&job.storage.key_file).map_err(job_failure)?;
@@ -136,8 +138,8 @@ fn host_limits(args: &Int4Args, limits: JobExecutionLimits, remaining: Duration)
         serialization_reserve_bytes: limits.serialization_reserve_bytes,
     }
 }
-fn check_host_quote(host: JobHostLimits, job: JobLimits, expected: u64) -> Result<(), Failure> {
-    if host.required_buffer_bytes(job).map_err(execution_failure)? != expected
+fn check_host_quote(host: JobHostLimits, job: JobLimits, expected: u64, input: JobInputMemory) -> Result<(), Failure> {
+    if host.required_buffer_bytes_for_input(job, input).map_err(execution_failure)? != expected
         || (INT4_REDACTION_JOB_RECIPE_BYTES as u64).checked_mul(4) != Some(RECIPE_RESERVE_BYTES) {
         return Err(Failure::usage("job_host_memory_quote"));
     }

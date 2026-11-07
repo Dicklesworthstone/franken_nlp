@@ -55,7 +55,7 @@ impl NlpEngine {
             result_bytes: planner.max_result_bytes(), output_tokens: planner.output_token_ceiling(),
         };
         let required = requirements(planner.group_width(), planner.task_budget(), envelope,
-            request.limits, limits)?;
+            request.limits, limits, request.mode.input_memory())?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(GenerationInput { preparation: Some((planner, request)), reader }))?;
@@ -103,9 +103,9 @@ impl NlpEngine {
 }
 
 fn requirements(width: usize, task: TaskBudget, envelope: GenerationEnvelope,
-    job: JobLimits, limits: JobHostLimits) -> Result<Requirements, HostedJobError> {
+    job: JobLimits, limits: JobHostLimits, input: JobInputMemory) -> Result<Requirements, HostedJobError> {
     task.validate().map_err(|_| HostedError::Limits("INT4 generation job task budget"))?;
-    let input_bytes = limits.required_buffer_bytes(job)?;
+    let input_bytes = limits.required_buffer_bytes_for_input(job, input)?;
     let native = Int4MemoryRequirement::for_context(limits.native.context_tokens, width).map_err(native_error)?;
     let run = envelope.native.native;
     if envelope.context_tokens != limits.native.context_tokens

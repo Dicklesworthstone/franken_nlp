@@ -140,7 +140,7 @@ fn impossible_population_ownership_rejects_before_model_loading() {
 }
 
 #[test]
-fn explicit_input_retention_does_not_change_question_policy_or_memory() {
+fn retained_record_replay_reduces_only_population_memory_and_preserves_question_policy() {
     let (ordinary, args) = parsed("start", &[]);
     let job = lifetime(&ordinary, &args);
     let common = ordinary.args.validate(&args).unwrap();
@@ -155,7 +155,11 @@ fn explicit_input_retention_does_not_change_question_policy_or_memory() {
         assert_eq!(retention.limits().unwrap().unwrap().max_spool_bytes, 8 * MIB);
         let common = command.args.validate(&args).unwrap();
         let declared = command.args.lifetime_limits(&args, common, AnswerOptions::default(), job).unwrap();
-        assert_eq!(declared.memory, baseline.memory);
+        let saved = if retention.use_retained_input { 2 * job.max_snapshot_bytes } else { 0 };
+        let mut expected = baseline.memory;
+        expected.population_buffer_bytes -= saved;
+        expected.document.input_bytes -= saved;
+        assert_eq!(declared.memory, expected);
         assert_eq!(declared.config.max_model_work, baseline.config.max_model_work);
         assert_eq!(declared.config.max_verification.max_scan_steps, baseline.config.max_verification.max_scan_steps);
     }

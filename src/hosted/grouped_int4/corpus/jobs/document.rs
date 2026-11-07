@@ -78,7 +78,8 @@ impl NlpEngine {
         let document_workspace = planner.workspace_bytes(limits.native, reduction_reserve_bytes)?;
         let mut required = document_requirements(model.model_identity().group_width(),
             planner.task_budget(), planner.planning_limits(), mapping, result_bytes,
-            request.limits, limits, document_workspace, private_question_bytes(planner.task()))?;
+            request.limits, limits, document_workspace, private_question_bytes(planner.task()),
+            request.mode.input_memory())?;
         let cohort = if planner.uses_native_cohorts() {
             Some(planner.cohort_requirements().map_err(HostedError::BatchSetup)?)
         } else { None };
@@ -177,10 +178,10 @@ fn private_question_bytes(task: &Int4SourceDocumentTask) -> u64 {
 #[allow(clippy::too_many_arguments)]
 fn document_requirements(width: usize, budget: TaskBudget, planning: SourcePlanningLimits,
     mapping: Int4SourceMapLimits, result_bytes: u64, job: JobLimits, limits: JobHostLimits,
-    document_workspace_bytes: u64, private_question_bytes: u64)
+    document_workspace_bytes: u64, private_question_bytes: u64, input: JobInputMemory)
     -> Result<DocumentRequirements, HostedJobError> {
     budget.validate().map_err(|_| HostedError::Limits("INT4 document job task budget"))?;
-    let input_bytes = sum(&[limits.required_buffer_bytes(job)?, private_question_bytes])?;
+    let input_bytes = sum(&[limits.required_buffer_bytes_for_input(job, input)?, private_question_bytes])?;
     let native = Int4MemoryRequirement::for_context(limits.native.context_tokens, width)
         .map_err(native_error)?;
     if limits.native.allocator_reserve_bytes == 0 || document_workspace_bytes == 0

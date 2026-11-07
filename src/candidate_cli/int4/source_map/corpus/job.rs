@@ -150,7 +150,7 @@ impl JobArgs {
                 io_reserve_bytes, reduction_reserve_bytes, cohort_chunks: self.questions.cohort_chunks,
                 hierarchy_groups: self.questions.cohort_hierarchy_groups },
             transport, journal_reserve_bytes, serialization_reserve_bytes,
-        }.requirements(args.group_width, config, job)
+        }.requirements(args.group_width, config, job, self.storage.input_retention.input_memory()?)
             .map_err(|_| Failure::usage("question_document_job_admission"))?;
         let q = memory.document;
         let execution = sum(&[q.input_bytes, q.native.kv_bytes, q.workspace_bytes,

@@ -64,7 +64,7 @@ impl NlpEngine {
             .transpose().map_err(HostedError::BatchSetup)?;
         let required = requirements(planner.group_width(), planner.document_budget(),
             planner.planning_limits(), planner.document_limits(), planner.request(),
-            request.limits, limits, cohort)?;
+            request.limits, limits, cohort, request.mode.input_memory())?;
         if planner.max_result_bytes() != required.memory.max_output_bytes {
             return Err(HostedError::Limits("INT4 classification document result envelope").into());
         }
@@ -141,9 +141,9 @@ fn memory_limits(host: JobHostLimits) -> Int4ClassificationMapMemoryLimits {
 fn requirements(width: usize, task: TaskBudget, planning: ClassificationLimits,
     document: Int4ClassificationMapLimits, settings: &ClassificationBatchArgs,
     job: JobLimits, host: JobHostLimits,
-    cohort: Option<(usize, Int4ClassificationMapCohortMemoryRequirement)>)
+    cohort: Option<(usize, Int4ClassificationMapCohortMemoryRequirement)>, input: JobInputMemory)
     -> Result<DocumentRequirements, HostedJobError> {
-    let population_bytes = host.required_buffer_bytes(job)?;
+    let population_bytes = host.required_buffer_bytes_for_input(job, input)?;
     if settings.budget != task || settings.labels.is_empty()
         || settings.labels.len() > planning.max_labels
         || host.native.context_tokens != document.chunks.context_tokens

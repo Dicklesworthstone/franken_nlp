@@ -5,7 +5,7 @@ use super::corpus::{DocumentAdmission, DocumentCapacity, document_output_bytes};
 use crate::{
     batch::judge::grouped_int4::FAITHFULNESS_DOCUMENT_CHUNK_METADATA_BYTES,
     hosted::corpus::jobs::{HostedJobError, JobHostLimits, SourceJobRequest, read_population, run_population},
-    jobs::{JobLimits, JobProgress, JobWork,
+    jobs::{JobInputMemory, JobLimits, JobProgress, JobWork,
         runner::{JobRunError, scored::grouped_int4::faithfulness_document::{
             Int4FaithfulnessDocumentJobPlanner, Int4FaithfulnessDocumentJobProcessor}}},
 };
@@ -43,7 +43,7 @@ impl NlpEngine {
         let mapping = planner.document_limits();
         let cohort_chunks = planner.cohort_chunks();
         let required = requirements(planner.group_width(), planner.task_budget(), planner.planning_limits(),
-            mapping, request.limits, limits, planner.max_heads(), cohort_chunks)?;
+            mapping, request.limits, limits, planner.max_heads(), cohort_chunks, request.mode.input_memory())?;
         if planner.max_result_bytes() != document_output_bytes(mapping, cohort_chunks)? {
             return Err(HostedError::Limits("faithfulness document job result envelope").into());
         }
@@ -113,8 +113,8 @@ fn map_memory(limits: JobHostLimits) -> Int4FaithfulnessMapMemoryLimits {
 #[allow(clippy::too_many_arguments)]
 fn requirements(width: usize, task: TaskBudget, planning: JudgeLimits,
     mapping: Int4FaithfulnessMapLimits, job: JobLimits, host: JobHostLimits,
-    max_heads: usize, cohort_chunks: Option<usize>) -> Result<Int4FaithfulnessMapMemoryRequirement, HostedJobError> {
-    let population = host.required_buffer_bytes(job)?;
+    max_heads: usize, cohort_chunks: Option<usize>, input: JobInputMemory) -> Result<Int4FaithfulnessMapMemoryRequirement, HostedJobError> {
+    let population = host.required_buffer_bytes_for_input(job, input)?;
     crate::batch::judge::grouped_int4::validate_limits(task, planning, mapping,
         job.max_work.int4_model_work()).map_err(HostedError::BatchSetup)?;
     if host.native.context_tokens != mapping.chunks.context_tokens

@@ -1,5 +1,6 @@
 //! Owned population, real resident INT4 model and one authenticated job run.
 use super::*;
+use crate::jobs::JobInputMemory;
 use std::{sync::Arc, time::{Duration, Instant}};
 use crate::{
     NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
@@ -16,6 +17,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     job: JobArgs, _admitted: Int4Limits, input: R, output: &mut impl Write) -> Result<(), Failure> {
     let started = Instant::now();
     job.storage.input_retention.validate(mode, &args.input)?;
+    let input_memory = job.storage.input_retention.input_memory()?;
     // Recheck options at the owned boundary before private IO/runtime creation.
     let common = job.validate(&args)?;
     let deadline = Duration::from_secs(args.timeout_seconds);
@@ -38,7 +40,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     let common = limits.common;
     // Cross-check the CLI quote against the same hosted reservation calculator
     // BEFORE key/schema/model reads. Neither calculation is a memory permit.
-    check_host_quote(host_limits(&args, limits, remaining()?), lifetime, limits.buffer_bytes)?;
+    check_host_quote(host_limits(&args, limits, remaining()?), lifetime, limits.buffer_bytes, input_memory)?;
     let key = JobSecret::read(&job.storage.key_file).map_err(job_failure)?;
     remaining()?;
     let schema = read_config(job.extraction.schema_path(), SCHEMA_BYTES, &remaining)?;
@@ -111,8 +113,8 @@ fn host_limits(args: &Int4Args, limits: JobExecutionLimits, remaining: Duration)
         serialization_reserve_bytes: limits.serialization_reserve_bytes,
     }
 }
-fn check_host_quote(host: JobHostLimits, job: JobLimits, expected: u64) -> Result<(), Failure> {
-    if host.required_buffer_bytes(job).map_err(host_failure)? != expected {
+fn check_host_quote(host: JobHostLimits, job: JobLimits, expected: u64, input: JobInputMemory) -> Result<(), Failure> {
+    if host.required_buffer_bytes_for_input(job, input).map_err(host_failure)? != expected {
         return Err(Failure::usage("job_host_memory_quote"));
     }
     Ok(())

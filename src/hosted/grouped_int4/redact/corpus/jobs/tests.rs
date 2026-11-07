@@ -102,7 +102,7 @@ fn secret() -> RedactionPseudonyms {
 #[test]
 fn the_job_quote_keeps_complete_population_map_edit_recipe_and_native_storage_together() {
     let c = config(); let (job, host) = limits(&c);
-    let required = job_requirements(&c, job, host, 127, None).unwrap();
+    let required = job_requirements(&c, job, host, 127, None, JobInputMemory::CompletePopulation).unwrap();
     assert_eq!(required.input_bytes, host.required_buffer_bytes(job).unwrap()
         + long::document_workspace_bytes(&c.batch.batch.detector, c.edit_reserve_bytes).unwrap()
         + 4 * INT4_REDACTION_JOB_RECIPE_BYTES as u64);
@@ -115,7 +115,7 @@ fn the_job_quote_keeps_complete_population_map_edit_recipe_and_native_storage_to
 #[test]
 fn a_larger_stored_frame_ceiling_does_not_expand_native_output_authority() {
     let c = config(); let (job, host) = limits(&c);
-    let required = job_requirements(&c, job, host, 127, None).unwrap();
+    let required = job_requirements(&c, job, host, 127, None, JobInputMemory::CompletePopulation).unwrap();
     assert!(job.max_result_bytes as u64 > c.batch.batch.detector.max_result_bytes);
     let fixed = FixedItem::new(&c.batch.batch, 127, required.native.kv_bytes, job.max_result_bytes as u64);
     assert_eq!(fixed.result_bytes, c.batch.batch.detector.max_result_bytes);
@@ -124,7 +124,7 @@ fn a_larger_stored_frame_ceiling_does_not_expand_native_output_authority() {
     let error = check_admission(&fixed, &enlarged).unwrap_err();
     assert!(error.stop); assert_eq!(error.fault.code, BatchCode::InvalidExecution);
     let mut too_small = job; too_small.max_result_bytes = c.batch.batch.detector.max_result_bytes as usize - 1;
-    assert!(job_requirements(&c, too_small, host, 127, None).is_err());
+    assert!(job_requirements(&c, too_small, host, 127, None, JobInputMemory::CompletePopulation).is_err());
 }
 
 #[test]
@@ -132,15 +132,15 @@ fn actual_allocated_kv_and_each_planning_context_must_fit_the_host() {
     let c = config(); let (job, host) = limits(&c);
     for position in [0, 64, 127] {
         let mut small = host; small.native.context_tokens = position;
-        assert!(job_requirements(&c, job, small, 127, None).is_err());
+        assert!(job_requirements(&c, job, small, 127, None, JobInputMemory::CompletePopulation).is_err());
     }
     let mut short = config(); short.batch.batch.detector.per_chunk.max_kv_bytes -= 1;
-    assert!(job_requirements(&short, job, host, 127, None).is_err());
+    assert!(job_requirements(&short, job, host, 127, None, JobInputMemory::CompletePopulation).is_err());
     let mut too_long = config(); too_long.batch.batch.detector.planning.max_context_tokens = 129;
-    assert!(job_requirements(&too_long, job, host, 127, None).is_err());
+    assert!(job_requirements(&too_long, job, host, 127, None, JobInputMemory::CompletePopulation).is_err());
     let mut too_long = config(); too_long.batch.batch.detector.mapping.chunks.context_tokens = 129;
-    assert!(job_requirements(&too_long, job, host, 127, None).is_err());
-    assert!(job_requirements(&c, job, host, 0, None).is_err());
+    assert!(job_requirements(&too_long, job, host, 127, None, JobInputMemory::CompletePopulation).is_err());
+    assert!(job_requirements(&c, job, host, 0, None, JobInputMemory::CompletePopulation).is_err());
 }
 
 #[test]
@@ -158,7 +158,7 @@ fn all_persisted_work_axes_and_mask_authority_must_equal_the_frozen_corpus_ceili
                 _ => &mut changed.max_work.mask_node_visits,
             };
             if increase { *counter += 1; } else { *counter -= 1; }
-            assert!(job_requirements(&c, changed, host, 127, None).is_err(), "{axis} {increase}");
+            assert!(job_requirements(&c, changed, host, 127, None, JobInputMemory::CompletePopulation).is_err(), "{axis} {increase}");
         }
     }
 }
@@ -169,10 +169,10 @@ fn original_decoded_text_encoded_envelope_and_transformed_source_have_distinct_b
     assert!(c.batch.max_source_bytes > c.batch.batch.detector.planning.max_input_bytes);
     assert!(job.max_input_bytes_per_item > c.batch.max_source_bytes);
     assert!(c.batch.batch.detector.mapping.chunks.max_input_bytes > job.max_input_bytes_per_item);
-    job_requirements(&c, job, host, 127, None).unwrap();
+    job_requirements(&c, job, host, 127, None, JobInputMemory::CompletePopulation).unwrap();
     for cap in [0, 65_537] {
         let mut wrong = config(); wrong.batch.max_source_bytes = cap;
-        assert!(job_requirements(&wrong, job, host, 127, None).is_err());
+        assert!(job_requirements(&wrong, job, host, 127, None, JobInputMemory::CompletePopulation).is_err());
     }
 }
 
@@ -189,24 +189,24 @@ fn missing_host_reserves_and_overflow_refuse_before_any_storage_access() {
             4 => limits.journal_reserve_bytes = 0,
             _ => limits.serialization_reserve_bytes = 0,
         }
-        assert!(job_requirements(&changed, job, limits, 127, None).is_err(), "{axis}");
+        assert!(job_requirements(&changed, job, limits, 127, None, JobInputMemory::CompletePopulation).is_err(), "{axis}");
     }
     let mut overflowing = host; overflowing.serialization_reserve_bytes = u64::MAX;
-    assert!(job_requirements(&c, job, overflowing, 127, None).is_err());
+    assert!(job_requirements(&c, job, overflowing, 127, None, JobInputMemory::CompletePopulation).is_err());
     let mut oversized_map = config();
     oversized_map.batch.batch.detector.mapping.verification.max_matches = usize::MAX;
-    assert!(job_requirements(&oversized_map, job, host, 127, None).is_err());
+    assert!(job_requirements(&oversized_map, job, host, 127, None, JobInputMemory::CompletePopulation).is_err());
 }
 
 #[test]
 fn namespace_capacity_and_key_owner_are_in_addition_to_all_job_buffers() {
     let c = config(); let (job, host) = limits(&c); let secret = secret();
-    let without = job_requirements(&c, job, host, 127, None).unwrap();
-    let with = job_requirements(&c, job, host, 127, Some(&secret)).unwrap();
+    let without = job_requirements(&c, job, host, 127, None, JobInputMemory::CompletePopulation).unwrap();
+    let with = job_requirements(&c, job, host, 127, Some(&secret), JobInputMemory::CompletePopulation).unwrap();
     assert_eq!(with.input_bytes - without.input_bytes, secret.namespace.capacity() as u64 + 2048);
     for namespace in [String::new(), "x".repeat(257)] {
         let invalid = RedactionPseudonyms { key: secret.key.clone(), namespace };
-        assert!(job_requirements(&c, job, host, 127, Some(&invalid)).is_err());
+        assert!(job_requirements(&c, job, host, 127, Some(&invalid), JobInputMemory::CompletePopulation).is_err());
     }
 }
 
@@ -233,7 +233,7 @@ fn pseudonym_scope_checks_the_actual_key_independently_of_retention_authenticati
 #[test]
 fn complete_document_work_remains_independent_contexts_inside_the_durable_guard() {
     let c = config(); let (job, host) = limits(&c);
-    let required = job_requirements(&c, job, host, 127, None).unwrap();
+    let required = job_requirements(&c, job, host, 127, None, JobInputMemory::CompletePopulation).unwrap();
     let fixed = FixedItem::new(&c.batch.batch, 127, required.native.kv_bytes, job.max_result_bytes as u64);
     assert!(fixed.model_work.forward_positions > host.native.context_tokens as u64);
     let concatenated = Int4Work::for_sequence(127, 0, fixed.model_work.forward_positions as usize,
@@ -260,9 +260,9 @@ fn owned_population_preparation_secrets_and_reader_cross_one_physical_boundary()
 fn retained_cohorts_keep_one_peak_across_stages_and_charge_the_whole_native_window() {
     let mut c = config(); c.batch.batch.detector.mapping.reduction.map_batch_chunks = 3;
     let (job, host) = limits(&c);
-    let serial = job_requirements(&c, job, host, 127, None).unwrap();
+    let serial = job_requirements(&c, job, host, 127, None, JobInputMemory::CompletePopulation).unwrap();
     assert!(serial.cohort.is_none());
-    let grouped = job_requirements_for_schedule(&c, job, host, 127, None, true).unwrap();
+    let grouped = job_requirements_for_schedule(&c, job, host, 127, None, true, JobInputMemory::CompletePopulation).unwrap();
     assert_eq!(grouped.native, Int4MemoryRequirement::for_cohort(&[128; 3], 127).unwrap());
     assert!(grouped.native.kv_bytes > c.batch.batch.detector.per_chunk.max_kv_bytes);
     let quote = grouped.cohort.unwrap();
@@ -277,7 +277,7 @@ fn retained_cohorts_keep_one_peak_across_stages_and_charge_the_whole_native_wind
     row_only.kv_reservation_bytes = c.batch.batch.detector.per_chunk.max_kv_bytes;
     assert_eq!(check_admission(&fixed, &row_only).unwrap_err().fault.code, BatchCode::Admission);
     c.batch.batch.request.verify = !c.batch.batch.request.verify;
-    let other_stage_count = job_requirements_for_schedule(&c, job, host, 127, None, true).unwrap();
+    let other_stage_count = job_requirements_for_schedule(&c, job, host, 127, None, true, JobInputMemory::CompletePopulation).unwrap();
     assert_eq!(other_stage_count.native, grouped.native);
     assert_eq!(other_stage_count.workspace_bytes, grouped.workspace_bytes);
     assert_eq!(other_stage_count.input_bytes, grouped.input_bytes);
@@ -288,7 +288,7 @@ fn changing_cohort_width_never_renews_persisted_work_masks_or_result_authority()
     for chunks in [1, 2, 3] {
         let mut c = config(); c.batch.batch.detector.mapping.reduction.map_batch_chunks = chunks;
         let (job, host) = limits(&c);
-        job_requirements_for_schedule(&c, job, host, 127, None, true).unwrap();
+        job_requirements_for_schedule(&c, job, host, 127, None, true, JobInputMemory::CompletePopulation).unwrap();
         for axis in 0..6 {
             for increase in [false, true] {
                 let mut changed = job;
@@ -301,12 +301,12 @@ fn changing_cohort_width_never_renews_persisted_work_masks_or_result_authority()
                     _ => &mut changed.max_work.mask_node_visits,
                 };
                 if increase { *counter += 1; } else { *counter -= 1; }
-                assert!(job_requirements_for_schedule(&c, changed, host, 127, None, true).is_err(),
+                assert!(job_requirements_for_schedule(&c, changed, host, 127, None, true, JobInputMemory::CompletePopulation).is_err(),
                     "chunks {chunks} axis {axis} increase {increase}");
             }
         }
         let mut short = job; short.max_result_bytes = c.batch.batch.detector.max_result_bytes as usize - 1;
-        assert!(job_requirements_for_schedule(&c, short, host, 127, None, true).is_err());
+        assert!(job_requirements_for_schedule(&c, short, host, 127, None, true, JobInputMemory::CompletePopulation).is_err());
     }
 }
 
@@ -315,7 +315,7 @@ fn retained_cohort_quotes_refuse_bad_windows_per_row_authority_and_unadmitted_me
     for chunks in [0, 4, 65, usize::MAX] {
         let mut c = config(); c.batch.batch.detector.mapping.reduction.map_batch_chunks = chunks;
         let (job, host) = limits(&c);
-        assert!(job_requirements_for_schedule(&c, job, host, 127, None, true).is_err(), "chunks {chunks}");
+        assert!(job_requirements_for_schedule(&c, job, host, 127, None, true, JobInputMemory::CompletePopulation).is_err(), "chunks {chunks}");
     }
     for axis in 0..8 {
         let mut c = config(); c.batch.batch.detector.mapping.reduction.map_batch_chunks = 3;
@@ -330,6 +330,6 @@ fn retained_cohort_quotes_refuse_bad_windows_per_row_authority_and_unadmitted_me
             6 => host.serialization_reserve_bytes = u64::MAX,
             _ => c.batch.batch.detector.per_chunk.max_output_bytes = u64::MAX,
         }
-        assert!(job_requirements_for_schedule(&c, job, host, 127, None, true).is_err(), "axis {axis}");
+        assert!(job_requirements_for_schedule(&c, job, host, 127, None, true, JobInputMemory::CompletePopulation).is_err(), "axis {axis}");
     }
 }

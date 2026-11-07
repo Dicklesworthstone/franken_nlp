@@ -88,6 +88,28 @@ fn input_retention_requires_separate_consent_and_an_explicit_positive_disk_cap()
     assert_eq!(retained.limits().unwrap(), Some(InputRetentionLimits { max_spool_bytes: 7 * MIB }));
 }
 #[test]
+fn input_memory_mode_requires_valid_consent_and_removes_only_complete_population_copies() {
+    use crate::jobs::JobInputMemory;
+    let external = InputRetentionArgs::default();
+    let spool = input_options(&["--spool-input", "--max-retained-input-mib", "7"]).unwrap();
+    let retained = input_options(&["--use-retained-input", "--max-retained-input-mib", "7"]).unwrap();
+    assert_eq!(external.input_memory().unwrap(), JobInputMemory::CompletePopulation);
+    assert_eq!(spool.input_memory().unwrap(), JobInputMemory::CompletePopulation);
+    assert_eq!(retained.input_memory().unwrap(), JobInputMemory::RetainedRecord);
+    let job = lifetime();
+    let full = external.buffer_bytes(job).unwrap();
+    assert_eq!(spool.buffer_bytes(job).unwrap(), full);
+    assert_eq!(retained.buffer_bytes(job).unwrap(), full - 2 * job.max_snapshot_bytes);
+    for invalid in [
+        InputRetentionArgs { use_retained_input: true, ..InputRetentionArgs::default() },
+        InputRetentionArgs { spool_input: true, ..retained },
+        InputRetentionArgs { max_retained_input_mib: Some(u64::MAX), ..retained },
+    ] {
+        assert_eq!(invalid.input_memory().unwrap_err().code, "job_input_retention_options");
+        assert_eq!(invalid.buffer_bytes(job).unwrap_err().code, "job_input_retention_options");
+    }
+}
+#[test]
 fn retained_replay_rejects_explicit_population_arguments_including_dash() {
     for population in ["original.ndjson", "-"] {
         assert!(input_options(&["--use-retained-input", "--max-retained-input-mib", "1", population]).is_err());

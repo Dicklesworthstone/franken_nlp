@@ -77,7 +77,7 @@ impl NlpEngine {
         let result_bytes = planner.max_result_bytes();
         let frontier_bytes = planner.workspace_bytes(limits.native, reduction_reserve_bytes)?;
         let mut required = requirements(planner.group_width(), budget, document, result_bytes,
-            request.limits, limits, frontier_bytes, planner.request().schema.capacity())?;
+            request.limits, limits, frontier_bytes, planner.request().schema.capacity(), request.mode.input_memory())?;
         let cohort = if planner.uses_chunk_cohorts() {
             Some(planner.cohort_requirements().map_err(HostedError::BatchSetup)?)
         } else { None };
@@ -158,14 +158,14 @@ impl DocumentRequirements {
 #[allow(clippy::too_many_arguments)]
 fn requirements(width: usize, budget: TaskBudget, document: Int4ExtractionMapLimits,
     result_bytes: u64, job: JobLimits, limits: JobHostLimits, document_workspace_bytes: u64,
-    schema_capacity: usize) -> Result<DocumentRequirements, HostedJobError> {
+    schema_capacity: usize, input: JobInputMemory) -> Result<DocumentRequirements, HostedJobError> {
     budget.validate().map_err(|_| HostedError::Limits("INT4 extraction document job task budget"))?;
     // The frozen private recipe and native shared-default compiler each own
     // schema bytes. Their variable capacity is additional to explicit planner
     // overhead and all population/serializer/journal buffers.
     let schemas = (schema_capacity as u64).checked_mul(2)
         .ok_or(HostedError::Limits("INT4 extraction document job schema arithmetic"))?;
-    let input_bytes = sum(&[limits.required_buffer_bytes(job)?, schemas])?;
+    let input_bytes = sum(&[limits.required_buffer_bytes_for_input(job, input)?, schemas])?;
     let native = Int4MemoryRequirement::for_context(limits.native.context_tokens, width).map_err(native_error)?;
     let mapping = document.mapping;
     if schema_capacity == 0 || document_workspace_bytes == 0 || limits.native.allocator_reserve_bytes == 0

@@ -39,7 +39,7 @@ impl NlpEngine {
         // Equality here binds that context to the actual resident KV before
         // reading any population bytes or opening a job directory.
         let required = job_requirements(model.model_identity().group_width(), planner.task_ceiling(),
-            request.limits, limits)?;
+            request.limits, limits, request.mode.input_memory())?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(SourceJobInput { preparation: Some((planner, vocabulary, request)), reader }))?;

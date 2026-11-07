@@ -38,7 +38,7 @@ fn fixture() -> (TaskBudget, SentimentLimits, Int4SentimentMapLimits, JobLimits,
 fn complete_population_and_replanned_documents_coexist_in_the_reservation() {
     let (task, planning, mapping, job, host) = fixture();
     for (axes, chunks) in [(1, None), (4, None), (4, Some(1)), (4, Some(16)), (1, Some(64))] {
-        let needed = requirements(32, task, planning, mapping, job, host, axes, chunks).unwrap();
+        let needed = requirements(32, task, planning, mapping, job, host, axes, chunks, JobInputMemory::CompletePopulation).unwrap();
         let map = map_memory(host, axes, chunks).requirements(32, task, planning, mapping).unwrap();
         assert_eq!(needed.native, map.native);
         assert_eq!(needed.output_reservation_bytes, map.output_reservation_bytes);
@@ -49,7 +49,7 @@ fn complete_population_and_replanned_documents_coexist_in_the_reservation() {
         // Native windows never replace the original population commitment.
         let mut larger = job;
         larger.max_snapshot_bytes += 4096;
-        let larger = requirements(32, task, planning, mapping, larger, host, axes, chunks).unwrap();
+        let larger = requirements(32, task, planning, mapping, larger, host, axes, chunks, JobInputMemory::CompletePopulation).unwrap();
         assert_eq!(larger.input_bytes - needed.input_bytes, 8192);
         assert_eq!(larger.native, needed.native);
     }
@@ -68,12 +68,12 @@ fn each_native_work_axis_must_fit_the_persisted_lifetime_allowance() {
             4 => limited.max_work.model.projections.multiply_accumulates -= 1,
             _ => limited.max_work.mask_node_visits = 1,
         }
-        assert!(requirements(32, task, planning, mapping, limited, host, 4, None).is_err(), "axis {axis}");
+        assert!(requirements(32, task, planning, mapping, limited, host, 4, None, JobInputMemory::CompletePopulation).is_err(), "axis {axis}");
     }
-    let quote = requirements(32, task, planning, mapping, job, host, 4, None).unwrap();
+    let quote = requirements(32, task, planning, mapping, job, host, 4, None, JobInputMemory::CompletePopulation).unwrap();
     let mut more_attempts = job;
     more_attempts.max_attempts = 100;
-    assert_eq!(quote, requirements(32, task, planning, mapping, more_attempts, host, 4, None).unwrap());
+    assert_eq!(quote, requirements(32, task, planning, mapping, more_attempts, host, 4, None, JobInputMemory::CompletePopulation).unwrap());
 }
 
 #[test]
@@ -81,28 +81,28 @@ fn oversized_axis_windows_refuse_without_clamping_the_fixed_recipe() {
     let (task, planning, mapping, job, host) = fixture();
     for (axes, chunks) in [(0, None), (5, None), (4, Some(0)), (4, Some(17)),
         (2, Some(33)), (1, Some(65)), (1, Some(usize::MAX))] {
-        assert!(requirements(32, task, planning, mapping, job, host, axes, chunks).is_err());
+        assert!(requirements(32, task, planning, mapping, job, host, axes, chunks, JobInputMemory::CompletePopulation).is_err());
     }
-    let needed = requirements(32, task, planning, mapping, job, host, 2, Some(3)).unwrap();
+    let needed = requirements(32, task, planning, mapping, job, host, 2, Some(3), JobInputMemory::CompletePopulation).unwrap();
     let row = Int4MemoryRequirement::for_context(256, 32).unwrap();
     assert_eq!(needed.native.kv_bytes, row.kv_bytes * 6);
     let mut missing_axis = task;
     missing_axis.max_kv_bytes = row.kv_bytes * 2 - 1;
-    assert!(requirements(32, missing_axis, planning, mapping, job, host, 2, Some(3)).is_err());
+    assert!(requirements(32, missing_axis, planning, mapping, job, host, 2, Some(3), JobInputMemory::CompletePopulation).is_err());
 }
 
 #[test]
 fn stored_document_cap_accounts_for_actual_cohort_wrapper() {
     let (task, planning, mapping, mut job, host) = fixture();
     job.max_result_bytes = mapping.max_result_bytes as usize;
-    requirements(32, task, planning, mapping, job, host, 4, None).unwrap();
-    assert!(requirements(32, task, planning, mapping, job, host, 4, Some(2)).is_err());
+    requirements(32, task, planning, mapping, job, host, 4, None, JobInputMemory::CompletePopulation).unwrap();
+    assert!(requirements(32, task, planning, mapping, job, host, 4, Some(2), JobInputMemory::CompletePopulation).is_err());
     job.max_result_bytes += 4096;
-    let quote = requirements(32, task, planning, mapping, job, host, 4, Some(2)).unwrap();
+    let quote = requirements(32, task, planning, mapping, job, host, 4, Some(2), JobInputMemory::CompletePopulation).unwrap();
     assert_eq!(quote.max_output_bytes, job.max_result_bytes as u64);
     assert!(quote.output_reservation_bytes > quote.max_output_bytes);
     job.max_result_bytes -= 1;
-    assert!(requirements(32, task, planning, mapping, job, host, 4, Some(2)).is_err());
+    assert!(requirements(32, task, planning, mapping, job, host, 4, Some(2), JobInputMemory::CompletePopulation).is_err());
 }
 
 #[test]
@@ -123,10 +123,10 @@ fn host_shortfalls_and_arithmetic_overflow_fail_before_population_io() {
             9 => host.transport.max_stream_bytes = 0,
             _ => host.native.allocator_reserve_bytes = u64::MAX,
         }
-        assert!(requirements(32, task, planning, mapping, job, host, 4, None).is_err(), "field {field}");
+        assert!(requirements(32, task, planning, mapping, job, host, 4, None, JobInputMemory::CompletePopulation).is_err(), "field {field}");
     }
     for width in [0, 10753, usize::MAX] {
-        assert!(requirements(width, task, planning, mapping, job, host, 4, None).is_err());
+        assert!(requirements(width, task, planning, mapping, job, host, 4, None, JobInputMemory::CompletePopulation).is_err());
     }
 }
 

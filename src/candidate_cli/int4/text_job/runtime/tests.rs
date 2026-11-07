@@ -63,10 +63,13 @@ fn pure_host_quote_matches_the_runtime_owner_and_rejects_missing_staging() {
     let job = lifetime(&args, common);
     let limits = c.args.lifetime_limits(&args, common, job).unwrap();
     let host = host_limits(&args, limits, Duration::from_secs(30));
-    check_host_quote(host, job, limits.buffer_bytes).unwrap();
-    assert_eq!(check_host_quote(host, job, limits.buffer_bytes - 1).unwrap_err().code, "job_host_memory_quote");
+    check_host_quote(host, job, limits.buffer_bytes, JobInputMemory::CompletePopulation).unwrap();
+    check_host_quote(host, job, limits.buffer_bytes - 2 * job.max_snapshot_bytes, JobInputMemory::RetainedRecord).unwrap();
+    assert_eq!(check_host_quote(host, job, limits.buffer_bytes - 1, JobInputMemory::CompletePopulation)
+        .unwrap_err().code, "job_host_memory_quote");
     let mut missing = host; missing.journal_reserve_bytes = 0;
-    assert_eq!(check_host_quote(missing, job, limits.buffer_bytes).unwrap_err().code, "job_host_admission");
+    assert_eq!(check_host_quote(missing, job, limits.buffer_bytes, JobInputMemory::CompletePopulation)
+        .unwrap_err().code, "job_host_admission");
     assert_eq!(host.native.context_tokens, args.context_tokens);
     assert_eq!(host.native.run.max_checkpoints, args.max_checkpoints);
     assert_eq!(host.native.run.max_elapsed, Duration::from_secs(30));
@@ -81,20 +84,23 @@ fn native_quote_includes_full_kv_sampler_and_output_vectors_in_addition_to_popul
     let limits = c.args.lifetime_limits(&args, common, job).unwrap();
     let config = configuration(&c.args, &args, limits, 166_101).unwrap();
     let host = host_limits(&args, limits, Duration::from_secs(30));
-    let total = simultaneous_memory(args.group_width, config.native, config.budget, host, job, common).unwrap();
+    let input = JobInputMemory::CompletePopulation;
+    let total = simultaneous_memory(args.group_width, config.native, config.budget, host, job, common, input).unwrap();
+    assert_eq!(simultaneous_memory(args.group_width, config.native, config.budget, host, job, common,
+        JobInputMemory::RetainedRecord).unwrap(), total - 2 * job.max_snapshot_bytes);
     assert!(total <= limits.common.minimum_memory_bytes);
     assert!(total > limits.buffer_bytes + common.preparation_bytes + common.load.weight_payload_bytes + common.native.kv_bytes);
     let mut sampler = config.native; sampler.max_sampler_bytes += MIB;
-    assert_eq!(simultaneous_memory(args.group_width, sampler, config.budget, host, job, common).unwrap(), total + MIB);
+    assert_eq!(simultaneous_memory(args.group_width, sampler, config.budget, host, job, common, input).unwrap(), total + MIB);
     let mut output = config.budget; output.max_output_tokens += 1;
-    assert_eq!(simultaneous_memory(args.group_width, config.native, output, host, job, common).unwrap(), total + 8);
+    assert_eq!(simultaneous_memory(args.group_width, config.native, output, host, job, common, input).unwrap(), total + 8);
     let mut output = config.budget; output.max_output_bytes += 1024;
-    assert_eq!(simultaneous_memory(args.group_width, config.native, output, host, job, common).unwrap(), total + 4096);
+    assert_eq!(simultaneous_memory(args.group_width, config.native, output, host, job, common, input).unwrap(), total + 4096);
     let mut context = host; context.native.context_tokens -= 1;
-    assert_eq!(simultaneous_memory(args.group_width, config.native, config.budget, context, job, common).unwrap_err().code,
+    assert_eq!(simultaneous_memory(args.group_width, config.native, config.budget, context, job, common, input).unwrap_err().code,
         "text_job_native_quote");
     let mut kv = config.native; kv.max_kv_bytes -= 1;
-    assert_eq!(simultaneous_memory(args.group_width, kv, config.budget, host, job, common).unwrap_err().code,
+    assert_eq!(simultaneous_memory(args.group_width, kv, config.budget, host, job, common, input).unwrap_err().code,
         "text_job_native_quote");
 }
 

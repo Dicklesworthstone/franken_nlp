@@ -24,7 +24,7 @@ impl NlpEngine {
             || planner.planning_limits().max_context_tokens > limits.native.context_tokens {
             return Err(HostedError::Limits("source document job complete native capacity").into());
         }
-        let bytes = sum(&[limits.reservation_bytes(request.limits)?,
+        let bytes = sum(&[limits.required_buffer_bytes_for_input(request.limits, request.mode.input_memory())?,
             document_workspace(&planner, reduction_reserve_bytes)?])?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,

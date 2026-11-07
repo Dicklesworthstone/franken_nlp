@@ -13,7 +13,7 @@ use crate::{
     batch::{BatchCode, extract::quantized::Int8ExtractionBatchLimits, source::quantized as source_batch},
     hosted::{HostedError, corpus::{SourceCorpusConfig, jobs::{HostedJobError, JobHostLimits,
         JobOpenMode, SourceJobRequest}}},
-    jobs::{JobError, JobId, JobLimits, JobProgress, JobSecret, JobWork, TailPolicy,
+    jobs::{JobError, JobId, JobInputMemory, JobLimits, JobProgress, JobSecret, JobWork, TailPolicy,
         population::PopulationReadLimits, runner::{JobRunError, extract::Int8ExtractionJobPlanner}},
     native_engine::decode::{DecodeCancellationKind, DecodeStepControl},
     tasks::{extract::ExtractionVocabulary, source_planning::SourceTaskPlanner},
@@ -79,8 +79,8 @@ fn host_limits(args: &JobArgs, common: &CandidateArgs, limits: Limits, session: 
         journal_reserve_bytes: args.journal_memory_mib.checked_mul(MIB).ok_or_else(|| Failure::usage("job_memory"))?,
         serialization_reserve_bytes: args.serialization_memory_mib.checked_mul(MIB).ok_or_else(|| Failure::usage("job_memory"))? })
 }
-fn preflight_memory(host: JobHostLimits, job: JobLimits, limits: Limits) -> Result<(), Failure> {
-    let buffers = host.required_buffer_bytes(job).map_err(host_failure)?;
+fn preflight_memory(host: JobHostLimits, job: JobLimits, limits: Limits, input: JobInputMemory) -> Result<(), Failure> {
+    let buffers = host.required_buffer_bytes_for_input(job, input).map_err(host_failure)?;
     // Necessary bound only; the real host additionally admits KV/workspace,
     // resident metadata and guarded output. Do not call this a memory permit.
     let minimum = buffers.checked_add(limits.preparation_bytes).and_then(|n| n.checked_add(limits.weight_bytes))
@@ -113,7 +113,8 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     let session = Session::new(&common, limits)?;
     let lifetime = command::parse_limits(&read_config(&session, &args.limits_file, command::LIMIT_BYTES)?)?;
     let native = command::native_limits(&args, lifetime)?;
-    preflight_memory(host_limits(&args, &common, limits, &session)?, lifetime, limits)?;
+    preflight_memory(host_limits(&args, &common, limits, &session)?, lifetime, limits,
+        args.input_retention.input_memory()?)?;
     let key = JobSecret::read(&args.key_file).map_err(job_failure)?;
     session.remaining()?;
     let defaults = args.defaults.as_ref().map(|path| read_config(&session, path, command::DEFAULT_BYTES)).transpose()?;

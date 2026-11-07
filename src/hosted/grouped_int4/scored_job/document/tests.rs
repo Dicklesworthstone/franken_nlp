@@ -48,7 +48,7 @@ fn fixture(width: usize) -> (ClassificationBatchArgs, ClassificationLimits,
 fn serial_job_prices_population_and_map_with_one_shared_preparation_reserve() {
     for width in [1, 3, 32, 127, 128, MAX_MODEL_K] {
         let (settings, planning, document, job, host) = fixture(width);
-        let needed = requirements(width, settings.budget, planning, document, &settings, job, host, None).unwrap();
+        let needed = requirements(width, settings.budget, planning, document, &settings, job, host, None, JobInputMemory::CompletePopulation).unwrap();
         let map = memory_limits(host).requirements(width, settings.budget, planning, document).unwrap();
         assert_eq!(needed.memory, map);
         assert_eq!(needed.input_bytes, host.required_buffer_bytes(job).unwrap()
@@ -66,7 +66,7 @@ fn cohorts_price_fixed_head_geometry_once_and_preserve_complete_output_wrapper()
             let quote = memory_limits(host).cohort_requirements(32, settings.budget, planning,
                 document, head_count(&settings), chunks).unwrap();
             let needed = requirements(32, settings.budget, planning, document, &settings,
-                job, host, Some((chunks, quote))).unwrap();
+                job, host, Some((chunks, quote)), JobInputMemory::CompletePopulation).unwrap();
             assert_eq!(needed.memory, quote.memory);
             assert_eq!(needed.input_bytes, host.required_buffer_bytes(job).unwrap()
                 + quote.memory.input_bytes - host.preparation_reserve_bytes);
@@ -93,17 +93,17 @@ fn changed_cohort_geometry_refuses_but_current_host_reserves_are_requoted() {
             5 => changed.task_workspace_bytes += 1,
             _ => changed.max_cohort_output_bytes += 1 }
         assert!(requirements(32, settings.budget, planning, document, &settings,
-            job, host, Some((2, changed))).is_err(), "axis {axis}");
+            job, host, Some((2, changed)), JobInputMemory::CompletePopulation).is_err(), "axis {axis}");
     }
     let mut wrong_context = host; wrong_context.native.context_tokens += 1;
     assert!(requirements(32, settings.budget, planning, document, &settings,
-        job, wrong_context, Some((2, quote))).is_err());
+        job, wrong_context, Some((2, quote)), JobInputMemory::CompletePopulation).is_err());
     for axis in 0..2 {
         let mut changed = host;
         match axis { 0 => changed.native.allocator_reserve_bytes += 1,
             _ => changed.preparation_reserve_bytes += 1 }
         let needed = requirements(32, settings.budget, planning, document, &settings,
-            job, changed, Some((2, quote))).unwrap();
+            job, changed, Some((2, quote)), JobInputMemory::CompletePopulation).unwrap();
         let current = memory_limits(changed).cohort_requirements(32, settings.budget,
             planning, document, 1, 2).unwrap();
         assert_eq!(needed.memory, current.memory);
@@ -122,11 +122,11 @@ fn every_document_work_axis_must_fit_lifetime_without_attempt_multiplication() {
             3 => wrong.max_work.model.projections.dot_products -= 1,
             4 => wrong.max_work.model.projections.multiply_accumulates -= 1,
             _ => wrong.max_work.mask_node_visits = 1 }
-        assert!(requirements(32, settings.budget, planning, document, &settings, wrong, host, None).is_err());
+        assert!(requirements(32, settings.budget, planning, document, &settings, wrong, host, None, JobInputMemory::CompletePopulation).is_err());
     }
-    let before = requirements(32, settings.budget, planning, document, &settings, job, host, None).unwrap();
+    let before = requirements(32, settings.budget, planning, document, &settings, job, host, None, JobInputMemory::CompletePopulation).unwrap();
     job.max_items = 40; job.max_attempts = 100;
-    let after = requirements(32, settings.budget, planning, document, &settings, job, host, None).unwrap();
+    let after = requirements(32, settings.budget, planning, document, &settings, job, host, None, JobInputMemory::CompletePopulation).unwrap();
     assert_eq!(before.memory, after.memory);
     assert_eq!(after.input_bytes - before.input_bytes, 37 * 1024);
 }
@@ -144,21 +144,21 @@ fn result_native_and_host_storage_shortfalls_refuse_before_population_io() {
             5 => host.preparation_reserve_bytes = u64::MAX,
             6 => host.journal_reserve_bytes = 0,
             _ => host.serialization_reserve_bytes = 0 }
-        assert!(requirements(32, settings.budget, planning, document, &settings, job, host, None).is_err(), "axis {axis}");
+        assert!(requirements(32, settings.budget, planning, document, &settings, job, host, None, JobInputMemory::CompletePopulation).is_err(), "axis {axis}");
     }
 }
 
 #[test]
 fn private_fixed_label_spare_capacities_are_priced_without_cloning_them() {
     let (mut settings, planning, document, job, host) = fixture(32);
-    let before = requirements(32, settings.budget, planning, document, &settings, job, host, None).unwrap();
+    let before = requirements(32, settings.budget, planning, document, &settings, job, host, None, JobInputMemory::CompletePopulation).unwrap();
     let mut labels = Vec::with_capacity(planning.max_labels + 4);
     labels.extend(settings.labels); settings.labels = labels;
     let mut id = String::with_capacity(planning.max_total_label_bytes + 4096);
     id.push_str(&settings.labels[0].id); settings.labels[0].id = id;
     let expected = spare_label_bytes(&settings, planning).unwrap();
     assert!(expected > 4096);
-    let after = requirements(32, settings.budget, planning, document, &settings, job, host, None).unwrap();
+    let after = requirements(32, settings.budget, planning, document, &settings, job, host, None, JobInputMemory::CompletePopulation).unwrap();
     assert_eq!(after.input_bytes - before.input_bytes, expected);
 }
 

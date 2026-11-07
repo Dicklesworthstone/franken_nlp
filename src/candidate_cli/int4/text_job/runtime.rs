@@ -1,5 +1,6 @@
 //! Actual resident model, pinned text compiler and one owned retained job.
 use super::*;
+use crate::jobs::JobInputMemory;
 use std::time::{Duration, Instant};
 use crate::{
     NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
@@ -15,6 +16,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     job: JobArgs, _admitted: Int4Limits, input: R, output: &mut impl Write) -> Result<(), Failure> {
     let started = Instant::now();
     job.storage.input_retention.validate(mode, &args.input)?;
+    let input_memory = job.storage.input_retention.input_memory()?;
     let common = job.validate(&args)?;
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
@@ -34,7 +36,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
         job_cli::LIMIT_BYTES, &remaining)?)?;
     let limits = job.lifetime_limits(&args, common, lifetime)?;
     let common = limits.common;
-    check_host_quote(host_limits(&args, limits, remaining()?), lifetime, limits.buffer_bytes)?;
+    check_host_quote(host_limits(&args, limits, remaining()?), lifetime, limits.buffer_bytes, input_memory)?;
     let key = JobSecret::read(&job.storage.key_file).map_err(job_failure)?;
     remaining()?;
     let reader = job_cli::population_reader(mode, job.storage.input_retention, &args.input, input, IO_BUFFER_BYTES)?;
@@ -45,7 +47,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     remaining()?;
     // Quote the actual native factory and complete host occupancy before the
     // optional snapshot creates any file. Only the host grants reservations.
-    check_native_quote(&planner, &args, limits, host_limits(&args, limits, remaining()?), lifetime)?;
+    check_native_quote(&planner, &args, limits, host_limits(&args, limits, remaining()?), lifetime, input_memory)?;
     let identity = planner.execution_identity().clone();
     let mut snapshot = common.snapshot_pin.map(|_| SnapshotRecord::new("loaded", common.snapshot_need));
     if let Some(path) = &args.save_snapshot {
@@ -125,15 +127,15 @@ fn host_limits(args: &Int4Args, limits: JobExecutionLimits, remaining: Duration)
         serialization_reserve_bytes: limits.serialization_reserve_bytes,
     }
 }
-fn check_host_quote(host: JobHostLimits, job: JobLimits, expected: u64) -> Result<(), Failure> {
-    if host.required_buffer_bytes(job).map_err(host_failure)? != expected {
+fn check_host_quote(host: JobHostLimits, job: JobLimits, expected: u64, input: JobInputMemory) -> Result<(), Failure> {
+    if host.required_buffer_bytes_for_input(job, input).map_err(host_failure)? != expected {
         return Err(Failure::usage("job_host_memory_quote"));
     }
     Ok(())
 }
 fn check_native_quote(planner: &Int4GenerationJobPlanner, args: &Int4Args,
-    limits: JobExecutionLimits, host: JobHostLimits, job: JobLimits) -> Result<(), Failure> {
-    check_host_quote(host, job, limits.buffer_bytes)?;
+    limits: JobExecutionLimits, host: JobHostLimits, job: JobLimits, input: JobInputMemory) -> Result<(), Failure> {
+    check_host_quote(host, job, limits.buffer_bytes, input)?;
     planner.check_job_limits(job).map_err(|_| CandidateError::Planning)?;
     let (task, _) = task_limits(args, limits.common)?;
     let native = planner.native_limits();
@@ -148,16 +150,17 @@ fn check_native_quote(planner: &Int4GenerationJobPlanner, args: &Int4Args,
         || native.native.max_projection_work != work.projections {
         return Err(Failure::usage("text_job_native_quote"));
     }
-    let quoted = simultaneous_memory(args.group_width, native, task, host, job, limits.common)?;
+    let quoted = simultaneous_memory(args.group_width, native, task, host, job, limits.common, input)?;
     if quoted > limits.common.minimum_memory_bytes || quoted > limits.common.memory_bytes {
         return Err(Failure { exit: ErrorCode::AdmissionOrResourceLimit, code: "text_job_native_memory" });
     }
     Ok(())
 }
 /// Price the host's independent full-context KV, native workspace/sampler and
-/// output_claim while CLI preparation and complete job buffers coexist.
+/// output_claim while CLI preparation and the selected job input owner coexist.
+#[allow(clippy::too_many_arguments)]
 fn simultaneous_memory(width: usize, native: Int4GenerationBudget, task: TaskBudget,
-    host: JobHostLimits, job: JobLimits, common: Int4Limits) -> Result<u64, Failure> {
+    host: JobHostLimits, job: JobLimits, common: Int4Limits, input: JobInputMemory) -> Result<u64, Failure> {
     let need = Int4MemoryRequirement::for_context(host.native.context_tokens, width)
         .map_err(|_| Failure::usage("text_job_native_quote"))?;
     if need != common.native || native.max_kv_bytes != need.kv_bytes || task.max_kv_bytes != need.kv_bytes
@@ -165,7 +168,7 @@ fn simultaneous_memory(width: usize, native: Int4GenerationBudget, task: TaskBud
         return Err(Failure::usage("text_job_native_quote"));
     }
     sum(&[common.preparation_bytes, common.load.weight_payload_bytes, ALLOCATOR_BYTES,
-        host.required_buffer_bytes(job).map_err(host_failure)?,
+        host.required_buffer_bytes_for_input(job, input).map_err(host_failure)?,
         need.kv_bytes, need.rope_bytes, need.scratch_payload_bound,
         host.native.allocator_reserve_bytes, native.max_sampler_bytes,
         product(task.max_output_bytes, 4)?, product(u64::from(task.max_output_tokens), 8)?, 4096,

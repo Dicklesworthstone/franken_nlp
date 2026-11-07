@@ -36,7 +36,7 @@ fn fixture(width: usize) -> (TaskBudget, Int4ScoredBatchLimits, JobLimits, JobHo
 fn full_population_and_group_specific_native_storage_are_charged_together() {
     for width in [1, 3, 32, 127, 128, MAX_MODEL_K] {
         let (task, work, job, host) = fixture(width);
-        let needed = requirements(width, task, work, job, host).unwrap();
+        let needed = requirements(width, task, work, job, host, JobInputMemory::CompletePopulation).unwrap();
         assert_eq!(needed.input_bytes, host.required_buffer_bytes(job).unwrap());
         assert_eq!(needed.native, Int4MemoryRequirement::for_context(32, width).unwrap());
         assert_eq!(needed.native.kv_bytes, task.max_kv_bytes);
@@ -50,7 +50,7 @@ fn multihead_work_is_independent_of_one_reused_kv_context() {
     let (task, work, job, host) = fixture(128);
     assert!(work.max_item_work.forward_positions > host.native.context_tokens as u64);
     assert!(work.max_model_work.forward_positions > work.max_item_work.forward_positions);
-    requirements(128, task, work, job, host).unwrap();
+    requirements(128, task, work, job, host, JobInputMemory::CompletePopulation).unwrap();
 }
 
 #[test]
@@ -66,18 +66,18 @@ fn every_lifetime_counter_must_match_and_scoring_never_grants_masks() {
             4 => wrong.max_work.model.projections.multiply_accumulates += 1,
             _ => wrong.max_work.mask_node_visits = 1,
         }
-        assert!(requirements(128, task, work, wrong, host).is_err(), "axis {axis}");
+        assert!(requirements(128, task, work, wrong, host, JobInputMemory::CompletePopulation).is_err(), "axis {axis}");
     }
 }
 
 #[test]
 fn item_and_attempt_counts_never_multiply_compute_authority() {
     let (task, work, mut job, host) = fixture(128);
-    let before = requirements(128, task, work, job, host).unwrap();
+    let before = requirements(128, task, work, job, host, JobInputMemory::CompletePopulation).unwrap();
     let immutable = job.max_work;
     job.max_items = 100;
     job.max_attempts = 100;
-    let after = requirements(128, task, work, job, host).unwrap();
+    let after = requirements(128, task, work, job, host, JobInputMemory::CompletePopulation).unwrap();
     assert_eq!(job.max_work, immutable);
     assert_eq!(before.native, after.native);
     assert_eq!(after.input_bytes - before.input_bytes, 98 * 1024);
@@ -90,12 +90,12 @@ fn incomplete_kv_or_result_capacity_refuses_before_population_access() {
         let mut wrong = task;
         match axis { 0 => wrong.max_kv_bytes = 0, 1 => wrong.max_kv_bytes -= 1,
             2 => wrong.max_output_bytes = 0, _ => wrong.max_output_bytes = job.max_result_bytes as u64 + 1 }
-        assert!(requirements(128, wrong, work, job, host).is_err(), "axis {axis}");
+        assert!(requirements(128, wrong, work, job, host, JobInputMemory::CompletePopulation).is_err(), "axis {axis}");
     }
     // A larger explicit task ceiling is not a larger native allocation.
     let mut ceiling = task;
     ceiling.max_kv_bytes += 1;
-    assert_eq!(requirements(128, ceiling, work, job, host).unwrap().native.kv_bytes, task.max_kv_bytes);
+    assert_eq!(requirements(128, ceiling, work, job, host, JobInputMemory::CompletePopulation).unwrap().native.kv_bytes, task.max_kv_bytes);
 }
 
 #[test]
@@ -116,9 +116,9 @@ fn impossible_context_and_missing_or_overflowing_host_storage_are_refused() {
             9 => wrong.transport.max_stream_bytes = 0,
             _ => wrong.transport.max_lines = 0,
         }
-        assert!(requirements(128, task, work, job, wrong).is_err(), "axis {axis}");
+        assert!(requirements(128, task, work, job, wrong, JobInputMemory::CompletePopulation).is_err(), "axis {axis}");
     }
-    assert!(requirements(0, task, work, job, host).is_err());
+    assert!(requirements(0, task, work, job, host, JobInputMemory::CompletePopulation).is_err());
 }
 
 #[test]
@@ -135,7 +135,7 @@ fn per_item_work_cannot_exceed_any_frozen_lifetime_axis() {
             _ => wrong.max_model_work.projections.multiply_accumulates -= 1,
         }
         job.max_work = JobWork::from_int4(wrong.max_model_work, 0);
-        assert!(requirements(128, task, wrong, job, host).is_err(), "axis {axis}");
+        assert!(requirements(128, task, wrong, job, host, JobInputMemory::CompletePopulation).is_err(), "axis {axis}");
     }
 }
 

@@ -62,7 +62,7 @@ fn request(identity: &ExecutionIdentity, envelope: GenerationEnvelope) -> Int4Ge
 #[test]
 fn full_population_context_and_sampler_coexist_in_the_same_admission() {
     let (task, envelope, job, host) = fixture();
-    let need = requirements(WIDTH, task, envelope, job, host).unwrap();
+    let need = requirements(WIDTH, task, envelope, job, host, JobInputMemory::CompletePopulation).unwrap();
     assert_eq!(need.input_bytes, host.required_buffer_bytes(job).unwrap());
     assert_eq!(need.native.kv_bytes, task.max_kv_bytes);
     assert_eq!(need.workspace_bytes, need.native.rope_bytes + need.native.scratch_payload_bound
@@ -79,7 +79,7 @@ fn looser_or_tighter_context_and_kv_cannot_change_the_frozen_recipe() {
         match axis { 0 => task.max_kv_bytes -= 1, 1 => task.max_kv_bytes += 1,
             2 => envelope.native.max_kv_bytes -= 1, 3 => envelope.kv_bytes += 1,
             4 => envelope.context_tokens -= 1, _ => host.native.context_tokens += 1 }
-        assert!(requirements(WIDTH, task, envelope, job, host).is_err(), "axis {axis}");
+        assert!(requirements(WIDTH, task, envelope, job, host, JobInputMemory::CompletePopulation).is_err(), "axis {axis}");
     }
 }
 
@@ -91,7 +91,7 @@ fn missing_reserves_and_workspace_overflow_refuse_before_input() {
             2 => host.journal_reserve_bytes = 0, 3 => host.serialization_reserve_bytes = 0,
             4 => host.native.allocator_reserve_bytes = 0, 5 => envelope.native.max_sampler_bytes = 0,
             _ => envelope.native.max_sampler_bytes = u64::MAX }
-        assert!(requirements(WIDTH, task, envelope, job, host).is_err(), "axis {axis}");
+        assert!(requirements(WIDTH, task, envelope, job, host, JobInputMemory::CompletePopulation).is_err(), "axis {axis}");
     }
 }
 
@@ -108,6 +108,25 @@ fn every_actual_work_axis_remains_within_the_persisted_lifetime_envelope() {
             3 => tighter.lifetime.model.projections.dot_products -= 1,
             _ => tighter.lifetime.model.projections.multiply_accumulates -= 1 }
         assert!(check_request(WIDTH, &base, tighter, &req).is_err(), "axis {axis}");
+    }
+}
+
+#[test]
+fn retained_generation_drops_only_snapshot_copies_and_keeps_sampler_and_native_floors() {
+    let (task, envelope, job, host) = fixture();
+    let complete = requirements(WIDTH, task, envelope, job, host, JobInputMemory::CompletePopulation).unwrap();
+    let retained = requirements(WIDTH, task, envelope, job, host, JobInputMemory::RetainedRecord).unwrap();
+    assert_eq!(complete.input_bytes - retained.input_bytes, 2 * job.max_snapshot_bytes);
+    assert_eq!(retained.input_bytes, host.required_buffer_bytes_for_input(job, JobInputMemory::RetainedRecord).unwrap());
+    assert_eq!(retained.native, complete.native);
+    assert_eq!(retained.workspace_bytes, complete.workspace_bytes);
+    for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
+        let mut short = job; short.max_work.model.projections.multiply_accumulates -= 1;
+        assert!(requirements(WIDTH, task, envelope, short, host, input).is_err());
+        let mut missing = envelope; missing.native.max_sampler_bytes = 0;
+        assert!(requirements(WIDTH, task, missing, job, host, input).is_err());
+        let mut missing = host; missing.native.allocator_reserve_bytes = 0;
+        assert!(requirements(WIDTH, task, envelope, job, missing, input).is_err());
     }
 }
 

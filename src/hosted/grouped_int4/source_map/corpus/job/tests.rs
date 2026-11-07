@@ -95,7 +95,7 @@ fn shared_quote_matches_job_host_population_and_independent_native_phase_peaks()
                 let (mut config, job, host) = fixture(mode);
                 config.mapping.reduction.map_batch_chunks = chunks.unwrap_or(1);
                 let actual = int4_question_document_job_requirements(WIDTH, config, job, host,
-                    1 << 20, chunks, groups).unwrap();
+                    1 << 20, chunks, groups, JobInputMemory::CompletePopulation).unwrap();
                 let expected = Int4QuestionDocumentJobMemoryLimits {
                     document: Int4QuestionDocumentMemoryLimits { context_tokens: host.native.context_tokens,
                         allocator_reserve_bytes: host.native.allocator_reserve_bytes,
@@ -104,7 +104,7 @@ fn shared_quote_matches_job_host_population_and_independent_native_phase_peaks()
                         cohort_chunks: chunks, hierarchy_groups: groups },
                     transport: host.transport, journal_reserve_bytes: host.journal_reserve_bytes,
                     serialization_reserve_bytes: host.serialization_reserve_bytes,
-                }.requirements(WIDTH, config, job).unwrap();
+                }.requirements(WIDTH, config, job, JobInputMemory::CompletePopulation).unwrap();
                 assert_eq!(actual, expected);
                 assert_eq!(actual.population_buffer_bytes, host.required_buffer_bytes(job).unwrap());
                 assert_eq!(actual.document.native.kv_bytes,
@@ -122,7 +122,7 @@ fn durable_output_admission_keeps_every_hierarchy_transcript_and_exact_result_ca
         let (mut config, job, host) = fixture(mode); config.mapping.reduction.map_batch_chunks = 3;
         let groups = (mode == 2).then_some(2);
         let quote = int4_question_document_job_requirements(WIDTH, config, job, host,
-            1 << 20, Some(3), groups).unwrap().document;
+            1 << 20, Some(3), groups, JobInputMemory::CompletePopulation).unwrap().document;
         let capacity = QuestionCapacity { config, kv_bytes: quote.native.kv_bytes,
             max_result_bytes: quote.max_output_bytes, max_output_tokens: quote.max_output_tokens };
         let base = identity(); let identities = [base.clone()];
@@ -155,18 +155,18 @@ fn durable_quote_rejects_work_verification_and_run_limits_before_population_io()
             3 => changed.max_work.model.projections.dot_products -= 1,
             4 => changed.max_work.model.projections.multiply_accumulates -= 1,
             _ => changed.max_work.mask_node_visits -= 1 }
-        assert!(int4_question_document_job_requirements(WIDTH, config, changed, host, 1 << 20, None, None).is_err());
+        assert!(int4_question_document_job_requirements(WIDTH, config, changed, host, 1 << 20, None, None, JobInputMemory::CompletePopulation).is_err());
     }
     for field in 0..6 {
         let mut changed = config;
         let pool = if field < 3 { &mut changed.max_map_verification } else { &mut changed.max_verification };
         match field % 3 { 0 => pool.max_fields -= 1, 1 => pool.max_matches -= 1, _ => pool.max_scan_steps -= 1 }
-        assert!(int4_question_document_job_requirements(WIDTH, changed, job, host, 1 << 20, None, None).is_err());
+        assert!(int4_question_document_job_requirements(WIDTH, changed, job, host, 1 << 20, None, None, JobInputMemory::CompletePopulation).is_err());
     }
     let mut changed = job; changed.max_attempts += 1;
-    assert!(int4_question_document_job_requirements(WIDTH, config, changed, host, 1 << 20, None, None).is_err());
+    assert!(int4_question_document_job_requirements(WIDTH, config, changed, host, 1 << 20, None, None, JobInputMemory::CompletePopulation).is_err());
     let mut changed = host; changed.native.run.max_checkpoints = 0;
-    assert!(int4_question_document_job_requirements(WIDTH, config, job, changed, 1 << 20, None, None).is_err());
+    assert!(int4_question_document_job_requirements(WIDTH, config, job, changed, 1 << 20, None, None, JobInputMemory::CompletePopulation).is_err());
 }
 
 #[test]
@@ -174,9 +174,9 @@ fn separate_decoded_maxima_do_not_replace_encoded_population_or_host_ownership_c
     let (mut config, job, host) = fixture(1);
     config.mapping.chunks.max_input_bytes = job.max_input_bytes_per_item;
     config.max_question_bytes = job.max_input_bytes_per_item;
-    let original = int4_question_document_job_requirements(WIDTH, config, job, host, 1 << 20, None, None).unwrap();
+    let original = int4_question_document_job_requirements(WIDTH, config, job, host, 1 << 20, None, None, JobInputMemory::CompletePopulation).unwrap();
     let mut larger = job; larger.max_snapshot_bytes += 4096;
-    let larger = int4_question_document_job_requirements(WIDTH, config, larger, host, 1 << 20, None, None).unwrap();
+    let larger = int4_question_document_job_requirements(WIDTH, config, larger, host, 1 << 20, None, None, JobInputMemory::CompletePopulation).unwrap();
     assert_eq!(larger.document.input_bytes - original.document.input_bytes, 8192);
     assert_eq!(larger.population_buffer_bytes - original.population_buffer_bytes, 8192);
     assert_eq!(larger.document.native, original.document.native);
@@ -186,7 +186,7 @@ fn separate_decoded_maxima_do_not_replace_encoded_population_or_host_ownership_c
             2 => changed.serialization_reserve_bytes = 0, 3 => changed.preparation_reserve_bytes = u64::MAX,
             4 => changed.io_reserve_bytes = u64::MAX, 5 => changed.journal_reserve_bytes = u64::MAX,
             _ => changed.transport.max_stream_bytes = 0 }
-        assert!(int4_question_document_job_requirements(WIDTH, config, job, changed, 1 << 20, None, None).is_err());
+        assert!(int4_question_document_job_requirements(WIDTH, config, job, changed, 1 << 20, None, None, JobInputMemory::CompletePopulation).is_err());
     }
 }
 

@@ -45,7 +45,7 @@ pub(in crate::candidate_cli) fn execute<R: Read + Send + 'static>(mode: RunMode,
     let session = Session::new(&args.common, limits)?;
     let lifetime = command::parse_limits(&read_config(&session, &args.limits_file, command::LIMIT_BYTES)?)?;
     args.check_lifetime(lifetime, limits)?;
-    preflight_memory(host_limits(&args, limits, &session)?, lifetime, limits)?;
+    preflight_memory(host_limits(&args, limits, &session)?, lifetime, limits, args.input_retention.input_memory()?)?;
     let key = JobSecret::read(&args.key_file).map_err(job_failure)?;
     session.remaining()?;
     let facts = session.facts(&args.common)?;

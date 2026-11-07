@@ -115,9 +115,8 @@ impl JobArgs {
         let io_reserve_bytes = product(IO_BUFFER_BYTES as u64, 2)?;
         let journal_reserve_bytes = product(self.storage.journal_memory_mib, MIB)?;
         let serialization_reserve_bytes = product(self.storage.serialization_memory_mib, MIB)?;
-        let buffer_bytes = sum(&[product(job.max_snapshot_bytes, 2)?, product(job.max_items, 1024)?,
-            product(job.max_input_bytes_per_item as u64, 8)?, product(job.max_result_bytes as u64, 4)?,
-            2 * MIB, preparation_reserve_bytes, io_reserve_bytes,
+        let buffer_bytes = sum(&[self.storage.input_retention.buffer_bytes(job)?,
+            preparation_reserve_bytes, io_reserve_bytes,
             journal_reserve_bytes, serialization_reserve_bytes])?;
         // Original and replayed descriptors retain each claim-aware chunk's
         // evidence-head identities alongside the complete-source quote.

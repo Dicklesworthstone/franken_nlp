@@ -92,7 +92,7 @@ fn request<'a>(ids: &'a [ExecutionIdentity], mapping: Int4SourceMapLimits, kv: u
 fn complete_population_question_frontier_and_native_workspace_are_reserved_together() {
     let (budget, planning, mapping, job, host) = fixture();
     let need = document_requirements(WIDTH, budget, planning, mapping, 65536,
-        job, host, 123456, 8192).unwrap();
+        job, host, 123456, 8192, JobInputMemory::CompletePopulation).unwrap();
     assert_eq!(need.input_bytes, host.required_buffer_bytes(job).unwrap() + 8192);
     assert_eq!(need.document_workspace_bytes, 123456);
     assert_eq!(need.native.kv_bytes, budget.max_kv_bytes);
@@ -110,7 +110,7 @@ fn context_and_kv_must_match_the_immutable_factory_before_population_access() {
             _ => host.native.allocator_reserve_bytes = 0,
         }
         assert!(document_requirements(WIDTH, budget, planning, mapping, 65536,
-            job, host, 65536, 0).is_err(), "axis {axis}");
+            job, host, 65536, 0, JobInputMemory::CompletePopulation).is_err(), "axis {axis}");
     }
 }
 
@@ -119,7 +119,7 @@ fn cohort_phase_reservation_keeps_population_question_and_complete_frontier_char
     use crate::tasks::source_planning::grouped_int4::long::cohort::Int4SourceMapCohortMemoryLimits;
     let (budget, planning, mapping, job, host) = fixture();
     let serial = document_requirements(WIDTH, budget, planning, mapping, 65536,
-        job, host, 123456, 8192).unwrap();
+        job, host, 123456, 8192, JobInputMemory::CompletePopulation).unwrap();
     for chunks in [1, 2, 4] {
         let quote = Int4SourceMapCohortMemoryLimits { max_chunks: chunks, context_tokens: 64,
             max_output_tokens_per_chunk: 16, max_result_bytes_per_chunk: 4096 }.requirements(WIDTH).unwrap()
@@ -142,7 +142,7 @@ fn partial_cohort_peaks_cannot_replace_complete_job_native_authority() {
     use crate::tasks::source_planning::grouped_int4::long::cohort::Int4SourceMapCohortMemoryLimits;
     let (budget, planning, mapping, job, host) = fixture();
     let serial = document_requirements(WIDTH, budget, planning, mapping, 65536,
-        job, host, 123456, 8192).unwrap();
+        job, host, 123456, 8192, JobInputMemory::CompletePopulation).unwrap();
     let quote = Int4SourceMapCohortMemoryLimits { max_chunks: 4, context_tokens: 64,
         max_output_tokens_per_chunk: 16, max_result_bytes_per_chunk: 4096 }.requirements(WIDTH).unwrap();
     for axis in 0..5 {
@@ -181,7 +181,7 @@ fn every_native_axis_and_masks_must_fit_the_persisted_lifetime_ceiling() {
             _ => job.max_work.mask_node_visits -= 1,
         }
         assert!(document_requirements(WIDTH, budget, planning, mapping, 65536,
-            job, host, 65536, 0).is_err(), "axis {axis}");
+            job, host, 65536, 0, JobInputMemory::CompletePopulation).is_err(), "axis {axis}");
     }
 }
 
@@ -191,11 +191,11 @@ fn selected_summary_can_have_a_smaller_final_envelope_than_each_native_map() {
     // The input population may choose a stricter independent source bound.
     job.max_input_bytes_per_item = 4096;
     assert!(document_requirements(WIDTH, budget, planning, mapping, 1024,
-        job, host, 65536, 0).is_ok());
+        job, host, 65536, 0, JobInputMemory::CompletePopulation).is_ok());
     assert!(document_requirements(WIDTH, budget, planning, mapping, job.max_result_bytes as u64 + 1,
-        job, host, 65536, 0).is_err());
+        job, host, 65536, 0, JobInputMemory::CompletePopulation).is_err());
     assert!(document_requirements(WIDTH, budget, planning, mapping, 0,
-        job, host, 65536, 0).is_err());
+        job, host, 65536, 0, JobInputMemory::CompletePopulation).is_err());
 }
 
 #[test]
@@ -318,14 +318,51 @@ fn question_capacity_and_all_passes_are_owned_until_physical_completion() {
 fn zero_reserves_and_overflow_cannot_create_small_job_memory_claims() {
     let (budget, planning, mapping, job, host) = fixture();
     assert!(document_requirements(WIDTH, budget, planning, mapping, 65536,
-        job, host, 0, 0).is_err());
+        job, host, 0, 0, JobInputMemory::CompletePopulation).is_err());
     assert!(document_requirements(WIDTH, budget, planning, mapping, 65536,
-        job, host, 65536, u64::MAX).is_err());
+        job, host, 65536, u64::MAX, JobInputMemory::CompletePopulation).is_err());
     for axis in 0..4 {
         let mut host = host;
         match axis { 0 => host.preparation_reserve_bytes = 0, 1 => host.io_reserve_bytes = 0,
             2 => host.journal_reserve_bytes = 0, _ => host.serialization_reserve_bytes = 0 }
         assert!(document_requirements(WIDTH, budget, planning, mapping, 65536,
-            job, host, 65536, 0).is_err(), "axis {axis}");
+            job, host, 65536, 0, JobInputMemory::CompletePopulation).is_err(), "axis {axis}");
+    }
+}
+
+#[test]
+fn retained_document_and_cohort_hosts_preserve_question_frontier_and_whole_work_authority() {
+    use crate::tasks::source_planning::grouped_int4::long::cohort::Int4SourceMapCohortMemoryLimits;
+    let (budget, planning, mapping, job, host) = fixture();
+    let complete = document_requirements(WIDTH, budget, planning, mapping, 65536,
+        job, host, 123456, 8192, JobInputMemory::CompletePopulation).unwrap();
+    let retained = document_requirements(WIDTH, budget, planning, mapping, 65536,
+        job, host, 123456, 8192, JobInputMemory::RetainedRecord).unwrap();
+    assert_eq!(complete.input_bytes - retained.input_bytes, 2 * job.max_snapshot_bytes);
+    assert_eq!(retained.input_bytes, host.required_buffer_bytes_for_input(job, JobInputMemory::RetainedRecord).unwrap() + 8192);
+    assert_eq!(retained.native, complete.native);
+    assert_eq!(retained.native_workspace_bytes, complete.native_workspace_bytes);
+    assert_eq!(retained.document_workspace_bytes, complete.document_workspace_bytes);
+    for chunks in [1, 2, 4] {
+        let quote = Int4SourceMapCohortMemoryLimits { max_chunks: chunks, context_tokens: 64,
+            max_output_tokens_per_chunk: 16, max_result_bytes_per_chunk: 4096 }.requirements(WIDTH).unwrap()
+            .with_synthesis_context(64, WIDTH, budget.max_kv_bytes).unwrap();
+        let mut full_cohort = complete; let mut retained_cohort = retained;
+        full_cohort.use_cohorts(quote, host.native.allocator_reserve_bytes).unwrap();
+        retained_cohort.use_cohorts(quote, host.native.allocator_reserve_bytes).unwrap();
+        assert_eq!(full_cohort.input_bytes - retained_cohort.input_bytes, 2 * job.max_snapshot_bytes);
+        assert_eq!(retained_cohort.native, full_cohort.native);
+        assert_eq!(retained_cohort.native_workspace_bytes, full_cohort.native_workspace_bytes);
+        assert_eq!(retained_cohort.document_workspace_bytes, full_cohort.document_workspace_bytes);
+    }
+    for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
+        let mut short = job; short.max_work.model.attention_pairs -= 1;
+        assert!(document_requirements(WIDTH, budget, planning, mapping, 65536,
+            short, host, 123456, 8192, input).is_err());
+        let mut missing = host; missing.native.allocator_reserve_bytes = 0;
+        assert!(document_requirements(WIDTH, budget, planning, mapping, 65536,
+            job, missing, 123456, 8192, input).is_err());
+        assert!(document_requirements(WIDTH, budget, planning, mapping, 65536,
+            job, host, 0, 8192, input).is_err());
     }
 }

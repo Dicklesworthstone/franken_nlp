@@ -24,7 +24,7 @@ impl NlpEngine {
         let mapping = planner.document_limits();
         check_capacity(planner.document_budget(), mapping.mapping.chunks.context_tokens,
             limits.native.context_tokens, required.kv_bytes, reduction_reserve_bytes)?;
-        let bytes = sum(&[limits.reservation_bytes(request.limits)?,
+        let bytes = sum(&[limits.required_buffer_bytes_for_input(request.limits, request.mode.input_memory())?,
             crate::hosted::extraction_map::document_workspace_bytes(planner.document_budget(), mapping,
                 mapping.mapping.chunks.max_chunks, reduction_reserve_bytes)?])?;
         let lease = self.resources().acquire_lease();

@@ -12,10 +12,12 @@ mod commitment;
 mod manifest;
 mod frame;
 mod retained;
+mod memory;
 pub mod population;
 pub use commitment::{Commitment, JobId, JobSecret};
 pub use manifest::{FrozenManifest, JobContract, JobInput, JobLimits, JobWork};
 pub use retained::{InputRetentionLimits, RetainedInputReport};
+pub use memory::JobInputMemory;
 
 #[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod journal;

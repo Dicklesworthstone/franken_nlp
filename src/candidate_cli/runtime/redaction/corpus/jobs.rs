@@ -35,7 +35,8 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         .map_err(|_| CandidateError::Input)?;
     retention.check_limits(&command, envelope, lifetime)?;
     let host = host_limits(&command, &common, limits, envelope, &session)?;
-    let minimum = host.required_buffer_bytes(lifetime).map_err(|_| CandidateError::Memory)?
+    let input_memory = retention.input_retention.input_memory().map_err(|_| CandidateError::Arguments)?;
+    let minimum = host.required_buffer_bytes_for_input(lifetime, input_memory).map_err(|_| CandidateError::Memory)?
         .checked_add(limits.preparation_bytes).and_then(|n| n.checked_add(limits.weight_bytes))
         .ok_or(CandidateError::Memory)?;
     if minimum > limits.memory_bytes { return Err(CandidateError::Memory); }

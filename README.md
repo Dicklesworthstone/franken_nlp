@@ -1988,9 +1988,21 @@ reconstruct the same execution recipe.
 Creation syncs a protected `inputs.spool` before publishing its authenticated
 journal receipt. Resume holds the same exclusive job lock while checking the
 receipt, every bounded frame, the original population and the fresh processor
-recipe before result recovery or native work. Committed items remain skipped;
-spent attempts and work budgets stay spent. A file without a receipt cannot
-authorize replay. The in-memory snapshot and item ceilings still apply.
+recipe, including every record's typed arguments, before result recovery or
+native work. Committed items are verified during that scan and skipped during
+execution; one authenticated bookmark starts replay at the next pending item.
+Spent attempts and work budgets stay spent. A file without a receipt cannot
+authorize replay. The logical snapshot and item ceilings still apply.
+
+Retained resume keeps one reusable record buffer and the bounded keyed
+metadata index instead of rebuilding the payload population. INT8/INT4 hosts
+and CLI preloading share the same input-mode quote, including a separate
+strict JSON parser reserve for dense arrays, sparse objects and deep diagnostic
+paths. Only retained replay removes the two complete-snapshot allowances;
+creation and resume with an external input file keep them. The existing
+100,000-item ceiling remains, and a large per-record limit can still require
+substantial admitted memory. This is bounded-record replay, with no measured
+RSS or throughput claim.
 
 `fnlp job status` and `verify` also authenticate retained inputs without a
 model, one record at a time. Their optional retention report exposes only

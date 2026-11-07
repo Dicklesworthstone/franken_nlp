@@ -109,6 +109,27 @@ fn retained_route_never_accepts_ignored_prefill_cohort_or_per_record_policy_flag
 }
 
 #[test]
+fn retained_generation_and_chat_resume_admit_only_the_live_input_record() {
+    for task in ["generate", "chat"] {
+        let (start, args) = command("start", task, &["--spool-input", "--max-retained-input-mib", "8"]);
+        let common = start.args.validate(&args).unwrap();
+        let job = lifetime(&args, common);
+        let full = start.args.lifetime_limits(&args, common, job).unwrap();
+        let (resume, args) = command("resume", task, &["--use-retained-input", "--max-retained-input-mib", "8"]);
+        let common = resume.args.validate(&args).unwrap();
+        let replay = resume.args.lifetime_limits(&args, common, job).unwrap();
+        assert_eq!(replay.buffer_bytes + 2 * job.max_snapshot_bytes, full.buffer_bytes);
+        assert_eq!(replay.common.minimum_memory_bytes + 2 * job.max_snapshot_bytes, full.common.minimum_memory_bytes);
+        assert_eq!(replay.native.native.max_forward_positions, full.native.native.max_forward_positions);
+        assert_eq!(replay.native.native.max_projection_work, full.native.native.max_projection_work);
+        assert_eq!(replay.native.max_sampler_bytes, full.native.max_sampler_bytes);
+        assert_eq!(replay.common.native, full.common.native);
+        let mut large = job; large.max_snapshot_bytes = common.memory_bytes;
+        assert_eq!(resume.args.lifetime_limits(&args, common, large).unwrap().buffer_bytes, replay.buffer_bytes);
+    }
+}
+
+#[test]
 fn seeded_generation_options_preserve_stops_penalties_and_logprobs_without_reseeding() {
     let seed = "ab".repeat(32);
     let (c, args) = command("resume", "chat", &["--seed", &seed, "--temperature-milli", "600",

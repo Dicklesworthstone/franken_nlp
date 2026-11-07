@@ -20,7 +20,7 @@ impl NlpEngine {
         self.check_resident_domain(model)?;
         check_model_identity(model.artifact_identity(), &config.identity)?;
         validate_work(config.max_model_work)?;
-        let bytes = limits.reservation_bytes(request.limits)?;
+        let bytes = limits.required_buffer_bytes_for_input(request.limits, request.mode.input_memory())?;
         let required = requirements(limits.native)?;
         let output_bytes = capacity(config.task_ceiling, required.kv_bytes, request.limits.max_result_bytes)?;
         let lease = self.resources().acquire_lease();
@@ -71,7 +71,7 @@ impl NlpEngine {
         self.check_resident_domain(model)?;
         check_model_identity(model.artifact_identity(), &config.identity)?;
         config.validate(&planner).map_err(HostedError::BatchSetup)?;
-        let bytes = limits.reservation_bytes(request.limits)?;
+        let bytes = limits.required_buffer_bytes_for_input(request.limits, request.mode.input_memory())?;
         let required = requirements(limits.native)?;
         capacity(config.task_ceiling, required.kv_bytes, request.limits.max_result_bytes)?;
         let lease = self.resources().acquire_lease();

@@ -33,15 +33,17 @@ fn hosted_buffer_quote_matches_complete_population_and_private_recipe_capacity_e
     let stored = lifetime(&args, document);
     let limits = job.args.lifetime_limits(&args, document, stored).unwrap();
     let host = host_limits(&args, limits, Duration::from_secs(19));
-    check_host_quote(host, stored, limits.buffer_bytes).unwrap();
-    assert_eq!(check_host_quote(host, stored, limits.buffer_bytes - 1).unwrap_err().code, "job_host_memory_quote");
+    check_host_quote(host, stored, limits.buffer_bytes, JobInputMemory::CompletePopulation).unwrap();
+    assert_eq!(check_host_quote(host, stored, limits.buffer_bytes - 1, JobInputMemory::CompletePopulation)
+        .unwrap_err().code, "job_host_memory_quote");
     assert_eq!(RECIPE_RESERVE_BYTES, INT4_REDACTION_JOB_RECIPE_BYTES as u64 * 4);
     assert_eq!(host.native.context_tokens, args.context_tokens);
     assert_eq!(host.native.run.max_checkpoints, args.max_checkpoints);
     assert_eq!(host.native.run.max_elapsed, Duration::from_secs(19));
     assert_eq!(host.preparation_reserve_bytes, document.common.preparation_bytes);
     let mut invalid = host; invalid.serialization_reserve_bytes = 0;
-    assert_eq!(check_host_quote(invalid, stored, limits.buffer_bytes).unwrap_err().code, "job_host_admission");
+    assert_eq!(check_host_quote(invalid, stored, limits.buffer_bytes, JobInputMemory::CompletePopulation)
+        .unwrap_err().code, "job_host_admission");
 }
 
 #[test]

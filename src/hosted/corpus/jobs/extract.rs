@@ -16,7 +16,7 @@ impl NlpEngine {
     where R: BufRead + Send + 'static {
         dispatch::preflight(self, limits.native.run)?;
         self.check_resident_domain(model)?;
-        let bytes = limits.reservation_bytes(request.limits)?;
+        let bytes = limits.required_buffer_bytes_for_input(request.limits, request.mode.input_memory())?;
         let required = requirements(limits.native)?;
         check_model_identity(model.artifact_identity(), planner.execution_identity())?;
         check_storage(planner.task_ceiling(), request.limits, required.kv_bytes)?;

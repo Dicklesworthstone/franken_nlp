@@ -247,7 +247,7 @@ fn parse<P: BatchProcessor>(input: &JobInput<'_>, limits: JobLimits)
     }
     let text = std::str::from_utf8(input.original).map_err(|_| JobRunError::InvalidEnvelope)?;
     let value = canonjson::parse_str_with_limits(text, canonjson::ParseLimits {
-        max_depth: 64, max_string_bytes: limits.max_input_bytes_per_item,
+        max_depth: super::memory::INPUT_JSON_DEPTH, max_string_bytes: limits.max_input_bytes_per_item,
     }).map_err(|_| JobRunError::InvalidEnvelope)?;
     let document: BatchDocument<P::Args> = serde_json::from_value(value).map_err(|_| JobRunError::InvalidEnvelope)?;
     if document.id != input.id { return Err(JobRunError::InvalidEnvelope); }

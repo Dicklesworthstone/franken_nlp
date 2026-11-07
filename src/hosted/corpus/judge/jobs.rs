@@ -40,7 +40,7 @@ impl NlpEngine {
         self.check_resident_domain(model)?;
         check_model_identity(model.artifact_identity(), &config.identity)?;
         config.validate(&planner)?;
-        let bytes = limits.required_buffer_bytes(request.limits)?;
+        let bytes = limits.required_buffer_bytes_for_input(request.limits, request.mode.input_memory())?;
         let required = requirements(limits.native)?;
         check_capacity(config.task_ceiling, required.kv_bytes, request.limits.max_result_bytes)?;
         let scratch_bytes = crate::hosted::scored::scoring_scratch(sum(&[required.rope_bytes,

@@ -35,7 +35,7 @@ impl NlpEngine {
         capacity(config.batch.detector.planning.max_context_tokens, config.batch.detector.per_pass.max_kv_bytes,
             config.batch.detector.max_result_bytes, config.edit_reserve_bytes,
             limits.native.context_tokens, required.kv_bytes, request.limits.max_result_bytes)?;
-        let buffers = sum(&[limits.required_buffer_bytes(request.limits)?, temporary_bytes(&config)?,
+        let buffers = sum(&[limits.required_buffer_bytes_for_input(request.limits, request.mode.input_memory())?, temporary_bytes(&config)?,
             secret_bytes(pseudonyms.as_ref())?, 4 * RECIPE_BYTES as u64])?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, buffers)?,

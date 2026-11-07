@@ -5,7 +5,7 @@ use crate::{
     batch::{BatchCode, BatchFault, BatchLimits, BatchWork,
         source::grouped_int4::question::{Int4QuestionDocumentBatchConfig,
             memory::{Int4QuestionDocumentMemoryLimits, Int4QuestionDocumentMemoryRequirement}}},
-    jobs::{JobLimits, population::PopulationReadLimits},
+    jobs::{JobInputMemory, JobLimits, population::PopulationReadLimits},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,7 +28,7 @@ pub struct Int4QuestionDocumentJobMemoryRequirement {
 
 impl Int4QuestionDocumentJobMemoryLimits {
     pub fn requirements(self, width: usize, config: Int4QuestionDocumentBatchConfig,
-        job: JobLimits) -> Result<Int4QuestionDocumentJobMemoryRequirement, BatchFault> {
+        job: JobLimits, input: JobInputMemory) -> Result<Int4QuestionDocumentJobMemoryRequirement, BatchFault> {
         super::check_limits(config, job)?;
         self.transport.validate().map_err(|_| BatchCode::InvalidLimits)?;
         if self.journal_reserve_bytes == 0 || self.serialization_reserve_bytes == 0
@@ -40,7 +40,7 @@ impl Int4QuestionDocumentJobMemoryLimits {
         let output_line = job.max_result_bytes.max(4096);
         // The shared complete-document quote prices one bounded record parser
         // and every source/question/identity representation. The job's complete
-        // id index and original population are accounted independently below;
+        // id index and selected input lifetime are accounted independently below;
         // live epoch limits do not restrict durable item ids or populations.
         let transport = BatchLimits { max_line_bytes: job.max_input_bytes_per_item,
             max_document_bytes: config.mapping.chunks.max_input_bytes,
@@ -52,9 +52,8 @@ impl Int4QuestionDocumentJobMemoryLimits {
         let mut document = self.document.requirements(width, config, transport)
             .map_err(|_| BatchCode::InvalidLimits)?;
         let population_buffer_bytes = sum(&[
-            product(job.max_snapshot_bytes, 2)?, product(job.max_items, 1024)?,
-            product(job.max_input_bytes_per_item as u64, 8)?, product(job.max_result_bytes as u64, 4)?,
-            2 * 1024 * 1024, self.document.preparation_reserve_bytes, self.document.io_reserve_bytes,
+            input.buffer_bytes(job).map_err(|_| BatchCode::InvalidLimits)?,
+            self.document.preparation_reserve_bytes, self.document.io_reserve_bytes,
             self.journal_reserve_bytes, self.serialization_reserve_bytes,
         ])?;
         let shared = sum(&[self.document.preparation_reserve_bytes, self.document.io_reserve_bytes])?;

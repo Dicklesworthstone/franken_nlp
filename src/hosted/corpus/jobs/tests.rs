@@ -26,6 +26,37 @@ fn whole_population_is_priced_not_only_a_live_batch_window() {
     }
 }
 #[test]
+fn actual_open_mode_selects_record_memory_only_for_retained_resume() {
+    let retention = InputRetentionLimits { max_spool_bytes: 1 << 20 };
+    let cap = job_limits(); let host = host_limits();
+    let complete = host.required_buffer_bytes(cap).unwrap();
+    for mode in [JobOpenMode::Create, JobOpenMode::Resume(TailPolicy::Refuse),
+        JobOpenMode::CreateRetainingInputs(retention)] {
+        assert_eq!(mode.input_memory(), JobInputMemory::CompletePopulation);
+        assert_eq!(host.required_buffer_bytes_for_input(cap, mode.input_memory()).unwrap(), complete);
+    }
+    let mode = JobOpenMode::ResumeRetained { tail: TailPolicy::DiscardUncommitted, retention };
+    assert_eq!(mode.input_memory(), JobInputMemory::RetainedRecord);
+    let replay = host.required_buffer_bytes_for_input(cap, mode.input_memory()).unwrap();
+    assert_eq!(complete - replay, 2 * cap.max_snapshot_bytes);
+    assert_eq!(replay, JobInputMemory::RetainedRecord.buffer_bytes(cap).unwrap()
+        + host.preparation_reserve_bytes + host.io_reserve_bytes
+        + host.journal_reserve_bytes + host.serialization_reserve_bytes);
+}
+#[test]
+fn retained_quote_keeps_parser_and_host_reserves_when_snapshot_ceiling_is_large() {
+    let mut cap = job_limits(); let mut host = host_limits();
+    let mode = JobInputMemory::RetainedRecord;
+    let baseline = host.required_buffer_bytes_for_input(cap, mode).unwrap();
+    cap.max_snapshot_bytes = i64::MAX as u64;
+    assert_eq!(host.required_buffer_bytes_for_input(cap, mode).unwrap(), baseline);
+    assert!(host.required_buffer_bytes(cap).is_err());
+    cap.max_input_bytes_per_item *= 2;
+    assert!(host.required_buffer_bytes_for_input(cap, mode).unwrap() > baseline);
+    host.serialization_reserve_bytes = 0;
+    assert!(host.required_buffer_bytes_for_input(cap, mode).is_err());
+}
+#[test]
 fn each_host_overhead_is_mandatory_and_adds_to_the_same_reservation() {
     let base = host_limits(); let bytes = base.reservation_bytes(job_limits()).unwrap();
     for axis in 0..4 {

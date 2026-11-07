@@ -118,9 +118,11 @@ fn impossible_population_memory_fails_before_resident_loading() {
         transport: PopulationReadLimits { max_stream_bytes: 64 * MIB, max_lines: 1000 },
         preparation_reserve_bytes: limits.preparation_bytes, io_reserve_bytes: 131072,
         journal_reserve_bytes: 64 * MIB, serialization_reserve_bytes: 16 * MIB };
-    preflight_memory(h, lifetime(), limits).unwrap();
+    preflight_memory(h, lifetime(), limits, JobInputMemory::CompletePopulation).unwrap();
     let mut huge = lifetime(); huge.max_snapshot_bytes = i64::MAX as u64;
-    assert!(preflight_memory(h, huge, limits).is_err());
+    assert!(preflight_memory(h, huge, limits, JobInputMemory::CompletePopulation).is_err());
+    preflight_memory(h, huge, limits, JobInputMemory::RetainedRecord).unwrap();
     let mut zero = h; zero.journal_reserve_bytes = 0;
-    assert!(preflight_memory(zero, lifetime(), limits).is_err());
+    assert!(preflight_memory(zero, lifetime(), limits, JobInputMemory::CompletePopulation).is_err());
+    assert!(preflight_memory(zero, lifetime(), limits, JobInputMemory::RetainedRecord).is_err());
 }

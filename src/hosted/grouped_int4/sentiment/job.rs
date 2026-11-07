@@ -7,7 +7,7 @@ use super::corpus::{DocumentAdmission, DocumentCapacity, document_output_bytes};
 use crate::{
     batch::sentiment::grouped_int4::SENTIMENT_DOCUMENT_CHUNK_METADATA_BYTES,
     hosted::corpus::jobs::{HostedJobError, JobHostLimits, SourceJobRequest, read_population, run_population},
-    jobs::{JobLimits, JobProgress, JobWork,
+    jobs::{JobInputMemory, JobLimits, JobProgress, JobWork,
         runner::{JobRunError, scored::grouped_int4::sentiment_document::{
             Int4SentimentDocumentJobPlanner, Int4SentimentDocumentJobProcessor}}},
     native_engine::{constrained_int4, strict_int4::cohort::MAX_INT4_SEQUENCES},
@@ -50,7 +50,8 @@ impl NlpEngine {
         let max_axes = planner.max_axes();
         let cohort_chunks = planner.cohort_chunks();
         let required = requirements(planner.group_width(), planner.task_budget(),
-            planner.planning_limits(), mapping, request.limits, limits, max_axes, cohort_chunks)?;
+            planner.planning_limits(), mapping, request.limits, limits, max_axes, cohort_chunks,
+            request.mode.input_memory())?;
         if planner.max_result_bytes() != document_output_bytes(mapping, cohort_chunks)?
             || planner.retained_defaults_bytes().map_err(HostedError::BatchSetup)?
                 > limits.preparation_reserve_bytes {
@@ -132,8 +133,8 @@ fn map_memory(limits: JobHostLimits, max_axes: usize, cohort_chunks: Option<usiz
 #[allow(clippy::too_many_arguments)]
 fn requirements(width: usize, task: TaskBudget, planning: SentimentLimits,
     mapping: Int4SentimentMapLimits, job: JobLimits, host: JobHostLimits,
-    max_axes: usize, cohort_chunks: Option<usize>) -> Result<Int4SentimentMapMemoryRequirement, HostedJobError> {
-    let population = host.required_buffer_bytes(job)?;
+    max_axes: usize, cohort_chunks: Option<usize>, input: JobInputMemory) -> Result<Int4SentimentMapMemoryRequirement, HostedJobError> {
+    let population = host.required_buffer_bytes_for_input(job, input)?;
     crate::batch::sentiment::grouped_int4::validate_limits(task, planning, mapping,
         job.max_work.int4_model_work()).map_err(HostedError::BatchSetup)?;
     if host.native.context_tokens != mapping.chunks.context_tokens

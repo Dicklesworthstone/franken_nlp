@@ -27,7 +27,7 @@ impl NlpEngine {
         capacity(d.planning.max_context_tokens.max(d.mapping.chunks.context_tokens), d.per_chunk.max_kv_bytes,
             d.max_result_bytes, config.edit_reserve_bytes, limits.native.context_tokens,
             required.kv_bytes, request.limits.max_result_bytes)?;
-        let buffers = sum(&[limits.required_buffer_bytes(request.limits)?,
+        let buffers = sum(&[limits.required_buffer_bytes_for_input(request.limits, request.mode.input_memory())?,
             super::super::long::temporary_bytes(d, config.edit_reserve_bytes)?,
             secret_bytes(pseudonyms.as_ref())?, 4 * RECIPE_BYTES as u64])?;
         let lease = self.resources().acquire_lease();

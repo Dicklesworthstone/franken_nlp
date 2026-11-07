@@ -43,7 +43,8 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     let host = host_limits(&args, limits, remaining()?);
     let quote = crate::hosted::int4_question_document_job_requirements(args.group_width,
         limits.config, lifetime, host, limits.reduction_reserve_bytes,
-        job.questions.cohort_chunks, job.questions.cohort_hierarchy_groups).map_err(host_failure)?;
+        job.questions.cohort_chunks, job.questions.cohort_hierarchy_groups,
+        job.storage.input_retention.input_memory()?).map_err(host_failure)?;
     if quote != limits.memory { return Err(CandidateError::Memory.into()); }
     remaining()?;
     let (source, vocabulary) = source::planner()?;

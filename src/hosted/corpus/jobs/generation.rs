@@ -21,7 +21,7 @@ impl NlpEngine {
         check_model_identity(model.artifact_identity(), planner.execution_identity())?;
         let native = planner.native_limits();
         validate_work(native.max_model_work)?;
-        let bytes = limits.required_buffer_bytes(request.limits)?;
+        let bytes = limits.required_buffer_bytes_for_input(request.limits, request.mode.input_memory())?;
         let required = requirements(limits.native)?;
         capacity(planner.task_budget(), required.kv_bytes, request.limits.max_result_bytes)?;
         let scratch_bytes = workspace(sum(&[required.rope_bytes, required.scratch_payload_bound,

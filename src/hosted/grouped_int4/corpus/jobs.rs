@@ -8,7 +8,7 @@ mod document_native;
 mod generation;
 use crate::{
     hosted::corpus::jobs::{HostedJobError, JobHostLimits, SourceJobRequest, read_population, run_population},
-    jobs::{JobLimits, JobProgress,
+    jobs::{JobInputMemory, JobLimits, JobProgress,
         runner::{JobRunError, extract::grouped_int4::{Int4ExtractionJobPlanner, Int4ExtractionJobProcessor}}},
     tasks::ir::TaskBudget,
 };
@@ -42,7 +42,7 @@ impl NlpEngine {
         planner.check_job_limits(request.limits).map_err(HostedError::BatchSetup)?;
         let native_work = planner.native_limits();
         let required = job_requirements(model.model_identity().group_width(), planner.task_ceiling(),
-            request.limits, limits)?;
+            request.limits, limits, request.mode.input_memory())?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(JobInput { preparation: Some((planner, vocabulary, request)), reader }))?;
@@ -88,9 +88,9 @@ impl NlpEngine {
     }
 }
 
-fn job_requirements(width: usize, task: TaskBudget, job: JobLimits, limits: JobHostLimits)
+fn job_requirements(width: usize, task: TaskBudget, job: JobLimits, limits: JobHostLimits, input: JobInputMemory)
     -> Result<Requirements, HostedJobError> {
-    let input_bytes = limits.required_buffer_bytes(job)?;
+    let input_bytes = limits.required_buffer_bytes_for_input(job, input)?;
     if limits.native.allocator_reserve_bytes == 0 {
         return Err(HostedError::Limits("INT4 job allocator reserve").into());
     }
@@ -132,7 +132,7 @@ mod tests {
     #[test]
     fn whole_population_native_workspace_and_full_context_are_priced_together() {
         let (task, job, host) = fixture();
-        let needed = job_requirements(128, task, job, host).unwrap();
+        let needed = job_requirements(128, task, job, host, JobInputMemory::CompletePopulation).unwrap();
         assert_eq!(needed.input_bytes, host.required_buffer_bytes(job).unwrap());
         assert_eq!(needed.native.kv_bytes, task.max_kv_bytes);
         assert_eq!(needed.workspace_bytes, needed.native.rope_bytes
@@ -143,17 +143,17 @@ mod tests {
         let (task, job, host) = fixture();
         for kv in [0, task.max_kv_bytes - 1, task.max_kv_bytes + 1] {
             let mut wrong = task; wrong.max_kv_bytes = kv;
-            assert!(job_requirements(128, wrong, job, host).is_err());
+            assert!(job_requirements(128, wrong, job, host, JobInputMemory::CompletePopulation).is_err());
         }
         let mut wrong = task; wrong.max_output_bytes = job.max_result_bytes as u64 + 1;
-        assert!(job_requirements(128, wrong, job, host).is_err());
+        assert!(job_requirements(128, wrong, job, host, JobInputMemory::CompletePopulation).is_err());
         let mut wrong = host; wrong.native.allocator_reserve_bytes = 0;
-        assert!(job_requirements(128, task, job, wrong).is_err());
+        assert!(job_requirements(128, task, job, wrong, JobInputMemory::CompletePopulation).is_err());
     }
     #[test]
     fn group_width_and_explicit_host_reserves_remain_mandatory() {
         let (task, job, host) = fixture();
-        assert!(job_requirements(0, task, job, host).is_err());
+        assert!(job_requirements(0, task, job, host, JobInputMemory::CompletePopulation).is_err());
         for axis in 0..4 {
             let mut wrong = host;
             match axis {
@@ -162,7 +162,7 @@ mod tests {
                 2 => wrong.journal_reserve_bytes = 0,
                 _ => wrong.serialization_reserve_bytes = 0,
             }
-            assert!(job_requirements(128, task, job, wrong).is_err());
+            assert!(job_requirements(128, task, job, wrong, JobInputMemory::CompletePopulation).is_err());
         }
     }
     #[test]

@@ -6,7 +6,7 @@ use std::io::BufRead;
 use crate::{
     batch::scored_int4::Int4ScoredBatchLimits,
     hosted::corpus::jobs::{HostedJobError, JobHostLimits, SourceJobRequest, read_population, run_population},
-    jobs::{JobLimits, JobProgress,
+    jobs::{JobInputMemory, JobLimits, JobProgress,
         runner::{JobRunError, scored::grouped_int4::{Int4ScoredJobPlanner,
             Int4ScoredJobProcessor, Int4ScoredJobTask}}},
     native_engine::constrained_int4,
@@ -54,7 +54,7 @@ impl NlpEngine {
         planner.check_job_limits(request.limits).map_err(HostedError::BatchSetup)?;
         let work = planner.native_limits();
         let required = requirements(model.model_identity().group_width(), planner.task_ceiling(),
-            work, request.limits, limits)?;
+            work, request.limits, limits, request.mode.input_memory())?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(JobInput { preparation: Some((planner, request)), reader }))?;
@@ -105,10 +105,10 @@ impl NlpEngine {
 }
 
 fn requirements(width: usize, task: TaskBudget, work: Int4ScoredBatchLimits,
-    job: JobLimits, limits: JobHostLimits) -> Result<Requirements, HostedJobError> {
+    job: JobLimits, limits: JobHostLimits, input: JobInputMemory) -> Result<Requirements, HostedJobError> {
     task.validate().map_err(|_| HostedError::Limits("INT4 scored job task ceiling"))?;
     work.validate().map_err(HostedError::BatchSetup)?;
-    let input_bytes = limits.required_buffer_bytes(job)?;
+    let input_bytes = limits.required_buffer_bytes_for_input(job, input)?;
     if job.max_work != crate::jobs::JobWork::from_int4(work.max_model_work, 0) {
         return Err(HostedError::Limits("INT4 scored job lifetime work").into());
     }

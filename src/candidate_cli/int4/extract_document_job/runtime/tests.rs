@@ -40,10 +40,12 @@ fn complete_population_memory_quote_matches_host_and_preserves_invocation_limits
         let (c, args) = command("resume", extra); let map = c.args.validate(&args).unwrap();
         let fixed = lifetime(&args, map); let limits = c.args.lifetime_limits(&args, map, fixed).unwrap();
         let host = host_limits(&args, limits, Duration::from_secs(30));
-        check_host_quote(host, fixed, limits.buffer_bytes).unwrap();
-        assert_eq!(check_host_quote(host, fixed, limits.buffer_bytes - 1).unwrap_err().code, "job_host_memory_quote");
+        check_host_quote(host, fixed, limits.buffer_bytes, JobInputMemory::CompletePopulation).unwrap();
+        assert_eq!(check_host_quote(host, fixed, limits.buffer_bytes - 1, JobInputMemory::CompletePopulation)
+            .unwrap_err().code, "job_host_memory_quote");
         let mut invalid = host; invalid.journal_reserve_bytes = 0;
-        assert_eq!(check_host_quote(invalid, fixed, limits.buffer_bytes).unwrap_err().code, "job_host_admission");
+        assert_eq!(check_host_quote(invalid, fixed, limits.buffer_bytes, JobInputMemory::CompletePopulation)
+            .unwrap_err().code, "job_host_admission");
         assert_eq!(host.native.context_tokens, args.context_tokens);
         assert_eq!(host.native.run.max_checkpoints, args.max_checkpoints);
         assert_eq!(host.native.run.max_elapsed, Duration::from_secs(30));

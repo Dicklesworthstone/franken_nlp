@@ -96,7 +96,7 @@ impl JobPopulation {
 pub(super) fn envelope_id(bytes: &[u8], limits: JobLimits) -> Result<String, JobError> {
     let text = std::str::from_utf8(bytes).map_err(|_| JobError::InvalidInput)?;
     let value = canonjson::parse_str_with_limits(text, canonjson::ParseLimits {
-        max_depth: 64, max_string_bytes: limits.max_input_bytes_per_item,
+        max_depth: super::memory::INPUT_JSON_DEPTH, max_string_bytes: limits.max_input_bytes_per_item,
     }).map_err(|_| JobError::InvalidInput)?;
     let document: BatchDocument<serde_json::Value> = serde_json::from_value(value).map_err(|_| JobError::InvalidInput)?;
     if document.id.is_empty() || document.id.len() > limits.max_id_bytes { return Err(JobError::InvalidInput); }
