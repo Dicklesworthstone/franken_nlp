@@ -267,7 +267,8 @@ impl<'a> PreparedInt4FaithfulnessMap<'a> {
             plan.preflight(identity, engine, Int4ScoringBudget {
                 native: Int4RunBudget::exact(plan.planned_work()), max_kv_bytes: budget.max_kv_bytes })?;
         }
-        checkpoint(control)
+        checkpoint(control)?;
+        Ok(())
     }
     pub fn execute_with_control<C: DecodeStepControl>(&self, admitted: &[ExecutionIdentity],
         engine: &mut StrictInt4Engine<'_>, budget: Int4ScoringBudget, control: &mut C)
