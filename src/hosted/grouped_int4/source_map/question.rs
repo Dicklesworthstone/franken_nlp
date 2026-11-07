@@ -2,10 +2,11 @@
 //! Passage answers and abstentions are retained without global answer selection.
 use super::*;
 use crate::tasks::{
-    answer::{ANSWER_TASK_VERSION, PassageCitation, PassageOccurrence},
+    answer::ANSWER_TASK_VERSION,
     source_planning::grouped_int4::long::question::{Int4QuestionRun, SourceQuestion},
-    summarize::SourceCitation,
 };
+#[cfg(test)]
+use crate::tasks::{answer::{PassageCitation, PassageOccurrence}, summarize::SourceCitation};
 mod synthesis;
 mod cohort;
 
@@ -13,14 +14,7 @@ impl<T: std::borrow::Borrow<SourceQuestion>> Int4SourceMapConfig<T> {
     /// Complete frontier plus native local, independent scan and lifted
     /// citation storage. This is a modeled reservation, not measured RSS.
     pub fn question_workspace_bytes(&self, chunks: usize) -> Result<u64, HostedError> {
-        let task = self.task.borrow();
-        let multiply = |n: u64, m: u64| n.checked_mul(m)
-            .ok_or(HostedError::Limits("INT4 question workspace arithmetic"));
-        let citations = multiply(task.verification.max_fields as u64,
-            (std::mem::size_of::<PassageCitation>() + std::mem::size_of::<SourceCitation>()) as u64)?;
-        let spans = multiply(task.verification.max_matches as u64,
-            (std::mem::size_of::<PassageOccurrence>() + 2 * std::mem::size_of::<VerifiedSourceSpan>()) as u64)?;
-        sum(&[self.workspace_bytes(chunks)?, citations, spans])
+        self.workspace().question(chunks, self.task.borrow())
     }
 }
 

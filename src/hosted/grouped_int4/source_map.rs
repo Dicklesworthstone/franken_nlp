@@ -15,6 +15,9 @@ mod keyphrases;
 mod cohort;
 mod corpus;
 pub use corpus::int4_question_document_corpus_requirements;
+pub(super) mod workspace;
+pub(super) mod documents;
+pub use documents::{Int4SourceDocumentCorpusRequirement, int4_source_document_corpus_requirements};
 
 /// One original document, fixed task/model and nonrenewable work envelope.
 /// Preparation prices all retained prompts/grammars, tokenizer/vocabulary
@@ -34,22 +37,11 @@ impl<T> Int4SourceMapConfig<T> {
     /// Checked complete-frontier quote shared with CLI preflight. This is not
     /// a memory permit or an observed RSS limit; the host reserves it below.
     pub fn workspace_bytes(&self, chunks: usize) -> Result<u64, HostedError> {
-        if chunks == 0 || chunks > self.mapping.chunks.max_chunks || chunks > 256
-            || self.reduction_reserve_bytes == 0 {
-            return Err(HostedError::Limits("INT4 source map partition or reduction reserve"));
-        }
-        let multiply = |n: u64, m: u64| n.checked_mul(m)
-            .ok_or(HostedError::Limits("INT4 source map workspace arithmetic"));
-        let native = multiply(self.budget.max_output_bytes, chunks as u64)?;
-        let staged = multiply(sum(&[native, self.mapping.reduction.max_live_value_bytes as u64])?, 4)?;
-        let tokens = multiply(multiply(u64::from(self.budget.max_output_tokens), chunks as u64)?, 8)?;
-        // Both local and original-coordinate occurrence arrays can coexist
-        // with a temporary independent verification scan.
-        let fields = multiply(self.mapping.verification.max_fields as u64,
-            std::mem::size_of::<SourceFieldEvidence>() as u64)?;
-        let spans = multiply(multiply(self.mapping.verification.max_matches as u64,
-            std::mem::size_of::<VerifiedSourceSpan>() as u64)?, 2)?;
-        sum(&[staged, tokens, fields, spans, self.reduction_reserve_bytes])
+        self.workspace().map(chunks)
+    }
+    fn workspace(&self) -> workspace::Workspace {
+        workspace::Workspace { budget: self.budget, mapping: self.mapping,
+            reserve_bytes: self.reduction_reserve_bytes }
     }
 }
 struct SourceMapInput<T = SourceMapTask> {

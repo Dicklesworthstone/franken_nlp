@@ -13,24 +13,7 @@ impl<T: std::borrow::Borrow<SourceQuestionSynthesis>> Int4SourceMapConfig<T> {
     /// independent occurrence scans and the temporary final native transcript.
     /// The final result keeps text/citations, so native token storage is temporary.
     pub fn question_synthesis_workspace_bytes(&self, chunks: usize) -> Result<u64, HostedError> {
-        let mul = |a: u64, b: u64| a.checked_mul(b)
-            .ok_or(HostedError::Limits("INT4 answer synthesis workspace arithmetic"));
-        let task = self.task.borrow();
-        let verification = task.question.verification;
-        let limits = task.limits;
-        let fields = mul(verification.max_fields as u64,
-            (std::mem::size_of::<PassageCitation>() + std::mem::size_of::<SourceCitation>()) as u64)?;
-        let spans = mul(verification.max_matches as u64,
-            (std::mem::size_of::<PassageOccurrence>() + 2 * std::mem::size_of::<VerifiedSourceSpan>()) as u64)?;
-        sum(&[
-            self.workspace_bytes(chunks)?, fields, spans,
-            mul(limits.max_evidence_bytes as u64, 64)?,
-            mul(limits.max_evidence_passages as u64, 1024)?,
-            mul(verification.max_matches as u64, 128)?,
-            mul(verification.max_fields as u64, 128)?,
-            mul(self.budget.max_output_bytes, 4)?,
-            mul(u64::from(self.budget.max_output_tokens), 8)?,
-        ])
+        self.workspace().question_synthesis(chunks, self.task.borrow())
     }
 }
 

@@ -124,7 +124,7 @@ fn all_seven_routes_prepare_real_complete_pinned_discovery() {
             assert_eq!(identity.numerics_profile, NumericsProfile::StrictQuantized { version: 2 });
             assert_ne!(identity.prompt_digest, factory.execution_identity().prompt_digest);
         }
-        assert_eq!(prepared.work, prepared.expected.work().unwrap());
+        assert_eq!(prepared.work, planning::expected_job_work(prepared.expected).unwrap());
         factory.plan(SOURCE, &mut Continue).unwrap().compare(&prepared, &mut Continue).unwrap();
     }
 }

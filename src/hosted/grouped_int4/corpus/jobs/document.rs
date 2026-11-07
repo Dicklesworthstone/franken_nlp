@@ -3,15 +3,18 @@
 use super::*;
 use super::document_native::DocumentNative;
 use crate::{
-    grammar::mask::MaskWorkLimits,
-    hosted::grouped_int4::source_map::Int4SourceMapConfig,
+    hosted::grouped_int4::source_map::{workspace::document_bytes,
+        documents::admission::{DocumentAdmission, work_fits}},
     jobs::runner::source::grouped_int4::document::{
-        Int4SourceDocumentAdmission, Int4SourceDocumentBatchAdmission,
         Int4SourceDocumentJobPlanner, Int4SourceDocumentJobProcessor, Int4SourceDocumentTask,
     },
     tasks::source_planning::{SourcePlanningLimits, grouped_int4::long::{Int4SourceMapLimits,
         cohort::{Int4SourceMapCohortBudget, Int4SourceMapCohortRequirement}}},
 };
+#[cfg(test)]
+use crate::{grammar::mask::MaskWorkLimits,
+    batch::source::grouped_int4::document::Int4SourceDocumentAdmission,
+    hosted::grouped_int4::source_map::documents::admission::check_document_request};
 
 struct DocumentJobInput<R> {
     preparation: Option<(Int4SourceDocumentJobPlanner, Arc<ExtractionVocabulary>, SourceJobRequest)>,
@@ -33,38 +36,9 @@ impl Int4SourceDocumentJobPlanner {
     /// private settings. It is a workspace quote, not a memory permit or RSS
     /// claim; the job entrypoint also validates and reserves native, input and
     /// output storage before executing any document.
-    pub fn workspace_bytes(&self, native: NativeLimits, reduction_reserve_bytes: u64)
+    pub fn workspace_bytes(&self, _native: NativeLimits, reduction_reserve_bytes: u64)
         -> Result<u64, HostedError> {
-        let chunks = self.document_limits().chunks.max_chunks;
-        match self.task() {
-            Int4SourceDocumentTask::Map(_) | Int4SourceDocumentTask::Summary { .. } =>
-                quote_config(self, (), native, reduction_reserve_bytes).workspace_bytes(chunks),
-            Int4SourceDocumentTask::Keyphrases { limits, .. } =>
-                quote_config(self, (), native, reduction_reserve_bytes).keyphrase_workspace_bytes(chunks, *limits),
-            Int4SourceDocumentTask::Question(question) =>
-                quote_config(self, question, native, reduction_reserve_bytes).question_workspace_bytes(chunks),
-            Int4SourceDocumentTask::SummarySynthesis(request) =>
-                quote_config(self, request, native, reduction_reserve_bytes).summary_synthesis_workspace_bytes(chunks),
-            Int4SourceDocumentTask::SummaryHierarchy { request, limits } =>
-                quote_config(self, request, native, reduction_reserve_bytes)
-                    .summary_hierarchy_workspace_bytes(chunks, *limits),
-            Int4SourceDocumentTask::QuestionSynthesis(request) =>
-                quote_config(self, request, native, reduction_reserve_bytes).question_synthesis_workspace_bytes(chunks),
-            Int4SourceDocumentTask::QuestionHierarchy { request, limits } =>
-                quote_config(self, request, native, reduction_reserve_bytes)
-                    .question_hierarchy_workspace_bytes(chunks, *limits),
-        }
-    }
-}
-
-fn quote_config<T>(planner: &Int4SourceDocumentJobPlanner, task: T,
-    native: NativeLimits, reduction_reserve_bytes: u64) -> Int4SourceMapConfig<T> {
-    Int4SourceMapConfig {
-        identity: planner.execution_identity().clone(), task, budget: planner.task_budget(),
-        planning: planner.planning_limits(), mapping: planner.document_limits(), native,
-        // The workspace-only methods do not inspect or grant preparation
-        // memory. The job host separately prices its real preparation owner.
-        preparation_reserve_bytes: 0, reduction_reserve_bytes,
+        document_bytes(self.task(), self.task_budget(), self.document_limits(), reduction_reserve_bytes)
     }
 }
 
@@ -221,87 +195,6 @@ fn document_requirements(width: usize, budget: TaskBudget, planning: SourcePlann
     let native_workspace_bytes = sum(&[native.rope_bytes, native.scratch_payload_bound,
         limits.native.allocator_reserve_bytes])?;
     Ok(DocumentRequirements { native, native_workspace_bytes, input_bytes, document_workspace_bytes })
-}
-
-struct DocumentAdmission<'a> {
-    lease: &'a EngineLease,
-    model: &'a Int4ModelIdentity,
-    task_spec: &'a str,
-    kv_bytes: u64,
-    mapping: Int4SourceMapLimits,
-    result_bytes: u64,
-    output_tokens: u64,
-}
-impl Int4SourceDocumentBatchAdmission for DocumentAdmission<'_> {
-    type Guard = Pending;
-    fn admit(&mut self, request: Int4SourceDocumentAdmission<'_>)
-        -> Result<(Vec<ExecutionIdentity>, Self::Guard), BatchItemFailure> {
-        check_document_request(self.model.group_width(), self.task_spec, self.kv_bytes,
-            self.mapping, self.result_bytes, self.output_tokens, &request)?;
-        let mut identities = Vec::new();
-        identities.try_reserve_exact(request.identities.len())
-            .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
-        for identity in request.identities {
-            constrained_int4::check_model(identity, self.model)
-                .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
-            identities.push(identity.clone());
-        }
-        let guard = output_claim(self.lease, request.max_result_bytes, request.max_output_tokens)
-            .map_err(admission_failure)?;
-        Ok((identities, guard))
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn check_document_request(width: usize, task_spec: &str, kv_bytes: u64,
-    mapping: Int4SourceMapLimits, result_bytes: u64, output_tokens: u64,
-    request: &Int4SourceDocumentAdmission<'_>) -> Result<(), BatchItemFailure> {
-    if !matches!(task_spec, "ner-v1" | "keyphrases-v1" | "summarize-v1" | "answer-v1")
-        || request.chunk_count == 0 || request.chunk_count > mapping.chunks.max_chunks
-        || request.chunk_count > 256 || request.identities.is_empty()
-        || request.identities.len() > request.chunk_count
-        || request.kv_reservation_bytes != kv_bytes {
-        return Err(BatchItemFailure::fatal(BatchCode::Admission));
-    }
-    for identity in request.identities {
-        constrained_int4::check_profile(identity, width)
-            .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
-        if identity.task_spec != task_spec {
-            return Err(BatchItemFailure::fatal(BatchCode::Admission));
-        }
-    }
-    if request.mask_node_visits == 0 || request.mask_node_visits > mapping.max_mask_visits
-        || !same_masks(request.mask_limits, mapping.mask_limits) {
-        return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
-    }
-    let work = request.model_work;
-    if work.forward_positions == 0 || work.attention_pairs == 0
-        || work.projections.dot_products == 0 || work.projections.multiply_accumulates == 0
-        || work.projected_logits == 0 || work.projected_logits % NANBEIGE_VOCAB_SIZE as u64 != 0
-        || work.projected_logits / NANBEIGE_VOCAB_SIZE as u64 > work.forward_positions
-        || !work_fits(work, mapping.max_model_work) {
-        return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
-    }
-    // Work is the sum of real independent sequences and reserved future
-    // passes. It must not be reinterpreted as one context-sized sequence or
-    // replaced with the similarly shaped INT8 projection formula.
-    if request.max_result_bytes == 0 || request.max_result_bytes != result_bytes
-        || request.max_output_tokens > output_tokens {
-        return Err(BatchItemFailure::reject(BatchCode::OutputLineLimit));
-    }
-    Ok(())
-}
-
-fn same_masks(left: MaskWorkLimits, right: MaskWorkLimits) -> bool {
-    left.max_trie_node_visits == right.max_trie_node_visits
-        && left.checkpoint_interval_nodes == right.checkpoint_interval_nodes
-}
-fn work_fits(work: Int4Work, ceiling: Int4Work) -> bool {
-    work.forward_positions <= ceiling.forward_positions
-        && work.projected_logits <= ceiling.projected_logits
-        && work.attention_pairs <= ceiling.attention_pairs
-        && work.projections.dot_products <= ceiling.projections.dot_products
-        && work.projections.multiply_accumulates <= ceiling.projections.multiply_accumulates
 }
 
 #[cfg(test)]

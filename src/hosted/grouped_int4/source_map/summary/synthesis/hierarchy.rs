@@ -14,18 +14,7 @@ impl<T: std::borrow::Borrow<SourceSummarySynthesis>> Int4SourceMapConfig<T> {
     /// levels. These are checked admission reserves, not measured RSS bounds.
     pub fn summary_hierarchy_workspace_bytes(&self, chunks: usize,
         hierarchy: SummaryHierarchyLimits) -> Result<u64, HostedError> {
-        hierarchy.validate().map_err(map_error)?;
-        let mul = |a: u64, b: u64| a.checked_mul(b)
-            .ok_or(HostedError::Limits("INT4 summary hierarchy workspace arithmetic"));
-        let per_pass = sum(&[mul(self.budget.max_output_bytes, 4)?,
-            mul(u64::from(self.budget.max_output_tokens), 8)?])?;
-        // The single-pass quote includes discovery, one final native payload,
-        // source copies, verifier fanout and two simultaneous evidence frontiers.
-        // Compact witnesses bind every group before any forward in its level.
-        sum(&[self.summary_synthesis_workspace_bytes(chunks)?,
-            mul(per_pass, (hierarchy.max_passes - 1) as u64)?,
-            mul(hierarchy.max_passes as u64, 8192 + 256)?,
-            mul(hierarchy.max_levels as u64, 128)?])
+        self.workspace().summary_hierarchy(chunks, self.task.borrow(), hierarchy)
     }
 }
 

@@ -16,18 +16,7 @@ impl<T: std::borrow::Borrow<SourceSummarySynthesis>> Int4SourceMapConfig<T> {
     /// prefix tables and original-coordinate occurrence fanout. This checked
     /// admission quote is shared with CLI preflight; it is not measured RSS.
     pub fn summary_synthesis_workspace_bytes(&self, chunks: usize) -> Result<u64, HostedError> {
-        let mul = |a: u64, b: u64| a.checked_mul(b)
-            .ok_or(HostedError::Limits("INT4 summary synthesis workspace arithmetic"));
-        let limits = self.task.borrow().limits;
-        sum(&[
-            self.workspace_bytes(chunks)?,
-            mul(self.budget.max_output_bytes, 4)?,
-            mul(u64::from(self.budget.max_output_tokens), 8)?,
-            mul(limits.max_evidence_bytes as u64, 64)?,
-            mul(limits.max_evidence_segments as u64, 128)?,
-            mul(limits.verification.max_matches as u64, 128)?,
-            mul(limits.verification.max_fields as u64, 128)?,
-        ])
+        self.workspace().summary_synthesis(chunks, self.task.borrow())
     }
 }
 

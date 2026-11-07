@@ -14,19 +14,7 @@ impl<T: std::borrow::Borrow<SourceQuestionSynthesis>> Int4SourceMapConfig<T> {
     /// entire invocation; these checked reserves are not measured RSS claims.
     pub fn question_hierarchy_workspace_bytes(&self, chunks: usize,
         hierarchy: QuestionHierarchyLimits) -> Result<u64, HostedError> {
-        hierarchy.validate().map_err(map_error)?;
-        let mul = |a: u64, b: u64| a.checked_mul(b)
-            .ok_or(HostedError::Limits("INT4 answer hierarchy workspace arithmetic"));
-        let per_pass = sum(&[mul(self.budget.max_output_bytes, 4)?,
-            mul(u64::from(self.budget.max_output_tokens), 8)?])?;
-        // The base quote includes discovery, one native result, source/question
-        // copies, verification fanout and simultaneous evidence frontiers.
-        // Witnesses bind every group before any forward in that level. The
-        // physical schedule separately reserves additional compiled plans.
-        sum(&[self.question_synthesis_workspace_bytes(chunks)?,
-            mul(per_pass, (hierarchy.max_passes - 1) as u64)?,
-            mul(hierarchy.max_passes as u64, 8192 + 256)?,
-            mul(hierarchy.max_levels as u64, 128)?])
+        self.workspace().question_hierarchy(chunks, self.task.borrow(), hierarchy)
     }
 }
 

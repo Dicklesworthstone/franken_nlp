@@ -1,43 +1,6 @@
-//! One native execution policy and one result guard through durable acknowledgement.
+//! Durable accounting delegates native admission/execution to the live core.
 use super::*;
-use crate::batch::extract::grouped_int4::memory::MAX_COHORT_RESULT_BYTES;
-
-/// Complete discovery admission. Future synthesis work is already included in
-/// model_work and masks; the native hierarchy authenticates each full dynamic
-/// level before its first forward. The host must retain complete preparation
-/// and reduction storage in addition to this final-result guard.
-pub struct Int4SourceDocumentAdmission<'a> {
-    pub identities: &'a [ExecutionIdentity],
-    pub model_work: Int4Work,
-    pub mask_node_visits: u64,
-    pub mask_limits: MaskWorkLimits,
-    /// Complete declared native KV peak. With chunk cohorts this is the
-    /// invocation's static physical reservation, never per-row task authority.
-    pub kv_reservation_bytes: u64,
-    pub max_result_bytes: u64,
-    pub max_output_tokens: u64,
-    pub chunk_count: usize,
-}
-pub trait Int4SourceDocumentBatchAdmission {
-    type Guard;
-    fn admit(&mut self, request: Int4SourceDocumentAdmission<'_>)
-        -> Result<(Vec<ExecutionIdentity>, Self::Guard), BatchItemFailure>;
-}
-
-/// Preserve the native wire object and its execution tag exactly. An extra
-/// wrapper would consume bytes outside its already-validated result ceiling.
-#[derive(Serialize)]
-#[serde(untagged)]
-pub enum Int4SourceDocumentRun {
-    Map(Int4SourceMapRun),
-    Keyphrases(Int4CorpusKeyphraseRun),
-    Summary(Int4CorpusSummaryRun),
-    Question(Int4QuestionRun),
-    SummarySynthesis(Int4SummarySynthesisRun),
-    SummaryHierarchy(Int4SummaryHierarchyRun),
-    QuestionSynthesis(Int4QuestionSynthesisRun),
-    QuestionHierarchy(Int4QuestionHierarchyRun),
-}
+use native_document::backend::DocumentEngine;
 
 pub struct Int4SourceDocumentJobProcessor<'p, 'e, 'w, 'v, A: Int4SourceDocumentBatchAdmission> {
     planner: &'p Int4SourceDocumentJobPlanner,
@@ -51,10 +14,8 @@ impl<'p, 'e, 'w, 'v, A: Int4SourceDocumentBatchAdmission> Int4SourceDocumentJobP
         vocabulary: &'v ExtractionVocabulary, admission: A) -> Result<Self, BatchFault> {
         Self::configured(planner, DocumentEngine::Serial(engine), vocabulary, admission)
     }
-    /// Reuse the same whole-attempt ledger and durable result guard while the
-    /// sealed document plans allocate and drain their own native chunk cohorts.
-    /// The host retains the complete static quote through processor teardown.
-    #[allow(clippy::too_many_arguments)]
+    /// Keep the complete immutable physical quote and the durable result guard
+    /// while the shared native plans allocate and drain their chunk cohorts.
     pub fn new_cohorts(planner: &'p Int4SourceDocumentJobPlanner, weights: &'w Int4ModelWeights,
         vocabulary: &'v ExtractionVocabulary, budget: Int4SourceMapCohortBudget,
         kernel: PackedInt4Kernel, admission: A) -> Result<Self, BatchFault> {
@@ -64,7 +25,7 @@ impl<'p, 'e, 'w, 'v, A: Int4SourceDocumentBatchAdmission> Int4SourceDocumentJobP
     }
     fn configured(planner: &'p Int4SourceDocumentJobPlanner, engine: DocumentEngine<'e, 'w>,
         vocabulary: &'v ExtractionVocabulary, admission: A) -> Result<Self, BatchFault> {
-        engine.check_capacity(planner).map_err(|e| e.fault)?;
+        engine.check_capacity(&planner.configuration()).map_err(|e| e.fault)?;
         planner.check_job_limits(planner.limits)?;
         Ok(Self { planner, engine, vocabulary, admission, ledger: Ledger::default() })
     }
@@ -81,10 +42,8 @@ impl<A: Int4SourceDocumentBatchAdmission> BatchProcessor for Int4SourceDocumentJ
         -> Result<Self::Prepared, BatchItemFailure> {
         self.ledger.ready()?;
         self.ledger.failed = true;
-        self.engine.check_capacity(self.planner)?;
+        self.engine.check_capacity(&self.planner.configuration())?;
         let prepared = self.planner.prepare_with_control(document, control)?;
-        // Preparation snapshots every actual discovery identity and reserves
-        // every permitted future synthesis pass before the journal debit.
         self.ledger.failed = false;
         Ok(prepared)
     }
@@ -98,12 +57,12 @@ impl<A: Int4SourceDocumentBatchAdmission> BatchProcessor for Int4SourceDocumentJ
     }
     fn execute_with_context<C: DecodeStepControl>(&mut self, prepared: Self::Prepared,
         context: BatchRequestContext, control: &mut C) -> Result<Self::Output, BatchItemFailure> {
-        // JobRunner has durably charged this complete reserved attempt. This
-        // invocation ledger adds no retry allowance and never replaces it.
+        // JobRunner already persisted this whole attempt. The invocation
+        // ledger adds no retry authority and never replaces that durable debit.
         self.ledger.begin(prepared.work, context, self.planner.limits)?;
         self.planner.owns(&prepared)?;
         poll(control)?;
-        let kv = self.engine.check_capacity(self.planner)?;
+        let kv = self.engine.check_capacity(&self.planner.configuration())?;
         let plan = self.planner.plan(&prepared.source, control)?;
         plan.compare(&prepared, control)?;
         self.engine.preflight(&plan, &prepared.identities, control)?;
@@ -116,17 +75,13 @@ impl<A: Int4SourceDocumentBatchAdmission> BatchProcessor for Int4SourceDocumentJ
         })?;
         poll(control)?;
         if admitted != prepared.identities { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
-        // ALL admitted identities are checked before any native forward. The
-        // existing drivers also bind the same compiler and actual model for
-        // dynamic synthesis; callers cannot supply native results or plans.
         self.engine.preflight(&plan, &admitted, control)?;
         let output = self.engine.execute(plan, &admitted, &self.planner.planner, self.vocabulary, control)?;
         prepared.expected.verify(&output, self.planner.task())?;
-        self.engine.check_capacity(self.planner)?;
+        self.engine.check_capacity(&self.planner.configuration())?;
         poll(control)?;
         self.ledger.failed = false;
-        // JobRunner retains this guard through serialization, spool sync and
-        // authenticated journal acknowledgement of the whole document.
+        // This guard remains held through spool sync and journal acknowledgement.
         Ok(GuardedOutput::new(output, guard))
     }
 }
@@ -138,81 +93,11 @@ impl<A: Int4SourceDocumentBatchAdmission> DurableBatchProcessor for Int4SourceDo
     fn durable_work(&self, prepared: &Self::Prepared) -> Result<JobWork, BatchItemFailure> {
         self.ledger.ready()?;
         self.planner.owns(prepared)?;
-        self.engine.check_capacity(self.planner)?;
-        if prepared.expected.work()? != prepared.work { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
+        self.engine.check_capacity(&self.planner.configuration())?;
+        if planning::expected_job_work(prepared.expected)? != prepared.work { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
         Ok(prepared.work)
     }
     fn max_result_bytes(&self, _: &Self::Prepared) -> u64 { self.planner.max_result_bytes() }
-}
-
-// Closed production policies share one prepare/debit/execute/verify lifecycle.
-// There is no task callback, second scheduler or caller-supplied native result.
-enum DocumentEngine<'e, 'w> {
-    Serial(&'e mut StrictInt4Engine<'w>),
-    Cohorts { weights: &'w Int4ModelWeights, budget: Int4SourceMapCohortBudget,
-        kernel: PackedInt4Kernel, required: Int4SourceMapCohortRequirement,
-        hierarchy: Option<Int4HierarchyCohortSchedule> },
-}
-impl DocumentEngine<'_, '_> {
-    fn check_capacity(&self, planner: &Int4SourceDocumentJobPlanner) -> Result<u64, BatchItemFailure> {
-        match self {
-            Self::Serial(engine) => {
-                if planner.uses_native_cohorts() { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
-                check_capacity(planner, engine)
-            }
-            Self::Cohorts { weights, budget, required, hierarchy, .. } => {
-                if !planner.uses_native_cohorts() || *hierarchy != planner.hierarchy_cohort_schedule()
-                    || budget.context_limit != planner.planning.max_context_tokens
-                    || weights.group_width() != planner.group_width {
-                    return Err(BatchItemFailure::fatal(BatchCode::Admission));
-                }
-                constrained_int4::check_model(planner.execution_identity(), weights.identity())
-                    .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
-                check_cohort_budget(*required, *budget)?;
-                Ok(required.native.kv_bytes)
-            }
-        }
-    }
-    fn preflight<C: DecodeStepControl>(&self, plan: &planning::NativePlan<'_>,
-        identities: &[ExecutionIdentity], control: &mut C) -> Result<(), BatchItemFailure> {
-        match self {
-            Self::Serial(engine) => plan.preflight(identities, engine, control),
-            Self::Cohorts { weights, budget, required, hierarchy, .. } => {
-                let actual = plan.cohort_requirements(budget.context_limit, *hierarchy)?;
-                check_cohort_peak(actual, *required)?;
-                check_cohort_budget(actual, *budget)?;
-                plan.preflight_cohorts(identities, weights, control)
-            }
-        }
-    }
-    fn execute<C: DecodeStepControl>(&mut self, plan: planning::NativePlan<'_>, admitted: &[ExecutionIdentity],
-        planner: &SourceTaskPlanner, vocabulary: &ExtractionVocabulary, control: &mut C)
-        -> Result<Int4SourceDocumentRun, BatchItemFailure> {
-        match self {
-            Self::Serial(engine) => plan.execute(admitted, planner, engine, vocabulary, control),
-            Self::Cohorts { weights, budget, kernel, hierarchy, .. } =>
-                plan.execute_cohorts(admitted, planner, weights, vocabulary, *budget, *kernel, *hierarchy, control),
-        }
-    }
-}
-fn check_cohort_peak(actual: Int4SourceMapCohortRequirement, declared: Int4SourceMapCohortRequirement)
-    -> Result<(), BatchItemFailure> {
-    if actual.native.kv_bytes > declared.native.kv_bytes || actual.native.rope_bytes > declared.native.rope_bytes
-        || actual.native.scratch_payload_bound > declared.native.scratch_payload_bound
-        || actual.workspace_bytes > declared.workspace_bytes || actual.max_result_bytes > declared.max_result_bytes {
-        return Err(BatchItemFailure::fatal(BatchCode::Admission));
-    }
-    Ok(())
-}
-fn check_cohort_budget(required: Int4SourceMapCohortRequirement, budget: Int4SourceMapCohortBudget)
-    -> Result<(), BatchItemFailure> {
-    if budget.max_result_bytes > MAX_COHORT_RESULT_BYTES { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
-    check_cohort_peak(required, Int4SourceMapCohortRequirement {
-        native: Int4MemoryRequirement { kv_bytes: budget.native_memory.max_kv_bytes,
-            rope_bytes: budget.native_memory.max_rope_bytes,
-            scratch_payload_bound: budget.native_memory.max_scratch_payload_bytes },
-        workspace_bytes: budget.max_workspace_bytes, max_result_bytes: budget.max_result_bytes,
-    })
 }
 
 #[derive(Default)]
@@ -235,26 +120,13 @@ impl Ledger {
         Ok(())
     }
 }
-fn check_capacity(planner: &Int4SourceDocumentJobPlanner, engine: &StrictInt4Engine<'_>) -> Result<u64, BatchItemFailure> {
-    constrained_int4::check_model(planner.execution_identity(), engine.model_identity())
-        .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
-    if engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0)
-        || engine.model_identity().group_width() != planner.group_width
-        || engine.kv_cache().capacity_positions() != planner.planning.max_context_tokens {
-        return Err(BatchItemFailure::fatal(BatchCode::Admission));
-    }
-    let required = Int4MemoryRequirement::for_context(planner.planning.max_context_tokens, planner.group_width)
-        .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
-    if required.kv_bytes == 0 || required.kv_bytes != planner.budget.max_kv_bytes {
-        return Err(BatchItemFailure::fatal(BatchCode::Admission));
-    }
-    Ok(required.kv_bytes)
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_engine::strict_int4::Int4MemoryBudget;
+    use native_document::backend::{check_cohort_budget, check_cohort_peak};
+    use crate::{batch::extract::grouped_int4::memory::MAX_COHORT_RESULT_BYTES,
+        native_engine::strict_int4::Int4MemoryBudget};
 
     fn declared() -> Int4SourceMapCohortRequirement {
         Int4SourceMapCohortMemoryLimits { max_chunks: 4, context_tokens: 8192,

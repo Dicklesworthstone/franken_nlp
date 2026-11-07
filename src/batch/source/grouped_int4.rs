@@ -18,6 +18,7 @@ pub use crate::batch::extract::grouped_int4::{Int4ExtractionAdmission as Int4Sou
     Int4ExtractionBatchAdmission as Int4SourceBatchAdmission, Int4ExtractionBatchLimits as Int4SourceBatchLimits};
 
 mod cohort;
+pub mod document;
 /// Live complete-document QA with a separate private question for every row.
 pub mod question;
 pub use cohort::{NativeInt4SourceCohortBatch, PreparedInt4CohortSource};

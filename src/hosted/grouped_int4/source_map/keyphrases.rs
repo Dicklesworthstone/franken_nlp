@@ -10,16 +10,7 @@ impl<T> Int4SourceMapConfig<T> {
     /// These are conservative owner allowances, not an observed RSS promise.
     pub fn keyphrase_workspace_bytes(&self, chunks: usize, limits: Int4KeyphraseLimits)
         -> Result<u64, HostedError> {
-        limits.validate(self.mapping).map_err(keyphrase_error)?;
-        let multiply = |value: u64, count: u64| value.checked_mul(count)
-            .ok_or(HostedError::Limits("INT4 keyphrase frontier arithmetic"));
-        let values = multiply(limits.aggregation.max_value_bytes as u64, 8)?;
-        let candidates = multiply(limits.aggregation.max_unique_phrases as u64, 512)?;
-        let evidence = multiply(multiply(limits.aggregation.max_evidence_spans as u64,
-            std::mem::size_of::<VerifiedSourceSpan>() as u64)?, 2)?;
-        // Aggregate construction, canonical serialization and exact matching
-        // coexist with the original native/source-verification frontier.
-        sum(&[self.workspace_bytes(chunks)?, values, candidates, evidence])
+        self.workspace().keyphrases(chunks, limits)
     }
 }
 

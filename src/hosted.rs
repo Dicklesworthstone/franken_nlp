@@ -34,6 +34,7 @@ pub use grouped_int4::{Int4HostError, Int4LoadLimits, Int4LoadRequirements, Int4
     Int4ClassificationMapHostConfig, int4_classification_document_corpus_requirements,
     int4_classification_document_corpus_cohort_requirements,
     Int4SourceCorpusConfig, Int4SourceMapConfig, Int4SentimentHostLimits, Int4SentimentMapHostConfig, Int4JudgeHostLimits,
+    Int4SourceDocumentCorpusRequirement, int4_source_document_corpus_requirements,
     int4_sentiment_document_corpus_requirements,
     Int4FaithfulnessMapHostConfig, int4_faithfulness_document_corpus_requirements,
     int4_faithfulness_document_corpus_requirements_with_max_heads,
