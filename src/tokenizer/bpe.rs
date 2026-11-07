@@ -15,6 +15,8 @@ use std::{
 
 use super::sp_model::{PieceType, SpecialPieceIds, SpmModel};
 
+mod safe_bpe;
+
 /// SentencePiece's visible replacement for an escaped input whitespace byte.
 pub const WHITESPACE_MARKER: char = '\u{2581}';
 
@@ -432,6 +434,17 @@ impl SpBpeTokenizer {
         let mut ids = Vec::with_capacity(input.len());
         self.encode_byte_fallback(input, &mut ids)?;
         Ok(ids)
+    }
+
+    pub(super) fn encode_untrusted_bpe<F: FnMut() -> bool>(
+        &self,
+        input: &[u8],
+        forbidden: &std::collections::BTreeSet<u32>,
+        limits: super::untrusted::SafeBpeLimits,
+        work: &mut super::untrusted::SafeBpeWork,
+        checkpoint: &mut F,
+    ) -> Result<Vec<u32>, super::untrusted::UntrustedDocumentError> {
+        safe_bpe::encode(self, input, forbidden, limits, work, checkpoint)
     }
 
     /// Reassembles the exact decoded byte stream. Invalid token ids fail closed.
