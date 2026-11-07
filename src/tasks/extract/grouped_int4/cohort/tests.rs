@@ -3,6 +3,7 @@ use super::*;
 use crate::{native_engine::{constrained::JsonWorkBudget, strict_int4::Int4RunBudget},
     validation::grounded_fields::SourceOccurrence};
 use super::super::tests::{plan, source_plan, raw as raw_row};
+mod packed;
 
 fn requests(plans: &[Int4ExtractPlan]) -> Vec<Int4ExtractCohortRequest<'_>> {
     plans.iter().map(|plan| {

@@ -2,6 +2,7 @@
 use super::*;
 use crate::{execution_identity::{NumericsProfile, Sha256Digest},
     grammar::{CompileLimits, runtime::SourceRuntimeLimits}};
+mod packed;
 
 const GROUP: usize = 127;
 struct Table(Vec<Vec<u8>>);
@@ -32,13 +33,13 @@ impl DecodeStepControl for Control {
 struct Script {
     control: Control, scores: Vec<Vec<f32>>, seen: Vec<Vec<u32>>, projected: Vec<usize>,
     groups: Vec<Vec<(usize, u32)>>, heads: Vec<Vec<usize>>, aborted: bool,
-    fail_group: Option<usize>, bad_work: bool, bad_head: bool,
+    fail_group: Option<usize>, bad_work: bool, bad_head: bool, packed_calls: usize,
 }
 impl Script {
     fn new(count: usize) -> Self {
         Self { control: Control::default(), scores: vec![vec![0.0, 2.0, 1.0, 4.0, 3.0, 1.0, 100.0]; count],
             seen: vec![Vec::new(); count], projected: vec![0; count], groups: Vec::new(), heads: Vec::new(),
-            aborted: false, fail_group: None, bad_work: false, bad_head: false }
+            aborted: false, fail_group: None, bad_work: false, bad_head: false, packed_calls: 0 }
     }
 }
 impl GroupDriver for Script {
@@ -51,6 +52,22 @@ impl GroupDriver for Script {
         for step in steps {
             self.seen[step.sequence].push(step.token);
             if self.fail_group == Some(self.groups.len()) { return Err(StrictInt4Error::Primitive.into()); }
+        }
+        Ok(())
+    }
+    fn append_packed(&mut self, runs: &[Int4TokenRun<'_>], limits: Int4PrefillLimits) -> Result<(), Int4JsonError> {
+        limits.validate()?;
+        assert!(!runs.is_empty());
+        assert!(runs.windows(2).all(|pair| pair[0].sequence < pair[1].sequence));
+        assert!(runs.iter().all(|run| !run.tokens.is_empty()));
+        assert!(runs.iter().map(|run| run.tokens.len()).sum::<usize>() <= limits.max_batch_rows);
+        self.packed_calls += 1;
+        self.groups.push(runs.iter().flat_map(|run| run.tokens.iter().map(move |&token| (run.sequence, token))).collect());
+        for run in runs {
+            for &token in run.tokens {
+                self.seen[run.sequence].push(token);
+                if self.fail_group == Some(self.groups.len()) { return Err(StrictInt4Error::Primitive.into()); }
+            }
         }
         Ok(())
     }

@@ -1,5 +1,6 @@
 //! Ragged native forward/head groups with independent constrained cursors.
 use super::*;
+mod packed;
 
 struct Cursor<'a> {
     grammar: JsonState<'a>, bytes: Vec<u8>, tokens: Vec<u32>,
@@ -20,7 +21,12 @@ impl<'a> Cursor<'a> {
 pub(super) fn drive<V, D, T, E, F>(group_width: usize, requests: &[Int4JsonCohortRequest<'_>], vocabulary: &V,
     budget: Int4JsonCohortBudget, driver: &mut D, finalize: F) -> Result<T, E>
 where V: Vocabulary, D: GroupDriver, E: From<Int4JsonError>, F: FnOnce(Int4JsonCohortRun) -> Result<T, E> {
-    let result = run(group_width, requests, vocabulary, budget, driver).map_err(E::from).and_then(|run| {
+    drive_scheduled(group_width, requests, vocabulary, budget, None, driver, finalize)
+}
+pub(super) fn drive_scheduled<V, D, T, E, F>(group_width: usize, requests: &[Int4JsonCohortRequest<'_>], vocabulary: &V,
+    budget: Int4JsonCohortBudget, prefill: Option<Int4PrefillLimits>, driver: &mut D, finalize: F) -> Result<T, E>
+where V: Vocabulary, D: GroupDriver, E: From<Int4JsonError>, F: FnOnce(Int4JsonCohortRun) -> Result<T, E> {
+    let result = run(group_width, requests, vocabulary, budget, prefill, driver).map_err(E::from).and_then(|run| {
         let step = run.sequences.iter().map(|row| row.output.token_ids.len()).max().unwrap_or(0);
         let result = finalize(run)?;
         poll(driver.control(), step).map_err(E::from)?;
@@ -30,30 +36,36 @@ where V: Vocabulary, D: GroupDriver, E: From<Int4JsonError>, F: FnOnce(Int4JsonC
     result
 }
 fn run<V: Vocabulary, D: GroupDriver>(group_width: usize, requests: &[Int4JsonCohortRequest<'_>], vocabulary: &V,
-    budget: Int4JsonCohortBudget, driver: &mut D) -> Result<Int4JsonCohortRun, Int4JsonError> {
+    budget: Int4JsonCohortBudget, prefill: Option<Int4PrefillLimits>, driver: &mut D)
+    -> Result<Int4JsonCohortRun, Int4JsonError> {
+    if let Some(limits) = prefill { limits.validate()?; }
     let planned_work = requests_preflight(group_width, requests, vocabulary, budget)?;
     let mut cursors = reserved(requests.len())?;
     for request in requests { cursors.push(Cursor::new(request)?); }
     let mut steps = reserved(requests.len())?; let mut ready = reserved(requests.len())?;
-    let mut group_steps = 0_u64; let mut projection_groups = 0_u64;
+    let mut group_steps = 0_u64; let mut projection_groups = 0_u64; let mut next_slot = 0;
     while cursors.iter().any(|row| !row.done) {
         steps.clear(); ready.clear();
-        for (slot, row) in cursors.iter().enumerate() {
-            if row.done { continue; }
-            if row.positions < requests[slot].prompt.len() {
-                if let Some(cause) = driver.control().prefill_checkpoint(row.positions) {
-                    return Err(JsonDecodeError::Cancelled(cause).into());
-                }
-            } else { poll(driver.control(), row.tokens.len())?; }
-            steps.push(Int4CohortToken { sequence: slot, token: row.next(requests[slot].prompt)? });
+        if let Some(limits) = prefill {
+            packed::append(&mut cursors, requests, limits, &mut next_slot, &mut ready, driver)?;
+        } else {
+            for (slot, row) in cursors.iter().enumerate() {
+                if row.done { continue; }
+                if row.positions < requests[slot].prompt.len() {
+                    if let Some(cause) = driver.control().prefill_checkpoint(row.positions) {
+                        return Err(JsonDecodeError::Cancelled(cause).into());
+                    }
+                } else { poll(driver.control(), row.tokens.len())?; }
+                steps.push(Int4CohortToken { sequence: slot, token: row.next(requests[slot].prompt)? });
+            }
+            driver.append_group(&steps)?;
+            for step in &steps {
+                let row = &mut cursors[step.sequence];
+                row.positions = row.positions.checked_add(1).ok_or(StrictInt4Error::Work)?;
+                if row.positions >= requests[step.sequence].prompt.len() { ready.push(step.sequence); }
+            }
         }
-        driver.append_group(&steps)?;
         group_steps = group_steps.checked_add(1).ok_or(StrictInt4Error::Work)?;
-        for step in &steps {
-            let row = &mut cursors[step.sequence];
-            row.positions = row.positions.checked_add(1).ok_or(StrictInt4Error::Work)?;
-            if row.positions >= requests[step.sequence].prompt.len() { ready.push(step.sequence); }
-        }
         if ready.is_empty() { continue; }
         // One real shared head call over only ready sequences. Selection-major
         // rows remain full-vocabulary and must be finite even for illegal IDs.
@@ -91,6 +103,7 @@ fn run<V: Vocabulary, D: GroupDriver>(group_width: usize, requests: &[Int4JsonCo
     }
     let mut sequences = reserved(requests.len())?; let mut model_work = Int4Work::default();
     let mut longest = 0_u64; let mut masks = 0_u64;
+    let mut all_projections = 0_u64; let mut longest_projection_sequence = 0;
     for (slot, row) in cursors.into_iter().enumerate() {
         let json = String::from_utf8(row.bytes).map_err(|_| JsonDecodeError::IndependentValidation)?;
         requests[slot].program.validate_json(&json).map_err(|_| JsonDecodeError::IndependentValidation)?;
@@ -101,14 +114,19 @@ fn run<V: Vocabulary, D: GroupDriver>(group_width: usize, requests: &[Int4JsonCo
         }
         longest = longest.max(work.forward_positions); model_work = model_work.checked_add(work)?;
         masks = masks.checked_add(row.mask_charge).ok_or(StrictInt4Error::Work)?;
+        let projections = u64::try_from(row.tokens.len()).map_err(|_| StrictInt4Error::Work)?;
+        all_projections = all_projections.checked_add(projections).ok_or(StrictInt4Error::Work)?;
+        longest_projection_sequence = longest_projection_sequence.max(projections);
         sequences.push(Int4JsonRun { schema_version: 1, execution: INT4_JSON_EXECUTION.to_owned(), group_width,
             model_work: work, output: JsonDecodeOutput { schema_version: 1, numerics_profile: STRICT_INT4_PROFILE.to_owned(),
                 token_ids: row.tokens, json, forward_positions: work.forward_positions,
                 projected_logits: work.projected_logits, mask_node_visit_charge: row.mask_charge } });
     }
-    if group_steps != longest || projection_groups == 0 || projection_groups > group_steps
-        || masks > budget.max_mask_node_visits { return Err(Int4JsonError::WorkMismatch); }
-    let result = Int4JsonCohortRun { schema_version: 1, execution: INT4_JSON_COHORT_EXECUTION.to_owned(), sequences,
+    check_group_counts(prefill, model_work.forward_positions, longest, all_projections,
+        longest_projection_sequence, group_steps, projection_groups)?;
+    if masks > budget.max_mask_node_visits { return Err(Int4JsonError::WorkMismatch); }
+    let execution = if prefill.is_some() { INT4_JSON_PACKED_COHORT_EXECUTION } else { INT4_JSON_COHORT_EXECUTION };
+    let result = Int4JsonCohortRun { schema_version: 1, execution: execution.to_owned(), sequences,
         group_steps, projection_groups, planned_work, model_work };
     check_size(&result, budget.max_result_bytes)?;
     Ok(result)

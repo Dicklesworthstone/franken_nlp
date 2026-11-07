@@ -5,10 +5,11 @@
 //! rows share one decoder step without padding their causal positions.
 use super::*;
 use crate::native_engine::strict_int4::cohort::{Int4CohortEngine, Int4CohortSession,
-    Int4CohortToken, MAX_INT4_SEQUENCES};
+    Int4CohortToken, packed::Int4TokenRun, MAX_INT4_SEQUENCES};
 mod execution;
 
 pub const INT4_JSON_COHORT_EXECUTION: &str = "grouped-int4-constrained-json-cohort-v1";
+pub const INT4_JSON_PACKED_COHORT_EXECUTION: &str = "grouped-int4-constrained-json-packed-cohort-v1";
 
 /// Additional live cohort buffers beyond Int4MemoryRequirement::for_cohort.
 /// The token allowance covers token vectors plus cursor/row bookkeeping; the
@@ -60,6 +61,8 @@ pub struct Int4JsonCohortRun {
     pub execution: String,
     /// Stable input order; inner results retain the existing dense semantics.
     pub sequences: Vec<Int4JsonRun>,
+    /// Actual native forward invocations. Packed execution can append several
+    /// known prompt positions per invocation; this is not a position count.
     pub group_steps: u64,
     /// Actual shared full-vocabulary head invocations, not projected row count.
     pub projection_groups: u64,
@@ -114,6 +117,16 @@ pub fn decode_json_int4_cohort<C: DecodeStepControl>(engine: &mut Int4CohortEngi
     budget: Int4JsonCohortBudget, control: &mut C) -> Result<Int4JsonCohortRun, Int4JsonError> {
     execute_with(engine, requests, vocabulary, budget, control, Ok)
 }
+/// Explicit packed prompt scheduling over the same native math and independent
+/// grammars. The caller must admit `prefill.validate()` extra scratch bytes in
+/// addition to the ordinary native cohort and constrained-workspace quotes.
+/// Ready decode rows consume only one sampled feedback token per invocation.
+pub fn decode_json_int4_cohort_packed<C: DecodeStepControl>(engine: &mut Int4CohortEngine<'_>,
+    requests: &[Int4JsonCohortRequest<'_>], vocabulary: &VocabMaskOracle,
+    budget: Int4JsonCohortBudget, prefill: Int4PrefillLimits, control: &mut C)
+    -> Result<Int4JsonCohortRun, Int4JsonError> {
+    execute_with_packed(engine, requests, vocabulary, budget, prefill, control, Ok)
+}
 /// Closed task finalizers run before the exclusive session can release any KV.
 /// Error, cancellation and unwind invalidate the complete cohort; session Drop
 /// clears every row before its embedding host can release resource ownership.
@@ -121,9 +134,22 @@ pub(crate) fn execute_with<C, T, E, F>(engine: &mut Int4CohortEngine<'_>,
     requests: &[Int4JsonCohortRequest<'_>], vocabulary: &VocabMaskOracle,
     budget: Int4JsonCohortBudget, control: &mut C, finalize: F) -> Result<T, E>
 where C: DecodeStepControl, E: From<Int4JsonError>, F: FnOnce(Int4JsonCohortRun) -> Result<T, E> {
+    execute_scheduled(engine, requests, vocabulary, budget, None, control, finalize)
+}
+pub(crate) fn execute_with_packed<C, T, E, F>(engine: &mut Int4CohortEngine<'_>,
+    requests: &[Int4JsonCohortRequest<'_>], vocabulary: &VocabMaskOracle,
+    budget: Int4JsonCohortBudget, prefill: Int4PrefillLimits, control: &mut C, finalize: F) -> Result<T, E>
+where C: DecodeStepControl, E: From<Int4JsonError>, F: FnOnce(Int4JsonCohortRun) -> Result<T, E> {
+    execute_scheduled(engine, requests, vocabulary, budget, Some(prefill), control, finalize)
+}
+fn execute_scheduled<C, T, E, F>(engine: &mut Int4CohortEngine<'_>,
+    requests: &[Int4JsonCohortRequest<'_>], vocabulary: &VocabMaskOracle,
+    budget: Int4JsonCohortBudget, prefill: Option<Int4PrefillLimits>, control: &mut C, finalize: F) -> Result<T, E>
+where C: DecodeStepControl, E: From<Int4JsonError>, F: FnOnce(Int4JsonCohortRun) -> Result<T, E> {
     let group_width = engine.model_identity().group_width();
     let preflight = (|| -> Result<Vec<Int4RunBudget>, Int4JsonError> {
         poll(control, 0)?; engine.check_idle()?;
+        if let Some(limits) = prefill { limits.validate()?; }
         if requests.len() != engine.sequence_count() || vocabulary.width() != NANBEIGE_VOCAB_SIZE {
             return Err(JsonDecodeError::InvalidRequest("cohort model/tokenizer/row mismatch").into());
         }
@@ -142,7 +168,33 @@ where C: DecodeStepControl, E: From<Int4JsonError>, F: FnOnce(Int4JsonCohortRun)
     })();
     let budgets = preflight.map_err(E::from)?;
     let mut session = engine.session(&budgets, control).map_err(Int4JsonError::from).map_err(E::from)?;
-    execution::drive(group_width, requests, vocabulary, budget, &mut session, finalize)
+    match prefill {
+        Some(limits) => execution::drive_scheduled(group_width, requests, vocabulary, budget,
+            Some(limits), &mut session, finalize),
+        None => execution::drive(group_width, requests, vocabulary, budget, &mut session, finalize),
+    }
+}
+
+/// Reconcile physical counters without confusing a packed invocation with one
+/// causal position. Per-row native work is checked independently and exactly;
+/// these bounds supplement that check for the closed scheduling strategy.
+pub(crate) fn check_group_counts(prefill: Option<Int4PrefillLimits>, total_positions: u64,
+    longest_positions: u64, total_projections: u64, longest_projection_sequence: u64,
+    group_steps: u64, projection_groups: u64) -> Result<(), Int4JsonError> {
+    let valid_steps = match prefill {
+        None => group_steps == longest_positions,
+        Some(limits) => {
+            limits.validate()?;
+            group_steps >= total_positions.div_ceil(limits.max_batch_rows as u64)
+                && group_steps <= total_positions
+        }
+    };
+    if !valid_steps || total_positions == 0 || projection_groups == 0
+        || projection_groups > group_steps || projection_groups < longest_projection_sequence
+        || projection_groups > total_projections {
+        return Err(Int4JsonError::WorkMismatch);
+    }
+    Ok(())
 }
 fn check_capacities(group_width: usize, requests: &[Int4JsonCohortRequest<'_>],
     capacities: &[usize], max_kv_bytes: u64) -> Result<(), Int4JsonError> {
@@ -184,6 +236,7 @@ trait GroupDriver {
     type Control: DecodeStepControl;
     fn control(&mut self) -> &mut Self::Control;
     fn append_group(&mut self, steps: &[Int4CohortToken]) -> Result<(), Int4JsonError>;
+    fn append_packed(&mut self, runs: &[Int4TokenRun<'_>], limits: Int4PrefillLimits) -> Result<(), Int4JsonError>;
     fn logits_group(&mut self, slots: &[usize]) -> Result<Vec<f32>, Int4JsonError>;
     fn work(&self, slot: usize) -> Result<Int4Work, Int4JsonError>;
     fn abort(&mut self);
@@ -193,6 +246,9 @@ impl<C: DecodeStepControl> GroupDriver for Int4CohortSession<'_, '_, C> {
     fn control(&mut self) -> &mut C { Int4CohortSession::control(self) }
     fn append_group(&mut self, steps: &[Int4CohortToken]) -> Result<(), Int4JsonError> {
         Ok(Int4CohortSession::append_group(self, steps)?)
+    }
+    fn append_packed(&mut self, runs: &[Int4TokenRun<'_>], limits: Int4PrefillLimits) -> Result<(), Int4JsonError> {
+        Ok(Int4CohortSession::append_packed(self, runs, limits)?)
     }
     fn logits_group(&mut self, slots: &[usize]) -> Result<Vec<f32>, Int4JsonError> {
         Ok(Int4CohortSession::logits_group(self, slots, LinearRows::All)?)

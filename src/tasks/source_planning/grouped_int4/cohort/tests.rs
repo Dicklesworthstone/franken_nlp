@@ -2,6 +2,7 @@
 use super::*;
 use crate::native_engine::{constrained::JsonWorkBudget, strict_int4::Int4RunBudget};
 use super::super::tests::{planner, prepare, ner, keyphrases, summary, answer, synthetic};
+mod packed;
 
 fn fixtures() -> Vec<(SourceTaskRequest, &'static str, &'static str)> {
     vec![
