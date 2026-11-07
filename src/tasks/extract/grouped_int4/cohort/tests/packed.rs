@@ -54,7 +54,7 @@ fn packed_marker_work_and_physical_limits_cannot_bypass_independent_finalization
 }
 
 #[test]
-fn packed_selection_keeps_the_full_projection_contract_and_exact_envelope_bound() {
+fn packed_head_markers_cannot_relabel_selected_results_or_expand_the_exact_envelope_bound() {
     let plans = [plan(r#"{"type":"boolean"}"#, 127)
         .with_selected_rows(selected_head::Int4JsonSparseLimits { max_rows_per_step: NANBEIGE_VOCAB_SIZE }).unwrap()];
     let selected = requests(&plans);

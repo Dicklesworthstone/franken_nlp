@@ -5,7 +5,7 @@
 //! checks only requested logits; it makes no claim about unrequested rows and
 //! does not replace the full-vocabulary reference or certify model parity.
 use super::*;
-mod selection;
+pub(super) mod selection;
 pub mod prefill;
 
 pub const INT4_SPARSE_JSON_EXECUTION: &str = "grouped-int4-grammar-first-selected-rows-v1";
@@ -68,7 +68,7 @@ fn check_request(engine: &StrictInt4Engine<'_>, identity: &ExecutionIdentity, pr
     check_capacity(work, engine.kv_cache().capacity_positions(), budget.json.max_kv_bytes)
 }
 
-fn preflight<V: Vocabulary>(group_width: usize, prompt: &[u32], vocabulary: &V, options: &JsonDecodeOptions,
+pub(super) fn preflight<V: Vocabulary>(group_width: usize, prompt: &[u32], vocabulary: &V, options: &JsonDecodeOptions,
     budget: Int4JsonBudget, limits: Int4JsonSparseLimits) -> Result<Int4Work, Int4JsonError> {
     let width = vocabulary.width();
     let cap = limits.validate()?;
@@ -98,7 +98,7 @@ fn preflight<V: Vocabulary>(group_width: usize, prompt: &[u32], vocabulary: &V, 
 }
 
 // A private static seam, never an external backend or native-receipt factory.
-trait Driver {
+pub(super) trait Driver {
     type Control: DecodeStepControl;
     fn control(&mut self) -> &mut Self::Control;
     fn append(&mut self, token: u32) -> Result<(), Int4JsonError>;
@@ -143,7 +143,7 @@ fn select(rows: &[u32], logits: &[f32]) -> Result<u32, Int4JsonError> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn drive<V, D, T, E, F>(group_width: usize, prompt: &[u32], program: &JsonProgram, vocabulary: &V,
+pub(super) fn drive<V, D, T, E, F>(group_width: usize, prompt: &[u32], program: &JsonProgram, vocabulary: &V,
     options: &JsonDecodeOptions, budget: Int4JsonBudget, limits: Int4JsonSparseLimits,
     driver: &mut D, finalize: F) -> Result<T, E>
 where V: Vocabulary, D: Driver, E: From<Int4JsonError>, F: FnOnce(Int4JsonRun) -> Result<T, E> {

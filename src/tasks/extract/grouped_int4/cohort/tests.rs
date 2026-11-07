@@ -4,6 +4,7 @@ use crate::{native_engine::{constrained::JsonWorkBudget, strict_int4::Int4RunBud
     validation::grounded_fields::SourceOccurrence};
 use super::super::tests::{plan, source_plan, raw as raw_row};
 mod packed;
+mod selected;
 
 fn requests(plans: &[Int4ExtractPlan]) -> Vec<Int4ExtractCohortRequest<'_>> {
     plans.iter().map(|plan| {
@@ -45,16 +46,15 @@ fn every_document_binds_its_full_identity_and_vocabulary_control_registry() {
 }
 
 #[test]
-fn full_head_cohorts_refuse_selected_plans_even_with_a_full_vocabulary_ceiling() {
+fn sealed_selected_plans_are_admitted_but_cannot_relabel_dense_native_envelopes() {
     let registry = crate::tasks::extract::tests::registry();
     let vocabulary = ExtractionVocabulary::pinned(registry.template_controls()).unwrap();
     for max_rows_per_step in [1, NANBEIGE_VOCAB_SIZE] {
         let plans = [plan(r#"{"type":"boolean"}"#, 127)
             .with_selected_rows(selected_head::Int4JsonSparseLimits { max_rows_per_step }).unwrap()];
         let requests = requests(&plans);
-        assert!(matches!(check_request(&requests[0], &vocabulary),
-            Err(Int4ExtractError::Extraction(ExtractError::Contract(_)))));
-        assert!(preflight(&requests[0], &vocabulary).is_err());
+        check_request(&requests[0], &vocabulary).unwrap();
+        preflight(&requests[0], &vocabulary).unwrap();
         assert!(finish(&requests, raw(&requests, &["true"]), 1 << 20).is_err());
     }
 }

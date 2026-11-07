@@ -1,6 +1,7 @@
 //! Ragged native forward/head groups with independent constrained cursors.
 use super::*;
 mod packed;
+mod head;
 
 struct Cursor<'a> {
     grammar: JsonState<'a>, bytes: Vec<u8>, tokens: Vec<u32>,
@@ -16,6 +17,39 @@ impl<'a> Cursor<'a> {
         prompt.get(self.positions).copied().or_else(|| self.tokens.last().copied())
             .ok_or_else(|| JsonDecodeError::IllegalTransition.into())
     }
+    fn charge_projection(&mut self, count: usize, request: &Int4JsonCohortRequest<'_>) -> Result<(), Int4JsonError> {
+        self.projected = self.projected.checked_add(count).ok_or(StrictInt4Error::Work)?;
+        if self.projected as u64 > request.budget.json.max_projected_logits {
+            return Err(JsonDecodeError::BudgetExceeded("cohort row projected logits").into());
+        }
+        Ok(())
+    }
+    fn mask<V: Vocabulary, D: GroupDriver>(&mut self, request: &Int4JsonCohortRequest<'_>,
+        vocabulary: &V, driver: &mut D) -> Result<DenseTokenMask, Int4JsonError> {
+        self.mask_charge = self.mask_charge.checked_add(vocabulary.mask_charge(request.budget.json.mask_limits) as u64)
+            .filter(|&n| n <= request.budget.json.max_total_mask_node_visits)
+            .ok_or(JsonDecodeError::BudgetExceeded("cohort row mask work"))?;
+        let mask = vocabulary.mask(&self.grammar, request.budget.json.mask_limits, driver.control(), self.tokens.len())?;
+        if mask.vocab_size() != vocabulary.width() { return Err(JsonDecodeError::IllegalTransition.into()); }
+        Ok(mask)
+    }
+    fn accept<V: Vocabulary, D: GroupDriver>(&mut self, selected: u32,
+        request: &Int4JsonCohortRequest<'_>, vocabulary: &V, driver: &mut D) -> Result<(), Int4JsonError> {
+        poll(driver.control(), self.tokens.len())?;
+        self.tokens.push(selected);
+        if selected == request.options.eos_token_id { self.done = true; return Ok(()); }
+        let emitted = vocabulary.bytes(selected).filter(|bytes| !bytes.is_empty())
+            .ok_or(JsonDecodeError::IllegalTransition)?;
+        if self.bytes.len().checked_add(emitted.len()).is_none_or(|n| n > request.program.max_output_bytes()) {
+            return Err(JsonDecodeError::BudgetExceeded("cohort row JSON bytes").into());
+        }
+        if !self.grammar.consume_bytes(emitted) { return Err(JsonDecodeError::IllegalTransition.into()); }
+        self.bytes.extend_from_slice(emitted);
+        if self.tokens.len() >= request.options.max_new_tokens {
+            return Err(JsonDecodeError::BudgetExceeded("cohort output tokens before EOS").into());
+        }
+        Ok(())
+    }
 }
 
 pub(super) fn drive<V, D, T, E, F>(group_width: usize, requests: &[Int4JsonCohortRequest<'_>], vocabulary: &V,
@@ -26,7 +60,14 @@ where V: Vocabulary, D: GroupDriver, E: From<Int4JsonError>, F: FnOnce(Int4JsonC
 pub(super) fn drive_scheduled<V, D, T, E, F>(group_width: usize, requests: &[Int4JsonCohortRequest<'_>], vocabulary: &V,
     budget: Int4JsonCohortBudget, prefill: Option<Int4PrefillLimits>, driver: &mut D, finalize: F) -> Result<T, E>
 where V: Vocabulary, D: GroupDriver, E: From<Int4JsonError>, F: FnOnce(Int4JsonCohortRun) -> Result<T, E> {
-    let result = run(group_width, requests, vocabulary, budget, prefill, driver).map_err(E::from).and_then(|run| {
+    drive_with_projection(group_width, requests, vocabulary, budget, Projection::Full, prefill, driver, finalize)
+}
+#[allow(clippy::too_many_arguments)]
+pub(super) fn drive_with_projection<V, D, T, E, F>(group_width: usize, requests: &[Int4JsonCohortRequest<'_>], vocabulary: &V,
+    budget: Int4JsonCohortBudget, projection: Projection<'_>, prefill: Option<Int4PrefillLimits>, driver: &mut D, finalize: F)
+    -> Result<T, E>
+where V: Vocabulary, D: GroupDriver, E: From<Int4JsonError>, F: FnOnce(Int4JsonCohortRun) -> Result<T, E> {
+    let result = run(group_width, requests, vocabulary, budget, projection, prefill, driver).map_err(E::from).and_then(|run| {
         let step = run.sequences.iter().map(|row| row.output.token_ids.len()).max().unwrap_or(0);
         let result = finalize(run)?;
         poll(driver.control(), step).map_err(E::from)?;
@@ -36,10 +77,10 @@ where V: Vocabulary, D: GroupDriver, E: From<Int4JsonError>, F: FnOnce(Int4JsonC
     result
 }
 fn run<V: Vocabulary, D: GroupDriver>(group_width: usize, requests: &[Int4JsonCohortRequest<'_>], vocabulary: &V,
-    budget: Int4JsonCohortBudget, prefill: Option<Int4PrefillLimits>, driver: &mut D)
+    budget: Int4JsonCohortBudget, projection: Projection<'_>, prefill: Option<Int4PrefillLimits>, driver: &mut D)
     -> Result<Int4JsonCohortRun, Int4JsonError> {
     if let Some(limits) = prefill { limits.validate()?; }
-    let planned_work = requests_preflight(group_width, requests, vocabulary, budget)?;
+    let planned_work = requests_preflight(group_width, requests, vocabulary, budget, projection)?;
     let mut cursors = reserved(requests.len())?;
     for request in requests { cursors.push(Cursor::new(request)?); }
     let mut steps = reserved(requests.len())?; let mut ready = reserved(requests.len())?;
@@ -67,39 +108,7 @@ fn run<V: Vocabulary, D: GroupDriver>(group_width: usize, requests: &[Int4JsonCo
         }
         group_steps = group_steps.checked_add(1).ok_or(StrictInt4Error::Work)?;
         if ready.is_empty() { continue; }
-        // One real shared head call over only ready sequences. Selection-major
-        // rows remain full-vocabulary and must be finite even for illegal IDs.
-        let logits = driver.logits_group(&ready)?;
-        let expected = vocabulary.width().checked_mul(ready.len()).ok_or(StrictInt4Error::Memory)?;
-        checked_logits(&logits, expected)?;
-        projection_groups = projection_groups.checked_add(1).ok_or(StrictInt4Error::Work)?;
-        for (&slot, logits) in ready.iter().zip(logits.chunks_exact(vocabulary.width())) {
-            let request = &requests[slot]; let row = &mut cursors[slot]; let step = row.tokens.len();
-            poll(driver.control(), step)?;
-            row.projected = row.projected.checked_add(vocabulary.width()).ok_or(StrictInt4Error::Work)?;
-            if row.projected as u64 > request.budget.json.max_projected_logits {
-                return Err(JsonDecodeError::BudgetExceeded("cohort row projected logits").into());
-            }
-            row.mask_charge = row.mask_charge.checked_add(vocabulary.mask_charge(request.budget.json.mask_limits) as u64)
-                .filter(|&n| n <= request.budget.json.max_total_mask_node_visits)
-                .ok_or(JsonDecodeError::BudgetExceeded("cohort row mask work"))?;
-            let mask = vocabulary.mask(&row.grammar, request.budget.json.mask_limits, driver.control(), step)?;
-            if mask.vocab_size() != vocabulary.width() { return Err(JsonDecodeError::IllegalTransition.into()); }
-            let selected = select(logits, &mask, row.grammar.is_accepting(), request.options)?;
-            drop(mask); poll(driver.control(), step)?;
-            row.tokens.push(selected);
-            if selected == request.options.eos_token_id { row.done = true; continue; }
-            let emitted = vocabulary.bytes(selected).filter(|bytes| !bytes.is_empty())
-                .ok_or(JsonDecodeError::IllegalTransition)?;
-            if row.bytes.len().checked_add(emitted.len()).is_none_or(|n| n > request.program.max_output_bytes()) {
-                return Err(JsonDecodeError::BudgetExceeded("cohort row JSON bytes").into());
-            }
-            if !row.grammar.consume_bytes(emitted) { return Err(JsonDecodeError::IllegalTransition.into()); }
-            row.bytes.extend_from_slice(emitted);
-            if row.tokens.len() >= request.options.max_new_tokens {
-                return Err(JsonDecodeError::BudgetExceeded("cohort output tokens before EOS").into());
-            }
-        }
+        head::project_ready(&mut cursors, requests, vocabulary, projection, &ready, driver, &mut projection_groups)?;
     }
     let mut sequences = reserved(requests.len())?; let mut model_work = Int4Work::default();
     let mut longest = 0_u64; let mut masks = 0_u64;
@@ -117,15 +126,15 @@ fn run<V: Vocabulary, D: GroupDriver>(group_width: usize, requests: &[Int4JsonCo
         let projections = u64::try_from(row.tokens.len()).map_err(|_| StrictInt4Error::Work)?;
         all_projections = all_projections.checked_add(projections).ok_or(StrictInt4Error::Work)?;
         longest_projection_sequence = longest_projection_sequence.max(projections);
-        sequences.push(Int4JsonRun { schema_version: 1, execution: INT4_JSON_EXECUTION.to_owned(), group_width,
+        sequences.push(Int4JsonRun { schema_version: 1, execution: projection.row_execution().to_owned(), group_width,
             model_work: work, output: JsonDecodeOutput { schema_version: 1, numerics_profile: STRICT_INT4_PROFILE.to_owned(),
                 token_ids: row.tokens, json, forward_positions: work.forward_positions,
                 projected_logits: work.projected_logits, mask_node_visit_charge: row.mask_charge } });
     }
-    check_group_counts(prefill, model_work.forward_positions, longest, all_projections,
-        longest_projection_sequence, group_steps, projection_groups)?;
+    projection.check_counts(prefill, model_work.forward_positions, longest, all_projections,
+        longest_projection_sequence, model_work.projected_logits, group_steps, projection_groups)?;
     if masks > budget.max_mask_node_visits { return Err(Int4JsonError::WorkMismatch); }
-    let execution = if prefill.is_some() { INT4_JSON_PACKED_COHORT_EXECUTION } else { INT4_JSON_COHORT_EXECUTION };
+    let execution = projection.execution(prefill.is_some());
     let result = Int4JsonCohortRun { schema_version: 1, execution: execution.to_owned(), sequences,
         group_steps, projection_groups, planned_work, model_work };
     check_size(&result, budget.max_result_bytes)?;

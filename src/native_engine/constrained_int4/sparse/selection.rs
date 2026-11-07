@@ -3,10 +3,23 @@
 //! 32-ID stack storage plus one <=32-logit output fits the ordinary engine's
 //! full-vocabulary head/scratch envelope; no new uncharged heap rail is added.
 use super::*;
-const ROWS: usize = 32;
+pub(in crate::native_engine::constrained_int4) const ROWS: usize = 32;
+
+/// Closed head-only seam shared by single-sequence and cohort execution.
+/// Legal-set admission, stable ties and bounded chunks stay one algorithm.
+pub(in crate::native_engine::constrained_int4) trait Head {
+    type Control: DecodeStepControl;
+    fn control(&mut self) -> &mut Self::Control;
+    fn logits(&mut self, rows: &[u32]) -> Result<Vec<f32>, Int4JsonError>;
+}
+impl<D: Driver> Head for D {
+    type Control = D::Control;
+    fn control(&mut self) -> &mut Self::Control { Driver::control(self) }
+    fn logits(&mut self, rows: &[u32]) -> Result<Vec<f32>, Int4JsonError> { Driver::logits(self, rows) }
+}
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn project<D: Driver>(mask: &DenseTokenMask, accepting: bool, options: &JsonDecodeOptions,
+pub(in crate::native_engine::constrained_int4) fn project<D: Head>(mask: &DenseTokenMask, accepting: bool, options: &JsonDecodeOptions,
     cap: usize, remaining: u64, driver: &mut D, step: usize) -> Result<(u32, usize), Int4JsonError> {
     let legal = |id: u32| if id == options.eos_token_id { accepting }
         else { mask.contains(id) && !options.excluded_token_ids.contains(&id) };
@@ -37,7 +50,7 @@ pub(super) fn project<D: Driver>(mask: &DenseTokenMask, accepting: bool, options
     poll(driver.control(), step)?;
     best.map(|(id, _)| (id, count)).ok_or_else(|| JsonDecodeError::NoLegalToken.into())
 }
-fn block<D: Driver>(rows: &[u32], driver: &mut D, step: usize, best: &mut Option<(u32, f32)>)
+fn block<D: Head>(rows: &[u32], driver: &mut D, step: usize, best: &mut Option<(u32, f32)>)
     -> Result<(), Int4JsonError> {
     poll(driver.control(), step)?;
     let logits = driver.logits(rows)?;

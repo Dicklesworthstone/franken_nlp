@@ -3,6 +3,7 @@ use super::*;
 use crate::{execution_identity::{NumericsProfile, Sha256Digest},
     grammar::{CompileLimits, runtime::SourceRuntimeLimits}};
 mod packed;
+mod selected;
 
 const GROUP: usize = 127;
 struct Table(Vec<Vec<u8>>);
@@ -32,13 +33,14 @@ impl DecodeStepControl for Control {
 }
 struct Script {
     control: Control, scores: Vec<Vec<f32>>, seen: Vec<Vec<u32>>, projected: Vec<usize>,
-    groups: Vec<Vec<(usize, u32)>>, heads: Vec<Vec<usize>>, aborted: bool,
+    groups: Vec<Vec<(usize, u32)>>, heads: Vec<Vec<usize>>, selected_heads: Vec<(usize, Vec<u32>)>, aborted: bool,
     fail_group: Option<usize>, bad_work: bool, bad_head: bool, packed_calls: usize,
 }
 impl Script {
     fn new(count: usize) -> Self {
         Self { control: Control::default(), scores: vec![vec![0.0, 2.0, 1.0, 4.0, 3.0, 1.0, 100.0]; count],
             seen: vec![Vec::new(); count], projected: vec![0; count], groups: Vec::new(), heads: Vec::new(),
+            selected_heads: Vec::new(),
             aborted: false, fail_group: None, bad_work: false, bad_head: false, packed_calls: 0 }
     }
 }
@@ -78,6 +80,15 @@ impl GroupDriver for Script {
             self.projected[slot] += self.scores[slot].len();
             logits.extend_from_slice(&self.scores[slot]);
         }
+        if self.bad_head { logits.pop(); }
+        Ok(logits)
+    }
+    fn logits_selected(&mut self, slot: usize, rows: &[u32]) -> Result<Vec<f32>, Int4JsonError> {
+        assert!(!rows.is_empty() && rows.len() <= 32);
+        assert!(rows.windows(2).all(|pair| pair[0] < pair[1]));
+        self.heads.push(vec![slot]); self.selected_heads.push((slot, rows.to_vec()));
+        self.projected[slot] += rows.len();
+        let mut logits: Vec<_> = rows.iter().map(|&id| self.scores[slot][id as usize]).collect();
         if self.bad_head { logits.pop(); }
         Ok(logits)
     }

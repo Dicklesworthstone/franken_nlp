@@ -1,13 +1,16 @@
 //! Independent schema/source plans sharing one actual INT4 decoder cohort.
-//! Original full-vocabulary task identities and results are unchanged; only
-//! this outer envelope describes physical grouping. No parity claim is made.
+//! Original full-vocabulary or selected-row task identities and results stay
+//! unchanged; this outer envelope describes grouping. No parity claim is made.
 use super::*;
 use crate::native_engine::{strict_int4::cohort::{Int4CohortEngine, MAX_INT4_SEQUENCES},
     constrained_int4::cohort::{self as native, Int4JsonCohortRequest, Int4JsonCohortBudget,
-        Int4JsonCohortRun, INT4_JSON_COHORT_EXECUTION, INT4_JSON_PACKED_COHORT_EXECUTION}};
+        Int4JsonCohortRun, INT4_JSON_COHORT_EXECUTION, INT4_JSON_PACKED_COHORT_EXECUTION,
+        INT4_JSON_SELECTED_COHORT_EXECUTION, INT4_JSON_SELECTED_PACKED_COHORT_EXECUTION}};
 
 pub const INT4_EXTRACT_COHORT_EXECUTION: &str = "grouped-int4-schema-source-extraction-cohort-v1";
 pub const INT4_EXTRACT_PACKED_COHORT_EXECUTION: &str = "grouped-int4-schema-source-extraction-packed-cohort-v1";
+pub const INT4_EXTRACT_SELECTED_COHORT_EXECUTION: &str = "grouped-int4-schema-source-extraction-selected-cohort-v1";
+pub const INT4_EXTRACT_SELECTED_PACKED_COHORT_EXECUTION: &str = "grouped-int4-schema-source-extraction-selected-packed-cohort-v1";
 
 pub struct Int4ExtractCohortRequest<'a> {
     pub prepared: &'a Int4ExtractPlan,
@@ -34,9 +37,6 @@ pub struct Int4ExtractCohortRun {
 
 fn check_request(request: &Int4ExtractCohortRequest<'_>, vocabulary: &ExtractionVocabulary)
     -> Result<(), Int4ExtractError> {
-    if request.prepared.selected_rows().is_some() {
-        return Err(ExtractError::Contract("selected-row INT4 extraction requires single-sequence execution").into());
-    }
     request.prepared.verify_identity(request.admitted_identity)?;
     if vocabulary.controls != request.prepared.extraction.controls {
         return Err(ExtractError::Contract("cohort vocabulary control registry differs from sealed INT4 plan").into());
@@ -49,11 +49,16 @@ fn check_request(request: &Int4ExtractCohortRequest<'_>, vocabulary: &Extraction
 pub(crate) fn preflight(request: &Int4ExtractCohortRequest<'_>, vocabulary: &ExtractionVocabulary)
     -> Result<(), Int4ExtractError> {
     check_request(request, vocabulary)?;
-    let work = native::preflight_request(request.prepared.group_width(),
-        &native_request(request), &vocabulary.oracle)?;
+    let row = native_request(request);
+    let work = match request.prepared.selected_rows() {
+        None => native::preflight_request(request.prepared.group_width(), &row, &vocabulary.oracle)?,
+        Some(limits) => native::preflight_request_selected(request.prepared.group_width(), &row, &vocabulary.oracle, limits)?,
+    };
     if work != request.prepared.planned_work() { return Err(Int4JsonError::WorkMismatch.into()); }
     Ok(())
 }
+/// Every row keeps its sealed head policy. A cohort may contain different
+/// selected-row ceilings, but never mixes full and selected head semantics.
 pub fn execute<C: DecodeStepControl>(engine: &mut Int4CohortEngine<'_>,
     requests: &[Int4ExtractCohortRequest<'_>], vocabulary: &ExtractionVocabulary,
     budget: Int4ExtractCohortBudget, control: &mut C) -> Result<Int4ExtractCohortRun, Int4ExtractError> {
@@ -94,10 +99,17 @@ where C: DecodeStepControl, E: From<Int4ExtractError> + From<Int4JsonError>,
     if requests.is_empty() || requests.len() > MAX_INT4_SEQUENCES || budget.max_result_bytes == 0 {
         return Err(E::from(Int4ExtractError::from(ExtractError::Contract("invalid INT4 extraction cohort bounds"))));
     }
+    let selected = selected_policy(requests).map_err(E::from)?;
     for request in requests { preflight(request, vocabulary).map_err(E::from)?; }
     let mut rows = Vec::new(); rows.try_reserve_exact(requests.len())
         .map_err(|_| E::from(Int4ExtractError::from(ExtractError::AllocationRefused)))?;
     for request in requests { rows.push(native_request(request)); }
+    let mut selected_limits = [selected_head::Int4JsonSparseLimits { max_rows_per_step: 1 }; MAX_INT4_SEQUENCES];
+    if selected {
+        for (slot, request) in requests.iter().enumerate() {
+            selected_limits[slot] = request.prepared.selected_rows().ok_or_else(|| E::from(Int4JsonError::WorkMismatch))?;
+        }
+    }
     let finalize_native = |run| {
         let output = match prefill {
             Some(_) => finish_scheduled(requests, run, budget.max_result_bytes, prefill),
@@ -105,11 +117,22 @@ where C: DecodeStepControl, E: From<Int4ExtractError> + From<Int4JsonError>,
         };
         finalize(output.map_err(E::from)?)
     };
-    match prefill {
-        Some(limits) => native::execute_with_packed(engine, &rows, &vocabulary.oracle, budget.decode,
+    match (selected, prefill) {
+        (false, Some(limits)) => native::execute_with_packed(engine, &rows, &vocabulary.oracle, budget.decode,
             limits, control, finalize_native),
-        None => native::execute_with(engine, &rows, &vocabulary.oracle, budget.decode, control, finalize_native),
+        (false, None) => native::execute_with(engine, &rows, &vocabulary.oracle, budget.decode, control, finalize_native),
+        (true, Some(limits)) => native::selected::execute_with_selected_packed(engine, &rows, &vocabulary.oracle,
+            budget.decode, &selected_limits[..rows.len()], limits, control, finalize_native),
+        (true, None) => native::selected::execute_with_selected(engine, &rows, &vocabulary.oracle,
+            budget.decode, &selected_limits[..rows.len()], control, finalize_native),
     }
+}
+fn selected_policy(requests: &[Int4ExtractCohortRequest<'_>]) -> Result<bool, Int4ExtractError> {
+    let first = requests.first().ok_or(ExtractError::InvalidResult)?.prepared.selected_rows().is_some();
+    if requests.iter().any(|row| row.prepared.selected_rows().is_some() != first) {
+        return Err(ExtractError::Contract("INT4 cohorts cannot mix full and selected head policies").into());
+    }
+    Ok(first)
 }
 fn native_request<'a>(request: &Int4ExtractCohortRequest<'a>) -> Int4JsonCohortRequest<'a> {
     let plan = request.prepared;
@@ -129,16 +152,19 @@ pub(super) fn finish(requests: &[Int4ExtractCohortRequest<'_>], raw: Int4JsonCoh
 fn finish_scheduled(requests: &[Int4ExtractCohortRequest<'_>], raw: Int4JsonCohortRun, cap: u64,
     prefill: Option<Int4PrefillLimits>) -> Result<Int4ExtractCohortRun, Int4ExtractError> {
     if let Some(limits) = prefill { limits.validate().map_err(Int4JsonError::from)?; }
-    let native_execution = if prefill.is_some() { INT4_JSON_PACKED_COHORT_EXECUTION } else { INT4_JSON_COHORT_EXECUTION };
+    let selected = selected_policy(requests)?;
+    let (native_execution, execution) = match (selected, prefill.is_some()) {
+        (false, false) => (INT4_JSON_COHORT_EXECUTION, INT4_EXTRACT_COHORT_EXECUTION),
+        (false, true) => (INT4_JSON_PACKED_COHORT_EXECUTION, INT4_EXTRACT_PACKED_COHORT_EXECUTION),
+        (true, false) => (INT4_JSON_SELECTED_COHORT_EXECUTION, INT4_EXTRACT_SELECTED_COHORT_EXECUTION),
+        (true, true) => (INT4_JSON_SELECTED_PACKED_COHORT_EXECUTION, INT4_EXTRACT_SELECTED_PACKED_COHORT_EXECUTION),
+    };
     if raw.schema_version != 1 || raw.execution != native_execution
         || raw.sequences.len() != requests.len() || requests.is_empty() || requests.len() > MAX_INT4_SEQUENCES {
         return Err(ExtractError::InvalidResult.into());
     }
     let mut expected = Int4Work::default();
     for request in requests {
-        if request.prepared.selected_rows().is_some() {
-            return Err(ExtractError::Contract("selected-row INT4 extraction requires single-sequence execution").into());
-        }
         request.prepared.verify_identity(request.admitted_identity)?;
         if request.prepared.group_width() != requests[0].prepared.group_width() { return Err(Int4ExtractError::Identity); }
         expected = expected.checked_add(request.prepared.planned_work()).map_err(Int4JsonError::from)?;
@@ -157,9 +183,13 @@ fn finish_scheduled(requests: &[Int4ExtractCohortRequest<'_>], raw: Int4JsonCoho
         sequences.push(result);
     }
     if raw.model_work != model_work { return Err(Int4JsonError::WorkMismatch.into()); }
-    native::check_group_counts(prefill, model_work.forward_positions, longest, all_projections,
-        longest_projection_sequence, raw.group_steps, raw.projection_groups)?;
-    let execution = if prefill.is_some() { INT4_EXTRACT_PACKED_COHORT_EXECUTION } else { INT4_EXTRACT_COHORT_EXECUTION };
+    if selected {
+        native::check_selected_group_counts(prefill, model_work.forward_positions, longest, all_projections,
+            longest_projection_sequence, model_work.projected_logits, raw.group_steps, raw.projection_groups)?;
+    } else {
+        native::check_group_counts(prefill, model_work.forward_positions, longest, all_projections,
+            longest_projection_sequence, raw.group_steps, raw.projection_groups)?;
+    }
     let output = Int4ExtractCohortRun { schema_version: 1, execution: execution.to_owned(),
         sequences, group_steps: raw.group_steps, projection_groups: raw.projection_groups,
         planned_work: expected, model_work };
