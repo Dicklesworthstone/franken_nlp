@@ -12,6 +12,15 @@ pub(super) struct QuestionArgs {
     /// Exact UTF-8 question file; stdin is reserved for the complete document.
     #[arg(long, value_name = "FILE")]
     question: PathBuf,
+    #[command(flatten)]
+    policy: QuestionPolicyArgs,
+    #[command(flatten)]
+    synthesis: synthesis::SynthesisArgs,
+}
+/// Source verification policy shared by a real question file and per-record
+/// questions. No synthetic file path or placeholder question is needed.
+#[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct QuestionPolicyArgs {
     /// Independent citation fields across ALL answered chunks.
     #[arg(long, default_value_t = 4096)]
     max_qa_citations: usize,
@@ -21,8 +30,6 @@ pub(super) struct QuestionArgs {
     /// Nonrenewable citation verification scan work across the complete document.
     #[arg(long, default_value_t = 67_108_864)]
     max_qa_scan_steps: u64,
-    #[command(flatten)]
-    synthesis: synthesis::SynthesisArgs,
 }
 impl std::fmt::Debug for QuestionArgs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("QuestionArgs") }
@@ -59,6 +66,18 @@ impl QuestionArgs {
         self.synthesis.request(question, planning)
     }
     pub(super) fn verification(&self) -> Result<GroundingBudget, CandidateError> {
+        self.policy.verification()
+    }
+    pub(super) fn task(&self, question: String, raw: Option<&str>) -> Result<SourceQuestion, CandidateError> {
+        self.validate()?;
+        if question.len() > QUESTION_BYTES { return Err(CandidateError::Input); }
+        let task = SourceQuestion { question, options: options(raw)?, verification: self.verification()? };
+        task.validate().map_err(|_| CandidateError::Input)?;
+        Ok(task)
+    }
+}
+impl QuestionPolicyArgs {
+    pub(super) fn verification(self) -> Result<GroundingBudget, CandidateError> {
         let verification = GroundingBudget { max_fields: self.max_qa_citations,
             max_matches: self.max_qa_evidence_spans, max_scan_steps: self.max_qa_scan_steps };
         if !(1..=1_000_000).contains(&verification.max_fields)
@@ -68,10 +87,9 @@ impl QuestionArgs {
         }
         Ok(verification)
     }
-    pub(super) fn task(&self, question: String, raw: Option<&str>) -> Result<SourceQuestion, CandidateError> {
-        self.validate()?;
-        if question.len() > QUESTION_BYTES { return Err(CandidateError::Input); }
-        let options = match raw {
+}
+pub(super) fn options(raw: Option<&str>) -> Result<AnswerOptions, CandidateError> {
+    let options = match raw {
             None => AnswerOptions::default(),
             Some(raw) => {
                 if raw.len() > shared::OPTIONS_BYTES { return Err(CandidateError::Input); }
@@ -80,12 +98,9 @@ impl QuestionArgs {
                 }).map_err(|_| CandidateError::Input)?;
                 serde_json::from_value::<AnswerOptions>(value).map_err(|_| CandidateError::Input)?
             }
-        };
-        options.schema_source().map_err(|_| CandidateError::Planning)?;
-        let task = SourceQuestion { question, options, verification: self.verification()? };
-        task.validate().map_err(|_| CandidateError::Input)?;
-        Ok(task)
-    }
+    };
+    options.schema_source().map_err(|_| CandidateError::Planning)?;
+    Ok(options)
 }
 
 pub(super) fn workspace_bytes(budget: TaskBudget, mapping: Int4SourceMapLimits,

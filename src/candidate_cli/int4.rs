@@ -140,6 +140,7 @@ enum Int4Task {
     Source(crate::candidate_cli::source::Kind, source::SourceArgs),
     SourceBatch(source_batch::BatchArgs),
     SourceMap(source_map::MapArgs),
+    AnswerCorpus(source_map::corpus::CorpusArgs),
     ExtractBatch(extract_batch::BatchArgs),
     ExtractMap(extract_map::MapArgs),
     ExtractCorpus(extract_map::corpus::CorpusArgs),
@@ -225,6 +226,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommands(source_batch::definitions())
         .subcommands(source_job::definitions())
         .subcommands(source_map::definitions())
+        .subcommand(source_map::corpus::definition())
         .subcommand(batch::definition())
         .subcommand(batch::corpus::definition())
         .subcommand(text_job::definition())
@@ -314,6 +316,7 @@ impl Int4Command {
             "extract-batch" => Int4Task::ExtractBatch(extract_batch::BatchArgs::from_matches(matches)?),
             "extract-map" => Int4Task::ExtractMap(extract_map::MapArgs::from_matches(matches)?),
             "extract-corpus" => Int4Task::ExtractCorpus(extract_map::corpus::CorpusArgs::from_matches(matches)?),
+            "answer-corpus" => Int4Task::AnswerCorpus(source_map::corpus::CorpusArgs::from_matches(matches)?),
             "ner" | "keyphrases" | "summarize" | "answer" => Int4Task::Source(
                 crate::candidate_cli::source::Kind::named(name).ok_or_else(||
                     clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source task refused"))?,
@@ -367,6 +370,8 @@ impl Int4Command {
             Self { task: Int4Task::ExtractBatch(options), args, batch: None, job: None } =>
                 options.execute_owned(args, input, output),
             Self { task: Int4Task::ExtractCorpus(options), args, batch: None, job: None } =>
+                return options.run_owned(args, input, output, diagnostics),
+            Self { task: Int4Task::AnswerCorpus(options), args, batch: None, job: None } =>
                 return options.run_owned(args, input, output, diagnostics),
             Self { task: Int4Task::SourceBatch(options), args, batch: None, job: None } =>
                 options.execute_owned(args, input, output),
@@ -438,7 +443,7 @@ impl Int4Command {
             Int4Task::Source(_, source) => source.validate_with_prefill(&self.args)?,
             // The blocking stream must own its input and writer through cleanup.
             Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::FaithfulnessMap(_) | Int4Task::FaithfulnessCorpus(_) | Int4Task::Semantic(_) | Int4Task::Resolve(_) | Int4Task::Sentiment(_) | Int4Task::SentimentMap(_) | Int4Task::SentimentCorpus(_) | Int4Task::ClassifyMap(_) | Int4Task::ClassifyCorpus(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ScoredBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
-                | Int4Task::ExtractCorpus(_) | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::ClassificationDocumentJob | Int4Task::SentimentDocumentJob | Int4Task::FaithfulnessDocumentJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob => return Err(CandidateError::Arguments),
+                | Int4Task::AnswerCorpus(_) | Int4Task::ExtractCorpus(_) | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::ClassificationDocumentJob | Int4Task::SentimentDocumentJob | Int4Task::FaithfulnessDocumentJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob => return Err(CandidateError::Arguments),
         };
         #[cfg(feature = "asupersync-runtime")]
         { runtime::execute_task(self.task, self.args, limits, input, output) }

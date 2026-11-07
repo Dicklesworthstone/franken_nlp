@@ -31,7 +31,7 @@ fn hierarchy_requires_explicit_answer_synthesis_and_child_controls_require_hiera
         assert!(parsed(kind, &["--question", "q", "--synthesize-answer", "--hierarchical-answer"]).is_err());
     }
     let (mut options, args) = arguments(&[]);
-    options.question.as_mut().unwrap().synthesis.synthesize_answer = false;
+    options.question.as_mut().unwrap().synthesis.flat.synthesize_answer = false;
     assert_eq!(options.validate(&args).unwrap_err(), CandidateError::Arguments);
     let (mut options, args) = arguments(&["--answer-max-passes", "3"]);
     options.question.as_mut().unwrap().synthesis.hierarchy.hierarchical_answer = false;

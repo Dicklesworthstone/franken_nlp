@@ -7,6 +7,15 @@ pub(in super::super) mod hierarchy;
 
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SynthesisArgs {
+    #[command(flatten)]
+    pub flat: FlatSynthesisArgs,
+    #[command(flatten)]
+    hierarchy: hierarchy::HierarchyArgs,
+}
+/// The bounded complete-evidence pass is independently reusable by streams;
+/// hierarchy arguments remain confined to workflows that execute hierarchies.
+#[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
+pub(in super::super) struct FlatSynthesisArgs {
     /// Add one native answer pass over ALL collected, verified source quotes.
     /// Generated chunk answers remain output data and are never source facts.
     #[arg(long)]
@@ -18,25 +27,42 @@ pub(super) struct SynthesisArgs {
     /// manifest, token and context fit must also pass independently.
     #[arg(long, requires = "synthesize_answer")]
     max_synthesis_evidence_bytes: Option<usize>,
-    #[command(flatten)]
-    hierarchy: hierarchy::HierarchyArgs,
 }
 impl SynthesisArgs {
     pub(super) fn validate(self) -> Result<(), CandidateError> {
+        self.flat.validate()?;
+        self.hierarchy()?;
+        Ok(())
+    }
+    pub(super) fn hierarchy(self)
+        -> Result<Option<crate::tasks::source_planning::grouped_int4::long::question::synthesis::hierarchy::QuestionHierarchyLimits>, CandidateError> {
+        self.hierarchy.limits(self.flat.synthesize_answer)
+    }
+    pub(super) fn planning(self, planning: SourcePlanningLimits) -> SourcePlanningLimits {
+        self.flat.planning(planning)
+    }
+    pub(super) fn limits(self, planning: SourcePlanningLimits)
+        -> Result<Option<QuestionSynthesisLimits>, CandidateError> {
+        self.validate()?;
+        self.flat.limits(planning)
+    }
+    pub(super) fn request(self, question: SourceQuestion, planning: SourcePlanningLimits)
+        -> Result<SourceQuestionSynthesis, CandidateError> {
+        self.validate()?;
+        self.flat.request(question, planning)
+    }
+}
+impl FlatSynthesisArgs {
+    pub(in super::super) fn validate(self) -> Result<(), CandidateError> {
         let supplied = self.max_synthesis_passages.is_some() || self.max_synthesis_evidence_bytes.is_some();
         if (!self.synthesize_answer && supplied)
             || self.max_synthesis_passages.is_some_and(|n| !(1..=1024).contains(&n))
             || self.max_synthesis_evidence_bytes.is_some_and(|n| !(1..=MAX_INPUT_BYTES).contains(&n)) {
             return Err(CandidateError::Arguments);
         }
-        self.hierarchy()?;
         Ok(())
     }
-    pub(super) fn hierarchy(self)
-        -> Result<Option<crate::tasks::source_planning::grouped_int4::long::question::synthesis::hierarchy::QuestionHierarchyLimits>, CandidateError> {
-        self.hierarchy.limits(self.synthesize_answer)
-    }
-    pub(super) fn planning(self, mut planning: SourcePlanningLimits) -> SourcePlanningLimits {
+    pub(in super::super) fn planning(self, mut planning: SourcePlanningLimits) -> SourcePlanningLimits {
         if self.synthesize_answer {
             // Only the explicit collected-evidence request expands this cap.
             // Ordinary passage QA and independent document maps keep theirs.
@@ -44,7 +70,7 @@ impl SynthesisArgs {
         }
         planning
     }
-    pub(super) fn limits(self, planning: SourcePlanningLimits)
+    pub(in super::super) fn limits(self, planning: SourcePlanningLimits)
         -> Result<Option<QuestionSynthesisLimits>, CandidateError> {
         self.validate()?;
         if !self.synthesize_answer { return Ok(None); }
@@ -58,7 +84,7 @@ impl SynthesisArgs {
         }
         Ok(Some(limits))
     }
-    pub(super) fn request(self, question: SourceQuestion, planning: SourcePlanningLimits)
+    pub(in super::super) fn request(self, question: SourceQuestion, planning: SourcePlanningLimits)
         -> Result<SourceQuestionSynthesis, CandidateError> {
         let limits = self.limits(planning)?.ok_or(CandidateError::Arguments)?;
         question.validate().map_err(|_| CandidateError::Input)?;

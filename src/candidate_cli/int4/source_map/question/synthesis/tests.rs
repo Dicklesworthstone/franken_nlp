@@ -47,7 +47,7 @@ fn synthesis_flags_require_the_question_and_cannot_leak_to_other_tasks() {
         assert!(parsed(kind, &["--synthesize-answer"]).is_err());
     }
     let (mut map, args) = arguments(&["--max-synthesis-passages", "2"]);
-    map.question.as_mut().unwrap().synthesis.synthesize_answer = false;
+    map.question.as_mut().unwrap().synthesis.flat.synthesize_answer = false;
     assert_eq!(map.validate(&args).unwrap_err(), CandidateError::Arguments);
 }
 

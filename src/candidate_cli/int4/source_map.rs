@@ -13,6 +13,7 @@ use crate::{
 };
 
 mod question;
+pub(in crate::candidate_cli::int4) mod corpus;
 mod synthesis;
 mod keyphrases;
 #[cfg(feature = "asupersync-runtime")]
@@ -188,25 +189,10 @@ impl MapArgs {
         let mut common = self.source.validate(args)?;
         if (self.kind == Kind::Answer) != self.question.is_some()
             || (self.kind == Kind::Summarize) != self.summary.is_some()
-            || (self.kind == Kind::Keyphrases) != self.keyphrases.is_some()
-            || self.cohort_chunks.is_some_and(|n| !(1..=64).contains(&n) || n > m.max_chunks)
-            || args.max_input_bytes < 4 || !(1..=256).contains(&m.max_chunks)
-            || !(1..=1_000_000).contains(&m.max_tokenizer_calls)
-            || m.max_chunk_bytes.is_some_and(|n| !(4..=MAX_INPUT_BYTES).contains(&n))
-            || [m.max_map_result_bytes, m.max_live_value_bytes, m.max_total_value_bytes]
-                .iter().any(|&n| !(1..=64 * 1024 * 1024).contains(&n))
-            || m.max_map_result_bytes > m.max_live_value_bytes || m.max_map_result_bytes > m.max_total_value_bytes
-            || common.result_bytes > m.max_map_result_bytes
-            || m.max_total_mask_node_visits < self.source.mask_visits()
-            || m.max_total_mask_node_visits > 1_000_000_000_000_000
-            || !(1..=16 * 1024 * 1024).contains(&m.max_forward_positions)
-            || m.max_projected_logits < NANBEIGE_VOCAB_SIZE as u64 || m.max_attention_pairs == 0
-            || m.max_dot_products == 0 || m.max_multiply_accumulates == 0
-            || !(1..=1_000_000).contains(&m.max_source_fields)
-            || !(1..=1_000_000).contains(&m.max_source_evidence_spans)
-            || !(1..=1_000_000_000_000).contains(&m.max_source_scan_steps) {
+            || (self.kind == Kind::Keyphrases) != self.keyphrases.is_some() {
             return Err(CandidateError::Arguments);
         }
+        m.validate(args, &self.source, common, self.cohort_chunks)?;
         let reduction_reserve_bytes = mib(m.reduction_reserve_mib)?;
         let mapping = self.mapping_limits(args)?;
         let keyphrases = self.keyphrases.map(|settings| settings.limits(mapping)).transpose()?.flatten();
@@ -403,28 +389,7 @@ impl MapArgs {
         })
     }
     fn mapping_limits(&self, args: &Int4Args) -> Result<Int4SourceMapLimits, CandidateError> {
-        let m = self.mapping;
-        let chunks = ChunkLimits { max_input_bytes: args.max_input_bytes,
-            max_chunk_bytes: m.max_chunk_bytes.unwrap_or(args.context_tokens).min(args.max_input_bytes),
-            max_chunk_tokens: args.context_tokens, context_tokens: args.context_tokens,
-            reserved_tokens: args.max_new_tokens, max_chunks: m.max_chunks, max_tokenizer_calls: m.max_tokenizer_calls };
-        // This preliminary ceiling is tightened by the core's EXACT scaffold
-        // capacity, independently for the selected task and typed options.
-        chunks.effective_token_limit().map_err(|_| CandidateError::Arguments)?;
-        Ok(Int4SourceMapLimits {
-            chunks, reduction: ExecutionLimits { map_batch_chunks: self.cohort_chunks.unwrap_or(1), reduce_fan_in: 8,
-                max_reduction_levels: 8, max_task_calls: 1024, max_value_bytes: m.max_map_result_bytes,
-                max_live_value_bytes: m.max_live_value_bytes, max_total_value_bytes: m.max_total_value_bytes,
-                max_result_bytes: m.max_map_result_bytes },
-            max_model_work: Int4Work { forward_positions: m.max_forward_positions,
-                projected_logits: m.max_projected_logits, attention_pairs: m.max_attention_pairs,
-                projections: ProjectionWork { dot_products: m.max_dot_products,
-                    multiply_accumulates: m.max_multiply_accumulates } },
-            mask_limits: self.source.masks(), mask_visits_per_chunk: self.source.mask_visits(),
-            max_mask_visits: m.max_total_mask_node_visits,
-            verification: GroundingBudget { max_fields: m.max_source_fields,
-                max_matches: m.max_source_evidence_spans, max_scan_steps: m.max_source_scan_steps },
-        })
+        self.mapping.limits(args, &self.source, self.cohort_chunks)
     }
     fn request(&self, text: String, options: Option<&str>, budget: TaskBudget, max_input_bytes: usize)
         -> Result<(String, SourceMapTask), CandidateError> {
@@ -445,6 +410,55 @@ impl MapArgs {
         { runtime::execute(args, self, limits, input, output) }
         #[cfg(not(feature = "asupersync-runtime"))]
         { let _ = (self, args, limits, input, output); Err(CandidateError::Unavailable) }
+    }
+}
+impl MappingArgs {
+    fn validate(self, args: &Int4Args, source: &source::SourceArgs, common: Int4Limits,
+        cohort_chunks: Option<usize>) -> Result<(), CandidateError> {
+        let m = self;
+        if cohort_chunks.is_some_and(|n| !(1..=64).contains(&n) || n > m.max_chunks)
+            || args.max_input_bytes < 4 || !(1..=256).contains(&m.max_chunks)
+            || !(1..=1_000_000).contains(&m.max_tokenizer_calls)
+            || m.max_chunk_bytes.is_some_and(|n| !(4..=MAX_INPUT_BYTES).contains(&n))
+            || [m.max_map_result_bytes, m.max_live_value_bytes, m.max_total_value_bytes]
+                .iter().any(|&n| !(1..=64 * 1024 * 1024).contains(&n))
+            || m.max_map_result_bytes > m.max_live_value_bytes || m.max_map_result_bytes > m.max_total_value_bytes
+            || common.result_bytes > m.max_map_result_bytes
+            || m.max_total_mask_node_visits < source.mask_visits()
+            || m.max_total_mask_node_visits > 1_000_000_000_000_000
+            || !(1..=16 * 1024 * 1024).contains(&m.max_forward_positions)
+            || m.max_projected_logits < NANBEIGE_VOCAB_SIZE as u64 || m.max_attention_pairs == 0
+            || m.max_dot_products == 0 || m.max_multiply_accumulates == 0
+            || !(1..=1_000_000).contains(&m.max_source_fields)
+            || !(1..=1_000_000).contains(&m.max_source_evidence_spans)
+            || !(1..=1_000_000_000_000).contains(&m.max_source_scan_steps) {
+            return Err(CandidateError::Arguments);
+        }
+        Ok(())
+    }
+    fn limits(self, args: &Int4Args, source: &source::SourceArgs,
+        cohort_chunks: Option<usize>) -> Result<Int4SourceMapLimits, CandidateError> {
+        let m = self;
+        let chunks = ChunkLimits { max_input_bytes: args.max_input_bytes,
+            max_chunk_bytes: m.max_chunk_bytes.unwrap_or(args.context_tokens).min(args.max_input_bytes),
+            max_chunk_tokens: args.context_tokens, context_tokens: args.context_tokens,
+            reserved_tokens: args.max_new_tokens, max_chunks: m.max_chunks, max_tokenizer_calls: m.max_tokenizer_calls };
+        // Actual source/question/schema/template capacity tightens this bound.
+        chunks.effective_token_limit().map_err(|_| CandidateError::Arguments)?;
+        Ok(Int4SourceMapLimits {
+            chunks, reduction: ExecutionLimits { map_batch_chunks: cohort_chunks.unwrap_or(1), reduce_fan_in: 8,
+                max_reduction_levels: 8, max_task_calls: 1024, max_value_bytes: m.max_map_result_bytes,
+                max_live_value_bytes: m.max_live_value_bytes, max_total_value_bytes: m.max_total_value_bytes,
+                max_result_bytes: m.max_map_result_bytes },
+            max_model_work: Int4Work { forward_positions: m.max_forward_positions,
+                projected_logits: m.max_projected_logits, attention_pairs: m.max_attention_pairs,
+                projections: ProjectionWork { dot_products: m.max_dot_products,
+                    multiply_accumulates: m.max_multiply_accumulates } },
+            mask_limits: source.masks(), mask_visits_per_chunk: source.mask_visits(),
+            max_mask_visits: m.max_total_mask_node_visits,
+            verification: GroundingBudget { max_fields: m.max_source_fields,
+                max_matches: m.max_source_evidence_spans, max_scan_steps: m.max_source_scan_steps },
+        })
     }
 }
 impl SummaryArgs {

@@ -1937,6 +1937,22 @@ input spool is introduced. Fixtures cover authority, resource, privacy and
 resume contracts; compilation, model-present execution, crash recovery and
 quality qualification remain pending controller-selected gates.
 
+## Implemented candidate INT4 complete-source question corpora
+
+`fnlp candidate source-int4 answer-corpus` accepts ordered
+`{id,text,task_args:{question}}` records, with a different exact question for each
+complete original source. One resident model serves the stream. The default
+preserves independent chunk answers and original-coordinate citations;
+`--synthesize-answer` adds one native answer over all collected verified source
+quotes. Explicit `--cohort-chunks N` shares native discovery layers before the
+optional scalar evidence pass. All five native work ceilings, masks and both
+verification pools remain finite across the entire run and every flush.
+
+See [complete-source question-answering corpora](docs/answer-corpus.md) for the
+strict input contract, source/snapshot examples, complete-evidence synthesis,
+memory and work admission, and completion semantics. This live route requires
+`asupersync-runtime`; it does not require retained-job storage.
+
 ## Implemented candidate INT4 source tasks
 
 `fnlp candidate source-int4 ner|keyphrases|summarize|answer` now uses the
