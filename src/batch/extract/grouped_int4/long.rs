@@ -21,6 +21,8 @@ use crate::{
     tasks::extract::grouped_int4::INT4_EXTRACT_VERSION};
 mod execution;
 pub mod cohort;
+/// Ordered live populations of independently complete source documents.
+pub mod stream;
 
 pub const INT4_EXTRACTION_MAP_EXECUTION: &str = "grouped-int4-exact-schema-document-map-v1";
 const SEMANTICS: &str = "independent-chunk-json-no-global-object-merge-v1";
