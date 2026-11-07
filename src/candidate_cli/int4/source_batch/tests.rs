@@ -1,6 +1,8 @@
 use super::*;
 use crate::tasks::answer::{AnswerOptions, AnswerPassage};
 
+mod selected;
+
 pub(super) fn command(name: &str, extra: &[&str]) -> Int4Command {
     let mut argv = vec!["candidate", "source-int4", name, "--source-dir", "explicit-source",
         "--source-manifest", "explicit-manifest.json", "--memory-mib", "8192"];

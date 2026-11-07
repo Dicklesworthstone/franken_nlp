@@ -22,6 +22,11 @@ struct StreamArgs {
     /// Interactive producers must fill a window or send a flush command.
     #[arg(long, value_name = "N")]
     cohort_documents: Option<usize>,
+    /// Serial only: project every grammar-legal row under this fixed ceiling.
+    /// A wider legal set refuses before projection; no pruning or fallback.
+    #[arg(long = "max-selected-rows", id = "source_batch_max_selected_rows", value_name = "N",
+        conflicts_with = "cohort_documents")]
+    max_selected_rows: Option<usize>,
     /// Complete SourceBatchArgs JSON. Without it QA requires per-record task_args.
     #[arg(long, value_name = "FILE")]
     defaults: Option<PathBuf>,
@@ -46,7 +51,7 @@ pub(super) fn definitions() -> Vec<clap::Command> {
         (Kind::Summarize, "summarize-batch"), (Kind::Answer, "answer-batch")]
         .into_iter().map(|(kind, name)| StreamArgs::augment_args(source::definition(kind).name(name)
             .about("Run an ordered source-task NDJSON stream with one resident grouped-INT4 model")
-            .long_about("Run one fixed source task over ordered {id,text,task_args?} NDJSON and exact {\"flush\":true} controls. NER, keyphrases and summarize use shipped options unless --defaults or per-record typed task_args supplies explicit bounded options. For answer, text is the question and task_args supplies separately typed passages, options and budget; no passage set is invented or reused implicitly. Defaults files use complete SourceBatchArgs JSON, including its task selector and budget. A record cannot switch tasks or raise the CLI ceilings. Execution is serial unless --cohort-documents N explicitly groups up to N complete documents through shared native decoder layers, preserving each original task budget, grammar, source/passages and causal KV. The entire window plus one lookahead is memory-admitted before IO. Partial windows execute at flush or EOF; interactive producers must fill a window or send a flush before waiting. Results and rejected records remain ordered, and IDs reset only after a drained flush. Every completed event carries candidate provenance. Require run_complete AND exit 0 for whole-run success; earlier completed groups remain valid if a later record fails. Native work, masks, checkpoints and transport ceilings span all documents, cohorts and epochs. Full-vocabulary greedy semantics are unchanged; there is no sparse projection, sampling, repair retry or prompt-prefill selector. Structural citations do not certify semantic support; failed inference is never abstention. Input/writer ownership survives cancellation until hosted cleanup. Blocking IO is cooperative, not preemptible.")
+            .long_about("Run one fixed source task over ordered {id,text,task_args?} NDJSON and exact {\"flush\":true} controls. NER, keyphrases and summarize use shipped options unless --defaults or per-record typed task_args supplies explicit bounded options. For answer, text is the question and task_args supplies separately typed passages, options and budget; no passage set is invented or reused implicitly. Defaults files use complete SourceBatchArgs JSON, including its task selector and budget. A record cannot switch tasks or raise the CLI ceilings. Execution is serial unless --cohort-documents N explicitly groups up to N complete documents through shared native decoder layers, preserving each original task budget, grammar, source/passages and causal KV. The entire window plus one lookahead is memory-admitted before IO. Partial windows execute at flush or EOF; interactive producers must fill a window or send a flush before waiting. Results and rejected records remain ordered, and IDs reset only after a drained flush. Every completed event carries candidate provenance. Require run_complete AND exit 0 for whole-run success; earlier completed groups remain valid if a later record fails. Native work, masks, checkpoints and transport ceilings span all documents, cohorts and epochs. Full-vocabulary projection remains the default. Explicit --max-selected-rows N fixes all-legal-row projection for the SERIAL stream; N must be 1..=166144 and cannot combine with --cohort-documents. Every item binds the cap and original built-in finalizer before admission. Per-record arguments cannot override the projection policy. A legal set exceeding the cap returns no result, never a pruned language or an automatic retry. Summary prose and answer text may need a wide ceiling. This path checks only selected logits; native parity and performance require separate evidence. No sampling, repair retry or prompt-prefill selector. Structural citations do not certify semantic support; failed inference is never abstention. Input/writer ownership survives cancellation until hosted cleanup. Blocking IO is cooperative, not preemptible.")
             .mut_arg("options", |arg| arg.hide(true))
             .mut_arg("input", |arg| arg.help("NDJSON file or '-' for stdin; each source record is bounded and read incrementally"))
             .mut_arg("max_input_bytes", |arg| arg.help("Maximum decoded document/question and passage input bytes per record"))
@@ -62,6 +67,7 @@ pub(super) struct BatchLimits {
     pub io_bytes: u64,
     pub preparation_reserve_bytes: u64,
     pub cohort_documents: Option<usize>,
+    pub selected_rows: Option<constrained_int4::sparse::Int4JsonSparseLimits>,
 }
 impl BatchArgs {
     pub(super) fn from_matches(kind: Kind, matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
@@ -73,17 +79,22 @@ impl BatchArgs {
     }
     pub(super) fn validate(&self, args: &Int4Args) -> Result<BatchLimits, CandidateError> {
         let stream = &self.stream;
+        let selected_rows = self.selected_rows()?;
         if !(1..=100_000).contains(&stream.max_requests)
             || stream.max_line_bytes < args.max_input_bytes || !(1..=4 * 1024 * 1024).contains(&stream.max_line_bytes)
             || !(1..=16 * 1024 * MIB).contains(&stream.max_total_input_bytes)
             || !(1..=16 * 1024 * MIB).contains(&stream.max_total_output_bytes)
             || self.source.options_path().is_some()
+            || (selected_rows.is_some() && stream.cohort_documents.is_some())
             || stream.defaults.as_ref().is_some_and(|path| path.as_os_str().is_empty() || path.as_os_str() == "-") {
             return Err(CandidateError::Arguments);
         }
         let mut common = self.source.validate(args)?;
-        let one = constrained_int4::planned_work(args.group_width, common.max_prompt_tokens, args.max_new_tokens)
-            .map_err(|_| CandidateError::Arguments)?;
+        let one = match selected_rows {
+            Some(rows) => constrained_int4::sparse::planned_work(args.group_width, common.max_prompt_tokens,
+                args.max_new_tokens, rows),
+            None => constrained_int4::planned_work(args.group_width, common.max_prompt_tokens, args.max_new_tokens),
+        }.map_err(|_| CandidateError::Arguments)?;
         // Scale the actual independent per-item attention triangles. Never
         // price a fictitious concatenated sequence or use INT8 group counts.
         let work = scale_work(one, stream.max_requests)?;
@@ -122,7 +133,14 @@ impl BatchArgs {
         }
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(BatchLimits { common, transport, native, output_bytes: stream.max_total_output_bytes,
-            io_bytes, preparation_reserve_bytes, cohort_documents: stream.cohort_documents })
+            io_bytes, preparation_reserve_bytes, cohort_documents: stream.cohort_documents, selected_rows })
+    }
+    fn selected_rows(&self) -> Result<Option<constrained_int4::sparse::Int4JsonSparseLimits>, CandidateError> {
+        self.stream.max_selected_rows.map(|max_rows_per_step| {
+            let limits = constrained_int4::sparse::Int4JsonSparseLimits { max_rows_per_step };
+            limits.validate().map_err(|_| CandidateError::Arguments)?;
+            Ok(limits)
+        }).transpose()
     }
     pub(super) fn load_defaults(&self, text: Option<&str>, ceiling: TaskBudget, max_input_bytes: usize)
         -> Result<Option<SourceBatchArgs>, CandidateError> {

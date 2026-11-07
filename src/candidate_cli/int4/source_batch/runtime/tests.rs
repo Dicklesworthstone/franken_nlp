@@ -34,6 +34,18 @@ fn owned_boundary_rechecks_cohort_admission_before_private_defaults_or_io() {
 }
 
 #[test]
+fn owned_boundary_rechecks_selected_policy_before_private_defaults_or_io() {
+    for name in ["ner-batch", "keyphrases-batch", "summarize-batch", "answer-batch"] {
+        let command = super::super::tests::command(name, &["--max-selected-rows", "7", "--defaults", "private-defaults.json"]);
+        let Int4Command { task: Int4Task::SourceBatch(mut batch), args, batch: None, job: None } = command
+            else { panic!("wrong source batch task") };
+        let quote = batch.validate(&args).unwrap();
+        batch.stream.cohort_documents = Some(1);
+        assert_eq!(execute(args, batch, quote, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
 fn every_source_task_stream_preserves_inner_spans_and_explicit_snapshot_provenance() {
     let need = Int4SnapshotRequirements::for_group_width(128).unwrap();
     for task in ["ner", "keyphrases", "summarize", "answer"] {
@@ -45,7 +57,7 @@ fn every_source_task_stream_preserves_inner_spans_and_explicit_snapshot_provenan
             candidate_format: "fnlp-int4-source-candidate-v1", quant_recipe: "fixture:group=128",
             group_width: 128, integer_kernel: "s_scalar_i32", task,
             snapshot: Some(SnapshotRecord::new("loaded", need)),
-            cohort_schedule: None,
+            cohort_schedule: None, max_selected_rows: None,
         };
         // Publication fixture only: it is not neural inference authority.
         let inner = "{\"event\":\"fixture\",\"text\":\"上海\",\"byte_start\":4,\"scalar_start\":3,\"exact\":12345678901234567890123456789012345678}\n";
@@ -67,14 +79,14 @@ fn every_source_task_stream_preserves_inner_spans_and_explicit_snapshot_provenan
         assert_eq!(value["snapshot"]["format"], INT4_SNAPSHOT_VERSION);
         assert_eq!(value["snapshot"]["file_bytes"], need.file_bytes);
         for absent in ["source_dir", "source_manifest", "snapshot_path", "defaults_path", "prompt_digest", "taskir_digest",
-            "cohort_schedule"] {
+            "cohort_schedule", "max_selected_rows"] {
             assert!(value.get(absent).is_none());
         }
     }
 }
 
 #[test]
-fn source_cohort_provenance_only_declares_the_window_not_executed_work() {
+fn source_schedule_provenance_declares_policy_without_private_bindings_or_work_claims() {
     let schedule = serde_json::to_value(CohortSchedule::new(4)).unwrap();
     assert_eq!(schedule, serde_json::json!({"execution":"cross_document_constrained_cohorts",
         "declared_max_documents":4}));
@@ -86,8 +98,17 @@ fn source_cohort_provenance_only_declares_the_window_not_executed_work() {
             source_root_sha256: "fixture-source", model_content_sha256: "fixture-content",
             candidate_format: "fnlp-int4-source-candidate-v1", quant_recipe: "fixture:group=128",
             group_width: 128, integer_kernel: "s_scalar_i32", task, snapshot: None, cohort_schedule: None,
+            max_selected_rows: None,
         };
         let serial = serde_json::to_value(&provenance).unwrap();
+        provenance.max_selected_rows = Some(7);
+        let mut selected = serde_json::to_value(&provenance).unwrap();
+        assert_eq!(selected.as_object_mut().unwrap().remove("max_selected_rows"), Some(serde_json::json!(7)));
+        assert_eq!(selected, serial);
+        for absent in ["decision_policy_digest", "request_digest", "prompt_digest", "options", "passages"] {
+            assert!(selected.get(absent).is_none());
+        }
+        provenance.max_selected_rows = None;
         provenance.cohort_schedule = Some(CohortSchedule::new(4));
         let mut grouped = serde_json::to_value(&provenance).unwrap();
         assert_eq!(grouped.as_object_mut().unwrap().remove("cohort_schedule"), Some(schedule.clone()));

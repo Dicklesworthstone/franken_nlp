@@ -167,9 +167,8 @@ fn check_request_for_projection(width: usize, kv_bytes: u64, output_bytes: u64,
         return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
     }
     let rows_per_token = match selected_rows {
-        Some(limits) if task_spec == "extract-v1" => limits.validate()
+        Some(limits) => limits.validate()
             .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))? as u64,
-        Some(_) => return Err(BatchItemFailure::fatal(BatchCode::Admission)),
         None => NANBEIGE_VOCAB_SIZE as u64,
     };
     let work = request.model_work;

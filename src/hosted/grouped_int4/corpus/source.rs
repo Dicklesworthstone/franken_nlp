@@ -19,6 +19,10 @@ pub struct Int4SourceCorpusConfig {
     pub planning: SourcePlanningLimits,
     pub defaults: Option<SourceBatchArgs>,
     pub native_work: Int4SourceBatchLimits,
+    /// Fixed all-legal-row ceiling for the serial stream only. The compiler
+    /// seals it into each actual source task before admission; rows cannot
+    /// override it. None retains the full-vocabulary execution contract.
+    pub selected_rows: Option<Int4JsonSparseLimits>,
 }
 
 /// Semantic results retain their existing source-task NDJSON envelopes.
@@ -39,8 +43,17 @@ impl Int4SourceCorpusConfig {
         source_batch::check_configuration(planner, &self.identity, self.task_ceiling,
             self.planning, self.defaults.as_ref(), group_width).map_err(HostedError::BatchSetup)?;
         source_batch::validate_limits(self.native_work).map_err(HostedError::BatchSetup)?;
+        if let Some(limits) = self.selected_rows {
+            limits.validate().map_err(|_| HostedError::Limits("INT4 source corpus selected-row ceiling"))?;
+        }
         if allocated_kv == 0 || allocated_kv > self.task_ceiling.max_kv_bytes {
             return Err(HostedError::Limits("INT4 source corpus complete KV reservation"));
+        }
+        Ok(())
+    }
+    fn require_full_projection(&self) -> Result<(), HostedError> {
+        if self.selected_rows.is_some() {
+            return Err(HostedError::Limits("INT4 source cohorts require full-vocabulary projection"));
         }
         Ok(())
     }
@@ -84,6 +97,10 @@ impl NlpEngine {
             let task_spec = config.identity.task_spec.clone();
             let compiler = Int4SourceBatchPlanner::new(&planner, config.identity, config.task_ceiling,
                 config.planning, config.defaults, width).map_err(HostedError::BatchSetup)?;
+            let compiler = match config.selected_rows {
+                Some(limits) => compiler.with_selected_rows(limits).map_err(HostedError::BatchSetup)?,
+                None => compiler,
+            };
             let mut engine = allocate_native(kv, workspace, || {
                 StrictInt4Engine::new(&model.inner.loaded.value, limits.native.context_tokens, Int4MemoryBudget {
                     max_kv_bytes: required.native.kv_bytes, max_rope_bytes: required.native.rope_bytes,
@@ -93,7 +110,7 @@ impl NlpEngine {
             let admission = SourceAdmission { inner: CorpusAdmission {
                 lease: &lease, model: model.model_identity(), kv_bytes: required.native.kv_bytes,
                 masks: config.native_work.masks, output_bytes: limits.transport.max_output_line_bytes as u64,
-                selected_rows: None,
+                selected_rows: config.selected_rows,
             }, task_spec: &task_spec };
             let result = {
                 let mut processor = NativeInt4SourceBatch::new(compiler, &mut engine.value,
@@ -125,6 +142,7 @@ impl NlpEngine {
         kernel: PackedInt4Kernel, reader: R, writer: W, cancellation: CancellationToken)
         -> Result<Int4SourceCohortBatchResult, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        config.require_full_projection()?;
         dispatch::preflight(self, limits.native.run)?;
         if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
         let width = model.model_identity().group_width();

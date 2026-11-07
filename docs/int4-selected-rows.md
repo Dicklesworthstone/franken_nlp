@@ -27,8 +27,9 @@ legal token set at every visited grammar state; this example cap is not a
 promise that an arbitrary schema fits.
 
 `--max-selected-rows` is available on one-off `extract`, `ner`, `keyphrases`,
-`summarize` and `answer`, and on serial `extract-batch`. Source-task batches,
-native cohorts, maps, durable jobs, redaction and the semantic second-reader
+`summarize` and `answer`, and on serial `extract-batch`, `ner-batch`,
+`keyphrases-batch`, `summarize-batch` and `answer-batch`. Native cohorts,
+complete-document maps/corpora, durable jobs, redaction and the semantic second-reader
 route reject it. Without the option, these tasks retain full-vocabulary execution and their
 existing identity. Native work in the result reports actual projected rows;
 grammar-mask, task, source and complete-result limits are unchanged.
@@ -86,6 +87,39 @@ Library callers select the policy on the immutable
 another explicitly loaded model. Durable extraction, native cohorts and
 complete-document extraction maps reject this factory before native work or
 journaling; they retain their existing full-vocabulary contracts.
+
+### Resident serial source-task streams
+
+The four built-in source tasks use the same explicit fixed projection policy:
+
+```sh
+fnlp candidate source-int4 ner-batch documents.ndjson \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --group-width 128 --memory-mib "$MEMORY_MIB" \
+  --max-selected-rows 4096
+```
+
+For NER, keyphrases and summaries, `text` contains the original source. The
+existing typed `task_args` or `--defaults` may change permitted task options
+inside the fixed ceilings, but cannot override the selected-row cap or task.
+For `answer-batch`, `text` is the question and typed arguments supply the
+passages, options and budget. Its input shape differs from complete-document
+`answer-corpus`, which supplies a source in `text` and a question in `task_args`.
+
+The compiler seals the projection policy before each item's admission.
+Injecting a dense plan into a selected stream, or a plan with another cap,
+fails before debit or execution. Exact work validation covers all five native
+axes and verifies the terminal EOS and excluded control IDs. Every original
+task finalizer still checks its source spans, citations and schema.
+
+Use `Int4SourceBatchPlanner::with_selected_rows` in the library or set
+`Int4SourceCorpusConfig.selected_rows` for `NlpEngine::batch_int4_source`.
+`None` retains dense execution. The host prices output-token storage from
+the fixed cap even when actual legal sets are smaller. Cohorts reject the
+strategy; `--cohort-documents` and `--prefill-rows` cannot combine with this
+serial source stream. The cap can refuse wide prose states in summaries and
+answers, and never causes silent pruning, retry or full-head fallback.
 
 ## Library use
 

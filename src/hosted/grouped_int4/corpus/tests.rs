@@ -270,16 +270,19 @@ fn selected_admission_rejects_nonintegral_caps_and_inconsistent_native_axes() {
 }
 
 #[test]
-fn selected_policy_does_not_spread_to_source_tasks_or_relax_masks_kv_and_output() {
+fn selected_policy_requires_exact_source_work_and_preserves_masks_kv_and_output() {
     let selected = Int4JsonSparseLimits { max_rows_per_step: 7 };
     let mut id = identity(127);
     for task in ["ner-v1", "keyphrases-v1", "summarize-v1", "answer-v1"] {
         id.task_spec = task.to_owned();
-        let request = request(&id, 127);
+        let mut request = request(&id, 127);
         check_request_for_task(127, request.kv_reservation_bytes, 8192, masks(), &request, task).unwrap();
         let failure = check_request_for_projection(127, request.kv_reservation_bytes, 8192,
             masks(), &request, task, Some(selected)).unwrap_err();
-        assert!(failure.stop); assert_eq!(failure.fault.code, BatchCode::Admission);
+        assert!(failure.stop); assert_eq!(failure.fault.code, BatchCode::InvalidExecution);
+        request.model_work = constrained_int4::sparse::planned_work(127, 8, 4, selected).unwrap();
+        assert_eq!(check_request_for_projection(127, request.kv_reservation_bytes, 8192,
+            masks(), &request, task, Some(selected)).unwrap(), 4);
     }
     id.task_spec = "extract-v1".to_owned();
     for axis in 0..4 {

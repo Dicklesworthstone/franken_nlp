@@ -35,7 +35,7 @@ impl Int4ExtractPlan {
     /// The native session reconciles every projected row with the physical
     /// group ledger. This closed task boundary independently verifies every
     /// work axis and the sealed row bounds. It is not receipt authentication.
-    pub(super) fn completed_work(&self, count: usize, projected: u64) -> Result<Int4Work, Int4ExtractError> {
+    pub(crate) fn completed_work(&self, count: usize, projected: u64) -> Result<Int4Work, Int4ExtractError> {
         if count == 0 || count > self.options().max_new_tokens { return Err(ExtractError::InvalidResult.into()); }
         match self.selected_rows {
             None => {

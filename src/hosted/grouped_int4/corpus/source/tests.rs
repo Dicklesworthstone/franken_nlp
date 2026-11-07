@@ -53,6 +53,7 @@ fn config(planner: &SourceTaskPlanner, task: BuiltInTask, width: usize) -> Int4S
         planning: SourcePlanningLimits::default(), defaults: None,
         native_work: Int4SourceBatchLimits { max_model_work: constrained_int4::planned_work(width, 8, 4).unwrap(),
             masks: masks() },
+        selected_rows: None,
     }
 }
 fn request(config: &Int4SourceCorpusConfig) -> Int4SourceAdmission<'_> {
@@ -252,4 +253,68 @@ fn cohort_source_admission_rechecks_work_masks_and_output_before_native_executio
     let error = check_source_cohort_request(32, 4096, 65_535, masks(), &request,
         &config.identity.task_spec).unwrap_err();
     assert!(!error.stop); assert_eq!(error.fault.code, BatchCode::OutputLineLimit);
+}
+
+#[test]
+fn all_source_tasks_reserve_exact_output_tokens_from_the_fixed_selected_row_cap() {
+    let planner = planner();
+    for task in [BuiltInTask::Ner, BuiltInTask::Keyphrases, BuiltInTask::Summarize, BuiltInTask::Answer] {
+        for width in [16, 127] {
+            for cap in [1, 7, NANBEIGE_VOCAB_SIZE] {
+                let mut config = config(&planner, task, width);
+                let selected = Int4JsonSparseLimits { max_rows_per_step: cap };
+                config.selected_rows = Some(selected);
+                config.native_work.max_model_work = constrained_int4::sparse::planned_work(width, 8, 4, selected).unwrap();
+                config.validate_planning(&planner, width, config.task_ceiling.max_kv_bytes).unwrap();
+                let request = request(&config);
+                let tokens = check_request_for_projection(width, config.task_ceiling.max_kv_bytes, 65_536,
+                    masks(), &request, &config.identity.task_spec, config.selected_rows).unwrap();
+                assert_eq!(tokens, 4);
+                if cap < NANBEIGE_VOCAB_SIZE {
+                    assert!(check_request_for_task(width, config.task_ceiling.max_kv_bytes, 65_536,
+                        masks(), &request, &config.identity.task_spec).is_err());
+                }
+                // Cohorts refuse even an arithmetically dense selected policy.
+                assert!(config.require_full_projection().is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn selected_configuration_and_every_admission_axis_remain_bounded() {
+    let planner = planner();
+    for cap in [0, NANBEIGE_VOCAB_SIZE + 1, usize::MAX] {
+        let mut config = config(&planner, BuiltInTask::Answer, 32);
+        config.selected_rows = Some(Int4JsonSparseLimits { max_rows_per_step: cap });
+        assert!(config.validate_planning(&planner, 32, config.task_ceiling.max_kv_bytes).is_err());
+    }
+    let mut config = config(&planner, BuiltInTask::Answer, 32);
+    let selected = Int4JsonSparseLimits { max_rows_per_step: 7 };
+    config.selected_rows = Some(selected);
+    config.native_work.max_model_work = constrained_int4::sparse::planned_work(32, 8, 4, selected).unwrap();
+    for axis in 0..9 {
+        let mut request = request(&config);
+        match axis {
+            0 => request.model_work.forward_positions += 1,
+            1 => request.model_work.projected_logits += 1,
+            2 => request.model_work.attention_pairs += 1,
+            3 => request.model_work.projections.dot_products += 1,
+            4 => request.model_work.projections.multiply_accumulates += 1,
+            5 => request.mask_node_visits -= 1,
+            6 => request.mask_limits.checkpoint_interval_nodes += 1,
+            7 => request.kv_reservation_bytes -= 1,
+            _ => request.max_result_bytes += 1,
+        }
+        let failure = check_request_for_projection(32, config.task_ceiling.max_kv_bytes, 65_536,
+            masks(), &request, &config.identity.task_spec, config.selected_rows).unwrap_err();
+        assert_eq!(failure.stop, axis != 8, "axis {axis}");
+        assert_eq!(failure.fault.code, match axis { 7 => BatchCode::Admission,
+            8 => BatchCode::OutputLineLimit, _ => BatchCode::InvalidExecution });
+    }
+    let mut wrong_task = config.identity.clone(); wrong_task.task_spec = "extract-v1".to_owned();
+    let mut request = request(&config); request.identity = &wrong_task;
+    assert_eq!(check_request_for_projection(32, config.task_ceiling.max_kv_bytes, 65_536,
+        masks(), &request, &config.identity.task_spec, config.selected_rows).unwrap_err().fault.code,
+        BatchCode::Admission);
 }

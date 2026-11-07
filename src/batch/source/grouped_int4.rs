@@ -6,11 +6,11 @@
 
 use super::*;
 use crate::{
-    native_engine::{constrained_int4::{self, Int4JsonBudget, Int4JsonError},
+    native_engine::{constrained_int4::{self, Int4JsonBudget, Int4JsonError, sparse::Int4JsonSparseLimits},
         strict_int4::{Int4MemoryRequirement, Int4RunBudget, Int4Work, StrictInt4Engine,
             StrictInt4Error, STRICT_INT4_PROFILE}},
     tasks::{extract::grouped_int4::Int4ExtractError,
-        source_planning::grouped_int4::{Int4SourceError, Int4SourceTaskRun, PreparedInt4SourceTask, INT4_SOURCE_EXECUTION}},
+        source_planning::grouped_int4::{Int4SourceError, Int4SourceTaskRun, PreparedInt4SourceTask}},
 };
 // The quantities and ownership contract are identical to schema extraction.
 // Reuse the existing host authority; do not require a second permit provider.
@@ -43,15 +43,30 @@ pub const MAX_SOURCE_ARGUMENT_BYTES: usize = 1024 * 1024;
 pub struct Int4SourceBatchPlanner<'p> {
     planner: &'p SourceTaskPlanner, identity: ExecutionIdentity, ceiling: TaskBudget,
     limits: SourcePlanningLimits, defaults: Option<SourceBatchArgs>, group_width: usize,
+    selected_rows: Option<Int4JsonSparseLimits>,
 }
 impl<'p> Int4SourceBatchPlanner<'p> {
     pub fn new(planner: &'p SourceTaskPlanner, identity: ExecutionIdentity, ceiling: TaskBudget,
         limits: SourcePlanningLimits, defaults: Option<SourceBatchArgs>, group_width: usize) -> Result<Self, BatchFault> {
         check_configuration(planner, &identity, ceiling, limits, defaults.as_ref(), group_width)?;
-        Ok(Self { planner, identity, ceiling, limits, defaults, group_width })
+        Ok(Self { planner, identity, ceiling, limits, defaults, group_width, selected_rows: None })
     }
     pub fn base_execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     pub fn group_width(&self) -> usize { self.group_width }
+    /// Fix the complete legal-row projection policy for this serial stream.
+    /// Every source plan binds the cap and its original built-in finalizer;
+    /// per-record options cannot replace this policy or omit a legal token.
+    pub fn with_selected_rows(mut self, limits: Int4JsonSparseLimits) -> Result<Self, BatchFault> {
+        limits.validate().map_err(|_| BatchCode::InvalidLimits)?;
+        if self.selected_rows.is_some() { return Err(BatchCode::InvalidLimits.into()); }
+        self.selected_rows = Some(limits);
+        Ok(self)
+    }
+    pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.selected_rows }
+    pub(crate) fn require_full_projection(&self) -> Result<(), BatchFault> {
+        if self.selected_rows.is_some() { return Err(BatchCode::Admission.into()); }
+        Ok(())
+    }
     pub fn prepare_with_control<C: DecodeStepControl>(&self, document: BatchDocument<SourceBatchArgs>,
         control: &mut C) -> Result<PreparedInt4SourceTask, BatchItemFailure> {
         checkpoint(control)?;
@@ -64,6 +79,10 @@ impl<'p> Int4SourceBatchPlanner<'p> {
             .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
         let plan = self.planner.plan_int4_with_control(&args.into_request(document.text),
             &context, self.limits, self.group_width, control).map_err(planning_failure)?;
+        let plan = match self.selected_rows {
+            Some(limits) => plan.with_selected_rows(limits).map_err(planning_failure)?,
+            None => plan,
+        };
         checkpoint(control)?;
         Ok(plan)
     }
@@ -114,7 +133,8 @@ impl<'p, 'e, 'weights, 'v, A: Int4SourceBatchAdmission> NativeInt4SourceBatch<'p
             .map_err(|_| BatchCode::Admission)?;
         let driver = NativeDriver { engine, vocabulary };
         if !driver.clean() { return Err(BatchCode::InvalidExecution.into()); }
-        Ok(Self { compiler, driver, admission, run: RunState::new(limits) })
+        let run = RunState::new(limits, compiler.selected_rows());
+        Ok(Self { compiler, driver, admission, run })
     }
     pub fn reserved_model_work(&self) -> Int4Work { self.run.reserved }
     pub fn reserved_mask_visits(&self) -> u64 { self.run.mask_visits }
@@ -157,10 +177,11 @@ pub(crate) fn validate_limits(limits: Int4SourceBatchLimits) -> Result<(), Batch
 }
 struct RunState {
     limits: Int4SourceBatchLimits, reserved: Int4Work, mask_visits: u64, last_sequence: u64, failed: bool,
+    selected_rows: Option<Int4JsonSparseLimits>,
 }
 impl RunState {
-    fn new(limits: Int4SourceBatchLimits) -> Self {
-        Self { limits, reserved: Int4Work::default(), mask_visits: 0, last_sequence: 0, failed: false }
+    fn new(limits: Int4SourceBatchLimits, selected_rows: Option<Int4JsonSparseLimits>) -> Self {
+        Self { limits, reserved: Int4Work::default(), mask_visits: 0, last_sequence: 0, failed: false, selected_rows }
     }
     fn ready(&self) -> Result<(), BatchItemFailure> {
         if self.failed { Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)) } else { Ok(()) }
@@ -205,7 +226,6 @@ impl Driver for NativeDriver<'_, '_, '_> {
     }
 }
 fn preflight(prepared: &PreparedInt4SourceTask, driver: &impl Driver) -> Result<u64, BatchItemFailure> {
-    prepared.require_full_projection().map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
     if !driver.clean() { return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)); }
     if prepared.group_width() != driver.group_width() {
         return Err(BatchItemFailure::fatal(BatchCode::Admission));
@@ -222,6 +242,13 @@ fn execute_admitted<D: Driver, A: Int4SourceBatchAdmission, C: DecodeStepControl
     prepared: PreparedInt4SourceTask, driver: &mut D, admission: &mut A,
     run: &mut RunState, context: BatchRequestContext, control: &mut C,
 ) -> Result<GuardedOutput<Int4SourceTaskRun, A::Guard>, BatchItemFailure> {
+    run.ready()?;
+    // A sealed plan from another stream still cannot change this invocation's
+    // projection policy, including a selected full-vocabulary row ceiling.
+    if prepared.selected_rows() != run.selected_rows {
+        run.failed = true;
+        return Err(BatchItemFailure::fatal(BatchCode::Admission));
+    }
     let work = prepared.planned_work(); run.begin(work, context)?;
     let result = (|| {
         checkpoint(control)?;
@@ -258,16 +285,16 @@ fn execute_admitted<D: Driver, A: Int4SourceBatchAdmission, C: DecodeStepControl
 }
 fn valid_result(plan: &PreparedInt4SourceTask, output: &Int4SourceTaskRun, mask_cap: u64) -> bool {
     let actual = observed(&output.result);
-    let (version, task, declared_task, profile) = match &output.result {
-        SourceTaskResult::Ner(r) => (r.schema_version, "ner-v1", r.task_spec_version.as_str(), r.numerics_profile.as_str()),
-        SourceTaskResult::Keyphrases(r) => (r.schema_version, "keyphrases-v1", r.task_spec_version.as_str(), r.numerics_profile.as_str()),
-        SourceTaskResult::Summarize(r) => (r.schema_version, "summarize-v1", r.task_spec_version.as_str(), r.numerics_profile.as_str()),
-        SourceTaskResult::Answer(r) => (r.schema_version, "answer-v1", r.task_spec_version.as_str(), r.numerics_profile.as_str()),
+    let (version, task, declared_task, profile, tokens) = match &output.result {
+        SourceTaskResult::Ner(r) => (r.schema_version, "ner-v1", r.task_spec_version.as_str(), r.numerics_profile.as_str(), &r.generated_token_ids),
+        SourceTaskResult::Keyphrases(r) => (r.schema_version, "keyphrases-v1", r.task_spec_version.as_str(), r.numerics_profile.as_str(), &r.generated_token_ids),
+        SourceTaskResult::Summarize(r) => (r.schema_version, "summarize-v1", r.task_spec_version.as_str(), r.numerics_profile.as_str(), &r.generated_token_ids),
+        SourceTaskResult::Answer(r) => (r.schema_version, "answer-v1", r.task_spec_version.as_str(), r.numerics_profile.as_str(), &r.generated_token_ids),
     };
-    output.schema_version == 1 && output.execution == INT4_SOURCE_EXECUTION && output.group_width == plan.group_width()
+    output.schema_version == 1 && output.execution == plan.execution_version() && output.group_width == plan.group_width()
         && version == 1 && task == declared_task && task == plan.execution_identity().task_spec && profile == STRICT_INT4_PROFILE
         && actual.tokens > 0 && actual.tokens <= plan.task_budget().max_output_tokens as usize
-        && constrained_int4::planned_work(plan.group_width(), plan.prompt_tokens(), actual.tokens).ok() == Some(output.model_work)
+        && plan.verify_completion_work(tokens, output.model_work).is_ok()
         && fits(output.model_work, plan.planned_work()) && actual.positions == output.model_work.forward_positions
         && actual.logits == output.model_work.projected_logits && actual.mask_visits <= mask_cap
 }

@@ -37,6 +37,7 @@ impl<'p, 'w, 'v, A: Int4SourceBatchAdmission> NativeInt4SourceCohortBatch<'p, 'w
     pub fn new(compiler: Int4SourceBatchPlanner<'p>, weights: &'w Int4ModelWeights,
         vocabulary: &'v ExtractionVocabulary, admission: A, work: Int4SourceBatchLimits,
         limits: Int4SourceCohortBatchLimits, kernel: PackedInt4Kernel) -> Result<Self, BatchFault> {
+        compiler.require_full_projection()?;
         work.validate()?; limits.validate(compiler.group_width())?;
         constrained_int4::check_model(compiler.base_execution_identity(), weights.identity())
             .map_err(|_| BatchCode::Admission)?;

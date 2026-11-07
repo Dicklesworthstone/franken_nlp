@@ -51,7 +51,8 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     remaining()?;
     let identity = source::identity(model.model_identity(), &planner, source::task(batch.kind))?;
     let config = Int4SourceCorpusConfig { identity: identity.clone(), task_ceiling: budget,
-        planning: batch.source.planning(&args), defaults, native_work: limits.native };
+        planning: batch.source.planning(&args), defaults, native_work: limits.native,
+        selected_rows: limits.selected_rows };
     let mut snapshot = common.snapshot_pin.map(|_| SnapshotRecord::new("loaded", common.snapshot_need));
     if let Some(path) = &args.save_snapshot {
         let pin = engine.save_int4_snapshot(&model, path.clone(), common.snapshot_budget(false)?,
@@ -71,6 +72,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(),
         task: batch.kind.name(), snapshot,
         cohort_schedule: limits.cohort_documents.map(CohortSchedule::new),
+        max_selected_rows: limits.selected_rows.map(|limits| limits.max_rows_per_step),
     };
     let writer = CandidateWriter::new(output, &provenance, limits.transport.max_output_line_bytes, limits.output_bytes)?;
     let corpus = CorpusLimits {
@@ -109,6 +111,8 @@ struct Provenance<'a> {
     snapshot: Option<SnapshotRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cohort_schedule: Option<CohortSchedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_selected_rows: Option<usize>,
 }
 #[derive(Serialize)]
 struct CohortSchedule { execution: &'static str, declared_max_documents: usize }

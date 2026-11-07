@@ -207,6 +207,22 @@ impl PreparedInt4SourceTask {
         Ok(self.extraction.verify_identity(admitted)?)
     }
 
+    /// Internal composition checks the original token policy and all five
+    /// native work axes after the sealed source finalizer has completed.
+    /// This does not authenticate caller-supplied or deserialized results.
+    pub(crate) fn verify_completion_work(&self, tokens: &[u32], work: Int4Work) -> Result<(), Int4SourceError> {
+        let options = self.extraction.options();
+        let Some((&last, body)) = tokens.split_last() else { return Err(Int4SourceError::InvalidResult); };
+        if last != options.eos_token_id
+            || body.iter().any(|&id| id == options.eos_token_id
+                || id as usize >= crate::native_engine::lmhead::NANBEIGE_VOCAB_SIZE
+                || options.excluded_token_ids.contains(&id))
+            || self.extraction.completed_work(tokens.len(), work.projected_logits)? != work {
+            return Err(Int4SourceError::InvalidResult);
+        }
+        Ok(())
+    }
+
     pub fn execute_with_control<C: DecodeStepControl>(&self, admitted: &ExecutionIdentity,
         engine: &mut StrictInt4Engine<'_>, vocabulary: &ExtractionVocabulary, work: Int4JsonBudget,
         control: &mut C) -> Result<Int4SourceTaskRun, Int4SourceError> {

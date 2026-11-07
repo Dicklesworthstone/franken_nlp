@@ -10,6 +10,8 @@ use crate::{artifact::converter::PINNED_REVISION, execution_identity::Sha256Dige
         keyphrases::{KeyphraseResult, KEYPHRASES_RANKING}, summarize::{CitationGuarantee, SummarySemanticSupport}},
     tokenizer::{embedded::EmbeddedTokenizer, pinned_controls}};
 
+mod selected;
+
 pub(super) fn planner() -> SourceTaskPlanner {
     let tokenizer = EmbeddedTokenizer::pinned().unwrap();
     let controls = pinned_controls::pinned().unwrap();
@@ -179,10 +181,10 @@ fn all_work_axes_and_masks_are_reserved_atomically_with_overflow_checks() {
         match axis { 0 => l.max_model_work.forward_positions -= 1, 1 => l.max_model_work.projected_logits -= 1,
             2 => l.max_model_work.attention_pairs -= 1, 3 => l.max_model_work.projections.dot_products -= 1,
             4 => l.max_model_work.projections.multiply_accumulates -= 1, _ => l.masks.max_visits_per_run = 0 }
-        let mut run = RunState::new(l); let error = run.begin(work, context(1, 1)).unwrap_err();
+        let mut run = RunState::new(l, None); let error = run.begin(work, context(1, 1)).unwrap_err();
         assert!(error.stop && run.failed); assert_eq!(error.fault.code, BatchCode::WorkLimit);
         assert_eq!(run.reserved, Int4Work::default()); assert_eq!(run.mask_visits, 0);
-        let mut run = RunState::new(limits());
+        let mut run = RunState::new(limits(), None);
         match axis { 0 => run.reserved.forward_positions = u64::MAX, 1 => run.reserved.projected_logits = u64::MAX,
             2 => run.reserved.attention_pairs = u64::MAX, 3 => run.reserved.projections.dot_products = u64::MAX,
             4 => run.reserved.projections.multiply_accumulates = u64::MAX, _ => run.mask_visits = u64::MAX }
@@ -200,9 +202,9 @@ fn invalid_limits_and_delivery_coordinates_cannot_reopen_execution() {
     }
     let work = Int4Work::for_sequence(32, 0, 1, 1).unwrap();
     for ctx in [context(0, 1), context(1, 0), BatchRequestContext { input_line: 0, ..context(1, 1) }] {
-        let mut run = RunState::new(limits()); assert!(run.begin(work, ctx).is_err()); assert!(run.failed);
+        let mut run = RunState::new(limits(), None); assert!(run.begin(work, ctx).is_err()); assert!(run.failed);
     }
-    let mut run = RunState::new(limits()); run.begin(work, context(4, 1)).unwrap(); run.failed = false;
+    let mut run = RunState::new(limits(), None); run.begin(work, context(4, 1)).unwrap(); run.failed = false;
     assert!(run.begin(work, context(4, 2)).is_err()); assert!(run.failed);
 }
 
@@ -237,7 +239,13 @@ fn completion(plan: &PreparedInt4SourceTask) -> Int4SourceTaskRun {
     let json: &[u8] = if answer { br#"{"answer":"","answerable":false,"citations":[]}"# } else { b"[]" };
     let mut tokens = tokenizer.tokenizer().encode_byte_fallback_only(json).unwrap();
     tokens.push(tokenizer.eos_token_id().unwrap());
-    let w = constrained_int4::planned_work(plan.group_width(), plan.prompt_tokens(), tokens.len()).unwrap();
+    // This private driver reports synthetic row counts only. It exercises
+    // the sealed completion/lifecycle checks, not actual native logits.
+    let w = match plan.selected_rows() {
+        Some(_) => Int4Work::for_sequence(plan.group_width(), 0,
+            plan.prompt_tokens() + tokens.len() - 1, tokens.len()).unwrap(),
+        None => constrained_int4::planned_work(plan.group_width(), plan.prompt_tokens(), tokens.len()).unwrap(),
+    };
     let result = if answer {
         SourceTaskResult::Answer(AnswerResult { schema_version: 1, task_spec_version: "answer-v1".to_owned(),
             numerics_profile: STRICT_INT4_PROFILE.to_owned(), status: AnswerStatus::Abstained, answerable: false,
@@ -252,7 +260,7 @@ fn completion(plan: &PreparedInt4SourceTask) -> Int4SourceTaskRun {
             score_space: ScoreSpace::NotComputed, grounding: ExtractionGrounding::SourceMembership, phrases: vec![],
             generated_token_ids: tokens, forward_positions: w.forward_positions, projected_logits: w.projected_logits, mask_node_visit_charge: 5 })
     };
-    Int4SourceTaskRun { schema_version: 1, execution: INT4_SOURCE_EXECUTION.to_owned(), group_width: plan.group_width(), model_work: w, result }
+    Int4SourceTaskRun { schema_version: 1, execution: plan.execution_version().to_owned(), group_width: plan.group_width(), model_work: w, result }
 }
 impl Driver for Engine {
     fn capacity(&self) -> usize { 4096 }
@@ -275,7 +283,7 @@ impl Driver for Engine {
 }
 fn host(state: &Rc<State>, mode: Mode) -> (Engine, Admission, RunState) {
     (Engine { state: Rc::clone(state), mode, clean: true, width: 32 },
-        Admission { state: Rc::clone(state), reject: false, wrong: false }, RunState::new(limits()))
+        Admission { state: Rc::clone(state), reject: false, wrong: false }, RunState::new(limits(), None))
 }
 #[test]
 fn selected_source_injection_refuses_before_batch_admission_or_native_execution() {
