@@ -429,12 +429,17 @@ scored explicitly, and native work reports the actual projected rows.
 
 The option composes with `--prefill-rows` and, for extraction, `--source-membership`.
 It binds a distinct execution identity before host admission and preserves
-the built-in source finalizers. Serial `extract-batch`, `ner-batch`,
+the built-in source finalizers. `extract-batch`, `ner-batch`,
 `keyphrases-batch`, `summarize-batch` and `answer-batch` accept a fixed
-`--max-selected-rows` for the entire resident stream, with exact output-token
-admission and cumulative native/mask limits. Per-record options cannot change
-that policy. Native cohorts, complete-document maps/corpora, durable jobs,
-redaction and semantic second-reader routes reject selected rows. Full-vocabulary execution remains the default.
+`--max-selected-rows` for the entire resident stream, including native
+cohorts and packed prompt passes, with exact output-token admission and
+cumulative native/mask limits. Per-record options cannot change that policy.
+Complete-document `extract-map`, `extract-corpus` and
+`extract-document-job start|resume` also support a fixed selected-row policy,
+including chunk cohorts; retained document jobs authenticate the cap on resume.
+Other source-task maps/corpora, single-context durable extraction, redaction
+and semantic second-reader routes retain full-vocabulary execution.
+Full-vocabulary execution remains the default.
 Prose fields can require a large row cap and fail
 explicitly when it is too small. See [selected-row INT4 source tasks](docs/int4-selected-rows.md)
 for CLI/library examples, accounting and the pending native-parity and
@@ -3369,6 +3374,16 @@ not renew at a window boundary. Outer `cohort_schedule.physical` reports actual
 cohort, chunk, decoder-step and head-projection counts. The map result's
 `map_batches` counter also reflects the chosen window width. These counters
 describe execution structure; they do not establish measured speedup or parity.
+
+Add `--max-selected-rows R` to `extract-map`, `extract-corpus` or
+`extract-document-job start|resume` for exact projection of every legal grammar
+row in each chunk. It composes with `--cohort-chunks` and `--root-array-union`.
+The cap includes accepting EOS and refuses an oversized legal set without
+pruning or fallback. Every chunk binds the strategy before work admission;
+whole-document and whole-run limits still apply. Retained jobs authenticate
+the exact cap on resume. Full-vocabulary execution remains the default, and
+model parity and performance remain separate qualification gates. See
+[selected-row INT4 execution](docs/int4-selected-rows.md).
 
 The result retains an ordered sequence of **independent exact-schema JSON
 strings**, chunk byte/scalar ranges, cumulative native work and source

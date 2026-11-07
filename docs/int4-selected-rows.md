@@ -29,8 +29,11 @@ promise that an arbitrary schema fits.
 `--max-selected-rows` is available on one-off `extract`, `ner`, `keyphrases`,
 `summarize` and `answer`, and on `extract-batch`, `ner-batch`,
 `keyphrases-batch`, `summarize-batch` and `answer-batch`, including explicit
-document cohorts and packed prompt passes. Complete-document maps/corpora,
-durable jobs, redaction and the semantic second-reader route reject it.
+document cohorts and packed prompt passes. Complete-document extraction also
+supports it on `extract-map`, `extract-corpus` and
+`extract-document-job start|resume`, with serial or cohort chunk execution.
+Other source-task maps/corpora, single-context durable extraction, redaction
+and the semantic second-reader route retain their full-vocabulary contracts.
 Without the option, these tasks retain full-vocabulary execution and their
 existing identity. Native work in the result reports actual projected rows;
 grammar-mask, task, source and complete-result limits are unchanged.
@@ -90,8 +93,58 @@ Library callers select the policy on the immutable
 `Int4ExtractionBatchPlanner::with_selected_rows` factory before passing it to
 `NlpEngine::batch_int4_extract`, `batch_int4_extract_cohorts` or
 `batch_int4_extract_cohorts_packed`. `with_model` carries the declared policy
-to another explicitly loaded model. Durable extraction and complete-document
-extraction maps retain their existing full-vocabulary contracts.
+to another explicitly loaded model. Complete-document extraction uses the
+same fixed policy as described below.
+
+### Complete-document extraction
+
+Use the same option when each original document spans several native contexts:
+
+```sh
+fnlp candidate source-int4 extract-corpus documents.ndjson \
+  --schema schema.json --source-membership \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --group-width 128 --memory-mib "$MEMORY_MIB" \
+  --max-new-tokens 128 --max-selected-rows 4096 \
+  --max-chunks 64 --cohort-chunks 4
+```
+
+For one document, use `extract-map document.txt` with the same schema, model
+and projection options. Each chunk seals the selected strategy and exact cap
+before its work is summed. A work ceiling can therefore admit selected-row
+execution even when full-vocabulary projection would exceed it. Every chunk
+must finish; a cap refusal never publishes a partial successful document.
+The strategy composes with `--root-array-union`, whose exact schema-checked
+record reduction and original-source evidence remain unchanged.
+
+The row cap applies independently to each chunk at each output selection,
+including accepting EOS. It never combines legal sets across chunks or drops
+candidates to fit. The complete document result includes `max_selected_rows`
+when selected projection is enabled. Its execution marker is
+`grouped-int4-selected-row-exact-schema-document-map-v1`; the native chunk
+cohort wrapper uses `grouped-int4-selected-row-exact-schema-document-cohorts-v1`.
+Corpus provenance repeats the public cap; raw schema and source commitments
+stay private. All five native work
+axes, mask visits and original-coordinate verification allowances remain
+cumulative across attempted documents and flush boundaries. Native KV and
+decoder storage retain their complete existing reservations.
+
+For retained work, `extract-document-job start` and `resume` accept the same
+option. The authenticated recipe binds the selected task/native execution
+versions and exact cap. Repeat the original cap on resume: adding, removing
+or changing it refuses the stored job instead of mixing policies. Failed
+attempts retain their durable work debit. Existing full-head jobs keep their
+original recipe when the option is omitted.
+
+Library callers select `Int4ExtractionBatchPlanner::with_selected_rows`
+before `plan_document_with_control` or hosted one-document extraction.
+`Int4ExtractionDocumentBatchPlanner::with_selected_rows` applies it to an
+ordered complete-document stream, and
+`Int4DocumentExtractionJobPlanner::with_selected_rows` binds it into a durable
+document job. Each consuming document-factory setter invalidates previously
+prepared documents; reconstruction checks every original chunk identity.
+These routes do not expose packed prompt prefill through this option.
 
 ### Resident source-task streams
 
@@ -231,8 +284,10 @@ per-row identities and result markers, with separate outer markers:
 `group_steps` counts forward passes. Selected `projection_groups` counts
 physical head invocations for the bounded row chunks and can exceed the
 forward-pass count. Both are checked against the completed per-document work;
-neither is a speed measurement. Durable job admission continues to refuse
-injected selected plans before durable work journaling.
+neither is a speed measurement. Single-context durable jobs continue to refuse
+injected selected plans before durable work journaling. Complete-document
+jobs require their immutable factory and authenticated recipe to select the
+strategy before any durable attempt is admitted.
 
 Independent JSON validation, exact-number preservation, source-membership
 evidence, complete result-size checks and the final cancellation check remain

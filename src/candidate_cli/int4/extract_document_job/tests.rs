@@ -76,6 +76,45 @@ fn start_resume_and_retained_replay_keep_exact_array_policy_and_one_extra_worksp
     }
 }
 #[test]
+fn selected_start_and_resume_keep_source_policy_and_complete_document_reservations() {
+    for operation in ["start", "resume"] {
+        for cohorts in [None, Some("3")] {
+            let mut flags = vec!["--source-membership"];
+            if let Some(width) = cohorts { flags.extend(["--cohort-chunks", width]); }
+            let (dense, args) = command(operation, &flags);
+            let before = dense.args.validate(&args).unwrap();
+            flags.extend(["--max-selected-rows", "4096"]);
+            let (selected, args) = command(operation, &flags);
+            let after = selected.args.validate(&args).unwrap();
+            assert_eq!(selected.args.map.extraction.selected_rows().unwrap().unwrap().max_rows_per_step, 4096);
+            assert_eq!(before.common.minimum_memory_bytes, after.common.minimum_memory_bytes);
+            assert_eq!(before.cohort, after.cohort);
+            assert_eq!(before.workspace_bytes, after.workspace_bytes);
+            assert_eq!(before.mapping.mapping.max_model_work, after.mapping.mapping.max_model_work);
+            assert_eq!(before.mapping.mapping.max_mask_visits, after.mapping.mapping.max_mask_visits);
+            assert_eq!(before.mapping.verification, after.mapping.verification);
+            let fixed = lifetime(&args, after);
+            selected.args.lifetime_limits(&args, after, fixed).unwrap();
+            let schema = " {\"type\":\"string\",\"x-fnlp-source\":\"verbatim\",\"enum\":[\"café 上海\"]}\n";
+            let budget = selected.args.map.extraction.budget(&args, after.common);
+            let request = selected.args.map.request(schema.to_owned(), budget).unwrap();
+            assert_eq!(request.schema, schema);
+            assert_eq!(request.budget, budget);
+        }
+    }
+}
+
+#[test]
+fn selected_document_job_refuses_invalid_caps_before_schema_keys_or_population() {
+    for operation in ["start", "resume"] {
+        for cap in ["0", "166145"] {
+            let (command, args) = command(operation, &["--max-selected-rows", cap]);
+            assert_eq!(command.execute_owned(args, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+        }
+    }
+}
+
+#[test]
 fn pinned_snapshot_and_source_conversion_preserve_schema_and_document_work() {
     let (source, source_args) = command("resume", &["--source-membership"]);
     let original = source.args.validate(&source_args).unwrap();

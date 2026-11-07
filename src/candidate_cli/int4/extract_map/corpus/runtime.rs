@@ -74,6 +74,11 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
             max_model_work: limits.document.mapping.mapping.max_model_work,
             max_mask_visits: limits.max_run_mask_visits, max_verification: limits.max_run_verification })
         .map_err(|fault| fault.cancellation.map(stopped).unwrap_or(CandidateError::Planning))?;
+    let planner = match command.document.extraction.selected_rows()? {
+        Some(rows) => planner.with_selected_rows(rows)
+            .map_err(|fault| fault.cancellation.map(stopped).unwrap_or(CandidateError::Planning))?,
+        None => planner,
+    };
     let planner = if limits.document.cohort_chunks.is_some() {
         planner.with_chunk_cohorts()
             .map_err(|fault| fault.cancellation.map(stopped).unwrap_or(CandidateError::Planning))?
@@ -110,6 +115,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "extract",
         source_mode: "complete_document", chunk_schedule: chunk_schedule(limits.document.cohort_chunks),
         cohort_chunks: limits.document.cohort_chunks,
+        max_selected_rows: planner.selected_rows().map(|rows| rows.max_rows_per_step),
         root_array_union: limits.document.mapping.root_array_union.map(array_union::ArrayUnionSelection::new),
         model_id: "Nanbeige4.2-3B", source_revision: &identity.source_revision,
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
@@ -159,6 +165,8 @@ struct Provenance<'a> {
     task: &'static str, source_mode: &'static str, chunk_schedule: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     cohort_chunks: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_selected_rows: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     root_array_union: Option<array_union::ArrayUnionSelection>,
     model_id: &'static str, source_revision: &'a str, source_root_sha256: &'a str, model_content_sha256: &'a str,

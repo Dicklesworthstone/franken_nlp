@@ -175,6 +175,28 @@ fn selecting_complete_legal_rows_rotates_the_factory_seal_and_preserves_peak_mem
 }
 
 #[test]
+fn selected_population_admits_exact_work_below_dense_projection_and_debits_across_flushes() {
+    let rows = Int4JsonSparseLimits { max_rows_per_step: 7 };
+    let measured = factory(false).with_selected_rows(rows).unwrap();
+    let expected = snapshot(&measured, SOURCE).expected;
+    let mut cap = config(false);
+    cap.limits.mapping.max_model_work = expected.planned_work();
+    cap.max_model_work = expected.planned_work();
+    cap.max_mask_visits = expected.reserved_mask_visits();
+    cap.limits.mapping.max_mask_visits = expected.reserved_mask_visits();
+    let dense = build(cap.clone()).unwrap();
+    assert_eq!(dense.plan(SOURCE, &mut Continue, false).err().unwrap().fault.code, BatchCode::WorkLimit);
+    let selected = build(cap.clone()).unwrap().with_selected_rows(rows).unwrap();
+    let prepared = snapshot(&selected, SOURCE);
+    assert_eq!(prepared.expected, expected);
+    let mut ledger = Ledger::default();
+    ledger.begin(&cap, expected, context(1, 1)).unwrap();
+    ledger.failed = false;
+    assert_eq!(ledger.begin(&cap, expected, context(2, 99)).err().unwrap().fault.code, BatchCode::WorkLimit);
+    assert_eq!(ledger.work, expected.planned_work());
+}
+
+#[test]
 fn document_args_are_strict_map_only_and_cannot_replace_any_policy() {
     for text in [r#"{"id":"x","text":"source"}"#, r#"{"id":"x","text":"source","task_args":null}"#,
         r#"{"id":"x","text":"source","task_args":{}}"#] {

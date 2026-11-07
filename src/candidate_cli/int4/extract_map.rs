@@ -69,13 +69,13 @@ struct MappingArgs {
 pub(super) fn definition() -> clap::Command {
     definition_with_cohorts(true)
         .arg(extract::selected_rows_argument())
-        .after_long_help(format!("{}\n\nSelected-row projection: --max-selected-rows N fixes the same complete-legal-row ceiling for EVERY chunk, including native chunk cohorts. Full-vocabulary projection remains the default. Every legal token is evaluated; a set larger than N refuses the complete document without pruning or fallback. The exact strategy and ceiling bind every chunk identity before native admission. Whole-document work is priced from the selected ceiling; grammar masks, source evidence, task limits and physical memory reservations are unchanged. Per-chunk results name their execution strategy and the document includes max_selected_rows. Actual-model parity and performance remain separately unqualified. Document corpus and retained-job commands keep their full-vocabulary policy.", array_union::HELP))
+        .after_long_help(format!("{}\n\nSelected-row projection: --max-selected-rows N fixes the same complete-legal-row ceiling for EVERY chunk, including native chunk cohorts. Full-vocabulary projection remains the default. Every legal token is evaluated; a set larger than N refuses the complete document without pruning or fallback. The exact strategy and ceiling bind every chunk identity before native admission. Whole-document work is priced from the selected ceiling; grammar masks, source evidence, task limits and physical memory reservations are unchanged. Per-chunk results name their execution strategy and the document includes max_selected_rows. Actual-model parity and performance remain separately unqualified. Document corpora apply the same fixed strategy across the entire stream; retained document jobs authenticate the exact strategy and row cap and require them again on resume.", array_union::HELP))
 }
 pub(super) fn document_job_definition() -> clap::Command {
-    definition_with_cohorts(true)
+    definition()
 }
 pub(super) fn corpus_definition() -> clap::Command {
-    definition_with_cohorts(true)
+    definition()
 }
 fn definition_with_cohorts(cohorts: bool) -> clap::Command {
     let command = ArrayUnionArgs::augment_args(MappingArgs::augment_args(extract::definition().name("extract-map")
@@ -122,8 +122,7 @@ impl MapArgs {
     }
     fn validate_mode(&self, args: &Int4Args, document_job: bool, admit_memory: bool) -> Result<MapLimits, CandidateError> {
         let m = self.mapping;
-        let mut common = if document_job { self.extraction.validate(args)? }
-            else { self.extraction.validate_with_projection(args)? };
+        let mut common = self.extraction.validate_with_projection(args)?;
         if args.max_input_bytes < 4 || !(1..=256).contains(&m.max_chunks)
             || self.cohort_chunks.is_some_and(|n| !(1..=64).contains(&n) || n > m.max_chunks)
             || !(1..=1_000_000).contains(&m.max_tokenizer_calls)

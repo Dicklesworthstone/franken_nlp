@@ -155,6 +155,44 @@ fn record_capacity_and_cohorts_do_not_multiply_any_of_nine_run_counters() {
 }
 
 #[test]
+fn selected_corpus_policy_preserves_fixed_schema_native_memory_and_whole_run_caps() {
+    for cohorts in [None, Some("3")] {
+        let mut flags = vec!["--source-membership"];
+        if let Some(width) = cohorts { flags.extend(["--cohort-chunks", width]); }
+        let (dense, args) = arguments(&flags); let before = dense.validate(&args).unwrap();
+        flags.extend(["--max-selected-rows", "4096"]);
+        let (selected, args) = arguments(&flags); let after = selected.validate(&args).unwrap();
+        assert_eq!(selected.document.extraction.selected_rows().unwrap().unwrap().max_rows_per_step, 4096);
+        assert_eq!(before.memory, after.memory);
+        assert_eq!(before.transport, after.transport);
+        assert_eq!(before.max_run_mask_visits, after.max_run_mask_visits);
+        assert_eq!(before.max_run_verification, after.max_run_verification);
+        assert_eq!(before.document.mapping.mapping.max_model_work, after.document.mapping.mapping.max_model_work);
+        let budget = selected.document.extraction.budget(&args, after.common);
+        let schema = " {\"type\":\"string\",\"x-fnlp-source\":\"verbatim\",\"enum\":[\"café 上海\"]}\n";
+        let request = selected.load_defaults(schema.to_owned(), budget).unwrap();
+        assert_eq!(request.schema, schema);
+        assert_eq!(request.grounding, ExtractionBatchGrounding::SourceMembership);
+        assert_eq!(request.budget, budget);
+    }
+}
+
+#[test]
+fn selected_corpus_accepts_pinned_snapshots_and_refuses_invalid_caps_before_private_io() {
+    let pin = "ab".repeat(32);
+    for cap in ["1", "166144"] {
+        let command = parsed(&["--snapshot", "private.snapshot", "--expected-model-sha256", &pin,
+            "--schema", "private-schema.json", "--max-selected-rows", cap]).unwrap();
+        let Int4Task::ExtractCorpus(options) = command.task else { panic!("extraction corpus required"); };
+        assert!(options.validate(&command.args).unwrap().common.snapshot_pin.is_some());
+    }
+    for cap in ["0", "166145"] {
+        let (options, args) = arguments(&["--max-selected-rows", cap]);
+        assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
 fn all_complete_stream_owners_fit_the_declared_peak_before_io() {
     for chunks in [None, Some(1), Some(3), Some(64)] {
         let (mut options, mut args) = arguments(&["--max-result-bytes", "65536"]);
@@ -205,7 +243,7 @@ fn invalid_transport_map_native_mask_and_verification_limits_refuse_before_all_i
 #[test]
 fn single_context_controls_and_retained_job_options_cannot_leak_into_the_live_route() {
     for flags in [vec!["--prefill-rows", "1"], vec!["--cohort-documents", "1"],
-        vec!["--max-selected-rows", "128"], vec!["--defaults", "other.json"],
+        vec!["--defaults", "other.json"],
         vec!["--min-new-tokens", "0"], vec!["--logprobs"], vec!["--seed", "ab"],
         vec!["--store-results"], vec!["--job-dir", "private-job"], vec!["--materialize"]] {
         let mut all = vec!["--source-dir", "source", "--source-manifest", "manifest", "--schema", "schema"];

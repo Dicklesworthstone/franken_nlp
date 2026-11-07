@@ -50,6 +50,10 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
     let planner = Int4DocumentExtractionJobPlanner::for_model(model.model_identity(), budget,
         job.map.extraction.compiler(), job.map.extraction.source_limits(), extraction,
         map.mapping, lifetime, job.lifetime.verification()).map_err(|_| CandidateError::Planning)?;
+    let planner = match job.map.extraction.selected_rows()? {
+        Some(rows) => planner.with_selected_rows(rows).map_err(|_| CandidateError::Planning)?,
+        None => planner,
+    };
     let planner = if map.cohort_chunks.is_some() {
         planner.with_chunk_cohorts().map_err(|_| CandidateError::Planning)?
     } else { planner };
@@ -57,6 +61,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
         .transpose().map_err(|_| CandidateError::Memory)?;
     if cohort != map.cohort { return Err(Failure::usage("extraction_document_job_cohort_quote")); }
     planner.check_job_limits(lifetime).map_err(|_| CandidateError::Planning)?;
+    let max_selected_rows = planner.selected_rows().map(|rows| rows.max_rows_per_step);
     let controls = crate::tokenizer::pinned_controls::pinned().map_err(|_| CandidateError::Identity)?;
     let vocabulary = ExtractionVocabulary::pinned(controls.template_controls())
         .map(Arc::new).map_err(|_| CandidateError::Planning)?;
@@ -98,6 +103,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(),
         snapshot, chunk_schedule: map.cohort_chunks.map(ChunkSchedule::new), output: &report,
+        max_selected_rows,
         root_array_union: map.mapping.root_array_union.map(ArrayUnionSelection::new),
     };
     // A failed metadata write can follow durable commits. No original text,
@@ -157,6 +163,8 @@ struct Response<'a, T: Serialize> {
     snapshot: Option<SnapshotRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     chunk_schedule: Option<ChunkSchedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_selected_rows: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     root_array_union: Option<ArrayUnionSelection>,
     output: &'a T,

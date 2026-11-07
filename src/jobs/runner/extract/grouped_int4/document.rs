@@ -5,10 +5,10 @@ use super::*;
 use crate::{
     batch::extract::grouped_int4::long::{Int4ExtractionMapError, Int4ExtractionMapLimits,
         Int4ExtractionMappingLimits, Int4ExtractionMapPreflight, Int4ExtractionMapRun,
-        PreparedInt4ExtractionMap, INT4_EXTRACTION_MAP_EXECUTION,
+        PreparedInt4ExtractionMap, INT4_EXTRACTION_MAP_EXECUTION, INT4_EXTRACTION_MAP_SELECTED_EXECUTION,
         cohort::{Int4ExtractionMapCohortBudget, Int4ExtractionMapCohortMemoryLimits,
             Int4ExtractionMapCohortRequirement}},
-    native_engine::{constrained_int4, int4::PackedInt4Kernel,
+    native_engine::{constrained_int4::{self, sparse::Int4JsonSparseLimits}, int4::PackedInt4Kernel,
         strict_int4::{Int4MemoryRequirement, Int4ModelWeights}},
     tasks::{mapreduce::{ChunkLimits, ExecutionLimits, CHUNK_PROFILE},
         extract::array_union::{RootArrayUnionLimits, ROOT_ARRAY_UNION_POLICY}},
@@ -30,6 +30,15 @@ const CHUNK_COHORT_SCHEDULE: &str = "native-document-chunk-cohorts-v1";
 struct RootArrayUnionRecipe {
     policy: &'static str,
     limits: RootArrayUnionLimits,
+}
+
+/// The complete legal set is projected or the step refuses. The cap and both
+/// native/task contracts are private resume authority, not tuning metadata.
+#[derive(Serialize)]
+struct SelectedRowsRecipe {
+    execution: &'static str,
+    native_execution: &'static str,
+    max_rows_per_step: usize,
 }
 
 /// Private immutable settings projected into JobRunner's keyed commitment.
@@ -58,6 +67,8 @@ pub struct Int4DocumentExtractionJobRecipe {
     chunk_cohorts: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     root_array_union: Option<RootArrayUnionRecipe>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_rows: Option<SelectedRowsRecipe>,
 }
 impl Int4DocumentExtractionJobRecipe {
     fn new(extraction: Int4ExtractionJobRecipe, document: Int4ExtractionMapLimits,
@@ -74,7 +85,7 @@ impl Int4DocumentExtractionJobRecipe {
             extraction, chunks, reduction, per_document_model_work: max_model_work,
             max_trie_node_visits, checkpoint_interval_nodes, mask_visits_per_chunk,
             max_mask_visits_per_document: max_mask_visits, verification,
-            max_lifetime_verification, max_attempts, chunk_cohorts: None,
+            max_lifetime_verification, max_attempts, chunk_cohorts: None, selected_rows: None,
             root_array_union: root_array_union.map(|limits| RootArrayUnionRecipe {
                 policy: ROOT_ARRAY_UNION_POLICY, limits }) };
         bounded_json(&recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
@@ -143,6 +154,24 @@ impl Int4DocumentExtractionJobPlanner {
     pub fn job_limits(&self) -> JobLimits { self.limits }
     pub fn request(&self) -> &ExtractionBatchArgs { &self.recipe.extraction.defaults }
     pub fn group_width(&self) -> usize { self.recipe.extraction.group_width }
+    /// Seal the same all-legal-row strategy into every chunk and the immutable
+    /// job recipe. Switching strategy or cap requires a different job; a
+    /// preexisting full-head attempt cannot be reused under this factory.
+    pub fn with_selected_rows(mut self, limits: Int4JsonSparseLimits) -> Result<Self, BatchFault> {
+        self.compiler = self.compiler.with_selected_rows(limits)?;
+        let execution = crate::tasks::extract::grouped_int4::INT4_SPARSE_EXTRACT_VERSION;
+        self.recipe.execution = INT4_EXTRACTION_MAP_SELECTED_EXECUTION;
+        self.recipe.extraction.execution = execution;
+        self.recipe.selected_rows = Some(SelectedRowsRecipe {
+            execution,
+            native_execution: constrained_int4::sparse::INT4_SPARSE_JSON_EXECUTION,
+            max_rows_per_step: limits.max_rows_per_step,
+        });
+        bounded_json(&self.recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
+        self.owner = Arc::new(());
+        Ok(self)
+    }
+    pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.compiler.selected_rows() }
     /// Opt into native windows within each durable document attempt. The
     /// already-authenticated map_batch_chunks fixes their maximum width.
     pub fn with_chunk_cohorts(mut self) -> Result<Self, BatchFault> {
@@ -205,7 +234,8 @@ impl Int4DocumentExtractionJobPlanner {
             identities.push(identity.clone());
         }
         if identities.len() != expected.chunk_count() || expected.chunk_count() == 0
-            || expected.group_width() != self.group_width() || plan.max_kv_bytes() != self.document_budget().max_kv_bytes
+            || expected.group_width() != self.group_width() || expected.selected_rows() != self.selected_rows()
+            || plan.max_kv_bytes() != self.document_budget().max_kv_bytes
             || plan.max_result_bytes() != self.max_result_bytes() {
             return Err(BatchItemFailure::fatal(BatchCode::Admission));
         }

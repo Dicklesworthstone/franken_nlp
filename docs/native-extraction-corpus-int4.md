@@ -90,6 +90,23 @@ Every real chunk and the complete requested schedule preflight before the
 document's first native forward. A later failed chunk yields no successful
 prefix of that document.
 
+Add `--max-selected-rows R` to project every grammar-legal output row instead
+of the full vocabulary. `R` must be in `1..=166144` and cover the complete
+legal set at every visited step, including accepting EOS. A larger legal set
+refuses that document before its first projection for that step; no candidate
+pruning, automatic full-head fallback or partial-document success occurs.
+The option composes with serial chunks, `--cohort-chunks` and
+`--root-array-union`. Every chunk binds the policy before admission, and the
+whole-run ledger charges the resulting selected-row plan. Original-source
+verification and complete native memory reservations remain in force.
+
+Candidate provenance and each completed document expose `max_selected_rows`
+only when the option is enabled. Individual NDJSON records cannot change the
+cap. The related `extract-map` and `extract-document-job start|resume` routes
+support the same policy; retained jobs authenticate it, including the exact
+cap, on resume. See [selected-row execution](int4-selected-rows.md) for its
+identity, accounting and qualification boundaries.
+
 ## Whole-run limits
 
 The five native flags are fixed ceilings for the **entire stream**:
@@ -145,6 +162,8 @@ with its fixed `Int4ExtractionDocumentBatchConfig`, then call
 `NlpEngine::batch_int4_extract_documents` with owned reader/writer, vocabulary,
 `CorpusLimits`, reduction reserve, kernel and cancellation token.
 `.with_chunk_cohorts()` uses the declared `map_batch_chunks` width.
+`.with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: R })` seals the
+projection policy for every document before the host admits the stream.
 `int4_extraction_document_corpus_requirements` and the runtime-independent
 `Int4ExtractionDocumentMemoryLimits` share the complete reservation formula.
 

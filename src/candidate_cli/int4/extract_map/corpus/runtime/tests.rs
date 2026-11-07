@@ -78,7 +78,7 @@ fn corpus_frame_keeps_exact_chunk_json_and_reveals_only_public_outer_metadata() 
             protocol: "fnlp-candidate-int4-extract-corpus-v1", schema_version: 1,
             scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "extract",
             source_mode: "complete_document", chunk_schedule: chunk_schedule(cohort_chunks), cohort_chunks,
-            root_array_union: None,
+            root_array_union: None, max_selected_rows: None,
             model_id: "Nanbeige4.2-3B", source_revision: "public-revision", source_root_sha256: "public-source",
             model_content_sha256: "public-model", candidate_format: "candidate-int4", quant_recipe: "recipe",
             group_width: 128, integer_kernel: "s_scalar_i32",
@@ -96,6 +96,7 @@ fn corpus_frame_keeps_exact_chunk_json_and_reveals_only_public_outer_metadata() 
         let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(value["source_mode"], "complete_document");
         assert_eq!(value["evidence"], "non_authoritative");
+        assert!(value.get("max_selected_rows").is_none());
         if let Some(chunks) = cohort_chunks {
             assert_eq!(value["chunk_schedule"], "native_chunk_cohorts"); assert_eq!(value["cohort_chunks"], chunks);
         } else {
@@ -110,5 +111,16 @@ fn corpus_frame_keeps_exact_chunk_json_and_reveals_only_public_outer_metadata() 
             assert!(value.get(absent).is_none());
         }
         assert!(matches!(CandidateWriter::new(NoIo, &provenance, 4096, 1), Err(CandidateError::Output)));
+        let selected = Provenance { max_selected_rows: Some(8192), ..provenance };
+        let mut selected_output = Vec::new();
+        {
+            let mut writer = CandidateWriter::new(&mut selected_output, &selected, 4096, 8192).unwrap();
+            writer.write_all(inner.as_bytes()).unwrap(); writer.flush().unwrap();
+        }
+        let selected_value: serde_json::Value = serde_json::from_slice(&selected_output).unwrap();
+        assert_eq!(selected_value["max_selected_rows"], 8192);
+        assert_eq!(selected_value["record"], value["record"]);
+        assert!(std::str::from_utf8(&selected_output).unwrap()
+            .ends_with(&format!("\"record\":{}}}\n", inner.trim_end_matches('\n'))));
     }
 }

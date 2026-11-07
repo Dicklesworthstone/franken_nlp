@@ -35,21 +35,20 @@ fn selected_maps_keep_complete_physical_admission_and_every_chunk_task_allowance
 }
 
 #[test]
-fn one_off_definition_does_not_silently_enable_population_head_policy() {
-    assert!(definition().get_arguments().any(|arg| arg.get_long() == Some("max-selected-rows")));
-    for shared in [corpus_definition(), document_job_definition()] {
-        assert!(!shared.get_arguments().any(|arg| arg.get_long() == Some("max-selected-rows")));
-        assert!(shared.try_get_matches_from(["extract-map", "--schema", "schema.json",
+fn document_projection_is_explicit_and_shared_by_population_definitions() {
+    for definition in [definition(), corpus_definition(), document_job_definition()] {
+        assert!(definition.get_arguments().any(|arg| arg.get_long() == Some("max-selected-rows")));
+        assert!(definition.try_get_matches_from(["extract-map", "--schema", "schema.json",
             "--source-dir", "source", "--source-manifest", "manifest",
-            "--memory-mib", "8192", "--max-selected-rows", "7"]).is_err());
+            "--memory-mib", "8192", "--max-selected-rows", "7"]).is_ok());
     }
     for operation in super::super::super::extract_document_job::definition().get_subcommands() {
-        assert!(!operation.get_arguments().any(|arg| arg.get_long() == Some("max-selected-rows")));
+        assert!(operation.get_arguments().any(|arg| arg.get_long() == Some("max-selected-rows")));
     }
     let (selected, args) = arguments(&["--max-selected-rows", "7"]);
     assert!(selected.validate(&args).is_ok());
-    assert_eq!(selected.validate_document_job(&args).err(), Some(CandidateError::Arguments));
-    assert_eq!(selected.validate_corpus(&args).err(), Some(CandidateError::Arguments));
+    assert!(selected.validate_document_job(&args).is_ok());
+    assert!(selected.validate_corpus(&args).is_ok());
 }
 
 #[test]

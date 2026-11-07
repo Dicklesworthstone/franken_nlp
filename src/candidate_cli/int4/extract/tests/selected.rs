@@ -22,13 +22,14 @@ fn only_supported_definitions_expose_selected_rows() {
     let mut found = Vec::new();
     collect(&crate::candidate_cli::definition(), "", &mut found);
     assert_eq!(found, ["/candidate/source-int4/extract", "/candidate/source-int4/extract-batch",
-        "/candidate/source-int4/extract-map", "/candidate/source-int4/ner",
+        "/candidate/source-int4/extract-map", "/candidate/source-int4/extract-corpus",
+        "/candidate/source-int4/extract-document-job/start", "/candidate/source-int4/extract-document-job/resume",
+        "/candidate/source-int4/ner",
         "/candidate/source-int4/keyphrases", "/candidate/source-int4/summarize", "/candidate/source-int4/answer",
         "/candidate/source-int4/ner-batch", "/candidate/source-int4/keyphrases-batch",
         "/candidate/source-int4/summarize-batch", "/candidate/source-int4/answer-batch"]);
-    for shared in [definition(),
-        super::super::super::extract_map::corpus_definition(), super::super::super::extract_job::definition(),
-        super::super::super::extract_document_job::definition(), super::super::super::semantic::definition()] {
+    for shared in [definition(), super::super::super::extract_job::definition(),
+        super::super::super::semantic::definition()] {
         let mut args = vec![shared.get_name().to_owned()];
         if shared.get_subcommands().next().is_some() { args.push("start".to_owned()); }
         args.extend(["--max-selected-rows".to_owned(), "7".to_owned()]);
