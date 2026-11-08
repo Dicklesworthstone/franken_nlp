@@ -51,8 +51,8 @@ pub(super) fn execute(args: Int4Args, command: JudgeArgs, _admitted: Int4Limits,
         .ok_or(CandidateError::Timeout);
     let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
         runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: limits.memory_bytes,
+        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: limits.compute.threads - 1,
+        helper_threads: 0, thread_ceiling: limits.compute.threads + 1, memory_ceiling_bytes: limits.memory_bytes,
         leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
     }).build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
@@ -104,14 +104,19 @@ pub(super) fn execute(args: Int4Args, command: JudgeArgs, _admitted: Int4Limits,
                 cleanup_reserve_bytes: CLEANUP_BYTES } },
         preparation_reserve_bytes: limits.preparation_bytes, max_model_work: command.scoring.work_ceiling(),
     };
-    let result = match limits.cohort {
-        Some(_) => engine.execute_int4_judge_cohort(&model, plan, host.native,
-            limits.preparation_bytes, host.max_model_work, limits.kernel, cancellation).map(cohort::Completion::Cohort),
-        None => match limits.prefill {
-            None => engine.execute_int4_judge(&model, plan, host, limits.kernel, cancellation),
-            Some(prefill) => engine.execute_int4_judge_layer_major(&model, plan, host,
-                limits.kernel, prefill, cancellation),
-        }.map(cohort::Completion::Serial),
+    let result = if limits.compute.threads > 1 {
+        engine.execute_int4_judge_with_threads(&model, plan, host, limits.kernel,
+            limits.compute.threads, cancellation).map(compute::Completion::Team)
+    } else {
+        match limits.cohort {
+            Some(_) => engine.execute_int4_judge_cohort(&model, plan, host.native,
+                limits.preparation_bytes, host.max_model_work, limits.kernel, cancellation).map(compute::Completion::grouped),
+            None => match limits.prefill {
+                None => engine.execute_int4_judge(&model, plan, host, limits.kernel, cancellation),
+                Some(prefill) => engine.execute_int4_judge_layer_major(&model, plan, host,
+                    limits.kernel, prefill, cancellation),
+            }.map(compute::Completion::serial),
+        }
     }.map_err(execution_error)?;
     if result.result().schema_version != 1 || result.result().execution != INT4_JUDGE_EXECUTION
         || result.result().numerics_profile != STRICT_INT4_PROFILE || result_mode(&result.result().result) != mode
@@ -132,7 +137,10 @@ pub(super) fn execute(args: Int4Args, command: JudgeArgs, _admitted: Int4Limits,
     // Both guards survive bounded staging, writing and flushing. Inference
     // failure never emits a prefix; a writer error remains an output failure.
     let response = Response { provenance: &provenance, output: result.result() };
-    publish_checked(&cohort::Response { response: &response, cohort: result.summary() },
+    publish_checked(&compute::Response {
+        response: &cohort::Response { response: &response, cohort: result.cohort() },
+        compute: result.compute(),
+    },
         limits.result_bytes + 4096, output, &|| remaining().map(|_| ()))
 }
 

@@ -5,7 +5,7 @@ use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, Me
     execution_identity::ExecutionIdentity,
     batch::{BatchDocument, extract::{ExtractionBatchArgs, grouped_int4::Int4ExtractionBatchPlanner}},
     grammar::mask::MaskWorkLimits,
-    hosted::{CancellationToken, HostedOutput, Int4LoadLimits, NativeLimits, ResidentInt4, RunLimits},
+    hosted::{CancellationToken, HostedError, HostedOutput, Int4HostError, Int4LoadLimits, NativeLimits, ResidentInt4, RunLimits},
     native_engine::{decode::{DecodeCancellationKind, DecodeStepControl}, int4::PackedInt4Kernel,
         strict_int4::{Int4ModelLoadBudget, weights::snapshot::INT4_SNAPSHOT_VERSION}},
     tasks::{chat::{ChatLimits, ChatRequest, GenerateRequest,
@@ -19,6 +19,8 @@ use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, Me
 pub(super) mod streaming;
 #[cfg(test)]
 mod compute_tests;
+#[cfg(test)]
+mod compute_tasks_tests;
 
 // Typed task alternatives share one loader, preparation guard and publication
 // envelope. Only real hosted execution can construct the guarded completion.
@@ -39,9 +41,9 @@ enum Prepared {
 enum Completed {
     Text(HostedOutput<Int4ChatResult>),
     TextTeam(crate::hosted::HostedInt4ChatTeamResult),
-    Classify(cohort::Completion<Int4ClassificationRun>),
-    Extract(HostedOutput<Int4ExtractRun>),
-    Source(HostedOutput<Int4SourceTaskRun>),
+    Classify(compute::Completion<Int4ClassificationRun>),
+    Extract(compute::Completion<Int4ExtractRun>),
+    Source(compute::Completion<Int4SourceTaskRun>),
 }
 impl Serialize for Completed {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -56,10 +58,16 @@ impl Serialize for Completed {
 }
 impl Completed {
     fn compute(&self) -> Option<&crate::hosted::Int4ComputeReceipt> {
-        match self { Self::TextTeam(result) => Some(result.compute()), _ => None }
+        match self {
+            Self::TextTeam(result) => Some(result.compute()),
+            Self::Classify(result) => result.compute(),
+            Self::Extract(result) => result.compute(),
+            Self::Source(result) => result.compute(),
+            Self::Text(_) => None,
+        }
     }
     fn cohort(&self) -> Option<cohort::Summary<'_>> {
-        match self { Self::Classify(result) => result.summary(), _ => None }
+        match self { Self::Classify(result) => result.cohort(), _ => None }
     }
 }
 impl Prepared {
@@ -75,20 +83,32 @@ impl Prepared {
         limits: Int4Limits, cancellation: CancellationToken)
         -> Result<Completed, CandidateError> {
         let kernel = limits.kernel;
+        if limits.compute.threads > 1 {
+            if limits.prefill.is_some() || limits.cohort.is_some() { return Err(CandidateError::Arguments); }
+            let threads = limits.compute.threads;
+            return match self {
+                Self::Text(plan) => engine.execute_int4_chat_with_threads(model, plan, 1, native, SAMPLER_BYTES,
+                    kernel, threads, cancellation).map(Completed::TextTeam),
+                Self::Classify(plan) => engine.execute_int4_classify_with_threads(model, plan, native,
+                    kernel, threads, cancellation)
+                    .map(|result| Completed::Classify(compute::Completion::Team(result))),
+                Self::Extract { plan, vocabulary, masks, max_mask_node_visits } =>
+                    engine.execute_int4_extract_with_threads(model, plan, vocabulary, native, masks,
+                        max_mask_node_visits, kernel, threads, cancellation)
+                        .map(|result| Completed::Extract(compute::Completion::Team(result))),
+                Self::Source { plan, vocabulary, masks, max_mask_node_visits } =>
+                    engine.execute_int4_source_task_with_threads(model, plan, vocabulary, native, masks,
+                        max_mask_node_visits, kernel, threads, cancellation)
+                        .map(|result| Completed::Source(compute::Completion::Team(result))),
+            }.map_err(execution_error);
+        }
         if let Some(admission) = limits.cohort {
             let Self::Classify(plan) = self else { return Err(CandidateError::Arguments); };
             if plan.head_count() > admission.heads { return Err(CandidateError::Planning); }
             let work = plan.planned_work();
             return engine.execute_int4_classify_cohort(model, plan, native, limits.preparation_bytes,
-                work, kernel, cancellation).map(|result| Completed::Classify(cohort::Completion::Cohort(result)))
-                .map_err(|_| CandidateError::Execution);
-        }
-        if limits.compute.threads > 1 {
-            let Self::Text(plan) = self else { return Err(CandidateError::Arguments); };
-            if limits.prefill.is_some() { return Err(CandidateError::Arguments); }
-            return engine.execute_int4_chat_with_threads(model, plan, 1, native, SAMPLER_BYTES,
-                kernel, limits.compute.threads, cancellation).map(Completed::TextTeam)
-                .map_err(|_| CandidateError::Execution);
+                work, kernel, cancellation).map(|result| Completed::Classify(compute::Completion::grouped(result)))
+                .map_err(execution_error);
         }
         match (self, limits.prefill) {
             (Self::Text(plan), None) => engine.execute_int4_chat(model, plan, 1, native, SAMPLER_BYTES,
@@ -96,22 +116,45 @@ impl Prepared {
             (Self::Text(plan), Some(limits)) => engine.execute_int4_chat_layer_major(model, plan, 1, native,
                 SAMPLER_BYTES, kernel, limits, cancellation).map(Completed::Text),
             (Self::Classify(plan), None) => engine.execute_int4_classify(model, plan, native,
-                kernel, cancellation).map(|result| Completed::Classify(cohort::Completion::Serial(result))),
+                kernel, cancellation).map(|result| Completed::Classify(compute::Completion::serial(result))),
             (Self::Classify(plan), Some(limits)) => engine.execute_int4_classify_layer_major(model, plan, native,
-                kernel, limits, cancellation).map(|result| Completed::Classify(cohort::Completion::Serial(result))),
+                kernel, limits, cancellation).map(|result| Completed::Classify(compute::Completion::serial(result))),
             (Self::Extract { plan, vocabulary, masks, max_mask_node_visits }, None) =>
                 engine.execute_int4_extract(model, plan, vocabulary, native, masks,
-                    max_mask_node_visits, kernel, cancellation).map(Completed::Extract),
+                    max_mask_node_visits, kernel, cancellation)
+                    .map(|result| Completed::Extract(compute::Completion::serial(result))),
             (Self::Extract { plan, vocabulary, masks, max_mask_node_visits }, Some(prefill)) =>
                 engine.execute_int4_extract_layer_major(model, plan, vocabulary, native, masks,
-                    max_mask_node_visits, kernel, prefill, cancellation).map(Completed::Extract),
+                    max_mask_node_visits, kernel, prefill, cancellation)
+                    .map(|result| Completed::Extract(compute::Completion::serial(result))),
             (Self::Source { plan, vocabulary, masks, max_mask_node_visits }, None) =>
                 engine.execute_int4_source_task(model, plan, vocabulary, native, masks,
-                    max_mask_node_visits, kernel, cancellation).map(Completed::Source),
+                    max_mask_node_visits, kernel, cancellation)
+                    .map(|result| Completed::Source(compute::Completion::serial(result))),
             (Self::Source { plan, vocabulary, masks, max_mask_node_visits }, Some(prefill)) =>
                 engine.execute_int4_source_task_layer_major(model, plan, vocabulary, native, masks,
-                    max_mask_node_visits, kernel, prefill, cancellation).map(Completed::Source),
-        }.map_err(|_| CandidateError::Execution)
+                    max_mask_node_visits, kernel, prefill, cancellation)
+                    .map(|result| Completed::Source(compute::Completion::serial(result))),
+        }.map_err(execution_error)
+    }
+}
+fn execution_error(error: HostedError) -> CandidateError {
+    let cancelled = |cause| match cause {
+        DecodeCancellationKind::Deadline | DecodeCancellationKind::Timeout => CandidateError::Timeout,
+        _ => CandidateError::Execution,
+    };
+    match error {
+        HostedError::Stopped { stop, .. } => cancelled(stop.kind),
+        HostedError::Join { physical_error: Some(error), .. }
+            | HostedError::Scope { physical_error: Some(error), .. } => execution_error(*error),
+        HostedError::Int4(Int4HostError::Native(crate::native_engine::strict_int4::StrictInt4Error::Cancelled(cause))) => cancelled(cause),
+        HostedError::Int4(Int4HostError::Chat(error)) => error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution),
+        HostedError::Int4(Int4HostError::Classification(error)) => error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution),
+        HostedError::Int4(Int4HostError::Extraction(error)) => error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution),
+        HostedError::Int4(Int4HostError::SourceTask(error)) => error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution),
+        HostedError::Reservation(_) => CandidateError::Memory,
+        HostedError::ModelIdentity | HostedError::ResourceDomain => CandidateError::Identity,
+        _ => CandidateError::Execution,
     }
 }
 struct DeadlineControl { started: Instant, deadline: Duration }

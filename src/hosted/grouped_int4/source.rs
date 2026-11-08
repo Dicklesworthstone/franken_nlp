@@ -10,6 +10,7 @@ use crate::{
     tasks::{extract::ExtractionVocabulary,
         source_planning::grouped_int4::{Int4SourceError, Int4SourceTaskRun, PreparedInt4SourceTask}},
 };
+mod team;
 
 impl NlpEngine {
     /// Execute NER, keyphrases, a structurally cited summary, or passage QA.

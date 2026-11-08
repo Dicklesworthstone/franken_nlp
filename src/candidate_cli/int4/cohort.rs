@@ -21,7 +21,7 @@ impl Admission {
 #[cfg(feature = "asupersync-runtime")]
 pub(super) fn matches(task: &Int4Task, args: &Int4Args, limits: Int4Limits) -> Result<bool, CandidateError> {
     let Int4Task::Classify(scoring) = task else { return Ok(limits.cohort.is_none()); };
-    let expected = scoring.validate_with_prefill(args)?;
+    let expected = scoring.validate_one_off_with_prefill(args)?;
     Ok(expected.cohort == limits.cohort && expected.native == limits.native
         && expected.minimum_memory_bytes == limits.minimum_memory_bytes)
 }

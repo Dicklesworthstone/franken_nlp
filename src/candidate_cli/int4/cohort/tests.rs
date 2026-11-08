@@ -13,7 +13,7 @@ fn parsed(task: &str, flags: &[&str]) -> Result<Int4Command, clap::Error> {
 }
 fn limits(command: &Int4Command) -> Result<Int4Limits, CandidateError> {
     match &command.task {
-        Int4Task::Classify(scoring) => scoring.validate_with_prefill(&command.args),
+        Int4Task::Classify(scoring) => scoring.validate_one_off_with_prefill(&command.args),
         Int4Task::Sentiment(options) => options.validate(&command.args),
         Int4Task::Judge(options) => options.validate(&command.args),
         _ => panic!("one-off scoring task required"),
@@ -69,6 +69,26 @@ fn simultaneous_heads_are_explicit_bounded_and_available_on_all_three_scored_tas
             let command = parsed(task, &["--cohort-heads", &heads.to_string()]).unwrap();
             assert_eq!(command.execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
         }
+    }
+}
+
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn runtime_admission_recheck_preserves_compact_classification_for_every_schedule() {
+    // This is the same guard used by execute_task before private input. It
+    // must validate the one-off policy instead of the byte-only batch policy.
+    for flags in [
+        &["--input-encoding", "safe-bpe-v1"][..],
+        &["--input-encoding", "safe-bpe-v1", "--cohort-heads", "4"][..],
+        &["--input-encoding", "safe-bpe-v1", "--prefill-rows", "4"][..],
+        &["--input-encoding", "safe-bpe-v1", "--compute-threads", "4"][..],
+    ] {
+        let command = parsed("classify", flags).unwrap();
+        let admitted = limits(&command).unwrap();
+        assert!(super::matches(&command.task, &command.args, admitted).unwrap());
+        assert!(compute::matches(&command.task, &command.args, admitted).unwrap());
+        let mut stale = admitted; stale.minimum_memory_bytes -= 1;
+        assert!(!super::matches(&command.task, &command.args, stale).unwrap());
     }
 }
 #[test]

@@ -9,6 +9,7 @@ mod long;
 pub use long::Int4SentimentMapHostConfig;
 mod corpus;
 pub use corpus::int4_sentiment_document_corpus_requirements;
+mod team;
 #[cfg(all(feature = "metadata-store", target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod job;

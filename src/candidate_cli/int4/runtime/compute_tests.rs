@@ -37,6 +37,32 @@ fn physical_team_metadata_is_separate_and_serial_wire_bytes_stay_identical() {
 }
 
 #[test]
+fn native_and_task_deadlines_keep_their_timeout_category_through_cli_dispatch() {
+    use crate::{native_engine::{constrained_int4::Int4JsonError,
+        generation::grouped_int4::Int4GenerationError, strict_int4::StrictInt4Error},
+        tasks::{chat::grouped_int4::Int4ChatError,
+            classify::grouped_int4::Int4ClassificationError, extract::grouped_int4::Int4ExtractError}};
+    fn extraction(cause: DecodeCancellationKind) -> Int4ExtractError {
+        Int4JsonError::from(StrictInt4Error::Cancelled(cause)).into()
+    }
+    for cause in [DecodeCancellationKind::Deadline, DecodeCancellationKind::Timeout] {
+        for error in [
+            Int4HostError::Native(StrictInt4Error::Cancelled(cause)),
+            Int4HostError::Chat(Int4ChatError::from(Int4GenerationError::from(StrictInt4Error::Cancelled(cause)))),
+            Int4HostError::Classification(Int4ClassificationError::Native(StrictInt4Error::Cancelled(cause))),
+            Int4HostError::Extraction(extraction(cause)),
+            Int4HostError::SourceTask(extraction(cause).into()),
+        ] {
+            assert_eq!(execution_error(HostedError::Int4(error)), CandidateError::Timeout);
+        }
+    }
+    assert_eq!(execution_error(HostedError::Int4(Int4HostError::Native(StrictInt4Error::Input))),
+        CandidateError::Execution);
+    assert_eq!(execution_error(HostedError::ModelIdentity), CandidateError::Identity);
+    assert_eq!(execution_error(HostedError::ResourceDomain), CandidateError::Identity);
+}
+
+#[test]
 #[ignore = "run alone in a fresh process with controller-admitted INT4 snapshot, independent pin and real multi-thread inference"]
 fn snapshot_fixed_teams_match_full_serial_results_and_drain_charges() {
     let snapshot = std::env::var("FNLP_INT4_STREAM_SNAPSHOT").expect("explicit existing snapshot required");

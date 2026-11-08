@@ -10,6 +10,7 @@ use crate::{
     tasks::extract::{ExtractionVocabulary,
         grouped_int4::{Int4ExtractError, Int4ExtractPlan, Int4ExtractRun}},
 };
+mod team;
 
 impl NlpEngine {
     /// Execute a sealed schema/source plan using either source-converted or

@@ -300,9 +300,10 @@ fnlp doctor                          # idempotent self-check/repair
 #   fnlp audit plan/grade · fnlp job partition/merge · fnlp resident start
 ```
 
-## Explicit multicore INT4 generation
+## Explicit multicore INT4 tasks
 
-Buffered `fnlp candidate source-int4 generate` and `chat` accept
+Buffered `fnlp candidate source-int4 generate`, `chat`, `classify`, `sentiment`,
+`judge`, `extract`, `ner`, `keyphrases`, `summarize` and `answer` accept
 `--compute-threads N`. The default, `1`, keeps the existing serial route.
 Values from `2` through `64` select one fixed team for the complete request:
 one blocking coordinator and `N - 1` persistent scoped workers. The command
@@ -315,6 +316,15 @@ fnlp candidate source-int4 generate prompt.txt \
   --expected-model-sha256 "$MODEL_SHA256" \
   --memory-mib 8192 --compute-threads 4 \
   --input-encoding safe-bpe-v1
+
+fnlp candidate source-int4 extract document.txt --schema extraction.schema.json \
+  --snapshot nanbeige.int4.snapshot --expected-model-sha256 "$MODEL_SHA256" \
+  --memory-mib 8192 --compute-threads 4 \
+  --input-encoding safe-bpe-v1 --max-selected-rows 4096
+
+fnlp candidate source-int4 classify classification.json \
+  --snapshot nanbeige.int4.snapshot --expected-model-sha256 "$MODEL_SHA256" \
+  --memory-mib 8192 --compute-threads 4 --input-encoding safe-bpe-v1
 ```
 
 All seven decoder projection roles and the language-model head use the team.
@@ -322,9 +332,13 @@ Each worker computes complete output rows using the same checked integer
 kernel, quantized activations and increasing group order as serial execution.
 The coordinator computes its own shard and assembles replies in row order.
 The team shares the resident weights; it creates no per-operator threads or
-weight copies. Sequence state, attention, sampling and task finalization stay
-on the coordinator. The model, prompt, sampling and numerical identities are
-unchanged by the physical worker count.
+weight copies. Sequence state, attention, sampling, grammar masks and task
+finalization stay on the coordinator. Classification labels, sentiment axes,
+judgment orders/criteria/evidence heads reuse that one team for the complete
+request, retaining their separate causal contexts and cumulative native work.
+Exact selected-row extraction/source decoding can use the same workers without
+changing its complete legal row set. The model, prompt, sampling and numerical
+identities are unchanged by the physical worker count.
 
 The complete fixed team forms behind an entry gate and seals before work is
 released. Reusable worker buffers pass through capacity-one command/reply
@@ -338,25 +352,35 @@ Worker input, row indices, output shards, unpacking scratch and protocol
 bookkeeping participate in memory admission before input or model IO. The
 quote models these allocations; OS thread stacks and process RSS are not
 measured or capped by it. Library callers must install a compatible
-`ResourceHostConfig` and can call `execute_int4_chat_with_threads`, using
-`int4_chat_team_workspace_bytes` for the extra scratch quote.
+`ResourceHostConfig` and can call `execute_int4_chat_with_threads` or the
+corresponding `execute_int4_classify_with_threads`,
+`execute_int4_sentiment_with_threads`, `execute_int4_judge_with_threads`,
+`execute_int4_extract_with_threads` and `execute_int4_source_task_with_threads`
+methods. `int4_task_team_workspace_bytes` quotes the additional scratch;
+the existing chat-specific quote remains available. A shared
+`HostedInt4TeamResult<T>` keeps each completed task and its work receipt guarded
+through caller publication; `HostedInt4ChatTeamResult` remains a compatible alias.
 
 An explicit team response adds `compute` with the schedule version, actual
 team width, completed projection count, completed output rows and completed
 worker rows. Serial responses omit this field. These are work counters;
 they carry no speedup or parity certification.
 
-This route currently handles one buffered generate/chat sequence. A worker
-count above one cannot combine with `--prefill-rows`; streaming, batches,
-corpora, structured tasks and durable jobs do not expose this option. Invalid
+This route handles one complete buffered request. A worker count above one
+cannot combine with `--prefill-rows` or `--cohort-heads`; streaming, batches,
+complete-document maps, corpora and durable jobs do not expose this option. Invalid
 widths, incompatible schedules and insufficient memory refuse before private
 IO, and a hosted request cannot exceed its installed child-thread envelope.
+Worker teams can combine with compact input on the tasks that expose it;
+judgment retains its byte-indexed evidence contract and byte-fallback input.
 
 Regression definitions cover exact row arithmetic, model/kernel binding,
 one-time work charging, persistent worker reuse, shared checkpoint exhaustion,
 cancellation during formation, and worker/coordinator panic drain. The gated
-snapshot fixture compares complete greedy and seeded generate/chat results
-at widths 1, 2 and 4, including byte and BPE inputs. Run that model fixture in
+snapshot fixtures compare complete greedy/seeded text and selected structured
+task results at widths 1, 2 and 4, including byte/BPE inputs and exact selected
+rows. Guarded completion fixtures cover result lifetime, typed failures,
+cancellation and insufficient child admission. Run each model fixture in
 a fresh test process: the process resource broker intentionally keeps its
 initial thread configuration. Compilation, executable regressions, complete
 model parity and hardware performance remain pending the authorized DSR

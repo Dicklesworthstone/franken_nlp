@@ -23,7 +23,10 @@ impl JudgeArgs {
         Ok(Self { scoring: classify::ScoringArgs::from_matches_with_prefill(matches)? })
     }
     pub(super) fn validate(self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
-        let mut limits = self.scoring.validate_with_prefill(args)?;
+        // Faithfulness evidence windows index original byte-fallback tokens.
+        // Physical row teams do not change that input representation.
+        if !args.input_encoding.is_default() { return Err(CandidateError::Arguments); }
+        let mut limits = self.scoring.validate_one_off_with_prefill(args)?;
         // CLI input/planning/publication and hosted compiled input remain
         // separate charged owners during the complete native invocation.
         if limits.cohort.is_none() {

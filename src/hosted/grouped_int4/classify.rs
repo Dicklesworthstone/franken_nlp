@@ -10,6 +10,7 @@ pub use long::Int4ClassificationMapHostConfig;
 mod corpus;
 pub use corpus::{int4_classification_document_corpus_requirements,
     int4_classification_document_corpus_cohort_requirements};
+mod team;
 
 impl NlpEngine {
     /// Execute all classification heads under one existing host call. A

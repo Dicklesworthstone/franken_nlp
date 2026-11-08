@@ -1,6 +1,8 @@
-//! Explicit whole-request output-row teams for single-sequence INT4 text.
+//! Explicit whole-request output-row teams for single-request INT4 tasks.
 use super::*;
 use crate::native_engine::strict_int4::projection::Int4ProjectionStats;
+mod task;
+pub(super) use task::{TaskMemory, execute_task};
 
 /// Physical execution evidence, separate from model, prompt and sampler identity.
 /// Counts describe successful projections; they do not certify speed or parity.
@@ -21,20 +23,31 @@ impl From<Int4ProjectionStats> for Int4ComputeReceipt {
     }
 }
 
-/// Completed text and its measured work counters retain the ordinary output
-/// charge through serialization and publication by their caller.
-pub struct HostedInt4ChatTeamResult {
-    output: HostedOutput<Int4ChatResult>,
+/// A complete task and its physical counters retain the ordinary output
+/// charge through serialization and publication by their caller. The receipt
+/// does not alter the task's model, prompt, grammar or scoring identity.
+pub struct HostedInt4TeamResult<T> {
+    output: HostedOutput<T>,
     compute: Int4ComputeReceipt,
 }
-impl HostedInt4ChatTeamResult {
-    pub fn result(&self) -> &Int4ChatResult { self.output.result() }
+impl<T> HostedInt4TeamResult<T> {
+    pub fn result(&self) -> &T { self.output.result() }
     pub fn compute(&self) -> &Int4ComputeReceipt { &self.compute }
 }
+/// Backward-compatible name for the buffered chat/generation team result.
+pub type HostedInt4ChatTeamResult = HostedInt4TeamResult<Int4ChatResult>;
 
 /// Additional modeled scratch for one fixed team, exclusive of the ordinary
 /// native KV, activation, sampler, allocator, result and cleanup reservations.
 pub fn int4_chat_team_workspace_bytes(compute_threads: usize, group_width: usize)
+    -> Result<u64, HostedError> {
+    dispatch::int4_team_workspace_bytes(compute_threads, group_width)
+}
+
+/// Additional modeled scratch for a fixed structured/scored task team. This
+/// is the same quote used by the dispatcher; it excludes ordinary native KV,
+/// task preparation, masks, result storage, allocator and cleanup reserves.
+pub fn int4_task_team_workspace_bytes(compute_threads: usize, group_width: usize)
     -> Result<u64, HostedError> {
     dispatch::int4_team_workspace_bytes(compute_threads, group_width)
 }

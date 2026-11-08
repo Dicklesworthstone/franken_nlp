@@ -94,7 +94,7 @@ impl ScoringArgs {
         // Shared corpus, map, job and judge callers keep their byte-based
         // planning contract. Only the one-off classification/sentiment routes
         // bind the explicit encoding policy before constructing any prompt.
-        if !args.input_encoding.is_default() { return Err(CandidateError::Arguments); }
+        if !args.input_encoding.is_default() || args.compute.threads() != 1 { return Err(CandidateError::Arguments); }
         self.validate_one_off_with_prefill(args)
     }
     pub(super) fn validate_one_off_with_prefill(self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {

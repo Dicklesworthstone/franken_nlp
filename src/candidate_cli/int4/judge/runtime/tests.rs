@@ -1,5 +1,67 @@
 use super::*;
 
+fn team_command(flags: &[&str]) -> Int4Command {
+    let mut argv = vec!["candidate", "source-int4", "judge", "--memory-mib", "8192",
+        "--source-dir", "explicit-source", "--source-manifest", "explicit-manifest"];
+    argv.extend_from_slice(flags);
+    let matches = crate::candidate_cli::definition().try_get_matches_from(argv).unwrap();
+    let CandidateCommand::SourceInt4(command) = CandidateCommand::from_matches(&matches).unwrap()
+        else { panic!("judge dispatcher required"); };
+    command
+}
+
+#[test]
+fn judge_teams_admit_scratch_but_preserve_byte_evidence_and_refuse_unsupported_composition() {
+    let command = team_command(&["--compute-threads", "2"]);
+    let Int4Task::Judge(options) = command.task else { panic!("judge required"); };
+    let limits = options.validate(&command.args).unwrap();
+    assert_eq!(limits.compute.threads, 2);
+    assert_eq!(limits.compute.workspace_bytes,
+        crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(2, command.args.group_width).unwrap());
+    assert!(limits.compute.workspace_bytes > 0);
+    assert!(command.args.input_encoding.is_default());
+    struct NoRead;
+    impl Read for NoRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("refused judgment reached private input"); }
+    }
+    let mut under = command;
+    under.args.memory_mib = limits.minimum_memory_bytes.saturating_sub(1) / MIB;
+    assert_eq!(under.execute(&mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+    for flags in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+        vec!["--compute-threads", "2", "--prefill-rows", "2"],
+        vec!["--compute-threads", "2", "--cohort-heads", "4"]] {
+        let mut output = Vec::new();
+        assert_eq!(team_command(&flags).execute(&mut NoRead, &mut output), Err(CandidateError::Arguments));
+        assert!(output.is_empty());
+    }
+    let mut compact = team_command(&["--compute-threads", "2"]);
+    let encoding = input_encoding::definition(clap::Command::new("encoding"))
+        .try_get_matches_from(["encoding", "--input-encoding", "safe-bpe-v1"]).unwrap();
+    compact.args.input_encoding = input_encoding::InputEncodingArgs::from_matches(&encoding).unwrap();
+    assert_eq!(compact.execute(&mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+}
+
+#[test]
+fn judge_team_receipt_is_optional_and_keeps_evidence_identical() {
+    let output = serde_json::json!({"fixture_only":true,"output":{"head_count":2,"result":{
+        "mode":"faithfulness","evidence":[{"quote":"é上海","span":{"byte_start":4,"byte_end":12}}]}}});
+    let receipt = crate::hosted::Int4ComputeReceipt { schedule: "int4-output-row-team-v1", compute_threads: 2,
+        completed_projections: 7, completed_rows: 100, completed_worker_rows: 50 };
+    for reported in [None, Some(&receipt)] {
+        let envelope = compute::Response {
+            response: &cohort::Response { response: &output, cohort: None }, compute: reported,
+        };
+        let mut bytes = Vec::new(); publish_checked(&envelope, 4096, &mut bytes, &|| Ok(())).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["output"], output["output"]);
+        assert!(value.get("cohort").is_none());
+        if reported.is_some() {
+            assert_eq!(value["compute"]["compute_threads"], 2);
+            assert_eq!(value["compute"]["completed_worker_rows"], 50);
+        } else { assert_eq!(value, output); }
+    }
+}
+
 #[test]
 fn typed_planning_and_host_cancellation_never_become_a_judgment() {
     for cause in [DecodeCancellationKind::Deadline, DecodeCancellationKind::Timeout] {

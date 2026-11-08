@@ -1,6 +1,7 @@
 use super::*;
 
 mod scored_encoding;
+mod structured_compute;
 
 fn command(task: &str, extra: &[&str]) -> Int4Command {
     let mut argv = vec!["candidate", "source-int4", task, "--source-dir", "explicit-source",
@@ -87,7 +88,7 @@ fn unsupported_compute_widths_and_prompt_schedules_refuse_before_io() {
     }
     // The option is absent from workflows without a persistent numerical team.
     for route in [vec!["stream", "generate"], vec!["text-batch"], vec!["text-corpus"],
-        vec!["classify"], vec!["extract"], vec!["ner"], vec!["sentiment"]] {
+        vec!["classify-map"], vec!["extract-batch"], vec!["ner-map"], vec!["sentiment-corpus"]] {
         let mut argv = vec!["candidate", "source-int4"];
         argv.extend(route);
         argv.extend(["--source-dir", "private-source", "--source-manifest", "private-manifest",

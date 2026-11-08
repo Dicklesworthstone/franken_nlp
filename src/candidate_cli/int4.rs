@@ -117,10 +117,10 @@ struct Int4Args {
     logprobs: bool,
     #[command(flatten)]
     policy: generation_policy::GenerationPolicyArgs,
-    /// Populated only by explicit text command parsers supporting this policy.
+    /// Populated only by explicit request parsers supporting this policy.
     #[arg(skip)]
     input_encoding: input_encoding::InputEncodingArgs,
-    /// Whole-request workers are exposed only by buffered single-request text.
+    /// Whole-request workers are exposed only by buffered single-request tasks.
     #[arg(skip)]
     compute: compute::Args,
 }
@@ -204,14 +204,14 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(compute::definition(input_encoding::definition(task("generate", "Generate from a bounded UTF-8 prompt using the pinned template"))))
         .subcommand(compute::definition(input_encoding::definition(task("chat", "Complete a bounded JSON system/user/assistant transcript"))))
         .subcommand(stream::definition())
-        .subcommand(input_encoding::definition(classify::prefill_definition(classify::definition())))
+        .subcommand(compute::definition(input_encoding::definition(classify::prefill_definition(classify::definition()))))
         .subcommand(classify_map::definition())
         .subcommand(classify_map::corpus::definition())
-        .subcommand(input_encoding::definition(sentiment::definition()))
+        .subcommand(compute::definition(input_encoding::definition(sentiment::definition())))
         .subcommand(sentiment_map::definition())
         .subcommand(sentiment_map::corpus::definition())
         .subcommand(sentiment_map::job::definition())
-        .subcommand(judge::definition())
+        .subcommand(compute::definition(judge::definition()))
         .subcommand(faithfulness_map::definition())
         .subcommand(faithfulness_map::corpus::definition())
         .subcommand(faithfulness_map::job::definition())
@@ -225,14 +225,14 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(redact::long::definition())
         .subcommand(redact::long::corpus::definition())
         .subcommand(redact::long::jobs::definition())
-        .subcommand(input_encoding::definition(prefill::definition(extract::one_off_definition())))
+        .subcommand(compute::definition(input_encoding::definition(prefill::definition(extract::one_off_definition()))))
         .subcommand(semantic::definition())
         .subcommand(extract_batch::definition())
         .subcommand(extract_job::definition())
         .subcommand(extract_map::definition())
         .subcommand(extract_map::corpus::definition())
         .subcommand(extract_document_job::definition())
-        .subcommands(source::one_off_definitions().into_iter().map(prefill::definition))
+        .subcommands(source::one_off_definitions().into_iter().map(prefill::definition).map(compute::definition))
         .subcommands(source_batch::definitions())
         .subcommands(source_job::definitions())
         .subcommands(source_map::definitions())
@@ -370,7 +370,8 @@ impl Int4Command {
         if matches!(name, "generate" | "chat" | "classify" | "sentiment" | "extract" | "ner" | "keyphrases" | "summarize" | "answer") {
             args.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
         }
-        if matches!(name, "generate" | "chat") {
+        if matches!(name, "generate" | "chat" | "classify" | "sentiment" | "judge" | "extract"
+            | "ner" | "keyphrases" | "summarize" | "answer") {
             args.compute = compute::Args::from_matches(matches)?;
         }
         Ok(Self { task, args, batch: None, job: None })
@@ -509,7 +510,7 @@ struct Int4Limits {
     prefill: Option<Int4PrefillLimits>,
     /// Explicit simultaneous scoring-head ceiling and transient workspace.
     cohort: Option<cohort::Admission>,
-    /// Fixed single-sequence output-row team, independently priced at execution.
+    /// Fixed whole-request output-row team, independently priced at execution.
     compute: compute::Admission,
     /// Lower bound for these declared simultaneous reservations. Host admission
     /// independently enforces all runtime/domain obligations; this is not RSS.
@@ -564,8 +565,10 @@ impl Int4Args {
     fn validate_storage_scheduled(&self, result_bytes: usize, output_tokens: usize,
         max_prompt_tokens: usize, sampler_bytes: u64, extra_preparation_bytes: u64,
         cohort: Option<cohort::Admission>) -> Result<Int4Limits, CandidateError> {
-        // Only text tasks and the explicitly wired one-request source route
-        // may change encoding. Composed/scored callers retain byte semantics.
+        // Only explicitly wired one-off routes may choose a numerical team.
+        // Their dedicated validators call common admission directly below.
+        if sampler_bytes == 0 && self.compute.threads() != 1 { return Err(CandidateError::Arguments); }
+        // Composed/scored callers retain their existing byte input semantics.
         if sampler_bytes == 0 && !self.input_encoding.is_default() { return Err(CandidateError::Arguments); }
         self.validate_storage_admission(result_bytes, output_tokens, max_prompt_tokens,
             sampler_bytes, extra_preparation_bytes, cohort)
@@ -581,7 +584,7 @@ impl Int4Args {
         let snapshot_pin = self.checked_model_input()?;
         let prefill = self.prefill()?;
         let compute = self.compute.admit(self.group_width)?;
-        if compute.threads != 1 && (prefill.is_some() || cohort.is_some() || sampler_bytes == 0) {
+        if compute.threads != 1 && (prefill.is_some() || cohort.is_some()) {
             return Err(CandidateError::Arguments);
         }
         if cohort.is_some() && (prefill.is_some() || sampler_bytes != 0) { return Err(CandidateError::Arguments); }

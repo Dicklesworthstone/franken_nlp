@@ -98,7 +98,8 @@ impl SourceArgs {
     /// option cannot silently replace that policy when prefill is enabled.
     pub(super) fn validate_full_projection_with_prefill(&self, args: &Int4Args)
         -> Result<Int4Limits, CandidateError> {
-        if self.max_selected_rows.is_some() || !args.input_encoding.is_default() { return Err(CandidateError::Arguments); }
+        if self.max_selected_rows.is_some() || !args.input_encoding.is_default()
+            || args.compute.threads() != 1 { return Err(CandidateError::Arguments); }
         self.validate_with_prefill(args)
     }
     pub(super) fn validate_with_prefill(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
