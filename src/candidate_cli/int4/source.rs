@@ -102,6 +102,14 @@ impl SourceArgs {
             || args.compute.threads() != 1 { return Err(CandidateError::Arguments); }
         self.validate_with_prefill(args)
     }
+    /// Only resident source streams bind their own selected-row policy and
+    /// execute a persistent team. Maps and durable jobs retain their guard.
+    pub(super) fn validate_batch_with_prefill(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
+        if self.max_selected_rows.is_some() || !args.input_encoding.is_default() {
+            return Err(CandidateError::Arguments);
+        }
+        self.validate_with_prefill(args)
+    }
     pub(super) fn validate_with_prefill(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
         let _ = self.selected_rows()?;
         if self.options.as_ref().is_some_and(|path| path.as_os_str().is_empty() || path.as_os_str() == "-")

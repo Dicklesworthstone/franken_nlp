@@ -1,8 +1,9 @@
 //! One owned ordered stream, one resident model, one finite native work ledger.
 use super::*;
+use super::super::compute::{resource_config, Schedule as ComputeSchedule};
 use std::{io::{BufRead, BufReader}, time::{Duration, Instant}};
 use crate::{
-    NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
+    NlpEngine, MemoryClass,
     batch::scored_int4::{Int4ScoredBatchPlanner, Int4ScoredTask},
     candidate_cli::batch::{CandidateWriter, completed},
     hosted::{CancellationToken, HostedError, Int4ScoredCohortHostLimits,
@@ -96,16 +97,6 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
             let planner = Int4ScoredBatchPlanner::new(planner, defaults, limits.native).map_err(|_| CandidateError::Planning)?;
             stream(&engine, &model, planner, "judge", &args, limits, started, deadline, reader, output, cancellation)
         }
-    }
-}
-
-fn resource_config(common: Int4Limits) -> ResourceHostConfig {
-    ResourceHostConfig {
-        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: common.compute.threads - 1,
-        helper_threads: 0, thread_ceiling: common.compute.threads + 1,
-        memory_ceiling_bytes: common.memory_bytes,
-        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
     }
 }
 
@@ -204,14 +195,6 @@ impl From<CohortWindow> for CohortSchedule {
     fn from(window: CohortWindow) -> Self {
         Self { execution: "cross_document_scoring_cohorts",
             declared_max_heads: window.max_heads, declared_max_documents: window.max_documents }
-    }
-}
-
-#[derive(Serialize)]
-struct ComputeSchedule { execution: &'static str, declared_compute_threads: usize }
-impl ComputeSchedule {
-    fn for_threads(threads: usize) -> Option<Self> {
-        (threads > 1).then_some(Self { execution: "int4-output-row-team-v1", declared_compute_threads: threads })
     }
 }
 

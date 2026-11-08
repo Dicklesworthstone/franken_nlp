@@ -1,4 +1,4 @@
-//! Explicit physical team selection for complete native tasks and scored streams.
+//! Explicit physical team selection for complete native tasks and resident streams.
 use super::*;
 use crate::native_engine::strict_int4::projection::int4_team_workspace_bytes;
 
@@ -24,7 +24,32 @@ pub(super) struct Admission { pub threads: usize, pub workspace_bytes: u64 }
 pub(super) fn definition(command: clap::Command) -> clap::Command {
     command.arg(clap::Arg::new("compute_threads").long("compute-threads")
         .value_name("N").value_parser(clap::value_parser!(usize)).default_value("1")
-        .help("Coordinator plus persistent INT4 row workers, 1..=64; 1 is serial. One team serves the complete request or score-batch stream across all heads, tokens and flushes; cannot combine with --prefill-rows or --cohort-heads. Runtime threads are additional. Worker scratch is admitted before IO"))
+        .help("Coordinator plus persistent INT4 row workers, 1..=64; 1 is serial. One team serves the complete request or supported resident batch across all documents, heads, tokens and flushes; cannot combine with --prefill-rows, --cohort-heads or --cohort-documents. Runtime threads are additional. Worker scratch is admitted before IO"))
+}
+
+/// The same admitted team width determines the process envelope for every
+/// resident stream. There is one runtime thread beyond the compute team.
+#[cfg(feature = "asupersync-runtime")]
+pub(super) fn resource_config(limits: Int4Limits) -> crate::ResourceHostConfig {
+    crate::ResourceHostConfig {
+        runtime_preset: crate::RuntimePreset::CurrentThread, runtime_workers: 1,
+        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: limits.compute.threads - 1,
+        helper_threads: 0, thread_ceiling: limits.compute.threads + 1,
+        memory_ceiling_bytes: limits.memory_bytes,
+        leak_response_policy: crate::LeakResponsePolicy::RecordAndEscalate,
+    }
+}
+
+/// Selected physical schedule only. Semantic results and execution identities
+/// do not absorb worker count, and no unobserved projection receipt is invented.
+#[cfg(feature = "asupersync-runtime")]
+#[derive(Serialize)]
+pub(super) struct Schedule { execution: &'static str, declared_compute_threads: usize }
+#[cfg(feature = "asupersync-runtime")]
+impl Schedule {
+    pub(super) fn for_threads(threads: usize) -> Option<Self> {
+        (threads > 1).then_some(Self { execution: "int4-output-row-team-v1", declared_compute_threads: threads })
+    }
 }
 
 #[cfg(feature = "asupersync-runtime")]

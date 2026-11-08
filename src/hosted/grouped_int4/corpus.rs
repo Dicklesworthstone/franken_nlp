@@ -24,6 +24,23 @@ struct StreamInput<R, W> {
     writer: W,
 }
 
+/// Both structured stream hosts retain the complete charged IO aggregate
+/// across worker join. The staged footer drops before that aggregate's charge
+/// on cancellation or unwind; successful publication consumes it exactly once.
+struct DeferredStream<I> {
+    completion: stream::deferred::DeferredCompletion,
+    input: Charged<I>,
+}
+impl<I> DeferredStream<I> {
+    fn publish<W: Write>(self, control: &mut RunControl, writer: fn(&mut I) -> &mut W)
+        -> Result<BatchSummary, HostedError> {
+        let Self { completion, mut input } = self;
+        let result = completion.publish(writer(&mut input.value), control).map_err(HostedError::Batch);
+        drop(input);
+        result
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Requirements {
     native: Int4MemoryRequirement,
@@ -47,7 +64,43 @@ impl NlpEngine {
         native_work: Int4ExtractionBatchLimits, limits: CorpusLimits, kernel: PackedInt4Kernel,
         reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
+        self.run_int4_extract_batch(model, planner, vocabulary, native_work, limits, kernel,
+            None, reader, writer, cancellation)
+    }
+
+    /// Execute the same extraction stream with one persistent team of 2..=64
+    /// compute threads, including the coordinator. All documents and flushes
+    /// share the original native-work, mask, deadline and checkpoint ledgers.
+    /// Full-vocabulary or explicitly selected legal-row projection keeps its
+    /// exact schema/source policy and independent extraction finalizer.
+    ///
+    /// Worker scratch is admitted in addition to the ordinary stream buffers.
+    /// The final run_complete is published inside the same tracked invocation
+    /// after every worker joins, with owned IO and its charge still retained.
+    /// Blocking writers remain cooperative. No cohort/prefill schedule is
+    /// enabled by this entry point, and failed delivery is never retried.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int4_extract_with_threads<R, W>(&self, model: &ResidentInt4,
+        planner: Int4ExtractionBatchPlanner, vocabulary: Arc<ExtractionVocabulary>,
+        native_work: Int4ExtractionBatchLimits, limits: CorpusLimits, kernel: PackedInt4Kernel,
+        compute_threads: usize, reader: R, writer: W, cancellation: CancellationToken)
+        -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        self.run_int4_extract_batch(model, planner, vocabulary, native_work, limits, kernel,
+            Some(compute_threads), reader, writer, cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_int4_extract_batch<R, W>(&self, model: &ResidentInt4,
+        planner: Int4ExtractionBatchPlanner, vocabulary: Arc<ExtractionVocabulary>,
+        native_work: Int4ExtractionBatchLimits, limits: CorpusLimits, kernel: PackedInt4Kernel,
+        compute_threads: Option<usize>, reader: R, writer: W, cancellation: CancellationToken)
+        -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        match compute_threads {
+            Some(width) => dispatch::preflight_int4_team(self, limits.native.run, width)?,
+            None => dispatch::preflight(self, limits.native.run)?,
+        }
         if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
         if planner.group_width() != model.model_identity().group_width() {
             return Err(HostedError::ModelIdentity);
@@ -56,13 +109,15 @@ impl NlpEngine {
             .map_err(|_| HostedError::ModelIdentity)?;
         let selected_rows = planner.selected_rows();
         let required = requirements(model.model_identity().group_width(), native_work, limits)?;
+        required.check_team_workspace(compute_threads, model.model_identity().group_width())?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(StreamInput { preparation: Some((planner, vocabulary)), reader, writer }))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
         let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.workspace_bytes)?;
         let model = model.clone();
-        dispatch::run(self, limits.native.run, cancellation, move |control| {
+        match compute_threads {
+        None => dispatch::run(self, limits.native.run, cancellation, move |control| {
             let mut input = input;
             checkpoint(control)?;
             let (planner, vocabulary) = input.value.preparation.take().ok_or(HostedError::CompletionMissing)?;
@@ -87,7 +142,48 @@ impl NlpEngine {
             drop(input); // readers/writers drop before their charge and physical completion
             drop(lease);
             result
-        })
+        }),
+        Some(width) => dispatch::run_int4_team_with_finalize(self, limits.native.run, cancellation,
+            model, width, kernel, move |weights, control, team| {
+                let mut input = input;
+                checkpoint(control)?;
+                let (planner, vocabulary) = input.value.preparation.take().ok_or(HostedError::CompletionMissing)?;
+                let mut engine = allocate_native(kv, workspace, || {
+                    StrictInt4Engine::new(weights, limits.native.context_tokens, Int4MemoryBudget {
+                        max_kv_bytes: required.native.kv_bytes, max_rope_bytes: required.native.rope_bytes,
+                        max_scratch_payload_bytes: required.native.scratch_payload_bound,
+                    }).map_err(native_error)?.with_kernel(kernel)
+                        .with_projection_executor(team).map_err(native_error)
+                })?;
+                let admission = CorpusAdmission { lease: &lease, model: weights.identity(),
+                    kv_bytes: required.native.kv_bytes, masks: native_work.masks,
+                    output_bytes: limits.transport.max_output_line_bytes as u64, selected_rows };
+                let completion = {
+                    let mut processor = NativeInt4ExtractionBatch::new(
+                        planner, &mut engine.value, &vocabulary, admission, native_work,
+                    ).map_err(HostedError::BatchSetup)?;
+                    stream::deferred::run_ndjson_deferred(&mut input.value.reader, &mut input.value.writer,
+                        &mut processor, limits.transport, control).map_err(HostedError::Batch)?
+                };
+                drop(engine);
+                drop(vocabulary);
+                drop(lease);
+                Ok(DeferredStream { completion, input })
+            }, |pending, control| pending.publish(control, |input| &mut input.writer)),
+        }
+    }
+}
+
+impl Requirements {
+    /// The dispatcher separately reserves this exact worker quote. Check its
+    /// addition before allocating any stream/native storage; the serial quote
+    /// and all semantic task budgets remain unchanged.
+    fn check_team_workspace(self, compute_threads: Option<usize>, group_width: usize)
+        -> Result<(), HostedError> {
+        let extra = compute_threads.map(|threads|
+            int4_task_team_workspace_bytes(threads, group_width)).transpose()?.unwrap_or(0);
+        sum(&[self.workspace_bytes, extra])?;
+        Ok(())
     }
 }
 

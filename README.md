@@ -307,9 +307,10 @@ fnlp doctor                          # idempotent self-check/repair
 Buffered `fnlp candidate source-int4 generate`, `chat`, `classify`, `sentiment`,
 `judge`, `extract`, `ner`, `keyphrases`, `summarize` and `answer` accept
 `--compute-threads N`, as do live `stream generate|chat` requests and resident
-`score-batch --task classify|sentiment|judge` streams. The default,
+`score-batch --task classify|sentiment|judge`, `extract-batch`, `ner-batch`,
+`keyphrases-batch`, `summarize-batch` and `answer-batch` streams. The default,
 `1`, keeps the existing serial route.
-Values from `2` through `64` select one fixed team for the complete request or scoring stream:
+Values from `2` through `64` select one fixed team for the complete request or supported resident stream:
 one blocking coordinator and `N - 1` persistent scoped workers. The command
 admits one additional runtime thread, for a configured process thread ceiling
 of `N + 1`. The candidate build requires `asupersync-runtime`.
@@ -370,14 +371,14 @@ team width, completed projection count, completed output rows and completed
 worker rows. Serial responses omit this field. These are work counters;
 they carry no speedup or parity certification.
 
-For `score-batch`, the same team and native engine serve every document, scoring
-head and flush boundary. Its `compute_schedule` provenance records the selected
+For the supported resident batches, the same team and native engine serve every
+document, scoring head, constrained token and flush boundary. Their `compute_schedule` provenance records the selected
 schedule and declared width; it does not invent per-item projection receipts.
 The required `run_complete` is staged under the existing transport budget and
 published after all workers join, inside the original invocation and deadline.
 
-A worker count above one cannot combine with `--prefill-rows` or `--cohort-heads`;
-other batches, complete-document maps, corpora and durable jobs do not expose this option. Invalid
+A worker count above one cannot combine with `--prefill-rows`, `--cohort-heads`
+or `--cohort-documents`; text batches, complete-document maps, corpora and durable jobs do not expose this option. Invalid
 widths, incompatible schedules and insufficient memory refuse before private
 IO, and a hosted request cannot exceed its installed child-thread envelope.
 Worker teams can combine with compact input on the tasks that expose it;
@@ -708,6 +709,30 @@ performance gates.
 extractor to an ordered NDJSON stream. It keeps one model, native engine and
 vocabulary resident for the run and compiles the shared schema against each
 document. This path requires a candidate build with `asupersync-runtime`.
+
+`--compute-threads 2..64` selects one persistent output-row team for the entire
+stream. Its coordinator retains the shared schema compiler, each document's
+grammar and source finalizer, logical KV, mask ledger and all five native work
+counters. Worker scratch is admitted once in addition to normal stream memory;
+documents and flushes never create another team or renew work allowances.
+The existing `--max-selected-rows` policy can use these workers while retaining
+every legal row and its exact admission ceiling. Team selection cannot combine
+with `--cohort-documents` or `--prefill-rows`.
+
+```bash
+fnlp candidate source-int4 extract-batch documents.ndjson \
+  --snapshot nanbeige.int4.snapshot --expected-model-sha256 "$MODEL_SHA256" \
+  --schema extraction.schema.json --memory-mib 8192 --compute-threads 4
+```
+
+Team events add `compute_schedule`, describing the selected schedule and width.
+The terminal `run_complete` is staged within the existing transport budget and
+published after every worker joins, under the same invocation deadline,
+checkpoint budget and re-entry guard. Charged input/writer storage remains
+owned through final delivery, and partial writes are never retried. Library
+callers use `batch_int4_extract_with_threads` with a compatible installed
+child-thread envelope. Model parity and performance still require the retained
+controller-only fixtures and authorized validation; this is an explicit schedule.
 
 Each input document supplies `id` and exact UTF-8 `text`. IDs must be unique
 within an epoch; an explicit flush starts a new epoch after delivery completes:
@@ -2507,6 +2532,17 @@ fnlp candidate source-int4 keyphrases-batch documents.ndjson \
   --max-total-input-bytes 67108864 --max-total-output-bytes 67108864 \
   > phrases.ndjson
 ```
+
+All four source-batch commands accept `--compute-threads 2..64` for one
+persistent output-row team spanning the entire stream. Original source bytes,
+passages, byte/scalar offsets, citations, grammar masks and independent task
+finalizers keep their existing authority. Selected-row execution can use the
+same workers. Thread count changes physical execution and its optional
+`compute_schedule` metadata; it does not change task identities or grant more
+native/mask work. The final completion is published after worker join under
+the original deadline, with charged IO retained through flush. Library callers
+use `batch_int4_source_with_threads`. This schedule excludes document cohorts
+and packed prefill; `--compute-threads 1` retains the serial route.
 
 Add `--cohort-documents N` (1 through 64) to execute independent documents
 through shared native INT4 layer/projection groups. For example:

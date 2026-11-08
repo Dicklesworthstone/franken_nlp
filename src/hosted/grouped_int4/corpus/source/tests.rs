@@ -169,8 +169,10 @@ fn source_admission_rechecks_group_work_masks_and_output_delivery_cap() {
 fn input_storage_and_public_corpus_entrypoint_cross_one_owned_boundary() {
     fn send<T: Send + 'static>() {}
     send::<Charged<SourceInput<std::io::Cursor<Vec<u8>>, Vec<u8>>>>();
+    send::<DeferredStream<SourceInput<std::io::Cursor<Vec<u8>>, Vec<u8>>>>();
     send::<Int4SourceCorpusConfig>();
     let _entry = NlpEngine::batch_int4_source::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
+    let _team = NlpEngine::batch_int4_source_with_threads::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
     let planner = planner(); let config = config(&planner, BuiltInTask::Keyphrases, 32);
     let limits = CorpusLimits { native: NativeLimits { context_tokens: 4096, allocator_reserve_bytes: 65_536,
         run: RunLimits { max_elapsed: Duration::from_secs(10), max_checkpoints: 1000, cleanup_reserve_bytes: 65_536 } },
@@ -279,6 +281,34 @@ fn all_source_tasks_reserve_exact_output_tokens_from_the_fixed_selected_row_cap(
                     ..request };
                 assert_eq!(check_source_cohort_request(width, 4096, 65_536, masks(), &request,
                     &config.identity.task_spec, config.selected_rows).unwrap(), 4);
+            }
+        }
+    }
+}
+
+#[test]
+fn source_team_width_never_changes_legal_row_caps_output_tokens_or_task_budgets() {
+    let planner = planner();
+    for task in [BuiltInTask::Ner, BuiltInTask::Keyphrases, BuiltInTask::Summarize, BuiltInTask::Answer] {
+        for selected in [None, Some(Int4JsonSparseLimits { max_rows_per_step: 7 })] {
+            let mut config = config(&planner, task, 127);
+            config.selected_rows = selected;
+            if let Some(selected) = selected {
+                config.native_work.max_model_work = constrained_int4::sparse::planned_work(127, 8, 4, selected).unwrap();
+            }
+            let limits = CorpusLimits { native: NativeLimits { context_tokens: 4096, allocator_reserve_bytes: 65_536,
+                run: RunLimits { max_elapsed: Duration::from_secs(10), max_checkpoints: 1000, cleanup_reserve_bytes: 65_536 } },
+                transport: BatchLimits::default(), preparation_reserve_bytes: 1 << 20, io_reserve_bytes: 65_536 };
+            let required = requirements(127, config.native_work, limits).unwrap();
+            let budget = config.task_ceiling;
+            for threads in [2, 3, 64] {
+                required.check_team_workspace(Some(threads), 127).unwrap();
+                config.validate_planning(&planner, 127, required.native.kv_bytes).unwrap();
+                let request = request(&config);
+                assert_eq!(check_request_for_projection(127, required.native.kv_bytes, 65_536,
+                    masks(), &request, &config.identity.task_spec, config.selected_rows).unwrap(), 4);
+                assert_eq!(config.task_ceiling, budget);
+                assert_eq!(config.selected_rows, selected);
             }
         }
     }

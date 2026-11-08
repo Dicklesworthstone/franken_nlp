@@ -54,6 +54,52 @@ fn all_four_batches_require_owned_execution_and_share_both_model_routes() {
 }
 
 #[test]
+fn every_source_stream_team_prices_one_workspace_without_renewing_task_mask_or_native_authority() {
+    for name in ["ner-batch", "keyphrases-batch", "summarize-batch", "answer-batch"] {
+        for selection in [None, Some("7"), Some("166144")] {
+            let mut flags = vec!["--max-requests", "8"];
+            if let Some(cap) = selection { flags.extend(["--max-selected-rows", cap]); }
+            let (batch, mut serial) = arguments(name, &flags);
+            flags.extend(["--compute-threads", "4"]);
+            let (_, mut team) = arguments(name, &flags);
+            for args in [&mut serial, &mut team] {
+                args.source_dir = None; args.source_manifest = None;
+                args.snapshot = Some(PathBuf::from("private.snapshot"));
+                args.expected_model_sha256 = Some("ab".repeat(32));
+            }
+            let before = batch.validate(&serial).unwrap(); let after = batch.validate(&team).unwrap();
+            let extra = crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(4, team.group_width).unwrap();
+            assert_eq!(after.common.compute, compute::Admission { threads: 4, workspace_bytes: extra });
+            assert_eq!(after.common.minimum_memory_bytes, before.common.minimum_memory_bytes + extra);
+            assert_eq!(after.common.native, before.common.native); assert_eq!(after.common.load, before.common.load);
+            assert_eq!(after.native.max_model_work, before.native.max_model_work);
+            assert_eq!(after.native.masks.max_visits_per_item, before.native.masks.max_visits_per_item);
+            assert_eq!(after.native.masks.max_visits_per_run, before.native.masks.max_visits_per_run);
+            assert_eq!(after.transport, before.transport); assert_eq!(after.selected_rows, before.selected_rows);
+            assert_eq!(batch.source.budget(&team, after.common), batch.source.budget(&serial, before.common));
+            team.memory_mib = (after.common.minimum_memory_bytes - 1) / MIB;
+            assert_eq!(batch.execute_owned(team, NoRead, NoWrite), Err(CandidateError::Arguments));
+        }
+    }
+}
+
+#[test]
+fn source_streams_refuse_invalid_team_widths_and_combined_schedules_before_private_io() {
+    for name in ["ner-batch", "keyphrases-batch", "summarize-batch", "answer-batch"] {
+        for flags in [
+            &["--compute-threads", "0"][..], &["--compute-threads", "65"][..],
+            &["--compute-threads", "2", "--cohort-documents", "1"][..],
+            &["--compute-threads", "4", "--cohort-documents", "2", "--prefill-rows", "1"][..],
+        ] {
+            let (batch, args) = arguments(name, flags);
+            assert_eq!(batch.execute_owned(args, NoRead, NoWrite), Err(CandidateError::Arguments));
+        }
+        let (batch, mut args) = arguments(name, &["--compute-threads", "1", "--cohort-documents", "2", "--prefill-rows", "1"]);
+        args.memory_mib = 262_144; batch.validate(&args).unwrap();
+    }
+}
+
+#[test]
 fn source_cohorts_preserve_each_task_budget_and_all_whole_stream_counters() {
     for name in ["ner-batch", "keyphrases-batch", "summarize-batch", "answer-batch"] {
         let (serial, mut args) = arguments(name, &["--max-requests", "8", "--max-result-bytes", "65536"]);

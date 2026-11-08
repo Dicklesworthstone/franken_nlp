@@ -120,7 +120,7 @@ struct Int4Args {
     /// Populated only by explicit request parsers supporting this policy.
     #[arg(skip)]
     input_encoding: input_encoding::InputEncodingArgs,
-    /// Whole-request workers are exposed only by buffered single-request tasks.
+    /// Parsed only by routes owning a complete request or resident batch team.
     #[arg(skip)]
     compute: compute::Args,
 }
@@ -227,13 +227,13 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(redact::long::jobs::definition())
         .subcommand(compute::definition(input_encoding::definition(prefill::definition(extract::one_off_definition()))))
         .subcommand(semantic::definition())
-        .subcommand(extract_batch::definition())
+        .subcommand(compute::definition(extract_batch::definition()))
         .subcommand(extract_job::definition())
         .subcommand(extract_map::definition())
         .subcommand(extract_map::corpus::definition())
         .subcommand(extract_document_job::definition())
         .subcommands(source::one_off_definitions().into_iter().map(prefill::definition).map(compute::definition))
-        .subcommands(source_batch::definitions())
+        .subcommands(source_batch::definitions().into_iter().map(compute::definition))
         .subcommands(source_job::definitions())
         .subcommands(source_map::definitions())
         .subcommand(source_map::documents::definition())
@@ -371,7 +371,8 @@ impl Int4Command {
             args.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
         }
         if matches!(name, "generate" | "chat" | "classify" | "sentiment" | "judge" | "extract"
-            | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch") {
+            | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch" | "extract-batch"
+            | "ner-batch" | "keyphrases-batch" | "summarize-batch" | "answer-batch") {
             args.compute = compute::Args::from_matches(matches)?;
         }
         Ok(Self { task, args, batch: None, job: None })

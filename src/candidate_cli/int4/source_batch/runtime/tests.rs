@@ -1,6 +1,7 @@
 use super::*;
 use std::{io::Cursor, sync::Mutex};
 use crate::tasks::{answer::{AnswerOptions, AnswerPassage}, ner::EntityType};
+mod team;
 
 struct NoIo;
 impl Read for NoIo {
@@ -58,7 +59,7 @@ fn every_source_task_stream_preserves_inner_spans_and_explicit_snapshot_provenan
             candidate_format: "fnlp-int4-source-candidate-v1", quant_recipe: "fixture:group=128",
             group_width: 128, integer_kernel: "s_scalar_i32", task,
             snapshot: Some(SnapshotRecord::new("loaded", need)),
-            cohort_schedule: None, max_selected_rows: None,
+            cohort_schedule: None, max_selected_rows: None, compute_schedule: None,
         };
         // Publication fixture only: it is not neural inference authority.
         let inner = "{\"event\":\"fixture\",\"text\":\"上海\",\"byte_start\":4,\"scalar_start\":3,\"exact\":12345678901234567890123456789012345678}\n";
@@ -80,7 +81,7 @@ fn every_source_task_stream_preserves_inner_spans_and_explicit_snapshot_provenan
         assert_eq!(value["snapshot"]["format"], INT4_SNAPSHOT_VERSION);
         assert_eq!(value["snapshot"]["file_bytes"], need.file_bytes);
         for absent in ["source_dir", "source_manifest", "snapshot_path", "defaults_path", "prompt_digest", "taskir_digest",
-            "cohort_schedule", "max_selected_rows"] {
+            "cohort_schedule", "max_selected_rows", "compute_schedule"] {
             assert!(value.get(absent).is_none());
         }
     }
@@ -99,7 +100,7 @@ fn source_schedule_provenance_declares_policy_without_private_bindings_or_work_c
             source_root_sha256: "fixture-source", model_content_sha256: "fixture-content",
             candidate_format: "fnlp-int4-source-candidate-v1", quant_recipe: "fixture:group=128",
             group_width: 128, integer_kernel: "s_scalar_i32", task, snapshot: None, cohort_schedule: None,
-            max_selected_rows: None,
+            max_selected_rows: None, compute_schedule: None,
         };
         let serial = serde_json::to_value(&provenance).unwrap();
         provenance.max_selected_rows = Some(7);
@@ -114,6 +115,31 @@ fn source_schedule_provenance_declares_policy_without_private_bindings_or_work_c
         let mut grouped = serde_json::to_value(&provenance).unwrap();
         assert_eq!(grouped.as_object_mut().unwrap().remove("cohort_schedule"), Some(schedule.clone()));
         assert_eq!(grouped, serial);
+        provenance.cohort_schedule = None;
+        for threads in [2, 4, 64] {
+            provenance.compute_schedule = compute::Schedule::for_threads(threads);
+            let mut scheduled = serde_json::to_value(&provenance).unwrap();
+            assert_eq!(scheduled.as_object_mut().unwrap().remove("compute_schedule"),
+                Some(serde_json::json!({"execution":"int4-output-row-team-v1", "declared_compute_threads":threads})));
+            assert_eq!(scheduled, serial);
+        }
+    }
+}
+
+#[test]
+fn owned_source_teams_recheck_schedule_and_process_envelope_before_private_io() {
+    for name in ["ner-batch", "keyphrases-batch", "summarize-batch", "answer-batch"] {
+        let command = super::super::tests::command(name, &["--compute-threads", "4",
+            "--max-selected-rows", "7", "--defaults", "private-defaults.json"]);
+        let Int4Command { task: Int4Task::SourceBatch(mut batch), args, batch: None, job: None } = command
+            else { panic!("wrong source task"); };
+        let quoted = batch.validate(&args).unwrap();
+        let config = compute::resource_config(quoted.common);
+        assert_eq!(config.scoped_cpu_children_per_coordinator, 3);
+        assert_eq!(config.max_blocking_coordinators, 1); assert_eq!(config.runtime_workers, 1);
+        assert_eq!(config.thread_ceiling, 5); assert_eq!(config.memory_ceiling_bytes, quoted.common.memory_bytes);
+        batch.stream.cohort_documents = Some(1);
+        assert_eq!(execute(args, batch, quoted, NoIo, NoIo), Err(CandidateError::Arguments));
     }
 }
 

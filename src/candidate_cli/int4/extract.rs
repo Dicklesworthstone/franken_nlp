@@ -113,6 +113,14 @@ impl ExtractionArgs {
         if !args.input_encoding.is_default() || args.compute.threads() != 1 { return Err(CandidateError::Arguments); }
         self.validate_one_off_with_prefill(args)
     }
+    /// Resident streams own a fixed output-row policy and may install one
+    /// persistent team. Other composed callers keep their separate validator.
+    pub(super) fn validate_batch_with_prefill(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
+        if self.max_selected_rows.is_some() || !args.input_encoding.is_default() {
+            return Err(CandidateError::Arguments);
+        }
+        self.validate_one_off_with_prefill(args)
+    }
     pub(super) fn validate_one_off_with_prefill(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
         let _ = self.selected_rows()?;
         crate::candidate_cli::extract::check_schema_path(&self.schema)?;

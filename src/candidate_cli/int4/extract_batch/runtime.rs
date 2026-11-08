@@ -2,7 +2,7 @@
 use super::*;
 use std::{fs::File, io::{BufRead, BufReader}, sync::Arc, time::{Duration, Instant}};
 use crate::{
-    NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
+    NlpEngine, MemoryClass,
     batch::extract::grouped_int4::Int4ExtractionBatchPlanner,
     candidate_cli::{batch::{CandidateWriter, completed}, extract::SCHEMA_BYTES},
     hosted::{CancellationToken, NativeLimits, RunLimits, corpus::CorpusLimits},
@@ -21,12 +21,8 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
-    let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
-        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: common.memory_bytes,
-        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
-    }).build().map_err(|_| CandidateError::Runtime)?;
+    let engine = NlpEngine::builder().resource_config(compute::resource_config(common))
+        .build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
     // Live before schema/tokenizer/planner/IO allocations and until the
     // blocking host has drained all output and physically released its owners.
@@ -83,6 +79,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         cohort_schedule: limits.cohort_documents.map(|documents|
             CohortSchedule::new(documents, common.prefill.map(|prefill| prefill.max_batch_rows))),
         max_selected_rows: limits.selected_rows.map(|limits| limits.max_rows_per_step),
+        compute_schedule: compute::Schedule::for_threads(common.compute.threads),
     };
     // This writer copies the canonical inner event without parsing its JSON
     // numbers. It stages one frame and permanently stops after partial IO.
@@ -103,6 +100,10 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
                 corpus, max_documents, common.kernel, reader, writer, cancellation),
         };
         result.map_err(|_| CandidateError::Batch)?.summary
+    } else if common.compute.threads > 1 {
+        engine.batch_int4_extract_with_threads(&model, planner, vocabulary, limits.native,
+            corpus, common.kernel, common.compute.threads, reader, writer, cancellation)
+            .map_err(|_| CandidateError::Batch)?
     } else {
         engine.batch_int4_extract(&model, planner, vocabulary, limits.native,
             corpus, common.kernel, reader, writer, cancellation).map_err(|_| CandidateError::Batch)?
@@ -143,6 +144,8 @@ struct Provenance<'a> {
     cohort_schedule: Option<CohortSchedule>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_selected_rows: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compute_schedule: Option<compute::Schedule>,
 }
 
 #[derive(Serialize)]

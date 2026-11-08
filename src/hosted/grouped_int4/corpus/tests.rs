@@ -208,6 +208,33 @@ fn owned_corpus_inputs_can_cross_the_existing_blocking_boundary() {
     send::<StreamInput<std::io::Cursor<Vec<u8>>, Vec<u8>>>();
     send::<Int4ExtractionBatchPlanner>();
     send::<Arc<ExtractionVocabulary>>();
+    send::<DeferredStream<StreamInput<std::io::Cursor<Vec<u8>>, Vec<u8>>>>();
+    let _serial = NlpEngine::batch_int4_extract::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
+    let _team = NlpEngine::batch_int4_extract_with_threads::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
+}
+
+#[test]
+fn stream_team_scratch_is_additional_without_multiplying_context_or_work_authority() {
+    for group_width in [1, 3, 32, 127, 128, MAX_MODEL_K] {
+        let limits = limits();
+        let native = native_work(group_width);
+        let required = requirements(group_width, native, limits).unwrap();
+        required.check_team_workspace(None, group_width).unwrap();
+        for threads in [2, 3, 7, 64] {
+            required.check_team_workspace(Some(threads), group_width).unwrap();
+            assert_eq!(requirements(group_width, native, limits).unwrap(), required);
+            let mut overflow = required; overflow.workspace_bytes = u64::MAX;
+            assert!(overflow.check_team_workspace(Some(threads), group_width).is_err());
+            let extra = int4_task_team_workspace_bytes(threads, group_width).unwrap();
+            overflow.workspace_bytes = u64::MAX - extra;
+            overflow.check_team_workspace(Some(threads), group_width).unwrap();
+            overflow.workspace_bytes += 1;
+            assert!(overflow.check_team_workspace(Some(threads), group_width).is_err());
+        }
+        for threads in [0, 1, 65, usize::MAX] {
+            assert!(required.check_team_workspace(Some(threads), group_width).is_err());
+        }
+    }
 }
 
 #[test]
@@ -298,3 +325,5 @@ fn selected_policy_requires_exact_source_work_and_preserves_masks_kv_and_output(
             2 => BatchCode::Admission, _ => BatchCode::OutputLineLimit });
     }
 }
+
+mod team;

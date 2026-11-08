@@ -1,5 +1,6 @@
 use super::*;
 use std::{io::Cursor, sync::Mutex};
+mod team;
 
 fn command(extra: &[&str]) -> Int4Command {
     let mut argv = vec!["candidate", "source-int4", "extract-batch",
@@ -40,7 +41,7 @@ fn extraction_stream_provenance_preserves_exact_inner_json_and_snapshot_identity
         candidate_format: "fnlp-int4-source-candidate-v1", quant_recipe: "fixture:group=128",
         group_width: 128, integer_kernel: "s_scalar_i32", task: "extract",
         snapshot: Some(SnapshotRecord::new("loaded", need)),
-        cohort_schedule: None, max_selected_rows: None,
+        cohort_schedule: None, max_selected_rows: None, compute_schedule: None,
     };
     // A transport fixture, not a fabricated inference result. The exact inner
     // bytes remain intact even if a consumer cannot represent this number.
@@ -64,7 +65,7 @@ fn extraction_stream_provenance_preserves_exact_inner_json_and_snapshot_identity
     assert_eq!(value["snapshot"]["format"], INT4_SNAPSHOT_VERSION);
     assert_eq!(value["snapshot"]["file_bytes"], need.file_bytes);
     for absent in ["logical_model_sha256", "prompt_digest", "schema_digest", "taskir_digest",
-        "source_dir", "source_manifest", "schema", "snapshot_path", "max_selected_rows"] {
+        "source_dir", "source_manifest", "schema", "snapshot_path", "max_selected_rows", "compute_schedule"] {
         assert!(value.get(absent).is_none());
     }
     provenance.max_selected_rows = Some(7);
@@ -72,6 +73,27 @@ fn extraction_stream_provenance_preserves_exact_inner_json_and_snapshot_identity
     assert_eq!(selected["max_selected_rows"], 7);
     assert!(selected.get("decision_policy_digest").is_none());
     assert!(selected.get("prompt_digest").is_none());
+    for threads in [2, 4, 64] {
+        provenance.compute_schedule = compute::Schedule::for_threads(threads);
+        let mut scheduled = serde_json::to_value(&provenance).unwrap();
+        assert_eq!(scheduled.as_object_mut().unwrap().remove("compute_schedule"),
+            Some(serde_json::json!({"execution":"int4-output-row-team-v1", "declared_compute_threads":threads})));
+        assert_eq!(scheduled, selected);
+    }
+}
+
+#[test]
+fn owned_extraction_team_rechecks_schedule_and_process_envelope_before_io() {
+    let Int4Command { task: Int4Task::ExtractBatch(mut batch), args, batch: None, job: None } =
+        command(&["--compute-threads", "4", "--max-selected-rows", "7"])
+        else { panic!("wrong task"); };
+    let quoted = batch.validate(&args).unwrap();
+    let config = compute::resource_config(quoted.common);
+    assert_eq!(config.scoped_cpu_children_per_coordinator, 3);
+    assert_eq!(config.max_blocking_coordinators, 1); assert_eq!(config.runtime_workers, 1);
+    assert_eq!(config.thread_ceiling, 5); assert_eq!(config.memory_ceiling_bytes, quoted.common.memory_bytes);
+    batch.stream.cohort_documents = Some(1);
+    assert_eq!(execute(args, batch, quoted, NoIo, NoIo), Err(CandidateError::Arguments));
 }
 
 #[test]

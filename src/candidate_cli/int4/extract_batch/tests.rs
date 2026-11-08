@@ -8,11 +8,13 @@ fn matches(extra: &[&str]) -> clap::ArgMatches {
         "--source-manifest", "explicit-manifest.json", "--memory-mib", "8192"];
     if !extra.contains(&"--schema") { argv.extend_from_slice(&["--schema", "schema.json"]); }
     argv.extend_from_slice(extra);
-    definition().try_get_matches_from(argv).unwrap()
+    compute::definition(definition()).try_get_matches_from(argv).unwrap()
 }
 fn arguments(extra: &[&str]) -> (BatchArgs, Int4Args) {
     let matches = matches(extra);
-    (BatchArgs::from_matches(&matches).unwrap(), Int4Args::from_arg_matches(&matches).unwrap())
+    let mut args = Int4Args::from_arg_matches(&matches).unwrap();
+    args.compute = compute::Args::from_matches(&matches).unwrap();
+    (BatchArgs::from_matches(&matches).unwrap(), args)
 }
 struct NoRead;
 impl Read for NoRead {
@@ -29,11 +31,55 @@ fn explicit_batch_route_uses_shared_schema_and_owned_streaming() {
     let matches = crate::candidate_cli::definition().try_get_matches_from([
         "candidate", "source-int4", "extract-batch", "--source-dir", "explicit-source",
         "--source-manifest", "explicit-manifest.json", "--memory-mib", "8192", "--schema", "schema.json",
+        "--compute-threads", "4",
     ]).unwrap();
     let CandidateCommand::SourceInt4(command) = CandidateCommand::from_matches(&matches).unwrap()
         else { panic!("wrong dispatcher"); };
     assert!(matches!(&command.task, Int4Task::ExtractBatch(_)));
+    assert_eq!(command.args.compute.threads(), 4);
     assert_eq!(command.execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+}
+
+#[test]
+fn extraction_stream_team_adds_one_workspace_and_preserves_selected_policy_and_all_work() {
+    for selection in [None, Some("7"), Some("166144")] {
+        let mut flags = vec!["--max-requests", "8"];
+        if let Some(cap) = selection { flags.extend(["--max-selected-rows", cap]); }
+        let (batch, mut serial) = arguments(&flags);
+        flags.extend(["--compute-threads", "4"]);
+        let (_, mut team) = arguments(&flags);
+        for args in [&mut serial, &mut team] {
+            args.source_dir = None; args.source_manifest = None;
+            args.snapshot = Some(PathBuf::from("private.snapshot"));
+            args.expected_model_sha256 = Some("ab".repeat(32));
+        }
+        let before = batch.validate(&serial).unwrap(); let after = batch.validate(&team).unwrap();
+        let extra = crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(4, team.group_width).unwrap();
+        assert_eq!(after.common.compute, compute::Admission { threads: 4, workspace_bytes: extra });
+        assert_eq!(after.common.minimum_memory_bytes, before.common.minimum_memory_bytes + extra);
+        assert_eq!(after.common.native, before.common.native); assert_eq!(after.common.load, before.common.load);
+        assert_eq!(after.native.max_model_work, before.native.max_model_work);
+        assert_eq!(after.native.masks.max_visits_per_item, before.native.masks.max_visits_per_item);
+        assert_eq!(after.native.masks.max_visits_per_run, before.native.masks.max_visits_per_run);
+        assert_eq!(after.transport, before.transport); assert_eq!(after.selected_rows, before.selected_rows);
+        assert_eq!(batch.extraction.budget(&team, after.common), batch.extraction.budget(&serial, before.common));
+        team.memory_mib = (after.common.minimum_memory_bytes - 1) / MIB;
+        assert_eq!(batch.execute_owned(team, NoRead, NoWrite), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
+fn extraction_stream_refuses_invalid_team_widths_and_mixed_schedules_before_io() {
+    for flags in [
+        &["--compute-threads", "0"][..], &["--compute-threads", "65"][..],
+        &["--compute-threads", "2", "--cohort-documents", "1"][..],
+        &["--compute-threads", "4", "--cohort-documents", "2", "--prefill-rows", "1"][..],
+    ] {
+        let (batch, args) = arguments(flags);
+        assert_eq!(batch.execute_owned(args, NoRead, NoWrite), Err(CandidateError::Arguments));
+    }
+    let (batch, mut args) = arguments(&["--compute-threads", "1", "--cohort-documents", "2", "--prefill-rows", "1"]);
+    args.memory_mib = 262_144; batch.validate(&args).unwrap();
 }
 
 #[test]
