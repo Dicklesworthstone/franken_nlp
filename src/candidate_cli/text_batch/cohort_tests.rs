@@ -2,7 +2,7 @@ use super::*;
 fn command(extra: &[&str]) -> TextBatchCommand {
     let mut args = vec!["text-batch", "--model", "local.fnlpq", "--memory-mib", "8192"];
     args.extend_from_slice(extra);
-    TextBatchCommand::from_arg_matches(&definition().try_get_matches_from(args).unwrap()).unwrap()
+    TextBatchCommand::from_matches(&definition().try_get_matches_from(args).unwrap()).unwrap()
 }
 #[test]
 fn cohort_execution_is_explicit_and_width_is_bounded_before_io() {

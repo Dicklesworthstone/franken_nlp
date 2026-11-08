@@ -397,7 +397,7 @@ checkpoint. The serial default remains the rollback selector.
 
 ## Explicit bounded BPE input for candidate text tasks
 
-Native INT8 `fnlp candidate generate`, `chat`, and `stream generate|chat`
+Native INT8 `fnlp candidate generate`, `chat`, `stream generate|chat`, and `text-batch`
 accept `--input-encoding safe-bpe-v1`. Buffered and live requests use the same
 policy-aware planner, including the original invocation deadline during
 tokenization. The complete encoder workspace is admitted before input or model
@@ -417,6 +417,29 @@ work-limit and provenance contracts below. Explicit compact input remains a
 separate input profile; source-level regression definitions do not establish
 compiled execution, model parity or task quality. Retained INT8 jobs keep their
 existing input contract.
+
+Resident INT8 `text-batch --task generate|chat` binds this policy to every
+complete NDJSON record. Generate records contain `id` and `prompt`; chat records
+contain `id` and a complete `messages` array. All messages within one record
+spend a shared tokenizer allowance, which renews for the next complete record.
+The corpus's input/output totals, native forward/logit work, unique-ID ceiling
+and original deadline remain cumulative. Per-record policy overrides are
+refused. The line-byte limit includes JSON framing as well as document text.
+
+Serial execution, `--cohort-rows` groups, packed prefill and `--active-rows`
+refilling windows use the same prepared record identities and actual encoded
+work. Preparation admits one transient encoder workspace alongside every
+retained plan and result in the full queued window, even when fewer slots are
+active. Every compact result and the mandatory `batch_complete` footer carry
+the full policy, including an empty corpus's footer. Byte fallback retains the
+existing wire shape. Planning and publication check the original deadline;
+whole-corpus success requires the footer and successful process exit.
+
+```bash
+fnlp candidate text-batch prompts.ndjson --task generate \
+  --model model.fnlpq --memory-mib 8192 --input-encoding safe-bpe-v1 \
+  --cohort-rows 4 --active-rows 2 --max-records 100
+```
 
 `fnlp candidate source-int4 generate`, `chat`, `classify`, `sentiment`, `extract`, `ner`, `keyphrases`,
 `summarize`, `answer`, `stream generate|chat`, `text-batch` and `text-corpus`

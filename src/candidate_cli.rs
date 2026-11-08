@@ -154,7 +154,7 @@ impl CandidateCommand {
             return jobs::generation::TextJobCommand::from_arg_matches(matches).map(Self::TextJob);
         }
         if name == "text-batch" {
-            return text_batch::TextBatchCommand::from_arg_matches(matches).map(Self::TextBatch);
+            return text_batch::TextBatchCommand::from_matches(matches).map(Self::TextBatch);
         }
         if name == "stream" {
             return stream::StreamCommand::from_matches(matches).map(Self::Stream);
@@ -435,9 +435,9 @@ impl CandidateError {
             Self::Runtime => "process runtime initialization refused",
             Self::Model => "explicit local current-candidate model loading refused",
             Self::Identity => "candidate model identity changed or is incompatible",
-            Self::Planning => "prompt, schema or task contract refused; no result published",
+            Self::Planning => "prompt, schema or task contract refused",
             Self::Timeout => "cooperative request deadline expired; successful completion not confirmed",
-            Self::Execution => "native execution failed or was cancelled; no result published",
+            Self::Execution => "native execution failed or was cancelled; successful completion not confirmed",
             Self::Output => "completed result could not be delivered",
             Self::Batch => "corpus stopped or contains failed records; earlier completed frames may exist",
         }

@@ -2,7 +2,7 @@ use super::*;
 fn command(extra: &[&str]) -> TextBatchCommand {
     let mut args = vec!["text-batch", "--model", "local.fnlpq", "--memory-mib", "8192"];
     args.extend_from_slice(extra);
-    TextBatchCommand::from_arg_matches(&definition().try_get_matches_from(args).unwrap()).unwrap()
+    TextBatchCommand::from_matches(&definition().try_get_matches_from(args).unwrap()).unwrap()
 }
 #[test]
 fn refill_is_explicit_and_requires_bounded_queued_and_active_widths() {

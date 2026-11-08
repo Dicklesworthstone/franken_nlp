@@ -10,13 +10,15 @@ pub(super) fn run(session: &Session, command: &TextBatchCommand, limits: Limits,
     command.refill_strategy(width)?;
     let prefill = command.common.policy.prefill()?;
     let args = &command.common;
+    let encoding = args.input_encoding_policy(limits)?;
     let mut input_bytes = 0;
     let mut transport = Output::new(output, command.max_total_output_bytes);
     let mut ledger = Ledger::default();
     // Empty/malformed first input still cannot open model metadata or weights.
     let first = read_record(input, command, &mut input_bytes)?;
     session.remaining()?;
-    let Some(first) = first else { return complete(&ledger, input_bytes, &mut transport); };
+    let Some(first) = first else { return complete(&ledger, input_bytes, &encoding,
+        &mut transport, &|| session.remaining().map(|_| ())); };
     let facts = session.facts(args)?;
     let planner = Planner::new(args, limits, &facts)?;
     let cancellation = CancellationToken::default();
@@ -25,7 +27,7 @@ pub(super) fn run(session: &Session, command: &TextBatchCommand, limits: Limits,
     let frame_cap = limits.result_bytes.checked_add(8192).ok_or(CandidateError::Output)?;
     while let Some(first) = pending.take() {
         let batch = collect(first, input, &planner, command, &mut ledger, &mut input_bytes,
-            width, &mut || session.remaining().map(|_| ()))?;
+            width, &mut session.control())?;
         let count = batch.ids.len();
         let refill = command.refill_strategy(count)?;
         let active_count = refill.as_ref().map_or(count, |(active, _)| *active);
@@ -62,10 +64,11 @@ pub(super) fn run(session: &Session, command: &TextBatchCommand, limits: Limits,
                 source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
                 quant_recipe: &facts.recipe_id, output: row };
             let frame = ResultFrame { protocol: PROTOCOL, schema_version: 1, event: "result",
-                id, request_seq: batch.first_request_seq + index as u64, response };
+                id, request_seq: batch.first_request_seq + index as u64, response,
+                input_encoding: input_encoding::reported_policy(&encoding) };
             // Keep the one guard covering ALL completed rows through each
             // canonical staging, write and flush. Do not clone out bare rows.
-            publish(&frame, frame_cap, &mut transport)?;
+            publish_checked(&frame, frame_cap, &mut transport, &|| session.remaining().map(|_| ()))?;
         }
         drop(result);
         session.remaining()?;
@@ -73,7 +76,7 @@ pub(super) fn run(session: &Session, command: &TextBatchCommand, limits: Limits,
         pending = read_record(input, command, &mut input_bytes)?;
     }
     session.remaining()?;
-    complete(&ledger, input_bytes, &mut transport)
+    complete(&ledger, input_bytes, &encoding, &mut transport, &|| session.remaining().map(|_| ()))
 }
 
 struct PreparedCohort {
@@ -85,7 +88,7 @@ struct PreparedCohort {
 #[allow(clippy::too_many_arguments)]
 fn collect(first: Record, input: &mut impl BufRead, planner: &Planner, command: &TextBatchCommand,
     ledger: &mut Ledger, input_bytes: &mut u64, width: usize,
-    checkpoint: &mut impl FnMut() -> Result<(), CandidateError>) -> Result<PreparedCohort, CandidateError> {
+    control: &mut impl DecodeStepControl) -> Result<PreparedCohort, CandidateError> {
     if width == 0 || width > MAX_BATCH_ROWS { return Err(CandidateError::Arguments); }
     let first_request_seq = ledger.records.checked_add(1).ok_or(CandidateError::Batch)?;
     let mut prepared = Vec::new(); let mut ids = Vec::new();
@@ -94,9 +97,9 @@ fn collect(first: Record, input: &mut impl BufRead, planner: &Planner, command: 
     let mut next = Some(first);
     let mut eof = false;
     while let Some(record) = next.take() {
-        checkpoint()?;
-        let (id, plan) = planner.prepare(record)?;
-        checkpoint()?;
+        planning_checkpoint(control)?;
+        let (id, plan) = planner.prepare_with_control(record, control)?;
+        planning_checkpoint(control)?;
         let work = plan.planned_work();
         if work.forward_positions > command.common.context_tokens as u64 { return Err(CandidateError::Planning); }
         ledger.admit(&id, ReservedWork { forward_positions: work.forward_positions,
@@ -106,11 +109,11 @@ fn collect(first: Record, input: &mut impl BufRead, planner: &Planner, command: 
         // After publishing this admitted group, any excess record will fail
         // the unchanged corpus ledger rather than being silently dropped.
         if prepared.len() == width || ledger.records == command.max_records { break; }
-        checkpoint()?;
+        planning_checkpoint(control)?;
         next = read_record(input, command, input_bytes)?;
         if next.is_none() { eof = true; }
     }
-    checkpoint()?;
+    planning_checkpoint(control)?;
     Ok(PreparedCohort { prepared, ids, first_request_seq, eof })
 }
 fn read_record(input: &mut impl BufRead, command: &TextBatchCommand, input_bytes: &mut u64)

@@ -43,12 +43,19 @@ pub(crate) struct TextBatchCommand {
 }
 
 pub(super) fn definition() -> clap::Command {
-    TextBatchCommand::augment_args(clap::Command::new("text-batch")
+    input_encoding::definition(TextBatchCommand::augment_args(clap::Command::new("text-batch")
         .about("Generate or chat over bounded NDJSON with one resident local INT8 model")
         .long_about("Explicit non-certified local candidate only. Each generate record is {\"id\":\"unique\",\"prompt\":\"...\"}; chat uses a messages array instead. Optional sample_index is a u64. IDs, not physical row positions, address seeded draws. Generation options apply to every record. max-input-bytes includes each record's JSON framing; max-checkpoints is per native invocation (one record by default, one whole cohort/window with --cohort-rows); timeout-seconds covers the entire invocation. One model is loaded lazily and reused. --cohort-rows groups 1..=64 documents. With --active-rows N, that group becomes a bounded preplanned FIFO window with N live KV/sampler slots: a finished slot refills while other requests continue. N must be 1..=cohort-rows. Refilling slots each reserve the longest queued context. --prefill-rows bounds TOTAL prompt/decode token rows per pack, not tokens per document; when refilling, omission uses the actual live-slot ceiling as the token width. Preparation and all retained outputs still scale with the entire queued window, not active-rows; extra packed scratch is separately admitted. Without active-rows the existing fixed-cohort modes are unchanged. Output is ordered completed-result NDJSON, never provisional tokens. Every request in the current window must finish and validate before its first result is published. The batch_complete frame plus successful process exit is required for whole-corpus success. Invalid input, duplicate IDs, budgets, native failure or a broken output stream stop the corpus without retries; earlier completed windows remain valid. No slot refill renews work or checkpoint budgets. Empty input completes without opening the model. Input is read in bounded windows, not during native execution. Blocking IO is cooperative, not preemptible. No network or tool execution."))
+        .after_help("--input-encoding safe-bpe-v1 opts every complete record into bounded byte-preserving, control-excluding BPE. One tokenizer work allowance covers all messages in that record; the next record gets a fresh allowance. Native work, total input/output, record count and the invocation deadline never reset. The same exact record plans execute in serial, fixed cohorts and refilling windows. The selected encoding and its limits are reported on results and batch_complete; byte-fallback retains the existing wire shape. Per-record encoding overrides are not accepted."))
 }
 
 impl TextBatchCommand {
+    pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let mut command = Self::from_arg_matches(matches)?;
+        command.common.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+        Ok(command)
+    }
+
     pub(super) fn validate(&self) -> Result<Limits, CandidateError> {
         let limits = self.common.validate()?;
         let _ = self.common.policy.prefill()?;
@@ -74,10 +81,15 @@ impl TextBatchCommand {
         let staging = (limits.result_bytes as u64).checked_add(8192)
             .and_then(|bytes| bytes.checked_mul(2)).and_then(|bytes| bytes.checked_mul(rows))
             .ok_or(CandidateError::Arguments)?;
+        let tokenizer_workspace = self.common.input_encoding.workspace_bytes(
+            self.common.max_input_bytes, limits.max_prompt_tokens)?;
         let floor = self.max_records.checked_mul(1024)
             .and_then(|n| n.checked_add(128 * MIB))
             .and_then(|n| n.checked_add(inputs))
             .and_then(|n| n.checked_add(staging))
+            // Planning is sequential even for a cohort. Its temporary BPE
+            // workspace is reused; retained plans are already charged above.
+            .and_then(|n| n.checked_add(tokenizer_workspace))
             .and_then(|n| n.checked_add(65_536)).ok_or(CandidateError::Arguments)?;
         if floor > limits.preparation_bytes { return Err(CandidateError::Arguments); }
         Ok(limits)
@@ -85,7 +97,7 @@ impl TextBatchCommand {
     pub(super) fn execute(self, input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
         let limits = self.validate()?;
         #[cfg(feature = "asupersync-runtime")]
-        { runtime::text_batch::execute(self, limits, input, output).map_err(|_| CandidateError::Batch) }
+        { runtime::text_batch::execute(self, limits, input, output) }
         #[cfg(not(feature = "asupersync-runtime"))]
         { let _ = (self, limits, input, output); Err(CandidateError::Unavailable) }
     }
@@ -201,7 +213,7 @@ mod tests {
     fn command(extra: &[&str]) -> TextBatchCommand {
         let mut argv = vec!["text-batch", "--model", "local.fnlpq", "--memory-mib", "8192"];
         argv.extend_from_slice(extra);
-        TextBatchCommand::from_arg_matches(&definition().try_get_matches_from(argv).unwrap()).unwrap()
+        TextBatchCommand::from_matches(&definition().try_get_matches_from(argv).unwrap()).unwrap()
     }
     #[test]
     fn cli_has_shared_generation_controls_and_bounded_corpus_defaults() {
@@ -212,6 +224,58 @@ mod tests {
         let matches = super::super::definition().try_get_matches_from(["candidate", "text-batch",
             "--model", "local.fnlpq", "--memory-mib", "8192"]).unwrap();
         assert!(matches!(CandidateCommand::from_matches(&matches).unwrap(), CandidateCommand::TextBatch(_)));
+    }
+    #[test]
+    fn root_parser_retains_one_encoding_policy_for_every_batch_schedule() {
+        use crate::tokenizer::untrusted::UntrustedEncoding;
+        for task in ["generate", "chat"] {
+            for schedule in [vec![], vec!["--cohort-rows", "4"],
+                vec!["--cohort-rows", "4", "--active-rows", "2", "--prefill-rows", "4"]] {
+                let mut argv = vec!["candidate", "text-batch", "--task", task,
+                    "--model", "local.fnlpq", "--memory-mib", "8192",
+                    "--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "1024",
+                    "--max-tokenizer-pair-bytes", "8192"];
+                argv.extend(schedule);
+                let matches = super::super::definition().try_get_matches_from(argv).unwrap();
+                let CandidateCommand::TextBatch(command) = CandidateCommand::from_matches(&matches).unwrap()
+                    else { panic!("text-batch route") };
+                let limits = command.validate().unwrap();
+                let UntrustedEncoding::SafeBpeV1(policy) = command.common.input_encoding_policy(limits).unwrap()
+                    else { panic!("batch discarded input policy") };
+                assert_eq!(policy.max_pair_checks, 1024); assert_eq!(policy.max_pair_bytes, 8192);
+                assert_eq!(policy.max_output_tokens, limits.max_prompt_tokens);
+                assert_eq!(policy.max_input_bytes, command.common.max_input_bytes);
+            }
+        }
+        for flag in ["--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes"] {
+            let matches = definition().try_get_matches_from(["text-batch", "--model", "local.fnlpq",
+                "--memory-mib", "8192", flag, "1"]);
+            assert!(matches.is_err() || TextBatchCommand::from_matches(&matches.unwrap()).is_err());
+        }
+    }
+    #[test]
+    fn compact_batch_prices_encoder_workspace_and_the_entire_retained_window_before_io() {
+        struct NoIo;
+        impl Read for NoIo {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("input before admission") }
+        }
+        impl Write for NoIo {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("output before admission") }
+            fn flush(&mut self) -> io::Result<()> { panic!("flush before admission") }
+        }
+        command(&["--max-input-bytes", "1048576"]).validate().unwrap();
+        assert!(command(&["--max-input-bytes", "1048576", "--input-encoding", "safe-bpe-v1"])
+            .execute(&mut NoIo, &mut NoIo).is_err());
+        command(&["--max-input-bytes", "1048576", "--input-encoding", "safe-bpe-v1",
+            "--preparation-mib", "512"]).validate().unwrap();
+        // One live slot still retains every queued plan and output. It cannot
+        // use the smaller serial admission quote to hide a full input window.
+        assert!(command(&["--max-input-bytes", "1048576", "--input-encoding", "safe-bpe-v1",
+            "--preparation-mib", "512", "--cohort-rows", "8", "--active-rows", "1"])
+            .execute(&mut NoIo, &mut NoIo).is_err());
+        command(&["--max-input-bytes", "1048576", "--input-encoding", "safe-bpe-v1",
+            "--preparation-mib", "768", "--cohort-rows", "8", "--active-rows", "1"])
+            .validate().unwrap();
     }
     #[test]
     fn source_bytes_and_semantic_sample_addresses_are_preserved() {
@@ -232,7 +296,9 @@ mod tests {
     fn ambiguous_records_and_policy_overrides_are_refused() {
         for row in [r#"{"id":"a","id":"b","prompt":"x"}"#, r#"{"id":" ","prompt":"x"}"#,
             r#"{"id":"a\n","prompt":"x"}"#, r#"{"id":"a","prompt":"x","seed":"1"}"#,
-            r#"{"id":"a","prompt":"x","sample_index":-1}"#, r#"{"id":"a","messages":[]}"#] {
+            r#"{"id":"a","prompt":"x","sample_index":-1}"#, r#"{"id":"a","messages":[]}"#,
+            r#"{"id":"a","prompt":"x","input_encoding":"safe-bpe-v1"}"#,
+            r#"{"id":"a","prompt":"x","max_tokenizer_pair_checks":1}"#] {
             assert!(parse_record(TextTask::Generate, row, 4096).is_err());
         }
     }

@@ -2,7 +2,7 @@
 use super::*;
 use std::io::Cursor;
 fn command(active: &str) -> TextBatchCommand {
-    TextBatchCommand::from_arg_matches(&wire::definition().try_get_matches_from(["text-batch",
+    TextBatchCommand::from_matches(&wire::definition().try_get_matches_from(["text-batch",
         "--model", "local.fnlpq", "--memory-mib", "8192", "--cohort-rows", "4", "--active-rows", active]).unwrap()).unwrap()
 }
 fn planner(command: &TextBatchCommand) -> Planner {
@@ -18,7 +18,7 @@ fn read_ahead_is_the_admitted_queue_not_the_smaller_live_slot_count() {
     let prefix = line("a") + &line("b") + &line("c") + &line("d");
     let mut input = Cursor::new(prefix.clone() + &line("e")); let mut bytes = 0; let mut ledger = Ledger::default();
     let first = read_record(&mut input, &command, &mut bytes).unwrap().unwrap();
-    let window = collect(first, &mut input, &planner, &command, &mut ledger, &mut bytes, 4, &mut || Ok(())).unwrap();
+    let window = collect(first, &mut input, &planner, &command, &mut ledger, &mut bytes, 4, &mut NeverCancelled).unwrap();
     assert_eq!(window.ids, ["a", "b", "c", "d"]); assert_eq!(ledger.records, 4);
     assert_eq!(bytes, prefix.len() as u64); assert_eq!(input.position(), bytes);
     assert_eq!(command.refill_strategy(window.ids.len()).unwrap().unwrap().0, 1);
@@ -30,7 +30,7 @@ fn partial_window_keeps_full_item_sample_and_corpus_work_identity() {
     let command = command("3"); let planner = planner(&command);
     let mut input = Cursor::new(line("a") + &line("b")); let mut bytes = 0; let mut ledger = Ledger::default();
     let first = read_record(&mut input, &command, &mut bytes).unwrap().unwrap();
-    let window = collect(first, &mut input, &planner, &command, &mut ledger, &mut bytes, 4, &mut || Ok(())).unwrap();
+    let window = collect(first, &mut input, &planner, &command, &mut ledger, &mut bytes, 4, &mut NeverCancelled).unwrap();
     assert!(window.eof); assert_eq!(window.ids.len(), 2);
     let (active, tokens) = command.refill_strategy(2).unwrap().unwrap(); assert_eq!(active, 2); assert_eq!(tokens.max_batch_rows, 2);
     for (id, plan) in window.ids.iter().zip(&window.prepared) {
