@@ -526,8 +526,10 @@ That aggregate policy is reported in `input_encoding`; its byte, token and pair
 work limits cover both segments. A source near one MiB leaves correspondingly
 less room for its schema. Library callers use the explicit one-request
 `prepare_with_document_encoding(document, policy, control)` method on the
-eager, INT8 or INT4 extraction batch planner. Reusing that planner through its
-ordinary batch/map/job methods preserves byte-fallback planning.
+eager, INT8 or INT4 extraction batch planner. INT4 resident streams can freeze
+the policy with `with_document_encoding`; their hosted entry points reserve the
+corresponding workspace. Legacy constructors and byte-capacity map/job methods
+retain their separate byte-only contract.
 
 One-off `classify` and `sentiment` apply the same explicit policy before native
 planning. Classification encodes the original document once and each canonical
@@ -709,6 +711,17 @@ performance gates.
 extractor to an ordered NDJSON stream. It keeps one model, native engine and
 vocabulary resident for the run and compiles the shared schema against each
 document. This path requires a candidate build with `asupersync-runtime`.
+
+`--input-encoding safe-bpe-v1` enables compact, byte-preserving input throughout
+the stream. Each record's exact schema and source share one bounded tokenizer
+ledger, including input bytes, output tokens, pair comparisons and examined
+pair bytes. The complete policy binds the prepared request and appears on every
+candidate event. The CLI and host admit one transient encoder workspace beside
+all retained plans and cohort lookahead. This option works with serial, CPU-team,
+cohort, packed-cohort and selected-row execution under their existing scheduling
+constraints. Byte-fallback remains the default. See
+[compact structured streams](docs/int4-structured-encoding.md) for examples,
+aggregate QA limits and library entry points.
 
 `--compute-threads 2..64` selects one persistent output-row team for the entire
 stream. Its coordinator retains the shared schema compiler, each document's
@@ -2533,6 +2546,15 @@ typed result. Prompt plus reserved output must fit the selected context.
 `ner-batch`, `keyphrases-batch`, `summarize-batch` and `answer-batch` reuse one
 resident model and vocabulary throughout an ordered NDJSON run. The default
 uses one serial native engine:
+
+All four commands also accept `--input-encoding safe-bpe-v1`, including their
+team, cohort and packed-cohort routes. Original source bytes and citation offsets
+remain authoritative. Each QA record shares one tokenizer allowance across its
+question, original passage manifest and joined evidence; metadata never becomes
+citation evidence. The actual tokenized prompt must still fit the complete
+context and reserved output. Encoder policy, transient workspace and optional
+event provenance follow the same [structured-stream contract](docs/int4-structured-encoding.md)
+as extraction. No truncation or automatic encoding fallback occurs.
 
 ```bash
 fnlp candidate source-int4 keyphrases-batch documents.ndjson \

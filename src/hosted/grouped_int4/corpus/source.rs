@@ -41,7 +41,7 @@ impl Int4SourceCorpusConfig {
 
     fn validate_planning(&self, planner: &SourceTaskPlanner, group_width: usize,
         allocated_kv: u64) -> Result<(), HostedError> {
-        source_batch::check_configuration(planner, &self.identity, self.task_ceiling,
+        source_batch::check_configuration_with_document_encoding(planner, &self.identity, self.task_ceiling,
             self.planning, self.defaults.as_ref(), group_width).map_err(HostedError::BatchSetup)?;
         source_batch::validate_limits(self.native_work).map_err(HostedError::BatchSetup)?;
         if let Some(limits) = self.selected_rows {
@@ -66,7 +66,8 @@ impl NlpEngine {
     /// supply the evidence. One model, engine, vocabulary and work reservation
     /// serve the entire stream, including all transport epochs.
     ///
-    /// Preparation/IO reservations price the owned captures. Cancellation
+    /// Preparation/IO reservations price the owned captures. The source
+    /// planner's fixed encoder workspace is added automatically. Cancellation
     /// retains their charge through physical cleanup and writer disposal.
     #[allow(clippy::too_many_arguments)]
     pub fn batch_int4_source<R, W>(&self, model: &ResidentInt4,
@@ -112,7 +113,8 @@ impl NlpEngine {
         }
         if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
         let width = model.model_identity().group_width();
-        let required = requirements(width, config.native_work, limits)?;
+        let required = requirements_with_document_encoding(width, config.native_work, limits,
+            planner.document_encoding())?;
         config.validate(&planner, model.model_identity(), required.native.kv_bytes)?;
         required.check_team_workspace(compute_threads, width)?;
         let lease = self.resources().acquire_lease();
@@ -127,7 +129,7 @@ impl NlpEngine {
             checkpoint(control)?;
             let (planner, vocabulary, config) = input.value.preparation.take().ok_or(HostedError::CompletionMissing)?;
             let task_spec = config.identity.task_spec.clone();
-            let compiler = Int4SourceBatchPlanner::new(&planner, config.identity, config.task_ceiling,
+            let compiler = Int4SourceBatchPlanner::new_with_document_encoding(&planner, config.identity, config.task_ceiling,
                 config.planning, config.defaults, width).map_err(HostedError::BatchSetup)?;
             let compiler = match config.selected_rows {
                 Some(limits) => compiler.with_selected_rows(limits).map_err(HostedError::BatchSetup)?,
@@ -145,7 +147,7 @@ impl NlpEngine {
                 selected_rows: config.selected_rows,
             }, task_spec: &task_spec };
             let result = {
-                let mut processor = NativeInt4SourceBatch::new(compiler, &mut engine.value,
+                let mut processor = NativeInt4SourceBatch::new_with_document_encoding(compiler, &mut engine.value,
                     &vocabulary, admission, config.native_work).map_err(HostedError::BatchSetup)?;
                 stream::run_ndjson(&mut input.value.reader, &mut input.value.writer,
                     &mut processor, limits.transport, control).map_err(HostedError::Batch)
@@ -163,7 +165,7 @@ impl NlpEngine {
                 checkpoint(control)?;
                 let (planner, vocabulary, config) = input.value.preparation.take().ok_or(HostedError::CompletionMissing)?;
                 let task_spec = config.identity.task_spec.clone();
-                let compiler = Int4SourceBatchPlanner::new(&planner, config.identity, config.task_ceiling,
+                let compiler = Int4SourceBatchPlanner::new_with_document_encoding(&planner, config.identity, config.task_ceiling,
                     config.planning, config.defaults, width).map_err(HostedError::BatchSetup)?;
                 let compiler = match config.selected_rows {
                     Some(limits) => compiler.with_selected_rows(limits).map_err(HostedError::BatchSetup)?,
@@ -182,7 +184,7 @@ impl NlpEngine {
                     selected_rows: config.selected_rows,
                 }, task_spec: &task_spec };
                 let completion = {
-                    let mut processor = NativeInt4SourceBatch::new(compiler, &mut engine.value,
+                    let mut processor = NativeInt4SourceBatch::new_with_document_encoding(compiler, &mut engine.value,
                         &vocabulary, admission, config.native_work).map_err(HostedError::BatchSetup)?;
                     stream::deferred::run_ndjson_deferred(&mut input.value.reader, &mut input.value.writer,
                         &mut processor, limits.transport, control).map_err(HostedError::Batch)?
@@ -247,8 +249,8 @@ impl NlpEngine {
             io_reserve_bytes: limits.io_reserve_bytes,
             allocator_reserve_bytes: limits.native.allocator_reserve_bytes,
         };
-        let required = memory.requirements_for_execution(width, config.native_work, limits.transport,
-            config.selected_rows, prefill).map_err(HostedError::BatchSetup)?;
+        let required = memory.requirements_for_execution_with_document_encoding(width, config.native_work, limits.transport,
+            config.selected_rows, prefill, planner.document_encoding()).map_err(HostedError::BatchSetup)?;
         // TaskBudget belongs to one document. The aggregate native allocation
         // must never be mistaken for authority to widen that document's KV.
         let row_kv = Int4MemoryRequirement::for_context(limits.native.context_tokens, width)
@@ -275,7 +277,7 @@ impl NlpEngine {
             checkpoint(control)?;
             let (planner, vocabulary, config) = input.value.preparation.take().ok_or(HostedError::CompletionMissing)?;
             let task_spec = config.identity.task_spec.clone();
-            let compiler = Int4SourceBatchPlanner::new(&planner, config.identity, config.task_ceiling,
+            let compiler = Int4SourceBatchPlanner::new_with_document_encoding(&planner, config.identity, config.task_ceiling,
                 config.planning, config.defaults, width).map_err(HostedError::BatchSetup)?;
             let compiler = match config.selected_rows {
                 Some(limits) => compiler.with_selected_rows(limits).map_err(HostedError::BatchSetup)?,
@@ -286,9 +288,9 @@ impl NlpEngine {
                 output_bytes: limits.transport.max_output_line_bytes as u64, task_spec: &task_spec,
                 selected_rows: config.selected_rows };
             let mut processor = match prefill {
-                Some(prefill) => NativeInt4SourceCohortBatch::new_packed(compiler, &model.inner.loaded.value,
+                Some(prefill) => NativeInt4SourceCohortBatch::new_packed_with_document_encoding(compiler, &model.inner.loaded.value,
                     &vocabulary, admission, config.native_work, native, kernel, prefill),
-                None => NativeInt4SourceCohortBatch::new(compiler, &model.inner.loaded.value,
+                None => NativeInt4SourceCohortBatch::new_with_document_encoding(compiler, &model.inner.loaded.value,
                     &vocabulary, admission, config.native_work, native, kernel),
             }.map_err(HostedError::BatchSetup)?;
             let result = stream::grouped::run_ndjson(&mut input.value.reader, &mut input.value.writer,

@@ -48,7 +48,7 @@ impl std::fmt::Debug for StreamArgs {
 pub(super) fn definitions() -> Vec<clap::Command> {
     [(Kind::Ner, "ner-batch"), (Kind::Keyphrases, "keyphrases-batch"),
         (Kind::Summarize, "summarize-batch"), (Kind::Answer, "answer-batch")]
-        .into_iter().map(|(kind, name)| StreamArgs::augment_args(source::definition(kind).name(name)
+        .into_iter().map(|(kind, name)| input_encoding::definition(StreamArgs::augment_args(source::definition(kind).name(name)
             .about("Run an ordered source-task NDJSON stream with one resident grouped-INT4 model")
             .long_about(concat!(
                 "Run one fixed source task over ordered {id,text,task_args?} NDJSON and exact {\"flush\":true} controls. NER, keyphrases and summarize use shipped options unless --defaults or per-record typed task_args supplies explicit bounded options. For answer, text is the question and task_args supplies separately typed passages, options and budget; no passage set is invented or reused implicitly. Defaults files use complete SourceBatchArgs JSON, including its task selector and budget. A record cannot switch tasks or raise the CLI ceilings. ",
@@ -63,6 +63,7 @@ pub(super) fn definitions() -> Vec<clap::Command> {
             .mut_arg("input", |arg| arg.help("NDJSON file or '-' for stdin; each source record is bounded and read incrementally"))
             .mut_arg("max_input_bytes", |arg| arg.help("Maximum decoded document/question and passage input bytes per record"))
             .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoint allowance for the ENTIRE corpus execution"))))
+            .after_long_help("--input-encoding safe-bpe-v1 selects compact, byte-preserving input for every record. The complete request shares one tokenizer-work allowance: QA includes the question, original passage manifest and joined evidence without renewing byte/token/pair ceilings between them. Only original passage text authorizes citations. The exact policy binds every task identity and is reported on every candidate event, including flush and run_complete. One transient tokenizer workspace is admitted alongside all retained serial/team/cohort plans and lookahead. Input-byte bounds, complete token context, native/mask budgets and the whole-stream deadline remain independent. Byte-fallback is unchanged by default; no truncation, automatic fallback or claim of byte/BPE model-output equivalence. Maps and durable jobs retain their byte-only capacity contract."))
         .collect()
 }
 #[derive(Clone, Copy, Debug)]
@@ -73,6 +74,7 @@ pub(super) struct BatchLimits {
     pub output_bytes: u64,
     pub io_bytes: u64,
     pub preparation_reserve_bytes: u64,
+    pub encoding_workspace_bytes: u64,
     pub cohort_documents: Option<usize>,
     pub selected_rows: Option<constrained_int4::sparse::Int4JsonSparseLimits>,
 }
@@ -100,6 +102,8 @@ impl BatchArgs {
             return Err(CandidateError::Arguments);
         }
         let mut common = self.source.validate_batch_with_prefill(args)?;
+        let encoding = args.input_encoding.policy(args.max_input_bytes, common.max_prompt_tokens)?;
+        let encoding_workspace_bytes = args.input_encoding.workspace_bytes(args.max_input_bytes, common.max_prompt_tokens)?;
         let one = match selected_rows {
             Some(rows) => constrained_int4::sparse::planned_work(args.group_width, common.max_prompt_tokens,
                 args.max_new_tokens, rows),
@@ -130,8 +134,8 @@ impl BatchArgs {
             let memory = Int4SourceCohortMemoryLimits { max_documents, context_tokens: args.context_tokens,
                 preparation_reserve_bytes, io_reserve_bytes: io_bytes, allocator_reserve_bytes: ALLOCATOR_BYTES,
             };
-            let quote = memory.requirements_for_execution(args.group_width, native, transport,
-                selected_rows, prefill).map_err(|_| CandidateError::Arguments)?;
+            let quote = memory.requirements_for_execution_with_document_encoding(args.group_width, native, transport,
+                selected_rows, prefill, &encoding).map_err(|_| CandidateError::Arguments)?;
             let execution = sum(&[quote.native.kv_bytes, quote.workspace_bytes,
                 quote.input_bytes, quote.output_reservation_bytes])?;
             common.minimum_memory_bytes = grouped_memory_floor(args, common, execution)?;
@@ -140,12 +144,13 @@ impl BatchArgs {
         } else {
             let corpus_reservation = sum(&[times(transport.max_line_bytes as u64, 8)?,
                 times(transport.max_output_line_bytes as u64, 4)?, times(transport.max_epoch_ids as u64, 128)?,
-                transport.max_epoch_id_bytes as u64, preparation_reserve_bytes, io_bytes])?;
+                transport.max_epoch_id_bytes as u64, preparation_reserve_bytes, io_bytes, encoding_workspace_bytes])?;
             common.minimum_memory_bytes = sum(&[common.minimum_memory_bytes, corpus_reservation])?;
         }
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(BatchLimits { common, transport, native, output_bytes: stream.max_total_output_bytes,
-            io_bytes, preparation_reserve_bytes, cohort_documents: stream.cohort_documents, selected_rows })
+            io_bytes, preparation_reserve_bytes, encoding_workspace_bytes,
+            cohort_documents: stream.cohort_documents, selected_rows })
     }
     fn selected_rows(&self) -> Result<Option<constrained_int4::sparse::Int4JsonSparseLimits>, CandidateError> {
         self.stream.max_selected_rows.map(|max_rows_per_step| {

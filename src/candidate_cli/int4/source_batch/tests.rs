@@ -3,6 +3,7 @@ use crate::tasks::answer::{AnswerOptions, AnswerPassage};
 
 mod selected;
 mod prefill;
+mod encoding;
 
 pub(super) fn command(name: &str, extra: &[&str]) -> Int4Command {
     let mut argv = vec!["candidate", "source-int4", name, "--source-dir", "explicit-source",

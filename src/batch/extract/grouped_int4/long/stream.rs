@@ -92,6 +92,7 @@ impl Int4ExtractionDocumentBatchPlanner {
     fn configured(compiler: Int4ExtractionBatchPlanner, config: Int4ExtractionDocumentBatchConfig)
         -> Result<Self, BatchFault> {
         config.validate()?;
+        compiler.require_byte_encoding()?;
         let ceiling = compiler.compiler.ceiling; let request = config.request.budget;
         ceiling.validate().map_err(|_| BatchCode::InvalidLimits)?;
         let kv = Int4MemoryRequirement::for_context(config.limits.mapping.chunks.context_tokens,

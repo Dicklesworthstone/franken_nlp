@@ -52,7 +52,7 @@ struct StreamArgs {
 }
 
 pub(super) fn definition() -> clap::Command {
-    StreamArgs::augment_args(extract::definition().name("extract-batch")
+    input_encoding::definition(StreamArgs::augment_args(extract::definition().name("extract-batch")
         .about("Extract one shared schema from bounded NDJSON using one resident INT4 model")
         .long_about(concat!(
             "Process ordered {id,text} NDJSON and exact {\"flush\":true} controls with one resident source-converted or digest-pinned snapshot INT4 model. ",
@@ -66,7 +66,8 @@ pub(super) fn definition() -> clap::Command {
         .mut_arg("prefill_rows", |arg| arg.hide(false).requires("cohort_documents")
             .help("With --cohort-documents: maximum TOTAL prompt/feedback token rows per packed pass, 1..=64; extra scratch is admitted"))
         .mut_arg("max_input_bytes", |arg| arg.help("Maximum decoded UTF-8 document bytes per record"))
-        .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoint allowance for the ENTIRE corpus execution")))
+        .mut_arg("max_checkpoints", |arg| arg.help("Cooperative checkpoint allowance for the ENTIRE corpus execution"))))
+        .after_long_help("--input-encoding safe-bpe-v1 selects compact, byte-preserving input for every record. Exact schema bytes and source text share one tokenizer-work allowance per record; neither segment renews it. The immutable policy and all limits bind each prepared request. The full transient tokenizer workspace is admitted alongside retained serial/team/cohort plans and lookahead before schema, input or model IO. It composes with the stream's selected-row and scheduling choices. Byte-fallback remains the default. Input byte bounds, complete token context, original source coordinates, native/mask budgets and the whole-stream deadline remain independent limits. No truncation, encoding fallback or claim of byte/BPE model-output equivalence. Maps and durable jobs retain their separate byte-only capacity contract.")
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -77,6 +78,7 @@ pub(super) struct BatchLimits {
     pub output_bytes: u64,
     pub io_bytes: u64,
     pub preparation_reserve_bytes: u64,
+    pub encoding_workspace_bytes: u64,
     pub cohort_documents: Option<usize>,
     pub selected_rows: Option<constrained_int4::sparse::Int4JsonSparseLimits>,
 }
@@ -102,6 +104,12 @@ impl BatchArgs {
         // Retain source/snapshot exclusivity, real hardware detection, schema
         // path checks and the extraction-only decoder policy before any IO.
         let mut common = self.extraction.validate_batch_with_prefill(args)?;
+        let encoding = self.extraction.encoding_policy(args, common.max_prompt_tokens)?;
+        let encoding_workspace_bytes = match &encoding {
+            crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback => 0,
+            crate::tokenizer::untrusted::UntrustedEncoding::SafeBpeV1(policy) => policy.requirements()
+                .map_err(|_| CandidateError::Arguments)?.workspace_bytes,
+        };
         let one = match selected_rows {
             Some(rows) => constrained_int4::sparse::planned_work(args.group_width, common.max_prompt_tokens,
                 args.max_new_tokens, rows),
@@ -141,8 +149,8 @@ impl BatchArgs {
             let memory = Int4ExtractionCohortMemoryLimits { max_documents, context_tokens: args.context_tokens,
                 preparation_reserve_bytes, io_reserve_bytes: io_bytes, allocator_reserve_bytes: ALLOCATOR_BYTES,
             };
-            let quote = memory.requirements_for_execution(args.group_width, native, transport,
-                selected_rows, prefill).map_err(|_| CandidateError::Arguments)?;
+            let quote = memory.requirements_for_execution_with_document_encoding(args.group_width, native, transport,
+                selected_rows, prefill, &encoding).map_err(|_| CandidateError::Arguments)?;
             let execution = sum(&[quote.native.kv_bytes, quote.workspace_bytes,
                 quote.input_bytes, quote.output_reservation_bytes])?;
             common.minimum_memory_bytes = grouped_memory_floor(args, common, execution)?;
@@ -153,13 +161,14 @@ impl BatchArgs {
                 times(transport.max_line_bytes as u64, 8)?,
                 times(transport.max_output_line_bytes as u64, 4)?,
                 times(transport.max_epoch_ids as u64, 128)?,
-                transport.max_epoch_id_bytes as u64, preparation_reserve_bytes, io_bytes,
+                transport.max_epoch_id_bytes as u64, preparation_reserve_bytes, io_bytes, encoding_workspace_bytes,
             ])?;
             common.minimum_memory_bytes = sum(&[common.minimum_memory_bytes, corpus_reservation])?;
         }
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(BatchLimits { common, transport, native, output_bytes: stream.max_total_output_bytes,
-            io_bytes, preparation_reserve_bytes, cohort_documents: stream.cohort_documents, selected_rows })
+            io_bytes, preparation_reserve_bytes, encoding_workspace_bytes,
+            cohort_documents: stream.cohort_documents, selected_rows })
     }
 
     fn selected_rows(&self) -> Result<Option<constrained_int4::sparse::Int4JsonSparseLimits>, CandidateError> {

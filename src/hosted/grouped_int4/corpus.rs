@@ -12,10 +12,11 @@ use crate::{
     batch::{self as stream, BatchCode, BatchItemFailure, BatchSummary,
         extract::{ExtractionMaskBudget, grouped_int4::{Int4ExtractionAdmission,
             Int4ExtractionBatchAdmission, Int4ExtractionBatchLimits,
-            Int4ExtractionBatchPlanner, NativeInt4ExtractionBatch}}},
+            Int4ExtractionBatchPlanner, NativeInt4ExtractionBatch, memory::encoding_workspace_bytes}}},
     hosted::corpus::CorpusLimits,
     native_engine::{constrained_int4::{self, sparse::Int4JsonSparseLimits}, kv::KV_BYTES_PER_TOKEN,
         lmhead::NANBEIGE_VOCAB_SIZE, strict_int4::Int4Work},
+    tokenizer::untrusted::UntrustedEncoding,
 };
 
 struct StreamInput<R, W> {
@@ -55,6 +56,8 @@ impl NlpEngine {
     ///
     /// Preparation reservations must price the owned planner, vocabulary and
     /// compiler work; IO reservations must price the supplied reader/writer.
+    /// The planner's fixed compact-encoding workspace is quoted separately and
+    /// automatically retained with the input aggregate for this whole stream.
     /// Both owners move into the blocking invocation and outlive all delivery.
     /// Kernel selection is explicit. Blocking IO remains synchronous, with
     /// cancellation waiting for physical cleanup before this method returns.
@@ -108,7 +111,8 @@ impl NlpEngine {
         constrained_int4::check_model(planner.base_execution_identity(), model.model_identity())
             .map_err(|_| HostedError::ModelIdentity)?;
         let selected_rows = planner.selected_rows();
-        let required = requirements(model.model_identity().group_width(), native_work, limits)?;
+        let required = requirements_with_document_encoding(model.model_identity().group_width(),
+            native_work, limits, planner.document_encoding())?;
         required.check_team_workspace(compute_threads, model.model_identity().group_width())?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
@@ -131,7 +135,7 @@ impl NlpEngine {
                 kv_bytes: required.native.kv_bytes, masks: native_work.masks,
                 output_bytes: limits.transport.max_output_line_bytes as u64, selected_rows };
             let result = {
-                let mut processor = NativeInt4ExtractionBatch::new(
+                let mut processor = NativeInt4ExtractionBatch::new_with_document_encoding(
                     planner, &mut engine.value, &vocabulary, admission, native_work,
                 ).map_err(HostedError::BatchSetup)?;
                 stream::run_ndjson(&mut input.value.reader, &mut input.value.writer,
@@ -159,7 +163,7 @@ impl NlpEngine {
                     kv_bytes: required.native.kv_bytes, masks: native_work.masks,
                     output_bytes: limits.transport.max_output_line_bytes as u64, selected_rows };
                 let completion = {
-                    let mut processor = NativeInt4ExtractionBatch::new(
+                    let mut processor = NativeInt4ExtractionBatch::new_with_document_encoding(
                         planner, &mut engine.value, &vocabulary, admission, native_work,
                     ).map_err(HostedError::BatchSetup)?;
                     stream::deferred::run_ndjson_deferred(&mut input.value.reader, &mut input.value.writer,
@@ -198,6 +202,13 @@ fn requirements(width: usize, work: Int4ExtractionBatchLimits, limits: CorpusLim
     let workspace_bytes = sum(&[native.rope_bytes, native.scratch_payload_bound,
         limits.native.allocator_reserve_bytes])?;
     Ok(Requirements { native, workspace_bytes, input_bytes })
+}
+fn requirements_with_document_encoding(width: usize, work: Int4ExtractionBatchLimits, limits: CorpusLimits,
+    encoding: &UntrustedEncoding) -> Result<Requirements, HostedError> {
+    let mut required = requirements(width, work, limits)?;
+    required.input_bytes = sum(&[required.input_bytes,
+        encoding_workspace_bytes(encoding).map_err(HostedError::BatchSetup)?])?;
+    Ok(required)
 }
 
 struct CorpusAdmission<'a> {

@@ -113,10 +113,10 @@ impl ExtractionArgs {
         if !args.input_encoding.is_default() || args.compute.threads() != 1 { return Err(CandidateError::Arguments); }
         self.validate_one_off_with_prefill(args)
     }
-    /// Resident streams own a fixed output-row policy and may install one
-    /// persistent team. Other composed callers keep their separate validator.
+    /// Resident streams own fixed output-row and input-encoding policies and
+    /// may install one persistent team. Maps/jobs keep their byte-only guard.
     pub(super) fn validate_batch_with_prefill(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
-        if self.max_selected_rows.is_some() || !args.input_encoding.is_default() {
+        if self.max_selected_rows.is_some() {
             return Err(CandidateError::Arguments);
         }
         self.validate_one_off_with_prefill(args)

@@ -18,6 +18,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     // or allocating the runtime, even for an internal programmatic caller.
     let limits = batch.validate(&args)?;
     let common = limits.common;
+    let encoding = batch.extraction.encoding_policy(&args, common.max_prompt_tokens)?;
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
@@ -49,7 +50,9 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         batch.extraction.compiler(), batch.extraction.source_limits(), Some(defaults))
         .and_then(Int4ExtractionBatchPlanner::require_shared_defaults)
         .map_err(|_| CandidateError::Planning)?;
-    let planner = batch.configure_planner(planner)?;
+    let planner = batch.configure_planner(planner)?
+        .with_document_encoding(encoding.clone()).map_err(|_| CandidateError::Planning)?;
+    if planner.document_encoding() != &encoding { return Err(CandidateError::Identity); }
     remaining()?;
     let controls = crate::tokenizer::pinned_controls::pinned().map_err(|_| CandidateError::Identity)?;
     let vocabulary = ExtractionVocabulary::pinned(controls.template_controls())
@@ -80,6 +83,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
             CohortSchedule::new(documents, common.prefill.map(|prefill| prefill.max_batch_rows))),
         max_selected_rows: limits.selected_rows.map(|limits| limits.max_rows_per_step),
         compute_schedule: compute::Schedule::for_threads(common.compute.threads),
+        input_encoding: input_encoding::reported_policy(&encoding),
     };
     // This writer copies the canonical inner event without parsing its JSON
     // numbers. It stages one frame and permanently stops after partial IO.
@@ -146,6 +150,8 @@ struct Provenance<'a> {
     max_selected_rows: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compute_schedule: Option<compute::Schedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<&'a crate::tokenizer::untrusted::UntrustedEncoding>,
 }
 
 #[derive(Serialize)]

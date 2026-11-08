@@ -26,6 +26,7 @@ pub use cohort::{Int4ExtractionCohortBatchLimits, Int4ExtractionCohortBatchStats
 pub struct Int4ExtractionBatchPlanner {
     compiler: ExtractionBatchPlanner, group_width: usize, shared_defaults_only: bool,
     selected_rows: Option<Int4JsonSparseLimits>,
+    document_encoding: UntrustedEncoding,
 }
 pub struct PreparedInt4BatchExtraction {
     plan: Int4ExtractPlan,
@@ -81,10 +82,29 @@ impl Int4ExtractionBatchPlanner {
         defaults: Option<ExtractionBatchArgs>) -> Result<Self, BatchFault> {
         Ok(Self { compiler: ExtractionBatchPlanner::pinned_for_backend(controls, eos, identity,
             ceiling, compiler_limits, source_limits, defaults, ExtractionBackend::Int4 { group_width })?,
-            group_width, shared_defaults_only: false, selected_rows: None })
+            group_width, shared_defaults_only: false, selected_rows: None,
+            document_encoding: UntrustedEncoding::ByteFallback })
     }
     pub fn base_execution_identity(&self) -> &ExecutionIdentity { &self.compiler.identity }
     pub fn group_width(&self) -> usize { self.group_width }
+
+    /// Fix one bounded schema/document encoding for every record in this
+    /// resident stream. Each preparation uses one ledger across both segments;
+    /// callers must admit its transient workspace before preparing any input.
+    /// Complete-document maps and durable recipes retain their byte-only path.
+    pub fn with_document_encoding(mut self, policy: UntrustedEncoding) -> Result<Self, BatchFault> {
+        memory::encoding_workspace_bytes(&policy)?;
+        self.require_byte_encoding()?;
+        self.document_encoding = policy;
+        Ok(self)
+    }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { &self.document_encoding }
+    pub(crate) fn require_byte_encoding(&self) -> Result<(), BatchFault> {
+        if self.document_encoding != UntrustedEncoding::ByteFallback {
+            return Err(BatchCode::Admission.into());
+        }
+        Ok(())
+    }
 
     /// Fix the complete legal-row projection strategy for this ordered stream.
     /// Each actual schema/source plan binds this exact cap before admission;
@@ -99,7 +119,10 @@ impl Int4ExtractionBatchPlanner {
     }
     pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.selected_rows }
     pub(crate) fn check_projection(&self, prepared: &PreparedInt4BatchExtraction) -> Result<(), BatchFault> {
-        if prepared.plan.selected_rows() != self.selected_rows { return Err(BatchCode::Admission.into()); }
+        if prepared.plan.selected_rows() != self.selected_rows
+            || prepared.source.document_encoding() != self.document_encoding() {
+            return Err(BatchCode::Admission.into());
+        }
         Ok(())
     }
 
@@ -111,7 +134,7 @@ impl Int4ExtractionBatchPlanner {
         compiler.identity = bind_candidate_model(compiler.identity.clone(), model)
             .map_err(|_| BatchCode::Admission)?;
         Ok(Self { compiler, group_width: model.group_width(), shared_defaults_only: self.shared_defaults_only,
-            selected_rows: self.selected_rows })
+            selected_rows: self.selected_rows, document_encoding: self.document_encoding.clone() })
     }
 
     /// Seal a shared schema/grounding/budget policy for the whole input stream.
@@ -127,12 +150,16 @@ impl Int4ExtractionBatchPlanner {
     /// new deadline, poll quota or no-op controller is installed here.
     pub fn prepare_with_control<C: DecodeStepControl>(&self, document: BatchDocument<ExtractionBatchArgs>,
         control: &mut C) -> Result<PreparedInt4BatchExtraction, BatchItemFailure> {
+        if self.document_encoding != UntrustedEncoding::ByteFallback {
+            return self.prepare_with_document_encoding(document, &self.document_encoding, control);
+        }
         checkpoint(control)?;
         let result = self.prepare(document);
         checkpoint(control)?;
         result
     }
     pub fn prepare(&self, document: BatchDocument<ExtractionBatchArgs>) -> Result<PreparedInt4BatchExtraction, BatchItemFailure> {
+        self.require_byte_encoding().map_err(BatchItemFailure::reject)?;
         if self.shared_defaults_only && document.task_args.is_some() {
             return Err(BatchItemFailure::reject(BatchCode::InvalidEnvelope));
         }
@@ -142,11 +169,14 @@ impl Int4ExtractionBatchPlanner {
     /// Explicit one-request schema/source encoding. One nonrenewable ledger
     /// spans both untrusted segments; selected-row planning remains independent.
     /// The caller admits the policy's tokenizer workspace before preparation.
-    /// No encoding policy is installed in map, corpus or durable-job factories.
+    /// A configured compact stream cannot substitute a different policy here.
     pub fn prepare_with_document_encoding<C: DecodeStepControl>(&self,
         document: BatchDocument<ExtractionBatchArgs>, policy: &UntrustedEncoding, control: &mut C,
     ) -> Result<PreparedInt4BatchExtraction, BatchItemFailure> {
         checkpoint(control)?;
+        if self.document_encoding != UntrustedEncoding::ByteFallback && policy != self.document_encoding() {
+            return Err(BatchItemFailure::reject(BatchCode::Admission));
+        }
         if self.shared_defaults_only && document.task_args.is_some() {
             return Err(BatchItemFailure::reject(BatchCode::InvalidEnvelope));
         }
@@ -213,6 +243,7 @@ fn planning_failure(error: Int4ExtractError) -> BatchItemFailure {
 mod tests {
     use super::*;
     mod encoding;
+    mod stream_encoding;
     mod selected;
     use crate::{artifact::converter::PINNED_REVISION,
         native_engine::{decode::DecodeCancellationKind, generation::grouped_int4::INT4_SOURCE_FORMAT,

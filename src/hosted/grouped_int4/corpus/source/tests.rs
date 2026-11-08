@@ -2,6 +2,7 @@
 //! Synthetic identities exercise policy only; no fixture supplies model or
 //! inference authority to the public resident-engine entrypoint.
 use super::*;
+mod encoding;
 use crate::{
     artifact::converter::PINNED_REVISION,
     batch::BatchLimits,

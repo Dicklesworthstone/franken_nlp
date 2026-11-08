@@ -1,6 +1,7 @@
 use super::*;
 use std::{io::Cursor, sync::Mutex};
 mod team;
+mod encoding;
 
 fn command(extra: &[&str]) -> Int4Command {
     let mut argv = vec!["candidate", "source-int4", "extract-batch",
@@ -41,7 +42,7 @@ fn extraction_stream_provenance_preserves_exact_inner_json_and_snapshot_identity
         candidate_format: "fnlp-int4-source-candidate-v1", quant_recipe: "fixture:group=128",
         group_width: 128, integer_kernel: "s_scalar_i32", task: "extract",
         snapshot: Some(SnapshotRecord::new("loaded", need)),
-        cohort_schedule: None, max_selected_rows: None, compute_schedule: None,
+        cohort_schedule: None, max_selected_rows: None, compute_schedule: None, input_encoding: None,
     };
     // A transport fixture, not a fabricated inference result. The exact inner
     // bytes remain intact even if a consumer cannot represent this number.
@@ -65,7 +66,7 @@ fn extraction_stream_provenance_preserves_exact_inner_json_and_snapshot_identity
     assert_eq!(value["snapshot"]["format"], INT4_SNAPSHOT_VERSION);
     assert_eq!(value["snapshot"]["file_bytes"], need.file_bytes);
     for absent in ["logical_model_sha256", "prompt_digest", "schema_digest", "taskir_digest",
-        "source_dir", "source_manifest", "schema", "snapshot_path", "max_selected_rows", "compute_schedule"] {
+        "source_dir", "source_manifest", "schema", "snapshot_path", "max_selected_rows", "compute_schedule", "input_encoding"] {
         assert!(value.get(absent).is_none());
     }
     provenance.max_selected_rows = Some(7);

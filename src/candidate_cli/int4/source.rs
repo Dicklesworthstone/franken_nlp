@@ -102,10 +102,10 @@ impl SourceArgs {
             || args.compute.threads() != 1 { return Err(CandidateError::Arguments); }
         self.validate_with_prefill(args)
     }
-    /// Only resident source streams bind their own selected-row policy and
-    /// execute a persistent team. Maps and durable jobs retain their guard.
+    /// Resident streams bind their input encoding and selected-row policy and
+    /// may execute a persistent team. Maps and durable jobs retain their guard.
     pub(super) fn validate_batch_with_prefill(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
-        if self.max_selected_rows.is_some() || !args.input_encoding.is_default() {
+        if self.max_selected_rows.is_some() {
             return Err(CandidateError::Arguments);
         }
         self.validate_with_prefill(args)

@@ -3,9 +3,20 @@ use super::Int4ExtractionBatchLimits;
 use crate::{batch::{BatchCode, BatchFault, BatchLimits},
     native_engine::{constrained_int4::{cohort::required_workspace_bytes, sparse::Int4JsonSparseLimits},
         lmhead::NANBEIGE_VOCAB_SIZE,
-        strict_int4::{Int4MemoryRequirement, cohort::MAX_INT4_SEQUENCES, prefill::Int4PrefillLimits}}};
+        strict_int4::{Int4MemoryRequirement, cohort::MAX_INT4_SEQUENCES, prefill::Int4PrefillLimits}},
+    tokenizer::untrusted::UntrustedEncoding};
 
 pub const MAX_COHORT_RESULT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// One transient encoder for sequential preparation, including a cohort's
+/// lookahead. Retained token vectors remain in the ordinary preparation quote.
+pub fn encoding_workspace_bytes(encoding: &UntrustedEncoding) -> Result<u64, BatchFault> {
+    match encoding {
+        UntrustedEncoding::ByteFallback => Ok(0),
+        UntrustedEncoding::SafeBpeV1(limits) => limits.requirements()
+            .map(|required| required.workspace_bytes).map_err(|_| BatchCode::InvalidLimits.into()),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Int4ExtractionCohortMemoryLimits {
@@ -55,6 +66,19 @@ impl Int4ExtractionCohortMemoryLimits {
     pub fn requirements_for_execution(self, width: usize, work: Int4ExtractionBatchLimits,
         transport: BatchLimits, selected_rows: Option<Int4JsonSparseLimits>,
         prefill: Option<Int4PrefillLimits>) -> Result<Int4ExtractionCohortMemoryRequirement, BatchFault> {
+        self.requirements_for_execution_with_document_encoding(width, work, transport, selected_rows,
+            prefill, &UntrustedEncoding::ByteFallback)
+    }
+
+    /// Price the actual immutable record encoding together with projection and
+    /// scheduling. Preparation is serial even when N plans and one lookahead
+    /// remain live, so tokenizer scratch is charged once for the entire stream.
+    #[allow(clippy::too_many_arguments)]
+    pub fn requirements_for_execution_with_document_encoding(self, width: usize, work: Int4ExtractionBatchLimits,
+        transport: BatchLimits, selected_rows: Option<Int4JsonSparseLimits>,
+        prefill: Option<Int4PrefillLimits>, encoding: &UntrustedEncoding)
+        -> Result<Int4ExtractionCohortMemoryRequirement, BatchFault> {
+        let encoding_workspace = encoding_workspace_bytes(encoding)?;
         let rows_per_token = match selected_rows {
             Some(limits) => limits.validate().map_err(|_| BatchCode::InvalidLimits)? as u64,
             None => NANBEIGE_VOCAB_SIZE as u64,
@@ -93,6 +117,7 @@ impl Int4ExtractionCohortMemoryLimits {
             multiply(transport.max_output_line_bytes as u64, 4)?,
             multiply(transport.max_epoch_ids as u64, 128)?, transport.max_epoch_id_bytes as u64,
             multiply(self.preparation_reserve_bytes, preparations)?, self.io_reserve_bytes, decode_workspace_bytes,
+            encoding_workspace,
         ])?;
         // Exactly the host's per-document output_claim model, retained for
         // every result until the last physical writer flush in this window.

@@ -61,6 +61,14 @@ impl<'e, 'weights, 'v, A: Int4ExtractionBatchAdmission> NativeInt4ExtractionBatc
     pub fn new(compiler: Int4ExtractionBatchPlanner, engine: &'e mut StrictInt4Engine<'weights>,
         vocabulary: &'v ExtractionVocabulary, admission: A, limits: Int4ExtractionBatchLimits)
         -> Result<Self, BatchFault> {
+        compiler.require_byte_encoding()?;
+        Self::new_with_document_encoding(compiler, engine, vocabulary, admission, limits)
+    }
+    /// Explicit policy-aware stream. The caller retains the fixed encoding's
+    /// workspace along with planner, vocabulary and ordinary input storage.
+    pub fn new_with_document_encoding(compiler: Int4ExtractionBatchPlanner, engine: &'e mut StrictInt4Engine<'weights>,
+        vocabulary: &'v ExtractionVocabulary, admission: A, limits: Int4ExtractionBatchLimits)
+        -> Result<Self, BatchFault> {
         limits.validate()?;
         if engine.is_poisoned() || !engine.kv_cache().all_slots_have_len(0) {
             return Err(BatchCode::InvalidExecution.into());

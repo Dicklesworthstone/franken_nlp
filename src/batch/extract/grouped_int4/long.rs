@@ -252,6 +252,7 @@ impl Int4ExtractionBatchPlanner {
         args: &ExtractionBatchArgs, limits: Int4ExtractionMapLimits, control: &mut C)
         -> Result<PreparedInt4ExtractionMap<'s>, Int4ExtractionMapError> {
         step(control)?;
+        self.require_byte_encoding().map_err(|_| Int4ExtractionMapError::Admission)?;
         limits.root_array_workspace_bytes()?;
         if source.is_empty() { return Err(Int4ExtractionMapError::EmptySource); }
         let b = args.budget; let c = &self.compiler; let m = limits.mapping; let v = limits.verification;

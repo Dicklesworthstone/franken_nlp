@@ -11,6 +11,7 @@ use crate::{artifact::converter::PINNED_REVISION, execution_identity::Sha256Dige
     tokenizer::{embedded::EmbeddedTokenizer, pinned_controls}};
 
 mod selected;
+mod encoding;
 
 pub(super) fn planner() -> SourceTaskPlanner {
     let tokenizer = EmbeddedTokenizer::pinned().unwrap();

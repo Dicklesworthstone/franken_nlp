@@ -11,6 +11,7 @@ use crate::{
             StrictInt4Error, STRICT_INT4_PROFILE}},
     tasks::{extract::grouped_int4::Int4ExtractError,
         source_planning::grouped_int4::{Int4SourceError, Int4SourceTaskRun, PreparedInt4SourceTask}},
+    tokenizer::untrusted::UntrustedEncoding,
 };
 // The quantities and ownership contract are identical to schema extraction.
 // Reuse the existing host authority; do not require a second permit provider.
@@ -32,7 +33,7 @@ pub mod memory {
     pub use crate::batch::extract::grouped_int4::memory::{
         Int4ExtractionCohortMemoryLimits as Int4SourceCohortMemoryLimits,
         Int4ExtractionCohortMemoryRequirement as Int4SourceCohortMemoryRequirement,
-        MAX_COHORT_RESULT_BYTES,
+        encoding_workspace_bytes, MAX_COHORT_RESULT_BYTES,
     };
 }
 
@@ -46,13 +47,28 @@ pub struct Int4SourceBatchPlanner<'p> {
     selected_rows: Option<Int4JsonSparseLimits>,
 }
 impl<'p> Int4SourceBatchPlanner<'p> {
+    /// Byte-only factory retained for existing map and durable-job recipes.
     pub fn new(planner: &'p SourceTaskPlanner, identity: ExecutionIdentity, ceiling: TaskBudget,
         limits: SourcePlanningLimits, defaults: Option<SourceBatchArgs>, group_width: usize) -> Result<Self, BatchFault> {
         check_configuration(planner, &identity, ceiling, limits, defaults.as_ref(), group_width)?;
         Ok(Self { planner, identity, ceiling, limits, defaults, group_width, selected_rows: None })
     }
+
+    /// Explicitly prepare a resident stream with the source planner's immutable
+    /// encoding policy. One ledger spans every untrusted segment of each record,
+    /// including QA question, passage manifest and ordered passage text. The
+    /// caller reserves the exact encoder workspace before preparing records.
+    pub fn new_with_document_encoding(planner: &'p SourceTaskPlanner, identity: ExecutionIdentity, ceiling: TaskBudget,
+        limits: SourcePlanningLimits, defaults: Option<SourceBatchArgs>, group_width: usize) -> Result<Self, BatchFault> {
+        check_configuration_with_document_encoding(planner, &identity, ceiling, limits, defaults.as_ref(), group_width)?;
+        Ok(Self { planner, identity, ceiling, limits, defaults, group_width, selected_rows: None })
+    }
     pub fn base_execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     pub fn group_width(&self) -> usize { self.group_width }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { self.planner.document_encoding() }
+    pub(crate) fn require_byte_encoding(&self) -> Result<(), BatchFault> {
+        require_byte_encoding(self.planner)
+    }
     /// Fix the complete legal-row projection policy for this ordered stream.
     /// Every source plan binds the cap and its original built-in finalizer;
     /// per-record options cannot replace this policy or omit a legal token.
@@ -63,6 +79,16 @@ impl<'p> Int4SourceBatchPlanner<'p> {
         Ok(self)
     }
     pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.selected_rows }
+    pub(crate) fn check_projection(&self, prepared: &PreparedInt4SourceTask) -> Result<(), BatchFault> {
+        let identity = prepared.execution_identity();
+        if prepared.selected_rows() != self.selected_rows
+            || identity.template_digest != self.identity.template_digest
+            || identity.tokenizer_digest != self.identity.tokenizer_digest
+            || identity.task_spec != self.identity.task_spec {
+            return Err(BatchCode::Admission.into());
+        }
+        Ok(())
+    }
     pub fn prepare_with_control<C: DecodeStepControl>(&self, document: BatchDocument<SourceBatchArgs>,
         control: &mut C) -> Result<PreparedInt4SourceTask, BatchItemFailure> {
         checkpoint(control)?;
@@ -86,6 +112,19 @@ impl<'p> Int4SourceBatchPlanner<'p> {
 pub(crate) fn check_configuration(planner: &SourceTaskPlanner, identity: &ExecutionIdentity,
     ceiling: TaskBudget, limits: SourcePlanningLimits, defaults: Option<&SourceBatchArgs>,
     group_width: usize) -> Result<(), BatchFault> {
+    require_byte_encoding(planner)?;
+    check_configuration_with_document_encoding(planner, identity, ceiling, limits, defaults, group_width)
+}
+fn require_byte_encoding(planner: &SourceTaskPlanner) -> Result<(), BatchFault> {
+    if planner.document_encoding() != &UntrustedEncoding::ByteFallback {
+        return Err(BatchCode::Admission.into());
+    }
+    Ok(())
+}
+pub(crate) fn check_configuration_with_document_encoding(planner: &SourceTaskPlanner, identity: &ExecutionIdentity,
+    ceiling: TaskBudget, limits: SourcePlanningLimits, defaults: Option<&SourceBatchArgs>,
+    group_width: usize) -> Result<(), BatchFault> {
+    memory::encoding_workspace_bytes(planner.document_encoding())?;
     identity.validate().map_err(|_| BatchCode::Admission)?;
     constrained_int4::check_profile(identity, group_width).map_err(|_| BatchCode::Admission)?;
     ceiling.validate().map_err(|_| BatchCode::InvalidLimits)?;
@@ -118,6 +157,13 @@ pub struct NativeInt4SourceBatch<'p, 'e, 'weights, 'v, A: Int4SourceBatchAdmissi
 }
 impl<'p, 'e, 'weights, 'v, A: Int4SourceBatchAdmission> NativeInt4SourceBatch<'p, 'e, 'weights, 'v, A> {
     pub fn new(compiler: Int4SourceBatchPlanner<'p>, engine: &'e mut StrictInt4Engine<'weights>,
+        vocabulary: &'v ExtractionVocabulary, admission: A, limits: Int4SourceBatchLimits) -> Result<Self, BatchFault> {
+        compiler.require_byte_encoding()?;
+        Self::new_with_document_encoding(compiler, engine, vocabulary, admission, limits)
+    }
+    /// The caller retains the planner policy's encoder workspace through the
+    /// complete stream, alongside the ordinary input and native reservations.
+    pub fn new_with_document_encoding(compiler: Int4SourceBatchPlanner<'p>, engine: &'e mut StrictInt4Engine<'weights>,
         vocabulary: &'v ExtractionVocabulary, admission: A, limits: Int4SourceBatchLimits) -> Result<Self, BatchFault> {
         validate_limits(limits)?;
         // Bind before accepting any record; profile-compatible fabricated or
@@ -164,6 +210,11 @@ impl<A: Int4SourceBatchAdmission> BatchProcessor for NativeInt4SourceBatch<'_, '
     }
     fn execute_with_context<C: DecodeStepControl>(&mut self, prepared: Self::Prepared, context: BatchRequestContext,
         control: &mut C) -> Result<Self::Output, BatchItemFailure> {
+        self.run.ready()?;
+        if let Err(fault) = self.compiler.check_projection(&prepared) {
+            self.run.failed = true;
+            return Err(BatchItemFailure::fatal(fault));
+        }
         execute_admitted(prepared, &mut self.driver, &mut self.admission, &mut self.run, context, control)
     }
 }

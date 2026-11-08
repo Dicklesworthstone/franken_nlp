@@ -39,6 +39,15 @@ impl<'p, 'w, 'v, A: Int4SourceBatchAdmission> NativeInt4SourceCohortBatch<'p, 'w
     pub fn new(compiler: Int4SourceBatchPlanner<'p>, weights: &'w Int4ModelWeights,
         vocabulary: &'v ExtractionVocabulary, admission: A, work: Int4SourceBatchLimits,
         limits: Int4SourceCohortBatchLimits, kernel: PackedInt4Kernel) -> Result<Self, BatchFault> {
+        compiler.require_byte_encoding()?;
+        Self::new_with_document_encoding(compiler, weights, vocabulary, admission, work, limits, kernel)
+    }
+    /// Explicit policy-aware preparation with one charged encoder workspace,
+    /// independent of the retained window and lookahead preparation storage.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_document_encoding(compiler: Int4SourceBatchPlanner<'p>, weights: &'w Int4ModelWeights,
+        vocabulary: &'v ExtractionVocabulary, admission: A, work: Int4SourceBatchLimits,
+        limits: Int4SourceCohortBatchLimits, kernel: PackedInt4Kernel) -> Result<Self, BatchFault> {
         work.validate()?; limits.validate(compiler.group_width())?;
         constrained_int4::check_model(compiler.base_execution_identity(), weights.identity())
             .map_err(|_| BatchCode::Admission)?;
@@ -55,8 +64,18 @@ impl<'p, 'w, 'v, A: Int4SourceBatchAdmission> NativeInt4SourceCohortBatch<'p, 'w
         vocabulary: &'v ExtractionVocabulary, admission: A, work: Int4SourceBatchLimits,
         limits: Int4SourceCohortBatchLimits, kernel: PackedInt4Kernel, prefill: Int4PrefillLimits)
         -> Result<Self, BatchFault> {
+        compiler.require_byte_encoding()?;
+        Self::new_packed_with_document_encoding(compiler, weights, vocabulary, admission, work, limits, kernel, prefill)
+    }
+    /// Both optional workspaces remain charged once per stream. Record policy
+    /// and every native/mask ledger remain unchanged at flush boundaries.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_packed_with_document_encoding(compiler: Int4SourceBatchPlanner<'p>, weights: &'w Int4ModelWeights,
+        vocabulary: &'v ExtractionVocabulary, admission: A, work: Int4SourceBatchLimits,
+        limits: Int4SourceCohortBatchLimits, kernel: PackedInt4Kernel, prefill: Int4PrefillLimits)
+        -> Result<Self, BatchFault> {
         prefill.validate().map_err(|_| BatchCode::InvalidLimits)?;
-        let mut processor = Self::new(compiler, weights, vocabulary, admission, work, limits, kernel)?;
+        let mut processor = Self::new_with_document_encoding(compiler, weights, vocabulary, admission, work, limits, kernel)?;
         processor.prefill = Some(prefill);
         Ok(processor)
     }
@@ -78,6 +97,7 @@ impl<'p, 'w, 'v, A: Int4SourceBatchAdmission> NativeInt4SourceCohortBatch<'p, 'w
         for request in &requests {
             if !Arc::ptr_eq(&request.prepared.seal, &self.seal) { return Err(BatchCode::Admission.into()); }
             let prepared = &request.prepared.prepared;
+            self.compiler.check_projection(prepared)?;
             let (context, kv) = price_plan(prepared, self.limits).map_err(|error| error.fault)?;
             let row = prepared.planned_work();
             work = work.checked_add(row).map_err(native_error)?;

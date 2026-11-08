@@ -2,6 +2,7 @@ use super::*;
 use std::{io::Cursor, sync::Mutex};
 use crate::tasks::{answer::{AnswerOptions, AnswerPassage}, ner::EntityType};
 mod team;
+mod encoding;
 
 struct NoIo;
 impl Read for NoIo {
@@ -59,7 +60,7 @@ fn every_source_task_stream_preserves_inner_spans_and_explicit_snapshot_provenan
             candidate_format: "fnlp-int4-source-candidate-v1", quant_recipe: "fixture:group=128",
             group_width: 128, integer_kernel: "s_scalar_i32", task,
             snapshot: Some(SnapshotRecord::new("loaded", need)),
-            cohort_schedule: None, max_selected_rows: None, compute_schedule: None,
+            cohort_schedule: None, max_selected_rows: None, compute_schedule: None, input_encoding: None,
         };
         // Publication fixture only: it is not neural inference authority.
         let inner = "{\"event\":\"fixture\",\"text\":\"上海\",\"byte_start\":4,\"scalar_start\":3,\"exact\":12345678901234567890123456789012345678}\n";
@@ -81,7 +82,7 @@ fn every_source_task_stream_preserves_inner_spans_and_explicit_snapshot_provenan
         assert_eq!(value["snapshot"]["format"], INT4_SNAPSHOT_VERSION);
         assert_eq!(value["snapshot"]["file_bytes"], need.file_bytes);
         for absent in ["source_dir", "source_manifest", "snapshot_path", "defaults_path", "prompt_digest", "taskir_digest",
-            "cohort_schedule", "max_selected_rows", "compute_schedule"] {
+            "cohort_schedule", "max_selected_rows", "compute_schedule", "input_encoding"] {
             assert!(value.get(absent).is_none());
         }
     }
@@ -100,7 +101,7 @@ fn source_schedule_provenance_declares_policy_without_private_bindings_or_work_c
             source_root_sha256: "fixture-source", model_content_sha256: "fixture-content",
             candidate_format: "fnlp-int4-source-candidate-v1", quant_recipe: "fixture:group=128",
             group_width: 128, integer_kernel: "s_scalar_i32", task, snapshot: None, cohort_schedule: None,
-            max_selected_rows: None, compute_schedule: None,
+            max_selected_rows: None, compute_schedule: None, input_encoding: None,
         };
         let serial = serde_json::to_value(&provenance).unwrap();
         provenance.max_selected_rows = Some(7);

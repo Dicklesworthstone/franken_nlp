@@ -67,8 +67,8 @@ impl NlpEngine {
             io_reserve_bytes: limits.io_reserve_bytes,
             allocator_reserve_bytes: limits.native.allocator_reserve_bytes,
         };
-        let required = memory.requirements_for_execution(planner.group_width(), native_work,
-            limits.transport, selected_rows, prefill).map_err(HostedError::BatchSetup)?;
+        let required = memory.requirements_for_execution_with_document_encoding(planner.group_width(), native_work,
+            limits.transport, selected_rows, prefill, planner.document_encoding()).map_err(HostedError::BatchSetup)?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(StreamInput { preparation: Some((planner, vocabulary)), reader, writer }))?;
@@ -95,9 +95,9 @@ impl NlpEngine {
                 context_limit: limits.native.context_tokens, masks: native_work.masks,
                 output_bytes: limits.transport.max_output_line_bytes as u64, selected_rows };
             let mut processor = match prefill {
-                Some(prefill) => NativeInt4ExtractionCohortBatch::new_packed(planner, &model.inner.loaded.value,
+                Some(prefill) => NativeInt4ExtractionCohortBatch::new_packed_with_document_encoding(planner, &model.inner.loaded.value,
                     &vocabulary, admission, native_work, native, kernel, prefill),
-                None => NativeInt4ExtractionCohortBatch::new(planner, &model.inner.loaded.value,
+                None => NativeInt4ExtractionCohortBatch::new_with_document_encoding(planner, &model.inner.loaded.value,
                     &vocabulary, admission, native_work, native, kernel),
             }.map_err(HostedError::BatchSetup)?;
             let result = grouped::run_ndjson(&mut input.value.reader, &mut input.value.writer,

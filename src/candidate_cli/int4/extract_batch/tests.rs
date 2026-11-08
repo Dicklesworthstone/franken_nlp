@@ -2,6 +2,7 @@ use super::*;
 use crate::native_engine::lmhead::NANBEIGE_VOCAB_SIZE;
 mod selected;
 mod prefill;
+mod encoding;
 
 fn matches(extra: &[&str]) -> clap::ArgMatches {
     let mut argv = vec!["extract-batch", "--source-dir", "explicit-source",
@@ -14,6 +15,7 @@ fn arguments(extra: &[&str]) -> (BatchArgs, Int4Args) {
     let matches = matches(extra);
     let mut args = Int4Args::from_arg_matches(&matches).unwrap();
     args.compute = compute::Args::from_matches(&matches).unwrap();
+    args.input_encoding = input_encoding::InputEncodingArgs::from_matches(&matches).unwrap();
     (BatchArgs::from_matches(&matches).unwrap(), args)
 }
 struct NoRead;

@@ -15,6 +15,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     // Internal callers cannot reuse a quote after changing options or model.
     let limits = batch.validate(&args)?;
     let common = limits.common;
+    let encoding = args.input_encoding.policy(args.max_input_bytes, common.max_prompt_tokens)?;
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
@@ -44,6 +45,8 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let model = super::super::runtime::load_model(&engine, &args, common, remaining()?, cancellation.clone())?;
     remaining()?;
     let (planner, vocabulary) = source::planner()?;
+    let planner = planner.with_document_encoding(encoding.clone()).map_err(|_| CandidateError::Planning)?;
+    if planner.document_encoding() != &encoding { return Err(CandidateError::Identity); }
     remaining()?;
     let identity = source::identity(model.model_identity(), &planner, source::task(batch.kind))?;
     let config = Int4SourceCorpusConfig { identity: identity.clone(), task_ceiling: budget,
@@ -71,6 +74,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
             CohortSchedule::new(documents, common.prefill.map(|prefill| prefill.max_batch_rows))),
         max_selected_rows: limits.selected_rows.map(|limits| limits.max_rows_per_step),
         compute_schedule: compute::Schedule::for_threads(common.compute.threads),
+        input_encoding: input_encoding::reported_policy(&encoding),
     };
     let writer = CandidateWriter::new(output, &provenance, limits.transport.max_output_line_bytes, limits.output_bytes)?;
     let corpus = CorpusLimits {
@@ -122,6 +126,8 @@ struct Provenance<'a> {
     max_selected_rows: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compute_schedule: Option<compute::Schedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<&'a crate::tokenizer::untrusted::UntrustedEncoding>,
 }
 #[derive(Serialize)]
 struct CohortSchedule {

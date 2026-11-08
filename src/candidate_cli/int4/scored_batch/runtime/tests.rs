@@ -162,7 +162,9 @@ fn compact_policy_is_reported_on_records_flush_and_empty_completion_without_rewr
         let mut output = Vec::new();
         {
             let mut writer = CandidateWriter::new(&mut output, &provenance, 4096, 16384).unwrap();
-            writer.write_all(records.as_bytes()).unwrap(); writer.flush().unwrap();
+            for frame in records.split_inclusive('\n') {
+                writer.write_all(frame.as_bytes()).unwrap(); writer.flush().unwrap();
+            }
         }
         let output = std::str::from_utf8(&output).unwrap();
         assert_eq!(output.lines().count(), records.lines().count());
