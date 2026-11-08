@@ -57,6 +57,8 @@
 > Complete-document answers support [final evidence synthesis](#int4-neural-answer-synthesis)
 > and [explicit hierarchical answer synthesis](#int4-hierarchical-answer-synthesis)
 > when the collected quotations exceed one context.
+> Native `eval` and `qualify` routes also support
+> [held-out sentiment ratings and paired model comparison](#native-int4-sentiment-evaluation-and-comparison).
 > Candidate results retain their explicit provenance; build verification,
 > model quality and release qualification remain separate pending gates.
 > The top-level task, batch and job examples below remain the disclosed 1.0
@@ -497,10 +499,12 @@ fnlp candidate source-int4 sentiment sentiment.json \
 ```
 
 These one-off scored routes reserve the encoder workspace before private IO and
-report the complete selected policy in `input_encoding`. Classification and
-sentiment maps, corpora, retained jobs and other scored routes retain their
-byte-based planning contract. The compact policy is a separate input profile;
-its task quality and model behavior require their own evaluation.
+report the complete selected policy in `input_encoding`. Resident
+[`score-batch` classification and sentiment](#implemented-candidate-int4-scoring-batches)
+also accept this policy, with a fresh tokenizer allowance per complete record.
+Maps, corpora and retained jobs retain their byte-based planning contract. The
+compact policy is a separate input profile; its task quality and model behavior
+require their own evaluation.
 
 Library
 callers can select the same contract with `with_document_encoding` on
@@ -4080,6 +4084,98 @@ for complete suite, case, gate and protected-key examples. Regression and
 ignored native-model fixtures accompany this candidate implementation;
 compilation, executable tests and model-quality evidence remain pending the
 controller-selected DSR and separate model-present gates.
+
+## Native INT4 sentiment evaluation and comparison
+
+`fnlp eval native-sentiment-int4` runs the native dimensional sentiment scorer
+against a frozen suite of human-rated documents.
+`fnlp qualify native-sentiment-int4` compares two independently pinned snapshots
+on that same population, axes and abstention policy. These commands require
+`asupersync-runtime`; `--schema` describes the complete suite, case, gate and
+report contracts without opening private files or loading a model.
+
+```bash
+fnlp eval native-sentiment-int4 --schema
+
+fnlp eval native-sentiment-int4 \
+  --suite sentiment-suite.json --cases sentiment-cases.ndjson \
+  --snapshot candidate.int4.snapshot --expected-model-sha256 "$CANDIDATE_SHA256" \
+  --memory-mib 32768 --key-file receipt.key --key-id local-eval \
+  --namespace support-sentiment --output sentiment-evaluation.json
+
+fnlp qualify native-sentiment-int4 \
+  --suite sentiment-suite.json --cases sentiment-cases.ndjson \
+  --snapshot candidate.int4.snapshot --expected-model-sha256 "$CANDIDATE_SHA256" \
+  --baseline-snapshot baseline.int4.snapshot --baseline-model-sha256 "$BASELINE_SHA256" \
+  --memory-mib 32768 --key-file receipt.key --key-id local-eval \
+  --namespace support-sentiment --host-scope declared-local-host \
+  --gates sentiment-gates.json --output sentiment-qualification.json
+```
+
+The suite selects any nonempty subset of `valence`, `arousal`, `dominance` and
+`approach`, fixes `minimum_peak_weight_ppm` and
+`maximum_normalized_entropy_ppm`, and pins the exact NDJSON bytes with
+`expected_input_sha256`. All development, calibration and locked-test splits
+must be nonempty, with distinct IDs and globally unique source texts. Every
+declared ID must occur exactly once, with one human rating for every requested
+axis. The complete input is validated before either model snapshot is opened;
+only locked-test documents execute. IDs, split names and human ratings never
+enter model prompts.
+
+Each NDJSON case contains `schema_version`, `id`, `split`, `text` and `gold`.
+For a suite requesting valence and arousal, a case has this shape:
+
+```json
+{"schema_version":1,"id":"heldout-001","split":"locked_test","text":"The replacement arrived promptly and works well.","gold":[{"axis":"valence","value_milli":750},{"axis":"arousal","value_milli":-250}]}
+```
+
+`value_milli` is an exact integer in `-1000..1000`, divided by 1000 for the
+implemented sentiment task's normalized `-1..1` coordinate. Human ratings can
+fall between the model's five bins and are not rounded. This coordinate is
+separate from the planned `-100..100` focus-preset interface described earlier.
+
+Every axis reports all-document MAE and RMSE, tie-aware Spearman correlation,
+estimated coverage and MAE restricted to estimated documents. All-document
+error includes the distribution means of abstained documents, so abstention
+cannot silently remove hard cases. Constant prediction or gold vectors yield
+an explicit undefined-rank status. Error and coverage intervals resample whole
+documents; all axes and both comparison arms reuse identical seeded draws.
+Axes never count as additional independent samples. Spearman is a point
+estimate only. The minimum held-out population defaults to 20 documents and
+can be set as low as 5; smaller populations yield typed `insufficient_data`.
+`--max-bootstrap-draws` covers the aggregate work across all axes and arms.
+
+Qualification applies every requested gate separately to every axis. For
+example, this gate file requires no increase in MAE or RMSE and no decrease in
+estimated coverage:
+
+```json
+{"schema_version":1,"max_mae_increase":0,"max_rmse_increase":0,"max_coverage_decrease":0}
+```
+
+Optional `max_spearman_decrease` and `max_estimated_mae_increase` gates can be
+added; an undefined requested metric fails its gate. Negative bounds require
+improvement. Gates use explicit per-axis point estimates, while reports also
+retain paired changes and document-bootstrap intervals. These thresholds are
+caller decisions, and passing them does not calibrate or activate a model.
+
+One native work ledger and original deadline cover every document, axis and
+both comparison arms. Admission includes both resident snapshots, one reusable
+native engine, complete prepared heads, retained replay values, rank/bootstrap
+workspace and report staging. The independent collector rechecks every
+candidate score, scored EOS, model and execution identity, distribution moment
+and policy abstention. Private source text, individual ratings, row IDs and
+raw content digests leave only keyed commitments. Guarded output stays charged
+through protected create-new publication and final flush.
+
+Library callers use `assay::native_sentiment::Dataset`,
+`Int4SentimentAssayHostLimits::requirements`,
+`NlpEngine::evaluate_int4_sentiment` and `NlpEngine::qualify_int4_sentiment`.
+Reports remain `AuditOnly` with `activation_authority=false`. The estimates
+describe model outputs against caller-supplied human ratings; they do not
+measure hidden mental states. Regression definitions accompany this candidate
+implementation. Compilation, executable regressions, model replay and task
+quality remain pending the controller-owned DSR and model-present gates.
 
 ## Installation
 

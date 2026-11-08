@@ -331,6 +331,7 @@ pub(in crate::assay_cli) fn host_failure(error: HostedError) -> Failure {
         },
         HostedError::Int4(Int4HostError::SourceTask(error)) => source_failure(error),
         HostedError::Int4(Int4HostError::Judge(error)) => judge_failure(error),
+        HostedError::Int4(Int4HostError::Sentiment(error)) => sentiment_failure(error),
         HostedError::Int4(Int4HostError::Extraction(error)) => int4_extraction_failure(error),
         HostedError::Int4(Int4HostError::Native(StrictInt4Error::Cancelled(kind))) => cancelled(kind),
         HostedError::Int4(Int4HostError::Native(StrictInt4Error::Work)) =>
@@ -341,6 +342,31 @@ pub(in crate::assay_cli) fn host_failure(error: HostedError) -> Failure {
         HostedError::ModelIdentity | HostedError::ResourceDomain =>
             Failure::new(ErrorCode::ArtifactIntegrityOrFormatOrVersion, "native_model_identity"),
         _ => Failure::new(ErrorCode::Generic, "native_execution_failed"),
+    }
+}
+
+fn sentiment_failure(error: crate::tasks::sentiment::grouped_int4::Int4SentimentError) -> Failure {
+    use crate::tasks::sentiment::{SentimentError, SentimentPlanningError, grouped_int4::Int4SentimentError};
+    match error {
+        Int4SentimentError::WorkBudget | Int4SentimentError::Task(SentimentError::LimitExceeded(_))
+            | Int4SentimentError::Planning(SentimentPlanningError::Task(SentimentError::LimitExceeded(_))) =>
+            Failure::new(ErrorCode::BudgetOrTimeout, "native_sentiment_work_budget"),
+        Int4SentimentError::Allocation | Int4SentimentError::OutputBudget
+            | Int4SentimentError::Planning(SentimentPlanningError::Budget | SentimentPlanningError::AllocationRefused
+                | SentimentPlanningError::Task(SentimentError::AllocationRefused
+                    | SentimentError::Scoring(ScoringError::AllocationRefused | ScoringError::LimitExceeded(_))))
+            | Int4SentimentError::Task(SentimentError::AllocationRefused
+                | SentimentError::Scoring(ScoringError::AllocationRefused | ScoringError::LimitExceeded(_)))
+            | Int4SentimentError::Scoring(Int4ScoringError::Allocation
+                | Int4ScoringError::Scoring(ScoringError::AllocationRefused | ScoringError::LimitExceeded(_))) =>
+                Failure::new(ErrorCode::AdmissionOrResourceLimit, "native_sentiment_admission_refused"),
+        Int4SentimentError::Native(error) | Int4SentimentError::Scoring(Int4ScoringError::Native(error)) =>
+            host_failure(HostedError::Int4(Int4HostError::Native(error))),
+        Int4SentimentError::Identity | Int4SentimentError::Accounting
+            | Int4SentimentError::Planning(SentimentPlanningError::Identity) =>
+            Failure::new(ErrorCode::ArtifactIntegrityOrFormatOrVersion, "native_sentiment_identity"),
+        error => error.cancellation().map(cancelled).unwrap_or_else(||
+            Failure::new(ErrorCode::StructuredTaskNoResult, "native_sentiment_failed")),
     }
 }
 

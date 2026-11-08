@@ -15,6 +15,8 @@ mod assay_extract;
 pub use assay_extract::{Int4ExtractAssayHostLimits, Int4ExtractAssayHostRequirements};
 mod assay_faithfulness;
 pub use assay_faithfulness::{Int4FaithfulnessAssayHostLimits, Int4FaithfulnessAssayHostRequirements};
+mod assay_sentiment;
+pub use assay_sentiment::{Int4SentimentAssayHostLimits, Int4SentimentAssayHostRequirements};
 mod sentiment;
 pub use sentiment::{Int4SentimentHostLimits, Int4SentimentMapHostConfig,
     int4_sentiment_document_corpus_requirements};

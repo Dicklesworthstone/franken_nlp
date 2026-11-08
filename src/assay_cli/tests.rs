@@ -9,6 +9,7 @@ fn command(args: &[&str]) -> ScoredCommand {
         AssayCommand::NativeNer(_) => panic!("supplied-observation fixture selected native NER"),
         AssayCommand::NativeExtract(_) => panic!("supplied-observation fixture selected native extraction"),
         AssayCommand::NativeFaithfulness(_) => panic!("supplied-observation fixture selected native faithfulness"),
+        AssayCommand::NativeSentiment(_) => panic!("supplied-observation fixture selected native sentiment"),
     }
 }
 struct NoRead;

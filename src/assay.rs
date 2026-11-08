@@ -24,6 +24,7 @@ pub mod native_classify;
 pub mod native_ner;
 pub mod native_extract;
 pub mod native_faithfulness;
+pub mod native_sentiment;
 pub use dataset::{Dataset, DatasetBindings, DatasetMetadata, Observation, Split, SplitBindings, SplitIds, SuiteManifest};
 
 pub const ASSAY_SCHEMA_VERSION: u32 = 1;

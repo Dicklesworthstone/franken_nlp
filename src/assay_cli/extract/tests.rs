@@ -8,7 +8,7 @@ pub(super) fn parse(arguments: &[&str]) -> Command {
     match AssayCommand::from_matches(arguments[0], &matches).unwrap() {
         AssayCommand::NativeExtract(command) => command,
         AssayCommand::Native(_) | AssayCommand::NativeNer(_) | AssayCommand::Scored(_)
-            | AssayCommand::NativeFaithfulness(_) =>
+            | AssayCommand::NativeFaithfulness(_) | AssayCommand::NativeSentiment(_) =>
             panic!("extraction fixture selected another task"),
     }
 }

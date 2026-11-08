@@ -11,6 +11,7 @@ pub(super) fn parse(arguments: &[&str]) -> Command {
         AssayCommand::NativeNer(_) => panic!("classification fixture selected NER"),
         AssayCommand::NativeExtract(_) => panic!("classification fixture selected extraction"),
         AssayCommand::NativeFaithfulness(_) => panic!("classification fixture selected faithfulness"),
+        AssayCommand::NativeSentiment(_) => panic!("classification fixture selected sentiment"),
     }
 }
 pub(super) fn command(paired: bool, flags: &[&str]) -> Command {
