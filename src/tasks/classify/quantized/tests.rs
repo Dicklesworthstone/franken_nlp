@@ -8,6 +8,29 @@ use crate::{execution_identity::{ThinkingMode, ToolMode},
 
 struct Continue;
 impl DecodeStepControl for Continue { fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None } }
+
+#[test]
+fn compact_int8_planning_keeps_native_identity_and_complete_unchanged_response_codes() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    let (p, mut id, _, _, _) = fixture(); let r = request(ClassificationMode::MultiLabel);
+    let byte = prepare(&p, &id, &r).unwrap();
+    let p = p.with_document_encoding(UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 16_384, max_output_tokens: 8192,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24,
+    })).unwrap();
+    id.template_digest = *p.template_digest();
+    let compact = prepare(&p, &id, &r).unwrap();
+    assert_eq!(compact.execution_identity().numerics_profile, NumericsProfile::StrictQuantized { version: 1 });
+    assert!(compact.planned_work().forward_positions < byte.planned_work().forward_positions);
+    assert_eq!(compact.planned_work().projected_logits, byte.planned_work().projected_logits);
+    for (a, b) in compact.inner.heads.iter().zip(&byte.inner.heads) {
+        assert_eq!(canonjson::canonical_bytes(a.task.ir().decode_strategy()).unwrap(),
+            canonjson::canonical_bytes(b.task.ir().decode_strategy()).unwrap());
+    }
+    let mut eager_id = id.clone(); eager_id.numerics_profile = NumericsProfile::HfBf16Eager;
+    let eager = p.plan(&r, &PlanContext::new(&eager_id, r.budget).unwrap(), ClassificationLimits::default()).unwrap();
+    assert_eq!(compact.execution_identity().prompt_digest, eager.execution_identity().prompt_digest);
+}
 fn fixture() -> (ClassificationPlanner, ExecutionIdentity, u32, u32, u32) {
     let tokenizer = EmbeddedTokenizer::pinned().unwrap();
     let entries: Vec<_> = [IM_START, IM_END, THINK_START, THINK_END].iter().map(|&surface| {

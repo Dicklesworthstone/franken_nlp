@@ -15,7 +15,8 @@ use crate::{
         GrammarReference, PlanContext, PromptSegment, PromptSegmentKind, TaskBudget, TaskIR, TaskPlan, TokenSequence}},
     template::{Conversation, Message, MessageRole, RenderOptions, TemplateBuilder, ToolFormat,
         IM_START, IM_END, THINK_START, THINK_END},
-    tokenizer::{bpe::EncodeOptions, specials::TemplateControlIds, untrusted::UntrustedDocumentEncoder,
+    tokenizer::{bpe::EncodeOptions, specials::TemplateControlIds,
+        untrusted::{SafeBpeWork, UntrustedDocument, UntrustedDocumentEncoder, UntrustedDocumentError, UntrustedEncoding},
         embedded::{EmbeddedTokenizer, PINNED_TOKENIZER_MODEL_BYTES, PINNED_ADDED_TOKENS_BYTES,
             PINNED_TOKENIZER_CONFIG_BYTES, PINNED_SPECIAL_TOKENS_MAP_BYTES}},
 };
@@ -135,6 +136,8 @@ pub struct ClassificationPlanner {
     controls: TemplateControlIds,
     eos: u32,
     fragments: [Vec<Vec<u32>>; 2],
+    byte_template_digest: Sha256Digest,
+    document_encoding: UntrustedEncoding,
     template_digest: Sha256Digest,
 }
 impl ClassificationPlanner {
@@ -164,8 +167,21 @@ impl ClassificationPlanner {
         let assets = [PINNED_TOKENIZER_MODEL_BYTES, PINNED_ADDED_TOKENS_BYTES,
             PINNED_TOKENIZER_CONFIG_BYTES, PINNED_SPECIAL_TOKENS_MAP_BYTES].map(Sha256Digest::of_bytes);
         let template_digest = digest(&(CLASSIFICATION_PROMPT_VERSION, &fragments, census, eos, assets))?;
-        Ok(Self { tokenizer, controls: controls.clone(), eos, fragments, template_digest })
+        Ok(Self { tokenizer, controls: controls.clone(), eos, fragments,
+            byte_template_digest: template_digest, document_encoding: UntrustedEncoding::ByteFallback, template_digest })
     }
+    /// Opt into bounded compact encoding for one complete classification request.
+    /// The document is encoded once and all canonical label records share its
+    /// work ledger. Output response codes keep their original finite language.
+    /// Admit the policy's workspace before reading private input or planning.
+    pub fn with_document_encoding(mut self, encoding: UntrustedEncoding) -> Result<Self, ClassificationPlanningError> {
+        encoding.validate().map_err(|_| ClassificationPlanningError::InvalidLimits)?;
+        self.template_digest = if encoding == UntrustedEncoding::ByteFallback { self.byte_template_digest }
+            else { digest(&("classification-untrusted-encoding-v1", self.byte_template_digest, &encoding))? };
+        self.document_encoding = encoding;
+        Ok(self)
+    }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { &self.document_encoding }
     pub fn template_digest(&self) -> &Sha256Digest { &self.template_digest }
     pub fn tokenizer_digest(&self) -> Sha256Digest { Sha256Digest::of_bytes(PINNED_TOKENIZER_MODEL_BYTES) }
 
@@ -174,6 +190,11 @@ impl ClassificationPlanner {
     /// escaped label codebooks and every independent head count in full.
     pub(super) fn source_capacity(&self, request: &ClassificationRequest, ceiling: TaskBudget,
         limits: ClassificationLimits, context_tokens: usize) -> Result<usize, ClassificationPlanningError> {
+        // Whole-document maps price byte-capacity probes, not an aggregate
+        // compact-tokenizer ledger. Never silently extend one-off authority.
+        if self.document_encoding != UntrustedEncoding::ByteFallback {
+            return Err(ClassificationPlanningError::InvalidLimits);
+        }
         limits.validate()?;
         request.budget.validate().map_err(|_| ClassificationPlanningError::InvalidLimits)?;
         ceiling.validate().map_err(|_| ClassificationPlanningError::InvalidLimits)?;
@@ -256,17 +277,34 @@ impl ClassificationPlanner {
             .ok_or(ClassificationPlanningError::ContextBudget)?;
         let codes = opaque_codes(labels.len())?;
         let maximum_code = if request.mode == ClassificationMode::Exclusive { codes[0].len() } else { 1 };
-        let metadata_room = limits.max_context_tokens.checked_sub(maximum_code)
-            .map(|n| n.min(request.budget.max_input_tokens as usize))
-            .and_then(|n| n.checked_sub(overhead)).and_then(|n| n.checked_sub(request.document.len()))
-            .ok_or(ClassificationPlanningError::ContextBudget)?;
+        let compact = match &self.document_encoding {
+            UntrustedEncoding::ByteFallback => None,
+            UntrustedEncoding::SafeBpeV1(limits) => Some(*limits),
+        };
+        let metadata_room = if let Some(encoding) = compact {
+            encoding.max_input_bytes.checked_sub(request.document.len())
+                .ok_or(ClassificationPlanningError::InputBudget)?
+        } else {
+            limits.max_context_tokens.checked_sub(maximum_code)
+                .map(|n| n.min(request.budget.max_input_tokens as usize))
+                .and_then(|n| n.checked_sub(overhead)).and_then(|n| n.checked_sub(request.document.len()))
+                .ok_or(ClassificationPlanningError::ContextBudget)?
+        };
         let mut drafts = reserved(count)?;
-        let mut total_prompt = 0_usize;
-        // Preflight all prompt lengths and finite languages before any repeated
-        // document-token allocation. Escaped codebook bytes count in FULL.
+        let mut total_prompt = 0_usize; let mut metadata_bytes = 0_usize;
+        // Preflight finite languages and the complete canonical metadata byte
+        // allowance before tokenization. Byte mode retains its original exact
+        // prompt preflight; compact mode separately checks actual token lengths.
         for index in 0..count {
             checkpoint(control)?;
-            let record = label_record(&labels, &codes, index, request.mode, metadata_room)?;
+            let remaining = if compact.is_some() {
+                metadata_room.checked_sub(metadata_bytes).ok_or(ClassificationPlanningError::InputBudget)?
+            } else { metadata_room };
+            let record = label_record(&labels, &codes, index, request.mode, remaining)
+                .map_err(|error| if compact.is_some() && error == ClassificationPlanningError::ContextBudget {
+                    ClassificationPlanningError::InputBudget
+                } else { error })?;
+            metadata_bytes = metadata_bytes.checked_add(record.len()).ok_or(ClassificationPlanningError::InputBudget)?;
             let (candidates, label_index) = if request.mode == ClassificationMode::Exclusive {
                 // TaskIR identifiers have a deliberately narrower alphabet than
                 // user labels. Never weaken that ABI or normalize a user ID.
@@ -276,25 +314,37 @@ impl ClassificationPlanner {
             } else {
                 (vec![self.candidate("no", "N")?, self.candidate("yes", "Y")?], Some(index))
             };
-            let prompt_len = overhead.checked_add(record.len()).and_then(|n| n.checked_add(request.document.len()))
-                .ok_or(ClassificationPlanningError::ContextBudget)?;
-            total_prompt = total_prompt.checked_add(prompt_len).ok_or(ClassificationPlanningError::ContextBudget)?;
             let maximum = candidates.iter().map(|c| c.continuation().token_ids().len()).max()
                 .ok_or(ClassificationPlanningError::InvalidRequest)?;
-            if prompt_len > request.budget.max_input_tokens as usize || maximum + 1 > request.budget.max_output_tokens as usize
-                || prompt_len.checked_add(maximum).is_none_or(|n| n > limits.max_context_tokens)
-                || total_prompt > limits.max_total_prompt_tokens { return Err(ClassificationPlanningError::ContextBudget); }
-            drafts.push((record, candidates, label_index, prompt_len));
+            if maximum + 1 > request.budget.max_output_tokens as usize {
+                return Err(ClassificationPlanningError::ContextBudget);
+            }
+            if compact.is_none() {
+                let prompt_len = overhead.checked_add(record.len()).and_then(|n| n.checked_add(request.document.len()))
+                    .ok_or(ClassificationPlanningError::ContextBudget)?;
+                total_prompt = total_prompt.checked_add(prompt_len).ok_or(ClassificationPlanningError::ContextBudget)?;
+                check_prompt_length(prompt_len, maximum, total_prompt, request.budget, limits)?;
+            }
+            drafts.push((record, candidates, label_index, maximum));
+        }
+        let encoder = UntrustedDocumentEncoder::new(self.tokenizer.tokenizer(), &self.controls);
+        let mut encoding_work = SafeBpeWork::default();
+        let document = encode_input(&encoder, request.document.as_bytes(), &self.document_encoding, &mut encoding_work, control)?;
+        let mut encoded = reserved(count)?; total_prompt = 0;
+        // The unique source is tokenized once even for independent labels. All
+        // metadata shares that same request ledger; repeated prompt copies are
+        // still counted by aggregate prompt and native scoring work limits.
+        for (record, candidates, label_index, maximum) in drafts {
+            let metadata = encode_input(&encoder, &record, &self.document_encoding, &mut encoding_work, control)?;
+            let prompt_len = overhead.checked_add(metadata.ids().len()).and_then(|n| n.checked_add(document.ids().len()))
+                .ok_or(ClassificationPlanningError::ContextBudget)?;
+            total_prompt = total_prompt.checked_add(prompt_len).ok_or(ClassificationPlanningError::ContextBudget)?;
+            check_prompt_length(prompt_len, maximum, total_prompt, request.budget, limits)?;
+            encoded.push((metadata, candidates, label_index, prompt_len));
         }
         let mut heads = reserved(count)?; let mut work = PrefixWork::default();
-        let encoder = UntrustedDocumentEncoder::new(self.tokenizer.tokenizer(), &self.controls);
-        for (record, candidates, label_index, prompt_len) in drafts {
+        for (metadata, candidates, label_index, prompt_len) in encoded {
             checkpoint(control)?;
-            let metadata = encoder.encode(&record).map_err(|_| ClassificationPlanningError::Tokenizer)?;
-            let document = encoder.encode(request.document.as_bytes()).map_err(|_| ClassificationPlanningError::Tokenizer)?;
-            if metadata.ids().len() != record.len() || document.ids().len() != request.document.len() {
-                return Err(ClassificationPlanningError::Tokenizer);
-            }
             let (expected, max_prefix) = language_work(&candidates)?;
             let bound = head_work(prompt_len, expected)?;
             let next_work = add_work(work, bound)?;
@@ -470,6 +520,34 @@ fn restore_label_ids(mut result: ClassificationResult, labels: &[String])
     Ok(result)
 }
 
+fn check_prompt_length(prompt: usize, continuation: usize, total: usize, budget: TaskBudget,
+    limits: ClassificationLimits) -> Result<(), ClassificationPlanningError> {
+    if prompt > budget.max_input_tokens as usize
+        || prompt.checked_add(continuation).is_none_or(|n| n > limits.max_context_tokens)
+        || total > limits.max_total_prompt_tokens { return Err(ClassificationPlanningError::ContextBudget); }
+    Ok(())
+}
+fn encode_input<C: DecodeStepControl>(encoder: &UntrustedDocumentEncoder<'_, '_>, bytes: &[u8],
+    policy: &UntrustedEncoding, work: &mut SafeBpeWork, control: &mut C)
+    -> Result<UntrustedDocument, ClassificationPlanningError> {
+    let mut cancelled = None;
+    let result = encoder.encode_with_policy(bytes, policy, work, &mut || {
+        cancelled = control.prefill_checkpoint(0); cancelled.is_none()
+    });
+    if let Some(cause) = cancelled { return Err(ClassificationPlanningError::Cancelled(cause)); }
+    let document = result.map_err(|error| match error {
+        UntrustedDocumentError::AllocationRefused => ClassificationPlanningError::AllocationRefused,
+        UntrustedDocumentError::InvalidEncodingLimits { .. } => ClassificationPlanningError::InvalidLimits,
+        UntrustedDocumentError::EncodingBudget { resource: "input bytes" } => ClassificationPlanningError::InputBudget,
+        UntrustedDocumentError::EncodingBudget { resource: "output tokens" } => ClassificationPlanningError::ContextBudget,
+        UntrustedDocumentError::EncodingBudget { .. } => ClassificationPlanningError::WorkBudget,
+        _ => ClassificationPlanningError::Tokenizer,
+    })?;
+    if *policy == UntrustedEncoding::ByteFallback && document.ids().len() != bytes.len() {
+        return Err(ClassificationPlanningError::Tokenizer);
+    }
+    Ok(document)
+}
 fn checked_labels(r: &ClassificationRequest, limits: ClassificationLimits) -> Result<Vec<&ClassificationLabel>, ClassificationPlanningError> {
     if r.document.is_empty() || r.labels.is_empty() || (r.mode == ClassificationMode::Exclusive && r.labels.len() < 2) {
         return Err(ClassificationPlanningError::InvalidRequest);

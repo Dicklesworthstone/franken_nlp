@@ -13,6 +13,29 @@ struct Continue;
 impl DecodeStepControl for Continue {
     fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }
 }
+
+#[test]
+fn compact_int8_axes_keep_five_bins_and_actual_native_work() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    let (p, mut id, r) = fixture(ScoringMode::FullVocabulary);
+    let byte = prepare(&p, &id, &r);
+    let p = p.with_document_encoding(UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 8192, max_output_tokens: 4096,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24,
+    })).unwrap();
+    id.template_digest = *p.template_digest();
+    let compact = prepare(&p, &id, &r);
+    assert_eq!(compact.execution_identity().numerics_profile, NumericsProfile::StrictQuantized { version: 1 });
+    assert!(compact.planned_work().forward_positions < byte.planned_work().forward_positions);
+    assert_eq!(compact.planned_work().projected_logits, byte.planned_work().projected_logits);
+    for (a, b) in compact.inner.heads.iter().zip(&byte.inner.heads) {
+        assert_eq!(canonjson::canonical_bytes(a.ir.decode_strategy()).unwrap(),
+            canonjson::canonical_bytes(b.ir.decode_strategy()).unwrap());
+    }
+    let mut eager_id = id.clone(); eager_id.numerics_profile = NumericsProfile::HfBf16Eager;
+    let eager = p.plan(&r, &PlanContext::new(&eager_id, r.budget).unwrap(), SentimentLimits::default()).unwrap();
+    assert_eq!(compact.inner.binding_digest(), eager.binding_digest());
+}
 struct StopAfter(usize);
 impl DecodeStepControl for StopAfter {
     fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {

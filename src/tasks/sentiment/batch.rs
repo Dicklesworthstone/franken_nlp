@@ -43,6 +43,9 @@ pub struct SentimentBatchConfig {
 }
 impl SentimentBatchConfig {
     pub fn validate(&self, planner: &SentimentPlanner) -> Result<(), BatchFault> {
+        if planner.document_encoding() != &crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback {
+            return Err(BatchCode::Admission.into());
+        }
         constrained_int8::check_profile(&self.identity).map_err(|_| BatchCode::Admission)?;
         if self.identity.task_spec != "sentiment-v1"
             || self.identity.template_digest != *planner.template_digest()

@@ -1,6 +1,7 @@
 use super::*;
 use crate::{native_engine::lmhead::scoring::{CandidateLogits, ProjectionRows, ScoringError},
     tokenizer::specials::ArchivedControlRegistries};
+mod encoding;
 
 fn fixture() -> (ClassificationPlanner, ExecutionIdentity) {
     // Model-free synthetic census, not a production control authority.

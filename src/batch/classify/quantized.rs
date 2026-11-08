@@ -38,6 +38,9 @@ impl PreparedInt8BatchClassification {
 impl<'p> Int8ClassificationBatchPlanner<'p> {
     pub fn new(planner: &'p ClassificationPlanner, identity: ExecutionIdentity, ceiling: TaskBudget,
         limits: ClassificationLimits, defaults: Option<ClassificationBatchArgs>) -> Result<Self, BatchFault> {
+        if planner.document_encoding() != &crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback {
+            return Err(BatchCode::Admission.into());
+        }
         identity.validate().map_err(|_| BatchCode::Admission)?;
         ceiling.validate().map_err(|_| BatchCode::InvalidLimits)?;
         if identity.task_spec != "classify-v1" || identity.template_digest != *planner.template_digest()

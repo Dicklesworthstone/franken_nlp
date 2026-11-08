@@ -23,7 +23,7 @@ impl SentimentArgs {
         Ok(Self { scoring: classify::ScoringArgs::from_matches_with_prefill(matches)? })
     }
     pub(super) fn validate(self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
-        let mut limits = self.scoring.validate_with_prefill(args)?;
+        let mut limits = self.scoring.validate_one_off_with_prefill(args)?;
         // CLI preparation retains the typed input, planner and publication
         // staging while the host independently owns the compiled bundle.
         // Full context KV and native output are already priced by storage.

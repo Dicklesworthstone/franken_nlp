@@ -10,6 +10,31 @@ use crate::{execution_identity::{Sha256Digest, ThinkingMode, ToolMode},
 
 struct Continue;
 impl DecodeStepControl for Continue { fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None } }
+
+#[test]
+fn compact_int4_planning_keeps_exact_candidate_language_and_group_work_binding() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    let (byte_planner, mut id, _) = fixture(); let r = request(ClassificationMode::MultiLabel);
+    let byte = prepare(byte_planner, &id, &r, 32).unwrap();
+    let controls = pinned_controls::pinned().unwrap();
+    let p = ClassificationPlanner::pinned(controls.template_controls(), EmbeddedTokenizer::pinned().unwrap().eos_token_id().unwrap())
+        .unwrap().with_document_encoding(UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+            max_input_bytes: 16_384, max_output_tokens: 8192,
+            max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24,
+        })).unwrap();
+    id.template_digest = *p.template_digest();
+    let compact = prepare(&p, &id, &r, 32).unwrap();
+    assert_eq!(compact.group_width(), 32);
+    assert_eq!(compact.execution_identity().numerics_profile, NumericsProfile::StrictQuantized { version: 2 });
+    assert!(compact.planned_work().forward_positions < byte.planned_work().forward_positions);
+    assert_eq!(compact.planned_work().projected_logits, byte.planned_work().projected_logits);
+    for (a, b) in compact.inner.heads.iter().zip(&byte.inner.heads) {
+        assert_eq!(canonjson::canonical_bytes(a.task.ir().decode_strategy()).unwrap(),
+            canonjson::canonical_bytes(b.task.ir().decode_strategy()).unwrap());
+    }
+    assert!(matches!(p.source_capacity(&r, r.budget, ClassificationLimits::default(), 4096),
+        Err(ClassificationPlanningError::InvalidLimits)));
+}
 fn fixture() -> (&'static ClassificationPlanner, ExecutionIdentity, [u32; 3]) {
     static FIXTURE: OnceLock<(ClassificationPlanner, ExecutionIdentity, [u32; 3])> = OnceLock::new();
     let (planner, identity, codes) = FIXTURE.get_or_init(|| {

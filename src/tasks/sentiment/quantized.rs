@@ -62,7 +62,8 @@ impl From<Int8ScoringError> for Int8SentimentError { fn from(e: Int8ScoringError
 impl From<StrictInt8Error> for Int8SentimentError { fn from(e: StrictInt8Error) -> Self { Self::Native(e) } }
 impl Int8SentimentError {
     pub fn cancellation(&self) -> Option<DecodeCancellationKind> {
-        match self { Self::Cancelled(c) | Self::Native(StrictInt8Error::Cancelled(c)) => Some(*c),
+        match self { Self::Cancelled(c) | Self::Native(StrictInt8Error::Cancelled(c))
+            | Self::Planning(SentimentPlanningError::Cancelled(c)) => Some(*c),
             Self::Scoring(e) => e.cancellation(), _ => None }
     }
 }
@@ -89,13 +90,14 @@ pub struct PreparedInt8Sentiment {
     budget: TaskBudget,
 }
 impl SentimentPlanner {
-    /// Tokenizer/grammar construction is bounded but not internally preempted.
-    /// Poll the same caller control before/after compilation and per schedule.
+    /// Reuse the caller control through bounded compact encoding, compilation
+    /// and every native schedule; never substitute a fresh deadline.
     pub fn plan_int8_with_control<C: DecodeStepControl>(&self, request: &SentimentRequest,
         context: &PlanContext<'_>, limits: SentimentLimits, control: &mut C)
         -> Result<PreparedInt8Sentiment, Int8SentimentError> {
         checkpoint(control)?;
-        let inner = self.plan_for_profile(request, context, limits, NumericsProfile::StrictQuantized { version: 1 })?;
+        let inner = self.plan_for_profile_with_control(request, context, limits,
+            NumericsProfile::StrictQuantized { version: 1 }, control)?;
         checkpoint(control)?;
         PreparedInt8Sentiment::compile(inner, context.execution_identity().clone(), request.budget, control)
     }

@@ -268,10 +268,15 @@ fn prepare(request: Input, model: &ResidentInt4, args: &Int4Args, limits: Int4Li
         }
         Input::Classify(request, scoring) => {
             let planner = Int4ClassificationPlanner::for_model(model.model_identity(), scoring.budget(limits),
-                scoring.classification_limits(args)).map_err(|_| CandidateError::Planning)?;
+                scoring.classification_limits(args)).map_err(|_| CandidateError::Planning)?
+                .with_document_encoding(args.input_encoding.policy(args.max_input_bytes, limits.max_prompt_tokens)?)
+                .map_err(|_| CandidateError::Planning)?;
             let plan = planner.plan_with_control(&request, control).map_err(|error| {
-                if error.cancellation() == Some(DecodeCancellationKind::Deadline) { CandidateError::Timeout }
-                else { CandidateError::Planning }
+                match error.cancellation() {
+                    Some(DecodeCancellationKind::Deadline | DecodeCancellationKind::Timeout) => CandidateError::Timeout,
+                    Some(_) => CandidateError::Execution,
+                    None => CandidateError::Planning,
+                }
             })?;
             scoring.admit_plan(plan.required_context(), args.context_tokens, plan.planned_work())?;
             scoring.admit_heads(plan.head_count())?;

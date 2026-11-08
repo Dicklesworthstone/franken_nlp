@@ -42,6 +42,9 @@ pub struct Int4SentimentDocumentBatchPlanner {
 impl Int4SentimentDocumentBatchPlanner {
     pub fn new(planner: Int4SentimentPlanner, defaults: Option<SentimentBatchArgs>,
         mapping: Int4SentimentMapLimits, max_run_work: Int4Work) -> Result<Self, BatchFault> {
+        if planner.document_encoding() != &crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback {
+            return Err(BatchCode::Admission.into());
+        }
         validate_limits(planner.task_budget(), planner.planning_limits(), mapping, max_run_work)?;
         constrained_int4::check_profile(planner.execution_identity(), planner.group_width())
             .map_err(|_| BatchCode::Admission)?;

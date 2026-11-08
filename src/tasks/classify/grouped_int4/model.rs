@@ -27,6 +27,17 @@ impl Int4ClassificationPlanner {
     /// Model/asset-bound base, not a compiled request identity. Each prepared
     /// task adds its complete prompt, label, score-space and policy bindings.
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
+    /// Configure one-off untrusted input before deriving a prepared identity.
+    /// Compact policy is deliberately refused by byte-capacity map planning.
+    pub fn with_document_encoding(mut self, encoding: crate::tokenizer::untrusted::UntrustedEncoding)
+        -> Result<Self, Int4ClassificationError> {
+        self.compiler = self.compiler.with_document_encoding(encoding)?;
+        self.identity.template_digest = *self.compiler.template_digest();
+        Ok(self)
+    }
+    pub fn document_encoding(&self) -> &crate::tokenizer::untrusted::UntrustedEncoding {
+        self.compiler.document_encoding()
+    }
     pub fn group_width(&self) -> usize { self.model.group_width() }
     /// Immutable per-chunk task authority, also used to price a whole-document stream.
     pub fn task_budget(&self) -> TaskBudget { self.ceiling }

@@ -74,8 +74,10 @@ pub(super) fn execute(args: Int4Args, command: SentimentArgs, _admitted: Int4Lim
     let cancellation = CancellationToken::default();
     let model = super::super::runtime::load_model(&engine, &args, limits, remaining()?, cancellation.clone())?;
     remaining()?;
+    let encoding = args.input_encoding.policy(args.max_input_bytes, limits.max_prompt_tokens)?;
     let planner = Int4SentimentPlanner::for_model(model.model_identity(), options(policy)?, budget,
-        command.scoring.sentiment_limits(&args)).map_err(planning_error)?;
+        command.scoring.sentiment_limits(&args)).map_err(planning_error)?
+        .with_document_encoding(encoding.clone()).map_err(planning_error)?;
     remaining()?;
     let plan = planner.plan_with_control(&request, &mut DeadlineControl { started, deadline })
         .map_err(planning_error)?;
@@ -131,7 +133,10 @@ pub(super) fn execute(args: Int4Args, command: SentimentArgs, _admitted: Int4Lim
     // Retain the host's complete output and the CLI preparation guards through
     // bounded staging, writing and flushing. Failed heads emit no prefix.
     let response = Response { provenance: &provenance, output: result.result() };
-    publish_checked(&cohort::Response { response: &response, cohort: result.summary() },
+    publish_checked(&input_encoding::Response {
+        response: &cohort::Response { response: &response, cohort: result.summary() },
+        input_encoding: input_encoding::reported_policy(&encoding),
+    },
         limits.result_bytes + 4096, output, &|| remaining().map(|_| ()))
 }
 

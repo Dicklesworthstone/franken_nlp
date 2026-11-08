@@ -91,6 +91,13 @@ impl ScoringArgs {
         self.validate_with_prefill(args)
     }
     pub(super) fn validate_with_prefill(self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
+        // Shared corpus, map, job and judge callers keep their byte-based
+        // planning contract. Only the one-off classification/sentiment routes
+        // bind the explicit encoding policy before constructing any prompt.
+        if !args.input_encoding.is_default() { return Err(CandidateError::Arguments); }
+        self.validate_one_off_with_prefill(args)
+    }
+    pub(super) fn validate_one_off_with_prefill(self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
         if !(2..=64).contains(&self.max_candidate_tokens) || self.max_candidate_tokens >= args.context_tokens
             || !(1..=MAX_CONTENT_BYTES).contains(&self.max_result_bytes)
             || !(1..=16 * 1024 * 1024).contains(&self.max_forward_positions)
@@ -107,7 +114,7 @@ impl ScoringArgs {
         // Bound repeated document/prompt/IR storage by the aggregate forward
         // ceiling, not by input bytes or just the longest live native context.
         let extra = sum(&[128 * MIB, self.max_forward_positions * 32, self.max_result_bytes as u64 * 16])?;
-        args.validate_storage_scheduled(self.max_result_bytes, self.max_candidate_tokens,
+        args.validate_storage_admission(self.max_result_bytes, self.max_candidate_tokens,
             args.context_tokens - self.max_candidate_tokens + 1, 0, extra, self.cohort_admission()?)
     }
     pub(super) fn cohort_admission(self) -> Result<Option<cohort::Admission>, CandidateError> {

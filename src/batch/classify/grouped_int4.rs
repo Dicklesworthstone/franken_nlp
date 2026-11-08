@@ -44,6 +44,9 @@ pub struct Int4ClassificationDocumentBatchPlanner {
 impl Int4ClassificationDocumentBatchPlanner {
     pub fn new(planner: Int4ClassificationPlanner, defaults: Option<ClassificationBatchArgs>,
         mapping: Int4ClassificationMapLimits, max_run_work: Int4Work) -> Result<Self, BatchFault> {
+        if planner.document_encoding() != &crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback {
+            return Err(BatchCode::Admission.into());
+        }
         validate_limits(planner.task_budget(), planner.planning_limits(), mapping, max_run_work)?;
         constrained_int4::check_profile(planner.execution_identity(), planner.group_width())
             .map_err(|_| BatchCode::Admission)?;

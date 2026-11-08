@@ -68,7 +68,8 @@ impl From<Int4ScoringError> for Int4SentimentError { fn from(e: Int4ScoringError
 impl From<StrictInt4Error> for Int4SentimentError { fn from(e: StrictInt4Error) -> Self { Self::Native(e) } }
 impl Int4SentimentError {
     pub fn cancellation(&self) -> Option<DecodeCancellationKind> {
-        match self { Self::Cancelled(c) | Self::Native(StrictInt4Error::Cancelled(c)) => Some(*c),
+        match self { Self::Cancelled(c) | Self::Native(StrictInt4Error::Cancelled(c))
+            | Self::Planning(SentimentPlanningError::Cancelled(c)) => Some(*c),
             Self::Scoring(e) => e.cancellation(), _ => None }
     }
 }
@@ -110,7 +111,8 @@ impl SentimentPlanner {
         context: &PlanContext<'_>, limits: SentimentLimits, group_width: usize,
         control: &mut C) -> Result<PreparedInt4Sentiment, Int4SentimentError> {
         checkpoint(control)?;
-        let inner = self.plan_for_profile(request, context, limits, NumericsProfile::StrictQuantized { version: 2 })?;
+        let inner = self.plan_for_profile_with_control(request, context, limits,
+            NumericsProfile::StrictQuantized { version: 2 }, control)?;
         checkpoint(control)?;
         PreparedInt4Sentiment::compile(inner, context.execution_identity().clone(), request.budget, group_width, control)
     }

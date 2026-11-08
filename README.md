@@ -364,7 +364,7 @@ checkpoint. The serial default remains the rollback selector.
 
 ## Explicit bounded BPE input for candidate INT4 tasks
 
-`fnlp candidate source-int4 generate`, `chat`, `ner`, `keyphrases`,
+`fnlp candidate source-int4 generate`, `chat`, `classify`, `sentiment`, `ner`, `keyphrases`,
 `summarize`, `answer`, `stream generate|chat`, `text-batch` and `text-corpus`
 accept `--input-encoding safe-bpe-v1`. The existing default is `byte-fallback`, which
 uses one token per input byte. The explicit BPE policy can use ordinary
@@ -427,9 +427,36 @@ fnlp candidate source-int4 text-corpus prompts.ndjson \
   --input-encoding safe-bpe-v1 --cohort-rows 4 --max-records 100
 ```
 
+One-off `classify` and `sentiment` apply the same explicit policy before native
+planning. Classification encodes the original document once and each canonical
+label record once under a shared tokenizer-work allowance; repeated multi-label
+heads reuse those encodings. Sentiment encodes the document once for all requested
+axes. The complete policy and limits enter task identity while the existing
+opaque output verbalizers, scored EOS and full-vocabulary probability space stay
+fixed. Each actual prompt plus its candidate continuation must still fit context.
+The unique encoded request segments also share the declared tokenizer token cap;
+canonical label-record wrappers count toward its input-byte cap.
+
+```bash
+fnlp candidate source-int4 classify classification.json \
+  --snapshot nanbeige.int4.snapshot --expected-model-sha256 "$MODEL_SHA256" \
+  --memory-mib 8192 --input-encoding safe-bpe-v1 --cohort-heads 4
+
+fnlp candidate source-int4 sentiment sentiment.json \
+  --snapshot nanbeige.int4.snapshot --expected-model-sha256 "$MODEL_SHA256" \
+  --memory-mib 8192 --input-encoding safe-bpe-v1 --prefill-rows 4
+```
+
+These one-off scored routes reserve the encoder workspace before private IO and
+report the complete selected policy in `input_encoding`. Classification and
+sentiment maps, corpora, retained jobs and other scored routes retain their
+byte-based planning contract. The compact policy is a separate input profile;
+its task quality and model behavior require their own evaluation.
+
 Library
 callers can select the same contract with `with_document_encoding` on
-`ChatPlanner`, `Int8ChatPlanner`, `Int4ChatPlanner` or `SourceTaskPlanner`, and use the
+`ChatPlanner`, `Int8ChatPlanner`, `Int4ChatPlanner`, the eager/INT8/INT4
+classification and sentiment planners, or `SourceTaskPlanner`, and use the
 `plan_chat_with_control` / `plan_generate_with_control` methods for cooperative
 planning cancellation. Source planners provide corresponding controlled
 one-request planning methods for BF16, INT8 and INT4. The host must admit

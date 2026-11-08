@@ -23,6 +23,17 @@ impl Int4SentimentPlanner {
         Ok(Self { compiler, identity, model: model.clone(), ceiling, limits })
     }
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
+    /// Configure one-off untrusted input before deriving a prepared identity.
+    /// Byte-capacity maps deliberately refuse a nondefault encoding policy.
+    pub fn with_document_encoding(mut self, encoding: crate::tokenizer::untrusted::UntrustedEncoding)
+        -> Result<Self, Int4SentimentError> {
+        self.compiler = self.compiler.with_document_encoding(encoding)?;
+        self.identity.template_digest = *self.compiler.template_digest();
+        Ok(self)
+    }
+    pub fn document_encoding(&self) -> &crate::tokenizer::untrusted::UntrustedEncoding {
+        self.compiler.document_encoding()
+    }
     pub fn group_width(&self) -> usize { self.model.group_width() }
     /// Immutable request authority retained by this model-bound compiler.
     pub fn task_budget(&self) -> TaskBudget { self.ceiling }

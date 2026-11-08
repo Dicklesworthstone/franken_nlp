@@ -14,6 +14,31 @@ struct Continue;
 impl DecodeStepControl for Continue {
     fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }
 }
+
+#[test]
+fn compact_int4_axes_keep_group_identity_five_bins_and_actual_native_work() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    let (p, mut id) = build(ScoringMode::FullVocabulary, permissive_policy());
+    let r = SentimentRequest { document: "The customer is pleased with the helpful service. ".repeat(8),
+        axes: SentimentAxis::ALL.to_vec(), budget: budget() };
+    let byte = prepare(&p, &id, &r, 32).unwrap();
+    let p = p.with_document_encoding(UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 8192, max_output_tokens: 4096,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24,
+    })).unwrap();
+    id.template_digest = *p.template_digest();
+    let compact = prepare(&p, &id, &r, 32).unwrap();
+    assert_eq!(compact.group_width(), 32);
+    assert_eq!(compact.execution_identity().numerics_profile, NumericsProfile::StrictQuantized { version: 2 });
+    assert!(compact.planned_work().forward_positions < byte.planned_work().forward_positions);
+    assert_eq!(compact.planned_work().projected_logits, byte.planned_work().projected_logits);
+    for (a, b) in compact.inner.heads.iter().zip(&byte.inner.heads) {
+        assert_eq!(canonjson::canonical_bytes(a.ir.decode_strategy()).unwrap(),
+            canonjson::canonical_bytes(b.ir.decode_strategy()).unwrap());
+    }
+    assert!(matches!(p.source_capacity(&r.axes, r.budget, r.budget, SentimentLimits::default(), 2048),
+        Err(SentimentPlanningError::Budget)));
+}
 struct StopAfter { remaining: usize, cause: DecodeCancellationKind }
 impl DecodeStepControl for StopAfter {
     fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {

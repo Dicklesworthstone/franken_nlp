@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     canonjson,
     execution_identity::{NumericsProfile, Sha256Digest, ThinkingMode, ToolMode},
-    native_engine::lmhead::{NANBEIGE_VOCAB_SIZE, scoring::{CandidateScorer, ScoringLimits}},
+    native_engine::{decode::{DecodeCancellationKind, DecodeStepControl},
+        lmhead::{NANBEIGE_VOCAB_SIZE, scoring::{CandidateScorer, ScoringLimits}}},
     tasks::{BuiltInTask, ir::{Candidate, DecodeStrategy, DependencyScope, FinitePostcondition,
         GrammarReference, PlanContext, PromptSegment, PromptSegmentKind, TaskBudget, TaskIR,
         TaskPlan, TokenSequence}},
@@ -22,7 +23,7 @@ use crate::{
         embedded::{EmbeddedTokenizer, PINNED_TOKENIZER_MODEL_BYTES, PINNED_ADDED_TOKENS_BYTES,
             PINNED_TOKENIZER_CONFIG_BYTES, PINNED_SPECIAL_TOKENS_MAP_BYTES},
         specials::TemplateControlIds,
-        untrusted::UntrustedDocumentEncoder,
+        untrusted::{SafeBpeWork, UntrustedDocumentEncoder, UntrustedDocumentError, UntrustedEncoding},
     },
 };
 use super::{SentimentAnchor, SentimentAxis, SentimentAxisInput, SentimentError,
@@ -59,6 +60,7 @@ pub enum SentimentPlanningError {
     TaskPlan,
     Task(SentimentError),
     Serialization,
+    Cancelled(DecodeCancellationKind),
 }
 impl fmt::Display for SentimentPlanningError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -76,6 +78,7 @@ impl fmt::Display for SentimentPlanningError {
             Self::TaskPlan => f.write_str("sentiment TaskIR or registry binding failed"),
             Self::Task(error) => write!(f, "sentiment task refused: {error}"),
             Self::Serialization => f.write_str("sentiment template binding serialization failed"),
+            Self::Cancelled(_) => f.write_str("sentiment planning cancelled"),
         }
     }
 }
@@ -103,6 +106,8 @@ pub struct SentimentPlanner {
     candidates: Vec<Candidate>,
     anchors: Vec<SentimentAnchor>,
     options: SentimentOptions,
+    byte_template_digest: Sha256Digest,
+    document_encoding: UntrustedEncoding,
     template_digest: Sha256Digest,
 }
 
@@ -188,8 +193,23 @@ impl SentimentPlanner {
         let digest = Sha256Digest::of_bytes(&canonjson::canonical_bytes(&witness)
             .map_err(|_| SentimentPlanningError::Serialization)?);
         Ok(Self { tokenizer, controls: controls.clone(), global, axes, candidates,
-            anchors, options, template_digest: digest })
+            anchors, options, byte_template_digest: digest,
+            document_encoding: UntrustedEncoding::ByteFallback, template_digest: digest })
     }
+
+    /// Opt into bounded compact encoding for one document, reused by every
+    /// requested axis. The five response bins retain their original tokens.
+    /// Admit the policy's workspace before reading private input or planning.
+    pub fn with_document_encoding(mut self, encoding: UntrustedEncoding) -> Result<Self, SentimentPlanningError> {
+        encoding.validate().map_err(|_| SentimentPlanningError::Budget)?;
+        self.template_digest = if encoding == UntrustedEncoding::ByteFallback { self.byte_template_digest }
+            else { Sha256Digest::of_bytes(&canonjson::canonical_bytes(
+                &("sentiment-untrusted-encoding-v1", self.byte_template_digest, &encoding))
+                .map_err(|_| SentimentPlanningError::Serialization)?) };
+        self.document_encoding = encoding;
+        Ok(self)
+    }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { &self.document_encoding }
 
     /// Public content-free template identity. Set this on the caller-owned
     /// execution identity before constructing the immutable PlanContext.
@@ -205,6 +225,11 @@ impl SentimentPlanner {
     pub(super) fn source_capacity(&self, axes: &[SentimentAxis], budget: TaskBudget,
         ceiling: TaskBudget, limits: SentimentLimits, context_tokens: usize)
         -> Result<usize, SentimentPlanningError> {
+        // Complete-document planners still price one token per byte. Their
+        // probes have no aggregate compact-encoding work ledger or admission.
+        if self.document_encoding != UntrustedEncoding::ByteFallback {
+            return Err(SentimentPlanningError::Budget);
+        }
         budget.validate().map_err(|_| SentimentPlanningError::Budget)?;
         ceiling.validate().map_err(|_| SentimentPlanningError::Budget)?;
         if !budget_fits(budget, ceiling) { return Err(SentimentPlanningError::Budget); }
@@ -238,11 +263,17 @@ impl SentimentPlanner {
 
     /// Compile raw text into one registry-bound TaskIR per dimension and then
     /// the complete executable sentiment bundle. All source and aggregate
-    /// prompt bounds are checked before byte-token allocation; no truncation,
+    /// prompt bounds are checked before repeated axis allocation; no truncation,
     /// scalar fallback, or flatten-and-retokenize retry is permitted.
     pub fn plan(&self, request: &SentimentRequest, context: &PlanContext<'_>, limits: SentimentLimits)
         -> Result<SentimentPlan, SentimentPlanningError> {
         self.plan_for_profile(request, context, limits, NumericsProfile::HfBf16Eager)
+    }
+
+    pub fn plan_with_control<C: DecodeStepControl>(&self, request: &SentimentRequest,
+        context: &PlanContext<'_>, limits: SentimentLimits, control: &mut C)
+        -> Result<SentimentPlan, SentimentPlanningError> {
+        self.plan_for_profile_with_control(request, context, limits, NumericsProfile::HfBf16Eager, control)
     }
 
     // Only the typed public entrypoints choose a profile. Quantized planning
@@ -250,6 +281,12 @@ impl SentimentPlanner {
     pub(super) fn plan_for_profile(&self, request: &SentimentRequest,
         context: &PlanContext<'_>, limits: SentimentLimits, profile: NumericsProfile)
         -> Result<SentimentPlan, SentimentPlanningError> {
+        self.plan_for_profile_with_control(request, context, limits, profile, &mut Continue)
+    }
+    pub(super) fn plan_for_profile_with_control<C: DecodeStepControl>(&self, request: &SentimentRequest,
+        context: &PlanContext<'_>, limits: SentimentLimits, profile: NumericsProfile, control: &mut C)
+        -> Result<SentimentPlan, SentimentPlanningError> {
+        checkpoint(control)?;
         let identity = context.execution_identity();
         let backend_matches = match &profile {
             NumericsProfile::HfBf16Eager => true,
@@ -277,18 +314,33 @@ impl SentimentPlanner {
             return Err(SentimentPlanningError::Budget);
         }
         let overheads = self.axis_overheads(&axes)?;
-        // The audited encoder uses one fallback token per source byte. Count
-        // bytes, not Unicode scalar values, and include every axis's overhead.
-        preflight_prompt_lengths(request.document.len(), &overheads,
-            request.budget.max_input_tokens as usize, limits.max_total_prompt_tokens)?;
-        let document = UntrustedDocumentEncoder::new(self.tokenizer.tokenizer(), &self.controls)
-            .encode(request.document.as_bytes()).map_err(|_| SentimentPlanningError::DocumentEncoding)?;
-        if document.ids().len() != request.document.len() {
+        // Preserve byte-default admission before allocation. Compact input has
+        // its own byte/work ceilings and is admitted by actual tokens below.
+        if self.document_encoding == UntrustedEncoding::ByteFallback {
+            preflight_prompt_lengths(request.document.len(), &overheads,
+                request.budget.max_input_tokens as usize, limits.max_total_prompt_tokens)?;
+        }
+        let mut work = SafeBpeWork::default(); let mut cancelled = None;
+        let encoded = UntrustedDocumentEncoder::new(self.tokenizer.tokenizer(), &self.controls)
+            .encode_with_policy(request.document.as_bytes(), &self.document_encoding, &mut work, &mut || {
+                cancelled = control.prefill_checkpoint(0); cancelled.is_none()
+            });
+        if let Some(cause) = cancelled { return Err(SentimentPlanningError::Cancelled(cause)); }
+        let document = encoded.map_err(|error| match error {
+            UntrustedDocumentError::AllocationRefused => SentimentPlanningError::AllocationRefused,
+            UntrustedDocumentError::InvalidEncodingLimits { .. } | UntrustedDocumentError::EncodingBudget { .. } =>
+                SentimentPlanningError::Budget,
+            _ => SentimentPlanningError::DocumentEncoding,
+        })?;
+        if self.document_encoding == UntrustedEncoding::ByteFallback && document.ids().len() != request.document.len() {
             return Err(SentimentPlanningError::DocumentEncoding);
         }
+        preflight_prompt_lengths(document.ids().len(), &overheads,
+            request.budget.max_input_tokens as usize, limits.max_total_prompt_tokens)?;
         let mut inputs = Vec::new();
         inputs.try_reserve_exact(axes.len()).map_err(|_| SentimentPlanningError::AllocationRefused)?;
         for axis in axes {
+            checkpoint(control)?;
             let template = &self.axes[axis as usize];
             let ir = TaskIR::new(vec![
                 PromptSegment::new(PromptSegmentKind::GlobalPolicy, self.global.clone()),
@@ -303,9 +355,17 @@ impl SentimentPlanner {
                 .map_err(|_| SentimentPlanningError::TaskPlan)?;
             inputs.push(SentimentAxisInput { axis, task, anchors: self.anchors.clone() });
         }
-        SentimentPlan::from_task_plans(&inputs, self.options, limits).map_err(SentimentPlanningError::from)
+        let plan = SentimentPlan::from_task_plans(&inputs, self.options, limits)?;
+        checkpoint(control)?;
+        Ok(plan)
     }
 }
+
+fn checkpoint<C: DecodeStepControl>(control: &mut C) -> Result<(), SentimentPlanningError> {
+    match control.prefill_checkpoint(0) { Some(cause) => Err(SentimentPlanningError::Cancelled(cause)), None => Ok(()) }
+}
+struct Continue;
+impl DecodeStepControl for Continue { fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None } }
 
 fn render_options(generation: bool) -> RenderOptions {
     RenderOptions { add_generation_prompt: generation, enable_thinking: false,
@@ -359,6 +419,7 @@ fn budget_fits(value: TaskBudget, ceiling: TaskBudget) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod encoding;
     use crate::execution_identity::ExecutionIdentity;
     use crate::native_engine::lmhead::scoring::ScoringMode;
     use crate::tokenizer::specials::ArchivedControlRegistries;

@@ -204,10 +204,10 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(compute::definition(input_encoding::definition(task("generate", "Generate from a bounded UTF-8 prompt using the pinned template"))))
         .subcommand(compute::definition(input_encoding::definition(task("chat", "Complete a bounded JSON system/user/assistant transcript"))))
         .subcommand(stream::definition())
-        .subcommand(classify::prefill_definition(classify::definition()))
+        .subcommand(input_encoding::definition(classify::prefill_definition(classify::definition())))
         .subcommand(classify_map::definition())
         .subcommand(classify_map::corpus::definition())
-        .subcommand(sentiment::definition())
+        .subcommand(input_encoding::definition(sentiment::definition()))
         .subcommand(sentiment_map::definition())
         .subcommand(sentiment_map::corpus::definition())
         .subcommand(sentiment_map::job::definition())
@@ -367,7 +367,7 @@ impl Int4Command {
             _ => return Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source-int4 task refused")),
         };
         let mut args = Int4Args::from_arg_matches(matches)?;
-        if matches!(name, "generate" | "chat" | "ner" | "keyphrases" | "summarize" | "answer") {
+        if matches!(name, "generate" | "chat" | "classify" | "sentiment" | "ner" | "keyphrases" | "summarize" | "answer") {
             args.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
         }
         if matches!(name, "generate" | "chat") {
@@ -483,7 +483,7 @@ impl Int4Command {
         }
         let limits = match &self.task {
             Int4Task::Text(_) => self.args.validate_text_compute()?,
-            Int4Task::Classify(scoring) => scoring.validate_with_prefill(&self.args)?,
+            Int4Task::Classify(scoring) => scoring.validate_one_off_with_prefill(&self.args)?,
             Int4Task::Extract(extraction) => extraction.validate_with_prefill(&self.args)?,
             Int4Task::Source(_, source) => source.validate_with_prefill(&self.args)?,
             // The blocking stream must own its input and writer through cleanup.
