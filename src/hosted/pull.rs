@@ -15,7 +15,9 @@ use crate::{
     artifact::pull::http::{
         NetworkPartsOptions, NetworkPartsReport, NetworkPartsRequest, NetworkPullError,
         download_release_parts,
+        direct::{NetworkArtifactReport, NetworkArtifactRequest, acquire_release_artifact},
     },
+    artifact::pull::LOCAL_RELEASE_WORKSPACE_RESERVE_BYTES,
 };
 
 const MIN_NETWORK_RESERVE_BYTES: u64 = 2 * 1024 * 1024;
@@ -63,6 +65,39 @@ impl From<NetworkPullError> for HostedNetworkPullError {
 }
 
 impl NlpEngine {
+    /// Stream an explicit release directly into one candidate artifact.
+    ///
+    /// Both local verification and transport bookkeeping are admitted before
+    /// any manifest, artifact or network IO, including a final cache hit. The
+    /// reservations and structured runtime remain owned until all verification
+    /// and publication work completes. This does not activate a model root.
+    pub fn acquire_release_artifact_candidate(
+        &self,
+        request: NetworkArtifactRequest,
+        transfer: NetworkPartsOptions,
+        host: NetworkPullHostOptions,
+    ) -> Result<NetworkArtifactReport, HostedNetworkPullError> {
+        if host.network_reserve_bytes < MIN_NETWORK_RESERVE_BYTES {
+            return Err(HostedError::Limits("release acquisition network reserve").into());
+        }
+        let _sync_call = self.enter_sync_call().map_err(|_| HostedError::Reentrant)?;
+        let lease = self.resources().acquire_lease();
+        let local = Pending::reserve(&lease, MemoryClass::Staging,
+            LOCAL_RELEASE_WORKSPACE_RESERVE_BYTES)?.commit()?;
+        let network = Pending::reserve(&lease, MemoryClass::Staging, host.network_reserve_bytes)?
+            .commit()?;
+        let result = self.resources().runtime().block_on(async move {
+            let cx = Cx::current().ok_or(HostedError::MissingRuntimeContext)?;
+            acquire_release_artifact(&cx, &request, transfer)
+                .await
+                .map_err(HostedNetworkPullError::Transfer)
+        });
+        drop(network);
+        drop(local);
+        drop(lease);
+        result
+    }
+
     /// Run candidate release-part acquisition on the one process-owned runtime.
     ///
     /// The returned report has no activation authority. The runtime context,
@@ -110,6 +145,8 @@ mod tests {
         send::<NetworkPartsRequest>();
         send::<NetworkPartsOptions>();
         send::<NetworkPartsReport>();
+        send::<NetworkArtifactRequest>();
+        send::<NetworkArtifactReport>();
         send::<HostedNetworkPullError>();
     }
 }

@@ -726,3 +726,203 @@ fn hex(bytes: &[u8]) -> String {
     for byte in bytes { write!(&mut output, "{byte:02x}").unwrap(); }
     output
 }
+
+#[cfg(feature = "asupersync-runtime")]
+mod direct_acquisition {
+    use super::*;
+    use franken_nlp::artifact::pull::http::{
+        NetworkPartsOptions, NetworkPullError,
+        direct::{NetworkArtifactReport, NetworkArtifactRequest, acquire_release_artifact},
+    };
+
+    fn request(fixture: &Fixture, label: &str) -> NetworkArtifactRequest {
+        let local = fixture.request(label);
+        NetworkArtifactRequest {
+            manifest: local.manifest,
+            expected_release_manifest_sha256: local.expected_release_manifest_sha256,
+            staging_output: local.staging_output, output: local.output,
+        }
+    }
+
+    fn acquire(request: &NetworkArtifactRequest, resume: bool)
+        -> Result<NetworkArtifactReport, NetworkPullError>
+    {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let cx = asupersync::cx::Cx::current().unwrap();
+            acquire_release_artifact(&cx, request, NetworkPartsOptions {
+                resume, max_new_bytes: Some(0), ..NetworkPartsOptions::default()
+            }).await
+        })
+    }
+
+    #[test]
+    fn complete_direct_staging_publishes_checked_artifact_without_parts_or_network() {
+        let fixture = Fixture::new("direct-complete");
+        let request = request(&fixture, "direct");
+        fs::write(&request.staging_output, &fixture.artifact).unwrap();
+        fs::rename(&fixture.parts_dir, fixture.root.join("unavailable-parts")).unwrap();
+        let report = acquire(&request, true).expect("complete staged artifact needs no network bytes");
+        assert!(!report.cache_hit);
+        assert_eq!(report.resumed_bytes, fixture.artifact.len() as u64);
+        assert_eq!(report.downloaded_bytes, 0);
+        assert_eq!(report.retained_new_bytes, 0);
+        assert_eq!(report.artifact_sha256, fixture.manifest.artifact.sha256);
+        assert!(!report.activation_authority);
+        assert!(!report.directory_durability_confirmed);
+        assert_eq!(fs::read(&request.output).unwrap(), fixture.artifact);
+        assert_eq!(fs::read(&request.staging_output).unwrap(), fixture.artifact);
+        assert!(!fixture.parts_dir.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&request.output).unwrap().ino(),
+                fs::metadata(&request.staging_output).unwrap().ino(),
+                "publication must not copy a second artifact");
+        }
+    }
+
+    #[test]
+    fn direct_cache_hit_ignores_staging_with_resume_disabled_and_zero_network_budget() {
+        let fixture = Fixture::new("direct-cache");
+        let mut request = request(&fixture, "unused");
+        request.output = fixture.root.join(LOGICAL_NAME);
+        let report = acquire(&request, false).unwrap();
+        assert!(report.cache_hit);
+        assert_eq!(report.resumed_bytes, 0);
+        assert_eq!(report.downloaded_bytes, 0);
+        assert_eq!(report.retained_new_bytes, 0);
+        assert!(!request.staging_output.exists());
+    }
+
+    #[test]
+    fn direct_partial_zero_budget_retains_exact_prefix_without_publication() {
+        let fixture = Fixture::new("direct-budget");
+        let request = request(&fixture, "partial");
+        fs::write(&request.staging_output, &fixture.artifact[..173]).unwrap();
+        assert!(matches!(acquire(&request, true),
+            Err(NetworkPullError::DownloadBudgetExceeded {
+                limit: 0, downloaded_bytes: 0, retained_bytes: 173, part: 0, ..
+            })));
+        assert_eq!(fs::read(&request.staging_output).unwrap(), fixture.artifact[..173]);
+        assert!(!request.output.exists());
+    }
+
+    #[test]
+    fn direct_bad_pin_and_no_resume_leave_retained_staging_untouched() {
+        let fixture = Fixture::new("direct-pin");
+        let mut request = request(&fixture, "retained");
+        fs::write(&request.staging_output, &fixture.artifact).unwrap();
+        let pin = request.expected_release_manifest_sha256.clone();
+        request.expected_release_manifest_sha256 = "0".repeat(64);
+        assert!(matches!(acquire(&request, true),
+            Err(NetworkPullError::Manifest(PullError::ManifestDigestMismatch { .. }))));
+        request.expected_release_manifest_sha256 = pin;
+        assert!(matches!(acquire(&request, false),
+            Err(NetworkPullError::Manifest(PullError::Publish { .. }))));
+        assert_eq!(fs::read(&request.staging_output).unwrap(), fixture.artifact);
+        assert!(!request.output.exists());
+    }
+
+    #[test]
+    fn direct_corrupt_complete_part_and_existing_final_are_never_repaired_or_replaced() {
+        let fixture = Fixture::new("direct-corrupt");
+        let request = request(&fixture, "corrupt");
+        let mut corrupt = fixture.artifact.clone();
+        corrupt[100] ^= 1;
+        fs::write(&request.staging_output, &corrupt).unwrap();
+        assert!(matches!(acquire(&request, true), Err(NetworkPullError::Digest { part: 0, .. })));
+        assert_eq!(fs::read(&request.staging_output).unwrap(), corrupt);
+        assert!(!request.output.exists());
+        fs::write(&request.output, b"existing-output-must-survive").unwrap();
+        assert!(matches!(acquire(&request, true),
+            Err(NetworkPullError::Manifest(PullError::ArtifactLength { .. }))));
+        assert_eq!(fs::read(&request.output).unwrap(), b"existing-output-must-survive");
+        assert_eq!(fs::read(&request.staging_output).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn direct_whole_artifact_and_container_identity_gates_remain_mandatory() {
+        for whole_digest in [true, false] {
+            let fixture = Fixture::new(if whole_digest { "direct-whole" } else { "direct-identity" });
+            let mut request = request(&fixture, "checked");
+            fs::write(&request.staging_output, &fixture.artifact).unwrap();
+            let mut manifest = fixture.manifest.clone();
+            if whole_digest { manifest.artifact.sha256 = "0".repeat(64); }
+            else { manifest.digests.logical_model_sha256 = "0".repeat(64); }
+            request.manifest = fixture.root.join("different.manifest.json");
+            fs::write(&request.manifest, manifest.canonical_bytes().unwrap()).unwrap();
+            request.expected_release_manifest_sha256 = manifest.release_manifest_sha256().unwrap();
+            let error = acquire(&request, true).unwrap_err();
+            if whole_digest {
+                assert!(matches!(error, NetworkPullError::Manifest(PullError::ArtifactDigest { .. })));
+            } else {
+                assert!(matches!(error, NetworkPullError::Manifest(PullError::ContainerIdentity(
+                    "digests.logical_model_sha256"))));
+            }
+            assert_eq!(fs::read(&request.staging_output).unwrap(), fixture.artifact);
+            assert!(!request.output.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_resume_refuses_a_staging_symlink() {
+        let fixture = Fixture::new("direct-symlink");
+        let request = request(&fixture, "link");
+        std::os::unix::fs::symlink(fixture.root.join(LOGICAL_NAME), &request.staging_output).unwrap();
+        assert!(matches!(acquire(&request, true),
+            Err(NetworkPullError::Manifest(PullError::InvalidPath(_)))));
+        assert_eq!(fs::read(fixture.root.join(LOGICAL_NAME)).unwrap(), fixture.artifact);
+        assert!(!request.output.exists());
+    }
+
+    #[test]
+    fn cli_direct_cache_and_complete_resume_succeed_without_a_parts_option() {
+        for cached in [false, true] {
+            let fixture = Fixture::new(if cached { "direct-cli-cache" } else { "direct-cli-complete" });
+            let mut request = request(&fixture, "cli");
+            if cached { request.output = fixture.root.join(LOGICAL_NAME); }
+            else { fs::write(&request.staging_output, &fixture.artifact).unwrap(); }
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_fnlp"))
+                .args(["models", "acquire", "--direct", "--manifest"])
+                .arg(&request.manifest).arg("--manifest-sha256")
+                .arg(&request.expected_release_manifest_sha256)
+                .arg("--staging-output").arg(&request.staging_output)
+                .arg("--output").arg(&request.output)
+                .args(["--memory-mib", "256", "--max-download-bytes", "0"])
+                .output().unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(output.status.success(), "{stderr}");
+            assert!(stderr.contains("MODELS_ACQUIRE RESULT=PASS mode=direct"), "{stderr}");
+            assert!(stderr.contains(&format!("cache_hit={cached}")), "{stderr}");
+            assert!(stderr.contains("network_downloaded_bytes=0"), "{stderr}");
+            assert!(stderr.contains("retained_new_bytes=0"), "{stderr}");
+            assert!(stderr.contains("activation_authority=false"), "{stderr}");
+            assert_eq!(fs::read(&request.output).unwrap(), fixture.artifact);
+            assert_eq!(request.staging_output.exists(), !cached);
+        }
+    }
+
+    #[test]
+    fn cli_direct_admits_both_workspaces_before_opening_a_manifest() {
+        let fixture = Fixture::new("direct-cli-memory");
+        let manifest = fixture.root.join("absent.manifest.json");
+        let request = request(&fixture, "unopened");
+        for memory in ["1", "127", "128", "143"] {
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_fnlp"))
+                .args(["models", "acquire", "--direct", "--manifest"])
+                .arg(&manifest).arg("--manifest-sha256")
+                .arg(&request.expected_release_manifest_sha256)
+                .arg("--staging-output").arg(&request.staging_output)
+                .arg("--output").arg(&request.output)
+                .args(["--memory-mib", memory])
+                .output().unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(output.status.code(), Some(9), "{stderr}");
+            assert!(!request.staging_output.exists());
+            assert!(!request.output.exists());
+            assert!(!manifest.exists());
+        }
+    }
+}

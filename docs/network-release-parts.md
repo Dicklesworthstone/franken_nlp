@@ -140,7 +140,8 @@ fnlp models download-parts \
 The command installs one ordinary `EngineResources` host and runs the HTTP
 future on that owned runtime; it does not create a second nested runtime.
 
-For the complete remote-to-local-artifact candidate path, use:
+For the complete remote-to-local-artifact candidate path with a reusable parts
+workspace, use:
 
 ```sh
 fnlp models acquire \
@@ -198,6 +199,88 @@ A successful command prints metadata only to stderr. `download-parts` exits
 zero after every part has a complete manifest digest; `acquire` exits zero only
 after the complete final artifact is verified or reconstructed. Both retain
 `activation_authority=false`.
+
+## Acquire directly into one artifact
+
+Add `--direct` when the goal is a complete checked artifact without retaining
+a separate full-model parts workspace:
+
+```sh
+fnlp models acquire --direct \
+  --manifest /release/model.manifest.json \
+  --manifest-sha256 "$INDEPENDENT_MANIFEST_SHA256" \
+  --staging-output /models/model.fnlpq.stage \
+  --output /models/model.fnlpq \
+  --memory-mib 256
+```
+
+Each bounded HTTPS response appends directly to the same staging file. There
+is no second reconstruction write and no `.partNN` or per-part `.partial`
+file. Staging and final output must have the same parent directory. Successful
+publication creates a no-replace hard link, so the retained staging name and
+final name refer to the same artifact storage. This avoids the separate
+artifact-sized parts copy used by the default mode. It does not measure or
+promise free disk space.
+
+`--direct` rejects `--parts-dir` and `--max-copy-bytes` before IO. Without
+`--direct`, the existing parts directory requirement and independent
+download/copy limits remain. The direct mode uses `--max-download-bytes` for
+newly received body bytes across every part and mirror attempt. Discarded
+failed-mirror bytes still spend that allowance. A successful partial range
+retains its bytes, returns exit category **5**, and can be resumed by repeating
+the command. Rollback after a failed mirror preserves the exact pre-attempt
+prefix, including all earlier complete parts.
+
+An existing regular staging file is resumed by default. Before any request,
+the command rehashes every retained complete part and compares it with the
+pinned manifest. It also rehashes a retained incomplete part, but that tail is
+not authenticated until its complete part digest passes. A corrupt retained
+tail therefore cannot produce a successful artifact; failed completion keeps
+the retained input for inspection rather than silently repairing it. Use a
+new staging pathname to restart from fresh bytes. `--no-resume` refuses any
+existing staging file. Oversized staging, symlinks, and observed pathname
+replacement are refused.
+
+A complete staging artifact can finish with `--max-download-bytes 0` and
+without the original release parts. Before creating the final name, the
+shared publication boundary syncs staging, rehashes its entire length,
+checks the manifest's whole-artifact SHA-256, and validates the checked
+container and all manifest-bound semantic identities. An already existing
+final artifact is independently verified first and succeeds as a cache hit
+without touching staging or contacting mirrors. An invalid existing final
+file is never replaced.
+
+The direct receipt includes `mode=direct`, `cache_hit`, `resumed_bytes`,
+`network_downloaded_bytes`, and `retained_new_bytes`. The last two differ when
+failed mirrors consumed bytes that were rolled back. A cache hit reports zero
+for all three byte counters. Direct mode admits both the 128 MiB local
+verification workspace and the configured network reserve before any IO,
+including a cache hit; the default reserve therefore needs at least 144 MiB
+of modeled memory allowance. The reservations model bounded metadata and
+transport bookkeeping, not artifact-sized allocations or an exhaustive RSS
+cap.
+
+Library users can call
+`artifact::pull::http::direct::acquire_release_artifact` with an explicit
+`Cx`, `NetworkArtifactRequest`, and `NetworkPartsOptions`. The synchronous
+`NlpEngine::acquire_release_artifact_candidate` adapter owns those local and
+network reservations on the existing process runtime. Both return a
+`NetworkArtifactReport` with `activation_authority=false` and
+`directory_durability_confirmed=false`.
+
+This remains a caller-controlled stable-path operation. It does not supply
+the hostile model-root transaction or trusted activation journal. Cancellation
+and synchronous filesystem failure can leave staging; cancellation detected
+after publication can also leave a verified final pathname without a success
+receipt. A retry verifies that pathname rather than overwriting it. The same
+per-mirror timeout, cancellation, redirect, exact `206 Content-Range`, and
+identity-encoding checks apply to both acquisition modes.
+
+Source regressions cover multipart resume boundaries, corrupt prefixes and
+tails, absolute-offset rollback, failed-mirror byte accounting, deterministic
+timeout/cancellation, and the real current-format container's zero-network
+completion/cache paths. Their execution remains pending the repository's
+controller-selected DSR checkpoint; this candidate is not release evidence.
 
 ## What this does not claim
 

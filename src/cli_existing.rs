@@ -40,6 +40,7 @@ use crate::{
 use crate::{
     artifact::pull::{LOCAL_RELEASE_WORKSPACE_RESERVE_BYTES, verify_local_release_cache},
     artifact::pull::http::{NetworkPartsOptions, NetworkPartsRequest, NetworkPullError},
+    artifact::pull::http::direct::NetworkArtifactRequest,
     hosted::{HostedError, HostedNetworkPullError, NetworkPullHostOptions},
 };
 use clap::{CommandFactory, Parser, Subcommand};
@@ -189,9 +190,12 @@ struct ModelsAcquireCommand {
     /// Independently trusted domain-separated manifest SHA-256.
     #[arg(long)]
     manifest_sha256: String,
-    /// Existing caller-controlled workspace for final .partNN and .partial files.
+    /// Stream directly into staging without storing a separate copy of every part.
     #[arg(long)]
-    parts_dir: PathBuf,
+    direct: bool,
+    /// Existing caller-controlled parts workspace; required without --direct.
+    #[arg(long, required_unless_present = "direct", conflicts_with = "direct")]
+    parts_dir: Option<PathBuf>,
     /// Staging Generic .fnlpq path, in the same directory as --output.
     #[arg(long)]
     staging_output: PathBuf,
@@ -204,8 +208,8 @@ struct ModelsAcquireCommand {
     /// Maximum newly received network bytes across this invocation.
     #[arg(long)]
     max_download_bytes: Option<u64>,
-    /// Maximum new bytes copied from verified parts into reconstruction staging.
-    #[arg(long)]
+    /// Maximum new bytes copied from verified parts; unavailable with --direct.
+    #[arg(long, conflicts_with = "direct")]
     max_copy_bytes: Option<u64>,
     /// Process memory-ledger ceiling in MiB; local verification reserves 128 MiB.
     /// Network work also needs the separate --network-reserve-mib allowance.
@@ -504,6 +508,14 @@ fn run_models_command(command: ModelsSubcommand) -> ExitCode {
 
 fn run_models_acquire(command: ModelsAcquireCommand) -> ExitCode {
     const MIB: u64 = 1024 * 1024;
+    // Enforce the same mode contract for programmatic callers as clap does for
+    // argv. Refuse conflicting or incomplete authority before any IO.
+    if (command.direct && (command.parts_dir.is_some() || command.max_copy_bytes.is_some()))
+        || (!command.direct && command.parts_dir.is_none())
+    {
+        eprintln!("MODELS_ACQUIRE RESULT=REFUSED reason=invalid-direct-or-parts-mode");
+        return ErrorCode::Usage.as_process_exit();
+    }
     let Some(memory_bytes) = command.memory_mib.checked_mul(MIB).filter(|&bytes| bytes != 0) else {
         eprintln!("MODELS_ACQUIRE RESULT=REFUSED reason=invalid-memory-mib");
         return ErrorCode::Usage.as_process_exit();
@@ -541,6 +553,39 @@ fn run_models_acquire(command: ModelsAcquireCommand) -> ExitCode {
                 return ErrorCode::AdmissionOrResourceLimit.as_process_exit();
             }
         };
+        if command.direct {
+            let result = engine.acquire_release_artifact_candidate(
+                NetworkArtifactRequest {
+                    manifest: command.manifest,
+                    expected_release_manifest_sha256: command.manifest_sha256,
+                    staging_output: command.staging_output,
+                    output: command.output,
+                },
+                NetworkPartsOptions {
+                    resume: !command.no_resume,
+                    max_new_bytes: command.max_download_bytes,
+                    request_timeout: Duration::from_secs(command.request_timeout_seconds),
+                    max_redirects: command.max_redirects,
+                },
+                NetworkPullHostOptions { network_reserve_bytes },
+            );
+            return match result {
+                Ok(report) => {
+                    eprintln!(
+                        "MODELS_ACQUIRE RESULT=PASS mode=direct output={} artifact_bytes={} artifact_sha256={} manifest_sha256={} parts={} cache_hit={} resumed_bytes={} network_downloaded_bytes={} retained_new_bytes={} local_workspace_bytes={LOCAL_RELEASE_WORKSPACE_RESERVE_BYTES} directory_durability=unconfirmed activation_authority=false",
+                        report.output.display(), report.artifact_bytes, report.artifact_sha256,
+                        report.release_manifest_sha256, report.part_count, report.cache_hit,
+                        report.resumed_bytes, report.downloaded_bytes, report.retained_new_bytes,
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("MODELS_ACQUIRE RESULT=FAIL mode=direct reason={error}");
+                    network_download_error_code(&error).as_process_exit()
+                }
+            };
+        }
+        let parts_dir = command.parts_dir.expect("parts mode checked before IO");
         let lease = engine.resources().acquire_lease();
         // Admit local metadata, canonical parsing and streaming scratch before
         // any manifest/artifact IO. Keep the charge through receipt output and
@@ -585,7 +630,7 @@ fn run_models_acquire(command: ModelsAcquireCommand) -> ExitCode {
             NetworkPartsRequest {
                 manifest: command.manifest.clone(),
                 expected_release_manifest_sha256: command.manifest_sha256.clone(),
-                parts_dir: command.parts_dir.clone(),
+                parts_dir: parts_dir.clone(),
             },
             transfer,
             NetworkPullHostOptions { network_reserve_bytes },
@@ -601,7 +646,7 @@ fn run_models_acquire(command: ModelsAcquireCommand) -> ExitCode {
             &LocalReconstructRequest {
                 manifest: command.manifest,
                 expected_release_manifest_sha256: command.manifest_sha256,
-                parts_dir: command.parts_dir,
+                parts_dir,
                 staging_output: command.staging_output,
                 output: command.output,
             },
@@ -2556,6 +2601,8 @@ mod tests {
         assert_eq!(command.max_download_bytes, Some(1_048_576));
         assert_eq!(command.max_copy_bytes, Some(1_048_576));
         assert!(!command.no_resume);
+        assert!(!command.direct);
+        assert_eq!(command.parts_dir, Some(PathBuf::from("/release/parts")));
 
         assert!(Cli::try_parse_from([
             "fnlp",
@@ -2572,6 +2619,31 @@ mod tests {
             "--output",
             "/models/model.fnlpq",
         ]).is_err(), "memory admission must be explicit");
+    }
+
+    #[test]
+    fn models_acquire_direct_omits_parts_but_refuses_conflicting_copy_authority() {
+        let base = ["fnlp", "models", "acquire",
+            "--manifest", "/release/model.manifest.json",
+            "--manifest-sha256", "abababababababababababababababababababababababababababababababab",
+            "--staging-output", "/models/model.stage", "--output", "/models/model.fnlpq",
+            "--memory-mib", "256"];
+        let mut direct = base.to_vec();
+        direct.extend(["--direct", "--max-download-bytes", "0", "--no-resume"]);
+        let parsed = Cli::try_parse_from(&direct).expect("direct acquisition requires no parts directory");
+        let Some(Command::Models { command: ModelsSubcommand::Acquire(command) }) = parsed.command
+            else { panic!("wrong direct acquisition route"); };
+        assert!(command.direct);
+        assert!(command.parts_dir.is_none());
+        assert!(command.max_copy_bytes.is_none());
+        assert_eq!(command.max_download_bytes, Some(0));
+        assert!(command.no_resume);
+        assert!(Cli::try_parse_from(base).is_err(), "default mode still needs a parts directory");
+        for conflict in [["--parts-dir", "/release/parts"], ["--max-copy-bytes", "0"]] {
+            let mut args = direct.clone();
+            args.extend(conflict);
+            assert!(Cli::try_parse_from(args).is_err(), "direct mode cannot silently ignore {conflict:?}");
+        }
     }
 
     #[test]

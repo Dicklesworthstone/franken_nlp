@@ -431,46 +431,10 @@ pub fn reconstruct_local_release_with_options(
         &mut progress, &mut checkpoint,
     )?;
 
-    staging.flush().map_err(|error| PullError::Publish {
-        operation: "flush staging output",
-        detail: error.to_string(),
-    })?;
-    staging.sync_all().map_err(|error| PullError::Publish {
-        operation: "sync staging output",
-        detail: error.to_string(),
-    })?;
-    progress.phase = LocalReconstructPhase::VerifyArtifact;
-    progress.part_index = None;
-    verify_staged_artifact(
-        &mut staging, &manifest, &mut buffer, progress, &mut checkpoint,
+    verify_and_publish_staged_artifact(
+        &mut staging, &manifest, &request.staging_output, &request.output,
+        &mut buffer, &mut progress, &mut checkpoint,
     )?;
-    let pinned_file = staging.try_clone().map_err(|error| PullError::Publish {
-        operation: "clone held staging descriptor",
-        detail: error.to_string(),
-    })?;
-    let reader = match FnlpqRangeReader::from_file_with_checkpoint(
-        pinned_file, || checkpoint(progress),
-    ) {
-        Ok(reader) => reader,
-        Err(FnlpqReadError::Cancelled(cause)) => {
-            return Err(PullError::Cancelled { cause, progress });
-        }
-        Err(error) => return Err(PullError::Container(error)),
-    };
-    verify_container_identity(&reader, &manifest)?;
-
-    progress.phase = LocalReconstructPhase::Publish;
-    reconstruction_checkpoint(progress, &mut checkpoint)?;
-    check_staging_path(&staging, &request.staging_output, manifest.artifact.bytes)?;
-    // Hard-link publication cannot replace an existing destination. The held
-    // descriptor stays alive through validation and publication; path checks
-    // also detect observed replacement. They are not a no-follow transaction
-    // against concurrent hostile mutation of the caller-controlled workspace.
-    fs::hard_link(&request.staging_output, &request.output).map_err(|error| PullError::Publish {
-        operation: "create final no-replace hard link",
-        detail: error.to_string(),
-    })?;
-    check_staging_path(&staging, &request.output, manifest.artifact.bytes)?;
 
     Ok(LocalReconstructReport {
         release_manifest_sha256: request.expected_release_manifest_sha256.clone(),
@@ -484,6 +448,59 @@ pub fn reconstruct_local_release_with_options(
         staging_output: request.staging_output.clone(),
         directory_durability_confirmed: false,
     })
+}
+
+/// Shared final integrity and no-replace publication boundary for explicit
+/// caller-controlled local and direct-network candidate staging.
+fn verify_and_publish_staged_artifact(
+    staging: &mut File,
+    manifest: &ReleaseManifest,
+    staging_output: &Path,
+    output: &Path,
+    buffer: &mut [u8],
+    progress: &mut LocalReconstructProgress,
+    checkpoint: &mut impl FnMut(LocalReconstructProgress) -> Option<DecodeCancellationKind>,
+) -> Result<(), PullError> {
+    staging.flush().map_err(|error| PullError::Publish {
+        operation: "flush staging output",
+        detail: error.to_string(),
+    })?;
+    staging.sync_all().map_err(|error| PullError::Publish {
+        operation: "sync staging output",
+        detail: error.to_string(),
+    })?;
+    progress.phase = LocalReconstructPhase::VerifyArtifact;
+    progress.part_index = None;
+    verify_staged_artifact(
+        staging, manifest, buffer, *progress, checkpoint,
+    )?;
+    let pinned_file = staging.try_clone().map_err(|error| PullError::Publish {
+        operation: "clone held staging descriptor",
+        detail: error.to_string(),
+    })?;
+    let reader = match FnlpqRangeReader::from_file_with_checkpoint(
+        pinned_file, || checkpoint(*progress),
+    ) {
+        Ok(reader) => reader,
+        Err(FnlpqReadError::Cancelled(cause)) => {
+            return Err(PullError::Cancelled { cause, progress: *progress });
+        }
+        Err(error) => return Err(PullError::Container(error)),
+    };
+    verify_container_identity(&reader, manifest)?;
+
+    progress.phase = LocalReconstructPhase::Publish;
+    reconstruction_checkpoint(*progress, checkpoint)?;
+    check_staging_path(staging, staging_output, manifest.artifact.bytes)?;
+    // Hard-link publication cannot replace an existing destination. The held
+    // descriptor stays alive through validation and publication; path checks
+    // also detect observed replacement. They are not a no-follow transaction
+    // against concurrent hostile mutation of the caller-controlled workspace.
+    fs::hard_link(staging_output, output).map_err(|error| PullError::Publish {
+        operation: "create final no-replace hard link",
+        detail: error.to_string(),
+    })?;
+    check_staging_path(staging, output, manifest.artifact.bytes)
 }
 
 fn reconstruction_checkpoint(

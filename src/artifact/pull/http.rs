@@ -14,6 +14,8 @@
 //! qualification; it closes the missing executable acquisition path without
 //! weakening those gates.
 
+pub mod direct;
+
 use std::{
     error::Error,
     fmt,
