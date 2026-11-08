@@ -31,11 +31,11 @@ pub(super) struct BatchArgs {
 }
 
 pub(super) fn definition() -> clap::Command {
-    BatchArgs::augment_args(Int4Args::augment_args(clap::Command::new("text-batch")
-        .about("Execute one bounded NDJSON generate/chat cohort on a shared INT4 model")))
+    input_encoding::definition(BatchArgs::augment_args(Int4Args::augment_args(clap::Command::new("text-batch")
+        .about("Execute one bounded NDJSON generate/chat cohort on a shared INT4 model"))))
         .mut_arg("input", |arg| arg.help("NDJSON file, or '-' for stdin; the complete nonempty cohort is read before model loading"))
         .mut_arg("prefill_rows", |arg| arg.help("Explicit packed prompt/decode schedule: at most this many TOTAL tokens per pass, 1..=64; extra workspace is admitted"))
-        .long_about("Explicit non-certified fixed-cohort INT4 execution. Input is 1..=max-records NDJSON records: {\"id\":\"unique\",\"prompt\":\"...\"} for generate; chat uses a messages array. Optional sample_index is a u64. Shared CLI generation options apply independently to each row; IDs, not row order, address seeded draws. --context-tokens is the allocated per-row capacity and --max-input-bytes includes one line's JSON/newlines. All rows, samplers and retained results are admitted together. --max-checkpoints covers the entire native cohort, never each row or pack. By default advance one prompt/feedback token per unfinished sequence per tick. --prefill-rows N instead bounds TOTAL prompt/decode tokens per layer-major pack; it rotates fairly even when N is smaller than the cohort and never batches unsampled feedback. Read, validate and plan the entire input before one shared-model execution; emit one completed JSON batch only after every task finalizes. No provisional token events, successful-prefix result, automatic refill or retry. Sources/snapshot pins and optional save behavior match the single-request source-int4 commands. Blocking IO is cooperative, not preemptible.")
+        .long_about("Explicit non-certified fixed-cohort INT4 execution. Input is 1..=max-records NDJSON records: {\"id\":\"unique\",\"prompt\":\"...\"} for generate; chat uses a messages array. Optional sample_index is a u64. Shared CLI generation options apply independently to each row; IDs, not row order, address seeded draws. --context-tokens is the allocated per-row capacity and --max-input-bytes includes one line's JSON/newlines. All rows, samplers and retained results are admitted together. --input-encoding safe-bpe-v1 explicitly selects byte-preserving, control-excluding BPE; tokenizer work caps cover each complete transcript and never renew between its messages. One transient encoder workspace is admitted alongside all retained row plans; the complete policy is bound to prompt identity and reported with the batch. Byte fallback remains the default. --max-checkpoints covers the entire native cohort, never each row or pack. By default advance one prompt/feedback token per unfinished sequence per tick. --prefill-rows N instead bounds TOTAL prompt/decode tokens per layer-major pack; it rotates fairly even when N is smaller than the cohort and never batches unsampled feedback. Read, validate and plan the entire input before one shared-model execution; emit one completed JSON batch only after every task finalizes. No provisional token events, successful-prefix result, automatic refill or retry. Sources/snapshot pins and optional save behavior match the single-request source-int4 commands. Blocking IO is cooperative, not preemptible.")
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -90,9 +90,13 @@ impl BatchArgs {
         let result_bytes = sum(&[times(rows, common.result_bytes as u64)?, 16_384])?;
         let publication_bytes = usize::try_from(sum(&[result_bytes, times(rows, 2048)?, 8192])?)
             .map_err(|_| CandidateError::Arguments)?;
+        // Plans are retained for the whole cohort, but each transcript's BPE
+        // scratch is dropped before planning the next. Price it once in the
+        // full preparation floor, not only in the earlier single-row quote.
+        let encoding_workspace = args.input_encoding.workspace_bytes(args.max_input_bytes, common.max_prompt_tokens)?;
         let preparation_floor = sum(&[128 * MIB,
             times(times(rows, args.max_input_bytes as u64)?, 32)?,
-            times(sum(&[publication_bytes as u64, 4096])?, 2)?, 65_536, extra_preparation])?;
+            times(sum(&[publication_bytes as u64, 4096])?, 2)?, 65_536, extra_preparation, encoding_workspace])?;
         if common.preparation_bytes < preparation_floor { return Err(CandidateError::Arguments); }
         // Count the actual complete phase occupancies, never sum mutually exclusive
         // load/save/execute scratch and never price a batch as a single sequence.

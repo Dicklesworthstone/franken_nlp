@@ -66,8 +66,8 @@ fn safe_bpe_keeps_buffered_identity_limits_and_prices_the_complete_workspace() {
         let byte_floor = 128 * MIB + a.max_input_bytes as u64 * 32
             + (limits.result_bytes as u64 + 4096) * 2;
         a.preparation_mib = byte_floor.div_ceil(MIB);
-        let mut byte_default = a.clone();
-        byte_default.input_encoding = input_encoding::InputEncodingArgs::default();
+        let (_, mut byte_default) = args(operation, &["--prefill-rows", "4"]);
+        byte_default.preparation_mib = a.preparation_mib;
         options.validate(&byte_default).unwrap();
         assert_eq!(options.validate(&a).err().unwrap().exit, ErrorCode::Usage);
         a.preparation_mib = (byte_floor + encoding.requirements().unwrap().workspace_bytes).div_ceil(MIB);

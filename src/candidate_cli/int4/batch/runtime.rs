@@ -5,7 +5,8 @@ use std::{fs::File, io::BufReader, time::{Duration, Instant}};
 use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
     hosted::{CancellationToken, Int4LoadLimits, RunLimits, ResidentInt4,
         grouped_int4::batch::{Int4BatchHostLimits, Int4ChatBatchMember}},
-    native_engine::strict_int4::{Int4ModelLoadBudget, weights::snapshot::INT4_SNAPSHOT_VERSION},
+    native_engine::{decode::{DecodeCancellationKind, DecodeStepControl},
+        strict_int4::{Int4ModelLoadBudget, weights::snapshot::INT4_SNAPSHOT_VERSION}},
     tasks::{ir::TaskBudget, chat::{ChatLimits, GenerateRequest, ChatRequest,
         grouped_int4::{Int4ChatPlanner, batch::Int4ChatBatchLimits}}}};
 
@@ -82,6 +83,8 @@ pub(super) fn execute(args: Int4Args, batch: BatchArgs, limits: BatchLimits,
         group_width: args.group_width, integer_kernel: limits.common.kernel.kind().id(),
         items: &items, output: result.result(), snapshot,
     };
+    let response = input_encoding::Response { response: &response,
+        input_encoding: input_encoding::reported_policy(planner.document_encoding()) };
     publish_checked(&response, limits.publication_bytes, output, &|| remaining().map(|_| ()))
 }
 
@@ -116,7 +119,9 @@ fn chat_limits(args: &Int4Args, limits: Int4Limits) -> ChatLimits {
         max_total_message_bytes: args.max_input_bytes, generation: args.generation_limits(limits) }
 }
 pub(super) fn planner(model: &ResidentInt4, args: &Int4Args, limits: Int4Limits) -> Result<Int4ChatPlanner, CandidateError> {
+    let policy = args.input_encoding.policy(args.max_input_bytes, limits.max_prompt_tokens)?;
     Int4ChatPlanner::for_model(model.model_identity(), task_budget(args, limits)?, chat_limits(args, limits))
+        .and_then(|planner| planner.with_document_encoding(policy))
         .map_err(|_| CandidateError::Planning)
 }
 #[derive(Serialize)]
@@ -128,6 +133,9 @@ pub(super) fn prepare(records: Vec<Record>, planner: &Int4ChatPlanner, args: &In
     -> Result<(Vec<Int4ChatBatchMember>, Vec<Item>), CandidateError> {
     if records.is_empty() || records.len() > MAX_INT4_SEQUENCES || first_sequence == 0
         || first_sequence.checked_add(records.len() as u64 - 1).is_none() { return Err(CandidateError::Input); }
+    if planner.document_encoding() != &args.input_encoding.policy(args.max_input_bytes, limits.max_prompt_tokens)? {
+        return Err(CandidateError::Identity);
+    }
     let mut members = Vec::new(); let mut items = Vec::new();
     members.try_reserve_exact(records.len()).map_err(|_| CandidateError::Memory)?;
     items.try_reserve_exact(records.len()).map_err(|_| CandidateError::Memory)?;
@@ -135,17 +143,33 @@ pub(super) fn prepare(records: Vec<Record>, planner: &Int4ChatPlanner, args: &In
     for (index, record) in records.into_iter().enumerate() {
         checkpoint()?;
         let request_seq = first_sequence.checked_add(index as u64).ok_or(CandidateError::Input)?;
+        let mut control = PlanningControl { checkpoint: &mut checkpoint, failure: None };
         let prepared = match record.content {
-            wire::Content::Generate(prompt) => planner.plan_generate(&GenerateRequest {
-                item_id: record.id.clone(), sample_index: record.sample_index, prompt, generation: options.clone(), budget }),
-            wire::Content::Chat(messages) => planner.plan_chat(&ChatRequest {
-                item_id: record.id.clone(), sample_index: record.sample_index, messages, generation: options.clone(), budget }),
-        }.map_err(|_| CandidateError::Planning)?;
+            wire::Content::Generate(prompt) => planner.plan_generate_with_control(&GenerateRequest {
+                item_id: record.id.clone(), sample_index: record.sample_index, prompt, generation: options.clone(), budget }, &mut control),
+            wire::Content::Chat(messages) => planner.plan_chat_with_control(&ChatRequest {
+                item_id: record.id.clone(), sample_index: record.sample_index, messages, generation: options.clone(), budget }, &mut control),
+        }.map_err(|_| control.failure.unwrap_or(CandidateError::Planning))?;
         items.push(Item { id: record.id, sample_index: record.sample_index, request_seq });
         members.push(Int4ChatBatchMember { prepared, request_seq, context_tokens: args.context_tokens });
     }
     checkpoint()?;
     Ok((members, items))
+}
+
+/// Forward the caller's deadline/resource checkpoint into the encoder's bounded
+/// inner loop. Preserve the first original CLI error; it must not be flattened
+/// into a generic planning refusal or polled again after cancellation.
+struct PlanningControl<'a, F> { checkpoint: &'a mut F, failure: Option<CandidateError> }
+impl<F: FnMut() -> Result<(), CandidateError>> DecodeStepControl for PlanningControl<'_, F> {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+        if self.failure.is_none() { self.failure = (self.checkpoint)().err(); }
+        self.failure.map(|error| match error {
+            CandidateError::Timeout => DecodeCancellationKind::Deadline,
+            CandidateError::Memory => DecodeCancellationKind::ResourceUnavailable,
+            _ => DecodeCancellationKind::FailFast,
+        })
+    }
 }
 #[derive(Clone, Copy, Serialize)]
 pub(super) struct Snapshot {

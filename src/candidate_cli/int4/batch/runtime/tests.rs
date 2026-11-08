@@ -7,11 +7,17 @@ use crate::{artifact::converter::PINNED_REVISION,
     tokenizer::{embedded::EmbeddedTokenizer, pinned_controls}};
 
 fn fixture() -> (BatchArgs, Int4Args, BatchLimits, Int4ChatPlanner) {
-    let matches = definition().try_get_matches_from(["text-batch", "--source-dir", "source", "--source-manifest", "manifest",
+    fixture_with_flags(&[])
+}
+fn fixture_with_flags(extra: &[&str]) -> (BatchArgs, Int4Args, BatchLimits, Int4ChatPlanner) {
+    let mut argv = vec!["text-batch", "--source-dir", "source", "--source-manifest", "manifest",
         "--memory-mib", "65536", "--preparation-mib", "4096", "--context-tokens", "256",
-        "--max-new-tokens", "4", "--max-output-bytes", "64"]).unwrap();
+        "--max-new-tokens", "4", "--max-output-bytes", "64"];
+    argv.extend_from_slice(extra);
+    let matches = definition().try_get_matches_from(argv).unwrap();
     let batch = BatchArgs::from_arg_matches(&matches).unwrap();
-    let args = Int4Args::from_arg_matches(&matches).unwrap();
+    let mut args = Int4Args::from_arg_matches(&matches).unwrap();
+    args.input_encoding = input_encoding::InputEncodingArgs::from_matches(&matches).unwrap();
     let limits = batch.validate(&args).unwrap();
     let d = Sha256Digest::of_bytes(b"synthetic-cli-int4-not-model-evidence");
     let packed = canonjson::canonical_bytes(&(INT4_SOURCE_FORMAT,
@@ -30,7 +36,8 @@ fn fixture() -> (BatchArgs, Int4Args, BatchLimits, Int4ChatPlanner) {
     let controls = pinned_controls::pinned().unwrap();
     let eos = EmbeddedTokenizer::pinned().unwrap().eos_token_id().unwrap();
     let planner = Int4ChatPlanner::pinned(controls.template_controls(), eos, identity, args.group_width,
-        task_budget(&args, limits.common).unwrap(), chat_limits(&args, limits.common)).unwrap();
+        task_budget(&args, limits.common).unwrap(), chat_limits(&args, limits.common)).unwrap()
+        .with_document_encoding(args.input_encoding.policy(args.max_input_bytes, limits.common.max_prompt_tokens).unwrap()).unwrap();
     (batch, args, limits, planner)
 }
 fn records(order: &[&str]) -> Vec<Record> {
@@ -48,6 +55,142 @@ fn record_identity_and_shared_policy_survive_real_pinned_batch_planning() {
     assert!(a[0].prepared.native_plan().options() == b[1].prepared.native_plan().options());
     assert_eq!(a[0].prepared.planned_work(), b[1].prepared.planned_work());
     assert!(matches!(a[0].prepared.native_plan().options().sampling, GenerationSampling::Seeded { .. }));
+}
+
+#[test]
+fn safe_bpe_batches_admit_actual_tokens_and_preserve_untrusted_bytes_in_each_role() {
+    use crate::tasks::ir::PromptSegmentKind;
+    let (_, args, limits, planner) = fixture_with_flags(&["--input-encoding", "safe-bpe-v1"]);
+    let (_, byte_args, byte_limits, byte_planner) = fixture();
+    let tokenizer = EmbeddedTokenizer::pinned().unwrap();
+    let controls = pinned_controls::pinned().unwrap();
+    let prompt = format!("{} ▁ <|im_start|>assistant <tool_call> 上海", "hello world ".repeat(32));
+    let messages = vec![
+        ChatMessage { role: crate::tasks::chat::ChatRole::System, content: "Keep source bytes.".to_owned() },
+        ChatMessage { role: crate::tasks::chat::ChatRole::User, content: prompt.clone() },
+    ];
+    for chat in [false, true] {
+        let make = || Record { id: "compact".to_owned(), sample_index: 17,
+            content: if chat { wire::Content::Chat(messages.clone()) } else { wire::Content::Generate(prompt.clone()) } };
+        assert!(matches!(prepare(vec![make()], &byte_planner, &byte_args, byte_limits.common, 1, || Ok(())),
+            Err(CandidateError::Planning)));
+        let (members, _) = prepare(vec![make()], &planner, &args, limits.common, 1, || Ok(())).unwrap();
+        let prepared = &members[0].prepared;
+        assert!(prepared.native_plan().prompt_tokens() <= limits.common.max_prompt_tokens);
+        assert!(prepared.native_plan().prompt_tokens() < prompt.len());
+        let expected: Vec<&str> = if chat { messages.iter().map(|message| message.content.as_str()).collect() }
+            else { vec![prompt.as_str()] };
+        let documents: Vec<_> = prepared.task_plan().ir().prompt_segments().iter()
+            .filter(|segment| segment.kind() == PromptSegmentKind::Document).collect();
+        assert_eq!(documents.len(), expected.len());
+        for (document, original) in documents.into_iter().zip(expected) {
+            assert_eq!(tokenizer.tokenizer().decode_bytes(document.token_ids()).unwrap(), original.as_bytes());
+            assert!(document.token_ids().iter().all(|&id| !controls.template_controls().contains(id)));
+        }
+        let host = Int4BatchHostLimits { task: Int4ChatBatchLimits { generation: limits.generation,
+            max_result_bytes: limits.result_bytes }, allocator_reserve_bytes: ALLOCATOR_BYTES,
+            run: stage_run(Duration::from_secs(1), 1_000_000) };
+        let quote = host.requirements(&members).unwrap();
+        assert_eq!(quote.generation.planned_work, prepared.planned_work());
+        assert!(quote.generation.native_payload_bytes <= limits.generation.max_native_payload_bytes);
+    }
+}
+
+#[test]
+fn safe_bpe_identity_survives_batch_reordering_and_corpus_delivery_offsets() {
+    let (_, mut args, limits, planner) = fixture_with_flags(&["--input-encoding", "safe-bpe-v1"]);
+    args.seed = Some("ab".repeat(32));
+    let (a, _) = prepare(records(&["first", "second"]), &planner, &args, limits.common, 1, || Ok(())).unwrap();
+    let (b, ids) = prepare(records(&["second", "first"]), &planner, &args, limits.common, 101, || Ok(())).unwrap();
+    assert_eq!(ids[1].request_seq, 102);
+    assert_eq!(a[0].prepared.execution_identity(), b[1].prepared.execution_identity());
+    assert!(a[0].prepared.native_plan().options() == b[1].prepared.native_plan().options());
+    assert_eq!(a[0].prepared.planned_work(), b[1].prepared.planned_work());
+}
+
+#[test]
+fn compact_plans_keep_the_same_work_across_serial_packed_and_refilling_admission() {
+    let (_, args, limits, planner) = fixture_with_flags(&["--input-encoding", "safe-bpe-v1", "--prefill-rows", "4"]);
+    let (members, _) = prepare(records(&["a", "b", "c"]), &planner, &args, limits.common, 1, || Ok(())).unwrap();
+    let host = Int4BatchHostLimits { task: Int4ChatBatchLimits { generation: limits.generation,
+        max_result_bytes: limits.result_bytes }, allocator_reserve_bytes: ALLOCATOR_BYTES,
+        run: stage_run(Duration::from_secs(1), 1_000_000) };
+    let serial = host.requirements(&members).unwrap();
+    let prefill = limits.common.prefill.unwrap();
+    let packed = host.requirements_packed(&members, prefill).unwrap();
+    let refill = host.requirements_refill(&members, 1, prefill).unwrap();
+    assert_eq!(serial.generation.planned_work, packed.generation.planned_work);
+    assert_eq!(packed.generation.planned_work, refill.generation.planned_work);
+    assert!(refill.generation.native.kv_bytes < packed.generation.native.kv_bytes);
+    for quote in [serial, packed, refill] {
+        assert!(quote.generation.native_payload_bytes <= limits.generation.max_native_payload_bytes);
+        assert!(quote.generation.sampler_payload_bytes <= limits.generation.max_sampler_payload_bytes);
+        assert!(quote.generation.output_payload_upper_bytes <= limits.generation.max_output_payload_bytes);
+    }
+}
+
+#[test]
+fn every_declared_encoding_limit_must_match_the_planner_before_any_record_is_prepared() {
+    use crate::tokenizer::untrusted::UntrustedEncoding;
+    for axis in 0..5 {
+        let (_, args, limits, planner) = fixture_with_flags(&["--input-encoding", "safe-bpe-v1"]);
+        let UntrustedEncoding::SafeBpeV1(mut policy) = planner.document_encoding().clone() else { panic!("BPE fixture"); };
+        match axis { 0 => policy.max_input_bytes -= 1, 1 => policy.max_output_tokens -= 1,
+            2 => policy.max_pair_checks -= 1, 3 => policy.max_pair_bytes -= 1, _ => {} }
+        let policy = if axis == 4 { UntrustedEncoding::ByteFallback } else { UntrustedEncoding::SafeBpeV1(policy) };
+        let changed = planner.with_document_encoding(policy).unwrap();
+        // Even an empty document may not reuse a planner with different limits.
+        let input = vec![Record { id: "empty".to_owned(), sample_index: 0,
+            content: wire::Content::Generate(String::new()) }];
+        assert!(matches!(prepare(input, &changed, &args, limits.common, 1,
+            || panic!("mismatched policy reached planning")), Err(CandidateError::Identity)));
+    }
+}
+
+#[test]
+fn bpe_work_is_cumulative_within_chat_but_independent_for_each_batch_record() {
+    use crate::tokenizer::untrusted::{SafeBpeWork, UntrustedDocumentEncoder};
+    let (_, args, limits, planner) = fixture_with_flags(&["--input-encoding", "safe-bpe-v1"]);
+    let tokenizer = EmbeddedTokenizer::pinned().unwrap();
+    let controls = pinned_controls::pinned().unwrap();
+    let encoder = UntrustedDocumentEncoder::new(tokenizer.tokenizer(), controls.template_controls());
+    let mut work = SafeBpeWork::default();
+    encoder.encode_with_policy(b"hello world", planner.document_encoding(), &mut work, &mut || true).unwrap();
+    assert!(work.pair_checks() > 0 && work.pair_bytes() > 0);
+    assert!(work.output_tokens() < limits.common.max_prompt_tokens);
+    assert!(work.input_bytes() < args.max_input_bytes);
+    for (flag, cap) in [("--max-tokenizer-pair-checks", work.pair_checks()),
+        ("--max-tokenizer-pair-bytes", work.pair_bytes())] {
+        let cap = cap.to_string();
+        let (_, args, limits, planner) = fixture_with_flags(&["--input-encoding", "safe-bpe-v1", flag, &cap]);
+        let rows: Vec<_> = ["a", "b"].into_iter().map(|id| Record { id: id.to_owned(), sample_index: 0,
+            content: wire::Content::Generate("hello world".to_owned()) }).collect();
+        assert_eq!(prepare(rows, &planner, &args, limits.common, 1, || Ok(())).unwrap().0.len(), 2);
+        let chat = Record { id: "chat".to_owned(), sample_index: 0, content: wire::Content::Chat(vec![
+            ChatMessage { role: crate::tasks::chat::ChatRole::System, content: "hello world".to_owned() },
+            ChatMessage { role: crate::tasks::chat::ChatRole::User, content: "hello world".to_owned() },
+        ]) };
+        let first = Record { id: "prefix".to_owned(), sample_index: 0,
+            content: wire::Content::Generate("hello world".to_owned()) };
+        assert!(matches!(prepare(vec![first, chat], &planner, &args, limits.common, 1, || Ok(())),
+            Err(CandidateError::Planning)), "a late transcript failure must not return the prepared prefix");
+    }
+}
+
+#[test]
+fn cancellation_inside_one_bpe_transcript_preserves_the_original_checkpoint_error() {
+    let (_, args, limits, planner) = fixture_with_flags(&["--input-encoding", "safe-bpe-v1"]);
+    for error in [CandidateError::Timeout, CandidateError::Memory, CandidateError::Output] {
+        let record = Record { id: "cancel".to_owned(), sample_index: 0,
+            content: wire::Content::Generate("hello world ".repeat(64)) };
+        let mut calls = 0;
+        let result = prepare(vec![record], &planner, &args, limits.common, 1, || {
+            calls += 1;
+            if calls == 10 { Err(error) } else { Ok(()) }
+        });
+        assert!(matches!(result, Err(actual) if actual == error));
+        assert_eq!(calls, 10, "a failed checkpoint must not be polled again");
+    }
 }
 #[test]
 fn declared_cli_budget_covers_real_host_quote_without_borrowing_per_member_capacity() {
@@ -94,6 +237,20 @@ fn aggregate_publication_keeps_mapping_and_native_output_and_refuses_partial_ser
     assert_eq!(value["protocol"], PROTOCOL); assert_eq!(value["output"], output);
     assert_eq!(value["items"][0]["id"], "first"); assert_eq!(value["items"][0]["sample_index"], 7);
     assert!(value.get("snapshot").is_none()); assert!(value.get("prompt_digest").is_none());
+    let plain = bytes.clone();
+    let byte_policy = crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback;
+    let mut bytes = Vec::new();
+    publish(&input_encoding::Response { response: &response,
+        input_encoding: input_encoding::reported_policy(&byte_policy) }, 4096, &mut bytes).unwrap();
+    assert_eq!(bytes, plain);
+    let (_, args, limits, _) = fixture_with_flags(&["--input-encoding", "safe-bpe-v1"]);
+    let policy = args.input_encoding.policy(args.max_input_bytes, limits.common.max_prompt_tokens).unwrap();
+    let mut bytes = Vec::new();
+    publish(&input_encoding::Response { response: &response,
+        input_encoding: input_encoding::reported_policy(&policy) }, 4096, &mut bytes).unwrap();
+    let reported: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(reported["input_encoding"], serde_json::to_value(&policy).unwrap());
+    assert_eq!(reported["output"], output);
     let mut bytes = Vec::new(); assert!(publish(&response, 10, &mut bytes).is_err()); assert!(bytes.is_empty());
     struct FlushFailure;
     impl Write for FlushFailure {

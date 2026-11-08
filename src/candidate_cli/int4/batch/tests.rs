@@ -7,7 +7,9 @@ fn parsed(extra: &[&str]) -> (BatchArgs, Int4Args) {
         "--memory-mib", "65536", "--max-load-mib", "65536", "--preparation-mib", "4096"];
     argv.extend_from_slice(extra);
     let matches = definition().try_get_matches_from(argv).unwrap();
-    (BatchArgs::from_arg_matches(&matches).unwrap(), Int4Args::from_arg_matches(&matches).unwrap())
+    let mut args = Int4Args::from_arg_matches(&matches).unwrap();
+    args.input_encoding = input_encoding::InputEncodingArgs::from_matches(&matches).unwrap();
+    (BatchArgs::from_arg_matches(&matches).unwrap(), args)
 }
 fn read(options: BatchArgs, text: &[u8], cap: usize) -> Result<Vec<Record>, CandidateError> {
     options.read(&mut BufReader::with_capacity(2, Cursor::new(text)), cap, || Ok(()))
@@ -71,6 +73,62 @@ fn full_declared_cohort_not_one_row_determines_memory_work_and_output_admission(
         args.memory_mib = 65536;
     }
 }
+
+#[test]
+fn safe_bpe_prices_one_transient_workspace_alongside_every_retained_row() {
+    for rows in [1, 8, 64] {
+        for packed in [false, true] {
+            let row = rows.to_string();
+            let mut flags = vec!["--max-records", &row];
+            if packed { flags.extend_from_slice(&["--prefill-rows", "4"]); }
+            let (byte_options, mut byte_args) = parsed(&flags);
+            flags.extend_from_slice(&["--input-encoding", "safe-bpe-v1"]);
+            let (options, mut args) = parsed(&flags);
+            let quote = options.validate(&args).unwrap();
+            let ordinary = byte_options.validate(&byte_args).unwrap();
+            assert_eq!(quote.generation.native.max_forward_positions, ordinary.generation.native.max_forward_positions);
+            assert_eq!(quote.generation.native.max_attention_pairs, ordinary.generation.native.max_attention_pairs);
+            assert_eq!(quote.generation.native.max_projection_work, ordinary.generation.native.max_projection_work);
+            assert_eq!(quote.generation.max_native_payload_bytes, ordinary.generation.max_native_payload_bytes);
+            assert_eq!(quote.publication_bytes, ordinary.publication_bytes);
+            let baseline = 128 * MIB + rows as u64 * args.max_input_bytes as u64 * 32
+                + (quote.publication_bytes as u64 + 4096) * 2 + 65_536;
+            let workspace = args.input_encoding.workspace_bytes(args.max_input_bytes, quote.common.max_prompt_tokens).unwrap();
+            byte_args.preparation_mib = baseline.div_ceil(MIB);
+            byte_options.validate(&byte_args).unwrap();
+            args.preparation_mib = byte_args.preparation_mib;
+            assert!(matches!(options.validate(&args), Err(CandidateError::Arguments)));
+            // A single scratch grant is sufficient even with 64 retained plans;
+            // reducing this exact rounded grant by one MiB is insufficient.
+            args.preparation_mib = (baseline + workspace).div_ceil(MIB);
+            options.validate(&args).unwrap();
+            args.preparation_mib -= 1;
+            assert!(matches!(options.validate(&args), Err(CandidateError::Arguments)));
+        }
+    }
+}
+
+#[test]
+fn bpe_refusals_precede_private_input_and_any_batch_publication() {
+    for task in ["generate", "chat"] {
+        for extra in [
+            &["--max-tokenizer-pair-checks", "0"][..],
+            &["--max-tokenizer-pair-bytes", "0"][..],
+        ] {
+            let mut flags = vec!["--task", task, "--input-encoding", "safe-bpe-v1"];
+            flags.extend_from_slice(extra);
+            let (batch, args) = parsed(&flags);
+            let mut out = Vec::new();
+            assert_eq!(batch.execute(args, &mut NoRead, &mut out), Err(CandidateError::Arguments));
+            assert!(out.is_empty());
+        }
+    }
+    let (batch, mut args) = parsed(&["--input-encoding", "safe-bpe-v1", "--max-input-bytes", "1048576"]);
+    args.preparation_mib = 256;
+    let mut out = Vec::new();
+    assert_eq!(batch.execute(args, &mut NoRead, &mut out), Err(CandidateError::Arguments));
+    assert!(out.is_empty());
+}
 #[test]
 fn invalid_width_prefill_or_undersized_preparation_refuses_before_reading() {
     let (mut options, mut args) = parsed(&[]);
@@ -108,6 +166,35 @@ fn root_dispatch_exposes_batch_without_replacing_single_or_int8_tasks() {
     }
     assert!(crate::candidate_cli::definition().try_get_matches_from(["candidate", "text-batch",
         "--model", "model.fnlpq", "--memory-mib", "8192"]).is_ok());
+}
+
+#[test]
+fn both_batch_routes_parse_the_explicit_whole_transcript_policy() {
+    use crate::tokenizer::untrusted::UntrustedEncoding;
+    for route in ["text-batch", "text-corpus"] {
+        for task in ["generate", "chat"] {
+            let matches = crate::candidate_cli::definition().try_get_matches_from([
+                "candidate", "source-int4", route, "--task", task, "--source-dir", "source",
+                "--source-manifest", "manifest", "--memory-mib", "8192",
+                "--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "12345",
+                "--max-tokenizer-pair-bytes", "67890",
+            ]).unwrap();
+            let CandidateCommand::SourceInt4(command) = CandidateCommand::from_matches(&matches).unwrap()
+                else { panic!("wrong route") };
+            assert!(command.batch.is_some());
+            assert_eq!(command.task, Int4Task::Text(if task == "chat" { Task::Chat } else { Task::Generate }));
+            let common = command.args.validate().unwrap();
+            let UntrustedEncoding::SafeBpeV1(policy) = command.args.input_encoding
+                .policy(command.args.max_input_bytes, common.max_prompt_tokens).unwrap() else { panic!("BPE policy lost"); };
+            assert_eq!(policy.max_pair_checks, 12345);
+            assert_eq!(policy.max_pair_bytes, 67890);
+            let matches = crate::candidate_cli::definition().try_get_matches_from([
+                "candidate", "source-int4", route, "--task", task, "--source-dir", "source",
+                "--source-manifest", "manifest", "--memory-mib", "8192", "--max-tokenizer-pair-checks", "1",
+            ]).unwrap();
+            assert!(CandidateCommand::from_matches(&matches).is_err());
+        }
+    }
 }
 #[test]
 fn programmatic_task_substitution_and_impossible_cohort_refuse_before_io() {

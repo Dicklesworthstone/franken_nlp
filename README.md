@@ -302,9 +302,9 @@ fnlp doctor                          # idempotent self-check/repair
 
 ## Explicit bounded BPE input for candidate INT4 tasks
 
-One-request `fnlp candidate source-int4 generate`, `chat`, `ner`, `keyphrases`,
-`summarize` and `answer` accept
-`--input-encoding safe-bpe-v1`. The existing default is `byte-fallback`, which
+`fnlp candidate source-int4 generate`, `chat`, `ner`, `keyphrases`,
+`summarize`, `answer`, `stream generate|chat`, `text-batch` and `text-corpus`
+accept `--input-encoding safe-bpe-v1`. The existing default is `byte-fallback`, which
 uses one token per input byte. The explicit BPE policy can use ordinary
 vocabulary pieces while preserving every original message byte and excluding
 all template-control and added-token IDs. Context admission counts the actual
@@ -344,7 +344,28 @@ and deadline checks run inside bounded encoding intervals. Long inputs may
 need a larger explicit work cap even when their final tokens fit the context.
 
 The selected policy and all its limits enter the template execution identity
-and appear in `input_encoding` on the completed candidate response. Library
+and appear in `input_encoding` on the completed candidate response. Token
+streams declare the policy in `run_start.data.input_encoding`; a final
+`run_complete` is still required. Batch windows declare it on their completed
+batch response, and a text corpus includes it in its required completion
+footer, including for empty input. Byte fallback omits the optional field.
+
+Finite batches and resident text corpora bind the same policy to every row.
+Each complete transcript shares one tokenizer-work budget across its messages;
+the allowance starts anew for the next record. The existing record, input and
+deadline ceilings bound aggregate work. There is no global shared tokenizer
+pair-work counter. Planning charges one transient encoder workspace alongside
+all retained row plans, and checks the deadline during encoding. The option
+works with the existing packed prefill and active-row text-corpus schedules.
+
+```bash
+fnlp candidate source-int4 text-corpus prompts.ndjson \
+  --task generate --snapshot nanbeige.int4.snapshot \
+  --expected-model-sha256 "$MODEL_SHA256" --memory-mib 8192 \
+  --input-encoding safe-bpe-v1 --cohort-rows 4 --max-records 100
+```
+
+Library
 callers can select the same contract with `with_document_encoding` on
 `ChatPlanner`, `Int8ChatPlanner`, `Int4ChatPlanner` or `SourceTaskPlanner`, and use the
 `plan_chat_with_control` / `plan_generate_with_control` methods for cooperative
@@ -375,8 +396,9 @@ tokenizer budget for every candidate boundary.
 
 This is a distinct candidate tokenization contract, with its own regression
 fixtures; it does not assert ordinary slow-tokenizer token-ID parity or task
-quality gains. Other CLI tasks, maps, corpora and retained jobs keep their
-existing byte-fallback contract. These encoding and planner tests still require
+quality gains. Unwired structured tasks, document maps, structured corpora and
+retained jobs keep their existing byte-fallback contract. These encoding and
+planner tests still require
 the repository's authorized DSR checkpoint and model-present qualification.
 
 ## Implemented candidate INT4 token streaming

@@ -313,7 +313,9 @@ impl Int4Command {
             _ => None,
         };
         if let Some(batch) = batch {
-            return Ok(Self { task: Int4Task::Text(batch.task()), args: Int4Args::from_arg_matches(matches)?, batch: Some(batch), job: None });
+            let mut args = Int4Args::from_arg_matches(matches)?;
+            args.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+            return Ok(Self { task: Int4Task::Text(batch.task()), args, batch: Some(batch), job: None });
         }
         let task = match name {
             "generate" => Int4Task::Text(Task::Generate),

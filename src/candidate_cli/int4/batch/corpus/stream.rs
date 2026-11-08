@@ -1,6 +1,7 @@
 //! Corpus execution and completion framing, separate from model ownership.
 //! The only production processor is the charged shared-model INT4 host.
 use super::*;
+use crate::tokenizer::untrusted::UntrustedEncoding;
 
 pub(super) struct Prepared<T> { pub value: T, pub planned: Int4Work }
 pub(super) struct Completed<T> { pub value: T, pub planned: Int4Work, pub actual: Int4Work, pub records: usize }
@@ -8,6 +9,7 @@ pub(super) struct Completed<T> { pub value: T, pub planned: Int4Work, pub actual
 pub(super) trait Processor {
     type Prepared;
     type Output: Serialize;
+    fn input_encoding(&self) -> &UntrustedEncoding;
     fn checkpoint(&mut self) -> Result<(), CandidateError>;
     fn prepare(&mut self, window: InputWindow) -> Result<Prepared<Self::Prepared>, CandidateError>;
     /// All work/output admission has succeeded before execute can save or infer.
@@ -43,6 +45,8 @@ pub(super) fn drive<P: Processor>(processor: &mut P, input: &mut impl BufRead, o
     }
     processor.checkpoint()?;
     let complete = ledger.summary(&reader, output.written)?;
+    let complete = input_encoding::Response { response: &complete,
+        input_encoding: input_encoding::reported_policy(processor.input_encoding()) };
     publish_canonical(&complete, wire::FOOTER_BYTES, &mut output)
 }
 

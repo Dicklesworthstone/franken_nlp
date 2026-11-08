@@ -8,6 +8,7 @@ use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, Me
     hosted::{CancellationToken, HostedOutput, ResidentInt4,
         grouped_int4::batch::{Int4BatchHostLimits, Int4ChatBatchMember}},
     native_engine::strict_int4::weights::snapshot::INT4_SNAPSHOT_VERSION,
+    tokenizer::untrusted::UntrustedEncoding,
     tasks::chat::grouped_int4::{Int4ChatPlanner,
         batch::{Int4ChatBatchLimits, Int4ChatBatchResult}}};
 
@@ -18,6 +19,7 @@ pub(super) fn execute(args: Int4Args, options: CorpusArgs, quoted: CorpusLimits,
         || limits.frame_bytes != quoted.frame_bytes
         || !crate::candidate_cli::int4::prefill::matches(&args, quoted.window.common)?
         || quoted.window.common.kernel.kind() != args.kernel { return Err(CandidateError::Arguments); }
+    let input_encoding = args.input_encoding.policy(args.max_input_bytes, limits.window.common.max_prompt_tokens)?;
     let started = Instant::now(); let deadline = Duration::from_secs(args.timeout_seconds);
     let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
         runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
@@ -32,7 +34,7 @@ pub(super) fn execute(args: Int4Args, options: CorpusArgs, quoted: CorpusLimits,
         .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
     let mut processor = NativeWindows { engine: &engine, args: &args, limits: limits.window,
         started, deadline, cancellation: CancellationToken::default(), model: None, planner: None,
-        first_execution: true, active_rows: options.active_rows };
+        first_execution: true, active_rows: options.active_rows, input_encoding };
     processor.remaining()?;
     if args.input.as_os_str() == "-" {
         stream::drive(&mut processor, &mut BufReader::with_capacity(8192, input), output,
@@ -49,6 +51,7 @@ struct NativeWindows<'a> {
     started: Instant, deadline: Duration, cancellation: CancellationToken,
     model: Option<ResidentInt4>, planner: Option<Int4ChatPlanner>, first_execution: bool,
     active_rows: Option<usize>,
+    input_encoding: UntrustedEncoding,
 }
 impl NativeWindows<'_> {
     fn remaining(&self) -> Result<Duration, CandidateError> {
@@ -62,25 +65,29 @@ struct NativePrepared {
 struct NativeCompleted {
     result: HostedOutput<Int4ChatBatchResult>, items: Vec<batch_runtime::Item>, identity: ExecutionIdentity,
     source_root: String, group_width: usize, kernel: &'static str, snapshot: Option<batch_runtime::Snapshot>,
+    input_encoding: UntrustedEncoding,
 }
 impl Serialize for NativeCompleted {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let digest = self.identity.logical_model_digest.to_hex();
         // The existing fixed-batch response is nested unchanged in the corpus
         // window frame. Its hosted result guard is not unwrapped or discarded.
-        batch_runtime::Response {
+        let response = batch_runtime::Response {
             schema_version: 1, protocol: PROTOCOL, scope: "real-source-current-candidate-int4",
             evidence: "non_authoritative", model_id: "Nanbeige4.2-3B",
             source_revision: &self.identity.source_revision, source_root_sha256: &self.source_root,
             model_content_sha256: &digest, candidate_format: &self.identity.artifact_format,
             quant_recipe: &self.identity.quant_recipe, group_width: self.group_width, integer_kernel: self.kernel,
             items: &self.items, output: self.result.result(), snapshot: self.snapshot,
-        }.serialize(serializer)
+        };
+        input_encoding::Response { response: &response,
+            input_encoding: input_encoding::reported_policy(&self.input_encoding) }.serialize(serializer)
     }
 }
 impl stream::Processor for NativeWindows<'_> {
     type Prepared = NativePrepared;
     type Output = NativeCompleted;
+    fn input_encoding(&self) -> &UntrustedEncoding { &self.input_encoding }
     fn checkpoint(&mut self) -> Result<(), CandidateError> { self.remaining().map(|_| ()) }
     fn prepare(&mut self, window: InputWindow) -> Result<stream::Prepared<NativePrepared>, CandidateError> {
         self.remaining()?;
@@ -147,6 +154,7 @@ impl stream::Processor for NativeWindows<'_> {
         let records = result.result().results.len();
         Ok(stream::Completed { value: NativeCompleted { result, items: prepared.items, identity: prepared.identity,
             source_root: model.model_identity().source_root_sha256().to_owned(), group_width: self.args.group_width,
-            kernel: self.limits.common.kernel.kind().id(), snapshot }, planned, actual, records })
+            kernel: self.limits.common.kernel.kind().id(), snapshot,
+            input_encoding: self.input_encoding.clone() }, planned, actual, records })
     }
 }

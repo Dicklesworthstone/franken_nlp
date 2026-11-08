@@ -2,6 +2,18 @@
 use super::*;
 use std::io::{BufReader, Cursor};
 
+fn parsed(extra: &[&str]) -> (CorpusArgs, Int4Args) {
+    let mut argv = vec!["text-corpus", "--source-dir", "not-a-local-model",
+        "--source-manifest", "not-a-local-manifest", "--memory-mib", "65536",
+        "--preparation-mib", "4096", "--context-tokens", "256",
+        "--max-new-tokens", "4", "--max-output-bytes", "64"];
+    argv.extend_from_slice(extra);
+    let matches = definition().try_get_matches_from(argv).unwrap();
+    let mut args = Int4Args::from_arg_matches(&matches).unwrap();
+    args.input_encoding = input_encoding::InputEncodingArgs::from_matches(&matches).unwrap();
+    (CorpusArgs::from_arg_matches(&matches).unwrap(), args)
+}
+
 fn options(rows: usize) -> CorpusArgs {
     CorpusArgs { task: BatchTask::Generate, cohort_rows: rows, active_rows: None, max_records: 1000,
         max_total_input_bytes: 1 << 20, max_total_output_bytes: 1 << 20,
@@ -93,6 +105,114 @@ fn empty_corpus_is_distinct_from_blank_record_and_needs_no_window_execution() {
     assert_eq!(summary.records, 0); assert_eq!(summary.windows, 0);
     assert_eq!(summary.reserved_work, Int4Work::default());
     assert_eq!(summary.event, "corpus_complete");
+}
+
+#[test]
+fn corpus_preparation_prices_bpe_with_retained_window_plans_and_whole_run_ids() {
+    for schedule in [&[][..], &["--prefill-rows", "4"][..],
+        &["--prefill-rows", "4", "--active-rows", "1"][..]] {
+        let (byte_options, mut byte_args) = parsed(schedule);
+        let mut flags = schedule.to_vec();
+        flags.extend_from_slice(&["--input-encoding", "safe-bpe-v1"]);
+        let (options, mut args) = parsed(&flags);
+        let quote = options.validate(&args).unwrap();
+        let ordinary = byte_options.validate(&byte_args).unwrap();
+        assert_eq!(quote.frame_bytes, ordinary.frame_bytes);
+        assert_eq!(quote.window.generation.max_native_payload_bytes, ordinary.window.generation.max_native_payload_bytes);
+        let retained = options.max_records * 1024 + (2 * FRAME_ALLOWANCE + 8192) as u64;
+        let baseline = 128 * MIB + options.cohort_rows as u64 * args.max_input_bytes as u64 * 32
+            + (quote.window.publication_bytes as u64 + 4096) * 2 + 65_536 + retained;
+        let workspace = args.input_encoding.workspace_bytes(args.max_input_bytes,
+            quote.window.common.max_prompt_tokens).unwrap();
+        byte_args.preparation_mib = baseline.div_ceil(MIB);
+        byte_options.validate(&byte_args).unwrap();
+        args.preparation_mib = byte_args.preparation_mib;
+        assert!(matches!(options.validate(&args), Err(CandidateError::Arguments)));
+        args.preparation_mib = (baseline + workspace).div_ceil(MIB);
+        options.validate(&args).unwrap();
+        args.preparation_mib -= 1;
+        assert!(matches!(options.validate(&args), Err(CandidateError::Arguments)));
+    }
+}
+
+#[test]
+fn empty_corpus_footer_reports_explicit_encoding_without_preparing_a_window() {
+    use crate::tokenizer::untrusted::UntrustedEncoding;
+    struct Empty { encoding: UntrustedEncoding }
+    impl stream::Processor for Empty {
+        type Prepared = ();
+        type Output = ();
+        fn input_encoding(&self) -> &UntrustedEncoding { &self.encoding }
+        fn checkpoint(&mut self) -> Result<(), CandidateError> { Ok(()) }
+        fn prepare(&mut self, _: InputWindow) -> Result<stream::Prepared<()>, CandidateError> {
+            panic!("empty corpus attempted to prepare/load a model");
+        }
+        fn execute(&mut self, _: ()) -> Result<stream::Completed<()>, CandidateError> {
+            panic!("empty corpus attempted native execution");
+        }
+    }
+    for flags in [&[][..], &["--input-encoding", "safe-bpe-v1"][..]] {
+        let (options, args) = parsed(flags);
+        let limits = options.validate(&args).unwrap();
+        let policy = args.input_encoding.policy(args.max_input_bytes, limits.window.common.max_prompt_tokens).unwrap();
+        let mut processor = Empty { encoding: policy.clone() };
+        let mut bytes = Vec::new();
+        stream::drive(&mut processor, &mut Cursor::new(b""), &mut bytes, options, limits,
+            args.max_input_bytes, args.max_checkpoints).unwrap();
+        assert!(bytes.len() <= wire::FOOTER_BYTES);
+        assert_eq!(bytes.iter().filter(|&&byte| byte == b'\n').count(), 1);
+        let mut state = CorpusInput::new(options).unwrap();
+        state.next_window(&mut Cursor::new(b""), args.max_input_bytes, || Ok(())).unwrap();
+        let baseline = CorpusLedger::default().summary(&state, 0).unwrap();
+        if policy == UntrustedEncoding::ByteFallback {
+            let mut expected = canonjson::canonical_bytes(&baseline).unwrap(); expected.push(b'\n');
+            assert_eq!(bytes, expected, "default footer must remain byte compatible");
+        }
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["event"], "corpus_complete");
+        assert_eq!(value["records"], 0); assert_eq!(value["windows"], 0);
+        assert_eq!(value["reserved_work"], serde_json::to_value(Int4Work::default()).unwrap());
+        assert_eq!(value.get("input_encoding").cloned(), input_encoding::reported_policy(&policy)
+            .map(|policy| serde_json::to_value(policy).unwrap()));
+        assert!(value.get("prompt_digest").is_none());
+        assert!(value.get("input").is_none());
+    }
+}
+
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn real_empty_corpus_path_keeps_bpe_policy_without_opening_missing_model_files() {
+    for task in ["generate", "chat"] {
+        let (options, args) = parsed(&["--task", task, "--input-encoding", "safe-bpe-v1",
+            "--max-tokenizer-pair-checks", "12345", "--max-tokenizer-pair-bytes", "67890"]);
+        let limits = options.validate(&args).unwrap();
+        let policy = args.input_encoding.policy(args.max_input_bytes, limits.window.common.max_prompt_tokens).unwrap();
+        let mut bytes = Vec::new();
+        options.execute(args, &mut Cursor::new(b""), &mut bytes).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["event"], "corpus_complete");
+        assert_eq!(value["records"], 0);
+        assert_eq!(value["input_encoding"], serde_json::to_value(policy).unwrap());
+    }
+}
+
+#[test]
+fn invalid_bpe_corpus_admission_never_reads_private_input() {
+    struct NoRead;
+    impl Read for NoRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("invalid BPE corpus read input"); }
+    }
+    for flag in ["--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes"] {
+        let (options, args) = parsed(&["--input-encoding", "safe-bpe-v1", flag, "0"]);
+        let mut bytes = Vec::new();
+        assert_eq!(options.execute(args, &mut NoRead, &mut bytes), Err(CandidateError::Arguments));
+        assert!(bytes.is_empty());
+    }
+    let (options, mut args) = parsed(&["--input-encoding", "safe-bpe-v1", "--max-input-bytes", "1048576"]);
+    args.preparation_mib = 256;
+    let mut bytes = Vec::new();
+    assert_eq!(options.execute(args, &mut NoRead, &mut bytes), Err(CandidateError::Arguments));
+    assert!(bytes.is_empty());
 }
 
 #[test]

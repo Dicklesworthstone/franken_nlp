@@ -1,4 +1,5 @@
-//! Explicit one-request text/source tokenization. Never an ambient/default change.
+//! Explicit text/source tokenization, bounded per complete request/transcript.
+//! Never an ambient/default change or a renewed allowance between segments.
 use super::*;
 use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
 
@@ -15,10 +16,10 @@ pub(super) fn definition(command: clap::Command) -> clap::Command {
         .help("Untrusted request-text encoding; safe-bpe-v1 is an explicit byte-preserving, control-excluding candidate policy"))
         .arg(clap::Arg::new("max_tokenizer_pair_checks").long("max-tokenizer-pair-checks")
             .value_parser(clap::value_parser!(u64)).value_name("COUNT")
-            .help("Whole-request BPE pair-comparison cap across all untrusted segments; safe-bpe-v1 only, default 4194304"))
+            .help("BPE pair-comparison cap per complete request/transcript across all untrusted segments; safe-bpe-v1 only, default 4194304"))
         .arg(clap::Arg::new("max_tokenizer_pair_bytes").long("max-tokenizer-pair-bytes")
             .value_parser(clap::value_parser!(u64)).value_name("BYTES")
-            .help("Whole-request BPE examined-pair byte cap across all untrusted segments; safe-bpe-v1 only, default 67108864"))
+            .help("BPE examined-pair byte cap per complete request/transcript across all untrusted segments; safe-bpe-v1 only, default 67108864"))
 }
 
 impl InputEncodingArgs {
@@ -57,6 +58,10 @@ impl InputEncodingArgs {
                 .map(|required| required.workspace_bytes).map_err(|_| CandidateError::Arguments),
         }
     }
+}
+
+pub(super) fn reported_policy(policy: &UntrustedEncoding) -> Option<&UntrustedEncoding> {
+    (policy != &UntrustedEncoding::ByteFallback).then_some(policy)
 }
 
 /// Only the explicitly changed tokenization route adds provenance to the
