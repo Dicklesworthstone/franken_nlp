@@ -6,6 +6,7 @@
 
 mod common;
 mod aggregation;
+pub(crate) use aggregation::validate_result as validate_faithfulness_result;
 mod faithfulness;
 mod native;
 mod pairwise;

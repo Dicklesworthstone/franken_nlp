@@ -77,6 +77,11 @@ pub enum JudgeRequest {
     Faithfulness { source: String, claim: String, policy: FaithfulnessPolicy, budget: TaskBudget },
 }
 impl JudgeRequest {
+    /// Exact private source/claim, task policy and budget association. This
+    /// commitment is not a model execution identity or a public content hash.
+    pub(crate) fn request_digest(&self) -> Result<Sha256Digest, JudgeError> {
+        digest(&("judge-request-v1", self))
+    }
     /// Check wire bytes before allocation; canonjson rejects duplicate keys.
     pub fn from_json(source: &str, max_request_bytes: usize) -> Result<Self, JudgeError> {
         if source.len() > max_request_bytes { return Err(JudgeError::Limit("request_bytes")); }

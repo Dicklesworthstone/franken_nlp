@@ -13,6 +13,8 @@ mod assay_ner;
 pub use assay_ner::{Int4NerAssayHostLimits, Int4NerAssayHostRequirements};
 mod assay_extract;
 pub use assay_extract::{Int4ExtractAssayHostLimits, Int4ExtractAssayHostRequirements};
+mod assay_faithfulness;
+pub use assay_faithfulness::{Int4FaithfulnessAssayHostLimits, Int4FaithfulnessAssayHostRequirements};
 mod sentiment;
 pub use sentiment::{Int4SentimentHostLimits, Int4SentimentMapHostConfig,
     int4_sentiment_document_corpus_requirements};

@@ -3842,6 +3842,69 @@ thinking, tool execution, durable checkpoints, or inference network access.
 Compilation, fixtures, model-present behavior and incremental error-catching
 value remain unverified until their separate controller/evaluation gates run.
 
+## Native INT4 faithfulness evaluation and comparison
+
+`fnlp eval native-faithfulness-int4` executes the real native faithfulness
+judge against a frozen suite of human-labelled source/claim cases.
+`fnlp qualify native-faithfulness-int4` compares two independently pinned
+snapshots on that same population and fixed evidence policy. These commands
+require `asupersync-runtime`; `--schema` explains the exact contracts without
+loading a model or opening private files.
+
+```bash
+fnlp eval native-faithfulness-int4 --schema
+
+fnlp eval native-faithfulness-int4 \
+  --suite faithfulness-suite.json --cases faithfulness-cases.ndjson \
+  --snapshot candidate.int4.snapshot --expected-model-sha256 "$CANDIDATE_SHA256" \
+  --memory-mib 32768 --key-file receipt.key --key-id local-eval \
+  --namespace support-faithfulness --output evaluation.json
+
+fnlp qualify native-faithfulness-int4 \
+  --suite faithfulness-suite.json --cases faithfulness-cases.ndjson \
+  --snapshot candidate.int4.snapshot --expected-model-sha256 "$CANDIDATE_SHA256" \
+  --baseline-snapshot baseline.int4.snapshot --baseline-model-sha256 "$BASELINE_SHA256" \
+  --memory-mib 32768 --key-file receipt.key --key-id local-eval \
+  --namespace support-faithfulness --host-scope declared-local-host \
+  --gates faithfulness-gates.json --output qualification.json
+```
+
+The suite pins the exact cases bytes, all development/calibration/locked-test
+IDs and one complete `FaithfulnessPolicy`. Every split is validated before
+model loading, but only locked-test claims execute. Exact source text cannot
+cross splits. Multiple distinct claims about one source remain a single
+statistical cluster; duplicate source/claim pairs are rejected. Gold labels,
+IDs and split names never enter prompts.
+
+Reports include three-relation precision/recall/F1, exact-label accuracy,
+coverage, selective risk, explicit abstention counts and the Brier loss of
+uncalibrated full-source candidate weights. Uncertainty resamples whole source
+clusters, carrying their claims together. Paired comparisons reuse the same
+draws, and minimum sample requirements count independent sources. Qualification
+uses explicit point-estimate gates for accuracy, macro F1, Brier loss and
+coverage; undefined required metrics cannot pass.
+
+Both model residents, complete prepared heads, one sequential native engine,
+private replay records and report staging are quoted before IO. Five native
+work ceilings and the original deadline cover the complete replay and both
+comparison arms. Every result is checked against its exact model and sealed
+source/claim/policy/budget request, then independently validated for all score
+heads, scored EOS, complete evidence windows and original source quotes.
+
+The complete report carries keyed commitments rather than private source,
+claim, row IDs or raw content digests. File output uses the existing protected
+create-new publication boundary. Output charges survive serialization and
+physical publication; a write or flush that finishes after the deadline
+returns failure. Reports remain `AuditOnly` with `activation_authority=false`.
+Human labels remain the quality reference; model agreement and byte-valid
+quotes do not establish factual truth or calibrated entailment.
+
+See [the native faithfulness Assay guide](docs/native-faithfulness-assay.md)
+for complete suite, case, gate and protected-key examples. Regression and
+ignored native-model fixtures accompany this candidate implementation;
+compilation, executable tests and model-quality evidence remain pending the
+controller-selected DSR and separate model-present gates.
+
 ## Installation
 
 **1. Install script: *not yet available*.** The planned script installs and SHA-256-verifies the `fnlp` binary, then offers (interactive `y/N`; `--with-model` / `--no-pull` in automation) to run the installed binary's own `fnlp pull`; shell never touches model bytes itself. It is deliberately not shown as a runnable command: `install.sh` does not exist yet and there are no release binaries for it to install. This section becomes a command again when Phase 6 ships one.

@@ -186,13 +186,22 @@ pub(in crate::assay_cli) fn publish_hosted<T: Serialize>(report: HostedOutput<T>
     operation: &'static str, limits: Limits,
     destination: Option<Destination>, output: &mut impl Write,
     remaining: &impl Fn() -> Result<Duration, Failure>) -> Result<(), Failure> {
+    publish_guarded(report, protocol, operation, limits, destination, output, remaining)
+}
+fn publish_guarded<T: Serialize, G>(report: crate::batch::generation::GuardedOutput<T, G>,
+    protocol: &'static str, operation: &'static str, limits: Limits,
+    destination: Option<Destination>, output: &mut impl Write,
+    remaining: &impl Fn() -> Result<Duration, Failure>) -> Result<(), Failure> {
     remaining()?;
     let bytes = encode(protocol, operation, report.result(), limits)?;
     remaining()?;
-    let result = publish(destination, &bytes, output);
-    // The output claim and outer staging both survive the physical flush.
+    publish(destination, &bytes, output)?;
+    // A blocking publication may finish after the original deadline. Keep
+    // the report and its charge through the completion check and never report
+    // successful timely completion merely because bytes reached the writer.
+    remaining()?;
     drop(report);
-    result
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -321,6 +330,7 @@ pub(in crate::assay_cli) fn host_failure(error: HostedError) -> Failure {
                 Failure::new(ErrorCode::StructuredTaskNoResult, "native_classification_failed")),
         },
         HostedError::Int4(Int4HostError::SourceTask(error)) => source_failure(error),
+        HostedError::Int4(Int4HostError::Judge(error)) => judge_failure(error),
         HostedError::Int4(Int4HostError::Extraction(error)) => int4_extraction_failure(error),
         HostedError::Int4(Int4HostError::Native(StrictInt4Error::Cancelled(kind))) => cancelled(kind),
         HostedError::Int4(Int4HostError::Native(StrictInt4Error::Work)) =>
@@ -331,6 +341,24 @@ pub(in crate::assay_cli) fn host_failure(error: HostedError) -> Failure {
         HostedError::ModelIdentity | HostedError::ResourceDomain =>
             Failure::new(ErrorCode::ArtifactIntegrityOrFormatOrVersion, "native_model_identity"),
         _ => Failure::new(ErrorCode::Generic, "native_execution_failed"),
+    }
+}
+
+fn judge_failure(error: crate::tasks::judge::grouped_int4::Int4JudgeError) -> Failure {
+    use crate::tasks::judge::{JudgeError, grouped_int4::Int4JudgeError};
+    match error {
+        Int4JudgeError::Cancelled(kind) => cancelled(kind),
+        Int4JudgeError::WorkBudget | Int4JudgeError::Task(JudgeError::Limit(_)) =>
+            Failure::new(ErrorCode::BudgetOrTimeout, "native_judge_work_budget"),
+        Int4JudgeError::Task(JudgeError::AllocationRefused | JudgeError::Scoring(ScoringError::AllocationRefused))
+            | Int4JudgeError::Scoring(Int4ScoringError::Allocation | Int4ScoringError::Scoring(ScoringError::AllocationRefused)) =>
+            Failure::new(ErrorCode::AdmissionOrResourceLimit, "native_judge_admission_refused"),
+        Int4JudgeError::Native(error) | Int4JudgeError::Scoring(Int4ScoringError::Native(error)) =>
+            host_failure(HostedError::Int4(Int4HostError::Native(error))),
+        Int4JudgeError::Identity | Int4JudgeError::Accounting =>
+            Failure::new(ErrorCode::ArtifactIntegrityOrFormatOrVersion, "native_judge_identity"),
+        error => error.cancellation().map(cancelled).unwrap_or_else(||
+            Failure::new(ErrorCode::StructuredTaskNoResult, "native_judge_no_result")),
     }
 }
 

@@ -75,6 +75,7 @@ pub struct Int4JudgeRun {
 /// deserialize a plan, substitute a score provider or extract an eager plan.
 pub struct PreparedInt4Judge {
     inner: PreparedJudge,
+    request_digest: Sha256Digest,
     schedules: Vec<CandidateSchedule>,
     group_width: usize,
     work: Int4Work,
@@ -98,11 +99,11 @@ impl JudgePlanner {
         let inner = self.plan_with_profile(request, context, limits,
             NumericsProfile::StrictQuantized { version: 2 })?;
         checkpoint(control)?;
-        PreparedInt4Judge::compile(inner, request.budget(), group_width, control)
+        PreparedInt4Judge::compile(inner, request.budget(), request.request_digest()?, group_width, control)
     }
 }
 impl PreparedInt4Judge {
-    fn compile<C: DecodeStepControl>(inner: PreparedJudge, budget: TaskBudget,
+    fn compile<C: DecodeStepControl>(inner: PreparedJudge, budget: TaskBudget, request_digest: Sha256Digest,
         group_width: usize, control: &mut C) -> Result<Self, Int4JudgeError> {
         let bundle = inner.executable.bundle();
         if bundle.heads.is_empty() { return Err(Int4JudgeError::Accounting); }
@@ -123,8 +124,9 @@ impl PreparedInt4Judge {
         // over every order, criterion and evidence head, not just the largest.
         if work.projected_logits != bundle.work.projected_logits { return Err(Int4JudgeError::Accounting); }
         checkpoint(control)?;
-        Ok(Self { inner, schedules, group_width, work, budget })
+        Ok(Self { inner, request_digest, schedules, group_width, work, budget })
     }
+    pub(crate) fn request_digest(&self) -> Sha256Digest { self.request_digest }
     pub fn execution_identity(&self) -> &ExecutionIdentity { self.inner.execution_identity() }
     pub fn planned_work(&self) -> Int4Work { self.work }
     pub fn group_width(&self) -> usize { self.group_width }

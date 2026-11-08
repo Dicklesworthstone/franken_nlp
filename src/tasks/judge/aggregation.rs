@@ -187,7 +187,7 @@ pub(crate) fn aggregate_with_control<'a>(chunks: impl IntoIterator<Item = Faithf
     Ok(aggregate)
 }
 
-fn validate_result(source: &str, result: &FaithfulnessResult, policy: FaithfulnessPolicy,
+pub(crate) fn validate_result(source: &str, result: &FaithfulnessResult, policy: FaithfulnessPolicy,
     signature: &mut Option<(u32, [usize; 3])>, control: &mut impl DecodeStepControl)
     -> Result<(), FaithfulnessAggregationError> {
     let windows = faithfulness::partition_evidence(source, policy).map_err(|_| FaithfulnessAggregationError::Result)?;

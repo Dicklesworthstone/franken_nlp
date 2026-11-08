@@ -1,5 +1,6 @@
 use super::*;
 use super::super::tests::{application, calibration_command, command};
+use std::io;
 
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod model;
@@ -319,4 +320,76 @@ fn failed_report_flush_returns_failure_without_retry_or_another_frame() {
     assert!(publish(None, b"{\"complete\":true}\n", &mut output).is_err());
     assert_eq!(output.bytes, b"{\"complete\":true}\n");
     assert_eq!(output.writes, 1); assert_eq!(output.flushes, 1);
+}
+
+#[test]
+fn guarded_report_checks_deadline_around_serialization_and_retains_its_charge() {
+    use std::cell::Cell;
+    use crate::batch::generation::GuardedOutput;
+    struct Charge<'a>(&'a Cell<bool>);
+    impl Drop for Charge<'_> { fn drop(&mut self) { self.0.set(true); } }
+    struct Report<'a> { serialized: &'a Cell<bool>, expired: &'a Cell<bool>, released: &'a Cell<bool> }
+    impl Serialize for Report<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            assert!(!self.released.get()); self.serialized.set(true); self.expired.set(true);
+            serde_json::json!({"complete": true}).serialize(serializer)
+        }
+    }
+    struct NoWrite;
+    impl Write for NoWrite {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("expired report reached publication"); }
+        fn flush(&mut self) -> io::Result<()> { panic!("expired report reached flush"); }
+    }
+    for already_expired in [false, true] {
+        let serialized = Cell::new(false); let expired = Cell::new(already_expired); let released = Cell::new(false);
+        let report = GuardedOutput::new(Report { serialized: &serialized, expired: &expired, released: &released }, Charge(&released));
+        let failure = publish_guarded(report, NATIVE_PROTOCOL, "eval", Limits::default(), None, &mut NoWrite, &|| {
+            assert!(!released.get());
+            if expired.get() { Err(Failure::new(ErrorCode::BudgetOrTimeout, "native_assay_deadline")) }
+            else { Ok(Duration::from_secs(1)) }
+        }).unwrap_err();
+        assert_eq!(failure.code, ErrorCode::BudgetOrTimeout);
+        assert_eq!(serialized.get(), !already_expired);
+        assert!(released.get());
+    }
+}
+
+#[test]
+fn guarded_report_cannot_succeed_after_late_write_or_flush_and_never_retries() {
+    use std::cell::Cell;
+    use crate::batch::generation::GuardedOutput;
+    struct Charge<'a>(&'a Cell<bool>);
+    impl Drop for Charge<'_> { fn drop(&mut self) { self.0.set(true); } }
+    struct Writer<'a> {
+        expired: &'a Cell<bool>, released: &'a Cell<bool>, expire_on_write: bool,
+        fail_flush: bool, bytes: Vec<u8>, writes: usize, flushes: usize,
+    }
+    impl Write for Writer<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            assert!(!self.released.get()); self.writes += 1; self.bytes.extend_from_slice(bytes);
+            if self.expire_on_write { self.expired.set(true); }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            assert!(!self.released.get()); self.flushes += 1; self.expired.set(true);
+            if self.fail_flush { Err(io::ErrorKind::BrokenPipe.into()) } else { Ok(()) }
+        }
+    }
+    for (expire_on_write, fail_flush) in [(false, false), (true, false), (false, true)] {
+        let expired = Cell::new(false); let released = Cell::new(false); let checks = Cell::new(0);
+        let mut output = Writer { expired: &expired, released: &released, expire_on_write,
+            fail_flush, bytes: Vec::new(), writes: 0, flushes: 0 };
+        let report = GuardedOutput::new(serde_json::json!({"complete": true}), Charge(&released));
+        let failure = publish_guarded(report, NATIVE_PROTOCOL, "eval", Limits::default(), None, &mut output, &|| {
+            assert!(!released.get()); checks.set(checks.get() + 1);
+            if expired.get() { Err(Failure::new(ErrorCode::BudgetOrTimeout, "native_assay_deadline")) }
+            else { Ok(Duration::from_secs(1)) }
+        }).unwrap_err();
+        assert_eq!(failure.code, if fail_flush { output_failure().code } else { ErrorCode::BudgetOrTimeout });
+        assert_eq!(checks.get(), if fail_flush { 2 } else { 3 });
+        assert_eq!(output.writes, 1); assert_eq!(output.flushes, 1);
+        assert_eq!(output.bytes.last(), Some(&b'\n')); assert!(released.get());
+        let report: serde_json::Value = serde_json::from_slice(&output.bytes).unwrap();
+        assert_eq!(report["report"]["complete"], true);
+    }
 }

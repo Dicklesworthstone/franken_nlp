@@ -11,6 +11,7 @@ mod schema;
 mod native;
 mod ner;
 mod extract;
+mod faithfulness;
 #[cfg(test)] mod tests;
 
 const PROTOCOL: &str = "fnlp.assay.scored";
@@ -132,6 +133,7 @@ pub(crate) struct Qualify {
 
 pub(crate) enum AssayCommand {
     Scored(ScoredCommand), Native(native::Command), NativeNer(ner::Command), NativeExtract(extract::Command),
+    NativeFaithfulness(faithfulness::Command),
 }
 pub(crate) enum ScoredCommand { Eval(Eval), Calibrate(Calibrate), Qualify(Qualify) }
 
@@ -149,12 +151,12 @@ pub(crate) fn definitions() -> Vec<clap::Command> {
             match name {
                 "eval" => command.about("Evaluate supplied observations or replay pinned native INT4 tasks")
                     .subcommand(native::definition("eval")).subcommand(ner::definition("eval"))
-                    .subcommand(extract::definition("eval")),
+                    .subcommand(extract::definition("eval")).subcommand(faithfulness::definition("eval")),
                 "calibrate" => command.about("Fit supplied observations or actual native INT4 reliability on calibration rows")
                     .subcommand(native::definition("calibrate")),
                 "qualify" => command.about("Compare paired supplied observations or native INT4 models under explicit local gates")
                     .subcommand(native::definition("qualify")).subcommand(ner::definition("qualify"))
-                    .subcommand(extract::definition("qualify")),
+                    .subcommand(extract::definition("qualify")).subcommand(faithfulness::definition("qualify")),
                 _ => command,
             }
         }).collect()
@@ -170,6 +172,8 @@ impl AssayCommand {
                 ner::Command::from_matches(name, matches).map(Self::NativeNer),
             Some(("native-extract-int4", matches)) if matches!(name, "eval" | "qualify") =>
                 extract::Command::from_matches(name, matches).map(Self::NativeExtract),
+            Some(("native-faithfulness-int4", matches)) if matches!(name, "eval" | "qualify") =>
+                faithfulness::Command::from_matches(name, matches).map(Self::NativeFaithfulness),
             Some(("scored", _)) => ScoredCommand::from_matches(name, matches).map(Self::Scored),
             _ => Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand,
                 "an explicit supported Assay backend is required")),
@@ -181,6 +185,7 @@ impl AssayCommand {
             Self::Native(command) => command.run(input, output, errors),
             Self::NativeNer(command) => command.run(input, output, errors),
             Self::NativeExtract(command) => command.run(input, output, errors),
+            Self::NativeFaithfulness(command) => command.run(input, output, errors),
         }
     }
 }
