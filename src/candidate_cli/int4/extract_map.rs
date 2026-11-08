@@ -2,6 +2,7 @@
 use super::*;
 pub(super) mod corpus;
 pub(super) mod array_union;
+pub(super) mod object;
 use array_union::ArrayUnionArgs;
 use crate::{
     batch::extract::{ExtractionBatchArgs, grouped_int4::long::{Int4ExtractionMappingLimits, Int4ExtractionMapLimits,

@@ -13,6 +13,8 @@ use crate::{
 };
 mod cohort;
 mod corpus;
+mod object;
+pub use object::Int4ObjectExtractionMapConfig;
 pub use corpus::int4_extraction_document_corpus_requirements;
 
 /// Admission for a complete original document. The immutable compiler owns

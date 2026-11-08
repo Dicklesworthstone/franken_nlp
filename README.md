@@ -3787,7 +3787,9 @@ examples, bounds, provenance and the unrun qualification gates.
 Each chunk must independently satisfy the schema. For example, a required
 verbatim constant present in only one chunk makes the complete request fail;
 the command does not invent the field in other chunks, skip them, or repair
-their outputs. Independent objects are not combined into a global object.
+their outputs. Independent objects are not combined into a global object by
+`extract-map`. For complementary root fields spread across chunks, use the
+explicit `extract-object-map` route below.
 Chunked inference also has no overlapping-window or single-context equivalence
 guarantee.
 
@@ -3814,6 +3816,40 @@ alongside `.cohorts` statistics under one result guard. See
 window memory requirements. This is
 source-inventoried candidate functionality; build, model-present correctness
 and quality qualification remain pending.
+
+### Complete-document root-object extraction
+
+`fnlp candidate source-int4 extract-object-map` combines complementary root
+properties into one object. It derives a separately authenticated partial schema
+by emptying only the root `required` set, then uses a fixed task instruction to
+omit properties absent from each chunk. Nested objects and arrays retain their
+complete original schemas and are treated as atomic values. Every chunk is
+planned and admitted before the first native forward.
+
+```bash
+fnlp candidate source-int4 extract-object-map long-document.txt \
+  --schema record.schema.json --source-membership \
+  --snapshot nanbeige.int4.snapshot --expected-model-sha256 "$MODEL_SHA256" \
+  --memory-mib 16384 --max-chunks 64 \
+  --max-map-result-bytes 16777216 > complete-record.json
+```
+
+The deterministic reducer coalesces exactly equal property values and retains
+every chunk origin. Conflicting values or a missing final required property
+fail the complete document. It never chooses the first or last conflicting
+value, invents a null, recursively combines partial nested values, or runs a
+repair pass. The final object independently validates against the untouched
+original schema. With `--source-membership`, final annotated fields are also
+matched against the complete original source, using the remainder of the
+original field/match/scan budgets after chunk verification.
+
+The result retains all partial native outputs, their original-coordinate
+evidence, the complete exact JSON object and property origins. Separate bounded
+reconciliation storage is admitted alongside the existing complete map. Initial
+execution uses serial full-vocabulary byte-input planning; compilation, model
+behavior and quality remain subject to the existing qualification gates. See
+[root-object reconciliation](docs/int4-extraction-object-map.md) for a worked
+example, limits, result fields and the library API.
 
 ## Implemented candidate INT4 durable whole-document schema extraction
 

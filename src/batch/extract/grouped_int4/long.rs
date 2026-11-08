@@ -22,6 +22,8 @@ use crate::{
     tasks::extract::grouped_int4::INT4_EXTRACT_VERSION};
 mod execution;
 pub mod cohort;
+/// Explicit partial-root schema derivation and conflict-refusing reconciliation.
+pub mod object;
 /// Ordered live populations of independently complete source documents.
 pub mod stream;
 

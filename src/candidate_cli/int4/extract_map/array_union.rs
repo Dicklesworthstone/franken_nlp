@@ -16,7 +16,7 @@ impl ArrayUnionSelection {
     }
 }
 
-#[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Args, Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct ArrayUnionArgs {
     /// Combine root-array records by exact canonical value, retaining every origin.
     #[arg(long)]

@@ -37,6 +37,8 @@ pub mod quantized;
 pub mod semantic;
 /// Explicit exact-record union of complete root-array extraction maps.
 pub mod array_union;
+/// Explicit root-property reconciliation after partial-schema document maps.
+pub mod object_reconcile;
 pub use grounded::{SourceDocument, SourceDocumentEncoder};
 
 /// Explicit sampler policy; this path does not accept seeded or thinking modes.

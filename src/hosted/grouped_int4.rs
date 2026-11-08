@@ -35,7 +35,7 @@ pub use semantic::{Int4SemanticHostLimits, Int4SemanticHostRequirements};
 mod source_semantic;
 pub use source_semantic::{Int4SourceSemanticHostLimits, Int4SourceSemanticHostRequirements};
 mod extraction_map;
-pub use extraction_map::{Int4ExtractionMapConfig, int4_extraction_document_corpus_requirements};
+pub use extraction_map::{Int4ExtractionMapConfig, Int4ObjectExtractionMapConfig, int4_extraction_document_corpus_requirements};
 mod source;
 mod source_map;
 pub use source_map::{Int4SourceMapConfig, Int4SourceDocumentCorpusRequirement,
@@ -127,6 +127,7 @@ pub enum Int4HostError {
     SemanticExtraction(crate::tasks::extract::semantic::grouped_int4::Int4SemanticError),
     SourceSemantic(crate::tasks::source_planning::grouped_int4::semantic::Int4SourceSemanticError),
     ExtractionMap(crate::batch::extract::grouped_int4::long::Int4ExtractionMapError),
+    ObjectExtractionMap(crate::batch::extract::grouped_int4::long::object::Int4ObjectExtractionMapError),
     SourceTask(crate::tasks::source_planning::grouped_int4::Int4SourceError),
     SourceMap(crate::tasks::source_planning::grouped_int4::long::Int4SourceMapError),
     SourceSummary(crate::tasks::source_planning::grouped_int4::long::summary::Int4CorpusSummaryError),
@@ -153,6 +154,7 @@ impl fmt::Display for Int4HostError {
             Self::SemanticExtraction(_) => "INT4 extraction second-reader execution or finalization refused",
             Self::SourceSemantic(_) => "INT4 summary or answer second-reader execution or finalization refused",
             Self::ExtractionMap(_) => "INT4 complete-document extraction or reduction refused",
+            Self::ObjectExtractionMap(_) => "INT4 complete-document root-object reconciliation refused",
             Self::SourceTask(_) => "INT4 source task execution or finalization refused",
             Self::SourceMap(_) => "INT4 complete-document source mapping refused",
             Self::SourceSummary(_) => "INT4 complete-document cited-summary reduction refused",
@@ -172,6 +174,7 @@ impl Error for Int4HostError {
             Self::Judge(e) => Some(e), Self::FaithfulnessMap(e) => Some(e), Self::Resolution(e) => Some(e),
             Self::Entities(e) => Some(e), Self::Redaction(e) => Some(e),
             Self::Extraction(e) => Some(e), Self::ExtractionMap(e) => Some(e), Self::SourceTask(e) => Some(e),
+            Self::ObjectExtractionMap(e) => Some(e),
             Self::SemanticExtraction(e) => Some(e),
             Self::SourceSemantic(e) => Some(e),
             Self::SourceMap(e) => Some(e), Self::SourceSummary(e) => Some(e), Self::SourceKeyphrases(e) => Some(e) }

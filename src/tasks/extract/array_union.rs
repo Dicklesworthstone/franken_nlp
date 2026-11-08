@@ -105,7 +105,7 @@ impl RootArrayUnionLimits {
         Ok(Sha256Digest::of_bytes(&bytes))
     }
 }
-fn schema_shape(schema: &SchemaNode, depth: usize) -> Result<(), RootArrayUnionError> {
+pub(super) fn schema_shape(schema: &SchemaNode, depth: usize) -> Result<(), RootArrayUnionError> {
     if depth > MAX_DEPTH { return Err(RootArrayUnionError::Schema); }
     match schema {
         SchemaNode::Array { items, .. } => schema_shape(items, depth + 1)?,
@@ -272,7 +272,7 @@ pub(crate) fn reduce<'a, C: DecodeStepControl>(schema: &SchemaNode, binding: Sha
     Ok(result)
 }
 
-fn parse<C: DecodeStepControl>(json: &str, nodes: usize, control: &mut C) -> Result<JsonValue, RootArrayUnionError> {
+pub(super) fn parse<C: DecodeStepControl>(json: &str, nodes: usize, control: &mut C) -> Result<JsonValue, RootArrayUnionError> {
     // Strings followed by ':' are object keys in valid JSON. The independent
     // parser still checks the complete syntax and duplicate-key semantics.
     // This scan has no allocation and caps path components before tree parsing.
@@ -332,10 +332,10 @@ fn hash_chunk(hash: &mut Sha256, chunk: &ArrayUnionChunk<'_>) {
         for &value in &field.spans { span(hash, value); }
     }
 }
-struct Writer { bytes: Vec<u8>, cap: usize }
+pub(super) struct Writer { bytes: Vec<u8>, cap: usize }
 impl Writer {
-    fn new(cap: usize) -> Self { Self { bytes: Vec::new(), cap } }
-    fn push(&mut self, bytes: &[u8]) -> Result<(), RootArrayUnionError> {
+    pub(super) fn new(cap: usize) -> Self { Self { bytes: Vec::new(), cap } }
+    pub(super) fn push(&mut self, bytes: &[u8]) -> Result<(), RootArrayUnionError> {
         let needed = self.bytes.len().checked_add(bytes.len()).filter(|&n| n <= self.cap)
             .ok_or(RootArrayUnionError::Limit)?;
         if needed > self.bytes.capacity() {
@@ -345,7 +345,7 @@ impl Writer {
         }
         self.bytes.extend_from_slice(bytes); Ok(())
     }
-    fn string<C: DecodeStepControl>(&mut self, text: &str, control: &mut C) -> Result<(), RootArrayUnionError> {
+    pub(super) fn string<C: DecodeStepControl>(&mut self, text: &str, control: &mut C) -> Result<(), RootArrayUnionError> {
         self.push(b"\"")?;
         let mut start = 0;
         for (i, byte) in text.bytes().enumerate() {
@@ -363,7 +363,7 @@ impl Writer {
         }
         self.push(&text.as_bytes()[start..])?; self.push(b"\"")
     }
-    fn value<C: DecodeStepControl>(&mut self, value: &JsonValue, remaining: &mut usize, control: &mut C)
+    pub(super) fn value<C: DecodeStepControl>(&mut self, value: &JsonValue, remaining: &mut usize, control: &mut C)
         -> Result<(), RootArrayUnionError> {
         poll(control)?;
         *remaining = remaining.checked_sub(1).ok_or(RootArrayUnionError::Limit)?;
@@ -383,7 +383,7 @@ impl Writer {
         }
         Ok(())
     }
-    fn finish(self) -> Result<String, RootArrayUnionError> {
+    pub(super) fn finish(self) -> Result<String, RootArrayUnionError> {
         String::from_utf8(self.bytes).map_err(|_| RootArrayUnionError::Serialization)
     }
 }
