@@ -279,6 +279,45 @@ pub(super) fn checkpoint<C: DecodeStepControl>(control: &mut C) -> Result<(), In
     match control.prefill_checkpoint(0) { Some(cause) => Err(Int4ModelError::Cancelled(cause)), None => Ok(()) }
 }
 
+/// Synthetic projection/protocol fixture only. Its deliberately tiny tensors
+/// are NOT a decoder model, pinned-source evidence or a model-quality oracle.
+/// Only tests can bypass the complete production loader's 201-tensor census.
+#[cfg(test)]
+pub(crate) fn projection_fixture(group_width: usize)
+    -> (Int4ModelWeights, crate::native_engine::portable_int8::ActivationBuffer) {
+    struct Continue;
+    impl DecodeStepControl for Continue {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }
+    }
+    let matrix = |rows: usize, seed: usize| {
+        let values: Vec<_> = (0..rows * 6).map(|i| Bf16::from_f32(
+            ((i * 7 + seed) % 37) as f32 - 18.0)).collect();
+        let need = Int4ConversionRequirement::for_shape(rows, 6, group_width).unwrap();
+        GroupedInt4Matrix::from_bf16(rows, 6, group_width, &values, Int4ConversionBudget {
+            max_payload_bytes: need.peak_payload_bytes().unwrap(), max_source_values: need.source_values,
+            max_groups: need.groups }, &mut Continue).unwrap()
+    };
+    let model = Int4ModelWeights {
+        embeddings: Bf16Matrix::new(10, 6, vec![Bf16::from_f32(1.0); 60]).unwrap(),
+        final_norm: vec![Bf16::from_f32(1.0); 6],
+        layers: std::array::from_fn(|layer| Int4Layer {
+            norm1: vec![Bf16::from_f32(1.0); 6], norm2: vec![Bf16::from_f32(1.0); 6],
+            q: matrix(6, layer * 7), k: matrix(6, layer * 7 + 1), v: matrix(6, layer * 7 + 2),
+            o: matrix(6, layer * 7 + 3), gate: matrix(6, layer * 7 + 4),
+            up: matrix(6, layer * 7 + 5), down: matrix(6, layer * 7 + 6),
+        }),
+        head: matrix(10, 31),
+        identity: Int4ModelIdentity {
+            source_root_sha256: "synthetic-int4-projection-protocol-fixture".to_owned(),
+            content_sha256: Sha256::digest(format!("test-only-int4-projection-width-{group_width}").as_bytes()).into(),
+            group_width,
+        },
+    };
+    let mut input = crate::native_engine::portable_int8::ActivationBuffer::try_new(6).unwrap();
+    input.encode_f32(&[-3.0, 127.0, -12.0, 0.0, 2.5, -55.0]).unwrap();
+    (model, input)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

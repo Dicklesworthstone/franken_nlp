@@ -113,8 +113,8 @@ fn native_projection_preserves_group_scaling_and_charges_actual_group_dots() {
     let rope = RopeTablesF32::nanbeige(1).unwrap(); let mut scratch = [0; 2]; let mut control = Continue;
     let mut executor = Executor { final_norm: &[], rope: &rope, activation: &mut activation,
         unpack: &mut scratch, kernel: PackedInt4Kernel::scalar(), ledger: &mut ledger,
-        control: &mut control, completed: 0, norms: 0 };
-    assert_eq!(executor.project(&matrix).unwrap(), [Bf16::from_f32(19_558.0)]);
+        projection: &mut None, control: &mut control, completed: 0, norms: 0 };
+    assert_eq!(executor.project(Int4ProjectionOp::Head, &matrix).unwrap(), [Bf16::from_f32(19_558.0)]);
     assert_eq!(ledger.reserved(), ProjectionWork { dot_products: 2, multiply_accumulates: 4 });
 }
 

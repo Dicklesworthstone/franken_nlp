@@ -25,9 +25,11 @@ pub mod weights;
 pub mod scoring;
 pub mod prefill;
 pub mod cohort;
+pub(crate) mod projection;
 pub use weights::{Int4ModelError, Int4ModelIdentity, Int4ModelLoadBudget,
     Int4ModelLoadRequirement, Int4ModelWeights};
 use weights::{Int4Layer, PROJECTION_SHAPES};
+use projection::{Int4ProjectionExecutor, Int4ProjectionKind, Int4ProjectionOp};
 
 // Version 1 remains the existing INT8 program. Version 2 names this distinct
 // grouped-INT4 candidate in the central ExecutionIdentity profile namespace.
@@ -37,7 +39,7 @@ pub const STRICT_INT4_EXECUTION: &str = "grouped-int4-bf16-rails-eager-gqa-v1";
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StrictInt4Error {
     Input, Context, Memory, Work, Allocation, Cache, Rope, Attention,
-    Primitive, Boundary, EmptyHidden, EngineUnavailable,
+    Primitive, Boundary, EmptyHidden, EngineUnavailable, ProjectionExecutor,
     Linear(GroupedInt4Error), Cancelled(DecodeCancellationKind),
 }
 impl fmt::Display for StrictInt4Error {
@@ -55,6 +57,7 @@ impl fmt::Display for StrictInt4Error {
             Self::Boundary => "strict INT4 shared loop boundary diverged",
             Self::EmptyHidden => "strict INT4 projection requires a completed forward",
             Self::EngineUnavailable => "strict INT4 engine is active or poisoned",
+            Self::ProjectionExecutor => "strict INT4 admitted projection executor refused or failed",
             Self::Linear(_) => "strict INT4 group-scaled projection failed",
             Self::Cancelled(_) => "strict INT4 execution cancelled",
         })
@@ -164,6 +167,7 @@ impl RunState {
 pub struct StrictInt4Engine<'weights> {
     weights: &'weights Int4ModelWeights, cache: KvCache, rope: RopeTablesF32,
     activation: ActivationBuffer, unpack: Vec<i8>, kernel: PackedInt4Kernel, state: RunState,
+    projection: Option<&'weights mut (dyn Int4ProjectionExecutor + 'weights)>,
 }
 impl<'weights> StrictInt4Engine<'weights> {
     pub fn new(weights: &'weights Int4ModelWeights, context: usize, budget: Int4MemoryBudget) -> Result<Self, StrictInt4Error> {
@@ -171,10 +175,20 @@ impl<'weights> StrictInt4Engine<'weights> {
         Ok(Self { weights, cache: KvCache::try_with_capacity(context).map_err(|_| StrictInt4Error::Allocation)?,
             rope: RopeTablesF32::nanbeige(context).map_err(|_| StrictInt4Error::Rope)?,
             activation: ActivationBuffer::try_new(I)?, unpack: filled(weights.group_width(), 0_i8)?,
-            kernel: PackedInt4Kernel::scalar(), state: RunState::default() })
+            kernel: PackedInt4Kernel::scalar(), state: RunState::default(), projection: None })
     }
     /// The caller supplies a real-host-checked handle before opening a session.
     pub fn with_kernel(mut self, kernel: PackedInt4Kernel) -> Self { self.kernel = kernel; self }
+    /// Only the hosted whole-request team installs an executor. It must use
+    /// this exact immutable model and checked integer kernel. Its separately
+    /// admitted workspace outlives the engine and drains with the host scope.
+    #[cfg(any(feature = "asupersync-runtime", test))]
+    pub(crate) fn with_projection_executor(mut self,
+        executor: &'weights mut (dyn Int4ProjectionExecutor + 'weights)) -> Result<Self, StrictInt4Error> {
+        projection::check_binding(self.weights.identity(), self.kernel.kind(), executor)?;
+        self.projection = Some(executor);
+        Ok(self)
+    }
     pub fn kernel_kind(&self) -> Int8KernelKind { self.kernel.kind() }
     pub fn profile(&self) -> &'static str { STRICT_INT4_PROFILE }
     pub fn model_identity(&self) -> &Int4ModelIdentity { self.weights.identity() }
@@ -183,6 +197,11 @@ impl<'weights> StrictInt4Engine<'weights> {
     pub fn session<'run, C: DecodeStepControl>(&'run mut self, budget: Int4RunBudget, control: &'run mut C)
         -> Result<Int4Session<'run, 'weights, C>, StrictInt4Error> {
         if !self.cache.all_slots_have_len(0) { return Err(StrictInt4Error::Cache); }
+        // Recheck after builder chaining: with_kernel must not silently change
+        // the kernel reported for an already installed projection executor.
+        if let Some(executor) = self.projection.as_ref() {
+            projection::check_binding(self.weights.identity(), self.kernel.kind(), &**executor)?;
+        }
         self.state.open()?;
         Ok(Int4Session { engine: self, control, remaining_positions: budget.max_forward_positions,
             remaining_attention: budget.max_attention_pairs, ledger: ProjectionLedger::new(budget.max_projection_work),
@@ -232,7 +251,8 @@ impl<C: DecodeStepControl> Int4Session<'_, '_, C> {
         let runner = LoopRunner::from_layer_weights(&self.engine.weights.layers);
         let mut executor = Executor { final_norm: &self.engine.weights.final_norm, rope: &self.engine.rope,
             activation: &mut self.engine.activation, unpack: &mut self.engine.unpack, kernel: self.engine.kernel,
-            ledger: &mut self.ledger, control: &mut *self.control, completed: 0, norms: 0 };
+            ledger: &mut self.ledger, projection: &mut self.engine.projection,
+            control: &mut *self.control, completed: 0, norms: 0 };
         runner.run_token(&mut executor, &mut hidden, PositionContext::at(position), &mut self.engine.cache)?;
         if executor.completed != KV_SLOT_COUNT || executor.norms != 2 { return Err(StrictInt4Error::Boundary); }
         if !self.engine.cache.all_slots_have_len(position + 1) { return Err(StrictInt4Error::Cache); }
@@ -251,8 +271,9 @@ impl<C: DecodeStepControl> Int4Session<'_, '_, C> {
         let mut output = filled(count, 0.0_f32)?;
         self.engine.state.poisoned = true;
         self.engine.activation.encode_bf16(self.hidden.as_deref().ok_or(StrictInt4Error::EmptyHidden)?)?;
-        self.engine.weights.head.as_linear().with_kernel(self.engine.kernel).project_f32_into(
-            &self.engine.activation, rows, &mut output, &mut self.engine.unpack, &mut self.ledger, &mut *self.control)?;
+        projection::project_f32(&mut self.engine.projection, Int4ProjectionOp::Head,
+            &self.engine.weights.head, &self.engine.activation, rows, &mut output,
+            &mut self.engine.unpack, self.engine.kernel, &mut self.ledger, &mut *self.control)?;
         self.work.projected_logits = next; self.engine.state.poisoned = false; Ok(output)
     }
     pub fn prefill(&mut self, tokens: &[u32], rows: LinearRows<'_>) -> Result<Vec<f32>, StrictInt4Error> {
@@ -269,12 +290,13 @@ fn end_session(cache: &mut KvCache, state: &mut RunState) {
     state.poisoned |= std::thread::panicking(); cache.clear(); state.active = false;
 }
 
-struct Executor<'a, C> {
+struct Executor<'a, 'executor, C> {
     final_norm: &'a [Bf16], rope: &'a RopeTablesF32, activation: &'a mut ActivationBuffer,
     unpack: &'a mut [i8], kernel: PackedInt4Kernel, ledger: &'a mut ProjectionLedger,
+    projection: &'a mut Option<&'executor mut (dyn Int4ProjectionExecutor + 'executor)>,
     control: &'a mut C, completed: usize, norms: usize,
 }
-impl<C: DecodeStepControl> LayerExecutor<Int4Layer> for Executor<'_, C> {
+impl<C: DecodeStepControl> LayerExecutor<Int4Layer> for Executor<'_, '_, C> {
     type Hidden = Vec<Bf16>;
     type Error = StrictInt4Error;
     fn layer_forward(&mut self, binding: &LayerBinding<'_, Int4Layer>, hidden: &mut Self::Hidden,
@@ -283,11 +305,12 @@ impl<C: DecodeStepControl> LayerExecutor<Int4Layer> for Executor<'_, C> {
             || positions != PositionContext::at(positions.position) { return Err(StrictInt4Error::Boundary); }
         poll(self.control)?;
         let layer = binding.weights();
+        let projection = |kind| Int4ProjectionOp::Layer { layer: binding.layer_index(), kind };
         let normalized = norm(hidden, &layer.norm1)?;
         self.activation.encode_bf16(&normalized)?;
-        let mut query = self.project(&layer.q)?;
-        let mut key = self.project(&layer.k)?;
-        let value = self.project(&layer.v)?;
+        let mut query = self.project(projection(Int4ProjectionKind::Query), &layer.q)?;
+        let mut key = self.project(projection(Int4ProjectionKind::Key), &layer.k)?;
+        let value = self.project(projection(Int4ProjectionKind::Value), &layer.v)?;
         for head in query.chunks_exact_mut(NANBEIGE_HEAD_DIM) { self.rope.apply_split_half(positions.rope_position, head).map_err(|_| StrictInt4Error::Rope)?; }
         for head in key.chunks_exact_mut(NANBEIGE_HEAD_DIM) { self.rope.apply_split_half(positions.rope_position, head).map_err(|_| StrictInt4Error::Rope)?; }
         finite(&query)?; finite(&key)?;
@@ -299,15 +322,15 @@ impl<C: DecodeStepControl> LayerExecutor<Int4Layer> for Executor<'_, C> {
         let attention = eager_gqa_attention_from_cache(&query, cache, binding.kv_slot()).map_err(|_| StrictInt4Error::Attention)?;
         finite(&attention)?; poll(self.control)?;
         self.activation.encode_bf16(&attention)?;
-        let update = self.project(&layer.o)?;
+        let update = self.project(projection(Int4ProjectionKind::AttentionOutput), &layer.o)?;
         let residual = residual_add_f32_cast_back(hidden, &update).map_err(|_| StrictInt4Error::Primitive)?;
         let normalized = norm(&residual, &layer.norm2)?;
         self.activation.encode_bf16(&normalized)?;
-        let gate = self.project(&layer.gate)?;
-        let up = self.project(&layer.up)?;
+        let gate = self.project(projection(Int4ProjectionKind::Gate), &layer.gate)?;
+        let up = self.project(projection(Int4ProjectionKind::Up), &layer.up)?;
         let product = swiglu_f32_cast_back(&gate, &up).map_err(|_| StrictInt4Error::Primitive)?;
         self.activation.encode_bf16(&product)?;
-        let update = self.project(&layer.down)?;
+        let update = self.project(projection(Int4ProjectionKind::Down), &layer.down)?;
         let output = residual_add_f32_cast_back(&residual, &update).map_err(|_| StrictInt4Error::Primitive)?;
         finite(&output)?; *hidden = output; self.completed += 1; Ok(())
     }
@@ -316,11 +339,11 @@ impl<C: DecodeStepControl> LayerExecutor<Int4Layer> for Executor<'_, C> {
         poll(self.control)?; *hidden = norm(hidden, self.final_norm)?; self.norms += 1; Ok(())
     }
 }
-impl<C: DecodeStepControl> Executor<'_, C> {
-    fn project(&mut self, matrix: &GroupedInt4Matrix) -> Result<Vec<Bf16>, StrictInt4Error> {
+impl<C: DecodeStepControl> Executor<'_, '_, C> {
+    fn project(&mut self, op: Int4ProjectionOp, matrix: &GroupedInt4Matrix) -> Result<Vec<Bf16>, StrictInt4Error> {
         let mut output = filled(matrix.rows(), Bf16::from_bits(0))?;
-        matrix.as_linear().with_kernel(self.kernel).project_bf16_into(self.activation, LinearRows::All,
-            &mut output, self.unpack, self.ledger, self.control)?;
+        projection::project_bf16(self.projection, op, matrix, self.activation, LinearRows::All,
+            &mut output, self.unpack, self.kernel, self.ledger, self.control)?;
         Ok(output)
     }
 }

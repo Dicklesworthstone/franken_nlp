@@ -6,6 +6,7 @@
 //! No dense weight expansion, hidden allocation, model activation or spawning.
 
 use super::*;
+use std::ops::Range;
 use crate::native_engine::int4::PackedInt4Kernel;
 
 pub mod convert;
@@ -95,7 +96,7 @@ impl<'a> GroupedInt4Linear<'a> {
     }
     fn project<C: DecodeStepControl>(&self, input: &ActivationBuffer, rows: LinearRows<'_>, length: usize,
         scratch: &mut [i8], ledger: &mut ProjectionLedger, control: &mut C,
-        mut store: impl FnMut(usize, f32) -> Result<(), LinearError>) -> Result<(), GroupedInt4Error> {
+        store: impl FnMut(usize, f32) -> Result<(), LinearError>) -> Result<(), GroupedInt4Error> {
         let input_values = input.values()?;
         let activation_scale = input.scale()?;
         if input_values.len() != self.columns { return Err(LinearError::Shape.into()); }
@@ -103,8 +104,65 @@ impl<'a> GroupedInt4Linear<'a> {
         if length != count { return Err(LinearError::OutputShape.into()); }
         if scratch.len() < self.scratch_len() { return Err(GroupedInt4Error::Scratch); }
         ledger.charge(self.planned_work(rows)?)?;
+        self.project_range(input_values, activation_scale, rows, 0..count, scratch, control, store)
+    }
+    /// Admit an entire externally scheduled projection exactly once, before
+    /// any output range is dispatched. Range leaves never debit a second
+    /// ledger, and failed or cancelled ranges never refund this charge.
+    pub(crate) fn reserve_projection(&self, input: &ActivationBuffer, rows: LinearRows<'_>,
+        length: usize, ledger: &mut ProjectionLedger) -> Result<(), GroupedInt4Error> {
+        let values = input.values()?;
+        input.scale()?;
+        if values.len() != self.columns { return Err(LinearError::Shape.into()); }
+        if rows.checked_count(self.rows)? != length { return Err(LinearError::OutputShape.into()); }
+        ledger.charge(self.planned_work(rows)?)?;
+        Ok(())
+    }
+    /// Exact row-range leaf for an already admitted projection. `range`
+    /// indexes output positions in `rows`, not a different weight matrix.
+    /// Quantized activations are copied unchanged into bounded worker storage;
+    /// this surface never requantizes, allocates, spawns, or resets work limits.
+    /// Each worker owns its output and unpacking scratch. Partial output on
+    /// any error is private staging and must not be published.
+    #[cfg(any(feature = "asupersync-runtime", test))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn project_f32_range_into(&self, input: &[i8], activation_scale: f32,
+        rows: LinearRows<'_>, range: Range<usize>, output: &mut [f32], scratch: &mut [i8],
+        control: &mut dyn DecodeStepControl) -> Result<(), GroupedInt4Error> {
+        self.check_range(input, activation_scale, rows, &range, output.len(), scratch.len())?;
+        self.project_range(input, activation_scale, rows, range, scratch, control,
+            |index, value| { output[index] = value; Ok(()) })
+    }
+    /// The BF16 cast is identical to the serial projection: exactly once,
+    /// after every group in the output row has been summed in ascending order.
+    #[cfg(any(feature = "asupersync-runtime", test))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn project_bf16_range_into(&self, input: &[i8], activation_scale: f32,
+        rows: LinearRows<'_>, range: Range<usize>, output: &mut [Bf16], scratch: &mut [i8],
+        control: &mut dyn DecodeStepControl) -> Result<(), GroupedInt4Error> {
+        self.check_range(input, activation_scale, rows, &range, output.len(), scratch.len())?;
+        self.project_range(input, activation_scale, rows, range, scratch, control, |index, value| {
+            output[index] = checked_bf16(value)?; Ok(())
+        })
+    }
+    #[cfg(any(feature = "asupersync-runtime", test))]
+    fn check_range(&self, input: &[i8], activation_scale: f32, rows: LinearRows<'_>,
+        range: &Range<usize>, length: usize, scratch_len: usize) -> Result<(), GroupedInt4Error> {
+        if input.len() != self.columns { return Err(LinearError::Shape.into()); }
+        if !activation_scale.is_finite() || activation_scale <= 0.0 { return Err(LinearError::Activation.into()); }
+        let count = rows.checked_count(self.rows)?;
+        if range.end > count || range.end.checked_sub(range.start) != Some(length) {
+            return Err(LinearError::OutputShape.into());
+        }
+        if scratch_len < self.scratch_len() { return Err(GroupedInt4Error::Scratch); }
+        Ok(())
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn project_range<C: DecodeStepControl + ?Sized>(&self, input_values: &[i8], activation_scale: f32,
+        rows: LinearRows<'_>, range: Range<usize>, scratch: &mut [i8], control: &mut C,
+        mut store: impl FnMut(usize, f32) -> Result<(), LinearError>) -> Result<(), GroupedInt4Error> {
         let mut since_poll = 0;
-        for index in 0..count {
+        for (local, index) in range.enumerate() {
             let row = rows.row(index);
             let mut total = 0.0_f32;
             for group in 0..self.groups {
@@ -117,7 +175,7 @@ impl<'a> GroupedInt4Linear<'a> {
                 accumulate_group(&mut total, dot[0], activation_scale, self.scales[row * self.groups + group])?;
                 since_poll = (since_poll + 1) % ROWS_PER_CHECKPOINT;
             }
-            store(index, total)?;
+            store(local, total)?;
         }
         poll(control)?;
         Ok(())
@@ -138,3 +196,5 @@ fn checked_bf16(value: f32) -> Result<Bf16, LinearError> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod range_tests;

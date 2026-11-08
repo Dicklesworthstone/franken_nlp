@@ -237,7 +237,7 @@ impl<'a> QuantizedLinear<'a> {
         poll(control)
     }
 }
-fn poll<C: DecodeStepControl>(control: &mut C) -> Result<(), LinearError> {
+fn poll<C: DecodeStepControl + ?Sized>(control: &mut C) -> Result<(), LinearError> {
     match control.prefill_checkpoint(0) { Some(cause) => Err(LinearError::Cancelled(cause)), None => Ok(()) }
 }
 
