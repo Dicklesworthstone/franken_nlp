@@ -60,7 +60,7 @@ fn changed_admitted_options_refuse_before_runtime_or_any_private_input() {
         fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("write after refused options"); }
         fn flush(&mut self) -> io::Result<()> { panic!("flush after refused options"); }
     }
-    for axis in 0..6 {
+    for axis in 0..8 {
         let (options, mut a) = args("generate", &[]);
         let (limits, mut bounds) = options.validate(&a).unwrap();
         match axis {
@@ -69,7 +69,31 @@ fn changed_admitted_options_refuse_before_runtime_or_any_private_input() {
             2 => bounds.content_bytes += 1,
             3 => bounds.capture_logprobs = !bounds.capture_logprobs,
             4 => a.preparation_mib += 1,
-            _ => a.context_tokens += 1,
+            5 => a.context_tokens += 1,
+            6 => a.compute = args("generate", &["--compute-threads", "4"]).1.compute,
+            _ => a.group_width /= 2,
+        }
+        let failure = execute(Task::Generate, a, limits, bounds, &mut NoIo, NoIo).unwrap_err();
+        assert_eq!(failure.exit, ErrorCode::Usage);
+        assert_eq!(failure.code, "stream_admitted_options_mismatch");
+    }
+}
+
+#[test]
+fn a_team_stream_cannot_reuse_a_different_width_or_workspace_admission() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("private input accessed"); } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("stdout accessed"); }
+        fn flush(&mut self) -> io::Result<()> { panic!("stdout flushed"); }
+    }
+    for axis in 0..3 {
+        let (options, mut a) = args("generate", &["--compute-threads", "4"]);
+        let (mut limits, bounds) = options.validate(&a).unwrap();
+        match axis {
+            0 => a.compute = args("generate", &["--compute-threads", "2"]).1.compute,
+            1 => limits.compute.workspace_bytes -= 1,
+            _ => a.group_width /= 2,
         }
         let failure = execute(Task::Generate, a, limits, bounds, &mut NoIo, NoIo).unwrap_err();
         assert_eq!(failure.exit, ErrorCode::Usage);

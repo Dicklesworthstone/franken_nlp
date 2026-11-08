@@ -10,15 +10,18 @@ pub(in crate::candidate_cli::int4) fn execute<W: Write + Send + 'static>(task: T
     args: Int4Args, limits: Int4Limits, bounds: StreamBounds, input: &mut impl Read, output: W)
     -> Result<(), Failure> {
     if limits.minimum_memory_bytes > limits.memory_bytes || limits.kernel.kind() != args.kernel
-        || !prefill::matches(&args, limits)? || bounds.tokens != args.max_new_tokens
+        || !prefill::matches(&args, limits)? || limits.compute != args.compute.admit(args.group_width)?
+        || bounds.tokens != args.max_new_tokens
         || bounds.content_bytes != args.max_output_bytes || bounds.capture_logprobs != args.logprobs {
         return Err(Failure::usage("stream_admitted_options_mismatch"));
     }
     // Recompute the complete preparation floor, including encoding workspace,
     // before private IO even for internal callers carrying an earlier quote.
-    let current = args.validate()?;
+    let current = args.validate_text_compute()?;
     if limits.preparation_bytes != current.preparation_bytes
-        || limits.max_prompt_tokens != current.max_prompt_tokens {
+        || limits.max_prompt_tokens != current.max_prompt_tokens
+        || limits.native != current.native || limits.load != current.load
+        || limits.compute != current.compute {
         return Err(Failure::usage("stream_admitted_options_mismatch"));
     }
     let started = Instant::now();
@@ -27,8 +30,10 @@ pub(in crate::candidate_cli::int4) fn execute<W: Write + Send + 'static>(task: T
         .ok_or(CandidateError::Timeout);
     let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
         runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: limits.memory_bytes,
+        max_blocking_coordinators: 1,
+        scoped_cpu_children_per_coordinator: limits.compute.threads - 1,
+        helper_threads: 0, thread_ceiling: limits.compute.threads + 1,
+        memory_ceiling_bytes: limits.memory_bytes,
         leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
     }).build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
@@ -77,16 +82,25 @@ pub(in crate::candidate_cli::int4) fn execute<W: Write + Send + 'static>(task: T
         max_sampler_bytes: SAMPLER_BYTES, preparation_reserve_bytes: limits.preparation_bytes,
         sink_reserve_bytes: bounds.sink_memory_bytes,
     };
-    let mut completed = match limits.prefill {
-        Some(prefill) => engine.execute_int4_chat_stream_layer_major(&model, prepared, 1,
-            stream_limits, prefill, limits.kernel, sink, cancellation),
-        None => engine.execute_int4_chat_stream(&model, prepared, 1, stream_limits,
-            limits.kernel, sink, cancellation),
+    let mut completed = if limits.compute.threads > 1 {
+        engine.execute_int4_chat_stream_with_threads(&model, prepared, 1, stream_limits,
+            limits.kernel, limits.compute.threads, sink, cancellation)
+    } else {
+        match limits.prefill {
+            Some(prefill) => engine.execute_int4_chat_stream_layer_major(&model, prepared, 1,
+                stream_limits, prefill, limits.kernel, sink, cancellation),
+            None => engine.execute_int4_chat_stream(&model, prepared, 1, stream_limits,
+                limits.kernel, sink, cancellation),
+        }
     }.map_err(host_failure)?;
     // Only the guarded completion returned AFTER physical drain may publish
     // success. A late deadline or final write failure leaves the stream incomplete.
     remaining()?;
-    completed.with_sink(|result, sink| sink.finish_int4(result))
+    let compute = completed.compute().copied();
+    completed.with_sink(|result, sink| match compute.as_ref() {
+        Some(compute) => sink.finish_int4_with_compute(result, compute),
+        None => sink.finish_int4(result),
+    })
 }
 
 fn cancelled(cause: DecodeCancellationKind) -> Failure {
@@ -143,3 +157,4 @@ fn host_failure(error: HostedError) -> Failure {
 }
 
 #[cfg(test)] mod tests;
+#[cfg(test)] mod team_tests;

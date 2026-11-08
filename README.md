@@ -304,7 +304,8 @@ fnlp doctor                          # idempotent self-check/repair
 
 Buffered `fnlp candidate source-int4 generate`, `chat`, `classify`, `sentiment`,
 `judge`, `extract`, `ner`, `keyphrases`, `summarize` and `answer` accept
-`--compute-threads N`. The default, `1`, keeps the existing serial route.
+`--compute-threads N`, as do live `stream generate|chat` requests. The default,
+`1`, keeps the existing serial route.
 Values from `2` through `64` select one fixed team for the complete request:
 one blocking coordinator and `N - 1` persistent scoped workers. The command
 admits one additional runtime thread, for a configured process thread ceiling
@@ -366,8 +367,8 @@ team width, completed projection count, completed output rows and completed
 worker rows. Serial responses omit this field. These are work counters;
 they carry no speedup or parity certification.
 
-This route handles one complete buffered request. A worker count above one
-cannot combine with `--prefill-rows` or `--cohort-heads`; streaming, batches,
+This route handles one complete buffered or streamed request. A worker count
+above one cannot combine with `--prefill-rows` or `--cohort-heads`; batches,
 complete-document maps, corpora and durable jobs do not expose this option. Invalid
 widths, incompatible schedules and insufficient memory refuse before private
 IO, and a hosted request cannot exceed its installed child-thread envelope.
@@ -549,6 +550,10 @@ validator as buffered INT4 generation. The candidate build requires
 Live `stream generate|chat` also accepts `--input-encoding safe-bpe-v1` and
 the same whole-transcript tokenizer-work ceilings. The explicit policy is
 reported in `run_start`; the final task result keeps the buffered format.
+`--compute-threads 2..=64` selects one persistent row team across the complete
+prompt and generation. Width `1` retains the serial route; multiple workers
+cannot combine with `--prefill-rows`. Compact input and seeded generation can
+use the team without changing their identities or token protocol.
 
 ```bash
 fnlp candidate source-int4 stream generate prompt.txt \
@@ -562,7 +567,7 @@ fnlp candidate source-int4 stream chat messages.json \
   --snapshot /models/nanbeige.int4.snapshot \
   --expected-model-sha256 "$EXPECTED_MODEL_SHA256" \
   --memory-mib 8192 \
-  --prefill-rows 4 \
+  --compute-threads 4 --input-encoding safe-bpe-v1 \
   --logprobs
 ```
 
@@ -579,7 +584,11 @@ Token payloads contain exact `decoded_bytes` arrays; individual tokens can
 split a UTF-8 character. Concatenate these bytes before decoding text.
 The terminal `data` is the complete native task result returned by buffered
 execution, including token IDs, finish reason, optional raw full-vocabulary
-log probabilities and grouped model-work counts.
+log probabilities and grouped model-work counts. A worker-team completion
+adds a top-level `compute` receipt beside `data`, containing the actual width,
+completed projections, output rows and worker rows. Provisional frames carry
+no completed-work receipt. The optional metadata spends the reserved terminal
+frame capacity; serial frames retain their existing bytes.
 
 **Success requires `run_complete` and exit code 0.** The terminal is emitted
 only after task validation, native cleanup and the host's final cancellation
@@ -594,14 +603,21 @@ buffered semantics. Exact stop bytes remain in the output, including stops
 split across token boundaries. `--max-output-bytes` bounds generated content;
 `--max-stream-bytes` separately bounds the entire transport and reserves space
 for the terminal result. Admission includes full native buffers, optional
-prefill scratch, retained preparation, sink storage and output. Blocking
-writes apply backpressure to native execution.
+prefill or worker scratch, retained preparation, sink storage and output.
+Blocking writes apply backpressure to the coordinator, without a writer thread
+or detached task. Cancellation and output failures drain the same fixed team
+before native storage or its reservations can be released.
 
-Embedding applications can use `NlpEngine::execute_int4_chat_stream` or
-`execute_int4_chat_stream_layer_major`. Their `HostedInt4ChatStream` completion
-retains the sink and its memory charge through final publication.
-The retained regression fixtures cover framing and failure boundaries; a
-separate model-present fixture compares buffered and streamed execution.
+Embedding applications can use `NlpEngine::execute_int4_chat_stream`,
+`execute_int4_chat_stream_layer_major` or `execute_int4_chat_stream_with_threads`.
+Their `HostedInt4ChatStream` completion retains the sink and its memory charge
+through final publication; `compute()` is populated only for the team route
+and becomes observable after all workers join.
+Regression definitions cover framing, complete thread/workspace admission,
+terminal receipt limits and failure boundaries. A separate model-present
+fixture compares complete serial buffered results with two- and four-thread
+streams for generate/chat and greedy/seeded sampling; it also exercises failed
+writes/flushes and cancellation before execution or during token callbacks.
 Compilation, test execution and model qualification remain pending the
 controller's required DSR and model gates.
 

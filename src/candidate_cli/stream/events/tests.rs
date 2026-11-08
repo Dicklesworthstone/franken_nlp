@@ -444,6 +444,63 @@ fn streams_cannot_exchange_completions_between_int8_and_int4_backends() {
 }
 
 #[test]
+#[cfg(feature = "asupersync-runtime")]
+fn compute_receipt_is_terminal_metadata_and_never_changes_task_data() {
+    let receipt = crate::hosted::Int4ComputeReceipt { schedule: "int4-output-row-team-v1",
+        compute_threads: 4, completed_projections: 100, completed_rows: 1000,
+        completed_worker_rows: 750 };
+    for has_token in [false, true] {
+        let mut s = int4_sink(true, 128).with_input_encoding(safe_bpe_policy()).unwrap();
+        let finish = if has_token {
+            push(&mut s, event(0, 166101, b"", true));
+            GenerationFinish::Eos
+        } else { GenerationFinish::ByteLimit };
+        let result = int4_completion(&s, finish, 128);
+        s.finish_int4_with_compute(&result, &receipt).unwrap();
+        let frames = rows(&s.writer);
+        let terminal = frames.last().unwrap();
+        assert_eq!(terminal["event"], "run_complete");
+        assert_eq!(terminal["data"], serde_json::to_value(&result).unwrap());
+        assert_eq!(terminal["compute"], serde_json::to_value(receipt).unwrap());
+        assert!(frames[..frames.len() - 1].iter().all(|frame| frame.get("compute").is_none()));
+        assert!(s.writer.len() as u64 <= s.bounds.stream_bytes);
+    }
+    let mut serial = int4_sink(false, 128);
+    push(&mut serial, event(0, 166101, b"", false));
+    serial.finish_int4(&int4_completion(&serial, GenerationFinish::Eos, 128)).unwrap();
+    assert!(rows(&serial.writer).iter().all(|frame| frame.get("compute").is_none()));
+}
+
+#[test]
+#[cfg(feature = "asupersync-runtime")]
+fn compute_receipt_spends_reserved_terminal_bytes_before_any_terminal_write() {
+    let receipt = crate::hosted::Int4ComputeReceipt { schedule: "int4-output-row-team-v1",
+        compute_threads: 64, completed_projections: u64::MAX, completed_rows: u64::MAX,
+        completed_worker_rows: u64::MAX - 1 };
+    let mut s = int4_sink(false, 128);
+    push(&mut s, event(0, 166101, b"", false));
+    let result = int4_completion(&s, GenerationFinish::Eos, 128);
+    let without = s.frame("run_complete", false, &result, s.bounds.terminal_bytes).unwrap();
+    let with = s.frame_with_compute("run_complete", false, &result, Some(&receipt),
+        s.bounds.terminal_bytes).unwrap();
+    assert!(with.len() > without.len());
+    s.bounds.terminal_bytes = without.len();
+    let before = s.writer.clone();
+    assert_eq!(s.finish_int4_with_compute(&result, &receipt).unwrap_err().code, "stream_frame_limit");
+    assert_eq!(s.writer, before);
+    assert!(s.finish_int4(&result).is_err());
+
+    let mut wrong = int4_sink(false, 128);
+    push(&mut wrong, event(0, 166101, b"", false));
+    let before = wrong.writer.clone();
+    let mut result = int4_completion(&wrong, GenerationFinish::Eos, 128);
+    result.model_work.projected_logits += 1;
+    assert_eq!(wrong.finish_int4_with_compute(&result, &receipt).unwrap_err().code,
+        "stream_completion_backend");
+    assert_eq!(wrong.writer, before);
+}
+
+#[test]
 fn int4_stop_suffix_and_output_failure_use_the_same_no_retry_protocol() {
     let mut policy = options(false);
     policy.min_new_tokens = 2;

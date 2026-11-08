@@ -14,9 +14,14 @@ struct StreamInput<S> { prepared: Option<PreparedInt4Chat>, sink: S }
 pub struct HostedInt4ChatStream<S> {
     output: HostedOutput<Int4ChatResult>,
     input: Charged<StreamInput<S>>,
+    compute: Option<Int4ComputeReceipt>,
 }
 impl<S> HostedInt4ChatStream<S> {
     pub fn result(&self) -> &Int4ChatResult { self.output.result() }
+
+    /// Successful physical row work, available only after every scoped
+    /// worker joined. Serial/prefill streams keep their original result shape.
+    pub fn compute(&self) -> Option<&Int4ComputeReceipt> { self.compute.as_ref() }
 
     /// Called after native drain and the host's final cancellation decision.
     /// Publication may still fail; provisional events alone are never success.
@@ -40,7 +45,7 @@ impl NlpEngine {
         request_seq: u64, limits: ChatStreamLimits, kernel: PackedInt4Kernel, sink: S,
         cancellation: CancellationToken) -> Result<HostedInt4ChatStream<S>, HostedError>
     where S: DecodeEventSink + Send + 'static {
-        self.run_int4_chat_stream(model, prepared, request_seq, limits, None, kernel, sink, cancellation)
+        self.run_int4_chat_stream(model, prepared, request_seq, limits, None, None, kernel, sink, cancellation)
     }
 
     /// The same streamed task with explicitly admitted layer-major prompt
@@ -51,16 +56,42 @@ impl NlpEngine {
         request_seq: u64, limits: ChatStreamLimits, prefill: Int4PrefillLimits, kernel: PackedInt4Kernel,
         sink: S, cancellation: CancellationToken) -> Result<HostedInt4ChatStream<S>, HostedError>
     where S: DecodeEventSink + Send + 'static {
-        self.run_int4_chat_stream(model, prepared, request_seq, limits, Some(prefill), kernel, sink, cancellation)
+        self.run_int4_chat_stream(model, prepared, request_seq, limits, Some(prefill), None, kernel, sink, cancellation)
+    }
+
+    /// Stream one request on a fixed team of 2..=64 compute threads, including
+    /// the coordinator. The same team serves every prompt/generated position;
+    /// complete rows retain serial arithmetic and the ordinary task finalizer.
+    ///
+    /// Worker scratch is additionally admitted in the installed resource
+    /// domain. The moved sink and preparation stay charged through physical
+    /// drain and final publication. Blocking sink callbacks backpressure the
+    /// coordinator; no writer thread, detached task or retry is introduced.
+    /// Packed prefill is a separate schedule and cannot be combined here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_int4_chat_stream_with_threads<S>(&self, model: &ResidentInt4,
+        prepared: PreparedInt4Chat, request_seq: u64, limits: ChatStreamLimits,
+        kernel: PackedInt4Kernel, compute_threads: usize, sink: S,
+        cancellation: CancellationToken) -> Result<HostedInt4ChatStream<S>, HostedError>
+    where S: DecodeEventSink + Send + 'static {
+        self.run_int4_chat_stream(model, prepared, request_seq, limits, None,
+            Some(compute_threads), kernel, sink, cancellation)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn run_int4_chat_stream<S>(&self, model: &ResidentInt4, prepared: PreparedInt4Chat,
         request_seq: u64, limits: ChatStreamLimits, prefill: Option<Int4PrefillLimits>,
-        kernel: PackedInt4Kernel, sink: S, cancellation: CancellationToken)
+        compute_threads: Option<usize>, kernel: PackedInt4Kernel, sink: S,
+        cancellation: CancellationToken)
         -> Result<HostedInt4ChatStream<S>, HostedError>
     where S: DecodeEventSink + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
+        match compute_threads {
+            Some(width) => {
+                if prefill.is_some() { return Err(HostedError::Limits("INT4 stream team/prefill schedule")); }
+                dispatch::preflight_int4_team(self, limits.native.run, width)?;
+            }
+            None => dispatch::preflight(self, limits.native.run)?,
+        }
         if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
         let rebound = bind_candidate_model(prepared.execution_identity().clone(), model.model_identity())
             .map_err(|_| HostedError::ModelIdentity)?;
@@ -71,6 +102,12 @@ impl NlpEngine {
         let retained = retained_bytes(limits)?;
         let required = native_requirements(&prepared, request_seq, limits.native, limits.max_sampler_bytes)?;
         let scratch = workspace_bytes(required, limits, prefill)?;
+        // Validate the full simultaneous quote before any reservation. The
+        // dispatcher owns the additional worker charge until physical join.
+        let team_scratch = compute_threads.map(|width|
+            int4_task_team_workspace_bytes(width, model.model_identity().group_width()))
+            .transpose()?.unwrap_or(0);
+        sum(&[scratch, team_scratch])?;
         let work = prepared.planned_work();
         let task = *prepared.task_plan().ir().budget();
         let lease = self.resources().acquire_lease();
@@ -82,34 +119,56 @@ impl NlpEngine {
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
         let workspace = Pending::reserve(&lease, MemoryClass::ActivationScratch, scratch)?;
         let output = output_claim(&lease, task.max_output_bytes, u64::from(task.max_output_tokens))?;
+        let memory = Int4MemoryBudget { max_kv_bytes: required.kv_bytes, max_rope_bytes: required.rope_bytes,
+            max_scratch_payload_bytes: required.scratch_payload_bound };
+        let budget = Int4GenerationBudget { native: Int4RunBudget::exact(work),
+            max_kv_bytes: required.kv_bytes, max_sampler_bytes: limits.max_sampler_bytes };
         let model = model.clone();
-        dispatch::run(self, limits.native.run, cancellation, move |control| {
-            let mut input = input;
-            let prepared = input.value.prepared.take().ok_or(HostedError::CompletionMissing)?;
-            let mut engine = allocate_native(kv, workspace, || {
-                StrictInt4Engine::new(&model.inner.loaded.value, limits.native.context_tokens,
-                    Int4MemoryBudget { max_kv_bytes: required.kv_bytes, max_rope_bytes: required.rope_bytes,
-                        max_scratch_payload_bytes: required.scratch_payload_bound })
-                    .map(|engine| engine.with_kernel(kernel)).map_err(native_error)
-            })?;
-            let budget = Int4GenerationBudget { native: Int4RunBudget::exact(work),
-                max_kv_bytes: required.kv_bytes, max_sampler_bytes: limits.max_sampler_bytes };
-            let result = match prefill {
-                None => prepared.execute_with_sink(prepared.execution_identity(), &mut engine.value,
-                    request_seq, budget, &mut input.value.sink, control),
-                Some(prefill) => prepared.execute_layer_major_with_sink(prepared.execution_identity(), &mut engine.value,
-                    request_seq, budget, prefill, &mut input.value.sink, control),
-            }.map_err(chat_error)?;
-            // The task's independent UTF-8/control/work/output validation has
-            // succeeded. Dispatch still owns final cancellation and full join;
-            // only its successful return exposes this guarded completion.
-            drop(engine);
-            drop(prepared);
-            let committed = output.commit()?;
-            drop(lease);
-            Ok(HostedInt4ChatStream { output: GuardedOutput::new(result, committed), input })
-        })
+        match compute_threads {
+            None => dispatch::run(self, limits.native.run, cancellation, move |control| {
+                let engine = allocate_native(kv, workspace, || {
+                    StrictInt4Engine::new(&model.inner.loaded.value, limits.native.context_tokens, memory)
+                        .map(|engine| engine.with_kernel(kernel)).map_err(native_error)
+                })?;
+                finish_stream(input, engine, output, lease, request_seq, budget, prefill, control)
+            }),
+            Some(width) => dispatch::run_int4_team(self, limits.native.run, cancellation, model,
+                width, kernel, move |weights, control, team| {
+                    let engine = allocate_native(kv, workspace, || {
+                        StrictInt4Engine::new(weights, limits.native.context_tokens, memory)
+                            .map_err(native_error)?.with_kernel(kernel)
+                            .with_projection_executor(team).map_err(native_error)
+                    })?;
+                    let mut result = finish_stream(input, engine, output, lease, request_seq,
+                        budget, None, control)?;
+                    result.compute = Some(team.stats().into());
+                    Ok(result)
+                }),
+        }
     }
+}
+
+/// Both physical schedules retain the complete charged input aggregate and
+/// run the same token protocol, causal work checks and independent finalizer.
+#[allow(clippy::too_many_arguments)]
+fn finish_stream<S: DecodeEventSink>(mut input: Charged<StreamInput<S>>,
+    mut engine: ChargedNative<StrictInt4Engine<'_>>, output: Pending, lease: EngineLease,
+    request_seq: u64, budget: Int4GenerationBudget, prefill: Option<Int4PrefillLimits>,
+    control: &mut RunControl) -> Result<HostedInt4ChatStream<S>, HostedError> {
+    let prepared = input.value.prepared.take().ok_or(HostedError::CompletionMissing)?;
+    let result = match prefill {
+        None => prepared.execute_with_sink(prepared.execution_identity(), &mut engine.value,
+            request_seq, budget, &mut input.value.sink, control),
+        Some(prefill) => prepared.execute_layer_major_with_sink(prepared.execution_identity(), &mut engine.value,
+            request_seq, budget, prefill, &mut input.value.sink, control),
+    }.map_err(chat_error)?;
+    // Dispatch still owns final cancellation and full join. This completion
+    // cannot escape to the caller if either rejects after task finalization.
+    drop(engine);
+    drop(prepared);
+    let committed = output.commit()?;
+    drop(lease);
+    Ok(HostedInt4ChatStream { output: GuardedOutput::new(result, committed), input, compute: None })
 }
 
 fn retained_bytes(limits: ChatStreamLimits) -> Result<u64, HostedError> {
@@ -209,5 +268,10 @@ mod tests {
         }
         fn send<T: Send + 'static>() {}
         send::<StreamInput<Sink>>(); send::<HostedInt4ChatStream<Sink>>();
+        let _serial = NlpEngine::execute_int4_chat_stream::<Sink>;
+        let _prefill = NlpEngine::execute_int4_chat_stream_layer_major::<Sink>;
+        let _team = NlpEngine::execute_int4_chat_stream_with_threads::<Sink>;
     }
 }
+
+#[cfg(test)] mod runtime_tests;

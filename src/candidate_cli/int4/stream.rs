@@ -13,12 +13,12 @@ pub(super) struct StreamArgs {
 }
 
 pub(super) fn definition() -> clap::Command {
-    let task = |name: &'static str, about: &'static str| input_encoding::definition(
-        StreamArgs::augment_args(Int4Args::augment_args(clap::Command::new(name).about(about))))
+    let task = |name: &'static str, about: &'static str| compute::definition(input_encoding::definition(
+        StreamArgs::augment_args(Int4Args::augment_args(clap::Command::new(name).about(about)))))
         .mut_arg("prefill_rows", |arg| arg.help("Explicit grouped-INT4 layer-major prompt execution, 1..=64 rows; extra workspace is process-admitted"));
     clap::Command::new("stream")
         .about("Stream candidate INT4 generation/chat as bounded provisional token NDJSON")
-        .long_about("Use the same explicit pinned source or digest-pinned snapshot as buffered INT4 generation. Emits run_start, token and, only after physical native drain and independent final validation, run_complete. Token byte arrays may split UTF-8 characters. A token, EOS, partial line or EOF never certifies completion. Errors report a content-free run_error on stderr and exit nonzero; stdout is never retried. The final frame retains the complete unchanged native task result. --max-stream-bytes prices all frames and reserves terminal space. Seed, stop suffixes, penalties, minimum tokens, log probabilities and explicit prefill/kernel selection retain buffered semantics. --input-encoding safe-bpe-v1 explicitly selects bounded byte-preserving, control-excluding BPE for the complete transcript; its limits are admitted before input, bound to prompt identity and reported in run_start. Byte fallback remains the default. Blocking writers backpressure inference and cannot be safely preempted mid-write. No download, automatic model selection, thinking, tool execution or release qualification.")
+        .long_about("Use the same explicit pinned source or digest-pinned snapshot as buffered INT4 generation. Emits run_start, token and, only after physical native drain and independent final validation, run_complete. Token byte arrays may split UTF-8 characters. A token, EOS, partial line or EOF never certifies completion. Errors report a content-free run_error on stderr and exit nonzero; stdout is never retried. The final frame retains the complete unchanged native task result. --max-stream-bytes prices all frames and reserves terminal space. Seed, stop suffixes, penalties, minimum tokens, log probabilities and explicit prefill/kernel selection retain buffered semantics. --compute-threads N selects one persistent row team for the complete stream when N is 2..=64; 1 retains serial execution. Worker scratch is admitted before private IO, all children join before terminal success, and physical work is reported separately from the task result. Multiple compute threads cannot combine with --prefill-rows. --input-encoding safe-bpe-v1 explicitly selects bounded byte-preserving, control-excluding BPE for the complete transcript; its limits are admitted before input, bound to prompt identity and reported in run_start. Byte fallback remains the default. Blocking writers backpressure inference and cannot be safely preempted mid-write. No download, automatic model selection, thinking, tool execution or release qualification.")
         .subcommand_required(true)
         .subcommand(task("generate", "Generate from one UTF-8 prompt with provisional token events"))
         .subcommand(task("chat", "Complete one JSON message transcript with provisional token events"))
@@ -36,12 +36,13 @@ pub(super) fn from_matches(matches: &clap::ArgMatches)
     };
     let mut args = Int4Args::from_arg_matches(matches)?;
     args.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+    args.compute = compute::Args::from_matches(matches)?;
     Ok((task, StreamArgs::from_arg_matches(matches)?, args))
 }
 
 impl StreamArgs {
     pub(super) fn validate(self, args: &Int4Args) -> Result<(Int4Limits, StreamBounds), Failure> {
-        let mut limits = args.validate()?;
+        let mut limits = args.validate_text_compute()?;
         if self.max_stream_bytes == 0 || self.max_stream_bytes > 1024 * MIB {
             return Err(Failure::usage("stream_transport_options"));
         }
@@ -62,7 +63,7 @@ impl StreamArgs {
             .and_then(|n| n.checked_add(args.max_new_tokens as u64 * 64))
             .ok_or_else(|| Failure::usage("stream_memory_arithmetic"))?;
         // The existing minimum includes model weights, full native KV/scratch,
-        // extra packed prefill, sampler, output, CLI preparation and cleanup.
+        // extra packed prefill or worker scratch, sampler, output, CLI preparation and cleanup.
         // The streaming host additionally owns the moved prompt and sink.
         limits.minimum_memory_bytes = limits.minimum_memory_bytes
             .checked_add(limits.preparation_bytes).and_then(|n| n.checked_add(sink_memory_bytes))

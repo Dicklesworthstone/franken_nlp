@@ -44,12 +44,14 @@ impl Provenance {
     }
 }
 #[derive(Serialize)]
-struct Frame<'a, T: Serialize> {
+struct Frame<'a, T: Serialize, C: Serialize> {
     protocol: &'static str, schema_version: u32, event: &'static str,
     scope: &'static str, evidence: &'static str, request_seq: u64,
     task: &'static str, provisional: bool,
     #[serde(flatten)] provenance: &'a Provenance,
     data: &'a T,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compute: Option<&'a C>,
 }
 #[derive(Serialize)]
 struct Start<'a> {
@@ -168,9 +170,13 @@ impl<W: Write> TokenSink<W> {
     }
     fn frame<T: Serialize>(&self, event: &'static str, provisional: bool, data: &T,
         cap: usize) -> Result<Vec<u8>, Failure> {
+        self.frame_with_compute(event, provisional, data, None::<&()>, cap)
+    }
+    fn frame_with_compute<T: Serialize, C: Serialize>(&self, event: &'static str,
+        provisional: bool, data: &T, compute: Option<&C>, cap: usize) -> Result<Vec<u8>, Failure> {
         encode(&Frame { protocol: PROTOCOL, schema_version: 1, event,
             scope: self.provenance.scope(), evidence: "non_authoritative", request_seq: 1,
-            task: self.task, provisional, provenance: &self.provenance, data }, cap)
+            task: self.task, provisional, provenance: &self.provenance, data, compute }, cap)
     }
     fn start(&self) -> Result<Vec<u8>, Failure> {
         self.frame("run_start", true, &Start { token_event_schema_version: DECODE_TOKEN_EVENT_SCHEMA_VERSION,
@@ -212,9 +218,21 @@ impl<W: Write> TokenSink<W> {
     /// Only the runtime's guarded, post-drain completion calls this in product
     /// code. Unit fixtures exercise framing without manufacturing model proof.
     pub(in crate::candidate_cli) fn finish(&mut self, result: &Int8ChatResult) -> Result<(), Failure> {
-        self.finish_result(result, result.schema_version, &result.result, Backend::Int8, true)
+        self.finish_result(result, result.schema_version, &result.result, Backend::Int8, true, None::<&()>)
     }
     pub(in crate::candidate_cli) fn finish_int4(&mut self, result: &Int4ChatResult) -> Result<(), Failure> {
+        self.finish_int4_receipt(result, None::<&()>)
+    }
+    /// Only the guarded post-join host completion supplies this receipt. It is
+    /// transport metadata beside the unchanged semantic task data, and spends
+    /// the same reserved terminal-frame allowance before any terminal write.
+    #[cfg(feature = "asupersync-runtime")]
+    pub(in crate::candidate_cli) fn finish_int4_with_compute(&mut self, result: &Int4ChatResult,
+        compute: &crate::hosted::Int4ComputeReceipt) -> Result<(), Failure> {
+        self.finish_int4_receipt(result, Some(compute))
+    }
+    fn finish_int4_receipt<C: Serialize>(&mut self, result: &Int4ChatResult, compute: Option<&C>)
+        -> Result<(), Failure> {
         // Recompute every grouped native work axis for this actual model's
         // partition. A result from another group width or backend cannot seal
         // this stream merely because its visible text happens to agree.
@@ -225,10 +243,10 @@ impl<W: Write> TokenSink<W> {
             Provenance::Int8 { .. } => None,
         };
         self.finish_result(result, result.schema_version, &result.result, Backend::Int4,
-            expected.is_some_and(|work| work == result.model_work))
+            expected.is_some_and(|work| work == result.model_work), compute)
     }
-    fn finish_result<T: Serialize>(&mut self, result: &T, schema_version: u32,
-        chat: &ChatResult, backend: Backend, work_matches: bool) -> Result<(), Failure> {
+    fn finish_result<T: Serialize, C: Serialize>(&mut self, result: &T, schema_version: u32,
+        chat: &ChatResult, backend: Backend, work_matches: bool, compute: Option<&C>) -> Result<(), Failure> {
         let old = self.state; self.state = State::Failed;
         if !matches!(old, State::Fresh | State::Open) { return Err(Failure::output("stream_state")); }
         if self.provenance.backend() != backend || !work_matches {
@@ -236,7 +254,7 @@ impl<W: Write> TokenSink<W> {
         }
         self.reconcile(schema_version, chat)?;
         let start = if old == State::Fresh { self.start()? } else { Vec::new() };
-        let terminal = self.frame("run_complete", false, result, self.bounds.terminal_bytes)?;
+        let terminal = self.frame_with_compute("run_complete", false, result, compute, self.bounds.terminal_bytes)?;
         let total = self.total(start.len(), terminal.len(), true)?;
         self.write_frames(&start, &terminal)?;
         self.emitted = total; self.state = State::Finished; Ok(())

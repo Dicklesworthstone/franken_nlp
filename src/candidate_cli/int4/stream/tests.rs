@@ -47,6 +47,67 @@ fn text_operations_keep_the_full_buffered_generation_policy() {
 }
 
 #[test]
+fn stream_teams_preserve_text_policy_and_admit_worker_scratch_before_io() {
+    for operation in ["generate", "chat"] {
+        let (default, serial) = args(operation, &[]);
+        let (explicit, one) = args(operation, &["--compute-threads", "1"]);
+        let (serial_limits, serial_bounds) = default.validate(&serial).unwrap();
+        let (one_limits, one_bounds) = explicit.validate(&one).unwrap();
+        assert_eq!(one_limits.compute.threads, 1);
+        assert_eq!(one_limits.compute.workspace_bytes, 0);
+        assert_eq!(serial_limits.minimum_memory_bytes, one_limits.minimum_memory_bytes);
+        assert_eq!(serial_bounds.stream_bytes, one_bounds.stream_bytes);
+        for width in ["2", "4", "64"] {
+            let flags = ["--compute-threads", width, "--input-encoding", "safe-bpe-v1"];
+            let (options, a) = args(operation, &flags);
+            let (stream, bounds) = options.validate(&a).unwrap();
+            let buffered = super::super::tests::args(operation, &flags);
+            let common = buffered.validate_text_compute().unwrap();
+            assert_eq!(stream.compute.threads, width.parse::<usize>().unwrap());
+            assert_eq!(stream.compute, common.compute);
+            assert!(stream.compute.workspace_bytes > 0);
+            assert_eq!(stream.compute.workspace_bytes,
+                crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(
+                    stream.compute.threads, a.group_width).unwrap());
+            assert_eq!(stream.minimum_memory_bytes, common.minimum_memory_bytes
+                + common.preparation_bytes + bounds.sink_memory_bytes);
+            assert_eq!(stream.native, common.native);
+            assert_eq!(stream.max_prompt_tokens, common.max_prompt_tokens);
+            assert_eq!(stream.result_bytes, common.result_bytes);
+            assert_eq!(stream.preparation_bytes, common.preparation_bytes);
+            assert!(a.options(166101).unwrap() == buffered.options(166101).unwrap());
+            assert_eq!(a.input_encoding.policy(a.max_input_bytes, stream.max_prompt_tokens).unwrap(),
+                buffered.input_encoding.policy(buffered.max_input_bytes, common.max_prompt_tokens).unwrap());
+        }
+    }
+}
+
+#[test]
+fn invalid_stream_team_or_combined_schedule_refuses_before_private_io() {
+    for operation in ["generate", "chat"] {
+        for extra in [
+            &["--compute-threads", "0"][..],
+            &["--compute-threads", "65"][..],
+            &["--compute-threads", "2", "--prefill-rows", "1"][..],
+            &["--compute-threads", "4", "--prefill-rows", "64"][..],
+        ] {
+            let mut diagnostics = Vec::new();
+            let status = parse(operation, extra).unwrap().run_owned(NoIo, NoIo, &mut diagnostics);
+            assert_eq!(status, ErrorCode::Usage.as_process_exit());
+            let error: serde_json::Value = serde_json::from_slice(&diagnostics).unwrap();
+            assert_eq!(error["code"], "stream_options");
+            assert_eq!(error["status"], "incomplete");
+            assert!(!String::from_utf8(diagnostics).unwrap().contains("private"));
+        }
+        assert!(parse(operation, &["--compute-threads", "2", "--cohort-heads", "2"]).is_err());
+        let (options, a) = args(operation, &["--compute-threads", "1", "--prefill-rows", "4"]);
+        let (limits, _) = options.validate(&a).unwrap();
+        assert_eq!(limits.compute.threads, 1);
+        assert_eq!(limits.prefill.unwrap().max_batch_rows, 4);
+    }
+}
+
+#[test]
 fn safe_bpe_keeps_buffered_identity_limits_and_prices_the_complete_workspace() {
     use crate::tokenizer::untrusted::UntrustedEncoding;
     for operation in ["generate", "chat"] {
@@ -143,16 +204,16 @@ fn every_token_and_the_completed_result_have_nonrenewable_transport_space() {
 
 #[test]
 fn stream_memory_includes_native_and_packed_prefill_plus_both_retained_owners() {
-    for flags in [&[][..], &["--prefill-rows", "4"][..]] {
+    for flags in [&[][..], &["--prefill-rows", "4"][..], &["--compute-threads", "4"][..]] {
         let (options, a) = args("generate", flags);
-        let common = a.validate().unwrap();
+        let common = a.validate_text_compute().unwrap();
         let (stream, bounds) = options.validate(&a).unwrap();
         assert_eq!(stream.minimum_memory_bytes, common.minimum_memory_bytes
             + common.preparation_bytes + bounds.sink_memory_bytes);
         assert_eq!(stream.native, common.native);
         let mut tight = a;
         tight.memory_mib = common.minimum_memory_bytes.div_ceil(MIB);
-        tight.validate().unwrap();
+        tight.validate_text_compute().unwrap();
         let error = options.validate(&tight).err().unwrap();
         assert_eq!(error.exit, ErrorCode::AdmissionOrResourceLimit);
         assert_eq!(error.code, "stream_memory_floor");
@@ -180,7 +241,9 @@ fn borrowed_dispatch_and_invalid_transport_never_read_or_publish() {
 #[test]
 fn unavailable_runtime_refuses_without_private_input_model_or_output_access() {
     for (operation, task) in [("generate", Task::Generate), ("chat", Task::Chat)] {
-        let (options, a) = args(operation, &[]);
-        assert_eq!(options.execute(task, a, &mut NoIo, NoIo).unwrap_err().code, "stream_profile_unavailable");
+        for flags in [&[][..], &["--compute-threads", "4"][..]] {
+            let (options, a) = args(operation, flags);
+            assert_eq!(options.execute(task, a, &mut NoIo, NoIo).unwrap_err().code, "stream_profile_unavailable");
+        }
     }
 }

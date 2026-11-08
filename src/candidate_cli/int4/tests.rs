@@ -63,7 +63,7 @@ fn fixed_compute_teams_are_opt_in_and_fully_priced_before_input() {
         assert_eq!(serial_limits.load, parallel_limits.load);
         assert_eq!(parallel_limits.minimum_memory_bytes, serial_limits.minimum_memory_bytes + extra);
         assert!(serial.options(166_101).unwrap() == parallel.options(166_101).unwrap());
-        // Shared batch/stream validation must not accept a width it cannot use.
+        // Shared batch validation must not accept a width it cannot use.
         assert!(parallel.validate().is_err());
         parallel.memory_mib = (parallel_limits.minimum_memory_bytes - 1) / MIB;
         assert!(parallel.validate_text_compute().is_err());
@@ -87,7 +87,7 @@ fn unsupported_compute_widths_and_prompt_schedules_refuse_before_io() {
         args(operation, &["--compute-threads", "1", "--prefill-rows", "4"]).validate().unwrap();
     }
     // The option is absent from workflows without a persistent numerical team.
-    for route in [vec!["stream", "generate"], vec!["text-batch"], vec!["text-corpus"],
+    for route in [vec!["text-batch"], vec!["text-corpus"],
         vec!["classify-map"], vec!["extract-batch"], vec!["ner-map"], vec!["sentiment-corpus"]] {
         let mut argv = vec!["candidate", "source-int4"];
         argv.extend(route);
