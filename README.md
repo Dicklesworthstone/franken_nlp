@@ -300,9 +300,10 @@ fnlp doctor                          # idempotent self-check/repair
 #   fnlp audit plan/grade · fnlp job partition/merge · fnlp resident start
 ```
 
-## Explicit bounded BPE input for candidate INT4 generation
+## Explicit bounded BPE input for candidate INT4 tasks
 
-One-request `fnlp candidate source-int4 generate` and `chat` accept
+One-request `fnlp candidate source-int4 generate`, `chat`, `ner`, `keyphrases`,
+`summarize` and `answer` accept
 `--input-encoding safe-bpe-v1`. The existing default is `byte-fallback`, which
 uses one token per input byte. The explicit BPE policy can use ordinary
 vocabulary pieces while preserving every original message byte and excluding
@@ -333,7 +334,7 @@ token matching or dummy prefix. Literal `▁`, whitespace, Unicode and
 marker-looking text retain their exact bytes. Both standalone and embedded
 decoding are checked before a message becomes an admitted prompt segment.
 
-The merge search has explicit work bounds: the default complete-transcript
+The merge search has explicit work bounds: the default complete-request
 limits are 4,194,304 pair checks and 67,108,864 examined pair bytes. Their hard
 ceilings are 67,108,864 checks and 536,870,912 bytes. A limit refusal produces
 no task result and never silently switches encoding. The existing input and
@@ -345,13 +346,36 @@ need a larger explicit work cap even when their final tokens fit the context.
 The selected policy and all its limits enter the template execution identity
 and appear in `input_encoding` on the completed candidate response. Library
 callers can select the same contract with `with_document_encoding` on
-`ChatPlanner`, `Int8ChatPlanner` or `Int4ChatPlanner`, and use the
+`ChatPlanner`, `Int8ChatPlanner`, `Int4ChatPlanner` or `SourceTaskPlanner`, and use the
 `plan_chat_with_control` / `plan_generate_with_control` methods for cooperative
-planning cancellation. The host must admit `SafeBpeLimits::requirements()`.
+planning cancellation. Source planners provide corresponding controlled
+one-request planning methods for BF16, INT8 and INT4. The host must admit
+`SafeBpeLimits::requirements()`.
+
+The four source tasks keep their original text for source spans and citation
+verification. An answer request's question, passage manifest and joined
+evidence share one cumulative tokenizer-work allowance; only original passage
+text authorizes evidence. Compact input composes independently with selected
+output rows and layer-major prompt prefill:
+
+```bash
+fnlp candidate source-int4 ner document.txt \
+  --snapshot nanbeige.int4.snapshot \
+  --expected-model-sha256 "$MODEL_SHA256" \
+  --memory-mib 8192 --input-encoding safe-bpe-v1 \
+  --max-selected-rows 4096 --prefill-rows 4
+```
+
+The complete trusted scaffold, actual input tokens and reserved output must
+still fit the context. Source input ceilings near one MiB require an explicit
+larger preparation grant, such as `--preparation-mib 768`, for the additional
+encoder workspace. The shared encoders refuse compact input through their
+uncontrolled legacy entry points, so chunk probing cannot silently restart a
+tokenizer budget for every candidate boundary.
 
 This is a distinct candidate tokenization contract, with its own regression
 fixtures; it does not assert ordinary slow-tokenizer token-ID parity or task
-quality gains. Other CLI tasks, streaming, corpora and retained jobs keep their
+quality gains. Other CLI tasks, maps, corpora and retained jobs keep their
 existing byte-fallback contract. These encoding and planner tests still require
 the repository's authorized DSR checkpoint and model-present qualification.
 
@@ -362,6 +386,10 @@ events for explicit INT4 source conversion or a digest-pinned local snapshot.
 It uses the same model, pinned text planner, generation policy and final task
 validator as buffered INT4 generation. The candidate build requires
 `asupersync-runtime`.
+
+Live `stream generate|chat` also accepts `--input-encoding safe-bpe-v1` and
+the same whole-transcript tokenizer-work ceilings. The explicit policy is
+reported in `run_start`; the final task result keeps the buffered format.
 
 ```bash
 fnlp candidate source-int4 stream generate prompt.txt \

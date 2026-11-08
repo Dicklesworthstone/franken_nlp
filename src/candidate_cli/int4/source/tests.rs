@@ -1,6 +1,7 @@
 use super::*;
 use crate::tasks::source_planning::SourceTaskRequest;
 mod selected;
+mod encoding;
 
 fn matches(name: &str, extra: &[&str]) -> clap::ArgMatches {
     let mut argv = vec!["candidate", "source-int4", name, "--source-dir", "explicit-source",

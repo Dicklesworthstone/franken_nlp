@@ -6,7 +6,9 @@
 use super::*;
 use crate::{
     grammar::source_index::SOURCE_LANGUAGE_VERSION,
-    tokenizer::untrusted::{UntrustedDocument, UntrustedDocumentEncoder},
+    native_engine::decode::DecodeCancellationKind,
+    tokenizer::untrusted::{SafeBpeWork, UntrustedDocument, UntrustedDocumentEncoder,
+        UntrustedDocumentError, UntrustedEncoding},
 };
 
 /// Retain this model-free encoder across corpus items. It emits no privileged
@@ -15,6 +17,7 @@ pub struct SourceDocumentEncoder {
     tokenizer: EmbeddedTokenizer,
     controls: TemplateControlIds,
     control_digest: Sha256Digest,
+    encoding: UntrustedEncoding,
 }
 impl SourceDocumentEncoder {
     pub fn pinned(controls: &TemplateControlIds) -> Result<Self, ExtractError> {
@@ -24,12 +27,36 @@ impl SourceDocumentEncoder {
         Ok(Self {
             tokenizer: EmbeddedTokenizer::pinned().map_err(|_| ExtractError::Tokenizer)?,
             controls: controls.clone(), control_digest: control_digest(controls)?,
+            encoding: UntrustedEncoding::ByteFallback,
         })
     }
-    /// The currently audited untrusted encoder uses one byte-fallback token
-    /// per byte. Check both ceilings before token or source copies allocate.
+    /// Explicit one-request policy. Hosts admit the policy's tokenizer workspace
+    /// before input/model IO; selecting it does not admit composed chunk probes.
+    pub fn with_document_encoding(mut self, encoding: UntrustedEncoding) -> Result<Self, ExtractError> {
+        encoding.validate().map_err(|_| ExtractError::Contract("invalid source document encoding policy"))?;
+        self.encoding = encoding;
+        Ok(self)
+    }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { &self.encoding }
+    pub(crate) fn require_byte_encoding(&self) -> Result<(), ExtractError> {
+        if self.encoding != UntrustedEncoding::ByteFallback {
+            return Err(ExtractError::Contract("source document encoding requires controlled one-request admission"));
+        }
+        Ok(())
+    }
+
+    /// Legacy byte-fallback entry point. Composed callers must not implicitly
+    /// renew compact-encoding work for every chunk or tokenizer probe.
     pub fn encode(&self, text: &str, max_bytes: usize, max_tokens: usize) -> Result<SourceDocument, ExtractError> {
         self.encode_with_context(text, &[], max_bytes, max_tokens)
+    }
+
+    /// Encode one complete admitted source, polling the caller's original
+    /// cancellation control. No replacement timeout or cancellation kind is made.
+    pub fn encode_with_control<F: FnMut() -> Option<DecodeCancellationKind>>(&self,
+        text: &str, max_bytes: usize, max_tokens: usize, checkpoint: &mut F)
+        -> Result<SourceDocument, ExtractError> {
+        self.encode_with_context_and_control(text, &[], max_bytes, max_tokens, checkpoint)
     }
 
     /// Encode a designated evidence source and at most 16 auxiliary contexts
@@ -40,15 +67,42 @@ impl SourceDocumentEncoder {
     /// The byte and token ceilings apply to the SUM, not freshly to each part.
     pub fn encode_with_context(&self, text: &str, contexts: &[&str], max_bytes: usize,
         max_tokens: usize) -> Result<SourceDocument, ExtractError> {
+        self.require_byte_encoding()?;
+        self.encode_with_context_and_control(text, contexts, max_bytes, max_tokens, &mut || None)
+    }
+
+    /// One nonrenewable safe-BPE ledger covers all contexts and then the source.
+    /// Only the designated source bytes authorize citations. Byte and actual
+    /// token ceilings are separate for compact encoding; neither is estimated.
+    pub fn encode_with_context_and_control<F: FnMut() -> Option<DecodeCancellationKind>>(&self,
+        text: &str, contexts: &[&str], max_bytes: usize, max_tokens: usize, checkpoint: &mut F)
+        -> Result<SourceDocument, ExtractError> {
+        encoding_checkpoint(checkpoint)?;
         if contexts.len() > 16 { return Err(ExtractError::Contract("too many source context segments")); }
         let total = contexts.iter().try_fold(text.len(), |sum, part| sum.checked_add(part.len()))
             .ok_or(ExtractError::AllocationRefused)?;
-        if total > max_bytes || total > max_tokens {
+        let byte_limit = match &self.encoding {
+            UntrustedEncoding::ByteFallback => max_bytes.min(max_tokens),
+            UntrustedEncoding::SafeBpeV1(limits) => max_bytes.min(limits.max_input_bytes),
+        };
+        if total > byte_limit {
             return Err(ExtractError::Contract("source and context exceed aggregate byte or token budget"));
         }
         let encoder = UntrustedDocumentEncoder::new(self.tokenizer.tokenizer(), &self.controls);
-        let encode = |part: &str| encoder.encode(part.as_bytes())
-            .map_err(|_| ExtractError::Contract("source byte-preserving encoding refused"));
+        let mut work = SafeBpeWork::default();
+        let mut encode = |part: &str| {
+            let mut cancelled = None;
+            let result = encoder.encode_with_policy(part.as_bytes(), &self.encoding, &mut work, &mut || {
+                cancelled = checkpoint();
+                cancelled.is_none()
+            });
+            if let Some(cause) = cancelled { return Err(ExtractError::Decode(JsonDecodeError::Cancelled(cause))); }
+            result.map_err(|error| match error {
+                UntrustedDocumentError::AllocationRefused => ExtractError::AllocationRefused,
+                UntrustedDocumentError::EncodingBudget { .. } => ExtractError::Contract("source encoding work budget exceeded"),
+                _ => ExtractError::Contract("source byte-preserving encoding refused"),
+            })
+        };
         let mut context_documents = Vec::new();
         context_documents.try_reserve_exact(contexts.len()).map_err(|_| ExtractError::AllocationRefused)?;
         let mut token_count = 0_usize;
@@ -61,9 +115,17 @@ impl SourceDocumentEncoder {
         let document = encode(text)?;
         token_count = token_count.checked_add(document.ids().len()).ok_or(ExtractError::AllocationRefused)?;
         if token_count > max_tokens { return Err(ExtractError::Contract("source token budget exceeded")); }
-        Ok(SourceDocument { document, context_documents, token_count, control_digest: self.control_digest })
+        encoding_checkpoint(checkpoint)?;
+        Ok(SourceDocument { document, context_documents, token_count, input_bytes: total,
+            control_digest: self.control_digest, encoding: self.encoding.clone() })
     }
 }
+
+fn encoding_checkpoint<F: FnMut() -> Option<DecodeCancellationKind>>(checkpoint: &mut F) -> Result<(), ExtractError> {
+    match checkpoint() { Some(cause) => Err(ExtractError::Decode(JsonDecodeError::Cancelled(cause))), None => Ok(()) }
+}
+
+#[cfg(test)] mod encoding_tests;
 
 /// Original evidence text, optional auxiliary contexts, and their exact pinned
 /// untrusted token sequences. No Debug/Serialize: this is private request data.
@@ -71,7 +133,9 @@ pub struct SourceDocument {
     document: UntrustedDocument,
     context_documents: Vec<UntrustedDocument>,
     token_count: usize,
+    input_bytes: usize,
     control_digest: Sha256Digest,
+    encoding: UntrustedEncoding,
 }
 impl SourceDocument {
     /// Evidence text only; questions and metadata are deliberately excluded.
@@ -83,6 +147,9 @@ impl SourceDocument {
         self.context_documents.iter().map(|document| document.ids())
     }
     pub fn total_token_count(&self) -> usize { self.token_count }
+    /// Exact aggregate source and auxiliary-context bytes, before tokenization.
+    pub fn total_input_bytes(&self) -> usize { self.input_bytes }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { &self.encoding }
     pub(super) fn verify_task(&self, ir: &TaskIR, controls: &TemplateControlIds) -> Result<(), ExtractError> {
         let mut docs = ir.prompt_segments().iter().filter(|s| s.kind() == PromptSegmentKind::Document);
         for expected in self.context_token_ids().chain(std::iter::once(self.token_ids())) {

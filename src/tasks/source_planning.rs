@@ -10,11 +10,12 @@ use crate::{
     canonjson,
     execution_identity::{ExecutionIdentity, NumericsProfile, Sha256Digest, ThinkingMode, ToolMode},
     grammar::{CompileLimits, runtime::{SourceRuntimeLimits, SOURCE_JSON_RUNTIME_VERSION}},
-    native_engine::{constrained::{JsonDecodeOptions, JsonWorkBudget}, decode::DecodeStepControl,
+    native_engine::{constrained::{JsonDecodeError, JsonDecodeOptions, JsonWorkBudget},
+        decode::{DecodeCancellationKind, DecodeStepControl},
         hf_bf16_eager::HfBf16EagerEngine, lmhead::NANBEIGE_VOCAB_SIZE},
     template::{Conversation, Message, MessageRole, RenderOptions, TemplateBuilder, ToolFormat,
         IM_START, IM_END, THINK_START, THINK_END},
-    tokenizer::{bpe::EncodeOptions, specials::TemplateControlIds,
+    tokenizer::{bpe::EncodeOptions, specials::TemplateControlIds, untrusted::UntrustedEncoding,
         embedded::{EmbeddedTokenizer, PINNED_TOKENIZER_MODEL_BYTES, PINNED_ADDED_TOKENS_BYTES,
             PINNED_TOKENIZER_CONFIG_BYTES, PINNED_SPECIAL_TOKENS_MAP_BYTES}},
 };
@@ -119,6 +120,18 @@ impl Error for SourcePlanningError {
             Self::Summary(e) => Some(e), Self::Answer(e) => Some(e), _ => None }
     }
 }
+impl SourcePlanningError {
+    pub fn cancellation(&self) -> Option<DecodeCancellationKind> {
+        let error = match self {
+            Self::Extraction(error) | Self::Ner(NerError::Extraction(error))
+                | Self::Keyphrases(KeyphraseError::Extraction(error))
+                | Self::Summary(SummaryError::Extraction(error))
+                | Self::Answer(AnswerError::Extraction(error)) => error,
+            _ => return None,
+        };
+        match error { ExtractError::Decode(JsonDecodeError::Cancelled(cause)) => Some(*cause), _ => None }
+    }
+}
 impl From<ExtractError> for SourcePlanningError { fn from(e: ExtractError) -> Self { Self::Extraction(e) } }
 impl From<NerError> for SourcePlanningError { fn from(e: NerError) -> Self { Self::Ner(e) } }
 impl From<KeyphraseError> for SourcePlanningError { fn from(e: KeyphraseError) -> Self { Self::Keyphrases(e) } }
@@ -181,6 +194,7 @@ pub struct SourceTaskPlanner {
     controls: TemplateControlIds,
     eos: u32,
     template_digest: Sha256Digest,
+    byte_template_digest: Sha256Digest,
 }
 impl SourceTaskPlanner {
     pub fn pinned(controls: &TemplateControlIds, eos: u32) -> Result<Self, SourcePlanningError> {
@@ -208,51 +222,82 @@ impl SourceTaskPlanner {
             &(SOURCE_PROMPT_VERSION, templates, census, eos, assets)
         ).map_err(|_| SourcePlanningError::Serialization)?);
         let encoder = SourceDocumentEncoder::pinned(controls)?;
-        Ok(Self { tokenizer, encoder, controls: controls.clone(), eos, template_digest })
+        Ok(Self { tokenizer, encoder, controls: controls.clone(), eos, template_digest,
+            byte_template_digest: template_digest })
     }
+    /// Select one complete source request's untrusted encoding before deriving
+    /// its execution identity. The byte-default digest remains unchanged; the
+    /// compact policy and every work ceiling bind even identical token streams.
+    /// Hosts reserve `SafeBpeLimits::requirements()` before input/model IO.
+    /// Composed map/corpus entry points remain byte-only until their aggregate
+    /// tokenizer-probe work has a separately admitted contract.
+    pub fn with_document_encoding(mut self, policy: UntrustedEncoding) -> Result<Self, SourcePlanningError> {
+        policy.validate().map_err(|_| SourcePlanningError::Contract("invalid source document encoding policy"))?;
+        self.template_digest = match &policy {
+            UntrustedEncoding::ByteFallback => self.byte_template_digest,
+            UntrustedEncoding::SafeBpeV1(_) => Sha256Digest::of_bytes(&canonjson::canonical_bytes(
+                &("source-untrusted-encoding-v1", self.byte_template_digest, &policy)
+            ).map_err(|_| SourcePlanningError::Serialization)?),
+        };
+        self.encoder = self.encoder.with_document_encoding(policy)?;
+        Ok(self)
+    }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { self.encoder.document_encoding() }
     pub fn template_digest(&self) -> &Sha256Digest { &self.template_digest }
     pub fn tokenizer_digest(&self) -> Sha256Digest { Sha256Digest::of_bytes(PINNED_TOKENIZER_MODEL_BYTES) }
     pub fn source_encoder(&self) -> &SourceDocumentEncoder { &self.encoder }
 
     pub fn plan(&self, request: &SourceTaskRequest, context: &PlanContext<'_>, limits: SourcePlanningLimits)
         -> Result<PreparedSourceTask, SourcePlanningError> {
+        self.plan_with_control(request, context, limits, &mut PlanningContinue)
+    }
+    pub fn plan_with_control<C: DecodeStepControl>(&self, request: &SourceTaskRequest,
+        context: &PlanContext<'_>, limits: SourcePlanningLimits, control: &mut C)
+        -> Result<PreparedSourceTask, SourcePlanningError> {
+        planning_checkpoint(control)?;
         let kind = request.task(); let budget = request.budget();
-        self.check_context(kind, context, budget, limits)?;
+        self.check_one_off_context_for_profile(kind, context, budget, limits, NumericsProfile::HfBf16Eager)?;
         let decode = JsonDecodeOptions { max_new_tokens: budget.max_output_tokens as usize,
             eos_token_id: self.eos, excluded_token_ids: Default::default() };
-        let encode = |text: &str| self.encoder.encode(text, limits.max_input_bytes, budget.max_input_tokens as usize);
+        let encode = |text: &str, control: &mut C| self.encoder.encode_with_control(text,
+            limits.max_input_bytes, budget.max_input_tokens as usize, &mut || control.prefill_checkpoint(0));
         let (executable, task) = match request {
             SourceTaskRequest::Ner { document, options, .. } => {
-                let schema = options.schema_source()?; let document = encode(document)?;
+                let schema = options.schema_source()?; let document = encode(document, control)?;
                 let task = self.task(kind, &document, &schema, context, budget, limits)?;
+                planning_checkpoint(control)?;
                 let plan = NerPlan::from_task_plan(&task, &document, options.clone(), decode, limits.compiler, &self.controls, limits.source)?;
                 (Executable::Ner(plan), task)
             }
             SourceTaskRequest::Keyphrases { document, options, .. } => {
-                let schema = options.schema_source()?; let document = encode(document)?;
+                let schema = options.schema_source()?; let document = encode(document, control)?;
                 let task = self.task(kind, &document, &schema, context, budget, limits)?;
+                planning_checkpoint(control)?;
                 let plan = KeyphrasePlan::from_task_plan(&task, &document, *options, decode, limits.compiler, &self.controls, limits.source)?;
                 (Executable::Keyphrases(plan), task)
             }
             SourceTaskRequest::Summarize { document, options, .. } => {
-                let schema = options.schema_source()?; let document = encode(document)?;
+                let schema = options.schema_source()?; let document = encode(document, control)?;
                 let task = self.task(kind, &document, &schema, context, budget, limits)?;
+                planning_checkpoint(control)?;
                 let plan = SummaryPlan::from_task_plan(&task, &document, *options, decode, limits.compiler, &self.controls, limits.source)?;
                 (Executable::Summarize(plan), task)
             }
             SourceTaskRequest::Answer { question, passages, options, .. } => {
                 let schema = options.schema_source()?;
-                let answer = AnswerContext::encode(&self.encoder, question, passages, AnswerInputLimits {
+                let answer = AnswerContext::encode_with_control(&self.encoder, question, passages, AnswerInputLimits {
                     max_passages: limits.max_passages, max_input_bytes: limits.max_input_bytes,
                     max_input_tokens: budget.max_input_tokens as usize,
-                })?;
+                }, &mut || control.prefill_checkpoint(0))?;
                 let task = self.task(kind, answer.document(), &schema, context, budget, limits)?;
+                planning_checkpoint(control)?;
                 let plan = AnswerPlan::from_task_plan(&task, &answer, *options, decode, limits.compiler, &self.controls, limits.source)?;
                 (Executable::Answer(plan), task)
             }
         };
         let prompt_tokens = task.ir().prompt_segments().iter().map(|s| s.token_ids().len()).sum();
         let identity = executable.bind(context.execution_identity().clone())?;
+        planning_checkpoint(control)?;
         Ok(PreparedSourceTask { executable, identity, prompt_tokens, max_output_bytes: budget.max_output_bytes })
     }
 
@@ -269,6 +314,11 @@ impl SourceTaskPlanner {
         self.check_context_for_profile(kind, context, budget, limits, NumericsProfile::HfBf16Eager)
     }
     fn check_context_for_profile(&self, kind: BuiltInTask, context: &PlanContext<'_>, budget: TaskBudget,
+        limits: SourcePlanningLimits, profile: NumericsProfile) -> Result<(), SourcePlanningError> {
+        self.encoder.require_byte_encoding()?;
+        self.check_one_off_context_for_profile(kind, context, budget, limits, profile)
+    }
+    fn check_one_off_context_for_profile(&self, kind: BuiltInTask, context: &PlanContext<'_>, budget: TaskBudget,
         limits: SourcePlanningLimits, profile: NumericsProfile) -> Result<(), SourcePlanningError> {
         limits.validate()?;
         budget.validate().map_err(|_| SourcePlanningError::Contract("invalid source task budget"))?;
@@ -289,9 +339,12 @@ impl SourceTaskPlanner {
         if document.context_token_ids().len() != expected_contexts {
             return Err(SourcePlanningError::Contract("source task auxiliary document layout"));
         }
-        if document.total_token_count() > limits.max_input_bytes {
-            // The pinned untrusted encoding is byte-for-byte; do not bypass
-            // byte admission through the pre-encoded corpus factory entrypoint.
+        if document.document_encoding() != self.document_encoding() {
+            return Err(SourcePlanningError::Contract("source document encoding differs from planner identity"));
+        }
+        if document.total_input_bytes() > limits.max_input_bytes {
+            // Preserve byte admission even when the admitted encoding compacts
+            // several original source bytes into one document token.
             return Err(SourcePlanningError::InputBudget);
         }
         let fragments = render_fragments(kind, schema)?.iter().map(|text|
@@ -319,6 +372,17 @@ impl SourceTaskPlanner {
                 FinitePostcondition::SourceSpansVerified, FinitePostcondition::OutputWithinBudget], budget, DependencyScope::ItemLocal)
             .map_err(|_| SourcePlanningError::Contract("source TaskIR compilation"))?;
         TaskPlan::new(kind.spec(), context, ir).map_err(|_| SourcePlanningError::Contract("source TaskPlan binding"))
+    }
+}
+
+struct PlanningContinue;
+impl DecodeStepControl for PlanningContinue {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }
+}
+fn planning_checkpoint<C: DecodeStepControl>(control: &mut C) -> Result<(), SourcePlanningError> {
+    match control.prefill_checkpoint(0) {
+        Some(cause) => Err(ExtractError::Decode(JsonDecodeError::Cancelled(cause)).into()),
+        None => Ok(()),
     }
 }
 
@@ -352,3 +416,5 @@ fn render_fragments(kind: BuiltInTask, schema: &str) -> Result<Vec<String>, Sour
     }
     Ok(fragments)
 }
+
+#[cfg(test)] mod encoding_tests;

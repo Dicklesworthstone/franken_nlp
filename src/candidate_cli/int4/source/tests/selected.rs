@@ -74,13 +74,14 @@ fn selected_source_and_snapshot_routes_keep_identical_task_options() {
     }
 }
 
-fn plan(kind: Kind, options: &SourceArgs, args: &Int4Args) -> PreparedInt4SourceTask {
+pub(super) fn plan(kind: Kind, options: &SourceArgs, args: &Int4Args) -> PreparedInt4SourceTask {
     struct Continue;
     impl DecodeStepControl for Continue { fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None } }
     let limits = options.validate_with_prefill(args).unwrap(); let budget = options.budget(args, limits);
     let controls = pinned_controls::pinned().unwrap();
     let eos = EmbeddedTokenizer::pinned().unwrap().eos_token_id().unwrap();
-    let planner = SourceTaskPlanner::pinned(controls.template_controls(), eos).unwrap();
+    let planner = SourceTaskPlanner::pinned(controls.template_controls(), eos).unwrap()
+        .with_document_encoding(args.input_encoding.policy(args.max_input_bytes, limits.max_prompt_tokens).unwrap()).unwrap();
     let width = args.group_width; let digest = Sha256Digest::of_bytes(b"metadata-only-selected-source-cli-fixture");
     let identity = ExecutionIdentity {
         schema_version: 1, source_revision: PINNED_REVISION.to_owned(), logical_model_digest: digest,

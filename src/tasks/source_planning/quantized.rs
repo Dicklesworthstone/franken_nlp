@@ -66,7 +66,8 @@ impl From<SummaryError> for Int8SourceError { fn from(e: SummaryError) -> Self {
 impl From<AnswerError> for Int8SourceError { fn from(e: AnswerError) -> Self { Self::Planning(e.into()) } }
 impl Int8SourceError {
     pub fn cancellation(&self) -> Option<DecodeCancellationKind> {
-        match self { Self::Cancelled(c) => Some(*c), Self::Extraction(e) => e.cancellation(), _ => None }
+        match self { Self::Cancelled(c) => Some(*c), Self::Extraction(e) => e.cancellation(),
+            Self::Planning(e) => e.cancellation(), Self::InvalidResult => None }
     }
 }
 
@@ -111,22 +112,23 @@ pub struct PreparedInt8SourceTask {
 }
 impl SourceTaskPlanner {
     /// The supplied context must ALREADY name the strict INT8 profile/backend.
-    /// Existing bounded tokenization/grammar operations are checkpointed around
-    /// their calls; this does not promise mid-operation or OS-thread preemption.
+    /// Safe-BPE polls during bounded encoding work. Other bounded compiler
+    /// operations remain cooperative around calls; no OS preemption is claimed.
     pub fn plan_int8_with_control<C: DecodeStepControl>(&self, request: &SourceTaskRequest,
         context: &PlanContext<'_>, limits: SourcePlanningLimits, control: &mut C)
         -> Result<PreparedInt8SourceTask, Int8SourceError> {
         checkpoint(control)?;
         constrained_int8::check_profile(context.execution_identity())?;
         let kind = request.task(); let budget = request.budget();
-        self.check_context_for_profile(kind, context, budget, limits, NumericsProfile::StrictQuantized { version: 1 })?;
+        self.check_one_off_context_for_profile(kind, context, budget, limits, NumericsProfile::StrictQuantized { version: 1 })?;
         let task_spec = match kind {
             BuiltInTask::Ner => NER_TASK_VERSION, BuiltInTask::Keyphrases => KEYPHRASES_TASK_VERSION,
             BuiltInTask::Summarize => SUMMARIZE_TASK_VERSION, BuiltInTask::Answer => ANSWER_TASK_VERSION,
             _ => return Err(SourcePlanningError::Contract("unsupported int8 source task").into()),
         };
-        let encode = |text: &str| self.encoder.encode(text, limits.max_input_bytes, budget.max_input_tokens as usize);
-        let mut compile = |document: &SourceDocument, schema: &str| -> Result<Int8ExtractPlan, Int8SourceError> {
+        let encode = |text: &str, control: &mut C| self.encoder.encode_with_control(text,
+            limits.max_input_bytes, budget.max_input_tokens as usize, &mut || control.prefill_checkpoint(0));
+        let compile = |document: &SourceDocument, schema: &str, control: &mut C| -> Result<Int8ExtractPlan, Int8SourceError> {
             checkpoint(control)?;
             let task = self.task(kind, document, schema, context, budget, limits)?;
             let decode = JsonDecodeOptions { max_new_tokens: budget.max_output_tokens as usize,
@@ -139,24 +141,24 @@ impl SourceTaskPlanner {
         };
         let (extraction, finalizer) = match request {
             SourceTaskRequest::Ner { document, options, .. } => {
-                let schema = options.schema_source()?; let source = encode(document)?;
-                (compile(&source, &schema)?, Finalizer::Ner(options.clone()))
+                let schema = options.schema_source()?; let source = encode(document, control)?;
+                (compile(&source, &schema, control)?, Finalizer::Ner(options.clone()))
             }
             SourceTaskRequest::Keyphrases { document, options, .. } => {
-                let schema = options.schema_source()?; let source = encode(document)?;
-                (compile(&source, &schema)?, Finalizer::Keyphrases(*options))
+                let schema = options.schema_source()?; let source = encode(document, control)?;
+                (compile(&source, &schema, control)?, Finalizer::Keyphrases(*options))
             }
             SourceTaskRequest::Summarize { document, options, .. } => {
-                let schema = options.schema_source()?; let source = encode(document)?;
-                (compile(&source, &schema)?, Finalizer::Summarize(*options))
+                let schema = options.schema_source()?; let source = encode(document, control)?;
+                (compile(&source, &schema, control)?, Finalizer::Summarize(*options))
             }
             SourceTaskRequest::Answer { question, passages, options, .. } => {
                 let schema = options.schema_source()?;
-                let answer = AnswerContext::encode(&self.encoder, question, passages, AnswerInputLimits {
+                let answer = AnswerContext::encode_with_control(&self.encoder, question, passages, AnswerInputLimits {
                     max_passages: limits.max_passages, max_input_bytes: limits.max_input_bytes,
                     max_input_tokens: budget.max_input_tokens as usize,
-                })?;
-                let extraction = compile(answer.document(), &schema)?;
+                }, &mut || control.prefill_checkpoint(0))?;
+                let extraction = compile(answer.document(), &schema, control)?;
                 (extraction, Finalizer::Answer(answer.into_int8_finalizer(), *options))
             }
         };

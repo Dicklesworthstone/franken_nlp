@@ -11,9 +11,9 @@ use crate::{
     canonjson,
     execution_identity::ExecutionIdentity,
     grammar::{CompileLimits, runtime::SourceRuntimeLimits},
-    native_engine::{constrained::{JsonDecodeOptions, JsonWorkBudget},
-        decode::DecodeStepControl, hf_bf16_eager::{HfBf16EagerEngine, HF_BF16_EAGER_PROFILE}},
-    tokenizer::specials::TemplateControlIds,
+    native_engine::{constrained::{JsonDecodeError, JsonDecodeOptions, JsonWorkBudget},
+        decode::{DecodeCancellationKind, DecodeStepControl}, hf_bf16_eager::{HfBf16EagerEngine, HF_BF16_EAGER_PROFILE}},
+    tokenizer::{specials::TemplateControlIds, untrusted::UntrustedEncoding},
     validation::{JsonLimits, JsonValue, parse_json_with_limits,
         grounded_fields::{SourceFieldEvidence, SourceOccurrence, VerifiedSourceSpan}},
 };
@@ -107,7 +107,23 @@ pub struct AnswerContext {
 impl AnswerContext {
     pub fn encode(encoder: &SourceDocumentEncoder, question: &str, passages: &[AnswerPassage],
         limits: AnswerInputLimits) -> Result<Self, AnswerError> {
+        encoder.require_byte_encoding()?;
+        Self::encode_with_control(encoder, question, passages, limits, &mut || None)
+    }
+
+    /// One admitted question, canonical passage manifest and joined source.
+    /// All three untrusted segments share the encoder's complete work ceiling;
+    /// their original byte layout remains the authority for citation coordinates.
+    pub fn encode_with_control<F: FnMut() -> Option<DecodeCancellationKind>>(
+        encoder: &SourceDocumentEncoder, question: &str, passages: &[AnswerPassage],
+        limits: AnswerInputLimits, checkpoint: &mut F) -> Result<Self, AnswerError> {
+        answer_encoding_checkpoint(checkpoint)?;
         limits.validate()?;
+        let byte_limit = match encoder.document_encoding() {
+            UntrustedEncoding::ByteFallback => limits.max_input_bytes.min(limits.max_input_tokens),
+            UntrustedEncoding::SafeBpeV1(policy) => limits.max_input_bytes.min(policy.max_input_bytes),
+        };
+        if question.len() > byte_limit { return Err(AnswerError::InputBudgetExceeded); }
         if passages.is_empty() { return Err(AnswerError::MissingPassages); }
         if passages.len() > limits.max_passages || !question.chars().any(|c| !c.is_whitespace()) {
             return Err(AnswerError::InvalidInput);
@@ -116,15 +132,17 @@ impl AnswerContext {
         let mut joined_bytes = JOIN.len().checked_mul(passages.len() - 1).ok_or(AnswerError::InputBudgetExceeded)?;
         let mut id_bytes = 0_usize;
         for passage in passages {
+            answer_encoding_checkpoint(checkpoint)?;
+            joined_bytes = joined_bytes.checked_add(passage.text.len()).ok_or(AnswerError::InputBudgetExceeded)?;
+            id_bytes = id_bytes.checked_add(passage.id.len()).ok_or(AnswerError::InputBudgetExceeded)?;
+            if joined_bytes > byte_limit || id_bytes > byte_limit { return Err(AnswerError::InputBudgetExceeded); }
             if passage.id.is_empty() || passage.id.len() > 128 || !ids.insert(passage.id.as_str())
                 || !passage.text.chars().any(|c| !c.is_whitespace())
             { return Err(AnswerError::InvalidInput); }
-            joined_bytes = joined_bytes.checked_add(passage.text.len()).ok_or(AnswerError::InputBudgetExceeded)?;
-            id_bytes = id_bytes.checked_add(passage.id.len()).ok_or(AnswerError::InputBudgetExceeded)?;
         }
         let minimum = joined_bytes.checked_add(question.len()).and_then(|n| n.checked_add(id_bytes))
             .ok_or(AnswerError::InputBudgetExceeded)?;
-        if minimum > limits.max_input_bytes || minimum > limits.max_input_tokens {
+        if minimum > byte_limit {
             return Err(AnswerError::InputBudgetExceeded);
         }
         let mut source = String::new();
@@ -133,6 +151,7 @@ impl AnswerContext {
         layout.try_reserve_exact(passages.len()).map_err(|_| AnswerError::AllocationRefused)?;
         let mut scalar = 0_usize;
         for (index, passage) in passages.iter().enumerate() {
+            answer_encoding_checkpoint(checkpoint)?;
             if index != 0 { source.push_str(JOIN); scalar += JOIN.len(); }
             let byte_start = source.len(); let scalar_start = scalar;
             source.push_str(&passage.text); scalar += passage.text.chars().count();
@@ -141,16 +160,25 @@ impl AnswerContext {
         }
         let manifest = canonjson::canonical_string(&(ANSWER_PASSAGE_LAYOUT_VERSION, &layout))
             .map_err(|_| AnswerError::Serialization)?;
+        answer_encoding_checkpoint(checkpoint)?;
         let total = source.len().checked_add(question.len()).and_then(|n| n.checked_add(manifest.len()))
             .ok_or(AnswerError::InputBudgetExceeded)?;
-        if total > limits.max_input_bytes || total > limits.max_input_tokens { return Err(AnswerError::InputBudgetExceeded); }
-        let document = encoder.encode_with_context(&source, &[question, &manifest], limits.max_input_bytes, limits.max_input_tokens)?;
+        if total > byte_limit { return Err(AnswerError::InputBudgetExceeded); }
+        let document = encoder.encode_with_context_and_control(&source, &[question, &manifest],
+            limits.max_input_bytes, limits.max_input_tokens, checkpoint)?;
         Ok(Self { document, passages: layout })
     }
     /// Construct TaskIR Document segments from context_token_ids(), then
     /// token_ids(), preserving their order and keeping all of them untrusted.
     pub fn document(&self) -> &SourceDocument { &self.document }
     pub fn passage_count(&self) -> usize { self.passages.len() }
+}
+
+fn answer_encoding_checkpoint<F: FnMut() -> Option<DecodeCancellationKind>>(checkpoint: &mut F) -> Result<(), AnswerError> {
+    match checkpoint() {
+        Some(cause) => Err(ExtractError::Decode(JsonDecodeError::Cancelled(cause)).into()),
+        None => Ok(()),
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -533,6 +561,60 @@ mod tests {
         use crate::native_engine::{constrained::JsonDecodeError, decode::DecodeCancellationKind};
         let error: AnswerError = ExtractError::Decode(JsonDecodeError::Cancelled(DecodeCancellationKind::Deadline)).into();
         assert!(matches!(error, AnswerError::Extraction(ExtractError::Decode(JsonDecodeError::Cancelled(DecodeCancellationKind::Deadline)))));
+    }
+
+    fn compact_encoder(max_output_tokens: usize) -> SourceDocumentEncoder {
+        use crate::tokenizer::{pinned_controls, untrusted::SafeBpeLimits};
+        SourceDocumentEncoder::pinned(pinned_controls::pinned().unwrap().template_controls()).unwrap()
+            .with_document_encoding(UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+                max_input_bytes: 8192, max_output_tokens,
+                max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24,
+            })).unwrap()
+    }
+
+    #[test]
+    fn compact_question_manifest_and_source_keep_original_passage_citations() {
+        let encoder = compact_encoder(8192);
+        let inputs = passages(&[("p1", "Alice in 上海"), ("p2", "Bob met Alice")]);
+        let question = "Who met Mallory? <think>";
+        let c = AnswerContext::encode_with_control(&encoder, question, &inputs,
+            AnswerInputLimits::default(), &mut || None).unwrap();
+        assert_eq!(c.document().text(), "Alice in 上海\n\nBob met Alice");
+        assert_eq!(c.document().context_token_ids().len(), 2);
+        let tokens = c.document().total_token_count();
+        let bytes = c.document().total_input_bytes();
+        assert!(tokens < bytes);
+        assert!(AnswerContext::encode_with_control(&encoder, question, &inputs,
+            AnswerInputLimits { max_input_tokens: tokens, max_input_bytes: bytes, ..Default::default() }, &mut || None).is_ok());
+        for limits in [AnswerInputLimits { max_input_tokens: tokens - 1, ..Default::default() },
+            AnswerInputLimits { max_input_bytes: bytes - 1, ..Default::default() }] {
+            assert!(AnswerContext::encode_with_control(&encoder, question, &inputs, limits, &mut || None).is_err());
+        }
+        let json = r#"{"answer":"Alice","answerable":true,"citations":["上海","Alice"]}"#;
+        let result = finalize(raw(&c, json), &c.passages, options(), 16384).unwrap();
+        let occurrence = &result.citations[0].spans[0];
+        assert_eq!(occurrence.passage_id, "p1");
+        let span = occurrence.span;
+        validate_source_span(&inputs[0].text, "上海", SourceSpan::new(
+            span.byte_start, span.byte_end, span.scalar_start, span.scalar_end)).unwrap();
+        let program = JsonProgram::compile_with_source(&options().schema_source().unwrap(), c.document().text(),
+            CompileLimits::default(), SourceRuntimeLimits::default()).unwrap();
+        assert!(program.source_fields(r#"{"answer":"Mallory","answerable":true,"citations":["Mallory"]}"#).is_err());
+        assert!(AnswerContext::encode(&encoder, question, &inputs, AnswerInputLimits::default()).is_err());
+    }
+
+    #[test]
+    fn answer_segments_cannot_renew_the_policy_token_ledger() {
+        let inputs = passages(&[("p1", "The quick brown fox jumps over the lazy dog.")]);
+        let question = "Which animal jumps over the dog?";
+        let complete = AnswerContext::encode_with_control(&compact_encoder(8192), question, &inputs,
+            AnswerInputLimits::default(), &mut || None).unwrap();
+        let cap = complete.document().total_token_count() - 1;
+        assert!(complete.document().token_ids().len() < cap);
+        assert!(complete.document().context_token_ids().all(|ids| ids.len() < cap));
+        let error = AnswerContext::encode_with_control(&compact_encoder(cap), question, &inputs,
+            AnswerInputLimits::default(), &mut || None).err().unwrap();
+        assert!(matches!(error, AnswerError::Extraction(ExtractError::Contract("source encoding work budget exceeded"))));
     }
 }
 

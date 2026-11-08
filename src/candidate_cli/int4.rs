@@ -361,7 +361,7 @@ impl Int4Command {
             _ => return Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source-int4 task refused")),
         };
         let mut args = Int4Args::from_arg_matches(matches)?;
-        if matches!(name, "generate" | "chat") {
+        if matches!(name, "generate" | "chat" | "ner" | "keyphrases" | "summarize" | "answer") {
             args.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
         }
         Ok(Self { task, args, batch: None, job: None })
@@ -548,6 +548,20 @@ impl Int4Args {
     fn validate_storage_scheduled(&self, result_bytes: usize, output_tokens: usize,
         max_prompt_tokens: usize, sampler_bytes: u64, extra_preparation_bytes: u64,
         cohort: Option<cohort::Admission>) -> Result<Int4Limits, CandidateError> {
+        // Only text tasks and the explicitly wired one-request source route
+        // may change encoding. Composed/scored callers retain byte semantics.
+        if sampler_bytes == 0 && !self.input_encoding.is_default() { return Err(CandidateError::Arguments); }
+        self.validate_storage_admission(result_bytes, output_tokens, max_prompt_tokens,
+            sampler_bytes, extra_preparation_bytes, cohort)
+    }
+    fn validate_source_storage(&self, result_bytes: usize, output_tokens: usize,
+        max_prompt_tokens: usize, extra_preparation_bytes: u64) -> Result<Int4Limits, CandidateError> {
+        self.validate_storage_admission(result_bytes, output_tokens, max_prompt_tokens,
+            0, extra_preparation_bytes, None)
+    }
+    fn validate_storage_admission(&self, result_bytes: usize, output_tokens: usize,
+        max_prompt_tokens: usize, sampler_bytes: u64, extra_preparation_bytes: u64,
+        cohort: Option<cohort::Admission>) -> Result<Int4Limits, CandidateError> {
         let snapshot_pin = self.checked_model_input()?;
         let prefill = self.prefill()?;
         if cohort.is_some() && (prefill.is_some() || sampler_bytes != 0) { return Err(CandidateError::Arguments); }
@@ -580,7 +594,6 @@ impl Int4Args {
             return Err(CandidateError::Arguments);
         }
         let encoding_workspace = self.input_encoding.workspace_bytes(self.max_input_bytes, max_prompt_tokens)?;
-        if sampler_bytes == 0 && encoding_workspace != 0 { return Err(CandidateError::Arguments); }
         let preparation_floor = sum(&[128 * MIB, self.max_input_bytes as u64 * 32,
             (result_bytes as u64 + 4096) * 2, extra_preparation_bytes, encoding_workspace])?;
         if preparation_bytes < preparation_floor { return Err(CandidateError::Arguments); }

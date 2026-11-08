@@ -1,4 +1,4 @@
-//! Explicit one-request input tokenization. Never an ambient/default change.
+//! Explicit one-request text/source tokenization. Never an ambient/default change.
 use super::*;
 use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
 
@@ -12,16 +12,18 @@ pub(super) struct InputEncodingArgs {
 pub(super) fn definition(command: clap::Command) -> clap::Command {
     command.arg(clap::Arg::new("input_encoding").long("input-encoding")
         .value_parser(["byte-fallback", "safe-bpe-v1"]).default_value("byte-fallback")
-        .help("Untrusted message encoding; safe-bpe-v1 is an explicit byte-preserving, control-excluding candidate policy"))
+        .help("Untrusted request-text encoding; safe-bpe-v1 is an explicit byte-preserving, control-excluding candidate policy"))
         .arg(clap::Arg::new("max_tokenizer_pair_checks").long("max-tokenizer-pair-checks")
             .value_parser(clap::value_parser!(u64)).value_name("COUNT")
-            .help("Whole-transcript BPE pair-comparison cap; safe-bpe-v1 only, default 4194304"))
+            .help("Whole-request BPE pair-comparison cap across all untrusted segments; safe-bpe-v1 only, default 4194304"))
         .arg(clap::Arg::new("max_tokenizer_pair_bytes").long("max-tokenizer-pair-bytes")
             .value_parser(clap::value_parser!(u64)).value_name("BYTES")
-            .help("Whole-transcript BPE examined-pair byte cap; safe-bpe-v1 only, default 67108864"))
+            .help("Whole-request BPE examined-pair byte cap across all untrusted segments; safe-bpe-v1 only, default 67108864"))
 }
 
 impl InputEncodingArgs {
+    pub(super) fn is_default(&self) -> bool { self == &Self::default() }
+
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let safe_bpe = matches.get_one::<String>("input_encoding").is_some_and(|value| value == "safe-bpe-v1");
         let options = Self { safe_bpe,

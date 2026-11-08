@@ -290,6 +290,9 @@ fn prepare(request: Input, model: &ResidentInt4, args: &Int4Args, limits: Int4Li
                 } else { CandidateError::Execution });
             }
             let (planner, vocabulary) = source::planner()?;
+            let planner = planner.with_document_encoding(
+                args.input_encoding.policy(args.max_input_bytes, limits.max_prompt_tokens)?)
+                .map_err(|_| CandidateError::Planning)?;
             let identity = source::identity(model.model_identity(), &planner, request.task())?;
             let context = PlanContext::new(&identity, options.budget(args, limits))
                 .map_err(|_| CandidateError::Planning)?;

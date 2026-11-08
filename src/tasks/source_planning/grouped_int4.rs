@@ -68,7 +68,8 @@ impl From<SummaryError> for Int4SourceError { fn from(e: SummaryError) -> Self {
 impl From<AnswerError> for Int4SourceError { fn from(e: AnswerError) -> Self { Self::Planning(e.into()) } }
 impl Int4SourceError {
     pub fn cancellation(&self) -> Option<DecodeCancellationKind> {
-        match self { Self::Cancelled(c) => Some(*c), Self::Extraction(e) => e.cancellation(), _ => None }
+        match self { Self::Cancelled(c) => Some(*c), Self::Extraction(e) => e.cancellation(),
+            Self::Planning(e) => e.cancellation(), Self::InvalidResult => None }
     }
 }
 
@@ -115,22 +116,23 @@ pub struct PreparedInt4SourceTask {
 }
 impl SourceTaskPlanner {
     /// The context must already identify the strict-v2 candidate and exact
-    /// group partition. The existing bounded compiler/tokenizer operations
-    /// are checkpointed around calls; no mid-operation preemption is claimed.
+    /// group partition. Safe-BPE polls inside its bounded encoding work; other
+    /// compiler operations remain cooperative around calls, without OS preemption.
     pub fn plan_int4_with_control<C: DecodeStepControl>(&self, request: &SourceTaskRequest,
         context: &PlanContext<'_>, limits: SourcePlanningLimits, group_width: usize, control: &mut C)
         -> Result<PreparedInt4SourceTask, Int4SourceError> {
         checkpoint(control)?;
         constrained_int4::check_profile(context.execution_identity(), group_width)?;
         let kind = request.task(); let budget = request.budget();
-        self.check_context_for_profile(kind, context, budget, limits, NumericsProfile::StrictQuantized { version: 2 })?;
+        self.check_one_off_context_for_profile(kind, context, budget, limits, NumericsProfile::StrictQuantized { version: 2 })?;
         let task_spec = match kind {
             BuiltInTask::Ner => NER_TASK_VERSION, BuiltInTask::Keyphrases => KEYPHRASES_TASK_VERSION,
             BuiltInTask::Summarize => SUMMARIZE_TASK_VERSION, BuiltInTask::Answer => ANSWER_TASK_VERSION,
             _ => return Err(SourcePlanningError::Contract("unsupported INT4 source task").into()),
         };
-        let encode = |text: &str| self.encoder.encode(text, limits.max_input_bytes, budget.max_input_tokens as usize);
-        let mut compile = |document: &SourceDocument, schema: &str| -> Result<Int4ExtractPlan, Int4SourceError> {
+        let encode = |text: &str, control: &mut C| self.encoder.encode_with_control(text,
+            limits.max_input_bytes, budget.max_input_tokens as usize, &mut || control.prefill_checkpoint(0));
+        let compile = |document: &SourceDocument, schema: &str, control: &mut C| -> Result<Int4ExtractPlan, Int4SourceError> {
             checkpoint(control)?;
             let task = self.task(kind, document, schema, context, budget, limits)?;
             let decode = JsonDecodeOptions { max_new_tokens: budget.max_output_tokens as usize,
@@ -143,24 +145,24 @@ impl SourceTaskPlanner {
         };
         let (extraction, finalizer) = match request {
             SourceTaskRequest::Ner { document, options, .. } => {
-                let schema = options.schema_source()?; let document = encode(document)?;
-                (compile(&document, &schema)?, Finalizer::Ner(options.clone()))
+                let schema = options.schema_source()?; let document = encode(document, control)?;
+                (compile(&document, &schema, control)?, Finalizer::Ner(options.clone()))
             }
             SourceTaskRequest::Keyphrases { document, options, .. } => {
-                let schema = options.schema_source()?; let document = encode(document)?;
-                (compile(&document, &schema)?, Finalizer::Keyphrases(*options))
+                let schema = options.schema_source()?; let document = encode(document, control)?;
+                (compile(&document, &schema, control)?, Finalizer::Keyphrases(*options))
             }
             SourceTaskRequest::Summarize { document, options, .. } => {
-                let schema = options.schema_source()?; let document = encode(document)?;
-                (compile(&document, &schema)?, Finalizer::Summarize(*options))
+                let schema = options.schema_source()?; let document = encode(document, control)?;
+                (compile(&document, &schema, control)?, Finalizer::Summarize(*options))
             }
             SourceTaskRequest::Answer { question, passages, options, .. } => {
                 let schema = options.schema_source()?;
-                let answer = AnswerContext::encode(&self.encoder, question, passages, AnswerInputLimits {
+                let answer = AnswerContext::encode_with_control(&self.encoder, question, passages, AnswerInputLimits {
                     max_passages: limits.max_passages, max_input_bytes: limits.max_input_bytes,
                     max_input_tokens: budget.max_input_tokens as usize,
-                })?;
-                let extraction = compile(answer.document(), &schema)?;
+                }, &mut || control.prefill_checkpoint(0))?;
+                let extraction = compile(answer.document(), &schema, control)?;
                 (extraction, Finalizer::Answer(answer.into_int4_finalizer(), *options))
             }
         };

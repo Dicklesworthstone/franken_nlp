@@ -42,7 +42,7 @@ fn default_options_use_the_same_pinned_greedy_contract_and_group_aware_requireme
 }
 
 #[test]
-fn explicit_safe_bpe_is_text_only_and_admits_workspace_before_any_io() {
+fn explicit_safe_bpe_text_admits_workspace_and_unwired_tasks_stay_byte_only() {
     use crate::tokenizer::untrusted::UntrustedEncoding;
     for task in ["generate", "chat"] {
         let options = args(task, &["--input-encoding", "safe-bpe-v1"]);
@@ -58,7 +58,8 @@ fn explicit_safe_bpe_is_text_only_and_admits_workspace_before_any_io() {
     }
     // A task that still uses byte-counted chunk planning must never accept a
     // tokenization switch which its planner would silently ignore.
-    for task in ["ner", "keyphrases", "summarize", "answer", "extract"] {
+    for task in ["extract", "classify", "sentiment", "judge", "ner-map", "keyphrases-map",
+        "summarize-map", "answer-map", "ner-batch", "keyphrases-batch", "summarize-batch", "answer-batch"] {
         let argv = ["candidate", "source-int4", task, "--source-dir", "source",
             "--source-manifest", "manifest.json", "--memory-mib", "8192",
             "--input-encoding", "safe-bpe-v1"];

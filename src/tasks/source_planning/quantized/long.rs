@@ -174,6 +174,7 @@ impl SourceTaskPlanner {
         -> Result<PreparedInt8SourceMap<'s>, Int8SourceMapError> {
         limits.validate(budget, planning)?;
         checkpoint(control)?;
+        self.encoder.require_byte_encoding().map_err(Int8SourceError::from)?;
         constrained_int8::check_profile(context.execution_identity()).map_err(Int8SourceError::from)?;
         if source.is_empty() { return Err(Int8SourceMapError::EmptySource); }
         let mut cancelled = None;

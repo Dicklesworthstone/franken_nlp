@@ -38,14 +38,14 @@ impl std::fmt::Debug for SourceArgs {
 pub(super) fn definitions() -> Vec<clap::Command> {
     [Kind::Ner, Kind::Keyphrases, Kind::Summarize, Kind::Answer].into_iter().map(definition).collect()
 }
-/// Shared definitions retain full-head schedules; only these direct commands
-/// can bind selected rows into a complete source task before host admission.
+/// Shared definitions retain byte input and full-head schedules. Only these
+/// direct commands bind explicit input encoding and selected output rows.
 pub(super) fn one_off_definitions() -> Vec<clap::Command> {
-    definitions().into_iter().map(|command| command
+    definitions().into_iter().map(|command| input_encoding::definition(command
         .arg(clap::Arg::new("max_selected_rows").long("max-selected-rows")
             .value_name("N").value_parser(clap::value_parser!(usize))
             .help("Opt into all legal grammar-row projections; 1..=166144 rows per step including accepted EOS; excess refuses"))
-        .after_long_help("Full-vocabulary projection remains the default. --max-selected-rows projects every legal token, never prunes the grammar, and refuses before projecting a set larger than the cap. The exact strategy, cap and source-task finalizer bind execution identity. Source spans, passage boundaries, citation verification, complete result limits and mask work remain unchanged. Summary prose and answer text can have wide legal sets, so a small cap may refuse them; no automatic fallback or retry occurs. --prefill-rows independently enables bounded layer-major prompt execution. This option checks only selected logits; actual-model parity and performance require separate evidence. Source batches expose their own fixed stream option, including document cohorts and packed prompt passes; maps, jobs and redaction retain full-vocabulary execution."))
+        .after_long_help("Full-vocabulary projection remains the default. --max-selected-rows projects every legal token, never prunes the grammar, and refuses before projecting a set larger than the cap. The exact strategy, cap and source-task finalizer bind execution identity. Source spans, passage boundaries, citation verification, complete result limits and mask work remain unchanged. Summary prose and answer text can have wide legal sets, so a small cap may refuse them; no automatic fallback or retry occurs. --prefill-rows independently enables bounded layer-major prompt execution. This option checks only selected logits; actual-model parity and performance require separate evidence. Source batches expose their own fixed stream option, including document cohorts and packed prompt passes; maps, jobs and redaction retain full-vocabulary execution. Separately, --input-encoding safe-bpe-v1 selects bounded compact input tokens for this one request while preserving every original byte and excluding template controls. Question, passage manifest and evidence source share one tokenizer-work allowance. The complete prompt must still fit its token context, and tokenizer workspace is admitted before input/model IO. The policy and all limits enter execution identity and public input_encoding metadata; only original evidence text can authorize citations. It composes with selected output rows and layer-major prefill. Byte-fallback remains the default. Composed source maps, corpora and jobs do not accept this input-encoding option.")))
         .collect()
 }
 pub(super) fn definition(kind: Kind) -> clap::Command {
@@ -98,7 +98,7 @@ impl SourceArgs {
     /// option cannot silently replace that policy when prefill is enabled.
     pub(super) fn validate_full_projection_with_prefill(&self, args: &Int4Args)
         -> Result<Int4Limits, CandidateError> {
-        if self.max_selected_rows.is_some() { return Err(CandidateError::Arguments); }
+        if self.max_selected_rows.is_some() || !args.input_encoding.is_default() { return Err(CandidateError::Arguments); }
         self.validate_with_prefill(args)
     }
     pub(super) fn validate_with_prefill(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
@@ -122,8 +122,8 @@ impl SourceArgs {
             self.max_result_bytes as u64 * 16, u64::from(self.max_grammar_states) * 32])?;
         // The source prompt compiler reserves prompt + full output, including
         // EOS, against context. Keep its stricter bound in admission as well.
-        args.validate_storage_with_prefill(self.max_result_bytes, args.max_new_tokens,
-            args.context_tokens - args.max_new_tokens, 0, extra)
+        args.validate_source_storage(self.max_result_bytes, args.max_new_tokens,
+            args.context_tokens - args.max_new_tokens, extra)
     }
     pub(super) fn budget(&self, args: &Int4Args, limits: Int4Limits) -> TaskBudget {
         TaskBudget { max_input_tokens: limits.max_prompt_tokens as u32,
