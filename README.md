@@ -389,7 +389,28 @@ initial thread configuration. Compilation, executable regressions, complete
 model parity and hardware performance remain pending the authorized DSR
 checkpoint. The serial default remains the rollback selector.
 
-## Explicit bounded BPE input for candidate INT4 tasks
+## Explicit bounded BPE input for candidate text tasks
+
+Native INT8 `fnlp candidate generate`, `chat`, and `stream generate|chat`
+accept `--input-encoding safe-bpe-v1`. Buffered and live requests use the same
+policy-aware planner, including the original invocation deadline during
+tokenization. The complete encoder workspace is admitted before input or model
+IO. For example:
+
+```bash
+fnlp candidate generate prompt.txt --model model.fnlpq --memory-mib 8192 \
+  --input-encoding safe-bpe-v1
+
+fnlp candidate stream chat messages.json --model model.fnlpq --memory-mib 8192 \
+  --input-encoding safe-bpe-v1 --max-tokenizer-pair-checks 8388608 \
+  --max-tokenizer-pair-bytes 134217728
+```
+
+These INT8 requests share the byte-preservation, control-exclusion, context,
+work-limit and provenance contracts below. Explicit compact input remains a
+separate input profile; source-level regression definitions do not establish
+compiled execution, model parity or task quality. Retained INT8 jobs keep their
+existing input contract.
 
 `fnlp candidate source-int4 generate`, `chat`, `classify`, `sentiment`, `extract`, `ner`, `keyphrases`,
 `summarize`, `answer`, `stream generate|chat`, `text-batch` and `text-corpus`

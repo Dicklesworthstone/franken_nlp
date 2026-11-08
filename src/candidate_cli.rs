@@ -92,6 +92,10 @@ pub(crate) struct CandidateArgs {
     logprobs: bool,
     #[command(flatten)]
     policy: generation_policy::GenerationPolicyArgs,
+    /// Parsed only by text routes that explicitly expose this policy. Other
+    /// consumers of the shared arguments retain byte-fallback admission.
+    #[arg(skip)]
+    input_encoding: input_encoding::InputEncodingArgs,
 }
 
 pub(crate) enum CandidateCommand {
@@ -133,10 +137,10 @@ pub(crate) fn definition() -> clap::Command {
         .subcommand(stream::definition())
         .subcommand(text_batch::definition())
         .subcommand(jobs::generation::definition())
-        .subcommand(CandidateArgs::augment_args(clap::Command::new("generate")
-            .about("Generate from a bounded UTF-8 prompt using the pinned chat template")))
-        .subcommand(CandidateArgs::augment_args(clap::Command::new("chat")
-            .about("Complete a bounded JSON array of system/user/assistant messages")))
+        .subcommand(input_encoding::definition(CandidateArgs::augment_args(clap::Command::new("generate")
+            .about("Generate from a bounded UTF-8 prompt using the pinned chat template"))))
+        .subcommand(input_encoding::definition(CandidateArgs::augment_args(clap::Command::new("chat")
+            .about("Complete a bounded JSON array of system/user/assistant messages"))))
 }
 
 impl CandidateCommand {
@@ -153,7 +157,7 @@ impl CandidateCommand {
             return text_batch::TextBatchCommand::from_arg_matches(matches).map(Self::TextBatch);
         }
         if name == "stream" {
-            return stream::StreamCommand::from_arg_matches(matches).map(Self::Stream);
+            return stream::StreamCommand::from_matches(matches).map(Self::Stream);
         }
         if name == "resolve" {
             return resolve::ResolveCommand::from_arg_matches(matches).map(Self::Resolve);
@@ -193,7 +197,7 @@ impl CandidateCommand {
             "chat" => Task::Chat,
             _ => return Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "candidate task refused")),
         };
-        Ok(Self::Text { task, args: CandidateArgs::from_arg_matches(matches)? })
+        Ok(Self::Text { task, args: CandidateArgs::from_text_matches(matches)? })
     }
 
     /// Called BEFORE the root dispatcher acquires any stdio locks. Batch
@@ -265,6 +269,17 @@ struct Limits {
 }
 
 impl CandidateArgs {
+    fn from_text_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let mut args = Self::from_arg_matches(matches)?;
+        args.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+        Ok(args)
+    }
+
+    fn input_encoding_policy(&self, limits: Limits)
+        -> Result<crate::tokenizer::untrusted::UntrustedEncoding, CandidateError> {
+        self.input_encoding.policy(self.max_input_bytes, limits.max_prompt_tokens)
+    }
+
     fn validate(&self) -> Result<Limits, CandidateError> {
         if self.max_input_bytes == 0 || self.max_input_bytes > MAX_INPUT_BYTES
             || self.max_output_bytes == 0 || self.max_output_bytes > MAX_CONTENT_BYTES
@@ -286,12 +301,18 @@ impl CandidateArgs {
         let result_bytes = self.max_output_bytes.checked_mul(8)
             .and_then(|bytes| bytes.checked_add(self.max_new_tokens.checked_mul(64)?))
             .and_then(|bytes| bytes.checked_add(65_536)).ok_or(CandidateError::Arguments)?;
-        let preparation_floor = 128 * MIB + self.max_input_bytes as u64 * 32
-            + (result_bytes as u64 + 4096) * 2;
+        let max_prompt_tokens = self.context_tokens - self.max_new_tokens + 1;
+        // One transient encoder workspace covers the complete request or
+        // transcript. Its policy is validated before any input/model IO and
+        // its allocations remain covered by the session's preparation lease.
+        let encoding_bytes = self.input_encoding.workspace_bytes(self.max_input_bytes, max_prompt_tokens)?;
+        let preparation_floor = (128 * MIB + self.max_input_bytes as u64 * 32
+            + (result_bytes as u64 + 4096) * 2).checked_add(encoding_bytes)
+            .ok_or(CandidateError::Arguments)?;
         if preparation_bytes < preparation_floor || preparation_bytes > memory_bytes
             || weight_bytes > memory_bytes { return Err(CandidateError::Arguments); }
         let limits = Limits { memory_bytes, weight_bytes, preparation_bytes, result_bytes,
-            max_prompt_tokens: self.context_tokens - self.max_new_tokens + 1, kv_bytes: memory.kv_bytes };
+            max_prompt_tokens, kv_bytes: memory.kv_bytes };
         self.options(166_101)?.validate(self.generation_limits(limits))
             .map_err(|_| CandidateError::Arguments)?;
         Ok(limits)

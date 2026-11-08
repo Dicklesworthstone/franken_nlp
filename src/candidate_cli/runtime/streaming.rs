@@ -3,14 +3,16 @@ use super::*;
 use super::source_tasks::Session;
 use crate::{candidate_cli::stream::{Failure, StreamBounds, events::TokenSink},
     hosted::{ChatStreamLimits, HostedError},
-    native_engine::{decode::DecodeCancellationKind, generation::quantized::Int8GenerationError},
+    native_engine::{decode::{DecodeCancellationKind, DecodeStepControl}, generation::quantized::Int8GenerationError},
     tasks::chat::{ChatError, quantized::{PreparedInt8Chat, Int8ChatError}}};
 
 /// Shared with the original buffered generate/chat path. In particular, stream
 /// framing never changes the stable item id, sample index, seed, source bytes,
 /// template/control policy, task ceiling or admitted native work.
-pub(super) fn prepare(args: &CandidateArgs, limits: Limits, text: String,
-    messages: Option<Vec<ChatMessage>>, facts: &ArtifactIdentity) -> Result<PreparedInt8Chat, CandidateError> {
+pub(super) fn prepare<C: DecodeStepControl>(args: &CandidateArgs, limits: Limits, text: String,
+    messages: Option<Vec<ChatMessage>>, facts: &ArtifactIdentity, control: &mut C)
+    -> Result<PreparedInt8Chat, CandidateError> {
+    if let Some(cause) = control.checkpoint(0) { return Err(preparation_cancelled(cause)); }
     let identity = candidate_identity(facts)?;
     let controls = pinned_controls::pinned().map_err(|_| CandidateError::Identity)?;
     let eos = controls.template_controls().entries().iter()
@@ -24,20 +26,30 @@ pub(super) fn prepare(args: &CandidateArgs, limits: Limits, text: String,
     let planner = Int8ChatPlanner::pinned(controls.template_controls(), eos, identity, budget,
         ChatLimits { max_messages: 128, max_message_bytes: args.max_input_bytes,
             max_total_message_bytes: args.max_input_bytes, generation: args.generation_limits(limits) })
+        .map_err(|_| CandidateError::Planning)?
+        .with_document_encoding(args.input_encoding_policy(limits)?)
         .map_err(|_| CandidateError::Planning)?;
     let options = args.options(eos)?;
     let prepared = match messages {
-        Some(messages) => planner.plan_chat(&ChatRequest { item_id: "cli".to_owned(), sample_index: 0,
-            messages, generation: options, budget }),
-        None => planner.plan_generate(&GenerateRequest { item_id: "cli".to_owned(), sample_index: 0,
-            prompt: text, generation: options, budget }),
-    }.map_err(|_| CandidateError::Planning)?;
+        Some(messages) => planner.plan_chat_with_control(&ChatRequest { item_id: "cli".to_owned(), sample_index: 0,
+            messages, generation: options, budget }, control),
+        None => planner.plan_generate_with_control(&GenerateRequest { item_id: "cli".to_owned(), sample_index: 0,
+            prompt: text, generation: options, budget }, control),
+    }.map_err(|error| error.cancellation().map_or(CandidateError::Planning, preparation_cancelled))?;
     if prepared.planned_work().forward_positions > args.context_tokens as u64 { return Err(CandidateError::Planning); }
     Ok(prepared)
 }
 
+fn preparation_cancelled(cause: DecodeCancellationKind) -> CandidateError {
+    match cause {
+        DecodeCancellationKind::Deadline | DecodeCancellationKind::Timeout => CandidateError::Timeout,
+        _ => CandidateError::Execution,
+    }
+}
+
 pub(in crate::candidate_cli) fn execute<W: Write + Send + 'static>(task: Task, args: CandidateArgs,
     limits: Limits, bounds: StreamBounds, input: &mut impl Read, output: W) -> Result<(), Failure> {
+    let encoding = args.input_encoding_policy(limits)?;
     // Declared first: initial input, token verification buffers, metadata and
     // planner allocations remain covered before transfer to the charged host.
     let session = Session::new(&args, limits)?;
@@ -46,9 +58,10 @@ pub(in crate::candidate_cli) fn execute<W: Write + Send + 'static>(task: Task, a
         Task::Chat => Some(parse_messages(&text, args.max_input_bytes)?), Task::Generate => None,
     };
     let facts = session.facts(&args)?;
-    let prepared = prepare(&args, limits, text, messages, &facts)?;
+    let prepared = prepare(&args, limits, text, messages, &facts, &mut session.control())?;
     session.remaining()?;
-    let sink = TokenSink::new(output, task, bounds, &facts, prepared.native_plan().options())?;
+    let sink = TokenSink::new(output, task, bounds, &facts, prepared.native_plan().options())?
+        .with_input_encoding(encoding)?;
     let cancellation = CancellationToken::default();
     let model = session.load(&args, limits, &facts, cancellation.clone())?;
     let stream_limits = ChatStreamLimits { native: session.native(&args)?, max_sampler_bytes: SAMPLER_BYTES,

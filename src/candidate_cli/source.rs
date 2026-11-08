@@ -82,7 +82,8 @@ impl SourceHostArgs {
             max_weight_mib: self.max_weight_mib, preparation_mib: self.preparation_mib,
             timeout_seconds: self.timeout_seconds, max_checkpoints: self.max_checkpoints,
             seed: None, temperature_milli: None, top_k: None, top_p_ppm: None, logprobs: false,
-            policy: generation_policy::GenerationPolicyArgs::default() };
+            policy: generation_policy::GenerationPolicyArgs::default(),
+            input_encoding: input_encoding::InputEncodingArgs::default() };
         let limits = common.validate()?;
         Ok((common, limits))
     }

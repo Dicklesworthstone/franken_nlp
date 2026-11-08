@@ -25,6 +25,7 @@ use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, Me
 
 pub(super) fn execute(task: Task, args: CandidateArgs, limits: Limits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
+    let encoding = args.input_encoding_policy(limits)?;
     // The same owned startup path serves buffered text, streams and source
     // tasks. Its preparation charge outlives checked metadata and all staging.
     let session = source_tasks::Session::new(&args, limits)?;
@@ -34,7 +35,7 @@ pub(super) fn execute(task: Task, args: CandidateArgs, limits: Limits,
         Task::Generate => None,
     };
     let facts = session.facts(&args)?;
-    let prepared = streaming::prepare(&args, limits, text, messages, &facts)?;
+    let prepared = streaming::prepare(&args, limits, text, messages, &facts, &mut session.control())?;
     let cancellation = CancellationToken::default();
     let model = session.load(&args, limits, &facts, cancellation.clone())?;
     let result = execute_chat(&session.engine, &model, prepared, 1, session.native(&args)?, &args, cancellation)?;
@@ -47,6 +48,8 @@ pub(super) fn execute(task: Task, args: CandidateArgs, limits: Limits,
         output: &result };
     // Keep both the hosted output charge and preparation/staging charge alive
     // until serialization, external delivery and flush have actually finished.
+    let response = input_encoding::Response { response: &response,
+        input_encoding: input_encoding::reported_policy(&encoding) };
     publish_checked(&response, limits.result_bytes + 4096, output, &|| session.remaining().map(|_| ()))
 }
 
@@ -137,6 +140,32 @@ mod tests {
                 3 => changed.logical_model_sha256 = "invalid".to_owned(),
                 _ => changed.source_root_sha256 = "invalid".to_owned() }
             assert!(candidate_identity(&changed).is_err());
+        }
+    }
+    #[test]
+    fn buffered_encoding_provenance_is_complete_and_byte_default_is_unchanged() {
+        let facts = facts();
+        // A framing-only value, deliberately not a fabricated native result.
+        let output = serde_json::json!({"framing_fixture": true});
+        let response = CandidateResponse { schema_version: 1, scope: "real-artifact-current-candidate",
+            evidence: "non_authoritative", model_id: &facts.model_id, source_revision: &facts.revision,
+            source_root_sha256: &facts.source_root_sha256, logical_model_sha256: &facts.logical_model_sha256,
+            quant_recipe: &facts.recipe_id, output: &output };
+        let original = serde_json::to_vec(&response).unwrap();
+        for extra in [vec![], vec!["--input-encoding", "byte-fallback"], vec!["--input-encoding", "safe-bpe-v1"]] {
+            let args = super::super::tests::args(&extra); let limits = args.validate().unwrap();
+            let policy = args.input_encoding_policy(limits).unwrap();
+            let wrapped = input_encoding::Response { response: &response,
+                input_encoding: input_encoding::reported_policy(&policy) };
+            let bytes = serde_json::to_vec(&wrapped).unwrap();
+            if wrapped.input_encoding.is_none() { assert_eq!(bytes, original); }
+            else {
+                let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["input_encoding"], serde_json::to_value(&policy).unwrap());
+                assert_eq!(value["output"], output);
+                assert!(bytes.len() < original.len() + 4096);
+                assert!(value.get("prompt_digest").is_none());
+            }
         }
     }
     #[test]

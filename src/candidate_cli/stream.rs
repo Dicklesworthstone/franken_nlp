@@ -72,8 +72,21 @@ pub(super) fn definition() -> clap::Command {
     StreamCommand::augment_args(clap::Command::new("stream")
         .about("Stream native generation/chat as bounded provisional token NDJSON")
         .long_about("Explicit non-certified local INT8 model only. Emits run_start, token and, only after native drain and independent final validation, run_complete. Token data contains exact u8 byte arrays, which may split UTF-8 characters. EOF, an EOS token or a partial line is NOT successful completion. Errors emit a content-free run_error on stderr and exit nonzero; stdout is never retried after a failed write. The final frame contains the same complete task result as buffered generation. No network, thinking or tool execution. Blocking writes apply backpressure and are not safely preemptible."))
+        .mut_subcommand("generate", input_encoding::definition)
+        .mut_subcommand("chat", input_encoding::definition)
 }
 impl StreamCommand {
+    pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let mut command = Self::from_arg_matches(matches)?;
+        let (_, request) = matches.subcommand().ok_or_else(||
+            clap::Error::raw(clap::error::ErrorKind::MissingSubcommand, "stream task required"))?;
+        let common = match &mut command.operation {
+            Operation::Generate(args) | Operation::Chat(args) => &mut args.common,
+        };
+        common.input_encoding = input_encoding::InputEncodingArgs::from_matches(request)?;
+        Ok(command)
+    }
+
     fn into_parts(self) -> (Task, StreamArgs) {
         match self.operation { Operation::Generate(args) => (Task::Generate, args),
             Operation::Chat(args) => (Task::Chat, args) }

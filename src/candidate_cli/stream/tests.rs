@@ -60,6 +60,27 @@ fn transport_capacity_never_changes_native_sampling_or_task_identity_inputs() {
     assert_eq!(canonjson::canonical_bytes(&a.common.options(166101).unwrap()).unwrap(),
         canonjson::canonical_bytes(&b.common.options(166101).unwrap()).unwrap());
 }
+
+#[test]
+fn streamed_text_preserves_the_explicit_encoding_and_refuses_unpriced_workspace() {
+    use crate::tokenizer::untrusted::UntrustedEncoding;
+    for task in ["generate", "chat"] {
+        let a = args(task, &["--input-encoding", "safe-bpe-v1",
+            "--max-tokenizer-pair-checks", "1024", "--max-tokenizer-pair-bytes", "8192"]);
+        let (limits, _) = a.validate().unwrap();
+        let UntrustedEncoding::SafeBpeV1(policy) = a.common.input_encoding_policy(limits).unwrap()
+            else { panic!("stream discarded encoding policy") };
+        assert_eq!(policy.max_pair_checks, 1024);
+        assert_eq!(policy.max_pair_bytes, 8192);
+        assert_eq!(policy.max_output_tokens, limits.max_prompt_tokens);
+        for flag in ["--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes"] {
+            assert!(parse(task, &[flag, "1"]).is_err());
+        }
+        assert!(args(task, &["--input-encoding", "safe-bpe-v1", "--max-input-bytes", "1048576"])
+            .validate().is_err());
+    }
+}
+
 #[test]
 fn impossible_stream_memory_floor_is_refused_before_input_or_model_io() {
     let mut a = args("generate", &[]); a.common.memory_mib = 6144;

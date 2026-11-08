@@ -347,6 +347,34 @@ fn safe_bpe_start_reports_all_limits_even_when_no_token_fits() {
 }
 
 #[test]
+fn int8_stream_keeps_default_bytes_and_reports_compact_policy_before_tokens() {
+    let mut implicit = sink(false);
+    let mut explicit = sink(false).with_input_encoding(UntrustedEncoding::ByteFallback).unwrap();
+    for s in [&mut implicit, &mut explicit] {
+        push(s, event(0, 166101, b"", false));
+        s.finish(&completion(s, GenerationFinish::Eos)).unwrap();
+    }
+    assert_eq!(implicit.writer, explicit.writer);
+    assert!(rows(&implicit.writer)[0]["data"].get("input_encoding").is_none());
+    let policy = safe_bpe_policy();
+    for has_token in [false, true] {
+        let mut s = sink(false).with_input_encoding(policy.clone()).unwrap();
+        let finish = if has_token {
+            push(&mut s, event(0, 166101, b"", false));
+            GenerationFinish::Eos
+        } else { GenerationFinish::ByteLimit };
+        let result = completion(&s, finish); s.finish(&result).unwrap();
+        let frames = rows(&s.writer);
+        assert_eq!(frames[0]["event"], "run_start");
+        assert_eq!(frames[0]["data"]["input_encoding"], serde_json::to_value(&policy).unwrap());
+        assert_eq!(frames.last().unwrap()["data"], serde_json::to_value(&result).unwrap());
+        assert!(frames.iter().all(|frame| frame.get("prompt_digest").is_none()
+            && frame.get("input").is_none()));
+        assert!(s.writer.len() as u64 <= s.bounds.stream_bytes);
+    }
+}
+
+#[test]
 fn stream_encoding_cannot_change_after_reservation_or_delivery() {
     for delivered in [false, true] {
         let mut s = int4_sink(false, 128);

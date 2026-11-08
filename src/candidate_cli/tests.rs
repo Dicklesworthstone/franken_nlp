@@ -81,6 +81,71 @@ fn prompt_ceiling_reserves_space_for_every_possible_generation_step() {
 }
 
 #[test]
+fn text_encoding_is_explicit_and_shared_arguments_do_not_enable_unwired_routes() {
+    use crate::tokenizer::untrusted::UntrustedEncoding;
+    for task in ["generate", "chat"] {
+        let matches = definition().try_get_matches_from(["candidate", task, "--model", "m",
+            "--memory-mib", "8192", "--input-encoding", "safe-bpe-v1",
+            "--max-tokenizer-pair-checks", "1234", "--max-tokenizer-pair-bytes", "10000"]).unwrap();
+        let CandidateCommand::Text { args, .. } = CandidateCommand::from_matches(&matches).unwrap()
+            else { panic!("wrong task") };
+        let limits = args.validate().unwrap();
+        let UntrustedEncoding::SafeBpeV1(policy) = args.input_encoding_policy(limits).unwrap()
+            else { panic!("compact policy discarded") };
+        assert_eq!(policy.max_input_bytes, args.max_input_bytes);
+        assert_eq!(policy.max_output_tokens, limits.max_prompt_tokens);
+        assert_eq!((policy.max_pair_checks, policy.max_pair_bytes), (1234, 10000));
+        for flag in ["--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes"] {
+            let matches = definition().try_get_matches_from(["candidate", task, "--model", "m",
+                "--memory-mib", "8192", flag, "10"]).unwrap();
+            assert!(CandidateCommand::from_matches(&matches).is_err());
+        }
+    }
+    // Sharing CandidateArgs must not make a retained job silently accept an
+    // encoding whose recipe/admission identity it has not implemented.
+    for operation in ["start", "resume"] {
+        for task in ["generate", "chat"] {
+            let mut argv = vec!["candidate", "text-job", operation, "--task", task,
+                "--model", "m", "--memory-mib", "8192", "--store-results",
+                "--job-dir", "protected-job", "--job-id", "0123456789abcdef0123456789abcdef",
+                "--key-file", "job.key", "--limits", "limits.json"];
+            assert!(definition().try_get_matches_from(&argv).is_ok());
+            argv.extend(["--input-encoding", "safe-bpe-v1"]);
+            assert_eq!(definition().try_get_matches_from(&argv).unwrap_err().kind(),
+                clap::error::ErrorKind::UnknownArgument);
+        }
+    }
+    for value in ["0", "67108865"] {
+        assert!(args(&["--input-encoding", "safe-bpe-v1",
+            "--max-tokenizer-pair-checks", value]).validate().is_err());
+    }
+    let a = args(&[]); let b = args(&["--input-encoding", "byte-fallback"]);
+    assert_eq!(a.input_encoding_policy(a.validate().unwrap()).unwrap(), UntrustedEncoding::ByteFallback);
+    assert!(a.input_encoding == b.input_encoding);
+}
+
+#[test]
+fn compact_text_workspace_refuses_before_private_input_or_model_access() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("unadmitted input"); } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("unadmitted output"); }
+        fn flush(&mut self) -> io::Result<()> { panic!("unadmitted output"); }
+    }
+    // The old byte-only preparation allowance fits, but the explicitly
+    // selected encoder needs another conservative 256 MiB for this input cap.
+    args(&["--max-input-bytes", "1048576"]).validate().unwrap();
+    for task in [Task::Generate, Task::Chat] {
+        let args = args(&["--max-input-bytes", "1048576", "--input-encoding", "safe-bpe-v1"]);
+        assert!(matches!(args.validate(), Err(CandidateError::Arguments)));
+        let command = CandidateCommand::Text { task, args };
+        assert_eq!(command.execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+    }
+    args(&["--max-input-bytes", "1048576", "--input-encoding", "safe-bpe-v1",
+        "--preparation-mib", "512"]).validate().unwrap();
+}
+
+#[test]
 fn bounded_reader_preserves_exact_bytes_and_stops_after_one_over_limit() {
     let original = "  é\n上海\r\n";
     assert_eq!(read_input(&mut Cursor::new(original.as_bytes()), original.len()).unwrap(), original);
