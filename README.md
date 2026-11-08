@@ -2495,6 +2495,16 @@ quality require separate evaluation. A successful answer may abstain with an
 explicitly uncalibrated signal. Native, budget or citation failure returns an
 error and never becomes a successful abstention.
 
+Explicit `summarize-semantic` and `answer-semantic` commands add a native
+faithfulness assessment for each complete summary bullet or answered question.
+They preserve the original source result and append a separate, explicitly
+uncalibrated same-model diagnostic. Review uses the complete original document
+or passages; it does not certify that a displayed citation alone supports its
+prose. All statement judges preflight before review inference and share one
+whole-request work allowance and deadline. See
+[INT4 summary and answer review](docs/source-semantic.md) for complete options,
+CLI examples, evidence scope, resource admission and the hosted API.
+
 Single-request `answer` reads a JSON object instead of plain document text:
 
 ```json

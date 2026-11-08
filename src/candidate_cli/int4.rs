@@ -22,6 +22,7 @@ mod extract_job;
 mod extract_map;
 mod extract_document_job;
 mod source;
+mod source_semantic;
 mod source_batch;
 mod source_job;
 mod source_map;
@@ -145,6 +146,7 @@ enum Int4Task {
     RedactDocument(redact::long::DocumentArgs),
     RedactCorpus(redact::long::corpus::CorpusArgs),
     Source(crate::candidate_cli::source::Kind, source::SourceArgs),
+    SourceSemantic(crate::candidate_cli::source::Kind, source_semantic::SemanticSourceArgs),
     SourceBatch(source_batch::BatchArgs),
     SourceMap(source_map::MapArgs),
     SourceCorpus(source_map::documents::CorpusArgs),
@@ -227,6 +229,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(redact::long::jobs::definition())
         .subcommand(compute::definition(input_encoding::definition(prefill::definition(extract::one_off_definition()))))
         .subcommand(semantic::definition())
+        .subcommands(source_semantic::definitions())
         .subcommand(compute::definition(extract_batch::definition()))
         .subcommand(extract_job::definition())
         .subcommand(extract_map::definition())
@@ -341,6 +344,10 @@ impl Int4Command {
             "redact-corpus" => Int4Task::RedactCorpus(redact::long::corpus::CorpusArgs::from_matches(matches)?),
             "extract" => Int4Task::Extract(extract::ExtractionArgs::from_matches_with_prefill(matches)?),
             "extract-semantic" => Int4Task::Semantic(semantic::SemanticArgs::from_matches(matches)?),
+            "summarize-semantic" | "answer-semantic" => Int4Task::SourceSemantic(
+                crate::candidate_cli::source::Kind::named(name.trim_end_matches("-semantic")).ok_or_else(||
+                    clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source semantic task refused"))?,
+                source_semantic::SemanticSourceArgs::from_matches(matches)?),
             "extract-batch" => Int4Task::ExtractBatch(extract_batch::BatchArgs::from_matches(matches)?),
             "extract-map" => Int4Task::ExtractMap(extract_map::MapArgs::from_matches(matches)?),
             "extract-corpus" => Int4Task::ExtractCorpus(extract_map::corpus::CorpusArgs::from_matches(matches)?),
@@ -474,6 +481,9 @@ impl Int4Command {
         if let Int4Task::Semantic(options) = self.task {
             return options.execute(self.args, input, output);
         }
+        if let Int4Task::SourceSemantic(kind, options) = self.task {
+            return options.execute(kind, self.args, input, output);
+        }
         if let Int4Task::Resolve(options) = self.task {
             return options.execute(self.args, input, output);
         }
@@ -490,7 +500,7 @@ impl Int4Command {
             Int4Task::Source(_, source) => source.validate_with_prefill(&self.args)?,
             // The blocking stream must own its input and writer through cleanup.
             Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::FaithfulnessMap(_) | Int4Task::FaithfulnessCorpus(_) | Int4Task::Semantic(_) | Int4Task::Resolve(_) | Int4Task::Sentiment(_) | Int4Task::SentimentMap(_) | Int4Task::SentimentCorpus(_) | Int4Task::ClassifyMap(_) | Int4Task::ClassifyCorpus(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ScoredBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)
-                | Int4Task::SourceCorpus(_) | Int4Task::AnswerCorpus(_) | Int4Task::ExtractCorpus(_) | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::ClassificationDocumentJob | Int4Task::SentimentDocumentJob | Int4Task::FaithfulnessDocumentJob | Int4Task::QuestionDocumentJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob => return Err(CandidateError::Arguments),
+                | Int4Task::SourceSemantic(..) | Int4Task::SourceCorpus(_) | Int4Task::AnswerCorpus(_) | Int4Task::ExtractCorpus(_) | Int4Task::TextJob | Int4Task::ExtractJob | Int4Task::ExtractDocumentJob | Int4Task::ScoredJob | Int4Task::ClassificationDocumentJob | Int4Task::SentimentDocumentJob | Int4Task::FaithfulnessDocumentJob | Int4Task::QuestionDocumentJob | Int4Task::SourceJob | Int4Task::DocumentJob | Int4Task::RedactJob => return Err(CandidateError::Arguments),
         };
         #[cfg(feature = "asupersync-runtime")]
         { runtime::execute_task(self.task, self.args, limits, input, output) }

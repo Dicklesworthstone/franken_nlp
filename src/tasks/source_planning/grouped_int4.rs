@@ -26,6 +26,7 @@ use crate::{
 pub mod capacity;
 pub mod cohort;
 pub mod long;
+pub mod semantic;
 mod model;
 pub use model::Int4SourcePlanner;
 
