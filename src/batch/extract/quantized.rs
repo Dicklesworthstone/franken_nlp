@@ -47,14 +47,27 @@ impl Int8ExtractionBatchPlanner {
     }
     pub fn prepare(&self, document: BatchDocument<ExtractionBatchArgs>) -> Result<PreparedInt8BatchExtraction, BatchItemFailure> {
         let input = self.compiler.prepare_input(document).map_err(planning_fault)?;
-        let ExtractionInput { task, source, schema, options, grounded, .. } = input;
+        self.prepare_from_input(input)
+    }
+    /// Explicit one-request encoding; schema and document spend one cumulative
+    /// tokenizer allowance and actual tokens determine the native work bound.
+    /// The caller admits the policy's workspace before preparation. Reusing
+    /// this planner for a stream, map or retained job keeps byte-fallback input.
+    pub fn prepare_with_document_encoding<C: DecodeStepControl>(&self,
+        document: BatchDocument<ExtractionBatchArgs>, policy: &UntrustedEncoding, control: &mut C,
+    ) -> Result<PreparedInt8BatchExtraction, BatchItemFailure> {
+        let input = self.compiler.prepare_input_with_encoding(document, policy,
+            &mut || control.prefill_checkpoint(0)).map_err(planning_fault)?;
+        let result = self.prepare_from_input(input);
+        preparation_checkpoint(control)?;
+        result
+    }
+    fn prepare_from_input(&self, input: ExtractionInput) -> Result<PreparedInt8BatchExtraction, BatchItemFailure> {
+        let ExtractionInput { task, source, schema, options, grounded, encoding, .. } = input;
         let c = &self.compiler;
-        let plan = if grounded {
-            Int8ExtractPlan::from_task_plan_with_source(&task, &schema, options, c.compiler_limits,
-                &c.controls, &source, c.source_limits, c.identity.clone())
-        } else {
-            Int8ExtractPlan::from_task_plan(&task, &schema, options, c.compiler_limits, &c.controls, c.identity.clone())
-        }.map_err(planning_failure)?;
+        let plan = Int8ExtractPlan::from_builtin_with_encoding(&task, &schema, options, c.compiler_limits,
+            &c.controls, grounded.then_some((&source, c.source_limits)), "extract-v1", c.identity.clone(), &encoding)
+            .map_err(planning_failure)?;
         Ok(PreparedInt8BatchExtraction { plan, task, source })
     }
 }
@@ -301,7 +314,7 @@ fn preparation_checkpoint<C: DecodeStepControl>(control: &mut C) -> Result<(), B
     }
 }
 fn planning_fault(fault: BatchFault) -> BatchItemFailure {
-    if matches!(fault.code, BatchCode::Allocation | BatchCode::InvalidExecution | BatchCode::Admission | BatchCode::Serialization) {
+    if matches!(fault.code, BatchCode::Cancelled | BatchCode::Allocation | BatchCode::InvalidExecution | BatchCode::Admission | BatchCode::Serialization) {
         BatchItemFailure::fatal(fault)
     } else { BatchItemFailure::reject(fault) }
 }

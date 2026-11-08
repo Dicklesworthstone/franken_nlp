@@ -108,6 +108,12 @@ impl ExtractionArgs {
         self.validate_with_prefill(args)
     }
     pub(super) fn validate_with_prefill(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
+        // Composed workflows still rely on byte-based chunk capacity. Their
+        // shared argument type must not enable a policy they never bind.
+        if !args.input_encoding.is_default() { return Err(CandidateError::Arguments); }
+        self.validate_one_off_with_prefill(args)
+    }
+    pub(super) fn validate_one_off_with_prefill(&self, args: &Int4Args) -> Result<Int4Limits, CandidateError> {
         let _ = self.selected_rows()?;
         crate::candidate_cli::extract::check_schema_path(&self.schema)?;
         if !(1..=MAX_CONTENT_BYTES).contains(&self.max_result_bytes)
@@ -125,10 +131,35 @@ impl ExtractionArgs {
         // Covers the pinned vocabulary trie, bounded source-index preparation,
         // schema/IR copies and complete source-evidence/output staging. These
         // are declared reserves, not an operating-system RSS guarantee.
+        let max_prompt_tokens = args.context_tokens - args.max_new_tokens + 1;
+        let encoding_extra = self.encoding_workspace_extra(args, max_prompt_tokens)?;
         let extra = sum(&[128 * MIB, crate::candidate_cli::extract::SCHEMA_BYTES as u64 * 16,
-            self.max_result_bytes as u64 * 16, u64::from(self.max_grammar_states) * 32])?;
-        args.validate_storage_with_prefill(self.max_result_bytes, args.max_new_tokens,
-            args.context_tokens - args.max_new_tokens + 1, 0, extra)
+            self.max_result_bytes as u64 * 16, u64::from(self.max_grammar_states) * 32, encoding_extra])?;
+        args.validate_source_storage(self.max_result_bytes, args.max_new_tokens,
+            max_prompt_tokens, extra)
+    }
+    /// The exact schema and document are two untrusted segments in one prompt.
+    /// Their aggregate cap cannot exceed the tokenizer's complete-request
+    /// ceiling, even when the separately declared document cap is that large.
+    pub(super) fn encoding_policy(&self, args: &Int4Args, max_prompt_tokens: usize)
+        -> Result<crate::tokenizer::untrusted::UntrustedEncoding, CandidateError> {
+        let bytes = args.max_input_bytes.checked_add(crate::candidate_cli::extract::SCHEMA_BYTES)
+            .ok_or(CandidateError::Arguments)?
+            .min(crate::tokenizer::untrusted::SafeBpeLimits::MAX_INPUT_BYTES);
+        args.input_encoding.policy(bytes, max_prompt_tokens)
+    }
+    fn encoding_workspace_extra(&self, args: &Int4Args, max_prompt_tokens: usize)
+        -> Result<u64, CandidateError> {
+        use crate::tokenizer::untrusted::UntrustedEncoding;
+        let complete = match self.encoding_policy(args, max_prompt_tokens)? {
+            UntrustedEncoding::ByteFallback => 0,
+            UntrustedEncoding::SafeBpeV1(policy) => policy.requirements()
+                .map_err(|_| CandidateError::Arguments)?.workspace_bytes,
+        };
+        // Common admission already prices the document-only quote. Charge
+        // the remaining schema allowance exactly once, before either file IO.
+        complete.checked_sub(args.input_encoding.workspace_bytes(args.max_input_bytes, max_prompt_tokens)?)
+            .ok_or(CandidateError::Arguments)
     }
     pub(super) fn budget(&self, args: &Int4Args, limits: Int4Limits) -> TaskBudget {
         TaskBudget { max_input_tokens: limits.max_prompt_tokens as u32,
@@ -224,6 +255,7 @@ impl ExtractionArgs {
 mod tests {
     use super::*;
     mod selected;
+    mod encoding;
     fn command(extra: &[&str]) -> Int4Command {
         let mut argv = vec!["candidate", "source-int4", "extract", "--source-dir", "explicit-source",
             "--source-manifest", "explicit-manifest.json", "--memory-mib", "8192", "--schema", "schema.json"];

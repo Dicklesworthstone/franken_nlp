@@ -137,6 +137,10 @@ pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
+    let encoding = match &task {
+        Int4Task::Extract(options) => options.encoding_policy(&args, limits.max_prompt_tokens)?,
+        _ => args.input_encoding.policy(args.max_input_bytes, limits.max_prompt_tokens)?,
+    };
     let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
         runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
         max_blocking_coordinators: 1,
@@ -224,7 +228,6 @@ pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
     };
     // Completed retains the exact hosted output guard while Serialize borrows
     // its result. No unguarded JSON value or partially completed head escapes.
-    let encoding = args.input_encoding.policy(args.max_input_bytes, limits.max_prompt_tokens)?;
     let input_encoding = match &encoding {
         crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback => None,
         _ => Some(&encoding),
@@ -285,9 +288,10 @@ fn prepare(request: Input, model: &ResidentInt4, args: &Int4Args, limits: Int4Li
         Input::Extract { document, request, options } => {
             let planner = Int4ExtractionBatchPlanner::for_model(model.model_identity(), options.budget(args, limits),
                 options.compiler(), options.source_limits(), None).map_err(|_| CandidateError::Planning)?;
-            let prepared = planner.prepare_with_control(BatchDocument {
+            let encoding = options.encoding_policy(args, limits.max_prompt_tokens)?;
+            let prepared = planner.prepare_with_document_encoding(BatchDocument {
                 id: "cli".to_owned(), text: document, task_args: Some(request),
-            }, control).map_err(|error| match error.fault.cancellation {
+            }, &encoding, control).map_err(|error| match error.fault.cancellation {
                 Some(DecodeCancellationKind::Deadline | DecodeCancellationKind::Timeout) => CandidateError::Timeout,
                 Some(_) => CandidateError::Execution,
                 None => CandidateError::Planning,

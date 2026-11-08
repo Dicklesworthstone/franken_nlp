@@ -225,7 +225,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(redact::long::definition())
         .subcommand(redact::long::corpus::definition())
         .subcommand(redact::long::jobs::definition())
-        .subcommand(prefill::definition(extract::one_off_definition()))
+        .subcommand(input_encoding::definition(prefill::definition(extract::one_off_definition())))
         .subcommand(semantic::definition())
         .subcommand(extract_batch::definition())
         .subcommand(extract_job::definition())
@@ -367,7 +367,7 @@ impl Int4Command {
             _ => return Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source-int4 task refused")),
         };
         let mut args = Int4Args::from_arg_matches(matches)?;
-        if matches!(name, "generate" | "chat" | "classify" | "sentiment" | "ner" | "keyphrases" | "summarize" | "answer") {
+        if matches!(name, "generate" | "chat" | "classify" | "sentiment" | "extract" | "ner" | "keyphrases" | "summarize" | "answer") {
             args.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
         }
         if matches!(name, "generate" | "chat") {
@@ -484,7 +484,7 @@ impl Int4Command {
         let limits = match &self.task {
             Int4Task::Text(_) => self.args.validate_text_compute()?,
             Int4Task::Classify(scoring) => scoring.validate_one_off_with_prefill(&self.args)?,
-            Int4Task::Extract(extraction) => extraction.validate_with_prefill(&self.args)?,
+            Int4Task::Extract(extraction) => extraction.validate_one_off_with_prefill(&self.args)?,
             Int4Task::Source(_, source) => source.validate_with_prefill(&self.args)?,
             // The blocking stream must own its input and writer through cleanup.
             Int4Task::Stream(..) | Int4Task::ResolveCorpus(_) | Int4Task::RedactCorpus(_) | Int4Task::RedactDocument(_) | Int4Task::Redact(_) | Int4Task::Judge(_) | Int4Task::FaithfulnessMap(_) | Int4Task::FaithfulnessCorpus(_) | Int4Task::Semantic(_) | Int4Task::Resolve(_) | Int4Task::Sentiment(_) | Int4Task::SentimentMap(_) | Int4Task::SentimentCorpus(_) | Int4Task::ClassifyMap(_) | Int4Task::ClassifyCorpus(_) | Int4Task::ExtractBatch(_) | Int4Task::SourceBatch(_) | Int4Task::ScoredBatch(_) | Int4Task::ExtractMap(_) | Int4Task::SourceMap(_)

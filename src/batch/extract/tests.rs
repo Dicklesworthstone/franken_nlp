@@ -1,6 +1,7 @@
 //! Model-free extraction planning regressions. No native quality claims.
 use super::*;
 use crate::tokenizer::specials::ArchivedControlRegistries;
+mod encoding;
 fn budget() -> TaskBudget { TaskBudget { max_input_tokens: 4096, max_output_tokens: 64,
     max_output_bytes: 100000, max_grammar_states: 4096, max_kv_bytes: 1 << 30 } }
 fn planner() -> ExtractionBatchPlanner {

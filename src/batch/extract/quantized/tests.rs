@@ -1,6 +1,7 @@
 //! Real pinned prompt/schema planning plus private lifecycle fault injection.
 //! Synthetic native outputs below exercise transport ownership, not fidelity.
 use super::*;
+mod encoding;
 use std::{cell::Cell, io::{self, Cursor, Write}, rc::Rc};
 use crate::{
     native_engine::{constrained::JsonDecodeOutput, portable_int8::ProjectionWork,

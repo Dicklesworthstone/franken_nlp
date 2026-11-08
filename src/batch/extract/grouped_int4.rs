@@ -137,18 +137,34 @@ impl Int4ExtractionBatchPlanner {
             return Err(BatchItemFailure::reject(BatchCode::InvalidEnvelope));
         }
         let input = self.compiler.prepare_input(document).map_err(planning_fault)?;
-        let ExtractionInput { task, source, schema, options, grounded, .. } = input;
+        self.prepare_from_input(input)
+    }
+    /// Explicit one-request schema/source encoding. One nonrenewable ledger
+    /// spans both untrusted segments; selected-row planning remains independent.
+    /// The caller admits the policy's tokenizer workspace before preparation.
+    /// No encoding policy is installed in map, corpus or durable-job factories.
+    pub fn prepare_with_document_encoding<C: DecodeStepControl>(&self,
+        document: BatchDocument<ExtractionBatchArgs>, policy: &UntrustedEncoding, control: &mut C,
+    ) -> Result<PreparedInt4BatchExtraction, BatchItemFailure> {
+        checkpoint(control)?;
+        if self.shared_defaults_only && document.task_args.is_some() {
+            return Err(BatchItemFailure::reject(BatchCode::InvalidEnvelope));
+        }
+        let input = self.compiler.prepare_input_with_encoding(document, policy,
+            &mut || control.prefill_checkpoint(0)).map_err(planning_fault)?;
+        let result = self.prepare_from_input(input);
+        checkpoint(control)?;
+        result
+    }
+    fn prepare_from_input(&self, input: ExtractionInput) -> Result<PreparedInt4BatchExtraction, BatchItemFailure> {
+        let ExtractionInput { task, source, schema, options, grounded, encoding, .. } = input;
         let request_digest = extraction_request_digest(source.text(), &schema,
             if grounded { ExtractionBatchGrounding::SourceMembership } else { ExtractionBatchGrounding::Structural },
             *task.ir().budget()).map_err(BatchItemFailure::fatal)?;
         let c = &self.compiler;
-        let plan = if grounded {
-            Int4ExtractPlan::from_task_plan_with_source(&task, &schema, options, c.compiler_limits,
-                &c.controls, &source, c.source_limits, c.identity.clone(), self.group_width)
-        } else {
-            Int4ExtractPlan::from_task_plan(&task, &schema, options, c.compiler_limits,
-                &c.controls, c.identity.clone(), self.group_width)
-        }.map_err(planning_failure)?;
+        let plan = Int4ExtractPlan::from_builtin_with_encoding(&task, &schema, options, c.compiler_limits,
+            &c.controls, grounded.then_some((&source, c.source_limits)), "extract-v1", c.identity.clone(), self.group_width, &encoding)
+            .map_err(planning_failure)?;
         let plan = match self.selected_rows {
             Some(limits) => plan.with_selected_rows(limits).map_err(planning_failure)?,
             None => plan,
@@ -178,7 +194,7 @@ fn checkpoint<C: DecodeStepControl>(control: &mut C) -> Result<(), BatchItemFail
     Ok(())
 }
 fn planning_fault(fault: BatchFault) -> BatchItemFailure {
-    if matches!(fault.code, BatchCode::Allocation | BatchCode::InvalidExecution) { BatchItemFailure::fatal(fault) }
+    if matches!(fault.code, BatchCode::Cancelled | BatchCode::Allocation | BatchCode::InvalidExecution) { BatchItemFailure::fatal(fault) }
     else { BatchItemFailure::reject(fault) }
 }
 fn planning_failure(error: Int4ExtractError) -> BatchItemFailure {
@@ -196,6 +212,7 @@ fn planning_failure(error: Int4ExtractError) -> BatchItemFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod encoding;
     mod selected;
     use crate::{artifact::converter::PINNED_REVISION,
         native_engine::{decode::DecodeCancellationKind, generation::grouped_int4::INT4_SOURCE_FORMAT,

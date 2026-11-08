@@ -26,6 +26,7 @@ use crate::{
         embedded::{EmbeddedTokenizer, PINNED_TOKENIZER_MODEL_BYTES, PINNED_ADDED_TOKENS_BYTES,
             PINNED_TOKENIZER_CONFIG_BYTES, PINNED_SPECIAL_TOKENS_MAP_BYTES},
         specials::TemplateControlIds,
+        untrusted::UntrustedEncoding,
     },
 };
 use super::ir::{DecodeStrategy, DependencyScope, FinitePostcondition, GrammarReference, PromptSegmentKind, ScoreSpace, TaskIR, TaskPlan};
@@ -154,10 +155,28 @@ impl ExtractPlan {
     }
 
     pub(crate) fn from_builtin(
+        task: &TaskPlan, schema_source: &str, options: JsonDecodeOptions,
+        limits: CompileLimits, controls: &TemplateControlIds,
+        source: Option<(&SourceDocument, SourceRuntimeLimits)>, task_identity: &'static str,
+    ) -> Result<Self, ExtractError> {
+        let encoding = source.map(|(document, _)| document.document_encoding().clone()).unwrap_or_default();
+        Self::from_builtin_with_encoding(task, schema_source, options, limits, controls, source, task_identity, &encoding)
+    }
+
+    /// The raw-text compiler supplies the policy used by both untrusted schema
+    /// and source segments. It is sealed before any native profile wraps this
+    /// plan. Legacy trusted TaskIR construction retains its byte policy.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_builtin_with_encoding(
         task: &TaskPlan, schema_source: &str, mut options: JsonDecodeOptions,
         mut limits: CompileLimits, controls: &TemplateControlIds,
         source: Option<(&SourceDocument, SourceRuntimeLimits)>, task_identity: &'static str,
+        encoding: &UntrustedEncoding,
     ) -> Result<Self, ExtractError> {
+        encoding.validate().map_err(|_| ExtractError::Contract("invalid extraction document encoding policy"))?;
+        if source.is_some_and(|(document, _)| document.document_encoding() != encoding) {
+            return Err(ExtractError::Contract("source encoding differs from extraction policy"));
+        }
         let ir = task.ir();
         ir.validate().map_err(|_| ExtractError::Contract("invalid TaskIR"))?;
         if !matches!(task_identity, "extract-v1" | "ner-v1" | "keyphrases-v1" | "summarize-v1" | "answer-v1")
@@ -221,6 +240,11 @@ impl ExtractPlan {
         let mut policy_digest = policy_digest(&options, limits, controls.ids())?;
         if let Some(source_limits) = program.source_limits() {
             policy_digest = grounded::source_policy_digest(policy_digest, source_limits)?;
+        }
+        if !matches!(encoding, UntrustedEncoding::ByteFallback) {
+            policy_digest = Sha256Digest::of_bytes(&canonjson::canonical_bytes(&(
+                "extract-schema-and-document-encoding-v1", policy_digest, encoding,
+            )).map_err(|_| ExtractError::Serialization)?);
         }
         let taskir_digest = ir.digest().map_err(|_| ExtractError::Serialization)?;
         let prompt_digest = Sha256Digest::of_bytes(&canonjson::canonical_bytes(ir.prompt_segments()).map_err(|_| ExtractError::Serialization)?);

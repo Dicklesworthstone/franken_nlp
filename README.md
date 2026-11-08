@@ -364,7 +364,7 @@ checkpoint. The serial default remains the rollback selector.
 
 ## Explicit bounded BPE input for candidate INT4 tasks
 
-`fnlp candidate source-int4 generate`, `chat`, `classify`, `sentiment`, `ner`, `keyphrases`,
+`fnlp candidate source-int4 generate`, `chat`, `classify`, `sentiment`, `extract`, `ner`, `keyphrases`,
 `summarize`, `answer`, `stream generate|chat`, `text-batch` and `text-corpus`
 accept `--input-encoding safe-bpe-v1`. The existing default is `byte-fallback`, which
 uses one token per input byte. The explicit BPE policy can use ordinary
@@ -405,7 +405,7 @@ included in preparation admission before document or model IO. Cancellation
 and deadline checks run inside bounded encoding intervals. Long inputs may
 need a larger explicit work cap even when their final tokens fit the context.
 
-The selected policy and all its limits enter the template execution identity
+The selected policy and all its limits enter the execution identity
 and appear in `input_encoding` on the completed candidate response. Token
 streams declare the policy in `run_start.data.input_encoding`; a final
 `run_complete` is still required. Batch windows declare it on their completed
@@ -426,6 +426,30 @@ fnlp candidate source-int4 text-corpus prompts.ndjson \
   --expected-model-sha256 "$MODEL_SHA256" --memory-mib 8192 \
   --input-encoding safe-bpe-v1 --cohort-rows 4 --max-records 100
 ```
+
+One-off `extract` applies compact encoding to both the exact declarative schema
+and original source, sharing one tokenizer-work allowance. The grammar compiler
+and independent validator still consume the original schema bytes, including
+exact decimal literals. Source-membership fields retain original UTF-8 bytes and
+all matching offsets; schema property names never become citation evidence.
+Actual encoded tokens plus the full trusted scaffold and reserved output must
+fit context. Compact input can combine with `--source-membership`, exact
+`--max-selected-rows`, or `--prefill-rows` under their existing limits.
+
+```bash
+fnlp candidate source-int4 extract document.txt --schema extraction.schema.json \
+  --snapshot nanbeige.int4.snapshot --expected-model-sha256 "$MODEL_SHA256" \
+  --memory-mib 8192 --input-encoding safe-bpe-v1 --max-selected-rows 4096
+```
+
+Extraction admits one workspace for the declared document cap plus the 64-KiB
+schema allowance, bounded by the tokenizer's one-MiB combined-input ceiling.
+That aggregate policy is reported in `input_encoding`; its byte, token and pair
+work limits cover both segments. A source near one MiB leaves correspondingly
+less room for its schema. Library callers use the explicit one-request
+`prepare_with_document_encoding(document, policy, control)` method on the
+eager, INT8 or INT4 extraction batch planner. Reusing that planner through its
+ordinary batch/map/job methods preserves byte-fallback planning.
 
 One-off `classify` and `sentiment` apply the same explicit policy before native
 planning. Classification encodes the original document once and each canonical

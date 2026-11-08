@@ -86,11 +86,19 @@ impl Int8ExtractPlan {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_builtin(task: &TaskPlan, schema: &str, options: JsonDecodeOptions,
         limits: CompileLimits, controls: &TemplateControlIds, source: Option<(&SourceDocument, SourceRuntimeLimits)>,
-        task_identity: &'static str, mut identity: ExecutionIdentity) -> Result<Self, Int8ExtractError> {
+        task_identity: &'static str, identity: ExecutionIdentity) -> Result<Self, Int8ExtractError> {
+        let encoding = source.map(|(document, _)| document.document_encoding().clone()).unwrap_or_default();
+        Self::from_builtin_with_encoding(task, schema, options, limits, controls, source, task_identity, identity, &encoding)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_builtin_with_encoding(task: &TaskPlan, schema: &str, options: JsonDecodeOptions,
+        limits: CompileLimits, controls: &TemplateControlIds, source: Option<(&SourceDocument, SourceRuntimeLimits)>,
+        task_identity: &'static str, mut identity: ExecutionIdentity, encoding: &UntrustedEncoding) -> Result<Self, Int8ExtractError> {
         // Refuse wrong profiles before source copies or grammar allocation.
         constrained_int8::check_profile(&identity)?;
         if identity.task_spec != task_identity { return Err(Int8ExtractError::Identity); }
-        let extraction = ExtractPlan::from_builtin(task, schema, options, limits, controls, source, task_identity)?;
+        let extraction = ExtractPlan::from_builtin_with_encoding(task, schema, options, limits, controls, source, task_identity, encoding)?;
         let work = constrained_int8::planned_work(extraction.prompt.len(), extraction.options.max_new_tokens)?;
         identity.taskir_digest = extraction.taskir_digest;
         identity.prompt_digest = extraction.prompt_digest;

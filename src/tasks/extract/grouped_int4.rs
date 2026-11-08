@@ -87,13 +87,22 @@ impl Int4ExtractPlan {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_builtin(task: &TaskPlan, schema: &str, options: JsonDecodeOptions, limits: CompileLimits,
         controls: &TemplateControlIds, source: Option<(&SourceDocument, SourceRuntimeLimits)>,
-        task_identity: &'static str, mut identity: ExecutionIdentity, group_width: usize) -> Result<Self, Int4ExtractError> {
+        task_identity: &'static str, identity: ExecutionIdentity, group_width: usize) -> Result<Self, Int4ExtractError> {
+        let encoding = source.map(|(document, _)| document.document_encoding().clone()).unwrap_or_default();
+        Self::from_builtin_with_encoding(task, schema, options, limits, controls, source, task_identity, identity, group_width, &encoding)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_builtin_with_encoding(task: &TaskPlan, schema: &str, options: JsonDecodeOptions, limits: CompileLimits,
+        controls: &TemplateControlIds, source: Option<(&SourceDocument, SourceRuntimeLimits)>,
+        task_identity: &'static str, mut identity: ExecutionIdentity, group_width: usize,
+        encoding: &UntrustedEncoding) -> Result<Self, Int4ExtractError> {
         // Refuse profile, candidate namespace and group mismatch BEFORE any
         // source copies or grammar construction. Model identity is rechecked
         // against actual resident weights by the native execution boundary.
         constrained_int4::check_profile(&identity, group_width)?;
         if identity.task_spec != task_identity { return Err(Int4ExtractError::Identity); }
-        let extraction = ExtractPlan::from_builtin(task, schema, options, limits, controls, source, task_identity)?;
+        let extraction = ExtractPlan::from_builtin_with_encoding(task, schema, options, limits, controls, source, task_identity, encoding)?;
         let work = constrained_int4::planned_work(group_width, extraction.prompt.len(), extraction.options.max_new_tokens)?;
         identity.taskir_digest = extraction.taskir_digest;
         identity.prompt_digest = extraction.prompt_digest;

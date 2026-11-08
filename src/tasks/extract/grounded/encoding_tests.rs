@@ -89,3 +89,37 @@ fn cancellation_inside_encoding_and_before_document_return_preserves_every_kind(
         }
     }
 }
+
+#[test]
+fn schema_and_evidence_source_spend_the_same_four_axis_encoding_ledger() {
+    let encoder = encoder(UntrustedEncoding::ByteFallback);
+    let schema = r#"{"type":"string","description":"The quick brown fox jumps over the lazy dog."}"#;
+    let policy = UntrustedEncoding::SafeBpeV1(limits());
+    let untrusted = UntrustedDocumentEncoder::new(encoder.tokenizer.tokenizer(), &encoder.controls);
+    let mut schema_work = SafeBpeWork::default();
+    untrusted.encode_with_policy(schema.as_bytes(), &policy, &mut schema_work, &mut || true).unwrap();
+    let mut source_work = SafeBpeWork::default();
+    untrusted.encode_with_policy(SOURCE.as_bytes(), &policy, &mut source_work, &mut || true).unwrap();
+    let exact = SafeBpeLimits {
+        max_input_bytes: schema_work.input_bytes() + source_work.input_bytes(),
+        max_output_tokens: schema_work.output_tokens() + source_work.output_tokens(),
+        max_pair_checks: schema_work.pair_checks() + source_work.pair_checks(),
+        max_pair_bytes: schema_work.pair_bytes() + source_work.pair_bytes(),
+    };
+    let (schema_document, evidence) = encoder.encode_schema_and_source_with_control(schema, SOURCE,
+        &UntrustedEncoding::SafeBpeV1(exact), 8192, 8192, &mut || None).unwrap();
+    assert_eq!(schema_document.text(), schema); assert_eq!(evidence.text(), SOURCE);
+    assert_eq!(evidence.context_token_ids().len(), 0);
+    for axis in 0..4 {
+        let mut short = exact;
+        match axis { 0 => short.max_input_bytes -= 1, 1 => short.max_output_tokens -= 1,
+            2 => short.max_pair_checks -= 1, _ => short.max_pair_bytes -= 1 }
+        // Each segment fits separately: refusal must come from cumulative work.
+        let short = UntrustedEncoding::SafeBpeV1(short);
+        for bytes in [schema.as_bytes(), SOURCE.as_bytes()] {
+            untrusted.encode_with_policy(bytes, &short, &mut SafeBpeWork::default(), &mut || true).unwrap();
+        }
+        assert!(encoder.encode_schema_and_source_with_control(schema, SOURCE, &short, 8192, 8192, &mut || None).is_err());
+    }
+    assert_eq!(encoder.document_encoding(), &UntrustedEncoding::ByteFallback);
+}

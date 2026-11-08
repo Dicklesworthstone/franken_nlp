@@ -13,7 +13,8 @@ use crate::{
             PromptSegment, PromptSegmentKind, TaskBudget, TaskIR, TaskPlan}},
     template::{Conversation, Message, MessageRole, RenderOptions, TemplateBuilder, ToolFormat, IM_START, IM_END, THINK_START, THINK_END},
     tokenizer::{bpe::EncodeOptions, embedded::{EmbeddedTokenizer, PINNED_TOKENIZER_MODEL_BYTES,
-        PINNED_ADDED_TOKENS_BYTES, PINNED_TOKENIZER_CONFIG_BYTES, PINNED_SPECIAL_TOKENS_MAP_BYTES}, specials::TemplateControlIds},
+        PINNED_ADDED_TOKENS_BYTES, PINNED_TOKENIZER_CONFIG_BYTES, PINNED_SPECIAL_TOKENS_MAP_BYTES}, specials::TemplateControlIds,
+        untrusted::UntrustedEncoding},
 };
 use super::*;
 /// Shared embedding admission and result-ownership surfaces for both families.
@@ -161,15 +162,31 @@ impl ExtractionBatchPlanner {
             compiler_limits, source_limits, defaults, eos })
     }
     pub fn prepare(&self, document: BatchDocument<ExtractionBatchArgs>) -> Result<PreparedBatchExtraction, BatchItemFailure> {
-        self.prepare_inner(document).map_err(|fault| if matches!(fault.code, BatchCode::Allocation | BatchCode::InvalidExecution) {
-            BatchItemFailure::fatal(fault)
-        } else { BatchItemFailure { fault, stop: false } })
+        self.prepare_inner(document).map_err(extraction_planning_fault)
+    }
+    /// Prepare ONE complete extraction with an explicit untrusted-input policy.
+    /// The original control covers schema/source encoding and final sealing;
+    /// one work ledger covers both untrusted segments. The host admits the
+    /// policy's tokenizer workspace before calling. This does not configure
+    /// batch, map or job byte-capacity probing on this reusable planner.
+    pub fn prepare_with_document_encoding<C: DecodeStepControl>(&self,
+        document: BatchDocument<ExtractionBatchArgs>, policy: &UntrustedEncoding, control: &mut C,
+    ) -> Result<PreparedBatchExtraction, BatchItemFailure> {
+        let input = self.prepare_input_with_encoding(document, policy, &mut || control.prefill_checkpoint(0))
+            .map_err(extraction_planning_fault)?;
+        let result = self.prepare_from_input(input).map_err(extraction_planning_fault);
+        if let Some(cause) = control.prefill_checkpoint(0) {
+            return Err(BatchItemFailure::fatal(BatchFault::cancelled(cause)));
+        }
+        result
     }
     fn prepare_inner(&self, document: BatchDocument<ExtractionBatchArgs>) -> Result<PreparedBatchExtraction, BatchFault> {
-        let ExtractionInput { task, source, schema, options, grounded, prompt_tokens } = self.prepare_input(document)?;
-        let plan = if grounded {
-            ExtractPlan::from_task_plan_with_source(&task, &schema, options, self.compiler_limits, &self.controls, &source, self.source_limits)
-        } else { ExtractPlan::from_task_plan(&task, &schema, options, self.compiler_limits, &self.controls) }
+        self.prepare_from_input(self.prepare_input(document)?)
+    }
+    fn prepare_from_input(&self, input: ExtractionInput) -> Result<PreparedBatchExtraction, BatchFault> {
+        let ExtractionInput { task, source, schema, options, grounded, prompt_tokens, encoding } = input;
+        let plan = ExtractPlan::from_builtin_with_encoding(&task, &schema, options, self.compiler_limits,
+            &self.controls, grounded.then_some((&source, self.source_limits)), "extract-v1", &encoding)
             .map_err(|e| if matches!(e, ExtractError::AllocationRefused) { BatchCode::Allocation } else { BatchCode::Planning })?;
         let identity = plan.bind_identity(self.identity.clone()).map_err(|_| BatchCode::Admission)?;
         // Universal decoder currently projects every prompt/continuation
@@ -182,6 +199,13 @@ impl ExtractionBatchPlanner {
     // Only raw prompt/schema/source construction is shared. Each backend
     // separately seals its own executable plan, policy and work accounting.
     fn prepare_input(&self, document: BatchDocument<ExtractionBatchArgs>) -> Result<ExtractionInput, BatchFault> {
+        self.prepare_input_with_encoding(document, &UntrustedEncoding::ByteFallback, &mut || None)
+    }
+    fn prepare_input_with_encoding<F: FnMut() -> Option<crate::native_engine::decode::DecodeCancellationKind>>(
+        &self, document: BatchDocument<ExtractionBatchArgs>, policy: &UntrustedEncoding, checkpoint: &mut F,
+    ) -> Result<ExtractionInput, BatchFault> {
+        if let Some(cause) = checkpoint() { return Err(BatchFault::cancelled(cause)); }
+        policy.validate().map_err(|_| BatchCode::InvalidLimits)?;
         let args = document.task_args.or_else(|| self.defaults.clone()).ok_or(BatchCode::Planning)?;
         let b = args.budget; let c = self.ceiling;
         b.validate().map_err(|_| BatchCode::Planning)?;
@@ -189,12 +213,22 @@ impl ExtractionBatchPlanner {
             || b.max_output_bytes > c.max_output_bytes || b.max_grammar_states > c.max_grammar_states || b.max_kv_bytes > c.max_kv_bytes
             || args.schema.len() > self.compiler_limits.max_schema_bytes { return Err(BatchCode::Planning.into()); }
         let overhead = self.fragments.iter().try_fold(0_usize, |n, f| n.checked_add(f.len()).ok_or(BatchCode::Planning))?;
-        let prompt = overhead.checked_add(args.schema.len()).and_then(|n| n.checked_add(document.text.len())).ok_or(BatchCode::Planning)?;
+        let untrusted_tokens = (b.max_input_tokens as usize).checked_sub(overhead).ok_or(BatchCode::Planning)?;
+        let input_bytes = match policy {
+            UntrustedEncoding::ByteFallback => untrusted_tokens,
+            UntrustedEncoding::SafeBpeV1(limits) => limits.max_input_bytes,
+        };
+        let (schema, source) = self.encoder.encode_schema_and_source_with_control(&args.schema,
+            &document.text, policy, input_bytes, untrusted_tokens, checkpoint).map_err(|error| match error {
+                ExtractError::Decode(JsonDecodeError::Cancelled(cause)) => BatchFault::cancelled(cause),
+                ExtractError::AllocationRefused => BatchCode::Allocation.into(),
+                _ => BatchCode::Planning.into(),
+            })?;
+        let prompt = overhead.checked_add(schema.token_ids().len()).and_then(|n| n.checked_add(source.token_ids().len()))
+            .ok_or(BatchCode::Planning)?;
         if prompt > b.max_input_tokens as usize { return Err(BatchCode::Planning.into()); }
-        let source = self.encoder.encode(&document.text, b.max_input_tokens as usize, b.max_input_tokens as usize).map_err(|_| BatchCode::Planning)?;
-        let schema = self.encoder.encode(&args.schema, self.compiler_limits.max_schema_bytes, b.max_input_tokens as usize).map_err(|_| BatchCode::Planning)?;
         // The schema is the caller-authorized declarative TASK configuration,
-        // not a second source document. It is still byte-fallback encoded so
+        // not a second source document. It is control-excluding encoded so
         // even hostile property names cannot contribute role/control IDs. No
         // schema or document bytes were passed to the trusted template renderer.
         let segments = vec![
@@ -215,7 +249,9 @@ impl ExtractionBatchPlanner {
         let context = PlanContext::new(&self.identity, self.ceiling).map_err(|_| BatchCode::Admission)?;
         let task = TaskPlan::new(BuiltInTask::Extract.spec(), &context, ir).map_err(|_| BatchCode::Planning)?;
         let options = JsonDecodeOptions { max_new_tokens: b.max_output_tokens as usize, eos_token_id: self.eos, excluded_token_ids: Default::default() };
-        Ok(ExtractionInput { task, source, schema: args.schema, options, grounded, prompt_tokens: prompt as u64 })
+        if let Some(cause) = checkpoint() { return Err(BatchFault::cancelled(cause)); }
+        Ok(ExtractionInput { task, source, schema: args.schema, options, grounded, prompt_tokens: prompt as u64,
+            encoding: policy.clone() })
     }
 }
 
@@ -223,7 +259,13 @@ impl ExtractionBatchPlanner {
 enum ExtractionBackend { Eager, Int8, Int4 { group_width: usize } }
 struct ExtractionInput {
     task: TaskPlan, source: SourceDocument, schema: String, options: JsonDecodeOptions,
-    grounded: bool, prompt_tokens: u64,
+    grounded: bool, prompt_tokens: u64, encoding: UntrustedEncoding,
+}
+
+fn extraction_planning_fault(fault: BatchFault) -> BatchItemFailure {
+    if matches!(fault.code, BatchCode::Cancelled | BatchCode::Allocation | BatchCode::InvalidExecution) {
+        BatchItemFailure::fatal(fault)
+    } else { BatchItemFailure::reject(fault) }
 }
 
 /// Independent nonrenewable mask-work allowance. It survives flush epochs,

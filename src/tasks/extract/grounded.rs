@@ -45,6 +45,60 @@ impl SourceDocumentEncoder {
         Ok(())
     }
 
+    /// Encode the declarative schema and its evidence source with one request
+    /// ledger. The schema remains separate task data: its bytes never enter
+    /// the source language or authorize a citation. This explicit policy
+    /// does not change the encoder used by composed byte-capacity planners.
+    pub(crate) fn encode_schema_and_source_with_control<F: FnMut() -> Option<DecodeCancellationKind>>(
+        &self, schema: &str, text: &str, policy: &UntrustedEncoding,
+        max_bytes: usize, max_tokens: usize, checkpoint: &mut F,
+    ) -> Result<(SourceDocument, SourceDocument), ExtractError> {
+        encoding_checkpoint(checkpoint)?;
+        policy.validate().map_err(|_| ExtractError::Contract("invalid extraction document encoding policy"))?;
+        let total = schema.len().checked_add(text.len()).ok_or(ExtractError::AllocationRefused)?;
+        let byte_limit = match policy {
+            UntrustedEncoding::ByteFallback => max_bytes.min(max_tokens),
+            UntrustedEncoding::SafeBpeV1(limits) => max_bytes.min(limits.max_input_bytes),
+        };
+        if total > byte_limit {
+            return Err(ExtractError::Contract("schema and source exceed aggregate byte or token budget"));
+        }
+        let mut work = SafeBpeWork::default();
+        let schema = self.encode_part(schema, policy, &mut work, checkpoint)?;
+        if schema.ids().len() > max_tokens {
+            return Err(ExtractError::Contract("schema token budget exceeded"));
+        }
+        let source = self.encode_part(text, policy, &mut work, checkpoint)?;
+        let tokens = schema.ids().len().checked_add(source.ids().len()).ok_or(ExtractError::AllocationRefused)?;
+        if tokens > max_tokens {
+            return Err(ExtractError::Contract("schema and source exceed aggregate token budget"));
+        }
+        encoding_checkpoint(checkpoint)?;
+        let bind = |document: UntrustedDocument| SourceDocument {
+            token_count: document.ids().len(), input_bytes: document.bytes().len(),
+            document, context_documents: Vec::new(), control_digest: self.control_digest,
+            encoding: policy.clone(),
+        };
+        Ok((bind(schema), bind(source)))
+    }
+
+    fn encode_part<F: FnMut() -> Option<DecodeCancellationKind>>(&self, part: &str,
+        policy: &UntrustedEncoding, work: &mut SafeBpeWork, checkpoint: &mut F,
+    ) -> Result<UntrustedDocument, ExtractError> {
+        let encoder = UntrustedDocumentEncoder::new(self.tokenizer.tokenizer(), &self.controls);
+        let mut cancelled = None;
+        let result = encoder.encode_with_policy(part.as_bytes(), policy, work, &mut || {
+            cancelled = checkpoint();
+            cancelled.is_none()
+        });
+        if let Some(cause) = cancelled { return Err(ExtractError::Decode(JsonDecodeError::Cancelled(cause))); }
+        result.map_err(|error| match error {
+            UntrustedDocumentError::AllocationRefused => ExtractError::AllocationRefused,
+            UntrustedDocumentError::EncodingBudget { .. } => ExtractError::Contract("source encoding work budget exceeded"),
+            _ => ExtractError::Contract("source byte-preserving encoding refused"),
+        })
+    }
+
     /// Legacy byte-fallback entry point. Composed callers must not implicitly
     /// renew compact-encoding work for every chunk or tokenizer probe.
     pub fn encode(&self, text: &str, max_bytes: usize, max_tokens: usize) -> Result<SourceDocument, ExtractError> {
@@ -88,31 +142,17 @@ impl SourceDocumentEncoder {
         if total > byte_limit {
             return Err(ExtractError::Contract("source and context exceed aggregate byte or token budget"));
         }
-        let encoder = UntrustedDocumentEncoder::new(self.tokenizer.tokenizer(), &self.controls);
         let mut work = SafeBpeWork::default();
-        let mut encode = |part: &str| {
-            let mut cancelled = None;
-            let result = encoder.encode_with_policy(part.as_bytes(), &self.encoding, &mut work, &mut || {
-                cancelled = checkpoint();
-                cancelled.is_none()
-            });
-            if let Some(cause) = cancelled { return Err(ExtractError::Decode(JsonDecodeError::Cancelled(cause))); }
-            result.map_err(|error| match error {
-                UntrustedDocumentError::AllocationRefused => ExtractError::AllocationRefused,
-                UntrustedDocumentError::EncodingBudget { .. } => ExtractError::Contract("source encoding work budget exceeded"),
-                _ => ExtractError::Contract("source byte-preserving encoding refused"),
-            })
-        };
         let mut context_documents = Vec::new();
         context_documents.try_reserve_exact(contexts.len()).map_err(|_| ExtractError::AllocationRefused)?;
         let mut token_count = 0_usize;
         for context in contexts {
-            let encoded = encode(context)?;
+            let encoded = self.encode_part(context, &self.encoding, &mut work, checkpoint)?;
             token_count = token_count.checked_add(encoded.ids().len()).ok_or(ExtractError::AllocationRefused)?;
             if token_count > max_tokens { return Err(ExtractError::Contract("source context token budget exceeded")); }
             context_documents.push(encoded);
         }
-        let document = encode(text)?;
+        let document = self.encode_part(text, &self.encoding, &mut work, checkpoint)?;
         token_count = token_count.checked_add(document.ids().len()).ok_or(ExtractError::AllocationRefused)?;
         if token_count > max_tokens { return Err(ExtractError::Contract("source token budget exceeded")); }
         encoding_checkpoint(checkpoint)?;
@@ -308,5 +348,34 @@ mod tests {
             assert!(ids.iter().all(|&id| !r.template_controls().contains(id)));
         }
         assert!(plan(&task(&d, true), &d).is_ok());
+    }
+
+    #[test]
+    fn compact_source_retains_all_original_unicode_offsets_and_seals_its_exact_limits() {
+        use crate::tokenizer::untrusted::SafeBpeLimits;
+        let controls = registry();
+        let limits = SafeBpeLimits { max_input_bytes: 1024, max_output_tokens: 1024,
+            max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
+        let encoder = SourceDocumentEncoder::pinned(controls.template_controls()).unwrap()
+            .with_document_encoding(UntrustedEncoding::SafeBpeV1(limits)).unwrap();
+        let text = "é Alice 上海 Alice";
+        let source = encoder.encode_with_control(text, 1024, 1024, &mut || None).unwrap();
+        assert!(source.token_ids().len() < text.len());
+        let task = task(&source, true); let compact = plan(&task, &source).unwrap();
+        let result = compact.finalize(output("\"Alice\"")).unwrap();
+        assert_eq!(result.source_fields[0].spans.len(), 2);
+        for span in &result.source_fields[0].spans {
+            assert_eq!(&text[span.byte_start..span.byte_end], "Alice");
+            assert_eq!(text[..span.byte_start].chars().count(), span.scalar_start);
+            assert_eq!(text[..span.byte_end].chars().count(), span.scalar_end);
+        }
+        assert!(compact.finalize(output("\"Carol\"")).is_err());
+        let changed = encoder.with_document_encoding(UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+            max_pair_checks: limits.max_pair_checks - 1, ..limits
+        })).unwrap().encode_with_control(text, 1024, 1024, &mut || None).unwrap();
+        assert_eq!(source.token_ids(), changed.token_ids());
+        let other = plan(&task, &changed).unwrap();
+        assert_ne!(compact.bind_identity(identity()).unwrap().decision_policy_digest,
+            other.bind_identity(identity()).unwrap().decision_policy_digest);
     }
 }
