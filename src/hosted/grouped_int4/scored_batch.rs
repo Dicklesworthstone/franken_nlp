@@ -40,7 +40,10 @@ impl NlpEngine {
             return Err(HostedError::ModelIdentity);
         }
         let work = planner.limits();
-        let required = requirements(model.model_identity().group_width(), work, limits)?;
+        let mut required = requirements(model.model_identity().group_width(), work, limits)?;
+        // One compiler call is active at a time. Retained plans and transport
+        // stay charged while this additional bounded encoder workspace is used.
+        required.input_bytes = sum(&[required.input_bytes, planner.encoding_workspace_bytes()])?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(StreamInput { planner: Some(planner), reader, writer }))?;

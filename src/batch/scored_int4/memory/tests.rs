@@ -42,6 +42,27 @@ fn one_lookahead_is_charged_even_when_the_window_is_full() {
 }
 
 #[test]
+fn compact_encoding_prices_one_transient_workspace_beside_every_retained_plan() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    let limits = SafeBpeLimits { max_input_bytes: 4096, max_output_tokens: 1024,
+        max_pair_checks: 100_000, max_pair_bytes: 1_000_000 };
+    let encoding = UntrustedEncoding::SafeBpeV1(limits);
+    let workspace = limits.requirements().unwrap().workspace_bytes;
+    for documents in [1, 3, 16] {
+        let cfg = Int4ScoredCohortMemoryLimits { max_documents: documents, ..config() };
+        let byte = cfg.requirements(32, work(32), BatchLimits::default()).unwrap();
+        let compact = cfg.requirements_with_document_encoding(32, work(32), BatchLimits::default(), &encoding).unwrap();
+        assert_eq!(compact.input_bytes - byte.input_bytes, workspace);
+        assert_eq!(compact.native, byte.native);
+        assert_eq!(compact.workspace_bytes, byte.workspace_bytes);
+        assert_eq!(compact.output_reservation_bytes, byte.output_reservation_bytes);
+        assert_eq!(compact.task_workspace_bytes, byte.task_workspace_bytes);
+    }
+    let invalid = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_pair_checks: 0, ..limits });
+    assert!(config().requirements_with_document_encoding(32, work(32), BatchLimits::default(), &invalid).is_err());
+}
+
+#[test]
 fn retained_results_and_each_guard_survive_all_delivery() {
     let cfg = config(); let transport = BatchLimits::default();
     let required = cfg.requirements(3, work(3), transport).unwrap();

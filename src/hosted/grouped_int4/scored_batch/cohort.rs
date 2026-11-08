@@ -16,13 +16,22 @@ impl Int4ScoredCohortHostLimits {
     /// Shared with CLI admission even when the runtime feature is disabled.
     pub fn requirements(self, group_width: usize, work: Int4ScoredBatchLimits,
         limits: CorpusLimits) -> Result<Int4ScoredCohortMemoryRequirement, HostedError> {
+        self.requirements_with_document_encoding(group_width, work, limits,
+            &crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback)
+    }
+    /// Same declared native window with one additional transient encoder,
+    /// alongside all retained document preparations and lookahead.
+    pub fn requirements_with_document_encoding(self, group_width: usize, work: Int4ScoredBatchLimits,
+        limits: CorpusLimits, encoding: &crate::tokenizer::untrusted::UntrustedEncoding)
+        -> Result<Int4ScoredCohortMemoryRequirement, HostedError> {
         limits.native.run.validate()?;
         Int4ScoredCohortMemoryLimits { max_documents: self.max_documents,
             max_heads: self.max_heads, context_tokens: limits.native.context_tokens,
             preparation_reserve_bytes: limits.preparation_reserve_bytes,
             io_reserve_bytes: limits.io_reserve_bytes,
             allocator_reserve_bytes: limits.native.allocator_reserve_bytes,
-        }.requirements(group_width, work, limits.transport).map_err(HostedError::BatchSetup)
+        }.requirements_with_document_encoding(group_width, work, limits.transport, encoding)
+            .map_err(HostedError::BatchSetup)
     }
 }
 
@@ -58,7 +67,8 @@ impl NlpEngine {
             return Err(HostedError::ModelIdentity);
         }
         let work = planner.limits();
-        let required = cohorts.requirements(planner.group_width(), work, limits)?;
+        let required = cohorts.requirements_with_document_encoding(planner.group_width(), work,
+            limits, planner.document_encoding())?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(StreamInput { planner: Some(planner), reader, writer }))?;

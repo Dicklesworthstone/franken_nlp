@@ -29,6 +29,7 @@ pub trait Int4ScoredTask: sealed::Sealed + Send + 'static {
     type Output: Serialize + Send + 'static;
     const TASK: &'static str;
     fn base_identity(&self) -> &ExecutionIdentity;
+    fn document_encoding(&self) -> &UntrustedEncoding { &UntrustedEncoding::ByteFallback }
     fn group_width(&self) -> usize;
     fn plan_document<C: DecodeStepControl>(&self, text: String, args: Self::Args, control: &mut C)
         -> Result<Self::Plan, BatchItemFailure>;
@@ -93,6 +94,7 @@ impl Int4ScoredTask for Int4ClassificationPlanner {
     type Plan = PreparedInt4Classification;
     type Output = Int4ClassificationRun;
     const TASK: &'static str = "classify-v1";
+    fn document_encoding(&self) -> &UntrustedEncoding { self.document_encoding() }
     fn plan_document<C: DecodeStepControl>(&self, text: String, args: Self::Args, control: &mut C)
         -> Result<Self::Plan, BatchItemFailure> {
         let request = ClassificationRequest { document: text, labels: args.labels, mode: args.mode,
@@ -108,6 +110,7 @@ impl Int4ScoredTask for Int4SentimentPlanner {
     type Plan = PreparedInt4Sentiment;
     type Output = Int4SentimentRun;
     const TASK: &'static str = "sentiment-v1";
+    fn document_encoding(&self) -> &UntrustedEncoding { self.document_encoding() }
     fn plan_document<C: DecodeStepControl>(&self, text: String, args: Self::Args, control: &mut C)
         -> Result<Self::Plan, BatchItemFailure> {
         let request = SentimentRequest { document: text, axes: args.axes, budget: args.budget };

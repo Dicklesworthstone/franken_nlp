@@ -54,7 +54,7 @@ struct StreamArgs {
 }
 
 pub(super) fn definition() -> clap::Command {
-    StreamArgs::augment_args(classify::definition().name("score-batch")
+    input_encoding::definition(StreamArgs::augment_args(classify::definition().name("score-batch")
         .about("Classify, score sentiment or judge ordered NDJSON with one resident INT4 model")
         .long_about("Run one fixed finite-scoring task over bounded ordered {id,text,task_args?} NDJSON, with exact {\"flush\":true} controls. --task selects classify, sentiment or judge. --defaults supplies shared task data without a document, budget, model or execution identity; a non-null task_args replaces the complete defaults under the same host ceiling. Source conversion and independently digest-pinned snapshot loading share one resident model. Execution is serial unless --cohort-heads N explicitly groups complete documents' scoring heads in one bounded native layer-major cohort. --cohort-documents caps buffered document/error records; otherwise the head ceiling and aggregate output cap determine it. Interactive producers must fill a window or send a flush; there is no timer-driven partial-window execution. Every candidate includes terminal EOS and full-vocabulary scoring; classification scores every label, sentiment retains independent axes and one fixed run policy, and judgment preserves all pairwise orders, rubric criteria or faithfulness evidence. Every admitted cohort preflights before its first native forward; a document with more heads than the ceiling is rejected without serial fallback. All five work flags bound the ENTIRE RUN and never renew per item, cohort or flush; accepting more records grants no additional compute. Complete results and errors remain ordered. IDs reset only after a drained flush. Every event carries non-authoritative candidate provenance. Require run_complete AND exit 0 for whole-run success; earlier complete results survive later item failure. No generated-label shortcut, sampling, thinking, tools, durable resume, calibrated confidence or semantic-accuracy claim. Blocking IO is cooperative, not preemptible.")
         .mut_arg("cohort_heads", |arg| arg.hide(false)
@@ -68,6 +68,7 @@ pub(super) fn definition() -> clap::Command {
         .mut_arg("max_attention_pairs", |arg| arg.help("Whole-stream attention pair ceiling"))
         .mut_arg("max_dot_products", |arg| arg.help("Whole-stream actual grouped native dot-product ceiling"))
         .mut_arg("max_multiply_accumulates", |arg| arg.help("Whole-stream multiply-accumulate ceiling")))
+        .after_long_help("Classification and sentiment accept --input-encoding safe-bpe-v1. The entire document and its untrusted label metadata share one bounded tokenizer ledger per record; sentiment reuses its document across axes. Byte/token/pair ceilings never renew between segments of that record. One transient encoder workspace is admitted alongside every retained cohort plan and lookahead. The exact policy binds each prompt identity and appears on every candidate event, including flush and run_complete. Aggregate transport, native work and deadline limits still cover the whole stream; tokenizer work caps are per document, not a separate stream-global allowance. Judge remains byte-fallback because its evidence windows use byte-token indexing. Existing byte-fallback output remains unchanged."))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -78,6 +79,7 @@ pub(super) struct BatchLimits {
     pub output_bytes: u64,
     pub io_bytes: u64,
     pub preparation_reserve_bytes: u64,
+    pub encoding_workspace_bytes: u64,
     pub cohort: Option<CohortWindow>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,7 +93,11 @@ impl BatchArgs {
         ScoreTask::named(&self.stream.task).ok_or(CandidateError::Arguments)
     }
     pub(super) fn validate(&self, args: &Int4Args) -> Result<BatchLimits, CandidateError> {
-        self.kind()?;
+        let kind = self.kind()?;
+        if args.prefill()?.is_some() || args.compute.threads() != 1
+            || (kind == ScoreTask::Judge && !args.input_encoding.is_default()) {
+            return Err(CandidateError::Arguments);
+        }
         let stream = &self.stream;
         if !(1..=MAX_REQUESTS).contains(&stream.max_requests)
             || stream.max_line_bytes < args.max_input_bytes
@@ -103,7 +109,9 @@ impl BatchArgs {
         }
         // Keep hardware selection, source/snapshot exclusivity and scored-only
         // policy refusal ahead of defaults, document or model IO.
-        let mut common = self.scoring.validate_batch(args)?;
+        let mut common = self.scoring.validate_one_off_with_prefill(args)?;
+        let encoding = args.input_encoding.policy(args.max_input_bytes, common.max_prompt_tokens)?;
+        let encoding_workspace_bytes = args.input_encoding.workspace_bytes(args.max_input_bytes, common.max_prompt_tokens)?;
         let work = self.scoring.work_ceiling();
         let native = Int4ScoredBatchLimits { max_item_work: work, max_model_work: work };
         native.validate().map_err(|_| CandidateError::Arguments)?;
@@ -127,7 +135,7 @@ impl BatchArgs {
                 let corpus = sum(&[times(transport.max_line_bytes as u64, 8)?,
                     times(transport.max_output_line_bytes as u64, 4)?,
                     times(transport.max_epoch_ids as u64, 128)?, transport.max_epoch_id_bytes as u64,
-                    preparation_reserve_bytes, io_bytes])?;
+                    preparation_reserve_bytes, io_bytes, encoding_workspace_bytes])?;
                 // CLI preparation stays owned while the serial host reserves
                 // compiler/defaults, one plan, transport and staged output.
                 common.minimum_memory_bytes = sum(&[common.minimum_memory_bytes, corpus])?;
@@ -142,7 +150,8 @@ impl BatchArgs {
                     max_documents, max_heads, context_tokens: args.context_tokens,
                     preparation_reserve_bytes, io_reserve_bytes: io_bytes,
                     allocator_reserve_bytes: ALLOCATOR_BYTES,
-                }.requirements(args.group_width, native, transport).map_err(|_| CandidateError::Arguments)?;
+                }.requirements_with_document_encoding(args.group_width, native, transport, &encoding)
+                    .map_err(|_| CandidateError::Arguments)?;
                 let execution = sum(&[quote.native.kv_bytes, quote.workspace_bytes,
                     quote.input_bytes, quote.output_reservation_bytes])?;
                 common.native = quote.native;
@@ -152,7 +161,7 @@ impl BatchArgs {
         };
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(BatchLimits { common, transport, native, output_bytes: stream.max_total_output_bytes,
-            io_bytes, preparation_reserve_bytes, cohort })
+            io_bytes, preparation_reserve_bytes, encoding_workspace_bytes, cohort })
     }
     fn load_defaults(&self, text: Option<&str>, budget: TaskBudget, args: &Int4Args)
         -> Result<Defaults, CandidateError> {

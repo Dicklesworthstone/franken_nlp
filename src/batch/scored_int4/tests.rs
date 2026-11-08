@@ -9,6 +9,8 @@ use crate::{canonjson, artifact::converter::PINNED_REVISION,
         portable_int8::int4::convert::GROUPED_INT4_RECIPE, strict_int4::STRICT_INT4_EXECUTION},
     batch::{BatchLimits, run_ndjson}};
 
+mod encoding;
+
 fn work(units: u64) -> Int4Work {
     Int4Work { forward_positions: 40 * units, projected_logits: 50 * units, attention_pairs: 60 * units,
         projections: ProjectionWork { dot_products: 70 * units, multiply_accumulates: 80 * units } }
@@ -540,7 +542,7 @@ fn task_argument_schemas_reject_wire_identity_tokens_and_foreign_task_fields() {
             judge::PairwisePolicy}};
     fn closed<A: Serialize + serde::de::DeserializeOwned>(args: A) {
         let value = serde_json::to_value(args).unwrap(); assert!(serde_json::from_value::<A>(value.clone()).is_ok());
-        for field in ["execution_identity", "prompt_tokens", "request_seq", "foreign_task"] {
+        for field in ["execution_identity", "prompt_tokens", "request_seq", "foreign_task", "input_encoding"] {
             let mut value = value.clone(); value.as_object_mut().unwrap().insert(field.to_owned(), serde_json::json!(7));
             assert!(serde_json::from_value::<A>(value).is_err());
         }

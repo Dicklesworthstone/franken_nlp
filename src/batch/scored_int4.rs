@@ -10,6 +10,7 @@ use crate::{
         strict_int4::{Int4MemoryRequirement, Int4RunBudget, Int4Work, StrictInt4Engine,
             scoring::Int4ScoringBudget}},
     tasks::ir::TaskBudget,
+    tokenizer::untrusted::UntrustedEncoding,
 };
 use super::{BatchCode, BatchDocument, BatchFault, BatchItemFailure, BatchProcessor,
     BatchRequestContext, BatchWork, output::GuardedOutput};
@@ -51,18 +52,40 @@ pub struct Int4ScoredBatchPlanner<P: Int4ScoredTask> {
     planner: P,
     defaults: Option<P::Args>,
     limits: Int4ScoredBatchLimits,
+    encoding_workspace_bytes: u64,
     // An unforgeable in-process factory identity, not a digest or certificate.
     seal: Arc<()>,
 }
 impl<P: Int4ScoredTask> Int4ScoredBatchPlanner<P> {
+    /// Existing composed/durable callers retain their byte-fallback contract.
+    /// Compact streams use the explicit constructor and its workspace quote.
     pub fn new(planner: P, defaults: Option<P::Args>, limits: Int4ScoredBatchLimits) -> Result<Self, BatchFault> {
+        if planner.document_encoding() != &UntrustedEncoding::ByteFallback {
+            return Err(BatchCode::InvalidLimits.into());
+        }
+        Self::new_with_document_encoding(planner, defaults, limits)
+    }
+    /// Admit the selected single-document encoding of a classify/sentiment
+    /// compiler. Every document owns one cumulative segment ledger; this does
+    /// not grant a fresh native work allowance at a document or flush boundary.
+    /// Hosts reserve the quoted encoder workspace once alongside all retained
+    /// plans. The caller also prices compiler/defaults and plan storage.
+    pub fn new_with_document_encoding(planner: P, defaults: Option<P::Args>,
+        limits: Int4ScoredBatchLimits) -> Result<Self, BatchFault> {
         limits.validate()?;
+        let encoding_workspace_bytes = memory::encoding_workspace_bytes(planner.document_encoding())?;
+        if encoding_workspace_bytes != 0 && !matches!(P::TASK, "classify-v1" | "sentiment-v1") {
+            return Err(BatchCode::InvalidLimits.into());
+        }
         constrained_int4::check_profile(planner.base_identity(), planner.group_width())
             .map_err(|_| BatchCode::Admission)?;
         if planner.base_identity().task_spec != P::TASK { return Err(BatchCode::Admission.into()); }
-        Ok(Self { planner, defaults, limits, seal: Arc::new(()) })
+        Ok(Self { planner, defaults, limits, encoding_workspace_bytes, seal: Arc::new(()) })
     }
     pub fn base_execution_identity(&self) -> &ExecutionIdentity { self.planner.base_identity() }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { self.planner.document_encoding() }
+    /// Additional transient workspace, not multiplied by buffered documents.
+    pub fn encoding_workspace_bytes(&self) -> u64 { self.encoding_workspace_bytes }
     pub fn group_width(&self) -> usize { self.planner.group_width() }
     pub fn limits(&self) -> Int4ScoredBatchLimits { self.limits }
     fn prepare<C: DecodeStepControl>(&self, document: BatchDocument<P::Args>, control: &mut C)

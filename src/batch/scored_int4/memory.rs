@@ -3,7 +3,7 @@
 use super::{BatchCode, BatchFault, Int4ScoredBatchLimits, Int4MemoryRequirement};
 use crate::{batch::{BatchLimits, grouped::MAX_GROUP_RECORDS},
     native_engine::strict_int4::{cohort::MAX_INT4_SEQUENCES,
-        scoring::cohort::required_task_workspace_bytes}};
+        scoring::cohort::required_task_workspace_bytes}, tokenizer::untrusted::UntrustedEncoding};
 
 pub const MAX_COHORT_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -41,8 +41,17 @@ impl Int4ScoredCohortMemoryLimits {
     /// no implicit document-count reduction or unpriced lookahead is used.
     pub fn requirements(self, group_width: usize, work: Int4ScoredBatchLimits,
         transport: BatchLimits) -> Result<Int4ScoredCohortMemoryRequirement, BatchFault> {
+        self.requirements_with_document_encoding(group_width, work, transport, &UntrustedEncoding::ByteFallback)
+    }
+    /// Retained plans and one lookahead coexist with one transient encoder.
+    /// Per-document byte/token/pair limits are enforced by each compiler; the
+    /// native work allowance and transport limits still cover the whole run.
+    pub fn requirements_with_document_encoding(self, group_width: usize, work: Int4ScoredBatchLimits,
+        transport: BatchLimits, encoding: &UntrustedEncoding)
+        -> Result<Int4ScoredCohortMemoryRequirement, BatchFault> {
         work.validate()?;
         transport.validate()?;
+        let encoding_workspace = encoding_workspace_bytes(encoding)?;
         if !(1..=MAX_GROUP_RECORDS).contains(&self.max_documents)
             || !(1..=MAX_INT4_SEQUENCES).contains(&self.max_heads)
             || self.preparation_reserve_bytes == 0 || self.io_reserve_bytes == 0
@@ -65,7 +74,7 @@ impl Int4ScoredCohortMemoryLimits {
             multiply(transport.max_output_line_bytes as u64, 4)?,
             multiply(transport.max_epoch_ids as u64, 128)?, transport.max_epoch_id_bytes as u64,
             multiply(self.preparation_reserve_bytes, live_preparations)?,
-            self.io_reserve_bytes, task_workspace_bytes,
+            self.io_reserve_bytes, task_workspace_bytes, encoding_workspace,
         ])?;
         // Each successful item owns output_claim(bytes, 0) until the last
         // cohort result is written AND flushed. Price every such guard.
@@ -73,6 +82,15 @@ impl Int4ScoredCohortMemoryLimits {
             multiply(documents, 4096)?])?;
         Ok(Int4ScoredCohortMemoryRequirement { native, workspace_bytes, input_bytes,
             output_reservation_bytes, task_workspace_bytes, max_output_bytes })
+    }
+}
+
+pub(super) fn encoding_workspace_bytes(encoding: &UntrustedEncoding) -> Result<u64, BatchFault> {
+    encoding.validate().map_err(|_| BatchCode::InvalidLimits)?;
+    match encoding {
+        UntrustedEncoding::ByteFallback => Ok(0),
+        UntrustedEncoding::SafeBpeV1(limits) => limits.requirements()
+            .map(|required| required.workspace_bytes).map_err(|_| BatchCode::InvalidLimits.into()),
     }
 }
 

@@ -63,6 +63,7 @@ fn every_scored_task_keeps_exact_native_records_and_explicit_snapshot_provenance
             group_width: 128, integer_kernel: "s_scalar_i32",
             snapshot: Some(SnapshotRecord::new("loaded", need)),
             cohort_schedule: None,
+            input_encoding: None,
         };
         // Publication fixture only; these synthetic bytes assert no model result.
         let inner = "{\"event\":\"fixture\",\"label\":\"café 上海\",\"calibration\":\"uncalibrated\",\"exact\":12345678901234567890123456789012345678}\n";
@@ -84,6 +85,7 @@ fn every_scored_task_keeps_exact_native_records_and_explicit_snapshot_provenance
         assert_eq!(value["snapshot"]["format"], INT4_SNAPSHOT_VERSION);
         assert_eq!(value["snapshot"]["file_bytes"], need.file_bytes);
         assert!(value.get("cohort_schedule").is_none());
+        assert!(value.get("input_encoding").is_none());
         for absent in ["document", "prompt", "source_dir", "source_manifest", "snapshot_path",
             "defaults_path", "prompt_digest", "taskir_digest"] {
             assert!(value.get(absent).is_none());
@@ -101,6 +103,39 @@ fn cohort_provenance_names_declared_limits_without_claiming_executed_counts() {
         "declared_max_heads": 8,
         "declared_max_documents": 3,
     }));
+}
+
+#[test]
+fn compact_policy_is_reported_on_records_flush_and_empty_completion_without_rewriting_inner_json() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    let encoding = UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 4096, max_output_tokens: 1024, max_pair_checks: 123456, max_pair_bytes: 2345678,
+    });
+    let provenance = Provenance {
+        protocol: "fnlp-candidate-int4-score-batch-v1", schema_version: 1,
+        scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "classify",
+        model_id: "Nanbeige4.2-3B", source_revision: "fixture-revision", source_root_sha256: "fixture-source",
+        model_content_sha256: "fixture-content", candidate_format: "fnlp-int4-source-candidate-v1",
+        quant_recipe: "fixture:group=128", group_width: 128, integer_kernel: "s_scalar_i32",
+        snapshot: None, cohort_schedule: None, input_encoding: Some(&encoding),
+    };
+    for records in [
+        "{\"event\":\"doc\",\"fixture_decimal\":12345678901234567890123456789012345678}\n{\"event\":\"flush\"}\n{\"event\":\"run_complete\"}\n",
+        "{\"event\":\"run_complete\",\"summary\":{\"succeeded\":0}}\n",
+    ] {
+        let mut output = Vec::new();
+        {
+            let mut writer = CandidateWriter::new(&mut output, &provenance, 4096, 16384).unwrap();
+            writer.write_all(records.as_bytes()).unwrap(); writer.flush().unwrap();
+        }
+        let output = std::str::from_utf8(&output).unwrap();
+        assert_eq!(output.lines().count(), records.lines().count());
+        for (line, original) in output.lines().zip(records.lines()) {
+            assert!(line.ends_with(&format!("\"record\":{original}}}")));
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(value["input_encoding"], serde_json::to_value(&encoding).unwrap());
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -175,12 +210,14 @@ fn model_present_cross_document_streams_preserve_complete_serial_records_and_flu
         .parse().expect("canonical kernel ID required");
     PackedInt4Kernel::detect(kernel).expect("requested kernel must be supported");
 
+    for encoding in ["byte-fallback", "safe-bpe-v1"] {
     for task in ["classify", "sentiment"] {
         let mut input = None;
         let mut expected = None;
         for flags in [&[][..], &["--cohort-heads", "3", "--cohort-documents", "3"][..],
             &["--cohort-heads", "8", "--cohort-documents", "3"][..]] {
             let mut flags = flags.to_vec();
+            flags.extend(["--input-encoding", encoding]);
             flags.extend(["--max-dot-products", "1000000000000",
                 "--max-multiply-accumulates", "10000000000000000"]);
             let command = super::super::tests::command(task, &flags);
@@ -191,6 +228,7 @@ fn model_present_cross_document_streams_preserve_complete_serial_records_and_flu
             args.memory_mib = memory; args.kernel = kernel; args.context_tokens = 2048;
             args.timeout_seconds = 86_400;
             let limits = batch.validate(&args).expect("explicit memory must admit all declared heads and plans");
+            let policy = args.input_encoding.policy(args.max_input_bytes, limits.common.max_prompt_tokens).unwrap();
             // Freeze identical task budgets and exact input bytes from the
             // serial route. Grouping may grant storage, never change TaskIR.
             let input = input.get_or_insert_with(|| model_stream_input(task, batch.scoring.budget(limits.common)));
@@ -204,6 +242,8 @@ fn model_present_cross_document_streams_preserve_complete_serial_records_and_flu
                 assert_eq!(value["task"], task);
                 assert_eq!(value["evidence"], "non_authoritative");
                 assert_eq!(value["model_content_sha256"], pin);
+                assert_eq!(value.get("input_encoding"), input_encoding::reported_policy(&policy)
+                    .map(serde_json::to_value).transpose().unwrap().as_ref());
                 let schedule = value.as_object_mut().unwrap().remove("cohort_schedule");
                 if let Some(window) = limits.cohort {
                     assert_eq!(schedule, Some(serde_json::to_value(CohortSchedule::from(window)).unwrap()));
@@ -234,6 +274,7 @@ fn model_present_cross_document_streams_preserve_complete_serial_records_and_flu
             if let Some(expected) = &expected { assert_eq!(&events, expected); }
             else { expected = Some(events); }
         }
+    }
     }
     println!("{COMPLETE}");
 }

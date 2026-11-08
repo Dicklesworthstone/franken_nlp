@@ -103,6 +103,109 @@ fn every_native_transport_and_preparation_ceiling_refuses_before_io() {
 }
 
 #[test]
+fn compact_classification_and_sentiment_admit_serial_and_cohort_streams_with_one_encoder() {
+    use crate::tokenizer::untrusted::UntrustedEncoding;
+    for task in ["classify", "sentiment"] {
+        for schedule in [&[][..], &["--cohort-heads", "8", "--cohort-documents", "3"][..]] {
+            let mut flags = schedule.to_vec();
+            flags.extend(["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "123456",
+                "--max-tokenizer-pair-bytes", "2345678"]);
+            let (batch, mut args) = arguments(task, &flags);
+            args.memory_mib = 262_144;
+            let limits = batch.validate(&args).unwrap();
+            let policy = args.input_encoding.policy(args.max_input_bytes, limits.common.max_prompt_tokens).unwrap();
+            let UntrustedEncoding::SafeBpeV1(selected) = &policy else { panic!("compact policy was lost"); };
+            assert_eq!(selected.max_pair_checks, 123456);
+            assert_eq!(selected.max_pair_bytes, 2345678);
+            assert_eq!(selected.max_input_bytes, args.max_input_bytes);
+            assert_eq!(selected.max_output_tokens, limits.common.max_prompt_tokens);
+            assert_eq!(limits.encoding_workspace_bytes, selected.requirements().unwrap().workspace_bytes);
+            assert_eq!(limits.native.max_item_work, limits.native.max_model_work);
+            if let Some(window) = limits.cohort {
+                let quote = Int4ScoredCohortMemoryLimits {
+                    max_documents: window.max_documents, max_heads: window.max_heads,
+                    context_tokens: args.context_tokens, preparation_reserve_bytes: limits.preparation_reserve_bytes,
+                    io_reserve_bytes: limits.io_bytes, allocator_reserve_bytes: ALLOCATOR_BYTES,
+                };
+                let byte = quote.requirements(args.group_width, limits.native, limits.transport).unwrap();
+                let compact = quote.requirements_with_document_encoding(args.group_width, limits.native,
+                    limits.transport, &policy).unwrap();
+                assert_eq!(compact.input_bytes - byte.input_bytes, limits.encoding_workspace_bytes);
+                let peak = compact.native.kv_bytes + compact.workspace_bytes + compact.input_bytes
+                    + compact.output_reservation_bytes;
+                assert_eq!(limits.common.minimum_memory_bytes, grouped_memory_floor(&args, limits.common, peak).unwrap());
+            } else {
+                let common = batch.scoring.validate_one_off_with_prefill(&args).unwrap();
+                let t = limits.transport;
+                let corpus = 8 * t.max_line_bytes as u64 + 4 * t.max_output_line_bytes as u64
+                    + 128 * t.max_epoch_ids as u64 + t.max_epoch_id_bytes as u64
+                    + limits.preparation_reserve_bytes + limits.io_bytes + limits.encoding_workspace_bytes;
+                assert_eq!(limits.common.minimum_memory_bytes, common.minimum_memory_bytes + corpus);
+            }
+            let native = limits.native;
+            args.memory_mib = limits.common.minimum_memory_bytes.div_ceil(MIB);
+            batch.validate(&args).unwrap();
+            args.memory_mib -= 1;
+            assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+            let (plain, mut plain_args) = arguments(task, schedule);
+            plain_args.memory_mib = 262_144;
+            let plain = plain.validate(&plain_args).unwrap();
+            assert_eq!(plain.encoding_workspace_bytes, 0);
+            assert_eq!(plain.native, native);
+        }
+    }
+}
+
+#[test]
+fn unsupported_compact_judgment_and_invalid_encoder_policy_refuse_before_private_io() {
+    for task in ["classify", "sentiment", "judge"] {
+        for limits in [&["--max-tokenizer-pair-checks", "0"][..], &["--max-tokenizer-pair-bytes", "0"][..]] {
+            let mut flags = vec!["--input-encoding", "safe-bpe-v1", "--defaults", "never-open.json"];
+            flags.extend_from_slice(limits);
+            let (batch, args) = arguments(task, &flags);
+            assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+        }
+    }
+    for schedule in [&[][..], &["--cohort-heads", "4"][..]] {
+        let mut flags = vec!["--input-encoding", "safe-bpe-v1", "--defaults", "never-open.json"];
+        flags.extend_from_slice(schedule);
+        let (batch, args) = arguments("judge", &flags);
+        assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+    let (batch, args) = arguments("judge", &["--input-encoding", "byte-fallback"]);
+    assert_eq!(batch.validate(&args).unwrap().encoding_workspace_bytes, 0);
+}
+
+#[test]
+fn compact_stream_policy_does_not_enable_prefill_or_cpu_teams_by_injection() {
+    for task in ["classify", "sentiment"] {
+        let (batch, mut args) = arguments(task, &["--input-encoding", "safe-bpe-v1"]);
+        args.prefill_rows = Some(2);
+        assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+        let (batch, mut args) = arguments(task, &["--input-encoding", "safe-bpe-v1"]);
+        let matches = compute::definition(clap::Command::new("team"))
+            .try_get_matches_from(["team", "--compute-threads", "2"]).unwrap();
+        args.compute = compute::Args::from_matches(&matches).unwrap();
+        assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
+fn snapshot_compaction_keeps_the_same_work_transport_and_encoding_limits() {
+    for task in ["classify", "sentiment"] {
+        let (batch, mut args) = arguments(task, &["--input-encoding", "safe-bpe-v1"]);
+        let source = batch.validate(&args).unwrap();
+        args.source_dir = None; args.source_manifest = None;
+        args.snapshot = Some(PathBuf::from("private.snapshot")); args.expected_model_sha256 = Some("ab".repeat(32));
+        let snapshot = batch.validate(&args).unwrap();
+        assert_eq!(source.native, snapshot.native);
+        assert_eq!(source.transport, snapshot.transport);
+        assert_eq!(source.encoding_workspace_bytes, snapshot.encoding_workspace_bytes);
+        assert!(snapshot.common.snapshot_pin.is_some());
+    }
+}
+
+#[test]
 fn explicit_generation_or_prefill_controls_are_never_silently_ignored() {
     for flags in [vec!["--max-new-tokens", "128"], vec!["--max-output-bytes", "65536"],
         vec!["--min-new-tokens", "0"], vec!["--temperature-milli", "1000"],

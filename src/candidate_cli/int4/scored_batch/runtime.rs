@@ -47,6 +47,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let started = Instant::now();
     let limits = batch.validate(&args)?;
     let common = limits.common;
+    let encoding = args.input_encoding.policy(args.max_input_bytes, common.max_prompt_tokens)?;
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
@@ -79,14 +80,18 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     match defaults {
         Defaults::Classify(defaults) => {
             let planner = Int4ClassificationPlanner::for_model(model.model_identity(), budget,
-                batch.scoring.classification_limits(&args)).map_err(|_| CandidateError::Planning)?;
-            let planner = Int4ScoredBatchPlanner::new(planner, defaults, limits.native).map_err(|_| CandidateError::Planning)?;
+                batch.scoring.classification_limits(&args))
+                .and_then(|planner| planner.with_document_encoding(encoding.clone())).map_err(|_| CandidateError::Planning)?;
+            let planner = Int4ScoredBatchPlanner::new_with_document_encoding(planner, defaults, limits.native)
+                .map_err(|_| CandidateError::Planning)?;
             stream(&engine, &model, planner, "classify", &args, limits, started, deadline, reader, output, cancellation)
         }
         Defaults::Sentiment { args: defaults, policy } => {
             let planner = Int4SentimentPlanner::for_model(model.model_identity(), sentiment_options(policy)?, budget,
-                batch.scoring.sentiment_limits(&args)).map_err(|_| CandidateError::Planning)?;
-            let planner = Int4ScoredBatchPlanner::new(planner, Some(defaults), limits.native).map_err(|_| CandidateError::Planning)?;
+                batch.scoring.sentiment_limits(&args))
+                .and_then(|planner| planner.with_document_encoding(encoding.clone())).map_err(|_| CandidateError::Planning)?;
+            let planner = Int4ScoredBatchPlanner::new_with_document_encoding(planner, Some(defaults), limits.native)
+                .map_err(|_| CandidateError::Planning)?;
             stream(&engine, &model, planner, "sentiment", &args, limits, started, deadline, reader, output, cancellation)
         }
         Defaults::Judge(defaults) => {
@@ -108,7 +113,12 @@ fn stream<P: Int4ScoredTask + Send + 'static, W: Write + Send + 'static>(engine:
     remaining()?;
     let common = limits.common;
     let identity = planner.base_execution_identity().clone();
-    if planner.group_width() != model.model_identity().group_width() { return Err(CandidateError::Identity); }
+    let encoding = args.input_encoding.policy(args.max_input_bytes, common.max_prompt_tokens)?;
+    if planner.group_width() != model.model_identity().group_width()
+        || planner.document_encoding() != &encoding
+        || planner.encoding_workspace_bytes() != limits.encoding_workspace_bytes {
+        return Err(CandidateError::Identity);
+    }
     let mut snapshot = common.snapshot_pin.map(|_| SnapshotRecord::new("loaded", common.snapshot_need));
     if let Some(path) = &args.save_snapshot {
         // Defaults and the model-bound factory are admitted first. Future
@@ -129,6 +139,7 @@ fn stream<P: Int4ScoredTask + Send + 'static, W: Write + Send + 'static>(engine:
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(), snapshot,
         cohort_schedule: limits.cohort.map(CohortSchedule::from),
+        input_encoding: input_encoding::reported_policy(&encoding),
     };
     let writer = CandidateWriter::new(output, &provenance, limits.transport.max_output_line_bytes, limits.output_bytes)?;
     let corpus = CorpusLimits {
@@ -167,6 +178,8 @@ struct Provenance<'a> {
     snapshot: Option<SnapshotRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cohort_schedule: Option<CohortSchedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<&'a crate::tokenizer::untrusted::UntrustedEncoding>,
 }
 
 #[derive(Serialize)]

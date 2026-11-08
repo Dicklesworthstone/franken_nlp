@@ -1099,9 +1099,19 @@ controller gates.
 
 `fnlp candidate source-int4 score-batch --task classify|sentiment|judge` runs
 ordered finite-scoring requests through **one resident grouped-INT4 model and
-one serial native engine**. The command requires `asupersync-runtime`, explicit
+serial or explicit cross-document cohort execution**. The command requires `asupersync-runtime`, explicit
 source or independently pinned snapshot input, and a process memory ceiling.
 The selected task remains fixed for the whole invocation.
+
+Classification and sentiment accept `--input-encoding safe-bpe-v1` with the
+same bounded encoder as their one-off commands. Each record gets one cumulative
+byte/token/pair-check/pair-byte budget: classification shares it across the
+document and canonical label metadata, while sentiment reuses the encoded
+document across every axis. Actual encoded prompt lengths determine context
+and native work. The byte cap therefore includes classification label metadata,
+not just the decoded document. Tokenizer ceilings apply to each complete record;
+the transport, checkpoint, deadline and native-work limits still cover the
+entire invocation. Judgment retains byte fallback for its indexed evidence.
 
 For classification, save shared settings as `labels.json`:
 
@@ -1134,6 +1144,7 @@ fnlp candidate source-int4 score-batch documents.ndjson \
   --source-dir /models/Nanbeige4.2-3B \
   --source-manifest /models/nanbeige-source-manifest.json \
   --memory-mib 8192 --group-width 128 \
+  --input-encoding safe-bpe-v1 \
   --max-requests 1000 --max-total-input-bytes 67108864 \
   --max-total-output-bytes 67108864
 ```
@@ -1172,9 +1183,11 @@ dimension distributions and decisions; judgment retains both pairwise orders,
 all rubric criteria, or the whole-source and evidence-window heads. Every head
 of one item preflights before its first native forward. Logical KV is cleared
 between heads and items. Failed execution never becomes a successful abstention.
-This is serial execution with resident weights; it does not select a shared
-layer-major prompt schedule. Generation, sampling and `--prefill-rows` controls
-are refused.
+Execution is serial by default. `--cohort-heads N` explicitly shares native
+layer-major work across complete documents, and `--cohort-documents N` bounds
+the buffered record window. Compact input works with either route; exact head
+counts, cumulative work and complete results retain the existing contract.
+Generation, sampling, CPU worker teams and `--prefill-rows` controls are refused.
 
 The five native work flags, `--max-forward-positions`, `--max-projected-logits`,
 `--max-attention-pairs`, `--max-dot-products` and `--max-multiply-accumulates`,
@@ -1193,12 +1206,16 @@ terminators. `--max-line-bytes` defaults to 1 MiB and cannot exceed 4 MiB;
 bounds each complete scored result, with transport and candidate framing priced
 separately. Memory admission includes the full resident KV allocation, native
 scratch, both preparation owners, bounded transport copies, retained defaults
-and output staging. A hosted output guard remains alive through delivery of
-each complete result.
+and output staging. Compact execution additionally reserves one transient
+encoder workspace alongside all retained plans and the cohort lookahead;
+the CLI and host use the same policy-specific quote. A hosted output guard
+remains alive through delivery of each complete result.
 
 Each result, error, flush or terminal event carries
 `fnlp-candidate-int4-score-batch-v1` candidate provenance with actual model,
-group, kernel and optional snapshot metadata. The inner native record is
+group, kernel and optional snapshot metadata. Compact requests also publish the
+complete `input_encoding` policy on every event, including flush and completion;
+byte-fallback events omit it. The inner native record is
 wrapped without reserializing its numbers. Private paths and prompts are omitted
 from provenance; labels and evidence quotes remain intentional result content.
 A complete event is flushed before the next record is read. IDs may be reused
@@ -1212,7 +1229,13 @@ Library callers wrap an existing model-bound `Int4ClassificationPlanner`,
 `Int4SentimentPlanner` or `Int4JudgePlanner` in `Int4ScoredBatchPlanner` with
 `Int4ScoredBatchLimits`, then call `NlpEngine::batch_int4_scored` with owned
 reader/writer and `CorpusLimits`. The task trait is sealed to these three
-native planners. CLI, native ledger and host fixtures are authored; compilation,
+native planners. For compact classification or sentiment, set the planner's
+document encoding and use `Int4ScoredBatchPlanner::new_with_document_encoding`;
+the host admits its `encoding_workspace_bytes()` in addition to retained
+preparations. `Int4ScoredCohortMemoryLimits::requirements_with_document_encoding`
+provides the matching pure window quote. The ordinary constructor keeps its
+byte-only contract for existing composed and durable-job callers. CLI, native
+ledger and host fixtures are authored; compilation,
 model-present execution and quality qualification remain pending the authorized
 controller gates.
 
