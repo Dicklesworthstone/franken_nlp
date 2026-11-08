@@ -298,6 +298,71 @@ fn int4_sink(scores: bool, width: usize) -> TokenSink<Vec<u8>> {
     TokenSink::with_provenance(Vec::new(), Task::Generate, bounds(scores),
         int4_provenance(width), &options(scores)).unwrap()
 }
+
+fn safe_bpe_policy() -> UntrustedEncoding {
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+    UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: SafeBpeLimits::MAX_INPUT_BYTES,
+        max_output_tokens: SafeBpeLimits::MAX_OUTPUT_TOKENS,
+        max_pair_checks: SafeBpeLimits::MAX_PAIR_CHECKS,
+        max_pair_bytes: SafeBpeLimits::MAX_PAIR_BYTES })
+}
+
+#[test]
+fn byte_fallback_keeps_the_existing_stream_bytes_and_start_schema() {
+    let mut implicit = int4_sink(false, 128);
+    let mut explicit = int4_sink(false, 128).with_input_encoding(UntrustedEncoding::ByteFallback).unwrap();
+    for s in [&mut implicit, &mut explicit] {
+        push(s, event(0, 166101, b"", false));
+        s.finish_int4(&int4_completion(s, GenerationFinish::Eos, 128)).unwrap();
+    }
+    assert_eq!(implicit.writer, explicit.writer);
+    assert_eq!(rows(&implicit.writer)[0]["data"], serde_json::json!({
+        "token_event_schema_version": DECODE_TOKEN_EVENT_SCHEMA_VERSION,
+        "byte_encoding": "u8-array", "completion_required": true,
+    }));
+}
+
+#[test]
+fn safe_bpe_start_reports_all_limits_even_when_no_token_fits() {
+    let policy = safe_bpe_policy();
+    for width in [3, 128] {
+        for has_token in [false, true] {
+            let mut s = int4_sink(false, width).with_input_encoding(policy.clone()).unwrap();
+            assert!(s.start().unwrap().len() < FRAME_BYTES);
+            let finish = if has_token {
+                push(&mut s, event(0, 166101, b"", false));
+                GenerationFinish::Eos
+            } else { GenerationFinish::ByteLimit };
+            let result = int4_completion(&s, finish, width);
+            s.finish_int4(&result).unwrap();
+            let frames = rows(&s.writer);
+            assert_eq!(frames[0]["event"], "run_start");
+            assert_eq!(frames[0]["data"]["input_encoding"], serde_json::to_value(&policy).unwrap());
+            assert_eq!(frames.last().unwrap()["data"], serde_json::to_value(&result).unwrap());
+            assert!(frames.iter().all(|frame| frame.get("input").is_none()
+                && frame.get("prompt_digest").is_none()));
+            assert!(s.writer.len() as u64 <= s.bounds.stream_bytes);
+        }
+    }
+}
+
+#[test]
+fn stream_encoding_cannot_change_after_reservation_or_delivery() {
+    for delivered in [false, true] {
+        let mut s = int4_sink(false, 128);
+        let e = event(0, 166101, b"", false);
+        let permit = s.reserve(&e).unwrap();
+        if delivered { s.permit(permit, e).unwrap(); }
+        else { drop(permit); assert!(s.writer.is_empty()); }
+        assert_eq!(s.with_input_encoding(safe_bpe_policy()).err().unwrap().code,
+            "stream_input_encoding_state");
+    }
+    let UntrustedEncoding::SafeBpeV1(mut limits) = safe_bpe_policy() else { unreachable!() };
+    limits.max_pair_checks = 0;
+    assert_eq!(int4_sink(false, 128).with_input_encoding(UntrustedEncoding::SafeBpeV1(limits))
+        .err().unwrap().code, "stream_input_encoding_policy");
+}
+
 fn int4_completion<W: Write>(s: &TokenSink<W>, finish: GenerationFinish, width: usize) -> Int4ChatResult {
     let mut chat = completion(s, finish).result;
     chat.execution = INT4_GENERATION_VERSION.to_owned();

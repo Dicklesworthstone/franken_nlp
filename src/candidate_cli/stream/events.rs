@@ -10,7 +10,8 @@ use crate::{execution_identity::Sha256Digest,
             grouped_int4::{INT4_GENERATION_VERSION, INT4_SOURCE_FORMAT}},
         lmhead::NANBEIGE_VOCAB_SIZE, sampler::Seed256, strict_int8::STRICT_INT8_PROFILE,
         strict_int4::{Int4ModelIdentity, Int4Work, STRICT_INT4_PROFILE}},
-    tasks::chat::{ChatResult, quantized::Int8ChatResult, grouped_int4::Int4ChatResult}};
+    tasks::chat::{ChatResult, quantized::Int8ChatResult, grouped_int4::Int4ChatResult},
+    tokenizer::untrusted::UntrustedEncoding};
 
 #[derive(Serialize)]
 #[serde(untagged)]
@@ -51,9 +52,11 @@ struct Frame<'a, T: Serialize> {
     data: &'a T,
 }
 #[derive(Serialize)]
-struct Start {
+struct Start<'a> {
     token_event_schema_version: u32, byte_encoding: &'static str,
     completion_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<&'a UntrustedEncoding>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State { Fresh, Open, Reserved, Failed, Finished }
@@ -71,6 +74,7 @@ pub(in crate::candidate_cli) struct TokenSink<W> {
     token_ids: Vec<u32>, bytes: Vec<u8>, scores: Option<Vec<f32>>,
     eos: u32, saw_eos: bool, saw_stop: bool, expected_seed: Option<String>,
     min_new_tokens: usize, stop_suffixes: Vec<Vec<u8>>,
+    input_encoding: Option<UntrustedEncoding>,
 }
 fn reserved<T>(count: usize) -> Result<Vec<T>, Failure> {
     let mut values = Vec::new();
@@ -147,7 +151,20 @@ impl<W: Write> TokenSink<W> {
             token_ids: reserved(bounds.tokens)?, bytes: reserved(bounds.content_bytes)?,
             scores: if bounds.capture_logprobs { Some(reserved(bounds.tokens)?) } else { None },
             eos: *eos, saw_eos: false, saw_stop: false, expected_seed: seed,
-            min_new_tokens: options.min_new_tokens, stop_suffixes: options.stop_suffixes.clone() })
+            min_new_tokens: options.min_new_tokens, stop_suffixes: options.stop_suffixes.clone(),
+            input_encoding: None })
+    }
+    /// Declare the same immutable policy used to prepare the prompt. The
+    /// default adds no wire fields, and a started or reserved stream cannot
+    /// relabel its input semantics after any event has been staged.
+    pub(in crate::candidate_cli) fn with_input_encoding(mut self, policy: UntrustedEncoding)
+        -> Result<Self, Failure> {
+        if self.state != State::Fresh {
+            return Err(Failure::usage("stream_input_encoding_state"));
+        }
+        policy.validate().map_err(|_| Failure::usage("stream_input_encoding_policy"))?;
+        self.input_encoding = (policy != UntrustedEncoding::ByteFallback).then_some(policy);
+        Ok(self)
     }
     fn frame<T: Serialize>(&self, event: &'static str, provisional: bool, data: &T,
         cap: usize) -> Result<Vec<u8>, Failure> {
@@ -157,7 +174,8 @@ impl<W: Write> TokenSink<W> {
     }
     fn start(&self) -> Result<Vec<u8>, Failure> {
         self.frame("run_start", true, &Start { token_event_schema_version: DECODE_TOKEN_EVENT_SCHEMA_VERSION,
-            byte_encoding: "u8-array", completion_required: true }, FRAME_BYTES)
+            byte_encoding: "u8-array", completion_required: true,
+            input_encoding: self.input_encoding.as_ref() }, FRAME_BYTES)
     }
     fn validate_event(&self, event: &DecodeTokenEvent) -> Result<(), Failure> {
         let score_ok = match (self.bounds.capture_logprobs, event.logprob) {

@@ -60,19 +60,38 @@ fn changed_admitted_options_refuse_before_runtime_or_any_private_input() {
         fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("write after refused options"); }
         fn flush(&mut self) -> io::Result<()> { panic!("flush after refused options"); }
     }
-    for axis in 0..4 {
+    for axis in 0..6 {
         let (options, mut a) = args("generate", &[]);
         let (limits, mut bounds) = options.validate(&a).unwrap();
         match axis {
             0 => a.kernel = Int8KernelKind::Avx2WidenedI16,
             1 => bounds.tokens += 1,
             2 => bounds.content_bytes += 1,
-            _ => bounds.capture_logprobs = !bounds.capture_logprobs,
+            3 => bounds.capture_logprobs = !bounds.capture_logprobs,
+            4 => a.preparation_mib += 1,
+            _ => a.context_tokens += 1,
         }
         let failure = execute(Task::Generate, a, limits, bounds, &mut NoIo, NoIo).unwrap_err();
         assert_eq!(failure.exit, ErrorCode::Usage);
         assert_eq!(failure.code, "stream_admitted_options_mismatch");
     }
+}
+
+#[test]
+fn changed_encoding_workspace_cannot_reuse_an_insufficient_preparation_quote() {
+    struct NoIo;
+    impl Read for NoIo { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("read before encoding admission"); } }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("write before encoding admission"); }
+        fn flush(&mut self) -> io::Result<()> { panic!("flush before encoding admission"); }
+    }
+    let (options, mut a) = args("generate", &["--max-input-bytes", "1048576"]);
+    let (limits, bounds) = options.validate(&a).unwrap();
+    let (_, bpe) = args("generate", &["--input-encoding", "safe-bpe-v1"]);
+    a.input_encoding = bpe.input_encoding;
+    let failure = execute(Task::Generate, a, limits, bounds, &mut NoIo, NoIo).unwrap_err();
+    assert_eq!(failure.exit, ErrorCode::Usage);
+    assert_eq!(failure.code, "stream_options");
 }
 
 #[test]
@@ -168,6 +187,10 @@ fn snapshot_stream_completion_and_bytes_equal_buffered_generate_and_chat() {
         ("generate", Task::Generate, &["--prefill-rows", "4"][..], true),
         ("chat", Task::Chat, &[][..], true),
         ("chat", Task::Chat, &["--prefill-rows", "4"][..], false),
+        ("generate", Task::Generate, &["--input-encoding", "safe-bpe-v1"][..], false),
+        ("generate", Task::Generate, &["--input-encoding", "safe-bpe-v1", "--prefill-rows", "4"][..], true),
+        ("chat", Task::Chat, &["--input-encoding", "safe-bpe-v1"][..], true),
+        ("chat", Task::Chat, &["--input-encoding", "safe-bpe-v1", "--prefill-rows", "4"][..], false),
     ] {
         let text = if task == Task::Chat {
             r#"[{"role":"user","content":"Reply with a short English greeting."}]"#
@@ -187,6 +210,7 @@ fn snapshot_stream_completion_and_bytes_equal_buffered_generate_and_chat() {
         let wire = collected.lock().unwrap();
         let frames = frames(&wire.bytes);
         assert_eq!(frames.first().unwrap()["event"], "run_start");
+        assert_eq!(frames[0]["data"].get("input_encoding"), buffered.get("input_encoding"));
         assert_eq!(frames.last().unwrap()["event"], "run_complete");
         assert_eq!(frames.last().unwrap()["data"], buffered["output"]);
         let expected_seed = if seeded { serde_json::Value::String(seed.clone()) } else { serde_json::Value::Null };

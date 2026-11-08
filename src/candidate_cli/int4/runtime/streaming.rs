@@ -14,6 +14,13 @@ pub(in crate::candidate_cli::int4) fn execute<W: Write + Send + 'static>(task: T
         || bounds.content_bytes != args.max_output_bytes || bounds.capture_logprobs != args.logprobs {
         return Err(Failure::usage("stream_admitted_options_mismatch"));
     }
+    // Recompute the complete preparation floor, including encoding workspace,
+    // before private IO even for internal callers carrying an earlier quote.
+    let current = args.validate()?;
+    if limits.preparation_bytes != current.preparation_bytes
+        || limits.max_prompt_tokens != current.max_prompt_tokens {
+        return Err(Failure::usage("stream_admitted_options_mismatch"));
+    }
     let started = Instant::now();
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
@@ -61,7 +68,8 @@ pub(in crate::candidate_cli::int4) fn execute<W: Write + Send + 'static>(task: T
     // The model supplies the actual independently recomputed INT4 identity.
     // The sink retains the full stop/minimum/seed policy of this exact plan.
     let sink = TokenSink::new_int4(output, task, bounds, model.model_identity(),
-        prepared.native_plan().options())?;
+        prepared.native_plan().options())?.with_input_encoding(
+            args.input_encoding.policy(args.max_input_bytes, limits.max_prompt_tokens)?)?;
     let stream_limits = ChatStreamLimits {
         native: NativeLimits { context_tokens: args.context_tokens, allocator_reserve_bytes: ALLOCATOR_BYTES,
             run: RunLimits { max_elapsed: remaining()?, max_checkpoints: args.max_checkpoints,

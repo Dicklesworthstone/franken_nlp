@@ -47,6 +47,60 @@ fn text_operations_keep_the_full_buffered_generation_policy() {
 }
 
 #[test]
+fn safe_bpe_keeps_buffered_identity_limits_and_prices_the_complete_workspace() {
+    use crate::tokenizer::untrusted::UntrustedEncoding;
+    for operation in ["generate", "chat"] {
+        let flags = ["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "12345",
+            "--max-tokenizer-pair-bytes", "456789", "--prefill-rows", "4"];
+        let (options, mut a) = args(operation, &flags);
+        let (limits, _) = options.validate(&a).unwrap();
+        let policy = a.input_encoding.policy(a.max_input_bytes, limits.max_prompt_tokens).unwrap();
+        let buffered = super::super::tests::args(operation, &flags);
+        assert_eq!(policy, buffered.input_encoding.policy(buffered.max_input_bytes,
+            buffered.validate().unwrap().max_prompt_tokens).unwrap());
+        let UntrustedEncoding::SafeBpeV1(encoding) = policy else { panic!("explicit BPE required"); };
+        assert_eq!(encoding.max_input_bytes, a.max_input_bytes);
+        assert_eq!(encoding.max_output_tokens, limits.max_prompt_tokens);
+        assert_eq!(encoding.max_pair_checks, 12345);
+        assert_eq!(encoding.max_pair_bytes, 456789);
+        let byte_floor = 128 * MIB + a.max_input_bytes as u64 * 32
+            + (limits.result_bytes as u64 + 4096) * 2;
+        a.preparation_mib = byte_floor.div_ceil(MIB);
+        let mut byte_default = a.clone();
+        byte_default.input_encoding = input_encoding::InputEncodingArgs::default();
+        options.validate(&byte_default).unwrap();
+        assert_eq!(options.validate(&a).err().unwrap().exit, ErrorCode::Usage);
+        a.preparation_mib = (byte_floor + encoding.requirements().unwrap().workspace_bytes).div_ceil(MIB);
+        options.validate(&a).unwrap();
+    }
+    for operation in ["generate", "chat"] {
+        assert!(parse(operation, &["--max-tokenizer-pair-checks", "1"]).is_err());
+        assert!(parse(operation, &["--max-tokenizer-pair-bytes", "1"]).is_err());
+        assert!(parse(operation, &["--input-encoding", "canonical-bpe"]).is_err());
+    }
+}
+
+#[test]
+fn invalid_bpe_work_or_workspace_refuses_before_input_model_and_output() {
+    for operation in ["generate", "chat"] {
+        for extra in [
+            &["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "0"][..],
+            &["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-bytes", "0"][..],
+            &["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "67108865"][..],
+            &["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-bytes", "536870913"][..],
+            &["--input-encoding", "safe-bpe-v1", "--max-input-bytes", "1048576"][..],
+        ] {
+            let mut diagnostics = Vec::new();
+            let status = parse(operation, extra).unwrap().run_owned(NoIo, NoIo, &mut diagnostics);
+            assert_eq!(status, ErrorCode::Usage.as_process_exit());
+            let error: serde_json::Value = serde_json::from_slice(&diagnostics).unwrap();
+            assert_eq!(error["code"], "stream_options");
+            assert!(!String::from_utf8(diagnostics).unwrap().contains("private"));
+        }
+    }
+}
+
+#[test]
 fn source_snapshot_and_backend_contracts_do_not_change_for_streaming() {
     let pin = "23".repeat(32);
     for operation in ["generate", "chat"] {
