@@ -39,6 +39,60 @@ fn default_options_use_the_same_pinned_greedy_contract_and_group_aware_requireme
     assert!(args.options(166_101).unwrap() == GenerationOptions::greedy(128, 65_536, 166_101));
     assert_eq!(limits.max_prompt_tokens + args.max_new_tokens - 1, args.context_tokens);
     assert!(limits.minimum_memory_bytes <= limits.memory_bytes);
+    assert_eq!(limits.compute, compute::Admission { threads: 1, workspace_bytes: 0 });
+}
+
+#[test]
+fn fixed_compute_teams_are_opt_in_and_fully_priced_before_input() {
+    for operation in ["generate", "chat"] {
+        let mut serial = args(operation, &["--compute-threads", "1"]);
+        let mut parallel = args(operation, &["--compute-threads", "4"]);
+        for a in [&mut serial, &mut parallel] {
+            a.source_dir = None; a.source_manifest = None;
+            a.snapshot = Some(PathBuf::from("private-snapshot"));
+            a.expected_model_sha256 = Some("39".repeat(32));
+        }
+        let serial_limits = serial.validate_text_compute().unwrap();
+        let parallel_limits = parallel.validate_text_compute().unwrap();
+        let extra = crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(4, 128).unwrap();
+        assert_eq!(parallel_limits.compute, compute::Admission { threads: 4, workspace_bytes: extra });
+        assert_eq!(serial_limits.native, parallel_limits.native);
+        assert_eq!(serial_limits.load, parallel_limits.load);
+        assert_eq!(parallel_limits.minimum_memory_bytes, serial_limits.minimum_memory_bytes + extra);
+        assert!(serial.options(166_101).unwrap() == parallel.options(166_101).unwrap());
+        // Shared batch/stream validation must not accept a width it cannot use.
+        assert!(parallel.validate().is_err());
+        parallel.memory_mib = (parallel_limits.minimum_memory_bytes - 1) / MIB;
+        assert!(parallel.validate_text_compute().is_err());
+        parallel.memory_mib = parallel_limits.minimum_memory_bytes.div_ceil(MIB);
+        parallel.validate_text_compute().unwrap();
+    }
+}
+
+#[test]
+fn unsupported_compute_widths_and_prompt_schedules_refuse_before_io() {
+    for operation in ["generate", "chat"] {
+        for flags in [
+            &["--compute-threads", "0"][..], &["--compute-threads", "65"][..],
+            &["--compute-threads", "2", "--prefill-rows", "1"][..],
+            &["--compute-threads", "4", "--prefill-rows", "4"][..],
+        ] {
+            let mut output = Vec::new();
+            assert_eq!(command(operation, flags).execute(&mut NoRead, &mut output), Err(CandidateError::Arguments));
+            assert!(output.is_empty());
+        }
+        args(operation, &["--compute-threads", "1", "--prefill-rows", "4"]).validate().unwrap();
+    }
+    // The option is absent from workflows without a persistent numerical team.
+    for route in [vec!["stream", "generate"], vec!["text-batch"], vec!["text-corpus"],
+        vec!["classify"], vec!["extract"], vec!["ner"], vec!["sentiment"]] {
+        let mut argv = vec!["candidate", "source-int4"];
+        argv.extend(route);
+        argv.extend(["--source-dir", "private-source", "--source-manifest", "private-manifest",
+            "--memory-mib", "8192", "--compute-threads", "2"]);
+        assert_eq!(crate::candidate_cli::definition().try_get_matches_from(argv).unwrap_err().kind(),
+            clap::error::ErrorKind::UnknownArgument);
+    }
 }
 
 #[test]

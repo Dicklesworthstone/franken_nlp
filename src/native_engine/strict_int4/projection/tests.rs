@@ -9,6 +9,12 @@ impl DecodeStepControl for Continue {
     fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }
 }
 
+#[test]
+fn optional_executor_preserves_the_public_engine_send_and_sync_contract() {
+    fn require_send_sync<T: Send + Sync>() {}
+    require_send_sync::<StrictInt4Engine<'static>>();
+}
+
 // A serial, two-range proof adapter, not a worker team or performance claim.
 // The hosted tests exercise the persistent real scoped workers separately.
 struct PartitionExecutor<'model> {

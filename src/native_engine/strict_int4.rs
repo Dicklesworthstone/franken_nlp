@@ -2,7 +2,7 @@
 //! canonical fnlpq format, activation authority, or BF16 fidelity claim.
 //! The common loop runner owns 22 -> norm -> 22 -> norm and all 44 KV slots.
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, sync::Mutex};
 use serde::{Deserialize, Serialize};
 use super::{
     attention::{QUERY_HEAD_COUNT, eager_gqa_attention_from_cache},
@@ -167,7 +167,10 @@ impl RunState {
 pub struct StrictInt4Engine<'weights> {
     weights: &'weights Int4ModelWeights, cache: KvCache, rope: RopeTablesF32,
     activation: ActivationBuffer, unpack: Vec<i8>, kernel: PackedInt4Kernel, state: RunState,
-    projection: Option<&'weights mut (dyn Int4ProjectionExecutor + 'weights)>,
+    // Preserve the engine's public Send + Sync auto-traits even when its
+    // private coordinator owns a Send-only reply receiver. Exclusive engine
+    // methods use get_mut(); this slot is never locked at runtime.
+    projection: Mutex<Option<&'weights mut (dyn Int4ProjectionExecutor + 'weights)>>,
 }
 impl<'weights> StrictInt4Engine<'weights> {
     pub fn new(weights: &'weights Int4ModelWeights, context: usize, budget: Int4MemoryBudget) -> Result<Self, StrictInt4Error> {
@@ -175,7 +178,7 @@ impl<'weights> StrictInt4Engine<'weights> {
         Ok(Self { weights, cache: KvCache::try_with_capacity(context).map_err(|_| StrictInt4Error::Allocation)?,
             rope: RopeTablesF32::nanbeige(context).map_err(|_| StrictInt4Error::Rope)?,
             activation: ActivationBuffer::try_new(I)?, unpack: filled(weights.group_width(), 0_i8)?,
-            kernel: PackedInt4Kernel::scalar(), state: RunState::default(), projection: None })
+            kernel: PackedInt4Kernel::scalar(), state: RunState::default(), projection: Mutex::new(None) })
     }
     /// The caller supplies a real-host-checked handle before opening a session.
     pub fn with_kernel(mut self, kernel: PackedInt4Kernel) -> Self { self.kernel = kernel; self }
@@ -186,7 +189,7 @@ impl<'weights> StrictInt4Engine<'weights> {
     pub(crate) fn with_projection_executor(mut self,
         executor: &'weights mut (dyn Int4ProjectionExecutor + 'weights)) -> Result<Self, StrictInt4Error> {
         projection::check_binding(self.weights.identity(), self.kernel.kind(), executor)?;
-        self.projection = Some(executor);
+        *self.projection.get_mut().map_err(|_| StrictInt4Error::ProjectionExecutor)? = Some(executor);
         Ok(self)
     }
     pub fn kernel_kind(&self) -> Int8KernelKind { self.kernel.kind() }
@@ -199,7 +202,7 @@ impl<'weights> StrictInt4Engine<'weights> {
         if !self.cache.all_slots_have_len(0) { return Err(StrictInt4Error::Cache); }
         // Recheck after builder chaining: with_kernel must not silently change
         // the kernel reported for an already installed projection executor.
-        if let Some(executor) = self.projection.as_ref() {
+        if let Some(executor) = self.projection.get_mut().map_err(|_| StrictInt4Error::ProjectionExecutor)?.as_ref() {
             projection::check_binding(self.weights.identity(), self.kernel.kind(), &**executor)?;
         }
         self.state.open()?;
@@ -251,7 +254,8 @@ impl<C: DecodeStepControl> Int4Session<'_, '_, C> {
         let runner = LoopRunner::from_layer_weights(&self.engine.weights.layers);
         let mut executor = Executor { final_norm: &self.engine.weights.final_norm, rope: &self.engine.rope,
             activation: &mut self.engine.activation, unpack: &mut self.engine.unpack, kernel: self.engine.kernel,
-            ledger: &mut self.ledger, projection: &mut self.engine.projection,
+            ledger: &mut self.ledger,
+            projection: self.engine.projection.get_mut().map_err(|_| StrictInt4Error::ProjectionExecutor)?,
             control: &mut *self.control, completed: 0, norms: 0 };
         runner.run_token(&mut executor, &mut hidden, PositionContext::at(position), &mut self.engine.cache)?;
         if executor.completed != KV_SLOT_COUNT || executor.norms != 2 { return Err(StrictInt4Error::Boundary); }
@@ -271,7 +275,8 @@ impl<C: DecodeStepControl> Int4Session<'_, '_, C> {
         let mut output = filled(count, 0.0_f32)?;
         self.engine.state.poisoned = true;
         self.engine.activation.encode_bf16(self.hidden.as_deref().ok_or(StrictInt4Error::EmptyHidden)?)?;
-        projection::project_f32(&mut self.engine.projection, Int4ProjectionOp::Head,
+        projection::project_f32(self.engine.projection.get_mut().map_err(|_| StrictInt4Error::ProjectionExecutor)?,
+            Int4ProjectionOp::Head,
             &self.engine.weights.head, &self.engine.activation, rows, &mut output,
             &mut self.engine.unpack, self.engine.kernel, &mut self.ledger, &mut *self.control)?;
         self.work.projected_logits = next; self.engine.state.poisoned = false; Ok(output)

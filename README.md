@@ -300,6 +300,68 @@ fnlp doctor                          # idempotent self-check/repair
 #   fnlp audit plan/grade · fnlp job partition/merge · fnlp resident start
 ```
 
+## Explicit multicore INT4 generation
+
+Buffered `fnlp candidate source-int4 generate` and `chat` accept
+`--compute-threads N`. The default, `1`, keeps the existing serial route.
+Values from `2` through `64` select one fixed team for the complete request:
+one blocking coordinator and `N - 1` persistent scoped workers. The command
+admits one additional runtime thread, for a configured process thread ceiling
+of `N + 1`. The candidate build requires `asupersync-runtime`.
+
+```bash
+fnlp candidate source-int4 generate prompt.txt \
+  --snapshot nanbeige.int4.snapshot \
+  --expected-model-sha256 "$MODEL_SHA256" \
+  --memory-mib 8192 --compute-threads 4 \
+  --input-encoding safe-bpe-v1
+```
+
+All seven decoder projection roles and the language-model head use the team.
+Each worker computes complete output rows using the same checked integer
+kernel, quantized activations and increasing group order as serial execution.
+The coordinator computes its own shard and assembles replies in row order.
+The team shares the resident weights; it creates no per-operator threads or
+weight copies. Sequence state, attention, sampling and task finalization stay
+on the coordinator. The model, prompt, sampling and numerical identities are
+unchanged by the physical worker count.
+
+The complete fixed team forms behind an entry gate and seals before work is
+released. Reusable worker buffers pass through capacity-one command/reply
+lanes. One shared checkpoint quota covers the coordinator and every worker;
+projection work is charged once by the native ledger before dispatch.
+Cancellation and panic disconnect the lanes and join all workers before the
+existing physical-completion handoff can release model and worker workspace
+ownership. Completed output retains its charge through publication.
+
+Worker input, row indices, output shards, unpacking scratch and protocol
+bookkeeping participate in memory admission before input or model IO. The
+quote models these allocations; OS thread stacks and process RSS are not
+measured or capped by it. Library callers must install a compatible
+`ResourceHostConfig` and can call `execute_int4_chat_with_threads`, using
+`int4_chat_team_workspace_bytes` for the extra scratch quote.
+
+An explicit team response adds `compute` with the schedule version, actual
+team width, completed projection count, completed output rows and completed
+worker rows. Serial responses omit this field. These are work counters;
+they carry no speedup or parity certification.
+
+This route currently handles one buffered generate/chat sequence. A worker
+count above one cannot combine with `--prefill-rows`; streaming, batches,
+corpora, structured tasks and durable jobs do not expose this option. Invalid
+widths, incompatible schedules and insufficient memory refuse before private
+IO, and a hosted request cannot exceed its installed child-thread envelope.
+
+Regression definitions cover exact row arithmetic, model/kernel binding,
+one-time work charging, persistent worker reuse, shared checkpoint exhaustion,
+cancellation during formation, and worker/coordinator panic drain. The gated
+snapshot fixture compares complete greedy and seeded generate/chat results
+at widths 1, 2 and 4, including byte and BPE inputs. Run that model fixture in
+a fresh test process: the process resource broker intentionally keeps its
+initial thread configuration. Compilation, executable regressions, complete
+model parity and hardware performance remain pending the authorized DSR
+checkpoint. The serial default remains the rollback selector.
+
 ## Explicit bounded BPE input for candidate INT4 tasks
 
 `fnlp candidate source-int4 generate`, `chat`, `ner`, `keyphrases`,

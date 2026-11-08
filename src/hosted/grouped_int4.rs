@@ -48,6 +48,8 @@ mod scored_cohort;
     any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod scored_job;
 mod prefill;
+mod parallel;
+pub use parallel::{HostedInt4ChatTeamResult, Int4ComputeReceipt, int4_chat_team_workspace_bytes};
 mod stream;
 pub use stream::HostedInt4ChatStream;
 pub mod batch;
@@ -183,6 +185,7 @@ pub struct ResidentInt4 { inner: Arc<ResidentModel> }
 impl ResidentInt4 {
     pub fn model_identity(&self) -> &Int4ModelIdentity { self.inner.loaded.value.identity() }
     pub fn resources(&self) -> &Arc<EngineResources> { self.inner.lease.resources() }
+    pub(super) fn weights(&self) -> &Int4ModelWeights { &self.inner.loaded.value }
 }
 
 impl NlpEngine {

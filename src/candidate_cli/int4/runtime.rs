@@ -17,6 +17,8 @@ use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, Me
             grouped_int4::{PreparedInt4SourceTask, Int4SourceTaskRun}}}};
 
 pub(super) mod streaming;
+#[cfg(test)]
+mod compute_tests;
 
 // Typed task alternatives share one loader, preparation guard and publication
 // envelope. Only real hosted execution can construct the guarded completion.
@@ -36,6 +38,7 @@ enum Prepared {
 }
 enum Completed {
     Text(HostedOutput<Int4ChatResult>),
+    TextTeam(crate::hosted::HostedInt4ChatTeamResult),
     Classify(cohort::Completion<Int4ClassificationRun>),
     Extract(HostedOutput<Int4ExtractRun>),
     Source(HostedOutput<Int4SourceTaskRun>),
@@ -44,6 +47,7 @@ impl Serialize for Completed {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             Self::Text(result) => result.result().serialize(serializer),
+            Self::TextTeam(result) => result.result().serialize(serializer),
             Self::Classify(result) => result.result().serialize(serializer),
             Self::Extract(result) => result.result().serialize(serializer),
             Self::Source(result) => result.result().serialize(serializer),
@@ -51,6 +55,9 @@ impl Serialize for Completed {
     }
 }
 impl Completed {
+    fn compute(&self) -> Option<&crate::hosted::Int4ComputeReceipt> {
+        match self { Self::TextTeam(result) => Some(result.compute()), _ => None }
+    }
     fn cohort(&self) -> Option<cohort::Summary<'_>> {
         match self { Self::Classify(result) => result.summary(), _ => None }
     }
@@ -74,6 +81,13 @@ impl Prepared {
             let work = plan.planned_work();
             return engine.execute_int4_classify_cohort(model, plan, native, limits.preparation_bytes,
                 work, kernel, cancellation).map(|result| Completed::Classify(cohort::Completion::Cohort(result)))
+                .map_err(|_| CandidateError::Execution);
+        }
+        if limits.compute.threads > 1 {
+            let Self::Text(plan) = self else { return Err(CandidateError::Arguments); };
+            if limits.prefill.is_some() { return Err(CandidateError::Arguments); }
+            return engine.execute_int4_chat_with_threads(model, plan, 1, native, SAMPLER_BYTES,
+                kernel, limits.compute.threads, cancellation).map(Completed::TextTeam)
                 .map_err(|_| CandidateError::Execution);
         }
         match (self, limits.prefill) {
@@ -114,6 +128,7 @@ pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
         || limits.minimum_memory_bytes > limits.memory_bytes || limits.kernel.kind() != args.kernel
         || !prefill::matches(&args, limits)?
         || !cohort::matches(&task, &args, limits)?
+        || !compute::matches(&task, &args, limits)?
         || (!matches!(&task, Int4Task::Text(_) | Int4Task::Classify(_) | Int4Task::Extract(_) | Int4Task::Source(..))
             && limits.prefill.is_some()) {
         return Err(CandidateError::Arguments);
@@ -124,8 +139,10 @@ pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
         .ok_or(CandidateError::Timeout);
     let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
         runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: limits.memory_bytes,
+        max_blocking_coordinators: 1,
+        scoped_cpu_children_per_coordinator: limits.compute.threads - 1,
+        helper_threads: 0, thread_ceiling: limits.compute.threads + 1,
+        memory_ceiling_bytes: limits.memory_bytes,
         leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
     }).build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
@@ -213,7 +230,10 @@ pub(super) fn execute_task(task: Int4Task, args: Int4Args, limits: Int4Limits,
         _ => Some(&encoding),
     };
     publish_checked(&input_encoding::Response {
-        response: &cohort::Response { response: &response, cohort: result.cohort() }, input_encoding,
+        response: &compute::Response {
+            response: &cohort::Response { response: &response, cohort: result.cohort() },
+            compute: result.compute(),
+        }, input_encoding,
     }, limits.result_bytes + 4096, output, &|| remaining().map(|_| ()))
 }
 
