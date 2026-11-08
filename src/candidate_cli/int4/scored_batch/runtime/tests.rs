@@ -63,6 +63,7 @@ fn every_scored_task_keeps_exact_native_records_and_explicit_snapshot_provenance
             group_width: 128, integer_kernel: "s_scalar_i32",
             snapshot: Some(SnapshotRecord::new("loaded", need)),
             cohort_schedule: None,
+            compute_schedule: None,
             input_encoding: None,
         };
         // Publication fixture only; these synthetic bytes assert no model result.
@@ -85,6 +86,7 @@ fn every_scored_task_keeps_exact_native_records_and_explicit_snapshot_provenance
         assert_eq!(value["snapshot"]["format"], INT4_SNAPSHOT_VERSION);
         assert_eq!(value["snapshot"]["file_bytes"], need.file_bytes);
         assert!(value.get("cohort_schedule").is_none());
+        assert!(value.get("compute_schedule").is_none());
         assert!(value.get("input_encoding").is_none());
         for absent in ["document", "prompt", "source_dir", "source_manifest", "snapshot_path",
             "defaults_path", "prompt_digest", "taskir_digest"] {
@@ -106,6 +108,40 @@ fn cohort_provenance_names_declared_limits_without_claiming_executed_counts() {
 }
 
 #[test]
+fn team_provenance_and_host_inventory_match_the_admitted_whole_stream_width() {
+    for threads in [1, 2, 3, 64] {
+        let width = threads.to_string();
+        let command = super::super::tests::command("classify", &["--compute-threads", &width]);
+        let Int4Task::ScoredBatch(batch) = command.task else { panic!("wrong task"); };
+        let limits = batch.validate(&command.args).unwrap();
+        let config = resource_config(limits.common);
+        assert_eq!(config.runtime_workers, 1); assert_eq!(config.max_blocking_coordinators, 1);
+        assert_eq!(config.scoped_cpu_children_per_coordinator, threads - 1);
+        assert_eq!(config.thread_ceiling, threads + 1);
+        assert_eq!(config.memory_ceiling_bytes, limits.common.memory_bytes);
+        let schedule = ComputeSchedule::for_threads(threads);
+        if threads == 1 { assert!(schedule.is_none()); }
+        else {
+            assert_eq!(serde_json::to_value(schedule.unwrap()).unwrap(), serde_json::json!({
+                "execution": "int4-output-row-team-v1", "declared_compute_threads": threads,
+            }));
+        }
+    }
+}
+
+#[test]
+fn changed_team_schedule_is_revalidated_before_owned_defaults_model_or_stream_io() {
+    for task in ["classify", "sentiment", "judge"] {
+        let command = super::super::tests::command(task, &["--compute-threads", "2", "--defaults", "never-open.json"]);
+        let Int4Command { task: Int4Task::ScoredBatch(batch), mut args, batch: None, job: None } = command
+            else { panic!("wrong scored stream task"); };
+        let quote = batch.validate(&args).unwrap();
+        args.prefill_rows = Some(2);
+        assert_eq!(execute(args, batch, quote, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
 fn compact_policy_is_reported_on_records_flush_and_empty_completion_without_rewriting_inner_json() {
     use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
     let encoding = UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
@@ -117,7 +153,7 @@ fn compact_policy_is_reported_on_records_flush_and_empty_completion_without_rewr
         model_id: "Nanbeige4.2-3B", source_revision: "fixture-revision", source_root_sha256: "fixture-source",
         model_content_sha256: "fixture-content", candidate_format: "fnlp-int4-source-candidate-v1",
         quant_recipe: "fixture:group=128", group_width: 128, integer_kernel: "s_scalar_i32",
-        snapshot: None, cohort_schedule: None, input_encoding: Some(&encoding),
+        snapshot: None, cohort_schedule: None, compute_schedule: None, input_encoding: Some(&encoding),
     };
     for records in [
         "{\"event\":\"doc\",\"fixture_decimal\":12345678901234567890123456789012345678}\n{\"event\":\"flush\"}\n{\"event\":\"run_complete\"}\n",
@@ -167,9 +203,16 @@ fn model_stream_input(task: &str, budget: TaskBudget) -> Vec<u8> {
                 "policy":{"minimum_candidate_weight_ppm":0,"minimum_margin_ppm":0},
                 "budget":budget,
             })
-        } else {
+        } else if task == "sentiment" {
             serde_json::json!({
                 "axes":if multiple { vec!["valence", "arousal"] } else { vec!["valence"] },
+                "budget":budget,
+            })
+        } else {
+            serde_json::json!({
+                "mode":"pairwise", "criterion":"How clearly does the response address the customer?",
+                "b":"Please contact the team with your request.",
+                "policy":{"minimum_margin_milli":0,"maximum_order_disagreement_milli":4294967295_u32},
                 "budget":budget,
             })
         };
@@ -278,3 +321,5 @@ fn model_present_cross_document_streams_preserve_complete_serial_records_and_flu
     }
     println!("{COMPLETE}");
 }
+
+mod team;

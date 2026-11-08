@@ -51,12 +51,8 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
-    let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
-        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: common.memory_bytes,
-        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
-    }).build().map_err(|_| CandidateError::Runtime)?;
+    let engine = NlpEngine::builder().resource_config(resource_config(common))
+        .build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
     let _preparation = lease.reserve(MemoryClass::JobBuffers, common.preparation_bytes)
         .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
@@ -103,6 +99,16 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     }
 }
 
+fn resource_config(common: Int4Limits) -> ResourceHostConfig {
+    ResourceHostConfig {
+        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
+        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: common.compute.threads - 1,
+        helper_threads: 0, thread_ceiling: common.compute.threads + 1,
+        memory_ceiling_bytes: common.memory_bytes,
+        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stream<P: Int4ScoredTask + Send + 'static, W: Write + Send + 'static>(engine: &NlpEngine,
     model: &ResidentInt4, planner: Int4ScoredBatchPlanner<P>, task: &'static str, args: &Int4Args,
@@ -139,6 +145,7 @@ fn stream<P: Int4ScoredTask + Send + 'static, W: Write + Send + 'static>(engine:
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(), snapshot,
         cohort_schedule: limits.cohort.map(CohortSchedule::from),
+        compute_schedule: ComputeSchedule::for_threads(common.compute.threads),
         input_encoding: input_encoding::reported_policy(&encoding),
     };
     let writer = CandidateWriter::new(output, &provenance, limits.transport.max_output_line_bytes, limits.output_bytes)?;
@@ -153,6 +160,9 @@ fn stream<P: Int4ScoredTask + Send + 'static, W: Write + Send + 'static>(engine:
         engine.batch_int4_scored_cohorts(model, planner, corpus,
             Int4ScoredCohortHostLimits { max_documents: cohort.max_documents, max_heads: cohort.max_heads },
             common.kernel, reader, writer, cancellation).map_err(execution_error)?.summary
+    } else if common.compute.threads > 1 {
+        engine.batch_int4_scored_with_threads(model, planner, corpus, common.kernel,
+            common.compute.threads, reader, writer, cancellation).map_err(execution_error)?
     } else {
         engine.batch_int4_scored(model, planner, corpus, common.kernel, reader, writer, cancellation)
             .map_err(execution_error)?
@@ -179,6 +189,8 @@ struct Provenance<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     cohort_schedule: Option<CohortSchedule>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    compute_schedule: Option<ComputeSchedule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     input_encoding: Option<&'a crate::tokenizer::untrusted::UntrustedEncoding>,
 }
 
@@ -192,6 +204,14 @@ impl From<CohortWindow> for CohortSchedule {
     fn from(window: CohortWindow) -> Self {
         Self { execution: "cross_document_scoring_cohorts",
             declared_max_heads: window.max_heads, declared_max_documents: window.max_documents }
+    }
+}
+
+#[derive(Serialize)]
+struct ComputeSchedule { execution: &'static str, declared_compute_threads: usize }
+impl ComputeSchedule {
+    fn for_threads(threads: usize) -> Option<Self> {
+        (threads > 1).then_some(Self { execution: "int4-output-row-team-v1", declared_compute_threads: threads })
     }
 }
 

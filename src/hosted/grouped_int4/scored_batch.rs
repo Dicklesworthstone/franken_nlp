@@ -14,6 +14,12 @@ pub use cohort::{Int4ScoredCohortHostLimits, Int4ScoredCohortBatchResult};
 struct StreamInput<P: Int4ScoredTask, R, W> {
     planner: Option<Int4ScoredBatchPlanner<P>>, reader: R, writer: W,
 }
+// The staged footer drops before the charged input on cancellation or unwind.
+// Its bounded bytes use the stream's existing canonical-output reservation.
+struct DeferredScoredStream<P: Int4ScoredTask, R, W> {
+    completion: stream::deferred::DeferredCompletion,
+    input: Charged<StreamInput<P, R, W>>,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Requirements { native: Int4MemoryRequirement, workspace_bytes: u64, input_bytes: u64 }
 
@@ -31,7 +37,38 @@ impl NlpEngine {
         planner: Int4ScoredBatchPlanner<P>, limits: CorpusLimits, kernel: PackedInt4Kernel,
         reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
     where P: Int4ScoredTask, R: BufRead + Send + 'static, W: Write + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
+        self.run_int4_scored(model, planner, limits, kernel, None, reader, writer, cancellation)
+    }
+
+    /// Run the same ordered stream on one persistent team of 2..=64 compute
+    /// threads, including the coordinator. Every document, head and flush uses
+    /// the same team, native engine and nonrenewable work/checkpoint budgets.
+    /// Worker scratch is admitted in addition to the serial stream workspace.
+    ///
+    /// Complete item records remain ordered. The terminal run_complete is
+    /// published only after every worker joins, under the original run control
+    /// and with the owned reader/writer and output staging still charged.
+    /// Blocking IO stays cooperative. This schedule does not combine with
+    /// layer-major prefill or cross-document cohorts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int4_scored_with_threads<P, R, W>(&self, model: &ResidentInt4,
+        planner: Int4ScoredBatchPlanner<P>, limits: CorpusLimits, kernel: PackedInt4Kernel,
+        compute_threads: usize, reader: R, writer: W, cancellation: CancellationToken)
+        -> Result<BatchSummary, HostedError>
+    where P: Int4ScoredTask, R: BufRead + Send + 'static, W: Write + Send + 'static {
+        self.run_int4_scored(model, planner, limits, kernel, Some(compute_threads), reader, writer, cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_int4_scored<P, R, W>(&self, model: &ResidentInt4,
+        planner: Int4ScoredBatchPlanner<P>, limits: CorpusLimits, kernel: PackedInt4Kernel,
+        compute_threads: Option<usize>, reader: R, writer: W, cancellation: CancellationToken)
+        -> Result<BatchSummary, HostedError>
+    where P: Int4ScoredTask, R: BufRead + Send + 'static, W: Write + Send + 'static {
+        match compute_threads {
+            Some(width) => dispatch::preflight_int4_team(self, limits.native.run, width)?,
+            None => dispatch::preflight(self, limits.native.run)?,
+        }
         if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
         constrained_int4::check_model(planner.base_execution_identity(), model.model_identity())
             .map_err(|_| HostedError::ModelIdentity)?;
@@ -44,13 +81,18 @@ impl NlpEngine {
         // One compiler call is active at a time. Retained plans and transport
         // stay charged while this additional bounded encoder workspace is used.
         required.input_bytes = sum(&[required.input_bytes, planner.encoding_workspace_bytes()])?;
+        let team_scratch = compute_threads.map(|width|
+            int4_task_team_workspace_bytes(width, model.model_identity().group_width()))
+            .transpose()?.unwrap_or(0);
+        sum(&[required.workspace_bytes, team_scratch])?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(StreamInput { planner: Some(planner), reader, writer }))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.workspace_bytes)?;
         let model = model.clone();
-        dispatch::run(self, limits.native.run, cancellation, move |control| {
+        match compute_threads {
+        None => dispatch::run(self, limits.native.run, cancellation, move |control| {
             let mut input = input;
             checkpoint(control)?;
             let planner = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
@@ -75,7 +117,40 @@ impl NlpEngine {
             drop(input);
             drop(lease);
             result
-        })
+        }),
+        Some(width) => dispatch::run_int4_team_with_finalize(self, limits.native.run, cancellation,
+            model, width, kernel, move |weights, control, team| {
+                let mut input = input;
+                checkpoint(control)?;
+                let planner = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
+                let mut engine = allocate_native(kv, scratch, || {
+                    StrictInt4Engine::new(weights, limits.native.context_tokens,
+                        Int4MemoryBudget { max_kv_bytes: required.native.kv_bytes,
+                            max_rope_bytes: required.native.rope_bytes,
+                            max_scratch_payload_bytes: required.native.scratch_payload_bound })
+                        .map_err(native_error)?.with_kernel(kernel)
+                        .with_projection_executor(team).map_err(native_error)
+                })?;
+                let admission = ScoredAdmission { lease: &lease, model: weights.identity(),
+                    context: limits.native.context_tokens, kv_bytes: required.native.kv_bytes,
+                    max_item_work: work.max_item_work, task_spec: P::TASK,
+                    output_bytes: limits.transport.max_output_line_bytes as u64 };
+                let completion = {
+                    let mut processor = NativeInt4ScoredBatch::new(planner, &mut engine.value, admission)
+                        .map_err(HostedError::BatchSetup)?;
+                    stream::deferred::run_ndjson_deferred(&mut input.value.reader, &mut input.value.writer,
+                        &mut processor, limits.transport, control).map_err(HostedError::Batch)?
+                };
+                drop(engine);
+                drop(lease);
+                Ok(DeferredScoredStream { completion, input })
+            }, |pending, control| {
+                let DeferredScoredStream { completion, mut input } = pending;
+                let result = completion.publish(&mut input.value.writer, control).map_err(HostedError::Batch);
+                drop(input);
+                result
+            }),
+        }
     }
 }
 

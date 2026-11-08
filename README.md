@@ -306,9 +306,10 @@ fnlp doctor                          # idempotent self-check/repair
 
 Buffered `fnlp candidate source-int4 generate`, `chat`, `classify`, `sentiment`,
 `judge`, `extract`, `ner`, `keyphrases`, `summarize` and `answer` accept
-`--compute-threads N`, as do live `stream generate|chat` requests. The default,
+`--compute-threads N`, as do live `stream generate|chat` requests and resident
+`score-batch --task classify|sentiment|judge` streams. The default,
 `1`, keeps the existing serial route.
-Values from `2` through `64` select one fixed team for the complete request:
+Values from `2` through `64` select one fixed team for the complete request or scoring stream:
 one blocking coordinator and `N - 1` persistent scoped workers. The command
 admits one additional runtime thread, for a configured process thread ceiling
 of `N + 1`. The candidate build requires `asupersync-runtime`.
@@ -369,9 +370,14 @@ team width, completed projection count, completed output rows and completed
 worker rows. Serial responses omit this field. These are work counters;
 they carry no speedup or parity certification.
 
-This route handles one complete buffered or streamed request. A worker count
-above one cannot combine with `--prefill-rows` or `--cohort-heads`; batches,
-complete-document maps, corpora and durable jobs do not expose this option. Invalid
+For `score-batch`, the same team and native engine serve every document, scoring
+head and flush boundary. Its `compute_schedule` provenance records the selected
+schedule and declared width; it does not invent per-item projection receipts.
+The required `run_complete` is staged under the existing transport budget and
+published after all workers join, inside the original invocation and deadline.
+
+A worker count above one cannot combine with `--prefill-rows` or `--cohort-heads`;
+other batches, complete-document maps, corpora and durable jobs do not expose this option. Invalid
 widths, incompatible schedules and insufficient memory refuse before private
 IO, and a hosted request cannot exceed its installed child-thread envelope.
 Worker teams can combine with compact input on the tasks that expose it;
@@ -1124,7 +1130,7 @@ controller gates.
 
 `fnlp candidate source-int4 score-batch --task classify|sentiment|judge` runs
 ordered finite-scoring requests through **one resident grouped-INT4 model and
-serial or explicit cross-document cohort execution**. The command requires `asupersync-runtime`, explicit
+serial, persistent CPU-team or explicit cross-document cohort execution**. The command requires `asupersync-runtime`, explicit
 source or independently pinned snapshot input, and a process memory ceiling.
 The selected task remains fixed for the whole invocation.
 
@@ -1210,9 +1216,34 @@ of one item preflights before its first native forward. Logical KV is cleared
 between heads and items. Failed execution never becomes a successful abstention.
 Execution is serial by default. `--cohort-heads N` explicitly shares native
 layer-major work across complete documents, and `--cohort-documents N` bounds
-the buffered record window. Compact input works with either route; exact head
-counts, cumulative work and complete results retain the existing contract.
-Generation, sampling, CPU worker teams and `--prefill-rows` controls are refused.
+the buffered record window. Alternatively, `--compute-threads N` admits one
+persistent output-row team with `N - 1` workers and one coordinator, for widths
+2 through 64. That team and native engine span every document, scoring head and
+flush. Complete row arithmetic and within-row order remain the serial kernel's;
+causal state, full-vocabulary scoring and task finalization stay on the
+coordinator. Compact classification and sentiment work with all three routes.
+Team and cohort schedules cannot be combined. Generation, sampling and
+`--prefill-rows` controls are refused.
+
+```bash
+fnlp candidate source-int4 score-batch documents.ndjson \
+  --task classify --defaults labels.json \
+  --snapshot nanbeige.int4.snapshot --expected-model-sha256 "$MODEL_SHA256" \
+  --memory-mib 8192 --compute-threads 4 --input-encoding safe-bpe-v1
+```
+
+The selected workers and reusable row buffers are included in the process
+thread envelope and memory admission before private IO. Worker buffers add to
+the ordinary scoring-stream quote; they do not replace resident model, KV,
+preparation or transport charges. OS thread stacks and RSS remain outside the
+modeled payload quote. Library callers use `batch_int4_scored_with_threads`
+with a compatible installed child-thread envelope.
+
+Team streams stage the terminal `run_complete` within the existing cumulative
+output ceiling and publish it only after every worker joins. The final write
+and flush still execute inside the original tracked invocation, deadline,
+checkpoint ledger and re-entry guard. A failed or partial terminal delivery is
+never retried. Earlier item output remains ordered and flushed normally.
 
 The five native work flags, `--max-forward-positions`, `--max-projected-logits`,
 `--max-attention-pairs`, `--max-dot-products` and `--max-multiply-accumulates`,
@@ -1240,7 +1271,9 @@ Each result, error, flush or terminal event carries
 `fnlp-candidate-int4-score-batch-v1` candidate provenance with actual model,
 group, kernel and optional snapshot metadata. Compact requests also publish the
 complete `input_encoding` policy on every event, including flush and completion;
-byte-fallback events omit it. The inner native record is
+byte-fallback events omit it. Explicit teams add `compute_schedule` with the
+schedule version and declared thread width; serial events omit that field.
+This is schedule provenance, not a speedup or parity certificate. The inner native record is
 wrapped without reserializing its numbers. Private paths and prompts are omitted
 from provenance; labels and evidence quotes remain intentional result content.
 A complete event is flushed before the next record is read. IDs may be reused

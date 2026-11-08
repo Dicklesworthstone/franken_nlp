@@ -215,7 +215,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(faithfulness_map::definition())
         .subcommand(faithfulness_map::corpus::definition())
         .subcommand(faithfulness_map::job::definition())
-        .subcommand(scored_batch::definition())
+        .subcommand(compute::definition(scored_batch::definition()))
         .subcommand(scored_job::definition())
         .subcommand(classify_document_job::definition())
         .subcommand(document_job::definition())
@@ -371,7 +371,7 @@ impl Int4Command {
             args.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
         }
         if matches!(name, "generate" | "chat" | "classify" | "sentiment" | "judge" | "extract"
-            | "ner" | "keyphrases" | "summarize" | "answer") {
+            | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch") {
             args.compute = compute::Args::from_matches(matches)?;
         }
         Ok(Self { task, args, batch: None, job: None })

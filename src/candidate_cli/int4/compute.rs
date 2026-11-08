@@ -1,4 +1,4 @@
-//! Explicit physical team selection for complete single-request native tasks.
+//! Explicit physical team selection for complete native tasks and scored streams.
 use super::*;
 use crate::native_engine::strict_int4::projection::int4_team_workspace_bytes;
 
@@ -24,7 +24,7 @@ pub(super) struct Admission { pub threads: usize, pub workspace_bytes: u64 }
 pub(super) fn definition(command: clap::Command) -> clap::Command {
     command.arg(clap::Arg::new("compute_threads").long("compute-threads")
         .value_name("N").value_parser(clap::value_parser!(usize)).default_value("1")
-        .help("Coordinator plus persistent INT4 row workers, 1..=64; 1 is serial. One complete request, shared across its native heads or streamed tokens; cannot combine with --prefill-rows or --cohort-heads. Runtime threads are additional. Worker scratch is admitted before IO"))
+        .help("Coordinator plus persistent INT4 row workers, 1..=64; 1 is serial. One team serves the complete request or score-batch stream across all heads, tokens and flushes; cannot combine with --prefill-rows or --cohort-heads. Runtime threads are additional. Worker scratch is admitted before IO"))
 }
 
 #[cfg(feature = "asupersync-runtime")]

@@ -109,6 +109,35 @@ pub(in crate::hosted) fn run_int4_team<T, F>(engine: &NlpEngine, limits: RunLimi
 where T: Send + 'static,
     F: FnOnce(&Int4ModelWeights, &mut RunControl, &mut dyn Int4ProjectionExecutor)
         -> Result<T, HostedError> + Send + 'static {
+    // Existing callers retain their exact checkpoint schedule and return their
+    // guarded result only after physical join, as before.
+    run_int4_team_then(engine, limits, cancellation, model, width, kernel, work,
+        |value, _, _| Ok(value))
+}
+
+/// Publish a terminal result after the team joins, inside the same tracked
+/// blocking invocation and NativeEntry. The finalizer borrows the original
+/// deadline/checkpoint state; it cannot create another execution allowance.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::hosted) fn run_int4_team_with_finalize<T, U, F, G>(engine: &NlpEngine,
+    limits: RunLimits, cancellation: CancellationToken, model: ResidentInt4, width: usize,
+    kernel: PackedInt4Kernel, work: F, finalize: G) -> Result<U, HostedError>
+where T: Send + 'static, U: Send + 'static,
+    F: FnOnce(&Int4ModelWeights, &mut RunControl, &mut dyn Int4ProjectionExecutor)
+        -> Result<T, HostedError> + Send + 'static,
+    G: FnOnce(T, &mut RunControl) -> Result<U, HostedError> + Send + 'static {
+    run_int4_team_then(engine, limits, cancellation, model, width, kernel, work,
+        move |value, cx, shared| finalize_after_join(cx, shared, value, finalize))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_int4_team_then<T, U, F, G>(engine: &NlpEngine, limits: RunLimits,
+    cancellation: CancellationToken, model: ResidentInt4, width: usize, kernel: PackedInt4Kernel,
+    work: F, finalize: G) -> Result<U, HostedError>
+where T: Send + 'static, U: Send + 'static,
+    F: FnOnce(&Int4ModelWeights, &mut RunControl, &mut dyn Int4ProjectionExecutor)
+        -> Result<T, HostedError> + Send + 'static,
+    G: FnOnce(T, &Cx, &Arc<RunShared>) -> Result<U, HostedError> + Send + 'static {
     preflight_int4_team(engine, limits, width)?;
     if !Arc::ptr_eq(engine.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
     let shared = RunShared::new(limits, cancellation)?;
@@ -121,12 +150,28 @@ where T: Send + 'static,
         // reservation even when setup or the coordinator unwinds.
         let mut workspace = workspace;
         let weights = model.weights();
-        let physical = run_scope(&blocking_cx, weights, &mut workspace.value, width, kernel, shared, work);
+        let physical = run_scope(&blocking_cx, weights, &mut workspace.value, width, kernel,
+            Arc::clone(&shared), work)
+            .and_then(|value| finalize(value, &blocking_cx, &shared));
         drop(workspace);
         drop(model);
         drop(lease);
         physical
     })
+}
+
+fn finalize_after_join<T, U>(blocking_cx: &Cx, shared: &Arc<RunShared>, value: T,
+    finalize: impl FnOnce(T, &mut RunControl) -> Result<U, HostedError>) -> Result<U, HostedError> {
+    let leaf = blocking_cx.restrict::<cap::None>();
+    let _ambient = leaf.clone().set_current_restricted();
+    let mut control = RunControl { cx: leaf, shared: Arc::clone(shared) };
+    let outcome = if control.checkpoint(0).is_some() {
+        drop(value); drop(finalize); None
+    } else { Some(finalize(value, &mut control)) };
+    // Writer callbacks remain cooperative. A cancellation during final flush
+    // still makes the invocation fail; a footer alone never replaces success.
+    control.checkpoint(0);
+    shared.finish(outcome)
 }
 
 fn run_scope<T, F>(blocking_cx: &Cx, weights: &Int4ModelWeights, workspace: &mut Workspace,

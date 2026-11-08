@@ -20,6 +20,8 @@ pub mod source;
 pub(crate) mod int4_document;
 mod framing;
 mod output;
+#[cfg(any(feature = "asupersync-runtime", test))]
+pub(crate) mod deferred;
 use framing::{Frame, read_frame};
 use output::{Event, Sink};
 
@@ -230,18 +232,29 @@ impl Error for BatchRunError {}
 pub fn run_ndjson<R: BufRead, W: Write, P: BatchProcessor, C: DecodeStepControl>(
     reader: &mut R, writer: &mut W, processor: &mut P, limits: BatchLimits, control: &mut C,
 ) -> Result<BatchSummary, BatchRunError> {
+    run_ndjson_with_completion(reader, writer, processor, limits, control,
+        |sink, summary, epoch, control| {
+            let mut event = Event::<()>::new("run_complete", epoch, summary.requests);
+            event.summary = Some(summary);
+            sink.emit_with_checkpoint(&event, true, || checkpoint(control))?;
+            Ok(*summary)
+        })
+}
+
+/// The item loop and error publication stay identical for immediate and
+/// deferred success. Only the host's final-success ownership boundary differs.
+fn run_ndjson_with_completion<R: BufRead, W: Write, P: BatchProcessor, C: DecodeStepControl, T>(
+    reader: &mut R, writer: &mut W, processor: &mut P, limits: BatchLimits, control: &mut C,
+    complete: impl FnOnce(&mut Sink<'_, W>, &BatchSummary, u64, &mut C) -> Result<T, BatchFault>,
+) -> Result<T, BatchRunError> {
     let mut summary = BatchSummary::default();
     limits.validate().map_err(|fault| BatchRunError { fault, summary })?;
     let mut sink = Sink::new(writer, limits);
     let mut epoch = 1_u64;
     let result = run(reader, &mut sink, processor, limits, control, &mut summary, &mut epoch)
-        .and_then(|()| {
-            let mut event = Event::<()>::new("run_complete", epoch, summary.requests);
-            event.summary = Some(&summary);
-            sink.emit_with_checkpoint(&event, true, || checkpoint(control))
-        });
+        .and_then(|()| complete(&mut sink, &summary, epoch, control));
     match result {
-        Ok(()) => Ok(summary),
+        Ok(value) => Ok(value),
         Err(fault) => {
             // Never append an error after a partial write or failed flush.
             if !sink.poisoned() {

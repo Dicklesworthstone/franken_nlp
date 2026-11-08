@@ -186,3 +186,86 @@ fn coordinator_panic_after_dispatch_disconnects_workers_before_implicit_join() {
     assert!(outcome.is_err());
     assert_eq!(dropped.load(Ordering::SeqCst), width - 1);
 }
+
+#[test]
+fn terminal_publication_waits_for_real_workers_and_keeps_native_reentry_guard() {
+    use std::io::{self, Write};
+    struct Writer { dropped: Arc<AtomicUsize>, bytes: Vec<u8>, children: usize }
+    impl Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            assert_eq!(self.dropped.load(Ordering::SeqCst), self.children,
+                "terminal IO must follow every physical worker exit");
+            assert!(matches!(NativeEntry::enter(), Err(HostedError::Reentrant)),
+                "post-join writer callbacks must not reenter the hosted runtime");
+            self.bytes.extend_from_slice(bytes); Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+    let _entry = NativeEntry::enter().unwrap();
+    let (weights, input) = projection_fixture(4);
+    let mut workspace = Workspace::new(3, 4).unwrap();
+    let dropped = track_children(&mut workspace);
+    let cx = Cx::for_testing();
+    let shared = RunShared::new(limits(100_000), CancellationToken::default()).unwrap();
+    let writer = run_scope(&cx, &weights, &mut workspace, 3, PackedInt4Kernel::scalar(),
+        Arc::clone(&shared), |_, control, executor| {
+            let mut output = vec![0.0; 10];
+            executor.project_f32_into(Int4ProjectionOp::Head, &input, LinearRows::All,
+                &mut output, control).map_err(native_error)?;
+            assert_eq!(dropped.load(Ordering::SeqCst), 0);
+            assert!(executor.stats().completed_worker_rows > 0);
+            Ok(Writer { dropped: Arc::clone(&dropped), bytes: Vec::new(), children: 2 })
+        }).unwrap();
+    let remaining = shared.state.lock().unwrap().remaining;
+    let deadline = shared.deadline;
+    let writer = finalize_after_join(&cx, &shared, writer, |mut writer, control| {
+        assert_eq!(control.shared.deadline, deadline);
+        assert_eq!(control.shared.state.lock().unwrap().remaining, remaining - 1);
+        writer.write_all(b"terminal after join\n").unwrap(); writer.flush().unwrap();
+        Ok(writer)
+    }).unwrap();
+    assert_eq!(shared.state.lock().unwrap().remaining, remaining - 2);
+    assert_eq!(writer.bytes, b"terminal after join\n");
+    assert_eq!(dropped.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn cancellation_before_post_join_publication_drops_owned_value_without_calling_writer() {
+    struct Owned(Arc<AtomicUsize>);
+    impl Drop for Owned { fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); } }
+    use DecodeCancellationKind::*;
+    for cause in [User, Deadline, PollQuota, Shutdown] {
+        let cx = Cx::for_testing();
+        let token = CancellationToken::default();
+        let shared = RunShared::new(limits(100), token.clone()).unwrap();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        token.cancel(cause);
+        let error = finalize_after_join(&cx, &shared, Owned(Arc::clone(&dropped)), |_, _| -> Result<(), HostedError> {
+            panic!("cancelled post-join publication reached the writer");
+        }).unwrap_err();
+        assert!(matches!(error, HostedError::Stopped { stop: RunStop { kind, .. }, .. } if kind == cause));
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn post_join_finalizer_never_renews_quota_and_late_flush_cancellation_remains_fatal() {
+    let cx = Cx::for_testing();
+    let shared = RunShared::new(limits(1), CancellationToken::default()).unwrap();
+    let error = finalize_after_join(&cx, &shared, (), |(), control| {
+        assert_eq!(control.checkpoint(0), Some(DecodeCancellationKind::PollQuota));
+        Ok(())
+    }).unwrap_err();
+    assert!(matches!(error, HostedError::Stopped { stop: RunStop { kind: DecodeCancellationKind::PollQuota, .. }, .. }));
+
+    let token = CancellationToken::default();
+    let shared = RunShared::new(limits(100), token.clone()).unwrap();
+    let error = finalize_after_join(&cx, &shared, (), |(), _| -> Result<(), HostedError> {
+        token.cancel(DecodeCancellationKind::User);
+        Err(HostedError::BatchSetup(crate::batch::BatchCode::OutputIo.into()))
+    }).unwrap_err();
+    let HostedError::Stopped { stop, task_error: Some(error) } = error else { panic!("late stop lost its task error"); };
+    assert_eq!(stop.kind, DecodeCancellationKind::User);
+    assert!(matches!(error.as_ref(), HostedError::BatchSetup(fault)
+        if fault.code == crate::batch::BatchCode::OutputIo));
+}

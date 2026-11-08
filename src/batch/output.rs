@@ -61,6 +61,7 @@ impl<'a, T: Serialize> Event<'a, T> {
 }
 
 pub(super) struct Sink<'a, W> { writer: &'a mut W, limits: BatchLimits, emitted: u64, poisoned: bool }
+pub(super) struct PreparedRecord { pub bytes: Vec<u8>, total: u64 }
 impl<'a, W: Write> Sink<'a, W> {
     pub fn new(writer: &'a mut W, limits: BatchLimits) -> Self { Self { writer, limits, emitted: 0, poisoned: false } }
     pub fn poisoned(&self) -> bool { self.poisoned }
@@ -71,7 +72,20 @@ impl<'a, W: Write> Sink<'a, W> {
     /// passes and immediately before external IO. Error records deliberately
     /// use `emit` so cancellation can still be reported from terminal reserve.
     pub fn emit_with_checkpoint<T: Serialize>(&mut self, event: &Event<'_, T>, terminal: bool,
-        mut checkpoint: impl FnMut() -> Result<(), BatchFault>) -> Result<(), BatchFault> {
+        checkpoint: impl FnMut() -> Result<(), BatchFault>) -> Result<(), BatchFault> {
+        let prepared = self.prepare_with_checkpoint(event, terminal, checkpoint)?;
+        // Treat even a flush-only error as possibly delivered. Never retry and
+        // never append a terminal record to an unknown/truncated output prefix.
+        if self.writer.write_all(&prepared.bytes).and_then(|_| self.writer.flush()).is_err() {
+            self.poisoned = true; return Err(BatchCode::OutputIo.into());
+        }
+        self.emitted = prepared.total; Ok(())
+    }
+    /// Stage a bounded record against this sink's cumulative byte allowance.
+    /// The deferred host uses this only for its final success record, retaining
+    /// the existing output reservation until physical join and publication.
+    pub fn prepare_with_checkpoint<T: Serialize>(&self, event: &Event<'_, T>, terminal: bool,
+        mut checkpoint: impl FnMut() -> Result<(), BatchFault>) -> Result<PreparedRecord, BatchFault> {
         if self.poisoned { return Err(BatchCode::OutputIo.into()); }
         checkpoint()?;
         let line_cap = if terminal { TERMINAL_RESERVE } else { self.limits.max_output_line_bytes };
@@ -96,12 +110,7 @@ impl<'a, W: Write> Sink<'a, W> {
             else { self.limits.max_output_bytes - TERMINAL_RESERVE as u64 };
         if total > ceiling { return Err(BatchCode::OutputLimit.into()); }
         checkpoint()?;
-        // Treat even a flush-only error as possibly delivered. Never retry and
-        // never append a terminal record to an unknown/truncated output prefix.
-        if self.writer.write_all(&bytes).and_then(|_| self.writer.flush()).is_err() {
-            self.poisoned = true; return Err(BatchCode::OutputIo.into());
-        }
-        self.emitted = total; Ok(())
+        Ok(PreparedRecord { bytes, total })
     }
 }
 struct Counter { remaining: usize, overflow: bool }

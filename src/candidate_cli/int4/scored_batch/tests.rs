@@ -177,15 +177,58 @@ fn unsupported_compact_judgment_and_invalid_encoder_policy_refuse_before_private
 }
 
 #[test]
-fn compact_stream_policy_does_not_enable_prefill_or_cpu_teams_by_injection() {
+fn compact_stream_policy_does_not_enable_prefill_by_injection() {
     for task in ["classify", "sentiment"] {
         let (batch, mut args) = arguments(task, &["--input-encoding", "safe-bpe-v1"]);
         args.prefill_rows = Some(2);
         assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
-        let (batch, mut args) = arguments(task, &["--input-encoding", "safe-bpe-v1"]);
-        let matches = compute::definition(clap::Command::new("team"))
-            .try_get_matches_from(["team", "--compute-threads", "2"]).unwrap();
-        args.compute = compute::Args::from_matches(&matches).unwrap();
+    }
+}
+
+#[test]
+fn persistent_team_admission_preserves_all_stream_budgets_and_prices_worker_scratch() {
+    for task in ["classify", "sentiment", "judge"] {
+        for threads in [2, 3, 64] {
+            let width = threads.to_string();
+            let (serial, serial_args) = arguments(task, &[]);
+            let serial = serial.validate(&serial_args).unwrap();
+            let (batch, mut args) = arguments(task, &["--compute-threads", &width]);
+            let admitted = batch.validate(&args).unwrap();
+            assert_eq!(admitted.common.compute.threads, threads);
+            assert_eq!(admitted.common.compute.workspace_bytes,
+                crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(threads, args.group_width).unwrap());
+            assert_eq!(admitted.native, serial.native);
+            assert_eq!(admitted.transport, serial.transport);
+            assert_eq!(admitted.encoding_workspace_bytes, serial.encoding_workspace_bytes);
+            assert!(admitted.common.minimum_memory_bytes >= serial.common.minimum_memory_bytes);
+            let common = batch.scoring.validate_one_off_with_prefill(&args).unwrap();
+            assert_eq!(admitted.common.minimum_memory_bytes - common.minimum_memory_bytes,
+                serial.common.minimum_memory_bytes - batch.scoring.validate_one_off_with_prefill(&serial_args).unwrap().minimum_memory_bytes);
+            args.memory_mib = admitted.common.minimum_memory_bytes.div_ceil(MIB) - 1;
+            assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+        }
+    }
+    for task in ["classify", "sentiment"] {
+        let (batch, args) = arguments(task, &["--compute-threads", "3", "--input-encoding", "safe-bpe-v1"]);
+        let admitted = batch.validate(&args).unwrap();
+        assert!(admitted.encoding_workspace_bytes > 0);
+        assert_eq!(admitted.common.compute.threads, 3);
+    }
+}
+
+#[test]
+fn unsupported_team_widths_and_combined_schedules_refuse_before_private_io() {
+    let maximum = usize::MAX.to_string();
+    for task in ["classify", "sentiment", "judge"] {
+        for width in ["0", "65", maximum.as_str()] {
+            let (batch, args) = arguments(task, &["--compute-threads", width, "--defaults", "never-open.json"]);
+            assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+        }
+        let (batch, args) = arguments(task, &["--compute-threads", "2", "--cohort-heads", "2",
+            "--defaults", "never-open.json"]);
+        assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+        let (batch, mut args) = arguments(task, &["--compute-threads", "2", "--defaults", "never-open.json"]);
+        args.prefill_rows = Some(2);
         assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
     }
 }
@@ -422,6 +465,9 @@ fn judge_shared_text_and_defaults_bytes_remain_finitely_bounded() {
 fn disabled_runtime_refuses_without_opening_defaults_or_touching_streams() {
     for task in ["classify", "sentiment", "judge"] {
         let (batch, args) = arguments(task, &["--defaults", "never-open-private-defaults.json"]);
+        assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Unavailable));
+        let (batch, args) = arguments(task, &["--defaults", "never-open-private-defaults.json",
+            "--compute-threads", "2"]);
         assert_eq!(batch.execute_owned(args, NoIo, NoIo), Err(CandidateError::Unavailable));
         let (batch, mut args) = arguments(task, &["--defaults", "never-open-private-defaults.json",
             "--cohort-heads", "8", "--cohort-documents", "2"]);

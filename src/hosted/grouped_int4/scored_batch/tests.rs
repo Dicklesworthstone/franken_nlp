@@ -177,4 +177,10 @@ fn all_three_closed_planners_and_owned_io_fit_the_existing_host_boundary() {
     let _classify = NlpEngine::batch_int4_scored::<Int4ClassificationPlanner, std::io::Cursor<Vec<u8>>, Vec<u8>>;
     let _sentiment = NlpEngine::batch_int4_scored::<Int4SentimentPlanner, std::io::Cursor<Vec<u8>>, Vec<u8>>;
     let _judge = NlpEngine::batch_int4_scored::<Int4JudgePlanner, std::io::Cursor<Vec<u8>>, Vec<u8>>;
+    send::<DeferredScoredStream<Int4ClassificationPlanner, std::io::Cursor<Vec<u8>>, Vec<u8>>>();
+    send::<DeferredScoredStream<Int4SentimentPlanner, std::io::Cursor<Vec<u8>>, Vec<u8>>>();
+    send::<DeferredScoredStream<Int4JudgePlanner, std::io::Cursor<Vec<u8>>, Vec<u8>>>();
+    let _classify_team = NlpEngine::batch_int4_scored_with_threads::<Int4ClassificationPlanner, std::io::Cursor<Vec<u8>>, Vec<u8>>;
+    let _sentiment_team = NlpEngine::batch_int4_scored_with_threads::<Int4SentimentPlanner, std::io::Cursor<Vec<u8>>, Vec<u8>>;
+    let _judge_team = NlpEngine::batch_int4_scored_with_threads::<Int4JudgePlanner, std::io::Cursor<Vec<u8>>, Vec<u8>>;
 }
