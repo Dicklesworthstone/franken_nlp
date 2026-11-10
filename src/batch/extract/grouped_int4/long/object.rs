@@ -98,6 +98,11 @@ impl Int4ObjectExtractionPlanner {
     pub fn group_width(&self) -> usize { self.inner.group_width() }
     pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.inner.selected_rows() }
     pub fn compiler_limits(&self) -> CompileLimits { self.inner.compiler.compiler_limits }
+    pub(crate) fn base_planner(&self) -> &Int4ExtractionBatchPlanner { &self.inner }
+    pub(crate) fn with_selected_rows(mut self, limits: Int4JsonSparseLimits) -> Result<Self, BatchFault> {
+        self.inner = self.inner.with_selected_rows(limits)?;
+        Ok(self)
+    }
     pub fn plan_document_with_control<'s, C: DecodeStepControl>(&self, source: &'s str,
         original_request: &ExtractionBatchArgs, limits: Int4ObjectExtractionMapLimits, control: &mut C)
         -> Result<PreparedInt4ObjectExtractionMap<'s>, Int4ObjectExtractionMapError> {
@@ -137,6 +142,7 @@ pub struct Int4ObjectExtractionMapPreflight {
     map_batch_chunks: usize,
 }
 impl Int4ObjectExtractionMapPreflight {
+    pub(crate) fn mapped(&self) -> Int4ExtractionMapPreflight { self.mapped }
     pub fn chunk_count(&self) -> usize { self.mapped.chunk_count() }
     pub fn group_width(&self) -> usize { self.mapped.group_width() }
     pub fn planned_work(&self) -> Int4Work { self.mapped.planned_work() }
@@ -252,6 +258,7 @@ pub struct PreparedInt4ObjectExtractionMap<'s> {
     expected: Int4ObjectExtractionMapPreflight,
 }
 impl PreparedInt4ObjectExtractionMap<'_> {
+    pub(crate) fn mapped(&self) -> &PreparedInt4ExtractionMap<'_> { &self.mapped }
     pub fn preflight_metadata(&self) -> Int4ObjectExtractionMapPreflight { self.expected }
     pub fn execution_identities(&self) -> impl ExactSizeIterator<Item = &ExecutionIdentity> {
         self.mapped.execution_identities()

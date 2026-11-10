@@ -8,7 +8,9 @@ use crate::{
                 Int4ExtractionDocumentAdmission, Int4ExtractionDocumentBatchAdmission,
                 memory::{Int4ExtractionDocumentMemoryLimits, Int4ExtractionDocumentMemoryRequirement}}}},
     hosted::corpus::CorpusLimits,
+    grammar::CompileLimits,
     native_engine::{constrained_int4::sparse::Int4JsonSparseLimits, lmhead::NANBEIGE_VOCAB_SIZE, strict_int4::Int4Work},
+    tasks::extract::object_reconcile::RootObjectLimits,
 };
 
 struct StreamInput<R, W> {
@@ -29,6 +31,20 @@ pub fn int4_extraction_document_corpus_requirements(width: usize, budget: TaskBu
         .requirements(width, budget, document, limits.transport).map_err(map_error)
 }
 
+/// The same complete stream quote with an explicit original-schema root-object
+/// reducer. Both schema parses and the complete reconciliation workspace coexist
+/// with the retained chunk map, before any original source is read or prepared.
+#[allow(clippy::too_many_arguments)]
+pub fn int4_extraction_document_object_corpus_requirements(width: usize, budget: TaskBudget,
+    document: Int4ExtractionMapLimits, limits: CorpusLimits, reduction_reserve_bytes: u64,
+    cohort_chunks: Option<usize>, compiler: CompileLimits, object: Option<RootObjectLimits>)
+    -> Result<Int4ExtractionDocumentMemoryRequirement, HostedError> {
+    limits.native.run.validate()?;
+    memory_limits(limits, reduction_reserve_bytes, cohort_chunks)
+        .requirements_with_root_object(width, budget, document, limits.transport, compiler, object)
+        .map_err(map_error)
+}
+
 fn memory_limits(limits: CorpusLimits, reduction_reserve_bytes: u64, cohort_chunks: Option<usize>)
     -> Int4ExtractionDocumentMemoryLimits {
     Int4ExtractionDocumentMemoryLimits { context_tokens: limits.native.context_tokens,
@@ -40,7 +56,9 @@ fn memory_limits(limits: CorpusLimits, reduction_reserve_bytes: u64, cohort_chun
 impl NlpEngine {
     /// Stream complete original documents using a fixed exact schema and one
     /// resident model. Every chunk retains its independent exact JSON value
-    /// and original coordinates; there is no fabricated global-object merge.
+    /// and original coordinates. An explicitly configured root-object planner
+    /// additionally reconciles complementary properties against the untouched
+    /// original schema; conflicts or missing required fields refuse the document.
     /// Native work, masks and all verification axes share one nonrenewable
     /// invocation ledger. A failed chunk publishes no partial document result.
     ///
@@ -66,8 +84,9 @@ impl NlpEngine {
         }
         let document = planner.document_limits();
         let cohort_chunks = planner.uses_chunk_cohorts().then_some(document.mapping.reduction.map_batch_chunks);
-        let required = int4_extraction_document_corpus_requirements(planner.group_width(),
-            planner.document_budget(), document, limits, reduction_reserve_bytes, cohort_chunks)?;
+        let required = int4_extraction_document_object_corpus_requirements(planner.group_width(),
+            planner.document_budget(), document, limits, reduction_reserve_bytes, cohort_chunks,
+            planner.compiler_limits(), planner.root_object_reconciliation())?;
         let cohort = cohort_chunks.map(|_| planner.cohort_requirements().map_err(HostedError::BatchSetup)).transpose()?;
         let capacity = DocumentCapacity { document, budget: planner.document_budget(), selected_rows: planner.selected_rows(),
             kv_bytes: required.native.kv_bytes, max_result_bytes: required.max_output_bytes };

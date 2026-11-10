@@ -69,6 +69,31 @@ fn run(prepared: PreparedInt4ObjectExtractionMap<'_>, args: &ExtractionBatchArgs
 }
 
 #[test]
+fn complete_document_envelope_keeps_object_wire_and_full_verification_authority() {
+    use super::super::stream::{DocumentPreflight, Int4ExtractionDocumentRun};
+    let planner = planner();
+    let args = map_fixture::args(GROUNDED, ExtractionBatchGrounding::SourceMembership);
+    let prepared = prepare(&planner, SOURCE, &args, limits());
+    let expected = DocumentPreflight::Object(prepared.preflight_metadata());
+    let values = grounded_values(&prepared);
+    let output = run(prepared, &args, values, Rc::new(Cell::new(0)), &mut Control::default()).unwrap();
+    let original = canonjson::canonical_bytes(&output).unwrap();
+    let mut envelope = Int4ExtractionDocumentRun::Object(output);
+    assert_eq!(canonjson::canonical_bytes(&envelope).unwrap(), original);
+    expected.verify_completed(&envelope).unwrap();
+    assert!(envelope.verification_used().scan_steps > envelope.mapped().verification_used.scan_steps);
+    assert!(envelope.verification_used().fields > envelope.mapped().verification_used.fields);
+    assert!(DocumentPreflight::Map(expected.mapped()).verify_completed(&envelope).is_err());
+    let Int4ExtractionDocumentRun::Object(output) = &mut envelope else { unreachable!() };
+    output.verification_used = output.partial_map.verification_used;
+    assert!(expected.verify_completed(&envelope).is_err());
+    let Int4ExtractionDocumentRun::Object(output) = envelope else { unreachable!() };
+    // Even all successful chunks remain insufficient evidence for the
+    // complete object result when its required reconciliation is omitted.
+    assert!(expected.verify_completed(&Int4ExtractionDocumentRun::Map(output.partial_map)).is_err());
+}
+
+#[test]
 fn complete_partial_maps_reconcile_exact_values_and_retain_every_whitespace_and_source_chunk() {
     let p = planner(); let args = map_fixture::args(STRUCTURAL, ExtractionBatchGrounding::Structural);
     let prepared = prepare(&p, SOURCE, &args, limits()); let expected = prepared.preflight_metadata();

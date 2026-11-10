@@ -84,7 +84,7 @@ fn all_real_unicode_chunks_keep_exact_source_schema_and_independent_identities()
         assert_eq!(prepared.source, SOURCE);
         assert_eq!(prepared.chunk_count(), 2);
         assert_eq!(prepared.execution_identities().len(), 2);
-        let span = prepared.expected.source_span();
+        let span = prepared.expected.mapped().source_span();
         assert_eq!((span.byte_start, span.byte_end), (0, SOURCE.len()));
         assert_eq!((span.scalar_start, span.scalar_end), (0, SOURCE.chars().count()));
         assert_eq!(prepared.reserved_mask_visits(), 2000);
@@ -111,8 +111,8 @@ fn union_factory_refuses_non_array_defaults_and_freezes_policy_before_document_e
     selected.limits.root_array_union = Some(super::super::tests::union_limits());
     let factory = build(selected).unwrap();
     let prepared = snapshot(&factory, SOURCE);
-    assert!(prepared.expected.root_array_binding.is_some());
-    let private = prepared.expected.root_array_binding.unwrap().to_hex();
+    assert!(prepared.expected.mapped().root_array_binding.is_some());
+    let private = prepared.expected.mapped().root_array_binding.unwrap().to_hex();
     assert!(!format!("{:?}", prepared.expected).contains(&private));
     let plan = factory.plan(SOURCE, &mut Continue, true).unwrap();
     factory.compare(&plan, &prepared, &mut Continue).unwrap();
@@ -299,7 +299,7 @@ fn transferred_schema_capacity_is_preserved_and_run_caps_need_only_one_document(
     assert_eq!(factory.request().schema.capacity(), original_capacity);
     assert_eq!(factory.retained_defaults_bytes().unwrap(),
         (original_capacity + std::mem::size_of::<ExtractionBatchArgs>()) as u64);
-    assert!(factory.compiler.compiler.defaults.is_none());
+    assert!(factory.compiler.base_planner().compiler.defaults.is_none());
     assert_eq!(factory.max_verification(), factory.document_limits().verification);
     assert_eq!(snapshot(&factory, SOURCE).chunk_count(), 2);
 }
@@ -321,4 +321,189 @@ fn cohort_quote_is_declared_peak_while_every_actual_window_is_smaller_or_equal()
     let mut invalid = config(true);
     invalid.request.budget.max_kv_bytes -= 1;
     assert_eq!(build(invalid).err().unwrap().code, BatchCode::InvalidLimits);
+}
+
+const OBJECT: &str = r#"{"type":"object","additionalProperties":false,"properties":{"first":{"type":"string","maxLength":16},"last":{"type":"string","maxLength":16}},"required":["first","last"]}"#;
+fn object_limits() -> RootObjectLimits {
+    RootObjectLimits { max_properties: 16, max_origins: 128, max_input_bytes: 1 << 20,
+        max_json_bytes: 65_536, max_nodes: 65_536, max_result_bytes: 1 << 20 }
+}
+fn object_config() -> Int4ExtractionDocumentBatchConfig {
+    let mut cfg = config(false);
+    cfg.request.schema = OBJECT.to_owned();
+    cfg.limits.mapping.reduction.map_batch_chunks = 1;
+    cfg
+}
+
+#[test]
+fn explicit_object_population_binds_original_partial_schema_prompt_and_complete_source() {
+    let ordinary = build(object_config()).unwrap();
+    let old = snapshot(&ordinary, SOURCE);
+    let old_base = ordinary.base_execution_identity().clone();
+    let object = ordinary.with_root_object_reconciliation(object_limits()).unwrap();
+    assert_eq!(object.root_object_reconciliation(), Some(object_limits()));
+    assert_eq!(object.request().schema, OBJECT);
+    assert_eq!(object.base_execution_identity().task_spec, "extract-v1");
+    assert_ne!(object.base_execution_identity().template_digest, old_base.template_digest);
+    assert!(object.owns(&old).is_err());
+    let prepared = snapshot(&object, SOURCE);
+    assert!(matches!(prepared.expected, DocumentPreflight::Object(_)));
+    assert_eq!(prepared.expected.execution_version(), super::super::object::INT4_OBJECT_MAP_EXECUTION);
+    assert_eq!(prepared.chunk_count(), 2);
+    let plan = object.plan(SOURCE, &mut Continue, false).unwrap();
+    object.compare(&plan, &prepared, &mut Continue).unwrap();
+    let mapped = plan.mapped();
+    assert_eq!(mapped.chunks.chunks().iter().map(|chunk| chunk.text()).collect::<String>(), SOURCE);
+    let partial = RootObjectSchema::derive(OBJECT, object.compiler_limits(), object_limits(), &mut Continue).unwrap();
+    let partial_digest = Sha256Digest::of_bytes(partial.partial_schema().as_bytes());
+    assert_ne!(partial_digest, Sha256Digest::of_bytes(OBJECT.as_bytes()));
+    for row in &mapped.plans {
+        assert_eq!(row.execution_identity().schema_digest, partial_digest);
+        assert_eq!(row.execution_identity().template_digest, object.base_execution_identity().template_digest);
+    }
+    let wrong_source = object.plan("éabc----βdeg", &mut Continue, true).unwrap();
+    assert!(object.compare(&wrong_source, &prepared, &mut Continue).is_err());
+    let ordinary = build(object_config()).unwrap();
+    let exact_schema = ordinary.plan(SOURCE, &mut Continue, true).unwrap();
+    assert_ne!(exact_schema.preflight_metadata(), prepared.expected);
+    assert!(object.compare(&exact_schema, &prepared, &mut Continue).is_err());
+}
+
+#[test]
+fn original_required_fields_and_reconciliation_limits_remain_authority_after_partial_schema_matches() {
+    let object = build(object_config()).unwrap().with_root_object_reconciliation(object_limits()).unwrap();
+    let prepared = snapshot(&object, SOURCE);
+    // Both requests derive the same partial schema and chunk prompts, but the
+    // final required set is different and may never borrow a previous proof.
+    let mut changed = object_config();
+    changed.request.schema = OBJECT.replace("[\"first\",\"last\"]", "[\"first\"]");
+    let different = build(changed).unwrap().with_root_object_reconciliation(object_limits()).unwrap();
+    let other = snapshot(&different, SOURCE);
+    assert_eq!(prepared.identities, other.identities);
+    assert_eq!(prepared.expected.mapped(), other.expected.mapped());
+    assert_ne!(prepared.expected, other.expected);
+    let mut limits = object_limits(); limits.max_origins += 1;
+    let different = build(object_config()).unwrap().with_root_object_reconciliation(limits).unwrap();
+    let changed_policy = snapshot(&different, SOURCE);
+    assert_eq!(prepared.identities, changed_policy.identities);
+    assert_ne!(prepared.expected, changed_policy.expected);
+    assert!(!format!("{:?}", prepared.expected).contains(SOURCE));
+}
+
+#[test]
+fn selected_rows_and_native_cohorts_preserve_object_semantics_in_both_builder_orders() {
+    let selected = Int4JsonSparseLimits { max_rows_per_step: 65 };
+    for object_first in [false, true] {
+        let mut cfg = object_config(); cfg.limits.mapping.reduction.map_batch_chunks = 3;
+        let plain = build(cfg).unwrap();
+        let peak = plain.cohort_requirements().unwrap();
+        let object = if object_first {
+            plain.with_root_object_reconciliation(object_limits()).unwrap().with_selected_rows(selected).unwrap()
+        } else {
+            plain.with_selected_rows(selected).unwrap().with_root_object_reconciliation(object_limits()).unwrap()
+        }.with_chunk_cohorts().unwrap();
+        assert_eq!(object.selected_rows(), Some(selected));
+        assert_eq!(object.root_object_reconciliation(), Some(object_limits()));
+        assert!(object.uses_chunk_cohorts());
+        assert_eq!(object.cohort_requirements().unwrap(), peak);
+        let prepared = snapshot(&object, SOURCE);
+        assert_eq!(prepared.expected.execution_version(), super::super::object::INT4_OBJECT_MAP_SELECTED_EXECUTION);
+        assert_eq!(prepared.expected.selected_rows(), Some(selected));
+        let plan = object.plan(SOURCE, &mut Continue, true).unwrap();
+        object.compare(&plan, &prepared, &mut Continue).unwrap();
+        let actual = plan.cohort_requirements(8192).unwrap();
+        assert!(actual.native.kv_bytes <= peak.native.kv_bytes);
+        assert!(actual.workspace_bytes <= peak.workspace_bytes);
+        assert!(object.with_root_object_reconciliation(object_limits()).is_err());
+    }
+}
+
+#[test]
+fn object_population_rejects_competing_reducers_bad_grounding_and_invalid_bounds_before_sources() {
+    assert!(factory(false).with_root_object_reconciliation(object_limits()).is_err());
+    for case in 0..5 {
+        let mut cfg = object_config(); let mut limits = object_limits();
+        match case {
+            0 => cfg.request.grounding = ExtractionBatchGrounding::SourceMembership,
+            1 => limits.max_properties = 1,
+            2 => limits.max_origins = 1,
+            3 => limits.max_json_bytes = cfg.limits.mapping.reduction.max_result_bytes + 1,
+            _ => limits.max_result_bytes = cfg.limits.mapping.reduction.max_result_bytes + 1,
+        }
+        assert!(build(cfg).unwrap().with_root_object_reconciliation(limits).is_err(), "case {case}");
+    }
+    let mut cfg = config(false);
+    cfg.request.schema = r#"{"type":"array","items":{"type":"integer"},"maxItems":8}"#.to_owned();
+    cfg.limits.root_array_union = Some(super::super::tests::union_limits());
+    assert!(build(cfg).unwrap().with_root_object_reconciliation(object_limits()).is_err());
+}
+
+#[test]
+fn object_attempts_charge_complete_work_mask_and_global_verification_once_per_document() {
+    let object = build(object_config()).unwrap().with_root_object_reconciliation(object_limits()).unwrap();
+    let expected = snapshot(&object, SOURCE).expected;
+    for dimension in 0..9 {
+        let mut cap = object.config.clone();
+        cap.max_model_work = expected.planned_work().checked_add(expected.planned_work()).unwrap();
+        cap.max_mask_visits = expected.reserved_mask_visits() * 2;
+        cap.max_verification = add_verification(cap.limits.verification, cap.limits.verification).unwrap();
+        match dimension {
+            0..=4 => *axis(&mut cap.max_model_work, dimension) -= 1,
+            5 => cap.max_mask_visits -= 1,
+            6 => cap.max_verification.max_fields -= 1,
+            7 => cap.max_verification.max_matches -= 1,
+            _ => cap.max_verification.max_scan_steps -= 1,
+        }
+        let mut ledger = Ledger::default();
+        ledger.begin(&cap, expected, context(1, 1)).unwrap();
+        assert_eq!(ledger.work, expected.planned_work());
+        assert_eq!(ledger.masks, expected.reserved_mask_visits());
+        assert_eq!(ledger.verification, object.document_limits().verification);
+        ledger.failed = false;
+        let before = (ledger.work, ledger.masks, ledger.verification);
+        let failure = ledger.begin(&cap, expected, context(2, 99)).unwrap_err();
+        assert_eq!(failure.fault.code, BatchCode::WorkLimit);
+        assert!(failure.stop && ledger.failed);
+        assert_eq!((ledger.work, ledger.masks, ledger.verification), before);
+    }
+    let mut ledger = Ledger::default();
+    ledger.begin(&object.config, expected, context(1, 1)).unwrap();
+    assert_eq!(ledger.begin(&object.config, expected, context(2, 2)).unwrap_err().fault.code, BatchCode::InvalidExecution);
+    for error in [RootObjectError::Conflict, RootObjectError::MissingRequired, RootObjectError::Source, RootObjectError::Limit] {
+        let failure = document_failure(Int4ObjectExtractionMapError::Reconciliation(error), true);
+        assert!(failure.stop); assert_eq!(failure.fault.code, BatchCode::InvalidExecution);
+    }
+}
+
+#[test]
+fn cancelled_object_planning_never_returns_partial_metadata_and_preserves_cause() {
+    let object = build(object_config()).unwrap().with_root_object_reconciliation(object_limits()).unwrap();
+    struct Cancel;
+    impl DecodeStepControl for Cancel {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { Some(DecodeCancellationKind::Deadline) }
+    }
+    let failure = object.plan(SOURCE, &mut Cancel, false).err().unwrap();
+    assert!(failure.stop); assert!(failure.fault.cancellation.is_some());
+    let failure = document_failure(Int4ObjectExtractionMapError::Reconciliation(
+        RootObjectError::Cancelled(DecodeCancellationKind::User)), false);
+    assert!(failure.stop); assert!(failure.fault.cancellation.is_some());
+}
+
+#[test]
+fn ordinary_document_result_keeps_identical_wire_and_cannot_satisfy_object_completion() {
+    use super::super::tests as fixture;
+    let compiler = fixture::planner();
+    let args = fixture::args(r#"{"type":"boolean"}"#, ExtractionBatchGrounding::Structural);
+    let plan = fixture::prepare(&compiler, SOURCE, &args, fixture::limits());
+    let expected = DocumentPreflight::Map(plan.preflight_metadata());
+    let identities = plan.execution_identities().cloned().collect::<Vec<_>>();
+    let mut script = fixture::Script::new(&args); script.json = Some("true".to_owned());
+    let run = plan.execute_with_driver(&identities, script, &mut Continue).unwrap();
+    let old_bytes = canonjson::canonical_bytes(&run).unwrap();
+    let document = Int4ExtractionDocumentRun::Map(run);
+    assert_eq!(canonjson::canonical_bytes(&document).unwrap(), old_bytes);
+    assert_eq!(document.verification_used(), document.mapped().verification_used);
+    expected.verify_completed(&document).unwrap();
+    let object = build(object_config()).unwrap().with_root_object_reconciliation(object_limits()).unwrap();
+    assert!(snapshot(&object, SOURCE).expected.verify_completed(&document).is_err());
 }

@@ -33,7 +33,9 @@ impl Backend<'_, '_> {
                     .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
                 if engine.kv_cache().capacity_positions() != context || required.kv_bytes == 0
                     || required.kv_bytes != planner.task_ceiling().max_kv_bytes
-                    || required.kv_bytes != planner.document_budget().max_kv_bytes {
+                    || required.kv_bytes != planner.document_budget().max_kv_bytes
+                    || (planner.root_object_reconciliation().is_some()
+                        && planner.document_limits().mapping.reduction.map_batch_chunks != 1) {
                     return Err(BatchItemFailure::fatal(BatchCode::Admission));
                 }
                 Ok(required.kv_bytes)
@@ -43,9 +45,10 @@ impl Backend<'_, '_> {
         }
     }
     pub(super) fn preflight<C: DecodeStepControl>(&mut self, planner: &Int4ExtractionDocumentBatchPlanner,
-        plan: &PreparedInt4ExtractionMap<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
+        plan: &DocumentPlan<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
         -> Result<(), BatchItemFailure> {
         self.check_capacity(planner)?;
+        let plan = plan.mapped();
         if plan.plans.len() != plan.chunks.chunks().len() || plan.plans.len() != plan.expected.chunk_count()
             || plan.expected.selected_rows() != planner.selected_rows() {
             return Err(BatchItemFailure::fatal(BatchCode::Admission));
@@ -83,13 +86,13 @@ impl Backend<'_, '_> {
         }
         poll(control)
     }
-    pub(super) fn execute<C: DecodeStepControl>(&mut self, plan: PreparedInt4ExtractionMap<'_>,
+    pub(super) fn execute<C: DecodeStepControl>(&mut self, plan: DocumentPlan<'_>,
         admitted: &[ExecutionIdentity], vocabulary: &ExtractionVocabulary, control: &mut C)
-        -> Result<Int4ExtractionMapRun, BatchItemFailure> {
+        -> Result<Int4ExtractionDocumentRun, BatchItemFailure> {
         match self {
-            Self::Serial(engine) => plan.execute_with_control(admitted, engine, vocabulary, control).map_err(|e| map_failure(e, true)),
+            Self::Serial(engine) => plan.execute_with_control(admitted, engine, vocabulary, control).map_err(|e| document_failure(e, true)),
             Self::Cohorts { weights, budget, kernel } => plan.execute_cohorts_with_control(
-                admitted, weights, vocabulary, *budget, *kernel, control).map(|run| run.document).map_err(|e| map_failure(e, true)),
+                admitted, weights, vocabulary, *budget, *kernel, control).map_err(|e| document_failure(e, true)),
         }
     }
 }

@@ -193,6 +193,42 @@ quotes the native/decoder window separately from `workspace_bytes`, which
 includes the full map, both schema parses and reconciliation. The serial API
 requires a width of one.
 
+### Resident complete-document streams
+
+The library stream planner also supports this explicit contract. Construct an
+`Int4ExtractionDocumentBatchPlanner` with the **original** schema in its
+`Int4ExtractionDocumentBatchConfig`, then call
+`with_root_object_reconciliation(RootObjectLimits)`. The factory installs the
+same fixed partial-object prompt and schema derivation. It retains the original
+schema rather than demanding that every chunk satisfy the original root
+required set. Configure `with_selected_rows` and `with_chunk_cohorts` as needed;
+serial object execution requires `map_batch_chunks == 1`.
+
+Run the resulting factory through `NlpEngine::batch_int4_extract_documents`.
+Before input or model IO, quote its complete ownership with
+`int4_extraction_document_object_corpus_requirements`, passing the same compiler
+limits and root-object limits. The host independently derives the quote from
+the sealed planner and retains the original/partial-schema and reconciliation
+workspace through output delivery. The pure
+`Int4ExtractionDocumentMemoryLimits::requirements_with_root_object` calculation
+supports callers without the hosted feature. Caller-owned factory preparation
+must also be covered by its explicit pre-IO reservation.
+
+`NativeInt4DocumentExtractionBatch` returns `Int4ExtractionDocumentRun`. Its
+`Map` variant preserves ordinary map JSON; its `Object` variant serializes the
+existing complete object envelope directly, without a new wrapper tag. The
+`mapped()` accessor provides the retained native chunk results, while
+`verification_used()` includes final original-source verification in object
+mode. Successful chunks alone cannot satisfy object completion.
+
+Every input document is one complete result. Flush controls reset only the
+duplicate-ID epoch. Native work, masks and the complete per-attempt verification
+allowance remain debited across documents, failed attempts and flushes. A
+conflict, missing required property, cancellation or exhausted allowance prevents
+publication of that document; earlier complete records remain available. Changing
+the original required fields, reducer limits, selected-row policy or schedule
+invalidates previous preparations even when derived partial schemas coincide.
+
 ## Qualification status
 
 The implementation includes reducer, planner, hosted admission and CLI

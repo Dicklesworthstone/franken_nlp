@@ -168,3 +168,61 @@ fn individually_representable_components_cannot_overflow_the_complete_peak() {
     memory.preparation_reserve_bytes = u64::MAX - other_input - 1024;
     assert!(memory.requirements(32, budget, document, transport).is_err());
 }
+
+#[test]
+fn root_object_quote_owns_original_partial_schemas_and_reconciliation_through_delivery() {
+    let (memory, budget, document, transport) = fixture();
+    let compiler = CompileLimits { max_schema_bytes: 4096, max_states: 128, ..CompileLimits::default() };
+    let object = RootObjectLimits { max_properties: 8, max_origins: 32,
+        max_input_bytes: 4096, max_json_bytes: 4096, max_nodes: 512, max_result_bytes: 65_536 };
+    for cohort_chunks in [None, Some(3)] {
+        let memory = Int4ExtractionDocumentMemoryLimits { cohort_chunks, ..memory };
+        let plain = memory.requirements(32, budget, document, transport).unwrap();
+        assert_eq!(memory.requirements_with_root_object(32, budget, document, transport, compiler, None).unwrap(), plain);
+        let complete = memory.requirements_with_root_object(32, budget, document, transport, compiler, Some(object)).unwrap();
+        assert_eq!(complete.document_workspace_bytes - plain.document_workspace_bytes,
+            object.workspace_bytes().unwrap() + RootObjectSchema::workspace_bytes(compiler).unwrap());
+        assert_eq!(complete.native, plain.native);
+        assert_eq!(complete.workspace_bytes, plain.workspace_bytes);
+        assert_eq!(complete.input_bytes, plain.input_bytes);
+        assert_eq!(complete.output_reservation_bytes, plain.output_reservation_bytes);
+        assert_eq!(complete.max_output_bytes, plain.max_output_bytes);
+    }
+}
+
+#[test]
+fn root_object_quote_rejects_competing_reducers_and_incoherent_bounds_before_io() {
+    for fault in 0..7 {
+        let (memory, budget, mut document, transport) = fixture();
+        let mut compiler = CompileLimits { max_schema_bytes: 4096, max_states: 128, ..CompileLimits::default() };
+        let mut object = RootObjectLimits { max_properties: 8, max_origins: 32,
+            max_input_bytes: 4096, max_json_bytes: 4096, max_nodes: 512, max_result_bytes: 65_536 };
+        match fault {
+            0 => document.root_array_union = Some(crate::tasks::extract::array_union::RootArrayUnionLimits {
+                max_records: 8, max_origins: 32, max_input_bytes: 4096,
+                max_json_bytes: 4096, max_nodes: 512, max_result_bytes: 65_536 }),
+            1 => object.max_properties = 0,
+            2 => object.max_origins = 1,
+            3 => object.max_json_bytes = document.mapping.reduction.max_result_bytes + 1,
+            4 => object.max_result_bytes = document.mapping.reduction.max_result_bytes + 1,
+            5 => compiler.max_schema_bytes = 0,
+            _ => compiler.max_states = usize::MAX,
+        }
+        assert!(memory.requirements_with_root_object(32, budget, document, transport, compiler, Some(object)).is_err(),
+            "fault {fault}");
+    }
+}
+
+#[test]
+fn root_object_extra_frontier_cannot_overflow_a_previously_representable_total() {
+    let (mut memory, budget, document, transport) = fixture();
+    let compiler = CompileLimits { max_schema_bytes: 4096, max_states: 128, ..CompileLimits::default() };
+    let object = RootObjectLimits { max_properties: 8, max_origins: 32,
+        max_input_bytes: 4096, max_json_bytes: 4096, max_nodes: 512, max_result_bytes: 65_536 };
+    let ordinary = memory.requirements(32, budget, document, transport).unwrap();
+    let ordinary_total = ordinary.native.kv_bytes + ordinary.workspace_bytes + ordinary.input_bytes
+        + ordinary.document_workspace_bytes + ordinary.output_reservation_bytes;
+    memory.preparation_reserve_bytes += u64::MAX - ordinary_total - 1024;
+    assert!(memory.requirements(32, budget, document, transport).is_ok());
+    assert!(memory.requirements_with_root_object(32, budget, document, transport, compiler, Some(object)).is_err());
+}

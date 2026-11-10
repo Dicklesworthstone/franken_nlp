@@ -9,6 +9,10 @@ use crate::{
 };
 use super::cohort::{Int4ExtractionMapCohortBudget, Int4ExtractionMapCohortMemoryLimits,
     Int4ExtractionMapCohortRequirement};
+use super::object::{Int4ObjectExtractionPlanner, Int4ObjectExtractionMapLimits,
+    Int4ObjectExtractionMapError, Int4ObjectExtractionMapPreflight,
+    Int4ObjectExtractionMapRun, PreparedInt4ObjectExtractionMap};
+use crate::tasks::extract::object_reconcile::{RootObjectError, RootObjectLimits, RootObjectSchema};
 
 pub mod memory;
 mod backend;
@@ -72,10 +76,159 @@ impl Int4ExtractionDocumentBatchConfig {
     }
 }
 
+/// The complete document retains its selected semantic contract. Untagged
+/// serialization keeps the ordinary map wire exactly as before; object mode
+/// carries the existing partial-map and independently verified object result.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum Int4ExtractionDocumentRun {
+    Map(Int4ExtractionMapRun),
+    Object(Int4ObjectExtractionMapRun),
+}
+impl Int4ExtractionDocumentRun {
+    pub fn mapped(&self) -> &Int4ExtractionMapRun {
+        match self { Self::Map(run) => run, Self::Object(run) => &run.partial_map }
+    }
+    /// Object reconciliation performs an additional original-source check.
+    /// Its complete charge must not be replaced with the partial-map charge.
+    pub fn verification_used(&self) -> ExtractionMapVerification {
+        match self { Self::Map(run) => run.verification_used, Self::Object(run) => run.verification_used }
+    }
+}
+
+/// Shared by the live and durable document hosts. The original required
+/// schema is never compiled as an independent per-chunk task in object mode.
+pub(crate) enum DocumentCompiler {
+    Map(Int4ExtractionBatchPlanner),
+    Object { planner: Int4ObjectExtractionPlanner, limits: RootObjectLimits },
+}
+impl DocumentCompiler {
+    pub(crate) fn base_planner(&self) -> &Int4ExtractionBatchPlanner {
+        match self { Self::Map(planner) => planner, Self::Object { planner, .. } => planner.base_planner() }
+    }
+    pub(crate) fn root_object_reconciliation(&self) -> Option<RootObjectLimits> {
+        match self { Self::Map(_) => None, Self::Object { limits, .. } => Some(*limits) }
+    }
+    pub(crate) fn with_selected_rows(self, limits: Int4JsonSparseLimits) -> Result<Self, BatchFault> {
+        match self {
+            Self::Map(planner) => Ok(Self::Map(planner.with_selected_rows(limits)?)),
+            Self::Object { planner, limits: reconciliation } => Ok(Self::Object {
+                planner: planner.with_selected_rows(limits)?, limits: reconciliation }),
+        }
+    }
+    pub(crate) fn with_root_object_reconciliation(self, request: &ExtractionBatchArgs,
+        mapping: Int4ExtractionMapLimits, reconciliation: RootObjectLimits)
+        -> Result<Self, Int4ObjectExtractionMapError> {
+        let Self::Map(planner) = self else { return Err(Int4ObjectExtractionMapError::Admission); };
+        let limits = Int4ObjectExtractionMapLimits { mapping, reconciliation };
+        limits.reconciliation_workspace_bytes()?;
+        // This bounded schema-only check occurs before any population read.
+        // Every document later repeats it under its original cancellation
+        // control and binds the exact original/partial declarations in proof.
+        struct Continue;
+        impl DecodeStepControl for Continue {
+            fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }
+        }
+        let schema = RootObjectSchema::derive(&request.schema, planner.compiler.compiler_limits,
+            reconciliation, &mut Continue)?;
+        if schema.requires_source() != (request.grounding == ExtractionBatchGrounding::SourceMembership) {
+            return Err(Int4ObjectExtractionMapError::Admission);
+        }
+        Ok(Self::Object { planner: Int4ObjectExtractionPlanner::new(planner)?, limits: reconciliation })
+    }
+    pub(crate) fn plan<'s, C: DecodeStepControl>(&self, source: &'s str,
+        request: &ExtractionBatchArgs, limits: Int4ExtractionMapLimits, control: &mut C)
+        -> Result<DocumentPlan<'s>, Int4ObjectExtractionMapError> {
+        match self {
+            Self::Map(planner) => Ok(DocumentPlan::Map(planner.plan_document_with_control(source, request, limits, control)?)),
+            Self::Object { planner, limits: reconciliation } => Ok(DocumentPlan::Object(
+                planner.plan_document_with_control(source, request,
+                    Int4ObjectExtractionMapLimits { mapping: limits, reconciliation: *reconciliation }, control)?)),
+        }
+    }
+}
+
+/// Private execution plans and complete proofs remain paired by enum variant.
+/// Exposing the mapped rows internally allows the existing real native
+/// preflight to inspect every partial-schema task before admission or forward.
+pub(crate) enum DocumentPlan<'s> {
+    Map(PreparedInt4ExtractionMap<'s>),
+    Object(PreparedInt4ObjectExtractionMap<'s>),
+}
+impl DocumentPlan<'_> {
+    pub(crate) fn mapped(&self) -> &PreparedInt4ExtractionMap<'_> {
+        match self { Self::Map(plan) => plan, Self::Object(plan) => plan.mapped() }
+    }
+    pub(crate) fn preflight_metadata(&self) -> DocumentPreflight {
+        match self { Self::Map(plan) => DocumentPreflight::Map(plan.preflight_metadata()),
+            Self::Object(plan) => DocumentPreflight::Object(plan.preflight_metadata()) }
+    }
+    pub(crate) fn execution_identities(&self) -> impl ExactSizeIterator<Item = &ExecutionIdentity> {
+        self.mapped().execution_identities()
+    }
+    pub(crate) fn max_kv_bytes(&self) -> u64 { self.mapped().max_kv_bytes() }
+    pub(crate) fn max_result_bytes(&self) -> u64 { self.mapped().max_result_bytes() }
+    pub(crate) fn cohort_requirements(&self, context_limit: usize)
+        -> Result<Int4ExtractionMapCohortRequirement, Int4ObjectExtractionMapError> {
+        Ok(self.mapped().cohort_requirements(context_limit)?)
+    }
+    pub(crate) fn execute_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
+        engine: &mut StrictInt4Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
+        -> Result<Int4ExtractionDocumentRun, Int4ObjectExtractionMapError> {
+        match self {
+            Self::Map(plan) => Ok(Int4ExtractionDocumentRun::Map(plan.execute_with_control(admitted, engine, vocabulary, control)?)),
+            Self::Object(plan) => Ok(Int4ExtractionDocumentRun::Object(plan.execute_with_control(admitted, engine, vocabulary, control)?)),
+        }
+    }
+    pub(crate) fn execute_cohorts_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
+        weights: &Int4ModelWeights, vocabulary: &ExtractionVocabulary, budget: Int4ExtractionMapCohortBudget,
+        kernel: PackedInt4Kernel, control: &mut C)
+        -> Result<Int4ExtractionDocumentRun, Int4ObjectExtractionMapError> {
+        match self {
+            Self::Map(plan) => Ok(Int4ExtractionDocumentRun::Map(
+                plan.execute_cohorts_with_control(admitted, weights, vocabulary, budget, kernel, control)?.document)),
+            Self::Object(plan) => Ok(Int4ExtractionDocumentRun::Object(
+                plan.execute_cohorts_with_control(admitted, weights, vocabulary, budget, kernel, control)?.document)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum DocumentPreflight {
+    Map(Int4ExtractionMapPreflight),
+    Object(Int4ObjectExtractionMapPreflight),
+}
+impl fmt::Debug for DocumentPreflight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DocumentPreflight").field("mapped", &self.mapped())
+            .field("root_object_reconciliation", &matches!(self, Self::Object(_))).finish()
+    }
+}
+impl DocumentPreflight {
+    pub(crate) fn mapped(&self) -> Int4ExtractionMapPreflight {
+        match self { Self::Map(proof) => *proof, Self::Object(proof) => proof.mapped() }
+    }
+    pub(crate) fn chunk_count(&self) -> usize { self.mapped().chunk_count() }
+    pub(crate) fn group_width(&self) -> usize { self.mapped().group_width() }
+    pub(crate) fn planned_work(&self) -> Int4Work { self.mapped().planned_work() }
+    pub(crate) fn reserved_mask_visits(&self) -> u64 { self.mapped().reserved_mask_visits() }
+    pub(crate) fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.mapped().selected_rows() }
+    pub(crate) fn execution_version(&self) -> &'static str {
+        match self { Self::Map(proof) => proof.execution_version(), Self::Object(proof) => proof.execution_version() }
+    }
+    pub(crate) fn verify_completed(&self, run: &Int4ExtractionDocumentRun) -> Result<(), Int4ObjectExtractionMapError> {
+        match (self, run) {
+            (Self::Map(proof), Int4ExtractionDocumentRun::Map(run)) => Ok(proof.verify_completed(run)?),
+            (Self::Object(proof), Int4ExtractionDocumentRun::Object(run)) => proof.verify_completed(run),
+            _ => Err(Int4ObjectExtractionMapError::Admission),
+        }
+    }
+}
+
 /// Sealed factory for this live population, bound to actual loaded weights.
 /// Records cannot replace the schema, grounding, compiler, budgets or schedule.
 pub struct Int4ExtractionDocumentBatchPlanner {
-    compiler: Int4ExtractionBatchPlanner,
+    compiler: DocumentCompiler,
     config: Int4ExtractionDocumentBatchConfig,
     chunk_cohorts: bool,
     owner: Arc<()>,
@@ -109,18 +262,29 @@ impl Int4ExtractionDocumentBatchPlanner {
                 &config.request.schema, compiler.compiler.compiler_limits).map_err(|_| BatchCode::Planning)?;
             union.validate_schema(declaration.root()).map_err(|_| BatchCode::Planning)?;
         }
-        Ok(Self { compiler, config, chunk_cohorts: false, owner: Arc::new(()) })
+        Ok(Self { compiler: DocumentCompiler::Map(compiler), config, chunk_cohorts: false, owner: Arc::new(()) })
     }
-    pub fn base_execution_identity(&self) -> &ExecutionIdentity { self.compiler.base_execution_identity() }
-    pub fn group_width(&self) -> usize { self.compiler.group_width() }
-    pub fn task_ceiling(&self) -> TaskBudget { self.compiler.compiler.ceiling }
+    pub fn base_execution_identity(&self) -> &ExecutionIdentity { self.compiler.base_planner().base_execution_identity() }
+    pub fn group_width(&self) -> usize { self.compiler.base_planner().group_width() }
+    pub fn task_ceiling(&self) -> TaskBudget { self.compiler.base_planner().compiler.ceiling }
+    pub fn compiler_limits(&self) -> CompileLimits { self.compiler.base_planner().compiler.compiler_limits }
     pub fn document_budget(&self) -> TaskBudget { self.config.request.budget }
     pub fn request(&self) -> &ExtractionBatchArgs { &self.config.request }
     pub fn document_limits(&self) -> Int4ExtractionMapLimits { self.config.limits }
     pub fn max_run_work(&self) -> Int4Work { self.config.max_model_work }
     pub fn max_mask_visits(&self) -> u64 { self.config.max_mask_visits }
     pub fn max_verification(&self) -> GroundingBudget { self.config.max_verification }
-    pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.compiler.selected_rows() }
+    pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.compiler.base_planner().selected_rows() }
+    pub fn root_object_reconciliation(&self) -> Option<RootObjectLimits> { self.compiler.root_object_reconciliation() }
+    /// Explicitly reconcile complementary root properties under the unchanged
+    /// original schema. This installs the fixed partial-object prompt before
+    /// any source planning and invalidates every earlier preparation owner.
+    pub fn with_root_object_reconciliation(mut self, limits: RootObjectLimits) -> Result<Self, BatchFault> {
+        self.compiler = self.compiler.with_root_object_reconciliation(&self.config.request, self.config.limits, limits)
+            .map_err(|e| document_failure(e, true).fault)?;
+        self.owner = Arc::new(());
+        Ok(self)
+    }
     pub fn uses_chunk_cohorts(&self) -> bool { self.chunk_cohorts }
     /// Bind the complete legal-row policy before any source is prepared. A
     /// prior preparation cannot be transferred even at the full-row ceiling,
@@ -161,17 +325,17 @@ impl Int4ExtractionDocumentBatchPlanner {
             .ok_or_else(|| BatchCode::InvalidLimits.into())
     }
     fn plan<'s, C: DecodeStepControl>(&self, source: &'s str, control: &mut C, fatal: bool)
-        -> Result<PreparedInt4ExtractionMap<'s>, BatchItemFailure> {
+        -> Result<DocumentPlan<'s>, BatchItemFailure> {
         poll(control)?;
         if source.is_empty() || source.len() > self.config.limits.mapping.chunks.max_input_bytes {
             return Err(if fatal { BatchItemFailure::fatal(BatchCode::DocumentLimit) }
                 else { BatchItemFailure::reject(BatchCode::DocumentLimit) });
         }
-        self.compiler.plan_document_with_control(source, self.request(), self.config.limits, control)
-            .map_err(|e| map_failure(e, fatal))
+        self.compiler.plan(source, self.request(), self.config.limits, control)
+            .map_err(|e| document_failure(e, fatal))
     }
-    fn snapshot<C: DecodeStepControl>(&self, plan: &PreparedInt4ExtractionMap<'_>, control: &mut C)
-        -> Result<(Int4ExtractionMapPreflight, Vec<ExecutionIdentity>), BatchItemFailure> {
+    fn snapshot<C: DecodeStepControl>(&self, plan: &DocumentPlan<'_>, control: &mut C)
+        -> Result<(DocumentPreflight, Vec<ExecutionIdentity>), BatchItemFailure> {
         let expected = plan.preflight_metadata();
         if expected.chunk_count() == 0 || expected.chunk_count() > self.config.limits.mapping.chunks.max_chunks
             || expected.group_width() != self.group_width() || expected.selected_rows() != self.selected_rows()
@@ -190,7 +354,7 @@ impl Int4ExtractionDocumentBatchPlanner {
         if !Arc::ptr_eq(&self.owner, &prepared.owner) { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
         Ok(())
     }
-    fn compare<C: DecodeStepControl>(&self, plan: &PreparedInt4ExtractionMap<'_>,
+    fn compare<C: DecodeStepControl>(&self, plan: &DocumentPlan<'_>,
         prepared: &PreparedInt4ExtractionDocument, control: &mut C) -> Result<(), BatchItemFailure> {
         self.owns(prepared)?;
         if plan.preflight_metadata() != prepared.expected || plan.max_kv_bytes() != self.document_budget().max_kv_bytes
@@ -210,7 +374,7 @@ impl Int4ExtractionDocumentBatchPlanner {
 /// Metadata alone cannot authorize another source, schema, factory or schedule.
 pub struct PreparedInt4ExtractionDocument {
     source: String,
-    expected: Int4ExtractionMapPreflight,
+    expected: DocumentPreflight,
     identities: Vec<ExecutionIdentity>,
     owner: Arc<()>,
 }
@@ -269,7 +433,7 @@ impl<A: Int4ExtractionDocumentBatchAdmission> BatchProcessor
     for NativeInt4DocumentExtractionBatch<'_, '_, '_, '_, A> {
     type Args = ExtractionDocumentArgs;
     type Prepared = PreparedInt4ExtractionDocument;
-    type Output = GuardedOutput<Int4ExtractionMapRun, A::Guard>;
+    type Output = GuardedOutput<Int4ExtractionDocumentRun, A::Guard>;
     fn prepare(&mut self, _: BatchDocument<Self::Args>) -> Result<Self::Prepared, BatchItemFailure> {
         self.ledger.failed = true;
         Err(BatchItemFailure::fatal(BatchCode::InvalidExecution))
@@ -326,7 +490,7 @@ impl<A: Int4ExtractionDocumentBatchAdmission> BatchProcessor
             poll(control)?;
             if admitted != prepared.identities { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
             let output = self.backend.execute(plan, &admitted, self.vocabulary, control)?;
-            prepared.expected.verify_completed(&output).map_err(|e| map_failure(e, true))?;
+            prepared.expected.verify_completed(&output).map_err(|e| document_failure(e, true))?;
             self.backend.check_capacity(self.planner)?;
             poll(control)?;
             Ok(GuardedOutput::new(output, guard))
@@ -356,7 +520,7 @@ impl Ledger {
     fn ready(&self) -> Result<(), BatchItemFailure> {
         if self.failed { Err(BatchItemFailure::fatal(BatchCode::InvalidExecution)) } else { Ok(()) }
     }
-    fn begin(&mut self, config: &Int4ExtractionDocumentBatchConfig, expected: Int4ExtractionMapPreflight,
+    fn begin(&mut self, config: &Int4ExtractionDocumentBatchConfig, expected: DocumentPreflight,
         context: BatchRequestContext) -> Result<(), BatchItemFailure> {
         self.ready()?;
         self.failed = true;
@@ -396,6 +560,22 @@ fn map_failure(error: Int4ExtractionMapError, fatal: bool) -> BatchItemFailure {
             | Int4ExtractionMapError::ArrayUnion(_) => (BatchCode::InvalidExecution, true),
     };
     if stop { BatchItemFailure::fatal(code) } else { BatchItemFailure::reject(code) }
+}
+
+fn document_failure(error: Int4ObjectExtractionMapError, fatal: bool) -> BatchItemFailure {
+    if let Some(cause) = error.cancellation() { return BatchItemFailure::fatal(BatchFault::cancelled(cause)); }
+    let code = match error {
+        Int4ObjectExtractionMapError::Map(error) => return map_failure(error, fatal),
+        Int4ObjectExtractionMapError::Admission => BatchCode::Admission,
+        Int4ObjectExtractionMapError::Reconciliation(RootObjectError::InvalidLimits) => BatchCode::InvalidLimits,
+        Int4ObjectExtractionMapError::Reconciliation(RootObjectError::Schema) => BatchCode::Planning,
+        Int4ObjectExtractionMapError::Reconciliation(RootObjectError::Allocation) => BatchCode::Allocation,
+        Int4ObjectExtractionMapError::Reconciliation(_) => BatchCode::InvalidExecution,
+    };
+    // Reconciliation is required document semantics. A conflict, missing
+    // required field, bad source witness or exhausted global allowance never
+    // turns already completed partial chunks into a successful document.
+    BatchItemFailure::fatal(code)
 }
 
 #[cfg(test)] mod tests;

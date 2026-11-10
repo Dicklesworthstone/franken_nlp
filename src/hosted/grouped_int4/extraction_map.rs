@@ -15,7 +15,8 @@ mod cohort;
 mod corpus;
 mod object;
 pub use object::Int4ObjectExtractionMapConfig;
-pub use corpus::int4_extraction_document_corpus_requirements;
+pub use corpus::{int4_extraction_document_corpus_requirements,
+    int4_extraction_document_object_corpus_requirements};
 
 /// Admission for a complete original document. The immutable compiler owns
 /// the base identity; this config cannot substitute another model or task.

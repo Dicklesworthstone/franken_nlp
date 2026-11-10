@@ -70,6 +70,55 @@ fn owned_host_and_cli_share_the_complete_quote_for_both_physical_schedules() {
 }
 
 #[test]
+fn object_stream_quote_retains_both_schema_parses_and_reducer_beside_complete_maps() {
+    let (budget, document, limits, reserve) = fixture();
+    let compiler = CompileLimits { max_schema_bytes: 8192, max_states: 256, ..CompileLimits::default() };
+    let object = RootObjectLimits { max_properties: 16, max_origins: 64,
+        max_input_bytes: 65_536, max_json_bytes: 1024, max_nodes: 4096, max_result_bytes: 4096 };
+    let extra = object.workspace_bytes().unwrap()
+        + crate::tasks::extract::object_reconcile::RootObjectSchema::workspace_bytes(compiler).unwrap();
+    for chunks in [None, Some(3)] {
+        let base = int4_extraction_document_corpus_requirements(32, budget, document, limits, reserve, chunks).unwrap();
+        let omitted = int4_extraction_document_object_corpus_requirements(32, budget, document,
+            limits, reserve, chunks, compiler, None).unwrap();
+        assert_eq!(base, omitted);
+        let quoted = int4_extraction_document_object_corpus_requirements(32, budget, document,
+            limits, reserve, chunks, compiler, Some(object)).unwrap();
+        let core = memory_limits(limits, reserve, chunks).requirements_with_root_object(32, budget,
+            document, limits.transport, compiler, Some(object)).unwrap();
+        assert_eq!(quoted, core);
+        assert_eq!(quoted.document_workspace_bytes, base.document_workspace_bytes + extra);
+        assert_eq!(quoted.native, base.native);
+        assert_eq!(quoted.workspace_bytes, base.workspace_bytes);
+        assert_eq!(quoted.input_bytes, base.input_bytes);
+        assert_eq!(quoted.output_reservation_bytes, base.output_reservation_bytes);
+        assert_eq!(quoted.max_output_bytes, base.max_output_bytes);
+    }
+}
+
+#[test]
+fn object_stream_refuses_conflicting_reducers_invalid_schema_quotes_and_oversized_results() {
+    let (budget, document, limits, reserve) = fixture();
+    let compiler = CompileLimits::default();
+    let object = RootObjectLimits { max_properties: 16, max_origins: 64,
+        max_input_bytes: 65_536, max_json_bytes: 1024, max_nodes: 4096, max_result_bytes: 4096 };
+    for fault in 0..5 {
+        let mut policy = object; let mut c = compiler; let mut d = document;
+        match fault {
+            0 => policy.max_result_bytes = d.mapping.reduction.max_result_bytes + 1,
+            1 => policy.max_json_bytes = d.mapping.reduction.max_result_bytes + 1,
+            2 => policy.max_properties = 0,
+            3 => c.max_schema_bytes = 0,
+            _ => d.root_array_union = Some(crate::tasks::extract::array_union::RootArrayUnionLimits {
+                max_records: 16, max_origins: 64, max_input_bytes: 65_536,
+                max_json_bytes: 1024, max_nodes: 4096, max_result_bytes: 4096 }),
+        }
+        assert!(int4_extraction_document_object_corpus_requirements(32, budget, d, limits,
+            reserve, Some(3), c, Some(policy)).is_err(), "fault {fault}");
+    }
+}
+
+#[test]
 fn admission_checks_the_final_chunk_identity_and_preserves_the_complete_count() {
     let base = identity();
     for cohorts in [false, true] {

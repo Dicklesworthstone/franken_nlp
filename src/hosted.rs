@@ -33,6 +33,7 @@ mod grouped_int4;
 pub use grouped_int4::int4_question_document_job_requirements;
 pub use grouped_int4::{Int4HostError, Int4LoadLimits, Int4LoadRequirements, Int4ExtractionMapConfig, Int4ObjectExtractionMapConfig,
     int4_extraction_document_corpus_requirements,
+    int4_extraction_document_object_corpus_requirements,
     int4_question_document_corpus_requirements,
     Int4ClassificationMapHostConfig, int4_classification_document_corpus_requirements,
     int4_classification_document_corpus_cohort_requirements,

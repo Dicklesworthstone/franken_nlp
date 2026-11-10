@@ -3,8 +3,9 @@
 use super::super::{Int4ExtractionMapError, Int4ExtractionMapLimits,
     cohort::{Int4ExtractionMapCohortMemoryLimits, Int4ExtractionMapCohortRequirement}};
 use super::EXTRACTION_DOCUMENT_CHUNK_METADATA_BYTES;
-use crate::{batch::BatchLimits, native_engine::strict_int4::Int4MemoryRequirement,
-    tasks::ir::TaskBudget, validation::grounded_fields::{SourceFieldEvidence, VerifiedSourceSpan}};
+use crate::{batch::BatchLimits, grammar::CompileLimits, native_engine::strict_int4::Int4MemoryRequirement,
+    tasks::{ir::TaskBudget, extract::object_reconcile::{RootObjectLimits, RootObjectSchema}},
+    validation::grounded_fields::{SourceFieldEvidence, VerifiedSourceSpan}};
 
 /// Caller-owned compiler, schema, vocabulary and IO allocations must fit the
 /// explicit preparation/IO declarations. Native, complete reduction, frozen
@@ -36,6 +37,23 @@ pub struct Int4ExtractionDocumentMemoryRequirement {
 }
 
 impl Int4ExtractionDocumentMemoryLimits {
+    /// Optional complete-object semantics retain both schema declarations and
+    /// the reconciliation frontier in addition to every native chunk result.
+    /// The extra ownership survives final validation and output delivery; it
+    /// neither increases an individual chunk's authority nor renews at flush.
+    #[allow(clippy::too_many_arguments)]
+    pub fn requirements_with_root_object(self, width: usize, budget: TaskBudget,
+        document: Int4ExtractionMapLimits, transport: BatchLimits, compiler: CompileLimits,
+        object: Option<RootObjectLimits>)
+        -> Result<Int4ExtractionDocumentMemoryRequirement, Int4ExtractionMapError> {
+        let mut required = self.requirements(width, budget, document, transport)?;
+        required.document_workspace_bytes = sum(&[required.document_workspace_bytes,
+            root_object_workspace_bytes(document, compiler, object)?])?;
+        sum(&[required.native.kv_bytes, required.workspace_bytes, required.input_bytes,
+            required.document_workspace_bytes, required.output_reservation_bytes])?;
+        Ok(required)
+    }
+
     pub fn requirements(self, width: usize, budget: TaskBudget, document: Int4ExtractionMapLimits,
         transport: BatchLimits) -> Result<Int4ExtractionDocumentMemoryRequirement, Int4ExtractionMapError> {
         budget.validate().map_err(|_| Int4ExtractionMapError::InvalidLimits)?;
@@ -104,6 +122,18 @@ impl Int4ExtractionDocumentMemoryLimits {
                 max_result_bytes_per_chunk: budget.max_output_bytes }.requirements(width)
         }).transpose()
     }
+}
+
+/// Shared pre-IO quote for corpus and durable complete-object extraction.
+/// A root-array reducer and a partial-root-object reducer cannot coexist.
+/// Absence preserves the ordinary exact-schema map's ownership contract.
+pub fn root_object_workspace_bytes(document: Int4ExtractionMapLimits, compiler: CompileLimits,
+    object: Option<RootObjectLimits>) -> Result<u64, Int4ExtractionMapError> {
+    let Some(reconciliation) = object else { return Ok(0); };
+    let limits = super::super::object::Int4ObjectExtractionMapLimits { mapping: document, reconciliation };
+    let reduction = limits.reconciliation_workspace_bytes().map_err(|_| Int4ExtractionMapError::InvalidLimits)?;
+    let schemas = RootObjectSchema::workspace_bytes(compiler).map_err(|_| Int4ExtractionMapError::InvalidLimits)?;
+    sum(&[reduction, schemas])
 }
 
 fn sum(values: &[u64]) -> Result<u64, Int4ExtractionMapError> {
