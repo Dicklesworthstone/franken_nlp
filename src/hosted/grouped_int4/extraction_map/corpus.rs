@@ -8,7 +8,7 @@ use crate::{
                 Int4ExtractionDocumentAdmission, Int4ExtractionDocumentBatchAdmission,
                 memory::{Int4ExtractionDocumentMemoryLimits, Int4ExtractionDocumentMemoryRequirement}}}},
     hosted::corpus::CorpusLimits,
-    native_engine::{lmhead::NANBEIGE_VOCAB_SIZE, strict_int4::Int4Work},
+    native_engine::{constrained_int4::sparse::Int4JsonSparseLimits, lmhead::NANBEIGE_VOCAB_SIZE, strict_int4::Int4Work},
 };
 
 struct StreamInput<R, W> {
@@ -69,7 +69,7 @@ impl NlpEngine {
         let required = int4_extraction_document_corpus_requirements(planner.group_width(),
             planner.document_budget(), document, limits, reduction_reserve_bytes, cohort_chunks)?;
         let cohort = cohort_chunks.map(|_| planner.cohort_requirements().map_err(HostedError::BatchSetup)).transpose()?;
-        let capacity = DocumentCapacity { document, budget: planner.document_budget(),
+        let capacity = DocumentCapacity { document, budget: planner.document_budget(), selected_rows: planner.selected_rows(),
             kv_bytes: required.native.kv_bytes, max_result_bytes: required.max_output_bytes };
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
@@ -128,6 +128,7 @@ impl NlpEngine {
 struct DocumentCapacity {
     document: Int4ExtractionMapLimits,
     budget: TaskBudget,
+    selected_rows: Option<Int4JsonSparseLimits>,
     kv_bytes: u64,
     max_result_bytes: u64,
 }
@@ -179,18 +180,27 @@ fn check_request(width: usize, base: &ExecutionIdentity, capacity: DocumentCapac
         || request.mask_limits.checkpoint_interval_nodes != m.mask_limits.checkpoint_interval_nodes {
         return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
     }
+    let rows_per_token = match c.selected_rows {
+        Some(limits) => limits.validate().map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))? as u64,
+        None => NANBEIGE_VOCAB_SIZE as u64,
+    };
+    // Admission receives planned ceilings, including terminal EOS for every
+    // chunk. Bind the whole allowance to the factory's exact projection policy;
+    // actual sparse rows and a divisible subtotal cannot renew or reduce it.
+    let tokens = u64::from(c.budget.max_output_tokens).checked_mul(request.chunk_count as u64)
+        .filter(|&tokens| tokens != 0).ok_or_else(|| BatchItemFailure::fatal(BatchCode::InvalidExecution))?;
+    let projected = tokens.checked_mul(rows_per_token)
+        .ok_or_else(|| BatchItemFailure::fatal(BatchCode::InvalidExecution))?;
     let work = request.model_work;
     if [work.forward_positions, work.projected_logits, work.attention_pairs,
         work.projections.dot_products, work.projections.multiply_accumulates].contains(&0)
-        || work.projected_logits % NANBEIGE_VOCAB_SIZE as u64 != 0
-        || work.projected_logits / NANBEIGE_VOCAB_SIZE as u64 > work.forward_positions
+        || work.projected_logits != projected || tokens > work.forward_positions
         || !work_fits(work, m.max_model_work) {
         return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
     }
     if c.max_result_bytes == 0 || c.max_result_bytes != m.reduction.max_result_bytes as u64
         || request.max_result_bytes != c.max_result_bytes
-        || u64::from(c.budget.max_output_tokens).checked_mul(request.chunk_count as u64)
-            != Some(request.max_output_tokens) {
+        || tokens != request.max_output_tokens {
         return Err(BatchItemFailure::fatal(BatchCode::OutputLineLimit));
     }
     Ok(())

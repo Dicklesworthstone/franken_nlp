@@ -33,12 +33,14 @@ fn capacity(cohorts: bool) -> DocumentCapacity {
     let (budget, document, limits, reserve) = fixture();
     let chunks = cohorts.then_some(document.mapping.reduction.map_batch_chunks);
     let quote = int4_extraction_document_corpus_requirements(32, budget, document, limits, reserve, chunks).unwrap();
-    DocumentCapacity { document, budget, kv_bytes: quote.native.kv_bytes, max_result_bytes: quote.max_output_bytes }
+    DocumentCapacity { document, budget, selected_rows: None,
+        kv_bytes: quote.native.kv_bytes, max_result_bytes: quote.max_output_bytes }
 }
 fn request(identities: &[ExecutionIdentity], capacity: DocumentCapacity) -> Int4ExtractionDocumentAdmission<'_> {
     let chunks = identities.len();
+    let rows = capacity.selected_rows.map_or(NANBEIGE_VOCAB_SIZE, |limits| limits.max_rows_per_step);
     Int4ExtractionDocumentAdmission { identities,
-        model_work: Int4Work::for_sequence(32, 0, 128, 16 * chunks * NANBEIGE_VOCAB_SIZE).unwrap(),
+        model_work: Int4Work::for_sequence(32, 0, 128, capacity.budget.max_output_tokens as usize * chunks * rows).unwrap(),
         mask_node_visits: capacity.document.mapping.mask_visits_per_chunk * chunks as u64,
         mask_limits: capacity.document.mapping.mask_limits, kv_reservation_bytes: capacity.kv_bytes,
         max_result_bytes: capacity.max_result_bytes,
@@ -182,4 +184,67 @@ fn supplied_io_and_all_document_owners_can_cross_the_physical_invocation() {
     send::<Charged<StreamInput<std::io::Cursor<Vec<u8>>, Vec<u8>>>>();
     let _host = NlpEngine::batch_int4_extract_documents::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
     let _public_quote = crate::hosted::int4_extraction_document_corpus_requirements;
+}
+
+
+#[test]
+fn selected_document_work_uses_the_factory_ceiling_in_serial_and_cohort_streams() {
+    let base = identity(); let identities = [identity(), identity(), identity()];
+    for cohorts in [false, true] {
+        let dense = capacity(cohorts);
+        let dense_request = request(&identities, dense);
+        check_request(32, &base, dense, &dense_request).unwrap();
+        for cap in [1, 7, 32, 65, NANBEIGE_VOCAB_SIZE] {
+            let mut selected = dense; selected.selected_rows = Some(Int4JsonSparseLimits { max_rows_per_step: cap });
+            let claim = request(&identities, selected);
+            assert_eq!(claim.model_work.projected_logits, claim.max_output_tokens * cap as u64);
+            assert_eq!(claim.max_output_tokens, dense_request.max_output_tokens);
+            assert_eq!(claim.max_result_bytes, dense_request.max_result_bytes);
+            assert_eq!(claim.kv_reservation_bytes, dense_request.kv_reservation_bytes);
+            if cap == 32 { assert_ne!(claim.model_work.projected_logits % NANBEIGE_VOCAB_SIZE as u64, 0); }
+            check_request(32, &base, selected, &claim).unwrap();
+            if cap != NANBEIGE_VOCAB_SIZE {
+                assert_eq!(check_request(32, &base, selected, &dense_request).unwrap_err().fault.code,
+                    BatchCode::InvalidExecution);
+                assert_eq!(check_request(32, &base, dense, &claim).unwrap_err().fault.code,
+                    BatchCode::InvalidExecution);
+            } else {
+                assert_eq!(claim.model_work, dense_request.model_work);
+            }
+            let mut another_policy = selected;
+            another_policy.selected_rows = Some(Int4JsonSparseLimits { max_rows_per_step: if cap == 1 { 2 } else { cap - 1 } });
+            assert!(check_request(32, &base, another_policy, &claim).is_err());
+        }
+    }
+}
+
+#[test]
+fn planned_sparse_rows_cannot_shrink_to_an_actual_subtotal_or_renew_output_ownership() {
+    let base = identity(); let identities = [identity(), identity()];
+    for cohorts in [false, true] {
+        let mut c = capacity(cohorts); c.selected_rows = Some(Int4JsonSparseLimits { max_rows_per_step: 32 });
+        let valid = request(&identities, c);
+        for change in [-32_i64, -1, 1, 32] {
+            let mut claim = request(&identities, c);
+            claim.model_work.projected_logits = valid.model_work.projected_logits.checked_add_signed(change).unwrap();
+            // A smaller divisible subtotal was accepted by a modulo-only gate.
+            if change == -32 { claim.max_output_tokens -= 1; }
+            let error = check_request(32, &base, c, &claim).unwrap_err();
+            assert!(error.stop); assert_eq!(error.fault.code, BatchCode::InvalidExecution);
+        }
+        for cap in [0, NANBEIGE_VOCAB_SIZE + 1] {
+            let mut invalid = c; invalid.selected_rows = Some(Int4JsonSparseLimits { max_rows_per_step: cap });
+            assert_eq!(check_request(32, &base, invalid, &valid).unwrap_err().fault.code, BatchCode::Admission);
+        }
+        let mut unselected = capacity(cohorts);
+        let mut dense = request(&identities, unselected);
+        dense.model_work.projected_logits -= NANBEIGE_VOCAB_SIZE as u64;
+        assert_eq!(check_request(32, &base, unselected, &dense).unwrap_err().fault.code, BatchCode::InvalidExecution);
+        unselected.budget.max_output_tokens = 0;
+        assert_eq!(check_request(32, &base, unselected, &dense).unwrap_err().fault.code, BatchCode::InvalidExecution);
+        let mut claim = request(&identities, c); claim.max_output_tokens -= 1;
+        assert_eq!(check_request(32, &base, c, &claim).unwrap_err().fault.code, BatchCode::OutputLineLimit);
+        let mut claim = request(&identities, c); claim.model_work.forward_positions = claim.max_output_tokens - 1;
+        assert_eq!(check_request(32, &base, c, &claim).unwrap_err().fault.code, BatchCode::InvalidExecution);
+    }
 }

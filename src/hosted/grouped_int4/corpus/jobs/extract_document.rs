@@ -6,6 +6,7 @@ use crate::{
     batch::extract::grouped_int4::long::{Int4ExtractionMapLimits,
         cohort::{Int4ExtractionMapCohortBudget, Int4ExtractionMapCohortRequirement}},
     grammar::mask::MaskWorkLimits,
+    native_engine::constrained_int4::sparse::Int4JsonSparseLimits,
     hosted::grouped_int4::extraction_map::document_workspace_bytes,
     jobs::runner::extract::grouped_int4::document::{Int4DocumentExtractionJobPlanner,
         Int4DocumentExtractionJobProcessor, Int4ExtractionDocumentAdmission,
@@ -116,7 +117,8 @@ impl NlpEngine {
                 required.native, kernel, kv, scratch, cohort)?;
             let admission = DocumentAdmission { lease: &lease, model: model.model_identity(),
                 base: planner.execution_identity(), kv_bytes: required.native.kv_bytes,
-                document, result_bytes, output_tokens_per_chunk: u64::from(budget.max_output_tokens) };
+                document, result_bytes, output_tokens_per_chunk: u64::from(budget.max_output_tokens),
+                selected_rows: planner.selected_rows() };
             let result = (|| {
                 let processor = match &mut native {
                     DocumentNative::Serial(engine) => Int4DocumentExtractionJobProcessor::new(
@@ -188,13 +190,14 @@ struct DocumentAdmission<'a> {
     document: Int4ExtractionMapLimits,
     result_bytes: u64,
     output_tokens_per_chunk: u64,
+    selected_rows: Option<Int4JsonSparseLimits>,
 }
 impl Int4ExtractionDocumentBatchAdmission for DocumentAdmission<'_> {
     type Guard = Pending;
     fn admit(&mut self, request: Int4ExtractionDocumentAdmission<'_>)
         -> Result<(Vec<ExecutionIdentity>, Self::Guard), BatchItemFailure> {
         check_request(self.model.group_width(), self.base, self.kv_bytes, self.document,
-            self.result_bytes, self.output_tokens_per_chunk, &request)?;
+            self.result_bytes, self.output_tokens_per_chunk, self.selected_rows, &request)?;
         let mut identities = Vec::new();
         identities.try_reserve_exact(request.identities.len())
             .map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
@@ -211,7 +214,8 @@ impl Int4ExtractionDocumentBatchAdmission for DocumentAdmission<'_> {
 
 #[allow(clippy::too_many_arguments)]
 fn check_request(width: usize, base: &ExecutionIdentity, kv_bytes: u64, document: Int4ExtractionMapLimits,
-    result_bytes: u64, output_tokens_per_chunk: u64, request: &Int4ExtractionDocumentAdmission<'_>)
+    result_bytes: u64, output_tokens_per_chunk: u64, selected_rows: Option<Int4JsonSparseLimits>,
+    request: &Int4ExtractionDocumentAdmission<'_>)
     -> Result<(), BatchItemFailure> {
     let mapping = document.mapping;
     if base.task_spec != "extract-v1" || request.chunk_count == 0
@@ -233,11 +237,21 @@ fn check_request(width: usize, base: &ExecutionIdentity, kv_bytes: u64, document
         || !same_masks(request.mask_limits, mapping.mask_limits) {
         return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
     }
+    let rows_per_token = match selected_rows {
+        Some(limits) => limits.validate().map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))? as u64,
+        None => NANBEIGE_VOCAB_SIZE as u64,
+    };
+    // Persisted document work is the complete planned allowance for every
+    // chunk, not the number of sparse rows actually projected by a completed
+    // attempt. Keep the selected ceiling supplied by the authenticated factory.
+    let tokens = output_tokens_per_chunk.checked_mul(request.chunk_count as u64)
+        .filter(|&tokens| tokens != 0).ok_or_else(|| BatchItemFailure::fatal(BatchCode::InvalidExecution))?;
+    let projected = tokens.checked_mul(rows_per_token)
+        .ok_or_else(|| BatchItemFailure::fatal(BatchCode::InvalidExecution))?;
     let work = request.model_work;
     if work.forward_positions == 0 || work.attention_pairs == 0
         || work.projections.dot_products == 0 || work.projections.multiply_accumulates == 0
-        || work.projected_logits == 0 || work.projected_logits % NANBEIGE_VOCAB_SIZE as u64 != 0
-        || work.projected_logits / NANBEIGE_VOCAB_SIZE as u64 > work.forward_positions
+        || work.projected_logits != projected || tokens > work.forward_positions
         || !crate::jobs::JobWork::from_int4(work, request.mask_node_visits)
             .fits(crate::jobs::JobWork::from_int4(mapping.max_model_work, mapping.max_mask_visits)) {
         return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
@@ -246,7 +260,7 @@ fn check_request(width: usize, base: &ExecutionIdentity, kv_bytes: u64, document
     // Preserve their actual INT4 group costs; do not reinterpret their sum as
     // one context or recompute it through the historical INT8 wire counters.
     if request.max_result_bytes == 0 || request.max_result_bytes != result_bytes
-        || output_tokens_per_chunk.checked_mul(request.chunk_count as u64) != Some(request.max_output_tokens) {
+        || tokens != request.max_output_tokens {
         return Err(BatchItemFailure::reject(BatchCode::OutputLineLimit));
     }
     Ok(())

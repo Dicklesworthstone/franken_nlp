@@ -152,11 +152,11 @@ fn cohort_admission_retains_whole_window_kv_with_exact_semantic_result_tokens() 
     let (budget, document, _, _) = fixture(); let base = identity(); let ids = [identity(), identity()];
     let peak = 4 * budget.max_kv_bytes;
     let mut claim = request(&ids, document, peak);
-    check_request(WIDTH, &base, peak, document, 65536, 16, &claim).unwrap();
+    check_request(WIDTH, &base, peak, document, 65536, 16, None, &claim).unwrap();
     claim.kv_reservation_bytes = budget.max_kv_bytes;
-    assert!(check_request(WIDTH, &base, peak, document, 65536, 16, &claim).is_err());
+    assert!(check_request(WIDTH, &base, peak, document, 65536, 16, None, &claim).is_err());
     claim.kv_reservation_bytes = peak; claim.max_output_tokens += 1;
-    assert!(check_request(WIDTH, &base, peak, document, 65536, 16, &claim).is_err());
+    assert!(check_request(WIDTH, &base, peak, document, 65536, 16, None, &claim).is_err());
 }
 
 #[test]
@@ -177,7 +177,7 @@ fn many_native_sequences_can_exceed_one_context_without_changing_the_group_work(
     let (budget, document, _, _) = fixture(); let base = identity(); let ids = [identity(), identity()];
     let req = request(&ids, document, budget.max_kv_bytes);
     assert!(req.model_work.forward_positions > document.mapping.chunks.context_tokens as u64);
-    assert!(check_request(WIDTH, &base, budget.max_kv_bytes, document, 65536, 16, &req).is_ok());
+    assert!(check_request(WIDTH, &base, budget.max_kv_bytes, document, 65536, 16, None, &req).is_ok());
 }
 
 #[test]
@@ -190,11 +190,11 @@ fn the_last_chunk_must_have_the_same_task_pinned_assets_and_profile() {
             2 => ids[1].quant_recipe = format!("{GROUPED_INT4_RECIPE}:group=128"),
             3 => ids[1].tokenizer_digest = Sha256Digest::of_bytes(b"different-tokenizer"),
             _ => ids[1].template_digest = Sha256Digest::of_bytes(b"different-template") }
-        assert!(check_request(WIDTH, &base, budget.max_kv_bytes, document, 65536, 16,
+        assert!(check_request(WIDTH, &base, budget.max_kv_bytes, document, 65536, 16, None,
             &request(&ids, document, budget.max_kv_bytes)).is_err(), "axis {axis}");
     }
     let ids = [identity()];
-    assert!(check_request(WIDTH, &base, budget.max_kv_bytes, document, 65536, 16,
+    assert!(check_request(WIDTH, &base, budget.max_kv_bytes, document, 65536, 16, None,
         &request(&ids, document, budget.max_kv_bytes)).is_err());
 }
 
@@ -212,7 +212,7 @@ fn chunk_count_mask_token_and_result_claims_cannot_diverge_from_complete_prepara
             10 => req.model_work.attention_pairs = document.mapping.max_model_work.attention_pairs + 1,
             11 => req.model_work.projections.dot_products = document.mapping.max_model_work.projections.dot_products + 1,
             _ => req.model_work.projections.multiply_accumulates = document.mapping.max_model_work.projections.multiply_accumulates + 1 }
-        assert!(check_request(WIDTH, &base, budget.max_kv_bytes, document, 65536, 16, &req).is_err(), "axis {axis}");
+        assert!(check_request(WIDTH, &base, budget.max_kv_bytes, document, 65536, 16, None, &req).is_err(), "axis {axis}");
     }
 }
 
@@ -256,4 +256,68 @@ fn the_private_factory_vocabulary_population_and_reader_cross_one_owned_boundary
     send::<ExtractionDocumentInput<Cursor<Vec<u8>>>>();
     send::<Charged<ExtractionDocumentInput<Cursor<Vec<u8>>>>>();
     let _entry = NlpEngine::job_int4_extract_document::<Cursor<Vec<u8>>>;
+}
+
+
+#[test]
+fn selected_document_jobs_preserve_the_exact_planned_ceiling_across_serial_and_cohort_admission() {
+    let (budget, document, _, _) = fixture(); let base = identity(); let ids = [identity(), identity()];
+    for slots in [1, 4] {
+        let peak = slots * budget.max_kv_bytes;
+        let dense = request(&ids, document, peak);
+        check_request(WIDTH, &base, peak, document, 65536, 16, None, &dense).unwrap();
+        for cap in [1, 7, 32, 65, NANBEIGE_VOCAB_SIZE] {
+            let selected = Some(Int4JsonSparseLimits { max_rows_per_step: cap });
+            let one = Int4Work::for_sequence(WIDTH, 0, 64, 16 * cap).unwrap();
+            let mut claim = request(&ids, document, peak);
+            claim.model_work = one.checked_add(one).unwrap();
+            assert_eq!(claim.model_work.projected_logits, claim.max_output_tokens * cap as u64);
+            assert!(claim.model_work.forward_positions > document.mapping.chunks.context_tokens as u64);
+            assert_eq!(claim.max_result_bytes, dense.max_result_bytes);
+            assert_eq!(claim.max_output_tokens, dense.max_output_tokens);
+            if cap == 32 { assert_ne!(claim.model_work.projected_logits % NANBEIGE_VOCAB_SIZE as u64, 0); }
+            check_request(WIDTH, &base, peak, document, 65536, 16, selected, &claim).unwrap();
+            if cap != NANBEIGE_VOCAB_SIZE {
+                assert_eq!(check_request(WIDTH, &base, peak, document, 65536, 16, None, &claim)
+                    .unwrap_err().fault.code, BatchCode::InvalidExecution);
+                assert_eq!(check_request(WIDTH, &base, peak, document, 65536, 16, selected, &dense)
+                    .unwrap_err().fault.code, BatchCode::InvalidExecution);
+            } else { assert_eq!(claim.model_work, dense.model_work); }
+            let other = Some(Int4JsonSparseLimits { max_rows_per_step: if cap == 1 { 2 } else { cap - 1 } });
+            assert!(check_request(WIDTH, &base, peak, document, 65536, 16, other, &claim).is_err());
+        }
+    }
+}
+
+#[test]
+fn selected_job_admission_refuses_short_divisible_work_overflow_and_renewed_output_authority() {
+    let (budget, document, _, _) = fixture(); let base = identity(); let ids = [identity(), identity()];
+    let selected = Some(Int4JsonSparseLimits { max_rows_per_step: 32 });
+    let one = Int4Work::for_sequence(WIDTH, 0, 64, 16 * 32).unwrap();
+    for slots in [1, 4] {
+        let peak = slots * budget.max_kv_bytes;
+        for delta in [-32_i64, -1, 1, 32] {
+            let mut claim = request(&ids, document, peak); claim.model_work = one.checked_add(one).unwrap();
+            claim.model_work.projected_logits = claim.model_work.projected_logits.checked_add_signed(delta).unwrap();
+            if delta == -32 { claim.max_output_tokens -= 1; }
+            let error = check_request(WIDTH, &base, peak, document, 65536, 16, selected, &claim).unwrap_err();
+            assert!(error.stop); assert_eq!(error.fault.code, BatchCode::InvalidExecution);
+        }
+        let mut claim = request(&ids, document, peak); claim.model_work = one.checked_add(one).unwrap();
+        for cap in [0, NANBEIGE_VOCAB_SIZE + 1] {
+            let invalid = Some(Int4JsonSparseLimits { max_rows_per_step: cap });
+            assert_eq!(check_request(WIDTH, &base, peak, document, 65536, 16, invalid, &claim)
+                .unwrap_err().fault.code, BatchCode::Admission);
+        }
+        for tokens in [0, u64::MAX, u64::MAX / 2] {
+            assert_eq!(check_request(WIDTH, &base, peak, document, 65536, tokens, selected, &claim)
+                .unwrap_err().fault.code, BatchCode::InvalidExecution);
+        }
+        claim.max_output_tokens -= 1;
+        assert_eq!(check_request(WIDTH, &base, peak, document, 65536, 16, selected, &claim)
+            .unwrap_err().fault.code, BatchCode::OutputLineLimit);
+        let mut dense = request(&ids, document, peak); dense.model_work.projected_logits -= NANBEIGE_VOCAB_SIZE as u64;
+        assert_eq!(check_request(WIDTH, &base, peak, document, 65536, 16, None, &dense)
+            .unwrap_err().fault.code, BatchCode::InvalidExecution);
+    }
 }
