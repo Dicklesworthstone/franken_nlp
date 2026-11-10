@@ -4,6 +4,7 @@ use super::*;
 use super::document_native::DocumentNative;
 use crate::{
     batch::extract::grouped_int4::long::{Int4ExtractionMapLimits,
+        stream::memory::root_object_workspace_bytes,
         cohort::{Int4ExtractionMapCohortBudget, Int4ExtractionMapCohortRequirement}},
     grammar::mask::MaskWorkLimits,
     native_engine::constrained_int4::sparse::Int4JsonSparseLimits,
@@ -35,24 +36,35 @@ impl Int4DocumentExtractionJobPlanner {
         if native.context_tokens != document.mapping.chunks.context_tokens {
             return Err(HostedError::Limits("INT4 extraction document job resident context"));
         }
-        document_workspace_bytes(self.document_budget(), document,
-            document.mapping.chunks.max_chunks, reduction_reserve_bytes)
+        complete_workspace_bytes(self.document_budget(), document, reduction_reserve_bytes,
+            self.compiler_limits(), self.root_object_reconciliation())
     }
+}
+
+fn complete_workspace_bytes(budget: TaskBudget, document: Int4ExtractionMapLimits, reserve: u64,
+    compiler: crate::grammar::CompileLimits,
+    object: Option<crate::tasks::extract::object_reconcile::RootObjectLimits>) -> Result<u64, HostedError> {
+    sum(&[document_workspace_bytes(budget, document, document.mapping.chunks.max_chunks, reserve)?,
+        root_object_workspace_bytes(document, compiler, object)
+            .map_err(|_| HostedError::Limits("INT4 extraction document job object workspace"))?])
 }
 
 impl NlpEngine {
     /// Start or resume fixed-schema extraction over the complete original
     /// population. Every document commits all independently validated chunk
     /// values and source locations as one result, including an optional exact
-    /// root-array union authenticated by the job recipe. A required field that cannot be produced
-    /// under its schema/source constraint remains a typed no-result failure.
+    /// root-array union authenticated by the job recipe. An explicitly
+    /// configured root-object factory instead reconciles complementary atomic
+    /// properties from partial chunk objects, verifies the complete original
+    /// schema and refuses conflicts or missing required fields. Both modes
+    /// preserve all native chunk values and original-coordinate evidence.
     ///
     /// The immutable factory and complete input population authenticate before
     /// native execution or tail repair. Exact group-aware work and masks are
     /// debited before execution; failed attempts and resumes do not replenish
     /// model or verification authority. Output guards survive spool sync and
     /// journal acknowledgement. This API does not publish private results to
-    /// stdout or retain an input spool for future resume.
+    /// stdout. Retaining original inputs requires the explicit request mode.
     /// `planner.with_chunk_cohorts()` selects authenticated native chunk
     /// windows while retaining one whole-document result and commit boundary.
     #[allow(clippy::too_many_arguments)]

@@ -4,14 +4,18 @@
 use super::*;
 use crate::{
     batch::extract::grouped_int4::long::{Int4ExtractionMapError, Int4ExtractionMapLimits,
-        Int4ExtractionMappingLimits, Int4ExtractionMapPreflight, Int4ExtractionMapRun,
-        PreparedInt4ExtractionMap, INT4_EXTRACTION_MAP_EXECUTION, INT4_EXTRACTION_MAP_SELECTED_EXECUTION,
+        Int4ExtractionMappingLimits, INT4_EXTRACTION_MAP_EXECUTION, INT4_EXTRACTION_MAP_SELECTED_EXECUTION,
+        object::{Int4ObjectExtractionMapError,
+            INT4_OBJECT_MAP_EXECUTION, INT4_OBJECT_MAP_SELECTED_EXECUTION, ROOT_OBJECT_MAP_PROMPT},
+        stream::{DocumentCompiler, DocumentPlan, DocumentPreflight, Int4ExtractionDocumentRun},
         cohort::{Int4ExtractionMapCohortBudget, Int4ExtractionMapCohortMemoryLimits,
             Int4ExtractionMapCohortRequirement}},
     native_engine::{constrained_int4::{self, sparse::Int4JsonSparseLimits}, int4::PackedInt4Kernel,
         strict_int4::{Int4MemoryRequirement, Int4ModelWeights}},
     tasks::{mapreduce::{ChunkLimits, ExecutionLimits, CHUNK_PROFILE},
-        extract::array_union::{RootArrayUnionLimits, ROOT_ARRAY_UNION_POLICY}},
+        extract::{array_union::{RootArrayUnionLimits, ROOT_ARRAY_UNION_POLICY},
+            object_reconcile::{RootObjectLimits, RootObjectError,
+                ROOT_OBJECT_DERIVATION, ROOT_OBJECT_RECONCILIATION}}},
     validation::grounded_fields::GroundingBudget,
 };
 use std::sync::Arc;
@@ -30,6 +34,18 @@ const CHUNK_COHORT_SCHEDULE: &str = "native-document-chunk-cohorts-v1";
 struct RootArrayUnionRecipe {
     policy: &'static str,
     limits: RootArrayUnionLimits,
+}
+
+/// Original schema bytes remain in `extraction.defaults`. The independently
+/// derived partial schema and the task-owned prompt are deterministic under
+/// these exact versions and compiler bounds; changing any value changes the
+/// private job commitment before recovery or native execution.
+#[derive(Serialize)]
+struct RootObjectRecipe {
+    policy: &'static str,
+    schema_derivation: &'static str,
+    prompt_version: &'static str,
+    limits: RootObjectLimits,
 }
 
 /// The complete legal set is projected or the step refuses. The cap and both
@@ -69,6 +85,8 @@ pub struct Int4DocumentExtractionJobRecipe {
     root_array_union: Option<RootArrayUnionRecipe>,
     #[serde(skip_serializing_if = "Option::is_none")]
     selected_rows: Option<SelectedRowsRecipe>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_object_reconciliation: Option<RootObjectRecipe>,
 }
 impl Int4DocumentExtractionJobRecipe {
     fn new(extraction: Int4ExtractionJobRecipe, document: Int4ExtractionMapLimits,
@@ -86,6 +104,7 @@ impl Int4DocumentExtractionJobRecipe {
             max_trie_node_visits, checkpoint_interval_nodes, mask_visits_per_chunk,
             max_mask_visits_per_document: max_mask_visits, verification,
             max_lifetime_verification, max_attempts, chunk_cohorts: None, selected_rows: None,
+            root_object_reconciliation: None,
             root_array_union: root_array_union.map(|limits| RootArrayUnionRecipe {
                 policy: ROOT_ARRAY_UNION_POLICY, limits }) };
         bounded_json(&recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
@@ -96,7 +115,7 @@ impl Int4DocumentExtractionJobRecipe {
 /// Model-bound immutable factory. This owns the same actual pinned compiler,
 /// fixed raw schema and source-verification settings used for every chunk.
 pub struct Int4DocumentExtractionJobPlanner {
-    compiler: Int4ExtractionBatchPlanner,
+    compiler: DocumentCompiler,
     identity: ExecutionIdentity,
     document: Int4ExtractionMapLimits,
     limits: JobLimits,
@@ -112,6 +131,44 @@ impl Int4DocumentExtractionJobPlanner {
         let native = native_limits(document, job);
         let extraction = Int4ExtractionJobPlanner::for_model(model, ceiling, compiler, source, request, native)?;
         Self::configured(extraction, document, job, max_lifetime_verification)
+    }
+    /// Execute explicitly partial root objects and reconcile one complete
+    /// original-schema result per durable item. Only the root required set is
+    /// relaxed for native chunks; nested values remain atomic. The original
+    /// schema, fixed prompt/derivation, reducer limits and every verification
+    /// allowance are authenticated before recovery. No ordinary extraction
+    /// job acquires these semantics implicitly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_object_model(model: &Int4ModelIdentity, ceiling: TaskBudget, compiler: CompileLimits,
+        source: SourceRuntimeLimits, request: ExtractionBatchArgs, document: Int4ExtractionMapLimits,
+        job: JobLimits, max_lifetime_verification: GroundingBudget, reconciliation: RootObjectLimits)
+        -> Result<Self, BatchFault> {
+        validate_limits(model.group_width(), ceiling, request.budget, document, job)?;
+        let extraction = Int4ExtractionJobRecipe::new(model.group_width(), ceiling, compiler,
+            source, native_limits(document, job), request)?;
+        // A full required object may exceed one chunk's output capacity. Do
+        // not run the ordinary shared-default compiler on that schema first.
+        let compiler = Int4ExtractionBatchPlanner::for_model(model, ceiling, compiler, source, None)?;
+        Self::configured_object(compiler, extraction, document, job, max_lifetime_verification, reconciliation)
+    }
+    fn configured_object(compiler: Int4ExtractionBatchPlanner, mut extraction: Int4ExtractionJobRecipe,
+        document: Int4ExtractionMapLimits, limits: JobLimits, max_lifetime_verification: GroundingBudget,
+        reconciliation: RootObjectLimits) -> Result<Self, BatchFault> {
+        validate_limits(extraction.group_width, extraction.task_ceiling, extraction.defaults.budget, document, limits)?;
+        verify_lifetime(document.verification, max_lifetime_verification, limits.max_attempts)?;
+        let compiler = DocumentCompiler::Map(compiler).with_root_object_reconciliation(
+            &extraction.defaults, document, reconciliation).map_err(|e| object_failure(e).fault)?;
+        let identity = compiler.base_planner().base_execution_identity().clone();
+        extraction.prompt_version = ROOT_OBJECT_MAP_PROMPT;
+        let mut recipe = Int4DocumentExtractionJobRecipe::new(extraction, document,
+            max_lifetime_verification, limits.max_attempts)?;
+        recipe.execution = INT4_OBJECT_MAP_EXECUTION;
+        recipe.root_object_reconciliation = Some(RootObjectRecipe {
+            policy: ROOT_OBJECT_RECONCILIATION, schema_derivation: ROOT_OBJECT_DERIVATION,
+            prompt_version: ROOT_OBJECT_MAP_PROMPT, limits: reconciliation,
+        });
+        bounded_json(&recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
+        Ok(Self { compiler, identity, document, limits, recipe, owner: Arc::new(()) })
     }
     // Fixtures use the real pinned compiler without exposing an alternate
     // production model constructor or any fabricated native execution result.
@@ -145,7 +202,7 @@ impl Int4DocumentExtractionJobPlanner {
         let Int4ExtractionJobPlanner { compiler, identity, recipe: extraction, .. } = extraction;
         let recipe = Int4DocumentExtractionJobRecipe::new(extraction, document,
             max_lifetime_verification, limits.max_attempts)?;
-        Ok(Self { compiler, identity, document, limits, recipe, owner: Arc::new(()) })
+        Ok(Self { compiler: DocumentCompiler::Map(compiler), identity, document, limits, recipe, owner: Arc::new(()) })
     }
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
     pub fn task_ceiling(&self) -> TaskBudget { self.recipe.extraction.task_ceiling }
@@ -154,13 +211,25 @@ impl Int4DocumentExtractionJobPlanner {
     pub fn job_limits(&self) -> JobLimits { self.limits }
     pub fn request(&self) -> &ExtractionBatchArgs { &self.recipe.extraction.defaults }
     pub fn group_width(&self) -> usize { self.recipe.extraction.group_width }
+    pub fn compiler_limits(&self) -> CompileLimits {
+        let CompilerRecipe { max_schema_bytes, max_string_bytes, max_array_items, max_output_bytes,
+            max_states, max_transitions, max_mask_bytes } = &self.recipe.extraction.compiler;
+        CompileLimits { max_schema_bytes: *max_schema_bytes, max_string_bytes: *max_string_bytes,
+            max_array_items: *max_array_items, max_output_bytes: *max_output_bytes,
+            max_states: *max_states, max_transitions: *max_transitions, max_mask_bytes: *max_mask_bytes }
+    }
+    pub fn root_object_reconciliation(&self) -> Option<RootObjectLimits> {
+        self.compiler.root_object_reconciliation()
+    }
     /// Seal the same all-legal-row strategy into every chunk and the immutable
     /// job recipe. Switching strategy or cap requires a different job; a
     /// preexisting full-head attempt cannot be reused under this factory.
     pub fn with_selected_rows(mut self, limits: Int4JsonSparseLimits) -> Result<Self, BatchFault> {
         self.compiler = self.compiler.with_selected_rows(limits)?;
         let execution = crate::tasks::extract::grouped_int4::INT4_SPARSE_EXTRACT_VERSION;
-        self.recipe.execution = INT4_EXTRACTION_MAP_SELECTED_EXECUTION;
+        self.recipe.execution = if self.root_object_reconciliation().is_some() {
+            INT4_OBJECT_MAP_SELECTED_EXECUTION
+        } else { INT4_EXTRACTION_MAP_SELECTED_EXECUTION };
         self.recipe.extraction.execution = execution;
         self.recipe.selected_rows = Some(SelectedRowsRecipe {
             execution,
@@ -171,7 +240,7 @@ impl Int4DocumentExtractionJobPlanner {
         self.owner = Arc::new(());
         Ok(self)
     }
-    pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.compiler.selected_rows() }
+    pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.compiler.base_planner().selected_rows() }
     /// Opt into native windows within each durable document attempt. The
     /// already-authenticated map_batch_chunks fixes their maximum width.
     pub fn with_chunk_cohorts(mut self) -> Result<Self, BatchFault> {
@@ -204,7 +273,10 @@ impl Int4DocumentExtractionJobPlanner {
     }
     pub fn job_recipe(&self) -> &Int4DocumentExtractionJobRecipe { &self.recipe }
     pub fn check_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> {
-        if limits != self.limits { return Err(BatchCode::InvalidLimits.into()); }
+        if limits != self.limits || (self.root_object_reconciliation().is_some()
+            && !self.uses_chunk_cohorts() && self.document.mapping.reduction.map_batch_chunks != 1) {
+            return Err(BatchCode::InvalidLimits.into());
+        }
         verify_lifetime(self.document.verification, self.recipe.max_lifetime_verification, limits.max_attempts)
     }
     fn output_tokens(&self, chunks: usize) -> Result<u64, BatchFault> {
@@ -216,25 +288,26 @@ impl Int4DocumentExtractionJobPlanner {
         Ok(())
     }
     fn plan<'s, C: DecodeStepControl>(&self, source: &'s str, control: &mut C)
-        -> Result<PreparedInt4ExtractionMap<'s>, BatchItemFailure> {
+        -> Result<DocumentPlan<'s>, BatchItemFailure> {
         poll(control)?;
         if source.len() > self.limits.max_input_bytes_per_item {
             return Err(BatchItemFailure::fatal(BatchCode::DocumentLimit));
         }
-        self.compiler.plan_document_with_control(source, self.request(), self.document, control).map_err(map_failure)
+        self.compiler.plan(source, self.request(), self.document, control).map_err(object_failure)
     }
     fn prepare_with_control<C: DecodeStepControl>(&self, document: BatchDocument<ExtractionDocumentArgs>, control: &mut C)
         -> Result<PreparedInt4ExtractionDocument, BatchItemFailure> {
         let plan = self.plan(&document.text, control)?;
         let expected = plan.preflight_metadata();
+        let mapped = expected.mapped();
         let mut identities = Vec::new();
-        identities.try_reserve_exact(expected.chunk_count()).map_err(|_| BatchItemFailure::fatal(BatchCode::Allocation))?;
+        identities.try_reserve_exact(mapped.chunk_count()).map_err(|_| BatchItemFailure::fatal(BatchCode::Allocation))?;
         for identity in plan.execution_identities() {
             poll(control)?;
             identities.push(identity.clone());
         }
-        if identities.len() != expected.chunk_count() || expected.chunk_count() == 0
-            || expected.group_width() != self.group_width() || expected.selected_rows() != self.selected_rows()
+        if identities.len() != mapped.chunk_count() || mapped.chunk_count() == 0
+            || mapped.group_width() != self.group_width() || mapped.selected_rows() != self.selected_rows()
             || expected.execution_version() != self.recipe.execution
             || plan.max_kv_bytes() != self.document_budget().max_kv_bytes
             || plan.max_result_bytes() != self.max_result_bytes() {
@@ -249,7 +322,7 @@ impl Int4DocumentExtractionJobPlanner {
         Ok(PreparedInt4ExtractionDocument { source: document.text, identities, expected, work,
             owner: Arc::clone(&self.owner) })
     }
-    fn compare<C: DecodeStepControl>(&self, plan: &PreparedInt4ExtractionMap<'_>,
+    fn compare<C: DecodeStepControl>(&self, plan: &DocumentPlan<'_>,
         prepared: &PreparedInt4ExtractionDocument, control: &mut C) -> Result<(), BatchItemFailure> {
         self.owns(prepared)?;
         if plan.preflight_metadata() != prepared.expected || receipt_work(prepared.expected) != prepared.work
@@ -271,16 +344,17 @@ impl Int4DocumentExtractionJobPlanner {
 pub struct PreparedInt4ExtractionDocument {
     source: String,
     identities: Vec<ExecutionIdentity>,
-    expected: Int4ExtractionMapPreflight,
+    expected: DocumentPreflight,
     work: JobWork,
     owner: Arc<()>,
 }
 impl PreparedInt4ExtractionDocument {
-    pub fn chunk_count(&self) -> usize { self.expected.chunk_count() }
+    pub fn chunk_count(&self) -> usize { self.expected.mapped().chunk_count() }
     pub fn planned_work(&self) -> JobWork { self.work }
     pub fn execution_identities(&self) -> &[ExecutionIdentity] { &self.identities }
 }
-fn receipt_work(expected: Int4ExtractionMapPreflight) -> JobWork {
+fn receipt_work(expected: DocumentPreflight) -> JobWork {
+    let expected = expected.mapped();
     JobWork::from_int4(expected.planned_work(), expected.reserved_mask_visits())
 }
 fn native_limits(document: Int4ExtractionMapLimits, job: JobLimits) -> Int4ExtractionBatchLimits {
@@ -344,6 +418,20 @@ fn map_failure(error: Int4ExtractionMapError) -> BatchItemFailure {
         Int4ExtractionMapError::Extraction(_) | Int4ExtractionMapError::Reduction(_)
             | Int4ExtractionMapError::ArrayUnion(_) => BatchCode::InvalidExecution,
     })
+}
+
+fn object_failure(error: Int4ObjectExtractionMapError) -> BatchItemFailure {
+    if let Some(cause) = error.cancellation() { return BatchItemFailure::fatal(BatchFault::cancelled(cause)); }
+    match error {
+        Int4ObjectExtractionMapError::Map(error) => map_failure(error),
+        Int4ObjectExtractionMapError::Admission => BatchItemFailure::fatal(BatchCode::Admission),
+        Int4ObjectExtractionMapError::Reconciliation(error) => BatchItemFailure::fatal(match error {
+            RootObjectError::InvalidLimits => BatchCode::InvalidLimits,
+            RootObjectError::Schema => BatchCode::Planning,
+            RootObjectError::Allocation => BatchCode::Allocation,
+            _ => BatchCode::InvalidExecution,
+        }),
+    }
 }
 
 #[cfg(test)] mod tests;

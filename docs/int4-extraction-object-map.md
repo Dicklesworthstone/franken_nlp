@@ -141,9 +141,10 @@ any later window still prevent a successful final object. The completed result
 binds the declared cohort width as well as the actual physical counters, so
 different schedules cannot be substituted when their batch counts coincide.
 
-Packed prefill, compute teams, Safe-BPE, root-array union and durable object jobs
-remain outside this route's execution contract. Cohort grouping and selected
-projection have no measured throughput or task-quality claim yet.
+Packed prefill, compute teams, Safe-BPE and root-array union remain outside
+this route's execution contract. Cohort grouping and selected projection have
+no measured throughput or task-quality claim yet. Population and durable
+execution use the explicit routes below.
 
 ## Streaming complete documents
 
@@ -186,6 +187,57 @@ renewing those allowances. Earlier completed documents remain valid if a later
 document fails; require the terminal `run_complete` event and exit status zero
 for complete-stream success. Per-record `task_args` must be absent, null or an
 empty object, so records cannot replace the schema, policy or limits.
+
+## Retained whole-document jobs
+
+`extract-document-job start|resume --reconcile-root-object` makes each complete
+reconciled object one atomic durable item. It uses the existing protected job
+directory, key, immutable limits, result spool and acknowledgement protocol.
+Prepare those inputs as described in [owned job storage](owned-jobs.md) and the
+README's whole-document jobs section, then start with the same document NDJSON:
+
+```bash
+fnlp candidate source-int4 extract-document-job start documents.ndjson \
+  --schema record.schema.json --reconcile-root-object --source-membership \
+  --snapshot nanbeige.int4.snapshot --expected-model-sha256 "$MODEL_SHA256" \
+  --memory-mib 32768 --max-chunks 8 --cohort-chunks 4 \
+  --max-selected-rows 4096 --store-results \
+  --job-dir /private/extraction-document-job --job-id "$JOB_ID" \
+  --key-file /private/extraction-document-job.key \
+  --limits document-job-limits.json --materialize
+```
+
+Resume by replacing `start` with `resume`, supplying the complete original
+population and preserving the exact schema bytes and selected settings.
+Original schema bytes, object policy, prompt and derivation versions, every
+`--max-object-*` bound, selected-row cap and cohort schedule are authenticated
+parts of the private recipe. Two original schemas with different required
+fields cannot share resume authority even if their partial chunk schemas
+coincide. Omitting object mode keeps existing ordinary-job recipes unchanged.
+
+Explicit input retention composes with object reconciliation. Add
+`--spool-input --max-retained-input-mib 512` on start to retain private input
+envelopes. On resume, omit the population positional argument and replace
+`--spool-input` with `--use-retained-input`, retaining the same explicit disk
+cap and all other immutable settings. Replay authenticates the retained
+population before execution; missing or corrupt retained input refuses without
+falling back to another source. The disk allowance does not enlarge job input,
+work, attempt or verification limits.
+
+Already committed documents are skipped. An interrupted document restarts in
+full, keeping its previous attempt's debit. The partial map alone cannot commit
+an object result: completion must verify reconciliation, the original schema
+and final source evidence before the guarded spool write and journal
+acknowledgement. Object schema/reducer storage is included in both population
+and retained-replay memory admission. Final verification spends the same
+remaining document allowance and immutable lifetime verification caps.
+
+Stdout reports public policy versions, declared bounds and job progress, with
+`extraction_mode: "root_object_exact_reconciliation"`; private schemas, source
+text, extracted values and content-derived schema commitments stay in protected
+job state. `--materialize` writes verified `materialized.ndjson` after every
+document commits. This route requires `metadata-store` and
+`asupersync-runtime` on Linux x86-64 or AArch64.
 
 ## Result and library API
 
@@ -271,6 +323,20 @@ publication of that document; earlier complete records remain available. Changin
 the original required fields, reducer limits, selected-row policy or schedule
 invalidates previous preparations even when derived partial schemas coincide.
 
+### Durable library jobs
+
+Construct `Int4DocumentExtractionJobPlanner::for_object_model` with the original
+`ExtractionBatchArgs`, compiler/source limits, document limits, `JobLimits`,
+lifetime `GroundingBudget` and `RootObjectLimits`. The dedicated constructor
+avoids compiling the original required set as a per-chunk extraction task.
+Apply `with_selected_rows` and `with_chunk_cohorts` as needed, then pass the
+factory to `NlpEngine::job_int4_extract_document` with the ordinary
+`SourceJobRequest` and `JobHostLimits`. Serial execution requires
+`map_batch_chunks == 1`; a wider declared window requires cohort opt-in.
+`workspace_bytes` quotes the complete map plus original/partial-schema and
+reconciliation ownership for hosted admission. The existing result guards
+survive spool synchronization and journal acknowledgement.
+
 ## Qualification status
 
 The implementation includes reducer, planner, hosted admission and CLI
@@ -279,8 +345,11 @@ decimals, nested atomic values, complete-source evidence, sealed identities,
 remaining verification budgets, cancellation and publication limits. Cohort
 regressions cover ragged windows, selected-policy binding, exact grouping,
 physical counter tampering, underfunded native/decoder reservations and
-unchanged original-schema reconciliation. Source
-review and syntax parsing do not establish compiled or executed behavior.
+unchanged original-schema reconciliation. Population and durable regressions
+cover optional CLI modes, unchanged ordinary serialization, original-schema
+capacity beyond per-chunk caps, complete hosted memory, private recipe binding,
+retained replay, lifetime verification and public metadata privacy. Source
+review and diff hygiene do not establish compiled or executed behavior.
 Compilation, executable regressions, model quality, numerical behavior and
 performance remain unrun pending the controller-owned DSR production checkpoint
 and model-present evaluation gates. There is no single-context equivalence or

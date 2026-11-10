@@ -52,7 +52,7 @@ impl<A: Int4ExtractionDocumentBatchAdmission> BatchProcessor for Int4DocumentExt
     type Prepared = PreparedInt4ExtractionDocument;
     // Preserve the actual native wire object, exact JSON strings and original
     // coordinate evidence. No wrapper consumes unreserved final-result bytes.
-    type Output = GuardedOutput<Int4ExtractionMapRun, A::Guard>;
+    type Output = GuardedOutput<Int4ExtractionDocumentRun, A::Guard>;
     fn prepare(&mut self, _: BatchDocument<Self::Args>) -> Result<Self::Prepared, BatchItemFailure> {
         self.ledger.failed = true;
         Err(BatchItemFailure::fatal(BatchCode::InvalidExecution))
@@ -98,7 +98,7 @@ impl<A: Int4ExtractionDocumentBatchAdmission> BatchProcessor for Int4DocumentExt
         // The actual native map authenticates EVERY full schema/source plan,
         // including the final chunk's KV, before the first model forward.
         let output = self.backend.execute(plan, &admitted, self.vocabulary, control)?;
-        prepared.expected.verify_completed(&output).map_err(map_failure)?;
+        prepared.expected.verify_completed(&output).map_err(object_failure)?;
         self.backend.check_capacity(self.planner)?;
         poll(control)?;
         self.ledger.failed = false;
@@ -147,7 +147,7 @@ impl Backend<'_, '_> {
         }
     }
     fn preflight<C: DecodeStepControl>(&self, planner: &Int4DocumentExtractionJobPlanner,
-        plan: &PreparedInt4ExtractionMap<'_>, identities: &[ExecutionIdentity], control: &mut C)
+        plan: &DocumentPlan<'_>, identities: &[ExecutionIdentity], control: &mut C)
         -> Result<(), BatchItemFailure> {
         for identity in identities {
             poll(control)?;
@@ -156,18 +156,18 @@ impl Backend<'_, '_> {
         }
         if let Self::Cohorts { budget, .. } = self {
             let ceiling = cohort_budget(planner, *budget)?;
-            let required = plan.cohort_requirements(budget.context_limit).map_err(map_failure)?;
+            let required = plan.cohort_requirements(budget.context_limit).map_err(object_failure)?;
             check_peak(required, ceiling)?;
         }
         poll(control)
     }
-    fn execute<C: DecodeStepControl>(&mut self, plan: PreparedInt4ExtractionMap<'_>,
+    fn execute<C: DecodeStepControl>(&mut self, plan: DocumentPlan<'_>,
         admitted: &[ExecutionIdentity], vocabulary: &ExtractionVocabulary, control: &mut C)
-        -> Result<Int4ExtractionMapRun, BatchItemFailure> {
+        -> Result<Int4ExtractionDocumentRun, BatchItemFailure> {
         match self {
-            Self::Serial(engine) => plan.execute_with_control(admitted, engine, vocabulary, control).map_err(map_failure),
+            Self::Serial(engine) => plan.execute_with_control(admitted, engine, vocabulary, control).map_err(object_failure),
             Self::Cohorts { weights, budget, kernel } => plan.execute_cohorts_with_control(
-                admitted, weights, vocabulary, *budget, *kernel, control).map(|run| run.document).map_err(map_failure),
+                admitted, weights, vocabulary, *budget, *kernel, control).map_err(object_failure),
         }
     }
 }

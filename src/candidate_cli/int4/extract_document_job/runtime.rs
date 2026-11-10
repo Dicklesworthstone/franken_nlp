@@ -6,10 +6,12 @@ use crate::{
     NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
     candidate_cli::{extract::SCHEMA_BYTES,
         int4::extract_map::array_union::ArrayUnionSelection,
+        int4::extract_map::object::RootObjectSelection,
         runtime::owned_jobs::{host_failure, job_failure, open_mode, progress_report}},
     hosted::{CancellationToken, NativeLimits, RunLimits, corpus::jobs::{JobHostLimits, SourceJobRequest}},
     jobs::{JobSecret, runner::extract::grouped_int4::document::Int4DocumentExtractionJobPlanner},
-    native_engine::strict_int4::weights::snapshot::INT4_SNAPSHOT_VERSION,
+    native_engine::{strict_int4::weights::snapshot::INT4_SNAPSHOT_VERSION,
+        decode::{DecodeCancellationKind, DecodeStepControl}},
     tasks::extract::ExtractionVocabulary,
 };
 
@@ -39,17 +41,31 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
     let map = limits.map; let common = map.common;
     check_host_quote(host_limits(&args, limits, remaining()?), lifetime, limits.buffer_bytes, input_memory)?;
     let key = JobSecret::read(&job.storage.key_file).map_err(job_failure)?;
+    let root_object = job.reconciliation.limits(job.map.mapping)?;
+    let object_bytes = job.reconciliation.workspace_bytes(&job.map, map)?;
+    // These schemas are derived before population ingestion and native
+    // startup. Transfer ownership to the host's complete frontier afterwards.
+    let object_preparation = if object_bytes == 0 { None } else {
+        Some(lease.reserve(MemoryClass::JobBuffers, object_bytes)
+            .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?)
+    };
     remaining()?;
     let schema = read_config(job.map.extraction.schema_path(), SCHEMA_BYTES, &remaining)?;
     let budget = job.map.extraction.budget(&args, common);
-    let extraction = job.map.request(schema, budget)?;
+    let extraction = job.reconciliation.request(&job.map, schema, budget,
+        &mut DeadlineControl { started, deadline })?;
     let cancellation = CancellationToken::default();
     remaining()?;
     let model = super::super::runtime::load_model(&engine, &args, common, remaining()?, cancellation.clone())?;
     remaining()?;
-    let planner = Int4DocumentExtractionJobPlanner::for_model(model.model_identity(), budget,
-        job.map.extraction.compiler(), job.map.extraction.source_limits(), extraction,
-        map.mapping, lifetime, job.lifetime.verification()).map_err(|_| CandidateError::Planning)?;
+    let planner = match root_object {
+        Some(object) => Int4DocumentExtractionJobPlanner::for_object_model(model.model_identity(), budget,
+            job.map.extraction.compiler(), job.map.extraction.source_limits(), extraction,
+            map.mapping, lifetime, job.lifetime.verification(), object),
+        None => Int4DocumentExtractionJobPlanner::for_model(model.model_identity(), budget,
+            job.map.extraction.compiler(), job.map.extraction.source_limits(), extraction,
+            map.mapping, lifetime, job.lifetime.verification()),
+    }.map_err(|_| CandidateError::Planning)?;
     let planner = match job.map.extraction.selected_rows()? {
         Some(rows) => planner.with_selected_rows(rows).map_err(|_| CandidateError::Planning)?,
         None => planner,
@@ -71,6 +87,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
         .map_err(|_| CandidateError::Memory)? != map.workspace_bytes {
         return Err(Failure::usage("extraction_document_job_workspace_quote"));
     }
+    drop(object_preparation);
     let mut snapshot = common.snapshot_pin.map(|_| SnapshotRecord::new("loaded", common.snapshot_need));
     if let Some(path) = &args.save_snapshot {
         // The independent model checkpoint follows immutable factory
@@ -96,8 +113,10 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
     let response = Response {
         protocol: "fnlp-candidate-int4-extract-document-job-v1", schema_version: 1,
         scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "extract",
-        durable_unit: "complete_original_document", extraction_mode: if map.mapping.root_array_union.is_some() {
-            "root_array_exact_union" } else { "independent_schema_chunk_values" },
+        durable_unit: "complete_original_document", extraction_mode: if root_object.is_some() {
+            "root_object_exact_reconciliation"
+        } else if map.mapping.root_array_union.is_some() { "root_array_exact_union" }
+            else { "independent_schema_chunk_values" },
         model_id: "Nanbeige4.2-3B", source_revision: &identity.source_revision,
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
@@ -105,10 +124,18 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
         snapshot, chunk_schedule: map.cohort_chunks.map(ChunkSchedule::new), output: &report,
         max_selected_rows,
         root_array_union: map.mapping.root_array_union.map(ArrayUnionSelection::new),
+        root_object_reconciliation: root_object.map(RootObjectSelection::new),
     };
     // A failed metadata write can follow durable commits. No original text,
     // schema, extracted values, coordinates, private paths or key is emitted.
     publish(&response, job_cli::REPORT_BYTES, output).map_err(Failure::from)
+}
+
+struct DeadlineControl { started: Instant, deadline: Duration }
+impl DecodeStepControl for DeadlineControl {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+        (self.started.elapsed() >= self.deadline).then_some(DecodeCancellationKind::Deadline)
+    }
 }
 
 fn read_config(path: &std::path::Path, cap: usize,
@@ -167,6 +194,8 @@ struct Response<'a, T: Serialize> {
     max_selected_rows: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     root_array_union: Option<ArrayUnionSelection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_object_reconciliation: Option<RootObjectSelection>,
     output: &'a T,
 }
 

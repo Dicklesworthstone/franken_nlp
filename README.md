@@ -3884,9 +3884,20 @@ population shares one resident model, one exact raw schema and one fixed set
 of chunking, work and verification limits. This route requires `metadata-store`
 and `asupersync-runtime` on Linux x86-64 or AArch64.
 
+Add `--reconcile-root-object` to assemble complementary root properties across
+chunks using the same contract as `extract-object-map`. The completed object
+must satisfy the original required fields; conflicting values or missing fields
+refuse the complete durable item. The original raw schema, fixed partial-object
+prompt and derivation, reducer policy and all `--max-object-*` bounds become
+authenticated resume settings. Repeat the mode and settings on resume, including
+retained-input replay. Object mode composes with selected rows and chunk cohorts
+and conflicts with `--root-array-union`. See
+[durable object extraction](docs/int4-extraction-object-map.md#retained-whole-document-jobs)
+for start/resume and retained-input examples.
+
 `--cohort-chunks N` also enables native chunk cohorts for this job, with N from
-1 through 64 and no greater than `--max-chunks`. Every row keeps the exact raw
-schema, grounding policy, task budget and independent causal context. Add the
+1 through 64 and no greater than `--max-chunks`. Every row keeps its selected
+chunk schema, grounding policy, task budget and independent causal context. Add the
 flag to `start` and repeat the same width on `resume`; serial jobs retain their
 existing recipe when it is omitted. Chunk windows are internal execution units:
 the original document remains the only result and durable commit unit.
@@ -3936,14 +3947,15 @@ completed independent model file survives later authentication or execution
 failure. A supplied snapshot always requires its independent model digest pin.
 
 Every document's chunks must all finish and independently verify before that
-document commits. Retained values preserve independent exact-schema JSON
-strings and chunk lineage; they are not merged into an arbitrary global
-object. With `--source-membership`, compatible occurrences are independently
-checked within each originating chunk and lifted to original UTF-8 byte and
-Unicode-scalar coordinates. This does not discover occurrences in chunks from
-which the value was not extracted. Required fields must be satisfiable in
-every chunk. Source membership establishes neither semantic accuracy nor
-single-context equivalence.
+document commits. By default, retained values preserve independent exact-schema
+JSON strings and chunk lineage, with required fields satisfiable in every
+chunk. Source-membership checks then cover compatible occurrences within each
+originating chunk, lifted to original UTF-8 byte and Unicode-scalar coordinates.
+With `--reconcile-root-object`, retained values instead include the complete
+partial map and independently verified object. Final source verification also
+covers matching occurrences elsewhere in the original document, using the
+remaining per-document allowance. Source membership establishes neither
+semantic accuracy nor single-context equivalence.
 
 The five `extract-map` native work axes and `--max-total-mask-node-visits`
 remain per-document ceilings that must fit the unchanged job-wide `max_work`.
@@ -3965,7 +3977,8 @@ the previous attempt's debit. Uncommitted spool tails require the explicit
 resume-only `--discard-uncommitted-tail` policy after authentication.
 
 Memory admission includes the complete population, declared native peak and
-cohort decoder workspace when selected,
+cohort decoder workspace when selected, original/partial-schema and object
+reconciliation workspace when selected,
 all prepared chunk programs, extraction/evidence frontier, complete original
 document result, journal and protected spool serialization. The complete
 NDJSON record, including JSON escaping, must fit the stored input byte limit.
@@ -3976,7 +3989,10 @@ Stdout uses `fnlp-candidate-int4-extract-document-job-v1`, identifies the durabl
 unit as `complete_original_document` and reports public model provenance and
 authenticated progress. An opted cohort schedule adds only declared execution,
 phase and width under `chunk_schedule`; stored results keep the original
-semantic document format. Schema bytes, original source and extracted values
+semantic document format. Object mode adds public policy versions and limits
+under `root_object_reconciliation` and reports
+`extraction_mode: "root_object_exact_reconciliation"`.
+Schema bytes, original source and extracted values
 stay out of that report. Result guards remain alive through spool
 synchronization and journal acknowledgement. `--materialize` publishes verified
 `materialized.ndjson` after all documents commit. Stored-job status, verification
@@ -3990,7 +4006,12 @@ document limits, `JobLimits` and lifetime `GroundingBudget`, then call
 `JobHostLimits`. The planner's `with_chunk_cohorts()` builder enables native
 windows using the immutable `document.mapping.reduction.map_batch_chunks`
 width; `cohort_requirements()` quotes the full declared reservation. This is
-source-inventoried candidate functionality. Compilation,
+source-inventoried candidate functionality. For object mode, use
+`Int4DocumentExtractionJobPlanner::for_object_model` with the original request
+and an additional `RootObjectLimits`; it compiles the derived partial schema
+for native chunks while retaining original-schema resume authority. The same
+host API, optional execution builders and durable result guards apply.
+Compilation,
 native correctness, crash recovery, parity and task quality remain unqualified
 until their named validation gates run.
 

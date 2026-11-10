@@ -9,7 +9,7 @@ use crate::{
     jobs::{JobLimits, JobWork, population::PopulationReadLimits},
     validation::grounded_fields::GroundingBudget,
 };
-use super::{extract_job::StorageArgs, extract_map::{MapArgs, MapLimits}};
+use super::{extract_job::StorageArgs, extract_map::{MapArgs, MapLimits, object::ReconciliationArgs}};
 
 #[cfg(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -18,7 +18,9 @@ mod runtime;
 mod tests;
 
 pub(super) struct JobCommand { mode: RunMode, args: JobArgs }
-pub(super) struct JobArgs { map: MapArgs, storage: StorageArgs, lifetime: LifetimeArgs }
+pub(super) struct JobArgs {
+    map: MapArgs, storage: StorageArgs, lifetime: LifetimeArgs, reconciliation: ReconciliationArgs,
+}
 
 #[derive(Args, Clone, Copy)]
 struct LifetimeArgs {
@@ -59,9 +61,9 @@ impl LifetimeArgs {
 
 pub(super) fn definition() -> clap::Command {
     let operation = |name: &'static str, about: &'static str| {
-        let command = LifetimeArgs::augment_args(StorageArgs::augment_args(extract_map::document_job_definition()
+        let command = LifetimeArgs::augment_args(StorageArgs::augment_args(ReconciliationArgs::augment_definition(extract_map::document_job_definition())
             .name(name).about(about)
-            .long_about("Retain and resume COMPLETE original documents using one fixed exact schema and the native INT4 extraction map pipeline. By default, supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation; explicit retained-input replay is available. text is the original document, never a pre-split chunk. Task arguments may only be absent, null or an empty object. Every chunk must finish and verify before its original document commits. Retained outputs contain independent exact chunk JSON values and original-document provenance; arbitrary schema values are not merged into a global object. Required schema fields must be satisfiable in every chunk. Optional --cohort-chunks N shares native layers across independent chunks while retaining each chunk's exact schema, grammar, source language and causal context. The declared schedule and width are authenticated: repeat the same flag on resume, and omit it for existing serial jobs. Optional --max-selected-rows N fixes one complete-legal-row ceiling for every chunk, including accepting EOS, and refuses excess without pruning or fallback. The strategy and exact row cap are authenticated: repeat the same flag on resume; omit it for existing full-vocabulary jobs. Complete native, decoder, schema, evidence, semantic-result and durable-job memory are admitted together. Optional --source-membership verifies every compatible occurrence within the originating chunk and lifts its offsets to the original document; it does not find occurrences in other chunks from which the value was not extracted or certify semantic accuracy. Requires --store-results, protected existing --job-dir and --key-file, exact --job-id and immutable --limits. The original schema bytes, chunking, all five native work axes, masks and explicit lifetime verification ceilings are authenticated and never renewed on resume; failed attempts remain debited. Stdout contains metadata only, including the declared schedule when enabled; stored results retain the original semantic document envelope. --materialize publishes retained results after every original document commits. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
+            .long_about("Retain and resume COMPLETE original documents using one fixed exact schema and the native INT4 extraction map pipeline. By default, supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation; explicit retained-input replay is available. text is the original document, never a pre-split chunk. Task arguments may only be absent, null or an empty object. Every chunk must finish and verify before its original document commits. The default retains independent exact chunk JSON values and original-document provenance, with required schema fields satisfiable in every chunk. Optional --reconcile-root-object derives a partial root-object schema for each chunk, preserves nested constraints, and combines complementary atomic properties into one independently validated original-schema object. Equal values retain every origin; conflicting values or missing final required properties fail the entire item. With --source-membership, the final object is additionally checked against the complete original source using the SAME remaining field/span/scan allowance. The object policy and every --max-object-* bound are authenticated; repeat them on resume. It cannot combine with --root-array-union. Optional --cohort-chunks N shares native layers across independent chunks while retaining each chunk's exact schema, grammar, source language and causal context. The declared schedule and width are authenticated: repeat the same flag on resume, and omit it for existing serial jobs. Optional --max-selected-rows N fixes one complete-legal-row ceiling for every chunk, including accepting EOS, and refuses excess without pruning or fallback. The strategy and exact row cap are authenticated: repeat the same flag on resume; omit it for existing full-vocabulary jobs. Complete native, decoder, schema, evidence, semantic-result and durable-job memory are admitted together. Source membership and exact reconciliation establish structural and lexical properties, not semantic accuracy or extraction completeness. Requires --store-results, protected existing --job-dir and --key-file, exact --job-id and immutable --limits. The original schema bytes, chunking, all five native work axes, masks and explicit lifetime verification ceilings are authenticated and never renewed on resume; failed attempts remain debited. Stdout contains metadata only, including the declared schedule and reduction policy when enabled. --materialize publishes retained results after every original document commits. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
             .after_help(job_cli::INPUT_RETENTION_HELP)
             .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population; omit with --use-retained-input; '-' reads stdin"))
             .mut_arg("max_input_bytes", |arg| arg.help("Outer ceiling for a complete NDJSON record and decoded original document; immutable stored input ceiling must fit"))
@@ -105,7 +107,15 @@ impl JobArgs {
             || self.lifetime.max_lifetime_extraction_scan_steps == 0 {
             return Err(Failure::usage("explicit_extraction_document_job_storage"));
         }
-        let map = self.map.validate_document_job(args)?;
+        let mut map = self.map.validate_document_job(args)?;
+        // The shared original/partial declaration and exact reducer quote is
+        // additional to retained native maps, owned population and output.
+        let object = self.reconciliation.workspace_bytes(&self.map, map)?;
+        map.common.minimum_memory_bytes = sum(&[map.common.minimum_memory_bytes, object])?;
+        map.workspace_bytes = sum(&[map.workspace_bytes, object])?;
+        if map.common.minimum_memory_bytes > map.common.memory_bytes {
+            return Err(CandidateError::Arguments.into());
+        }
         for mib in [s.journal_memory_mib, s.serialization_memory_mib] {
             if mib.checked_mul(MIB).is_none_or(|bytes| bytes > map.common.memory_bytes) {
                 return Err(Failure::usage("extraction_document_job_memory"));
@@ -159,7 +169,8 @@ impl JobCommand {
             _ => return Err(invalid("extract-document-job operation refused")),
         };
         let args = JobArgs { map: MapArgs::from_matches(matches)?,
-            storage: StorageArgs::from_arg_matches(matches)?, lifetime: LifetimeArgs::from_arg_matches(matches)? };
+            storage: StorageArgs::from_arg_matches(matches)?, lifetime: LifetimeArgs::from_arg_matches(matches)?,
+            reconciliation: ReconciliationArgs::from_arg_matches(matches)? };
         Ok((Self { mode, args }, Int4Args::from_arg_matches(matches)?))
     }
     pub(super) fn run_owned<R: Read + Send + 'static>(self, args: Int4Args, input: R,

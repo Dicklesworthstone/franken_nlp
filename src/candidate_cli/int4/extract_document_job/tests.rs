@@ -32,6 +32,106 @@ impl Write for NoIo {
 }
 
 #[test]
+fn object_reconciliation_is_explicit_on_start_resume_and_retained_replay() {
+    use crate::batch::extract::grouped_int4::long::stream::memory::root_object_workspace_bytes;
+    for (operation, retained) in [("start", false), ("resume", false), ("resume", true)] {
+        for cohorts in [false, true] {
+            let mut flags = Vec::new();
+            if retained { flags.push("--use-retained-input"); }
+            if cohorts { flags.extend(["--cohort-chunks", "3"]); }
+            let (ordinary, args) = command(operation, &flags);
+            let before = ordinary.args.validate(&args).unwrap();
+            flags.extend(["--reconcile-root-object", "--max-object-properties", "32",
+                "--max-object-origins", "128", "--max-object-input-bytes", "1048576",
+                "--max-object-json-bytes", "65536", "--max-object-nodes", "4096",
+                "--max-object-result-bytes", "262144", "--max-selected-rows", "32"]);
+            let (object, args) = command(operation, &flags);
+            let after = object.args.validate(&args).unwrap();
+            let policy = object.args.reconciliation.limits(object.args.map.mapping).unwrap().unwrap();
+            let extra = root_object_workspace_bytes(after.mapping, object.args.map.extraction.compiler(), Some(policy)).unwrap();
+            assert_eq!(after.workspace_bytes - before.workspace_bytes, extra);
+            assert_eq!(after.common.minimum_memory_bytes - before.common.minimum_memory_bytes, extra);
+            assert_eq!(after.cohort, before.cohort);
+            assert_eq!(after.mapping.verification, before.mapping.verification);
+            assert_eq!(after.mapping.mapping.max_model_work, before.mapping.mapping.max_model_work);
+            assert_eq!(after.mapping.mapping.max_mask_visits, before.mapping.mapping.max_mask_visits);
+            assert!(after.mapping.root_array_union.is_none());
+            let fixed = lifetime(&args, after);
+            let original = ordinary.args.lifetime_limits(&args, before, fixed).unwrap();
+            let admitted = object.args.lifetime_limits(&args, after, fixed).unwrap();
+            assert_eq!(admitted.buffer_bytes, original.buffer_bytes);
+            assert_eq!(admitted.map.common.minimum_memory_bytes - original.map.common.minimum_memory_bytes, extra);
+            assert_eq!(admitted.map.mapping.verification, original.map.mapping.verification);
+            assert_eq!(admitted.map.workspace_bytes, after.workspace_bytes);
+        }
+    }
+}
+
+#[test]
+fn object_job_request_preserves_original_schema_and_decimal_lexemes() {
+    use crate::native_engine::decode::{DecodeCancellationKind, DecodeStepControl};
+    struct Continue;
+    impl DecodeStepControl for Continue {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }
+    }
+    for operation in ["start", "resume"] {
+        let (object, args) = command(operation, &["--reconcile-root-object", "--cohort-chunks", "3",
+            "--max-selected-rows", "32", "--source-membership"]);
+        let map = object.args.validate(&args).unwrap();
+        let budget = object.args.map.extraction.budget(&args, map.common);
+        let schema = " {\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"amount\":{\"type\":\"number\",\"const\":12345678901234567890123456789012345678},\"quote\":{\"type\":\"string\",\"x-fnlp-source\":\"verbatim\",\"maxLength\":64}},\"required\":[\"amount\",\"quote\"]}\n";
+        let request = object.args.reconciliation.request(&object.args.map, schema.to_owned(), budget, &mut Continue).unwrap();
+        assert_eq!(request.schema, schema);
+        assert_eq!(request.budget, budget);
+        assert_eq!(request.grounding, crate::batch::extract::ExtractionBatchGrounding::SourceMembership);
+        assert!(object.args.reconciliation.request(&object.args.map, r#"{"type":"boolean"}"#.to_owned(),
+            budget, &mut Continue).is_err());
+    }
+}
+
+#[test]
+fn invalid_or_conflicting_object_job_options_refuse_before_any_io() {
+    for extra in [vec!["--max-object-properties", "32"],
+        vec!["--reconcile-root-object", "--root-array-union"],
+        vec!["--reconcile-root-object", "--max-union-records", "16"]] {
+        for operation in ["start", "resume"] {
+            let mut words = argv(operation); words.extend(extra.iter().map(|s| (*s).to_owned()));
+            assert!(parse(words).is_err());
+        }
+    }
+    for extra in [vec!["--reconcile-root-object", "--max-object-properties", "0"],
+        vec!["--reconcile-root-object", "--max-object-origins", "0"],
+        vec!["--reconcile-root-object", "--max-object-nodes", "0"],
+        vec!["--reconcile-root-object", "--max-object-input-bytes", "0"],
+        vec!["--reconcile-root-object", "--max-object-json-bytes", "0"],
+        vec!["--reconcile-root-object", "--max-object-result-bytes", "16777217"],
+        vec!["--reconcile-root-object", "--max-selected-rows", "0"],
+        vec!["--reconcile-root-object", "--cohort-chunks", "9"]] {
+        for operation in ["start", "resume"] {
+            let (command, args) = command(operation, &extra);
+            assert_eq!(command.execute_owned(args, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+        }
+    }
+}
+
+#[test]
+fn root_object_job_admits_extra_schema_and_reducer_memory_before_io() {
+    let (command, mut args) = command("start", &["--reconcile-root-object", "--cohort-chunks", "3"]);
+    let need = command.args.validate(&args).unwrap();
+    args.memory_mib = need.common.minimum_memory_bytes.div_ceil(MIB) - 1;
+    assert_eq!(command.execute_owned(args, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+}
+
+#[test]
+fn object_resume_does_not_renew_original_source_verification_allowances() {
+    let (command, args) = command("resume", &["--reconcile-root-object", "--use-retained-input"]);
+    let map = command.args.validate(&args).unwrap();
+    let mut fixed = lifetime(&args, map);
+    fixed.max_attempts = i64::MAX as u64;
+    assert_eq!(command.args.lifetime_limits(&args, map, fixed).unwrap_err().code, "lifetime_extraction_verification");
+}
+
+#[test]
 fn start_resume_and_retained_replay_preserve_the_explicit_selected_row_policy() {
     for (operation, retained) in [("start", false), ("resume", false), ("resume", true)] {
         for grouped in [false, true] {

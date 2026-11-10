@@ -70,7 +70,7 @@ fn whole_document_progress_report_does_not_emit_schema_source_values_or_private_
         model_content_sha256: &content, candidate_format: "fixture-candidate-format", quant_recipe: "fixture-grouped-int4",
         group_width: args.group_width, integer_kernel: map.common.kernel.kind().id(),
         snapshot: Some(SnapshotRecord::new("loaded", map.common.snapshot_need)), chunk_schedule: None, output: &report,
-        root_array_union: None, max_selected_rows: None,
+        root_array_union: None, max_selected_rows: None, root_object_reconciliation: None,
     };
     let mut bytes = Vec::new(); publish(&response, job_cli::REPORT_BYTES, &mut bytes).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -82,6 +82,7 @@ fn whole_document_progress_report_does_not_emit_schema_source_values_or_private_
     assert_eq!(value["output"]["reserved_work"], serde_json::to_value(fixed.max_work).unwrap());
     assert!(value.get("chunk_schedule").is_none());
     assert!(value.get("root_array_union").is_none());
+    assert!(value.get("root_object_reconciliation").is_none());
     assert!(value.get("max_selected_rows").is_none());
     for forbidden in ["text", "schema", "values", "spans", "recipe", "key", "job_dir", "results", "documents"] {
         assert!(value.get(forbidden).is_none()); assert!(value["output"].get(forbidden).is_none());
@@ -98,4 +99,36 @@ fn whole_document_progress_report_does_not_emit_schema_source_values_or_private_
     assert_eq!(selected["max_selected_rows"], 8192);
     assert_eq!(selected["output"], value["output"]);
     assert_eq!(selected["chunk_schedule"], grouped["chunk_schedule"]);
+    let (object, object_args) = command("resume", &["--reconcile-root-object"]);
+    let object_limits = object.args.reconciliation.limits(object.args.map.mapping).unwrap().unwrap();
+    response.root_object_reconciliation = Some(RootObjectSelection::new(object_limits));
+    response.extraction_mode = "root_object_exact_reconciliation";
+    let object = serde_json::to_value(&response).unwrap();
+    assert_eq!(object["extraction_mode"], "root_object_exact_reconciliation");
+    assert_eq!(object["root_object_reconciliation"]["policy"],
+        crate::tasks::extract::object_reconcile::ROOT_OBJECT_RECONCILIATION);
+    assert_eq!(object["root_object_reconciliation"]["limits"], serde_json::to_value(object_limits).unwrap());
+    assert_eq!(object["output"], value["output"]);
+    let bytes = serde_json::to_string(&object).unwrap();
+    for private in ["private-schema", "private/job", "private/key", "schema_digest", "binding"] {
+        assert!(!bytes.contains(private));
+    }
+    assert_eq!(object_args.group_width, args.group_width);
+}
+
+#[test]
+fn object_runtime_rechecks_complete_schema_workspace_before_private_io() {
+    let (c, mut args) = command("resume", &["--reconcile-root-object", "--cohort-chunks", "3",
+        "--max-selected-rows", "32"]);
+    let map = c.args.validate(&args).unwrap();
+    args.memory_mib = map.common.minimum_memory_bytes.div_ceil(MIB) - 1;
+    assert_eq!(execute(c.mode, args, c.args, map, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+}
+
+#[test]
+fn deadline_control_refuses_object_schema_work_without_a_new_time_budget() {
+    let mut expired = DeadlineControl { started: Instant::now(), deadline: Duration::ZERO };
+    assert_eq!(expired.prefill_checkpoint(0), Some(DecodeCancellationKind::Deadline));
+    let mut live = DeadlineControl { started: Instant::now(), deadline: Duration::from_secs(30) };
+    assert_eq!(live.prefill_checkpoint(0), None);
 }

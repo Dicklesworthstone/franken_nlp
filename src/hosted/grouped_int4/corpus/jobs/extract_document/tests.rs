@@ -93,6 +93,48 @@ fn whole_population_two_schema_owners_and_maximum_frontier_are_admitted_together
 }
 
 #[test]
+fn complete_object_frontier_includes_schema_and_reducer_ownership_without_native_renewal() {
+    use crate::{grammar::CompileLimits, tasks::extract::object_reconcile::{RootObjectLimits, RootObjectSchema}};
+    let (budget, document, job, host) = fixture();
+    let compiler = CompileLimits::default();
+    let object = RootObjectLimits { max_properties: 32, max_origins: 128,
+        max_input_bytes: 1 << 20, max_json_bytes: 32768, max_nodes: 4096, max_result_bytes: 65536 };
+    let ordinary = complete_workspace_bytes(budget, document, 65536, compiler, None).unwrap();
+    let complete = complete_workspace_bytes(budget, document, 65536, compiler, Some(object)).unwrap();
+    assert_eq!(complete - ordinary, object.workspace_bytes().unwrap() + RootObjectSchema::workspace_bytes(compiler).unwrap());
+    for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
+        let before = requirements(WIDTH, budget, document, 65536, job, host, ordinary, 8192, input).unwrap();
+        let after = requirements(WIDTH, budget, document, 65536, job, host, complete, 8192, input).unwrap();
+        assert_eq!(before.input_bytes, after.input_bytes);
+        assert_eq!(before.native, after.native);
+        assert_eq!(before.native_workspace_bytes, after.native_workspace_bytes);
+        assert_eq!(after.document_workspace_bytes - before.document_workspace_bytes, complete - ordinary);
+    }
+    let larger = CompileLimits { max_schema_bytes: compiler.max_schema_bytes + 1, ..compiler };
+    assert!(complete_workspace_bytes(budget, document, 65536, larger, Some(object)).unwrap() > complete);
+}
+
+#[test]
+fn object_frontier_refuses_conflicting_reducers_and_schema_workspace_overflow() {
+    use crate::{grammar::CompileLimits, tasks::extract::{object_reconcile::RootObjectLimits,
+        array_union::RootArrayUnionLimits}};
+    let (budget, document, _, _) = fixture();
+    let object = RootObjectLimits { max_properties: 32, max_origins: 128,
+        max_input_bytes: 1 << 20, max_json_bytes: 32768, max_nodes: 4096, max_result_bytes: 65536 };
+    let mut conflict = document;
+    conflict.root_array_union = Some(RootArrayUnionLimits { max_records: 32, max_origins: 128,
+        max_input_bytes: 1 << 20, max_json_bytes: 32768, max_nodes: 4096, max_result_bytes: 65536 });
+    assert!(complete_workspace_bytes(budget, conflict, 65536, CompileLimits::default(), Some(object)).is_err());
+    for compiler in [CompileLimits { max_schema_bytes: usize::MAX, ..CompileLimits::default() },
+        CompileLimits { max_states: usize::MAX, ..CompileLimits::default() },
+        CompileLimits { max_schema_bytes: 0, ..CompileLimits::default() }] {
+        assert!(complete_workspace_bytes(budget, document, 65536, compiler, Some(object)).is_err());
+    }
+    let too_large = RootObjectLimits { max_result_bytes: 65537, ..object };
+    assert!(complete_workspace_bytes(budget, document, 65536, CompileLimits::default(), Some(too_large)).is_err());
+}
+
+#[test]
 fn exact_resident_context_kv_and_nonzero_schema_are_required_before_input() {
     for axis in 0..5 {
         let (mut budget, mut document, job, mut host) = fixture();

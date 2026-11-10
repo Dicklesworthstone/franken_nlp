@@ -79,6 +79,25 @@ fn factory(grounded: bool) -> Int4DocumentExtractionJobPlanner {
     build(WIDTH, budget(), CompileLimits::default(), SourceRuntimeLimits::default(),
         request(grounded), mapping(), limits(), lifetime()).unwrap()
 }
+const OBJECT_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"amount":{"type":"number","const":12345678901234567890123456789012345678},"name":{"type":"string","maxLength":64}},"required":["amount","name"]}"#;
+fn object_limits() -> RootObjectLimits {
+    RootObjectLimits { max_properties: 32, max_origins: 128, max_input_bytes: 1 << 20,
+        max_json_bytes: 65_536, max_nodes: 4096, max_result_bytes: 262_144 }
+}
+fn object_factory(schema: &str, policy: RootObjectLimits, map: Int4ExtractionMapLimits,
+    max_lifetime_verification: GroundingBudget) -> Result<Int4DocumentExtractionJobPlanner, BatchFault> {
+    let controls = pinned_controls::pinned().unwrap();
+    let eos = EmbeddedTokenizer::pinned().unwrap().eos_token_id().unwrap();
+    let compiler_limits = CompileLimits::default(); let source = SourceRuntimeLimits::default();
+    let request = ExtractionBatchArgs { schema: schema.to_owned(), grounding: ExtractionBatchGrounding::Structural,
+        budget: budget() };
+    let recipe = Int4ExtractionJobRecipe::new(WIDTH, budget(), compiler_limits, source,
+        native_limits(map, limits()), request)?;
+    let compiler = Int4ExtractionBatchPlanner::pinned(controls.template_controls(), eos, identity(WIDTH), WIDTH,
+        budget(), compiler_limits, source, None)?;
+    Int4DocumentExtractionJobPlanner::configured_object(compiler, recipe, map,
+        limits(), max_lifetime_verification, policy)
+}
 fn document(text: &str) -> BatchDocument<ExtractionDocumentArgs> {
     BatchDocument { id: "whole-document".to_owned(), text: text.to_owned(), task_args: None }
 }
@@ -97,13 +116,144 @@ fn axis(work: &mut Int4Work, axis: usize) -> &mut u64 {
 }
 
 #[test]
+fn complete_object_jobs_keep_original_schema_and_fixed_partial_prompt_authority() {
+    let original = format!(" {OBJECT_SCHEMA}\n");
+    let object = object_factory(&original, object_limits(), mapping(), lifetime()).unwrap();
+    assert_eq!(object.request().schema, original);
+    assert_eq!(object.root_object_reconciliation(), Some(object_limits()));
+    assert_eq!(object.compiler_limits().max_schema_bytes, CompileLimits::default().max_schema_bytes);
+    let value = serde_json::to_value(object.job_recipe()).unwrap();
+    assert_eq!(value["extraction"]["defaults"]["schema"], original);
+    assert_eq!(value["execution"], INT4_OBJECT_MAP_EXECUTION);
+    assert_eq!(value["root_object_reconciliation"]["policy"], ROOT_OBJECT_RECONCILIATION);
+    assert_eq!(value["root_object_reconciliation"]["schema_derivation"], ROOT_OBJECT_DERIVATION);
+    assert_eq!(value["root_object_reconciliation"]["prompt_version"], ROOT_OBJECT_MAP_PROMPT);
+    assert_eq!(value["extraction"]["prompt_version"], ROOT_OBJECT_MAP_PROMPT);
+    assert!(value.get("root_array_union").is_none());
+    assert!(serde_json::to_value(factory(false).job_recipe()).unwrap().get("root_object_reconciliation").is_none());
+    assert_ne!(object.execution_identity().template_digest, factory(false).execution_identity().template_digest);
+    let prepared = prepare(&object, SOURCE);
+    assert_eq!(prepared.chunk_count(), 2);
+    assert!(matches!(prepared.expected, DocumentPreflight::Object(_)));
+    assert_eq!(prepared.expected.execution_version(), INT4_OBJECT_MAP_EXECUTION);
+    let plan = object.plan(SOURCE, &mut Continue).unwrap();
+    object.compare(&plan, &prepared, &mut Continue).unwrap();
+    assert_eq!(prepared.work, receipt_work(plan.preflight_metadata()));
+    assert_eq!(prepared.work.mask_node_visits, 2 * mapping().mapping.mask_visits_per_chunk);
+}
+
+#[test]
+fn original_required_set_and_every_object_limit_authenticate_before_resume() {
+    let original = object_factory(OBJECT_SCHEMA, object_limits(), mapping(), lifetime()).unwrap();
+    let frozen = freeze(&original); let before = prepare(&original, SOURCE);
+    for schema in [format!(" {OBJECT_SCHEMA}\n"),
+        OBJECT_SCHEMA.replace(r#""required":["amount","name"]"#, r#""required":["name"]"#)] {
+        let changed = object_factory(&schema, object_limits(), mapping(), lifetime()).unwrap();
+        let after = prepare(&changed, SOURCE);
+        // The same partial task cannot substitute for the complete schema:
+        // native identities agree while the complete-object proof does not.
+        assert_eq!(after.identities, before.identities);
+        assert_eq!(after.work, before.work);
+        assert_ne!(after.expected, before.expected);
+        assert_eq!(frozen.binding.compare(&freeze(&changed).binding), Err(JobError::Mismatch(MismatchField::Recipe)));
+    }
+    for field in 0..6 {
+        let mut policy = object_limits();
+        match field { 0 => policy.max_properties += 1, 1 => policy.max_origins += 1,
+            2 => policy.max_input_bytes += 1, 3 => policy.max_json_bytes += 1,
+            4 => policy.max_nodes += 1, _ => policy.max_result_bytes += 1 }
+        let changed = object_factory(OBJECT_SCHEMA, policy, mapping(), lifetime()).unwrap();
+        assert_eq!(frozen.binding.compare(&freeze(&changed).binding), Err(JobError::Mismatch(MismatchField::Recipe)), "field {field}");
+    }
+    for field in 0..3 {
+        let mut changed = object_factory(OBJECT_SCHEMA, object_limits(), mapping(), lifetime()).unwrap();
+        let recipe = changed.recipe.root_object_reconciliation.as_mut().unwrap();
+        match field { 0 => recipe.policy = "different-reconciliation", 1 => recipe.schema_derivation = "different-derivation",
+            _ => recipe.prompt_version = "different-map-prompt" }
+        assert_eq!(frozen.binding.compare(&freeze(&changed).binding), Err(JobError::Mismatch(MismatchField::Recipe)));
+    }
+}
+
+#[test]
+fn root_object_job_selected_rows_and_cohorts_bind_complete_attempts_and_expire_ownership() {
+    let mut map = mapping(); map.mapping.reduction.map_batch_chunks = 3;
+    let original = object_factory(OBJECT_SCHEMA, object_limits(), map, lifetime()).unwrap();
+    assert_eq!(original.check_job_limits(limits()).unwrap_err().code, BatchCode::InvalidLimits);
+    let old = prepare(&original, SOURCE);
+    let rows = Int4JsonSparseLimits { max_rows_per_step: 32 };
+    let selected = original.with_selected_rows(rows).unwrap();
+    assert_eq!(selected.owns(&old).unwrap_err().fault.code, BatchCode::Admission);
+    let selected_prepared = prepare(&selected, SOURCE);
+    let selected_work = selected_prepared.work;
+    assert_eq!(selected_prepared.expected.execution_version(), INT4_OBJECT_MAP_SELECTED_EXECUTION);
+    assert_eq!(selected_work.model.projected_logits, 2 * u64::from(budget().max_output_tokens) * 32);
+    assert_eq!(selected_work.mask_node_visits, old.work.mask_node_visits);
+    assert_eq!(selected_work.model.forward_positions, old.work.model.forward_positions);
+    assert_eq!(selected_work.model.attention_pairs, old.work.model.attention_pairs);
+    let grouped = selected.with_chunk_cohorts().unwrap();
+    grouped.check_job_limits(limits()).unwrap();
+    assert_eq!(grouped.owns(&selected_prepared).unwrap_err().fault.code, BatchCode::Admission);
+    let grouped_prepared = prepare(&grouped, SOURCE);
+    assert_eq!(grouped_prepared.work, selected_work);
+    assert_eq!(grouped_prepared.identities, selected_prepared.identities);
+    assert_eq!(grouped.root_object_reconciliation(), Some(object_limits()));
+    let inverse = object_factory(OBJECT_SCHEMA, object_limits(), map, lifetime()).unwrap()
+        .with_chunk_cohorts().unwrap().with_selected_rows(rows).unwrap();
+    frozen_equal(&grouped, &inverse);
+    let recipe = serde_json::to_value(grouped.job_recipe()).unwrap();
+    assert_eq!(recipe["execution"], INT4_OBJECT_MAP_SELECTED_EXECUTION);
+    assert_eq!(recipe["selected_rows"]["max_rows_per_step"], 32);
+    assert_eq!(recipe["root_object_reconciliation"]["limits"], serde_json::to_value(object_limits()).unwrap());
+    assert_eq!(recipe["chunk_cohorts"], CHUNK_COHORT_SCHEDULE);
+}
+fn frozen_equal(left: &Int4DocumentExtractionJobPlanner, right: &Int4DocumentExtractionJobPlanner) {
+    freeze(left).binding.compare(&freeze(right).binding).unwrap();
+}
+
+#[test]
+fn object_jobs_reject_array_reduction_wrong_schema_and_renewed_verification_authority() {
+    let mut map = mapping();
+    map.root_array_union = Some(RootArrayUnionLimits { max_records: 32, max_origins: 128,
+        max_input_bytes: 1 << 20, max_json_bytes: 65_536, max_nodes: 4096, max_result_bytes: 262_144 });
+    assert!(object_factory(OBJECT_SCHEMA, object_limits(), map, lifetime()).is_err());
+    for wrong in [r#"{"type":"boolean"}"#, r#"{"type":"array","maxItems":2,"items":{"type":"number"}}"#,
+        r#"{"type":"object","properties":{},"additionalProperties":true}"#] {
+        assert!(object_factory(wrong, object_limits(), mapping(), lifetime()).is_err());
+    }
+    let per = mapping().verification; let attempts = limits().max_attempts;
+    for field in 0..3 {
+        let mut max = lifetime();
+        match field { 0 => max.max_fields = per.max_fields * attempts as usize - 1,
+            1 => max.max_matches = per.max_matches * attempts as usize - 1,
+            _ => max.max_scan_steps = per.max_scan_steps * attempts - 1 }
+        assert!(object_factory(OBJECT_SCHEMA, object_limits(), mapping(), max).is_err());
+    }
+}
+
+#[test]
+fn object_preparation_cancellation_keeps_its_exact_terminal_reason() {
+    struct Cancel;
+    impl DecodeStepControl for Cancel {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { Some(DecodeCancellationKind::Deadline) }
+    }
+    let factory = object_factory(OBJECT_SCHEMA, object_limits(), mapping(), lifetime()).unwrap();
+    let error = factory.prepare_with_control(document(SOURCE), &mut Cancel).err().unwrap();
+    assert!(error.stop); assert_eq!(error.fault.cancellation, Some(DecodeCancellationKind::Deadline));
+    for failure in [RootObjectError::Conflict, RootObjectError::MissingRequired, RootObjectError::Source,
+        RootObjectError::Limit] {
+        let mapped = object_failure(failure.into());
+        assert!(mapped.stop); assert_eq!(mapped.fault.code, BatchCode::InvalidExecution);
+    }
+}
+
+#[test]
 fn both_grounding_modes_compile_every_real_unicode_chunk_and_reconstruct_exactly() {
     for grounded in [false, true] {
         let factory = factory(grounded); let prepared = prepare(&factory, SOURCE);
         assert_eq!(prepared.source, SOURCE);
         assert_eq!(prepared.chunk_count(), 2);
         assert_eq!(prepared.execution_identities().len(), 2);
-        let span = prepared.expected.source_span();
+        let span = prepared.expected.mapped().source_span();
         assert_eq!((span.byte_start, span.byte_end), (0, SOURCE.len()));
         assert_eq!((span.scalar_start, span.scalar_end), (0, SOURCE.chars().count()));
         for identity in prepared.execution_identities() {
@@ -518,7 +668,7 @@ fn empty_schema_oversized_schema_or_nonpositive_map_authority_never_prepare() {
             request(false), map, limits(), lifetime()).is_err());
     }
     let mut override_args = factory.request().clone(); override_args.schema.push(' ');
-    assert!(factory.compiler.plan_document_with_control(SOURCE, &override_args, mapping(), &mut Continue).is_err());
+    assert!(factory.compiler.plan(SOURCE, &override_args, mapping(), &mut Continue).is_err());
 }
 
 #[test]
@@ -540,7 +690,7 @@ impl Int4ExtractionDocumentBatchAdmission for Admission {
 fn real_native_processor_factory_and_owned_preparation_satisfy_host_contracts() {
     fn durable<P: DurableBatchProcessor<Recipe = Int4DocumentExtractionJobRecipe,
         Args = ExtractionDocumentArgs, Prepared = PreparedInt4ExtractionDocument,
-        Output = GuardedOutput<Int4ExtractionMapRun, ()>>>() {}
+        Output = GuardedOutput<Int4ExtractionDocumentRun, ()>>>() {}
     fn send<T: Send + 'static>() {}
     durable::<Int4DocumentExtractionJobProcessor<'static, 'static, 'static, 'static, Admission>>();
     send::<Int4DocumentExtractionJobPlanner>(); send::<PreparedInt4ExtractionDocument>();
