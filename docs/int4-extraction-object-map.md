@@ -107,10 +107,43 @@ The output guard stays alive through the complete write and flush. Failed
 execution never becomes a successful empty object, and partial writes are not
 retried as a new result.
 
-Initial execution is serial with full-vocabulary greedy decoding and byte input.
-Chunk cohorts, selected rows, packed prefill, compute teams, Safe-BPE, root-array
-union and durable object jobs are not accepted by this route. Those separate
-execution contracts need explicit future integration.
+Execution defaults to serial, full-vocabulary greedy decoding with byte input.
+Two explicit execution options can be used independently or together:
+
+```bash
+fnlp candidate source-int4 extract-object-map long-document.txt \
+  --schema record.schema.json --source-membership \
+  --snapshot nanbeige.int4.snapshot --expected-model-sha256 "$MODEL_SHA256" \
+  --memory-mib 32768 --max-chunks 64 --cohort-chunks 4 \
+  --max-selected-rows 4096 --max-map-result-bytes 16777216 > complete-record.json
+```
+
+`--cohort-chunks N` shares native decoder passes across up to N independent
+chunks. N must be 1 through 64 and cannot exceed `--max-chunks`. Every chunk
+retains its own prompt, grammar, causal KV and task budget. All real windows,
+including a short final window, are preflighted before native execution or an
+optional snapshot save. Admission covers the componentwise peak native and
+decoder storage, the complete retained document map, and the original-schema
+reconciliation workspace. One retained peak reservation covers successive
+windows; no work, field, match, scan or output allowance renews per cohort.
+
+`--max-selected-rows R` fixes an exact grammar-legal row ceiling for every
+chunk, from 1 through 166144. Every legal token is evaluated, including EOS
+when the grammar accepts it. A legal set larger than R refuses the complete
+document; the engine never prunes that set or silently changes projection
+strategy. The policy and row cap bind every chunk's execution identity before
+admission. Selected rows change the planned projection work while preserving
+the existing physical-memory quote and all schema, source and reducer limits.
+
+The same original-schema reconciliation runs once after every native chunk
+finishes. Conflicts, missing required properties, cancellation or exhaustion in
+any later window still prevent a successful final object. The completed result
+binds the declared cohort width as well as the actual physical counters, so
+different schedules cannot be substituted when their batch counts coincide.
+
+Packed prefill, compute teams, Safe-BPE, root-array union and durable object jobs
+remain outside this route's execution contract. Cohort grouping and selected
+projection have no measured throughput or task-quality claim yet.
 
 ## Result and library API
 
@@ -128,6 +161,14 @@ snapshot, reconciliation limits and versioned policy. Its `output` retains:
 - Verification usage and fixed schema-derivation, prompt and reconciliation
   policy identifiers.
 
+Selected execution uses
+`grouped-int4-selected-row-partial-root-object-document-map-v1` and records the
+cap in `output.partial_map.max_selected_rows`. Cohort CLI output keeps the
+complete object at the same `output` path and adds `cohort_schedule`, with the
+declared maximum chunk count and the actual cohort, group-step, projection and
+work counters. Those counters describe execution; they are not speedup claims.
+The bounded cohort metadata shares the existing candidate envelope allowance.
+
 `RootObjectResult` is constructed only by the bounded reducer. It exposes
 read-only accessors rather than mutable authority fields. The map preflight
 binds the original schema, derived schema, original source, all actual chunk
@@ -141,12 +182,26 @@ use `NlpEngine::extract_int4_object_document` with
 `Int4ObjectExtractionMapConfig`, keeping the original request in its mapping
 config. No caller-supplied prompt hook is introduced.
 
+Library callers may configure the base planner with `with_selected_rows`
+before constructing `Int4ObjectExtractionPlanner`. Prepared object maps expose
+`cohort_requirements` and `execute_cohorts_with_control`; the preflight's
+`verify_cohorts_completed` checks the complete object and sealed schedule
+statistics. Hosted callers use `NlpEngine::extract_int4_object_document_cohorts`
+with the same config and set `mapping.limits.mapping.reduction.map_batch_chunks`
+to the declared width. `Int4ObjectExtractionMapConfig::cohort_requirements`
+quotes the native/decoder window separately from `workspace_bytes`, which
+includes the full map, both schema parses and reconciliation. The serial API
+requires a width of one.
+
 ## Qualification status
 
 The implementation includes reducer, planner, hosted admission and CLI
 regression sources for complementary fields, conflicts, required fields, exact
 decimals, nested atomic values, complete-source evidence, sealed identities,
-remaining verification budgets, cancellation and publication limits. Source
+remaining verification budgets, cancellation and publication limits. Cohort
+regressions cover ragged windows, selected-policy binding, exact grouping,
+physical counter tampering, underfunded native/decoder reservations and
+unchanged original-schema reconciliation. Source
 review and syntax parsing do not establish compiled or executed behavior.
 Compilation, executable regressions, model quality, numerical behavior and
 performance remain unrun pending the controller-owned DSR production checkpoint

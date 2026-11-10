@@ -57,7 +57,7 @@ fn invalid_reducer_schedules_and_complete_output_bounds_refuse_the_object_quote(
     for axis in 0..9 {
         let mut config = config();
         match axis {
-            0 => config.mapping.limits.mapping.reduction.map_batch_chunks = 2,
+            0 => config.mapping.limits.mapping.reduction.map_batch_chunks = 0,
             1 => config.mapping.limits.root_array_union = Some(RootArrayUnionLimits {
                 max_records: 16, max_origins: 64, max_input_bytes: 65536,
                 max_json_bytes: 1024, max_nodes: 4096, max_result_bytes: 4096,
@@ -117,4 +117,95 @@ fn object_error_wrapper_preserves_every_cancellation_cause_and_the_original_sour
             assert!(std::error::Error::source(&error).is_some());
         }
     }
+}
+
+#[test]
+fn native_cohort_windows_do_not_widen_task_or_complete_document_reconciliation_budgets() {
+    for width in [16, 32, 64] {
+        for context in [128, 256] {
+            let mut config = config();
+            config.mapping.native.context_tokens = context;
+            config.mapping.limits.mapping.chunks.context_tokens = context;
+            let serial = Int4MemoryRequirement::for_context(context, width).unwrap();
+            config.mapping.request.budget.max_kv_bytes = serial.kv_bytes;
+            let task = config.mapping.request.budget;
+            let work = config.mapping.limits.mapping.max_model_work;
+            let verification = config.mapping.limits.verification;
+            let compiler = CompileLimits::default();
+            let whole_document = config.workspace_bytes(11, compiler).unwrap();
+            let object = config.object_workspace_bytes(compiler).unwrap();
+            let result_bytes = config.mapping.limits.mapping.reduction.max_result_bytes;
+            for chunks in [1, 3, 4] {
+                config.mapping.limits.mapping.reduction.map_batch_chunks = chunks;
+                let required = config.cohort_requirements(width).unwrap();
+                assert_eq!(required.native.kv_bytes, chunks as u64 * serial.kv_bytes);
+                assert_eq!(required.native.rope_bytes, serial.rope_bytes);
+                assert!(required.native.scratch_payload_bound >= serial.scratch_payload_bound);
+                assert!(required.workspace_bytes > chunks as u64 * task.max_output_bytes);
+                assert!(required.max_result_bytes > chunks as u64 * task.max_output_bytes);
+                assert_eq!(config.mapping.request.budget, task);
+                assert_eq!(config.mapping.limits.mapping.max_model_work, work);
+                assert_eq!(config.mapping.limits.verification, verification);
+                assert_eq!(config.workspace_bytes(11, compiler).unwrap(), whole_document);
+                assert_eq!(config.object_workspace_bytes(compiler).unwrap(), object);
+                assert_eq!(config.mapping.limits.mapping.reduction.max_result_bytes, result_bytes);
+            }
+        }
+    }
+}
+
+#[test]
+fn complete_object_cohort_peak_refuses_each_underfunded_axis_and_admits_the_short_tail() {
+    let mut config = config();
+    config.mapping.limits.mapping.reduction.map_batch_chunks = 4;
+    let required = config.cohort_requirements(32).unwrap();
+    check_object_peak(required, required).unwrap();
+    for axis in 0..5 {
+        let mut underfunded = required;
+        match axis {
+            0 => underfunded.native.kv_bytes -= 1,
+            1 => underfunded.native.rope_bytes -= 1,
+            2 => underfunded.native.scratch_payload_bound -= 1,
+            3 => underfunded.workspace_bytes -= 1,
+            _ => underfunded.max_result_bytes -= 1,
+        }
+        assert!(check_object_peak(required, underfunded).is_err(), "resource axis {axis}");
+    }
+    config.mapping.limits.mapping.reduction.map_batch_chunks = 1;
+    check_object_peak(config.cohort_requirements(32).unwrap(), required).unwrap();
+}
+
+#[test]
+fn invalid_object_cohort_windows_reducers_and_overflow_fail_before_native_allocation() {
+    for chunks in [0, 17, 65, usize::MAX] {
+        let mut config = config();
+        config.mapping.limits.mapping.reduction.map_batch_chunks = chunks;
+        assert!(config.cohort_requirements(32).is_err(), "window {chunks}");
+    }
+    let mut config = config();
+    config.mapping.limits.mapping.reduction.map_batch_chunks = 2;
+    config.mapping.limits.root_array_union = Some(RootArrayUnionLimits {
+        max_records: 16, max_origins: 64, max_input_bytes: 65536,
+        max_json_bytes: 1024, max_nodes: 4096, max_result_bytes: 4096,
+    });
+    assert!(config.cohort_requirements(32).is_err());
+    config.mapping.limits.root_array_union = None;
+    config.reconciliation.max_nodes = 0;
+    assert!(config.cohort_requirements(32).is_err());
+    config.reconciliation.max_nodes = 4096;
+    config.mapping.request.budget.max_output_bytes = u64::MAX;
+    assert!(config.cohort_requirements(32).is_err());
+    config.mapping.request.budget.max_output_bytes = 4096;
+    config.mapping.native.context_tokens = 0;
+    assert!(config.cohort_requirements(32).is_err());
+}
+
+#[test]
+fn owned_object_and_cohort_outputs_cross_the_physical_invocation_boundary() {
+    fn send<T: Send + 'static>() {}
+    send::<Charged<ObjectInput>>();
+    send::<HostedOutput<Int4ObjectExtractionMapRun>>();
+    send::<HostedOutput<Int4ObjectExtractionMapCohortRun>>();
+    let _serial = NlpEngine::extract_int4_object_document;
+    let _cohorts = NlpEngine::extract_int4_object_document_cohorts;
 }

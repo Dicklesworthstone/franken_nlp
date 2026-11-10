@@ -32,8 +32,7 @@ fn actual_dispatcher_exposes_separate_object_contract_and_rejects_unbound_modes(
     assert!(limits.map.mapping.root_array_union.is_none());
     assert!(limits.map.cohort.is_none());
     assert_eq!(limits.map.mapping.mapping.reduction.map_batch_chunks, 1);
-    for flags in [vec!["--root-array-union"], vec!["--cohort-chunks", "2"],
-        vec!["--max-selected-rows", "7"], vec!["--input-encoding", "safe-bpe"],
+    for flags in [vec!["--root-array-union"], vec!["--input-encoding", "safe-bpe-v1"],
         vec!["--compute-threads", "2"], vec!["--prefill-rows", "2"], vec!["--seed", "3"],
         vec!["--temperature-milli", "900"]] {
         let mut argv = vec!["candidate", "source-int4", "extract-object-map", "--schema", "schema.json",
@@ -42,6 +41,85 @@ fn actual_dispatcher_exposes_separate_object_contract_and_rejects_unbound_modes(
         if let Ok(matches) = crate::candidate_cli::definition().try_get_matches_from(argv) {
             assert!(CandidateCommand::from_matches(&matches).is_err(), "unsupported mode parsed into an executable command");
         }
+    }
+}
+
+#[test]
+fn object_cohorts_price_all_simultaneous_chunks_and_keep_original_task_and_reducer_bounds() {
+    let (serial, args) = fixture(&[]);
+    let baseline = serial.validate(&args).unwrap();
+    for width in [1, 2, 64] {
+        let value = width.to_string();
+        let (grouped, args) = fixture(&["--cohort-chunks", &value]);
+        let limits = grouped.validate(&args).unwrap();
+        let quote = limits.map.cohort.unwrap();
+        assert_eq!(limits.map.cohort_chunks, Some(width));
+        assert_eq!(limits.map.mapping.mapping.reduction.map_batch_chunks, width);
+        assert_eq!(quote.native.kv_bytes, baseline.map.common.native.kv_bytes * width as u64);
+        assert!(quote.workspace_bytes > 0);
+        assert_eq!(limits.object, baseline.object);
+        assert_eq!(limits.object_workspace_bytes, baseline.object_workspace_bytes);
+        assert_eq!(limits.map.workspace_bytes, baseline.map.workspace_bytes);
+        assert_eq!(limits.map.mapping.verification, baseline.map.mapping.verification);
+        assert_eq!(limits.map.mapping.mapping.max_model_work, baseline.map.mapping.mapping.max_model_work);
+        assert_eq!(grouped.map.extraction.budget(&args, limits.map.common),
+            serial.map.extraction.budget(&args, baseline.map.common));
+        let ordinary = grouped.map.validate(&args).unwrap();
+        assert_eq!(limits.map.common.minimum_memory_bytes,
+            ordinary.common.minimum_memory_bytes + limits.object_workspace_bytes);
+        let mut short = args;
+        short.memory_mib = limits.map.common.minimum_memory_bytes.div_ceil(MIB) - 1;
+        assert_eq!(grouped.execute(short, &mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
+fn exact_selected_rows_compose_with_object_cohorts_without_widening_any_other_allowance() {
+    for width in [None, Some(1), Some(4)] {
+        let (mut full, args) = fixture(&[]);
+        full.map.cohort_chunks = width;
+        let reference = full.validate(&args).unwrap();
+        for cap in [1, 32, crate::native_engine::lmhead::NANBEIGE_VOCAB_SIZE] {
+            let value = cap.to_string();
+            let (mut selected, args) = fixture(&["--max-selected-rows", &value]);
+            selected.map.cohort_chunks = width;
+            let limits = selected.validate(&args).unwrap();
+            assert_eq!(selected.map.extraction.selected_rows().unwrap().unwrap().max_rows_per_step, cap);
+            assert_eq!(limits.map.common.minimum_memory_bytes, reference.map.common.minimum_memory_bytes);
+            assert_eq!(limits.map.cohort, reference.map.cohort);
+            assert_eq!(limits.map.mapping.mapping.max_model_work, reference.map.mapping.mapping.max_model_work);
+            assert_eq!(limits.map.mapping.mapping.max_mask_visits, reference.map.mapping.mapping.max_mask_visits);
+            assert_eq!(limits.map.mapping.verification, reference.map.mapping.verification);
+            assert_eq!(limits.object, reference.object);
+            let raw = r#"{"type":"object","properties":{"amount":{"type":"number","const":9007199254740993}},"required":["amount"],"additionalProperties":false}"#;
+            let budget = selected.map.extraction.budget(&args, limits.map.common);
+            let request = selected.request(raw.to_owned(), budget, limits, &mut Continue).unwrap();
+            assert_eq!(request.schema, raw);
+            assert_eq!(request.budget, full.map.extraction.budget(&args, reference.map.common));
+        }
+    }
+}
+
+#[test]
+fn invalid_cohort_and_selected_bounds_refuse_before_private_input_or_model_io() {
+    for flags in [vec!["--cohort-chunks", "0"], vec!["--cohort-chunks", "65"],
+        vec!["--cohort-chunks", "3", "--max-chunks", "2"],
+        vec!["--max-selected-rows", "0"], vec!["--max-selected-rows", "166145"]] {
+        let (options, args) = fixture(&flags);
+        assert_eq!(options.execute(args, &mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+    }
+    let (mut options, args) = fixture(&[]);
+    options.map.cohort_chunks = Some(usize::MAX);
+    assert_eq!(options.execute(args, &mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+}
+
+#[cfg(not(feature = "asupersync-runtime"))]
+#[test]
+fn configured_object_execution_still_requires_runtime_before_input() {
+    for flags in [vec!["--cohort-chunks", "2"], vec!["--max-selected-rows", "32"],
+        vec!["--cohort-chunks", "2", "--max-selected-rows", "32"]] {
+        let (options, args) = fixture(&flags);
+        assert_eq!(options.execute(args, &mut NoIo, &mut NoIo), Err(CandidateError::Unavailable));
     }
 }
 

@@ -28,11 +28,15 @@ struct ObjectArgs {
 pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
     ObjectArgs::augment_args(MappingArgs::augment_args(extract::definition().name("extract-object-map")
         .about("Extract complementary root-object properties across a complete document")
-        .long_about("Use an explicit root-object schema for a complete UTF-8 document. A versioned derivation empties ONLY its root required set for each native chunk; nested objects and arrays retain all original constraints and are atomic values. A separate fixed instruction asks the model to omit root properties whose complete values are absent from a chunk. Every actual chunk plan preflights before the first forward. The deterministic reducer combines complementary properties, coalesces exactly equal values with ALL origins, and refuses any conflicting value or missing final required property. No first/last-wins choice, null substitution, recursive merge or model repair. The final exact JSON is independently validated against the ORIGINAL schema. With --source-membership, every final annotated field is independently matched against the COMPLETE original source, retaining all exact occurrences; this uses the remaining original field/match/scan allowance after chunk verification. Chunk-native outputs and their original-coordinate evidence remain available. Structural validity, lexical membership and conflict-free reconciliation do not establish semantic accuracy or extraction completeness. All work, tokenizer, output, memory and deadline limits cover the entire invocation. The whole map-plus-object envelope must fit --max-map-result-bytes. This initial route uses byte input, serial full-vocabulary native execution and one resident engine; it does not accept cohorts, selected rows, packed prefill, CPU teams, Safe-BPE, sampling, thinking, tools or durable jobs.")
+        .long_about("Use an explicit root-object schema for a complete UTF-8 document. A versioned derivation empties ONLY its root required set for each native chunk; nested objects and arrays retain all original constraints and are atomic values. A separate fixed instruction asks the model to omit root properties whose complete values are absent from a chunk. Every actual chunk plan preflights before the first forward. The deterministic reducer combines complementary properties, coalesces exactly equal values with ALL origins, and refuses any conflicting value or missing final required property. No first/last-wins choice, null substitution, recursive merge or model repair. The final exact JSON is independently validated against the ORIGINAL schema. With --source-membership, every final annotated field is independently matched against the COMPLETE original source, retaining all exact occurrences; this uses the remaining original field/match/scan allowance after chunk verification. Chunk-native outputs and their original-coordinate evidence remain available. Structural validity, lexical membership and conflict-free reconciliation do not establish semantic accuracy or extraction completeness. All work, tokenizer, output, memory and deadline limits cover the entire invocation. The whole map-plus-object envelope must fit --max-map-result-bytes. Execution is serial and full-vocabulary by default. --cohort-chunks N shares native decoder passes across up to N independent chunks, admitting every window before model execution. --max-selected-rows N evaluates ALL legal grammar rows, including accepted EOS; a wider legal set refuses without pruning or fallback. These options compose and retain independent chunk KV, the complete original-schema reducer and one resident model. Input remains byte-encoded; packed prefill, CPU teams, Safe-BPE, sampling, thinking, tools and durable object jobs require separate execution contracts.")
         .mut_arg("input", |arg| arg.help("Complete UTF-8 document; '-' reads stdin; not NDJSON"))
         .mut_arg("max_input_bytes", |arg| arg.default_value("1048576").help("Maximum bytes of the complete original document"))
         .mut_arg("preparation_mib", |arg| arg.default_value("1024"))
         .mut_arg("max_checkpoints", |arg| arg.help("One allowance for hosted preparation, every native chunk and final reconciliation"))))
+        .arg(extract::selected_rows_argument())
+        .arg(clap::Arg::new("cohort_chunks").long("cohort-chunks")
+            .value_name("N").value_parser(clap::value_parser!(usize))
+            .help("Share native decoder passes across up to N independent partial-object chunks (1..=64); serial if omitted"))
 }
 #[derive(Clone, Copy, Debug)]
 struct ObjectMapLimits { map: MapLimits, object: RootObjectLimits, object_workspace_bytes: u64 }
@@ -43,14 +47,14 @@ impl ObjectMapLimits {
 }
 impl ObjectMapArgs {
     pub(in crate::candidate_cli::int4) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-        Ok(Self { map: MapArgs { extraction: extract::ExtractionArgs::from_matches(matches)?,
-            mapping: MappingArgs::from_arg_matches(matches)?, cohort_chunks: None,
+        Ok(Self { map: MapArgs { extraction: extract::ExtractionArgs::from_matches_with_projection(matches)?,
+            mapping: MappingArgs::from_arg_matches(matches)?,
+            cohort_chunks: matches.get_one::<usize>("cohort_chunks").copied(),
             array_union: ArrayUnionArgs::default() }, object: ObjectArgs::from_arg_matches(matches)? })
     }
     fn validate(&self, args: &Int4Args) -> Result<ObjectMapLimits, CandidateError> {
         // Revalidate the owned arguments too: parser absence is not authority.
-        if self.map.cohort_chunks.is_some() || self.map.extraction.selected_rows()?.is_some()
-            || self.map.array_union.limits(self.map.mapping)?.is_some()
+        if self.map.array_union.limits(self.map.mapping)?.is_some()
             || !args.input_encoding.is_default() || args.compute.threads() != 1 {
             return Err(CandidateError::Arguments);
         }
@@ -79,7 +83,7 @@ impl ObjectMapArgs {
             .map_err(planning_error)?;
         // The complete ORIGINAL object may exceed one chunk's output ceiling;
         // the partial contract, not the full required set, is the native schema.
-        let partial = self.map.extraction.shared_defaults(derived.partial_schema().to_owned(), budget)?;
+        let partial = self.map.extraction.shared_defaults_with_projection(derived.partial_schema().to_owned(), budget)?;
         if derived.requires_source() != (partial.grounding == ExtractionBatchGrounding::SourceMembership) {
             return Err(CandidateError::Planning);
         }
