@@ -2,10 +2,18 @@
 //! This wrapper owns a distinct fixed prompt and exact schema derivation; it
 //! cannot silently change the ordinary independent-chunk extraction contract.
 use super::*;
+use super::cohort::{Int4ExtractionMapCohortBudget, Int4ExtractionMapCohortRequirement,
+    Int4ExtractionMapCohortRun, Int4ExtractionMapCohortStats, COHORT_ENVELOPE_BYTES,
+    INT4_EXTRACTION_MAP_COHORT_EXECUTION, INT4_EXTRACTION_MAP_SELECTED_COHORT_EXECUTION};
+use crate::native_engine::{int4::PackedInt4Kernel,
+    strict_int4::{Int4ModelWeights, cohort::MAX_INT4_SEQUENCES}};
 use crate::tasks::extract::object_reconcile::{self, RootObjectError, RootObjectLimits,
     RootObjectResult, RootObjectSchema, ROOT_OBJECT_DERIVATION, ROOT_OBJECT_RECONCILIATION};
 
 pub const INT4_OBJECT_MAP_EXECUTION: &str = "grouped-int4-partial-root-object-document-map-v1";
+pub const INT4_OBJECT_MAP_SELECTED_EXECUTION: &str = "grouped-int4-selected-row-partial-root-object-document-map-v1";
+pub const INT4_OBJECT_MAP_COHORT_EXECUTION: &str = "grouped-int4-partial-root-object-document-cohorts-v1";
+pub const INT4_OBJECT_MAP_SELECTED_COHORT_EXECUTION: &str = "grouped-int4-selected-row-partial-root-object-document-cohorts-v1";
 pub const ROOT_OBJECT_MAP_PROMPT: &str = "extract-present-atomic-root-properties-only-v1";
 
 #[derive(Clone, Copy, Debug)]
@@ -15,7 +23,9 @@ pub struct Int4ObjectExtractionMapLimits {
 }
 impl Int4ObjectExtractionMapLimits {
     pub fn reconciliation_workspace_bytes(self) -> Result<u64, Int4ObjectExtractionMapError> {
-        if self.mapping.root_array_union.is_some() || self.mapping.mapping.reduction.map_batch_chunks != 1
+        if self.mapping.root_array_union.is_some()
+            || !(1..=MAX_INT4_SEQUENCES).contains(&self.mapping.mapping.reduction.map_batch_chunks)
+            || self.mapping.mapping.reduction.map_batch_chunks > self.mapping.mapping.chunks.max_chunks
             || self.reconciliation.max_json_bytes > self.mapping.mapping.reduction.max_result_bytes
             || self.reconciliation.max_result_bytes > self.mapping.mapping.reduction.max_result_bytes {
             return Err(Int4ObjectExtractionMapError::Admission);
@@ -56,7 +66,7 @@ pub struct Int4ObjectExtractionPlanner { inner: Int4ExtractionBatchPlanner }
 impl Int4ObjectExtractionPlanner {
     pub fn new(mut planner: Int4ExtractionBatchPlanner) -> Result<Self, Int4ObjectExtractionMapError> {
         planner.require_byte_encoding().map_err(|_| Int4ObjectExtractionMapError::Admission)?;
-        if planner.selected_rows().is_some() || planner.shared_defaults_only || planner.compiler.defaults.is_some() {
+        if planner.shared_defaults_only || planner.compiler.defaults.is_some() {
             return Err(Int4ObjectExtractionMapError::Admission);
         }
         let compiler = &mut planner.compiler;
@@ -86,6 +96,7 @@ impl Int4ObjectExtractionPlanner {
     }
     pub fn base_execution_identity(&self) -> &ExecutionIdentity { self.inner.base_execution_identity() }
     pub fn group_width(&self) -> usize { self.inner.group_width() }
+    pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.inner.selected_rows() }
     pub fn compiler_limits(&self) -> CompileLimits { self.inner.compiler.compiler_limits }
     pub fn plan_document_with_control<'s, C: DecodeStepControl>(&self, source: &'s str,
         original_request: &ExtractionBatchArgs, limits: Int4ObjectExtractionMapLimits, control: &mut C)
@@ -111,7 +122,8 @@ impl Int4ObjectExtractionPlanner {
             .map_err(|_| RootObjectError::Serialization)?;
         let expected = Int4ObjectExtractionMapPreflight { mapped: mapped.preflight_metadata(),
             binding: Sha256Digest::of_bytes(&bytes), verification: limits.mapping.verification,
-            max_result_bytes: limits.mapping.mapping.reduction.max_result_bytes as u64 };
+            max_result_bytes: limits.mapping.mapping.reduction.max_result_bytes as u64,
+            map_batch_chunks: limits.mapping.mapping.reduction.map_batch_chunks };
         poll(control)?;
         Ok(PreparedInt4ObjectExtractionMap { source, schema, mapped, limits, expected })
     }
@@ -122,11 +134,20 @@ pub struct Int4ObjectExtractionMapPreflight {
     binding: Sha256Digest,
     verification: GroundingBudget,
     max_result_bytes: u64,
+    map_batch_chunks: usize,
 }
 impl Int4ObjectExtractionMapPreflight {
     pub fn chunk_count(&self) -> usize { self.mapped.chunk_count() }
     pub fn group_width(&self) -> usize { self.mapped.group_width() }
     pub fn planned_work(&self) -> Int4Work { self.mapped.planned_work() }
+    pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.mapped.selected_rows() }
+    pub fn map_batch_chunks(&self) -> usize { self.map_batch_chunks }
+    pub fn execution_version(&self) -> &'static str {
+        if self.selected_rows().is_some() { INT4_OBJECT_MAP_SELECTED_EXECUTION } else { INT4_OBJECT_MAP_EXECUTION }
+    }
+    pub fn cohort_execution_version(&self) -> &'static str {
+        if self.selected_rows().is_some() { INT4_OBJECT_MAP_SELECTED_COHORT_EXECUTION } else { INT4_OBJECT_MAP_COHORT_EXECUTION }
+    }
     pub fn verify_completed(&self, run: &Int4ObjectExtractionMapRun) -> Result<(), Int4ObjectExtractionMapError> {
         self.mapped.verify_completed(&run.partial_map)?;
         let base = run.partial_map.verification_used;
@@ -134,7 +155,9 @@ impl Int4ObjectExtractionMapPreflight {
         let fields = base.fields.checked_add(global.fields).ok_or(Int4ObjectExtractionMapError::Admission)?;
         let matches = base.matches.checked_add(global.matches).ok_or(Int4ObjectExtractionMapError::Admission)?;
         let scans = base.scan_steps.checked_add(global.scan_steps).ok_or(Int4ObjectExtractionMapError::Admission)?;
-        if run.schema_version != 1 || run.execution != INT4_OBJECT_MAP_EXECUTION
+        if run.schema_version != 1 || run.execution != self.execution_version()
+            || run.mapped_batch_chunks != self.map_batch_chunks
+            || run.partial_map.mapped.map_batches() != self.chunk_count().div_ceil(self.map_batch_chunks)
             || run.schema_derivation != ROOT_OBJECT_DERIVATION || run.map_prompt != ROOT_OBJECT_MAP_PROMPT
             || run.object.binding() != self.binding
             || run.partial_map.verification_used != run.mapped_verification
@@ -148,6 +171,59 @@ impl Int4ObjectExtractionMapPreflight {
         check_size(run, self.max_result_bytes).map_err(|_| RootObjectError::Limit)?;
         Ok(())
     }
+    pub fn verify_cohorts_completed(&self, run: &Int4ObjectExtractionMapCohortRun)
+        -> Result<(), Int4ObjectExtractionMapError> {
+        self.verify_completed(&run.document)?;
+        if run.schema_version != 1 || run.execution != self.cohort_execution_version()
+            || run.cohorts != run.completed_stats {
+            return Err(Int4ObjectExtractionMapError::Admission);
+        }
+        self.verify_cohort_stats(&run.document.partial_map, run.cohorts)?;
+        let cap = self.max_result_bytes.checked_add(COHORT_ENVELOPE_BYTES)
+            .ok_or(Int4ObjectExtractionMapError::Admission)?;
+        check_size(run, cap).map_err(|_| RootObjectError::Limit)?;
+        Ok(())
+    }
+    fn verify_cohort_stats(&self, map: &Int4ExtractionMapRun, stats: Int4ExtractionMapCohortStats)
+        -> Result<(), Int4ObjectExtractionMapError> {
+        if stats.cohorts != self.chunk_count().div_ceil(self.map_batch_chunks) as u64
+            || stats.chunks != self.chunk_count() as u64 || stats.planned_work != self.planned_work()
+            || stats.model_work != map.model_work || stats.cohorts != map.mapped.map_batches() as u64 {
+            return Err(Int4ObjectExtractionMapError::Admission);
+        }
+        let add = |a: u64, b: u64| a.checked_add(b).ok_or(Int4ObjectExtractionMapError::Admission);
+        let (mut positions, mut projections, mut all_projections) = (0_u64, 0_u64, 0_u64);
+        let (mut longest, mut longest_head) = (0, 0);
+        for (index, chunk) in map.mapped.root().value().chunks().enumerate() {
+            longest = longest.max(chunk.native.model_work.forward_positions);
+            let tokens = chunk.native.result.output.token_ids.len() as u64;
+            longest_head = longest_head.max(tokens);
+            all_projections = add(all_projections, tokens)?;
+            if (index + 1) % self.map_batch_chunks == 0 || index + 1 == self.chunk_count() {
+                positions = add(positions, longest)?;
+                projections = add(projections, longest_head)?;
+                longest = 0; longest_head = 0;
+            }
+        }
+        let check = if self.selected_rows().is_some() {
+            constrained_int4::cohort::check_selected_group_counts(None, stats.model_work.forward_positions,
+                positions, all_projections, projections, stats.model_work.projected_logits,
+                stats.group_steps, stats.projection_groups)
+        } else {
+            constrained_int4::cohort::check_group_counts(None, stats.model_work.forward_positions,
+                positions, all_projections, projections, stats.group_steps, stats.projection_groups)
+        };
+        check.map_err(|_| Int4ObjectExtractionMapError::Admission)
+    }
+}
+#[derive(Serialize)]
+pub struct Int4ObjectExtractionMapCohortRun {
+    pub schema_version: u32,
+    pub execution: &'static str,
+    pub document: Int4ObjectExtractionMapRun,
+    pub cohorts: Int4ExtractionMapCohortStats,
+    #[serde(skip)]
+    completed_stats: Int4ExtractionMapCohortStats,
 }
 #[derive(Serialize)]
 pub struct Int4ObjectExtractionMapRun {
@@ -165,6 +241,8 @@ pub struct Int4ObjectExtractionMapRun {
     // cannot make a genuine object report a cheaper completed source scan.
     #[serde(skip)]
     mapped_verification: ExtractionMapVerification,
+    #[serde(skip)]
+    mapped_batch_chunks: usize,
 }
 pub struct PreparedInt4ObjectExtractionMap<'s> {
     source: &'s str,
@@ -181,13 +259,46 @@ impl PreparedInt4ObjectExtractionMap<'_> {
     pub fn group_width(&self) -> usize { self.mapped.group_width() }
     pub fn max_kv_bytes(&self) -> u64 { self.mapped.max_kv_bytes() }
     pub fn max_result_bytes(&self) -> u64 { self.expected.max_result_bytes }
+    pub fn cohort_requirements(&self, context_limit: usize)
+        -> Result<Int4ExtractionMapCohortRequirement, Int4ObjectExtractionMapError> {
+        Ok(self.mapped.cohort_requirements(context_limit)?)
+    }
     pub fn execute_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
         engine: &mut StrictInt4Engine<'_>, vocabulary: &ExtractionVocabulary, control: &mut C)
         -> Result<Int4ObjectExtractionMapRun, Int4ObjectExtractionMapError> {
+        if self.expected.map_batch_chunks != 1 { return Err(Int4ObjectExtractionMapError::Admission); }
         let Self { source, schema, mapped, limits, expected } = self;
         let partial = mapped.execute_with_control(admitted, engine, vocabulary, control)?;
         finish(source, schema, limits, expected, partial, control)
     }
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_cohorts_with_control<C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
+        weights: &Int4ModelWeights, vocabulary: &ExtractionVocabulary, budget: Int4ExtractionMapCohortBudget,
+        kernel: PackedInt4Kernel, control: &mut C)
+        -> Result<Int4ObjectExtractionMapCohortRun, Int4ObjectExtractionMapError> {
+        let Self { source, schema, mapped, limits, expected } = self;
+        let partial = mapped.execute_cohorts_with_control(admitted, weights, vocabulary, budget, kernel, control)?;
+        finish_cohorts(source, schema, limits, expected, partial, control)
+    }
+}
+fn finish_cohorts<C: DecodeStepControl>(source: &str, schema: RootObjectSchema, limits: Int4ObjectExtractionMapLimits,
+    expected: Int4ObjectExtractionMapPreflight, partial: Int4ExtractionMapCohortRun, control: &mut C)
+    -> Result<Int4ObjectExtractionMapCohortRun, Int4ObjectExtractionMapError> {
+    poll(control)?;
+    let execution = if expected.selected_rows().is_some() { INT4_EXTRACTION_MAP_SELECTED_COHORT_EXECUTION }
+        else { INT4_EXTRACTION_MAP_COHORT_EXECUTION };
+    expected.mapped.verify_completed(&partial.document)?;
+    if partial.schema_version != 1 || partial.execution != execution {
+        return Err(Int4ObjectExtractionMapError::Admission);
+    }
+    expected.verify_cohort_stats(&partial.document, partial.cohorts)?;
+    let cohorts = partial.cohorts;
+    let document = finish(source, schema, limits, expected, partial.document, control)?;
+    let result = Int4ObjectExtractionMapCohortRun { schema_version: 1, execution: expected.cohort_execution_version(),
+        document, cohorts, completed_stats: cohorts };
+    expected.verify_cohorts_completed(&result)?;
+    poll(control)?;
+    Ok(result)
 }
 fn finish<C: DecodeStepControl>(source: &str, schema: RootObjectSchema, limits: Int4ObjectExtractionMapLimits,
     expected: Int4ObjectExtractionMapPreflight, partial_map: Int4ExtractionMapRun, control: &mut C)
@@ -204,13 +315,14 @@ fn finish<C: DecodeStepControl>(source: &str, schema: RootObjectSchema, limits: 
         remaining, partial_map.grounding == ExtractionGrounding::SourceMembership,
         partial_map.mapped.root().value().chunks().map(object_chunk), control)?;
     let additional = object.verification_used();
-    let result = Int4ObjectExtractionMapRun { schema_version: 1, execution: INT4_OBJECT_MAP_EXECUTION,
+    let result = Int4ObjectExtractionMapRun { schema_version: 1, execution: expected.execution_version(),
         schema_derivation: ROOT_OBJECT_DERIVATION, map_prompt: ROOT_OBJECT_MAP_PROMPT, partial_map, object,
         verification_used: ExtractionMapVerification {
             fields: used.fields.checked_add(additional.fields).ok_or(Int4ObjectExtractionMapError::Admission)?,
             matches: used.matches.checked_add(additional.matches).ok_or(Int4ObjectExtractionMapError::Admission)?,
             scan_steps: used.scan_steps.checked_add(additional.scan_steps).ok_or(Int4ObjectExtractionMapError::Admission)?,
-        }, untrusted_fields: ["partial_map", "object"], mapped_verification: used };
+        }, untrusted_fields: ["partial_map", "object"], mapped_verification: used,
+        mapped_batch_chunks: expected.map_batch_chunks };
     expected.verify_completed(&result)?;
     poll(control)?;
     Ok(result)

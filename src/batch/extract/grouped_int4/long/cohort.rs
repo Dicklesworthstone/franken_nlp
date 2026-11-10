@@ -145,7 +145,7 @@ impl PreparedInt4ExtractionMap<'_> {
 
     // Private deterministic injection only. Public execution requires real
     // immutable weights and performs the complete actual-model binding above.
-    fn execute_cohorts_with_driver<D: CohortDriver, C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
+    pub(super) fn execute_cohorts_with_driver<D: CohortDriver, C: DecodeStepControl>(self, admitted: &[ExecutionIdentity],
         vocabulary: &ExtractionVocabulary, budget: Int4ExtractionMapCohortBudget, driver: D, control: &mut C)
         -> Result<Int4ExtractionMapCohortRun, Int4ExtractionMapError> {
         step(control)?;
@@ -251,7 +251,7 @@ fn native_error(error: StrictInt4Error) -> Int4ExtractionMapError {
 
 // A test-only injected implementation exercises the coordinator and independent
 // evidence checks. The public API never accepts a driver or serialized output.
-trait CohortDriver {
+pub(super) trait CohortDriver {
     fn execute<C: DecodeStepControl>(&mut self, plans: &[PreparedInt4BatchExtraction], admitted: &[ExecutionIdentity],
         masks: ExtractionMaskBudget, control: &mut C) -> Result<Int4ExtractCohortRun, Int4ExtractError>;
 }
