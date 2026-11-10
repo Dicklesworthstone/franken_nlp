@@ -145,6 +145,48 @@ Packed prefill, compute teams, Safe-BPE, root-array union and durable object job
 remain outside this route's execution contract. Cohort grouping and selected
 projection have no measured throughput or task-quality claim yet.
 
+## Streaming complete documents
+
+`extract-corpus --reconcile-root-object` applies the same object contract to
+every complete document in an ordered NDJSON stream, using one resident model:
+
+```json
+{"id":"record-1","text":"The complete original source for the first record."}
+{"id":"record-2","text":"The complete original source for the second record."}
+```
+
+```bash
+fnlp candidate source-int4 extract-corpus documents.ndjson \
+  --schema record.schema.json --reconcile-root-object --source-membership \
+  --snapshot nanbeige.int4.snapshot --expected-model-sha256 "$MODEL_SHA256" \
+  --memory-mib 32768 --max-chunks 64 --cohort-chunks 4 \
+  --max-selected-rows 4096 --max-map-result-bytes 16777216 > complete-records.ndjson
+```
+
+The flag is explicit and conflicts with `--root-array-union`. All
+`--max-object-*` overrides require it; omitting the mode preserves ordinary
+per-chunk extraction. Each document retains its partial map and one completed
+object, with the same conflict refusal, final required-field validation and
+complete-source verification as the standalone command. A complete original
+object may exceed a single chunk's output cap: only the derived partial schema
+is compiled against that cap, while the full object must fit the declared
+object and complete-map limits.
+
+The CLI reserves original/partial-schema and reconciliation workspace before
+reading the schema or loading the model. It retains preparation ownership
+through optional snapshot saving, then transfers that workspace into the
+hosted document frontier through result delivery. Cohort windows and selected
+rows compose with the same fixed object policy. Provenance adds only policy
+versions and declared limits, without exposing schema contents or private
+schema commitments.
+
+Whole-run native-work, mask and verification allowances cover every admitted
+attempt. Exact `{"flush":true}` controls reset the duplicate-ID epoch without
+renewing those allowances. Earlier completed documents remain valid if a later
+document fails; require the terminal `run_complete` event and exit status zero
+for complete-stream success. Per-record `task_args` must be absent, null or an
+empty object, so records cannot replace the schema, policy or limits.
+
 ## Result and library API
 
 The candidate envelope reports the actual model, group width, kernel, optional

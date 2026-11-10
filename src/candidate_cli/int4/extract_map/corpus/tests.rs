@@ -30,6 +30,107 @@ impl Write for NoIo {
     fn flush(&mut self) -> io::Result<()> { panic!("refused corpus flushed output"); }
 }
 
+struct Control(Option<crate::native_engine::decode::DecodeCancellationKind>);
+impl DecodeStepControl for Control {
+    fn checkpoint(&mut self, _: usize) -> Option<crate::native_engine::decode::DecodeCancellationKind> { self.0 }
+}
+
+#[test]
+fn root_object_stream_reserves_one_complete_reducer_without_renewing_work_or_verification() {
+    for cohorts in [None, Some(3)] {
+        let (mut plain, args) = arguments(&[]);
+        let (mut object, _) = arguments(&["--reconcile-root-object", "--max-object-properties", "32",
+            "--max-object-origins", "128", "--max-object-input-bytes", "1048576",
+            "--max-object-json-bytes", "65536", "--max-object-nodes", "4096",
+            "--max-object-result-bytes", "262144", "--max-selected-rows", "32"]);
+        plain.document.cohort_chunks = cohorts; object.document.cohort_chunks = cohorts;
+        let before = plain.validate(&args).unwrap();
+        let after = object.validate(&args).unwrap();
+        let policy = after.root_object.unwrap();
+        let extra = policy.workspace_bytes().unwrap()
+            + crate::tasks::extract::object_reconcile::RootObjectSchema::workspace_bytes(
+                object.document.extraction.compiler()).unwrap();
+        assert_eq!(after.object_preparation_bytes, extra);
+        assert_eq!(after.memory.document_workspace_bytes - before.memory.document_workspace_bytes, extra);
+        assert_eq!(after.memory.native, before.memory.native);
+        assert_eq!(after.memory.workspace_bytes, before.memory.workspace_bytes);
+        assert_eq!(after.memory.input_bytes, before.memory.input_bytes);
+        assert_eq!(after.memory.output_reservation_bytes, before.memory.output_reservation_bytes);
+        assert_eq!(after.transport, before.transport);
+        assert_eq!(after.max_run_mask_visits, before.max_run_mask_visits);
+        assert_eq!(after.max_run_verification, before.max_run_verification);
+        assert_eq!(after.document.mapping.mapping.max_model_work, before.document.mapping.mapping.max_model_work);
+        assert_eq!(after.cli_preparation_bytes, before.cli_preparation_bytes);
+        assert!(after.common.minimum_memory_bytes >= before.common.minimum_memory_bytes);
+        let mut short = args;
+        short.memory_mib = after.common.minimum_memory_bytes.div_ceil(MIB) - 1;
+        assert_eq!(object.execute_owned(short, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
+fn root_object_stream_preserves_raw_schema_and_admits_complete_required_objects_above_chunk_cap() {
+    let (options, args) = arguments(&["--reconcile-root-object", "--max-result-bytes", "2048"]);
+    let limits = options.validate(&args).unwrap();
+    let budget = options.document.extraction.budget(&args, limits.common);
+    let value = "x".repeat(896);
+    let schema = format!(r#" {{"type":"object","additionalProperties":false,"properties":{{"a":{{"type":"string","const":"{value}"}},"b":{{"type":"string","const":"{value}"}},"c":{{"type":"string","const":"{value}"}}}},"required":["a","b","c"]}} "#);
+    assert!(crate::grammar::runtime::JsonValidationSchema::compile(&schema,
+        options.document.extraction.compiler()).is_err());
+    let request = options.load_defaults_with_control(schema.clone(), budget, &mut Control(None)).unwrap();
+    assert_eq!(request.schema, schema);
+    assert_eq!(request.budget.max_output_bytes, 2048);
+    assert_eq!(request.grounding, ExtractionBatchGrounding::Structural);
+    let raw = " {\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"n\":{\"type\":\"number\",\"const\":12345678901234567890123456789012345678}},\"required\":[\"n\"]}\n";
+    assert_eq!(options.load_defaults_with_control(raw.to_owned(), budget, &mut Control(None)).unwrap().schema, raw);
+    for schema in [r#"{"type":"number"}"#, r#"{"type":"array","items":{"type":"number"}}"#,
+        r#"{"type":"object","properties":{},"additionalProperties":true}"#] {
+        assert!(options.load_defaults_with_control(schema.to_owned(), budget, &mut Control(None)).is_err());
+    }
+}
+
+#[test]
+fn root_object_stream_checks_original_grounding_and_preserves_schema_preparation_cancellation() {
+    let (structural, args) = arguments(&["--reconcile-root-object"]);
+    let (grounded, _) = arguments(&["--reconcile-root-object", "--source-membership"]);
+    let budget = structural.document.extraction.budget(&args, structural.validate(&args).unwrap().common);
+    let schema = r#"{"type":"object","additionalProperties":false,"properties":{"name":{"type":"string","maxLength":64,"x-fnlp-source":"verbatim"}},"required":["name"]}"#;
+    assert!(structural.load_defaults_with_control(schema.to_owned(), budget, &mut Control(None)).is_err());
+    let request = grounded.load_defaults_with_control(schema.to_owned(), budget, &mut Control(None)).unwrap();
+    assert_eq!(request.schema, schema);
+    assert_eq!(request.grounding, ExtractionBatchGrounding::SourceMembership);
+    use crate::native_engine::decode::DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let expected = if matches!(cause, Timeout | Deadline) { CandidateError::Timeout } else { CandidateError::Execution };
+        assert_eq!(grounded.load_defaults_with_control(schema.to_owned(), budget, &mut Control(Some(cause))).err(), Some(expected));
+    }
+}
+
+#[test]
+fn object_policy_and_every_reducer_limit_refuse_before_private_population_or_model_io() {
+    for flags in [vec!["--max-object-properties", "0"], vec!["--max-object-origins", "1"],
+        vec!["--max-object-nodes", "0"], vec!["--max-object-input-bytes", "1"],
+        vec!["--max-object-json-bytes", "16777217"], vec!["--max-object-result-bytes", "16777217"]] {
+        let mut selected = vec!["--reconcile-root-object"]; selected.extend(flags);
+        let (options, args) = arguments(&selected);
+        assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+    for flags in [vec!["--reconcile-root-object", "--root-array-union"],
+        vec!["--max-object-properties", "16"], vec!["--max-object-origins", "64"],
+        vec!["--max-object-nodes", "1024"], vec!["--max-object-input-bytes", "1024"],
+        vec!["--max-object-json-bytes", "1024"], vec!["--max-object-result-bytes", "1024"]] {
+        let mut selected = vec!["--source-dir", "source", "--source-manifest", "manifest", "--schema", "schema"];
+        selected.extend(flags);
+        assert!(parsed(&selected).is_err());
+    }
+    // Programmatic callers must not combine modes after parser admission.
+    let (mut object, args) = arguments(&["--reconcile-root-object"]);
+    let (array, _) = arguments(&["--root-array-union"]);
+    object.document.array_union = array.document.array_union;
+    assert_eq!(object.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+}
+
 #[test]
 fn selected_projection_composes_with_exact_array_reduction_without_renewing_stream_limits() {
     for flags in [&["--root-array-union"][..],
@@ -284,6 +385,9 @@ fn single_context_controls_and_retained_job_options_cannot_leak_into_the_live_ro
 #[cfg(not(feature = "asupersync-runtime"))]
 #[test]
 fn unsupported_profile_refuses_before_schema_or_population_io() {
-    let (options, args) = arguments(&[]);
-    assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Unavailable));
+    for flags in [&[][..], &["--reconcile-root-object"][..],
+        &["--reconcile-root-object", "--cohort-chunks", "3", "--max-selected-rows", "32"][..]] {
+        let (options, args) = arguments(flags);
+        assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Unavailable));
+    }
 }

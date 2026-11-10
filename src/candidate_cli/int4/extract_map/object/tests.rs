@@ -185,3 +185,59 @@ fn one_chunk_output_cap_does_not_limit_the_original_full_required_object() {
     let request = options.request(schema, budget, limits, &mut Continue).unwrap();
     assert_eq!(request.budget.max_output_bytes, 2048);
 }
+
+#[test]
+fn population_object_options_are_explicit_and_share_the_standalone_contract() {
+    let (standalone, args) = fixture(&[]);
+    let map = standalone.map.validate(&args).unwrap();
+    let selected = standalone.validate(&args).unwrap();
+    let disabled = ReconciliationArgs::default();
+    assert_eq!(disabled.limits(standalone.map.mapping).unwrap(), None);
+    assert_eq!(disabled.workspace_bytes(&standalone.map, map).unwrap(), 0);
+    let enabled = ReconciliationArgs { reconcile_root_object: true, ..Default::default() };
+    assert_eq!(enabled.limits(standalone.map.mapping).unwrap(), Some(selected.object));
+    assert_eq!(enabled.workspace_bytes(&standalone.map, map).unwrap(), selected.object_workspace_bytes);
+    for field in 0..6 {
+        let mut invalid = disabled;
+        match field {
+            0 => invalid.max_object_properties = Some(16),
+            1 => invalid.max_object_origins = Some(32),
+            2 => invalid.max_object_input_bytes = Some(4096),
+            3 => invalid.max_object_json_bytes = Some(4096),
+            4 => invalid.max_object_nodes = Some(512),
+            _ => invalid.max_object_result_bytes = Some(65536),
+        }
+        assert_eq!(invalid.limits(standalone.map.mapping), Err(CandidateError::Arguments), "field {field}");
+    }
+}
+
+#[test]
+fn population_request_preserves_original_schema_and_prices_original_validation_separately() {
+    let (standalone, args) = fixture(&["--max-result-bytes", "2048"]);
+    let selected = standalone.validate(&args).unwrap();
+    let budget = standalone.map.extraction.budget(&args, selected.map.common);
+    let value = "x".repeat(896);
+    let schema = format!(r#"{{"type":"object","additionalProperties":false,"properties":{{"a":{{"type":"string","const":"{value}"}},"b":{{"type":"string","const":"{value}"}},"c":{{"type":"string","const":"{value}"}}}},"required":["a","b","c"]}}"#);
+    assert!(ReconciliationArgs::default().request(&standalone.map, schema.clone(), budget, &mut Continue).is_err());
+    let enabled = ReconciliationArgs { reconcile_root_object: true, ..Default::default() };
+    let request = enabled.request(&standalone.map, schema.clone(), budget, &mut Continue).unwrap();
+    assert_eq!(request.schema, schema);
+    assert_eq!(request.budget, budget);
+    assert_eq!(request.grounding, ExtractionBatchGrounding::Structural);
+    let metadata = crate::canonjson::canonical_string(&RootObjectSelection::new(selected.object)).unwrap();
+    assert!(metadata.contains(crate::tasks::extract::object_reconcile::ROOT_OBJECT_RECONCILIATION));
+    assert!(!metadata.contains(&value));
+    assert!(!metadata.contains("schema_digest"));
+}
+
+#[test]
+fn population_option_parser_requires_mode_and_refuses_competing_reducers() {
+    let definition = || ReconciliationArgs::augment_definition(clap::Command::new("object-options")
+        .arg(clap::Arg::new("root_array_union").long("root-array-union").action(clap::ArgAction::SetTrue)));
+    for name in ["--max-object-properties", "--max-object-origins", "--max-object-input-bytes",
+        "--max-object-json-bytes", "--max-object-nodes", "--max-object-result-bytes"] {
+        assert!(definition().try_get_matches_from(["object-options", name, "32"]).is_err());
+        assert!(definition().try_get_matches_from(["object-options", "--reconcile-root-object", name, "32"]).is_ok());
+    }
+    assert!(definition().try_get_matches_from(["object-options", "--reconcile-root-object", "--root-array-union"]).is_err());
+}

@@ -35,6 +35,31 @@ fn pure_host_quote_matches_cli_for_every_admitted_native_document_schedule() {
 }
 
 #[test]
+fn root_object_host_and_cli_quotes_include_the_same_complete_reconciliation_ownership() {
+    for width in [32, 128] {
+        for chunks in [None, Some(1), Some(3), Some(64)] {
+            let (mut command, mut args) = arguments(&["--reconcile-root-object", "--max-result-bytes", "65536",
+                "--max-selected-rows", "32"]);
+            args.group_width = width; args.max_load_mib = 65_536;
+            command.document.cohort_chunks = chunks;
+            let limits = command.validate(&args).unwrap();
+            let budget = command.document.extraction.budget(&args, limits.common);
+            let host = host_limits(&args, limits, Duration::from_secs(7));
+            let quote = crate::hosted::int4_extraction_document_object_corpus_requirements(width, budget,
+                limits.document.mapping, host, limits.document.reduction_reserve_bytes, chunks,
+                command.document.extraction.compiler(), limits.root_object).unwrap();
+            assert_eq!(quote, limits.memory);
+            assert_eq!(quote.document_workspace_bytes, limits.document.workspace_bytes
+                + limits.document.cohort.map_or(0, |cohort| cohort.workspace_bytes)
+                + limits.object_preparation_bytes);
+            assert_eq!(quote.max_output_bytes as usize + FRAME_ALLOWANCE as usize,
+                limits.transport.max_output_line_bytes);
+            assert_eq!(quote.native.kv_bytes, budget.max_kv_bytes * chunks.unwrap_or(1) as u64);
+        }
+    }
+}
+
+#[test]
 fn runtime_rechecks_programmatic_refusal_before_schema_or_population_io() {
     let (mut command, args) = arguments(&[]);
     let admitted = command.validate(&args).unwrap();
@@ -56,6 +81,9 @@ fn typed_cancellation_survives_loading_planning_batching_and_nested_failures() {
             HostedError::Int4(Int4HostError::Native(StrictInt4Error::Cancelled(cause))),
             HostedError::Int4(Int4HostError::Extraction(extraction())),
             HostedError::Int4(Int4HostError::ExtractionMap(Int4ExtractionMapError::Extraction(extraction()))),
+            HostedError::Int4(Int4HostError::ObjectExtractionMap(
+                crate::batch::extract::grouped_int4::long::object::Int4ObjectExtractionMapError::Reconciliation(
+                    crate::tasks::extract::object_reconcile::RootObjectError::Cancelled(cause)))),
             HostedError::Scope { source: asupersync::cx::ScopedCpuError::WorkerCapExceeded { cap: 1 },
                 physical_error: Some(Box::new(HostedError::BatchSetup(BatchFault::cancelled(cause)))) }] {
             assert_eq!(host_error(error, CandidateError::Batch), expected);
@@ -78,7 +106,7 @@ fn corpus_frame_keeps_exact_chunk_json_and_reveals_only_public_outer_metadata() 
             protocol: "fnlp-candidate-int4-extract-corpus-v1", schema_version: 1,
             scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "extract",
             source_mode: "complete_document", chunk_schedule: chunk_schedule(cohort_chunks), cohort_chunks,
-            root_array_union: None, max_selected_rows: None,
+            root_array_union: None, root_object_reconciliation: None, max_selected_rows: None,
             model_id: "Nanbeige4.2-3B", source_revision: "public-revision", source_root_sha256: "public-source",
             model_content_sha256: "public-model", candidate_format: "candidate-int4", quant_recipe: "recipe",
             group_width: 128, integer_kernel: "s_scalar_i32",
@@ -97,6 +125,7 @@ fn corpus_frame_keeps_exact_chunk_json_and_reveals_only_public_outer_metadata() 
         assert_eq!(value["source_mode"], "complete_document");
         assert_eq!(value["evidence"], "non_authoritative");
         assert!(value.get("max_selected_rows").is_none());
+        assert!(value.get("root_object_reconciliation").is_none());
         if let Some(chunks) = cohort_chunks {
             assert_eq!(value["chunk_schedule"], "native_chunk_cohorts"); assert_eq!(value["cohort_chunks"], chunks);
         } else {
@@ -121,6 +150,25 @@ fn corpus_frame_keeps_exact_chunk_json_and_reveals_only_public_outer_metadata() 
         assert_eq!(selected_value["max_selected_rows"], 8192);
         assert_eq!(selected_value["record"], value["record"]);
         assert!(std::str::from_utf8(&selected_output).unwrap()
+            .ends_with(&format!("\"record\":{}}}\n", inner.trim_end_matches('\n'))));
+        let root = RootObjectLimits { max_properties: 16, max_origins: 64,
+            max_input_bytes: 65_536, max_json_bytes: 4096, max_nodes: 4096, max_result_bytes: 8192 };
+        let reconciled = Provenance { root_object_reconciliation: Some(RootObjectSelection::new(root)), ..selected };
+        let mut object_output = Vec::new();
+        {
+            let mut writer = CandidateWriter::new(&mut object_output, &reconciled, 4096, 8192).unwrap();
+            writer.write_all(inner.as_bytes()).unwrap(); writer.flush().unwrap();
+        }
+        let object_value: serde_json::Value = serde_json::from_slice(&object_output).unwrap();
+        assert_eq!(object_value["record"], value["record"]);
+        assert_eq!(object_value["root_object_reconciliation"]["policy"],
+            crate::tasks::extract::object_reconcile::ROOT_OBJECT_RECONCILIATION);
+        assert_eq!(object_value["root_object_reconciliation"]["schema_derivation"],
+            crate::tasks::extract::object_reconcile::ROOT_OBJECT_DERIVATION);
+        assert_eq!(object_value["root_object_reconciliation"]["map_prompt"],
+            crate::batch::extract::grouped_int4::long::object::ROOT_OBJECT_MAP_PROMPT);
+        assert_eq!(object_value["root_object_reconciliation"]["limits"], serde_json::to_value(root).unwrap());
+        assert!(std::str::from_utf8(&object_output).unwrap()
             .ends_with(&format!("\"record\":{}}}\n", inner.trim_end_matches('\n'))));
     }
 }

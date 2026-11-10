@@ -3845,9 +3845,33 @@ original field/match/scan budgets after chunk verification.
 
 The result retains all partial native outputs, their original-coordinate
 evidence, the complete exact JSON object and property origins. Separate bounded
-reconciliation storage is admitted alongside the existing complete map. Initial
-execution uses serial full-vocabulary byte-input planning; compilation, model
-behavior and quality remain subject to the existing qualification gates. See
+reconciliation storage is admitted alongside the existing complete map.
+Execution defaults to serial full-vocabulary byte-input planning. Optional
+`--cohort-chunks N` and `--max-selected-rows R` compose with the same original
+schema and reducer; neither option renews document budgets.
+
+Use `extract-corpus --reconcile-root-object` to process an ordered NDJSON
+population of complete documents through one resident model:
+
+```bash
+fnlp candidate source-int4 extract-corpus documents.ndjson \
+  --schema record.schema.json --reconcile-root-object --source-membership \
+  --snapshot nanbeige.int4.snapshot --expected-model-sha256 "$MODEL_SHA256" \
+  --memory-mib 32768 --max-chunks 64 --cohort-chunks 4 \
+  --max-selected-rows 4096 --max-map-result-bytes 16777216 > complete-records.ndjson
+```
+
+Each input is `{"id":"record-1","text":"The complete original document."}`.
+Every completed record retains its partial map and independently validated
+object. Conflicts or missing final required fields refuse that document.
+Whole-run native work, masks and verification remain bounded across failed
+attempts and flushes. Original/partial-schema and reducer storage is admitted
+before schema/model IO and retained through delivery. `--max-object-*`
+overrides require the mode, which conflicts with `--root-array-union`.
+Require `run_complete` and exit status zero for whole-stream success.
+
+Compilation, executable regressions, model behavior and quality remain subject
+to the existing qualification gates. See
 [root-object reconciliation](docs/int4-extraction-object-map.md) for a worked
 example, limits, result fields and the library API.
 

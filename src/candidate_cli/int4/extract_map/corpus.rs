@@ -5,7 +5,10 @@ use crate::{
         extract::grouped_int4::long::stream::memory::{Int4ExtractionDocumentMemoryLimits,
             Int4ExtractionDocumentMemoryRequirement}},
     candidate_cli::batch::{FRAME_ALLOWANCE, IO_BUFFER_BYTES},
+    native_engine::decode::DecodeStepControl,
+    tasks::extract::object_reconcile::RootObjectLimits,
 };
+use super::object::ReconciliationArgs;
 
 #[cfg(feature = "asupersync-runtime")]
 mod runtime;
@@ -51,15 +54,31 @@ impl StreamArgs {
 pub(in crate::candidate_cli::int4) struct CorpusArgs {
     document: MapArgs,
     stream: StreamArgs,
+    reconciliation: ReconciliationArgs,
 }
 impl std::fmt::Debug for CorpusArgs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ExtractionCorpusArgs") }
 }
 
 pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
-    StreamArgs::augment_args(super::corpus_definition().name("extract-corpus")
+    ReconciliationArgs::augment_definition(StreamArgs::augment_args(super::corpus_definition().name("extract-corpus")
         .about("Extract one exact schema from every chunk of ordered complete documents")
-        .long_about("Stream strict {id,text,task_args?} NDJSON and exact {\"flush\":true} controls through one resident grouped-INT4 model. text is the COMPLETE original source. --schema fixes one exact raw JSON schema; task_args must be absent, null or an empty object, with no schema, budget or grounding overrides. Each source is losslessly partitioned using the real schema and prompt capacity. Preflight every chunk before that document's first native forward. Preserve every independent exact-schema JSON string and its original byte/scalar lineage; --source-membership checks all compatible occurrences in the originating chunk and lifts them to the complete source. Required fields must be satisfiable in each chunk; no global-object merge or partial-document success. Documents execute sequentially; --cohort-chunks explicitly shares native layers within a document without changing per-chunk task authority. Optional --max-selected-rows N fixes one all-legal-row ceiling for every chunk and document, including accepting EOS. Oversized legal sets refuse without pruning or fallback; the cap cannot change at a flush. All five native work flags bound the ENTIRE RUN. Separate --max-run-mask-node-visits and --max-run-extraction-* ceilings bound mask and original-coordinate verification work across admitted attempts. Failed attempts, chunk cohorts and flush controls never replenish them. Every completed event carries public candidate provenance. Require run_complete AND exit 0 for whole-run success; earlier completed records remain valid after later failure. Source conversion and independently pinned snapshots share this route. Optional snapshot saving follows fixed schema/model/envelope admission and may remain after a later row fails. No retained job, input spool, per-row overrides, semantic correctness claim, prompt prefill, cross-document cohorts, sampling or repair retry. Blocking IO observes the end-to-end deadline cooperatively.")
+        .long_about(concat!(
+            "Stream strict {id,text,task_args?} NDJSON and exact {\"flush\":true} controls through one resident grouped-INT4 model. ",
+            "text is the COMPLETE original source. --schema fixes one exact raw schema; task_args must be absent, null or an empty object. ",
+            "Preflight every real chunk before that document's first native forward. By default, each chunk independently satisfies the complete schema. ",
+            "--reconcile-root-object instead derives a separately authenticated partial root schema and combines complementary properties into one original-schema-valid object. ",
+            "Only root required fields are relaxed for chunks; nested values stay atomic. Equal values retain all origins; conflicts and missing final required properties fail the document. ",
+            "This mode conflicts with --root-array-union. --max-object-* bounds the complete reducer and adds schema/reconciliation memory before input or model IO. ",
+            "--source-membership retains chunk evidence and verifies reconciled fields against the complete original source using the remaining document verification allowance. ",
+            "No partial document succeeds. Documents execute sequentially; --cohort-chunks shares native layers within a document and --max-selected-rows N evaluates every legal grammar row, including accepting EOS. ",
+            "Oversized legal sets refuse without pruning or fallback. All five native work flags bound the ENTIRE RUN. ",
+            "--max-run-mask-node-visits and --max-run-extraction-* bound mask and source-verification work across every admitted attempt. ",
+            "Failed attempts, cohorts and flushes never renew these allowances. Every completed event carries public candidate provenance. ",
+            "Require run_complete AND exit 0 for whole-run success; earlier completed records remain valid after later failure. ",
+            "Source conversion and independently pinned snapshots share this route. Optional snapshot saving follows fixed schema/model/envelope admission and may remain after a later row fails. ",
+            "No retained job, input spool, per-row overrides, semantic correctness claim, prompt prefill, cross-document cohorts, sampling or repair retry. ",
+            "Blocking IO observes the end-to-end deadline cooperatively."))
         .mut_arg("input", |arg| arg.help("NDJSON file or '-' for stdin; each text is a complete original document"))
         .mut_arg("max_input_bytes", |arg| arg.help("Maximum decoded UTF-8 bytes of each COMPLETE original document"))
         .mut_arg("max_map_result_bytes", |arg| arg.help("Complete semantic document result cap; transport/provenance framing is additional"))
@@ -70,7 +89,7 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
         .mut_arg("max_projected_logits", |arg| arg.help("Whole-stream projected-logit ceiling under the selected head strategy"))
         .mut_arg("max_attention_pairs", |arg| arg.help("Whole-stream attention-pair ceiling"))
         .mut_arg("max_dot_products", |arg| arg.help("Whole-stream grouped native dot-product ceiling"))
-        .mut_arg("max_multiply_accumulates", |arg| arg.help("Whole-stream multiply-accumulate ceiling")))
+        .mut_arg("max_multiply_accumulates", |arg| arg.help("Whole-stream multiply-accumulate ceiling"))))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -84,16 +103,21 @@ pub(in crate::candidate_cli::int4) struct CorpusLimits {
     output_bytes: u64,
     io_bytes: u64,
     cli_preparation_bytes: u64,
+    root_object: Option<RootObjectLimits>,
+    object_preparation_bytes: u64,
 }
 
 impl CorpusArgs {
     pub(in crate::candidate_cli::int4) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-        Ok(Self { document: MapArgs::from_matches(matches)?, stream: StreamArgs::from_arg_matches(matches)? })
+        Ok(Self { document: MapArgs::from_matches(matches)?, stream: StreamArgs::from_arg_matches(matches)?,
+            reconciliation: ReconciliationArgs::from_arg_matches(matches)? })
     }
 
     pub(in crate::candidate_cli::int4) fn validate(&self, args: &Int4Args) -> Result<CorpusLimits, CandidateError> {
         let document = self.document.validate_corpus(args)?;
         let mut common = document.common;
+        let root_object = self.reconciliation.limits(self.document.mapping)?;
+        let object_preparation_bytes = self.reconciliation.workspace_bytes(&self.document, document)?;
         let s = self.stream;
         let verification = s.verification();
         let per_document = document.mapping.verification;
@@ -132,15 +156,25 @@ impl CorpusArgs {
             allocator_reserve_bytes: ALLOCATOR_BYTES, preparation_reserve_bytes: common.preparation_bytes,
             io_reserve_bytes: io_bytes, reduction_reserve_bytes: document.reduction_reserve_bytes,
             cohort_chunks: document.cohort_chunks }
-            .requirements(args.group_width, budget, document.mapping, transport)
+            .requirements_with_root_object(args.group_width, budget, document.mapping, transport,
+                self.document.extraction.compiler(), root_object)
             .map_err(|_| CandidateError::Arguments)?;
         let execution = sum(&[memory.native.kv_bytes, memory.workspace_bytes, memory.input_bytes,
             memory.document_workspace_bytes, memory.output_reservation_bytes])?;
-        common.minimum_memory_bytes = sum(&[grouped_memory_floor(args, common, execution)?, io_bytes])?;
+        // The separate original/partial-schema charge remains owned during
+        // model loading and optional snapshot saving. It is relinquished before
+        // the hosted invocation takes the full object-map frontier charge.
+        let loading = if common.snapshot_pin.is_some() { common.snapshot_need.scratch_bytes }
+            else { sum(&[common.source_preparation_bytes, common.load.scratch_payload_bytes])? };
+        let saving = if args.save_snapshot.is_some() { common.snapshot_need.scratch_bytes } else { 0 };
+        let preparation_peak = sum(&[loading.max(saving), object_preparation_bytes])?;
+        common.minimum_memory_bytes = sum(&[
+            grouped_memory_floor(args, common, execution.max(preparation_peak))?, io_bytes])?;
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(CorpusLimits { common, document, transport, memory,
             max_run_mask_visits: s.max_run_mask_node_visits, max_run_verification: verification,
-            output_bytes: s.max_total_output_bytes, io_bytes, cli_preparation_bytes })
+            output_bytes: s.max_total_output_bytes, io_bytes, cli_preparation_bytes,
+            root_object, object_preparation_bytes })
     }
 
     fn load_defaults(&self, schema: String, budget: TaskBudget) -> Result<ExtractionBatchArgs, CandidateError> {
@@ -154,6 +188,15 @@ impl CorpusArgs {
             return Err(CandidateError::Planning);
         }
         Ok(request)
+    }
+
+    fn load_defaults_with_control<C: DecodeStepControl>(&self, schema: String,
+        budget: TaskBudget, control: &mut C) -> Result<ExtractionBatchArgs, CandidateError> {
+        if self.reconciliation.limits(self.document.mapping)?.is_some() {
+            self.reconciliation.request(&self.document, schema, budget, control)
+        } else {
+            self.load_defaults(schema, budget)
+        }
     }
 
     pub(in crate::candidate_cli::int4) fn execute_owned<R: Read + Send + 'static, W: Write + Send + 'static>(

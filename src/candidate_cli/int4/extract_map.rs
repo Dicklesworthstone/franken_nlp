@@ -20,12 +20,12 @@ mod tests;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct MapArgs {
     pub extraction: extract::ExtractionArgs,
-    mapping: MappingArgs,
+    pub(super) mapping: MappingArgs,
     cohort_chunks: Option<usize>,
     array_union: ArrayUnionArgs,
 }
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
-struct MappingArgs {
+pub(super) struct MappingArgs {
     /// Fail if complete input requires more chunks; never truncate the source.
     #[arg(long, default_value_t = 64)]
     max_chunks: usize,

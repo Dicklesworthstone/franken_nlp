@@ -5,14 +5,22 @@ use crate::{
     NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
     batch::extract::grouped_int4::long::stream::{Int4ExtractionDocumentBatchConfig,
         Int4ExtractionDocumentBatchPlanner},
-    candidate_cli::{batch::{CandidateWriter, completed}, extract::SCHEMA_BYTES},
+    candidate_cli::{batch::{CandidateWriter, completed}, extract::SCHEMA_BYTES,
+        int4::extract_map::object::RootObjectSelection},
     hosted::{CancellationToken, HostedError, Int4HostError, NativeLimits, RunLimits,
         corpus::CorpusLimits as HostCorpusLimits},
-    native_engine::{decode::DecodeCancellationKind,
+    native_engine::{decode::{DecodeCancellationKind, DecodeStepControl},
         strict_int4::{Int4ModelError, StrictInt4Error,
             weights::snapshot::{Int4SnapshotError, INT4_SNAPSHOT_VERSION}}},
     tasks::extract::ExtractionVocabulary,
 };
+
+struct DeadlineControl { started: Instant, deadline: Duration }
+impl DecodeStepControl for DeadlineControl {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+        (self.started.elapsed() >= self.deadline).then_some(DecodeCancellationKind::Deadline)
+    }
+}
 
 fn stopped(cause: DecodeCancellationKind) -> CandidateError {
     match cause {
@@ -28,6 +36,7 @@ fn host_error(error: HostedError, fallback: CandidateError) -> CandidateError {
         HostedError::BatchSetup(fault) => fault.cancellation.map(stopped).unwrap_or(fallback),
         HostedError::Batch(error) => error.fault.cancellation.map(stopped).unwrap_or(fallback),
         HostedError::Int4(Int4HostError::ExtractionMap(error)) => error.cancellation().map(stopped).unwrap_or(fallback),
+        HostedError::Int4(Int4HostError::ObjectExtractionMap(error)) => error.cancellation().map(stopped).unwrap_or(fallback),
         HostedError::Int4(Int4HostError::Extraction(error)) => error.cancellation().map(stopped).unwrap_or(fallback),
         HostedError::Int4(Int4HostError::Model(Int4ModelError::Cancelled(cause)))
             | HostedError::Int4(Int4HostError::Snapshot(Int4SnapshotError::Cancelled(cause)))
@@ -58,11 +67,15 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     // staging stay charged until the owned hosted invocation physically drains.
     let _preparation = lease.reserve(MemoryClass::JobBuffers, limits.cli_preparation_bytes)
         .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
+    let object_preparation = if limits.object_preparation_bytes == 0 { None } else {
+        Some(lease.reserve(MemoryClass::JobBuffers, limits.object_preparation_bytes)
+            .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?)
+    };
     remaining()?;
     let schema = read_input(&mut crate::local_io::open_document(command.document.extraction.schema_path())
         .map_err(|_| CandidateError::Input)?, SCHEMA_BYTES)?;
     let budget = command.document.extraction.budget(&args, common);
-    let request = command.load_defaults(schema, budget)?;
+    let request = command.load_defaults_with_control(schema, budget, &mut DeadlineControl { started, deadline })?;
     remaining()?;
     let cancellation = CancellationToken::default();
     let model = crate::candidate_cli::int4::runtime::load_model_with_failure(&engine, &args, common,
@@ -74,6 +87,10 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
             max_model_work: limits.document.mapping.mapping.max_model_work,
             max_mask_visits: limits.max_run_mask_visits, max_verification: limits.max_run_verification })
         .map_err(|fault| fault.cancellation.map(stopped).unwrap_or(CandidateError::Planning))?;
+    let planner = if let Some(object) = limits.root_object {
+        planner.with_root_object_reconciliation(object)
+            .map_err(|fault| fault.cancellation.map(stopped).unwrap_or(CandidateError::Planning))?
+    } else { planner };
     let planner = match command.document.extraction.selected_rows()? {
         Some(rows) => planner.with_selected_rows(rows)
             .map_err(|fault| fault.cancellation.map(stopped).unwrap_or(CandidateError::Planning))?,
@@ -91,8 +108,9 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let vocabulary = ExtractionVocabulary::pinned(controls.template_controls())
         .map(Arc::new).map_err(|_| CandidateError::Planning)?;
     let mut host = host_limits(&args, limits, remaining()?);
-    let quote = crate::hosted::int4_extraction_document_corpus_requirements(args.group_width, budget,
-        limits.document.mapping, host, limits.document.reduction_reserve_bytes, limits.document.cohort_chunks)
+    let quote = crate::hosted::int4_extraction_document_object_corpus_requirements(args.group_width, budget,
+        limits.document.mapping, host, limits.document.reduction_reserve_bytes, limits.document.cohort_chunks,
+        command.document.extraction.compiler(), limits.root_object)
         .map_err(|error| host_error(error, CandidateError::Planning))?;
     if quote != limits.memory { return Err(CandidateError::Identity); }
     remaining()?;
@@ -117,6 +135,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         cohort_chunks: limits.document.cohort_chunks,
         max_selected_rows: planner.selected_rows().map(|rows| rows.max_rows_per_step),
         root_array_union: limits.document.mapping.root_array_union.map(array_union::ArrayUnionSelection::new),
+        root_object_reconciliation: limits.root_object.map(RootObjectSelection::new),
         model_id: "Nanbeige4.2-3B", source_revision: &identity.source_revision,
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
@@ -130,6 +149,9 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
             crate::local_io::open_document(&args.input).map_err(|_| CandidateError::Input)?))
     };
     host.native.run.max_elapsed = remaining()?;
+    // The hosted quote now retains the same schema/reconciliation workspace
+    // through original-document validation, serialization and writer flush.
+    drop(object_preparation);
     let summary = engine.batch_int4_extract_documents(&model, planner, vocabulary, host,
         limits.document.reduction_reserve_bytes, common.kernel, reader, writer, cancellation)
         .map_err(|error| host_error(error, CandidateError::Batch))?;
@@ -169,6 +191,8 @@ struct Provenance<'a> {
     max_selected_rows: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     root_array_union: Option<array_union::ArrayUnionSelection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_object_reconciliation: Option<RootObjectSelection>,
     model_id: &'static str, source_revision: &'a str, source_root_sha256: &'a str, model_content_sha256: &'a str,
     candidate_format: &'a str, quant_recipe: &'a str, group_width: usize, integer_kernel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]

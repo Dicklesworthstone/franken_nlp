@@ -25,6 +25,98 @@ struct ObjectArgs {
     #[arg(long)]
     max_object_result_bytes: Option<usize>,
 }
+
+/// Explicit opt-in for population routes. Every override requires the mode so
+/// a typo or a resume invocation cannot silently discard the selected policy.
+#[derive(Args, Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(in crate::candidate_cli::int4) struct ReconciliationArgs {
+    /// Combine complementary root properties; reject conflicts and missing required fields.
+    #[arg(long, conflicts_with = "root_array_union")]
+    reconcile_root_object: bool,
+    #[arg(long, requires = "reconcile_root_object")]
+    max_object_properties: Option<usize>,
+    #[arg(long, requires = "reconcile_root_object")]
+    max_object_origins: Option<usize>,
+    /// Aggregate JSON bytes inspected across all partial chunk objects.
+    #[arg(long, requires = "reconcile_root_object")]
+    max_object_input_bytes: Option<usize>,
+    #[arg(long, requires = "reconcile_root_object")]
+    max_object_json_bytes: Option<usize>,
+    #[arg(long, requires = "reconcile_root_object")]
+    max_object_nodes: Option<usize>,
+    /// Reconciled-object envelope within the complete --max-map-result-bytes cap.
+    #[arg(long, requires = "reconcile_root_object")]
+    max_object_result_bytes: Option<usize>,
+}
+impl ReconciliationArgs {
+    pub(in crate::candidate_cli::int4) fn augment_definition(command: clap::Command) -> clap::Command {
+        Self::augment_args(command)
+    }
+    pub(in crate::candidate_cli::int4) fn limits(self, mapping: MappingArgs)
+        -> Result<Option<RootObjectLimits>, CandidateError> {
+        let overrides = [self.max_object_properties, self.max_object_origins, self.max_object_input_bytes,
+            self.max_object_json_bytes, self.max_object_nodes, self.max_object_result_bytes];
+        if !self.reconcile_root_object {
+            if overrides.iter().any(Option::is_some) { return Err(CandidateError::Arguments); }
+            return Ok(None);
+        }
+        ObjectArgs { max_object_properties: self.max_object_properties.unwrap_or(4096),
+            max_object_origins: self.max_object_origins.unwrap_or(16_384),
+            max_object_input_bytes: self.max_object_input_bytes, max_object_json_bytes: self.max_object_json_bytes,
+            max_object_nodes: self.max_object_nodes.unwrap_or(262_144),
+            max_object_result_bytes: self.max_object_result_bytes }.limits(mapping).map(Some)
+    }
+    pub(in crate::candidate_cli::int4) fn workspace_bytes(self, map: &MapArgs, limits: MapLimits)
+        -> Result<u64, CandidateError> {
+        let object = self.limits(map.mapping)?;
+        if object.is_some() && map.extraction.schema_path().to_str().is_some_and(|path| path.contains("://")) {
+            return Err(CandidateError::Arguments);
+        }
+        crate::batch::extract::grouped_int4::long::stream::memory::root_object_workspace_bytes(
+            limits.mapping, map.extraction.compiler(), object).map_err(|_| CandidateError::Arguments)
+    }
+    pub(in crate::candidate_cli::int4) fn request<C: DecodeStepControl>(self, map: &MapArgs,
+        schema: String, budget: TaskBudget, control: &mut C) -> Result<ExtractionBatchArgs, CandidateError> {
+        match self.limits(map.mapping)? {
+            None => map.request(schema, budget),
+            Some(object) => {
+                if map.array_union.limits(map.mapping)?.is_some() { return Err(CandidateError::Arguments); }
+                object_request(map, schema, budget, object, control)
+            }
+        }
+    }
+}
+
+/// Public selection describes the policy and bounds without private schema,
+/// source bytes, paths, extracted values or content-derived commitments.
+#[derive(Serialize)]
+pub(in crate::candidate_cli::int4) struct RootObjectSelection {
+    policy: &'static str,
+    schema_derivation: &'static str,
+    map_prompt: &'static str,
+    limits: RootObjectLimits,
+}
+impl RootObjectSelection {
+    pub(in crate::candidate_cli::int4) fn new(limits: RootObjectLimits) -> Self {
+        Self { policy: crate::tasks::extract::object_reconcile::ROOT_OBJECT_RECONCILIATION,
+            schema_derivation: crate::tasks::extract::object_reconcile::ROOT_OBJECT_DERIVATION,
+            map_prompt: crate::batch::extract::grouped_int4::long::object::ROOT_OBJECT_MAP_PROMPT, limits }
+    }
+}
+impl ObjectArgs {
+    fn limits(self, mapping: MappingArgs) -> Result<RootObjectLimits, CandidateError> {
+        let limits = RootObjectLimits { max_properties: self.max_object_properties, max_origins: self.max_object_origins,
+            max_input_bytes: self.max_object_input_bytes.unwrap_or(mapping.max_total_value_bytes),
+            max_json_bytes: self.max_object_json_bytes.unwrap_or(mapping.max_map_result_bytes),
+            max_nodes: self.max_object_nodes,
+            max_result_bytes: self.max_object_result_bytes.unwrap_or(mapping.max_map_result_bytes) };
+        limits.workspace_bytes().map_err(|_| CandidateError::Arguments)?;
+        if limits.max_json_bytes > mapping.max_map_result_bytes || limits.max_result_bytes > mapping.max_map_result_bytes {
+            return Err(CandidateError::Arguments);
+        }
+        Ok(limits)
+    }
+}
 pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
     ObjectArgs::augment_args(MappingArgs::augment_args(extract::definition().name("extract-object-map")
         .about("Extract complementary root-object properties across a complete document")
@@ -61,12 +153,7 @@ impl ObjectMapArgs {
         let remote = self.map.extraction.schema_path().to_str().is_some_and(|path| path.contains("://"));
         if remote { return Err(CandidateError::Arguments); }
         let mut map = self.map.validate(args)?;
-        let m = self.map.mapping;
-        let o = self.object;
-        let object = RootObjectLimits { max_properties: o.max_object_properties, max_origins: o.max_object_origins,
-            max_input_bytes: o.max_object_input_bytes.unwrap_or(m.max_total_value_bytes),
-            max_json_bytes: o.max_object_json_bytes.unwrap_or(m.max_map_result_bytes),
-            max_nodes: o.max_object_nodes, max_result_bytes: o.max_object_result_bytes.unwrap_or(m.max_map_result_bytes) };
+        let object = self.object.limits(self.map.mapping)?;
         let object_workspace_bytes = sum(&[
             Int4ObjectExtractionMapLimits { mapping: map.mapping, reconciliation: object }
                 .reconciliation_workspace_bytes().map_err(|_| CandidateError::Arguments)?,
@@ -79,15 +166,7 @@ impl ObjectMapArgs {
     }
     fn request<C: DecodeStepControl>(&self, schema: String, budget: TaskBudget,
         limits: ObjectMapLimits, control: &mut C) -> Result<ExtractionBatchArgs, CandidateError> {
-        let derived = RootObjectSchema::derive(&schema, self.map.extraction.compiler(), limits.object, control)
-            .map_err(planning_error)?;
-        // The complete ORIGINAL object may exceed one chunk's output ceiling;
-        // the partial contract, not the full required set, is the native schema.
-        let partial = self.map.extraction.shared_defaults_with_projection(derived.partial_schema().to_owned(), budget)?;
-        if derived.requires_source() != (partial.grounding == ExtractionBatchGrounding::SourceMembership) {
-            return Err(CandidateError::Planning);
-        }
-        Ok(ExtractionBatchArgs { schema, grounding: partial.grounding, budget })
+        object_request(&self.map, schema, budget, limits.object, control)
     }
     pub(in crate::candidate_cli::int4) fn execute(self, args: Int4Args, input: &mut impl Read, output: &mut impl Write)
         -> Result<(), CandidateError> {
@@ -97,6 +176,21 @@ impl ObjectMapArgs {
         #[cfg(not(feature = "asupersync-runtime"))]
         { let _ = (self, args, limits, input, output); Err(CandidateError::Unavailable) }
     }
+}
+fn object_request<C: DecodeStepControl>(map: &MapArgs, schema: String, budget: TaskBudget,
+    limits: RootObjectLimits, control: &mut C) -> Result<ExtractionBatchArgs, CandidateError> {
+    let derived = RootObjectSchema::derive(&schema, map.extraction.compiler(), limits, control)
+        .map_err(planning_error)?;
+    // The complete ORIGINAL object may exceed one chunk's output ceiling;
+    // the partial contract, not the full required set, is the native schema.
+    let partial = map.extraction.shared_defaults_with_projection(derived.partial_schema().to_owned(), budget)?;
+    if derived.requires_source() != (partial.grounding == ExtractionBatchGrounding::SourceMembership) {
+        return Err(CandidateError::Planning);
+    }
+    if let Some(cause) = control.prefill_checkpoint(0) {
+        return Err(planning_error(crate::tasks::extract::object_reconcile::RootObjectError::Cancelled(cause)));
+    }
+    Ok(ExtractionBatchArgs { schema, grounding: partial.grounding, budget })
 }
 fn planning_error(error: crate::tasks::extract::object_reconcile::RootObjectError) -> CandidateError {
     use crate::{native_engine::decode::DecodeCancellationKind, tasks::extract::object_reconcile::RootObjectError};
