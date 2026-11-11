@@ -2,7 +2,7 @@
 use super::*;
 use std::{sync::Arc, time::{Duration, Instant}};
 use crate::{
-    NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
+    NlpEngine, MemoryClass,
     execution_identity::ExecutionIdentity,
     hosted::{CancellationToken, HostedError, Int4HostError, Int4SourceMapConfig, NativeLimits, RunLimits},
     native_engine::{decode::{DecodeCancellationKind, DecodeStepControl},
@@ -170,12 +170,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
-    let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
-        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: common.memory_bytes,
-        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
-    }).build().map_err(|_| CandidateError::Runtime)?;
+    let engine = NlpEngine::builder().resource_config(compute::resource_config(common))
+        .build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
     let _preparation = lease.reserve(MemoryClass::JobBuffers, common.preparation_bytes)
         .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
@@ -335,7 +331,16 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
             config.native.run.max_elapsed = remaining()?;
             let planner = Arc::new(planner);
             if let Some(aggregation) = limits.keyphrases {
-                if let Some(chunks) = limits.cohort_chunks {
+                if common.compute.threads > 1 {
+                    let result = engine.reduce_int4_keyphrases_document_with_threads(&model, text,
+                        Arc::clone(&planner), Arc::new(vocabulary), config, aggregation, common.kernel,
+                        common.compute.threads, cancellation).map_err(execution_error)?;
+                    expected.verify_keyphrases_completed_with_limits(result.result(), aggregation)
+                        .map_err(|_| CandidateError::Execution)?;
+                    remaining()?;
+                    publish_team_map(&provenance, result.result(), result.compute(), &planner,
+                        limits.max_result_bytes + 4096, output, &publication)
+                } else if let Some(chunks) = limits.cohort_chunks {
                     let result = engine.reduce_int4_keyphrases_document_cohorts(&model, text,
                         Arc::clone(&planner), Arc::new(vocabulary), config, aggregation, common.kernel, cancellation)
                         .map_err(execution_error)?;
@@ -354,7 +359,16 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
                         limits.max_result_bytes + 4096, output, &publication)
                 }
             } else if let Some(summary) = limits.summary {
-                if let Some(chunks) = limits.cohort_chunks {
+                if common.compute.threads > 1 {
+                    let result = engine.summarize_int4_source_with_threads(&model, text,
+                        Arc::clone(&planner), Arc::new(vocabulary), config, summary, common.kernel,
+                        common.compute.threads, cancellation).map_err(execution_error)?;
+                    expected.verify_summary_completed_with_limits(result.result(), summary)
+                        .map_err(|_| CandidateError::Execution)?;
+                    remaining()?;
+                    publish_team_map(&provenance, result.result(), result.compute(), &planner,
+                        limits.max_result_bytes + 4096, output, &publication)
+                } else if let Some(chunks) = limits.cohort_chunks {
                     let result = engine.summarize_int4_source_cohorts(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
                         config, summary, common.kernel, cancellation).map_err(execution_error)?;
                     expected.verify_summary_completed_with_limits(&result.result().document, summary)
@@ -371,6 +385,14 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
                     publish_map(&provenance, result.result(), None, &planner,
                         limits.max_result_bytes + 4096, output, &publication)
                 }
+            } else if common.compute.threads > 1 {
+                let result = engine.map_int4_source_with_threads(&model, text,
+                    Arc::clone(&planner), Arc::new(vocabulary), config, common.kernel,
+                    common.compute.threads, cancellation).map_err(execution_error)?;
+                expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+                remaining()?;
+                publish_team_map(&provenance, result.result(), result.compute(), &planner,
+                    limits.max_result_bytes + 4096, output, &publication)
             } else if let Some(chunks) = limits.cohort_chunks {
                 let result = engine.map_int4_source_cohorts(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
                     config, common.kernel, cancellation).map_err(execution_error)?;
@@ -566,6 +588,18 @@ fn publish_map<T: Serialize>(provenance: &Provenance<'_>, document: &T,
             response: Response { provenance, output: document }, input_encoding: report.as_ref(),
         }, max_bytes, output, check),
     }
+}
+#[allow(clippy::too_many_arguments)]
+fn publish_team_map<T: Serialize>(provenance: &Provenance<'_>, document: &T,
+    compute: &crate::hosted::Int4ComputeReceipt, planner: &SourceTaskPlanner,
+    max_bytes: usize, output: &mut impl Write, check: &impl Fn() -> Result<(), CandidateError>)
+    -> Result<(), CandidateError> {
+    let report = encoding::report(planner)?;
+    let response = encoding::EncodedResponse {
+        response: Response { provenance, output: document }, input_encoding: report.as_ref(),
+    };
+    publish_checked(&compute::Response { response: &response, compute: Some(compute) },
+        max_bytes, output, check)
 }
 fn publish_discovery_cohort<T: Serialize>(provenance: &Provenance<'_>, document: &T,
     physical: &Int4SourceMapCohortStats, chunks: usize, max_bytes: usize, output: &mut impl Write,

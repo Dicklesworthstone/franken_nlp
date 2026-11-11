@@ -102,7 +102,12 @@ struct SummaryArgs {
 }
 pub(super) fn definitions() -> Vec<clap::Command> {
     definitions_with_cohorts(true).into_iter().map(|command| {
-        if command.get_name() == "answer-map" { command } else { encoding::definition(command) }
+        if command.get_name() == "answer-map" { return command; }
+        let command = encoding::definition(command);
+        let details = command.get_after_long_help().map(|help| help.to_string()).unwrap_or_default();
+        compute::definition(command)
+            .mut_arg("compute_threads", |arg| arg.help("Coordinator plus persistent INT4 row workers, 1..=64; one team spans every source chunk and the complete reducer. Extra worker scratch is admitted before IO. Cannot combine with chunk cohorts or neural synthesis; runtime threads are additional"))
+            .after_long_help(format!("{details}\n\n--compute-threads N forms one persistent output-row team across the complete NER, keyphrase or cited-summary document. The default width of 1 keeps serial execution. Widths 2..64 retain each chunk's independent causal context, original-source evidence, and the complete-document native, mask and verification budgets. Both byte-fallback and safe-bpe-v1 are supported. Exact summary and keyphrase reducers run after every chunk completes. Actual projection counts appear only in the optional compute receipt; worker count does not change semantic identity. Chunk cohorts, neural synthesis, hierarchy, corpora and durable jobs retain their separate schedules."))
     }).collect()
 }
 pub(super) fn document_job_definitions() -> Vec<clap::Command> {
@@ -198,6 +203,12 @@ impl MapArgs {
     }
     fn validate_mode(&self, args: &Int4Args, map_only: bool, document_job: bool) -> Result<MapLimits, CandidateError> {
         let m = self.mapping;
+        let threaded = args.compute.threads() != 1;
+        if threaded && (document_job || map_only || self.kind == Kind::Answer
+            || self.cohort_chunks.is_some() || self.cohort_hierarchy_groups.is_some()
+            || self.summary.is_some_and(|summary| summary.synthesis.synthesize_summary)) {
+            return Err(CandidateError::Arguments);
+        }
         let encoding = m.encoding.limits(args, &m, !document_job && !map_only
             && self.kind != Kind::Answer
             && self.summary.is_none_or(|summary| !summary.synthesis.synthesize_summary))?;
@@ -206,7 +217,10 @@ impl MapArgs {
         // workspace and the complete-invocation ledger below.
         let mut storage = args.clone();
         storage.input_encoding = input_encoding::InputEncodingArgs::default();
-        let mut common = self.source.validate(&storage)?;
+        let mut common = if threaded {
+            if storage.prefill()?.is_some() { return Err(CandidateError::Arguments); }
+            self.source.validate_batch_with_prefill(&storage)?
+        } else { self.source.validate(&storage)? };
         if (self.kind == Kind::Answer) != self.question.is_some()
             || (self.kind == Kind::Summarize) != self.summary.is_some()
             || (self.kind == Kind::Keyphrases) != self.keyphrases.is_some() {

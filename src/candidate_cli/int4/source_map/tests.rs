@@ -31,6 +31,86 @@ pub(super) const SYNTHESIS_MODES: [(Kind, &[&str]); 4] = [
 ];
 
 #[test]
+fn persistent_source_teams_price_one_workspace_without_changing_document_authority() {
+    for (kind, mode) in [(Kind::Ner, &[][..]), (Kind::Keyphrases, &[][..]),
+        (Kind::Keyphrases, &["--reduce-keyphrases"][..]), (Kind::Summarize, &[][..])] {
+        for encoding in [&[][..], &["--input-encoding", "safe-bpe-v1"][..]] {
+            let mut flags = mode.to_vec(); flags.extend_from_slice(encoding);
+            let (serial, mut args) = arguments(kind, &flags);
+            args.memory_mib = 262_144;
+            let original = serial.validate(&args).unwrap();
+            for width in [2, 3, 4, 64] {
+                let width_text = width.to_string();
+                let mut threaded_flags = flags.clone();
+                threaded_flags.extend_from_slice(&["--compute-threads", &width_text]);
+                let (threaded, mut args) = arguments(kind, &threaded_flags);
+                args.memory_mib = 262_144;
+                let limits = threaded.validate(&args).unwrap();
+                let workspace = crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(
+                    width, args.group_width).unwrap();
+                assert_eq!(limits.common.compute.threads, width);
+                assert_eq!(limits.common.compute.workspace_bytes, workspace);
+                assert_eq!(limits.mapping.chunks, original.mapping.chunks);
+                assert_eq!(limits.mapping.reduction, original.mapping.reduction);
+                assert_eq!(limits.mapping.max_model_work, original.mapping.max_model_work);
+                assert_eq!(limits.mapping.mask_limits, original.mapping.mask_limits);
+                assert_eq!(limits.mapping.mask_visits_per_chunk, original.mapping.mask_visits_per_chunk);
+                assert_eq!(limits.mapping.max_mask_visits, original.mapping.max_mask_visits);
+                assert_eq!(limits.mapping.verification, original.mapping.verification);
+                assert_eq!(limits.encoding, original.encoding);
+                assert_eq!(limits.workspace_bytes, original.workspace_bytes);
+                assert_eq!(limits.common.native, original.common.native);
+                assert_eq!(threaded.source.budget(&args, limits.common), serial.source.budget(&args, original.common));
+                assert!(limits.common.minimum_memory_bytes >= original.common.minimum_memory_bytes);
+                assert!(limits.common.minimum_memory_bytes <= original.common.minimum_memory_bytes + workspace);
+                assert!(threaded.validate_corpus(&args).is_err());
+                assert!(threaded.validate_document_job(&args, false).is_err());
+                args.memory_mib = limits.common.minimum_memory_bytes.saturating_sub(1) / MIB;
+                assert!(threaded.validate(&args).is_err());
+                args.memory_mib = limits.common.minimum_memory_bytes.div_ceil(MIB);
+                assert!(threaded.validate(&args).is_ok());
+            }
+        }
+    }
+}
+
+#[test]
+fn unsupported_source_team_widths_and_schedules_refuse_before_private_io() {
+    for kind in KINDS {
+        for flags in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+            vec!["--compute-threads", "18446744073709551615"],
+            vec!["--compute-threads", "2", "--cohort-chunks", "1"],
+            vec!["--compute-threads", "4", "--cohort-chunks", "2"]] {
+            let (map, args) = arguments(kind, &flags);
+            let mut output = Vec::new();
+            assert_eq!(map.execute(args, &mut NoRead, &mut output), Err(CandidateError::Arguments));
+            assert!(output.is_empty());
+        }
+    }
+    for mode in [&["--synthesize-summary"][..], &["--synthesize-summary", "--hierarchical-summary"][..]] {
+        let mut flags = mode.to_vec(); flags.extend_from_slice(&["--compute-threads", "2"]);
+        let (map, args) = arguments(Kind::Summarize, &flags);
+        assert_eq!(map.execute(args, &mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+    }
+    for command in document_job_definitions().into_iter().chain(documents::definitions()) {
+        assert!(!command.get_arguments().any(|arg| arg.get_id() == "compute_threads"));
+    }
+    let answer = definitions().into_iter().find(|command| command.get_name() == "answer-map").unwrap();
+    assert!(!answer.get_arguments().any(|arg| arg.get_id() == "compute_threads"));
+}
+
+#[cfg(not(feature = "asupersync-runtime"))]
+#[test]
+fn unavailable_source_team_runtime_never_reads_or_publishes() {
+    for kind in KINDS {
+        let (map, args) = arguments(kind, &["--compute-threads", "2"]);
+        let mut output = Vec::new();
+        assert_eq!(map.execute(args, &mut NoRead, &mut output), Err(CandidateError::Unavailable));
+        assert!(output.is_empty());
+    }
+}
+
+#[test]
 fn compact_maps_require_one_complete_tokenizer_budget_and_admit_workspace() {
     for kind in KINDS {
         let (map, args) = arguments(kind, &["--input-encoding", "safe-bpe-v1"]);

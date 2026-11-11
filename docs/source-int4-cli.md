@@ -63,6 +63,50 @@ the matching synthesis and hierarchy flags and never enables prompt prefill.
 See [structured INT4 cohorts](int4-structured-cohorts.md#native-hierarchy-group-cohorts)
 for allowed widths, complete memory admission and examples.
 
+### Persistent CPU teams for complete source documents
+
+`ner-map`, `keyphrases-map` and plain cited `summarize-map` accept
+`--compute-threads N` for `N` from 1 through 64. The default of 1 retains
+serial execution. Larger widths form one fixed numerical team spanning all
+chunks and the final exact reducer. Each projection divides complete output
+rows; the reduction order within each row stays unchanged. Each chunk retains
+its own causal context, grammar and original-source evidence.
+
+```sh
+fnlp candidate source-int4 summarize-map report.txt \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$MODEL_SHA256" \
+  --memory-mib 8192 --compute-threads 4
+```
+
+The compute width counts the coordinator and its row workers. The runtime
+thread is additional. Worker scratch is priced once before private input or
+model IO and remains owned through physical worker join. Native work, masks,
+source verification, final top-k limits and the whole-document deadline keep
+their existing bounds. Both byte fallback and compact Safe-BPE input use the
+same team path. Successful threaded results add a separate `compute` receipt
+with the actual completed projections and rows; the semantic result and its
+execution identity do not absorb worker width. The guarded result remains
+owned through serialization, write and flush.
+
+Library callers use `NlpEngine::map_int4_source_with_threads`,
+`summarize_int4_source_with_threads`, or
+`reduce_int4_keyphrases_document_with_threads` on the same resource host as
+their resident model. Each returns `HostedInt4TeamResult<T>`, retaining the
+ordinary result owner alongside the physical compute receipt. The serial and
+threaded routes share admission, complete-map preparation, source/result seals
+and reducer validation. The installed process envelope must admit the requested
+worker width; it never silently creates a larger host or falls back to another
+width.
+
+These numerical teams currently require serial chunk scheduling. Combining
+them with `--cohort-chunks`, packed prompt prefill, QA, neural synthesis or
+hierarchies is refused. Corpus and durable-job commands retain their existing
+schedules. Regression definitions cover admission, unsupported combinations,
+cancellation, charge release and serial/team model parity. Executable and
+model-present checks remain pending the controller's DSR gates; no measured
+speedup or parity result is claimed here.
+
 ### Compact input for complete source maps
 
 `ner-map`, `keyphrases-map` and plain cited `summarize-map` accept explicit

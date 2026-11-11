@@ -385,7 +385,8 @@ impl Int4Command {
         if matches!(name, "generate" | "chat" | "classify" | "sentiment" | "judge" | "extract"
             | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch" | "extract-batch"
             | "ner-batch" | "keyphrases-batch" | "summarize-batch" | "answer-batch"
-            | "classify-map" | "sentiment-map" | "extract-map") {
+            | "classify-map" | "sentiment-map" | "extract-map"
+            | "ner-map" | "keyphrases-map" | "summarize-map") {
             args.compute = compute::Args::from_matches(matches)?;
         }
         Ok(Self { task, args, batch: None, job: None })
