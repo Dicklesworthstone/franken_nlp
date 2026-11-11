@@ -8,9 +8,10 @@ pub(super) struct Authority {
     pub planning: SentimentLimits,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn request<C: DecodeStepControl>(request: &SentimentRequest,
-    limits: Int4SentimentMapLimits, authority: Authority, chunks: &ChunkPlan<'_>,
-    plans: &[PreparedInt4Sentiment], control: &mut C) -> Result<[u8; 32], Int4SentimentMapError> {
+    limits: Int4SentimentMapLimits, authority: Authority, encoding: &UntrustedEncoding,
+    work: SafeBpeWork, chunks: &ChunkPlan<'_>, plans: &[PreparedInt4Sentiment], control: &mut C) -> Result<[u8; 32], Int4SentimentMapError> {
     checkpoint(control)?;
     if chunks.chunks().len() != plans.len() { return Err(Int4SentimentMapError::Admission); }
     // Validated finite source/plan bounds precede this streaming pass. The
@@ -24,7 +25,7 @@ pub(super) fn request<C: DecodeStepControl>(request: &SentimentRequest,
         p.max_total_nodes, p.max_total_projected_logits, p.max_output_bytes))?;
     writer.value(&(s.max_candidates, s.max_total_tokens, s.max_nodes, s.max_depth,
         s.max_candidate_id_bytes, s.max_projected_logits))?;
-    writer.value(&plans.len())?;
+    writer.value(&(encoding, work, plans.len()))?;
     for (chunk, plan) in chunks.chunks().iter().zip(plans) {
         writer.checkpoint()?;
         let identity = plan.execution_identity().receipt_identity()

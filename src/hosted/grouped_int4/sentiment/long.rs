@@ -1,5 +1,6 @@
 //! One owned, fully admitted invocation for complete-document sentiment.
 use super::*;
+use crate::tokenizer::untrusted::UntrustedEncoding;
 use crate::{native_engine::lmhead::NANBEIGE_VOCAB_SIZE,
     tasks::sentiment::{SentimentAxis, SentimentLimits, SentimentOptions, SentimentRequest,
         grouped_int4::{Int4SentimentPlanner,
@@ -35,9 +36,17 @@ impl Int4SentimentMapHostConfig {
             max_axes, cohort_chunks }
             .requirements(group_width, task, self.planning, self.mapping).map_err(map_error)
     }
+    /// Price the compact workspace before tokenizer construction or private
+    /// source planning; the native schedule does not renew this allowance.
+    pub fn requirements_with_encoding(self, group_width: usize, task: TaskBudget, max_axes: usize,
+        cohort_chunks: Option<usize>, encoding: &UntrustedEncoding)
+        -> Result<Int4SentimentMapMemoryRequirement, HostedError> {
+        self.requirements(group_width, task, max_axes, cohort_chunks)?
+            .with_input_encoding(encoding).map_err(map_error)
+    }
 }
 
-struct MapInput { request: SentimentRequest, config: Int4SentimentMapHostConfig }
+struct MapInput { request: SentimentRequest, config: Int4SentimentMapHostConfig, encoding: UntrustedEncoding }
 
 impl NlpEngine {
     /// Plan every chunk, admit the whole five-axis work sum, then execute on
@@ -46,10 +55,19 @@ impl NlpEngine {
     pub fn map_int4_sentiment(&self, model: &ResidentInt4, request: SentimentRequest,
         config: Int4SentimentMapHostConfig, kernel: PackedInt4Kernel, cancellation: CancellationToken)
         -> Result<HostedOutput<Int4SentimentMapRun>, HostedError> {
-        let (required, input_bytes) = admit(self, model, &request, config, None)?;
+        self.map_int4_sentiment_with_encoding(model, request, config, UntrustedEncoding::ByteFallback, kernel, cancellation)
+    }
+
+    /// Every attempted source chunk and actual plan spends one tokenizer
+    /// allowance. All complete plans are admitted before any native forward.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_int4_sentiment_with_encoding(&self, model: &ResidentInt4, request: SentimentRequest,
+        config: Int4SentimentMapHostConfig, encoding: UntrustedEncoding, kernel: PackedInt4Kernel,
+        cancellation: CancellationToken) -> Result<HostedOutput<Int4SentimentMapRun>, HostedError> {
+        let (required, input_bytes) = admit(self, model, &request, config, None, &encoding)?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, input_bytes)?,
-            || Ok(MapInput { request, config }))?;
+            || Ok(MapInput { request, config, encoding }))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.workspace_bytes)?;
         let output = Pending::reserve(&lease, MemoryClass::JobBuffers, required.output_reservation_bytes)?;
@@ -93,13 +111,24 @@ impl NlpEngine {
     pub fn map_int4_sentiment_with_threads(&self, model: &ResidentInt4, request: SentimentRequest,
         config: Int4SentimentMapHostConfig, kernel: PackedInt4Kernel, compute_threads: usize,
         cancellation: CancellationToken) -> Result<HostedInt4TeamResult<Int4SentimentMapRun>, HostedError> {
+        self.map_int4_sentiment_with_encoding_and_threads(model, request, config,
+            UntrustedEncoding::ByteFallback, kernel, compute_threads, cancellation)
+    }
+
+    /// Combine one complete-document input policy with one sealed numerical
+    /// team. Neither chunk count, axis count nor worker width renews it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_int4_sentiment_with_encoding_and_threads(&self, model: &ResidentInt4, request: SentimentRequest,
+        config: Int4SentimentMapHostConfig, encoding: UntrustedEncoding, kernel: PackedInt4Kernel,
+        compute_threads: usize, cancellation: CancellationToken)
+        -> Result<HostedInt4TeamResult<Int4SentimentMapRun>, HostedError> {
         dispatch::preflight_int4_team(self, config.native.run, compute_threads)?;
-        let (required, input_bytes) = admit(self, model, &request, config, None)?;
+        let (required, input_bytes) = admit(self, model, &request, config, None, &encoding)?;
         sum(&[required.workspace_bytes,
             int4_task_team_workspace_bytes(compute_threads, model.model_identity().group_width())?])?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, input_bytes)?,
-            || Ok(MapInput { request, config }))?;
+            || Ok(MapInput { request, config, encoding }))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.workspace_bytes)?;
         let output = Pending::reserve(&lease, MemoryClass::JobBuffers, required.output_reservation_bytes)?;
@@ -138,10 +167,18 @@ impl NlpEngine {
     pub fn map_int4_sentiment_cohorts(&self, model: &ResidentInt4, request: SentimentRequest,
         config: Int4SentimentMapHostConfig, cohort_chunks: usize, kernel: PackedInt4Kernel,
         cancellation: CancellationToken) -> Result<HostedOutput<Int4SentimentMapCohortRun>, HostedError> {
-        let (required, input_bytes) = admit(self, model, &request, config, Some(cohort_chunks))?;
+        self.map_int4_sentiment_cohorts_with_encoding(model, request, config,
+            UntrustedEncoding::ByteFallback, cohort_chunks, kernel, cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_int4_sentiment_cohorts_with_encoding(&self, model: &ResidentInt4, request: SentimentRequest,
+        config: Int4SentimentMapHostConfig, encoding: UntrustedEncoding, cohort_chunks: usize, kernel: PackedInt4Kernel,
+        cancellation: CancellationToken) -> Result<HostedOutput<Int4SentimentMapCohortRun>, HostedError> {
+        let (required, input_bytes) = admit(self, model, &request, config, Some(cohort_chunks), &encoding)?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, input_bytes)?,
-            || Ok(MapInput { request, config }))?;
+            || Ok(MapInput { request, config, encoding }))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.workspace_bytes)?;
         let output = Pending::reserve(&lease, MemoryClass::JobBuffers, required.output_reservation_bytes)?;
@@ -182,13 +219,13 @@ impl NlpEngine {
 }
 
 fn admit(engine: &NlpEngine, model: &ResidentInt4, request: &SentimentRequest,
-    config: Int4SentimentMapHostConfig, cohort_chunks: Option<usize>)
+    config: Int4SentimentMapHostConfig, cohort_chunks: Option<usize>, encoding: &UntrustedEncoding)
     -> Result<(Int4SentimentMapMemoryRequirement, u64), HostedError> {
     dispatch::preflight(engine, config.native.run)?;
     if !Arc::ptr_eq(engine.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
     validate_request(request, config, cohort_chunks)?;
-    let required = config.requirements(model.model_identity().group_width(), request.budget,
-        request.axes.len(), cohort_chunks)?;
+    let required = config.requirements_with_encoding(model.model_identity().group_width(), request.budget,
+        request.axes.len(), cohort_chunks, encoding)?;
     Ok((required, owned_input_bytes(request, config, required)?))
 }
 fn owned_input_bytes(request: &SentimentRequest, config: Int4SentimentMapHostConfig,
@@ -216,6 +253,7 @@ fn validate_request(request: &SentimentRequest, config: Int4SentimentMapHostConf
 fn planner(model: &ResidentInt4, input: &MapInput) -> Result<Int4SentimentPlanner, HostedError> {
     Int4SentimentPlanner::for_model(model.model_identity(), input.config.options,
         input.request.budget, input.config.planning)
+        .and_then(|planner| planner.with_document_encoding(input.encoding.clone()))
         .map_err(|error| map_error(error.into()))
 }
 fn prepare<'a>(planner: &Int4SentimentPlanner, model: &ResidentInt4, input: &'a MapInput,

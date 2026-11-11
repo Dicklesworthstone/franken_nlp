@@ -18,7 +18,8 @@ use crate::{
             scoring::{self, CandidateSchedule, Int4CandidateRun, Int4ScoringBudget,
                 Int4ScoringError, INT4_SCORING_EXECUTION}},
     },
-    tasks::ir::{DecodeStrategy, PlanContext, TaskBudget},
+    tasks::ir::{DecodeStrategy, PlanContext, PromptSegmentKind, TaskBudget},
+    tokenizer::untrusted::SafeBpeWork,
 };
 use super::{SentimentError, SentimentLimits, SentimentOptions, SentimentPlan, SentimentPlanner,
     SentimentPlanningError, SentimentRequest, SentimentResult, distribution::HeadPlan};
@@ -110,9 +111,15 @@ impl SentimentPlanner {
     fn compile_int4<C: DecodeStepControl>(&self, request: &SentimentRequest,
         context: &PlanContext<'_>, limits: SentimentLimits, group_width: usize,
         control: &mut C) -> Result<PreparedInt4Sentiment, Int4SentimentError> {
+        self.compile_int4_with_work(request, context, limits, group_width, control, &mut SafeBpeWork::default())
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn compile_int4_with_work<C: DecodeStepControl>(&self, request: &SentimentRequest,
+        context: &PlanContext<'_>, limits: SentimentLimits, group_width: usize,
+        control: &mut C, work: &mut SafeBpeWork) -> Result<PreparedInt4Sentiment, Int4SentimentError> {
         checkpoint(control)?;
-        let inner = self.plan_for_profile_with_control(request, context, limits,
-            NumericsProfile::StrictQuantized { version: 2 }, control)?;
+        let inner = self.plan_for_profile_with_work(request, context, limits,
+            NumericsProfile::StrictQuantized { version: 2 }, control, work)?;
         checkpoint(control)?;
         PreparedInt4Sentiment::compile(inner, context.execution_identity().clone(), request.budget, group_width, control)
     }
@@ -162,6 +169,19 @@ impl PreparedInt4Sentiment {
     pub fn head_count(&self) -> usize { self.schedules.len() }
     pub fn task_budget(&self) -> TaskBudget { self.budget }
     pub fn max_result_bytes(&self) -> u64 { self.inner.max_output_bytes }
+    /// The independently prepared axes must share the exact document IDs.
+    fn source_token_count(&self) -> Result<usize, Int4SentimentError> {
+        let mut source: Option<&[u32]> = None;
+        for head in &self.inner.heads {
+            let mut segments = head.ir.prompt_segments().iter().filter(|segment| segment.kind() == PromptSegmentKind::Document);
+            let ids = segments.next().ok_or(Int4SentimentError::Accounting)?.token_ids();
+            if ids.is_empty() || segments.next().is_some() || source.is_some_and(|prior| prior != ids) {
+                return Err(Int4SentimentError::Accounting);
+            }
+            source = Some(ids);
+        }
+        source.map(<[u32]>::len).ok_or(Int4SentimentError::Accounting)
+    }
     pub fn required_context(&self) -> usize { self.schedules.iter().map(|s| s.context).max().unwrap_or(0) }
     pub fn verify_identity(&self, admitted: &ExecutionIdentity) -> Result<(), Int4SentimentError> {
         admitted.validate().map_err(|_| Int4SentimentError::Identity)?;

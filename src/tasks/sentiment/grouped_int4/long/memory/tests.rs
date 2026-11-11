@@ -130,3 +130,38 @@ fn invalid_axes_work_limits_and_overflow_refuse_pure_admission() {
         assert!(memory.requirements(width, task, planning, mapping).is_err());
     }
 }
+
+#[test]
+fn compact_workspace_is_admitted_once_beside_plans_in_every_schedule() {
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+    let policy = SafeBpeLimits { max_input_bytes: 8192, max_output_tokens: 4096,
+        max_pair_checks: 100_000, max_pair_bytes: 1_000_000 };
+    let encoding = UntrustedEncoding::SafeBpeV1(policy);
+    let encoder_bytes = policy.requirements().unwrap().workspace_bytes;
+    let (mut memory, task, planning, mapping) = fixture();
+    for axes in [1, 4] {
+        memory.max_axes = axes;
+        for cohort in [None, Some(1), Some(4)] {
+            memory.cohort_chunks = cohort;
+            let byte = memory.requirements(32, task, planning, mapping).unwrap();
+            assert_eq!(byte.with_input_encoding(&UntrustedEncoding::ByteFallback).unwrap(), byte);
+            let compact = byte.with_input_encoding(&encoding).unwrap();
+            assert_eq!(compact.input_bytes, byte.input_bytes + encoder_bytes);
+            assert_eq!(compact.native, byte.native);
+            assert_eq!(compact.task_workspace_bytes, byte.task_workspace_bytes);
+            assert_eq!(compact.workspace_bytes, byte.workspace_bytes);
+            assert_eq!(compact.output_reservation_bytes, byte.output_reservation_bytes);
+        }
+    }
+    let quote = memory.requirements(32, task, planning, mapping).unwrap();
+    for axis in 0..4 {
+        let mut invalid = policy;
+        match axis { 0 => invalid.max_input_bytes = 0, 1 => invalid.max_output_tokens = 0,
+            2 => invalid.max_pair_checks = 0, _ => invalid.max_pair_bytes = 0 }
+        assert!(quote.with_input_encoding(&UntrustedEncoding::SafeBpeV1(invalid)).is_err());
+    }
+    let mut overflow = quote; overflow.input_bytes = u64::MAX;
+    assert!(overflow.with_input_encoding(&encoding).is_err());
+    overflow = quote; overflow.output_reservation_bytes = u64::MAX - quote.input_bytes;
+    assert!(overflow.with_input_encoding(&encoding).is_err());
+}

@@ -377,7 +377,7 @@ impl Int4Command {
             _ => return Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source-int4 task refused")),
         };
         let mut args = Int4Args::from_arg_matches(matches)?;
-        if matches!(name, "generate" | "chat" | "classify" | "classify-map" | "sentiment" | "extract" | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch"
+        if matches!(name, "generate" | "chat" | "classify" | "classify-map" | "sentiment" | "sentiment-map" | "extract" | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch"
             | "extract-batch" | "ner-batch" | "keyphrases-batch" | "summarize-batch" | "answer-batch"
             | "ner-map" | "keyphrases-map" | "summarize-map" | "answer-map") {
             args.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;

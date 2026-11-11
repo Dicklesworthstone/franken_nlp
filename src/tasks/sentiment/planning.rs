@@ -23,7 +23,7 @@ use crate::{
         embedded::{EmbeddedTokenizer, PINNED_TOKENIZER_MODEL_BYTES, PINNED_ADDED_TOKENS_BYTES,
             PINNED_TOKENIZER_CONFIG_BYTES, PINNED_SPECIAL_TOKENS_MAP_BYTES},
         specials::TemplateControlIds,
-        untrusted::{SafeBpeWork, UntrustedDocumentEncoder, UntrustedDocumentError, UntrustedEncoding},
+        untrusted::{SafeBpeWork, UntrustedDocument, UntrustedDocumentEncoder, UntrustedDocumentError, UntrustedEncoding},
     },
 };
 use super::{SentimentAnchor, SentimentAxis, SentimentAxisInput, SentimentError,
@@ -225,11 +225,18 @@ impl SentimentPlanner {
     pub(super) fn source_capacity(&self, axes: &[SentimentAxis], budget: TaskBudget,
         ceiling: TaskBudget, limits: SentimentLimits, context_tokens: usize)
         -> Result<usize, SentimentPlanningError> {
-        // Complete-document planners still price one token per byte. Their
-        // probes have no aggregate compact-encoding work ledger or admission.
+        // Byte-capacity callers (including corpus/jobs) retain their original
+        // one-token-per-byte contract. Compact maps ask for tokens explicitly.
         if self.document_encoding != UntrustedEncoding::ByteFallback {
             return Err(SentimentPlanningError::Budget);
         }
+        self.source_token_capacity(axes, budget, ceiling, limits, context_tokens)
+    }
+
+    pub(super) fn source_token_capacity(&self, axes: &[SentimentAxis], budget: TaskBudget,
+        ceiling: TaskBudget, limits: SentimentLimits, context_tokens: usize)
+        -> Result<usize, SentimentPlanningError> {
+        self.document_encoding.validate().map_err(|_| SentimentPlanningError::Budget)?;
         budget.validate().map_err(|_| SentimentPlanningError::Budget)?;
         ceiling.validate().map_err(|_| SentimentPlanningError::Budget)?;
         if !budget_fits(budget, ceiling) { return Err(SentimentPlanningError::Budget); }
@@ -251,6 +258,35 @@ impl SentimentPlanner {
         let capacity = per_axis.min(aggregate).min(native);
         if capacity == 0 { return Err(SentimentPlanningError::Budget); }
         Ok(capacity)
+    }
+
+    /// Every probe uses the same isolated document segment as the final plan.
+    /// Compact token counts need not be monotone as the source grows.
+    pub(super) fn source_tokens_with_work<C: DecodeStepControl>(&self, source: &str,
+        work: &mut SafeBpeWork, control: &mut C) -> Result<usize, SentimentPlanningError> {
+        checkpoint(control)?;
+        if self.document_encoding == UntrustedEncoding::ByteFallback { return Ok(source.len()); }
+        Ok(self.encode_source(source.as_bytes(), work, control)?.ids().len())
+    }
+
+    fn encode_source<C: DecodeStepControl>(&self, source: &[u8],
+        work: &mut SafeBpeWork, control: &mut C) -> Result<UntrustedDocument, SentimentPlanningError> {
+        let mut cancelled = None;
+        let encoded = UntrustedDocumentEncoder::new(self.tokenizer.tokenizer(), &self.controls)
+            .encode_with_policy(source, &self.document_encoding, work, &mut || {
+                cancelled = control.prefill_checkpoint(0); cancelled.is_none()
+            });
+        if let Some(cause) = cancelled { return Err(SentimentPlanningError::Cancelled(cause)); }
+        let document = encoded.map_err(|error| match error {
+            UntrustedDocumentError::AllocationRefused => SentimentPlanningError::AllocationRefused,
+            UntrustedDocumentError::InvalidEncodingLimits { .. } | UntrustedDocumentError::EncodingBudget { .. } =>
+                SentimentPlanningError::Budget,
+            _ => SentimentPlanningError::DocumentEncoding,
+        })?;
+        if self.document_encoding == UntrustedEncoding::ByteFallback && document.ids().len() != source.len() {
+            return Err(SentimentPlanningError::DocumentEncoding);
+        }
+        Ok(document)
     }
 
     fn axis_overheads(&self, axes: &[SentimentAxis]) -> Result<Vec<usize>, SentimentPlanningError> {
@@ -286,6 +322,14 @@ impl SentimentPlanner {
     pub(super) fn plan_for_profile_with_control<C: DecodeStepControl>(&self, request: &SentimentRequest,
         context: &PlanContext<'_>, limits: SentimentLimits, profile: NumericsProfile, control: &mut C)
         -> Result<SentimentPlan, SentimentPlanningError> {
+        self.plan_for_profile_with_work(request, context, limits, profile, control, &mut SafeBpeWork::default())
+    }
+
+    /// A complete-document map lends one nonrenewable ledger to every plan.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn plan_for_profile_with_work<C: DecodeStepControl>(&self, request: &SentimentRequest,
+        context: &PlanContext<'_>, limits: SentimentLimits, profile: NumericsProfile, control: &mut C,
+        work: &mut SafeBpeWork) -> Result<SentimentPlan, SentimentPlanningError> {
         checkpoint(control)?;
         let identity = context.execution_identity();
         let backend_matches = match &profile {
@@ -320,21 +364,7 @@ impl SentimentPlanner {
             preflight_prompt_lengths(request.document.len(), &overheads,
                 request.budget.max_input_tokens as usize, limits.max_total_prompt_tokens)?;
         }
-        let mut work = SafeBpeWork::default(); let mut cancelled = None;
-        let encoded = UntrustedDocumentEncoder::new(self.tokenizer.tokenizer(), &self.controls)
-            .encode_with_policy(request.document.as_bytes(), &self.document_encoding, &mut work, &mut || {
-                cancelled = control.prefill_checkpoint(0); cancelled.is_none()
-            });
-        if let Some(cause) = cancelled { return Err(SentimentPlanningError::Cancelled(cause)); }
-        let document = encoded.map_err(|error| match error {
-            UntrustedDocumentError::AllocationRefused => SentimentPlanningError::AllocationRefused,
-            UntrustedDocumentError::InvalidEncodingLimits { .. } | UntrustedDocumentError::EncodingBudget { .. } =>
-                SentimentPlanningError::Budget,
-            _ => SentimentPlanningError::DocumentEncoding,
-        })?;
-        if self.document_encoding == UntrustedEncoding::ByteFallback && document.ids().len() != request.document.len() {
-            return Err(SentimentPlanningError::DocumentEncoding);
-        }
+        let document = self.encode_source(request.document.as_bytes(), work, control)?;
         preflight_prompt_lengths(document.ids().len(), &overheads,
             request.budget.max_input_tokens as usize, limits.max_total_prompt_tokens)?;
         let mut inputs = Vec::new();

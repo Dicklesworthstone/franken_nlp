@@ -118,3 +118,25 @@ fn typed_native_cancellation_survives_redacted_host_diagnostics() {
     send::<HostedOutput<Int4SentimentMapRun>>();
     send::<HostedOutput<Int4SentimentMapCohortRun>>();
 }
+
+#[test]
+fn explicit_compact_host_quote_matches_pre_io_policy_admission_for_all_axes_and_cohorts() {
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+    let (config, request) = fixture();
+    let policy = SafeBpeLimits { max_input_bytes: 8192, max_output_tokens: 4096,
+        max_pair_checks: 100_000, max_pair_bytes: 1_000_000 };
+    let encoding = UntrustedEncoding::SafeBpeV1(policy);
+    for max_axes in [1, 4] {
+        for chunks in [None, Some(1), Some(4)] {
+            let byte = config.requirements(32, request.budget, max_axes, chunks).unwrap();
+            let expected = byte.with_input_encoding(&encoding).unwrap();
+            let compact = config.requirements_with_encoding(32, request.budget, max_axes, chunks, &encoding).unwrap();
+            assert_eq!(compact, expected);
+            assert_eq!(compact.input_bytes - byte.input_bytes, policy.requirements().unwrap().workspace_bytes);
+            assert_eq!(config.requirements_with_encoding(32, request.budget, max_axes, chunks,
+                &UntrustedEncoding::ByteFallback).unwrap(), byte);
+        }
+    }
+    let invalid = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 0, ..policy });
+    assert!(config.requirements_with_encoding(32, request.budget, 4, None, &invalid).is_err());
+}

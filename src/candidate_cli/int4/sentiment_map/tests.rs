@@ -216,3 +216,109 @@ fn complete_memory_quote_retains_outer_publication_and_uses_the_exact_host_peak_
 fn unavailable_map_runtime_refuses_without_touching_input_or_models() {
     assert_eq!(command(&[]).execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Unavailable));
 }
+
+#[test]
+fn compact_sentiment_maps_admit_the_actual_policy_once_for_serial_cohort_and_team() {
+    for schedule in [vec![], vec!["--cohort-chunks", "2"], vec!["--compute-threads", "3"]] {
+        let byte = command(&schedule); let baseline = selected(&byte).validate_with_threads(&byte.args).unwrap();
+        let mut flags = schedule;
+        flags.extend(["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "262144",
+            "--max-tokenizer-output-tokens", "131072", "--max-tokenizer-pair-checks", "33554432",
+            "--max-tokenizer-pair-bytes", "268435456"]);
+        let compact = command(&flags); let options = selected(&compact);
+        let limits = options.validate_with_threads(&compact.args).unwrap();
+        let policy = SafeBpeLimits { max_input_bytes: 262144, max_output_tokens: 131072,
+            max_pair_checks: 33554432, max_pair_bytes: 268435456 };
+        assert_eq!(options.input_encoding(&compact.args).unwrap(), UntrustedEncoding::SafeBpeV1(policy));
+        assert_eq!(limits.memory.input_bytes - baseline.memory.input_bytes, policy.requirements().unwrap().workspace_bytes);
+        assert_eq!(limits.memory.native, baseline.memory.native);
+        assert_eq!(limits.memory.workspace_bytes, baseline.memory.workspace_bytes);
+        assert_eq!(limits.memory.output_reservation_bytes, baseline.memory.output_reservation_bytes);
+        assert_eq!(limits.mapping.chunks, baseline.mapping.chunks);
+        assert_eq!(limits.mapping.max_model_work, baseline.mapping.max_model_work);
+        assert_eq!(limits.common.compute, baseline.common.compute);
+        assert_eq!(options.budget(limits.common).unwrap(), selected(&byte).budget(baseline.common).unwrap());
+    }
+    let hash = "ab".repeat(32);
+    let snapshot = parsed(&["--snapshot", "explicit.snapshot", "--expected-model-sha256", &hash,
+        "--input-encoding", "safe-bpe-v1"]).unwrap();
+    let options = selected(&snapshot); let limits = options.validate(&snapshot.args).unwrap();
+    assert!(limits.common.snapshot_pin.is_some());
+    let UntrustedEncoding::SafeBpeV1(policy) = options.input_encoding(&snapshot.args).unwrap() else {
+        panic!("explicit compact policy required");
+    };
+    assert_eq!(policy.max_input_bytes, SafeBpeLimits::MAX_INPUT_BYTES);
+    assert_eq!(policy.max_output_tokens, SafeBpeLimits::MAX_OUTPUT_TOKENS);
+}
+
+#[test]
+fn small_map_tokenizer_ceilings_do_not_inherit_the_one_off_workspace_floor() {
+    let compact = command(&["--input-encoding", "safe-bpe-v1", "--preparation-mib", "400",
+        "--max-tokenizer-input-bytes", "64", "--max-tokenizer-output-tokens", "64"]);
+    let options = selected(&compact);
+    let limits = options.validate(&compact.args).unwrap();
+    let byte = command(&["--preparation-mib", "400"]);
+    let baseline = selected(&byte).validate(&byte.args).unwrap();
+    let UntrustedEncoding::SafeBpeV1(policy) = options.input_encoding(&compact.args).unwrap() else {
+        panic!("explicit compact policy required");
+    };
+    assert_eq!(limits.memory.input_bytes - baseline.memory.input_bytes, policy.requirements().unwrap().workspace_bytes);
+    assert_eq!(compact.args.max_input_bytes, MAX_INPUT_BYTES);
+}
+
+#[test]
+fn invalid_compact_work_and_repeated_presave_planning_refuse_before_private_io() {
+    for flags in [vec!["--max-tokenizer-input-bytes", "100"],
+        vec!["--input-encoding", "byte-fallback", "--max-tokenizer-output-tokens", "100"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "0"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "1048577"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-output-tokens", "0"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-output-tokens", "1048577"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "0"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "67108865"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-bytes", "0"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-bytes", "536870913"],
+        vec!["--input-encoding", "safe-bpe-v1", "--save-snapshot", "must-not-create.snapshot"]] {
+        assert_eq!(command(&flags).execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+    }
+    for flag in ["--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes"] {
+        assert!(parsed(&["--source-dir", "d", "--source-manifest", "m", flag, "1"]).is_err());
+    }
+    let mut short = command(&["--input-encoding", "safe-bpe-v1"]); short.args.memory_mib = 1;
+    assert_eq!(short.execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+}
+
+#[test]
+fn byte_only_corpus_and_retained_jobs_do_not_inherit_compact_document_options() {
+    for definition in [corpus::definition(), job::definition()] {
+        assert!(!definition.get_arguments().any(|arg| arg.get_id() == "input_encoding"));
+    }
+    for mut argv in [vec!["candidate", "source-int4", "sentiment-corpus"],
+        vec!["candidate", "source-int4", "sentiment-document-job", "start"],
+        vec!["candidate", "source-int4", "sentiment-document-job", "resume"]] {
+        argv.extend(["--input-encoding", "safe-bpe-v1"]);
+        assert!(crate::candidate_cli::definition().try_get_matches_from(argv).is_err());
+    }
+    let compact = command(&["--input-encoding", "safe-bpe-v1"]);
+    assert_eq!(selected(&compact).validate_with_max_axes(&compact.args, 4).err(), Some(CandidateError::Arguments));
+    let mut byte = command(&[]);
+    let Int4Task::SentimentMap(options) = &mut byte.task else { panic!("sentiment map required") };
+    options.encoding.max_tokenizer_input_bytes = Some(128);
+    assert_eq!(options.validate_with_max_axes(&byte.args, 4).err(), Some(CandidateError::Arguments));
+    let help = threaded_definition().render_long_help().to_string();
+    let words = help.split_whitespace().collect::<Vec<_>>().join(" ");
+    for required in ["--input-encoding", "--max-tokenizer-input-bytes", "--max-tokenizer-output-tokens",
+        "oversized probes", "one shared tokenizer allowance", "refuse --save-snapshot"] {
+        assert!(words.contains(required), "missing {required}");
+    }
+}
+
+#[test]
+fn explicit_byte_encoding_preserves_the_default_map_admission() {
+    let byte = command(&[]); let explicit = command(&["--input-encoding", "byte-fallback"]);
+    assert_eq!(selected(&byte), selected(&explicit));
+    let a = selected(&byte).validate(&byte.args).unwrap();
+    let b = selected(&explicit).validate(&explicit.args).unwrap();
+    assert_eq!(a.memory, b.memory); assert_eq!(a.mapping.chunks, b.mapping.chunks);
+    assert_eq!(a.common.minimum_memory_bytes, b.common.minimum_memory_bytes);
+}

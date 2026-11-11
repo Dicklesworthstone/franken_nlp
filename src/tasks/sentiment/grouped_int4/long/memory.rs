@@ -6,7 +6,7 @@
 use super::{Int4SentimentMapError, Int4SentimentMapLimits};
 use crate::{native_engine::strict_int4::{Int4MemoryRequirement,
         cohort::MAX_INT4_SEQUENCES, scoring::cohort::required_task_workspace_bytes},
-    tasks::{ir::TaskBudget, sentiment::SentimentLimits}};
+    tasks::{ir::TaskBudget, sentiment::SentimentLimits}, tokenizer::untrusted::UntrustedEncoding};
 
 /// Pinned compiler/tokenizer construction and fixed metadata are admitted
 /// independently of the explicit document-dependent payloads below.
@@ -44,6 +44,22 @@ pub struct Int4SentimentMapMemoryRequirement {
     pub max_output_bytes: u64,
     /// Per-window native task output ceiling, not the complete document cap.
     pub max_cohort_output_bytes: u64,
+}
+
+impl Int4SentimentMapMemoryRequirement {
+    /// One transient encoder workspace lives beside the retained plans. It
+    /// is reused across probes and axes, independently of cohort/team width.
+    pub fn with_input_encoding(mut self, encoding: &UntrustedEncoding)
+        -> Result<Self, Int4SentimentMapError> {
+        let workspace = match encoding {
+            UntrustedEncoding::ByteFallback => 0,
+            UntrustedEncoding::SafeBpeV1(limits) => limits.requirements()
+                .map_err(|_| Int4SentimentMapError::Limits)?.workspace_bytes,
+        };
+        self.input_bytes = add(&[self.input_bytes, workspace])?;
+        add(&[self.native.kv_bytes, self.workspace_bytes, self.input_bytes, self.output_reservation_bytes])?;
+        Ok(self)
+    }
 }
 
 impl Int4SentimentMapMemoryLimits {

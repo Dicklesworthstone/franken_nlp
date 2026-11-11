@@ -1,5 +1,6 @@
 //! Complete-document dimensional sentiment under one finite native budget.
 use super::*;
+use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
 use crate::tasks::{ir::TaskBudget, mapreduce::ChunkLimits,
     sentiment::{SentimentAggregationPolicy, SentimentLimits, SentimentRequest,
         grouped_int4::long::{Int4SentimentMapLimits,
@@ -16,6 +17,18 @@ mod tests;
 pub(super) struct MapArgs {
     scoring: classify::ScoringArgs,
     mapping: MappingArgs,
+    encoding: MapEncodingArgs,
+}
+#[derive(Args, Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MapEncodingArgs {
+    /// Cumulative bytes across all attempted chunks and actual plans;
+    /// safe-bpe-v1 only, at most 1048576. Source byte limits are separate.
+    #[arg(long, value_name = "BYTES")]
+    max_tokenizer_input_bytes: Option<usize>,
+    /// Cumulative encoded tokens across all probes and final chunk plans;
+    /// safe-bpe-v1 only, at most 1048576. Native context limits are separate.
+    #[arg(long, value_name = "COUNT")]
+    max_tokenizer_output_tokens: Option<usize>,
 }
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
 struct MappingArgs {
@@ -59,11 +72,20 @@ pub(super) fn definition() -> clap::Command {
         .mut_arg("max_checkpoints", |arg| arg.help("Cooperative allowance for the complete hosted plan, all chunks and reduction")))
 }
 
+/// Corpus/job callers keep the original byte-only parser. One document
+/// owns one nonrenewable compact-tokenizer allowance across its complete plan.
+pub(super) fn one_off_definition() -> clap::Command {
+    MapEncodingArgs::augment_args(input_encoding::definition(definition()))
+        .after_long_help("--input-encoding safe-bpe-v1 chooses chunks using actual compact source-token counts. Every attempted chunk, including oversized probes, and every actual chunk plan spends one shared tokenizer allowance. Each encoded chunk is reused across its sentiment axes. --max-tokenizer-input-bytes and --max-tokenizer-output-tokens default to 1048576 each; pair checks and examined pair bytes use their explicit shared flags. Exhaustion refuses the whole document before any native forward. Context, source bytes, native work, output and memory retain separate ceilings. Compact output records the exact policy and consumed work. This selects a different prompt token sequence and makes no model-quality or tokenizer-parity claim. Compact maps accept pinned sources or snapshot reload but refuse --save-snapshot, whose separate pre-save planning would repeat tokenizer work. The byte-fallback default, sentiment-corpus and sentiment-document-job retain their existing contracts.")
+}
+
 /// Keep numerical teams opt-in on the one-document route; definitions reused
 /// by corpora and retained jobs do not acquire an unwired compute flag.
 pub(super) fn threaded_definition() -> clap::Command {
-    compute::definition(definition()).after_long_help(
-        "--compute-threads N keeps one admitted output-row team across every chunk and sentiment axis. The complete semantic result and whole-document work ceilings are unchanged. Actual projection counters are reported separately in compute. Cannot combine with --cohort-chunks; corpus and durable-job routes retain their existing schedules.")
+    let command = one_off_definition();
+    let encoding_help = command.get_after_long_help().map(|help| help.to_string()).unwrap_or_default();
+    compute::definition(command).after_long_help(format!(
+        "{encoding_help}\n\n--compute-threads N keeps one admitted output-row team across every chunk and sentiment axis. It supports byte-fallback and safe-bpe-v1 with the same complete-document tokenizer and native work ceilings. Actual projection counters are reported separately in compute. Cannot combine with --cohort-chunks; corpus and durable-job routes retain their existing schedules."))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -78,28 +100,52 @@ pub(super) struct MapLimits {
 impl MapArgs {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         Ok(Self { scoring: classify::ScoringArgs::from_matches(matches)?,
-            mapping: MappingArgs::from_arg_matches(matches)? })
+            mapping: MappingArgs::from_arg_matches(matches)?,
+            encoding: if matches.try_get_one::<String>("input_encoding").ok().flatten().is_some() {
+                MapEncodingArgs::from_arg_matches(matches)?
+            } else { MapEncodingArgs::default() } })
     }
     pub(super) fn validate(self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
-        self.validate_with_max_axes(args, 4)
+        if args.compute.threads() != 1 { return Err(CandidateError::Arguments); }
+        self.validate_document(args, 4)
     }
     /// Corpus callers can narrow every document's declared axis capability.
     /// One-off maps continue to admit their original four-axis request space.
     fn validate_with_max_axes(self, args: &Int4Args, max_axes: usize) -> Result<MapLimits, CandidateError> {
-        if args.compute.threads() != 1 { return Err(CandidateError::Arguments); }
+        if args.compute.threads() != 1 || !args.input_encoding.is_default()
+            || self.encoding != MapEncodingArgs::default() {
+            return Err(CandidateError::Arguments);
+        }
         self.validate_document(args, max_axes)
     }
     fn validate_with_threads(self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
         if args.compute.threads() == 1 { self.validate(args) }
         else { self.validate_document(args, 4) }
     }
+    fn input_encoding(self, args: &Int4Args) -> Result<UntrustedEncoding, CandidateError> {
+        if args.input_encoding.is_default() && self.encoding != MapEncodingArgs::default() {
+            return Err(CandidateError::Arguments);
+        }
+        args.input_encoding.policy(
+            self.encoding.max_tokenizer_input_bytes.unwrap_or(SafeBpeLimits::MAX_INPUT_BYTES),
+            self.encoding.max_tokenizer_output_tokens.unwrap_or(SafeBpeLimits::MAX_OUTPUT_TOKENS))
+    }
     fn validate_document(self, args: &Int4Args, max_axes: usize) -> Result<MapLimits, CandidateError> {
-        if !(1..=4).contains(&max_axes) || !args.input_encoding.is_default()
+        if !(1..=4).contains(&max_axes)
             || args.prefill()?.is_some() || self.scoring.cohort_head_limit().is_some()
             || (args.compute.threads() != 1 && self.mapping.cohort_chunks.is_some()) {
             return Err(CandidateError::Arguments);
         }
-        let mut common = self.scoring.validate_one_off_with_prefill(args)?;
+        let encoding = self.input_encoding(args)?;
+        if encoding != UntrustedEncoding::ByteFallback && args.save_snapshot.is_some() {
+            return Err(CandidateError::Arguments);
+        }
+        // Shared scorer admission prices fixed storage and native authority.
+        // This map's independently validated policy is charged below with its
+        // actual cumulative ceilings, not the one-off source/context defaults.
+        let mut storage_args = args.clone();
+        storage_args.input_encoding = input_encoding::InputEncodingArgs::default();
+        let mut common = self.scoring.validate_one_off_with_prefill(&storage_args)?;
         let m = self.mapping;
         if args.max_input_bytes < 4 || !(1..=256).contains(&m.max_chunks)
             || !(1..=1_000_000).contains(&m.max_tokenizer_calls)
@@ -130,7 +176,8 @@ impl MapArgs {
         let memory = Int4SentimentMapMemoryLimits { context_tokens: args.context_tokens,
             preparation_reserve_bytes: common.preparation_bytes, allocator_reserve_bytes: ALLOCATOR_BYTES,
             max_axes, cohort_chunks: m.cohort_chunks }
-            .requirements(args.group_width, budget, planning, mapping).map_err(|_| CandidateError::Arguments)?;
+            .requirements(args.group_width, budget, planning, mapping)
+            .and_then(|required| required.with_input_encoding(&encoding)).map_err(|_| CandidateError::Arguments)?;
         let envelope_bytes = memory.max_output_bytes.checked_add(4096)
             .and_then(|bytes| usize::try_from(bytes).ok()).ok_or(CandidateError::Arguments)?;
         let cli_preparation_bytes = sum(&[common.preparation_bytes,

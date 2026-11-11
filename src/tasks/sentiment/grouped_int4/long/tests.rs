@@ -12,6 +12,7 @@ use fixtures::Continue;
 mod capacity;
 mod execution;
 mod binding;
+mod encoding;
 
 fn task_budget() -> TaskBudget { fixtures::budget() }
 fn fixture() -> (&'static SentimentPlanner, &'static ExecutionIdentity) {

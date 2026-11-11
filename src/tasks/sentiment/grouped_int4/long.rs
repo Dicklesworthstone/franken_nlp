@@ -5,6 +5,8 @@
 //! are retained in source order and aggregated once without hierarchical
 //! copying, cross-chunk context, calibrated confidence or hidden truncation.
 use super::*;
+use std::cell::RefCell;
+use sha2::{Digest, Sha256};
 use crate::{native_engine::{int4::PackedInt4Kernel,
         strict_int4::{Int4MemoryBudget, Int4MemoryRequirement, Int4ModelWeights,
             cohort::{Int4CohortEngine, MAX_INT4_SEQUENCES},
@@ -12,6 +14,7 @@ use crate::{native_engine::{int4::PackedInt4Kernel,
     tasks::{mapreduce::{CHUNK_PROFILE, ChunkLimits, ChunkPlan, MapReduceError},
         sentiment::{SentimentAggregate, SentimentAggregationPolicy,
             aggregation::{SentimentAggregationError, SentimentChunkView, aggregate_with_control}}},
+    tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding},
     validation::grounded_fields::VerifiedSourceSpan};
 
 mod execution;
@@ -77,6 +80,9 @@ impl Error for Int4SentimentMapError {
     }
 }
 impl From<Int4SentimentError> for Int4SentimentMapError { fn from(error: Int4SentimentError) -> Self { Self::Sentiment(error) } }
+impl From<SentimentPlanningError> for Int4SentimentMapError {
+    fn from(error: SentimentPlanningError) -> Self { Self::Sentiment(error.into()) }
+}
 impl From<StrictInt4Error> for Int4SentimentMapError { fn from(error: StrictInt4Error) -> Self { Self::Sentiment(error.into()) } }
 impl From<Int4ScoringError> for Int4SentimentMapError { fn from(error: Int4ScoringError) -> Self { Self::Sentiment(error.into()) } }
 impl From<SentimentAggregationError> for Int4SentimentMapError {
@@ -98,8 +104,17 @@ impl Int4SentimentMapError {
 pub struct Int4SentimentMapChunk {
     pub chunk_id: usize,
     pub source_span: VerifiedSourceSpan,
+    /// Exact document tokens under the admitted encoding, excluding the
+    /// fixed trusted prompt and five-bin candidate continuations.
     pub source_tokens: usize,
     pub run: Int4SentimentRun,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct Int4SentimentMapEncoding {
+    pub policy: UntrustedEncoding,
+    /// Every attempted chunk and actual chunk plan shares this ledger. The
+    /// encoded document is reused across its independent sentiment axes.
+    pub work: SafeBpeWork,
 }
 /// Complete native output only; no caller-supplied result constructor enters
 /// the executable path. The aggregate never replaces the original chunks.
@@ -120,6 +135,9 @@ pub struct Int4SentimentMapRun {
     pub retained_result_bytes: u64,
     pub chunks: Vec<Int4SentimentMapChunk>,
     pub aggregate: SentimentAggregate,
+    /// Absent for the unchanged byte-fallback contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_encoding: Option<Int4SentimentMapEncoding>,
     #[serde(skip)]
     request_binding: [u8; 32],
     #[serde(skip)]
@@ -135,7 +153,8 @@ impl fmt::Debug for Int4SentimentMapRun {
             .field("source_span", &self.source_span).field("chunk_limits", &self.chunk_limits)
             .field("tokenizer_checks", &self.tokenizer_checks).field("planned_model_work", &self.planned_model_work)
             .field("model_work", &self.model_work).field("retained_result_bytes", &self.retained_result_bytes)
-            .field("chunks", &self.chunks).field("aggregate", &self.aggregate).finish()
+            .field("chunks", &self.chunks).field("aggregate", &self.aggregate)
+            .field("input_encoding", &self.input_encoding).finish()
     }
 }
 #[derive(Clone, PartialEq, Serialize)]
@@ -180,6 +199,9 @@ pub struct Int4SentimentMapPreflight {
     aggregation: SentimentAggregationPolicy,
     chunk_limits: ChunkLimits,
     tokenizer_checks: usize,
+    source_geometry: [u8; 32],
+    encoding: Option<SafeBpeLimits>,
+    encoding_work: SafeBpeWork,
     request_binding: [u8; 32],
 }
 impl fmt::Debug for Int4SentimentMapPreflight {
@@ -189,7 +211,8 @@ impl fmt::Debug for Int4SentimentMapPreflight {
             .field("heads", &self.heads).field("group_width", &self.group_width).field("work", &self.work)
             .field("max_retained_bytes", &self.max_retained_bytes).field("max_result_bytes", &self.max_result_bytes)
             .field("aggregation", &self.aggregation).field("chunk_limits", &self.chunk_limits)
-            .field("tokenizer_checks", &self.tokenizer_checks).finish_non_exhaustive()
+            .field("tokenizer_checks", &self.tokenizer_checks).field("encoding", &self.encoding)
+            .field("encoding_work", &self.encoding_work).finish_non_exhaustive()
     }
 }
 impl Int4SentimentMapPreflight {
@@ -198,6 +221,10 @@ impl Int4SentimentMapPreflight {
     pub fn group_width(&self) -> usize { self.group_width }
     pub fn planned_work(&self) -> Int4Work { self.work }
     pub fn max_result_bytes(&self) -> u64 { self.max_result_bytes }
+    fn encoding_record(&self) -> Option<Int4SentimentMapEncoding> {
+        self.encoding.map(|limits| Int4SentimentMapEncoding {
+            policy: UntrustedEncoding::SafeBpeV1(limits), work: self.encoding_work })
+    }
     /// Verify private request association and the unchanged native payload.
     /// Neither a geometric match nor external JSON can mint these seals.
     pub fn verify_completed(&self, run: &Int4SentimentMapRun) -> Result<(), Int4SentimentMapError> {
@@ -224,7 +251,9 @@ impl Int4SentimentMapPreflight {
             || run.aggregate.dimensions.iter().any(|axis| axis.estimate.is_some_and(|value| !value.is_finite())) {
             return Err(Int4SentimentMapError::Admission);
         }
-        if run.chunk_limits != self.chunk_limits || run.tokenizer_checks != self.tokenizer_checks {
+        if run.chunk_limits != self.chunk_limits || run.tokenizer_checks != self.tokenizer_checks
+            || run.input_encoding != self.encoding_record()
+            || geometry(run.chunks.iter().map(|chunk| (chunk.chunk_id, chunk.source_span, chunk.source_tokens))) != self.source_geometry {
             return Err(Int4SentimentMapError::Admission);
         }
         let mut byte = 0; let mut scalar = 0; let mut work = Int4Work::default(); let mut retained = 0_u64;
@@ -233,7 +262,8 @@ impl Int4SentimentMapPreflight {
             let span = chunk.source_span;
             if chunk.chunk_id != index || span.byte_start != byte || span.scalar_start != scalar
                 || span.byte_end <= span.byte_start || span.scalar_end <= span.scalar_start
-                || chunk.source_tokens != span.byte_end - span.byte_start
+                || chunk.source_tokens == 0
+                || (self.encoding.is_none() && chunk.source_tokens != span.byte_end - span.byte_start)
                 || chunk.run.schema_version != 1 || chunk.run.execution != INT4_SENTIMENT_EXECUTION
                 || chunk.run.numerics_profile != STRICT_INT4_PROFILE || chunk.run.group_width != self.group_width
                 || chunk.run.head_count != self.heads || chunk.run.result.dimensions.len() != self.heads
@@ -288,30 +318,55 @@ impl Int4SentimentPlanner {
     pub fn plan_document_with_control<'a, C: DecodeStepControl>(&self, request: &'a SentimentRequest,
         limits: Int4SentimentMapLimits, control: &mut C) -> Result<PreparedInt4SentimentMap<'a>, Int4SentimentMapError> {
         checkpoint(control)?; limits.validate(request.budget)?;
-        let capacity = self.max_document_bytes(&request.axes, request.budget, limits.chunks.context_tokens)?;
-        PreparedInt4SentimentMap::compile(request, limits, capacity, self.group_width(),
-            binding::Authority { ceiling: self.task_budget(), planning: self.planning_limits() }, control,
-            |request, control| self.plan_with_control(request, control))
+        if request.document.is_empty() { return Err(Int4SentimentMapError::EmptySource); }
+        let capacity = self.source_token_capacity(&request.axes, request.budget, limits.chunks.context_tokens)?;
+        PreparedInt4SentimentMap::compile_encoded(request, limits, capacity, self.group_width(),
+            binding::Authority { ceiling: self.task_budget(), planning: self.planning_limits() },
+            self.document_encoding(), SafeBpeWork::default(), control,
+            |source, control, work| self.source_tokens_with_work(source, work, control),
+            |request, control, work| self.plan_with_encoding_work(request, control, work))
     }
 }
 impl<'a> PreparedInt4SentimentMap<'a> {
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn compile<C: DecodeStepControl, F>(request: &'a SentimentRequest, limits: Int4SentimentMapLimits,
         capacity: usize, width: usize, authority: binding::Authority,
         control: &mut C, mut prepare: F) -> Result<Self, Int4SentimentMapError>
     where F: FnMut(&SentimentRequest, &mut C) -> Result<PreparedInt4Sentiment, Int4SentimentError> {
+        Self::compile_encoded(request, limits, capacity, width, authority,
+            &UntrustedEncoding::ByteFallback, SafeBpeWork::default(), control,
+            |source, _, _| Ok(source.len()), |request, control, _| prepare(request, control))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn compile_encoded<C: DecodeStepControl, Count, Prepare>(request: &'a SentimentRequest,
+        limits: Int4SentimentMapLimits, capacity: usize, width: usize, authority: binding::Authority,
+        encoding: &UntrustedEncoding, mut work: SafeBpeWork, control: &mut C, mut count: Count, mut prepare: Prepare)
+        -> Result<Self, Int4SentimentMapError>
+    where Count: FnMut(&str, &mut C, &mut SafeBpeWork) -> Result<usize, SentimentPlanningError>,
+        Prepare: FnMut(&SentimentRequest, &mut C, &mut SafeBpeWork) -> Result<PreparedInt4Sentiment, Int4SentimentError> {
+        encoding.validate().map_err(|_| Int4SentimentMapError::Limits)?;
         limits.validate(request.budget)?;
         if request.document.is_empty() { return Err(Int4SentimentMapError::EmptySource); }
         if capacity == 0 { return Err(Int4SentimentMapError::Limits); }
         let reservation = limits.chunks.context_tokens.checked_sub(capacity).ok_or(Int4SentimentMapError::Limits)?;
         let chunks_limits = ChunkLimits { max_chunk_tokens: limits.chunks.max_chunk_tokens.min(capacity),
             reserved_tokens: limits.chunks.reserved_tokens.max(reservation), ..limits.chunks };
-        let mut cancelled = None;
-        let chunks = ChunkPlan::build_with_checkpoints(&request.document, chunks_limits, |text| Ok(text.len()),
-            || match control.prefill_checkpoint(0) {
-                Some(cause) => { cancelled = Some(cause); Err(MapReduceError::Cancelled) }, None => Ok(()),
-            });
-        if let Some(cause) = cancelled { return Err(Int4SentimentError::Cancelled(cause).into()); }
+        let error = RefCell::new(None);
+        let chunks = {
+            let control = RefCell::new(&mut *control);
+            ChunkPlan::build_with_checkpoints(&request.document, chunks_limits,
+                |text| count(text, &mut **control.borrow_mut(), &mut work).map_err(|cause| {
+                    *error.borrow_mut() = Some(cause); MapReduceError::Tokenizer
+                }),
+                || match control.borrow_mut().prefill_checkpoint(0) {
+                    Some(cause) => {
+                        *error.borrow_mut() = Some(SentimentPlanningError::Cancelled(cause));
+                        Err(MapReduceError::Cancelled)
+                    }, None => Ok(()),
+                })
+        };
+        if let Some(error) = error.into_inner() { return Err(error.into()); }
         let chunks = chunks.map_err(Int4SentimentMapError::Chunk)?;
         let end = chunks.chunks().last().ok_or(Int4SentimentMapError::EmptySource)?.span();
         let mut expected = Int4SentimentMapPreflight { source_span: VerifiedSourceSpan { byte_start: 0,
@@ -319,6 +374,9 @@ impl<'a> PreparedInt4SentimentMap<'a> {
             heads: request.axes.len(), group_width: width, work: Int4Work::default(),
             max_retained_bytes: limits.max_retained_result_bytes, max_result_bytes: limits.max_result_bytes,
             aggregation: limits.aggregation, chunk_limits: chunks_limits, tokenizer_checks: chunks.tokenizer_calls(),
+            source_geometry: geometry(chunks.chunks().iter().map(|chunk| (chunk.id(), chunk.span(), chunk.tokens()))),
+            encoding: match encoding { UntrustedEncoding::ByteFallback => None,
+                UntrustedEncoding::SafeBpeV1(limits) => Some(*limits) }, encoding_work: work,
             request_binding: [0; 32] };
         let mut plans = reserved(expected.chunks)?;
         for chunk in chunks.chunks() {
@@ -326,14 +384,16 @@ impl<'a> PreparedInt4SentimentMap<'a> {
             let mut text = String::new(); text.try_reserve_exact(chunk.text().len()).map_err(|_| Int4SentimentMapError::Allocation)?;
             text.push_str(chunk.text());
             let row = SentimentRequest { document: text, axes: request.axes.clone(), budget: request.budget };
-            let plan = prepare(&row, control)?;
+            let plan = prepare(&row, control, &mut work)?;
             if plan.group_width() != width || plan.head_count() != expected.heads || plan.task_budget() != request.budget
+                || plan.source_token_count()? != chunk.tokens()
                 || plan.required_context() > chunks_limits.context_tokens { return Err(Int4SentimentMapError::Admission); }
             expected.work = expected.work.checked_add(plan.planned_work())?;
             if !fits(expected.work, limits.max_model_work) { return Err(Int4SentimentMapError::Work); }
             plans.push(plan);
         }
-        expected.request_binding = binding::request(request, limits, authority, &chunks, &plans, control)?;
+        expected.encoding_work = work;
+        expected.request_binding = binding::request(request, limits, authority, encoding, work, &chunks, &plans, control)?;
         checkpoint(control)?;
         Ok(Self { chunks, plans, limits, expected, task: request.budget })
     }
@@ -350,6 +410,17 @@ impl<'a> PreparedInt4SentimentMap<'a> {
     pub fn required_context(&self) -> usize { self.plans.iter().map(PreparedInt4Sentiment::required_context).max().unwrap_or(0) }
     pub fn max_result_bytes(&self) -> u64 { self.limits.max_result_bytes }
     pub fn task_budget(&self) -> TaskBudget { self.task }
+}
+
+fn geometry(rows: impl Iterator<Item = (usize, VerifiedSourceSpan, usize)>) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"sentiment-map-source-token-geometry-v1");
+    for (id, span, tokens) in rows {
+        for value in [id, span.byte_start, span.byte_end, span.scalar_start, span.scalar_end, tokens] {
+            hash.update((value as u64).to_le_bytes());
+        }
+    }
+    hash.finalize().into()
 }
 
 fn positive_work(work: Int4Work) -> bool {

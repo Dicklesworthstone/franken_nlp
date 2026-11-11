@@ -23,8 +23,8 @@ impl Int4SentimentPlanner {
         Ok(Self { compiler, identity, model: model.clone(), ceiling, limits })
     }
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
-    /// Configure one-off untrusted input before deriving a prepared identity.
-    /// Byte-capacity maps deliberately refuse a nondefault encoding policy.
+    /// Configure untrusted input before deriving a prepared identity. A
+    /// complete-document map shares these ceilings across probes and plans.
     pub fn with_document_encoding(mut self, encoding: crate::tokenizer::untrusted::UntrustedEncoding)
         -> Result<Self, Int4SentimentError> {
         self.compiler = self.compiler.with_document_encoding(encoding)?;
@@ -45,6 +45,20 @@ impl Int4SentimentPlanner {
         budget: TaskBudget, context_tokens: usize) -> Result<usize, Int4SentimentError> {
         self.compiler.source_capacity(axes, budget, self.ceiling, self.limits, context_tokens)
             .map_err(Int4SentimentError::from)
+    }
+    pub(super) fn source_token_capacity(&self, axes: &[crate::tasks::sentiment::SentimentAxis],
+        budget: TaskBudget, context_tokens: usize) -> Result<usize, SentimentPlanningError> {
+        self.compiler.source_token_capacity(axes, budget, self.ceiling, self.limits, context_tokens)
+    }
+    pub(super) fn source_tokens_with_work<C: DecodeStepControl>(&self, source: &str,
+        work: &mut SafeBpeWork, control: &mut C) -> Result<usize, SentimentPlanningError> {
+        self.compiler.source_tokens_with_work(source, work, control)
+    }
+    pub(super) fn plan_with_encoding_work<C: DecodeStepControl>(&self, request: &SentimentRequest,
+        control: &mut C, work: &mut SafeBpeWork) -> Result<PreparedInt4Sentiment, Int4SentimentError> {
+        let context = PlanContext::new(&self.identity, self.ceiling).map_err(|_| SentimentPlanningError::Budget)?;
+        check_model(context.execution_identity(), &self.model)?;
+        self.compiler.compile_int4_with_work(request, &context, self.limits, self.model.group_width(), control, work)
     }
     #[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub(crate) fn durable_configuration(&self) -> (TaskBudget, SentimentLimits) {

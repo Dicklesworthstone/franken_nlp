@@ -192,7 +192,8 @@ impl<'map, 'source> Collection<'map, 'source> {
             chunk_profile: CHUNK_PROFILE.to_owned(), semantics: SEMANTICS.to_owned(), single_context_equivalence: false,
             source_span: span, chunk_limits: self.prepared.chunks.limits(), tokenizer_checks: self.prepared.chunks.tokenizer_calls(),
             planned_model_work: self.prepared.planned_work(), model_work: self.work, retained_result_bytes: self.bytes,
-            chunks: self.chunks, aggregate, request_binding: self.prepared.expected.request_binding,
+            chunks: self.chunks, aggregate, input_encoding: self.prepared.expected.encoding_record(),
+            request_binding: self.prepared.expected.request_binding,
             result_binding: [0; 32] };
         run.result_binding = binding::result_with_control(&run, self.prepared.limits.max_result_bytes, control)?;
         value_bytes(&run, self.prepared.limits.max_result_bytes)?; checkpoint(control)?; Ok(run)

@@ -49,6 +49,7 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
     let started = Instant::now();
     let limits = options.validate_with_threads(&args)?;
+    let encoding = options.input_encoding(&args)?;
     let common = limits.common;
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
@@ -86,7 +87,7 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         let _preflight = lease.reserve(MemoryClass::JobBuffers, preflight_bytes)
             .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
         let planner = Int4SentimentPlanner::for_model(model.model_identity(), config.options, budget,
-            config.planning).map_err(sentiment_error)?;
+            config.planning).and_then(|planner| planner.with_document_encoding(encoding.clone())).map_err(sentiment_error)?;
         let prepared = planner.plan_document_with_control(&request, config.mapping,
             &mut DeadlineControl { started, deadline }).map_err(planning_error)?;
         if prepared.head_count() != request.axes.len() || prepared.required_context() > args.context_tokens {
@@ -114,7 +115,7 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         candidate_format: INT4_SOURCE_FORMAT, quant_recipe: &recipe,
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(), snapshot };
     if let Some(chunks) = options.mapping.cohort_chunks {
-        let result = engine.map_int4_sentiment_cohorts(&model, request, config, chunks,
+        let result = engine.map_int4_sentiment_cohorts_with_encoding(&model, request, config, encoding, chunks,
             common.kernel, cancellation).map_err(execution_error)?;
         if let Some(expected) = expected {
             expected.verify_completed_cohorts_with_control(result.result(), chunks,
@@ -127,8 +128,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         publish_complete(&Response { provenance: &provenance, output: &result.result().output, cohort: Some(cohort) },
             limits.envelope_bytes, output, &remaining)
     } else if common.compute.threads > 1 {
-        let result = engine.map_int4_sentiment_with_threads(&model, request, config, common.kernel,
-            common.compute.threads, cancellation).map_err(execution_error)?;
+        let result = engine.map_int4_sentiment_with_encoding_and_threads(&model, request, config, encoding,
+            common.kernel, common.compute.threads, cancellation).map_err(execution_error)?;
         if let Some(expected) = expected {
             expected.verify_completed_with_control(result.result(), &mut DeadlineControl { started, deadline })
                 .map_err(completion_error)?;
@@ -137,7 +138,7 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         publish_complete(&compute::Response { response: &response, compute: Some(result.compute()) },
             limits.envelope_bytes, output, &remaining)
     } else {
-        let result = engine.map_int4_sentiment(&model, request, config, common.kernel, cancellation)
+        let result = engine.map_int4_sentiment_with_encoding(&model, request, config, encoding, common.kernel, cancellation)
             .map_err(execution_error)?;
         if let Some(expected) = expected {
             expected.verify_completed_with_control(result.result(), &mut DeadlineControl { started, deadline })
