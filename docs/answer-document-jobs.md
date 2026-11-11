@@ -131,6 +131,21 @@ window and level drains before the next dependent phase. Serial, discovery
 cohorts, hierarchy cohorts with serial discovery, and both schedules use the
 same underlying native task contracts. Repeat the selected schedules on resume.
 
+`--compute-threads 2..=64` is a separate physical schedule: one persistent
+INT4 output-row team spans the complete invocation, every pending source/question
+pair, discovery map and permitted synthesis or hierarchy pass. Width `1`
+retains serial execution. Team selection rejects chunk and hierarchy-group
+cohorts before population or storage access. The shared pre-IO quote adds one
+worker-scratch reservation without multiplying task KV or changing work caps.
+
+The compute width is not part of the authenticated semantic recipe. A later
+explicit resume can select a different compatible width while retaining the
+exact input/options/model binding, stored result bytes and cumulative native,
+mask and attempt debits. Compact input keeps its existing complete-document
+scope and supported modes; neural synthesis and hierarchies remain byte-input.
+The invocation still drains workers before returning, including after a
+durable commit whose completion acknowledgement is lost to cancellation.
+
 ## Lifetime work and complete memory admission
 
 The shared `JobLimits` JSON is the sole lifetime authority for item count,
@@ -227,6 +242,13 @@ Library callers select schedules on
 reader. The public `hosted::int4_question_document_job_requirements` exposes
 the same pure quote; explicit retained-input modes use the shared
 `JobOpenMode` variants.
+
+`NlpEngine::job_int4_question_documents_with_threads` adds an explicit team
+width and requires a compatible process thread envelope. The dispatcher owns
+the additional worker scratch until physical join. CLI progress metadata
+adds `compute_schedule` for this route, while durable semantic results and
+serial report shapes remain unchanged. Thread selection is not a measured
+performance claim.
 
 Regression definitions cover real owned-storage replay with explicitly
 synthetic transport output, strict question contracts, lifetime accounting,

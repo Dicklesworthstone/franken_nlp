@@ -57,6 +57,47 @@ fn complete_question_modes_and_independent_schedules_keep_one_lifetime() {
 }
 
 #[test]
+fn question_job_worker_width_is_additive_and_preserves_source_question_and_lifetime_authority() {
+    for flags in [&[][..], &["--synthesize-answer"][..],
+        &["--synthesize-answer", "--hierarchical-answer", "--answer-max-passes", "4"][..]] {
+        let (serial, args) = parsed("start", flags);
+        let job = lifetime(&serial, &args);
+        let common = serial.args.validate(&args).unwrap();
+        let original = serial.args.lifetime_limits(&args, common, AnswerOptions::default(), job).unwrap();
+        for operation in ["start", "resume"] {
+            for threads in ["2", "4"] {
+                let mut flags = flags.to_vec(); flags.extend(["--compute-threads", threads]);
+                let (command, args) = parsed(operation, &flags);
+                let common = command.args.validate(&args).unwrap();
+                let limits = command.args.lifetime_limits(&args, common, AnswerOptions::default(), job).unwrap();
+                assert_eq!(common.compute.threads, threads.parse::<usize>().unwrap());
+                assert_eq!(limits.common.minimum_memory_bytes - original.common.minimum_memory_bytes,
+                    common.compute.workspace_bytes);
+                assert_eq!(limits.memory, original.memory);
+                assert_eq!(limits.config.max_model_work, original.config.max_model_work);
+                assert_eq!(limits.config.max_mask_visits, original.config.max_mask_visits);
+                assert_eq!(limits.config.max_map_verification, original.config.max_map_verification);
+                assert_eq!(limits.config.max_verification, original.config.max_verification);
+                assert_eq!(limits.config.budget, original.config.budget);
+                assert_eq!(limits.config.max_question_bytes, original.config.max_question_bytes);
+                assert_eq!(limits.config.continuation_passes(), original.config.continuation_passes());
+            }
+        }
+    }
+}
+
+#[test]
+fn competing_question_job_schedules_and_invalid_worker_widths_refuse_before_private_io() {
+    for flags in [&["--compute-threads", "0"][..], &["--compute-threads", "65"][..],
+        &["--compute-threads", "2", "--cohort-chunks", "1"][..],
+        &["--compute-threads", "2", "--synthesize-answer", "--hierarchical-answer",
+            "--cohort-hierarchy-groups", "1"][..]] {
+        let (command, args) = parsed("resume", flags);
+        assert!(command.args.validate(&args).is_err());
+    }
+}
+
+#[test]
 fn changing_attempt_ceiling_scales_verification_without_multiplying_native_authority() {
     let (command, args) = parsed("start", &["--synthesize-answer"]);
     let common = command.args.validate(&args).unwrap();

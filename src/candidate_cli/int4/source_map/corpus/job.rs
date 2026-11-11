@@ -52,6 +52,9 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
                 MappingArgs::augment_args(command)))))
             .mut_arg("store_results", |arg| arg.help("Required consent to retain private complete source/question results"));
         let command = encoding::population_definition(command);
+        let details = command.get_after_long_help().map(|help| help.to_string()).unwrap_or_default();
+        let command = compute::definition(command)
+            .after_long_help(format!("{details}\n\n--compute-threads 2..=64 forms one persistent exact row team for all pending source/question items and every dependent synthesis pass. This physical width may change on authenticated resume while recipes, native-work debits and committed results remain unchanged. Extra worker scratch is admitted before private IO. Chunk and hierarchy-group cohorts cannot combine with a worker team. Serial is the default; no speed or model-parity qualification is implied."));
         if name == "resume" {
             command.arg(clap::Arg::new("discard_uncommitted_tail").long("discard-uncommitted-tail")
                 .action(clap::ArgAction::SetTrue)
@@ -97,7 +100,13 @@ impl JobArgs {
             !self.synthesis.flat.synthesize_answer, true)?;
         let mut storage = args.clone();
         storage.input_encoding = input_encoding::InputEncodingArgs::default();
-        let common = self.source.validate(&storage)?;
+        let common = if args.compute.threads() != 1 {
+            if args.prefill()?.is_some() || self.questions.cohort_chunks.is_some()
+                || self.questions.cohort_hierarchy_groups.is_some() {
+                return Err(CandidateError::Arguments.into());
+            }
+            self.source.validate_batch_with_prefill(&storage)?
+        } else { self.source.validate(&storage)? };
         self.mapping.validate(args, &self.source, common, self.questions.cohort_chunks)?;
         self.synthesis.validate()?;
         self.policy.verification()?;
@@ -163,7 +172,7 @@ impl JobArgs {
             .map_err(|_| Failure::usage("question_document_job_admission"))?;
         let q = memory.document;
         let execution = sum(&[q.input_bytes, q.native.kv_bytes, q.workspace_bytes,
-            q.document_workspace_bytes, q.output_reservation_bytes])?;
+            q.document_workspace_bytes, q.output_reservation_bytes, common.compute.workspace_bytes])?;
         common.minimum_memory_bytes = sum(&[grouped_memory_floor(args, common, execution)?, io_reserve_bytes])?;
         if common.minimum_memory_bytes > common.memory_bytes {
             return Err(Failure { exit: ErrorCode::AdmissionOrResourceLimit, code: "question_document_job_memory" });
@@ -199,6 +208,7 @@ impl JobCommand {
             questions: QuestionJobArgs::from_arg_matches(matches)?, storage: StorageArgs::from_arg_matches(matches)? };
         let mut common = Int4Args::from_arg_matches(matches)?;
         common.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+        common.compute = compute::Args::from_matches(matches)?;
         Ok((Self { mode, args }, common))
     }
     pub(in crate::candidate_cli::int4) fn run_owned<R: Read + Send + 'static>(self, args: Int4Args,

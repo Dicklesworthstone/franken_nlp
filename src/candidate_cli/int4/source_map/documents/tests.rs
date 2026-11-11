@@ -32,6 +32,81 @@ impl Write for NoIo {
 }
 
 #[test]
+fn persistent_teams_cover_every_document_mode_without_widening_semantic_budgets() {
+    for (name, flags) in [
+        ("ner-corpus", &[][..]), ("keyphrases-corpus", &["--reduce-keyphrases"][..]),
+        ("summarize-corpus", &[][..]), ("summarize-corpus", &["--synthesize-summary"][..]),
+        ("summarize-corpus", &["--synthesize-summary", "--hierarchical-summary"][..]),
+        ("answer", &[][..]), ("answer", &["--synthesize-answer"][..]),
+        ("answer", &["--synthesize-answer", "--hierarchical-answer"][..]),
+    ] {
+        let (serial, serial_args) = arguments(name, flags);
+        let baseline = serial.validate(&serial_args).unwrap();
+        for width in ["2", "4", "64"] {
+            let mut selected = flags.to_vec(); selected.extend_from_slice(&["--compute-threads", width]);
+            let (command, args) = arguments(name, &selected);
+            let quoted = command.validate(&args).unwrap();
+            assert_eq!(quoted.common.compute.threads, width.parse::<usize>().unwrap());
+            assert_eq!(quoted.run, baseline.run);
+            assert_eq!(quoted.transport, baseline.transport);
+            assert_eq!(quoted.document.mapping.max_model_work, baseline.document.mapping.max_model_work);
+            assert_eq!(quoted.document.mapping.verification, baseline.document.mapping.verification);
+            assert_eq!(quoted.document.workspace_bytes, baseline.document.workspace_bytes);
+            assert_eq!(quoted.execution_bytes - baseline.execution_bytes, quoted.common.compute.workspace_bytes);
+            assert_eq!(quoted.common.compute.workspace_bytes,
+                crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(
+                    width.parse().unwrap(), args.group_width).unwrap());
+            assert_eq!(command.mode_name(quoted.document), serial.mode_name(baseline.document));
+        }
+    }
+}
+
+#[test]
+fn corpus_team_aliases_and_compact_input_share_the_actual_parser_and_admission() {
+    for (task, short) in [("ner", "ner-corpus"), ("keyphrases", "keyphrases-corpus"),
+        ("summarize", "summarize-corpus")] {
+        for encoding in ["byte-fallback", "safe-bpe-v1"] {
+            let (short_options, short_args) = arguments(short,
+                &["--compute-threads", "3", "--input-encoding", encoding]);
+            let argv = vec!["candidate", "source-int4", "source-corpus", task,
+                "--memory-mib", "131072", "--source-dir", "private-source", "--source-manifest", "private-manifest",
+                "--compute-threads", "3", "--input-encoding", encoding];
+            let matches = crate::candidate_cli::definition().try_get_matches_from(argv).unwrap();
+            let CandidateCommand::SourceInt4(long) = CandidateCommand::from_matches(&matches).unwrap()
+                else { panic!("source INT4 required"); };
+            let Int4Task::SourceCorpus(long_options) = long.task else { panic!("source corpus required"); };
+            assert_eq!(long_options, short_options);
+            assert_eq!(long.args.compute, short_args.compute);
+            assert_eq!(long.args.compute.threads(), 3);
+            assert_eq!(long_options.validate(&long.args).unwrap().common.compute,
+                short_options.validate(&short_args).unwrap().common.compute);
+        }
+    }
+}
+
+#[test]
+fn corpus_teams_refuse_unfunded_widths_and_schedule_mixtures_before_owned_io() {
+    for name in ["ner-corpus", "keyphrases-corpus", "summarize-corpus", "answer"] {
+        for flags in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+            vec!["--compute-threads", "3", "--cohort-chunks", "1"],
+            vec!["--compute-threads", "3", "--cohort-chunks", "2"]] {
+            let (command, args) = arguments(name, &flags);
+            assert_eq!(command.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+        }
+        let (command, mut args) = arguments(name, &["--compute-threads", "3"]);
+        let quote = command.validate(&args).unwrap();
+        args.memory_mib = quote.common.minimum_memory_bytes.div_ceil(MIB) - 1;
+        assert_eq!(command.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+    for (name, synthesis, hierarchy) in [("summarize-corpus", "--synthesize-summary", "--hierarchical-summary"),
+        ("answer", "--synthesize-answer", "--hierarchical-answer")] {
+        let (command, args) = arguments(name,
+            &[synthesis, hierarchy, "--compute-threads", "3", "--cohort-hierarchy-groups", "1"]);
+        assert_eq!(command.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
 fn four_owned_routes_preserve_every_existing_semantic_document_mode() {
     for (name, flags, mode) in [
         ("ner-corpus", &[][..], "source_map"),

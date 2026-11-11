@@ -27,6 +27,52 @@ impl Write for NoIo {
 }
 
 #[test]
+fn question_stream_team_preserves_all_question_modes_and_prices_one_worker_workspace() {
+    for mode in [&[][..], &["--synthesize-answer"][..],
+        &["--synthesize-answer", "--hierarchical-answer"][..],
+        &["--input-encoding", "safe-bpe-v1"][..]] {
+        let (serial, serial_args) = arguments(mode);
+        let baseline = serial.validate(&serial_args).unwrap();
+        for threads in ["2", "4", "64"] {
+            let mut flags = mode.to_vec(); flags.extend_from_slice(&["--compute-threads", threads]);
+            let (command, args) = arguments(&flags);
+            let selected = command.validate(&args).unwrap();
+            assert_eq!(selected.common.compute.threads, threads.parse::<usize>().unwrap());
+            assert_eq!(selected.config.budget, baseline.config.budget);
+            assert_eq!(selected.config.max_model_work, baseline.config.max_model_work);
+            assert_eq!(selected.config.max_mask_visits, baseline.config.max_mask_visits);
+            assert_eq!(selected.config.max_verification, baseline.config.max_verification);
+            assert_eq!(selected.config.max_map_verification, baseline.config.max_map_verification);
+            assert_eq!(selected.config.synthesis.is_some(), baseline.config.synthesis.is_some());
+            assert_eq!(selected.config.hierarchy.is_some(), baseline.config.hierarchy.is_some());
+            assert_eq!(selected.memory, baseline.memory);
+            assert_eq!(selected.transport, baseline.transport);
+            assert_eq!(selected.encoding, baseline.encoding);
+            let execution = sum(&[selected.memory.native.kv_bytes, selected.memory.workspace_bytes,
+                selected.memory.input_bytes, selected.memory.document_workspace_bytes,
+                selected.memory.output_reservation_bytes, selected.common.compute.workspace_bytes]).unwrap();
+            assert_eq!(selected.common.minimum_memory_bytes,
+                grouped_memory_floor(&args, selected.common, execution).unwrap() + selected.io_bytes);
+        }
+    }
+}
+
+#[test]
+fn question_stream_team_refuses_incompatible_schedules_and_short_memory_before_io() {
+    for flags in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+        vec!["--compute-threads", "4", "--cohort-chunks", "1"],
+        vec!["--compute-threads", "4", "--cohort-chunks", "3"],
+        vec!["--compute-threads", "4", "--synthesize-answer", "--hierarchical-answer", "--cohort-hierarchy-groups", "1"]] {
+        let (command, args) = arguments(&flags);
+        assert_eq!(command.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+    let (command, mut args) = arguments(&["--compute-threads", "4"]);
+    let quoted = command.validate(&args).unwrap();
+    args.memory_mib = quoted.common.minimum_memory_bytes.div_ceil(MIB) - 1;
+    assert_eq!(command.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+}
+
+#[test]
 fn per_record_question_route_has_no_file_default_and_supports_both_actual_model_routes() {
     let command = parsed(&["--source-dir", "d", "--source-manifest", "m"]).unwrap();
     assert_eq!(command.execute(&mut NoIo, &mut NoIo), Err(CandidateError::Arguments));

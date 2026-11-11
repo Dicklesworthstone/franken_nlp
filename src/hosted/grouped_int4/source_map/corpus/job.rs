@@ -6,11 +6,25 @@ use crate::{
         runner::{JobRunError, source::grouped_int4::question_document::{
             Int4QuestionDocumentJobPlanner, Int4QuestionDocumentJobProcessor,
             memory::{Int4QuestionDocumentJobMemoryLimits, Int4QuestionDocumentJobMemoryRequirement}}}},
+    native_engine::strict_int4::projection::Int4ProjectionExecutor,
+    tasks::source_planning::grouped_int4::long::cohort::Int4SourceMapCohortRequirement,
 };
 
 struct QuestionJobInput<R> {
     preparation: Option<(Int4QuestionDocumentJobPlanner, Arc<ExtractionVocabulary>, SourceJobRequest)>,
     reader: R,
+}
+
+struct QuestionJobExecution<R> {
+    input: Charged<QuestionJobInput<R>>,
+    frontier: Pending,
+    kv: Pending,
+    scratch: Pending,
+    host: JobHostLimits,
+    config: Int4QuestionDocumentBatchConfig,
+    required: Int4QuestionDocumentMemoryRequirement,
+    cohort: Option<Int4SourceMapCohortRequirement>,
+    lease: EngineLease,
 }
 
 /// Quote the same complete population, question/source frontiers, native
@@ -55,7 +69,37 @@ impl NlpEngine {
         kernel: PackedInt4Kernel, reader: R, cancellation: CancellationToken)
         -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        dispatch::preflight(self, host.native.run)?;
+        self.run_int4_question_document_job(model, planner, vocabulary, request, host,
+            reduction_reserve_bytes, kernel, None, reader, cancellation)
+    }
+
+    /// Retain the same authenticated whole-source/question results with one
+    /// persistent numerical team across pending items and all dependent
+    /// synthesis/hierarchy passes. The physical width is not a recipe field;
+    /// changing it on explicit resume does not renew persisted work or alter
+    /// existing committed records. Native cohort schedules remain separate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int4_question_documents_with_threads<R>(&self, model: &ResidentInt4,
+        planner: Int4QuestionDocumentJobPlanner, vocabulary: Arc<ExtractionVocabulary>,
+        request: SourceJobRequest, host: JobHostLimits, reduction_reserve_bytes: u64,
+        kernel: PackedInt4Kernel, compute_threads: usize, reader: R,
+        cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        self.run_int4_question_document_job(model, planner, vocabulary, request, host,
+            reduction_reserve_bytes, kernel, Some(compute_threads), reader, cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_int4_question_document_job<R>(&self, model: &ResidentInt4,
+        planner: Int4QuestionDocumentJobPlanner, vocabulary: Arc<ExtractionVocabulary>,
+        request: SourceJobRequest, host: JobHostLimits, reduction_reserve_bytes: u64,
+        kernel: PackedInt4Kernel, compute_threads: Option<usize>, reader: R,
+        cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        match compute_threads {
+            Some(width) => dispatch::preflight_int4_team(self, host.native.run, width)?,
+            None => dispatch::preflight(self, host.native.run)?,
+        }
         if !Arc::ptr_eq(self.resources(), model.resources()) {
             return Err(HostedError::ResourceDomain.into());
         }
@@ -63,6 +107,7 @@ impl NlpEngine {
             .map_err(|_| HostedError::ModelIdentity)?;
         planner.check_job_limits(request.limits).map_err(HostedError::BatchSetup)?;
         let config = *planner.config();
+        check_question_team_schedule(compute_threads, planner.uses_native_cohorts(), config)?;
         if planner.group_width() != model.model_identity().group_width()
             || planner.execution_identity().task_spec != ANSWER_TASK_VERSION
             || config.planning.max_context_tokens != host.native.context_tokens {
@@ -81,65 +126,97 @@ impl NlpEngine {
         }
         let cohort = planner.uses_native_cohorts().then(|| planner.cohort_requirements()
             .map_err(HostedError::BatchSetup)).transpose()?;
+        let team_scratch = compute_threads.map(|threads|
+            int4_task_team_workspace_bytes(threads, model.model_identity().group_width()))
+            .transpose()?.unwrap_or(0);
+        // The dispatcher admits/owns this extra charge once for the complete
+        // invocation; it is not part of each item's durable native work.
+        sum(&[required.workspace_bytes, team_scratch])?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(QuestionJobInput { preparation: Some((planner, vocabulary, request)), reader }))?;
         let frontier = Pending::reserve(&lease, MemoryClass::JobBuffers, required.document_workspace_bytes)?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.workspace_bytes)?;
+        let execution = QuestionJobExecution { input, frontier, kv, scratch, host, config,
+            required, cohort, lease };
         let model = model.clone();
-        let completed = dispatch::run(self, host.native.run, cancellation, move |control| {
-            let mut input = input;
-            checkpoint(control)?;
-            let (planner, vocabulary, request) = input.value.preparation.take()
-                .ok_or(HostedError::CompletionMissing)?;
-            let population = match read_population(&mut input.value.reader,
-                &request, host.transport, control) {
-                Ok(population) => population,
-                Err(error) => return Ok(Err(JobRunError::Storage(error))),
-            };
-            checkpoint(control)?;
-            let admission = QuestionAdmission::new(&lease, model.model_identity(),
-                planner.execution_identity(), config, required);
-            let result = if let Some(cohort) = cohort {
-                let budget = Int4SourceMapCohortBudget { context_limit: host.native.context_tokens,
-                    native_memory: Int4MemoryBudget { max_kv_bytes: cohort.native.kv_bytes,
-                        max_rope_bytes: cohort.native.rope_bytes,
-                        max_scratch_payload_bytes: cohort.native.scratch_payload_bound },
-                    max_workspace_bytes: cohort.workspace_bytes, max_result_bytes: cohort.max_result_bytes };
-                let result = (|| {
-                    let processor = Int4QuestionDocumentJobProcessor::new_cohorts(&planner,
-                        &model.inner.loaded.value, &vocabulary, budget, kernel, admission)
-                        .map_err(JobRunError::Processor)?;
-                    run_population(request, &population, processor, control)
-                })();
-                // Discovery and hierarchy phases drain sequentially. Retain
-                // the phase-peak charge without constructing a spare engine.
-                drop(scratch); drop(kv);
-                result
-            } else {
-                let mut engine = allocate_native(kv, scratch, || {
-                    StrictInt4Engine::new(&model.inner.loaded.value, host.native.context_tokens,
-                        Int4MemoryBudget { max_kv_bytes: required.native.kv_bytes,
-                            max_rope_bytes: required.native.rope_bytes,
-                            max_scratch_payload_bytes: required.native.scratch_payload_bound })
-                        .map(|engine| engine.with_kernel(kernel)).map_err(native_error)
-                })?;
-                let result = (|| {
-                    let processor = Int4QuestionDocumentJobProcessor::new(&planner,
-                        &mut engine.value, &vocabulary, admission).map_err(JobRunError::Processor)?;
-                    run_population(request, &population, processor, control)
-                })();
-                drop(engine);
-                result
-            };
-            // Result guards survive canonical serialization, spool sync and
-            // journal acknowledgement inside run_population before these drop.
-            drop(population); drop(vocabulary); drop(planner); drop(input);
-            drop(frontier); drop(lease);
-            Ok(result)
-        })?;
+        let completed = match compute_threads {
+            None => dispatch::run(self, host.native.run, cancellation, move |control|
+                execution.run(&model.inner.loaded.value, kernel, None, control)),
+            Some(width) => dispatch::run_int4_team(self, host.native.run, cancellation,
+                model, width, kernel, move |weights, control, team|
+                    execution.run(weights, kernel, Some(team), control)),
+        }?;
         completed.map_err(HostedJobError::Job)
+    }
+}
+
+fn check_question_team_schedule(threads: Option<usize>, cohorts: bool,
+    config: Int4QuestionDocumentBatchConfig) -> Result<(), HostedError> {
+    if threads.is_some() && (cohorts || config.mapping.reduction.map_batch_chunks != 1) {
+        return Err(HostedError::Limits("INT4 question job team requires serial chunk and hierarchy schedules"));
+    }
+    Ok(())
+}
+
+impl<R: BufRead> QuestionJobExecution<R> {
+    fn run<'weights>(self, weights: &'weights Int4ModelWeights, kernel: PackedInt4Kernel,
+        projection: Option<&'weights mut (dyn Int4ProjectionExecutor + 'weights)>,
+        control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError> {
+        let Self { mut input, frontier, kv, scratch, host, config, required, cohort, lease } = self;
+        checkpoint(control)?;
+        let (planner, vocabulary, request) = input.value.preparation.take()
+            .ok_or(HostedError::CompletionMissing)?;
+        let population = match read_population(&mut input.value.reader,
+            &request, host.transport, control) {
+            Ok(population) => population,
+            Err(error) => return Ok(Err(JobRunError::Storage(error))),
+        };
+        checkpoint(control)?;
+        let admission = QuestionAdmission::new(&lease, weights.identity(),
+            planner.execution_identity(), config, required);
+        let result = if let Some(cohort) = cohort {
+            if projection.is_some() {
+                return Err(HostedError::Limits("INT4 question job conflicting physical schedules"));
+            }
+            let budget = Int4SourceMapCohortBudget { context_limit: host.native.context_tokens,
+                native_memory: Int4MemoryBudget { max_kv_bytes: cohort.native.kv_bytes,
+                    max_rope_bytes: cohort.native.rope_bytes,
+                    max_scratch_payload_bytes: cohort.native.scratch_payload_bound },
+                max_workspace_bytes: cohort.workspace_bytes, max_result_bytes: cohort.max_result_bytes };
+            let result = (|| {
+                let processor = Int4QuestionDocumentJobProcessor::new_cohorts(&planner,
+                    weights, &vocabulary, budget, kernel, admission).map_err(JobRunError::Processor)?;
+                run_population(request, &population, processor, control)
+            })();
+            drop(scratch); drop(kv);
+            result
+        } else {
+            let mut engine = allocate_native(kv, scratch, || {
+                let engine = StrictInt4Engine::new(weights, host.native.context_tokens,
+                    Int4MemoryBudget { max_kv_bytes: required.native.kv_bytes,
+                        max_rope_bytes: required.native.rope_bytes,
+                        max_scratch_payload_bytes: required.native.scratch_payload_bound })
+                    .map_err(native_error)?.with_kernel(kernel);
+                match projection {
+                    Some(team) => engine.with_projection_executor(team).map_err(native_error),
+                    None => Ok(engine),
+                }
+            })?;
+            let result = (|| {
+                let processor = Int4QuestionDocumentJobProcessor::new(&planner,
+                    &mut engine.value, &vocabulary, admission).map_err(JobRunError::Processor)?;
+                run_population(request, &population, processor, control)
+            })();
+            drop(engine);
+            result
+        };
+        // Each output guard survives serialization, spool sync and journal
+        // acknowledgement; runtime cancellation/drain still outranks success.
+        drop(population); drop(vocabulary); drop(planner); drop(input);
+        drop(frontier); drop(lease);
+        Ok(result)
     }
 }
 

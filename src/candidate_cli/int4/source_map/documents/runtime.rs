@@ -2,7 +2,7 @@
 use super::*;
 use std::{io::{BufRead, BufReader}, sync::Arc, time::{Duration, Instant}};
 use crate::{
-    NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
+    NlpEngine, MemoryClass,
     batch::source::grouped_int4::document::Int4SourceDocumentBatchPlanner,
     candidate_cli::batch::{CandidateWriter, completed},
     hosted::{CancellationToken, HostedError, Int4HostError, NativeLimits, RunLimits,
@@ -47,12 +47,8 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
-    let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
-        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: common.memory_bytes,
-        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
-    }).build().map_err(|_| CandidateError::Runtime)?;
+    let engine = NlpEngine::builder().resource_config(compute::resource_config(common))
+        .build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
     let _preparation = lease.reserve(MemoryClass::JobBuffers, limits.cli_preparation_bytes)
         .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
@@ -129,6 +125,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(), snapshot,
+        compute_schedule: compute::Schedule::for_threads(common.compute.threads),
     };
     let provenance = encoding::population_response(provenance, limits.document.encoding);
     let writer = CandidateWriter::new(output, &provenance, limits.transport.max_output_line_bytes, limits.output_bytes)?;
@@ -138,10 +135,15 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         Box::new(BufReader::with_capacity(IO_BUFFER_BYTES,
             crate::local_io::open_document(&args.input).map_err(|_| CandidateError::Input)?))
     };
-    let summary = engine.batch_int4_source_documents(&model, planner, Arc::new(vocabulary),
-        host_limits(&args, limits, remaining()?), limits.document.reduction_reserve_bytes,
-        common.kernel, reader, writer, cancellation)
-        .map_err(|error| host_error(error, CandidateError::Batch))?;
+    let host = host_limits(&args, limits, remaining()?);
+    let summary = if common.compute.threads == 1 {
+        engine.batch_int4_source_documents(&model, planner, Arc::new(vocabulary), host,
+            limits.document.reduction_reserve_bytes, common.kernel, reader, writer, cancellation)
+    } else {
+        engine.batch_int4_source_documents_with_threads(&model, planner, Arc::new(vocabulary), host,
+            limits.document.reduction_reserve_bytes, common.kernel, common.compute.threads,
+            reader, writer, cancellation)
+    }.map_err(|error| host_error(error, CandidateError::Batch))?;
     remaining()?;
     // A drained stream may contain rejected rows. Its host emits the sole
     // run_complete footer; any later error is diagnostic-only and exits nonzero.
@@ -154,7 +156,9 @@ fn check_quote(limits: CorpusLimits, quote: Int4SourceDocumentCorpusRequirement)
         || quote.document_workspace_bytes != limits.document.workspace_bytes {
         return Err(CandidateError::Identity);
     }
-    if quote.total_bytes > limits.execution_bytes { return Err(CandidateError::Memory); }
+    if sum(&[quote.total_bytes, limits.common.compute.workspace_bytes])? > limits.execution_bytes {
+        return Err(CandidateError::Memory);
+    }
     Ok(())
 }
 fn read_config(path: &std::path::Path, cap: usize,
@@ -196,6 +200,8 @@ struct Provenance<'a> {
     candidate_format: &'a str, quant_recipe: &'a str, group_width: usize, integer_kernel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<SnapshotRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compute_schedule: Option<compute::Schedule>,
 }
 
 #[cfg(test)]

@@ -40,7 +40,9 @@ fn arguments(name: &str, extra: &[&str]) -> (CorpusArgs, Int4Args) {
     argv.extend_from_slice(extra);
     let matches = super::super::definition().try_get_matches_from(argv).unwrap();
     let (_, matches) = matches.subcommand().unwrap();
-    (CorpusArgs::from_matches(kind, matches).unwrap(), Int4Args::from_arg_matches(matches).unwrap())
+    let mut args = Int4Args::from_arg_matches(matches).unwrap();
+    args.compute = compute::Args::from_matches(matches).unwrap();
+    (CorpusArgs::from_matches(kind, matches).unwrap(), args)
 }
 
 fn quote(command: &CorpusArgs, args: &Int4Args, limits: CorpusLimits, task: &Task)
@@ -102,6 +104,29 @@ fn nine_modes_match_the_shared_host_quote_and_reserve_private_defaults_before_io
             assert_eq!(host.preparation_reserve_bytes, limits.common.preparation_bytes);
             assert_eq!(host.io_reserve_bytes, limits.io_bytes);
         }
+    }
+}
+
+#[test]
+fn team_quote_has_one_worker_workspace_and_a_matching_process_envelope_for_every_mode() {
+    for (name, mode, _) in MODES {
+        let mut flags = mode.to_vec(); flags.extend_from_slice(&["--compute-threads", "3"]);
+        let (command, args) = arguments(name, &flags);
+        let limits = command.validate(&args).unwrap();
+        let task = command.document.document_task(&args, limits.document, None,
+            (name == "answer").then(|| "Exact private question?".to_owned()),
+            limits.run.max_keyphrase_scan_work).unwrap();
+        let quoted = quote(&command, &args, limits, &task);
+        check_quote(limits, quoted).unwrap();
+        let unallocated = limits.retained_defaults_bytes - task.retained_bytes().unwrap();
+        assert_eq!(quoted.total_bytes + unallocated + limits.common.compute.workspace_bytes,
+            limits.execution_bytes);
+        let host = compute::resource_config(limits.common);
+        assert_eq!(host.scoped_cpu_children_per_coordinator, 2);
+        assert_eq!(host.thread_ceiling, 4);
+        let mut short = limits;
+        short.execution_bytes = quoted.total_bytes + limits.common.compute.workspace_bytes - 1;
+        assert_eq!(check_quote(short, quoted), Err(CandidateError::Memory));
     }
 }
 
@@ -280,6 +305,7 @@ fn public_provenance_preserves_exact_transport_and_omits_private_inputs_and_bind
         candidate_format: "fnlp-int4-source-candidate-v1", quant_recipe: "fixture:group=128",
         group_width: 128, integer_kernel: "s_scalar_i32",
         snapshot: Some(SnapshotRecord::new("loaded", need)),
+        compute_schedule: None,
     };
     // Transport-only data: the numeric bytes must survive without a lossy
     // JSON number round-trip. This is not a fabricated native task result.

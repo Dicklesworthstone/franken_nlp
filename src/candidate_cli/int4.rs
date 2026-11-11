@@ -264,6 +264,7 @@ impl Int4Command {
                 clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source corpus task refused"))?;
             let mut args = Int4Args::from_arg_matches(matches)?;
             args.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+            args.compute = compute::Args::from_matches(matches)?;
             return Ok(Self { task: Int4Task::SourceCorpus(source_map::documents::CorpusArgs::from_matches(kind, matches)?),
                 args, batch: None, job: None });
         }
@@ -389,7 +390,8 @@ impl Int4Command {
             | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch" | "extract-batch"
             | "ner-batch" | "keyphrases-batch" | "summarize-batch" | "answer-batch"
             | "classify-map" | "sentiment-map" | "extract-map"
-            | "ner-map" | "keyphrases-map" | "summarize-map" | "answer-map") {
+            | "ner-map" | "keyphrases-map" | "summarize-map" | "answer-map"
+            | "ner-corpus" | "keyphrases-corpus" | "summarize-corpus" | "answer-corpus") {
             args.compute = compute::Args::from_matches(matches)?;
         }
         Ok(Self { task, args, batch: None, job: None })

@@ -311,7 +311,182 @@ fn question_capacity_and_all_passes_are_owned_until_physical_completion() {
     send::<Int4SourceDocumentJobPlanner>();
     send::<DocumentJobInput<Cursor<Vec<u8>>>>();
     send::<Charged<DocumentJobInput<Cursor<Vec<u8>>>>>();
+    send::<DocumentExecution<Cursor<Vec<u8>>>>();
     let _entry = NlpEngine::job_int4_source_document::<Cursor<Vec<u8>>>;
+    let _threaded = NlpEngine::job_int4_source_document_with_threads::<Cursor<Vec<u8>>>;
+}
+
+#[test]
+fn persistent_document_workers_cannot_silently_replace_chunk_or_hierarchy_cohorts() {
+    let (_, _, mut mapping, _, _) = fixture();
+    for threads in [2, 4] {
+        assert!(check_team_schedule(Some(threads), false, mapping).is_ok());
+        assert!(check_team_schedule(Some(threads), true, mapping).is_err());
+        mapping.reduction.map_batch_chunks = 2;
+        assert!(check_team_schedule(Some(threads), false, mapping).is_err());
+        assert!(check_team_schedule(None, true, mapping).is_ok());
+        mapping.reduction.map_batch_chunks = 1;
+    }
+}
+
+mod team {
+    use super::*;
+    use crate::{LeakResponsePolicy, ResourceHostConfig, RuntimePreset,
+        hosted::corpus::jobs::JobOpenMode,
+        jobs::{JobError, JobId, JobSecret,
+            runner::source::grouped_int4::document::Int4SourceDocumentLifetime},
+        native_engine::{decode::DecodeCancellationKind, strict_int4::weights::projection_fixture},
+        tasks::source_planning::{SourceTaskPlanner, grouped_int4::long::SourceMapTask}};
+    use std::{io::{self, BufRead, Read}, sync::atomic::{AtomicU64, AtomicUsize, Ordering}};
+
+    const MIB: u64 = 1 << 20;
+    const PREPARATION: u64 = 128 * MIB;
+
+    #[derive(Clone, Copy)]
+    enum ReadAction { Refuse, Cancel(DecodeCancellationKind), Panic, Empty }
+    #[derive(Default)]
+    struct Observation { reads: AtomicUsize, drops: AtomicUsize,
+        input_at_drop: AtomicU64, workers_at_read: AtomicU64 }
+    struct Reader { resources: Arc<EngineResources>, observed: Arc<Observation>,
+        action: ReadAction, stop: CancellationToken }
+    impl Drop for Reader {
+        fn drop(&mut self) {
+            let snapshot = self.resources.memory_snapshot();
+            let bytes = snapshot.by_class.get(&MemoryClass::JobBuffers)
+                .map_or(0, |value| value.committed_bytes + value.reserved_bytes);
+            self.observed.input_at_drop.store(bytes, Ordering::SeqCst);
+            self.observed.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl Read for Reader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { self.fill_buf()?; Ok(0) }
+    }
+    impl BufRead for Reader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            self.observed.reads.fetch_add(1, Ordering::SeqCst);
+            let snapshot = self.resources.memory_snapshot();
+            let bytes = snapshot.by_class.get(&MemoryClass::ActivationScratch)
+                .map_or(0, |value| value.committed_bytes);
+            self.observed.workers_at_read.store(bytes, Ordering::SeqCst);
+            match self.action {
+                ReadAction::Refuse => panic!("refused document job read private input"),
+                ReadAction::Panic => panic!("synthetic document input panic"),
+                ReadAction::Cancel(cause) => self.stop.cancel(cause),
+                ReadAction::Empty => (),
+            }
+            Ok(&[])
+        }
+        fn consume(&mut self, _: usize) {}
+    }
+    fn reader(host: &NlpEngine, action: ReadAction, stop: CancellationToken) -> (Reader, Arc<Observation>) {
+        let observed = Arc::new(Observation::default());
+        (Reader { resources: Arc::clone(host.resources()), observed: Arc::clone(&observed), action, stop }, observed)
+    }
+    fn planner(model: &ResidentInt4) -> (Int4SourceDocumentJobPlanner, SourceJobRequest, JobHostLimits) {
+        let (budget, planning, mapping, job, mut host) = fixture();
+        host.preparation_reserve_bytes = PREPARATION;
+        host.native.run.max_elapsed = Duration::from_secs(60);
+        host.native.run.max_checkpoints = 100_000;
+        let controls = crate::tokenizer::pinned_controls::pinned().unwrap();
+        let eos = controls.template_controls().entries().iter()
+            .find(|entry| entry.special && entry.surface == crate::template::IM_END).unwrap().id;
+        let compiler = SourceTaskPlanner::pinned(controls.template_controls(), eos).unwrap();
+        let verification = mapping.verification;
+        let lifetime = Int4SourceDocumentLifetime { verification: GroundingBudget {
+            max_fields: verification.max_fields * job.max_attempts as usize,
+            max_matches: verification.max_matches * job.max_attempts as usize,
+            max_scan_steps: verification.max_scan_steps * job.max_attempts }, summary_scan_steps: 0 };
+        let planner = Int4SourceDocumentJobPlanner::for_model(model.model_identity(), Arc::new(compiler),
+            Int4SourceDocumentTask::Map(SourceMapTask::Ner(Default::default())), budget,
+            planning, mapping, job, lifetime).unwrap();
+        let request = SourceJobRequest { root: PathBuf::from("/nonexistent/fnlp-document-job-team-refusal"),
+            key: JobSecret::from_bytes([3; 32]), job_id: JobId([4; 16]), limits: job,
+            mode: JobOpenMode::Create, materialize: false };
+        (planner, request, host)
+    }
+    fn drained(host: &NlpEngine, baseline: &crate::MemorySnapshot) {
+        assert_eq!(&host.resources().memory_snapshot(), baseline);
+        let closures = host.resources().outstanding_closure_snapshot();
+        assert_eq!(closures.active_closures, 0);
+        assert_eq!(closures.wrapper_cancelled_closures, 0);
+    }
+
+    #[test]
+    #[ignore = "controller-only runtime: tiny weights prove input/admission/drain, never native model or durable-result parity"]
+    fn document_teams_keep_private_storage_charged_and_preserve_terminal_causes() {
+        let host = NlpEngine::builder().resource_config(ResourceHostConfig {
+            runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
+            max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 3,
+            helper_threads: 0, thread_ceiling: 5, memory_ceiling_bytes: 1024 * MIB,
+            leak_response_policy: LeakResponsePolicy::PanicInLabOrCi,
+        }).build().unwrap();
+        let idle = host.resources().memory_snapshot();
+        let lease = host.resources().acquire_lease();
+        let preparation = Pending::reserve(&lease, MemoryClass::JobBuffers, PREPARATION).unwrap().commit().unwrap();
+        let model_lease = host.resources().acquire_lease();
+        let loaded = allocate(Pending::reserve(&model_lease, MemoryClass::Weights, MIB).unwrap(),
+            || Ok(projection_fixture(WIDTH).0)).unwrap();
+        let model = ResidentInt4 { inner: Arc::new(ResidentModel { loaded, lease: model_lease }) };
+        let controls = crate::tokenizer::pinned_controls::pinned().unwrap();
+        let vocabulary = Arc::new(ExtractionVocabulary::pinned(controls.template_controls()).unwrap());
+        let baseline = host.resources().memory_snapshot();
+        use DecodeCancellationKind::*;
+        for width in [2, 4] {
+            for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+                ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+                let (planner, request, limits) = planner(&model);
+                let charge = limits.required_buffer_bytes(request.limits).unwrap();
+                let stop = CancellationToken::default(); stop.cancel(cause);
+                let (reader, observed) = reader(&host, ReadAction::Refuse, stop.clone());
+                let error = host.job_int4_source_document_with_threads(&model, planner, Arc::clone(&vocabulary),
+                    request, limits, MIB, PackedInt4Kernel::scalar(), width, reader, stop).err().unwrap();
+                let HostedJobError::Host(HostedError::Stopped { stop, .. }) = error
+                    else { panic!("document pre-cancellation lost its typed cause"); };
+                assert_eq!(stop.kind, cause);
+                assert_eq!(observed.reads.load(Ordering::SeqCst), 0);
+                assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+                assert!(observed.input_at_drop.load(Ordering::SeqCst) >= PREPARATION + charge);
+                drained(&host, &baseline);
+            }
+        }
+        for width in [0, 1, 5, 65, usize::MAX] {
+            let (planner, request, limits) = planner(&model);
+            let stop = CancellationToken::default();
+            let (reader, observed) = reader(&host, ReadAction::Refuse, stop.clone());
+            let error = host.job_int4_source_document_with_threads(&model, planner, Arc::clone(&vocabulary),
+                request, limits, MIB, PackedInt4Kernel::scalar(), width, reader, stop).err().unwrap();
+            assert!(matches!(error, HostedJobError::Host(HostedError::Limits(_))));
+            assert_eq!(observed.reads.load(Ordering::SeqCst), 0); drained(&host, &baseline);
+        }
+        for action in [ReadAction::Cancel(Deadline), ReadAction::Panic, ReadAction::Empty] {
+            let (planner, request, limits) = planner(&model);
+            let charge = limits.required_buffer_bytes(request.limits).unwrap();
+            let stop = CancellationToken::default();
+            let (reader, observed) = reader(&host, action, stop.clone());
+            let error = host.job_int4_source_document_with_threads(&model, planner, Arc::clone(&vocabulary),
+                request, limits, MIB, PackedInt4Kernel::scalar(), 4, reader, stop).err().unwrap();
+            match action {
+                ReadAction::Cancel(cause) => {
+                    let HostedJobError::Host(HostedError::Stopped { stop, .. }) = error
+                        else { panic!("document reader cancellation lost its typed cause"); };
+                    assert_eq!(stop.kind, cause);
+                }
+                ReadAction::Panic => assert!(matches!(error,
+                    HostedJobError::Host(HostedError::Panicked | HostedError::Scope { .. }))),
+                ReadAction::Empty => assert!(matches!(error,
+                    HostedJobError::Job(JobRunError::Storage(JobError::InvalidInput)))),
+                ReadAction::Refuse => unreachable!(),
+            }
+            assert_eq!(observed.reads.load(Ordering::SeqCst), 1);
+            assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+            assert!(observed.workers_at_read.load(Ordering::SeqCst)
+                >= int4_task_team_workspace_bytes(4, WIDTH).unwrap());
+            assert!(observed.input_at_drop.load(Ordering::SeqCst) >= PREPARATION + charge);
+            drained(&host, &baseline);
+        }
+        drop(vocabulary); drop(model); drop(preparation); drop(lease);
+        drained(&host, &idle);
+    }
 }
 
 #[test]

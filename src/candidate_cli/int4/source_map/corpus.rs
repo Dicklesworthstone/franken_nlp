@@ -91,14 +91,16 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
         .mut_arg("max_checkpoints", |arg| arg.help("Nonrenewable cooperative checkpoint allowance for the ENTIRE stream"));
     let command = StreamArgs::augment_args(question::QuestionPolicyArgs::augment_args(
         question::synthesis::SynthesisArgs::augment_args(MappingArgs::augment_args(command))));
-    encoding::population_definition(command)
+    let command = compute::definition(encoding::population_definition(command))
         .mut_arg("max_map_result_bytes", |arg| arg.help("Complete semantic answer document cap; transport and provenance framing are separate"))
         .mut_arg("max_total_mask_node_visits", |arg| arg.help("Complete-document mask allowance spanning discovery and optional synthesis"))
         .mut_arg("max_forward_positions", |arg| arg.help("Whole-stream forward ceiling across every document and synthesis pass"))
         .mut_arg("max_projected_logits", |arg| arg.help("Whole-stream full-vocabulary projection ceiling"))
         .mut_arg("max_attention_pairs", |arg| arg.help("Whole-stream attention-pair ceiling"))
         .mut_arg("max_dot_products", |arg| arg.help("Whole-stream native grouped dot-product ceiling"))
-        .mut_arg("max_multiply_accumulates", |arg| arg.help("Whole-stream multiply-accumulate ceiling"))
+        .mut_arg("max_multiply_accumulates", |arg| arg.help("Whole-stream multiply-accumulate ceiling"));
+    let details = command.get_after_long_help().map(|help| help.to_string()).unwrap_or_default();
+    command.after_long_help(format!("{details}\n\n--compute-threads N selects one persistent output-row team for the entire question stream. Width 1 is serial; widths 2..64 preserve each record's exact question, complete source, independent context and all existing semantic results. One worker workspace and the full process thread envelope are admitted before IO. The same team serves discovery, optional synthesis and every hierarchy level. run_complete is published after every worker joins under the original deadline. Teams cannot combine with chunk/hierarchy cohorts or --prefill-rows. Compact safe-bpe-v1 remains available for independent question maps; neural continuations retain their byte-only contract."))
 }
 
 #[derive(Clone, Copy)]
@@ -131,8 +133,14 @@ impl CorpusArgs {
             !self.synthesis.flat.synthesize_answer, true)?;
         let mut storage = args.clone();
         storage.input_encoding = input_encoding::InputEncodingArgs::default();
-        let mut common = self.source.validate(&storage)?;
         let s = self.stream;
+        let threaded = args.compute.threads() != 1;
+        if threaded && (args.prefill()?.is_some() || s.cohort_chunks.is_some()
+            || s.cohort_hierarchy_groups.is_some()) {
+            return Err(CandidateError::Arguments);
+        }
+        let mut common = if threaded { self.source.validate_batch_with_prefill(&storage)? }
+            else { self.source.validate(&storage)? };
         self.mapping.validate(args, &self.source, common, s.cohort_chunks)?;
         self.synthesis.validate()?;
         let verification = self.policy.verification()?;
@@ -194,7 +202,7 @@ impl CorpusArgs {
             hierarchy_groups: s.cohort_hierarchy_groups }
             .requirements(args.group_width, config, transport).map_err(|_| CandidateError::Arguments)?;
         let execution = sum(&[memory.native.kv_bytes, memory.workspace_bytes, memory.input_bytes,
-            memory.document_workspace_bytes, memory.output_reservation_bytes])?;
+            memory.document_workspace_bytes, memory.output_reservation_bytes, common.compute.workspace_bytes])?;
         common.minimum_memory_bytes = sum(&[grouped_memory_floor(args, common, execution)?, io_bytes])?;
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(CorpusLimits { common, config, encoding, transport, memory, reduction_reserve_bytes,

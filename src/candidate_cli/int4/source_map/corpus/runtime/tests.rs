@@ -47,7 +47,37 @@ fn provenance(synthesis: bool, chunks: Option<usize>) -> Provenance<'static> {
         model_id: "Nanbeige4.2-3B", source_revision: "fixture-public-revision",
         source_root_sha256: "fixture-public-source", model_content_sha256: "fixture-public-model",
         candidate_format: "fixture-public-format", quant_recipe: "fixture-grouped-int4",
-        group_width: 128, integer_kernel: "s_scalar_i32", snapshot: None }
+        group_width: 128, integer_kernel: "s_scalar_i32", snapshot: None, compute_schedule: None }
+}
+
+#[test]
+fn selected_team_metadata_is_physical_only_and_never_claims_unobserved_work() {
+    let mut metadata = provenance(true, None);
+    let serial = serde_json::to_value(&metadata).unwrap();
+    assert!(serial.get("compute_schedule").is_none());
+    metadata.compute_schedule = compute::Schedule::for_threads(4);
+    let mut parallel = serde_json::to_value(&metadata).unwrap();
+    assert_eq!(parallel.as_object_mut().unwrap().remove("compute_schedule"),
+        Some(serde_json::json!({"execution":"int4-output-row-team-v1", "declared_compute_threads":4})));
+    assert_eq!(parallel, serial);
+}
+
+#[test]
+fn question_team_quote_remains_scalar_native_and_selects_the_complete_host_thread_envelope() {
+    for mode in [&[][..], &["--synthesize-answer"][..],
+        &["--synthesize-answer", "--hierarchical-answer"][..]] {
+        let mut flags = mode.to_vec(); flags.extend_from_slice(&["--compute-threads", "3"]);
+        let (command, args) = arguments(&flags);
+        let limits = command.validate(&args).unwrap();
+        let quoted = crate::hosted::int4_question_document_corpus_requirements(args.group_width,
+            limits.config, host_limits(&args, limits, Duration::from_secs(19)),
+            limits.reduction_reserve_bytes, None, None).unwrap();
+        assert_eq!(quoted, limits.memory);
+        assert_eq!(quoted.native, limits.common.native);
+        let host = compute::resource_config(limits.common);
+        assert_eq!(host.scoped_cpu_children_per_coordinator, 2);
+        assert_eq!(host.thread_ceiling, 4);
+    }
 }
 
 #[test]

@@ -110,7 +110,8 @@ pub(super) fn definitions() -> Vec<clap::Command> {
     }).collect()
 }
 pub(super) fn document_job_definitions() -> Vec<clap::Command> {
-    definitions_with_cohorts(true).into_iter().map(encoding::population_definition).collect()
+    definitions_with_cohorts(true).into_iter().map(encoding::population_definition)
+        .map(compute::definition).collect()
 }
 fn definitions_with_cohorts(cohorts: bool) -> Vec<clap::Command> {
     [(Kind::Ner, "ner-map"), (Kind::Keyphrases, "keyphrases-map"),
@@ -203,8 +204,7 @@ impl MapArgs {
     fn validate_mode(&self, args: &Int4Args, map_only: bool, document_job: bool) -> Result<MapLimits, CandidateError> {
         let m = self.mapping;
         let threaded = args.compute.threads() != 1;
-        if threaded && (document_job || map_only
-            || self.cohort_chunks.is_some() || self.cohort_hierarchy_groups.is_some()) {
+        if threaded && (self.cohort_chunks.is_some() || self.cohort_hierarchy_groups.is_some()) {
             return Err(CandidateError::Arguments);
         }
         let encoding = m.encoding.limits(args, &m,

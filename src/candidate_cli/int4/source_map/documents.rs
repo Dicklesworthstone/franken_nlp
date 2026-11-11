@@ -66,6 +66,7 @@ pub(in crate::candidate_cli::int4) fn definitions() -> Vec<clap::Command> {
 fn all_definitions() -> Vec<clap::Command> {
     ["ner-corpus", "keyphrases-corpus", "summarize-corpus", "answer-corpus"]
         .into_iter().zip(super::document_job_definitions()).map(|(name, command)| {
+            let details = command.get_after_long_help().map(|help| help.to_string()).unwrap_or_default();
             StreamArgs::augment_args(command.name(name)
                 .about("Stream complete original documents through one resident source-task pipeline")
                 .long_about("Process strict {id,text,task_args?} NDJSON and exact {\"flush\":true} controls with one resident grouped-INT4 model. text is the COMPLETE original document. --options fixes the per-chunk task options; source-corpus answer also requires one exact --question FILE for the entire stream. task_args must be absent, null or an empty object. Every document is losslessly chunked and fully preflighted before its first native forward. NER and default keyphrases retain independent source-grounded chunk results. --reduce-keyphrases preserves the complete candidate union and applies global ranking once. Summaries default to an exact cited-bullet union; --synthesize-summary and --hierarchical-summary select the existing explicit neural pipelines. Answer defaults to question-aware chunk answers; --synthesize-answer and --hierarchical-answer select their evidence-based synthesis pipelines. Every selected pass belongs to one atomic document result. --cohort-chunks shares native layers within each document. Independently, --cohort-hierarchy-groups shares native layers across independent groups in each explicitly enabled hierarchy level. All five native work flags bound the ENTIRE stream. Separate --max-run-mask-node-visits, --max-run-source-* and reducer scan ceilings remain nonrenewable across documents, failures and flush controls. All allowed synthesis passes are reserved before discovery. Completed events include public candidate provenance and the selected mode/schedules. Require run_complete AND exit 0 for whole-run success; earlier completed documents remain valid after later failure. Source conversion and independently pinned snapshots use the same route. Optional snapshot saving follows fixed task/model/envelope admission and may remain after a later row fails. Hierarchies are explicitly lossy; source membership does not establish semantic entailment. No retained job, input spool, per-row options/question overrides, selected-row projection, prompt prefill, cross-document cohorts, sampling or repair retry. Blocking IO observes one end-to-end deadline cooperatively.")
@@ -79,6 +80,7 @@ fn all_definitions() -> Vec<clap::Command> {
                 .mut_arg("max_attention_pairs", |arg| arg.help("Whole-stream attention-pair ceiling"))
                 .mut_arg("max_dot_products", |arg| arg.help("Whole-stream grouped native dot-product ceiling"))
                 .mut_arg("max_multiply_accumulates", |arg| arg.help("Whole-stream multiply-accumulate ceiling")))
+                .after_long_help(format!("{details}\n\n--compute-threads N selects one persistent output-row team for the entire stream, across every complete document, neural continuation and flush. Width 1 is serial; widths 2..64 preserve the same semantic document and nonrenewable work, mask and verification budgets. One worker workspace and the full process thread envelope are admitted before IO. run_complete is delivered only after workers join. This selection cannot combine with --cohort-chunks, --cohort-hierarchy-groups or --prefill-rows. Explicit safe-bpe-v1 remains available for the same supported document modes."))
         }).collect()
 }
 
@@ -173,7 +175,7 @@ impl CorpusArgs {
         let native = document.cohort.map_or(common.native, |quote| quote.native);
         let execution_bytes = sum(&[native.kv_bytes, native.rope_bytes, native.scratch_payload_bound,
             ALLOCATOR_BYTES, document.cohort.map_or(0, |quote| quote.workspace_bytes),
-            input_bytes, document.workspace_bytes, output_reservation_bytes])?;
+            input_bytes, document.workspace_bytes, output_reservation_bytes, common.compute.workspace_bytes])?;
         common.minimum_memory_bytes = sum(&[grouped_memory_floor(args, common, execution_bytes)?, io_bytes])?;
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(CorpusLimits { common, document, transport, run, execution_bytes, retained_defaults_bytes,

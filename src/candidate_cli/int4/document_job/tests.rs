@@ -64,6 +64,51 @@ fn every_document_mode_supports_start_resume_and_preserves_distinct_semantics() 
         }
     }
 }
+
+#[test]
+fn persistent_document_job_width_prices_only_worker_scratch_and_keeps_durable_limits() {
+    for &(task, flags, mode) in MODES {
+        let (serial, serial_args) = command("start", task, flags);
+        let original = serial.args.validate(&serial_args).unwrap();
+        let fixed = lifetime(&serial_args, original);
+        let serial_job = serial.args.lifetime_limits(&serial_args, original, fixed).unwrap();
+        for operation in ["start", "resume"] {
+            for width in ["2", "4"] {
+                let mut flags = flags.to_vec(); flags.extend(["--compute-threads", width]);
+                let (c, args) = command(operation, task, &flags);
+                let map = c.args.validate(&args).unwrap();
+                let threaded = c.args.lifetime_limits(&args, map, fixed).unwrap();
+                assert_eq!(c.args.mode_name(map), mode);
+                assert_eq!(map.common.compute.threads, width.parse::<usize>().unwrap());
+                assert_eq!(map.common.minimum_memory_bytes - original.common.minimum_memory_bytes,
+                    map.common.compute.workspace_bytes);
+                assert_eq!(threaded.map.common.minimum_memory_bytes - serial_job.map.common.minimum_memory_bytes,
+                    map.common.compute.workspace_bytes);
+                assert_eq!(threaded.buffer_bytes, serial_job.buffer_bytes);
+                assert_eq!(map.mapping.chunks, original.mapping.chunks);
+                assert_eq!(map.mapping.max_model_work, original.mapping.max_model_work);
+                assert_eq!(map.mapping.max_mask_visits, original.mapping.max_mask_visits);
+                assert_eq!(map.mapping.verification, original.mapping.verification);
+                assert_eq!(map.workspace_bytes, original.workspace_bytes);
+                assert_eq!(map.max_result_bytes, original.max_result_bytes);
+                assert!(map.cohort.is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_team_or_competing_cohorts_refuse_before_document_job_io() {
+    for &(task, flags, _) in MODES {
+        for extra in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+            vec!["--compute-threads", "2", "--cohort-chunks", "1"]] {
+            let mut all = flags.to_vec(); all.extend(extra);
+            let (c, args) = command("resume", task, &all);
+            let error = c.execute_owned(args, NoIo, &mut NoIo).unwrap_err();
+            assert_eq!(error.exit, ErrorCode::Usage);
+        }
+    }
+}
 #[test]
 fn independently_pinned_snapshots_preserve_complete_document_admission() {
     for &(task, flags, mode) in MODES {

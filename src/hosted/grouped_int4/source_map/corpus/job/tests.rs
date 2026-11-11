@@ -197,7 +197,24 @@ fn private_planner_request_reader_and_guards_cross_the_owned_send_boundary() {
     send::<SourceJobRequest>();
     send::<QuestionJobInput<Cursor<Vec<u8>>>>();
     send::<Charged<QuestionJobInput<Cursor<Vec<u8>>>>>();
+    send::<QuestionJobExecution<Cursor<Vec<u8>>>>();
     let _host = NlpEngine::job_int4_question_documents::<Cursor<Vec<u8>>>;
+    let _threaded = NlpEngine::job_int4_question_documents_with_threads::<Cursor<Vec<u8>>>;
+}
+
+#[test]
+fn numerical_team_keeps_all_question_modes_and_rejects_native_cohort_mixtures() {
+    for mode in 0..3 {
+        let (mut config, _, _) = fixture(mode);
+        for threads in [2, 4] {
+            assert!(check_question_team_schedule(Some(threads), false, config).is_ok());
+            assert!(check_question_team_schedule(Some(threads), true, config).is_err());
+            config.mapping.reduction.map_batch_chunks = 2;
+            assert!(check_question_team_schedule(Some(threads), false, config).is_err());
+            assert!(check_question_team_schedule(None, true, config).is_ok());
+            config.mapping.reduction.map_batch_chunks = 1;
+        }
+    }
 }
 
 #[test]

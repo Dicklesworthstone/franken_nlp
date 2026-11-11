@@ -212,7 +212,7 @@ fn unsupported_source_team_widths_and_schedules_refuse_before_private_io() {
         }
     }
     for command in document_job_definitions().into_iter().chain(documents::definitions()) {
-        assert!(!command.get_arguments().any(|arg| arg.get_id() == "compute_threads"));
+        assert!(command.get_arguments().any(|arg| arg.get_id() == "compute_threads"));
     }
     let answer = definitions().into_iter().find(|command| command.get_name() == "answer-map").unwrap();
     assert!(answer.get_arguments().any(|arg| arg.get_id() == "compute_threads"));

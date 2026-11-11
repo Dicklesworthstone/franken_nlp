@@ -3429,6 +3429,20 @@ Durable document jobs reuse the same storage-neutral task/planning/backend
 code and preserve their original authenticated recipe bytes. See
 [resident complete-source task corpora](docs/source-corpus.md) for input,
 limits, mode selection, source/snapshot acquisition and library details.
+
+These complete-source corpora and per-record `answer-corpus` also accept
+`--compute-threads 2..=64`. One persistent INT4 output-row team serves all
+documents, maps, exact reducers and selected synthesis/hierarchy passes under
+the same bounded invocation. The thread width changes physical execution;
+it does not increase context or renew native, mask, tokenizer or verification
+allowances. Admission includes worker scratch exactly once, and terminal
+`run_complete` waits for physical worker join. Public `compute_schedule`
+provenance reports the selected width; semantic records remain unchanged.
+Width `1` keeps the serial route. Teams cannot combine with either chunk or
+hierarchy-group cohorts. Library callers use
+`batch_int4_source_documents_with_threads` or
+`batch_int4_question_documents_with_threads` with a compatible process envelope.
+
 Compilation, tests and native qualification remain pending the required DSR
 production gate.
 
@@ -3587,6 +3601,27 @@ the same original flags, and existing serial jobs omit both. Stdout reports
 only declared `chunk_schedule` and `hierarchy_schedule` metadata; stored results
 retain their original semantic envelope and contain no physical-statistics
 wrapper. See [durable document cohorts](docs/int4-structured-cohorts.md#durable-complete-document-cohorts).
+
+Alternatively, `--compute-threads 2..=64` keeps one persistent INT4 output-row
+team through a whole `document-job` invocation, covering every pending item,
+map, exact reducer and permitted neural synthesis/hierarchy pass. The same
+option is available on `answer-document-job` for per-record questions. Team
+execution refuses chunk and hierarchy-group cohorts before private IO and
+reserves its worker scratch once alongside the complete job envelope.
+Width `1` uses the existing serial path. Compact input remains available on
+its supported map/reducer modes; synthesis and hierarchies remain byte-input.
+
+Compute width is physical scheduling and stays outside the authenticated
+semantic recipe. Explicit resume may choose a different compatible width
+without changing stored results or replenishing durable work or attempts.
+The matching library entrypoints are `job_int4_source_document_with_threads`
+and `job_int4_question_documents_with_threads`. A successful return and public
+completion report follow worker drain. If cancellation or output failure
+occurs after durable progress, authenticated resume reconciles that progress;
+it is not rolled back. Public metadata adds only `compute_schedule`, and the
+stored semantic envelopes remain unchanged. These team routes await the same
+DSR, model-parity and target-host performance gates as the individual-document
+team implementations.
 
 The input is the **complete original NDJSON population on every invocation**,
 including committed records when resuming:

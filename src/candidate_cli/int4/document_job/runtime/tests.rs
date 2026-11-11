@@ -175,7 +175,7 @@ fn metadata_reports_whole_document_progress_without_private_source_question_or_q
         model_content_sha256: &content, candidate_format: "fixture-candidate-format", quant_recipe: "fixture-grouped-int4",
         group_width: args.group_width, integer_kernel: map.common.kernel.kind().id(),
         snapshot: Some(SnapshotRecord::new("loaded", map.common.snapshot_need)), chunk_schedule: None,
-        hierarchy_schedule: None, output: &report,
+        hierarchy_schedule: None, compute_schedule: None, output: &report,
     };
     let mut bytes = Vec::new(); publish(&response, job_cli::REPORT_BYTES, &mut bytes).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -186,6 +186,7 @@ fn metadata_reports_whole_document_progress_without_private_source_question_or_q
     assert_eq!(value["output"]["reserved_work"], serde_json::to_value(fixed.max_work).unwrap());
     assert!(value.get("chunk_schedule").is_none());
     assert!(value.get("hierarchy_schedule").is_none());
+    assert!(value.get("compute_schedule").is_none());
     for forbidden in ["text", "question", "quotes", "citations", "recipe", "options", "key", "job_dir", "results"] {
         assert!(value.get(forbidden).is_none()); assert!(value["output"].get(forbidden).is_none());
     }
@@ -215,5 +216,36 @@ fn metadata_reports_whole_document_progress_without_private_source_question_or_q
                 "phase": "discovery", "declared_max_chunks": 2 }));
         }
         assert_eq!(grouped, value, "declared schedules cannot alter durable progress or publish actual phase statistics");
+    }
+    response.chunk_schedule = None;
+    response.hierarchy_schedule = None;
+    for threads in [2, 4] {
+        response.compute_schedule = compute::Schedule::for_threads(threads);
+        let mut threaded = serde_json::to_value(&response).unwrap();
+        let schedule = threaded.as_object_mut().unwrap().remove("compute_schedule").unwrap();
+        assert_eq!(schedule, serde_json::json!({ "execution": "int4-output-row-team-v1",
+            "declared_compute_threads": threads }));
+        assert_eq!(threaded, value, "physical width cannot alter durable progress or semantic metadata");
+    }
+}
+
+#[test]
+fn document_report_keeps_the_original_deadline_through_serialization_and_flush() {
+    use std::cell::Cell;
+    for stop_at in [2, 3] {
+        let checks = Cell::new(0);
+        let remaining = || {
+            checks.set(checks.get() + 1);
+            if checks.get() == stop_at { Err(CandidateError::Timeout) }
+            else { Ok(Duration::from_secs(1)) }
+        };
+        let mut output = Vec::new();
+        let error = publish_report(&serde_json::json!({"status":"complete"}),
+            &mut output, &remaining).unwrap_err();
+        assert_eq!(error.exit, ErrorCode::BudgetOrTimeout);
+        if stop_at == 2 { assert!(output.is_empty()); }
+        else {
+            assert_eq!(output.iter().filter(|&&byte| byte == b'\n').count(), 1);
+        }
     }
 }

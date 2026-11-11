@@ -150,6 +150,23 @@ question-synthesis or question-hierarchy wire shape. Public candidate provenance
 records the answer mode, discovery schedule and optional hierarchy schedule;
 physical scheduling does not replace the semantic result with a wrapper.
 
+Alternatively, `--compute-threads 2..=64` keeps one persistent output-row team
+through the entire bounded stream, including every question's discovery,
+optional flat synthesis, hierarchy levels and flushes. Width `1` retains the
+serial default. Team execution refuses either cohort flag before private IO;
+it does not silently choose between schedules. Add `--compute-threads 4` to
+any example after removing its cohort flags. Independent-answer maps may
+combine the team with their existing compact-input policy; neural synthesis
+and hierarchies retain their byte-input restriction.
+
+Worker scratch is quoted and reserved exactly once in addition to native KV,
+question/evidence frontiers and output ownership. The team changes the physical
+row schedule without changing question identity, original coordinates or any
+whole-run allowance. Provenance adds `compute_schedule`; serial events and
+semantic `record` payloads keep their existing shapes. Terminal success is
+published only after workers join, under the original deadline and cancellation
+state. Native parity and target-host performance still require their named gates.
+
 ## Bounds and whole-run accounting
 
 These input ceilings have separate meanings:
@@ -247,6 +264,11 @@ owned reader/writer, `CorpusLimits`, reduction reserve, kernel and cancellation
 token. `hosted::int4_question_document_corpus_requirements` exposes the same pure
 quote used by the command. Neither API requires metadata-store or invents a
 durable population contract.
+
+`NlpEngine::batch_int4_question_documents_with_threads` additionally takes the
+explicit compute width and requires a compatible installed process envelope.
+The dispatcher owns the single additional worker-scratch reservation and
+drains the team before final protocol publication.
 
 ## Authenticated durable populations
 

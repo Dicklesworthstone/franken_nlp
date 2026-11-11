@@ -125,6 +125,21 @@ decoder layers across independent discovery chunks within a document.
 groups in an explicitly enabled hierarchy level. Discovery remains serial
 unless its own cohort flag is supplied.
 
+`--compute-threads 2..=64` selects one persistent INT4 output-row team for the
+whole bounded invocation. The coordinator and workers serve every document,
+map, exact reducer and selected neural synthesis or hierarchy pass, including
+across flush boundaries. Documents still finish in input order. Width `1`
+keeps the existing serial route. This physical schedule preserves each row's
+arithmetic, semantic identity and cumulative work limits; it cannot combine
+with chunk cohorts or hierarchy-group cohorts.
+
+For example, add `--compute-threads 4` to a corpus command without either
+cohort flag. Compact `safe-bpe-v1` input can use the team on its existing
+supported map/reducer modes. Neural synthesis and hierarchies retain their
+existing byte-input restriction. One additional worker-workspace reservation
+is admitted before private IO and stays charged through physical worker join;
+the native KV/context and complete evidence-frontier charges remain separate.
+
 Each row keeps its own prompt, grammar, source language, causal state and
 typed finalizer. The complete current level finishes before the next level
 starts. Chunks and hierarchy groups do not become partial results or durable
@@ -133,7 +148,7 @@ neither changes the semantic document envelope.
 
 The host reserves the complete declared native phase peak and decoder
 workspace before execution. It uses the existing native kernels and closed
-serial/cohort backends; no caller-supplied executor or automatic schedule
+serial/cohort/team backends; no caller-supplied executor or automatic schedule
 selection participates.
 
 ## Nonrenewable work and memory
@@ -189,6 +204,12 @@ remain valid if a later record or terminal write fails. Guarded output,
 reader/writer ownership and native reservations survive delivery and physical
 cleanup. There is no retained job or implicit input spool.
 
+Explicit teams add `compute_schedule` to public provenance, with the selected
+schedule and declared width. The semantic `record` stays unchanged, and serial
+events omit this field. Terminal `run_complete` is deferred until every worker
+has joined; cancellation or a failed terminal write still makes the invocation
+fail. No measured speed or projection-count claim follows from selecting a team.
+
 Library callers use:
 
 - `batch::source::grouped_int4::document::Int4SourceDocumentBatchPlanner`
@@ -198,6 +219,8 @@ Library callers use:
 - `hosted::int4_source_document_corpus_requirements` for the pure complete
   memory quote.
 - `NlpEngine::batch_int4_source_documents` for one owned resident stream.
+- `NlpEngine::batch_int4_source_documents_with_threads` for the same stream
+  with a compatible installed process thread envelope and one persistent team.
 
 The durable source-document runner reuses the same task representation,
 native planning, receipt verification, execution backend, workspace formulas

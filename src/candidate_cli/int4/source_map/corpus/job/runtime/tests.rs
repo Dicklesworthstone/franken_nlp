@@ -75,14 +75,14 @@ fn public_question_job_modes_are_explicit_and_private_question_content_is_absent
         let common = command.args.validate(&args).unwrap();
         let limits = command.args.lifetime_limits(&args, common, AnswerOptions::default(), job).unwrap();
         assert_eq!(answer_mode(limits.config), expected);
-        let response = Response { protocol: "fnlp-candidate-int4-answer-document-job-v1", schema_version: 1,
+        let mut response = Response { protocol: "fnlp-candidate-int4-answer-document-job-v1", schema_version: 1,
             scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "answer",
             durable_unit: "complete_original_source_question", question_source: "per_record",
             answer_mode: expected, model_id: "Nanbeige4.2-3B", source_revision: "public-revision",
             source_root_sha256: "public-source", model_content_sha256: "public-model",
             candidate_format: "candidate", quant_recipe: "fixed", group_width: 128,
             integer_kernel: "s_scalar_i32", snapshot: None, cohort_chunks: None,
-            cohort_hierarchy_groups: None, output: &serde_json::json!({"completed":2}) };
+            cohort_hierarchy_groups: None, compute_schedule: None, output: &serde_json::json!({"completed":2}) };
         let encoded = serde_json::to_string(&response).unwrap();
         assert!(!encoded.contains("/private/"));
         assert!(!encoded.contains("task_args"));
@@ -90,5 +90,13 @@ fn public_question_job_modes_are_explicit_and_private_question_content_is_absent
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(value["question_source"], "per_record");
         assert_eq!(value["answer_mode"], expected);
+        assert!(value.get("compute_schedule").is_none());
+        for threads in [2, 4] {
+            response.compute_schedule = compute::Schedule::for_threads(threads);
+            let mut threaded = serde_json::to_value(&response).unwrap();
+            assert_eq!(threaded.as_object_mut().unwrap().remove("compute_schedule").unwrap(),
+                serde_json::json!({ "execution": "int4-output-row-team-v1", "declared_compute_threads": threads }));
+            assert_eq!(threaded, value, "physical scheduling cannot alter retained semantics");
+        }
     }
 }

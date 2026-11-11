@@ -2,7 +2,7 @@
 use super::*;
 use std::{sync::Arc, time::{Duration, Instant}};
 use crate::{
-    NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
+    NlpEngine, MemoryClass,
     batch::source::grouped_int4::question::Int4QuestionDocumentBatchPlanner,
     candidate_cli::runtime::owned_jobs::{host_failure, job_failure, open_mode, progress_report},
     hosted::{CancellationToken, HostedError, Int4HostError, NativeLimits, RunLimits,
@@ -22,12 +22,8 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
-    let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
-        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: declared.memory_bytes,
-        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
-    }).build().map_err(|_| CandidateError::Runtime)?;
+    let engine = NlpEngine::builder().resource_config(compute::resource_config(declared))
+        .build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
     let preparation = sum(&[declared.preparation_bytes,
         2 * IO_BUFFER_BYTES as u64, job_cli::REPORT_BYTES as u64])?;
@@ -91,9 +87,14 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     let materialize = job.storage.materialize;
     let request = SourceJobRequest { root: job.storage.job_dir, key, job_id, limits: lifetime,
         mode: open_mode(mode, job.storage.input_retention)?, materialize };
-    let progress = engine.job_int4_question_documents(&model, planner, Arc::new(vocabulary), request,
-        host_limits(&args, limits, remaining()?), limits.reduction_reserve_bytes,
-        common.kernel, reader, cancellation).map_err(|error| match error {
+    let host = host_limits(&args, limits, remaining()?);
+    let progress = if common.compute.threads == 1 {
+        engine.job_int4_question_documents(&model, planner, Arc::new(vocabulary), request,
+            host, limits.reduction_reserve_bytes, common.kernel, reader, cancellation)
+    } else {
+        engine.job_int4_question_documents_with_threads(&model, planner, Arc::new(vocabulary), request,
+            host, limits.reduction_reserve_bytes, common.kernel, common.compute.threads, reader, cancellation)
+    }.map_err(|error| match error {
             HostedJobError::Host(error) => model_failure(error), other => host_failure(other),
         })?;
     remaining()?;
@@ -107,7 +108,8 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
         model_content_sha256: &content, candidate_format: &identity.artifact_format,
         quant_recipe: &identity.quant_recipe, group_width: model.model_identity().group_width(),
         integer_kernel: common.kernel.kind().id(), snapshot, cohort_chunks: job.questions.cohort_chunks,
-        cohort_hierarchy_groups: job.questions.cohort_hierarchy_groups, output: &report };
+        cohort_hierarchy_groups: job.questions.cohort_hierarchy_groups,
+        compute_schedule: compute::Schedule::for_threads(common.compute.threads), output: &report };
     let response = encoding::population_response(response, limits.encoding);
     publish_report(&response, output, &remaining)
 }
@@ -183,6 +185,8 @@ struct Response<'a, T: Serialize> {
     cohort_chunks: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cohort_hierarchy_groups: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compute_schedule: Option<compute::Schedule>,
     output: &'a T,
 }
 
