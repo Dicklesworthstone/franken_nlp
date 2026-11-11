@@ -1,7 +1,7 @@
 use std::{
     ffi::OsString,
     fs,
-    io::{self, BufRead, IsTerminal, Read, Write},
+    io::{self, BufRead, IsTerminal, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -117,8 +117,8 @@ struct ConvertCommand {
     /// Canonical artifact target; only `generic` is admitted.
     #[arg(long)]
     arch: String,
-    /// Final canonical `.fnlpq` destination; no final-path entry is created
-    /// until a complete staged streaming envelope is ready to publish.
+    /// Final canonical `.fnlpq` destination. Reruns verify the complete canonical
+    /// conversion before completing or reusing its exact receipt; never overwrites.
     #[arg(short = 'o', long)]
     output: PathBuf,
     /// Exact lowercase Git commit that built this converter binary, retained
@@ -1086,9 +1086,10 @@ fn run_streaming_convert(
     prepared: &PreparedConversionInput,
     generic: &GenericPayloadPlan,
 ) -> ExitCode {
-    if let Err(error) = ensure_conversion_destinations_absent(&request.output) {
-        return emit_streaming_refusal(request, "preflight-output", error);
-    }
+    let existing = match inspect_conversion_destinations(&request.output) {
+        Ok(existing) => existing,
+        Err(error) => return emit_streaming_refusal(request, "preflight-output", error),
+    };
     eprintln!(
         "CONVERT STAGE=plan RESULT=START tensors={}",
         prepared.tensor_count()
@@ -1108,6 +1109,70 @@ fn run_streaming_convert(
         plan.input.sections.len(),
     );
     emit_convert_robot_stage(request, "plan", "END");
+    if let Some(mut existing) = existing {
+        eprintln!(
+            "CONVERT STAGE=recovery RESULT=START destination={}",
+            request.output.display(),
+        );
+        emit_convert_robot_stage(request, "recovery", "START");
+        let (written, artifact_raw_sha256) = match replay_conversion_artifact(
+            &mut existing,
+            &plan.input,
+            |section, sink| {
+                emit_streaming_section(
+                    &request.source_dir,
+                    prepared,
+                    generic,
+                    &materialized,
+                    section,
+                    sink,
+                )
+            },
+        ) {
+            Ok(value) => value,
+            Err(error) => return emit_streaming_refusal(request, "recovery-replay", error),
+        };
+        let reload_file = match existing.try_clone() {
+            Ok(file) => file,
+            Err(error) => return emit_streaming_refusal(request, "recovery-reload", error),
+        };
+        let reloaded = match FnlpqRangeReader::from_file_with_checkpoint(reload_file, || None) {
+            Ok(artifact) => artifact,
+            Err(error) => return emit_streaming_refusal(request, "recovery-reload", error),
+        };
+        if let Err(error) = verify_reloaded_conversion(&reloaded, prepared, &plan, &written) {
+            return emit_streaming_refusal(request, "recovery-reload", error);
+        }
+        drop(reloaded);
+        if let Err(error) = check_conversion_file(&existing, &request.output, written.file_len) {
+            return emit_streaming_refusal(request, "recovery-path", error);
+        }
+        let receipt = match write_conversion_receipt_sidecar(
+            request,
+            prepared,
+            &plan,
+            &written,
+            &artifact_raw_sha256,
+        ) {
+            Ok(value) => value,
+            Err(error) => return emit_streaming_refusal(request, "receipt", error),
+        };
+        eprintln!(
+            "CONVERT STAGE=recovery RESULT=PASS destination={} artifact-bytes={}",
+            request.output.display(),
+            written.file_len,
+        );
+        emit_convert_robot_stage(request, "recovery", "PASS");
+        emit_convert_robot_stage(request, "receipt", "PASS");
+        return emit_converted_unqualified(
+            &request.output,
+            None,
+            prepared,
+            &written,
+            &artifact_raw_sha256,
+            &receipt,
+        );
+    }
     let (staging_path, mut output) = match create_conversion_stage(&request.output) {
         Ok(stage) => stage,
         Err(error) => return emit_streaming_refusal(request, "create-staging", error),
@@ -1194,13 +1259,16 @@ fn run_streaming_convert(
     eprintln!(
         "CONVERT STAGE=receipt RESULT=PASS destination={} staging-receipt={} receipt-sha256={}",
         receipt.destination.display(),
-        receipt.staging_path.display(),
+        receipt.staging_path.as_ref().map_or_else(
+            || "none".to_owned(),
+            |path| path.display().to_string(),
+        ),
         receipt.sha256,
     );
     emit_convert_robot_stage(request, "receipt", "PASS");
     emit_converted_unqualified(
         &request.output,
-        &staging_path,
+        Some(&staging_path),
         prepared,
         &written,
         &artifact_raw_sha256,
@@ -1292,29 +1360,148 @@ fn verify_reloaded_conversion(
     Ok(())
 }
 
-/// Keep explicit artifact and receipt final names unoccupied before the
-/// expensive source traversal.  Publish repeats no-clobber enforcement to
-/// fail closed if another process races this read-only preflight.
-fn ensure_conversion_destinations_absent(destination: &Path) -> Result<(), String> {
+/// Retain an existing explicit artifact for a bounded, read-only canonical
+/// replay. A receipt without its artifact cannot authorize a new conversion.
+/// Final publication still uses no-clobber hard links.
+fn inspect_conversion_destinations(destination: &Path) -> Result<Option<fs::File>, String> {
+    let artifact = open_existing_conversion_file(destination)?;
     let receipt = conversion_receipt_path(destination)?;
-    for path in [destination, receipt.as_path()] {
-        match fs::symlink_metadata(path) {
-            Ok(_) => {
-                return Err(format!(
-                    "final destination already exists: {}",
-                    path.display()
-                ));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "inspect final destination {}: {error}",
-                    path.display()
-                ));
-            }
+    let existing_receipt = open_existing_conversion_file(&receipt)?;
+    if artifact.is_none() && existing_receipt.is_some() {
+        return Err(format!(
+            "conversion receipt exists without its artifact: {}",
+            receipt.display()
+        ));
+    }
+    Ok(artifact)
+}
+
+/// These explicit-output paths belong to a stable, caller-controlled
+/// workspace. Descriptor/path checks detect observed replacement; they do not
+/// establish hostile-root or managed-cache transaction authority.
+fn open_existing_conversion_file(path: &Path) -> Result<Option<fs::File>, String> {
+    let path_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!("inspect existing conversion file {}: {error}", path.display()));
         }
+    };
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        return Err(format!("existing conversion path is not a regular non-symlink file: {}", path.display()));
+    }
+    let file = fs::File::open(path)
+        .map_err(|error| format!("open existing conversion file {}: {error}", path.display()))?;
+    let held_metadata = file.metadata()
+        .map_err(|error| format!("inspect held conversion file {}: {error}", path.display()))?;
+    if !same_conversion_file(&held_metadata, &path_metadata) {
+        return Err(format!("conversion file changed while opening: {}", path.display()));
+    }
+    Ok(Some(file))
+}
+
+fn same_conversion_file(held: &fs::Metadata, observed: &fs::Metadata) -> bool {
+    if !held.is_file() || !observed.is_file() || held.len() != observed.len() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        held.dev() == observed.dev() && held.ino() == observed.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        // Portable std does not expose a stable file identity. The explicit
+        // caller-controlled workspace must remain stable during conversion.
+        true
+    }
+}
+
+fn check_conversion_file(file: &fs::File, path: &Path, expected_len: u64) -> Result<(), String> {
+    let held = file.metadata()
+        .map_err(|error| format!("inspect held conversion file {}: {error}", path.display()))?;
+    let observed = fs::symlink_metadata(path)
+        .map_err(|error| format!("reinspect conversion path {}: {error}", path.display()))?;
+    if observed.file_type().is_symlink()
+        || held.len() != expected_len
+        || !same_conversion_file(&held, &observed)
+    {
+        return Err(format!("conversion file changed during verification: {}", path.display()));
     }
     Ok(())
+}
+
+/// A writer-shaped read-only sink. It compares the canonical writer's bytes
+/// with the held artifact using fixed scratch, without making another
+/// model-sized output or trusting a sidecar's claimed identity.
+struct ConversionReplay<'a> {
+    file: &'a mut fs::File,
+    scratch: [u8; 64 * 1024],
+    sha256: Sha256,
+    compared: u64,
+}
+
+impl<'a> ConversionReplay<'a> {
+    fn new(file: &'a mut fs::File) -> Result<Self, String> {
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| format!("rewind existing conversion file: {error}"))?;
+        Ok(Self {
+            file,
+            scratch: [0; 64 * 1024],
+            sha256: Sha256::new(),
+            compared: 0,
+        })
+    }
+
+    fn finish(self, expected_len: u64) -> Result<String, String> {
+        let actual_len = self.file.metadata()
+            .map_err(|error| format!("inspect replayed conversion file: {error}"))?.len();
+        let mut extra = [0_u8; 1];
+        let trailing = self.file.read(&mut extra)
+            .map_err(|error| format!("check replayed conversion EOF: {error}"))?;
+        if self.compared != expected_len || actual_len != expected_len || trailing != 0 {
+            return Err(format!(
+                "existing conversion length differs: expected={expected_len} compared={} observed={actual_len}",
+                self.compared,
+            ));
+        }
+        Ok(hex_lower(&self.sha256.finalize()))
+    }
+}
+
+impl Write for ConversionReplay<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        for expected in bytes.chunks(self.scratch.len()) {
+            let observed = &mut self.scratch[..expected.len()];
+            self.file.read_exact(observed)?;
+            if observed != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("existing conversion artifact differs near byte {}", self.compared),
+                ));
+            }
+            self.sha256.update(expected);
+            self.compared = self.compared.checked_add(expected.len() as u64)
+                .ok_or_else(|| io::Error::other("conversion replay byte count overflow"))?;
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn replay_conversion_artifact(
+    file: &mut fs::File,
+    input: &FnlpqStreamingInput,
+    emit_section: impl FnMut(&StreamingSection, &mut dyn Write) -> Result<(), FnlpqWriteError>,
+) -> Result<(StreamedFnlpq, String), String> {
+    let mut replay = ConversionReplay::new(file)?;
+    let written = write_streaming(input, &mut replay, emit_section)
+        .map_err(|error| format!("replay canonical conversion: {error}"))?;
+    let raw_sha256 = replay.finish(written.file_len)?;
+    Ok((written, raw_sha256))
 }
 
 /// Derive a deterministic sibling staging name.  It is deliberately distinct
@@ -1426,8 +1613,9 @@ fn publish_explicit_conversion_stage(stage: &Path, destination: &Path) -> Result
 
 struct WrittenConversionReceipt {
     destination: PathBuf,
-    staging_path: PathBuf,
+    staging_path: Option<PathBuf>,
     sha256: String,
+    reused: bool,
 }
 
 /// Construct the typed conversion receipt from the completed explicit-output
@@ -1487,6 +1675,19 @@ fn write_canonical_receipt_sidecar(
         .canonical_json()
         .map_err(|error| format!("serialize conversion receipt: {error}"))?;
     let destination = conversion_receipt_path(output)?;
+    if let Some(mut existing) = open_existing_conversion_file(&destination)? {
+        let mut replay = ConversionReplay::new(&mut existing)?;
+        replay.write_all(json.as_bytes())
+            .map_err(|error| format!("existing conversion receipt differs: {error}"))?;
+        let sha256 = replay.finish(json.len() as u64)?;
+        check_conversion_file(&existing, &destination, json.len() as u64)?;
+        return Ok(WrittenConversionReceipt {
+            destination,
+            staging_path: None,
+            sha256,
+            reused: true,
+        });
+    }
     let (staging_path, mut file) = create_conversion_receipt_stage(&destination)?;
     // The cleanup guard owns the path; on any early return the staged
     // receipt is unlinked. After a successful publish we transfer the path
@@ -1537,8 +1738,9 @@ fn write_canonical_receipt_sidecar(
     let staging_path = receipt_guard.take();
     Ok(WrittenConversionReceipt {
         destination,
-        staging_path,
+        staging_path: Some(staging_path),
         sha256,
+        reused: false,
     })
 }
 
@@ -1573,18 +1775,20 @@ fn raw_sha256_file(path: &Path) -> Result<String, String> {
 /// conversion milestone and is intentionally not implied by this line.
 fn emit_converted_unqualified(
     destination: &Path,
-    staging_output: &Path,
+    staging_output: Option<&Path>,
     prepared: &PreparedConversionInput,
     written: &StreamedFnlpq,
     artifact_raw_sha256: &str,
     receipt: &WrittenConversionReceipt,
 ) -> ExitCode {
     eprintln!(
-        "CONVERT RESULT=PASS stage=explicit-output destination={} staging-artifact={} receipt={} staging-receipt={} receipt-sha256={} source-root-sha256={} census-sha256={} tensors={} fnlpq-file-sha256={} artifact-raw-sha256={} staging-bytes={} license-bundle-sha256={} reload=PASS status=converted-not-qualified cache-activation=NOT-ATTEMPTED",
+        "CONVERT RESULT=PASS stage=explicit-output destination={} staging-artifact={} artifact-reused={} receipt={} staging-receipt={} receipt-reused={} receipt-sha256={} source-root-sha256={} census-sha256={} tensors={} fnlpq-file-sha256={} artifact-raw-sha256={} artifact-bytes={} staging-bytes={} license-bundle-sha256={} reload=PASS status=converted-not-qualified cache-activation=NOT-ATTEMPTED",
         destination.display(),
-        staging_output.display(),
+        staging_output.map_or_else(|| "none".to_owned(), |path| path.display().to_string()),
+        staging_output.is_none(),
         receipt.destination.display(),
-        receipt.staging_path.display(),
+        receipt.staging_path.as_ref().map_or_else(|| "none".to_owned(), |path| path.display().to_string()),
+        receipt.reused,
         receipt.sha256,
         prepared.source_root_sha256(),
         prepared.census_sha256(),
@@ -1592,6 +1796,7 @@ fn emit_converted_unqualified(
         hex_lower(&written.fnlpq_file_sha256),
         artifact_raw_sha256,
         written.file_len,
+        if staging_output.is_some() { written.file_len } else { 0 },
         hex_lower(&written.license_bundle_sha256),
     );
     ExitCode::SUCCESS
@@ -2395,7 +2600,7 @@ mod tests {
     use std::{
         ffi::OsString,
         fs,
-        io::Cursor,
+        io::{Cursor, Write},
         path::{Path, PathBuf},
         process::ExitCode,
         time::{SystemTime, UNIX_EPOCH},
@@ -2406,16 +2611,24 @@ mod tests {
     use super::{
         Cli, Command, KvCacheQuantization, LogicalTensorFirstPass, ModelsSubcommand,
         ReleaseSubcommand, RobotSubcommand, cli_main_with_reader, confirm_convert,
-        conversion_receipt_path, conversion_staging_path, validate_generic_tensor_authorities,
-        write_canonical_receipt_sidecar,
+        ConversionReplay, check_conversion_file, conversion_receipt_path, conversion_staging_path,
+        hex_lower, inspect_conversion_destinations, replay_conversion_artifact,
+        validate_generic_tensor_authorities, write_canonical_receipt_sidecar,
     };
     use crate::artifact::converter::{
         CONVERSION_ARTIFACT_FORMAT, CONVERSION_RECEIPT_SCHEMA, ConversionReceipt, ConvertArch,
         ConvertRequest, GENERIC_PACKING_V1, GenericPayloadPlan, GenericTensorLayout, OutputRange,
         PINNED_SOURCE_MANIFEST_SHA256, PORTABLE_QUANT_V1, StorageStage, expected_nanbeige42_census,
     };
-    use crate::artifact::format::validate_authority_identifier;
+    use crate::artifact::format::{
+        ArchTarget, BF16_VERBATIM_V1, CanonicalDtype, FnlpqStreamingInput, FnlpqWriteError,
+        FnlpqWriterInput, PackingSetInput, SectionKind, SectionPayload, SectionRange, TensorInput,
+        digest_domain, framed_sha256, logical_model_sha256, logical_tensor_sha256,
+        validate_authority_identifier, write,
+    };
+    use crate::artifact::reader::FnlpqRangeReader;
     use crate::artifact::safetensors::{SafetensorDtype, TensorCensusEntry};
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn schema_dash_uses_the_injected_reader() {
@@ -2491,7 +2704,23 @@ mod tests {
             "franken-nlp-conversion-receipt-{}-{nonce}.fnlpq",
             std::process::id()
         ));
-        let receipt = ConversionReceipt {
+        let receipt = conversion_receipt_fixture();
+        let written = write_canonical_receipt_sidecar(&output, &receipt)
+            .expect("canonical receipt sidecar writes beside explicit output");
+        assert!(written.destination.is_file());
+        assert!(!written.reused);
+        assert!(written.staging_path.as_ref().is_some_and(|path| path.is_file()));
+        let sidecar = fs::read_to_string(&written.destination)
+            .expect("retained conversion receipt sidecar reads");
+        assert_eq!(
+            ConversionReceipt::parse_canonical_json(&sidecar)
+                .expect("retained sidecar parses canonically"),
+            receipt
+        );
+    }
+
+    fn conversion_receipt_fixture() -> ConversionReceipt {
+        ConversionReceipt {
             receipt_schema: CONVERSION_RECEIPT_SCHEMA.to_owned(),
             model_id: "Nanbeige4.2-3B".to_owned(),
             model_revision: "f56ec5a9650268aa098496734743c25ea778bd2d".to_owned(),
@@ -2514,17 +2743,240 @@ mod tests {
             fnlpq_file_sha256: "c".repeat(64),
             artifact_raw_sha256: "e".repeat(64),
             license_bundle_sha256: "d".repeat(64),
+        }
+    }
+
+    fn conversion_recovery_directory(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock is after Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "franken-nlp-conversion-recovery-{name}-{}-{nonce}",
+            std::process::id(),
+        ));
+        fs::create_dir(&directory).expect("create isolated conversion fixture");
+        directory
+    }
+
+    fn conversion_replay_fixture() -> (FnlpqWriterInput, FnlpqStreamingInput) {
+        let model_id = "ConversionRecoveryFixture";
+        let revision = "f56ec5a9650268aa098496734743c25ea778bd2d";
+        let payload = [0x80_u8, 0x3f].repeat(40_000);
+        let logical_tensor = logical_tensor_sha256(
+            "fixture.weight", "bf16", &[40_000], BF16_VERBATIM_V1, &payload, &[], &[],
+        ).expect("fixture tensor identity");
+        let sections = vec![
+            SectionPayload::new("generic-payload", SectionKind::GenericTensorPayload, payload, 64),
+            SectionPayload::new("generic-scales", SectionKind::GenericTensorScales, Vec::new(), 8),
+            SectionPayload::new("generic-row-sums", SectionKind::GenericTensorRowSums, Vec::new(), 8),
+            SectionPayload::new("tokenizer-model", SectionKind::TokenizerModel, b"fixture-tokenizer".to_vec(), 8),
+            SectionPayload::new("model-config", SectionKind::ModelConfig, b"{}".to_vec(), 8),
+            SectionPayload::new("tokenizer-config", SectionKind::TokenizerConfig, b"{}".to_vec(), 8),
+            SectionPayload::new("chat-template", SectionKind::ChatTemplate, b"{{ messages }}".to_vec(), 8),
+            SectionPayload::new("license-bundle", SectionKind::LicenseBundle, b"fixture license".to_vec(), 8),
+        ];
+        let logical_model = logical_model_sha256(
+            model_id,
+            revision,
+            &[logical_tensor],
+            &[
+                ("model_config", b"{}"),
+                ("tokenizer_model", b"fixture-tokenizer"),
+                ("tokenizer_config", b"{}"),
+                ("chat_template", b"{{ messages }}"),
+            ],
+        ).expect("fixture model identity");
+        let input = FnlpqWriterInput {
+            model_id: model_id.to_owned(),
+            revision: revision.to_owned(),
+            recipe_id: "fixture-v1".to_owned(),
+            source_root_sha256: "a".repeat(64),
+            logical_model_sha256: hex_lower(&logical_model),
+            sections,
+            tensors: vec![TensorInput {
+                name: "fixture.weight".to_owned(),
+                canonical_dtype: CanonicalDtype::Bf16,
+                shape: vec![40_000],
+                canonical_logical_sha256: hex_lower(&logical_tensor),
+                quantization: BF16_VERBATIM_V1.to_owned(),
+                data: SectionRange::new("generic-payload", 0, 80_000),
+                scale: SectionRange::new("generic-scales", 0, 0),
+                row_sum: SectionRange::new("generic-row-sums", 0, 0),
+            }],
+            packing_sets: vec![PackingSetInput {
+                id: "generic".to_owned(),
+                target: ArchTarget::Generic,
+                section_names: ["generic-payload", "generic-scales", "generic-row-sums"]
+                    .into_iter().map(str::to_owned).collect(),
+            }],
         };
+        let streaming = FnlpqStreamingInput {
+            model_id: input.model_id.clone(),
+            revision: input.revision.clone(),
+            recipe_id: input.recipe_id.clone(),
+            source_root_sha256: input.source_root_sha256.clone(),
+            logical_model_sha256: input.logical_model_sha256.clone(),
+            sections: input.sections.iter().map(|section| {
+                super::streaming_small_section(
+                    &section.name, section.kind, section.alignment, &section.bytes,
+                ).expect("fixture streaming section")
+            }).collect(),
+            tensors: input.tensors.clone(),
+            packing_sets: input.packing_sets.clone(),
+            license_bundle_sha256: framed_sha256(
+                digest_domain::LICENSE_BUNDLE, &[b"fixture license"],
+            ).expect("fixture license identity"),
+        };
+        (input, streaming)
+    }
+
+    #[test]
+    fn conversion_recovery_replays_the_canonical_stream_and_preserves_the_artifact() {
+        let directory = conversion_recovery_directory("canonical");
+        let output = directory.join("output.fnlpq");
+        let (input, streaming) = conversion_replay_fixture();
+        let artifact = write(&input).expect("canonical fixture writes");
+        fs::write(&output, &artifact.bytes).expect("seed completed artifact");
+        let mut existing = inspect_conversion_destinations(&output)
+            .expect("existing artifact is inspectable").expect("artifact retained");
+        let (replayed, raw_sha256) = replay_conversion_artifact(
+            &mut existing, &streaming, |section, sink| {
+                let bytes = &input.sections.iter().find(|item| item.name == section.name)
+                    .expect("fixture section exists").bytes;
+                sink.write_all(bytes).map_err(|error| FnlpqWriteError::Io {
+                    operation: "emit replay fixture",
+                    detail: error.to_string(),
+                })
+            },
+        ).expect("canonical replay succeeds");
+        assert_eq!(replayed.file_len, artifact.bytes.len() as u64);
+        assert_eq!(replayed.fnlpq_file_sha256, artifact.fnlpq_file_sha256);
+        assert_eq!(raw_sha256, hex_lower(&Sha256::digest(&artifact.bytes)));
+        let reloaded = FnlpqRangeReader::from_file_with_checkpoint(
+            existing.try_clone().expect("clone held artifact"), || None,
+        ).expect("replayed artifact reloads through checked reader");
+        assert_eq!(reloaded.recipe_id(), streaming.recipe_id);
+        assert!(reloaded.select_packing(ArchTarget::Generic).is_ok());
+        drop(reloaded);
+        check_conversion_file(&existing, &output, replayed.file_len)
+            .expect("held artifact remains at the exact final path");
+        assert_eq!(fs::read(&output).expect("artifact remains readable"), artifact.bytes);
+        assert_eq!(fs::read_dir(&directory).expect("fixture directory").count(), 1);
+
+        let mut different_request = streaming.clone();
+        different_request.recipe_id = "fixture-v2".to_owned();
+        let mut emitted = false;
+        assert!(replay_conversion_artifact(
+            &mut existing, &different_request, |_, _| { emitted = true; Ok(()) },
+        ).is_err());
+        assert!(!emitted, "a changed request is rejected before its section payloads");
+        assert_eq!(fs::read(&output).expect("artifact after refusal"), artifact.bytes);
+    }
+
+    #[test]
+    fn conversion_replay_rejects_corruption_short_files_and_trailing_bytes() {
+        let directory = conversion_recovery_directory("bad-artifacts");
+        let expected = vec![0x5a_u8; 150_000];
+        let mut corrupt = expected.clone();
+        corrupt[70_000] ^= 1;
+        let mut trailing = expected.clone();
+        trailing.push(0);
+        for (name, bytes) in [
+            ("corrupt", corrupt), ("short", expected[..90_000].to_vec()), ("trailing", trailing),
+        ] {
+            let output = directory.join(name);
+            fs::write(&output, &bytes).expect("seed conflicting artifact");
+            let mut file = fs::File::open(&output).expect("open conflicting artifact");
+            let mut replay = ConversionReplay::new(&mut file).expect("replay starts");
+            let result = replay.write_all(&expected).map_err(|error| error.to_string())
+                .and_then(|()| replay.finish(expected.len() as u64));
+            assert!(result.is_err(), "{name} must not authorize a receipt");
+            assert_eq!(fs::read(&output).expect("preserved conflicting bytes"), bytes);
+        }
+    }
+
+    #[test]
+    fn conversion_sidecar_failure_is_recoverable_and_exact_reruns_are_idempotent() {
+        let directory = conversion_recovery_directory("receipt-retry");
+        let output = directory.join("output.fnlpq");
+        // This transaction fixture isolates sidecar failure from source acquisition.
+        // The preceding test covers the real canonical writer and checked reader.
+        let artifact = vec![7_u8; 20];
+        fs::write(&output, &artifact).expect("seed completed explicit output");
+        let receipt_path = conversion_receipt_path(&output).expect("receipt path");
+        fs::create_dir(&receipt_path).expect("block sidecar publication");
+        let mut receipt = conversion_receipt_fixture();
+        receipt.artifact_raw_sha256 = hex_lower(&Sha256::digest(&artifact));
+        assert!(write_canonical_receipt_sidecar(&output, &receipt).is_err());
+        assert_eq!(fs::read(&output).expect("artifact survives receipt refusal"), artifact);
+        fs::rename(&receipt_path, directory.join("caller-moved-obstruction"))
+            .expect("caller resolves sidecar obstruction");
+        let mut file = inspect_conversion_destinations(&output)
+            .expect("rerun inspects output").expect("rerun retains artifact");
+        let mut replay = ConversionReplay::new(&mut file).expect("rerun starts comparison");
+        replay.write_all(&artifact).expect("rerun compares canonical bytes");
+        assert_eq!(replay.finish(artifact.len() as u64).expect("rerun verifies EOF"),
+            receipt.artifact_raw_sha256);
+        check_conversion_file(&file, &output, artifact.len() as u64).expect("artifact path unchanged");
         let written = write_canonical_receipt_sidecar(&output, &receipt)
-            .expect("canonical receipt sidecar writes beside explicit output");
-        assert!(written.destination.is_file());
-        let sidecar = fs::read_to_string(&written.destination)
-            .expect("retained conversion receipt sidecar reads");
-        assert_eq!(
-            ConversionReceipt::parse_canonical_json(&sidecar)
-                .expect("retained sidecar parses canonically"),
-            receipt
-        );
+            .expect("rerun completes missing receipt");
+        assert!(!written.reused);
+        let entries = fs::read_dir(&directory).expect("directory after completion").count();
+        let reused = write_canonical_receipt_sidecar(&output, &receipt)
+            .expect("exact completed receipt is reusable");
+        assert!(reused.reused);
+        assert!(reused.staging_path.is_none());
+        assert_eq!(reused.sha256, written.sha256);
+        assert_eq!(fs::read_dir(&directory).expect("directory after reuse").count(), entries);
+        assert_eq!(fs::read(&output).expect("artifact after reuse"), artifact);
+    }
+
+    #[test]
+    fn conversion_recovery_refuses_conflicting_or_orphaned_receipts() {
+        let directory = conversion_recovery_directory("conflicting-receipts");
+        let output = directory.join("output.fnlpq");
+        let receipt = conversion_receipt_fixture();
+        let written = write_canonical_receipt_sidecar(&output, &receipt).expect("seed orphan receipt");
+        assert!(inspect_conversion_destinations(&output).is_err());
+        let canonical = fs::read(&written.destination).expect("canonical receipt bytes");
+        fs::write(&output, [0_u8; 20]).expect("seed artifact beside receipt");
+        let mut changed_commit = receipt.clone();
+        changed_commit.converter_commit = "f".repeat(40);
+        let mut changed_digest = receipt.clone();
+        changed_digest.artifact_raw_sha256 = "0".repeat(64);
+        for different in [changed_commit, changed_digest] {
+            assert!(write_canonical_receipt_sidecar(&output, &different).is_err());
+            assert_eq!(fs::read(&written.destination).expect("receipt after refusal"), canonical);
+        }
+
+        let corrupt_output = directory.join("corrupt.fnlpq");
+        let corrupt_receipt = conversion_receipt_path(&corrupt_output).expect("corrupt receipt path");
+        fs::write(&corrupt_receipt, b"{broken").expect("seed corrupt sidecar");
+        assert!(write_canonical_receipt_sidecar(&corrupt_output, &receipt).is_err());
+        assert_eq!(fs::read(corrupt_receipt).expect("preserved corrupt sidecar"), b"{broken");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conversion_recovery_refuses_symlinks_and_observed_same_length_path_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let directory = conversion_recovery_directory("path-identity");
+        let output = directory.join("output.fnlpq");
+        fs::write(&output, b"same length").expect("seed artifact");
+        let held = inspect_conversion_destinations(&output)
+            .expect("inspect artifact").expect("retain artifact descriptor");
+        fs::rename(&output, directory.join("original.fnlpq")).expect("move original artifact");
+        fs::write(&output, b"replacement").expect("seed equal-length replacement");
+        assert!(check_conversion_file(&held, &output, 11).is_err());
+
+        let artifact_link = directory.join("linked.fnlpq");
+        symlink(&output, &artifact_link).expect("create artifact symlink");
+        assert!(inspect_conversion_destinations(&artifact_link).is_err());
+        let receipt_path = conversion_receipt_path(&output).expect("receipt path");
+        symlink(&output, &receipt_path).expect("create receipt symlink");
+        assert!(inspect_conversion_destinations(&output).is_err());
     }
 
     #[test]
