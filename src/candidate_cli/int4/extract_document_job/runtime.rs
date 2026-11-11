@@ -3,7 +3,7 @@ use super::*;
 use crate::jobs::JobInputMemory;
 use std::{sync::Arc, time::{Duration, Instant}};
 use crate::{
-    NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
+    NlpEngine, MemoryClass,
     candidate_cli::{extract::SCHEMA_BYTES,
         int4::extract_map::array_union::ArrayUnionSelection,
         int4::extract_map::object::RootObjectSelection,
@@ -25,12 +25,8 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
-    let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
-        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: common.memory_bytes,
-        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
-    }).build().map_err(|_| CandidateError::Runtime)?;
+    let engine = NlpEngine::builder().resource_config(compute::resource_config(common))
+        .build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
     // Exact schema, tokenizer, vocabulary and final publication staging retain
     // this owner while the host separately charges transferred job buffers.
@@ -106,9 +102,15 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
     let job_id = job.storage.job_id; let materialize = job.storage.materialize;
     let request = SourceJobRequest { root: job.storage.job_dir, key, job_id, limits: lifetime,
         mode: open_mode(mode, job.storage.input_retention)?, materialize };
-    let progress = engine.job_int4_extract_document(&model, planner, vocabulary, request,
-        host_limits(&args, limits, remaining()?), map.reduction_reserve_bytes, common.kernel,
-        reader, cancellation).map_err(host_failure)?;
+    let progress = if common.compute.threads == 1 {
+        engine.job_int4_extract_document(&model, planner, vocabulary, request,
+            host_limits(&args, limits, remaining()?), map.reduction_reserve_bytes, common.kernel,
+            reader, cancellation)
+    } else {
+        engine.job_int4_extract_document_with_threads(&model, planner, vocabulary, request,
+            host_limits(&args, limits, remaining()?), map.reduction_reserve_bytes, common.kernel,
+            common.compute.threads, reader, cancellation)
+    }.map_err(host_failure)?;
     remaining()?;
     let report = progress_report(progress, job_id, lifetime, materialize, mode, "extract")?;
     let content = identity.logical_model_digest.to_hex();
@@ -128,6 +130,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
         root_array_union: map.mapping.root_array_union.map(ArrayUnionSelection::new),
         root_object_reconciliation: root_object.map(RootObjectSelection::new),
         input_encoding: input_encoding::reported_policy(&encoding),
+        compute_schedule: compute::Schedule::for_threads(common.compute.threads),
     };
     // A failed metadata write can follow durable commits. No original text,
     // schema, extracted values, coordinates, private paths or key is emitted.
@@ -201,6 +204,8 @@ struct Response<'a, T: Serialize> {
     root_object_reconciliation: Option<RootObjectSelection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     input_encoding: Option<&'a crate::tokenizer::untrusted::UntrustedEncoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compute_schedule: Option<compute::Schedule>,
     output: &'a T,
 }
 

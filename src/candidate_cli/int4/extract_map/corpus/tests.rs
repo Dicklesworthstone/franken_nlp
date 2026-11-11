@@ -36,6 +36,58 @@ impl DecodeStepControl for Control {
 }
 
 #[test]
+fn persistent_corpus_teams_charge_one_workspace_without_changing_document_authority() {
+    for mode in [&[][..], &["--root-array-union", "--source-membership", "--max-selected-rows", "32"][..],
+        &["--reconcile-root-object", "--source-membership"][..],
+        &["--input-encoding", "safe-bpe-v1", "--max-selected-rows", "65"][..]] {
+        let mut flags = vec!["--preparation-mib", "8192"];
+        flags.extend_from_slice(mode);
+        let (serial, args) = arguments(&flags);
+        let before = serial.validate(&args).unwrap();
+        for threads in [2, 4, 64] {
+            let width = threads.to_string();
+            let mut selected = flags.clone(); selected.extend(["--compute-threads", &width]);
+            let (parallel, mut args) = arguments(&selected);
+            let after = parallel.validate(&args).unwrap();
+            let scratch = crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(
+                threads, args.group_width).unwrap();
+            assert_eq!(after.common.compute.threads, threads);
+            assert_eq!(after.common.compute.workspace_bytes, scratch);
+            assert_eq!(after.memory, before.memory, "worker scratch must not change semantic or native quotes");
+            assert_eq!(after.transport, before.transport);
+            assert_eq!(after.max_run_mask_visits, before.max_run_mask_visits);
+            assert_eq!(after.max_run_verification, before.max_run_verification);
+            assert_eq!(after.document.mapping.mapping.max_model_work, before.document.mapping.mapping.max_model_work);
+            assert_eq!(after.document.mapping.verification, before.document.mapping.verification);
+            assert_eq!(after.root_object, before.root_object);
+            assert_eq!(parallel.document.encoding.policy().unwrap(), serial.document.encoding.policy().unwrap());
+            // Retained preparation alone exceeds the model loading ceiling,
+            // so execution owns the peak and worker scratch is charged once.
+            assert_eq!(after.common.minimum_memory_bytes, before.common.minimum_memory_bytes + scratch);
+            args.memory_mib = after.common.minimum_memory_bytes.div_ceil(MIB) - 1;
+            assert_eq!(parallel.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+        }
+    }
+}
+
+#[test]
+fn corpus_worker_width_and_mixed_chunk_schedules_refuse_before_any_private_io() {
+    for flags in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+        vec!["--compute-threads", "18446744073709551615"],
+        vec!["--compute-threads", "2", "--cohort-chunks", "1"],
+        vec!["--compute-threads", "4", "--cohort-chunks", "3"]] {
+        let (command, args) = arguments(&flags);
+        assert_eq!(command.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+    let (explicit, args) = arguments(&["--compute-threads", "1", "--cohort-chunks", "3"]);
+    assert!(explicit.validate(&args).is_ok());
+    let (plain, plain_args) = arguments(&[]);
+    let (one, one_args) = arguments(&["--compute-threads", "1"]);
+    assert_eq!(plain.validate(&plain_args).unwrap().common.minimum_memory_bytes,
+        one.validate(&one_args).unwrap().common.minimum_memory_bytes);
+}
+
+#[test]
 fn compact_document_corpus_prices_one_workspace_for_serial_and_chunk_cohort_streams() {
     for flags in [&[][..], &["--cohort-chunks", "3", "--max-selected-rows", "32"][..],
         &["--root-array-union", "--source-membership"][..]] {

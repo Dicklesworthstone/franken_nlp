@@ -73,21 +73,22 @@ pub(super) fn definition() -> clap::Command {
         .arg(extract::selected_rows_argument())
         .after_long_help(format!("{}\n\n{}\n\nSelected-row projection: --max-selected-rows N fixes the same complete-legal-row ceiling for EVERY chunk, including native chunk cohorts. Full-vocabulary projection remains the default. Every legal token is evaluated; a set larger than N refuses the complete document without pruning or fallback. The exact strategy and ceiling bind every chunk identity before native admission. Whole-document work is priced from the selected ceiling; grammar masks, source evidence, task limits and physical memory reservations are unchanged. Per-chunk results name their execution strategy and the document includes max_selected_rows. Actual-model parity and performance remain separately unqualified. Document corpora apply the same fixed strategy across the entire stream; retained document jobs authenticate the exact strategy and row cap and require them again on resume.", array_union::HELP, input_encoding::DOCUMENT_ENCODING_HELP))
 }
-/// Only this complete one-shot document route owns a persistent numerical
-/// team. The shared definition also feeds corpus and durable-job parsers,
-/// whose existing scheduling and ownership contracts remain separate.
+/// One-shot documents publish a physical projection receipt. Population
+/// routes use the same width selection with their own lifetime and framing.
 pub(super) fn threaded_definition() -> clap::Command {
     let command = definition();
     let details = command.get_after_long_help().map(|help| help.to_string()).unwrap_or_default();
     compute::definition(command)
         .mut_arg("compute_threads", |arg| arg.help("Coordinator plus persistent INT4 row workers, 1..=64; one team spans every independent chunk and the complete reducer. Extra worker scratch is admitted before IO. Cannot combine with --cohort-chunks; runtime threads are additional"))
-        .after_long_help(format!("{details}\n\nPersistent document team: --compute-threads N with N=2..64 forms one sealed numerical team for the complete document. Each projection splits complete output rows; each chunk retains its independent causal KV, grammar, selected-row policy and task budget. All chunks preflight before the first native forward. Original-coordinate evidence and optional root-array union use the ordinary independent finalizers. Worker count and completed projection rows appear only in the optional compute receipt, never the semantic document identity. Workers join before any completed document can be returned. --cohort-chunks, packed prefill and unsupported population/job routes cannot combine with this selection. Serial remains the default; no speed or full-model parity claim is implied."))
+        .after_long_help(format!("{details}\n\nPersistent document team: --compute-threads N with N=2..64 forms one sealed numerical team for the complete document. Each projection splits complete output rows; each chunk retains its independent causal KV, grammar, selected-row policy and task budget. All chunks preflight before the first native forward. Original-coordinate evidence and optional root-array union use the ordinary independent finalizers. Worker count and completed projection rows appear only in the optional compute receipt, never the semantic document identity. Workers join before any completed document can be returned. --cohort-chunks and packed prefill cannot combine with this selection. Complete-document corpus and job commands expose their own whole-invocation team lifetime. Serial remains the default; no speed or full-model parity claim is implied."))
 }
 pub(super) fn document_job_definition() -> clap::Command {
-    definition()
+    compute::definition(definition())
+        .mut_arg("compute_threads", |arg| arg.help("Coordinator plus persistent INT4 row workers, 1..=64; one team spans this complete durable invocation. May change on resume without renewing work or changing the recipe. Cannot combine with --cohort-chunks"))
 }
 pub(super) fn corpus_definition() -> clap::Command {
-    definition()
+    compute::definition(definition())
+        .mut_arg("compute_threads", |arg| arg.help("Coordinator plus persistent INT4 row workers, 1..=64; one team spans the complete stream, every chunk and flush. Terminal success follows worker join. Cannot combine with --cohort-chunks"))
 }
 fn definition_with_cohorts(cohorts: bool) -> clap::Command {
     let command = ArrayUnionArgs::augment_args(MappingArgs::augment_args(extract::definition().name("extract-map")
@@ -139,11 +140,9 @@ impl MapArgs {
         let mut common = if args.compute.threads() == 1 {
             self.extraction.validate_with_projection(args)?
         } else {
-            // Parser absence is not authority: programmatically constructed
-            // corpora/jobs and unsupported schedule mixtures must refuse too.
             // Complete-document encoding belongs to self.encoding; the
             // one-request policy in args must remain at its byte default.
-            if document_job || self.cohort_chunks.is_some() || args.prefill()?.is_some()
+            if self.cohort_chunks.is_some() || args.prefill()?.is_some()
                 || !args.input_encoding.is_default() { return Err(CandidateError::Arguments); }
             self.extraction.validate_one_off_with_prefill(args)?
         };

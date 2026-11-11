@@ -103,6 +103,101 @@ fn runtime_rechecks_programmatic_refusal_before_schema_or_population_io() {
 }
 
 #[test]
+#[ignore = "controller-only real-model gate: requires independently pinned snapshot, explicit memory and fresh process"]
+fn persistent_document_corpus_teams_preserve_native_values_lineage_and_work_across_flushes() {
+    use std::sync::Mutex;
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+    struct Continue;
+    impl DecodeStepControl for Continue {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }
+    }
+    let snapshot = std::env::var("FNLP_INT4_PREFILL_SNAPSHOT").expect("explicit existing snapshot required");
+    let pin = std::env::var("FNLP_INT4_PREFILL_MODEL_SHA256").expect("independent model-content pin required");
+    let memory = std::env::var("FNLP_INT4_TEST_MEMORY_MIB").expect("explicit memory ceiling required");
+    let schema = r#"{"type":"array","minItems":1,"maxItems":1,"items":{"type":"string","maxLength":5,"const":"Alice","x-fnlp-source":"verbatim"}}"#;
+    let source = "é Alice\n".repeat(6);
+    let record = serde_json::to_string(&serde_json::json!({"id":"same-document","text":source,"task_args":{}})).unwrap();
+    let input = format!("{record}\n{{\"flush\":true}}\n{record}\n").into_bytes();
+    let command = |threads: usize, selected: bool| {
+        let width = threads.to_string();
+        let mut argv = vec!["candidate", "source-int4", "extract-corpus", "--snapshot", &snapshot,
+            "--expected-model-sha256", &pin, "--memory-mib", &memory,
+            "--schema", "controller-inline-schema.json", "--source-membership", "--root-array-union",
+            "--context-tokens", "1024", "--max-new-tokens", "32", "--max-chunk-bytes", "9",
+            "--compute-threads", &width, "--timeout-seconds", "86400"];
+        if selected { argv.extend(["--max-selected-rows", "166144"]); }
+        let matches = crate::candidate_cli::definition().try_get_matches_from(argv).unwrap();
+        let CandidateCommand::SourceInt4(command) = CandidateCommand::from_matches(&matches).unwrap()
+            else { panic!("explicit extraction corpus required"); };
+        command
+    };
+    let base = command(4, false);
+    let Int4Task::ExtractCorpus(options) = &base.task else { panic!("corpus arguments required"); };
+    let limits = options.validate(&base.args).unwrap();
+    assert!(crate::installed_process_resources().is_none(), "model gate requires its own fresh process");
+    let engine = NlpEngine::builder().resource_config(compute::resource_config(limits.common)).build().unwrap();
+    let idle = engine.resources().memory_snapshot();
+    let lease = engine.resources().acquire_lease();
+    let preparation = lease.reserve(MemoryClass::JobBuffers, limits.cli_preparation_bytes).unwrap().commit().unwrap();
+    let model = crate::candidate_cli::int4::runtime::load_model(&engine, &base.args, limits.common,
+        Duration::from_secs(3600), CancellationToken::default()).unwrap();
+    let resident = engine.resources().memory_snapshot();
+    let controls = crate::tokenizer::pinned_controls::pinned().unwrap();
+    let vocabulary = Arc::new(ExtractionVocabulary::pinned(controls.template_controls()).unwrap());
+    for selected in [false, true] {
+        let mut expected = None;
+        for threads in [1, 2, 4] {
+            let command = command(threads, selected);
+            let Int4Task::ExtractCorpus(options) = command.task else { panic!("corpus task required"); };
+            let limits = options.validate(&command.args).unwrap();
+            let budget = options.document.extraction.budget(&command.args, limits.common);
+            let request = options.load_defaults_with_control(schema.to_owned(), budget, &mut Continue).unwrap();
+            let planner = Int4ExtractionDocumentBatchPlanner::for_model(model.model_identity(), budget,
+                options.document.extraction.compiler(), options.document.extraction.source_limits(),
+                Int4ExtractionDocumentBatchConfig { request, limits: limits.document.mapping,
+                    max_model_work: limits.document.mapping.mapping.max_model_work,
+                    max_mask_visits: limits.max_run_mask_visits,
+                    max_verification: limits.max_run_verification }).unwrap();
+            let planner = if selected {
+                planner.with_selected_rows(options.document.extraction.selected_rows().unwrap().unwrap()).unwrap()
+            } else { planner };
+            let output = Arc::new(Mutex::new(Vec::new()));
+            let host = host_limits(&command.args, limits, Duration::from_secs(86_400));
+            let summary = if threads == 1 {
+                engine.batch_int4_extract_documents(&model, planner, Arc::clone(&vocabulary), host,
+                    limits.document.reduction_reserve_bytes, limits.common.kernel,
+                    std::io::Cursor::new(input.clone()), Capture(Arc::clone(&output)), CancellationToken::default())
+            } else {
+                engine.batch_int4_extract_documents_with_threads(&model, planner, Arc::clone(&vocabulary), host,
+                    limits.document.reduction_reserve_bytes, limits.common.kernel, threads,
+                    std::io::Cursor::new(input.clone()), Capture(Arc::clone(&output)), CancellationToken::default())
+            }.unwrap();
+            assert_eq!(summary.succeeded, 2); assert_eq!(summary.failed, 0); assert_eq!(summary.flushes, 2);
+            assert!(summary.reserved_work.forward_positions > 0);
+            let bytes = output.lock().unwrap().clone();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert_eq!(text.matches("\"event\":\"run_complete\"").count(), 1);
+            assert!(text.contains("\"root_array_union\""));
+            assert!(text.contains("\"source_span\""));
+            let completed = (bytes, serde_json::to_value(summary).unwrap());
+            if let Some(expected) = &expected { assert_eq!(&completed, expected); }
+            else { expected = Some(completed); }
+            assert_eq!(engine.resources().memory_snapshot(), resident);
+            let closures = engine.resources().outstanding_closure_snapshot();
+            assert_eq!(closures.active_closures, 0); assert_eq!(closures.wrapper_cancelled_closures, 0);
+        }
+    }
+    drop(vocabulary); drop(model); drop(preparation); drop(lease);
+    assert_eq!(engine.resources().memory_snapshot(), idle);
+}
+
+#[test]
 fn typed_cancellation_survives_loading_planning_batching_and_nested_failures() {
     use DecodeCancellationKind::*;
     for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
@@ -142,6 +237,7 @@ fn corpus_frame_keeps_exact_chunk_json_and_reveals_only_public_outer_metadata() 
             scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "extract",
             source_mode: "complete_document", chunk_schedule: chunk_schedule(cohort_chunks), cohort_chunks,
             root_array_union: None, root_object_reconciliation: None, max_selected_rows: None, input_encoding: None,
+            compute_schedule: None,
             model_id: "Nanbeige4.2-3B", source_revision: "public-revision", source_root_sha256: "public-source",
             model_content_sha256: "public-model", candidate_format: "candidate-int4", quant_recipe: "recipe",
             group_width: 128, integer_kernel: "s_scalar_i32",
@@ -161,6 +257,7 @@ fn corpus_frame_keeps_exact_chunk_json_and_reveals_only_public_outer_metadata() 
         assert_eq!(value["evidence"], "non_authoritative");
         assert!(value.get("max_selected_rows").is_none());
         assert!(value.get("root_object_reconciliation").is_none());
+        assert!(value.get("compute_schedule").is_none());
         if let Some(chunks) = cohort_chunks {
             assert_eq!(value["chunk_schedule"], "native_chunk_cohorts"); assert_eq!(value["cohort_chunks"], chunks);
         } else {
@@ -205,6 +302,30 @@ fn corpus_frame_keeps_exact_chunk_json_and_reveals_only_public_outer_metadata() 
         assert_eq!(object_value["root_object_reconciliation"]["limits"], serde_json::to_value(root).unwrap());
         assert!(std::str::from_utf8(&object_output).unwrap()
             .ends_with(&format!("\"record\":{}}}\n", inner.trim_end_matches('\n'))));
+        for threads in [2, 4, 64] {
+            let threaded = Provenance {
+                    protocol: "fnlp-candidate-int4-extract-corpus-v1", schema_version: 1,
+                    scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "extract",
+                    source_mode: "complete_document", chunk_schedule: "serial", cohort_chunks: None,
+                    root_array_union: None, root_object_reconciliation: None, max_selected_rows: Some(32),
+                    input_encoding: None, compute_schedule: compute::Schedule::for_threads(threads),
+                    model_id: "Nanbeige4.2-3B", source_revision: "public-revision", source_root_sha256: "public-source",
+                    model_content_sha256: "public-model", candidate_format: "candidate-int4", quant_recipe: "recipe",
+                    group_width: 128, integer_kernel: "s_scalar_i32", snapshot: None,
+                };
+            let mut bytes = Vec::new();
+            {
+                let mut writer = CandidateWriter::new(&mut bytes, &threaded, 4096, 8192).unwrap();
+                writer.write_all(inner.as_bytes()).unwrap(); writer.flush().unwrap();
+            }
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["compute_schedule"], serde_json::json!({
+                "execution": "int4-output-row-team-v1", "declared_compute_threads": threads }));
+            assert_eq!(value["record"]["result"]["chunks"][0]["json"],
+                "{\"n\":12345678901234567890123456789012345678}");
+            assert!(std::str::from_utf8(&bytes).unwrap()
+                .ends_with(&format!("\"record\":{}}}\n", inner.trim_end_matches('\n'))));
+        }
     }
 }
 
@@ -247,6 +368,7 @@ fn compact_provenance_preserves_inner_bytes_and_every_empty_stream_frame_includi
             source_mode: "complete_document", chunk_schedule: "serial", cohort_chunks: None,
             root_array_union: None, root_object_reconciliation: None, max_selected_rows: None,
             input_encoding: input_encoding::reported_policy(&encoding),
+            compute_schedule: None,
             model_id: "Nanbeige4.2-3B", source_revision: "public-revision", source_root_sha256: "public-source",
             model_content_sha256: "public-model", candidate_format: "candidate-int4", quant_recipe: "recipe",
             group_width: 128, integer_kernel: "s_scalar_i32", snapshot: None,

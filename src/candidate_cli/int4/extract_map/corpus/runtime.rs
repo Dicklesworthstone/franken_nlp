@@ -2,7 +2,7 @@
 use super::*;
 use std::{io::{BufRead, BufReader}, sync::Arc, time::{Duration, Instant}};
 use crate::{
-    NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
+    NlpEngine, MemoryClass,
     batch::extract::grouped_int4::long::stream::{Int4ExtractionDocumentBatchConfig,
         Int4ExtractionDocumentBatchPlanner},
     candidate_cli::{batch::{CandidateWriter, completed}, extract::SCHEMA_BYTES,
@@ -56,12 +56,8 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
-    let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
-        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: common.memory_bytes,
-        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
-    }).build().map_err(|_| CandidateError::Runtime)?;
+    let engine = NlpEngine::builder().resource_config(compute::resource_config(common))
+        .build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
     // Fixed schema, tokenizer/vocabulary preparation and candidate frame
     // staging stay charged until the owned hosted invocation physically drains.
@@ -140,6 +136,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         root_array_union: limits.document.mapping.root_array_union.map(array_union::ArrayUnionSelection::new),
         root_object_reconciliation: limits.root_object.map(RootObjectSelection::new),
         input_encoding: input_encoding::reported_policy(&encoding),
+        compute_schedule: compute::Schedule::for_threads(common.compute.threads),
         model_id: "Nanbeige4.2-3B", source_revision: &identity.source_revision,
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
@@ -156,9 +153,14 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     // The hosted quote now retains the same schema/reconciliation workspace
     // through original-document validation, serialization and writer flush.
     drop(object_preparation);
-    let summary = engine.batch_int4_extract_documents(&model, planner, vocabulary, host,
-        limits.document.reduction_reserve_bytes, common.kernel, reader, writer, cancellation)
-        .map_err(|error| host_error(error, CandidateError::Batch))?;
+    let summary = if common.compute.threads == 1 {
+        engine.batch_int4_extract_documents(&model, planner, vocabulary, host,
+            limits.document.reduction_reserve_bytes, common.kernel, reader, writer, cancellation)
+    } else {
+        engine.batch_int4_extract_documents_with_threads(&model, planner, vocabulary, host,
+            limits.document.reduction_reserve_bytes, common.kernel, common.compute.threads,
+            reader, writer, cancellation)
+    }.map_err(|error| host_error(error, CandidateError::Batch))?;
     remaining()?;
     // A drained stream can contain rejected documents. The host owns its only
     // completion footer, and a later error never becomes a second stdout frame.
@@ -199,6 +201,8 @@ struct Provenance<'a> {
     root_object_reconciliation: Option<RootObjectSelection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     input_encoding: Option<&'a crate::tokenizer::untrusted::UntrustedEncoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compute_schedule: Option<compute::Schedule>,
     model_id: &'static str, source_revision: &'a str, source_root_sha256: &'a str, model_content_sha256: &'a str,
     candidate_format: &'a str, quant_recipe: &'a str, group_width: usize, integer_kernel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]

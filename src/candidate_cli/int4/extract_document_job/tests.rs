@@ -32,6 +32,60 @@ impl Write for NoIo {
 }
 
 #[test]
+fn document_job_teams_preserve_semantic_and_lifetime_limits_across_resume() {
+    for (operation, replay) in [("start", false), ("resume", false), ("resume", true)] {
+        for mode in [&[][..], &["--root-array-union", "--source-membership", "--max-selected-rows", "32"][..],
+            &["--reconcile-root-object"][..], &["--input-encoding", "safe-bpe-v1"][..]] {
+            let mut flags = mode.to_vec();
+            if replay { flags.push("--use-retained-input"); }
+            let (serial, serial_args) = command(operation, &flags);
+            let before = serial.args.validate(&serial_args).unwrap();
+            let fixed = lifetime(&serial_args, before);
+            let serial_lifetime = serial.args.lifetime_limits(&serial_args, before, fixed).unwrap();
+            for threads in [2, 4, 64] {
+                let width = threads.to_string();
+                let mut selected = flags.clone(); selected.extend(["--compute-threads", &width]);
+                let (parallel, mut args) = command(operation, &selected);
+                let after = parallel.args.validate(&args).unwrap();
+                let scratch = crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(
+                    threads, args.group_width).unwrap();
+                assert_eq!(after.common.compute.threads, threads);
+                assert_eq!(after.common.compute.workspace_bytes, scratch);
+                assert_eq!(after.common.minimum_memory_bytes, before.common.minimum_memory_bytes + scratch);
+                assert_eq!(after.common.native, before.common.native);
+                assert_eq!(after.workspace_bytes, before.workspace_bytes);
+                assert_eq!(after.mapping.mapping.max_model_work, before.mapping.mapping.max_model_work);
+                assert_eq!(after.mapping.mapping.max_mask_visits, before.mapping.mapping.max_mask_visits);
+                assert_eq!(after.mapping.verification, before.mapping.verification);
+                assert_eq!(after.mapping.root_array_union, before.mapping.root_array_union);
+                assert_eq!(parallel.args.map.encoding.policy().unwrap(), serial.args.map.encoding.policy().unwrap());
+                let resumed = parallel.args.lifetime_limits(&args, after, fixed).unwrap();
+                assert_eq!(resumed.buffer_bytes, serial_lifetime.buffer_bytes);
+                assert_eq!(resumed.map.common.minimum_memory_bytes,
+                    serial_lifetime.map.common.minimum_memory_bytes + scratch);
+                args.memory_mib = after.common.minimum_memory_bytes.div_ceil(MIB) - 1;
+                assert_eq!(parallel.execute_owned(args, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+            }
+        }
+    }
+}
+
+#[test]
+fn document_job_teams_refuse_widths_and_mixed_schedules_before_storage_or_population_io() {
+    for operation in ["start", "resume"] {
+        for flags in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+            vec!["--compute-threads", "18446744073709551615"],
+            vec!["--compute-threads", "2", "--cohort-chunks", "1"],
+            vec!["--compute-threads", "4", "--cohort-chunks", "3"]] {
+            let (job, args) = command(operation, &flags);
+            assert_eq!(job.execute_owned(args, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+        }
+        let (job, args) = command(operation, &["--compute-threads", "1", "--cohort-chunks", "3"]);
+        assert!(job.args.validate(&args).is_ok());
+    }
+}
+
+#[test]
 fn retained_compact_documents_bind_explicit_caps_on_start_resume_and_retained_replay() {
     use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
     for (operation, replay) in [("start", false), ("resume", false), ("resume", true)] {

@@ -3871,6 +3871,21 @@ hosted preparation each receive a separately bounded ledger with the same
 fixed policy. Each corpus document, reconstruction and resumed attempt does
 likewise; tokenizer work is not a persisted lifetime debit.
 
+Both complete-document population routes also accept `--compute-threads N`.
+Width `1` retains serial execution; widths `2..64` keep one persistent INT4
+output-row team for the complete stream or durable invocation. The same team
+serves every document and chunk, including exact selected-row projection,
+source checks and the supported reducers. Worker scratch and the installed
+process thread envelope are admitted before private IO. A live stream publishes
+`run_complete` only after workers join; a durable invocation returns progress
+after the same physical drain. Native chunk cohorts cannot combine with this
+team. Root-object reconciliation remains compatible with teams in byte mode;
+its compact-input restriction is unchanged. Thread width is physical scheduling,
+so an explicit job resume may change it without changing the authenticated
+recipe or renewing lifetime work. Optional `compute_schedule` provenance names
+the width; serial output omits it. These are candidate execution routes; model
+parity and performance qualification remain pending.
+
 Completed compact map results report the full `input_encoding` policy and
 actual `input_encoding_work`. Corpus frames, including the mandatory completion
 footer for an empty input, report the policy. Retained jobs authenticate the

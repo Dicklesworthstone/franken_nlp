@@ -290,8 +290,211 @@ fn deadlines_transports_and_complete_output_are_refused_by_the_pure_host_quote()
 fn supplied_io_and_all_document_owners_can_cross_the_physical_invocation() {
     fn send<T: Send + 'static>() {}
     send::<Charged<StreamInput<std::io::Cursor<Vec<u8>>, Vec<u8>>>>();
+    send::<DeferredExtractionStream<std::io::Cursor<Vec<u8>>, Vec<u8>>>();
     let _host = NlpEngine::batch_int4_extract_documents::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
+    let _team = NlpEngine::batch_int4_extract_documents_with_threads::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
     let _public_quote = crate::hosted::int4_extraction_document_corpus_requirements;
+}
+
+#[test]
+fn numerical_document_teams_refuse_both_explicit_and_hidden_chunk_cohorts() {
+    let (_, mut document, _, _) = fixture();
+    for chunks in [1, 3] {
+        document.mapping.reduction.map_batch_chunks = chunks;
+        check_team_schedule(None, false, document).unwrap();
+        check_team_schedule(None, true, document).unwrap();
+        for threads in [2, 4, 64] {
+            assert!(matches!(check_team_schedule(Some(threads), true, document), Err(HostedError::Limits(_))));
+            assert_eq!(check_team_schedule(Some(threads), false, document).is_ok(), chunks == 1);
+        }
+    }
+}
+
+mod team {
+    use super::*;
+    use std::{io::{self, Cursor, Read}, sync::Mutex, time::Duration};
+    use crate::{LeakResponsePolicy, ResourceHostConfig, RuntimePreset,
+        batch::extract::grouped_int4::long::stream::Int4ExtractionDocumentBatchConfig,
+        grammar::runtime::SourceRuntimeLimits, hosted::{RunLimits, RunStop},
+        native_engine::{decode::DecodeCancellationKind, strict_int4::weights::projection_fixture}};
+
+    const INPUT: &[u8] = b"invalid-json\n{\"flush\":true}\n";
+    const PREPARATION: u64 = 128 << 20;
+    #[derive(Clone, Copy)]
+    enum Delivery { Complete, PartialTerminal, CancelAtEof, CancelAtTerminalFlush, PanicAtTerminal }
+    #[derive(Default)]
+    struct Observation { bytes: Vec<u8>, writes: usize, terminals: usize, drops: usize, input_at_drop: u64 }
+    struct Writer { host: Arc<NlpEngine>, observed: Arc<Mutex<Observation>>, run: RunLimits,
+        threads: usize, delivery: Delivery, stop: CancellationToken, terminal: bool, eof: bool }
+    impl Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let event: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            self.terminal = event["event"] == "run_complete";
+            self.eof = event["event"] == "flush" && event["eof"] == true;
+            assert_eq!(self.host.resources().outstanding_closure_snapshot().active_closures, 1);
+            assert!(matches!(dispatch::preflight(&self.host, self.run), Err(HostedError::Reentrant)));
+            if self.terminal {
+                let snapshot = self.host.resources().memory_snapshot();
+                let kv = snapshot.by_class.get(&MemoryClass::KvPages).map_or(0, |v| v.committed_bytes);
+                if self.threads > 1 {
+                    assert_eq!(kv, 0, "all native state must drop before post-join completion");
+                    assert_eq!(snapshot.by_class[&MemoryClass::ActivationScratch].committed_bytes,
+                        int4_task_team_workspace_bytes(self.threads, 32).unwrap());
+                } else { assert!(kv > 0, "legacy serial terminal scheduling must remain unchanged"); }
+                self.observed.lock().unwrap().terminals += 1;
+            }
+            self.observed.lock().unwrap().writes += 1;
+            if self.terminal && matches!(self.delivery, Delivery::PanicAtTerminal) {
+                panic!("injected extraction terminal writer panic");
+            }
+            let mut observed = self.observed.lock().unwrap();
+            if self.terminal && matches!(self.delivery, Delivery::PartialTerminal) {
+                observed.bytes.extend_from_slice(&bytes[..bytes.len().min(7)]);
+                return Err(io::Error::other("injected extraction terminal partial write"));
+            }
+            observed.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if self.eof && matches!(self.delivery, Delivery::CancelAtEof) {
+                self.stop.cancel(DecodeCancellationKind::Deadline);
+            }
+            if self.terminal && matches!(self.delivery, Delivery::CancelAtTerminalFlush) {
+                self.stop.cancel(DecodeCancellationKind::Shutdown);
+            }
+            Ok(())
+        }
+    }
+    impl Drop for Writer {
+        fn drop(&mut self) {
+            let snapshot = self.host.resources().memory_snapshot();
+            let mut observed = self.observed.lock().unwrap();
+            observed.input_at_drop = snapshot.by_class.get(&MemoryClass::JobBuffers)
+                .map_or(0, |v| v.committed_bytes + v.reserved_bytes);
+            observed.drops += 1;
+        }
+    }
+    struct NoRead;
+    impl Read for NoRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("refused extraction read input"); }
+    }
+    impl BufRead for NoRead {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> { panic!("refused extraction filled input"); }
+        fn consume(&mut self, _: usize) { panic!("refused extraction consumed input"); }
+    }
+    fn planner(model: &ResidentInt4) -> (Int4ExtractionDocumentBatchPlanner, CorpusLimits, u64) {
+        let (budget, mut document, mut limits, reserve) = fixture();
+        document.mapping.reduction.map_batch_chunks = 1;
+        limits.preparation_reserve_bytes = PREPARATION;
+        limits.native.run.max_elapsed = Duration::from_secs(60);
+        limits.native.run.max_checkpoints = 100_000;
+        let request = super::super::super::tests::config().request;
+        let planner = Int4ExtractionDocumentBatchPlanner::for_model(model.model_identity(), budget,
+            CompileLimits::default(), SourceRuntimeLimits::default(),
+            Int4ExtractionDocumentBatchConfig { request, limits: document,
+                max_model_work: document.mapping.max_model_work, max_mask_visits: document.mapping.max_mask_visits,
+                max_verification: document.verification }).unwrap();
+        (planner, limits, reserve)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn execute<R: BufRead + Send + 'static>(host: &Arc<NlpEngine>, model: &ResidentInt4,
+        vocabulary: &Arc<ExtractionVocabulary>, threads: usize, selected: bool, delivery: Delivery,
+        input: R, stop: CancellationToken) -> (Result<BatchSummary, HostedError>, Arc<Mutex<Observation>>) {
+        let (planner, limits, reserve) = planner(model);
+        let planner = if selected {
+            planner.with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: 7 }).unwrap()
+        } else { planner };
+        let observed = Arc::new(Mutex::new(Observation::default()));
+        let writer = Writer { host: Arc::clone(host), observed: Arc::clone(&observed), run: limits.native.run,
+            threads, delivery, stop: stop.clone(), terminal: false, eof: false };
+        let result = if threads == 1 {
+            host.batch_int4_extract_documents(model, planner, Arc::clone(vocabulary), limits, reserve,
+                PackedInt4Kernel::scalar(), input, writer, stop)
+        } else {
+            host.batch_int4_extract_documents_with_threads(model, planner, Arc::clone(vocabulary),
+                limits, reserve, PackedInt4Kernel::scalar(), threads, input, writer, stop)
+        };
+        (result, observed)
+    }
+    fn drained(host: &NlpEngine, baseline: &crate::MemorySnapshot) {
+        assert_eq!(&host.resources().memory_snapshot(), baseline);
+        let closures = host.resources().outstanding_closure_snapshot();
+        assert_eq!(closures.active_closures, 0);
+        assert_eq!(closures.wrapper_cancelled_closures, 0);
+    }
+    #[test]
+    #[ignore = "controller-only fresh runtime: tiny weights prove transport/ownership, never native extraction parity"]
+    fn document_stream_terminal_delivery_joins_and_retains_input_until_success_cancel_or_failure() {
+        assert!(crate::installed_process_resources().is_none());
+        let host = Arc::new(NlpEngine::builder().resource_config(ResourceHostConfig {
+            runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
+            max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 2,
+            helper_threads: 0, thread_ceiling: 4, memory_ceiling_bytes: 1024 << 20,
+            leak_response_policy: LeakResponsePolicy::PanicInLabOrCi,
+        }).build().unwrap());
+        let idle = host.resources().memory_snapshot();
+        let lease = host.resources().acquire_lease();
+        let preparation = Pending::reserve(&lease, MemoryClass::JobBuffers, PREPARATION).unwrap().commit().unwrap();
+        let controls = crate::tokenizer::pinned_controls::pinned().unwrap();
+        let vocabulary = Arc::new(ExtractionVocabulary::pinned(controls.template_controls()).unwrap());
+        let loaded = allocate(Pending::reserve(&lease, MemoryClass::Weights, 1 << 20).unwrap(),
+            || Ok(projection_fixture(32).0)).unwrap();
+        let model = ResidentInt4 { inner: Arc::new(ResidentModel { loaded, lease }) };
+        let baseline = host.resources().memory_snapshot();
+        let (p, limits, reserve) = planner(&model);
+        let charge = int4_extraction_document_corpus_requirements(32, p.document_budget(),
+            p.document_limits(), limits, reserve, None).unwrap().input_bytes;
+        drop(p);
+        for selected in [false, true] {
+            let mut expected = None;
+            for threads in [1, 2, 3] {
+                let (result, observed) = execute(&host, &model, &vocabulary, threads, selected,
+                    Delivery::Complete, Cursor::new(INPUT.to_vec()), CancellationToken::default());
+                let summary = result.unwrap();
+                assert_eq!(summary.failed, 1); assert_eq!(summary.succeeded, 0); assert_eq!(summary.flushes, 2);
+                assert_eq!(summary.reserved_work, crate::batch::BatchWork::default());
+                let observed = observed.lock().unwrap();
+                assert_eq!(observed.drops, 1); assert_eq!(observed.terminals, 1);
+                assert!(observed.input_at_drop >= PREPARATION + charge);
+                if let Some(expected) = &expected { assert_eq!(&observed.bytes, expected); }
+                else { expected = Some(observed.bytes.clone()); }
+                drained(&host, &baseline);
+            }
+        }
+        for delivery in [Delivery::PartialTerminal, Delivery::CancelAtEof,
+            Delivery::CancelAtTerminalFlush, Delivery::PanicAtTerminal] {
+            let (result, observed) = execute(&host, &model, &vocabulary, 3, true, delivery,
+                Cursor::new(INPUT.to_vec()), CancellationToken::default());
+            match delivery {
+                Delivery::PartialTerminal => assert!(matches!(result, Err(HostedError::Batch(error))
+                    if error.fault.code == BatchCode::OutputIo)),
+                Delivery::CancelAtEof => assert!(matches!(result, Err(HostedError::Stopped {
+                    stop: RunStop { kind: DecodeCancellationKind::Deadline, .. }, .. }))),
+                Delivery::CancelAtTerminalFlush => assert!(matches!(result, Err(HostedError::Stopped {
+                    stop: RunStop { kind: DecodeCancellationKind::Shutdown, .. }, .. }))),
+                Delivery::PanicAtTerminal => assert!(matches!(result, Err(HostedError::Panicked))),
+                Delivery::Complete => unreachable!(),
+            }
+            let observed = observed.lock().unwrap();
+            assert_eq!(observed.drops, 1); assert!(observed.input_at_drop >= PREPARATION + charge);
+            let text = std::str::from_utf8(&observed.bytes).unwrap();
+            if matches!(delivery, Delivery::CancelAtEof) {
+                assert_eq!(observed.terminals, 0); assert!(!text.contains("run_complete"));
+                assert!(text.contains("run_error"));
+            } else { assert_eq!(observed.terminals, 1); assert!(!text.contains("run_error")); }
+            drained(&host, &baseline);
+        }
+        for threads in [0, 4, 65, usize::MAX] {
+            let (result, observed) = execute(&host, &model, &vocabulary, threads, false,
+                Delivery::Complete, NoRead, CancellationToken::default());
+            assert!(matches!(result, Err(HostedError::Limits(_))));
+            let observed = observed.lock().unwrap();
+            assert_eq!(observed.writes, 0); assert_eq!(observed.drops, 1);
+            drained(&host, &baseline);
+        }
+        drop(model); drop(vocabulary); drop(preparation);
+        drained(&host, &idle);
+    }
 }
 
 

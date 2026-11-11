@@ -72,6 +72,7 @@ pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
             "This mode conflicts with --root-array-union. --max-object-* bounds the complete reducer and adds schema/reconciliation memory before input or model IO. ",
             "--source-membership retains chunk evidence and verifies reconciled fields against the complete original source using the remaining document verification allowance. ",
             "No partial document succeeds. Documents execute sequentially; --cohort-chunks shares native layers within a document and --max-selected-rows N evaluates every legal grammar row, including accepting EOS. ",
+            "--compute-threads N instead selects one persistent output-row team for the ENTIRE stream, including every chunk and flush. It cannot combine with --cohort-chunks. Worker scratch and process thread capacity are admitted before private IO; run_complete follows physical join under the original deadline. ",
             "Oversized legal sets refuse without pruning or fallback. All five native work flags bound the ENTIRE RUN. ",
             "--max-run-mask-node-visits and --max-run-extraction-* bound mask and source-verification work across every admitted attempt. ",
             "Failed attempts, cohorts and flushes never renew these allowances. Every completed event carries public candidate provenance. ",
@@ -163,7 +164,7 @@ impl CorpusArgs {
             .requirements_with_root_object_and_encoding(args.group_width, budget, document.mapping, transport,
                 self.document.extraction.compiler(), root_object, &encoding)
             .map_err(|_| CandidateError::Arguments)?;
-        let execution = sum(&[memory.native.kv_bytes, memory.workspace_bytes, memory.input_bytes,
+        let execution = sum(&[memory.native.kv_bytes, memory.workspace_bytes, common.compute.workspace_bytes, memory.input_bytes,
             memory.document_workspace_bytes, memory.output_reservation_bytes])?;
         // The separate original/partial-schema charge remains owned during
         // model loading and optional snapshot saving. It is relinquished before

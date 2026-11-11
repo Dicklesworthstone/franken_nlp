@@ -80,9 +80,11 @@ fn document_team_mixtures_and_unfunded_workspace_refuse_before_private_io() {
 }
 
 #[test]
-fn complete_document_teams_do_not_silently_enable_population_or_job_schedules() {
-    assert!(threaded_definition().get_arguments().any(|arg| arg.get_id() == "compute_threads"));
-    for command in [definition(), corpus_definition(), document_job_definition(), object::definition()] {
+fn complete_document_team_selection_is_explicit_for_maps_corpora_and_jobs() {
+    for command in [threaded_definition(), corpus_definition(), document_job_definition()] {
+        assert!(command.get_arguments().any(|arg| arg.get_id() == "compute_threads"));
+    }
+    for command in [definition(), object::definition()] {
         assert!(!command.get_arguments().any(|arg| arg.get_id() == "compute_threads"));
     }
     for flags in [&["--compute-threads", "2"][..],
@@ -90,8 +92,8 @@ fn complete_document_teams_do_not_silently_enable_population_or_job_schedules() 
         let (map, mut args) = arguments(flags);
         args.memory_mib = 262_144;
         assert!(map.validate(&args).is_ok());
-        assert!(matches!(map.validate_document_job(&args), Err(CandidateError::Arguments)));
-        assert!(matches!(map.validate_corpus(&args), Err(CandidateError::Arguments)));
+        assert!(map.validate_document_job(&args).is_ok());
+        assert!(map.validate_corpus(&args).is_ok());
     }
 }
 

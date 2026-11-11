@@ -17,6 +17,47 @@ fn runtime_rechecks_cohort_memory_before_host_schema_or_population_io() {
     args.memory_mib = map.common.minimum_memory_bytes.div_ceil(MIB) - 1;
     assert_eq!(execute(c.mode, args, c.args, map, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
 }
+
+#[test]
+fn changing_physical_team_width_on_resume_preserves_the_complete_authenticated_recipe() {
+    use crate::native_engine::strict_int4::weights::projection_fixture;
+    // Real pinned schema compilation and recipe serialization, without native
+    // execution or private job IO. Semantic policy changes remain distinct.
+    let mut recipes = Vec::new();
+    for flags in [&[][..], &["--max-selected-rows", "32"][..],
+        &["--input-encoding", "safe-bpe-v1"][..]] {
+        let mut expected = None;
+        for operation in ["start", "resume"] {
+            for width in [1, 2, 4, 64] {
+                let width = width.to_string();
+                let mut options = flags.to_vec(); options.extend(["--compute-threads", &width]);
+                let (c, args) = command(operation, &options);
+                let map = c.args.validate(&args).unwrap();
+                let fixed = lifetime(&args, map);
+                let limits = c.args.lifetime_limits(&args, map, fixed).unwrap();
+                let budget = c.args.map.extraction.budget(&args, map.common);
+                let request = c.args.map.request(" {\"type\":\"boolean\"}\n".to_owned(), budget).unwrap();
+                let (weights, _) = projection_fixture(args.group_width);
+                let planner = Int4DocumentExtractionJobPlanner::for_model(weights.identity(), budget,
+                    c.args.map.extraction.compiler(), c.args.map.extraction.source_limits(),
+                    request, map.mapping, fixed, c.args.lifetime.verification()).unwrap()
+                    .with_document_encoding(c.args.map.encoding.policy().unwrap()).unwrap();
+                let planner = match c.args.map.extraction.selected_rows().unwrap() {
+                    Some(rows) => planner.with_selected_rows(rows).unwrap(), None => planner,
+                };
+                planner.check_job_limits(fixed).unwrap();
+                let recipe = crate::canonjson::canonical_bytes(planner.job_recipe()).unwrap();
+                let identity = crate::canonjson::canonical_bytes(planner.execution_identity()).unwrap();
+                let semantic = (recipe, identity, fixed.max_work, limits.buffer_bytes);
+                if let Some(expected) = &expected { assert_eq!(&semantic, expected); }
+                else { expected = Some(semantic); }
+            }
+        }
+        recipes.push(expected.unwrap().0);
+    }
+    assert_ne!(recipes[0], recipes[1], "selected-row policy remains authenticated");
+    assert_ne!(recipes[0], recipes[2], "compact encoding remains authenticated");
+}
 #[test]
 fn exact_schema_request_uses_the_same_native_context_and_grounding_policy() {
     for grounding in [false, true] {
@@ -71,6 +112,7 @@ fn whole_document_progress_report_does_not_emit_schema_source_values_or_private_
         group_width: args.group_width, integer_kernel: map.common.kernel.kind().id(),
         snapshot: Some(SnapshotRecord::new("loaded", map.common.snapshot_need)), chunk_schedule: None, output: &report,
         root_array_union: None, max_selected_rows: None, root_object_reconciliation: None, input_encoding: None,
+        compute_schedule: None,
     };
     let mut bytes = Vec::new(); publish(&response, job_cli::REPORT_BYTES, &mut bytes).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -85,10 +127,20 @@ fn whole_document_progress_report_does_not_emit_schema_source_values_or_private_
     assert!(value.get("root_object_reconciliation").is_none());
     assert!(value.get("max_selected_rows").is_none());
     assert!(value.get("input_encoding").is_none());
+    assert!(value.get("compute_schedule").is_none());
     for forbidden in ["text", "schema", "values", "spans", "recipe", "key", "job_dir", "results", "documents"] {
         assert!(value.get(forbidden).is_none()); assert!(value["output"].get(forbidden).is_none());
     }
     assert!(bytes.ends_with(b"\n")); assert_eq!(publish(&response, 1, &mut NoIo), Err(CandidateError::Output));
+    for width in [2, 4, 64] {
+        response.compute_schedule = compute::Schedule::for_threads(width);
+        let threaded = serde_json::to_value(&response).unwrap();
+        assert_eq!(threaded["compute_schedule"], serde_json::json!({
+            "execution": "int4-output-row-team-v1", "declared_compute_threads": width }));
+        assert_eq!(threaded["output"], value["output"]);
+        assert_eq!(threaded["extraction_mode"], value["extraction_mode"]);
+    }
+    response.compute_schedule = None;
     response.chunk_schedule = Some(ChunkSchedule::new(4));
     let grouped = serde_json::to_value(&response).unwrap();
     assert_eq!(grouped["chunk_schedule"], serde_json::json!({
