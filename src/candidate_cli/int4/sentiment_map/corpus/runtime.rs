@@ -45,6 +45,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let started = Instant::now();
     let limits = command.validate(&args)?;
     let common = limits.common;
+    let encoding = command.document.input_encoding(&args)?;
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
@@ -73,6 +74,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     remaining()?;
     let budget = command.document.budget_with_max_axes(common, command.stream.max_axes)?;
     let planner = Int4SentimentPlanner::for_model(model.model_identity(), options, budget, limits.document.planning)
+        .and_then(|planner| planner.with_document_encoding(encoding.clone()))
         .map_err(|error| error.cancellation().map(stopped).unwrap_or(CandidateError::Planning))?;
     let planner = Int4SentimentDocumentBatchPlanner::new(planner, Some(defaults),
         limits.document.mapping, limits.document.mapping.max_model_work)
@@ -87,7 +89,8 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let mut host = host_limits(&args, limits, remaining()?);
     let quote = crate::hosted::int4_sentiment_document_corpus_requirements(args.group_width, budget,
         limits.document.planning, limits.document.mapping, host, command.stream.max_axes, cohort_chunks)
-        .map_err(|error| host_error(error, CandidateError::Planning))?;
+        .map_err(|error| host_error(error, CandidateError::Planning))?
+        .with_input_encoding(&encoding).map_err(|_| CandidateError::Planning)?;
     let expected = limits.document.memory;
     if quote.native != expected.native || quote.workspace_bytes != expected.workspace_bytes
         || quote.output_reservation_bytes != expected.output_reservation_bytes
@@ -122,6 +125,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(), snapshot,
+        input_encoding: input_encoding::reported_policy(&encoding),
     };
     let writer = CandidateWriter::new(output, &provenance, limits.transport.max_output_line_bytes, limits.output_bytes)?;
     let reader: Box<dyn BufRead + Send> = if args.input.as_os_str() == "-" {
@@ -170,6 +174,8 @@ struct Provenance<'a> {
     candidate_format: &'a str, quant_recipe: &'a str, group_width: usize, integer_kernel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<SnapshotRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<&'a UntrustedEncoding>,
 }
 
 #[cfg(test)]

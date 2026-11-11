@@ -31,15 +31,59 @@ fn compact_mapping() -> Int4SentimentMapLimits {
 fn compile<'a, C: DecodeStepControl>(planner: &SentimentPlanner, identity: &ExecutionIdentity,
     request: &'a SentimentRequest, limits: Int4SentimentMapLimits, control: &mut C)
     -> Result<PreparedInt4SentimentMap<'a>, Int4SentimentMapError> {
+    compile_accumulated(planner, identity, request, limits, control, &mut SafeBpeWork::default())
+}
+fn compile_accumulated<'a, C: DecodeStepControl>(planner: &SentimentPlanner, identity: &ExecutionIdentity,
+    request: &'a SentimentRequest, limits: Int4SentimentMapLimits, control: &mut C, work: &mut SafeBpeWork)
+    -> Result<PreparedInt4SentimentMap<'a>, Int4SentimentMapError> {
     let planning = SentimentLimits::default();
     let capacity = planner.source_token_capacity(&request.axes, request.budget, request.budget,
         planning, limits.chunks.context_tokens)?;
-    PreparedInt4SentimentMap::compile_encoded(request, limits, capacity, 32,
+    PreparedInt4SentimentMap::compile_encoded_with_work(request, limits, capacity, 32,
         super::super::binding::Authority { ceiling: request.budget, planning },
-        planner.document_encoding(), SafeBpeWork::default(), control,
+        planner.document_encoding(), work, control,
         |source, control, work| planner.source_tokens_with_work(source, work, control),
         |row, control, work| planner.compile_int4_with_work(row,
             &PlanContext::new(identity, request.budget).unwrap(), planning, 32, control, work))
+}
+
+#[test]
+fn population_reconstruction_spends_the_original_ledger_and_preserves_exact_pass_seals() {
+    let request = compact_source(&[SentimentAxis::Valence, SentimentAxis::Arousal]);
+    let (planner, identity) = compact_planner(compact_limits());
+    let mut work = SafeBpeWork::default();
+    let first = compile_accumulated(&planner, &identity, &request, compact_mapping(), &mut Continue, &mut work).unwrap();
+    let first_work = work;
+    let second = compile_accumulated(&planner, &identity, &request, compact_mapping(), &mut Continue, &mut work).unwrap();
+    assert_eq!(first.preflight_metadata(), second.preflight_metadata());
+    assert_eq!(first.identities().unwrap(), second.identities().unwrap());
+    assert_eq!(work.checked_sub(first_work), Some(first_work));
+    assert_eq!(second.preflight_metadata().encoding_work, first_work);
+    let exact = SafeBpeLimits { max_input_bytes: work.input_bytes(), max_output_tokens: work.output_tokens(),
+        max_pair_checks: work.pair_checks(), max_pair_bytes: work.pair_bytes() };
+    let (planner, identity) = compact_planner(exact);
+    let mut exact_work = SafeBpeWork::default();
+    let before = compile_accumulated(&planner, &identity, &request, compact_mapping(), &mut Continue, &mut exact_work).unwrap();
+    let after = compile_accumulated(&planner, &identity, &request, compact_mapping(), &mut Continue, &mut exact_work).unwrap();
+    assert_eq!(exact_work, work);
+    assert_eq!(before.preflight_metadata(), after.preflight_metadata());
+    after.preflight_metadata().verify_completed(&finish(&after).unwrap()).unwrap();
+    for axis in 0..4 {
+        let mut short = exact;
+        match axis { 0 => short.max_input_bytes -= 1, 1 => short.max_output_tokens -= 1,
+            2 => short.max_pair_checks -= 1, _ => short.max_pair_bytes -= 1 }
+        let (planner, identity) = compact_planner(short);
+        let mut spent = SafeBpeWork::default();
+        compile_accumulated(&planner, &identity, &request, compact_mapping(), &mut Continue, &mut spent).unwrap();
+        let error = compile_accumulated(&planner, &identity, &request, compact_mapping(), &mut Continue, &mut spent)
+            .err().unwrap();
+        assert!(matches!(error, Int4SentimentMapError::Sentiment(Int4SentimentError::Planning(
+            SentimentPlanningError::Budget))), "axis {axis}");
+        // An explicit new document has its own bounded ledger. No native
+        // execution, repair or model-quality claim is part of this fixture.
+        compile_accumulated(&planner, &identity, &request, compact_mapping(), &mut Continue,
+            &mut SafeBpeWork::default()).unwrap();
+    }
 }
 
 #[test]

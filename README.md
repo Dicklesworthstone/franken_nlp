@@ -994,6 +994,21 @@ the explicit coverage and peak/entropy policy. These quantities remain
 uncalibrated and do not establish full-context equivalence or psychological
 measurement.
 
+`sentiment-corpus` and `sentiment-document-job start|resume` also accept
+`--input-encoding safe-bpe-v1`, with the same four explicit tokenizer ceilings
+as `sentiment-map`. Chunk sizes use actual compact token counts while preserving
+the original source bytes, scalar coordinates and control-token exclusion.
+Initial preparation and reconstruction for execution share one bounded ledger
+per complete document attempt. Chunk probes, axes and native cohorts cannot
+reset it; a tokenizer failure publishes no partial document. The existing
+map receipt reports its deterministic per-pass work, while the private attempt
+ledger includes both passes. Admission adds one encoder workspace, independently
+of chunk and axis counts. Native work retains its separate whole-run and durable
+lifetime limits. Retained jobs authenticate the encoding kind and every ceiling,
+including retained-input replay; repeat them unchanged on resume. Byte fallback
+preserves the existing recipe and output shape. Compact source input and pinned
+snapshot reload are supported; compact `--save-snapshot` refuses before IO.
+
 For example, save fixed settings as `affect-axes.json`:
 
 ```json

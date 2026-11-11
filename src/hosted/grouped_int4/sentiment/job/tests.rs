@@ -139,3 +139,25 @@ fn owned_reader_and_private_recipe_travel_through_the_hosted_job_boundary() {
 
 #[cfg(feature = "asupersync-runtime")]
 mod native;
+
+#[test]
+fn retained_replay_keeps_one_compact_workspace_without_restoring_population_payloads() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    let policy = SafeBpeLimits { max_input_bytes: 262_144, max_output_tokens: 131_072,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 };
+    let encoding = UntrustedEncoding::SafeBpeV1(policy);
+    let workspace = policy.requirements().unwrap().workspace_bytes;
+    let (task, planning, mapping, job, host) = fixture();
+    for cohorts in [None, Some(2)] {
+        let complete = requirements(32, task, planning, mapping, job, host, 4, cohorts,
+            JobInputMemory::CompletePopulation).unwrap().with_input_encoding(&encoding).unwrap();
+        let retained = requirements(32, task, planning, mapping, job, host, 4, cohorts,
+            JobInputMemory::RetainedRecord).unwrap();
+        let compact = retained.with_input_encoding(&encoding).unwrap();
+        assert_eq!(compact.input_bytes - retained.input_bytes, workspace);
+        assert_eq!(complete.input_bytes - compact.input_bytes, 2 * job.max_snapshot_bytes);
+        assert_eq!(complete.native, compact.native);
+        assert_eq!(compact.native, retained.native);
+        assert_eq!(compact.output_reservation_bytes, retained.output_reservation_bytes);
+    }
+}

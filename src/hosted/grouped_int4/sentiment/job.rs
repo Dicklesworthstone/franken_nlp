@@ -51,7 +51,8 @@ impl NlpEngine {
         let cohort_chunks = planner.cohort_chunks();
         let required = requirements(planner.group_width(), planner.task_budget(),
             planner.planning_limits(), mapping, request.limits, limits, max_axes, cohort_chunks,
-            request.mode.input_memory())?;
+            request.mode.input_memory())?
+            .with_input_encoding(planner.document_encoding()).map_err(map_error)?;
         if planner.max_result_bytes() != document_output_bytes(mapping, cohort_chunks)?
             || planner.retained_defaults_bytes().map_err(HostedError::BatchSetup)?
                 > limits.preparation_reserve_bytes {

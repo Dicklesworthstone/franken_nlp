@@ -196,3 +196,45 @@ fn absent_host_feature_refuses_before_opening_private_defaults_or_source_files()
     let (options, args) = arguments(&["--defaults", "never-open-private-axes.json"]);
     assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Unavailable));
 }
+
+#[test]
+fn compact_corpus_policy_is_explicit_and_encoder_memory_is_not_multiplied_by_cohorts() {
+    for schedule in [vec![], vec!["--cohort-chunks", "2", "--max-axes", "2"]] {
+        let (byte_options, byte_args) = arguments(&schedule);
+        let byte = byte_options.validate(&byte_args).unwrap();
+        let mut flags = schedule;
+        flags.extend(["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "262144",
+            "--max-tokenizer-output-tokens", "131072", "--max-tokenizer-pair-checks", "33554432",
+            "--max-tokenizer-pair-bytes", "268435456"]);
+        let (options, args) = arguments(&flags);
+        let compact = options.validate(&args).unwrap();
+        let policy = SafeBpeLimits { max_input_bytes: 262_144, max_output_tokens: 131_072,
+            max_pair_checks: 33_554_432, max_pair_bytes: 268_435_456 };
+        assert_eq!(options.document.input_encoding(&args).unwrap(), UntrustedEncoding::SafeBpeV1(policy));
+        assert_eq!(compact.document.memory.input_bytes - byte.document.memory.input_bytes,
+            policy.requirements().unwrap().workspace_bytes);
+        assert_eq!(compact.document.memory.native, byte.document.memory.native);
+        assert_eq!(compact.document.mapping.max_model_work, byte.document.mapping.max_model_work);
+        assert_eq!(compact.transport, byte.transport);
+        let (explicit, explicit_args) = arguments(&["--input-encoding", "byte-fallback"]);
+        let (default, default_args) = arguments(&[]);
+        assert_eq!(explicit.validate(&explicit_args).unwrap().document.memory,
+            default.validate(&default_args).unwrap().document.memory);
+    }
+}
+
+#[test]
+fn compact_corpus_limits_refuse_before_defaults_model_or_source_io() {
+    for flags in [vec!["--max-tokenizer-input-bytes", "128"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "0"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-output-tokens", "1048577"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "0"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-bytes", "536870913"],
+        vec!["--input-encoding", "safe-bpe-v1", "--save-snapshot", "never-create.snapshot"]] {
+        let (options, args) = arguments(&flags);
+        assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments), "{flags:?}");
+    }
+    let (options, mut args) = arguments(&["--input-encoding", "safe-bpe-v1"]);
+    args.memory_mib = 1;
+    assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+}

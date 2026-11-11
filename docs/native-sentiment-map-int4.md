@@ -59,6 +59,29 @@ fails. Snapshot creation does not activate a model or authenticate a publisher.
 `--kernel` selects an existing hardware-checked native integer kernel. Scalar
 is the default. Unsupported selections refuse without a fallback.
 
+## Compact input across complete-document routes
+
+`sentiment-map`, `sentiment-corpus` and `sentiment-document-job start|resume`
+accept `--input-encoding safe-bpe-v1`. The encoder preserves source bytes,
+excludes template-control tokens and chooses chunk boundaries using actual
+token counts. The explicit input-byte, output-token, pair-check and pair-byte
+ceilings are tokenizer work limits; they are separate from source size,
+native context, model work and result size. Byte fallback remains the default.
+
+One-shot maps share their allowance across every probe and final chunk plan.
+Corpus and durable document attempts additionally carry that same ledger from
+initial preparation into reconstruction for execution. Reconstruction and
+axis/cohort boundaries cannot renew work. Exhaustion refuses the document
+before native execution. The existing completion seal retains per-pass work;
+the private attempt ledger charges all preparation. One encoder workspace
+is admitted beside the retained chunk plans, independent of axis/cohort width.
+
+Durable recipes authenticate the policy and all four ceilings, which must be
+repeated unchanged on resume, including retained-input replay. Byte-mode recipe
+bytes remain unchanged. Compact mode supports pinned source input and pinned
+snapshot reload; `--save-snapshot` is refused before private IO. The complete
+native work ledger retains its existing invocation or durable lifetime scope.
+
 ## Partition and native scoring
 
 The one-document `sentiment-map` command accepts `--compute-threads N` to keep

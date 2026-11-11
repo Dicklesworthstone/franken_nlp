@@ -14,6 +14,7 @@ use crate::{
         grouped_int4::{Int4SentimentPlanner, long::{Int4SentimentMapLimits,
             INT4_SENTIMENT_MAP_EXECUTION, INT4_SENTIMENT_MAP_COHORT_EXECUTION,
             memory::Int4SentimentMapMemoryLimits}}}},
+    tokenizer::untrusted::UntrustedEncoding,
 };
 
 const RECIPE_BYTES: usize = 1024 * 1024 - 1024;
@@ -60,6 +61,8 @@ pub struct Int4SentimentDocumentJobRecipe {
     max_stored_result_bytes: u64,
     aggregation: SentimentAggregationPolicy,
     cohort_chunks: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<UntrustedEncoding>,
 }
 impl Int4SentimentDocumentJobRecipe {
     fn new(sentiment: Int4ScoredJobRecipe, mapping: Int4SentimentMapLimits) -> Result<Self, BatchFault> {
@@ -73,7 +76,7 @@ impl Int4SentimentDocumentJobRecipe {
             reservation_policy: "exact-all-chunk-five-axis-work-before-durable-attempt-v1",
             sentiment, chunks, per_document_model_work: max_model_work,
             max_retained_result_bytes, max_result_bytes, max_stored_result_bytes: max_result_bytes,
-            aggregation, cohort_chunks: None };
+            aggregation, cohort_chunks: None, input_encoding: None };
         bounded_json(&recipe, RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
         Ok(recipe)
     }
@@ -96,7 +99,11 @@ impl Int4SentimentDocumentJobPlanner {
         let (sentiment, settings) = Int4ScoredJobRecipe::sentiment_retaining_defaults(
             planner.group_width(), ceiling, planning, settings, native)?;
         let max_axes = settings.axes.len();
-        let recipe = Int4SentimentDocumentJobRecipe::new(sentiment, mapping)?;
+        let mut recipe = Int4SentimentDocumentJobRecipe::new(sentiment, mapping)?;
+        if planner.document_encoding() != &UntrustedEncoding::ByteFallback {
+            recipe.input_encoding = Some(planner.document_encoding().clone());
+            bounded_json(&recipe, RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
+        }
         let compiler = Int4SentimentDocumentBatchPlanner::new(planner, Some(settings), mapping,
             native.max_model_work)?.with_max_axes(max_axes)?;
         Ok(Self { compiler, identity, recipe, limits })
@@ -113,6 +120,7 @@ impl Int4SentimentDocumentJobPlanner {
         Ok(self)
     }
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { self.compiler.document_encoding() }
     pub fn task_budget(&self) -> TaskBudget { self.compiler.task_budget() }
     pub fn planning_limits(&self) -> SentimentLimits { self.compiler.planning_limits() }
     pub fn document_limits(&self) -> Int4SentimentMapLimits { self.compiler.mapping_limits() }

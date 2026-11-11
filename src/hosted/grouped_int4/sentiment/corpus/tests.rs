@@ -191,3 +191,24 @@ fn owned_stream_and_pure_quote_use_the_existing_host_surface() {
     fn send<T: Send + 'static>() {}
     send::<StreamInput<std::io::Cursor<Vec<u8>>, Vec<u8>>>();
 }
+
+#[test]
+fn compact_corpus_workspace_is_charged_once_independently_of_axes_and_chunk_cohorts() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    let policy = SafeBpeLimits { max_input_bytes: 262_144, max_output_tokens: 131_072,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 };
+    let encoding = UntrustedEncoding::SafeBpeV1(policy);
+    let workspace = policy.requirements().unwrap().workspace_bytes;
+    let (task, planning, mapping, limits) = fixture();
+    for (axes, chunks) in [(1, None), (4, None), (4, Some(2)), (1, Some(64))] {
+        let byte = int4_sentiment_document_corpus_requirements(32, task, planning, mapping, limits, axes, chunks).unwrap();
+        let compact = byte.with_input_encoding(&encoding).unwrap();
+        assert_eq!(compact.input_bytes - byte.input_bytes, workspace);
+        assert_eq!(compact.native, byte.native);
+        assert_eq!(compact.workspace_bytes, byte.workspace_bytes);
+        assert_eq!(compact.output_reservation_bytes, byte.output_reservation_bytes);
+        assert_eq!(byte.with_input_encoding(&UntrustedEncoding::ByteFallback).unwrap(), byte);
+        let mut overflow = byte; overflow.input_bytes = u64::MAX;
+        assert!(overflow.with_input_encoding(&encoding).is_err());
+    }
+}

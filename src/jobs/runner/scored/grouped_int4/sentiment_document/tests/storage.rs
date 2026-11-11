@@ -173,3 +173,39 @@ fn changed_sentiment_policy_refuses_before_cancelled_tail_repair_and_never_refun
     assert_eq!((complete.committed, complete.attempts), (2, 3));
     assert_eq!(complete.reserved_work, JobWork::from_int4(work(3), 0));
 }
+
+#[test]
+fn retained_input_replay_authenticates_compact_policy_before_any_reexecution() {
+    let root = Root::new(); let inputs = inputs(); let events = Rc::new(Events::default());
+    let retention = crate::jobs::InputRetentionLimits { max_spool_bytes: 65_536 };
+    let make = || {
+        let mut processor = Processor::new(mapping(), limits(), Rc::clone(&events));
+        processor.recipe.input_encoding = Some(compact_policy());
+        processor
+    };
+    let mut job = JobRunner::create_with_retained_inputs(&root.0, key(), JobId([9; 16]), limits(),
+        retention, &inputs, make(), &mut Continue).unwrap();
+    assert_eq!(job.step(&mut Continue).unwrap().unwrap().committed, 1); drop(job);
+    for axis in 0..5 {
+        let mut changed = make();
+        if axis == 4 { changed.recipe.input_encoding = None; }
+        else {
+            let Some(UntrustedEncoding::SafeBpeV1(policy)) = &mut changed.recipe.input_encoding else {
+                panic!("compact recipe required");
+            };
+            match axis { 0 => policy.max_input_bytes -= 1, 1 => policy.max_output_tokens -= 1,
+                2 => policy.max_pair_checks -= 1, _ => policy.max_pair_bytes -= 1 }
+        }
+        assert_eq!(error(JobRunner::resume_with_retained_inputs(&root.0, key(), JobId([9; 16]),
+            limits(), retention, changed, TailPolicy::DiscardUncommitted, &mut Continue)),
+            JobRunError::Storage(JobError::Mismatch(MismatchField::Recipe)), "axis {axis}");
+        assert_eq!(events.executions.get(), 1);
+    }
+    let mut restored = JobRunner::resume_with_retained_inputs(&root.0, key(), JobId([9; 16]),
+        limits(), retention, make(), TailPolicy::Refuse, &mut Continue).unwrap();
+    let complete = restored.run(&mut Continue).unwrap();
+    assert_eq!((complete.committed, complete.attempts), (2, 2));
+    assert_eq!(complete.reserved_work, JobWork::from_int4(work(2), 0));
+    assert_eq!(events.executions.get(), 2);
+    restored.verify(&mut Continue).unwrap();
+}

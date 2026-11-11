@@ -18,6 +18,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
     let started = Instant::now();
     job.storage.input_retention.validate(mode, &args.input)?;
     let map = job.validate(&args)?;
+    let encoding = job.map.input_encoding(&args)?;
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
@@ -54,6 +55,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
         remaining()?, cancellation.clone(), model_failure)?;
     remaining()?;
     let compiler = Int4SentimentPlanner::for_model(model.model_identity(), options, budget, map.planning)
+        .and_then(|planner| planner.with_document_encoding(encoding.clone()))
         .map_err(|_| CandidateError::Planning)?;
     let planner = Int4SentimentDocumentJobPlanner::new(compiler, settings, map.mapping, lifetime)
         .map_err(|_| CandidateError::Planning)?;
@@ -93,7 +95,8 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
         source_revision: &identity.source_revision, source_root_sha256: model.model_identity().source_root_sha256(),
         model_content_sha256: &content, candidate_format: &identity.artifact_format,
         quant_recipe: &identity.quant_recipe, group_width: model.model_identity().group_width(),
-        integer_kernel: common.kernel.kind().id(), snapshot, cohort_chunks, output: &report };
+        integer_kernel: common.kernel.kind().id(), snapshot, cohort_chunks,
+        input_encoding: input_encoding::reported_policy(&encoding), output: &report };
     // Failure can follow durable commits; stdout contains only metadata.
     publish_report(&response, output, &remaining)
 }
@@ -155,6 +158,8 @@ struct Response<'a, T: Serialize> {
     snapshot: Option<SnapshotRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cohort_chunks: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<&'a UntrustedEncoding>,
     output: &'a T,
 }
 

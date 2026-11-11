@@ -244,3 +244,45 @@ fn optional_defaults_keep_four_axes_unless_an_explicit_fixed_selection_fits_the_
     assert_eq!(settings.axes, [SentimentAxis::Valence]);
     assert_eq!(settings.budget, budget, "a smaller fixed selection cannot change the declared task authority");
 }
+
+#[test]
+fn compact_start_and_resume_keep_fixed_policy_and_exact_document_memory() {
+    for operation in ["start", "resume"] {
+        for schedule in [vec![], vec!["--cohort-chunks", "2", "--max-axes", "2"]] {
+            let (byte_command, byte_args) = command(operation, &schedule);
+            let byte = byte_command.args.validate(&byte_args).unwrap();
+            let mut flags = schedule;
+            flags.extend(["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "262144",
+                "--max-tokenizer-output-tokens", "131072", "--max-tokenizer-pair-checks", "33554432",
+                "--max-tokenizer-pair-bytes", "268435456"]);
+            let (compact_command, compact_args) = command(operation, &flags);
+            let compact = compact_command.args.validate(&compact_args).unwrap();
+            let policy = SafeBpeLimits { max_input_bytes: 262_144, max_output_tokens: 131_072,
+                max_pair_checks: 33_554_432, max_pair_bytes: 268_435_456 };
+            assert_eq!(compact_command.args.map.input_encoding(&compact_args).unwrap(), UntrustedEncoding::SafeBpeV1(policy));
+            assert_eq!(compact.memory.input_bytes - byte.memory.input_bytes, policy.requirements().unwrap().workspace_bytes);
+            assert_eq!(compact.memory.native, byte.memory.native);
+            assert_eq!(compact.mapping.max_model_work, byte.mapping.max_model_work);
+            let fixed = lifetime(&compact_args, compact);
+            let admitted = compact_command.args.lifetime_limits(&compact_args, compact, fixed).unwrap();
+            assert_eq!(admitted.map.mapping.max_model_work, fixed.max_work.int4_model_work());
+            assert_eq!(admitted.map.common.minimum_memory_bytes, compact.common.minimum_memory_bytes
+                + admitted.buffer_bytes + compact.mapping.chunks.max_chunks as u64 * SENTIMENT_DOCUMENT_CHUNK_METADATA_BYTES);
+        }
+    }
+}
+
+#[test]
+fn invalid_compact_job_policy_refuses_before_keys_population_and_storage() {
+    for operation in ["start", "resume"] {
+        for flags in [vec!["--max-tokenizer-input-bytes", "128"],
+            vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "0"],
+            vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-output-tokens", "1048577"],
+            vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "0"],
+            vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-bytes", "536870913"],
+            vec!["--input-encoding", "safe-bpe-v1", "--save-snapshot", "never-create.snapshot"]] {
+            let (command, args) = command(operation, &flags);
+            assert_eq!(command.execute_owned(args, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage, "{flags:?}");
+        }
+    }
+}

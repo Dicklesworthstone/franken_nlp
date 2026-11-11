@@ -53,17 +53,26 @@ fn completion_reports_only_public_model_and_durable_progress_metadata() {
         durable_unit: "complete_original_document", model_id: "Nanbeige4.2-3B",
         source_revision: "public-revision", source_root_sha256: "public-source", model_content_sha256: "public-model",
         candidate_format: "candidate-int4", quant_recipe: "strict-int4", group_width: args.group_width,
-        integer_kernel: map.common.kernel.kind().id(), snapshot: None, cohort_chunks: Some(3), output: &report };
+        integer_kernel: map.common.kernel.kind().id(), snapshot: None, cohort_chunks: Some(3),
+        input_encoding: None, output: &report };
     let mut bytes = Vec::new(); publish_report(&response, &mut bytes, &available).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["durable_unit"], "complete_original_document"); assert_eq!(value["cohort_chunks"], 3);
     assert_eq!(value["task"], "sentiment"); assert_eq!(value["output"]["committed"], 2);
     assert_eq!(value["output"]["attempts"], 3);
+    assert!(value.get("input_encoding").is_none());
     assert_eq!(value["output"]["reserved_work"], serde_json::to_value(fixed.max_work).unwrap());
     for forbidden in ["text", "axes", "scores", "policy", "recipe", "key", "job_dir", "documents", "aggregate"] {
         assert!(value.get(forbidden).is_none()); assert!(value["output"].get(forbidden).is_none());
     }
     assert!(bytes.ends_with(b"\n"));
+    let encoding = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 262_144,
+        max_output_tokens: 131_072, max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 });
+    let compact = Response { input_encoding: Some(&encoding), ..response };
+    let mut compact_bytes = Vec::new(); publish_report(&compact, &mut compact_bytes, &available).unwrap();
+    let compact: serde_json::Value = serde_json::from_slice(&compact_bytes).unwrap();
+    assert_eq!(compact["input_encoding"], serde_json::to_value(&encoding).unwrap());
+    assert_eq!(compact["output"], value["output"]);
 }
 
 fn available() -> Result<Duration, CandidateError> { Ok(Duration::from_secs(1)) }

@@ -236,3 +236,35 @@ fn original_axis_capacity_remains_visible_to_host_admission() {
             SentimentLimits::default(), SentimentBatchArgs { axes, budget: budget() }, native).is_err());
     }
 }
+
+fn compact_policy() -> UntrustedEncoding {
+    UntrustedEncoding::SafeBpeV1(crate::tokenizer::untrusted::SafeBpeLimits {
+        max_input_bytes: 262_144, max_output_tokens: 131_072,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28,
+    })
+}
+
+#[test]
+fn compact_policy_and_every_tokenizer_ceiling_authenticate_resume_without_changing_byte_recipe() {
+    let make = || recipe(mapping(), settings(), SentimentLimits::default(), limits());
+    let byte = make();
+    assert!(serde_json::to_value(&byte).unwrap().get("input_encoding").is_none());
+    let mut compact = make(); compact.input_encoding = Some(compact_policy());
+    assert_eq!(freeze(&byte).binding.compare(&freeze(&compact).binding),
+        Err(JobError::Mismatch(MismatchField::Recipe)));
+    for axis in 0..4 {
+        let mut changed = make();
+        let UntrustedEncoding::SafeBpeV1(mut policy) = compact_policy() else { panic!("compact fixture"); };
+        match axis { 0 => policy.max_input_bytes -= 1, 1 => policy.max_output_tokens -= 1,
+            2 => policy.max_pair_checks -= 1, _ => policy.max_pair_bytes -= 1 }
+        changed.input_encoding = Some(UntrustedEncoding::SafeBpeV1(policy));
+        assert_eq!(freeze(&compact).binding.compare(&freeze(&changed).binding),
+            Err(JobError::Mismatch(MismatchField::Recipe)), "axis {axis}");
+    }
+    let mut cohorts = make(); cohorts.input_encoding = Some(compact_policy());
+    cohorts.execution = INT4_SENTIMENT_MAP_COHORT_EXECUTION; cohorts.cohort_chunks = Some(2);
+    cohorts.max_stored_result_bytes += 4096;
+    assert_eq!(freeze(&compact).binding.compare(&freeze(&cohorts).binding),
+        Err(JobError::Mismatch(MismatchField::Recipe)));
+    assert_eq!(freeze(&compact).binding.compare(&freeze(&compact).binding), Ok(()));
+}

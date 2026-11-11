@@ -79,7 +79,8 @@ impl NlpEngine {
             mapping, planner.max_run_work()).map_err(HostedError::BatchSetup)?;
         let max_axes = planner.max_axes(); let cohort_chunks = planner.cohort_chunks();
         let required = int4_sentiment_document_corpus_requirements(planner.group_width(), planner.task_budget(),
-            planner.planning_limits(), mapping, limits, max_axes, cohort_chunks)?;
+            planner.planning_limits(), mapping, limits, max_axes, cohort_chunks)?
+            .with_input_encoding(planner.document_encoding()).map_err(map_error)?;
         if planner.retained_defaults_bytes().map_err(HostedError::BatchSetup)? > limits.preparation_reserve_bytes {
             return Err(HostedError::Limits("sentiment defaults exceed their preparation reservation"));
         }

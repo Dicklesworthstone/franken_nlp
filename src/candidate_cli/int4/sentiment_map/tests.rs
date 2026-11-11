@@ -289,18 +289,17 @@ fn invalid_compact_work_and_repeated_presave_planning_refuse_before_private_io()
 }
 
 #[test]
-fn byte_only_corpus_and_retained_jobs_do_not_inherit_compact_document_options() {
-    for definition in [corpus::definition(), job::definition()] {
-        assert!(!definition.get_arguments().any(|arg| arg.get_id() == "input_encoding"));
-    }
-    for mut argv in [vec!["candidate", "source-int4", "sentiment-corpus"],
-        vec!["candidate", "source-int4", "sentiment-document-job", "start"],
-        vec!["candidate", "source-int4", "sentiment-document-job", "resume"]] {
-        argv.extend(["--input-encoding", "safe-bpe-v1"]);
-        assert!(crate::candidate_cli::definition().try_get_matches_from(argv).is_err());
+fn complete_population_routes_expose_compact_policy_but_keep_compute_separate() {
+    let corpus = corpus::definition();
+    assert!(corpus.get_arguments().any(|arg| arg.get_id() == "input_encoding"));
+    let jobs = job::definition();
+    for operation in ["start", "resume"] {
+        let definition = jobs.find_subcommand(operation).unwrap();
+        assert!(definition.get_arguments().any(|arg| arg.get_id() == "input_encoding"));
+        assert!(!definition.get_arguments().any(|arg| arg.get_id() == "compute_threads"));
     }
     let compact = command(&["--input-encoding", "safe-bpe-v1"]);
-    assert_eq!(selected(&compact).validate_with_max_axes(&compact.args, 4).err(), Some(CandidateError::Arguments));
+    selected(&compact).validate_with_max_axes(&compact.args, 4).unwrap();
     let mut byte = command(&[]);
     let Int4Task::SentimentMap(options) = &mut byte.task else { panic!("sentiment map required") };
     options.encoding.max_tokenizer_input_bytes = Some(128);
@@ -308,7 +307,8 @@ fn byte_only_corpus_and_retained_jobs_do_not_inherit_compact_document_options() 
     let help = threaded_definition().render_long_help().to_string();
     let words = help.split_whitespace().collect::<Vec<_>>().join(" ");
     for required in ["--input-encoding", "--max-tokenizer-input-bytes", "--max-tokenizer-output-tokens",
-        "oversized probes", "one shared tokenizer allowance", "refuse --save-snapshot"] {
+        "oversized probes", "one shared tokenizer allowance", "refuse --save-snapshot",
+        "preparation AND exact execution reconstruction", "all four limits authenticate"] {
         assert!(words.contains(required), "missing {required}");
     }
 }

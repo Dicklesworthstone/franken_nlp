@@ -112,8 +112,10 @@ pub struct Int4SentimentMapChunk {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Int4SentimentMapEncoding {
     pub policy: UntrustedEncoding,
-    /// Every attempted chunk and actual chunk plan shares this ledger. The
-    /// encoded document is reused across its independent sentiment axes.
+    /// Every attempted chunk and actual chunk plan in this completed planning
+    /// pass shares this ledger. Population preparation and reconstruction are
+    /// additionally charged together; this is not their summed invocation cost.
+    /// The encoded document is reused across its independent sentiment axes.
     pub work: SafeBpeWork,
 }
 /// Complete native output only; no caller-supplied result constructor enters
@@ -317,12 +319,19 @@ pub struct PreparedInt4SentimentMap<'a> {
 impl Int4SentimentPlanner {
     pub fn plan_document_with_control<'a, C: DecodeStepControl>(&self, request: &'a SentimentRequest,
         limits: Int4SentimentMapLimits, control: &mut C) -> Result<PreparedInt4SentimentMap<'a>, Int4SentimentMapError> {
+        self.plan_document_with_encoding_work(request, limits, control, &mut SafeBpeWork::default())
+    }
+    /// Population preparation and exact reconstruction spend the same owned
+    /// ledger. Completed-map seals retain only this pass's deterministic delta.
+    pub(crate) fn plan_document_with_encoding_work<'a, C: DecodeStepControl>(&self,
+        request: &'a SentimentRequest, limits: Int4SentimentMapLimits, control: &mut C,
+        work: &mut SafeBpeWork) -> Result<PreparedInt4SentimentMap<'a>, Int4SentimentMapError> {
         checkpoint(control)?; limits.validate(request.budget)?;
         if request.document.is_empty() { return Err(Int4SentimentMapError::EmptySource); }
         let capacity = self.source_token_capacity(&request.axes, request.budget, limits.chunks.context_tokens)?;
-        PreparedInt4SentimentMap::compile_encoded(request, limits, capacity, self.group_width(),
+        PreparedInt4SentimentMap::compile_encoded_with_work(request, limits, capacity, self.group_width(),
             binding::Authority { ceiling: self.task_budget(), planning: self.planning_limits() },
-            self.document_encoding(), SafeBpeWork::default(), control,
+            self.document_encoding(), work, control,
             |source, control, work| self.source_tokens_with_work(source, work, control),
             |request, control, work| self.plan_with_encoding_work(request, control, work))
     }
@@ -338,13 +347,25 @@ impl<'a> PreparedInt4SentimentMap<'a> {
             &UntrustedEncoding::ByteFallback, SafeBpeWork::default(), control,
             |source, _, _| Ok(source.len()), |request, control, _| prepare(request, control))
     }
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn compile_encoded<C: DecodeStepControl, Count, Prepare>(request: &'a SentimentRequest,
         limits: Int4SentimentMapLimits, capacity: usize, width: usize, authority: binding::Authority,
-        encoding: &UntrustedEncoding, mut work: SafeBpeWork, control: &mut C, mut count: Count, mut prepare: Prepare)
+        encoding: &UntrustedEncoding, mut work: SafeBpeWork, control: &mut C, count: Count, prepare: Prepare)
         -> Result<Self, Int4SentimentMapError>
     where Count: FnMut(&str, &mut C, &mut SafeBpeWork) -> Result<usize, SentimentPlanningError>,
         Prepare: FnMut(&SentimentRequest, &mut C, &mut SafeBpeWork) -> Result<PreparedInt4Sentiment, Int4SentimentError> {
+        Self::compile_encoded_with_work(request, limits, capacity, width, authority, encoding,
+            &mut work, control, count, prepare)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn compile_encoded_with_work<C: DecodeStepControl, Count, Prepare>(request: &'a SentimentRequest,
+        limits: Int4SentimentMapLimits, capacity: usize, width: usize, authority: binding::Authority,
+        encoding: &UntrustedEncoding, work: &mut SafeBpeWork, control: &mut C, mut count: Count, mut prepare: Prepare)
+        -> Result<Self, Int4SentimentMapError>
+    where Count: FnMut(&str, &mut C, &mut SafeBpeWork) -> Result<usize, SentimentPlanningError>,
+        Prepare: FnMut(&SentimentRequest, &mut C, &mut SafeBpeWork) -> Result<PreparedInt4Sentiment, Int4SentimentError> {
+        let previous_work = *work;
         encoding.validate().map_err(|_| Int4SentimentMapError::Limits)?;
         limits.validate(request.budget)?;
         if request.document.is_empty() { return Err(Int4SentimentMapError::EmptySource); }
@@ -356,7 +377,7 @@ impl<'a> PreparedInt4SentimentMap<'a> {
         let chunks = {
             let control = RefCell::new(&mut *control);
             ChunkPlan::build_with_checkpoints(&request.document, chunks_limits,
-                |text| count(text, &mut **control.borrow_mut(), &mut work).map_err(|cause| {
+                |text| count(text, &mut **control.borrow_mut(), work).map_err(|cause| {
                     *error.borrow_mut() = Some(cause); MapReduceError::Tokenizer
                 }),
                 || match control.borrow_mut().prefill_checkpoint(0) {
@@ -376,7 +397,7 @@ impl<'a> PreparedInt4SentimentMap<'a> {
             aggregation: limits.aggregation, chunk_limits: chunks_limits, tokenizer_checks: chunks.tokenizer_calls(),
             source_geometry: geometry(chunks.chunks().iter().map(|chunk| (chunk.id(), chunk.span(), chunk.tokens()))),
             encoding: match encoding { UntrustedEncoding::ByteFallback => None,
-                UntrustedEncoding::SafeBpeV1(limits) => Some(*limits) }, encoding_work: work,
+                UntrustedEncoding::SafeBpeV1(limits) => Some(*limits) }, encoding_work: SafeBpeWork::default(),
             request_binding: [0; 32] };
         let mut plans = reserved(expected.chunks)?;
         for chunk in chunks.chunks() {
@@ -384,7 +405,7 @@ impl<'a> PreparedInt4SentimentMap<'a> {
             let mut text = String::new(); text.try_reserve_exact(chunk.text().len()).map_err(|_| Int4SentimentMapError::Allocation)?;
             text.push_str(chunk.text());
             let row = SentimentRequest { document: text, axes: request.axes.clone(), budget: request.budget };
-            let plan = prepare(&row, control, &mut work)?;
+            let plan = prepare(&row, control, work)?;
             if plan.group_width() != width || plan.head_count() != expected.heads || plan.task_budget() != request.budget
                 || plan.source_token_count()? != chunk.tokens()
                 || plan.required_context() > chunks_limits.context_tokens { return Err(Int4SentimentMapError::Admission); }
@@ -392,8 +413,9 @@ impl<'a> PreparedInt4SentimentMap<'a> {
             if !fits(expected.work, limits.max_model_work) { return Err(Int4SentimentMapError::Work); }
             plans.push(plan);
         }
-        expected.encoding_work = work;
-        expected.request_binding = binding::request(request, limits, authority, encoding, work, &chunks, &plans, control)?;
+        let delta = work.checked_sub(previous_work).ok_or(Int4SentimentMapError::Admission)?;
+        expected.encoding_work = delta;
+        expected.request_binding = binding::request(request, limits, authority, encoding, delta, &chunks, &plans, control)?;
         checkpoint(control)?;
         Ok(Self { chunks, plans, limits, expected, task: request.budget })
     }

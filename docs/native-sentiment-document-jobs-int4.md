@@ -113,6 +113,28 @@ can replace the independently pinned snapshot route. Explicit
 `--save-snapshot NEW_FILE` saves the admitted model before population ingestion;
 that model file can remain if a later job or report-delivery step fails.
 
+## Compact input and resume
+
+Add `--input-encoding safe-bpe-v1` and repeat the same encoding policy on every
+resume. `--max-tokenizer-input-bytes`, `--max-tokenizer-output-tokens`,
+`--max-tokenizer-pair-checks` and `--max-tokenizer-pair-bytes` bind one complete
+document attempt, including initial preparation, all chunk probes and exact
+reconstruction for execution. The stored private recipe authenticates every
+ceiling before replay or tail repair. A changed policy refuses resume, including
+when `--use-retained-input` reads the authenticated original population.
+
+Compact serial and chunk-cohort jobs admit one encoder workspace. Reaching a
+tokenizer ceiling refuses the document before any native forward, with no
+truncation or fallback. Per-pass result work remains deterministic; the private
+attempt ledger includes both planning passes. Native work and failed attempts
+retain their separate durable lifetime semantics. Byte fallback preserves the
+existing recipe and output shape. Compact mode accepts pinned sources or a
+pinned snapshot, and refuses `--save-snapshot` before IO.
+
+Embedding callers select `Int4SentimentPlanner::with_document_encoding` before
+constructing `Int4SentimentDocumentJobPlanner`; no record argument may override
+that sealed policy.
+
 ## Work, memory and recovery
 
 The five per-document native work flags cover all chunks and requested axes:

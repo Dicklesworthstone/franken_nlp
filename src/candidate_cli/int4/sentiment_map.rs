@@ -72,11 +72,11 @@ pub(super) fn definition() -> clap::Command {
         .mut_arg("max_checkpoints", |arg| arg.help("Cooperative allowance for the complete hosted plan, all chunks and reduction")))
 }
 
-/// Corpus/job callers keep the original byte-only parser. One document
-/// owns one nonrenewable compact-tokenizer allowance across its complete plan.
+/// One document owns a bounded compact-tokenizer allowance. Population
+/// callers additionally retain that allowance through exact reconstruction.
 pub(super) fn one_off_definition() -> clap::Command {
     MapEncodingArgs::augment_args(input_encoding::definition(definition()))
-        .after_long_help("--input-encoding safe-bpe-v1 chooses chunks using actual compact source-token counts. Every attempted chunk, including oversized probes, and every actual chunk plan spends one shared tokenizer allowance. Each encoded chunk is reused across its sentiment axes. --max-tokenizer-input-bytes and --max-tokenizer-output-tokens default to 1048576 each; pair checks and examined pair bytes use their explicit shared flags. Exhaustion refuses the whole document before any native forward. Context, source bytes, native work, output and memory retain separate ceilings. Compact output records the exact policy and consumed work. This selects a different prompt token sequence and makes no model-quality or tokenizer-parity claim. Compact maps accept pinned sources or snapshot reload but refuse --save-snapshot, whose separate pre-save planning would repeat tokenizer work. The byte-fallback default, sentiment-corpus and sentiment-document-job retain their existing contracts.")
+        .after_long_help("--input-encoding safe-bpe-v1 chooses chunks using actual compact source-token counts. Every attempted chunk, including oversized probes, and every actual chunk plan spends one shared tokenizer allowance. Each encoded chunk is reused across its sentiment axes. --max-tokenizer-input-bytes and --max-tokenizer-output-tokens default to 1048576 each; pair checks and examined pair bytes use their explicit shared flags. Corpus and retained-job documents share that allowance across preparation AND exact execution reconstruction; neither pass renews it. The result's input_encoding.work records the completed planning pass, not the summed two-pass cost. Each new document or explicit resumed attempt receives its own bounded tokenizer ledger; native work and durable attempts retain their existing lifetime accounting. Exhaustion refuses the whole document before any native forward. Context, source bytes, native work, output and memory retain separate ceilings. The exact policy and all four limits authenticate retained-job resume. This selects a different prompt token sequence and makes no model-quality or tokenizer-parity claim. Compact maps accept pinned sources or snapshot reload but refuse --save-snapshot, whose separate pre-save planning would repeat tokenizer work. Byte-fallback output and job recipes are unchanged when the option is omitted.")
 }
 
 /// Keep numerical teams opt-in on the one-document route; definitions reused
@@ -112,8 +112,7 @@ impl MapArgs {
     /// Corpus callers can narrow every document's declared axis capability.
     /// One-off maps continue to admit their original four-axis request space.
     fn validate_with_max_axes(self, args: &Int4Args, max_axes: usize) -> Result<MapLimits, CandidateError> {
-        if args.compute.threads() != 1 || !args.input_encoding.is_default()
-            || self.encoding != MapEncodingArgs::default() {
+        if args.compute.threads() != 1 {
             return Err(CandidateError::Arguments);
         }
         self.validate_document(args, max_axes)

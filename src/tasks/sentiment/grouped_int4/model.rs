@@ -46,7 +46,7 @@ impl Int4SentimentPlanner {
         self.compiler.source_capacity(axes, budget, self.ceiling, self.limits, context_tokens)
             .map_err(Int4SentimentError::from)
     }
-    pub(super) fn source_token_capacity(&self, axes: &[crate::tasks::sentiment::SentimentAxis],
+    pub(crate) fn source_token_capacity(&self, axes: &[crate::tasks::sentiment::SentimentAxis],
         budget: TaskBudget, context_tokens: usize) -> Result<usize, SentimentPlanningError> {
         self.compiler.source_token_capacity(axes, budget, self.ceiling, self.limits, context_tokens)
     }

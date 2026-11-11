@@ -104,6 +104,7 @@ fn candidate_frames_preserve_native_bytes_and_report_only_the_declared_public_sc
             candidate_format: "fixture-format", quant_recipe: "fixture-recipe:group=128",
             group_width: 128, integer_kernel: "s_scalar_i32",
             snapshot: operation.map(|name| SnapshotRecord::new(name, need)),
+            input_encoding: None,
         };
         // Framing bytes are a transport fixture, never invented native scores.
         let inner = "{\"event\":\"fixture\",\"result\":{\"label\":\"café 上海\",\"single_context_equivalence\":false,\"exact\":12345678901234567890123456789012345678}}\n";
@@ -137,7 +138,36 @@ fn candidate_frames_preserve_native_bytes_and_report_only_the_declared_public_sc
             assert!(value.get(absent).is_none());
         }
         assert!(matches!(CandidateWriter::new(NoIo, &provenance, 4096, 1), Err(CandidateError::Output)));
+        assert!(value.get("input_encoding").is_none());
+        let encoding = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 262_144,
+            max_output_tokens: 131_072, max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 });
+        let compact = Provenance { input_encoding: Some(&encoding), ..provenance };
+        let compact = serde_json::to_value(&compact).unwrap();
+        assert_eq!(compact["input_encoding"], serde_json::to_value(&encoding).unwrap());
     }
 }
 
 mod model;
+
+#[test]
+fn compact_host_and_cli_quotes_share_one_encoder_reservation() {
+    for schedule in [vec![], vec!["--cohort-chunks", "2", "--max-axes", "2"]] {
+        let mut flags = schedule;
+        flags.extend(["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "262144",
+            "--max-tokenizer-output-tokens", "131072"]);
+        let command = command(&flags);
+        let Int4Task::SentimentCorpus(options) = command.task else { panic!("sentiment corpus required"); };
+        let args = command.args; let limits = options.validate(&args).unwrap();
+        let encoding = options.document.input_encoding(&args).unwrap();
+        let task = options.document.budget_with_max_axes(limits.common, options.stream.max_axes).unwrap();
+        let host = host_limits(&args, limits, Duration::from_secs(30));
+        let quote = crate::hosted::int4_sentiment_document_corpus_requirements(args.group_width, task,
+            limits.document.planning, limits.document.mapping, host, options.stream.max_axes,
+            options.document.mapping.cohort_chunks).unwrap().with_input_encoding(&encoding).unwrap();
+        assert_eq!(quote.input_bytes, limits.document.memory.input_bytes
+            + corpus_buffer_bytes(limits.transport, limits.common.preparation_bytes, limits.io_bytes).unwrap()
+            + retained_metadata_bytes(limits.document.mapping.chunks.max_chunks).unwrap());
+        assert_eq!(quote.native, limits.document.memory.native);
+        assert_eq!(quote.workspace_bytes, limits.document.memory.workspace_bytes);
+    }
+}

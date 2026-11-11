@@ -18,6 +18,7 @@ use crate::{
             long::{Int4SentimentMapError, Int4SentimentMapLimits, Int4SentimentMapPreflight,
                 Int4SentimentMapRun, Int4SentimentMapCohortRun,
                 memory::Int4SentimentMapMemoryLimits}}}},
+    tokenizer::untrusted::{SafeBpeWork, UntrustedEncoding},
 };
 mod backend;
 use backend::Backend;
@@ -42,17 +43,17 @@ pub struct Int4SentimentDocumentBatchPlanner {
 impl Int4SentimentDocumentBatchPlanner {
     pub fn new(planner: Int4SentimentPlanner, defaults: Option<SentimentBatchArgs>,
         mapping: Int4SentimentMapLimits, max_run_work: Int4Work) -> Result<Self, BatchFault> {
-        if planner.document_encoding() != &crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback {
-            return Err(BatchCode::Admission.into());
-        }
         validate_limits(planner.task_budget(), planner.planning_limits(), mapping, max_run_work)?;
         constrained_int4::check_profile(planner.execution_identity(), planner.group_width())
             .map_err(|_| BatchCode::Admission)?;
         if planner.execution_identity().task_spec != "sentiment-v1" { return Err(BatchCode::Admission.into()); }
         if let Some(args) = &defaults {
             validate_args(args, planner.task_budget()).map_err(|e| e.fault)?;
-            planner.max_document_bytes(&args.axes, args.budget, mapping.chunks.context_tokens)
-                .map_err(|e| map_failure(e.into(), false).fault)?;
+            // This is a token capacity, independent of the source encoding.
+            // Actual compact source counts are bounded inside each complete
+            // document preparation; bytes must never stand in for tokens.
+            planner.source_token_capacity(&args.axes, args.budget, mapping.chunks.context_tokens)
+                .map_err(|e| map_failure(Int4SentimentError::from(e).into(), false).fault)?;
         }
         Ok(Self { planner, defaults, mapping, max_run_work, max_axes: 4, cohort_chunks: None, seal: Arc::new(()) })
     }
@@ -80,6 +81,10 @@ impl Int4SentimentDocumentBatchPlanner {
         Ok(self)
     }
     pub fn base_execution_identity(&self) -> &ExecutionIdentity { self.planner.execution_identity() }
+    /// One immutable policy for every document and its exact reconstruction.
+    /// Both passes share one nonrenewable per-document tokenizer ledger;
+    /// native invocation work remains cumulative across documents.
+    pub fn document_encoding(&self) -> &UntrustedEncoding { self.planner.document_encoding() }
     pub fn group_width(&self) -> usize { self.planner.group_width() }
     pub fn task_budget(&self) -> TaskBudget { self.planner.task_budget() }
     pub fn planning_limits(&self) -> SentimentLimits { self.planner.planning_limits() }
@@ -109,6 +114,7 @@ pub struct PreparedInt4SentimentDocument {
     identities: Vec<ExecutionIdentity>,
     required_context: usize,
     head_count: usize,
+    encoding_work: SafeBpeWork,
     seal: Arc<()>,
 }
 impl PreparedInt4SentimentDocument {
@@ -116,6 +122,8 @@ impl PreparedInt4SentimentDocument {
     pub fn planned_work(&self) -> Int4Work { self.expected.planned_work() }
     pub fn chunk_count(&self) -> usize { self.expected.chunk_count() }
     pub fn head_count(&self) -> usize { self.head_count }
+    /// Work already consumed by preparation; reconstruction must continue it.
+    pub fn encoding_work(&self) -> SafeBpeWork { self.encoding_work }
 }
 
 /// Preserve the existing standalone serial/cohort wire values verbatim.
@@ -185,7 +193,9 @@ impl<A: Int4SentimentDocumentBatchAdmission> BatchProcessor for NativeInt4Sentim
             checkpoint(control)?;
             let request = self.compiler.request(document)?;
             self.backend.check(&self.compiler, request.budget, request.axes.len())?;
-            let plan = self.compiler.planner.plan_document_with_control(&request, self.compiler.mapping, control)
+            let mut encoding_work = SafeBpeWork::default();
+            let plan = self.compiler.planner.plan_document_with_encoding_work(&request, self.compiler.mapping,
+                control, &mut encoding_work)
                 .map_err(|e| map_failure(e, false))?;
             subtract(self.run.remaining(), plan.planned_work())?;
             let identities = plan.identities().map_err(|e| map_failure(e, false))?;
@@ -193,7 +203,7 @@ impl<A: Int4SentimentDocumentBatchAdmission> BatchProcessor for NativeInt4Sentim
             let expected = plan.preflight_metadata(); let required_context = plan.required_context();
             let head_count = plan.head_count();
             drop(plan); checkpoint(control)?;
-            Ok(PreparedInt4SentimentDocument { request, expected, identities, required_context, head_count,
+            Ok(PreparedInt4SentimentDocument { request, expected, identities, required_context, head_count, encoding_work,
                 seal: Arc::clone(&self.compiler.seal) })
         })();
         self.run.finish_preparation(result, self.backend.clean())
@@ -205,7 +215,7 @@ impl<A: Int4SentimentDocumentBatchAdmission> BatchProcessor for NativeInt4Sentim
     fn execute<C: DecodeStepControl>(&mut self, _: Self::Prepared, _: &mut C) -> Result<Self::Output, BatchItemFailure> {
         self.run.fail(); Err(BatchItemFailure::fatal(BatchCode::InvalidExecution))
     }
-    fn execute_with_context<C: DecodeStepControl>(&mut self, prepared: Self::Prepared,
+    fn execute_with_context<C: DecodeStepControl>(&mut self, mut prepared: Self::Prepared,
         context: BatchRequestContext, control: &mut C) -> Result<Self::Output, BatchItemFailure> {
         self.run.enter()?;
         let result = (|| {
@@ -217,7 +227,8 @@ impl<A: Int4SentimentDocumentBatchAdmission> BatchProcessor for NativeInt4Sentim
             self.run.charge(prepared.planned_work(), context)?;
             checkpoint(control)?;
             let kv = self.backend.check(&self.compiler, prepared.request.budget, prepared.head_count)?;
-            let plan = self.compiler.planner.plan_document_with_control(&prepared.request, self.compiler.mapping, control)
+            let plan = self.compiler.planner.plan_document_with_encoding_work(&prepared.request, self.compiler.mapping,
+                control, &mut prepared.encoding_work)
                 .map_err(|e| map_failure(e, true))?;
             let actual = plan.identities().map_err(|e| map_failure(e, true))?;
             if plan.preflight_metadata() != prepared.expected || actual != prepared.identities
