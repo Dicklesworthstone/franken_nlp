@@ -83,7 +83,7 @@ impl NlpEngine {
                 let result = prepared.execute_with_control(&admitted, &mut engine.value,
                     Int4ScoringBudget { native: Int4RunBudget::exact(prepared.planned_work()),
                         max_kv_bytes: required.native.kv_bytes }, control).map_err(map_error)?;
-                expected.verify_completed(&result).map_err(map_error)?;
+                expected.verify_completed_with_control(&result, control).map_err(map_error)?;
                 if engine.value.is_poisoned() || !engine.value.kv_cache().all_slots_have_len(0) {
                     return Err(map_error(Int4FaithfulnessMapError::Admission));
                 }
@@ -140,7 +140,7 @@ impl NlpEngine {
                     || !valid_physical_counts(result.output.model_work, result.group_steps, result.projection_groups) {
                     return Err(map_error(Int4FaithfulnessMapError::Admission));
                 }
-                expected.verify_completed(&result.output).map_err(map_error)?;
+                expected.verify_completed_cohorts_with_control(&result, cohort_chunks, control).map_err(map_error)?;
                 checkpoint(control)?;
                 Ok(result)
             })?;

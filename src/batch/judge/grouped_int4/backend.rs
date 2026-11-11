@@ -92,17 +92,18 @@ fn cohort_budget(work: Int4Work, required: Int4FaithfulnessMapCohortMemoryRequir
             max_scratch_payload_bytes: required.memory.native.scratch_payload_bound },
         max_task_workspace_bytes: required.task_workspace_bytes, max_output_bytes: required.max_cohort_output_bytes }
 }
-pub(super) fn verify_completed(expected: &Int4FaithfulnessMapPreflight, chunks: Option<usize>,
-    result: &Int4FaithfulnessDocumentRun) -> Result<(), Int4FaithfulnessMapError> {
+pub(super) fn verify_completed<C: DecodeStepControl>(expected: &Int4FaithfulnessMapPreflight,
+    chunks: Option<usize>, result: &Int4FaithfulnessDocumentRun, control: &mut C)
+    -> Result<(), Int4FaithfulnessMapError> {
     match (chunks, result) {
-        (None, Int4FaithfulnessDocumentRun::Serial(run)) => expected.verify_completed(run),
+        (None, Int4FaithfulnessDocumentRun::Serial(run)) => expected.verify_completed_with_control(run, control),
         (Some(chunks), Int4FaithfulnessDocumentRun::ChunkCohorts(run)) => {
             if run.schema_version != 1 || run.execution != INT4_FAITHFULNESS_MAP_COHORT_EXECUTION {
                 return Err(Int4FaithfulnessMapError::Admission);
             }
             verify_schedule(expected.chunk_count(), chunks, run.chunk_cohorts,
                 run.group_steps, run.projection_groups, expected.planned_work())?;
-            expected.verify_completed(&run.output)
+            expected.verify_completed_cohorts_with_control(run, chunks, control)
         }
         _ => Err(Int4FaithfulnessMapError::Admission),
     }

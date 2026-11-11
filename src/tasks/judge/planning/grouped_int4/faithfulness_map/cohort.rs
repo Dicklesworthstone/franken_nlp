@@ -11,7 +11,7 @@ use crate::native_engine::{int4::PackedInt4Kernel,
 pub const INT4_FAITHFULNESS_MAP_COHORT_EXECUTION: &str = "grouped-int4-faithfulness-chunk-cohorts-v1";
 pub(super) const COHORT_WRAPPER_BYTES: u64 = 4096;
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 pub struct Int4FaithfulnessMapCohortRun {
     pub schema_version: u32,
     pub execution: String,
@@ -19,6 +19,25 @@ pub struct Int4FaithfulnessMapCohortRun {
     pub group_steps: u64,
     pub projection_groups: u64,
     pub output: Int4FaithfulnessMapRun,
+    #[serde(skip)]
+    effective_cohort_chunks: usize,
+    #[serde(skip)]
+    result_binding: [u8; 32],
+}
+impl Int4FaithfulnessMapCohortRun {
+    pub(super) fn effective_cohort_chunks(&self) -> usize { self.effective_cohort_chunks }
+    pub(super) fn binding_matches_with_control<C: DecodeStepControl>(&self, cap: u64,
+        control: &mut C) -> Result<bool, Int4FaithfulnessMapError> {
+        Ok(self.result_binding == binding::cohort_with_control(self, cap, control)?)
+    }
+}
+impl fmt::Debug for Int4FaithfulnessMapCohortRun {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Int4FaithfulnessMapCohortRun")
+            .field("schema_version", &self.schema_version).field("execution", &self.execution)
+            .field("chunk_cohorts", &self.chunk_cohorts).field("group_steps", &self.group_steps)
+            .field("projection_groups", &self.projection_groups).field("output", &self.output).finish()
+    }
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Int4FaithfulnessMapCohortBudget {
@@ -181,11 +200,17 @@ impl PreparedInt4FaithfulnessMap<'_> {
             results.next().ok_or(Int4FaithfulnessMapError::Admission)
         })?;
         if results.len() != 0 || next_window != windows.len() { return Err(Int4FaithfulnessMapError::Admission); }
-        let run = Int4FaithfulnessMapCohortRun { schema_version: 1,
+        let first = windows.first().ok_or(Int4FaithfulnessMapError::Admission)?;
+        let effective_cohort_chunks = first.end.checked_sub(first.start)
+            .filter(|&width| width != 0).ok_or(Int4FaithfulnessMapError::Admission)?;
+        let mut run = Int4FaithfulnessMapCohortRun { schema_version: 1,
             execution: INT4_FAITHFULNESS_MAP_COHORT_EXECUTION.to_owned(),
-            chunk_cohorts: windows.len(), group_steps, projection_groups, output };
-        value_bytes(&run, self.limits.max_result_bytes.checked_add(COHORT_WRAPPER_BYTES)
-            .ok_or(Int4FaithfulnessMapError::Limits)?)?;
+            chunk_cohorts: windows.len(), group_steps, projection_groups, output,
+            effective_cohort_chunks, result_binding: [0; 32] };
+        let cap = self.limits.max_result_bytes.checked_add(COHORT_WRAPPER_BYTES)
+            .ok_or(Int4FaithfulnessMapError::Limits)?;
+        run.result_binding = binding::cohort_with_control(&run, cap, control)?;
+        value_bytes(&run, cap)?;
         checkpoint(control)?; Ok(run)
     }
 }

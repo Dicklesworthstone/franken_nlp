@@ -26,6 +26,9 @@ fn stopped(cause: DecodeCancellationKind) -> CandidateError {
 fn planning_error(error: Int4FaithfulnessMapError) -> CandidateError {
     error.cancellation().map(stopped).unwrap_or(CandidateError::Planning)
 }
+fn completion_error(error: Int4FaithfulnessMapError) -> CandidateError {
+    error.cancellation().map(stopped).unwrap_or(CandidateError::Execution)
+}
 fn judge_error(error: Int4JudgeError) -> CandidateError {
     error.cancellation().map(stopped).unwrap_or(CandidateError::Planning)
 }
@@ -159,7 +162,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         let result = engine.map_int4_faithfulness_cohorts(&model, request, config, chunks,
             common.kernel, cancellation).map_err(|error| host_error(error, CandidateError::Execution))?;
         if let Some(expected) = expected {
-            expected.verify_completed(&result.result().output).map_err(|_| CandidateError::Execution)?;
+            expected.verify_completed_cohorts_with_control(result.result(), chunks,
+                &mut DeadlineControl { started, deadline }).map_err(completion_error)?;
         }
         let cohort = Cohort { schema_version: result.result().schema_version,
             execution: &result.result().execution, max_chunks: chunks, chunk_cohorts: result.result().chunk_cohorts,
@@ -170,7 +174,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         let result = engine.map_int4_faithfulness(&model, request, config, common.kernel, cancellation)
             .map_err(|error| host_error(error, CandidateError::Execution))?;
         if let Some(expected) = expected {
-            expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+            expected.verify_completed_with_control(result.result(),
+                &mut DeadlineControl { started, deadline }).map_err(completion_error)?;
         }
         publish_complete(&Response { provenance: &provenance, output: result.result(), cohort: None },
             limits.envelope_bytes, output, &remaining)

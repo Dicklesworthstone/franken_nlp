@@ -233,7 +233,7 @@ impl<A: Int4FaithfulnessDocumentBatchAdmission> BatchProcessor for NativeInt4Fai
             if admitted != prepared.identities { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
             checkpoint(control)?;
             let output = self.backend.execute(&plan, &admitted, control).map_err(|error| map_failure(error, true))?;
-            backend::verify_completed(&prepared.expected, self.compiler.cohort_chunks, &output)
+            backend::verify_completed(&prepared.expected, self.compiler.cohort_chunks, &output, control)
                 .map_err(|error| map_failure(error, true))?;
             checkpoint(control)?;
             Ok(GuardedOutput::new(output, guard))

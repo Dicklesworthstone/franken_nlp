@@ -9,6 +9,7 @@ use crate::{tasks::{judge::{FaithfulnessAggregate, FaithfulnessAggregationPolicy
 
 pub mod memory;
 mod cohort;
+mod binding;
 pub use cohort::{Int4FaithfulnessMapCohortBudget, Int4FaithfulnessMapCohortRun,
     INT4_FAITHFULNESS_MAP_COHORT_EXECUTION};
 
@@ -106,23 +107,52 @@ pub struct Int4FaithfulnessMapChunk {
     /// Aggregate witnesses separately carry original-source coordinates.
     pub run: Int4JudgeRun,
 }
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 pub struct Int4FaithfulnessMapRun {
     pub schema_version: u32, pub execution: String, pub numerics_profile: String, pub group_width: usize,
     pub chunk_profile: String, pub semantics: String, pub single_context_equivalence: bool,
     pub source_span: VerifiedSourceSpan, pub chunk_limits: ChunkLimits, pub tokenizer_checks: usize,
     pub planned_model_work: Int4Work, pub model_work: Int4Work, pub retained_result_bytes: u64,
     pub chunks: Vec<Int4FaithfulnessMapChunk>, pub aggregate: FaithfulnessAggregate,
+    #[serde(skip)]
+    request_binding: [u8; 32],
+    #[serde(skip)]
+    result_binding: [u8; 32],
+}
+impl fmt::Debug for Int4FaithfulnessMapRun {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Int4FaithfulnessMapRun")
+            .field("schema_version", &self.schema_version).field("execution", &self.execution)
+            .field("numerics_profile", &self.numerics_profile).field("group_width", &self.group_width)
+            .field("chunk_profile", &self.chunk_profile).field("semantics", &self.semantics)
+            .field("single_context_equivalence", &self.single_context_equivalence)
+            .field("source_span", &self.source_span).field("chunk_limits", &self.chunk_limits)
+            .field("tokenizer_checks", &self.tokenizer_checks).field("planned_model_work", &self.planned_model_work)
+            .field("model_work", &self.model_work).field("retained_result_bytes", &self.retained_result_bytes)
+            .field("chunks", &self.chunks).field("aggregate", &self.aggregate).finish()
+    }
 }
 
-/// Content-free completion geometry from one sealed plan, not an external
-/// JSON authenticator or a substitute for execution of the native heads.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Private request authority and content-free completion geometry. Only the
+/// native collector seals completed results; external JSON has no authority.
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Int4FaithfulnessMapPreflight {
     source: VerifiedSourceSpan, chunks: usize, heads: usize, max_heads: usize,
     policy: FaithfulnessPolicy, group_width: usize, work: Int4Work,
     retained_bytes: u64, result_bytes: u64, aggregation: FaithfulnessAggregationPolicy,
     chunk_limits: ChunkLimits, tokenizer_checks: usize,
+    request_binding: [u8; 32],
+}
+impl fmt::Debug for Int4FaithfulnessMapPreflight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Int4FaithfulnessMapPreflight")
+            .field("source", &self.source).field("chunks", &self.chunks)
+            .field("heads", &self.heads).field("max_heads", &self.max_heads)
+            .field("policy", &self.policy).field("group_width", &self.group_width).field("work", &self.work)
+            .field("retained_bytes", &self.retained_bytes).field("result_bytes", &self.result_bytes)
+            .field("aggregation", &self.aggregation).field("chunk_limits", &self.chunk_limits)
+            .field("tokenizer_checks", &self.tokenizer_checks).finish()
+    }
 }
 impl Int4FaithfulnessMapPreflight {
     pub fn chunk_count(&self) -> usize { self.chunks }
@@ -130,7 +160,49 @@ impl Int4FaithfulnessMapPreflight {
     pub fn max_head_count(&self) -> usize { self.max_heads }
     pub fn planned_work(&self) -> Int4Work { self.work }
     pub fn source_span(&self) -> VerifiedSourceSpan { self.source }
+    pub fn verify_completed_cohorts(&self, run: &Int4FaithfulnessMapCohortRun, cohort_chunks: usize)
+        -> Result<(), Int4FaithfulnessMapError> {
+        self.verify_completed_cohorts_with_control(run, cohort_chunks, &mut Continue)
+    }
+    /// Verify the physical schedule and nested result without leaving the
+    /// caller's deadline and checkpoint allowance during private hashing.
+    pub fn verify_completed_cohorts_with_control<C: DecodeStepControl>(&self,
+        run: &Int4FaithfulnessMapCohortRun, cohort_chunks: usize, control: &mut C)
+        -> Result<(), Int4FaithfulnessMapError> {
+        checkpoint(control)?;
+        let cap = self.result_bytes.checked_add(cohort::COHORT_WRAPPER_BYTES)
+            .ok_or(Int4FaithfulnessMapError::Limits)?;
+        let vocabulary = NANBEIGE_VOCAB_SIZE as u64;
+        if !run.binding_matches_with_control(cap, control)? || cohort_chunks == 0
+            || cohort_chunks > self.chunk_limits.max_chunks
+            || cohort_chunks > crate::native_engine::strict_int4::cohort::MAX_INT4_SEQUENCES
+            || run.effective_cohort_chunks() != cohort_chunks.min(self.chunks)
+            || run.schema_version != 1 || run.execution != INT4_FAITHFULNESS_MAP_COHORT_EXECUTION
+            || run.chunk_cohorts != self.chunks.div_ceil(cohort_chunks)
+            || run.group_steps == 0 || run.group_steps > self.work.forward_positions
+            || self.work.projected_logits % vocabulary != 0
+            || run.projection_groups == 0 || run.projection_groups > self.work.projected_logits / vocabulary {
+            return Err(Int4FaithfulnessMapError::Admission);
+        }
+        self.verify_completed_with_control(&run.output, control)?;
+        value_bytes(run, cap)?;
+        checkpoint(control)?; Ok(())
+    }
     pub fn verify_completed(&self, run: &Int4FaithfulnessMapRun) -> Result<(), Int4FaithfulnessMapError> {
+        self.verify_completed_with_control(run, &mut Continue)
+    }
+    /// Preserve cancellation through result hashing and complete validation.
+    /// The compatibility wrapper above uses the same checks without a stop source.
+    pub fn verify_completed_with_control<C: DecodeStepControl>(&self,
+        run: &Int4FaithfulnessMapRun, control: &mut C) -> Result<(), Int4FaithfulnessMapError> {
+        checkpoint(control)?;
+        // Equal source length, claim length and work do not identify the
+        // admitted source/claim. Public fields remain editable for consumers,
+        // but no edited result can pass the original completion authority.
+        if run.request_binding != self.request_binding
+            || run.result_binding != binding::result_with_control(run, self.result_bytes, control)? {
+            return Err(Int4FaithfulnessMapError::Admission);
+        }
         if run.schema_version != 1 || run.execution != INT4_FAITHFULNESS_MAP_EXECUTION
             || run.numerics_profile != STRICT_INT4_PROFILE || run.group_width != self.group_width
             || run.chunk_profile != CHUNK_PROFILE || run.semantics != SEMANTICS || run.single_context_equivalence
@@ -145,6 +217,7 @@ impl Int4FaithfulnessMapPreflight {
         let mut byte = 0; let mut scalar = 0; let mut heads = 0_usize; let mut max_heads = 0;
         let mut work = Int4Work::default(); let mut bytes = 0_u64;
         for (index, chunk) in run.chunks.iter().enumerate() {
+            checkpoint(control)?;
             let span = chunk.source_span;
             let JudgeResult::Faithfulness(result) = &chunk.run.result else { return Err(Int4FaithfulnessMapError::Admission); };
             if chunk.chunk_id != index || span.byte_start != byte || span.scalar_start != scalar
@@ -167,7 +240,7 @@ impl Int4FaithfulnessMapPreflight {
             || heads != self.heads || max_heads != self.max_heads || bytes != run.retained_result_bytes {
             return Err(Int4FaithfulnessMapError::Admission);
         }
-        value_bytes(run, self.result_bytes)?; Ok(())
+        value_bytes(run, self.result_bytes)?; checkpoint(control)?; Ok(())
     }
 }
 
@@ -183,13 +256,23 @@ impl Int4JudgePlanner {
         -> Result<PreparedInt4FaithfulnessMap<'a>, Int4FaithfulnessMapError> {
         checkpoint(control)?;
         let capacity = self.max_faithfulness_source_bytes(request, limits.chunks.context_tokens)?;
-        PreparedInt4FaithfulnessMap::compile(request, limits, capacity, self.group_width(), control,
+        PreparedInt4FaithfulnessMap::compile_bound(request, limits, capacity, self.group_width(),
+            self.semantic_configuration(), control,
             |request, control| self.plan_with_control(request, control))
     }
 }
 impl<'a> PreparedInt4FaithfulnessMap<'a> {
+    #[cfg(test)]
     fn compile<C: DecodeStepControl, F>(request: &'a JudgeRequest, limits: Int4FaithfulnessMapLimits,
         capacity: usize, width: usize, control: &mut C, mut prepare: F)
+        -> Result<Self, Int4FaithfulnessMapError>
+    where F: FnMut(&JudgeRequest, &mut C) -> Result<PreparedInt4Judge, Int4JudgeError> {
+        Self::compile_bound(request, limits, capacity, width, (request.budget(), JudgeLimits::default()),
+            control, |request, control| prepare(request, control))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn compile_bound<C: DecodeStepControl, F>(request: &'a JudgeRequest, limits: Int4FaithfulnessMapLimits,
+        capacity: usize, width: usize, authority: (TaskBudget, JudgeLimits), control: &mut C, mut prepare: F)
         -> Result<Self, Int4FaithfulnessMapError>
     where F: FnMut(&JudgeRequest, &mut C) -> Result<PreparedInt4Judge, Int4JudgeError> {
         checkpoint(control)?;
@@ -215,7 +298,7 @@ impl<'a> PreparedInt4FaithfulnessMap<'a> {
             source: VerifiedSourceSpan { byte_start: 0, byte_end: last.byte_end, scalar_start: 0, scalar_end: last.scalar_end },
             chunks: chunks.chunks().len(), heads: 0, max_heads: 0, policy: *policy, group_width: width,
             work: Int4Work::default(), retained_bytes: limits.max_retained_result_bytes, result_bytes: limits.max_result_bytes,
-            aggregation: limits.aggregation, chunk_limits, tokenizer_checks: chunks.tokenizer_calls() };
+            aggregation: limits.aggregation, chunk_limits, tokenizer_checks: chunks.tokenizer_calls(), request_binding: [0; 32] };
         let mut plans = reserved(expected.chunks)?;
         for chunk in chunks.chunks() {
             checkpoint(control)?;
@@ -233,6 +316,7 @@ impl<'a> PreparedInt4FaithfulnessMap<'a> {
             expected.max_heads = expected.max_heads.max(prepared.head_count());
             plans.push(prepared);
         }
+        expected.request_binding = binding::request(request, limits, authority, &chunks, &plans, control)?;
         checkpoint(control)?;
         Ok(Self { source, chunks, plans, limits, expected, task: *budget })
     }
@@ -309,11 +393,13 @@ impl<'a> PreparedInt4FaithfulnessMap<'a> {
         }
         let aggregate = aggregate_with_control(views, chunks.len(), self.source,
             self.expected.policy, self.limits.aggregation, control)?;
-        let run = Int4FaithfulnessMapRun { schema_version: 1, execution: INT4_FAITHFULNESS_MAP_EXECUTION.to_owned(),
+        let mut run = Int4FaithfulnessMapRun { schema_version: 1, execution: INT4_FAITHFULNESS_MAP_EXECUTION.to_owned(),
             numerics_profile: STRICT_INT4_PROFILE.to_owned(), group_width: self.group_width(),
             chunk_profile: CHUNK_PROFILE.to_owned(), semantics: SEMANTICS.to_owned(), single_context_equivalence: false,
             source_span: self.expected.source, chunk_limits: self.chunks.limits(), tokenizer_checks: self.chunks.tokenizer_calls(),
-            planned_model_work: self.planned_work(), model_work: work, retained_result_bytes: bytes, chunks, aggregate };
+            planned_model_work: self.planned_work(), model_work: work, retained_result_bytes: bytes, chunks, aggregate,
+            request_binding: self.expected.request_binding, result_binding: [0; 32] };
+        run.result_binding = binding::result_with_control(&run, self.limits.max_result_bytes, control)?;
         value_bytes(&run, self.limits.max_result_bytes)?;
         checkpoint(control)?; Ok(run)
     }

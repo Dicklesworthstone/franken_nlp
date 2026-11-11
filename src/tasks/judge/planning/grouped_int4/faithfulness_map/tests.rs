@@ -9,6 +9,8 @@ use crate::{native_engine::{lmhead::scoring::{CandidateLogits, ProjectionRows},
     tokenizer::pinned_controls};
 use fixtures::Continue;
 
+mod binding;
+
 fn fixture() -> (&'static JudgePlanner, &'static ExecutionIdentity) {
     static FIXTURE: OnceLock<(JudgePlanner, ExecutionIdentity)> = OnceLock::new();
     let (planner, identity) = FIXTURE.get_or_init(|| {
@@ -243,7 +245,7 @@ fn real_task_cohort_finalizers_preserve_serial_complete_document_results() {
         let actual = plan.collect_cohorts_with_control(&windows, &mut Continue,
             |window, _| finish_window(&plan, &admitted, window)).unwrap();
         assert_eq!(actual.output, expected); assert_eq!(actual.chunk_cohorts, plan.chunk_count().div_ceil(chunks));
-        plan.preflight_metadata().verify_completed(&actual.output).unwrap();
+        plan.preflight_metadata().verify_completed_cohorts(&actual, chunks).unwrap();
     }
 }
 
@@ -343,5 +345,5 @@ fn native_faithfulness_chunk_cohorts_match_serial_complete_document_and_evidence
         budget, &mut Continue).unwrap();
     assert_eq!(actual.output, expected); assert_eq!(actual.chunk_cohorts, plan.chunk_count().div_ceil(2));
     assert!(actual.group_steps < plan.planned_work().forward_positions);
-    plan.preflight_metadata().verify_completed(&actual.output).unwrap();
+    plan.preflight_metadata().verify_completed_cohorts(&actual, 2).unwrap();
 }
