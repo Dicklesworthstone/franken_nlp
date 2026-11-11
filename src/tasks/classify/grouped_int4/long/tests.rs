@@ -10,6 +10,7 @@ use fixtures::Continue;
 
 mod cohorts;
 mod model;
+mod encoding;
 
 fn fixture() -> (&'static ClassificationPlanner, &'static ExecutionIdentity) {
     static FIXTURE: OnceLock<(ClassificationPlanner, ExecutionIdentity)> = OnceLock::new();

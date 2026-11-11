@@ -162,3 +162,31 @@ fn hosted_cohorts_share_the_pure_quote_and_charge_excess_transferred_capacity() 
     send::<Int4ClassificationMapCohortRun>();
     let _cohorts = NlpEngine::map_int4_classify_cohorts;
 }
+
+#[test]
+fn compact_encoder_workspace_is_reserved_once_for_serial_and_native_cohort_maps() {
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+    let (request, config) = fixture();
+    let limits = SafeBpeLimits { max_input_bytes: 262144, max_output_tokens: 131072,
+        max_pair_checks: 33554432, max_pair_bytes: 268435456 };
+    let encoding = UntrustedEncoding::SafeBpeV1(limits);
+    let bytes = limits.requirements().unwrap().workspace_bytes;
+    let serial = config.requirements(32, request.budget).unwrap();
+    let compact = config.requirements_with_encoding(32, request.budget, &encoding).unwrap();
+    assert_eq!(compact.input_bytes, serial.input_bytes + bytes);
+    assert_eq!(compact, serial.with_input_encoding(&encoding).unwrap());
+    assert_eq!(config.requirements_with_encoding(32, request.budget, &UntrustedEncoding::ByteFallback).unwrap(), serial);
+    for chunks in [1, 2, 8] {
+        let byte = config.cohort_requirements(32, request.budget, 1, chunks).unwrap();
+        let compact = config.cohort_requirements_with_encoding(32, request.budget, 1, chunks, &encoding).unwrap();
+        assert_eq!(compact.memory, byte.memory.with_input_encoding(&encoding).unwrap());
+        assert_eq!(compact.memory.input_bytes, byte.memory.input_bytes + bytes);
+        assert_eq!(compact.task_workspace_bytes, byte.task_workspace_bytes);
+        assert_eq!(compact.max_cohort_output_bytes, byte.max_cohort_output_bytes);
+    }
+    let invalid = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_pair_checks: 0, ..limits });
+    assert!(config.requirements_with_encoding(32, request.budget, &invalid).is_err());
+    assert!(config.cohort_requirements_with_encoding(32, request.budget, 1, 2, &invalid).is_err());
+    let _serial = NlpEngine::map_int4_classify_with_encoding;
+    let _cohorts = NlpEngine::map_int4_classify_cohorts_with_encoding;
+}

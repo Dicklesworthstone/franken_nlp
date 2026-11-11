@@ -208,7 +208,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(compute::definition(input_encoding::definition(task("chat", "Complete a bounded JSON system/user/assistant transcript"))))
         .subcommand(stream::definition())
         .subcommand(compute::definition(input_encoding::definition(classify::prefill_definition(classify::definition()))))
-        .subcommand(classify_map::definition())
+        .subcommand(classify_map::one_off_definition())
         .subcommand(classify_map::corpus::definition())
         .subcommand(compute::definition(input_encoding::definition(sentiment::definition())))
         .subcommand(sentiment_map::definition())
@@ -377,7 +377,7 @@ impl Int4Command {
             _ => return Err(clap::Error::raw(clap::error::ErrorKind::InvalidSubcommand, "source-int4 task refused")),
         };
         let mut args = Int4Args::from_arg_matches(matches)?;
-        if matches!(name, "generate" | "chat" | "classify" | "sentiment" | "extract" | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch"
+        if matches!(name, "generate" | "chat" | "classify" | "classify-map" | "sentiment" | "extract" | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch"
             | "extract-batch" | "ner-batch" | "keyphrases-batch" | "summarize-batch" | "answer-batch") {
             args.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
         }

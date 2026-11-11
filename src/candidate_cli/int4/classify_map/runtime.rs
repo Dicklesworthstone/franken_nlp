@@ -61,6 +61,7 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
     let started = Instant::now();
     let limits = options.validate(&args)?;
+    let encoding = options.input_encoding(&args)?;
     let common = limits.common;
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
@@ -105,6 +106,7 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         let _preflight = lease.reserve(MemoryClass::JobBuffers, preflight_bytes)
             .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
         let planner = Int4ClassificationPlanner::for_model(model.model_identity(), budget, config.planning)
+            .and_then(|planner| planner.with_document_encoding(encoding.clone()))
             .map_err(classification_error)?;
         let prepared = planner.plan_document_with_control(&request, config.mapping,
             &mut DeadlineControl { started, deadline }).map_err(planning_error)?;
@@ -117,7 +119,7 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         if let Some(chunks) = options.mapping.cohort_chunks {
             // Match the host's actual per-chunk head geometry, within the
             // conservative unknown-input reservation already held above.
-            let quote = config.cohort_requirements(model.model_identity().group_width(), budget, heads, chunks)
+            let quote = config.cohort_requirements_with_encoding(model.model_identity().group_width(), budget, heads, chunks, &encoding)
                 .map_err(|_| CandidateError::Planning)?;
             let admitted = prepared.identities().map_err(planning_error)?;
             prepared.preflight_cohorts_with_control(&admitted, model.model_identity(), chunks,
@@ -151,7 +153,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     // here against the whole semantic/physical wrapper, never just its maps.
     // Both branches retain their guard through serialization, write and flush.
     if let Some(chunks) = options.mapping.cohort_chunks {
-        let result = engine.map_int4_classify_cohorts(&model, request, config, chunks, common.kernel, cancellation)
+        let result = engine.map_int4_classify_cohorts_with_encoding(&model, request, config, chunks,
+            encoding, common.kernel, cancellation)
             .map_err(|error| host_error(error, CandidateError::Execution))?;
         if let Some(expected) = expected {
             expected.verify_completed_cohorts(result.result(), chunks).map_err(|_| CandidateError::Execution)?;
@@ -163,7 +166,7 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         publish_complete(&Response { provenance: &provenance, output: &run.output, cohort: Some(cohort) },
             limits.envelope_bytes, output, &remaining)
     } else {
-        let result = engine.map_int4_classify(&model, request, config, common.kernel, cancellation)
+        let result = engine.map_int4_classify_with_encoding(&model, request, config, encoding, common.kernel, cancellation)
             .map_err(|error| host_error(error, CandidateError::Execution))?;
         if let Some(expected) = expected {
             expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;

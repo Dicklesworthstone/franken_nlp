@@ -13,7 +13,8 @@ use crate::{canonjson, execution_identity::{ExecutionIdentity, NumericsProfile},
         strict_int4::{Int4ModelIdentity, Int4RunBudget, Int4Work, StrictInt4Engine, StrictInt4Error, STRICT_INT4_PROFILE,
             prefill::Int4PrefillLimits,
             scoring::{self, CandidateSchedule, Int4CandidateRun, Int4ScoringBudget, Int4ScoringError, INT4_SCORING_EXECUTION}}},
-    tasks::ir::{DecodeStrategy, PlanContext, TaskBudget}};
+    tasks::ir::{DecodeStrategy, PlanContext, PromptSegmentKind, TaskBudget},
+    tokenizer::untrusted::SafeBpeWork};
 use super::{ClassificationLimits, ClassificationPlanner, ClassificationPlanningError, ClassificationRequest,
     ClassificationTaskResult, PreparedClassification, planning::{self, ClassificationHead}};
 
@@ -87,7 +88,14 @@ impl ClassificationPlanner {
     fn compile_int4<C: DecodeStepControl>(&self, request: &ClassificationRequest,
         context: &PlanContext<'_>, limits: ClassificationLimits, group_width: usize, control: &mut C)
         -> Result<PreparedInt4Classification, Int4ClassificationError> {
-        let inner = self.plan_with_profile(request, context, limits, control, NumericsProfile::StrictQuantized { version: 2 })?;
+        self.compile_int4_with_work(request, context, limits, group_width, control, &mut SafeBpeWork::default())
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn compile_int4_with_work<C: DecodeStepControl>(&self, request: &ClassificationRequest,
+        context: &PlanContext<'_>, limits: ClassificationLimits, group_width: usize, control: &mut C,
+        encoding_work: &mut SafeBpeWork) -> Result<PreparedInt4Classification, Int4ClassificationError> {
+        let inner = self.plan_with_profile_and_work(request, context, limits, control,
+            NumericsProfile::StrictQuantized { version: 2 }, encoding_work)?;
         let mut schedules = planning::reserved(inner.head_count())?;
         let mut work = Int4Work::default();
         for head in &inner.heads {
@@ -114,6 +122,20 @@ impl PreparedInt4Classification {
     pub fn head_count(&self) -> usize { self.schedules.len() }
     pub fn task_budget(&self) -> TaskBudget { self.inner.budget }
     pub fn required_context(&self) -> usize { self.schedules.iter().map(|s| s.context).max().unwrap_or(0) }
+    /// The document is one separately encoded segment, reused by every head.
+    /// Map admission checks its actual size against the counted chunk, never
+    /// equating UTF-8 byte length with compact token length.
+    fn source_token_count(&self) -> Result<usize, Int4ClassificationError> {
+        let source = |head: &ClassificationHead| head.task.ir().prompt_segments().get(4)
+            .filter(|segment| segment.kind() == PromptSegmentKind::Document)
+            .map(|segment| segment.token_ids().len());
+        let count = self.inner.heads.first().and_then(source).filter(|&count| count != 0)
+            .ok_or(Int4ClassificationError::Accounting)?;
+        if self.inner.heads.iter().any(|head| source(head) != Some(count)) {
+            return Err(Int4ClassificationError::Accounting);
+        }
+        Ok(count)
+    }
     pub fn verify_identity(&self, admitted: &ExecutionIdentity) -> Result<(), Int4ClassificationError> {
         self.inner.verify_identity(admitted).map_err(Into::into)
     }

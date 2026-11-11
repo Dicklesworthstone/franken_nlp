@@ -75,7 +75,7 @@ impl JobArgs {
             || s.journal_memory_mib == 0 || s.serialization_memory_mib == 0 {
             return Err(Failure::usage("explicit_classification_document_job_storage"));
         }
-        let map = self.map.validate(args)?;
+        let map = self.map.validate_with_max_labels(args, 128)?;
         for mib in [s.journal_memory_mib, s.serialization_memory_mib] {
             if mib.checked_mul(MIB).is_none_or(|bytes| bytes > map.common.memory_bytes) {
                 return Err(Failure::usage("classification_document_job_memory"));

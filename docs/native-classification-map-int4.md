@@ -63,12 +63,86 @@ Duplicate keys, unknown fields, invalid policies, duplicate labels and empty
 source refuse before model loading. Request JSON cannot supply task budgets,
 chunks, scores, prompts, model identity, EOS, score-space selection or
 aggregation authority. Literal control-marker text stays untrusted source
-data under the existing byte-preserving encoder.
+data under either explicitly selected byte-preserving encoder.
 
 An explicit `--save-snapshot NEW_FILE` requires complete document preflight
 before creating the requested file. The existing create-new policy applies;
 this does not activate a model or authenticate a publisher. A saved snapshot
-can remain if later inference or publication fails.
+can remain if later inference or publication fails. This option currently
+requires the default byte-fallback encoding; compact maps refuse it before
+input or model IO.
+
+## Explicit compact source encoding
+
+The default remains one byte per source token. Add
+`--input-encoding safe-bpe-v1` to use bounded compact encoding for both the
+original document and the untrusted label records. The planner counts actual
+compact tokens when selecting each chunk and reserves the exact metadata and
+candidate-scoring context for every head. Ordinary prose can therefore fit
+more source bytes in each context and need fewer native chunk evaluations.
+The resulting chunk boundaries and model scores may change; this is an
+explicit candidate tokenization policy with its own execution identity.
+
+For example, add these options to the pinned snapshot invocation above:
+
+```sh
+  --input-encoding safe-bpe-v1 \
+  --max-tokenizer-input-bytes 1048576 \
+  --max-tokenizer-output-tokens 1048576 \
+  --max-tokenizer-pair-checks 33554432 \
+  --max-tokenizer-pair-bytes 268435456
+```
+
+Both pinned source inference and independently pinned snapshot reload support
+compact maps, with serial or `--cohort-chunks` execution. The compact policy
+does not normalize, truncate or rewrite source text. Token decoding must
+reconstruct the original bytes, and source/label tokens cannot be template
+control IDs. Literal marker text remains data. These guarantees concern the
+token boundary; they do not establish resistance to instruction-shaped text
+or equivalence to an ordinary tokenizer or another model's scores.
+
+One tokenizer allowance covers the complete operation: encoding metadata to
+find available source capacity, every attempted chunk count (including
+oversized candidates that must shrink), and every final chunk plan and label
+head. No probe, chunk, label or cohort receives a fresh allowance.
+
+| Compact work option | Default | Maximum | Counts across the complete map |
+|---|---:|---:|---|
+| `--max-tokenizer-input-bytes` | 1,048,576 | 1,048,576 | All bytes submitted to compact encoding, including repeated probes and metadata. |
+| `--max-tokenizer-output-tokens` | 1,048,576 | 1,048,576 | All tokens produced by those encodings. |
+| `--max-tokenizer-pair-checks` | 4,194,304 | 67,108,864 | Pair comparisons during merge searches. |
+| `--max-tokenizer-pair-bytes` | 67,108,864 | 536,870,912 | Pair bytes examined during those comparisons. |
+
+These limits are separate from the original request's `--max-input-bytes`,
+each context's token ceiling, `--max-tokenizer-calls` for chunk probes and the
+five native work ceilings. A document fitting the request-byte ceiling can
+still exhaust compact work, because planning may encode its bytes more than
+once. `--max-chunk-bytes` can limit the size of attempted probes. Exhaustion
+refuses the complete document before the first native forward; it never
+silently switches encoding or publishes only the chunks planned so far.
+
+Compact semantic output adds `input_encoding` with the exact `policy` and
+consumed `work` counters. Each chunk's `source_tokens` is its actual token
+count, while byte/scalar coordinates and aggregation weights still refer to
+the original source. The complete result verifier binds those counts and
+coordinates, the policy and its work receipt to the prepared map. The default
+byte output omits this optional field and retains its original identities.
+
+The memory quote adds one bounded tokenizer workspace beside all retained
+plans. Hosted callers can use `requirements_with_encoding` or
+`cohort_requirements_with_encoding` on `Int4ClassificationMapHostConfig`, then
+`NlpEngine::map_int4_classify_with_encoding` or
+`NlpEngine::map_int4_classify_cohorts_with_encoding`. The existing methods
+continue to select byte fallback. Direct planner callers select
+`Int4ClassificationPlanner::with_document_encoding` before
+`plan_document_with_control` and add the encoder with the pure quote's
+`with_input_encoding` method.
+
+Compact `--save-snapshot` is refused because the current pre-save flow would
+plan again during hosted inference and renew tokenizer work. Use an already
+pinned snapshot or pinned source inference without saving on this route.
+`classify-corpus` and `classify-document-job` retain their byte-only contracts;
+compact encoding and its extra work flags are not accepted there.
 
 ## Serial and native cohort execution
 
@@ -96,7 +170,7 @@ Every chunk still has its own original source span, complete label codebook,
 prompt context and exact native work. All windows and identities are checked
 before the first native forward, including the final short window. The same
 whole-document work ceilings, retained-result limit and complete-result limit
-cover all windows. Optional snapshot saving first invokes the same exact
+cover all windows. Optional byte-mode snapshot saving first invokes the same exact
 all-window admission checks used by execution. Each chunk's task budget must
 cover its simultaneous heads; the whole window separately admits its combined native memory and
 scoring workspace. The CLI keeps logical task authority fixed across serial
@@ -222,6 +296,12 @@ whole-document budget and memory admission, source/snapshot symmetry, typed
 deadline handling and complete publication. Cohort regression source also
 covers ragged windows, per-chunk summed KV authority, every native work and
 memory axis, late identity failures, malformed results and unchanged
-aggregation of nonuniform chunk scores. Compilation and Rust tests remain
+aggregation of nonuniform chunk scores. Compact regression source covers
+lossless Unicode/control text, exact cumulative limits on all four tokenizer
+axes, cancellation causes, actual source-token geometry, encoding/work receipt
+substitution, byte-default compatibility, workspace admission and the
+pre-IO snapshot-save refusal. The explicit model-present fixture includes
+both encodings and both decision modes for serial/cohort comparisons.
+Compilation and Rust tests remain
 pending the repository-required controller-selected DSR checkpoint. Model
 quality and performance require their separate retained evidence.

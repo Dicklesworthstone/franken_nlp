@@ -3,7 +3,7 @@ use super::*;
 
 #[test]
 #[ignore = "requires controller-admitted pinned source, explicit kernel and multi-GB native memory"]
-fn complete_native_classification_cohorts_match_serial_maps_in_both_modes() {
+fn complete_native_classification_cohorts_match_serial_maps_in_both_modes_and_encodings() {
     use crate::{artifact::converter::{ConversionSourceManifest, prepare_nanbeige42_input},
         native_engine::{int4::PackedInt4Kernel, simd::Int8KernelKind,
             strict_int4::{Int4ModelLoadBudget, Int4ModelLoadRequirement, Int4ModelWeights,
@@ -29,7 +29,11 @@ fn complete_native_classification_cohorts_match_serial_maps_in_both_modes() {
     let memory = memory::Int4ClassificationMapMemoryLimits { context_tokens: 1024,
         preparation_reserve_bytes: memory::MIN_CLASSIFICATION_MAP_PREPARATION_BYTES,
         allocator_reserve_bytes: 16 * 1024 * 1024 };
-    let quote = memory.cohort_requirements(width, task, planning, mapping, 3, 2).unwrap();
+    let encoding = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 262_144,
+        max_output_tokens: 262_144, max_pair_checks: 1 << 25, max_pair_bytes: 1 << 28 });
+    let mut quote = memory.cohort_requirements(width, task, planning, mapping, 3, 2).unwrap();
+    // Admit the largest selected encoder workspace before the pinned model IO.
+    quote.memory = quote.memory.with_input_encoding(&encoding).unwrap();
     let execution = load.weight_payload_bytes.checked_add(quote.memory.native.kv_bytes)
         .and_then(|bytes| bytes.checked_add(quote.memory.workspace_bytes))
         .and_then(|bytes| bytes.checked_add(quote.memory.input_bytes))
@@ -44,9 +48,11 @@ fn complete_native_classification_cohorts_match_serial_maps_in_both_modes() {
         max_groups: load.groups, max_shard_revalidation_bytes: load.shard_revalidation_bytes,
     }, &mut Continue).unwrap();
     drop(source);
+    for policy in [UntrustedEncoding::ByteFallback, encoding] {
     for mode in [ClassificationMode::Exclusive, ClassificationMode::MultiLabel] {
         let mut request = request(mode); request.document = "0123456789abcdefghijklmn".to_owned(); request.budget = task;
-        let planner = Int4ClassificationPlanner::for_model(weights.identity(), task, planning).unwrap();
+        let planner = Int4ClassificationPlanner::for_model(weights.identity(), task, planning).unwrap()
+            .with_document_encoding(policy.clone()).unwrap();
         let prepared = planner.plan_document_with_control(&request, mapping, &mut Continue).unwrap();
         assert_eq!(prepared.chunk_count(), 3);
         let identities = prepared.identities().unwrap(); let expected = prepared.preflight_metadata();
@@ -74,5 +80,6 @@ fn complete_native_classification_cohorts_match_serial_maps_in_both_modes() {
         expected.verify_completed_cohorts(&grouped, 2).unwrap();
         assert!(prepared.execute_cohorts_with_control(&identities, &weights, kernel, 2, under, &mut Continue).is_err());
         assert!(prepared.execute_cohorts_with_control(&foreign, &weights, kernel, 2, budget, &mut Continue).is_err());
+    }
     }
 }

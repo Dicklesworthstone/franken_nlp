@@ -190,11 +190,24 @@ impl ClassificationPlanner {
     /// escaped label codebooks and every independent head count in full.
     pub(super) fn source_capacity(&self, request: &ClassificationRequest, ceiling: TaskBudget,
         limits: ClassificationLimits, context_tokens: usize) -> Result<usize, ClassificationPlanningError> {
-        // Whole-document maps price byte-capacity probes, not an aggregate
-        // compact-tokenizer ledger. Never silently extend one-off authority.
+        // This legacy byte-capacity query is also used by callers without a
+        // tokenizer work ledger. Compact maps use the explicit token query.
         if self.document_encoding != UntrustedEncoding::ByteFallback {
             return Err(ClassificationPlanningError::InvalidLimits);
         }
+        self.source_token_capacity_with_work(request, ceiling, limits, context_tokens,
+            &mut SafeBpeWork::default(), &mut Continue)
+    }
+
+    /// Exact source TOKEN capacity after the separately encoded label data.
+    /// Capacity probes and actual chunk plans share the caller's ledger; the
+    /// work spent encoding metadata here is not refunded or renewed later.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn source_token_capacity_with_work<C: DecodeStepControl>(&self,
+        request: &ClassificationRequest, ceiling: TaskBudget, limits: ClassificationLimits,
+        context_tokens: usize, work: &mut SafeBpeWork, control: &mut C)
+        -> Result<usize, ClassificationPlanningError> {
+        checkpoint(control)?;
         limits.validate()?;
         request.budget.validate().map_err(|_| ClassificationPlanningError::InvalidLimits)?;
         ceiling.validate().map_err(|_| ClassificationPlanningError::InvalidLimits)?;
@@ -215,11 +228,22 @@ impl ClassificationPlanner {
         let fragments = &self.fragments[usize::from(request.mode == ClassificationMode::MultiLabel)];
         let overhead = fragments.iter().try_fold(0_usize, |n, ids| n.checked_add(ids.len()))
             .ok_or(ClassificationPlanningError::ContextBudget)?;
-        let metadata_room = prompt_cap.checked_sub(overhead).ok_or(ClassificationPlanningError::ContextBudget)?;
+        let metadata_room = match &self.document_encoding {
+            UntrustedEncoding::ByteFallback => prompt_cap.checked_sub(overhead)
+                .ok_or(ClassificationPlanningError::ContextBudget)?,
+            UntrustedEncoding::SafeBpeV1(limits) => limits.max_input_bytes,
+        };
+        let encoder = UntrustedDocumentEncoder::new(self.tokenizer.tokenizer(), &self.controls);
         let mut largest = 0; let mut total = 0_usize;
         for index in 0..count {
+            checkpoint(control)?;
             let record = label_record(&labels, &codes, index, request.mode, metadata_room)?;
-            let fixed = overhead.checked_add(record.len()).ok_or(ClassificationPlanningError::ContextBudget)?;
+            let tokens = match &self.document_encoding {
+                UntrustedEncoding::ByteFallback => record.len(),
+                UntrustedEncoding::SafeBpeV1(_) =>
+                    encode_input(&encoder, &record, &self.document_encoding, work, control)?.ids().len(),
+            };
+            let fixed = overhead.checked_add(tokens).ok_or(ClassificationPlanningError::ContextBudget)?;
             largest = largest.max(fixed);
             total = total.checked_add(fixed).ok_or(ClassificationPlanningError::ContextBudget)?;
         }
@@ -229,6 +253,16 @@ impl ClassificationPlanner {
         let capacity = per_head.min(aggregate).min(limits.max_input_bytes);
         if capacity == 0 { return Err(ClassificationPlanningError::ContextBudget); }
         Ok(capacity)
+    }
+
+    /// Count the same isolated document segment used in the final TaskIR.
+    /// BPE may be nonmonotone; every attempted chunk is actually encoded.
+    pub(super) fn source_tokens_with_work<C: DecodeStepControl>(&self, source: &str,
+        work: &mut SafeBpeWork, control: &mut C) -> Result<usize, ClassificationPlanningError> {
+        checkpoint(control)?;
+        if self.document_encoding == UntrustedEncoding::ByteFallback { return Ok(source.len()); }
+        let encoder = UntrustedDocumentEncoder::new(self.tokenizer.tokenizer(), &self.controls);
+        Ok(encode_input(&encoder, source.as_bytes(), &self.document_encoding, work, control)?.ids().len())
     }
 
     pub fn plan(&self, request: &ClassificationRequest, context: &PlanContext<'_>, limits: ClassificationLimits)
@@ -245,6 +279,14 @@ impl ClassificationPlanner {
     pub(super) fn plan_with_profile<C: DecodeStepControl>(&self, request: &ClassificationRequest,
         context: &PlanContext<'_>, limits: ClassificationLimits, control: &mut C, profile: NumericsProfile)
         -> Result<PreparedClassification, ClassificationPlanningError> {
+        self.plan_with_profile_and_work(request, context, limits, control, profile, &mut SafeBpeWork::default())
+    }
+    /// Composed maps retain one ledger across all capacity probes and heads.
+    /// The ordinary one-request entrypoint above deliberately starts its own.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn plan_with_profile_and_work<C: DecodeStepControl>(&self, request: &ClassificationRequest,
+        context: &PlanContext<'_>, limits: ClassificationLimits, control: &mut C, profile: NumericsProfile,
+        encoding_work: &mut SafeBpeWork) -> Result<PreparedClassification, ClassificationPlanningError> {
         let backend = match &profile {
             NumericsProfile::HfBf16Eager => None,
             NumericsProfile::StrictQuantized { version: 1 } => Some((
@@ -328,14 +370,13 @@ impl ClassificationPlanner {
             drafts.push((record, candidates, label_index, maximum));
         }
         let encoder = UntrustedDocumentEncoder::new(self.tokenizer.tokenizer(), &self.controls);
-        let mut encoding_work = SafeBpeWork::default();
-        let document = encode_input(&encoder, request.document.as_bytes(), &self.document_encoding, &mut encoding_work, control)?;
+        let document = encode_input(&encoder, request.document.as_bytes(), &self.document_encoding, encoding_work, control)?;
         let mut encoded = reserved(count)?; total_prompt = 0;
         // The unique source is tokenized once even for independent labels. All
         // metadata shares that same request ledger; repeated prompt copies are
         // still counted by aggregate prompt and native scoring work limits.
         for (record, candidates, label_index, maximum) in drafts {
-            let metadata = encode_input(&encoder, &record, &self.document_encoding, &mut encoding_work, control)?;
+            let metadata = encode_input(&encoder, &record, &self.document_encoding, encoding_work, control)?;
             let prompt_len = overhead.checked_add(metadata.ids().len()).and_then(|n| n.checked_add(document.ids().len()))
                 .ok_or(ClassificationPlanningError::ContextBudget)?;
             total_prompt = total_prompt.checked_add(prompt_len).ok_or(ClassificationPlanningError::ContextBudget)?;

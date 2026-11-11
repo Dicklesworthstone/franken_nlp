@@ -1,5 +1,6 @@
 //! One charged invocation from complete document to complete mixture.
 use super::*;
+use crate::tokenizer::untrusted::UntrustedEncoding;
 use crate::tasks::classify::{ClassificationLabel, ClassificationLimits, ClassificationMode, ClassificationRequest,
     grouped_int4::{Int4ClassificationPlanner,
         long::{Int4ClassificationMapCohortBudget, Int4ClassificationMapCohortRun,
@@ -27,6 +28,10 @@ impl Int4ClassificationMapHostConfig {
             allocator_reserve_bytes: self.native.allocator_reserve_bytes }
             .requirements(width, task, self.planning, self.mapping).map_err(map_error)
     }
+    pub fn requirements_with_encoding(self, width: usize, task: TaskBudget, encoding: &UntrustedEncoding)
+        -> Result<Int4ClassificationMapMemoryRequirement, HostedError> {
+        self.requirements(width, task)?.with_input_encoding(encoding).map_err(map_error)
+    }
     /// Complete checked quote for explicit native chunk cohorts. `max_heads`
     /// is one for exclusive classification or the declared multilabel count.
     /// Its task workspace is already charged inside `memory.input_bytes`.
@@ -38,8 +43,15 @@ impl Int4ClassificationMapHostConfig {
             allocator_reserve_bytes: self.native.allocator_reserve_bytes }
             .cohort_requirements(width, task, self.planning, self.mapping, max_heads, cohort_chunks).map_err(map_error)
     }
+    pub fn cohort_requirements_with_encoding(self, width: usize, task: TaskBudget, max_heads: usize,
+        cohort_chunks: usize, encoding: &UntrustedEncoding)
+        -> Result<Int4ClassificationMapCohortMemoryRequirement, HostedError> {
+        let mut required = self.cohort_requirements(width, task, max_heads, cohort_chunks)?;
+        required.memory = required.memory.with_input_encoding(encoding).map_err(map_error)?;
+        Ok(required)
+    }
 }
-struct MapInput { request: ClassificationRequest, config: Int4ClassificationMapHostConfig }
+struct MapInput { request: ClassificationRequest, config: Int4ClassificationMapHostConfig, encoding: UntrustedEncoding }
 
 impl NlpEngine {
     /// Admit every original source chunk and its complete independent heads,
@@ -49,14 +61,23 @@ impl NlpEngine {
     pub fn map_int4_classify(&self, model: &ResidentInt4, request: ClassificationRequest,
         config: Int4ClassificationMapHostConfig, kernel: PackedInt4Kernel, cancellation: CancellationToken)
         -> Result<HostedOutput<Int4ClassificationMapRun>, HostedError> {
+        self.map_int4_classify_with_encoding(model, request, config, UntrustedEncoding::ByteFallback, kernel, cancellation)
+    }
+    /// Explicit compact input uses one document-wide tokenizer allowance,
+    /// including all failed-size probes and every actual chunk plan. Model
+    /// execution still starts only after the entire source has been planned.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_int4_classify_with_encoding(&self, model: &ResidentInt4, request: ClassificationRequest,
+        config: Int4ClassificationMapHostConfig, encoding: UntrustedEncoding, kernel: PackedInt4Kernel,
+        cancellation: CancellationToken) -> Result<HostedOutput<Int4ClassificationMapRun>, HostedError> {
         dispatch::preflight(self, config.native.run)?;
         if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
-        let required = config.requirements(model.model_identity().group_width(), request.budget)?;
+        let required = config.requirements_with_encoding(model.model_identity().group_width(), request.budget, &encoding)?;
         validate_request(&request, config)?;
         let input_bytes = owned_input_bytes(&request, config, required)?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, input_bytes)?,
-            || Ok(MapInput { request, config }))?;
+            || Ok(MapInput { request, config, encoding }))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.workspace_bytes)?;
         let output = Pending::reserve(&lease, MemoryClass::JobBuffers, required.output_reservation_bytes)?;
@@ -65,7 +86,8 @@ impl NlpEngine {
             let input = input;
             checkpoint(control)?;
             let planner = Int4ClassificationPlanner::for_model(model.model_identity(), input.value.request.budget,
-                input.value.config.planning).map_err(classification_error)?;
+                input.value.config.planning).and_then(|planner| planner.with_document_encoding(input.value.encoding.clone()))
+                .map_err(classification_error)?;
             let (prepared, admitted) = prepare(&planner, &model, &input.value, control)?;
             let expected = prepared.preflight_metadata();
             let mut engine = allocate_native(kv, scratch, || {
@@ -96,16 +118,27 @@ impl NlpEngine {
     pub fn map_int4_classify_cohorts(&self, model: &ResidentInt4, request: ClassificationRequest,
         config: Int4ClassificationMapHostConfig, cohort_chunks: usize, kernel: PackedInt4Kernel,
         cancellation: CancellationToken) -> Result<HostedOutput<Int4ClassificationMapCohortRun>, HostedError> {
+        self.map_int4_classify_cohorts_with_encoding(model, request, config, cohort_chunks,
+            UntrustedEncoding::ByteFallback, kernel, cancellation)
+    }
+    /// Compact document maps retain independent contexts in every native
+    /// window. The encoding allowance belongs to the complete source, not a
+    /// window, and the same sealed result metadata verifies either schedule.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_int4_classify_cohorts_with_encoding(&self, model: &ResidentInt4, request: ClassificationRequest,
+        config: Int4ClassificationMapHostConfig, cohort_chunks: usize, encoding: UntrustedEncoding,
+        kernel: PackedInt4Kernel, cancellation: CancellationToken)
+        -> Result<HostedOutput<Int4ClassificationMapCohortRun>, HostedError> {
         dispatch::preflight(self, config.native.run)?;
         if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
         validate_cohort_request(&request, config, cohort_chunks)?;
-        let required = config.cohort_requirements(model.model_identity().group_width(), request.budget,
-            head_count(&request), cohort_chunks)?;
+        let required = config.cohort_requirements_with_encoding(model.model_identity().group_width(), request.budget,
+            head_count(&request), cohort_chunks, &encoding)?;
         let memory = required.memory;
         let input_bytes = owned_input_bytes(&request, config, memory)?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, input_bytes)?,
-            || Ok(MapInput { request, config }))?;
+            || Ok(MapInput { request, config, encoding }))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, memory.native.kv_bytes)?;
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, memory.workspace_bytes)?;
         let output = Pending::reserve(&lease, MemoryClass::JobBuffers, memory.output_reservation_bytes)?;
@@ -114,7 +147,8 @@ impl NlpEngine {
             let input = input;
             checkpoint(control)?;
             let planner = Int4ClassificationPlanner::for_model(model.model_identity(), input.value.request.budget,
-                input.value.config.planning).map_err(classification_error)?;
+                input.value.config.planning).and_then(|planner| planner.with_document_encoding(input.value.encoding.clone()))
+                .map_err(classification_error)?;
             let (prepared, admitted) = prepare(&planner, &model, &input.value, control)?;
             let expected = prepared.preflight_metadata();
             // These charges remain owned until every exact-sized native

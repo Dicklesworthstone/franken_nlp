@@ -560,8 +560,10 @@ These one-off scored routes reserve the encoder workspace before private IO and
 report the complete selected policy in `input_encoding`. Resident
 [`score-batch` classification and sentiment](#implemented-candidate-int4-scoring-batches)
 also accept this policy, with a fresh tokenizer allowance per complete record.
-Classification and sentiment maps, corpora and retained jobs retain their
-byte-based planning contract. The
+Complete-document `classify-map` also supports the separately bounded
+[compact classification policy](#implemented-candidate-int4-compact-complete-document-classification).
+Classification corpora and retained jobs, and sentiment maps, corpora and
+retained jobs, keep their byte-based planning contract. The
 compact policy is a separate input profile; its task quality and model behavior
 require their own evaluation.
 
@@ -1364,6 +1366,37 @@ byte-only contract for existing composed and durable-job callers. CLI, native
 ledger and host fixtures are authored; compilation,
 model-present execution and quality qualification remain pending the authorized
 controller gates.
+
+## Implemented candidate INT4 compact complete-document classification
+
+`fnlp candidate source-int4 classify-map` accepts explicit
+`--input-encoding safe-bpe-v1` for exclusive and independent multi-label
+classification. It selects chunks using their actual compact token counts,
+while preserving every original source byte and scalar coordinate. This can
+fit more prose into each context and reduce the number of chunk evaluations;
+the changed tokenization and chunk boundaries can also change model scores.
+Serial execution and `--cohort-chunks` use the same complete semantic result
+contract, with every chunk planned before the first native forward.
+
+One tokenizer allowance covers label-capacity preparation, every attempted
+chunk boundary (including oversized probes), and all final chunk/head plans.
+`--max-tokenizer-input-bytes`, `--max-tokenizer-output-tokens`,
+`--max-tokenizer-pair-checks` and `--max-tokenizer-pair-bytes` bound that complete
+operation. They are separate from source size, context, native work and output
+ceilings. Exhaustion refuses the whole document. Compact results include the
+exact encoding policy and consumed work, and verification binds the original
+source spans and actual token counts to the prepared result. CLI and hosted
+admission reserve the bounded encoder workspace beside all retained plans.
+
+The default remains byte fallback with its existing output shape. Compact
+maps support pinned source inference and digest-pinned snapshot reload;
+`--save-snapshot` is refused before IO because its separate planning pass would
+renew tokenizer work. Corpus and durable document jobs remain byte-only. See
+the [complete-document classification guide](docs/native-classification-map-int4.md)
+for limits, hosted APIs and examples. Regression sources cover cumulative
+budgets, cancellation, source coverage, result verification, memory admission
+and serial/cohort equivalence. Rust compilation, test execution and model
+qualification remain pending the repository-required DSR checkpoint.
 
 ## Implemented candidate INT4 complete-document classification corpora
 

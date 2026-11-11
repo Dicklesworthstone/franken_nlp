@@ -145,6 +145,17 @@ fn explicit_storage_and_valid_geometry_precede_all_private_io() {
 }
 
 #[test]
+fn durable_document_jobs_refuse_programmatic_compact_encoding_before_private_io() {
+    let matches = input_encoding::definition(clap::Command::new("encoding"))
+        .try_get_matches_from(["encoding", "--input-encoding", "safe-bpe-v1"]).unwrap();
+    for operation in ["start", "resume"] {
+        let (command, mut args) = command(operation, &[]);
+        args.input_encoding = input_encoding::InputEncodingArgs::from_matches(&matches).unwrap();
+        assert_eq!(command.execute_owned(args, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+    }
+}
+
+#[test]
 fn source_and_pinned_snapshot_share_task_authority_and_resume_requires_an_operation() {
     let (source, source_args) = command("resume", &[]); let original = source.args.validate(&source_args).unwrap();
     let mut words = argv("resume"); let at = words.iter().position(|s| s == "--source-dir").unwrap();

@@ -3,10 +3,13 @@
 //! chunk/head contexts. Every plan and all five work axes are admitted before
 //! any native forward, and both schedules use the same complete finalizer.
 use super::*;
+use std::cell::RefCell;
+use sha2::{Digest, Sha256};
 use crate::{tasks::{classify::{ClassificationMode, ClassificationPolicy, ClassificationAggregate,
         ClassificationAggregateResult, ClassificationAggregationPolicy, ClassificationAggregationError,
         aggregation::{ClassificationChunkView, aggregate_with_control}},
     mapreduce::{CHUNK_PROFILE, ChunkLimits, ChunkPlan, MapReduceError}},
+    tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding},
     validation::grounded_fields::VerifiedSourceSpan};
 
 mod execution;
@@ -100,9 +103,17 @@ impl Int4ClassificationMapError {
 pub struct Int4ClassificationMapChunk {
     pub chunk_id: usize,
     pub source_span: VerifiedSourceSpan,
-    /// Exact byte-fallback source-token count, excluding the trusted prompt.
+    /// Exact source-token count under the admitted encoding, excluding the
+    /// trusted prompt and the separately encoded label data.
     pub source_tokens: usize,
     pub run: Int4ClassificationRun,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct Int4ClassificationMapEncoding {
+    pub policy: UntrustedEncoding,
+    /// Includes label-capacity preparation, every attempted source chunk and
+    /// every actual chunk/head plan. No probe, chunk or label renews it.
+    pub work: SafeBpeWork,
 }
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Int4ClassificationMapRun {
@@ -112,6 +123,9 @@ pub struct Int4ClassificationMapRun {
     pub planned_model_work: Int4Work, pub model_work: Int4Work, pub retained_result_bytes: u64,
     pub chunks: Vec<Int4ClassificationMapChunk>,
     pub aggregate: ClassificationAggregate,
+    /// Absent for the unchanged byte-fallback contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_encoding: Option<Int4ClassificationMapEncoding>,
 }
 
 /// Content-free geometry from the sealed complete plan. It is not an
@@ -122,11 +136,16 @@ pub struct Int4ClassificationMapPreflight {
     mode: ClassificationMode, policy: ClassificationPolicy,
     group_width: usize, work: Int4Work, retained_bytes: u64, result_bytes: u64,
     aggregation: ClassificationAggregationPolicy, chunk_limits: ChunkLimits, tokenizer_checks: usize,
+    source_geometry: [u8; 32], encoding: Option<SafeBpeLimits>, encoding_work: SafeBpeWork,
 }
 impl Int4ClassificationMapPreflight {
     pub fn chunk_count(&self) -> usize { self.chunks }
     pub fn planned_work(&self) -> Int4Work { self.work }
     pub fn source_span(&self) -> VerifiedSourceSpan { self.source }
+    fn encoding_record(&self) -> Option<Int4ClassificationMapEncoding> {
+        self.encoding.map(|limits| Int4ClassificationMapEncoding {
+            policy: UntrustedEncoding::SafeBpeV1(limits), work: self.encoding_work })
+    }
     pub fn verify_completed_cohorts(&self, run: &Int4ClassificationMapCohortRun, cohort_chunks: usize)
         -> Result<(), Int4ClassificationMapError> {
         if cohort_chunks == 0 || cohort_chunks > self.chunk_limits.max_chunks
@@ -154,7 +173,9 @@ impl Int4ClassificationMapPreflight {
             || run.aggregate.profile != crate::tasks::classify::CLASSIFICATION_AGGREGATION_PROFILE
             || run.aggregate.policy != self.aggregation || run.aggregate.classification_policy != self.policy
             || run.aggregate.chunk_count != self.chunks || run.aggregate.source_bytes != self.source.byte_end
-            || run.aggregate.source_scalars != self.source.scalar_end || run.retained_result_bytes > self.retained_bytes {
+            || run.aggregate.source_scalars != self.source.scalar_end || run.retained_result_bytes > self.retained_bytes
+            || run.input_encoding != self.encoding_record()
+            || geometry(run.chunks.iter().map(|chunk| (chunk.chunk_id, chunk.source_span, chunk.source_tokens))) != self.source_geometry {
             return Err(Int4ClassificationMapError::Admission);
         }
         match (self.mode, &run.aggregate.result) {
@@ -169,7 +190,9 @@ impl Int4ClassificationMapPreflight {
             let span = chunk.source_span;
             if chunk.chunk_id != index || span.byte_start != byte || span.scalar_start != scalar
                 || span.byte_end <= byte || span.scalar_end <= scalar
-                || chunk.source_tokens != span.byte_end - byte || chunk.run.schema_version != 1
+                || chunk.source_tokens == 0
+                || (self.encoding.is_none() && chunk.source_tokens != span.byte_end - byte)
+                || chunk.run.schema_version != 1
                 || chunk.run.execution != INT4_CLASSIFICATION_EXECUTION || chunk.run.numerics_profile != STRICT_INT4_PROFILE
                 || chunk.run.group_width != self.group_width || chunk.run.head_count != self.heads {
                 return Err(Int4ClassificationMapError::Admission);
@@ -195,26 +218,51 @@ impl Int4ClassificationPlanner {
         limits: Int4ClassificationMapLimits, control: &mut C) -> Result<PreparedInt4ClassificationMap<'a>, Int4ClassificationMapError> {
         planning::checkpoint(control)?; limits.validate(request.budget)?;
         if request.document.is_empty() { return Err(Int4ClassificationMapError::EmptySource); }
-        let capacity = self.max_document_bytes(request, limits.chunks.context_tokens)?;
-        PreparedInt4ClassificationMap::compile(request, limits, capacity, self.group_width(), control,
-            |request, control| self.plan_with_control(request, control))
+        let mut work = SafeBpeWork::default();
+        let capacity = self.source_token_capacity_with_work(request, limits.chunks.context_tokens, &mut work, control)?;
+        PreparedInt4ClassificationMap::compile_encoded(request, limits, capacity, self.group_width(),
+            self.document_encoding(), work, control,
+            |source, control, work| self.source_tokens_with_work(source, work, control),
+            |request, control, work| self.plan_with_encoding_work(request, control, work))
     }
 }
 impl<'a> PreparedInt4ClassificationMap<'a> {
+    #[cfg(test)]
     fn compile<C: DecodeStepControl, F>(request: &'a ClassificationRequest, limits: Int4ClassificationMapLimits,
         capacity: usize, width: usize, control: &mut C, mut prepare: F) -> Result<Self, Int4ClassificationMapError>
     where F: FnMut(&ClassificationRequest, &mut C) -> Result<PreparedInt4Classification, Int4ClassificationError> {
+        Self::compile_encoded(request, limits, capacity, width, &UntrustedEncoding::ByteFallback,
+            SafeBpeWork::default(), control, |source, _, _| Ok(source.len()),
+            |request, control, _| prepare(request, control))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn compile_encoded<C: DecodeStepControl, Count, Prepare>(request: &'a ClassificationRequest,
+        limits: Int4ClassificationMapLimits, capacity: usize, width: usize, encoding: &UntrustedEncoding,
+        mut work: SafeBpeWork, control: &mut C, mut count: Count, mut prepare: Prepare)
+        -> Result<Self, Int4ClassificationMapError>
+    where Count: FnMut(&str, &mut C, &mut SafeBpeWork) -> Result<usize, ClassificationPlanningError>,
+        Prepare: FnMut(&ClassificationRequest, &mut C, &mut SafeBpeWork)
+            -> Result<PreparedInt4Classification, Int4ClassificationError> {
+        encoding.validate().map_err(|_| Int4ClassificationMapError::Limits)?;
         limits.validate(request.budget)?;
         if request.document.is_empty() { return Err(Int4ClassificationMapError::EmptySource); }
         if capacity == 0 { return Err(Int4ClassificationMapError::Limits); }
         let reserved = limits.chunks.context_tokens.checked_sub(capacity).ok_or(Int4ClassificationMapError::Limits)?;
         let chunk_limits = ChunkLimits { max_chunk_tokens: limits.chunks.max_chunk_tokens.min(capacity),
             reserved_tokens: limits.chunks.reserved_tokens.max(reserved), ..limits.chunks };
-        let mut stopped = None;
-        let chunks = ChunkPlan::build_with_checkpoints(&request.document, chunk_limits, |text| Ok(text.len()),
-            || match control.prefill_checkpoint(0) { None => Ok(()), Some(cause) => {
-                stopped = Some(cause); Err(MapReduceError::Cancelled) } });
-        if let Some(cause) = stopped { return Err(ClassificationPlanningError::Cancelled(cause).into()); }
+        let error = RefCell::new(None);
+        let chunks = {
+            let control = RefCell::new(&mut *control);
+            ChunkPlan::build_with_checkpoints(&request.document, chunk_limits,
+                |text| count(text, &mut **control.borrow_mut(), &mut work).map_err(|cause| {
+                    *error.borrow_mut() = Some(cause); MapReduceError::Tokenizer
+                }),
+                || match control.borrow_mut().prefill_checkpoint(0) { None => Ok(()), Some(cause) => {
+                    *error.borrow_mut() = Some(ClassificationPlanningError::Cancelled(cause));
+                    Err(MapReduceError::Cancelled)
+                } })
+        };
+        if let Some(error) = error.into_inner() { return Err(error.into()); }
         let chunks = chunks.map_err(Int4ClassificationMapError::Chunk)?;
         let last = chunks.chunks().last().ok_or(Int4ClassificationMapError::EmptySource)?.span();
         let heads = if request.mode == ClassificationMode::Exclusive { 1 } else { request.labels.len() };
@@ -222,7 +270,10 @@ impl<'a> PreparedInt4ClassificationMap<'a> {
             byte_end: last.byte_end, scalar_start: 0, scalar_end: last.scalar_end }, chunks: chunks.chunks().len(), heads,
             labels: request.labels.len(), mode: request.mode, policy: request.policy, group_width: width,
             work: Int4Work::default(), retained_bytes: limits.max_retained_result_bytes, result_bytes: limits.max_result_bytes,
-            aggregation: limits.aggregation, chunk_limits, tokenizer_checks: chunks.tokenizer_calls() };
+            aggregation: limits.aggregation, chunk_limits, tokenizer_checks: chunks.tokenizer_calls(),
+            source_geometry: geometry(chunks.chunks().iter().map(|chunk| (chunk.id(), chunk.span(), chunk.tokens()))),
+            encoding: match encoding { UntrustedEncoding::ByteFallback => None,
+                UntrustedEncoding::SafeBpeV1(limits) => Some(*limits) }, encoding_work: work };
         let mut plans = planning::reserved(expected.chunks)?;
         for chunk in chunks.chunks() {
             planning::checkpoint(control)?;
@@ -231,13 +282,15 @@ impl<'a> PreparedInt4ClassificationMap<'a> {
             document.push_str(chunk.text());
             let row = ClassificationRequest { document, labels: request.labels.clone(), mode: request.mode,
                 policy: request.policy, budget: request.budget };
-            let prepared = prepare(&row, control)?;
+            let prepared = prepare(&row, control, &mut work)?;
             if prepared.group_width() != width || prepared.head_count() != heads || prepared.task_budget() != request.budget
+                || prepared.source_token_count()? != chunk.tokens()
                 || prepared.required_context() > chunk_limits.context_tokens { return Err(Int4ClassificationMapError::Admission); }
             expected.work = expected.work.checked_add(prepared.planned_work())?;
             if !fits(expected.work, limits.max_model_work) { return Err(Int4ClassificationMapError::Work); }
             plans.push(prepared);
         }
+        expected.encoding_work = work;
         planning::checkpoint(control)?;
         Ok(Self { chunks, plans, limits, expected, task: request.budget })
     }
@@ -311,10 +364,21 @@ impl<'a> PreparedInt4ClassificationMap<'a> {
             numerics_profile: STRICT_INT4_PROFILE.to_owned(), group_width: self.group_width(),
             chunk_profile: CHUNK_PROFILE.to_owned(), semantics: SEMANTICS.to_owned(), single_context_equivalence: false,
             source_span: span, chunk_limits: self.chunks.limits(), tokenizer_checks: self.chunks.tokenizer_calls(),
-            planned_model_work: self.planned_work(), model_work: work, retained_result_bytes: bytes, chunks, aggregate };
+            planned_model_work: self.planned_work(), model_work: work, retained_result_bytes: bytes, chunks, aggregate,
+            input_encoding: self.expected.encoding_record() };
         value_bytes(&run, self.limits.max_result_bytes)?;
         planning::checkpoint(control)?; Ok(run)
     }
+}
+fn geometry(rows: impl Iterator<Item = (usize, VerifiedSourceSpan, usize)>) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"classification-map-source-token-geometry-v1");
+    for (id, span, tokens) in rows {
+        for value in [id, span.byte_start, span.byte_end, span.scalar_start, span.scalar_end, tokens] {
+            hash.update((value as u64).to_le_bytes());
+        }
+    }
+    hash.finalize().into()
 }
 pub(super) fn fits(work: Int4Work, cap: Int4Work) -> bool {
     work.forward_positions <= cap.forward_positions && work.projected_logits <= cap.projected_logits

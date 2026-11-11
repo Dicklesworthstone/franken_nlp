@@ -1,6 +1,7 @@
 //! Complete-document exclusive and independent multi-label classification.
 use super::*;
 use crate::{native_engine::strict_int4::cohort::MAX_INT4_SEQUENCES,
+    tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding},
     tasks::{ir::TaskBudget, mapreduce::ChunkLimits,
     classify::{ClassificationAggregationPolicy, ClassificationLimits, ClassificationMode, ClassificationRequest,
         grouped_int4::long::{Int4ClassificationMapLimits,
@@ -16,6 +17,18 @@ mod tests;
 pub(super) struct MapArgs {
     scoring: classify::ScoringArgs,
     mapping: MappingArgs,
+    encoding: MapEncodingArgs,
+}
+#[derive(Args, Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MapEncodingArgs {
+    /// Cumulative bytes across label-capacity preparation, all attempted
+    /// source chunks and actual chunk plans; safe-bpe-v1 only, at most 1048576.
+    #[arg(long, value_name = "BYTES")]
+    max_tokenizer_input_bytes: Option<usize>,
+    /// Cumulative tokens produced during all source/metadata encoding work;
+    /// safe-bpe-v1 only, at most 1048576. Native prompt limits are separate.
+    #[arg(long, value_name = "COUNT")]
+    max_tokenizer_output_tokens: Option<usize>,
 }
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
 struct MappingArgs {
@@ -60,6 +73,13 @@ pub(super) fn definition() -> clap::Command {
         .mut_arg("max_checkpoints", |arg| arg.help("Cooperative allowance for the complete hosted plan, every chunk and reduction")))
 }
 
+/// Corpus/job callers keep the original byte-only parser. This complete
+/// one-document route owns the aggregate compact-tokenizer work allowance.
+pub(super) fn one_off_definition() -> clap::Command {
+    MapEncodingArgs::augment_args(input_encoding::definition(definition()))
+        .after_long_help("--input-encoding safe-bpe-v1 uses actual compact source-token counts when choosing chunks. Label-capacity preparation, every attempted chunk (including oversized probes) and all final chunk/label plans spend one shared tokenizer allowance. --max-tokenizer-input-bytes and --max-tokenizer-output-tokens default to 1048576 each; pair checks and examined pair bytes use their explicit shared flags. Exhaustion refuses the complete document before any native forward. Context, source bytes, native work, output and memory retain separate ceilings. Compact output includes the exact policy and consumed tokenizer work. Compact maps accept pinned sources or snapshot reload but refuse --save-snapshot, whose separate pre-save planning would repeat tokenizer work. The byte-fallback default, classify-corpus and classify-document-job retain their existing contracts.")
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct MapLimits {
     pub common: Int4Limits,
@@ -72,17 +92,41 @@ pub(super) struct MapLimits {
 impl MapArgs {
     pub(super) fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         Ok(Self { scoring: classify::ScoringArgs::from_matches(matches)?,
-            mapping: MappingArgs::from_arg_matches(matches)? })
+            mapping: MappingArgs::from_arg_matches(matches)?,
+            encoding: if matches.try_get_one::<String>("input_encoding").ok().flatten().is_some() {
+                MapEncodingArgs::from_arg_matches(matches)?
+            } else { MapEncodingArgs::default() } })
     }
     pub(super) fn validate(self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
-        self.validate_with_max_labels(args, 128)
+        self.validate_encoding(args, 128)
     }
     /// A live corpus may narrow label authority for every default and override.
     /// Existing one-off and durable workflows keep their original ceiling.
     pub(super) fn validate_with_max_labels(self, args: &Int4Args, max_labels: usize)
         -> Result<MapLimits, CandidateError> {
+        if !args.input_encoding.is_default() || self.encoding != MapEncodingArgs::default() {
+            return Err(CandidateError::Arguments);
+        }
+        self.validate_encoding(args, max_labels)
+    }
+    fn input_encoding(self, args: &Int4Args) -> Result<UntrustedEncoding, CandidateError> {
+        if args.input_encoding.is_default() && self.encoding != MapEncodingArgs::default() {
+            return Err(CandidateError::Arguments);
+        }
+        args.input_encoding.policy(
+            self.encoding.max_tokenizer_input_bytes.unwrap_or(SafeBpeLimits::MAX_INPUT_BYTES),
+            self.encoding.max_tokenizer_output_tokens.unwrap_or(SafeBpeLimits::MAX_OUTPUT_TOKENS))
+    }
+    fn validate_encoding(self, args: &Int4Args, max_labels: usize) -> Result<MapLimits, CandidateError> {
         if !(1..=128).contains(&max_labels) { return Err(CandidateError::Arguments); }
-        let mut common = self.scoring.validate(args)?;
+        if args.prefill()?.is_some() || args.compute.threads() != 1 || self.scoring.cohort_head_limit().is_some() {
+            return Err(CandidateError::Arguments);
+        }
+        let encoding = self.input_encoding(args)?;
+        if encoding != UntrustedEncoding::ByteFallback && args.save_snapshot.is_some() {
+            return Err(CandidateError::Arguments);
+        }
+        let mut common = self.scoring.validate_one_off_with_prefill(args)?;
         let m = self.mapping;
         if args.max_input_bytes < 4 || !(1..=256).contains(&m.max_chunks)
             || !(1..=1_000_000).contains(&m.max_tokenizer_calls)
@@ -122,7 +166,7 @@ impl MapArgs {
         } else {
             quote.requirements(args.group_width, budget, planning, mapping)
                 .map_err(|_| CandidateError::Arguments)?
-        };
+        }.with_input_encoding(&encoding).map_err(|_| CandidateError::Arguments)?;
         let envelope_bytes = memory.max_output_bytes.checked_add(4096)
             .and_then(|bytes| usize::try_from(bytes).ok()).ok_or(CandidateError::Arguments)?;
         let cli_preparation_bytes = sum(&[common.preparation_bytes,

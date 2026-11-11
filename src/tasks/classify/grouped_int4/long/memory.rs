@@ -3,7 +3,7 @@
 use super::{Int4ClassificationMapError, Int4ClassificationMapLimits, cohort::COHORT_WRAPPER_BYTES};
 use crate::{native_engine::strict_int4::{Int4MemoryRequirement,
         cohort::MAX_INT4_SEQUENCES, scoring::cohort::required_task_workspace_bytes},
-    tasks::{classify::ClassificationLimits, ir::TaskBudget}};
+    tasks::{classify::ClassificationLimits, ir::TaskBudget}, tokenizer::untrusted::UntrustedEncoding};
 
 pub const MIN_CLASSIFICATION_MAP_PREPARATION_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -23,6 +23,22 @@ pub struct Int4ClassificationMapMemoryRequirement {
     /// Result remains charged through complete caller publication.
     pub output_reservation_bytes: u64,
     pub max_output_bytes: u64,
+}
+impl Int4ClassificationMapMemoryRequirement {
+    /// Add one transient encoder workspace beside every retained chunk plan.
+    /// It is reused across probes and heads, never multiplied by the cohort
+    /// width and never substituted for existing source or result ownership.
+    pub fn with_input_encoding(mut self, encoding: &UntrustedEncoding)
+        -> Result<Self, Int4ClassificationMapError> {
+        let workspace = match encoding {
+            UntrustedEncoding::ByteFallback => 0,
+            UntrustedEncoding::SafeBpeV1(limits) => limits.requirements()
+                .map_err(|_| Int4ClassificationMapError::Limits)?.workspace_bytes,
+        };
+        self.input_bytes = sum(&[self.input_bytes, workspace])?;
+        sum(&[self.native.kv_bytes, self.workspace_bytes, self.input_bytes, self.output_reservation_bytes])?;
+        Ok(self)
+    }
 }
 
 /// The `memory` fields are the complete simultaneous quote for the cohort

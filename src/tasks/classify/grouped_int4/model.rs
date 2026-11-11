@@ -27,8 +27,8 @@ impl Int4ClassificationPlanner {
     /// Model/asset-bound base, not a compiled request identity. Each prepared
     /// task adds its complete prompt, label, score-space and policy bindings.
     pub fn execution_identity(&self) -> &ExecutionIdentity { &self.identity }
-    /// Configure one-off untrusted input before deriving a prepared identity.
-    /// Compact policy is deliberately refused by byte-capacity map planning.
+    /// Configure untrusted input before deriving a prepared identity. A
+    /// complete-document map shares these ceilings across probes and plans.
     pub fn with_document_encoding(mut self, encoding: crate::tokenizer::untrusted::UntrustedEncoding)
         -> Result<Self, Int4ClassificationError> {
         self.compiler = self.compiler.with_document_encoding(encoding)?;
@@ -47,6 +47,21 @@ impl Int4ClassificationPlanner {
     pub fn max_document_bytes(&self, request: &ClassificationRequest, context_tokens: usize)
         -> Result<usize, Int4ClassificationError> {
         self.compiler.source_capacity(request, self.ceiling, self.limits, context_tokens).map_err(Into::into)
+    }
+    pub(super) fn source_token_capacity_with_work<C: DecodeStepControl>(&self, request: &ClassificationRequest,
+        context_tokens: usize, work: &mut SafeBpeWork, control: &mut C)
+        -> Result<usize, ClassificationPlanningError> {
+        self.compiler.source_token_capacity_with_work(request, self.ceiling, self.limits, context_tokens, work, control)
+    }
+    pub(super) fn source_tokens_with_work<C: DecodeStepControl>(&self, source: &str,
+        work: &mut SafeBpeWork, control: &mut C) -> Result<usize, ClassificationPlanningError> {
+        self.compiler.source_tokens_with_work(source, work, control)
+    }
+    pub(super) fn plan_with_encoding_work<C: DecodeStepControl>(&self, request: &ClassificationRequest,
+        control: &mut C, work: &mut SafeBpeWork) -> Result<PreparedInt4Classification, Int4ClassificationError> {
+        let context = PlanContext::new(&self.identity, self.ceiling).map_err(|_| ClassificationPlanningError::InvalidLimits)?;
+        check_model(context.execution_identity(), &self.model)?;
+        self.compiler.compile_int4_with_work(request, &context, self.limits, self.model.group_width(), control, work)
     }
     #[cfg(all(feature = "metadata-store", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub(crate) fn durable_configuration(&self) -> (TaskBudget, ClassificationLimits) {

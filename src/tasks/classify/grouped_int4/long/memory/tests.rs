@@ -186,3 +186,27 @@ fn cohort_workspace_and_current_result_frontier_have_checked_finite_bounds() {
     mapping.max_model_work.forward_positions = u64::MAX;
     assert!(memory.cohort_requirements(32, task, planning, mapping, 1, 1).is_err());
 }
+
+#[test]
+fn compact_encoder_addition_preserves_original_owners_and_rejects_overflow() {
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+    let (memory, task, planning, mapping) = fixture();
+    let byte = memory.requirements(32, task, planning, mapping).unwrap();
+    let limits = SafeBpeLimits { max_input_bytes: 262144, max_output_tokens: 131072,
+        max_pair_checks: 33554432, max_pair_bytes: 268435456 };
+    let encoding = UntrustedEncoding::SafeBpeV1(limits);
+    let compact = byte.with_input_encoding(&encoding).unwrap();
+    assert_eq!(compact.input_bytes - byte.input_bytes, limits.requirements().unwrap().workspace_bytes);
+    assert_eq!(compact.native, byte.native);
+    assert_eq!(compact.workspace_bytes, byte.workspace_bytes);
+    assert_eq!(compact.output_reservation_bytes, byte.output_reservation_bytes);
+    assert_eq!(compact.max_output_bytes, byte.max_output_bytes);
+    assert_eq!(byte.with_input_encoding(&UntrustedEncoding::ByteFallback).unwrap(), byte);
+    for field in 0..3 {
+        let mut overflowing = byte;
+        match field { 0 => overflowing.input_bytes = u64::MAX,
+            1 => overflowing.workspace_bytes = u64::MAX,
+            _ => overflowing.output_reservation_bytes = u64::MAX }
+        assert!(overflowing.with_input_encoding(&encoding).is_err());
+    }
+}
