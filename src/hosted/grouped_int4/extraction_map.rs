@@ -9,6 +9,7 @@ use crate::{
         long::{Int4ExtractionMapError, Int4ExtractionMapLimits, Int4ExtractionMapRun}}},
     native_engine::{constrained::JsonDecodeError, constrained_int4},
     tasks::{extract::{ExtractError, grouped_int4::Int4ExtractError}, ir::TaskBudget},
+    tokenizer::untrusted::UntrustedEncoding,
     validation::grounded_fields::{SourceFieldEvidence, VerifiedSourceSpan},
 };
 mod cohort;
@@ -16,7 +17,9 @@ mod corpus;
 mod object;
 pub use object::Int4ObjectExtractionMapConfig;
 pub use corpus::{int4_extraction_document_corpus_requirements,
-    int4_extraction_document_object_corpus_requirements};
+    int4_extraction_document_corpus_requirements_with_encoding,
+    int4_extraction_document_object_corpus_requirements,
+    int4_extraction_document_object_corpus_requirements_with_encoding};
 
 /// Admission for a complete original document. The immutable compiler owns
 /// the base identity; this config cannot substitute another model or task.
@@ -31,6 +34,14 @@ pub struct Int4ExtractionMapConfig {
     pub reduction_reserve_bytes: u64,
 }
 impl Int4ExtractionMapConfig {
+    /// Source, retained preparation and one transient document-encoding
+    /// workspace. Encoding scratch is reused by schema sizing, chunk probes
+    /// and compilation; it is never multiplied by the number of chunks.
+    pub fn input_bytes(&self, source_capacity: usize, encoding: &UntrustedEncoding) -> Result<u64, HostedError> {
+        let encoding = crate::batch::extract::grouped_int4::memory::encoding_workspace_bytes(encoding)
+            .map_err(|_| HostedError::Limits("INT4 extraction map input encoding limits"))?;
+        sum(&[input_bytes(source_capacity, self)?, encoding])
+    }
     /// Exact modeled reduction reservation for this admitted chunk count,
     /// including native results, both coordinate copies and retained tokens.
     /// Native, source/planner and final output storage are charged separately.
@@ -64,7 +75,7 @@ impl NlpEngine {
         constrained_int4::check_model(identity, model.model_identity()).map_err(|_| HostedError::ModelIdentity)?;
         let required = Int4MemoryRequirement::for_context(config.native.context_tokens, width).map_err(native_error)?;
         validate(&config, identity, width, source.len(), required.kv_bytes)?;
-        let bytes = input_bytes(source.capacity(), &config)?;
+        let bytes = config.input_bytes(source.capacity(), planner.document_encoding())?;
         let run = config.native.run;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,
@@ -81,6 +92,8 @@ impl NlpEngine {
             let expected = prepared.preflight_metadata();
             let count = expected.chunk_count();
             if prepared.group_width() != width || expected.group_width() != width
+                || &prepared.document_encoding() != input.value.planner.document_encoding()
+                || &expected.document_encoding() != input.value.planner.document_encoding()
                 || prepared.execution_identities().len() != count
                 || required.kv_bytes > prepared.max_kv_bytes() {
                 return Err(HostedError::ModelIdentity);

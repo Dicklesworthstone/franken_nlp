@@ -14,7 +14,7 @@ use crate::{
     template::{Conversation, Message, MessageRole, RenderOptions, TemplateBuilder, ToolFormat, IM_START, IM_END, THINK_START, THINK_END},
     tokenizer::{bpe::EncodeOptions, embedded::{EmbeddedTokenizer, PINNED_TOKENIZER_MODEL_BYTES,
         PINNED_ADDED_TOKENS_BYTES, PINNED_TOKENIZER_CONFIG_BYTES, PINNED_SPECIAL_TOKENS_MAP_BYTES}, specials::TemplateControlIds,
-        untrusted::UntrustedEncoding},
+        untrusted::{SafeBpeWork, UntrustedEncoding}},
 };
 use super::*;
 /// Shared embedding admission and result-ownership surfaces for both families.
@@ -204,6 +204,12 @@ impl ExtractionBatchPlanner {
     fn prepare_input_with_encoding<F: FnMut() -> Option<crate::native_engine::decode::DecodeCancellationKind>>(
         &self, document: BatchDocument<ExtractionBatchArgs>, policy: &UntrustedEncoding, checkpoint: &mut F,
     ) -> Result<ExtractionInput, BatchFault> {
+        self.prepare_input_with_encoding_work(document, policy, &mut SafeBpeWork::default(), checkpoint)
+    }
+    fn prepare_input_with_encoding_work<F: FnMut() -> Option<crate::native_engine::decode::DecodeCancellationKind>>(
+        &self, document: BatchDocument<ExtractionBatchArgs>, policy: &UntrustedEncoding,
+        work: &mut SafeBpeWork, checkpoint: &mut F,
+    ) -> Result<ExtractionInput, BatchFault> {
         if let Some(cause) = checkpoint() { return Err(BatchFault::cancelled(cause)); }
         policy.validate().map_err(|_| BatchCode::InvalidLimits)?;
         let args = document.task_args.or_else(|| self.defaults.clone()).ok_or(BatchCode::Planning)?;
@@ -218,8 +224,8 @@ impl ExtractionBatchPlanner {
             UntrustedEncoding::ByteFallback => untrusted_tokens,
             UntrustedEncoding::SafeBpeV1(limits) => limits.max_input_bytes,
         };
-        let (schema, source) = self.encoder.encode_schema_and_source_with_control(&args.schema,
-            &document.text, policy, input_bytes, untrusted_tokens, checkpoint).map_err(|error| match error {
+        let (schema, source) = self.encoder.encode_schema_and_source_with_work(&args.schema,
+            &document.text, policy, input_bytes, untrusted_tokens, work, checkpoint).map_err(|error| match error {
                 ExtractError::Decode(JsonDecodeError::Cancelled(cause)) => BatchFault::cancelled(cause),
                 ExtractError::AllocationRefused => BatchCode::Allocation.into(),
                 _ => BatchCode::Planning.into(),

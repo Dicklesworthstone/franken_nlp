@@ -10,7 +10,9 @@ impl PreparedInt4ExtractionMap<'_> {
         for ((plan, identity), chunk) in self.plans.iter().zip(admitted).zip(self.chunks.chunks()) {
             step(control)?;
             plan.verify_identity(identity)?;
-            if plan.source().text() != chunk.text() || plan.plan.selected_rows() != self.expected.selected_rows {
+            if plan.source().text() != chunk.text() || plan.plan.selected_rows() != self.expected.selected_rows
+                || plan.source().document_encoding() != &self.document_encoding()
+                || plan.source().total_token_count() != chunk.tokens() {
                 return Err(Int4ExtractionMapError::Admission);
             }
             // Check even the FINAL chunk's full resident KV reservation before
@@ -147,6 +149,8 @@ pub(super) fn complete(expected: Int4ExtractionMapPreflight, total: GroundingBud
         numerics_profile: STRICT_INT4_PROFILE, group_width: expected.group_width,
         semantics: if root_array_union.is_some() { ROOT_ARRAY_UNION_POLICY } else { SEMANTICS }, grounding: expected.grounding,
         max_selected_rows: expected.selected_rows.map(|limits| limits.max_rows_per_step),
+        input_encoding: expected.encoding.map(UntrustedEncoding::SafeBpeV1),
+        input_encoding_work: expected.encoding_work,
         planned_model_work: expected.work, model_work: work, reserved_mask_node_visits: expected.masks,
         mask_node_visit_charge: masks, verification_used: ExtractionMapVerification {
             fields: total.max_fields.checked_sub(remaining.max_fields).ok_or(Int4ExtractionMapError::WorkLimit)?,

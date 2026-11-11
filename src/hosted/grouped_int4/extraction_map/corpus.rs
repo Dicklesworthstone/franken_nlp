@@ -11,6 +11,7 @@ use crate::{
     grammar::CompileLimits,
     native_engine::{constrained_int4::sparse::Int4JsonSparseLimits, lmhead::NANBEIGE_VOCAB_SIZE, strict_int4::Int4Work},
     tasks::extract::object_reconcile::RootObjectLimits,
+    tokenizer::untrusted::SafeBpeLimits,
 };
 
 struct StreamInput<R, W> {
@@ -31,6 +32,18 @@ pub fn int4_extraction_document_corpus_requirements(width: usize, budget: TaskBu
         .requirements(width, budget, document, limits.transport).map_err(map_error)
 }
 
+/// Complete stream ownership with one optional bounded input-encoding
+/// workspace in addition to the unchanged retained preparation declaration.
+#[allow(clippy::too_many_arguments)]
+pub fn int4_extraction_document_corpus_requirements_with_encoding(width: usize, budget: TaskBudget,
+    document: Int4ExtractionMapLimits, limits: CorpusLimits, reduction_reserve_bytes: u64,
+    cohort_chunks: Option<usize>, encoding: &UntrustedEncoding)
+    -> Result<Int4ExtractionDocumentMemoryRequirement, HostedError> {
+    limits.native.run.validate()?;
+    memory_limits(limits, reduction_reserve_bytes, cohort_chunks)
+        .requirements_with_encoding(width, budget, document, limits.transport, encoding).map_err(map_error)
+}
+
 /// The same complete stream quote with an explicit original-schema root-object
 /// reducer. Both schema parses and the complete reconciliation workspace coexist
 /// with the retained chunk map, before any original source is read or prepared.
@@ -42,6 +55,20 @@ pub fn int4_extraction_document_object_corpus_requirements(width: usize, budget:
     limits.native.run.validate()?;
     memory_limits(limits, reduction_reserve_bytes, cohort_chunks)
         .requirements_with_root_object(width, budget, document, limits.transport, compiler, object)
+        .map_err(map_error)
+}
+
+/// The common pre-IO quote for the fixed document semantics and input policy.
+/// Compact exact-schema maps and root arrays are supported; compact partial
+/// root-object reconciliation is refused by both this quote and its compiler.
+#[allow(clippy::too_many_arguments)]
+pub fn int4_extraction_document_object_corpus_requirements_with_encoding(width: usize, budget: TaskBudget,
+    document: Int4ExtractionMapLimits, limits: CorpusLimits, reduction_reserve_bytes: u64,
+    cohort_chunks: Option<usize>, compiler: CompileLimits, object: Option<RootObjectLimits>,
+    encoding: &UntrustedEncoding) -> Result<Int4ExtractionDocumentMemoryRequirement, HostedError> {
+    limits.native.run.validate()?;
+    memory_limits(limits, reduction_reserve_bytes, cohort_chunks)
+        .requirements_with_root_object_and_encoding(width, budget, document, limits.transport, compiler, object, encoding)
         .map_err(map_error)
 }
 
@@ -84,11 +111,14 @@ impl NlpEngine {
         }
         let document = planner.document_limits();
         let cohort_chunks = planner.uses_chunk_cohorts().then_some(document.mapping.reduction.map_batch_chunks);
-        let required = int4_extraction_document_object_corpus_requirements(planner.group_width(),
+        let required = int4_extraction_document_object_corpus_requirements_with_encoding(planner.group_width(),
             planner.document_budget(), document, limits, reduction_reserve_bytes, cohort_chunks,
-            planner.compiler_limits(), planner.root_object_reconciliation())?;
+            planner.compiler_limits(), planner.root_object_reconciliation(), planner.document_encoding())?;
         let cohort = cohort_chunks.map(|_| planner.cohort_requirements().map_err(HostedError::BatchSetup)).transpose()?;
         let capacity = DocumentCapacity { document, budget: planner.document_budget(), selected_rows: planner.selected_rows(),
+            encoding: match planner.document_encoding() {
+                UntrustedEncoding::ByteFallback => None, UntrustedEncoding::SafeBpeV1(limits) => Some(*limits),
+            },
             kv_bytes: required.native.kv_bytes, max_result_bytes: required.max_output_bytes };
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
@@ -148,6 +178,7 @@ struct DocumentCapacity {
     document: Int4ExtractionMapLimits,
     budget: TaskBudget,
     selected_rows: Option<Int4JsonSparseLimits>,
+    encoding: Option<SafeBpeLimits>,
     kv_bytes: u64,
     max_result_bytes: u64,
 }
@@ -182,6 +213,7 @@ fn check_request(width: usize, base: &ExecutionIdentity, capacity: DocumentCapac
     let c = capacity; let m = c.document.mapping;
     if base.task_spec != "extract-v1" || request.chunk_count == 0 || request.chunk_count > m.chunks.max_chunks
         || request.chunk_count > 256 || request.identities.len() != request.chunk_count
+        || request.document_encoding != c.encoding.map_or(UntrustedEncoding::ByteFallback, UntrustedEncoding::SafeBpeV1)
         || request.kv_reservation_bytes != c.kv_bytes || c.kv_bytes == 0 {
         return Err(BatchItemFailure::fatal(BatchCode::Admission));
     }

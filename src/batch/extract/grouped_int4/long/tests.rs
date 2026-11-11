@@ -128,6 +128,7 @@ fn array_union_keeps_duplicate_verbatim_origins_and_every_original_span() {
 }
 
 mod selected;
+mod encoding;
 pub(super) struct Script {
     args: ExtractionBatchArgs, pub(super) quote: Option<String>, pub(super) json: Option<String>, pub(super) calls: Rc<Cell<usize>>,
     pub(super) corrupt: Option<usize>, pub(super) fail_at: Option<usize>, capacity: usize, group_width: usize, dirty_at: Option<usize>,

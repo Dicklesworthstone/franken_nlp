@@ -49,9 +49,22 @@ impl SourceDocumentEncoder {
     /// ledger. The schema remains separate task data: its bytes never enter
     /// the source language or authorize a citation. This explicit policy
     /// does not change the encoder used by composed byte-capacity planners.
+    #[cfg(test)]
     pub(crate) fn encode_schema_and_source_with_control<F: FnMut() -> Option<DecodeCancellationKind>>(
         &self, schema: &str, text: &str, policy: &UntrustedEncoding,
         max_bytes: usize, max_tokens: usize, checkpoint: &mut F,
+    ) -> Result<(SourceDocument, SourceDocument), ExtractError> {
+        self.encode_schema_and_source_with_work(schema, text, policy, max_bytes, max_tokens,
+            &mut SafeBpeWork::default(), checkpoint)
+    }
+
+    /// Internal composition boundary: complete-document planning keeps this
+    /// SAME ledger through sizing, discarded chunk probes and final plans.
+    /// Per-prompt byte/token caps remain independent of cumulative BPE work.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_schema_and_source_with_work<F: FnMut() -> Option<DecodeCancellationKind>>(
+        &self, schema: &str, text: &str, policy: &UntrustedEncoding,
+        max_bytes: usize, max_tokens: usize, work: &mut SafeBpeWork, checkpoint: &mut F,
     ) -> Result<(SourceDocument, SourceDocument), ExtractError> {
         encoding_checkpoint(checkpoint)?;
         policy.validate().map_err(|_| ExtractError::Contract("invalid extraction document encoding policy"))?;
@@ -63,12 +76,11 @@ impl SourceDocumentEncoder {
         if total > byte_limit {
             return Err(ExtractError::Contract("schema and source exceed aggregate byte or token budget"));
         }
-        let mut work = SafeBpeWork::default();
-        let schema = self.encode_part(schema, policy, &mut work, checkpoint)?;
+        let schema = self.encode_part(schema, policy, work, checkpoint)?;
         if schema.ids().len() > max_tokens {
             return Err(ExtractError::Contract("schema token budget exceeded"));
         }
-        let source = self.encode_part(text, policy, &mut work, checkpoint)?;
+        let source = self.encode_part(text, policy, work, checkpoint)?;
         let tokens = schema.ids().len().checked_add(source.ids().len()).ok_or(ExtractError::AllocationRefused)?;
         if tokens > max_tokens {
             return Err(ExtractError::Contract("schema and source exceed aggregate token budget"));
@@ -80,6 +92,27 @@ impl SourceDocumentEncoder {
             encoding: policy.clone(),
         };
         Ok((bind(schema), bind(source)))
+    }
+
+    /// Count an exact schema/source segment using the eventual prompt policy.
+    /// Probes consume work even when the map coordinator subsequently shrinks
+    /// the candidate; they cannot renew the complete-document allowance.
+    pub(crate) fn encode_with_policy_and_work<F: FnMut() -> Option<DecodeCancellationKind>>(
+        &self, text: &str, policy: &UntrustedEncoding, max_bytes: usize, max_tokens: usize,
+        work: &mut SafeBpeWork, checkpoint: &mut F,
+    ) -> Result<SourceDocument, ExtractError> {
+        encoding_checkpoint(checkpoint)?;
+        policy.validate().map_err(|_| ExtractError::Contract("invalid source document encoding policy"))?;
+        let byte_limit = match policy {
+            UntrustedEncoding::ByteFallback => max_bytes.min(max_tokens),
+            UntrustedEncoding::SafeBpeV1(limits) => max_bytes.min(limits.max_input_bytes),
+        };
+        if text.len() > byte_limit { return Err(ExtractError::Contract("source encoding byte budget exceeded")); }
+        let document = self.encode_part(text, policy, work, checkpoint)?;
+        if document.ids().len() > max_tokens { return Err(ExtractError::Contract("source token budget exceeded")); }
+        encoding_checkpoint(checkpoint)?;
+        Ok(SourceDocument { token_count: document.ids().len(), input_bytes: document.bytes().len(),
+            document, context_documents: Vec::new(), control_digest: self.control_digest, encoding: policy.clone() })
     }
 
     fn encode_part<F: FnMut() -> Option<DecodeCancellationKind>>(&self, part: &str,

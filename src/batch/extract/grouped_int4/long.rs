@@ -17,6 +17,7 @@ use crate::{
             MapReduceResult, MapReduceTask, MapOutput, ReduceInput, ReductionPolicy, SourceChunk}},
     validation::grounded_fields::{GroundingBudget, SourceFieldEvidence, VerifiedSourceSpan,
         SourceOccurrence, FieldGroundingError, scan_occurrences},
+    tokenizer::untrusted::SafeBpeLimits,
 };
 #[cfg(test)] use crate::{native_engine::constrained_int4::Int4JsonBudget,
     tasks::extract::grouped_int4::INT4_EXTRACT_VERSION};
@@ -120,6 +121,8 @@ pub struct Int4ExtractionMapPreflight {
     verification: GroundingBudget,
     root_array_binding: Option<Sha256Digest>,
     selected_rows: Option<Int4JsonSparseLimits>,
+    encoding: Option<SafeBpeLimits>,
+    encoding_work: Option<SafeBpeWork>,
 }
 impl fmt::Debug for Int4ExtractionMapPreflight {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -128,6 +131,7 @@ impl fmt::Debug for Int4ExtractionMapPreflight {
             .field("work", &self.work).field("masks", &self.masks).field("group_width", &self.group_width)
             .field("grounding", &self.grounding).field("verification", &self.verification)
             .field("selected_rows", &self.selected_rows)
+            .field("input_encoding", &self.encoding).field("input_encoding_work", &self.encoding_work)
             .field("root_array_union", &self.root_array_binding.is_some()).finish()
     }
 }
@@ -138,6 +142,12 @@ impl Int4ExtractionMapPreflight {
     pub fn reserved_mask_visits(&self) -> u64 { self.masks }
     pub fn group_width(&self) -> usize { self.group_width }
     pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.selected_rows }
+    /// Complete planning policy, including work spent on sizing and probes.
+    /// Byte-fallback metadata remains absent from the existing wire contract.
+    pub fn document_encoding(&self) -> UntrustedEncoding {
+        self.encoding.map_or(UntrustedEncoding::ByteFallback, UntrustedEncoding::SafeBpeV1)
+    }
+    pub fn encoding_work(&self) -> Option<SafeBpeWork> { self.encoding_work }
     pub fn execution_version(&self) -> &'static str {
         if self.selected_rows.is_some() { INT4_EXTRACTION_MAP_SELECTED_EXECUTION } else { INT4_EXTRACTION_MAP_EXECUTION }
     }
@@ -151,6 +161,8 @@ impl Int4ExtractionMapPreflight {
             })));
         if run.schema_version != 1 || run.execution != self.execution_version()
             || run.max_selected_rows != self.selected_rows.map(|limits| limits.max_rows_per_step)
+            || run.input_encoding != self.encoding.map(UntrustedEncoding::SafeBpeV1)
+            || run.input_encoding_work != self.encoding_work
             || run.numerics_profile != STRICT_INT4_PROFILE || run.group_width != self.group_width
             || run.semantics != if self.root_array_binding.is_some() { ROOT_ARRAY_UNION_POLICY } else { SEMANTICS }
             || run.root_array_union.as_ref().map(RootArrayUnionResult::binding) != self.root_array_binding
@@ -204,6 +216,12 @@ pub struct Int4ExtractionMapRun {
     /// Omitted for the unchanged full-vocabulary document contract.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_selected_rows: Option<usize>,
+    /// Explicit complete-document tokenizer authority, never a renewed
+    /// allowance per probe, chunk or native cohort.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_encoding: Option<UntrustedEncoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_encoding_work: Option<SafeBpeWork>,
     pub planned_model_work: Int4Work,
     pub model_work: Int4Work,
     pub reserved_mask_node_visits: u64,
@@ -232,6 +250,10 @@ impl PreparedInt4ExtractionMap<'_> {
     pub fn max_result_bytes(&self) -> u64 { self.limits.mapping.reduction.max_result_bytes as u64 }
     pub fn group_width(&self) -> usize { self.expected.group_width }
     pub fn max_kv_bytes(&self) -> u64 { self.kv_ceiling }
+    pub fn document_encoding(&self) -> UntrustedEncoding { self.expected.document_encoding() }
+    pub fn encoding_workspace_bytes(&self) -> Result<u64, Int4ExtractionMapError> {
+        memory::encoding_workspace_bytes(&self.document_encoding()).map_err(|_| Int4ExtractionMapError::InvalidLimits)
+    }
     fn reduce_root_array<C: DecodeStepControl>(&self, mapped: &MapReduceResult<ExtractionMapValue>, control: &mut C)
         -> Result<Option<RootArrayUnionResult>, Int4ExtractionMapError> {
         let Some(limits) = self.limits.root_array_union else { return Ok(None); };
@@ -254,7 +276,7 @@ impl Int4ExtractionBatchPlanner {
         args: &ExtractionBatchArgs, limits: Int4ExtractionMapLimits, control: &mut C)
         -> Result<PreparedInt4ExtractionMap<'s>, Int4ExtractionMapError> {
         step(control)?;
-        self.require_byte_encoding().map_err(|_| Int4ExtractionMapError::Admission)?;
+        memory::encoding_workspace_bytes(self.document_encoding()).map_err(|_| Int4ExtractionMapError::InvalidLimits)?;
         limits.root_array_workspace_bytes()?;
         if source.is_empty() { return Err(Int4ExtractionMapError::EmptySource); }
         let b = args.budget; let c = &self.compiler; let m = limits.mapping; let v = limits.verification;
@@ -279,28 +301,49 @@ impl Int4ExtractionBatchPlanner {
         // neither it nor source text passes through trusted template rendering.
         let scaffold = c.fragments.iter().try_fold(0_usize, |n, f| n.checked_add(f.len()))
             .ok_or(Int4ExtractionMapError::WorkLimit)?;
-        let schema = c.encoder.encode(&args.schema, c.compiler_limits.max_schema_bytes, b.max_input_tokens as usize)
-            .map_err(|_| Int4ExtractionMapError::InvalidLimits)?;
+        let encoding = match self.document_encoding() {
+            UntrustedEncoding::ByteFallback => None,
+            UntrustedEncoding::SafeBpeV1(limits) => Some(*limits),
+        };
+        let mut encoding_work = SafeBpeWork::default();
+        let schema = if encoding.is_some() {
+            c.encoder.encode_with_policy_and_work(&args.schema, self.document_encoding(),
+                c.compiler_limits.max_schema_bytes, b.max_input_tokens as usize, &mut encoding_work,
+                &mut || control.prefill_checkpoint(0))?
+        } else {
+            c.encoder.encode(&args.schema, c.compiler_limits.max_schema_bytes, b.max_input_tokens as usize)
+                .map_err(|_| Int4ExtractionMapError::InvalidLimits)?
+        };
         let non_source = scaffold.checked_add(schema.total_token_count()).ok_or(Int4ExtractionMapError::WorkLimit)?;
         let token_room = (b.max_input_tokens as usize).checked_sub(non_source).filter(|&n| n > 0)
             .ok_or(Int4ExtractionMapError::InvalidLimits)?;
-        let byte_room = (b.max_input_tokens as usize).checked_sub(scaffold)
-            .and_then(|n| n.checked_sub(args.schema.len())).filter(|&n| n > 0).ok_or(Int4ExtractionMapError::InvalidLimits)?;
+        let byte_room = if let Some(encoding) = encoding {
+            // Byte room and token room are distinct under compact input. The
+            // actual ledger also includes this schema probe and every later
+            // candidate/final encoding, so this local cap never renews work.
+            encoding.max_input_bytes.checked_sub(args.schema.len())
+        } else {
+            (b.max_input_tokens as usize).checked_sub(scaffold).and_then(|n| n.checked_sub(args.schema.len()))
+        }.filter(|&n| n > 0).ok_or(Int4ExtractionMapError::InvalidLimits)?;
         let mut chunk_limits = m.chunks;
         chunk_limits.effective_token_limit().map_err(Int4ExtractionMapError::Chunk)?;
         chunk_limits.reserved_tokens = chunk_limits.reserved_tokens.max(non_source.checked_add(b.max_output_tokens as usize)
             .ok_or(Int4ExtractionMapError::WorkLimit)?);
         chunk_limits.max_chunk_tokens = chunk_limits.max_chunk_tokens.min(token_room);
         chunk_limits.max_chunk_bytes = chunk_limits.max_chunk_bytes.min(byte_room.max(4));
-        let mut cancelled = None;
-        let chunks = ChunkPlan::build_with_checkpoints(source, chunk_limits, |text| {
-            c.encoder.encode(text, chunk_limits.max_chunk_bytes, chunk_limits.max_chunk_bytes)
-                .map(|d| d.total_token_count()).map_err(|_| MapReduceError::Tokenizer)
-        }, || match control.prefill_checkpoint(0) {
-            Some(cause) => { cancelled = Some(cause); Err(MapReduceError::Cancelled) }, None => Ok(()),
-        });
-        if let Some(cause) = cancelled { return Err(cancelled_error(cause).into()); }
-        let chunks = chunks.map_err(Int4ExtractionMapError::Chunk)?;
+        let chunks = if encoding.is_some() {
+            compact_chunks(source, chunk_limits, &c.encoder, self.document_encoding(), &mut encoding_work, control)?
+        } else {
+            let mut cancelled = None;
+            let chunks = ChunkPlan::build_with_checkpoints(source, chunk_limits, |text| {
+                c.encoder.encode(text, chunk_limits.max_chunk_bytes, chunk_limits.max_chunk_bytes)
+                    .map(|d| d.total_token_count()).map_err(|_| MapReduceError::Tokenizer)
+            }, || match control.prefill_checkpoint(0) {
+                Some(cause) => { cancelled = Some(cause); Err(MapReduceError::Cancelled) }, None => Ok(()),
+            });
+            if let Some(cause) = cancelled { return Err(cancelled_error(cause).into()); }
+            chunks.map_err(Int4ExtractionMapError::Chunk)?
+        };
         let first = chunks.chunks().first().ok_or(Int4ExtractionMapError::EmptySource)?.span();
         let last = chunks.chunks().last().ok_or(Int4ExtractionMapError::EmptySource)?.span();
         let mut expected = Int4ExtractionMapPreflight {
@@ -308,6 +351,7 @@ impl Int4ExtractionBatchPlanner {
                 scalar_start: first.scalar_start, scalar_end: last.scalar_end }, chunks: chunks.chunks().len(),
             work: Int4Work::default(), masks: 0, group_width: self.group_width, verification: v, root_array_binding: None,
             selected_rows: self.selected_rows(),
+            encoding, encoding_work: None,
             grounding: match args.grounding { ExtractionBatchGrounding::Structural => ExtractionGrounding::NotRequested,
                 ExtractionBatchGrounding::SourceMembership => ExtractionGrounding::SourceMembership } };
         let mut plans = Vec::new();
@@ -317,13 +361,16 @@ impl Int4ExtractionBatchPlanner {
             let task_args = if self.shared_defaults_only { None } else {
                 Some(ExtractionBatchArgs { schema: copy(&args.schema)?, grounding: args.grounding, budget: b })
             };
-            let plan = self.prepare_with_control(BatchDocument { id: format!("chunk_{}", chunk.id()), text: copy(chunk.text())?,
-                task_args }, control)
-                .map_err(batch_error)?;
+            let document = BatchDocument { id: format!("chunk_{}", chunk.id()), text: copy(chunk.text())?, task_args };
+            let plan = if encoding.is_some() {
+                self.prepare_with_encoding_work(document, self.document_encoding(), &mut encoding_work, control)
+            } else { self.prepare_with_control(document, control) }.map_err(batch_error)?;
             if non_source.checked_add(chunk.tokens()) != Some(plan.plan.prompt_tokens())
                 || plan.plan.prompt_tokens().checked_add(b.max_output_tokens as usize).is_none_or(|n| n > chunk_limits.context_tokens)
                 || plan.source().text() != chunk.text() || plan.plan.group_width() != self.group_width
-                || plan.plan.selected_rows() != expected.selected_rows {
+                || plan.plan.selected_rows() != expected.selected_rows
+                || plan.source().document_encoding() != self.document_encoding()
+                || plan.source().total_token_count() != chunk.tokens() {
                 return Err(Int4ExtractionMapError::Admission);
             }
             expected.work = add_work(expected.work, plan.planned_work()).filter(|w| fits(*w, m.max_model_work))
@@ -332,6 +379,7 @@ impl Int4ExtractionBatchPlanner {
                 .ok_or(Int4ExtractionMapError::WorkLimit)?;
             plans.push(plan);
         }
+        expected.encoding_work = encoding.map(|_| encoding_work);
         if let Some(union) = limits.root_array_union {
             let first = plans.first().ok_or(Int4ExtractionMapError::Admission)?;
             union.validate_schema(first.plan.semantic_schema(&first.task, &first.source)?)?;
@@ -350,6 +398,30 @@ impl Int4ExtractionBatchPlanner {
         step(control)?;
         Ok(PreparedInt4ExtractionMap { chunks, plans, limits, expected, kv_ceiling: b.max_kv_bytes })
     }
+}
+
+/// The ordinary partitioner makes no prefix-monotonicity assumption. Every
+/// discarded prefix is encoded and charged before it geometrically shrinks;
+/// both callbacks borrow the original control so cancellation inside a BPE
+/// scan retains its exact kind instead of becoming a generic tokenizer error.
+fn compact_chunks<'s, C: DecodeStepControl>(source: &'s str, limits: ChunkLimits,
+    encoder: &SourceDocumentEncoder, policy: &UntrustedEncoding, work: &mut SafeBpeWork, control: &mut C)
+    -> Result<ChunkPlan<'s>, Int4ExtractionMapError> {
+    let control = std::cell::RefCell::new(control);
+    let mut encoding_error = None;
+    let mut cancelled = None;
+    let chunks = ChunkPlan::build_with_checkpoints(source, limits, |text| {
+        encoder.encode_with_policy_and_work(text, policy, limits.max_chunk_bytes,
+            limits.max_chunk_bytes, work, &mut || control.borrow_mut().prefill_checkpoint(0))
+            .map(|source| source.total_token_count()).map_err(|error| {
+                encoding_error = Some(error); MapReduceError::Tokenizer
+            })
+    }, || match control.borrow_mut().prefill_checkpoint(0) {
+        Some(cause) => { cancelled = Some(cause); Err(MapReduceError::Cancelled) }, None => Ok(()),
+    });
+    if let Some(error) = encoding_error { return Err(error.into()); }
+    if let Some(cause) = cancelled { return Err(cancelled_error(cause).into()); }
+    chunks.map_err(Int4ExtractionMapError::Chunk)
 }
 fn step<C: DecodeStepControl>(control: &mut C) -> Result<(), Int4ExtractError> {
     match control.prefill_checkpoint(0) { Some(cause) => Err(cancelled_error(cause)), None => Ok(()) }

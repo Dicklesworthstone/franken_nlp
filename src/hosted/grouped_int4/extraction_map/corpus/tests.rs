@@ -33,18 +33,77 @@ fn capacity(cohorts: bool) -> DocumentCapacity {
     let (budget, document, limits, reserve) = fixture();
     let chunks = cohorts.then_some(document.mapping.reduction.map_batch_chunks);
     let quote = int4_extraction_document_corpus_requirements(32, budget, document, limits, reserve, chunks).unwrap();
-    DocumentCapacity { document, budget, selected_rows: None,
+    DocumentCapacity { document, budget, selected_rows: None, encoding: None,
         kv_bytes: quote.native.kv_bytes, max_result_bytes: quote.max_output_bytes }
 }
 fn request(identities: &[ExecutionIdentity], capacity: DocumentCapacity) -> Int4ExtractionDocumentAdmission<'_> {
     let chunks = identities.len();
     let rows = capacity.selected_rows.map_or(NANBEIGE_VOCAB_SIZE, |limits| limits.max_rows_per_step);
     Int4ExtractionDocumentAdmission { identities,
+        document_encoding: capacity.encoding.map_or(UntrustedEncoding::ByteFallback, UntrustedEncoding::SafeBpeV1),
         model_work: Int4Work::for_sequence(32, 0, 128, capacity.budget.max_output_tokens as usize * chunks * rows).unwrap(),
         mask_node_visits: capacity.document.mapping.mask_visits_per_chunk * chunks as u64,
         mask_limits: capacity.document.mapping.mask_limits, kv_reservation_bytes: capacity.kv_bytes,
         max_result_bytes: capacity.max_result_bytes,
         max_output_tokens: u64::from(capacity.budget.max_output_tokens) * chunks as u64, chunk_count: chunks }
+}
+
+#[test]
+fn compact_stream_quotes_share_one_workspace_and_preserve_native_authority() {
+    let (budget, document, limits, reserve) = fixture();
+    let policy = SafeBpeLimits { max_input_bytes: 4096, max_output_tokens: 2048,
+        max_pair_checks: 65_536, max_pair_bytes: 131_072 };
+    let encoding = UntrustedEncoding::SafeBpeV1(policy);
+    for chunks in [None, Some(3)] {
+        let plain = int4_extraction_document_corpus_requirements(32, budget, document, limits, reserve, chunks).unwrap();
+        let quote = int4_extraction_document_corpus_requirements_with_encoding(32, budget,
+            document, limits, reserve, chunks, &encoding).unwrap();
+        let core = memory_limits(limits, reserve, chunks)
+            .requirements_with_encoding(32, budget, document, limits.transport, &encoding).unwrap();
+        assert_eq!(quote, core);
+        assert_eq!(quote.input_bytes - plain.input_bytes, policy.requirements().unwrap().workspace_bytes);
+        assert_eq!(quote.native, plain.native);
+        assert_eq!(quote.workspace_bytes, plain.workspace_bytes);
+        assert_eq!(quote.document_workspace_bytes, plain.document_workspace_bytes);
+        assert_eq!(quote.output_reservation_bytes, plain.output_reservation_bytes);
+        assert_eq!(quote.max_output_bytes, plain.max_output_bytes);
+        assert_eq!(int4_extraction_document_object_corpus_requirements_with_encoding(32, budget,
+            document, limits, reserve, chunks, CompileLimits::default(), None, &encoding).unwrap(), quote);
+        assert!(int4_extraction_document_object_corpus_requirements_with_encoding(32, budget,
+            document, limits, reserve, chunks, CompileLimits::default(), Some(RootObjectLimits {
+                max_properties: 16, max_origins: 64, max_input_bytes: 65_536,
+                max_json_bytes: 1024, max_nodes: 4096, max_result_bytes: 4096,
+            }), &encoding).is_err());
+    }
+}
+
+#[test]
+fn admission_binds_all_compact_policy_limits_for_serial_and_cohort_documents() {
+    let base = identity();
+    let identities = [identity(), identity()];
+    let policy = SafeBpeLimits { max_input_bytes: 4096, max_output_tokens: 2048,
+        max_pair_checks: 65_536, max_pair_bytes: 131_072 };
+    for cohorts in [false, true] {
+        let mut compact = capacity(cohorts); compact.encoding = Some(policy);
+        for selected in [None, Some(Int4JsonSparseLimits { max_rows_per_step: 65 })] {
+            compact.selected_rows = selected;
+            let claim = request(&identities, compact);
+            check_request(32, &base, compact, &claim).unwrap();
+            let mut plain = compact; plain.encoding = None;
+            assert_eq!(check_request(32, &base, plain, &claim).unwrap_err().fault.code, BatchCode::Admission);
+            assert_eq!(check_request(32, &base, compact, &request(&identities, plain)).unwrap_err().fault.code,
+                BatchCode::Admission);
+            for axis in 0..4 {
+                let mut changed = policy;
+                match axis { 0 => changed.max_input_bytes += 1, 1 => changed.max_output_tokens += 1,
+                    2 => changed.max_pair_checks += 1, _ => changed.max_pair_bytes += 1 }
+                let mut substituted = request(&identities, compact);
+                substituted.document_encoding = UntrustedEncoding::SafeBpeV1(changed);
+                assert_eq!(check_request(32, &base, compact, &substituted).unwrap_err().fault.code,
+                    BatchCode::Admission, "axis {axis}");
+            }
+        }
+    }
 }
 
 #[test]

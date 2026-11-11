@@ -5,6 +5,7 @@ use super::super::{Int4ExtractionMapError, Int4ExtractionMapLimits,
 use super::EXTRACTION_DOCUMENT_CHUNK_METADATA_BYTES;
 use crate::{batch::BatchLimits, grammar::CompileLimits, native_engine::strict_int4::Int4MemoryRequirement,
     tasks::{ir::TaskBudget, extract::object_reconcile::{RootObjectLimits, RootObjectSchema}},
+    tokenizer::untrusted::UntrustedEncoding,
     validation::grounded_fields::{SourceFieldEvidence, VerifiedSourceSpan}};
 
 /// Caller-owned compiler, schema, vocabulary and IO allocations must fit the
@@ -27,7 +28,8 @@ pub struct Int4ExtractionDocumentMemoryRequirement {
     pub native: Int4MemoryRequirement,
     /// Native RoPE/scratch and caller-declared allocator headroom.
     pub workspace_bytes: u64,
-    /// Transport, compiler/vocabulary, IO and all frozen chunk identities.
+    /// Transport, compiler/vocabulary, IO, all frozen chunk identities and
+    /// one optional transient encoding workspace shared by every chunk.
     pub input_bytes: u64,
     /// Complete map frontier, evidence, token storage and cohort decoder state.
     pub document_workspace_bytes: u64,
@@ -37,6 +39,41 @@ pub struct Int4ExtractionDocumentMemoryRequirement {
 }
 
 impl Int4ExtractionDocumentMemoryLimits {
+    /// Compact schema/source preparation reuses one transient workspace across
+    /// every chunk probe and final plan. The declared preparation reserve still
+    /// owns retained plans; neither chunk count nor native cohort width renews
+    /// or multiplies this encoding workspace.
+    pub fn requirements_with_encoding(self, width: usize, budget: TaskBudget,
+        document: Int4ExtractionMapLimits, transport: BatchLimits, encoding: &UntrustedEncoding)
+        -> Result<Int4ExtractionDocumentMemoryRequirement, Int4ExtractionMapError> {
+        let workspace = crate::batch::extract::grouped_int4::memory::encoding_workspace_bytes(encoding)
+            .map_err(|_| Int4ExtractionMapError::InvalidLimits)?;
+        let mut required = self.requirements(width, budget, document, transport)?;
+        required.input_bytes = sum(&[required.input_bytes, workspace])?;
+        sum(&[required.native.kv_bytes, required.workspace_bytes, required.input_bytes,
+            required.document_workspace_bytes, required.output_reservation_bytes])?;
+        Ok(required)
+    }
+
+    /// Root-object reconciliation currently preserves its byte encoding
+    /// contract. Reject compact object policies before population IO instead
+    /// of quoting an encoding the object compiler cannot execute.
+    #[allow(clippy::too_many_arguments)]
+    pub fn requirements_with_root_object_and_encoding(self, width: usize, budget: TaskBudget,
+        document: Int4ExtractionMapLimits, transport: BatchLimits, compiler: CompileLimits,
+        object: Option<RootObjectLimits>, encoding: &UntrustedEncoding)
+        -> Result<Int4ExtractionDocumentMemoryRequirement, Int4ExtractionMapError> {
+        if object.is_some() && *encoding != UntrustedEncoding::ByteFallback {
+            return Err(Int4ExtractionMapError::InvalidLimits);
+        }
+        let mut required = self.requirements_with_encoding(width, budget, document, transport, encoding)?;
+        required.document_workspace_bytes = sum(&[required.document_workspace_bytes,
+            root_object_workspace_bytes(document, compiler, object)?])?;
+        sum(&[required.native.kv_bytes, required.workspace_bytes, required.input_bytes,
+            required.document_workspace_bytes, required.output_reservation_bytes])?;
+        Ok(required)
+    }
+
     /// Optional complete-object semantics retain both schema declarations and
     /// the reconciliation frontier in addition to every native chunk result.
     /// The extra ownership survives final validation and output delivery; it

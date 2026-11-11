@@ -92,6 +92,50 @@ fn without_schedule(run: &Int4ExtractionMapRun) -> serde_json::Value {
 }
 
 #[test]
+fn compact_serial_and_ragged_cohorts_share_the_complete_encoding_ledger_and_exact_evidence() {
+    let policy = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_input_bytes: 1 << 20,
+        max_output_tokens: 1 << 20, max_pair_checks: 1 << 26, max_pair_bytes: 1 << 29 });
+    let source = "éAéA      éAéA Alice Bob Carol";
+    let args = source_args(); let vocabulary = vocabulary();
+    for selected in [None, Some(Int4JsonSparseLimits { max_rows_per_step: NANBEIGE_VOCAB_SIZE })] {
+        let planner = planner().with_document_encoding(policy.clone()).unwrap();
+        let planner = if let Some(selected) = selected { planner.with_selected_rows(selected).unwrap() } else { planner };
+        let serial_plan = prepare(&planner, source, &args, limits(1));
+        let ids: Vec<_> = serial_plan.execution_identities().cloned().collect();
+        let serial = serial_plan.execute_with_driver(&ids, Script::new(&args), &mut Continue).unwrap();
+        for width in [1, 2, 4] {
+            let prepared = prepare(&planner, source, &args, limits(width));
+            let expected = prepared.preflight_metadata();
+            assert_eq!(expected.document_encoding(), policy);
+            let completed = run(prepared, Scripted::new(&args), &vocabulary).unwrap();
+            expected.verify_completed(&completed.document).unwrap();
+            assert_eq!(without_schedule(&completed.document), without_schedule(&serial));
+            assert_eq!(completed.document.input_encoding, Some(policy.clone()));
+            assert_eq!(completed.document.input_encoding_work, serial.input_encoding_work);
+            assert_eq!(completed.document.max_selected_rows, selected.map(|limits| limits.max_rows_per_step));
+        }
+    }
+}
+
+#[test]
+fn compact_cohorts_refuse_a_same_token_tail_with_different_encoding_limits_before_any_window() {
+    let policy = SafeBpeLimits { max_input_bytes: 8192, max_output_tokens: 8192,
+        max_pair_checks: 1 << 22, max_pair_bytes: 1 << 26 };
+    let compiler = planner().with_document_encoding(UntrustedEncoding::SafeBpeV1(policy)).unwrap();
+    let other = planner().with_document_encoding(UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_pair_checks: policy.max_pair_checks - 1, ..policy })).unwrap();
+    let args = source_args(); let vocabulary = vocabulary();
+    let mut prepared = prepare(&compiler, "Alice Bob Carol", &args, limits(2));
+    let text = prepared.chunks.chunks().last().unwrap().text().to_owned();
+    let replacement = other.prepare_with_control(BatchDocument { id: "tail".to_owned(),
+        text, task_args: Some(args.clone()) }, &mut Continue).unwrap();
+    assert_eq!(prepared.plans.last().unwrap().source().token_ids(), replacement.source().token_ids());
+    *prepared.plans.last_mut().unwrap() = replacement;
+    let script = Scripted::new(&args); let windows = Rc::clone(&script.windows);
+    assert!(run(prepared, script, &vocabulary).is_err()); assert!(windows.borrow().is_empty());
+}
+
+#[test]
 fn actual_windows_include_a_ragged_tail_and_preserve_every_serial_semantic_field() {
     let planner = planner(); let args = source_args(); let vocabulary = vocabulary();
     let source = "éAéA      éAéA Alice Bob Carol";

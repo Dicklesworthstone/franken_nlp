@@ -48,7 +48,7 @@ impl NlpEngine {
         let row = Int4MemoryRequirement::for_context(config.native.context_tokens, width).map_err(native_error)?;
         validate(&config, identity, width, source.len(), row.kv_bytes)?;
         let ceiling = config.cohort_requirements(width)?;
-        let bytes = input_bytes(source.capacity(), &config)?;
+        let bytes = config.input_bytes(source.capacity(), planner.document_encoding())?;
         let run = config.native.run;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,
@@ -63,6 +63,8 @@ impl NlpEngine {
             let expected = prepared.preflight_metadata();
             let count = expected.chunk_count();
             if prepared.group_width() != width || expected.group_width() != width
+                || &prepared.document_encoding() != input.value.planner.document_encoding()
+                || &expected.document_encoding() != input.value.planner.document_encoding()
                 || prepared.execution_identities().len() != count || row.kv_bytes > prepared.max_kv_bytes() {
                 return Err(HostedError::ModelIdentity);
             }

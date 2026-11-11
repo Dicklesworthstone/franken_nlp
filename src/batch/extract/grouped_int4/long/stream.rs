@@ -109,6 +109,18 @@ impl DocumentCompiler {
     pub(crate) fn root_object_reconciliation(&self) -> Option<RootObjectLimits> {
         match self { Self::Map(_) => None, Self::Object { limits, .. } => Some(*limits) }
     }
+    pub(crate) fn document_encoding(&self) -> &UntrustedEncoding { self.base_planner().document_encoding() }
+    pub(crate) fn encoding_workspace_bytes(&self) -> Result<u64, BatchFault> {
+        crate::batch::extract::grouped_int4::memory::encoding_workspace_bytes(self.document_encoding())
+    }
+    pub(crate) fn with_document_encoding(self, policy: UntrustedEncoding) -> Result<Self, BatchFault> {
+        crate::batch::extract::grouped_int4::memory::encoding_workspace_bytes(&policy)?;
+        match self {
+            Self::Map(planner) => Ok(Self::Map(planner.with_document_encoding(policy)?)),
+            object @ Self::Object { .. } if policy == UntrustedEncoding::ByteFallback => Ok(object),
+            Self::Object { .. } => Err(BatchCode::InvalidLimits.into()),
+        }
+    }
     pub(crate) fn with_selected_rows(self, limits: Int4JsonSparseLimits) -> Result<Self, BatchFault> {
         match self {
             Self::Map(planner) => Ok(Self::Map(planner.with_selected_rows(limits)?)),
@@ -120,6 +132,7 @@ impl DocumentCompiler {
         mapping: Int4ExtractionMapLimits, reconciliation: RootObjectLimits)
         -> Result<Self, Int4ObjectExtractionMapError> {
         let Self::Map(planner) = self else { return Err(Int4ObjectExtractionMapError::Admission); };
+        planner.require_byte_encoding().map_err(|_| Int4ObjectExtractionMapError::Admission)?;
         let limits = Int4ObjectExtractionMapLimits { mapping, reconciliation };
         limits.reconciliation_workspace_bytes()?;
         // This bounded schema-only check occurs before any population read.
@@ -213,6 +226,7 @@ impl DocumentPreflight {
     pub(crate) fn planned_work(&self) -> Int4Work { self.mapped().planned_work() }
     pub(crate) fn reserved_mask_visits(&self) -> u64 { self.mapped().reserved_mask_visits() }
     pub(crate) fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.mapped().selected_rows() }
+    pub(crate) fn document_encoding(&self) -> UntrustedEncoding { self.mapped().document_encoding() }
     pub(crate) fn execution_version(&self) -> &'static str {
         match self { Self::Map(proof) => proof.execution_version(), Self::Object(proof) => proof.execution_version() }
     }
@@ -276,6 +290,17 @@ impl Int4ExtractionDocumentBatchPlanner {
     pub fn max_verification(&self) -> GroundingBudget { self.config.max_verification }
     pub fn selected_rows(&self) -> Option<Int4JsonSparseLimits> { self.compiler.base_planner().selected_rows() }
     pub fn root_object_reconciliation(&self) -> Option<RootObjectLimits> { self.compiler.root_object_reconciliation() }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { self.compiler.document_encoding() }
+    pub fn encoding_workspace_bytes(&self) -> Result<u64, BatchFault> { self.compiler.encoding_workspace_bytes() }
+    /// Select the bounded source/schema encoding for every complete document.
+    /// One preparation shares its work allowance across sizing, chunk probes
+    /// and all final chunk plans. An earlier preparation cannot be transferred
+    /// across policy changes, even when its resulting chunk geometry matches.
+    pub fn with_document_encoding(mut self, policy: UntrustedEncoding) -> Result<Self, BatchFault> {
+        self.compiler = self.compiler.with_document_encoding(policy)?;
+        self.owner = Arc::new(());
+        Ok(self)
+    }
     /// Explicitly reconcile complementary root properties under the unchanged
     /// original schema. This installs the fixed partial-object prompt before
     /// any source planning and invalidates every earlier preparation owner.
@@ -339,6 +364,8 @@ impl Int4ExtractionDocumentBatchPlanner {
         let expected = plan.preflight_metadata();
         if expected.chunk_count() == 0 || expected.chunk_count() > self.config.limits.mapping.chunks.max_chunks
             || expected.group_width() != self.group_width() || expected.selected_rows() != self.selected_rows()
+            || &expected.document_encoding() != self.document_encoding()
+            || &plan.mapped().document_encoding() != self.document_encoding()
             || plan.max_kv_bytes() != self.document_budget().max_kv_bytes
             || plan.max_result_bytes() != self.max_result_bytes() || plan.execution_identities().len() != expected.chunk_count()
             || !fits(expected.planned_work(), self.config.max_model_work)
@@ -358,6 +385,7 @@ impl Int4ExtractionDocumentBatchPlanner {
         prepared: &PreparedInt4ExtractionDocument, control: &mut C) -> Result<(), BatchItemFailure> {
         self.owns(prepared)?;
         if plan.preflight_metadata() != prepared.expected || plan.max_kv_bytes() != self.document_budget().max_kv_bytes
+            || &prepared.expected.document_encoding() != self.document_encoding()
             || plan.max_result_bytes() != self.max_result_bytes()
             || plan.execution_identities().len() != prepared.identities.len() {
             return Err(BatchItemFailure::fatal(BatchCode::Admission));
@@ -383,9 +411,11 @@ impl PreparedInt4ExtractionDocument {
     pub fn planned_work(&self) -> Int4Work { self.expected.planned_work() }
     pub fn reserved_mask_visits(&self) -> u64 { self.expected.reserved_mask_visits() }
     pub fn execution_identities(&self) -> &[ExecutionIdentity] { &self.identities }
+    pub fn document_encoding(&self) -> UntrustedEncoding { self.expected.document_encoding() }
 }
 pub struct Int4ExtractionDocumentAdmission<'a> {
     pub identities: &'a [ExecutionIdentity],
+    pub document_encoding: UntrustedEncoding,
     pub model_work: Int4Work,
     pub mask_node_visits: u64,
     pub mask_limits: MaskWorkLimits,
@@ -482,6 +512,7 @@ impl<A: Int4ExtractionDocumentBatchAdmission> BatchProcessor
             self.backend.preflight(self.planner, &plan, self.vocabulary, control)?;
             let (admitted, guard) = self.admission.admit(Int4ExtractionDocumentAdmission {
                 identities: &prepared.identities, model_work: prepared.planned_work(),
+                document_encoding: prepared.document_encoding(),
                 mask_node_visits: prepared.reserved_mask_visits(), mask_limits: self.planner.config.limits.mapping.mask_limits,
                 kv_reservation_bytes: kv, max_result_bytes: self.planner.max_result_bytes(),
                 max_output_tokens: self.planner.output_tokens(prepared.chunk_count()).map_err(BatchItemFailure::fatal)?,

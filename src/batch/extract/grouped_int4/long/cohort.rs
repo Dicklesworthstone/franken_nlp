@@ -137,7 +137,8 @@ impl PreparedInt4ExtractionMap<'_> {
             return Err(Int4ExtractionMapError::InvalidLimits);
         }
         if self.plans.iter().any(|plan| plan.plan.group_width() != self.group_width()
-            || plan.plan.selected_rows() != self.expected.selected_rows) {
+            || plan.plan.selected_rows() != self.expected.selected_rows
+            || plan.source().document_encoding() != &self.document_encoding()) {
             return Err(Int4ExtractionMapError::Admission);
         }
         Ok(())
@@ -158,7 +159,9 @@ impl PreparedInt4ExtractionMap<'_> {
         for ((plan, identity), chunk) in self.plans.iter().zip(admitted).zip(self.chunks.chunks()) {
             step(control)?;
             plan.verify_identity(identity)?;
-            if plan.source().text() != chunk.text() { return Err(Int4ExtractionMapError::Admission); }
+            if plan.source().text() != chunk.text() || plan.source().total_token_count() != chunk.tokens() {
+                return Err(Int4ExtractionMapError::Admission);
+            }
             let context = usize::try_from(plan.planned_work().forward_positions).map_err(|_| Int4ExtractionMapError::Admission)?;
             extraction::preflight(&Int4ExtractCohortRequest { prepared: &plan.plan, admitted_identity: identity,
                 budget: row_budget(plan, context, masks)? }, vocabulary)?;

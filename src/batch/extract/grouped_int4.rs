@@ -91,7 +91,9 @@ impl Int4ExtractionBatchPlanner {
     /// Fix one bounded schema/document encoding for every record in this
     /// resident stream. Each preparation uses one ledger across both segments;
     /// callers must admit its transient workspace before preparing any input.
-    /// Complete-document maps and durable recipes retain their byte-only path.
+    /// Exact-schema complete-document maps share one ledger through sizing,
+    /// chunk probes and all final plans; their hosts admit this same workspace.
+    /// Partial-root-object composition remains a separate byte-only contract.
     pub fn with_document_encoding(mut self, policy: UntrustedEncoding) -> Result<Self, BatchFault> {
         memory::encoding_workspace_bytes(&policy)?;
         self.require_byte_encoding()?;
@@ -173,6 +175,14 @@ impl Int4ExtractionBatchPlanner {
     pub fn prepare_with_document_encoding<C: DecodeStepControl>(&self,
         document: BatchDocument<ExtractionBatchArgs>, policy: &UntrustedEncoding, control: &mut C,
     ) -> Result<PreparedInt4BatchExtraction, BatchItemFailure> {
+        self.prepare_with_encoding_work(document, policy, &mut SafeBpeWork::default(), control)
+    }
+    /// Only composed planning supplies an existing work ledger. A public
+    /// one-request preparation still creates one complete-record allowance.
+    fn prepare_with_encoding_work<C: DecodeStepControl>(&self,
+        document: BatchDocument<ExtractionBatchArgs>, policy: &UntrustedEncoding,
+        work: &mut SafeBpeWork, control: &mut C,
+    ) -> Result<PreparedInt4BatchExtraction, BatchItemFailure> {
         checkpoint(control)?;
         if self.document_encoding != UntrustedEncoding::ByteFallback && policy != self.document_encoding() {
             return Err(BatchItemFailure::reject(BatchCode::Admission));
@@ -180,7 +190,7 @@ impl Int4ExtractionBatchPlanner {
         if self.shared_defaults_only && document.task_args.is_some() {
             return Err(BatchItemFailure::reject(BatchCode::InvalidEnvelope));
         }
-        let input = self.compiler.prepare_input_with_encoding(document, policy,
+        let input = self.compiler.prepare_input_with_encoding_work(document, policy, work,
             &mut || control.prefill_checkpoint(0)).map_err(planning_fault)?;
         let result = self.prepare_from_input(input);
         checkpoint(control)?;

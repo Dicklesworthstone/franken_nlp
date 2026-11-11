@@ -36,7 +36,9 @@ mod source_semantic;
 pub use source_semantic::{Int4SourceSemanticHostLimits, Int4SourceSemanticHostRequirements};
 mod extraction_map;
 pub use extraction_map::{Int4ExtractionMapConfig, Int4ObjectExtractionMapConfig,
-    int4_extraction_document_corpus_requirements, int4_extraction_document_object_corpus_requirements};
+    int4_extraction_document_corpus_requirements, int4_extraction_document_object_corpus_requirements,
+    int4_extraction_document_corpus_requirements_with_encoding,
+    int4_extraction_document_object_corpus_requirements_with_encoding};
 mod source;
 mod source_map;
 pub use source_map::{Int4SourceMapConfig, Int4SourceDocumentCorpusRequirement,

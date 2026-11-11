@@ -163,6 +163,39 @@ fn source_and_schema_capacities_are_charged_even_when_mostly_empty() {
     assert!(input_bytes(1024, &c).is_err());
 }
 #[test]
+fn compact_preparation_owns_one_workspace_beside_retained_chunk_plans() {
+    let mut c = config();
+    let limits = crate::tokenizer::untrusted::SafeBpeLimits {
+        max_input_bytes: 4096, max_output_tokens: 2048, max_pair_checks: 65_536, max_pair_bytes: 131_072,
+    };
+    let encoding = UntrustedEncoding::SafeBpeV1(limits);
+    let workspace = limits.requirements().unwrap().workspace_bytes;
+    let plain = input_bytes(1024, &c).unwrap();
+    assert_eq!(c.input_bytes(1024, &UntrustedEncoding::ByteFallback).unwrap(), plain);
+    for chunks in [1, 3, 16] {
+        c.limits.mapping.chunks.max_chunks = chunks;
+        assert_eq!(c.input_bytes(1024, &encoding).unwrap(), plain + workspace);
+    }
+    c.preparation_reserve_bytes = u64::MAX - plain;
+    assert!(c.input_bytes(1024, &encoding).is_err());
+}
+#[test]
+fn compact_input_quote_validates_every_policy_axis_before_planning() {
+    let limits = crate::tokenizer::untrusted::SafeBpeLimits {
+        max_input_bytes: 4096, max_output_tokens: 2048, max_pair_checks: 65_536, max_pair_bytes: 131_072,
+    };
+    for axis in 0..4 {
+        let mut changed = limits;
+        match axis {
+            0 => changed.max_input_bytes = 0,
+            1 => changed.max_output_tokens = 0,
+            2 => changed.max_pair_checks = 0,
+            _ => changed.max_pair_bytes = 0,
+        }
+        assert!(config().input_bytes(1024, &UntrustedEncoding::SafeBpeV1(changed)).is_err(), "axis {axis}");
+    }
+}
+#[test]
 fn reduction_charges_native_results_and_temporary_coordinate_scan_storage() {
     let c = config(); let count = 3;
     let fields = 32 * std::mem::size_of::<SourceFieldEvidence>() as u64;

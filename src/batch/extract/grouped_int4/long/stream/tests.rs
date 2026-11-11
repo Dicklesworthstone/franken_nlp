@@ -62,6 +62,10 @@ fn build(config: Int4ExtractionDocumentBatchConfig) -> Result<Int4ExtractionDocu
     Int4ExtractionDocumentBatchPlanner::configured(compiler, config)
 }
 fn factory(grounded: bool) -> Int4ExtractionDocumentBatchPlanner { build(config(grounded)).unwrap() }
+fn compact_limits() -> crate::tokenizer::untrusted::SafeBpeLimits {
+    crate::tokenizer::untrusted::SafeBpeLimits { max_input_bytes: 1 << 20, max_output_tokens: 1 << 20,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 26 }
+}
 // Exercise closed preparation commitments without constructing weights or a
 // public alternate inference path. Native capacity checks are separate gates.
 fn snapshot(factory: &Int4ExtractionDocumentBatchPlanner, source: &str) -> PreparedInt4ExtractionDocument {
@@ -146,6 +150,87 @@ fn changed_tail_or_factory_cannot_reuse_frozen_preparation_and_schedule_rotates_
 }
 
 #[test]
+fn compact_documents_freeze_policy_and_rebuild_every_original_source_chunk() {
+    let byte = factory(true);
+    let original = snapshot(&byte, SOURCE);
+    assert_eq!(original.document_encoding(), UntrustedEncoding::ByteFallback);
+    let policy = UntrustedEncoding::SafeBpeV1(compact_limits());
+    let compact = byte.with_document_encoding(policy.clone()).unwrap();
+    assert_eq!(compact.document_encoding(), &policy);
+    assert_eq!(compact.encoding_workspace_bytes().unwrap(), compact_limits().requirements().unwrap().workspace_bytes);
+    assert!(compact.owns(&original).is_err());
+    let prepared = snapshot(&compact, SOURCE);
+    assert_eq!(prepared.document_encoding(), policy);
+    assert!(prepared.expected.mapped().encoding_work().is_some());
+    let plan = compact.plan(SOURCE, &mut Continue, true).unwrap();
+    compact.compare(&plan, &prepared, &mut Continue).unwrap();
+    assert_eq!(plan.mapped().chunks.chunks().iter().map(|chunk| chunk.text()).collect::<String>(), SOURCE);
+    assert_eq!(prepared.chunk_count(), original.chunk_count());
+    assert!(prepared.planned_work().forward_positions < original.planned_work().forward_positions);
+    assert_eq!(prepared.planned_work().projected_logits, original.planned_work().projected_logits);
+    assert_eq!(prepared.reserved_mask_visits(), original.reserved_mask_visits());
+    for row in &plan.mapped().plans {
+        assert_eq!(row.source().document_encoding(), compact.document_encoding());
+        assert_eq!(row.execution_identity().template_digest, compact.base_execution_identity().template_digest);
+        assert_eq!(row.execution_identity().schema_digest, Sha256Digest::of_bytes(SCHEMA.as_bytes()));
+    }
+    assert!(compact.compare(&plan, &original, &mut Continue).is_err());
+}
+
+#[test]
+fn every_compact_limit_is_bound_even_when_tokens_geometry_and_native_work_are_identical() {
+    let base = factory(false).with_document_encoding(UntrustedEncoding::SafeBpeV1(compact_limits())).unwrap();
+    let before = snapshot(&base, SOURCE);
+    for axis in 0..4 {
+        let mut changed = compact_limits();
+        match axis { 0 => changed.max_input_bytes -= 1, 1 => changed.max_output_tokens -= 1,
+            2 => changed.max_pair_checks -= 1, _ => changed.max_pair_bytes -= 1 }
+        let other = factory(false).with_document_encoding(UntrustedEncoding::SafeBpeV1(changed)).unwrap();
+        let after = snapshot(&other, SOURCE);
+        assert_eq!(before.chunk_count(), after.chunk_count());
+        assert_eq!(before.planned_work(), after.planned_work());
+        assert_ne!(before.expected, after.expected, "axis {axis}");
+        for (before, after) in before.identities.iter().zip(&after.identities) {
+            assert_eq!(before.prompt_digest, after.prompt_digest);
+            assert_ne!(before.decision_policy_digest, after.decision_policy_digest);
+        }
+        let other_plan = other.plan(SOURCE, &mut Continue, true).unwrap();
+        other.compare(&other_plan, &after, &mut Continue).unwrap();
+        assert!(base.compare(&other_plan, &before, &mut Continue).is_err());
+    }
+}
+
+#[test]
+fn compact_root_arrays_preserve_selected_row_policy_across_native_schedules() {
+    let rows = Int4JsonSparseLimits { max_rows_per_step: 65 };
+    for cohorts in [false, true] {
+        for encoding_first in [false, true] {
+            let mut cfg = config(false);
+            cfg.request.schema = r#"{"type":"array","items":{"type":"integer"},"maxItems":8}"#.to_owned();
+            cfg.limits.root_array_union = Some(super::super::tests::union_limits());
+            let plain = build(cfg).unwrap();
+            let peak = plain.cohort_requirements().unwrap();
+            let policy = UntrustedEncoding::SafeBpeV1(compact_limits());
+            let mut selected = if encoding_first {
+                plain.with_document_encoding(policy.clone()).unwrap().with_selected_rows(rows).unwrap()
+            } else {
+                plain.with_selected_rows(rows).unwrap().with_document_encoding(policy.clone()).unwrap()
+            };
+            if cohorts { selected = selected.with_chunk_cohorts().unwrap(); }
+            assert_eq!(selected.cohort_requirements().unwrap(), peak);
+            let prepared = snapshot(&selected, SOURCE);
+            assert_eq!(prepared.document_encoding(), policy);
+            assert_eq!(prepared.expected.selected_rows(), Some(rows));
+            assert!(prepared.expected.mapped().root_array_binding.is_some());
+            assert_eq!(prepared.planned_work().projected_logits,
+                prepared.chunk_count() as u64 * u64::from(budget().max_output_tokens) * rows.max_rows_per_step as u64);
+            let plan = selected.plan(SOURCE, &mut Continue, true).unwrap();
+            selected.compare(&plan, &prepared, &mut Continue).unwrap();
+        }
+    }
+}
+
+#[test]
 fn selecting_complete_legal_rows_rotates_the_factory_seal_and_preserves_peak_memory() {
     for cap in [65, NANBEIGE_VOCAB_SIZE] {
         let dense = factory(true).with_chunk_cohorts().unwrap();
@@ -211,7 +296,10 @@ fn document_args_are_strict_map_only_and_cannot_replace_any_policy() {
 
 #[test]
 fn each_of_nine_whole_run_axes_exhausts_atomically_across_flush_epochs() {
-    for factory in [factory(true), factory(true).with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: 65 }).unwrap()] {
+    for factory in [factory(true), factory(true).with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: 65 }).unwrap(),
+        factory(true).with_document_encoding(UntrustedEncoding::SafeBpeV1(compact_limits())).unwrap(),
+        factory(true).with_selected_rows(Int4JsonSparseLimits { max_rows_per_step: 65 }).unwrap()
+            .with_document_encoding(UntrustedEncoding::SafeBpeV1(compact_limits())).unwrap()] {
     let prepared = snapshot(&factory, SOURCE); let expected = prepared.expected;
     let twice_work = expected.planned_work().checked_add(expected.planned_work()).unwrap();
     let twice_verification = add_verification(factory.config.limits.verification, factory.config.limits.verification).unwrap();
@@ -333,6 +421,25 @@ fn object_config() -> Int4ExtractionDocumentBatchConfig {
     cfg.request.schema = OBJECT.to_owned();
     cfg.limits.mapping.reduction.map_batch_chunks = 1;
     cfg
+}
+
+#[test]
+fn compact_partial_object_reconciliation_refuses_both_builder_orders_before_sources() {
+    let compact = UntrustedEncoding::SafeBpeV1(compact_limits());
+    assert!(build(object_config()).unwrap().with_document_encoding(compact.clone()).unwrap()
+        .with_root_object_reconciliation(object_limits()).is_err());
+    let object = build(object_config()).unwrap().with_root_object_reconciliation(object_limits()).unwrap();
+    assert!(object.with_document_encoding(compact).is_err());
+    let object = build(object_config()).unwrap().with_root_object_reconciliation(object_limits()).unwrap()
+        .with_document_encoding(UntrustedEncoding::ByteFallback).unwrap();
+    assert_eq!(object.document_encoding(), &UntrustedEncoding::ByteFallback);
+    assert_eq!(object.encoding_workspace_bytes().unwrap(), 0);
+    for axis in 0..4 {
+        let mut invalid = compact_limits();
+        match axis { 0 => invalid.max_input_bytes = 0, 1 => invalid.max_output_tokens = 0,
+            2 => invalid.max_pair_checks = 0, _ => invalid.max_pair_bytes = 0 }
+        assert!(factory(false).with_document_encoding(UntrustedEncoding::SafeBpeV1(invalid)).is_err());
+    }
 }
 
 #[test]

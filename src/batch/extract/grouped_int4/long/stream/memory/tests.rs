@@ -87,6 +87,57 @@ fn cohort_peak_changes_physical_rows_without_widening_a_chunk_or_final_result() 
 }
 
 #[test]
+fn compact_workspace_is_one_shared_allocation_for_longer_maps_root_arrays_and_cohorts() {
+    let (memory, budget, document, transport) = fixture();
+    let limits = crate::tokenizer::untrusted::SafeBpeLimits {
+        max_input_bytes: 8192, max_output_tokens: 4096, max_pair_checks: 65_536, max_pair_bytes: 131_072,
+    };
+    let policy = UntrustedEncoding::SafeBpeV1(limits);
+    let workspace = limits.requirements().unwrap().workspace_bytes;
+    for cohorts in [None, Some(3)] {
+        for chunks in [8, 16] {
+            for array in [false, true] {
+                let memory = Int4ExtractionDocumentMemoryLimits { cohort_chunks: cohorts, ..memory };
+                let mut document = document; document.mapping.chunks.max_chunks = chunks;
+                if array {
+                    document.root_array_union = Some(crate::tasks::extract::array_union::RootArrayUnionLimits {
+                        max_records: 8, max_origins: 32, max_input_bytes: 4096, max_json_bytes: 4096,
+                        max_nodes: 512, max_result_bytes: 65_536,
+                    });
+                }
+                let ordinary = memory.requirements(32, budget, document, transport).unwrap();
+                assert_eq!(memory.requirements_with_encoding(32, budget, document, transport,
+                    &UntrustedEncoding::ByteFallback).unwrap(), ordinary);
+                let mut expected = ordinary; expected.input_bytes += workspace;
+                assert_eq!(memory.requirements_with_encoding(32, budget, document, transport, &policy).unwrap(), expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn compact_limits_and_total_live_memory_are_checked_before_input() {
+    let (mut memory, budget, document, transport) = fixture();
+    let limits = crate::tokenizer::untrusted::SafeBpeLimits {
+        max_input_bytes: 8192, max_output_tokens: 4096, max_pair_checks: 65_536, max_pair_bytes: 131_072,
+    };
+    for axis in 0..4 {
+        let mut invalid = limits;
+        match axis { 0 => invalid.max_input_bytes = 0, 1 => invalid.max_output_tokens = 0,
+            2 => invalid.max_pair_checks = 0, _ => invalid.max_pair_bytes = 0 }
+        assert!(memory.requirements_with_encoding(32, budget, document, transport,
+            &UntrustedEncoding::SafeBpeV1(invalid)).is_err(), "axis {axis}");
+    }
+    let ordinary = memory.requirements(32, budget, document, transport).unwrap();
+    let total = ordinary.native.kv_bytes + ordinary.workspace_bytes + ordinary.input_bytes
+        + ordinary.document_workspace_bytes + ordinary.output_reservation_bytes;
+    memory.preparation_reserve_bytes += u64::MAX - total - 1024;
+    assert!(memory.requirements(32, budget, document, transport).is_ok());
+    assert!(memory.requirements_with_encoding(32, budget, document, transport,
+        &UntrustedEncoding::SafeBpeV1(limits)).is_err());
+}
+
+#[test]
 fn all_document_chunks_and_both_coordinate_copies_outlive_the_native_window() {
     let (mut memory, budget, mut document, transport) = fixture();
     memory.cohort_chunks = Some(3);
@@ -180,6 +231,8 @@ fn root_object_quote_owns_original_partial_schemas_and_reconciliation_through_de
         let plain = memory.requirements(32, budget, document, transport).unwrap();
         assert_eq!(memory.requirements_with_root_object(32, budget, document, transport, compiler, None).unwrap(), plain);
         let complete = memory.requirements_with_root_object(32, budget, document, transport, compiler, Some(object)).unwrap();
+        assert_eq!(memory.requirements_with_root_object_and_encoding(32, budget, document, transport,
+            compiler, Some(object), &UntrustedEncoding::ByteFallback).unwrap(), complete);
         assert_eq!(complete.document_workspace_bytes - plain.document_workspace_bytes,
             object.workspace_bytes().unwrap() + RootObjectSchema::workspace_bytes(compiler).unwrap());
         assert_eq!(complete.native, plain.native);

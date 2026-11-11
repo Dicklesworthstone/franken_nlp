@@ -155,7 +155,7 @@ fn shared_arguments_and_every_original_cancellation_cause_survive_stream_prepara
 }
 
 #[test]
-fn compact_item_policy_does_not_silently_enable_byte_capacity_document_maps() {
+fn compact_document_maps_require_one_allowance_for_sizing_probes_and_all_final_chunks() {
     use super::super::long::{Int4ExtractionMapLimits, Int4ExtractionMappingLimits};
     let map_limits = Int4ExtractionMapLimits { mapping: Int4ExtractionMappingLimits {
         chunks: ChunkLimits { max_input_bytes: 8192, max_chunk_bytes: 64, max_chunk_tokens: 4096,
@@ -169,5 +169,10 @@ fn compact_item_policy_does_not_silently_enable_byte_capacity_document_maps() {
     let byte = planner(32, None);
     assert!(byte.plan_document_with_control(SOURCE, &args, map_limits, &mut Control::continuing()).is_ok());
     let compact = planner(32, None).with_document_encoding(policy(8192)).unwrap();
-    assert!(compact.plan_document_with_control(SOURCE, &args, map_limits, &mut Control::continuing()).is_err());
+    let prepared = compact.plan_document_with_control(SOURCE, &args, map_limits, &mut Control::continuing()).unwrap();
+    assert_eq!(prepared.document_encoding(), policy(8192));
+    assert!(prepared.preflight_metadata().encoding_work().unwrap().input_bytes() > SOURCE.len() + SCHEMA.len());
+    let per_item = planner(32, None).with_document_encoding(policy(SOURCE.len() + SCHEMA.len())).unwrap();
+    assert!(per_item.prepare_with_control(item(), &mut Control::continuing()).is_ok());
+    assert!(per_item.plan_document_with_control(SOURCE, &args, map_limits, &mut Control::continuing()).is_err());
 }
