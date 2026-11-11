@@ -109,8 +109,8 @@ speedup or parity result is claimed here.
 
 ### Compact input for complete source maps
 
-`ner-map`, `keyphrases-map` and plain cited `summarize-map` accept explicit
-`--input-encoding safe-bpe-v1`. This uses the pinned byte-preserving encoder for
+`ner-map`, `keyphrases-map`, plain cited `summarize-map` and independent
+`answer-map` accept explicit `--input-encoding safe-bpe-v1`. This uses the pinned byte-preserving encoder for
 every real chunk, including exact keyphrase/summary reducers and
 `--cohort-chunks`. Actual encoded token counts determine chunk capacity,
 compiled prompts and native work. Source evidence continues to use the exact
@@ -153,8 +153,53 @@ complete_limits)` once for the complete operation, retain that same planner
 through preflight/replanning, and admit
 `map_document_encoding_workspace_bytes()`. The one-request
 `with_document_encoding` constructor alone does not authorize repeated map
-probes. QA, neural summary synthesis/hierarchies, source corpora and durable
-source jobs continue to require their existing byte-only policy.
+probes. Neural summary/answer synthesis and hierarchies, source corpora and
+durable source jobs continue to require their existing byte-only policy.
+
+#### Compact complete-document QA
+
+`answer-map` retains every independent answer, abstention and whitespace
+interval across the complete source. Its compact policy encodes the exact
+question, canonical passage manifest and original chunk source under one
+per-call allowance. That allowance is bounded by `--max-input-bytes` and the
+encoder's one-MiB ceiling; it is separate from the complete document's byte
+limit. Capacity reserves the question and passage metadata before partitioning
+source bytes, and uses actual encoded token counts for context and native work.
+A question may therefore contain more UTF-8 bytes than the token ceiling while
+still fitting its actual compact prompt. Oversized questions or source
+segments are refused instead of truncated.
+
+```sh
+fnlp candidate source-int4 answer-map report.txt --question question.txt \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$MODEL_SHA256" \
+  --memory-mib 16384 --input-encoding safe-bpe-v1 \
+  --max-chunk-bytes 8192 --cohort-chunks 2
+```
+
+One cumulative ledger covers repeated question/manifest encodings, every
+discarded chunk-size probe, complete CLI preflight and hosted recompilation.
+Serial and chunk-cohort QA share that same planner; neither a new chunk nor a
+host boundary resets its allowance. The selected per-call policy and all total
+ceilings enter execution identity, and compact output reports consumed work.
+The default policy preserves the existing response shape.
+
+Question-answer completion checks now privately bind the exact source,
+question, answer options, model/task authority, planning and map limits, and
+source partition. A second seal covers the completed public payload. Equal
+lengths, equal work estimates or identical source geometry cannot substitute
+for the admitted request, and modifying a completed answer or its counters
+invalidates its seal. These commitments never enter serialized responses or
+Debug output. Bounded streaming hashing avoids allocating a second
+document-sized serialization and checks cancellation during long writes.
+
+The independent source-citation verifier continues to use original UTF-8 byte
+and Unicode-scalar coordinates. Encoding literal role/tool marker text never
+grants it template-control authority. Structural citation validity does not
+certify semantic entailment or answer quality. Compact QA currently supports
+independent passage answers and their native chunk cohorts; combining it with
+neural synthesis, hierarchy, corpus or retained-job routes is refused before
+private IO. Numerical worker teams remain a separate unsupported QA schedule.
 
 Added regression definitions cover actual compact prompt work, Unicode and
 literal-control preservation, per-call and cumulative exhaustion, cancellation,

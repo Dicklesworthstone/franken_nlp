@@ -162,3 +162,68 @@ fn unavailable_qa_runtime_never_opens_question_source_or_options() {
     assert_eq!(map.execute(args, &mut NoRead, &mut output), Err(CandidateError::Unavailable));
     assert!(output.is_empty());
 }
+
+
+#[test]
+fn compact_document_qa_admits_complete_question_manifest_and_source_encoding() {
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+    for chunks in [None, Some("1"), Some("2")] {
+        let mut flags = vec!["--input-encoding", "safe-bpe-v1", "--max-chunk-bytes", "8192"];
+        if let Some(chunks) = chunks { flags.extend_from_slice(&["--cohort-chunks", chunks]); }
+        let (map, mut args) = arguments(&flags);
+        args.memory_mib = 262_144;
+        let source = map.validate(&args).unwrap();
+        let encoding = source.encoding.unwrap();
+        assert_eq!(encoding.call.max_input_bytes, args.max_input_bytes.min(SafeBpeLimits::MAX_INPUT_BYTES));
+        assert_eq!(encoding.call.max_output_tokens, encoding.call.max_input_bytes);
+        assert!(encoding.call.max_input_bytes > 8192,
+            "the question and passage manifest share the per-call source allowance");
+        assert_eq!(encoding.complete.max_input_bytes, 8 * args.max_input_bytes as u64);
+        assert_eq!(encoding.complete.max_output_tokens, 8 * args.max_input_bytes as u64);
+        assert!(encoding.workspace_bytes().unwrap() < source.common.preparation_bytes);
+        assert_eq!(source.cohort_chunks, chunks.map(|n| n.parse().unwrap()));
+        assert!(map.validate_corpus(&args).is_err());
+        assert!(map.validate_document_job(&args, false).is_err());
+        args.source_dir = None; args.source_manifest = None;
+        args.snapshot = Some(PathBuf::from("explicit.snapshot"));
+        args.expected_model_sha256 = Some("ab".repeat(32));
+        let snapshot = map.validate(&args).unwrap();
+        assert_eq!(snapshot.encoding, source.encoding);
+        assert_eq!(snapshot.mapping.max_model_work, source.mapping.max_model_work);
+        assert_eq!(snapshot.workspace_bytes, source.workspace_bytes);
+    }
+}
+
+#[test]
+fn whole_document_byte_cap_does_not_expand_one_qa_encoder_past_its_hard_limit() {
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+    let (map, mut args) = arguments(&["--input-encoding", "safe-bpe-v1"]);
+    args.max_input_bytes = SafeBpeLimits::MAX_INPUT_BYTES * 2;
+    args.memory_mib = 262_144;
+    args.preparation_mib = 4096;
+    let limits = map.validate(&args).unwrap();
+    let encoding = limits.encoding.unwrap();
+    assert_eq!(limits.mapping.chunks.max_input_bytes, args.max_input_bytes);
+    assert_eq!(encoding.call.max_input_bytes, SafeBpeLimits::MAX_INPUT_BYTES);
+    assert_eq!(encoding.complete.max_input_bytes, 8 * args.max_input_bytes as u64);
+    args.preparation_mib = 1;
+    assert!(map.validate(&args).is_err());
+}
+
+#[test]
+fn compact_qa_unsupported_synthesis_and_invalid_work_refuse_before_private_io() {
+    for flags in [
+        vec!["--input-encoding", "safe-bpe-v1", "--synthesize-answer"],
+        vec!["--input-encoding", "safe-bpe-v1", "--synthesize-answer", "--hierarchical-answer"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-input-bytes", "0"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-output-tokens", "0"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-pair-checks", "0"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-pair-bytes", "0"],
+        vec!["--max-total-tokenizer-input-bytes", "1"],
+    ] {
+        let (map, args) = arguments(&flags);
+        let mut output = Vec::new();
+        assert_eq!(map.execute(args, &mut NoRead, &mut output), Err(CandidateError::Arguments));
+        assert!(output.is_empty());
+    }
+}

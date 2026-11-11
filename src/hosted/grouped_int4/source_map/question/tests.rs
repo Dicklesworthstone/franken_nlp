@@ -2,6 +2,7 @@
 use super::*;
 use crate::{execution_identity::NumericsProfile, native_engine::decode::DecodeCancellationKind,
     tasks::{answer::AnswerOptions, source_planning::grouped_int4::Int4SourceError},
+    tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding},
     validation::grounded_fields::GroundingBudget};
 
 pub(super) fn fixture(width: usize) -> (SourceTaskPlanner, Int4SourceMapConfig<SourceQuestion>) {
@@ -48,6 +49,73 @@ fn invalid_question_and_cumulative_citation_allowances_refuse_before_capture() {
     }
     let (planner, c) = fixture(32);
     for bytes in [0, c.mapping.chunks.max_input_bytes + 1] { assert!(question_requirements(&c, bytes, 32, &planner).is_err()); }
+}
+
+fn compact_policy() -> (UntrustedEncoding, SafeBpeWorkLimits) {
+    (UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 4096, max_output_tokens: 4096,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24,
+    }), SafeBpeWorkLimits { max_input_bytes: 65_536, max_output_tokens: 65_536,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 })
+}
+
+#[test]
+fn only_explicit_compact_policy_admits_question_bytes_above_the_token_count_cap() {
+    for width in [16, 32, 128] {
+        let (planner, mut c) = fixture(width);
+        c.task.question = "Where did Alice live? ".repeat(80);
+        assert!(c.task.question.len() > c.budget.max_input_tokens as usize);
+        assert!(question_requirements(&c, 32, width, &planner).is_err());
+        let (policy, work) = compact_policy();
+        let planner = planner.with_map_document_encoding(policy, work).unwrap();
+        c.identity.template_digest = *planner.template_digest();
+        c.preparation_reserve_bytes = planner.map_document_encoding_workspace_bytes().unwrap();
+        let before = planner.map_document_encoding_work().unwrap();
+        let native = question_requirements(&c, 32, width, &planner).unwrap();
+        assert_eq!(native, Int4MemoryRequirement::for_context(c.native.context_tokens, width).unwrap());
+        // This is admission, not a promise that arbitrary admitted bytes fit
+        // the model. The controlled planner owns actual token/prompt checks.
+        assert_eq!(planner.map_document_encoding_work().unwrap(), before);
+        c.planning.max_input_bytes = c.task.question.len() - 1;
+        assert!(question_requirements(&c, 32, width, &planner).is_err());
+        c.planning.max_input_bytes = 8192;
+        c.task.question = "x".repeat(4097);
+        assert!(question_requirements(&c, 32, width, &planner).is_err());
+    }
+}
+
+#[test]
+fn compact_question_maps_require_the_whole_ledger_and_one_reusable_workspace() {
+    let (policy, work) = compact_policy();
+    let (planner, mut c) = fixture(32);
+    let planner = planner.with_document_encoding(policy.clone()).unwrap();
+    c.identity.template_digest = *planner.template_digest();
+    // A one-request encoder cannot authorize repeated question/manifest and
+    // passage encodings. The complete-document ledger is mandatory.
+    assert!(question_requirements(&c, 32, 32, &planner).is_err());
+
+    let (planner, mut c) = fixture(32);
+    let planner = planner.with_map_document_encoding(policy.clone(), work).unwrap();
+    let bytes = planner.map_document_encoding_workspace_bytes().unwrap();
+    c.identity.template_digest = *planner.template_digest();
+    c.preparation_reserve_bytes = bytes;
+    for chunks in [1, 8, 256] {
+        c.mapping.chunks.max_chunks = chunks;
+        question_requirements(&c, 32, 32, &planner).unwrap();
+        assert_eq!(planner.map_document_encoding_workspace_bytes().unwrap(), bytes);
+        assert_eq!(input_bytes(1024, &c).unwrap(),
+            1024 + c.task.question.capacity() as u64 + bytes);
+    }
+    c.preparation_reserve_bytes = bytes - 1;
+    assert!(question_requirements(&c, 32, 32, &planner).is_err());
+    c.preparation_reserve_bytes = bytes;
+    let (changed, _) = fixture(32);
+    let changed = changed.with_map_document_encoding(policy,
+        SafeBpeWorkLimits { max_pair_bytes: work.max_pair_bytes + 1, ..work }).unwrap();
+    assert_ne!(planner.template_digest(), changed.template_digest());
+    assert!(question_requirements(&c, 32, 32, &changed).is_err());
+    c.identity.template_digest = *changed.template_digest();
+    question_requirements(&c, 32, 32, &changed).unwrap();
 }
 #[test]
 fn original_question_capacity_and_all_evidence_owners_are_charged() {

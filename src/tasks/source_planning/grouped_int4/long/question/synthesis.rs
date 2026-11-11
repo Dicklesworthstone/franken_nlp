@@ -144,6 +144,9 @@ impl SourceTaskPlanner {
         planning: SourcePlanningLimits, mapping: Int4SourceMapLimits, group_width: usize, control: &mut C)
         -> Result<Int4QuestionSynthesisPreflight, Int4SourceMapError> {
         checkpoint(control)?;
+        // Compact discovery does not authorize the later data-dependent
+        // synthesis or hierarchy tokenization contract.
+        self.encoder.require_byte_encoding().map_err(Int4SourceError::from)?;
         let (discovery_limits, reserve) = reserve(request.limits, budget, planning, mapping, group_width)?;
         let discovery = self.preflight_int4_question_with_control(source, &request.question, budget, context,
             planning, discovery_limits, group_width, control)?;
@@ -155,6 +158,9 @@ impl SourceTaskPlanner {
         planning: SourcePlanningLimits, mapping: Int4SourceMapLimits, group_width: usize, control: &mut C)
         -> Result<PreparedInt4QuestionSynthesis<'s>, Int4SourceMapError> {
         checkpoint(control)?;
+        // Compact discovery does not authorize the later data-dependent
+        // synthesis or hierarchy tokenization contract.
+        self.encoder.require_byte_encoding().map_err(Int4SourceError::from)?;
         let (discovery_limits, reserve) = reserve(request.limits, budget, planning, mapping, group_width)?;
         let map = self.plan_int4_question_with_control(source, &request.question, budget, context,
             planning, discovery_limits, group_width, control)?;

@@ -16,14 +16,15 @@ impl SourceTaskPlanner {
         mapping.validate(budget, planning)?;
         let cap = capacity(self, question, budget, context, planning, mapping.chunks, group_width, control)?;
         let chunks = partition(self, source, cap.chunks, control)?;
-        let mut expected = metadata(&chunks, question.verification, group_width)?;
+        let mut expected = metadata(&chunks, question.verification, group_width, mapping)?;
         for chunk in chunks.chunks() {
             checkpoint(control)?;
             if !has_text(chunk.text()) { continue; }
             let passages = [AnswerPassage { id: copy(PASSAGE_ID)?, text: copy(chunk.text())? }];
-            let answer = AnswerContext::encode(&self.encoder, &question.question, &passages,
+            let answer = AnswerContext::encode_with_control(&self.encoder, &question.question, &passages,
                 AnswerInputLimits { max_passages: planning.max_passages, max_input_bytes: planning.max_input_bytes,
-                    max_input_tokens: budget.max_input_tokens as usize }).map_err(Int4SourceError::from)?;
+                    max_input_tokens: budget.max_input_tokens as usize },
+                &mut || control.prefill_checkpoint(0)).map_err(Int4SourceError::from)?;
             let prompt = cap.scaffold.checked_add(answer.document().total_token_count())
                 .ok_or(Int4SourceMapError::WorkLimit)?;
             check_prompt(&cap, chunk, prompt, budget)?;
@@ -32,6 +33,8 @@ impl SourceTaskPlanner {
             charge(&mut expected, work, mapping)?;
         }
         if expected.native_chunks == 0 { return Err(Int4SourceMapError::EmptySource); }
+        expected.request_binding = binding::request(source, question, budget, context, planning, mapping,
+            self, &chunks, group_width, control)?;
         checkpoint(control)?;
         Ok(expected)
     }
@@ -48,7 +51,7 @@ impl SourceTaskPlanner {
         mapping.validate(budget, planning)?;
         let cap = capacity(self, question, budget, context, planning, mapping.chunks, group_width, control)?;
         let chunks = partition(self, source, cap.chunks, control)?;
-        let mut expected = metadata(&chunks, question.verification, group_width)?;
+        let mut expected = metadata(&chunks, question.verification, group_width, mapping)?;
         let mut plans = Vec::new(); let mut indices = Vec::new();
         plans.try_reserve_exact(chunks.chunks().len()).map_err(|_| Int4SourceMapError::Allocation)?;
         indices.try_reserve_exact(chunks.chunks().len()).map_err(|_| Int4SourceMapError::Allocation)?;
@@ -67,6 +70,8 @@ impl SourceTaskPlanner {
             indices.push(Some(plans.len())); plans.push(plan);
         }
         if expected.native_chunks == 0 { return Err(Int4SourceMapError::EmptySource); }
+        expected.request_binding = binding::request(source, question, budget, context, planning, mapping,
+            self, &chunks, group_width, control)?;
         checkpoint(control)?;
         Ok(PreparedInt4Question { chunks, plans, plan_indices: indices, mapping,
             options: question.options, verification: question.verification, expected,
@@ -80,13 +85,21 @@ fn capacity<C: DecodeStepControl>(planner: &SourceTaskPlanner, question: &Source
     mut chunks: ChunkLimits, group_width: usize, control: &mut C) -> Result<Capacity, Int4SourceError> {
     checkpoint(control)?;
     constrained_int4::check_profile(context.execution_identity(), group_width)?;
-    planner.check_context_for_profile(BuiltInTask::Answer, context, budget, planning,
+    // One request's encoding policy cannot authorize an unbounded sequence of
+    // sizing probes, repeated questions/manifests and actual passage plans.
+    planner.map_document_encoding_workspace_bytes()?;
+    planner.check_one_off_context_for_profile(BuiltInTask::Answer, context, budget, planning,
         NumericsProfile::StrictQuantized { version: 2 })?;
     Int4MemoryRequirement::for_context(planning.max_context_tokens, group_width)
         .map_err(|_| SourcePlanningError::ContextBudget)?;
     let schema = question.options.schema_source()?;
-    if schema.len() > planning.compiler.max_schema_bytes || question.question.len() > planning.max_input_bytes
-        || question.question.len() > budget.max_input_tokens as usize {
+    let byte_limit = match planner.document_encoding() {
+        crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback =>
+            planning.max_input_bytes.min(budget.max_input_tokens as usize),
+        crate::tokenizer::untrusted::UntrustedEncoding::SafeBpeV1(policy) =>
+            planning.max_input_bytes.min(policy.max_input_bytes),
+    };
+    if schema.len() > planning.compiler.max_schema_bytes || question.question.len() > byte_limit {
         return Err(SourcePlanningError::InputBudget.into());
     }
     let mut scaffold = 0_usize;
@@ -97,8 +110,8 @@ fn capacity<C: DecodeStepControl>(planner: &SourceTaskPlanner, question: &Source
             .map_err(|_| SourcePlanningError::Contract("INT4 question scaffold encoding"))?;
         scaffold = scaffold.checked_add(ids.len()).ok_or(SourcePlanningError::ContextBudget)?;
     }
-    let question_tokens = planner.encoder.encode(&question.question, planning.max_input_bytes,
-        budget.max_input_tokens as usize)?.total_token_count();
+    let question_tokens = planner.encoder.encode_with_control(&question.question, planning.max_input_bytes,
+        budget.max_input_tokens as usize, &mut || control.prefill_checkpoint(0))?.total_token_count();
     // Price the largest decimal coordinate widths in the versioned manifest,
     // not an artificial passage. The byte-preserving encoder needs at most one
     // id per manifest byte; each ACTUAL complete prompt is checked below too.
@@ -109,8 +122,7 @@ fn capacity<C: DecodeStepControl>(planner: &SourceTaskPlanner, question: &Source
         .ok_or(SourcePlanningError::ContextBudget)?;
     let prompt_room = (budget.max_input_tokens as usize).checked_sub(non_source)
         .ok_or(SourcePlanningError::ContextBudget)?;
-    let byte_room = planning.max_input_bytes.min(budget.max_input_tokens as usize)
-        .checked_sub(question.question.len()).and_then(|n| n.checked_sub(manifest))
+    let byte_room = byte_limit.checked_sub(question.question.len()).and_then(|n| n.checked_sub(manifest))
         .ok_or(SourcePlanningError::InputBudget)?;
     if scaffold == 0 || byte_room < 4 || prompt_room == 0 { return Err(SourcePlanningError::ContextBudget.into()); }
     chunks.context_tokens = chunks.context_tokens.min(planning.max_context_tokens);
@@ -143,23 +155,33 @@ fn partition<'s, C: DecodeStepControl>(planner: &SourceTaskPlanner, source: &'s 
     if source.is_empty() { return Err(Int4SourceMapError::EmptySource); }
     checkpoint(control)?;
     let mut cancelled = None;
-    let plan = ChunkPlan::build_with_checkpoints(source, chunks, |text| {
-        planner.encoder.encode(text, chunks.max_chunk_bytes, chunks.max_chunk_bytes)
-            .map(|document| document.total_token_count()).map_err(|_| MapReduceError::Tokenizer)
-    }, || match control.prefill_checkpoint(0) {
-        Some(cause) => { cancelled = Some(cause); Err(MapReduceError::Cancelled) }, None => Ok(()),
-    });
+    let mut encoding_error = None;
+    let plan = {
+        let control = RefCell::new(&mut *control);
+        ChunkPlan::build_with_checkpoints(source, chunks, |text| {
+            planner.encoder.encode_with_control(text, chunks.max_chunk_bytes, chunks.max_chunk_bytes,
+                &mut || control.borrow_mut().prefill_checkpoint(0))
+                .map(|document| document.total_token_count()).map_err(|error| {
+                    encoding_error = Some(error); MapReduceError::Tokenizer
+                })
+        }, || match control.borrow_mut().prefill_checkpoint(0) {
+            Some(cause) => { cancelled = Some(cause); Err(MapReduceError::Cancelled) }, None => Ok(()),
+        })
+    };
     if let Some(cause) = cancelled { return Err(Int4SourceError::Cancelled(cause).into()); }
+    if let Some(error) = encoding_error { return Err(Int4SourceError::from(error).into()); }
     plan.map_err(Int4SourceMapError::Chunk)
 }
-fn metadata(chunks: &ChunkPlan<'_>, verification: GroundingBudget, group_width: usize)
+fn metadata(chunks: &ChunkPlan<'_>, verification: GroundingBudget, group_width: usize,
+    mapping: Int4SourceMapLimits)
     -> Result<Int4QuestionPreflight, Int4SourceMapError> {
     let first = chunks.chunks().first().ok_or(Int4SourceMapError::EmptySource)?.span();
     let last = chunks.chunks().last().ok_or(Int4SourceMapError::EmptySource)?.span();
     Ok(Int4QuestionPreflight { source_span: VerifiedSourceSpan { byte_start: first.byte_start,
         byte_end: last.byte_end, scalar_start: first.scalar_start, scalar_end: last.scalar_end },
         chunks: chunks.chunks().len(), native_chunks: 0, group_width,
-        work: Int4Work::default(), masks: 0, verification })
+        work: Int4Work::default(), masks: 0, verification,
+        request_binding: [0; 32], max_result_bytes: mapping.reduction.max_result_bytes as u64 })
 }
 fn charge(expected: &mut Int4QuestionPreflight, work: Int4Work, limits: Int4SourceMapLimits)
     -> Result<(), Int4SourceMapError> {

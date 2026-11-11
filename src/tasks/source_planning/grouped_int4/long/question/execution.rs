@@ -71,7 +71,7 @@ impl PreparedInt4Question<'_> {
         if task.next != self.chunks.chunks().len() || stats.work != task.work || stats.masks != task.masks {
             return Err(Int4SourceError::InvalidResult.into());
         }
-        let run = Int4QuestionRun { schema_version: 1, execution: INT4_QUESTION_EXECUTION,
+        let mut run = Int4QuestionRun { schema_version: 1, execution: INT4_QUESTION_EXECUTION,
             numerics_profile: STRICT_INT4_PROFILE, group_width: self.expected.group_width,
             semantics: QUESTION_SEMANTICS, outcome: stats.outcome, distinct_answer_texts: stats.distinct,
             native_chunks: stats.answered + stats.abstained, whitespace_chunks: stats.blank,
@@ -81,9 +81,11 @@ impl PreparedInt4Question<'_> {
             verification_used: SourceMapVerification::used(self.verification, task.remaining)?,
             calibration: AnswerCalibration::Uncalibrated,
             citation_guarantee: CitationGuarantee::StructuralSourceMembership,
-            semantic_support: SummarySemanticSupport::NotAssessed, untrusted_fields: ["mapped.root.value"], mapped };
-        self.expected.verify_completed(&run)?;
-        check_size(&run, self.max_result_bytes()).map_err(Int4SourceError::from)?;
+            semantic_support: SummarySemanticSupport::NotAssessed, untrusted_fields: ["mapped.root.value"], mapped,
+            request_binding: self.expected.request_binding, result_binding: [0; 32] };
+        let mut check = || driver.borrow_mut().checkpoint().map_err(Int4SourceMapError::from);
+        run.result_binding = binding::result_with_checkpoints(&run, self.max_result_bytes(), &mut check)?;
+        self.expected.verify_completed_with_checkpoints(&run, &mut check)?;
         driver.borrow_mut().checkpoint()?;
         Ok(run)
     }

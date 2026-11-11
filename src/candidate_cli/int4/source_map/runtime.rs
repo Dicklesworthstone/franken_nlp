@@ -414,23 +414,24 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         }
         Prepared::Question(mut config, expected) => {
             config.native.run.max_elapsed = remaining()?;
+            let planner = Arc::new(planner);
             if let Some(chunks) = limits.cohort_chunks {
-                let result = engine.answer_int4_document_cohorts(&model, text, Arc::new(planner), Arc::new(vocabulary),
+                let result = engine.answer_int4_document_cohorts(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
                     config, common.kernel, cancellation).map_err(execution_error)?;
                 expected.verify_completed(&result.result().document).map_err(|_| CandidateError::Execution)?;
                 remaining()?;
                 // The document includes whitespace-only chunks; physical
                 // stats count only actual native rows and nonempty windows.
-                publish_cohort(&provenance, &result.result().document, &result.result().cohorts,
-                    chunks, limits.max_result_bytes + 4096, output, &publication)
+                publish_map(&provenance, &result.result().document, Some((&result.result().cohorts, chunks)),
+                    &planner, limits.max_result_bytes + 4096, output, &publication)
             } else {
-                let result = engine.answer_int4_document(&model, text, Arc::new(planner), Arc::new(vocabulary),
+                let result = engine.answer_int4_document(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
                     config, common.kernel, cancellation).map_err(execution_error)?;
                 expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
                 remaining()?;
-                // The hosted output guard survives staging, write AND flush.
-                // Native failure cannot publish a successful prefix or abstention.
-                publish_checked(&Response { provenance: &provenance, output: result.result() },
+                // The hosted output guard and shared encoding ledger survive
+                // staging, write AND flush. Failure is never an abstention.
+                publish_map(&provenance, result.result(), None, &planner,
                     limits.max_result_bytes + 4096, output, &publication)
             }
         }
@@ -579,6 +580,8 @@ fn publish_map<T: Serialize>(provenance: &Provenance<'_>, document: &T,
     -> Result<(), CandidateError> {
     let report = encoding::report(planner)?;
     match physical {
+        Some((physical, chunks)) if report.is_none() =>
+            publish_cohort(provenance, document, physical, chunks, max_bytes, output, check),
         Some((physical, chunks)) => publish_checked(&encoding::EncodedResponse {
             response: CohortResponse { response: Response { provenance, output: document },
                 cohort_schedule: CohortSchedule { execution: "cross_chunk_constrained_cohorts",

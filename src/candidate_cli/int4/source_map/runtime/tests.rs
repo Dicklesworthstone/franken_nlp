@@ -424,6 +424,18 @@ fn complete_publication_keeps_provenance_and_original_coordinates_and_refuses_ov
     assert!(refused.is_empty());
 }
 
+// Geometry and native work may stay identical when the exact sealed scheduling
+// or resource authority changes. Full receipt equality remains config-specific.
+fn assert_same_question_geometry_and_work(actual: Int4QuestionPreflight, expected: Int4QuestionPreflight) {
+    assert_eq!(actual.source_span(), expected.source_span());
+    assert_eq!(actual.chunk_count(), expected.chunk_count());
+    assert_eq!(actual.native_chunks(), expected.native_chunks());
+    assert_eq!(actual.whitespace_chunks(), expected.whitespace_chunks());
+    assert_eq!(actual.group_width(), expected.group_width());
+    assert_eq!(actual.planned_work(), expected.planned_work());
+    assert_eq!(actual.reserved_mask_visits(), expected.reserved_mask_visits());
+}
+
 fn question_fixture(width: usize) -> (SourceTaskPlanner, Int4SourceMapConfig<SourceQuestion>, MapLimits) {
     let (planner, base, _) = fixture(Kind::Ner, width);
     let width_arg = width.to_string();
@@ -477,12 +489,15 @@ fn question_cohorts_preserve_private_question_identities_and_complete_whitespace
     assert!(expected.whitespace_chunks() >= 4);
     assert_eq!(expected.native_chunks() + expected.whitespace_chunks(), expected.chunk_count());
     assert_eq!(identities.len(), expected.native_chunks());
+    let serial_chunks = config.mapping.reduction.map_batch_chunks;
     for chunks in [1, 2, 4, 64] {
         config.mapping.reduction.map_batch_chunks = chunks;
-        assert_eq!(question_preflight(&source, &planner, &config, 32, &mut continuing()).unwrap(), expected);
+        let grouped_expected = question_preflight(&source, &planner, &config, 32, &mut continuing()).unwrap();
+        assert_same_question_geometry_and_work(grouped_expected, expected);
+        assert_eq!(grouped_expected == expected, chunks == serial_chunks);
         let grouped = planner.plan_int4_question_with_control(&source, &config.task, config.budget, &context,
             config.planning, config.mapping, 32, &mut continuing()).unwrap();
-        assert_eq!(grouped.preflight_metadata(), expected);
+        assert_eq!(grouped.preflight_metadata(), grouped_expected);
         assert_eq!(grouped.execution_identities().cloned().collect::<Vec<_>>(), identities);
         let actual = grouped.cohort_requirements(config.native.context_tokens).unwrap();
         let ceiling = config.cohort_requirements(32).unwrap();
@@ -533,7 +548,9 @@ fn document_qa_complete_work_and_mask_caps_cannot_restart_for_another_passage() 
     }
     config.mapping.max_model_work = expected.planned_work();
     config.mapping.max_mask_visits = expected.reserved_mask_visits();
-    assert_eq!(question_preflight(SOURCE, &planner, &config, 32, &mut continuing()).unwrap(), expected);
+    let bounded = question_preflight(SOURCE, &planner, &config, 32, &mut continuing()).unwrap();
+    assert_same_question_geometry_and_work(bounded, expected);
+    assert_ne!(bounded, expected);
 }
 
 #[test]
@@ -889,7 +906,12 @@ fn complete_qa_and_final_answer_cannot_each_spend_the_full_work_ceiling() {
     }
     config.mapping.max_model_work = work;
     config.mapping.max_mask_visits = masks;
-    assert_eq!(question_synthesis_preflight(SOURCE, &planner, &config, 32, &mut continuing()).unwrap(), expected);
+    let bounded = question_synthesis_preflight(SOURCE, &planner, &config, 32, &mut continuing()).unwrap();
+    assert_same_question_geometry_and_work(bounded.discovery(), expected.discovery());
+    assert_eq!(bounded.synthesis_reserved_work(), expected.synthesis_reserved_work());
+    assert_eq!(bounded.reserved_model_work().unwrap(), expected.reserved_model_work().unwrap());
+    assert_eq!(bounded.reserved_mask_visits().unwrap(), expected.reserved_mask_visits().unwrap());
+    assert_ne!(bounded, expected);
 }
 
 #[test]
@@ -1144,7 +1166,8 @@ fn answer_hierarchy_preflight_reserves_every_permitted_pass_with_complete_discov
     let single = question_synthesis_preflight(SOURCE, &planner, &config, 32, &mut continuing()).unwrap();
     let expected = question_hierarchy_preflight(SOURCE, &planner, &config, hierarchy, 32, &mut continuing()).unwrap();
     let discovery = expected.discovery();
-    assert_eq!(discovery, single.discovery());
+    assert_same_question_geometry_and_work(discovery, single.discovery());
+    assert_ne!(discovery, single.discovery());
     assert_eq!(discovery.source_span().byte_end, SOURCE.len());
     assert_eq!(discovery.source_span().scalar_end, SOURCE.chars().count());
     assert_eq!(expected.group_width(), 32); assert_eq!(expected.limits(), hierarchy);
@@ -1193,7 +1216,11 @@ fn later_answer_levels_cannot_renew_any_native_work_axis_or_mask_allowance() {
             Err(CandidateError::Planning));
     }
     config.mapping.max_model_work = work; config.mapping.max_mask_visits = masks;
-    assert_eq!(question_hierarchy_preflight(SOURCE, &planner, &config, hierarchy, 32, &mut continuing()).unwrap(), expected);
+    let bounded = question_hierarchy_preflight(SOURCE, &planner, &config, hierarchy, 32, &mut continuing()).unwrap();
+    assert_same_question_geometry_and_work(bounded.discovery(), expected.discovery());
+    assert_eq!(bounded.reserved_model_work(), expected.reserved_model_work());
+    assert_eq!(bounded.reserved_mask_visits(), expected.reserved_mask_visits());
+    assert_ne!(bounded, expected);
 }
 
 #[test]

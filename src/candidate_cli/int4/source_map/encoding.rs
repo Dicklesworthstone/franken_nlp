@@ -35,12 +35,16 @@ impl EncodingLimits {
 
 impl EncodingArgs {
     pub(super) fn limits(self, args: &Int4Args, mapping: &MappingArgs,
-        supported: bool) -> Result<Option<EncodingLimits>, CandidateError> {
+        supported: bool, question: bool) -> Result<Option<EncodingLimits>, CandidateError> {
         if args.input_encoding.is_default() {
             return if self == Self::default() { Ok(None) } else { Err(CandidateError::Arguments) };
         }
         if !supported { return Err(CandidateError::Arguments); }
-        let bytes = mapping.max_chunk_bytes.unwrap_or(args.context_tokens).min(args.max_input_bytes);
+        // QA encodes the question, canonical passage manifest and source in
+        // one request. Its per-call byte ceiling cannot be the source chunk
+        // ceiling alone. Complete-document bytes still have their own bound.
+        let bytes = if question { args.max_input_bytes.min(SafeBpeLimits::MAX_INPUT_BYTES) }
+            else { mapping.max_chunk_bytes.unwrap_or(args.context_tokens).min(args.max_input_bytes) };
         // Probes must be able to count an oversized candidate so the existing
         // lossless partitioner can shrink it. Actual chunk plans separately
         // enforce the full prompt/context limit.
@@ -63,7 +67,7 @@ pub(super) fn definition(command: clap::Command) -> clap::Command {
     input_encoding::definition(command)
         .mut_arg("max_tokenizer_pair_checks", |arg| arg.help("Safe-BPE pair checks per chunk encoding; the complete invocation also has --max-total-tokenizer-pair-checks"))
         .mut_arg("max_tokenizer_pair_bytes", |arg| arg.help("Safe-BPE pair bytes per chunk encoding; the complete invocation also has --max-total-tokenizer-pair-bytes"))
-        .after_long_help("--input-encoding safe-bpe-v1 preserves exact document bytes and excludes every template control token while compacting ordinary text. NER, keyphrase and plain cited-summary maps support this option, including --cohort-chunks and exact reducers. All chunk-size probes, real chunk plans and the hosted repeat preflight consume ONE nonrenewable tokenizer ledger. --max-total-tokenizer-input-bytes and --max-total-tokenizer-output-tokens default to eight times --max-input-bytes; total pair checks default to 268435456 and total examined pair bytes to 4294967296. Exhaustion refuses the whole document without retry or a partial result. Per-call tokenizer workspace is admitted before private input/model IO. Policy and every ceiling bind prompt identity; successful output reports cumulative work separately. QA, neural synthesis/hierarchies, corpora and durable jobs remain byte-only.")
+        .after_long_help("--input-encoding safe-bpe-v1 preserves exact document bytes and excludes every template control token while compacting ordinary text. NER, keyphrase, plain cited-summary and independent document-answer maps support this option, including --cohort-chunks and exact reducers. QA encodes the question, canonical passage manifest and source under one per-call ceiling bounded by --max-input-bytes and the encoder's one-MiB limit. All chunk-size probes, real chunk plans and the hosted repeat preflight consume ONE nonrenewable tokenizer ledger. --max-total-tokenizer-input-bytes and --max-total-tokenizer-output-tokens default to eight times --max-input-bytes; total pair checks default to 268435456 and total examined pair bytes to 4294967296. Exhaustion refuses the whole document without retry or a partial result. Per-call tokenizer workspace is admitted before private input/model IO. Policy and every ceiling bind prompt identity; successful output reports cumulative work separately. Neural synthesis/hierarchies, corpora and durable jobs remain byte-only.")
 }
 
 #[cfg(feature = "asupersync-runtime")]

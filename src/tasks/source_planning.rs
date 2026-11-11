@@ -243,10 +243,11 @@ impl SourceTaskPlanner {
         Ok(self)
     }
     /// Admit compact input for one complete INT4 NER/keyphrase/plain-summary
-    /// map operation. All probes, chunk plans and host replanning share this
+    /// or independent-passage QA map. All probes, chunk plans and host replanning
+    /// share this
     /// nonrenewable ledger for the planner's entire lifetime. Create another
     /// explicitly admitted planner for a different document; there is no reset.
-    /// QA, neural synthesis, corpus streams and durable jobs remain byte-only.
+    /// Neural synthesis, corpus streams and durable jobs remain byte-only.
     pub fn with_map_document_encoding(mut self, policy: UntrustedEncoding,
         work: crate::tokenizer::untrusted::SafeBpeWorkLimits) -> Result<Self, SourcePlanningError> {
         if !matches!(policy, UntrustedEncoding::SafeBpeV1(_)) {

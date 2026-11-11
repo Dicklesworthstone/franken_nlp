@@ -379,7 +379,7 @@ impl Int4Command {
         let mut args = Int4Args::from_arg_matches(matches)?;
         if matches!(name, "generate" | "chat" | "classify" | "classify-map" | "sentiment" | "extract" | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch"
             | "extract-batch" | "ner-batch" | "keyphrases-batch" | "summarize-batch" | "answer-batch"
-            | "ner-map" | "keyphrases-map" | "summarize-map") {
+            | "ner-map" | "keyphrases-map" | "summarize-map" | "answer-map") {
             args.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
         }
         if matches!(name, "generate" | "chat" | "classify" | "sentiment" | "judge" | "extract"

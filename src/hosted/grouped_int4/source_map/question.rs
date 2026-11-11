@@ -23,6 +23,8 @@ impl NlpEngine {
     /// Preserve all answers, abstentions and interior whitespace in source
     /// order with original-coordinate citations. Distinct texts are not votes
     /// or semantic contradiction labels. Empty/wholly blank documents refuse.
+    /// An explicitly selected compact planner retains one cumulative encoder
+    /// ledger across question sizing, source probes and every compiled passage.
     #[allow(clippy::too_many_arguments)]
     pub fn answer_int4_document(&self, model: &ResidentInt4, source: String,
         planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
@@ -101,8 +103,16 @@ fn question_requirements(config: &Int4SourceMapConfig<SourceQuestion>, source_by
     let required = common_requirements(config, source_bytes, width, planner)?;
     if config.identity.task_spec != ANSWER_TASK_VERSION { return Err(HostedError::ModelIdentity); }
     config.task.validate().map_err(map_error)?;
-    if config.task.question.len() > config.planning.max_input_bytes
-        || config.task.question.len() > config.budget.max_input_tokens as usize {
+    // Byte fallback emits one token per byte. Compact input has a distinct
+    // byte ceiling: controlled preparation checks its actual token count and
+    // complete prompt/context, including the trusted schema and manifest.
+    let byte_limit = match planner.document_encoding() {
+        crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback =>
+            config.planning.max_input_bytes.min(config.budget.max_input_tokens as usize),
+        crate::tokenizer::untrusted::UntrustedEncoding::SafeBpeV1(policy) =>
+            config.planning.max_input_bytes.min(policy.max_input_bytes),
+    };
+    if config.task.question.len() > byte_limit {
         return Err(HostedError::Limits("INT4 document question input budget"));
     }
     config.question_workspace_bytes(config.mapping.chunks.max_chunks)?;

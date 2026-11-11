@@ -102,8 +102,8 @@ struct SummaryArgs {
 }
 pub(super) fn definitions() -> Vec<clap::Command> {
     definitions_with_cohorts(true).into_iter().map(|command| {
-        if command.get_name() == "answer-map" { return command; }
         let command = encoding::definition(command);
+        if command.get_name() == "answer-map" { return command; }
         let details = command.get_after_long_help().map(|help| help.to_string()).unwrap_or_default();
         compute::definition(command)
             .mut_arg("compute_threads", |arg| arg.help("Coordinator plus persistent INT4 row workers, 1..=64; one team spans every source chunk and the complete reducer. Extra worker scratch is admitted before IO. Cannot combine with chunk cohorts or neural synthesis; runtime threads are additional"))
@@ -210,8 +210,8 @@ impl MapArgs {
             return Err(CandidateError::Arguments);
         }
         let encoding = m.encoding.limits(args, &m, !document_job && !map_only
-            && self.kind != Kind::Answer
-            && self.summary.is_none_or(|summary| !summary.synthesis.synthesize_summary))?;
+            && self.summary.is_none_or(|summary| !summary.synthesis.synthesize_summary),
+            self.kind == Kind::Answer)?;
         // Single-source storage validation prices the original input envelope.
         // Compact map probes instead use the separately quoted per-chunk
         // workspace and the complete-invocation ledger below.
@@ -239,6 +239,9 @@ impl MapArgs {
             Some(question) => question.synthesis_limits(self.planning(args))?,
             None => None,
         };
+        if encoding.is_some() && question_synthesis.is_some() {
+            return Err(CandidateError::Arguments);
+        }
         let hierarchy = match self.summary {
             Some(summary) => summary.synthesis.hierarchy()?,
             None => None,

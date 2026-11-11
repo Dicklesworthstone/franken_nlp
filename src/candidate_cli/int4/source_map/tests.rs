@@ -161,7 +161,7 @@ fn unsupported_compact_modes_and_invalid_total_ceilings_refuse_before_io() {
         assert!(!command.get_arguments().any(|arg| arg.get_id() == "input_encoding"));
     }
     let answer = definitions().into_iter().find(|command| command.get_name() == "answer-map").unwrap();
-    assert!(!answer.get_arguments().any(|arg| arg.get_id() == "input_encoding"));
+    assert!(answer.get_arguments().any(|arg| arg.get_id() == "input_encoding"));
 }
 
 #[test]

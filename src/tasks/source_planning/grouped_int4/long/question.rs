@@ -10,6 +10,7 @@ use crate::tasks::{
     summarize::{CitationGuarantee, SourceCitation, SummarySemanticSupport},
 };
 
+mod binding;
 mod planning;
 mod execution;
 /// Native cohorts for independent passage answers with lossless source order.
@@ -45,7 +46,7 @@ fn has_text(text: &str) -> bool { text.chars().any(|c| !c.is_whitespace()) }
 
 /// Pinned source/question geometry and exact work, not a native result. Only
 /// the planner creates this receipt; private fields prevent invented authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Int4QuestionPreflight {
     source_span: VerifiedSourceSpan,
     chunks: usize,
@@ -54,6 +55,15 @@ pub struct Int4QuestionPreflight {
     work: Int4Work,
     masks: u64,
     verification: GroundingBudget,
+    request_binding: [u8; 32],
+    max_result_bytes: u64,
+}
+impl fmt::Debug for Int4QuestionPreflight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Int4QuestionPreflight").field("chunks", &self.chunks)
+            .field("native_chunks", &self.native_chunks).field("group_width", &self.group_width)
+            .field("work", &self.work).field("masks", &self.masks).finish_non_exhaustive()
+    }
 }
 impl Int4QuestionPreflight {
     pub fn source_span(&self) -> VerifiedSourceSpan { self.source_span }
@@ -64,6 +74,14 @@ impl Int4QuestionPreflight {
     pub fn planned_work(&self) -> Int4Work { self.work }
     pub fn reserved_mask_visits(&self) -> u64 { self.masks }
     pub fn verify_completed(&self, run: &Int4QuestionRun) -> Result<(), Int4SourceMapError> {
+        self.verify_completed_with_checkpoints(run, &mut || Ok(()))
+    }
+    pub(super) fn verify_completed_with_checkpoints<F>(&self, run: &Int4QuestionRun, checkpoint: &mut F)
+        -> Result<(), Int4SourceMapError> where F: FnMut() -> Result<(), Int4SourceMapError> {
+        if run.request_binding != self.request_binding
+            || run.result_binding != binding::result_with_checkpoints(run, self.max_result_bytes, checkpoint)? {
+            return Err(Int4SourceError::InvalidResult.into());
+        }
         let root = run.mapped.root();
         let stats = execution::statistics(root.value())?;
         if run.schema_version != 1 || run.execution != INT4_QUESTION_EXECUTION
@@ -89,6 +107,7 @@ impl Int4QuestionPreflight {
         }
         let mut byte_end = 0; let mut scalar_end = 0;
         for (index, chunk) in root.value().chunks().enumerate() {
+            checkpoint()?;
             let span = chunk.source_span;
             if chunk.chunk_id != index || span.byte_start != byte_end || span.scalar_start != scalar_end
                 || span.byte_end <= span.byte_start || span.scalar_end <= span.scalar_start {
@@ -155,6 +174,10 @@ pub struct Int4QuestionRun {
     pub semantic_support: SummarySemanticSupport,
     pub untrusted_fields: [&'static str; 1],
     pub mapped: MapReduceResult<QuestionValue>,
+    #[serde(skip)]
+    request_binding: [u8; 32],
+    #[serde(skip)]
+    result_binding: [u8; 32],
 }
 
 /// Consumed complete-document commitment. Whitespace chunks have no fabricated
@@ -180,3 +203,4 @@ impl PreparedInt4Question<'_> {
 }
 
 #[cfg(test)] mod tests;
+#[cfg(test)] mod encoding_tests;
