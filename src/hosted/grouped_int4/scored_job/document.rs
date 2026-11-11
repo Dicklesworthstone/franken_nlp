@@ -1,6 +1,7 @@
 //! Complete-document classification on the owned durable job boundary.
 //! One input document owns all chunk plans, scores and the final aggregate.
 use super::*;
+use crate::native_engine::strict_int4::projection::Int4ProjectionExecutor;
 use crate::{
     batch::{BatchCode, BatchItemFailure, classify::ClassificationBatchArgs},
     jobs::{JobWork, runner::scored::grouped_int4::document::{
@@ -23,6 +24,16 @@ struct DocumentRequirements {
     memory: Int4ClassificationMapMemoryRequirement,
     /// Complete original population, private factory and one map frontier.
     input_bytes: u64,
+}
+
+struct DocumentExecution<R> {
+    input: Charged<DocumentInput<R>>,
+    kv: Pending,
+    scratch: Pending,
+    limits: JobHostLimits,
+    required: DocumentRequirements,
+    cohort: Option<(usize, Int4ClassificationMapCohortMemoryRequirement)>,
+    lease: EngineLease,
 }
 
 /// Cohort processors construct each exact window themselves. Their peak
@@ -48,7 +59,35 @@ impl NlpEngine {
         limits: JobHostLimits, kernel: PackedInt4Kernel, reader: R,
         cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
+        self.run_int4_classification_document_job(model, planner, request, limits, kernel, None,
+            reader, cancellation)
+    }
+
+    /// Keep one persistent numerical team across every complete-document
+    /// attempt. Worker width is operational: authenticated recipes, result
+    /// identities and all lifetime work debits remain unchanged on resume.
+    /// Worker scratch is reserved before population IO and every worker joins
+    /// before this method returns. Native chunk cohorts cannot be combined.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int4_classification_document_with_threads<R>(&self, model: &ResidentInt4,
+        planner: Int4ClassificationDocumentJobPlanner, request: SourceJobRequest,
+        limits: JobHostLimits, kernel: PackedInt4Kernel, compute_threads: usize, reader: R,
+        cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        self.run_int4_classification_document_job(model, planner, request, limits, kernel, Some(compute_threads),
+            reader, cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_int4_classification_document_job<R>(&self, model: &ResidentInt4,
+        planner: Int4ClassificationDocumentJobPlanner, request: SourceJobRequest,
+        limits: JobHostLimits, kernel: PackedInt4Kernel, compute_threads: Option<usize>, reader: R,
+        cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        match compute_threads {
+            Some(width) => dispatch::preflight_int4_team(self, limits.native.run, width)?,
+            None => dispatch::preflight(self, limits.native.run)?,
+        }
         if !Arc::ptr_eq(self.resources(), model.resources()) {
             return Err(HostedError::ResourceDomain.into());
         }
@@ -59,6 +98,7 @@ impl NlpEngine {
             return Err(HostedError::ModelIdentity.into());
         }
         planner.check_job_limits(request.limits).map_err(HostedError::BatchSetup)?;
+        check_team_schedule(compute_threads, planner.cohort_chunks())?;
         let cohort = planner.cohort_chunks().map(|chunks|
             planner.cohort_requirements().map(|quote| (chunks, quote)))
             .transpose().map_err(HostedError::BatchSetup)?;
@@ -69,8 +109,10 @@ impl NlpEngine {
         required.memory = required.memory.with_input_encoding(planner.document_encoding()).map_err(map_error)?;
         required.input_bytes = sum(&[required.input_bytes, required.memory.input_bytes.checked_sub(base_input_bytes)
             .ok_or(HostedError::Limits("classification document encoding memory arithmetic"))?])?;
+        let team_scratch = compute_threads.map(|width|
+            int4_task_team_workspace_bytes(width, planner.group_width())).transpose()?.unwrap_or(0);
         sum(&[required.input_bytes, required.memory.native.kv_bytes, required.memory.workspace_bytes,
-            required.memory.output_reservation_bytes])?;
+            required.memory.output_reservation_bytes, team_scratch])?;
         if planner.max_result_bytes() != required.memory.max_output_bytes {
             return Err(HostedError::Limits("INT4 classification document result envelope").into());
         }
@@ -79,61 +121,87 @@ impl NlpEngine {
             || Ok(DocumentInput { preparation: Some((planner, request)), reader }))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.memory.native.kv_bytes)?;
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.memory.workspace_bytes)?;
+        let execution = DocumentExecution { input, kv, scratch, limits, required, cohort, lease };
         let model = model.clone();
-        let completed = dispatch::run(self, limits.native.run, cancellation, move |control| {
-            // Capture the complete transferred owner so queued cancellation
-            // drops caller buffers, fixed labels and key before their charge.
-            let mut input = input;
-            checkpoint(control)?;
-            let (planner, request) = input.value.preparation.take()
-                .ok_or(HostedError::CompletionMissing)?;
-            let population = match read_population(&mut input.value.reader,
-                &request, limits.transport, control) {
-                Ok(population) => population,
-                Err(error) => return Ok(Err(JobRunError::Storage(error))),
-            };
-            checkpoint(control)?;
-            let memory = required.memory;
-            let native_budget = Int4MemoryBudget { max_kv_bytes: memory.native.kv_bytes,
-                max_rope_bytes: memory.native.rope_bytes,
-                max_scratch_payload_bytes: memory.native.scratch_payload_bound };
-            let mut native = if let Some((_, quote)) = cohort {
-                DocumentNative::Cohorts { budget: Int4ClassificationMapCohortBudget {
-                    native: Int4RunBudget::exact(planner.document_limits().max_model_work),
-                    memory: native_budget, max_task_workspace_bytes: quote.task_workspace_bytes,
-                    max_output_bytes: quote.max_cohort_output_bytes,
-                }, _kv: kv, _scratch: scratch }
-            } else {
-                DocumentNative::Serial(allocate_native(kv, scratch, || {
-                    StrictInt4Engine::new(&model.inner.loaded.value, limits.native.context_tokens,
-                        native_budget).map(|engine| engine.with_kernel(kernel)).map_err(native_error)
-                })?)
-            };
-            let admission = DocumentAdmission { lease: &lease, model: model.model_identity(),
-                base: planner.execution_identity(), document: planner.document_limits(),
-                kv_bytes: memory.native.kv_bytes, head_count: head_count(planner.request()),
-                result_bytes: memory.max_output_bytes, output_bytes: memory.output_reservation_bytes };
-            let result = (|| {
-                match &mut native {
-                    DocumentNative::Serial(engine) => {
-                        let processor = Int4ClassificationDocumentJobProcessor::new(
-                            &planner, &mut engine.value, admission).map_err(JobRunError::Processor)?;
-                        run_population(request, &population, processor, control)
-                    }
-                    DocumentNative::Cohorts { budget, .. } => {
-                        let processor = Int4ClassificationDocumentJobProcessor::new_cohorts(
-                            &planner, &model.inner.loaded.value, *budget, kernel, admission)
-                            .map_err(JobRunError::Processor)?;
-                        run_population(request, &population, processor, control)
-                    }
-                }
-            })();
-            // Runner/processor and per-result guards have physically dropped
-            // before their population, native state and complete-map charge.
-            drop(native); drop(population); drop(planner); drop(input); drop(lease);
-            Ok(result)
-        })?;
+        let completed = match compute_threads {
+            None => dispatch::run(self, limits.native.run, cancellation, move |control|
+                execution.run(&model.inner.loaded.value, kernel, None, control)),
+            Some(width) => dispatch::run_int4_team(self, limits.native.run, cancellation,
+                model, width, kernel, move |weights, control, team|
+                    execution.run(weights, kernel, Some(team), control)),
+        }?;
+        // Physical drain and terminal cancellation take precedence even if a
+        // durable result committed; authenticated resume reconciles progress.
         completed.map_err(HostedJobError::Job)
+    }
+}
+
+fn check_team_schedule(threads: Option<usize>, cohort_chunks: Option<usize>) -> Result<(), HostedError> {
+    if threads.is_some() && cohort_chunks.is_some() {
+        return Err(HostedError::Limits("INT4 classification document job team cannot combine with native chunk cohorts"));
+    }
+    Ok(())
+}
+
+impl<R: BufRead> DocumentExecution<R> {
+    fn run<'weights>(self, weights: &'weights Int4ModelWeights, kernel: PackedInt4Kernel,
+        projection: Option<&'weights mut (dyn Int4ProjectionExecutor + 'weights)>,
+        control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError> {
+        // Capture the complete transferred owner so queued cancellation drops
+        // caller buffers, fixed labels and key before their charged storage.
+        let Self { mut input, kv, scratch, limits, required, cohort, lease } = self;
+        checkpoint(control)?;
+        let (planner, request) = input.value.preparation.take()
+            .ok_or(HostedError::CompletionMissing)?;
+        let population = match read_population(&mut input.value.reader,
+            &request, limits.transport, control) {
+            Ok(population) => population,
+            Err(error) => return Ok(Err(JobRunError::Storage(error))),
+        };
+        checkpoint(control)?;
+        let memory = required.memory;
+        let native_budget = Int4MemoryBudget { max_kv_bytes: memory.native.kv_bytes,
+            max_rope_bytes: memory.native.rope_bytes,
+            max_scratch_payload_bytes: memory.native.scratch_payload_bound };
+        let mut native = if let Some((_, quote)) = cohort {
+            DocumentNative::Cohorts { budget: Int4ClassificationMapCohortBudget {
+                native: Int4RunBudget::exact(planner.document_limits().max_model_work),
+                memory: native_budget, max_task_workspace_bytes: quote.task_workspace_bytes,
+                max_output_bytes: quote.max_cohort_output_bytes,
+            }, _kv: kv, _scratch: scratch }
+        } else {
+            DocumentNative::Serial(allocate_native(kv, scratch, || {
+                let engine = StrictInt4Engine::new(weights, limits.native.context_tokens,
+                    native_budget).map_err(native_error)?.with_kernel(kernel);
+                match projection {
+                    Some(team) => engine.with_projection_executor(team).map_err(native_error),
+                    None => Ok(engine),
+                }
+            })?)
+        };
+        let admission = DocumentAdmission { lease: &lease, model: weights.identity(),
+            base: planner.execution_identity(), document: planner.document_limits(),
+            kv_bytes: memory.native.kv_bytes, head_count: head_count(planner.request()),
+            result_bytes: memory.max_output_bytes, output_bytes: memory.output_reservation_bytes };
+        let result = (|| {
+            match &mut native {
+                DocumentNative::Serial(engine) => {
+                    let processor = Int4ClassificationDocumentJobProcessor::new(
+                        &planner, &mut engine.value, admission).map_err(JobRunError::Processor)?;
+                    run_population(request, &population, processor, control)
+                }
+                DocumentNative::Cohorts { budget, .. } => {
+                    let processor = Int4ClassificationDocumentJobProcessor::new_cohorts(
+                        &planner, weights, *budget, kernel, admission)
+                        .map_err(JobRunError::Processor)?;
+                    run_population(request, &population, processor, control)
+                }
+            }
+        })();
+        // Runner/processor and per-result guards have physically dropped
+        // before their population, native state and complete-map charge.
+        drop(native); drop(population); drop(planner); drop(input); drop(lease);
+        Ok(result)
     }
 }
 

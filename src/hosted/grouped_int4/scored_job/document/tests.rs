@@ -207,7 +207,193 @@ fn real_factory_and_transferred_reader_cross_the_owned_host_boundary() {
     fn send<T: Send + 'static>() {}
     send::<Int4ClassificationDocumentJobPlanner>();
     send::<DocumentInput<std::io::Cursor<Vec<u8>>>>();
+    send::<DocumentExecution<std::io::Cursor<Vec<u8>>>>();
     let _entrypoint = NlpEngine::job_int4_classification_document::<std::io::Cursor<Vec<u8>>>;
+    let _team = NlpEngine::job_int4_classification_document_with_threads::<std::io::Cursor<Vec<u8>>>;
+}
+
+#[test]
+fn durable_team_width_is_independent_of_native_chunk_cohort_authority() {
+    for chunks in [1, 2, 8] {
+        check_team_schedule(None, Some(chunks)).unwrap();
+        for threads in [2, 4, 64] {
+            check_team_schedule(Some(threads), None).unwrap();
+            assert!(matches!(check_team_schedule(Some(threads), Some(chunks)), Err(HostedError::Limits(_))));
+        }
+    }
+}
+
+#[cfg(feature = "asupersync-runtime")]
+mod team {
+    use super::*;
+    use crate::{LeakResponsePolicy, ResourceHostConfig, RuntimePreset,
+        hosted::corpus::jobs::JobOpenMode, jobs::{JobId, JobSecret},
+        native_engine::{decode::DecodeCancellationKind, strict_int4::weights::projection_fixture},
+        tasks::classify::grouped_int4::Int4ClassificationPlanner,
+        tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding}};
+    use std::{io::{self, Read}, path::PathBuf, sync::atomic::{AtomicU64, AtomicUsize, Ordering}};
+
+    const PREPARATION: u64 = 128 << 20;
+    #[derive(Clone, Copy)]
+    enum Action { Refuse, Cancel(DecodeCancellationKind), Panic }
+    #[derive(Default)]
+    struct Observation { reads: AtomicUsize, drops: AtomicUsize,
+        input_at_drop: AtomicU64, workers_at_read: AtomicU64 }
+    struct Reader { resources: Arc<EngineResources>, observed: Arc<Observation>,
+        action: Action, stop: CancellationToken }
+    impl Drop for Reader {
+        fn drop(&mut self) {
+            let snapshot = self.resources.memory_snapshot();
+            self.observed.input_at_drop.store(snapshot.by_class.get(&MemoryClass::JobBuffers)
+                .map_or(0, |value| value.committed_bytes + value.reserved_bytes), Ordering::SeqCst);
+            self.observed.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl Read for Reader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { self.fill_buf()?; Ok(0) }
+    }
+    impl BufRead for Reader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            self.observed.reads.fetch_add(1, Ordering::SeqCst);
+            self.observed.workers_at_read.store(self.resources.memory_snapshot().by_class
+                .get(&MemoryClass::ActivationScratch).map_or(0, |value| value.committed_bytes), Ordering::SeqCst);
+            match self.action {
+                Action::Refuse => panic!("unadmitted classification job read private input"),
+                Action::Panic => panic!("injected classification job reader panic"),
+                Action::Cancel(cause) => self.stop.cancel(cause),
+            }
+            Ok(&[])
+        }
+        fn consume(&mut self, _: usize) {}
+    }
+    fn planner(model: &ResidentInt4, compact: bool, cohorts: Option<usize>)
+        -> (Int4ClassificationDocumentJobPlanner, SourceJobRequest, JobHostLimits) {
+        let (settings, planning, document, job, mut limits) = fixture(32);
+        limits.native.run.max_elapsed = Duration::from_secs(60);
+        limits.native.run.max_checkpoints = 100_000;
+        let encoding = if compact { UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+            max_input_bytes: 4096, max_output_tokens: 4096, max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24,
+        }) } else { UntrustedEncoding::ByteFallback };
+        let compiler = Int4ClassificationPlanner::for_model(model.model_identity(), settings.budget, planning).unwrap()
+            .with_document_encoding(encoding).unwrap();
+        let planner = Int4ClassificationDocumentJobPlanner::new(compiler, settings, document, job).unwrap();
+        let planner = if let Some(chunks) = cohorts {
+            planner.with_chunk_cohorts(chunks, memory_limits(limits)).unwrap()
+        } else { planner };
+        let request = SourceJobRequest { root: PathBuf::from("/nonexistent/fnlp-classification-job-team-refusal"),
+            key: JobSecret::from_bytes([3; 32]), job_id: JobId([4; 16]), limits: job,
+            mode: JobOpenMode::Create, materialize: false };
+        (planner, request, limits)
+    }
+    fn drained(host: &NlpEngine, baseline: &crate::MemorySnapshot) {
+        assert_eq!(&host.resources().memory_snapshot(), baseline);
+        let closures = host.resources().outstanding_closure_snapshot();
+        assert_eq!(closures.active_closures, 0); assert_eq!(closures.wrapper_cancelled_closures, 0);
+    }
+    #[test]
+    #[ignore = "controller-only fresh runtime: tiny weights prove admission and drain, never native or durable-result parity"]
+    fn classification_job_teams_preserve_cancellation_and_population_ownership() {
+        assert!(crate::installed_process_resources().is_none());
+        let host = NlpEngine::builder().resource_config(ResourceHostConfig {
+            runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
+            max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 3,
+            helper_threads: 0, thread_ceiling: 5, memory_ceiling_bytes: 1024 << 20,
+            leak_response_policy: LeakResponsePolicy::PanicInLabOrCi,
+        }).build().unwrap();
+        let idle = host.resources().memory_snapshot();
+        let lease = host.resources().acquire_lease();
+        let preparation = Pending::reserve(&lease, MemoryClass::JobBuffers, PREPARATION).unwrap().commit().unwrap();
+        let loaded = allocate(Pending::reserve(&lease, MemoryClass::Weights, 1 << 20).unwrap(),
+            || Ok(projection_fixture(32).0)).unwrap();
+        let model = ResidentInt4 { inner: Arc::new(ResidentModel { loaded, lease }) };
+        let baseline = host.resources().memory_snapshot();
+        use DecodeCancellationKind::*;
+        for width in [2, 4] {
+            for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+                ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+                let (planner, request, limits) = planner(&model, true, None);
+                let charge = limits.required_buffer_bytes(request.limits).unwrap();
+                let stop = CancellationToken::default(); stop.cancel(cause);
+                let observed = Arc::new(Observation::default());
+                let reader = Reader { resources: Arc::clone(host.resources()), observed: Arc::clone(&observed),
+                    action: Action::Refuse, stop: stop.clone() };
+                let error = host.job_int4_classification_document_with_threads(&model, planner,
+                    request, limits, PackedInt4Kernel::scalar(), width, reader, stop).err().unwrap();
+                let HostedJobError::Host(HostedError::Stopped { stop, .. }) = error
+                    else { panic!("classification pre-cancellation lost its typed cause"); };
+                assert_eq!(stop.kind, cause); assert_eq!(observed.reads.load(Ordering::SeqCst), 0);
+                assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+                assert!(observed.input_at_drop.load(Ordering::SeqCst) >= PREPARATION + charge);
+                drained(&host, &baseline);
+            }
+        }
+        for (width, cohorts) in [(0, None), (1, None), (5, None), (65, None), (usize::MAX, None),
+            (2, Some(1)), (4, Some(2))] {
+            let (planner, request, limits) = planner(&model, false, cohorts);
+            let stop = CancellationToken::default();
+            let observed = Arc::new(Observation::default());
+            let reader = Reader { resources: Arc::clone(host.resources()), observed: Arc::clone(&observed),
+                action: Action::Refuse, stop: stop.clone() };
+            let error = host.job_int4_classification_document_with_threads(&model, planner,
+                request, limits, PackedInt4Kernel::scalar(), width, reader, stop).err().unwrap();
+            assert!(matches!(error, HostedJobError::Host(HostedError::Limits(_))));
+            assert_eq!(observed.reads.load(Ordering::SeqCst), 0);
+            assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+            drained(&host, &baseline);
+        }
+        // Leave exactly one byte less than the complete native plus worker
+        // reservation. The numerical team must refuse before private input IO.
+        {
+            let (planner, request, limits) = planner(&model, false, None);
+            let required = requirements(32, planner.document_budget(), planner.planning_limits(),
+                planner.document_limits(), planner.request(), request.limits, limits, None,
+                request.mode.input_memory()).unwrap();
+            let room = sum(&[required.input_bytes, required.memory.native.kv_bytes,
+                required.memory.workspace_bytes, int4_task_team_workspace_bytes(4, 32).unwrap() - 1]).unwrap();
+            let bytes = host.resources().config().memory_ceiling_bytes
+                .checked_sub(baseline.committed_bytes + baseline.reserved_bytes).unwrap().checked_sub(room).unwrap();
+            let lease = host.resources().acquire_lease();
+            let held = Pending::reserve(&lease, MemoryClass::JobBuffers, bytes).unwrap().commit().unwrap();
+            let stop = CancellationToken::default();
+            let observed = Arc::new(Observation::default());
+            let reader = Reader { resources: Arc::clone(host.resources()), observed: Arc::clone(&observed),
+                action: Action::Refuse, stop: stop.clone() };
+            let error = host.job_int4_classification_document_with_threads(&model, planner,
+                request, limits, PackedInt4Kernel::scalar(), 4, reader, stop).err().unwrap();
+            assert!(matches!(error, HostedJobError::Host(HostedError::Reservation(_))));
+            assert_eq!(observed.reads.load(Ordering::SeqCst), 0);
+            assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+            drop(held); drop(lease);
+            drained(&host, &baseline);
+        }
+        for action in [Action::Cancel(Deadline), Action::Panic] {
+            let (planner, request, limits) = planner(&model, true, None);
+            let charge = limits.required_buffer_bytes(request.limits).unwrap();
+            let stop = CancellationToken::default();
+            let observed = Arc::new(Observation::default());
+            let reader = Reader { resources: Arc::clone(host.resources()), observed: Arc::clone(&observed),
+                action, stop: stop.clone() };
+            let error = host.job_int4_classification_document_with_threads(&model, planner,
+                request, limits, PackedInt4Kernel::scalar(), 4, reader, stop).err().unwrap();
+            match action {
+                Action::Cancel(cause) => {
+                    let HostedJobError::Host(HostedError::Stopped { stop, .. }) = error
+                        else { panic!("classification reader cancellation lost its typed cause"); };
+                    assert_eq!(stop.kind, cause);
+                }
+                Action::Panic => assert!(matches!(error,
+                    HostedJobError::Host(HostedError::Panicked | HostedError::Scope { .. }))),
+                Action::Refuse => unreachable!(),
+            }
+            assert_eq!(observed.reads.load(Ordering::SeqCst), 1);
+            assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+            assert!(observed.workers_at_read.load(Ordering::SeqCst) >= int4_task_team_workspace_bytes(4, 32).unwrap());
+            assert!(observed.input_at_drop.load(Ordering::SeqCst) >= PREPARATION + charge);
+            drained(&host, &baseline);
+        }
+        drop(model); drop(preparation);
+        drained(&host, &idle);
+    }
 }
 
 #[cfg(feature = "asupersync-runtime")]

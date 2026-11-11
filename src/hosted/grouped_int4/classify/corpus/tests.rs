@@ -146,7 +146,228 @@ fn actual_full_kv_and_all_document_work_axes_are_independently_authorized() {
 
 #[test]
 fn owned_stream_crosses_only_the_existing_blocking_host_surface() {
+    fn send<T: Send + 'static>() {}
+    send::<DeferredClassificationStream<std::io::Cursor<Vec<u8>>, Vec<u8>>>();
     let _host = NlpEngine::batch_int4_classification_documents::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
+    let _team = NlpEngine::batch_int4_classification_documents_with_threads::<std::io::Cursor<Vec<u8>>, Vec<u8>>;
     let _quote = crate::hosted::int4_classification_document_corpus_requirements;
     let _cohorts = int4_classification_document_corpus_cohort_requirements;
+}
+
+#[test]
+fn numerical_teams_reject_every_explicit_native_chunk_cohort() {
+    for chunks in [1, 2, 8] {
+        check_team_schedule(None, Some(chunks)).unwrap();
+        for threads in [2, 3, 64] {
+            check_team_schedule(Some(threads), None).unwrap();
+            assert!(matches!(check_team_schedule(Some(threads), Some(chunks)), Err(HostedError::Limits(_))));
+        }
+    }
+}
+
+#[cfg(feature = "asupersync-runtime")]
+mod team {
+    use super::*;
+    use std::{io::{self, Cursor, Read}, sync::Mutex};
+    use crate::{LeakResponsePolicy, ResourceHostConfig, RuntimePreset,
+        hosted::RunStop, native_engine::{decode::DecodeCancellationKind,
+            strict_int4::weights::projection_fixture},
+        tasks::classify::grouped_int4::Int4ClassificationPlanner,
+        tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding}};
+
+    const INPUT: &[u8] = b"invalid-json\n{\"flush\":true}\n";
+    const PREPARATION: u64 = 128 << 20;
+    #[derive(Clone, Copy)]
+    enum Delivery { Complete, PartialTerminal, CancelAtEof, CancelAtTerminalFlush, PanicAtTerminal }
+    #[derive(Default)]
+    struct Observation { bytes: Vec<u8>, writes: usize, terminals: usize, drops: usize, input_at_drop: u64 }
+    struct Writer { host: Arc<NlpEngine>, observed: Arc<Mutex<Observation>>, run: RunLimits,
+        threads: usize, delivery: Delivery, stop: CancellationToken, terminal: bool, eof: bool }
+    impl Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let event: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            self.terminal = event["event"] == "run_complete";
+            self.eof = event["event"] == "flush" && event["eof"] == true;
+            assert_eq!(self.host.resources().outstanding_closure_snapshot().active_closures, 1);
+            assert!(matches!(dispatch::preflight(&self.host, self.run), Err(HostedError::Reentrant)));
+            if self.terminal {
+                let snapshot = self.host.resources().memory_snapshot();
+                let kv = snapshot.by_class.get(&MemoryClass::KvPages).map_or(0, |value| value.committed_bytes);
+                if self.threads > 1 {
+                    assert_eq!(kv, 0, "native state must drop before post-join completion");
+                    assert_eq!(snapshot.by_class[&MemoryClass::ActivationScratch].committed_bytes,
+                        int4_task_team_workspace_bytes(self.threads, 32).unwrap());
+                } else { assert!(kv > 0, "preserve the serial terminal schedule"); }
+                self.observed.lock().unwrap().terminals += 1;
+            }
+            self.observed.lock().unwrap().writes += 1;
+            if self.terminal && matches!(self.delivery, Delivery::PanicAtTerminal) {
+                panic!("injected classification terminal writer panic");
+            }
+            let mut observed = self.observed.lock().unwrap();
+            if self.terminal && matches!(self.delivery, Delivery::PartialTerminal) {
+                observed.bytes.extend_from_slice(&bytes[..bytes.len().min(7)]);
+                return Err(io::Error::other("injected classification terminal partial write"));
+            }
+            observed.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if self.eof && matches!(self.delivery, Delivery::CancelAtEof) {
+                self.stop.cancel(DecodeCancellationKind::Deadline);
+            }
+            if self.terminal && matches!(self.delivery, Delivery::CancelAtTerminalFlush) {
+                self.stop.cancel(DecodeCancellationKind::Shutdown);
+            }
+            Ok(())
+        }
+    }
+    impl Drop for Writer {
+        fn drop(&mut self) {
+            let snapshot = self.host.resources().memory_snapshot();
+            let mut observed = self.observed.lock().unwrap();
+            observed.input_at_drop = snapshot.by_class.get(&MemoryClass::JobBuffers)
+                .map_or(0, |value| value.committed_bytes + value.reserved_bytes);
+            observed.drops += 1;
+        }
+    }
+    struct NoRead;
+    impl Read for NoRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("refused classification read input"); }
+    }
+    impl BufRead for NoRead {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> { panic!("refused classification filled input"); }
+        fn consume(&mut self, _: usize) { panic!("refused classification consumed input"); }
+    }
+    fn planner(model: &ResidentInt4, compact: bool, cohorts: Option<usize>)
+        -> (Int4ClassificationDocumentBatchPlanner, CorpusLimits) {
+        let (mut budget, planning, mapping, mut limits) = fixture();
+        if cohorts.is_some() {
+            budget.max_kv_bytes = budget.max_kv_bytes.checked_mul(planning.max_labels as u64).unwrap();
+        }
+        limits.native.run.max_elapsed = Duration::from_secs(60);
+        limits.native.run.max_checkpoints = 100_000;
+        let encoding = if compact { UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+            max_input_bytes: 4096, max_output_tokens: 4096, max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24,
+        }) } else { UntrustedEncoding::ByteFallback };
+        let compiler = Int4ClassificationPlanner::for_model(model.model_identity(), budget, planning).unwrap()
+            .with_document_encoding(encoding).unwrap();
+        let planner = Int4ClassificationDocumentBatchPlanner::new(compiler, None, mapping, mapping.max_model_work).unwrap();
+        let planner = if let Some(chunks) = cohorts {
+            planner.with_chunk_cohorts(chunks, Int4ClassificationMapMemoryLimits {
+                context_tokens: limits.native.context_tokens, preparation_reserve_bytes: limits.preparation_reserve_bytes,
+                allocator_reserve_bytes: limits.native.allocator_reserve_bytes,
+            }).unwrap()
+        } else { planner };
+        (planner, limits)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn execute<R: BufRead + Send + 'static>(host: &Arc<NlpEngine>, model: &ResidentInt4,
+        threads: Option<usize>, compact: bool, cohorts: Option<usize>, delivery: Delivery,
+        input: R, stop: CancellationToken) -> (Result<BatchSummary, HostedError>, Arc<Mutex<Observation>>) {
+        let (planner, limits) = planner(model, compact, cohorts);
+        let observed = Arc::new(Mutex::new(Observation::default()));
+        let writer = Writer { host: Arc::clone(host), observed: Arc::clone(&observed), run: limits.native.run,
+            threads: threads.unwrap_or(1), delivery, stop: stop.clone(), terminal: false, eof: false };
+        let result = if let Some(threads) = threads {
+            host.batch_int4_classification_documents_with_threads(model, planner, limits,
+                PackedInt4Kernel::scalar(), threads, input, writer, stop)
+        } else {
+            host.batch_int4_classification_documents(model, planner, limits,
+                PackedInt4Kernel::scalar(), input, writer, stop)
+        };
+        (result, observed)
+    }
+    fn drained(host: &NlpEngine, baseline: &crate::MemorySnapshot) {
+        assert_eq!(&host.resources().memory_snapshot(), baseline);
+        let closures = host.resources().outstanding_closure_snapshot();
+        assert_eq!(closures.active_closures, 0); assert_eq!(closures.wrapper_cancelled_closures, 0);
+    }
+    #[test]
+    #[ignore = "controller-only fresh runtime: tiny weights prove stream ownership, never native classification parity"]
+    fn classification_stream_team_joins_before_terminal_delivery_and_drains_all_failure_paths() {
+        assert!(crate::installed_process_resources().is_none());
+        let host = Arc::new(NlpEngine::builder().resource_config(ResourceHostConfig {
+            runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
+            max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 2,
+            helper_threads: 0, thread_ceiling: 4, memory_ceiling_bytes: 1024 << 20,
+            leak_response_policy: LeakResponsePolicy::PanicInLabOrCi,
+        }).build().unwrap());
+        let idle = host.resources().memory_snapshot();
+        let lease = host.resources().acquire_lease();
+        let preparation = Pending::reserve(&lease, MemoryClass::JobBuffers, PREPARATION).unwrap().commit().unwrap();
+        let loaded = allocate(Pending::reserve(&lease, MemoryClass::Weights, 1 << 20).unwrap(),
+            || Ok(projection_fixture(32).0)).unwrap();
+        let model = ResidentInt4 { inner: Arc::new(ResidentModel { loaded, lease }) };
+        let baseline = host.resources().memory_snapshot();
+        let (task, planning, mapping, limits) = fixture();
+        let charge = int4_classification_document_corpus_requirements(32, task, planning, mapping, limits).unwrap().input_bytes;
+        for compact in [false, true] {
+            let mut expected = None;
+            for threads in [None, Some(2), Some(3)] {
+                let (result, observed) = execute(&host, &model, threads, compact, None,
+                    Delivery::Complete, Cursor::new(INPUT.to_vec()), CancellationToken::default());
+                let summary = result.unwrap();
+                assert_eq!(summary.failed, 1); assert_eq!(summary.succeeded, 0); assert_eq!(summary.flushes, 2);
+                assert_eq!(summary.reserved_work, crate::batch::BatchWork::default());
+                let observed = observed.lock().unwrap();
+                assert_eq!(observed.drops, 1); assert_eq!(observed.terminals, 1);
+                assert!(observed.input_at_drop >= PREPARATION + charge);
+                if let Some(expected) = &expected { assert_eq!(&observed.bytes, expected); }
+                else { expected = Some(observed.bytes.clone()); }
+                drained(&host, &baseline);
+            }
+        }
+        for delivery in [Delivery::PartialTerminal, Delivery::CancelAtEof,
+            Delivery::CancelAtTerminalFlush, Delivery::PanicAtTerminal] {
+            let (result, observed) = execute(&host, &model, Some(3), true, None, delivery,
+                Cursor::new(INPUT.to_vec()), CancellationToken::default());
+            match delivery {
+                Delivery::PartialTerminal => assert!(matches!(result, Err(HostedError::Batch(error))
+                    if error.fault.code == BatchCode::OutputIo)),
+                Delivery::CancelAtEof => assert!(matches!(result, Err(HostedError::Stopped {
+                    stop: RunStop { kind: DecodeCancellationKind::Deadline, .. }, .. }))),
+                Delivery::CancelAtTerminalFlush => assert!(matches!(result, Err(HostedError::Stopped {
+                    stop: RunStop { kind: DecodeCancellationKind::Shutdown, .. }, .. }))),
+                Delivery::PanicAtTerminal => assert!(matches!(result, Err(HostedError::Panicked))),
+                Delivery::Complete => unreachable!(),
+            }
+            let observed = observed.lock().unwrap();
+            assert_eq!(observed.drops, 1); assert!(observed.input_at_drop >= PREPARATION + charge);
+            let text = std::str::from_utf8(&observed.bytes).unwrap();
+            if matches!(delivery, Delivery::CancelAtEof) {
+                assert_eq!(observed.terminals, 0); assert!(!text.contains("run_complete"));
+                assert!(text.contains("run_error"));
+            } else { assert_eq!(observed.terminals, 1); assert!(!text.contains("run_error")); }
+            drained(&host, &baseline);
+        }
+        for (threads, cohorts) in [(0, None), (1, None), (4, None), (65, None), (usize::MAX, None),
+            (2, Some(1)), (3, Some(2))] {
+            let (result, observed) = execute(&host, &model, Some(threads), false, cohorts,
+                Delivery::Complete, NoRead, CancellationToken::default());
+            assert!(matches!(result, Err(HostedError::Limits(_))));
+            let observed = observed.lock().unwrap();
+            assert_eq!(observed.writes, 0); assert_eq!(observed.drops, 1);
+            drained(&host, &baseline);
+        }
+        {
+            let (task, planning, mapping, limits) = fixture();
+            let required = int4_classification_document_corpus_requirements(32, task, planning, mapping, limits).unwrap();
+            let room = sum(&[required.input_bytes, required.native.kv_bytes,
+                required.workspace_bytes, int4_task_team_workspace_bytes(3, 32).unwrap() - 1]).unwrap();
+            let bytes = host.resources().config().memory_ceiling_bytes
+                .checked_sub(baseline.committed_bytes + baseline.reserved_bytes).unwrap().checked_sub(room).unwrap();
+            let lease = host.resources().acquire_lease();
+            let held = Pending::reserve(&lease, MemoryClass::JobBuffers, bytes).unwrap().commit().unwrap();
+            let (result, observed) = execute(&host, &model, Some(3), false, None,
+                Delivery::Complete, NoRead, CancellationToken::default());
+            assert!(matches!(result, Err(HostedError::Reservation(_))));
+            let observed = observed.lock().unwrap();
+            assert_eq!(observed.writes, 0); assert_eq!(observed.drops, 1);
+            drop(held); drop(lease);
+            drained(&host, &baseline);
+        }
+        drop(model); drop(preparation);
+        drained(&host, &idle);
+    }
 }
