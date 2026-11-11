@@ -124,7 +124,10 @@ The keyed job contract binds the exact original input population, IDs and
 order; the actual model and compiler identity; fixed labels, descriptions,
 order, mode and local decision policy; task ceilings; all chunk limits;
 complete-document native work and result ceilings; aggregate coverage policy;
-and the selected serial/cohort schedule and requested cohort width.
+and the selected serial/cohort schedule and requested cohort width. Numerical
+output-row worker width is a separate physical selection and is excluded from
+this recipe; changing `--compute-threads` on an explicit resume does not change
+any semantic authority or renew attempts and work.
 
 Job limits are immutable, including lifetime attempts, all five native work
 counters, and storage capacities. A changed recipe or population refuses
@@ -163,8 +166,9 @@ no source is truncated and no encoding fallback is selected.
 The immutable private recipe binds the encoding kind and every ceiling before
 population replay or repair, including retained-input replay. Changing the
 policy refuses resume. Byte fallback remains the default, with its existing
-recipe bytes unchanged. Serial and chunk-cohort execution both use the fixed
-policy and admit exactly one transient encoder workspace. The native work
+recipe bytes unchanged. Serial, persistent numerical teams and chunk-cohort
+execution use the fixed policy and admit exactly one transient encoder
+workspace; numerical teams and chunk cohorts are mutually exclusive. The native work
 ledger remains separate and retains the original lifetime semantics.
 Compact mode supports pinned source input and pinned snapshot reload;
 `--save-snapshot` is refused before IO.
@@ -172,6 +176,38 @@ Compact mode supports pinned source input and pinned snapshot reload;
 For embedding, configure `Int4ClassificationPlanner::with_document_encoding`
 before constructing the durable planner. The host derives the workspace from
 the sealed policy; per-record arguments cannot replace it.
+
+## Persistent numerical teams
+
+Add `--compute-threads 4` to either `start` or `resume` to retain one coordinator
+and three output-row workers for the complete invocation, with an additional
+runtime thread. The same team serves all documents, chunks and label heads,
+including every admitted durable attempt. Both exclusive and independent
+multi-label modes preserve their ordinary full-vocabulary scores and complete
+document aggregate. Explicit compact input retains the fixed attempt-wide
+tokenizer allowance.
+
+Width one preserves serial execution; widths 2..64 add one admitted worker
+workspace and the corresponding process thread capacity before private IO.
+Multiple workers cannot combine with any explicit `--cohort-chunks` selection,
+including one. The original native, retained-result and durable-buffer quotes
+remain in force, and all workers physically join before successful progress
+returns. The original deadline continues through metadata publication.
+
+Worker width is not part of the authenticated recipe. You may change it on an
+explicit resume while preserving the original input population, labels, model,
+encoding and semantic limits. Lifetime attempts and native work never renew.
+Stdout adds only optional `compute_schedule` metadata with execution
+`int4-output-row-team-v1` and `declared_compute_threads`; width one omits it.
+Stored semantic results and their canonical bytes retain the serial contract.
+
+Embedding callers use
+`NlpEngine::job_int4_classification_document_with_threads(model, planner,
+request, limits, kernel, compute_threads, reader, cancellation)` for widths
+2..64, with a resource configuration that admits the selected team. The
+existing `job_int4_classification_document` method retains serial execution.
+Source review and regression definitions cover these boundaries; executable
+validation and model comparison remain pending the required DSR checkpoint.
 
 ## Serial execution and chunk cohorts
 

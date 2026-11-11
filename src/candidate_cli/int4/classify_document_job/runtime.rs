@@ -2,7 +2,7 @@
 use super::*;
 use std::time::{Duration, Instant};
 use crate::{
-    NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
+    NlpEngine, MemoryClass,
     candidate_cli::runtime::owned_jobs::{host_failure, job_failure, open_mode, progress_report},
     hosted::{CancellationToken, HostedError, Int4HostError, NativeLimits, RunLimits,
         corpus::jobs::{HostedJobError, JobHostLimits, SourceJobRequest}},
@@ -22,12 +22,8 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
-    let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
-        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: map.common.memory_bytes,
-        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
-    }).build().map_err(|_| CandidateError::Runtime)?;
+    let engine = NlpEngine::builder().resource_config(compute::resource_config(map.common))
+        .build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
     // Fixed defaults, model/planner preparation and bounded final reporting
     // retain their owner from before private configuration IO until return.
@@ -85,10 +81,15 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
     let job_id = job.storage.job_id; let materialize = job.storage.materialize;
     let request = SourceJobRequest { root: job.storage.job_dir, key, job_id, limits: lifetime,
         mode: open_mode(mode, job.storage.input_retention)?, materialize };
-    let progress = engine.job_int4_classification_document(&model, planner, request,
-        host_limits(&args, limits, remaining()?), common.kernel, reader, cancellation)
-        .map_err(|error| match error { HostedJobError::Host(error) => model_failure(error),
-            other => host_failure(other) })?;
+    let host = host_limits(&args, limits, remaining()?);
+    let progress = if common.compute.threads == 1 {
+        engine.job_int4_classification_document(&model, planner, request,
+            host, common.kernel, reader, cancellation)
+    } else {
+        engine.job_int4_classification_document_with_threads(&model, planner, request,
+            host, common.kernel, common.compute.threads, reader, cancellation)
+    }.map_err(|error| match error { HostedJobError::Host(error) => model_failure(error),
+        other => host_failure(other) })?;
     remaining()?;
     let report = progress_report(progress, job_id, lifetime, materialize, mode, "classify")?;
     let content = identity.logical_model_digest.to_hex();
@@ -99,7 +100,8 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
         model_content_sha256: &content, candidate_format: &identity.artifact_format,
         quant_recipe: &identity.quant_recipe, group_width: model.model_identity().group_width(),
         integer_kernel: common.kernel.kind().id(), snapshot, cohort_chunks,
-        input_encoding: input_encoding::reported_policy(&encoding), output: &report };
+        input_encoding: input_encoding::reported_policy(&encoding),
+        compute_schedule: compute::Schedule::for_threads(common.compute.threads), output: &report };
     // Publication failure may follow durable commits. This bounded metadata
     // contains no source, labels, policy contents, scores, key or private path.
     publish_report(&response, output, &remaining)
@@ -164,6 +166,8 @@ struct Response<'a, T: Serialize> {
     cohort_chunks: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     input_encoding: Option<&'a crate::tokenizer::untrusted::UntrustedEncoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compute_schedule: Option<compute::Schedule>,
     output: &'a T,
 }
 

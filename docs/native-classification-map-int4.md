@@ -140,9 +140,15 @@ the nested result cannot transplant another request's execution counters.
 
 These checks apply to byte and compact maps. Hashing streams through the
 existing finite input and result bounds without allocating a second
-source-sized buffer. Request hashing checks cancellation at bounded byte
-intervals. The seals are omitted from JSON and debug output, preserving the
-serialized result contract without publishing source-derived fingerprints.
+source-sized buffer. Request, result and cohort hashing poll the original
+cancellation control every 64 KiB, including inside a single large serializer
+write. Completion verification forwards that control through hosted execution,
+corpus batches and retained jobs; final CLI staging uses the original deadline.
+Canonical size and finite-number validation retain checkpoints before and after
+their existing serialization passes. The seals are omitted from JSON and debug
+output, preserving the serialized result contract without publishing
+source-derived fingerprints. Cohort seals also bind the actual effective
+window width: equal window counts cannot authorize different schedules.
 
 The memory quote adds one bounded tokenizer workspace beside all retained
 plans. Hosted callers can use `requirements_with_encoding` or
@@ -193,10 +199,46 @@ speedup or model-parity result; its regression tests await the required DSR
 checkpoint and model-present comparison.
 
 The width must be between 1 and 64. More than one compute thread cannot combine
-with `--cohort-chunks`, `--cohort-heads` or `--prefill-rows`. The corpus and durable
-job commands keep their existing serial/cohort schedules and do not expose this
-option. Each independent head still has its own causal context and full
-vocabulary denominator; worker count never multiplies its logical work budget.
+with `--cohort-chunks`, `--cohort-heads` or `--prefill-rows`. Each independent
+head still has its own causal context and full vocabulary denominator; worker
+count never multiplies its logical work budget.
+
+### Complete-document corpora and retained jobs
+
+`classify-corpus` and `classify-document-job start|resume` also accept
+`--compute-threads N`. One team spans the entire invocation: every original
+document, chunk and label head, including corpus flushes and durable attempts.
+Both exclusive and independent multi-label classification keep their existing
+full-vocabulary scoring and scalar-weighted aggregation. Byte fallback and
+explicit `safe-bpe-v1` use the same original tokenizer and native work limits;
+worker count neither renews those limits nor multiplies encoder workspace.
+
+The CLI admits the additional worker scratch exactly once and configures the
+process envelope for the selected compute width plus its runtime thread. It
+rejects invalid widths and explicit cohort/team mixtures before private IO.
+Documents remain sequential, with output rows within each projection assigned
+to the persistent team. The corpus publishes its terminal `run_complete` only
+after physical worker join; every exit path drains workers. Earlier complete
+document frames may remain after a later failure, so whole-run success still
+requires both `run_complete` and exit zero.
+
+Population output adds optional `compute_schedule` with execution
+`int4-output-row-team-v1` and `declared_compute_threads`. This describes the
+selected physical schedule; it does not invent projection counters. Width one
+omits the field and retains the existing envelope. Inner semantic result bytes,
+request identity, output caps and native work accounting remain unchanged.
+
+The durable recipe excludes numerical worker width. An explicit resume may
+therefore switch between serial execution and a valid team width while retaining
+the exact original inputs, labels, encoding, task policy, attempts and lifetime
+work debits. The distinct `--cohort-chunks` schedule remains authenticated and
+cannot be combined with multiple compute workers.
+
+Library callers use `NlpEngine::batch_int4_classification_documents_with_threads`
+or `NlpEngine::job_int4_classification_document_with_threads` for widths 2..64;
+the existing methods retain serial execution. These routes are code-first:
+added admission, lifecycle, wire and recipe regressions await DSR execution,
+and no model-parity or measured speedup result is claimed.
 
 ## Serial and native cohort execution
 

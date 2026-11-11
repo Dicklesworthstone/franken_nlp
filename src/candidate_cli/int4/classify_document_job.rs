@@ -141,6 +141,7 @@ impl JobCommand {
             classification: ClassificationArgs::from_arg_matches(matches)? };
         let mut common = Int4Args::from_arg_matches(matches)?;
         common.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+        common.compute = compute::Args::from_matches(matches)?;
         Ok((Self { mode, args }, common))
     }
     pub(super) fn run_owned<R: Read + Send + 'static>(self, args: Int4Args, input: R,

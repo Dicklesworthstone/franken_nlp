@@ -83,7 +83,9 @@ fn compact_document_teams_preserve_one_tokenizer_allowance_and_price_both_worksp
             threads, parallel.args.group_width).unwrap();
         assert_eq!(limits.common.compute.workspace_bytes, extra);
         assert_eq!(limits.common.minimum_memory_bytes, base.common.minimum_memory_bytes + extra);
-        assert!(options.validate_with_max_labels(&parallel.args, 4).is_err());
+        let population = options.validate_with_max_labels(&parallel.args, 4).unwrap();
+        assert_eq!(population.planning.max_labels, 4);
+        assert_eq!(population.common.compute.workspace_bytes, extra);
     }
     for extra in [vec!["--cohort-chunks", "1"], vec!["--save-snapshot", "must-not-create.snapshot"]] {
         let mut flags = flags.to_vec(); flags.extend(["--compute-threads", "2"]); flags.extend(extra);
@@ -101,7 +103,7 @@ fn invalid_document_team_and_cohort_composition_refuse_before_input_or_model_io(
     assert_eq!(short.execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
     let explicit_serial = command(&["--compute-threads", "1", "--cohort-chunks", "2"]);
     assert!(selected(&explicit_serial).validate_with_threads(&explicit_serial.args).is_ok());
-    assert!(!corpus::definition().get_arguments().any(|arg| arg.get_id() == "compute_threads"));
+    assert!(corpus::definition().get_arguments().any(|arg| arg.get_id() == "compute_threads"));
 }
 
 #[test]

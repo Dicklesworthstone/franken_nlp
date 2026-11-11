@@ -322,3 +322,60 @@ fn compact_population_limits_and_snapshot_mutation_refuse_before_private_io() {
     let Int4Task::ClassifyCorpus(options) = snapshot.task else { panic!("classification corpus required"); };
     assert!(options.validate(&snapshot.args).unwrap().common.snapshot_pin.is_some());
 }
+
+#[test]
+fn persistent_population_teams_preserve_document_authority_and_charge_one_workspace() {
+    for compact in [false, true] {
+        let mut flags = vec!["--preparation-mib", "8192", "--max-labels", "4"];
+        if compact { flags.extend(["--input-encoding", "safe-bpe-v1"]); }
+        let (serial, serial_args) = arguments(&flags);
+        let before = serial.validate(&serial_args).unwrap();
+        let encoding = serial.document.input_encoding(&serial_args).unwrap();
+        for threads in [2, 4, 64] {
+            let width = threads.to_string();
+            let mut selected = flags.clone(); selected.extend(["--compute-threads", &width]);
+            let (team, mut args) = arguments(&selected);
+            let after = team.validate(&args).unwrap();
+            let scratch = crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(
+                threads, args.group_width).unwrap();
+            assert_eq!(after.common.compute.threads, threads);
+            assert_eq!(after.common.compute.workspace_bytes, scratch);
+            assert_eq!(after.common.minimum_memory_bytes, before.common.minimum_memory_bytes + scratch);
+            assert_eq!(after.document.memory, before.document.memory);
+            assert_eq!(after.transport, before.transport);
+            assert_eq!(after.document.mapping.chunks, before.document.mapping.chunks);
+            assert_eq!(after.document.mapping.max_model_work, before.document.mapping.max_model_work);
+            assert_eq!(after.document.mapping.aggregation, before.document.mapping.aggregation);
+            assert_eq!(team.document.input_encoding(&args).unwrap(), encoding);
+            assert_eq!(team.document.budget(after.common, after.document.planning.max_labels).unwrap(),
+                serial.document.budget(before.common, before.document.planning.max_labels).unwrap());
+            for mode in ["exclusive", "multi_label"] {
+                let defaults = serde_json::json!({"labels":[{"id":"Billing"},{"id":"退款"}],"mode":mode}).to_string();
+                let settings = team.load_defaults(Some(&defaults), after).unwrap().unwrap();
+                let original = serial.load_defaults(Some(&defaults), before).unwrap().unwrap();
+                assert_eq!(settings.budget, original.budget);
+                assert_eq!(settings.mode, original.mode);
+                assert_eq!(settings.labels.len(), original.labels.len());
+            }
+            args.memory_mib = after.common.minimum_memory_bytes.div_ceil(MIB) - 1;
+            assert_eq!(team.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+        }
+    }
+}
+
+#[test]
+fn population_teams_reject_invalid_widths_and_explicit_cohorts_before_any_io() {
+    for flags in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+        vec!["--compute-threads", "18446744073709551615"],
+        vec!["--compute-threads", "2", "--cohort-chunks", "1"],
+        vec!["--compute-threads", "4", "--cohort-chunks", "3"]] {
+        let (options, args) = arguments(&flags);
+        assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+    let (explicit, args) = arguments(&["--compute-threads", "1", "--cohort-chunks", "3"]);
+    assert!(explicit.validate(&args).is_ok());
+    let (plain, plain_args) = arguments(&[]);
+    let (one, one_args) = arguments(&["--compute-threads", "1"]);
+    assert_eq!(plain.validate(&plain_args).unwrap().common.minimum_memory_bytes,
+        one.validate(&one_args).unwrap().common.minimum_memory_bytes);
+}

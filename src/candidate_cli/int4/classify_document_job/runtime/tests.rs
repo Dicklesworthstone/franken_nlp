@@ -51,13 +51,13 @@ fn completion_reports_only_public_model_and_durable_progress_metadata() {
     let progress = JobProgress { job_id: id, items: 2, committed: 2, attempts: 3,
         reserved_work: fixed.max_work, spool_bytes: 1024, materialized: true };
     let report = progress_report(progress, id, fixed, true, c.mode, "classify").unwrap();
-    let response = Response { protocol: "fnlp-candidate-int4-classify-document-job-v1", schema_version: 1,
+    let mut response = Response { protocol: "fnlp-candidate-int4-classify-document-job-v1", schema_version: 1,
         scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "classify",
         durable_unit: "complete_original_document", model_id: "Nanbeige4.2-3B",
         source_revision: "public-revision", source_root_sha256: "public-source", model_content_sha256: "public-model",
         candidate_format: "candidate-int4", quant_recipe: "strict-int4", group_width: args.group_width,
         integer_kernel: map.common.kernel.kind().id(), snapshot: None, cohort_chunks: Some(3),
-        input_encoding: None, output: &report };
+        input_encoding: None, compute_schedule: None, output: &report };
     let mut bytes = Vec::new(); publish_report(&response, &mut bytes, &available).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["durable_unit"], "complete_original_document"); assert_eq!(value["cohort_chunks"], 3);
@@ -67,6 +67,16 @@ fn completion_reports_only_public_model_and_durable_progress_metadata() {
         assert!(value.get(forbidden).is_none()); assert!(value["output"].get(forbidden).is_none());
     }
     assert!(bytes.ends_with(b"\n"));
+    assert!(value.get("compute_schedule").is_none());
+    response.cohort_chunks = None;
+    for threads in [2, 4, 64] {
+        response.compute_schedule = compute::Schedule::for_threads(threads);
+        let scheduled = serde_json::to_value(&response).unwrap();
+        assert_eq!(scheduled["compute_schedule"], serde_json::json!({
+            "execution":"int4-output-row-team-v1", "declared_compute_threads":threads }));
+        assert_eq!(scheduled["output"], value["output"]);
+        assert!(scheduled.get("cohort_chunks").is_none());
+    }
 }
 
 fn available() -> Result<Duration, CandidateError> { Ok(Duration::from_secs(1)) }
@@ -99,4 +109,44 @@ fn flush_failure_or_a_deadline_during_delivery_never_reports_success() {
     let mut bytes = Vec::new();
     assert_eq!(publish_report(&true, &mut bytes, &deadline).unwrap_err().exit, ErrorCode::BudgetOrTimeout);
     assert_eq!(bytes, b"true\n"); assert_eq!(checks.get(), 3);
+}
+
+#[test]
+fn changing_team_width_preserves_authenticated_recipe_and_native_lifetime_on_resume() {
+    use crate::native_engine::strict_int4::weights::projection_fixture;
+    let (weights, _) = projection_fixture(128);
+    for mode in ["exclusive", "multi_label"] {
+        let settings = serde_json::json!({"labels":[{"id":"Billing"},{"id":"退款"}],"mode":mode}).to_string();
+        let mut recipes = Vec::new();
+        for compact in [false, true] {
+            let mut expected = None;
+            for operation in ["start", "resume"] {
+                for threads in [1, 2, 4, 64] {
+                    let width = threads.to_string();
+                    let mut flags = vec!["--compute-threads", &width];
+                    if compact { flags.extend(["--input-encoding", "safe-bpe-v1"]); }
+                    let (command, args) = command(operation, &flags);
+                    let map = command.args.validate(&args).unwrap();
+                    let fixed = lifetime(&args, map);
+                    let limits = command.args.lifetime_limits(&args, map, fixed).unwrap();
+                    let budget = command.args.map.budget(map.common, map.planning.max_labels).unwrap();
+                    let private = command.args.load_settings(&settings, budget, &args, map).unwrap();
+                    let compiler = Int4ClassificationPlanner::for_model(weights.identity(), budget, map.planning)
+                        .unwrap().with_document_encoding(command.args.map.input_encoding(&args).unwrap()).unwrap();
+                    let planner = Int4ClassificationDocumentJobPlanner::new(compiler, private, map.mapping, fixed).unwrap();
+                    planner.check_job_limits(fixed).unwrap();
+                    let semantic = (crate::canonjson::canonical_bytes(planner.job_recipe()).unwrap(),
+                        crate::canonjson::canonical_bytes(planner.execution_identity()).unwrap(),
+                        fixed.max_work, limits.buffer_bytes);
+                    if let Some(expected) = &expected { assert_eq!(&semantic, expected); }
+                    else { expected = Some(semantic); }
+                    let config = compute::resource_config(map.common);
+                    assert_eq!(config.scoped_cpu_children_per_coordinator, threads - 1);
+                    assert_eq!(config.thread_ceiling, threads + 1);
+                }
+            }
+            recipes.push(expected.unwrap().0);
+        }
+        assert_ne!(recipes[0], recipes[1], "compact policy remains authenticated even though worker width is not");
+    }
 }

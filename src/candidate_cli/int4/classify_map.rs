@@ -80,17 +80,17 @@ pub(super) fn one_off_definition() -> clap::Command {
 }
 
 pub(super) fn population_definition(command: clap::Command) -> clap::Command {
-    MapEncodingArgs::augment_args(input_encoding::definition(command))
-        .after_long_help("Explicit compact input preserves exact source and label bytes and excludes template controls while compacting ordinary text. ONE fixed tokenizer allowance covers each complete document operation, including initial preparation, all sizing probes, every label/chunk plan and execution reconstruction. --max-tokenizer-input-bytes and --max-tokenizer-output-tokens default to 1048576 each; the pair-work flags cover the same operation. No chunk, head or reconstruction renews these limits. Each original document receives a separate allowance; an explicit resumed attempt may prepare again, while durable native-work counters and attempts retain their lifetime scope. The policy and every ceiling authenticate retained jobs. input_encoding.work on each completed result reports its final deterministic planning pass, not the sum of both passes. Encoder workspace is admitted once beside retained plans. Serial and native chunk cohorts are supported. Compact populations accept pinned sources or snapshot reload but refuse --save-snapshot. Byte-mode recipe and result bytes remain unchanged. Compact input changes prompt tokens and makes no output-parity, quality or speed claim.")
+    compute::definition(MapEncodingArgs::augment_args(input_encoding::definition(command)))
+        .after_long_help("Explicit compact input preserves exact source and label bytes and excludes template controls while compacting ordinary text. ONE fixed tokenizer allowance covers each complete document operation, including initial preparation, all sizing probes, every label/chunk plan and execution reconstruction. --max-tokenizer-input-bytes and --max-tokenizer-output-tokens default to 1048576 each; the pair-work flags cover the same operation. No chunk, head or reconstruction renews these limits. Each original document receives a separate allowance; an explicit resumed attempt may prepare again, while durable native-work counters and attempts retain their lifetime scope. The policy and every ceiling authenticate retained jobs. input_encoding.work on each completed result reports its final deterministic planning pass, not the sum of both passes. Encoder workspace is admitted once beside retained plans. Serial and native chunk cohorts are supported. --compute-threads N instead keeps one persistent numerical output-row team across the complete stream or durable invocation, including every chunk and label head. Width 1 preserves serial execution; widths 2..64 admit worker scratch and process thread capacity before private IO. Multiple workers cannot combine with --cohort-chunks. Byte and compact modes retain their original task, tokenizer and lifetime work allowances. Workers join before terminal run_complete or successful job progress is published. compute_schedule reports only the physical width; durable recipes exclude it, so explicit resume can change width without renewing work. Compact populations accept pinned sources or snapshot reload but refuse --save-snapshot. Byte-mode recipe and result bytes remain unchanged. Compact input changes prompt tokens and makes no output-parity, quality or speed claim.")
 }
 
-/// Only the complete one-document command owns a persistent row team. Its
-/// explicit input policy and tokenizer allowance remain independent of width.
+/// One complete document owns a persistent row team. Its explicit input
+/// policy and tokenizer allowance remain independent of physical width.
 pub(super) fn threaded_definition() -> clap::Command {
     let command = one_off_definition();
     let encoding_help = command.get_after_long_help().map(|help| help.to_string()).unwrap_or_default();
     compute::definition(command).after_long_help(format!(
-        "{encoding_help}\n\n--compute-threads N keeps one admitted output-row team across every chunk and label head. It supports byte-fallback and safe-bpe-v1 with the same complete-document tokenizer and native work ceilings. Actual projection counters are reported separately in compute. Cannot combine with --cohort-chunks; corpus and durable-job routes retain their existing schedules."))
+        "{encoding_help}\n\n--compute-threads N keeps one admitted output-row team across every chunk and label head. It supports byte-fallback and safe-bpe-v1 with the same complete-document tokenizer and native work ceilings. Actual projection counters are reported separately in compute. Cannot combine with --cohort-chunks. Corpus and durable-job commands expose a team spanning their complete invocation."))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -114,13 +114,11 @@ impl MapArgs {
         if args.compute.threads() != 1 { return Err(CandidateError::Arguments); }
         self.validate_encoding(args, 128)
     }
-    /// A live corpus may narrow label authority for every default and override.
-    /// Existing one-off and durable workflows keep their original ceiling.
+    /// Population routes explicitly admit persistent row teams. A live corpus
+    /// may narrow label authority for every default and override; physical
+    /// width never changes labels, task budgets or tokenizer allowances.
     pub(super) fn validate_with_max_labels(self, args: &Int4Args, max_labels: usize)
         -> Result<MapLimits, CandidateError> {
-        if args.compute.threads() != 1 {
-            return Err(CandidateError::Arguments);
-        }
         self.validate_encoding(args, max_labels)
     }
     fn validate_with_threads(self, args: &Int4Args) -> Result<MapLimits, CandidateError> {

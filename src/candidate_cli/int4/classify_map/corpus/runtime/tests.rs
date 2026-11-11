@@ -87,7 +87,7 @@ fn candidate_frames_preserve_complete_native_record_bytes_and_private_paths_stay
     let need = Int4SnapshotRequirements::for_group_width(128).unwrap();
     for (operation, cohort_chunks) in [(None, None), (Some("saved"), None), (Some("loaded"), None),
         (None, Some(1)), (Some("saved"), Some(4)), (Some("loaded"), Some(4))] {
-        let provenance = Provenance {
+        let mut provenance = Provenance {
             protocol: "fnlp-candidate-int4-classify-corpus-v1", schema_version: 1,
             scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "classify",
             classification_mode: "complete_document", chunk_schedule: chunk_schedule(cohort_chunks), cohort_chunks,
@@ -96,7 +96,7 @@ fn candidate_frames_preserve_complete_native_record_bytes_and_private_paths_stay
             candidate_format: "fixture-format", quant_recipe: "fixture-recipe:group=128",
             group_width: 128, integer_kernel: "s_scalar_i32",
             snapshot: operation.map(|name| SnapshotRecord::new(name, need)),
-            input_encoding: None,
+            input_encoding: None, compute_schedule: None,
         };
         // These bytes test framing, not fabricated native model behavior.
         let inner = "{\"event\":\"fixture\",\"result\":{\"chunks\":[{\"label\":\"café 上海\"}],\"single_context_equivalence\":false,\"exact\":12345678901234567890123456789012345678}}\n";
@@ -118,6 +118,7 @@ fn candidate_frames_preserve_complete_native_record_bytes_and_private_paths_stay
             assert!(value.get("cohort_chunks").is_none(), "serial provenance stays wire-compatible");
         }
         assert_eq!(value["evidence"], "non_authoritative");
+        assert!(value.get("compute_schedule").is_none());
         assert_eq!(value["record"]["result"]["single_context_equivalence"], false);
         if let Some(operation) = operation {
             assert_eq!(value["snapshot"]["operation"], operation);
@@ -129,6 +130,22 @@ fn candidate_frames_preserve_complete_native_record_bytes_and_private_paths_stay
             assert!(value.get(absent).is_none());
         }
         assert!(matches!(CandidateWriter::new(NoIo, &provenance, 4096, 1), Err(CandidateError::Output)));
+        if cohort_chunks.is_none() {
+            for threads in [2, 4, 64] {
+                provenance.compute_schedule = compute::Schedule::for_threads(threads);
+                let mut threaded = Vec::new();
+                {
+                    let mut writer = CandidateWriter::new(&mut threaded, &provenance, 4096, 8192).unwrap();
+                    writer.write_all(inner.as_bytes()).unwrap(); writer.flush().unwrap();
+                }
+                let scheduled: serde_json::Value = serde_json::from_slice(&threaded).unwrap();
+                assert_eq!(scheduled["compute_schedule"], serde_json::json!({
+                    "execution":"int4-output-row-team-v1", "declared_compute_threads":threads }));
+                assert_eq!(scheduled["record"], value["record"]);
+                assert!(std::str::from_utf8(&threaded).unwrap()
+                    .ends_with(&format!("\"record\":{}}}\n", inner.trim_end_matches('\n'))));
+            }
+        }
     }
 }
 
@@ -329,5 +346,33 @@ fn compact_host_quote_includes_exactly_one_reused_encoder_workspace() {
             + retained_metadata_bytes(limits.document.mapping.chunks.max_chunks).unwrap());
         assert_eq!(quote.native, limits.document.memory.native);
         assert_eq!(quote.output_reservation_bytes, limits.document.memory.output_reservation_bytes);
+    }
+}
+
+#[test]
+fn team_process_envelope_and_native_quotes_are_rechecked_before_private_io() {
+    for compact in [false, true] {
+        let mut flags = vec!["--compute-threads", "4", "--max-labels", "4"];
+        if compact { flags.extend(["--input-encoding", "safe-bpe-v1"]); }
+        let parsed = command(&flags);
+        let Int4Task::ClassifyCorpus(mut options) = parsed.task else { panic!("classification corpus required"); };
+        let args = parsed.args;
+        let limits = options.validate(&args).unwrap();
+        let config = compute::resource_config(limits.common);
+        assert_eq!(config.scoped_cpu_children_per_coordinator, 3);
+        assert_eq!(config.thread_ceiling, 5);
+        let task = options.document.budget(limits.common, limits.document.planning.max_labels).unwrap();
+        let host = host_limits(&args, limits, Duration::from_secs(30));
+        let quote = memory_quote(args.group_width, task, limits, host, None,
+            &options.document.input_encoding(&args).unwrap()).unwrap();
+        assert_eq!(quote.native, limits.document.memory.native);
+        assert_eq!(quote.workspace_bytes, limits.document.memory.workspace_bytes);
+        let execution = quote.native.kv_bytes + quote.workspace_bytes + quote.input_bytes
+            + quote.output_reservation_bytes + limits.common.compute.workspace_bytes;
+        let resident = limits.common.load.weight_payload_bytes + ALLOCATOR_BYTES;
+        assert!(limits.cli_preparation_bytes + resident + execution + CLEANUP_BYTES
+            <= limits.common.minimum_memory_bytes);
+        options.document.mapping.cohort_chunks = Some(1);
+        assert_eq!(execute(args, options, limits, NoIo, NoIo), Err(CandidateError::Arguments));
     }
 }

@@ -226,3 +226,56 @@ fn owned_root_dispatch_cannot_fall_through_to_single_document_execution() {
         assert!(parse(words).is_err());
     }
 }
+
+#[test]
+fn persistent_job_teams_preserve_lifetime_work_and_compact_policy_on_every_resume_mode() {
+    for (operation, replay) in [("start", false), ("resume", false), ("resume", true)] {
+        for compact in [false, true] {
+            let mut flags = vec!["--preparation-mib", "8192"];
+            if compact { flags.extend(["--input-encoding", "safe-bpe-v1"]); }
+            if replay { flags.push("--use-retained-input"); }
+            let (serial, serial_args) = command(operation, &flags);
+            let before = serial.args.validate(&serial_args).unwrap();
+            let fixed = lifetime(&serial_args, before);
+            let original = serial.args.lifetime_limits(&serial_args, before, fixed).unwrap();
+            for threads in [2, 4, 64] {
+                let width = threads.to_string();
+                let mut selected = flags.clone(); selected.extend(["--compute-threads", &width]);
+                let (team, mut args) = command(operation, &selected);
+                let after = team.args.validate(&args).unwrap();
+                let scratch = crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(
+                    threads, args.group_width).unwrap();
+                assert_eq!(after.common.compute.threads, threads);
+                assert_eq!(after.common.compute.workspace_bytes, scratch);
+                assert_eq!(after.common.minimum_memory_bytes, before.common.minimum_memory_bytes + scratch);
+                assert_eq!(after.memory, before.memory);
+                assert_eq!(after.mapping.chunks, before.mapping.chunks);
+                assert_eq!(after.mapping.max_model_work, before.mapping.max_model_work);
+                assert_eq!(after.mapping.aggregation, before.mapping.aggregation);
+                assert_eq!(team.args.map.input_encoding(&args).unwrap(),
+                    serial.args.map.input_encoding(&serial_args).unwrap());
+                let resumed = team.args.lifetime_limits(&args, after, fixed).unwrap();
+                assert_eq!(resumed.buffer_bytes, original.buffer_bytes);
+                assert_eq!(resumed.map.common.minimum_memory_bytes,
+                    original.map.common.minimum_memory_bytes + scratch);
+                args.memory_mib = after.common.minimum_memory_bytes.div_ceil(MIB) - 1;
+                assert_eq!(team.execute_owned(args, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+            }
+        }
+    }
+}
+
+#[test]
+fn persistent_job_teams_refuse_mixed_schedules_before_storage_or_population_access() {
+    for operation in ["start", "resume"] {
+        for flags in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+            vec!["--compute-threads", "18446744073709551615"],
+            vec!["--compute-threads", "2", "--cohort-chunks", "1"],
+            vec!["--compute-threads", "4", "--cohort-chunks", "3"]] {
+            let (job, args) = command(operation, &flags);
+            assert_eq!(job.execute_owned(args, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+        }
+        let (job, args) = command(operation, &["--compute-threads", "1", "--cohort-chunks", "3"]);
+        assert!(job.args.validate(&args).is_ok());
+    }
+}

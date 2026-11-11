@@ -1424,7 +1424,13 @@ qualification remain pending the repository-required DSR checkpoint.
 
 `fnlp candidate source-int4 classify-corpus` applies complete-document
 classification to ordered `{id,text,task_args?}` NDJSON while retaining one
-grouped-INT4 model for the entire stream. Each document is
+grouped-INT4 model for the entire stream. Add `--compute-threads N` to keep one
+persistent numerical output-row team across every document, chunk, label head
+and flush. Widths 2..64 admit worker scratch once before private IO; width one
+preserves serial execution. Teams support byte fallback and explicit compact
+input, and cannot combine with `--cohort-chunks`. Terminal `run_complete`
+follows physical worker join. Optional `compute_schedule` provenance records
+the declared width without changing inner result bytes or work allowances. Each document is
 losslessly partitioned according to its exact label prompts and context
 capacity. Every chunk is planned before that document's first native forward;
 the completed result retains the original byte/scalar spans, complete chunk
@@ -1645,7 +1651,12 @@ classification results for complete original documents, including documents
 requiring multiple native contexts. Each source is one durable item: every
 chunk must finish before its map and scalar-weighted aggregate can commit.
 It supports exclusive and independent multi-label decisions, with serial
-execution or explicit `--cohort-chunks N` windows.
+execution, a persistent numerical team selected by `--compute-threads N`, or
+explicit `--cohort-chunks N` windows. Numerical teams span the complete
+invocation and cannot combine with chunk cohorts. Their width is excluded from
+the authenticated recipe, so an explicit resume may change physical width
+without renewing attempts or lifetime work. Workers join before successful
+progress is published; byte and compact input keep their existing policies.
 
 Provide fixed `--defaults labels.json`, the complete original
 `{id,text,task_args?}` NDJSON population on every invocation, and the existing
