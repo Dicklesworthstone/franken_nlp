@@ -250,10 +250,11 @@ impl<A: Int4ClassificationDocumentBatchAdmission> BatchProcessor for NativeInt4C
                 .map_err(|e| map_failure(e, true))?;
             match &output {
                 Int4ClassificationDocumentRun::Serial(run) if self.compiler.cohort_chunks().is_none() =>
-                    prepared.expected.verify_completed(run).map_err(|e| map_failure(e, true))?,
+                    prepared.expected.verify_completed_with_control(run, control).map_err(|e| map_failure(e, true))?,
                 Int4ClassificationDocumentRun::Cohorts(run) => {
                     let chunks = self.compiler.cohort_chunks().ok_or_else(|| BatchItemFailure::fatal(BatchCode::Admission))?;
-                    prepared.expected.verify_completed_cohorts(run, chunks).map_err(|e| map_failure(e, true))?;
+                    prepared.expected.verify_completed_cohorts_with_control(run, chunks, control)
+                        .map_err(|e| map_failure(e, true))?;
                 }
                 _ => return Err(BatchItemFailure::fatal(BatchCode::Admission)),
             }

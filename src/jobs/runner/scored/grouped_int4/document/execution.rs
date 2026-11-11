@@ -98,11 +98,11 @@ impl<A: Int4ClassificationDocumentBatchAdmission> BatchProcessor for Int4Classif
         let output = self.backend.execute(self.planner, &plan, &admitted, control)?;
         match &output {
             Int4ClassificationDocumentRun::Serial(run) if !self.planner.uses_chunk_cohorts() =>
-                prepared.expected.verify_completed(run).map_err(map_failure)?,
+                prepared.expected.verify_completed_with_control(run, control).map_err(map_failure)?,
             Int4ClassificationDocumentRun::Cohorts(run) => {
                 let chunks = self.planner.cohort_chunks()
                     .ok_or_else(|| BatchItemFailure::fatal(BatchCode::Admission))?;
-                prepared.expected.verify_completed_cohorts(run, chunks).map_err(map_failure)?;
+                prepared.expected.verify_completed_cohorts_with_control(run, chunks, control).map_err(map_failure)?;
             }
             _ => return Err(BatchItemFailure::fatal(BatchCode::Admission)),
         }

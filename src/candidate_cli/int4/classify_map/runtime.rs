@@ -27,6 +27,9 @@ fn stopped(cause: DecodeCancellationKind) -> CandidateError {
 fn planning_error(error: Int4ClassificationMapError) -> CandidateError {
     error.cancellation().map(stopped).unwrap_or(CandidateError::Planning)
 }
+fn completion_error(error: Int4ClassificationMapError) -> CandidateError {
+    error.cancellation().map(stopped).unwrap_or(CandidateError::Execution)
+}
 fn classification_error(error: Int4ClassificationError) -> CandidateError {
     error.cancellation().map(stopped).unwrap_or(CandidateError::Planning)
 }
@@ -153,7 +156,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
             encoding, common.kernel, cancellation)
             .map_err(|error| host_error(error, CandidateError::Execution))?;
         if let Some(expected) = expected {
-            expected.verify_completed_cohorts(result.result(), chunks).map_err(|_| CandidateError::Execution)?;
+            expected.verify_completed_cohorts_with_control(result.result(), chunks,
+                &mut DeadlineControl { started, deadline }).map_err(completion_error)?;
         }
         let run = result.result();
         let cohort = Cohort { schema_version: run.schema_version, execution: &run.execution,
@@ -166,7 +170,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
             common.kernel, common.compute.threads, cancellation)
             .map_err(|error| host_error(error, CandidateError::Execution))?;
         if let Some(expected) = expected {
-            expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+            expected.verify_completed_with_control(result.result(),
+                &mut DeadlineControl { started, deadline }).map_err(completion_error)?;
         }
         let response = Response { provenance: &provenance, output: result.result(), cohort: None };
         publish_complete(&compute::Response { response: &response, compute: Some(result.compute()) },
@@ -175,7 +180,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         let result = engine.map_int4_classify_with_encoding(&model, request, config, encoding, common.kernel, cancellation)
             .map_err(|error| host_error(error, CandidateError::Execution))?;
         if let Some(expected) = expected {
-            expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+            expected.verify_completed_with_control(result.result(),
+                &mut DeadlineControl { started, deadline }).map_err(completion_error)?;
         }
         publish_complete(&Response { provenance: &provenance, output: result.result(), cohort: None },
             limits.envelope_bytes, output, &remaining)
@@ -190,13 +196,54 @@ fn publish_complete<T: Serialize>(value: &T, cap: usize, output: &mut impl Write
     remaining()?;
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(cap).map_err(|_| CandidateError::Memory)?;
-    let mut stage = BoundedOutput { bytes, cap };
-    serde_json::to_writer(&mut stage, value).map_err(|_| CandidateError::Output)?;
-    stage.write_all(b"\n").map_err(|_| CandidateError::Output)?;
+    let mut stage = CompletionOutput { inner: BoundedOutput { bytes, cap }, remaining,
+        until_checkpoint: COMPLETION_CHECKPOINT_BYTES, failure: None };
+    if serde_json::to_writer(&mut stage, value).is_err() {
+        return Err(stage.failure.unwrap_or(CandidateError::Output));
+    }
+    if stage.write_all(b"\n").is_err() {
+        return Err(stage.failure.unwrap_or(CandidateError::Output));
+    }
     remaining()?;
-    output.write_all(&stage.bytes).and_then(|()| output.flush()).map_err(|_| CandidateError::Output)?;
+    output.write_all(&stage.inner.bytes).and_then(|()| output.flush()).map_err(|_| CandidateError::Output)?;
     remaining()?;
     Ok(())
+}
+
+const COMPLETION_CHECKPOINT_BYTES: usize = 64 * 1024;
+
+/// Staging remains private until complete. A large string serializer may
+/// issue one write, so split its copy/check interval without renewing time.
+struct CompletionOutput<'a, F> {
+    inner: BoundedOutput,
+    remaining: &'a F,
+    until_checkpoint: usize,
+    failure: Option<CandidateError>,
+}
+impl<F: Fn() -> Result<Duration, CandidateError>> Write for CompletionOutput<'_, F> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.failure.is_some() { return Err(io::Error::other("classification completion stopped")); }
+        if bytes.len() > self.inner.cap - self.inner.bytes.len() {
+            self.failure = Some(CandidateError::Output);
+            return Err(io::Error::other("classification completion output limit"));
+        }
+        let mut offset = 0;
+        while offset < bytes.len() {
+            if self.until_checkpoint == 0 {
+                if let Err(error) = (self.remaining)() {
+                    self.failure = Some(error);
+                    return Err(io::Error::other("classification completion deadline"));
+                }
+                self.until_checkpoint = COMPLETION_CHECKPOINT_BYTES;
+            }
+            let count = self.until_checkpoint.min(bytes.len() - offset);
+            self.inner.write_all(&bytes[offset..offset + count])?;
+            self.until_checkpoint -= count;
+            offset += count;
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
 }
 
 #[derive(Serialize)]

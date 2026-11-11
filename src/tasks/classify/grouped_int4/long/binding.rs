@@ -19,7 +19,7 @@ pub(super) fn request<C: DecodeStepControl>(request: &ClassificationRequest,
     if chunks.chunks().len() != plans.len() { return Err(Int4ClassificationMapError::Admission); }
     // Source, label and plan sizes have already passed their finite declared
     // ceilings. Streaming avoids a second source-sized serialization buffer.
-    let mut writer = RequestDigest::new(b"fnlp-int4-classification-map-request-v1", control);
+    let mut writer = ControlledDigest::new(b"fnlp-int4-classification-map-request-v1", u64::MAX, control);
     writer.value(request)?;
     writer.value(&(limits.chunks, limits.max_model_work, limits.max_retained_result_bytes,
         limits.max_result_bytes, limits.aggregation, encoding, work))?;
@@ -40,22 +40,34 @@ pub(super) fn request<C: DecodeStepControl>(request: &ClassificationRequest,
     Ok(writer.finish())
 }
 
+#[cfg(test)]
 pub(super) fn result(run: &Int4ClassificationMapRun, cap: u64)
     -> Result<[u8; 32], Int4ClassificationMapError> {
-    let mut writer = PrivateDigest::new(b"fnlp-int4-classification-map-result-v1", cap);
-    writer.seal(&run.request_binding);
+    result_with_control(run, cap, &mut Continue)
+}
+pub(super) fn result_with_control<C: DecodeStepControl>(run: &Int4ClassificationMapRun, cap: u64,
+    control: &mut C) -> Result<[u8; 32], Int4ClassificationMapError> {
+    let mut writer = ControlledDigest::new(b"fnlp-int4-classification-map-result-v1", cap, control);
+    writer.inner.seal(&run.request_binding);
     writer.value(run)?;
+    writer.checkpoint()?;
     Ok(writer.finish())
 }
+#[cfg(test)]
 pub(super) fn cohort(run: &Int4ClassificationMapCohortRun, cap: u64)
     -> Result<[u8; 32], Int4ClassificationMapError> {
-    let mut writer = PrivateDigest::new(b"fnlp-int4-classification-map-cohort-result-v1", cap);
+    cohort_with_control(run, cap, &mut Continue)
+}
+pub(super) fn cohort_with_control<C: DecodeStepControl>(run: &Int4ClassificationMapCohortRun, cap: u64,
+    control: &mut C) -> Result<[u8; 32], Int4ClassificationMapError> {
+    let mut writer = ControlledDigest::new(b"fnlp-int4-classification-map-cohort-result-v1", cap, control);
     // Two different requests may legitimately produce identical public JSON.
     // Replacing the public `output` owner must not carry unrelated physical
     // completion facts into that other request's otherwise valid preflight.
-    writer.seal(&run.output.request_binding);
-    writer.seal(&run.output.result_binding);
+    writer.inner.seal(&run.output.request_binding);
+    writer.inner.seal(&run.output.result_binding);
     writer.value(run)?;
+    writer.checkpoint()?;
     Ok(writer.finish())
 }
 
@@ -81,6 +93,7 @@ impl PrivateDigest {
         // never passes through Serialize or Debug.
         self.hash.update(binding); self.hash.update([0]);
     }
+    #[cfg(test)]
     fn value(&mut self, value: &(impl Serialize + ?Sized)) -> Result<(), Int4ClassificationMapError> {
         if serde_json::to_writer(&mut *self, value).is_err() {
             return Err(if self.exceeded { Int4ClassificationMapError::Output }
@@ -103,20 +116,20 @@ impl std::io::Write for PrivateDigest {
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
-const REQUEST_CHECKPOINT_BYTES: usize = 64 * 1024;
+const CHECKPOINT_BYTES: usize = 64 * 1024;
 
-/// Request strings can expand during escaping. Poll on serialized-byte
+/// Private strings can expand during escaping. Poll on serialized-byte
 /// progress, including within a single large serde write, while keeping the
 /// original stream/hash unchanged and never allocating a serialized copy.
-struct RequestDigest<'a, C> {
+struct ControlledDigest<'a, C> {
     inner: PrivateDigest,
     control: &'a mut C,
     until_checkpoint: usize,
     cancelled: Option<DecodeCancellationKind>,
 }
-impl<'a, C: DecodeStepControl> RequestDigest<'a, C> {
-    fn new(domain: &[u8], control: &'a mut C) -> Self {
-        Self { inner: PrivateDigest::new(domain, u64::MAX), control,
+impl<'a, C: DecodeStepControl> ControlledDigest<'a, C> {
+    fn new(domain: &[u8], cap: u64, control: &'a mut C) -> Self {
+        Self { inner: PrivateDigest::new(domain, cap), control,
             until_checkpoint: 0, cancelled: None }
     }
     fn checkpoint(&mut self) -> Result<(), Int4ClassificationMapError> {
@@ -124,7 +137,7 @@ impl<'a, C: DecodeStepControl> RequestDigest<'a, C> {
         if let Some(cause) = self.cancelled {
             return Err(ClassificationPlanningError::Cancelled(cause).into());
         }
-        self.until_checkpoint = REQUEST_CHECKPOINT_BYTES;
+        self.until_checkpoint = CHECKPOINT_BYTES;
         Ok(())
     }
     fn value(&mut self, value: &(impl Serialize + ?Sized)) -> Result<(), Int4ClassificationMapError> {
@@ -140,12 +153,12 @@ impl<'a, C: DecodeStepControl> RequestDigest<'a, C> {
     }
     fn finish(self) -> [u8; 32] { self.inner.finish() }
 }
-impl<C: DecodeStepControl> std::io::Write for RequestDigest<'_, C> {
+impl<C: DecodeStepControl> std::io::Write for ControlledDigest<'_, C> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         let mut written = 0;
         while written < bytes.len() {
             if self.until_checkpoint == 0 {
-                self.checkpoint().map_err(|_| std::io::Error::other("INT4 classification request binding cancelled"))?;
+                self.checkpoint().map_err(|_| std::io::Error::other("INT4 classification binding cancelled"))?;
             }
             let count = self.until_checkpoint.min(bytes.len() - written);
             std::io::Write::write(&mut self.inner, &bytes[written..written + count])?;
@@ -155,6 +168,11 @@ impl<C: DecodeStepControl> std::io::Write for RequestDigest<'_, C> {
         Ok(written)
     }
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+pub(super) struct Continue;
+impl DecodeStepControl for Continue {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }
 }
 
 #[cfg(test)]
@@ -170,15 +188,15 @@ mod tests {
                 (self.checks == 2).then_some(self.cause)
             }
         }
-        let source = "x".repeat(3 * REQUEST_CHECKPOINT_BYTES);
+        let source = "x".repeat(3 * CHECKPOINT_BYTES);
         use DecodeCancellationKind::*;
         for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
             ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
             let mut control = Stop { checks: 0, cause };
-            let mut writer = RequestDigest::new(b"request-cancellation-test", &mut control);
+            let mut writer = ControlledDigest::new(b"request-cancellation-test", u64::MAX, &mut control);
             let error = writer.value(&source).err().unwrap();
             assert_eq!(error.cancellation(), Some(cause));
-            assert_eq!(writer.inner.remaining, u64::MAX - REQUEST_CHECKPOINT_BYTES as u64);
+            assert_eq!(writer.inner.remaining, u64::MAX - CHECKPOINT_BYTES as u64);
             drop(writer);
             assert_eq!(control.checks, 2);
         }
@@ -187,7 +205,7 @@ mod tests {
             fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }
         }
         let mut control = KeepGoing;
-        let mut writer = RequestDigest::new(b"request-cancellation-test", &mut control);
+        let mut writer = ControlledDigest::new(b"request-cancellation-test", u64::MAX, &mut control);
         writer.value(&source).unwrap();
         assert_eq!(writer.finish(), digest(b"request-cancellation-test", &source, u64::MAX).unwrap());
     }

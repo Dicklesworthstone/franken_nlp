@@ -220,3 +220,90 @@ fn fingerprints_stay_private_and_result_hashing_enforces_the_complete_byte_cap()
     }
     assert!(matches!(seals::digest(b"refusal", &Refuse, u64::MAX), Err(Int4ClassificationMapError::Serialization)));
 }
+
+struct CompletionControl { checks: usize, stop: usize, cause: DecodeCancellationKind }
+impl DecodeStepControl for CompletionControl {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+        self.checks += 1;
+        (self.checks == self.stop).then_some(self.cause)
+    }
+}
+
+#[test]
+fn complete_verification_preserves_every_cancellation_cause_through_the_last_check() {
+    let request = source(ClassificationMode::MultiLabel); let plan = prepare(&request, mapping()).unwrap();
+    let expected = plan.preflight_metadata(); let serial = finish(&plan).unwrap(); let grouped = cohorts(&plan);
+    let before = serde_json::to_vec(&serial).unwrap();
+    use DecodeCancellationKind::*;
+    for cohort in [false, true] {
+        let verify = |control: &mut CompletionControl| {
+            if cohort { expected.verify_completed_cohorts_with_control(&grouped, 2, control) }
+            else { expected.verify_completed_with_control(&serial, control) }
+        };
+        let mut count = CompletionControl { checks: 0, stop: usize::MAX, cause: User };
+        verify(&mut count).unwrap();
+        assert!(count.checks > 8, "hash, chunk walks and both sizing phases are controlled");
+        for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+            ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+            for stop in [1, 2, count.checks / 2, count.checks - 1, count.checks] {
+                let mut control = CompletionControl { checks: 0, stop, cause };
+                assert_eq!(verify(&mut control).unwrap_err().cancellation(), Some(cause));
+                assert_eq!(control.checks, stop, "the original stop is terminal");
+            }
+        }
+    }
+    expected.verify_completed(&serial).unwrap(); expected.verify_completed_cohorts(&grouped, 2).unwrap();
+    assert_eq!(serde_json::to_vec(&serial).unwrap(), before);
+}
+
+#[test]
+fn large_complete_payload_hashes_stop_inside_a_single_serializer_write() {
+    let request = source(ClassificationMode::Exclusive); let plan = prepare(&request, mapping()).unwrap();
+    let expected = plan.preflight_metadata(); let mut serial = finish(&plan).unwrap(); let mut grouped = cohorts(&plan);
+    // A substituted public payload still enters the bounded private seal
+    // check before it can be rejected for association or execution metadata.
+    serial.execution = "x".repeat(3 * 64 * 1024);
+    grouped.execution = serial.execution.clone();
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let mut control = CompletionControl { checks: 0, stop: 3, cause };
+        assert_eq!(expected.verify_completed_with_control(&serial, &mut control).unwrap_err().cancellation(), Some(cause));
+        assert_eq!(control.checks, 3);
+        let mut control = CompletionControl { checks: 0, stop: 3, cause };
+        assert_eq!(expected.verify_completed_cohorts_with_control(&grouped, 2, &mut control)
+            .unwrap_err().cancellation(), Some(cause));
+        assert_eq!(control.checks, 3);
+    }
+}
+
+#[test]
+fn controlled_seals_preserve_legacy_bytes_and_canonical_size_refusals() {
+    let request = source(ClassificationMode::Exclusive); let plan = prepare(&request, mapping()).unwrap();
+    let serial = finish(&plan).unwrap(); let grouped = cohorts(&plan);
+    let wire = serde_json::to_vec(&serial).unwrap();
+    let mut legacy = Sha256::new(); legacy.update(b"fnlp-int4-classification-map-result-v1\0");
+    legacy.update(serial.request_binding); legacy.update([0]); legacy.update(&wire); legacy.update([0]);
+    let legacy: [u8; 32] = legacy.finalize().into();
+    assert_eq!(serial.result_binding, legacy);
+    assert_eq!(seals::result_with_control(&serial, wire.len() as u64, &mut Continue).unwrap(), legacy);
+    let cohort_wire = serde_json::to_vec(&grouped).unwrap();
+    let mut legacy = Sha256::new(); legacy.update(b"fnlp-int4-classification-map-cohort-result-v1\0");
+    legacy.update(grouped.output.request_binding); legacy.update([0]);
+    legacy.update(grouped.output.result_binding); legacy.update([0]);
+    legacy.update(&cohort_wire); legacy.update([0]);
+    let legacy: [u8; 32] = legacy.finalize().into();
+    assert_eq!(seals::cohort_with_control(&grouped, cohort_wire.len() as u64, &mut Continue).unwrap(), legacy);
+    assert!(grouped.binding_matches_with_control(cohort_wire.len() as u64, &mut Continue).unwrap());
+    let size = canonjson::canonical_bytes(&serial).unwrap().len() as u64;
+    assert_eq!(value_bytes_with_control(&serial, size, &mut Continue).unwrap(), size);
+    assert!(matches!(value_bytes_with_control(&serial, size - 1, &mut Continue), Err(Int4ClassificationMapError::Output)));
+    for nonfinite in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let mut invalid = serial.clone();
+        if let ClassificationAggregateResult::Exclusive(result) = &mut invalid.aggregate.result {
+            result.best_candidate_weight = nonfinite;
+        }
+        assert!(matches!(value_bytes_with_control(&invalid, mapping().max_result_bytes, &mut Continue),
+            Err(Int4ClassificationMapError::Serialization)));
+    }
+}

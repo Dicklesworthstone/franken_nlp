@@ -169,6 +169,37 @@ fn late_serialization_or_prior_deadline_refuses_before_the_first_output_byte() {
 }
 
 #[test]
+fn completion_verification_keeps_typed_deadlines_and_all_other_terminal_causes() {
+    use crate::tasks::classify::ClassificationPlanningError;
+    use DecodeCancellationKind::*;
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        let error = Int4ClassificationMapError::from(ClassificationPlanningError::Cancelled(cause));
+        let expected = if matches!(cause, Timeout | Deadline) { CandidateError::Timeout }
+            else { CandidateError::Execution };
+        assert_eq!(completion_error(error), expected);
+    }
+    assert_eq!(completion_error(Int4ClassificationMapError::Admission), CandidateError::Execution);
+}
+
+#[test]
+fn complete_publication_polls_inside_large_strings_before_any_transport_byte() {
+    use std::cell::Cell;
+    let checks = Cell::new(0);
+    let remaining = || {
+        checks.set(checks.get() + 1);
+        if checks.get() == 2 { Err(CandidateError::Timeout) } else { available() }
+    };
+    let value = "x".repeat(3 * COMPLETION_CHECKPOINT_BYTES);
+    let mut output = Vec::new();
+    assert_eq!(publish_complete(&value, value.len() + 3, &mut output, &remaining), Err(CandidateError::Timeout));
+    assert_eq!(checks.get(), 2); assert!(output.is_empty());
+    let mut expected = serde_json::to_vec(&value).unwrap(); expected.push(b'\n');
+    publish_complete(&value, expected.len(), &mut output, &available).unwrap();
+    assert_eq!(output, expected);
+}
+
+#[test]
 fn serializer_failure_never_publishes_a_completed_prefix() {
     struct Refuse;
     impl Serialize for Refuse {

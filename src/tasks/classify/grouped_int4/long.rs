@@ -182,9 +182,15 @@ impl Int4ClassificationMapPreflight {
     }
     pub fn verify_completed_cohorts(&self, run: &Int4ClassificationMapCohortRun, cohort_chunks: usize)
         -> Result<(), Int4ClassificationMapError> {
+        self.verify_completed_cohorts_with_control(run, cohort_chunks, &mut binding::Continue)
+    }
+    pub fn verify_completed_cohorts_with_control<C: DecodeStepControl>(&self,
+        run: &Int4ClassificationMapCohortRun, cohort_chunks: usize, control: &mut C)
+        -> Result<(), Int4ClassificationMapError> {
+        planning::checkpoint(control)?;
         let cap = self.result_bytes.checked_add(cohort::COHORT_WRAPPER_BYTES)
             .ok_or(Int4ClassificationMapError::Limits)?;
-        if !run.binding_matches(cap)? { return Err(Int4ClassificationMapError::Admission); }
+        if !run.binding_matches_with_control(cap, control)? { return Err(Int4ClassificationMapError::Admission); }
         if cohort_chunks == 0 || cohort_chunks > self.chunk_limits.max_chunks
             || self.heads == 0 || cohort_chunks.checked_mul(self.heads)
                 .is_none_or(|heads| heads > crate::native_engine::strict_int4::cohort::MAX_INT4_SEQUENCES)
@@ -194,15 +200,22 @@ impl Int4ClassificationMapPreflight {
             || run.projection_groups == 0 || run.projection_groups > self.work.projected_logits {
             return Err(Int4ClassificationMapError::Admission);
         }
-        self.verify_completed(&run.output)?;
-        value_bytes(run, cap)?;
+        self.verify_completed_with_control(&run.output, control)?;
+        value_bytes_with_control(run, cap, control)?;
         Ok(())
     }
     pub fn verify_completed(&self, run: &Int4ClassificationMapRun) -> Result<(), Int4ClassificationMapError> {
+        self.verify_completed_with_control(run, &mut binding::Continue)
+    }
+    /// Keep complete-payload association and every verification phase inside
+    /// the caller's original cancellation/deadline/checkpoint allowance.
+    pub fn verify_completed_with_control<C: DecodeStepControl>(&self, run: &Int4ClassificationMapRun,
+        control: &mut C) -> Result<(), Int4ClassificationMapError> {
+        planning::checkpoint(control)?;
         // Shape and work do not identify the source, taxonomy or model. The
         // second seal also rejects public payload replacement on a valid run.
         if run.request_binding != self.request_binding
-            || run.result_binding != binding::result(run, self.result_bytes)? {
+            || run.result_binding != binding::result_with_control(run, self.result_bytes, control)? {
             return Err(Int4ClassificationMapError::Admission);
         }
         if run.schema_version != 1 || run.execution != INT4_CLASSIFICATION_MAP_EXECUTION
@@ -229,6 +242,7 @@ impl Int4ClassificationMapPreflight {
         }
         let mut byte = 0; let mut scalar = 0; let mut work = Int4Work::default(); let mut bytes = 0_u64;
         for (index, chunk) in run.chunks.iter().enumerate() {
+            planning::checkpoint(control)?;
             let span = chunk.source_span;
             if chunk.chunk_id != index || span.byte_start != byte || span.scalar_start != scalar
                 || span.byte_end <= byte || span.scalar_end <= scalar
@@ -240,12 +254,12 @@ impl Int4ClassificationMapPreflight {
                 return Err(Int4ClassificationMapError::Admission);
             }
             byte = span.byte_end; scalar = span.scalar_end; work = work.checked_add(chunk.run.model_work)?;
-            bytes = bytes.checked_add(value_bytes(chunk, self.retained_bytes)?)
+            bytes = bytes.checked_add(value_bytes_with_control(chunk, self.retained_bytes, control)?)
                 .filter(|&n| n <= self.retained_bytes).ok_or(Int4ClassificationMapError::Output)?;
         }
         if byte != self.source.byte_end || scalar != self.source.scalar_end || work != self.work
             || bytes != run.retained_result_bytes { return Err(Int4ClassificationMapError::Admission); }
-        value_bytes(run, self.result_bytes)?; Ok(())
+        value_bytes_with_control(run, self.result_bytes, control)?; Ok(())
     }
 }
 
@@ -422,7 +436,8 @@ impl<'a> PreparedInt4ClassificationMap<'a> {
             }
             let chunk = Int4ClassificationMapChunk { chunk_id: index, source_span: source.span(), source_tokens: source.tokens(), run };
             let room = self.limits.max_retained_result_bytes.checked_sub(bytes).ok_or(Int4ClassificationMapError::Output)?;
-            bytes = bytes.checked_add(value_bytes(&chunk, room)?).ok_or(Int4ClassificationMapError::Output)?;
+            bytes = bytes.checked_add(value_bytes_with_control(&chunk, room, control)?)
+                .ok_or(Int4ClassificationMapError::Output)?;
             work = work.checked_add(chunk.run.model_work)?; chunks.push(chunk);
         }
         if chunks.len() != self.expected.chunks || work != self.planned_work() { return Err(Int4ClassificationMapError::Admission); }
@@ -437,8 +452,8 @@ impl<'a> PreparedInt4ClassificationMap<'a> {
             planned_model_work: self.planned_work(), model_work: work, retained_result_bytes: bytes, chunks, aggregate,
             input_encoding: self.expected.encoding_record(), request_binding: self.expected.request_binding,
             result_binding: [0; 32] };
-        run.result_binding = binding::result(&run, self.limits.max_result_bytes)?;
-        value_bytes(&run, self.limits.max_result_bytes)?;
+        run.result_binding = binding::result_with_control(&run, self.limits.max_result_bytes, control)?;
+        value_bytes_with_control(&run, self.limits.max_result_bytes, control)?;
         planning::checkpoint(control)?; Ok(run)
     }
 }
@@ -456,11 +471,19 @@ pub(super) fn fits(work: Int4Work, cap: Int4Work) -> bool {
     work.forward_positions <= cap.forward_positions && work.projected_logits <= cap.projected_logits
         && work.attention_pairs <= cap.attention_pairs && work.projections.fits(cap.projections)
 }
+#[cfg(test)]
 fn value_bytes(value: &impl Serialize, cap: u64) -> Result<u64, Int4ClassificationMapError> {
+    value_bytes_with_control(value, cap, &mut binding::Continue)
+}
+fn value_bytes_with_control<C: DecodeStepControl>(value: &impl Serialize, cap: u64, control: &mut C)
+    -> Result<u64, Int4ClassificationMapError> {
+    planning::checkpoint(control)?;
     planning::check_output(value, cap).map_err(|error| if error == ClassificationPlanningError::OutputBudget {
         Int4ClassificationMapError::Output
     } else { Int4ClassificationMapError::Serialization })?;
+    planning::checkpoint(control)?;
     let bytes = canonjson::canonical_bytes(value).map_err(|_| Int4ClassificationMapError::Serialization)?;
+    planning::checkpoint(control)?;
     if bytes.len() as u64 > cap { return Err(Int4ClassificationMapError::Output); }
     Ok(bytes.len() as u64)
 }

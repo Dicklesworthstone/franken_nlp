@@ -25,8 +25,13 @@ pub struct Int4ClassificationMapCohortRun {
     result_binding: [u8; 32],
 }
 impl Int4ClassificationMapCohortRun {
+    #[cfg(test)]
     pub(super) fn binding_matches(&self, cap: u64) -> Result<bool, Int4ClassificationMapError> {
-        Ok(self.result_binding == binding::cohort(self, cap)?)
+        self.binding_matches_with_control(cap, &mut binding::Continue)
+    }
+    pub(super) fn binding_matches_with_control<C: DecodeStepControl>(&self, cap: u64, control: &mut C)
+        -> Result<bool, Int4ClassificationMapError> {
+        Ok(self.result_binding == binding::cohort_with_control(self, cap, control)?)
     }
 }
 impl fmt::Debug for Int4ClassificationMapCohortRun {
@@ -74,7 +79,7 @@ impl PreparedInt4ClassificationMap<'_> {
             planning::checkpoint(control)?;
             Ok(run)
         })?;
-        self.expected.verify_completed_cohorts(&run, cohort_chunks)?;
+        self.expected.verify_completed_cohorts_with_control(&run, cohort_chunks, control)?;
         planning::checkpoint(control)?;
         Ok(run)
     }
@@ -176,8 +181,8 @@ impl PreparedInt4ClassificationMap<'_> {
             chunk_cohorts: windows.len(), group_steps, projection_groups, output, result_binding: [0; 32] };
         let cap = self.limits.max_result_bytes.checked_add(COHORT_WRAPPER_BYTES)
             .ok_or(Int4ClassificationMapError::Limits)?;
-        run.result_binding = binding::cohort(&run, cap)?;
-        value_bytes(&run, cap)?;
+        run.result_binding = binding::cohort_with_control(&run, cap, control)?;
+        value_bytes_with_control(&run, cap, control)?;
         planning::checkpoint(control)?;
         Ok(run)
     }
