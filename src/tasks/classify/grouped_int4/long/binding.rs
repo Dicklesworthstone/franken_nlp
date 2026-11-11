@@ -66,6 +66,8 @@ pub(super) fn cohort_with_control<C: DecodeStepControl>(run: &Int4Classification
     // completion facts into that other request's otherwise valid preflight.
     writer.inner.seal(&run.output.request_binding);
     writer.inner.seal(&run.output.result_binding);
+    // Equal window counts do not identify the executed chunk grouping.
+    writer.inner.width(run.effective_cohort_chunks());
     writer.value(run)?;
     writer.checkpoint()?;
     Ok(writer.finish())
@@ -92,6 +94,10 @@ impl PrivateDigest {
         // Fixed-size private framing is not part of the public byte cap and
         // never passes through Serialize or Debug.
         self.hash.update(binding); self.hash.update([0]);
+    }
+    // Hidden fixed-size schedule framing is outside the public byte ceiling.
+    fn width(&mut self, width: usize) {
+        self.hash.update((width as u64).to_le_bytes()); self.hash.update([0]);
     }
     #[cfg(test)]
     fn value(&mut self, value: &(impl Serialize + ?Sized)) -> Result<(), Int4ClassificationMapError> {

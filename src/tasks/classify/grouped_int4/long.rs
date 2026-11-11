@@ -194,6 +194,7 @@ impl Int4ClassificationMapPreflight {
         if cohort_chunks == 0 || cohort_chunks > self.chunk_limits.max_chunks
             || self.heads == 0 || cohort_chunks.checked_mul(self.heads)
                 .is_none_or(|heads| heads > crate::native_engine::strict_int4::cohort::MAX_INT4_SEQUENCES)
+            || run.effective_cohort_chunks() != cohort_chunks.min(self.chunks)
             || run.schema_version != 1 || run.execution != INT4_CLASSIFICATION_MAP_COHORT_EXECUTION
             || run.chunk_cohorts != self.chunks.div_ceil(cohort_chunks)
             || run.group_steps == 0 || run.group_steps > self.work.forward_positions

@@ -32,8 +32,11 @@ fn same_geometry(left: Int4ClassificationMapPreflight, right: Int4Classification
     assert_eq!(left.source_geometry, right.source_geometry);
 }
 fn cohorts(plan: &PreparedInt4ClassificationMap<'_>) -> Int4ClassificationMapCohortRun {
+    cohorts_with_width(plan, 2)
+}
+fn cohorts_with_width(plan: &PreparedInt4ClassificationMap<'_>, chunks: usize) -> Int4ClassificationMapCohortRun {
     let admitted = plan.identities().unwrap();
-    let windows = plan.cohort_windows(&admitted, 2, cohort_budget(plan), &mut Continue).unwrap();
+    let windows = plan.cohort_windows(&admitted, chunks, cohort_budget(plan), &mut Continue).unwrap();
     plan.collect_cohorts_with_control(&windows, &mut Continue,
         |window, _| finish_window(plan, &admitted, window)).unwrap()
 }
@@ -186,11 +189,63 @@ fn identical_public_payloads_cannot_transplant_another_requests_cohort_provenanc
 }
 
 #[test]
+fn equal_cohort_counts_cannot_authorize_a_different_executed_width() {
+    for mode in [ClassificationMode::Exclusive, ClassificationMode::MultiLabel] {
+        let mut request = source(mode); request.document = "abcdefgh".repeat(5);
+        let plan = prepare(&request, mapping()).unwrap(); let expected = plan.preflight_metadata();
+        assert_eq!(plan.chunk_count(), 5);
+        let left = cohorts_with_width(&plan, 3); let right = cohorts_with_width(&plan, 4);
+        assert_eq!(left.chunk_cohorts, 2); assert_eq!(right.chunk_cohorts, 2);
+        assert_eq!(left.effective_cohort_chunks(), 3); assert_eq!(right.effective_cohort_chunks(), 4);
+        // Constant synthetic logits retain identical scores and summed
+        // diagnostics, so the public JSON cannot identify these schedules.
+        let wire = serde_json::to_vec(&left).unwrap();
+        assert_eq!(wire, serde_json::to_vec(&right).unwrap());
+        for (run, width, foreign_width) in [(&left, 3, 4), (&right, 4, 3)] {
+            expected.verify_completed_cohorts_with_control(run, width, &mut Continue).unwrap();
+            assert!(matches!(expected.verify_completed_cohorts(run, foreign_width),
+                Err(Int4ClassificationMapError::Admission)));
+            assert!(run.binding_matches(wire.len() as u64).unwrap());
+        }
+        assert_ne!(seals::cohort(&left, wire.len() as u64).unwrap(),
+            seals::cohort(&right, wire.len() as u64).unwrap());
+        assert!(matches!(seals::cohort(&left, wire.len() as u64 - 1),
+            Err(Int4ClassificationMapError::Output)));
+    }
+}
+
+#[test]
+fn wider_valid_allowances_preserve_the_same_capped_physical_window() {
+    for mode in [ClassificationMode::Exclusive, ClassificationMode::MultiLabel] {
+        let request = source(mode); let plan = prepare(&request, mapping()).unwrap();
+        let expected = plan.preflight_metadata(); assert_eq!(plan.chunk_count(), 2);
+        let maximum = (crate::native_engine::strict_int4::cohort::MAX_INT4_SEQUENCES / plan.head_count())
+            .min(mapping().chunks.max_chunks);
+        let exact = cohorts_with_width(&plan, 2); let wider = cohorts_with_width(&plan, maximum);
+        assert_eq!(exact.effective_cohort_chunks(), 2); assert_eq!(wider.effective_cohort_chunks(), 2);
+        assert_eq!(exact, wider);
+        let wire = serde_json::to_vec(&exact).unwrap();
+        assert_eq!(wire, serde_json::to_vec(&wider).unwrap());
+        assert_eq!(seals::cohort(&exact, wire.len() as u64).unwrap(),
+            seals::cohort(&wider, wire.len() as u64).unwrap());
+        for width in [2, 3, 4, maximum] {
+            expected.verify_completed_cohorts(&exact, width).unwrap();
+        }
+        // Capping the physical width does not relax requested geometry or
+        // authorize the distinct schedule that executes two singletons.
+        for width in [0, 1, maximum + 1, usize::MAX] {
+            assert!(matches!(expected.verify_completed_cohorts(&exact, width),
+                Err(Int4ClassificationMapError::Admission)));
+        }
+    }
+}
+
+#[test]
 fn fingerprints_stay_private_and_result_hashing_enforces_the_complete_byte_cap() {
     let request = source(ClassificationMode::Exclusive); let plan = prepare(&request, mapping()).unwrap();
     let expected = plan.preflight_metadata(); let result = finish(&plan).unwrap(); let grouped = cohorts(&plan);
     let wire = serde_json::to_value(&result).unwrap(); let cohort_wire = serde_json::to_value(&grouped).unwrap();
-    for field in ["request_binding", "result_binding"] {
+    for field in ["request_binding", "result_binding", "effective_cohort_chunks"] {
         assert!(wire.get(field).is_none()); assert!(cohort_wire.get(field).is_none());
         assert!(cohort_wire["output"].get(field).is_none());
     }
@@ -201,6 +256,7 @@ fn fingerprints_stay_private_and_result_hashing_enforces_the_complete_byte_cap()
     for debug in [format!("{expected:?}"), format!("{result:?}"), format!("{grouped:?}")] {
         assert!(!debug.contains("Alice"));
         assert!(!debug.contains("request_binding")); assert!(!debug.contains("result_binding"));
+        assert!(!debug.contains("effective_cohort_chunks"));
         assert!(!debug.contains(&format!("{:?}", expected.request_binding)));
         assert!(!debug.contains(&format!("{:?}", result.result_binding)));
         assert!(!debug.contains(&format!("{:?}", seals::cohort(&grouped, u64::MAX).unwrap())));
@@ -278,7 +334,7 @@ fn large_complete_payload_hashes_stop_inside_a_single_serializer_write() {
 }
 
 #[test]
-fn controlled_seals_preserve_legacy_bytes_and_canonical_size_refusals() {
+fn controlled_seals_preserve_wire_bytes_and_canonical_size_refusals() {
     let request = source(ClassificationMode::Exclusive); let plan = prepare(&request, mapping()).unwrap();
     let serial = finish(&plan).unwrap(); let grouped = cohorts(&plan);
     let wire = serde_json::to_vec(&serial).unwrap();
@@ -288,12 +344,13 @@ fn controlled_seals_preserve_legacy_bytes_and_canonical_size_refusals() {
     assert_eq!(serial.result_binding, legacy);
     assert_eq!(seals::result_with_control(&serial, wire.len() as u64, &mut Continue).unwrap(), legacy);
     let cohort_wire = serde_json::to_vec(&grouped).unwrap();
-    let mut legacy = Sha256::new(); legacy.update(b"fnlp-int4-classification-map-cohort-result-v1\0");
-    legacy.update(grouped.output.request_binding); legacy.update([0]);
-    legacy.update(grouped.output.result_binding); legacy.update([0]);
-    legacy.update(&cohort_wire); legacy.update([0]);
-    let legacy: [u8; 32] = legacy.finalize().into();
-    assert_eq!(seals::cohort_with_control(&grouped, cohort_wire.len() as u64, &mut Continue).unwrap(), legacy);
+    let mut expected = Sha256::new(); expected.update(b"fnlp-int4-classification-map-cohort-result-v1\0");
+    expected.update(grouped.output.request_binding); expected.update([0]);
+    expected.update(grouped.output.result_binding); expected.update([0]);
+    expected.update((grouped.effective_cohort_chunks() as u64).to_le_bytes()); expected.update([0]);
+    expected.update(&cohort_wire); expected.update([0]);
+    let expected: [u8; 32] = expected.finalize().into();
+    assert_eq!(seals::cohort_with_control(&grouped, cohort_wire.len() as u64, &mut Continue).unwrap(), expected);
     assert!(grouped.binding_matches_with_control(cohort_wire.len() as u64, &mut Continue).unwrap());
     let size = canonjson::canonical_bytes(&serial).unwrap().len() as u64;
     assert_eq!(value_bytes_with_control(&serial, size, &mut Continue).unwrap(), size);

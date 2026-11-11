@@ -22,9 +22,12 @@ pub struct Int4ClassificationMapCohortRun {
     pub projection_groups: u64,
     pub output: Int4ClassificationMapRun,
     #[serde(skip)]
+    effective_cohort_chunks: usize,
+    #[serde(skip)]
     result_binding: [u8; 32],
 }
 impl Int4ClassificationMapCohortRun {
+    pub(super) fn effective_cohort_chunks(&self) -> usize { self.effective_cohort_chunks }
     #[cfg(test)]
     pub(super) fn binding_matches(&self, cap: u64) -> Result<bool, Int4ClassificationMapError> {
         self.binding_matches_with_control(cap, &mut binding::Continue)
@@ -176,9 +179,15 @@ impl PreparedInt4ClassificationMap<'_> {
             results.next().ok_or(Int4ClassificationMapError::Admission)
         })?;
         if results.len() != 0 || next_window != windows.len() { return Err(Int4ClassificationMapError::Admission); }
+        // The first admitted window records the actual width. A requested
+        // allowance larger than the source still executes one capped window.
+        let first = windows.first().ok_or(Int4ClassificationMapError::Admission)?;
+        let effective_cohort_chunks = first.end.checked_sub(first.start)
+            .filter(|&width| width != 0).ok_or(Int4ClassificationMapError::Admission)?;
         let mut run = Int4ClassificationMapCohortRun { schema_version: 1,
             execution: INT4_CLASSIFICATION_MAP_COHORT_EXECUTION.to_owned(),
-            chunk_cohorts: windows.len(), group_steps, projection_groups, output, result_binding: [0; 32] };
+            chunk_cohorts: windows.len(), group_steps, projection_groups, output,
+            effective_cohort_chunks, result_binding: [0; 32] };
         let cap = self.limits.max_result_bytes.checked_add(COHORT_WRAPPER_BYTES)
             .ok_or(Int4ClassificationMapError::Limits)?;
         run.result_binding = binding::cohort_with_control(&run, cap, control)?;
