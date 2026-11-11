@@ -4,6 +4,7 @@
 //! global entity census, phrase ranking or neural summary synthesis.
 use super::*;
 use std::{cell::RefCell, sync::Arc};
+use sha2::{Digest, Sha256};
 use crate::{
     grammar::mask::MaskWorkLimits,
     native_engine::{constrained::JsonWorkBudget, strict_int4::{Int4MemoryRequirement, Int4RunBudget}},
@@ -109,7 +110,7 @@ impl Int4SourceMapError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Int4SourceMapPreflight {
     source_span: VerifiedSourceSpan,
     chunks: usize,
@@ -118,6 +119,15 @@ pub struct Int4SourceMapPreflight {
     work: Int4Work,
     masks: u64,
     verification: GroundingBudget,
+    request_binding: [u8; 32],
+    max_result_bytes: u64,
+}
+impl fmt::Debug for Int4SourceMapPreflight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Int4SourceMapPreflight").field("chunks", &self.chunks)
+            .field("group_width", &self.group_width).field("task_spec", &self.task_spec)
+            .field("work", &self.work).field("masks", &self.masks).finish_non_exhaustive()
+    }
 }
 impl Int4SourceMapPreflight {
     pub fn source_span(&self) -> VerifiedSourceSpan { self.source_span }
@@ -126,6 +136,10 @@ impl Int4SourceMapPreflight {
     pub fn planned_work(&self) -> Int4Work { self.work }
     pub fn reserved_mask_visits(&self) -> u64 { self.masks }
     pub fn verify_completed(&self, run: &Int4SourceMapRun) -> Result<(), Int4SourceMapError> {
+        if run.request_binding != self.request_binding
+            || run.result_binding != private_digest(b"fnlp-int4-source-map-result-v1", run, self.max_result_bytes)? {
+            return Err(Int4SourceError::InvalidResult.into());
+        }
         let root = run.mapped.root();
         let (work, masks, fields, matches) = execution::statistics(root.value())?;
         if run.schema_version != 1 || run.execution != INT4_SOURCE_MAP_EXECUTION
@@ -209,6 +223,10 @@ pub struct Int4SourceMapRun {
     pub verification_used: SourceMapVerification,
     pub untrusted_fields: [&'static str; 1],
     pub mapped: MapReduceResult<SourceMapValue>,
+    #[serde(skip)]
+    request_binding: [u8; 32],
+    #[serde(skip)]
+    result_binding: [u8; 32],
 }
 
 pub struct PreparedInt4SourceMap<'s> {
@@ -243,14 +261,22 @@ impl SourceTaskPlanner {
         if source.is_empty() { return Err(Int4SourceMapError::EmptySource); }
         let capacity = self.int4_map_capacity_with_control(task, budget, context, planning, group_width, control)?;
         let chunk_limits = capacity.constrain_chunks(limits.chunks)?;
+        let mut encoding_error = None;
         let mut cancellation = None;
-        let chunks = ChunkPlan::build_with_checkpoints(source, chunk_limits, |text| {
-            self.encoder.encode(text, chunk_limits.max_chunk_bytes, chunk_limits.max_chunk_bytes)
-                .map(|document| document.total_token_count()).map_err(|_| MapReduceError::Tokenizer)
-        }, || match control.prefill_checkpoint(0) {
-            Some(cause) => { cancellation = Some(cause); Err(MapReduceError::Cancelled) }, None => Ok(()),
-        });
+        let chunks = {
+            let control = RefCell::new(&mut *control);
+            ChunkPlan::build_with_checkpoints(source, chunk_limits, |text| {
+                self.encoder.encode_with_control(text, chunk_limits.max_chunk_bytes,
+                    chunk_limits.max_chunk_bytes, &mut || control.borrow_mut().prefill_checkpoint(0))
+                    .map(|document| document.total_token_count()).map_err(|error| {
+                        encoding_error = Some(error); MapReduceError::Tokenizer
+                    })
+            }, || match control.borrow_mut().prefill_checkpoint(0) {
+                Some(cause) => { cancellation = Some(cause); Err(MapReduceError::Cancelled) }, None => Ok(()),
+            })
+        };
         if let Some(cause) = cancellation { return Err(Int4SourceError::Cancelled(cause).into()); }
+        if let Some(error) = encoding_error { return Err(Int4SourceError::from(error).into()); }
         let chunks = chunks.map_err(Int4SourceMapError::Chunk)?;
         let first = chunks.chunks().first().ok_or(Int4SourceMapError::EmptySource)?.span();
         let last = chunks.chunks().last().ok_or(Int4SourceMapError::EmptySource)?.span();
@@ -259,6 +285,7 @@ impl SourceTaskPlanner {
                 scalar_start: first.scalar_start, scalar_end: last.scalar_end },
             chunks: chunks.chunks().len(), group_width, task_spec: task.task_spec(),
             work: Int4Work::default(), masks: 0, verification: limits.verification,
+            request_binding: [0; 32], max_result_bytes: limits.reduction.max_result_bytes as u64,
         };
         let mut plans = Vec::new();
         plans.try_reserve_exact(expected.chunks).map_err(|_| Int4SourceMapError::Allocation)?;
@@ -279,8 +306,66 @@ impl SourceTaskPlanner {
             plans.push(plan);
         }
         checkpoint(control)?;
+        expected.request_binding = request_binding(source, task, budget, planning, limits,
+            self, &chunks, &plans, control)?;
         Ok(PreparedInt4SourceMap { chunks, plans, limits, expected, kv_ceiling: budget.max_kv_bytes })
     }
+}
+
+/// Bind every prepared source/option/policy and ordered native child. Hashes
+/// stay process-private: neither result JSON nor Debug exposes content hashes.
+#[allow(clippy::too_many_arguments)]
+fn request_binding<C: DecodeStepControl>(source: &str, task: &SourceMapTask, budget: TaskBudget,
+    planning: SourcePlanningLimits, limits: Int4SourceMapLimits, planner: &SourceTaskPlanner,
+    chunks: &ChunkPlan<'_>, plans: &[PreparedInt4SourceTask], control: &mut C)
+    -> Result<[u8; 32], Int4SourceMapError> {
+    let mut writer = PrivateDigest::new(b"fnlp-int4-source-map-request-v1", u64::MAX);
+    let compiler = planning.compiler;
+    writer.value(&(source, task, budget))?;
+    writer.value(&(limits.chunks, limits.reduction, limits.max_model_work,
+        (limits.mask_limits.max_trie_node_visits, limits.mask_limits.checkpoint_interval_nodes),
+        limits.mask_visits_per_chunk, limits.max_mask_visits, limits.verification))?;
+    writer.value(&((planning.max_input_bytes, planning.max_context_tokens, planning.max_passages),
+        (compiler.max_schema_bytes, compiler.max_string_bytes, compiler.max_array_items, compiler.max_output_bytes,
+            compiler.max_states, compiler.max_transitions, compiler.max_mask_bytes),
+        planning.source, planner.document_encoding(), planner.map_document_encoding_limits()))?;
+    writer.value(&plans.len())?;
+    for (chunk, plan) in chunks.chunks().iter().zip(plans) {
+        checkpoint(control)?;
+        let identity = plan.execution_identity().receipt_digest().map_err(|_| Int4SourceMapError::Admission)?;
+        writer.value(&(chunk.id(), chunk.span(), chunk.tokens(), identity, plan.request_digest(),
+            plan.comparison_policy_digest()))?;
+    }
+    checkpoint(control)?;
+    Ok(writer.finish())
+}
+
+/// Hash fixed typed values without allocating another result-sized buffer.
+/// This private seal is not an exported canonical digest or import authority.
+struct PrivateDigest { hash: Sha256, remaining: u64 }
+impl PrivateDigest {
+    fn new(domain: &[u8], cap: u64) -> Self {
+        let mut hash = Sha256::new(); hash.update(domain); hash.update([0]);
+        Self { hash, remaining: cap }
+    }
+    fn value(&mut self, value: &(impl Serialize + ?Sized)) -> Result<(), Int4SourceMapError> {
+        serde_json::to_writer(&mut *self, value).map_err(|_| Int4SourceMapError::Admission)?;
+        self.hash.update([0]);
+        Ok(())
+    }
+    fn finish(self) -> [u8; 32] { self.hash.finalize().into() }
+}
+impl std::io::Write for PrivateDigest {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.remaining = self.remaining.checked_sub(bytes.len() as u64)
+            .ok_or_else(|| std::io::Error::other("INT4 source map private binding limit"))?;
+        self.hash.update(bytes); Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+fn private_digest(domain: &[u8], value: &(impl Serialize + ?Sized), cap: u64)
+    -> Result<[u8; 32], Int4SourceMapError> {
+    let mut writer = PrivateDigest::new(domain, cap); writer.value(value)?; Ok(writer.finish())
 }
 fn add_work(a: Int4Work, b: Int4Work) -> Option<Int4Work> { a.checked_add(b).ok() }
 fn fits(work: Int4Work, ceiling: Int4Work) -> bool {
@@ -299,3 +384,4 @@ fn valid_reduction(limits: ExecutionLimits) -> bool {
         && limits.max_value_bytes <= limits.max_live_value_bytes
 }
 #[cfg(test)] mod tests;
+#[cfg(test)] mod encoding_tests;

@@ -31,6 +31,60 @@ pub(super) const SYNTHESIS_MODES: [(Kind, &[&str]); 4] = [
 ];
 
 #[test]
+fn compact_maps_require_one_complete_tokenizer_budget_and_admit_workspace() {
+    for kind in KINDS {
+        let (map, args) = arguments(kind, &["--input-encoding", "safe-bpe-v1"]);
+        let limits = map.validate(&args).unwrap();
+        let encoding = limits.encoding.unwrap();
+        assert_eq!(encoding.call.max_input_bytes, args.context_tokens);
+        assert_eq!(encoding.call.max_output_tokens, args.context_tokens);
+        assert_eq!(encoding.complete.max_input_bytes, 8 * args.max_input_bytes as u64);
+        assert_eq!(encoding.complete.max_output_tokens, 8 * args.max_input_bytes as u64);
+        assert_eq!(encoding.complete.max_pair_checks, 268_435_456);
+        assert_eq!(encoding.complete.max_pair_bytes, 4_294_967_296);
+        assert!(encoding.workspace_bytes().unwrap() <= limits.common.preparation_bytes);
+        assert!(map.validate_document_job(&args, false).is_err());
+        assert!(map.validate_document_job(&args, true).is_err());
+        assert!(map.validate_corpus(&args).is_err());
+    }
+    let (map, mut args) = arguments(Kind::Keyphrases, &["--input-encoding", "safe-bpe-v1",
+        "--cohort-chunks", "2", "--reduce-keyphrases", "--max-total-tokenizer-input-bytes", "123456",
+        "--max-total-tokenizer-output-tokens", "234567", "--max-total-tokenizer-pair-checks", "345678",
+        "--max-total-tokenizer-pair-bytes", "456789"]);
+    args.memory_mib = 262_144;
+    let encoding = map.validate(&args).unwrap().encoding.unwrap();
+    assert_eq!((encoding.complete.max_input_bytes, encoding.complete.max_output_tokens,
+        encoding.complete.max_pair_checks, encoding.complete.max_pair_bytes), (123456, 234567, 345678, 456789));
+}
+
+#[test]
+fn unsupported_compact_modes_and_invalid_total_ceilings_refuse_before_io() {
+    for mode in [vec!["--max-total-tokenizer-pair-checks", "1"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-pair-checks", "0"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-total-tokenizer-pair-bytes", "18446744073709551615"],
+        vec!["--input-encoding", "safe-bpe-v1", "--synthesize-summary"],
+        vec!["--input-encoding", "safe-bpe-v1", "--synthesize-summary", "--hierarchical-summary"]] {
+        let (map, args) = arguments(Kind::Summarize, &mode);
+        assert_eq!(map.execute(args, &mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+    }
+    // Invalid source ceilings must be rejected, including when explicit totals
+    // would otherwise hide an eager overflowing default computation.
+    for totals in [&[][..], &["--max-total-tokenizer-input-bytes", "1",
+        "--max-total-tokenizer-output-tokens", "1"][..]] {
+        let mut flags = vec!["--input-encoding", "safe-bpe-v1"];
+        flags.extend_from_slice(totals);
+        let (map, mut args) = arguments(Kind::Ner, &flags);
+        args.max_input_bytes = usize::MAX;
+        assert_eq!(map.execute(args, &mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+    }
+    for command in document_job_definitions().into_iter().chain(documents::definitions()) {
+        assert!(!command.get_arguments().any(|arg| arg.get_id() == "input_encoding"));
+    }
+    let answer = definitions().into_iter().find(|command| command.get_name() == "answer-map").unwrap();
+    assert!(!answer.get_arguments().any(|arg| arg.get_id() == "input_encoding"));
+}
+
+#[test]
 fn every_map_uses_whole_document_limits_on_source_and_pinned_snapshot_routes() {
     for kind in KINDS {
         let (map, args) = arguments(kind, &[]);

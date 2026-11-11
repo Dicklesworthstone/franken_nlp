@@ -59,17 +59,17 @@ impl Expected {
         match (self, run) {
             (Self::Map(p), Int4SourceDocumentRun::Map(run)) => p.verify_completed(run).map_err(map_failure),
             (Self::Keyphrases(p), Int4SourceDocumentRun::Keyphrases(run)) => {
-                p.verify_keyphrases_completed(run).map_err(keyphrase_failure)?;
                 let Int4SourceDocumentTask::Keyphrases { limits, .. } = task else {
                     return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
                 };
+                p.verify_keyphrases_completed_with_limits(run, *limits).map_err(keyphrase_failure)?;
                 verify_keyphrase_limits(run, *limits)
             }
             (Self::Summary(p), Int4SourceDocumentRun::Summary(run)) => {
-                p.verify_summary_completed(run).map_err(summary_failure)?;
                 let Int4SourceDocumentTask::Summary { limits, .. } = task else {
                     return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));
                 };
+                p.verify_summary_completed_with_limits(run, *limits).map_err(summary_failure)?;
                 if run.summary.requested_max_bullets != limits.max_bullets
                     || run.verification_scan_steps > limits.aggregation.max_scan_steps {
                     return Err(BatchItemFailure::fatal(BatchCode::InvalidExecution));

@@ -70,6 +70,7 @@ impl SourceTaskPlanner {
         context: &PlanContext<'_>, planning: SourcePlanningLimits, mapping: Int4SourceMapLimits,
         group_width: usize, control: &mut C) -> Result<PreparedInt4SummaryHierarchy<'s>, Int4SourceMapError> {
         checkpoint(control)?;
+        self.encoder.require_byte_encoding().map_err(Int4SourceError::from)?;
         hierarchy.validate()?; request.validate(planning)?;
         let capacity = self.int4_map_capacity_with_control(&SourceMapTask::Summarize(request.synthesis_options),
             budget, context, planning, group_width, control)?;

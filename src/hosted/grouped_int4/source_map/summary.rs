@@ -73,7 +73,7 @@ impl NlpEngine {
             let result = allocate(output, || {
                 let result = prepared.execute_summary_with_control(&admitted,
                     &mut engine.value, &input.value.vocabulary, summary, control).map_err(summary_error)?;
-                expected.verify_summary_completed(&result).map_err(summary_error)?;
+                expected.verify_summary_completed_with_limits(&result, summary).map_err(summary_error)?;
                 check_clean(&engine.value)?;
                 checkpoint(control)?;
                 Ok(result)

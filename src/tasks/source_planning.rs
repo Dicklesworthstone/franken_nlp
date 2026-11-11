@@ -229,8 +229,8 @@ impl SourceTaskPlanner {
     /// its execution identity. The byte-default digest remains unchanged; the
     /// compact policy and every work ceiling bind even identical token streams.
     /// Hosts reserve `SafeBpeLimits::requirements()` before input/model IO.
-    /// Composed map/corpus entry points remain byte-only until their aggregate
-    /// tokenizer-probe work has a separately admitted contract.
+    /// Composed maps additionally require `with_map_document_encoding`; the
+    /// one-request policy alone cannot renew work across tokenizer probes.
     pub fn with_document_encoding(mut self, policy: UntrustedEncoding) -> Result<Self, SourcePlanningError> {
         policy.validate().map_err(|_| SourcePlanningError::Contract("invalid source document encoding policy"))?;
         self.template_digest = match &policy {
@@ -241,6 +241,43 @@ impl SourceTaskPlanner {
         };
         self.encoder = self.encoder.with_document_encoding(policy)?;
         Ok(self)
+    }
+    /// Admit compact input for one complete INT4 NER/keyphrase/plain-summary
+    /// map operation. All probes, chunk plans and host replanning share this
+    /// nonrenewable ledger for the planner's entire lifetime. Create another
+    /// explicitly admitted planner for a different document; there is no reset.
+    /// QA, neural synthesis, corpus streams and durable jobs remain byte-only.
+    pub fn with_map_document_encoding(mut self, policy: UntrustedEncoding,
+        work: crate::tokenizer::untrusted::SafeBpeWorkLimits) -> Result<Self, SourcePlanningError> {
+        if !matches!(policy, UntrustedEncoding::SafeBpeV1(_)) {
+            return Err(SourcePlanningError::Contract("compact source maps require safe BPE"));
+        }
+        work.validate().map_err(|_| SourcePlanningError::Contract("invalid source map encoding budget"))?;
+        self = self.with_document_encoding(policy)?;
+        self.template_digest = Sha256Digest::of_bytes(&canonjson::canonical_bytes(
+            &("source-map-untrusted-encoding-v1", self.template_digest, work)
+        ).map_err(|_| SourcePlanningError::Serialization)?);
+        self.encoder = self.encoder.with_cumulative_encoding_work(work)?;
+        Ok(self)
+    }
+    pub fn map_document_encoding_limits(&self) -> Option<crate::tokenizer::untrusted::SafeBpeWorkLimits> {
+        self.encoder.cumulative_encoding_limits()
+    }
+    pub fn map_document_encoding_work(&self) -> Result<Option<crate::tokenizer::untrusted::SafeBpeWork>, SourcePlanningError> {
+        Ok(self.encoder.cumulative_encoding_work()?)
+    }
+    /// Reserve this payload in addition to the retained task-plan estimate.
+    /// The same workspace is reused sequentially by probes and chunk plans.
+    pub fn map_document_encoding_workspace_bytes(&self) -> Result<u64, SourcePlanningError> {
+        match (self.document_encoding(), self.map_document_encoding_limits()) {
+            (UntrustedEncoding::ByteFallback, None) => Ok(0),
+            (UntrustedEncoding::SafeBpeV1(call), Some(work)) => {
+                work.validate().map_err(|_| SourcePlanningError::Contract("invalid source map encoding budget"))?;
+                call.requirements().map(|quote| quote.workspace_bytes + 512)
+                    .map_err(|_| SourcePlanningError::Contract("invalid source map encoding workspace"))
+            },
+            _ => Err(SourcePlanningError::Contract("source maps require cumulative encoding admission")),
+        }
     }
     pub fn document_encoding(&self) -> &UntrustedEncoding { self.encoder.document_encoding() }
     pub fn template_digest(&self) -> &Sha256Digest { &self.template_digest }

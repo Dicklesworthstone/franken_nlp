@@ -101,6 +101,12 @@ pub struct Int4CorpusKeyphraseRun {
     /// Additional independent corpus matching work, capped across every map.
     pub verification_scan_work: u64,
     pub keyphrases: CorpusKeyphraseResult,
+    #[serde(skip)]
+    pub(crate) request_binding: [u8; 32],
+    #[serde(skip)]
+    pub(crate) reduction_binding: [u8; 32],
+    #[serde(skip)]
+    pub(crate) result_binding: [u8; 32],
 }
 #[derive(Serialize)]
 pub struct Int4CorpusKeyphraseCohortRun {
@@ -110,8 +116,27 @@ pub struct Int4CorpusKeyphraseCohortRun {
     pub document: Int4CorpusKeyphraseRun,
     pub cohorts: Int4SourceMapCohortStats,
 }
+#[cfg(test)]
+impl Int4CorpusKeyphraseRun {
+    /// Test-only metadata fixture authority, never a native execution route.
+    pub(crate) fn seal_test_fixture(mut self, expected: Int4SourceMapPreflight, limits: Int4KeyphraseLimits)
+        -> Result<Self, Int4CorpusKeyphraseError> {
+        self.request_binding = expected.request_binding;
+        self.reduction_binding = keyphrase_binding(limits)?;
+        self.result_binding = private_digest(b"fnlp-int4-source-keyphrases-result-v1", &self, expected.max_result_bytes)?;
+        expected.verify_keyphrases_completed_with_limits(&self, limits)?;
+        Ok(self)
+    }
+}
 impl Int4SourceMapPreflight {
+    /// Authenticate this source, every admitted child and the unchanged result.
+    /// Use `verify_keyphrases_completed_with_limits` to additionally require one
+    /// caller-selected exact union and final ranking policy.
     pub fn verify_keyphrases_completed(&self, run: &Int4CorpusKeyphraseRun) -> Result<(), Int4CorpusKeyphraseError> {
+        if run.request_binding != self.request_binding
+            || run.result_binding != private_digest(b"fnlp-int4-source-keyphrases-result-v1", run, self.max_result_bytes)? {
+            return Err(Int4CorpusKeyphraseError::Accounting);
+        }
         let result = &run.keyphrases;
         if self.task_spec != KEYPHRASES_TASK_VERSION || run.schema_version != 1
             || run.execution != INT4_CORPUS_KEYPHRASE_EXECUTION || run.numerics_profile != STRICT_INT4_PROFILE
@@ -138,6 +163,21 @@ impl Int4SourceMapPreflight {
         }
         Ok(())
     }
+
+    pub fn verify_keyphrases_completed_with_limits(&self, run: &Int4CorpusKeyphraseRun,
+        limits: Int4KeyphraseLimits) -> Result<(), Int4CorpusKeyphraseError> {
+        if run.reduction_binding != keyphrase_binding(limits)? {
+            return Err(Int4CorpusKeyphraseError::Accounting);
+        }
+        self.verify_keyphrases_completed(run)
+    }
+}
+
+fn keyphrase_binding(limits: Int4KeyphraseLimits) -> Result<[u8; 32], Int4SourceMapError> {
+    let aggregation = limits.aggregation;
+    private_digest(b"fnlp-int4-source-keyphrases-reduction-v1", &(aggregation.max_unique_phrases,
+        aggregation.max_evidence_spans, aggregation.max_value_bytes, aggregation.max_scan_work,
+        limits.max_phrases, limits.max_result_bytes), 4096)
 }
 impl PreparedInt4SourceMap<'_> {
     /// Check every compiled task and its options before any native forward.
@@ -215,15 +255,18 @@ impl PreparedInt4SourceMap<'_> {
             return Err(Int4CorpusKeyphraseError::Accounting);
         }
         let keyphrases = reduced.into_value().into_ranked(limits.max_phrases, limits.max_result_bytes)?;
-        let run = Int4CorpusKeyphraseRun { schema_version: 1, execution: INT4_CORPUS_KEYPHRASE_EXECUTION,
+        let mut run = Int4CorpusKeyphraseRun { schema_version: 1, execution: INT4_CORPUS_KEYPHRASE_EXECUTION,
             numerics_profile: STRICT_INT4_PROFILE, group_width: self.expected.group_width, chunk_profile: CHUNK_PROFILE,
             semantics: INT4_CORPUS_KEYPHRASE_SEMANTICS, source_span: metadata.0, map_batches: metadata.1,
             reduce_calls: metadata.2, reduction_levels: metadata.3, requested_max_phrases: limits.max_phrases,
             planned_model_work: self.expected.work, model_work: pass.work,
             reserved_mask_node_visits: self.expected.masks, mask_node_visit_charge: pass.masks,
             verification_used: SourceMapVerification::used(self.limits.verification, pass.remaining)?,
-            verification_scan_work: scan_work, keyphrases };
-        self.expected.verify_keyphrases_completed(&run)?;
+            verification_scan_work: scan_work, keyphrases,
+            request_binding: self.expected.request_binding, reduction_binding: keyphrase_binding(limits)?,
+            result_binding: [0; 32] };
+        run.result_binding = private_digest(b"fnlp-int4-source-keyphrases-result-v1", &run, self.expected.max_result_bytes)?;
+        self.expected.verify_keyphrases_completed_with_limits(&run, limits)?;
         // The output cap includes the complete native/map/verification envelope.
         check_bytes(&run, limits.max_result_bytes)?;
         driver.borrow_mut().checkpoint()?;

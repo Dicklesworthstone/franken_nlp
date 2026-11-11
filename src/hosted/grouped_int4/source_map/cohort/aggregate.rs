@@ -72,7 +72,7 @@ impl DocumentAggregation for Int4SummaryLimits {
             .map_err(summary_error)
     }
     fn verify(self, expected: Int4SourceMapPreflight, result: &Self::Output) -> Result<(), HostedError> {
-        expected.verify_summary_completed(&result.document).map_err(summary_error)
+        expected.verify_summary_completed_with_limits(&result.document, self).map_err(summary_error)
     }
 }
 
@@ -98,7 +98,7 @@ impl DocumentAggregation for Int4KeyphraseLimits {
             .map_err(keyphrase_error)
     }
     fn verify(self, expected: Int4SourceMapPreflight, result: &Self::Output) -> Result<(), HostedError> {
-        expected.verify_keyphrases_completed(&result.document).map_err(keyphrase_error)
+        expected.verify_keyphrases_completed_with_limits(&result.document, self).map_err(keyphrase_error)
     }
 }
 

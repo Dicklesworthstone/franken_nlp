@@ -108,6 +108,28 @@ fn complete_capacity_source_and_owned_storage_are_required_before_preparation() 
 }
 
 #[test]
+fn compact_map_workspace_and_complete_ledger_are_admitted_before_capture() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding};
+    let policy = UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 4096, max_output_tokens: 4096, max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24,
+    });
+    let total = SafeBpeWorkLimits { max_input_bytes: 65_536, max_output_tokens: 65_536,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 };
+    let (planner, mut config) = fixture(SourceMapTask::Ner(Default::default()), 32);
+    let planner = planner.with_map_document_encoding(policy.clone(), total).unwrap();
+    config.identity.template_digest = *planner.template_digest();
+    let workspace = planner.map_document_encoding_workspace_bytes().unwrap();
+    config.preparation_reserve_bytes = workspace;
+    map_requirements(&config, 16, 32, &planner).unwrap();
+    config.preparation_reserve_bytes = workspace - 1;
+    assert!(map_requirements(&config, 16, 32, &planner).is_err());
+    let (one_request, mut config) = fixture(SourceMapTask::Ner(Default::default()), 32);
+    let one_request = one_request.with_document_encoding(policy).unwrap();
+    config.identity.template_digest = *one_request.template_digest();
+    assert!(map_requirements(&config, 16, 32, &one_request).is_err());
+}
+
+#[test]
 fn frontier_quote_prices_all_chunks_local_and_lifted_evidence() {
     let (_, mut config) = fixture(SourceMapTask::Summarize(Default::default()), 32);
     let one = config.workspace_bytes(1).unwrap();

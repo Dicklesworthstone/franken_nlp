@@ -78,7 +78,7 @@ impl NlpEngine {
             let result = allocate(output, || {
                 let result = prepared.execute_keyphrases_with_control(&admitted,
                     &mut engine.value, &input.value.vocabulary, keyphrases, control).map_err(keyphrase_error)?;
-                expected.verify_keyphrases_completed(&result).map_err(keyphrase_error)?;
+                expected.verify_keyphrases_completed_with_limits(&result, keyphrases).map_err(keyphrase_error)?;
                 check_clean(&engine.value)?;
                 checkpoint(control)?;
                 Ok(result)

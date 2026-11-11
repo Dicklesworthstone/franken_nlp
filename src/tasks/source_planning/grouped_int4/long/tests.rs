@@ -18,6 +18,43 @@ pub(super) fn planner() -> SourceTaskPlanner {
     let registry = pinned_controls::pinned().unwrap();
     SourceTaskPlanner::pinned(registry.template_controls(), EmbeddedTokenizer::pinned().unwrap().eos_token_id().unwrap()).unwrap()
 }
+
+#[test]
+fn complete_source_receipts_reject_equal_geometry_substitution_and_mutated_payloads() {
+    let planner = planner();
+    let first = prepare(&planner, "Alice Bob", limits());
+    let second = prepare(&planner, "Alice Eve", limits());
+    let expected = first.preflight_metadata();
+    let other = second.preflight_metadata();
+    assert_eq!(expected.source_span(), other.source_span());
+    assert_eq!(expected.planned_work(), other.planned_work());
+    let ids = admitted(&first); let driver = script(&first);
+    let mut first = first.execute_with_driver(&ids, driver).unwrap();
+    let ids = admitted(&second); let driver = script(&second);
+    let mut second = second.execute_with_driver(&ids, driver).unwrap();
+    expected.verify_completed(&first).unwrap(); other.verify_completed(&second).unwrap();
+    assert!(expected.verify_completed(&second).is_err());
+    assert!(other.verify_completed(&first).is_err());
+    let public = serde_json::to_value(&first).unwrap();
+    assert!(public.get("request_binding").is_none() && public.get("result_binding").is_none());
+    assert!(!format!("{expected:?}").contains("request_binding"));
+    std::mem::swap(&mut first.mapped, &mut second.mapped);
+    assert!(expected.verify_completed(&first).is_err());
+    assert!(other.verify_completed(&second).is_err());
+}
+
+#[test]
+fn identical_source_and_native_work_do_not_authorize_another_map_policy() {
+    let planner = planner();
+    let original = prepare(&planner, "Alice Bob", limits());
+    let expected = original.preflight_metadata();
+    let mut changed = limits(); changed.verification.max_scan_steps -= 1;
+    let changed = prepare(&planner, "Alice Bob", changed);
+    assert_eq!(expected.planned_work(), changed.planned_work());
+    let ids = admitted(&changed); let driver = script(&changed);
+    let result = changed.execute_with_driver(&ids, driver).unwrap();
+    assert!(expected.verify_completed(&result).is_err());
+}
 pub(super) fn budget() -> TaskBudget {
     TaskBudget { max_input_tokens: 8192, max_output_tokens: 64, max_output_bytes: 1 << 20,
         max_grammar_states: 4096, max_kv_bytes: Int4MemoryRequirement::for_context(8192, 32).unwrap().kv_bytes }

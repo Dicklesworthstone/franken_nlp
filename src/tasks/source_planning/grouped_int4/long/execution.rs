@@ -198,13 +198,15 @@ pub(super) fn reduce(input: ReduceInput<'_, SourceMapValue>,
 pub(super) fn complete(expected: Int4SourceMapPreflight, verification: GroundingBudget,
     remaining: GroundingBudget, work: Int4Work, masks: u64, mapped: MapReduceResult<SourceMapValue>, cap: u64)
     -> Result<Int4SourceMapRun, Int4SourceMapError> {
-    let run = Int4SourceMapRun { schema_version: 1, execution: INT4_SOURCE_MAP_EXECUTION,
+    let mut run = Int4SourceMapRun { schema_version: 1, execution: INT4_SOURCE_MAP_EXECUTION,
         numerics_profile: STRICT_INT4_PROFILE, group_width: expected.group_width,
         task_spec: expected.task_spec, semantics: SEMANTICS,
         planned_model_work: expected.work, model_work: work,
         reserved_mask_node_visits: expected.masks, mask_node_visit_charge: masks,
         verification_used: SourceMapVerification::used(verification, remaining)?,
-        untrusted_fields: ["mapped.root.value"], mapped };
+        untrusted_fields: ["mapped.root.value"], mapped,
+        request_binding: expected.request_binding, result_binding: [0; 32] };
+    run.result_binding = private_digest(b"fnlp-int4-source-map-result-v1", &run, cap)?;
     expected.verify_completed(&run)?;
     check_size(&run, cap).map_err(Int4SourceError::from)?;
     Ok(run)

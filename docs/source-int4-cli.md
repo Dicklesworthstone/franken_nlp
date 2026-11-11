@@ -63,6 +63,62 @@ the matching synthesis and hierarchy flags and never enables prompt prefill.
 See [structured INT4 cohorts](int4-structured-cohorts.md#native-hierarchy-group-cohorts)
 for allowed widths, complete memory admission and examples.
 
+### Compact input for complete source maps
+
+`ner-map`, `keyphrases-map` and plain cited `summarize-map` accept explicit
+`--input-encoding safe-bpe-v1`. This uses the pinned byte-preserving encoder for
+every real chunk, including exact keyphrase/summary reducers and
+`--cohort-chunks`. Actual encoded token counts determine chunk capacity,
+compiled prompts and native work. Source evidence continues to use the exact
+original UTF-8 bytes and their original byte/scalar coordinates. The default
+remains byte fallback; compact input is a distinct candidate input policy and
+does not establish tokenizer-oracle parity or task-quality equivalence.
+
+```sh
+fnlp candidate source-int4 ner-map report.txt \
+  --source-dir /models/nanbeige-source \
+  --source-manifest /models/pinned-source-manifest.json \
+  --memory-mib 8192 --input-encoding safe-bpe-v1 \
+  --max-chunk-bytes 8192 --cohort-chunks 2
+```
+
+One nonrenewable tokenizer ledger covers every chunk-size probe, discarded
+probe, actual plan and hosted repeat preflight. A failed or cancelled encoding
+keeps its incurred work. Input/output totals default to eight times
+`--max-input-bytes`; `--max-total-tokenizer-input-bytes` and
+`--max-total-tokenizer-output-tokens` select explicit ceilings. The complete
+invocation defaults to 268,435,456 pair checks and 4,294,967,296 examined pair
+bytes, selected by `--max-total-tokenizer-pair-checks` and
+`--max-total-tokenizer-pair-bytes`. Existing `--max-tokenizer-pair-checks` and
+`--max-tokenizer-pair-bytes` additionally cap each encoding. Exceeding any
+ceiling refuses the complete document. No retry renews those allowances.
+
+The per-call tokenizer workspace is included in preparation admission before
+private input or model IO. Policy and every configured ceiling bind the
+template identity; successful compact responses add an `input_encoding`
+object containing the policy, complete-operation limits and total work used.
+Byte-default response JSON keeps its existing shape. Internal source-map
+commitments additionally bind the exact source, options, all map limits and
+ordered native children. Completion seals reject substituted or changed
+payloads; exact reducer boundaries also bind every selected aggregation and
+final top-k limit. These process-private bindings are absent from JSON and
+default diagnostics.
+
+Library callers use `SourceTaskPlanner::with_map_document_encoding(policy,
+complete_limits)` once for the complete operation, retain that same planner
+through preflight/replanning, and admit
+`map_document_encoding_workspace_bytes()`. The one-request
+`with_document_encoding` constructor alone does not authorize repeated map
+probes. QA, neural summary synthesis/hierarchies, source corpora and durable
+source jobs continue to require their existing byte-only policy.
+
+Added regression definitions cover actual compact prompt work, Unicode and
+literal-control preservation, per-call and cumulative exhaustion, cancellation,
+host workspace admission, unchanged default output, request/payload substitution
+and every exact reducer limit. Executable Rust regressions, native-model
+quality/parity and performance remain pending the controller's DSR checkpoint
+and model-present gates.
+
 Entity `resolve` and resident `resolve-corpus` have independent native schedules:
 `--cohort-pairs 1..=32` keeps both orders of each candidate pair together, while
 `--cohort-chunks 1..=64` batches NER discovery with `--discover-entities`.

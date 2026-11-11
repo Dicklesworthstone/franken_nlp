@@ -165,6 +165,7 @@ impl SourceTaskPlanner {
         planning: SourcePlanningLimits, mapping: Int4SourceMapLimits, group_width: usize, control: &mut C)
         -> Result<PreparedInt4SummarySynthesis<'s>, Int4SourceMapError> {
         checkpoint(control)?;
+        self.encoder.require_byte_encoding().map_err(Int4SourceError::from)?;
         request.validate(planning)?;
         let (mut discovery_limits, synthesis_reserve) = reserve(budget, planning, mapping, group_width)?;
         discovery_limits.verification = meet_verification(discovery_limits.verification, request.limits.verification);

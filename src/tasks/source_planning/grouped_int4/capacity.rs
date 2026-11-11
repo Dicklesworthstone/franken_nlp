@@ -38,7 +38,8 @@ impl SourceTaskPlanner {
             SourceMapTask::Keyphrases(options) => (BuiltInTask::Keyphrases, options.schema_source()?),
             SourceMapTask::Summarize(options) => (BuiltInTask::Summarize, options.schema_source()?),
         };
-        self.check_context_for_profile(kind, context, budget, planning,
+        self.map_document_encoding_workspace_bytes()?;
+        self.check_one_off_context_for_profile(kind, context, budget, planning,
             NumericsProfile::StrictQuantized { version: 2 })?;
         if schema.len() > planning.compiler.max_schema_bytes {
             return Err(SourcePlanningError::InputBudget.into());

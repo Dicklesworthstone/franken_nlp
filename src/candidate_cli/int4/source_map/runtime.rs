@@ -53,8 +53,8 @@ fn preflight(source: &str, planner: &SourceTaskPlanner, config: &Int4SourceMapCo
     let prepared = planner.plan_int4_map_with_control(source, &config.task, config.budget, &context,
         config.planning, config.mapping, width, control).map_err(planning_error)?;
     if let Some(summary) = summary { prepared.check_summary(summary).map_err(|_| CandidateError::Planning)?; }
-    // Only bounded geometry/work metadata survives. The host replans the same
-    // original document under its own charge before native work can start.
+    // Bounded metadata includes the private request seal. The host replans the
+    // same document under its own charge and shared tokenizer-work allowance.
     Ok(prepared.preflight_metadata())
 }
 fn keyphrase_preflight(source: &str, planner: &SourceTaskPlanner, config: &Int4SourceMapConfig,
@@ -215,6 +215,11 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     let model = super::super::runtime::load_model(&engine, &args, common, remaining()?, cancellation.clone())?;
     remaining()?;
     let (planner, vocabulary) = source::planner()?;
+    let planner = match limits.encoding {
+        Some(encoding) => planner.with_map_document_encoding(encoding.policy(), encoding.complete)
+            .map_err(|_| CandidateError::Planning)?,
+        None => planner,
+    };
     let identity = source::identity(model.model_identity(), &planner, source::task(options.kind))?;
     let prepared = match task {
         Request::Map(task) => {
@@ -328,55 +333,60 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     match prepared {
         Prepared::Map(mut config, expected) => {
             config.native.run.max_elapsed = remaining()?;
+            let planner = Arc::new(planner);
             if let Some(aggregation) = limits.keyphrases {
                 if let Some(chunks) = limits.cohort_chunks {
                     let result = engine.reduce_int4_keyphrases_document_cohorts(&model, text,
-                        Arc::new(planner), Arc::new(vocabulary), config, aggregation, common.kernel, cancellation)
+                        Arc::clone(&planner), Arc::new(vocabulary), config, aggregation, common.kernel, cancellation)
                         .map_err(execution_error)?;
-                    expected.verify_keyphrases_completed(&result.result().document).map_err(|_| CandidateError::Execution)?;
+                    expected.verify_keyphrases_completed_with_limits(&result.result().document, aggregation)
+                        .map_err(|_| CandidateError::Execution)?;
                     remaining()?;
-                    publish_cohort(&provenance, &result.result().document, &result.result().cohorts,
-                        chunks, limits.max_result_bytes + 4096, output, &publication)
+                    publish_map(&provenance, &result.result().document, Some((&result.result().cohorts, chunks)),
+                        &planner, limits.max_result_bytes + 4096, output, &publication)
                 } else {
-                    let result = engine.reduce_int4_keyphrases_document(&model, text, Arc::new(planner), Arc::new(vocabulary),
+                    let result = engine.reduce_int4_keyphrases_document(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
                         config, aggregation, common.kernel, cancellation).map_err(execution_error)?;
-                    expected.verify_keyphrases_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+                    expected.verify_keyphrases_completed_with_limits(result.result(), aggregation)
+                        .map_err(|_| CandidateError::Execution)?;
                     remaining()?;
-                    publish_checked(&Response { provenance: &provenance, output: result.result() },
+                    publish_map(&provenance, result.result(), None, &planner,
                         limits.max_result_bytes + 4096, output, &publication)
                 }
             } else if let Some(summary) = limits.summary {
                 if let Some(chunks) = limits.cohort_chunks {
-                    let result = engine.summarize_int4_source_cohorts(&model, text, Arc::new(planner), Arc::new(vocabulary),
+                    let result = engine.summarize_int4_source_cohorts(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
                         config, summary, common.kernel, cancellation).map_err(execution_error)?;
-                    expected.verify_summary_completed(&result.result().document).map_err(|_| CandidateError::Execution)?;
+                    expected.verify_summary_completed_with_limits(&result.result().document, summary)
+                        .map_err(|_| CandidateError::Execution)?;
                     remaining()?;
-                    publish_cohort(&provenance, &result.result().document, &result.result().cohorts,
-                        chunks, limits.max_result_bytes + 4096, output, &publication)
+                    publish_map(&provenance, &result.result().document, Some((&result.result().cohorts, chunks)),
+                        &planner, limits.max_result_bytes + 4096, output, &publication)
                 } else {
-                    let result = engine.summarize_int4_source(&model, text, Arc::new(planner), Arc::new(vocabulary),
+                    let result = engine.summarize_int4_source(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
                         config, summary, common.kernel, cancellation).map_err(execution_error)?;
-                    expected.verify_summary_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+                    expected.verify_summary_completed_with_limits(result.result(), summary)
+                        .map_err(|_| CandidateError::Execution)?;
                     remaining()?;
-                    publish_checked(&Response { provenance: &provenance, output: result.result() },
+                    publish_map(&provenance, result.result(), None, &planner,
                         limits.max_result_bytes + 4096, output, &publication)
                 }
             } else if let Some(chunks) = limits.cohort_chunks {
-                let result = engine.map_int4_source_cohorts(&model, text, Arc::new(planner), Arc::new(vocabulary),
+                let result = engine.map_int4_source_cohorts(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
                     config, common.kernel, cancellation).map_err(execution_error)?;
                 expected.verify_completed(&result.result().document).map_err(|_| CandidateError::Execution)?;
                 remaining()?;
                 // Preserve the semantic document and keep its host guard live
                 // through complete serialization, write and flush. Only this
                 // outer scheduling field describes shared native execution.
-                publish_cohort(&provenance, &result.result().document, &result.result().cohorts,
-                    chunks, limits.max_result_bytes + 4096, output, &publication)
+                publish_map(&provenance, &result.result().document, Some((&result.result().cohorts, chunks)),
+                    &planner, limits.max_result_bytes + 4096, output, &publication)
             } else {
-                let result = engine.map_int4_source(&model, text, Arc::new(planner), Arc::new(vocabulary),
+                let result = engine.map_int4_source(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
                     config, common.kernel, cancellation).map_err(execution_error)?;
                 expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
                 remaining()?;
-                publish_checked(&Response { provenance: &provenance, output: result.result() },
+                publish_map(&provenance, result.result(), None, &planner,
                     limits.max_result_bytes + 4096, output, &publication)
             }
         }
@@ -539,6 +549,23 @@ fn publish_cohort<T: Serialize>(provenance: &Provenance<'_>, document: &T, physi
     publish_checked(&CohortResponse { response: Response { provenance, output: document },
         cohort_schedule: CohortSchedule { execution: "cross_chunk_constrained_cohorts",
             declared_max_chunks: chunks, physical } }, max_bytes, output, check)
+}
+#[allow(clippy::too_many_arguments)]
+fn publish_map<T: Serialize>(provenance: &Provenance<'_>, document: &T,
+    physical: Option<(&Int4SourceMapCohortStats, usize)>, planner: &SourceTaskPlanner,
+    max_bytes: usize, output: &mut impl Write, check: &impl Fn() -> Result<(), CandidateError>)
+    -> Result<(), CandidateError> {
+    let report = encoding::report(planner)?;
+    match physical {
+        Some((physical, chunks)) => publish_checked(&encoding::EncodedResponse {
+            response: CohortResponse { response: Response { provenance, output: document },
+                cohort_schedule: CohortSchedule { execution: "cross_chunk_constrained_cohorts",
+                    declared_max_chunks: chunks, physical } }, input_encoding: report.as_ref(),
+        }, max_bytes, output, check),
+        None => publish_checked(&encoding::EncodedResponse {
+            response: Response { provenance, output: document }, input_encoding: report.as_ref(),
+        }, max_bytes, output, check),
+    }
 }
 fn publish_discovery_cohort<T: Serialize>(provenance: &Provenance<'_>, document: &T,
     physical: &Int4SourceMapCohortStats, chunks: usize, max_bytes: usize, output: &mut impl Write,

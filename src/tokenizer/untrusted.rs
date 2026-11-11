@@ -113,6 +113,17 @@ impl SafeBpeWork {
     pub const fn pair_checks(&self) -> u64 { self.pair_checks }
     pub const fn pair_bytes(&self) -> u64 { self.pair_bytes }
 
+    /// Accumulate completed, failed or cancelled encoding work without a
+    /// refund. Composed callers separately retain the original limit envelope.
+    pub fn checked_add(self, other: Self) -> Option<Self> {
+        Some(Self {
+            input_bytes: self.input_bytes.checked_add(other.input_bytes)?,
+            output_tokens: self.output_tokens.checked_add(other.output_tokens)?,
+            pair_checks: self.pair_checks.checked_add(other.pair_checks)?,
+            pair_bytes: self.pair_bytes.checked_add(other.pair_bytes)?,
+        })
+    }
+
     fn check(&self, limits: SafeBpeLimits) -> Result<(), UntrustedDocumentError> {
         for (resource, exceeded) in [
             ("input bytes", self.input_bytes > limits.max_input_bytes),
@@ -151,6 +162,54 @@ impl SafeBpeWork {
         self.pair_checks = checks;
         self.pair_bytes = bytes;
         Ok(())
+    }
+}
+
+/// A nonrenewable allowance for repeated encodings within one explicit
+/// document operation. Each individual call still obeys `SafeBpeLimits` and
+/// its bounded workspace; these counters also cover probes and replanning.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SafeBpeWorkLimits {
+    pub max_input_bytes: u64,
+    pub max_output_tokens: u64,
+    pub max_pair_checks: u64,
+    pub max_pair_bytes: u64,
+}
+
+impl SafeBpeWorkLimits {
+    pub fn validate(self) -> Result<(), UntrustedDocumentError> {
+        for (resource, value, cap) in [
+            ("cumulative input bytes", self.max_input_bytes, (1_u64 << 40).min(usize::MAX as u64)),
+            ("cumulative output tokens", self.max_output_tokens, (1_u64 << 40).min(usize::MAX as u64)),
+            ("cumulative pair checks", self.max_pair_checks, 1_u64 << 44),
+            ("cumulative pair bytes", self.max_pair_bytes, 1_u64 << 48),
+        ] {
+            if value == 0 || value > cap {
+                return Err(UntrustedDocumentError::InvalidEncodingLimits { resource });
+            }
+        }
+        Ok(())
+    }
+
+    /// Tighten a call before it performs work. Exhaustion remains exhaustion
+    /// even if the previous call failed or the same document is replanned.
+    pub fn remaining_call(self, used: SafeBpeWork, call: SafeBpeLimits)
+        -> Result<SafeBpeLimits, UntrustedDocumentError> {
+        self.validate()?;
+        call.validate()?;
+        let left = |resource, cap: u64, used: u64| {
+            cap.checked_sub(used).filter(|&remaining| remaining != 0)
+                .ok_or(UntrustedDocumentError::EncodingBudget { resource })
+        };
+        Ok(SafeBpeLimits {
+            max_input_bytes: call.max_input_bytes.min(usize::try_from(left("cumulative input bytes",
+                self.max_input_bytes, used.input_bytes as u64)?).map_err(|_| UntrustedDocumentError::AllocationRefused)?),
+            max_output_tokens: call.max_output_tokens.min(usize::try_from(left("cumulative output tokens",
+                self.max_output_tokens, used.output_tokens as u64)?).map_err(|_| UntrustedDocumentError::AllocationRefused)?),
+            max_pair_checks: call.max_pair_checks.min(left("cumulative pair checks", self.max_pair_checks, used.pair_checks)?),
+            max_pair_bytes: call.max_pair_bytes.min(left("cumulative pair bytes", self.max_pair_bytes, used.pair_bytes)?),
+        })
     }
 }
 

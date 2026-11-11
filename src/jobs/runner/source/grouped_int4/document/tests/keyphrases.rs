@@ -177,7 +177,9 @@ fn receipt_fixture(factory: &Int4SourceDocumentJobPlanner) -> (planning::Expecte
         requested_max_phrases: limits.max_phrases, planned_model_work: work, model_work: work,
         reserved_mask_node_visits: expected.reserved_mask_visits(), mask_node_visit_charge: 0,
         verification_used: SourceMapVerification { fields: 0, matches: 0, scan_steps: 0 },
-        verification_scan_work: 0, keyphrases: result };
+        verification_scan_work: 0, keyphrases: result,
+        request_binding: [0; 32], reduction_binding: [0; 32], result_binding: [0; 32] }
+        .seal_test_fixture(expected, *limits).unwrap();
     (prepared.expected, run)
 }
 

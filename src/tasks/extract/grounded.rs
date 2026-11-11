@@ -7,7 +7,7 @@ use super::*;
 use crate::{
     grammar::source_index::SOURCE_LANGUAGE_VERSION,
     native_engine::decode::DecodeCancellationKind,
-    tokenizer::untrusted::{SafeBpeWork, UntrustedDocument, UntrustedDocumentEncoder,
+    tokenizer::untrusted::{SafeBpeWork, SafeBpeWorkLimits, UntrustedDocument, UntrustedDocumentEncoder,
         UntrustedDocumentError, UntrustedEncoding},
 };
 
@@ -18,6 +18,9 @@ pub struct SourceDocumentEncoder {
     controls: TemplateControlIds,
     control_digest: Sha256Digest,
     encoding: UntrustedEncoding,
+    /// Explicit composed-operation authority, shared by every use of this
+    /// encoder. Only counters are retained; there is no source-text cache.
+    encoding_work: Option<(SafeBpeWorkLimits, std::sync::Mutex<SafeBpeWork>)>,
 }
 impl SourceDocumentEncoder {
     pub fn pinned(controls: &TemplateControlIds) -> Result<Self, ExtractError> {
@@ -28,6 +31,7 @@ impl SourceDocumentEncoder {
             tokenizer: EmbeddedTokenizer::pinned().map_err(|_| ExtractError::Tokenizer)?,
             controls: controls.clone(), control_digest: control_digest(controls)?,
             encoding: UntrustedEncoding::ByteFallback,
+            encoding_work: None,
         })
     }
     /// Explicit one-request policy. Hosts admit the policy's tokenizer workspace
@@ -35,9 +39,25 @@ impl SourceDocumentEncoder {
     pub fn with_document_encoding(mut self, encoding: UntrustedEncoding) -> Result<Self, ExtractError> {
         encoding.validate().map_err(|_| ExtractError::Contract("invalid source document encoding policy"))?;
         self.encoding = encoding;
+        self.encoding_work = None;
         Ok(self)
     }
     pub fn document_encoding(&self) -> &UntrustedEncoding { &self.encoding }
+    pub(crate) fn with_cumulative_encoding_work(mut self, limits: SafeBpeWorkLimits) -> Result<Self, ExtractError> {
+        limits.validate().map_err(|_| ExtractError::Contract("invalid cumulative source encoding budget"))?;
+        if !matches!(self.encoding, UntrustedEncoding::SafeBpeV1(_)) {
+            return Err(ExtractError::Contract("cumulative source encoding requires safe BPE"));
+        }
+        self.encoding_work = Some((limits, std::sync::Mutex::new(SafeBpeWork::default())));
+        Ok(self)
+    }
+    pub fn cumulative_encoding_limits(&self) -> Option<SafeBpeWorkLimits> {
+        self.encoding_work.as_ref().map(|(limits, _)| *limits)
+    }
+    pub fn cumulative_encoding_work(&self) -> Result<Option<SafeBpeWork>, ExtractError> {
+        self.encoding_work.as_ref().map(|(_, work)| work.try_lock().map(|work| *work)
+            .map_err(|_| ExtractError::Contract("source encoding ledger is busy or poisoned"))).transpose()
+    }
     pub(crate) fn require_byte_encoding(&self) -> Result<(), ExtractError> {
         if self.encoding != UntrustedEncoding::ByteFallback {
             return Err(ExtractError::Contract("source document encoding requires controlled one-request admission"));
@@ -164,28 +184,54 @@ impl SourceDocumentEncoder {
     pub fn encode_with_context_and_control<F: FnMut() -> Option<DecodeCancellationKind>>(&self,
         text: &str, contexts: &[&str], max_bytes: usize, max_tokens: usize, checkpoint: &mut F)
         -> Result<SourceDocument, ExtractError> {
+        // Do not wait on the encoder from a callback or a concurrent caller.
+        // A retained ledger serializes a single admitted document operation;
+        // overlapping use refuses instead of deadlocking or renewing work.
+        let mut retained = self.encoding_work.as_ref().map(|(_, work)| work.try_lock()
+            .map_err(|_| ExtractError::Contract("source encoding ledger is busy or poisoned"))).transpose()?;
+        let policy = match (&self.encoding, self.cumulative_encoding_limits(), retained.as_ref()) {
+            (UntrustedEncoding::SafeBpeV1(call), Some(limits), Some(used)) => {
+                UntrustedEncoding::SafeBpeV1(limits.remaining_call(**used, *call)
+                    .map_err(|_| ExtractError::Contract("cumulative source encoding budget exceeded"))?)
+            },
+            (_, None, None) => self.encoding.clone(),
+            _ => return Err(ExtractError::Contract("source encoding ledger policy mismatch")),
+        };
+        let mut work = SafeBpeWork::default();
+        let result = self.encode_with_context_budget(text, contexts, max_bytes, max_tokens,
+            &policy, &mut work, checkpoint);
+        if let Some(used) = &mut retained {
+            **used = (**used).checked_add(work).ok_or(ExtractError::AllocationRefused)?;
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_with_context_budget<F: FnMut() -> Option<DecodeCancellationKind>>(&self,
+        text: &str, contexts: &[&str], max_bytes: usize, max_tokens: usize,
+        policy: &UntrustedEncoding, work: &mut SafeBpeWork, checkpoint: &mut F)
+        -> Result<SourceDocument, ExtractError> {
         encoding_checkpoint(checkpoint)?;
         if contexts.len() > 16 { return Err(ExtractError::Contract("too many source context segments")); }
         let total = contexts.iter().try_fold(text.len(), |sum, part| sum.checked_add(part.len()))
             .ok_or(ExtractError::AllocationRefused)?;
-        let byte_limit = match &self.encoding {
+        let byte_limit = match policy {
             UntrustedEncoding::ByteFallback => max_bytes.min(max_tokens),
             UntrustedEncoding::SafeBpeV1(limits) => max_bytes.min(limits.max_input_bytes),
         };
         if total > byte_limit {
             return Err(ExtractError::Contract("source and context exceed aggregate byte or token budget"));
         }
-        let mut work = SafeBpeWork::default();
         let mut context_documents = Vec::new();
         context_documents.try_reserve_exact(contexts.len()).map_err(|_| ExtractError::AllocationRefused)?;
         let mut token_count = 0_usize;
         for context in contexts {
-            let encoded = self.encode_part(context, &self.encoding, &mut work, checkpoint)?;
+            let encoded = self.encode_part(context, policy, work, checkpoint)?;
             token_count = token_count.checked_add(encoded.ids().len()).ok_or(ExtractError::AllocationRefused)?;
             if token_count > max_tokens { return Err(ExtractError::Contract("source context token budget exceeded")); }
             context_documents.push(encoded);
         }
-        let document = self.encode_part(text, &self.encoding, &mut work, checkpoint)?;
+        let document = self.encode_part(text, policy, work, checkpoint)?;
         token_count = token_count.checked_add(document.ids().len()).ok_or(ExtractError::AllocationRefused)?;
         if token_count > max_tokens { return Err(ExtractError::Contract("source token budget exceeded")); }
         encoding_checkpoint(checkpoint)?;

@@ -38,6 +38,35 @@ fn run(prepared: PreparedInt4SourceMap<'_>, limits: Int4KeyphraseLimits, driver:
 }
 
 #[test]
+fn complete_keyphrases_bind_every_reduction_limit_and_their_published_payload() {
+    let p = planner(); let prepared = prepare(&p, SOURCE, 2, 1);
+    let expected = prepared.preflight_metadata(); let driver = script(&prepared);
+    let mut result = run(prepared, limits(), driver).unwrap();
+    expected.verify_keyphrases_completed_with_limits(&result, limits()).unwrap();
+    for axis in 0..6 {
+        let mut changed = limits();
+        match axis {
+            0 => changed.max_phrases += 1,
+            1 => changed.max_result_bytes -= 1,
+            2 => changed.aggregation.max_unique_phrases += 1,
+            3 => changed.aggregation.max_evidence_spans += 1,
+            4 => changed.aggregation.max_value_bytes -= 1,
+            _ => changed.aggregation.max_scan_work += 1,
+        }
+        assert!(expected.verify_keyphrases_completed_with_limits(&result, changed).is_err(), "axis {axis}");
+    }
+    let prepared = prepare(&p, SOURCE, 2, 1); let driver = script(&prepared);
+    let mut another = limits(); another.max_phrases = 2;
+    let foreign = run(prepared, another, driver).unwrap();
+    expected.verify_keyphrases_completed_with_limits(&foreign, another).unwrap();
+    assert!(expected.verify_keyphrases_completed_with_limits(&foreign, limits()).is_err());
+    let json = serde_json::to_value(&result).unwrap();
+    for field in ["request_binding", "reduction_binding", "result_binding"] { assert!(json.get(field).is_none()); }
+    result.keyphrases.phrases[0].text.push('x');
+    assert!(expected.verify_keyphrases_completed(&result).is_err());
+}
+
+#[test]
 fn complete_root_ranking_preserves_late_support_and_every_unicode_occurrence() {
     let p = planner(); let prepared = prepare(&p, SOURCE, 2, 1);
     assert_eq!(prepared.chunk_count(), 4); let expected = prepared.preflight_metadata();

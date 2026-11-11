@@ -123,3 +123,60 @@ fn schema_and_evidence_source_spend_the_same_four_axis_encoding_ledger() {
     }
     assert_eq!(encoder.document_encoding(), &UntrustedEncoding::ByteFallback);
 }
+
+fn complete_limits(work: SafeBpeWork, times: u64) -> SafeBpeWorkLimits {
+    SafeBpeWorkLimits { max_input_bytes: work.input_bytes() as u64 * times,
+        max_output_tokens: work.output_tokens() as u64 * times,
+        max_pair_checks: work.pair_checks() * times, max_pair_bytes: work.pair_bytes() * times }
+}
+
+#[test]
+fn cumulative_encoder_tightens_every_axis_and_never_renews_between_calls() {
+    let ordinary = encoder(UntrustedEncoding::SafeBpeV1(limits()));
+    let mut once = SafeBpeWork::default();
+    UntrustedDocumentEncoder::new(ordinary.tokenizer.tokenizer(), &ordinary.controls)
+        .encode_with_policy(SOURCE.as_bytes(), ordinary.document_encoding(), &mut once, &mut || true).unwrap();
+    let complete = complete_limits(once, 2);
+    let shared = encoder(UntrustedEncoding::SafeBpeV1(limits()))
+        .with_cumulative_encoding_work(complete).unwrap();
+    for _ in 0..2 {
+        let result = shared.encode_with_control(SOURCE, 8192, 8192, &mut || None).unwrap();
+        assert_eq!(result.text(), SOURCE);
+        assert_eq!(result.document_encoding(), shared.document_encoding());
+    }
+    assert_eq!(shared.cumulative_encoding_work().unwrap(), once.checked_add(once));
+    assert!(shared.encode_with_control(SOURCE, 8192, 8192, &mut || None).is_err());
+    assert_eq!(shared.cumulative_encoding_work().unwrap(), once.checked_add(once));
+
+    for axis in 0..4 {
+        let mut short = complete;
+        match axis { 0 => short.max_input_bytes -= 1, 1 => short.max_output_tokens -= 1,
+            2 => short.max_pair_checks -= 1, _ => short.max_pair_bytes -= 1 }
+        let shared = encoder(UntrustedEncoding::SafeBpeV1(limits()))
+            .with_cumulative_encoding_work(short).unwrap();
+        shared.encode_with_control(SOURCE, 8192, 8192, &mut || None).unwrap();
+        assert!(shared.encode_with_control(SOURCE, 8192, 8192, &mut || None).is_err(), "axis {axis}");
+        let used = shared.cumulative_encoding_work().unwrap().unwrap();
+        assert!(used.input_bytes() as u64 <= short.max_input_bytes);
+        assert!(used.output_tokens() as u64 <= short.max_output_tokens);
+        assert!(used.pair_checks() <= short.max_pair_checks && used.pair_bytes() <= short.max_pair_bytes);
+    }
+}
+
+#[test]
+fn cumulative_encoder_charges_cancelled_work_and_refuses_reentry() {
+    let shared = encoder(UntrustedEncoding::SafeBpeV1(limits()))
+        .with_cumulative_encoding_work(SafeBpeWorkLimits { max_input_bytes: SOURCE.len() as u64,
+            max_output_tokens: 8192, max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 }).unwrap();
+    let mut polls = 0;
+    let result = shared.encode_with_control(SOURCE, 8192, 8192, &mut || {
+        polls += 1;
+        assert!(shared.cumulative_encoding_work().is_err(), "must not deadlock on its own ledger");
+        (polls == 3).then_some(DecodeCancellationKind::CostBudget)
+    });
+    assert!(matches!(result, Err(ExtractError::Decode(JsonDecodeError::Cancelled(DecodeCancellationKind::CostBudget)))));
+    assert_eq!(shared.cumulative_encoding_work().unwrap().unwrap().input_bytes(), SOURCE.len());
+    assert!(shared.encode_with_control(SOURCE, 8192, 8192, &mut || None).is_err());
+    assert!(encoder(UntrustedEncoding::ByteFallback).with_cumulative_encoding_work(SafeBpeWorkLimits {
+        max_input_bytes: 1, max_output_tokens: 1, max_pair_checks: 1, max_pair_bytes: 1 }).is_err());
+}

@@ -18,6 +18,37 @@ fn run(prepared: PreparedInt4SourceMap<'_>, limits: Int4SummaryLimits, driver: S
     -> Result<Int4CorpusSummaryRun, Int4CorpusSummaryError> {
     let ids = admitted(&prepared); prepared.execute_summary_with_driver(&ids, limits, driver)
 }
+
+#[test]
+fn complete_summary_binds_every_reduction_limit_and_its_published_payload() {
+    let p = planner(); let prepared = prepare(&p, "éAéAéAéA", 2);
+    let expected = prepared.preflight_metadata(); let driver = script(&prepared);
+    let mut result = run(prepared, limits(), driver).unwrap();
+    expected.verify_summary_completed_with_limits(&result, limits()).unwrap();
+    for axis in 0..7 {
+        let mut changed = limits();
+        match axis {
+            0 => changed.max_bullets += 1,
+            1 => changed.max_result_bytes -= 1,
+            2 => changed.aggregation.max_unique_bullets += 1,
+            3 => changed.aggregation.max_citations += 1,
+            4 => changed.aggregation.max_evidence_spans += 1,
+            5 => changed.aggregation.max_value_bytes -= 1,
+            _ => changed.aggregation.max_scan_steps += 1,
+        }
+        assert!(expected.verify_summary_completed_with_limits(&result, changed).is_err(), "axis {axis}");
+    }
+    let prepared = prepare(&p, "éAéAéAéA", 2); let driver = script(&prepared);
+    let mut another = limits(); another.max_bullets = 2;
+    let foreign = run(prepared, another, driver).unwrap();
+    expected.verify_summary_completed_with_limits(&foreign, another).unwrap();
+    assert!(expected.verify_summary_completed_with_limits(&foreign, limits()).is_err());
+    let json = serde_json::to_value(&result).unwrap();
+    for field in ["request_binding", "reduction_binding", "result_binding"] { assert!(json.get(field).is_none()); }
+    result.summary.bullets.clear();
+    assert!(expected.verify_summary_completed(&result).is_err());
+}
+
 #[test]
 fn final_top_k_preserves_late_support_and_every_original_unicode_occurrence() {
     let p = planner(); let source = "éAéAéAéA"; let prepared = prepare(&p, source, 2);

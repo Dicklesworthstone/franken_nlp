@@ -94,7 +94,14 @@ fn native_chunk_schedule_keeps_every_sealed_task_identity_and_whole_source_prefl
             config.mapping.reduction.map_batch_chunks = chunks;
             let grouped = planner.plan_int4_map_with_control(SOURCE, &config.task, config.budget, &context,
                 config.planning, config.mapping, 32, &mut continuing()).unwrap();
-            assert_eq!(grouped.preflight_metadata(), expected);
+            let grouped_meta = grouped.preflight_metadata();
+            assert_eq!(grouped_meta.source_span(), expected.source_span());
+            assert_eq!(grouped_meta.chunk_count(), expected.chunk_count());
+            assert_eq!(grouped_meta.planned_work(), expected.planned_work());
+            assert_eq!(grouped_meta.reserved_mask_visits(), expected.reserved_mask_visits());
+            // Physical scheduling leaves every child identity unchanged, but
+            // its selected complete-map policy has distinct receipt authority.
+            assert_eq!(grouped_meta == expected, chunks == 1);
             assert_eq!(grouped.execution_identities().cloned().collect::<Vec<_>>(), identities);
             let actual = grouped.cohort_requirements(config.native.context_tokens).unwrap();
             let ceiling = config.cohort_requirements(32).unwrap();
@@ -105,6 +112,34 @@ fn native_chunk_schedule_keeps_every_sealed_task_identity_and_whole_source_prefl
             assert!(actual.max_result_bytes <= ceiling.max_result_bytes);
         }
     }
+}
+
+#[test]
+fn compact_cli_preflight_and_host_replan_share_work_without_changing_request_binding() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, SafeBpeWorkLimits, UntrustedEncoding};
+    let (planner, mut config, summary) = fixture(Kind::Summarize, 32);
+    let response = serde_json::json!({"output":{"fixture_only":true}});
+    let byte_report = encoding::report(&planner).unwrap();
+    let byte = serde_json::to_value(encoding::EncodedResponse {
+        response: &response, input_encoding: byte_report.as_ref() }).unwrap();
+    assert_eq!(byte, response);
+    let planner = planner.with_map_document_encoding(UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+        max_input_bytes: 4096, max_output_tokens: 4096, max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24,
+    }), SafeBpeWorkLimits { max_input_bytes: 65_536, max_output_tokens: 65_536,
+        max_pair_checks: 1 << 24, max_pair_bytes: 1 << 28 }).unwrap();
+    config.identity.template_digest = *planner.template_digest();
+    let expected = preflight(SOURCE, &planner, &config, 32, summary, &mut continuing()).unwrap();
+    let once = planner.map_document_encoding_work().unwrap().unwrap();
+    let planner = Arc::new(planner);
+    let repeated = preflight(SOURCE, &Arc::clone(&planner), &config, 32, summary, &mut continuing()).unwrap();
+    assert_eq!(repeated, expected);
+    assert_eq!(planner.map_document_encoding_work().unwrap(), once.checked_add(once));
+    let report = encoding::report(&planner).unwrap();
+    let compact = serde_json::to_value(encoding::EncodedResponse {
+        response: &response, input_encoding: report.as_ref() }).unwrap();
+    assert_eq!(compact["output"], response["output"]);
+    assert_eq!(compact["input_encoding"]["work_used"]["input_bytes"], 2 * once.input_bytes());
+    assert!(!serde_json::to_string(&compact).unwrap().contains(SOURCE));
 }
 
 #[test]

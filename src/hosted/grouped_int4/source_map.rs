@@ -151,8 +151,11 @@ fn common_requirements<T>(config: &Int4SourceMapConfig<T>, source_bytes: usize, 
         return Err(HostedError::ModelIdentity);
     }
     let required = Int4MemoryRequirement::for_context(config.native.context_tokens, width).map_err(native_error)?;
+    let encoding_workspace = planner.map_document_encoding_workspace_bytes()
+        .map_err(|_| HostedError::Limits("INT4 source map encoding admission"))?;
     if source_bytes == 0 || source_bytes > config.mapping.chunks.max_input_bytes
         || config.preparation_reserve_bytes == 0 || config.reduction_reserve_bytes == 0
+        || config.preparation_reserve_bytes < encoding_workspace
         || config.native.allocator_reserve_bytes == 0
         || config.planning.max_context_tokens > config.native.context_tokens
         || required.kv_bytes > config.budget.max_kv_bytes

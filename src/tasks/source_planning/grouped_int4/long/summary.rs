@@ -100,6 +100,12 @@ pub struct Int4CorpusSummaryRun {
     /// Additional independent evidence-union verification, cumulatively capped.
     pub verification_scan_steps: u64,
     pub summary: CorpusSummaryResult,
+    #[serde(skip)]
+    request_binding: [u8; 32],
+    #[serde(skip)]
+    reduction_binding: [u8; 32],
+    #[serde(skip)]
+    result_binding: [u8; 32],
 }
 #[derive(Serialize)]
 pub struct Int4CorpusSummaryCohortRun {
@@ -110,7 +116,14 @@ pub struct Int4CorpusSummaryCohortRun {
     pub cohorts: Int4SourceMapCohortStats,
 }
 impl Int4SourceMapPreflight {
+    /// Authenticate this source, every admitted child and the unchanged result.
+    /// Use `verify_summary_completed_with_limits` to additionally require one
+    /// caller-selected exact reduction and final top-k policy.
     pub fn verify_summary_completed(&self, run: &Int4CorpusSummaryRun) -> Result<(), Int4CorpusSummaryError> {
+        if run.request_binding != self.request_binding
+            || run.result_binding != private_digest(b"fnlp-int4-source-summary-result-v1", run, self.max_result_bytes)? {
+            return Err(Int4CorpusSummaryError::Accounting);
+        }
         let s = &run.summary;
         if self.task_spec != SUMMARIZE_TASK_VERSION || run.schema_version != 1
             || run.execution != INT4_CORPUS_SUMMARY_EXECUTION || run.numerics_profile != STRICT_INT4_PROFILE
@@ -129,6 +142,19 @@ impl Int4SourceMapPreflight {
         }
         Ok(())
     }
+
+    pub fn verify_summary_completed_with_limits(&self, run: &Int4CorpusSummaryRun,
+        limits: Int4SummaryLimits) -> Result<(), Int4CorpusSummaryError> {
+        if run.reduction_binding != summary_binding(limits)? {
+            return Err(Int4CorpusSummaryError::Accounting);
+        }
+        self.verify_summary_completed(run)
+    }
+}
+
+fn summary_binding(limits: Int4SummaryLimits) -> Result<[u8; 32], Int4SourceMapError> {
+    private_digest(b"fnlp-int4-source-summary-reduction-v1",
+        &(limits.aggregation, limits.max_bullets, limits.max_result_bytes), 4096)
 }
 impl PreparedInt4SourceMap<'_> {
     pub fn check_summary(&self, limits: Int4SummaryLimits) -> Result<(), Int4CorpusSummaryError> {
@@ -196,14 +222,17 @@ impl PreparedInt4SourceMap<'_> {
             return Err(Int4CorpusSummaryError::Accounting);
         }
         let summary = reduced.into_value().into_ranked(limits.max_bullets, limits.max_result_bytes)?;
-        let run = Int4CorpusSummaryRun { schema_version: 1, execution: INT4_CORPUS_SUMMARY_EXECUTION,
+        let mut run = Int4CorpusSummaryRun { schema_version: 1, execution: INT4_CORPUS_SUMMARY_EXECUTION,
             numerics_profile: STRICT_INT4_PROFILE, group_width: self.expected.group_width, chunk_profile: CHUNK_PROFILE,
             semantics: SUMMARY_SEMANTICS, source_span: metadata.0, map_batches: metadata.1, reduce_calls: metadata.2,
             reduction_levels: metadata.3, planned_model_work: self.expected.work, model_work: pass.work,
             reserved_mask_node_visits: self.expected.masks, mask_node_visit_charge: pass.masks,
             verification_used: SourceMapVerification::used(self.limits.verification, pass.remaining)?,
-            verification_scan_steps: scan_steps, summary };
-        self.expected.verify_summary_completed(&run)?;
+            verification_scan_steps: scan_steps, summary,
+            request_binding: self.expected.request_binding, reduction_binding: summary_binding(limits)?,
+            result_binding: [0; 32] };
+        run.result_binding = private_digest(b"fnlp-int4-source-summary-result-v1", &run, self.expected.max_result_bytes)?;
+        self.expected.verify_summary_completed_with_limits(&run, limits)?;
         check_bytes(&run, limits.max_result_bytes)?;
         driver.borrow_mut().checkpoint()?;
         Ok(run)

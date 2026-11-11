@@ -16,6 +16,7 @@ mod question;
 pub(in crate::candidate_cli::int4) mod corpus;
 mod synthesis;
 mod keyphrases;
+mod encoding;
 pub(super) mod documents;
 #[cfg(feature = "asupersync-runtime")]
 mod runtime;
@@ -35,6 +36,8 @@ pub(super) struct MapArgs {
 }
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
 struct MappingArgs {
+    #[command(flatten)]
+    encoding: encoding::EncodingArgs,
     /// Refuse a document requiring more chunks; never truncate its source.
     #[arg(long, default_value_t = 64)]
     max_chunks: usize,
@@ -98,7 +101,9 @@ struct SummaryArgs {
     synthesis: synthesis::SynthesisArgs,
 }
 pub(super) fn definitions() -> Vec<clap::Command> {
-    definitions_with_cohorts(true)
+    definitions_with_cohorts(true).into_iter().map(|command| {
+        if command.get_name() == "answer-map" { command } else { encoding::definition(command) }
+    }).collect()
 }
 pub(super) fn document_job_definitions() -> Vec<clap::Command> {
     definitions_with_cohorts(true)
@@ -159,6 +164,7 @@ pub(super) struct MapLimits {
     pub hierarchy_cohorts: Option<Int4HierarchyCohortSchedule>,
     /// Additional simultaneous plan/source owners beyond the existing reserve.
     pub hierarchy_preparation_bytes: u64,
+    encoding: Option<encoding::EncodingLimits>,
 }
 impl MapArgs {
     pub(super) fn planning(&self, args: &Int4Args) -> crate::tasks::source_planning::SourcePlanningLimits {
@@ -192,7 +198,15 @@ impl MapArgs {
     }
     fn validate_mode(&self, args: &Int4Args, map_only: bool, document_job: bool) -> Result<MapLimits, CandidateError> {
         let m = self.mapping;
-        let mut common = self.source.validate(args)?;
+        let encoding = m.encoding.limits(args, &m, !document_job && !map_only
+            && self.kind != Kind::Answer
+            && self.summary.is_none_or(|summary| !summary.synthesis.synthesize_summary))?;
+        // Single-source storage validation prices the original input envelope.
+        // Compact map probes instead use the separately quoted per-chunk
+        // workspace and the complete-invocation ledger below.
+        let mut storage = args.clone();
+        storage.input_encoding = input_encoding::InputEncodingArgs::default();
+        let mut common = self.source.validate(&storage)?;
         if (self.kind == Kind::Answer) != self.question.is_some()
             || (self.kind == Kind::Summarize) != self.summary.is_some()
             || (self.kind == Kind::Keyphrases) != self.keyphrases.is_some() {
@@ -260,7 +274,7 @@ impl MapArgs {
         let preparation_passes = m.max_chunks as u64 + synthesis_passes;
         let preparation_floor = sum(&[times(per_chunk, preparation_passes)?, 256 * MIB,
             args.max_input_bytes as u64 * 64, (m.max_map_result_bytes as u64 + 4096) * 2,
-            question_preparation])?;
+            question_preparation, encoding.map(encoding::EncodingLimits::workspace_bytes).transpose()?.unwrap_or(0)])?;
         if common.preparation_bytes < preparation_floor { return Err(CandidateError::Arguments); }
         let workspace_bytes = match &self.question {
             Some(question) => match question_synthesis {
@@ -333,7 +347,7 @@ impl MapArgs {
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(MapLimits { common, mapping, summary, keyphrases, synthesis, question_synthesis, hierarchy, question_hierarchy,
             reduction_reserve_bytes, max_result_bytes, workspace_bytes,
-            cohort_chunks: self.cohort_chunks, cohort, hierarchy_cohorts, hierarchy_preparation_bytes })
+            cohort_chunks: self.cohort_chunks, cohort, hierarchy_cohorts, hierarchy_preparation_bytes, encoding })
     }
     pub(super) fn question_path(&self) -> Option<&std::path::Path> {
         self.question.as_ref().map(question::QuestionArgs::path)
