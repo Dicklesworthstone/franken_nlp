@@ -21,7 +21,9 @@ CHECK_ONLY=0
 ALLOW_UNTRUSTED=0
 TEST_BASE=
 LOCK_DIR=
+LOCK_OWNED=0
 JOURNAL_DIR=
+USER_AGENT='franken_nlp-agent (+https://github.com/Dicklesworthstone/franken_nlp)'
 
 log() {
     printf '%s FETCH_MODEL %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2
@@ -38,14 +40,21 @@ EOF
 }
 
 resume_guidance() {
-    printf 'RESUME command=scripts/fetch_model.sh --dest %s journal_dir=%s note="retry resumes secure journal-bound partials rather than restarting"\n' \
-        "$(printf %s "$DEST" | sed "s/'/'\\\\''/g; s/^/'/; s/$/'/")" \
-        "$(printf %s "$JOURNAL_DIR" | sed "s/'/'\\\\''/g; s/^/'/; s/$/'/")" >&2
+    printf 'RESUME command=scripts/fetch_model.sh --dest %s' "$(shell_quote "$DEST")" >&2
+    if [ "$REVISION" != "$DEFAULT_REVISION" ]; then printf ' --revision %s' "$(shell_quote "$REVISION")" >&2; fi
+    if [ "$ALLOW_UNTRUSTED" -eq 1 ]; then printf ' --allow-untrusted-revision' >&2; fi
+    if [ -n "$CATALOG" ]; then printf ' --catalog %s' "$(shell_quote "$CATALOG")" >&2; fi
+    if [ -n "$TEST_BASE" ]; then printf ' --test-base-url %s' "$(shell_quote "$TEST_BASE")" >&2; fi
+    printf ' journal_dir=%s note="retry resumes secure journal-bound partials rather than restarting"\n' "$(shell_quote "$JOURNAL_DIR")" >&2
 }
 
+shell_quote() { printf %s "$1" | sed "s/'/'\\\\''/g; s/^/'/; s/$/'/"; }
+
 release_lock() {
-    if [ -n "$LOCK_DIR" ] && [ -d "$LOCK_DIR" ]; then
-        rmdir "$LOCK_DIR" 2>/dev/null || log "LOCK_RELEASE_DEFERRED path=$LOCK_DIR"
+    # A failed mkdir never grants ownership of another downloader's lock.
+    if [ "$LOCK_OWNED" -eq 1 ] && [ -n "$LOCK_DIR" ]; then
+        if rmdir "$LOCK_DIR" 2>/dev/null; then LOCK_OWNED=0
+        else log "LOCK_RELEASE_DEFERRED path=$LOCK_DIR"; fi
     fi
 }
 
@@ -188,6 +197,7 @@ acquire_lock() {
     if ! mkdir "$LOCK_DIR" 2>/dev/null; then
         fail 4 "revision lock busy or stale path=$LOCK_DIR; do not bypass concurrent access"
     fi
+    LOCK_OWNED=1
     log "LOCK RESULT=PASS path=$LOCK_DIR"
 }
 
@@ -277,45 +287,97 @@ ensure_partial_and_journal() {
 }
 
 effective_host_ok() {
-    effective=$1
-    case "$effective" in
-        https://huggingface.co/*|https://cdn-lfs.huggingface.co/*|https://*.xethub.hf.co/*|https://*.cdn.hf.co/*) return 0 ;;
-        *) return 1 ;;
+    # Compare the authority, not a glob over the complete URL: a path such as
+    # unlisted.invalid/example.cdn.hf.co/file must never satisfy the host rule.
+    case "$1" in https://*) ;; *) return 1;; esac
+    case "$1" in *[[:space:][:cntrl:]]*|*\\*) return 1;; esac
+    policy_authority=${1#https://}
+    policy_authority=${policy_authority%%[/?#]*}
+    case "$policy_authority" in *:443) policy_authority=${policy_authority%:443};; esac
+    policy_host=$(printf %s "$policy_authority" | tr '[:upper:]' '[:lower:]')
+    case "$policy_host" in ''|*[!a-z0-9.-]*|.*|*.|*..*) return 1;; esac
+    policy_labels=$policy_host
+    while [ -n "$policy_labels" ]; do
+        policy_label=${policy_labels%%.*}
+        case "$policy_label" in -*|*-) return 1;; esac
+        case "$policy_labels" in *.*) policy_labels=${policy_labels#*.};; *) break;; esac
+    done
+    case "$policy_host" in
+        huggingface.co|cdn-lfs.huggingface.co|*.xethub.hf.co|*.cdn.hf.co) return 0;;
+        *) return 1;;
     esac
 }
 
 download_with_progress() {
-    url=$1
-    partial=$2
-    start=$(bytes "$partial")
-    curl_log="$JOURNAL_DIR/${partial##*/}.curl.log"
-    set -- curl --fail --location
-    if [ -z "$TEST_BASE" ]; then
-        set -- "$@" --proto =https --proto-redir =https
-    fi
-    set -- "$@" --max-redirs 8 --retry 3 --retry-all-errors --connect-timeout 30
-    if [ "$start" -gt 0 ]; then
-        "$@" --continue-at - --output "$partial" --write-out '%{url_effective}' "$url" > "$curl_log" 2>&1 &
-    else
-        "$@" --output "$partial" --write-out '%{url_effective}' "$url" > "$curl_log" 2>&1 &
-    fi
-    curl_pid=$!
-    while kill -0 "$curl_pid" 2>/dev/null; do
-        current=$(bytes "$partial" 2>/dev/null || printf 0)
-        log "PROGRESS file=${partial##*/} bytes=$current"
-        sleep 5
+    transfer_origin=$1
+    transfer_partial=$2
+    transfer_expected=$3
+    curl_log="$JOURNAL_DIR/${transfer_partial##*/}.curl.log"
+    curl_meta="$JOURNAL_DIR/${transfer_partial##*/}.curl.meta"
+    for transfer_log in "$curl_log" "$curl_meta"; do
+        if { [ -e "$transfer_log" ] || [ -L "$transfer_log" ]; } && ! is_secure_regular "$transfer_log"; then
+            log "TRANSFER_LOG_REFUSED path=$transfer_log"
+            return 90
+        fi
     done
-    wait "$curl_pid"
-    curl_status=$?
-    if [ "$curl_status" -ne 0 ]; then return "$curl_status"; fi
-    effective=$(tail -n 1 "$curl_log" | tr -d '\r\n')
-    if [ -z "$TEST_BASE" ] && ! effective_host_ok "$effective"; then
-        # This final-URL check gates verification and activation. Curl has already
-        # transferred the response, so it is not a no-request-to-unlisted-host claim.
-        log "REDIRECT_HOST_REFUSED phase=post-transfer activation=refused effective_url=$effective"
-        return 90
-    fi
-    return 0
+    transfer_attempt=1
+    while [ "$transfer_attempt" -le 4 ]; do
+        transfer_url=$transfer_origin
+        transfer_hops=0
+        while :; do
+            if [ -z "$TEST_BASE" ] && ! effective_host_ok "$transfer_url"; then
+                log "REDIRECT_HOST_REFUSED phase=pre-contact activation=refused effective_url=$transfer_url"
+                return 90
+            fi
+            transfer_start=$(bytes "$transfer_partial")
+            if [ "$transfer_start" -eq "$transfer_expected" ]; then return 0; fi
+            if [ "$transfer_start" -gt "$transfer_expected" ]; then return 63; fi
+            # Zero automatic hops lets curl resolve relative Location values,
+            # but it returns 47 BEFORE following or writing a redirect body.
+            # Only the next iteration may contact the validated destination.
+            # Disable user curl config so it cannot add credentials/redirects.
+            set -- curl --disable --globoff --silent --show-error --fail --location --max-redirs 0
+            if [ -z "$TEST_BASE" ]; then set -- "$@" --proto =https --proto-redir =https; fi
+            set -- "$@" --connect-timeout 30 --user-agent "$USER_AGENT"
+            "$@" --continue-at - --output "$transfer_partial" --write-out '%{http_code}
+%{redirect_url}
+' "$transfer_url" > "$curl_meta" 2> "$curl_log" &
+            curl_pid=$!
+            while kill -0 "$curl_pid" 2>/dev/null; do
+                current=$(bytes "$transfer_partial" 2>/dev/null || printf 0)
+                log "PROGRESS file=${transfer_partial##*/} bytes=$current expected_bytes=$transfer_expected"
+                sleep 1
+            done
+            wait "$curl_pid"
+            curl_status=$?
+            transfer_status=$(sed -n '1p' "$curl_meta" | tr -d '\r')
+            if [ "$curl_status" -eq 47 ]; then
+                case "$transfer_status" in 301|302|303|307|308) ;; *) return 47;; esac
+                if [ "$(bytes "$transfer_partial")" != "$transfer_start" ]; then
+                    log "REDIRECT_BODY_REFUSED file=${transfer_partial##*/}"
+                    return 90
+                fi
+                if [ "$transfer_hops" -ge 8 ]; then
+                    log "REDIRECT_LIMIT_REFUSED maximum=8"
+                    return 47
+                fi
+                transfer_next=$(sed -n '2p' "$curl_meta" | tr -d '\r')
+                if [ -z "$transfer_next" ]; then return 47; fi
+                transfer_hops=$((transfer_hops + 1))
+                transfer_url=$transfer_next
+                continue
+            fi
+            if [ "$curl_status" -eq 0 ]; then
+                case "$transfer_status" in 200|206) return 0;; *) return 22;; esac
+            fi
+            # The caller quarantines a server-refused resume before restarting.
+            if [ "$curl_status" -eq 33 ]; then return 33; fi
+            break
+        done
+        if [ "$transfer_attempt" -lt 4 ]; then sleep "$transfer_attempt"; fi
+        transfer_attempt=$((transfer_attempt + 1))
+    done
+    return "$curl_status"
 }
 
 verify_file() {
@@ -366,14 +428,14 @@ download_one() {
         start=0
     fi
     log "DECISION=$([ "$start" -gt 0 ] && printf RESUME || printf MISS) file=$name existing_bytes=$start expected_bytes=$length"
-    download_with_progress "$url" "$partial"
+    download_with_progress "$url" "$partial" "$length"
     curl_status=$?
     if [ "$curl_status" -eq 33 ] && [ "$start" -gt 0 ]; then
         log "DECISION=RESTART file=$name reason=server-refused-range-resume"
         quarantine "$partial" "server-refused-range-resume"
         quarantine "$journal" "server-refused-range-resume"
         ensure_partial_and_journal "$partial" "$journal" "$url" "$name" "$length" "$digest"
-        download_with_progress "$url" "$partial"
+        download_with_progress "$url" "$partial" "$length"
         curl_status=$?
     fi
     if [ "$curl_status" -ne 0 ]; then
@@ -405,6 +467,9 @@ case "$REVISION" in *[!0123456789abcdef]*|'') usage; exit 2;; esac
 if [ "$REVISION" != "$DEFAULT_REVISION" ]; then
     [ "$ALLOW_UNTRUSTED" -eq 1 ] && [ -n "$CATALOG" ] || { log "UNTRUSTED_REVISION_REFUSED revision=$REVISION requires --allow-untrusted-revision and --catalog"; exit 2; }
     log "UNTRUSTED_REVISION revision=$REVISION catalog=$CATALOG; this download is not the default recipe/catalog identity"
+elif [ -n "$CATALOG" ]; then
+    [ "$ALLOW_UNTRUSTED" -eq 1 ] || { log "UNTRUSTED_CATALOG_REFUSED revision=$REVISION requires --allow-untrusted-revision with --catalog"; exit 2; }
+    log "UNTRUSTED_CATALOG revision=$REVISION catalog=$CATALOG; this download is not the default recipe/catalog identity"
 fi
 if [ "$DEST_WAS_SET" -eq 0 ]; then
     DEST="$HOME/.cache/franken_nlp/source/$MODEL/$REVISION"

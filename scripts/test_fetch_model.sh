@@ -58,11 +58,13 @@ BASE="http://127.0.0.1:$PORT/resolve/$REV"
 run_fetch() {
     dest=$1
     shift
-    FNLP_FETCH_ALLOW_TEST_BASE_URL=1 "$FETCH" --dest "$dest" --catalog "$CATALOG" --test-base-url "$BASE" "$@"
+    FNLP_FETCH_ALLOW_TEST_BASE_URL=1 "$FETCH" --dest "$dest" --catalog "$CATALOG" --allow-untrusted-revision --test-base-url "$BASE" "$@"
 }
 
 start_redirect_server() {
     redirect_host=$1
+    redirect_location=${2:-}
+    REDIRECT_TRACE="$WORK/redirect-$redirect_host-$CASES.trace"
     TLS_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
     cat > "$WORK/redirect-openssl.cnf" <<EOF
 [req]
@@ -87,7 +89,7 @@ EOF
         ! openssl x509 -req -in "$WORK/redirect.csr" -CA "$WORK/redirect-ca.crt" -CAkey "$WORK/redirect-ca.key" -CAcreateserial -out "$WORK/redirect.crt" -days 1 -sha256 -extfile "$WORK/redirect-openssl.cnf" -extensions v3_leaf >> "$WORK/openssl.log" 2>&1; then
         return 1
     fi
-    FIXTURE_ROOT="$FIXTURE" REDIRECT_HOST="$redirect_host" TLS_PORT="$TLS_PORT" TLS_CERT="$WORK/redirect.crt" TLS_KEY="$WORK/redirect.key" python3 -c '
+    FIXTURE_ROOT="$FIXTURE" REDIRECT_HOST="$redirect_host" REDIRECT_LOCATION="$redirect_location" REDIRECT_TRACE="$REDIRECT_TRACE" TLS_PORT="$TLS_PORT" TLS_CERT="$WORK/redirect.crt" TLS_KEY="$WORK/redirect.key" python3 -c '
 import http.server
 import os
 import ssl
@@ -100,12 +102,20 @@ redirect_host = os.environ["REDIRECT_HOST"]
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         host = self.headers.get("Host", "").split(":", 1)[0].lower()
-        if host == "huggingface.co":
+        with open(os.environ["REDIRECT_TRACE"], "a", encoding="ascii") as trace:
+            trace.write("host={} path={} range={} agent={}\n".format(host, self.path, self.headers.get("Range", ""), self.headers.get("User-Agent", "")))
+        if host == "huggingface.co" and not self.path.startswith("/redirect-final/"):
             self.send_response(302)
-            self.send_header("Location", "https://{}{}".format(redirect_host, self.path))
+            target = os.environ["REDIRECT_LOCATION"] or "https://{}{}".format(redirect_host, self.path)
+            self.send_header("Location", target.replace("{name}", Path(urlsplit(self.path).path).name))
+            self.send_header("Content-Length", "15")
             self.end_headers()
+            try:
+                self.wfile.write(b"REDIRECTPAYLOAD")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             return
-        if host != redirect_host:
+        if host not in (redirect_host, "huggingface.co"):
             self.send_error(421, "unexpected host")
             return
         candidate = root / Path(urlsplit(self.path).path).name
@@ -113,10 +123,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
             return
         payload = candidate.read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Length", str(len(payload)))
+        start = 0
+        if self.headers.get("Range"):
+            start = int(self.headers["Range"].removeprefix("bytes=").removesuffix("-"))
+        self.send_response(206 if start else 200)
+        if start:
+            self.send_header("Content-Range", "bytes {}-{}/{}".format(start, len(payload) - 1, len(payload)))
+        self.send_header("Content-Length", str(len(payload) - start))
         self.end_headers()
-        self.wfile.write(payload)
+        self.wfile.write(payload[start:])
 
     def log_message(self, _format, *_args):
         pass
@@ -145,17 +160,17 @@ run_redirect_policy_fetch() {
     dest=$2
     output=$3
     error=$4
-    start_redirect_server "$redirect_host" || return 1
+    start_redirect_server "$redirect_host" "${5:-}" || return 1
     wrapper_dir="$WORK/redirect-curl-bin-$redirect_host"
     mkdir -p "$wrapper_dir"
     cat > "$wrapper_dir/curl" <<EOF
 #!/bin/sh
-exec "$REAL_CURL" --connect-to "huggingface.co:443:127.0.0.1:$TLS_PORT" --connect-to "$redirect_host:443:127.0.0.1:$TLS_PORT" --cacert "$WORK/redirect-ca.crt" "\$@"
+exec "$REAL_CURL" --disable --connect-to "huggingface.co:443:127.0.0.1:$TLS_PORT" --connect-to "$redirect_host:443:127.0.0.1:$TLS_PORT" --cacert "$WORK/redirect-ca.crt" "\$@"
 EOF
     chmod 700 "$wrapper_dir/curl"
     HTTPS_PROXY= https_proxy= HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
         PATH="$wrapper_dir:$PATH" \
-        "$FETCH" --dest "$dest" --catalog "$CATALOG" > "$output" 2> "$error"
+        "$FETCH" --dest "$dest" --catalog "$CATALOG" --allow-untrusted-revision > "$output" 2> "$error"
     status=$?
     stop_redirect_server
     return "$status"
@@ -195,9 +210,9 @@ if run_fetch "$DEST5" > "$WORK/case5.out" 2> "$WORK/case5.err" && cmp "$FIXTURE/
 
 # 6. Check-only fully hashes: complete passes, one tampered byte fails with both values.
 CASES=$((CASES + 1)); DEST6="$WORK/case6"
-if run_fetch "$DEST6" > "$WORK/case6-download.out" 2> "$WORK/case6-download.err" && FNLP_FETCH_ALLOW_TEST_BASE_URL=1 "$FETCH" --dest "$DEST6" --catalog "$CATALOG" --test-base-url "$BASE" --check-only > "$WORK/case6-pass.out" 2> "$WORK/case6-pass.err"; then
+if run_fetch "$DEST6" > "$WORK/case6-download.out" 2> "$WORK/case6-download.err" && run_fetch "$DEST6" --check-only > "$WORK/case6-pass.out" 2> "$WORK/case6-pass.err"; then
     printf 'X' >> "$DEST6/alpha.bin"
-    if FNLP_FETCH_ALLOW_TEST_BASE_URL=1 "$FETCH" --dest "$DEST6" --catalog "$CATALOG" --test-base-url "$BASE" --check-only > "$WORK/case6-fail.out" 2> "$WORK/case6-fail.err"; then fail_case 6 check-only-tamper; elif grep -q 'expected_sha256=' "$WORK/case6-fail.err" && grep -q 'observed_sha256=' "$WORK/case6-fail.err"; then pass_case 6 check-only-tamper; else fail_case 6 check-only-tamper; fi
+    if run_fetch "$DEST6" --check-only > "$WORK/case6-fail.out" 2> "$WORK/case6-fail.err"; then fail_case 6 check-only-tamper; elif grep -q 'expected_sha256=' "$WORK/case6-fail.err" && grep -q 'observed_sha256=' "$WORK/case6-fail.err"; then pass_case 6 check-only-tamper; else fail_case 6 check-only-tamper; fi
 else fail_case 6 check-only-setup; fi
 
 # 7. A non-default revision cannot inherit the default catalog identity.
@@ -209,12 +224,12 @@ CASES=$((CASES + 1)); DEST8="$WORK/case8"; secure_mkdir "$DEST8/.fnlp-fetch-jour
 head -c 5 "$FIXTURE/alpha.bin" > "$DEST8/alpha.bin.partial"
 printf 'url=http://127.0.0.1:1/alpha.bin\nrevision=%s\nname=alpha.bin\nbytes=%s\nsha256=%s\n' "$REV" "$ALPHA_BYTES" "$ALPHA_SHA" > "$DEST8/.fnlp-fetch-journals/alpha.bin.journal"
 BAD_BASE=http://127.0.0.1:1
-if FNLP_FETCH_ALLOW_TEST_BASE_URL=1 "$FETCH" --dest "$DEST8" --catalog "$CATALOG" --test-base-url "$BAD_BASE" > "$WORK/case8.out" 2> "$WORK/case8.err"; then fail_case 8 interrupted-resume-guidance; elif grep -Fq "scripts/fetch_model.sh --dest '$DEST8'" "$WORK/case8.err" && grep -q 'journal_dir=' "$WORK/case8.err"; then pass_case 8 interrupted-resume-guidance; else fail_case 8 interrupted-resume-guidance; fi
+if FNLP_FETCH_ALLOW_TEST_BASE_URL=1 "$FETCH" --dest "$DEST8" --catalog "$CATALOG" --allow-untrusted-revision --test-base-url "$BAD_BASE" > "$WORK/case8.out" 2> "$WORK/case8.err"; then fail_case 8 interrupted-resume-guidance; elif grep -Fq "scripts/fetch_model.sh --dest '$DEST8' --allow-untrusted-revision --catalog '$CATALOG'" "$WORK/case8.err" && grep -q 'journal_dir=' "$WORK/case8.err"; then pass_case 8 interrupted-resume-guidance; else fail_case 8 interrupted-resume-guidance; fi
 
 # 9. Check-only refuses an empty closure: exit zero means all catalogued files
 # verified, never merely that no model is installed.
 CASES=$((CASES + 1)); DEST9="$WORK/case9"
-if FNLP_FETCH_ALLOW_TEST_BASE_URL=1 "$FETCH" --dest "$DEST9" --catalog "$CATALOG" --test-base-url "$BASE" --check-only > "$WORK/case9.out" 2> "$WORK/case9.err"; then
+if run_fetch "$DEST9" --check-only > "$WORK/case9.out" 2> "$WORK/case9.err"; then
     fail_case 9 check-only-missing-closure-refusal
 elif grep -q 'CHECK_ONLY RESULT=FAIL' "$WORK/case9.err" && grep -q 'VERIFY RESULT=FAIL file=alpha.bin' "$WORK/case9.err" && grep -q 'VERIFY RESULT=FAIL file=beta.bin' "$WORK/case9.err"; then
     pass_case 9 check-only-missing-closure-refusal
@@ -226,12 +241,91 @@ fi
 CASES=$((CASES + 1)); DEST10="$WORK/case10"
 if run_redirect_policy_fetch us.aws.cdn.hf.co "$DEST10" "$WORK/case10.out" "$WORK/case10.err" && cmp "$FIXTURE/alpha.bin" "$DEST10/alpha.bin" >/dev/null && cmp "$FIXTURE/beta.bin" "$DEST10/beta.bin" >/dev/null; then pass_case 10 regional-cdn-redirect-accepted; else fail_case 10 regional-cdn-redirect-accepted; fi
 
-# 11. An unlisted final URL is post-transfer refused and never activated.
+# 11. An unlisted redirect is refused before contacting it or writing its body.
 CASES=$((CASES + 1)); DEST11="$WORK/case11"
 if run_redirect_policy_fetch unlisted.invalid "$DEST11" "$WORK/case11.out" "$WORK/case11.err"; then
     fail_case 11 unlisted-redirect-refusal
-elif [ ! -e "$DEST11/alpha.bin" ] && grep -q 'REDIRECT_HOST_REFUSED phase=post-transfer activation=refused effective_url=https://unlisted.invalid/' "$WORK/case11.err"; then
+elif [ ! -e "$DEST11/alpha.bin" ] && [ ! -s "$DEST11/alpha.bin.partial" ] &&
+    ! grep -q 'host=unlisted.invalid ' "$REDIRECT_TRACE" &&
+    grep -q 'REDIRECT_HOST_REFUSED phase=pre-contact activation=refused effective_url=https://unlisted.invalid/' "$WORK/case11.err"; then
     pass_case 11 unlisted-redirect-refusal
 else
     fail_case 11 unlisted-redirect-refusal
 fi
+
+# 12. Failed acquisition cannot release another downloader's empty lock.
+CASES=$((CASES + 1)); DEST12="$WORK/case12"
+secure_mkdir "$DEST12/.fnlp-fetch-lock-$REV"
+run_fetch "$DEST12" --check-only > "$WORK/case12.out" 2> "$WORK/case12.err"
+lock_status=$?
+run_fetch "$DEST12" --check-only > "$WORK/case12-again.out" 2> "$WORK/case12-again.err"
+lock_retry_status=$?
+if [ "$lock_status" -eq 4 ] && [ "$lock_retry_status" -eq 4 ] && [ -d "$DEST12/.fnlp-fetch-lock-$REV" ] &&
+    grep -q 'revision lock busy or stale' "$WORK/case12.err"; then pass_case 12 contended-lock-preserved
+else fail_case 12 contended-lock-preserved; fi
+
+# 13. A custom catalog never inherits the pinned revision's trust implicitly.
+CASES=$((CASES + 1)); DEST13="$WORK/case13"
+"$FETCH" --dest "$DEST13" --catalog "$CATALOG" --check-only > "$WORK/case13.out" 2> "$WORK/case13.err"
+catalog_status=$?
+if [ "$catalog_status" -eq 2 ] && [ ! -e "$DEST13" ] && grep -q 'UNTRUSTED_CATALOG_REFUSED' "$WORK/case13.err"; then pass_case 13 custom-catalog-requires-opt-in
+else fail_case 13 custom-catalog-requires-opt-in; fi
+
+# 14. An allowlisted-looking path cannot authorize an unlisted hostname.
+CASES=$((CASES + 1)); DEST14="$WORK/case14"
+if run_redirect_policy_fetch unlisted.invalid "$DEST14" "$WORK/case14.out" "$WORK/case14.err" 'https://unlisted.invalid/example.xethub.hf.co/{name}'; then
+    fail_case 14 redirect-path-cannot-authorize-host
+elif [ ! -s "$DEST14/alpha.bin.partial" ] && ! grep -q 'host=unlisted.invalid ' "$REDIRECT_TRACE" && grep -q 'phase=pre-contact' "$WORK/case14.err"; then
+    pass_case 14 redirect-path-cannot-authorize-host
+else fail_case 14 redirect-path-cannot-authorize-host; fi
+
+# 15. Relative redirects retain the original authority and exclude body bytes.
+CASES=$((CASES + 1)); DEST15="$WORK/case15"
+if run_redirect_policy_fetch us.aws.cdn.hf.co "$DEST15" "$WORK/case15.out" "$WORK/case15.err" '/redirect-final/{name}' &&
+    cmp "$FIXTURE/alpha.bin" "$DEST15/alpha.bin" >/dev/null &&
+    grep -q 'host=huggingface.co path=/redirect-final/alpha.bin' "$REDIRECT_TRACE" &&
+    grep -q 'agent=franken_nlp-agent ' "$REDIRECT_TRACE"; then pass_case 15 relative-redirect-and-agent
+else fail_case 15 relative-redirect-and-agent; fi
+
+# 16. A loop is bounded even when every hop uses an authorized hostname.
+CASES=$((CASES + 1)); DEST16="$WORK/case16"
+if run_redirect_policy_fetch us.aws.cdn.hf.co "$DEST16" "$WORK/case16.out" "$WORK/case16.err" '/loop/{name}'; then
+    fail_case 16 redirect-loop-bounded
+elif [ "$(wc -l < "$REDIRECT_TRACE" | tr -d '[:space:]')" -eq 9 ] && [ ! -s "$DEST16/alpha.bin.partial" ] && grep -q 'REDIRECT_LIMIT_REFUSED' "$WORK/case16.err"; then
+    pass_case 16 redirect-loop-bounded
+else fail_case 16 redirect-loop-bounded; fi
+
+# 17. A Range resume survives an accepted redirect without losing its prefix.
+CASES=$((CASES + 1)); DEST17="$WORK/case17"; secure_mkdir "$DEST17/.fnlp-fetch-journals"
+head -c 5 "$FIXTURE/alpha.bin" > "$DEST17/alpha.bin.partial"
+printf 'url=https://huggingface.co/Nanbeige/Nanbeige4.2-3B/resolve/%s/alpha.bin\nrevision=%s\nname=alpha.bin\nbytes=%s\nsha256=%s\n' "$REV" "$REV" "$ALPHA_BYTES" "$ALPHA_SHA" > "$DEST17/.fnlp-fetch-journals/alpha.bin.journal"
+if run_redirect_policy_fetch us.aws.cdn.hf.co "$DEST17" "$WORK/case17.out" "$WORK/case17.err" &&
+    cmp "$FIXTURE/alpha.bin" "$DEST17/alpha.bin" >/dev/null &&
+    grep -q 'host=us.aws.cdn.hf.co .*range=bytes=5-' "$REDIRECT_TRACE" &&
+    ! grep -q 'DECISION=RESTART' "$WORK/case17.err"; then pass_case 17 redirected-range-resume
+else fail_case 17 redirected-range-resume; fi
+
+# 18. Authority parsing rejects credentials, nondefault ports and scheme tricks.
+CASES=$((CASES + 1))
+sed -n '/^effective_host_ok() {/,/^}/p' "$FETCH" > "$WORK/host-policy.sh"
+cat >> "$WORK/host-policy.sh" <<'EOF'
+for allowed in 'https://huggingface.co/file' 'https://CDN-LFS.HUGGINGFACE.CO:443/file' 'https://us.aws.cdn.hf.co/file' 'https://cas-bridge.xethub.hf.co/file'; do
+    effective_host_ok "$allowed" || exit 1
+done
+for denied in 'https://huggingface.co@unlisted.invalid/file' 'https://unlisted.invalid@huggingface.co/file' 'https://huggingface.co:444/file' 'http://huggingface.co/file' 'https://unlisted.invalid/.cdn.hf.co/file' 'https://a..cdn.hf.co/file' 'https://-a.cdn.hf.co/file' 'https://huggingface.co\@unlisted.invalid/file'; do
+    if effective_host_ok "$denied"; then exit 1; fi
+done
+EOF
+if sh "$WORK/host-policy.sh"; then pass_case 18 strict-redirect-authority
+else fail_case 18 strict-redirect-authority; fi
+
+# 19. Contention also preserves a lock's retained owner/recovery contents.
+CASES=$((CASES + 1)); DEST19="$WORK/case19"
+secure_mkdir "$DEST19/.fnlp-fetch-lock-$REV"
+printf 'another invocation owns this lock\n' > "$DEST19/.fnlp-fetch-lock-$REV/owner.txt"
+run_fetch "$DEST19" --check-only > "$WORK/case19.out" 2> "$WORK/case19.err"
+lock_status=$?
+if [ "$lock_status" -eq 4 ] && [ -f "$DEST19/.fnlp-fetch-lock-$REV/owner.txt" ] &&
+    [ "$(cat "$DEST19/.fnlp-fetch-lock-$REV/owner.txt")" = 'another invocation owns this lock' ] &&
+    ! grep -q 'LOCK_RELEASE_DEFERRED' "$WORK/case19.err"; then pass_case 19 nonempty-contended-lock-untouched
+else fail_case 19 nonempty-contended-lock-untouched; fi

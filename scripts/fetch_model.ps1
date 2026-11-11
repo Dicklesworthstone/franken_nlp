@@ -18,7 +18,9 @@ $Model = 'Nanbeige4.2-3B'
 $DefaultBase = 'https://huggingface.co/Nanbeige/Nanbeige4.2-3B/resolve'
 $MarginBytes = [int64]67108864
 $script:LockDir = $null
+$script:LockOwned = $false
 $script:JournalDir = $null
+$UserAgent = 'franken_nlp-agent (+https://github.com/Dicklesworthstone/franken_nlp)'
 
 function Write-Log([string]$Message) {
     [Console]::Error.WriteLine("{0} FETCH_MODEL {1}" -f [DateTime]::UtcNow.ToString('o'), $Message)
@@ -31,12 +33,18 @@ function Write-Usage {
 }
 
 function Write-ResumeGuidance {
-    [Console]::Error.WriteLine(('RESUME command=pwsh -File scripts/fetch_model.ps1 -Dest "{0}" journal_dir="{1}" note="retry resumes secure journal-bound partials rather than restarting"' -f $Dest, $script:JournalDir))
+    $resumeOptions = ''
+    if ($Revision -ne $DefaultRevision) { $resumeOptions += " -Revision '$($Revision.Replace("'", "''"))'" }
+    if ($AllowUntrustedRevision) { $resumeOptions += ' -AllowUntrustedRevision' }
+    if ($Catalog) { $resumeOptions += " -Catalog '$($Catalog.Replace("'", "''"))'" }
+    if ($TestBaseUrl) { $resumeOptions += " -TestBaseUrl '$($TestBaseUrl.Replace("'", "''"))'" }
+    [Console]::Error.WriteLine(('RESUME command=pwsh -File scripts/fetch_model.ps1 -Dest "{0}"{2} journal_dir="{1}" note="retry resumes secure journal-bound partials rather than restarting"' -f $Dest, $script:JournalDir, $resumeOptions))
 }
 
 function Release-Lock {
-    if ($null -ne $script:LockDir -and (Test-Path -LiteralPath $script:LockDir -PathType Container)) {
-        try { Remove-Item -LiteralPath $script:LockDir -Force -ErrorAction Stop }
+    # Failed acquisition must never remove another downloader's directory.
+    if ($script:LockOwned -and $null -ne $script:LockDir) {
+        try { [IO.Directory]::Delete($script:LockDir, $false); $script:LockOwned = $false }
         catch { Write-Log "LOCK_RELEASE_DEFERRED path=$script:LockDir" }
     }
 }
@@ -139,10 +147,10 @@ function Test-SecureRegularFile([string]$Path) {
 }
 
 function Ensure-Destination {
-    New-Item -ItemType Directory -LiteralPath $Dest -Force | Out-Null
+    New-Item -ItemType Directory -Path $Dest -Force | Out-Null
     Assert-OwnerControlledDirectory $Dest
     $script:JournalDir = Join-Path $Dest '.fnlp-fetch-journals'
-    New-Item -ItemType Directory -LiteralPath $script:JournalDir -Force | Out-Null
+    New-Item -ItemType Directory -Path $script:JournalDir -Force | Out-Null
     Assert-OwnerControlledDirectory $script:JournalDir
 }
 
@@ -168,7 +176,7 @@ function Test-VerifiedFile([string]$Path, [int64]$ExpectedLength, [string]$Expec
 function Quarantine([string]$Path, [string]$Reason) {
     if (-not (Test-Path -LiteralPath $Path)) { return }
     $qdir = Join-Path $Dest 'quarantine'
-    New-Item -ItemType Directory -LiteralPath $qdir -Force | Out-Null
+    New-Item -ItemType Directory -Path $qdir -Force | Out-Null
     Assert-OwnerControlledDirectory $qdir
     $observed = if (Test-SecureRegularFile $Path) { Get-Sha256 $Path } elseif (Test-ReparsePoint $Path) { 'reparse-refused' } else { 'unreadable' }
     $target = Join-Path $qdir (([IO.Path]::GetFileName($Path)) + '.' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '.' + $PID + '.' + $observed)
@@ -225,8 +233,11 @@ function Assert-Preflight($Entries) {
 }
 
 function Test-EffectiveHost([Uri]$Uri) {
-    $host = $Uri.Host.ToLowerInvariant()
-    return $Uri.Scheme -eq 'https' -and ($host -eq 'huggingface.co' -or $host -eq 'cdn-lfs.huggingface.co' -or $host -like '*.xethub.hf.co' -or $host -like '*.cdn.hf.co')
+    if (-not $Uri.IsAbsoluteUri -or $Uri.Scheme -ne 'https' -or $Uri.Port -ne 443 -or $Uri.UserInfo -or $Uri.OriginalString -match '[\s\x00-\x1f\x7f\\]') { return $false }
+    # $Host is a read-only PowerShell automatic variable.
+    $downloadHost = $Uri.Host.ToLowerInvariant()
+    if ($downloadHost -notmatch '^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$') { return $false }
+    return $downloadHost -eq 'huggingface.co' -or $downloadHost -eq 'cdn-lfs.huggingface.co' -or $downloadHost -like '*.xethub.hf.co' -or $downloadHost -like '*.cdn.hf.co'
 }
 
 function Download-Partial([string]$Url, [string]$Partial, [string]$Journal, $Entry) {
@@ -246,19 +257,35 @@ function Download-Partial([string]$Url, [string]$Partial, [string]$Journal, $Ent
             if ($start -eq $Entry.Length) { return }
             $expectedBodyBytes = $Entry.Length - $start
             $requestedUri = [Uri]$Url
-            if (-not $TestBaseUrl -and -not (Test-EffectiveHost $requestedUri)) { throw "redirect host refused effective_url=$requestedUri" }
             $handler = [Net.Http.HttpClientHandler]::new()
-            $handler.AllowAutoRedirect = $true
-            $handler.MaxAutomaticRedirections = 8
+            $handler.AllowAutoRedirect = $false
+            $handler.UseCookies = $false
             $client = [Net.Http.HttpClient]::new($handler)
             $request = $null
             $response = $null
             $input = $null
             $output = $null
             try {
-                $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, $Url)
-                if ($start -gt 0) { $request.Headers.Range = [Net.Http.Headers.RangeHeaderValue]::Parse("bytes=$start-") }
-                $response = $client.SendAsync($request, [Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+                for ($redirects = 0; ; $redirects++) {
+                    if (-not $TestBaseUrl -and -not (Test-EffectiveHost $requestedUri)) {
+                        Write-Log "REDIRECT_HOST_REFUSED phase=pre-contact activation=refused effective_url=$requestedUri"
+                        throw "redirect host refused effective_url=$requestedUri"
+                    }
+                    $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, $requestedUri)
+                    $request.Headers.UserAgent.ParseAdd($UserAgent)
+                    if ($start -gt 0) { $request.Headers.Range = [Net.Http.Headers.RangeHeaderValue]::Parse("bytes=$start-") }
+                    $response = $client.SendAsync($request, [Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+                    if ([int]$response.StatusCode -notin @(301, 302, 303, 307, 308)) { break }
+                    if ($redirects -ge 8) { throw 'redirect limit exceeded maximum=8' }
+                    $location = $response.Headers.Location
+                    if ($null -eq $location) { throw 'redirect response has no Location' }
+                    $requestedUri = [Uri]::new($requestedUri, $location)
+                    # Never consume a redirect body or forward request headers
+                    # through an automatic redirect. Validate the resolved URI
+                    # before the next request, including relative Location.
+                    $response.Dispose(); $response = $null
+                    $request.Dispose(); $request = $null
+                }
                 if (-not $response.IsSuccessStatusCode) { throw "HTTP status $([int]$response.StatusCode)" }
                 if ($start -gt 0) {
                     if ($response.StatusCode -ne [Net.HttpStatusCode]::PartialContent) { throw 'server refused secure Range resume' }
@@ -271,11 +298,6 @@ function Download-Partial([string]$Url, [string]$Partial, [string]$Journal, $Ent
                 $contentLength = $response.Content.Headers.ContentLength
                 if ($null -ne $contentLength -and $contentLength -ne $expectedBodyBytes) {
                     throw "server returned mismatched Content-Length expected=$expectedBodyBytes actual=$contentLength"
-                }
-                $effectiveUri = $response.RequestMessage.RequestUri
-                if (-not $TestBaseUrl -and -not (Test-EffectiveHost $effectiveUri)) {
-                    Write-Log "REDIRECT_HOST_REFUSED phase=post-contact-body-refused activation=refused effective_url=$effectiveUri"
-                    throw "redirect host refused effective_url=$effectiveUri"
                 }
                 $input = $response.Content.ReadAsStream()
                 $output = [IO.File]::Open($Partial, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::None)
@@ -359,8 +381,9 @@ if ($TestBaseUrl -and $env:FNLP_FETCH_ALLOW_TEST_BASE_URL -ne '1') { Exit-Fetch 
 Ensure-Destination
 $entries = Get-Catalog
 $script:LockDir = Join-Path $Dest ('.fnlp-fetch-lock-' + $Revision)
-try { New-Item -ItemType Directory -LiteralPath $script:LockDir -ErrorAction Stop | Out-Null }
+try { New-Item -ItemType Directory -Path $script:LockDir -ErrorAction Stop | Out-Null }
 catch { Exit-Fetch 4 "revision lock busy or stale path=$script:LockDir; do not bypass concurrent access" }
+$script:LockOwned = $true
 Write-Log "LOCK RESULT=PASS path=$script:LockDir"
 
 $failed = $false

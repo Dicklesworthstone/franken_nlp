@@ -4,7 +4,45 @@ This is the retained local-fixture evidence for `franken_nlp-mzr`. It exercises
 the provisioning scripts only; it does not download model weights and is not an
 inference or release-installer test.
 
-## Unix fixture run
+## Current source-acquisition regression run
+
+The source fetchers now authorize each resolved redirect destination before
+contacting it. The allowlist remains `huggingface.co`,
+`cdn-lfs.huggingface.co`, `*.xethub.hf.co`, and `*.cdn.hf.co`, on HTTPS port 443
+without URL credentials. Host matching examines the authority rather than a
+path substring. Relative redirects are resolved before this check, at most
+eight hops are allowed per attempt, and redirect bodies never enter the model
+partial. Both clients send the project User-Agent and retain Range offsets.
+
+Lock cleanup now requires successful acquisition by the current invocation.
+A competing downloader cannot remove an empty lock or alter retained owner
+contents. Unix custom catalogs, including those using the default revision,
+now require `--allow-untrusted-revision`, matching PowerShell's explicit
+`-AllowUntrustedRevision` consent. Printed retry guidance retains the custom
+catalog, revision and opt-in options.
+
+The current Unix local fixture suite completed with exit code 0:
+
+```text
+2026-11-11T02:56:52Z FETCH_MODEL_TEST FETCH_MODEL_TESTS RESULT=PASS cases=20 failed=none retained_work=/tmp/fnlp-fetch-model-test.i3cnvt
+```
+
+Command: `scripts/test_fetch_model.sh`. Separate `sh -n` checks of both shell
+scripts and Python AST parsing of the embedded loopback servers also passed.
+The added cases retain request traces for unlisted-host refusal before contact,
+hostname/path confusion, accepted relative redirects, redirect loops, resumed
+Range requests, project User-Agent, strict authority syntax, both empty and
+nonempty contended locks, and custom-catalog refusal before filesystem access.
+Existing download, quarantine, digest, symlink and missing-closure cases passed.
+
+This is local provisioning-script evidence only, not a DSR, model-parity,
+publisher or release qualification. Equivalent PowerShell cases are committed
+but **unrun** because `pwsh` is absent on this host. PowerShell also corrects
+the read-only `$Host` variable collision and uses the supported `New-Item -Path`
+parameter for destination, journal, quarantine and lock directories.
+The full real-model closure and Windows filesystem receipts remain outstanding.
+
+## Historical Unix fixture run
 
 - Timestamp: `2026-07-31T10:00:47Z` through `2026-07-31T10:02:23Z`
 - Host-local command: `sh -n scripts/fetch_model.sh && sh -n scripts/test_fetch_model.sh && scripts/test_fetch_model.sh`

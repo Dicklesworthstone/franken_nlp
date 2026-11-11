@@ -109,7 +109,17 @@ The exact byte-routing requires care: stdout is for data, stderr is for diagnost
 
 ## cr-003 — `scripts/fetch_model.sh::effective_host_ok` is bypassable via path substring
 
-**Status:** finding logged, fix NOT staged (coordinating with swarm before touching shell scripts; see "Coordination" below). Bead id is not yet filed because `br create` is returning `UNIQUE constraint failed: blocked_issues_cache.issue_id` after the recent `fsqlite` migration repair (the DB view is currently inconsistent; only `br doctor` succeeds, and each doctor run triggers another migration). The JSONL still records every prior bead including yjg9/o1bk/eak4/3awi/3rf4, so the data is durable; only the in-memory DB cache is wedged. A future `br doctor` or restart should reset it.
+**Current status:** source repair implemented under `franken_nlp-mzr`.
+The Unix helper now validates the authority and authorizes each redirect before
+contact; it no longer matches the whole URL or follows an unlisted redirect.
+The expanded local Unix fixture suite passes all 20 cases, including a retained
+request trace proving refusal of the path-substring example below before
+contact. See [the current fixture transcript](truth-pack/fetch-model-fixture-transcript.md).
+PowerShell has equivalent regression definitions but remains unrun on this
+host. Its old `$host` assignment also collided with PowerShell's read-only
+automatic `$Host`; the repaired function uses `$downloadHost`. The original
+analysis below describes the historical implementation; it is not a current
+Windows, DSR or full-source-closure qualification.
 
 ### Symptom (evidence)
 

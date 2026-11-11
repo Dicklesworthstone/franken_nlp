@@ -115,14 +115,16 @@ server.serve_forever()
     Stop-RetryServer
     return $null
 }
-function Start-RedirectServer([string]$RedirectHost) {
+function Start-RedirectServer([string]$RedirectHost, [string]$RedirectLocation = '') {
+    $runId = [Guid]::NewGuid().ToString('N')
     $cert = Join-Path $Work 'redirect.crt'
     $key = Join-Path $Work 'redirect.key'
     $caCert = Join-Path $Work 'redirect-ca.crt'
     $caKey = Join-Path $Work 'redirect-ca.key'
     $leafCsr = Join-Path $Work 'redirect.csr'
     $leafConfig = Join-Path $Work 'redirect-openssl.cnf'
-    $ready = Join-Path $Work 'redirect.ready'
+    $ready = Join-Path $Work ("redirect-$runId.ready")
+    $trace = Join-Path $Work ("redirect-$runId.trace")
     $serverScript = Join-Path $Work 'redirect_server.py'
     $serverCode = @'
 import http.server
@@ -136,18 +138,28 @@ import threading
 from pathlib import Path
 from urllib.parse import urlsplit
 
-fixture, cert, key, redirect_host, ready_path = sys.argv[1:]
+fixture, cert, key, redirect_host, ready_path, trace_path, redirect_location = sys.argv[1:]
 root = Path(fixture)
+if redirect_location == "default":
+    redirect_location = ""
 
 class RedirectHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         host = self.headers.get("Host", "").split(":", 1)[0].lower()
-        if host == "huggingface.co":
+        with open(trace_path, "a", encoding="ascii") as trace:
+            trace.write("host={} path={} range={} agent={}\n".format(host, self.path, self.headers.get("Range", ""), self.headers.get("User-Agent", "")))
+        if host == "huggingface.co" and not self.path.startswith("/redirect-final/"):
             self.send_response(302)
-            self.send_header("Location", "https://{}{}".format(redirect_host, self.path))
+            target = redirect_location or "https://{}{}".format(redirect_host, self.path)
+            self.send_header("Location", target.replace("{name}", Path(urlsplit(self.path).path).name))
+            self.send_header("Content-Length", "15")
             self.end_headers()
+            try:
+                self.wfile.write(b"REDIRECTPAYLOAD")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             return
-        if host != redirect_host:
+        if host not in (redirect_host, "huggingface.co"):
             self.send_error(421, "unexpected host")
             return
         candidate = root / Path(urlsplit(self.path).path).name
@@ -155,10 +167,15 @@ class RedirectHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
             return
         payload = candidate.read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Length", str(len(payload)))
+        start = 0
+        if self.headers.get("Range"):
+            start = int(self.headers["Range"].removeprefix("bytes=").removesuffix("-"))
+        self.send_response(206 if start else 200)
+        if start:
+            self.send_header("Content-Range", "bytes {}-{}/{}".format(start, len(payload) - 1, len(payload)))
+        self.send_header("Content-Length", str(len(payload) - start))
         self.end_headers()
-        self.wfile.write(payload)
+        self.wfile.write(payload[start:])
 
     def log_message(self, _format, *_args):
         pass
@@ -175,6 +192,8 @@ class Proxy(socketserver.ThreadingTCPServer):
 class ConnectHandler(socketserver.StreamRequestHandler):
     def handle(self):
         request = self.rfile.readline(65537).decode("ascii", "replace")
+        with open(trace_path, "a", encoding="ascii") as trace:
+            trace.write("proxy={}\n".format(request.strip()))
         if not request.startswith("CONNECT "):
             self.wfile.write(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
             return
@@ -230,11 +249,14 @@ DNS.2 = $RedirectHost
     if ($LASTEXITCODE -ne 0) { return $null }
     & openssl x509 -req -in $leafCsr -CA $caCert -CAkey $caKey -CAcreateserial -out $cert -days 1 -sha256 -extfile $leafConfig -extensions v3_leaf *>> (Join-Path $Work 'openssl.log')
     if ($LASTEXITCODE -ne 0) { return $null }
-    $script:RedirectServer = Start-Process -FilePath python3 -ArgumentList @($serverScript, $Fixture, $cert, $key, $RedirectHost, $ready) -PassThru -RedirectStandardOutput (Join-Path $Work 'redirect.out') -RedirectStandardError (Join-Path $Work 'redirect.err')
+    # Start-Process joins ArgumentList, so represent an empty optional target
+    # with a sentinel and resolve it in the Python command instead of losing it.
+    $locationArgument = if ($RedirectLocation) { $RedirectLocation } else { 'default' }
+    $script:RedirectServer = Start-Process -FilePath python3 -ArgumentList @($serverScript, $Fixture, $cert, $key, $RedirectHost, $ready, $trace, $locationArgument) -PassThru -RedirectStandardOutput (Join-Path $Work ("redirect-$runId.out")) -RedirectStandardError (Join-Path $Work ("redirect-$runId.err"))
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
         if (Test-Path -LiteralPath $ready) {
             $ports = (Get-Content -LiteralPath $ready -Raw).Trim().Split(' ')
-            if ($ports.Count -eq 2) { return [PSCustomObject]@{ ProxyPort = [int]$ports[0]; TlsPort = [int]$ports[1]; CaCertificate = $caCert } }
+            if ($ports.Count -eq 2) { return [PSCustomObject]@{ ProxyPort = [int]$ports[0]; TlsPort = [int]$ports[1]; CaCertificate = $caCert; Trace = $trace } }
         }
         Start-Sleep -Milliseconds 100
     }
@@ -378,11 +400,82 @@ try {
     $script:Cases++; $d11 = Join-Path $Work 'case11'; $rejected = Start-RedirectServer 'unlisted.invalid'; $case11Err = Join-Path $Work 'case11.err'
     if ($rejected) {
         $status = Invoke-RedirectPolicyFetch $d11 $rejected.ProxyPort $rejected.CaCertificate 2> $case11Err
-        if ($status -ne 0 -and -not (Test-Path -LiteralPath (Join-Path $d11 'alpha.bin')) -and (Get-Content -LiteralPath $case11Err -Raw) -match 'REDIRECT_HOST_REFUSED phase=post-contact-body-refused activation=refused effective_url=https://unlisted.invalid/') { Pass '11' 'unlisted-redirect-refusal' } else { Fail '11' "unlisted-redirect-refusal exit=$status" }
+        $contacts = Get-Content -LiteralPath $rejected.Trace -Raw
+        if ($status -eq 3 -and -not (Test-Path -LiteralPath (Join-Path $d11 'alpha.bin')) -and (Get-Item (Join-Path $d11 'alpha.bin.partial')).Length -eq 0 -and $contacts -notmatch 'host=unlisted.invalid |CONNECT unlisted.invalid:' -and (Get-Content -LiteralPath $case11Err -Raw) -match 'REDIRECT_HOST_REFUSED phase=pre-contact activation=refused effective_url=https://unlisted.invalid/') { Pass '11' 'unlisted-redirect-refused-before-contact' } else { Fail '11' "unlisted-redirect-refusal exit=$status" }
     } else {
         Fail '11' 'unlisted-redirect-server'
     }
     Stop-RedirectServer
+
+    # A failed acquisition must preserve a lock owned by another invocation.
+    $script:Cases++; $d12 = Join-Path $Work 'case12'; $lock = Join-Path $d12 ('.fnlp-fetch-lock-' + $Revision)
+    New-Item -ItemType Directory -Path $lock -Force | Out-Null
+    $firstStatus = Invoke-Fetch $d12 @('-CheckOnly')
+    $secondStatus = Invoke-Fetch $d12 @('-CheckOnly')
+    if ($firstStatus -eq 4 -and $secondStatus -eq 4 -and (Test-Path -LiteralPath $lock -PathType Container)) { Pass '12' 'contended-lock-preserved' }
+    else { Fail '12' "contended-lock-preserved first=$firstStatus second=$secondStatus" }
+
+    $script:Cases++; $d13 = Join-Path $Work 'case13'
+    & $script:PwshPath -NoProfile -File $Fetch -Dest $d13 -Catalog $script:Catalog -CheckOnly 2> (Join-Path $Work 'case13.err')
+    $status = $LASTEXITCODE
+    if ($status -eq 2 -and -not (Test-Path -LiteralPath $d13) -and (Get-Content (Join-Path $Work 'case13.err') -Raw) -match 'UNTRUSTED_CATALOG_REFUSED') { Pass '13' 'custom-catalog-requires-opt-in' }
+    else { Fail '13' "custom-catalog-requires-opt-in exit=$status" }
+
+    $script:Cases++; $d14 = Join-Path $Work 'case14'
+    $confused = Start-RedirectServer 'unlisted.invalid' 'https://unlisted.invalid/example.xethub.hf.co/{name}'
+    if ($confused) {
+        $status = Invoke-RedirectPolicyFetch $d14 $confused.ProxyPort $confused.CaCertificate 2> (Join-Path $Work 'case14.err')
+        if ($status -eq 3 -and (Get-Item (Join-Path $d14 'alpha.bin.partial')).Length -eq 0 -and (Get-Content $confused.Trace -Raw) -notmatch 'host=unlisted.invalid |CONNECT unlisted.invalid:') { Pass '14' 'redirect-path-cannot-authorize-host' }
+        else { Fail '14' "redirect-path-cannot-authorize-host exit=$status" }
+    } else { Fail '14' 'confused-host-server' }
+    Stop-RedirectServer
+
+    $script:Cases++; $d15 = Join-Path $Work 'case15'; $relative = Start-RedirectServer 'us.aws.cdn.hf.co' '/redirect-final/{name}'
+    if ($relative -and (Invoke-RedirectPolicyFetch $d15 $relative.ProxyPort $relative.CaCertificate) -eq 0 -and (Get-FileHash (Join-Path $d15 'alpha.bin') -Algorithm SHA256).Hash.ToLowerInvariant() -eq $alphaSha -and (Get-Content $relative.Trace -Raw) -match 'agent=franken_nlp-agent ') { Pass '15' 'relative-redirect-and-agent' }
+    else { Fail '15' 'relative-redirect-and-agent' }
+    Stop-RedirectServer
+
+    $script:Cases++; $d16 = Join-Path $Work 'case16'; $loop = Start-RedirectServer 'us.aws.cdn.hf.co' '/loop/{name}'
+    if ($loop) {
+        $status = Invoke-RedirectPolicyFetch $d16 $loop.ProxyPort $loop.CaCertificate 2> (Join-Path $Work 'case16.err')
+        $requests = @(Get-Content $loop.Trace | Where-Object { $_ -match '^host=' }).Count
+        if ($status -eq 3 -and $requests -eq 36 -and (Get-Item (Join-Path $d16 'alpha.bin.partial')).Length -eq 0 -and (Get-Content (Join-Path $Work 'case16.err') -Raw) -match 'redirect limit exceeded') { Pass '16' 'redirect-loop-bounded' }
+        else { Fail '16' "redirect-loop-bounded exit=$status requests=$requests" }
+    } else { Fail '16' 'redirect-loop-server' }
+    Stop-RedirectServer
+
+    $script:Cases++; $d17 = Join-Path $Work 'case17'
+    Write-Journal $d17 'alpha.bin' $alphaLength $alphaSha "https://huggingface.co/Nanbeige/Nanbeige4.2-3B/resolve/$Revision/alpha.bin"
+    [IO.File]::WriteAllBytes((Join-Path $d17 'alpha.bin.partial'), [IO.File]::ReadAllBytes($alpha)[0..4])
+    $resumed = Start-RedirectServer 'us.aws.cdn.hf.co'
+    if ($resumed -and (Invoke-RedirectPolicyFetch $d17 $resumed.ProxyPort $resumed.CaCertificate) -eq 0 -and (Get-FileHash (Join-Path $d17 'alpha.bin') -Algorithm SHA256).Hash.ToLowerInvariant() -eq $alphaSha -and (Get-Content $resumed.Trace -Raw) -match 'host=us.aws.cdn.hf.co .*range=bytes=5-') { Pass '17' 'redirected-range-resume' }
+    else { Fail '17' 'redirected-range-resume' }
+    Stop-RedirectServer
+
+    # Execute only the parsed policy function, without starting the fetcher.
+    $script:Cases++
+    $tokens = $null; $parseErrors = $null
+    $fetchAst = [Management.Automation.Language.Parser]::ParseFile($Fetch, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count -ne 0) { throw 'fetcher has PowerShell parse errors' }
+    $hostFunction = $fetchAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-EffectiveHost' }, $true)
+    . ([scriptblock]::Create($hostFunction.Extent.Text))
+    $policyPassed = $true
+    foreach ($allowed in @('https://huggingface.co/file', 'https://CDN-LFS.HUGGINGFACE.CO:443/file', 'https://us.aws.cdn.hf.co/file', 'https://cas-bridge.xethub.hf.co/file')) {
+        if (-not (Test-EffectiveHost ([Uri]$allowed))) { $policyPassed = $false }
+    }
+    foreach ($denied in @('https://huggingface.co@unlisted.invalid/file', 'https://unlisted.invalid@huggingface.co/file', 'https://huggingface.co:444/file', 'http://huggingface.co/file', 'https://unlisted.invalid/.cdn.hf.co/file', 'https://a..cdn.hf.co/file', 'https://-a.cdn.hf.co/file', 'https://huggingface.co\@unlisted.invalid/file')) {
+        $deniedUri = $null
+        if ([Uri]::TryCreate($denied, [UriKind]::Absolute, [ref]$deniedUri) -and (Test-EffectiveHost $deniedUri)) { $policyPassed = $false }
+    }
+    if ($policyPassed) { Pass '18' 'strict-redirect-authority' } else { Fail '18' 'strict-redirect-authority' }
+
+    $script:Cases++; $d19 = Join-Path $Work 'case19'; $nonemptyLock = Join-Path $d19 ('.fnlp-fetch-lock-' + $Revision)
+    New-Item -ItemType Directory -Path $nonemptyLock -Force | Out-Null
+    $ownerMarker = Join-Path $nonemptyLock 'owner.txt'
+    [IO.File]::WriteAllText($ownerMarker, 'another invocation owns this lock')
+    $status = Invoke-Fetch $d19 @('-CheckOnly') 2> (Join-Path $Work 'case19.err')
+    if ($status -eq 4 -and [IO.File]::ReadAllText($ownerMarker) -eq 'another invocation owns this lock' -and (Get-Content (Join-Path $Work 'case19.err') -Raw) -notmatch 'LOCK_RELEASE_DEFERRED') { Pass '19' 'nonempty-contended-lock-untouched' }
+    else { Fail '19' "nonempty-contended-lock-untouched exit=$status" }
 } catch {
     Fail 'harness' $_.Exception.Message
 } finally {
