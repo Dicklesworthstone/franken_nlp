@@ -159,5 +159,25 @@ fn typed_cancellation_is_retained_with_redacted_diagnostics() {
 fn complete_private_capture_is_sendable_to_physical_host() {
     fn send<T: Send + 'static>() {}
     send::<Int4SourceMapConfig<SourceQuestion>>(); send::<Charged<SourceMapInput<SourceQuestion>>>();
+    send::<QuestionAdmission>(); send::<HostedInt4TeamResult<Int4QuestionRun>>();
     let _host = NlpEngine::answer_int4_document;
+    let _team_host = NlpEngine::answer_int4_document_with_threads;
+}
+
+#[test]
+fn question_team_scratch_is_charged_once_without_replacing_question_or_frontier_charges() {
+    let (_, mut config) = fixture(32);
+    let input = input_bytes(1024, &config).unwrap();
+    let question_workspace = config.question_workspace_bytes(3).unwrap();
+    for threads in [2, 4, 64] {
+        let expected = int4_task_team_workspace_bytes(threads, 32).unwrap();
+        for chunks in [3, 8, 256] {
+            config.mapping.chunks.max_chunks = chunks;
+            assert_eq!(team::team_requirements(&config, 32, threads).unwrap(), expected);
+            assert_eq!(input_bytes(1024, &config).unwrap(), input);
+            assert_eq!(config.question_workspace_bytes(3).unwrap(), question_workspace);
+        }
+    }
+    config.mapping.reduction.map_batch_chunks = 2;
+    assert!(team::team_requirements(&config, 32, 2).is_err());
 }

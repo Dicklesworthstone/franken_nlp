@@ -65,11 +65,12 @@ for allowed widths, complete memory admission and examples.
 
 ### Persistent CPU teams for complete source documents
 
-`ner-map`, `keyphrases-map` and plain cited `summarize-map` accept
-`--compute-threads N` for `N` from 1 through 64. The default of 1 retains
+`ner-map`, `keyphrases-map`, plain cited `summarize-map` and independent
+`answer-map` accept `--compute-threads N` for `N` from 1 through 64. The default of 1 retains
 serial execution. Larger widths form one fixed numerical team spanning all
-chunks and the final exact reducer. Each projection divides complete output
-rows; the reduction order within each row stays unchanged. Each chunk retains
+chunks and the final exact reducer or complete answer collection. Each
+projection divides complete output rows; the reduction order within each row
+stays unchanged. Each chunk retains
 its own causal context, grammar and original-source evidence.
 
 ```sh
@@ -77,6 +78,11 @@ fnlp candidate source-int4 summarize-map report.txt \
   --snapshot /models/nanbeige.int4.snapshot \
   --expected-model-sha256 "$MODEL_SHA256" \
   --memory-mib 8192 --compute-threads 4
+
+fnlp candidate source-int4 answer-map report.txt --question question.txt \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$MODEL_SHA256" \
+  --memory-mib 8192 --compute-threads 4 --input-encoding safe-bpe-v1
 ```
 
 The compute width counts the coordinator and its row workers. The runtime
@@ -89,9 +95,16 @@ with the actual completed projections and rows; the semantic result and its
 execution identity do not absorb worker width. The guarded result remains
 owned through serialization, write and flush.
 
+QA keeps the same private question across every nonblank chunk, preserves
+interior whitespace ranges, and retains all independently validated answers
+and abstentions. A team does not select a global answer or enable synthesis.
+Compact QA retains one cumulative encoding allowance across question sizing,
+source probes, CLI preflight and hosted replanning.
+
 Library callers use `NlpEngine::map_int4_source_with_threads`,
-`summarize_int4_source_with_threads`, or
-`reduce_int4_keyphrases_document_with_threads` on the same resource host as
+`summarize_int4_source_with_threads`,
+`reduce_int4_keyphrases_document_with_threads`, or
+`answer_int4_document_with_threads` on the same resource host as
 their resident model. Each returns `HostedInt4TeamResult<T>`, retaining the
 ordinary result owner alongside the physical compute receipt. The serial and
 threaded routes share admission, complete-map preparation, source/result seals
@@ -100,7 +113,7 @@ worker width; it never silently creates a larger host or falls back to another
 width.
 
 These numerical teams currently require serial chunk scheduling. Combining
-them with `--cohort-chunks`, packed prompt prefill, QA, neural synthesis or
+them with `--cohort-chunks`, packed prompt prefill, neural synthesis or
 hierarchies is refused. Corpus and durable-job commands retain their existing
 schedules. Regression definitions cover admission, unsupported combinations,
 cancellation, charge release and serial/team model parity. Executable and
@@ -179,8 +192,8 @@ fnlp candidate source-int4 answer-map report.txt --question question.txt \
 
 One cumulative ledger covers repeated question/manifest encodings, every
 discarded chunk-size probe, complete CLI preflight and hosted recompilation.
-Serial and chunk-cohort QA share that same planner; neither a new chunk nor a
-host boundary resets its allowance. The selected per-call policy and all total
+Serial, chunk-cohort and persistent-team QA share that same planner; neither a
+new chunk nor a host boundary resets its allowance. The selected per-call policy and all total
 ceilings enter execution identity, and compact output reports consumed work.
 The default policy preserves the existing response shape.
 
@@ -192,14 +205,17 @@ for the admitted request, and modifying a completed answer or its counters
 invalidates its seal. These commitments never enter serialized responses or
 Debug output. Bounded streaming hashing avoids allocating a second
 document-sized serialization and checks cancellation during long writes.
+Hosted and CLI completion checks also use the invocation's existing control
+while rehashing the result and traversing its accounting and source coordinates.
 
 The independent source-citation verifier continues to use original UTF-8 byte
 and Unicode-scalar coordinates. Encoding literal role/tool marker text never
 grants it template-control authority. Structural citation validity does not
 certify semantic entailment or answer quality. Compact QA currently supports
-independent passage answers and their native chunk cohorts; combining it with
+independent passage answers, native chunk cohorts and persistent numerical
+teams; combining it with
 neural synthesis, hierarchy, corpus or retained-job routes is refused before
-private IO. Numerical worker teams remain a separate unsupported QA schedule.
+private IO. Numerical teams and chunk cohorts cannot be combined in one call.
 
 Added regression definitions cover actual compact prompt work, Unicode and
 literal-control preservation, per-call and cumulative exhaustion, cancellation,
@@ -207,6 +223,17 @@ host workspace admission, unchanged default output, request/payload substitution
 and every exact reducer limit. Executable Rust regressions, native-model
 quality/parity and performance remain pending the controller's DSR checkpoint
 and model-present gates.
+
+Complete-document `sentiment-map` also accepts `--input-encoding safe-bpe-v1`
+for serial, chunk-cohort and persistent-team execution. Actual encoded source
+tokens determine chunk boundaries. One shared ledger for input bytes, output
+tokens, pair checks and pair bytes covers rejected probes and final plans;
+each chunk's encoding is reused across sentiment axes.
+`--max-tokenizer-input-bytes` and `--max-tokenizer-output-tokens` cap cumulative
+encoder work separately from source and native-work limits. The byte-default
+response stays unchanged, and sentiment corpora and durable jobs remain
+byte-only. Compact execution accepts pinned sources or a digest-pinned snapshot
+reload; combining it with `--save-snapshot` is refused.
 
 Entity `resolve` and resident `resolve-corpus` have independent native schedules:
 `--cohort-pairs 1..=32` keeps both orders of each candidate pair together, while

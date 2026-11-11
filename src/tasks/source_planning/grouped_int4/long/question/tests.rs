@@ -313,3 +313,31 @@ fn completed_receipt_rechecks_group_work_masks_and_verification_counts() {
         assert!(expected.verify_completed(&run).is_err());
     }
 }
+
+#[test]
+fn complete_receipt_verification_obeys_the_existing_control_at_every_boundary() {
+    struct Control { calls: usize, stop_at: usize, cause: DecodeCancellationKind }
+    impl DecodeStepControl for Control {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+            self.calls += 1; (self.calls >= self.stop_at).then_some(self.cause)
+        }
+    }
+    let planner = fixtures::planner();
+    let prepared = prepare(&planner, "Alice       Bob 上海 Carol", &question(), limits(), 32);
+    let expected = prepared.preflight_metadata();
+    let driver = script(&prepared);
+    let run = execute(prepared, driver).unwrap();
+    let mut complete = Control { calls: 0, stop_at: usize::MAX, cause: DecodeCancellationKind::PollQuota };
+    expected.verify_completed_with_control(&run, &mut complete).unwrap();
+    assert!(complete.calls > expected.chunk_count(), "hashing, statistics and coordinate walks must all poll");
+    for cause in [DecodeCancellationKind::ParentCancelled, DecodeCancellationKind::Deadline,
+        DecodeCancellationKind::Timeout, DecodeCancellationKind::PollQuota] {
+        for stop_at in 1..=complete.calls {
+            let mut control = Control { calls: 0, stop_at, cause };
+            let error = expected.verify_completed_with_control(&run, &mut control).unwrap_err();
+            assert_eq!(error.cancellation(), Some(cause));
+            assert_eq!(control.calls, stop_at);
+        }
+    }
+    expected.verify_completed(&run).unwrap();
+}

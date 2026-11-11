@@ -75,6 +75,51 @@ fn persistent_source_teams_price_one_workspace_without_changing_document_authori
 }
 
 #[test]
+fn question_teams_keep_one_encoder_ledger_and_the_complete_private_request_authority() {
+    for encoding in [&[][..], &["--input-encoding", "safe-bpe-v1"][..]] {
+        let mut flags = vec!["--question", "private-question.txt"];
+        flags.extend_from_slice(encoding);
+        let (serial, mut args) = arguments(Kind::Answer, &flags);
+        args.memory_mib = 262_144;
+        let original = serial.validate(&args).unwrap();
+        let budget = serial.source.budget(&args, original.common);
+        for threads in [1, 2, 4, 64] {
+            let count = threads.to_string();
+            let mut flags = flags.clone(); flags.extend_from_slice(&["--compute-threads", &count]);
+            let (team, mut args) = arguments(Kind::Answer, &flags);
+            args.memory_mib = 262_144;
+            let admitted = team.validate(&args).unwrap();
+            assert_eq!(team, serial);
+            assert_eq!(admitted.common.compute.threads, threads);
+            let workspace = if threads == 1 { 0 } else {
+                crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(threads, args.group_width).unwrap()
+            };
+            assert_eq!(admitted.common.compute.workspace_bytes, workspace);
+            assert!(admitted.common.minimum_memory_bytes >= original.common.minimum_memory_bytes);
+            assert!(admitted.common.minimum_memory_bytes <= original.common.minimum_memory_bytes + workspace);
+            assert_eq!(admitted.common.native, original.common.native);
+            assert_eq!(team.source.budget(&args, admitted.common), budget);
+            assert_eq!(admitted.mapping.chunks, original.mapping.chunks);
+            assert_eq!(admitted.mapping.reduction, original.mapping.reduction);
+            assert_eq!(admitted.mapping.max_model_work, original.mapping.max_model_work);
+            assert_eq!(admitted.mapping.max_mask_visits, original.mapping.max_mask_visits);
+            assert_eq!(admitted.mapping.verification, original.mapping.verification);
+            assert_eq!(admitted.workspace_bytes, original.workspace_bytes);
+            assert_eq!(admitted.common.preparation_bytes, original.common.preparation_bytes);
+            assert_eq!(admitted.encoding, original.encoding);
+            if threads > 1 {
+                assert!(team.validate_corpus(&args).is_err());
+                assert!(team.validate_document_job(&args, false).is_err());
+            }
+            args.memory_mib = admitted.common.minimum_memory_bytes.saturating_sub(1) / MIB;
+            assert!(team.validate(&args).is_err());
+            args.memory_mib = admitted.common.minimum_memory_bytes.div_ceil(MIB);
+            assert!(team.validate(&args).is_ok());
+        }
+    }
+}
+
+#[test]
 fn unsupported_source_team_widths_and_schedules_refuse_before_private_io() {
     for kind in KINDS {
         for flags in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
@@ -96,7 +141,19 @@ fn unsupported_source_team_widths_and_schedules_refuse_before_private_io() {
         assert!(!command.get_arguments().any(|arg| arg.get_id() == "compute_threads"));
     }
     let answer = definitions().into_iter().find(|command| command.get_name() == "answer-map").unwrap();
-    assert!(!answer.get_arguments().any(|arg| arg.get_id() == "compute_threads"));
+    assert!(answer.get_arguments().any(|arg| arg.get_id() == "compute_threads"));
+    for unsupported in [&["--compute-threads", "0"][..], &["--compute-threads", "65"][..],
+        &["--compute-threads", "2", "--cohort-chunks", "1"][..],
+        &["--compute-threads", "4", "--cohort-chunks", "2"][..],
+        &["--compute-threads", "2", "--synthesize-answer"][..],
+        &["--compute-threads", "2", "--synthesize-answer", "--hierarchical-answer"][..]] {
+        let mut flags = vec!["--question", "private-question.txt"];
+        flags.extend_from_slice(unsupported);
+        let (map, args) = arguments(Kind::Answer, &flags);
+        let mut refused = Vec::new();
+        assert_eq!(map.execute(args, &mut NoRead, &mut refused), Err(CandidateError::Arguments));
+        assert!(refused.is_empty());
+    }
 }
 
 #[cfg(not(feature = "asupersync-runtime"))]
@@ -108,6 +165,10 @@ fn unavailable_source_team_runtime_never_reads_or_publishes() {
         assert_eq!(map.execute(args, &mut NoRead, &mut output), Err(CandidateError::Unavailable));
         assert!(output.is_empty());
     }
+    let (map, args) = arguments(Kind::Answer, &["--question", "private-question.txt", "--compute-threads", "2"]);
+    let mut output = Vec::new();
+    assert_eq!(map.execute(args, &mut NoRead, &mut output), Err(CandidateError::Unavailable));
+    assert!(output.is_empty());
 }
 
 #[test]

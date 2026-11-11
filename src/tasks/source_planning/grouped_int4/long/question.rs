@@ -76,14 +76,22 @@ impl Int4QuestionPreflight {
     pub fn verify_completed(&self, run: &Int4QuestionRun) -> Result<(), Int4SourceMapError> {
         self.verify_completed_with_checkpoints(run, &mut || Ok(()))
     }
+    /// Verify the complete private request/result seal and original-source
+    /// accounting under the caller's existing deadline and checkpoint budget.
+    pub fn verify_completed_with_control<C: DecodeStepControl>(&self, run: &Int4QuestionRun,
+        control: &mut C) -> Result<(), Int4SourceMapError> {
+        self.verify_completed_with_checkpoints(run,
+            &mut || checkpoint(control).map_err(Int4SourceMapError::from))
+    }
     pub(super) fn verify_completed_with_checkpoints<F>(&self, run: &Int4QuestionRun, checkpoint: &mut F)
         -> Result<(), Int4SourceMapError> where F: FnMut() -> Result<(), Int4SourceMapError> {
+        checkpoint()?;
         if run.request_binding != self.request_binding
             || run.result_binding != binding::result_with_checkpoints(run, self.max_result_bytes, checkpoint)? {
             return Err(Int4SourceError::InvalidResult.into());
         }
         let root = run.mapped.root();
-        let stats = execution::statistics(root.value())?;
+        let stats = execution::statistics(root.value(), checkpoint)?;
         if run.schema_version != 1 || run.execution != INT4_QUESTION_EXECUTION
             || run.numerics_profile != STRICT_INT4_PROFILE || run.group_width != self.group_width
             || run.semantics != QUESTION_SEMANTICS

@@ -72,7 +72,7 @@ fn execute_with_threads<O: DocumentOperation>(host: &NlpEngine, model: &Resident
         })
 }
 
-fn team_requirements(config: &Int4SourceMapConfig, group_width: usize, compute_threads: usize)
+pub(super) fn team_requirements<T>(config: &Int4SourceMapConfig<T>, group_width: usize, compute_threads: usize)
     -> Result<u64, HostedError> {
     if config.mapping.reduction.map_batch_chunks != 1 {
         return Err(HostedError::Limits("INT4 source document teams require serial chunk scheduling"));

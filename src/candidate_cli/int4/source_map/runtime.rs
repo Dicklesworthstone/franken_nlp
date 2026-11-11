@@ -146,6 +146,9 @@ fn cancelled(cause: DecodeCancellationKind) -> CandidateError {
 fn planning_error(error: Int4SourceMapError) -> CandidateError {
     error.cancellation().map(cancelled).unwrap_or(CandidateError::Planning)
 }
+fn verification_error(error: Int4SourceMapError) -> CandidateError {
+    error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution)
+}
 fn execution_error(error: HostedError) -> CandidateError {
     match error {
         HostedError::Stopped { stop, .. } => cancelled(stop.kind),
@@ -415,10 +418,20 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         Prepared::Question(mut config, expected) => {
             config.native.run.max_elapsed = remaining()?;
             let planner = Arc::new(planner);
-            if let Some(chunks) = limits.cohort_chunks {
+            if common.compute.threads > 1 {
+                let result = engine.answer_int4_document_with_threads(&model, text,
+                    Arc::clone(&planner), Arc::new(vocabulary), config, common.kernel,
+                    common.compute.threads, cancellation).map_err(execution_error)?;
+                expected.verify_completed_with_control(result.result(), &mut DeadlineControl { started, deadline })
+                    .map_err(verification_error)?;
+                remaining()?;
+                publish_team_map(&provenance, result.result(), result.compute(), &planner,
+                    limits.max_result_bytes + 4096, output, &publication)
+            } else if let Some(chunks) = limits.cohort_chunks {
                 let result = engine.answer_int4_document_cohorts(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
                     config, common.kernel, cancellation).map_err(execution_error)?;
-                expected.verify_completed(&result.result().document).map_err(|_| CandidateError::Execution)?;
+                expected.verify_completed_with_control(&result.result().document, &mut DeadlineControl { started, deadline })
+                    .map_err(verification_error)?;
                 remaining()?;
                 // The document includes whitespace-only chunks; physical
                 // stats count only actual native rows and nonempty windows.
@@ -427,7 +440,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
             } else {
                 let result = engine.answer_int4_document(&model, text, Arc::clone(&planner), Arc::new(vocabulary),
                     config, common.kernel, cancellation).map_err(execution_error)?;
-                expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+                expected.verify_completed_with_control(result.result(), &mut DeadlineControl { started, deadline })
+                    .map_err(verification_error)?;
                 remaining()?;
                 // The hosted output guard and shared encoding ledger survive
                 // staging, write AND flush. Failure is never an abstention.

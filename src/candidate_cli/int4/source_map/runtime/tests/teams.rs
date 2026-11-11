@@ -122,9 +122,78 @@ fn model_present_source_document_teams_match_serial_and_release_all_guards() {
             else { serial_bytes = Some(bytes); }
         }
     }
+    // QA has a distinct complete-document seal and retains blank source
+    // ranges without inventing native work for them. Exercise that driver
+    // separately, under the same installed four-lane process envelope.
+    let command = make_command(Kind::Answer, &["--question", "private-question.txt"]);
+    let Int4Task::SourceMap(options) = command.task else { panic!("document question required"); };
+    let limits = options.validate(&command.args).unwrap();
+    assert_eq!(limits.common.preparation_bytes, common.preparation_bytes);
+    let identity = source::identity(model.model_identity(), &planner, source::task(Kind::Answer)).unwrap();
+    let config = || configuration(identity.clone(), options.question.as_ref().unwrap()
+        .task("Where did Alice meet Bob?".to_owned(), None).unwrap(),
+        &command.args, &options, limits, Duration::from_secs(86_400));
+    let document = format!("{document}{}Bob visits Paris.\r\n", " ".repeat(96));
+    let expected = question_preflight(&document, &planner, &config(), model.model_identity().group_width(),
+        &mut continuing()).unwrap();
+    assert!(expected.native_chunks() > 1);
+    assert!(expected.whitespace_chunks() > 0);
+    assert_eq!(expected.source_span().byte_end, document.len());
+    assert_eq!(expected.source_span().scalar_end, document.chars().count());
+    let mut serial_bytes = None;
+    for threads in [1, 2, 4] {
+        let output = if threads == 1 {
+            compute::Completion::serial(engine.answer_int4_document(&model, document.clone(),
+                Arc::clone(&planner), Arc::clone(&vocabulary), config(), common.kernel,
+                CancellationToken::default()).unwrap())
+        } else {
+            compute::Completion::Team(engine.answer_int4_document_with_threads(&model, document.clone(),
+                Arc::clone(&planner), Arc::clone(&vocabulary), config(), common.kernel, threads,
+                CancellationToken::default()).unwrap())
+        };
+        expected.verify_completed(output.result()).unwrap();
+        let held = engine.resources().memory_snapshot();
+        assert!(held.committed_bytes > resident.committed_bytes);
+        let bytes = serde_json::to_vec(output.result()).unwrap();
+        if let Some(serial) = &serial_bytes { assert_eq!(&bytes, serial); } else { serial_bytes = Some(bytes); }
+        if threads == 1 { assert!(output.compute().is_none()); }
+        else {
+            let receipt = output.compute().unwrap();
+            assert_eq!(receipt.compute_threads, threads);
+            assert!(receipt.completed_projections > expected.native_chunks() as u64);
+            assert!(receipt.completed_worker_rows > 0);
+            assert!(receipt.completed_rows > receipt.completed_worker_rows);
+        }
+        assert_eq!(engine.resources().memory_snapshot(), held);
+        drop(output);
+        assert_eq!(engine.resources().memory_snapshot(), resident);
+        assert_eq!(engine.resources().outstanding_closure_snapshot().active_closures, 0);
+    }
+    for cause in [DecodeCancellationKind::ParentCancelled, DecodeCancellationKind::Timeout,
+        DecodeCancellationKind::PollQuota] {
+        let cancellation = CancellationToken::default();
+        let mut config = config();
+        if cause == DecodeCancellationKind::PollQuota { config.native.run.max_checkpoints = 2; }
+        else { cancellation.cancel(cause); }
+        let error = engine.answer_int4_document_with_threads(&model, document.clone(),
+            Arc::clone(&planner), Arc::clone(&vocabulary), config, common.kernel, 4, cancellation)
+            .err().expect("stopped QA must not return an answer, abstention or completed prefix");
+        assert_eq!(stopped_kind(error), cause);
+        assert_eq!(engine.resources().memory_snapshot(), resident);
+        assert_eq!(engine.resources().outstanding_closure_snapshot().active_closures, 0);
+    }
     drop(vocabulary); drop(planner); drop(model); drop(preparation); drop(lease);
     assert_eq!(engine.resources().memory_snapshot(), idle);
     println!("{COMPLETE}");
+}
+
+fn stopped_kind(error: HostedError) -> DecodeCancellationKind {
+    match error {
+        HostedError::Stopped { stop, .. } => stop.kind,
+        HostedError::Join { physical_error: Some(error), .. }
+            | HostedError::Scope { physical_error: Some(error), .. } => stopped_kind(*error),
+        _ => panic!("expected the original hosted cancellation cause"),
+    }
 }
 
 fn inspect_completion<T: Serialize>(engine: &NlpEngine, output: compute::Completion<T>,
@@ -201,4 +270,42 @@ fn optional_compute_metadata_preserves_source_output_and_complete_publication_ca
     assert_eq!(publish_team_map(&provenance, &semantic, &receipt, &planner,
         threaded.len() - 1, &mut refused, &|| Ok(())), Err(CandidateError::Output));
     assert!(refused.is_empty());
+}
+
+#[test]
+fn stale_question_team_admission_rejects_new_schedules_before_runtime_or_private_io() {
+    struct NoIo;
+    impl Read for NoIo {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("invalid question team read source"); }
+    }
+    impl Write for NoIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { panic!("invalid question team wrote output"); }
+        fn flush(&mut self) -> io::Result<()> { panic!("invalid question team flushed output"); }
+    }
+    let mut command = crate::candidate_cli::int4::source_map::tests::command(Kind::Answer,
+        &["--question", "private-question.txt", "--compute-threads", "2", "--input-encoding", "safe-bpe-v1"]);
+    command.args.memory_mib = 262_144;
+    let Int4Task::SourceMap(mut options) = command.task else { panic!("document question required"); };
+    let admitted = options.validate(&command.args).unwrap();
+    options.cohort_chunks = Some(2);
+    assert_eq!(execute(command.args.clone(), options.clone(), admitted, &mut NoIo, &mut NoIo),
+        Err(CandidateError::Arguments));
+    options.cohort_chunks = None;
+    let replacement = crate::candidate_cli::int4::source_map::tests::command(Kind::Answer,
+        &["--question", "private-question.txt", "--synthesize-answer"]);
+    let Int4Task::SourceMap(replacement) = replacement.task else { panic!("document question required"); };
+    options.question = replacement.question;
+    assert_eq!(execute(command.args, options, admitted, &mut NoIo, &mut NoIo), Err(CandidateError::Arguments));
+}
+
+#[test]
+fn controlled_question_verification_keeps_timeout_distinct_from_invalid_results() {
+    use crate::tasks::source_planning::grouped_int4::Int4SourceError;
+    for cause in [DecodeCancellationKind::Deadline, DecodeCancellationKind::Timeout] {
+        assert_eq!(verification_error(Int4SourceError::Cancelled(cause).into()), CandidateError::Timeout);
+    }
+    for cause in [DecodeCancellationKind::ParentCancelled, DecodeCancellationKind::PollQuota] {
+        assert_eq!(verification_error(Int4SourceError::Cancelled(cause).into()), CandidateError::Execution);
+    }
+    assert_eq!(verification_error(Int4SourceError::InvalidResult.into()), CandidateError::Execution);
 }

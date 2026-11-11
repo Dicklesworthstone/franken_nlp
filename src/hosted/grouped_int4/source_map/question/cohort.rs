@@ -91,7 +91,7 @@ impl NlpEngine {
             let result = allocate(output, || {
                 let result = prepared.execute_cohorts_with_control(&admitted, &model.inner.loaded.value,
                     &input.value.vocabulary, budget, kernel, control).map_err(map_error)?;
-                expected.verify_completed(&result.document).map_err(map_error)?;
+                expected.verify_completed_with_control(&result.document, control).map_err(map_error)?;
                 checkpoint(control)?;
                 Ok(result)
             })?;

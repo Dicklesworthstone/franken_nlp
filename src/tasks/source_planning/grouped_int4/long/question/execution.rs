@@ -67,7 +67,8 @@ impl PreparedInt4Question<'_> {
         if let Some(error) = stopped { return Err(error.into()); }
         let mapped = mapped.map_err(Int4SourceMapError::Reduction)?;
         driver.borrow_mut().checkpoint()?;
-        let stats = statistics(mapped.root().value())?;
+        let mut check = || driver.borrow_mut().checkpoint().map_err(Int4SourceMapError::from);
+        let stats = statistics(mapped.root().value(), &mut check)?;
         if task.next != self.chunks.chunks().len() || stats.work != task.work || stats.masks != task.masks {
             return Err(Int4SourceError::InvalidResult.into());
         }
@@ -83,7 +84,6 @@ impl PreparedInt4Question<'_> {
             citation_guarantee: CitationGuarantee::StructuralSourceMembership,
             semantic_support: SummarySemanticSupport::NotAssessed, untrusted_fields: ["mapped.root.value"], mapped,
             request_binding: self.expected.request_binding, result_binding: [0; 32] };
-        let mut check = || driver.borrow_mut().checkpoint().map_err(Int4SourceMapError::from);
         run.result_binding = binding::result_with_checkpoints(&run, self.max_result_bytes(), &mut check)?;
         self.expected.verify_completed_with_checkpoints(&run, &mut check)?;
         driver.borrow_mut().checkpoint()?;
@@ -254,14 +254,19 @@ pub(super) struct Statistics {
     pub outcome: QuestionOutcome, pub work: Int4Work, pub masks: u64,
     pub citations: usize, pub spans: usize,
 }
-pub(super) fn statistics(value: &QuestionValue) -> Result<Statistics, Int4SourceError> {
+pub(super) fn statistics<F>(value: &QuestionValue, checkpoint: &mut F) -> Result<Statistics, Int4SourceMapError>
+    where F: FnMut() -> Result<(), Int4SourceMapError> {
+    checkpoint()?;
     let mut answers = Vec::new();
-    answers.try_reserve_exact(value.chunks.len()).map_err(|_| SourcePlanningError::AllocationRefused)?;
+    answers.try_reserve_exact(value.chunks.len())
+        .map_err(|_| Int4SourceError::from(SourcePlanningError::AllocationRefused))?;
     let mut stats = Statistics { answered: 0, abstained: 0, blank: 0, distinct: 0,
         outcome: QuestionOutcome::NoAnswerProposed, work: Int4Work::default(), masks: 0, citations: 0, spans: 0 };
     for chunk in value.chunks() {
+        checkpoint()?;
         stats.citations = stats.citations.checked_add(chunk.citations.len()).ok_or(Int4SourceError::InvalidResult)?;
         for citation in &chunk.citations {
+            checkpoint()?;
             stats.spans = stats.spans.checked_add(citation.spans.len()).ok_or(Int4SourceError::InvalidResult)?;
         }
         stats.work = add_work(stats.work, chunk.model_work).ok_or(Int4SourceError::InvalidResult)?;
@@ -269,21 +274,23 @@ pub(super) fn statistics(value: &QuestionValue) -> Result<Statistics, Int4Source
         match chunk.status {
             QuestionChunkStatus::Answered => {
                 let answer = chunk.answer.as_deref().ok_or(Int4SourceError::InvalidResult)?;
-                if !has_text(answer) || chunk.citations.is_empty() { return Err(Int4SourceError::InvalidResult); }
+                if !has_text(answer) || chunk.citations.is_empty() { return Err(Int4SourceError::InvalidResult.into()); }
                 stats.answered += 1; answers.push(answer);
             }
             QuestionChunkStatus::Abstained => {
-                if chunk.answer.is_some() || !chunk.citations.is_empty() { return Err(Int4SourceError::InvalidResult); }
+                if chunk.answer.is_some() || !chunk.citations.is_empty() { return Err(Int4SourceError::InvalidResult.into()); }
                 stats.abstained += 1;
             }
             QuestionChunkStatus::WhitespaceOnly => {
                 if chunk.answer.is_some() || !chunk.citations.is_empty() || chunk.model_work != Int4Work::default()
-                    || chunk.mask_node_visit_charge != 0 { return Err(Int4SourceError::InvalidResult); }
+                    || chunk.mask_node_visit_charge != 0 { return Err(Int4SourceError::InvalidResult.into()); }
                 stats.blank += 1;
             }
         }
     }
+    checkpoint()?;
     answers.sort_unstable(); answers.dedup(); stats.distinct = answers.len();
+    checkpoint()?;
     stats.outcome = match stats.distinct { 0 => QuestionOutcome::NoAnswerProposed,
         1 => QuestionOutcome::OneAnswerText, _ => QuestionOutcome::MultipleAnswerTexts };
     Ok(stats)
