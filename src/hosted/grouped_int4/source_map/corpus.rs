@@ -22,6 +22,12 @@ struct QuestionStreamInput<R, W> {
     writer: W,
 }
 
+struct DeferredQuestionStream<R, W> {
+    completion: stream::deferred::DeferredCompletion,
+    input: Charged<QuestionStreamInput<R, W>>,
+    frontier: Pending,
+}
+
 /// Pure, shared pre-IO quotation of transport, question copies, complete source
 /// frontiers, citations, optional synthesis, native phases and output staging.
 /// Caller-owned compiler/vocabulary and IO allocations must also fit their
@@ -61,11 +67,45 @@ impl NlpEngine {
         limits: CorpusLimits, reduction_reserve_bytes: u64, kernel: PackedInt4Kernel,
         reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
+        self.run_int4_question_documents(model, planner, vocabulary, limits,
+            reduction_reserve_bytes, kernel, None, reader, writer, cancellation)
+    }
+
+    /// Run all per-record questions, complete-source maps and optional neural
+    /// continuations on one persistent output-row team. Each record retains
+    /// its own question and causal context; no work allowance renews at flush.
+    /// The terminal footer is published after physical join under the original
+    /// deadline. Native chunk/hierarchy cohorts cannot combine with this path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int4_question_documents_with_threads<R, W>(&self, model: &ResidentInt4,
+        planner: Int4QuestionDocumentBatchPlanner, vocabulary: Arc<ExtractionVocabulary>,
+        limits: CorpusLimits, reduction_reserve_bytes: u64, kernel: PackedInt4Kernel,
+        compute_threads: usize, reader: R, writer: W, cancellation: CancellationToken)
+        -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        self.run_int4_question_documents(model, planner, vocabulary, limits,
+            reduction_reserve_bytes, kernel, Some(compute_threads), reader, writer, cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_int4_question_documents<R, W>(&self, model: &ResidentInt4,
+        planner: Int4QuestionDocumentBatchPlanner, vocabulary: Arc<ExtractionVocabulary>,
+        limits: CorpusLimits, reduction_reserve_bytes: u64, kernel: PackedInt4Kernel,
+        compute_threads: Option<usize>, reader: R, writer: W, cancellation: CancellationToken)
+        -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        match compute_threads {
+            Some(width) => dispatch::preflight_int4_team(self, limits.native.run, width)?,
+            None => dispatch::preflight(self, limits.native.run)?,
+        }
         if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
         constrained_int4::check_model(planner.base_execution_identity(), model.model_identity())
             .map_err(|_| HostedError::ModelIdentity)?;
         let config = *planner.config();
+        if compute_threads.is_some() && (planner.uses_native_cohorts()
+            || config.mapping.reduction.map_batch_chunks != 1) {
+            return Err(HostedError::Limits("INT4 question corpus teams require serial chunk scheduling"));
+        }
         if planner.group_width() != model.model_identity().group_width()
             || planner.base_execution_identity().task_spec != ANSWER_TASK_VERSION
             || config.planning.max_context_tokens != limits.native.context_tokens {
@@ -77,6 +117,9 @@ impl NlpEngine {
         let hierarchy_groups = planner.hierarchy_cohort_schedule().map(|schedule| schedule.max_groups);
         let required = int4_question_document_corpus_requirements(planner.group_width(), config,
             limits, reduction_reserve_bytes, cohort_chunks, hierarchy_groups)?;
+        let team_scratch = compute_threads.map(|width|
+            int4_task_team_workspace_bytes(width, planner.group_width())).transpose()?.unwrap_or(0);
+        sum(&[required.workspace_bytes, team_scratch])?;
         let cohort = planner.uses_native_cohorts().then(|| planner.cohort_requirements()
             .map_err(HostedError::BatchSetup)).transpose()?;
         let lease = self.resources().acquire_lease();
@@ -86,7 +129,8 @@ impl NlpEngine {
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.workspace_bytes)?;
         let model = model.clone();
-        dispatch::run(self, limits.native.run, cancellation, move |control| {
+        match compute_threads {
+        None => dispatch::run(self, limits.native.run, cancellation, move |control| {
             let mut input = input;
             checkpoint(control)?;
             let (planner, vocabulary) = input.value.preparation.take().ok_or(HostedError::CompletionMissing)?;
@@ -129,7 +173,36 @@ impl NlpEngine {
             drop(vocabulary); drop(planner); drop(input);
             drop(frontier); drop(lease);
             result
-        })
+        }),
+        Some(width) => dispatch::run_int4_team_with_finalize(self, limits.native.run, cancellation,
+            model, width, kernel, move |weights, control, team| {
+                let mut input = input;
+                checkpoint(control)?;
+                let (planner, vocabulary) = input.value.preparation.take().ok_or(HostedError::CompletionMissing)?;
+                let mut engine = allocate_native(kv, scratch, || {
+                    StrictInt4Engine::new(weights, limits.native.context_tokens, Int4MemoryBudget {
+                        max_kv_bytes: required.native.kv_bytes, max_rope_bytes: required.native.rope_bytes,
+                        max_scratch_payload_bytes: required.native.scratch_payload_bound,
+                    }).map_err(native_error)?.with_kernel(kernel)
+                        .with_projection_executor(team).map_err(native_error)
+                })?;
+                let admission = QuestionAdmission::new(&lease, weights.identity(),
+                    planner.base_execution_identity(), config, required);
+                let completion = {
+                    let mut processor = NativeInt4QuestionDocumentBatch::new(&planner, &mut engine.value,
+                        &vocabulary, admission).map_err(HostedError::BatchSetup)?;
+                    stream::deferred::run_ndjson_deferred(&mut input.value.reader, &mut input.value.writer,
+                        &mut processor, limits.transport, control).map_err(HostedError::Batch)?
+                };
+                drop(engine); drop(vocabulary); drop(planner); drop(lease);
+                Ok(DeferredQuestionStream { completion, input, frontier })
+            }, |pending, control| {
+                let DeferredQuestionStream { completion, mut input, frontier } = pending;
+                let result = completion.publish(&mut input.value.writer, control).map_err(HostedError::Batch);
+                drop(input); drop(frontier);
+                result
+            }),
+        }
     }
 }
 
