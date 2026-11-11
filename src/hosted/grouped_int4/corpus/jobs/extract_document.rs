@@ -12,6 +12,7 @@ use crate::{
     jobs::runner::extract::grouped_int4::document::{Int4DocumentExtractionJobPlanner,
         Int4DocumentExtractionJobProcessor, Int4ExtractionDocumentAdmission,
         Int4ExtractionDocumentBatchAdmission},
+    tokenizer::untrusted::UntrustedEncoding,
 };
 
 struct ExtractionDocumentInput<R> {
@@ -29,13 +30,16 @@ struct DocumentRequirements {
 impl Int4DocumentExtractionJobPlanner {
     /// Checked maximum document-frontier quote using the same calculation as
     /// `extract_int4_document`. Native, private preparation, population and
-    /// final-result ownership are reserved separately by the job host.
+    /// final-result ownership are reserved separately by the job host. Compact
+    /// input encoding adds one encoder workspace to preparation ownership,
+    /// independently of this frontier and the native cohort width.
     pub fn workspace_bytes(&self, native: NativeLimits, reduction_reserve_bytes: u64)
         -> Result<u64, HostedError> {
         let document = self.document_limits();
         if native.context_tokens != document.mapping.chunks.context_tokens {
             return Err(HostedError::Limits("INT4 extraction document job resident context"));
         }
+        self.encoding_workspace_bytes().map_err(HostedError::BatchSetup)?;
         complete_workspace_bytes(self.document_budget(), document, reduction_reserve_bytes,
             self.compiler_limits(), self.root_object_reconciliation())
     }
@@ -90,7 +94,8 @@ impl NlpEngine {
         let result_bytes = planner.max_result_bytes();
         let frontier_bytes = planner.workspace_bytes(limits.native, reduction_reserve_bytes)?;
         let mut required = requirements(planner.group_width(), budget, document, result_bytes,
-            request.limits, limits, frontier_bytes, planner.request().schema.capacity(), request.mode.input_memory())?;
+            request.limits, limits, frontier_bytes, planner.request().schema.capacity(), request.mode.input_memory(),
+            planner.document_encoding())?;
         let cohort = if planner.uses_chunk_cohorts() {
             Some(planner.cohort_requirements().map_err(HostedError::BatchSetup)?)
         } else { None };
@@ -130,7 +135,7 @@ impl NlpEngine {
             let admission = DocumentAdmission { lease: &lease, model: model.model_identity(),
                 base: planner.execution_identity(), kv_bytes: required.native.kv_bytes,
                 document, result_bytes, output_tokens_per_chunk: u64::from(budget.max_output_tokens),
-                selected_rows: planner.selected_rows() };
+                selected_rows: planner.selected_rows(), document_encoding: planner.document_encoding() };
             let result = (|| {
                 let processor = match &mut native {
                     DocumentNative::Serial(engine) => Int4DocumentExtractionJobProcessor::new(
@@ -172,14 +177,21 @@ impl DocumentRequirements {
 #[allow(clippy::too_many_arguments)]
 fn requirements(width: usize, budget: TaskBudget, document: Int4ExtractionMapLimits,
     result_bytes: u64, job: JobLimits, limits: JobHostLimits, document_workspace_bytes: u64,
-    schema_capacity: usize, input: JobInputMemory) -> Result<DocumentRequirements, HostedJobError> {
+    schema_capacity: usize, input: JobInputMemory, encoding: &UntrustedEncoding)
+    -> Result<DocumentRequirements, HostedJobError> {
     budget.validate().map_err(|_| HostedError::Limits("INT4 extraction document job task budget"))?;
     // The frozen private recipe and native shared-default compiler each own
     // schema bytes. Their variable capacity is additional to explicit planner
     // overhead and all population/serializer/journal buffers.
     let schemas = (schema_capacity as u64).checked_mul(2)
         .ok_or(HostedError::Limits("INT4 extraction document job schema arithmetic"))?;
-    let input_bytes = sum(&[limits.required_buffer_bytes_for_input(job, input)?, schemas])?;
+    // One bounded encoder is reused serially for every sizing probe and final
+    // chunk compilation. Reserve it before population ingestion and retain it
+    // through reconstruction; neither document count nor cohort width scales
+    // this workspace. Each preparation has its own bounded tokenizer work.
+    let encoding = crate::batch::extract::grouped_int4::memory::encoding_workspace_bytes(encoding)
+        .map_err(HostedError::BatchSetup)?;
+    let input_bytes = sum(&[limits.required_buffer_bytes_for_input(job, input)?, schemas, encoding])?;
     let native = Int4MemoryRequirement::for_context(limits.native.context_tokens, width).map_err(native_error)?;
     let mapping = document.mapping;
     if schema_capacity == 0 || document_workspace_bytes == 0 || limits.native.allocator_reserve_bytes == 0
@@ -203,11 +215,13 @@ struct DocumentAdmission<'a> {
     result_bytes: u64,
     output_tokens_per_chunk: u64,
     selected_rows: Option<Int4JsonSparseLimits>,
+    document_encoding: &'a UntrustedEncoding,
 }
 impl Int4ExtractionDocumentBatchAdmission for DocumentAdmission<'_> {
     type Guard = Pending;
     fn admit(&mut self, request: Int4ExtractionDocumentAdmission<'_>)
         -> Result<(Vec<ExecutionIdentity>, Self::Guard), BatchItemFailure> {
+        check_encoding(self.document_encoding, &request)?;
         check_request(self.model.group_width(), self.base, self.kv_bytes, self.document,
             self.result_bytes, self.output_tokens_per_chunk, self.selected_rows, &request)?;
         let mut identities = Vec::new();
@@ -222,6 +236,13 @@ impl Int4ExtractionDocumentBatchAdmission for DocumentAdmission<'_> {
             .map_err(admission_failure)?;
         Ok((identities, guard))
     }
+}
+
+fn check_encoding(expected: &UntrustedEncoding, request: &Int4ExtractionDocumentAdmission<'_>)
+    -> Result<(), BatchItemFailure> {
+    expected.validate().map_err(|_| BatchItemFailure::fatal(BatchCode::Admission))?;
+    if expected != &request.document_encoding { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

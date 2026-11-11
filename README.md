@@ -531,7 +531,10 @@ less room for its schema. Library callers use the explicit one-request
 eager, INT8 or INT4 extraction batch planner. INT4 resident streams can freeze
 the policy with `with_document_encoding`; their hosted entry points reserve the
 corresponding workspace. Legacy constructors and byte-capacity map/job methods
-retain their separate byte-only contract.
+retain their separate byte-only contract unless they expose an explicit policy
+builder. Complete-document INT4 extraction maps, corpora and jobs provide the
+separately bounded opt-in described under
+[whole-document extraction](#implemented-candidate-int4-whole-document-extraction).
 
 One-off `classify` and `sentiment` apply the same explicit policy before native
 planning. Classification encodes the original document once and each canonical
@@ -557,7 +560,8 @@ These one-off scored routes reserve the encoder workspace before private IO and
 report the complete selected policy in `input_encoding`. Resident
 [`score-batch` classification and sentiment](#implemented-candidate-int4-scoring-batches)
 also accept this policy, with a fresh tokenizer allowance per complete record.
-Maps, corpora and retained jobs retain their byte-based planning contract. The
+Classification and sentiment maps, corpora and retained jobs retain their
+byte-based planning contract. The
 compact policy is a separate input profile; its task quality and model behavior
 require their own evaluation.
 
@@ -593,8 +597,9 @@ tokenizer budget for every candidate boundary.
 
 This is a distinct candidate tokenization contract, with its own regression
 fixtures; it does not assert ordinary slow-tokenizer token-ID parity or task
-quality gains. Unwired structured tasks, document maps, structured corpora and
-retained jobs keep their existing byte-fallback contract. These encoding and
+quality gains. Other source-task maps and retained jobs keep their existing
+byte-fallback contract; complete-document INT4 extraction has the explicit
+policy described below. These encoding and
 planner tests still require
 the repository's authorized DSR checkpoint and model-present qualification.
 
@@ -3740,6 +3745,67 @@ preflights; a later task failure preserves the completed snapshot. All model
 inputs remain explicit candidate inputs with the actual model digest, group
 width and kernel carried in output provenance.
 
+Add `--input-encoding safe-bpe-v1` to compactly encode the exact schema and
+source while preserving their bytes and excluding template-control tokens.
+The planner sizes each chunk from its actual encoded tokens, including the
+trusted prompt and reserved output. This can fit more source bytes into a
+chunk than byte fallback; original UTF-8 byte and scalar ranges still identify
+the complete lossless partition. Byte fallback remains the default.
+
+```bash
+fnlp candidate source-int4 extract-map long-document.txt \
+  --schema exact-spans.schema.json --source-membership \
+  --snapshot /models/nanbeige.int4.snapshot \
+  --expected-model-sha256 "$EXPECTED_MODEL_SHA256" \
+  --memory-mib 16384 --max-input-bytes 65536 \
+  --input-encoding safe-bpe-v1 \
+  --max-tokenizer-input-bytes 1048576 \
+  --max-tokenizer-output-tokens 1048576 \
+  --max-tokenizer-pair-checks 67108864 \
+  --max-tokenizer-pair-bytes 536870912 \
+  > document-result.json
+```
+
+These four tokenizer limits cover **one complete document preparation**:
+initial schema sizing, every accepted or rejected chunk-size probe, and the
+final schema/source compilation for every chunk. They never renew at a chunk
+or cohort boundary. Their defaults and hard maxima are:
+
+| Option | Default and maximum | Charged work |
+| --- | ---: | --- |
+| `--max-tokenizer-input-bytes` | 1,048,576 | All bytes encoded, including repeated schema/source probes |
+| `--max-tokenizer-output-tokens` | 1,048,576 | All untrusted tokens produced across the preparation |
+| `--max-tokenizer-pair-checks` | 67,108,864 | BPE pair comparisons |
+| `--max-tokenizer-pair-bytes` | 536,870,912 | Bytes examined by BPE pair comparisons |
+
+These are work ceilings, separate from the original document's
+`--max-input-bytes`, each chunk's native context, and `--max-tokenizer-calls`.
+Repeated probes and schemas consume the byte/token allowance even when the
+final chunks fit context. A document can therefore reach a tokenizer ceiling
+well before its original input-byte limit. Any exceeded ceiling rejects the
+complete document before native execution, without truncation or a change of
+encoding. The existing declaration of one MiB of tokenizer input work is not
+a promise to accept a one-MiB original document in compact mode.
+
+The same flags work on `extract-corpus` and
+`extract-document-job start|resume`, including selected-row projection,
+source-membership checks, root-array union and chunk cohorts. Compact input
+is refused with root-object reconciliation. One transient encoder workspace
+is admitted alongside all retained chunk plans; its size is not multiplied
+by the chunk count or cohort width. A preliminary CLI preflight and the later
+hosted preparation each receive a separately bounded ledger with the same
+fixed policy. Each corpus document, reconstruction and resumed attempt does
+likewise; tokenizer work is not a persisted lifetime debit.
+
+Completed compact map results report the full `input_encoding` policy and
+actual `input_encoding_work`. Corpus frames, including the mandatory completion
+footer for an empty input, report the policy. Retained jobs authenticate the
+encoding kind and all four ceilings in their private recipe; repeat them
+unchanged on resume, including retained-input replay. Default byte-fallback
+recipes and response fields remain unchanged. Compact input changes the model's
+prompt tokens; native parity, task quality and performance still require their
+own model-present qualification.
+
 Add `--cohort-chunks N` (1 through 64, at most `--max-chunks`) to execute
 independent chunks through shared native INT4 decoder layers. Each window,
 including a short final window, uses exactly its actual sequence contexts.
@@ -3885,6 +3951,17 @@ retained job. Each original document is one atomic durable item. The full
 population shares one resident model, one exact raw schema and one fixed set
 of chunking, work and verification limits. This route requires `metadata-store`
 and `asupersync-runtime` on Linux x86-64 or AArch64.
+
+Independent exact-schema chunks and root-array union also accept the
+[complete-document compact input policy](#implemented-candidate-int4-whole-document-extraction).
+Use `--input-encoding safe-bpe-v1` and repeat the same four tokenizer ceilings
+on every `resume`, including `--use-retained-input`. The authenticated recipe
+rejects a changed encoding kind or ceiling before recovery/execution. Each
+preparation is bounded under that policy; native, mask and source-verification
+lifetime ledgers retain their existing nonrenewable semantics. Compact mode
+adds only public encoding metadata to the progress report, never private
+source/schema text or recipe material. Root-object reconciliation remains
+byte-fallback only.
 
 Add `--reconcile-root-object` to assemble complementary root properties across
 chunks using the same contract as `extract-object-map`. The completed object

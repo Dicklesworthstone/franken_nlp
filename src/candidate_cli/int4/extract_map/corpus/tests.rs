@@ -36,6 +36,42 @@ impl DecodeStepControl for Control {
 }
 
 #[test]
+fn compact_document_corpus_prices_one_workspace_for_serial_and_chunk_cohort_streams() {
+    for flags in [&[][..], &["--cohort-chunks", "3", "--max-selected-rows", "32"][..],
+        &["--root-array-union", "--source-membership"][..]] {
+        let (plain, args) = arguments(flags);
+        let before = plain.validate(&args).unwrap();
+        let mut compact_flags = flags.to_vec();
+        compact_flags.extend(["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "262144",
+            "--max-tokenizer-output-tokens", "131072", "--max-tokenizer-pair-checks", "8192",
+            "--max-tokenizer-pair-bytes", "65536"]);
+        let (compact, _) = arguments(&compact_flags);
+        let after = compact.validate(&args).unwrap();
+        let bytes = compact.document.encoding.workspace_bytes().unwrap();
+        assert_eq!(after.memory.input_bytes - before.memory.input_bytes, bytes);
+        assert_eq!(after.memory.document_workspace_bytes, before.memory.document_workspace_bytes);
+        assert_eq!(after.memory.native, before.memory.native);
+        assert_eq!(after.memory.workspace_bytes, before.memory.workspace_bytes);
+        assert_eq!(after.memory.output_reservation_bytes, before.memory.output_reservation_bytes);
+        assert_eq!(after.transport.max_work, before.transport.max_work);
+        assert_eq!(after.max_run_mask_visits, before.max_run_mask_visits);
+        assert_eq!(after.max_run_verification, before.max_run_verification);
+        assert!(after.common.minimum_memory_bytes >= before.common.minimum_memory_bytes);
+    }
+}
+
+#[test]
+fn compact_corpus_rejects_invalid_policy_and_unqualified_object_mode_before_io() {
+    for flags in [vec!["--input-encoding", "safe-bpe-v1", "--reconcile-root-object"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "0"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-output-tokens", "1048577"],
+        vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "0"]] {
+        let (command, args) = arguments(&flags);
+        assert_eq!(command.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
 fn root_object_stream_reserves_one_complete_reducer_without_renewing_work_or_verification() {
     for cohorts in [None, Some(3)] {
         let (mut plain, args) = arguments(&[]);

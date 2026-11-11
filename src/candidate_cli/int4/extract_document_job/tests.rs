@@ -32,6 +32,46 @@ impl Write for NoIo {
 }
 
 #[test]
+fn retained_compact_documents_bind_explicit_caps_on_start_resume_and_retained_replay() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    for (operation, replay) in [("start", false), ("resume", false), ("resume", true)] {
+        let mut flags = vec!["--cohort-chunks", "3", "--max-selected-rows", "32", "--source-membership"];
+        if replay { flags.push("--use-retained-input"); }
+        let (plain, args) = command(operation, &flags);
+        let before = plain.args.validate(&args).unwrap();
+        flags.extend(["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "65536",
+            "--max-tokenizer-output-tokens", "32768", "--max-tokenizer-pair-checks", "100000",
+            "--max-tokenizer-pair-bytes", "1000000"]);
+        let (compact, _) = command(operation, &flags);
+        let after = compact.args.validate(&args).unwrap();
+        assert_eq!(compact.args.map.encoding.policy().unwrap(), UntrustedEncoding::SafeBpeV1(SafeBpeLimits {
+            max_input_bytes: 65536, max_output_tokens: 32768, max_pair_checks: 100000, max_pair_bytes: 1000000 }));
+        assert_eq!(after.common.minimum_memory_bytes - before.common.minimum_memory_bytes,
+            compact.args.map.encoding.workspace_bytes().unwrap());
+        assert_eq!(after.workspace_bytes, before.workspace_bytes);
+        assert_eq!(after.cohort, before.cohort);
+        assert_eq!(after.mapping.mapping.max_model_work, before.mapping.mapping.max_model_work);
+        assert_eq!(after.mapping.mapping.max_mask_visits, before.mapping.mapping.max_mask_visits);
+        assert_eq!(after.mapping.verification, before.mapping.verification);
+        let fixed = lifetime(&args, after);
+        assert!(compact.args.lifetime_limits(&args, after, fixed).is_ok());
+    }
+}
+
+#[test]
+fn retained_compact_policy_refuses_unsupported_object_mode_or_caps_before_private_io() {
+    for operation in ["start", "resume"] {
+        for flags in [vec!["--input-encoding", "safe-bpe-v1", "--reconcile-root-object"],
+            vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "0"],
+            vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-output-tokens", "1048577"],
+            vec!["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-bytes", "0"]] {
+            let (command, args) = command(operation, &flags);
+            assert_eq!(command.execute_owned(args, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+        }
+    }
+}
+
+#[test]
 fn object_reconciliation_is_explicit_on_start_resume_and_retained_replay() {
     use crate::batch::extract::grouped_int4::long::stream::memory::root_object_workspace_bytes;
     for (operation, retained) in [("start", false), ("resume", false), ("resume", true)] {

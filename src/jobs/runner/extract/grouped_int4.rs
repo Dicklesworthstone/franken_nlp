@@ -16,6 +16,7 @@ use crate::{
         strict_int4::{Int4ModelIdentity, Int4Work, StrictInt4Engine}},
     tasks::{extract::{ExtractionVocabulary, grouped_int4::{Int4ExtractRun, INT4_EXTRACT_VERSION}},
         ir::TaskBudget},
+    tokenizer::untrusted::UntrustedEncoding,
 };
 use serde::Serialize;
 
@@ -42,6 +43,10 @@ pub struct Int4ExtractionJobRecipe {
     source: SourceRuntimeLimits,
     native: NativeRecipe,
     defaults: ExtractionBatchArgs,
+    /// Complete-document compact encoding is explicit private resume authority.
+    /// Omission preserves the original byte-fallback recipe exactly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<UntrustedEncoding>,
 }
 #[derive(Serialize)]
 struct NativeRecipe {
@@ -80,7 +85,7 @@ impl Int4ExtractionJobRecipe {
             compiler: CompilerRecipe { max_schema_bytes, max_string_bytes, max_array_items,
                 max_output_bytes, max_states, max_transitions, max_mask_bytes }, source,
             native: NativeRecipe { max_model_work, max_trie_node_visits, checkpoint_interval_nodes,
-                max_visits_per_item, max_visits_per_run }, defaults };
+                max_visits_per_item, max_visits_per_run }, defaults, input_encoding: None };
         // Bound before cloning exact schema bytes into the native compiler.
         // Keep room for JobRunner's protocol/input-profile wrapper.
         bounded_json(&recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;

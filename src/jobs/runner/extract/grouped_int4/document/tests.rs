@@ -1,5 +1,6 @@
 //! UNRUN real pinned-planning and private-contract fixtures. These do not run
 //! native inference, qualify model accuracy or establish crash recovery proof.
+mod encoding;
 use super::*;
 use crate::{
     artifact::converter::PINNED_REVISION,

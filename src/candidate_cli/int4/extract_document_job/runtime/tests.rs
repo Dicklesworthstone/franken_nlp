@@ -70,7 +70,7 @@ fn whole_document_progress_report_does_not_emit_schema_source_values_or_private_
         model_content_sha256: &content, candidate_format: "fixture-candidate-format", quant_recipe: "fixture-grouped-int4",
         group_width: args.group_width, integer_kernel: map.common.kernel.kind().id(),
         snapshot: Some(SnapshotRecord::new("loaded", map.common.snapshot_need)), chunk_schedule: None, output: &report,
-        root_array_union: None, max_selected_rows: None, root_object_reconciliation: None,
+        root_array_union: None, max_selected_rows: None, root_object_reconciliation: None, input_encoding: None,
     };
     let mut bytes = Vec::new(); publish(&response, job_cli::REPORT_BYTES, &mut bytes).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -84,6 +84,7 @@ fn whole_document_progress_report_does_not_emit_schema_source_values_or_private_
     assert!(value.get("root_array_union").is_none());
     assert!(value.get("root_object_reconciliation").is_none());
     assert!(value.get("max_selected_rows").is_none());
+    assert!(value.get("input_encoding").is_none());
     for forbidden in ["text", "schema", "values", "spans", "recipe", "key", "job_dir", "results", "documents"] {
         assert!(value.get(forbidden).is_none()); assert!(value["output"].get(forbidden).is_none());
     }
@@ -99,6 +100,28 @@ fn whole_document_progress_report_does_not_emit_schema_source_values_or_private_
     assert_eq!(selected["max_selected_rows"], 8192);
     assert_eq!(selected["output"], value["output"]);
     assert_eq!(selected["chunk_schedule"], grouped["chunk_schedule"]);
+    let encoding = crate::tokenizer::untrusted::UntrustedEncoding::SafeBpeV1(
+        crate::tokenizer::untrusted::SafeBpeLimits { max_input_bytes: 65536, max_output_tokens: 32768,
+            max_pair_checks: 100000, max_pair_bytes: 1000000 });
+    response.input_encoding = input_encoding::reported_policy(&encoding);
+    let mut compact_bytes = Vec::new();
+    publish(&response, job_cli::REPORT_BYTES, &mut compact_bytes).unwrap();
+    let mut compact: serde_json::Value = serde_json::from_slice(&compact_bytes).unwrap();
+    assert_eq!(compact["input_encoding"], serde_json::json!({
+        "kind": "safe_bpe_v1", "limits": { "max_input_bytes": 65536, "max_output_tokens": 32768,
+            "max_pair_checks": 100000, "max_pair_bytes": 1000000 } }));
+    assert_eq!(compact["output"], selected["output"]);
+    for forbidden in ["text", "schema", "values", "spans", "recipe", "key", "job_dir", "results", "documents"] {
+        assert!(compact.get(forbidden).is_none()); assert!(compact["output"].get(forbidden).is_none());
+    }
+    let compact_text = std::str::from_utf8(&compact_bytes).unwrap();
+    for private in ["private-schema", "private/job", "private/key", "schema_digest", "binding"] {
+        assert!(!compact_text.contains(private));
+    }
+    assert!(compact_bytes.ends_with(b"\n"));
+    compact.as_object_mut().unwrap().remove("input_encoding");
+    assert_eq!(compact, selected, "encoding provenance must not change progress or other public metadata");
+    response.input_encoding = None;
     let (object, object_args) = command("resume", &["--reconcile-root-object"]);
     let object_limits = object.args.reconciliation.limits(object.args.map.mapping).unwrap().unwrap();
     response.root_object_reconciliation = Some(RootObjectSelection::new(object_limits));
@@ -109,6 +132,7 @@ fn whole_document_progress_report_does_not_emit_schema_source_values_or_private_
         crate::tasks::extract::object_reconcile::ROOT_OBJECT_RECONCILIATION);
     assert_eq!(object["root_object_reconciliation"]["limits"], serde_json::to_value(object_limits).unwrap());
     assert_eq!(object["output"], value["output"]);
+    assert!(object.get("input_encoding").is_none());
     let bytes = serde_json::to_string(&object).unwrap();
     for private in ["private-schema", "private/job", "private/key", "schema_digest", "binding"] {
         assert!(!bytes.contains(private));

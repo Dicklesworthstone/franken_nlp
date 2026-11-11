@@ -159,6 +159,46 @@ fn caller_cancellation_survives_final_preflight_and_never_gets_a_fresh_budget() 
 }
 
 #[test]
+fn hosted_compact_repreparation_preserves_timeout_classification_after_physical_drain() {
+    let (planner, request, mapping) = fixture(32);
+    let command = super::super::tests::command(&["--input-encoding", "safe-bpe-v1"]);
+    let Int4Task::ExtractMap(options) = command.task else { panic!("wrong map task"); };
+    let planner = options.configure_planner(planner).unwrap();
+    let mut complete = continuing();
+    let expected = preflight(SOURCE, &request, &planner, mapping, &mut complete).unwrap();
+    assert!(expected.encoding_work().is_some());
+    assert!(complete.calls > 2);
+    for cause in [DecodeCancellationKind::Deadline, DecodeCancellationKind::Timeout,
+        DecodeCancellationKind::User, DecodeCancellationKind::PollQuota] {
+        let classified = if matches!(cause, DecodeCancellationKind::Deadline | DecodeCancellationKind::Timeout) {
+            CandidateError::Timeout
+        } else { CandidateError::Execution };
+        for stop_at in [2, complete.calls] {
+            let task_error = || {
+                let mut control = Control { calls: 0, stop_at, cause };
+                let error = planner.plan_document_with_control(SOURCE, &request, mapping, &mut control).err().unwrap();
+                assert_eq!(error.cancellation(), Some(cause));
+                HostedError::Int4(Int4HostError::ExtractionMap(error))
+            };
+            assert_eq!(execution_error(task_error()), classified);
+            assert_eq!(execution_error(HostedError::Scope {
+                source: asupersync::cx::ScopedCpuError::WorkerCapExceeded { cap: 1 },
+                physical_error: Some(Box::new(task_error())),
+            }), classified);
+            assert_eq!(execution_error(HostedError::Stopped {
+                stop: crate::hosted::RunStop { kind: cause, runtime_reason: None, runtime_checkpoint_error: None },
+                task_error: Some(Box::new(task_error())),
+            }), classified);
+        }
+    }
+    for error in [HostedError::ModelIdentity,
+        HostedError::Reservation(crate::ReservationError::ArithmeticOverflow),
+        HostedError::Int4(Int4HostError::ExtractionMap(Int4ExtractionMapError::WorkLimit))] {
+        assert_eq!(execution_error(error), CandidateError::Execution);
+    }
+}
+
+#[test]
 fn cli_workspace_quote_matches_actual_host_for_complete_occurrence_vectors() {
     let command = super::super::tests::command(&[]);
     let Int4Task::ExtractMap(options) = command.task else { panic!("wrong map task"); };

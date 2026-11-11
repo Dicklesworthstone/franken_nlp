@@ -142,11 +142,13 @@ impl ObjectMapArgs {
         Ok(Self { map: MapArgs { extraction: extract::ExtractionArgs::from_matches_with_projection(matches)?,
             mapping: MappingArgs::from_arg_matches(matches)?,
             cohort_chunks: matches.get_one::<usize>("cohort_chunks").copied(),
-            array_union: ArrayUnionArgs::default() }, object: ObjectArgs::from_arg_matches(matches)? })
+            array_union: ArrayUnionArgs::default(), encoding: input_encoding::DocumentInputEncodingArgs::default() },
+            object: ObjectArgs::from_arg_matches(matches)? })
     }
     fn validate(&self, args: &Int4Args) -> Result<ObjectMapLimits, CandidateError> {
         // Revalidate the owned arguments too: parser absence is not authority.
         if self.map.array_union.limits(self.map.mapping)?.is_some()
+            || self.map.encoding.policy()? != crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback
             || !args.input_encoding.is_default() || args.compute.threads() != 1 {
             return Err(CandidateError::Arguments);
         }

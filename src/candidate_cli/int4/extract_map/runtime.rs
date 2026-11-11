@@ -6,7 +6,7 @@ use crate::{
     batch::extract::grouped_int4::{Int4ExtractionBatchPlanner,
         long::{Int4ExtractionMapPreflight, Int4ExtractionMapError, Int4ExtractionMapRun,
             cohort::Int4ExtractionMapCohortStats}},
-    hosted::{CancellationToken, Int4ExtractionMapConfig, NativeLimits, RunLimits},
+    hosted::{CancellationToken, HostedError, Int4ExtractionMapConfig, Int4HostError, NativeLimits, RunLimits},
     native_engine::{decode::{DecodeCancellationKind, DecodeStepControl},
         strict_int4::weights::snapshot::INT4_SNAPSHOT_VERSION},
     tasks::extract::ExtractionVocabulary,
@@ -34,6 +34,22 @@ fn planning_error(error: Int4ExtractionMapError) -> CandidateError {
         None => CandidateError::Planning,
     }
 }
+fn execution_error(error: HostedError) -> CandidateError {
+    // Hosted preparation repeats the complete map under its own reservation.
+    // Its original timeout survives both the task error and a drained runtime
+    // wrapper; other execution failures keep their existing classification.
+    let cause = match error {
+        HostedError::Stopped { stop, .. } => Some(stop.kind),
+        HostedError::Join { physical_error: Some(error), .. }
+            | HostedError::Scope { physical_error: Some(error), .. } => return execution_error(*error),
+        HostedError::Int4(Int4HostError::ExtractionMap(error)) => error.cancellation(),
+        _ => None,
+    };
+    match cause {
+        Some(DecodeCancellationKind::Deadline | DecodeCancellationKind::Timeout) => CandidateError::Timeout,
+        _ => CandidateError::Execution,
+    }
+}
 pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
     let started = Instant::now();
@@ -51,6 +67,12 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     let lease = engine.resources().acquire_lease();
     let _preparation = lease.reserve(MemoryClass::JobBuffers, common.preparation_bytes)
         .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
+    let encoding = options.encoding.policy()?;
+    let encoding_bytes = options.encoding.workspace_bytes()?;
+    let encoding_preparation = if encoding_bytes == 0 { None } else {
+        Some(lease.reserve(MemoryClass::JobBuffers, encoding_bytes)
+            .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?)
+    };
     remaining()?;
     let schema = read_input(&mut File::open(options.extraction.schema_path())
         .map_err(|_| CandidateError::Input)?, crate::candidate_cli::extract::SCHEMA_BYTES)?;
@@ -66,8 +88,9 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     remaining()?;
     let planner = Int4ExtractionBatchPlanner::for_model(model.model_identity(), budget,
         options.extraction.compiler(), options.extraction.source_limits(), None).map_err(|_| CandidateError::Planning)?;
-    let planner = options.extraction.configure_planner(planner)?;
+    let planner = options.configure_planner(planner)?;
     let expected = preflight(&text, &request, &planner, limits.mapping, &mut DeadlineControl { started, deadline })?;
+    if expected.document_encoding() != encoding { return Err(CandidateError::Identity); }
     let controls = crate::tokenizer::pinned_controls::pinned().map_err(|_| CandidateError::Identity)?;
     let vocabulary = ExtractionVocabulary::pinned(controls.template_controls())
         .map(Arc::new).map_err(|_| CandidateError::Planning)?;
@@ -114,13 +137,16 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         publish_checked(&response, limits.max_result_bytes + 4096, output,
             &|| remaining().map(|_| ()))
     };
+    // Preliminary plans are gone. Transfer encoder ownership to the hosted
+    // input claim, which remains alive through native drain and publication.
+    drop(encoding_preparation);
     if let Some(max_chunks) = limits.cohort_chunks {
         let result = engine.extract_int4_document_cohorts(&model, text, Arc::new(planner), vocabulary,
-            config, common.kernel, cancellation).map_err(|_| CandidateError::Execution)?;
+            config, common.kernel, cancellation).map_err(execution_error)?;
         finish(&result.result().document, Some(CohortSchedule::new(max_chunks, &result.result().cohorts)))
     } else {
         let result = engine.extract_int4_document(&model, text, Arc::new(planner), vocabulary,
-            config, common.kernel, cancellation).map_err(|_| CandidateError::Execution)?;
+            config, common.kernel, cancellation).map_err(execution_error)?;
         finish(result.result(), None)
     }
 }

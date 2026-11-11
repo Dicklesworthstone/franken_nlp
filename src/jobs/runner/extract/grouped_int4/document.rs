@@ -221,6 +221,47 @@ impl Int4DocumentExtractionJobPlanner {
     pub fn root_object_reconciliation(&self) -> Option<RootObjectLimits> {
         self.compiler.root_object_reconciliation()
     }
+    /// Seal the complete document's input policy before population recovery.
+    /// Schema encoding, chunk fit probes and final chunk compilation share
+    /// one allowance per complete-document preparation. Reconstruction starts
+    /// a separately bounded preparation under the same authenticated policy;
+    /// tokenizer work is not a persisted lifetime debit. The private recipe
+    /// authenticates every limit, and a previously prepared byte-fallback
+    /// attempt cannot acquire compact semantics. Root-object reconciliation
+    /// remains byte-fallback only.
+    pub fn with_document_encoding(mut self, policy: UntrustedEncoding) -> Result<Self, BatchFault> {
+        self.check_document_encoding()?;
+        if self.document_encoding() == &policy { return Ok(self); }
+        self.compiler = self.compiler.with_document_encoding(policy.clone())?;
+        self.recipe.extraction.input_encoding = match policy {
+            UntrustedEncoding::ByteFallback => None,
+            compact @ UntrustedEncoding::SafeBpeV1(_) => Some(compact),
+        };
+        self.check_document_encoding()?;
+        bounded_json(&self.recipe, 1024 * 1024 - 1024).map_err(|_| BatchCode::InvalidLimits)?;
+        self.owner = Arc::new(());
+        Ok(self)
+    }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { self.compiler.document_encoding() }
+    /// One transient encoder is live during serial preparation/reconstruction,
+    /// independently of the number of retained chunks or native cohort rows.
+    pub fn encoding_workspace_bytes(&self) -> Result<u64, BatchFault> {
+        self.check_document_encoding()?;
+        self.compiler.encoding_workspace_bytes()
+    }
+    fn check_document_encoding(&self) -> Result<(), BatchFault> {
+        let expected = match &self.recipe.extraction.input_encoding {
+            None => &UntrustedEncoding::ByteFallback,
+            Some(UntrustedEncoding::ByteFallback) => return Err(BatchCode::Admission.into()),
+            Some(compact @ UntrustedEncoding::SafeBpeV1(_)) => compact,
+        };
+        if self.document_encoding() != expected
+            || (self.root_object_reconciliation().is_some() && expected != &UntrustedEncoding::ByteFallback) {
+            return Err(BatchCode::Admission.into());
+        }
+        self.compiler.encoding_workspace_bytes()?;
+        Ok(())
+    }
     /// Seal the same all-legal-row strategy into every chunk and the immutable
     /// job recipe. Switching strategy or cap requires a different job; a
     /// preexisting full-head attempt cannot be reused under this factory.
@@ -273,6 +314,7 @@ impl Int4DocumentExtractionJobPlanner {
     }
     pub fn job_recipe(&self) -> &Int4DocumentExtractionJobRecipe { &self.recipe }
     pub fn check_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> {
+        self.check_document_encoding()?;
         if limits != self.limits || (self.root_object_reconciliation().is_some()
             && !self.uses_chunk_cohorts() && self.document.mapping.reduction.map_batch_chunks != 1) {
             return Err(BatchCode::InvalidLimits.into());
@@ -284,12 +326,14 @@ impl Int4DocumentExtractionJobPlanner {
             .ok_or_else(|| BatchCode::InvalidLimits.into())
     }
     fn owns(&self, prepared: &PreparedInt4ExtractionDocument) -> Result<(), BatchItemFailure> {
+        self.check_document_encoding().map_err(BatchItemFailure::fatal)?;
         if !Arc::ptr_eq(&self.owner, &prepared.owner) { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
         Ok(())
     }
     fn plan<'s, C: DecodeStepControl>(&self, source: &'s str, control: &mut C)
         -> Result<DocumentPlan<'s>, BatchItemFailure> {
         poll(control)?;
+        self.check_document_encoding().map_err(BatchItemFailure::fatal)?;
         if source.len() > self.limits.max_input_bytes_per_item {
             return Err(BatchItemFailure::fatal(BatchCode::DocumentLimit));
         }
@@ -308,6 +352,7 @@ impl Int4DocumentExtractionJobPlanner {
         }
         if identities.len() != mapped.chunk_count() || mapped.chunk_count() == 0
             || mapped.group_width() != self.group_width() || mapped.selected_rows() != self.selected_rows()
+            || &mapped.document_encoding() != self.document_encoding()
             || expected.execution_version() != self.recipe.execution
             || plan.max_kv_bytes() != self.document_budget().max_kv_bytes
             || plan.max_result_bytes() != self.max_result_bytes() {

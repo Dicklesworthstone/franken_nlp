@@ -108,6 +108,10 @@ impl JobArgs {
             return Err(Failure::usage("explicit_extraction_document_job_storage"));
         }
         let mut map = self.map.validate_document_job(args)?;
+        if self.reconciliation.limits(self.map.mapping)?.is_some()
+            && self.map.encoding.policy()? != crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback {
+            return Err(CandidateError::Arguments.into());
+        }
         // The shared original/partial declaration and exact reducer quote is
         // additional to retained native maps, owned population and output.
         let object = self.reconciliation.workspace_bytes(&self.map, map)?;

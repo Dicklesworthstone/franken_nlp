@@ -76,6 +76,7 @@ fn fixture() -> (TaskBudget, Int4ExtractionMapLimits, JobLimits, JobHostLimits) 
 fn request(ids: &[ExecutionIdentity], document: Int4ExtractionMapLimits, kv: u64)
     -> Int4ExtractionDocumentAdmission<'_> {
     Int4ExtractionDocumentAdmission { identities: ids, model_work: work(2), mask_node_visits: 8000,
+        document_encoding: UntrustedEncoding::ByteFallback,
         mask_limits: document.mapping.mask_limits, kv_reservation_bytes: kv,
         max_result_bytes: 65536, max_output_tokens: 32, chunk_count: 2 }
 }
@@ -84,12 +85,92 @@ fn request(ids: &[ExecutionIdentity], document: Int4ExtractionMapLimits, kv: u64
 fn whole_population_two_schema_owners_and_maximum_frontier_are_admitted_together() {
     let (budget, document, job, host) = fixture();
     let frontier = document_workspace_bytes(budget, document, 4, 65536).unwrap();
-    let need = requirements(WIDTH, budget, document, 65536, job, host, frontier, 8192, JobInputMemory::CompletePopulation).unwrap();
+    let need = requirements(WIDTH, budget, document, 65536, job, host, frontier, 8192,
+        JobInputMemory::CompletePopulation, &UntrustedEncoding::ByteFallback).unwrap();
     assert_eq!(need.input_bytes, host.required_buffer_bytes(job).unwrap() + 2 * 8192);
     assert_eq!(need.document_workspace_bytes, frontier);
     assert_eq!(need.native.kv_bytes, budget.max_kv_bytes);
     assert_eq!(need.native_workspace_bytes, need.native.rope_bytes + need.native.scratch_payload_bound
         + host.native.allocator_reserve_bytes);
+}
+
+#[test]
+fn compact_encoder_is_reserved_once_before_input_independent_of_chunks_cohorts_and_input_mode() {
+    use crate::{batch::extract::grouped_int4::long::cohort::Int4ExtractionMapCohortMemoryLimits,
+        tokenizer::untrusted::SafeBpeLimits};
+    let (budget, document, job, host) = fixture();
+    let compact = SafeBpeLimits { max_input_bytes: 65536, max_output_tokens: 32768,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
+    let encoder_bytes = compact.requirements().unwrap().workspace_bytes;
+    for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
+        for chunks in [1, 4] {
+            let mut document = document; document.mapping.chunks.max_chunks = chunks;
+            let frontier = document_workspace_bytes(budget, document, chunks, 65536).unwrap();
+            let byte = requirements(WIDTH, budget, document, 65536, job, host, frontier, 8192,
+                input, &UntrustedEncoding::ByteFallback).unwrap();
+            let compact = requirements(WIDTH, budget, document, 65536, job, host, frontier, 8192,
+                input, &UntrustedEncoding::SafeBpeV1(compact)).unwrap();
+            assert_eq!(compact.input_bytes - byte.input_bytes, encoder_bytes);
+            assert_eq!(compact.document_workspace_bytes, frontier);
+            assert_eq!(compact.native, byte.native);
+            assert_eq!(compact.native_workspace_bytes, byte.native_workspace_bytes);
+            for rows in [1, chunks] {
+                let quote = Int4ExtractionMapCohortMemoryLimits { max_chunks: rows, context_tokens: 64,
+                    max_output_tokens_per_chunk: 16, max_result_bytes_per_chunk: 4096 }.requirements(WIDTH).unwrap();
+                let mut grouped_byte = byte; let mut grouped_compact = compact;
+                grouped_byte.use_cohorts(quote, host.native.allocator_reserve_bytes).unwrap();
+                grouped_compact.use_cohorts(quote, host.native.allocator_reserve_bytes).unwrap();
+                assert_eq!(grouped_compact.input_bytes - grouped_byte.input_bytes, encoder_bytes);
+                assert_eq!(grouped_compact.document_workspace_bytes, frontier);
+                assert_eq!(grouped_compact.native, grouped_byte.native);
+                assert_eq!(grouped_compact.native_workspace_bytes, grouped_byte.native_workspace_bytes);
+            }
+        }
+    }
+}
+
+#[test]
+fn every_compact_encoder_cap_is_validated_before_population_ownership() {
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+    let (budget, document, job, host) = fixture();
+    for axis in 0..8 {
+        let mut caps = SafeBpeLimits { max_input_bytes: 65536, max_output_tokens: 32768,
+            max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
+        match axis { 0 => caps.max_input_bytes = 0, 1 => caps.max_output_tokens = 0,
+            2 => caps.max_pair_checks = 0, 3 => caps.max_pair_bytes = 0,
+            4 => caps.max_input_bytes = SafeBpeLimits::MAX_INPUT_BYTES + 1,
+            5 => caps.max_output_tokens = SafeBpeLimits::MAX_OUTPUT_TOKENS + 1,
+            6 => caps.max_pair_checks = SafeBpeLimits::MAX_PAIR_CHECKS + 1,
+            _ => caps.max_pair_bytes = SafeBpeLimits::MAX_PAIR_BYTES + 1 }
+        assert!(requirements(WIDTH, budget, document, 65536, job, host, 65536, 8192,
+            JobInputMemory::CompletePopulation, &UntrustedEncoding::SafeBpeV1(caps)).is_err(), "axis {axis}");
+    }
+}
+
+#[test]
+fn native_admission_binds_the_complete_encoding_policy_that_owns_the_workspace() {
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+    let (budget, document, _, _) = fixture(); let ids = [identity(), identity()];
+    let mut claim = request(&ids, document, budget.max_kv_bytes);
+    check_encoding(&UntrustedEncoding::ByteFallback, &claim).unwrap();
+    let compact = SafeBpeLimits { max_input_bytes: 65536, max_output_tokens: 32768,
+        max_pair_checks: 1 << 20, max_pair_bytes: 1 << 24 };
+    let expected = UntrustedEncoding::SafeBpeV1(compact);
+    assert!(check_encoding(&expected, &claim).is_err());
+    claim.document_encoding = expected.clone();
+    check_encoding(&expected, &claim).unwrap();
+    assert!(check_encoding(&UntrustedEncoding::ByteFallback, &claim).is_err());
+    for axis in 0..4 {
+        let mut changed = compact;
+        match axis { 0 => changed.max_input_bytes += 1, 1 => changed.max_output_tokens += 1,
+            2 => changed.max_pair_checks += 1, _ => changed.max_pair_bytes += 1 }
+        claim.document_encoding = UntrustedEncoding::SafeBpeV1(changed);
+        let error = check_encoding(&expected, &claim).unwrap_err();
+        assert!(error.stop); assert_eq!(error.fault.code, BatchCode::Admission, "axis {axis}");
+    }
+    let invalid = UntrustedEncoding::SafeBpeV1(SafeBpeLimits { max_pair_checks: 0, ..compact });
+    claim.document_encoding = invalid.clone();
+    assert!(check_encoding(&invalid, &claim).is_err());
 }
 
 #[test]
@@ -103,8 +184,10 @@ fn complete_object_frontier_includes_schema_and_reducer_ownership_without_native
     let complete = complete_workspace_bytes(budget, document, 65536, compiler, Some(object)).unwrap();
     assert_eq!(complete - ordinary, object.workspace_bytes().unwrap() + RootObjectSchema::workspace_bytes(compiler).unwrap());
     for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
-        let before = requirements(WIDTH, budget, document, 65536, job, host, ordinary, 8192, input).unwrap();
-        let after = requirements(WIDTH, budget, document, 65536, job, host, complete, 8192, input).unwrap();
+        let before = requirements(WIDTH, budget, document, 65536, job, host, ordinary, 8192,
+            input, &UntrustedEncoding::ByteFallback).unwrap();
+        let after = requirements(WIDTH, budget, document, 65536, job, host, complete, 8192,
+            input, &UntrustedEncoding::ByteFallback).unwrap();
         assert_eq!(before.input_bytes, after.input_bytes);
         assert_eq!(before.native, after.native);
         assert_eq!(before.native_workspace_bytes, after.native_workspace_bytes);
@@ -141,10 +224,12 @@ fn exact_resident_context_kv_and_nonzero_schema_are_required_before_input() {
         match axis { 0 => budget.max_kv_bytes -= 1, 1 => budget.max_kv_bytes += 1,
             2 => document.mapping.chunks.context_tokens -= 1, 3 => host.native.context_tokens += 1,
             _ => host.native.allocator_reserve_bytes = 0 }
-        assert!(requirements(WIDTH, budget, document, 65536, job, host, 65536, 128, JobInputMemory::CompletePopulation).is_err(), "axis {axis}");
+        assert!(requirements(WIDTH, budget, document, 65536, job, host, 65536, 128,
+            JobInputMemory::CompletePopulation, &UntrustedEncoding::ByteFallback).is_err(), "axis {axis}");
     }
     let (budget, document, job, host) = fixture();
-    assert!(requirements(WIDTH, budget, document, 65536, job, host, 65536, 0, JobInputMemory::CompletePopulation).is_err());
+    assert!(requirements(WIDTH, budget, document, 65536, job, host, 65536, 0,
+        JobInputMemory::CompletePopulation, &UntrustedEncoding::ByteFallback).is_err());
 }
 
 #[test]
@@ -152,7 +237,8 @@ fn cohort_reservation_keeps_both_schema_owners_and_the_complete_document_frontie
     use crate::batch::extract::grouped_int4::long::cohort::Int4ExtractionMapCohortMemoryLimits;
     let (budget, document, job, host) = fixture();
     let frontier = document_workspace_bytes(budget, document, 4, 65536).unwrap();
-    let serial = requirements(WIDTH, budget, document, 65536, job, host, frontier, 8192, JobInputMemory::CompletePopulation).unwrap();
+    let serial = requirements(WIDTH, budget, document, 65536, job, host, frontier, 8192,
+        JobInputMemory::CompletePopulation, &UntrustedEncoding::ByteFallback).unwrap();
     for chunks in [1, 2, 4] {
         let quote = Int4ExtractionMapCohortMemoryLimits { max_chunks: chunks, context_tokens: 64,
             max_output_tokens_per_chunk: 16, max_result_bytes_per_chunk: 4096 }.requirements(WIDTH).unwrap();
@@ -173,7 +259,8 @@ fn cohort_reservation_keeps_both_schema_owners_and_the_complete_document_frontie
 fn incomplete_native_or_decoder_declarations_refuse_before_job_execution() {
     use crate::batch::extract::grouped_int4::long::cohort::Int4ExtractionMapCohortMemoryLimits;
     let (budget, document, job, host) = fixture();
-    let serial = requirements(WIDTH, budget, document, 65536, job, host, 65536, 8192, JobInputMemory::CompletePopulation).unwrap();
+    let serial = requirements(WIDTH, budget, document, 65536, job, host, 65536, 8192,
+        JobInputMemory::CompletePopulation, &UntrustedEncoding::ByteFallback).unwrap();
     let quote = Int4ExtractionMapCohortMemoryLimits { max_chunks: 4, context_tokens: 64,
         max_output_tokens_per_chunk: 16, max_result_bytes_per_chunk: 4096 }.requirements(WIDTH).unwrap();
     for axis in 0..5 {
@@ -210,7 +297,8 @@ fn every_document_work_axis_and_masks_fit_the_persisted_lifetime_budget() {
             3 => job.max_work.model.projections.dot_products -= 1,
             4 => job.max_work.model.projections.multiply_accumulates -= 1,
             _ => job.max_work.mask_node_visits -= 1 }
-        assert!(requirements(WIDTH, budget, document, 65536, job, host, 65536, 128, JobInputMemory::CompletePopulation).is_err(), "axis {axis}");
+        assert!(requirements(WIDTH, budget, document, 65536, job, host, 65536, 128,
+            JobInputMemory::CompletePopulation, &UntrustedEncoding::ByteFallback).is_err(), "axis {axis}");
     }
 }
 
@@ -276,10 +364,12 @@ fn shared_workspace_quote_prices_all_native_values_and_both_evidence_coordinate_
 #[test]
 fn zero_reserves_overflow_and_small_stored_result_caps_refuse_before_execution() {
     let (budget, document, job, host) = fixture();
-    assert!(requirements(WIDTH, budget, document, 65536, job, host, 0, 128, JobInputMemory::CompletePopulation).is_err());
-    assert!(requirements(WIDTH, budget, document, 65536, job, host, 65536, usize::MAX, JobInputMemory::CompletePopulation).is_err());
+    assert!(requirements(WIDTH, budget, document, 65536, job, host, 0, 128,
+        JobInputMemory::CompletePopulation, &UntrustedEncoding::ByteFallback).is_err());
+    assert!(requirements(WIDTH, budget, document, 65536, job, host, 65536, usize::MAX,
+        JobInputMemory::CompletePopulation, &UntrustedEncoding::ByteFallback).is_err());
     assert!(requirements(WIDTH, budget, document, job.max_result_bytes as u64 + 1,
-        job, host, 65536, 128, JobInputMemory::CompletePopulation).is_err());
+        job, host, 65536, 128, JobInputMemory::CompletePopulation, &UntrustedEncoding::ByteFallback).is_err());
     for chunks in [0, 5, 257, usize::MAX] {
         assert!(document_workspace_bytes(budget, document, chunks, 65536).is_err());
     }
@@ -287,7 +377,8 @@ fn zero_reserves_overflow_and_small_stored_result_caps_refuse_before_execution()
         let mut host = host;
         match axis { 0 => host.preparation_reserve_bytes = 0, 1 => host.io_reserve_bytes = 0,
             2 => host.journal_reserve_bytes = 0, _ => host.serialization_reserve_bytes = 0 }
-        assert!(requirements(WIDTH, budget, document, 65536, job, host, 65536, 128, JobInputMemory::CompletePopulation).is_err(), "axis {axis}");
+        assert!(requirements(WIDTH, budget, document, 65536, job, host, 65536, 128,
+            JobInputMemory::CompletePopulation, &UntrustedEncoding::ByteFallback).is_err(), "axis {axis}");
     }
 }
 

@@ -6,6 +6,8 @@ use super::*;
 /// native output staging and reduction storage for the complete operation.
 pub struct Int4ExtractionDocumentAdmission<'a> {
     pub identities: &'a [ExecutionIdentity],
+    /// The complete authenticated input policy, including every compact cap.
+    pub document_encoding: UntrustedEncoding,
     pub model_work: Int4Work,
     pub mask_node_visits: u64,
     pub mask_limits: MaskWorkLimits,
@@ -87,6 +89,7 @@ impl<A: Int4ExtractionDocumentBatchAdmission> BatchProcessor for Int4DocumentExt
         self.backend.preflight(self.planner, &plan, &prepared.identities, control)?;
         let (admitted, guard) = self.admission.admit(Int4ExtractionDocumentAdmission {
             identities: &prepared.identities, model_work: prepared.work.int4_model_work(),
+            document_encoding: prepared.expected.mapped().document_encoding(),
             mask_node_visits: prepared.work.mask_node_visits,
             mask_limits: self.planner.document.mapping.mask_limits, kv_reservation_bytes: kv,
             max_result_bytes: self.planner.max_result_bytes(),

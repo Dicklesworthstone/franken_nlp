@@ -23,6 +23,7 @@ pub(super) struct MapArgs {
     pub(super) mapping: MappingArgs,
     cohort_chunks: Option<usize>,
     array_union: ArrayUnionArgs,
+    pub(super) encoding: input_encoding::DocumentInputEncodingArgs,
 }
 #[derive(Args, Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct MappingArgs {
@@ -68,9 +69,9 @@ pub(super) struct MappingArgs {
     max_extraction_scan_steps: u64,
 }
 pub(super) fn definition() -> clap::Command {
-    definition_with_cohorts(true)
+    input_encoding::document_definition(definition_with_cohorts(true))
         .arg(extract::selected_rows_argument())
-        .after_long_help(format!("{}\n\nSelected-row projection: --max-selected-rows N fixes the same complete-legal-row ceiling for EVERY chunk, including native chunk cohorts. Full-vocabulary projection remains the default. Every legal token is evaluated; a set larger than N refuses the complete document without pruning or fallback. The exact strategy and ceiling bind every chunk identity before native admission. Whole-document work is priced from the selected ceiling; grammar masks, source evidence, task limits and physical memory reservations are unchanged. Per-chunk results name their execution strategy and the document includes max_selected_rows. Actual-model parity and performance remain separately unqualified. Document corpora apply the same fixed strategy across the entire stream; retained document jobs authenticate the exact strategy and row cap and require them again on resume.", array_union::HELP))
+        .after_long_help(format!("{}\n\n{}\n\nSelected-row projection: --max-selected-rows N fixes the same complete-legal-row ceiling for EVERY chunk, including native chunk cohorts. Full-vocabulary projection remains the default. Every legal token is evaluated; a set larger than N refuses the complete document without pruning or fallback. The exact strategy and ceiling bind every chunk identity before native admission. Whole-document work is priced from the selected ceiling; grammar masks, source evidence, task limits and physical memory reservations are unchanged. Per-chunk results name their execution strategy and the document includes max_selected_rows. Actual-model parity and performance remain separately unqualified. Document corpora apply the same fixed strategy across the entire stream; retained document jobs authenticate the exact strategy and row cap and require them again on resume.", array_union::HELP, input_encoding::DOCUMENT_ENCODING_HELP))
 }
 pub(super) fn document_job_definition() -> clap::Command {
     definition()
@@ -108,6 +109,7 @@ impl MapArgs {
         Ok(Self { extraction: extract::ExtractionArgs::from_matches_with_projection(matches)?,
             mapping: MappingArgs::from_arg_matches(matches)?,
             array_union: ArrayUnionArgs::from_arg_matches(matches)?,
+            encoding: input_encoding::DocumentInputEncodingArgs::from_matches(matches)?,
             cohort_chunks: matches.try_get_one::<usize>("cohort_chunks").ok().flatten().copied() })
     }
     pub(super) fn validate_document_job(&self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
@@ -123,6 +125,7 @@ impl MapArgs {
     }
     fn validate_mode(&self, args: &Int4Args, document_job: bool, admit_memory: bool) -> Result<MapLimits, CandidateError> {
         let m = self.mapping;
+        let encoding_bytes = self.encoding.workspace_bytes()?;
         let mut common = self.extraction.validate_with_projection(args)?;
         if args.max_input_bytes < 4 || !(1..=256).contains(&m.max_chunks)
             || self.cohort_chunks.is_some_and(|n| !(1..=64).contains(&n) || n > m.max_chunks)
@@ -179,6 +182,10 @@ impl MapArgs {
         } else {
             common.minimum_memory_bytes = sum(&[common.minimum_memory_bytes, input, workspace_bytes, output])?;
         }
+        // Exactly one transient encoder coexists with the complete retained
+        // plan set. Preliminary CLI preparation and owned execution are
+        // separate phases; each retains its own charge while it can encode.
+        common.minimum_memory_bytes = sum(&[common.minimum_memory_bytes, encoding_bytes])?;
         if admit_memory && common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
         Ok(MapLimits { common, mapping, reduction_reserve_bytes, max_result_bytes: m.max_map_result_bytes,
             workspace_bytes, cohort_chunks: self.cohort_chunks, cohort })
@@ -211,6 +218,12 @@ impl MapArgs {
         let request = self.extraction.shared_defaults_with_projection(schema, budget)?;
         self.array_union.check_schema(&request.schema, self.extraction.compiler(), self.mapping)?;
         Ok(request)
+    }
+    #[cfg(any(feature = "asupersync-runtime", test))]
+    fn configure_planner(&self, planner: crate::batch::extract::grouped_int4::Int4ExtractionBatchPlanner)
+        -> Result<crate::batch::extract::grouped_int4::Int4ExtractionBatchPlanner, CandidateError> {
+        let planner = self.extraction.configure_planner(planner)?;
+        planner.with_document_encoding(self.encoding.policy()?).map_err(|_| CandidateError::Planning)
     }
     pub(super) fn execute(self, args: Int4Args, input: &mut impl Read, output: &mut impl Write)
         -> Result<(), CandidateError> {

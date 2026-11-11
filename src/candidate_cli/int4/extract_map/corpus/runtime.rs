@@ -91,6 +91,9 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         planner.with_root_object_reconciliation(object)
             .map_err(|fault| fault.cancellation.map(stopped).unwrap_or(CandidateError::Planning))?
     } else { planner };
+    let encoding = command.document.encoding.policy()?;
+    let planner = planner.with_document_encoding(encoding.clone())
+        .map_err(|fault| fault.cancellation.map(stopped).unwrap_or(CandidateError::Planning))?;
     let planner = match command.document.extraction.selected_rows()? {
         Some(rows) => planner.with_selected_rows(rows)
             .map_err(|fault| fault.cancellation.map(stopped).unwrap_or(CandidateError::Planning))?,
@@ -108,9 +111,9 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let vocabulary = ExtractionVocabulary::pinned(controls.template_controls())
         .map(Arc::new).map_err(|_| CandidateError::Planning)?;
     let mut host = host_limits(&args, limits, remaining()?);
-    let quote = crate::hosted::int4_extraction_document_object_corpus_requirements(args.group_width, budget,
+    let quote = crate::hosted::int4_extraction_document_object_corpus_requirements_with_encoding(args.group_width, budget,
         limits.document.mapping, host, limits.document.reduction_reserve_bytes, limits.document.cohort_chunks,
-        command.document.extraction.compiler(), limits.root_object)
+        command.document.extraction.compiler(), limits.root_object, &encoding)
         .map_err(|error| host_error(error, CandidateError::Planning))?;
     if quote != limits.memory { return Err(CandidateError::Identity); }
     remaining()?;
@@ -136,6 +139,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         max_selected_rows: planner.selected_rows().map(|rows| rows.max_rows_per_step),
         root_array_union: limits.document.mapping.root_array_union.map(array_union::ArrayUnionSelection::new),
         root_object_reconciliation: limits.root_object.map(RootObjectSelection::new),
+        input_encoding: input_encoding::reported_policy(&encoding),
         model_id: "Nanbeige4.2-3B", source_revision: &identity.source_revision,
         source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
@@ -193,6 +197,8 @@ struct Provenance<'a> {
     root_array_union: Option<array_union::ArrayUnionSelection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     root_object_reconciliation: Option<RootObjectSelection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<&'a crate::tokenizer::untrusted::UntrustedEncoding>,
     model_id: &'static str, source_revision: &'a str, source_root_sha256: &'a str, model_content_sha256: &'a str,
     candidate_format: &'a str, quant_recipe: &'a str, group_width: usize, integer_kernel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]

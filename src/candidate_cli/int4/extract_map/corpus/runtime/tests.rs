@@ -35,6 +35,41 @@ fn pure_host_quote_matches_cli_for_every_admitted_native_document_schedule() {
 }
 
 #[test]
+fn compact_host_and_cli_quotes_charge_one_encoder_workspace_for_every_schedule() {
+    for width in [32, 128] {
+        for chunks in [None, Some(1), Some(3), Some(64)] {
+            let (mut plain, mut args) = arguments(&["--max-result-bytes", "65536"]);
+            let (mut compact, _) = arguments(&["--max-result-bytes", "65536", "--input-encoding", "safe-bpe-v1",
+                "--max-tokenizer-input-bytes", "262144", "--max-tokenizer-output-tokens", "131072",
+                "--max-tokenizer-pair-checks", "8192", "--max-tokenizer-pair-bytes", "65536"]);
+            args.group_width = width; args.max_load_mib = 65_536;
+            plain.document.cohort_chunks = chunks; compact.document.cohort_chunks = chunks;
+            let before = plain.validate(&args).unwrap();
+            let after = compact.validate(&args).unwrap();
+            let encoding = compact.document.encoding.policy().unwrap();
+            let crate::tokenizer::untrusted::UntrustedEncoding::SafeBpeV1(policy) = &encoding
+                else { panic!("compact policy required"); };
+            let budget = compact.document.extraction.budget(&args, after.common);
+            let quote = crate::hosted::int4_extraction_document_object_corpus_requirements_with_encoding(width,
+                budget, after.document.mapping, host_limits(&args, after, Duration::from_secs(7)),
+                after.document.reduction_reserve_bytes, chunks, compact.document.extraction.compiler(),
+                after.root_object, &encoding).unwrap();
+            assert_eq!(quote, after.memory);
+            assert_eq!(quote.input_bytes - before.memory.input_bytes, policy.requirements().unwrap().workspace_bytes);
+            assert_eq!(quote.document_workspace_bytes, before.memory.document_workspace_bytes);
+            assert_eq!(quote.document_workspace_bytes, after.document.workspace_bytes
+                + after.document.cohort.map_or(0, |cohort| cohort.workspace_bytes));
+            assert_eq!(quote.native, before.memory.native);
+            assert_eq!(quote.workspace_bytes, before.memory.workspace_bytes);
+            assert_eq!(quote.output_reservation_bytes, before.memory.output_reservation_bytes);
+            assert_eq!(quote.native.kv_bytes, budget.max_kv_bytes * chunks.unwrap_or(1) as u64);
+            assert_eq!(after.cli_preparation_bytes, before.cli_preparation_bytes);
+            assert_eq!(after.common.preparation_bytes, before.common.preparation_bytes);
+        }
+    }
+}
+
+#[test]
 fn root_object_host_and_cli_quotes_include_the_same_complete_reconciliation_ownership() {
     for width in [32, 128] {
         for chunks in [None, Some(1), Some(3), Some(64)] {
@@ -106,7 +141,7 @@ fn corpus_frame_keeps_exact_chunk_json_and_reveals_only_public_outer_metadata() 
             protocol: "fnlp-candidate-int4-extract-corpus-v1", schema_version: 1,
             scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "extract",
             source_mode: "complete_document", chunk_schedule: chunk_schedule(cohort_chunks), cohort_chunks,
-            root_array_union: None, root_object_reconciliation: None, max_selected_rows: None,
+            root_array_union: None, root_object_reconciliation: None, max_selected_rows: None, input_encoding: None,
             model_id: "Nanbeige4.2-3B", source_revision: "public-revision", source_root_sha256: "public-source",
             model_content_sha256: "public-model", candidate_format: "candidate-int4", quant_recipe: "recipe",
             group_width: 128, integer_kernel: "s_scalar_i32",
@@ -170,5 +205,82 @@ fn corpus_frame_keeps_exact_chunk_json_and_reveals_only_public_outer_metadata() 
         assert_eq!(object_value["root_object_reconciliation"]["limits"], serde_json::to_value(root).unwrap());
         assert!(std::str::from_utf8(&object_output).unwrap()
             .ends_with(&format!("\"record\":{}}}\n", inner.trim_end_matches('\n'))));
+    }
+}
+
+#[test]
+fn compact_provenance_preserves_inner_bytes_and_every_empty_stream_frame_including_completion() {
+    use crate::{batch::{BatchDocument, BatchItemFailure, BatchLimits, BatchProcessor, BatchWork},
+        tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding}};
+    struct Empty;
+    impl BatchProcessor for Empty {
+        type Args = serde_json::Value;
+        type Prepared = ();
+        type Output = ();
+        fn prepare(&mut self, _: BatchDocument<Self::Args>) -> Result<(), BatchItemFailure> {
+            panic!("empty population must not prepare a document");
+        }
+        fn planned_work(&self, _: &()) -> BatchWork { panic!("empty population has no model work"); }
+        fn execute<C: DecodeStepControl>(&mut self, _: (), _: &mut C) -> Result<(), BatchItemFailure> {
+            panic!("empty population must not execute native inference");
+        }
+    }
+    struct Continue;
+    impl DecodeStepControl for Continue {
+        fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> { None }
+    }
+    let transport = BatchLimits { max_output_line_bytes: 4096, ..BatchLimits::default() };
+    let mut inner = Vec::new();
+    let summary = crate::batch::run_ndjson(&mut io::Cursor::new(b""), &mut inner,
+        &mut Empty, transport, &mut Continue).unwrap();
+    assert_eq!(summary.requests, 0); assert_eq!(summary.succeeded, 0); assert_eq!(summary.failed, 0);
+    let inner_lines = inner.split_inclusive(|byte| *byte == b'\n').collect::<Vec<_>>();
+    let footer: serde_json::Value = serde_json::from_slice(inner_lines.last().unwrap()).unwrap();
+    assert_eq!(footer["event"], "run_complete");
+    assert_eq!(footer["summary"]["requests"], 0);
+    let limits = SafeBpeLimits { max_input_bytes: 262_144, max_output_tokens: 131_072,
+        max_pair_checks: 8192, max_pair_bytes: 65_536 };
+    for encoding in [UntrustedEncoding::ByteFallback, UntrustedEncoding::SafeBpeV1(limits)] {
+        let provenance = Provenance {
+            protocol: "fnlp-candidate-int4-extract-corpus-v1", schema_version: 1,
+            scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "extract",
+            source_mode: "complete_document", chunk_schedule: "serial", cohort_chunks: None,
+            root_array_union: None, root_object_reconciliation: None, max_selected_rows: None,
+            input_encoding: input_encoding::reported_policy(&encoding),
+            model_id: "Nanbeige4.2-3B", source_revision: "public-revision", source_root_sha256: "public-source",
+            model_content_sha256: "public-model", candidate_format: "candidate-int4", quant_recipe: "recipe",
+            group_width: 128, integer_kernel: "s_scalar_i32", snapshot: None,
+        };
+        let mut output = Vec::new();
+        {
+            let mut writer = CandidateWriter::new(&mut output, &provenance, 4096, 16_384).unwrap();
+            assert_eq!(crate::batch::run_ndjson(&mut io::Cursor::new(b""), &mut writer,
+                &mut Empty, transport, &mut Continue).unwrap(), summary);
+        }
+        let frames = output.split_inclusive(|byte| *byte == b'\n').collect::<Vec<_>>();
+        assert_eq!(frames.len(), inner_lines.len());
+        for (frame, original) in frames.iter().zip(&inner_lines) {
+            let value: serde_json::Value = serde_json::from_slice(frame).unwrap();
+            let original_text = std::str::from_utf8(original).unwrap().trim_end_matches('\n');
+            assert!(std::str::from_utf8(frame).unwrap().ends_with(&format!("\"record\":{original_text}}}\n")));
+            if encoding == UntrustedEncoding::ByteFallback {
+                assert!(value.get("input_encoding").is_none());
+            } else {
+                assert_eq!(value["input_encoding"], serde_json::to_value(&encoding).unwrap());
+                assert_eq!(value["input_encoding"]["kind"], "safe_bpe_v1");
+                assert_eq!(value["input_encoding"]["limits"], serde_json::to_value(limits).unwrap());
+            }
+        }
+        // Raw precision and whitespace remain untouched under the same policy
+        // envelope; this transport fixture is not an injected native result.
+        let exact = b"{\"event\":\"fixture\",\"result\": {\"n\":12345678901234567890123456789012345678}}\n";
+        let mut framed = Vec::new();
+        {
+            let mut writer = CandidateWriter::new(&mut framed, &provenance, 4096, 8192).unwrap();
+            writer.write_all(exact).unwrap(); writer.flush().unwrap();
+        }
+        let mut suffix = b"\"record\":".to_vec();
+        suffix.extend_from_slice(&exact[..exact.len() - 1]); suffix.extend_from_slice(b"}\n");
+        assert!(framed.ends_with(&suffix));
     }
 }

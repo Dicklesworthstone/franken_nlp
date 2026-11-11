@@ -117,6 +117,10 @@ impl CorpusArgs {
         let document = self.document.validate_corpus(args)?;
         let mut common = document.common;
         let root_object = self.reconciliation.limits(self.document.mapping)?;
+        let encoding = self.document.encoding.policy()?;
+        if root_object.is_some() && encoding != crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback {
+            return Err(CandidateError::Arguments);
+        }
         let object_preparation_bytes = self.reconciliation.workspace_bytes(&self.document, document)?;
         let s = self.stream;
         let verification = s.verification();
@@ -156,8 +160,8 @@ impl CorpusArgs {
             allocator_reserve_bytes: ALLOCATOR_BYTES, preparation_reserve_bytes: common.preparation_bytes,
             io_reserve_bytes: io_bytes, reduction_reserve_bytes: document.reduction_reserve_bytes,
             cohort_chunks: document.cohort_chunks }
-            .requirements_with_root_object(args.group_width, budget, document.mapping, transport,
-                self.document.extraction.compiler(), root_object)
+            .requirements_with_root_object_and_encoding(args.group_width, budget, document.mapping, transport,
+                self.document.extraction.compiler(), root_object, &encoding)
             .map_err(|_| CandidateError::Arguments)?;
         let execution = sum(&[memory.native.kv_bytes, memory.workspace_bytes, memory.input_bytes,
             memory.document_workspace_bytes, memory.output_reservation_bytes])?;

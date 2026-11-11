@@ -66,6 +66,8 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
             job.map.extraction.compiler(), job.map.extraction.source_limits(), extraction,
             map.mapping, lifetime, job.lifetime.verification()),
     }.map_err(|_| CandidateError::Planning)?;
+    let encoding = job.map.encoding.policy()?;
+    let planner = planner.with_document_encoding(encoding.clone()).map_err(|_| CandidateError::Planning)?;
     let planner = match job.map.extraction.selected_rows()? {
         Some(rows) => planner.with_selected_rows(rows).map_err(|_| CandidateError::Planning)?,
         None => planner,
@@ -125,6 +127,7 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args, j
         max_selected_rows,
         root_array_union: map.mapping.root_array_union.map(ArrayUnionSelection::new),
         root_object_reconciliation: root_object.map(RootObjectSelection::new),
+        input_encoding: input_encoding::reported_policy(&encoding),
     };
     // A failed metadata write can follow durable commits. No original text,
     // schema, extracted values, coordinates, private paths or key is emitted.
@@ -196,6 +199,8 @@ struct Response<'a, T: Serialize> {
     root_array_union: Option<ArrayUnionSelection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     root_object_reconciliation: Option<RootObjectSelection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<&'a crate::tokenizer::untrusted::UntrustedEncoding>,
     output: &'a T,
 }
 

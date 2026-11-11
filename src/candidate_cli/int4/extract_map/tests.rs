@@ -22,6 +22,54 @@ impl Read for NoRead {
 }
 
 #[test]
+fn compact_document_encoding_is_explicit_and_admits_transient_workspace_before_input() {
+    use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
+    for schedule in [&[][..], &["--cohort-chunks", "3", "--max-selected-rows", "32"][..],
+        &["--source-membership", "--root-array-union"][..]] {
+        let (plain, mut args) = arguments(schedule);
+        args.memory_mib = 262_144;
+        let mut flags = schedule.to_vec(); flags.extend(["--input-encoding", "safe-bpe-v1"]);
+        let (compact, _) = arguments(&flags);
+        let plain_limits = plain.validate(&args).unwrap();
+        let compact_limits = compact.validate(&args).unwrap();
+        assert_eq!(plain.encoding.policy().unwrap(), UntrustedEncoding::ByteFallback);
+        let UntrustedEncoding::SafeBpeV1(policy) = compact.encoding.policy().unwrap() else { panic!("wrong encoding"); };
+        assert_eq!(policy.max_input_bytes, SafeBpeLimits::MAX_INPUT_BYTES);
+        assert_eq!(policy.max_output_tokens, SafeBpeLimits::MAX_OUTPUT_TOKENS);
+        assert!(compact.encoding.workspace_bytes().unwrap() > 256 * MIB);
+        assert_eq!(compact_limits.common.minimum_memory_bytes - plain_limits.common.minimum_memory_bytes,
+            compact.encoding.workspace_bytes().unwrap());
+        assert_eq!(compact_limits.common.native, plain_limits.common.native);
+        assert_eq!(compact_limits.cohort, plain_limits.cohort);
+        assert_eq!(compact_limits.mapping.mapping.max_model_work, plain_limits.mapping.mapping.max_model_work);
+        assert_eq!(compact_limits.mapping.mapping.max_mask_visits, plain_limits.mapping.mapping.max_mask_visits);
+        assert_eq!(compact_limits.mapping.verification, plain_limits.mapping.verification);
+        assert_eq!(compact_limits.mapping.root_array_union, plain_limits.mapping.root_array_union);
+        assert_eq!(compact.extraction.budget(&args, compact_limits.common),
+            plain.extraction.budget(&args, plain_limits.common));
+        assert!(args.input_encoding.is_default(), "document policy must not masquerade as one-shot request encoding");
+    }
+    let (compact, mut args) = arguments(&["--input-encoding", "safe-bpe-v1"]);
+    args.memory_mib = 262_144;
+    let (plain, _) = arguments(&[]);
+    args.memory_mib = plain.validate(&args).unwrap().common.minimum_memory_bytes.div_ceil(MIB);
+    assert!(plain.validate(&args).is_ok());
+    assert_eq!(compact.execute(args, &mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+}
+
+#[test]
+fn complete_document_encoding_caps_refuse_before_private_input_or_model_access() {
+    for flag in ["--max-tokenizer-input-bytes", "--max-tokenizer-output-tokens",
+        "--max-tokenizer-pair-checks", "--max-tokenizer-pair-bytes"] {
+        for value in ["0", "18446744073709551615"] {
+            let mut command = command(&["--input-encoding", "safe-bpe-v1", flag, value]);
+            command.args.memory_mib = 262_144;
+            assert_eq!(command.execute(&mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+        }
+    }
+}
+
+#[test]
 fn selected_projection_is_explicit_and_preserves_complete_document_memory_and_safety_limits() {
     for flags in [&[][..], &["--cohort-chunks", "4"][..],
         &["--source-membership", "--root-array-union", "--cohort-chunks", "3"][..]] {
