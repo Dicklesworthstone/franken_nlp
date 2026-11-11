@@ -157,8 +157,16 @@ continue to select byte fallback. Direct planner callers select
 Compact `--save-snapshot` is refused because the current pre-save flow would
 plan again during hosted inference and renew tokenizer work. Use an already
 pinned snapshot or pinned source inference without saving on this route.
-`classify-corpus` and `classify-document-job` retain their byte-only contracts;
-compact encoding and its extra work flags are not accepted there.
+`classify-corpus` and `classify-document-job start|resume` also accept this
+explicit policy. Each original document attempt shares one tokenizer ledger
+across initial preparation and reconstruction for execution, including all
+label-capacity work, rejected size probes and final chunk plans. The per-pass
+map receipt retains its original meaning; the private attempt ledger also
+charges the earlier preparation. Corpus flushes cannot renew native work,
+and durable retries retain their existing lifetime debits. The job recipe
+authenticates the encoding kind and all four ceilings, so resume must repeat
+them exactly. One encoder workspace is admitted beside the retained plans;
+chunk cohorts do not multiply it. Compact snapshot saving remains refused.
 
 ## Persistent CPU teams
 

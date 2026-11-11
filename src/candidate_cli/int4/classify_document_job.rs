@@ -31,7 +31,7 @@ struct ClassificationArgs {
 
 pub(super) fn definition() -> clap::Command {
     let operation = |name: &'static str, about: &'static str| {
-        let command = ClassificationArgs::augment_args(StorageArgs::augment_args(classify_map::definition()
+        let command = ClassificationArgs::augment_args(StorageArgs::augment_args(classify_map::population_definition(classify_map::definition())
             .name(name).about(about)
             .long_about("Retain and resume classification of COMPLETE original documents with fixed --defaults {labels,mode?,policy?}. By default, supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation; explicit retained-input replay is available. text is never a pre-split chunk and task_args may only be absent, null or an empty object. Each document is losslessly partitioned and every native chunk must finish before that original document commits. Retained results preserve full-vocabulary chunk scores, original byte/scalar coordinates and the explicitly named scalar-weighted exclusive or independent multi-label aggregate. --cohort-chunks shares native layers within a document; repeat the exact declared schedule and width on resume. Requires --store-results, protected existing --job-dir and --key-file, exact --job-id, immutable --limits and unchanged private label settings. All five per-document work flags cover every chunk; JobLimits.max_work is the sole lifetime allowance, including failed attempts, and mask_node_visits must be zero. Neither new chunks, attempts nor resume renew that work. Complete input, planning, native, retained-result and durable-job memory are admitted before reading the population. Stdout is metadata only; --materialize publishes private retained results after every document commits. No partial-document success, automatic retry, calibrated confidence or full-context equivalence. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
             .after_help(job_cli::INPUT_RETENTION_HELP)
@@ -139,7 +139,9 @@ impl JobCommand {
         };
         let args = JobArgs { map: MapArgs::from_matches(matches)?, storage: StorageArgs::from_arg_matches(matches)?,
             classification: ClassificationArgs::from_arg_matches(matches)? };
-        Ok((Self { mode, args }, Int4Args::from_arg_matches(matches)?))
+        let mut common = Int4Args::from_arg_matches(matches)?;
+        common.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+        Ok((Self { mode, args }, common))
     }
     pub(super) fn run_owned<R: Read + Send + 'static>(self, args: Int4Args, input: R,
         output: &mut impl Write, diagnostics: &mut impl Write) -> ExitCode {

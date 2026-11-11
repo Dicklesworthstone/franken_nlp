@@ -145,12 +145,47 @@ fn explicit_storage_and_valid_geometry_precede_all_private_io() {
 }
 
 #[test]
-fn durable_document_jobs_refuse_programmatic_compact_encoding_before_private_io() {
-    let matches = input_encoding::definition(clap::Command::new("encoding"))
-        .try_get_matches_from(["encoding", "--input-encoding", "safe-bpe-v1"]).unwrap();
+fn compact_document_jobs_keep_one_encoder_reservation_and_unchanged_native_lifetime_work() {
     for operation in ["start", "resume"] {
-        let (command, mut args) = command(operation, &[]);
-        args.input_encoding = input_encoding::InputEncodingArgs::from_matches(&matches).unwrap();
+        for schedule in [vec![], vec!["--cohort-chunks", "2"]] {
+            let (byte_command, byte_args) = command(operation, &schedule);
+            let byte = byte_command.args.validate(&byte_args).unwrap();
+            let mut flags = schedule;
+            flags.extend(["--input-encoding", "safe-bpe-v1",
+                "--max-tokenizer-input-bytes", "262144", "--max-tokenizer-output-tokens", "131072"]);
+            let (compact_command, args) = command(operation, &flags);
+            let compact = compact_command.args.validate(&args).unwrap();
+            let crate::tokenizer::untrusted::UntrustedEncoding::SafeBpeV1(policy) =
+                compact_command.args.map.input_encoding(&args).unwrap() else { panic!("compact job required"); };
+            assert_eq!(compact.memory.input_bytes,
+                byte.memory.input_bytes + policy.requirements().unwrap().workspace_bytes);
+            assert_eq!(compact.memory.native, byte.memory.native);
+            assert_eq!(compact.mapping.max_model_work, byte.mapping.max_model_work);
+            let fixed = lifetime(&args, compact);
+            let admitted = compact_command.args.lifetime_limits(&args, compact, fixed).unwrap();
+            assert_eq!(admitted.map.mapping.max_model_work, fixed.max_work.int4_model_work());
+            assert_eq!(admitted.map.common.minimum_memory_bytes,
+                compact.common.minimum_memory_bytes + admitted.buffer_bytes);
+        }
+    }
+}
+
+#[test]
+fn invalid_or_unfunded_compact_jobs_refuse_before_keys_storage_or_population_io() {
+    for operation in ["start", "resume"] {
+        for flags in [
+            &["--max-tokenizer-output-tokens", "32"][..],
+            &["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "0"][..],
+            &["--input-encoding", "safe-bpe-v1", "--max-tokenizer-output-tokens", "1048577"][..],
+            &["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "0"][..],
+            &["--input-encoding", "safe-bpe-v1", "--save-snapshot", "never-created.snapshot"][..],
+        ] {
+            let (command, args) = command(operation, flags);
+            assert_eq!(command.execute_owned(args, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+        }
+        let (command, mut args) = command(operation, &["--input-encoding", "safe-bpe-v1"]);
+        let minimum = command.args.validate(&args).unwrap().common.minimum_memory_bytes;
+        args.memory_mib = minimum.div_ceil(MIB) - 1;
         assert_eq!(command.execute_owned(args, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
     }
 }

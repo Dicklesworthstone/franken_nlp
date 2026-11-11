@@ -62,9 +62,15 @@ impl NlpEngine {
         let cohort = planner.cohort_chunks().map(|chunks|
             planner.cohort_requirements().map(|quote| (chunks, quote)))
             .transpose().map_err(HostedError::BatchSetup)?;
-        let required = requirements(planner.group_width(), planner.document_budget(),
+        let mut required = requirements(planner.group_width(), planner.document_budget(),
             planner.planning_limits(), planner.document_limits(), planner.request(),
             request.limits, limits, cohort, request.mode.input_memory())?;
+        let base_input_bytes = required.memory.input_bytes;
+        required.memory = required.memory.with_input_encoding(planner.document_encoding()).map_err(map_error)?;
+        required.input_bytes = sum(&[required.input_bytes, required.memory.input_bytes.checked_sub(base_input_bytes)
+            .ok_or(HostedError::Limits("classification document encoding memory arithmetic"))?])?;
+        sum(&[required.input_bytes, required.memory.native.kv_bytes, required.memory.workspace_bytes,
+            required.memory.output_reservation_bytes])?;
         if planner.max_result_bytes() != required.memory.max_output_bytes {
             return Err(HostedError::Limits("INT4 classification document result envelope").into());
         }

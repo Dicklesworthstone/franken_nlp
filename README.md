@@ -1397,7 +1397,8 @@ cooperative cancellation checks and requires no second source-sized buffer.
 The default remains byte fallback with its existing output shape. Compact
 maps support pinned source inference and digest-pinned snapshot reload;
 `--save-snapshot` is refused before IO because its separate planning pass would
-renew tokenizer work. Corpus and durable document jobs remain byte-only. See
+renew tokenizer work. Corpus and durable document jobs accept the same explicit
+compact policy, with the per-document attempt accounting described below. See
 the [complete-document classification guide](docs/native-classification-map-int4.md)
 for limits, hosted APIs and examples. Regression sources cover cumulative
 budgets, cancellation, source coverage, result verification, memory admission
@@ -1416,6 +1417,22 @@ scores and a separate scalar-weighted aggregate. Exclusive classification and
 independent multi-label classification preserve their existing finalizers and
 coverage/abstention policy. The aggregate remains uncalibrated and does not
 claim equivalence to scoring the source in one larger context.
+
+Both `classify-corpus` and `classify-document-job start|resume` accept
+`--input-encoding safe-bpe-v1` and the four tokenizer ceilings used by
+`classify-map`. Source text and label metadata retain exact bytes and exclude
+template-control tokens. Each complete-document attempt carries one bounded
+tokenizer ledger through initial preparation and reconstruction for execution;
+chunk probes, label heads and reconstruction cannot replenish it. A document
+that exceeds any tokenizer allowance fails before its native forward. The
+reported map work remains the exact execution-plan work, while private attempt
+accounting includes both preparations. Native corpus and durable lifetime work
+remain separately cumulative. One encoder workspace is added to admission,
+independent of chunk count or cohort width. Compact snapshot saving is refused;
+pinned source input and independently pinned snapshot reload are supported.
+Durable jobs authenticate the encoding kind and every ceiling, including on
+retained-input replay; repeat the policy unchanged on resume. Byte fallback
+remains the default and preserves existing byte-mode job recipes and output.
 
 Use the same private `labels.json` and NDJSON envelope shown above:
 

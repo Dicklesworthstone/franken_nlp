@@ -75,7 +75,7 @@ impl<A: Int4ClassificationDocumentBatchAdmission> BatchProcessor for Int4Classif
         self.ledger.failed = true;
         Err(BatchItemFailure::fatal(BatchCode::InvalidExecution))
     }
-    fn execute_with_context<C: DecodeStepControl>(&mut self, prepared: Self::Prepared,
+    fn execute_with_context<C: DecodeStepControl>(&mut self, mut prepared: Self::Prepared,
         context: BatchRequestContext, control: &mut C) -> Result<Self::Output, BatchItemFailure> {
         // JobRunner persisted the exact whole-document debit already. Poison
         // before any callback so failure/unwinding can never silently retry.
@@ -83,7 +83,7 @@ impl<A: Int4ClassificationDocumentBatchAdmission> BatchProcessor for Int4Classif
         self.planner.owns(&prepared)?;
         poll(control)?;
         let kv = self.backend.check_capacity(self.planner)?;
-        let plan = self.planner.plan(&prepared.request, control)?;
+        let plan = self.planner.plan_with_encoding_work(&prepared.request, control, &mut prepared.encoding_work)?;
         self.planner.compare(&plan, &prepared, control)?;
         self.backend.preflight(self.planner, &plan, &prepared.identities, control)?;
         let (admitted, guard) = self.admission.admit(Int4ClassificationDocumentAdmission {

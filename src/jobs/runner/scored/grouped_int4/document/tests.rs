@@ -220,6 +220,7 @@ fn record_arguments_cannot_override_frozen_task_or_mapping_policy() {
     }
     for override_value in [r#"{"labels":[]}"#, r#"{"mode":"multi_label"}"#,
         r#"{"budget":{}}"#, r#"{"max_chunks":1}"#, r#"{"cohort_chunks":1}"#,
+        r#"{"input_encoding":"safe-bpe-v1"}"#, r#"{"max_tokenizer_input_bytes":1}"#,
         r#"{"minimum_classified_coverage_ppm":0}"#, "[]", "[{}]", "true", "0", r#""""#] {
         let input = format!(r#"{{"id":"a","text":"source","task_args":{override_value}}}"#);
         assert!(serde_json::from_str::<BatchDocument<Int4ClassificationDocumentArgs>>(&input).is_err(), "{override_value}");
@@ -277,4 +278,35 @@ fn actual_native_processor_implements_the_guarded_durable_boundary() {
     fn send<T: Send + 'static>() {}
     durable::<Int4ClassificationDocumentJobProcessor<'static, 'static, 'static, Admission>>();
     send::<Int4ClassificationDocumentJobPlanner>();
+}
+
+#[test]
+fn compact_policy_and_every_shared_operation_ceiling_authenticate_resume() {
+    use crate::tokenizer::untrusted::SafeBpeLimits;
+    let byte = recipe(mapping(), settings(), planning(), limits());
+    assert!(serde_json::to_value(&byte).unwrap().get("input_encoding").is_none(),
+        "byte-mode recipe commitments retain their exact original object");
+    let policy = SafeBpeLimits { max_input_bytes: 262_144, max_output_tokens: 262_144,
+        max_pair_checks: 4_194_304, max_pair_bytes: 67_108_864 };
+    let mut compact = recipe(mapping(), settings(), planning(), limits());
+    compact.input_encoding = Some(UntrustedEncoding::SafeBpeV1(policy));
+    assert_eq!(freeze(&byte).binding.compare(&freeze(&compact).binding),
+        Err(JobError::Mismatch(MismatchField::Recipe)));
+    let original = freeze(&compact);
+    for axis in 0..4 {
+        let mut changed = policy;
+        match axis {
+            0 => changed.max_input_bytes -= 1,
+            1 => changed.max_output_tokens -= 1,
+            2 => changed.max_pair_checks -= 1,
+            _ => changed.max_pair_bytes -= 1,
+        }
+        compact.input_encoding = Some(UntrustedEncoding::SafeBpeV1(changed));
+        assert_eq!(original.binding.compare(&freeze(&compact).binding),
+            Err(JobError::Mismatch(MismatchField::Recipe)), "axis {axis}");
+    }
+    compact.input_encoding = Some(UntrustedEncoding::SafeBpeV1(policy));
+    assert!(original.binding.compare(&freeze(&compact).binding).is_ok());
+    compact.input_encoding = None;
+    assert_eq!(canonjson::canonical_bytes(&compact).unwrap(), canonjson::canonical_bytes(&byte).unwrap());
 }

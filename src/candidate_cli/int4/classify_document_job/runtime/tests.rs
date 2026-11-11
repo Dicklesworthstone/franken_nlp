@@ -5,7 +5,9 @@ use crate::{jobs::{JobId, JobProgress}, native_engine::decode::DecodeCancellatio
 
 #[test]
 fn host_population_quote_matches_the_admitted_complete_document_memory() {
-    for flags in [vec![], vec!["--cohort-chunks", "3"]] {
+    for flags in [vec![], vec!["--cohort-chunks", "3"],
+        vec!["--input-encoding", "safe-bpe-v1"],
+        vec!["--input-encoding", "safe-bpe-v1", "--cohort-chunks", "3"]] {
         let (c, args) = command("resume", &flags); let map = c.args.validate(&args).unwrap();
         let fixed = lifetime(&args, map); let limits = c.args.lifetime_limits(&args, map, fixed).unwrap();
         let host = host_limits(&args, limits, Duration::from_secs(30));
@@ -54,7 +56,8 @@ fn completion_reports_only_public_model_and_durable_progress_metadata() {
         durable_unit: "complete_original_document", model_id: "Nanbeige4.2-3B",
         source_revision: "public-revision", source_root_sha256: "public-source", model_content_sha256: "public-model",
         candidate_format: "candidate-int4", quant_recipe: "strict-int4", group_width: args.group_width,
-        integer_kernel: map.common.kernel.kind().id(), snapshot: None, cohort_chunks: Some(3), output: &report };
+        integer_kernel: map.common.kernel.kind().id(), snapshot: None, cohort_chunks: Some(3),
+        input_encoding: None, output: &report };
     let mut bytes = Vec::new(); publish_report(&response, &mut bytes, &available).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["durable_unit"], "complete_original_document"); assert_eq!(value["cohort_chunks"], 3);

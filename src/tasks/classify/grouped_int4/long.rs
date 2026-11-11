@@ -258,13 +258,21 @@ pub struct PreparedInt4ClassificationMap<'a> {
 impl Int4ClassificationPlanner {
     pub fn plan_document_with_control<'a, C: DecodeStepControl>(&self, request: &'a ClassificationRequest,
         limits: Int4ClassificationMapLimits, control: &mut C) -> Result<PreparedInt4ClassificationMap<'a>, Int4ClassificationMapError> {
+        self.plan_document_with_encoding_work(request, limits, control, &mut SafeBpeWork::default())
+    }
+    /// Population preparation and execution reconstruction share one bounded
+    /// allowance. Each complete plan retains only its own deterministic delta,
+    /// so replayed identities and result seals remain identical.
+    pub(crate) fn plan_document_with_encoding_work<'a, C: DecodeStepControl>(&self,
+        request: &'a ClassificationRequest, limits: Int4ClassificationMapLimits, control: &mut C,
+        work: &mut SafeBpeWork) -> Result<PreparedInt4ClassificationMap<'a>, Int4ClassificationMapError> {
         planning::checkpoint(control)?; limits.validate(request.budget)?;
         if request.document.is_empty() { return Err(Int4ClassificationMapError::EmptySource); }
-        let mut work = SafeBpeWork::default();
-        let capacity = self.source_token_capacity_with_work(request, limits.chunks.context_tokens, &mut work, control)?;
-        PreparedInt4ClassificationMap::compile_encoded(request, limits, capacity, self.group_width(),
+        let before = *work;
+        let capacity = self.source_token_capacity_with_work(request, limits.chunks.context_tokens, work, control)?;
+        PreparedInt4ClassificationMap::compile_encoded_with_work(request, limits, capacity, self.group_width(),
             binding::Authority { ceiling: self.task_budget(), planning: self.planning_limits() },
-            self.document_encoding(), work, control,
+            self.document_encoding(), work, before, control,
             |source, control, work| self.source_tokens_with_work(source, work, control),
             |request, control, work| self.plan_with_encoding_work(request, control, work))
     }
@@ -280,11 +288,24 @@ impl<'a> PreparedInt4ClassificationMap<'a> {
             SafeBpeWork::default(), control, |source, _, _| Ok(source.len()),
             |request, control, _| prepare(request, control))
     }
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn compile_encoded<C: DecodeStepControl, Count, Prepare>(request: &'a ClassificationRequest,
         limits: Int4ClassificationMapLimits, capacity: usize, width: usize,
         authority: binding::Authority, encoding: &UntrustedEncoding,
-        mut work: SafeBpeWork, control: &mut C, mut count: Count, mut prepare: Prepare)
+        mut work: SafeBpeWork, control: &mut C, count: Count, prepare: Prepare)
+        -> Result<Self, Int4ClassificationMapError>
+    where Count: FnMut(&str, &mut C, &mut SafeBpeWork) -> Result<usize, ClassificationPlanningError>,
+        Prepare: FnMut(&ClassificationRequest, &mut C, &mut SafeBpeWork)
+            -> Result<PreparedInt4Classification, Int4ClassificationError> {
+        Self::compile_encoded_with_work(request, limits, capacity, width, authority, encoding,
+            &mut work, SafeBpeWork::default(), control, count, prepare)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn compile_encoded_with_work<C: DecodeStepControl, Count, Prepare>(request: &'a ClassificationRequest,
+        limits: Int4ClassificationMapLimits, capacity: usize, width: usize,
+        authority: binding::Authority, encoding: &UntrustedEncoding,
+        work: &mut SafeBpeWork, before: SafeBpeWork, control: &mut C, mut count: Count, mut prepare: Prepare)
         -> Result<Self, Int4ClassificationMapError>
     where Count: FnMut(&str, &mut C, &mut SafeBpeWork) -> Result<usize, ClassificationPlanningError>,
         Prepare: FnMut(&ClassificationRequest, &mut C, &mut SafeBpeWork)
@@ -300,7 +321,7 @@ impl<'a> PreparedInt4ClassificationMap<'a> {
         let chunks = {
             let control = RefCell::new(&mut *control);
             ChunkPlan::build_with_checkpoints(&request.document, chunk_limits,
-                |text| count(text, &mut **control.borrow_mut(), &mut work).map_err(|cause| {
+                |text| count(text, &mut **control.borrow_mut(), work).map_err(|cause| {
                     *error.borrow_mut() = Some(cause); MapReduceError::Tokenizer
                 }),
                 || match control.borrow_mut().prefill_checkpoint(0) { None => Ok(()), Some(cause) => {
@@ -319,7 +340,7 @@ impl<'a> PreparedInt4ClassificationMap<'a> {
             aggregation: limits.aggregation, chunk_limits, tokenizer_checks: chunks.tokenizer_calls(),
             source_geometry: geometry(chunks.chunks().iter().map(|chunk| (chunk.id(), chunk.span(), chunk.tokens()))),
             encoding: match encoding { UntrustedEncoding::ByteFallback => None,
-                UntrustedEncoding::SafeBpeV1(limits) => Some(*limits) }, encoding_work: work,
+                UntrustedEncoding::SafeBpeV1(limits) => Some(*limits) }, encoding_work: SafeBpeWork::default(),
             request_binding: [0; 32] };
         let mut plans = planning::reserved(expected.chunks)?;
         for chunk in chunks.chunks() {
@@ -329,7 +350,7 @@ impl<'a> PreparedInt4ClassificationMap<'a> {
             document.push_str(chunk.text());
             let row = ClassificationRequest { document, labels: request.labels.clone(), mode: request.mode,
                 policy: request.policy, budget: request.budget };
-            let prepared = prepare(&row, control, &mut work)?;
+            let prepared = prepare(&row, control, work)?;
             if prepared.group_width() != width || prepared.head_count() != heads || prepared.task_budget() != request.budget
                 || prepared.source_token_count()? != chunk.tokens()
                 || prepared.required_context() > chunk_limits.context_tokens { return Err(Int4ClassificationMapError::Admission); }
@@ -337,8 +358,8 @@ impl<'a> PreparedInt4ClassificationMap<'a> {
             if !fits(expected.work, limits.max_model_work) { return Err(Int4ClassificationMapError::Work); }
             plans.push(prepared);
         }
-        expected.encoding_work = work;
-        expected.request_binding = binding::request(request, limits, authority, encoding, work,
+        expected.encoding_work = work.checked_sub(before).ok_or(Int4ClassificationMapError::Admission)?;
+        expected.request_binding = binding::request(request, limits, authority, encoding, expected.encoding_work,
             &chunks, &plans, control)?;
         planning::checkpoint(control)?;
         Ok(Self { chunks, plans, limits, expected, task: request.budget })

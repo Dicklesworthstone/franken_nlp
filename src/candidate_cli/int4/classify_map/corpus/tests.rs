@@ -276,3 +276,49 @@ fn missing_host_feature_refuses_without_opening_defaults_or_source_input() {
     let (options, args) = arguments(&["--defaults", "never-open-private-defaults.json"]);
     assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Unavailable));
 }
+
+#[test]
+fn compact_corpora_price_one_encoder_beside_serial_and_cohort_document_owners() {
+    for schedule in [vec![], vec!["--cohort-chunks", "2"]] {
+        let (byte_options, byte_args) = arguments(&schedule);
+        let byte = byte_options.validate(&byte_args).unwrap();
+        let mut flags = schedule;
+        flags.extend(["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "262144",
+            "--max-tokenizer-output-tokens", "131072"]);
+        let (options, mut args) = arguments(&flags);
+        let compact = options.validate(&args).unwrap();
+        let policy = options.document.input_encoding(&args).unwrap();
+        let UntrustedEncoding::SafeBpeV1(encoding) = policy else { panic!("compact corpus required"); };
+        assert_eq!(encoding.max_input_bytes, 262_144);
+        assert_eq!(encoding.max_output_tokens, 131_072);
+        assert_eq!(compact.document.memory.input_bytes,
+            byte.document.memory.input_bytes + encoding.requirements().unwrap().workspace_bytes);
+        assert_eq!(compact.document.memory.native, byte.document.memory.native);
+        assert_eq!(compact.document.mapping.max_model_work, byte.document.mapping.max_model_work);
+        assert_eq!(compact.transport.max_work, byte.transport.max_work);
+        args.memory_mib = compact.common.minimum_memory_bytes.div_ceil(MIB);
+        options.validate(&args).unwrap();
+        args.memory_mib -= 1;
+        assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
+fn compact_population_limits_and_snapshot_mutation_refuse_before_private_io() {
+    for flags in [
+        &["--max-tokenizer-input-bytes", "10"][..],
+        &["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "0"][..],
+        &["--input-encoding", "safe-bpe-v1", "--max-tokenizer-output-tokens", "1048577"][..],
+        &["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-checks", "0"][..],
+        &["--input-encoding", "safe-bpe-v1", "--max-tokenizer-pair-bytes", "536870913"][..],
+        &["--input-encoding", "safe-bpe-v1", "--save-snapshot", "never-created.snapshot"][..],
+    ] {
+        let (options, args) = arguments(flags);
+        assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+    let pin = "ab".repeat(32);
+    let snapshot = parsed(&["--snapshot", "private.snapshot", "--expected-model-sha256", &pin,
+        "--input-encoding", "safe-bpe-v1"]).unwrap();
+    let Int4Task::ClassifyCorpus(options) = snapshot.task else { panic!("classification corpus required"); };
+    assert!(options.validate(&snapshot.args).unwrap().common.snapshot_pin.is_some());
+}

@@ -30,7 +30,8 @@ fn host_quote_keeps_the_full_map_and_exact_transport_metadata_envelope() {
             let limits = options.validate(&args).unwrap();
             let task = options.document.budget(limits.common, limits.document.planning.max_labels).unwrap();
             let host = host_limits(&args, limits, Duration::from_secs(30));
-            let quote = memory_quote(width, task, limits, host, cohort_chunks).unwrap();
+            let quote = memory_quote(width, task, limits, host, cohort_chunks,
+                &options.document.input_encoding(&args).unwrap()).unwrap();
             assert_eq!(quote.native, limits.document.memory.native);
             assert_eq!(quote.workspace_bytes, limits.document.memory.workspace_bytes);
             assert_eq!(quote.output_reservation_bytes, limits.document.memory.output_reservation_bytes);
@@ -95,6 +96,7 @@ fn candidate_frames_preserve_complete_native_record_bytes_and_private_paths_stay
             candidate_format: "fixture-format", quant_recipe: "fixture-recipe:group=128",
             group_width: 128, integer_kernel: "s_scalar_i32",
             snapshot: operation.map(|name| SnapshotRecord::new(name, need)),
+            input_encoding: None,
         };
         // These bytes test framing, not fabricated native model behavior.
         let inner = "{\"event\":\"fixture\",\"result\":{\"chunks\":[{\"label\":\"café 上海\"}],\"single_context_equivalence\":false,\"exact\":12345678901234567890123456789012345678}}\n";
@@ -179,16 +181,19 @@ fn model_present_resident_documents_match_maps_and_flush_does_not_renew_work() {
         args.memory_mib = memory; args.kernel = kernel; args.context_tokens = 2048;
         args.timeout_seconds = 86_400;
     };
-    let mut serial_results = Vec::new();
-    for cohort_chunks in [None, Some(2)] {
-        assert_native_corpus_schedule(&configure, cohort_chunks, &pin, &mut serial_results);
+    for compact in [false, true] {
+        let mut serial_results = Vec::new();
+        for cohort_chunks in [None, Some(2)] {
+            assert_native_corpus_schedule(&configure, cohort_chunks, &pin, &mut serial_results, compact);
+        }
     }
     println!("{COMPLETE}");
 }
 
 fn assert_native_corpus_schedule(configure: &impl Fn(&mut Int4Args), cohort_chunks: Option<usize>,
-    pin: &str, serial_results: &mut Vec<Vec<u8>>) {
+    pin: &str, serial_results: &mut Vec<Vec<u8>>, compact: bool) {
     let mut flags = vec!["--max-chunks", "8", "--max-chunk-bytes", "64"];
+    if compact { flags.extend(["--input-encoding", "safe-bpe-v1"]); }
     let cohort_text = cohort_chunks.map(|chunks| chunks.to_string());
     if let Some(chunks) = &cohort_text { flags.extend(["--cohort-chunks", chunks.as_str()]); }
     let standalone_flags = flags.clone();
@@ -303,4 +308,26 @@ fn assert_native_corpus_schedule(configure: &impl Fn(&mut Int4Args), cohort_chun
     assert_eq!(footer["summary"]["reserved_work"]["projected_logits"], work.projected_logits);
     let resources = crate::installed_process_resources().unwrap();
     assert_eq!(resources.outstanding_closure_snapshot().active_closures, 0);
+}
+
+#[test]
+fn compact_host_quote_includes_exactly_one_reused_encoder_workspace() {
+    for schedule in [vec![], vec!["--cohort-chunks", "2"]] {
+        let mut flags = schedule;
+        flags.extend(["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "262144"]);
+        let command = command(&flags);
+        let Int4Task::ClassifyCorpus(options) = command.task else { panic!("classification corpus required"); };
+        let args = command.args;
+        let limits = options.validate(&args).unwrap();
+        let encoding = options.document.input_encoding(&args).unwrap();
+        let task = options.document.budget(limits.common, limits.document.planning.max_labels).unwrap();
+        let host = host_limits(&args, limits, Duration::from_secs(30));
+        let quote = memory_quote(args.group_width, task, limits, host,
+            options.document.cohort_chunks(), &encoding).unwrap();
+        assert_eq!(quote.input_bytes, limits.document.memory.input_bytes
+            + corpus_buffer_bytes(limits.transport, limits.common.preparation_bytes, limits.io_bytes).unwrap()
+            + retained_metadata_bytes(limits.document.mapping.chunks.max_chunks).unwrap());
+        assert_eq!(quote.native, limits.document.memory.native);
+        assert_eq!(quote.output_reservation_bytes, limits.document.memory.output_reservation_bytes);
+    }
 }

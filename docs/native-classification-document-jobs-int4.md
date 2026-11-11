@@ -150,6 +150,29 @@ Uncommitted spool bytes or stages refuse by default. The resume-only
 the original contract authenticates. Report-delivery failure may follow durable
 progress; inspect the job or resume rather than assuming rollback.
 
+## Compact input and resume
+
+Add `--input-encoding safe-bpe-v1` to `start` and repeat it on `resume`, with
+identical `--max-tokenizer-input-bytes`, `--max-tokenizer-output-tokens`,
+`--max-tokenizer-pair-checks` and `--max-tokenizer-pair-bytes` values. These
+limits cover one complete document attempt, including initial preparation,
+all source/label probes and reconstruction for execution. They never reset
+between those passes. Exhaustion refuses the document before native inference;
+no source is truncated and no encoding fallback is selected.
+
+The immutable private recipe binds the encoding kind and every ceiling before
+population replay or repair, including retained-input replay. Changing the
+policy refuses resume. Byte fallback remains the default, with its existing
+recipe bytes unchanged. Serial and chunk-cohort execution both use the fixed
+policy and admit exactly one transient encoder workspace. The native work
+ledger remains separate and retains the original lifetime semantics.
+Compact mode supports pinned source input and pinned snapshot reload;
+`--save-snapshot` is refused before IO.
+
+For embedding, configure `Int4ClassificationPlanner::with_document_encoding`
+before constructing the durable planner. The host derives the workspace from
+the sealed policy; per-record arguments cannot replace it.
+
 ## Serial execution and chunk cohorts
 
 Serial is the default. Add `--cohort-chunks N` at job creation to share native

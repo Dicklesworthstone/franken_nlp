@@ -124,6 +124,17 @@ impl SafeBpeWork {
         })
     }
 
+    /// Report one planning pass without renewing its enclosing operation's
+    /// allowance. The cumulative owner remains charged across reconstruction.
+    pub(crate) fn checked_sub(self, earlier: Self) -> Option<Self> {
+        Some(Self {
+            input_bytes: self.input_bytes.checked_sub(earlier.input_bytes)?,
+            output_tokens: self.output_tokens.checked_sub(earlier.output_tokens)?,
+            pair_checks: self.pair_checks.checked_sub(earlier.pair_checks)?,
+            pair_bytes: self.pair_bytes.checked_sub(earlier.pair_bytes)?,
+        })
+    }
+
     fn check(&self, limits: SafeBpeLimits) -> Result<(), UntrustedDocumentError> {
         for (resource, exceeded) in [
             ("input bytes", self.input_bytes > limits.max_input_bytes),

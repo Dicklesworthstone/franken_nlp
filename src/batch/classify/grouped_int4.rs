@@ -3,6 +3,7 @@
 //! verifies every frozen chunk identity; it never borrows through its own owner.
 use std::sync::Arc;
 use crate::{
+    tokenizer::untrusted::{SafeBpeWork, UntrustedEncoding},
     batch::{BatchCode, BatchDocument, BatchFault, BatchItemFailure, BatchProcessor,
         BatchRequestContext, BatchWork, output::GuardedOutput},
     execution_identity::ExecutionIdentity,
@@ -44,20 +45,20 @@ pub struct Int4ClassificationDocumentBatchPlanner {
 impl Int4ClassificationDocumentBatchPlanner {
     pub fn new(planner: Int4ClassificationPlanner, defaults: Option<ClassificationBatchArgs>,
         mapping: Int4ClassificationMapLimits, max_run_work: Int4Work) -> Result<Self, BatchFault> {
-        if planner.document_encoding() != &crate::tokenizer::untrusted::UntrustedEncoding::ByteFallback {
-            return Err(BatchCode::Admission.into());
-        }
+        planner.document_encoding().validate().map_err(|_| BatchCode::InvalidLimits)?;
         validate_limits(planner.task_budget(), planner.planning_limits(), mapping, max_run_work)?;
         constrained_int4::check_profile(planner.execution_identity(), planner.group_width())
             .map_err(|_| BatchCode::Admission)?;
         if planner.execution_identity().task_spec != "classify-v1" { return Err(BatchCode::Admission.into()); }
         if let Some(args) = &defaults {
             validate_args(args, planner.task_budget(), planner.planning_limits()).map_err(|e| e.fault)?;
-            // Refuse fixed defaults that cannot leave any source capacity.
-            // No document content or model forward is involved in this check.
-            let request = args.clone().into_request("x".to_owned());
-            planner.max_document_bytes(&request, mapping.chunks.context_tokens)
-                .map_err(|e| map_failure(e.into(), false).fault)?;
+            // Byte-mode capacity is content-free. Compact metadata capacity
+            // is measured inside each complete document's own allowance.
+            if planner.document_encoding() == &UntrustedEncoding::ByteFallback {
+                let request = args.clone().into_request("x".to_owned());
+                planner.max_document_bytes(&request, mapping.chunks.context_tokens)
+                    .map_err(|e| map_failure(e.into(), false).fault)?;
+            }
         }
         Ok(Self { planner, defaults, mapping, max_run_work, cohorts: None, seal: Arc::new(()) })
     }
@@ -67,6 +68,7 @@ impl Int4ClassificationDocumentBatchPlanner {
     pub fn planning_limits(&self) -> ClassificationLimits { self.planner.planning_limits() }
     pub fn mapping_limits(&self) -> Int4ClassificationMapLimits { self.mapping }
     pub fn max_run_work(&self) -> Int4Work { self.max_run_work }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { self.planner.document_encoding() }
     pub fn cohort_chunks(&self) -> Option<usize> { self.cohorts.map(|schedule| schedule.chunks) }
     /// Opt into actual chunk-by-head native windows. Unknown records reserve
     /// the largest valid head count; an oversized actual record is refused,
@@ -115,12 +117,16 @@ pub struct PreparedInt4ClassificationDocument {
     expected: Int4ClassificationMapPreflight,
     identities: Vec<ExecutionIdentity>,
     required_context: usize,
+    encoding_work: SafeBpeWork,
     seal: Arc<()>,
 }
 impl PreparedInt4ClassificationDocument {
     pub fn execution_identities(&self) -> &[ExecutionIdentity] { &self.identities }
     pub fn planned_work(&self) -> Int4Work { self.expected.planned_work() }
     pub fn chunk_count(&self) -> usize { self.expected.chunk_count() }
+    /// Cumulative tokenizer work already spent by this document operation.
+    /// Reconstruction spends the remainder of the same fixed allowance.
+    pub fn encoding_work(&self) -> SafeBpeWork { self.encoding_work }
 }
 
 /// Admission covers every exact chunk identity and the complete document
@@ -182,7 +188,9 @@ impl<A: Int4ClassificationDocumentBatchAdmission> BatchProcessor for NativeInt4C
             checkpoint(control)?;
             let request = self.compiler.request(document)?;
             let kv = self.backend.check_capacity(&self.compiler, request.budget)?;
-            let plan = self.compiler.planner.plan_document_with_control(&request, self.compiler.mapping, control)
+            let mut encoding_work = SafeBpeWork::default();
+            let plan = self.compiler.planner.plan_document_with_encoding_work(&request, self.compiler.mapping,
+                control, &mut encoding_work)
                 .map_err(|e| map_failure(e, false))?;
             subtract(self.run.remaining(), plan.planned_work())?;
             let identities = plan.identities().map_err(|e| map_failure(e, false))?;
@@ -191,7 +199,7 @@ impl<A: Int4ClassificationDocumentBatchAdmission> BatchProcessor for NativeInt4C
             let expected = plan.preflight_metadata(); let required_context = plan.required_context();
             drop(plan);
             checkpoint(control)?;
-            Ok(PreparedInt4ClassificationDocument { request, expected, identities, required_context,
+            Ok(PreparedInt4ClassificationDocument { request, expected, identities, required_context, encoding_work,
                 seal: Arc::clone(&self.compiler.seal) })
         })();
         self.run.finish_preparation(result, self.backend.is_clean())
@@ -204,7 +212,7 @@ impl<A: Int4ClassificationDocumentBatchAdmission> BatchProcessor for NativeInt4C
         self.run.fail();
         Err(BatchItemFailure::fatal(BatchCode::InvalidExecution))
     }
-    fn execute_with_context<C: DecodeStepControl>(&mut self, prepared: Self::Prepared,
+    fn execute_with_context<C: DecodeStepControl>(&mut self, mut prepared: Self::Prepared,
         context: BatchRequestContext, control: &mut C) -> Result<Self::Output, BatchItemFailure> {
         self.run.enter()?;
         let result = (|| {
@@ -216,7 +224,8 @@ impl<A: Int4ClassificationDocumentBatchAdmission> BatchProcessor for NativeInt4C
             self.run.charge(prepared.planned_work(), context)?;
             checkpoint(control)?;
             let kv = self.backend.check_capacity(&self.compiler, prepared.request.budget)?;
-            let plan = self.compiler.planner.plan_document_with_control(&prepared.request, self.compiler.mapping, control)
+            let plan = self.compiler.planner.plan_document_with_encoding_work(&prepared.request, self.compiler.mapping,
+                control, &mut prepared.encoding_work)
                 .map_err(|e| map_failure(e, true))?;
             let actual_ids = plan.identities().map_err(|e| map_failure(e, true))?;
             if plan.preflight_metadata() != prepared.expected || actual_ids != prepared.identities

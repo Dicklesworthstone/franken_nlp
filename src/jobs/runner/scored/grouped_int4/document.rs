@@ -6,6 +6,7 @@ use super::*;
 use std::sync::Arc;
 use serde::{Deserialize, Deserializer, Serialize, de::{self, MapAccess, Visitor}};
 use crate::{
+    tokenizer::untrusted::{SafeBpeWork, UntrustedEncoding},
     batch::classify::ClassificationBatchArgs,
     jobs::manifest::bounded_json,
     native_engine::{constrained_int4, int4::PackedInt4Kernel,
@@ -73,6 +74,10 @@ pub struct Int4ClassificationDocumentJobRecipe {
     max_stored_result_bytes: u64,
     aggregation: ClassificationAggregationPolicy,
     cohort_chunks: Option<usize>,
+    /// One operation includes initial preparation and execution reconstruction.
+    /// Omission preserves every existing byte-mode recipe commitment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_encoding: Option<UntrustedEncoding>,
 }
 impl Int4ClassificationDocumentJobRecipe {
     fn new(classification: Int4ScoredJobRecipe, mapping: Int4ClassificationMapLimits)
@@ -88,7 +93,7 @@ impl Int4ClassificationDocumentJobRecipe {
             reservation_policy: "exact-all-chunk-five-axis-work-before-durable-attempt-v1",
             classification, chunks, per_document_model_work: max_model_work,
             max_retained_result_bytes, max_result_bytes, max_stored_result_bytes: max_result_bytes,
-            aggregation, cohort_chunks: None };
+            aggregation, cohort_chunks: None, input_encoding: None };
         bounded_json(&recipe, RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
         Ok(recipe)
     }
@@ -124,7 +129,12 @@ impl Int4ClassificationDocumentJobPlanner {
             max_model_work: limits.max_work.int4_model_work() };
         let (classification, settings) = Int4ScoredJobRecipe::classification_retaining_defaults(
             compiler.group_width(), ceiling, planning, settings, native)?;
-        let recipe = Int4ClassificationDocumentJobRecipe::new(classification, mapping)?;
+        compiler.document_encoding().validate().map_err(|_| BatchCode::InvalidLimits)?;
+        let mut recipe = Int4ClassificationDocumentJobRecipe::new(classification, mapping)?;
+        if compiler.document_encoding() != &UntrustedEncoding::ByteFallback {
+            recipe.input_encoding = Some(compiler.document_encoding().clone());
+            bounded_json(&recipe, RECIPE_BYTES).map_err(|_| BatchCode::InvalidLimits)?;
+        }
         Ok(Self { compiler, settings, mapping, limits, recipe, cohorts: None, owner: Arc::new(()) })
     }
     pub fn execution_identity(&self) -> &ExecutionIdentity { self.compiler.execution_identity() }
@@ -135,6 +145,7 @@ impl Int4ClassificationDocumentJobPlanner {
     pub fn job_limits(&self) -> JobLimits { self.limits }
     pub fn request(&self) -> &ClassificationBatchArgs { &self.settings }
     pub fn group_width(&self) -> usize { self.compiler.group_width() }
+    pub fn document_encoding(&self) -> &UntrustedEncoding { self.compiler.document_encoding() }
     pub fn head_count(&self) -> usize {
         if self.settings.mode == ClassificationMode::Exclusive { 1 } else { self.settings.labels.len() }
     }
@@ -178,7 +189,8 @@ impl Int4ClassificationDocumentJobPlanner {
         } else {
             memory.requirements(self.group_width(), self.document_budget(), self.planning_limits(), self.mapping)
         };
-        required.map_err(|error| map_failure(error).fault)
+        required.and_then(|required| required.with_input_encoding(self.document_encoding()))
+            .map_err(|error| map_failure(error).fault)
     }
     pub fn check_job_limits(&self, limits: JobLimits) -> Result<(), BatchFault> {
         if limits != self.limits || self.max_result_bytes() > limits.max_result_bytes as u64 {
@@ -186,14 +198,15 @@ impl Int4ClassificationDocumentJobPlanner {
         }
         Ok(())
     }
-    fn plan<'a, C: DecodeStepControl>(&self, request: &'a ClassificationRequest, control: &mut C)
+    fn plan_with_encoding_work<'a, C: DecodeStepControl>(&self, request: &'a ClassificationRequest,
+        control: &mut C, work: &mut SafeBpeWork)
         -> Result<PreparedInt4ClassificationMap<'a>, BatchItemFailure> {
         poll(control)?;
         if request.document.is_empty() || request.document.len() > self.mapping.chunks.max_input_bytes
             || request.document.len() > self.limits.max_input_bytes_per_item {
             return Err(BatchItemFailure::fatal(BatchCode::DocumentLimit));
         }
-        self.compiler.plan_document_with_control(request, self.mapping, control).map_err(map_failure)
+        self.compiler.plan_document_with_encoding_work(request, self.mapping, control, work).map_err(map_failure)
     }
     /// Performs no native inference or filesystem work. The exact source is
     /// moved into the preparation; every original chunk is compiled first.
@@ -206,7 +219,8 @@ impl Int4ClassificationDocumentJobPlanner {
         }
         let request = ClassificationRequest { document: document.text, labels: self.settings.labels.clone(),
             mode: self.settings.mode, policy: self.settings.policy, budget: self.settings.budget };
-        let plan = self.plan(&request, control)?;
+        let mut encoding_work = SafeBpeWork::default();
+        let plan = self.plan_with_encoding_work(&request, control, &mut encoding_work)?;
         let expected = plan.preflight_metadata();
         let identities = plan.identities().map_err(map_failure)?;
         let work = JobWork::from_int4(plan.planned_work(), 0);
@@ -220,7 +234,7 @@ impl Int4ClassificationDocumentJobPlanner {
         if !work.fits(self.limits.max_work) { return Err(BatchItemFailure::fatal(BatchCode::WorkLimit)); }
         drop(plan);
         poll(control)?;
-        Ok(PreparedInt4ClassificationDocument { request, identities, expected, work,
+        Ok(PreparedInt4ClassificationDocument { request, identities, expected, work, encoding_work,
             owner: Arc::clone(&self.owner) })
     }
     fn owns(&self, prepared: &PreparedInt4ClassificationDocument) -> Result<(), BatchItemFailure> {
@@ -250,6 +264,7 @@ pub struct PreparedInt4ClassificationDocument {
     identities: Vec<ExecutionIdentity>,
     expected: Int4ClassificationMapPreflight,
     work: JobWork,
+    encoding_work: SafeBpeWork,
     owner: Arc<()>,
 }
 impl PreparedInt4ClassificationDocument {
@@ -257,6 +272,9 @@ impl PreparedInt4ClassificationDocument {
     pub fn planned_work(&self) -> JobWork { self.work }
     pub fn execution_identities(&self) -> &[ExecutionIdentity] { &self.identities }
     pub fn preflight_metadata(&self) -> Int4ClassificationMapPreflight { self.expected }
+    /// Preparation and reconstruction consume this one document allowance;
+    /// native work and attempts separately retain their durable lifetime scope.
+    pub fn encoding_work(&self) -> SafeBpeWork { self.encoding_work }
 }
 
 fn validate_limits(width: usize, ceiling: TaskBudget, task: TaskBudget, planning: ClassificationLimits,

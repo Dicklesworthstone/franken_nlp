@@ -436,15 +436,15 @@ fn compact_limits_and_repeated_presave_planning_refuse_before_private_io() {
 }
 
 #[test]
-fn corpus_and_retained_jobs_do_not_inherit_unpriced_compact_map_options() {
-    for mut argv in [vec!["candidate", "source-int4", "classify-corpus"],
-        vec!["candidate", "source-int4", "classify-document-job", "start"],
-        vec!["candidate", "source-int4", "classify-document-job", "resume"]] {
-        argv.extend(["--input-encoding", "safe-bpe-v1"]);
-        assert!(crate::candidate_cli::definition().try_get_matches_from(argv).is_err());
-    }
+fn compact_population_options_share_the_priced_map_policy() {
     let compact = command(&["--input-encoding", "safe-bpe-v1"]);
-    assert_eq!(selected(&compact).validate_with_max_labels(&compact.args, 4).err(), Some(CandidateError::Arguments));
+    let limits = selected(&compact).validate_with_max_labels(&compact.args, 4).unwrap();
+    assert_eq!(limits.planning.max_labels, 4);
+    let population = population_definition(definition()).render_long_help().to_string();
+    for required in ["execution reconstruction", "ONE fixed tokenizer allowance",
+        "authenticate retained jobs", "input_encoding.work", "refuse --save-snapshot"] {
+        assert!(population.split_whitespace().collect::<Vec<_>>().join(" ").contains(required));
+    }
     let help = one_off_definition().render_long_help().to_string();
     let words = help.split_whitespace().collect::<Vec<_>>().join(" ");
     for required in ["--input-encoding", "--max-tokenizer-input-bytes", "--max-tokenizer-output-tokens",

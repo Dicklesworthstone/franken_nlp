@@ -98,7 +98,7 @@ impl NlpEngine {
         let required = if let Some(cohorts) = cohorts { cohorts.memory } else {
             int4_classification_document_corpus_requirements(planner.group_width(), planner.task_budget(),
                 planner.planning_limits(), mapping, limits)?
-        };
+        }.with_input_encoding(planner.document_encoding()).map_err(map_error)?;
         let max_heads = if let Some(chunks) = cohort_chunks {
             cohort_head_limit(planner.planning_limits().max_labels, chunks).map_err(HostedError::BatchSetup)?
         } else { planner.planning_limits().max_labels };

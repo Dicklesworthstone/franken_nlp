@@ -73,11 +73,15 @@ pub(super) fn definition() -> clap::Command {
         .mut_arg("max_checkpoints", |arg| arg.help("Cooperative allowance for the complete hosted plan, every chunk and reduction")))
 }
 
-/// Corpus/job callers keep the original byte-only parser. This complete
-/// one-document route owns the aggregate compact-tokenizer work allowance.
+/// This complete one-document route owns its compact preparation allowance.
 pub(super) fn one_off_definition() -> clap::Command {
     MapEncodingArgs::augment_args(input_encoding::definition(definition()))
-        .after_long_help("--input-encoding safe-bpe-v1 uses actual compact source-token counts when choosing chunks. Label-capacity preparation, every attempted chunk (including oversized probes) and all final chunk/label plans spend one shared tokenizer allowance. --max-tokenizer-input-bytes and --max-tokenizer-output-tokens default to 1048576 each; pair checks and examined pair bytes use their explicit shared flags. Exhaustion refuses the complete document before any native forward. Context, source bytes, native work, output and memory retain separate ceilings. Compact output includes the exact policy and consumed tokenizer work. Compact maps accept pinned sources or snapshot reload but refuse --save-snapshot, whose separate pre-save planning would repeat tokenizer work. The byte-fallback default, classify-corpus and classify-document-job retain their existing contracts.")
+        .after_long_help("--input-encoding safe-bpe-v1 uses actual compact source-token counts when choosing chunks. Label-capacity preparation, every attempted chunk (including oversized probes) and all final chunk/label plans spend one shared tokenizer allowance. --max-tokenizer-input-bytes and --max-tokenizer-output-tokens default to 1048576 each; pair checks and examined pair bytes use their explicit shared flags. Exhaustion refuses the complete document before any native forward. Context, source bytes, native work, output and memory retain separate ceilings. Compact output includes the exact policy and consumed tokenizer work. Compact maps accept pinned sources or snapshot reload but refuse --save-snapshot, whose separate pre-save planning would repeat tokenizer work. The byte-fallback default retains its existing contract.")
+}
+
+pub(super) fn population_definition(command: clap::Command) -> clap::Command {
+    MapEncodingArgs::augment_args(input_encoding::definition(command))
+        .after_long_help("Explicit compact input preserves exact source and label bytes and excludes template controls while compacting ordinary text. ONE fixed tokenizer allowance covers each complete document operation, including initial preparation, all sizing probes, every label/chunk plan and execution reconstruction. --max-tokenizer-input-bytes and --max-tokenizer-output-tokens default to 1048576 each; the pair-work flags cover the same operation. No chunk, head or reconstruction renews these limits. Each original document receives a separate allowance; an explicit resumed attempt may prepare again, while durable native-work counters and attempts retain their lifetime scope. The policy and every ceiling authenticate retained jobs. input_encoding.work on each completed result reports its final deterministic planning pass, not the sum of both passes. Encoder workspace is admitted once beside retained plans. Serial and native chunk cohorts are supported. Compact populations accept pinned sources or snapshot reload but refuse --save-snapshot. Byte-mode recipe and result bytes remain unchanged. Compact input changes prompt tokens and makes no output-parity, quality or speed claim.")
 }
 
 /// Only the complete one-document command owns a persistent row team. Its
@@ -114,8 +118,7 @@ impl MapArgs {
     /// Existing one-off and durable workflows keep their original ceiling.
     pub(super) fn validate_with_max_labels(self, args: &Int4Args, max_labels: usize)
         -> Result<MapLimits, CandidateError> {
-        if args.compute.threads() != 1 || !args.input_encoding.is_default()
-            || self.encoding != MapEncodingArgs::default() {
+        if args.compute.threads() != 1 {
             return Err(CandidateError::Arguments);
         }
         self.validate_encoding(args, max_labels)
@@ -124,7 +127,7 @@ impl MapArgs {
         if args.compute.threads() == 1 { self.validate(args) }
         else { self.validate_encoding(args, 128) }
     }
-    fn input_encoding(self, args: &Int4Args) -> Result<UntrustedEncoding, CandidateError> {
+    pub(super) fn input_encoding(self, args: &Int4Args) -> Result<UntrustedEncoding, CandidateError> {
         if args.input_encoding.is_default() && self.encoding != MapEncodingArgs::default() {
             return Err(CandidateError::Arguments);
         }

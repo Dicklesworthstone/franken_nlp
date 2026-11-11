@@ -29,13 +29,18 @@ fn compact_mapping() -> Int4ClassificationMapLimits {
 fn compile<'a, C: DecodeStepControl>(planner: &ClassificationPlanner, identity: &ExecutionIdentity,
     request: &'a ClassificationRequest, limits: Int4ClassificationMapLimits, control: &mut C)
     -> Result<PreparedInt4ClassificationMap<'a>, Int4ClassificationMapError> {
+    compile_with_work(planner, identity, request, limits, control, &mut SafeBpeWork::default())
+}
+fn compile_with_work<'a, C: DecodeStepControl>(planner: &ClassificationPlanner, identity: &ExecutionIdentity,
+    request: &'a ClassificationRequest, limits: Int4ClassificationMapLimits, control: &mut C,
+    work: &mut SafeBpeWork) -> Result<PreparedInt4ClassificationMap<'a>, Int4ClassificationMapError> {
     let planning = ClassificationLimits::default();
-    let mut work = SafeBpeWork::default();
+    let before = *work;
     let capacity = planner.source_token_capacity_with_work(request, request.budget, planning,
-        limits.chunks.context_tokens, &mut work, control)?;
-    PreparedInt4ClassificationMap::compile_encoded(request, limits, capacity, 32,
+        limits.chunks.context_tokens, work, control)?;
+    PreparedInt4ClassificationMap::compile_encoded_with_work(request, limits, capacity, 32,
         super::super::binding::Authority { ceiling: request.budget, planning },
-        planner.document_encoding(), work, control,
+        planner.document_encoding(), work, before, control,
         |source, control, work| planner.source_tokens_with_work(source, work, control),
         |row, control, work| planner.compile_int4_with_work(row,
             &PlanContext::new(identity, request.budget).unwrap(), planning, 32, control, work))
@@ -188,4 +193,69 @@ fn byte_mode_output_and_execution_identity_keep_the_original_contract() {
     let value = serde_json::to_value(finish(&new).unwrap()).unwrap();
     assert!(value.get("input_encoding").is_none());
     assert_eq!(new.preflight_metadata().encoding_work, SafeBpeWork::default());
+}
+
+#[test]
+fn complete_operation_reconstruction_keeps_its_ledger_and_stable_per_pass_seals() {
+    let request = compact_source(ClassificationMode::MultiLabel);
+    let (planner, identity) = compact_planner(compact_limits());
+    let mut work = SafeBpeWork::default();
+    let first = compile_with_work(&planner, &identity, &request, compact_mapping(), &mut Continue, &mut work).unwrap();
+    let once = work;
+    let second = compile_with_work(&planner, &identity, &request, compact_mapping(), &mut Continue, &mut work).unwrap();
+    assert_eq!(work, once.checked_add(once).unwrap());
+    assert_eq!(work.checked_sub(once), Some(once));
+    assert_eq!(once.checked_sub(work), None);
+    assert_eq!(first.preflight_metadata(), second.preflight_metadata());
+    assert_eq!(first.identities().unwrap(), second.identities().unwrap());
+    assert_eq!(canonjson::canonical_bytes(&finish(&first).unwrap()).unwrap(),
+        canonjson::canonical_bytes(&finish(&second).unwrap()).unwrap());
+    assert_eq!(second.preflight_metadata().encoding_work, once,
+        "result provenance describes this deterministic pass, not cumulative operation cost");
+}
+
+#[test]
+fn reconstruction_cannot_renew_any_tokenizer_axis_after_initial_preparation() {
+    let request = compact_source(ClassificationMode::Exclusive);
+    let (planner, identity) = compact_planner(compact_limits());
+    let once = compile(&planner, &identity, &request, compact_mapping(), &mut Continue)
+        .unwrap().preflight_metadata().encoding_work;
+    let twice = once.checked_add(once).unwrap();
+    let exact = SafeBpeLimits { max_input_bytes: twice.input_bytes(), max_output_tokens: twice.output_tokens(),
+        max_pair_checks: twice.pair_checks(), max_pair_bytes: twice.pair_bytes() };
+    for axis in 0..5 {
+        let mut limits = exact;
+        match axis {
+            0 => limits.max_input_bytes -= 1,
+            1 => limits.max_output_tokens -= 1,
+            2 => limits.max_pair_checks -= 1,
+            3 => limits.max_pair_bytes -= 1,
+            _ => {}
+        }
+        let (planner, identity) = compact_planner(limits);
+        let mut work = SafeBpeWork::default();
+        let initial = compile_with_work(&planner, &identity, &request, compact_mapping(),
+            &mut Continue, &mut work).unwrap();
+        assert_eq!(work, once);
+        let rebuilt = compile_with_work(&planner, &identity, &request, compact_mapping(),
+            &mut Continue, &mut work);
+        if axis == 4 {
+            let rebuilt = rebuilt.unwrap();
+            assert_eq!(rebuilt.preflight_metadata(), initial.preflight_metadata());
+            assert_eq!(work, twice);
+        } else {
+            assert!(rebuilt.is_err(), "axis {axis} renewed its preparation allowance");
+            assert!(work.checked_sub(once).is_some(), "failed reconstruction refunded prior work");
+            assert!(work.input_bytes() <= limits.max_input_bytes);
+            assert!(work.output_tokens() <= limits.max_output_tokens);
+            assert!(work.pair_checks() <= limits.max_pair_checks);
+            assert!(work.pair_bytes() <= limits.max_pair_bytes);
+        }
+        assert!(compile_with_work(&planner, &identity, &request, compact_mapping(),
+            &mut Continue, &mut work).is_err(), "exhausted operation resumed with a fresh ledger");
+        let mut other_document = SafeBpeWork::default();
+        compile_with_work(&planner, &identity, &request, compact_mapping(),
+            &mut Continue, &mut other_document).unwrap();
+        assert_eq!(other_document, once, "a separate document owns a separate allowance");
+    }
 }
