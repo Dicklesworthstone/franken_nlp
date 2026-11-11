@@ -166,6 +166,54 @@ document job. Each consuming document-factory setter invalidates previously
 prepared documents; reconstruction checks every original chunk identity.
 These routes do not expose packed prompt prefill through this option.
 
+### Persistent CPU teams for a complete extraction document
+
+The one-document `extract-map` command additionally accepts
+`--compute-threads N`, with `N` from 2 through 64. One coordinator and `N - 1`
+scoped workers serve every chunk and constrained output projection in the
+document. The team uses the existing exact output-row partitioning; it does
+not change a row's group reduction order. The ordinary single-threaded path
+remains the default.
+
+```sh
+fnlp candidate source-int4 extract-map document.txt \
+  --schema records.schema.json --source-membership \
+  --snapshot /models/nanbeige-g128.int4snap \
+  --expected-model-sha256 "$MODEL_CONTENT_SHA256" \
+  --group-width 128 --memory-mib "$MEMORY_MIB" \
+  --max-selected-rows 4096 --compute-threads 4 --root-array-union
+```
+
+All chunks, identities and complete-document work preflight before the native
+engine allocation and first forward. The team is formed once for the physical
+invocation, and its additional worker workspace is included in admission before
+private input IO. Runtime scheduler threads are additional to the selected
+compute width. Original source coordinates, exact chunk JSON, the optional
+root-array union, and every work/mask/verification allowance retain the existing
+serial contracts. A completion becomes available only after the workers join;
+the output reservation remains held through CLI serialization, write and flush.
+
+The optional top-level `compute` receipt records the declared team width and
+completed projection/row counts. It is separate from the semantic document and
+its identities. With `--compute-threads 1` or no flag, that field is omitted.
+The library entry point is `NlpEngine::extract_int4_document_with_threads`, which
+returns `HostedInt4TeamResult<Int4ExtractionMapRun>` and shares the serial
+planner, native execution and independent finalizer.
+
+The document's explicit `--input-encoding safe-bpe-v1` policy can also be
+combined with this team. Its complete-preparation tokenizer ceilings and
+encoding identity remain in force, and admission adds one reusable encoder
+workspace alongside one team workspace. This encoding choice changes prompt
+tokens; the team itself only changes how output rows are scheduled.
+
+This selection is currently limited to the one-document independent-chunk and
+root-array routes. `--cohort-chunks`, packed prefill, `extract-object-map`,
+document corpora and durable document jobs have separate scheduling contracts
+and do not accept this team selection. Invalid widths, unsupported mixtures
+and an unfunded complete memory quote refuse before schema/source/model IO.
+Real-model serial/team equality and target-host performance remain separate
+controller-run gates; the option does not claim a measured speedup.
+
 ### Resident source-task streams
 
 The four built-in source tasks use the same explicit fixed projection policy:

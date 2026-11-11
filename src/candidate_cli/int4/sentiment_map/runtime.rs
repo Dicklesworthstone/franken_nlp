@@ -1,7 +1,7 @@
 //! Whole-document preflight, one owned native map and complete publication.
 use super::*;
 use std::time::{Duration, Instant};
-use crate::{NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
+use crate::{NlpEngine, MemoryClass,
     hosted::{CancellationToken, HostedError, Int4HostError, Int4SentimentMapHostConfig,
         NativeLimits, RunLimits},
     native_engine::{decode::{DecodeCancellationKind, DecodeStepControl},
@@ -45,17 +45,13 @@ fn execution_error(error: HostedError) -> CandidateError {
 pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     input: &mut impl Read, output: &mut impl Write) -> Result<(), CandidateError> {
     let started = Instant::now();
-    let limits = options.validate(&args)?;
+    let limits = options.validate_with_threads(&args)?;
     let common = limits.common;
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
-    let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
-        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: common.memory_bytes,
-        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
-    }).build().map_err(|_| CandidateError::Runtime)?;
+    let engine = NlpEngine::builder().resource_config(compute::resource_config(common))
+        .build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
     let _preparation = lease.reserve(MemoryClass::JobBuffers, limits.cli_preparation_bytes)
         .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
@@ -125,6 +121,15 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
             execution: result.result().execution.clone(), max_chunks: chunks, chunk_cohorts: result.result().chunk_cohorts,
             group_steps: result.result().group_steps, projection_groups: result.result().projection_groups };
         publish_complete(&Response { provenance: &provenance, output: &result.result().output, cohort: Some(cohort) },
+            limits.envelope_bytes, output, &remaining)
+    } else if common.compute.threads > 1 {
+        let result = engine.map_int4_sentiment_with_threads(&model, request, config, common.kernel,
+            common.compute.threads, cancellation).map_err(execution_error)?;
+        if let Some(expected) = expected {
+            expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+        }
+        let response = Response { provenance: &provenance, output: result.result(), cohort: None };
+        publish_complete(&compute::Response { response: &response, compute: Some(result.compute()) },
             limits.envelope_bytes, output, &remaining)
     } else {
         let result = engine.map_int4_sentiment(&model, request, config, common.kernel, cancellation)

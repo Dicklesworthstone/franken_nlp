@@ -2,11 +2,12 @@
 use super::*;
 use std::{fs::File, sync::Arc, time::{Duration, Instant}};
 use crate::{
-    NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
+    NlpEngine, MemoryClass,
     batch::extract::grouped_int4::{Int4ExtractionBatchPlanner,
         long::{Int4ExtractionMapPreflight, Int4ExtractionMapError, Int4ExtractionMapRun,
             cohort::Int4ExtractionMapCohortStats}},
-    hosted::{CancellationToken, HostedError, Int4ExtractionMapConfig, Int4HostError, NativeLimits, RunLimits},
+    hosted::{CancellationToken, HostedError, Int4ComputeReceipt, Int4ExtractionMapConfig,
+        Int4HostError, NativeLimits, RunLimits},
     native_engine::{decode::{DecodeCancellationKind, DecodeStepControl},
         strict_int4::weights::snapshot::INT4_SNAPSHOT_VERSION},
     tasks::extract::ExtractionVocabulary,
@@ -23,8 +24,9 @@ fn preflight(source: &str, request: &ExtractionBatchArgs, planner: &Int4Extracti
     -> Result<Int4ExtractionMapPreflight, CandidateError> {
     if source.is_empty() { return Err(CandidateError::Input); }
     let prepared = planner.plan_document_with_control(source, request, mapping, control).map_err(planning_error)?;
-    // Retain geometry and work only. The host recompiles under its own charge
-    // and verifies every chunk before any native work starts.
+    // Retain bounded preflight metadata, including its private request seal.
+    // The host recompiles under its own charge and verifies every chunk before
+    // any native work starts.
     Ok(prepared.preflight_metadata())
 }
 fn planning_error(error: Int4ExtractionMapError) -> CandidateError {
@@ -35,18 +37,21 @@ fn planning_error(error: Int4ExtractionMapError) -> CandidateError {
     }
 }
 fn execution_error(error: HostedError) -> CandidateError {
-    // Hosted preparation repeats the complete map under its own reservation.
-    // Its original timeout survives both the task error and a drained runtime
-    // wrapper; other execution failures keep their existing classification.
-    let cause = match error {
-        HostedError::Stopped { stop, .. } => Some(stop.kind),
-        HostedError::Join { physical_error: Some(error), .. }
-            | HostedError::Scope { physical_error: Some(error), .. } => return execution_error(*error),
-        HostedError::Int4(Int4HostError::ExtractionMap(error)) => error.cancellation(),
-        _ => None,
+    // Preserve the original timeout through hosted preparation and a drained
+    // team/runtime wrapper; retain admission failures' public classifications.
+    let cancelled = |cause| match cause {
+        DecodeCancellationKind::Deadline | DecodeCancellationKind::Timeout => CandidateError::Timeout,
+        _ => CandidateError::Execution,
     };
-    match cause {
-        Some(DecodeCancellationKind::Deadline | DecodeCancellationKind::Timeout) => CandidateError::Timeout,
+    match error {
+        HostedError::Stopped { stop, .. } => cancelled(stop.kind),
+        HostedError::Join { physical_error: Some(error), .. }
+            | HostedError::Scope { physical_error: Some(error), .. } => execution_error(*error),
+        HostedError::Int4(Int4HostError::ExtractionMap(error)) =>
+            error.cancellation().map(cancelled).unwrap_or(CandidateError::Execution),
+        HostedError::Int4(Int4HostError::Native(crate::native_engine::strict_int4::StrictInt4Error::Cancelled(cause))) => cancelled(cause),
+        HostedError::Reservation(_) => CandidateError::Memory,
+        HostedError::ModelIdentity | HostedError::ResourceDomain => CandidateError::Identity,
         _ => CandidateError::Execution,
     }
 }
@@ -58,12 +63,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
-    let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
-        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: common.memory_bytes,
-        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
-    }).build().map_err(|_| CandidateError::Runtime)?;
+    let engine = NlpEngine::builder().resource_config(compute::resource_config(common))
+        .build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
     let _preparation = lease.reserve(MemoryClass::JobBuffers, common.preparation_bytes)
         .map_err(|_| CandidateError::Memory)?.commit().map_err(|_| CandidateError::Memory)?;
@@ -121,7 +122,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         }
     }
     let content = identity.logical_model_digest.to_hex();
-    let finish = |document: &Int4ExtractionMapRun, cohort_schedule: Option<CohortSchedule<'_>>| {
+    let finish = |document: &Int4ExtractionMapRun, cohort_schedule: Option<CohortSchedule<'_>>,
+        compute: Option<&Int4ComputeReceipt>| {
         expected.verify_completed(document).map_err(|_| CandidateError::Execution)?;
         remaining()?;
         let response = SourceResponse { schema_version: 1, scope: "real-source-current-candidate-int4",
@@ -129,7 +131,7 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
             source_root_sha256: model.model_identity().source_root_sha256(), model_content_sha256: &content,
             candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
             group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(),
-            output: document, snapshot, cohort_schedule,
+            output: document, snapshot, cohort_schedule, compute,
             root_array_union: limits.mapping.root_array_union.map(array_union::ArrayUnionSelection::new) };
         // Preserve every exact chunk JSON string and the optional independently
         // validated record union. The result guard survives both
@@ -140,14 +142,19 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
     // Preliminary plans are gone. Transfer encoder ownership to the hosted
     // input claim, which remains alive through native drain and publication.
     drop(encoding_preparation);
-    if let Some(max_chunks) = limits.cohort_chunks {
+    if common.compute.threads > 1 {
+        let result = engine.extract_int4_document_with_threads(&model, text, Arc::new(planner), vocabulary,
+            config, common.kernel, common.compute.threads, cancellation)
+            .map_err(execution_error)?;
+        finish(result.result(), None, Some(result.compute()))
+    } else if let Some(max_chunks) = limits.cohort_chunks {
         let result = engine.extract_int4_document_cohorts(&model, text, Arc::new(planner), vocabulary,
             config, common.kernel, cancellation).map_err(execution_error)?;
-        finish(&result.result().document, Some(CohortSchedule::new(max_chunks, &result.result().cohorts)))
+        finish(&result.result().document, Some(CohortSchedule::new(max_chunks, &result.result().cohorts)), None)
     } else {
         let result = engine.extract_int4_document(&model, text, Arc::new(planner), vocabulary,
             config, common.kernel, cancellation).map_err(execution_error)?;
-        finish(result.result(), None)
+        finish(result.result(), None, None)
     }
 }
 #[derive(Serialize)]
@@ -167,6 +174,8 @@ struct SourceResponse<'a, T: Serialize> {
     snapshot: Option<SnapshotRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cohort_schedule: Option<CohortSchedule<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compute: Option<&'a Int4ComputeReceipt>,
     #[serde(skip_serializing_if = "Option::is_none")]
     root_array_union: Option<array_union::ArrayUnionSelection>,
 }

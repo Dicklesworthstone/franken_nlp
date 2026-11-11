@@ -7,7 +7,8 @@ use super::*;
 use crate::{
     batch::extract::{ExtractionBatchArgs, grouped_int4::{Int4ExtractionBatchPlanner,
         long::{Int4ExtractionMapError, Int4ExtractionMapLimits, Int4ExtractionMapRun}}},
-    native_engine::{constrained::JsonDecodeError, constrained_int4},
+    native_engine::{constrained::JsonDecodeError, constrained_int4,
+        strict_int4::projection::Int4ProjectionExecutor},
     tasks::{extract::{ExtractError, grouped_int4::Int4ExtractError}, ir::TaskBudget},
     tokenizer::untrusted::UntrustedEncoding,
     validation::grounded_fields::{SourceFieldEvidence, VerifiedSourceSpan},
@@ -15,6 +16,7 @@ use crate::{
 mod cohort;
 mod corpus;
 mod object;
+mod team;
 pub use object::Int4ObjectExtractionMapConfig;
 pub use corpus::{int4_extraction_document_corpus_requirements,
     int4_extraction_document_corpus_requirements_with_encoding,
@@ -55,6 +57,12 @@ struct ExtractionMapInput {
     vocabulary: Arc<ExtractionVocabulary>,
     config: Int4ExtractionMapConfig,
 }
+// Keep the complete input owner ahead of its lease during queued cancellation.
+struct DocumentAdmission {
+    input: Charged<ExtractionMapInput>,
+    required: Int4MemoryRequirement,
+    lease: EngineLease,
+}
 
 impl NlpEngine {
     /// Produce independently validated schema values for every source chunk.
@@ -67,82 +75,103 @@ impl NlpEngine {
         planner: Arc<Int4ExtractionBatchPlanner>, vocabulary: Arc<ExtractionVocabulary>,
         config: Int4ExtractionMapConfig, kernel: PackedInt4Kernel, cancellation: CancellationToken)
         -> Result<HostedOutput<Int4ExtractionMapRun>, HostedError> {
-        dispatch::preflight(self, config.native.run)?;
-        if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
-        let width = model.model_identity().group_width();
-        if planner.group_width() != width { return Err(HostedError::ModelIdentity); }
-        let identity = planner.base_execution_identity();
-        constrained_int4::check_model(identity, model.model_identity()).map_err(|_| HostedError::ModelIdentity)?;
-        let required = Int4MemoryRequirement::for_context(config.native.context_tokens, width).map_err(native_error)?;
-        validate(&config, identity, width, source.len(), required.kv_bytes)?;
-        let bytes = config.input_bytes(source.capacity(), planner.document_encoding())?;
         let run = config.native.run;
-        let lease = self.resources().acquire_lease();
-        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,
-            || Ok(ExtractionMapInput { source, planner, vocabulary, config }))?;
+        let admitted = admit_document(self, model, source, planner, vocabulary, config)?;
         let model = model.clone();
         dispatch::run(self, run, cancellation, move |control| {
-            // Capture the complete storage-before-charge aggregate. Queued
-            // cancellation must dispose its owners before releasing the charge.
-            let input = input;
-            let config = &input.value.config;
-            poll(control)?;
-            let prepared = input.value.planner.plan_document_with_control(&input.value.source,
-                &config.request, config.limits, control).map_err(map_error)?;
-            let expected = prepared.preflight_metadata();
-            let count = expected.chunk_count();
-            if prepared.group_width() != width || expected.group_width() != width
-                || &prepared.document_encoding() != input.value.planner.document_encoding()
-                || &expected.document_encoding() != input.value.planner.document_encoding()
-                || prepared.execution_identities().len() != count
-                || required.kv_bytes > prepared.max_kv_bytes() {
-                return Err(HostedError::ModelIdentity);
-            }
-            let reduction = Pending::reserve(&lease, MemoryClass::JobBuffers, config.workspace_bytes(count)?)?;
-            let tokens = (count as u64).checked_mul(u64::from(config.request.budget.max_output_tokens))
-                .ok_or(HostedError::Limits("INT4 extraction map token arithmetic"))?;
-            let output = output_claim(&lease, prepared.max_result_bytes(), tokens)?;
-            let mut admitted = Vec::new();
-            admitted.try_reserve_exact(count).map_err(|_| map_error(Int4ExtractionMapError::Allocation))?;
-            for identity in prepared.execution_identities() {
-                poll(control)?;
-                constrained_int4::check_model(identity, model.model_identity()).map_err(|_| HostedError::ModelIdentity)?;
-                check_identity(identity, width)?;
-                let base = input.value.planner.base_execution_identity();
-                if identity.tokenizer_digest != base.tokenizer_digest
-                    || identity.template_digest != base.template_digest {
-                    return Err(HostedError::ModelIdentity);
-                }
-                admitted.push(identity.clone());
-            }
-            poll(control)?;
-            let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-            let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-                sum(&[required.rope_bytes, required.scratch_payload_bound, config.native.allocator_reserve_bytes])?)?;
-            let mut engine = allocate_native(kv, scratch, || {
-                StrictInt4Engine::new(&model.inner.loaded.value, config.native.context_tokens, Int4MemoryBudget {
-                    max_kv_bytes: required.kv_bytes, max_rope_bytes: required.rope_bytes,
-                    max_scratch_payload_bytes: required.scratch_payload_bound,
-                }).map(|engine| engine.with_kernel(kernel)).map_err(native_error)
-            })?;
-            let result = allocate(output, || {
-                let result = prepared.execute_with_control(&admitted, &mut engine.value,
-                    &input.value.vocabulary, control).map_err(map_error)?;
-                expected.verify_completed(&result).map_err(map_error)?;
-                if engine.value.is_poisoned() || !engine.value.kv_cache().all_slots_have_len(0) {
-                    return Err(map_error(Int4ExtractionMapError::Extraction(ExtractError::InvalidResult.into())));
-                }
-                poll(control)?;
-                Ok(result)
-            })?;
-            drop(engine);
-            drop(admitted);
-            drop(input);
-            drop(reduction);
-            drop(lease);
-            Ok(GuardedOutput::new(result.value, result._memory))
+            execute_document(admitted, model.weights(), kernel, control, None)
         })
     }
+}
+
+fn admit_document(host: &NlpEngine, model: &ResidentInt4, source: String,
+    planner: Arc<Int4ExtractionBatchPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+    config: Int4ExtractionMapConfig) -> Result<DocumentAdmission, HostedError> {
+    dispatch::preflight(host, config.native.run)?;
+    if !Arc::ptr_eq(host.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
+    let width = model.model_identity().group_width();
+    if planner.group_width() != width { return Err(HostedError::ModelIdentity); }
+    let identity = planner.base_execution_identity();
+    constrained_int4::check_model(identity, model.model_identity()).map_err(|_| HostedError::ModelIdentity)?;
+    let required = Int4MemoryRequirement::for_context(config.native.context_tokens, width).map_err(native_error)?;
+    validate(&config, identity, width, source.len(), required.kv_bytes)?;
+    let bytes = config.input_bytes(source.capacity(), planner.document_encoding())?;
+    let lease = host.resources().acquire_lease();
+    let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,
+        || Ok(ExtractionMapInput { source, planner, vocabulary, config }))?;
+    Ok(DocumentAdmission { input, required, lease })
+}
+
+/// The serial and fixed-team routes share planning, exact native task drivers,
+/// source-coordinate verification and the complete root-array reducer. The
+/// optional executor changes only projection scheduling and survives every
+/// chunk; it never creates another per-chunk budget or native engine.
+fn execute_document<'weights>(admission: DocumentAdmission, weights: &'weights Int4ModelWeights,
+    kernel: PackedInt4Kernel, control: &mut RunControl,
+    team: Option<&'weights mut (dyn Int4ProjectionExecutor + 'weights)>)
+    -> Result<HostedOutput<Int4ExtractionMapRun>, HostedError> {
+    let DocumentAdmission { input, required, lease } = admission;
+    let config = &input.value.config;
+    let width = weights.group_width();
+    poll(control)?;
+    let prepared = input.value.planner.plan_document_with_control(&input.value.source,
+        &config.request, config.limits, control).map_err(map_error)?;
+    let expected = prepared.preflight_metadata();
+    let count = expected.chunk_count();
+    if prepared.group_width() != width || expected.group_width() != width
+        || &prepared.document_encoding() != input.value.planner.document_encoding()
+        || &expected.document_encoding() != input.value.planner.document_encoding()
+        || prepared.execution_identities().len() != count
+        || required.kv_bytes > prepared.max_kv_bytes() {
+        return Err(HostedError::ModelIdentity);
+    }
+    let reduction = Pending::reserve(&lease, MemoryClass::JobBuffers, config.workspace_bytes(count)?)?;
+    let tokens = (count as u64).checked_mul(u64::from(config.request.budget.max_output_tokens))
+        .ok_or(HostedError::Limits("INT4 extraction map token arithmetic"))?;
+    let output = output_claim(&lease, prepared.max_result_bytes(), tokens)?;
+    let mut admitted = Vec::new();
+    admitted.try_reserve_exact(count).map_err(|_| map_error(Int4ExtractionMapError::Allocation))?;
+    for identity in prepared.execution_identities() {
+        poll(control)?;
+        constrained_int4::check_model(identity, weights.identity()).map_err(|_| HostedError::ModelIdentity)?;
+        check_identity(identity, width)?;
+        let base = input.value.planner.base_execution_identity();
+        if identity.tokenizer_digest != base.tokenizer_digest
+            || identity.template_digest != base.template_digest {
+            return Err(HostedError::ModelIdentity);
+        }
+        admitted.push(identity.clone());
+    }
+    poll(control)?;
+    let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
+    let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch,
+        sum(&[required.rope_bytes, required.scratch_payload_bound, config.native.allocator_reserve_bytes])?)?;
+    let mut engine = allocate_native(kv, scratch, || {
+        let engine = StrictInt4Engine::new(weights, config.native.context_tokens, Int4MemoryBudget {
+            max_kv_bytes: required.kv_bytes, max_rope_bytes: required.rope_bytes,
+            max_scratch_payload_bytes: required.scratch_payload_bound,
+        }).map_err(native_error)?.with_kernel(kernel);
+        match team {
+            Some(team) => engine.with_projection_executor(team).map_err(native_error),
+            None => Ok(engine),
+        }
+    })?;
+    let result = allocate(output, || {
+        let result = prepared.execute_with_control(&admitted, &mut engine.value,
+            &input.value.vocabulary, control).map_err(map_error)?;
+        expected.verify_completed(&result).map_err(map_error)?;
+        if engine.value.is_poisoned() || !engine.value.kv_cache().all_slots_have_len(0) {
+            return Err(map_error(Int4ExtractionMapError::Extraction(ExtractError::InvalidResult.into())));
+        }
+        poll(control)?;
+        Ok(result)
+    })?;
+    drop(engine);
+    drop(admitted);
+    drop(input);
+    drop(reduction);
+    drop(lease);
+    Ok(GuardedOutput::new(result.value, result._memory))
 }
 fn map_error(error: Int4ExtractionMapError) -> HostedError { HostedError::Int4(Int4HostError::ExtractionMap(error)) }
 fn check_identity(identity: &ExecutionIdentity, width: usize) -> Result<(), HostedError> {

@@ -38,6 +38,19 @@ fn host_uses_the_same_complete_pure_memory_quote_as_pre_io_callers() {
     let mut wrong = config; wrong.native.run.max_checkpoints = 1;
     assert!(wrong.requirements(32, request.budget).is_err());
 }
+
+#[test]
+fn document_team_keeps_one_native_cache_and_one_guarded_semantic_result() {
+    let (request, mut config) = fixture();
+    let native = config.requirements(32, request.budget).unwrap().native;
+    for chunks in [1, 8, 64] {
+        config.mapping.chunks.max_chunks = chunks;
+        assert_eq!(config.requirements(32, request.budget).unwrap().native, native);
+    }
+    fn send<T: Send + 'static>() {}
+    send::<HostedInt4TeamResult<Int4ClassificationMapRun>>();
+    let _entry = NlpEngine::map_int4_classify_with_threads;
+}
 #[test]
 fn complete_request_semantics_are_rejected_before_planner_or_model_work() {
     for field in 0..8 {
@@ -189,4 +202,5 @@ fn compact_encoder_workspace_is_reserved_once_for_serial_and_native_cohort_maps(
     assert!(config.cohort_requirements_with_encoding(32, request.budget, 1, 2, &invalid).is_err());
     let _serial = NlpEngine::map_int4_classify_with_encoding;
     let _cohorts = NlpEngine::map_int4_classify_cohorts_with_encoding;
+    let _team = NlpEngine::map_int4_classify_with_encoding_and_threads;
 }

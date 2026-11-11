@@ -87,6 +87,51 @@ impl NlpEngine {
         })
     }
 
+    /// Reuse one sealed row-projection team across the complete document and
+    /// all of its dimension heads. The serial planner, native work allowance,
+    /// chunk evidence and aggregate semantics remain the same.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_int4_sentiment_with_threads(&self, model: &ResidentInt4, request: SentimentRequest,
+        config: Int4SentimentMapHostConfig, kernel: PackedInt4Kernel, compute_threads: usize,
+        cancellation: CancellationToken) -> Result<HostedInt4TeamResult<Int4SentimentMapRun>, HostedError> {
+        dispatch::preflight_int4_team(self, config.native.run, compute_threads)?;
+        let (required, input_bytes) = admit(self, model, &request, config, None)?;
+        sum(&[required.workspace_bytes,
+            int4_task_team_workspace_bytes(compute_threads, model.model_identity().group_width())?])?;
+        let lease = self.resources().acquire_lease();
+        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, input_bytes)?,
+            || Ok(MapInput { request, config }))?;
+        let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
+        let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.workspace_bytes)?;
+        let output = Pending::reserve(&lease, MemoryClass::JobBuffers, required.output_reservation_bytes)?;
+        let model = model.clone();
+        dispatch::run_int4_team(self, config.native.run, cancellation, model.clone(), compute_threads,
+            kernel, move |weights, control, team| {
+                let input = input;
+                checkpoint(control)?;
+                let planner = planner(&model, &input.value)?;
+                let (prepared, admitted) = prepare(&planner, &model, &input.value, control)?;
+                let expected = prepared.preflight_metadata();
+                let mut engine = allocate_native(kv, scratch, || {
+                    StrictInt4Engine::new(weights, config.native.context_tokens, native_budget(required.native))
+                        .map_err(native_error)?.with_kernel(kernel)
+                        .with_projection_executor(team).map_err(native_error)
+                })?;
+                let result = allocate(output, || {
+                    let result = prepared.execute_with_control(&admitted, &mut engine.value,
+                        Int4ScoringBudget { native: Int4RunBudget::exact(prepared.planned_work()),
+                            max_kv_bytes: required.native.kv_bytes }, control).map_err(map_error)?;
+                    finish(&expected, &result, control)?;
+                    if engine.value.is_poisoned() || !engine.value.kv_cache().all_slots_have_len(0) {
+                        return Err(map_error(Int4SentimentMapError::Admission));
+                    }
+                    Ok(result)
+                })?;
+                drop(engine); drop(admitted); drop(prepared); drop(planner); drop(input); drop(lease);
+                Ok(HostedInt4TeamResult::new(GuardedOutput::new(result.value, result._memory), team.stats().into()))
+            })
+    }
+
     /// Share real decoder layers across finite cohorts of independent chunk
     /// axes. All exact ragged windows are admitted before the first forward;
     /// partial chunks, documents or aggregate outputs are never published.

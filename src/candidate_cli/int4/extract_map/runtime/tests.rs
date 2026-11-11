@@ -191,10 +191,10 @@ fn hosted_compact_repreparation_preserves_timeout_classification_after_physical_
             }), classified);
         }
     }
-    for error in [HostedError::ModelIdentity,
-        HostedError::Reservation(crate::ReservationError::ArithmeticOverflow),
-        HostedError::Int4(Int4HostError::ExtractionMap(Int4ExtractionMapError::WorkLimit))] {
-        assert_eq!(execution_error(error), CandidateError::Execution);
+    for (error, expected) in [(HostedError::ModelIdentity, CandidateError::Identity),
+        (HostedError::Reservation(crate::ReservationError::ArithmeticOverflow), CandidateError::Memory),
+        (HostedError::Int4(Int4HostError::ExtractionMap(Int4ExtractionMapError::WorkLimit)), CandidateError::Execution)] {
+        assert_eq!(execution_error(error), expected);
     }
 }
 
@@ -269,7 +269,7 @@ fn publication_preserves_independent_json_strings_and_original_coordinates() {
         evidence: "non_authoritative", model_id: "Nanbeige4.2-3B", source_revision: "fixture",
         source_root_sha256: "fixture-source", model_content_sha256: "fixture-model",
         candidate_format: INT4_SOURCE_FORMAT, quant_recipe: "fixture:group=32", group_width: 32,
-        integer_kernel: "s_scalar_i32", output: &output, snapshot: None, cohort_schedule: None,
+        integer_kernel: "s_scalar_i32", output: &output, snapshot: None, cohort_schedule: None, compute: None,
         root_array_union: None };
     let mut bytes = Vec::new(); publish(&response, 4096, &mut bytes).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -277,11 +277,144 @@ fn publication_preserves_independent_json_strings_and_original_coordinates() {
     assert_eq!(value["output"]["chunks"][1]["byte_start"], 10);
     assert_eq!(value["output"]["chunks"].as_array().unwrap().len(), 2);
     assert_eq!(value["evidence"], "non_authoritative");
-    for absent in ["source_dir", "source_manifest", "schema", "snapshot_path", "prompt_digest", "cohort_schedule", "root_array_union"] {
+    for absent in ["source_dir", "source_manifest", "schema", "snapshot_path", "prompt_digest", "cohort_schedule", "compute", "root_array_union"] {
         assert!(value.get(absent).is_none());
     }
     let mut refused = Vec::new(); assert!(publish(&response, 1, &mut refused).is_err());
     assert!(refused.is_empty());
+}
+
+#[test]
+fn physical_compute_receipt_is_additional_to_the_unchanged_complete_document() {
+    let output = serde_json::json!({"json":"{\"n\":12345678901234567890123456789012345678}",
+        "source_span":{"byte_start":0,"byte_end":24,"scalar_start":0,"scalar_end":16}});
+    let compute = Int4ComputeReceipt { schedule: "int4-output-row-team-v1", compute_threads: 4,
+        completed_projections: 600, completed_rows: 10000, completed_worker_rows: 7500 };
+    let mut response = SourceResponse { schema_version: 1, scope: "real-source-current-candidate-int4",
+        evidence: "non_authoritative", model_id: "Nanbeige4.2-3B", source_revision: "fixture",
+        source_root_sha256: "fixture-source", model_content_sha256: "fixture-model",
+        candidate_format: INT4_SOURCE_FORMAT, quant_recipe: "fixture:group=32", group_width: 32,
+        integer_kernel: "s_scalar_i32", output: &output, snapshot: None, cohort_schedule: None,
+        compute: None, root_array_union: None };
+    let serial = serde_json::to_value(&response).unwrap();
+    response.compute = Some(&compute);
+    let mut parallel = serde_json::to_value(&response).unwrap();
+    assert_eq!(parallel.as_object_mut().unwrap().remove("compute").unwrap(), serde_json::to_value(compute).unwrap());
+    assert_eq!(parallel, serial);
+}
+
+#[test]
+fn document_execution_retains_deadline_identity_and_memory_errors_at_cli_boundary() {
+    use crate::{hosted::RunStop, native_engine::constrained::JsonDecodeError, tasks::extract::ExtractError};
+    for cause in [DecodeCancellationKind::Deadline, DecodeCancellationKind::Timeout,
+        DecodeCancellationKind::User, DecodeCancellationKind::PollQuota] {
+        let expected = if matches!(cause, DecodeCancellationKind::Deadline | DecodeCancellationKind::Timeout) {
+            CandidateError::Timeout
+        } else { CandidateError::Execution };
+        let stop = HostedError::Stopped { stop: RunStop { kind: cause,
+            runtime_reason: None, runtime_checkpoint_error: None }, task_error: None };
+        assert_eq!(execution_error(stop), expected);
+        let nested = HostedError::Int4(Int4HostError::ExtractionMap(
+            Int4ExtractionMapError::Extraction(ExtractError::Decode(JsonDecodeError::Cancelled(cause)).into())));
+        assert_eq!(execution_error(nested), expected);
+    }
+    assert_eq!(execution_error(HostedError::ModelIdentity), CandidateError::Identity);
+    assert_eq!(execution_error(HostedError::ResourceDomain), CandidateError::Identity);
+    let error = crate::ReservationError::CapacityExceeded {
+        requested_bytes: 10, available_bytes: 1, ceiling_bytes: 10,
+    };
+    assert_eq!(execution_error(HostedError::Reservation(error)), CandidateError::Memory);
+}
+
+#[test]
+#[ignore = "run alone with controller-admitted INT4 snapshot, independent pin and real complete-document inference"]
+fn document_teams_match_serial_selected_rows_source_lineage_and_exact_array_union() {
+    let snapshot = std::env::var("FNLP_INT4_PREFILL_SNAPSHOT").expect("explicit existing snapshot required");
+    let pin = std::env::var("FNLP_INT4_PREFILL_MODEL_SHA256").expect("independent model-content pin required");
+    let memory = std::env::var("FNLP_INT4_TEST_MEMORY_MIB").expect("explicit memory ceiling required");
+    let source = "é Alice\n".repeat(6);
+    let schema = r#"{"type":"array","minItems":1,"maxItems":1,"items":{"type":"string","maxLength":5,"const":"Alice","x-fnlp-source":"verbatim"}}"#;
+    let command = |threads: usize, selected: bool| {
+        let threads = threads.to_string();
+        let mut argv = vec!["candidate", "source-int4", "extract-map", "--snapshot", &snapshot,
+            "--expected-model-sha256", &pin, "--memory-mib", &memory,
+            "--schema", "controller-inline-schema.json", "--source-membership", "--root-array-union",
+            "--context-tokens", "1024", "--max-new-tokens", "32", "--max-chunk-bytes", "9",
+            "--compute-threads", &threads, "--timeout-seconds", "86400"];
+        if selected { argv.extend(["--max-selected-rows", "166144"]); }
+        let matches = crate::candidate_cli::definition().try_get_matches_from(argv).unwrap();
+        let CandidateCommand::SourceInt4(command) = CandidateCommand::from_matches(&matches).unwrap()
+            else { panic!("explicit document extraction required"); };
+        command
+    };
+    let base = command(1, false);
+    let Int4Task::ExtractMap(options) = &base.task else { panic!("map arguments required"); };
+    let common = options.validate(&base.args).unwrap().common;
+    let mut resource = compute::resource_config(common);
+    resource.scoped_cpu_children_per_coordinator = 3;
+    resource.thread_ceiling = 5;
+    assert!(crate::installed_process_resources().is_none(), "model gate requires its own fresh process");
+    let engine = NlpEngine::builder().resource_config(resource).build().unwrap();
+    let idle = engine.resources().memory_snapshot();
+    let lease = engine.resources().acquire_lease();
+    let preparation = lease.reserve(MemoryClass::JobBuffers, common.preparation_bytes).unwrap().commit().unwrap();
+    let model = super::super::super::runtime::load_model(&engine, &base.args, common,
+        Duration::from_secs(3600), CancellationToken::default()).unwrap();
+    let resident = engine.resources().memory_snapshot();
+    let controls = pinned_controls::pinned().unwrap();
+    let vocabulary = Arc::new(ExtractionVocabulary::pinned(controls.template_controls()).unwrap());
+    for selected in [false, true] {
+        let mut expected_value = None;
+        for threads in [1, 2, 4] {
+            let command = command(threads, selected);
+            let Int4Task::ExtractMap(options) = command.task else { panic!("map task required"); };
+            let limits = options.validate(&command.args).unwrap();
+            let common = limits.common;
+            let budget = options.extraction.budget(&command.args, common);
+            let request = options.request(schema.to_owned(), budget).unwrap();
+            let planner = Int4ExtractionBatchPlanner::for_model(model.model_identity(), budget,
+                options.extraction.compiler(), options.extraction.source_limits(), None).unwrap();
+            let planner = Arc::new(options.extraction.configure_planner(planner).unwrap());
+            let expected = planner.plan_document_with_control(&source, &request, limits.mapping,
+                &mut continuing()).unwrap().preflight_metadata();
+            assert!(expected.chunk_count() > 1);
+            let config = Int4ExtractionMapConfig { request, limits: limits.mapping,
+                native: NativeLimits { context_tokens: command.args.context_tokens,
+                    allocator_reserve_bytes: ALLOCATOR_BYTES,
+                    run: RunLimits { max_elapsed: Duration::from_secs(86_400),
+                        max_checkpoints: command.args.max_checkpoints, cleanup_reserve_bytes: CLEANUP_BYTES } },
+                preparation_reserve_bytes: common.preparation_bytes,
+                reduction_reserve_bytes: limits.reduction_reserve_bytes };
+            let output = if threads == 1 {
+                compute::Completion::serial(engine.extract_int4_document(&model, source.clone(), planner,
+                    Arc::clone(&vocabulary), config, common.kernel, CancellationToken::default()).unwrap())
+            } else {
+                compute::Completion::Team(engine.extract_int4_document_with_threads(&model, source.clone(), planner,
+                    Arc::clone(&vocabulary), config, common.kernel, threads, CancellationToken::default()).unwrap())
+            };
+            expected.verify_completed(output.result()).unwrap();
+            let value = serde_json::to_value(output.result()).unwrap();
+            assert_eq!(value["mapped"]["root"]["source_span"]["byte_end"], source.len());
+            assert_eq!(value["mapped"]["root"]["source_span"]["scalar_end"], source.chars().count());
+            assert!(value["root_array_union"].is_object());
+            if let Some(expected) = &expected_value { assert_eq!(&value, expected); }
+            else { expected_value = Some(value); }
+            if threads > 1 {
+                let physical = output.compute().expect("completed team receipt required");
+                assert_eq!(physical.compute_threads, threads);
+                assert!(physical.completed_worker_rows > 0);
+                assert!(physical.completed_rows > physical.completed_worker_rows);
+                assert!(physical.completed_projections > expected.chunk_count() as u64);
+            } else { assert!(output.compute().is_none()); }
+            drop(output);
+            assert_eq!(engine.resources().memory_snapshot(), resident);
+        }
+    }
+    drop(vocabulary);
+    drop(model);
+    drop(preparation);
+    drop(lease);
+    assert_eq!(engine.resources().memory_snapshot(), idle);
 }
 
 #[test]

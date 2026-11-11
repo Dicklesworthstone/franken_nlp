@@ -29,6 +29,46 @@ impl Write for NoWrite {
 }
 
 #[test]
+fn complete_sentiment_team_preserves_axis_authority_and_prices_worker_storage_once() {
+    let serial = command(&[]);
+    let serial_options = selected(&serial);
+    let base = serial_options.validate_with_threads(&serial.args).unwrap();
+    for threads in [2, 3, 8, 64] {
+        let width = threads.to_string();
+        let command = command(&["--compute-threads", &width]);
+        let options = selected(&command);
+        let limits = options.validate_with_threads(&command.args).unwrap();
+        assert_eq!(limits.common.compute.threads, threads);
+        assert_eq!(limits.common.compute.workspace_bytes,
+            crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(threads, command.args.group_width).unwrap());
+        assert_eq!(limits.memory, base.memory);
+        assert_eq!(limits.mapping.chunks, base.mapping.chunks);
+        assert_eq!(limits.mapping.max_model_work, base.mapping.max_model_work);
+        assert_eq!(options.budget(limits.common).unwrap(), serial_options.budget(base.common).unwrap());
+        let execution = limits.memory.native.kv_bytes + limits.memory.input_bytes
+            + limits.memory.workspace_bytes + limits.memory.output_reservation_bytes
+            + limits.common.compute.workspace_bytes;
+        assert!(limits.common.minimum_memory_bytes >= limits.cli_preparation_bytes
+            + limits.common.load.weight_payload_bytes + ALLOCATOR_BYTES + execution + CLEANUP_BYTES);
+        assert!(options.validate(&command.args).is_err(), "corpus/job admission remains serial or cohort");
+    }
+}
+
+#[test]
+fn complete_sentiment_team_refuses_invalid_widths_and_conflicting_schedules_before_io() {
+    for flags in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+        vec!["--compute-threads", "2", "--cohort-chunks", "1"]] {
+        assert_eq!(command(&flags).execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+    }
+    let mut short = command(&["--compute-threads", "2"]); short.args.memory_mib = 1;
+    assert_eq!(short.execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+    let explicit_serial = command(&["--compute-threads", "1", "--cohort-chunks", "2"]);
+    assert!(selected(&explicit_serial).validate_with_threads(&explicit_serial.args).is_ok());
+    assert!(!corpus::definition().get_arguments().any(|arg| arg.get_id() == "compute_threads"));
+    assert!(!job::definition().get_arguments().any(|arg| arg.get_id() == "compute_threads"));
+}
+
+#[test]
 fn map_dispatch_has_explicit_source_or_pinned_snapshot_and_distinct_workflow() {
     let original = command(&[]); let options = selected(&original);
     let limits = options.validate(&original.args).unwrap();

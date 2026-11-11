@@ -94,7 +94,8 @@ For example, add these options to the pinned snapshot invocation above:
 ```
 
 Both pinned source inference and independently pinned snapshot reload support
-compact maps, with serial or `--cohort-chunks` execution. The compact policy
+compact maps, with serial, `--cohort-chunks` or `--compute-threads` execution.
+Chunk cohorts and CPU teams are separate scheduling selections. The compact policy
 does not normalize, truncate or rewrite source text. Token decoding must
 reconstruct the original bytes, and source/label tokens cannot be template
 control IDs. Literal marker text remains data. These guarantees concern the
@@ -143,6 +144,36 @@ plan again during hosted inference and renew tokenizer work. Use an already
 pinned snapshot or pinned source inference without saving on this route.
 `classify-corpus` and `classify-document-job` retain their byte-only contracts;
 compact encoding and its extra work flags are not accepted there.
+
+## Persistent CPU teams
+
+Add `--compute-threads 4` to `classify-map` to keep one coordinator and three
+row-projection workers across the complete document, including every label
+head and chunk. The runtime thread is additional. Worker scratch is admitted
+once before input or model IO, and the fixed team joins before the complete
+guarded result is returned. The equivalent library entry point is
+`NlpEngine::map_int4_classify_with_threads`.
+
+The team also accepts `--input-encoding safe-bpe-v1`. One compact-tokenizer
+workspace and one worker workspace are admitted together; source and label
+encoding still spend the complete operation's original tokenizer allowance.
+Hosted callers select that combination with
+`NlpEngine::map_int4_classify_with_encoding_and_threads`. The compact
+snapshot-save restriction continues to apply.
+
+The semantic `output`, request identity, chunk evidence, probability spaces,
+aggregate and whole-document native work limits use the ordinary serial path.
+A separate top-level `compute` receipt records the selected width and actual
+completed projection/row counters. The default width of one retains the
+existing output envelope. This scheduling option does not establish a measured
+speedup or model-parity result; its regression tests await the required DSR
+checkpoint and model-present comparison.
+
+The width must be between 1 and 64. More than one compute thread cannot combine
+with `--cohort-chunks`, `--cohort-heads` or `--prefill-rows`. The corpus and durable
+job commands keep their existing serial/cohort schedules and do not expose this
+option. Each independent head still has its own causal context and full
+vocabulary denominator; worker count never multiplies its logical work budget.
 
 ## Serial and native cohort execution
 

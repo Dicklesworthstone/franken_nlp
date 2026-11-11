@@ -61,6 +61,25 @@ is the default. Unsupported selections refuse without a fallback.
 
 ## Partition and native scoring
 
+The one-document `sentiment-map` command accepts `--compute-threads N` to keep
+one output-row team across every chunk and sentiment axis. The width includes
+the coordinator and must be 1 through 64; the runtime thread is additional.
+Worker storage is admitted once before input or model IO, and all workers join
+before the complete guarded output is returned. Library callers use
+`NlpEngine::map_int4_sentiment_with_threads` with the same host envelope.
+
+The complete semantic result, task identity, source partition, score spaces,
+aggregation and whole-document work ceilings use the existing serial path.
+An explicit team adds a separate `compute` receipt with its width and completed
+projection/row counters. Width one preserves the existing response. No measured
+throughput or model parity is claimed by this integration; the new regressions
+remain pending the required DSR and model-present checkpoints.
+
+Teams with more than one compute thread cannot combine with `--cohort-chunks`,
+`--cohort-heads` or `--prefill-rows`. Corpus and retained-job commands keep their
+existing schedules. Cancellation and errors retain the same typed failure and
+publish no partial document.
+
 Chunks form a disjoint, complete partition in original source order. Every
 boundary is a UTF-8 boundary, with both byte and Unicode scalar coordinates.
 There is no overlap weighting, normalization, truncation or sentence-boundary

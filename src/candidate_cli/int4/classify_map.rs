@@ -80,6 +80,15 @@ pub(super) fn one_off_definition() -> clap::Command {
         .after_long_help("--input-encoding safe-bpe-v1 uses actual compact source-token counts when choosing chunks. Label-capacity preparation, every attempted chunk (including oversized probes) and all final chunk/label plans spend one shared tokenizer allowance. --max-tokenizer-input-bytes and --max-tokenizer-output-tokens default to 1048576 each; pair checks and examined pair bytes use their explicit shared flags. Exhaustion refuses the complete document before any native forward. Context, source bytes, native work, output and memory retain separate ceilings. Compact output includes the exact policy and consumed tokenizer work. Compact maps accept pinned sources or snapshot reload but refuse --save-snapshot, whose separate pre-save planning would repeat tokenizer work. The byte-fallback default, classify-corpus and classify-document-job retain their existing contracts.")
 }
 
+/// Only the complete one-document command owns a persistent row team. Its
+/// explicit input policy and tokenizer allowance remain independent of width.
+pub(super) fn threaded_definition() -> clap::Command {
+    let command = one_off_definition();
+    let encoding_help = command.get_after_long_help().map(|help| help.to_string()).unwrap_or_default();
+    compute::definition(command).after_long_help(format!(
+        "{encoding_help}\n\n--compute-threads N keeps one admitted output-row team across every chunk and label head. It supports byte-fallback and safe-bpe-v1 with the same complete-document tokenizer and native work ceilings. Actual projection counters are reported separately in compute. Cannot combine with --cohort-chunks; corpus and durable-job routes retain their existing schedules."))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct MapLimits {
     pub common: Int4Limits,
@@ -98,16 +107,22 @@ impl MapArgs {
             } else { MapEncodingArgs::default() } })
     }
     pub(super) fn validate(self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
+        if args.compute.threads() != 1 { return Err(CandidateError::Arguments); }
         self.validate_encoding(args, 128)
     }
     /// A live corpus may narrow label authority for every default and override.
     /// Existing one-off and durable workflows keep their original ceiling.
     pub(super) fn validate_with_max_labels(self, args: &Int4Args, max_labels: usize)
         -> Result<MapLimits, CandidateError> {
-        if !args.input_encoding.is_default() || self.encoding != MapEncodingArgs::default() {
+        if args.compute.threads() != 1 || !args.input_encoding.is_default()
+            || self.encoding != MapEncodingArgs::default() {
             return Err(CandidateError::Arguments);
         }
         self.validate_encoding(args, max_labels)
+    }
+    fn validate_with_threads(self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
+        if args.compute.threads() == 1 { self.validate(args) }
+        else { self.validate_encoding(args, 128) }
     }
     fn input_encoding(self, args: &Int4Args) -> Result<UntrustedEncoding, CandidateError> {
         if args.input_encoding.is_default() && self.encoding != MapEncodingArgs::default() {
@@ -119,7 +134,8 @@ impl MapArgs {
     }
     fn validate_encoding(self, args: &Int4Args, max_labels: usize) -> Result<MapLimits, CandidateError> {
         if !(1..=128).contains(&max_labels) { return Err(CandidateError::Arguments); }
-        if args.prefill()?.is_some() || args.compute.threads() != 1 || self.scoring.cohort_head_limit().is_some() {
+        if args.prefill()?.is_some() || self.scoring.cohort_head_limit().is_some()
+            || (args.compute.threads() != 1 && self.mapping.cohort_chunks.is_some()) {
             return Err(CandidateError::Arguments);
         }
         let encoding = self.input_encoding(args)?;
@@ -176,7 +192,7 @@ impl MapArgs {
             else { sum(&[common.source_preparation_bytes, common.load.scratch_payload_bytes])? };
         let saving = if args.save_snapshot.is_some() { common.snapshot_need.scratch_bytes } else { 0 };
         let execution = sum(&[memory.native.kv_bytes, memory.input_bytes,
-            memory.workspace_bytes, memory.output_reservation_bytes])?;
+            memory.workspace_bytes, memory.output_reservation_bytes, common.compute.workspace_bytes])?;
         common.minimum_memory_bytes = sum(&[cli_preparation_bytes, resident,
             loading.max(saving).max(execution), CLEANUP_BYTES])?;
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
@@ -214,7 +230,7 @@ impl MapArgs {
     }
     pub(super) fn execute(self, args: Int4Args, input: &mut impl Read, output: &mut impl Write)
         -> Result<(), CandidateError> {
-        let limits = self.validate(&args)?;
+        let limits = self.validate_with_threads(&args)?;
         #[cfg(feature = "asupersync-runtime")]
         { runtime::execute(args, self, limits, input, output) }
         #[cfg(not(feature = "asupersync-runtime"))]

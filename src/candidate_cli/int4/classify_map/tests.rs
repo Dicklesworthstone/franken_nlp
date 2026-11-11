@@ -34,6 +34,77 @@ impl Write for NoWrite {
 }
 
 #[test]
+fn document_team_preserves_task_limits_and_admits_one_additional_worker_workspace() {
+    let serial = command(&[]);
+    let serial_options = selected(&serial);
+    let base = serial_options.validate_with_threads(&serial.args).unwrap();
+    for threads in [2, 3, 8, 64] {
+        let width = threads.to_string();
+        let command = command(&["--compute-threads", &width]);
+        let options = selected(&command);
+        let limits = options.validate_with_threads(&command.args).unwrap();
+        assert_eq!(limits.common.compute.threads, threads);
+        assert_eq!(limits.common.compute.workspace_bytes,
+            crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(threads, command.args.group_width).unwrap());
+        assert_eq!(limits.memory, base.memory);
+        assert_eq!(limits.mapping.chunks, base.mapping.chunks);
+        assert_eq!(limits.mapping.max_model_work, base.mapping.max_model_work);
+        assert_eq!(options.budget(limits.common, limits.planning.max_labels).unwrap(),
+            serial_options.budget(base.common, base.planning.max_labels).unwrap());
+        let execution = limits.memory.native.kv_bytes + limits.memory.input_bytes
+            + limits.memory.workspace_bytes + limits.memory.output_reservation_bytes
+            + limits.common.compute.workspace_bytes;
+        assert!(limits.common.minimum_memory_bytes >= limits.cli_preparation_bytes
+            + limits.common.load.weight_payload_bytes + ALLOCATOR_BYTES + execution + CLEANUP_BYTES);
+        assert!(options.validate(&command.args).is_err(), "durable/shared callers remain explicit");
+    }
+}
+
+#[test]
+fn compact_document_teams_preserve_one_tokenizer_allowance_and_price_both_workspaces() {
+    let flags = ["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "262144",
+        "--max-tokenizer-output-tokens", "131072", "--max-tokenizer-pair-checks", "33554432",
+        "--max-tokenizer-pair-bytes", "268435456"];
+    let serial = command(&flags); let serial_options = selected(&serial);
+    let base = serial_options.validate(&serial.args).unwrap();
+    let encoding = serial_options.input_encoding(&serial.args).unwrap();
+    for threads in [2, 4] {
+        let width = threads.to_string();
+        let mut flags = flags.to_vec(); flags.extend(["--compute-threads", &width]);
+        let parallel = command(&flags); let options = selected(&parallel);
+        let limits = options.validate_with_threads(&parallel.args).unwrap();
+        assert_eq!(options.input_encoding(&parallel.args).unwrap(), encoding);
+        assert_eq!(limits.memory, base.memory);
+        assert_eq!(limits.mapping.chunks, base.mapping.chunks);
+        assert_eq!(limits.mapping.max_model_work, base.mapping.max_model_work);
+        assert_eq!(options.budget(limits.common, limits.planning.max_labels).unwrap(),
+            serial_options.budget(base.common, base.planning.max_labels).unwrap());
+        let extra = crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(
+            threads, parallel.args.group_width).unwrap();
+        assert_eq!(limits.common.compute.workspace_bytes, extra);
+        assert_eq!(limits.common.minimum_memory_bytes, base.common.minimum_memory_bytes + extra);
+        assert!(options.validate_with_max_labels(&parallel.args, 4).is_err());
+    }
+    for extra in [vec!["--cohort-chunks", "1"], vec!["--save-snapshot", "must-not-create.snapshot"]] {
+        let mut flags = flags.to_vec(); flags.extend(["--compute-threads", "2"]); flags.extend(extra);
+        assert_eq!(command(&flags).execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+    }
+}
+
+#[test]
+fn invalid_document_team_and_cohort_composition_refuse_before_input_or_model_io() {
+    for flags in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+        vec!["--compute-threads", "2", "--cohort-chunks", "1"]] {
+        assert_eq!(command(&flags).execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+    }
+    let mut short = command(&["--compute-threads", "2"]); short.args.memory_mib = 1;
+    assert_eq!(short.execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
+    let explicit_serial = command(&["--compute-threads", "1", "--cohort-chunks", "2"]);
+    assert!(selected(&explicit_serial).validate_with_threads(&explicit_serial.args).is_ok());
+    assert!(!corpus::definition().get_arguments().any(|arg| arg.get_id() == "compute_threads"));
+}
+
+#[test]
 fn source_and_independently_pinned_snapshot_select_the_complete_document_route() {
     let original = command(&[]); let options = selected(&original);
     let limits = options.validate(&original.args).unwrap();

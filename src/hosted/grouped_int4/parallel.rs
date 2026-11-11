@@ -31,6 +31,9 @@ pub struct HostedInt4TeamResult<T> {
     compute: Int4ComputeReceipt,
 }
 impl<T> HostedInt4TeamResult<T> {
+    pub(in crate::hosted::grouped_int4) fn new(output: HostedOutput<T>, compute: Int4ComputeReceipt) -> Self {
+        Self { output, compute }
+    }
     pub fn result(&self) -> &T { self.output.result() }
     pub fn compute(&self) -> &Int4ComputeReceipt { &self.compute }
 }

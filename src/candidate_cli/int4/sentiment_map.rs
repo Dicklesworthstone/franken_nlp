@@ -59,6 +59,13 @@ pub(super) fn definition() -> clap::Command {
         .mut_arg("max_checkpoints", |arg| arg.help("Cooperative allowance for the complete hosted plan, all chunks and reduction")))
 }
 
+/// Keep numerical teams opt-in on the one-document route; definitions reused
+/// by corpora and retained jobs do not acquire an unwired compute flag.
+pub(super) fn threaded_definition() -> clap::Command {
+    compute::definition(definition()).after_long_help(
+        "--compute-threads N keeps one admitted output-row team across every chunk and sentiment axis. The complete semantic result and whole-document work ceilings are unchanged. Actual projection counters are reported separately in compute. Cannot combine with --cohort-chunks; corpus and durable-job routes retain their existing schedules.")
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct MapLimits {
     pub common: Int4Limits,
@@ -79,8 +86,20 @@ impl MapArgs {
     /// Corpus callers can narrow every document's declared axis capability.
     /// One-off maps continue to admit their original four-axis request space.
     fn validate_with_max_axes(self, args: &Int4Args, max_axes: usize) -> Result<MapLimits, CandidateError> {
-        if !(1..=4).contains(&max_axes) { return Err(CandidateError::Arguments); }
-        let mut common = self.scoring.validate(args)?;
+        if args.compute.threads() != 1 { return Err(CandidateError::Arguments); }
+        self.validate_document(args, max_axes)
+    }
+    fn validate_with_threads(self, args: &Int4Args) -> Result<MapLimits, CandidateError> {
+        if args.compute.threads() == 1 { self.validate(args) }
+        else { self.validate_document(args, 4) }
+    }
+    fn validate_document(self, args: &Int4Args, max_axes: usize) -> Result<MapLimits, CandidateError> {
+        if !(1..=4).contains(&max_axes) || !args.input_encoding.is_default()
+            || args.prefill()?.is_some() || self.scoring.cohort_head_limit().is_some()
+            || (args.compute.threads() != 1 && self.mapping.cohort_chunks.is_some()) {
+            return Err(CandidateError::Arguments);
+        }
+        let mut common = self.scoring.validate_one_off_with_prefill(args)?;
         let m = self.mapping;
         if args.max_input_bytes < 4 || !(1..=256).contains(&m.max_chunks)
             || !(1..=1_000_000).contains(&m.max_tokenizer_calls)
@@ -121,7 +140,7 @@ impl MapArgs {
             else { sum(&[common.source_preparation_bytes, common.load.scratch_payload_bytes])? };
         let saving = if args.save_snapshot.is_some() { common.snapshot_need.scratch_bytes } else { 0 };
         let execution = sum(&[memory.native.kv_bytes, memory.input_bytes,
-            memory.workspace_bytes, memory.output_reservation_bytes])?;
+            memory.workspace_bytes, memory.output_reservation_bytes, common.compute.workspace_bytes])?;
         common.minimum_memory_bytes = sum(&[cli_preparation_bytes, resident,
             loading.max(saving).max(execution), CLEANUP_BYTES])?;
         if common.minimum_memory_bytes > common.memory_bytes { return Err(CandidateError::Arguments); }
@@ -149,7 +168,7 @@ impl MapArgs {
     }
     pub(super) fn execute(self, args: Int4Args, input: &mut impl Read, output: &mut impl Write)
         -> Result<(), CandidateError> {
-        let limits = self.validate(&args)?;
+        let limits = self.validate_with_threads(&args)?;
         #[cfg(feature = "asupersync-runtime")]
         { runtime::execute(args, self, limits, input, output) }
         #[cfg(not(feature = "asupersync-runtime"))]

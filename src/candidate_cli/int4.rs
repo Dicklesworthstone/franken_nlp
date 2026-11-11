@@ -208,10 +208,10 @@ pub(super) fn definition() -> clap::Command {
         .subcommand(compute::definition(input_encoding::definition(task("chat", "Complete a bounded JSON system/user/assistant transcript"))))
         .subcommand(stream::definition())
         .subcommand(compute::definition(input_encoding::definition(classify::prefill_definition(classify::definition()))))
-        .subcommand(classify_map::one_off_definition())
+        .subcommand(classify_map::threaded_definition())
         .subcommand(classify_map::corpus::definition())
         .subcommand(compute::definition(input_encoding::definition(sentiment::definition())))
-        .subcommand(sentiment_map::definition())
+        .subcommand(sentiment_map::threaded_definition())
         .subcommand(sentiment_map::corpus::definition())
         .subcommand(sentiment_map::job::definition())
         .subcommand(compute::definition(judge::definition()))
@@ -233,7 +233,7 @@ pub(super) fn definition() -> clap::Command {
         .subcommands(source_semantic::definitions())
         .subcommand(compute::definition(extract_batch::definition()))
         .subcommand(extract_job::definition())
-        .subcommand(extract_map::definition())
+        .subcommand(extract_map::threaded_definition())
         .subcommand(extract_map::object::definition())
         .subcommand(extract_map::corpus::definition())
         .subcommand(extract_document_job::definition())
@@ -383,7 +383,8 @@ impl Int4Command {
         }
         if matches!(name, "generate" | "chat" | "classify" | "sentiment" | "judge" | "extract"
             | "ner" | "keyphrases" | "summarize" | "answer" | "score-batch" | "extract-batch"
-            | "ner-batch" | "keyphrases-batch" | "summarize-batch" | "answer-batch") {
+            | "ner-batch" | "keyphrases-batch" | "summarize-batch" | "answer-batch"
+            | "classify-map" | "sentiment-map" | "extract-map") {
             args.compute = compute::Args::from_matches(matches)?;
         }
         Ok(Self { task, args, batch: None, job: None })

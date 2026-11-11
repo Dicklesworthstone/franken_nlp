@@ -22,10 +22,86 @@ impl Read for NoRead {
 }
 
 #[test]
+fn document_teams_admit_one_extra_workspace_without_changing_semantic_limits() {
+    for (selected, compact) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut flags = vec!["--root-array-union", "--source-membership"];
+        if selected { flags.extend(["--max-selected-rows", "166144"]); }
+        if compact { flags.extend(["--input-encoding", "safe-bpe-v1"]); }
+        let (serial, mut serial_args) = arguments(&flags);
+        serial_args.memory_mib = 262_144;
+        let baseline = serial.validate(&serial_args).unwrap();
+        for threads in [2, 3, 4, 64] {
+            let value = threads.to_string();
+            let mut flags = flags.clone(); flags.extend(["--compute-threads", &value]);
+            let (parallel, mut args) = arguments(&flags); args.memory_mib = 262_144;
+            let quoted = parallel.validate(&args).unwrap();
+            let extra = crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(
+                threads, args.group_width).unwrap();
+            assert_eq!(quoted.common.compute.threads, threads);
+            assert_eq!(quoted.common.compute.workspace_bytes, extra);
+            assert_eq!(quoted.common.minimum_memory_bytes, baseline.common.minimum_memory_bytes + extra);
+            assert_eq!(quoted.mapping.mapping.chunks, baseline.mapping.mapping.chunks);
+            assert_eq!(quoted.mapping.mapping.reduction, baseline.mapping.mapping.reduction);
+            assert_eq!(quoted.mapping.mapping.max_model_work, baseline.mapping.mapping.max_model_work);
+            assert_eq!(quoted.mapping.mapping.mask_limits.max_trie_node_visits,
+                baseline.mapping.mapping.mask_limits.max_trie_node_visits);
+            assert_eq!(quoted.mapping.mapping.mask_limits.checkpoint_interval_nodes,
+                baseline.mapping.mapping.mask_limits.checkpoint_interval_nodes);
+            assert_eq!(quoted.mapping.mapping.mask_visits_per_chunk, baseline.mapping.mapping.mask_visits_per_chunk);
+            assert_eq!(quoted.mapping.mapping.max_mask_visits, baseline.mapping.mapping.max_mask_visits);
+            assert_eq!(quoted.mapping.verification, baseline.mapping.verification);
+            assert_eq!(quoted.mapping.root_array_union, baseline.mapping.root_array_union);
+            assert_eq!(quoted.workspace_bytes, baseline.workspace_bytes);
+            assert_eq!(quoted.common.native, baseline.common.native);
+            assert_eq!(quoted.max_result_bytes, baseline.max_result_bytes);
+            assert_eq!(parallel.encoding.policy().unwrap(), serial.encoding.policy().unwrap());
+            assert!(args.input_encoding.is_default());
+            assert!(quoted.cohort.is_none());
+            assert_eq!(parallel.extraction.budget(&args, quoted.common),
+                serial.extraction.budget(&serial_args, baseline.common));
+        }
+    }
+}
+
+#[test]
+fn document_team_mixtures_and_unfunded_workspace_refuse_before_private_io() {
+    for flags in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+        vec!["--compute-threads", "18446744073709551615"],
+        vec!["--compute-threads", "2", "--cohort-chunks", "1"],
+        vec!["--compute-threads", "4", "--cohort-chunks", "4"]] {
+        let mut command = command(&flags); command.args.memory_mib = 262_144;
+        assert_eq!(command.execute(&mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+    }
+    let (map, mut args) = arguments(&["--compute-threads", "4"]);
+    args.memory_mib = 262_144;
+    let quoted = map.validate(&args).unwrap();
+    args.memory_mib = quoted.common.minimum_memory_bytes.div_ceil(MIB) - 1;
+    assert_eq!(map.execute(args, &mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
+}
+
+#[test]
+fn complete_document_teams_do_not_silently_enable_population_or_job_schedules() {
+    assert!(threaded_definition().get_arguments().any(|arg| arg.get_id() == "compute_threads"));
+    for command in [definition(), corpus_definition(), document_job_definition(), object::definition()] {
+        assert!(!command.get_arguments().any(|arg| arg.get_id() == "compute_threads"));
+    }
+    for flags in [&["--compute-threads", "2"][..],
+        &["--compute-threads", "2", "--input-encoding", "safe-bpe-v1"][..]] {
+        let (map, mut args) = arguments(flags);
+        args.memory_mib = 262_144;
+        assert!(map.validate(&args).is_ok());
+        assert!(matches!(map.validate_document_job(&args), Err(CandidateError::Arguments)));
+        assert!(matches!(map.validate_corpus(&args), Err(CandidateError::Arguments)));
+    }
+}
+
+#[test]
 fn compact_document_encoding_is_explicit_and_admits_transient_workspace_before_input() {
     use crate::tokenizer::untrusted::{SafeBpeLimits, UntrustedEncoding};
     for schedule in [&[][..], &["--cohort-chunks", "3", "--max-selected-rows", "32"][..],
-        &["--source-membership", "--root-array-union"][..]] {
+        &["--source-membership", "--root-array-union"][..],
+        &["--compute-threads", "4"][..],
+        &["--compute-threads", "4", "--max-selected-rows", "32", "--source-membership", "--root-array-union"][..]] {
         let (plain, mut args) = arguments(schedule);
         args.memory_mib = 262_144;
         let mut flags = schedule.to_vec(); flags.extend(["--input-encoding", "safe-bpe-v1"]);
@@ -403,7 +479,8 @@ fn native_group_partition_is_explicit_and_free_text_controls_cannot_leak() {
 #[cfg(not(feature = "asupersync-runtime"))]
 #[test]
 fn unavailable_runtime_never_opens_source_schema_or_model() {
-    for flags in [&[][..], &["--cohort-chunks", "1"][..], &["--cohort-chunks", "4"][..]] {
+    for flags in [&[][..], &["--cohort-chunks", "1"][..], &["--cohort-chunks", "4"][..],
+        &["--compute-threads", "2"][..], &["--compute-threads", "4", "--root-array-union"][..]] {
         let mut command = command(flags); command.args.memory_mib = 262_144;
         let mut output = Vec::new();
         assert_eq!(command.execute(&mut NoRead, &mut output), Err(CandidateError::Unavailable));
