@@ -52,6 +52,11 @@ pub(super) fn document_output_bytes(mapping: Int4SentimentMapLimits, cohort_chun
 
 struct StreamInput<R, W> { planner: Option<Int4SentimentDocumentBatchPlanner>, reader: R, writer: W }
 
+struct DeferredSentimentStream<R, W> {
+    completion: stream::deferred::DeferredCompletion,
+    input: Charged<StreamInput<R, W>>,
+}
+
 impl NlpEngine {
     /// Stream complete original sources under one resident model, deadline and
     /// five-axis work ledger. Every axis and chunk completes before one result
@@ -66,7 +71,35 @@ impl NlpEngine {
         planner: Int4SentimentDocumentBatchPlanner, limits: CorpusLimits, kernel: PackedInt4Kernel,
         reader: R, writer: W, cancellation: CancellationToken) -> Result<BatchSummary, HostedError>
     where R: BufRead + Send + 'static, W: Write + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
+        self.run_int4_sentiment_documents(model, planner, limits, kernel, None,
+            reader, writer, cancellation)
+    }
+
+    /// Keep one persistent numerical row team across every axis, chunk and
+    /// original document. The same planner, policy and complete-map finalizer
+    /// retain their nonrenewable native and compact-tokenizer allowances.
+    /// Terminal completion is published after physical worker join under the
+    /// original run deadline. Native chunk cohorts cannot be combined.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_int4_sentiment_documents_with_threads<R, W>(&self, model: &ResidentInt4,
+        planner: Int4SentimentDocumentBatchPlanner, limits: CorpusLimits, kernel: PackedInt4Kernel,
+        compute_threads: usize, reader: R, writer: W, cancellation: CancellationToken)
+        -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        self.run_int4_sentiment_documents(model, planner, limits, kernel, Some(compute_threads),
+            reader, writer, cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_int4_sentiment_documents<R, W>(&self, model: &ResidentInt4,
+        planner: Int4SentimentDocumentBatchPlanner, limits: CorpusLimits, kernel: PackedInt4Kernel,
+        compute_threads: Option<usize>, reader: R, writer: W, cancellation: CancellationToken)
+        -> Result<BatchSummary, HostedError>
+    where R: BufRead + Send + 'static, W: Write + Send + 'static {
+        match compute_threads {
+            Some(width) => dispatch::preflight_int4_team(self, limits.native.run, width)?,
+            None => dispatch::preflight(self, limits.native.run)?,
+        }
         if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
         constrained_int4::check_model(planner.base_execution_identity(), model.model_identity())
             .map_err(|_| HostedError::ModelIdentity)?;
@@ -78,9 +111,14 @@ impl NlpEngine {
         crate::batch::sentiment::grouped_int4::validate_limits(planner.task_budget(), planner.planning_limits(),
             mapping, planner.max_run_work()).map_err(HostedError::BatchSetup)?;
         let max_axes = planner.max_axes(); let cohort_chunks = planner.cohort_chunks();
+        check_team_schedule(compute_threads, cohort_chunks)?;
         let required = int4_sentiment_document_corpus_requirements(planner.group_width(), planner.task_budget(),
             planner.planning_limits(), mapping, limits, max_axes, cohort_chunks)?
             .with_input_encoding(planner.document_encoding()).map_err(map_error)?;
+        let team_scratch = compute_threads.map(|width|
+            int4_task_team_workspace_bytes(width, planner.group_width())).transpose()?.unwrap_or(0);
+        sum(&[required.input_bytes, required.native.kv_bytes, required.workspace_bytes,
+            required.output_reservation_bytes, team_scratch])?;
         if planner.retained_defaults_bytes().map_err(HostedError::BatchSetup)? > limits.preparation_reserve_bytes {
             return Err(HostedError::Limits("sentiment defaults exceed their preparation reservation"));
         }
@@ -92,7 +130,8 @@ impl NlpEngine {
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.workspace_bytes)?;
         let model = model.clone();
-        dispatch::run(self, limits.native.run, cancellation, move |control| {
+        match compute_threads {
+        None => dispatch::run(self, limits.native.run, cancellation, move |control| {
             let mut input = input;
             checkpoint(control)?;
             let planner = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
@@ -130,7 +169,48 @@ impl NlpEngine {
             drop(input); // IO and retained compiler storage precede physical completion.
             drop(lease);
             result
-        })
+        }),
+        Some(width) => dispatch::run_int4_team_with_finalize(self, limits.native.run, cancellation,
+            model, width, kernel, move |weights, control, team| {
+                let mut input = input;
+                checkpoint(control)?;
+                let planner = input.value.planner.take().ok_or(HostedError::CompletionMissing)?;
+                let admission = DocumentAdmission { lease: &lease, model: weights.identity(),
+                    capacity, output_bytes: required.output_reservation_bytes };
+                let mut engine = allocate_native(kv, scratch, || {
+                    StrictInt4Engine::new(weights, limits.native.context_tokens, Int4MemoryBudget {
+                        max_kv_bytes: required.native.kv_bytes, max_rope_bytes: required.native.rope_bytes,
+                        max_scratch_payload_bytes: required.native.scratch_payload_bound,
+                    }).map_err(native_error)?.with_kernel(kernel)
+                        .with_projection_executor(team).map_err(native_error)
+                })?;
+                let completion = {
+                    let mut processor = NativeInt4SentimentDocumentBatch::new(planner,
+                        &mut engine.value, admission).map_err(HostedError::BatchSetup)?;
+                    stream::deferred::run_ndjson_deferred(&mut input.value.reader, &mut input.value.writer,
+                        &mut processor, limits.transport, control).map_err(HostedError::Batch)?
+                };
+                drop(engine); drop(lease);
+                Ok(DeferredSentimentStream { completion, input })
+            }, |pending, control| pending.publish(control)),
+        }
+    }
+}
+
+fn check_team_schedule(threads: Option<usize>, cohort_chunks: Option<usize>) -> Result<(), HostedError> {
+    if threads.is_some() && cohort_chunks.is_some() {
+        return Err(HostedError::Limits("INT4 sentiment corpus team cannot combine with native chunk cohorts"));
+    }
+    Ok(())
+}
+
+impl<R, W: Write> DeferredSentimentStream<R, W> {
+    fn publish<C: crate::native_engine::decode::DecodeStepControl>(self, control: &mut C)
+        -> Result<BatchSummary, HostedError> {
+        let Self { completion, mut input } = self;
+        let result = completion.publish(&mut input.value.writer, control).map_err(HostedError::Batch);
+        drop(input);
+        result
     }
 }
 

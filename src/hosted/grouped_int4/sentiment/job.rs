@@ -4,6 +4,7 @@
 use super::*;
 use std::io::BufRead;
 use super::corpus::{DocumentAdmission, DocumentCapacity, document_output_bytes};
+use crate::native_engine::strict_int4::projection::Int4ProjectionExecutor;
 use crate::{
     batch::sentiment::grouped_int4::SENTIMENT_DOCUMENT_CHUNK_METADATA_BYTES,
     hosted::corpus::jobs::{HostedJobError, JobHostLimits, SourceJobRequest, read_population, run_population},
@@ -18,6 +19,16 @@ use crate::{
 struct JobInput<R> {
     preparation: Option<(Int4SentimentDocumentJobPlanner, SourceJobRequest)>,
     reader: R,
+}
+
+struct JobExecution<R> {
+    input: Charged<JobInput<R>>,
+    kv: Pending,
+    scratch: Pending,
+    limits: JobHostLimits,
+    required: Int4SentimentMapMemoryRequirement,
+    capacity: DocumentCapacity,
+    lease: EngineLease,
 }
 
 impl NlpEngine {
@@ -35,7 +46,35 @@ impl NlpEngine {
         limits: JobHostLimits, kernel: PackedInt4Kernel, reader: R,
         cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
+        self.run_int4_sentiment_document_job(model, planner, request, limits, kernel, None,
+            reader, cancellation)
+    }
+
+    /// Keep one persistent numerical row team for the entire durable
+    /// invocation. Physical width does not change fixed axes, thresholds,
+    /// score space, compact-input policy, authenticated recipe or work debits.
+    /// Worker scratch is reserved before population IO; every worker joins
+    /// before return. Explicit native chunk cohorts cannot be combined.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int4_sentiment_document_with_threads<R>(&self, model: &ResidentInt4,
+        planner: Int4SentimentDocumentJobPlanner, request: SourceJobRequest,
+        limits: JobHostLimits, kernel: PackedInt4Kernel, compute_threads: usize, reader: R,
+        cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        self.run_int4_sentiment_document_job(model, planner, request, limits, kernel, Some(compute_threads),
+            reader, cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_int4_sentiment_document_job<R>(&self, model: &ResidentInt4,
+        planner: Int4SentimentDocumentJobPlanner, request: SourceJobRequest,
+        limits: JobHostLimits, kernel: PackedInt4Kernel, compute_threads: Option<usize>, reader: R,
+        cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        match compute_threads {
+            Some(width) => dispatch::preflight_int4_team(self, limits.native.run, width)?,
+            None => dispatch::preflight(self, limits.native.run)?,
+        }
         if !Arc::ptr_eq(self.resources(), model.resources()) {
             return Err(HostedError::ResourceDomain.into());
         }
@@ -49,10 +88,15 @@ impl NlpEngine {
         let mapping = planner.document_limits();
         let max_axes = planner.max_axes();
         let cohort_chunks = planner.cohort_chunks();
+        check_team_schedule(compute_threads, cohort_chunks)?;
         let required = requirements(planner.group_width(), planner.task_budget(),
             planner.planning_limits(), mapping, request.limits, limits, max_axes, cohort_chunks,
             request.mode.input_memory())?
             .with_input_encoding(planner.document_encoding()).map_err(map_error)?;
+        let team_scratch = compute_threads.map(|width|
+            int4_task_team_workspace_bytes(width, planner.group_width())).transpose()?.unwrap_or(0);
+        sum(&[required.input_bytes, required.native.kv_bytes, required.workspace_bytes,
+            required.output_reservation_bytes, team_scratch])?;
         if planner.max_result_bytes() != document_output_bytes(mapping, cohort_chunks)?
             || planner.retained_defaults_bytes().map_err(HostedError::BatchSetup)?
                 > limits.preparation_reserve_bytes {
@@ -66,59 +110,85 @@ impl NlpEngine {
             || Ok(JobInput { preparation: Some((planner, request)), reader }))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.workspace_bytes)?;
+        let execution = JobExecution { input, kv, scratch, limits, required, capacity, lease };
         let model = model.clone();
-        let completed = dispatch::run(self, limits.native.run, cancellation, move |control| {
-            // Capture the aggregate owner, including queued reader/key/defaults,
-            // so cancellation cannot release its memory charge prematurely.
-            let mut input = input;
-            checkpoint(control)?;
-            let (planner, request) = input.value.preparation.take().ok_or(HostedError::CompletionMissing)?;
-            let population = match read_population(&mut input.value.reader,
-                &request, limits.transport, control) {
-                Ok(population) => population,
-                Err(error) => return Ok(Err(JobRunError::Storage(error))),
-            };
-            checkpoint(control)?;
-            let admission = DocumentAdmission { lease: &lease, model: model.model_identity(),
-                capacity, output_bytes: required.output_reservation_bytes };
-            let result = if cohort_chunks.is_some() {
-                // Each exact ragged window is created and destroyed by the
-                // existing map executor while the declared peak stays charged.
-                let kv = kv.commit()?;
-                let scratch = scratch.commit()?;
-                let result = (|| {
-                    let processor = Int4SentimentDocumentJobProcessor::new_cohorts(planner,
-                        &model.inner.loaded.value, kernel, map_memory(limits, max_axes, cohort_chunks), admission)
-                        .map_err(JobRunError::Processor)?;
-                    run_population(request, &population, processor, control)
-                })();
-                drop(scratch);
-                drop(kv);
-                result
-            } else {
-                let mut engine = allocate_native(kv, scratch, || {
-                    StrictInt4Engine::new(&model.inner.loaded.value, limits.native.context_tokens,
-                        Int4MemoryBudget { max_kv_bytes: required.native.kv_bytes,
-                            max_rope_bytes: required.native.rope_bytes,
-                            max_scratch_payload_bytes: required.native.scratch_payload_bound })
-                        .map(|engine| engine.with_kernel(kernel)).map_err(native_error)
-                })?;
-                let result = (|| {
-                    let processor = Int4SentimentDocumentJobProcessor::new(planner, &mut engine.value, admission)
-                        .map_err(JobRunError::Processor)?;
-                    run_population(request, &population, processor, control)
-                })();
-                drop(engine);
-                result
-            };
-            // The job runner and result guards drop before the original
-            // population and its input, journal and serialization allowance.
-            drop(population);
-            drop(input);
-            drop(lease);
-            Ok(result)
-        })?;
+        let completed = match compute_threads {
+            None => dispatch::run(self, limits.native.run, cancellation, move |control|
+                execution.run(&model.inner.loaded.value, kernel, None, control)),
+            Some(width) => dispatch::run_int4_team(self, limits.native.run, cancellation,
+                model, width, kernel, move |weights, control, team|
+                    execution.run(weights, kernel, Some(team), control)),
+        }?;
+        // A durable acknowledgement never replaces physical worker drain or
+        // terminal cancellation. Authenticated resume reconciles any commit.
         completed.map_err(HostedJobError::Job)
+    }
+}
+
+fn check_team_schedule(threads: Option<usize>, cohort_chunks: Option<usize>) -> Result<(), HostedError> {
+    if threads.is_some() && cohort_chunks.is_some() {
+        return Err(HostedError::Limits("INT4 sentiment document job team cannot combine with native chunk cohorts"));
+    }
+    Ok(())
+}
+
+impl<R: BufRead> JobExecution<R> {
+    fn run<'weights>(self, weights: &'weights Int4ModelWeights, kernel: PackedInt4Kernel,
+        projection: Option<&'weights mut (dyn Int4ProjectionExecutor + 'weights)>,
+        control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError> {
+        // Capture the aggregate owner, including queued reader/key/defaults,
+        // so cancellation cannot release its memory charge prematurely.
+        let Self { mut input, kv, scratch, limits, required, capacity, lease } = self;
+        checkpoint(control)?;
+        let (planner, request) = input.value.preparation.take().ok_or(HostedError::CompletionMissing)?;
+        let population = match read_population(&mut input.value.reader,
+            &request, limits.transport, control) {
+            Ok(population) => population,
+            Err(error) => return Ok(Err(JobRunError::Storage(error))),
+        };
+        checkpoint(control)?;
+        let admission = DocumentAdmission { lease: &lease, model: weights.identity(),
+            capacity, output_bytes: required.output_reservation_bytes };
+        let result = if capacity.cohort_chunks.is_some() {
+            // Each exact ragged window is created and destroyed by the
+            // existing map executor while the declared peak stays charged.
+            let kv = kv.commit()?;
+            let scratch = scratch.commit()?;
+            let result = (|| {
+                let processor = Int4SentimentDocumentJobProcessor::new_cohorts(planner,
+                    weights, kernel, map_memory(limits, capacity.max_axes, capacity.cohort_chunks), admission)
+                    .map_err(JobRunError::Processor)?;
+                run_population(request, &population, processor, control)
+            })();
+            drop(scratch);
+            drop(kv);
+            result
+        } else {
+            let mut engine = allocate_native(kv, scratch, || {
+                let engine = StrictInt4Engine::new(weights, limits.native.context_tokens,
+                    Int4MemoryBudget { max_kv_bytes: required.native.kv_bytes,
+                        max_rope_bytes: required.native.rope_bytes,
+                        max_scratch_payload_bytes: required.native.scratch_payload_bound })
+                    .map_err(native_error)?.with_kernel(kernel);
+                match projection {
+                    Some(team) => engine.with_projection_executor(team).map_err(native_error),
+                    None => Ok(engine),
+                }
+            })?;
+            let result = (|| {
+                let processor = Int4SentimentDocumentJobProcessor::new(planner, &mut engine.value, admission)
+                    .map_err(JobRunError::Processor)?;
+                run_population(request, &population, processor, control)
+            })();
+            drop(engine);
+            result
+        };
+        // The job runner and result guards drop before the original
+        // population and its input, journal and serialization allowance.
+        drop(population);
+        drop(input);
+        drop(lease);
+        Ok(result)
     }
 }
 
