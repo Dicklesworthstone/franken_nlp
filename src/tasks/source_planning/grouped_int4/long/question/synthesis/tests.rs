@@ -249,3 +249,64 @@ fn final_byte_limit_and_final_checkpoint_prevent_partial_publication() {
         else { assert!(matches!(error, Int4SourceMapError::Source(_))); }
     }
 }
+
+#[test]
+fn plausible_final_answer_and_same_width_quote_tampering_cannot_retain_completion() {
+    for quote in [false, true] {
+        let (expected, mut run) = synthetic(0);
+        if quote { run.synthesis.citations[0].quote = "ê".to_owned(); }
+        else { run.synthesis.answer = Some("Different final answer".to_owned()); }
+        assert!(expected.verify_completed(&run).is_err());
+    }
+}
+#[test]
+fn identical_discovery_cannot_authorize_different_synthesis_evidence_limits() {
+    let (expected, run) = synthetic(0);
+    let p = maps::planner();
+    for bytes in [false, true] {
+        let mut request = request();
+        if bytes { request.limits.max_evidence_bytes -= 1; }
+        else { request.limits.max_evidence_passages -= 1; }
+        let other = prepare(&p, "ééé                        ééé", &request, mapping(), 32, &mut continuing()).unwrap().expected;
+        assert_eq!(expected.discovery, other.discovery);
+        assert_ne!(expected, other);
+        assert!(other.verify_completed(&run).is_err());
+    }
+}
+
+struct SealControl { calls: usize, stop: usize, cause: DecodeCancellationKind }
+impl DecodeStepControl for SealControl {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+        self.calls += 1;
+        (self.calls == self.stop).then_some(self.cause)
+    }
+}
+#[test]
+fn sealed_completion_preserves_every_cancellation_cause_through_the_last_checkpoint() {
+    use DecodeCancellationKind::*;
+    let (expected, run) = synthetic(0);
+    let mut done = SealControl { calls: 0, stop: usize::MAX, cause: User };
+    expected.verify_completed_with_control(&run, &mut done).unwrap();
+    assert!(done.calls > 2);
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        for stop in [1, done.calls / 2, done.calls] {
+            let mut control = SealControl { calls: 0, stop, cause };
+            let error = expected.verify_completed_with_control(&run, &mut control).unwrap_err();
+            assert_eq!(error.cancellation(), Some(cause));
+            assert_eq!(control.calls, stop);
+        }
+    }
+}
+#[test]
+fn private_completion_authority_is_absent_from_json_and_debug() {
+    let (expected, mut run) = synthetic(0);
+    let before = serde_json::to_vec(&run).unwrap();
+    let value = serde_json::to_value(&run).unwrap();
+    assert!(value.get("request_binding").is_none());
+    assert!(value.get("result_binding").is_none());
+    assert!(!format!("{expected:?}").contains("binding"));
+    run.result_binding[0] ^= 1;
+    assert_eq!(before, serde_json::to_vec(&run).unwrap());
+    assert!(expected.verify_completed(&run).is_err());
+}

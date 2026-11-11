@@ -131,7 +131,7 @@ impl native_cohorts::SynthesisPlan for PreparedInt4QuestionHierarchy<'_> {
         let expected = self.preflight_metadata();
         let result = self.execute_cohorts_with_control(admitted, planner, weights, vocabulary, budget, kernel, control)
             .map_err(map_error)?;
-        expected.verify_completed(&result.document).map_err(map_error)?;
+        expected.verify_completed_with_control(&result.document, control).map_err(map_error)?;
         Ok(result)
     }
 }
@@ -187,7 +187,7 @@ impl native_cohorts::SynthesisPlan for GroupedHierarchyPlan<PreparedInt4Question
         let expected = self.prepared.preflight_metadata();
         let result = self.prepared.execute_hierarchy_cohorts_with_control(admitted, planner, weights,
             vocabulary, self.schedule, budget, kernel, control).map_err(map_error)?;
-        expected.verify_completed(&result.document).map_err(map_error)?;
+        expected.verify_completed_with_control(&result.document, control).map_err(map_error)?;
         Ok(result)
     }
 }
@@ -208,7 +208,7 @@ impl native_synthesis::SynthesisPlan for PreparedInt4QuestionHierarchy<'_> {
         control: &mut RunControl) -> Result<Self::Output, HostedError> {
         let expected = self.preflight_metadata();
         let result = self.execute_with_control(admitted, planner, engine, vocabulary, control).map_err(map_error)?;
-        expected.verify_completed(&result).map_err(map_error)?;
+        expected.verify_completed_with_control(&result, control).map_err(map_error)?;
         Ok(result)
     }
 }

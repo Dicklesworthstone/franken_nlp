@@ -39,13 +39,23 @@ impl QuestionHierarchyLimits {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Capacity { scaffold: usize, prompt: usize, input_bytes: usize, question_bytes: usize, eos: u32 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Int4QuestionHierarchyPreflight {
     base: Int4QuestionSynthesisPreflight,
     limits: QuestionHierarchyLimits,
     capacity: Capacity,
     reserved_work: Int4Work,
     reserved_masks: u64,
+    request_binding: [u8; 32],
+    max_result_bytes: u64,
+}
+impl fmt::Debug for Int4QuestionHierarchyPreflight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Int4QuestionHierarchyPreflight").field("base", &self.base)
+            .field("limits", &self.limits).field("capacity", &self.capacity)
+            .field("reserved_work", &self.reserved_work).field("reserved_masks", &self.reserved_masks)
+            .finish_non_exhaustive()
+    }
 }
 impl Int4QuestionHierarchyPreflight {
     pub fn discovery(&self) -> Int4QuestionPreflight { self.base.discovery }
@@ -53,7 +63,22 @@ impl Int4QuestionHierarchyPreflight {
     pub fn limits(&self) -> QuestionHierarchyLimits { self.limits }
     pub fn reserved_model_work(&self) -> Int4Work { self.reserved_work }
     pub fn reserved_mask_visits(&self) -> u64 { self.reserved_masks }
-    pub fn verify_completed(&self, run: &Int4QuestionHierarchyRun) -> Result<(), Int4SourceMapError> { receipt::verify(self, run) }
+    pub fn verify_completed(&self, run: &Int4QuestionHierarchyRun) -> Result<(), Int4SourceMapError> {
+        self.verify_completed_with_control(run, &mut completion_binding::Continue)
+    }
+    /// Verify all final and intermediate content with its exact discovery owner.
+    pub fn verify_completed_with_control<C: DecodeStepControl>(&self, run: &Int4QuestionHierarchyRun,
+        control: &mut C) -> Result<(), Int4SourceMapError> {
+        checkpoint(control)?;
+        if run.request_binding != self.request_binding || run.result_binding != completion_binding::result(
+            b"fnlp-int4-question-hierarchy-result-v1", self.request_binding,
+            run.discovery.request_binding, run.discovery.result_binding, run, self.max_result_bytes, control)? {
+            return Err(invalid());
+        }
+        receipt::verify(self, run, control)?;
+        checkpoint(control)?;
+        Ok(())
+    }
 }
 pub struct PreparedInt4QuestionHierarchy<'s> {
     base: PreparedInt4QuestionSynthesis<'s>,
@@ -130,7 +155,11 @@ fn hierarchy_expectation<C: DecodeStepControl>(planner: &SourceTaskPlanner, requ
     let capacity = Capacity { scaffold, prompt, input_bytes: planning.max_input_bytes.min(budget.max_input_tokens as usize),
         question_bytes: request.question.question.len(), eos: planner.eos };
     checkpoint(control)?;
-    Ok(Int4QuestionHierarchyPreflight { base, limits, capacity, reserved_work, reserved_masks })
+    let request_binding = completion_binding::request(b"fnlp-int4-question-hierarchy-request-v1",
+        base.request_binding, &(limits, (capacity.scaffold, capacity.prompt, capacity.input_bytes,
+            capacity.question_bytes, capacity.eos), reserved_work, reserved_masks), mapping, control)?;
+    Ok(Int4QuestionHierarchyPreflight { base, limits, capacity, reserved_work, reserved_masks,
+        request_binding, max_result_bytes: mapping.reduction.max_result_bytes as u64 })
 }
 impl<'s> PreparedInt4QuestionHierarchy<'s> {
     pub fn preflight_metadata(&self) -> Int4QuestionHierarchyPreflight { self.expected }
@@ -162,7 +191,7 @@ impl HierarchyContinuation<'_> {
         where F: FnOnce(&Self, evidence::Collection, &mut GroundingBudget, &mut C)
             -> Result<execution::Reduced, Int4SourceMapError> {
         let expected = self.expected;
-        expected.discovery().verify_completed(&discovery)?;
+        expected.discovery().verify_completed_with_control(&discovery, control)?;
         let mut remaining = remaining_verification(expected.base.discovery.verification, discovery.verification_used)?;
         let collection = evidence::collect(self.base.source, discovery.mapped.root().value(), expected.base.limits, &mut remaining, control)?;
         let initial = EvidenceSize::of(&collection);
@@ -189,7 +218,7 @@ fn finish<C: DecodeStepControl>(discovery: Int4QuestionRun, initial_evidence: Ev
     remaining: GroundingBudget, expected: Int4QuestionHierarchyPreflight, cap: u64, control: &mut C)
     -> Result<Int4QuestionHierarchyRun, Int4SourceMapError> {
     checkpoint(control)?;
-    let run = Int4QuestionHierarchyRun { schema_version: 1, execution: INT4_QUESTION_HIERARCHY_EXECUTION,
+    let mut run = Int4QuestionHierarchyRun { schema_version: 1, execution: INT4_QUESTION_HIERARCHY_EXECUTION,
         numerics_profile: STRICT_INT4_PROFILE, group_width: expected.group_width(), semantics: SEMANTICS, limits: expected.limits,
         calibration: AnswerCalibration::Uncalibrated, citation_guarantee: CitationGuarantee::StructuralSourceMembership,
         semantic_support: SummarySemanticSupport::NotAssessed, untrusted_fields: ["passes", "discovery.mapped.root.value"],
@@ -199,9 +228,12 @@ fn finish<C: DecodeStepControl>(discovery: Int4QuestionRun, initial_evidence: Ev
         reserved_mask_node_visits: expected.reserved_masks,
         mask_node_visit_charge: discovery.mask_node_visit_charge.checked_add(reduced.masks).ok_or(Int4SourceMapError::WorkLimit)?,
         verification_used: SourceMapVerification::used(expected.base.discovery.verification, remaining)?,
-        tokenizer_work: reduced.tokenizer, levels: reduced.levels, passes: reduced.passes, discovery };
-    expected.verify_completed(&run)?;
-    check_size(&run, cap).map_err(Int4SourceError::from)?;
+        tokenizer_work: reduced.tokenizer, levels: reduced.levels, passes: reduced.passes, discovery,
+        request_binding: expected.request_binding, result_binding: [0; 32] };
+    run.result_binding = completion_binding::result(b"fnlp-int4-question-hierarchy-result-v1",
+        expected.request_binding, run.discovery.request_binding, run.discovery.result_binding,
+        &run, cap.min(expected.max_result_bytes), control)?;
+    expected.verify_completed_with_control(&run, control)?;
     checkpoint(control)?;
     Ok(run)
 }
@@ -264,6 +296,10 @@ pub struct Int4QuestionHierarchyRun {
     pub levels: Vec<QuestionHierarchyLevel>,
     pub passes: Vec<QuestionHierarchyPass>,
     pub discovery: Int4QuestionRun,
+    #[serde(skip)]
+    request_binding: [u8; 32],
+    #[serde(skip)]
+    result_binding: [u8; 32],
 }
 impl Int4QuestionHierarchyRun {
     pub fn answer(&self) -> Option<&SynthesisAnswer> { self.final_pass.and_then(|i| self.passes.get(i)).map(|pass| &pass.answer) }

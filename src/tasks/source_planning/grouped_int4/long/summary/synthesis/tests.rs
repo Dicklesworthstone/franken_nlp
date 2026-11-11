@@ -216,3 +216,71 @@ fn final_result_byte_limit_and_last_checkpoint_cannot_publish_partial_success() 
         run.bullets, run.evidence_segments, run.evidence_bytes, remaining, expected, 16 << 20, &mut control).err().unwrap();
     assert_eq!(error.cancellation(), Some(DecodeCancellationKind::PollQuota));
 }
+
+#[test]
+fn coordinated_final_text_and_same_width_quote_tampering_cannot_retain_completion() {
+    for quote in [false, true] {
+        let (expected, mut run) = synthetic(false);
+        let SourceTaskResult::Summarize(raw) = &mut run.synthesis_native.as_mut().unwrap().result else { panic!() };
+        if quote {
+            // Same byte and scalar extents used to satisfy every envelope check.
+            raw.bullets[0].citations[0].quote = "ê".to_owned();
+            run.bullets[0].citations[0].quote = "ê".to_owned();
+        } else {
+            raw.bullets[0].text = "Different final assertion".to_owned();
+            run.bullets[0].text = "Different final assertion".to_owned();
+        }
+        assert!(expected.verify_completed(&run).is_err());
+    }
+}
+#[test]
+fn identical_discovery_cannot_authorize_different_synthesis_options_or_evidence_limits() {
+    let (expected, run) = synthetic(false);
+    let p = maps::planner();
+    for options in [false, true] {
+        let mut request = request();
+        if options { request.synthesis_options.max_bullets = 1; }
+        else { request.limits.max_evidence_segments -= 1; }
+        let other = prepare(&p, "éééééééé", request, maps::limits(), 32, &mut continuing()).unwrap().expected;
+        assert_eq!(expected.discovery, other.discovery);
+        assert_ne!(expected, other);
+        assert!(other.verify_completed(&run).is_err());
+    }
+}
+
+struct SealControl { calls: usize, stop: usize, cause: DecodeCancellationKind }
+impl DecodeStepControl for SealControl {
+    fn checkpoint(&mut self, _: usize) -> Option<DecodeCancellationKind> {
+        self.calls += 1;
+        (self.calls == self.stop).then_some(self.cause)
+    }
+}
+#[test]
+fn sealed_completion_preserves_every_cancellation_cause_through_the_last_checkpoint() {
+    use DecodeCancellationKind::*;
+    let (expected, run) = synthetic(false);
+    let mut done = SealControl { calls: 0, stop: usize::MAX, cause: User };
+    expected.verify_completed_with_control(&run, &mut done).unwrap();
+    assert!(done.calls > 2);
+    for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+        ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+        for stop in [1, done.calls / 2, done.calls] {
+            let mut control = SealControl { calls: 0, stop, cause };
+            let error = expected.verify_completed_with_control(&run, &mut control).unwrap_err();
+            assert_eq!(error.cancellation(), Some(cause));
+            assert_eq!(control.calls, stop);
+        }
+    }
+}
+#[test]
+fn private_completion_authority_is_absent_from_json_and_debug() {
+    let (expected, mut run) = synthetic(false);
+    let before = serde_json::to_vec(&run).unwrap();
+    let value = serde_json::to_value(&run).unwrap();
+    assert!(value.get("request_binding").is_none());
+    assert!(value.get("result_binding").is_none());
+    assert!(!format!("{expected:?}").contains("binding"));
+    run.result_binding[0] ^= 1;
+    assert_eq!(before, serde_json::to_vec(&run).unwrap());
+    assert!(expected.verify_completed(&run).is_err());
+}

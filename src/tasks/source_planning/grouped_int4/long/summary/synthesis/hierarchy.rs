@@ -39,13 +39,23 @@ impl SummaryHierarchyLimits {
         Ok(())
     }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Int4SummaryHierarchyPreflight {
     discovery: Int4SummarySynthesisPreflight,
     limits: SummaryHierarchyLimits,
     capacity: Int4SourceMapCapacity,
     reserved_work: Int4Work,
     reserved_masks: u64,
+    request_binding: [u8; 32],
+    max_result_bytes: u64,
+}
+impl fmt::Debug for Int4SummaryHierarchyPreflight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Int4SummaryHierarchyPreflight").field("discovery", &self.discovery)
+            .field("limits", &self.limits).field("capacity", &self.capacity)
+            .field("reserved_work", &self.reserved_work).field("reserved_masks", &self.reserved_masks)
+            .finish_non_exhaustive()
+    }
 }
 impl Int4SummaryHierarchyPreflight {
     pub fn chunk_count(&self) -> usize { self.discovery.chunk_count() }
@@ -54,7 +64,22 @@ impl Int4SummaryHierarchyPreflight {
     pub fn reserved_model_work(&self) -> Int4Work { self.reserved_work }
     pub fn reserved_mask_visits(&self) -> u64 { self.reserved_masks }
     pub fn limits(&self) -> SummaryHierarchyLimits { self.limits }
-    pub fn verify_completed(&self, run: &Int4SummaryHierarchyRun) -> Result<(), Int4SourceMapError> { receipt::verify(self, run) }
+    pub fn verify_completed(&self, run: &Int4SummaryHierarchyRun) -> Result<(), Int4SourceMapError> {
+        self.verify_completed_with_control(run, &mut completion_binding::Continue)
+    }
+    /// Verify all final and intermediate content with its exact discovery owner.
+    pub fn verify_completed_with_control<C: DecodeStepControl>(&self, run: &Int4SummaryHierarchyRun,
+        control: &mut C) -> Result<(), Int4SourceMapError> {
+        checkpoint(control)?;
+        if run.request_binding != self.request_binding || run.result_binding != completion_binding::result(
+            b"fnlp-int4-summary-hierarchy-result-v1", self.request_binding,
+            run.discovery.request_binding, run.discovery.result_binding, run, self.max_result_bytes, control)? {
+            return Err(invalid());
+        }
+        receipt::verify(self, run, control)?;
+        checkpoint(control)?;
+        Ok(())
+    }
 }
 pub struct PreparedInt4SummaryHierarchy<'s> {
     base: PreparedInt4SummarySynthesis<'s>,
@@ -86,7 +111,11 @@ impl SourceTaskPlanner {
         let reserved_masks = discovery.synthesis_masks.checked_mul(hierarchy.max_passes as u64)
             .and_then(|n| n.checked_add(discovery.discovery.reserved_mask_visits())).ok_or(Int4SourceMapError::WorkLimit)?;
         if !fits(reserved_work, mapping.max_model_work) || reserved_masks > mapping.max_mask_visits { return Err(Int4SourceMapError::WorkLimit); }
-        let expected = Int4SummaryHierarchyPreflight { discovery, limits: hierarchy, capacity, reserved_work, reserved_masks };
+        let request_binding = completion_binding::request(b"fnlp-int4-summary-hierarchy-request-v1",
+            discovery.request_binding, &(hierarchy, (capacity.scaffold_tokens(), capacity.reserved_tokens(),
+                capacity.max_source_tokens(), capacity.context_tokens()), reserved_work, reserved_masks), mapping, control)?;
+        let expected = Int4SummaryHierarchyPreflight { discovery, limits: hierarchy, capacity, reserved_work, reserved_masks,
+            request_binding, max_result_bytes: mapping.reduction.max_result_bytes as u64 };
         checkpoint(control)?;
         Ok(PreparedInt4SummaryHierarchy { base, expected, mapping })
     }
@@ -126,7 +155,7 @@ impl SummaryHierarchyTail<'_> {
         -> Result<Int4SummaryHierarchyRun, Int4SourceMapError>
         where F: FnOnce(&Self, evidence::Collection, &mut GroundingBudget, &mut C)
             -> Result<execution::Reduced, Int4SourceMapError> {
-        self.expected.discovery.discovery.verify_completed(&discovery)?;
+        self.expected.discovery.discovery.verify_completed_with_control(&discovery, control)?;
         let request = self.base.request;
         let mut remaining = remaining_verification(request.limits.verification, discovery.verification_used)?;
         let collection = evidence::collect(self.base.source, discovery.mapped.root().value(), request.map_options,
@@ -164,7 +193,7 @@ fn finish<C: DecodeStepControl>(discovery: Int4SourceMapRun, initial: EvidenceSi
     remaining: GroundingBudget, expected: Int4SummaryHierarchyPreflight, cap: u64, control: &mut C)
     -> Result<Int4SummaryHierarchyRun, Int4SourceMapError> {
     checkpoint(control)?;
-    let run = Int4SummaryHierarchyRun { schema_version: 1, execution: INT4_SUMMARY_HIERARCHY_EXECUTION,
+    let mut run = Int4SummaryHierarchyRun { schema_version: 1, execution: INT4_SUMMARY_HIERARCHY_EXECUTION,
         numerics_profile: STRICT_INT4_PROFILE, group_width: expected.group_width(), semantics: SEMANTICS, limits: expected.limits,
         citation_guarantee: CitationGuarantee::StructuralSourceMembership, semantic_support: SummarySemanticSupport::NotAssessed,
         untrusted_fields: ["passes", "discovery.mapped.root.value"], initial_evidence: initial,
@@ -174,9 +203,12 @@ fn finish<C: DecodeStepControl>(discovery: Int4SourceMapRun, initial: EvidenceSi
         reserved_mask_node_visits: expected.reserved_masks,
         mask_node_visit_charge: discovery.mask_node_visit_charge.checked_add(reduced.masks).ok_or(Int4SourceMapError::WorkLimit)?,
         verification_used: SourceMapVerification::used(expected.discovery.limits.verification, remaining)?,
-        tokenizer_work: reduced.tokenizer, levels: reduced.levels, passes: reduced.passes, discovery };
-    expected.verify_completed(&run)?;
-    check_size(&run, cap).map_err(Int4SourceError::from)?;
+        tokenizer_work: reduced.tokenizer, levels: reduced.levels, passes: reduced.passes, discovery,
+        request_binding: expected.request_binding, result_binding: [0; 32] };
+    run.result_binding = completion_binding::result(b"fnlp-int4-summary-hierarchy-result-v1",
+        expected.request_binding, run.discovery.request_binding, run.discovery.result_binding,
+        &run, cap.min(expected.max_result_bytes), control)?;
+    expected.verify_completed_with_control(&run, control)?;
     checkpoint(control)?;
     Ok(run)
 }
@@ -234,6 +266,10 @@ pub struct Int4SummaryHierarchyRun {
     pub levels: Vec<SummaryHierarchyLevel>,
     pub passes: Vec<SummaryHierarchyPass>,
     pub discovery: Int4SourceMapRun,
+    #[serde(skip)]
+    request_binding: [u8; 32],
+    #[serde(skip)]
+    result_binding: [u8; 32],
 }
 impl Int4SummaryHierarchyRun {
     pub fn bullets(&self) -> &[CitedBullet] {

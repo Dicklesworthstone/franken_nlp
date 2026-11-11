@@ -2,9 +2,11 @@
 use super::*;
 use std::collections::BTreeSet;
 
-pub(super) fn verify(expected: &Int4QuestionHierarchyPreflight, run: &Int4QuestionHierarchyRun) -> Result<(), Int4SourceMapError> {
+pub(super) fn verify<C: DecodeStepControl>(expected: &Int4QuestionHierarchyPreflight, run: &Int4QuestionHierarchyRun,
+    control: &mut C) -> Result<(), Int4SourceMapError> {
+    checkpoint(control)?;
     let base = expected.base; let map = &run.discovery;
-    base.discovery.verify_completed(map)?;
+    base.discovery.verify_completed_with_control(map, control)?;
     if run.schema_version != 1 || run.execution != INT4_QUESTION_HIERARCHY_EXECUTION
         || run.numerics_profile != STRICT_INT4_PROFILE || run.group_width != expected.group_width()
         || run.semantics != SEMANTICS || run.limits != expected.limits
@@ -21,8 +23,10 @@ pub(super) fn verify(expected: &Int4QuestionHierarchyPreflight, run: &Int4Questi
         || run.tokenizer_work.calls < run.passes.len() { return Err(invalid()); }
     let mut frontier = Vec::new();
     for chunk in map.mapped.root().value().chunks() {
+        checkpoint(control)?;
         let mut seen = BTreeSet::new();
         for citation in &chunk.citations {
+            checkpoint(control)?;
             if seen.insert(citation.quote.as_str()) {
                 frontier.try_reserve(1).map_err(|_| Int4SourceMapError::Allocation)?;
                 frontier.push(citation.quote.as_str());
@@ -35,6 +39,7 @@ pub(super) fn verify(expected: &Int4QuestionHierarchyPreflight, run: &Int4Questi
     let mut planned = map.planned_model_work; let mut actual = map.model_work; let mut masks = map.mask_node_visit_charge;
     let mut counted_bytes = 0_u64;
     for pass in &run.passes {
+        checkpoint(control)?;
         verify_pass(expected, pass)?;
         planned = add_work(planned, pass.planned_model_work).ok_or_else(invalid)?;
         actual = add_work(actual, pass.native.model_work).ok_or_else(invalid)?;
@@ -55,12 +60,14 @@ pub(super) fn verify(expected: &Int4QuestionHierarchyPreflight, run: &Int4Questi
     if initial.bytes == 0 || map.answered_chunks == 0 || run.levels.is_empty() { return Err(invalid()); }
     let mut next_pass = 0; let mut final_pass = None;
     for (level_index, level) in run.levels.iter().enumerate() {
+        checkpoint(control)?;
         let size = transport::quote_size(&frontier)?;
         if level.input != size || level.passes.start != next_pass || level.passes.start >= level.passes.end
             || level.passes.end > run.passes.len() { return Err(invalid()); }
         let passes = &run.passes[level.passes.clone()];
         let mut next_passage = 0;
         for (group, pass) in passes.iter().enumerate() {
+            checkpoint(control)?;
             if pass.level != level_index || pass.group != group || pass.input_passages.start != next_passage
                 || pass.input_passages.end > frontier.len() { return Err(invalid()); }
             let quotes = &frontier[pass.input_passages.clone()];
@@ -72,7 +79,7 @@ pub(super) fn verify(expected: &Int4QuestionHierarchyPreflight, run: &Int4Questi
             if bytes != pass.context_bytes { return Err(invalid()); }
             // Native local citations must still designate an actual quote
             // passage in this group; synthetic joins/question/manifest cannot.
-            verify_local_passages(pass, &ids, quotes)?;
+            verify_local_passages(pass, &ids, quotes, control)?;
             next_passage = pass.input_passages.end;
         }
         if next_passage != frontier.len() { return Err(invalid()); }
@@ -135,20 +142,26 @@ pub(super) fn verify_pass(expected: &Int4QuestionHierarchyPreflight, pass: &Ques
     }
     Ok(())
 }
-fn verify_local_passages(pass: &QuestionHierarchyPass, ids: &[String], quotes: &[&str]) -> Result<(), Int4SourceMapError> {
+fn verify_local_passages<C: DecodeStepControl>(pass: &QuestionHierarchyPass, ids: &[String], quotes: &[&str],
+    control: &mut C) -> Result<(), Int4SourceMapError> {
     let SourceTaskResult::Answer(raw) = &pass.native.result else { return Err(invalid()); };
     // One bounded scalar-boundary index per passage. Recounting the entire
     // prefix for every repeated occurrence would make receipt checks quadratic.
     let mut boundaries = vector(quotes.len())?;
     for text in quotes {
+        checkpoint(control)?;
         let mut positions = vector(text.len().checked_add(1).ok_or_else(invalid)?)?;
-        positions.extend(text.char_indices().map(|(byte, _)| byte));
+        for (index, (byte, _)) in text.char_indices().enumerate() {
+            if index % 4096 == 0 { checkpoint(control)?; }
+            positions.push(byte);
+        }
         positions.push(text.len());
         boundaries.push(positions);
     }
     for citation in &raw.citations {
         let mut previous = None;
         for occurrence in &citation.spans {
+            checkpoint(control)?;
             let index = ids.iter().position(|id| id == &occurrence.passage_id).ok_or_else(invalid)?;
             let text = quotes[index]; let span = occurrence.span;
             let key = (index, span.byte_start);

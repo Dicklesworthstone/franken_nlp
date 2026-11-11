@@ -2,6 +2,7 @@
 //! Generated map bullets remain inspectable output, never factual input. The
 //! complete evidence set must fit one final context; overflow returns no result.
 use super::*;
+use super::super::completion_binding;
 use crate::{
     native_engine::{lmhead::NANBEIGE_VOCAB_SIZE, portable_int8::ProjectionWork},
     tasks::summarize::{CitedBullet, SourceCitation},
@@ -51,7 +52,7 @@ impl SourceSummarySynthesis {
 }
 
 /// A private, content-free planning commitment, never a native model receipt.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Int4SummarySynthesisPreflight {
     discovery: Int4SourceMapPreflight,
     synthesis_reserve: Int4Work,
@@ -60,6 +61,15 @@ pub struct Int4SummarySynthesisPreflight {
     options: SummaryOptions,
     max_output_tokens: usize,
     eos_token_id: u32,
+    request_binding: [u8; 32],
+    max_result_bytes: u64,
+}
+impl fmt::Debug for Int4SummarySynthesisPreflight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Int4SummarySynthesisPreflight").field("discovery", &self.discovery)
+            .field("synthesis_reserve", &self.synthesis_reserve).field("synthesis_masks", &self.synthesis_masks)
+            .field("limits", &self.limits).field("options", &self.options).finish_non_exhaustive()
+    }
 }
 impl Int4SummarySynthesisPreflight {
     pub fn discovery(&self) -> Int4SourceMapPreflight { self.discovery }
@@ -74,7 +84,19 @@ impl Int4SummarySynthesisPreflight {
         self.discovery.reserved_mask_visits().checked_add(self.synthesis_masks).ok_or(Int4SourceMapError::WorkLimit)
     }
     pub fn verify_completed(&self, run: &Int4SummarySynthesisRun) -> Result<(), Int4SourceMapError> {
-        self.discovery.verify_completed(&run.discovery)?;
+        self.verify_completed_with_control(run, &mut completion_binding::Continue)
+    }
+    /// Verify exact final content and discovery authority with the original
+    /// cancellation, deadline and resource-owner checkpoints.
+    pub fn verify_completed_with_control<C: DecodeStepControl>(&self, run: &Int4SummarySynthesisRun,
+        control: &mut C) -> Result<(), Int4SourceMapError> {
+        checkpoint(control)?;
+        if run.request_binding != self.request_binding || run.result_binding != completion_binding::result(
+            b"fnlp-int4-summary-synthesis-result-v1", self.request_binding,
+            run.discovery.request_binding, run.discovery.result_binding, run, self.max_result_bytes, control)? {
+            return Err(invalid());
+        }
+        self.discovery.verify_completed_with_control(&run.discovery, control)?;
         let map = &run.discovery;
         let actual = add_work(map.model_work, run.synthesis_model_work).ok_or(Int4SourceMapError::WorkLimit)?;
         let masks = map.mask_node_visit_charge.checked_add(run.synthesis_mask_node_visits)
@@ -131,8 +153,10 @@ impl Int4SummarySynthesisPreflight {
                         else { SummarySynthesisStatus::Synthesized } { return Err(invalid()); }
                 let source = self.source_span();
                 for (raw, lifted) in raw.bullets.iter().zip(&run.bullets) {
+                    checkpoint(control)?;
                     if raw.text != lifted.text || raw.citations.len() != lifted.citations.len() { return Err(invalid()); }
                     for (local, original) in raw.citations.iter().zip(&lifted.citations) {
+                        checkpoint(control)?;
                         if local.quote != original.quote { return Err(invalid()); }
                         evidence::check_citation(original, self.options.max_quote_scalars)?;
                         if original.spans.iter().any(|s| s.byte_end > source.byte_end || s.scalar_end > source.scalar_end) {
@@ -142,6 +166,7 @@ impl Int4SummarySynthesisPreflight {
                 }
             }
         }
+        checkpoint(control)?;
         Ok(())
     }
 }
@@ -172,10 +197,16 @@ impl SourceTaskPlanner {
         let task = SourceMapTask::Summarize(request.map_options);
         let map = self.plan_int4_map_with_control(source, &task, budget, context, planning,
             discovery_limits, group_width, control)?;
-        let expected = Int4SummarySynthesisPreflight { discovery: map.preflight_metadata(), synthesis_reserve,
+        let discovery = map.preflight_metadata();
+        let request_binding = completion_binding::request(b"fnlp-int4-summary-synthesis-request-v1",
+            discovery.request_binding, &(request.map_options, request.synthesis_options,
+                (request.limits.max_evidence_segments, request.limits.max_evidence_bytes, request.limits.verification),
+                budget, context.budget_ceiling(), synthesis_reserve, mapping.mask_visits_per_chunk, self.eos),
+            mapping, control)?;
+        let expected = Int4SummarySynthesisPreflight { discovery, synthesis_reserve,
             synthesis_masks: mapping.mask_visits_per_chunk, limits: request.limits,
             options: request.synthesis_options, max_output_tokens: budget.max_output_tokens as usize,
-            eos_token_id: self.eos };
+            eos_token_id: self.eos, request_binding, max_result_bytes: mapping.reduction.max_result_bytes as u64 };
         if !fits(expected.reserved_model_work()?, mapping.max_model_work)
             || expected.reserved_mask_visits()? > mapping.max_mask_visits { return Err(Int4SourceMapError::WorkLimit); }
         checkpoint(control)?;
@@ -253,7 +284,7 @@ impl SummarySynthesisTail<'_> {
         -> Result<Int4SummarySynthesisRun, Int4SourceMapError>
         where F: FnOnce(&PreparedInt4SourceTask, &mut C) -> Result<Int4SourceTaskRun, Int4SourceMapError> {
         let Self { source, identity, budget, planning, mapping, request, expected } = self;
-        expected.discovery.verify_completed(&discovery)?;
+        expected.discovery.verify_completed_with_control(&discovery, control)?;
         let mut remaining = remaining_verification(request.limits.verification, discovery.verification_used)?;
         let collection = evidence::collect(source, discovery.mapped.root().value(), request.map_options,
             request.limits, &mut remaining, control)?;
@@ -299,7 +330,7 @@ fn finish<C: DecodeStepControl>(discovery: Int4SourceMapRun, native: Option<Int4
     let masks = native.as_ref().map_or(0, |n| mask_charge(&n.result));
     let status = if native.is_none() { SummarySynthesisStatus::NoEvidenceCollected }
         else if bullets.is_empty() { SummarySynthesisStatus::NoBulletsProduced } else { SummarySynthesisStatus::Synthesized };
-    let run = Int4SummarySynthesisRun { schema_version: 1, execution: INT4_SUMMARY_SYNTHESIS_EXECUTION,
+    let mut run = Int4SummarySynthesisRun { schema_version: 1, execution: INT4_SUMMARY_SYNTHESIS_EXECUTION,
         numerics_profile: STRICT_INT4_PROFILE, group_width: expected.group_width(), semantics: SEMANTICS, status,
         evidence_segments: segments, evidence_bytes: bytes, synthesis_prompt_tokens: prompt_tokens,
         synthesis_reserved_work: expected.synthesis_reserve, synthesis_planned_work: planned, synthesis_model_work: work,
@@ -310,9 +341,11 @@ fn finish<C: DecodeStepControl>(discovery: Int4SourceMapRun, native: Option<Int4
         verification_used: SourceMapVerification::used(expected.limits.verification, remaining)?,
         citation_guarantee: CitationGuarantee::StructuralSourceMembership, semantic_support: SummarySemanticSupport::NotAssessed,
         untrusted_fields: ["bullets", "synthesis_native", "discovery.mapped.root.value"],
-        bullets, synthesis_native: native, discovery };
-    expected.verify_completed(&run)?;
-    check_size(&run, cap).map_err(Int4SourceError::from)?;
+        bullets, synthesis_native: native, discovery, request_binding: expected.request_binding, result_binding: [0; 32] };
+    run.result_binding = completion_binding::result(b"fnlp-int4-summary-synthesis-result-v1",
+        expected.request_binding, run.discovery.request_binding, run.discovery.result_binding,
+        &run, cap.min(expected.max_result_bytes), control)?;
+    expected.verify_completed_with_control(&run, control)?;
     checkpoint(control)?;
     Ok(run)
 }
@@ -348,6 +381,10 @@ pub struct Int4SummarySynthesisRun {
     pub synthesis_native: Option<Int4SourceTaskRun>,
     /// All map results, including empty summaries and conflicting bullets.
     pub discovery: Int4SourceMapRun,
+    #[serde(skip)]
+    request_binding: [u8; 32],
+    #[serde(skip)]
+    result_binding: [u8; 32],
 }
 fn invalid() -> Int4SourceMapError { Int4SourceError::InvalidResult.into() }
 fn vector<T>(n: usize) -> Result<Vec<T>, Int4SourceMapError> {

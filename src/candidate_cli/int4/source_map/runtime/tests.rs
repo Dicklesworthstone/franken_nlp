@@ -426,6 +426,14 @@ fn complete_publication_keeps_provenance_and_original_coordinates_and_refuses_ov
 
 // Geometry and native work may stay identical when the exact sealed scheduling
 // or resource authority changes. Full receipt equality remains config-specific.
+fn assert_same_source_geometry_and_work(actual: Int4SourceMapPreflight, expected: Int4SourceMapPreflight) {
+    assert_eq!(actual.source_span(), expected.source_span());
+    assert_eq!(actual.chunk_count(), expected.chunk_count());
+    assert_eq!(actual.group_width(), expected.group_width());
+    assert_eq!(actual.planned_work(), expected.planned_work());
+    assert_eq!(actual.reserved_mask_visits(), expected.reserved_mask_visits());
+}
+
 fn assert_same_question_geometry_and_work(actual: Int4QuestionPreflight, expected: Int4QuestionPreflight) {
     assert_eq!(actual.source_span(), expected.source_span());
     assert_eq!(actual.chunk_count(), expected.chunk_count());
@@ -673,7 +681,12 @@ fn every_native_work_axis_and_mask_limit_admits_discovery_plus_synthesis_once() 
     }
     config.mapping.max_model_work = work;
     config.mapping.max_mask_visits = masks;
-    assert_eq!(summary_synthesis_preflight(SOURCE, &planner, &config, 32, &mut continuing()).unwrap(), expected);
+    let bounded = summary_synthesis_preflight(SOURCE, &planner, &config, 32, &mut continuing()).unwrap();
+    assert_same_source_geometry_and_work(bounded.discovery(), expected.discovery());
+    assert_eq!(bounded.synthesis_reserved_work(), expected.synthesis_reserved_work());
+    assert_eq!(bounded.reserved_model_work().unwrap(), expected.reserved_model_work().unwrap());
+    assert_eq!(bounded.reserved_mask_visits().unwrap(), expected.reserved_mask_visits().unwrap());
+    assert_ne!(bounded, expected);
 }
 
 #[test]
@@ -779,16 +792,28 @@ fn synthesis_cohort_cli_and_host_keep_the_same_complete_phase_reservation() {
                         let grouped = summary_hierarchy_preflight(SOURCE, &planner, &config, hierarchy,
                             width, &mut continuing()).unwrap();
                         config.mapping.reduction.map_batch_chunks = 1;
-                        assert_eq!(summary_hierarchy_preflight(SOURCE, &planner, &config, hierarchy,
-                            width, &mut continuing()).unwrap(), grouped);
+                        let serial = summary_hierarchy_preflight(SOURCE, &planner, &config, hierarchy,
+                            width, &mut continuing()).unwrap();
+                        assert_eq!(serial.source_span(), grouped.source_span());
+                        assert_eq!(serial.chunk_count(), grouped.chunk_count());
+                        assert_eq!(serial.group_width(), grouped.group_width());
+                        assert_eq!(serial.limits(), grouped.limits());
+                        assert_eq!(serial.reserved_model_work(), grouped.reserved_model_work());
+                        assert_eq!(serial.reserved_mask_visits(), grouped.reserved_mask_visits());
+                        assert_eq!(serial == grouped, chunks == 1);
                     } else {
                         assert_eq!(config.summary_synthesis_workspace_bytes(limits.mapping.chunks.max_chunks)
                             .unwrap(), limits.workspace_bytes);
                         let grouped = summary_synthesis_preflight(SOURCE, &planner, &config,
                             width, &mut continuing()).unwrap();
                         config.mapping.reduction.map_batch_chunks = 1;
-                        assert_eq!(summary_synthesis_preflight(SOURCE, &planner, &config,
-                            width, &mut continuing()).unwrap(), grouped);
+                        let serial = summary_synthesis_preflight(SOURCE, &planner, &config,
+                            width, &mut continuing()).unwrap();
+                        assert_same_source_geometry_and_work(serial.discovery(), grouped.discovery());
+                        assert_eq!(serial.synthesis_reserved_work(), grouped.synthesis_reserved_work());
+                        assert_eq!(serial.reserved_model_work().unwrap(), grouped.reserved_model_work().unwrap());
+                        assert_eq!(serial.reserved_mask_visits().unwrap(), grouped.reserved_mask_visits().unwrap());
+                        assert_eq!(serial == grouped, chunks == 1);
                     }
                 } else {
                     let (planner, base) = question_synthesis_fixture(width);
@@ -807,16 +832,27 @@ fn synthesis_cohort_cli_and_host_keep_the_same_complete_phase_reservation() {
                         let grouped = question_hierarchy_preflight(SOURCE, &planner, &config, hierarchy,
                             width, &mut continuing()).unwrap();
                         config.mapping.reduction.map_batch_chunks = 1;
-                        assert_eq!(question_hierarchy_preflight(SOURCE, &planner, &config, hierarchy,
-                            width, &mut continuing()).unwrap(), grouped);
+                        let serial = question_hierarchy_preflight(SOURCE, &planner, &config, hierarchy,
+                            width, &mut continuing()).unwrap();
+                        assert_same_question_geometry_and_work(serial.discovery(), grouped.discovery());
+                        assert_eq!(serial.group_width(), grouped.group_width());
+                        assert_eq!(serial.limits(), grouped.limits());
+                        assert_eq!(serial.reserved_model_work(), grouped.reserved_model_work());
+                        assert_eq!(serial.reserved_mask_visits(), grouped.reserved_mask_visits());
+                        assert_eq!(serial == grouped, chunks == 1);
                     } else {
                         assert_eq!(config.question_synthesis_workspace_bytes(limits.mapping.chunks.max_chunks)
                             .unwrap(), limits.workspace_bytes);
                         let grouped = question_synthesis_preflight(SOURCE, &planner, &config,
                             width, &mut continuing()).unwrap();
                         config.mapping.reduction.map_batch_chunks = 1;
-                        assert_eq!(question_synthesis_preflight(SOURCE, &planner, &config,
-                            width, &mut continuing()).unwrap(), grouped);
+                        let serial = question_synthesis_preflight(SOURCE, &planner, &config,
+                            width, &mut continuing()).unwrap();
+                        assert_same_question_geometry_and_work(serial.discovery(), grouped.discovery());
+                        assert_eq!(serial.synthesis_reserved_work(), grouped.synthesis_reserved_work());
+                        assert_eq!(serial.reserved_model_work().unwrap(), grouped.reserved_model_work().unwrap());
+                        assert_eq!(serial.reserved_mask_visits().unwrap(), grouped.reserved_mask_visits().unwrap());
+                        assert_eq!(serial == grouped, chunks == 1);
                     }
                 }
             }
@@ -1068,7 +1104,14 @@ fn hierarchy_cannot_renew_any_work_axis_or_masks_for_a_later_level() {
             Err(CandidateError::Planning));
     }
     config.mapping.max_model_work = work; config.mapping.max_mask_visits = masks;
-    assert_eq!(summary_hierarchy_preflight(SOURCE, &planner, &config, hierarchy, 32, &mut continuing()).unwrap(), expected);
+    let bounded = summary_hierarchy_preflight(SOURCE, &planner, &config, hierarchy, 32, &mut continuing()).unwrap();
+    assert_eq!(bounded.source_span(), expected.source_span());
+    assert_eq!(bounded.chunk_count(), expected.chunk_count());
+    assert_eq!(bounded.group_width(), expected.group_width());
+    assert_eq!(bounded.limits(), expected.limits());
+    assert_eq!(bounded.reserved_model_work(), expected.reserved_model_work());
+    assert_eq!(bounded.reserved_mask_visits(), expected.reserved_mask_visits());
+    assert_ne!(bounded, expected);
 }
 
 #[test]

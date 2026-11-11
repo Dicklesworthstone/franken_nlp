@@ -2,9 +2,11 @@
 use super::*;
 use std::collections::BTreeSet;
 
-pub(super) fn verify(expected: &Int4SummaryHierarchyPreflight, run: &Int4SummaryHierarchyRun) -> Result<(), Int4SourceMapError> {
+pub(super) fn verify<C: DecodeStepControl>(expected: &Int4SummaryHierarchyPreflight, run: &Int4SummaryHierarchyRun,
+    control: &mut C) -> Result<(), Int4SourceMapError> {
+    checkpoint(control)?;
     let d = expected.discovery; let map = &run.discovery;
-    d.discovery.verify_completed(map)?;
+    d.discovery.verify_completed_with_control(map, control)?;
     let root = map.mapped.root();
     if run.schema_version != 1 || run.execution != INT4_SUMMARY_HIERARCHY_EXECUTION
         || run.numerics_profile != STRICT_INT4_PROFILE || run.group_width != expected.group_width()
@@ -21,9 +23,11 @@ pub(super) fn verify(expected: &Int4SummaryHierarchyPreflight, run: &Int4Summary
         || run.tokenizer_work.calls < run.passes.len() { return Err(invalid()); }
     let mut initial = EvidenceSize { segments: 0, bytes: 0 };
     for chunk in root.value().chunks() {
+        checkpoint(control)?;
         let SourceTaskResult::Summarize(raw) = &chunk.native.result else { return Err(invalid()); };
         let mut seen = BTreeSet::new();
         for bullet in &raw.bullets { for citation in &bullet.citations {
+            checkpoint(control)?;
             if seen.insert(citation.quote.as_str()) {
                 initial.bytes = initial.bytes.checked_add(if initial.segments == 0 { 0 } else { 2 })
                     .and_then(|n| n.checked_add(citation.quote.len())).ok_or_else(invalid)?;
@@ -36,6 +40,7 @@ pub(super) fn verify(expected: &Int4SummaryHierarchyPreflight, run: &Int4Summary
     let mut planned = map.planned_model_work; let mut actual = map.model_work; let mut masks = map.mask_node_visit_charge;
     let mut counted_bytes = 0_u64;
     for pass in &run.passes {
+        checkpoint(control)?;
         verify_pass(expected, pass)?;
         planned = add_work(planned, pass.planned_model_work).ok_or_else(invalid)?;
         actual = add_work(actual, pass.native.model_work).ok_or_else(invalid)?;
@@ -55,11 +60,13 @@ pub(super) fn verify(expected: &Int4SummaryHierarchyPreflight, run: &Int4Summary
     if run.levels.is_empty() { return Err(invalid()); }
     let mut frontier = initial; let mut next_pass = 0; let mut final_pass = None;
     for (level_index, level) in run.levels.iter().enumerate() {
+        checkpoint(control)?;
         if level.input != frontier || level.passes.start != next_pass || level.passes.start >= level.passes.end
             || level.passes.end > run.passes.len() { return Err(invalid()); }
         let passes = &run.passes[level.passes.clone()];
         let mut next_segment = 0; let mut bytes = 0_usize;
         for (group, pass) in passes.iter().enumerate() {
+            checkpoint(control)?;
             if pass.level != level_index || pass.group != group || pass.input_segments.start != next_segment
                 || pass.input_segments.end > frontier.segments { return Err(invalid()); }
             next_segment = pass.input_segments.end;

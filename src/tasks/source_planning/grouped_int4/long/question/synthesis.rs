@@ -2,6 +2,7 @@
 //! All original passage answers remain inspectable. Their generated assertions
 //! never enter the evidence input, and absent evidence is not calibrated abstention.
 use super::*;
+use super::super::completion_binding;
 use super::super::execution::{NativeDriver, SourceDriver, check_run, preflight};
 use crate::native_engine::portable_int8::ProjectionWork;
 mod evidence;
@@ -35,7 +36,7 @@ pub struct SourceQuestionSynthesis {
     pub limits: QuestionSynthesisLimits,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Int4QuestionSynthesisPreflight {
     discovery: Int4QuestionPreflight,
     synthesis_reserve: Int4Work,
@@ -43,6 +44,15 @@ pub struct Int4QuestionSynthesisPreflight {
     limits: QuestionSynthesisLimits,
     options: AnswerOptions,
     max_output_tokens: usize,
+    request_binding: [u8; 32],
+    max_result_bytes: u64,
+}
+impl fmt::Debug for Int4QuestionSynthesisPreflight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Int4QuestionSynthesisPreflight").field("discovery", &self.discovery)
+            .field("synthesis_reserve", &self.synthesis_reserve).field("synthesis_masks", &self.synthesis_masks)
+            .field("limits", &self.limits).field("options", &self.options).finish_non_exhaustive()
+    }
 }
 impl Int4QuestionSynthesisPreflight {
     pub fn discovery(&self) -> Int4QuestionPreflight { self.discovery }
@@ -54,7 +64,19 @@ impl Int4QuestionSynthesisPreflight {
         self.discovery.reserved_mask_visits().checked_add(self.synthesis_masks).ok_or(Int4SourceMapError::WorkLimit)
     }
     pub fn verify_completed(&self, run: &Int4QuestionSynthesisRun) -> Result<(), Int4SourceMapError> {
-        self.discovery.verify_completed(&run.discovery)?;
+        self.verify_completed_with_control(run, &mut completion_binding::Continue)
+    }
+    /// Verify exact final content and discovery authority with the original
+    /// cancellation, deadline and resource-owner checkpoints.
+    pub fn verify_completed_with_control<C: DecodeStepControl>(&self, run: &Int4QuestionSynthesisRun,
+        control: &mut C) -> Result<(), Int4SourceMapError> {
+        checkpoint(control)?;
+        if run.request_binding != self.request_binding || run.result_binding != completion_binding::result(
+            b"fnlp-int4-question-synthesis-result-v1", self.request_binding,
+            run.discovery.request_binding, run.discovery.result_binding, run, self.max_result_bytes, control)? {
+            return Err(invalid());
+        }
+        self.discovery.verify_completed_with_control(&run.discovery, control)?;
         let actual = add_work(run.discovery.model_work, run.synthesis_model_work).ok_or(Int4SourceMapError::WorkLimit)?;
         let masks = run.discovery.mask_node_visit_charge.checked_add(run.synthesis_mask_node_visits)
             .ok_or(Int4SourceMapError::WorkLimit)?;
@@ -102,11 +124,13 @@ impl Int4QuestionSynthesisPreflight {
                         return Err(invalid());
                     }
                     for citation in &run.synthesis.citations {
+                        checkpoint(control)?;
                         evidence::check_original_citation(citation, self.options, self.discovery.source_span())?;
                     }
                 } else if run.synthesis.answer.is_some() || !run.synthesis.citations.is_empty() { return Err(invalid()); }
             }
         }
+        checkpoint(control)?;
         Ok(())
     }
 }
@@ -150,7 +174,7 @@ impl SourceTaskPlanner {
         let (discovery_limits, reserve) = reserve(request.limits, budget, planning, mapping, group_width)?;
         let discovery = self.preflight_int4_question_with_control(source, &request.question, budget, context,
             planning, discovery_limits, group_width, control)?;
-        expectation(discovery, reserve, request, budget, mapping)
+        expectation(discovery, reserve, request, budget, mapping, control)
     }
     #[allow(clippy::too_many_arguments)]
     pub fn plan_int4_question_synthesis_with_control<'s, C: DecodeStepControl>(&self, source: &'s str,
@@ -164,16 +188,22 @@ impl SourceTaskPlanner {
         let (discovery_limits, reserve) = reserve(request.limits, budget, planning, mapping, group_width)?;
         let map = self.plan_int4_question_with_control(source, &request.question, budget, context,
             planning, discovery_limits, group_width, control)?;
-        let expected = expectation(map.preflight_metadata(), reserve, request, budget, mapping)?;
+        let expected = expectation(map.preflight_metadata(), reserve, request, budget, mapping, control)?;
         checkpoint(control)?;
         Ok(PreparedInt4QuestionSynthesis { source, question: copy(&request.question.question)?, map,
             identity: context.execution_identity().clone(), budget, planning, mapping, options: request.question.options, expected })
     }
 }
-fn expectation(discovery: Int4QuestionPreflight, synthesis_reserve: Int4Work, request: &SourceQuestionSynthesis,
-    budget: TaskBudget, mapping: Int4SourceMapLimits) -> Result<Int4QuestionSynthesisPreflight, Int4SourceMapError> {
+fn expectation<C: DecodeStepControl>(discovery: Int4QuestionPreflight, synthesis_reserve: Int4Work,
+    request: &SourceQuestionSynthesis, budget: TaskBudget, mapping: Int4SourceMapLimits, control: &mut C)
+    -> Result<Int4QuestionSynthesisPreflight, Int4SourceMapError> {
+    let request_binding = completion_binding::request(b"fnlp-int4-question-synthesis-request-v1",
+        discovery.request_binding, &(request.limits.max_evidence_passages, request.limits.max_evidence_bytes,
+            request.question.options, request.question.verification, budget, synthesis_reserve, mapping.mask_visits_per_chunk),
+        mapping, control)?;
     let value = Int4QuestionSynthesisPreflight { discovery, synthesis_reserve, synthesis_masks: mapping.mask_visits_per_chunk,
-        limits: request.limits, options: request.question.options, max_output_tokens: budget.max_output_tokens as usize };
+        limits: request.limits, options: request.question.options, max_output_tokens: budget.max_output_tokens as usize,
+        request_binding, max_result_bytes: mapping.reduction.max_result_bytes as u64 };
     if !fits(value.reserved_model_work()?, mapping.max_model_work) || value.reserved_mask_visits()? > mapping.max_mask_visits {
         return Err(Int4SourceMapError::WorkLimit);
     }
@@ -229,7 +259,7 @@ impl Continuation<'_> {
         -> Result<Int4QuestionSynthesisRun, Int4SourceMapError>
         where F: FnOnce(&PreparedInt4SourceTask, &mut C) -> Result<Int4SourceTaskRun, Int4SourceMapError> {
         let Self { source, question, identity, budget, planning, mapping, options, expected } = self;
-        expected.discovery.verify_completed(&discovery)?;
+        expected.discovery.verify_completed_with_control(&discovery, control)?;
         let mut remaining = remaining_verification(expected.discovery.verification, discovery.verification_used)?;
         let collection = evidence::collect(source, discovery.mapped.root().value(), expected.limits, &mut remaining, control)?;
         let passages = collection.passages.len(); let bytes = collection.bytes;
@@ -300,6 +330,10 @@ pub struct Int4QuestionSynthesisRun {
     pub synthesis: SynthesisAnswer,
     /// All alternatives and abstentions remain present after final synthesis.
     pub discovery: Int4QuestionRun,
+    #[serde(skip)]
+    request_binding: [u8; 32],
+    #[serde(skip)]
+    result_binding: [u8; 32],
 }
 fn remaining_verification(total: GroundingBudget, used: SourceMapVerification) -> Result<GroundingBudget, Int4SourceMapError> {
     Ok(GroundingBudget { max_fields: total.max_fields.checked_sub(used.fields).ok_or(Int4SourceMapError::WorkLimit)?,
@@ -317,7 +351,7 @@ fn finish<C: DecodeStepControl>(discovery: Int4QuestionRun, synthesis: Synthesis
     let model_work = add_work(discovery.model_work, synthesis_model_work).ok_or(Int4SourceMapError::WorkLimit)?;
     let mask_node_visit_charge = discovery.mask_node_visit_charge.checked_add(synthesis_mask_node_visits)
         .ok_or(Int4SourceMapError::WorkLimit)?;
-    let run = Int4QuestionSynthesisRun { schema_version: 1, execution: INT4_QUESTION_SYNTHESIS_EXECUTION,
+    let mut run = Int4QuestionSynthesisRun { schema_version: 1, execution: INT4_QUESTION_SYNTHESIS_EXECUTION,
         numerics_profile: STRICT_INT4_PROFILE, group_width: expected.discovery.group_width(), semantics: SEMANTICS,
         evidence_passages, evidence_bytes, synthesis_prompt_tokens, synthesis_generated_tokens,
         synthesis_reserved_work: expected.synthesis_reserve, synthesis_planned_work, synthesis_model_work,
@@ -325,9 +359,12 @@ fn finish<C: DecodeStepControl>(discovery: Int4QuestionRun, synthesis: Synthesis
         reserved_mask_node_visits: expected.reserved_mask_visits()?, synthesis_mask_node_visits, mask_node_visit_charge,
         verification_used, calibration: AnswerCalibration::Uncalibrated,
         citation_guarantee: CitationGuarantee::StructuralSourceMembership, semantic_support: SummarySemanticSupport::NotAssessed,
-        untrusted_fields: ["synthesis", "discovery.mapped.root.value"], synthesis, discovery };
-    expected.verify_completed(&run)?;
-    check_size(&run, cap).map_err(Int4SourceError::from)?;
+        untrusted_fields: ["synthesis", "discovery.mapped.root.value"], synthesis, discovery,
+        request_binding: expected.request_binding, result_binding: [0; 32] };
+    run.result_binding = completion_binding::result(b"fnlp-int4-question-synthesis-result-v1",
+        expected.request_binding, run.discovery.request_binding, run.discovery.result_binding,
+        &run, cap.min(expected.max_result_bytes), control)?;
+    expected.verify_completed_with_control(&run, control)?;
     checkpoint(control)?;
     Ok(run)
 }

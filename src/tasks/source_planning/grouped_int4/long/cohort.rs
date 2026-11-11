@@ -194,7 +194,8 @@ impl PreparedInt4SourceMap<'_> {
             return Err(Int4SourceError::InvalidResult.into());
         }
         let document = execution::complete(self.expected, self.limits.verification, task.remaining,
-            task.stats.model_work, task.masks, mapped, self.max_result_bytes())?;
+            task.stats.model_work, task.masks, mapped, self.max_result_bytes(),
+            &mut || checkpoint(&mut **control.borrow_mut()).map_err(Int4SourceMapError::from))?;
         let result = Int4SourceMapCohortRun { schema_version: 1, execution: INT4_SOURCE_MAP_COHORT_EXECUTION,
             document, cohorts: task.stats };
         let cap = self.max_result_bytes().checked_add(COHORT_ENVELOPE_BYTES).ok_or(Int4SourceMapError::WorkLimit)?;

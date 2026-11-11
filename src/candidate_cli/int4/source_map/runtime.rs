@@ -456,7 +456,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
                 let result = engine.synthesize_int4_source_summary_with_threads(&model, text,
                     Arc::clone(&planner), Arc::new(vocabulary), config, common.kernel,
                     common.compute.threads, cancellation).map_err(execution_error)?;
-                expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+                expected.verify_completed_with_control(result.result(), &mut DeadlineControl { started, deadline })
+                    .map_err(verification_error)?;
                 remaining()?;
                 publish_team_map(&provenance, result.result(), result.compute(), &planner,
                     limits.max_result_bytes + 4096, output, &publication)
@@ -464,14 +465,16 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
                 let result = engine.synthesize_int4_source_summary_cohorts(&model, text,
                     Arc::new(planner), Arc::new(vocabulary), config, common.kernel, cancellation)
                     .map_err(execution_error)?;
-                expected.verify_completed(&result.result().document).map_err(|_| CandidateError::Execution)?;
+                expected.verify_completed_with_control(&result.result().document, &mut DeadlineControl { started, deadline })
+                    .map_err(verification_error)?;
                 remaining()?;
                 publish_discovery_cohort(&provenance, &result.result().document,
                     &result.result().discovery_cohorts, chunks, limits.max_result_bytes + 4096, output, &publication)
             } else {
                 let result = engine.synthesize_int4_source_summary(&model, text, Arc::new(planner), Arc::new(vocabulary),
                     config, common.kernel, cancellation).map_err(execution_error)?;
-                expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+                expected.verify_completed_with_control(result.result(), &mut DeadlineControl { started, deadline })
+                    .map_err(verification_error)?;
                 remaining()?;
                 publish_checked(&Response { provenance: &provenance, output: result.result() },
                     limits.max_result_bytes + 4096, output, &publication)
@@ -484,7 +487,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
                 let result = engine.synthesize_int4_document_answer_with_threads(&model, text,
                     Arc::clone(&planner), Arc::new(vocabulary), config, common.kernel,
                     common.compute.threads, cancellation).map_err(execution_error)?;
-                expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+                expected.verify_completed_with_control(result.result(), &mut DeadlineControl { started, deadline })
+                    .map_err(verification_error)?;
                 remaining()?;
                 publish_team_map(&provenance, result.result(), result.compute(), &planner,
                     limits.max_result_bytes + 4096, output, &publication)
@@ -492,14 +496,16 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
                 let result = engine.synthesize_int4_document_answer_cohorts(&model, text,
                     Arc::new(planner), Arc::new(vocabulary), config, common.kernel, cancellation)
                     .map_err(execution_error)?;
-                expected.verify_completed(&result.result().document).map_err(|_| CandidateError::Execution)?;
+                expected.verify_completed_with_control(&result.result().document, &mut DeadlineControl { started, deadline })
+                    .map_err(verification_error)?;
                 remaining()?;
                 publish_discovery_cohort(&provenance, &result.result().document,
                     &result.result().discovery_cohorts, chunks, limits.max_result_bytes + 4096, output, &publication)
             } else {
                 let result = engine.synthesize_int4_document_answer(&model, text, Arc::new(planner), Arc::new(vocabulary),
                     config, common.kernel, cancellation).map_err(execution_error)?;
-                expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+                expected.verify_completed_with_control(result.result(), &mut DeadlineControl { started, deadline })
+                    .map_err(verification_error)?;
                 remaining()?;
                 publish_checked(&Response { provenance: &provenance, output: result.result() },
                     limits.max_result_bytes + 4096, output, &publication)
@@ -512,7 +518,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
                 let result = engine.synthesize_int4_document_answer_hierarchy_with_threads(&model, text,
                     Arc::clone(&planner), Arc::new(vocabulary), config, expected.limits(), common.kernel,
                     common.compute.threads, cancellation).map_err(execution_error)?;
-                expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+                expected.verify_completed_with_control(result.result(), &mut DeadlineControl { started, deadline })
+                    .map_err(verification_error)?;
                 remaining()?;
                 publish_team_map(&provenance, result.result(), result.compute(), &planner,
                     limits.max_result_bytes + 4096, output, &publication)
@@ -520,7 +527,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
                 let result = engine.synthesize_int4_document_answer_hierarchy_grouped(&model, text,
                     Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), schedule, common.kernel, cancellation)
                     .map_err(execution_error)?;
-                expected.verify_completed(&result.result().document).map_err(|_| CandidateError::Execution)?;
+                expected.verify_completed_with_control(&result.result().document, &mut DeadlineControl { started, deadline })
+                    .map_err(verification_error)?;
                 remaining()?;
                 publish_hierarchy_cohorts(&provenance, &result.result().document,
                     result.result().discovery_cohorts.as_ref(), &result.result().hierarchy_cohorts,
@@ -529,7 +537,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
                 let result = engine.synthesize_int4_document_answer_hierarchy_cohorts(&model, text,
                     Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), common.kernel, cancellation)
                     .map_err(execution_error)?;
-                expected.verify_completed(&result.result().document).map_err(|_| CandidateError::Execution)?;
+                expected.verify_completed_with_control(&result.result().document, &mut DeadlineControl { started, deadline })
+                    .map_err(verification_error)?;
                 remaining()?;
                 publish_discovery_cohort(&provenance, &result.result().document,
                     &result.result().discovery_cohorts, chunks, limits.max_result_bytes + 4096, output, &publication)
@@ -537,7 +546,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
                 let result = engine.synthesize_int4_document_answer_hierarchy(&model, text,
                     Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), common.kernel, cancellation)
                     .map_err(execution_error)?;
-                expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+                expected.verify_completed_with_control(result.result(), &mut DeadlineControl { started, deadline })
+                    .map_err(verification_error)?;
                 remaining()?;
                 publish_checked(&Response { provenance: &provenance, output: result.result() },
                     limits.max_result_bytes + 4096, output, &publication)
@@ -550,7 +560,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
                 let result = engine.synthesize_int4_source_summary_hierarchy_with_threads(&model, text,
                     Arc::clone(&planner), Arc::new(vocabulary), config, expected.limits(), common.kernel,
                     common.compute.threads, cancellation).map_err(execution_error)?;
-                expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+                expected.verify_completed_with_control(result.result(), &mut DeadlineControl { started, deadline })
+                    .map_err(verification_error)?;
                 remaining()?;
                 publish_team_map(&provenance, result.result(), result.compute(), &planner,
                     limits.max_result_bytes + 4096, output, &publication)
@@ -558,7 +569,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
                 let result = engine.synthesize_int4_source_summary_hierarchy_grouped(&model, text,
                     Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), schedule, common.kernel, cancellation)
                     .map_err(execution_error)?;
-                expected.verify_completed(&result.result().document).map_err(|_| CandidateError::Execution)?;
+                expected.verify_completed_with_control(&result.result().document, &mut DeadlineControl { started, deadline })
+                    .map_err(verification_error)?;
                 remaining()?;
                 publish_hierarchy_cohorts(&provenance, &result.result().document,
                     result.result().discovery_cohorts.as_ref(), &result.result().hierarchy_cohorts,
@@ -567,7 +579,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
                 let result = engine.synthesize_int4_source_summary_hierarchy_cohorts(&model, text,
                     Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), common.kernel, cancellation)
                     .map_err(execution_error)?;
-                expected.verify_completed(&result.result().document).map_err(|_| CandidateError::Execution)?;
+                expected.verify_completed_with_control(&result.result().document, &mut DeadlineControl { started, deadline })
+                    .map_err(verification_error)?;
                 remaining()?;
                 publish_discovery_cohort(&provenance, &result.result().document,
                     &result.result().discovery_cohorts, chunks, limits.max_result_bytes + 4096, output, &publication)
@@ -575,7 +588,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
                 let result = engine.synthesize_int4_source_summary_hierarchy(&model, text,
                     Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), common.kernel, cancellation)
                     .map_err(execution_error)?;
-                expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+                expected.verify_completed_with_control(result.result(), &mut DeadlineControl { started, deadline })
+                    .map_err(verification_error)?;
                 remaining()?;
                 publish_checked(&Response { provenance: &provenance, output: result.result() },
                     limits.max_result_bytes + 4096, output, &publication)

@@ -116,7 +116,8 @@ impl PreparedInt4SourceMap<'_> {
         driver.borrow_mut().checkpoint()?;
         if task.next_chunk != self.plans.len() { return Err(Int4SourceError::InvalidResult.into()); }
         let run = complete(self.expected, self.limits.verification, task.remaining,
-            task.work, task.masks, mapped, self.max_result_bytes())?;
+            task.work, task.masks, mapped, self.max_result_bytes(),
+            &mut || driver.borrow_mut().checkpoint().map_err(Int4SourceMapError::from))?;
         driver.borrow_mut().checkpoint()?;
         Ok(run)
     }
@@ -195,9 +196,12 @@ pub(super) fn reduce(input: ReduceInput<'_, SourceMapValue>,
     checkpoint()?;
     Ok(SourceMapValue { chunks })
 }
-pub(super) fn complete(expected: Int4SourceMapPreflight, verification: GroundingBudget,
-    remaining: GroundingBudget, work: Int4Work, masks: u64, mapped: MapReduceResult<SourceMapValue>, cap: u64)
-    -> Result<Int4SourceMapRun, Int4SourceMapError> {
+#[allow(clippy::too_many_arguments)]
+pub(super) fn complete<F>(expected: Int4SourceMapPreflight, verification: GroundingBudget,
+    remaining: GroundingBudget, work: Int4Work, masks: u64, mapped: MapReduceResult<SourceMapValue>, cap: u64,
+    check: &mut F) -> Result<Int4SourceMapRun, Int4SourceMapError>
+    where F: FnMut() -> Result<(), Int4SourceMapError> {
+    check()?;
     let mut run = Int4SourceMapRun { schema_version: 1, execution: INT4_SOURCE_MAP_EXECUTION,
         numerics_profile: STRICT_INT4_PROFILE, group_width: expected.group_width,
         task_spec: expected.task_spec, semantics: SEMANTICS,
@@ -206,9 +210,9 @@ pub(super) fn complete(expected: Int4SourceMapPreflight, verification: Grounding
         verification_used: SourceMapVerification::used(verification, remaining)?,
         untrusted_fields: ["mapped.root.value"], mapped,
         request_binding: expected.request_binding, result_binding: [0; 32] };
-    run.result_binding = private_digest(b"fnlp-int4-source-map-result-v1", &run, cap)?;
-    expected.verify_completed(&run)?;
-    check_size(&run, cap).map_err(Int4SourceError::from)?;
+    run.result_binding = completion_binding::source_map_result_with_checkpoints(&run,
+        cap.min(expected.max_result_bytes), check)?;
+    expected.verify_completed_with_checkpoints(&run, check)?;
     Ok(run)
 }
 

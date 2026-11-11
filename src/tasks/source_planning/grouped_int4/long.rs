@@ -15,6 +15,7 @@ use crate::{
         VerifiedSourceSpan, scan_occurrences},
 };
 mod execution;
+mod completion_binding;
 /// Shared native decoder layers over independently planned source chunks.
 pub mod cohort;
 pub mod summary;
@@ -136,8 +137,19 @@ impl Int4SourceMapPreflight {
     pub fn planned_work(&self) -> Int4Work { self.work }
     pub fn reserved_mask_visits(&self) -> u64 { self.masks }
     pub fn verify_completed(&self, run: &Int4SourceMapRun) -> Result<(), Int4SourceMapError> {
+        self.verify_completed_with_control(run, &mut completion_binding::Continue)
+    }
+    /// Verify the sealed complete result with the original cancellation owner.
+    pub fn verify_completed_with_control<C: DecodeStepControl>(&self, run: &Int4SourceMapRun,
+        control: &mut C) -> Result<(), Int4SourceMapError> {
+        self.verify_completed_with_checkpoints(run,
+            &mut || checkpoint(control).map_err(Int4SourceMapError::from))
+    }
+    pub(super) fn verify_completed_with_checkpoints<F>(&self, run: &Int4SourceMapRun, check: &mut F)
+        -> Result<(), Int4SourceMapError> where F: FnMut() -> Result<(), Int4SourceMapError> {
+        check()?;
         if run.request_binding != self.request_binding
-            || run.result_binding != private_digest(b"fnlp-int4-source-map-result-v1", run, self.max_result_bytes)? {
+            || run.result_binding != completion_binding::source_map_result_with_checkpoints(run, self.max_result_bytes, check)? {
             return Err(Int4SourceError::InvalidResult.into());
         }
         let root = run.mapped.root();
@@ -155,6 +167,7 @@ impl Int4SourceMapPreflight {
         }
         let mut next = VerifiedSourceSpan { byte_start: 0, byte_end: 0, scalar_start: 0, scalar_end: 0 };
         for (index, chunk) in root.value().chunks().enumerate() {
+            check()?;
             if chunk.chunk_id != index || chunk.source_span.byte_start != next.byte_end
                 || chunk.source_span.scalar_start != next.scalar_end || chunk.source_span.byte_end <= chunk.source_span.byte_start
                 || chunk.source_span.scalar_end <= chunk.source_span.scalar_start
@@ -166,6 +179,7 @@ impl Int4SourceMapPreflight {
         if next.byte_end != self.source_span.byte_end || next.scalar_end != self.source_span.scalar_end {
             return Err(Int4SourceError::InvalidResult.into());
         }
+        check()?;
         Ok(())
     }
 }
