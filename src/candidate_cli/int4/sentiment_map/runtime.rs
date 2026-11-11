@@ -29,6 +29,9 @@ fn planning_error(error: Int4SentimentMapError) -> CandidateError {
 fn sentiment_error(error: Int4SentimentError) -> CandidateError {
     error.cancellation().map(stopped).unwrap_or(CandidateError::Planning)
 }
+fn completion_error(error: Int4SentimentMapError) -> CandidateError {
+    error.cancellation().map(stopped).unwrap_or(CandidateError::Execution)
+}
 fn execution_error(error: HostedError) -> CandidateError {
     match error {
         HostedError::Stopped { stop, .. } => stopped(stop.kind),
@@ -114,7 +117,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         let result = engine.map_int4_sentiment_cohorts(&model, request, config, chunks,
             common.kernel, cancellation).map_err(execution_error)?;
         if let Some(expected) = expected {
-            expected.verify_completed(&result.result().output).map_err(|_| CandidateError::Execution)?;
+            expected.verify_completed_cohorts_with_control(result.result(), chunks,
+                &mut DeadlineControl { started, deadline }).map_err(completion_error)?;
         }
         remaining()?;
         let cohort = Cohort { schema_version: result.result().schema_version,
@@ -126,7 +130,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         let result = engine.map_int4_sentiment_with_threads(&model, request, config, common.kernel,
             common.compute.threads, cancellation).map_err(execution_error)?;
         if let Some(expected) = expected {
-            expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+            expected.verify_completed_with_control(result.result(), &mut DeadlineControl { started, deadline })
+                .map_err(completion_error)?;
         }
         let response = Response { provenance: &provenance, output: result.result(), cohort: None };
         publish_complete(&compute::Response { response: &response, compute: Some(result.compute()) },
@@ -135,7 +140,8 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         let result = engine.map_int4_sentiment(&model, request, config, common.kernel, cancellation)
             .map_err(execution_error)?;
         if let Some(expected) = expected {
-            expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+            expected.verify_completed_with_control(result.result(), &mut DeadlineControl { started, deadline })
+                .map_err(completion_error)?;
         }
         remaining()?;
         publish_complete(&Response { provenance: &provenance, output: result.result(), cohort: None },

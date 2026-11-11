@@ -234,7 +234,7 @@ impl<A: Int4SentimentDocumentBatchAdmission> BatchProcessor for NativeInt4Sentim
             if admitted != prepared.identities { return Err(BatchItemFailure::fatal(BatchCode::Admission)); }
             checkpoint(control)?;
             let result = self.backend.execute(&plan, &admitted, control).map_err(|e| map_failure(e, true))?;
-            backend::verify_completed(&prepared.expected, self.compiler.cohort_chunks, &result)
+            backend::verify_completed(&prepared.expected, self.compiler.cohort_chunks, &result, control)
                 .map_err(|e| map_failure(e, true))?;
             checkpoint(control)?;
             // GuardedOutput destroys the complete value before its reservation;

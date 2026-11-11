@@ -11,6 +11,7 @@ use fixtures::Continue;
 
 mod capacity;
 mod execution;
+mod binding;
 
 fn task_budget() -> TaskBudget { fixtures::budget() }
 fn fixture() -> (&'static SentimentPlanner, &'static ExecutionIdentity) {
@@ -50,7 +51,8 @@ fn prepare_with_control<'a, C: DecodeStepControl>(request: &'a SentimentRequest,
     let planning = SentimentLimits::default();
     let capacity = planner.source_capacity(&request.axes, request.budget, task_budget(), planning,
         limits.chunks.context_tokens).map_err(Int4SentimentError::from)?;
-    PreparedInt4SentimentMap::compile(request, limits, capacity, 32, control, |row, control|
+    PreparedInt4SentimentMap::compile(request, limits, capacity, 32,
+        super::binding::Authority { ceiling: task_budget(), planning }, control, |row, control|
         planner.compile_int4(row, &PlanContext::new(identity, task_budget()).unwrap(), planning, 32, control))
 }
 fn heads(plan: &PreparedInt4Sentiment) -> Int4CandidateCohortRun {

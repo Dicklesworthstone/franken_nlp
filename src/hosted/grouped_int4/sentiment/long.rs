@@ -6,7 +6,6 @@ use crate::{native_engine::lmhead::NANBEIGE_VOCAB_SIZE,
             long::{Int4SentimentMapCohortBudget, Int4SentimentMapCohortRun,
                 Int4SentimentMapError, Int4SentimentMapLimits, Int4SentimentMapPreflight,
                 Int4SentimentMapRun, PreparedInt4SentimentMap,
-                INT4_SENTIMENT_MAP_COHORT_EXECUTION,
                 memory::{Int4SentimentMapMemoryLimits, Int4SentimentMapMemoryRequirement}}}}};
 
 /// Fixed per-chunk semantics and complete-document work/result allowances.
@@ -166,13 +165,8 @@ impl NlpEngine {
                         max_task_workspace_bytes: required.task_workspace_bytes,
                         max_output_bytes: required.max_cohort_output_bytes,
                     }, control).map_err(map_error)?;
-                if result.schema_version != 1 || result.execution != INT4_SENTIMENT_MAP_COHORT_EXECUTION
-                    || result.chunk_cohorts != prepared.chunk_count().div_ceil(cohort_chunks)
-                    || result.group_steps == 0 || result.group_steps > result.output.model_work.forward_positions
-                    || result.projection_groups == 0 || result.projection_groups > result.output.model_work.projected_logits {
-                    return Err(map_error(Int4SentimentMapError::Admission));
-                }
-                finish(&expected, &result.output, control)?;
+                expected.verify_completed_cohorts_with_control(&result, cohort_chunks, control).map_err(map_error)?;
+                checkpoint(control)?;
                 Ok(result)
             })?;
             drop(admitted);
@@ -264,7 +258,7 @@ fn finish(expected: &Int4SentimentMapPreflight, document: &Int4SentimentMapRun,
     // This verifies complete canonical document bytes as well as every chunk
     // and work counter. The sealed cohort executor separately checks its
     // fixed-size physical wrapper; do not allocate a redundant second tree.
-    expected.verify_completed(document).map_err(map_error)?;
+    expected.verify_completed_with_control(document, control).map_err(map_error)?;
     checkpoint(control)
 }
 fn native_budget(required: Int4MemoryRequirement) -> Int4MemoryBudget {

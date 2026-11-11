@@ -3,7 +3,7 @@
 use super::*;
 use crate::{native_engine::strict_int4::Int4MemoryBudget,
     tasks::sentiment::grouped_int4::long::{PreparedInt4SentimentMap,
-        Int4SentimentMapCohortBudget, INT4_SENTIMENT_MAP_COHORT_EXECUTION,
+        Int4SentimentMapCohortBudget,
         memory::Int4SentimentMapMemoryRequirement}};
 
 pub(super) enum Backend<'e, 'w> {
@@ -109,17 +109,14 @@ fn cohort_budget(work: Int4Work, required: Int4SentimentMapMemoryRequirement) ->
         max_output_bytes: required.max_cohort_output_bytes }
 }
 
-pub(super) fn verify_completed(expected: &Int4SentimentMapPreflight, chunks: Option<usize>,
-    result: &Int4SentimentDocumentRun) -> Result<(), Int4SentimentMapError> {
+pub(super) fn verify_completed<C: DecodeStepControl>(expected: &Int4SentimentMapPreflight, chunks: Option<usize>,
+    result: &Int4SentimentDocumentRun, control: &mut C) -> Result<(), Int4SentimentMapError> {
     match (chunks, result) {
-        (None, Int4SentimentDocumentRun::Serial(run)) => expected.verify_completed(run),
+        (None, Int4SentimentDocumentRun::Serial(run)) => expected.verify_completed_with_control(run, control),
         (Some(chunks), Int4SentimentDocumentRun::ChunkCohorts(run)) => {
-            if run.schema_version != 1 || run.execution != INT4_SENTIMENT_MAP_COHORT_EXECUTION {
-                return Err(Int4SentimentMapError::Admission);
-            }
             verify_schedule(expected.chunk_count(), chunks, run.chunk_cohorts,
                 run.group_steps, run.projection_groups, expected.planned_work())?;
-            expected.verify_completed(&run.output)
+            expected.verify_completed_cohorts_with_control(run, chunks, control)
         }
         _ => Err(Int4SentimentMapError::Admission),
     }

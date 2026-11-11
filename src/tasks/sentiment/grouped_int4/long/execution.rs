@@ -79,9 +79,19 @@ impl PreparedInt4SentimentMap<'_> {
             drop(engine); checkpoint(control)?;
         }
         let output = collected.finish(control)?;
-        let run = Int4SentimentMapCohortRun { schema_version: 1, execution: INT4_SENTIMENT_MAP_COHORT_EXECUTION.to_owned(),
-            chunk_cohorts: windows.len(), group_steps, projection_groups, output };
-        value_bytes(&run, self.limits.max_result_bytes.checked_add(4096).ok_or(Int4SentimentMapError::Limits)?)?;
+        self.complete_cohorts(output, cohort_chunks, windows.len(), group_steps, projection_groups, control)
+    }
+
+    pub(super) fn complete_cohorts<C: DecodeStepControl>(&self, output: Int4SentimentMapRun,
+        cohort_chunks: usize, chunk_cohorts: usize, group_steps: u64, projection_groups: u64,
+        control: &mut C) -> Result<Int4SentimentMapCohortRun, Int4SentimentMapError> {
+        checkpoint(control)?;
+        let cap = self.limits.max_result_bytes.checked_add(COHORT_WRAPPER_BYTES).ok_or(Int4SentimentMapError::Limits)?;
+        let mut run = Int4SentimentMapCohortRun { schema_version: 1, execution: INT4_SENTIMENT_MAP_COHORT_EXECUTION.to_owned(),
+            chunk_cohorts, group_steps, projection_groups, output,
+            executed_cohort_chunks: cohort_chunks.min(self.chunk_count()), result_binding: [0; 32] };
+        run.result_binding = binding::cohort_with_control(&run, cap, control)?;
+        self.expected.verify_completed_cohorts_with_control(&run, cohort_chunks, control)?;
         checkpoint(control)?; Ok(run)
     }
 
@@ -104,7 +114,8 @@ impl PreparedInt4SentimentMap<'_> {
 
     pub(super) fn cohort_windows<C: DecodeStepControl>(&self, admitted: &[ExecutionIdentity], chunks: usize,
         budget: Int4SentimentMapCohortBudget, control: &mut C) -> Result<Vec<Window>, Int4SentimentMapError> {
-        if chunks == 0 || chunks.checked_mul(self.head_count()).is_none_or(|heads| heads > MAX_INT4_SEQUENCES)
+        if chunks == 0 || chunks > self.limits.chunks.max_chunks || self.head_count() == 0
+            || chunks.checked_mul(self.head_count()).is_none_or(|heads| heads > MAX_INT4_SEQUENCES)
             || admitted.len() != self.plans.len() || !(1..=MAX_BYTES).contains(&budget.max_output_bytes)
             || budget.max_task_workspace_bytes == 0 { return Err(Int4SentimentMapError::Limits); }
         check_work(self.expected.work, budget.native)?;
@@ -176,12 +187,14 @@ impl<'map, 'source> Collection<'map, 'source> {
         let aggregate = aggregate_with_control(self.chunks.iter().map(|chunk| SentimentChunkView {
             chunk_id: chunk.chunk_id, span: chunk.source_span, result: &chunk.run.result }), self.chunks.len(),
             span.byte_end, span.scalar_end, self.prepared.limits.aggregation, control)?;
-        let run = Int4SentimentMapRun { schema_version: 1, execution: INT4_SENTIMENT_MAP_EXECUTION.to_owned(),
+        let mut run = Int4SentimentMapRun { schema_version: 1, execution: INT4_SENTIMENT_MAP_EXECUTION.to_owned(),
             numerics_profile: STRICT_INT4_PROFILE.to_owned(), group_width: self.prepared.group_width(),
             chunk_profile: CHUNK_PROFILE.to_owned(), semantics: SEMANTICS.to_owned(), single_context_equivalence: false,
             source_span: span, chunk_limits: self.prepared.chunks.limits(), tokenizer_checks: self.prepared.chunks.tokenizer_calls(),
             planned_model_work: self.prepared.planned_work(), model_work: self.work, retained_result_bytes: self.bytes,
-            chunks: self.chunks, aggregate };
+            chunks: self.chunks, aggregate, request_binding: self.prepared.expected.request_binding,
+            result_binding: [0; 32] };
+        run.result_binding = binding::result_with_control(&run, self.prepared.limits.max_result_bytes, control)?;
         value_bytes(&run, self.prepared.limits.max_result_bytes)?; checkpoint(control)?; Ok(run)
     }
 }

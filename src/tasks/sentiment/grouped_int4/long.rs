@@ -15,12 +15,14 @@ use crate::{native_engine::{int4::PackedInt4Kernel,
     validation::grounded_fields::VerifiedSourceSpan};
 
 mod execution;
+mod binding;
 pub mod memory;
 pub const INT4_SENTIMENT_MAP_EXECUTION: &str = "grouped-int4-complete-sentiment-map-v1";
 pub const INT4_SENTIMENT_MAP_COHORT_EXECUTION: &str = "grouped-int4-sentiment-chunk-cohorts-v1";
 pub const MAX_SENTIMENT_MAP_CHUNKS: usize = 256;
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
 const SEMANTICS: &str = "independent-chunks-flat-source-scalar-mixture-v1";
+const COHORT_WRAPPER_BYTES: u64 = 4096;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Int4SentimentMapLimits {
@@ -101,7 +103,7 @@ pub struct Int4SentimentMapChunk {
 }
 /// Complete native output only; no caller-supplied result constructor enters
 /// the executable path. The aggregate never replaces the original chunks.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 pub struct Int4SentimentMapRun {
     pub schema_version: u32,
     pub execution: String,
@@ -118,8 +120,25 @@ pub struct Int4SentimentMapRun {
     pub retained_result_bytes: u64,
     pub chunks: Vec<Int4SentimentMapChunk>,
     pub aggregate: SentimentAggregate,
+    #[serde(skip)]
+    request_binding: [u8; 32],
+    #[serde(skip)]
+    result_binding: [u8; 32],
 }
-#[derive(Clone, Debug, PartialEq, Serialize)]
+impl fmt::Debug for Int4SentimentMapRun {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Int4SentimentMapRun")
+            .field("schema_version", &self.schema_version).field("execution", &self.execution)
+            .field("numerics_profile", &self.numerics_profile).field("group_width", &self.group_width)
+            .field("chunk_profile", &self.chunk_profile).field("semantics", &self.semantics)
+            .field("single_context_equivalence", &self.single_context_equivalence)
+            .field("source_span", &self.source_span).field("chunk_limits", &self.chunk_limits)
+            .field("tokenizer_checks", &self.tokenizer_checks).field("planned_model_work", &self.planned_model_work)
+            .field("model_work", &self.model_work).field("retained_result_bytes", &self.retained_result_bytes)
+            .field("chunks", &self.chunks).field("aggregate", &self.aggregate).finish()
+    }
+}
+#[derive(Clone, PartialEq, Serialize)]
 pub struct Int4SentimentMapCohortRun {
     pub schema_version: u32,
     pub execution: String,
@@ -127,6 +146,18 @@ pub struct Int4SentimentMapCohortRun {
     pub group_steps: u64,
     pub projection_groups: u64,
     pub output: Int4SentimentMapRun,
+    #[serde(skip)]
+    executed_cohort_chunks: usize,
+    #[serde(skip)]
+    result_binding: [u8; 32],
+}
+impl fmt::Debug for Int4SentimentMapCohortRun {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Int4SentimentMapCohortRun")
+            .field("schema_version", &self.schema_version).field("execution", &self.execution)
+            .field("chunk_cohorts", &self.chunk_cohorts).field("group_steps", &self.group_steps)
+            .field("projection_groups", &self.projection_groups).field("output", &self.output).finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -137,7 +168,7 @@ pub struct Int4SentimentMapCohortBudget {
     pub max_output_bytes: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Int4SentimentMapPreflight {
     source_span: VerifiedSourceSpan,
     chunks: usize,
@@ -149,6 +180,17 @@ pub struct Int4SentimentMapPreflight {
     aggregation: SentimentAggregationPolicy,
     chunk_limits: ChunkLimits,
     tokenizer_checks: usize,
+    request_binding: [u8; 32],
+}
+impl fmt::Debug for Int4SentimentMapPreflight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Int4SentimentMapPreflight")
+            .field("source_span", &self.source_span).field("chunks", &self.chunks)
+            .field("heads", &self.heads).field("group_width", &self.group_width).field("work", &self.work)
+            .field("max_retained_bytes", &self.max_retained_bytes).field("max_result_bytes", &self.max_result_bytes)
+            .field("aggregation", &self.aggregation).field("chunk_limits", &self.chunk_limits)
+            .field("tokenizer_checks", &self.tokenizer_checks).finish_non_exhaustive()
+    }
 }
 impl Int4SentimentMapPreflight {
     pub fn source_span(&self) -> VerifiedSourceSpan { self.source_span }
@@ -156,9 +198,18 @@ impl Int4SentimentMapPreflight {
     pub fn group_width(&self) -> usize { self.group_width }
     pub fn planned_work(&self) -> Int4Work { self.work }
     pub fn max_result_bytes(&self) -> u64 { self.max_result_bytes }
-    /// Verify complete geometry and accounting; this is not an authenticator
-    /// for external JSON or a substitute for the sealed native execution.
+    /// Verify private request association and the unchanged native payload.
+    /// Neither a geometric match nor external JSON can mint these seals.
     pub fn verify_completed(&self, run: &Int4SentimentMapRun) -> Result<(), Int4SentimentMapError> {
+        self.verify_completed_with_control(run, &mut binding::Continue)
+    }
+    pub fn verify_completed_with_control<C: DecodeStepControl>(&self, run: &Int4SentimentMapRun,
+        control: &mut C) -> Result<(), Int4SentimentMapError> {
+        checkpoint(control)?;
+        if run.request_binding != self.request_binding
+            || run.result_binding != binding::result_with_control(run, self.max_result_bytes, control)? {
+            return Err(Int4SentimentMapError::Admission);
+        }
         if run.schema_version != 1 || run.execution != INT4_SENTIMENT_MAP_EXECUTION
             || run.numerics_profile != STRICT_INT4_PROFILE || run.group_width != self.group_width
             || run.chunk_profile != CHUNK_PROFILE || run.semantics != SEMANTICS || run.single_context_equivalence
@@ -167,7 +218,10 @@ impl Int4SentimentMapPreflight {
             || run.aggregate.policy != self.aggregation || run.aggregate.chunk_count != self.chunks
             || run.aggregate.source_bytes != self.source_span.byte_end
             || run.aggregate.source_scalars != self.source_span.scalar_end
-            || run.aggregate.dimensions.len() != self.heads || run.retained_result_bytes > self.max_retained_bytes {
+            || run.aggregate.dimensions.len() != self.heads || run.retained_result_bytes > self.max_retained_bytes
+            // serde_json maps nonfinite floats to null, just like None.
+            // The private byte seal therefore needs this typed check too.
+            || run.aggregate.dimensions.iter().any(|axis| axis.estimate.is_some_and(|value| !value.is_finite())) {
             return Err(Int4SentimentMapError::Admission);
         }
         if run.chunk_limits != self.chunk_limits || run.tokenizer_checks != self.tokenizer_checks {
@@ -175,13 +229,15 @@ impl Int4SentimentMapPreflight {
         }
         let mut byte = 0; let mut scalar = 0; let mut work = Int4Work::default(); let mut retained = 0_u64;
         for (index, chunk) in run.chunks.iter().enumerate() {
+            checkpoint(control)?;
             let span = chunk.source_span;
             if chunk.chunk_id != index || span.byte_start != byte || span.scalar_start != scalar
                 || span.byte_end <= span.byte_start || span.scalar_end <= span.scalar_start
                 || chunk.source_tokens != span.byte_end - span.byte_start
                 || chunk.run.schema_version != 1 || chunk.run.execution != INT4_SENTIMENT_EXECUTION
                 || chunk.run.numerics_profile != STRICT_INT4_PROFILE || chunk.run.group_width != self.group_width
-                || chunk.run.head_count != self.heads || chunk.run.result.dimensions.len() != self.heads {
+                || chunk.run.head_count != self.heads || chunk.run.result.dimensions.len() != self.heads
+                || chunk.run.result.dimensions.iter().any(|axis| axis.estimate.is_some_and(|value| !value.is_finite())) {
                 return Err(Int4SentimentMapError::Admission);
             }
             byte = span.byte_end; scalar = span.scalar_end;
@@ -191,7 +247,31 @@ impl Int4SentimentMapPreflight {
         }
         if byte != self.source_span.byte_end || scalar != self.source_span.scalar_end
             || work != self.work || retained != run.retained_result_bytes { return Err(Int4SentimentMapError::Admission); }
-        execution::value_bytes(run, self.max_result_bytes)?; Ok(())
+        execution::value_bytes(run, self.max_result_bytes)?; checkpoint(control)
+    }
+    /// Cohort diagnostics belong to this exact completed request as well as
+    /// its semantic output; valid-looking replacement counters are refused.
+    pub fn verify_completed_cohorts(&self, run: &Int4SentimentMapCohortRun, cohort_chunks: usize)
+        -> Result<(), Int4SentimentMapError> {
+        self.verify_completed_cohorts_with_control(run, cohort_chunks, &mut binding::Continue)
+    }
+    pub fn verify_completed_cohorts_with_control<C: DecodeStepControl>(&self, run: &Int4SentimentMapCohortRun,
+        cohort_chunks: usize, control: &mut C) -> Result<(), Int4SentimentMapError> {
+        checkpoint(control)?;
+        let cap = self.max_result_bytes.checked_add(COHORT_WRAPPER_BYTES).ok_or(Int4SentimentMapError::Limits)?;
+        if run.result_binding != binding::cohort_with_control(run, cap, control)?
+            || cohort_chunks == 0 || cohort_chunks > self.chunk_limits.max_chunks || self.heads == 0
+            || cohort_chunks.checked_mul(self.heads).is_none_or(|heads| heads > MAX_INT4_SEQUENCES)
+            || run.executed_cohort_chunks != cohort_chunks.min(self.chunks)
+            || run.schema_version != 1 || run.execution != INT4_SENTIMENT_MAP_COHORT_EXECUTION
+            || run.chunk_cohorts != self.chunks.div_ceil(cohort_chunks)
+            || run.group_steps == 0 || run.group_steps > self.work.forward_positions
+            || run.projection_groups == 0 || run.projection_groups > self.work.projected_logits {
+            return Err(Int4SentimentMapError::Admission);
+        }
+        self.verify_completed_with_control(&run.output, control)?;
+        execution::value_bytes(run, cap)?;
+        checkpoint(control)
     }
 }
 
@@ -209,13 +289,16 @@ impl Int4SentimentPlanner {
         limits: Int4SentimentMapLimits, control: &mut C) -> Result<PreparedInt4SentimentMap<'a>, Int4SentimentMapError> {
         checkpoint(control)?; limits.validate(request.budget)?;
         let capacity = self.max_document_bytes(&request.axes, request.budget, limits.chunks.context_tokens)?;
-        PreparedInt4SentimentMap::compile(request, limits, capacity, self.group_width(), control,
+        PreparedInt4SentimentMap::compile(request, limits, capacity, self.group_width(),
+            binding::Authority { ceiling: self.task_budget(), planning: self.planning_limits() }, control,
             |request, control| self.plan_with_control(request, control))
     }
 }
 impl<'a> PreparedInt4SentimentMap<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn compile<C: DecodeStepControl, F>(request: &'a SentimentRequest, limits: Int4SentimentMapLimits,
-        capacity: usize, width: usize, control: &mut C, mut prepare: F) -> Result<Self, Int4SentimentMapError>
+        capacity: usize, width: usize, authority: binding::Authority,
+        control: &mut C, mut prepare: F) -> Result<Self, Int4SentimentMapError>
     where F: FnMut(&SentimentRequest, &mut C) -> Result<PreparedInt4Sentiment, Int4SentimentError> {
         limits.validate(request.budget)?;
         if request.document.is_empty() { return Err(Int4SentimentMapError::EmptySource); }
@@ -235,7 +318,8 @@ impl<'a> PreparedInt4SentimentMap<'a> {
             byte_end: end.byte_end, scalar_start: 0, scalar_end: end.scalar_end }, chunks: chunks.chunks().len(),
             heads: request.axes.len(), group_width: width, work: Int4Work::default(),
             max_retained_bytes: limits.max_retained_result_bytes, max_result_bytes: limits.max_result_bytes,
-            aggregation: limits.aggregation, chunk_limits: chunks_limits, tokenizer_checks: chunks.tokenizer_calls() };
+            aggregation: limits.aggregation, chunk_limits: chunks_limits, tokenizer_checks: chunks.tokenizer_calls(),
+            request_binding: [0; 32] };
         let mut plans = reserved(expected.chunks)?;
         for chunk in chunks.chunks() {
             checkpoint(control)?;
@@ -249,6 +333,7 @@ impl<'a> PreparedInt4SentimentMap<'a> {
             if !fits(expected.work, limits.max_model_work) { return Err(Int4SentimentMapError::Work); }
             plans.push(plan);
         }
+        expected.request_binding = binding::request(request, limits, authority, &chunks, &plans, control)?;
         checkpoint(control)?;
         Ok(Self { chunks, plans, limits, expected, task: request.budget })
     }
