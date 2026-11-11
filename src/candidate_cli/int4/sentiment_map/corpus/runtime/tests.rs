@@ -93,8 +93,9 @@ fn cancellation_preserves_actual_causes_and_never_claims_earlier_frames_were_unp
 #[test]
 fn candidate_frames_preserve_native_bytes_and_report_only_the_declared_public_schedule() {
     let need = Int4SnapshotRequirements::for_group_width(128).unwrap();
-    for (operation, cohort_chunks) in [(None, None), (Some("saved"), None), (Some("loaded"), None),
-        (None, Some(1)), (Some("saved"), Some(4)), (Some("loaded"), Some(4))] {
+    for (operation, cohort_chunks, threads) in [(None, None, 1), (Some("saved"), None, 1), (Some("loaded"), None, 1),
+        (None, Some(1), 1), (Some("saved"), Some(4), 1), (Some("loaded"), Some(4), 1),
+        (None, None, 2), (Some("saved"), None, 4), (Some("loaded"), None, 64)] {
         let provenance = Provenance {
             protocol: "fnlp-candidate-int4-sentiment-corpus-v1", schema_version: 1,
             scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "sentiment",
@@ -104,7 +105,7 @@ fn candidate_frames_preserve_native_bytes_and_report_only_the_declared_public_sc
             candidate_format: "fixture-format", quant_recipe: "fixture-recipe:group=128",
             group_width: 128, integer_kernel: "s_scalar_i32",
             snapshot: operation.map(|name| SnapshotRecord::new(name, need)),
-            input_encoding: None,
+            input_encoding: None, compute_schedule: compute::Schedule::for_threads(threads),
         };
         // Framing bytes are a transport fixture, never invented native scores.
         let inner = "{\"event\":\"fixture\",\"result\":{\"label\":\"café 上海\",\"single_context_equivalence\":false,\"exact\":12345678901234567890123456789012345678}}\n";
@@ -127,6 +128,12 @@ fn candidate_frames_preserve_native_bytes_and_report_only_the_declared_public_sc
             assert!(value.get("cohort_chunks").is_none());
         }
         assert_eq!(value["evidence"], "non_authoritative");
+        if threads == 1 { assert!(value.get("compute_schedule").is_none()); }
+        else {
+            assert_eq!(value["compute_schedule"]["execution"], "int4-output-row-team-v1");
+            assert_eq!(value["compute_schedule"]["declared_compute_threads"], threads);
+        }
+        assert!(value.get("compute").is_none(), "no native projection receipt is fabricated");
         assert_eq!(value["record"]["result"]["single_context_equivalence"], false);
         if let Some(operation) = operation {
             assert_eq!(value["snapshot"]["operation"], operation);
@@ -151,7 +158,8 @@ mod model;
 
 #[test]
 fn compact_host_and_cli_quotes_share_one_encoder_reservation() {
-    for schedule in [vec![], vec!["--cohort-chunks", "2", "--max-axes", "2"]] {
+    for schedule in [vec![], vec!["--cohort-chunks", "2", "--max-axes", "2"],
+        vec!["--compute-threads", "4"], vec!["--compute-threads", "64"]] {
         let mut flags = schedule;
         flags.extend(["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "262144",
             "--max-tokenizer-output-tokens", "131072"]);
@@ -169,5 +177,22 @@ fn compact_host_and_cli_quotes_share_one_encoder_reservation() {
             + retained_metadata_bytes(limits.document.mapping.chunks.max_chunks).unwrap());
         assert_eq!(quote.native, limits.document.memory.native);
         assert_eq!(quote.workspace_bytes, limits.document.memory.workspace_bytes);
+        let config = compute::resource_config(limits.common);
+        assert_eq!(config.scoped_cpu_children_per_coordinator, limits.common.compute.threads - 1);
+        assert_eq!(config.thread_ceiling, limits.common.compute.threads + 1);
+        let execution = quote.native.kv_bytes + quote.workspace_bytes + quote.input_bytes
+            + quote.output_reservation_bytes + limits.common.compute.workspace_bytes;
+        assert!(limits.cli_preparation_bytes + limits.common.load.weight_payload_bytes
+            + ALLOCATOR_BYTES + execution + CLEANUP_BYTES <= limits.common.minimum_memory_bytes);
     }
+}
+
+#[test]
+fn runtime_rechecks_team_cohort_conflicts_before_private_io() {
+    let command = command(&["--compute-threads", "4"]);
+    let Int4Command { task: Int4Task::SentimentCorpus(mut options), args, batch: None, job: None } = command
+        else { panic!("sentiment corpus required"); };
+    let admitted = options.validate(&args).unwrap();
+    options.document.mapping.cohort_chunks = Some(1);
+    assert_eq!(execute(args, options, admitted, NoIo, NoIo), Err(CandidateError::Arguments));
 }

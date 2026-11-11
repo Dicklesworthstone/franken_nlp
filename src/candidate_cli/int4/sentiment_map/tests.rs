@@ -50,7 +50,9 @@ fn complete_sentiment_team_preserves_axis_authority_and_prices_worker_storage_on
             + limits.common.compute.workspace_bytes;
         assert!(limits.common.minimum_memory_bytes >= limits.cli_preparation_bytes
             + limits.common.load.weight_payload_bytes + ALLOCATOR_BYTES + execution + CLEANUP_BYTES);
-        assert!(options.validate(&command.args).is_err(), "corpus/job admission remains serial or cohort");
+        let population = options.validate_with_max_axes(&command.args, 4).unwrap();
+        assert_eq!(population.common.compute, limits.common.compute);
+        assert_eq!(population.memory, limits.memory);
     }
 }
 
@@ -64,8 +66,12 @@ fn complete_sentiment_team_refuses_invalid_widths_and_conflicting_schedules_befo
     assert_eq!(short.execute(&mut NoRead, &mut NoWrite), Err(CandidateError::Arguments));
     let explicit_serial = command(&["--compute-threads", "1", "--cohort-chunks", "2"]);
     assert!(selected(&explicit_serial).validate_with_threads(&explicit_serial.args).is_ok());
-    assert!(!corpus::definition().get_arguments().any(|arg| arg.get_id() == "compute_threads"));
-    assert!(!job::definition().get_arguments().any(|arg| arg.get_id() == "compute_threads"));
+    assert!(corpus::definition().get_arguments().any(|arg| arg.get_id() == "compute_threads"));
+    let jobs = job::definition();
+    for operation in ["start", "resume"] {
+        assert!(jobs.find_subcommand(operation).unwrap().get_arguments()
+            .any(|arg| arg.get_id() == "compute_threads"));
+    }
 }
 
 #[test]
@@ -289,14 +295,15 @@ fn invalid_compact_work_and_repeated_presave_planning_refuse_before_private_io()
 }
 
 #[test]
-fn complete_population_routes_expose_compact_policy_but_keep_compute_separate() {
+fn complete_population_routes_expose_compact_policy_and_physical_team_options() {
     let corpus = corpus::definition();
     assert!(corpus.get_arguments().any(|arg| arg.get_id() == "input_encoding"));
+    assert!(corpus.get_arguments().any(|arg| arg.get_id() == "compute_threads"));
     let jobs = job::definition();
     for operation in ["start", "resume"] {
         let definition = jobs.find_subcommand(operation).unwrap();
         assert!(definition.get_arguments().any(|arg| arg.get_id() == "input_encoding"));
-        assert!(!definition.get_arguments().any(|arg| arg.get_id() == "compute_threads"));
+        assert!(definition.get_arguments().any(|arg| arg.get_id() == "compute_threads"));
     }
     let compact = command(&["--input-encoding", "safe-bpe-v1"]);
     selected(&compact).validate_with_max_axes(&compact.args, 4).unwrap();

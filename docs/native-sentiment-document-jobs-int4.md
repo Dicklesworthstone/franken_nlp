@@ -123,7 +123,8 @@ reconstruction for execution. The stored private recipe authenticates every
 ceiling before replay or tail repair. A changed policy refuses resume, including
 when `--use-retained-input` reads the authenticated original population.
 
-Compact serial and chunk-cohort jobs admit one encoder workspace. Reaching a
+Compact serial, persistent-team and chunk-cohort jobs admit one encoder
+workspace. Numerical teams and chunk cohorts are mutually exclusive. Reaching a
 tokenizer ceiling refuses the document before any native forward, with no
 truncation or fallback. Per-pass result work remains deterministic; the private
 attempt ledger includes both planning passes. Native work and failed attempts
@@ -134,6 +135,36 @@ pinned snapshot, and refuses `--save-snapshot` before IO.
 Embedding callers select `Int4SentimentPlanner::with_document_encoding` before
 constructing `Int4SentimentDocumentJobPlanner`; no record argument may override
 that sealed policy.
+
+## Persistent numerical teams
+
+Add `--compute-threads 4` to `start` or `resume` for one coordinator and three
+persistent output-row workers across the complete invocation, with an additional
+runtime thread. Every original document, chunk and selected sentiment axis uses
+that team. The existing scorer and reducer retain their original axis order,
+decision thresholds, coverage, distributions, source spans and aggregate
+statistics. Byte fallback and explicit compact input use their existing fixed
+policies and work ledgers.
+
+Width one preserves serial execution; widths 2..64 add one worker workspace
+and the corresponding process thread capacity to pre-IO admission. Multiple
+workers cannot combine with any explicit `--cohort-chunks`, including one.
+All workers physically join before successful job progress is returned, and
+the original invocation deadline continues through final metadata publication.
+
+Numerical worker width is excluded from the authenticated recipe. An explicit
+resume may select another admitted width while retaining the original inputs,
+axes, thresholds, encoding, task limits and native lifetime work. Attempts and
+failed-work debits never renew. Stdout adds optional physical `compute_schedule`
+metadata (`int4-output-row-team-v1`, `declared_compute_threads`); width one omits
+it and stored semantic results keep their serial format.
+
+Embedding callers use `NlpEngine::job_int4_sentiment_document_with_threads`
+with `compute_threads` after `kernel` and before `reader` for widths 2..64.
+The existing method retains serial execution. Source review and regression
+definitions cover admission, ownership, cancellation, output framing and recipe
+invariance; compilation, executable tests and model comparison remain pending
+the prescribed DSR production checkpoint.
 
 ## Work, memory and recovery
 
@@ -161,8 +192,9 @@ instead of the twelve in the omitted-option quote. It does not increase any
 work allowance. A cap below four requires compatible explicit defaults, since
 omitting `--defaults` still selects all four axes.
 
-The schedule, exact width, fixed axes and task budget are part of the
-authenticated job recipe. Repeat them on resume, including `--max-axes` when
+The chunk-cohort schedule, exact chunk width, fixed axes and task budget are
+part of the authenticated job recipe. Numerical worker width is separate.
+Repeat the authenticated settings on resume, including `--max-axes` when
 it was used at creation. Adding a narrower cap to an existing job would change
 its authenticated task budget; it is not a way to rewrite stored authority.
 

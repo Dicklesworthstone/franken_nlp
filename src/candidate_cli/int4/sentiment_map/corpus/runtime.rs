@@ -2,7 +2,7 @@
 use super::*;
 use std::{io::{BufRead, BufReader}, time::{Duration, Instant}};
 use crate::{
-    NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
+    NlpEngine, MemoryClass,
     batch::sentiment::grouped_int4::Int4SentimentDocumentBatchPlanner,
     candidate_cli::{batch::{CandidateWriter, completed}, int4::scored_batch::runtime::sentiment_options},
     hosted::{CancellationToken, HostedError, Int4HostError, NativeLimits, RunLimits,
@@ -49,12 +49,8 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
-    let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
-        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: common.memory_bytes,
-        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
-    }).build().map_err(|_| CandidateError::Runtime)?;
+    let engine = NlpEngine::builder().resource_config(compute::resource_config(common))
+        .build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
     // Charge defaults/parser and transport storage before allocation, retaining
     // the owner through native physical drain and the final writer flush.
@@ -126,6 +122,7 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
         candidate_format: &identity.artifact_format, quant_recipe: &identity.quant_recipe,
         group_width: model.model_identity().group_width(), integer_kernel: common.kernel.kind().id(), snapshot,
         input_encoding: input_encoding::reported_policy(&encoding),
+        compute_schedule: compute::Schedule::for_threads(common.compute.threads),
     };
     let writer = CandidateWriter::new(output, &provenance, limits.transport.max_output_line_bytes, limits.output_bytes)?;
     let reader: Box<dyn BufRead + Send> = if args.input.as_os_str() == "-" {
@@ -135,8 +132,13 @@ pub(super) fn execute<R: Read + Send + 'static, W: Write + Send + 'static>(
             crate::local_io::open_document(&args.input).map_err(|_| CandidateError::Input)?))
     };
     host.native.run.max_elapsed = remaining()?;
-    let summary = engine.batch_int4_sentiment_documents(&model, planner, host, common.kernel,
-        reader, writer, cancellation).map_err(|error| host_error(error, CandidateError::Batch))?;
+    let summary = if common.compute.threads == 1 {
+        engine.batch_int4_sentiment_documents(&model, planner, host, common.kernel,
+            reader, writer, cancellation)
+    } else {
+        engine.batch_int4_sentiment_documents_with_threads(&model, planner, host, common.kernel,
+            common.compute.threads, reader, writer, cancellation)
+    }.map_err(|error| host_error(error, CandidateError::Batch))?;
     remaining()?;
     // The host publishes the sole footer. Rejected documents still require a
     // nonzero exit even when later records and the stream drain successfully.
@@ -176,6 +178,8 @@ struct Provenance<'a> {
     snapshot: Option<SnapshotRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     input_encoding: Option<&'a UntrustedEncoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compute_schedule: Option<compute::Schedule>,
 }
 
 #[cfg(test)]

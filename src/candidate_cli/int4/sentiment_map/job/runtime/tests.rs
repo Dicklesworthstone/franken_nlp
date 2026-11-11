@@ -54,7 +54,7 @@ fn completion_reports_only_public_model_and_durable_progress_metadata() {
         source_revision: "public-revision", source_root_sha256: "public-source", model_content_sha256: "public-model",
         candidate_format: "candidate-int4", quant_recipe: "strict-int4", group_width: args.group_width,
         integer_kernel: map.common.kernel.kind().id(), snapshot: None, cohort_chunks: Some(3),
-        input_encoding: None, output: &report };
+        input_encoding: None, compute_schedule: None, output: &report };
     let mut bytes = Vec::new(); publish_report(&response, &mut bytes, &available).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["durable_unit"], "complete_original_document"); assert_eq!(value["cohort_chunks"], 3);
@@ -120,4 +120,84 @@ fn runtime_rechecks_explicit_axis_capability_before_private_io() {
     c.args.map.mapping.max_chunks = 64; c.args.map.mapping.cohort_chunks = Some(22);
     assert_eq!(execute(c.mode, args, c.args, map, NoIo, &mut NoIo).unwrap_err().code,
         "sentiment_document_job_geometry");
+}
+
+#[test]
+fn changing_team_width_preserves_authenticated_recipe_policy_and_lifetime_on_resume() {
+    use crate::native_engine::strict_int4::weights::projection_fixture;
+    let (weights, _) = projection_fixture(128);
+    for defaults in ["{}", r#"{"axes":["approach","valence"],"policy":{"minimum_peak_weight_ppm":650000,"maximum_normalized_entropy_ppm":800000}}"#] {
+        let mut recipes = Vec::new();
+        for compact in [false, true] {
+            let mut expected = None;
+            for operation in ["start", "resume"] {
+                for threads in [1, 2, 4, 64] {
+                    let width = threads.to_string();
+                    let mut flags = vec!["--compute-threads", width.as_str()];
+                    if compact { flags.extend(["--input-encoding", "safe-bpe-v1"]); }
+                    let (command, args) = command(operation, &flags);
+                    let map = command.args.validate(&args).unwrap();
+                    let fixed = lifetime(&args, map);
+                    let limits = command.args.lifetime_limits(&args, map, fixed).unwrap();
+                    let budget = command.args.map.budget_with_max_axes(map.common,
+                        command.args.sentiment.max_axes.unwrap_or(4)).unwrap();
+                    let (settings, policy) = command.args.load_settings(Some(defaults), budget, &args).unwrap();
+                    let options = crate::candidate_cli::int4::scored_batch::runtime::sentiment_options(policy).unwrap();
+                    let compiler = Int4SentimentPlanner::for_model(weights.identity(), options, budget, map.planning)
+                        .unwrap().with_document_encoding(command.args.map.input_encoding(&args).unwrap()).unwrap();
+                    let planner = Int4SentimentDocumentJobPlanner::new(compiler, settings, map.mapping, fixed).unwrap();
+                    planner.check_job_limits(fixed).unwrap();
+                    let semantic = (crate::canonjson::canonical_bytes(planner.job_recipe()).unwrap(),
+                        crate::canonjson::canonical_bytes(planner.execution_identity()).unwrap(),
+                        fixed.max_work, fixed.max_attempts, limits.buffer_bytes);
+                    if let Some(expected) = &expected { assert_eq!(&semantic, expected); }
+                    else { expected = Some(semantic); }
+                    let config = compute::resource_config(map.common);
+                    assert_eq!(config.scoped_cpu_children_per_coordinator, threads - 1);
+                    assert_eq!(config.thread_ceiling, threads + 1);
+                }
+            }
+            recipes.push(expected.unwrap().0);
+        }
+        assert_ne!(recipes[0], recipes[1], "compact policy remains authenticated while worker width may change");
+    }
+}
+
+#[test]
+fn team_progress_metadata_changes_only_the_optional_physical_schedule() {
+    let mut expected = None;
+    for threads in [1, 2, 4, 64] {
+        let width = threads.to_string();
+        let (c, args) = command("resume", &["--compute-threads", width.as_str()]);
+        let map = c.args.validate(&args).unwrap(); let fixed = lifetime(&args, map); let id = JobId([0x12; 16]);
+        let progress = JobProgress { job_id: id, items: 2, committed: 2, attempts: 3,
+            reserved_work: fixed.max_work, spool_bytes: 1024, materialized: true };
+        let report = progress_report(progress, id, fixed, true, c.mode, "sentiment").unwrap();
+        let response = Response { protocol: "fnlp-candidate-int4-sentiment-document-job-v1", schema_version: 1,
+            scope: "real-source-current-candidate-int4", evidence: "non_authoritative", task: "sentiment",
+            durable_unit: "complete_original_document", model_id: "Nanbeige4.2-3B",
+            source_revision: "public-revision", source_root_sha256: "public-source", model_content_sha256: "public-model",
+            candidate_format: "candidate-int4", quant_recipe: "strict-int4", group_width: args.group_width,
+            integer_kernel: map.common.kernel.kind().id(), snapshot: None, cohort_chunks: None,
+            input_encoding: None, compute_schedule: compute::Schedule::for_threads(threads), output: &report };
+        let mut bytes = Vec::new(); publish_report(&response, &mut bytes, &available).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        if threads == 1 { assert!(value.get("compute_schedule").is_none()); }
+        else {
+            assert_eq!(value["compute_schedule"]["execution"], "int4-output-row-team-v1");
+            assert_eq!(value["compute_schedule"]["declared_compute_threads"], threads);
+        }
+        assert!(value.get("compute").is_none(), "no native projection receipt is fabricated");
+        value.as_object_mut().unwrap().remove("compute_schedule");
+        if let Some(expected) = &expected { assert_eq!(&value, expected); }
+        else { expected = Some(value); }
+    }
+}
+
+#[test]
+fn runtime_rechecks_team_cohort_conflicts_before_private_job_io() {
+    let (mut c, args) = command("resume", &["--compute-threads", "4"]);
+    let map = c.args.validate(&args).unwrap();
+    c.args.map.mapping.cohort_chunks = Some(1);
+    assert_eq!(execute(c.mode, args, c.args, map, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
 }

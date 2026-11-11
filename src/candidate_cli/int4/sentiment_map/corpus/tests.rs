@@ -238,3 +238,71 @@ fn compact_corpus_limits_refuse_before_defaults_model_or_source_io() {
     args.memory_mib = 1;
     assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
 }
+
+#[test]
+fn resident_teams_preserve_axis_policy_work_and_one_encoder_quote() {
+    for axes in ["1", "4"] {
+        for compact in [false, true] {
+            let mut base_flags = vec!["--max-axes", axes];
+            if compact {
+                base_flags.extend(["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "262144",
+                    "--max-tokenizer-output-tokens", "131072", "--max-tokenizer-pair-checks", "33554432",
+                    "--max-tokenizer-pair-bytes", "268435456"]);
+            }
+            let (baseline, base_args) = arguments(&base_flags);
+            let base = baseline.validate(&base_args).unwrap();
+            let defaults = r#"{"axes":["valence"],"policy":{"minimum_peak_weight_ppm":650000,"maximum_normalized_entropy_ppm":800000}}"#;
+            let (base_settings, base_policy) = baseline.load_defaults(Some(defaults), base, &base_args).unwrap();
+            for threads in [1, 2, 4, 64] {
+                let width = threads.to_string(); let mut flags = base_flags.clone();
+                flags.extend(["--compute-threads", width.as_str()]);
+                let (options, args) = arguments(&flags); let limits = options.validate(&args).unwrap();
+                assert_eq!(args.compute.threads(), threads, "root dispatch must retain explicit team width");
+                let workspace = if threads == 1 { 0 } else {
+                    crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(threads, args.group_width).unwrap()
+                };
+                assert_eq!(limits.common.compute.workspace_bytes, workspace);
+                assert_eq!(limits.document.memory, base.document.memory);
+                assert_eq!(limits.document.mapping.chunks, base.document.mapping.chunks);
+                assert_eq!(limits.document.mapping.max_model_work, base.document.mapping.max_model_work);
+                assert_eq!(limits.document.mapping.aggregation, base.document.mapping.aggregation);
+                assert_eq!(limits.transport, base.transport);
+                assert_eq!(options.document.input_encoding(&args).unwrap(),
+                    baseline.document.input_encoding(&base_args).unwrap());
+                let (settings, policy) = options.load_defaults(Some(defaults), limits, &args).unwrap();
+                assert_eq!(settings.axes, base_settings.axes); assert_eq!(settings.budget, base_settings.budget);
+                assert_eq!(policy, base_policy);
+                let map = limits.document; let common = limits.common;
+                let loading = common.source_preparation_bytes + common.load.scratch_payload_bytes;
+                let execution = map.memory.native.kv_bytes + map.memory.input_bytes
+                    + map.memory.workspace_bytes + map.memory.output_reservation_bytes + workspace;
+                let document_peak = map.cli_preparation_bytes + common.load.weight_payload_bytes
+                    + ALLOCATOR_BYTES + loading.max(execution) + CLEANUP_BYTES;
+                assert_eq!(map.common.minimum_memory_bytes, document_peak);
+                assert_eq!(common.minimum_memory_bytes, document_peak
+                    + corpus_buffer_bytes(limits.transport, common.preparation_bytes, limits.io_bytes).unwrap()
+                    + retained_metadata_bytes(map.mapping.chunks.max_chunks).unwrap() + limits.io_bytes);
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_or_underfunded_population_teams_refuse_before_private_io() {
+    for compact in [false, true] {
+        for mut flags in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+            vec!["--compute-threads", "2", "--cohort-chunks", "1"],
+            vec!["--compute-threads", "4", "--cohort-chunks", "2"]] {
+            if compact { flags.extend(["--input-encoding", "safe-bpe-v1"]); }
+            let (options, args) = arguments(&flags);
+            assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments), "{flags:?}");
+        }
+        let mut flags = vec!["--compute-threads", "64"];
+        if compact { flags.extend(["--input-encoding", "safe-bpe-v1"]); }
+        let (options, mut args) = arguments(&flags); let limits = options.validate(&args).unwrap();
+        args.memory_mib = limits.common.minimum_memory_bytes.div_ceil(MIB) - 1;
+        assert_eq!(options.execute_owned(args, NoIo, NoIo), Err(CandidateError::Arguments));
+    }
+    let (options, args) = arguments(&["--compute-threads", "1", "--cohort-chunks", "2"]);
+    options.validate(&args).unwrap();
+}

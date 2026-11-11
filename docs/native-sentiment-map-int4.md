@@ -99,9 +99,10 @@ throughput or model parity is claimed by this integration; the new regressions
 remain pending the required DSR and model-present checkpoints.
 
 Teams with more than one compute thread cannot combine with `--cohort-chunks`,
-`--cohort-heads` or `--prefill-rows`. Corpus and retained-job commands keep their
-existing schedules. Cancellation and errors retain the same typed failure and
-publish no partial document.
+`--cohort-heads` or `--prefill-rows`. Corpus and retained-job commands also
+support a team spanning the complete invocation, as described below.
+Cancellation and errors retain the same typed failure and publish no partial
+document.
 
 Chunks form a disjoint, complete partition in original source order. Every
 boundary is a UTF-8 boundary, with both byte and Unicode scalar coordinates.
@@ -169,6 +170,49 @@ The result explicitly carries `single_context_equivalence: false`. Changing
 chunk geometry can change the estimator because the model receives different
 local context. It is not a harmless performance switch. Changing only the
 native cohort schedule preserves the same chunk geometry and semantic policy.
+
+## Persistent teams across corpora and retained jobs
+
+`sentiment-corpus` and `sentiment-document-job start|resume` accept
+`--compute-threads N`. One persistent numerical output-row team serves the
+entire invocation, including every original document, chunk, selected axis,
+flush and durable attempt. Width one preserves serial execution; widths 2..64
+include the coordinator and admit their worker scratch once, with the runtime
+thread additional. Invalid widths and any explicit chunk-cohort/team mixture
+refuse before private IO.
+
+This schedule reuses the existing sentiment planner, finite scorer and complete
+map reducer. Selected axes and their order, peak/entropy thresholds, abstention,
+coverage, source coordinates, per-chunk distributions and aggregate statistics
+retain their original authority. Source documents remain sequential; workers
+split complete output rows within native projections. Worker count does not
+increase task, result, tokenizer or native work limits.
+
+Byte fallback and explicit `safe-bpe-v1` are supported. Compact preparation and
+execution reconstruction keep one shared allowance per original document
+attempt, and admission retains one encoder workspace independently of team
+width. The compact snapshot-save restriction continues to apply.
+
+The corpus defers terminal `run_complete` until all workers physically join,
+while charged IO owners remain alive through final delivery. A later failure
+can leave earlier complete document frames, so successful whole-run completion
+still requires the footer and exit zero. Durable invocations likewise join
+workers before returning successful progress, and retain the original deadline
+through metadata write and flush.
+
+Population provenance adds optional `compute_schedule` with execution
+`int4-output-row-team-v1` and `declared_compute_threads`. It describes selected
+physical width without reporting unobserved projection counters. Width one
+omits it; inner semantic results retain the serial format. Durable recipes
+exclude numerical worker width, allowing explicit resume at another admitted
+width without renewing attempts or lifetime work. The separately selected
+chunk-cohort width remains authenticated.
+
+Library callers use `NlpEngine::batch_int4_sentiment_documents_with_threads` or
+`NlpEngine::job_int4_sentiment_document_with_threads` for widths 2..64; existing
+methods retain serial execution. Added resource, cancellation, delivery and
+recipe regressions are code-first and await the required DSR checkpoint.
+This integration does not claim measured throughput or model-result parity.
 
 ## Native chunk cohorts
 

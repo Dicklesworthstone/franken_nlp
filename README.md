@@ -1041,9 +1041,15 @@ fnlp candidate source-int4 sentiment-corpus reviews.ndjson \
   --max-total-output-bytes 67108864
 ```
 
-Documents execute sequentially. Without `--cohort-chunks`, all chunks reuse
-one serial native cache. Explicit cohorts share native decoder layers across
-independent chunk/axis sessions within the current document. `--max-axes`
+Documents execute sequentially. Add `--compute-threads N` for one persistent
+numerical output-row team across the complete stream, every chunk, axis and
+flush. Widths 2..64 admit worker scratch once; width one preserves serial
+execution. Byte and compact input keep their original allowances. Teams split
+output rows while reusing one native cache, and cannot combine with explicit
+chunk cohorts. Terminal `run_complete` follows physical worker join; optional
+`compute_schedule` reports only the declared width. Explicit cohorts instead
+share native decoder layers across independent chunk/axis sessions within the
+current document. `--max-axes`
 defaults to four and bounds **every** defaults selection and per-record
 replacement. Its product with the declared cohort width must not exceed 64;
 invalid geometry is refused before IO without clamping or fallback. The
@@ -1687,8 +1693,13 @@ actual-model evidence remain pending the prescribed controller gates.
 resumes dimensional sentiment for complete original documents. Fixed private
 `--defaults` select axes and decision policy; each original source is one
 durable result containing all chunk distributions, source spans and the
-Unicode-scalar-weighted aggregate. Serial execution and explicit
-`--cohort-chunks N` use the existing native sentiment processor.
+Unicode-scalar-weighted aggregate. Serial execution, persistent numerical teams
+selected by `--compute-threads N`, and explicit `--cohort-chunks N` use the
+existing native sentiment processor. Numerical teams span the complete
+invocation and cannot combine with chunk cohorts. Worker width remains outside
+the authenticated recipe, so explicit resume may change it without renewing
+attempts or lifetime work. Workers join before successful progress is published;
+byte and compact input retain the original axes, thresholds and tokenizer policy.
 
 Provide the complete original NDJSON population on every invocation, a
 protected job directory and key, exact job ID, immutable limits and explicit

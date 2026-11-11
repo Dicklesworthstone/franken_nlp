@@ -286,3 +286,72 @@ fn invalid_compact_job_policy_refuses_before_keys_population_and_storage() {
         }
     }
 }
+
+#[test]
+fn retained_population_teams_charge_one_workspace_without_renewing_authority() {
+    for operation in ["start", "resume"] {
+        for compact in [false, true] {
+            let mut base_flags = vec!["--max-axes", "2"];
+            if compact {
+                base_flags.extend(["--input-encoding", "safe-bpe-v1", "--max-tokenizer-input-bytes", "262144",
+                    "--max-tokenizer-output-tokens", "131072"]);
+            }
+            let (base_command, base_args) = command(operation, &base_flags);
+            let base = base_command.args.validate(&base_args).unwrap();
+            let fixed = lifetime(&base_args, base);
+            let baseline = base_command.args.lifetime_limits(&base_args, base, fixed).unwrap();
+            let base_budget = base_command.args.map.budget_with_max_axes(base.common, 2).unwrap();
+            for threads in [1, 2, 4, 64] {
+                let width = threads.to_string(); let mut flags = base_flags.clone();
+                flags.extend(["--compute-threads", width.as_str()]);
+                let (c, args) = command(operation, &flags); let map = c.args.validate(&args).unwrap();
+                assert_eq!(args.compute.threads(), threads);
+                let workspace = if threads == 1 { 0 } else {
+                    crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(threads, args.group_width).unwrap()
+                };
+                assert_eq!(map.common.compute.workspace_bytes, workspace);
+                assert_eq!(map.memory, base.memory); assert_eq!(map.mapping.chunks, base.mapping.chunks);
+                assert_eq!(map.mapping.max_model_work, base.mapping.max_model_work);
+                assert_eq!(map.mapping.aggregation, base.mapping.aggregation);
+                assert_eq!(c.args.map.input_encoding(&args).unwrap(),
+                    base_command.args.map.input_encoding(&base_args).unwrap());
+                assert_eq!(c.args.map.budget_with_max_axes(map.common, 2).unwrap(), base_budget);
+                let execution = map.memory.native.kv_bytes + map.memory.input_bytes
+                    + map.memory.workspace_bytes + map.memory.output_reservation_bytes + workspace;
+                let loading = map.common.source_preparation_bytes + map.common.load.scratch_payload_bytes;
+                assert_eq!(map.common.minimum_memory_bytes, map.cli_preparation_bytes
+                    + map.common.load.weight_payload_bytes + ALLOCATOR_BYTES + loading.max(execution) + CLEANUP_BYTES);
+                let admitted = c.args.lifetime_limits(&args, map, fixed).unwrap();
+                assert_eq!(admitted.buffer_bytes, baseline.buffer_bytes);
+                assert_eq!(admitted.map.mapping.max_model_work, fixed.max_work.int4_model_work());
+                let mut short = map; short.common.memory_bytes = admitted.map.common.minimum_memory_bytes - 1;
+                assert_eq!(c.args.lifetime_limits(&args, short, fixed).unwrap_err().exit,
+                    ErrorCode::AdmissionOrResourceLimit);
+                short.common.memory_bytes += 1;
+                c.args.lifetime_limits(&args, short, fixed).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_or_conflicting_job_teams_refuse_before_keys_defaults_or_population_io() {
+    for operation in ["start", "resume"] {
+        for compact in [false, true] {
+            for mut flags in [vec!["--compute-threads", "0"], vec!["--compute-threads", "65"],
+                vec!["--compute-threads", "2", "--cohort-chunks", "1"],
+                vec!["--compute-threads", "4", "--cohort-chunks", "2"]] {
+                if compact { flags.extend(["--input-encoding", "safe-bpe-v1"]); }
+                let (c, args) = command(operation, &flags);
+                assert_eq!(c.execute_owned(args, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage, "{flags:?}");
+            }
+            let mut flags = vec!["--compute-threads", "64"];
+            if compact { flags.extend(["--input-encoding", "safe-bpe-v1"]); }
+            let (c, mut args) = command(operation, &flags); let map = c.args.validate(&args).unwrap();
+            args.memory_mib = map.common.minimum_memory_bytes.div_ceil(MIB) - 1;
+            assert_eq!(c.execute_owned(args, NoIo, &mut NoIo).unwrap_err().exit, ErrorCode::Usage);
+        }
+        let (c, args) = command(operation, &["--compute-threads", "1", "--cohort-chunks", "2"]);
+        c.args.validate(&args).unwrap();
+    }
+}

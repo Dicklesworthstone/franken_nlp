@@ -79,13 +79,22 @@ pub(super) fn one_off_definition() -> clap::Command {
         .after_long_help("--input-encoding safe-bpe-v1 chooses chunks using actual compact source-token counts. Every attempted chunk, including oversized probes, and every actual chunk plan spends one shared tokenizer allowance. Each encoded chunk is reused across its sentiment axes. --max-tokenizer-input-bytes and --max-tokenizer-output-tokens default to 1048576 each; pair checks and examined pair bytes use their explicit shared flags. Corpus and retained-job documents share that allowance across preparation AND exact execution reconstruction; neither pass renews it. The result's input_encoding.work records the completed planning pass, not the summed two-pass cost. Each new document or explicit resumed attempt receives its own bounded tokenizer ledger; native work and durable attempts retain their existing lifetime accounting. Exhaustion refuses the whole document before any native forward. Context, source bytes, native work, output and memory retain separate ceilings. The exact policy and all four limits authenticate retained-job resume. This selects a different prompt token sequence and makes no model-quality or tokenizer-parity claim. Compact maps accept pinned sources or snapshot reload but refuse --save-snapshot, whose separate pre-save planning would repeat tokenizer work. Byte-fallback output and job recipes are unchanged when the option is omitted.")
 }
 
-/// Keep numerical teams opt-in on the one-document route; definitions reused
-/// by corpora and retained jobs do not acquire an unwired compute flag.
+/// Population commands retain one physical row team across the whole
+/// invocation while preserving each document's original bounded authority.
+pub(super) fn population_definition() -> clap::Command {
+    let command = one_off_definition();
+    let encoding_help = command.get_after_long_help().map(|help| help.to_string()).unwrap_or_default();
+    compute::definition(command).after_long_help(format!(
+        "{encoding_help}\n\n--compute-threads N keeps one persistent numerical output-row team across the complete stream or retained-job invocation, including every chunk and sentiment axis. Width 1 preserves serial execution; widths 2..64 admit worker scratch and process thread capacity before private IO. Multiple workers cannot combine with --cohort-chunks. Byte and compact input keep their original axis selection, policy thresholds, tokenizer limits and lifetime native-work allowance. Workers join before terminal run_complete or successful job progress is published. Optional compute_schedule reports only the physical width. Durable recipes exclude worker width, so explicit resume may change it without renewing work or attempts."))
+}
+
+/// One complete document owns a persistent row team; its task and tokenizer
+/// allowances remain independent of physical width.
 pub(super) fn threaded_definition() -> clap::Command {
     let command = one_off_definition();
     let encoding_help = command.get_after_long_help().map(|help| help.to_string()).unwrap_or_default();
     compute::definition(command).after_long_help(format!(
-        "{encoding_help}\n\n--compute-threads N keeps one admitted output-row team across every chunk and sentiment axis. It supports byte-fallback and safe-bpe-v1 with the same complete-document tokenizer and native work ceilings. Actual projection counters are reported separately in compute. Cannot combine with --cohort-chunks; corpus and durable-job routes retain their existing schedules."))
+        "{encoding_help}\n\n--compute-threads N keeps one admitted output-row team across every chunk and sentiment axis. It supports byte-fallback and safe-bpe-v1 with the same complete-document tokenizer and native work ceilings. Actual projection counters are reported separately in compute. Cannot combine with --cohort-chunks. Corpus and retained-job commands expose a team spanning their complete invocation."))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -109,12 +118,9 @@ impl MapArgs {
         if args.compute.threads() != 1 { return Err(CandidateError::Arguments); }
         self.validate_document(args, 4)
     }
-    /// Corpus callers can narrow every document's declared axis capability.
-    /// One-off maps continue to admit their original four-axis request space.
+    /// Population routes admit persistent teams without changing declared
+    /// axis capability, task budgets or the complete tokenizer allowance.
     fn validate_with_max_axes(self, args: &Int4Args, max_axes: usize) -> Result<MapLimits, CandidateError> {
-        if args.compute.threads() != 1 {
-            return Err(CandidateError::Arguments);
-        }
         self.validate_document(args, max_axes)
     }
     fn validate_with_threads(self, args: &Int4Args) -> Result<MapLimits, CandidateError> {

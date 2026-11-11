@@ -1,5 +1,5 @@
 //! Retained sentiment of complete original documents, one attempt each.
-//! Fixed axes, policy, mapping and native schedule authenticate every resume.
+//! Fixed axes, policy, mapping and chunk-cohort schedule authenticate every resume.
 #![cfg_attr(not(all(feature = "metadata-store", feature = "asupersync-runtime", target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64"))), allow(dead_code))]
 
@@ -35,7 +35,7 @@ struct SentimentArgs {
 
 pub(in crate::candidate_cli::int4) fn definition() -> clap::Command {
     let operation = |name: &'static str, about: &'static str| {
-        let command = SentimentArgs::augment_args(StorageArgs::augment_args(super::one_off_definition()
+        let command = SentimentArgs::augment_args(StorageArgs::augment_args(super::population_definition()
             .name(name).about(about)
             .long_about("Retain and resume dimensional sentiment of COMPLETE original documents with fixed optional --defaults {axes?,policy?}; omission selects all four axes and the standard policy. By default, supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation; explicit retained-input replay is available. Text is never a pre-split chunk and task_args may only be absent, null or an empty object. Every chunk and requested axis must finish before the original document commits. Retained results include complete per-chunk distributions, original byte/scalar coordinates and named scalar-weighted descriptive aggregates. Optional --max-axes bounds the fixed dimension selection and can reduce admitted memory; a bound below four requires --defaults selecting no more than that many axes. An explicit axis bound times --cohort-chunks must fit 64 heads. Omitting --max-axes preserves existing four-axis task budgeting and checks the actual fixed selection. --cohort-chunks shares native layers within one document; repeat the exact task budget, schedule and width on resume. Requires --store-results, protected existing --job-dir and --key-file, exact --job-id, immutable --limits and unchanged axes/policy. All five per-document work flags cover every chunk and axis; JobLimits.max_work is the sole lifetime allowance, including failed attempts, and mask_node_visits must be zero. Chunks, attempts and resume never renew that allowance. Complete input, planning, native, retained-result and durable-job memory are admitted before population IO. Stdout is metadata only; --materialize publishes private results after every document commits. No partial-document success, automatic retry, calibrated confidence or full-context equivalence. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
             .after_help(job_cli::INPUT_RETENTION_HELP)
@@ -171,6 +171,7 @@ impl JobCommand {
             sentiment: SentimentArgs::from_arg_matches(matches)? };
         let mut native = Int4Args::from_arg_matches(matches)?;
         native.input_encoding = input_encoding::InputEncodingArgs::from_matches(matches)?;
+        native.compute = compute::Args::from_matches(matches)?;
         Ok((Self { mode, args }, native))
     }
     pub(in crate::candidate_cli::int4) fn run_owned<R: Read + Send + 'static>(self, args: Int4Args,
