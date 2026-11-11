@@ -119,6 +119,85 @@ fn question_teams_keep_one_encoder_ledger_and_the_complete_private_request_autho
     }
 }
 
+
+#[test]
+fn neural_source_teams_reserve_one_workspace_across_discovery_and_all_evidence_passes() {
+    for (kind, mode) in SYNTHESIS_MODES {
+        for snapshot in [false, true] {
+            let configure = |args: &mut Int4Args| {
+                args.memory_mib = 262_144;
+                if snapshot {
+                    args.source_dir = None; args.source_manifest = None;
+                    args.snapshot = Some("explicit.snapshot".into());
+                    args.expected_model_sha256 = Some("ab".repeat(32));
+                }
+            };
+            let (serial, mut args) = arguments(kind, mode);
+            configure(&mut args);
+            let original = serial.validate(&args).unwrap();
+            let budget = serial.source.budget(&args, original.common);
+            for width in [1, 2, 4, 64] {
+                let count = width.to_string();
+                let mut flags = mode.to_vec(); flags.extend_from_slice(&["--compute-threads", &count]);
+                let (team, mut args) = arguments(kind, &flags);
+                configure(&mut args);
+                let admitted = team.validate(&args).unwrap();
+                let workspace = if width == 1 { 0 } else {
+                    crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(
+                        width, args.group_width).unwrap()
+                };
+                assert_eq!(team, serial);
+                assert_eq!(admitted.common.compute.threads, width);
+                assert_eq!(admitted.common.compute.workspace_bytes, workspace);
+                assert_eq!(admitted.common.native, original.common.native);
+                assert_eq!(team.source.budget(&args, admitted.common), budget);
+                assert_eq!(admitted.mapping.chunks, original.mapping.chunks);
+                assert_eq!(admitted.mapping.reduction, original.mapping.reduction);
+                assert_eq!(admitted.mapping.max_model_work, original.mapping.max_model_work);
+                assert_eq!(admitted.mapping.max_mask_visits, original.mapping.max_mask_visits);
+                assert_eq!(admitted.mapping.verification, original.mapping.verification);
+                assert_eq!(admitted.synthesis, original.synthesis);
+                assert_eq!(admitted.question_synthesis, original.question_synthesis);
+                assert_eq!(admitted.hierarchy, original.hierarchy);
+                assert_eq!(admitted.question_hierarchy, original.question_hierarchy);
+                assert_eq!(admitted.workspace_bytes, original.workspace_bytes);
+                assert_eq!(admitted.common.preparation_bytes, original.common.preparation_bytes);
+                assert!(admitted.encoding.is_none());
+                assert!(admitted.common.minimum_memory_bytes >= original.common.minimum_memory_bytes);
+                assert!(admitted.common.minimum_memory_bytes <= original.common.minimum_memory_bytes + workspace);
+                if width > 1 {
+                    assert!(team.validate_corpus(&args).is_err());
+                    assert!(team.validate_document_job(&args, false).is_err());
+                }
+                args.memory_mib = admitted.common.minimum_memory_bytes.saturating_sub(1) / MIB;
+                assert!(team.validate(&args).is_err());
+                args.memory_mib = admitted.common.minimum_memory_bytes.div_ceil(MIB);
+                assert!(team.validate(&args).is_ok());
+            }
+        }
+    }
+}
+
+#[test]
+fn neural_source_teams_refuse_cohort_mixtures_and_compact_synthesis_before_io() {
+    for (kind, mode) in SYNTHESIS_MODES {
+        let mut incompatible = vec![vec!["--cohort-chunks", "1"], vec!["--cohort-chunks", "2"],
+            vec!["--input-encoding", "safe-bpe-v1"]];
+        if mode.contains(&"--hierarchical-summary") || mode.contains(&"--hierarchical-answer") {
+            incompatible.push(vec!["--cohort-hierarchy-groups", "1"]);
+            incompatible.push(vec!["--cohort-hierarchy-groups", "2"]);
+        }
+        for extras in incompatible {
+            let mut flags = mode.to_vec(); flags.extend_from_slice(&["--compute-threads", "2"]);
+            flags.extend_from_slice(&extras);
+            let (map, mut args) = arguments(kind, &flags); args.memory_mib = 262_144;
+            let mut output = Vec::new();
+            assert_eq!(map.execute(args, &mut NoRead, &mut output), Err(CandidateError::Arguments));
+            assert!(output.is_empty());
+        }
+    }
+}
+
 #[test]
 fn unsupported_source_team_widths_and_schedules_refuse_before_private_io() {
     for kind in KINDS {
@@ -132,11 +211,6 @@ fn unsupported_source_team_widths_and_schedules_refuse_before_private_io() {
             assert!(output.is_empty());
         }
     }
-    for mode in [&["--synthesize-summary"][..], &["--synthesize-summary", "--hierarchical-summary"][..]] {
-        let mut flags = mode.to_vec(); flags.extend_from_slice(&["--compute-threads", "2"]);
-        let (map, args) = arguments(Kind::Summarize, &flags);
-        assert_eq!(map.execute(args, &mut NoRead, &mut Vec::new()), Err(CandidateError::Arguments));
-    }
     for command in document_job_definitions().into_iter().chain(documents::definitions()) {
         assert!(!command.get_arguments().any(|arg| arg.get_id() == "compute_threads"));
     }
@@ -144,9 +218,7 @@ fn unsupported_source_team_widths_and_schedules_refuse_before_private_io() {
     assert!(answer.get_arguments().any(|arg| arg.get_id() == "compute_threads"));
     for unsupported in [&["--compute-threads", "0"][..], &["--compute-threads", "65"][..],
         &["--compute-threads", "2", "--cohort-chunks", "1"][..],
-        &["--compute-threads", "4", "--cohort-chunks", "2"][..],
-        &["--compute-threads", "2", "--synthesize-answer"][..],
-        &["--compute-threads", "2", "--synthesize-answer", "--hierarchical-answer"][..]] {
+        &["--compute-threads", "4", "--cohort-chunks", "2"][..]] {
         let mut flags = vec!["--question", "private-question.txt"];
         flags.extend_from_slice(unsupported);
         let (map, args) = arguments(Kind::Answer, &flags);
@@ -159,6 +231,13 @@ fn unsupported_source_team_widths_and_schedules_refuse_before_private_io() {
 #[cfg(not(feature = "asupersync-runtime"))]
 #[test]
 fn unavailable_source_team_runtime_never_reads_or_publishes() {
+    for (kind, mode) in SYNTHESIS_MODES {
+        let mut flags = mode.to_vec(); flags.extend_from_slice(&["--compute-threads", "2"]);
+        let (map, mut args) = arguments(kind, &flags); args.memory_mib = 262_144;
+        let mut output = Vec::new();
+        assert_eq!(map.execute(args, &mut NoRead, &mut output), Err(CandidateError::Unavailable));
+        assert!(output.is_empty());
+    }
     for kind in KINDS {
         let (map, args) = arguments(kind, &["--compute-threads", "2"]);
         let mut output = Vec::new();

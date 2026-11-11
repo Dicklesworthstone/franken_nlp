@@ -188,3 +188,37 @@ fn discovery_cohort_adapter_keeps_full_summary_frontier_and_final_transcript_cha
         assert!(mode.requirements(&config, 32, width, &planner).is_err());
     }
 }
+
+#[test]
+fn numerical_team_keeps_complete_synthesis_frontier_and_original_transcript_policy() {
+    use native_cohorts::SynthesisMode;
+    let (planner, mut config) = fixture(32);
+    let mode = SummarySynthesisMode;
+    let identity = config.identity.clone();
+    let budget = config.budget;
+    for chunks in [1, 4, 8] {
+        let workspace = mode.workspace_bytes(&config, chunks).unwrap();
+        let tokens = mode.output_tokens(&config, chunks).unwrap();
+        assert_eq!(tokens, (chunks as u64 + 1) * u64::from(budget.max_output_tokens));
+        for threads in [2, 4, 64] {
+            let extra = team::team_requirements(&config, 32, threads).unwrap();
+            assert_eq!(extra, int4_task_team_workspace_bytes(threads, 32).unwrap());
+            mode.requirements(&config, 32, 32, &planner).unwrap();
+            assert_eq!(mode.workspace_bytes(&config, chunks).unwrap(), workspace);
+            assert_eq!(mode.output_tokens(&config, chunks).unwrap(), tokens);
+            assert_eq!(config.identity, identity);
+            assert_eq!(config.budget, budget);
+        }
+    }
+    // Discovery cohorts cannot be silently scheduled through this engine.
+    for chunks in [0, 2, 8] {
+        config.mapping.reduction.map_batch_chunks = chunks;
+        assert!(team::team_requirements(&config, 32, 2).is_err());
+    }
+    config.mapping.reduction.map_batch_chunks = 1;
+    config.native.allocator_reserve_bytes = u64::MAX;
+    assert!(team::team_requirements(&config, 32, 2).is_err());
+    fn send<T: Send + 'static>() {}
+    send::<HostedInt4TeamResult<Int4SummarySynthesisRun>>();
+    let _threaded = NlpEngine::synthesize_int4_source_summary_with_threads;
+}

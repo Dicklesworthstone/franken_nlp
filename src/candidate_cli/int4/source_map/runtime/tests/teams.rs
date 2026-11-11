@@ -182,9 +182,138 @@ fn model_present_source_document_teams_match_serial_and_release_all_guards() {
         assert_eq!(engine.resources().memory_snapshot(), resident);
         assert_eq!(engine.resources().outstanding_closure_snapshot().active_closures, 0);
     }
+    // The same persistent numerical team must span discovery and the later
+    // native synthesis passes; compare every public semantic field unchanged.
+    for hierarchical in [false, true] {
+        let mut mode = vec!["--synthesize-summary", "--synthesis-bullets", "2"];
+        if hierarchical { mode.push("--hierarchical-summary"); }
+        let command = make_command(Kind::Summarize, &mode);
+        let Int4Task::SourceMap(options) = command.task else { panic!("summary synthesis required"); };
+        let limits = options.validate(&command.args).unwrap();
+        let budget = options.source.budget(&command.args, limits.common);
+        let (_, SourceMapTask::Summarize(map_options)) = options.request(document.clone(), None,
+            budget, command.args.max_input_bytes).unwrap() else { panic!("summary map required"); };
+        let task = options.summary.unwrap().synthesis.request(map_options, options.planning(&command.args)).unwrap();
+        let identity = source::identity(model.model_identity(), &planner, source::task(Kind::Summarize)).unwrap();
+        let config = || configuration(identity.clone(), task, &command.args, &options, limits, Duration::from_secs(86_400));
+        let mut serial_bytes = None;
+        for threads in [1, 2, 4] {
+            let bytes = if let Some(hierarchy) = limits.hierarchy {
+                let expected = summary_hierarchy_preflight(&document, &planner, &config(), hierarchy,
+                    model.model_identity().group_width(), &mut continuing()).unwrap();
+                let output = if threads == 1 {
+                    compute::Completion::serial(engine.synthesize_int4_source_summary_hierarchy(&model,
+                        document.clone(), Arc::clone(&planner), Arc::clone(&vocabulary), config(), hierarchy,
+                        common.kernel, CancellationToken::default()).unwrap())
+                } else {
+                    compute::Completion::Team(engine.synthesize_int4_source_summary_hierarchy_with_threads(&model,
+                        document.clone(), Arc::clone(&planner), Arc::clone(&vocabulary), config(), hierarchy,
+                        common.kernel, threads, CancellationToken::default()).unwrap())
+                };
+                expected.verify_completed(output.result()).unwrap();
+                assert!(!output.result().passes.is_empty(), "gate must execute a native reduction pass");
+                inspect_synthesis_completion(&engine, output, expected.reserved_model_work(), &document, threads, &resident)
+            } else {
+                let expected = summary_synthesis_preflight(&document, &planner, &config(),
+                    model.model_identity().group_width(), &mut continuing()).unwrap();
+                let output = if threads == 1 {
+                    compute::Completion::serial(engine.synthesize_int4_source_summary(&model, document.clone(),
+                        Arc::clone(&planner), Arc::clone(&vocabulary), config(), common.kernel,
+                        CancellationToken::default()).unwrap())
+                } else {
+                    compute::Completion::Team(engine.synthesize_int4_source_summary_with_threads(&model, document.clone(),
+                        Arc::clone(&planner), Arc::clone(&vocabulary), config(), common.kernel,
+                        threads, CancellationToken::default()).unwrap())
+                };
+                expected.verify_completed(output.result()).unwrap();
+                inspect_synthesis_completion(&engine, output, expected.reserved_model_work().unwrap(),
+                    &document, threads, &resident)
+            };
+            if let Some(serial) = &serial_bytes { assert_eq!(&bytes, serial); } else { serial_bytes = Some(bytes); }
+        }
+
+        let mut mode = vec!["--question", "private-question.txt", "--synthesize-answer"];
+        if hierarchical { mode.push("--hierarchical-answer"); }
+        let command = make_command(Kind::Answer, &mode);
+        let Int4Task::SourceMap(options) = command.task else { panic!("question synthesis required"); };
+        let limits = options.validate(&command.args).unwrap();
+        let identity = source::identity(model.model_identity(), &planner, source::task(Kind::Answer)).unwrap();
+        let config = || {
+            let question = options.question.as_ref().unwrap();
+            let task = question.task("Where did Alice meet Bob?".to_owned(), None).unwrap();
+            let task = question.synthesis_request(task, options.planning(&command.args)).unwrap();
+            configuration(identity.clone(), task, &command.args, &options, limits, Duration::from_secs(86_400))
+        };
+        let mut serial_bytes = None;
+        for threads in [1, 2, 4] {
+            let bytes = if let Some(hierarchy) = limits.question_hierarchy {
+                let expected = question_hierarchy_preflight(&document, &planner, &config(), hierarchy,
+                    model.model_identity().group_width(), &mut continuing()).unwrap();
+                let output = if threads == 1 {
+                    compute::Completion::serial(engine.synthesize_int4_document_answer_hierarchy(&model,
+                        document.clone(), Arc::clone(&planner), Arc::clone(&vocabulary), config(), hierarchy,
+                        common.kernel, CancellationToken::default()).unwrap())
+                } else {
+                    compute::Completion::Team(engine.synthesize_int4_document_answer_hierarchy_with_threads(&model,
+                        document.clone(), Arc::clone(&planner), Arc::clone(&vocabulary), config(), hierarchy,
+                        common.kernel, threads, CancellationToken::default()).unwrap())
+                };
+                expected.verify_completed(output.result()).unwrap();
+                assert!(!output.result().passes.is_empty(), "gate must execute a native reduction pass");
+                inspect_synthesis_completion(&engine, output, expected.reserved_model_work(), &document, threads, &resident)
+            } else {
+                let expected = question_synthesis_preflight(&document, &planner, &config(),
+                    model.model_identity().group_width(), &mut continuing()).unwrap();
+                let output = if threads == 1 {
+                    compute::Completion::serial(engine.synthesize_int4_document_answer(&model, document.clone(),
+                        Arc::clone(&planner), Arc::clone(&vocabulary), config(), common.kernel,
+                        CancellationToken::default()).unwrap())
+                } else {
+                    compute::Completion::Team(engine.synthesize_int4_document_answer_with_threads(&model, document.clone(),
+                        Arc::clone(&planner), Arc::clone(&vocabulary), config(), common.kernel,
+                        threads, CancellationToken::default()).unwrap())
+                };
+                expected.verify_completed(output.result()).unwrap();
+                inspect_synthesis_completion(&engine, output, expected.reserved_model_work().unwrap(),
+                    &document, threads, &resident)
+            };
+            if let Some(serial) = &serial_bytes { assert_eq!(&bytes, serial); } else { serial_bytes = Some(bytes); }
+        }
+    }
     drop(vocabulary); drop(planner); drop(model); drop(preparation); drop(lease);
     assert_eq!(engine.resources().memory_snapshot(), idle);
     println!("{COMPLETE}");
+}
+
+
+fn inspect_synthesis_completion<T: Serialize>(engine: &NlpEngine, output: compute::Completion<T>,
+    reserved: crate::native_engine::strict_int4::Int4Work, source: &str, threads: usize,
+    resident: &MemorySnapshot) -> Vec<u8> {
+    let held = engine.resources().memory_snapshot();
+    assert!(held.committed_bytes > resident.committed_bytes);
+    let bytes = serde_json::to_vec(output.result()).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["reserved_model_work"], serde_json::to_value(reserved).unwrap());
+    let actual = value["model_work"]["forward_positions"].as_u64().unwrap();
+    let discovery = value["discovery"]["model_work"]["forward_positions"].as_u64().unwrap();
+    assert!(actual > discovery, "parity gate must exercise synthesis after native discovery");
+    assert!(actual <= reserved.forward_positions);
+    let span = &value["discovery"]["mapped"]["root"]["source_span"];
+    assert_eq!(span["byte_start"], 0); assert_eq!(span["scalar_start"], 0);
+    assert_eq!(span["byte_end"], source.len()); assert_eq!(span["scalar_end"], source.chars().count());
+    if threads == 1 { assert!(output.compute().is_none()); }
+    else {
+        let receipt = output.compute().expect("one team must report actual projection work");
+        assert_eq!(receipt.compute_threads, threads);
+        assert_eq!(receipt.schedule, "int4-output-row-team-v1");
+        assert!(receipt.completed_projections > 1 && receipt.completed_worker_rows > 0);
+        assert!(receipt.completed_rows > receipt.completed_worker_rows);
+    }
+    assert_eq!(engine.resources().memory_snapshot(), held);
+    drop(output);
+    assert_eq!(&engine.resources().memory_snapshot(), resident);
+    assert_eq!(engine.resources().outstanding_closure_snapshot().active_closures, 0);
+    bytes
 }
 
 fn stopped_kind(error: HostedError) -> DecodeCancellationKind {

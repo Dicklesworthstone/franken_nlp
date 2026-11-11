@@ -65,10 +65,12 @@ for allowed widths, complete memory admission and examples.
 
 ### Persistent CPU teams for complete source documents
 
-`ner-map`, `keyphrases-map`, plain cited `summarize-map` and independent
-`answer-map` accept `--compute-threads N` for `N` from 1 through 64. The default of 1 retains
-serial execution. Larger widths form one fixed numerical team spanning all
-chunks and the final exact reducer or complete answer collection. Each
+`ner-map`, `keyphrases-map`, `summarize-map` and `answer-map` accept
+`--compute-threads N` for `N` from 1 through 64, including explicit neural
+summary/answer synthesis and their hierarchies. The default of 1 retains serial
+execution. Larger widths form one fixed numerical team spanning all discovery
+chunks, the exact reducer or answer collection, and every dependent neural
+evidence pass selected by the command. Each
 projection divides complete output rows; the reduction order within each row
 stays unchanged. Each chunk retains
 its own causal context, grammar and original-source evidence.
@@ -97,15 +99,26 @@ owned through serialization, write and flush.
 
 QA keeps the same private question across every nonblank chunk, preserves
 interior whitespace ranges, and retains all independently validated answers
-and abstentions. A team does not select a global answer or enable synthesis.
-Compact QA retains one cumulative encoding allowance across question sizing,
-source probes, CLI preflight and hosted replanning.
+and abstentions. Selecting a worker width does not itself enable synthesis.
+The existing `--synthesize-answer` or `--synthesize-summary` switch controls
+that additional native pass; the hierarchy switches explicitly enable bounded
+dependent quote-selection levels. Those modes reuse one team from discovery
+through the last evidence pass. They retain their original complete work,
+mask, context, evidence and maximum-pass bounds without renewed allowances or
+per-pass worker scratch. Generated prose still cannot become source evidence.
+Neural synthesis remains byte-only; compact independent QA retains one
+cumulative encoding allowance across question sizing, source probes, CLI
+preflight and hosted replanning.
 
 Library callers use `NlpEngine::map_int4_source_with_threads`,
 `summarize_int4_source_with_threads`,
 `reduce_int4_keyphrases_document_with_threads`, or
 `answer_int4_document_with_threads` on the same resource host as
-their resident model. Each returns `HostedInt4TeamResult<T>`, retaining the
+their resident model. Neural callers use
+`synthesize_int4_source_summary_with_threads`,
+`synthesize_int4_document_answer_with_threads`, or their
+`_hierarchy_with_threads` counterparts. Each returns
+`HostedInt4TeamResult<T>`, retaining the
 ordinary result owner alongside the physical compute receipt. The serial and
 threaded routes share admission, complete-map preparation, source/result seals
 and reducer validation. The installed process envelope must admit the requested
@@ -113,8 +126,8 @@ worker width; it never silently creates a larger host or falls back to another
 width.
 
 These numerical teams currently require serial chunk scheduling. Combining
-them with `--cohort-chunks`, packed prompt prefill, neural synthesis or
-hierarchies is refused. Corpus and durable-job commands retain their existing
+them with `--cohort-chunks`, `--cohort-hierarchy-groups`, or packed prompt
+prefill is refused. Corpus and durable-job commands retain their existing
 schedules. Regression definitions cover admission, unsupported combinations,
 cancellation, charge release and serial/team model parity. Executable and
 model-present checks remain pending the controller's DSR gates; no measured

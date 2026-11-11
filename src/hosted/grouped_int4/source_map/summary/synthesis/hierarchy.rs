@@ -53,73 +53,22 @@ impl NlpEngine {
         config: Int4SourceMapConfig<SourceSummarySynthesis>, hierarchy: SummaryHierarchyLimits,
         kernel: PackedInt4Kernel, cancellation: CancellationToken)
         -> Result<HostedOutput<Int4SummaryHierarchyRun>, HostedError> {
-        dispatch::preflight(self, config.native.run)?;
-        if !Arc::ptr_eq(self.resources(), model.resources()) { return Err(HostedError::ResourceDomain); }
-        constrained_int4::check_model(&config.identity, model.model_identity())
-            .map_err(|_| HostedError::ModelIdentity)?;
-        let width = model.model_identity().group_width();
-        let required = hierarchy_requirements(&config, hierarchy, source.len(), width, &planner)?;
-        let bytes = sum(&[source.capacity() as u64, config.preparation_reserve_bytes])?;
-        let run = config.native.run;
-        let lease = self.resources().acquire_lease();
-        let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, bytes)?,
-            || Ok(SourceMapInput { source, planner, vocabulary, config }))?;
-        let model = model.clone();
-        dispatch::run(self, run, cancellation, move |control| {
-            // The source, planners and their full charge remain owned through
-            // every level, cancellation, final evidence lift and native drain.
-            let input = input;
-            let config = &input.value.config;
-            let context = PlanContext::new(&config.identity, config.budget)
-                .map_err(|_| HostedError::Limits("INT4 summary hierarchy task context"))?;
-            let prepared = input.value.planner.plan_int4_summary_hierarchy_with_control(
-                &input.value.source, config.task, hierarchy, config.budget, &context,
-                config.planning, config.mapping, width, control).map_err(map_error)?;
-            let expected = prepared.preflight_metadata();
-            let count = expected.chunk_count();
-            if prepared.group_width() != width || expected.group_width() != width
-                || count == 0 || prepared.execution_identities().len() != count
-                || required.kv_bytes > prepared.max_kv_bytes() {
-                return Err(HostedError::ModelIdentity);
-            }
-            let reduction = Pending::reserve(&lease, MemoryClass::JobBuffers,
-                config.summary_hierarchy_workspace_bytes(count, hierarchy)?)?;
-            let tokens = hierarchy_output_tokens(count, config.budget.max_output_tokens, hierarchy)?;
-            let output = output_claim(&lease, prepared.max_result_bytes(), tokens)?;
-            let mut admitted = Vec::new();
-            admitted.try_reserve_exact(count).map_err(|_| map_error(Int4SourceMapError::Allocation))?;
-            for identity in prepared.execution_identities() {
-                checkpoint(control)?;
-                constrained_int4::check_model(identity, model.model_identity())
-                    .map_err(|_| HostedError::ModelIdentity)?;
-                admitted.push(identity.clone());
-            }
-            let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.kv_bytes)?;
-            let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch,
-                sum(&[required.rope_bytes, required.scratch_payload_bound,
-                    config.native.allocator_reserve_bytes])?)?;
-            let mut engine = allocate_native(kv, scratch, || {
-                StrictInt4Engine::new(&model.inner.loaded.value, config.native.context_tokens,
-                    Int4MemoryBudget { max_kv_bytes: required.kv_bytes,
-                        max_rope_bytes: required.rope_bytes,
-                        max_scratch_payload_bytes: required.scratch_payload_bound })
-                    .map(|engine| engine.with_kernel(kernel)).map_err(native_error)
-            })?;
-            let result = allocate(output, || {
-                let result = prepared.execute_with_control(&admitted, &input.value.planner,
-                    &mut engine.value, &input.value.vocabulary, control).map_err(map_error)?;
-                expected.verify_completed(&result).map_err(map_error)?;
-                check_clean(&engine.value)?;
-                checkpoint(control)?;
-                Ok(result)
-            })?;
-            drop(engine);
-            drop(admitted);
-            drop(input);
-            drop(reduction);
-            drop(lease);
-            Ok(GuardedOutput::new(result.value, result._memory))
-        })
+        native_synthesis::execute(self, model, source, planner, vocabulary, config,
+            hierarchy, kernel, cancellation)
+    }
+
+    /// Keep one numerical team through discovery, every evidence-selection
+    /// level and the final synthesis pass. Whole-invocation work, evidence,
+    /// transcripts and cancellation remain shared with serial execution.
+    /// Independent chunk and hierarchy-group cohorts are separate schedules.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_int4_source_summary_hierarchy_with_threads(&self, model: &ResidentInt4,
+        source: String, planner: Arc<SourceTaskPlanner>, vocabulary: Arc<ExtractionVocabulary>,
+        config: Int4SourceMapConfig<SourceSummarySynthesis>, hierarchy: SummaryHierarchyLimits,
+        kernel: PackedInt4Kernel, compute_threads: usize, cancellation: CancellationToken)
+        -> Result<HostedInt4TeamResult<Int4SummaryHierarchyRun>, HostedError> {
+        native_synthesis::execute_with_threads(self, model, source, planner, vocabulary, config,
+            hierarchy, kernel, compute_threads, cancellation)
     }
 }
 
@@ -242,6 +191,25 @@ impl native_cohorts::SynthesisPlan for GroupedHierarchyPlan<PreparedInt4SummaryH
         let result = self.prepared.execute_hierarchy_cohorts_with_control(admitted, planner, weights,
             vocabulary, self.schedule, budget, kernel, control).map_err(map_error)?;
         expected.verify_completed(&result.document).map_err(map_error)?;
+        Ok(result)
+    }
+}
+
+
+impl native_synthesis::SynthesisPlan for PreparedInt4SummaryHierarchy<'_> {
+    type Output = Int4SummaryHierarchyRun;
+    fn validate_metadata(&self) -> Result<(), HostedError> {
+        if self.preflight_metadata().group_width() != self.group_width() {
+            return Err(HostedError::ModelIdentity);
+        }
+        Ok(())
+    }
+    fn run_on_engine(self, admitted: &[ExecutionIdentity], planner: &SourceTaskPlanner,
+        engine: &mut StrictInt4Engine<'_>, vocabulary: &ExtractionVocabulary,
+        control: &mut RunControl) -> Result<Self::Output, HostedError> {
+        let expected = self.preflight_metadata();
+        let result = self.execute_with_control(admitted, planner, engine, vocabulary, control).map_err(map_error)?;
+        expected.verify_completed(&result).map_err(map_error)?;
         Ok(result)
     }
 }

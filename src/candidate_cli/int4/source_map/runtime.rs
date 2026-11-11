@@ -451,7 +451,16 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         }
         Prepared::SummarySynthesis(mut config, expected) => {
             config.native.run.max_elapsed = remaining()?;
-            if let Some(chunks) = limits.cohort_chunks {
+            if common.compute.threads > 1 {
+                let planner = Arc::new(planner);
+                let result = engine.synthesize_int4_source_summary_with_threads(&model, text,
+                    Arc::clone(&planner), Arc::new(vocabulary), config, common.kernel,
+                    common.compute.threads, cancellation).map_err(execution_error)?;
+                expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+                remaining()?;
+                publish_team_map(&provenance, result.result(), result.compute(), &planner,
+                    limits.max_result_bytes + 4096, output, &publication)
+            } else if let Some(chunks) = limits.cohort_chunks {
                 let result = engine.synthesize_int4_source_summary_cohorts(&model, text,
                     Arc::new(planner), Arc::new(vocabulary), config, common.kernel, cancellation)
                     .map_err(execution_error)?;
@@ -470,7 +479,16 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         }
         Prepared::QuestionSynthesis(mut config, expected) => {
             config.native.run.max_elapsed = remaining()?;
-            if let Some(chunks) = limits.cohort_chunks {
+            if common.compute.threads > 1 {
+                let planner = Arc::new(planner);
+                let result = engine.synthesize_int4_document_answer_with_threads(&model, text,
+                    Arc::clone(&planner), Arc::new(vocabulary), config, common.kernel,
+                    common.compute.threads, cancellation).map_err(execution_error)?;
+                expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+                remaining()?;
+                publish_team_map(&provenance, result.result(), result.compute(), &planner,
+                    limits.max_result_bytes + 4096, output, &publication)
+            } else if let Some(chunks) = limits.cohort_chunks {
                 let result = engine.synthesize_int4_document_answer_cohorts(&model, text,
                     Arc::new(planner), Arc::new(vocabulary), config, common.kernel, cancellation)
                     .map_err(execution_error)?;
@@ -489,7 +507,16 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         }
         Prepared::QuestionHierarchy(mut config, expected) => {
             config.native.run.max_elapsed = remaining()?;
-            if let Some(schedule) = limits.hierarchy_cohorts {
+            if common.compute.threads > 1 {
+                let planner = Arc::new(planner);
+                let result = engine.synthesize_int4_document_answer_hierarchy_with_threads(&model, text,
+                    Arc::clone(&planner), Arc::new(vocabulary), config, expected.limits(), common.kernel,
+                    common.compute.threads, cancellation).map_err(execution_error)?;
+                expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+                remaining()?;
+                publish_team_map(&provenance, result.result(), result.compute(), &planner,
+                    limits.max_result_bytes + 4096, output, &publication)
+            } else if let Some(schedule) = limits.hierarchy_cohorts {
                 let result = engine.synthesize_int4_document_answer_hierarchy_grouped(&model, text,
                     Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), schedule, common.kernel, cancellation)
                     .map_err(execution_error)?;
@@ -518,7 +545,16 @@ pub(super) fn execute(args: Int4Args, options: MapArgs, _admitted: MapLimits,
         }
         Prepared::SummaryHierarchy(mut config, expected) => {
             config.native.run.max_elapsed = remaining()?;
-            if let Some(schedule) = limits.hierarchy_cohorts {
+            if common.compute.threads > 1 {
+                let planner = Arc::new(planner);
+                let result = engine.synthesize_int4_source_summary_hierarchy_with_threads(&model, text,
+                    Arc::clone(&planner), Arc::new(vocabulary), config, expected.limits(), common.kernel,
+                    common.compute.threads, cancellation).map_err(execution_error)?;
+                expected.verify_completed(result.result()).map_err(|_| CandidateError::Execution)?;
+                remaining()?;
+                publish_team_map(&provenance, result.result(), result.compute(), &planner,
+                    limits.max_result_bytes + 4096, output, &publication)
+            } else if let Some(schedule) = limits.hierarchy_cohorts {
                 let result = engine.synthesize_int4_source_summary_hierarchy_grouped(&model, text,
                     Arc::new(planner), Arc::new(vocabulary), config, expected.limits(), schedule, common.kernel, cancellation)
                     .map_err(execution_error)?;
