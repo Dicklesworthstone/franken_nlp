@@ -145,7 +145,7 @@ pub(super) fn complete(expected: Int4ExtractionMapPreflight, total: GroundingBud
     work: Int4Work, masks: u64, mapped: MapReduceResult<ExtractionMapValue>, cap: u64,
     root_array_union: Option<RootArrayUnionResult>)
     -> Result<Int4ExtractionMapRun, Int4ExtractionMapError> {
-    let run = Int4ExtractionMapRun { schema_version: 1, execution: expected.execution_version(),
+    let mut run = Int4ExtractionMapRun { schema_version: 1, execution: expected.execution_version(),
         numerics_profile: STRICT_INT4_PROFILE, group_width: expected.group_width,
         semantics: if root_array_union.is_some() { ROOT_ARRAY_UNION_POLICY } else { SEMANTICS }, grounding: expected.grounding,
         max_selected_rows: expected.selected_rows.map(|limits| limits.max_rows_per_step),
@@ -157,7 +157,9 @@ pub(super) fn complete(expected: Int4ExtractionMapPreflight, total: GroundingBud
             matches: total.max_matches.checked_sub(remaining.max_matches).ok_or(Int4ExtractionMapError::WorkLimit)?,
             scan_steps: total.max_scan_steps.checked_sub(remaining.max_scan_steps).ok_or(Int4ExtractionMapError::WorkLimit)? },
         untrusted_fields: if root_array_union.is_some() { vec!["mapped.root.value", "root_array_union"] }
-            else { vec!["mapped.root.value"] }, mapped, root_array_union };
+            else { vec!["mapped.root.value"] }, mapped, root_array_union,
+        request_binding: expected.request_binding, result_binding: [0; 32] };
+    run.result_binding = private_digest(b"fnlp-int4-extraction-map-result-v1", &run, cap)?;
     expected.verify_completed(&run)?;
     check_size(&run, cap)?;
     Ok(run)

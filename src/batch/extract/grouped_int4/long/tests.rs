@@ -283,6 +283,101 @@ fn schema_changes_rebind_every_identity_and_invalid_or_unbound_source_schemas_re
     }
 }
 #[test]
+fn equal_geometry_and_work_do_not_authorize_another_source() {
+    let p = planner(); let a = source_args();
+    let left = prepare(&p, "Alice Bob", &a, limits()).preflight_metadata();
+    let prepared = prepare(&p, "Carol Dan", &a, limits());
+    let right = prepared.preflight_metadata();
+    assert_eq!(left.source_span(), right.source_span());
+    assert_eq!(left.chunk_count(), right.chunk_count());
+    assert_eq!(left.planned_work(), right.planned_work());
+    assert_eq!(left.reserved_mask_visits(), right.reserved_mask_visits());
+    assert_ne!(left.request_binding, right.request_binding);
+    let result = run(prepared, Script::new(&a)).unwrap();
+    right.verify_completed(&result).unwrap();
+    assert!(matches!(left.verify_completed(&result),
+        Err(Int4ExtractionMapError::Extraction(Int4ExtractError::Extraction(ExtractError::InvalidResult)))));
+}
+
+#[test]
+fn exact_request_model_schema_task_and_map_policies_bind_even_without_changing_work() {
+    let p = planner(); let a = source_args(); let source = "Alice Bob";
+    let prepared = prepare(&p, source, &a, limits()); let expected = prepared.preflight_metadata();
+    let result = run(prepared, Script::new(&a)).unwrap();
+    for axis in 0..11 {
+        let mut other_planner = planner(); let mut other_args = a.clone(); let mut other_limits = limits();
+        match axis {
+            0 => {
+                let digest = Sha256Digest::of_bytes(b"different extraction model, same shape");
+                other_planner.compiler.identity.logical_model_digest = digest;
+                other_planner.compiler.identity.packing_set_digest = Sha256Digest::of_bytes(&canonjson::canonical_bytes(&(
+                    INT4_SOURCE_FORMAT, "low-nibble-first-no-padding-f32le-scales-v1", digest, 32,
+                )).unwrap());
+            },
+            1 => other_args.schema = a.schema.replace("64", "63"),
+            2 => other_args.budget.max_input_tokens -= 1,
+            3 => other_limits.mapping.mask_limits.max_trie_node_visits += 1,
+            4 => other_limits.mapping.mask_limits.checkpoint_interval_nodes += 1,
+            5 => other_limits.mapping.chunks.max_tokenizer_calls += 1,
+            6 => other_limits.mapping.reduction.max_task_calls += 1,
+            7 => other_limits.verification.max_scan_steps += 1,
+            8 => other_planner.compiler.compiler_limits.max_transitions += 1,
+            9 => other_planner.compiler.source_limits.verification.max_scan_steps += 1,
+            _ => other_limits.mapping.reduction.map_batch_chunks = 3,
+        }
+        let changed = prepare(&other_planner, source, &other_args, other_limits).preflight_metadata();
+        assert_eq!(changed.source_span(), expected.source_span(), "axis {axis}");
+        assert_eq!(changed.planned_work(), expected.planned_work(), "axis {axis}");
+        assert_eq!(changed.reserved_mask_visits(), expected.reserved_mask_visits(), "axis {axis}");
+        assert_ne!(changed.request_binding, expected.request_binding, "axis {axis}");
+        assert!(changed.verify_completed(&result).is_err(), "axis {axis}");
+    }
+}
+
+#[test]
+fn replacing_the_public_map_cannot_keep_an_unrelated_private_request_seal() {
+    let p = planner(); let a = source_args();
+    let prepared = prepare(&p, "Alice Bob", &a, limits()); let expected = prepared.preflight_metadata();
+    let mut left = run(prepared, Script::new(&a)).unwrap();
+    let right = run(prepare(&p, "Carol Dan", &a, limits()), Script::new(&a)).unwrap();
+    assert_eq!(left.model_work, right.model_work);
+    assert_eq!(left.verification_used, right.verification_used);
+    expected.verify_completed(&left).unwrap();
+    left.mapped = right.mapped;
+    assert!(expected.verify_completed(&left).is_err());
+
+    // Even another valid output for the SAME preparation cannot replace the
+    // completed native result while retaining its original private seal.
+    let a = args(r#"{"type":"integer"}"#, ExtractionBatchGrounding::Structural);
+    let prepared = prepare(&p, "Alice Bob", &a, limits()); let expected = prepared.preflight_metadata();
+    let mut first = Script::new(&a); first.json = Some("1".to_owned());
+    let mut second = Script::new(&a); second.json = Some("2".to_owned());
+    let mut left = run(prepared, first).unwrap();
+    let right = run(prepare(&p, "Alice Bob", &a, limits()), second).unwrap();
+    expected.verify_completed(&left).unwrap(); expected.verify_completed(&right).unwrap();
+    assert_eq!(left.request_binding, right.request_binding);
+    left.mapped = right.mapped;
+    assert!(expected.verify_completed(&left).is_err());
+}
+
+#[test]
+fn private_request_and_result_bindings_never_enter_wire_data_or_debug() {
+    let p = planner(); let a = source_args();
+    let prepared = prepare(&p, "Alice Bob", &a, limits()); let expected = prepared.preflight_metadata();
+    let result = run(prepared, Script::new(&a)).unwrap();
+    let wire = serde_json::to_value(&result).unwrap();
+    for field in ["request_binding", "result_binding", "max_result_bytes"] {
+        assert!(wire.get(field).is_none(), "private {field}");
+    }
+    let debug = format!("{expected:?}");
+    assert!(!debug.contains("Alice")); assert!(!debug.contains("request_binding"));
+    assert!(!debug.contains(&format!("{:?}", expected.request_binding)));
+    assert!(private_digest(b"fnlp-int4-extraction-map-result-v1", &result, 1).is_err());
+    assert_ne!(private_digest(b"request-domain", &1_u64, 64).unwrap(),
+        private_digest(b"result-domain", &1_u64, 64).unwrap());
+}
+
+#[test]
 fn every_final_identity_and_resident_kv_requirement_is_checked_before_the_first_forward() {
     let p = planner(); let a = source_args(); let prepared = prepare(&p, "Alice Bob", &a, limits());
     let mut ids: Vec<_> = prepared.execution_identities().cloned().collect();

@@ -7,6 +7,7 @@
 use super::*;
 use super::native::{Driver, NativeDriver, preflight, native_budget, valid_result};
 use std::sync::Arc;
+use sha2::{Digest, Sha256};
 use crate::{
     native_engine::{constrained_int4, decode::DecodeCancellationKind,
         strict_int4::{StrictInt4Engine, STRICT_INT4_PROFILE}},
@@ -121,6 +122,9 @@ pub struct Int4ExtractionMapPreflight {
     verification: GroundingBudget,
     root_array_binding: Option<Sha256Digest>,
     selected_rows: Option<Int4JsonSparseLimits>,
+    // Private request authority, never a public source/equality fingerprint.
+    request_binding: [u8; 32],
+    max_result_bytes: u64,
     encoding: Option<SafeBpeLimits>,
     encoding_work: Option<SafeBpeWork>,
 }
@@ -152,6 +156,13 @@ impl Int4ExtractionMapPreflight {
         if self.selected_rows.is_some() { INT4_EXTRACTION_MAP_SELECTED_EXECUTION } else { INT4_EXTRACTION_MAP_EXECUTION }
     }
     pub fn verify_completed(&self, run: &Int4ExtractionMapRun) -> Result<(), Int4ExtractionMapError> {
+        // Equal source lengths, chunk geometry and native counters do not
+        // identify a request. Also seal the actual retained result: callers
+        // can move public `mapped` values between otherwise legitimate runs.
+        if run.request_binding != self.request_binding
+            || run.result_binding != private_digest(b"fnlp-int4-extraction-map-result-v1", run, self.max_result_bytes)? {
+            return Err(ExtractError::InvalidResult.into());
+        }
         let root = run.mapped.root();
         let (work, masks, fields, spans) = execution::statistics(root.value(), self.group_width, self.selected_rows)?;
         let same_children = run.root_array_union.as_ref().is_none_or(|union| union.matches_chunks(
@@ -231,6 +242,10 @@ pub struct Int4ExtractionMapRun {
     pub mapped: MapReduceResult<ExtractionMapValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root_array_union: Option<RootArrayUnionResult>,
+    #[serde(skip)]
+    request_binding: [u8; 32],
+    #[serde(skip)]
+    result_binding: [u8; 32],
 }
 
 /// Source-borrowing, consumed commitment. No wire constructor or external
@@ -351,6 +366,7 @@ impl Int4ExtractionBatchPlanner {
                 scalar_start: first.scalar_start, scalar_end: last.scalar_end }, chunks: chunks.chunks().len(),
             work: Int4Work::default(), masks: 0, group_width: self.group_width, verification: v, root_array_binding: None,
             selected_rows: self.selected_rows(),
+            request_binding: [0; 32], max_result_bytes: m.reduction.max_result_bytes as u64,
             encoding, encoding_work: None,
             grounding: match args.grounding { ExtractionBatchGrounding::Structural => ExtractionGrounding::NotRequested,
                 ExtractionBatchGrounding::SourceMembership => ExtractionGrounding::SourceMembership } };
@@ -395,9 +411,77 @@ impl Int4ExtractionBatchPlanner {
                 Sha256Digest::of_bytes(source.as_bytes()), identities)).map_err(|_| Int4ExtractionMapError::Admission)?;
             expected.root_array_binding = Some(Sha256Digest::of_bytes(&bytes));
         }
+        expected.request_binding = request_binding(source, args, self, limits, &chunks, &plans, control)?;
         step(control)?;
         Ok(PreparedInt4ExtractionMap { chunks, plans, limits, expected, kv_ceiling: b.max_kv_bytes })
     }
+}
+
+/// Bind the complete caller request and the ordered, actually compiled child
+/// identities. Unused ceilings are still authority: changing a schema, model,
+/// source-verification allowance or physical chunk schedule cannot reuse an
+/// unrelated preflight merely because both requests happen to cost the same.
+/// This digest is process-private and is absent from Debug and all wire data.
+#[allow(clippy::too_many_arguments)]
+fn request_binding<C: DecodeStepControl>(source: &str, args: &ExtractionBatchArgs,
+    planner: &Int4ExtractionBatchPlanner, limits: Int4ExtractionMapLimits,
+    chunks: &ChunkPlan<'_>, plans: &[PreparedInt4BatchExtraction], control: &mut C)
+    -> Result<[u8; 32], Int4ExtractionMapError> {
+    let mut writer = PrivateDigest::new(b"fnlp-int4-extraction-map-request-v1", u64::MAX);
+    let m = limits.mapping;
+    let c = planner.compiler.compiler_limits;
+    writer.value(&(source, &args.schema, args.grounding, args.budget))?;
+    writer.value(&(m.chunks, m.reduction, m.max_model_work,
+        (m.mask_limits.max_trie_node_visits, m.mask_limits.checkpoint_interval_nodes),
+        m.mask_visits_per_chunk, m.max_mask_visits, limits.verification, limits.root_array_union))?;
+    writer.value(&((c.max_schema_bytes, c.max_string_bytes, c.max_array_items, c.max_output_bytes,
+        c.max_states, c.max_transitions, c.max_mask_bytes), planner.compiler.source_limits,
+        planner.document_encoding(), planner.selected_rows().map(|limits| limits.max_rows_per_step)))?;
+    writer.value(&plans.len())?;
+    for (chunk, plan) in chunks.chunks().iter().zip(plans) {
+        step(control)?;
+        let identity = plan.execution_identity().receipt_digest().map_err(|_| Int4ExtractionMapError::Admission)?;
+        writer.value(&(chunk.id(), chunk.span(), chunk.tokens(), identity,
+            plan.request_digest(), plan.comparison_policy_digest()))?;
+    }
+    step(control)?;
+    Ok(writer.finish())
+}
+
+/// Streaming private seals avoid another result-sized allocation. All callers
+/// serialize fixed repository-owned structs; this is not an exported canonical
+/// digest protocol or a way to accept arbitrary user-provided serialized data.
+struct PrivateDigest { hash: Sha256, remaining: u64, exceeded: bool }
+impl PrivateDigest {
+    fn new(domain: &[u8], cap: u64) -> Self {
+        let mut hash = Sha256::new(); hash.update(domain); hash.update([0]);
+        Self { hash, remaining: cap, exceeded: false }
+    }
+    fn value(&mut self, value: &(impl Serialize + ?Sized)) -> Result<(), Int4ExtractionMapError> {
+        if serde_json::to_writer(&mut *self, value).is_err() {
+            let error = if self.exceeded { ExtractError::OutputBudgetExceeded } else { ExtractError::Serialization };
+            return Err(error.into());
+        }
+        // Typed JSON values are framed, so adjacent scalar/list segments
+        // cannot collide by concatenating their serialized bytes.
+        self.hash.update([0]);
+        Ok(())
+    }
+    fn finish(self) -> [u8; 32] { self.hash.finalize().into() }
+}
+impl std::io::Write for PrivateDigest {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let Some(remaining) = self.remaining.checked_sub(bytes.len() as u64) else {
+            self.exceeded = true;
+            return Err(std::io::Error::other("INT4 extraction map private binding limit"));
+        };
+        self.remaining = remaining; self.hash.update(bytes); Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+fn private_digest(domain: &[u8], value: &(impl Serialize + ?Sized), cap: u64)
+    -> Result<[u8; 32], Int4ExtractionMapError> {
+    let mut writer = PrivateDigest::new(domain, cap); writer.value(value)?; Ok(writer.finish())
 }
 
 /// The ordinary partitioner makes no prefix-monotonicity assumption. Every
