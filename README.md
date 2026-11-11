@@ -308,7 +308,8 @@ Buffered `fnlp candidate source-int4 generate`, `chat`, `classify`, `sentiment`,
 `judge`, `extract`, `ner`, `keyphrases`, `summarize` and `answer` accept
 `--compute-threads N`, as do live `stream generate|chat` requests and resident
 `score-batch --task classify|sentiment|judge`, `extract-batch`, `ner-batch`,
-`keyphrases-batch`, `summarize-batch` and `answer-batch` streams. The default,
+`keyphrases-batch`, `summarize-batch` and `answer-batch` streams, and retained
+`text-job start|resume generate|chat` invocations. The default,
 `1`, keeps the existing serial route.
 Values from `2` through `64` select one fixed team for the complete request or supported resident stream:
 one blocking coordinator and `N - 1` persistent scoped workers. The command
@@ -378,7 +379,8 @@ The required `run_complete` is staged under the existing transport budget and
 published after all workers join, inside the original invocation and deadline.
 
 A worker count above one cannot combine with `--prefill-rows`, `--cohort-heads`
-or `--cohort-documents`; text batches, complete-document maps, corpora and durable jobs do not expose this option. Invalid
+or `--cohort-documents`; text batches, complete-document maps, other corpora and
+durable tasks other than generation/chat do not expose this option. Invalid
 widths, incompatible schedules and insufficient memory refuse before private
 IO, and a hosted request cannot exceed its installed child-thread envelope.
 Worker teams can combine with compact input on the tasks that expose it;
@@ -4022,7 +4024,12 @@ complete native generation results in the authenticated job spool. This route
 requires `metadata-store` and `asupersync-runtime` on Linux x86-64 or AArch64.
 It accepts the same pinned source conversion and independently digest-pinned
 snapshot inputs as the existing INT4 text commands. One resident model serves
-all pending items, through one owned physical invocation.
+all pending items, through one owned physical invocation. Optional
+`--compute-threads 2..64` creates one persistent output-row team for that
+invocation; width `1` retains the serial route. The team serves every pending
+item and token while preserving ordered whole-item commits. Width is a physical
+schedule, so it may change on resume without changing the authenticated task
+recipe, original sample addresses or lifetime work allowances.
 
 Supply the **complete original population** on start and ordinary resume,
 including already committed items. Explicit input retention also permits
@@ -4129,12 +4136,19 @@ loading. A final report failure does not imply that durable progress rolled back
 
 Memory admission covers the entire frozen population, journal/serialization,
 CLI and hosted preparation, resident weights, full context KV, native sampler,
-workspace and guarded complete result. The current retained adapter is serial
-and rejects `--prefill-rows` or cohort scheduling. It uses the existing pinned
-no-thinking/no-tools generation contract. Library callers construct
+workspace and guarded complete result. Explicit teams additionally reserve
+their worker buffers before private IO and install one coordinator plus
+`N - 1` scoped workers and one runtime thread. The final progress report follows
+physical worker drain and adds `compute_schedule` with the declared width;
+stored semantic results and their identities do not include that width.
+The adapter rejects `--prefill-rows` and cohort scheduling. It uses the existing
+pinned no-thinking/no-tools generation contract. Library callers construct
 `Int4GenerationJobPlanner::for_model` with the actual model identity,
 `Int4GenerationJobConfig` and exact `JobLimits`, then call
-`NlpEngine::job_int4_generation` with `SourceJobRequest` and `JobHostLimits`.
+`NlpEngine::job_int4_generation` or `job_int4_generation_with_threads` with
+`SourceJobRequest` and `JobHostLimits`. The threaded method requires a compatible
+installed resource-host thread envelope. Cancellation or report failure may
+follow committed progress; authenticate and resume the job to reconcile it.
 This is source-inventoried candidate functionality; build, model-present
 correctness, crash recovery, determinism and quality gates remain pending.
 

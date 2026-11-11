@@ -191,6 +191,180 @@ fn owned_population_factory_and_native_result_fit_the_existing_blocking_boundary
     fn send<T: Send + 'static>() {}
     send::<Int4GenerationJobPlanner>();
     send::<GenerationInput<Cursor<Vec<u8>>>>();
+    send::<GenerationExecution<Cursor<Vec<u8>>>>();
     send::<crate::tasks::chat::grouped_int4::Int4ChatResult>();
     let _entry = NlpEngine::job_int4_generation::<Cursor<Vec<u8>>>;
+    let _team_entry = NlpEngine::job_int4_generation_with_threads::<Cursor<Vec<u8>>>;
+}
+
+mod team {
+    use super::*;
+    use crate::{LeakResponsePolicy, ResourceHostConfig, RuntimePreset,
+        hosted::corpus::jobs::JobOpenMode,
+        jobs::{JobError, JobId, JobSecret, runner::generation::{GenerationJobTask,
+            grouped_int4::Int4GenerationJobConfig}},
+        native_engine::{decode::DecodeCancellationKind,
+            generation::{GenerationLimits, GenerationOptions},
+            strict_int4::weights::projection_fixture},
+        tasks::chat::ChatLimits,
+        tokenizer::embedded::EmbeddedTokenizer};
+    use std::{io::{self, BufRead, Read}, sync::atomic::{AtomicU64, AtomicUsize, Ordering}};
+
+    const MIB: u64 = 1 << 20;
+    const PREPARATION: u64 = 128 * MIB;
+
+    #[derive(Clone, Copy)]
+    enum ReadAction { Refuse, Cancel(DecodeCancellationKind), Panic, Empty }
+    #[derive(Default)]
+    struct Observation {
+        reads: AtomicUsize, drops: AtomicUsize,
+        input_bytes_at_drop: AtomicU64, worker_bytes_at_read: AtomicU64,
+    }
+    struct Reader {
+        resources: Arc<EngineResources>, observation: Arc<Observation>,
+        action: ReadAction, stop: CancellationToken,
+    }
+    impl Drop for Reader {
+        fn drop(&mut self) {
+            let snapshot = self.resources.memory_snapshot();
+            let bytes = snapshot.by_class.get(&MemoryClass::JobBuffers)
+                .map_or(0, |value| value.committed_bytes + value.reserved_bytes);
+            self.observation.input_bytes_at_drop.store(bytes, Ordering::SeqCst);
+            self.observation.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl Read for Reader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            self.fill_buf()?; Ok(0)
+        }
+    }
+    impl BufRead for Reader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            self.observation.reads.fetch_add(1, Ordering::SeqCst);
+            let snapshot = self.resources.memory_snapshot();
+            let bytes = snapshot.by_class.get(&MemoryClass::ActivationScratch)
+                .map_or(0, |value| value.committed_bytes);
+            self.observation.worker_bytes_at_read.store(bytes, Ordering::SeqCst);
+            match self.action {
+                ReadAction::Refuse => panic!("refused job read private input"),
+                ReadAction::Panic => panic!("synthetic input panic"),
+                ReadAction::Cancel(cause) => self.stop.cancel(cause),
+                ReadAction::Empty => (),
+            }
+            Ok(&[])
+        }
+        fn consume(&mut self, _: usize) {}
+    }
+    fn reader(host: &NlpEngine, action: ReadAction, stop: CancellationToken)
+        -> (Reader, Arc<Observation>) {
+        let observation = Arc::new(Observation::default());
+        (Reader { resources: Arc::clone(host.resources()), observation: Arc::clone(&observation),
+            action, stop }, observation)
+    }
+    fn planner(model: &ResidentInt4, task: GenerationJobTask)
+        -> (Int4GenerationJobPlanner, SourceJobRequest, JobHostLimits) {
+        let (budget, mut envelope, mut job, mut host) = fixture();
+        let width = model.model_identity().group_width();
+        let work = Int4Work::for_sequence(width, 0, 128, 16 * NANBEIGE_VOCAB_SIZE).unwrap();
+        job.max_work = JobWork::from_int4(work, 0);
+        envelope.native.native = Int4RunBudget::exact(work);
+        host.preparation_reserve_bytes = PREPARATION;
+        host.native.run.max_elapsed = Duration::from_secs(60);
+        host.native.run.max_checkpoints = 100_000;
+        let eos = EmbeddedTokenizer::pinned().unwrap().eos_token_id().unwrap();
+        let planner = Int4GenerationJobPlanner::for_model(model.model_identity(), Int4GenerationJobConfig {
+            task, generation: GenerationOptions::greedy(4, 256, eos), budget,
+            planning: ChatLimits { max_messages: 4, max_message_bytes: 128, max_total_message_bytes: 256,
+                generation: GenerationLimits { max_prompt_tokens: 48, max_new_tokens: 4,
+                    max_output_bytes: 256, max_sampler_bytes: envelope.native.max_sampler_bytes } },
+            native: envelope.native, context_tokens: 64,
+        }, job).unwrap();
+        let request = SourceJobRequest { root: PathBuf::from("/nonexistent/fnlp-text-job-team-refusal"),
+            key: JobSecret::from_bytes([3; 32]), job_id: JobId([4; 16]), limits: job,
+            mode: JobOpenMode::Create, materialize: false };
+        (planner, request, host)
+    }
+    fn drained(host: &NlpEngine, baseline: &crate::MemorySnapshot) {
+        assert_eq!(&host.resources().memory_snapshot(), baseline);
+        let closures = host.resources().outstanding_closure_snapshot();
+        assert_eq!(closures.active_closures, 0);
+        assert_eq!(closures.wrapper_cancelled_closures, 0);
+    }
+
+    #[test]
+    #[ignore = "controller-only real runtime: tiny weights test admission/ownership/drain, never model or durable-result parity"]
+    fn durable_text_team_rejects_before_input_and_drains_cancelled_or_panicked_readers() {
+        let host = NlpEngine::builder().resource_config(ResourceHostConfig {
+            runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
+            max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 2,
+            helper_threads: 0, thread_ceiling: 4, memory_ceiling_bytes: 1024 * MIB,
+            leak_response_policy: LeakResponsePolicy::PanicInLabOrCi,
+        }).build().unwrap();
+        let idle = host.resources().memory_snapshot();
+        let lease = host.resources().acquire_lease();
+        let preparation = Pending::reserve(&lease, MemoryClass::JobBuffers, PREPARATION).unwrap().commit().unwrap();
+        let model_lease = host.resources().acquire_lease();
+        let loaded = allocate(Pending::reserve(&model_lease, MemoryClass::Weights, MIB).unwrap(),
+            || Ok(projection_fixture(4).0)).unwrap();
+        let model = ResidentInt4 { inner: Arc::new(ResidentModel { loaded, lease: model_lease }) };
+        let baseline = host.resources().memory_snapshot();
+        use DecodeCancellationKind::*;
+        for task in [GenerationJobTask::Generate, GenerationJobTask::Chat] {
+            for cause in [User, Timeout, Deadline, PollQuota, CostBudget, FailFast, RaceLost,
+                ParentCancelled, ResourceUnavailable, Shutdown, LinkedExit] {
+                let (planner, request, limits) = planner(&model, task);
+                let charge = limits.required_buffer_bytes(request.limits).unwrap();
+                let stop = CancellationToken::default(); stop.cancel(cause);
+                let (reader, observed) = reader(&host, ReadAction::Refuse, stop.clone());
+                let error = host.job_int4_generation_with_threads(&model, planner, request, limits,
+                    PackedInt4Kernel::scalar(), 3, reader, stop).err().unwrap();
+                let HostedJobError::Host(HostedError::Stopped { stop, .. }) = error
+                    else { panic!("job pre-cancellation lost its typed cause"); };
+                assert_eq!(stop.kind, cause);
+                assert_eq!(observed.reads.load(Ordering::SeqCst), 0);
+                assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+                assert!(observed.input_bytes_at_drop.load(Ordering::SeqCst) >= PREPARATION + charge);
+                drained(&host, &baseline);
+            }
+        }
+        for width in [0, 1, 4, 65, usize::MAX] {
+            let (planner, request, limits) = planner(&model, GenerationJobTask::Generate);
+            let stop = CancellationToken::default();
+            let (reader, observed) = reader(&host, ReadAction::Refuse, stop.clone());
+            let error = host.job_int4_generation_with_threads(&model, planner, request, limits,
+                PackedInt4Kernel::scalar(), width, reader, stop).err().unwrap();
+            assert!(matches!(error, HostedJobError::Host(HostedError::Limits(_))));
+            assert_eq!(observed.reads.load(Ordering::SeqCst), 0);
+            assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+            drained(&host, &baseline);
+        }
+        for action in [ReadAction::Cancel(Deadline), ReadAction::Panic, ReadAction::Empty] {
+            let (planner, request, limits) = planner(&model, GenerationJobTask::Chat);
+            let charge = limits.required_buffer_bytes(request.limits).unwrap();
+            let stop = CancellationToken::default();
+            let (reader, observed) = reader(&host, action, stop.clone());
+            let error = host.job_int4_generation_with_threads(&model, planner, request, limits,
+                PackedInt4Kernel::scalar(), 3, reader, stop).err().unwrap();
+            match action {
+                ReadAction::Cancel(cause) => {
+                    let HostedJobError::Host(HostedError::Stopped { stop, .. }) = error
+                        else { panic!("reader cancellation lost its typed cause"); };
+                    assert_eq!(stop.kind, cause);
+                }
+                ReadAction::Panic => assert!(matches!(error,
+                    HostedJobError::Host(HostedError::Panicked | HostedError::Scope { .. }))),
+                ReadAction::Empty => assert!(matches!(error,
+                    HostedJobError::Job(JobRunError::Storage(JobError::InvalidInput)))),
+                ReadAction::Refuse => unreachable!(),
+            }
+            assert_eq!(observed.reads.load(Ordering::SeqCst), 1);
+            assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+            assert!(observed.worker_bytes_at_read.load(Ordering::SeqCst)
+                >= int4_task_team_workspace_bytes(3, 4).unwrap());
+            assert!(observed.input_bytes_at_drop.load(Ordering::SeqCst) >= PREPARATION + charge);
+            drained(&host, &baseline);
+        }
+        drop(model); drop(preparation); drop(lease);
+        drained(&host, &idle);
+    }
 }

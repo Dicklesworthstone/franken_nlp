@@ -23,9 +23,9 @@ struct JobArgs { task: GenerationJobTask, storage: StorageArgs }
 pub(super) fn definition() -> clap::Command {
     let operation = |name: &'static str, about: &'static str| {
         let tasks = ["generate", "chat"].into_iter().map(|task| {
-            let command = StorageArgs::augment_args(Int4Args::augment_args(clap::Command::new(task)))
+            let command = compute::definition(StorageArgs::augment_args(Int4Args::augment_args(clap::Command::new(task))))
                 .about("Retain complete native results under one immutable generation recipe")
-                .long_about("Run or resume retained generate/chat items on one resident grouped-INT4 model. By default, supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation; explicit retained-input replay is available. text is the prompt or final user turn; optional task_args contains only sample_index and, for chat, history. Shared seed, stops, penalties, logprobs, context, task limits and model/group identity are authenticated and cannot change on resume. No seed means greedy; no implicit random seed is generated. Requires --store-results, existing protected --job-dir and --key-file, exact --job-id, and immutable --limits. All five native lifetime work axes are charged before each attempt and never refunded for EOS, failure or cancellation; mask_node_visits must be zero. Results commit only after whole native completion. Stdout is metadata only; --materialize publishes verified private results after every item commits. The retained adapter is serial; --prefill-rows and cohort scheduling are unsupported. No partial-token checkpoints, flush controls, per-record policy changes, automatic retry, thinking mode, tools, model download or release activation. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
+                .long_about("Run or resume retained generate/chat items on one resident grouped-INT4 model. By default, supply the COMPLETE original {id,text,task_args?} NDJSON population on every invocation; explicit retained-input replay is available. text is the prompt or final user turn; optional task_args contains only sample_index and, for chat, history. Shared seed, stops, penalties, logprobs, context, task limits and model/group identity are authenticated and cannot change on resume. No seed means greedy; no implicit random seed is generated. Requires --store-results, existing protected --job-dir and --key-file, exact --job-id, and immutable --limits. All five native lifetime work axes are charged before each attempt and never refunded for EOS, failure or cancellation; mask_node_visits must be zero. Results commit only after whole native completion. Stdout is metadata only; --materialize publishes verified private results after every item commits. Items execute in order; --compute-threads 2..=64 reuses one persistent output-row team across the entire invocation. Physical width may change on resume without changing the authenticated recipe or renewing its work. Worker scratch and the process thread envelope are admitted before IO. --prefill-rows and cohort scheduling are unsupported. No partial-token checkpoints, flush controls, per-record policy changes, automatic retry, thinking mode, tools, model download or release activation. Requires metadata-store and asupersync-runtime on Linux x86-64/AArch64.")
                 .after_help(job_cli::INPUT_RETENTION_HELP)
                 .mut_arg("input", |arg| arg.help("COMPLETE original NDJSON population; omit with --use-retained-input; '-' reads stdin"))
                 .mut_arg("max_input_bytes", |arg| arg.help("Outer ceiling for each complete NDJSON record; immutable JobLimits.max_input_bytes_per_item must fit"))
@@ -76,7 +76,10 @@ impl JobArgs {
             return Err(Failure::usage("explicit_text_job_storage"));
         }
         if args.prefill()?.is_some() { return Err(Failure::usage("text_job_serial_schedule")); }
-        let common = args.validate()?;
+        // The retained recipe still uses its original byte-fallback compiler.
+        // Reject a programmatic encoding override rather than ignoring it.
+        if !args.input_encoding.is_default() { return Err(Failure::usage("text_job_input_encoding")); }
+        let common = args.validate_text_compute()?;
         for mib in [s.journal_memory_mib, s.serialization_memory_mib] {
             if mib.checked_mul(MIB).is_none_or(|bytes| bytes > common.memory_bytes) {
                 return Err(Failure::usage("text_job_memory"));
@@ -144,7 +147,9 @@ impl JobCommand {
             _ => return Err(invalid("text-job operation refused")),
         };
         let args = JobArgs { task, storage: StorageArgs::from_arg_matches(matches)? };
-        Ok((Self { mode, args }, Int4Args::from_arg_matches(matches)?))
+        let mut native = Int4Args::from_arg_matches(matches)?;
+        native.compute = compute::Args::from_matches(matches)?;
+        Ok((Self { mode, args }, native))
     }
     pub(super) fn run_owned<R: Read + Send + 'static>(self, args: Int4Args, input: R,
         output: &mut impl Write, diagnostics: &mut impl Write) -> ExitCode {

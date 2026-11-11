@@ -109,6 +109,53 @@ fn retained_route_never_accepts_ignored_prefill_cohort_or_per_record_policy_flag
 }
 
 #[test]
+fn retained_text_jobs_admit_explicit_worker_teams_without_widening_lifetime_work() {
+    for task in ["generate", "chat"] {
+        let (serial, args) = command("start", task, &[]);
+        let common = serial.args.validate(&args).unwrap();
+        let job = lifetime(&args, common);
+        let baseline = serial.args.lifetime_limits(&args, common, job).unwrap();
+        assert_eq!(common.compute.threads, 1);
+        assert_eq!(common.compute.workspace_bytes, 0);
+        for operation in ["start", "resume"] {
+            for width in ["1", "2", "4", "64"] {
+                let (selected, args) = command(operation, task, &["--compute-threads", width]);
+                let common = selected.args.validate(&args).unwrap();
+                let scheduled = selected.args.lifetime_limits(&args, common, job).unwrap();
+                assert_eq!(common.compute.threads, width.parse::<usize>().unwrap());
+                assert_eq!(common.compute.workspace_bytes, if width == "1" { 0 } else {
+                    crate::native_engine::strict_int4::projection::int4_team_workspace_bytes(
+                        common.compute.threads, args.group_width).unwrap()
+                });
+                assert_eq!(scheduled.buffer_bytes, baseline.buffer_bytes);
+                assert_eq!(scheduled.common.native, baseline.common.native);
+                assert_eq!(scheduled.common.result_bytes, baseline.common.result_bytes);
+                assert_eq!(scheduled.native.native.max_forward_positions, baseline.native.native.max_forward_positions);
+                assert_eq!(scheduled.native.native.max_attention_pairs, baseline.native.native.max_attention_pairs);
+                assert_eq!(scheduled.native.native.max_projection_work, baseline.native.native.max_projection_work);
+                assert_eq!(scheduled.native.max_sampler_bytes, baseline.native.max_sampler_bytes);
+                assert!(scheduled.common.minimum_memory_bytes >= baseline.common.minimum_memory_bytes);
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_worker_width_and_unwired_encoding_refuse_before_private_io() {
+    for task in ["generate", "chat"] {
+        for width in ["0", "65", "18446744073709551615"] {
+            let (c, args) = command("resume", task, &["--compute-threads", width]);
+            assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().exit, ErrorCode::Usage);
+        }
+    }
+    let matches = input_encoding::definition(clap::Command::new("encoding"))
+        .try_get_matches_from(["encoding", "--input-encoding", "safe-bpe-v1"]).unwrap();
+    let (c, mut args) = command("start", "generate", &[]);
+    args.input_encoding = input_encoding::InputEncodingArgs::from_matches(&matches).unwrap();
+    assert_eq!(c.execute_owned(args, NoRead, &mut NoWrite).unwrap_err().code, "text_job_input_encoding");
+}
+
+#[test]
 fn retained_generation_and_chat_resume_admit_only_the_live_input_record() {
     for task in ["generate", "chat"] {
         let (start, args) = command("start", task, &["--spool-input", "--max-retained-input-mib", "8"]);

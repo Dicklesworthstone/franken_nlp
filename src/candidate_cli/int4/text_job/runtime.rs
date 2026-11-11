@@ -3,7 +3,7 @@ use super::*;
 use crate::jobs::JobInputMemory;
 use std::time::{Duration, Instant};
 use crate::{
-    NlpEngine, ResourceHostConfig, RuntimePreset, LeakResponsePolicy, MemoryClass,
+    NlpEngine, MemoryClass,
     candidate_cli::runtime::owned_jobs::{host_failure, job_failure, open_mode, progress_report},
     hosted::{CancellationToken, NativeLimits, ResidentInt4, RunLimits,
         corpus::jobs::{JobHostLimits, SourceJobRequest}},
@@ -21,12 +21,8 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
     let deadline = Duration::from_secs(args.timeout_seconds);
     let remaining = || deadline.checked_sub(started.elapsed()).filter(|time| !time.is_zero())
         .ok_or(CandidateError::Timeout);
-    let engine = NlpEngine::builder().resource_config(ResourceHostConfig {
-        runtime_preset: RuntimePreset::CurrentThread, runtime_workers: 1,
-        max_blocking_coordinators: 1, scoped_cpu_children_per_coordinator: 0,
-        helper_threads: 0, thread_ceiling: 2, memory_ceiling_bytes: common.memory_bytes,
-        leak_response_policy: LeakResponsePolicy::RecordAndEscalate,
-    }).build().map_err(|_| CandidateError::Runtime)?;
+    let engine = NlpEngine::builder().resource_config(compute::resource_config(common))
+        .build().map_err(|_| CandidateError::Runtime)?;
     let lease = engine.resources().acquire_lease();
     // Declare ahead of every key/config/planner/reader allocation and keep it
     // until the final report has flushed, including errors after durable work.
@@ -63,8 +59,12 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
         mode: open_mode(mode, job.storage.input_retention)?, materialize };
     // The host authenticates the complete population and exact recipe before
     // replay/repair, executes only pending whole items and drains physically.
-    let progress = engine.job_int4_generation(&model, planner, request, host,
-        common.kernel, reader, cancellation).map_err(host_failure)?;
+    let progress = if common.compute.threads == 1 {
+        engine.job_int4_generation(&model, planner, request, host, common.kernel, reader, cancellation)
+    } else {
+        engine.job_int4_generation_with_threads(&model, planner, request, host,
+            common.kernel, common.compute.threads, reader, cancellation)
+    }.map_err(host_failure)?;
     remaining()?;
     let report = progress_report(progress, job_id, lifetime, materialize, mode, task)?;
     let content = identity.logical_model_digest.to_hex();
@@ -75,7 +75,8 @@ pub(super) fn execute<R: Read + Send + 'static>(mode: RunMode, args: Int4Args,
         source_root_sha256: model.model_identity().source_root_sha256(),
         model_content_sha256: &content, candidate_format: &identity.artifact_format,
         quant_recipe: &identity.quant_recipe, group_width: model.model_identity().group_width(),
-        integer_kernel: common.kernel.kind().id(), snapshot, output: &report,
+        integer_kernel: common.kernel.kind().id(), snapshot,
+        compute_schedule: compute::Schedule::for_threads(common.compute.threads), output: &report,
     };
     // No prompts, histories, seeds, tokens, generated text or scores on stdout.
     // Report delivery failure can follow committed progress and is not rollback.
@@ -169,7 +170,7 @@ fn simultaneous_memory(width: usize, native: Int4GenerationBudget, task: TaskBud
     }
     sum(&[common.preparation_bytes, common.load.weight_payload_bytes, ALLOCATOR_BYTES,
         host.required_buffer_bytes_for_input(job, input).map_err(host_failure)?,
-        need.kv_bytes, need.rope_bytes, need.scratch_payload_bound,
+        need.kv_bytes, need.rope_bytes, need.scratch_payload_bound, common.compute.workspace_bytes,
         host.native.allocator_reserve_bytes, native.max_sampler_bytes,
         product(task.max_output_bytes, 4)?, product(u64::from(task.max_output_tokens), 8)?, 4096,
         host.native.run.cleanup_reserve_bytes])
@@ -191,6 +192,8 @@ struct Response<'a, T: Serialize> {
     group_width: usize, integer_kernel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<SnapshotRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compute_schedule: Option<compute::Schedule>,
     output: &'a T,
 }
 

@@ -3,7 +3,8 @@ use super::*;
 use crate::{
     jobs::{JobWork, runner::generation::grouped_int4::{Int4GenerationAdmission,
         Int4GenerationBatchAdmission, Int4GenerationJobPlanner, Int4GenerationJobProcessor}},
-    native_engine::generation::grouped_int4::Int4GenerationBudget,
+    native_engine::{generation::grouped_int4::Int4GenerationBudget,
+        strict_int4::projection::Int4ProjectionExecutor},
 };
 
 struct GenerationInput<R> {
@@ -19,6 +20,18 @@ struct GenerationEnvelope {
     lifetime: JobWork,
     result_bytes: u64,
     output_tokens: u64,
+}
+
+// One owner crosses the blocking boundary, including cancellation while
+// queued. Private storage drops before its charges; its lease drops last.
+struct GenerationExecution<R> {
+    input: Charged<GenerationInput<R>>,
+    kv: Pending,
+    scratch: Pending,
+    envelope: GenerationEnvelope,
+    limits: JobHostLimits,
+    required: Int4MemoryRequirement,
+    lease: EngineLease,
 }
 
 impl NlpEngine {
@@ -38,7 +51,40 @@ impl NlpEngine {
         request: SourceJobRequest, limits: JobHostLimits, kernel: PackedInt4Kernel,
         reader: R, cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
     where R: BufRead + Send + 'static {
-        dispatch::preflight(self, limits.native.run)?;
+        self.run_int4_generation_job(model, planner, request, limits, kernel, None, reader, cancellation)
+    }
+
+    /// Run the same durable generation/chat job on one persistent team of
+    /// 2..=64 compute threads, including the coordinator. Every pending item
+    /// and generated token uses that team and the original invocation budget.
+    /// Worker scratch is additional to native, sampler and journal storage.
+    ///
+    /// Physical team width is not part of the immutable semantic recipe: an
+    /// authenticated resume may change it without changing addressed samples,
+    /// native work debits or committed records. Items remain ordered and use
+    /// the existing complete-result spool/journal protocol. The method returns
+    /// only after every worker joins; cancellation can leave durable progress
+    /// which must be reconciled through authenticated resume.
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_int4_generation_with_threads<R>(&self, model: &ResidentInt4,
+        planner: Int4GenerationJobPlanner, request: SourceJobRequest, limits: JobHostLimits,
+        kernel: PackedInt4Kernel, compute_threads: usize, reader: R,
+        cancellation: CancellationToken) -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        self.run_int4_generation_job(model, planner, request, limits, kernel,
+            Some(compute_threads), reader, cancellation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_int4_generation_job<R>(&self, model: &ResidentInt4, planner: Int4GenerationJobPlanner,
+        request: SourceJobRequest, limits: JobHostLimits, kernel: PackedInt4Kernel,
+        compute_threads: Option<usize>, reader: R, cancellation: CancellationToken)
+        -> Result<JobProgress, HostedJobError>
+    where R: BufRead + Send + 'static {
+        match compute_threads {
+            Some(width) => dispatch::preflight_int4_team(self, limits.native.run, width)?,
+            None => dispatch::preflight(self, limits.native.run)?,
+        }
         if !Arc::ptr_eq(self.resources(), model.resources()) {
             return Err(HostedError::ResourceDomain.into());
         }
@@ -56,49 +102,73 @@ impl NlpEngine {
         };
         let required = requirements(planner.group_width(), planner.task_budget(), envelope,
             request.limits, limits, request.mode.input_memory())?;
+        // The dispatcher owns and charges this additional worker storage.
+        // Check the simultaneous quote before reserving or reading input.
+        let team_scratch = compute_threads.map(|width|
+            int4_task_team_workspace_bytes(width, model.model_identity().group_width()))
+            .transpose()?.unwrap_or(0);
+        sum(&[required.workspace_bytes, team_scratch])?;
         let lease = self.resources().acquire_lease();
         let input = allocate(Pending::reserve(&lease, MemoryClass::JobBuffers, required.input_bytes)?,
             || Ok(GenerationInput { preparation: Some((planner, request)), reader }))?;
         let kv = Pending::reserve(&lease, MemoryClass::KvPages, required.native.kv_bytes)?;
         let scratch = Pending::reserve(&lease, MemoryClass::ActivationScratch, required.workspace_bytes)?;
+        let execution = GenerationExecution { input, kv, scratch, envelope, limits,
+            required: required.native, lease };
         let model = model.clone();
-        let completed = dispatch::run(self, limits.native.run, cancellation, move |control| {
-            // Capture the whole owner even while queued. Its storage drops
-            // before the charge, including cancellation before the first poll.
-            let mut input = input;
-            checkpoint(control)?;
-            let (planner, request) = input.value.preparation.take()
-                .ok_or(HostedError::CompletionMissing)?;
-            let population = match read_population(&mut input.value.reader,
-                &request, limits.transport, control) {
-                Ok(population) => population,
-                Err(error) => return Ok(Err(JobRunError::Storage(error))),
-            };
-            checkpoint(control)?;
-            let mut engine = allocate_native(kv, scratch, || {
-                StrictInt4Engine::new(&model.inner.loaded.value, envelope.context_tokens,
-                    Int4MemoryBudget { max_kv_bytes: required.native.kv_bytes,
-                        max_rope_bytes: required.native.rope_bytes,
-                        max_scratch_payload_bytes: required.native.scratch_payload_bound })
-                    .map(|engine| engine.with_kernel(kernel)).map_err(native_error)
-            })?;
-            let admission = GenerationAdmission { lease: &lease, model: model.model_identity(),
-                base: planner.execution_identity(), envelope };
-            let result = (|| {
-                let processor = Int4GenerationJobProcessor::new(&planner, &mut engine.value, admission)
-                    .map_err(JobRunError::Processor)?;
-                run_population(request, &population, processor, control)
-            })();
-            drop(engine);
-            drop(population);
-            drop(planner);
-            drop(input);
-            drop(lease);
-            Ok(result)
-        })?;
+        let completed = match compute_threads {
+            None => dispatch::run(self, limits.native.run, cancellation, move |control|
+                execution.run(&model.inner.loaded.value, kernel, None, control)),
+            Some(width) => dispatch::run_int4_team(self, limits.native.run, cancellation,
+                model, width, kernel, move |weights, control, team|
+                    execution.run(weights, kernel, Some(team), control)),
+        }?;
         // Runtime cancellation/drain failure takes precedence over a job return;
         // authenticated resume reconciles any lost durable acknowledgement.
         completed.map_err(HostedJobError::Job)
+    }
+}
+
+impl<R: BufRead> GenerationExecution<R> {
+    /// Physical scheduling changes only the exact projection executor. Both
+    /// routes use the same authenticated population, planner and job runner.
+    fn run<'weights>(self, weights: &'weights Int4ModelWeights, kernel: PackedInt4Kernel,
+        projection: Option<&'weights mut (dyn Int4ProjectionExecutor + 'weights)>,
+        control: &mut RunControl) -> Result<Result<JobProgress, JobRunError>, HostedError> {
+        let Self { mut input, kv, scratch, envelope, limits, required, lease } = self;
+        checkpoint(control)?;
+        let (planner, request) = input.value.preparation.take()
+            .ok_or(HostedError::CompletionMissing)?;
+        let population = match read_population(&mut input.value.reader,
+            &request, limits.transport, control) {
+            Ok(population) => population,
+            Err(error) => return Ok(Err(JobRunError::Storage(error))),
+        };
+        checkpoint(control)?;
+        let mut engine = allocate_native(kv, scratch, || {
+            let engine = StrictInt4Engine::new(weights, envelope.context_tokens,
+                Int4MemoryBudget { max_kv_bytes: required.kv_bytes,
+                    max_rope_bytes: required.rope_bytes,
+                    max_scratch_payload_bytes: required.scratch_payload_bound })
+                .map_err(native_error)?.with_kernel(kernel);
+            match projection {
+                Some(team) => engine.with_projection_executor(team).map_err(native_error),
+                None => Ok(engine),
+            }
+        })?;
+        let admission = GenerationAdmission { lease: &lease, model: weights.identity(),
+            base: planner.execution_identity(), envelope };
+        let result = (|| {
+            let processor = Int4GenerationJobProcessor::new(&planner, &mut engine.value, admission)
+                .map_err(JobRunError::Processor)?;
+            run_population(request, &population, processor, control)
+        })();
+        drop(engine);
+        drop(population);
+        drop(planner);
+        drop(input);
+        drop(lease);
+        Ok(result)
     }
 }
 

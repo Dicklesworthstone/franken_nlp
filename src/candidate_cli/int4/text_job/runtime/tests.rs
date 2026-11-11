@@ -105,6 +105,43 @@ fn native_quote_includes_full_kv_sampler_and_output_vectors_in_addition_to_popul
 }
 
 #[test]
+fn persistent_team_scratch_and_process_threads_are_priced_without_changing_the_recipe() {
+    let seed = "cd".repeat(32);
+    let (serial, args) = command("start", "generate", &["--seed", &seed]);
+    let common = serial.args.validate(&args).unwrap();
+    let job = lifetime(&args, common);
+    let limits = serial.args.lifetime_limits(&args, common, job).unwrap();
+    let baseline = configuration(&serial.args, &args, limits, 166_101).unwrap();
+    let host = host_limits(&args, limits, Duration::from_secs(30));
+    for input in [JobInputMemory::CompletePopulation, JobInputMemory::RetainedRecord] {
+        let serial_bytes = simultaneous_memory(args.group_width, baseline.native,
+            baseline.budget, host, job, common, input).unwrap();
+        for width in ["2", "4", "64"] {
+            let (selected, args) = command("resume", "generate", &["--compute-threads", width, "--seed", &seed]);
+            let common = selected.args.validate(&args).unwrap();
+            let limits = selected.args.lifetime_limits(&args, common, job).unwrap();
+            let config = configuration(&selected.args, &args, limits, 166_101).unwrap();
+            let host = host_limits(&args, limits, Duration::from_secs(30));
+            let threads = compute::resource_config(common);
+            assert_eq!(threads.scoped_cpu_children_per_coordinator, common.compute.threads - 1);
+            assert_eq!(threads.thread_ceiling, common.compute.threads + 1);
+            assert_eq!(threads.runtime_workers, 1);
+            assert_eq!(threads.max_blocking_coordinators, 1);
+            assert_eq!(config.task, baseline.task);
+            assert!(config.generation == baseline.generation);
+            assert_eq!(config.budget, baseline.budget);
+            assert_eq!(config.context_tokens, baseline.context_tokens);
+            assert_eq!(config.planning.max_total_message_bytes, baseline.planning.max_total_message_bytes);
+            assert_eq!(config.native.native.max_projection_work, baseline.native.native.max_projection_work);
+            let team_bytes = simultaneous_memory(args.group_width, config.native,
+                config.budget, host, job, common, input).unwrap();
+            assert_eq!(team_bytes, serial_bytes + common.compute.workspace_bytes);
+            assert!(team_bytes <= limits.common.minimum_memory_bytes);
+        }
+    }
+}
+
+#[test]
 fn complete_envelope_publishes_only_public_model_identity_and_authenticated_progress() {
     let (c, args) = command("resume", "chat", &[]);
     let common = c.args.validate(&args).unwrap();
@@ -123,7 +160,7 @@ fn complete_envelope_publishes_only_public_model_identity_and_authenticated_prog
         source_root_sha256: &source, model_content_sha256: &content,
         candidate_format: "fixture-candidate-format", quant_recipe: "fixture-grouped-int4",
         group_width: args.group_width, integer_kernel: common.kernel.kind().id(),
-        snapshot: Some(SnapshotRecord::new("loaded", common.snapshot_need)), output: &report,
+        snapshot: Some(SnapshotRecord::new("loaded", common.snapshot_need)), compute_schedule: None, output: &report,
     };
     let mut bytes = Vec::new(); publish(&response, job_cli::REPORT_BYTES, &mut bytes).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -131,6 +168,7 @@ fn complete_envelope_publishes_only_public_model_identity_and_authenticated_prog
     assert_eq!(value["evidence"], "non_authoritative");
     assert_eq!(value["model_content_sha256"], content);
     assert_eq!(value["group_width"], args.group_width);
+    assert!(value.get("compute_schedule").is_none());
     assert_eq!(value["snapshot"]["format"], INT4_SNAPSHOT_VERSION);
     assert_eq!(value["output"]["operation"], "resume");
     assert_eq!(value["output"]["task"], "chat");
@@ -144,4 +182,11 @@ fn complete_envelope_publishes_only_public_model_identity_and_authenticated_prog
     }
     assert!(bytes.ends_with(b"\n"));
     assert_eq!(publish(&response, 1, &mut NoWrite), Err(CandidateError::Output));
+    let scheduled = Response { compute_schedule: compute::Schedule::for_threads(4), ..response };
+    let mut bytes = Vec::new(); publish(&scheduled, job_cli::REPORT_BYTES, &mut bytes).unwrap();
+    let selected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(selected["compute_schedule"]["execution"], "int4-output-row-team-v1");
+    assert_eq!(selected["compute_schedule"]["declared_compute_threads"], 4);
+    assert_eq!(selected["output"], value["output"]);
+    assert!(selected.get("compute").is_none());
 }
