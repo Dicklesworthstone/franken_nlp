@@ -120,7 +120,7 @@ impl Int4ObjectExtractionPlanner {
             .map_err(|_| RootObjectError::Allocation)?;
         for identity in mapped.execution_identities() {
             poll(control)?;
-            identities.push(identity.receipt_digest().map_err(|_| Int4ObjectExtractionMapError::Admission)?);
+            identities.push(identity.receipt_identity().map_err(|_| Int4ObjectExtractionMapError::Admission)?);
         }
         let bytes = canonjson::canonical_bytes(&(INT4_OBJECT_MAP_EXECUTION, ROOT_OBJECT_MAP_PROMPT,
             schema.binding(limits.reconciliation)?, Sha256Digest::of_bytes(source.as_bytes()), identities))

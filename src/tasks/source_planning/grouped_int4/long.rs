@@ -332,7 +332,7 @@ fn request_binding<C: DecodeStepControl>(source: &str, task: &SourceMapTask, bud
     writer.value(&plans.len())?;
     for (chunk, plan) in chunks.chunks().iter().zip(plans) {
         checkpoint(control)?;
-        let identity = plan.execution_identity().receipt_digest().map_err(|_| Int4SourceMapError::Admission)?;
+        let identity = plan.execution_identity().receipt_identity().map_err(|_| Int4SourceMapError::Admission)?;
         writer.value(&(chunk.id(), chunk.span(), chunk.tokens(), identity, plan.request_digest(),
             plan.comparison_policy_digest()))?;
     }

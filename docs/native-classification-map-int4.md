@@ -129,6 +129,21 @@ the original source. The complete result verifier binds those counts and
 coordinates, the policy and its work receipt to the prepared map. The default
 byte output omits this optional field and retains its original identities.
 
+Completion verification also binds the exact original source, label taxonomy,
+task and planning limits, encoding policy and ordered compiled model
+identities. Equal source lengths, chunk geometry and native work cannot make
+a result from another admitted request interchangeable. Returned typed
+results carry private request and completed-payload seals; changing scores,
+aggregate values or cohort counters invalidates the corresponding seal.
+The cohort seal also binds its nested result's private authority, so replacing
+the nested result cannot transplant another request's execution counters.
+
+These checks apply to byte and compact maps. Hashing streams through the
+existing finite input and result bounds without allocating a second
+source-sized buffer. Request hashing checks cancellation at bounded byte
+intervals. The seals are omitted from JSON and debug output, preserving the
+serialized result contract without publishing source-derived fingerprints.
+
 The memory quote adds one bounded tokenizer workspace beside all retained
 plans. Hosted callers can use `requirements_with_encoding` or
 `cohort_requirements_with_encoding` on `Int4ClassificationMapHostConfig`, then
@@ -333,6 +348,9 @@ axes, cancellation causes, actual source-token geometry, encoding/work receipt
 substitution, byte-default compatibility, workspace admission and the
 pre-IO snapshot-save refusal. The explicit model-present fixture includes
 both encodings and both decision modes for serial/cohort comparisons.
+Completion-binding regressions cover same-geometry source, model, taxonomy
+and authority substitutions, public score/aggregate/counter changes, nested
+result replacement, private-fingerprint omission and hashing cancellation.
 Compilation and Rust tests remain
 pending the repository-required controller-selected DSR checkpoint. Model
 quality and performance require their separate retained evidence.

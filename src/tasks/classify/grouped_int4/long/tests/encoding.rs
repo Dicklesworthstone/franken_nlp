@@ -34,6 +34,7 @@ fn compile<'a, C: DecodeStepControl>(planner: &ClassificationPlanner, identity: 
     let capacity = planner.source_token_capacity_with_work(request, request.budget, planning,
         limits.chunks.context_tokens, &mut work, control)?;
     PreparedInt4ClassificationMap::compile_encoded(request, limits, capacity, 32,
+        super::super::binding::Authority { ceiling: request.budget, planning },
         planner.document_encoding(), work, control,
         |source, control, work| planner.source_tokens_with_work(source, work, control),
         |row, control, work| planner.compile_int4_with_work(row,
@@ -148,6 +149,7 @@ fn cancellation_during_compact_chunk_probes_preserves_every_native_cause() {
         let mut stop = Stop { checks: 0, cause };
         let mut prepared_heads = 0;
         let error = PreparedInt4ClassificationMap::compile_encoded(&request, limits, capacity, 32,
+            super::super::binding::Authority { ceiling: request.budget, planning },
             planner.document_encoding(), work, &mut stop,
             |source, control, work| planner.source_tokens_with_work(source, work, control),
             |row, control, work| {

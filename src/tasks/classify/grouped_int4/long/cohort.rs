@@ -13,7 +13,7 @@ pub(super) const COHORT_WRAPPER_BYTES: u64 = 4096;
 
 /// Physical grouping statistics stay separate from the unchanged per-chunk
 /// scores and the explicitly named whole-document aggregate estimator.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 pub struct Int4ClassificationMapCohortRun {
     pub schema_version: u32,
     pub execution: String,
@@ -21,6 +21,21 @@ pub struct Int4ClassificationMapCohortRun {
     pub group_steps: u64,
     pub projection_groups: u64,
     pub output: Int4ClassificationMapRun,
+    #[serde(skip)]
+    result_binding: [u8; 32],
+}
+impl Int4ClassificationMapCohortRun {
+    pub(super) fn binding_matches(&self, cap: u64) -> Result<bool, Int4ClassificationMapError> {
+        Ok(self.result_binding == binding::cohort(self, cap)?)
+    }
+}
+impl fmt::Debug for Int4ClassificationMapCohortRun {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Int4ClassificationMapCohortRun")
+            .field("schema_version", &self.schema_version).field("execution", &self.execution)
+            .field("chunk_cohorts", &self.chunk_cohorts).field("group_steps", &self.group_steps)
+            .field("projection_groups", &self.projection_groups).field("output", &self.output).finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -156,11 +171,13 @@ impl PreparedInt4ClassificationMap<'_> {
             results.next().ok_or(Int4ClassificationMapError::Admission)
         })?;
         if results.len() != 0 || next_window != windows.len() { return Err(Int4ClassificationMapError::Admission); }
-        let run = Int4ClassificationMapCohortRun { schema_version: 1,
+        let mut run = Int4ClassificationMapCohortRun { schema_version: 1,
             execution: INT4_CLASSIFICATION_MAP_COHORT_EXECUTION.to_owned(),
-            chunk_cohorts: windows.len(), group_steps, projection_groups, output };
-        value_bytes(&run, self.limits.max_result_bytes.checked_add(COHORT_WRAPPER_BYTES)
-            .ok_or(Int4ClassificationMapError::Limits)?)?;
+            chunk_cohorts: windows.len(), group_steps, projection_groups, output, result_binding: [0; 32] };
+        let cap = self.limits.max_result_bytes.checked_add(COHORT_WRAPPER_BYTES)
+            .ok_or(Int4ClassificationMapError::Limits)?;
+        run.result_binding = binding::cohort(&run, cap)?;
+        value_bytes(&run, cap)?;
         planning::checkpoint(control)?;
         Ok(run)
     }

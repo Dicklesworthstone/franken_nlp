@@ -1388,6 +1388,12 @@ exact encoding policy and consumed work, and verification binds the original
 source spans and actual token counts to the prepared result. CLI and hosted
 admission reserve the bounded encoder workspace beside all retained plans.
 
+Both encodings verify completed results against the exact original request,
+planning limits and compiled model identities. Private seals also detect
+changes to returned scores, aggregates and cohort execution counters. The
+seals are omitted from JSON and debug output; streaming request hashing uses
+cooperative cancellation checks and requires no second source-sized buffer.
+
 The default remains byte fallback with its existing output shape. Compact
 maps support pinned source inference and digest-pinned snapshot reload;
 `--save-snapshot` is refused before IO because its separate planning pass would

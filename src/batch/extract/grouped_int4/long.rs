@@ -403,7 +403,7 @@ impl Int4ExtractionBatchPlanner {
             identities.try_reserve_exact(plans.len()).map_err(|_| Int4ExtractionMapError::Allocation)?;
             for plan in &plans {
                 step(control)?;
-                identities.push(plan.execution_identity().receipt_digest().map_err(|_| Int4ExtractionMapError::Admission)?);
+                identities.push(plan.execution_identity().receipt_identity().map_err(|_| Int4ExtractionMapError::Admission)?);
             }
             // A sealed aggregate from another source, model, chunk partition,
             // schema or policy cannot be transplanted into this map result.
@@ -440,7 +440,7 @@ fn request_binding<C: DecodeStepControl>(source: &str, args: &ExtractionBatchArg
     writer.value(&plans.len())?;
     for (chunk, plan) in chunks.chunks().iter().zip(plans) {
         step(control)?;
-        let identity = plan.execution_identity().receipt_digest().map_err(|_| Int4ExtractionMapError::Admission)?;
+        let identity = plan.execution_identity().receipt_identity().map_err(|_| Int4ExtractionMapError::Admission)?;
         writer.value(&(chunk.id(), chunk.span(), chunk.tokens(), identity,
             plan.request_digest(), plan.comparison_policy_digest()))?;
     }
